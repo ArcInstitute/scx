@@ -555,8 +555,18 @@ def _run_with_thread_scaling(
                     "scenario": scenario,
                     "run_idx": rec["run_idx"],
                     "thread_count": tc,
-                    f"{scenario}_peak_rss_mb": rec["peak_rss_mb"],
-                    f"{scenario}_wall_s": rec["wall_s"],
+                    # Thread-count-qualified, NOT the bare `{scenario}_peak_rss_mb`.
+                    # That bare key is what `thresholds.yaml` floors, and
+                    # `_load_current_raw_metric` takes the MEDIAN of every run
+                    # carrying it — so emitting it here would make the pinned
+                    # rt=4 ceiling a median over whatever thread counts the
+                    # operator swept, silently undoing the pinning. Found by
+                    # review (codex - gpt-5.6-sol) on PR #451, reproduced with
+                    # mocked workers: counts 1 and 16 both emitted the floored
+                    # key. `submit_streaming_threads_census1m.sh` exercises this
+                    # branch, so it is not hypothetical.
+                    f"{scenario}_t{tc}_peak_rss_mb": rec["peak_rss_mb"],
+                    f"{scenario}_t{tc}_wall_s": rec["wall_s"],
                 },
             )
             result.metadata["scenarios"].append(scenario)

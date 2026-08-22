@@ -380,3 +380,75 @@ def test_both_streaming_modules_use_the_true_peak_sampler():
         assert "max(rss_before, rss_after)" not in code, (
             f"{name} still reports max(before, after) as a peak"
         )
+
+
+@pytest.mark.parametrize(
+    "mod", ["conversion_streaming", "export_streaming"]
+)
+def test_thread_sweep_does_not_emit_the_floored_metric_key(mod: str):
+    """The thread-scaling sweep must not reuse the gated key.
+
+    `thresholds.yaml` floors `streaming_peak_rss_mb`, and
+    `_load_current_raw_metric` takes the **median of every run carrying it**. The
+    sweep emitted that bare key for each thread count, so setting
+    `SCX_{CONV,EXPORT}_STREAM_THREAD_COUNTS` turned the pinned rt=4 ceiling into a
+    median over whatever counts the operator swept — silently undoing the pinning
+    the floor depends on. `submit_streaming_threads_census1m.sh` exercises that
+    branch, so it was reachable, not hypothetical. Found by review
+    (codex - gpt-5.6-sol) on PR #451.
+
+    Checked on the source rather than by running a sweep: the sweep needs a real
+    census-scale fixture and minutes of wall time, and the defect is entirely in
+    which key string is written.
+    """
+    import ast
+
+    path = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks" / f"{mod}.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    sweep = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_run_with_thread_scaling"),
+        None,
+    )
+    assert sweep is not None, f"{mod}: _run_with_thread_scaling not found — retarget this test"
+
+    # Every f-string key built inside the sweep must be thread-qualified.
+    bare = []
+    for node in ast.walk(sweep):
+        if not isinstance(node, ast.JoinedStr):
+            continue
+        rendered = "".join(
+            v.value if isinstance(v, ast.Constant) else "{}"
+            for v in node.values
+        )
+        if rendered.endswith("_peak_rss_mb") or rendered.endswith("_wall_s"):
+            if "_t{}" not in rendered:
+                bare.append(f"line {node.lineno}: {rendered}")
+    assert not bare, (
+        f"{mod}'s thread sweep emits un-qualified metric keys {bare}; the bare "
+        f"`streaming_peak_rss_mb` is the floored key and mixing thread counts into "
+        f"its median defeats GATED_READER_THREADS"
+    )
+
+
+def test_export_streaming_bounds_its_materialize_arm_too():
+    """The ingest twin caps the materialize arm above 1M cells; so must this one.
+
+    `to_h5ad(..., stream=False)` calls `read_all_csr_shards_filtered()` — 13.98 GB
+    resident on census_1m, scaling linearly — and `estimate_memory_gb` has no arm
+    for either streaming benchmark, so the job falls through to `2x` the h5ad size
+    and would be under-provisioned at census_5m/10m. Registration is what makes a
+    tiered capture schedule it. The asymmetry was found by review
+    (Cursor Agent - Grok 4.6 High) on PR #451.
+    """
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.benchmarks import export_streaming as es
+
+    assert es.MATERIALIZE_MAX_N_OBS == cs.MATERIALIZE_MAX_N_OBS, (
+        "the two streaming benchmarks should cap the same arm at the same scale"
+    )
+    for m in (cs, es):
+        assert m._skip_materialize_reason(m.MATERIALIZE_MAX_N_OBS) is None
+        reason = m._skip_materialize_reason(m.MATERIALIZE_MAX_N_OBS + 1)
+        assert reason and "streaming" in reason

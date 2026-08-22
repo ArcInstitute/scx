@@ -85,7 +85,8 @@ pub use shard_decode::{
 pub use shard_report::{codec_id_histogram, distinct_sorted_shard_field, total_shard_bytes};
 pub use shard_source::{ColumnShardSource, ShardSizeHint, ShardSource};
 pub use writer::{
-    assign_csr_shard_column_stats, chmod_to_umask, clear_all_csr_shard_column_stats,
-    clear_csr_shard_column_stats_for, compute_shard_stats, fsync_parent_dir, make_sibling_tempfile,
-    write_obs_section, MajorAxis, PreEncodedSection, ScxWriter, SECTIONS_START_OFFSET,
+    assign_csr_shard_column_stats, carry_csr_shard_column_stats, chmod_to_umask,
+    clear_all_csr_shard_column_stats, clear_csr_shard_column_stats_for, compute_shard_stats,
+    fsync_parent_dir, make_sibling_tempfile, write_obs_section, MajorAxis, PreEncodedSection,
+    ScxWriter, SECTIONS_START_OFFSET,
 };

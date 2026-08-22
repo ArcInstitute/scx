@@ -1661,6 +1661,17 @@ impl ScxWriter {
         assign_csr_shard_column_stats(&mut self.entries, per_shard)
     }
 
+    /// Carry obs `column_stats` from a source catalog's CSR entries onto this
+    /// writer's, matching by `row_start`. Returns how many shards received them.
+    ///
+    /// For `build-csc` / `optimize`, which re-encode every CSR shard while
+    /// preserving the row partition 1:1. See
+    /// [`carry_csr_shard_column_stats`] for why this copies rather than
+    /// re-deriving from the carried index.
+    pub fn carry_csr_shard_column_stats_from(&mut self, source: &[FullCatalogEntry]) -> usize {
+        carry_csr_shard_column_stats(&mut self.entries, source)
+    }
+
     // -----------------------------------------------------------------------
     // Phase B: per-modality writer API
     // -----------------------------------------------------------------------
@@ -2928,6 +2939,81 @@ pub fn assign_csr_shard_column_stats(
         }
     }
     Ok(())
+}
+
+/// Carry per-shard obs `column_stats` from a source catalog's CSR entries onto
+/// `entries`, matching by `row_start`. Returns the number of entries that
+/// received stats.
+///
+/// For an op that **re-encodes** every CSR shard while preserving the row
+/// partition 1:1 — `build-csc` and `optimize` — this is what keeps Level-1
+/// pruning alive. `compute_shard_stats` produces no `column_stats`, so a
+/// re-encoded shard comes out bare even though the `ObsPredicateIndex` section
+/// was copied through verbatim; the index survives and the pruning silently
+/// stops, returning the right rows after a full scan.
+///
+/// **Why carrying beats re-deriving from the index.** An earlier version of this
+/// derived the stats afresh from the carried index bytes, guarded by comparing
+/// the index's highest recorded `shard_id + 1` against the output CSR shard
+/// count. That equality is not proof the index is keyed to the CSR partition:
+/// `modify_metadata` falls back to building the index over **obs**-shard ranges
+/// when the CSR shards do not tile `[0, n_obs)`, and an obs partition can have
+/// the same shard *count* as the CSR one with different *boundaries* — CSR
+/// `[0,100) [100,200) [200,300)` against obs `[0,134) [134,268) [268,400)`.
+/// Derivation would then attach shard 0's obs statistics to CSR rows they do not
+/// describe, and Level-1 consumes `column_stats` **before** residual
+/// evaluation — so a fabricated "value absent" prunes a shard holding real
+/// matches and the query returns an incomplete row set. Found by review
+/// (codex - gpt-5.6-sol) on PR #451.
+///
+/// Copying sidesteps the inference entirely. It is also strictly more faithful:
+/// the output's shards hold exactly the rows the input's did, so the input's
+/// statistics are already correct for them, and a file whose index *is*
+/// obs-keyed has had its stats cleared by `modify_metadata`
+/// (`clear_all_csr_shard_column_stats`) — so there is nothing to carry and
+/// nothing to mis-attribute.
+///
+/// Both axes are scoped to `modality_id == 0`, matching
+/// [`assign_csr_shard_column_stats`]; a multimodal file's per-modality shards
+/// are neither read nor written here.
+pub fn carry_csr_shard_column_stats(
+    entries: &mut [FullCatalogEntry],
+    source: &[FullCatalogEntry],
+) -> usize {
+    use std::collections::HashMap;
+
+    let by_row_start: HashMap<u64, &Vec<crate::catalog::ColumnStat>> = source
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+        .filter_map(|e| e.stats.as_ref())
+        .filter(|s| !s.column_stats.is_empty())
+        .map(|s| (s.row_start, &s.column_stats))
+        .collect();
+    if by_row_start.is_empty() {
+        return 0;
+    }
+
+    let mut carried = 0usize;
+    for entry in entries
+        .iter_mut()
+        .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+    {
+        let Some(stats) = entry.stats.as_mut() else {
+            continue;
+        };
+        if let Some(src) = by_row_start.get(&stats.row_start) {
+            // `n_indexed_columns` is a u8 and the source came through the same
+            // cap in `assign_csr_shard_column_stats`, so this cannot overflow —
+            // but clamp rather than truncate silently if that ever changes.
+            if src.len() > u8::MAX as usize {
+                continue;
+            }
+            stats.n_indexed_columns = src.len() as u8;
+            stats.column_stats = (*src).clone();
+            carried += 1;
+        }
+    }
+    carried
 }
 
 /// Drop the per-shard column statistics for **every** indexed obs column from

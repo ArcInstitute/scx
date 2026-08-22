@@ -307,28 +307,25 @@ pub fn run_build_csc(
     // `copy_auxiliary_sections` carries the predicate-index bytes verbatim, which
     // the carry policy requires — but step 11 above re-encoded every CSR shard
     // through `write_csr_shard`, and `compute_shard_stats` emits no
-    // `column_stats`. Without this the index section survived and Level-1 shard
-    // pruning silently stopped: `filter_obs` fell back to a full scan and still
-    // returned the right rows, which is why it went unnoticed long enough to be
-    // pinned as a documented gap. `optimize` is the only other op declaring
-    // `Carry::Verbatim` here and had the same defect. Multimodal input is
-    // refused at the top of this function, so `csr_entries` is the modality-0
-    // shard list `assign_csr_shard_column_stats` addresses.
-    if let Some(bytes) = reader.read_obs_predicate_index_bytes()? {
-        match scx_engine::reapply_carried_obs_shard_column_stats(
-            &mut writer,
-            bytes,
-            csr_entries.len(),
-        )? {
-            scx_engine::CarriedStatsOutcome::ShardSpaceMismatch {
-                index_slots,
-                output_shards,
-            } => log::warn!(
-                "build-csc: the carried obs predicate index spans {index_slots} shard slots but                  the output has {output_shards} CSR shards, so per-shard column statistics were                  not re-derived. Level-1 shard pruning stays off; rebuild the index with                  `scx sort`/`scx compact` plus --index-obs / --index-preset."
-            ),
-            scx_engine::CarriedStatsOutcome::Applied
-            | scx_engine::CarriedStatsOutcome::NothingToApply => {}
-        }
+    // `column_stats`. Level-1 pruning reads *those*, not the section, so without
+    // this the index survived while the pruning silently stopped: `filter_obs`
+    // fell back to a full scan and still returned the right rows, which is why it
+    // went unnoticed long enough to be pinned as a documented gap.
+    //
+    // The stats are **carried from the input**, not re-derived from the index.
+    // Step 11 writes one output shard per input shard at the same `row_start`, so
+    // the input's statistics are already exactly right for the output's rows —
+    // and re-deriving would have to *infer* that the index is keyed to the CSR
+    // partition, which cannot be proven from the index bytes. See
+    // `scx_format_io::carry_csr_shard_column_stats`.
+    let carried_stats = writer.carry_csr_shard_column_stats_from(&reader.catalog().entries);
+    if carried_stats == 0 && reader.read_obs_predicate_index_bytes()?.is_some() {
+        log::debug!(
+            "build-csc: the input carries an obs predicate index but no per-shard column \
+             statistics, so there are none to carry forward. Level-1 shard pruning was \
+             already off on the input; rebuild the index with `scx sort`/`scx compact` plus \
+             --index-obs / --index-preset to enable it."
+        );
     }
 
     // 15. Check the staged catalog against the declared carry policy, then

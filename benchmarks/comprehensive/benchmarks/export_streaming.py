@@ -100,6 +100,34 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
 # under `streaming_default_threads_peak_rss_mb` and not gated.
 GATED_READER_THREADS: int = 4
 
+# Above this many cells the `materialize` arm is skipped and only the streaming
+# arms run. Mirrors `conversion_streaming.MATERIALIZE_MAX_N_OBS`, and it is
+# needed for the same reason: registering this module in `ALL_BENCHMARKS` is what
+# makes a tiered capture schedule it, and `to_h5ad(..., stream=False)` calls
+# `read_all_csr_shards_filtered()` — the whole CSR triplet resident, measured at
+# **13.98 GB** on census_1m and scaling linearly, so ~70 GB at census_5m and
+# ~140 GB at census_10m. `estimate_memory_gb` has no arm for either streaming
+# benchmark, so those jobs fall through to `peak_mb = base_mb` (2x the h5ad size)
+# and would be under-provisioned. The ingest twin had this cap and this module
+# did not — the asymmetry was found by review (Cursor Agent - Grok 4.6 High) on
+# PR #451.
+#
+# The streaming arms — the ones `thresholds.yaml` floors — still run at every
+# tier. The skip is recorded in `metadata`, never silent.
+MATERIALIZE_MAX_N_OBS: int = 1_000_000
+
+
+def _skip_materialize_reason(n_obs: int) -> str | None:
+    """Why the materialize arm is not run at this scale, or `None` to run it."""
+    if n_obs > MATERIALIZE_MAX_N_OBS:
+        return (
+            f"materialize holds the whole CSR triplet (~14 GB at 1M cells, "
+            f"scaling linearly); skipped above n_obs={MATERIALIZE_MAX_N_OBS:,} so "
+            f"a full-tier capture does not pay it. The streaming arms — the ones "
+            f"the thresholds.yaml floor gates — still run."
+        )
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -496,7 +524,7 @@ def run(
 
     try:
         if thread_counts is None:
-            return _run_isolated(scx_in, out_ext, n_runs, result)
+            return _run_isolated(scx_in, out_ext, n_runs, result, dataset.n_obs)
         return _run_with_thread_scaling(
             scx_in, out_ext, n_runs, thread_counts, result
         )
@@ -510,6 +538,7 @@ def _run_isolated(
     out_ext: str,
     n_runs: int,
     result: BenchmarkResult,
+    n_obs: int = 0,
 ) -> BenchmarkResult:
     """Default path: three arms, each in its own subprocess.
 
@@ -529,11 +558,17 @@ def _run_isolated(
     ``benchmarks/comprehensive/tests/test_floor_reachability.py`` keeps either
     module from regressing to the nested form.
     """
+    skip_materialize = _skip_materialize_reason(n_obs)
+    result.metadata["materialize_skipped_reason"] = skip_materialize
+    if skip_materialize:
+        log.info("materialize arm skipped: %s", skip_materialize)
+
     arms: list[tuple[str, int | None]] = [
         ("streaming", GATED_READER_THREADS),
         ("streaming_default_threads", None),
-        ("materialize", None),
     ]
+    if not skip_materialize:
+        arms.append(("materialize", None))
 
     structural: dict[str, dict | None] = {}
     for label, reader_threads in arms:
@@ -567,9 +602,14 @@ def _run_isolated(
     result.metadata["gated_reader_threads"] = GATED_READER_THREADS
     result.metadata["structural"] = {
         **structural,
-        "equal": structural.get("streaming") == structural.get("materialize"),
+        # `None`, not `False`, when the materialize arm did not run: nothing to
+        # compare is not the same claim as "they differ".
+        "equal": (
+            None if skip_materialize
+            else structural.get("streaming") == structural.get("materialize")
+        ),
     }
-    if structural.get("streaming") != structural.get("materialize"):
+    if not skip_materialize and structural.get("streaming") != structural.get("materialize"):
         log.warning(
             "Structural mismatch streaming=%s materialize=%s",
             structural.get("streaming"), structural.get("materialize"),
@@ -618,8 +658,18 @@ def _run_with_thread_scaling(
                 "scenario": scenario,
                 "run_idx": rec["run_idx"],
                 "thread_count": tc,
-                f"{scenario}_peak_rss_mb": rec["peak_rss_mb"],
-                f"{scenario}_wall_s": rec["wall_s"],
+                # Thread-count-qualified, NOT the bare `{scenario}_peak_rss_mb`.
+                # That bare key is what `thresholds.yaml` floors, and
+                # `_load_current_raw_metric` takes the MEDIAN of every run
+                # carrying it — so emitting it here would make the pinned
+                # rt=4 ceiling a median over whatever thread counts the
+                # operator swept, silently undoing the pinning. Found by
+                # review (codex - gpt-5.6-sol) on PR #451, reproduced with
+                # mocked workers: counts 1 and 16 both emitted the floored
+                # key. `submit_streaming_threads_census1m.sh` exercises this
+                # branch, so it is not hypothetical.
+                f"{scenario}_t{tc}_peak_rss_mb": rec["peak_rss_mb"],
+                f"{scenario}_t{tc}_wall_s": rec["wall_s"],
             }
             result.add_run(
                 wall_s=rec["wall_s"],

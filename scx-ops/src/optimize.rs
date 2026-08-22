@@ -242,16 +242,6 @@ pub fn optimize_with_framing(
         .collect();
     obsp_csr_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Counted before the chain consumes `x_entries`. Scoped to `modality_id == 0`
-    // to match what `assign_csr_shard_column_stats` addresses, so a multimodal
-    // file's per-modality shards cannot make the count look right by accident.
-    let n_global_csr_shards = reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
-        .count();
-
     let mut stats = OptimizeStats {
         format_version: out_format_version,
         ..Default::default()
@@ -418,28 +408,21 @@ pub fn optimize_with_framing(
     // Copying the section bytes is only half of carrying an index. Optimize
     // re-encodes every CSR shard above, and `compute_shard_stats` emits no
     // `column_stats` — so without this the index section survived and Level-1
-    // shard pruning silently stopped, turning every `filter_obs` into a full
-    // scan that still returned the right rows. `build-csc` had the same defect
-    // and the same fix; they are the only two ops declaring
-    // `Carry::Verbatim` for this family.
-    if let Some(bytes) = reader.read_obs_predicate_index_bytes()? {
-        match scx_engine::reapply_carried_obs_shard_column_stats(
-            &mut writer,
-            bytes,
-            n_global_csr_shards,
-        )
-        .map_err(OpsError::Engine)?
-        {
-            scx_engine::CarriedStatsOutcome::ShardSpaceMismatch {
-                index_slots,
-                output_shards,
-            } => log::warn!(
-                "optimize: the carried obs predicate index spans {index_slots} shard slots but                  the output has {output_shards} CSR shards, so per-shard column statistics were                  not re-derived. Level-1 shard pruning stays off; rebuild the index with                  `scx sort`/`scx compact` plus --index-obs / --index-preset."
-            ),
-            scx_engine::CarriedStatsOutcome::Applied
-            | scx_engine::CarriedStatsOutcome::NothingToApply => {}
-        }
-    }
+    // shard pruning silently stopped, turning every `filter_obs` into a full scan
+    // that still returned the right rows. `build-csc` had the same defect and the
+    // same fix, and so does `upgrade` — three ops, not two. `build-csc` and
+    // `optimize` declare `Carry::Verbatim` for this family in their own match
+    // arms; `upgrade` reaches the same arm through `other => build_csc(other)`
+    // and re-emits every CSR shard too. Counting only the explicit arms is how
+    // the first pass missed it.
+    //
+    // Carried from the input rather than re-derived from the index: optimize
+    // preserves row order and CSR shard boundaries 1:1, so the input's stats are
+    // already correct for the output's shards, and re-deriving would have to
+    // infer that the index is CSR-keyed — which the index bytes cannot establish.
+    // See `scx_format_io::carry_csr_shard_column_stats`.
+    writer.carry_csr_shard_column_stats_from(&reader.catalog().entries);
+
     // Record the obs-sharding decision so the layout change is auditable via
     // `scx info --history` (the obs layout is the one thing optimize can now
     // change beyond the CSR re-encode).
@@ -1513,7 +1496,7 @@ mod tests {
     /// shard. This fixture has three, with `cell_type` constant within each, so
     /// a query for one value can eliminate the other two.
     ///
-    /// The same defect in `build-csc`, the only other op declaring
+    /// The same defect in `build-csc` and `upgrade`, the other ops declaring
     /// `Carry::Verbatim` here, is pinned at
     /// `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`.
     #[test]

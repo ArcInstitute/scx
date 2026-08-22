@@ -23,10 +23,9 @@ pub use index::{
     apply_obs_shard_column_stats, build_and_write_conversion_predicate_indexes,
     build_and_write_conversion_predicate_indexes_streaming, build_indexes,
     build_obs_predicate_index_bytes, build_var_predicate_index_bytes, derive_shard_column_stats,
-    index_covers_all_obs, index_preset_columns, reapply_carried_obs_shard_column_stats,
-    resolve_predicate_index_build_options, BuildOutcome, CarriedStatsOutcome,
-    ConversionPredicateIndexOptions, ConversionPredicateIndexResult, IndexKind, IndexPreset,
-    ObsPredicateIndexBuilder, PredicateIndex, PredicateIndexBuildOptions,
+    index_covers_all_obs, index_preset_columns, resolve_predicate_index_build_options,
+    BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult, IndexKind,
+    IndexPreset, ObsPredicateIndexBuilder, PredicateIndex, PredicateIndexBuildOptions,
     ResolvedIndexBuildOptions, ShardRange, SkipReason, HIGH_CARDINALITY_THRESHOLD,
 };
 pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult};

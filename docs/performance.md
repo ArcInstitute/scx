@@ -187,10 +187,23 @@ triplet fits: census_1m's is ~26.9 GB resident at peak, and `census_5m` /
 backed-AnnData path used by `pyscx.from_anndata(adata)` when
 `adata.isbacked` is true.
 
-Source data:
-`benchmarks/comprehensive/results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`
-(absolute floor: `streaming_peak_rss_mb max: 2048` on `census_1m`,
-declared in `benchmarks/comprehensive/thresholds.yaml`).
+Source data (tracked, per
+[docs/benchmark_manifest.md](benchmark_manifest.md#for-readmedocs-authors)):
+`benchmarks/comprehensive/results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`,
+also promoted to
+`benchmarks/comprehensive/results/baselines/v0.14.0-phase5c-streaming-floors/`
+(**not** `LATEST` — that stays on `v0.11.2-multimodal-loader-fix`, which is the
+canonical full-tier baseline). SLURM job 2834737, `git_sha f1515c6a`. The absolute
+floor is `streaming_peak_rss_mb max: 4096` on `census_1m`, declared in
+`benchmarks/comprehensive/thresholds.yaml`, and it is measured on the
+`reader_threads=4` arm — see the note above on why the gated arm is pinned.
+
+> `git_dirty` is `true` on that capture, which
+> [docs/benchmark_manifest.md](benchmark_manifest.md#for-readmedocs-authors)
+> permits when the dirtiness is documented: the working tree carried only
+> untracked scratch markdown and the gate driver script
+> (`benchmarks/scripts/_run_phase6_gate.sh`), neither of which is compiled or
+> imported. Every tracked file was at `f1515c6a`.
 
 ### Streaming export (SCX → h5ad / h5mu)
 

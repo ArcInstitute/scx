@@ -297,6 +297,18 @@ fn rewrite_with_current_version(
         },
     )?;
 
+    // Same half-carry `build-csc` and `optimize` had, and for the same reason:
+    // the helper above copies the predicate-index *section*, but this op decodes
+    // and re-emits every CSR shard, and `compute_shard_stats` produces no
+    // `column_stats`. Level-1 pruning reads those, not the section — so without
+    // this the index survives and the pruning silently stops, a full scan that
+    // still returns the right rows. Row order and shard boundaries are 1:1 here
+    // (`upgrade` re-emits, it does not re-shard), so the input's statistics are
+    // exactly right for the output's shards. Found by review
+    // (Cursor Agent - Grok 4.6 High) on PR #451, which noted this op was a third
+    // instance the fix had missed.
+    writer.carry_csr_shard_column_stats_from(&reader.catalog().entries);
+
     // `upgrade` is the one op in the carry table whose call site lives outside
     // `scx-ops`, so the audit is wired here rather than inside the shared helper
     // above — which is also shared with `build-csc`, whose policy differs on the

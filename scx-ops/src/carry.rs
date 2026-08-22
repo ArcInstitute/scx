@@ -299,7 +299,12 @@ pub enum Carry {
     /// no `Carry` variant expresses: `build-csc` copied the bytes and never
     /// re-derived the per-shard `column_stats` those bytes' Level-1 pushdown
     /// reads, so the section survived and the pruning did not. `optimize`, the
-    /// only other op declaring `Verbatim` for that family, had it too.
+    /// only other op declaring `Verbatim` for that family in its own match arm,
+    /// had it too — and so did `upgrade`, which reaches that arm through
+    /// `other => build_csc(other)` and re-emits every CSR shard as well. Three
+    /// ops, not two: an earlier version of this note said two, because it counted
+    /// the explicit match arms and missed the delegation. Found by review
+    /// (Cursor Agent - Grok 4.6 High) on PR #451.
     ///
     /// Both are fixed (Phase 5c,
     /// `scx_engine::reapply_carried_obs_shard_column_stats`), but the lesson is
