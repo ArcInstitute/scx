@@ -136,3 +136,27 @@ fn closed_form_guard_catches_sign_flip_and_tiny_positive() {
         4
     ));
 }
+
+/// The one predicate behind all three cancellation guards, on its own.
+#[test]
+fn residual_predicate_needs_something_to_have_been_lost() {
+    // Nothing to cancel: an exactly-zero second moment means an exactly-zero
+    // answer, not a destroyed one. This is the asymmetry that keeps every
+    // all-zero column out of `ColumnMoments::unstable`.
+    assert!(!residual_lost_to_cancellation(0.0, 0.0));
+    assert!(!residual_lost_to_cancellation(0.0, -1.0));
+    // Total loss, and sign-flipped loss.
+    assert!(residual_lost_to_cancellation(0.0, 1.0e6));
+    assert!(residual_lost_to_cancellation(-3.0, 1.0e6));
+    // Right at the threshold, either side.
+    assert!(residual_lost_to_cancellation(
+        CLOSED_FORM_VAR_REL_EPS * 1.0e6,
+        1.0e6
+    ));
+    assert!(!residual_lost_to_cancellation(
+        CLOSED_FORM_VAR_REL_EPS * 1.0e6 * 1.001,
+        1.0e6
+    ));
+    // A healthy residual.
+    assert!(!residual_lost_to_cancellation(0.9e6, 1.0e6));
+}

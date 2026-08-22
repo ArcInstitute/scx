@@ -65,6 +65,23 @@ pub struct ColumnMoments {
     pub unstable: Vec<u32>,
 }
 
+/// Whether a `Σx² − n·mean²`-style residual has lost too much of its input's
+/// magnitude to cancellation to be trusted.
+///
+/// `residual` is the difference; `second_moment` is the positive quantity it was
+/// subtracted from. Returns `false` when `second_moment` is zero or negative:
+/// there is nothing to cancel, so an exactly-zero residual is an exact answer,
+/// not a lost one. That exclusion is load-bearing — without it every all-zero
+/// column in a sparse matrix reports as unstable.
+///
+/// The single predicate behind all three cancellation guards in the tree: the
+/// per-column one in [`finalize_column_moments`], the whole-matrix one in
+/// [`closed_form_variance_unstable`], and `scx-accel`'s `pflog_total_variance`.
+#[inline]
+pub fn residual_lost_to_cancellation(residual: f64, second_moment: f64) -> bool {
+    second_moment > 0.0 && residual <= CLOSED_FORM_VAR_REL_EPS * second_moment
+}
+
 impl ColumnMoments {
     /// Log the columns whose variance lost too much precision to cancellation.
     ///
@@ -157,7 +174,7 @@ pub fn finalize_column_moments(col_sum: &[f64], col_sum_sq: &[f64], n: usize) ->
         // A zero second moment means an all-zero column: exactly zero variance,
         // nothing cancelled. Checking it first keeps such columns out of
         // `unstable`, where a bare relative test would put every one of them.
-        if col_sum_sq[j] > 0.0 && residual <= CLOSED_FORM_VAR_REL_EPS * col_sum_sq[j] {
+        if residual_lost_to_cancellation(residual, col_sum_sq[j]) {
             unstable.push(j as u32);
         }
         let var = residual / denom;
@@ -187,7 +204,10 @@ pub fn finalize_column_moments(col_sum: &[f64], col_sum_sq: &[f64], n: usize) ->
 pub fn closed_form_variance_unstable(col_sum_sq: &[f64], means: &[f64], n_obs: usize) -> bool {
     let sum_sq: f64 = col_sum_sq.iter().sum();
     let mean_sq: f64 = means.iter().map(|&m| m * m).sum::<f64>() * n_obs as f64;
-    (sum_sq - mean_sq) <= CLOSED_FORM_VAR_REL_EPS * sum_sq
+    // Note the asymmetry with the per-column test: here a zero `sum_sq` *is*
+    // reported unstable, because a whole matrix with no second moment has no
+    // usable total variance for `variance_ratio` to divide by either way.
+    sum_sq <= 0.0 || residual_lost_to_cancellation(sum_sq - mean_sq, sum_sq)
 }
 
 #[cfg(test)]

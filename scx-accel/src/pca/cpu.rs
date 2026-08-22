@@ -708,9 +708,9 @@ fn pflog_total_variance(
     let b2: f64 = baseline.iter().map(|&b| b * b).sum();
     let denom = (n_obs as f64 - 1.0).max(1.0);
     let d = n_vars as f64;
-    match colmean_delta {
+    let tss = match colmean_delta {
         // Uncentered: Σ Z² = S_dd − D·B2 (the cross term 2Σδb = −2D·B2 cancels D·B2).
-        None => ((s_dd - d * b2) / denom).max(0.0),
+        None => s_dd - d * b2,
         Some(cd) => {
             let baseline_mean = baseline.iter().sum::<f64>() / (n_obs as f64).max(1.0);
             let n = n_obs as f64;
@@ -720,10 +720,28 @@ fn pflog_total_variance(
                 m2 += mu * mu;
             }
             // Cross terms cancel to −n·Σμ² (see doc comment): TSS = S_dd − D·B2 − n·Σμ².
-            let tss = s_dd - d * b2 - n * m2;
-            (tss / denom).max(0.0)
+            s_dd - d * b2 - n * m2
         }
+    };
+    // Both branches are differences of same-order quantities, so both can cancel
+    // — and a cancelled `tss` clamps to `0.0`, which `build_pca_result` turns into
+    // `variance_ratio = vec![0.0; k]` via its `if total_var > 0.0` guard. That
+    // was indistinguishable from a genuinely degenerate matrix; the same relative
+    // floor the other three PCA routes use now names it.
+    //
+    // Reported and not repaired: unlike the closed-form column moments, there is
+    // no second-pass alternative here. `Z = delta + baseline·1ᵀ` is never
+    // materialized — the closed form is the whole point of the PFlog route — so a
+    // "stable recompute" would mean building the dense `Z`.
+    if scx_sparse::residual_lost_to_cancellation(tss, s_dd) {
+        log::warn!(
+            "pflog_total_variance: the closed-form total variance lost precision \
+             to cancellation (S_dd = {s_dd}, TSS = {tss}); `variance_ratio` will \
+             be reported as zeros. This is a conditioning failure, not a \
+             degenerate matrix."
+        );
     }
+    (tss / denom).max(0.0)
 }
 
 /// Exact PFlog (v4) randomized PCA, streaming the `delta` source out-of-core.
@@ -2571,6 +2589,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A cancelled PFlog total variance is now named, not just clamped.
+    ///
+    /// `pflog_total_variance` returns `(tss / (n-1)).max(0.0)`, and
+    /// `build_pca_result`'s `if total_var > 0.0` then turns a zero into
+    /// `variance_ratio = vec![0.0; k]`. Before the guard that was
+    /// indistinguishable from a genuinely degenerate matrix — the review's
+    /// "fails to zero silently" minor.
+    ///
+    /// This asserts the observable (a cancelled input still clamps to zero, and a
+    /// well-conditioned one does not) plus the predicate that decides whether to
+    /// warn. The `log::warn!` itself is not asserted: capturing it would need a
+    /// logger fixture for a one-line diagnostic, and
+    /// `scx_sparse::residual_lost_to_cancellation` — which is the whole decision —
+    /// is unit-tested in its own crate.
+    ///
+    /// Reported and not repaired, deliberately: `Z = delta + baseline·1ᵀ` is never
+    /// materialized, which is the entire point of the PFlog route, so there is no
+    /// second-pass stable recompute to fall back to the way the other three PCA
+    /// routes have.
+    #[test]
+    fn pflog_total_variance_reports_cancellation_instead_of_a_silent_zero() {
+        let (n_obs, n_vars) = (5usize, 4usize);
+        let baseline = vec![1.0f64; n_obs]; // b2 = 5, baseline_mean = 1
+        let colmean_delta = vec![-1.0f64; n_vars]; // μ_j = 0 ⇒ Σμ² = 0
+
+        // S_dd = 20 = D·B2, so TSS = 0 with a second moment of 20 to lose it from.
+        let cancelled = pflog_total_variance(
+            &vec![5.0; n_vars],
+            Some(&colmean_delta),
+            &baseline,
+            n_obs,
+            n_vars,
+        );
+        assert_eq!(cancelled, 0.0, "a cancelled TSS still clamps to zero");
+        assert!(
+            scx_sparse::residual_lost_to_cancellation(0.0, 20.0),
+            "the guard must classify TSS=0 against S_dd=20 as cancellation"
+        );
+
+        // Well conditioned: S_dd = 400, TSS = 380 — no warning, real answer.
+        let healthy = pflog_total_variance(
+            &vec![100.0; n_vars],
+            Some(&colmean_delta),
+            &baseline,
+            n_obs,
+            n_vars,
+        );
+        assert!((healthy - 95.0).abs() < 1e-12, "got {healthy}");
+        assert!(
+            !scx_sparse::residual_lost_to_cancellation(380.0, 400.0),
+            "a 95% surviving residual must not be flagged"
+        );
+
+        // An all-zero matrix is NOT a cancellation: nothing was lost, the answer
+        // is exactly zero. Without this asymmetry every empty input would warn.
+        assert!(!scx_sparse::residual_lost_to_cancellation(0.0, 0.0));
     }
 
     /// `pflog_total_variance` (both branches) must match a brute-force dense
