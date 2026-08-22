@@ -306,7 +306,7 @@ pub enum Carry {
     /// the explicit match arms and missed the delegation. Found by review
     /// (Cursor Agent - Grok 4.6 High) on PR #451.
     ///
-    /// Both are fixed (Phase 5c,
+    /// All three are fixed (Phase 5c,
     /// `scx_format_io::carry_csr_shard_column_stats`, which copies the input's
     /// stats by `row_start` rather than inferring the index's keying), but the lesson is
     /// structural and outlives the fix: **`Verbatim` asserts that the section is

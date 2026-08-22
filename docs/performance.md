@@ -198,11 +198,15 @@ backed-AnnData path used by `pyscx.from_anndata(adata)` when
 
 Source data (tracked, per
 [docs/benchmark_manifest.md](benchmark_manifest.md#for-readmedocs-authors)):
-`benchmarks/comprehensive/results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`,
-also promoted to
+`benchmarks/comprehensive/results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`
+— the per-arm runs quoted above live there, and only there.
+`promote_baseline.py` does **not** copy `raw/*.json`, so the companion snapshot at
 `benchmarks/comprehensive/results/baselines/v0.14.0-phase5c-streaming-floors/`
-(**not** `LATEST` — that stays on `v0.11.2-multimodal-loader-fix`, which is the
-canonical full-tier baseline). SLURM job 2834737, `git_sha f1515c6a`. The absolute
+carries the aggregate `summary.json` (which medians all nine runs into one figure
+and therefore cannot back a per-arm claim), plus `environment.json`,
+`MANIFEST.sha256` and the fingerprint summary. It is **not** `LATEST` — that stays
+on `v0.11.2-multimodal-loader-fix`, the canonical full-tier baseline. SLURM job
+2834737, `git_sha f1515c6a`. The absolute
 floor is `streaming_peak_rss_mb max: 4096` on `census_1m`, declared in
 `benchmarks/comprehensive/thresholds.yaml`, and it is measured on the
 `reader_threads=4` arm — see the note above on why the gated arm is pinned.

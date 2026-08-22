@@ -529,3 +529,48 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
         )
         checked += 1
     assert checked == 3, checked
+
+
+@pytest.mark.parametrize("mod", ["conversion_streaming", "export_streaming"])
+def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, monkeypatch):
+    """Drive `run()` — do not just assert the constants exist.
+
+    Round 1 added the export cap with a test that checked `MATERIALIZE_MAX_N_OBS`
+    and `_skip_materialize_reason`, and the sweep path stayed uncapped because
+    nothing exercised it: `_run_thread_count_subprocess` unconditionally appends
+    the materialize arm. All three round-2 reviewers found the bypass, and round 3
+    pointed out the replacement test was still the same source-shape check
+    (codex - gpt-5.6-sol, Cursor Agent - Grok 4.6 High).
+
+    So this drives the real entry point with the sweep env var set and a dataset
+    above the cap, and asserts it refuses *before* touching any input — which is
+    also why the guard sits ahead of input resolution.
+    """
+    import importlib
+
+    from benchmarks.comprehensive.config import DATASETS, FormatVariant
+
+    m = importlib.import_module(f"benchmarks.comprehensive.benchmarks.{mod}")
+    big = next(
+        (d for d in DATASETS.values()
+         if d.n_obs > m.MATERIALIZE_MAX_N_OBS and not d.multimodal),
+        None,
+    )
+    assert big is not None, "no registered dataset above the cap — retarget this test"
+
+    monkeypatch.setenv(m._THREAD_COUNTS_ENV, "1,4")
+    # If the guard were removed, these would be reached and would do real work;
+    # blowing up here is a much clearer failure than a 140 GB allocation.
+    monkeypatch.setattr(
+        m, "_run_with_thread_scaling",
+        lambda *a, **k: pytest.fail("sweep ran above the materialize cap"),
+    )
+    if hasattr(m, "_run_arm_subprocess"):
+        monkeypatch.setattr(
+            m, "_run_arm_subprocess",
+            lambda *a, **k: pytest.fail("a benchmark arm ran above the cap"),
+        )
+
+    fmt = FormatVariant("SCX (auto)", "scx_auto", "primary", "scx_runner", {})
+    with pytest.raises(ValueError, match=r"thread-scaling|THREAD_COUNTS"):
+        m.run(dataset=big, format_variant=fmt, n_runs=1)

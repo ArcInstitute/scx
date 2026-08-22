@@ -253,10 +253,10 @@ a framed output. Both derive it from `scx_ops::framing_for_csc_rebuild`, which
 is the only correct source — see the note on `rebuild_csc_inplace` for why both
 `None` and a `decode_target`-carrying `FramingConfig` are wrong here.
 
-> **`build-csc` and `optimize` keep the predicate index *and* its Level-1
-> pruning.** Both copy `obs_predicate_index` / `var_predicate_index`
+> **`build-csc`, `optimize` and `upgrade` keep the predicate index *and* its
+> Level-1 pruning.** All three copy `obs_predicate_index` / `var_predicate_index`
 > byte-for-byte, and the copy stays *valid* — shard boundaries and row ranges are
-> unchanged. Both also re-encode every CSR shard, and `compute_shard_stats` emits
+> unchanged. All three also re-encode every CSR shard, and `compute_shard_stats` emits
 > no per-shard `column_stats`, so each additionally **carries the input's** stats
 > onto the output's shards, matched by `row_start`
 > (`scx_format_io::carry_csr_shard_column_stats`). All three re-emit one output
@@ -276,7 +276,10 @@ is the only correct source — see the note on `rebuild_csc_inplace` for why bot
 > stopped, and the query returned the *right* rows after a full scan — which is
 > why it went unnoticed. Measured on a 200-cell / 8-shard file indexed on a
 > clustered `cell_type`: `Level 1 eliminated 6/8` before `build-csc`, `0/8`
-> after. `optimize` had the identical defect for the identical reason.
+> after. `optimize` and `upgrade` had the identical defect for the identical
+> reason — `upgrade` reaches `build-csc`'s carry policy through
+> `other => build_csc(other)` in `scx-ops/src/carry.rs`, which is why the first
+> pass at this fix counted two ops and missed the third.
 >
 > Pinned by
 > `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`

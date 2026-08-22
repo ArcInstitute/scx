@@ -373,8 +373,10 @@ mod tests {
     /// with the other two ops covered and `upgrade` not.
     ///
     /// Both directions, because either alone is passable by broken code: stats
-    /// present on the input must survive, and an input with an index but no stats
-    /// must not have any invented for it.
+    /// present on the input must survive, and an input whose index section is
+    /// present with its stats absent must not have any invented for it. The
+    /// second arm builds that shape explicitly — an input with *neither* would
+    /// pass against code that invents stats only when an index exists.
     #[test]
     fn upgrade_carries_obs_column_stats() {
         use scx_format_io::section::SectionType;
@@ -438,14 +440,103 @@ mod tests {
             "the index section itself must still be there"
         );
 
-        // The other direction: no stats in, none invented.
+        // The other direction, and it has to be the *dangerous* shape: an index
+        // section PRESENT with the stats absent. An input with neither (which is
+        // what `write_test_file` gives) would pass even against code that invents
+        // stats conditionally on an index existing — the exact reintroduction this
+        // arm is here to catch. Round 3 caught the rustdoc claiming this arm
+        // before it did it (codex - gpt-5.6-sol, Cursor Agent - Grok 4.6 High).
+        //
+        // Multiple shards, so a mis-attribution would have somewhere wrong to go.
+        let bare_src = dir.path().join("indexed_no_stats.scx");
+        {
+            use scx_format_io::writer::ScxWriter;
+            let src = ScxReader::open(&input).unwrap();
+            let obs = src.read_obs().unwrap();
+            let var = src.read_var().unwrap();
+            let (indptr, indices, values) = src
+                .read_shard_from_entry(
+                    src.catalog()
+                        .entries
+                        .iter()
+                        .find(|e| e.section_type == SectionType::CsrShard)
+                        .unwrap(),
+                )
+                .unwrap();
+            let mut header = src.header().clone();
+            drop(src);
+            header.shard_target_rows = 4;
+
+            let mut w = ScxWriter::new(&bare_src, header).unwrap();
+            w.write_obs(&obs).unwrap();
+            w.write_var(&var).unwrap();
+            // Three shards of four rows over the same 12 rows.
+            let mut ranges: Vec<(u64, u64)> = Vec::new();
+            for shard in 0..3u64 {
+                let lo = (shard * 4) as usize;
+                let ip: Vec<u64> = (lo..=lo + 4)
+                    .map(|r| indptr[r] as u64 - indptr[lo] as u64)
+                    .collect();
+                let nnz_lo = indptr[lo] as usize;
+                let nnz_hi = indptr[lo + 4] as usize;
+                let idx: Vec<u32> = indices[nnz_lo..nnz_hi].iter().map(|&v| v as u32).collect();
+                let vals = ValueEncoding::Uint8
+                    .encode_f32_batch(&values[nnz_lo..nnz_hi])
+                    .unwrap();
+                w.write_csr_shard(
+                    &ip,
+                    &idx,
+                    &vals,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    shard * 4,
+                )
+                .unwrap();
+                ranges.push((shard * 4, shard * 4 + 4));
+            }
+            let opts = scx_engine::PredicateIndexBuildOptions {
+                forced_columns: vec!["cell_type".to_string()],
+                preset_columns: Vec::new(),
+                auto_threshold: 0,
+                high_cardinality_threshold: scx_engine::HIGH_CARDINALITY_THRESHOLD,
+            };
+            let mut outcomes = Vec::new();
+            let mut named = Vec::new();
+            let bytes = scx_engine::build_obs_predicate_index_bytes(
+                &obs,
+                &ranges,
+                &opts,
+                &mut outcomes,
+                &mut named,
+            )
+            .unwrap()
+            .expect("cell_type must be indexable");
+            w.write_obs_predicate_index(&bytes).unwrap();
+            // Deliberately NOT `apply_obs_shard_column_stats` — this is the shape
+            // `modify_metadata` leaves when its index is obs-keyed.
+            w.finish().unwrap();
+        }
+        assert!(
+            column_stats(&bare_src).iter().all(|n| *n == 0),
+            "setup: the fixture must have no per-shard stats"
+        );
+        assert!(
+            ScxReader::open(&bare_src)
+                .unwrap()
+                .read_obs_predicate_index_bytes()
+                .unwrap()
+                .is_some(),
+            "setup: the index section must be PRESENT, or this arm proves nothing"
+        );
+
         let bare = dir.path().join("bare.scx");
-        let reader = ScxReader::open(&input).unwrap();
+        let reader = ScxReader::open(&bare_src).unwrap();
         rewrite_with_current_version(&reader, &bare).unwrap();
         drop(reader);
         assert!(
             column_stats(&bare).iter().all(|n| *n == 0),
-            "an input with no per-shard stats must not gain any"
+            "an index whose keying cannot be verified must not have stats invented \
+             for it — fabricated bounds prune shards holding real matches"
         );
     }
 
