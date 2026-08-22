@@ -302,11 +302,11 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
 
     calls = []
 
-    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None):
-        calls.append(scenario)
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None, reader_threads=None):
+        calls.append((scenario, reader_threads))
         return [{
             "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
-            "peak_rss_mb": 123.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
             "structural": {"n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1},
             "output_bytes": 10,
         }]
@@ -326,17 +326,38 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     finally:
         cs._run_arm_subprocess = original
 
-    # One process per arm — the whole point of the isolation.
-    assert calls == ["streaming", "materialize"], calls
+    # One process per arm, and the GATED arm must be the pinned one — a floor
+    # measured at the runner's core count is a property of the runner.
+    assert calls == [
+        ("streaming", cs.GATED_READER_THREADS),
+        ("streaming", None),
+        ("materialize", None),
+    ], calls
 
-    streaming = [r for r in result.runs if r.extra.get("scenario") == "streaming"]
-    assert streaming, "no streaming run recorded"
-    for r in streaming:
+    gated = [r for r in result.runs if r.extra.get("scenario") == "streaming"]
+    assert gated, "no gated streaming run recorded"
+    for r in gated:
         assert "streaming_peak_rss_mb" in r.extra, (
             f"the floored metric is not a top-level key in extra: {sorted(r.extra)}"
         )
         assert "extra" not in r.extra, "extra is nested one level too deep"
+        assert r.extra["reader_threads"] == cs.GATED_READER_THREADS
+
+    # The unpinned arm is recorded under its own key so it cannot be confused
+    # with the gated one by `_load_current_raw_metric`.
+    unpinned = [
+        r for r in result.runs
+        if r.extra.get("scenario") == "streaming_default_threads"
+    ]
+    assert unpinned and all(
+        "streaming_default_threads_peak_rss_mb" in r.extra for r in unpinned
+    )
+    assert all("streaming_peak_rss_mb" not in r.extra for r in unpinned), (
+        "the unpinned arm must not emit the gated metric key, or the floor's "
+        "median would mix pinned and unpinned measurements"
+    )
     assert result.metadata["structural"]["equal"] is True
+    assert result.metadata["gated_reader_threads"] == cs.GATED_READER_THREADS
 
 
 def test_both_streaming_modules_use_the_true_peak_sampler():

@@ -80,6 +80,23 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
 # capture. The skip is recorded in `metadata`, never silent.
 MATERIALIZE_MAX_N_OBS: int = 1_000_000
 
+# Reader threads for the **gated** streaming arm.
+#
+# The `streaming_peak_rss_mb` floor has to be machine-independent, and the
+# parallel reader's bound is `shards_in_flight x per_shard_working_set` — so with
+# `reader_threads` left to `available_parallelism()` the floor's value is a
+# property of the runner, not of the code. Measured on census_1m
+# (1402 nnz/cell => 351 MB per 16384-row shard): 5.67-5.84 GB true peak at 16
+# threads, matching 16 x 351 MB to within 6%. The same build would pass on a
+# 4-core runner and fail on a 64-core one.
+#
+# Pinning the gated arm makes the floor test the actual contract — "bounded by N
+# shards, independent of file size" — deterministically. The default-parallelism
+# number is still measured and recorded under
+# `streaming_default_threads_peak_rss_mb`, just not gated; that is how this suite
+# already treats wall clock.
+GATED_READER_THREADS: int = 4
+
 
 def _skip_materialize_reason(n_obs: int) -> str | None:
     """Why the materialize arm is not run at this scale, or `None` to run it."""
@@ -114,7 +131,11 @@ def _structural_summary(scx_path: Path) -> dict[str, int]:
     }
 
 
-def _timed_streaming(h5ad_path: Path, out_path: Path) -> dict[str, float]:
+def _timed_streaming(
+    h5ad_path: Path,
+    out_path: Path,
+    reader_threads: int | None = None,
+) -> dict[str, float]:
     """Run `pyscx.from_h5ad` and capture wall + the true in-region peak RSS.
 
     Uses :class:`PeakRssSampler`, like the six sibling modules that already do
@@ -142,9 +163,10 @@ def _timed_streaming(h5ad_path: Path, out_path: Path) -> dict[str, float]:
     """
     import pyscx
 
+    kwargs = {} if reader_threads is None else {"reader_threads": reader_threads}
     t0 = time.perf_counter()
     with PeakRssSampler() as sampler:
-        pyscx.from_h5ad(str(h5ad_path), str(out_path))
+        pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
     wall = time.perf_counter() - t0
     return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
 
@@ -186,6 +208,8 @@ _WORKER_SCRIPT = textwrap.dedent("""\
     h5ad_path = sys.argv[1]
     n_runs = int(sys.argv[2])
     scenario = sys.argv[3]          # "streaming" | "materialize"
+    rt = sys.argv[4]                # reader_threads, or "" to inherit
+    reader_threads = int(rt) if rt else None
 
     from benchmarks.comprehensive.benchmarks.conversion_streaming import (
         _timed_streaming,
@@ -193,7 +217,6 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         _structural_summary,
     )
 
-    timed = _timed_streaming if scenario == "streaming" else _timed_materialize
     prefix = "scx_bench_stream_" if scenario == "streaming" else "scx_bench_bulk_"
     fname = "stream.scx" if scenario == "streaming" else "bulk.scx"
 
@@ -202,10 +225,16 @@ _WORKER_SCRIPT = textwrap.dedent("""\
     for run_idx in range(n_runs):
         with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
             out = Path(tmp) / fname
-            t = timed(Path(h5ad_path), out)
+            if scenario == "streaming":
+                t = _timed_streaming(Path(h5ad_path), out, reader_threads)
+            else:
+                # `from_anndata` has no reader-threads knob; the arm is a
+                # whole-file materialization either way.
+                t = _timed_materialize(Path(h5ad_path), out)
             rec = {
                 "scenario": scenario,
                 "run_idx": run_idx,
+                "reader_threads": reader_threads,
                 "wall_s": t["wall_s"],
                 "peak_rss_mb": t["peak_rss_mb"],
             }
@@ -224,6 +253,7 @@ def _run_arm_subprocess(
     n_runs: int,
     scenario: str,
     thread_count: int | None = None,
+    reader_threads: int | None = None,
 ) -> list[dict]:
     """Run ``n_runs`` of **one** arm in a fresh subprocess.
 
@@ -246,7 +276,11 @@ def _run_arm_subprocess(
             env[var] = str(thread_count)
 
     proc = subprocess.run(
-        [sys.executable, "-c", _WORKER_SCRIPT, str(h5ad_path), str(n_runs), scenario],
+        [
+            sys.executable, "-c", _WORKER_SCRIPT,
+            str(h5ad_path), str(n_runs), scenario,
+            "" if reader_threads is None else str(reader_threads),
+        ],
         capture_output=True,
         text=True,
         env=env,
@@ -408,55 +442,71 @@ def _run_isolated(
     result: BenchmarkResult,
     skip_materialize: str | None = None,
 ) -> BenchmarkResult:
-    """Default path: each arm in its own subprocess at the inherited thread count.
+    """Default path: three arms, each in its own subprocess.
 
-    Replaces the previous in-process paired loop, which kept the wall budget low
-    by skipping subprocess overhead and paid for it with a measurement that could
-    not distinguish this benchmark's own allocations from the previous run's —
-    see :func:`_run_arm_subprocess`. Two subprocesses per invocation is a few
-    seconds against a multi-minute conversion.
+    * ``streaming`` at :data:`GATED_READER_THREADS` — carries
+      ``streaming_peak_rss_mb``, the key ``thresholds.yaml`` floors. Pinned so
+      the floor is a property of the code and not of the runner's core count.
+    * ``streaming_default_threads`` at the inherited parallelism — carries
+      ``streaming_default_threads_peak_rss_mb``, **recorded, not gated**, so the
+      real-world number stays visible without making the gate machine-dependent.
+    * ``materialize`` — the comparison baseline. No reader-threads knob applies.
+
+    One arm per process is load-bearing, not tidiness: the materialize arm
+    allocates tens of GB, glibc does not return it, and
+    ``PeakRssSampler.__enter__`` seeds itself with the entry RSS — so a shared
+    process makes one arm's peak include another's garbage. Measured: interleaved
+    in one process, the streaming figure climbed 1722 -> 2983 -> 3472 MB across
+    three identical runs.
     """
-    records = _run_arm_subprocess(h5ad_path, n_runs, "streaming")
+    arms: list[tuple[str, int | None]] = [("streaming", GATED_READER_THREADS)]
+    arms.append(("streaming_default_threads", None))
     if not skip_materialize:
-        records += _run_arm_subprocess(h5ad_path, n_runs, "materialize")
+        arms.append(("materialize", None))
 
-    structural: dict[str, dict | None] = {"streaming": None, "materialize": None}
-    for rec in records:
-        scenario = rec["scenario"]
-        if rec.get("structural") is not None and structural[scenario] is None:
-            structural[scenario] = rec["structural"]
-            if rec.get("output_bytes") is not None:
-                result.metadata[f"{scenario}_output_bytes"] = rec["output_bytes"]
-        result.add_run(
-            wall_s=rec["wall_s"],
-            peak_rss_mb=rec["peak_rss_mb"],
-            **{
-                "scenario": scenario,
-                "run_idx": rec["run_idx"],
-                f"{scenario}_peak_rss_mb": rec["peak_rss_mb"],
-                f"{scenario}_wall_s": rec["wall_s"],
-            },
+    structural: dict[str, dict | None] = {}
+    for label, reader_threads in arms:
+        scenario = "materialize" if label == "materialize" else "streaming"
+        records = _run_arm_subprocess(
+            h5ad_path, n_runs, scenario, reader_threads=reader_threads,
         )
-        result.metadata["scenarios"].append(scenario)
-        log.info(
-            "  %s run %d: wall=%.2fs peak_rss=%.1f MB",
-            scenario, rec["run_idx"], rec["wall_s"], rec["peak_rss_mb"],
-        )
+        for rec in records:
+            if rec.get("structural") is not None and label not in structural:
+                structural[label] = rec["structural"]
+                if rec.get("output_bytes") is not None:
+                    result.metadata[f"{label}_output_bytes"] = rec["output_bytes"]
+            result.add_run(
+                wall_s=rec["wall_s"],
+                peak_rss_mb=rec["peak_rss_mb"],
+                **{
+                    "scenario": label,
+                    "run_idx": rec["run_idx"],
+                    "reader_threads": reader_threads,
+                    f"{label}_peak_rss_mb": rec["peak_rss_mb"],
+                    f"{label}_wall_s": rec["wall_s"],
+                },
+            )
+            result.metadata["scenarios"].append(label)
+            log.info(
+                "  %s (reader_threads=%s) run %d: wall=%.2fs peak_rss=%.1f MB",
+                label, reader_threads, rec["run_idx"],
+                rec["wall_s"], rec["peak_rss_mb"],
+            )
 
+    result.metadata["gated_reader_threads"] = GATED_READER_THREADS
     result.metadata["structural"] = {
-        "streaming": structural["streaming"],
-        "materialize": structural["materialize"],
-        # `None`, not `False`, when the materialize arm did not run: there is
-        # nothing to compare, which is not the same claim as "they differ".
+        **structural,
+        # `None`, not `False`, when an arm did not run: nothing to compare is not
+        # the same claim as "they differ".
         "equal": (
             None if skip_materialize
-            else structural["streaming"] == structural["materialize"]
+            else structural.get("streaming") == structural.get("materialize")
         ),
     }
-    if not skip_materialize and structural["streaming"] != structural["materialize"]:
+    if not skip_materialize and structural.get("streaming") != structural.get("materialize"):
         log.warning(
             "Structural mismatch streaming=%s materialize=%s",
-            structural["streaming"], structural["materialize"],
+            structural.get("streaming"), structural.get("materialize"),
         )
     return result
 
