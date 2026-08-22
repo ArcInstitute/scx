@@ -102,6 +102,16 @@ _NO_CONVERSION = {
     # and writes its own shuffled copies in-process; it never needs a Phase-A
     # h5ad conversion.
     "shuffle_layout",
+    # conversion_streaming IS the conversion: both its arms read
+    # `dataset.h5ad_path` and write their own SCX output to a temp dir, and it
+    # ignores `converted_path` entirely.
+    #
+    # Its inverse, `export_streaming`, is deliberately NOT here — it consumes a
+    # pre-converted SCX file, and its own fallback (`dataset.scx_path`, i.e.
+    # `<name>.scx`) does not exist on disk for the census fixtures, which are
+    # built as `<name>_auto.scx`. Without Phase A it would re-ingest the source
+    # h5ad inline on every run.
+    "conversion_streaming",
 }
 
 # Benchmarks that operate on multimodal h5mu sources. They expect

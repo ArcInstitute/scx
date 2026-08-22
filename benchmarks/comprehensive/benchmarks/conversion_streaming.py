@@ -61,6 +61,37 @@ _THREAD_ENV_VARS = (
 
 _THREAD_COUNTS_ENV = "SCX_CONV_STREAM_THREAD_COUNTS"
 
+# Only the canonical SCX variant runs: the metric is path-shape, not
+# format-shape, and both paths emit the same format under the same auto-codec.
+# Declared as a module constant (not only as the inline `run()` guard below) so
+# `run_parallel._bench_format_compatible` filters at cohort-build time. Without
+# it the orchestrator schedules one job per format in the tier, each of which
+# returns `None` — the phantom `missing_result` entries that function exists to
+# prevent. Same pattern as `obs_open.py` / `cellset_gather.py`.
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+
+# Above this many cells the `materialize` arm is skipped and only `streaming`
+# runs. The materialize arm loads the whole h5ad: measured 13.6 GB peak RSS on
+# census_1m (98.2 s / 851 MB for streaming — see docs/performance.md
+# "Streaming conversion"), which extrapolates to ~68 GB at census_5m and ~136 GB
+# at census_10m. It is a comparison baseline, not the thing under contract — the
+# `streaming_peak_rss_mb` floor gates the streaming arm — so it is bounded here
+# rather than being sized for by `estimate_memory_gb` on every future full-tier
+# capture. The skip is recorded in `metadata`, never silent.
+MATERIALIZE_MAX_N_OBS: int = 1_000_000
+
+
+def _skip_materialize_reason(n_obs: int) -> str | None:
+    """Why the materialize arm is not run at this scale, or `None` to run it."""
+    if n_obs > MATERIALIZE_MAX_N_OBS:
+        return (
+            f"materialize loads the whole h5ad (~14 GB at 1M cells, scaling "
+            f"linearly); skipped above n_obs={MATERIALIZE_MAX_N_OBS:,} so a "
+            f"full-tier capture does not pay it. The streaming arm — the one "
+            f"the thresholds.yaml floor gates — still runs."
+        )
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -325,8 +356,25 @@ def run(
         },
     )
 
+    skip_materialize = _skip_materialize_reason(dataset.n_obs)
+    result.metadata["materialize_skipped_reason"] = skip_materialize
+    if skip_materialize:
+        log.info("materialize arm skipped: %s", skip_materialize)
+
     if thread_counts is None:
-        return _run_in_process(h5ad_path, n_runs, result)
+        return _run_in_process(h5ad_path, n_runs, result, skip_materialize)
+    if skip_materialize:
+        # Thread scaling exists to compare how the two arms scale, so dropping
+        # one silently would make its output meaningless — and running a ~136 GB
+        # arm the operator did not know they asked for is worse. Refuse and say
+        # which knob to change.
+        raise ValueError(
+            f"{_THREAD_COUNTS_ENV} is set on a dataset with n_obs="
+            f"{dataset.n_obs:,}, where the materialize arm is skipped "
+            f"({skip_materialize}). A thread-scaling run compares the two arms, "
+            f"so it needs both: either use a dataset at or below "
+            f"n_obs={MATERIALIZE_MAX_N_OBS:,}, or unset {_THREAD_COUNTS_ENV}."
+        )
     return _run_with_thread_scaling(h5ad_path, n_runs, thread_counts, result)
 
 
@@ -334,6 +382,7 @@ def _run_in_process(
     h5ad_path: Path,
     n_runs: int,
     result: BenchmarkResult,
+    skip_materialize: str | None = None,
 ) -> BenchmarkResult:
     """Legacy path: run paired streaming + materialize in-process at
     the inherited thread count. Used when
@@ -374,6 +423,9 @@ def _run_in_process(
                 timings["peak_rss_mb"],
             )
 
+        if skip_materialize:
+            continue
+
         with tempfile.TemporaryDirectory(prefix="scx_bench_bulk_") as tmp:
             bulk_out = Path(tmp) / "bulk.scx"
             timings = _timed_materialize(h5ad_path, bulk_out)
@@ -401,9 +453,11 @@ def _run_in_process(
     result.metadata["structural"] = {
         "streaming": structural_stream,
         "materialize": structural_bulk,
-        "equal": structural_stream == structural_bulk,
+        # `None` rather than `False` when the materialize arm did not run: there
+        # is nothing to compare, which is not the same claim as "they differ".
+        "equal": None if skip_materialize else structural_stream == structural_bulk,
     }
-    if structural_stream != structural_bulk:
+    if not skip_materialize and structural_stream != structural_bulk:
         log.warning(
             "Structural mismatch streaming=%s materialize=%s",
             structural_stream,

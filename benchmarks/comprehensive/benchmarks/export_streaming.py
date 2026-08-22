@@ -72,6 +72,24 @@ _MULTIMODAL_SCX_KEYS = (
     "scx_multimodal_uniform_auto",
 )
 
+# Declared as a module constant (not only as the inline `run()` guard below) so
+# `run_parallel._bench_format_compatible` filters at cohort-build time; without
+# it the orchestrator schedules one job per format in the tier, each returning
+# `None`, which is the phantom `missing_result` case that function exists to
+# prevent.
+#
+# **Only the single-modality key is listed, and the multimodal arm below is
+# therefore not reachable through `run_parallel` today.** That is an orchestrator
+# constraint, not an oversight: `_bench_format_compatible` requires
+# `bench_is_multimodal == fmt_is_multimodal`, where `bench_is_multimodal` is
+# membership in `_MULTIMODAL_BENCHMARKS` — so adding this benchmark to that set
+# to reach `_MULTIMODAL_SCX_KEYS` would make its single-modality arm unreachable
+# instead. The h5mu arm stays exercised out-of-band via
+# `scripts/run_slurm_export_streaming.sh` and by the Rust round-trip tests named
+# in this module's docstring. Named here rather than left silently
+# unschedulable.
+SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
