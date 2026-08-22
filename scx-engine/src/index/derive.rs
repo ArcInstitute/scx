@@ -122,6 +122,45 @@ pub fn derive_shard_column_stats(
     per_shard
 }
 
+impl PredicateIndex {
+    /// The number of shard slots this index was built against, i.e. the largest
+    /// `shard_id` it records plus one. `None` for an index that records no shard
+    /// range at all (no indexed column, or every column empty).
+    ///
+    /// Exists so a caller re-deriving stats from an index it did not build can
+    /// check the shard space *before* calling
+    /// [`derive_shard_column_stats`], which trips a `debug_assert!` on an
+    /// out-of-range id and otherwise drops it. An index built over **obs-shard**
+    /// ranges rather than CSR-shard ranges — `modify_metadata`'s documented
+    /// fallback when the CSR shards do not tile `[0, n_obs)` — is exactly the
+    /// case that would land there.
+    pub fn n_shard_slots(&self) -> Option<usize> {
+        let mut max_id: Option<u32> = None;
+        let mut bump = |id: u32| {
+            max_id = Some(max_id.map_or(id, |m: u32| m.max(id)));
+        };
+        for column in &self.columns {
+            match column {
+                IndexedColumn::Categorical(cat) => {
+                    for entry in &cat.entries {
+                        for range in &entry.shard_ranges {
+                            bump(range.shard_id);
+                        }
+                    }
+                }
+                IndexedColumn::Numeric(num) => {
+                    for page in &num.leaf_pages {
+                        for entry in &page.entries {
+                            bump(entry.shard_id);
+                        }
+                    }
+                }
+            }
+        }
+        max_id.map(|m| m as usize + 1)
+    }
+}
+
 /// Parse a serialized obs predicate index and attach the per-shard column stats
 /// it implies to the writer's CSR shard catalog entries (one bulk pass).
 ///
@@ -137,4 +176,66 @@ pub fn apply_obs_shard_column_stats(
     let per_shard = derive_shard_column_stats(&index, n_shards);
     writer.set_csr_shard_column_stats_bulk(per_shard)?;
     Ok(())
+}
+
+/// What [`reapply_carried_obs_shard_column_stats`] did.
+///
+/// Not a `bool`: the two non-applied arms are different situations and only one
+/// of them is worth telling the user about. `scx-engine` has no warning channel
+/// of its own (and no `log` dependency), so routing is the caller's — the same
+/// division `scx_ops::predicate_index`'s module doc states for build outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarriedStatsOutcome {
+    /// Stats were derived and attached to the writer's CSR shard entries.
+    Applied,
+    /// The index records no shard range at all, so it implies no stats. Nothing
+    /// was lost and there is nothing to report.
+    NothingToApply,
+    /// The index's shard space disagrees with the output's CSR shard count, so
+    /// deriving would mis-place "value present" bits. The caller should warn:
+    /// Level-1 pruning stays off on this output until the index is rebuilt.
+    ShardSpaceMismatch {
+        /// Shard slots the index spans.
+        index_slots: usize,
+        /// Modality-0 CSR shards in the output.
+        output_shards: usize,
+    },
+}
+
+/// Re-derive the per-shard column stats for an obs predicate index the caller is
+/// **carrying through verbatim** rather than rebuilding, and attach them to the
+/// writer's CSR shard entries.
+///
+/// **Why this exists.** `Carry::Verbatim` on `ObsPredicateIndex` is satisfied by
+/// copying the section bytes, and both ops that declare it — `build-csc` and
+/// `optimize` — re-encode every CSR shard on the way out. `compute_shard_stats`
+/// does not produce `column_stats`, so the index section survived while the
+/// Level-1 statistics its pruning reads were dropped: the query returned the
+/// right rows, after a full scan. Byte-carrying an index is only half of
+/// carrying it.
+///
+/// Unlike [`apply_obs_shard_column_stats`], this checks the shard space first.
+/// The caller here did not build the index and so cannot know that its
+/// `shard_id`s are CSR-shard ids — an index built over **obs-shard** ranges
+/// (`modify_metadata`'s documented fallback) would trip
+/// [`derive_shard_column_stats`]'s `debug_assert!` and silently drop bits in
+/// release.
+pub fn reapply_carried_obs_shard_column_stats(
+    writer: &mut scx_format_io::ScxWriter,
+    obs_index_bytes: &[u8],
+    n_shards: usize,
+) -> Result<CarriedStatsOutcome> {
+    let index = PredicateIndex::read_from(&mut std::io::Cursor::new(obs_index_bytes))?;
+    match index.n_shard_slots() {
+        None => Ok(CarriedStatsOutcome::NothingToApply),
+        Some(slots) if slots != n_shards => Ok(CarriedStatsOutcome::ShardSpaceMismatch {
+            index_slots: slots,
+            output_shards: n_shards,
+        }),
+        Some(_) => {
+            let per_shard = derive_shard_column_stats(&index, n_shards);
+            writer.set_csr_shard_column_stats_bulk(per_shard)?;
+            Ok(CarriedStatsOutcome::Applied)
+        }
+    }
 }

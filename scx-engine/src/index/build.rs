@@ -540,6 +540,81 @@ pub struct ConversionPredicateIndexOptions {
     pub index_auto_threshold: usize,
 }
 
+/// Hard cap above which a *named* (forced or preset) column is rejected as
+/// unsupported. **The one derivation site**: every builder in the workspace
+/// reaches this constant through [`resolve_predicate_index_build_options`] or
+/// through the `scx-ops` pass built on it. It used to be a `100_000` literal
+/// spelled out at seven call sites — `streaming_impl` here plus six in
+/// `scx-ops` — and a CI guard now rejects a new one (ORG-6.14-2).
+///
+/// The cap exists to keep a forced/preset column from blowing up the index;
+/// auto-detection uses `ConversionPredicateIndexOptions::index_auto_threshold`
+/// (default 1000) instead.
+pub const HIGH_CARDINALITY_THRESHOLD: usize = 100_000;
+
+/// The obs and var halves of a resolved predicate-index request.
+///
+/// Produced once by [`resolve_predicate_index_build_options`] so the preset
+/// lookup, the forced-column list, the auto threshold and
+/// [`HIGH_CARDINALITY_THRESHOLD`] cannot be spelled differently on the two
+/// axes or by two callers.
+#[derive(Debug, Clone)]
+pub struct ResolvedIndexBuildOptions {
+    /// Options for the obs axis.
+    pub obs: PredicateIndexBuildOptions,
+    /// Options for the var axis.
+    pub var: PredicateIndexBuildOptions,
+}
+
+/// Resolve a [`ConversionPredicateIndexOptions`] into the per-axis
+/// [`PredicateIndexBuildOptions`] the builders take.
+///
+/// **Errors on an unknown `index_preset`**, and does so before the caller has
+/// touched any writer state — which is the whole reason this is a separate,
+/// fallible step rather than something each builder does inline. Six `scx-ops`
+/// call sites used to resolve the preset with
+/// `index_preset_columns(name).map(…).unwrap_or_default()`, so
+/// `scx merge --index-preset typo` built no preset columns and exited 0 while
+/// `scx convert --index-preset typo` failed. They now share this function and
+/// fail the same way.
+pub fn resolve_predicate_index_build_options(
+    options: &ConversionPredicateIndexOptions,
+) -> Result<ResolvedIndexBuildOptions> {
+    let (preset_obs, preset_var) = match options.index_preset.as_deref() {
+        Some(name) => {
+            let preset = index_preset_columns(name)
+                .ok_or_else(|| EngineError::UnknownIndexPreset(name.to_string()))?;
+            (
+                preset
+                    .obs_columns
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+                preset
+                    .var_columns
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(ResolvedIndexBuildOptions {
+        obs: PredicateIndexBuildOptions {
+            forced_columns: options.index_obs.clone(),
+            preset_columns: preset_obs,
+            auto_threshold: options.index_auto_threshold,
+            high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
+        },
+        var: PredicateIndexBuildOptions {
+            forced_columns: options.index_var.clone(),
+            preset_columns: preset_var,
+            auto_threshold: options.index_auto_threshold,
+            high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
+        },
+    })
+}
+
 /// Result of [`build_and_write_conversion_predicate_indexes`]. Callers
 /// walk the outcomes to demote preset skips to typed warnings and to
 /// short-circuit on forced errors; `indexed_columns` is useful for
@@ -632,40 +707,14 @@ fn streaming_impl(
     n_vars: usize,
     options: &ConversionPredicateIndexOptions,
 ) -> Result<ConversionPredicateIndexResult> {
-    const HIGH_CARDINALITY_THRESHOLD: usize = 100_000;
-
     // Resolve preset up front so an unknown name fails before any
     // writer state changes.
-    let (preset_obs, preset_var) = match options.index_preset.as_deref() {
-        Some(name) => {
-            let preset = index_preset_columns(name)
-                .ok_or_else(|| EngineError::UnknownIndexPreset(name.to_string()))?;
-            (
-                preset
-                    .obs_columns
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect::<Vec<_>>(),
-                preset
-                    .var_columns
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect::<Vec<_>>(),
-            )
-        }
-        None => (Vec::new(), Vec::new()),
-    };
+    let resolved = resolve_predicate_index_build_options(options)?;
 
     let mut result = ConversionPredicateIndexResult::default();
 
     // obs — stream shards through the builder.
-    let obs_build_opts = PredicateIndexBuildOptions {
-        forced_columns: options.index_obs.clone(),
-        preset_columns: preset_obs,
-        auto_threshold: options.index_auto_threshold,
-        high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
-    };
-    let mut builder = ObsPredicateIndexBuilder::new(obs_schema, &obs_build_opts)?;
+    let mut builder = ObsPredicateIndexBuilder::new(obs_schema, &resolved.obs)?;
     for shard in obs_shards {
         let (batch, row_offset) = shard?;
         builder.push_shard_split(&batch, row_offset, obs_row_ranges)?;
@@ -687,16 +736,10 @@ fn streaming_impl(
     // var (single shard) — gene metadata is small enough that the
     // batch-mode builder stays fine.
     let var_row_ranges: [(u64, u64); 1] = [(0, n_vars as u64)];
-    let var_build_opts = PredicateIndexBuildOptions {
-        forced_columns: options.index_var.clone(),
-        preset_columns: preset_var,
-        auto_threshold: options.index_auto_threshold,
-        high_cardinality_threshold: HIGH_CARDINALITY_THRESHOLD,
-    };
     let var_bytes = build_var_predicate_index_bytes(
         var,
         &var_row_ranges,
-        &var_build_opts,
+        &resolved.var,
         &mut result.var_outcomes,
         &mut result.var_indexed_columns,
     )?;

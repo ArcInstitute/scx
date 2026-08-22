@@ -24,7 +24,8 @@ use crate::error::{OpsError, Result};
 use crate::flock::FileLock;
 use crate::in_place::{commit_in_place, prepare_in_place, InPlacePrep};
 use crate::predicate_index::{
-    user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+    user_wants_index, validate_forced_columns, ObsVarIndexPass, PredicateIndexBuildSummary,
+    StatsSink,
 };
 use crate::rewrite_helpers::{build_raw_copied_csr_section, raw_copy_csr_eligible};
 
@@ -121,6 +122,13 @@ pub fn append_with_index_options(
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<PredicateIndexBuildSummary> {
     let (mut lock, prep) = prepare_append(target_path, options.modality_id)?;
+
+    // Resolve the index request here, immediately after the lock and before any
+    // append writes: `append` writes into the *existing* file, so an unknown
+    // `--index-preset` has to be refused while the target is still untouched.
+    // Placed after `prepare_append` so a missing / multimodal / locked target
+    // still reports that first, which is the more useful diagnosis.
+    let index_pass = ObsVarIndexPass::resolve(index_options)?;
 
     if new_indptr.is_empty() {
         return Ok(PredicateIndexBuildSummary::skipped());
@@ -239,7 +247,7 @@ pub fn append_with_index_options(
         total_new_nnz,
         n_new_rows as u64,
         write_offset,
-        index_options,
+        &index_pass,
     )
 }
 
@@ -296,6 +304,10 @@ pub fn append_from_reader_with_index_options(
     index_options: &ConversionPredicateIndexOptions,
 ) -> Result<PredicateIndexBuildSummary> {
     let (mut lock, mut prep) = prepare_append(target_path, options.modality_id)?;
+
+    // As in `append_with_index_options`: resolve the index request before any
+    // append write, so an unknown `--index-preset` leaves the target untouched.
+    let index_pass = ObsVarIndexPass::resolve(index_options)?;
 
     // Appended source shards are raw-copied or decoded+re-encoded without
     // re-canonicalization, so a pre-v3 source could inject non-canonical shards
@@ -553,7 +565,7 @@ pub fn append_from_reader_with_index_options(
         total_new_nnz,
         cumulative_row_offset,
         write_offset,
-        index_options,
+        &index_pass,
     )
 }
 
@@ -1014,7 +1026,7 @@ fn finalize_append(
     total_new_nnz: u64,
     n_new_rows: u64,
     mut write_offset: u64,
-    index_options: &ConversionPredicateIndexOptions,
+    index_pass: &ObsVarIndexPass,
 ) -> Result<PredicateIndexBuildSummary> {
     // Phase 2d + post-review bug 2 fix.
     //
@@ -1050,7 +1062,7 @@ fn finalize_append(
     // `PredicateIndexBuildSummary` because `merge` and `compact` do populate it
     // (`scx-cli/src/index_warnings.rs` renders it).
     let multimodal_skip = None;
-    let rebuild_index = user_wants_index(index_options);
+    let rebuild_index = user_wants_index(index_pass.request());
 
     let new_n_obs = prep.old_n_obs + n_new_rows;
     let shard_target_rows = prep.header.shard_target_rows.max(1) as usize;
@@ -1096,7 +1108,11 @@ fn finalize_append(
     // pre-append (header still points to old catalog).
     let var_for_index = if rebuild_index {
         let var = read_existing_axis(lock, &prep.old_catalog, MetadataAxis::Var)?;
-        validate_forced_columns(index_options, &schema_for_validate.schema(), &var.schema())?;
+        validate_forced_columns(
+            index_pass.request(),
+            &schema_for_validate.schema(),
+            &var.schema(),
+        )?;
         lock.seek(SeekFrom::Start(write_offset))?;
         Some(var)
     } else {
@@ -1133,13 +1149,7 @@ fn finalize_append(
         ScxWriter::adopt_in_place(cloned_file, prep.header.clone(), write_offset, Vec::new())?;
 
     let mut obs_index_builder = if rebuild_index {
-        Some(
-            scx_engine::ObsPredicateIndexBuilder::new(
-                schema_for_validate.schema(),
-                &predicate_index_build_options_for_obs(index_options),
-            )
-            .map_err(OpsError::Engine)?,
-        )
+        Some(index_pass.obs_builder(schema_for_validate.schema())?)
     } else {
         None
     };
@@ -1268,48 +1278,17 @@ fn finalize_append(
 
         let var = var_for_index.expect("var_for_index populated when rebuild_index is true");
         let mut result = scx_engine::ConversionPredicateIndexResult::default();
-        let obs_bytes = builder
-            .finish(
-                shard_row_ranges,
-                &mut result.obs_outcomes,
-                &mut result.obs_indexed_columns,
-            )
-            .map_err(OpsError::Engine)?;
-        if let Some(bytes) = obs_bytes {
-            writer.write_obs_predicate_index(&bytes)?;
-            // Derive the per-shard CategoryBitset / MinMax stats now (the index
-            // shard_id space == `shard_row_ranges` order). They're applied to
-            // the assembled catalog entries below.
-            let index = scx_engine::PredicateIndex::read_from(&mut Cursor::new(&bytes))
-                .map_err(OpsError::Engine)?;
-            per_shard_obs_stats = Some(scx_engine::derive_shard_column_stats(
-                &index,
-                shard_row_ranges.len(),
-            ));
-        }
-        let preset_var = match index_options.index_preset.as_deref() {
-            Some(name) => scx_engine::index_preset_columns(name)
-                .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let var_row_ranges: [(u64, u64); 1] = [(0, prep.target_n_vars)];
-        let var_build_opts = scx_engine::PredicateIndexBuildOptions {
-            forced_columns: index_options.index_var.clone(),
-            preset_columns: preset_var,
-            auto_threshold: index_options.index_auto_threshold,
-            high_cardinality_threshold: 100_000,
-        };
-        let var_bytes = scx_engine::build_var_predicate_index_bytes(
-            &var,
-            &var_row_ranges,
-            &var_build_opts,
-            &mut result.var_outcomes,
-            &mut result.var_indexed_columns,
+        // The index's `shard_id` space is `shard_row_ranges` order, so the
+        // derived stats are positional against it — hence `Deferred` rather
+        // than `Writer`.
+        index_pass.finish_obs(
+            builder,
+            shard_row_ranges,
+            &mut writer,
+            &mut result,
+            StatsSink::Deferred(&mut per_shard_obs_stats),
         )?;
-        if let Some(bytes) = var_bytes {
-            writer.write_var_predicate_index(&bytes)?;
-        }
+        index_pass.write_var(&var, prep.target_n_vars, &mut writer, &mut result)?;
         Some(result)
     } else {
         None
@@ -1376,7 +1355,7 @@ fn finalize_append(
             params["predicate_index"] = serde_json::json!({
                 "obs_columns": result.obs_indexed_columns,
                 "var_columns": result.var_indexed_columns,
-                "preset": index_options.index_preset,
+                "preset": index_pass.request().index_preset,
             });
         }
         entries.push(ProvenanceEntry {
@@ -1592,28 +1571,6 @@ fn next_shard_idx(old_per_modality_csr: u32, n_appended_so_far: usize) -> Result
         .ok_or_else(|| OpsError::ShapeMismatch {
             detail: format!("next CSR shard index overflows u32: {old_per_modality_csr} + {added}"),
         })
-}
-
-/// Build the obs predicate-index options from a conversion-time
-/// options struct. Mirrors the preset / forced / auto resolution
-/// applied by [`scx_engine::build_and_write_conversion_predicate_indexes`]
-/// so the Phase 2d streaming append produces byte-identical predicate
-/// indexes to the legacy batch path.
-pub(crate) fn predicate_index_build_options_for_obs(
-    index_options: &ConversionPredicateIndexOptions,
-) -> scx_engine::PredicateIndexBuildOptions {
-    let preset_obs = match index_options.index_preset.as_deref() {
-        Some(name) => scx_engine::index_preset_columns(name)
-            .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    scx_engine::PredicateIndexBuildOptions {
-        forced_columns: index_options.index_obs.clone(),
-        preset_columns: preset_obs,
-        auto_threshold: index_options.index_auto_threshold,
-        high_cardinality_threshold: 100_000,
-    }
 }
 
 /// Return the effective (dictionary-stripped) value type of a `DataType`.

@@ -20,7 +20,8 @@ use crate::merge_options::MergeOptions;
 use crate::merge_pairwise;
 use crate::merge_sorted;
 use crate::predicate_index::{
-    requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
+    requested_columns, user_wants_index, validate_forced_columns, ObsVarIndexPass,
+    PredicateIndexBuildSummary, StatsSink,
 };
 use crate::rewrite_helpers::{build_raw_copied_csr_section, raw_copy_csr_eligible};
 
@@ -327,11 +328,12 @@ pub fn merge_with_options(
         .unwrap_or(first_header.shard_target_rows) as u64;
 
     let want_index = user_wants_index(index_options);
+    // Resolved once, before any output bytes: an unknown `--index-preset` fails
+    // here rather than being silently dropped, and both merge paths below share
+    // the resolution with `scx convert`.
+    let index_pass = ObsVarIndexPass::resolve(index_options)?;
     let mut obs_index_builder = if want_index {
-        Some(obs_predicate_index_builder(
-            unified_obs_schema.clone(),
-            index_options,
-        )?)
+        Some(index_pass.obs_builder(unified_obs_schema.clone())?)
     } else {
         None
     };
@@ -399,42 +401,14 @@ pub fn merge_with_options(
         // Predicate index (same shape as the concat path).
         let index_result = if let Some(builder) = obs_index_builder.take() {
             let mut result = scx_engine::ConversionPredicateIndexResult::default();
-            let obs_bytes = builder.finish(
+            index_pass.finish_obs(
+                builder,
                 &output_shard_row_ranges,
-                &mut result.obs_outcomes,
-                &mut result.obs_indexed_columns,
+                &mut writer,
+                &mut result,
+                StatsSink::Writer,
             )?;
-            if let Some(bytes) = obs_bytes {
-                writer.write_obs_predicate_index(&bytes)?;
-                scx_engine::apply_obs_shard_column_stats(
-                    &mut writer,
-                    &bytes,
-                    output_shard_row_ranges.len(),
-                )?;
-            }
-            let preset_var = match index_options.index_preset.as_deref() {
-                Some(name) => scx_engine::index_preset_columns(name)
-                    .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
-            let var_row_ranges: [(u64, u64); 1] = [(0, n_vars)];
-            let var_build_opts = scx_engine::PredicateIndexBuildOptions {
-                forced_columns: index_options.index_var.clone(),
-                preset_columns: preset_var,
-                auto_threshold: index_options.index_auto_threshold,
-                high_cardinality_threshold: 100_000,
-            };
-            let var_bytes = scx_engine::build_var_predicate_index_bytes(
-                &var,
-                &var_row_ranges,
-                &var_build_opts,
-                &mut result.var_outcomes,
-                &mut result.var_indexed_columns,
-            )?;
-            if let Some(bytes) = var_bytes {
-                writer.write_var_predicate_index(&bytes)?;
-            }
+            index_pass.write_var(&var, n_vars, &mut writer, &mut result)?;
             Some(result)
         } else {
             None
@@ -809,53 +783,19 @@ pub fn merge_with_options(
     // already caught by `validate_forced_columns` above; engine
     // outcomes here are limited to preset skips and supported-type
     // checks.
+    // `output_shard_row_ranges` is the CSR-shard space the index was built
+    // against, so the pass derives the per-shard catalog column stats over it
+    // and query-time shard skipping works on the merged output.
     let index_result = if let Some(builder) = obs_index_builder {
         let mut result = scx_engine::ConversionPredicateIndexResult::default();
-        let obs_bytes = builder.finish(
+        index_pass.finish_obs(
+            builder,
             &output_shard_row_ranges,
-            &mut result.obs_outcomes,
-            &mut result.obs_indexed_columns,
+            &mut writer,
+            &mut result,
+            StatsSink::Writer,
         )?;
-        if let Some(bytes) = obs_bytes {
-            writer.write_obs_predicate_index(&bytes)?;
-            // Populate per-shard catalog column stats so query-time shard
-            // skipping works on the merged output. `output_shard_row_ranges`
-            // is the CSR-shard space the index was built against.
-            scx_engine::apply_obs_shard_column_stats(
-                &mut writer,
-                &bytes,
-                output_shard_row_ranges.len(),
-            )?;
-        }
-        // var stays on the batch-mode builder — var rarely overflows
-        // and the streaming path doesn't help small-axis predicate
-        // indexes. Reuse `build_var_predicate_index_bytes` with the
-        // same column-resolution policy used by
-        // `build_and_write_conversion_predicate_indexes` so behaviour
-        // is byte-identical to the non-streaming entry point.
-        let preset_var = match index_options.index_preset.as_deref() {
-            Some(name) => scx_engine::index_preset_columns(name)
-                .map(|p| p.var_columns.iter().map(|s| (*s).to_string()).collect())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-        let var_row_ranges: [(u64, u64); 1] = [(0, n_vars)];
-        let var_build_opts = scx_engine::PredicateIndexBuildOptions {
-            forced_columns: index_options.index_var.clone(),
-            preset_columns: preset_var,
-            auto_threshold: index_options.index_auto_threshold,
-            high_cardinality_threshold: 100_000,
-        };
-        let var_bytes = scx_engine::build_var_predicate_index_bytes(
-            &var,
-            &var_row_ranges,
-            &var_build_opts,
-            &mut result.var_outcomes,
-            &mut result.var_indexed_columns,
-        )?;
-        if let Some(bytes) = var_bytes {
-            writer.write_var_predicate_index(&bytes)?;
-        }
+        index_pass.write_var(&var, n_vars, &mut writer, &mut result)?;
         Some(result)
     } else {
         None
@@ -1866,28 +1806,6 @@ fn validate_dense_mapping_schemas(
         }
     }
     Ok(())
-}
-
-/// Construct the streaming obs predicate-index builder using the same
-/// preset resolution and option defaults that
-/// [`scx_engine::build_and_write_conversion_predicate_indexes`] applies.
-fn obs_predicate_index_builder(
-    schema: arrow::datatypes::SchemaRef,
-    index_options: &ConversionPredicateIndexOptions,
-) -> Result<scx_engine::ObsPredicateIndexBuilder> {
-    let preset_obs = match index_options.index_preset.as_deref() {
-        Some(name) => scx_engine::index_preset_columns(name)
-            .map(|p| p.obs_columns.iter().map(|s| (*s).to_string()).collect())
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let build_opts = scx_engine::PredicateIndexBuildOptions {
-        forced_columns: index_options.index_obs.clone(),
-        preset_columns: preset_obs,
-        auto_threshold: index_options.index_auto_threshold,
-        high_cardinality_threshold: 100_000,
-    };
-    scx_engine::ObsPredicateIndexBuilder::new(schema, &build_opts).map_err(OpsError::Engine)
 }
 
 /// Phase 3b: which dense-mapping axis to stream during merge.
