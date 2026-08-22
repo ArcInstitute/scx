@@ -304,6 +304,33 @@ pub fn run_build_csc(
     // unchanged.
     rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
 
+    // `copy_auxiliary_sections` carries the predicate-index bytes verbatim, which
+    // the carry policy requires — but step 11 above re-encoded every CSR shard
+    // through `write_csr_shard`, and `compute_shard_stats` emits no
+    // `column_stats`. Without this the index section survived and Level-1 shard
+    // pruning silently stopped: `filter_obs` fell back to a full scan and still
+    // returned the right rows, which is why it went unnoticed long enough to be
+    // pinned as a documented gap. `optimize` is the only other op declaring
+    // `Carry::Verbatim` here and had the same defect. Multimodal input is
+    // refused at the top of this function, so `csr_entries` is the modality-0
+    // shard list `assign_csr_shard_column_stats` addresses.
+    if let Some(bytes) = reader.read_obs_predicate_index_bytes()? {
+        match scx_engine::reapply_carried_obs_shard_column_stats(
+            &mut writer,
+            bytes,
+            csr_entries.len(),
+        )? {
+            scx_engine::CarriedStatsOutcome::ShardSpaceMismatch {
+                index_slots,
+                output_shards,
+            } => log::warn!(
+                "build-csc: the carried obs predicate index spans {index_slots} shard slots but                  the output has {output_shards} CSR shards, so per-shard column statistics were                  not re-derived. Level-1 shard pruning stays off; rebuild the index with                  `scx sort`/`scx compact` plus --index-obs / --index-preset."
+            ),
+            scx_engine::CarriedStatsOutcome::Applied
+            | scx_engine::CarriedStatsOutcome::NothingToApply => {}
+        }
+    }
+
     // 15. Check the staged catalog against the declared carry policy, then
     //     finalize. Before `finish()`, not after: `finish()` renames over the
     //     target, and `scx build-csc` with no `<OUTPUT>` makes that target the

@@ -2238,26 +2238,32 @@ fn test_query_no_filter_gets_no_category_note() {
     assert!(!stderr.contains("no category"), "got: {stderr}");
 }
 
-/// `build-csc` keeps the predicate index **sections** but loses the **pushdown**
-/// they enable. Both halves are pinned, because a doc asserting either one alone is
-/// wrong — and the matrix asserted one of them until this test was written.
+/// `build-csc` keeps the predicate index **sections** *and* the **pushdown** they
+/// enable. Both halves are pinned, because a doc asserting either one alone is
+/// wrong — and the operations matrix asserted one of them until this test existed.
 ///
-/// Review (Cursor Agent - Grok 4.5 High Fast) correctly pointed out that the
-/// original "Dropped" cell contradicted the code: `copy_auxiliary_sections` →
-/// `copy_predicate_indices` copies both sections verbatim, and the copies stay
-/// *valid* because shard boundaries and row ranges are unchanged. But "Preserved"
-/// would have been just as wrong from the user's side: `run_build_csc` re-encodes
-/// shards through its own path and never re-derives the per-shard catalog
-/// `column_stats`, and Level-1 pruning resolves a categorical predicate against
-/// those stats' `CategoryBitset`. So the section is there and the pruning is gone.
+/// **History, because the shape of the mistake is the reusable part.** The matrix
+/// first said "Dropped", which contradicted the code: `copy_auxiliary_sections` →
+/// `copy_predicate_indices` copies both sections verbatim and the copies stay
+/// *valid*, since shard boundaries and row ranges are unchanged. "Preserved" was
+/// just as wrong from the user's side, though: `run_build_csc` re-encodes every
+/// shard through `write_csr_shard`, `compute_shard_stats` emits no `column_stats`,
+/// and Level-1 pruning resolves a categorical predicate against those stats'
+/// `CategoryBitset`. So the section was there and the pruning was gone — a full
+/// scan returning the right rows, which is why nothing caught it.
 ///
-/// This is a **pre-existing** `build_csc` defect, not one this PR introduced — the
-/// only change here to `build_csc.rs` is the multimodal guard. Pinned rather than
-/// fixed so the gap is visible and cannot be "resolved" by editing the docs; the
-/// fix belongs in its own change (wire `apply_obs_shard_column_stats` into the
-/// re-emit, as `merge` does).
+/// That gap was pinned here rather than fixed, with a note saying the fix was to
+/// wire the stats into the re-emit as `merge` does. Phase 5c did that, and found
+/// `optimize` — the only other op declaring `Carry::Verbatim` for this family —
+/// had the identical defect, unpinned and invisible because its own test has a
+/// single CSR shard. See
+/// `scx-ops::optimize::tests::optimize_preserves_level1_shard_pruning`.
+///
+/// The generalisable rule: **`Carry::Verbatim` on a predicate index is satisfied
+/// by copying bytes, and the carry audit cannot see that the statistics those
+/// bytes need went missing.** Any future op declaring it owes this assertion too.
 #[test]
-fn test_build_csc_preserves_predicate_index_sections_but_not_pushdown() {
+fn build_csc_carries_predicate_index_and_pushdown() {
     let dir = tempfile::tempdir().unwrap();
     // `write_clustered_test_file` gives obs a `cell_type` / `disease` to index.
     let input = write_clustered_test_file(&dir, "indexed_for_csc.scx", 200, 10, 50);
@@ -2387,17 +2393,26 @@ fn test_build_csc_preserves_predicate_index_sections_but_not_pushdown() {
     );
     let (after_elim, after_matched) = pruned(&copied);
     assert_eq!(
-        after_elim, 0,
-        "documented gap: build-csc does not re-derive the per-shard column stats \
-         that Level-1 pruning needs, so pruning stops even though the index \
-         section survives. If this now prunes, the gap was fixed — update \
-         docs/operations.md's build-csc row and this assertion together."
+        after_elim, before_elim,
+        "build-csc re-encodes every CSR shard, so it must re-derive the per-shard \
+         column stats Level-1 pruning reads from the index it carried. Carrying \
+         the section bytes alone leaves pruning off."
     );
-    // Correctness is unaffected: a full scan, not a wrong answer.
     assert_eq!(
         before_matched, after_matched,
-        "losing pruning must not change which rows match"
+        "which rows match must not change either way"
     );
+
+    // The in-place form never touches the CSR shards, so its stats were never
+    // lost — assert that rather than assuming it, since the two forms take
+    // different paths to the same catalog.
+    let (in_place_elim, in_place_matched) = pruned(&in_place);
+    assert_eq!(
+        in_place_elim, before_elim,
+        "in-place build-csc leaves the CSR shards alone, so their column stats \
+         must survive untouched"
+    );
+    assert_eq!(in_place_matched, before_matched);
 }
 
 /// §11.12: `scx query --count --output out.scx` used to exit 0, print the

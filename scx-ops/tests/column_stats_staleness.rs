@@ -784,29 +784,46 @@ fn obs_replacement_with_an_index_rebuild_restores_pruning() {
 // Ops that must NOT lose their stats
 // ---------------------------------------------------------------------------
 
-/// The contrast case, and the reason the two failure modes must not be
-/// conflated: `optimize` re-emits every shard through the writer and never
-/// re-derives the stats, so it **loses** them. That costs Level-1 pruning and
-/// nothing else — the rows still come back correct. Keeping a *stale* stat is
-/// the one that returns the wrong answer.
+/// `optimize` re-emits every shard through the writer, and until Phase 5c it
+/// never re-derived the stats — so it silently **lost** them, costing Level-1
+/// pruning and nothing else. This test used to assert that loss: it read
+/// `csr_column_stats(&out).is_empty()` and `skipped_shards == 0`, which is a
+/// specification for the bug rather than for the behaviour anyone wanted. It
+/// now asserts the carry, and the two failure modes it exists to separate are
+/// still separated — losing a stat costs pruning, keeping a *stale* one returns
+/// the wrong rows, and only the second is a correctness bug.
 ///
-/// Pinned so the operations-matrix cell describing this stays honest. `optimize`
-/// itself is deliberately unchanged here.
+/// `optimize` declares `ObsPredicateIndex => Carry::Verbatim`; the audit checks
+/// the section is present and cannot see whether the statistics its pruning
+/// needs came along. `build-csc` had the identical defect —
+/// `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`.
 #[test]
-fn optimize_loses_the_column_stats_but_never_returns_wrong_rows() {
+fn optimize_carries_the_column_stats_and_the_pruning() {
     let dir = TempDir::new().unwrap();
     let path = write_indexed_fixture(&dir, "atlas.scx");
+    let before_stats = csr_column_stats(&path);
+    assert!(
+        !before_stats.is_empty(),
+        "fixture precondition: the input must carry per-shard column stats"
+    );
+    let before = query(&path, "n_counts > 300");
+
     let out = dir.path().join("optimized.scx");
     scx_ops::optimize(&path, &out, None, scx_format_io::ObsShardPolicy::Auto).unwrap();
 
-    assert!(
-        csr_column_stats(&out).is_empty(),
-        "optimize re-encodes shards and does not re-derive column stats"
+    assert_eq!(
+        csr_column_stats(&out),
+        before_stats,
+        "optimize preserves row order and CSR shard boundaries, so the stats it \
+         re-derives from the carried index must equal the input's"
     );
-    // Which is safe: no stats means no pruning, and the row evaluator is exact.
-    let r = query(&out, "n_counts > 300");
-    assert_eq!(r.matched_rows, expected_gt(n_counts_before, 300));
-    assert_eq!(r.skipped_shards, 0, "no stats, so nothing can be pruned");
+    let after = query(&out, "n_counts > 300");
+    assert_eq!(after.matched_rows, expected_gt(n_counts_before, 300));
+    assert_eq!(
+        after.skipped_shards, before.skipped_shards,
+        "carrying the index bytes without the stats leaves Level-1 pruning off"
+    );
+    assert_stats_counts_agree(&out);
 }
 
 /// A patch that never touches obs has no reason to cost the file its pushdown.

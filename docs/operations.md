@@ -253,37 +253,43 @@ a framed output. Both derive it from `scx_ops::framing_for_csc_rebuild`, which
 is the only correct source — see the note on `rebuild_csc_inplace` for why both
 `None` and a `decode_target`-carrying `FramingConfig` are wrong here.
 
-> **Known gap: `build-csc` keeps the predicate index but loses Level-1 pruning.**
-> `copy_auxiliary_sections` copies `obs_predicate_index` / `var_predicate_index`
+> **`build-csc` and `optimize` keep the predicate index *and* its Level-1
+> pruning.** Both copy `obs_predicate_index` / `var_predicate_index`
 > byte-for-byte, and the copy stays *valid* — shard boundaries and row ranges are
-> unchanged. But `run_build_csc` re-encodes each shard through its own path and
-> does not re-derive the per-shard catalog `column_stats`, and **Level-1** pruning
-> resolves a categorical predicate against those stats' `CategoryBitset`.
+> unchanged. Both also re-encode every CSR shard, and `compute_shard_stats` emits
+> no per-shard `column_stats`, so each additionally re-derives those from the
+> carried index (`scx_engine::reapply_carried_obs_shard_column_stats`).
 >
-> Scope matters, because the index drives two independent pushdown paths:
+> Both halves matter, because the index drives two independent pushdown paths:
 >
-> - **Level-1** (catalog-stats shard pruning) **stops.** Measured on a
->   200-cell / 8-shard file indexed on a clustered `cell_type`: `Level 1
->   eliminated 6/8` before `build-csc`, `0/8` after — same correct row count.
-> - **Level-2** (row-set pushdown) reads the copied `PredicateIndex` directly and
->   does **not** consult `column_stats`, so it is unaffected. It has its own
->   precondition — row-sharded obs metadata — so on a single-section-obs file,
->   where Level-2 is inactive regardless, the query does degrade to a full obs
->   scan.
+> - **Level-1** (catalog-stats shard pruning) reads the per-shard
+>   `column_stats`, not the index section.
+> - **Level-2** (row-set pushdown) reads the `PredicateIndex` directly and does
+>   **not** consult `column_stats`. It has its own precondition — row-sharded obs
+>   metadata — so on a single-section-obs file, where Level-2 is inactive
+>   regardless, a query degrades to a full obs scan.
 >
-> Correctness is never affected either way: the same rows match, just without the
-> pruning. The real fix is to derive the stats on re-emit
-> (`scx_engine::apply_obs_shard_column_stats`, as `merge` does). Until then, if
-> you need Level-1 pruning back, rebuild the index with an op that derives stats
-> — e.g. `scx sort --by <col> --index-preset …`. Prefer that over `scx compact`,
-> which re-runs `codec=auto` and can grow the file; and note `scx convert` cannot
-> take an `.scx` input at all. Pinned by
-> `scx-cli/tests/cli_ops_integration.rs::test_build_csc_preserves_predicate_index_sections_but_not_pushdown`.
+> Until v0.14 the stats were dropped: the section survived, Level-1 pruning
+> stopped, and the query returned the *right* rows after a full scan — which is
+> why it went unnoticed. Measured on a 200-cell / 8-shard file indexed on a
+> clustered `cell_type`: `Level 1 eliminated 6/8` before `build-csc`, `0/8`
+> after. `optimize` had the identical defect for the identical reason.
 >
-> `optimize` has the same gap for the same reason: it re-encodes every shard
-> through `write_preencoded_shard` and never calls `apply_obs_shard_column_stats`.
 > Pinned by
-> `scx-ops/tests/column_stats_staleness.rs::optimize_loses_the_column_stats_but_never_returns_wrong_rows`.
+> `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`
+> and
+> `scx-ops/tests/column_stats_staleness.rs::optimize_carries_the_column_stats_and_the_pruning`,
+> plus `scx-ops::optimize::tests::optimize_preserves_level1_shard_pruning` — the
+> earlier `optimize` test could not see the loss because its fixture has a single
+> CSR shard, and Level-1 pruning is unobservable on one shard.
+>
+> Re-derivation is skipped, with a warning, when the carried index's shard space
+> does not match the output's CSR shard count — an index finished over obs-shard
+> rather than CSR-shard ranges, which `modify_metadata` falls back to on a file
+> whose CSR shards do not tile `[0, n_obs)`. In that case rebuild the index with
+> an op that derives stats: `scx sort --by <col> --index-preset …`. Prefer that
+> over `scx compact`, which re-runs `codec=auto` and can grow the file; and note
+> `scx convert` cannot take an `.scx` input at all.
 
 ### Per-shard column stats and the in-place ops
 

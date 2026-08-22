@@ -242,6 +242,16 @@ pub fn optimize_with_framing(
         .collect();
     obsp_csr_entries.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Counted before the chain consumes `x_entries`. Scoped to `modality_id == 0`
+    // to match what `assign_csr_shard_column_stats` addresses, so a multimodal
+    // file's per-modality shards cannot make the count look right by accident.
+    let n_global_csr_shards = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+        .count();
+
     let mut stats = OptimizeStats {
         format_version: out_format_version,
         ..Default::default()
@@ -405,6 +415,31 @@ pub fn optimize_with_framing(
     // preserved, so they stay valid — copy through. Then record provenance.
     copy_predicate_indices(&reader, &mut writer)
         .map_err(|e| OpsError::InvalidInput(format!("copy predicate indices: {e}")))?;
+    // Copying the section bytes is only half of carrying an index. Optimize
+    // re-encodes every CSR shard above, and `compute_shard_stats` emits no
+    // `column_stats` — so without this the index section survived and Level-1
+    // shard pruning silently stopped, turning every `filter_obs` into a full
+    // scan that still returned the right rows. `build-csc` had the same defect
+    // and the same fix; they are the only two ops declaring
+    // `Carry::Verbatim` for this family.
+    if let Some(bytes) = reader.read_obs_predicate_index_bytes()? {
+        match scx_engine::reapply_carried_obs_shard_column_stats(
+            &mut writer,
+            bytes,
+            n_global_csr_shards,
+        )
+        .map_err(OpsError::Engine)?
+        {
+            scx_engine::CarriedStatsOutcome::ShardSpaceMismatch {
+                index_slots,
+                output_shards,
+            } => log::warn!(
+                "optimize: the carried obs predicate index spans {index_slots} shard slots but                  the output has {output_shards} CSR shards, so per-shard column statistics were                  not re-derived. Level-1 shard pruning stays off; rebuild the index with                  `scx sort`/`scx compact` plus --index-obs / --index-preset."
+            ),
+            scx_engine::CarriedStatsOutcome::Applied
+            | scx_engine::CarriedStatsOutcome::NothingToApply => {}
+        }
+    }
     // Record the obs-sharding decision so the layout change is auditable via
     // `scx info --history` (the obs layout is the one thing optimize can now
     // change beyond the CSR re-encode).
@@ -1464,6 +1499,131 @@ mod tests {
             matched(&output),
             before,
             "predicate-index query is stable across obs reshape"
+        );
+    }
+    /// `optimize` declares `ObsPredicateIndex => Carry::Verbatim`, and it
+    /// satisfies that by copying the section bytes. But it re-encodes every CSR
+    /// shard through `encode_one_shard` / `write_preencoded_shard`, and
+    /// `compute_shard_stats` does not produce `column_stats` — so the Level-1
+    /// statistics the index's shard pruning reads were dropped on the way out.
+    /// The query still returned the right rows, after a full scan.
+    ///
+    /// `optimize_shard_obs_preserves_predicate_index` above could not see this:
+    /// it has one CSR shard, and Level-1 pruning is unobservable on a single
+    /// shard. This fixture has three, with `cell_type` constant within each, so
+    /// a query for one value can eliminate the other two.
+    ///
+    /// The same defect in `build-csc`, the only other op declaring
+    /// `Carry::Verbatim` here, is pinned at
+    /// `scx-cli/tests/cli_ops_integration.rs::build_csc_carries_predicate_index_and_pushdown`.
+    #[test]
+    fn optimize_preserves_level1_shard_pruning() {
+        use std::sync::Arc;
+
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use scx_engine::{
+            build_and_write_conversion_predicate_indexes, ConversionPredicateIndexOptions,
+            QueryPipeline,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        let output = dir.path().join("out.scx");
+
+        // Three shards of four rows, `cell_type` constant per shard.
+        const ROWS_PER_SHARD: usize = 4;
+        const N_SHARDS: usize = 3;
+        let n_obs = ROWS_PER_SHARD * N_SHARDS;
+        let n_vars = 1000usize;
+        let types = ["T cell", "B cell", "NK cell"];
+
+        let obs = {
+            let schema = Schema::new(vec![
+                Field::new("cell_id", DataType::Utf8, false),
+                Field::new("cell_type", DataType::Utf8, true),
+            ]);
+            let ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+            let ct: Vec<&str> = (0..n_obs).map(|i| types[i / ROWS_PER_SHARD]).collect();
+            RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(
+                        ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(arrow::array::StringArray::from(ct)),
+                ],
+            )
+            .unwrap()
+        };
+        let var = sample_var(n_vars);
+
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.index_dtype = 1;
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&obs).unwrap();
+            w.write_var(&var).unwrap();
+            let mut ranges: Vec<(u64, u64)> = Vec::new();
+            for s in 0..N_SHARDS {
+                let (indptr, indices, values) = small_csr(ROWS_PER_SHARD);
+                let row_start = (s * ROWS_PER_SHARD) as u64;
+                w.write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_start,
+                )
+                .unwrap();
+                ranges.push((row_start, row_start + ROWS_PER_SHARD as u64));
+            }
+            let opts = ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_type".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            };
+            build_and_write_conversion_predicate_indexes(
+                &mut w, &obs, &var, &ranges, n_vars, &opts,
+            )
+            .unwrap();
+            w.finish().unwrap();
+        }
+
+        let probe = |path: &Path| -> (usize, usize) {
+            let pipeline = QueryPipeline::open(path)
+                .unwrap()
+                .filter_obs("cell_type == 'T cell'")
+                .unwrap();
+            let c = scx_engine::collect::count(&pipeline).unwrap();
+            (c.skipped_shards, c.matched_rows)
+        };
+
+        let (before_skipped, before_matched) = probe(&input);
+        assert_eq!(
+            before_skipped,
+            N_SHARDS - 1,
+            "fixture precondition: the input must prune {} of {N_SHARDS} shards, or the \
+             comparison below proves nothing",
+            N_SHARDS - 1
+        );
+        assert_eq!(before_matched, ROWS_PER_SHARD);
+
+        optimize(&input, &output, None, ObsShardPolicy::Off).unwrap();
+
+        let (after_skipped, after_matched) = probe(&output);
+        assert_eq!(
+            after_matched, before_matched,
+            "optimize must not change which rows match"
+        );
+        assert_eq!(
+            after_skipped, before_skipped,
+            "optimize carries the obs predicate index verbatim, so it must also carry the \
+             per-shard column_stats that index's Level-1 pruning reads — carrying the section \
+             bytes alone leaves pruning off"
         );
     }
 }
