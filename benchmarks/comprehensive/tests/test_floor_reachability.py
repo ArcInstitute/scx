@@ -452,3 +452,80 @@ def test_export_streaming_bounds_its_materialize_arm_too():
         assert m._skip_materialize_reason(m.MATERIALIZE_MAX_N_OBS) is None
         reason = m._skip_materialize_reason(m.MATERIALIZE_MAX_N_OBS + 1)
         assert reason and "streaming" in reason
+
+
+# ---------------------------------------------------------------------------
+# Published numbers must match the results tracked to back them
+# ---------------------------------------------------------------------------
+
+
+def test_performance_doc_streaming_table_matches_the_tracked_json():
+    """`docs/performance.md`'s census_1m streaming table must equal the medians in
+    the tracked raw JSON.
+
+    `docs/benchmark_manifest.md` requires every user-visible number to be backed by
+    a tracked result. It was not enough: round 1 force-added the JSON and left the
+    prose quoting a *different* capture, with two compounding errors that all three
+    round-2 reviewers caught —
+
+    * the GB figures divided MB by 1000, so 5 893 MB was published as "5.79 GB"
+      (it is 5.75 GiB); and
+    * two of three were the *minimum* of the three runs, not the median.
+
+    The table is now quoted in MB, the same unit the JSON and `thresholds.yaml`
+    use, which removes the conversion that produced both. This test is the part
+    that keeps them tied together — a manifest rule nothing checks is the same
+    shape as a floor nothing can trip.
+    """
+    import json
+    import re
+    import statistics
+
+    raw = PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "raw"
+    doc = (PROJECT_ROOT / "docs" / "performance.md").read_text()
+
+    # (doc row label, results file, scenario key in runs[].extra)
+    rows = [
+        ("streaming (`pyscx.from_h5ad`), `reader_threads=4`",
+         "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
+         "streaming"),
+        ("streaming, default parallelism (16 readers)",
+         "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
+         "streaming_default_threads"),
+        ("materialise (`pyscx.from_anndata`)",
+         "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
+         "materialize"),
+    ]
+
+    checked = 0
+    for label, fname in {(l, f) for l, f, _ in rows}:
+        assert (raw / fname).is_file(), (
+            f"{fname} is not tracked, so the numbers citing it cannot be audited "
+            f"from a fresh checkout — force-add it (see docs/benchmark_manifest.md)"
+        )
+
+    for label, fname, scenario in rows:
+        d = json.loads((raw / fname).read_text())
+        runs = [r for r in d["runs"] if r.get("extra", {}).get("scenario") == scenario]
+        assert runs, f"{fname} has no runs for scenario {scenario!r}"
+        want_wall = statistics.median(r["wall_s"] for r in runs)
+        want_rss = statistics.median(r["peak_rss_mb"] for r in runs)
+
+        # `| <label> | 25.37 s | **2 342 MB** |`, tolerating bold and thin spaces.
+        pat = re.escape(label) + r"\s*\|\s*\*{0,2}([\d.]+)\s*s\*{0,2}\s*\|\s*\*{0,2}([\d\s,]+)\s*MB"
+        m = re.search(pat, doc)
+        assert m, f"no MB-denominated table row for {label!r} in docs/performance.md"
+        got_wall = float(m.group(1))
+        got_rss = float(m.group(2).replace(" ", "").replace(",", "").replace(" ", ""))
+
+        assert abs(got_wall - want_wall) < 0.05, (
+            f"{label}: doc says {got_wall} s, tracked median is {want_wall:.2f} s"
+        )
+        assert abs(got_rss - want_rss) < 1.0, (
+            f"{label}: doc says {got_rss} MB, tracked median is {want_rss:.0f} MB "
+            f"(min {min(r['peak_rss_mb'] for r in runs):.0f}, "
+            f"max {max(r['peak_rss_mb'] for r in runs):.0f}) — publishing the min "
+            f"instead of the median is how this drifted before"
+        )
+        checked += 1
+    assert checked == 3, checked

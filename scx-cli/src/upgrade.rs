@@ -362,6 +362,93 @@ mod tests {
         assert_eq!(out.read_all_csr_shards_filtered().unwrap().shape.0, 6);
     }
 
+    /// An upgrade re-emits every CSR shard, so it must bring the per-shard obs
+    /// `column_stats` with it — those, not the `ObsPredicateIndex` section, are
+    /// what Level-1 pruning reads. `build-csc` and `optimize` had this defect and
+    /// were fixed first; `upgrade` reaches the same `Carry::Verbatim` arm through
+    /// `other => build_csc(other)` in `carry.rs` and was missed, because the first
+    /// pass counted explicit match arms. Found by review
+    /// (Cursor Agent - Grok 4.6 High) on PR #451; this test was added after a
+    /// second reviewer (Antigravity - Gemini 3.7 Flash) noted the fix had shipped
+    /// with the other two ops covered and `upgrade` not.
+    ///
+    /// Both directions, because either alone is passable by broken code: stats
+    /// present on the input must survive, and an input with an index but no stats
+    /// must not have any invented for it.
+    #[test]
+    fn upgrade_carries_obs_column_stats() {
+        use scx_format_io::section::SectionType;
+
+        fn column_stats(p: &std::path::Path) -> Vec<usize> {
+            ScxReader::open(p)
+                .unwrap()
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+                .filter_map(|e| e.stats.as_ref())
+                .map(|s| s.column_stats.len())
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = write_test_file(&dir, 12, 5);
+
+        // Give the input an index and the per-shard stats that go with it, the
+        // way any indexing op would.
+        let indexed = dir.path().join("indexed.scx");
+        scx_ops::compact_with_index_options(
+            &input,
+            &indexed,
+            &scx_engine::ConversionPredicateIndexOptions {
+                index_obs: vec!["cell_type".to_string()],
+                index_var: vec![],
+                index_preset: None,
+                index_auto_threshold: 0,
+            },
+            false,
+        )
+        .unwrap();
+
+        let before = column_stats(&indexed);
+        assert!(
+            before.iter().any(|n| *n > 0),
+            "fixture precondition: the indexed input must carry per-shard column \
+             stats, or this test cannot tell a carry from a drop (got {before:?})"
+        );
+
+        let upgraded = dir.path().join("upgraded.scx");
+        let reader = ScxReader::open(&indexed).unwrap();
+        rewrite_with_current_version(&reader, &upgraded).unwrap();
+        drop(reader);
+
+        assert_eq!(
+            column_stats(&upgraded),
+            before,
+            "upgrade re-emits every CSR shard, so it must carry the per-shard \
+             column stats Level-1 pruning reads — carrying the index section \
+             alone leaves pruning off"
+        );
+        assert!(
+            ScxReader::open(&upgraded)
+                .unwrap()
+                .read_obs_predicate_index_bytes()
+                .unwrap()
+                .is_some(),
+            "the index section itself must still be there"
+        );
+
+        // The other direction: no stats in, none invented.
+        let bare = dir.path().join("bare.scx");
+        let reader = ScxReader::open(&input).unwrap();
+        rewrite_with_current_version(&reader, &bare).unwrap();
+        drop(reader);
+        assert!(
+            column_stats(&bare).iter().all(|n| *n == 0),
+            "an input with no per-shard stats must not gain any"
+        );
+    }
+
     #[test]
     fn test_upgrade_preserves_data() {
         let dir = tempfile::tempdir().unwrap();

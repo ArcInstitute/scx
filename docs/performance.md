@@ -126,17 +126,26 @@ shard plus ~80 MB indptr at 10M cells (~800 MB at 100M cells).
 12.7 GB h5ad → 3.04 GB streaming SCX vs 3.11 GB materialise SCX;
 median of 3 paired runs on a 16-core Lambda `standard` node):
 
-| Path | Median wall | Peak RSS |
+| Path | Median wall | Median peak RSS |
 |---|---:|---:|
-| streaming (`pyscx.from_h5ad`), `reader_threads=4`   |  25.4 s | **2.34 GB** |
-| streaming, default parallelism (16 readers)         |  17.7 s |   5.79 GB |
-| materialise (`pyscx.from_anndata`)                  |  35.4 s |  26.9 GB |
+| streaming (`pyscx.from_h5ad`), `reader_threads=4`   |  25.37 s | **2 342 MB** |
+| streaming, default parallelism (16 readers)         |  17.24 s |   5 893 MB |
+| materialise (`pyscx.from_anndata`)                  |  35.62 s |  26 919 MB |
 
-Re-measured 2026-08-22 (job 2834726, median of 3 runs per arm, 16-core node).
-Streaming uses ~11× less peak RSS than materialising at the pinned thread count,
-and is *faster* as well — the earlier table recorded the sequential-era 98.2 s.
-Both paths emit byte-equivalent SCX (identical n_obs / n_vars / nnz / 62-shard
-catalog).
+Re-measured 2026-08-22 (job **2834737**, median of 3 runs per arm, 16-core node);
+every figure is the median from the tracked JSON cited below. Streaming uses
+~11× less peak RSS than materialising at the pinned thread count, and is *faster*
+as well — the earlier table recorded the sequential-era 98.2 s. Both paths emit
+byte-equivalent SCX (identical n_obs / n_vars / nnz / 62-shard catalog).
+
+> **RSS is quoted in MB, deliberately.** An earlier version of this table gave GB
+> figures computed as `MB / 1000` — so 5 893 MB was published as "5.79 GB" (it is
+> 5.75 GiB), 26 919 MB as "26.9 GB" (26.29 GiB), and export's 13 988 MB as
+> "13.98 GB" (13.66 GiB). Two of the three were also the *minimum* of the three
+> runs rather than the median, and they came from an earlier capture (2834726)
+> than the JSON now tracked to back them (2834737). Reporting the same unit the
+> results file and `thresholds.yaml` use removes the conversion step that
+> produced all of it.
 
 > **These numbers replace an earlier table that read 98.2 s / 851 MB streaming
 > and 60.2 s / 13.6 GB materialising, and the RSS figures there were wrong** —
@@ -174,15 +183,15 @@ across the whole range. Materialise scales sub-linearly (1.69× peak
 at 32 threads, efficiency 5 %) because the upstream
 `anndata.read_h5ad` is single-threaded HDF5 and the rayon-parallel
 encode pool runs into Amdahl's law on top of that. Materialise peak
-RSS is thread-independent — measured 26.9 GB in 2026-08-22's re-capture; the
+RSS is thread-independent — measured 26 919 MB in 2026-08-22's re-capture; the
 ~13.6 GB this line used to quote came from the pre-`PeakRssSampler` metric and
 was roughly the *residual* after the call, not the peak during it.
 
 **Crossover regime**: streaming now wins on wall *and* memory at census_1m
-(25.4 s / 2.34 GB pinned, 17.7 s / 5.79 GB at default parallelism, against
-35.4 s / 26.9 GB) — the parallel reader closed the wall gap the sequential-era
+(25.37 s / 2 342 MB pinned, 17.24 s / 5 893 MB at default parallelism, against
+35.62 s / 26 919 MB) — the parallel reader closed the wall gap the sequential-era
 table above records. Materialise remains viable only while the in-memory CSR
-triplet fits: census_1m's is ~26.9 GB resident at peak, and `census_5m` /
+triplet fits: census_1m's is ~27 GB resident at peak, and `census_5m` /
 `census_10m` push it past most workstation memory outright. Streaming also fits the
 backed-AnnData path used by `pyscx.from_anndata(adata)` when
 `adata.isbacked` is true.
@@ -246,13 +255,15 @@ The streaming row's `streaming_peak_rss_mb` is gated on `census_1m` in
 `scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor without
 needing a wall-clock signal.
 
-Measured 2026-08-22 (job 2834726, median of 3, census_1m → h5ad): **3.17 GB**
-peak at `reader_threads=4`, 5.62 GB at the default 16, against **13.98 GB** for
-`stream=False`. The materialise arm calls `read_all_csr_shards_filtered()` and
-holds the whole CSR triplet, so the ~4.4× separation at the pinned thread count
-is the contract working. Before the harness was fixed that arm reported 913 MB —
-under-stated by 15×, which made the two arms look indistinguishable and the
-comparison this benchmark exists for vacuous.
+Measured 2026-08-22 (job **2834737**, median of 3, census_1m → h5ad):
+**3 162 MB** peak at `reader_threads=4`, 5 622 MB at the default 16, against
+**14 037 MB** for `stream=False`. The materialise arm calls
+`read_all_csr_shards_filtered()` and holds the whole CSR triplet, so the ~4.4×
+separation at the pinned thread count is the contract working. Before the harness
+was fixed that arm reported 913 MB — under-stated by 15×, which made the two arms
+look indistinguishable and the comparison this benchmark exists for vacuous.
+Backed by the tracked
+`results/raw/export_streaming__scx_streaming_vs_materialize__census_1m.json`.
 
 ## Column Projection (2000 HVGs)
 

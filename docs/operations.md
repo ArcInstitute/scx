@@ -257,8 +257,11 @@ is the only correct source — see the note on `rebuild_csc_inplace` for why bot
 > pruning.** Both copy `obs_predicate_index` / `var_predicate_index`
 > byte-for-byte, and the copy stays *valid* — shard boundaries and row ranges are
 > unchanged. Both also re-encode every CSR shard, and `compute_shard_stats` emits
-> no per-shard `column_stats`, so each additionally re-derives those from the
-> carried index (`scx_engine::reapply_carried_obs_shard_column_stats`).
+> no per-shard `column_stats`, so each additionally **carries the input's** stats
+> onto the output's shards, matched by `row_start`
+> (`scx_format_io::carry_csr_shard_column_stats`). All three re-emit one output
+> shard per input shard at the same offset, so the input's statistics are already
+> exactly right for the output's rows.
 >
 > Both halves matter, because the index drives two independent pushdown paths:
 >
@@ -283,12 +286,25 @@ is the only correct source — see the note on `rebuild_csc_inplace` for why bot
 > earlier `optimize` test could not see the loss because its fixture has a single
 > CSR shard, and Level-1 pruning is unobservable on one shard.
 >
-> Re-derivation is skipped, with a warning, when the carried index's shard space
-> does not match the output's CSR shard count — an index finished over obs-shard
-> rather than CSR-shard ranges, which `modify_metadata` falls back to on a file
-> whose CSR shards do not tile `[0, n_obs)`. In that case rebuild the index with
-> an op that derives stats: `scx sort --by <col> --index-preset …`. Prefer that
-> over `scx compact`, which re-runs `codec=auto` and can grow the file; and note
+> **Why carrying rather than re-deriving from the index.** An earlier version of
+> this fix derived the stats afresh from the carried index bytes, gated on the
+> index's highest recorded `shard_id + 1` matching the output CSR shard count.
+> That equality is not proof the index is keyed to the CSR partition:
+> `modify_metadata` falls back to building the index over **obs**-shard ranges
+> when the CSR shards do not tile `[0, n_obs)`, and an obs partition can have the
+> same shard *count* with different *boundaries* — CSR `[0,100) [100,200)
+> [200,300)` against obs `[0,134) [134,268) [268,400)`. Derivation would attach
+> shard 0's obs statistics to CSR rows they do not describe, and Level-1 consumes
+> `column_stats` **before** residual evaluation, so a fabricated "value absent"
+> prunes a shard holding real matches and the query returns an **incomplete row
+> set**. Copying removes the inference entirely.
+>
+> A file in that state has no stats to carry — `modify_metadata` clears them
+> (`clear_all_csr_shard_column_stats`) precisely because its index is obs-keyed —
+> so the rewrite output is unprunable rather than wrongly pruned. To get Level-1
+> pruning back, rebuild the index with an op that derives stats against the CSR
+> partition: `scx sort --by <col> --index-preset …`. Prefer that over
+> `scx compact`, which re-runs `codec=auto` and can grow the file; and note
 > `scx convert` cannot take an `.scx` input at all.
 
 ### Per-shard column stats and the in-place ops

@@ -1668,13 +1668,19 @@ absolute_floors:
   # The unpinned number is recorded as `streaming_default_threads_peak_rss_mb`
   # and deliberately not gated.
   #
-  # Derivation for census_1m, 2026-08-22 (job 2834726, three runs):
+  # Derivation for census_1m, 2026-08-22. Measured figures are from job **2834737**,
+  # whose results are tracked at
+  # `results/raw/conversion_streaming__scx_streaming_vs_materialize__census_1m.json`
+  # — the same capture docs/performance.md publishes, so the two cannot drift.
+  # (An earlier revision of this comment quoted job 2834726's 2278/2335/2423 MB,
+  # a different run of the same code; the numbers agree to ~2% but citing an
+  # untracked capture is what let the doc and its backing diverge.)
   #   nnz/cell                    1402
   #   one 16384-row shard         16384 × 1402 × 16 B  = 351 MB
-  #   ~6 in flight at rt=4        (4 readers + writer queue) = 2.1 GB
-  #   + interpreter/import base   ~0.35 GB (measured on pbmc3k)
-  #   = predicted                 ~2.4 GB
-  #   measured                    2278 / 2335 / 2423 MB
+  #   ~6 in flight at rt=4        (4 readers + writer queue) = ~2100 MB
+  #   + interpreter/import base   ~350 MB (measured on pbmc3k)
+  #   = predicted                 ~2450 MB
+  #   measured                    2258 / 2342 / 2368 MB (median 2342)
   # Floor set at 4096 MB — ~1.7× the worst observed, tight enough to catch a
   # doubling (which is what an accumulator leak looks like) and loose enough to
   # absorb allocator variance. The previous 2048 MB was "~10× the design
@@ -1705,11 +1711,13 @@ absolute_floors:
   # naturally wins on datasets that fit in RAM, and a streaming wall
   # regression doesn't change the bounded-memory contract.
   # Same pinned-arm construction as the ingestion floor above.
-  # Measured on census_1m at rt=4 (job 2834726): 3128 / 3167 / 3205 MB. Higher
-  # than ingest's 2335 MB at the same thread count because the decode pool and
-  # the HDF5 write buffers are both live while the writer runs on the calling
-  # thread; and it scales more gently with threads for the same reason
-  # (3128 → 5416 MB from 4 to 16, against ingest's 2278 → 5647).
+  # Measured on census_1m at rt=4 (job 2834737, tracked at
+  # `results/raw/export_streaming__scx_streaming_vs_materialize__census_1m.json`):
+  # 3125 / 3162 / 3189 MB, median 3162. Higher than ingest's 2342 MB at the same
+  # thread count because the decode pool and the HDF5 write buffers are both live
+  # while the writer runs on the calling thread; and it scales more gently with
+  # threads for the same reason (3162 → 5622 MB median from 4 to 16,
+  # against ingest's 2342 → 5893).
   # Floor at 5120 MB, ~1.6× the worst observed.
   - benchmark: export_streaming
     format: scx_streaming_vs_materialize

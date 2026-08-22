@@ -525,6 +525,28 @@ def run(
     try:
         if thread_counts is None:
             return _run_isolated(scx_in, out_ext, n_runs, result, dataset.n_obs)
+        if _skip_materialize_reason(dataset.n_obs):
+            # The cap has to guard this branch too, and the first pass guarded only
+            # `_run_isolated`: `_run_thread_count_subprocess` unconditionally
+            # appends the materialize arm, so a sweep above the cap still loaded
+            # the whole CSR triplet (~70 GB at census_5m, ~140 GB at census_10m) --
+            # exactly what the cap was added to prevent. Found by all three
+            # round-2 reviewers on PR #451; the round-1 test only asserted the
+            # constants existed and never drove this branch.
+            #
+            # Refused rather than silently skipped, mirroring
+            # `conversion_streaming.run`: a thread sweep exists to compare how the
+            # two arms scale, so dropping one makes its output meaningless, and
+            # running a ~140 GB arm the operator did not know they asked for is
+            # worse.
+            raise ValueError(
+                f"{_THREAD_COUNTS_ENV} is set on a dataset with n_obs="
+                f"{dataset.n_obs:,}, where the materialize arm is skipped "
+                f"({_skip_materialize_reason(dataset.n_obs)}). A thread-scaling "
+                f"run compares the two arms, so it needs both: either use a "
+                f"dataset at or below n_obs={MATERIALIZE_MAX_N_OBS:,}, or unset "
+                f"{_THREAD_COUNTS_ENV}."
+            )
         return _run_with_thread_scaling(
             scx_in, out_ext, n_runs, thread_counts, result
         )

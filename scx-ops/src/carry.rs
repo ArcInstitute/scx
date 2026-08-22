@@ -307,7 +307,8 @@ pub enum Carry {
     /// (Cursor Agent - Grok 4.6 High) on PR #451.
     ///
     /// Both are fixed (Phase 5c,
-    /// `scx_engine::reapply_carried_obs_shard_column_stats`), but the lesson is
+    /// `scx_format_io::carry_csr_shard_column_stats`, which copies the input's
+    /// stats by `row_start` rather than inferring the index's keying), but the lesson is
     /// structural and outlives the fix: **`Verbatim` asserts that the section is
     /// present, not that state derived from it elsewhere in the catalog is still
     /// correct.** The audit cannot see the difference, and no entry in this table
@@ -638,7 +639,7 @@ fn optimize(family: SectionFamily) -> Carry {
         F::DeletionVectors => Carry::Verbatim,
         // Same shape as `build_csc`'s cell below, and it had the same defect:
         // optimize re-encodes every shard, so the per-shard `column_stats` that
-        // Level-1 pushdown reads have to be re-derived from the carried bytes.
+        // Level-1 pushdown reads have to be carried over from the input.
         // `Verbatim` does not assert that half.
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         F::Provenance => Carry::Rebuilt,
@@ -730,9 +731,10 @@ fn build_csc(family: SectionFamily) -> Carry {
         // Copied through, so presence *is* asserted — but presence is the only
         // thing asserted, and it is not the whole property that matters here.
         // Level-1 pushdown reads the per-shard `column_stats`, not this section,
-        // and build-csc re-encodes every CSR shard; 5c re-derives them from the
-        // carried bytes. No `Carry` variant expresses that half and none
-        // pretends to — see `Carry::Rebuilt`'s doc, and the two tests it names.
+        // and build-csc re-encodes every CSR shard; 5c carries them over from the
+        // input instead (`scx_format_io::carry_csr_shard_column_stats`, keyed by
+        // `row_start`). No `Carry` variant expresses that half and none pretends
+        // to — see `Carry::Rebuilt`'s doc, and the tests it names.
         F::ObsPredicateIndex | F::VarPredicateIndex => Carry::Verbatim,
         // The whole point of the op.
         F::XCsc => Carry::Rebuilt,
