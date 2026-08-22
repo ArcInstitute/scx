@@ -128,12 +128,32 @@ median of 3 paired runs on a 16-core Lambda `standard` node):
 
 | Path | Median wall | Peak RSS |
 |---|---:|---:|
-| streaming (`pyscx.from_h5ad`)        |  98.2 s | **851 MB** |
-| materialise (`pyscx.from_anndata`)   |  60.2 s |  13.6 GB |
+| streaming (`pyscx.from_h5ad`), `reader_threads=4`   |  25.4 s | **2.34 GB** |
+| streaming, default parallelism (16 readers)         |  17.7 s |   5.79 GB |
+| materialise (`pyscx.from_anndata`)                  |  35.4 s |  26.9 GB |
 
-Streaming uses ~16× less peak RSS at ~63% wall-clock premium on
-this size. Both paths emit byte-equivalent SCX (identical n_obs /
-n_vars / nnz / 62-shard catalog).
+Re-measured 2026-08-22 (job 2834726, median of 3 runs per arm, 16-core node).
+Streaming uses ~11× less peak RSS than materialising at the pinned thread count,
+and is *faster* as well — the earlier table recorded the sequential-era 98.2 s.
+Both paths emit byte-equivalent SCX (identical n_obs / n_vars / nnz / 62-shard
+catalog).
+
+> **These numbers replace an earlier table that read 98.2 s / 851 MB streaming
+> and 60.2 s / 13.6 GB materialising, and the RSS figures there were wrong** —
+> not stale. The benchmark reported `max(rss_before, rss_after)` of the
+> *instantaneous* RSS rather than a peak, so a transient spike inside the call was
+> invisible: the materialise arm's true peak is 26.9 GB, not 13.6. It also ran
+> both arms in one process, so the streaming figure inherited the materialise
+> arm's freed-but-unreturned heap. Both are fixed
+> (`benchmarks/comprehensive/benchmarks/conversion_streaming.py` now uses
+> `PeakRssSampler` and one arm per subprocess).
+>
+> Peak RSS scales with **reader threads**, not with file size — that is the
+> bounded-memory contract. One 16384-row shard of census_1m is 351 MB
+> (1402 nnz/cell × 16 B), and the reader holds
+> `reader_threads + writer_queue_depth` of them. Hence the two streaming rows:
+> `thresholds.yaml` gates the pinned one, because a floor whose value depends on
+> the runner's core count is not a floor.
 
 **Thread scaling on the same fixture** (median wall in seconds across
 3 paired runs, `RAYON_NUM_THREADS` set per subprocess):
@@ -154,13 +174,16 @@ across the whole range. Materialise scales sub-linearly (1.69× peak
 at 32 threads, efficiency 5 %) because the upstream
 `anndata.read_h5ad` is single-threaded HDF5 and the rayon-parallel
 encode pool runs into Amdahl's law on top of that. Materialise peak
-RSS is thread-independent at ~13.6 GB.
+RSS is thread-independent — measured 26.9 GB in 2026-08-22's re-capture; the
+~13.6 GB this line used to quote came from the pre-`PeakRssSampler` metric and
+was roughly the *residual* after the call, not the peak during it.
 
-**Crossover regime**: materialise wins on wall whenever the
-in-memory CSR triplet fits comfortably; streaming becomes the only
-viable path once that working set exceeds node RAM (somewhere above
-the `census_1m` 13.6 GB working set; `census_5m` / `census_10m`
-push it well past most workstation memory). Streaming also fits the
+**Crossover regime**: streaming now wins on wall *and* memory at census_1m
+(25.4 s / 2.34 GB pinned, 17.7 s / 5.79 GB at default parallelism, against
+35.4 s / 26.9 GB) — the parallel reader closed the wall gap the sequential-era
+table above records. Materialise remains viable only while the in-memory CSR
+triplet fits: census_1m's is ~26.9 GB resident at peak, and `census_5m` /
+`census_10m` push it past most workstation memory outright. Streaming also fits the
 backed-AnnData path used by `pyscx.from_anndata(adata)` when
 `adata.isbacked` is true.
 
@@ -204,11 +227,19 @@ For regression coverage, see
 `pyscx.to_h5ad` / `pyscx.to_h5mu` with `stream=True` vs
 `stream=False`, run via
 `benchmarks/comprehensive/scripts/run_slurm_export_streaming.sh`).
-The streaming row's `streaming_peak_rss_mb` is gated on `census_1m`
-in `benchmarks/comprehensive/thresholds.yaml` at the same `2048 MB`
-ceiling as the ingestion floor; a cross-shard accumulator leak in
-`scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor
-without needing a wall-clock signal.
+The streaming row's `streaming_peak_rss_mb` is gated on `census_1m` in
+`benchmarks/comprehensive/thresholds.yaml`, measured on the arm pinned to
+`reader_threads=4`; a cross-shard accumulator leak in
+`scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor without
+needing a wall-clock signal.
+
+Measured 2026-08-22 (job 2834726, median of 3, census_1m → h5ad): **3.17 GB**
+peak at `reader_threads=4`, 5.62 GB at the default 16, against **13.98 GB** for
+`stream=False`. The materialise arm calls `read_all_csr_shards_filtered()` and
+holds the whole CSR triplet, so the ~4.4× separation at the pinned thread count
+is the contract working. Before the harness was fixed that arm reported 913 MB —
+under-stated by 15×, which made the two arms look indistinguishable and the
+comparison this benchmark exists for vacuous.
 
 ## Column Projection (2000 HVGs)
 

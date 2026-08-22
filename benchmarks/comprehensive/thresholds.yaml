@@ -1659,14 +1659,30 @@ absolute_floors:
     max: 4.0         # ~2.5× measured 1.61s
 
   # ─── Streaming h5ad → SCX conversion (Phase 10) ─────────────────────
-  # The streaming converter's whole point is bounded peak memory: at
-  # `DEFAULT_SHARD_TARGET_ROWS = 16384`, ~5% density, ~20 000 vars, the
-  # per-shard ceiling is ~130 MB and the always-resident indptr is
-  # ~80 MB at 10M cells (see docs/performance.md § "Streaming
-  # conversion"). A regression on the streaming row that pushes
-  # `peak_rss_mb` above a generous multiple of that bound means
-  # something has started accumulating across shards — exactly the
-  # failure mode the streaming design exists to prevent.
+  # The streaming converter's whole point is bounded peak memory — bounded by
+  # SHARDS IN FLIGHT, not by file size. `streaming_peak_rss_mb` comes from the
+  # arm pinned to `conversion_streaming.GATED_READER_THREADS` (4), because the
+  # parallel reader holds `reader_threads + writer_queue_depth` shards and
+  # `reader_threads` otherwise defaults to `available_parallelism()` — which
+  # would make this threshold a property of the runner rather than of the code.
+  # The unpinned number is recorded as `streaming_default_threads_peak_rss_mb`
+  # and deliberately not gated.
+  #
+  # Derivation for census_1m, 2026-08-22 (job 2834726, three runs):
+  #   nnz/cell                    1402
+  #   one 16384-row shard         16384 × 1402 × 16 B  = 351 MB
+  #   ~6 in flight at rt=4        (4 readers + writer queue) = 2.1 GB
+  #   + interpreter/import base   ~0.35 GB (measured on pbmc3k)
+  #   = predicted                 ~2.4 GB
+  #   measured                    2278 / 2335 / 2423 MB
+  # Floor set at 4096 MB — ~1.7× the worst observed, tight enough to catch a
+  # doubling (which is what an accumulator leak looks like) and loose enough to
+  # absorb allocator variance. The previous 2048 MB was "~10× the design
+  # ceiling" of ~130 MB/shard, derived for ~20 000 vars at ~5% density on a
+  # SEQUENTIAL reader holding one shard; the parallel ingest reader landed four
+  # days after that floor was written (2026-05-15 vs 2026-05-19) and census_1m's
+  # per-shard working set is 2.7× the assumed one. The floor was never evaluated
+  # in between, because the benchmark was absent from ALL_BENCHMARKS.
   #
   # Wall-clock is intentionally NOT gated: the materialise path naturally
   # wins on datasets that fit in RAM (parallel shard encode over
@@ -1676,8 +1692,8 @@ absolute_floors:
   - benchmark: conversion_streaming
     format: scx_streaming_vs_materialize
     dataset: census_1m
-    metric: streaming_peak_rss_mb     # only streaming runs carry this key
-    max: 2048.0       # ~10× the design ceiling; trips on accumulator leaks.
+    metric: streaming_peak_rss_mb     # the reader_threads=4 arm only
+    max: 4096.0
 
   # ─── Streaming SCX → h5ad / h5mu export (Phase 8) ──────────────────
   # Mirror of the ingestion floor above. Streaming export's contract
@@ -1688,11 +1704,18 @@ absolute_floors:
   # this floor. Wall-clock is intentionally not gated — materialise
   # naturally wins on datasets that fit in RAM, and a streaming wall
   # regression doesn't change the bounded-memory contract.
+  # Same pinned-arm construction as the ingestion floor above.
+  # Measured on census_1m at rt=4 (job 2834726): 3128 / 3167 / 3205 MB. Higher
+  # than ingest's 2335 MB at the same thread count because the decode pool and
+  # the HDF5 write buffers are both live while the writer runs on the calling
+  # thread; and it scales more gently with threads for the same reason
+  # (3128 → 5416 MB from 4 to 16, against ingest's 2278 → 5647).
+  # Floor at 5120 MB, ~1.6× the worst observed.
   - benchmark: export_streaming
     format: scx_streaming_vs_materialize
     dataset: census_1m
-    metric: streaming_peak_rss_mb     # only streaming runs carry this key
-    max: 2048.0       # ~10× the design ceiling; mirrors the ingestion floor.
+    metric: streaming_peak_rss_mb     # the reader_threads=4 arm only
+    max: 5120.0
 
   # ─── Grouped sharding (sort / convert --group-by) ─────────────────
   # Correctness-only floors (perf is hardware/density sensitive — see the
