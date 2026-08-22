@@ -494,12 +494,20 @@ mod tests {
                 .unwrap();
                 ranges.push((shard * 4, shard * 4 + 4));
             }
-            let opts = scx_engine::PredicateIndexBuildOptions {
-                forced_columns: vec!["cell_type".to_string()],
-                preset_columns: Vec::new(),
-                auto_threshold: 0,
-                high_cardinality_threshold: scx_engine::HIGH_CARDINALITY_THRESHOLD,
-            };
+            // Through the real resolver, not a hand-built options struct: it is
+            // the one place the high-cardinality cap is set (ORG-6.14-2, and the
+            // CI guard that enforces it caught the hand-built version here), and
+            // it means this fixture is built the way production builds one.
+            let opts = scx_engine::resolve_predicate_index_build_options(
+                &scx_engine::ConversionPredicateIndexOptions {
+                    index_obs: vec!["cell_type".to_string()],
+                    index_var: vec![],
+                    index_preset: None,
+                    index_auto_threshold: 0,
+                },
+            )
+            .unwrap()
+            .obs;
             let mut outcomes = Vec::new();
             let mut named = Vec::new();
             let bytes = scx_engine::build_obs_predicate_index_bytes(
