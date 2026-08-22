@@ -29,11 +29,12 @@ use scx_format_io::error::ScxError;
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::SectionType;
 
-use super::write::{
-    build_unified_export_schema, scan_column_export_layout, write_dataframe_group_at,
-    write_dataframe_group_filtered_at, write_dataframe_group_from_shards, write_obsm_entry_at,
-    write_uns_entries_at,
+use super::column_stream::{
+    write_dataframe_group_at, write_dataframe_group_filtered_at, write_dataframe_group_from_shards,
 };
+use super::columns::{build_unified_export_schema, scan_column_export_layout};
+use super::uns::write_uns_entries_at;
+use super::write::write_obsm_entry_at;
 use crate::h5_write_util::vlu;
 use crate::pipeline::ConvertError;
 use crate::warnings::{ConvertWarning, WarningSink};
@@ -504,7 +505,7 @@ fn stream_csr_into_prealloc_parallel(
 
     // Pool, bounded channel, rolling-window spawn, reorder buffer and the
     // panic-to-`Err` conversion all live in `crate::parallel_drain`, shared
-    // with the ingest coordinator in `pipeline.rs`. Export keeps only what is
+    // with the ingest coordinator in `pipeline/coordinator.rs`. Export keeps only
     // its own: decoding a shard, and the envelope its failures wear.
     crate::parallel_drain::ordered_parallel_drain(
         n_shards,

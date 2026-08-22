@@ -858,7 +858,7 @@ fn sample_modality_values(
 ///
 /// Per-shard validate + rebase + index-narrow go through the shared
 /// `scx_sparse` helpers (`shard_nnz_bounds` + `rebase_csr_shard`), matching the
-/// eager `pipeline.rs` and streaming `h5ad/stream.rs` ingest paths. This also
+/// eager `pipeline/shards.rs` and streaming `h5ad/stream.rs` ingest paths. This also
 /// runs the `indices < n_vars` column-bound check (via `validate_csr_arrays`)
 /// that the previously hand-rolled h5mu loops skipped.
 #[allow(clippy::too_many_arguments)]
@@ -965,7 +965,8 @@ fn write_modality_csc_shards_from_csr(
     value_encoding: ValueEncoding,
     codec_id: CodecId,
     csc_cols_per_shard: usize,
-    // Same threading as the single-modality sibling in `pipeline.rs`: the bound
+    // Same threading as the single-modality sibling in
+    // `pipeline/coordinator.rs`: the bound
     // is on the emitted shard's column count, so passing the builder's 4 GiB
     // default here made `--memory-budget` inert for multimodal sidecars too.
     memory_budget: Option<u64>,

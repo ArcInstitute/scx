@@ -1221,15 +1221,17 @@ fn parallel_export_worker_panic_does_not_deadlock() {
 /// ⚠️ **This is the assertion `dense_parallel_with_memory_budget_byte_identical`
 /// never made, and without which its two arms are secretly one arm.** That test
 /// asks for `reader_threads = Some(4)`, but the budget derate collapses the
-/// grant to 1 and `pipeline.rs`'s `if granted <= 1` routes it to the
+/// grant to 1 and the `if granted_threads <= 1` branch in
+/// `pipeline::coordinator::run_streaming_writer_coordinator` routes it to the
 /// *sequential* coordinator — so it compares the sequential path against itself
 /// and byte-identity is trivially true. Its own comment computes
 /// `(8192 / 200) / 4 = 10` and then asserts nothing about it.
 ///
 /// The oracle is `parallel_drain::hooks::last_run_peak()`, a thread-local set
 /// at the tail of `ordered_parallel_drain`. Only two production callers exist —
-/// parallel ingest (`pipeline.rs:2286`) and parallel export
-/// (`stream_write.rs:509`) — and the sequential coordinator calls neither, so it
+/// parallel ingest (`pipeline::coordinator::streaming_writer_coordinator_parallel`)
+/// and parallel export (`h5ad::stream_write::stream_csr_to_group_at`) — and the
+/// sequential coordinator calls neither, so it
 /// leaves the counter at its initial `0`. That makes `0` vs `> 0` an exact
 /// answer to "which coordinator ran", which is the only question this test asks.
 /// (It is deliberately *not* an assertion about how much concurrency was
@@ -1332,7 +1334,8 @@ fn dense_convert_under_a_memory_budget_stays_parallel() {
 /// ⚠️ **This bug is not §11.5 and is not in the code review at all.** §11.5 is
 /// the ÷4-then-×2 double-count, which costs parallelism; this is the ÷4 being
 /// keyed to the wrong unit, which costs the budget itself. They live on the
-/// same line (`dense_stream.rs:142`) and are fixed by the same split, but only
+/// same line — `dense_stream`'s `max_slab_rows` computation, now
+/// `budget::dense_max_slab_rows` — and are fixed by the same split, but only
 /// one of them was known.
 ///
 /// What is resident at peak, from `read_range_inner` and `read_dense_slab_f32`,

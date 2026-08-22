@@ -383,7 +383,7 @@ SCX → h5ad/h5mu (export) shard processing via rayon worker pools.
 
 ### Parallel streaming ingest (h5ad/h5mu → SCX)
 
-`run_streaming_writer_coordinator` in `scx-convert/src/pipeline.rs` routes
+`run_streaming_writer_coordinator` in `scx-convert/src/pipeline/coordinator.rs` routes
 to `streaming_writer_coordinator_parallel` when `reader_threads > 1`, the
 reader supports indexed row-range reads, and libhdf5 is thread-safe
 (`H5is_library_threadsafe` probe). The parallel coordinator:

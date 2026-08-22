@@ -1650,7 +1650,8 @@ fn effective_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataTyp
 ///
 /// * The schema-level `pandas` envelope naming `index_columns`. Without it the
 ///   h5ad exporter falls back to "field 0 is the index"
-///   (`scx-convert::h5ad::write::write_dataframe_header`), which is true for a
+///   (`write_dataframe_header`, in `scx-convert/src/h5ad/column_stream.rs` and
+///   private to it), which is true for a
 ///   CLI-converted file and false after an obs rewrite — so every exported
 ///   cell got renamed to the first string column's value.
 /// * The per-field `scx.categorical.ordered` flag, which is stamped on exactly

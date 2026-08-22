@@ -183,7 +183,8 @@ impl DenseXStreamReader {
     /// sparsify into a `StreamedCsrShard` without mutating internal
     /// state. Subject to the same `max_slab_rows` budget cap as
     /// `next_csr_shard`; callers (the parallel coordinator) must size
-    /// their ranges accordingly via [`crate::pipeline::compute_shard_row_ranges`]
+    /// their ranges accordingly via the pipeline coordinator's
+    /// `compute_shard_row_ranges`
     /// with `target_rows ≤ max_slab_rows`.
     fn read_range_inner(
         &self,

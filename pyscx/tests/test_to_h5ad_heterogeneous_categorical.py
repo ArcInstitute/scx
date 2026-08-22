@@ -15,9 +15,9 @@ green regression tests covering both **string** and **numeric** categoricals
 **Phase-0 finding (kept for the record):** the spec originally claimed
 ``to_h5ad(stream=False)`` was a working workaround. It is not, for a
 *sharded* obs axis: both ``write_scx_to_h5ad`` (stream=False) and
-``write_scx_to_h5ad_streaming`` route obs through the same
-``write_dataframe_group_streaming`` writer (``stream_write.rs:57`` only takes
-the eager ``read_obs`` branch when the shard count is 0). So *both* flags were
+``write_scx_to_h5ad_streaming`` route obs through the same shard-stream writer
+(``write_obs_streaming_or_eager`` only takes the eager ``read_obs`` branch when
+``obs_metadata_shard_count() == 0``). So *both* flags were
 broken before the fix and *both* are exercised here as a regression guard;
 ``to_anndata()`` is the authoritative read baseline. Category code **order** is
 best-effort (spec §6) — equality is asserted **by value**, not by code.

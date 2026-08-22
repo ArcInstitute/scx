@@ -567,15 +567,40 @@ jobs:
       # The convention the grep keys on: an export-only option is named
       # `export_*`. Declaring one on `IngestOptions` re-creates the whole "flag
       # silently ignored on the wrong direction" class (review 1.1, 11.12).
+      #
+      # This step used to name `scx-convert/src/pipeline.rs` and `sed` the struct
+      # out of it. ORG-11.16-6 moved `IngestOptions` to `options.rs` (beside
+      # `ExportOptions`) and turned `pipeline.rs` into `pipeline/mod.rs`, and
+      # EITHER change silently disarmed the guard: `sed` on a file that no longer
+      # holds the struct emits nothing, `grep` on empty input exits 1, and the
+      # `if` is therefore false. Green. Measured on the 6e branch with a real
+      # `pub export_bogus` field added to `IngestOptions`: the old guard passed.
+      #
+      # (The old `set -e` was not `pipefail`, so a missing file did not even
+      # surface as an error -- `sed`'s status is discarded as the left side of a
+      # pipe. That is the second, independent way it went vacuous.)
+      #
+      # So: find the declaration instead of assuming its path, and FAIL when the
+      # search comes up empty or ambiguous. A guard that cannot tell "nothing to
+      # check" from "checked, nothing wrong" is not a guard.
       - name: No export-only option is declared on the ingest options
         run: |
-          set -e
+          set -euo pipefail
           if grep -rEn --include='*.rs' 'fn reject_export_row_filter_on_import' . \
                | grep -v '^./target'; then
             echo "::error::reject_export_row_filter_on_import is back — the ingest/export split is what makes it unnecessary (ORG-11.16-3)."
             exit 1
           fi
-          if sed -n '/^pub struct IngestOptions {/,/^}/p' scx-convert/src/pipeline.rs \
+          src=$(grep -rlE '^pub struct IngestOptions \{' --include='*.rs' scx-convert/src || true)
+          if [ -z "$src" ]; then
+            echo "::error::no 'pub struct IngestOptions {' declaration found under scx-convert/src — this guard just went vacuous. Retarget it rather than deleting it (ORG-11.16-3)."
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$src" | wc -l)" -ne 1 ]; then
+            echo "::error::more than one IngestOptions declaration, so the grep below would only check one of them: $src"
+            exit 1
+          fi
+          if sed -n '/^pub struct IngestOptions {/,/^}/p' "$src" \
                | grep -nE '^[[:space:]]*pub[[:space:]]+export_'; then
             echo "::error::an export-only option (export_*) is declared on IngestOptions — it belongs on ExportOptions (ORG-11.16-3)."
             exit 1
@@ -637,7 +662,7 @@ jobs:
           fi
       # The arithmetic grep above cannot see a budget bypassed as a CONSTANT or a
       # STRING rather than a division -- which is how the CSC sidecar ignored
-      # `memory_budget` for three releases while `pipeline.rs` documented the
+      # `memory_budget` for three releases while the pipeline documented the
       # opposite: the call sites passed `DEFAULT_CSC_MEMORY_BYTES` and the
       # literal "4G". Both spellings now come from
       # `budget::csc_sidecar_bytes(opts.memory_budget)`.
@@ -666,12 +691,35 @@ jobs:
       # to find. The two dense sites that drifted apart in 11.5 -- the slab cap
       # in `open_dense_streaming` and the estimate in `per_worker_bytes` -- must
       # each derive from it. Re-splitting them is exactly the double-count.
+      #
+      # Names a single FILE, which is the same coupling that silently disarmed the
+      # IngestOptions guard above -- and it fails the same way, verified: with the
+      # path missing, `grep -c` writes nothing, `|| true` swallows the error, `n`
+      # is the empty string, and `[ "" -lt 3 ]` exits 2 with "integer expression
+      # expected", which makes the `if` FALSE. Vacuous pass, with the diagnosis
+      # buried in stderr. 6e does not move `dense_stream.rs`, so the assertion
+      # below is pre-emptive rather than a fix -- but the guard is one file move
+      # away from silence and there is no reason to leave it there.
       - name: Both dense budget sites derive from one table entry
         run: |
-          n=$(grep -cE 'budget::dense_(slab_bytes|max_slab_rows|min_budget|peak_bytes_per_elem)[[:space:]]*\(' \
-                scx-convert/src/h5ad/dense_stream.rs || true)
-          if [ "$n" -lt 3 ]; then
-            echo "::error::expected at least 3 budget::dense_* call sites in dense_stream.rs (slab cap, refusal message, per_worker_bytes estimate), found $n. Re-deriving any of them locally is the 11.5 double-count (ORG-11.16-5)."
+          set -euo pipefail
+          f=scx-convert/src/h5ad/dense_stream.rs
+          if [ ! -f "$f" ]; then
+            echo "::error::$f not found — this guard just went vacuous. Retarget it rather than deleting it (ORG-11.16-5)."
+            exit 1
+          fi
+          # Count CALLS, not mentions. The original counted 5 "sites" in this
+          # file, one of which is a doc comment on line 8 naming
+          # `dense_peak_bytes_per_elem` in prose -- so with a threshold of 3 the
+          # guard tolerated a real call being inlined away and still passed
+          # (verified). Comment lines are excluded and the floor is the actual
+          # production call count, which makes losing any one of them fail.
+          n=$(grep -nE 'crate::budget::dense_(slab_bytes|max_slab_rows|min_budget|peak_bytes_per_elem)[[:space:]]*\(' \
+                "$f" \
+                | grep -vE '^[0-9]+:[[:space:]]*(//|///|//!)' \
+                | wc -l)
+          if [ "${n:-0}" -lt 4 ]; then
+            echo "::error::expected at least 4 crate::budget::dense_* CALLS in $f (slab cap, refusal message, per_worker_bytes estimate), found ${n:-0} (comment lines excluded). Re-deriving any of them locally is the 11.5 double-count (ORG-11.16-5)."
             exit 1
           fi
 

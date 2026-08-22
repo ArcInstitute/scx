@@ -2201,7 +2201,7 @@ fn dense_sparsify_allocates_exactly() {
 /// own 4 GiB default.
 ///
 /// `write_csc_sidecar` documents its bound as "`cols_per_shard` or
-/// `memory_budget_bytes`, whichever is smaller", and `pipeline.rs` documented
+/// `memory_budget_bytes`, whichever is smaller", and the pipeline documented
 /// the convert side the same way — but every convert call site passed the
 /// 4 GiB default unconditionally, so `--memory-budget 512M --csc always` let
 /// sidecar generation claim 4 GiB regardless. The doc was true of the callee and

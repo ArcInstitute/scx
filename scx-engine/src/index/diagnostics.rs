@@ -13,7 +13,7 @@ use std::borrow::Cow;
 /// column that doesn't exist in the source DataFrame. Adds the
 /// available column list and, when one is close enough, a single
 /// `Did you mean '<col>'?` suggestion (Levenshtein-normalised
-/// threshold ≥ 0.6). Shared by `scx-convert/src/pipeline.rs` (CLI
+/// threshold ≥ 0.6). Shared by `scx-convert/src/pipeline/index.rs` (CLI
 /// path) and `pyscx/src/convert/from_anndata.rs` (Python path) so both surfaces
 /// emit the same message. — E2-2026-05-20.
 ///

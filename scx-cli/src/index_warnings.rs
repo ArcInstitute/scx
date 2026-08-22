@@ -1,7 +1,7 @@
 //! Shared rendering for predicate-index outcomes from the `scx merge`,
 //! `scx append`, and `scx compact` subcommands.
 //!
-//! Mirrors `scx-convert::pipeline::process_predicate_index_outcomes`
+//! Mirrors `scx-convert/src/pipeline/index.rs::process_predicate_index_outcomes`
 //! semantics in plain `eprintln!`s: forced-column errors are reported
 //! by the rewrite op (it returns an error before producing a summary),
 //! preset skips become per-column stderr warnings, and a multimodal

@@ -83,7 +83,7 @@ pub trait CsrShardStream {
 /// Implementers must be `Send + Sync` and stateless across calls
 /// (no internal cursor). The streaming writer coordinator partitions
 /// the matrix into `[(row_start, n_rows)]` ranges via
-/// [`crate::pipeline::compute_shard_row_ranges`] and fans them out
+/// the pipeline coordinator's `compute_shard_row_ranges` and fans them out
 /// across a rayon worker pool. The encoded shards funnel through a
 /// bounded reorder buffer and are written in shard-index order so
 /// the output `.scx` file is byte-identical to the sequential path.
@@ -127,8 +127,8 @@ pub trait IndexedCsrShardStream: Send + Sync {
     /// override it to size the dense slab buffer instead.
     fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
         let density_den: u64 = match modality_type {
-            ModalityType::Atac => crate::pipeline::PARALLEL_DENSITY_ATAC_DEN,
-            _ => crate::pipeline::PARALLEL_DENSITY_DEFAULT_DEN,
+            ModalityType::Atac => crate::budget::PARALLEL_DENSITY_ATAC_DEN,
+            _ => crate::budget::PARALLEL_DENSITY_DEFAULT_DEN,
         };
         let est = (shard_target_rows as u64)
             .saturating_mul(self.n_vars())

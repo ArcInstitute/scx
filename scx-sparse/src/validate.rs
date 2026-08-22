@@ -158,7 +158,7 @@ pub fn shard_nnz_bounds(
 /// from disk and never hold the whole array.
 ///
 /// Single source of truth for the per-shard rebase performed by every
-/// ingest path (the two eager `pipeline.rs` sites, the two streaming
+/// ingest path (the three eager `pipeline/shards.rs` sites, the two streaming
 /// `h5ad/stream.rs` readers, and the materialized-CSC
 /// `h5ad/csc_stream.rs` reader). Folding them here closed review findings
 /// C5 (missing monotonicity guard) and C6 (the eager sites previously

@@ -58,7 +58,8 @@ pub fn merge(input_paths: &[&Path], output_path: &Path) -> Result<()> {
 /// / `VarPredicateIndex` sections after the obs / var sections and
 /// before `provenance`. The returned [`PredicateIndexBuildSummary`]
 /// carries per-axis outcomes so the caller can emit user-facing warnings
-/// on its own channel (see `scx-convert::pipeline::process_predicate_index_outcomes`
+/// on its own channel (see
+/// `scx-convert/src/pipeline/index.rs::process_predicate_index_outcomes`
 /// for the reference outcome → `ConvertWarning` mapping).
 ///
 /// Multimodal merge currently cannot persist predicate-index sections
@@ -868,7 +869,7 @@ pub fn merge_with_options(
         }
     }
     // Record the actually-indexed columns in provenance (mirrors the convert
-    // path at `scx-convert/src/pipeline.rs`) so the merge record carries an
+    // path at `scx-convert/src/pipeline/index.rs`) so the merge record carries an
     // audit trail of which predicate indexes were rebuilt — closes the
     // "NO index field in params_json" gap reported against atlas merges.
     let mut params = serde_json::json!({

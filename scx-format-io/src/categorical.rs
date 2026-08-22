@@ -52,7 +52,8 @@
 //! [`crate::reader::ScxReader::distinct_obs_values`], which *can* stop early.
 //!
 //! The interning strategy is lifted from `scx-convert`'s streaming h5ad
-//! categorical writer (`h5ad/write.rs`'s `CatAccum` / `local_categorical_view`),
+//! categorical writer (`h5ad/categorical.rs`'s `CatAccum` /
+//! `local_categorical_view`),
 //! which solves the same problem on the write side. It is duplicated rather than
 //! shared because `scx-convert` is `hdf5`-feature-gated and this must build on a
 //! default `cargo test`.
