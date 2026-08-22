@@ -283,3 +283,79 @@ def test_archive_raw_results_signature_takes_datasets():
         assert "datasets=args.datasets" in src, (
             "archive_raw_results is called without forwarding --datasets"
         )
+
+
+def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
+    """End-to-end plumbing for the one metric `thresholds.yaml` floors.
+
+    Monkeypatches the subprocess worker so this stays a unit test, and asserts
+    what `_load_current_raw_metric` will actually read: `runs[].extra` must carry
+    `streaming_peak_rss_mb` as a **top-level** key on the streaming runs. The AST
+    guard above catches the `extra={...}` spelling; this catches any other way of
+    burying the metric, and it is the assertion that was missing when the floor
+    sat unevaluable.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    calls = []
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None):
+        calls.append(scenario)
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0,
+            "structural": {"n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1},
+            "output_bytes": 10,
+        }]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        result = cs._run_isolated(
+            pathlib.Path("/nonexistent.h5ad"), 1,
+            BenchmarkResult(
+                benchmark="conversion_streaming",
+                format="scx_streaming_vs_materialize",
+                dataset="unit",
+                metadata={"scenarios": []},
+            ),
+        )
+    finally:
+        cs._run_arm_subprocess = original
+
+    # One process per arm — the whole point of the isolation.
+    assert calls == ["streaming", "materialize"], calls
+
+    streaming = [r for r in result.runs if r.extra.get("scenario") == "streaming"]
+    assert streaming, "no streaming run recorded"
+    for r in streaming:
+        assert "streaming_peak_rss_mb" in r.extra, (
+            f"the floored metric is not a top-level key in extra: {sorted(r.extra)}"
+        )
+        assert "extra" not in r.extra, "extra is nested one level too deep"
+    assert result.metadata["structural"]["equal"] is True
+
+
+def test_both_streaming_modules_use_the_true_peak_sampler():
+    """`*_peak_rss_mb` has to be a peak.
+
+    Both modules previously computed `max(before, after)` of the instantaneous
+    RSS while their docstrings argued the under-report was harmless "because the
+    streaming path's memory profile is bounded structurally" — i.e. assuming the
+    property the floor exists to verify. Six sibling benchmark modules already
+    use `PeakRssSampler`.
+    """
+    bench_dir = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+    for name in ("conversion_streaming.py", "export_streaming.py"):
+        text = (bench_dir / name).read_text()
+        assert "PeakRssSampler" in text, f"{name} does not use the peak sampler"
+        code = "\n".join(
+            l for l in text.splitlines()
+            if not l.lstrip().startswith("#")
+        )
+        assert "max(rss_before, rss_after)" not in code, (
+            f"{name} still reports max(before, after) as a peak"
+        )

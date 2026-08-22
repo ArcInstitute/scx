@@ -46,7 +46,7 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.rss import current_rss_mb
+from benchmarks.comprehensive.rss import PeakRssSampler
 
 
 log = logging.getLogger(__name__)
@@ -181,23 +181,30 @@ def _timed_export_h5ad(
     out_path: Path,
     stream: bool,
 ) -> dict[str, float]:
-    """Run ``pyscx.to_h5ad`` and capture wall + RSS deltas.
+    """Run ``pyscx.to_h5ad`` and capture wall + the true in-region peak RSS.
 
-    Mirrors ``conversion_streaming.py``'s ``_timed_streaming``/
-    ``_timed_materialize`` envelope: ``max(before, after)`` RSS via
-    ``current_rss_mb`` (no sampler thread). For short exports this
-    under-reports the peak; the streaming path's memory profile is
-    bounded structurally so under-report is harmless for regression
-    detection.
+    Uses :class:`PeakRssSampler`, as ``ooc_rss_boundary`` / ``ooc_loader`` /
+    ``cellset_gather`` / ``obs_open`` / ``shuffle_layout`` / ``grouped_read``
+    already do.
+
+    It previously took ``max(before, after)`` of the *instantaneous* RSS, and
+    argued in this docstring that under-reporting was "harmless for regression
+    detection" because "the streaming path's memory profile is bounded
+    structurally" — which assumes exactly the property the
+    ``streaming_peak_rss_mb`` floor exists to check. Measured consequence: the
+    materialize arm, which calls ``read_all_csr_shards_filtered()`` and holds
+    the whole ~11 GB CSR triplet for census_1m, reported **913 MB** — within 1%
+    of the streaming arm. The comparison the benchmark is named for was
+    indistinguishable in both arms, and the floor gated a number that was not a
+    peak.
     """
     import pyscx
 
-    rss_before = current_rss_mb()
     t0 = time.perf_counter()
-    pyscx.to_h5ad(str(scx_path), str(out_path), stream=stream)
+    with PeakRssSampler() as sampler:
+        pyscx.to_h5ad(str(scx_path), str(out_path), stream=stream)
     wall = time.perf_counter() - t0
-    rss_after = current_rss_mb()
-    return {"wall_s": wall, "peak_rss_mb": max(rss_before, rss_after)}
+    return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
 
 
 def _timed_export_h5mu(
@@ -208,12 +215,11 @@ def _timed_export_h5mu(
     """Multimodal sibling of ``_timed_export_h5ad``."""
     import pyscx
 
-    rss_before = current_rss_mb()
     t0 = time.perf_counter()
-    pyscx.to_h5mu(str(scx_path), str(out_path), stream=stream)
+    with PeakRssSampler() as sampler:
+        pyscx.to_h5mu(str(scx_path), str(out_path), stream=stream)
     wall = time.perf_counter() - t0
-    rss_after = current_rss_mb()
-    return {"wall_s": wall, "peak_rss_mb": max(rss_before, rss_after)}
+    return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
 
 
 # ---------------------------------------------------------------------------
