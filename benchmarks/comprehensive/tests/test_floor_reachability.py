@@ -160,3 +160,126 @@ def test_materialize_arm_is_bounded_above_census_1m():
     assert cs._skip_materialize_reason(cs.MATERIALIZE_MAX_N_OBS) is None
     reason = cs._skip_materialize_reason(5_000_000)
     assert reason and "streaming arm" in reason
+
+
+# ---------------------------------------------------------------------------
+# The two ways a registered floor is still unevaluable
+# ---------------------------------------------------------------------------
+#
+# Registration gets a benchmark scheduled. Two further silent steps sit between
+# "it ran" and "its floor was checked", and job 2834602 hit both at once.
+
+
+def test_no_benchmark_passes_extra_as_a_dict():
+    """`BenchmarkResult.add_run` takes `**extra`.
+
+    `add_run(..., extra={...})` therefore nests the payload under a literal
+    `"extra"` key, so `_load_current_raw_metric` — which reads
+    `runs[].extra[<metric>]` — never finds the metric and the floor is reported
+    as a missing-metric violation or skipped entirely.
+
+    `conversion_streaming` did this at all three call sites while carrying a
+    comment explaining that the mirroring existed *for* the gate;
+    `export_streaming` has a comment warning against it. A grep is the whole
+    check, and it is cheap enough to keep.
+    """
+    import ast
+
+    bench_dir = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+    assert bench_dir.is_dir(), f"{bench_dir} moved — retarget this test"
+
+    # Parsed, not grepped. A regex over the source flags this test's own
+    # explanatory comment — and the comment above the fixed call site contains
+    # the literal `extra={`, which is precisely the "a grep cannot tell a call
+    # from a sentence" failure. `ast` sees calls only.
+    offenders = []
+    for path in sorted(bench_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+            if name != "add_run":
+                continue
+            for kw in node.keywords:
+                if kw.arg == "extra" and isinstance(kw.value, ast.Dict):
+                    offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        "add_run() takes **extra, so these sites nest the payload under a "
+        f"literal 'extra' key and their metrics are invisible to the gate: "
+        f"{offenders}. Pass them as keyword arguments (or splat with **{{...}})."
+    )
+
+
+def test_archive_honours_the_effective_dataset_list():
+    """`--datasets` can name a dataset outside `--tier`.
+
+    `archive_raw_results` used to filter on `tier_cfg["datasets"]` alone, so
+    `--tier small --datasets census_1m` ran the benchmarks and archived none of
+    the results: census_1m is not in tier small. The candidate snapshot came out
+    empty, every floor was skipped as a scoped-out triple, and the gate returned
+    0 — a pass over nothing measured, which is the failure mode this whole file
+    exists for.
+    """
+    import importlib
+
+    cb = importlib.import_module("benchmarks.comprehensive.scripts.capture_baseline")
+
+    import json
+    import pathlib
+    import tempfile
+
+    small = cb.TIERS["small"]
+    assert "census_1m" not in small["datasets"], (
+        "premise: census_1m must be outside tier small for this test to mean "
+        "anything. If the tier changed, pick another out-of-tier dataset."
+    )
+    # The tier filter alone rejects it, which is the mechanism under test.
+    name = "conversion_streaming__scx_streaming_vs_materialize__census_1m.json"
+    assert not cb._tier_matches(name, small)
+
+    # Drive `archive_raw_results` itself. Asserting on `_tier_matches` with a
+    # hand-widened dict passed with the fix reverted — it never reached the
+    # widening inside the function, which is the thing that broke.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        fake_raw = tmp / "raw_src"
+        fake_raw.mkdir()
+        (fake_raw / name).write_text(json.dumps({
+            "schema_version": 2, "benchmark": "conversion_streaming",
+            "format": "scx_streaming_vs_materialize", "dataset": "census_1m",
+            "runs": [{"wall_s": 1.0, "peak_rss_mb": 1.0,
+                      "extra": {"streaming_peak_rss_mb": 800.0}}],
+        }))
+        snapshot = tmp / "snap"
+        orig = cb.RAW_DIR
+        try:
+            cb.RAW_DIR = fake_raw
+            cb.archive_raw_results(small, snapshot, datasets=["census_1m"])
+        finally:
+            cb.RAW_DIR = orig
+        archived = sorted(p.name for p in (snapshot / "raw").glob("*.json"))
+    assert archived == [name], (
+        f"an out-of-tier --datasets result was not archived (got {archived}); "
+        f"the candidate snapshot would be empty and every floor silently skipped"
+    )
+
+
+def test_archive_raw_results_signature_takes_datasets():
+    """Guard the fix itself: the parameter has to exist and be wired, or the
+    behaviour above silently reverts to tier-only filtering."""
+    import importlib
+    import inspect
+
+    cb = importlib.import_module("benchmarks.comprehensive.scripts.capture_baseline")
+    sig = inspect.signature(cb.archive_raw_results)
+    assert "datasets" in sig.parameters, (
+        "archive_raw_results lost its `datasets` parameter — an out-of-tier "
+        "--datasets run would archive nothing again"
+    )
+    src = inspect.getsource(cb.main) if hasattr(cb, "main") else cb.__file__
+    if isinstance(src, str) and "def main" in src:
+        assert "datasets=args.datasets" in src, (
+            "archive_raw_results is called without forwarding --datasets"
+        )

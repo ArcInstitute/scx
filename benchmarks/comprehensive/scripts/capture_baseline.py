@@ -289,13 +289,12 @@ def _tier_matches(filename: str, tier_cfg: dict[str, Any]) -> bool:
     if len(parts) != 3 or not parts[-1].endswith(".json"):
         return False
     dataset = parts[-1][:-len(".json")]
-    if dataset in tier_cfg["datasets"]:
+    keys = tier_cfg["datasets"]
+    if dataset in keys:
         return True
     # Fallback: translate tier keys to .name fields and check there.
     from benchmarks.comprehensive.config import DATASETS
-    tier_names = {
-        DATASETS[k].name for k in tier_cfg["datasets"] if k in DATASETS
-    }
+    tier_names = {DATASETS[k].name for k in keys if k in DATASETS}
     return dataset in tier_names
 
 
@@ -304,8 +303,9 @@ def archive_raw_results(
     baseline_dir: Path,
     *,
     since_mtime: float | None = None,
+    datasets: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Copy result JSONs for the selected tier into baseline/raw/.
+    """Copy result JSONs for the selected datasets into baseline/raw/.
 
     ``since_mtime`` (epoch seconds), when set, filters out files written
     before this run started — without it, ``RAW_DIR`` accumulates results
@@ -314,8 +314,19 @@ def archive_raw_results(
     diff against that mix and report regressions that have nothing to do
     with the current commit.
 
+    ``datasets`` is the **effective** list — what ``--datasets`` narrowed the
+    run to, which is not necessarily a subset of the tier. Without it this
+    filtered on ``tier_cfg["datasets"]`` alone, so
+    ``--tier small --datasets census_1m`` ran every benchmark on census_1m and
+    then archived **none** of the results, because census_1m is not in tier
+    small. The snapshot came out empty, `check_absolute_floors` skipped every
+    floor as a scoped-out triple, and the gate reported zero regressions and
+    exited 0 — a green gate over nothing measured. Observed on job 2834602.
+
     Returns a per-file summary dict suitable for summary.json.
     """
+    if datasets:
+        tier_cfg = {**tier_cfg, "datasets": list(datasets)}
     dst = baseline_dir / "raw"
     dst.mkdir(parents=True, exist_ok=True)
 
@@ -600,13 +611,17 @@ def main() -> int:
     if args.mode != "fingerprint-only":
         summary = archive_raw_results(
             tier_cfg, baseline_dir, since_mtime=submission_start,
+            datasets=args.datasets or None,
         )
         (baseline_dir / "summary.json").write_text(json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,
                 "snapshot_name": args.name,
                 "tier": args.tier,
-                "datasets": tier_cfg["datasets"],
+                # The effective list, not the tier's: `--datasets` can name a
+                # dataset outside the tier, and a snapshot that claims a
+                # coverage it does not have is worse than one that is narrow.
+                "datasets": list(args.datasets) if args.datasets else tier_cfg["datasets"],
                 "rows": summary,
             },
             indent=2, default=str,

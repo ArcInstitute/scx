@@ -396,21 +396,25 @@ def _run_in_process(
         with tempfile.TemporaryDirectory(prefix="scx_bench_stream_") as tmp:
             stream_out = Path(tmp) / "stream.scx"
             timings = _timed_streaming(h5ad_path, stream_out)
-            # `streaming_peak_rss_mb` / `streaming_wall_s` are mirrored
-            # into `extra` so `compare_against_baseline.py --gate` (which
-            # only reads metrics from `runs[].extra`, see
-            # `_load_current_raw_metric`) can floor the streaming
-            # scenario without dragging the materialise scenario into
-            # the median.
+            # `streaming_peak_rss_mb` / `streaming_wall_s` are mirrored into
+            # `extra` so `compare_against_baseline.py --gate` can floor the
+            # streaming scenario without dragging the materialise scenario into
+            # the median. See the note on the keyword arguments below: this
+            # comment stated the intent correctly while the call defeated it.
             result.add_run(
                 wall_s=timings["wall_s"],
                 peak_rss_mb=timings["peak_rss_mb"],
-                extra={
-                    "scenario": "streaming",
-                    "run_idx": run_idx,
-                    "streaming_peak_rss_mb": timings["peak_rss_mb"],
-                    "streaming_wall_s": timings["wall_s"],
-                },
+                # `BenchmarkResult.add_run` takes `**extra`, so these must be
+                # keyword arguments. Passing `extra={...}` nests the dict under
+                # a literal "extra" key and `_load_current_raw_metric` — which
+                # reads `runs[].extra[<metric>]` — never finds the metric. The
+                # `streaming_peak_rss_mb` floor was therefore unevaluable even
+                # after the benchmark was registered; measured on job 2834602,
+                # where every run carried `extra == {"extra": {...}}`.
+                scenario="streaming",
+                run_idx=run_idx,
+                streaming_peak_rss_mb=timings["peak_rss_mb"],
+                streaming_wall_s=timings["wall_s"],
             )
             result.metadata["scenarios"].append("streaming")
             if structural_stream is None:
@@ -432,12 +436,10 @@ def _run_in_process(
             result.add_run(
                 wall_s=timings["wall_s"],
                 peak_rss_mb=timings["peak_rss_mb"],
-                extra={
-                    "scenario": "materialize",
-                    "run_idx": run_idx,
-                    "materialize_peak_rss_mb": timings["peak_rss_mb"],
-                    "materialize_wall_s": timings["wall_s"],
-                },
+                scenario="materialize",
+                run_idx=run_idx,
+                materialize_peak_rss_mb=timings["peak_rss_mb"],
+                materialize_wall_s=timings["wall_s"],
             )
             result.metadata["scenarios"].append("materialize")
             if structural_bulk is None:
@@ -506,7 +508,7 @@ def _run_with_thread_scaling(
             result.add_run(
                 wall_s=rec["wall_s"],
                 peak_rss_mb=rec["peak_rss_mb"],
-                extra={
+                **{
                     "scenario": scenario,
                     "run_idx": rec["run_idx"],
                     "thread_count": tc,
