@@ -160,3 +160,64 @@ fn residual_predicate_needs_something_to_have_been_lost() {
     // A healthy residual.
     assert!(!residual_lost_to_cancellation(0.9e6, 1.0e6));
 }
+
+/// `first_non_finite_column` is the gate the four GPU finalize sites use in place
+/// of an input scan, so its soundness claim is load-bearing: a non-finite input
+/// value in column `j` must leave `sums[j]` non-finite.
+///
+/// Tested here on the predicate rather than through a GPU route, because the
+/// call sites need a device and this is where the reasoning lives. The four
+/// arms below are the four ways non-finiteness arises, including the two that
+/// an input scan would get wrong in opposite directions: `∞ + (−∞)` collapses to
+/// NaN (still caught), and a sum of entirely *finite* values can overflow to `∞`
+/// (caught here, invisible to an input scan).
+#[test]
+fn first_non_finite_column_catches_every_route_to_non_finite() {
+    // Clean input: no column reported.
+    assert_eq!(
+        first_non_finite_column(&[1.0, 2.0, 3.0], &[1.0, 4.0, 9.0]),
+        None
+    );
+
+    // A NaN in the sums, at a specific column.
+    assert_eq!(
+        first_non_finite_column(&[1.0, f64::NAN, 3.0], &[1.0, 4.0, 9.0]),
+        Some(1)
+    );
+    // A NaN only in the second moments is equally disqualifying.
+    assert_eq!(
+        first_non_finite_column(&[1.0, 2.0, 3.0], &[1.0, 4.0, f64::NAN]),
+        Some(2)
+    );
+    // An infinity, either sign.
+    assert_eq!(
+        first_non_finite_column(&[f64::INFINITY, 2.0], &[1.0, 4.0]),
+        Some(0)
+    );
+    assert_eq!(
+        first_non_finite_column(&[1.0, f64::NEG_INFINITY], &[1.0, 4.0]),
+        Some(1)
+    );
+
+    // The soundness argument, made concrete: NaN and ±∞ do not cancel back to a
+    // finite number, so an accumulator that is clean proves the input was.
+    assert!(
+        (f64::NAN + 5.0).is_nan(),
+        "NaN must poison any sum it joins"
+    );
+    assert!(
+        (f64::INFINITY + f64::NEG_INFINITY).is_nan(),
+        "opposite infinities must collapse to NaN, not to a finite value"
+    );
+
+    // And the case an input scan misses: every input finite, the sum is not.
+    let big = f64::MAX;
+    assert!(big.is_finite() && !(big + big).is_finite());
+    assert_eq!(first_non_finite_column(&[big + big], &[1.0]), Some(0));
+
+    // First, not any: with two bad columns the lower index is reported.
+    assert_eq!(
+        first_non_finite_column(&[f64::NAN, f64::NAN], &[1.0, 1.0]),
+        Some(0)
+    );
+}

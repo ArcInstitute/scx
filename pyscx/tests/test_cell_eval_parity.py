@@ -672,18 +672,100 @@ class TestDiscriminationDuplicateGeneParity:
                 )
 
 
-class TestDiscriminationTieParity:
-    """The tie case, against the real cell-eval rather than a hand-derived value.
+def _make_mixed_tie_discrimination_adata() -> tuple[ad.AnnData, ad.AnnData]:
+    """Four perturbations whose L1 distances from a zero prediction are [3,3,1,1].
 
-    This is the empirical answer to a caveat the Rust-side fixtures can only
-    state: cell-eval reads its rank off `np.argsort`, whose default kind is
-    `quicksort` and therefore not a stable sort, so its tie behaviour is formally
-    implementation-defined. Comparing against the installed package settles what
-    it actually does on the array sizes this metric sees.
-
-    If a future numpy changes that, this test fails rather than the claim quietly
-    becoming false.
+    Two tied blocks rather than one — the shape on which a stable and an unstable
+    argsort disagree, and therefore the shape a total-tie fixture cannot reach.
     """
+    import pandas as pd
+
+    gene_names = ["gene_0", "gene_1"]
+    perts = ["control", "p0", "p1", "p2", "p3"]
+    # Control at the origin; each perturbation's effect has |effect| in gene_0 of
+    # 3, 3, 1, 1 and nothing in gene_1. Predictions sit exactly on control, so
+    # every prediction's effect is the zero vector and each perturbation sees the
+    # same distance vector [3, 3, 1, 1].
+    base = 4.5
+    real_offsets = {"control": 0.0, "p0": 3.0, "p1": -3.0, "p2": 1.0, "p3": -1.0}
+
+    def build(offsets):
+        rows, labels = [], []
+        for pert in perts:
+            for _ in range(32):
+                rows.append([base + offsets[pert], base])
+                labels.append(pert)
+        X = np.array(rows, dtype=np.float32)
+        obs = pd.DataFrame({"perturbation": labels})
+        obs.index = [f"cell_{i}" for i in range(X.shape[0])]
+        return ad.AnnData(
+            X=sp.csr_matrix(X), obs=obs, var=pd.DataFrame(index=gene_names)
+        )
+
+    real = build(real_offsets)
+    # Prediction: every group sits on the control profile, so every predicted
+    # effect is zero.
+    pred = build({k: 0.0 for k in real_offsets})
+    return real, pred
+
+
+class TestDiscriminationTieParity:
+    """The **total**-tie case, against the real cell-eval rather than a
+    hand-derived value.
+
+    Scoped to a total tie deliberately, and the scope is the point. cell-eval
+    reads its rank off `np.argsort`, whose default kind is `quicksort` and
+    therefore *not* a stable sort — so its tie order is implementation-defined and
+    parity with it is only a meaningful claim where the stable and unstable
+    readings coincide. Measured on numpy 2.4.4, that is exactly the totally-tied
+    case:
+
+        np.argsort([5, 5, 5])                -> [0, 1, 2]   (agrees with stable)
+        np.argsort([3, 3, 1, 1])             -> [3, 2, 1, 0]
+        np.argsort([3, 3, 1, 1], kind="stable") -> [2, 3, 0, 1]
+
+    `test_mixed_ties_are_not_claimed_to_match` below covers the other side: SCX
+    keeps the stable rule, cell-eval does not, and that divergence is documented
+    rather than chased. An earlier version of this file claimed parity on ties in
+    general, which was false — found by codex in review.
+    """
+
+    def test_mixed_ties_are_not_claimed_to_match(self):
+        """A mixed tie: assert SCX's stable rule, and assert the reference differs.
+
+        This is the honest complement to the parity test above. It pins two
+        things, both of which have to hold for the documentation to be right:
+
+        1. SCX's scores equal the **stable** argsort ranks (its documented rule).
+        2. numpy's default argsort really does disagree with stable here — so if a
+           future numpy makes its default sort stable, this test fails and tells
+           us the divergence note in `docs/scanpy.md` has become obsolete, rather
+           than leaving a stale caveat in the docs forever.
+        """
+        # Distances [3, 3, 1, 1] from a zero prediction: two tied blocks.
+        d = np.array([3.0, 3.0, 1.0, 1.0])
+        default_order = list(np.argsort(d))
+        stable_order = list(np.argsort(d, kind="stable"))
+        assert default_order != stable_order, (
+            f"premise gone: numpy {np.__version__} now agrees with stable on "
+            f"{list(d)} ({default_order}). The mixed-tie divergence documented in "
+            f"docs/scanpy.md may no longer exist — recheck it."
+        )
+
+        real, pred = _make_mixed_tie_discrimination_adata()
+        scx = pyscx.accel.discrimination_score(
+            real, pred, metric="l1", exclude_target_gene=False,
+        )
+        # SCX's rule: rank = position under a STABLE ascending sort.
+        n = len(scx)
+        want = {}
+        for rank, idx in enumerate(np.argsort(d, kind="stable")):
+            want[f"p{idx}"] = 1.0 - rank / n
+        for pert, w in want.items():
+            assert scx[pert] == pytest.approx(w, abs=0), (
+                f"SCX scored '{pert}' {scx[pert]}, expected {w} from its "
+                f"documented stable tie rule. All SCX={scx}"
+            )
 
     def test_all_ties_match_cell_eval(self):
         real, pred = _make_tied_discrimination_adata()

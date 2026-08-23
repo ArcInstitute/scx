@@ -18,21 +18,31 @@
 //! norm_ranks[p]  = 1 - rank / data.perts.size
 //! ```
 //!
-//! One caveat worth stating rather than glossing: `np.argsort`'s default kind is
-//! `quicksort`, which is **not** a stable sort, so the reference's own tie
-//! behaviour is formally implementation-defined. We match the stable reading —
-//! ties break by index, which is what `kind="stable"` gives and what numpy
-//! produces on the small already-tied arrays this metric sees. That is a choice,
-//! not a derivation, and it is the only interpretation under which the reference's
-//! score is reproducible at all.
+//! One caveat, and it is sharper than the first draft of this comment said:
+//! `np.argsort`'s default kind is `quicksort`, which is **not** a stable sort, so
+//! the reference's own tie behaviour is implementation-defined. SCX matches the
+//! stable reading. That agrees with the reference on a **total** tie — measured,
+//! not assumed — and *disagrees* on a mixed tie, where numpy 2.4.4 returns
+//! reverse index order within each tied block
+//! (`np.argsort([3,3,1,1]) -> [3,2,1,0]`). The stable reading is kept anyway,
+//! because it is deterministic and reproducible across versions and languages
+//! where the reference's is neither; see
+//! [`mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity`], which pins that
+//! as SCX's contract rather than a parity claim.
 //!
 //! Distances are symmetric in all three metrics, so computing `d(pred, real)`
 //! where the reference computes `d(real, pred)` is not a fourth divergence.
 
 use super::*;
 
-/// Ties: rank must be the argsort *position*, not the count of strictly-smaller
-/// distances.
+/// A **total** tie: rank must be the argsort *position*, not the count of
+/// strictly-smaller distances.
+///
+/// Scoped to a total tie on purpose. That is the one shape where the stable and
+/// unstable readings of `np.argsort` agree, so it is the only tie shape on which
+/// exact cell-eval parity is a meaningful claim. The mixed-tie case, where they
+/// diverge and SCX deliberately keeps the stable reading, is
+/// [`mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity`].
 ///
 /// Fixture: every real effect is the same vector, so a prediction equal to it is
 /// equidistant (0.0) from all `P` of them. cell-eval puts the correct
@@ -43,7 +53,7 @@ use super::*;
 /// `1.0`. A metric that reports a perfect score for a model that cannot tell three
 /// perturbations apart is the failure mode.
 #[test]
-fn ties_rank_by_index_like_cell_eval_argsort() {
+fn total_ties_rank_by_index_matching_cell_eval() {
     let n_perts = 3usize;
     let n_genes = 4usize;
     // Three identical real effects → every distance is a tie.
@@ -71,6 +81,102 @@ fn ties_rank_by_index_like_cell_eval_argsort() {
         assert!(
             (g - w).abs() < 1e-12,
             "pert {p}: got {g}, cell-eval gives {w} (all scores {:?})",
+            got.scores
+        );
+    }
+}
+
+/// A **mixed** tie — some distances equal, some not — pins SCX's own
+/// deterministic semantics, which is where they stop matching cell-eval.
+///
+/// This is the case the total-tie fixture above cannot see, and the distinction
+/// is not academic: `np.argsort`'s default `quicksort` happens to preserve index
+/// order on a *fully* tied array, so a total tie is the one shape where the
+/// stable and unstable readings agree. On a mixed tie they diverge, and on numpy
+/// 2.4.4 the divergence is not even "arbitrary" — it is *reverse* index order
+/// within each tied block:
+///
+/// ```text
+/// np.argsort([3, 3, 1, 1])                 -> [3, 2, 1, 0]
+/// np.argsort([3, 3, 1, 1], kind="stable")  -> [2, 3, 0, 1]
+/// np.argsort([5, 5, 5])                    -> [0, 1, 2]     <- total tie: agrees
+/// ```
+///
+/// So for distances `[3, 3, 1, 1]` the two readings give different scores:
+///
+/// | pert | SCX (stable) | cell-eval on numpy 2.4.4 (quicksort) |
+/// |------|--------------|--------------------------------------|
+/// | p0   | 0.50         | 0.25                                 |
+/// | p1   | 0.25         | 0.50                                 |
+/// | p2   | 1.00         | 0.75                                 |
+/// | p3   | 0.75         | 1.00                                 |
+///
+/// **SCX deliberately keeps the stable reading**, and this test is that contract
+/// rather than a parity claim. Chasing the reference here would mean
+/// reimplementing NumPy's introsort — pivot choices, array-size thresholds, dtype
+/// dispatch — and would then break on any NumPy release that touched it. A
+/// deterministic, documented tie rule is worth more than bit-parity with an
+/// unspecified one, and it is reproducible across versions, platforms and
+/// languages, which the reference's is not.
+///
+/// What *is* a bug, and is fixed alongside this test, is having claimed exact
+/// cell-eval parity on ties in `docs/scanpy.md`. Ties agree with the reference
+/// only when the tie is total.
+#[test]
+fn mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity() {
+    let n_perts = 4usize;
+    let n_genes = 2usize;
+    // Every prediction is the zero vector, so each perturbation sees the same
+    // L1 distance vector [3, 3, 1, 1] — two tied blocks, not one.
+    let real = vec![
+        3.0, 0.0, // p0
+        -3.0, 0.0, // p1
+        1.0, 0.0, // p2
+        -1.0, 0.0, // p3
+    ];
+    let pred = vec![0.0; n_perts * n_genes];
+    let perts: Vec<String> = (0..n_perts).map(|i| format!("p{i}")).collect();
+
+    let got = compute_discrimination_score(
+        &real,
+        &pred,
+        n_perts,
+        n_genes,
+        &perts,
+        None,
+        DistanceMetric::L1,
+        false,
+    )
+    .unwrap();
+
+    // Premise: the fixture must produce a MIXED tie. A total tie would make this
+    // a duplicate of the test above and would agree with the reference, hiding
+    // exactly the divergence being pinned.
+    let d: Vec<f64> = (0..n_perts)
+        .map(|i| (0..n_genes).map(|g| (real[i * n_genes + g]).abs()).sum())
+        .collect();
+    let distinct = {
+        let mut v = d.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup();
+        v.len()
+    };
+    assert_eq!(
+        distinct, 2,
+        "premise broken: distances {d:?} have {distinct} distinct values, need \
+         exactly 2 so there are two tied blocks rather than one"
+    );
+
+    // The stable-argsort ranks: position of p among distances sorted ascending,
+    // ties by ascending index.
+    let want = [0.5, 0.25, 1.0, 0.75];
+    for (p, (&g, &w)) in got.scores.iter().zip(want.iter()).enumerate() {
+        assert!(
+            (g - w).abs() < 1e-12,
+            "pert {p}: got {g}, SCX's documented stable semantics give {w} \
+             (all scores {:?}). Note cell-eval on numpy 2.4.4 gives \
+             [0.25, 0.5, 0.75, 1.0] here — that divergence is documented, not a \
+             target.",
             got.scores
         );
     }

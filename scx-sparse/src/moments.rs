@@ -3,26 +3,36 @@
 //!
 //! # Why this lives in `scx-sparse`
 //!
-//! Before Phase 7a the `(Σx² − n·mean²)/(n−1)` finalize was written out seven
-//! times: four in `scx-accel`'s `hvg/cpu.rs`, one in its `csc/mean_var.rs`, and
-//! two in `scx-gpu`'s `gpu_hvg.rs`. `scx-accel` depends on `scx-gpu` (optional
-//! `gpu` feature) and never the reverse, so no primitive in either of them can
-//! be reached from the other. `scx-sparse` is the only crate below both — and it
-//! already hosts [`crate::total_variance_from_col_sq`], the whole-matrix
-//! analogue of this function, which `scx-gpu`'s PCA already calls.
+//! Before Phase 7a the `(Σx² − n·mean²)/(n−1)` finalize was written out **nine**
+//! times: four in `scx-accel`'s `hvg/cpu.rs`, one in its `csc/mean_var.rs`, two
+//! in its `hvg/gpu.rs` (the batched device wrapper's per-batch and global
+//! finalizes), and two in `scx-gpu`'s `gpu_hvg.rs`. `scx-accel` depends on
+//! `scx-gpu` (optional `gpu` feature) and never the reverse, so no primitive in
+//! either of them can be reached from the other. `scx-sparse` is the only crate
+//! below both — and it already hosts [`crate::total_variance_from_col_sq`], the
+//! whole-matrix analogue of this function, which `scx-gpu`'s PCA already calls.
 //!
 //! # Two conventions this settles, which used to be per-site
 //!
-//! **The clamp.** Five of the seven sites clamped with `if v < 0.0 { 0.0 }` and
-//! two (the batched HVG arms) with `.max(0.0)`. Those are *not* equivalent:
-//! Rust's `f64::max` returns the non-NaN operand, so `.max(0.0)` maps a NaN
-//! variance silently to `0.0`, while `if v < 0.0` is false for NaN and lets it
-//! propagate. This function takes the second behaviour — a NaN is a bug worth
-//! seeing, not worth rounding to a plausible zero — and
-//! `nan_variance_is_not_clamped_to_zero` pins it. Both forms were measured to be
-//! bit-identical on real data, because every caller sits behind a finiteness
-//! guard on its input; the divergence is reachable only by calling this
-//! function directly.
+//! **The clamp.** Five of the nine sites clamped with `if v < 0.0 { 0.0 }` and
+//! four — every GPU arm: both of `scx-gpu`'s and both of `hvg/gpu.rs`'s — with
+//! `.max(0.0)`. Those are *not* equivalent: Rust's `f64::max` returns the
+//! non-NaN operand, so `.max(0.0)` maps a NaN variance silently to `0.0`, while
+//! `if v < 0.0` is false for NaN and lets it propagate. This function takes the
+//! second behaviour — a NaN is a bug worth seeing, not worth rounding to a
+//! plausible zero — and `nan_variance_is_not_clamped_to_zero` pins it.
+//!
+//! On the five CPU sites the two forms are bit-identical on real data, because
+//! each sits behind an input finiteness guard (`ensure_finite_hvg_data`). **The
+//! four GPU sites had no such guard**, so for them the unification was a real
+//! behaviour change on non-finite input: previously a NaN variance was absorbed
+//! to `0.0` (the gene then looks constant and is never selected as HVG), and
+//! afterwards it would have propagated into HVG ranking. Neither is acceptable,
+//! so those four now reject non-finite input outright via
+//! [`first_non_finite_column`], matching what the CPU routes already did. That
+//! is what makes "every caller is gated" true rather than aspirational — it was
+//! not true when this module was first written, and the earlier version of this
+//! paragraph claimed it was.
 //!
 //! **The cancellation report.** `Σx² − n·mean²` is the cancellation-prone form.
 //! It is used anyway because the stable two-pass alternative needs a second
@@ -80,6 +90,25 @@ pub struct ColumnMoments {
 #[inline]
 pub fn residual_lost_to_cancellation(residual: f64, second_moment: f64) -> bool {
     second_moment > 0.0 && residual <= CLOSED_FORM_VAR_REL_EPS * second_moment
+}
+
+/// The first column whose accumulated moments are not finite, if any.
+///
+/// This is the cheap gate the GPU HVG routes use in place of an input scan, and
+/// it is exactly as strong: if any input value in column `j` is non-finite then
+/// `sums[j]` is non-finite too, because neither NaN nor an infinity can cancel
+/// back to a finite number (`NaN + x` is `NaN` for every `x`, and `∞ + (−∞)` is
+/// `NaN`, not `0`). So a clean accumulator proves clean input, per column.
+///
+/// It costs `O(n_vars)` rather than the `O(nnz)` of scanning the values, which
+/// is why the device paths can afford it — they have already copied exactly
+/// these two vectors back to the host. It also catches a *finite* input whose
+/// sum overflowed to an infinity, which an input scan would miss.
+///
+/// Returns the column index so the caller can name it; `None` means every
+/// column's moments are finite.
+pub fn first_non_finite_column(sums: &[f64], sums_sq: &[f64]) -> Option<usize> {
+    (0..sums.len().min(sums_sq.len())).find(|&j| !sums[j].is_finite() || !sums_sq[j].is_finite())
 }
 
 impl ColumnMoments {

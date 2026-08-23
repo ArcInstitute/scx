@@ -114,6 +114,20 @@ pub fn gpu_streaming_mean_var(
     // (`scx_accel::hvg::cpu`, `scx_accel::csc::mean_var`) via `scx-sparse` —
     // which is where it has to live, since `scx-accel` depends on this crate and
     // not the reverse. Only the accumulation is on the device.
+    // The GPU routes have no on-device input finiteness gate (the CPU routes use
+    // `ensure_finite_hvg_data`). Check the accumulated moments instead: a
+    // non-finite input value in column j necessarily leaves `col_sum[j]`
+    // non-finite, so this is exactly as strong at O(n_vars) instead of O(nnz).
+    // Before Phase 7a a NaN variance here was absorbed to 0.0 by `.max(0.0)`,
+    // making the gene look constant; erroring is the honest alternative.
+    if let Some(j) = scx_sparse::first_non_finite_column(&col_sum, &col_sum_sq) {
+        return Err(GpuError::InvalidShard(format!(
+            "gpu_streaming_mean_var: column {j} accumulated a non-finite moment \
+             (sum = {}, sum_sq = {}) — the input contains NaN/Inf, or a finite \
+             input overflowed. HVG statistics would be meaningless.",
+            col_sum[j], col_sum_sq[j]
+        )));
+    }
     let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
     m.warn_if_unstable("gpu_streaming_mean_var");
     let (means, variances) = (m.means, m.variances);
@@ -246,6 +260,16 @@ pub fn gpu_streaming_mean_var_csc(
     // (`scx_accel::hvg::cpu`, `scx_accel::csc::mean_var`) via `scx-sparse` —
     // which is where it has to live, since `scx-accel` depends on this crate and
     // not the reverse. Only the accumulation is on the device.
+    // Same accumulated-moment gate as the CSR route above; see the comment there
+    // for why checking the sums is equivalent to scanning the input values.
+    if let Some(j) = scx_sparse::first_non_finite_column(&col_sum, &col_sum_sq) {
+        return Err(GpuError::InvalidShard(format!(
+            "gpu_streaming_mean_var_csc: column {j} accumulated a non-finite \
+             moment (sum = {}, sum_sq = {}) — the input contains NaN/Inf, or a \
+             finite input overflowed. HVG statistics would be meaningless.",
+            col_sum[j], col_sum_sq[j]
+        )));
+    }
     let m = scx_sparse::finalize_column_moments(&col_sum, &col_sum_sq, n_obs);
     m.warn_if_unstable("gpu_streaming_mean_var_csc");
     let (means, variances) = (m.means, m.variances);

@@ -733,13 +733,35 @@ fn pflog_total_variance(
     // no second-pass alternative here. `Z = delta + baseline·1ᵀ` is never
     // materialized — the closed form is the whole point of the PFlog route — so a
     // "stable recompute" would mean building the dense `Z`.
+    //
+    // The two branches below are NOT the same failure, and saying "reported as
+    // zeros" for both would be wrong for the second. `residual_lost_to_cancellation`
+    // fires whenever `0 < TSS <= eps·S_dd` as well as when `TSS <= 0`:
+    //   * `TSS <= 0` — the clamp floors it to 0.0, `build_pca_result`'s
+    //     `if total_var > 0.0` fails, and every `variance_ratio` is 0.0.
+    //   * `0 < TSS <= eps·S_dd` — the clamp keeps it, `build_pca_result` divides
+    //     by it, and the ratios are non-zero but computed against a denominator
+    //     that is almost entirely round-off. Those ratios can be wildly
+    //     *inflated*, which is a worse failure to mislabel as "zeros" because it
+    //     looks like a result.
     if scx_sparse::residual_lost_to_cancellation(tss, s_dd) {
-        log::warn!(
-            "pflog_total_variance: the closed-form total variance lost precision \
-             to cancellation (S_dd = {s_dd}, TSS = {tss}); `variance_ratio` will \
-             be reported as zeros. This is a conditioning failure, not a \
-             degenerate matrix."
-        );
+        if tss <= 0.0 {
+            log::warn!(
+                "pflog_total_variance: the closed-form total variance cancelled \
+                 to zero or below (S_dd = {s_dd}, TSS = {tss}); every \
+                 `variance_ratio` will be reported as 0.0. This is a conditioning \
+                 failure, not a degenerate matrix."
+            );
+        } else {
+            log::warn!(
+                "pflog_total_variance: the closed-form total variance lost nearly \
+                 all precision to cancellation (S_dd = {s_dd}, TSS = {tss}); it \
+                 is still positive, so `variance_ratio` will be computed against \
+                 a denominator that is mostly round-off and may be inflated well \
+                 beyond 1.0. Treat the ratios as unreliable rather than small. \
+                 This is a conditioning failure, not a degenerate matrix."
+            );
+        }
     }
     (tss / denom).max(0.0)
 }

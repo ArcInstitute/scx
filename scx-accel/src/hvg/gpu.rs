@@ -124,6 +124,18 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
     // formula that happen to agree.
     let mut per_batch = Vec::with_capacity(n_batches);
     for b in 0..n_batches {
+        // Unlike `streaming_mean_var_batched`, this route never sees the shard
+        // values on the host, so it cannot call `ensure_finite_hvg_data`. It
+        // checks the accumulated moments instead — equivalent per column, since
+        // a non-finite input value leaves its column's sum non-finite, and
+        // O(n_vars) rather than O(nnz). Before Phase 7a `.max(0.0)` absorbed a
+        // NaN variance to 0.0 here, so the gene silently looked constant.
+        if let Some(j) = scx_sparse::first_non_finite_column(&batch_sum[b], &batch_sum_sq[b]) {
+            return Err(crate::error::AccelError::InvalidInput(format!(
+                "streaming_mean_var_batched_with_device: batch {b}, column {j}                  accumulated a non-finite moment (sum = {}, sum_sq = {}) — the                  input contains NaN/Inf, or a finite input overflowed. HVG                  statistics would be meaningless.",
+                batch_sum[b][j], batch_sum_sq[b][j]
+            )));
+        }
         let m =
             scx_sparse::finalize_column_moments(&batch_sum[b], &batch_sum_sq[b], batch_counts[b]);
         m.warn_if_unstable(&format!(
@@ -141,6 +153,16 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
     for j in 0..n_vars {
         global_sum[j] = batch_sum.iter().map(|bs| bs[j]).sum();
         global_sum_sq[j] = batch_sum_sq.iter().map(|bs| bs[j]).sum();
+    }
+    // The global sums are derived from the per-batch ones, each already checked
+    // above, so this cannot fire on non-finite *input* — it can still fire if
+    // summing finite per-batch moments overflows to an infinity, which is
+    // exactly the case an input scan would miss.
+    if let Some(j) = scx_sparse::first_non_finite_column(&global_sum, &global_sum_sq) {
+        return Err(crate::error::AccelError::InvalidInput(format!(
+            "streaming_mean_var_batched_with_device: global column {j}              accumulated a non-finite moment (sum = {}, sum_sq = {}) after              summing {n_batches} finite per-batch moments — the totals overflowed.",
+            global_sum[j], global_sum_sq[j]
+        )));
     }
     let global = scx_sparse::finalize_column_moments(&global_sum, &global_sum_sq, total_n);
     global.warn_if_unstable("streaming_mean_var_batched_with_device[global]");

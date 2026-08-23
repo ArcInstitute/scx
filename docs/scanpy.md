@@ -2913,7 +2913,7 @@ for numbers at 10K / 100K / 500K / 1M cells).
 | pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. |
 | energy_distance / pearson_edistance | `atol=1e-4` correlation, `atol=1e-3` per-pert | O(N²) pairwise reduction; faer-gemm reduction order differs from sklearn BLAS GEMM. f32 + gemm matches f64 + scalar within these bounds (test parametrised over both dtypes). |
 | clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Native-Rust kNN (HNSW) + Leiden replaces scanpy under the hood; the two algorithms produce within-permutation labels on graphs with `n_perts ≥ 16` (parity test scaffold uses `n_perts=30`). |
-| discrimination_score rank | exact (`abs=0`) | Integer rank computation; any non-zero diff is a correctness regression. Exactness requires matching the reference on ties, duplicated gene symbols and zero-norm effect vectors — see [Discrimination score](#discrimination-score-pyscxacceldiscrimination_score). All three diverged through v0.13.0, and the parity fixture (400×20 continuous random) contains none of the three, so it did not see them. |
+| discrimination_score rank | exact (`abs=0`) **on untied and totally-tied distances**; not claimed on mixed ties | Integer rank computation; any non-zero diff on those inputs is a correctness regression. Exactness requires matching the reference on duplicated gene symbols and zero-norm effect vectors, both of which diverged through v0.13.0 — and the parity fixture (400×20 continuous random) contains neither, so it did not see them. **Mixed ties are explicitly out of scope**: the reference's order comes from an unstable `np.argsort` and is not reproducible. See [Discrimination score](#discrimination-score-pyscxacceldiscrimination_score). |
 
 All functions accept in-memory, backed, or lazy-transformed inputs. They
 expect the `cell-eval` data conventions: an `obs` column with
@@ -2991,16 +2991,33 @@ in practice (10x matrices routinely repeat a gene symbol), and leaving one copy
 of the target column in place restores exactly the self-match the flag exists to
 remove. Through v0.13.0 inclusive one copy did survive.
 
-**Ties break by index**, matching the rank the reference reads off `np.argsort`.
-Also fixed in v0.14.0: the rank was previously the number of *strictly* smaller
-distances, which is the position of the first tied element rather than of the
-perturbation being scored. The visible symptom was at the extreme — a model whose
-predicted effects cannot separate its perturbations at all made every distance
-tie, and scored a perfect 1.0 on every perturbation instead of the reference's
-`1 - p/P`. One caveat on the reference itself: `np.argsort`'s default kind is
-`quicksort`, which is not a stable sort, so cell-eval's own tie behaviour is
-formally implementation-defined; SCX matches the stable reading, which is the only
-one under which the reference's score is reproducible.
+**Ties break by ascending index** — a deterministic, stable rule. Also fixed in
+v0.14.0: the rank was previously the number of *strictly* smaller distances, which
+is the position of the first tied element rather than of the perturbation being
+scored. The visible symptom was at the extreme — a model whose predicted effects
+cannot separate its perturbations at all made every distance tie, and scored a
+perfect 1.0 on every perturbation instead of `1 - p/P`.
+
+⚠️ **On a tie, SCX does not claim bit-parity with cell-eval, and cannot.** The
+reference ranks by `np.argsort`, whose default kind is `quicksort` — not a stable
+sort — so its tie order is implementation-defined. Measured on numpy 2.4.4:
+
+| distances | `np.argsort` (default) | `kind="stable"` |
+|---|---|---|
+| `[5, 5, 5]` | `[0, 1, 2]` | `[0, 1, 2]` — agrees |
+| `[3, 3, 1, 1]` | `[3, 2, 1, 0]` | `[2, 3, 0, 1]` — **differs** |
+
+A *total* tie is the one shape where the two readings coincide, and there SCX
+matches the reference exactly (`abs=0`, pinned by `TestDiscriminationTieParity`).
+On a **mixed** tie — some distances equal, some not — they diverge: for
+`[3, 3, 1, 1]` SCX scores `[0.50, 0.25, 1.00, 0.75]` and cell-eval on numpy 2.4.4
+scores `[0.25, 0.50, 0.75, 1.00]`.
+
+SCX keeps the stable rule deliberately. Reproducing the reference would mean
+reimplementing NumPy's introsort and would break on any release that touched it,
+whereas a documented stable rule is reproducible across versions, platforms and
+languages. If you need scores that track a specific cell-eval run tie-for-tie,
+compare against that run directly rather than relying on this metric's tie order.
 
 A zero-norm effect vector under `metric="cosine"` is distance `1.0` — maximally
 distant — not `0.0`. This is sklearn's `cosine_distances` convention and is now
