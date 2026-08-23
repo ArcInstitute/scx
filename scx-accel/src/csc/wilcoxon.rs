@@ -196,7 +196,7 @@ fn assign_block_ranks(
 /// global, so it is what an out-of-range row is checked against. It is not a
 /// statistical parameter here; `n_labelled` is.
 #[allow(clippy::too_many_arguments)]
-fn gene_stats_nnz(
+pub(crate) fn gene_stats_nnz(
     rows: &[i32],
     vals: &[f32],
     groups: &[usize],

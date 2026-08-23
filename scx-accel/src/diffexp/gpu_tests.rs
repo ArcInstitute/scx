@@ -1556,3 +1556,91 @@ fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
         }
     }
 }
+
+/// The GPU arm against the **same external reference values** the two host
+/// kernels use (ORG-7.21-3).
+///
+/// The third implementation of the rank-sum, and the one that cannot share a
+/// line of code with the other two: it is a `.cu` kernel, so the tie-run walk
+/// `for_each_tie_run` unified on the host is a separate CUDA implementation
+/// here by necessity. Reference values are therefore the *only* agreement
+/// available between them — which is exactly why they had to exist before this
+/// arm could be checked against anything but a sibling SCX kernel.
+///
+/// Same table (`scx_testkit::de_reference`), same fixture, same two
+/// conventions. In particular the kernel is handed all 12 rows including the
+/// two unlabelled ones while every expected value was computed on the 10
+/// labelled rows, so the unlabelled-cell contract is asserted here against
+/// scipy rather than against `wilcoxon_rank_sum_gpu_dense`'s own physical-subset
+/// run (which `test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset`
+/// above still covers, and which cannot see a bug both arms share).
+#[test]
+fn test_wilcoxon_gpu_matches_the_external_reference_values() {
+    require_gpu_or_skip!();
+    use crate::diffexp::wilcoxon_reference_values as r;
+
+    let data = r::dense_x();
+    let gene_names: Vec<String> = (0..r::N_VARS).map(|j| format!("g{j}")).collect();
+    let group_names: Vec<String> = (0..r::N_GROUPS).map(|g| format!("grp{g}")).collect();
+
+    for tie_correct in [true, false] {
+        let result = wilcoxon_rank_sum_gpu_dense(
+            0,
+            &data,
+            r::N_OBS,
+            r::N_VARS,
+            &gene_names,
+            &r::FIXTURE_GROUPS,
+            &group_names,
+            None,  // 1-vs-rest
+            false, // log_transformed
+            false, // rankby_abs
+            tie_correct,
+        )
+        .expect("GPU wilcoxon on the reference fixture");
+
+        for (grp, names_in_group) in result.names.iter().enumerate() {
+            for (gene, want_name) in gene_names.iter().enumerate() {
+                // Keyed by name, not position: three genes tie at score 0 and
+                // their relative order in a sorted result is not a contract.
+                let col = names_in_group
+                    .iter()
+                    .position(|n| n == want_name)
+                    .unwrap_or_else(|| panic!("gene {want_name} missing from group {grp}"));
+                let (z, p) = (result.scores[grp][col], result.pvals[grp][col]);
+
+                let (want_z, want_p, atol_z, atol_p) = if tie_correct {
+                    (
+                        r::SCIPY_Z_TIE_CORRECTED[gene][grp],
+                        r::SCIPY_P_TIE_CORRECTED[gene][grp],
+                        // Not abs=0 like the host arms: the CUDA kernel
+                        // accumulates rank sums in a different order, so this
+                        // is an f64-reduction-order bound, not a convention
+                        // difference. It is still four orders tighter than the
+                        // gap between the two tie conventions (7.6e-02), so it
+                        // cannot launder one into the other.
+                        1e-9,
+                        1e-12,
+                    )
+                } else {
+                    (
+                        r::SCANPY_Z_UNCORRECTED[gene][grp],
+                        r::SCANPY_P_UNCORRECTED[gene][grp],
+                        r::Z_UNCORRECTED_ATOL,
+                        r::P_UNCORRECTED_ATOL,
+                    )
+                };
+                assert!(
+                    (z - want_z).abs() <= atol_z,
+                    "gpu gene {want_name} group {grp} tie_correct={tie_correct}: \
+                     z {z} vs reference {want_z}"
+                );
+                assert!(
+                    (p - want_p).abs() <= atol_p,
+                    "gpu gene {want_name} group {grp} tie_correct={tie_correct}: \
+                     p {p} vs reference {want_p}"
+                );
+            }
+        }
+    }
+}
