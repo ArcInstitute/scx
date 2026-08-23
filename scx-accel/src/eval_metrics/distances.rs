@@ -128,58 +128,62 @@ fn resolve_backend(
 /// Euclidean distance between two row vectors of length `n_dims`.
 ///
 /// `a` and `b` should point to contiguous slices of at least `n_dims` elements.
+///
+/// A thin `f64` alias for [`euclidean_distance_generic`]; for `F = f64` the
+/// widening in the generic body monomorphises away, so this is the same machine
+/// code it always was.
 #[inline]
 pub fn euclidean_distance(a: &[f64], b: &[f64], n_dims: usize) -> f64 {
-    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
-    let mut sum_sq = 0.0f64;
-    for k in 0..n_dims {
-        let diff = a[k] - b[k];
-        sum_sq += diff * diff;
-    }
-    sum_sq.sqrt()
+    euclidean_distance_generic(a, b, n_dims, None)
 }
 
 /// Manhattan (L1) distance between two row vectors of length `n_dims`.
 #[inline]
 pub fn l1_distance(a: &[f64], b: &[f64], n_dims: usize) -> f64 {
-    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
-    let mut sum_abs = 0.0f64;
-    for k in 0..n_dims {
-        sum_abs += (a[k] - b[k]).abs();
-    }
-    sum_abs
+    l1_distance_generic(a, b, n_dims, None)
 }
 
 /// Cosine distance between two row vectors: `1 - cosine_similarity(a, b)`.
 ///
-/// Returns 1.0 (maximum distance) if either vector has zero norm.
+/// Returns 1.0 (maximum distance) if either vector has zero norm, and clamps the
+/// result to `[0, 2]`. Both conventions match sklearn's `cosine_distances`, which
+/// is the reference every `eval_metrics` parity claim is measured against.
 #[inline]
 pub fn cosine_distance(a: &[f64], b: &[f64], n_dims: usize) -> f64 {
-    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for k in 0..n_dims {
-        dot += a[k] * b[k];
-        norm_a += a[k] * a[k];
-        norm_b += b[k] * b[k];
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        return 1.0;
-    }
-    // Clamp to [0, 2] to handle floating-point imprecision.
-    (1.0 - dot / denom).clamp(0.0, 2.0)
+    cosine_distance_generic(a, b, n_dims, None)
 }
 
 /// Dispatch a point-to-point distance by metric enum.
 #[inline]
 pub fn point_distance(a: &[f64], b: &[f64], n_dims: usize, metric: DistanceMetric) -> f64 {
-    match metric {
-        DistanceMetric::Euclidean => euclidean_distance(a, b, n_dims),
-        DistanceMetric::L1 => l1_distance(a, b, n_dims),
-        DistanceMetric::Cosine => cosine_distance(a, b, n_dims),
-    }
+    point_distance_generic(a, b, n_dims, None, metric)
+}
+
+/// Dispatch a point-to-point distance over a subset of the dimensions.
+///
+/// `keep`, when `Some`, is a length-`n_dims` mask: dimension `k` participates iff
+/// `keep[k]`. `None` means every dimension participates and is exactly
+/// [`point_distance`].
+///
+/// This exists so a column-excluding caller does not need its own copy of the
+/// three metric bodies. `discrimination.rs` had one, and it disagreed with this
+/// module on two of cosine's edge conventions — a zero denominator gave `0.0`
+/// (identical) instead of `1.0` (maximally distant), and the `[0, 2]` clamp was
+/// absent. Those are the kind of divergence that only shows up on a fixture
+/// nobody wrote.
+///
+/// A masked call is not slower per active dimension than an unmasked one: the
+/// mask is resolved once, outside the accumulation loop, by monomorphising the
+/// same body over two different index iterators.
+#[inline]
+pub fn point_distance_masked(
+    a: &[f64],
+    b: &[f64],
+    n_dims: usize,
+    keep: Option<&[bool]>,
+    metric: DistanceMetric,
+) -> f64 {
+    point_distance_generic(a, b, n_dims, keep, metric)
 }
 
 // ── Generic scalar distance helpers ─────────────────────────────────────
@@ -188,11 +192,28 @@ pub fn point_distance(a: &[f64], b: &[f64], n_dims: usize, metric: DistanceMetri
 // lose precision in the inner reduction. For `F = f64` the `as_f64` calls
 // monomorphise to no-ops, so these are equivalent to the existing f64 fns.
 
+// Each metric's accumulation loop is written once, generic over the *index
+// source*. `dims_unmasked` yields `0..n_dims`; `dims_masked` yields only the
+// dimensions a `keep` mask selects. Because the accumulators are generic over
+// `impl Iterator<Item = usize>`, the compiler emits a separate specialised loop
+// for each — so the unmasked path carries no per-element mask check, and the
+// masked path carries no duplicated source. This is the reason a caller that
+// needs to exclude a column does not need its own copy of the three metrics.
+
 #[inline]
-fn euclidean_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) -> f64 {
-    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+fn dims_unmasked(n_dims: usize) -> impl Iterator<Item = usize> {
+    0..n_dims
+}
+
+#[inline]
+fn dims_masked<'m>(n_dims: usize, keep: &'m [bool]) -> impl Iterator<Item = usize> + 'm {
+    (0..n_dims).filter(move |&k| keep[k])
+}
+
+#[inline]
+fn euclidean_acc<F: PairwiseFloat, I: Iterator<Item = usize>>(a: &[F], b: &[F], dims: I) -> f64 {
     let mut sum_sq = 0.0f64;
-    for k in 0..n_dims {
+    for k in dims {
         let diff = a[k].as_f64() - b[k].as_f64();
         sum_sq += diff * diff;
     }
@@ -200,22 +221,23 @@ fn euclidean_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize)
 }
 
 #[inline]
-fn l1_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) -> f64 {
-    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+fn l1_acc<F: PairwiseFloat, I: Iterator<Item = usize>>(a: &[F], b: &[F], dims: I) -> f64 {
     let mut sum_abs = 0.0f64;
-    for k in 0..n_dims {
+    for k in dims {
         sum_abs += (a[k].as_f64() - b[k].as_f64()).abs();
     }
     sum_abs
 }
 
+/// Accumulate the three cosine sums, then apply the two conventions that make
+/// this module agree with sklearn's `cosine_distances`: a zero denominator is
+/// maximal distance (`1.0`), and the result is clamped to `[0, 2]`.
 #[inline]
-fn cosine_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) -> f64 {
-    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+fn cosine_acc<F: PairwiseFloat, I: Iterator<Item = usize>>(a: &[F], b: &[F], dims: I) -> f64 {
     let mut dot = 0.0f64;
     let mut norm_a = 0.0f64;
     let mut norm_b = 0.0f64;
-    for k in 0..n_dims {
+    for k in dims {
         let ak = a[k].as_f64();
         let bk = b[k].as_f64();
         dot += ak * bk;
@@ -230,16 +252,62 @@ fn cosine_distance_generic<F: PairwiseFloat>(a: &[F], b: &[F], n_dims: usize) ->
 }
 
 #[inline]
+fn euclidean_distance_generic<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
+    n_dims: usize,
+    keep: Option<&[bool]>,
+) -> f64 {
+    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+    debug_assert!(keep.is_none_or(|m| m.len() >= n_dims));
+    match keep {
+        None => euclidean_acc(a, b, dims_unmasked(n_dims)),
+        Some(m) => euclidean_acc(a, b, dims_masked(n_dims, m)),
+    }
+}
+
+#[inline]
+fn l1_distance_generic<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
+    n_dims: usize,
+    keep: Option<&[bool]>,
+) -> f64 {
+    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+    debug_assert!(keep.is_none_or(|m| m.len() >= n_dims));
+    match keep {
+        None => l1_acc(a, b, dims_unmasked(n_dims)),
+        Some(m) => l1_acc(a, b, dims_masked(n_dims, m)),
+    }
+}
+
+#[inline]
+fn cosine_distance_generic<F: PairwiseFloat>(
+    a: &[F],
+    b: &[F],
+    n_dims: usize,
+    keep: Option<&[bool]>,
+) -> f64 {
+    debug_assert!(a.len() >= n_dims && b.len() >= n_dims);
+    debug_assert!(keep.is_none_or(|m| m.len() >= n_dims));
+    match keep {
+        None => cosine_acc(a, b, dims_unmasked(n_dims)),
+        Some(m) => cosine_acc(a, b, dims_masked(n_dims, m)),
+    }
+}
+
+#[inline]
 fn point_distance_generic<F: PairwiseFloat>(
     a: &[F],
     b: &[F],
     n_dims: usize,
+    keep: Option<&[bool]>,
     metric: DistanceMetric,
 ) -> f64 {
     match metric {
-        DistanceMetric::Euclidean => euclidean_distance_generic(a, b, n_dims),
-        DistanceMetric::L1 => l1_distance_generic(a, b, n_dims),
-        DistanceMetric::Cosine => cosine_distance_generic(a, b, n_dims),
+        DistanceMetric::Euclidean => euclidean_distance_generic(a, b, n_dims, keep),
+        DistanceMetric::L1 => l1_distance_generic(a, b, n_dims, keep),
+        DistanceMetric::Cosine => cosine_distance_generic(a, b, n_dims, keep),
     }
 }
 
@@ -583,7 +651,7 @@ fn mean_pairwise_distance_with_budget<F: PairwiseFloat>(
                 let mut row_sum = 0.0f64;
                 for j in 0..n_b {
                     let row_b = &b[j * n_dims..(j + 1) * n_dims];
-                    row_sum += point_distance_generic(row_a, row_b, n_dims, metric);
+                    row_sum += point_distance_generic(row_a, row_b, n_dims, None, metric);
                 }
                 row_sum
             })
@@ -682,7 +750,7 @@ fn mean_pairwise_distance_self_with_budget<F: PairwiseFloat>(
                     let mut row_sum = 0.0f64;
                     for j in (i + 1)..n {
                         let row_j = &a[j * n_dims..(j + 1) * n_dims];
-                        row_sum += point_distance_generic(row_i, row_j, n_dims, metric);
+                        row_sum += point_distance_generic(row_i, row_j, n_dims, None, metric);
                     }
                     row_sum
                 })
@@ -1199,6 +1267,110 @@ mod tests {
     /// Budget that admits exactly `rows` rows of `a` per Gram block.
     fn budget_for<F>(rows: usize, n_b: usize) -> u64 {
         (rows as u64) * (n_b as u64) * (std::mem::size_of::<F>() as u64)
+    }
+
+    /// A masked call must equal the unmasked call on the physically compacted
+    /// vectors — for every metric, and for an all-true mask.
+    ///
+    /// This is the property that lets a column-excluding caller drop its own copy
+    /// of the three metric bodies. Asserting it against a compacted reference
+    /// rather than against constants is what makes it catch a divergence in
+    /// *either* direction: a masked path that forgets the cosine clamp, and an
+    /// unmasked path that drifts from it.
+    #[test]
+    fn masking_equals_compacting_the_vectors() {
+        let a = [1.0f64, -2.0, 0.5, 7.0, -0.25];
+        let b = [0.0f64, 3.0, 0.5, -1.0, 2.0];
+        let n = a.len();
+
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::L1,
+            DistanceMetric::Cosine,
+        ] {
+            // All-true mask is exactly the unmasked call.
+            let all = vec![true; n];
+            let masked_all = point_distance_masked(&a, &b, n, Some(&all), metric);
+            let unmasked = point_distance(&a, &b, n, metric);
+            assert!(
+                (masked_all - unmasked).abs() < 1e-15,
+                "{metric:?}: all-true mask gave {masked_all}, unmasked gives {unmasked}"
+            );
+            // `None` is the same thing spelled without a mask.
+            let none = point_distance_masked(&a, &b, n, None, metric);
+            assert!(
+                (none - unmasked).abs() < 1e-15,
+                "{metric:?}: None mask gave {none}, unmasked gives {unmasked}"
+            );
+
+            // Every proper subset: mask == compact-then-unmasked.
+            for drop_bits in 1u32..(1 << n) {
+                let keep: Vec<bool> = (0..n).map(|k| drop_bits & (1 << k) == 0).collect();
+                let ca: Vec<f64> = (0..n).filter(|&k| keep[k]).map(|k| a[k]).collect();
+                let cb: Vec<f64> = (0..n).filter(|&k| keep[k]).map(|k| b[k]).collect();
+                let got = point_distance_masked(&a, &b, n, Some(&keep), metric);
+                let want = point_distance(&ca, &cb, ca.len(), metric);
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "{metric:?} keep={keep:?}: masked {got} != compacted {want}"
+                );
+            }
+        }
+    }
+
+    /// The zero-norm and clamp conventions, stated once so a future edit to
+    /// either kernel has something to break.
+    ///
+    /// `1.0` for a zero denominator and a `[0, 2]` range are sklearn's
+    /// `cosine_distances` conventions, and every `eval_metrics` cell-eval parity
+    /// claim rests on matching them. Checked through the masked entry point too,
+    /// because that is the path that used to disagree.
+    #[test]
+    fn cosine_zero_norm_and_range_hold_on_both_entry_points() {
+        let zeros = [0.0f64, 0.0, 0.0];
+        let v = [1.0f64, 2.0, 3.0];
+        let w = [0.0f64, 5.0, 0.0];
+        for (label, d) in [
+            ("unmasked zero/zero", cosine_distance(&zeros, &zeros, 3)),
+            ("unmasked zero/v", cosine_distance(&zeros, &v, 3)),
+            (
+                "masked zero/v",
+                // Mask nothing out; the zero norm is intrinsic.
+                point_distance_masked(
+                    &zeros,
+                    &v,
+                    3,
+                    Some(&[true, true, true]),
+                    DistanceMetric::Cosine,
+                ),
+            ),
+            (
+                "masked-to-zero",
+                // `w` is nonzero ONLY at index 1, and index 1 is the one the mask
+                // drops -- so the kept view of `w` is [0.0, 0.0]. Masking to a
+                // column that still holds a nonzero (the obvious mistake, and the
+                // one the first draft of this test made) proves nothing.
+                point_distance_masked(
+                    &w,
+                    &w,
+                    3,
+                    Some(&[true, false, true]),
+                    DistanceMetric::Cosine,
+                ),
+            ),
+        ] {
+            assert!(
+                (d - 1.0).abs() < 1e-15,
+                "{label}: got {d}, want 1.0 (a zero denominator is MAXIMAL distance)"
+            );
+        }
+
+        // Anti-parallel is the top of the range, and nothing exceeds it.
+        let anti = point_distance(&[1.0, 0.0], &[-1.0, 0.0], 2, DistanceMetric::Cosine);
+        assert!(
+            (0.0..=2.0).contains(&anti) && (anti - 2.0).abs() < 1e-15,
+            "anti-parallel cosine distance is {anti}, want exactly 2.0 within [0, 2]"
+        );
     }
 
     #[test]

@@ -245,6 +245,12 @@ fn masked_distance(
     }
 }
 
+/// The §7.13 divergence fixtures: distance ties, duplicate `var_names`, and a
+/// zero-norm effect vector under a masked cosine.
+#[cfg(test)]
+#[path = "discrimination_cell_eval_tests.rs"]
+mod cell_eval_divergences;
+
 #[cfg(test)]
 mod tests {
     use super::*;
