@@ -129,7 +129,7 @@ fn resolve_backend(
 ///
 /// `a` and `b` should point to contiguous slices of at least `n_dims` elements.
 ///
-/// A thin `f64` alias for [`euclidean_distance_generic`]; for `F = f64` the
+/// A thin `f64` alias for the generic body below; for `F = f64` the
 /// widening in the generic body monomorphises away, so this is the same machine
 /// code it always was.
 #[inline]
