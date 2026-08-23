@@ -13,7 +13,7 @@
 //! - Parallelized across perturbations with rayon.
 //! - Uses the shared distance kernels from `distances.rs`.
 
-use super::distances::point_distance;
+use super::distances::point_distance_masked;
 use super::DistanceMetric;
 use rayon::prelude::*;
 
@@ -140,13 +140,22 @@ pub fn compute_discrimination_score(
         ));
     }
 
-    // ── Pre-build gene name → column index map (if needed) ──────────
-    let gene_idx_map: Option<std::collections::HashMap<&str, usize>> = if exclude_target_gene {
+    // ── Pre-build gene name → column indices map (if needed) ────────
+    //
+    // `Vec<usize>`, not `usize`: `var_names` are not unique in practice (10x
+    // matrices routinely repeat a gene symbol), and the reference excludes
+    // *every* matching column — `np.flatnonzero(genes != p)`. A map keyed to a
+    // single index keeps whichever one it saw last, and the surviving duplicate
+    // restores exactly the trivial self-match `exclude_target_gene` exists to
+    // remove.
+    let gene_idx_map: Option<std::collections::HashMap<&str, Vec<usize>>> = if exclude_target_gene {
         gene_names.map(|gn| {
-            gn.iter()
-                .enumerate()
-                .map(|(i, g)| (g.as_str(), i))
-                .collect()
+            let mut m: std::collections::HashMap<&str, Vec<usize>> =
+                std::collections::HashMap::with_capacity(gn.len());
+            for (i, g) in gn.iter().enumerate() {
+                m.entry(g.as_str()).or_default().push(i);
+            }
+            m
         })
     } else {
         None
@@ -156,13 +165,19 @@ pub fn compute_discrimination_score(
     let scores: Vec<f64> = (0..n_perts)
         .into_par_iter()
         .map(|p| {
-            // Determine which gene column to exclude (if any) for this perturbation.
-            let exclude_col: Option<usize> = if exclude_target_gene {
-                gene_idx_map
-                    .as_ref()
-                    .and_then(|m| m.get(pert_names[p].as_str()).copied())
-            } else {
-                None
+            // Build this perturbation's column mask once, outside the O(P) inner
+            // loop: `None` when nothing is excluded (the common case, and the one
+            // that keeps the kernel's unmasked loop), otherwise a keep mask with
+            // *every* column named after this perturbation dropped.
+            let keep: Option<Vec<bool>> = match (exclude_target_gene, gene_idx_map.as_ref()) {
+                (true, Some(m)) => m.get(pert_names[p].as_str()).map(|cols| {
+                    let mut keep = vec![true; n_genes];
+                    for &c in cols {
+                        keep[c] = false;
+                    }
+                    keep
+                }),
+                _ => None,
             };
 
             // Compute distance from pred_effects[p] to each real_effects[i].
@@ -171,15 +186,31 @@ pub fn compute_discrimination_score(
 
             for i in 0..n_perts {
                 let real_row = &real_effects[i * n_genes..(i + 1) * n_genes];
-                let d = masked_distance(pred_row, real_row, n_genes, exclude_col, metric);
+                let d = point_distance_masked(pred_row, real_row, n_genes, keep.as_deref(), metric);
                 distances.push(d);
             }
 
-            // Find rank of the correct perturbation (index p) in sorted order.
-            // Rank = number of perturbations with distance strictly less than
-            // the distance to the correct one.
+            // Rank of the correct perturbation = its position in ascending
+            // distance order, breaking ties by index. That is what the reference
+            // reads off `np.argsort`:
+            //
+            //   sorted_indices = np.argsort(distances)
+            //   rank = np.flatnonzero(sorted_indices == p_index)[0]
+            //
+            // Counting only strictly-smaller distances is the position of the
+            // *first* tied element, not of `p`, so a model that cannot separate
+            // its perturbations at all scored a perfect 1.0 on every one of them.
+            //
+            // Computed without sorting: the number of strictly-smaller distances
+            // plus the number of equal ones at a lower index is exactly the stable
+            // argsort position. NaN cannot reach here — both effect matrices are
+            // rejected above if they hold any non-finite value.
             let correct_dist = distances[p];
-            let rank = distances.iter().filter(|&&d| d < correct_dist).count();
+            let rank = distances
+                .iter()
+                .enumerate()
+                .filter(|&(i, &d)| d < correct_dist || (d == correct_dist && i < p))
+                .count();
 
             // Normalize: 1.0 = rank 0 (best), 1/P = rank P-1 (worst).
             // Matches cell-eval convention: score = 1 - rank / P.
@@ -191,58 +222,6 @@ pub fn compute_discrimination_score(
         scores,
         pert_names: pert_names.to_vec(),
     })
-}
-
-/// Compute distance between two row vectors with an optional column exclusion.
-///
-/// When `exclude_col` is `Some(j)`, gene column `j` is skipped. The distance
-/// is computed inline via iterators — zero heap allocation per call. This is
-/// important because this function is called O(P²) times in the inner loop.
-#[inline]
-fn masked_distance(
-    a: &[f64],
-    b: &[f64],
-    n_genes: usize,
-    exclude_col: Option<usize>,
-    metric: DistanceMetric,
-) -> f64 {
-    match exclude_col {
-        None => point_distance(a, b, n_genes, metric),
-        Some(excl) => {
-            let n_masked = n_genes - 1;
-            if n_masked == 0 {
-                return 0.0;
-            }
-            // Compute distance inline without allocating masked vectors.
-            let filtered = || (0..n_genes).filter(move |&k| k != excl);
-            match metric {
-                DistanceMetric::L1 => filtered().map(|k| (a[k] - b[k]).abs()).sum(),
-                DistanceMetric::Euclidean => {
-                    let sum_sq: f64 = filtered()
-                        .map(|k| {
-                            let d = a[k] - b[k];
-                            d * d
-                        })
-                        .sum();
-                    sum_sq.sqrt()
-                }
-                DistanceMetric::Cosine => {
-                    let (mut dot, mut norm_a, mut norm_b) = (0.0f64, 0.0f64, 0.0f64);
-                    for k in filtered() {
-                        dot += a[k] * b[k];
-                        norm_a += a[k] * a[k];
-                        norm_b += b[k] * b[k];
-                    }
-                    let denom = norm_a.sqrt() * norm_b.sqrt();
-                    if denom < 1e-30 {
-                        0.0
-                    } else {
-                        1.0 - dot / denom
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// The §7.13 divergence fixtures: distance ties, duplicate `var_names`, and a
