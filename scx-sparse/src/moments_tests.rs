@@ -227,3 +227,54 @@ fn first_non_finite_column_catches_every_route_to_non_finite() {
         Some(0)
     );
 }
+
+/// Degenerate and cancelled are different diagnoses, and the covariance PCA
+/// warning shows one of them to the user.
+///
+/// An all-zero matrix has `Σx² = 0`: nothing cancelled, its zero eigenvalues are
+/// exact, and there is simply no variance to apportion. Telling that user "the
+/// covariance cross-product lost conditioning ... the eigenvalues are themselves
+/// unreliable" is false and unactionable. A matrix whose positive `Σx²` was eaten
+/// by `− nμ²` is the case that message is for.
+///
+/// `closed_form_variance_unstable` deliberately answers `true` to both — it exists
+/// to decide "should I recompute stably?", and neither closed form is usable — so
+/// this test also pins that the bool wrapper keeps that behaviour while the
+/// classifier separates the two.
+#[test]
+fn degenerate_input_is_not_reported_as_a_conditioning_failure() {
+    // All-zero matrix: no second moment, zero means.
+    let health = closed_form_variance_health(&[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], 8);
+    assert_eq!(
+        health,
+        ClosedFormVarianceHealth::Degenerate,
+        "an all-zero matrix is degenerate, not ill-conditioned"
+    );
+
+    // Large means, tiny variance: Σx² is positive and almost entirely cancelled.
+    let n = 4usize;
+    let mean = 1e8f64;
+    let sum_sq = n as f64 * mean * mean; // exactly n·μ² -> residual 0
+    let cancelled = closed_form_variance_health(&[sum_sq], &[mean], n);
+    assert_eq!(
+        cancelled,
+        ClosedFormVarianceHealth::Cancelled,
+        "a positive second moment lost to cancellation is the ill-conditioned case"
+    );
+
+    // A healthy matrix is neither.
+    assert_eq!(
+        closed_form_variance_health(&[20.0, 20.0], &[1.0, 1.0], 4),
+        ClosedFormVarianceHealth::Usable
+    );
+
+    // The bool wrapper still answers "unusable" for both failure modes, because
+    // both of them mean the closed form cannot be divided by.
+    assert!(closed_form_variance_unstable(&[0.0], &[0.0], 8));
+    assert!(closed_form_variance_unstable(&[sum_sq], &[mean], n));
+    assert!(!closed_form_variance_unstable(
+        &[20.0, 20.0],
+        &[1.0, 1.0],
+        4
+    ));
+}

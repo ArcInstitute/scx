@@ -252,12 +252,59 @@ pub fn finalize_column_moments(col_sum: &[f64], col_sum_sq: &[f64], n: usize) ->
 /// that can afford a second pass over the data should recompute via the stable
 /// centered form when this returns `true`.
 pub fn closed_form_variance_unstable(col_sum_sq: &[f64], means: &[f64], n_obs: usize) -> bool {
+    !matches!(
+        closed_form_variance_health(col_sum_sq, means, n_obs),
+        ClosedFormVarianceHealth::Usable
+    )
+}
+
+/// Why a closed-form total variance is unusable — which is not one condition but
+/// two, with opposite diagnoses.
+///
+/// [`closed_form_variance_unstable`] collapses these to a bool, which is the right
+/// shape for "should I recompute stably?" but the wrong shape for telling the user
+/// what happened: a matrix with no second moment at all is *degenerate*, and its
+/// zero eigenvalues are exact, whereas a matrix whose second moment cancelled has
+/// eigenvalues that are round-off. Reporting the first as the second tells someone
+/// with an all-zero layer that their eigenvalues are unreliable, which is false
+/// and unactionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedFormVarianceHealth {
+    /// The closed form is fine; use it.
+    Usable,
+    /// `Σx² <= 0` — no second moment anywhere. The input is genuinely degenerate
+    /// (an all-zero matrix or layer). Nothing cancelled and no eigenvalue is
+    /// suspect; there is simply no variance to apportion.
+    Degenerate,
+    /// `Σx²` is positive but `Σx² − nμ²` lost nearly all of it to cancellation.
+    /// The total variance is recoverable by a stable second pass; the eigenvalues
+    /// of the cross-product are not.
+    Cancelled,
+}
+
+/// Classify a closed-form total variance, distinguishing degenerate input from
+/// cancellation. See [`ClosedFormVarianceHealth`] for why the distinction is
+/// user-visible.
+pub fn closed_form_variance_health(
+    col_sum_sq: &[f64],
+    means: &[f64],
+    n_obs: usize,
+) -> ClosedFormVarianceHealth {
     let sum_sq: f64 = col_sum_sq.iter().sum();
+    // Note the asymmetry with the per-column test: here a non-positive `sum_sq`
+    // *is* reported unusable, because a whole matrix with no second moment has no
+    // usable total variance for `variance_ratio` to divide by either way. What
+    // differs from the per-column case is only the label, and the label is what
+    // the caller puts in front of a user.
+    if sum_sq <= 0.0 {
+        return ClosedFormVarianceHealth::Degenerate;
+    }
     let mean_sq: f64 = means.iter().map(|&m| m * m).sum::<f64>() * n_obs as f64;
-    // Note the asymmetry with the per-column test: here a zero `sum_sq` *is*
-    // reported unstable, because a whole matrix with no second moment has no
-    // usable total variance for `variance_ratio` to divide by either way.
-    sum_sq <= 0.0 || residual_lost_to_cancellation(sum_sq - mean_sq, sum_sq)
+    if residual_lost_to_cancellation(sum_sq - mean_sq, sum_sq) {
+        ClosedFormVarianceHealth::Cancelled
+    } else {
+        ClosedFormVarianceHealth::Usable
+    }
 }
 
 #[cfg(test)]

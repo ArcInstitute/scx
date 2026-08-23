@@ -695,19 +695,36 @@ jobs:
               exit 1
             fi
           done
-          # Positive half 2: the masked entry point is actually used outside its
-          # own module. Without this, deleting it would leave the negative grep
-          # below nothing to find and this guard would pass on a re-duplicated tree.
+          # Positive half 2: the masked entry point is actually used by PRODUCTION
+          # code outside its own module. Without this, deleting it would leave the
+          # negative grep below nothing to find and this guard would pass on a
+          # re-duplicated tree.
+          #
+          # The `_tests.rs` exclusion is load-bearing, not tidiness: the first
+          # version of this check counted every file, and
+          # `discrimination_cell_eval_tests.rs` calls the masked kernel too — so
+          # deleting the *production* call still left a count of 1 and the guard
+          # passed. (My own falsification of it removed both callers at once and
+          # therefore did not catch this; found by codex in review.)
           n=$(grep -rlE 'point_distance_masked\(' scx-accel/src --include='*.rs' \
-                | grep -vE '(^|/)distances(_[a-z_]+)?\.rs$' | wc -l | tr -d ' ')
+                | grep -vE '(^|/)distances(_[a-z_]+)?\.rs$' \
+                | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs$' | wc -l | tr -d ' ')
           if [ "$n" -lt 1 ]; then
-            echo "::error::no module outside distances.rs calls point_distance_masked — a column-excluding caller has its own kernel again (ORG-7.21-5)."
+            echo "::error::no PRODUCTION module outside distances.rs calls point_distance_masked — a column-excluding caller has its own kernel again (ORG-7.21-5)."
             exit 1
           fi
 
           # Negative half: within eval_metrics -- where every cell-eval parity
           # claim in docs/scanpy.md lives -- no file but distances.rs accumulates
-          # cosine norms. `\bnorm_a\b` with word boundaries, because a bare
+          # cosine norms.
+          #
+          # Scope, stated so it is not mistaken for more: this catches a
+          # re-implemented *cosine*, which is the metric whose edge conventions
+          # (zero-norm -> 1.0, [0, 2] clamp) actually diverged. A hand-rolled L1 or
+          # Euclidean body would slip past it -- those have no distinctive
+          # identifier to grep for and no edge conventions to get wrong. The
+          # load-bearing half against wholesale re-duplication is the positive
+          # production-caller check above. `\bnorm_a\b` with word boundaries, because a bare
           # `norm_a` also matches inside the identifier
           # `zero_norm_and_range_hold_on_both_entry_points`; a grep cannot tell a
           # call from a sentence unless you make it.

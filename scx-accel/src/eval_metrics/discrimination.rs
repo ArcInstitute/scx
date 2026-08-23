@@ -219,11 +219,18 @@ pub fn compute_discrimination_score(
             }
 
             // Rank of the correct perturbation = its position in ascending
-            // distance order, breaking ties by index. That is what the reference
-            // reads off `np.argsort`:
+            // distance order, breaking ties by ascending index. That is SCX's own
+            // deterministic rule, NOT a reproduction of the reference's: cell-eval
+            // reads its rank off
             //
             //   sorted_indices = np.argsort(distances)
             //   rank = np.flatnonzero(sorted_indices == p_index)[0]
+            //
+            // whose default `quicksort` is unstable, so its tie order is
+            // implementation-defined. The two agree on the total ties measured so
+            // far and can differ on a mixed tie; `docs/scanpy.md` scopes the parity
+            // claim accordingly and
+            // `mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity` pins ours.
             //
             // Counting only strictly-smaller distances is the position of the
             // *first* tied element, not of `p`, so a model that cannot separate

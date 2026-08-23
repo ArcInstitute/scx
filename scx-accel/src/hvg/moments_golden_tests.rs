@@ -123,7 +123,7 @@ fn assert_bits(got: &[f64], want: &[u64], what: &str) {
     }
 }
 
-/// `streaming_mean_var` — the CSR raw-moments finalize (`hvg/cpu.rs`, site 1 of 7).
+/// `streaming_mean_var` — the CSR raw-moments finalize (`hvg/cpu.rs`, site 1 of 9).
 ///
 /// Column 2 is the cancellation witness. Its exact variance is `1/9`
 /// (`0.111111111111...`); the closed form returns `0.11111111110949423` —
@@ -157,7 +157,7 @@ fn streaming_mean_var_golden() {
 }
 
 /// `streaming_mean_var_batched` — the per-batch and global finalizes
-/// (`hvg/cpu.rs`, sites 3 and 4 of 7).
+/// (`hvg/cpu.rs`, sites 3 and 4 of 9).
 ///
 /// These two are the sites whose clamp is `.max(0.0)` rather than
 /// `if v < 0.0 { 0.0 }`. For every value here the two are bit-identical, which
@@ -227,7 +227,7 @@ fn streaming_mean_var_batched_golden() {
 }
 
 /// `streaming_mean_var_expm1` — the seurat count-space finalize
-/// (`hvg/cpu.rs`, site 2 of 7).
+/// (`hvg/cpu.rs`, site 2 of 9).
 ///
 /// The **only** arm here that is not bit-pinned. `f64::exp_m1` is a libm call
 /// and is not IEEE-exact across platforms or libm versions, so pinning its bits
@@ -253,7 +253,7 @@ fn streaming_mean_var_expm1_golden() {
     }
 }
 
-/// `streaming_mean_var_csc` — the CSC finalize (`csc/mean_var.rs`, site 5 of 7).
+/// `streaming_mean_var_csc` — the CSC finalize (`csc/mean_var.rs`, site 5 of 9).
 ///
 /// Pinned separately from the CSR arm rather than asserted equal to it. The two
 /// accumulate in different orders (CSR walks a shard's rows, CSC walks a

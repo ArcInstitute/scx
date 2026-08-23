@@ -2913,7 +2913,7 @@ for numbers at 10K / 100K / 500K / 1M cells).
 | pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. |
 | energy_distance / pearson_edistance | `atol=1e-4` correlation, `atol=1e-3` per-pert | O(N²) pairwise reduction; faer-gemm reduction order differs from sklearn BLAS GEMM. f32 + gemm matches f64 + scalar within these bounds (test parametrised over both dtypes). |
 | clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Native-Rust kNN (HNSW) + Leiden replaces scanpy under the hood; the two algorithms produce within-permutation labels on graphs with `n_perts ≥ 16` (parity test scaffold uses `n_perts=30`). |
-| discrimination_score rank | exact (`abs=0`) **on untied and totally-tied distances**; not claimed on mixed ties | Integer rank computation; any non-zero diff on those inputs is a correctness regression. Exactness requires matching the reference on duplicated gene symbols and zero-norm effect vectors, both of which diverged through v0.13.0 — and the parity fixture (400×20 continuous random) contains neither, so it did not see them. **Mixed ties are explicitly out of scope**: the reference's order comes from an unstable `np.argsort` and is not reproducible. See [Discrimination score](#discrimination-score-pyscxacceldiscrimination_score). |
+| discrimination_score rank | exact (`abs=0`) on untied distances; **empirically** exact on totally-tied ones (tested, not guaranteed — the reference's sort is unstable); not claimed on mixed ties | Integer rank computation; any non-zero diff on untied input is a correctness regression, and on a total tie it means numpy's tie order moved. Exactness requires matching the reference on duplicated gene symbols and zero-norm effect vectors, both of which diverged through v0.13.0 — and the parity fixture (400×20 continuous random) contains neither, so it did not see them. **Mixed ties are explicitly out of scope**: the reference's order comes from an unstable `np.argsort` and is not reproducible. See [Discrimination score](#discrimination-score-pyscxacceldiscrimination_score). |
 
 All functions accept in-memory, backed, or lazy-transformed inputs. They
 expect the `cell-eval` data conventions: an `obs` column with
@@ -3008,18 +3008,27 @@ sort — so its tie order is implementation-defined. Measured on numpy 2.4.4:
 | `[1, 1, 2]` | `[0, 1, 2]` | `[0, 1, 2]` | agrees |
 | `[3, 3, 1, 1]` | `[3, 2, 1, 0]` | `[2, 3, 0, 1]` | **differs** |
 
-A **total** tie always coincides, and there SCX matches the reference exactly
-(`abs=0`, pinned by `TestDiscriminationTieParity`). On a **mixed** tie — some
-distances equal, some not — the two readings *may* diverge and are not
-guaranteed to agree: `[1, 1, 2]` happens to agree, `[3, 3, 1, 1]` does not, and
-which one you get depends on introsort internals rather than on anything you can
-predict from the data. Where it diverges the scores differ outright: for
-`[3, 3, 1, 1]` SCX scores `[0.50, 0.25, 1.00, 0.75]` and cell-eval on numpy 2.4.4
-scores `[0.25, 0.50, 0.75, 1.00]`.
+On a **total** tie the two readings coincide *on every numpy measured so far*,
+and there SCX matches the reference exactly — but that is an empirical
+compatibility point, not a guarantee anyone owes you. An unstable sort has no
+contract to preserve the order of equal keys, including when every key is equal,
+so a future numpy could change it without breaking any promise.
+`TestDiscriminationTieParity` pins it at `abs=0` against the installed cell-eval,
+which means a change is caught rather than assumed away.
 
-So the contract is a *scope* limit, not a prediction: parity is claimed on
-untied and totally-tied distances, and **not claimed** on mixed ties — whether or
-not a particular mixed tie happens to agree.
+On a **mixed** tie — some distances equal, some not — the two readings *may*
+diverge and are not guaranteed to agree: `[1, 1, 2]` happens to agree,
+`[3, 3, 1, 1]` does not, and which one you get depends on introsort internals
+rather than on anything you can predict from the data. Where it diverges the
+scores differ outright: for `[3, 3, 1, 1]` SCX scores `[0.50, 0.25, 1.00, 0.75]`
+and cell-eval on numpy 2.4.4 scores `[0.25, 0.50, 0.75, 1.00]`.
+
+So the contract has one guaranteed half and one observed half. **Guaranteed:**
+SCX's own rule — ties break by ascending index, deterministically, on every
+platform and version. **Observed, and tested rather than promised:** that this
+coincides with cell-eval on untied and totally-tied distances for the numpy
+versions exercised. **Not claimed at all:** mixed ties, whether or not a
+particular one happens to agree.
 
 SCX keeps the stable rule deliberately. Reproducing the reference would mean
 reimplementing NumPy's introsort and would break on any release that touched it,

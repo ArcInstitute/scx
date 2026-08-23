@@ -741,13 +741,13 @@ class TestDiscriminationTieParity:
            fixture differently, which is what makes the "not claimed" scope in
            `docs/scanpy.md` load-bearing rather than defensive.
 
-        The numpy-only half of the canary lives in `test_eval_metrics.py`, which
-        does not require `cell_eval` and therefore actually runs in CI.
+        The numpy-only half of the canary lives in `test_accel.py`, which has no
+        module-level optional-dependency skip and therefore actually runs in CI.
         """
         # Distances [3, 3, 1, 1] from a zero prediction: two tied blocks.
         #
         # The numpy default-vs-stable canary that used to live here has moved to
-        # `test_eval_metrics.py::test_numpy_default_argsort_still_disagrees_with_stable`
+        # `test_accel.py::test_numpy_default_argsort_still_disagrees_with_stable`
         # — this module `importorskip`s `cell_eval`, which CI's Python-bindings
         # image does not have, so a canary here could never fire. Flagged by
         # Cursor Agent in review.

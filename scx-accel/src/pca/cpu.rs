@@ -66,7 +66,9 @@ use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 use scx_format_io::ShardSource;
-use scx_sparse::{closed_form_variance_unstable, total_variance_from_col_sq};
+use scx_sparse::{
+    closed_form_variance_health, total_variance_from_col_sq, ClosedFormVarianceHealth,
+};
 
 use scx_sparse::ScxCsr;
 
@@ -1006,7 +1008,8 @@ fn validate_inputs(n_obs: usize, n_vars: usize, n_components: usize) -> Result<(
 /// `total_var` is the denominator of `variance_ratio`, and computing it as
 /// `Σ col_sum_sq − n·Σ μ²` is the same cancellation-prone subtraction the
 /// per-column moments finalize does — so it carries the same guard
-/// ([`scx_sparse::closed_form_variance_unstable`]) and, when that fires, the same
+/// ([`scx_sparse::closed_form_variance_health`]) and, when it reports
+/// cancellation (not mere degeneracy), the same
 /// stable two-pass recompute (`Σ (x − μ)²` formed directly, plus the implicit
 /// zeros' `(n − nnz)·μ²`).
 ///
@@ -1036,8 +1039,14 @@ fn guarded_total_variance_streaming<S: ShardSource + Sync + ?Sized>(
     let Some(mu) = means else {
         return Ok((closed, false));
     };
-    if !closed_form_variance_unstable(col_sum_sq, mu, n_obs) {
-        return Ok((closed, false));
+    // Degenerate input (no second moment at all) is NOT a conditioning failure:
+    // its zero eigenvalues are exact and a stable recompute would find the same
+    // zero. Only cancellation earns the second pass and the warning.
+    match closed_form_variance_health(col_sum_sq, mu, n_obs) {
+        ClosedFormVarianceHealth::Usable | ClosedFormVarianceHealth::Degenerate => {
+            return Ok((closed, false));
+        }
+        ClosedFormVarianceHealth::Cancelled => {}
     }
     log::debug!(
         "{route}: closed-form total variance lost precision to cancellation \
@@ -1065,8 +1074,12 @@ fn guarded_total_variance_inmemory(
     let Some(mu) = means else {
         return (closed, false);
     };
-    if !closed_form_variance_unstable(col_sum_sq, mu, n_obs) {
-        return (closed, false);
+    // Same asymmetry as the streaming route: degenerate is exact, not unstable.
+    match closed_form_variance_health(col_sum_sq, mu, n_obs) {
+        ClosedFormVarianceHealth::Usable | ClosedFormVarianceHealth::Degenerate => {
+            return (closed, false);
+        }
+        ClosedFormVarianceHealth::Cancelled => {}
     }
     log::debug!(
         "{route}: closed-form total variance lost precision to cancellation \
@@ -2147,7 +2160,11 @@ mod tests {
             "closed-form {closed} vs stable {stable} diverged on benign data"
         );
         // Guard must NOT fire for benign data.
-        assert!(!closed_form_variance_unstable(&col_sum_sq, &means, n_obs));
+        assert!(!scx_sparse::closed_form_variance_unstable(
+            &col_sum_sq,
+            &means,
+            n_obs
+        ));
     }
 
     #[test]
@@ -2158,7 +2175,11 @@ mod tests {
         // rounding pushes ≤0 in practice); the closed form yields a non-positive
         // total variance that would zero out variance_ratio. The guard must flag it.
         let degenerate = vec![n_obs as f64 * means[0] * means[0]];
-        assert!(closed_form_variance_unstable(&degenerate, &means, n_obs));
+        assert!(scx_sparse::closed_form_variance_unstable(
+            &degenerate,
+            &means,
+            n_obs
+        ));
         assert!(total_variance_from_col_sq(&degenerate, Some(&means), n_obs) <= 0.0);
 
         // A typical scRNA-scale column (small mean, variance comparable to the
@@ -2166,7 +2187,7 @@ mod tests {
         // numerator/Σx² = 1/5, far above the threshold.
         let healthy_means = vec![2.0_f64];
         let healthy = vec![n_obs as f64 * (healthy_means[0] * healthy_means[0] + 1.0)];
-        assert!(!closed_form_variance_unstable(
+        assert!(!scx_sparse::closed_form_variance_unstable(
             &healthy,
             &healthy_means,
             n_obs
@@ -2185,7 +2206,7 @@ mod tests {
 
         // Guard fires for this regime.
         assert!(
-            closed_form_variance_unstable(&col_sum_sq, &means, n),
+            scx_sparse::closed_form_variance_unstable(&col_sum_sq, &means, n),
             "fixture should trigger the cancellation guard"
         );
         // The stable fallback recovers the analytic variance 3·n / (n−1).

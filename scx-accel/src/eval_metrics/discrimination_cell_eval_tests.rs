@@ -39,9 +39,15 @@ use super::*;
 /// A **total** tie: rank must be the argsort *position*, not the count of
 /// strictly-smaller distances.
 ///
-/// Scoped to a total tie on purpose. That is the one shape where the stable and
-/// unstable readings of `np.argsort` agree, so it is the only tie shape on which
-/// exact cell-eval parity is a meaningful claim. The mixed-tie case, where they
+/// Scoped to a total tie on purpose: it is the shape on which the stable and
+/// unstable readings of `np.argsort` have been *measured* to agree, so it is the
+/// only tie shape on which exact cell-eval parity is even a meaningful claim.
+///
+/// "Measured" rather than "guaranteed", deliberately. An unstable sort owes no
+/// contract about equal keys, all-equal included, so this is an empirical
+/// compatibility point that a future numpy could move. That is an argument for
+/// pinning it against the installed reference — which the Python
+/// `TestDiscriminationTieParity` does — not for claiming it must hold. The mixed-tie case, where they
 /// diverge and SCX deliberately keeps the stable reading, is
 /// [`mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity`].
 ///

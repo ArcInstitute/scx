@@ -18,8 +18,9 @@ pub use materialize::{
     ValueDtype,
 };
 pub use moments::{
-    closed_form_variance_unstable, finalize_column_moments, first_non_finite_column,
-    residual_lost_to_cancellation, ColumnMoments, CLOSED_FORM_VAR_REL_EPS,
+    closed_form_variance_health, closed_form_variance_unstable, finalize_column_moments,
+    first_non_finite_column, residual_lost_to_cancellation, ClosedFormVarianceHealth,
+    ColumnMoments, CLOSED_FORM_VAR_REL_EPS,
 };
 pub use transpose::{
     compute_chunk_cols_with_cap, streaming_csr_to_csc_iter_with_cap, CscArrays, CscShardIterator,

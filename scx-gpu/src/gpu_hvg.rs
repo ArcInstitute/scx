@@ -118,8 +118,12 @@ pub fn gpu_streaming_mean_var(
     // `ensure_finite_hvg_data`). Check the accumulated moments instead: a
     // non-finite input value in column j necessarily leaves `col_sum[j]`
     // non-finite, so this is exactly as strong at O(n_vars) instead of O(nnz).
-    // Before Phase 7a a NaN variance here was absorbed to 0.0 by `.max(0.0)`,
-    // making the gene look constant; erroring is the honest alternative.
+    // This file's two finalizes already used `if var < 0.0`, so Phase 7a did not
+    // change their clamp — a NaN variance propagated here before it too. (The
+    // `.max(0.0)` sites were the four *batched* finalizes; see
+    // `scx_sparse::moments`' table.) The gate is therefore closing a pre-existing
+    // hole rather than a regression, and it is here because these routes are
+    // ungated, not because their clamp moved.
     if let Some(j) = scx_sparse::first_non_finite_column(&col_sum, &col_sum_sq) {
         return Err(GpuError::InvalidShard(format!(
             "gpu_streaming_mean_var: column {j} accumulated a non-finite moment \
