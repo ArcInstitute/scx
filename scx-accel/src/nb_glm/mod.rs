@@ -528,3 +528,9 @@ pub use gpu::{finalize_nb_glm, gpu_nb_glm_fit_states, gpu_pseudobulk_nb_glm, NbG
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+// Pinned pydeseq2 comparison at the bar `docs/pseudobulk_nb_glm.md` claims —
+// ranking / sign / significance, not numerical equality (ORG-7.21-4).
+#[cfg(test)]
+#[path = "pydeseq2_reference_tests.rs"]
+mod pydeseq2_reference_tests;

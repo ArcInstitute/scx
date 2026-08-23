@@ -188,6 +188,94 @@ def f64_literal(v: float) -> str:
     return s if ("." in s or "e" in s or "E" in s) else s + ".0"
 
 
+
+
+# --- NB-GLM vs pydeseq2 ------------------------------------------------------
+#
+# `docs/pseudobulk_nb_glm.md` is explicit about the bar: "ranking / effect-sign
+# / significance parity, not numerical equality". So this section pins exactly
+# that, and nothing tighter -- a numerical-equality assertion here would be a
+# claim the docs deliberately do not make, and would go red on the apeglm
+# shrinkage and dispersion-outlier handling SCX omits on purpose.
+#
+# The counts are emitted as literals rather than as a seed + distribution, so
+# pydeseq2 and the Rust fitter see byte-identical input. Gene-major, matching
+# `pseudobulk_nb_glm`'s `counts_gene_major` parameter directly.
+
+NB_N_GENES = 24
+NB_N_SAMPLES = 8
+NB_ALPHA = 0.1  # true NB dispersion used to simulate; 9 genes carry a real LFC
+
+
+def nb_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """`(counts[sample][gene], condition[sample], true_lfc[gene])`, deterministic."""
+    rng = np.random.default_rng(20260823)
+    mu = np.round(rng.uniform(30, 400, NB_N_GENES))
+    lfc = np.zeros(NB_N_GENES)
+    lfc[:5] = np.round(rng.uniform(1.2, 2.5, 5), 2)
+    lfc[5:9] = -np.round(rng.uniform(1.2, 2.5, 4), 2)
+    cond = np.array([0] * 4 + [1] * 4)
+    counts = np.empty((NB_N_SAMPLES, NB_N_GENES), dtype=np.int64)
+    for s in range(NB_N_SAMPLES):
+        m = mu * (2.0 ** (lfc * cond[s]))
+        counts[s] = rng.negative_binomial(1.0 / NB_ALPHA, 1.0 / (1.0 + NB_ALPHA * m))
+    return counts, cond, lfc
+
+
+def pydeseq2_reference() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """`(counts_gene_major, cond, log2FoldChange, padj)` from a real pydeseq2 run."""
+    import pandas as pd
+    from pydeseq2.dds import DeseqDataSet
+    from pydeseq2.ds import DeseqStats
+
+    counts, cond, _ = nb_fixture()
+    genes = [f"g{j}" for j in range(NB_N_GENES)]
+    samples = [f"s{i}" for i in range(NB_N_SAMPLES)]
+    cts = pd.DataFrame(counts, index=samples, columns=genes)
+    meta = pd.DataFrame({"condition": ["A"] * 4 + ["B"] * 4}, index=samples)
+
+    dds = DeseqDataSet(counts=cts, metadata=meta, design="~condition", quiet=True)
+    dds.deseq2()
+    st = DeseqStats(dds, contrast=["condition", "B", "A"], quiet=True)
+    st.summary()
+    ref = st.results_df.reindex(genes)
+    return (
+        counts.T.astype(np.float64),  # gene-major, as pseudobulk_nb_glm wants
+        cond.astype(np.float64),
+        ref["log2FoldChange"].to_numpy(dtype=np.float64),
+        ref["padj"].to_numpy(dtype=np.float64),
+    )
+
+
+def emit_nb_glm() -> None:
+    import importlib.metadata as md
+
+    counts_gm, cond, lfc, padj = pydeseq2_reference()
+    _, _, true_lfc = nb_fixture()
+
+    print()
+    print(f"// --- NB-GLM vs pydeseq2 {md.version('pydeseq2')} ---")
+    print(f"// bar: ranking / sign / significance parity (docs/pseudobulk_nb_glm.md),")
+    print(f"// NOT numerical equality. {int((true_lfc != 0).sum())} of {NB_N_GENES} genes")
+    print(f"// carry a real log2 fold change; NB dispersion alpha = {NB_ALPHA}.")
+    print()
+    print(f"const NB_N_GENES: usize = {NB_N_GENES};")
+    print(f"const NB_N_SAMPLES: usize = {NB_N_SAMPLES};")
+    print()
+    print(rust_matrix("NB_COUNTS_GENE_MAJOR", counts_gm, ty="f64"))
+    print()
+    cond_lits = ", ".join(f64_literal(v) for v in cond)
+    print(f"const NB_CONDITION: [f64; NB_N_SAMPLES] = [{cond_lits}];")
+    print()
+    for name, arr in (("NB_PYDESEQ2_LOG2FC", lfc), ("NB_PYDESEQ2_PADJ", padj)):
+        lits = ",\n    ".join(
+            ", ".join(f64_literal(v) for v in arr[i : i + 4]) for i in range(0, len(arr), 4)
+        )
+        print(f"const {name}: [f64; NB_N_GENES] = [\n    {lits},\n];")
+        print()
+
+
+
 def rust_matrix(name: str, m: np.ndarray, ty: str = "f64") -> str:
     rows = ",\n".join(
         "    [" + ", ".join(f64_literal(v) for v in row) + "]" for row in m
@@ -233,6 +321,7 @@ def main() -> int:
     print("// scanpy stores `scores` as float32 and `pvals` as float64 (verified")
     print("// against the recarray dtypes, not assumed), so the uncorrected arm")
     print("// pins z at f32 precision and p tightly. scipy is f64 throughout.")
+    emit_nb_glm()
     return 0
 
 
