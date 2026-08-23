@@ -393,6 +393,53 @@ fn ensure_finite_de_input(data: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// Walk the equal-value runs of a sorted sequence, handing each run its 1-based
+/// mid-rank, and return the Wilcoxon tie correction `Σ(t³ − t)`.
+///
+/// **The one definition of mid-ranking and tie correction in this crate**
+/// (ORG-7.21-3). Both Wilcoxon rank assignments reduce to this walk and differ
+/// only in what they do with a run:
+///
+/// | caller | `equal` | `offset` | `on_run` |
+/// |---|---|---|---|
+/// | [`rank_with_ties`] (dense) | compares through a sort permutation | `0` — the run spans a whole column | writes `ranks[idx]` per element |
+/// | `csc::wilcoxon::assign_block_ranks` (analytic nnz) | compares `(value, group)` pairs | elements ordered before this block | accumulates into `rank_sum[group]` |
+///
+/// They were independent copies until this primitive, and that is how the nnz
+/// path came to re-derive the 1-vs-rest logFC bug on its own.
+///
+/// `equal(i, j)` reports whether sorted positions `i` and `j` hold the same
+/// value. `offset` is the count of elements ordered *before* this sequence, so
+/// the mid-rank of the run at `[i, j)` is `offset + (i + 1 + j) / 2` — computed
+/// as `(2·offset + i + 1 + j) / 2` to keep it a single exact division.
+///
+/// **The GPU arm is deliberately absent.** `scx-gpu`'s ranking lives in a
+/// `.cu` kernel and cannot call this; it is covered by the shared *reference
+/// values* in `wilcoxon_reference_tests.rs` instead, which is the only kind of
+/// agreement a host primitive and a device kernel can have.
+pub(crate) fn for_each_tie_run(
+    len: usize,
+    offset: usize,
+    equal: impl Fn(usize, usize) -> bool,
+    mut on_run: impl FnMut(f64, std::ops::Range<usize>),
+) -> f64 {
+    let mut tie_correction = 0.0f64;
+    let mut i = 0;
+    while i < len {
+        let mut j = i + 1;
+        while j < len && equal(i, j) {
+            j += 1;
+        }
+        on_run((2 * offset + i + 1 + j) as f64 / 2.0, i..j);
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_correction += t * t * t - t;
+        }
+        i = j;
+    }
+    tie_correction
+}
+
 /// Rank values with mid-rank tie handling. Returns `(ranks, tie_correction)`.
 ///
 /// `ranks[i]` is the 1-based mid-rank for `values[i]`.
@@ -416,24 +463,17 @@ fn rank_with_ties(values: &[f64], index_buf: &mut Vec<usize>, ranks: &mut Vec<f6
     index_buf.sort_unstable_by(|&a, &b| values[a].total_cmp(&values[b]));
 
     ranks.resize(n, 0.0);
-    let mut tie_correction = 0.0f64;
-    let mut i = 0;
-    while i < n {
-        let mut j = i + 1;
-        while j < n && values[index_buf[j]] == values[index_buf[i]] {
-            j += 1;
-        }
-        let mid_rank = (i as f64 + 1.0 + j as f64) / 2.0;
-        let tie_size = (j - i) as f64;
-        for idx in &index_buf[i..j] {
-            ranks[*idx] = mid_rank;
-        }
-        if tie_size > 1.0 {
-            tie_correction += tie_size * tie_size * tie_size - tie_size;
-        }
-        i = j;
-    }
-    tie_correction
+    let order: &[usize] = index_buf;
+    for_each_tie_run(
+        n,
+        0,
+        |i, j| values[order[j]] == values[order[i]],
+        |mid_rank, run| {
+            for &idx in &order[run] {
+                ranks[idx] = mid_rank;
+            }
+        },
+    )
 }
 
 /// Compute Wilcoxon rank-sum z-score and p-value from pre-computed ranks.

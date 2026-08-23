@@ -13,7 +13,9 @@
 
 use std::sync::OnceLock;
 
-use crate::diffexp::cpu::{compute_logfc, de_rank_cmp, wilcoxon_stats_from_rank_sum};
+use crate::diffexp::cpu::{
+    compute_logfc, de_rank_cmp, for_each_tie_run, wilcoxon_stats_from_rank_sum,
+};
 use crate::diffexp::{
     benjamini_hochberg, merge_diff_exp_results, wilcoxon_rank_sum, DiffExpResult,
 };
@@ -151,9 +153,13 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
 /// correction `Σ(t³−t)`.
 ///
 /// `block` is sorted ascending by value; `offset` is the count of cells sorted
-/// *before* this block (0 for negatives; `n_neg + n_zero` for positives). Global
-/// 1-based rank of a tie run at within-block positions `[i, j)` is
-/// `offset + (i + 1 + j) / 2`, identical to `rank_with_ties`' mid-rank.
+/// *before* this block (0 for negatives; `n_neg + n_zero` for positives).
+///
+/// The walk itself — runs, mid-ranks, `Σ(t³−t)` — is
+/// [`for_each_tie_run`](crate::diffexp::cpu::for_each_tie_run), shared with the
+/// dense path's `rank_with_ties`. It used to be a second copy of that loop, and
+/// the two agreeing was an assertion in a doc comment rather than a fact about
+/// the code; all this function supplies now is *where a run's rank goes*.
 ///
 /// Every entry here belongs to a real group: the caller drops unlabelled cells
 /// before building the blocks, because they are not in the comparison pool at
@@ -164,23 +170,16 @@ fn assign_block_ranks(
     rank_sum: &mut [f64],
     tie_correction: &mut f64,
 ) {
-    let n = block.len();
-    let mut i = 0;
-    while i < n {
-        let mut j = i + 1;
-        while j < n && block[j].0 == block[i].0 {
-            j += 1;
-        }
-        let mid_rank = (2 * offset + i + 1 + j) as f64 / 2.0;
-        for entry in &block[i..j] {
-            rank_sum[entry.1] += mid_rank;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            *tie_correction += t * t * t - t;
-        }
-        i = j;
-    }
+    *tie_correction += for_each_tie_run(
+        block.len(),
+        offset,
+        |i, j| block[j].0 == block[i].0,
+        |mid_rank, run| {
+            for entry in &block[run] {
+                rank_sum[entry.1] += mid_rank;
+            }
+        },
+    );
 }
 
 /// Per-gene 1-vs-rest Wilcoxon `(score, pval, logfc)` for every group, computed
