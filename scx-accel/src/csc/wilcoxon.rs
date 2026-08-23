@@ -1307,4 +1307,63 @@ mod tests {
             }
         }
     }
+
+    // --- ORG-7.21-3: the tie-run walk, pinned before it was shared ----------
+    //
+    // The nnz path's half of the duplication `diffexp::cpu::rank_with_ties`
+    // held the other half of. Same walk over equal-value runs, same `Σ(t³−t)`,
+    // but offset into a global rank space and accumulating per *group* rather
+    // than per element. Pinned here before the two collapsed onto one
+    // primitive, so the refactor is provably arithmetic-neutral.
+    //
+    // Expected values are derived by hand from `(2·offset + i + 1 + j) / 2`,
+    // not read off a run of the code. Falsify by perturbing one `mid_rank`.
+
+    /// Leading tie run, singleton, trailing tie run, at both offsets.
+    ///
+    /// The block sorts as `1,1 | 2 | 3,3` over positions `[0,2) [2,3) [3,5)`.
+    /// At `offset = 0` the mid-ranks are `1.5, 3.0, 4.5`; at `offset = 4` they
+    /// shift by exactly 4 to `5.5, 7.0, 8.5`. The correction is offset-free:
+    /// `(2³−2) + (2³−2) = 12`.
+    #[test]
+    fn assign_block_ranks_pinned_mid_ranks_and_tie_correction() {
+        let block = [(1.0, 0usize), (1.0, 1), (2.0, 0), (3.0, 1), (3.0, 1)];
+
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 0.0f64;
+        assign_block_ranks(&block, 0, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![4.5, 10.5]);
+        assert_eq!(tc, 12.0);
+        // Ranks 1..=5 sum to 15 whatever the grouping — an independent check
+        // on the mid-ranks that does not restate them.
+        assert_eq!(rank_sum.iter().sum::<f64>(), 15.0);
+
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 0.0f64;
+        assign_block_ranks(&block, 4, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![12.5, 22.5]);
+        assert_eq!(tc, 12.0);
+        // Ranks 5..=9 sum to 35.
+        assert_eq!(rank_sum.iter().sum::<f64>(), 35.0);
+    }
+
+    /// One run spanning the whole block, and an empty block.
+    ///
+    /// All-equal at `offset = 3`: mid-rank `(2·3 + 0 + 1 + 4)/2 = 5.5`,
+    /// correction `4³ − 4 = 60`. An empty block must touch neither output.
+    #[test]
+    fn assign_block_ranks_pinned_all_equal_and_empty() {
+        let block = [(2.5, 0usize), (2.5, 0), (2.5, 1), (2.5, 1)];
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 0.0f64;
+        assign_block_ranks(&block, 3, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![11.0, 11.0]);
+        assert_eq!(tc, 60.0);
+
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 7.0f64; // pre-loaded: an empty block must not reset it
+        assign_block_ranks(&[], 0, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![0.0, 0.0]);
+        assert_eq!(tc, 7.0);
+    }
 }

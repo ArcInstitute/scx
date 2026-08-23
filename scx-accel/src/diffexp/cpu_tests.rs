@@ -1989,3 +1989,65 @@ fn test_fully_labelled_is_unaffected_by_pool_compaction() {
         }
     }
 }
+
+// --- ORG-7.21-3: the tie-run walk, pinned before it was shared ---------------
+//
+// `rank_with_ties` (here) and `csc::wilcoxon::assign_block_ranks` were two
+// independent copies of one walk: step over the equal-value runs of a sorted
+// sequence, give each run its 1-based mid-rank, and accumulate the Wilcoxon tie
+// correction `Σ(t³−t)`. These goldens pin this side's output *before* the two
+// collapsed onto one primitive, so the refactor is provably arithmetic-neutral
+// rather than argued to be.
+//
+// Every expected value below is derived by hand from the mid-rank definition
+// `(i + 1 + j) / 2` over the sorted run `[i, j)`, not read off a run of the
+// code. Falsify by perturbing one `mid_rank`.
+
+/// Leading tie run, singleton, trailing tie run — in one fixture.
+///
+/// `[3, 1, 3, 2, 3, 1]` sorts to `1,1 | 2 | 3,3,3` at positions `[0,2) [2,3)
+/// [3,6)`, so the mid-ranks are `1.5`, `3.0`, `5.0` and the correction is
+/// `(2³−2) + (3³−3) = 6 + 24 = 30`.
+#[test]
+fn rank_with_ties_pinned_leading_singleton_trailing() {
+    let values = [3.0, 1.0, 3.0, 2.0, 3.0, 1.0];
+    let mut index_buf = Vec::new();
+    let mut ranks = Vec::new();
+    let tc = rank_with_ties(&values, &mut index_buf, &mut ranks);
+
+    assert_eq!(ranks, vec![5.0, 1.5, 5.0, 3.0, 5.0, 1.5]);
+    assert_eq!(tc, 30.0);
+    // The ranks of 1..=n always sum to n(n+1)/2 — an independent check on the
+    // mid-ranks that does not restate them.
+    assert_eq!(ranks.iter().sum::<f64>(), 21.0);
+}
+
+/// One run spanning everything: mid-rank `(0 + 1 + 4)/2 = 2.5`, correction
+/// `4³ − 4 = 60`.
+#[test]
+fn rank_with_ties_pinned_all_equal() {
+    let values = [7.0, 7.0, 7.0, 7.0];
+    let mut index_buf = Vec::new();
+    let mut ranks = Vec::new();
+    let tc = rank_with_ties(&values, &mut index_buf, &mut ranks);
+
+    assert_eq!(ranks, vec![2.5, 2.5, 2.5, 2.5]);
+    assert_eq!(tc, 60.0);
+}
+
+/// Degenerate lengths. A single element is rank 1 with no correction (`t == 1`
+/// contributes nothing); an empty sequence must not divide by zero.
+#[test]
+fn rank_with_ties_pinned_degenerate_lengths() {
+    let mut index_buf = Vec::new();
+    let mut ranks = Vec::new();
+
+    let tc = rank_with_ties(&[9.0], &mut index_buf, &mut ranks);
+    assert_eq!(ranks, vec![1.0]);
+    assert_eq!(tc, 0.0);
+
+    ranks.clear();
+    let tc = rank_with_ties(&[], &mut index_buf, &mut ranks);
+    assert!(ranks.is_empty());
+    assert_eq!(tc, 0.0);
+}
