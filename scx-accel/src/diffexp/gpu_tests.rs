@@ -1575,6 +1575,7 @@ fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
 /// run (which `test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset`
 /// above still covers, and which cannot see a bug both arms share).
 #[test]
+#[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_matches_the_external_reference_values() {
     require_gpu_or_skip!();
     use crate::diffexp::wilcoxon_reference_values as r;

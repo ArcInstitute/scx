@@ -156,7 +156,7 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
 /// *before* this block (0 for negatives; `n_neg + n_zero` for positives).
 ///
 /// The walk itself — runs, mid-ranks, `Σ(t³−t)` — is
-/// [`for_each_tie_run`](crate::diffexp::cpu::for_each_tie_run), shared with the
+/// [`crate::diffexp::cpu::for_each_tie_run`], shared with the
 /// dense path's `rank_with_ties`. It used to be a second copy of that loop, and
 /// the two agreeing was an assertion in a doc comment rather than a fact about
 /// the code; all this function supplies now is *where a run's rank goes*.
