@@ -744,6 +744,155 @@ jobs:
             exit 1
           fi
 
+      # ORG-7.21-3: one tie-run walk, and one external oracle for all three
+      # rank-sum kernels.
+      #
+      # `rank_with_ties` (dense) and `assign_block_ranks` (analytic nnz) were two
+      # independent copies of "walk the equal-value runs of a sorted sequence,
+      # emit each run's mid-rank, accumulate Σ(t³−t)". The review's finding was
+      # not the duplication itself but its consequence: the nnz path re-derived
+      # the 1-vs-rest logFC bug on its own, and its only evidence was a proptest
+      # against the dense kernel -- which cannot see a dense-kernel bug.
+      - name: One tie-run walk, one DE oracle
+        run: |
+          set -euo pipefail
+          prim=scx-accel/src/diffexp/cpu.rs
+          # Assert the input exists before asserting anything about it: a guard
+          # keyed on a path that has moved passes vacuously and says nothing.
+          test -f "$prim" || { echo "::error::$prim is missing — this guard's path moved; retarget it rather than deleting it (ORG-7.21-3)."; exit 1; }
+
+          # Positive half 1: the primitive is declared, here.
+          if ! grep -qE '^pub\(crate\) fn for_each_tie_run\(' "$prim"; then
+            echo "::error::$prim no longer declares \`for_each_tie_run\` — it is the single source of mid-ranking and the Wilcoxon tie correction (ORG-7.21-3)."
+            exit 1
+          fi
+
+          # Positive half 2: PRODUCTION code in more than one module calls it.
+          # Deleting the primitive outright would otherwise leave the negative
+          # grep below nothing to find and this guard would pass on a fully
+          # re-duplicated tree.
+          #
+          # `*_tests.rs` excluded, and this exclusion is load-bearing rather than
+          # tidiness -- exactly the trap ORG-7.21-5's guard fell into in review.
+          # `nb_glm/pydeseq2_reference_tests.rs` also calls the primitive (for
+          # Spearman mid-ranks), so counting every file would let the production
+          # callers be deleted while the count stayed non-zero.
+          n=$(grep -rlE 'for_each_tie_run\(' scx-accel/src --include='*.rs' \
+                | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs$' | wc -l | tr -d ' ')
+          if [ "$n" -lt 2 ]; then
+            echo "::error::only $n PRODUCTION module(s) call for_each_tie_run, expected 2 (the dense kernel and the analytic-nnz kernel). One of them has its own tie-run walk again (ORG-7.21-3)."
+            exit 1
+          fi
+
+          # Negative half: nobody else computes Σ(t³−t).
+          #
+          # Two exemptions, both deliberate:
+          #
+          #  * `csc/wilcoxon.rs` adds the correction for the **implicit-zero
+          #    block** -- a single tie run of analytically known size that is
+          #    never materialized, so there is no sequence for the walker to walk.
+          #    Routing it through `for_each_tie_run` would mean synthesizing
+          #    n_zero entries to iterate over, which is the whole point of the
+          #    analytic path not to do.
+          #  * `*_tests.rs`, where re-deriving the formula to check the kernel is
+          #    the point.
+          #
+          # CUDA kernels in scx-gpu are out of scope for an `--include='*.rs'`
+          # grep by construction; the GPU arm is held to the shared reference
+          # values instead, which is the only agreement a host function and a
+          # device kernel can have.
+          # Counted rather than exempted by line number: an exempted *file*
+          # would let a third copy be added inside it, and a line number goes
+          # stale the moment anything above it moves.
+          in_prim=$(grep -cE -- 't \* t \* t - t' "$prim" | tr -d ' ')
+          if [ "$in_prim" -ne 1 ]; then
+            echo "::error::$prim contains $in_prim copies of the tie correction, expected exactly 1 (inside for_each_tie_run) (ORG-7.21-3)."
+            exit 1
+          fi
+          nnz=scx-accel/src/csc/wilcoxon.rs
+          in_nnz=$(grep -cE -- 't \* t \* t - t' "$nnz" | tr -d ' ')
+          if [ "$in_nnz" -ne 1 ]; then
+            echo "::error::$nnz contains $in_nnz copies of the tie correction, expected exactly 1 (the implicit-zero block) (ORG-7.21-3)."
+            exit 1
+          fi
+          if grep -rEln --include='*.rs' -- 't \* t \* t - t' \
+               scx-accel/src scx-gpu/src pyscx/src \
+               | grep -vE "^$prim$" \
+               | grep -vE "^$nnz$" \
+               | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs$'; then
+            echo "::error::the file(s) above compute the Wilcoxon tie correction themselves — call diffexp::cpu::for_each_tie_run so the mid-rank and Σ(t³−t) exist once (ORG-7.21-3)."
+            exit 1
+          fi
+
+          # Positive half 3: the oracle exists at all. Every pinned reference
+          # value and the script that regenerates it -- without these the two
+          # halves above only prove the code is deduplicated, which is what the
+          # review said was NOT the gap.
+          for f in scx-accel/src/diffexp/wilcoxon_reference_values.rs \
+                   scx-accel/src/diffexp/wilcoxon_reference_tests.rs \
+                   scx-accel/src/nb_glm/pydeseq2_reference_tests.rs \
+                   benchmarks/scripts/generate_de_parity_references.py; do
+            test -f "$f" || { echo "::error::$f is missing — the DE parity claims are backed by nothing again (ORG-7.21-3, ORG-7.21-4)."; exit 1; }
+          done
+          # ...and the two tie conventions are still pinned to DIFFERENT oracles.
+          # Collapsing them onto one table is how `tie_correct` stops meaning
+          # anything while every assertion still passes.
+          for sym in SCIPY_Z_TIE_CORRECTED SCANPY_Z_UNCORRECTED; do
+            if ! grep -q "$sym" scx-accel/src/diffexp/wilcoxon_reference_values.rs; then
+              echo "::error::wilcoxon_reference_values.rs no longer defines $sym — scipy always tie-corrects and scanpy never does, so one table cannot serve both arms (ORG-7.21-3)."
+              exit 1
+            fi
+          done
+
+      # ORG-7.21-4: the weak scanpy DE bars cannot come back.
+      #
+      # `overlap >= 0.80` on the top-20 gene NAMES could not see a constant
+      # shift in every score -- the ranking, and so the overlap, is untouched
+      # (measured: overlap 1.00 under a +0.51 shift). `abs(Δlog2FC) < 0.5` passes
+      # a 1.40x fold-change error. Both are replaced by name-keyed comparisons at
+      # the measured max |Δ| plus one decimal order.
+      - name: The scanpy DE parity bars stay measured, not chosen
+        run: |
+          set -euo pipefail
+          t=pyscx/tests/test_accel.py
+          test -f "$t" || { echo "::error::$t is missing — this guard's path moved; retarget it rather than deleting it (ORG-7.21-4)."; exit 1; }
+
+          # Positive half: the measured bars are declared AND used. A declared
+          # constant nobody asserts against is the same as no bar at all.
+          for sym in SCANPY_SCORE_ATOL SCANPY_PVAL_ATOL SCANPY_LOGFC_ATOL; do
+            if ! grep -qE "^$sym = " "$t"; then
+              echo "::error::$t no longer declares $sym — the scanpy DE bars are the measured max |Δ| and live in one place (ORG-7.21-4)."
+              exit 1
+            fi
+          done
+          # Counted as *code* references, excluding the declarations themselves
+          # and comment lines: the file explains at length why the old bars went,
+          # so counting every mention of the name would count the explanation.
+          # Three is the floor because there are three fields to bound -- scores,
+          # pvals/pvals_adj, logfoldchanges.
+          uses=$(grep -nE 'SCANPY_(SCORE|PVAL|LOGFC)_ATOL' "$t" \
+                   | grep -vE '^[0-9]+:SCANPY_' \
+                   | grep -vcE '^[0-9]+:[[:space:]]*#' | tr -d ' ')
+          if [ "$uses" -lt 3 ]; then
+            echo "::error::only $uses code reference(s) in $t use a SCANPY_*_ATOL bar, expected at least 3 (scores, pvals/pvals_adj, logfoldchanges). A declared-but-unused bar is not a bar (ORG-7.21-4)."
+            exit 1
+          fi
+
+          # Negative half: no `assert` in this file rests on a name overlap.
+          # Keyed on `assert` and not on the word `overlap`, because the file
+          # explains at length why the overlap bars were removed -- a bare grep
+          # cannot tell a call from a sentence unless you make it.
+          #
+          # Scope, stated so it is not read as more: this covers the *DE* parity
+          # tests only. `test_hvg*.py` still carries `overlap >= 0.70` / `> 0.80`
+          # bars; those are HVG gene-selection claims, a different metric with a
+          # different documented tolerance, and they are not in ORG-7.21-4's DE
+          # scope. They are unguarded, not guarded-and-passing.
+          if grep -nE '^[[:space:]]*assert.*overlap' "$t"; then
+            echo "::error::the assertion(s) above compare scanpy DE output by name overlap — a ranking-preserving error in every score passes that bar (measured: 1.00 overlap under a +0.51 shift). Compare the fields by name against SCANPY_*_ATOL (ORG-7.21-4)."
+            exit 1
+          fi
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
