@@ -737,20 +737,21 @@ class TestDiscriminationTieParity:
         things, both of which have to hold for the documentation to be right:
 
         1. SCX's scores equal the **stable** argsort ranks (its documented rule).
-        2. numpy's default argsort really does disagree with stable here — so if a
-           future numpy makes its default sort stable, this test fails and tells
-           us the divergence note in `docs/scanpy.md` has become obsolete, rather
-           than leaving a stale caveat in the docs forever.
+        2. that on this numpy the divergence is real — cell-eval scores this
+           fixture differently, which is what makes the "not claimed" scope in
+           `docs/scanpy.md` load-bearing rather than defensive.
+
+        The numpy-only half of the canary lives in `test_eval_metrics.py`, which
+        does not require `cell_eval` and therefore actually runs in CI.
         """
         # Distances [3, 3, 1, 1] from a zero prediction: two tied blocks.
+        #
+        # The numpy default-vs-stable canary that used to live here has moved to
+        # `test_eval_metrics.py::test_numpy_default_argsort_still_disagrees_with_stable`
+        # — this module `importorskip`s `cell_eval`, which CI's Python-bindings
+        # image does not have, so a canary here could never fire. Flagged by
+        # Cursor Agent in review.
         d = np.array([3.0, 3.0, 1.0, 1.0])
-        default_order = list(np.argsort(d))
-        stable_order = list(np.argsort(d, kind="stable"))
-        assert default_order != stable_order, (
-            f"premise gone: numpy {np.__version__} now agrees with stable on "
-            f"{list(d)} ({default_order}). The mixed-tie divergence documented in "
-            f"docs/scanpy.md may no longer exist — recheck it."
-        )
 
         real, pred = _make_mixed_tie_discrimination_adata()
         scx = pyscx.accel.discrimination_score(
@@ -766,6 +767,20 @@ class TestDiscriminationTieParity:
                 f"SCX scored '{pert}' {scx[pert]}, expected {w} from its "
                 f"documented stable tie rule. All SCX={scx}"
             )
+
+        # And the divergence itself, against the installed reference: this is the
+        # fixture the docs cite, so if cell-eval ever agrees here the "not
+        # claimed" scope has become unnecessarily broad and should be revisited.
+        ce = ce_discrimination_score(
+            _build_pair(real, pred), metric="l1", exclude_target_gene=False,
+        )
+        assert any(
+            scx[p] != pytest.approx(ce[p], abs=0) for p in ce
+        ), (
+            f"cell-eval now agrees with SCX on this mixed tie (SCX={scx}, "
+            f"cell-eval={dict(ce)}). The mixed-tie exclusion in docs/scanpy.md "
+            f"may be broader than it needs to be — recheck it."
+        )
 
     def test_all_ties_match_cell_eval(self):
         real, pred = _make_tied_discrimination_adata()

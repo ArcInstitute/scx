@@ -15,24 +15,33 @@
 //! # Two conventions this settles, which used to be per-site
 //!
 //! **The clamp.** Five of the nine sites clamped with `if v < 0.0 { 0.0 }` and
-//! four — every GPU arm: both of `scx-gpu`'s and both of `hvg/gpu.rs`'s — with
-//! `.max(0.0)`. Those are *not* equivalent: Rust's `f64::max` returns the
-//! non-NaN operand, so `.max(0.0)` maps a NaN variance silently to `0.0`, while
-//! `if v < 0.0` is false for NaN and lets it propagate. This function takes the
-//! second behaviour — a NaN is a bug worth seeing, not worth rounding to a
+//! four with `.max(0.0)`. Those are *not* equivalent: Rust's `f64::max` returns
+//! the non-NaN operand, so `.max(0.0)` maps a NaN variance silently to `0.0`,
+//! while `if v < 0.0` is false for NaN and lets it propagate. This function takes
+//! the second behaviour — a NaN is a bug worth seeing, not worth rounding to a
 //! plausible zero — and `nan_variance_is_not_clamped_to_zero` pins it.
 //!
-//! On the five CPU sites the two forms are bit-identical on real data, because
-//! each sits behind an input finiteness guard (`ensure_finite_hvg_data`). **The
-//! four GPU sites had no such guard**, so for them the unification was a real
-//! behaviour change on non-finite input: previously a NaN variance was absorbed
-//! to `0.0` (the gene then looks constant and is never selected as HVG), and
-//! afterwards it would have propagated into HVG ranking. Neither is acceptable,
-//! so those four now reject non-finite input outright via
-//! [`first_non_finite_column`], matching what the CPU routes already did. That
-//! is what makes "every caller is gated" true rather than aspirational — it was
-//! not true when this module was first written, and the earlier version of this
-//! paragraph claimed it was.
+//! The four `.max(0.0)` sites were the **batched** finalizes, two on each side:
+//! `hvg/cpu.rs`'s per-batch and global, and `hvg/gpu.rs`'s per-batch and global.
+//! Both of `scx-gpu`'s `gpu_hvg.rs` sites already used `if var < 0.0`. Getting
+//! this assignment right matters, because it decides where the unification was a
+//! behaviour change:
+//!
+//! | Sites | Old clamp | Input gated? | Effect of unifying |
+//! |---|---|---|---|
+//! | `hvg/cpu.rs` batched ×2 | `.max(0.0)` | yes (`ensure_finite_hvg_data`) | none — unreachable |
+//! | `hvg/gpu.rs` batched ×2 | `.max(0.0)` | **no** | **real**: NaN was absorbed to `0.0`, would now propagate |
+//! | `hvg/cpu.rs` ×2, `csc/mean_var.rs` | `if v < 0.0` | yes | none — same form |
+//! | `scx-gpu/gpu_hvg.rs` ×2 | `if var < 0.0` | **no** | none — same form, but NaN already propagated here before Phase 7a |
+//!
+//! So the unification changed behaviour on **two** sites, not four. All four
+//! ungated sites (the two `hvg/gpu.rs` batched and the two `scx-gpu` ones) now
+//! reject non-finite input via [`first_non_finite_column`] — closing the real
+//! change on the first pair and a pre-existing hole on the second.
+//!
+//! An earlier version of this paragraph said the divergence was unreachable
+//! because "every caller sits behind a finiteness guard". That was false for the
+//! four GPU sites, and it is only true now because they were given one.
 //!
 //! **The cancellation report.** `Σx² − n·mean²` is the cancellation-prone form.
 //! It is used anyway because the stable two-pass alternative needs a second
@@ -94,11 +103,23 @@ pub fn residual_lost_to_cancellation(residual: f64, second_moment: f64) -> bool 
 
 /// The first column whose accumulated moments are not finite, if any.
 ///
-/// This is the cheap gate the GPU HVG routes use in place of an input scan, and
-/// it is exactly as strong: if any input value in column `j` is non-finite then
-/// `sums[j]` is non-finite too, because neither NaN nor an infinity can cancel
-/// back to a finite number (`NaN + x` is `NaN` for every `x`, and `∞ + (−∞)` is
-/// `NaN`, not `0`). So a clean accumulator proves clean input, per column.
+/// This is the cheap gate the GPU HVG routes use in place of an input scan. For
+/// every value that *reaches* the accumulator it is exactly as strong: if any
+/// accumulated input value in column `j` is non-finite then `sums[j]` is
+/// non-finite too, because neither NaN nor an infinity can cancel back to a
+/// finite number (`NaN + x` is `NaN` for every `x`, and `∞ + (−∞)` is `NaN`, not
+/// `0`). So a clean accumulator proves clean *accumulated* input, per column.
+///
+/// ⚠️ **That is narrower than an input scan, in one specific way.** The batched
+/// GPU kernel (`colmajor_ops.cu`) returns early on `row_to_batch[row] < 0`
+/// *before* reading any values, so a non-finite value in a row excluded from
+/// every batch never reaches these sums and this predicate cannot see it. The CPU
+/// batched route scans the whole shard with `ensure_finite_hvg_data` before
+/// consulting the batch assignment, so it rejects that input. The two routes
+/// therefore have different validation domains for excluded rows: CPU rejects,
+/// GPU accepts and ignores. Closing that needs a device-side non-finite flag
+/// independent of batch inclusion, which is a kernel change and is tracked as a
+/// follow-on, not done here.
 ///
 /// It costs `O(n_vars)` rather than the `O(nnz)` of scanning the values, which
 /// is why the device paths can afford it — they have already copied exactly

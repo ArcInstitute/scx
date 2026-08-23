@@ -51,19 +51,25 @@ fn a_negative_residual_from_round_off_is_clamped_to_zero() {
 
 /// The clamp divergence Phase 7a settles.
 ///
-/// The two batched HVG sites used `.max(0.0)`, which returns the non-NaN operand
-/// and therefore maps a NaN variance to a plausible-looking `0.0`. The other five
-/// used `if v < 0.0`, which is false for NaN and lets it through. This function
-/// takes the second behaviour on purpose: a NaN here means the accumulators are
-/// already wrong, and reporting zero variance for a broken gene is worse than
-/// reporting NaN.
+/// Four of the nine pre-unification sites — the batched finalizes, two in
+/// `hvg/cpu.rs` and two in `hvg/gpu.rs` — used `.max(0.0)`, which returns the
+/// non-NaN operand and therefore maps a NaN variance to a plausible-looking
+/// `0.0`. The other five used `if v < 0.0`, which is false for NaN and lets it
+/// through. This function takes the second behaviour on purpose: a NaN here means
+/// the accumulators are already wrong, and reporting zero variance for a broken
+/// gene is worse than reporting NaN.
 ///
-/// **Not reachable from data.** Every caller runs a finiteness guard over the
-/// shard values first (`ensure_finite_hvg_data` on the CSR path,
-/// `ensure_finite_values` on the CSC path), and no finite f32 input can drive the
-/// f64 accumulators to NaN. So this is a unit test on the primitive by necessity,
-/// not by preference — do not go looking for the end-to-end case, and do not
-/// "fix" an input guard to create one.
+/// **Reachable from data only on the GPU routes, and now gated there.** The five
+/// CPU/CSC callers run a finiteness guard over the shard values first
+/// (`ensure_finite_hvg_data` on the CSR path, `ensure_finite_values` on the CSC
+/// path), and no finite f32 input can drive the f64 accumulators to NaN. The four
+/// GPU callers had no such guard — an earlier version of this comment said
+/// "every caller" and was wrong — so they now check their accumulated moments
+/// with [`first_non_finite_column`] and error out. See its docs for the one
+/// residual gap (rows excluded from every batch).
+///
+/// So this stays a unit test on the primitive: the end-to-end case is now an
+/// `Err` from the caller, not a NaN variance.
 #[test]
 fn nan_variance_is_not_clamped_to_zero() {
     let m = finalize_column_moments(&[f64::NAN], &[f64::NAN], 4);

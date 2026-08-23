@@ -126,13 +126,24 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
     for b in 0..n_batches {
         // Unlike `streaming_mean_var_batched`, this route never sees the shard
         // values on the host, so it cannot call `ensure_finite_hvg_data`. It
-        // checks the accumulated moments instead — equivalent per column, since
-        // a non-finite input value leaves its column's sum non-finite, and
-        // O(n_vars) rather than O(nnz). Before Phase 7a `.max(0.0)` absorbed a
-        // NaN variance to 0.0 here, so the gene silently looked constant.
+        // checks the accumulated moments instead: a non-finite value that reaches
+        // the accumulator leaves its column's sum non-finite, at O(n_vars) rather
+        // than O(nnz). Before Phase 7a `.max(0.0)` absorbed a NaN variance to 0.0
+        // here, so the gene silently looked constant.
+        //
+        // Narrower than the CPU scan in one way, deliberately documented rather
+        // than papered over: the device kernel returns early on
+        // `row_to_batch[row] < 0` before reading values, so a non-finite value in
+        // a row excluded from every batch never reaches these sums. CPU rejects
+        // that input, GPU accepts and ignores it. Closing the gap needs a
+        // device-side flag independent of batch inclusion; see
+        // `scx_sparse::first_non_finite_column`.
         if let Some(j) = scx_sparse::first_non_finite_column(&batch_sum[b], &batch_sum_sq[b]) {
             return Err(crate::error::AccelError::InvalidInput(format!(
-                "streaming_mean_var_batched_with_device: batch {b}, column {j}                  accumulated a non-finite moment (sum = {}, sum_sq = {}) — the                  input contains NaN/Inf, or a finite input overflowed. HVG                  statistics would be meaningless.",
+                "streaming_mean_var_batched_with_device: batch {b}, column {j} accumulated \
+                 a non-finite moment (sum = {}, sum_sq = {}) — the input contains \
+                 NaN/Inf, or a finite input overflowed. HVG statistics would be \
+                 meaningless.",
                 batch_sum[b][j], batch_sum_sq[b][j]
             )));
         }
@@ -160,7 +171,9 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
     // exactly the case an input scan would miss.
     if let Some(j) = scx_sparse::first_non_finite_column(&global_sum, &global_sum_sq) {
         return Err(crate::error::AccelError::InvalidInput(format!(
-            "streaming_mean_var_batched_with_device: global column {j}              accumulated a non-finite moment (sum = {}, sum_sq = {}) after              summing {n_batches} finite per-batch moments — the totals overflowed.",
+            "streaming_mean_var_batched_with_device: global column {j} accumulated a \
+             non-finite moment (sum = {}, sum_sq = {}) after summing {n_batches} \
+             finite per-batch moments — the totals overflowed.",
             global_sum[j], global_sum_sq[j]
         )));
     }

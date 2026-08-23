@@ -161,6 +161,34 @@ pub fn compute_discrimination_score(
         None
     };
 
+    // Every column excluded is not a distance of zero — it is no distance at all,
+    // and the reference agrees: cell-eval hands its empty
+    // `np.flatnonzero(genes != p)` selection to sklearn, which raises `Found array
+    // with 0 feature(s)`. Without this check L1/L2 reduce the empty iterator to
+    // 0.0 and cosine returns 1.0 from its zero-denominator branch, so every
+    // perturbation ties and scores a meaningless 1.0.
+    //
+    // Reachable, not hypothetical: a single-gene panel whose gene is the
+    // perturbation target, or a matrix whose `var_names` are all the same symbol.
+    // Checked up front rather than inside the rayon loop so it fails before any
+    // work and does not have to thread a `Result` through the parallel map.
+    if let Some(m) = gene_idx_map.as_ref() {
+        for (p, name) in pert_names.iter().enumerate() {
+            if let Some(cols) = m.get(name.as_str()) {
+                if cols.len() >= n_genes {
+                    return Err(crate::AccelError::InvalidInput(format!(
+                        "exclude_target_gene removed every gene column for \
+                         perturbation '{name}' (index {p}): all {n_genes} column(s) \
+                         are named after it, so there are no features left to \
+                         compare. cell-eval raises here too. Drop \
+                         exclude_target_gene, or give the matrix at least one gene \
+                         that is not this perturbation's target."
+                    )));
+                }
+            }
+        }
+    }
+
     // ── Compute scores in parallel ──────────────────────────────────
     let scores: Vec<f64> = (0..n_perts)
         .into_par_iter()

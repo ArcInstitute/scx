@@ -1,8 +1,11 @@
 //! Golden per-column mean/variance values for every `scx-accel` finalize site.
 //!
-//! Phase 7a unifies seven copies of the `(Σx² − n·mean²)/(n−1)` finalize — four
-//! here in [`super::super::cpu`], one in `crate::csc::mean_var`, and two in
-//! `scx-gpu`'s `gpu_hvg` — onto `scx_sparse::finalize_column_moments`. These
+//! Phase 7a unifies **nine** copies of the `(Σx² − n·mean²)/(n−1)` finalize —
+//! four here in [`super::super::cpu`], one in `crate::csc::mean_var`, two in
+//! [`super::gpu`]'s batched device wrapper, and two in `scx-gpu`'s `gpu_hvg` —
+//! onto `scx_sparse::finalize_column_moments`. (An earlier version of this
+//! comment said seven, written before the last two were found; the CI guard and
+//! `scx_sparse::moments`' module docs are the authority.) These
 //! tests exist to make that adoption *provably* behaviour-preserving rather than
 //! preserving-by-intent, which is the whole reason the Organization series
 //! requires the safety net to land before the refactor.

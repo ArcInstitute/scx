@@ -3002,16 +3002,24 @@ perfect 1.0 on every perturbation instead of `1 - p/P`.
 reference ranks by `np.argsort`, whose default kind is `quicksort` — not a stable
 sort — so its tie order is implementation-defined. Measured on numpy 2.4.4:
 
-| distances | `np.argsort` (default) | `kind="stable"` |
-|---|---|---|
-| `[5, 5, 5]` | `[0, 1, 2]` | `[0, 1, 2]` — agrees |
-| `[3, 3, 1, 1]` | `[3, 2, 1, 0]` | `[2, 3, 0, 1]` — **differs** |
+| distances | `np.argsort` (default) | `kind="stable"` | |
+|---|---|---|---|
+| `[5, 5, 5]` | `[0, 1, 2]` | `[0, 1, 2]` | agrees |
+| `[1, 1, 2]` | `[0, 1, 2]` | `[0, 1, 2]` | agrees |
+| `[3, 3, 1, 1]` | `[3, 2, 1, 0]` | `[2, 3, 0, 1]` | **differs** |
 
-A *total* tie is the one shape where the two readings coincide, and there SCX
-matches the reference exactly (`abs=0`, pinned by `TestDiscriminationTieParity`).
-On a **mixed** tie — some distances equal, some not — they diverge: for
+A **total** tie always coincides, and there SCX matches the reference exactly
+(`abs=0`, pinned by `TestDiscriminationTieParity`). On a **mixed** tie — some
+distances equal, some not — the two readings *may* diverge and are not
+guaranteed to agree: `[1, 1, 2]` happens to agree, `[3, 3, 1, 1]` does not, and
+which one you get depends on introsort internals rather than on anything you can
+predict from the data. Where it diverges the scores differ outright: for
 `[3, 3, 1, 1]` SCX scores `[0.50, 0.25, 1.00, 0.75]` and cell-eval on numpy 2.4.4
 scores `[0.25, 0.50, 0.75, 1.00]`.
+
+So the contract is a *scope* limit, not a prediction: parity is claimed on
+untied and totally-tied distances, and **not claimed** on mixed ties — whether or
+not a particular mixed tie happens to agree.
 
 SCX keeps the stable rule deliberately. Reproducing the reference would mean
 reimplementing NumPy's introsort and would break on any release that touched it,

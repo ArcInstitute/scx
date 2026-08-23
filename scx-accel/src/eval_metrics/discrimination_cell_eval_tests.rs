@@ -22,9 +22,10 @@
 //! `np.argsort`'s default kind is `quicksort`, which is **not** a stable sort, so
 //! the reference's own tie behaviour is implementation-defined. SCX matches the
 //! stable reading. That agrees with the reference on a **total** tie — measured,
-//! not assumed — and *disagrees* on a mixed tie, where numpy 2.4.4 returns
-//! reverse index order within each tied block
-//! (`np.argsort([3,3,1,1]) -> [3,2,1,0]`). The stable reading is kept anyway,
+//! not assumed — and on a mixed tie may or may not: numpy 2.4.4 returns reverse
+//! index order within each tied block for `[3,3,1,1]` but plain index order for
+//! `[1,1,2]`, so mixed-tie parity is unpredictable rather than reliably wrong.
+//! The stable reading is kept anyway,
 //! because it is deterministic and reproducible across versions and languages
 //! where the reference's is neither; see
 //! [`mixed_ties_pin_scx_stable_semantics_not_cell_eval_parity`], which pins that
@@ -89,17 +90,19 @@ fn total_ties_rank_by_index_matching_cell_eval() {
 /// A **mixed** tie — some distances equal, some not — pins SCX's own
 /// deterministic semantics, which is where they stop matching cell-eval.
 ///
-/// This is the case the total-tie fixture above cannot see, and the distinction
-/// is not academic: `np.argsort`'s default `quicksort` happens to preserve index
-/// order on a *fully* tied array, so a total tie is the one shape where the
-/// stable and unstable readings agree. On a mixed tie they diverge, and on numpy
-/// 2.4.4 the divergence is not even "arbitrary" — it is *reverse* index order
-/// within each tied block:
+/// This is the case the total-tie fixture above cannot see. `np.argsort`'s default
+/// `quicksort` preserves index order on a *fully* tied array, so a total tie
+/// always agrees with the stable reading. A mixed tie *may* diverge — it is not
+/// guaranteed either way, which is the whole problem: `[1, 1, 2]` happens to
+/// agree on numpy 2.4.4 while `[3, 3, 1, 1]` does not, and nothing about the data
+/// predicts which. Where it diverges the order is not even random-looking — it is
+/// *reverse* index order within each tied block:
 ///
 /// ```text
 /// np.argsort([3, 3, 1, 1])                 -> [3, 2, 1, 0]
-/// np.argsort([3, 3, 1, 1], kind="stable")  -> [2, 3, 0, 1]
-/// np.argsort([5, 5, 5])                    -> [0, 1, 2]     <- total tie: agrees
+/// np.argsort([3, 3, 1, 1], kind="stable")  -> [2, 3, 0, 1]   <- mixed: differs
+/// np.argsort([1, 1, 2])                    -> [0, 1, 2]      <- mixed: agrees
+/// np.argsort([5, 5, 5])                    -> [0, 1, 2]      <- total: always agrees
 /// ```
 ///
 /// So for distances `[3, 3, 1, 1]` the two readings give different scores:
@@ -242,6 +245,68 @@ fn duplicate_var_names_exclude_every_matching_column() {
         got.scores[0],
         got.scores
     );
+}
+
+/// Excluding **every** gene column must be an error, not a distance of zero.
+///
+/// The boundary the duplicate-name fixture cannot reach: it always leaves an
+/// unrelated `g1` column standing. When every column is named after the
+/// perturbation, the keep mask is all-false and the kernels answer anyway — L1
+/// and L2 reduce an empty iterator to `0.0`, cosine returns `1.0` from its
+/// zero-denominator branch — so every perturbation ties and scores a meaningless
+/// `1.0`. Measured before the fix: `{g0: 1.0, g1: 1.0}`.
+///
+/// The reference does not answer: cell-eval hands its empty
+/// `np.flatnonzero(genes != p)` to sklearn, which raises `Found array with 0
+/// feature(s) (shape=(2, 0))`. Verified against the installed package.
+///
+/// Reachable rather than hypothetical — a single-gene panel whose gene is the
+/// perturbation target, or a matrix whose `var_names` are all one symbol.
+#[test]
+fn excluding_every_column_is_an_error_not_a_perfect_score() {
+    let n_perts = 2usize;
+    let n_genes = 2usize;
+    // BOTH columns are named "g0", and "g0" is a perturbation.
+    let gene_names = vec!["g0".to_string(), "g0".to_string()];
+    let perts = vec!["g0".to_string(), "g1".to_string()];
+    let real = vec![7.0, 3.0, 1.0, 5.0];
+    let pred = real.clone();
+
+    let err = compute_discrimination_score(
+        &real,
+        &pred,
+        n_perts,
+        n_genes,
+        &perts,
+        Some(&gene_names),
+        DistanceMetric::L1,
+        true,
+    )
+    .expect_err(
+        "excluding every column must be rejected — before the fix this returned \
+         a perfect 1.0 for every perturbation",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("every gene column") && msg.contains("g0"),
+        "error should name the condition and the perturbation, got: {msg}"
+    );
+
+    // The complement: one surviving column is fine, so the guard is keyed to
+    // "nothing left" and not merely to "a duplicate exists".
+    let ok_genes = vec!["g0".to_string(), "g0".to_string(), "g1".to_string()];
+    let ok_real = vec![7.0, 3.0, 2.0, 1.0, 5.0, 4.0];
+    compute_discrimination_score(
+        &ok_real,
+        &ok_real.clone(),
+        2,
+        3,
+        &perts,
+        Some(&ok_genes),
+        DistanceMetric::L1,
+        true,
+    )
+    .expect("one surviving column must still be accepted");
 }
 
 /// A zero-norm effect vector under a masked cosine distance must score `1.0`

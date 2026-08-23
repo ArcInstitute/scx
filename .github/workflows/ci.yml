@@ -622,9 +622,11 @@ jobs:
       # ORG-7.21-1: one column-moments finalize, one cancellation threshold.
       # The Bessel-corrected `(sum(x^2) - n*mean^2)/(n-1)` per-column finalize was
       # written out nine times before Phase 7a -- four HVG CSR arms, one CSC arm,
-      # two `scx-gpu` device arms and two `scx-accel/src/hvg/gpu.rs` batched arms,
-      # four of them with a NaN-swallowing `.max(0.0)` clamp and five with
-      # `if v < 0.0`. It now lives once, in `scx-sparse`, which is the only crate
+      # two `scx-gpu` device arms and two `scx-accel/src/hvg/gpu.rs` batched arms.
+      # Five clamped with `if v < 0.0`; four -- the *batched* finalizes, two in
+      # `hvg/cpu.rs` and two in `hvg/gpu.rs` -- used a NaN-swallowing `.max(0.0)`.
+      # (The `scx-gpu` pair already used `if var < 0.0`; an earlier version of
+      # this comment mis-assigned the four.) It now lives once, in `scx-sparse`, which is the only crate
       # below both `scx-accel` and `scx-gpu`.
       - name: One column-moments finalize, one cancellation threshold
         run: |
