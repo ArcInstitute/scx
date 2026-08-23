@@ -673,6 +673,58 @@ jobs:
             exit 1
           fi
 
+      # ORG-7.21-5: one distance kernel per metric, in distances.rs.
+      # `discrimination.rs` carried a private masked copy of all three metrics
+      # that disagreed with the shared kernel on two of cosine's edge
+      # conventions (a zero denominator gave 0.0 instead of 1.0, and the [0, 2]
+      # clamp was missing). Every cell-eval parity claim in docs/scanpy.md rests
+      # on those conventions, so a second kernel is a second set of them.
+      - name: One distance kernel per metric
+        run: |
+          set -euo pipefail
+          dist=scx-accel/src/eval_metrics/distances.rs
+          # Assert the input exists before asserting anything about it.
+          test -f "$dist" || { echo "::error::$dist is missing — this guard's path moved; retarget it rather than deleting it (ORG-7.21-5)."; exit 1; }
+
+          # Positive half 1: both entry points are declared, in that file.
+          for sym in 'pub fn point_distance' 'pub fn point_distance_masked'; do
+            if ! grep -qE "^$sym\(" "$dist"; then
+              echo "::error::$dist no longer declares \`$sym\` — it is the only place a pairwise distance is defined (ORG-7.21-5)."
+              exit 1
+            fi
+          done
+          # Positive half 2: the masked entry point is actually used outside its
+          # own module. Without this, deleting it would leave the negative grep
+          # below nothing to find and this guard would pass on a re-duplicated tree.
+          n=$(grep -rlE 'point_distance_masked\(' scx-accel/src --include='*.rs' \
+                | grep -vE '(^|/)distances(_[a-z_]+)?\.rs$' | wc -l | tr -d ' ')
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no module outside distances.rs calls point_distance_masked — a column-excluding caller has its own kernel again (ORG-7.21-5)."
+            exit 1
+          fi
+
+          # Negative half: within eval_metrics -- where every cell-eval parity
+          # claim in docs/scanpy.md lives -- no file but distances.rs accumulates
+          # cosine norms. `\bnorm_a\b` with word boundaries, because a bare
+          # `norm_a` also matches inside the identifier
+          # `zero_norm_and_range_hold_on_both_entry_points`; a grep cannot tell a
+          # call from a sentence unless you make it.
+          #
+          # Scoped to eval_metrics deliberately, and the two things it does NOT
+          # cover are legitimate rather than overlooked. `pca/cpu.rs` computes a
+          # cosine *similarity* inside an inline `#[cfg(test)]` assertion, which is
+          # not a distance kernel. `harmony/cpu.rs` computes `2*(1 - dot*inv_norm)`
+          # -- a squared cosine distance against whole-matrix precomputed inverse
+          # norms, not a per-pair distance; routing it through the pairwise kernel
+          # would be both wrong and slower. CUDA C kernels in scx-gpu are out of
+          # scope too, gated by their own CPU/GPU parity tests.
+          if grep -rEln --include='*.rs' '\bnorm_a\b' scx-accel/src/eval_metrics \
+               | grep -vE '(^|/)distances\.rs$' \
+               | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs$'; then
+            echo "::error::the eval_metrics file(s) above accumulate cosine norms themselves — call distances::point_distance{,_masked} so the zero-norm and [0, 2] clamp conventions exist once (ORG-7.21-5)."
+            exit 1
+          fi
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
