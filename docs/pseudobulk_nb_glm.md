@@ -16,6 +16,28 @@ pydeseq2.
 > numerical equality. If you need exact DESeq2 behaviour, use PyDESeq2
 > (`backend="pydeseq2"`, plus `pip install 'pyscx[pydeseq2]'`).
 
+**That bar is pinned, at exactly that bar and no tighter.**
+`scx-accel/src/nb_glm/pydeseq2_reference_tests.rs` holds a real pydeseq2 0.5.4
+run — 24 genes × 8 samples, NB(μ, α = 0.1) with 9 implanted fold changes, counts
+checked in as literals so both fitters see byte-identical input — and asserts:
+
+| Claim | Bar | Observed |
+|---|---|---|
+| Significance: the `padj < 0.05` sets | **exact** set equality | 11 genes, identical |
+| Effect sign, every gene | **exact** | 24 / 24 |
+| Ranking by `log2FoldChange` | Spearman ρ ≥ 0.999 | 1.00000 |
+| Ranking by `padj` | Spearman ρ ≥ 0.99 | 0.99151 |
+| Gross-drift canary (**not** a parity claim) | max &#124;Δlog2FC&#124; ≤ 0.1 | 0.0024 |
+
+Two things are deliberately **not** asserted, because the paragraph above
+promises they will not hold: numerical equality of `log2FoldChange` (no apeglm
+shrinkage; different dispersion-outlier handling), and *ordered-list* equality
+of `padj` — the two do swap a few adjacent genes inside the significant block,
+which is why the ranking claim is a rank correlation rather than an exact order.
+
+Regenerate the reference with
+`benchmarks/scripts/generate_de_parity_references.py`.
+
 > **Behavior change.** Cook's-distance outlier filtering and base-mean
 > independent filtering are **on by default** (matching DESeq2 `results()`). Versus
 > the first NB-GLM release, `accel.nb_glm` / `pdex_nb_glm` /
