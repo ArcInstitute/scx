@@ -2,6 +2,7 @@ pub mod convert;
 pub mod csc;
 pub mod csr;
 pub mod materialize;
+pub mod moments;
 pub mod transpose;
 pub mod umap_math;
 pub mod validate;
@@ -15,6 +16,11 @@ pub use csr::{
 pub use materialize::{
     Container, IndexBuffer, IndexDtype, MaterializePlan, TypedCsr, TypedDense, ValueBuffer,
     ValueDtype,
+};
+pub use moments::{
+    closed_form_variance_health, closed_form_variance_unstable, finalize_column_moments,
+    first_non_finite_column, residual_lost_to_cancellation, ClosedFormVarianceHealth,
+    ColumnMoments, CLOSED_FORM_VAR_REL_EPS,
 };
 pub use transpose::{
     compute_chunk_cols_with_cap, streaming_csr_to_csc_iter_with_cap, CscArrays, CscShardIterator,

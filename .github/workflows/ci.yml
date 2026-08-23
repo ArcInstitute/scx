@@ -619,6 +619,131 @@ jobs:
           fi
 
 
+      # ORG-7.21-1: one column-moments finalize, one cancellation threshold.
+      # The Bessel-corrected `(sum(x^2) - n*mean^2)/(n-1)` per-column finalize was
+      # written out nine times before Phase 7a -- four HVG CSR arms, one CSC arm,
+      # two `scx-gpu` device arms and two `scx-accel/src/hvg/gpu.rs` batched arms.
+      # Five clamped with `if v < 0.0`; four -- the *batched* finalizes, two in
+      # `hvg/cpu.rs` and two in `hvg/gpu.rs` -- used a NaN-swallowing `.max(0.0)`.
+      # (The `scx-gpu` pair already used `if var < 0.0`; an earlier version of
+      # this comment mis-assigned the four.) It now lives once, in `scx-sparse`, which is the only crate
+      # below both `scx-accel` and `scx-gpu`.
+      - name: One column-moments finalize, one cancellation threshold
+        run: |
+          set -euo pipefail
+          prim=scx-sparse/src/moments.rs
+          # Assert the input exists before asserting anything about it: a guard
+          # keyed on a path that has moved passes vacuously and says nothing.
+          test -f "$prim" || { echo "::error::$prim is missing — this guard's path moved; retarget it rather than deleting it (ORG-7.21-1)."; exit 1; }
+
+          # Positive half 1: the primitive and the one threshold are declared here.
+          for sym in 'pub fn finalize_column_moments' 'pub const CLOSED_FORM_VAR_REL_EPS' 'pub fn residual_lost_to_cancellation'; do
+            if ! grep -qE "^$sym" "$prim"; then
+              echo "::error::$prim no longer declares \`$sym\` — it is the single source of the per-column mean/variance finalize and its cancellation guard (ORG-7.21-1)."
+              exit 1
+            fi
+          done
+          # Positive half 2: the primitive is actually used by more than one crate.
+          # Deleting it outright would otherwise leave the negative greps below
+          # nothing to find, and this guard would pass on a fully re-duplicated tree.
+          for crate in scx-accel scx-gpu; do
+            n=$(grep -rhoE 'finalize_column_moments\(' "$crate/src" --include='*.rs' | wc -l | tr -d ' ')
+            if [ "$n" -lt 2 ]; then
+              echo "::error::$crate has $n finalize_column_moments call sites, expected at least 2. A kernel that stopped calling it has its own copy of the finalize again (ORG-7.21-1). If a refactor legitimately merged entry points, lower this number in the same commit."
+              exit 1
+            fi
+          done
+
+          # Negative half 1: nobody re-derives the finalize. `nb_glm/dispersion.rs`
+          # is exempt and deliberately so -- it is a *scalar* per-gene variance, not
+          # a per-column vector, and routing it through a vector primitive would
+          # allocate two 1-element slices per gene inside a per-gene loop.
+          # `*_tests.rs` files are exempt: a test re-implementing the formula to
+          # check the kernel is the point (see pflog_tests.rs).
+          if grep -rEn --include='*.rs' -- '- *(n|nf|total_f|n_obs as f64) \* mean \* mean' \
+               scx-accel/src scx-gpu/src scx-format-io/src pyscx/src \
+               | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs:' \
+               | grep -vE '(^|/)dispersion\.rs:' \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::a site computes the Bessel-corrected column variance itself — call scx_sparse::finalize_column_moments so the formula, the clamp and the cancellation report exist once (ORG-7.21-1)."
+            exit 1
+          fi
+          # Negative half 2: the threshold is not redefined anywhere.
+          if grep -rEn --include='*.rs' 'CLOSED_FORM_VAR_REL_EPS *: *f64 *=' \
+               scx-accel/src scx-gpu/src scx-engine/src scx-format-io/src pyscx/src; then
+            echo "::error::the cancellation threshold is redefined outside scx-sparse — one threshold, one definition, shared by the per-column, whole-matrix and pflog guards (ORG-7.21-1)."
+            exit 1
+          fi
+
+      # ORG-7.21-5: one distance kernel per metric, in distances.rs.
+      # `discrimination.rs` carried a private masked copy of all three metrics
+      # that disagreed with the shared kernel on two of cosine's edge
+      # conventions (a zero denominator gave 0.0 instead of 1.0, and the [0, 2]
+      # clamp was missing). Every cell-eval parity claim in docs/scanpy.md rests
+      # on those conventions, so a second kernel is a second set of them.
+      - name: One distance kernel per metric
+        run: |
+          set -euo pipefail
+          dist=scx-accel/src/eval_metrics/distances.rs
+          # Assert the input exists before asserting anything about it.
+          test -f "$dist" || { echo "::error::$dist is missing — this guard's path moved; retarget it rather than deleting it (ORG-7.21-5)."; exit 1; }
+
+          # Positive half 1: both entry points are declared, in that file.
+          for sym in 'pub fn point_distance' 'pub fn point_distance_masked'; do
+            if ! grep -qE "^$sym\(" "$dist"; then
+              echo "::error::$dist no longer declares \`$sym\` — it is the only place a pairwise distance is defined (ORG-7.21-5)."
+              exit 1
+            fi
+          done
+          # Positive half 2: the masked entry point is actually used by PRODUCTION
+          # code outside its own module. Without this, deleting it would leave the
+          # negative grep below nothing to find and this guard would pass on a
+          # re-duplicated tree.
+          #
+          # The `_tests.rs` exclusion is load-bearing, not tidiness: the first
+          # version of this check counted every file, and
+          # `discrimination_cell_eval_tests.rs` calls the masked kernel too — so
+          # deleting the *production* call still left a count of 1 and the guard
+          # passed. (My own falsification of it removed both callers at once and
+          # therefore did not catch this; found by codex in review.)
+          n=$(grep -rlE 'point_distance_masked\(' scx-accel/src --include='*.rs' \
+                | grep -vE '(^|/)distances(_[a-z_]+)?\.rs$' \
+                | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs$' | wc -l | tr -d ' ')
+          if [ "$n" -lt 1 ]; then
+            echo "::error::no PRODUCTION module outside distances.rs calls point_distance_masked — a column-excluding caller has its own kernel again (ORG-7.21-5)."
+            exit 1
+          fi
+
+          # Negative half: within eval_metrics -- where every cell-eval parity
+          # claim in docs/scanpy.md lives -- no file but distances.rs accumulates
+          # cosine norms.
+          #
+          # Scope, stated so it is not mistaken for more: this catches a
+          # re-implemented *cosine*, which is the metric whose edge conventions
+          # (zero-norm -> 1.0, [0, 2] clamp) actually diverged. A hand-rolled L1 or
+          # Euclidean body would slip past it -- those have no distinctive
+          # identifier to grep for and no edge conventions to get wrong. The
+          # load-bearing half against wholesale re-duplication is the positive
+          # production-caller check above. `\bnorm_a\b` with word boundaries, because a bare
+          # `norm_a` also matches inside the identifier
+          # `zero_norm_and_range_hold_on_both_entry_points`; a grep cannot tell a
+          # call from a sentence unless you make it.
+          #
+          # Scoped to eval_metrics deliberately, and the two things it does NOT
+          # cover are legitimate rather than overlooked. `pca/cpu.rs` computes a
+          # cosine *similarity* inside an inline `#[cfg(test)]` assertion, which is
+          # not a distance kernel. `harmony/cpu.rs` computes `2*(1 - dot*inv_norm)`
+          # -- a squared cosine distance against whole-matrix precomputed inverse
+          # norms, not a per-pair distance; routing it through the pairwise kernel
+          # would be both wrong and slower. CUDA C kernels in scx-gpu are out of
+          # scope too, gated by their own CPU/GPU parity tests.
+          if grep -rEln --include='*.rs' '\bnorm_a\b' scx-accel/src/eval_metrics \
+               | grep -vE '(^|/)distances\.rs$' \
+               | grep -vE '(^|/)[a-z_0-9]*_tests?\.rs$'; then
+            echo "::error::the eval_metrics file(s) above accumulate cosine norms themselves — call distances::point_distance{,_masked} so the zero-norm and [0, 2] clamp conventions exist once (ORG-7.21-5)."
+            exit 1
+          fi
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police

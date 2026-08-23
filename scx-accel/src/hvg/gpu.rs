@@ -118,44 +118,73 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
             |e| crate::error::AccelError::LinAlg(format!("gpu_streaming_mean_var_batched: {e}")),
         )?;
 
-    // Per-batch means & variances (Bessel's correction).
+    // Per-batch and global finalize, through the same
+    // `scx_sparse::finalize_column_moments` the CPU batched path uses — so
+    // "matches the CPU path" below is shared code rather than two copies of the
+    // formula that happen to agree.
     let mut per_batch = Vec::with_capacity(n_batches);
     for b in 0..n_batches {
-        let n = batch_counts[b] as f64;
-        let mut means = vec![0.0f64; n_vars];
-        let mut variances = vec![0.0f64; n_vars];
-        if batch_counts[b] > 0 {
-            let denom = (n - 1.0).max(1.0);
-            for j in 0..n_vars {
-                let mean = batch_sum[b][j] / n;
-                means[j] = mean;
-                variances[j] = ((batch_sum_sq[b][j] - n * mean * mean) / denom).max(0.0);
-            }
+        // Unlike `streaming_mean_var_batched`, this route never sees the shard
+        // values on the host, so it cannot call `ensure_finite_hvg_data`. It
+        // checks the accumulated moments instead: a non-finite value that reaches
+        // the accumulator leaves its column's sum non-finite, at O(n_vars) rather
+        // than O(nnz). Before Phase 7a `.max(0.0)` absorbed a NaN variance to 0.0
+        // here, so the gene silently looked constant.
+        //
+        // Narrower than the CPU scan in one way, deliberately documented rather
+        // than papered over: the device kernel returns early on
+        // `row_to_batch[row] < 0` before reading values, so a non-finite value in
+        // a row excluded from every batch never reaches these sums. CPU rejects
+        // that input, GPU accepts and ignores it. Closing the gap needs a
+        // device-side flag independent of batch inclusion; see
+        // `scx_sparse::first_non_finite_column`.
+        if let Some(j) = scx_sparse::first_non_finite_column(&batch_sum[b], &batch_sum_sq[b]) {
+            return Err(crate::error::AccelError::InvalidInput(format!(
+                "streaming_mean_var_batched_with_device: batch {b}, column {j} accumulated \
+                 a non-finite moment (sum = {}, sum_sq = {}) — the input contains \
+                 NaN/Inf, or a finite input overflowed. HVG statistics would be \
+                 meaningless.",
+                batch_sum[b][j], batch_sum_sq[b][j]
+            )));
         }
-        per_batch.push(HvgStats { means, variances });
+        let m =
+            scx_sparse::finalize_column_moments(&batch_sum[b], &batch_sum_sq[b], batch_counts[b]);
+        m.warn_if_unstable(&format!(
+            "streaming_mean_var_batched_with_device[batch {b}]"
+        ));
+        per_batch.push(HvgStats {
+            means: m.means,
+            variances: m.variances,
+        });
     }
 
-    // Derive global stats from per-batch accumulators — matches the CPU path.
     let total_n: usize = batch_counts.iter().sum();
-    let total_f = total_n as f64;
-    let mut global_means = vec![0.0f64; n_vars];
-    let mut global_variances = vec![0.0f64; n_vars];
-    if total_n > 0 {
-        let denom = (total_f - 1.0).max(1.0);
-        for j in 0..n_vars {
-            let global_sum: f64 = batch_sum.iter().map(|bs| bs[j]).sum();
-            let global_sum_sq: f64 = batch_sum_sq.iter().map(|bs| bs[j]).sum();
-            let mean = global_sum / total_f;
-            global_means[j] = mean;
-            global_variances[j] = ((global_sum_sq - total_f * mean * mean) / denom).max(0.0);
-        }
+    let mut global_sum = vec![0.0f64; n_vars];
+    let mut global_sum_sq = vec![0.0f64; n_vars];
+    for j in 0..n_vars {
+        global_sum[j] = batch_sum.iter().map(|bs| bs[j]).sum();
+        global_sum_sq[j] = batch_sum_sq.iter().map(|bs| bs[j]).sum();
     }
+    // The global sums are derived from the per-batch ones, each already checked
+    // above, so this cannot fire on non-finite *input* — it can still fire if
+    // summing finite per-batch moments overflows to an infinity, which is
+    // exactly the case an input scan would miss.
+    if let Some(j) = scx_sparse::first_non_finite_column(&global_sum, &global_sum_sq) {
+        return Err(crate::error::AccelError::InvalidInput(format!(
+            "streaming_mean_var_batched_with_device: global column {j} accumulated a \
+             non-finite moment (sum = {}, sum_sq = {}) after summing {n_batches} \
+             finite per-batch moments — the totals overflowed.",
+            global_sum[j], global_sum_sq[j]
+        )));
+    }
+    let global = scx_sparse::finalize_column_moments(&global_sum, &global_sum_sq, total_n);
+    global.warn_if_unstable("streaming_mean_var_batched_with_device[global]");
 
     Ok(BatchedHvgStats {
         per_batch,
         global: HvgStats {
-            means: global_means,
-            variances: global_variances,
+            means: global.means,
+            variances: global.variances,
         },
         batch_counts,
     })

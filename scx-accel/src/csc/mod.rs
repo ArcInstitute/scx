@@ -18,8 +18,10 @@ pub mod pdex;
 pub mod pseudobulk;
 pub mod wilcoxon;
 
+// Reached from `crate::hvg::moments_golden` as well as this module's own
+// tests, so it is `pub(crate)` rather than private.
 #[cfg(test)]
-mod test_helpers;
+pub(crate) mod test_helpers;
 
 #[cfg(test)]
 mod parity_test;

@@ -532,6 +532,290 @@ class TestEdistanceParity:
 # Discrimination score parity
 # =============================================================================
 
+def _make_tied_discrimination_adata(
+    n_perts_non_control=3, cells_per_group=32,
+) -> tuple[ad.AnnData, ad.AnnData]:
+    """A fixture whose real effects are IDENTICAL, so every distance ties.
+
+    The shared `_make_cell_eval_adata` fixture (continuous random) has no ties,
+    no repeated gene symbol and no zero-norm effect vector, so it cannot see any
+    of the three divergences fixed in v0.14.0 (review §7.13). This one is built
+    to produce exact ties: every perturbation group has the same profile, so
+    every `real_effect[i]` is the same vector and all `P` distances from any
+    prediction are equal.
+
+    "Exact" is the load-bearing word, and it is why the values are dyadic
+    rationals and the group size is a power of two: a group mean is then
+    representable with no rounding in f32 or f64, so the tie survives into both
+    implementations rather than being broken by a last-bit difference. Cell-level
+    noise would defeat the whole fixture.
+    """
+    n_genes = 4
+    gene_names = [f"gene_{i}" for i in range(n_genes)]
+    # Perturbation names must match gene names for target-gene exclusion.
+    perts = ["control"] + [f"gene_{i}" for i in range(n_perts_non_control)]
+
+    control_profile = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+    # One profile shared by EVERY perturbation group -> identical effects.
+    pert_profile = np.array([2.0, 3.0, 1.5, 0.5], dtype=np.float32)
+
+    rows, labels = [], []
+    for pert in perts:
+        profile = control_profile if pert == "control" else pert_profile
+        for _ in range(cells_per_group):
+            rows.append(profile)
+            labels.append(pert)
+    X = np.vstack(rows)
+
+    obs = __import__("pandas").DataFrame({"perturbation": labels})
+    obs.index = [f"cell_{i}" for i in range(X.shape[0])]
+    var = __import__("pandas").DataFrame(index=gene_names)
+
+    real = ad.AnnData(X=sp.csr_matrix(X), obs=obs.copy(), var=var.copy())
+    # Prediction identical to real: distances are all exactly 0.0, the most
+    # degenerate tie there is.
+    pred = ad.AnnData(X=sp.csr_matrix(X.copy()), obs=obs.copy(), var=var.copy())
+    return real, pred
+
+
+def _make_duplicate_gene_discrimination_adata() -> tuple[ad.AnnData, ad.AnnData]:
+    """A fixture with a repeated gene symbol, built so the *number* of excluded
+    columns changes the answer.
+
+    `var_names` are not unique in real 10x data, and cell-eval excludes every
+    matching column (`np.flatnonzero(genes != p)`). A lookup keyed to one index
+    leaves a duplicate of the target column in place, and that surviving copy
+    restores the trivial self-match `exclude_target_gene` exists to remove.
+
+    Making that observable takes care, because the obvious fixture does not: if
+    the prediction already matches its own real effect on the remaining genes,
+    the score is 1.0 with either exclusion width. Here `gene_0`'s prediction is
+    built to agree with `gene_0`'s real effect on the two duplicated columns and
+    with `gene_1`'s real effect everywhere else. Drop both duplicates and
+    `gene_0` is closer to the wrong perturbation (score 0.5); drop only one and
+    the surviving column ties it back to rank 0 (score 1.0).
+
+    Dyadic values and a power-of-two group size again, so the pseudobulk means
+    are exact and the comparison is `abs=0` rather than approximate.
+    """
+    import pandas as pd
+
+    gene_names = ["gene_0", "gene_0", "gene_1", "gene_2"]  # gene_0 duplicated
+    perts = ["control", "gene_0", "gene_1"]
+    real_profiles = {
+        "control": [1.5, 1.5, 1.5, 1.5],
+        "gene_0": [11.5, 11.5, 1.5, 1.5],
+        "gene_1": [1.5, 1.5, 6.5, 6.5],
+    }
+    pred_profiles = {
+        "control": [1.5, 1.5, 1.5, 1.5],
+        # Matches gene_0's real effect on the duplicated columns, and gene_1's
+        # real effect on the rest.
+        "gene_0": [11.5, 11.5, 6.5, 6.5],
+        "gene_1": [1.5, 1.5, 6.5, 6.5],
+    }
+
+    def build(profiles):
+        rows, labels = [], []
+        for pert in perts:
+            for _ in range(32):
+                rows.append(profiles[pert])
+                labels.append(pert)
+        X = np.array(rows, dtype=np.float32)
+        obs = pd.DataFrame({"perturbation": labels})
+        obs.index = [f"cell_{i}" for i in range(X.shape[0])]
+        return ad.AnnData(
+            X=sp.csr_matrix(X), obs=obs, var=pd.DataFrame(index=gene_names)
+        )
+
+    return build(real_profiles), build(pred_profiles)
+
+
+class TestDiscriminationDuplicateGeneParity:
+    """`exclude_target_gene` with a repeated gene symbol, against real cell-eval."""
+
+    def test_every_matching_column_is_excluded(self):
+        real, pred = _make_duplicate_gene_discrimination_adata()
+        pair = _build_pair(real, pred)
+
+        # Premise: the duplicate must survive into cell-eval's own view of the
+        # genes, or the fixture is testing nothing about duplicates.
+        genes = [str(g) for g in pair.genes]
+        assert genes.count("gene_0") == 2, (
+            f"premise broken: cell-eval sees genes {genes}, which does not "
+            f"contain the duplicated symbol this fixture is built around"
+        )
+
+        for metric in ("l1", "l2"):
+            scx = pyscx.accel.discrimination_score(
+                real, pred, metric=metric, exclude_target_gene=True,
+            )
+            ce = ce_discrimination_score(
+                pair, metric=metric, exclude_target_gene=True,
+            )
+
+            # Premise: excluding BOTH copies must demote gene_0. If the reference
+            # says 1.0 the fixture has stopped discriminating and a match below
+            # would prove nothing.
+            assert ce["gene_0"] == pytest.approx(0.5, abs=0), (
+                f"premise broken at metric={metric}: cell-eval scored gene_0 "
+                f"{ce['gene_0']}, expected 0.5 (both duplicated columns dropped). "
+                f"A 1.0 here means the fixture no longer separates the two "
+                f"exclusion widths."
+            )
+
+            for pert in ce:
+                assert scx[pert] == pytest.approx(ce[pert], abs=0), (
+                    f"duplicate-gene exclusion mismatch for '{pert}' at "
+                    f"metric={metric}: SCX={scx[pert]} vs cell-eval={ce[pert]}. "
+                    f"All SCX={scx}, all cell-eval={ce}"
+                )
+
+
+def _make_mixed_tie_discrimination_adata() -> tuple[ad.AnnData, ad.AnnData]:
+    """Four perturbations whose L1 distances from a zero prediction are [3,3,1,1].
+
+    Two tied blocks rather than one — the shape on which a stable and an unstable
+    argsort disagree, and therefore the shape a total-tie fixture cannot reach.
+    """
+    import pandas as pd
+
+    gene_names = ["gene_0", "gene_1"]
+    perts = ["control", "p0", "p1", "p2", "p3"]
+    # Control at the origin; each perturbation's effect has |effect| in gene_0 of
+    # 3, 3, 1, 1 and nothing in gene_1. Predictions sit exactly on control, so
+    # every prediction's effect is the zero vector and each perturbation sees the
+    # same distance vector [3, 3, 1, 1].
+    base = 4.5
+    real_offsets = {"control": 0.0, "p0": 3.0, "p1": -3.0, "p2": 1.0, "p3": -1.0}
+
+    def build(offsets):
+        rows, labels = [], []
+        for pert in perts:
+            for _ in range(32):
+                rows.append([base + offsets[pert], base])
+                labels.append(pert)
+        X = np.array(rows, dtype=np.float32)
+        obs = pd.DataFrame({"perturbation": labels})
+        obs.index = [f"cell_{i}" for i in range(X.shape[0])]
+        return ad.AnnData(
+            X=sp.csr_matrix(X), obs=obs, var=pd.DataFrame(index=gene_names)
+        )
+
+    real = build(real_offsets)
+    # Prediction: every group sits on the control profile, so every predicted
+    # effect is zero.
+    pred = build({k: 0.0 for k in real_offsets})
+    return real, pred
+
+
+class TestDiscriminationTieParity:
+    """The **total**-tie case, against the real cell-eval rather than a
+    hand-derived value.
+
+    Scoped to a total tie deliberately, and the scope is the point. cell-eval
+    reads its rank off `np.argsort`, whose default kind is `quicksort` and
+    therefore *not* a stable sort — so its tie order is implementation-defined and
+    parity with it is only a meaningful claim where the stable and unstable
+    readings coincide. Measured on numpy 2.4.4, that is exactly the totally-tied
+    case:
+
+        np.argsort([5, 5, 5])                -> [0, 1, 2]   (agrees with stable)
+        np.argsort([3, 3, 1, 1])             -> [3, 2, 1, 0]
+        np.argsort([3, 3, 1, 1], kind="stable") -> [2, 3, 0, 1]
+
+    `test_mixed_ties_are_not_claimed_to_match` below covers the other side: SCX
+    keeps the stable rule, cell-eval does not, and that divergence is documented
+    rather than chased. An earlier version of this file claimed parity on ties in
+    general, which was false — found by codex in review.
+    """
+
+    def test_mixed_ties_are_not_claimed_to_match(self):
+        """A mixed tie: assert SCX's stable rule, and assert the reference differs.
+
+        This is the honest complement to the parity test above. It pins two
+        things, both of which have to hold for the documentation to be right:
+
+        1. SCX's scores equal the **stable** argsort ranks (its documented rule).
+        2. that on this numpy the divergence is real — cell-eval scores this
+           fixture differently, which is what makes the "not claimed" scope in
+           `docs/scanpy.md` load-bearing rather than defensive.
+
+        The numpy-only half of the canary lives in `test_accel.py`, which has no
+        module-level optional-dependency skip and therefore actually runs in CI.
+        """
+        # Distances [3, 3, 1, 1] from a zero prediction: two tied blocks.
+        #
+        # The numpy default-vs-stable canary that used to live here has moved to
+        # `test_accel.py::test_numpy_default_argsort_still_disagrees_with_stable`
+        # — this module `importorskip`s `cell_eval`, which CI's Python-bindings
+        # image does not have, so a canary here could never fire. Flagged by
+        # Cursor Agent in review.
+        d = np.array([3.0, 3.0, 1.0, 1.0])
+
+        real, pred = _make_mixed_tie_discrimination_adata()
+        scx = pyscx.accel.discrimination_score(
+            real, pred, metric="l1", exclude_target_gene=False,
+        )
+        # SCX's rule: rank = position under a STABLE ascending sort.
+        n = len(scx)
+        want = {}
+        for rank, idx in enumerate(np.argsort(d, kind="stable")):
+            want[f"p{idx}"] = 1.0 - rank / n
+        for pert, w in want.items():
+            assert scx[pert] == pytest.approx(w, abs=0), (
+                f"SCX scored '{pert}' {scx[pert]}, expected {w} from its "
+                f"documented stable tie rule. All SCX={scx}"
+            )
+
+        # And the divergence itself, against the installed reference: this is the
+        # fixture the docs cite, so if cell-eval ever agrees here the "not
+        # claimed" scope has become unnecessarily broad and should be revisited.
+        ce = ce_discrimination_score(
+            _build_pair(real, pred), metric="l1", exclude_target_gene=False,
+        )
+        assert any(
+            scx[p] != pytest.approx(ce[p], abs=0) for p in ce
+        ), (
+            f"cell-eval now agrees with SCX on this mixed tie (SCX={scx}, "
+            f"cell-eval={dict(ce)}). The mixed-tie exclusion in docs/scanpy.md "
+            f"may be broader than it needs to be — recheck it."
+        )
+
+    def test_all_ties_match_cell_eval(self):
+        real, pred = _make_tied_discrimination_adata()
+        pair = _build_pair(real, pred)
+
+        for metric in ("l1", "l2", "cosine"):
+            scx = pyscx.accel.discrimination_score(
+                real, pred, metric=metric, exclude_target_gene=False,
+            )
+            ce = ce_discrimination_score(pair, metric=metric, exclude_target_gene=False)
+
+            # Premise: the fixture must actually be exercising tie-breaking, or
+            # this is just another random-data parity test wearing a new name.
+            # Under a total tie the reference's scores are exactly the stable
+            # argsort positions, `1 - p/P` — all distinct, and *nothing* like the
+            # all-1.0 that a rank-by-strictly-smaller-count produces.
+            n = len(ce)
+            want_stable = {
+                pert: 1.0 - i / n for i, pert in enumerate(pair.perts)
+            }
+            assert ce == pytest.approx(want_stable, abs=0), (
+                f"premise broken for metric={metric}: cell-eval returned {ce}, "
+                f"not the stable-argsort ranks {want_stable}. Either the fixture "
+                f"stopped producing exact ties, or numpy's argsort no longer "
+                f"breaks them by index — check which before trusting this file."
+            )
+
+            for pert in ce:
+                assert scx[pert] == pytest.approx(ce[pert], abs=0), (
+                    f"tie-breaking mismatch for '{pert}' at metric={metric}: "
+                    f"SCX={scx[pert]} vs cell-eval={ce[pert]}. All SCX={scx}, "
+                    f"all cell-eval={ce}"
+                )
+
+
 class TestDiscriminationScoreParity:
     """Verify discrimination score matches cell-eval."""
 

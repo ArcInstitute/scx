@@ -2074,3 +2074,36 @@ class TestLeiden:
         pyscx.accel.leiden(adata, device="cpu")
 
         assert adata.uns["leiden"]["backend"] in ("scx-accel", "leidenalg")
+
+
+def test_numpy_default_argsort_still_disagrees_with_stable():
+    """Canary for the mixed-tie caveat in `docs/scanpy.md`.
+
+    `discrimination_score` breaks ties by ascending index — a deterministic,
+    stable rule. cell-eval instead reads its rank off `np.argsort`, whose default
+    kind is `quicksort` and therefore not stable, so the docs say mixed-tie parity
+    is **not claimed**. That caveat is only worth carrying while it is true.
+
+    This test lives here, and the choice of file is the whole point. It cannot go
+    in `test_cell_eval_parity.py`, which `importorskip`s `cell_eval` at module
+    level — not installed in CI's Python-bindings image, so a canary there could
+    never fire (flagged by Cursor Agent in review). It cannot go in
+    `test_eval_metrics.py` either: that module has a module-level
+    `importorskip("polars")`, which skips the *entire file* at import time when
+    polars — an optional extra — is absent, canary included. `test_accel.py` has
+    no module-level gate. It needs only numpy.
+
+    If a future numpy makes its default sort stable, this fails and tells us to
+    delete the caveat — rather than leaving a stale warning in the docs forever.
+    """
+    import numpy as np
+
+    d = np.array([3.0, 3.0, 1.0, 1.0])
+    default_order = list(np.argsort(d))
+    stable_order = list(np.argsort(d, kind="stable"))
+    assert default_order != stable_order, (
+        f"numpy {np.__version__} now agrees with a stable sort on {list(d)} "
+        f"({default_order}). The mixed-tie divergence documented in "
+        f"docs/scanpy.md § Discrimination score may no longer exist — recheck it "
+        f"and drop the caveat if so."
+    )
