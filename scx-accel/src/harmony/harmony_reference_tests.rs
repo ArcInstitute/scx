@@ -432,9 +432,18 @@ fn the_objectives_cross_entropy_is_a_stated_divergence_not_parity() {
 /// `test_gpu_vs_cpu_per_pc_correlation` the thing that caught it — a parity
 /// test between two SCX arms, which is the evidence shape this phase replaces.
 ///
-/// This pins the device kernels directly. The call site is covered by
-/// `test_gpu_vs_cpu_per_pc_correlation`: with the M-step on one arm only, the
-/// two embeddings stop correlating.
+/// This pins the device kernels directly, and that is the ONLY thing covering
+/// them.
+///
+/// An earlier version of this comment said the call site was covered by
+/// `test_gpu_vs_cpu_per_pc_correlation` — "with the M-step on one arm only, the
+/// two embeddings stop correlating". **That was asserted, and it is false.**
+/// Measured on an H100 (job 2840979): remove `gpu_harmony_update_y` from the
+/// sub-loop, keep the CPU M-step, and the parity test still passes at its
+/// `r >= 0.95` bar. Harmony's corrected embedding is dominated by the ridge
+/// solve, which is identical on both arms, so a correlation between two SCX
+/// arms cannot see a clustering-loop divergence — the same reason the gate's
+/// between-batch-variance probe could not separate the two builds either.
 #[cfg(feature = "gpu")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
