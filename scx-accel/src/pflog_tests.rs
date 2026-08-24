@@ -9,60 +9,6 @@
 
 use super::*;
 use crate::pca::pflog_pca;
-use scx_format_io::{Result as IoResult, ShardSource};
-use scx_sparse::ScxCsr;
-
-/// Build a CSR shard from a dense row-major matrix (drops zeros).
-fn csr_from_dense(rows: &[Vec<f32>]) -> ScxCsr {
-    let n_rows = rows.len();
-    let n_cols = rows.first().map(|r| r.len()).unwrap_or(0);
-    let mut indptr = vec![0i64];
-    let mut indices = Vec::new();
-    let mut data = Vec::new();
-    for row in rows {
-        for (c, &v) in row.iter().enumerate() {
-            if v != 0.0 {
-                indices.push(c as i32);
-                data.push(v);
-            }
-        }
-        indptr.push(indices.len() as i64);
-    }
-    ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
-}
-
-/// Multi-shard raw-count `ShardSource` over a list of CSR shards.
-struct MultiShardSource {
-    shards: Vec<ScxCsr>,
-    n_obs: usize,
-    n_vars: usize,
-}
-
-impl ShardSource for MultiShardSource {
-    fn n_shards(&self) -> usize {
-        self.shards.len()
-    }
-    fn n_obs(&self) -> usize {
-        self.n_obs
-    }
-    fn n_vars(&self) -> usize {
-        self.n_vars
-    }
-    fn read_shard(&self, shard_idx: usize) -> IoResult<ScxCsr> {
-        Ok(self.shards[shard_idx].clone())
-    }
-}
-
-/// Raw-count source split into the given per-shard row groups.
-fn raw_source_from_shards(shards: &[&[Vec<f32>]], n_vars: usize) -> MultiShardSource {
-    let csr_shards: Vec<ScxCsr> = shards.iter().map(|s| csr_from_dense(s)).collect();
-    let n_obs = shards.iter().map(|s| s.len()).sum();
-    MultiShardSource {
-        shards: csr_shards,
-        n_obs,
-        n_vars,
-    }
-}
 
 /// Build the v4 `delta` source from raw rows: `delta_ij = log1p(4α·x_ij)` at
 /// nonzero positions (this is what the lazy `Scale{4α}→Log1p` chain produces).
@@ -505,43 +451,6 @@ fn pca_centered_reconstructs_with_general_alpha() {
 
 // --- v4 α estimator --------------------------------------------------------
 
-/// Independent f64 reference for `estimate_alpha`: per-gene MoM
-/// `α_g = (var − mean)/mean²` (Bessel-corrected, matching
-/// `streaming_mean_var`), filtered by `mean > mu_min && var > mean`, pooled by
-/// median. Returns `(median_alpha, n_genes_used)`.
-fn reference_alpha(rows: &[Vec<f32>], n_vars: usize, mu_min: f64) -> (f64, usize) {
-    let n = rows.len() as f64;
-    let denom = (n - 1.0).max(1.0);
-    let mut cand: Vec<f64> = Vec::new();
-    for g in 0..n_vars {
-        let mut sum = 0.0f64;
-        let mut sum_sq = 0.0f64;
-        for row in rows {
-            let v = row[g] as f64;
-            sum += v;
-            sum_sq += v * v;
-        }
-        let mean = sum / n;
-        let var = ((sum_sq - n * mean * mean) / denom).max(0.0);
-        if mean > mu_min && var > mean {
-            let a = (var - mean) / (mean * mean);
-            if a.is_finite() && a > 0.0 {
-                cand.push(a);
-            }
-        }
-    }
-    let k = cand.len();
-    cand.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let med = if k == 0 {
-        f64::NAN
-    } else if k % 2 == 1 {
-        cand[k / 2]
-    } else {
-        0.5 * (cand[k / 2 - 1] + cand[k / 2])
-    };
-    (med, k)
-}
-
 /// Hand-computed single gene: cells [1, 5] → mean 3, var 8 (n−1 denom),
 /// α = (8−3)/9 = 5/9, pseudocount = 1/(4α) = 0.45.
 #[test]
@@ -559,37 +468,20 @@ fn estimate_alpha_known_single_gene() {
     );
 }
 
-/// `estimate_alpha` matches the independent f64 reference on a mixed matrix.
+/// Every gene with a mean above `mu_min` enters the pool, including
+/// under-dispersed ones (§7.14). Here `g0` has α = 1/9 and `g3` α = 10/9, `g1`
+/// is constant so its honest MoM estimate is **negative** (α = (0−4)/16 =
+/// −0.25), and `g2` is all-zero so it has no mean to speak of and is the one
+/// gene `mu_min` excludes. Pool = {−0.25, 1/9, 10/9} ⇒ `n_genes_used == 3` and
+/// the median is 1/9.
+///
+/// The previous version of this test asserted `n_genes_used == 2` and a median
+/// of `(1/9 + 10/9)/2` — it encoded the `var > mean` pre-filter as the
+/// specification. Dropping the negative half of the pool before the median is
+/// what biased α high on any matrix that has under-dispersed genes, which is
+/// every real one.
 #[test]
-fn estimate_alpha_matches_reference() {
-    let rows = vec![
-        vec![0.0f32, 5.0, 2.0, 0.0],
-        vec![3.0, 0.0, 8.0, 1.0],
-        vec![1.0, 2.0, 0.0, 4.0],
-        vec![7.0, 1.0, 3.0, 0.0],
-        vec![0.0, 9.0, 1.0, 2.0],
-    ];
-    let n_vars = 4;
-    let opts = AlphaOptions::default();
-    let raw = raw_source_from_shards(&[&rows], n_vars);
-    let est = estimate_alpha(&raw, &opts).unwrap();
-    let (ref_alpha, ref_k) = reference_alpha(&rows, n_vars, opts.mu_min);
-    assert_eq!(est.n_genes_used, ref_k);
-    assert!(!est.fell_back);
-    assert!(
-        (est.alpha - ref_alpha).abs() <= 1e-9,
-        "{} != {}",
-        est.alpha,
-        ref_alpha
-    );
-    assert!((est.pseudocount - 1.0 / (4.0 * ref_alpha)).abs() <= 1e-9);
-}
-
-/// Only overdispersed, above-mu_min genes count. Here gene0 (α=1/9) and gene3
-/// (α=10/9) qualify; gene1 is constant (var=0) and gene2 is all-zero (mean=0),
-/// both excluded → `n_genes_used == 2`, median = mean of the two.
-#[test]
-fn estimate_alpha_counts_and_pools_mixed_genes() {
+fn estimate_alpha_pools_every_gene_with_a_mean() {
     let rows = vec![
         vec![1.0f32, 4.0, 0.0, 2.0],
         vec![5.0, 4.0, 0.0, 0.0],
@@ -597,10 +489,17 @@ fn estimate_alpha_counts_and_pools_mixed_genes() {
     ];
     let raw = raw_source_from_shards(&[&rows], 4);
     let est = estimate_alpha(&raw, &AlphaOptions::default()).unwrap();
-    assert_eq!(est.n_genes_used, 2);
+    assert_eq!(
+        est.n_genes_used, 3,
+        "the constant gene has a mean and belongs in the pool"
+    );
     assert!(!est.fell_back);
-    let expected = 0.5 * (1.0 / 9.0 + 10.0 / 9.0);
-    assert!((est.alpha - expected).abs() <= 1e-12, "α={}", est.alpha);
+    let expected = 1.0 / 9.0;
+    assert!(
+        (est.alpha - expected).abs() <= 1e-12,
+        "α={} (expected the median of {{-0.25, 1/9, 10/9}})",
+        est.alpha
+    );
 }
 
 /// All-zero matrix: no candidate → fallback to α=0.25 (pseudocount 1.0), no error.
@@ -615,10 +514,18 @@ fn estimate_alpha_falls_back_on_all_zero() {
     assert!((est.pseudocount - 1.0).abs() <= 1e-12);
 }
 
-/// Under-dispersed input (constant columns → var 0 ≤ mean for every gene):
-/// no positive dispersion signal anywhere → fallback fires, no error.
+/// Under-dispersed input (constant columns → var 0 < mean for every gene): the
+/// pool is **not** empty — every gene contributes a negative α_g — and the
+/// pooled median is negative, so the documented fallback fires.
+///
+/// `n_genes_used == 3`, not `0`, is the assertion that distinguishes the fixed
+/// estimator from the one that dropped under-dispersed genes before pooling.
+/// With the pre-filter in place this matrix reached the fallback for the wrong
+/// reason ("nothing to pool"), and a matrix with a *few* over-dispersed genes
+/// reached no fallback at all and reported those few genes' dispersion as the
+/// whole matrix's — see `pflog_reference_tests.rs`'s fixture C.
 #[test]
-fn estimate_alpha_falls_back_when_underdispersed() {
+fn estimate_alpha_falls_back_when_the_pooled_median_is_not_positive() {
     let rows = vec![
         vec![2.0f32, 3.0, 4.0],
         vec![2.0, 3.0, 4.0],
@@ -627,7 +534,10 @@ fn estimate_alpha_falls_back_when_underdispersed() {
     let raw = raw_source_from_shards(&[&rows], 3);
     let est = estimate_alpha(&raw, &AlphaOptions::default()).unwrap();
     assert!(est.fell_back);
-    assert_eq!(est.n_genes_used, 0);
+    assert_eq!(
+        est.n_genes_used, 3,
+        "all three genes have a mean above mu_min and belong in the pool"
+    );
     assert_eq!(est.alpha, 0.25);
 }
 

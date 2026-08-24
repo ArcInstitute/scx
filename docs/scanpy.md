@@ -2580,6 +2580,32 @@ estimated once from the counts (`alpha=None`, the default) or pinned
 (`alpha=<float>`, e.g. a reference `α` reused across datasets). Unlike v2 there is
 **no per-cell depth** — it cancels under the Anscombe scale.
 
+**How `α` is estimated.** Per gene, method-of-moments
+`α_g = (var_g − mean_g) / mean_g²`; the matrix-wide `α` is the **median over
+every gene whose mean exceeds `1e-3`**, negative `α_g` included. Two details are
+load-bearing:
+
+- *Nothing is filtered by dispersion.* Dropping the genes with `var_g ≤ mean_g`
+  before the median keeps only the upper tail of sampling noise and biases `α`
+  high by a factor that grows as the true dispersion falls. On a matrix where 20
+  of 24 genes are under-dispersed, that version reported the remaining four
+  genes' dispersion as the whole matrix's and reported success while doing it.
+  Fixed; a run from before the fix will show a smaller `n_genes_used` and a larger
+  `α` on the same counts.
+- *A median, not a mean or a `Σ(var−mean)/Σmean²` ratio.* The median is the only
+  one of the three that survives an outlier: a single highly-expressed
+  over-dispersed gene — a mitochondrial or ambient-RNA spike, routine in real
+  counts — moves the moment-pooled estimate by more than an order of magnitude
+  and leaves the median where it was.
+
+If the pooled median comes out non-positive the matrix carries no NB
+overdispersion to report, so `α` falls back to `0.25` (pseudocount `1.0`, i.e.
+plain `log1p`) and `uns["pflog"]["fell_back"]` is `True` — a clamp to a small
+positive floor would instead return a confident number the counts do not support.
+The estimator is pinned against counts simulated from a **known** `α` in
+`scx-accel/src/pflog_reference_tests.rs`; regenerate those fixtures with
+`.venv/bin/python benchmarks/scripts/generate_pflog_alpha_references.py`.
+
 The exact output is **dense** (zeros map to a per-cell baseline), so a naïve
 materialization is `O(N·D)`. The accelerator avoids that by exploiting the
 decomposition `Z = delta + baseline·1ᵀ`, where `delta = log1p(4α·x)` is exactly the
@@ -2974,18 +3000,35 @@ SCX ships Rust-accelerated equivalents of the metrics in
 [`cell-eval`](https://github.com/arcinstitute/cell-eval) and
 [`arc-bench`](https://github.com/arcinstitute/arc-bench). The outputs are
 numerically equivalent to the Python references within the tolerances
-below (30/30 parity tests in `pyscx/tests/test_cell_eval_parity.py` pass),
-so an existing cell-eval pipeline can swap in `pyscx.accel.*` for 10–20×
+below, so an existing cell-eval pipeline can swap in `pyscx.accel.*` for 10–20×
 wall-clock speedup at census-scale perturbation datasets (see
 [`docs/performance.md`](performance.md#perturbation-metrics-cell-eval--arc-bench-parity)
 for numbers at 10K / 100K / 500K / 1M cells).
 
+**How each tolerance is gated.** Every row below is pinned twice:
+
+- **Rust-side**, against reference values `cell-eval` and `arc-bench`
+  *produced*, checked into `scx-accel/src/eval_metrics/cell_eval_reference_values.rs`
+  and asserted by `cell_eval_reference_tests.rs`. This runs under plain
+  `cargo test` with no Python installed, and it is what makes these claims
+  reproducible. Regenerate with
+  `.venv/bin/python benchmarks/scripts/generate_eval_metrics_references.py`.
+- **Python-side**, by `pyscx/tests/test_cell_eval_parity.py` against the live
+  libraries. That file `importorskip`s `cell_eval` / `arc_bench` / `polars`,
+  which are editable installs in the repo's `.venv` and are in **no** conda env
+  and not in CI — so it strengthens the local gate and is not on its own
+  evidence for anything here.
+
+The two clustering rows are Python-side only: `clustering_agreement` wraps a
+stochastic Leiden, and AMI / NMI / ARI are pinned against sklearn in
+`eval_metrics/clustering.rs` rather than against cell-eval.
+
 | Metric | Tolerance | Rationale |
 |---|---|---|
 | AMI / NMI / ARI on label vectors | `atol=1e-10` | Integer-label inputs; limited by double-precision floor (~2.2e-16). |
-| pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. |
-| energy_distance / pearson_edistance | `atol=1e-4` correlation, `atol=1e-3` per-pert | O(N²) pairwise reduction; faer-gemm reduction order differs from sklearn BLAS GEMM. f32 + gemm matches f64 + scalar within these bounds (test parametrised over both dtypes). |
-| clustering_agreement (AMI over Leiden sweep) | `atol=0.05` per-resolution, `atol=0.15` aggregate | Native-Rust kNN (HNSW) + Leiden replaces scanpy under the hood; the two algorithms produce within-permutation labels on graphs with `n_perts ≥ 16` (parity test scaffold uses `n_perts=30`). |
+| pseudobulk_means, pearson_delta, mse/mae (and `_delta` variants), knockdown_efficiency, log_deviation | `atol=1e-6` **plus** `rtol=1e-7` | f32 CSR promoted to f64 before accumulation; expected rounding `O(n_cells · 2⁻²³) ≈ 1e-7` at 1M cells. The relative term is not new: the parity tests write `np.testing.assert_allclose(…, atol=1e-6)`, and **numpy's default `rtol` is `1e-7`**, so this has always been the enforced bar. The absolute half alone cannot be the whole claim — cell-eval stores these in f32, so the divergence scales with the value: `mse_delta` of `23.0172` differs by `1.25e-6`, inside numpy's bar and outside a bare `atol=1e-6`. |
+| energy_distance / pearson_edistance | `atol=1e-4`, correlation and per-pert alike | O(N²) pairwise reduction; faer-gemm reduction order differs from sklearn BLAS GEMM. f32 + gemm matches f64 + scalar within these bounds (test parametrised over both dtypes). |
+| clustering_agreement (AMI over Leiden sweep) | `atol=0.15` aggregate | Native-Rust kNN (HNSW) + Leiden replaces scanpy under the hood; the two algorithms produce within-permutation labels on graphs with `n_perts ≥ 16` (parity test scaffold uses `n_perts=30`). |
 | discrimination_score rank | exact (`abs=0`) on untied distances; **empirically** exact on totally-tied ones (tested, not guaranteed — the reference's sort is unstable); not claimed on mixed ties | Integer rank computation; any non-zero diff on untied input is a correctness regression, and on a total tie it means numpy's tie order moved. Exactness requires matching the reference on duplicated gene symbols and zero-norm effect vectors, both of which diverged through v0.13.0 — and the parity fixture (400×20 continuous random) contains neither, so it did not see them. **Mixed ties are explicitly out of scope**: the reference's order comes from an unstable `np.argsort` and is not reproducible. See [Discrimination score](#discrimination-score-pyscxacceldiscrimination_score). |
 
 All functions accept in-memory, backed, or lazy-transformed inputs. They

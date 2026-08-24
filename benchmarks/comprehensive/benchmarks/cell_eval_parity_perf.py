@@ -239,7 +239,7 @@ def run(
 
     # Lazy-import the bench-eval optional deps so ``--list`` and non-parity
     # benchmarks don't need cell-eval / arc-bench / pdex installed. Wrap in
-    # try/except so dev machines without the scx-bench-eval conda env skip
+    # try/except so a machine without the editable cell-eval install skips
     # gracefully (rather than crash) — the gate then reports a missing-
     # metric floor violation, which surfaces the env mistake clearly on
     # Chimera / CI. Mirrors the scoped optional-import pattern in
@@ -264,8 +264,8 @@ def run(
     except ImportError as e:
         logger.warning(
             "Skipping cell_eval_parity_perf: %s. Required packages "
-            "(cell_eval, arc_bench, pdex) live in the scx-bench-eval "
-            "conda env — activate it before running this benchmark.",
+            "(cell_eval, arc_bench, pdex) are editable installs in the repo's "
+            "uv venv (.venv) — no conda env has them.",
             e,
         )
         return None

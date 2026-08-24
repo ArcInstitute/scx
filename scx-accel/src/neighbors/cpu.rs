@@ -281,7 +281,11 @@ fn build_knn_hnsw(
 ///
 /// Returns flat `(indices, distances)` arrays of length `n_obs * n_neighbors`
 /// (row-major), matching `build_knn_hnsw` exactly.
-fn build_knn_exact(
+///
+/// `pub(crate)` rather than private so the §7.12 large-norm f32 fixture in
+/// `crate::eval_metrics::distance_floor_reference_tests` can assert both users of
+/// the gemm distance expansion from one file.
+pub(crate) fn build_knn_exact(
     data: &[f32],
     n_obs: usize,
     n_vars: usize,
@@ -328,12 +332,18 @@ fn build_knn_exact(
     // walks down column `i` — contiguous in memory — instead of striding
     // across rows. At n_obs ≈ 5K the gram is ~100 MB (>> L2), so contiguous
     // access is a measurable win over the symmetric `gram[(i, j)]`.
+    // Hoisted out of the O(n_obs²) loop: it depends only on `n_vars` and f32's
+    // unit roundoff.
+    let rel_floor =
+        crate::eval_metrics::distances::gemm_expansion_rel_floor(n_vars, f32::EPSILON as f64);
+
     let per_row: Vec<Vec<(usize, f64)>> = (0..n_obs)
         .into_par_iter()
         .with_min_len(8)
         .map(|i| {
             let mut candidates: Vec<(usize, f64)> = Vec::with_capacity(n_obs - 1);
             let ai_sq = row_norm_sq[i];
+            let row_i = &data[i * n_vars..(i + 1) * n_vars];
             for j in 0..n_obs {
                 if j == i {
                     continue;
@@ -342,9 +352,23 @@ fn build_knn_exact(
                 // walks contiguously down column `i` in faer's column-major
                 // layout.
                 let g = gram[(j, i)] as f64;
-                // max(0, ·) clamps tiny negatives from FP cancellation on
-                // near-identical rows. Same guard as `pairwise_gemm_row_sums`.
-                let d_sq = (ai_sq + row_norm_sq[j] - 2.0 * g).max(0.0);
+                // Below `rel_floor` the f32 expansion has cancelled the answer
+                // away and the old `.max(0.0)` reported 0 for pairs an order of
+                // magnitude apart in distance (§7.12); those pairs are
+                // recomputed exactly. Same primitive as
+                // `pairwise_gemm_row_sums`.
+                let d_sq = crate::eval_metrics::distances::expand_sq_distance(
+                    ai_sq,
+                    row_norm_sq[j],
+                    g,
+                    rel_floor,
+                    || {
+                        crate::eval_metrics::distances::exact_sq_distance(
+                            row_i,
+                            &data[j * n_vars..(j + 1) * n_vars],
+                        )
+                    },
+                );
                 candidates.push((j, d_sq));
             }
             // Partial sort: smallest `n_neighbors` distances land in

@@ -56,6 +56,10 @@ import sys
 
 import numpy as np
 
+# Shared with the other reference generators in this directory (Phase 7d
+# extracted them so a second generator would not copy them).
+from _rust_literals import f64_literal, rust_matrix
+
 # --- the fixture -------------------------------------------------------------
 #
 # 12 cells x 6 genes, 2 groups, 2 unlabelled cells. Every value is exactly
@@ -181,27 +185,6 @@ def scanpy_reference(tie_correct: bool) -> tuple[np.ndarray, np.ndarray]:
     return z, p
 
 
-def f64_literal(v: float) -> str:
-    """Format as a Rust `f64` literal.
-
-    `repr` gives the **shortest** string that round-trips through f64, which is
-    what clippy's `excessive_precision` lint demands: `.17g` would emit
-    `0.0090234388180803256` where f64 only carries
-    `0.009023438818080326`, and clippy rejects the extra digits as a claim of
-    precision the type cannot hold. Shortest-round-trip is also the honest
-    form — every digit printed is a digit the value has.
-    """
-    v = float(v)
-    if v != v or v in (float("inf"), float("-inf")):
-        # `repr` gives 'nan' / 'inf', and the decimal-point fallback below would
-        # then emit `nan.0`, which is not Rust. A non-finite reference value is
-        # a broken fixture, not something to format around.
-        raise ValueError(
-            f"refusing to emit a non-finite reference value ({v!r}); fix the "
-            f"fixture rather than the formatter"
-        )
-    s = repr(v)
-    return s if ("." in s or "e" in s or "E" in s) else s + ".0"
 
 
 
@@ -411,11 +394,6 @@ def emit_nb_glm() -> None:
 
 
 
-def rust_matrix(name: str, m: np.ndarray, ty: str = "f64") -> str:
-    rows = ",\n".join(
-        "    [" + ", ".join(f64_literal(v) for v in row) + "]" for row in m
-    )
-    return f"const {name}: [[{ty}; {m.shape[1]}]; {m.shape[0]}] = [\n{rows},\n];"
 
 
 def main() -> int:

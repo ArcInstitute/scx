@@ -67,6 +67,12 @@ pub trait PairwiseFloat:
     /// Narrow `f64` → Self. Used to apply an `f64` scaling factor (e.g. an
     /// inverse norm) back into an `F`-typed buffer.
     fn from_f64(x: f64) -> Self;
+    /// Unit roundoff of the type the **gemm accumulates in**, which is `Self`.
+    ///
+    /// Used only by [`gemm_expansion_rel_floor`]: the expansion
+    /// `‖a‖² + ‖b‖² − 2·a·b` cancels, and how much it can cancel before the
+    /// answer is gone is set by the accumulator's precision, not by `f64`'s.
+    fn accum_eps() -> f64;
 }
 
 impl PairwiseFloat for f32 {
@@ -78,6 +84,10 @@ impl PairwiseFloat for f32 {
     fn from_f64(x: f64) -> Self {
         x as f32
     }
+    #[inline]
+    fn accum_eps() -> f64 {
+        f32::EPSILON as f64
+    }
 }
 
 impl PairwiseFloat for f64 {
@@ -88,6 +98,10 @@ impl PairwiseFloat for f64 {
     #[inline]
     fn from_f64(x: f64) -> Self {
         x
+    }
+    #[inline]
+    fn accum_eps() -> f64 {
+        f64::EPSILON
     }
 }
 
@@ -184,6 +198,75 @@ pub fn point_distance_masked(
     metric: DistanceMetric,
 ) -> f64 {
     point_distance_generic(a, b, n_dims, keep, metric)
+}
+
+// --- the gemm expansion, and where it stops being trustworthy ----------------
+
+/// Safety factor on [`gemm_expansion_rel_floor`].
+///
+/// The error bound below is `√n_dims · ε` up to a small constant that depends on
+/// the summation order the BLAS chose, which is not knowable here. `1.0` is kept
+/// deliberately: the measured error on the reference case (32 dims, `‖x‖² ≈
+/// 6.4e8`) is 2.75e+02 against a floor of 4.4e+02, so the bound holds with
+/// margin, and raising this only widens the band of pairs that pay for an exact
+/// recomputation they did not need.
+const GEMM_EXPANSION_SAFETY: f64 = 1.0;
+
+/// The relative floor below which `‖a‖² + ‖b‖² − 2·a·b` has lost the answer, in
+/// units of `(‖a‖² + ‖b‖²)`.
+///
+/// The dot product is accumulated at the scale of the *norms*, so the absolute
+/// error surviving into the difference is bounded by the norms' rounding —
+/// roughly `√n_dims · ε · (‖a‖² + ‖b‖²)` — and not by `d²`'s own magnitude. Once
+/// `d²` falls below that, every digit of it is noise, and the `.max(0.0)` clamp
+/// that follows makes the resulting bias one-sided (§7.12).
+///
+/// Measured, on 24 rows of 32 f32 dims with `‖x‖² ≈ 6.4e8` and two pairs planted
+/// at `d² = 2⁻¹⁰` and `2⁻⁸`: the expansion returns **exactly 0.0 for both**, so
+/// two pairs an order of magnitude apart in distance report as identical. With
+/// `f64` accumulation the same floor is ~2e-8 of the norms and never fires on
+/// data like this, which is the point of keying it to the accumulator.
+#[inline]
+pub(crate) fn gemm_expansion_rel_floor(n_dims: usize, accum_eps: f64) -> f64 {
+    GEMM_EXPANSION_SAFETY * (n_dims as f64).sqrt() * accum_eps
+}
+
+/// Squared Euclidean distance between two rows, accumulated in `f64` from the
+/// stored values — no norms, no cancellation.
+///
+/// The fallback for [`gemm_expansion_rel_floor`]. `O(n_dims)` per pair, taken
+/// only for pairs the expansion cannot resolve, which on real embeddings is the
+/// near-duplicates and nothing else.
+#[inline]
+pub(crate) fn exact_sq_distance<F: PairwiseFloat>(a: &[F], b: &[F]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = x.as_f64() - y.as_f64();
+            d * d
+        })
+        .sum()
+}
+
+/// Expand a Gram entry into `d²`, recomputing exactly when the expansion has
+/// fallen inside its own error floor.
+///
+/// `rel_floor` comes from [`gemm_expansion_rel_floor`] and is hoisted out of the
+/// caller's inner loop; `exact` is called only on the rare pair that needs it.
+#[inline]
+pub(crate) fn expand_sq_distance(
+    a_sq: f64,
+    b_sq: f64,
+    gram: f64,
+    rel_floor: f64,
+    exact: impl FnOnce() -> f64,
+) -> f64 {
+    let d_sq = a_sq + b_sq - 2.0 * gram;
+    if d_sq < rel_floor * (a_sq + b_sq) {
+        return exact().max(0.0);
+    }
+    d_sq
 }
 
 // ── Generic scalar distance helpers ─────────────────────────────────────
@@ -435,6 +518,10 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
     };
     let b_sq: &[f64] = b_sq_owned.as_deref().unwrap_or(&a_sq);
 
+    // Hoisted: depends only on `n_dims` and the accumulator's precision, so it
+    // is one multiply per pair inside the loop rather than a sqrt.
+    let rel_floor = gemm_expansion_rel_floor(n_dims, F::accum_eps());
+
     let block_rows =
         crate::mem_budget::plan_gram_row_block(n_a, n_b, std::mem::size_of::<F>(), budget);
 
@@ -495,11 +582,17 @@ fn pairwise_gemm_row_sums<F: PairwiseFloat>(
                 match metric {
                     DistanceMetric::Euclidean => {
                         let ai_sq = a_sq[a0 + t];
+                        let ai = &a_data[(a0 + t) * n_dims..(a0 + t + 1) * n_dims];
                         for jl in j_start..extent {
-                            // max(0, ·) clamps tiny negatives from FP
-                            // cancellation for near-identical rows.
+                            // Below `rel_floor` the expansion has cancelled away
+                            // the answer, so recompute that pair exactly; the
+                            // old `.max(0.0)` silently reported 0 instead
+                            // (§7.12).
                             let gv = g[(jl, t)].as_f64();
-                            let d_sq = (ai_sq + b_sq[b0 + jl] - 2.0 * gv).max(0.0);
+                            let bj = b0 + jl;
+                            let d_sq = expand_sq_distance(ai_sq, b_sq[bj], gv, rel_floor, || {
+                                exact_sq_distance(ai, &b_data[bj * n_dims..(bj + 1) * n_dims])
+                            });
                             row_sum += d_sq.sqrt();
                         }
                     }
