@@ -318,6 +318,24 @@ impl HarmonyState {
                 "embeddings contain NaN or Inf".to_string(),
             ));
         }
+        // §7.18. `sigma` is the softmax bandwidth: `update_r` computes
+        // `exp(-dist / sigma)`. At `sigma = 0` that is `-inf` / `NaN`, the
+        // `sum_sd > 0.0` test fails, and the "degenerate: assign uniform"
+        // fallback fires for *every* cell — Harmony returns an essentially
+        // uncorrected embedding and reports `converged = true`. A negative
+        // `sigma` inverts the softmax silently, assigning each cell to the
+        // cluster it is furthest from.
+        //
+        // Checked here rather than at the pyscx boundary on purpose: pyscx,
+        // rscx and any future binding all reach `HarmonyState::new`, and an
+        // invariant enforced in one binding is not enforced (the §9.5 lesson).
+        if !config.sigma.is_finite() || config.sigma <= 0.0 {
+            return Err(AccelError::InvalidInput(format!(
+                "sigma must be finite and > 0 (got {}); it is the softmax \
+                 bandwidth in exp(-dist / sigma)",
+                config.sigma
+            )));
+        }
 
         // --- Dimensions ---
         let n = n_obs;

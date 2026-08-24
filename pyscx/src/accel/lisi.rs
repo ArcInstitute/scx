@@ -65,7 +65,8 @@ fn factorize_obs_column(
 ///     basis: obsm key holding embeddings (default "X_pca").
 ///     perplexity: target perplexity for the Gaussian kernel (default 30.0).
 ///     n_neighbors: number of neighbours to use. `None` (default) uses
-///         `3 * perplexity`.
+///         `3 * perplexity - 1` — harmonypy's `3 * perplexity` retrieved
+///         neighbours minus the self-match it drops.
 ///     approximate_knn: when `True`, use an HNSW approximate kNN instead of
 ///         the exact O(N²) sweep. Trades small numerical drift (~0.01–0.05 on
 ///         mean-LISI) for an order-of-magnitude speed-up at N ≳ 100k. Default
@@ -163,7 +164,10 @@ pub fn compute_lisi<'py>(
         )));
     }
 
-    let k = n_neighbors.unwrap_or_else(|| (perplexity * 3.0).ceil() as usize);
+    // §7.19: one derivation, in scx-accel, so this binding and rscx cannot
+    // drift from it (they both used to spell out `ceil(3 * perplexity)`, which
+    // is one neighbour wider than harmonypy's effective neighbourhood).
+    let k = n_neighbors.unwrap_or_else(|| scx_accel::lisi::default_n_neighbors(perplexity));
     let config = LisiConfig {
         perplexity,
         n_neighbors: k,

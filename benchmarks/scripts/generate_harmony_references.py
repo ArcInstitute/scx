@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Generate `scx-accel/src/harmony/harmony_reference_values.rs` from harmonypy.
+"""Generate SCX's harmonypy-pinned reference modules.
+
+Two targets, because harmonypy owns two of SCX's documented parity claims:
+
+    .venv/bin/python benchmarks/scripts/generate_harmony_references.py harmony \
+        > scx-accel/src/harmony/harmony_reference_values.rs
+    .venv/bin/python benchmarks/scripts/generate_harmony_references.py lisi \
+        > scx-accel/src/lisi_reference_values.rs
+
 
 Phase 7e / ORG-7.21-4. Harmony was the last documented parity claim in
 `scx-accel` with no checked-in reference number: `harmony/tests.rs` is entirely
 self-consistency, and the one R-reference test skips whenever its gitignored
 50 MB `.npz` is absent — which is for every contributor and for CI.
-
-Run it:
-
-    .venv/bin/python benchmarks/scripts/generate_harmony_references.py \
-        > scx-accel/src/harmony/harmony_reference_values.rs
 
 Four rules this generator inherits from `generate_de_parity_references.py` and
 `generate_pflog_alpha_references.py`, because breaking any one of them turns the
@@ -44,7 +47,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _rust_literals import f64_literal, rust_matrix  # noqa: E402
+from _rust_literals import f64_literal, rust_f64_array, rust_matrix  # noqa: E402
 
 try:
     import torch
@@ -391,5 +394,159 @@ def main() -> None:
         print(f"pub const {name}: f64 = {f64_literal(val)};")
 
 
+# ─── LISI (§7.19) ────────────────────────────────────────────────────────────
+
+LISI_N_CELLS = 60
+LISI_N_DIMS = 4
+LISI_N_LABELS = 3
+LISI_PERPLEXITY = 4  # int: harmonypy passes `perplexity * 3` straight to sklearn
+LISI_SEED = 20260825
+
+# Measured Rust-side, as in BARS above.
+LISI_ATOL = (1e-6, "observed 2.220e-16 on f64 both sides; the sweep is exact")
+
+
+def emit_lisi() -> None:
+    """Pin `compute_lisi` against harmonypy's own `compute_lisi`.
+
+    The neighbourhood is the whole point of this arm. harmonypy retrieves
+    `3 * perplexity` neighbours and drops column 0 — the self-match — so its
+    effective neighbourhood is `3 * perplexity - 1`. SCX skips `j == i` while
+    collecting, so it must ask for one fewer to see the same cells. That
+    off-by-one was in three places (§7.19) and no test could see it, because
+    the only harmonypy comparison in the tree ran at `atol = 1e-2`, which is
+    wider than the error one extra neighbour causes.
+
+    A small `perplexity` is deliberate: at the default 30 the neighbourhood is
+    89 of any tractable fixture's cells, so dropping one changes almost nothing
+    and the arm would pass either way. The generator checks that below.
+    """
+    import pandas as pd
+    from harmonypy.lisi import compute_lisi as hpy_lisi
+
+    rng = np.random.default_rng(LISI_SEED)
+    labels = rng.integers(0, LISI_N_LABELS, size=LISI_N_CELLS)
+    # Label-correlated blobs that OVERLAP. Well-separated blobs pin LISI at
+    # 1.0 for every cell, where the metric is flat and one neighbour more or
+    # less changes nothing — the fixture would pass against either convention.
+    # At this separation LISI spans roughly [1.0, 2.6] on 3 labels.
+    centers = rng.normal(0.0, 0.8, size=(LISI_N_LABELS, LISI_N_DIMS))
+    x = centers[labels] + rng.normal(0.0, 1.4, size=(LISI_N_CELLS, LISI_N_DIMS))
+    x = x.astype(np.float32).astype(np.float64)
+
+    meta = pd.DataFrame({"batch": labels})
+    want = hpy_lisi(x, meta, ["batch"], perplexity=LISI_PERPLEXITY)[:, 0]
+
+    k_hpy = int(np.ceil(LISI_PERPLEXITY * 3))
+
+    # The wrong-convention answer, as an explicit repulsion target. Only the
+    # *retrieval width* is patched — harmonypy's kernel, its self-match drop and
+    # its Simpson index all still run — so this is what harmonypy would return
+    # if SCX's neighbourhood were handed to it. Nothing asserts SCX equals it;
+    # the arm asserts SCX is far from it, the shape `pflog_reference_values`
+    # uses for its pre-fix estimator.
+    import harmonypy.lisi as _hl
+
+    real_nn = _hl.NearestNeighbors
+    _hl.NearestNeighbors = lambda n_neighbors, **kw: real_nn(
+        n_neighbors=n_neighbors + 1, **kw
+    )
+    try:
+        off_by_one = hpy_lisi(x, meta, ["batch"], perplexity=LISI_PERPLEXITY)[:, 0]
+    finally:
+        _hl.NearestNeighbors = real_nn
+
+    sep = float(np.abs(want - off_by_one).max())
+    assert sep > 1e-2, (
+        f"one extra neighbour moves LISI by only {sep:.3e} on this fixture; "
+        "the arm cannot detect the off-by-one it was written for"
+    )
+    assert LISI_ATOL[0] * 100 < sep, (
+        f"the bar {LISI_ATOL[0]:.1e} is not comfortably below the one-neighbour "
+        f"shift {sep:.3e}; the arm would not separate the two conventions"
+    )
+    assert 1.2 < want.mean() < LISI_N_LABELS, (
+        f"mean LISI {want.mean():.3f} is too close to the unmixed bound of 1.0; "
+        "the metric is flat there and the fixture cannot separate the two "
+        "neighbourhood conventions"
+    )
+
+    v = {p: md.version(p) for p in ("harmonypy", "numpy", "scikit-learn", "pandas")}
+
+    print("//! Pinned harmonypy reference values for LISI (§7.19, ORG-7.21-4).")
+    print("//!")
+    print("//! GENERATED FILE — do not edit by hand. See `# Regenerating` below.")
+    print("//!")
+    print("//! # Why an external reference at all")
+    print("//!")
+    print("//! SCX's LISI asked for `3 * perplexity` neighbours where harmonypy's")
+    print("//! effective neighbourhood is `3 * perplexity - 1`: it retrieves")
+    print("//! `3 * perplexity` from `NearestNeighbors` and drops column 0, the")
+    print("//! self-match, while SCX's sweep skips `j == i` as it collects. The")
+    print("//! derivation was written out three times — `LisiConfig::default`,")
+    print("//! `pyscx/src/accel/lisi.rs` and `rscx/src/lisi.rs` — and all three said")
+    print("//! `3 * perplexity`. The one harmonypy comparison in the tree")
+    print("//! (`test_harmony_validation.py::test_lisi_matches_harmonypy_per_cell`)")
+    print("//! ran at `atol = 1e-2` and passed with the bug.")
+    print("//!")
+    print("//! # Provenance")
+    print("//!")
+    print("//! | constant | produced by |")
+    print("//! |---|---|")
+    print("//! | `LISI_X`, `LISI_LABELS` | this generator's RNG — the fixture INPUT |")
+    print("//! | [`LISI_EXPECTED`] | harmonypy `harmonypy.lisi.compute_lisi` |")
+    print("//! | [`LISI_OFF_BY_ONE`] | the same, with only the retrieval width patched |")
+    print("//!")
+    for p_, ver in v.items():
+        print(f"//! {p_} {ver}")
+    print("//!")
+    print("//! # Why the perplexity is 4 and not the default 30")
+    print("//!")
+    print("//! At perplexity 30 the neighbourhood is 89 cells, so on any fixture")
+    print("//! small enough to read as literals one neighbour more or less changes")
+    print("//! almost nothing and the arm would pass against either convention. At")
+    print(f"//! perplexity {LISI_PERPLEXITY} the neighbourhood is {k_hpy - 1} of {LISI_N_CELLS} cells and one extra")
+    print(f"//! neighbour moves LISI by up to {sep:.3e} — checked by the generator, which")
+    print("//! refuses a fixture that cannot separate the two conventions.")
+    print("//!")
+    print("//! # Regenerating")
+    print("//!")
+    print("//! ```text")
+    print("//! .venv/bin/python benchmarks/scripts/generate_harmony_references.py lisi \\")
+    print("//!     > scx-accel/src/lisi_reference_values.rs")
+    print("//! ```")
+    print()
+    print("#![allow(clippy::unreadable_literal)]")
+    print()
+    print(f"pub const LISI_N_CELLS: usize = {LISI_N_CELLS};")
+    print(f"pub const LISI_N_DIMS: usize = {LISI_N_DIMS};")
+    print(f"pub const LISI_N_LABELS: usize = {LISI_N_LABELS};")
+    print(f"pub const LISI_PERPLEXITY: f64 = {f64_literal(float(LISI_PERPLEXITY))};")
+    print("/// harmonypy retrieves this many, then drops the self-match.")
+    print(f"pub const LISI_HARMONYPY_RETRIEVED: usize = {k_hpy};")
+    print(f"/// {LISI_ATOL[1]}")
+    print(f"pub const LISI_ATOL: f64 = {f64_literal(LISI_ATOL[0])};")
+    print("/// Max |LISI| shift from one extra neighbour, measured by the generator.")
+    print("/// The off-by-one arm asserts the bar is far below this.")
+    print(f"pub const LISI_ONE_NEIGHBOUR_SHIFT: f64 = {f64_literal(sep)};")
+    print()
+    print("pub " + rust_matrix("LISI_X", x, ty="f64"))
+    print()
+    lab = ", ".join(str(int(t)) for t in labels)
+    print(f"pub const LISI_LABELS: [u32; LISI_N_CELLS] = [{lab}];")
+    print()
+    print("pub " + rust_f64_array("LISI_EXPECTED", want))
+    print()
+    print("/// harmonypy's answer if it were handed SCX's pre-fix neighbourhood —")
+    print("/// one cell wider. A REPULSION target: nothing asserts SCX equals it.")
+    print("pub " + rust_f64_array("LISI_OFF_BY_ONE", off_by_one))
+
+
 if __name__ == "__main__":
-    main()
+    target = sys.argv[1] if len(sys.argv) > 1 else "harmony"
+    if target == "harmony":
+        main()
+    elif target == "lisi":
+        emit_lisi()
+    else:
+        sys.exit(f"unknown target {target!r}; expected 'harmony' or 'lisi'")

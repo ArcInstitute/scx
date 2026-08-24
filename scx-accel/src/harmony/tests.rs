@@ -429,6 +429,63 @@ fn test_single_iteration_decreases_objective() {
     );
 }
 
+/// §7.18. `sigma` is the softmax bandwidth in `exp(-dist / sigma)`.
+///
+/// At `sigma = 0` every scaled distance is `-inf`, `sum_sd > 0.0` is false and
+/// the uniform-assignment fallback fires for *every* cell — Harmony returned an
+/// essentially uncorrected embedding and reported `converged = true`, which is
+/// worse than an error because a pipeline downstream cannot tell. A negative
+/// `sigma` inverts the softmax and assigns each cell to the cluster it is
+/// furthest from, also silently.
+#[test]
+fn test_sigma_must_be_positive_and_finite() {
+    let n = 40;
+    let d = 4;
+    let emb = random_embeddings(n, d, 7);
+    let cov = BatchCovariate {
+        labels: (0..n as u32).map(|i| i % 2).collect(),
+        n_levels: 2,
+        name: None,
+    };
+    for bad in [0.0, -0.1, f64::NAN, f64::INFINITY] {
+        let config = HarmonyConfig {
+            n_clusters: Some(3),
+            max_iter: 1,
+            sigma: bad,
+            ..Default::default()
+        };
+        let err = harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config)
+            .expect_err(&format!("sigma = {bad} was accepted"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sigma"),
+            "sigma = {bad} was rejected, but the message does not name it: {msg}"
+        );
+    }
+}
+
+/// The accept side. A guard with no accept-side test is how #436 broke reading
+/// real f32 counts: the default must still run.
+#[test]
+fn test_default_sigma_still_runs() {
+    let n = 40;
+    let d = 4;
+    let emb = random_embeddings(n, d, 7);
+    let cov = BatchCovariate {
+        labels: (0..n as u32).map(|i| i % 2).collect(),
+        n_levels: 2,
+        name: None,
+    };
+    let config = HarmonyConfig {
+        n_clusters: Some(3),
+        max_iter: 1,
+        ..Default::default()
+    };
+    assert!(config.sigma > 0.0, "the default sigma must be accepted");
+    harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config)
+        .expect("the default sigma must still run");
+}
+
 #[test]
 fn test_determinism_same_seed() {
     let n = 200;

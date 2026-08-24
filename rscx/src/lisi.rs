@@ -37,7 +37,7 @@ fn factorize_chars(labels: &[String]) -> (Vec<u32>, usize) {
 /// @param labels Character vector of length N with categorical labels.
 /// @param perplexity Gaussian-kernel target perplexity (default 30).
 /// @param n_neighbors Number of neighbours to use. NULL means
-///   `ceil(3 * perplexity)`.
+///   `ceil(3 * perplexity) - 1` (harmonypy's effective neighbourhood).
 ///
 /// @return Numeric vector of length N with LISI values.
 ///
@@ -117,7 +117,8 @@ fn scx_compute_lisi_impl(
         Nullable::NotNull(k) => {
             return Err(Error::Other(format!("n_neighbors must be >= 1 (got {k})")));
         }
-        Nullable::Null => (perplexity * 3.0).ceil() as usize,
+        // §7.19: shared derivation, see `scx_accel::lisi::default_n_neighbors`.
+        Nullable::Null => scx_accel::lisi::default_n_neighbors(perplexity),
     };
 
     let config = LisiConfig {
