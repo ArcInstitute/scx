@@ -842,7 +842,10 @@ jobs:
           # one. A guard that counts prose is the "a bare grep cannot tell a call
           # from a sentence" failure, and the file that EXPLAINS the guard is the
           # likeliest place to trip it.
-          TIE_SHAPE='\b(\w+) \* \1 \* \1 - \1\b|\b(\w+)\.powi\(3\)\s*-\s*\2\b'
+          # Whitespace-optional: the first version required single spaces and
+          # would not have seen `t*t*t-t`. Same "one spelling" class as the bug
+          # it replaced, one level down. Found in round-2 review.
+          TIE_SHAPE='\b(\w+)\s*\*\s*\1\s*\*\s*\1\s*-\s*\1\b|\b(\w+)\.powi\(3\)\s*-\s*\2\b'
           code() { grep -vE '^[[:space:]]*(//|\*)' "$1"; }
           in_prim=$({ code "$prim" | grep -cP -- "$TIE_SHAPE" || true; } | tr -d ' ')
           if [ "$in_prim" -ne 1 ]; then

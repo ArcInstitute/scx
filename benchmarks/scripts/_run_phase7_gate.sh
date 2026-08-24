@@ -39,7 +39,11 @@ cd "$REPO"
 unset VIRTUAL_ENV
 unset PYTHONHOME PYTHONPATH
 
-source /home/nickyoungblut/miniforge3/etc/profile.d/conda.sh
+# Derived from whichever conda is on PATH, with the submitting host's install as
+# the fallback. `#SBATCH --output` above stays absolute of necessity: sbatch
+# parses those directives before any shell runs, so it cannot take a variable.
+CONDA_SH=$( { conda info --base 2>/dev/null || echo /home/nickyoungblut/miniforge3; } )/etc/profile.d/conda.sh
+source "$CONDA_SH"
 conda activate scx-bench-gpu
 
 echo "=== HEAD: $(git rev-parse HEAD) on $(git rev-parse --abbrev-ref HEAD)"
@@ -98,26 +102,30 @@ a2 = anndata.AnnData(
 pyscx.accel.rank_genes_groups(a2, "g", tie_correct=True, device="cpu")
 rgg = a2.uns["rank_genes_groups"]
 D = np.asarray(a2.X.todense(), dtype=np.float64)
+# Compare the P-VALUE against scipy's own `.pvalue`, not a z this script
+# reconstructs. The first version of this probe took `U` from scipy and rebuilt z
+# with `s2 = (n1*n2/12)*((n+1) - tc/(n(n-1)))` -- SCX's own variance formula --
+# so a bug in the tie term would have matched and the probe would have passed.
+# The same defect was found and fixed in the reference GENERATOR one round
+# earlier; it survived here because the fix went file by file instead of
+# following the formula. scipy's `.pvalue` applies scipy's own tie correction,
+# which is the whole reason it can falsify SCX's.
 worst = 0.0
 for grp in rgg["names"].dtype.names:
-    m = dict(zip(rgg["names"][grp], np.asarray(rgg["scores"][grp], np.float64)))
+    m = dict(zip(rgg["names"][grp], np.asarray(rgg["pvals"][grp], np.float64)))
     mask = g == grp
     for j in range(12):
         x, y = D[mask, j], D[~mask, j]
         if x.min() == x.max() == y.min() == y.max():
             continue
-        u1, _ = mannwhitneyu(x, y, use_continuity=False, alternative="two-sided",
-                             method="asymptotic")
-        n1, n2 = len(x), len(y)
-        _, cnt = np.unique(np.concatenate([x, y]), return_counts=True)
-        tc = float(np.sum(cnt**3 - cnt))
-        s2 = (n1 * n2 / 12.0) * ((n + 1) - tc / (n * (n - 1)))
-        if s2 <= 0:
+        res = mannwhitneyu(x, y, use_continuity=False, alternative="two-sided",
+                           method="asymptotic")
+        if not np.isfinite(res.pvalue):
             continue
-        worst = max(worst, abs((u1 - n1 * n2 / 2.0) / np.sqrt(s2) - m[f"g{j}"]))
-print(f"preflight: max |z - scipy| with tie_correct=True = {worst:.3e}")
-if worst > 1e-9:
-    fail.append(f"tie-corrected z diverges from scipy by {worst:.3e}; the .so is "
+        worst = max(worst, abs(res.pvalue - m[f"g{j}"]))
+print(f"preflight: max |p - scipy.pvalue| with tie_correct=True = {worst:.3e}")
+if worst > 1e-12:
+    fail.append(f"tie-corrected p diverges from scipy by {worst:.3e}; the .so is "
                 f"stale or the tie-run walk changed")
 
 if fail:

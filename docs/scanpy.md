@@ -2743,7 +2743,9 @@ keyed by gene name:
 
 The observed column is the pytest fixture's; the generator re-measures on a
 second, independent fixture and **fails** if any field there exceeds the same
-bar (it lands within 5e-07 / 3e-16 / 3e-16 / 2e-07). The bars are what is
+bar (it lands within 5e-07 / 3e-16 / 3e-16 / 2e-07). Run it in the `.venv`, where
+scanpy and `pyscx` are importable — it refuses to exit 0 having skipped that
+half, unless you ask for the Rust tables alone with `SCX_SKIP_PYTHON_BARS=1`. The bars are what is
 claimed — the observed figures are fixture-dependent by nature, and pinning a
 tolerance to one fixture's exact divergence is how a bar stops surviving a
 change of input.

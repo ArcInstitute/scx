@@ -448,10 +448,8 @@ class TestRankGenesGroups:
         constant leaves the ranking, and therefore the overlap, untouched, and
         nothing here compared `scores` or `pvals` at all.
 
-        Keyed by gene **name**, never by position. scanpy and SCX order tied
-        scores differently, so a positional comparison would pin the sort rather
-        than the statistic -- see
-        gene *order* -- scanpy's tie order comes from `np.argsort`'s default
+        Keyed by gene **name**, never by position, and gene *order* is not
+        compared at all. scanpy's tie order comes from `np.argsort`'s default
         `quicksort`, which is not stable, so a run of equal scores can come out
         in either arrangement. Order is therefore compared nowhere: not here,
         and not by a separate test *requiring* the two to disagree. An earlier
@@ -1128,7 +1126,13 @@ class TestStreamingDE:
                 # `pvals_adj` matters most here and was the field missing: BH is
                 # the one step that reads *across* genes, so a chunking bug that
                 # left every raw p-value intact could still corrupt it.
-                for field in ("names", "scores", "pvals", "pvals_adj"):
+                for field in (
+                    "names",
+                    "scores",
+                    "pvals",
+                    "pvals_adj",
+                    "logfoldchanges",
+                ):
                     np.testing.assert_array_equal(
                         ref_rgg[field][group],
                         results[cs][field][group],

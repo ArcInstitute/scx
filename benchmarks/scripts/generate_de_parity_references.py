@@ -51,6 +51,7 @@ the oracle generator. Do not reintroduce a computed reference here.
 
 from __future__ import annotations
 
+import os
 import sys
 
 import numpy as np
@@ -284,9 +285,23 @@ def measure_python_side_bars() -> None:
         import scipy.sparse as sp
 
         import pyscx  # noqa: F401
-    except ImportError as e:  # pragma: no cover - optional in a stock env
-        print(f"// python-side bars NOT measured: {e}")
-        return
+    except ImportError as e:
+        # LOUD, and non-zero. `docs/scanpy.md` says this script "fails if any
+        # field there exceeds the same bar" -- a silent `return` made that true
+        # only when the imports happened to succeed, so running it in a bare env
+        # printed the reference tables, skipped the check, and exited 0. Found in
+        # round-2 review. `SCX_SKIP_PYTHON_BARS=1` is the deliberate opt-out for
+        # regenerating the Rust tables alone.
+        if os.environ.get("SCX_SKIP_PYTHON_BARS") == "1":
+            print(f"// python-side bars SKIPPED on request (SCX_SKIP_PYTHON_BARS=1): {e}")
+            return
+        raise SystemExit(
+            f"// cannot measure the Python-side bars: {e}\n"
+            f"// This script owns those bars as well as the Rust tables, so a run\n"
+            f"// that cannot measure them has regenerated only half of what the\n"
+            f"// docs say it does. Use the .venv (scanpy + pyscx installed), or\n"
+            f"// set SCX_SKIP_PYTHON_BARS=1 to regenerate the Rust tables alone."
+        )
 
     rng = np.random.default_rng(0)
     counts = rng.poisson(2.0, size=(120, 50)).astype(np.float32)
@@ -306,6 +321,18 @@ def measure_python_side_bars() -> None:
         sc.tl.rank_genes_groups(a, "batch", method="wilcoxon")
         pyscx.accel.rank_genes_groups(b, "batch", device="cpu")
         ra, rb = a.uns["rank_genes_groups"], b.uns["rank_genes_groups"]
+        # Both sides must report the SAME gene set before any field is compared.
+        # Without this the loop below iterates SCX's genes and looks each up in
+        # scanpy's map, so a result that dropped genes would be compared over
+        # fewer of them -- the identical hole this PR removed from the pytest
+        # logFC loop, reintroduced in the script that measures its bars. Found
+        # in round-2 review.
+        for grp in rb["names"].dtype.names:
+            if set(ra["names"][grp]) != set(rb["names"][grp]):
+                raise SystemExit(
+                    f"// group {grp}: scanpy and scx report different gene sets, so "
+                    f"the measured bars below would cover only the intersection"
+                )
         worst: dict[str, float] = {}
         for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
             w = 0.0

@@ -174,7 +174,7 @@ fn the_two_libraries_agree_on_the_tie_corrected_p_value() {
 /// two conventions differ by 7.6e-02 in `z`, which is a different answer rather
 /// than a looser one. scanpy is the implementation of *this* convention, and its
 /// `scores` are float32 in the recarray, which is where
-/// [`Z_UNCORRECTED_ATOL`](r::Z_UNCORRECTED_ATOL) comes from.
+/// [`Z_ATOL`](r::Z_ATOL) comes from.
 #[test]
 fn dense_wilcoxon_matches_scanpy_without_tie_correction() {
     assert_matches_reference(
