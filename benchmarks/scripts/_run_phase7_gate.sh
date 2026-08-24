@@ -3,14 +3,21 @@
 #
 # ONE run for four sub-phases, deliberately. 7a and 7b (PR #452) never produced
 # a measurement -- no gate script existed -- and 7c's tie-run primitive touches
-# the dense DE inner loop, so the debt compounds rather than resolving. 7d adds
-# Harmony's missing k-means M-step, which is the largest perf change of the four.
+# the dense DE inner loop, so the debt compounds rather than resolving.
 #
-# NOT YET SUBMITTED. It is written now so the numbers it will report are
-# reviewable before the hours are spent, and because a gate script that does not
-# exist is how Phase 6 arrived at a gate that had never run. Submit it once 7d
-# has landed; run `--benchmarks accel_de accel_de_nb_glm accel_hvg accel_pca
-# accel_eval_metrics bench_csc_dispatch` alone if you want a 7a-7c answer sooner.
+# What 7d actually changed, which is not what an earlier version of this comment
+# predicted:
+#
+#   * The PFlog alpha estimator no longer filters candidates by dispersion
+#     (SS7.14). Every `pflog(alpha=None)` caller gets a different alpha on the
+#     same counts, so the transform itself moved. No pflog benchmark exists, so
+#     the preflight below is the only measurement of it in this job.
+#   * The gemm distance expansion recomputes exactly below its error floor
+#     (SS7.12), in the exact-kNN path and in the blocked pairwise kernel. That is
+#     why `accel_knn` joins the list.
+#   * Harmony's missing k-means M-step -- previously billed here as 7d's largest
+#     perf change -- moved to 7e, along with registering `accel_harmony` at all.
+#     Nothing in this run touches Harmony.
 #
 # ONE job, and nothing else submitted alongside: `maturin develop` rewrites the
 # in-tree `.so` that every pyscx-importing job resolves through, so a second scx
@@ -128,6 +135,48 @@ if worst > 1e-12:
     fail.append(f"tie-corrected p diverges from scipy by {worst:.3e}; the .so is "
                 f"stale or the tie-run walk changed")
 
+# --- 3. the PFlog alpha estimator is the post-SS7.14 one ----------------------
+#
+# There is no pflog benchmark, so without this arm the job would spend hours
+# without touching the one numeric change 7d made to a user-facing transform. The
+# probe is the review's own regime: counts simulated from a KNOWN alpha, where the
+# pre-fix estimator biases high by discarding the under-dispersed genes.
+#
+# The assertion is on `n_genes_used`, not on alpha. At 50 cells the estimator's
+# sampling spread is wider than the bias it is being distinguished from, so an
+# alpha tolerance cannot separate the two estimators -- measured, and the reason
+# `pflog_reference_tests.rs` rests on exact arms instead. The pool size is exact:
+# every gene with a mean above mu_min, where the old filter kept only the
+# over-dispersed ones.
+import anndata, scipy.sparse as sp
+
+rng = np.random.default_rng(70301)
+n_cells, n_genes, alpha_true = 60, 80, 0.02
+mus = np.exp(rng.uniform(np.log(0.5), np.log(200.0), n_genes))
+cols = [
+    rng.negative_binomial(1.0 / alpha_true, 1.0 / (1.0 + alpha_true * mu), size=n_cells)
+    for mu in mus
+]
+counts = np.stack(cols, axis=1).astype(np.float32)
+ad = anndata.AnnData(sp.csr_matrix(counts))
+ad.var_names = [f"g{i}" for i in range(n_genes)]
+ad.obs_names = [f"c{i}" for i in range(n_cells)]
+pyscx.accel.pflog(ad, store="baseline")
+meta = ad.uns.get("pflog", {})
+n_used = int(meta.get("n_genes_used", -1))
+n_expected = int((counts.mean(axis=0) > 1e-3).sum())
+print(
+    f"preflight: pflog alpha={float(meta.get('alpha', float('nan'))):.6f} "
+    f"(alpha_true={alpha_true}), n_genes_used={n_used}/{n_expected}"
+)
+if meta.get("alpha_source") != "estimated":
+    fail.append(f"pflog did not estimate alpha (alpha_source={meta.get('alpha_source')!r})")
+elif n_used != n_expected:
+    fail.append(
+        f"pflog pooled {n_used} of {n_expected} genes with a mean above mu_min; the "
+        f"dispersion pre-filter is back, or the .so predates SS7.14"
+    )
+
 if fail:
     for f in fail:
         print(f"PREFLIGHT FAILED: {f}", file=sys.stderr)
@@ -141,10 +190,17 @@ PY
 # and 7c added a GPU arm to the Wilcoxon reference test. --no-gpu would leave all
 # of that unmeasured while still printing a green gate.
 #
-# accel_harmony is included ONLY if 7d registered it in ALL_BENCHMARKS.
-# `capture_baseline.py` rejects an off-list name outright -- that exact failure
-# killed Phase 6's first gate attempt in 2.2s -- so check before adding it:
+# accel_harmony is NOT here and must not be added until 7e registers it in
+# ALL_BENCHMARKS. `capture_baseline.py` rejects an off-list name outright -- that
+# exact failure killed Phase 6's first gate attempt in 2.2s -- so check before
+# adding it:
 #   python -c "from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS as A; print('accel_harmony' in A)"
+# It is absent today: `benchmarks/comprehensive/benchmarks/` holds 52 modules and
+# none is harmony, so registering it means WRITING one, not adding a name.
+#
+# accel_knn is here because SS7.12 changed the precision of the distance the
+# exact-kNN path returns for near-duplicate rows. `thresholds.yaml` already
+# carries `recall_vs_scanpy >= 0.90` floors for it, which is the signal.
 #
 # READ THE RESULT CAREFULLY, on two counts.
 #
@@ -155,13 +211,20 @@ PY
 #      Reporting the run as "no regressions against LATEST" would be false.
 #   2. `accel_eval_metrics`' two GPU route floors have never been evaluated. If
 #      they come back unevaluated again, say so; do not report them as passed.
+#   3. Accelerator FINGERPRINTS will move, and the fingerprint check is not
+#      filtered by --only-benchmarks. Expect drift in the kNN fingerprint (SS7.12)
+#      and any that touches pflog (SS7.14). Do NOT pass
+#      `-- --allow-fingerprint-drift` pre-emptively: run it, read which
+#      fingerprints moved, confirm each one is explained by those two changes, and
+#      only then re-run with the flag -- naming the drifted fingerprints in the
+#      report. Phase 6 waved seven through and that is how a real change hides.
 #
 # --skip-smoke: the pre-submit contract check sweeps all 14 runners on pbmc3k and
 # blocks submission if any fails. Right for a full capture, wrong here -- every
 # benchmark named below is SCX-only and touches no competitor format.
 echo "=== gate_candidate.py"
 python benchmarks/comprehensive/scripts/gate_candidate.py \
-    --benchmarks accel_de accel_de_nb_glm accel_hvg accel_pca \
+    --benchmarks accel_de accel_de_nb_glm accel_hvg accel_pca accel_knn \
                  accel_eval_metrics bench_csc_dispatch \
     --datasets pbmc3k census_1m \
     --name phase7-accel-gate \
