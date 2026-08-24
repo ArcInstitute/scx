@@ -1212,6 +1212,19 @@ jobs:
               # was missing from this set beside its sibling. Found in review by
               # Cursor Agent.
               "compute_log_deviation",
+              # The five bulk-metric producers, likewise. The symbol loop above
+              # already demands their `CE_*` tables be declared and read, so
+              # without these a generator could swap all five for a local numpy
+              # score, keep `_bulk_anndata` and the const names, and stay green —
+              # the same "reference it COMPUTES" failure this walk exists to
+              # catch, in the one metric family it did not name. Third instance
+              # of this hole class on this branch; found in review by Cursor
+              # Agent, round 2.
+              "pearson_delta",
+              "mse",
+              "mae",
+              "mse_delta",
+              "mae_delta",
           }
           missing = sorted(required - called)
           if missing:
