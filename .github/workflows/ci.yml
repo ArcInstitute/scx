@@ -1002,6 +1002,226 @@ jobs:
               raise SystemExit(1)
           PY
 
+      # ORG-7.21-4 / §7.14: PFlog's α is pinned against a GENERATING α, and the
+      # three copies of the estimator stay gone.
+      #
+      # `estimate_alpha` filtered `var > mean` before the median, so the pool was
+      # the upper tail of sampling noise. Every test of it compared one
+      # implementation of that definition to another: `reference_alpha` in
+      # `pflog_tests.rs` and a numpy copy in `test_accel_pflog.py`, both carrying
+      # the same filter. Three implementations, one bug, mutual agreement.
+      - name: The PFlog α oracle is a generating parameter, not a sibling
+        run: |
+          set -euo pipefail
+          vals=scx-accel/src/pflog_reference_values.rs
+          tst=scx-accel/src/pflog_reference_tests.rs
+          gen=benchmarks/scripts/generate_pflog_alpha_references.py
+          prod=scx-accel/src/pflog.rs
+          # Assert the inputs exist before asserting anything about them: a guard
+          # keyed on a path that has moved passes vacuously and says nothing.
+          for f in "$vals" "$tst" "$gen" "$prod"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-7.21-4)."; exit 1; }
+          done
+
+          # Positive half, first: deleting the oracle outright must not satisfy
+          # the negative greps below. Each table has to be DEFINED in the values
+          # module and READ by the tests -- a defined-but-unread table is not an
+          # oracle, which is the escalation guard 18 needed.
+          # Anchored on the DECLARATION and on a `r::`-qualified read, not on the
+          # bare substring: `grep -q A_ALPHA_TRUE` also matches
+          # `A_ALPHA_TRUE_RENAMED`, so a rename walked straight past the first
+          # version of this loop. Found by falsifying it.
+          for sym in A_ALPHA_TRUE A_TRUNCATED_ALPHA A_N_GENES_POOLED \
+                     B_ALPHA_TRUE C_TRUNCATED_ALPHA C_N_UNDERDISPERSED; do
+            grep -qE "^pub const $sym:" "$vals" || { echo "::error::$vals no longer declares \`$sym\` — the α claim is back to resting on the estimator's own definition (ORG-7.21-4)."; exit 1; }
+            grep -qE "\\br::$sym\\b" "$tst"  || { echo "::error::$tst no longer READS r::$sym — a defined-but-unread reference constant is not an oracle (ORG-7.21-4)."; exit 1; }
+          done
+
+          # The three arms are what carry the claim, and two of them carry no
+          # tolerance. Measurement showed a tolerance CANNOT carry it: the
+          # truncation's bias and the estimator's sampling spread are both
+          # proportional to the per-gene MoM noise, so at every fixture size that
+          # fits in a source file the 99th-percentile spread is wider than the
+          # bias. Losing the exact arms would leave a green tolerance test over a
+          # reintroduced bug.
+          for t in the_pool_holds_every_gene_with_a_mean \
+                   the_estimate_is_closer_to_the_generating_alpha_than_the_truncated_one \
+                   an_underdispersed_matrix_falls_back_instead_of_reporting_a_handful_of_genes \
+                   the_sampling_bar_cannot_separate_the_two_estimators; do
+            grep -qE "fn $t\\(" "$tst" || { echo "::error::$tst no longer has \`$t\` — the exact arms are what catch the truncation; the tolerance arm stays green on the buggy estimator by design (ORG-7.21-4)."; exit 1; }
+          done
+
+          # Negative half 1: no dispersion filter in the candidate pipeline. Keyed
+          # on the SHAPE of a variance-vs-mean comparison rather than one
+          # spelling.
+          #
+          # `code()` strips comment lines first. Measured: with the current
+          # pattern it is NOT load-bearing -- removing it does not false-positive
+          # on this file. It stays as defence, because `pflog.rs`'s own doc
+          # comment discusses the forbidden filter at length and a later widening
+          # of the pattern would trip on that prose. Claimed as necessary in the
+          # first version of this comment; falsifying it showed otherwise, and an
+          # unverified claim in a guard is the thing this series keeps finding.
+          code() { grep -vE '^[[:space:]]*(//|\*)' "$1"; }
+          if code "$prod" | grep -qE '(v|var|variance)[a-z_]*[[:space:]]*>[[:space:]]*(m|mean)[a-z_]*[[:space:]]*[,)&]'; then
+            echo "::error::$prod filters candidates by variance > mean again — dropping the under-dispersed genes before the median keeps only the upper tail of sampling noise and biases α high (§7.14, ORG-7.21-4)."
+            exit 1
+          fi
+
+          # Negative half 2: no fourth copy of the estimator in a test. The
+          # per-gene MoM ratio is the definition under test; a helper that
+          # recomputes it and asserts equality is the self-referential oracle
+          # coming back, which is what this phase deleted twice.
+          MOM='\(\s*var[a-z_]*\s*-\s*mean[a-z_]*\s*\)\s*/\s*\(\s*mean[a-z_]*\s*\*'
+          for f in scx-accel/src/pflog_tests.rs pyscx/tests/test_accel_pflog.py; do
+            test -f "$f" || continue
+            if code "$f" | grep -qE "$MOM"; then
+              echo "::error::$f recomputes the per-gene method-of-moments α — that is the definition under test, and a test asserting SCX equals it can only confirm two copies of one bug agree (ORG-7.21-4)."
+              exit 1
+            fi
+          done
+
+          # Generator provenance: the reference must stay the SIMULATION
+          # parameter. A generator that estimates α and pins its own answer would
+          # move together with any bug in SCX, which is exactly the defect the
+          # first `wilcoxon_reference_values.rs` had.
+          #
+          # An `ast` walk, not a grep: the module docstring spells out
+          # `negative_binomial(n=1/α, p=1/(1+α·μ))` to document the
+          # parameterisation, so a grep is satisfied by the prose alone. Replacing
+          # every call with `rng.poisson` left the first version green. Found by
+          # falsifying it, and the same reason guard ORG-7.21-4's overlap check is
+          # Python rather than a grep.
+          python3 - "$gen" <<'PY'
+          import ast, sys
+          tree = ast.parse(open(sys.argv[1]).read())
+          calls = {
+              n.func.attr
+              for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+          }
+          if "negative_binomial" not in calls:
+              print(
+                  f"::error file={sys.argv[1]}::this script no longer CALLS "
+                  f"negative_binomial (only names it, if at all) — the oracle here "
+                  f"is the generating parameter, and without a simulation there is "
+                  f"nothing external left (ORG-7.21-4)."
+              )
+              raise SystemExit(1)
+          # Tuple targets count: the generator writes
+          # `A_N_CELLS, A_N_GENES, A_ALPHA_TRUE = 50, 120, 0.02`, so a walk that
+          # only looks at `ast.Name` targets misses it and the check fires on
+          # correct code. It did, on the first run.
+          assigned = {
+              nm.id
+              for n in ast.walk(tree)
+              if isinstance(n, (ast.Assign, ast.AnnAssign))
+              for nm in ast.walk(n)
+              if isinstance(nm, ast.Name) and isinstance(nm.ctx, ast.Store)
+          }
+          if not any(name.endswith("ALPHA_TRUE") for name in assigned):
+              print(
+                  f"::error file={sys.argv[1]}::no `*_ALPHA_TRUE` is assigned — the "
+                  f"generating α is the reference (ORG-7.21-4)."
+              )
+              raise SystemExit(1)
+          PY
+
+      # ORG-7.21-4: every documented cell-eval / arc-bench tolerance is pinned
+      # Rust-side, so `cargo test` gates it with no Python installed.
+      #
+      # `docs/scanpy.md` cited `test_cell_eval_parity.py` as its evidence. That
+      # file `importorskip`s `cell_eval` / `arc_bench` / `polars`; no conda env
+      # has them and neither does CI's Python job, so the claim rested on a local
+      # run in a developer venv. Across `eval_metrics/` exactly three external
+      # numbers were pinned -- sklearn's AMI/NMI/ARI -- and the rest was
+      # hand-derivation or two SCX code paths agreeing.
+      - name: The cell-eval parity claims are pinned where cargo test can see them
+        run: |
+          set -euo pipefail
+          vals=scx-accel/src/eval_metrics/cell_eval_reference_values.rs
+          tst=scx-accel/src/eval_metrics/cell_eval_reference_tests.rs
+          gen=benchmarks/scripts/generate_eval_metrics_references.py
+          for f in "$vals" "$tst" "$gen"; do
+            test -f "$f" || { echo "::error::$f is missing — the cell-eval tolerances in docs/scanpy.md are back to being backed only by a pytest file that skips everywhere (ORG-7.21-4)."; exit 1; }
+          done
+
+          # Positive half: defined AND read, per metric family. Pinning one family
+          # and letting the others lapse is the failure mode -- the table in
+          # docs/scanpy.md has a row for each.
+          for sym in CE_PEARSON_DELTA CE_MSE CE_MAE CE_MSE_DELTA CE_MAE_DELTA \
+                     CE_DISCRIM_L1_EXCL CE_DISCRIM_L1_ALL \
+                     CE_DISCRIM_L2_EXCL CE_DISCRIM_COSINE_EXCL \
+                     CE_EDISTANCE_CORR CE_KD_BASELINE CE_KD_EFFICIENCY \
+                     CE_KD_LOG_DEVIATION CE_KD_IS_NAN; do
+            # Anchored on the declaration, not the bare substring: `grep -q
+            # CE_EDISTANCE_CORR` also matches `CE_EDISTANCE_CORR_OLD`, so a rename
+            # walked past the first version. Found by falsifying it — the same
+            # hole, and the same fix, as the α guard above.
+            grep -qE "^pub const $sym(:| )" "$vals" || { echo "::error::$vals no longer declares \`$sym\` — a documented tolerance just lost its Rust-side pin (ORG-7.21-4)."; exit 1; }
+            grep -qE "\\br::$sym\\b" "$tst" || { echo "::error::$tst no longer READS r::$sym — a defined-but-unread reference table is not an oracle (ORG-7.21-4)."; exit 1; }
+          done
+
+          # The bars must be COMPARED against, not merely declared. A constant
+          # that survives only inside a failure message is not a bar -- the
+          # escalation ORG-7.21-4's scanpy guard needed after pooled counting let
+          # one field go unchecked.
+          for sym in CE_ATOL CE_RTOL CE_EDISTANCE_ATOL; do
+            n=$({ grep -cE "(<=|<|>=|>|\+)[[:space:]]*r::$sym\b" "$tst" || true; } | tr -d ' ')
+            if [ "$n" -lt 1 ]; then
+              echo "::error::$sym is declared but never COMPARED against in $tst ($n comparison(s)) — its metric family is now unchecked (ORG-7.21-4)."
+              exit 1
+            fi
+          done
+
+          # Generator provenance: every value must be one cell-eval or arc-bench
+          # PRODUCED. The pseudobulk means especially -- recomputing them here
+          # would score two slightly different matrices and call the difference a
+          # tolerance.
+          # An `ast` walk over the CALLS, not a grep: this script's docstring
+          # names every one of these functions to document where its numbers come
+          # from, so a grep is satisfied by the prose with every call removed.
+          # Verified by removing them — the grep version stayed green.
+          #
+          # `check_untied` is checked as a DEFINITION for the same reason a rename
+          # walked past the symbol greps above: the call sites keep the name alive
+          # after the function is gone.
+          python3 - "$gen" <<'PY'
+          import ast, sys
+          tree = ast.parse(open(sys.argv[1]).read())
+          called = set()
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Call):
+                  f = n.func
+                  called.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+          required = {
+              "_bulk_anndata",
+              "discrimination_score",
+              "edistance",
+              "compute_control_baseline",
+              "compute_knockdown_efficiency",
+          }
+          missing = sorted(required - called)
+          if missing:
+              print(
+                  f"::error file={sys.argv[1]}::this script no longer CALLS "
+                  f"{', '.join(missing)} — a reference it COMPUTES is the 'sibling "
+                  f"implementations agreeing' failure ORG-7.21-4 exists to retire, "
+                  f"relocated into the oracle (ORG-7.21-4)."
+              )
+              raise SystemExit(1)
+          defs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+          if "check_untied" not in defs:
+              print(
+                  f"::error file={sys.argv[1]}::`check_untied` is no longer defined "
+                  f"— on a tie cell-eval's discrimination rank comes from numpy's "
+                  f"unstable quicksort, which docs/scanpy.md explicitly does not "
+                  f"claim, and pinning a tied fixture freezes that arbitrary order "
+                  f"as the contract (ORG-7.21-4)."
+              )
+              raise SystemExit(1)
+          PY
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
