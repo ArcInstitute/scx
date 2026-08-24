@@ -158,7 +158,7 @@ pub use gpu_harmony::{
     gpu_harmony_correction_grouped, gpu_harmony_distances, gpu_harmony_distances_gemm,
     gpu_harmony_fits, gpu_harmony_l2_normalize_cols, gpu_harmony_memory_bytes,
     gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy, gpu_harmony_reduce_objective,
-    gpu_harmony_softmax, gpu_harmony_z_sum,
+    gpu_harmony_softmax, gpu_harmony_update_y, gpu_harmony_z_sum,
 };
 pub use gpu_hvg::{
     gpu_streaming_clip_square_sum, gpu_streaming_clip_square_sum_batched,

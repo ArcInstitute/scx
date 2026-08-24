@@ -11,7 +11,8 @@ use scx_gpu::{
     gpu_harmony_block_softmax_penalty, gpu_harmony_compute_o_e_full,
     gpu_harmony_correction_grouped, gpu_harmony_distances, gpu_harmony_distances_gemm,
     gpu_harmony_l2_normalize_cols, gpu_harmony_obj_cross, gpu_harmony_obj_kmeans_entropy,
-    gpu_harmony_softmax, gpu_harmony_z_sum, CublasHandle, CudaSlice, GpuDevice,
+    gpu_harmony_softmax, gpu_harmony_update_y, gpu_harmony_z_sum, CublasHandle, CudaSlice,
+    GpuDevice,
 };
 use std::sync::Arc;
 
@@ -371,6 +372,17 @@ pub fn harmony_integrate_gpu(
         .memcpy_htod(&state.dist_mat, &mut d_dist)
         .map_err(|e| AccelError::LinAlg(format!("upload dist (iter 0 cold-start): {e}")))?;
 
+    // `Z_cos = l2_normalize(Z_corr)`. Previously only the `iter > 0`
+    // cold-start branch built this, because nothing at iter 0 read it —
+    // the sub-loop took `d_dist` straight from the CPU state. The M-step
+    // reads it on every sub-iteration including iter 0's, so it has to be
+    // live before the loop starts, not one iteration in.
+    dev.stream()
+        .memcpy_dtod(&d_z_corr, &mut d_z_cos)
+        .map_err(|e| AccelError::LinAlg(format!("memcpy Z_corr->Z_cos (iter 0): {e}")))?;
+    gpu_harmony_l2_normalize_cols(&dev, &mut d_z_cos, d, n)
+        .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize Z_cos (iter 0): {e}")))?;
+
     // Read-only constants — uploaded once.
     let d_sigma = dev
         .htod_copy(&f64_to_f32(&state.sigma))
@@ -530,12 +542,12 @@ pub fn harmony_integrate_gpu(
             gpu_harmony_l2_normalize_cols(&dev, &mut d_z_cos, d, n)
                 .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize: {e}")))?;
 
-            // Refresh d_y from CPU state.y (mutated by previous
-            // iter's correction step).
-            let y_f32 = f64_to_f32(&state.y);
-            dev.stream()
-                .memcpy_htod(&y_f32, &mut d_y)
-                .map_err(|e| AccelError::LinAlg(format!("upload Y: {e}")))?;
+            // `d_y` is NOT refreshed from the host here any more. It
+            // used to be, because `correct()` wrote the ridge intercept
+            // into `state.y` — the stand-in for the missing M-step. The
+            // M-step now owns `d_y` on device, and it already holds the
+            // last sub-iteration's centroids, which is what this
+            // cold-start distance step wants.
 
             dispatch_harmony_distances(&dev, &cublas, &d_y, &d_z_cos, &mut d_dist, d, k, n)?;
             gpu_harmony_softmax(&dev, &d_dist, &d_sigma, &mut d_r, k, n)
@@ -603,6 +615,39 @@ pub fn harmony_integrate_gpu(
             upload_stream
                 .memcpy_htod(&order_i32, &mut d_order)
                 .map_err(|e| AccelError::LinAlg(format!("upload order: {e}")))?;
+
+            // ── M-step (§7.4), OUTSIDE the captured region ───────────
+            //
+            // `Y = normalize(Z_cos · Rᵀ)`, then the distances it
+            // invalidates. harmonypy 0.2.0 `cluster()` does both at the
+            // top of every sub-iteration; before Phase 7e neither arm
+            // did either, so `d_y` and `d_dist` were frozen for the
+            // whole sub-loop.
+            //
+            // Deliberately not folded into the capture. Both steps are
+            // cuBLAS gemms, and `run_kmeans_subiter_kernels` takes
+            // `d_dist` immutably — a contract
+            // `test_gpu_harmony_captures_once_across_outer_iters`
+            // guards. Capturing cuBLAS needs the handle bound to the
+            // capture stream and a warm-up to pre-allocate its
+            // workspace, and a capture failure degrades silently to
+            // direct dispatch for the rest of the call. The cost of
+            // staying outside is two gemms and one normalize per
+            // sub-iter — at most `max_iter × max_iter_kmeans` = 60
+            // extra launches per run against a per-sub-iter block
+            // loop that already issues `n_blocks` × 4 of them.
+            //
+            // These run on `dev` (the default stream), not `dev_pts`,
+            // and the replayed graph launches on `pts`. The sync below
+            // orders them; see the per-sub-iter sync at the end of this
+            // block.
+            gpu_harmony_update_y(&dev, &cublas, &d_z_cos, &d_r, &mut d_y, d, k, n)
+                .map_err(|e| AccelError::LinAlg(format!("GPU M-step (Y = Z_cos R'): {e}")))?;
+            gpu_harmony_l2_normalize_cols(&dev, &mut d_y, d, k)
+                .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize Y: {e}")))?;
+            dispatch_harmony_distances(&dev, &cublas, &d_y, &d_z_cos, &mut d_dist, d, k, n)?;
+            dev.synchronize()
+                .map_err(|e| AccelError::LinAlg(format!("sync after M-step: {e}")))?;
 
             // Sub-iter execution strategy:
             //
@@ -966,10 +1011,16 @@ pub fn harmony_integrate_gpu(
                 }
             }
 
-            // Extract centroid into CPU state.y; zero W[0, :].
-            let y_off = ku * d;
+            // Zero W[0, :] — the intercept is not a batch effect, so it
+            // is not subtracted. harmonypy `moe_correct_ridge` does the
+            // same and never reads that row.
+            //
+            // It used to be copied into `state.y` first, here and in the
+            // CPU arm: a centroid written once per *outer* iteration as a
+            // by-product of the correction solve, standing in for the
+            // M-step the sub-loop did not have. `update_y` owns the
+            // centroids now, on both arms.
             for t in 0..d {
-                state.y[y_off + t] = w[t];
                 w[t] = 0.0;
             }
 
@@ -1007,14 +1058,12 @@ pub fn harmony_integrate_gpu(
             .map_err(|e| AccelError::LinAlg(format!("GPU correction (grouped): {e}")))?;
         }
 
-        // L2-normalize Y columns on GPU (d x K). Y was just mutated
-        // by CPU correction; refresh d_y in place and run the kernel.
-        let y_f32 = f64_to_f32(&state.y);
-        dev.stream()
-            .memcpy_htod(&y_f32, &mut d_y)
-            .map_err(|e| AccelError::LinAlg(format!("upload Y for norm: {e}")))?;
-        gpu_harmony_l2_normalize_cols(&dev, &mut d_y, d, k)
-            .map_err(|e| AccelError::LinAlg(format!("GPU L2 normalize Y: {e}")))?;
+        // Mirror the device centroids back to `state.y`. This used to be
+        // an upload-normalize-download round trip, because CPU correction
+        // had just written `state.y` from the ridge intercept. It does
+        // not any more: `d_y` is authoritative, and this is a plain
+        // read-back (d x K floats, at most `max_iter` times) so the CPU
+        // mirror is not silently stale for anything that reads it.
         dev.synchronize()
             .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
         let y_back = dev

@@ -372,3 +372,67 @@ fn the_objectives_cross_entropy_is_a_stated_divergence_not_parity() {
          difference is moving the cross-entropy."
     );
 }
+
+// ─── GPU arm ─────────────────────────────────────────────────────────
+// `#[ignore]`d and gated, so a machine without a CUDA driver reports these as
+// ignored rather than as passes that did nothing. The GPU harness re-selects
+// them with `--include-ignored` under `SCX_REQUIRE_GPU=1`.
+
+/// The device M-step, against the same harmonypy literals the CPU arm uses.
+///
+/// §7.4 was present on **both** arms: `harmony/gpu.rs` had its own copy of the
+/// ridge-intercept centroid write, and its sub-loop passed `d_dist` immutably
+/// into a captured graph. Fixing only the CPU would have made
+/// `test_gpu_vs_cpu_per_pc_correlation` the thing that caught it — a parity
+/// test between two SCX arms, which is the evidence shape this phase replaces.
+///
+/// This pins the device kernels directly. The call site is covered by
+/// `test_gpu_vs_cpu_per_pc_correlation`: with the M-step on one arm only, the
+/// two embeddings stop correlating.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn gpu_m_step_matches_harmonypy() {
+    require_gpu_or_skip!();
+    use scx_gpu::{gpu_harmony_l2_normalize_cols, gpu_harmony_update_y, CublasHandle, GpuDevice};
+
+    let dev = GpuDevice::new(0).expect("device");
+    let cublas = CublasHandle::new().expect("cublas");
+    let (d, k, n) = (r::HP_N_PCS, r::HP_N_CLUSTERS, r::HP_N_CELLS);
+
+    // Z_cos column-major (d x N) — harmonypy's own normalization, so the
+    // device arm's *input* is on the reference side too.
+    let z_cos: Vec<f32> = r::HP_FIX_Z_COS
+        .iter()
+        .flat_map(|row| row.iter().map(|&v| v as f32))
+        .collect();
+    let r_fix: Vec<f32> = r::HP_FIX_R
+        .iter()
+        .flat_map(|row| row.iter().map(|&v| v as f32))
+        .collect();
+
+    let d_z_cos = dev.htod_copy(&z_cos).expect("upload Z_cos");
+    let d_r = dev.htod_copy(&r_fix).expect("upload R");
+    let mut d_y = dev.alloc_zeros::<f32>(d * k).expect("alloc Y");
+
+    gpu_harmony_update_y(&dev, &cublas, &d_z_cos, &d_r, &mut d_y, d, k, n).expect("M-step");
+    gpu_harmony_l2_normalize_cols(&dev, &mut d_y, d, k).expect("normalize");
+    dev.synchronize().expect("sync");
+
+    let got: Vec<f64> = dev
+        .dtoh_copy(&d_y)
+        .expect("download Y")
+        .iter()
+        .map(|&v| v as f64)
+        .collect();
+    let want: Vec<f64> = r::HP_MSTEP_Y
+        .iter()
+        .flat_map(|c| c.iter().copied())
+        .collect();
+    let (delta, at) = max_abs(&got, &want);
+    assert!(
+        delta <= r::HP_GPU_MSTEP_Y_ATOL,
+        "GPU M-step centroid {at}: |delta| {delta:.3e} > {:.3e}",
+        r::HP_GPU_MSTEP_Y_ATOL
+    );
+}

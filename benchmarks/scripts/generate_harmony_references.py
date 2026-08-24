@@ -104,6 +104,10 @@ BARS = {
     "HP_OBJ_ATOL": (1e-4, "observed 3.523e-05 on a term of magnitude 407 (8.7e-08 relative)"),
     "HP_OBJ_CROSS_GAP": (277.5595425793, "SCX 3.7439426553 vs harmonypy 281.3034852346"),
     "HP_OBJ_CROSS_GAP_ATOL": (1e-3, "the gap itself is a difference of two f32-derived sums"),
+    # The device arm runs the same product through a cuBLAS sgemm rather than a
+    # rayon reduction, so its rounding differs from the CPU arm's and gets its
+    # own bar. Measured on an H100 by the Phase 7e GPU job.
+    "HP_GPU_MSTEP_Y_ATOL": (1e-6, "cuBLAS sgemm accumulates in f32; the CPU arm accumulates in f64"),
 }
 
 
@@ -272,7 +276,7 @@ def main() -> None:
     print("//! | constant | produced by |")
     print("//! |---|---|")
     print("//! | `HP_Z`, `HP_LABELS` | this generator's RNG — the fixture INPUT |")
-    print("//! | `HP_FIX_*` | harmonypy `Harmony.init_cluster` |")
+    print("//! | `HP_FIX_*` | harmonypy `Harmony.init_cluster` (`HP_FIX_Z_COS` from `__init__`) |")
     print("//! | `HP_MSTEP_Y`, `HP_MSTEP_DIST` | harmonypy `Harmony.cluster` |")
     print("//! | `HP_RIDGE_Z_CORR` | harmonypy `Harmony.moe_correct_ridge` |")
     print("//! | `HP_SOFTMAX_R` | harmonypy `Harmony.update_R` at `theta = 0` |")
@@ -354,6 +358,13 @@ def main() -> None:
     print("pub " + rust_matrix("HP_FIX_O", fix_o, ty="f64"))
     print()
     print("pub " + rust_matrix("HP_FIX_E", fix_e, ty="f64"))
+    print()
+    print("// `Z_cos = Z / ||Z||` per column, harmonypy's own normalization, in")
+    print("// SCX's row-major (N x d) read order. The CPU arms derive this from")
+    print("// `HP_Z` through `compute_inv_norms`; the GPU arm needs it as an")
+    print("// explicit device upload, and taking it from harmonypy keeps that")
+    print("// arm's input on the reference side too.")
+    print("pub " + rust_matrix("HP_FIX_Z_COS", fix_z_cos.T, ty="f64"))
     print()
     print("// --- Arm 1: the M-step, and the distances it invalidates ---------------")
     print(f"// `HP_MSTEP_Y` moves the fixture centroids by max |dY| = {y_shift:.3e},")

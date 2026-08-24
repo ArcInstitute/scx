@@ -110,6 +110,79 @@ pub fn gpu_harmony_distances(
     Ok(())
 }
 
+/// Harmony's M-step on device: `Y = Z_cos · Rᵀ`, un-normalized.
+///
+/// §7.4. The soft k-means sub-loop had no M-step on either arm — `Y` and the
+/// distance matrix were frozen for the whole loop, so the E-step could only
+/// trade `Σ R·dist` against the entropy penalty at fixed centroids. harmonypy
+/// 0.2.0 `Harmony.cluster()` recomputes `Y = Z_cos @ R.T` and normalizes its
+/// columns at the top of every sub-iteration; this is the first half, and
+/// [`gpu_harmony_l2_normalize_cols`] is the second.
+///
+/// Layouts, all as the rest of this module uses them: `z_cos` is column-major
+/// `(d, N)`, `r` is row-major `(K, N)` — the same memory as column-major
+/// `(N, K)` — and `y_out` is column-major `(d, K)`. So the gemm is a plain
+/// `N`/`N` product with `m = d`, `n = K`, `k = N`, and no transpose is needed
+/// on either operand: the "transpose" in `R.T` is already the layout.
+///
+/// Note: cuBLAS sgemm dimensions are `i32`, same caveat as
+/// [`gpu_harmony_distances_gemm`].
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_harmony_update_y(
+    dev: &GpuDevice,
+    handle: &CublasHandle,
+    z_cos: &CudaSlice<f32>,
+    r: &CudaSlice<f32>,
+    y_out: &mut CudaSlice<f32>,
+    d: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), GpuError> {
+    if z_cos.len() < d * n {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("Z_cos length >= d*N = {}", d * n),
+            got: format!("{}", z_cos.len()),
+        });
+    }
+    if r.len() < k * n {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("R length >= K*N = {}", k * n),
+            got: format!("{}", r.len()),
+        });
+    }
+    if y_out.len() < d * k {
+        return Err(GpuError::ShapeMismatch {
+            expected: format!("Y length >= d*K = {}", d * k),
+            got: format!("{}", y_out.len()),
+        });
+    }
+    if k == 0 || n == 0 || d == 0 {
+        return Ok(());
+    }
+    if (n as u64) > (i32::MAX as u64) || (k as u64) > (i32::MAX as u64) {
+        return Err(GpuError::ShapeMismatch {
+            expected: "K, N each fit in i32 for cuBLAS sgemm".into(),
+            got: format!("K={k}, N={n}"),
+        });
+    }
+
+    let stream: &Arc<CudaStream> = dev.stream();
+    gpu_sgemm(
+        handle,
+        stream,
+        z_cos,
+        r,
+        y_out,
+        d,
+        k,
+        n,
+        1.0,
+        0.0,
+        cbs::cublasOperation_t::CUBLAS_OP_N,
+        cbs::cublasOperation_t::CUBLAS_OP_N,
+    )
+}
+
 /// GEMM-backed variant of `gpu_harmony_distances`.
 ///
 /// Computes `D = -2 · Z_cos^T · Y` via cuBLAS sgemm and adds the
