@@ -148,6 +148,10 @@ fn mid_ranks(values: &[f64]) -> Vec<f64> {
 }
 
 fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    // Not decoration: `zip` below truncates to the shorter slice while `n` came
+    // from `a` alone, so an unequal pair would divide a short sum by a long
+    // count and still return a plausible correlation.
+    assert_eq!(a.len(), b.len(), "pearson over unequal-length slices");
     let n = a.len() as f64;
     let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
     let mut num = 0.0;
@@ -181,6 +185,32 @@ fn padj_or_one(p: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Every per-gene vector the assertions below zip against the reference tables
+/// must be exactly `NB_N_GENES` long.
+///
+/// `zip` truncates silently, and the truncated comparison stays *plausible*: drop
+/// the last `p_adj` from this fixture and the significant set is unchanged (g23
+/// is not significant) while the Spearman rank correlation comes out at 0.99125
+/// — above the 0.99 bar. So a result that returned fewer genes than it was asked
+/// for would pass three of the four semantic tests. Checked once, here, rather
+/// than at each `zip`.
+fn assert_full_length(got: &crate::nb_glm::NbGlmResult) {
+    assert_eq!(got.n_genes, NB_N_GENES, "n_genes");
+    assert_eq!(got.n_samples, NB_N_SAMPLES, "n_samples");
+    for (name, len) in [
+        ("log2_fold_change", got.log2_fold_change.len()),
+        ("p_adj", got.p_adj.len()),
+        ("p_value", got.p_value.len()),
+        ("dispersion", got.dispersion.len()),
+    ] {
+        assert_eq!(
+            len, NB_N_GENES,
+            "{name} has {len} entries, expected {NB_N_GENES} — a zipped comparison \
+             against the reference tables would silently cover only the prefix"
+        );
+    }
+}
+
 fn fit() -> crate::nb_glm::NbGlmResult {
     let counts: Vec<f64> = NB_COUNTS_GENE_MAJOR
         .iter()
@@ -200,6 +230,13 @@ fn fit() -> crate::nb_glm::NbGlmResult {
         NbGlmOptions::default(),
     )
     .expect("nb_glm on the pydeseq2 reference fixture")
+}
+
+/// [`fit`] plus the shape precondition every zipped assertion depends on.
+fn fit_checked() -> crate::nb_glm::NbGlmResult {
+    let got = fit();
+    assert_full_length(&got);
+    got
 }
 
 fn significant(padj: &[f64]) -> Vec<usize> {
@@ -243,7 +280,7 @@ fn the_fixture_has_genes_on_both_sides_of_significance_and_of_zero() {
 /// different answer, not a rounding difference.
 #[test]
 fn nb_glm_calls_the_same_genes_significant_as_pydeseq2() {
-    let got = fit();
+    let got = fit_checked();
     let ours = significant(&got.p_adj);
     let theirs = significant(&NB_PYDESEQ2_PADJ);
     assert_eq!(
@@ -260,7 +297,7 @@ fn nb_glm_calls_the_same_genes_significant_as_pydeseq2() {
 /// its own p-value.
 #[test]
 fn nb_glm_agrees_with_pydeseq2_on_every_effect_sign() {
-    let got = fit();
+    let got = fit_checked();
     for (gene, (&ours, &theirs)) in got
         .log2_fold_change
         .iter()
@@ -284,7 +321,7 @@ fn nb_glm_agrees_with_pydeseq2_on_every_effect_sign() {
 /// and asserting it would fail today for a reason the docs already allow.
 #[test]
 fn nb_glm_ranks_genes_the_way_pydeseq2_does() {
-    let got = fit();
+    let got = fit_checked();
 
     let rho_lfc = spearman(&got.log2_fold_change, &NB_PYDESEQ2_LOG2FC);
     assert!(
@@ -312,7 +349,7 @@ fn nb_glm_ranks_genes_the_way_pydeseq2_does() {
 /// significance, and would pass all of them.
 #[test]
 fn nb_glm_effects_have_not_drifted_grossly_from_pydeseq2() {
-    let got = fit();
+    let got = fit_checked();
     let worst = got
         .log2_fold_change
         .iter()

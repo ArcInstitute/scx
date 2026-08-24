@@ -25,7 +25,11 @@
 #SBATCH --output=/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/logs/phase7-gate-%j.out
 
 set -euo pipefail
-REPO=/home/nickyoungblut/dev/rust/scx
+# Derived, with the submitting path as the fallback: sbatch runs this from an
+# arbitrary cwd, and `--output` above cannot take a variable. Keep the two in
+# sync if the checkout ever moves.
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) \
+  || REPO=/home/nickyoungblut/dev/rust/scx
 cd "$REPO"
 
 # sbatch exports the submitting shell's environment, and this repo's `.venv`
@@ -64,9 +68,17 @@ ad = anndata.AnnData(X=sp.csr_matrix(X))
 try:
     pyscx.accel.highly_variable_genes(ad, n_top_genes=200, flavor="seurat_v3", device="gpu")
     route = ad.uns.get("scx_accel", {}).get("highly_variable_genes", {}).get("route")
-    print(f"preflight: GPU HVG route={route}")
-    if route and "gpu" not in str(route) and "rapids" not in str(route):
-        fail.append(f"GPU HVG silently fell back to {route}")
+    print(f"preflight: GPU HVG route={route!r}")
+    # A MISSING route is a failure, not a pass. `if route and ...` treated None
+    # and "" as "nothing to complain about", which is the one outcome this check
+    # exists to catch: a stale build or a broken route stamp would have sailed
+    # through the probe whose whole purpose is to stop hours of CPU-fallback
+    # numbers being reported as GPU results.
+    if not route:
+        fail.append("GPU HVG stamped no route at all (stale build or broken "
+                    "route metadata) -- cannot confirm the op ran on the device")
+    elif "gpu" not in str(route) and "rapids" not in str(route):
+        fail.append(f"GPU HVG silently fell back to {route!r}")
 except Exception as e:                                    # noqa: BLE001
     fail.append(f"GPU HVG raised: {e!r}")
 

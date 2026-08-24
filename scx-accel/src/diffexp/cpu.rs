@@ -571,34 +571,26 @@ fn wilcoxon_test(group: &[f64], rest: &[f64]) -> (f64, f64) {
     // Sort by value (stable sort to handle ties consistently).
     combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Assign mid-ranks and compute rank sum for group, track tie info.
-    let total = combined.len();
+    // Assign mid-ranks and accumulate the group's rank sum, through the SAME
+    // walk the two production kernels use (ORG-7.21-3). This was a third,
+    // independent copy, spelled `tie_size * tie_size * tie_size - tie_size` --
+    // which the CI guard's `t * t * t - t` grep could not see. Test-only today,
+    // but it is exactly the spelling a later production clone would use to walk
+    // around the guard, so the guard now keys on the shape and this body no
+    // longer has one.
     let mut rank_sum_group: f64 = 0.0;
-    let mut tie_correction: f64 = 0.0;
-    let mut i = 0;
-
-    while i < total {
-        // Find extent of this tie group.
-        let mut j = i + 1;
-        while j < total && combined[j].0 == combined[i].0 {
-            j += 1;
-        }
-        let tie_size = (j - i) as f64;
-        // Mid-rank: average of ranks (1-indexed).
-        let mid_rank = (i as f64 + 1.0 + j as f64) / 2.0;
-
-        // Add to group rank sum, compute tie correction.
-        for item in combined.iter().take(j).skip(i) {
-            if item.1 == 0 {
-                rank_sum_group += mid_rank;
+    let tie_correction = for_each_tie_run(
+        combined.len(),
+        0,
+        |i, j| combined[j].0 == combined[i].0,
+        |mid_rank, run| {
+            for item in &combined[run] {
+                if item.1 == 0 {
+                    rank_sum_group += mid_rank;
+                }
             }
-        }
-        if tie_size > 1.0 {
-            tie_correction += tie_size * tie_size * tie_size - tie_size;
-        }
-
-        i = j;
-    }
+        },
+    );
 
     // U-statistic for group.
     let u1 = rank_sum_group - n1 * (n1 + 1.0) / 2.0;

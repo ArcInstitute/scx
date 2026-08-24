@@ -119,21 +119,52 @@ fn assert_matches_reference(
     }
 }
 
-/// The dense CSR kernel against **scipy**, `tie_correct = true`, at `abs = 0`.
+/// The dense CSR kernel with `tie_correct = true`, against **two independent
+/// references**: scipy's own p-value and scanpy's tie-corrected scores.
 ///
-/// Exact rather than approximate because both sides are f64 throughout: the
-/// fixture's values are all exactly representable in f32, so the kernel's
-/// `f32 → f64` promotion is lossless.
+/// Neither is derived here. The first version of this test asserted `z` at
+/// `abs = 0` against a `z` this repo's own generator had *rebuilt* from scipy's
+/// `U` using the same variance formula as
+/// [`wilcoxon_stats_from_rank_sum`](crate::diffexp::cpu::wilcoxon_stats_from_rank_sum)
+/// — so a bug in the `Σ(t³−t)` term would have matched, and the uncorrected arm
+/// could not have caught it because it runs with `tc = 0`. The constants did not
+/// change when that was fixed (`max |Δp| = 0.0` against
+/// `mannwhitneyu(...).pvalue`); their provenance did.
 #[test]
-fn dense_wilcoxon_matches_scipy_exactly_with_tie_correction() {
+fn dense_wilcoxon_matches_the_tie_corrected_references() {
     assert_matches_reference(
-        "scipy",
+        "scanpy(tie_correct=True) z / scipy p",
         &dense_result(true),
-        &r::SCIPY_Z_TIE_CORRECTED,
+        &r::SCANPY_Z_TIE_CORRECTED,
         &r::SCIPY_P_TIE_CORRECTED,
-        0.0,
-        1e-15,
+        r::Z_ATOL,
+        r::P_CORRECTED_ATOL,
     );
+}
+
+/// scipy and scanpy agree on the tie-corrected p-value at **exactly 0.0**.
+///
+/// The premise that makes either of them an oracle. Two libraries implementing
+/// `Σ(t³−t)/(n(n−1))` independently and landing on the same double is evidence
+/// about the *formula*; SCX matching one of them is then evidence about SCX. Drop
+/// this and the corrected arm rests on a single external implementation again,
+/// which is one better than resting on SCX's own but not two.
+#[test]
+fn the_two_libraries_agree_on_the_tie_corrected_p_value() {
+    for (gene, (sp, sc)) in r::SCIPY_P_TIE_CORRECTED
+        .iter()
+        .zip(r::SCANPY_P_TIE_CORRECTED.iter())
+        .enumerate()
+    {
+        for (grp, (&a, &b)) in sp.iter().zip(sc.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "gene g{gene} group {grp}: scipy p {a} vs scanpy(tie_correct=True) p {b} — \
+                 the two references for the corrected convention have diverged, so neither \
+                 is confirming the other's tie term any more"
+            );
+        }
+    }
 }
 
 /// The dense CSR kernel against **scanpy**, `tie_correct = false` — the default.
@@ -147,34 +178,39 @@ fn dense_wilcoxon_matches_scipy_exactly_with_tie_correction() {
 #[test]
 fn dense_wilcoxon_matches_scanpy_without_tie_correction() {
     assert_matches_reference(
-        "scanpy",
+        "scanpy(tie_correct=False)",
         &dense_result(false),
         &r::SCANPY_Z_UNCORRECTED,
         &r::SCANPY_P_UNCORRECTED,
-        r::Z_UNCORRECTED_ATOL,
+        r::Z_ATOL,
         r::P_UNCORRECTED_ATOL,
     );
 }
 
 /// The two conventions are not each other's tolerance.
 ///
-/// This is the premise the two tests above rest on. Without it, someone could
-/// widen `Z_UNCORRECTED_ATOL` to `0.1`, point both arms at one table, and every
+/// The premise the two tests above rest on. Without it, someone could widen
+/// [`Z_ATOL`](r::Z_ATOL) to `0.1`, point both arms at one table, and every
 /// assertion would still pass while the `tie_correct` flag had stopped meaning
 /// anything.
+///
+/// Both sides of this comparison come from **scanpy**, which takes a
+/// `tie_correct` parameter (default `False`). So this measures a difference in
+/// *convention*, not one between libraries — which is the honest framing: scanpy
+/// can produce either answer, and SCX's default matches scanpy's default.
 #[test]
 fn the_two_tie_conventions_are_genuinely_different_answers() {
-    let worst = r::SCIPY_Z_TIE_CORRECTED
+    let worst = r::SCANPY_Z_TIE_CORRECTED
         .iter()
         .zip(r::SCANPY_Z_UNCORRECTED.iter())
         .flat_map(|(a, b)| a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()))
         .fold(0.0f64, f64::max);
     assert!(
-        worst > 1e3 * r::Z_UNCORRECTED_ATOL,
+        worst > 1e3 * r::Z_ATOL,
         "the corrected and uncorrected references differ by only {worst:.3e}, which is \
-         within {:.0e} of the uncorrected tolerance — the fixture has stopped \
-         distinguishing the two conventions and both arms would pass against either table",
-        r::Z_UNCORRECTED_ATOL
+         within {:.0e} of the z tolerance — the fixture has stopped distinguishing the \
+         two conventions and both arms would pass against either table",
+        r::Z_ATOL
     );
 }
 
@@ -208,21 +244,20 @@ fn nnz_wilcoxon_matches_the_same_reference_values() {
             .expect("nnz wilcoxon on the reference fixture");
 
             for (grp, &(z, p, _logfc)) in stats.iter().enumerate() {
-                let (want_z, want_p, atol_z, atol_p) = if tie_correct {
+                let (want_z, want_p, atol_p) = if tie_correct {
                     (
-                        r::SCIPY_Z_TIE_CORRECTED[gene][grp],
+                        r::SCANPY_Z_TIE_CORRECTED[gene][grp],
                         r::SCIPY_P_TIE_CORRECTED[gene][grp],
-                        0.0,
-                        1e-15,
+                        r::P_CORRECTED_ATOL,
                     )
                 } else {
                     (
                         r::SCANPY_Z_UNCORRECTED[gene][grp],
                         r::SCANPY_P_UNCORRECTED[gene][grp],
-                        r::Z_UNCORRECTED_ATOL,
                         r::P_UNCORRECTED_ATOL,
                     )
                 };
+                let atol_z = r::Z_ATOL;
                 assert!(
                     (z - want_z).abs() <= atol_z,
                     "nnz gene g{gene} group {grp} tie_correct={tie_correct}: z {z} vs {want_z}"

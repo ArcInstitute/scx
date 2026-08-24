@@ -1610,27 +1610,25 @@ fn test_wilcoxon_gpu_matches_the_external_reference_values() {
                     .unwrap_or_else(|| panic!("gene {want_name} missing from group {grp}"));
                 let (z, p) = (result.scores[grp][col], result.pvals[grp][col]);
 
-                let (want_z, want_p, atol_z, atol_p) = if tie_correct {
+                let (want_z, want_p) = if tie_correct {
                     (
-                        r::SCIPY_Z_TIE_CORRECTED[gene][grp],
+                        r::SCANPY_Z_TIE_CORRECTED[gene][grp],
                         r::SCIPY_P_TIE_CORRECTED[gene][grp],
-                        // Not abs=0 like the host arms: the CUDA kernel
-                        // accumulates rank sums in a different order, so this
-                        // is an f64-reduction-order bound, not a convention
-                        // difference. It is still four orders tighter than the
-                        // gap between the two tie conventions (7.6e-02), so it
-                        // cannot launder one into the other.
-                        1e-9,
-                        1e-12,
                     )
                 } else {
                     (
                         r::SCANPY_Z_UNCORRECTED[gene][grp],
                         r::SCANPY_P_UNCORRECTED[gene][grp],
-                        r::Z_UNCORRECTED_ATOL,
-                        r::P_UNCORRECTED_ATOL,
                     )
                 };
+                // The z bar is the same f32-wide scanpy bound the host arms use,
+                // which already dominates any CUDA reduction-order difference.
+                // The p bar is deliberately looser than the host's
+                // `P_CORRECTED_ATOL`: the kernel accumulates rank sums in a
+                // different order, so this is a reduction-order bound. It is
+                // still seven orders tighter than the 7.6e-02 gap between the
+                // two tie conventions, so it cannot launder one into the other.
+                let (atol_z, atol_p) = (r::Z_ATOL, 1e-9);
                 assert!(
                     (z - want_z).abs() <= atol_z,
                     "gpu gene {want_name} group {grp} tie_correct={tie_correct}: \

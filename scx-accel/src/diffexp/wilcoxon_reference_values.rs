@@ -7,18 +7,57 @@
 //! ([`crate::diffexp::cpu`]), the analytic sparse-nnz one
 //! (`crate::csc::wilcoxon::gene_stats_nnz`) and a CUDA kernel driven by
 //! [`crate::diffexp::gpu`]. Two of them now share one tie-run walk
-//! ([`for_each_tie_run`](crate::diffexp::cpu::for_each_tie_run)); the third is a
-//! `.cu` file and structurally cannot. So the only agreement all three can have
-//! is *agreement on a number computed by something else* — and until this
-//! module, no such number existed. The nnz path's correctness rested entirely
-//! on a proptest against the dense kernel, which makes a dense-kernel bug
-//! invisible, and the review established that the nnz path had already
-//! re-derived one of the dense path's bugs independently.
+//! ([`crate::diffexp::cpu::for_each_tie_run`]); the third is a `.cu` file and
+//! structurally cannot. So the only agreement all three can have is *agreement
+//! on a number computed by something else* — and until this module, no such
+//! number existed. The nnz path's correctness rested entirely on a proptest
+//! against the dense kernel, which makes a dense-kernel bug invisible, and the
+//! review established that the nnz path had already re-derived one of the dense
+//! path's bugs independently.
 //!
-//! One table, three consumers, all inside this crate — including the GPU arm,
-//! whose test lives in `diffexp/gpu_tests.rs` because `scx-accel` is where the
-//! GPU DE orchestration lives. Nothing in `scx-gpu` reads it, so it needs no
-//! cross-crate home.
+//! # Every value here was PRODUCED by another implementation, not derived here
+//!
+//! | table | source |
+//! |---|---|
+//! | [`SCIPY_P_TIE_CORRECTED`] | `scipy.stats.mannwhitneyu(...).pvalue` |
+//! | [`SCANPY_Z_TIE_CORRECTED`] / [`SCANPY_P_TIE_CORRECTED`] | `scanpy.tl.rank_genes_groups(tie_correct=True)` |
+//! | [`SCANPY_Z_UNCORRECTED`] / [`SCANPY_P_UNCORRECTED`] | the same, `tie_correct=False` |
+//!
+//! **The first version of this module was self-referential and that was the
+//! defect, not the numbers.** It took only `U` from scipy and rebuilt `z` and
+//! `p` with `sigma_sq = (n1·n2/12)·((n+1) − tc/(n(n−1)))` — the same transform
+//! as [`crate::diffexp::cpu::wilcoxon_stats_from_rank_sum`]. The values were
+//! bit-identical either way (measured: `max |Δp| = 0.0` against
+//! `mannwhitneyu(...).pvalue`), so nothing about the constants changed when this
+//! was fixed. What changed is that a bug in the `Σ(t³−t)` term copied into the
+//! generator would previously have matched SCX exactly — and the uncorrected arm
+//! could not have caught it, because that arm runs with `tc = 0`. That is the
+//! "two implementations of one semantics agreeing" failure ORG-7.21-3 exists to
+//! retire, relocated into the oracle. Do not reintroduce a computed reference.
+//!
+//! # Two conventions, and what scanpy actually does
+//!
+//! `scipy.stats.mannwhitneyu(..., method="asymptotic")` **always** applies the
+//! `Σ(t³−t)` tie correction. `scanpy.tl.rank_genes_groups` takes a
+//! `tie_correct` parameter that **defaults to `False`**, and SCX's default
+//! matches scanpy's — so scanpy *can* produce the corrected convention and
+//! simply does not by default. On this fixture the two conventions differ by
+//! **7.647e-02** in `z`, both measured from scanpy: a difference in definition,
+//! not in precision, so each arm needs its own reference.
+//!
+//! [`SCIPY_P_TIE_CORRECTED`] and [`SCANPY_P_TIE_CORRECTED`] agree at
+//! **exactly 0.0** — two independent implementations of the tie term. That
+//! agreement is asserted in `wilcoxon_reference_tests.rs`, because it is what
+//! makes either of them an oracle for SCX rather than a second opinion on the
+//! same arithmetic.
+//!
+//! | field | bar | why |
+//! |---|---|---|
+//! | `z`, either arm | [`Z_ATOL`] = 1e-6 | scanpy stores `scores` as **float32** in its recarray |
+//! | `p`, corrected | [`P_CORRECTED_ATOL`] = 1e-15 | scipy is f64; only `normal_sf` vs `norm.sf` separates them |
+//! | `p`, uncorrected | [`P_UNCORRECTED_ATOL`] = 1e-12 | scanpy's `pvals` are float64 |
+//!
+//! The dtypes were checked against the recarray, not assumed.
 //!
 //! # Regenerating
 //!
@@ -29,20 +68,6 @@
 //! That script owns the fixture *and* the expected values, so they cannot
 //! drift. Do not hand-edit a constant here: if a number needs to change, the
 //! reference changed, and the script is what says so.
-//!
-//! # The two conventions, and why there are two tables
-//!
-//! `scipy.stats.mannwhitneyu(..., method="asymptotic")` **always** applies the
-//! `Σ(t³−t)` tie correction. SCX's `tie_correct` defaults to `false`, matching
-//! scanpy, which applies none. On this fixture the two answers differ by
-//! **7.647e-02** in `z` — a different answer, not rounding. So:
-//!
-//! | arm | oracle | tolerance | why |
-//! |---|---|---|---|
-//! | `tie_correct = true` | scipy 1.17.1 | `abs = 0` on `z` | both f64 end to end |
-//! | `tie_correct = false` | scanpy 1.12 | `1e-6` on `z`, `1e-12` on `p` | scanpy stores `scores` as **float32** and `pvals` as float64 — verified against the recarray dtypes, not assumed |
-//!
-//! Pinning the uncorrected arm against scipy would be wrong rather than loose.
 
 /// Cells in the fixture, including the two unlabelled ones.
 pub const N_OBS: usize = 12;
@@ -53,11 +78,18 @@ pub const N_GROUPS: usize = 2;
 /// Cells that take part in the comparison — `N_OBS` minus the unlabelled ones.
 pub const N_LABELLED: usize = 10;
 
+/// Tolerance for every `z` table: scanpy's f32 storage, one decimal order over
+/// the observed 4.3e-08.
+pub const Z_ATOL: f64 = 1e-6;
+/// Tolerance for [`SCIPY_P_TIE_CORRECTED`] — f64 on both sides.
+pub const P_CORRECTED_ATOL: f64 = 1e-15;
+/// Tolerance for [`SCANPY_P_UNCORRECTED`] — f64 on both sides.
+pub const P_UNCORRECTED_ATOL: f64 = 1e-12;
+
 /// The fixture, row-major `[N_OBS × N_VARS]`.
 ///
 /// Every value is exactly representable in `f32`, so the `f32 → f64` promotion
-/// inside the kernels is lossless and an `f64` reference is comparable at
-/// `abs = 0`.
+/// inside the kernels is lossless.
 ///
 /// Rows 10 and 11 are unlabelled and carry deliberately extreme values: if any
 /// kernel ever let an unlabelled cell into the rank pool or the rest
@@ -91,30 +123,22 @@ pub const FIXTURE_X: [[f32; N_VARS]; N_OBS] = [
 /// Group of each cell. `2` (`== N_GROUPS`) is the unlabelled sentinel.
 pub const FIXTURE_GROUPS: [usize; N_OBS] = [0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 2, 2];
 
-/// scipy `z` per `[gene][group]`, 1-vs-rest, `tie_correct = true`.
+/// scipy's own two-sided p per `[gene][group]`, 1-vs-rest, `tie_correct = true`.
 ///
-/// Computed over the **labelled subset only** — scipy has no notion of a cell
-/// outside the pool, so the reference is `mannwhitneyu(group_values,
-/// rest_values)` on the physically subsetted matrix. A kernel handed the full
-/// `N_OBS` matrix plus the sentinel must reproduce it exactly; that equality
-/// *is* the unlabelled-cell contract, referenced to scipy rather than to a
-/// sibling implementation of the same idea.
+/// `mannwhitneyu(...).pvalue` verbatim — scipy applies its own tie correction
+/// internally, which is what makes this an independent check on SCX's
+/// `Σ(t³−t)/(n(n−1))` term rather than a restatement of it.
+///
+/// Computed over the **labelled subset only**, because scipy has no notion of a
+/// cell outside the pool. A kernel handed the full `N_OBS` matrix plus the
+/// sentinel must reproduce it; that equality *is* the unlabelled-cell contract,
+/// referenced to scipy rather than to a sibling implementation of the same idea.
 ///
 /// `g1`, `g2` and `g5` are fully tied over the labelled pool, so
 /// `σ² = (n₁n₂/12)·((n+1) − Σ(t³−t)/(n(n−1)))` is exactly 0. scipy warns and
 /// yields `nan` there; every SCX kernel returns the documented `(0.0, 1.0)`.
-/// Those three cells pin SCX's contract, not scipy's — the generator says so
-/// at the point it writes them.
-pub const SCIPY_Z_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
-    [-2.6111648393354674, 2.6111648393354674],
-    [0.0, 0.0],
-    [0.0, 0.0],
-    [-1.4849242404917498, 1.4849242404917498],
-    [-1.6431676725154984, 1.6431676725154984],
-    [0.0, 0.0],
-];
-
-/// scipy two-sided `p` per `[gene][group]`, `tie_correct = true`.
+/// Those three cells pin SCX's contract, not scipy's — the generator says so at
+/// the point it writes them.
 pub const SCIPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
     [0.009023438818080326, 0.009023438818080326],
     [1.0, 1.0],
@@ -124,12 +148,41 @@ pub const SCIPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
     [1.0, 1.0],
 ];
 
-/// scanpy `scores` per `[gene][group]`, `tie_correct = false` (the default).
+/// scanpy `scores` per `[gene][group]` with `tie_correct=True`.
 ///
-/// **float32 in scanpy's recarray**, hence [`Z_UNCORRECTED_ATOL`] rather than an
-/// exact match. `g0` shows it: scipy says `-2.6111648393354674`, scanpy says
-/// `-2.6111648082733154`, and `g0` has no ties at all — so the gap is purely
-/// scanpy's storage width, not a difference in convention.
+/// The corrected arm's `z` reference. scipy exposes no z, and reconstructing one
+/// from `U` with SCX's own variance formula is what made the first version of
+/// this module self-referential — so the z oracle is scanpy, which implements
+/// the tie term independently. **float32** in the recarray, hence [`Z_ATOL`].
+pub const SCANPY_Z_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
+    [-2.6111648082733154, 2.6111648082733154],
+    [0.0, 0.0],
+    [0.0, 0.0],
+    [-1.4849241971969604, 1.4849241971969604],
+    [-1.6431676149368286, 1.6431676149368286],
+    [0.0, 0.0],
+];
+
+/// scanpy `pvals` per `[gene][group]` with `tie_correct=True`.
+///
+/// Agrees with [`SCIPY_P_TIE_CORRECTED`] at **exactly 0.0** — two independent
+/// implementations of the tie term. `wilcoxon_reference_tests.rs` asserts that,
+/// because it is what makes either of them an oracle for SCX rather than a
+/// second opinion on the same arithmetic.
+pub const SCANPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
+    [0.009023438818080326, 0.009023438818080326],
+    [1.0, 1.0],
+    [1.0, 1.0],
+    [0.13756389390990328, 0.13756389390990328],
+    [0.10034824646229074, 0.10034824646229074],
+    [1.0, 1.0],
+];
+
+/// scanpy `scores` per `[gene][group]` with `tie_correct=False` — the default.
+///
+/// float32, like the corrected arm. `g0` shows the storage width plainly: it has
+/// no ties at all, so both conventions must agree exactly on it, and the two
+/// scanpy tables do.
 pub const SCANPY_Z_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
     [-2.6111648082733154, 2.6111648082733154],
     [0.0, 0.0],
@@ -139,10 +192,10 @@ pub const SCANPY_Z_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
     [0.0, 0.0],
 ];
 
-/// scanpy `pvals` per `[gene][group]`, `tie_correct = false`.
+/// scanpy `pvals` per `[gene][group]` with `tie_correct=False`.
 ///
-/// float64 in scanpy's recarray — computed from an f64 z, not from the f32
-/// `scores` above — so this one is pinned tightly.
+/// float64 in the recarray — computed from an f64 z, not from the f32 `scores`
+/// above — so this one is pinned tightly.
 pub const SCANPY_P_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
     [0.009023438818080326, 0.009023438818080326],
     [1.0, 1.0],
@@ -151,13 +204,6 @@ pub const SCANPY_P_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
     [0.11718508719813801, 0.11718508719813801],
     [1.0, 1.0],
 ];
-
-/// Tolerance for [`SCANPY_Z_UNCORRECTED`]: scanpy's f32 storage, one decimal
-/// order of headroom over the observed 3.1e-08.
-pub const Z_UNCORRECTED_ATOL: f64 = 1e-6;
-
-/// Tolerance for [`SCANPY_P_UNCORRECTED`] — f64 on both sides.
-pub const P_UNCORRECTED_ATOL: f64 = 1e-12;
 
 /// The fixture flattened row-major, for kernels that take a dense `&[f32]`.
 pub fn dense_x() -> Vec<f32> {

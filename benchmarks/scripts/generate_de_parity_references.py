@@ -24,15 +24,29 @@ matrix and the expected values, so the two cannot drift.
 The one convention that matters
 -------------------------------
 `scipy.stats.mannwhitneyu(..., method="asymptotic")` ALWAYS applies the
-Σ(t³−t) tie correction. SCX's `tie_correct` defaults to **false**, matching
-scanpy, which applies none. So:
+Σ(t³−t) tie correction. SCX's `tie_correct` **defaults to false**, matching
+scanpy's default — `scanpy.tl.rank_genes_groups` takes a `tie_correct`
+parameter whose default is `False`, so scanpy *can* produce the corrected
+convention and simply does not by default. Measured on the fixture below the
+two conventions differ by 7.6e-02 in z, so they are different answers rather
+than different precisions, and each arm needs its own reference.
 
-  * `tie_correct=true`  → pinned against **scipy**, exact.
-  * `tie_correct=false` → pinned against **scanpy**, which is the only
-    external implementation of that convention.
+Every reference here is a value some other implementation PRODUCED, never one
+this script derives:
 
-Measured on the fixture below: the two conventions differ by 8.2e-02 in z.
-Pinning the uncorrected arm against scipy would be wrong, not merely loose.
+  * corrected p   ← `mannwhitneyu(...).pvalue`         (scipy's own p-value)
+  * corrected z   ← `scanpy(tie_correct=True).scores`  (f32 in the recarray)
+  * uncorrected z ← `scanpy(tie_correct=False).scores` (f32)
+  * uncorrected p ← `scanpy(tie_correct=False).pvals`  (f64)
+
+An earlier version of this script took only `U` from scipy and rebuilt z and p
+with `sigma_sq = (n1·n2/12)·((n+1) − tc/(n(n−1)))` — the same transform as
+`wilcoxon_stats_from_rank_sum`. The numbers were identical (verified: max
+|Δp| = 0.0), but the *provenance* was not: a bug in the tie term copied into
+this script would have matched SCX exactly, and the uncorrected arm could not
+have caught it because it runs with `tc = 0`. That is precisely the "sibling
+implementations agreeing" failure ORG-7.21-3 exists to retire, relocated into
+the oracle generator. Do not reintroduce a computed reference here.
 """
 
 from __future__ import annotations
@@ -87,50 +101,42 @@ N_OBS, N_VARS = X.shape
 LABELLED = [i for i, g in enumerate(GROUPS) if g < N_GROUPS]
 
 
-def scipy_reference(tie_correct: bool) -> tuple[np.ndarray, np.ndarray]:
-    """Per-(gene, group) 1-vs-rest `(z, p)` from scipy, over LABELLED cells only.
+def scipy_reference() -> np.ndarray:
+    """Per-(gene, group) 1-vs-rest two-sided p from **scipy's own p-value**.
 
-    scipy is asked for `U` (which carries no tie-correction choice) and the
-    z-score is formed from it with the tie term this arm wants, so the
-    `tie_correct=False` arm is not silently scipy's corrected answer.
+    Over LABELLED cells only: scipy has no notion of a cell outside the
+    comparison pool, so the reference is `mannwhitneyu(group, rest)` on the
+    physically subsetted matrix.
+
+    `res.pvalue` is taken verbatim. scipy applies its own tie correction
+    internally, which is what makes this an independent check on SCX's
+    `Σ(t³−t)/(n(n−1))` term rather than a restatement of it.
     """
-    from scipy.stats import mannwhitneyu, norm
+    from scipy.stats import mannwhitneyu
 
-    z = np.zeros((N_VARS, N_GROUPS))
     p = np.zeros((N_VARS, N_GROUPS))
     d = X[LABELLED].astype(np.float64)
     g = np.asarray([GROUPS[i] for i in LABELLED])
-    n = len(LABELLED)
     for j in range(N_VARS):
         col = d[:, j]
-        _, counts = np.unique(col, return_counts=True)
-        tc = float(np.sum(counts**3 - counts)) if tie_correct else 0.0
         for grp in range(N_GROUPS):
-            mask = g == grp
-            n1, n2 = int(mask.sum()), int((~mask).sum())
             if col.min() == col.max():
-                # Fully tied column: sigma^2 collapses to exactly 0 and every
-                # kernel here returns the documented (0.0, 1.0) rather than a
-                # 0/0. scipy warns and yields nan, so it is no oracle at all
-                # for this cell -- the pin is SCX's documented contract.
-                z[j, grp], p[j, grp] = 0.0, 1.0
+                # Fully tied column: sigma^2 collapses to exactly 0. Every SCX
+                # kernel returns the documented (0.0, 1.0); scipy warns and
+                # yields nan, so it is no oracle at all for this cell. The pin
+                # is SCX's documented contract, and this branch says so.
+                p[j, grp] = 1.0
                 continue
-            u1, _ = mannwhitneyu(
-                col[mask], col[~mask],
+            res = mannwhitneyu(
+                col[g == grp], col[g != grp],
                 use_continuity=False, alternative="two-sided", method="asymptotic",
             )
-            sigma_sq = (n1 * n2 / 12.0) * ((n + 1) - tc / (n * (n - 1)))
-            if sigma_sq <= 0.0:
-                z[j, grp], p[j, grp] = 0.0, 1.0
-                continue
-            zz = (u1 - n1 * n2 / 2.0) / np.sqrt(sigma_sq)
-            z[j, grp] = zz
-            p[j, grp] = 2.0 * norm.sf(abs(zz))
-    return z, p
+            p[j, grp] = res.pvalue
+    return p
 
 
-def scanpy_reference() -> tuple[np.ndarray, np.ndarray]:
-    """scanpy `rank_genes_groups(method="wilcoxon")` — the uncorrected arm.
+def scanpy_reference(tie_correct: bool) -> tuple[np.ndarray, np.ndarray]:
+    """scanpy `rank_genes_groups(method="wilcoxon")`, either convention.
 
     Run on the LABELLED subset, because scanpy has no notion of a cell outside
     the comparison pool: its "rest" is every other row. Feeding it the full
@@ -149,7 +155,7 @@ def scanpy_reference() -> tuple[np.ndarray, np.ndarray]:
                          index=[f"c{i}" for i in LABELLED]),
         var=pd.DataFrame(index=[f"g{j}" for j in range(N_VARS)]),
     )
-    sc.tl.rank_genes_groups(ad, "g", method="wilcoxon", tie_correct=False)
+    sc.tl.rank_genes_groups(ad, "g", method="wilcoxon", tie_correct=tie_correct)
     rgg = ad.uns["rank_genes_groups"]
     z = np.zeros((N_VARS, N_GROUPS))
     p = np.zeros((N_VARS, N_GROUPS))
@@ -184,7 +190,16 @@ def f64_literal(v: float) -> str:
     precision the type cannot hold. Shortest-round-trip is also the honest
     form — every digit printed is a digit the value has.
     """
-    s = repr(float(v))
+    v = float(v)
+    if v != v or v in (float("inf"), float("-inf")):
+        # `repr` gives 'nan' / 'inf', and the decimal-point fallback below would
+        # then emit `nan.0`, which is not Rust. A non-finite reference value is
+        # a broken fixture, not something to format around.
+        raise ValueError(
+            f"refusing to emit a non-finite reference value ({v!r}); fix the "
+            f"fixture rather than the formatter"
+        )
+    s = repr(v)
     return s if ("." in s or "e" in s or "E" in s) else s + ".0"
 
 
@@ -247,6 +262,99 @@ def pydeseq2_reference() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray
     )
 
 
+def measure_python_side_bars() -> None:
+    """Print the Python-side max |Δ| figures `docs/scanpy.md` quotes.
+
+    The Rust tables above are the reference *values*; these are the *bars* the
+    pytest suite compares at. They lived only in a session transcript until
+    review pointed out that the page says "regenerate with this script" beside
+    numbers the script did not produce — so a reader following the instruction
+    got the tables and silently not the bars.
+
+    Emitted as a comment block rather than as Rust, because these bars live in
+    `pyscx/tests/test_accel.py` as module-level constants.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    try:
+        import anndata
+        import pandas as pd
+        import scanpy as sc
+        import scipy.sparse as sp
+
+        import pyscx  # noqa: F401
+    except ImportError as e:  # pragma: no cover - optional in a stock env
+        print(f"// python-side bars NOT measured: {e}")
+        return
+
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(2.0, size=(120, 50)).astype(np.float32)
+    counts[:40, :10] += rng.poisson(6.0, size=(40, 10))
+    obs = pd.DataFrame(
+        {"batch": pd.Categorical(["A"] * 40 + ["B"] * 40 + ["C"] * 40)},
+        index=[f"c{i}" for i in range(120)],
+    )
+    var = pd.DataFrame(index=[f"g{j}" for j in range(50)])
+
+    def measure(log1p: bool) -> dict[str, float]:
+        ad = anndata.AnnData(X=sp.csr_matrix(counts.copy()), obs=obs.copy(), var=var.copy())
+        if log1p:
+            sc.pp.normalize_total(ad, target_sum=1e4)
+            sc.pp.log1p(ad)
+        a, b = ad.copy(), ad.copy()
+        sc.tl.rank_genes_groups(a, "batch", method="wilcoxon")
+        pyscx.accel.rank_genes_groups(b, "batch", device="cpu")
+        ra, rb = a.uns["rank_genes_groups"], b.uns["rank_genes_groups"]
+        worst: dict[str, float] = {}
+        for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
+            w = 0.0
+            for grp in rb["names"].dtype.names:
+                ma = dict(zip(ra["names"][grp], np.asarray(ra[field][grp], np.float64)))
+                mb = dict(zip(rb["names"][grp], np.asarray(rb[field][grp], np.float64)))
+                for gene in mb:
+                    x, y = ma[gene], mb[gene]
+                    if np.isfinite(x) and np.isfinite(y):
+                        w = max(w, abs(x - y))
+            worst[field] = w
+        return worst
+
+    raw, logged = measure(log1p=False), measure(log1p=True)
+    print("// Python-side bars (pyscx/tests/test_accel.py), max |delta| vs scanpy:")
+    for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
+        note = ""
+        if field == "logfoldchanges":
+            note = "  <- raw-count value is a DEFINITION difference, not a bar"
+        print(f"//   {field:16s} raw={raw[field]:.4e}  log1p={logged[field]:.4e}{note}")
+    print("// scanpy expm1s the group means unconditionally, so the raw-count")
+    print("// logfoldchanges figure is pinned as a divergence, not as parity.")
+
+    # And CHECK them, rather than only printing. Emitting a number a reader is
+    # expected to eyeball against a doc table is how the bars drifted out of the
+    # script in the first place. These are the constants in
+    # pyscx/tests/test_accel.py; the figures above are this script's own fixture,
+    # which is NOT the pytest fixture, so they differ -- what has to hold on both
+    # is that every measurement stays under the shared bar.
+    bars = {"scores": 1e-6, "pvals": 1e-12, "pvals_adj": 1e-12}
+    over = [
+        f"{field} {which}={vals[field]:.4e} exceeds its bar {bar:.0e}"
+        for field, bar in bars.items()
+        for which, vals in (("raw", raw), ("log1p", logged))
+        if vals[field] > bar
+    ]
+    if logged["logfoldchanges"] > 1e-6:
+        over.append(
+            f"logfoldchanges log1p={logged['logfoldchanges']:.4e} exceeds its bar 1e-06"
+        )
+    if over:
+        raise SystemExit(
+            "// the measured divergence has outgrown the pinned bar(s):\n  "
+            + "\n  ".join(over)
+            + "\n// re-measure and widen deliberately, or find what regressed."
+        )
+    print("// every measurement above is inside the bar it justifies.")
+
+
 def emit_nb_glm() -> None:
     import importlib.metadata as md
 
@@ -292,8 +400,9 @@ def main() -> int:
     # reference reads.
     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-    z_tc, p_tc = scipy_reference(tie_correct=True)
-    z_no, p_no = scanpy_reference()
+    p_scipy_tc = scipy_reference()
+    z_scanpy_tc, p_scanpy_tc = scanpy_reference(tie_correct=True)
+    z_scanpy_un, p_scanpy_un = scanpy_reference(tie_correct=False)
 
     versions = ", ".join(
         f"{d} {md.version(d)}" for d in ("scipy", "scanpy", "numpy")
@@ -303,24 +412,35 @@ def main() -> int:
     print()
     print(rust_matrix("FIXTURE_X", X.astype(np.float64), ty="f32"))
     print()
-    print(f"const FIXTURE_GROUPS: [usize; {N_OBS}] = {GROUPS};".replace("[", "[").replace("'", ""))
+    print(f"const FIXTURE_GROUPS: [usize; {N_OBS}] = {GROUPS};")
     print()
-    print(rust_matrix("SCIPY_Z_TIE_CORRECTED", z_tc))
+    print(rust_matrix("SCIPY_P_TIE_CORRECTED", p_scipy_tc))
     print()
-    print(rust_matrix("SCIPY_P_TIE_CORRECTED", p_tc))
+    print(rust_matrix("SCANPY_Z_TIE_CORRECTED", z_scanpy_tc))
     print()
-    print(rust_matrix("SCANPY_Z_UNCORRECTED", z_no))
+    print(rust_matrix("SCANPY_P_TIE_CORRECTED", p_scanpy_tc))
     print()
-    print(rust_matrix("SCANPY_P_UNCORRECTED", p_no))
+    print(rust_matrix("SCANPY_Z_UNCORRECTED", z_scanpy_un))
     print()
-    gap = float(np.max(np.abs(z_tc - z_no)))
-    print(f"// max |z_corrected - z_uncorrected| on this fixture = {gap:.3e}")
-    print("// -- the two conventions are genuinely different answers, not")
-    print("//    rounding: pinning the uncorrected arm against scipy is wrong.")
+    print(rust_matrix("SCANPY_P_UNCORRECTED", p_scanpy_un))
+    print()
+    gap = float(np.max(np.abs(z_scanpy_tc - z_scanpy_un)))
+    print(f"// max |z_corrected - z_uncorrected| on this fixture = {gap:.3e},")
+    print("// both from scanpy, so this is a convention difference and not a")
+    print("// cross-library one. Pinning either arm against the other's oracle")
+    print("// would be wrong rather than merely loose.")
+    print()
+    cross = float(np.max(np.abs(p_scipy_tc - p_scanpy_tc)))
+    print(f"// scipy's corrected p vs scanpy's corrected p = {cross:.3e} --")
+    print("// two independent implementations of the tie term, agreeing. That")
+    print("// agreement is asserted in wilcoxon_reference_tests.rs, because it")
+    print("// is what makes either of them an oracle for SCX rather than a")
+    print("// second opinion of the same arithmetic.")
     print()
     print("// scanpy stores `scores` as float32 and `pvals` as float64 (verified")
-    print("// against the recarray dtypes, not assumed), so the uncorrected arm")
-    print("// pins z at f32 precision and p tightly. scipy is f64 throughout.")
+    print("// against the recarray dtypes, not assumed), so every z bar is f32-wide")
+    print("// and every p bar is tight. scipy is f64 throughout.")
+    measure_python_side_bars()
     emit_nb_glm()
     return 0
 

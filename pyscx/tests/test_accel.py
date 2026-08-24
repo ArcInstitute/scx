@@ -451,9 +451,14 @@ class TestRankGenesGroups:
         Keyed by gene **name**, never by position. scanpy and SCX order tied
         scores differently, so a positional comparison would pin the sort rather
         than the statistic -- see
-        `test_scanpy_name_order_is_not_a_contract` below, which records that as
-        observed behaviour rather than leaving it as a silent reason this test
-        is loose.
+        gene *order* -- scanpy's tie order comes from `np.argsort`'s default
+        `quicksort`, which is not stable, so a run of equal scores can come out
+        in either arrangement. Order is therefore compared nowhere: not here,
+        and not by a separate test *requiring* the two to disagree. An earlier
+        version of this file had one, and it was the wrong shape -- a stable-sort
+        change upstream would have reddened it without anything being wrong, and
+        agreement on one fixture would not have made positional comparison safe
+        anyway. The reason for keying by name belongs here, next to the keying.
 
         `logfoldchanges` is deliberately absent. This fixture is raw counts, and
         scanpy's logFC `expm1`s the group means unconditionally -- it emits a
@@ -506,45 +511,6 @@ class TestRankGenesGroups:
                         f"group {group} gene {gene} {field}: "
                         f"scanpy={sc_val!r} scx={scx_val!r} (bar {bar:g})"
                     )
-
-    def test_scanpy_name_order_is_not_a_contract(self, synthetic_adata):
-        """The gene *order* within a group differs from scanpy's, by design.
-
-        `test_scores_and_pvals_match_scanpy` above compares by name rather than
-        by position, and this is the reason: the two sort tied scores
-        differently. Recording it as an assertion rather than a comment means
-        that if the orders ever do coincide, someone is told -- and can decide
-        whether positional comparison has become safe -- instead of the
-        name-keyed indirection surviving as unexplained caution.
-
-        Note what is *not* claimed: not that the orders always differ on every
-        input, only that they differ here. Tie order in scanpy comes from
-        `np.argsort`'s default `quicksort`, which is not stable.
-        """
-        try:
-            import scanpy as sc
-        except ImportError:
-            pytest.skip("scanpy not available")
-
-        import pyscx
-
-        adata_sc = synthetic_adata.copy()
-        sc.tl.rank_genes_groups(adata_sc, "batch", method="wilcoxon")
-        adata_scx = synthetic_adata.copy()
-        pyscx.accel.rank_genes_groups(adata_scx, "batch")
-
-        rgg_sc = adata_sc.uns["rank_genes_groups"]
-        rgg_scx = adata_scx.uns["rank_genes_groups"]
-        differs = any(
-            list(rgg_sc["names"][g]) != list(rgg_scx["names"][g])
-            for g in rgg_scx["names"].dtype.names
-        )
-        assert differs, (
-            "scanpy and scx now agree on gene order for every group on this "
-            "fixture. That is not a failure -- but the name-keyed comparison in "
-            "test_scores_and_pvals_match_scanpy exists because they did not, so "
-            "re-check whether a positional comparison is now the stronger test."
-        )
 
     def test_pairwise_reference(self, synthetic_adata):
         """With reference='A', only non-A groups should appear in results."""
@@ -1153,28 +1119,25 @@ class TestStreamingDE:
         ref_rgg = results[5]
         for cs in [25, 50]:
             for group in ref_rgg["names"].dtype.names:
-                # Gene names should be in the same order.
-                ref_names = list(ref_rgg["names"][group])
-                other_names = list(results[cs]["names"][group])
-                assert ref_names == other_names, (
-                    f"chunk_size={cs}: gene order differs for group {group}"
-                )
-
-                # Scores should match.
-                np.testing.assert_allclose(
-                    ref_rgg["scores"][group],
-                    results[cs]["scores"][group],
-                    rtol=1e-10,
-                    err_msg=f"chunk_size={cs}, group={group}: scores differ",
-                )
-
-                # Raw p-values should match.
-                np.testing.assert_allclose(
-                    ref_rgg["pvals"][group],
-                    results[cs]["pvals"][group],
-                    rtol=1e-10,
-                    err_msg=f"chunk_size={cs}, group={group}: pvals differ",
-                )
+                # Every field, exactly. The chunk size decides how many genes a
+                # pass covers; it does not enter the arithmetic for any one gene,
+                # so bit-identity is the honest bar and `rtol=1e-10` on two of
+                # the four fields was strictly weaker than the code. Measured
+                # identical across 5 / 25 / 50 before this was tightened.
+                #
+                # `pvals_adj` matters most here and was the field missing: BH is
+                # the one step that reads *across* genes, so a chunking bug that
+                # left every raw p-value intact could still corrupt it.
+                for field in ("names", "scores", "pvals", "pvals_adj"):
+                    np.testing.assert_array_equal(
+                        ref_rgg[field][group],
+                        results[cs][field][group],
+                        err_msg=(
+                            f"chunk_size={cs}, group={group}: {field} differs "
+                            f"from the chunk_size=5 result. gene_chunk_size is a "
+                            f"memory knob and must not change any output."
+                        ),
+                    )
 
     def test_streaming_pairwise_reference(
         self, synthetic_adata, scx_from_adata
