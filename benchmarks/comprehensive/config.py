@@ -833,6 +833,13 @@ def accel_formats() -> list[FormatVariant]:
     except ImportError:
         pass
     try:
+        from benchmarks.comprehensive.benchmarks.accel_harmony import (
+            accel_harmony_variants,
+        )
+        out.extend(accel_harmony_variants())
+    except ImportError:
+        pass
+    try:
         from benchmarks.comprehensive.benchmarks.accel_preprocess import (
             accel_preproc_variants,
         )
@@ -1227,7 +1234,7 @@ def estimate_memory_gb(
         # scx_auto conversion in prep), so it sits in the same tier — sizing it
         # on the generic `accel_*` estimate (dense_mb × 0.1) under-budgets it.
         peak_mb = max(base_mb, dense_mb * 0.5)
-    elif benchmark in ("accel_umap", "accel_leiden"):
+    elif benchmark in ("accel_umap", "accel_leiden", "accel_harmony"):
         # Embeddings + kNN graph + leiden graph in RAM. Observed <10 GB on
         # 1M cells.
         peak_mb = max(base_mb, dense_mb * 0.2)
@@ -1402,6 +1409,12 @@ def estimate_time_minutes(
         "accel_knn":              60,
         "accel_umap":            120,
         "accel_leiden":           90,
+        # Harmony runs `max_iter` x `max_iter_kmeans` = 60 sub-iterations over
+        # an N x n_comps embedding, three arms, and the harmonypy CPU reference
+        # is by far the slowest (docs/performance.md: R harmony 80.5 min where
+        # scx-accel is minutes). Budgeted alongside accel_leiden rather than at
+        # the 15-min fall-through.
+        "accel_harmony":          90,
         "accel_preprocess":       60,
         "accel_hvg":              45,
         # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark runs all

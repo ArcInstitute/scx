@@ -646,6 +646,33 @@ absolute_floors:
     metric: ari_vs_leidenalg
     min: 0.85
 
+  # --- accel_harmony: mean per-PC Pearson r vs harmonypy ---
+  # Phase 7e, ORG-7.21-4. Harmony had no thresholds entry at all before this.
+  #
+  # This is NOT a numerical-parity floor and cannot be one: SCX seeds k-means++
+  # from `rand_chacha` where harmonypy uses `sklearn.KMeans`, so the two runs
+  # start from different cluster geometry, and the objective cross-entropies
+  # differ by a `log(2)` term (pinned as a divergence in
+  # `scx-accel/src/harmony/harmony_reference_values.rs`, which gates the exact
+  # numerics Rust-side under plain `cargo test`). This is the end-to-end sanity
+  # net at the resolution a stochastic init allows.
+  #
+  # The floor is deliberately set from a MEASURED first run and not from the
+  # `0.989-0.999` figure `docs/performance.md` reports against R harmony: that
+  # number was measured before the Phase 7e M-step landed, on gitignored
+  # fixtures nobody can rerun. Provisional at 0.90 until the first gate run
+  # populates a baseline; tighten it then, and say what it was measured on.
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_cpu
+    dataset: pbmc3k
+    metric: mean_per_pc_r_vs_harmonypy
+    min: 0.90
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_gpu
+    dataset: pbmc3k
+    metric: mean_per_pc_r_vs_harmonypy
+    min: 0.90
+
   # --- accel_preprocess: numerical equivalence to scanpy ---
   # GPU f32 vs CPU f64 intermediate drift on normalize+log1p is ~1e-5
   # on typical counts; 1e-3 provides ~2 orders of magnitude headroom.
@@ -795,6 +822,15 @@ absolute_floors:
     format: accel_leiden__pyscx_gpu
     dataset: pbmc3k
     metric: leiden_route_gpu_correct
+    min: 1.0
+  # Harmony GPU route gate. `device="gpu"` reporting a `cpu_*` route means
+  # device resolution silently fell back — a hard failure, not a slow run.
+  # Phase 7e moved the M-step onto the device arm, so a fallback now also means
+  # the two arms are running different algorithms.
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_gpu
+    dataset: pbmc3k
+    metric: harmony_route_gpu_correct
     min: 1.0
   - benchmark: accel_hvg
     format: accel_hvg__pyscx_gpu

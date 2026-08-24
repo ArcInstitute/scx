@@ -35,11 +35,36 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let out_path = std::path::Path::new(&out_dir);
 
+    // Whether nvcc exists is NOT part of this build script's fingerprint —
+    // cargo reruns it on `.cu` changes, not on a toolchain appearing. So a
+    // target directory that once saw a CPU-only build keeps replaying the stub
+    // branch below, *and its warning*, on a machine that has nvcc. That is not
+    // hypothetical: the Phase 7 gate job burned a GPU allocation on it, built a
+    // wheel from 41-byte PTX files, and died at
+    // `CUDA_ERROR_INVALID_IMAGE: device kernel image is invalid` — a runtime
+    // symptom four steps from its cause.
+    //
+    // `SCX_GPU_REQUIRE_NVCC=1` turns that into a build failure instead. Set it
+    // in any job that intends to *run* GPU kernels; the stub branch stays the
+    // default so a CPU-only `cargo check` still works.
+    println!("cargo:rerun-if-env-changed=SCX_GPU_REQUIRE_NVCC");
+    let require_nvcc = std::env::var("SCX_GPU_REQUIRE_NVCC").is_ok_and(|v| v != "0");
+
     // Check if nvcc is available
     let nvcc_available = std::process::Command::new("nvcc")
         .arg("--version")
         .output()
         .is_ok();
+
+    if !nvcc_available && require_nvcc {
+        panic!(
+            "SCX_GPU_REQUIRE_NVCC is set but `nvcc` is not on PATH, so every \
+             GPU kernel would be an empty PTX stub and fail at load time with \
+             CUDA_ERROR_INVALID_IMAGE. Put the CUDA toolkit on PATH (a conda \
+             env with `cuda-nvcc`, or /usr/local/cuda/bin), or unset \
+             SCX_GPU_REQUIRE_NVCC to accept stubs."
+        );
+    }
 
     if !nvcc_available {
         println!(
