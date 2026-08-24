@@ -35,9 +35,22 @@ set -euo pipefail
 # Derived, with the submitting path as the fallback: sbatch runs this from an
 # arbitrary cwd, and `--output` above cannot take a variable. Keep the two in
 # sync if the checkout ever moves.
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) \
-  || REPO=/home/nickyoungblut/dev/rust/scx
+# `sbatch` copies the batch script into slurmd's spool and runs it from there, so
+# `${BASH_SOURCE[0]}` is something like /var/spool/slurmd/job123/slurm_script.
+# `dirname/../..` is then /var/spool -- which EXISTS, so `cd` succeeds and the
+# `||` fallback never fires. Validate the candidate instead of trusting the exit
+# status, and fail loudly if neither candidate is a checkout.
+REPO_FALLBACK=/home/nickyoungblut/dev/rust/scx
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd || true)
+if [ ! -f "${REPO:-/nonexistent}/pyscx/Cargo.toml" ]; then
+  REPO=$REPO_FALLBACK
+fi
+if [ ! -f "$REPO/pyscx/Cargo.toml" ]; then
+  echo "cannot locate the scx checkout (tried \"$REPO\"); set REPO_FALLBACK" >&2
+  exit 1
+fi
 cd "$REPO"
+echo "=== repo: $REPO"
 
 # sbatch exports the submitting shell's environment, and this repo's `.venv`
 # sets VIRTUAL_ENV. maturin refuses outright when both VIRTUAL_ENV and
