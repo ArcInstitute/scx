@@ -393,6 +393,53 @@ fn ensure_finite_de_input(data: &[f32]) -> Result<()> {
     Ok(())
 }
 
+/// Walk the equal-value runs of a sorted sequence, handing each run its 1-based
+/// mid-rank, and return the Wilcoxon tie correction `Σ(t³ − t)`.
+///
+/// **The one definition of mid-ranking and tie correction in this crate**
+/// (ORG-7.21-3). Both Wilcoxon rank assignments reduce to this walk and differ
+/// only in what they do with a run:
+///
+/// | caller | `equal` | `offset` | `on_run` |
+/// |---|---|---|---|
+/// | [`rank_with_ties`] (dense) | compares through a sort permutation | `0` — the run spans a whole column | writes `ranks[idx]` per element |
+/// | `csc::wilcoxon::assign_block_ranks` (analytic nnz) | compares `(value, group)` pairs | elements ordered before this block | accumulates into `rank_sum[group]` |
+///
+/// They were independent copies until this primitive, and that is how the nnz
+/// path came to re-derive the 1-vs-rest logFC bug on its own.
+///
+/// `equal(i, j)` reports whether sorted positions `i` and `j` hold the same
+/// value. `offset` is the count of elements ordered *before* this sequence, so
+/// the mid-rank of the run at `[i, j)` is `offset + (i + 1 + j) / 2` — computed
+/// as `(2·offset + i + 1 + j) / 2` to keep it a single exact division.
+///
+/// **The GPU arm is deliberately absent.** `scx-gpu`'s ranking lives in a
+/// `.cu` kernel and cannot call this; it is covered by the shared *reference
+/// values* in `wilcoxon_reference_tests.rs` instead, which is the only kind of
+/// agreement a host primitive and a device kernel can have.
+pub(crate) fn for_each_tie_run(
+    len: usize,
+    offset: usize,
+    equal: impl Fn(usize, usize) -> bool,
+    mut on_run: impl FnMut(f64, std::ops::Range<usize>),
+) -> f64 {
+    let mut tie_correction = 0.0f64;
+    let mut i = 0;
+    while i < len {
+        let mut j = i + 1;
+        while j < len && equal(i, j) {
+            j += 1;
+        }
+        on_run((2 * offset + i + 1 + j) as f64 / 2.0, i..j);
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_correction += t * t * t - t;
+        }
+        i = j;
+    }
+    tie_correction
+}
+
 /// Rank values with mid-rank tie handling. Returns `(ranks, tie_correction)`.
 ///
 /// `ranks[i]` is the 1-based mid-rank for `values[i]`.
@@ -416,24 +463,17 @@ fn rank_with_ties(values: &[f64], index_buf: &mut Vec<usize>, ranks: &mut Vec<f6
     index_buf.sort_unstable_by(|&a, &b| values[a].total_cmp(&values[b]));
 
     ranks.resize(n, 0.0);
-    let mut tie_correction = 0.0f64;
-    let mut i = 0;
-    while i < n {
-        let mut j = i + 1;
-        while j < n && values[index_buf[j]] == values[index_buf[i]] {
-            j += 1;
-        }
-        let mid_rank = (i as f64 + 1.0 + j as f64) / 2.0;
-        let tie_size = (j - i) as f64;
-        for idx in &index_buf[i..j] {
-            ranks[*idx] = mid_rank;
-        }
-        if tie_size > 1.0 {
-            tie_correction += tie_size * tie_size * tie_size - tie_size;
-        }
-        i = j;
-    }
-    tie_correction
+    let order: &[usize] = index_buf;
+    for_each_tie_run(
+        n,
+        0,
+        |i, j| values[order[j]] == values[order[i]],
+        |mid_rank, run| {
+            for &idx in &order[run] {
+                ranks[idx] = mid_rank;
+            }
+        },
+    )
 }
 
 /// Compute Wilcoxon rank-sum z-score and p-value from pre-computed ranks.
@@ -531,34 +571,26 @@ fn wilcoxon_test(group: &[f64], rest: &[f64]) -> (f64, f64) {
     // Sort by value (stable sort to handle ties consistently).
     combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Assign mid-ranks and compute rank sum for group, track tie info.
-    let total = combined.len();
+    // Assign mid-ranks and accumulate the group's rank sum, through the SAME
+    // walk the two production kernels use (ORG-7.21-3). This was a third,
+    // independent copy, spelled `tie_size * tie_size * tie_size - tie_size` --
+    // which the CI guard's `t * t * t - t` grep could not see. Test-only today,
+    // but it is exactly the spelling a later production clone would use to walk
+    // around the guard, so the guard now keys on the shape and this body no
+    // longer has one.
     let mut rank_sum_group: f64 = 0.0;
-    let mut tie_correction: f64 = 0.0;
-    let mut i = 0;
-
-    while i < total {
-        // Find extent of this tie group.
-        let mut j = i + 1;
-        while j < total && combined[j].0 == combined[i].0 {
-            j += 1;
-        }
-        let tie_size = (j - i) as f64;
-        // Mid-rank: average of ranks (1-indexed).
-        let mid_rank = (i as f64 + 1.0 + j as f64) / 2.0;
-
-        // Add to group rank sum, compute tie correction.
-        for item in combined.iter().take(j).skip(i) {
-            if item.1 == 0 {
-                rank_sum_group += mid_rank;
+    let tie_correction = for_each_tie_run(
+        combined.len(),
+        0,
+        |i, j| combined[j].0 == combined[i].0,
+        |mid_rank, run| {
+            for item in &combined[run] {
+                if item.1 == 0 {
+                    rank_sum_group += mid_rank;
+                }
             }
-        }
-        if tie_size > 1.0 {
-            tie_correction += tie_size * tie_size * tie_size - tie_size;
-        }
-
-        i = j;
-    }
+        },
+    );
 
     // U-statistic for group.
     let u1 = rank_sum_group - n1 * (n1 + 1.0) / 2.0;

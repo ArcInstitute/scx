@@ -5,6 +5,23 @@ import pytest
 import scipy.sparse as sp
 
 
+# --- scanpy DE parity bars (ORG-7.21-4) --------------------------------------
+#
+# Every number below is the observed max |Δ| against scanpy on the fixture that
+# uses it, rounded up one decimal order — not a value picked because it passed.
+# Regenerate with `benchmarks/scripts/generate_de_parity_references.py`, which
+# prints the same measurement for the Rust-side pins.
+#
+# These replace an `overlap >= 0.80` on the top-20 gene *names* and an
+# `abs(Δlog2FC) < 0.5`. Neither could detect what it was written for: a
+# constant shift in 1-vs-rest logFC leaves the ranking (and so the overlap)
+# untouched, a 1.4x fold-change gap passes `< 0.5`, and nothing compared
+# `scores` or `pvals` at all.
+SCANPY_SCORE_ATOL = 1e-6  # observed 1.4373e-07 (log1p) / 5.8359e-08 (raw)
+SCANPY_PVAL_ATOL = 1e-12  # observed 3.3307e-16 on both fixtures
+SCANPY_LOGFC_ATOL = 1e-6  # observed 2.2619e-07 -- log1p'd input ONLY, see below
+
+
 @pytest.fixture
 def pca_adata(synthetic_adata, scx_from_adata):
     """Write synthetic AnnData to SCX, return (scx_path, original_adata)."""
@@ -423,8 +440,32 @@ class TestRankGenesGroups:
                 adj >= raw - 1e-10
             ), f"adjusted p-values for {group} should be >= raw"
 
-    def test_overlap_with_scanpy(self, synthetic_adata):
-        """Top DE genes should substantially overlap with scanpy's output."""
+    def test_scores_and_pvals_match_scanpy(self, synthetic_adata):
+        """`scores`, `pvals`, `pvals_adj` match scanpy per gene, not "mostly".
+
+        Replaces an `overlap >= 0.80` on the top-20 gene *names*, which could
+        not see the finding it was written for: a 1-vs-rest logFC shifted by a
+        constant leaves the ranking, and therefore the overlap, untouched, and
+        nothing here compared `scores` or `pvals` at all.
+
+        Keyed by gene **name**, never by position, and gene *order* is not
+        compared at all. scanpy's tie order comes from `np.argsort`'s default
+        `quicksort`, which is not stable, so a run of equal scores can come out
+        in either arrangement. Order is therefore compared nowhere: not here,
+        and not by a separate test *requiring* the two to disagree. An earlier
+        version of this file had one, and it was the wrong shape -- a stable-sort
+        change upstream would have reddened it without anything being wrong, and
+        agreement on one fixture would not have made positional comparison safe
+        anyway. The reason for keying by name belongs here, next to the keying.
+
+        `logfoldchanges` is deliberately absent. This fixture is raw counts, and
+        scanpy's logFC `expm1`s the group means unconditionally -- it emits a
+        warning saying so. The two formulas differ by ~6e+01 here, which is a
+        difference in definition, not precision. logFC parity is asserted on
+        log1p'd input by `test_logfc_matches_scanpy_log_transformed`, and the
+        raw-count divergence is pinned by
+        `test_raw_count_logfc_deliberately_diverges_from_scanpy`.
+        """
         try:
             import scanpy as sc
         except ImportError:
@@ -432,26 +473,42 @@ class TestRankGenesGroups:
 
         import pyscx
 
-        n_top = 20
-
-        # scanpy DE
         adata_sc = synthetic_adata.copy()
         sc.tl.rank_genes_groups(adata_sc, "batch", method="wilcoxon")
 
-        # SCX DE
         adata_scx = synthetic_adata.copy()
         pyscx.accel.rank_genes_groups(adata_scx, "batch")
 
         rgg_sc = adata_sc.uns["rank_genes_groups"]
         rgg_scx = adata_scx.uns["rank_genes_groups"]
 
+        assert rgg_sc["names"].dtype.names == rgg_scx["names"].dtype.names
+
+        atol = {
+            "scores": SCANPY_SCORE_ATOL,
+            "pvals": SCANPY_PVAL_ATOL,
+            "pvals_adj": SCANPY_PVAL_ATOL,
+        }
         for group in rgg_scx["names"].dtype.names:
-            sc_top = set(rgg_sc["names"][group][:n_top])
-            scx_top = set(rgg_scx["names"][group][:n_top])
-            overlap = len(sc_top & scx_top) / n_top
-            assert (
-                overlap >= 0.80
-            ), f"overlap for group {group} = {overlap:.2f} (expected >= 0.80)"
+            sc_names = list(rgg_sc["names"][group])
+            scx_names = list(rgg_scx["names"][group])
+            # Every gene on both sides, so a field comparison cannot skip a
+            # gene by failing to find it.
+            assert set(sc_names) == set(scx_names), (
+                f"group {group}: scanpy and scx report different gene sets"
+            )
+
+            for field, bar in atol.items():
+                sc_map = dict(zip(sc_names, np.asarray(rgg_sc[field][group], dtype=np.float64)))
+                scx_map = dict(zip(scx_names, np.asarray(rgg_scx[field][group], dtype=np.float64)))
+                for gene, sc_val in sc_map.items():
+                    scx_val = scx_map[gene]
+                    if np.isnan(sc_val) and np.isnan(scx_val):
+                        continue
+                    assert abs(sc_val - scx_val) <= bar, (
+                        f"group {group} gene {gene} {field}: "
+                        f"scanpy={sc_val!r} scx={scx_val!r} (bar {bar:g})"
+                    )
 
     def test_pairwise_reference(self, synthetic_adata):
         """With reference='A', only non-A groups should appear in results."""
@@ -556,23 +613,86 @@ class TestRankGenesGroups:
         scx_names_a = list(rgg_scx["names"]["A"])
         scx_logfc_a = list(rgg_scx["logfoldchanges"]["A"])
 
-        # Build name → logFC maps
-        sc_map = dict(zip(sc_names_a, sc_logfc_a))
-        scx_map = dict(zip(scx_names_a, scx_logfc_a))
+        # Keyed by name, and EVERY gene must be on both sides. The old version
+        # of this loop skipped any gene missing from the other map
+        # (`if gene in scx_map`), so a result that dropped genes entirely would
+        # have passed by comparing fewer and fewer of them.
+        sc_map = dict(zip(sc_names_a, np.asarray(sc_logfc_a, dtype=np.float64)))
+        scx_map = dict(zip(scx_names_a, np.asarray(scx_logfc_a, dtype=np.float64)))
+        assert set(sc_map) == set(scx_map), (
+            "scanpy and scx report different gene sets for group A"
+        )
 
-        # For every gene that appears in both, logFC should be close
-        for gene in sc_map:
-            if gene in scx_map:
-                sc_val = sc_map[gene]
+        # `< 0.5` before this -- a bar a 1.4x fold-change gap passes. The
+        # observed max |Δ| on this fixture is 2.2619e-07, so SCANPY_LOGFC_ATOL
+        # is six orders tighter and still has headroom.
+        for gene, sc_val in sc_map.items():
+            scx_val = scx_map[gene]
+            if np.isnan(sc_val) and np.isnan(scx_val):
+                continue
+            assert abs(sc_val - scx_val) <= SCANPY_LOGFC_ATOL, (
+                f"logFC mismatch for {gene}: scanpy={sc_val!r}, scx={scx_val!r} "
+                f"(bar {SCANPY_LOGFC_ATOL:g})"
+            )
+
+        # gene_0 is the implanted signal: it must be present, agree, and be
+        # positive for group A. Asserted separately because "all genes agree"
+        # is also true of two implementations that both return zeros.
+        assert "gene_0" in sc_map
+        assert sc_map["gene_0"] > 0.0 and scx_map["gene_0"] > 0.0, (
+            f"gene_0 is upregulated in A by construction, got "
+            f"scanpy={sc_map['gene_0']!r} scx={scx_map['gene_0']!r}"
+        )
+
+    def test_raw_count_logfc_deliberately_diverges_from_scanpy(self, synthetic_adata):
+        """On raw counts SCX's logFC is NOT scanpy's, and that is correct.
+
+        scanpy's `rank_genes_groups` `expm1`s the group means unconditionally --
+        it assumes log1p'd input and emits a warning when the data looks like
+        counts. SCX detects the untransformed case and uses
+        `log2(mean_g + eps) − log2(mean_r + eps)` instead. Two different
+        formulas, so the answers differ by ~6e+01 on this fixture.
+
+        Pinned rather than left implicit, for two reasons. It is the reason
+        `test_scores_and_pvals_match_scanpy` excludes `logfoldchanges` -- an
+        exclusion that would otherwise read as an unexplained gap in coverage
+        and invite someone to "finish" it. And if SCX ever started expm1-ing
+        raw counts too, every other test here would still pass.
+        """
+        try:
+            import scanpy as sc
+        except ImportError:
+            pytest.skip("scanpy not available")
+
+        import pyscx
+
+        adata_sc = synthetic_adata.copy()
+        sc.tl.rank_genes_groups(adata_sc, "batch", method="wilcoxon")
+        adata_scx = synthetic_adata.copy()
+        pyscx.accel.rank_genes_groups(adata_scx, "batch")
+
+        rgg_sc = adata_sc.uns["rank_genes_groups"]
+        rgg_scx = adata_scx.uns["rank_genes_groups"]
+
+        worst = 0.0
+        for group in rgg_scx["names"].dtype.names:
+            sc_map = dict(zip(rgg_sc["names"][group],
+                              np.asarray(rgg_sc["logfoldchanges"][group], dtype=np.float64)))
+            scx_map = dict(zip(rgg_scx["names"][group],
+                               np.asarray(rgg_scx["logfoldchanges"][group], dtype=np.float64)))
+            for gene, sc_val in sc_map.items():
                 scx_val = scx_map[gene]
-                assert abs(sc_val - scx_val) < 0.5, (
-                    f"logFC mismatch for {gene}: scanpy={sc_val:.4f}, scx={scx_val:.4f}"
-                )
+                if np.isfinite(sc_val) and np.isfinite(scx_val):
+                    worst = max(worst, abs(sc_val - scx_val))
 
-        # Gene 0 should have positive and similar logFC
-        assert "gene_0" in sc_map and "gene_0" in scx_map
-        assert abs(sc_map["gene_0"] - scx_map["gene_0"]) < 0.5, (
-            f"gene_0 logFC: scanpy={sc_map['gene_0']:.4f}, scx={scx_map['gene_0']:.4f}"
+        # Far beyond any precision story: this is a formula difference. The
+        # bound is deliberately loose in the *lower* direction only -- it
+        # asserts the divergence is real, not that it has a particular size.
+        assert worst > 1.0, (
+            f"SCX's raw-count logFC now agrees with scanpy's expm1'd one to "
+            f"{worst:.3e}. Either SCX started expm1-ing untransformed counts "
+            f"(a regression -- scanpy itself warns against it) or the fixture "
+            f"stopped looking like counts."
         )
 
     def test_backed_pipeline(self, pca_adata):
@@ -948,14 +1068,26 @@ class TestStreamingDE:
         # Same group structure.
         assert rgg_mem["names"].dtype.names == rgg_stream["names"].dtype.names
 
-        # For each group, top 20 genes should overlap substantially.
+        # In-memory and streaming are the SAME kernel over the same values, so
+        # this is not a parity claim with a tolerance -- it is an identity.
+        # Measured bit-identical on every field including gene order, so
+        # asserted that way (ORG-7.21-4). It was `overlap >= 0.80` on the top-20
+        # gene names, which is 20 % of one field of four: a streaming path that
+        # returned the wrong score for every gene while preserving their ranking
+        # would have passed, and the sibling test below
+        # (`test_streaming_chunk_sizes_consistent`) already held streaming to
+        # exact name order across chunk sizes -- so the weaker bar here was
+        # weaker than its own neighbour, not weaker than what the code does.
         for group in rgg_mem["names"].dtype.names:
-            mem_top = set(rgg_mem["names"][group][:20])
-            stream_top = set(rgg_stream["names"][group][:20])
-            overlap = len(mem_top & stream_top) / 20
-            assert overlap >= 0.80, (
-                f"group {group}: overlap {overlap:.2f} (expected >= 0.80)"
+            assert list(rgg_mem["names"][group]) == list(rgg_stream["names"][group]), (
+                f"group {group}: gene order differs between in-memory and streaming"
             )
+            for field in ("scores", "pvals", "pvals_adj", "logfoldchanges"):
+                np.testing.assert_array_equal(
+                    np.asarray(rgg_mem[field][group]),
+                    np.asarray(rgg_stream[field][group]),
+                    err_msg=f"group {group}: {field} differs in-memory vs streaming",
+                )
 
         # P-values should be in valid range.
         for group in rgg_stream["pvals"].dtype.names:
@@ -985,28 +1117,31 @@ class TestStreamingDE:
         ref_rgg = results[5]
         for cs in [25, 50]:
             for group in ref_rgg["names"].dtype.names:
-                # Gene names should be in the same order.
-                ref_names = list(ref_rgg["names"][group])
-                other_names = list(results[cs]["names"][group])
-                assert ref_names == other_names, (
-                    f"chunk_size={cs}: gene order differs for group {group}"
-                )
-
-                # Scores should match.
-                np.testing.assert_allclose(
-                    ref_rgg["scores"][group],
-                    results[cs]["scores"][group],
-                    rtol=1e-10,
-                    err_msg=f"chunk_size={cs}, group={group}: scores differ",
-                )
-
-                # Raw p-values should match.
-                np.testing.assert_allclose(
-                    ref_rgg["pvals"][group],
-                    results[cs]["pvals"][group],
-                    rtol=1e-10,
-                    err_msg=f"chunk_size={cs}, group={group}: pvals differ",
-                )
+                # Every field, exactly. The chunk size decides how many genes a
+                # pass covers; it does not enter the arithmetic for any one gene,
+                # so bit-identity is the honest bar and `rtol=1e-10` on two of
+                # the four fields was strictly weaker than the code. Measured
+                # identical across 5 / 25 / 50 before this was tightened.
+                #
+                # `pvals_adj` matters most here and was the field missing: BH is
+                # the one step that reads *across* genes, so a chunking bug that
+                # left every raw p-value intact could still corrupt it.
+                for field in (
+                    "names",
+                    "scores",
+                    "pvals",
+                    "pvals_adj",
+                    "logfoldchanges",
+                ):
+                    np.testing.assert_array_equal(
+                        ref_rgg[field][group],
+                        results[cs][field][group],
+                        err_msg=(
+                            f"chunk_size={cs}, group={group}: {field} differs "
+                            f"from the chunk_size=5 result. gene_chunk_size is a "
+                            f"memory knob and must not change any output."
+                        ),
+                    )
 
     def test_streaming_pairwise_reference(
         self, synthetic_adata, scx_from_adata

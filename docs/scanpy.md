@@ -2686,12 +2686,85 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
-| `tie_correct` | `False` | Apply tie correction to the Wilcoxon rank-sum variance estimate. |
+| `tie_correct` | `False` | Apply the `Σ(t³−t)` tie correction to the Wilcoxon rank-sum variance estimate. The default `False` matches **scanpy's default** (`scanpy.tl.rank_genes_groups` takes the same parameter, also defaulting to `False`); `True` matches **scipy**, which always corrects. These are two different answers, not two precisions — see [Numerical parity](#numerical-parity-against-scanpy-and-scipy) below. |
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
 | `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present, else CSR), `"csr"`, or `"csc"`. |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
+
+##### Numerical parity against scanpy and scipy
+
+Pinned against both references, in the Rust suite (so `cargo test` gates it
+with no Python installed) and in `pyscx/tests/test_accel.py`. Every tolerance
+below is the **observed** max |Δ| plus one decimal order. Regenerate the
+reference *tables* with `benchmarks/scripts/generate_de_parity_references.py`,
+which owns the fixtures and the expected values together; it also prints the
+Python-side max |Δ| measurements quoted below, so every number on this page
+comes out of one script rather than out of a session someone ran once.
+
+**Which reference applies depends on `tie_correct`**, and this is a difference
+in definition rather than in precision. scipy *always* applies the tie
+correction. scanpy takes the same `tie_correct` parameter and **defaults it to
+`False`**, so it can produce either convention and simply does not correct
+unless asked — SCX's default matches scanpy's. On a fixture with ties the two
+conventions differ by **7.6e-02** in `z`, so pinning one arm against the other's
+reference would be wrong, not merely loose.
+
+Rust-side pins (`scx-accel`, CPU dense and analytic-nnz kernels):
+
+| `tie_correct` | `z` reference | bar | `p` reference | bar |
+|---|---|---|---|---|
+| `True` | `scanpy(tie_correct=True).scores` | `1e-6` | `scipy.stats.mannwhitneyu(...).pvalue` | `1e-15` |
+| `False` (default) | `scanpy(tie_correct=False).scores` | `1e-6` | `scanpy(...).pvals` | `1e-12` |
+
+Both `z` bars are `1e-6` because scanpy stores `scores` as **float32** in its
+recarray; its `pvals` are float64, and scipy is f64 throughout, hence the tight
+`p` bars. scipy exposes no `z`, so the `z` reference is scanpy on both arms —
+deriving one from scipy's `U` would mean re-implementing the variance formula
+being tested. On the corrected arm scipy's and scanpy's `p` agree at **exactly
+0.0**, and that agreement is itself asserted: two independent implementations of
+the tie term is what makes either of them an oracle for SCX.
+
+The **GPU** arm is held to the same `z` bar and a looser `p` bar (`1e-9`), which
+is a CUDA reduction-order bound rather than a convention difference. `pvals_adj`
+is **not** pinned Rust-side — BH is applied above the kernel — and is covered on
+the Python side below.
+
+Python-side pins (`pyscx/tests/test_accel.py`), against scanpy on real fixtures,
+keyed by gene name:
+
+| Field | Observed max &#124;Δ&#124; | Bar |
+|---|---|---|
+| `scores` | 1.4e-07 | `1e-6` |
+| `pvals` | 1.1e-16 | `1e-12` |
+| `pvals_adj` | 3.3e-16 | `1e-12` |
+| `logfoldchanges` (log1p'd input) | 2.3e-07 | `1e-6` |
+
+The observed column is the pytest fixture's; the generator re-measures on a
+second, independent fixture and **fails** if any field there exceeds the same
+bar (it lands within 5e-07 / 3e-16 / 3e-16 / 2e-07). Run it in the `.venv`, where
+scanpy and `pyscx` are importable — it refuses to exit 0 having skipped that
+half, unless you ask for the Rust tables alone with `SCX_SKIP_PYTHON_BARS=1`. The bars are what is
+claimed — the observed figures are fixture-dependent by nature, and pinning a
+tolerance to one fixture's exact divergence is how a bar stops surviving a
+change of input.
+
+Two caveats that are load-bearing rather than fine print:
+
+- **Gene *order* within a group is not claimed.** scanpy's tie order comes from
+  `np.argsort`'s default `quicksort`, which is not stable, so two genes with
+  equal scores may come out in either order. Compare by gene name, never by
+  position. (The *set* of names is claimed, and asserted.)
+- **`logfoldchanges` on raw counts is deliberately not scanpy's.** scanpy
+  `expm1`s the group means unconditionally, assuming log1p'd input — it emits a
+  warning when the data looks like counts. SCX detects the untransformed case
+  and uses `log2(mean + ε)` differences instead. On raw counts the two differ by
+  ~6e+01. Log-transform first if you want the two to agree.
+
+In-memory and backed/streaming DE are **bit-identical** to each other on every
+field including gene order, at every `gene_chunk_size` — an identity, not a
+tolerance.
 
 #### `pyscx.accel.pdex_ref`
 

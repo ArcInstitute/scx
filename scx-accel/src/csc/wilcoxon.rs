@@ -13,7 +13,9 @@
 
 use std::sync::OnceLock;
 
-use crate::diffexp::cpu::{compute_logfc, de_rank_cmp, wilcoxon_stats_from_rank_sum};
+use crate::diffexp::cpu::{
+    compute_logfc, de_rank_cmp, for_each_tie_run, wilcoxon_stats_from_rank_sum,
+};
 use crate::diffexp::{
     benjamini_hochberg, merge_diff_exp_results, wilcoxon_rank_sum, DiffExpResult,
 };
@@ -151,9 +153,13 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
 /// correction `Σ(t³−t)`.
 ///
 /// `block` is sorted ascending by value; `offset` is the count of cells sorted
-/// *before* this block (0 for negatives; `n_neg + n_zero` for positives). Global
-/// 1-based rank of a tie run at within-block positions `[i, j)` is
-/// `offset + (i + 1 + j) / 2`, identical to `rank_with_ties`' mid-rank.
+/// *before* this block (0 for negatives; `n_neg + n_zero` for positives).
+///
+/// The walk itself — runs, mid-ranks, `Σ(t³−t)` — is
+/// [`crate::diffexp::cpu::for_each_tie_run`], shared with the
+/// dense path's `rank_with_ties`. It used to be a second copy of that loop, and
+/// the two agreeing was an assertion in a doc comment rather than a fact about
+/// the code; all this function supplies now is *where a run's rank goes*.
 ///
 /// Every entry here belongs to a real group: the caller drops unlabelled cells
 /// before building the blocks, because they are not in the comparison pool at
@@ -164,23 +170,16 @@ fn assign_block_ranks(
     rank_sum: &mut [f64],
     tie_correction: &mut f64,
 ) {
-    let n = block.len();
-    let mut i = 0;
-    while i < n {
-        let mut j = i + 1;
-        while j < n && block[j].0 == block[i].0 {
-            j += 1;
-        }
-        let mid_rank = (2 * offset + i + 1 + j) as f64 / 2.0;
-        for entry in &block[i..j] {
-            rank_sum[entry.1] += mid_rank;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            *tie_correction += t * t * t - t;
-        }
-        i = j;
-    }
+    *tie_correction += for_each_tie_run(
+        block.len(),
+        offset,
+        |i, j| block[j].0 == block[i].0,
+        |mid_rank, run| {
+            for entry in &block[run] {
+                rank_sum[entry.1] += mid_rank;
+            }
+        },
+    );
 }
 
 /// Per-gene 1-vs-rest Wilcoxon `(score, pval, logfc)` for every group, computed
@@ -197,7 +196,7 @@ fn assign_block_ranks(
 /// global, so it is what an out-of-range row is checked against. It is not a
 /// statistical parameter here; `n_labelled` is.
 #[allow(clippy::too_many_arguments)]
-fn gene_stats_nnz(
+pub(crate) fn gene_stats_nnz(
     rows: &[i32],
     vals: &[f32],
     groups: &[usize],
@@ -1306,5 +1305,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- ORG-7.21-3: the tie-run walk, pinned before it was shared ----------
+    //
+    // The nnz path's half of the duplication `diffexp::cpu::rank_with_ties`
+    // held the other half of. Same walk over equal-value runs, same `Σ(t³−t)`,
+    // but offset into a global rank space and accumulating per *group* rather
+    // than per element. Pinned here before the two collapsed onto one
+    // primitive, so the refactor is provably arithmetic-neutral.
+    //
+    // Expected values are derived by hand from `(2·offset + i + 1 + j) / 2`,
+    // not read off a run of the code. Falsify by perturbing one `mid_rank`.
+
+    /// Leading tie run, singleton, trailing tie run, at both offsets.
+    ///
+    /// The block sorts as `1,1 | 2 | 3,3` over positions `[0,2) [2,3) [3,5)`.
+    /// At `offset = 0` the mid-ranks are `1.5, 3.0, 4.5`; at `offset = 4` they
+    /// shift by exactly 4 to `5.5, 7.0, 8.5`. The correction is offset-free:
+    /// `(2³−2) + (2³−2) = 12`.
+    #[test]
+    fn assign_block_ranks_pinned_mid_ranks_and_tie_correction() {
+        let block = [(1.0, 0usize), (1.0, 1), (2.0, 0), (3.0, 1), (3.0, 1)];
+
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 0.0f64;
+        assign_block_ranks(&block, 0, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![4.5, 10.5]);
+        assert_eq!(tc, 12.0);
+        // Ranks 1..=5 sum to 15 whatever the grouping — an independent check
+        // on the mid-ranks that does not restate them.
+        assert_eq!(rank_sum.iter().sum::<f64>(), 15.0);
+
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 0.0f64;
+        assign_block_ranks(&block, 4, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![12.5, 22.5]);
+        assert_eq!(tc, 12.0);
+        // Ranks 5..=9 sum to 35.
+        assert_eq!(rank_sum.iter().sum::<f64>(), 35.0);
+    }
+
+    /// One run spanning the whole block, and an empty block.
+    ///
+    /// All-equal at `offset = 3`: mid-rank `(2·3 + 0 + 1 + 4)/2 = 5.5`,
+    /// correction `4³ − 4 = 60`. An empty block must touch neither output.
+    #[test]
+    fn assign_block_ranks_pinned_all_equal_and_empty() {
+        let block = [(2.5, 0usize), (2.5, 0), (2.5, 1), (2.5, 1)];
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 0.0f64;
+        assign_block_ranks(&block, 3, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![11.0, 11.0]);
+        assert_eq!(tc, 60.0);
+
+        let mut rank_sum = vec![0.0f64; 2];
+        let mut tc = 7.0f64; // pre-loaded: an empty block must not reset it
+        assign_block_ranks(&[], 0, &mut rank_sum, &mut tc);
+        assert_eq!(rank_sum, vec![0.0, 0.0]);
+        assert_eq!(tc, 7.0);
     }
 }

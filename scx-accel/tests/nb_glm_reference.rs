@@ -3,6 +3,22 @@
 //! The fitter must never panic on arbitrary in-shape input — it either returns a
 //! fitted result or a typed [`AccelError`]. Malformed input (wrong shape, empty
 //! dims, negative / non-finite counts, too few samples) must be rejected.
+//!
+//! # This file's name is not a reference comparison
+//!
+//! Despite `_reference`, nothing here compares against pydeseq2 or DESeq2 — the
+//! review named exactly that gap: a file called "reference" holding only
+//! never-panic properties, with no pinned external numbers anywhere in the Rust
+//! suite. The name is kept (moving it would churn nothing useful) and the
+//! comparison now exists next to the fitter, where it can reuse crate-internal
+//! primitives: `scx-accel/src/nb_glm/pydeseq2_reference_tests.rs` pins a real
+//! pydeseq2 0.5.4 run at the bar `docs/pseudobulk_nb_glm.md` claims — ranking,
+//! effect sign and significance, explicitly not numerical equality.
+//!
+//! Both files are load-bearing and neither substitutes for the other: a
+//! never-panic property holds over arbitrary input and says nothing about
+//! correctness; a pinned reference says everything about one input and nothing
+//! about the rest.
 
 use proptest::prelude::*;
 use scx_accel::{pseudobulk_nb_glm, AccelError, NbGlmContrast, NbGlmOptions};
