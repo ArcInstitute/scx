@@ -42,6 +42,10 @@
 //! .venv/bin/python benchmarks/scripts/generate_harmony_references.py lisi \
 //!     > scx-accel/src/lisi_reference_values.rs
 //! ```
+//! cargo fmt -p scx-accel
+//!
+//! Format before diffing a regeneration: rustfmt rewraps these
+//! tables, so whitespace and values would otherwise look alike.
 
 #![allow(clippy::unreadable_literal)]
 

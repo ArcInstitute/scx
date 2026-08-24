@@ -123,6 +123,12 @@ def _run_harmonypy(adata: Any, batch_key: str, _seed: int) -> str:
         max_iter_harmony=_MAX_ITER,
         max_iter_kmeans=_MAX_ITER_KMEANS,
         verbose=False,
+        # Pinned, not left to `device=None`. harmonypy 0.2.0 is torch-backed and
+        # picks a device itself, so on a GPU node this variant would silently
+        # become a GPU run under a name that says CPU — and the reference
+        # embedding every other arm is scored against would change with the node
+        # the job landed on.
+        device="cpu",
     )
     adata.obsm["X_pca_harmony"] = np.asarray(ho.Z_corr, dtype=np.float32)
     return "harmonypy"

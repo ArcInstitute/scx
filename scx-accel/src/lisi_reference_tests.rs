@@ -87,6 +87,21 @@ fn the_fixture_can_separate_the_two_neighbourhood_conventions() {
     );
 }
 
+/// LISI is bounded by its own definition: 1 when every neighbour shares a
+/// label, at most the number of categories under uniform mixing. A reference
+/// table outside that range would mean the fixture and the labels disagree
+/// about how many categories there are — which no tolerance would reveal.
+#[test]
+fn the_reference_lisi_lies_inside_its_definitional_range() {
+    for (i, &v) in r::LISI_EXPECTED.iter().enumerate() {
+        assert!(
+            (1.0 - 1e-9..=r::LISI_N_LABELS as f64 + 1e-9).contains(&v),
+            "reference LISI[{i}] = {v} is outside [1, {}]",
+            r::LISI_N_LABELS
+        );
+    }
+}
+
 /// The parity arm.
 #[test]
 fn lisi_matches_harmonypy_per_cell() {

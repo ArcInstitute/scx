@@ -60,6 +60,29 @@ except ImportError as e:  # pragma: no cover - environment guard
         "    .venv/bin/python benchmarks/scripts/generate_harmony_references.py\n"
     )
 
+# The version every pinned value in this file was produced by. Checked, not
+# assumed: `pip install harmonypy` resolves to **2.0.0**, and 0.2.0 is what the
+# repo's `.venv`, `scx-bench` and `scx-gpu` all carry. Regenerating under a
+# different version would silently replace every expected value with numbers
+# from a different implementation while the module doc still named 0.2.0.
+EXPECTED_HARMONYPY = "0.2.0"
+
+
+def _check_version() -> None:
+    got = md.version("harmonypy")
+    if got != EXPECTED_HARMONYPY:
+        sys.exit(
+            f"FATAL: harmonypy {got} is installed, but every value in the "
+            f"generated module was produced by {EXPECTED_HARMONYPY}.\n"
+            f"Regenerating here would swap the oracle without saying so.\n"
+            f"  pip install --no-deps 'harmonypy=={EXPECTED_HARMONYPY}'\n"
+            f"or, if the bump is intended, change EXPECTED_HARMONYPY and "
+            f"re-read the divergence claims in the module doc — 0.2.0's "
+            f"diversity penalty is already not the one this repo's review "
+            f"was written against."
+        )
+
+
 # ─── Fixture design ──────────────────────────────────────────────────────────
 # Small enough to read as Rust literals, large enough that the ridge solve has
 # a well-conditioned per-cluster covariance and every batch survives SCX's
@@ -168,6 +191,7 @@ def np_(t):
 
 
 def main() -> None:
+    _check_version()
     torch.manual_seed(SEED)
     z_dn, phi, pr_b, labels = build_fixture()
 
@@ -326,9 +350,17 @@ def main() -> None:
     print("//! # Regenerating")
     print("//!")
     print("//! ```text")
-    print("//! .venv/bin/python benchmarks/scripts/generate_harmony_references.py \\")
+    print("//! .venv/bin/python benchmarks/scripts/generate_harmony_references.py harmony \\")
     print("//!     > scx-accel/src/harmony/harmony_reference_values.rs")
     print("//! ```")
+    print("//! cargo fmt -p scx-accel")
+    print("//!")
+    print("//! The `cargo fmt` is not cosmetic. rustfmt rewraps these tables one")
+    print("//! element per line, so the checked-in file and a fresh generation")
+    print("//! differ in whitespace on every row — and a regenerate-and-diff")
+    print("//! would then show a value change and a reflow as the same thing.")
+    print("//! Format before comparing. Verified: the values round-trip")
+    print("//! byte-identically once both sides are rustfmt\u0027d.")
     print()
     print("#![allow(clippy::unreadable_literal)]")
     print()
@@ -435,6 +467,8 @@ def emit_lisi() -> None:
     import pandas as pd
     from harmonypy.lisi import compute_lisi as hpy_lisi
 
+    _check_version()
+
     rng = np.random.default_rng(LISI_SEED)
     labels = rng.integers(0, LISI_N_LABELS, size=LISI_N_CELLS)
     # Label-correlated blobs that OVERLAP. Well-separated blobs pin LISI at
@@ -526,6 +560,10 @@ def emit_lisi() -> None:
     print("//! .venv/bin/python benchmarks/scripts/generate_harmony_references.py lisi \\")
     print("//!     > scx-accel/src/lisi_reference_values.rs")
     print("//! ```")
+    print("//! cargo fmt -p scx-accel")
+    print("//!")
+    print("//! Format before diffing a regeneration: rustfmt rewraps these")
+    print("//! tables, so whitespace and values would otherwise look alike.")
     print()
     print("#![allow(clippy::unreadable_literal)]")
     print()

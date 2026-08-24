@@ -126,6 +126,45 @@ fn the_m_step_target_is_not_where_the_fixture_already_is() {
     );
 }
 
+/// SCX never materializes a `Z_cos` buffer — `compute_inv_norms` normalizes per
+/// cell inside `compute_distances` and `update_y` (the H9 note in `cpu.rs`). So
+/// the cosine normalization every arm below depends on is implicit, and nothing
+/// checked it against the reference's. harmonypy's `_Z_cos` is
+/// `Z / ||Z||` per column, computed in f32.
+#[test]
+fn the_implicit_cosine_normalization_matches_harmonypys() {
+    let s = fixture_state(r::HP_THETA, r::HP_BLOCK_SIZE, 1);
+    let inv = compute_inv_norms(&s.z_corr, s.d, s.n);
+    let mut got = Vec::with_capacity(s.n * s.d);
+    for i in 0..s.n {
+        for t in 0..s.d {
+            got.push(s.z_corr[i * s.d + t] * inv[i]);
+        }
+    }
+    let want: Vec<f64> = r::HP_FIX_Z_COS
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect();
+    let (d, at) = max_abs(&got, &want);
+    assert!(
+        d <= r::HP_MSTEP_Y_ATOL,
+        "Z_cos element {at}: |delta| {d:.3e} > {:.3e}",
+        r::HP_MSTEP_Y_ATOL
+    );
+}
+
+// The device bar must not be TIGHTER than the host bar. cuBLAS accumulates the
+// M-step's product in f32 where the CPU arm accumulates in f64, so a GPU bar
+// below the CPU one would be claiming the device is more accurate than the
+// host — and would red on hardware nobody runs in CI, which is the worst place
+// to discover a mis-set tolerance.
+//
+// A compile-time assertion, not a `#[test]`: both sides are `const`, so clippy
+// rightly calls a runtime `assert!` on them constant-valued. This fails the
+// BUILD, which is stronger and also keeps `HP_GPU_MSTEP_Y_ATOL` used in a
+// non-`gpu` build, where nothing else reads it.
+const _: () = assert!(r::HP_GPU_MSTEP_Y_ATOL >= r::HP_MSTEP_Y_ATOL);
+
 // ─── Arm 1: the M-step, and the distances it invalidates ─────────────
 
 /// **This is §7.4, and it is the arm that pins the CALL SITE.**

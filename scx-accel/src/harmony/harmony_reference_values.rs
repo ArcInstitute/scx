@@ -70,9 +70,17 @@
 //! # Regenerating
 //!
 //! ```text
-//! .venv/bin/python benchmarks/scripts/generate_harmony_references.py \
+//! .venv/bin/python benchmarks/scripts/generate_harmony_references.py harmony \
 //!     > scx-accel/src/harmony/harmony_reference_values.rs
 //! ```
+//! cargo fmt -p scx-accel
+//!
+//! The `cargo fmt` is not cosmetic. rustfmt rewraps these tables one
+//! element per line, so the checked-in file and a fresh generation
+//! differ in whitespace on every row — and a regenerate-and-diff
+//! would then show a value change and a reflow as the same thing.
+//! Format before comparing. Verified: the values round-trip
+//! byte-identically once both sides are rustfmt'd.
 
 #![allow(clippy::unreadable_literal)]
 

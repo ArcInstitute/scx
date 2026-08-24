@@ -1,5 +1,5 @@
 #!/bin/bash
-# The gate owed by Organization Phase 7, covering 7a-7d in one run.
+# The gate owed by Organization Phase 7, covering 7a-7e in one run.
 #
 # ONE run for four sub-phases, deliberately. 7a and 7b (PR #452) never produced
 # a measurement -- no gate script existed -- and 7c's tie-run primitive touches
@@ -15,9 +15,18 @@
 #   * The gemm distance expansion recomputes exactly below its error floor
 #     (SS7.12), in the exact-kNN path and in the blocked pairwise kernel. That is
 #     why `accel_knn` joins the list.
-#   * Harmony's missing k-means M-step -- previously billed here as 7d's largest
-#     perf change -- moved to 7e, along with registering `accel_harmony` at all.
-#     Nothing in this run touches Harmony.
+#
+# What 7e changed:
+#
+#   * Harmony's soft k-means sub-loop gained the M-step it never had (SS7.4), on
+#     BOTH arms: `Y = normalize(Z_cos R')` plus the distances it invalidates, per
+#     sub-iteration. That is `max_iter x max_iter_kmeans` = 60 extra passes over
+#     a d x N embedding per run, so it is the largest perf change in this job --
+#     and `accel_harmony` now exists to measure it.
+#   * On the GPU arm those are two cuBLAS gemms plus a normalize per sub-iter,
+#     dispatched OUTSIDE the captured graph, so the capture still happens once.
+#   * LISI's default neighbourhood dropped from 90 to 89 (SS7.19). No LISI
+#     benchmark exists; it is gated Rust-side by `lisi_reference_tests.rs`.
 #
 # ONE job, and nothing else submitted alongside: `maturin develop` rewrites the
 # in-tree `.so` that every pyscx-importing job resolves through, so a second scx
@@ -70,6 +79,19 @@ echo "=== HEAD: $(git rev-parse HEAD) on $(git rev-parse --abbrev-ref HEAD)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # --- build, release: a debug .so runs 4-10x slower and poisons every timing ---
+#
+# Whether nvcc exists is NOT part of scx-gpu's build-script fingerprint, so a
+# target directory that once saw a CPU-only build replays the stub branch -- and
+# its warning -- on a machine that has nvcc. That is exactly how the first
+# attempt at this gate (job 2839940) died: it built a wheel from 41-byte PTX
+# files and failed at CUDA_ERROR_INVALID_IMAGE 82 seconds in, having measured
+# nothing. Two defences, because either alone is insufficient:
+#   * `touch` makes the build script RERUN, so the probe happens at all;
+#   * `SCX_GPU_REQUIRE_NVCC=1` makes a missing nvcc a 20-second build failure
+#     instead of a runtime symptom four steps from its cause.
+export SCX_GPU_REQUIRE_NVCC=1
+export PATH=/usr/local/cuda/bin:${PATH}
+touch scx-gpu/build.rs
 echo "=== maturin develop --release --features hdf5,gpu"
 ( cd pyscx && maturin develop --release --features hdf5,gpu )
 
@@ -190,6 +212,82 @@ elif n_used != n_expected:
         f"dispersion pre-filter is back, or the .so predates SS7.14"
     )
 
+# --- 3b. the gate env's harmonypy is the one the pins were made against ------
+#
+# `accel_harmony` scores every arm against harmonypy, and `scx-bench-gpu` did
+# not carry it at all -- so without this the benchmark would emit
+# `missing_reason=no_harmonypy` for all three variants and its floors would come
+# back as missing-metric violations hours in, rather than as a 20-second failure
+# here. And `pip install harmonypy` resolves to **2.0.0**, while the Rust pins
+# in `harmony_reference_values.rs` were produced by **0.2.0** -- which is what
+# `.venv`, `scx-bench` and `scx-gpu` all carry. A silent major-version swap
+# would make the benchmark floor and the cargo-test pins disagree about what
+# "harmonypy" means.
+import importlib.metadata as _md
+try:
+    _hv = _md.version("harmonypy")
+    print(f"preflight: harmonypy {_hv}")
+    if _hv != "0.2.0":
+        fail.append(
+            f"harmonypy {_hv} in this env, but the Rust pins were produced by "
+            f"0.2.0 -- `pip install --no-deps 'harmonypy==0.2.0'`"
+        )
+except _md.PackageNotFoundError:
+    fail.append("harmonypy is not installed; accel_harmony scores every arm "
+                "against it -- `pip install --no-deps 'harmonypy==0.2.0'`")
+
+# --- 4. Harmony's k-means sub-loop has the SS7.4 M-step, in THIS build --------
+#
+# The three arms above touch HVG, Wilcoxon and pflog; none of them sees Harmony,
+# so without this the job could spend hours reporting `accel_harmony` numbers
+# from a binary whose centroids never move.
+#
+# The signal is the OBJECTIVE CURVE, and it was chosen by measuring candidates
+# rather than by reasoning about them. Two that look obvious do not work:
+# between-batch variance after correction separates the two builds by 0.5152 vs
+# 0.5136 (nothing), and `n_iterations` is 7 either way. The relative drop across
+# the run does separate them, because the M-step is what actually minimises
+# `sum R.dist` at fixed R:
+#
+#     rel_drop = (obj[0] - obj[-1]) / |obj[0]|
+#
+#     with the M-step:     obj 185.60 -> -53.18   rel_drop 1.286
+#     without (reverted):  obj 251.57 -> 241.66   rel_drop 0.039
+#
+# Both measured through pyscx on THIS fixture, with the M-step call site removed
+# and the wheel rebuilt for the second. A ratio rather than an absolute so the
+# bar does not need recalibrating whenever the fixture is touched; 0.5 sits an
+# order of magnitude above 0.039 and well below 1.286.
+rng = np.random.default_rng(90210)
+n_per, d_pcs, n_batch = 300, 12, 3
+base = rng.normal(0.0, 1.0, size=(n_per * n_batch, d_pcs))
+shift = rng.normal(0.0, 3.0, size=(n_batch, d_pcs))
+lab = np.repeat(np.arange(n_batch), n_per)
+pcs = (base + shift[lab]).astype(np.float32)
+ah = anndata.AnnData(
+    X=sp.csr_matrix(np.zeros((len(lab), 1), dtype=np.float32)),
+    obs=pd.DataFrame({"b": pd.Categorical([f"b{v}" for v in lab])},
+                     index=[f"c{i}" for i in range(len(lab))]),
+)
+ah.obsm["X_pca"] = pcs
+try:
+    pyscx.accel.harmony_integrate(ah, "b", device="cpu", random_state=0)
+    obj = list(ah.uns["harmony"]["objective_harmony"])
+    if len(obj) < 2 or not np.isfinite(obj[0]) or obj[0] == 0.0:
+        fail.append(f"harmony objective curve is unusable: {obj[:3]}")
+    else:
+        rel_drop = (obj[0] - obj[-1]) / abs(obj[0])
+        print(f"preflight: harmony objective {obj[0]:.4f} -> {obj[-1]:.4f} "
+              f"(rel_drop {rel_drop:.4f}, n_iter={ah.uns['harmony']['n_iterations']})")
+        if rel_drop < 0.5:
+            fail.append(
+                f"harmony objective fell by only {rel_drop:.3f} of its initial "
+                f"value; the k-means sub-loop is not moving centroids, so the .so "
+                f"predates SS7.4's M-step (reverted build measures 0.039)"
+            )
+except Exception as e:                                    # noqa: BLE001
+    fail.append(f"harmony_integrate raised: {e!r}")
+
 if fail:
     for f in fail:
         print(f"PREFLIGHT FAILED: {f}", file=sys.stderr)
@@ -203,13 +301,19 @@ PY
 # and 7c added a GPU arm to the Wilcoxon reference test. --no-gpu would leave all
 # of that unmeasured while still printing a green gate.
 #
-# accel_harmony is NOT here and must not be added until 7e registers it in
-# ALL_BENCHMARKS. `capture_baseline.py` rejects an off-list name outright -- that
-# exact failure killed Phase 6's first gate attempt in 2.2s -- so check before
-# adding it:
+# accel_harmony IS here as of 7e, which wrote the module and its five
+# registration sites. `capture_baseline.py` rejects an off-list name outright --
+# that exact failure killed Phase 6's first gate attempt in 2.2s -- so the
+# registration was falsified before this line was added: dropping the name from
+# ALL_BENCHMARKS reds `test_every_floored_benchmark_is_in_all_benchmarks`.
+# Confirm before any future edit here:
 #   python -c "from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS as A; print('accel_harmony' in A)"
-# It is absent today: `benchmarks/comprehensive/benchmarks/` holds 52 modules and
-# none is harmony, so registering it means WRITING one, not adding a name.
+#
+# Its floors are BASELINE-ABSENT by construction -- the benchmark did not exist
+# when `LATEST` was captured -- so its regression arm cannot fire and this run
+# tests its absolute floors only. Its `mean_per_pc_r_vs_harmonypy` floor is
+# provisional at 0.90 pending this first measurement; report what it measured so
+# it can be set from data rather than from the withdrawn R-harmony figure.
 #
 # accel_knn is here because SS7.12 changed the precision of the distance the
 # exact-kNN path returns for near-duplicate rows. `thresholds.yaml` already
@@ -225,8 +329,9 @@ PY
 #   2. `accel_eval_metrics`' two GPU route floors have never been evaluated. If
 #      they come back unevaluated again, say so; do not report them as passed.
 #   3. Accelerator FINGERPRINTS will move, and the fingerprint check is not
-#      filtered by --only-benchmarks. Expect drift in the kNN fingerprint (SS7.12)
-#      and any that touches pflog (SS7.14). Do NOT pass
+#      filtered by --only-benchmarks. Expect drift in the kNN fingerprint
+#      (SS7.12), any that touches pflog (SS7.14), and any that touches Harmony or
+#      LISI (SS7.4, SS7.19 -- both change output for every caller). Do NOT pass
 #      `-- --allow-fingerprint-drift` pre-emptively: run it, read which
 #      fingerprints moved, confirm each one is explained by those two changes, and
 #      only then re-run with the flag -- naming the drifted fingerprints in the
@@ -238,7 +343,7 @@ PY
 echo "=== gate_candidate.py"
 python benchmarks/comprehensive/scripts/gate_candidate.py \
     --benchmarks accel_de accel_de_nb_glm accel_hvg accel_pca accel_knn \
-                 accel_eval_metrics bench_csc_dispatch \
+                 accel_harmony accel_eval_metrics bench_csc_dispatch \
     --datasets pbmc3k census_1m \
     --name phase7-accel-gate \
     --skip-smoke \
