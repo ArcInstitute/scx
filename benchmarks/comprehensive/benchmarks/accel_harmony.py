@@ -252,11 +252,16 @@ def run(
     )
 
     # harmonypy reference embedding, for the correctness floor. Computed once
-    # per dataset and reused by all three variants — including the harmonypy
-    # variant itself, where the comparison is against a *different run* of the
-    # same implementation and therefore measures its own init stochasticity.
-    # That is the useful control: it is the floor below which no arm can be
-    # expected to land.
+    # per dataset and reused by all three variants.
+    #
+    # The harmonypy variant therefore scores against another run of itself. An
+    # earlier version of this comment called that "the useful control: the floor
+    # below which no arm can be expected to land". It is NOT: `random_state` is
+    # fixed and harmonypy is deterministic given it, so that arm returns exactly
+    # 1.0 and bounds nothing. Measured across 5 runs on pbmc3k and 3 on
+    # census_1m — every value 1.0, spread exactly zero. It is kept because it
+    # costs nothing and would catch harmonypy becoming non-deterministic, which
+    # would invalidate the floors on the other two arms.
     ref_key = ("harmony_ref", dataset.name, n_comps)
     if ref_key not in _fixture_cache:
         ref = base.copy()
