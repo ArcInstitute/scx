@@ -432,18 +432,26 @@ fn the_objectives_cross_entropy_is_a_stated_divergence_not_parity() {
 /// `test_gpu_vs_cpu_per_pc_correlation` the thing that caught it — a parity
 /// test between two SCX arms, which is the evidence shape this phase replaces.
 ///
-/// This pins the device kernels directly, and that is the ONLY thing covering
-/// them.
+/// This pins the device kernels directly. `test_gpu_vs_cpu_per_pc_correlation`
+/// now covers the device *call site* as well — but only because Phase 7e
+/// tightened it, and the story is worth keeping.
 ///
-/// An earlier version of this comment said the call site was covered by
-/// `test_gpu_vs_cpu_per_pc_correlation` — "with the M-step on one arm only, the
-/// two embeddings stop correlating". **That was asserted, and it is false.**
-/// Measured on an H100 (job 2840979): remove `gpu_harmony_update_y` from the
-/// sub-loop, keep the CPU M-step, and the parity test still passes at its
-/// `r >= 0.95` bar. Harmony's corrected embedding is dominated by the ridge
-/// solve, which is identical on both arms, so a correlation between two SCX
-/// arms cannot see a clustering-loop divergence — the same reason the gate's
-/// between-batch-variance probe could not separate the two builds either.
+/// An earlier version of this comment asserted that coverage already existed:
+/// "with the M-step on one arm only, the two embeddings stop correlating".
+/// **That was false at the bar the test then carried.** Measured on an H100
+/// (job 2840979): remove `gpu_harmony_update_y` from the sub-loop, keep the CPU
+/// M-step, and the parity test passed at `r > 0.95`. Job 2841267 then measured
+/// what the bar would have to be — both arms agree to **nine decimals**
+/// (1.000000000 on all five PCs) when they run the same algorithm, while the
+/// one-armed build bottoms out at 0.998355901. So 0.95 was three orders looser
+/// than the signal. The bar is 0.999, and job 2841282 confirmed the mutant now
+/// reds while the baseline passes.
+///
+/// The lesson that outlives the numbers: a parity test between two SCX arms is
+/// only as good as its bar, and Harmony's corrected embedding is dominated by
+/// the ridge solve — identical on both arms — so a *loose* correlation cannot
+/// see a divergence confined to the clustering loop. The same insensitivity
+/// defeated the gate's first between-batch-variance probe.
 #[cfg(feature = "gpu")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
