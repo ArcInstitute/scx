@@ -596,7 +596,22 @@ fn test_gpu_vs_cpu_per_pc_correlation() {
     let cpu = harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
     let gpu = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
 
-    // Compare per-PC Pearson correlation (f32 rounding → expect ~0.99+).
+    // Compare per-PC Pearson correlation. The bar is 0.999, tightened from
+    // 0.95 in Phase 7e after measuring what it could and could not detect.
+    //
+    // At 0.95 this test was decorative: removing the M-step from the GPU arm
+    // while keeping it on the CPU one left it GREEN (job 2840979, H100), and a
+    // comment in `harmony_reference_tests.rs` claimed the opposite. Measured
+    // per-PC correlations on this exact fixture (job 2841267, H100):
+    //
+    //     both arms:            1.000000000 on all five PCs
+    //     GPU M-step removed:   0.999999496, 0.999388667, 0.998355901,
+    //                           0.999836465, 0.999995808
+    //
+    // So the two arms agree to nine decimals when they run the same algorithm,
+    // and the divergence is 1.6e-03 at its widest. 0.999 sits between them with
+    // ~1e-03 of headroom for cross-device f32 drift — an order more slack than
+    // the margin by which it rejects the one-armed build.
     for pc in 0..d {
         let mut x: Vec<f64> = Vec::with_capacity(n);
         let mut y: Vec<f64> = Vec::with_capacity(n);
@@ -619,7 +634,12 @@ fn test_gpu_vs_cpu_per_pc_correlation() {
         let r = num / (dx.sqrt() * dy.sqrt() + 1e-30);
         // Either strong correlation OR both PCs are near-constant (dx or dy ~ 0).
         if dx > 1e-8 && dy > 1e-8 {
-            assert!(r > 0.95, "PC {pc}: r={r}");
+            assert!(
+                r > 0.999,
+                "PC {pc}: r={r} — the CPU and GPU arms have diverged by more \
+                 than f32 rounding explains. Both arms measured exactly 1.0 on \
+                 this fixture; an M-step present on one arm only measures 0.9984."
+            );
         }
     }
 }
