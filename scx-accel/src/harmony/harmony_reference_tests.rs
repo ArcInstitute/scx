@@ -6,11 +6,18 @@
 //! harmonypy's own `init_cluster` output, so there is no step where SCX supplies
 //! an input that SCX also grades.
 //!
-//! The load-bearing arm is [`the_m_step_moves_centroids_onto_the_r_weighted_means`].
-//! Before Phase 7e `update_y` did not exist: `cluster_iteration` called
-//! `update_r` in a loop with `y` and `dist_mat` frozen, so soft k-means could
-//! never move a centroid off a batch-driven mode. That test is §7.4 stated as a
-//! number rather than as an argument.
+//! The load-bearing arm is `the_clustering_sub_loop_runs_the_m_step`, not the
+//! unit arm beside it. Before Phase 7e `update_y` did not exist:
+//! `cluster_iteration` called `update_r` in a loop with `y` and `dist_mat`
+//! frozen, so soft k-means could never move a centroid off a batch-driven mode.
+//! Falsification settled which arm carries that: deleting `self.update_y()`
+//! from the sub-loop while keeping the function leaves every *unit* arm green,
+//! because they call it directly. §7.4 is stated as a number by the sub-loop
+//! arm and by nothing else.
+//!
+//! (Plain backticks rather than intra-doc links throughout: rustdoc compiles
+//! `#[test]` items out, so a link to one can never resolve — and this whole
+//! module is `#[cfg(test)]`, which rustdoc does not process at all.)
 
 use super::harmony_reference_values as r;
 use super::*;
