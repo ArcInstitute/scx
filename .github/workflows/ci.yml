@@ -1149,9 +1149,17 @@ jobs:
           # Positive half: defined AND read, per metric family. Pinning one family
           # and letting the others lapse is the failure mode -- the table in
           # docs/scanpy.md has a row for each.
+          #
+          # All SIX discrimination tables, not four. The first version named
+          # `L1_EXCL`, `L1_ALL`, `L2_EXCL` and `COSINE_EXCL`, so dropping
+          # `L2_ALL` and `COSINE_ALL` from the test's loop — and then the
+          # now-unused consts — stayed green. That is the same class of hole this
+          # commit exists to close, in the guard closing it. Found in review by
+          # Cursor Agent.
           for sym in CE_PEARSON_DELTA CE_MSE CE_MAE CE_MSE_DELTA CE_MAE_DELTA \
                      CE_DISCRIM_L1_EXCL CE_DISCRIM_L1_ALL \
-                     CE_DISCRIM_L2_EXCL CE_DISCRIM_COSINE_EXCL \
+                     CE_DISCRIM_L2_EXCL CE_DISCRIM_L2_ALL \
+                     CE_DISCRIM_COSINE_EXCL CE_DISCRIM_COSINE_ALL \
                      CE_EDISTANCE_CORR CE_KD_BASELINE CE_KD_EFFICIENCY \
                      CE_KD_LOG_DEVIATION CE_KD_IS_NAN; do
             # Anchored on the declaration, not the bare substring: `grep -q
@@ -1200,6 +1208,10 @@ jobs:
               "edistance",
               "compute_control_baseline",
               "compute_knockdown_efficiency",
+              # The generator calls it and the tests assert its output, but it
+              # was missing from this set beside its sibling. Found in review by
+              # Cursor Agent.
+              "compute_log_deviation",
           }
           missing = sorted(required - called)
           if missing:

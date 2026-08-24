@@ -350,9 +350,16 @@ pub fn estimate_alpha<S: ShardSource + Sync>(
 
     let n_genes_used = candidates.len();
 
+    // `why` says what the pool showed; the COUNT is appended here rather than
+    // interpolated by each caller. The first version left that to the call site
+    // and one of them wrote `{n_genes_used}` inside a plain `&str`, which
+    // `log::warn!("{why}")` printed verbatim — braces, name and all. Owning the
+    // count in the one place that logs it removes the interpolation a call site
+    // can get wrong, instead of fixing the instance. Found in review by
+    // Antigravity and Cursor Agent.
     let fallback = |n_used: usize, why: &str| {
         log::warn!(
-            "estimate_alpha: {why}; falling back to α={} (pseudocount {})",
+            "estimate_alpha: {why} (pooled {n_used} gene(s)); falling back to α={} (pseudocount {})",
             opts.fallback_alpha,
             1.0 / (4.0 * opts.fallback_alpha)
         );
@@ -378,7 +385,7 @@ pub fn estimate_alpha<S: ShardSource + Sync>(
         // can tell "nothing to measure" from "measured, and the answer is no".
         return Ok(fallback(
             n_genes_used,
-            "the matrix is not overdispersed: the pooled median α over              {n_genes_used} gene(s) is non-positive or non-finite",
+            "the matrix is not overdispersed: the pooled median α is non-positive or non-finite",
         ));
     }
 
