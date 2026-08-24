@@ -5,12 +5,20 @@ Python reference implementations in cell-eval and arc-bench. Every Tier 1
 metric must match the Python reference within specified tolerance on the
 same input data before the Rust accelerators can replace the Python codepath.
 
-Run from within the scx-bench-eval conda environment:
-    conda activate scx-bench-eval
+Run from the repo's uv venv, which is where `cell_eval` / `arc_bench` / `pdex`
+are editable-installed:
+    .venv/bin/python -m pytest pyscx/tests/test_cell_eval_parity.py
+
+There is no `scx-bench-eval` conda environment. Three places used to name one;
+none of the six conda envs has these packages, and neither does CI. That is why
+every documented tolerance in this file is now **also** pinned Rust-side in
+`scx-accel/src/eval_metrics/cell_eval_reference_tests.rs`, which `cargo test`
+runs with no Python at all — this file strengthens the local gate and cannot be
+the only evidence for a claim in `docs/scanpy.md`.
     cd pyscx && maturin develop --release && cd ..
     pytest pyscx/tests/test_cell_eval_parity.py -v
 
-External dependencies (only available in scx-bench-eval):
+External dependencies (editable installs in the repo's uv venv):
     - cell-eval  (/home/nickyoungblut/dev/python/cell-eval)
     - arc-bench  (/home/nickyoungblut/dev/python/arc-bench)
     - pdex, polars, tqdm
@@ -24,9 +32,9 @@ import pytest
 import scipy.sparse as sp
 
 # Guard: skip entire module if cell-eval / arc-bench are not installed.
-cell_eval = pytest.importorskip("cell_eval", reason="cell-eval not installed (need scx-bench-eval env)")
-arc_bench = pytest.importorskip("arc_bench", reason="arc-bench not installed (need scx-bench-eval env)")
-pl = pytest.importorskip("polars", reason="polars not installed (need scx-bench-eval env)")
+cell_eval = pytest.importorskip("cell_eval", reason="cell-eval not installed; it is an editable install in the repo's .venv")
+arc_bench = pytest.importorskip("arc_bench", reason="arc-bench not installed; it is an editable install in the repo's .venv")
+pl = pytest.importorskip("polars", reason="polars not installed; it is an editable install in the repo's .venv")
 
 import pyscx  # noqa: E402
 from cell_eval import PerturbationAnndataPair, score_agg_metrics  # noqa: E402
