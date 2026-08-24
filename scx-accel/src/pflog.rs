@@ -244,7 +244,8 @@ pub fn pflog_baseline_from_delta<S: ShardSource + Sync>(delta_source: &S) -> Res
 #[derive(Debug, Clone)]
 pub struct AlphaOptions {
     /// Genes with per-gene mean ≤ `mu_min` are excluded from the pool (their
-    /// per-gene `α_g` is unstable near zero mean).
+    /// per-gene `α_g` is unstable near zero mean). This is the **only**
+    /// exclusion; see [`estimate_alpha`] for why there is no dispersion filter.
     pub mu_min: f64,
     /// `α` used when no valid candidate survives. Default `0.25` ⇒ pseudocount
     /// `1/(4α) = 1.0`, i.e. the transform degrades to plain `log1p(x)` on raw
@@ -270,7 +271,13 @@ pub struct AlphaEstimate {
     pub alpha: f64,
     /// Anscombe pseudocount `1/(4·alpha)` — the matrix-wide shift for v4 PFlog.
     pub pseudocount: f64,
-    /// Number of genes whose `α_g` entered the median pool.
+    /// Number of genes whose `α_g` entered the median pool — every gene with
+    /// `mean_g > mu_min`.
+    ///
+    /// Before the §7.14 fix this counted only the *over-dispersed* genes, so on
+    /// a matrix with under-dispersed genes it was smaller than the number of
+    /// genes actually measured. It is stamped into `uns["pflog"]`, so a reader
+    /// comparing runs across that change will see it rise.
     pub n_genes_used: usize,
     /// `true` when no valid candidate survived and `fallback_alpha` was used.
     pub fell_back: bool,
@@ -284,18 +291,38 @@ pub struct AlphaEstimate {
 /// the pseudobulk estimator at `nb_glm::dispersion.rs:65`, replicated here
 /// (rather than shared) because that `pub(crate)` helper takes
 /// size-factor-normalized pseudobulk rows, not per-gene raw-count moments.
-/// Genes with `mean_g ≤ opts.mu_min` or `var_g ≤ mean_g` (Poisson /
-/// under-dispersed — no positive dispersion signal) are excluded. The pooled
-/// `α` is the median of the survivors.
+///
+/// **Every gene with `mean_g > opts.mu_min` enters the pool, including genes
+/// whose `α_g` is negative.** `mu_min` is a signal gate — below it `mean_g²` is
+/// too small for the ratio to mean anything — and it is the only exclusion.
+/// There is deliberately no `var_g > mean_g` pre-filter: dropping the
+/// under-dispersed genes before the median keeps only the upper tail of
+/// sampling noise, which biases `α` high by a factor that grows as the true
+/// dispersion falls. On a 24-gene matrix of which 20 are under-dispersed, the
+/// filtered version reported the remaining four genes' dispersion as the whole
+/// matrix's and reported success while doing it. `nb_glm::moments_dispersion`
+/// keeps negatives for the same reason (it clamps rather than truncating).
+///
+/// The pooled `α` is the median of that pool — a median rather than a mean or a
+/// `Σ(var−mean)/Σmean²` ratio because it is the only one of the three that
+/// survives an outlier gene: a single highly-expressed over-dispersed gene (a
+/// mitochondrial or ambient-RNA spike, routine in real counts) moves the
+/// moment-pooled estimate by more than an order of magnitude and leaves the
+/// median where it was.
 ///
 /// `raw` must carry **raw counts**. Per-gene moments are computed in `f64` in a
 /// single streaming pass via [`crate::hvg::streaming_mean_var`] (Bessel-corrected
 /// sample variance), which also runs the non-finite input guard per shard — so
 /// a NaN/Inf count surfaces as [`AccelError::InvalidInput`].
 ///
-/// On a degenerate matrix (no surviving candidate, or a non-positive/non-finite
-/// median) this does **not** error: it logs a warning, falls back to
-/// `opts.fallback_alpha`, and sets `fell_back = true`.
+/// This does **not** error on a matrix that carries no dispersion signal: it
+/// logs a warning, falls back to `opts.fallback_alpha`, and sets
+/// `fell_back = true`. Two distinct cases reach that path and the warning says
+/// which — no gene had a mean above `mu_min` at all, or the pool was non-empty
+/// and its median came out non-positive (the matrix is Poisson or tighter, so
+/// there is no NB `α` to report and the honest answer is the fallback's plain
+/// `log1p`). A clamp to a small positive floor would instead return a confident
+/// number the counts do not support.
 pub fn estimate_alpha<S: ShardSource + Sync>(
     raw: &S,
     opts: &AlphaOptions,
@@ -309,14 +336,16 @@ pub fn estimate_alpha<S: ShardSource + Sync>(
     let stats = streaming_mean_var(raw)?;
 
     // Per-gene method-of-moments: α_g = (var − mean) / mean².
-    // Same algebra as nb_glm::dispersion.rs:65 (see doc comment).
+    // Same algebra as nb_glm::dispersion.rs:65 (see doc comment). `mu_min` is
+    // the only exclusion — a negative α_g is a real observation about a gene and
+    // pooling without it is what biased the estimate high (§7.14).
     let mut candidates: Vec<f64> = stats
         .means
         .iter()
         .zip(stats.variances.iter())
-        .filter(|(&m, &v)| m > opts.mu_min && v > m)
+        .filter(|(&m, _)| m > opts.mu_min)
         .map(|(&m, &v)| (v - m) / (m * m))
-        .filter(|a| a.is_finite() && *a > 0.0)
+        .filter(|a| a.is_finite())
         .collect();
 
     let n_genes_used = candidates.len();
@@ -338,15 +367,18 @@ pub fn estimate_alpha<S: ShardSource + Sync>(
     if n_genes_used == 0 {
         return Ok(fallback(
             0,
-            "no gene passed the mean>mu_min and var>mean filters (degenerate/near-empty matrix)",
+            "no gene has a mean above mu_min (degenerate/near-empty matrix)",
         ));
     }
 
     let alpha = median(&mut candidates);
     if !alpha.is_finite() || alpha <= 0.0 {
+        // Distinct from the branch above: there WAS a pool, and its median says
+        // the matrix is not overdispersed. Reported separately so `uns["pflog"]`
+        // can tell "nothing to measure" from "measured, and the answer is no".
         return Ok(fallback(
             n_genes_used,
-            "pooled median α is non-positive or non-finite",
+            "the matrix is not overdispersed: the pooled median α over              {n_genes_used} gene(s) is non-positive or non-finite",
         ));
     }
 
@@ -373,6 +405,87 @@ fn median(v: &mut [f64]) -> f64 {
         0.5 * (v[n / 2 - 1] + v[n / 2])
     }
 }
+
+#[cfg(test)]
+use scx_format_io::Result as IoResult;
+#[cfg(test)]
+use scx_sparse::ScxCsr;
+
+// --- test-only fixture scaffolding ------------------------------------------
+//
+// At module scope rather than inside `mod tests`, so the reference-values module
+// mounted below can build the same kind of source without a second copy. This is
+// the arrangement Phase 7a settled on in `hvg/cpu.rs`, whose comment records the
+// reason: the crate already carries several in-memory `ShardSource` doubles and
+// another one is not an improvement.
+
+#[cfg(test)]
+/// Build a CSR shard from a dense row-major matrix (drops zeros).
+fn csr_from_dense(rows: &[Vec<f32>]) -> ScxCsr {
+    let n_rows = rows.len();
+    let n_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    for row in rows {
+        for (c, &v) in row.iter().enumerate() {
+            if v != 0.0 {
+                indices.push(c as i32);
+                data.push(v);
+            }
+        }
+        indptr.push(indices.len() as i64);
+    }
+    ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+}
+
+#[cfg(test)]
+/// Multi-shard raw-count `ShardSource` over a list of CSR shards.
+pub(crate) struct MultiShardSource {
+    shards: Vec<ScxCsr>,
+    n_obs: usize,
+    n_vars: usize,
+}
+
+#[cfg(test)]
+impl ShardSource for MultiShardSource {
+    fn n_shards(&self) -> usize {
+        self.shards.len()
+    }
+    fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+    fn n_vars(&self) -> usize {
+        self.n_vars
+    }
+    fn read_shard(&self, shard_idx: usize) -> IoResult<ScxCsr> {
+        Ok(self.shards[shard_idx].clone())
+    }
+}
+
+#[cfg(test)]
+/// Raw-count source split into the given per-shard row groups.
+pub(crate) fn raw_source_from_shards(shards: &[&[Vec<f32>]], n_vars: usize) -> MultiShardSource {
+    let csr_shards: Vec<ScxCsr> = shards.iter().map(|s| csr_from_dense(s)).collect();
+    let n_obs = shards.iter().map(|s| s.len()).sum();
+    MultiShardSource {
+        shards: csr_shards,
+        n_obs,
+        n_vars,
+    }
+}
+
+// The external oracle for the α estimator (§7.14, ORG-7.21-4): counts simulated
+// from a known dispersion, generated by
+// `benchmarks/scripts/generate_pflog_alpha_references.py`. The values module is
+// `pub(crate)` only so the tests module beside it can read the tables; nothing
+// outside `#[cfg(test)]` sees either.
+#[cfg(test)]
+#[path = "pflog_reference_tests.rs"]
+mod pflog_reference_tests;
+#[cfg(test)]
+#[path = "pflog_reference_values.rs"]
+pub(crate) mod pflog_reference_values;
 
 #[cfg(test)]
 #[path = "pflog_tests.rs"]

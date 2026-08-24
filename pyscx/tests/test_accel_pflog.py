@@ -33,18 +33,14 @@ def reference_dense(X, alpha):
     return L - L.mean(axis=1, keepdims=True)
 
 
-def reference_alpha(X, mu_min=1e-3):
-    """Independent Python MoM: α_g = (var−mean)/mean² (Bessel var), filtered by
-    mean>mu_min & var>mean, pooled by median. Returns (median_alpha, n_used)."""
-    X = np.asarray(X, dtype=np.float64)
-    mean = X.mean(axis=0)
-    var = X.var(axis=0, ddof=1)
-    mask = (mean > mu_min) & (var > mean)
-    cand = ((var - mean) / (mean * mean))[mask]
-    cand = cand[np.isfinite(cand) & (cand > 0)]
-    if cand.size == 0:
-        return float("nan"), 0
-    return float(np.median(cand)), int(cand.size)
+# The estimator's numerics are pinned Rust-side against counts simulated from a
+# known dispersion (`scx-accel/src/pflog_reference_tests.rs`). A Python
+# re-implementation of the MoM median used to live here and assert equality with
+# it; it carried the same `var > mean` pre-filter as the code under test, so all
+# it could confirm was that two copies of one bug agreed (§7.14). What is left
+# below is the binding's job: that `alpha=None` routes to estimation and that the
+# stamped `uns["pflog"]` fields are internally consistent.
+MU_MIN = 1e-3
 
 
 def small_adata():
@@ -58,6 +54,25 @@ def small_adata():
             [0, 0, 6, 2],
             [3, 3, 1, 0],
         ],
+        dtype=np.float32,
+    )
+    ad = anndata.AnnData(sp.csr_matrix(X))
+    ad.var_names = [f"gene_{i}" for i in range(X.shape[1])]
+    ad.obs_names = [f"cell_{i}" for i in range(X.shape[0])]
+    return ad, X
+
+
+def underdispersed_gene_adata():
+    """6×3 counts whose first gene is constant, so `var == 0 < mean`.
+
+    `small_adata`'s four genes are all over-dispersed, which makes any assertion
+    about the size of the α pool pass whether or not the pre-fix `var > mean`
+    filter is present. This fixture is the discriminating one: the pool is 3
+    genes, the filtered pool would be 2, and the two give different α
+    (0.379 vs 0.525).
+    """
+    X = np.array(
+        [[2, 0, 4], [2, 5, 0], [2, 1, 7], [2, 3, 1], [2, 0, 5], [2, 6, 2]],
         dtype=np.float32,
     )
     ad = anndata.AnnData(sp.csr_matrix(X))
@@ -110,15 +125,45 @@ class TestAlphaEstimation:
         ad, X = small_adata()
         pyscx.accel.pflog(ad, store="baseline")  # alpha=None → estimate
         meta = ad.uns["pflog"]
-        ref_alpha, ref_k = reference_alpha(X)
-        assert ref_k > 0  # fixture is overdispersed → real estimate, not fallback
         assert meta["version"] == "v4"
         assert meta["alpha_source"] == "estimated"
-        assert int(meta["n_genes_used"]) == ref_k
         assert not bool(meta["fell_back"])
-        np.testing.assert_allclose(float(meta["alpha"]), ref_alpha, rtol=1e-6)
+
+        # `n_genes_used` is the size of the median pool, and the pool is every
+        # gene with a mean above `mu_min` — nothing else is excluded. Counting
+        # that here is a threshold on a column mean, not a second copy of the
+        # estimator. On THIS fixture every gene is over-dispersed, so the
+        # assertion holds with or without a dispersion filter; the discriminating
+        # case is `test_pool_includes_underdispersed_genes` below.
+        n_with_a_mean = int((np.asarray(X, dtype=np.float64).mean(axis=0) > MU_MIN).sum())
+        assert n_with_a_mean > 0, "fixture has no gene above mu_min"
+        assert int(meta["n_genes_used"]) == n_with_a_mean
+
+        alpha = float(meta["alpha"])
+        assert alpha > 0.0 and np.isfinite(alpha)
         np.testing.assert_allclose(
-            float(meta["pseudocount"]), 1.0 / (4.0 * ref_alpha), rtol=1e-6
+            float(meta["pseudocount"]), 1.0 / (4.0 * alpha), rtol=1e-12
+        )
+
+    def test_pool_includes_underdispersed_genes(self):
+        """A constant gene has a mean, so it belongs in the α pool (§7.14).
+
+        With the pre-fix `var > mean` filter this reports 2 pooled genes and a
+        different α; the filter kept only the upper tail of the dispersion
+        distribution and biased the estimate high.
+        """
+        ad, X = underdispersed_gene_adata()
+        pyscx.accel.pflog(ad, store="baseline")  # alpha=None → estimate
+        meta = ad.uns["pflog"]
+        assert meta["alpha_source"] == "estimated"
+        assert not bool(meta["fell_back"])
+        assert int(meta["n_genes_used"]) == 3, (
+            "the constant gene was dropped from the pool before the median"
+        )
+        alpha = float(meta["alpha"])
+        assert alpha > 0.0 and np.isfinite(alpha)
+        np.testing.assert_allclose(
+            float(meta["pseudocount"]), 1.0 / (4.0 * alpha), rtol=1e-12
         )
 
     def test_pinned_alpha_stamps_source(self):
