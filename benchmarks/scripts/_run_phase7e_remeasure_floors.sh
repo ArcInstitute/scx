@@ -53,7 +53,12 @@ N_COMPS = 50
 WANT = [(ds, arm) for ds in ("pbmc3k", "census_1m")
         for arm in ("harmonypy_cpu", "pyscx_cpu", "pyscx_gpu")]
 seen, failures = set(), []
-by_name = {d.name: d for d in DATASETS}
+# `config.DATASETS` is a dict keyed by name, not a list of DatasetConfig.
+# The first version iterated it and read `.name` off the keys, which is
+# how this job failed with `'str' object has no attribute 'name'` — the
+# fail-loud exit added this round is what surfaced it as rc=1 rather than
+# as a green job with no floors.
+by_name = dict(DATASETS)
 
 for ds in ("pbmc3k", "census_1m"):
     try:
