@@ -1474,6 +1474,26 @@ Rust-native re-implementation of the Harmony2 algorithm (Korsunsky et al., 2019)
 
 > **Withdrawn, pending re-measurement.** A table here previously reported *mean per-PC Pearson r* of **0.999 / 0.989 / 0.999** against R `harmony` "v2.x" on three fixtures. Three problems: the numbers pre-date the soft k-means M-step (`scx-accel/src/harmony/cpu.rs::update_y`), which changes the corrected embedding; the fixtures they were measured on are `.npz` files under `benchmarks/results/harmony/reference/` that are **gitignored**, so `pyscx/tests/test_harmony_validation.py` skips for every contributor and for CI and nobody can reproduce them; and the installed R package is **1.2.4**, not v2.x (the *algorithm* is Harmony2 — the version string was wrong). The figures are removed rather than restated, and will return when they are measured on current code against a fixture that ships.
 
+> **⚠️ Withdrawn, pending re-measurement — the Harmony wall-time table below and
+> every figure derived from it.** These were captured before the soft k-means
+> M-step (`scx-accel/src/harmony/cpu.rs::update_y`). The M-step adds a centroid
+> gemm, a column normalization and a full distance recomputation on **every**
+> k-means sub-iteration — up to `max_iter × max_iter_kmeans` = 60 per run — so
+> the `scx-accel CPU` and `scx-accel GPU` rows, the α wall exponents fitted from
+> them, and the "~13M cells in ~2 h" / "~23M cells in ~3 h" capacity
+> extrapolations do not describe the current code. The accuracy table above was
+> withdrawn for the same reason; these were left standing by mistake and are
+> withdrawn on the same grounds.
+>
+> First aligned measurement on the gate fixtures, for scale (harmonypy pinned to
+> the same seed, cluster count, tolerances and dynamic-lambda policy):
+> census_1m (1M cells, 618 donors) — harmonypy 1697 s, scx-accel CPU 565 s,
+> scx-accel GPU 125 s. Not a replacement for the sweep; a single point.
+>
+> The **peak-RSS** table is retained: the M-step allocates no new host memory
+> (`update_y` writes into the existing `y` buffer, and the device gemm targets
+> the already-allocated `d_y`), so those figures are unaffected by this change.
+
 Scaling sweep (d=30, K=100, theta=2, max_iter=10) — wall time in seconds per dataset size:
 
 | Impl / device | D1 (2.7K) | D2 (11.8K) | D3 (50K) | D4 (100K) | D5 (500K) | D6 (1M) | D7 (5M) | α (wall) |

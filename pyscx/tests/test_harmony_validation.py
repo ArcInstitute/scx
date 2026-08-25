@@ -41,11 +41,14 @@ noise*:
     `Rtsne::Hbeta`; see benchmarks/results/harmony/REPORT.md for the
     cross-impl LISI table).
 
-Observed mean per-PC r on the three validation sets (see diagnostic
-values from `benchmarks/scripts/build_harmony_validation_fixtures.py`
-in the Phase 6 logs): pbmc_small 0.9992, cell_lines 0.9885,
-hlca_subset 0.9991. Cell-lines is the worst case because smartseq2 has
-47 batches at only ~9.5k cells, amplifying init-seed sensitivity.
+Observed mean per-PC r is deliberately NOT quoted here any more. It was
+— pbmc_small 0.9992, cell_lines 0.9885, hlca_subset 0.9991 — and those
+are pre-M-step numbers on the same gitignored fixtures whose published
+form Phase 7e withdrew from `docs/api.md`, `docs/scanpy.md` and
+`docs/performance.md`. Restating them in a test module would make that
+withdrawal internally inconsistent. Run with the fixtures present to see
+the current values. (Cell-lines remains the worst case: smartseq2 has 47
+batches at only ~9.5k cells, amplifying init-seed sensitivity.)
 """
 
 from __future__ import annotations

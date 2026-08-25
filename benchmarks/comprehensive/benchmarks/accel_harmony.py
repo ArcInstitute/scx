@@ -82,19 +82,35 @@ _SYNTHETIC_N_BATCHES = 3
 # own default of 0 — while the module and `thresholds.yaml` both said the two
 # sides shared a seed. Found in review by codex and Cursor Agent, independently.
 #
-# Audited pair by pair. `sigma`, `theta`, `lamb`, `alpha`, `block_size` and
-# `tau` already agree between the two libraries; these four do not:
+# ⚠️ The first version of this audit said `sigma`, `theta`, `lamb`, `alpha`,
+# `block_size` and `tau` "already agree". **`lamb` does not**, and that sentence
+# was new false documentation introduced by the fix commit itself. Found in
+# review by Cursor Agent and codex, independently, in round 2.
 #
-#   parameter          pyscx     harmonypy   pinned to
-#   max_iter(_harmony) 10        10          10
-#   max_iter_kmeans    6         20          6
-#   epsilon_harmony    1e-2      1e-4        1e-2 (pyscx's)
-#   epsilon_kmeans /   1e-3      1e-5        1e-3 (pyscx's)
+#   parameter          pyscx        harmonypy 0.2.0   pinned to
+#   max_iter(_harmony) 10           10                10
+#   max_iter_kmeans    6            20                6
+#   epsilon_harmony    1e-2         1e-4              1e-2 (pyscx's)
+#   epsilon_kmeans /   1e-3         1e-5              1e-3 (pyscx's)
 #     epsilon_cluster
+#   lamb               None =>      None => FIXED     dynamic, via
+#                      DYNAMIC      lambda = 1        harmonypy's `lamb=-1`
 #
-# The tolerances are pinned to pyscx's because those are the values a user of
-# `pyscx.accel.harmony_integrate` actually gets, and this floor exists to
-# describe that call.
+# `sigma`, `theta`, `alpha`, `block_size` and `tau` genuinely do agree — that
+# half of the audit was checked and holds.
+#
+# The `lamb` omission was the trap: both calls omitted it, and the omissions
+# mean opposite things. `pyscx`'s `lamb=None` reaches
+# `scx_accel::harmony::build_dynamic_lambda` (`lam[j+1] = alpha * E[k,gb]`);
+# harmonypy's `lamb=None` builds a vector of ones and sets
+# `lambda_estimation = False`. harmonypy spells dynamic estimation `lamb=-1`,
+# which routes to `find_lambda_torch` — `lamb[1:] = cluster_E * alpha`, the
+# same formula with the same intercept-0 convention. Verified against both
+# sources, not inferred from the docstrings.
+#
+# Pinned to the DYNAMIC policy because this floor exists to describe what a
+# user of `pyscx.accel.harmony_integrate` actually gets by default.
+_HARMONYPY_DYNAMIC_LAMBDA = -1
 _MAX_ITER = 10
 _MAX_ITER_KMEANS = 6
 _EPSILON_HARMONY = 1e-2
@@ -157,6 +173,10 @@ def _run_harmonypy(adata: Any, batch_key: str, seed: int) -> str:
         max_iter_kmeans=_MAX_ITER_KMEANS,
         epsilon_harmony=_EPSILON_HARMONY,
         epsilon_cluster=_EPSILON_KMEANS,
+        # -1 is harmonypy's spelling of "estimate lambda dynamically", which is
+        # pyscx's `lamb=None` default. Omitting it here would silently pin
+        # lambda = 1 and compare two different ridge policies.
+        lamb=_HARMONYPY_DYNAMIC_LAMBDA,
         random_state=seed,
         verbose=False,
         # Pinned, not left to `device=None`. harmonypy 0.2.0 is torch-backed and
@@ -176,6 +196,10 @@ def _run_pyscx_cpu(adata: Any, batch_key: str, seed: int) -> str:
     pyscx.accel.harmony_integrate(
         adata, batch_key, device="cpu", random_state=seed,
         n_clusters=_n_clusters(adata),
+        # Explicit even though it is the default: the harmonypy arm has to name
+        # the matching policy, so naming it on both sides is what keeps the two
+        # from drifting apart again.
+        lamb=None,
         max_iter=_MAX_ITER, max_iter_kmeans=_MAX_ITER_KMEANS,
         epsilon_harmony=_EPSILON_HARMONY, epsilon_kmeans=_EPSILON_KMEANS,
     )
@@ -188,6 +212,10 @@ def _run_pyscx_gpu(adata: Any, batch_key: str, seed: int) -> str:
     pyscx.accel.harmony_integrate(
         adata, batch_key, device="gpu", random_state=seed,
         n_clusters=_n_clusters(adata),
+        # Explicit even though it is the default: the harmonypy arm has to name
+        # the matching policy, so naming it on both sides is what keeps the two
+        # from drifting apart again.
+        lamb=None,
         max_iter=_MAX_ITER, max_iter_kmeans=_MAX_ITER_KMEANS,
         epsilon_harmony=_EPSILON_HARMONY, epsilon_kmeans=_EPSILON_KMEANS,
     )
@@ -370,4 +398,5 @@ def run(
     result.metadata["epsilon_harmony"] = _EPSILON_HARMONY
     result.metadata["epsilon_kmeans"] = _EPSILON_KMEANS
     result.metadata["n_clusters"] = _n_clusters(base)
+    result.metadata["lambda_policy"] = "dynamic (alpha * E)"
     return result
