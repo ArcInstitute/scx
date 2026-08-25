@@ -29,11 +29,14 @@ is preserved. The assertions below therefore use slightly looser
 thresholds that still establish *numerical equivalence up to stochastic
 noise*:
 
-  * Per-PC Pearson r >= 0.95  (>= 0.998 in the deterministic limit,
-    which would require aligning RNG streams across languages —
-    deferred as a future improvement).
-  * Iteration count within ±6 (RNG divergence perturbs the per-iter
-    objective trajectory).
+  * Per-PC Pearson r >= 0.95 per PC and >= 0.97 on the mean (0.998
+    would require aligning RNG streams across languages — deferred).
+    The test is named for what it enforces (`test_per_pc_pearson_ge_095`);
+    it was named `..._ge_0998` while asserting 0.95.
+  * Iteration count: REPORTED, not asserted. It carried "within ±6",
+    which is vacuous at max_iter=10 — R returns 4/8/5 on these three
+    fixtures and SCX can only return 1-10, so every reachable value
+    passed. Deleted in Phase 7e; the counts are printed instead.
   * LISI mean within 5% (R `lisi` has its own RNG path through
     `Rtsne::Hbeta`; see benchmarks/results/harmony/REPORT.md for the
     cross-impl LISI table).

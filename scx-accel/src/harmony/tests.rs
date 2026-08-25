@@ -573,6 +573,63 @@ fn test_gpu_harmony_shape_matches_cpu() {
     assert!(result.z_corrected.iter().all(|v| v.is_finite()));
 }
 
+/// `max_iter_kmeans = 0` must not make the two arms compute different things.
+///
+/// The sub-loop body never runs at zero, so the M-step — the only write to
+/// `d_y` on the device — never fires. Without an explicit seed, `d_y` stays the
+/// zeros it was allocated as while the CPU arm keeps its k-means++ centroids,
+/// and the `iter > 0` cold-start then computes every distance from an all-zero
+/// centroid matrix. Zero is reachable: `rscx` rejects it, `pyscx` and
+/// `HarmonyState::new` do not.
+///
+/// `max_iter >= 2` is required for the divergence to surface at all — it shows
+/// up through the *next* outer iteration's cold start. Found in review by codex.
+#[cfg(feature = "gpu")]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn test_gpu_vs_cpu_agree_with_no_kmeans_sub_iterations() {
+    require_gpu_or_skip!();
+    let n_per = 80;
+    let d = 5;
+    let (emb, labels) = batched_gaussian(n_per, d, 123);
+    let n = emb.len() / d;
+    let cov = BatchCovariate {
+        labels,
+        n_levels: 2,
+        name: None,
+    };
+    let config = HarmonyConfig {
+        n_clusters: Some(4),
+        max_iter: 3,
+        max_iter_kmeans: 0,
+        random_state: 11,
+        ..Default::default()
+    };
+    let cpu = harmony_integrate(&emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+    let gpu = harmony_integrate_gpu(0, &emb, n, d, std::slice::from_ref(&cov), &config).unwrap();
+    for pc in 0..d {
+        let x: Vec<f64> = (0..n).map(|i| cpu.z_corrected[i * d + pc]).collect();
+        let y: Vec<f64> = (0..n).map(|i| gpu.z_corrected[i * d + pc]).collect();
+        let mx = x.iter().sum::<f64>() / n as f64;
+        let my = y.iter().sum::<f64>() / n as f64;
+        let (mut num, mut dx, mut dy) = (0.0, 0.0, 0.0);
+        for i in 0..n {
+            let (a, b) = (x[i] - mx, y[i] - my);
+            num += a * b;
+            dx += a * a;
+            dy += b * b;
+        }
+        if dx > 1e-8 && dy > 1e-8 {
+            let r = num / (dx.sqrt() * dy.sqrt());
+            assert!(
+                r > 0.999,
+                "max_iter_kmeans=0, PC {pc}: r={r} — the GPU arm is not using \
+                 the k-means++ centroids the CPU arm uses"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "gpu")]
 #[test]
 #[ignore = "requires a CUDA GPU"]
@@ -653,10 +710,20 @@ fn test_gpu_vs_cpu_per_pc_correlation() {
 /// docstring on `harmony_integrate_gpu` calls out f32 rounding +
 /// atomic-ordering nondeterminism in the O/E updates), so a
 /// fixed-tolerance coordinate-wise check would be brittle. Using
-/// the same Pearson-r ≥ 0.95 contract as the CPU↔GPU test gives
-/// us a noise-aware bound that catches "graph replay produced a
+/// the same Pearson-r contract as the CPU↔GPU test gives us a
+/// noise-aware bound that catches "graph replay produced a
 /// fundamentally different embedding" while accepting legitimate
 /// jitter.
+///
+/// **The bar is 0.999, not 0.95** — the same number as the CPU↔GPU
+/// test, because "the same contract" has to mean the same threshold.
+/// It was left at 0.95 when that test was tightened, and this test
+/// guards a failure mode Phase 7e's M-step newly created: the M-step
+/// writes `d_dist` OUTSIDE the captured region and the replayed
+/// kernels only read it, so a replay observing a stale distance
+/// matrix is exactly the one-armed-M-step shape that 0.95 was
+/// measured unable to see (0.9984 vs a 0.95 bar). Found in review by
+/// Cursor Agent.
 ///
 /// We flip the kill switch in-process via
 /// `set_cuda_graphs_enabled_override` so both paths run in the
@@ -716,8 +783,8 @@ fn test_gpu_harmony_graph_vs_direct_parity() {
         let r = num / (dx.sqrt() * dy.sqrt() + 1e-30);
         if dx > 1e-8 && dy > 1e-8 {
             assert!(
-                r > 0.95,
-                "graph vs direct PC {pc}: r={r:.4} (expected > 0.95). \
+                r > 0.999,
+                "graph vs direct PC {pc}: r={r:.4} (expected > 0.999). \
                      Suggests sub-iter capture/replay diverges from the \
                      direct kernel sequence — likely a stream-binding or \
                      buffer-pointer bug, NOT atomic-race jitter (which \

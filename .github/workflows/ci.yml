@@ -1309,6 +1309,22 @@ jobs:
           echo "$body" | grep -q "self.update_y()" || { echo "::error::\`cluster_iteration\` no longer calls \`update_y\` — the soft k-means sub-loop is back to frozen centroids, which is review §7.4 exactly (ORG-7.21-4)."; exit 1; }
           echo "$body" | grep -q "compute_distances(" || { echo "::error::\`cluster_iteration\` no longer recomputes distances — the M-step's output is not reaching the E-step (ORG-7.21-4, §7.4)."; exit 1; }
 
+          # The GPU sub-loop must call the M-step too. `gpu_m_step_matches_harmonypy`
+          # exercises the device kernel in ISOLATION, and every GPU test in this
+          # crate is `#[ignore]`d and needs hardware CI does not have -- so
+          # deleting the GPU launch would fail nothing this job can see. That is
+          # the same call-site-vs-kernel gap the CPU half above exists to close.
+          # Found in review by Cursor Agent.
+          gpu=scx-accel/src/harmony/gpu.rs
+          test -f "$gpu" || { echo "::error::$gpu is missing."; exit 1; }
+          sub=$(awk '/for _sub in 0\.\./{f=1} f{print} f&&/^        }$/{exit}' "$gpu")
+          if [ -z "$sub" ]; then
+            echo "::error::awk matched no \`for _sub in 0..\` sub-loop in $gpu — renamed or restructured. This guard fails rather than passing vacuously (ORG-7.21-4)."
+            exit 1
+          fi
+          echo "$sub" | grep -q "gpu_harmony_update_y(" || { echo "::error::the GPU k-means sub-loop no longer calls \`gpu_harmony_update_y\` — the device arm is back to frozen centroids while the CPU arm has an M-step, and no CI-visible test covers that (ORG-7.21-4, §7.4)."; exit 1; }
+          echo "$sub" | grep -q "dispatch_harmony_distances(" || { echo "::error::the GPU k-means sub-loop no longer recomputes distances after the M-step (ORG-7.21-4, §7.4)."; exit 1; }
+
           # The ridge solve must not write the centroid on EITHER arm. That copy
           # was the stand-in for the missing M-step, and the GPU arm had its own.
           for f in scx-accel/src/harmony/cpu.rs scx-accel/src/harmony/gpu.rs; do

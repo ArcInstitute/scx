@@ -73,11 +73,32 @@ _BATCH_CANDIDATES = ("batch", "donor_id", "sample", "sample_id", "dataset_id", "
 _SYNTHETIC_BATCH = "_harmony_bench_batch"
 _SYNTHETIC_N_BATCHES = 3
 
-# Harmony's own defaults, pinned here so all three arms are timed on the same
-# work. `max_iter_kmeans` is the sub-loop the Phase 7e M-step runs in, so it is
-# the parameter this benchmark is most sensitive to.
+# Pinned on EVERY arm, because pyscx and harmonypy do not share these defaults
+# and an unpinned parameter turns the correctness floor into a comparison of
+# stopping policies rather than of implementations.
+#
+# The first version of this module pinned only the iteration caps and the
+# device, and passed `random_state=42` to pyscx while letting harmonypy take its
+# own default of 0 — while the module and `thresholds.yaml` both said the two
+# sides shared a seed. Found in review by codex and Cursor Agent, independently.
+#
+# Audited pair by pair. `sigma`, `theta`, `lamb`, `alpha`, `block_size` and
+# `tau` already agree between the two libraries; these four do not:
+#
+#   parameter          pyscx     harmonypy   pinned to
+#   max_iter(_harmony) 10        10          10
+#   max_iter_kmeans    6         20          6
+#   epsilon_harmony    1e-2      1e-4        1e-2 (pyscx's)
+#   epsilon_kmeans /   1e-3      1e-5        1e-3 (pyscx's)
+#     epsilon_cluster
+#
+# The tolerances are pinned to pyscx's because those are the values a user of
+# `pyscx.accel.harmony_integrate` actually gets, and this floor exists to
+# describe that call.
 _MAX_ITER = 10
 _MAX_ITER_KMEANS = 6
+_EPSILON_HARMONY = 1e-2
+_EPSILON_KMEANS = 1e-3
 
 
 def accel_harmony_variants() -> list[FormatVariant]:
@@ -112,7 +133,18 @@ def _resolve_batch_key(adata: Any) -> str:
     return _SYNTHETIC_BATCH
 
 
-def _run_harmonypy(adata: Any, batch_key: str, _seed: int) -> str:
+def _n_clusters(adata: Any) -> int:
+    """The cluster count BOTH arms are pinned to.
+
+    `pyscx` resolves `n_clusters=None` as `clamp(n_obs / 30, 2, 100)`
+    (`scx_accel::harmony::resolve_n_clusters`); harmonypy resolves `nclust=None`
+    by its own rule. Left unpinned they can disagree, and a floor comparing two
+    runs with different K is not comparing implementations.
+    """
+    return max(2, min(100, len(adata) // 30))
+
+
+def _run_harmonypy(adata: Any, batch_key: str, seed: int) -> str:
     import harmonypy
     import pandas as pd
 
@@ -120,8 +152,12 @@ def _run_harmonypy(adata: Any, batch_key: str, _seed: int) -> str:
         adata.obsm["X_pca"],
         pd.DataFrame({batch_key: adata.obs[batch_key].astype(str).values}),
         [batch_key],
+        nclust=_n_clusters(adata),
         max_iter_harmony=_MAX_ITER,
         max_iter_kmeans=_MAX_ITER_KMEANS,
+        epsilon_harmony=_EPSILON_HARMONY,
+        epsilon_cluster=_EPSILON_KMEANS,
+        random_state=seed,
         verbose=False,
         # Pinned, not left to `device=None`. harmonypy 0.2.0 is torch-backed and
         # picks a device itself, so on a GPU node this variant would silently
@@ -139,7 +175,9 @@ def _run_pyscx_cpu(adata: Any, batch_key: str, seed: int) -> str:
 
     pyscx.accel.harmony_integrate(
         adata, batch_key, device="cpu", random_state=seed,
+        n_clusters=_n_clusters(adata),
         max_iter=_MAX_ITER, max_iter_kmeans=_MAX_ITER_KMEANS,
+        epsilon_harmony=_EPSILON_HARMONY, epsilon_kmeans=_EPSILON_KMEANS,
     )
     return adata.uns.get("harmony", {}).get("backend", "scx-accel-cpu")
 
@@ -149,7 +187,9 @@ def _run_pyscx_gpu(adata: Any, batch_key: str, seed: int) -> str:
 
     pyscx.accel.harmony_integrate(
         adata, batch_key, device="gpu", random_state=seed,
+        n_clusters=_n_clusters(adata),
         max_iter=_MAX_ITER, max_iter_kmeans=_MAX_ITER_KMEANS,
+        epsilon_harmony=_EPSILON_HARMONY, epsilon_kmeans=_EPSILON_KMEANS,
     )
     return adata.uns.get("harmony", {}).get("backend", "scx-accel-gpu")
 
@@ -327,4 +367,7 @@ def run(
             float(np.median(rs)), 4
         )
     result.metadata["backend"] = backend
+    result.metadata["epsilon_harmony"] = _EPSILON_HARMONY
+    result.metadata["epsilon_kmeans"] = _EPSILON_KMEANS
+    result.metadata["n_clusters"] = _n_clusters(base)
     return result

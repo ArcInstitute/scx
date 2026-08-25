@@ -662,18 +662,30 @@ absolute_floors:
   # that number pre-dates the Phase 7e M-step and was measured on gitignored
   # fixtures nobody can rerun.
   #
-  # Measured, post-M-step, with a fixed `random_state` on both sides:
+  # ⚠️ The first version of this comment said these were measured "with a fixed
+  # `random_state` on both sides". THAT WAS FALSE: the benchmark passed
+  # `random_state=42` to pyscx and let harmonypy take its own default of 0, and
+  # `epsilon_harmony` / `epsilon_kmeans` were unmatched too (1e-2/1e-3 vs
+  # 1e-4/1e-5). Found in review by codex and Cursor Agent, independently. The
+  # arms are now pinned to one seed, one cluster count and one pair of
+  # tolerances, and these numbers are re-measured on THAT configuration —
+  # the earlier ones described a comparison that no longer exists.
   #
-  #     pbmc3k     cpu 0.9996   gpu 0.9995   (5 runs each, spread EXACTLY zero)
-  #     census_1m  cpu 0.9891   gpu 0.9902   (3 runs each, spread EXACTLY zero,
-  #                                           618 real donors via `donor_id`)
+  # Re-measured post-M-step with all three arms aligned:
   #
-  # The zero spread is not luck: both implementations are deterministic given
-  # the seed, so this metric has no run-to-run noise to absorb. The floors are
-  # therefore set for cross-ENVIRONMENT drift (a different BLAS, node, or
-  # harmonypy build), not for sampling noise — roughly 100x the observed gap on
-  # pbmc3k and 3x on census_1m, which is the harder fixture because 618 batches
+  #     pbmc3k     cpu 0.999   (local, seed 42 both sides, K=90)
+  #     census_1m  job 2842829, 618 real donors via `donor_id`
+  #
+  # pbmc3k moved 0.9996 -> 0.999 once the seeds matched, so 0.99 still holds
+  # with 0.009 of headroom. The census_1m floor below is the pre-alignment
+  # measurement (0.9891 cpu / 0.9902 gpu) until 2842829 reports; it is the
+  # looser of the two bars and the arm most likely to move, because 618 batches
   # give k-means++ far more room to diverge from sklearn's init.
+  #
+  # Run-to-run spread is exactly zero: both implementations are deterministic
+  # given the seed, so this metric has no sampling noise for a floor to absorb.
+  # The floors are therefore sized for cross-ENVIRONMENT drift (a different
+  # BLAS, node, or harmonypy build), not for run-to-run variance.
   - benchmark: accel_harmony
     format: accel_harmony__pyscx_cpu
     dataset: pbmc3k

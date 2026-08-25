@@ -314,6 +314,33 @@ fn update_r_matches_harmonypy_with_the_penalty_switched_off() {
 
 // ─── Arm 4: the objective, decomposed ────────────────────────────────
 
+/// The production `compute_objective`, against harmonypy's own components.
+///
+/// `objective_parts` below decomposes the same formula so the parity halves and
+/// the divergence half can be asserted apart — but a decomposition is a second
+/// copy, and two copies of one formula agreeing is the evidence shape this
+/// phase retires everywhere else. This arm closes that: it calls the function
+/// `cluster_iteration` actually uses and compares its TOTAL against harmonypy's
+/// three components, with the documented cross-entropy gap subtracted.
+///
+/// Changing the `+1` smoothing in `cpu.rs`, or dropping its `num > 0 && den > 0`
+/// guard, now reds here even though `objective_parts` would follow the edit.
+/// Found in review by Cursor Agent.
+#[test]
+fn the_production_objective_matches_harmonypy_minus_the_stated_gap() {
+    let s = fixture_state(r::HP_THETA, r::HP_BLOCK_SIZE, 1);
+    let got = s.compute_objective();
+    // harmonypy's total, adjusted by the cross-entropy divergence this module
+    // pins: SCX's cross-entropy sits `HP_OBJ_CROSS_GAP` BELOW harmonypy's.
+    let want = r::HP_OBJ_DIST + r::HP_OBJ_ENTROPY + (r::HP_OBJ_CROSS - r::HP_OBJ_CROSS_GAP);
+    let d = (got - want).abs();
+    assert!(
+        d <= r::HP_OBJ_ATOL,
+        "compute_objective returned {got}, expected {want} \
+         (harmonypy total minus the pinned cross-entropy gap): |delta| {d:.3e}"
+    );
+}
+
 /// Recompute the three objective components the way `compute_objective` does,
 /// but separately, so the parity halves and the divergence half can be
 /// asserted apart. The formulas are read off `compute_objective`; they are not

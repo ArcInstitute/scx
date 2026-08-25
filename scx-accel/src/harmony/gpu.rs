@@ -254,8 +254,12 @@ fn run_kmeans_subiter_kernels(
 /// Output is bit-compatible in shape with the CPU path
 /// (`HarmonyResult`), but values differ from the CPU reference by
 /// f32 rounding plus atomic-ordering nondeterminism in the O/E
-/// updates. The validation gate is per-PC Pearson r ≥ 0.95
-/// (`test_gpu_vs_cpu_per_pc_correlation`); the CPU
+/// updates. The validation gate is per-PC Pearson r > 0.999
+/// (`test_gpu_vs_cpu_per_pc_correlation`) — measured, not assumed:
+/// the two arms agree to nine decimals on that fixture when they run
+/// the same algorithm, and the published 0.95 was three orders looser
+/// than the signal, wide enough to accept an arm missing the M-step
+/// entirely. The CPU
 /// `test_determinism_same_seed` bit-exact contract applies only
 /// to the CPU path.
 pub fn harmony_integrate_gpu(
@@ -371,6 +375,26 @@ pub fn harmony_integrate_gpu(
     dev.stream()
         .memcpy_htod(&state.dist_mat, &mut d_dist)
         .map_err(|e| AccelError::LinAlg(format!("upload dist (iter 0 cold-start): {e}")))?;
+
+    // Seed `d_y` with the k-means++ centroids `HarmonyState::new` computed.
+    //
+    // The M-step overwrites this on its first sub-iteration, so it looks
+    // redundant — and it is, for every `max_iter_kmeans >= 1`. At
+    // `max_iter_kmeans = 0` the sub-loop body never runs, so without this the
+    // ONLY write to `d_y` never happens: it stays the zeros it was allocated
+    // as, the `iter > 0` cold-start computes every distance from an all-zero
+    // centroid matrix, and the read-back below overwrites `state.y` with zeros
+    // too. The CPU arm keeps its initialized centroids in that configuration,
+    // so the two arms would silently compute different things.
+    //
+    // Zero is reachable: `rscx` rejects `max_iter_kmeans < 1`, but neither
+    // `pyscx` nor `HarmonyState::new` does. Before Phase 7e the `iter > 0`
+    // branch re-uploaded `state.y` every outer iteration, which masked this;
+    // removing that upload is what exposed it. Found in review by codex.
+    let y_init = f64_to_f32(&state.y);
+    dev.stream()
+        .memcpy_htod(&y_init, &mut d_y)
+        .map_err(|e| AccelError::LinAlg(format!("seed Y from k-means++ init: {e}")))?;
 
     // `Z_cos = l2_normalize(Z_corr)`. Previously only the `iter > 0`
     // cold-start branch built this, because nothing at iter 0 read it —

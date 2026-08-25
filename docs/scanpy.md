@@ -2473,7 +2473,8 @@ gates mean per-PC Pearson r vs harmonypy as an absolute floor
 > it. It is not restated until it is re-measured on the current code. Two
 > further corrections: the installed R package is **1.2.4** (the
 > *algorithm* is Harmony2 — the version string was wrong), and
-> `pyscx/tests/test_harmony_validation.py::test_per_pc_pearson_ge_0998`
+> `pyscx/tests/test_harmony_validation.py::test_per_pc_pearson_ge_095` (renamed
+> in Phase 7e; it was `..._ge_0998`)
 > asserts **0.95** per PC and 0.97 on the mean, not the 0.998 its name
 > claims.
 
