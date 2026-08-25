@@ -1247,6 +1247,145 @@ jobs:
               raise SystemExit(1)
           PY
 
+      - name: Harmony's M-step and LISI's neighbourhood are pinned against harmonypy
+        run: |
+          set -euo pipefail
+          hvals=scx-accel/src/harmony/harmony_reference_values.rs
+          htst=scx-accel/src/harmony/harmony_reference_tests.rs
+          lvals=scx-accel/src/lisi_reference_values.rs
+          ltst=scx-accel/src/lisi_reference_tests.rs
+          gen=benchmarks/scripts/generate_harmony_references.py
+          for f in "$hvals" "$htst" "$lvals" "$ltst" "$gen"; do
+            test -f "$f" || { echo "::error::$f is missing — Harmony is back to self-consistency tests, which is the state in which its soft k-means ran with no M-step (ORG-7.21-4, review §7.4)."; exit 1; }
+          done
+
+          # Positive half: defined AND read. A defined-but-unread table is not an
+          # oracle (guard 18's double check). Anchored on the declaration, not the
+          # bare substring, because `grep -q HP_MSTEP_Y` also matches
+          # `HP_MSTEP_Y_ATOL` and `HP_MSTEP_Y_RENAMED` — the hole falsification
+          # found in the α and cell-eval guards.
+          for sym in HP_MSTEP_Y HP_MSTEP_DIST HP_RIDGE_Z_CORR HP_SOFTMAX_R \
+                     HP_FIX_Y HP_FIX_R HP_FIX_DIST HP_FIX_O HP_FIX_E HP_FIX_Z_COS \
+                     HP_OBJ_DIST HP_OBJ_ENTROPY HP_OBJ_CROSS HP_OBJ_CROSS_GAP; do
+            grep -qE "^pub const $sym(:| )" "$hvals" || { echo "::error::$hvals no longer declares \`$sym\` — a harmonypy reference table just vanished (ORG-7.21-4)."; exit 1; }
+            grep -qE "\\br::$sym\\b" "$htst" || { echo "::error::$htst no longer READS r::$sym — a defined-but-unread reference table is not an oracle (ORG-7.21-4)."; exit 1; }
+          done
+          for sym in LISI_EXPECTED LISI_OFF_BY_ONE LISI_X LISI_LABELS \
+                     LISI_HARMONYPY_RETRIEVED LISI_ONE_NEIGHBOUR_SHIFT; do
+            grep -qE "^pub const $sym(:| )" "$lvals" || { echo "::error::$lvals no longer declares \`$sym\` (ORG-7.19)."; exit 1; }
+            grep -qE "\\br::$sym\\b" "$ltst" || { echo "::error::$ltst no longer READS r::$sym (ORG-7.19)."; exit 1; }
+          done
+
+          # The bars must be COMPARED against, not merely declared.
+          for pair in "$hvals|$htst|HP_MSTEP_Y_ATOL" "$hvals|$htst|HP_MSTEP_DIST_ATOL" \
+                      "$hvals|$htst|HP_RIDGE_ATOL" "$hvals|$htst|HP_SOFTMAX_R_ATOL" \
+                      "$hvals|$htst|HP_OBJ_ATOL" "$lvals|$ltst|LISI_ATOL"; do
+            tst=$(echo "$pair" | cut -d'|' -f2); sym=$(echo "$pair" | cut -d'|' -f3)
+            n=$({ grep -cE "(<=|<|>=|>|\*)[[:space:]]*r::$sym\b" "$tst" || true; } | tr -d ' ')
+            if [ "$n" -lt 1 ]; then
+              echo "::error::$sym is declared but never COMPARED against in $tst — its arm is now unchecked (ORG-7.21-4)."
+              exit 1
+            fi
+          done
+
+          # §7.4's negative half, and the one that matters most: the M-step must
+          # be CALLED FROM THE SUB-LOOP, not merely exist. Falsification proved
+          # this is a distinct failure — deleting `self.update_y();` from
+          # `cluster_iteration` while keeping the function left every unit arm
+          # green, because they call `update_y` directly.
+          #
+          # Brace-matched rather than line-numbered: line numbers go stale and a
+          # whole-file grep is satisfied by the definition.
+          cpu=scx-accel/src/harmony/cpu.rs
+          body=$(awk '/fn cluster_iteration\(/,/^    }$/' "$cpu")
+          # Emptiness FIRST. With this after the greps, a renamed function made
+          # the very next `grep -q` fail on empty input and the guard blamed a
+          # missing `update_y` call — right verdict, wrong cause, and the wrong
+          # cause is what someone would go and "fix".
+          if [ -z "$body" ]; then
+            echo "::error::awk matched nothing for \`cluster_iteration\` in $cpu — renamed or moved. This guard cannot tell that from 'clean', so it fails rather than passing vacuously (ORG-7.21-4)."
+            exit 1
+          fi
+          echo "$body" | grep -q "self.update_y()" || { echo "::error::\`cluster_iteration\` no longer calls \`update_y\` — the soft k-means sub-loop is back to frozen centroids, which is review §7.4 exactly (ORG-7.21-4)."; exit 1; }
+          echo "$body" | grep -q "compute_distances(" || { echo "::error::\`cluster_iteration\` no longer recomputes distances — the M-step's output is not reaching the E-step (ORG-7.21-4, §7.4)."; exit 1; }
+
+          # The GPU sub-loop must call the M-step too. `gpu_m_step_matches_harmonypy`
+          # exercises the device kernel in ISOLATION, and every GPU test in this
+          # crate is `#[ignore]`d and needs hardware CI does not have -- so
+          # deleting the GPU launch would fail nothing this job can see. That is
+          # the same call-site-vs-kernel gap the CPU half above exists to close.
+          # Found in review by Cursor Agent.
+          gpu=scx-accel/src/harmony/gpu.rs
+          test -f "$gpu" || { echo "::error::$gpu is missing."; exit 1; }
+          sub=$(awk '/for _sub in 0\.\./{f=1} f{print} f&&/^        }$/{exit}' "$gpu")
+          if [ -z "$sub" ]; then
+            echo "::error::awk matched no \`for _sub in 0..\` sub-loop in $gpu — renamed or restructured. This guard fails rather than passing vacuously (ORG-7.21-4)."
+            exit 1
+          fi
+          echo "$sub" | grep -q "gpu_harmony_update_y(" || { echo "::error::the GPU k-means sub-loop no longer calls \`gpu_harmony_update_y\` — the device arm is back to frozen centroids while the CPU arm has an M-step, and no CI-visible test covers that (ORG-7.21-4, §7.4)."; exit 1; }
+          echo "$sub" | grep -q "dispatch_harmony_distances(" || { echo "::error::the GPU k-means sub-loop no longer recomputes distances after the M-step (ORG-7.21-4, §7.4)."; exit 1; }
+
+          # The ridge solve must not write the centroid on EITHER arm. That copy
+          # was the stand-in for the missing M-step, and the GPU arm had its own.
+          for f in scx-accel/src/harmony/cpu.rs scx-accel/src/harmony/gpu.rs; do
+            n=$({ grep -cE "(self\.)?(state\.)?y\[y_off \+ t\] = w\[t\]" "$f" || true; } | tr -d ' ')
+            if [ "$n" -ne 0 ]; then
+              echo "::error::$f writes the ridge intercept into the centroid again ($n site(s)) — \`update_y\` owns \`y\`, and this clobbers it once per outer iteration (ORG-7.21-4, §7.4)."
+              exit 1
+            fi
+          done
+
+          # §7.19's negative half: ONE derivation of LISI's neighbour count. It
+          # was written out three times — the Rust default and both bindings —
+          # and all three said `3 * perplexity`, so fixing the default alone left
+          # pyscx and rscx one neighbour wide. `default_n_neighbors` is the only
+          # place that arithmetic may appear.
+          for f in pyscx/src/accel/lisi.rs rscx/src/lisi.rs; do
+            n=$({ grep -vE "^\s*(//|///)" "$f" | grep -cE "perplexity \* 3\.0|3\.0 \* perplexity" || true; } | tr -d ' ')
+            if [ "$n" -ne 0 ]; then
+              echo "::error::$f re-derives LISI's neighbour count ($n site(s)) instead of calling scx_accel::lisi::default_n_neighbors — that is how the §7.19 off-by-one survived in three places."
+              exit 1
+            fi
+          done
+          grep -q "pub fn default_n_neighbors" scx-accel/src/lisi.rs || { echo "::error::scx-accel/src/lisi.rs no longer defines \`default_n_neighbors\` — the shared derivation the guard above points every binding at (ORG-7.19)."; exit 1; }
+
+          # Generator provenance: the values must be ones harmonypy PRODUCED.
+          # An `ast` walk over the CALLS, not a grep — this script's docstring
+          # names its methods to document where the numbers come from, so a grep
+          # is satisfied by prose with every call removed (the hole falsification
+          # found in the cell-eval guard).
+          #
+          # The walk reads `ast.Attribute` and `ast.Name` call targets. Note the
+          # `Harmony(...)` constructor is what runs `init_cluster`, so the
+          # fixture itself is harmonypy's; requiring `Harmony` here is what keeps
+          # someone from hand-rolling a fixture and calling only the methods.
+          python3 - "$gen" <<'PYEOF'
+          import ast, sys
+          tree = ast.parse(open(sys.argv[1]).read())
+          called = set()
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Call):
+                  f = n.func
+                  called.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", ""))
+          required = {
+              "Harmony",            # __init__ runs allocate_buffers + init_cluster
+              "cluster",            # the M-step and the distances it invalidates
+              "moe_correct_ridge",  # the ridge solve
+              "update_R",           # the softmax half
+              "compute_objective",  # the three objective components
+              "hpy_lisi",           # harmonypy.lisi.compute_lisi, aliased on import
+          }
+          missing = sorted(required - called)
+          if missing:
+              print(
+                  f"::error file={sys.argv[1]}::this script no longer CALLS "
+                  f"{', '.join(missing)} — a reference it COMPUTES is the "
+                  f"'sibling implementations agreeing' failure ORG-7.21-4 exists "
+                  f"to retire, relocated into the oracle."
+              )
+              raise SystemExit(1)
+          PYEOF
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police

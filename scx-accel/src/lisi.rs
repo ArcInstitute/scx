@@ -29,7 +29,15 @@ use crate::error::{AccelError, Result};
 pub struct LisiConfig {
     /// Target perplexity for the Gaussian kernel (default 30.0).
     pub perplexity: f64,
-    /// Number of neighbours to retrieve (default: `3 * perplexity`).
+    /// Number of neighbours to retrieve (default: `3 * perplexity - 1` = 89).
+    ///
+    /// §7.19. The `-1` is not a fencepost slip, it is harmonypy's shape:
+    /// `compute_lisi` fits `NearestNeighbors(n_neighbors = perplexity * 3)`
+    /// and then drops column 0, which is every point's own self-match
+    /// (`harmonypy/lisi.py`). SCX's sweep skips `j == i` *while* collecting,
+    /// so asking for `3 * perplexity` here yields 90 genuine neighbours where
+    /// harmonypy has 89. The `// 3 * perplexity` comment that used to sit on
+    /// the default is what made 90 look right.
     pub n_neighbors: usize,
     /// Binary-search tolerance on log-perplexity (default 1e-5).
     pub tol: f64,
@@ -42,11 +50,29 @@ pub struct LisiConfig {
     pub approximate_knn: bool,
 }
 
+/// The neighbour count harmonypy's `compute_lisi` effectively uses at a given
+/// perplexity.
+///
+/// §7.19. harmonypy retrieves `ceil(3 * perplexity)` neighbours with
+/// `NearestNeighbors` and then drops column 0 — every point's own self-match —
+/// leaving `3 * perplexity - 1`. SCX's sweep skips `j == i` *while* collecting,
+/// so it must ask for one fewer to end up with the same neighbourhood.
+///
+/// This exists as a function because the derivation was written out three
+/// separate times — here, in `pyscx/src/accel/lisi.rs` and in
+/// `rscx/src/lisi.rs` — and all three said `3 * perplexity`, so fixing the
+/// default alone would have left both bindings one neighbour wide.
+pub fn default_n_neighbors(perplexity: f64) -> usize {
+    ((perplexity * 3.0).ceil() as usize)
+        .saturating_sub(1)
+        .max(1)
+}
+
 impl Default for LisiConfig {
     fn default() -> Self {
         Self {
             perplexity: 30.0,
-            n_neighbors: 90, // 3 * perplexity
+            n_neighbors: default_n_neighbors(30.0),
             tol: 1e-5,
             max_iter: 200,
             approximate_knn: false,

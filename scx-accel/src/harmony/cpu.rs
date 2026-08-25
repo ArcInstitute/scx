@@ -318,6 +318,24 @@ impl HarmonyState {
                 "embeddings contain NaN or Inf".to_string(),
             ));
         }
+        // §7.18. `sigma` is the softmax bandwidth: `update_r` computes
+        // `exp(-dist / sigma)`. At `sigma = 0` that is `-inf` / `NaN`, the
+        // `sum_sd > 0.0` test fails, and the "degenerate: assign uniform"
+        // fallback fires for *every* cell — Harmony returns an essentially
+        // uncorrected embedding and reports `converged = true`. A negative
+        // `sigma` inverts the softmax silently, assigning each cell to the
+        // cluster it is furthest from.
+        //
+        // Checked here rather than at the pyscx boundary on purpose: pyscx,
+        // rscx and any future binding all reach `HarmonyState::new`, and an
+        // invariant enforced in one binding is not enforced (the §9.5 lesson).
+        if !config.sigma.is_finite() || config.sigma <= 0.0 {
+            return Err(AccelError::InvalidInput(format!(
+                "sigma must be finite and > 0 (got {}); it is the softmax \
+                 bandwidth in exp(-dist / sigma)",
+                config.sigma
+            )));
+        }
 
         // --- Dimensions ---
         let n = n_obs;
@@ -882,6 +900,53 @@ fn kmeans_refine(z: &[f64], y: &mut [f64], d: usize, n: usize, k: usize, n_iter:
     }
 }
 
+// ─── M-step: centroids from the current soft assignments ─────────────
+
+impl HarmonyState {
+    /// `Y[:, k] = normalize( Σ_i Z_cos[:, i] · R[k, i] )` — each centroid is
+    /// the R-weighted mean of the L2-normalized embeddings, renormalized onto
+    /// the unit sphere the cosine distance lives on.
+    ///
+    /// This is the M-step of the soft k-means sub-loop. Without it `y` and
+    /// `dist_mat` are frozen for the whole sub-loop and the E-step can only
+    /// trade `Σ R·dist` against the entropy penalty at fixed centroids —
+    /// never move a centroid off a batch-driven mode. Pinned against
+    /// harmonypy 0.2.0 `Harmony.cluster()`, which computes
+    /// `Y = Z_cos @ R.T` followed by a per-column L2 normalization at the top
+    /// of every sub-iteration; see `harmony_reference_tests.rs`.
+    ///
+    /// `z` is the un-normalized d·N embedding (column-major), cosine-normalized
+    /// per cell through `compute_inv_norms` exactly as `compute_distances`
+    /// does, so no `z_cos` buffer is materialized (H9). Clusters own disjoint
+    /// d-length slices of `y`, so we parallelize across clusters and keep the
+    /// inner cell loop sequential — the summation order is then independent of
+    /// how rayon schedules, which `test_determinism_same_seed` gates.
+    fn update_y(&mut self) {
+        let d = self.d;
+        let n = self.n;
+        let inv_norms = compute_inv_norms(&self.z_corr, d, n);
+        let z = &self.z_corr;
+        let r = &self.r;
+        self.y
+            .par_chunks_mut(d)
+            .enumerate()
+            .for_each(|(ku, y_col)| {
+                y_col.fill(0.0);
+                for i in 0..n {
+                    let w = r[ku * n + i] as f64 * inv_norms[i];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let z_col = &z[i * d..(i + 1) * d];
+                    for t in 0..d {
+                        y_col[t] += z_col[t] * w;
+                    }
+                }
+            });
+        l2_normalize_columns(&mut self.y, d, self.k);
+    }
+}
+
 // ─── Cold-start R re-estimation (iterations 2+) ──────────────────────
 
 impl HarmonyState {
@@ -1154,6 +1219,10 @@ impl HarmonyState {
         let mut local_objectives: Vec<f64> = Vec::new();
 
         for _sub in 0..self.config.max_iter_kmeans {
+            // M-step, then the distances it invalidates, then the E-step —
+            // harmonypy 0.2.0 `cluster()` orders them the same way.
+            self.update_y();
+            self.dist_mat = compute_distances(&self.y, &self.z_corr, self.d, self.k, self.n);
             self.update_r();
             let obj = self.compute_objective();
             local_objectives.push(obj);
@@ -1432,10 +1501,15 @@ impl HarmonyState {
                 }
             }
 
-            // Centroid: Y[:, k] = W[0, :]. Zero out W[0, :].
-            let y_off = ku * d;
+            // Zero out W[0, :] — the intercept is not a batch effect, so it
+            // is not subtracted. harmonypy `moe_correct_ridge`: `W[0, :] = 0`.
+            //
+            // This row used to be copied into `Y[:, k]` first. That was the
+            // stand-in for the missing M-step: a centroid written once per
+            // *outer* iteration as a by-product of the correction solve.
+            // `update_y` now owns `y`, and leaving the copy here would clobber
+            // it once per outer iteration.
             for t in 0..d {
-                self.y[y_off + t] = w[t];
                 w[t] = 0.0;
             }
 
@@ -1460,8 +1534,6 @@ impl HarmonyState {
             }
         }
 
-        // L2-normalize centroid columns.
-        l2_normalize_columns(&mut self.y, self.d, self.k);
         Ok(())
     }
 
@@ -1564,3 +1636,14 @@ pub mod gpu;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// ─── Pinned harmonypy reference (§7.4, ORG-7.21-4) ────────────────────
+// Mounted here rather than beside `mod.rs` for the same reason `tests.rs` is:
+// the arms drive `HarmonyState`'s private clustering buffers directly.
+#[cfg(test)]
+#[path = "harmony_reference_tests.rs"]
+mod harmony_reference_tests;
+
+#[cfg(test)]
+#[path = "harmony_reference_values.rs"]
+pub(crate) mod harmony_reference_values;

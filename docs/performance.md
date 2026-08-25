@@ -1470,15 +1470,29 @@ Source: 2026-05-25 full-tier gate (post-G10 graph capture + bench env-routing fi
 
 Rust-native re-implementation of the Harmony2 algorithm (Korsunsky et al., 2019) and the Local Inverse Simpson Index (LISI). Exposed via `pyscx.accel.harmony_integrate` and `pyscx.accel.compute_lisi`; R wrappers are `rscx::scx_harmony_integrate` and `rscx::scx_compute_lisi`. GPU path available behind the `gpu` feature (`pyscx.accel.harmony_integrate(adata, ..., device="gpu")`).
 
-Numerical parity against R `harmony` v2.x (clean-room Rust implementation; validation fixtures + thresholds in `pyscx/tests/test_harmony_validation.py`):
+**Numerical parity** is pinned against **harmonypy 0.2.0** at the level of the clustering primitives, in `scx-accel/src/harmony/harmony_reference_values.rs`, so `cargo test` gates it with no Python installed: the M-step, the cosine-distance kernel, the ridge correction against `torch.linalg.inv`, and `update_R`'s softmax half. End-to-end agreement is gated as a mean per-PC Pearson correlation floor by the `accel_harmony` benchmark (`benchmarks/comprehensive/thresholds.yaml`). Correlation is the strongest claim available end to end: SCX seeds k-means++ from `rand_chacha` where harmonypy uses `sklearn.KMeans` and R uses Mersenne Twister, so the runs start from different cluster geometry.
 
-| Dataset | N | Batches | d | K | mean per-PC Pearson r vs R | mean LISI agreement |
-|---------|---:|---:|---:|---:|---:|---:|
-| pbmc_small (D1) | 2,700 | 3 | 30 | 100 | **0.999** | within 5% |
-| cell_lines (smartseq2, D3) | 9,478 | 47 | 20 | 100 | **0.989** | within 5% |
-| hlca_subset (tabula_sapiens, D4) | 50,000 | 118 | 30 | 100 | **0.999** | within 5% |
+> **Withdrawn, pending re-measurement.** A table here previously reported *mean per-PC Pearson r* of **0.999 / 0.989 / 0.999** against R `harmony` "v2.x" on three fixtures. Three problems: the numbers pre-date the soft k-means M-step (`scx-accel/src/harmony/cpu.rs::update_y`), which changes the corrected embedding; the fixtures they were measured on are `.npz` files under `benchmarks/results/harmony/reference/` that are **gitignored**, so `pyscx/tests/test_harmony_validation.py` skips for every contributor and for CI and nobody can reproduce them; and the installed R package is **1.2.4**, not v2.x (the *algorithm* is Harmony2 — the version string was wrong). The figures are removed rather than restated, and will return when they are measured on current code against a fixture that ships.
 
-The Rust RNG (`rand_chacha`) draws differ from R's Mersenne Twister, so tail PCs can deviate by up to ~2% on high-batch-count inputs (see `benchmarks/results/harmony/REPORT.md` for per-PC curves and wall/RSS scaling across D1–D7 for CPU scx-accel vs harmonypy vs R harmony).
+> **⚠️ Withdrawn, pending re-measurement — the Harmony wall-time table below and
+> every figure derived from it.** These were captured before the soft k-means
+> M-step (`scx-accel/src/harmony/cpu.rs::update_y`). The M-step adds a centroid
+> gemm, a column normalization and a full distance recomputation on **every**
+> k-means sub-iteration — up to `max_iter × max_iter_kmeans` = 60 per run — so
+> the `scx-accel CPU` and `scx-accel GPU` rows, the α wall exponents fitted from
+> them, and the "~13M cells in ~2 h" / "~23M cells in ~3 h" capacity
+> extrapolations do not describe the current code. The accuracy table above was
+> withdrawn for the same reason; these were left standing by mistake and are
+> withdrawn on the same grounds.
+>
+> First aligned measurement on the gate fixtures, for scale (harmonypy pinned to
+> the same seed, cluster count, tolerances and dynamic-lambda policy):
+> census_1m (1M cells, 618 donors) — harmonypy 1697 s, scx-accel CPU 565 s,
+> scx-accel GPU 125 s. Not a replacement for the sweep; a single point.
+>
+> The **peak-RSS** table is retained: the M-step allocates no new host memory
+> (`update_y` writes into the existing `y` buffer, and the device gemm targets
+> the already-allocated `d_y`), so those figures are unaffected by this change.
 
 Scaling sweep (d=30, K=100, theta=2, max_iter=10) — wall time in seconds per dataset size:
 
@@ -1516,7 +1530,7 @@ that is the dominant allocation at D7. Supplying a precomputed PCA (skipping
 | scx-accel CPU | 1.98 | 1.36 |  9.1M, 1.4 h |  12.9M, 2.2 h |
 | scx-accel GPU | 1.18 | 1.25 | 12.6M, 1.6 h |  22.7M, 3.3 h |
 | harmonypy (CPU) | 1.91 | 1.25 |  9.2M, 0.8 h |  13.3M, 1.2 h |
-| R harmony (CPU) | 0.95 | 1.20 |   compute-bound¹ |  compute-bound¹ |
+| R harmony 1.2.4 (CPU) | 0.95 | 1.20 |   compute-bound¹ |  compute-bound¹ |
 
 ¹ R harmony's RSS scales ~linearly with N (β≈0.95), so a 500 GB budget
 would technically fit >1B cells, but the α≈1.20 wall-time curve puts even

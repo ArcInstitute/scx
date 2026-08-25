@@ -2451,12 +2451,53 @@ Results:
   `fallback_reason`), so you can prove GPU-vs-CPU dispatch the same way as the
   other accelerator ops. See [docs/api.md § Accelerator route metadata](../docs/api.md#accelerator-route-metadata).
 
-**Numerical parity** against R `harmony` v2.x on the validation fixtures
-in `benchmarks/results/harmony/reference/`: mean per-PC Pearson r is
-0.989–0.999. Rust uses `rand_chacha` while R uses Mersenne Twister, so
-tail PCs can drift by a few percent on high-batch-count inputs — see
-[`docs/performance.md`](performance.md#harmony2-batch-integration--lisi)
-and `pyscx/tests/test_harmony_validation.py`.
+**Numerical parity.** The clustering primitives are pinned against
+**harmonypy 0.2.0** in `scx-accel/src/harmony/harmony_reference_values.rs`,
+so `cargo test` gates them with no Python installed: the M-step
+(`Y = normalize(Z_cos·Rᵀ)`), the cosine-distance kernel, the ridge
+correction against `torch.linalg.inv`, and `update_R`'s softmax half. Two
+of the three objective components match; the third is a **documented
+divergence** (below).
+
+End-to-end agreement is a *correlation* claim, not a numerical one, and
+cannot be otherwise: SCX seeds k-means++ from `rand_chacha` where
+harmonypy uses `sklearn.KMeans` and R uses Mersenne Twister, so the runs
+start from different cluster geometry. The `accel_harmony` benchmark
+gates mean per-PC Pearson r vs harmonypy as an absolute floor
+(`benchmarks/comprehensive/thresholds.yaml`).
+
+> The figure previously quoted here — *mean per-PC Pearson r 0.989–0.999
+> against R `harmony` v2.x* — was measured **before** the soft k-means
+> M-step landed, on `.npz` fixtures under `benchmarks/results/harmony/reference/`
+> that are gitignored, so neither CI nor any contributor could reproduce
+> it. It is not restated until it is re-measured on the current code. Two
+> further corrections: the installed R package is **1.2.4** (the
+> *algorithm* is Harmony2 — the version string was wrong), and
+> `pyscx/tests/test_harmony_validation.py::test_per_pc_pearson_ge_095` (renamed
+> in Phase 7e; it was `..._ge_0998`)
+> asserts **0.95** per PC and 0.97 on the mean, not the 0.998 its name
+> claims.
+
+**Two documented divergences from harmonypy**, asserted as such rather
+than left as unexplained looseness:
+
+* The diversity penalty is `((2E+1)/(O+E+1))^θ` where harmonypy 0.2.0
+  uses `(E/(O+E))^θ`. The factor of 2 cancels — it is constant across
+  clusters for a fixed cell, so the per-cell L1 normalization removes it —
+  but the `+1` smoothing does not.
+* The objective's cross-entropy is `log((O+E+1)/(2E+1))` where harmonypy
+  uses `log((O+E)/E)`, which puts SCX's term below harmonypy's by
+  `log(2)·(2000/N)·Σ σ·O·θ`. Both convergence checks are ratio-based, so
+  the two can converge at different sub-iterations.
+
+Both forms are self-consistent and matched across the CPU and GPU arms.
+
+Regenerate the reference tables with
+`benchmarks/scripts/generate_harmony_references.py harmony` (and
+`… lisi` for LISI), which owns the fixtures and the expected values
+together so they cannot drift apart. It drives harmonypy's own
+`cluster` / `moe_correct_ridge` / `update_R` / `compute_objective` —
+only the driver loop is monkeypatched out, never a formula.
 
 **Scaling** (5M cells × 30 PCs × 100 clusters, single covariate):
 scx-accel CPU 37.5 min, scx-accel GPU 31.1 min, harmonypy 22.4 min,
@@ -2496,7 +2537,7 @@ print(adata.obs["lisi_batch"].describe())
 | `key` | (required) | `obs` column with the categorical label to score. |
 | `basis` | `"X_pca"` | `obsm` key for the embedding to compute neighbourhoods over. |
 | `perplexity` | `30.0` | Gaussian-kernel target perplexity (t-SNE-style bandwidth search). |
-| `n_neighbors` | `None` | k for the kNN graph. `None` → `ceil(3 × perplexity)`. |
+| `n_neighbors` | `None` | k for the kNN graph. `None` → `ceil(3 × perplexity) − 1` = **89** at the default perplexity. The `−1` is harmonypy's shape, not a fencepost: `harmonypy.lisi.compute_lisi` retrieves `3 × perplexity` neighbours and then drops column 0, its own self-match, while SCX's sweep skips `j == i` as it collects. Before v0.15 this was `ceil(3 × perplexity)` in three places — the Rust default and both bindings — giving one neighbour more than harmonypy. Pinned in `scx-accel/src/lisi_reference_values.rs`. |
 | `approximate_knn` | `False` | Use HNSW approximate kNN instead of the exact O(N²) sweep. ~10× faster at N ≳ 100k, with ~0.01–0.05 mean-LISI drift. |
 
 Returns a `numpy.ndarray` of length N and also writes the values to

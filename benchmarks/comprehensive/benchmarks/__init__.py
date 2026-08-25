@@ -125,6 +125,7 @@ ALL_BENCHMARKS: list[str] = [
     "accel_knn",
     "accel_umap",
     "accel_leiden",
+    "accel_harmony",
     "accel_preprocess",
     "accel_hvg",
     # V3 task 2.7 — end-to-end PCA→kNN→UMAP residency benchmark: the fused

@@ -191,10 +191,32 @@ def _load_pbmc3k(h5ad_path: Path):
     return adata
 
 
+# Every accelerator below is pinned to the CPU.
+#
+# This file's own header lists the knobs that "must be identical on baseline
+# capture and on later runs" — thread count, seeds, hashed dtype — and did not
+# list the DEVICE. It should have: `device` defaults to `"auto"`, so the hash
+# silently depended on whether the wheel this job happened to build carried the
+# `gpu` feature.
+#
+# It went unnoticed while every gate built `--features hdf5`. Phase 7's gate is
+# the first to build `hdf5,gpu`, and all six fingerprints failed at once: PCA
+# routed to rapids-singlecell, which rejects genes with zero expression across
+# all cells (raw pbmc3k has many), and neighbors / umap / leiden / harmony /
+# lisi then cascaded off the missing `X_pca`. "Fingerprint missing: 8" is what
+# the gate reported — not a mismatch, because nothing ran.
+#
+# So Phase 6's stable hashes were CPU hashes all along, and pinning the CPU is
+# what makes them comparable rather than a fresh convention. A GPU-vs-CPU
+# numerical claim is a different artefact from a drift lock, and the
+# `*_route_gpu_correct` floors in `thresholds.yaml` are where it belongs.
+FP_DEVICE = "cpu"
+
+
 def _fingerprint_pca(adata, results: dict[str, Any], arrays_dir: Path) -> None:
     import pyscx
 
-    pyscx.accel.pca(adata, n_comps=20, random_state=PINNED_SEED)
+    pyscx.accel.pca(adata, n_comps=20, random_state=PINNED_SEED, device=FP_DEVICE)
     arr = adata.obsm["X_pca"]
     h, meta = _hash_array(arr)
     results["pca"] = {"hash": h, **meta}
@@ -211,7 +233,7 @@ def _fingerprint_pca(adata, results: dict[str, Any], arrays_dir: Path) -> None:
 def _fingerprint_neighbors(adata, results: dict[str, Any], arrays_dir: Path) -> None:
     import pyscx
 
-    pyscx.accel.neighbors(adata, n_neighbors=15, random_state=PINNED_SEED)
+    pyscx.accel.neighbors(adata, n_neighbors=15, random_state=PINNED_SEED, device=FP_DEVICE)
     # Hash the indices matrix (distances are perturbation-sensitive so not
     # ideal as a byte-exact regression lock; we still save them for diffing).
     dist = adata.obsp["distances"].toarray()
@@ -227,7 +249,7 @@ def _fingerprint_neighbors(adata, results: dict[str, Any], arrays_dir: Path) -> 
 def _fingerprint_umap(adata, results: dict[str, Any], arrays_dir: Path) -> None:
     import pyscx
 
-    pyscx.accel.umap(adata, n_epochs=200, random_state=PINNED_SEED)
+    pyscx.accel.umap(adata, n_epochs=200, random_state=PINNED_SEED, device=FP_DEVICE)
     arr = adata.obsm["X_umap"]
     h, meta = _hash_array(arr)
     results["umap"] = {"hash": h, **meta}
@@ -238,7 +260,7 @@ def _fingerprint_leiden(adata, results: dict[str, Any], arrays_dir: Path) -> Non
     import numpy as np
     import pyscx
 
-    pyscx.accel.leiden(adata, random_state=PINNED_SEED, key_added="leiden_fp")
+    pyscx.accel.leiden(adata, random_state=PINNED_SEED, key_added="leiden_fp", device=FP_DEVICE)
     labels = np.asarray(adata.obs["leiden_fp"].astype("int32"))
     h, meta = _hash_array(labels)
     results["leiden"] = {"hash": h, **meta}
@@ -262,6 +284,7 @@ def _fingerprint_harmony(adata, results: dict[str, Any], arrays_dir: Path) -> No
         adata, "_fp_batch",
         max_iter=5,
         random_state=PINNED_SEED,
+        device=FP_DEVICE,
         adjusted_basis="X_pca_harmony_fp",
     )
     arr = adata.obsm["X_pca_harmony_fp"]
@@ -283,6 +306,7 @@ def _fingerprint_lisi(adata, results: dict[str, Any], arrays_dir: Path) -> None:
         ["A", "B", "C"] * (n // 3 + 1)
     )[:n]
 
+    # No `device=` here: `compute_lisi` is CPU-only and does not take one.
     lisi = pyscx.accel.compute_lisi(
         adata, "_fp_batch_lisi",
         perplexity=30.0,

@@ -63,6 +63,15 @@ pub mod harmony;
 pub mod hvg;
 pub mod leiden;
 pub mod lisi;
+
+// ─── Pinned harmonypy LISI reference (§7.19, ORG-7.21-4) ──────────────
+#[cfg(test)]
+#[path = "lisi_reference_tests.rs"]
+mod lisi_reference_tests;
+
+#[cfg(test)]
+#[path = "lisi_reference_values.rs"]
+pub(crate) mod lisi_reference_values;
 pub mod mem_budget;
 pub mod nb_glm;
 pub mod neighbors;

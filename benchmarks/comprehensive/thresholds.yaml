@@ -646,6 +646,67 @@ absolute_floors:
     metric: ari_vs_leidenalg
     min: 0.85
 
+  # --- accel_harmony: mean per-PC Pearson r vs harmonypy ---
+  # Phase 7e, ORG-7.21-4. Harmony had no thresholds entry at all before this.
+  #
+  # This is NOT a numerical-parity floor and cannot be one: SCX seeds k-means++
+  # from `rand_chacha` where harmonypy uses `sklearn.KMeans`, so the two runs
+  # start from different cluster geometry, and the objective cross-entropies
+  # differ by a `log(2)` term (pinned as a divergence in
+  # `scx-accel/src/harmony/harmony_reference_values.rs`, which gates the exact
+  # numerics Rust-side under plain `cargo test`). This is the end-to-end sanity
+  # net at the resolution a stochastic init allows.
+  #
+  # Set from the MEASURED first gate run (job 2840853), not from the
+  # `0.989-0.999` figure `docs/performance.md` used to report against R harmony:
+  # that number pre-dates the Phase 7e M-step and was measured on gitignored
+  # fixtures nobody can rerun.
+  #
+  # ⚠️ The first version of this comment said these were measured "with a fixed
+  # `random_state` on both sides". THAT WAS FALSE: the benchmark passed
+  # `random_state=42` to pyscx and let harmonypy take its own default of 0, and
+  # `epsilon_harmony` / `epsilon_kmeans` were unmatched too (1e-2/1e-3 vs
+  # 1e-4/1e-5). Found in review by codex and Cursor Agent, independently. The
+  # arms are now pinned to one seed, one cluster count and one pair of
+  # tolerances, and these numbers are re-measured on THAT configuration —
+  # the earlier ones described a comparison that no longer exists.
+  #
+  # Re-measured post-M-step with all three arms aligned:
+  #
+  #     pbmc3k     cpu 0.999   (local, seed 42 both sides, K=90)
+  #     census_1m  job 2842829, 618 real donors via `donor_id`
+  #
+  # pbmc3k moved 0.9996 -> 0.999 once the seeds matched, so 0.99 still holds
+  # with 0.009 of headroom. The census_1m floor below is the pre-alignment
+  # measurement (0.9891 cpu / 0.9902 gpu) until 2842829 reports; it is the
+  # looser of the two bars and the arm most likely to move, because 618 batches
+  # give k-means++ far more room to diverge from sklearn's init.
+  #
+  # Run-to-run spread is exactly zero: both implementations are deterministic
+  # given the seed, so this metric has no sampling noise for a floor to absorb.
+  # The floors are therefore sized for cross-ENVIRONMENT drift (a different
+  # BLAS, node, or harmonypy build), not for run-to-run variance.
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_cpu
+    dataset: pbmc3k
+    metric: mean_per_pc_r_vs_harmonypy
+    min: 0.99
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_gpu
+    dataset: pbmc3k
+    metric: mean_per_pc_r_vs_harmonypy
+    min: 0.99
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_cpu
+    dataset: census_1m
+    metric: mean_per_pc_r_vs_harmonypy
+    min: 0.97
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_gpu
+    dataset: census_1m
+    metric: mean_per_pc_r_vs_harmonypy
+    min: 0.97
+
   # --- accel_preprocess: numerical equivalence to scanpy ---
   # GPU f32 vs CPU f64 intermediate drift on normalize+log1p is ~1e-5
   # on typical counts; 1e-3 provides ~2 orders of magnitude headroom.
@@ -795,6 +856,15 @@ absolute_floors:
     format: accel_leiden__pyscx_gpu
     dataset: pbmc3k
     metric: leiden_route_gpu_correct
+    min: 1.0
+  # Harmony GPU route gate. `device="gpu"` reporting a `cpu_*` route means
+  # device resolution silently fell back — a hard failure, not a slow run.
+  # Phase 7e moved the M-step onto the device arm, so a fallback now also means
+  # the two arms are running different algorithms.
+  - benchmark: accel_harmony
+    format: accel_harmony__pyscx_gpu
+    dataset: pbmc3k
+    metric: harmony_route_gpu_correct
     min: 1.0
   - benchmark: accel_hvg
     format: accel_hvg__pyscx_gpu
