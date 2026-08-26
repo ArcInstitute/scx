@@ -824,58 +824,118 @@ mod tests {
         );
     }
 
-    /// Driving one adapter twice yields identical bytes on the second pass.
+    /// A CSR source whose single shard carries a **different payload on every
+    /// read**, tagged by a generation counter.
+    ///
+    /// This is the load-bearing half of the cross-drive test below. With a
+    /// fixed fixture, a pinned slot overwritten mid-DMA is overwritten with the
+    /// *same* bytes, so the readback matches and the assertion cannot fail —
+    /// which is what the first version of that test did (found by
+    /// codex - gpt-5.6-sol in review).
+    struct GenerationalCsrSource {
+        rows: usize,
+        n_vars: usize,
+        generation: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GenerationalCsrSource {
+        /// Value base for read `g`. Spaced so two generations share no value,
+        /// and small enough that every value is an exactly-representable f32
+        /// integer (< 2^24).
+        fn base_for(g: usize) -> f32 {
+            (100_000 * (g + 1)) as f32
+        }
+    }
+
+    impl ShardSource for GenerationalCsrSource {
+        fn n_shards(&self) -> usize {
+            1
+        }
+        fn n_obs(&self) -> usize {
+            self.rows
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, _shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            let g = self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(make_csr(self.rows, self.n_vars, Self::base_for(g)))
+        }
+    }
+
+    /// Driving one adapter repeatedly stages each drive's own bytes.
     ///
     /// The hardware half of §8.18, and the row-major twin of
-    /// `driving_a_single_shard_csc_source_twice_stages_identical_bytes`. Both
-    /// layouts used to special-case a single-shard drive: no ring, no copy
-    /// stream, and **no event recorded**, on the stated grounds that "there is
-    /// no successor `stage()` that could race the in-flight DMA". True within
-    /// one drive. Across two, the second drive re-entered `pinned[0]` while the
-    /// first drive's `memcpy_htod_async` could still be reading it, with
-    /// nothing on the host having synchronised.
+    /// `driving_a_single_shard_csc_source_twice_stages_own_bytes`. Both layouts
+    /// used to special-case a single-shard drive: no ring, no copy stream, and
+    /// **no event recorded**, on the stated grounds that "there is no successor
+    /// `stage()` that could race the in-flight DMA". True within one drive.
+    /// Across two, the second drive re-entered `pinned[0]` while the first
+    /// drive's `memcpy_htod_async` could still be reading it, with nothing on
+    /// the host having synchronised.
     ///
     /// `staging_driver_tests.rs` proves the driver *orders* the host-wait; only
-    /// a device can show the bytes survive. The consumer copies device-to-device
-    /// on the compute stream rather than reading back per callback — a
-    /// host-blocking `dtoh` inside the callback would synchronise away the very
-    /// window the bug lives in.
+    /// a device can show the bytes survive.
+    ///
+    /// Two properties make this able to fail, and the first version of this
+    /// test had neither (codex - gpt-5.6-sol):
+    ///
+    /// 1. **Every drive carries distinct bytes** (`GenerationalCsrSource`), so
+    ///    a slot overwritten mid-DMA shows up as another generation's values.
+    /// 2. **No host synchronisation between drives.** Device buffers are
+    ///    allocated up front — `cudaMalloc` is itself device-synchronising, so
+    ///    allocating inside the loop would silently insert the very barrier the
+    ///    eventless path lacked — and the single `dev.synchronize()` comes only
+    ///    after all `DRIVES` drives are queued. Readback happens afterwards.
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn driving_a_single_shard_csr_source_twice_stages_identical_bytes() {
+    fn driving_a_single_shard_csr_source_repeatedly_stages_own_bytes() {
         let dev = require_gpu!();
-        // One shard, large enough that its DMA is not trivially short.
-        let src = InMemorySource {
-            shards: vec![make_csr(65_536, 16, 1.0)],
-            n_obs: 65_536,
-            n_vars: 16,
+        const ROWS: usize = 65_536;
+        const N_VARS: usize = 16;
+        const DRIVES: usize = 8;
+
+        // `make_csr` emits exactly one nonzero per row.
+        const NNZ: usize = ROWS;
+
+        let src = GenerationalCsrSource {
+            rows: ROWS,
+            n_vars: N_VARS,
+            generation: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut gpu = RawGpuShardSource::new(&dev, &src).unwrap();
 
-        let mut passes: Vec<Vec<f32>> = Vec::new();
-        for _ in 0..8 {
-            let mut captured: Option<CudaSlice<f32>> = None;
+        // Pre-allocated: no allocation, and therefore no implicit device
+        // synchronisation, inside the drive loop.
+        let mut captures: Vec<CudaSlice<f32>> = (0..DRIVES)
+            .map(|_| dev.alloc_zeros::<f32>(NNZ).unwrap())
+            .collect();
+
+        for dst in captures.iter_mut() {
             gpu.for_each_gpu_shard(|_idx, slot| {
                 let view = slot.view();
-                let mut dst = dev.alloc_zeros::<f32>(view.data.len())?;
+                assert_eq!(view.data.len(), NNZ, "fixture nnz must be stable");
                 dev.stream()
-                    .memcpy_dtod(&view.data, &mut dst)
+                    .memcpy_dtod(&view.data, dst)
                     .map_err(|e| GpuError::CudaError(format!("dtod: {e}")))?;
-                captured = Some(dst);
                 Ok(())
             })
             .unwrap();
-            let dst = captured.expect("one shard must have been dispatched");
-            let mut host = vec![0.0f32; dst.len()];
-            dev.stream().memcpy_dtoh(&dst, &mut host).unwrap();
-            dev.synchronize().unwrap();
-            passes.push(host);
+            // Deliberately no synchronisation here.
         }
-        for (i, pass) in passes.iter().enumerate().skip(1) {
+        dev.synchronize().unwrap();
+
+        for (g, dst) in captures.iter().enumerate() {
+            let mut host = vec![0.0f32; NNZ];
+            dev.stream().memcpy_dtoh(dst, &mut host).unwrap();
+            dev.synchronize().unwrap();
+            let expected = make_csr(ROWS, N_VARS, GenerationalCsrSource::base_for(g)).data;
             assert_eq!(
-                *pass, passes[0],
-                "pass {i} staged different bytes than pass 0 — the pinned slot was rewritten \
-                 while its previous DMA was still in flight"
+                host, expected,
+                "drive {g} did not stage its own generation — the pinned slot was rewritten \
+                 while this drive's DMA was still reading it"
             );
         }
     }

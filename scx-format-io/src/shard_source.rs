@@ -63,7 +63,17 @@ impl ShardSizeHint {
 /// differential test pins it to this.
 #[inline]
 pub fn col_range_overlaps(shard_start: u32, shard_end: u32, range: &Range<u32>) -> bool {
-    shard_end > range.start && shard_start < range.end
+    // The empty/inverted guard is not redundant with the half-open comparisons.
+    // Without it `col_range_overlaps(4, 8, &(5..5))` is `true` (`8 > 5 && 4 < 5`)
+    // while `BackedCscIndex::shards_for_col_range` returns nothing for the same
+    // input, because it guards `c_lo >= c_hi` up front — so the trait default
+    // and the backed override disagreed on an interior empty range, in a
+    // function this PR made the single named boundary rule.
+    //
+    // Latent rather than live (production GPU DE passes non-empty gene chunks),
+    // and found by Cursor Agent - Grok 4.6 High and Antigravity - Gemini 3.7
+    // Flash independently.
+    range.start < range.end && shard_end > range.start && shard_start < range.end
 }
 
 /// A source of CSR shards for streaming computation.

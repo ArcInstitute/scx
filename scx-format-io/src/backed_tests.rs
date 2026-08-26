@@ -2101,13 +2101,21 @@ fn backed_csc_shards_for_col_range_matches_the_trait_default_predicate() {
     let ranges: Vec<(u32, u32)> = (0..src.n_csc_shards())
         .map(|i| src.csc_shard_col_range(i).unwrap())
         .collect();
-    // Independent statement of the overlap rule: half-open on both ends.
+    // The reference IS `col_range_overlaps`, deliberately.
+    //
+    // This closure used to restate the rule by hand, complete with its own
+    // `lo >= hi` guard — which meant the test pinned the binary search to a
+    // *third* copy of the predicate rather than to the helper, while
+    // `col_range_overlaps`'s docstring claimed the opposite. It also hid a real
+    // disagreement: the helper had no empty-range guard, so the two answered
+    // differently on an interior empty range and this test could not see it
+    // (Cursor Agent - Grok 4.6 High).
+    //
+    // The hand-computed anchors below are what keep this from passing by both
+    // sides being wrong together.
     let reference = |lo: u32, hi: u32| -> Vec<usize> {
-        if lo >= hi {
-            return Vec::new();
-        }
         (0..ranges.len())
-            .filter(|&i| ranges[i].1 > lo && ranges[i].0 < hi)
+            .filter(|&i| crate::col_range_overlaps(ranges[i].0, ranges[i].1, &(lo..hi)))
             .collect()
     };
 
@@ -2130,6 +2138,24 @@ fn backed_csc_shards_for_col_range_matches_the_trait_default_predicate() {
     assert_eq!(src.csc_shards_for_col_range(0..12), vec![0, 1, 2]);
     assert!(src.csc_shards_for_col_range(12..14).is_empty());
     assert!(src.csc_shards_for_col_range(5..5).is_empty());
+
+    // The empty-range case, stated against the helper directly: an interior
+    // empty range overlaps nothing, even though both half-open comparisons
+    // taken alone would say otherwise (`8 > 5 && 4 < 5`).
+    //
+    // Built from bindings rather than literals so clippy's
+    // `reversed_empty_ranges` does not reject the very inputs under test.
+    let empty = |at: u32| at..at;
+    assert!(!crate::col_range_overlaps(4, 8, &empty(5)));
+    assert!(!crate::col_range_overlaps(0, 12, &empty(6)));
+    // ...and an inverted range likewise.
+    let inverted = {
+        let (lo, hi) = (9u32, 3u32);
+        lo..hi
+    };
+    assert!(!crate::col_range_overlaps(0, 12, &inverted));
+    // Sanity: the same shard against a one-column range that does overlap.
+    assert!(crate::col_range_overlaps(4, 8, &(5..6)));
 }
 
 /// The CSC size hint is a true upper bound on every shard, and tight on a file

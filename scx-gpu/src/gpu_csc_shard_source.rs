@@ -239,7 +239,15 @@ impl<'a> RawGpuCscShardSource<'a> {
         let data = dev.alloc_zeros::<f32>(nnz_cap)?;
 
         // Dedicated copy stream — used only when n_csc_shards > 1
-        // (single-shard fast path reuses the compute stream).
+        // A single-shard file aliases this to the compute stream: with one
+        // shard there is no second slot to overlap with, so a dedicated copy
+        // stream buys nothing.
+        //
+        // This is NOT the deleted single-shard *fast path* — that one skipped
+        // the event record entirely, which is the §8.18 bug. Every drive still
+        // records and waits on its upload event whatever this alias resolves
+        // to. Spelled out because the earlier wording named the fast path and
+        // would invite the next reader to put it back.
         let copy_stream = if source.n_csc_shards() > 1 {
             dev.context()
                 .new_stream()
@@ -412,7 +420,7 @@ impl<F> CscStaging<'_, F> {
         let (s, e) = self.source.csc_shard_col_range(idx).ok_or_else(|| {
             GpuError::InvalidShard(format!(
                 "csc_shard_col_range({idx}) returned None: the CSC sidecar's catalog does not \
-                 record this shard's column range, so its rows cannot be placed in the global \
+                 record this shard's column range, so its columns cannot be placed in the global \
                  gene axis"
             ))
         })?;
@@ -958,52 +966,120 @@ mod tests {
         gpu2.for_each_gpu_csc_shard(|_idx, _view| Ok(())).unwrap();
     }
 
-    /// Driving one adapter twice yields identical bytes on the second pass.
+    /// A CSC source whose single shard carries a **different payload on every
+    /// read**, tagged by a generation counter. Column-major twin of
+    /// `GenerationalCsrSource`; see that type for why a fixed fixture makes the
+    /// cross-drive test unable to fail.
+    struct GenerationalCscSource {
+        n_obs: usize,
+        n_cols: usize,
+        per_col: usize,
+        generation: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GenerationalCscSource {
+        /// Offset added to every value on read `g`. Spaced wider than one
+        /// shard's value span so no two generations share a value.
+        fn offset_for(g: usize) -> f32 {
+            (100_000 * (g + 1)) as f32
+        }
+        fn shard_for(&self, g: usize) -> ScxCsc {
+            let mut csc = make_dense_csc(self.n_obs, self.n_cols, self.per_col);
+            let off = Self::offset_for(g);
+            for v in csc.data.iter_mut() {
+                *v += off;
+            }
+            csc
+        }
+    }
+
+    impl ColumnShardSource for GenerationalCscSource {
+        fn n_csc_shards(&self) -> usize {
+            1
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_cols
+        }
+        fn read_csc_shard(&self, _shard_idx: usize) -> scx_format_io::Result<ScxCsc> {
+            let g = self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.shard_for(g))
+        }
+        fn read_csc_columns(
+            &self,
+            _col_range: std::ops::Range<u32>,
+        ) -> scx_format_io::Result<ScxCsc> {
+            unimplemented!("test stub does not implement read_csc_columns")
+        }
+        fn csc_shard_col_range(&self, _shard_idx: usize) -> Option<(u32, u32)> {
+            Some((0, self.n_cols as u32))
+        }
+    }
+
+    /// Driving one adapter repeatedly stages each drive's own bytes.
     ///
-    /// The hardware half of §8.18. Both layouts used to special-case a
-    /// single-shard drive: no ring, no copy stream, and **no event recorded**,
-    /// on the stated grounds that "there is no successor `stage()` that could
-    /// race the in-flight DMA". True within one drive. Across two, the second
-    /// drive re-entered `pinned[0]` while the first drive's
-    /// `memcpy_htod_async` could still be reading it, with nothing on the host
-    /// having synchronised.
-    ///
-    /// `staging_driver_tests.rs` proves the driver *orders* the host-wait; only
-    /// a device can show the bytes survive. A device-only consumer
-    /// (`memcpy_dtod` into a private buffer on the compute stream) is used
-    /// deliberately — a per-callback host-blocking `dtoh` would synchronise
-    /// away the very window the bug lives in.
+    /// Column-major twin of
+    /// `driving_a_single_shard_csr_source_repeatedly_stages_own_bytes`; the
+    /// reasoning, and the two properties that make it able to fail at all, are
+    /// documented there.
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn driving_a_single_shard_csc_source_twice_stages_identical_bytes() {
+    fn driving_a_single_shard_csc_source_repeatedly_stages_own_bytes() {
         let dev = require_gpu!();
-        // One shard, large enough that its DMA is not trivially short.
-        let src = InMemoryCscSource::new(vec![make_dense_csc(4096, 4, 512)], vec![(0, 4)], 4096, 4);
+        const N_OBS: usize = 4096;
+        const N_COLS: usize = 4;
+        const PER_COL: usize = 512;
+        const DRIVES: usize = 8;
+        const NNZ: usize = N_COLS * PER_COL;
+
+        let src = GenerationalCscSource {
+            n_obs: N_OBS,
+            n_cols: N_COLS,
+            per_col: PER_COL,
+            generation: std::sync::atomic::AtomicUsize::new(0),
+        };
         let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
 
-        let mut passes: Vec<Vec<f32>> = Vec::new();
-        for _ in 0..8 {
-            let mut captured: Option<cudarc::driver::safe::CudaSlice<f32>> = None;
+        // Allocated up front: `cudaMalloc` is device-synchronising, so
+        // allocating inside the loop would insert the barrier this test exists
+        // to do without.
+        let mut captures: Vec<cudarc::driver::safe::CudaSlice<f32>> = (0..DRIVES)
+            .map(|_| dev.alloc_zeros::<f32>(NNZ).unwrap())
+            .collect();
+
+        for dst in captures.iter_mut() {
             gpu.for_each_gpu_csc_shard(|_idx, view| {
-                let mut dst = dev.alloc_zeros::<f32>(view.data.len())?;
+                assert_eq!(view.data.len(), NNZ, "fixture nnz must be stable");
                 dev.stream()
-                    .memcpy_dtod(&view.data, &mut dst)
+                    .memcpy_dtod(&view.data, dst)
                     .map_err(|e| GpuError::CudaError(format!("dtod: {e}")))?;
-                captured = Some(dst);
                 Ok(())
             })
             .unwrap();
-            let dst = captured.expect("one shard must have been dispatched");
-            let mut host = vec![0.0f32; dst.len()];
-            dev.stream().memcpy_dtoh(&dst, &mut host).unwrap();
-            dev.synchronize().unwrap();
-            passes.push(host);
+            // Deliberately no synchronisation here.
         }
-        for (i, pass) in passes.iter().enumerate().skip(1) {
+        dev.synchronize().unwrap();
+
+        for (g, dst) in captures.iter().enumerate() {
+            let mut host = vec![0.0f32; NNZ];
+            dev.stream().memcpy_dtoh(dst, &mut host).unwrap();
+            dev.synchronize().unwrap();
+            let expected = GenerationalCscSource {
+                n_obs: N_OBS,
+                n_cols: N_COLS,
+                per_col: PER_COL,
+                generation: std::sync::atomic::AtomicUsize::new(0),
+            }
+            .shard_for(g)
+            .data;
             assert_eq!(
-                *pass, passes[0],
-                "pass {i} staged different bytes than pass 0 — the pinned slot was rewritten \
-                 while its previous DMA was still in flight"
+                host, expected,
+                "drive {g} did not stage its own generation — the pinned slot was rewritten \
+                 while this drive's DMA was still reading it"
             );
         }
     }
