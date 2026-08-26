@@ -212,22 +212,37 @@ fn test_pdex_ref_gpu_dense_matches_cpu() {
     }
 }
 
-/// G10.4 parity: graph-captured per-chunk path produces identical
-/// results to the direct per-chunk path under the same fixture.
-/// Unlike UMAP (where atomicAdd races create irreducible run-to-run
-/// jitter), pdex_ref's kernels are deterministic given fixed input
-/// — sort + searchsorted + tie-correct + pvalues — so the two
-/// paths should agree to fp32 tolerance bit-for-bit on U / p /
-/// log2_fc / means. Any divergence implies the graph-replay path
-/// is feeding stale buffer pointers or missing a kernel.
+/// Both CUDA streams give the same pdex_ref answer.
 ///
-/// Uses `set_cuda_graphs_enabled_override` to flip the kill switch
-/// in-process so both branches run in the same test invocation
-/// (the `SCX_DISABLE_CUDA_GRAPHS=1` env var is `OnceLock`-cached
-/// at process start and can't be re-read).
+/// ⚠️ **This is not a graph-capture test, despite what the switch is called.**
+/// DE never captures a graph: `grep capture_graph scx-accel/src/diffexp/`
+/// returns nothing, and the workspace's only production `capture_graph` call is
+/// `scx-accel/src/harmony/gpu.rs`. What `set_cuda_graphs_enabled_override`
+/// selects here is a *stream* — `diffexp/gpu.rs` reads
+/// `let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };` at
+/// three places, `dev_pts` being the per-thread stream — with the reason stated
+/// beside it: "Mode 4 reserved for v3 CSR if graph capture is later re-enabled;
+/// for now skip capture (shard loop count is dynamic so the per-chunk kernel
+/// count diverges from v2)."
+///
+/// So both arms run the identical kernel sequence and the test cannot detect a
+/// stale-pointer replay, which is what its previous name and docstring claimed.
+/// It is still worth having: it is the only coverage that the per-thread-stream
+/// arm — the one every `device="gpu"` DE call takes — produces the same numbers
+/// as the default stream. Renamed to say that, rather than deleted. A CI guard
+/// (ORG-8.20-5) fails if `scx-accel/src/diffexp/` ever gains a `capture_graph`
+/// call, so if capture returns this test gets its original claim back on
+/// purpose rather than by inheritance.
+///
+/// pdex_ref's kernels are deterministic given fixed input — sort +
+/// searchsorted + tie-correct + pvalues — so the bar is fp32-tight.
+///
+/// Uses `set_cuda_graphs_enabled_override` to flip the switch in-process so
+/// both branches run in one test invocation (the `SCX_DISABLE_CUDA_GRAPHS=1`
+/// env var is `OnceLock`-cached at process start and can't be re-read).
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_pdex_ref_gpu_graph_vs_direct_parity() {
+fn test_pdex_ref_gpu_per_thread_stream_vs_default_parity() {
     require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
@@ -391,17 +406,16 @@ fn test_wilcoxon_gpu_dense_matches_cpu_one_vs_rest() {
     }
 }
 
-/// G10.5 parity (1-vs-rest): graph-captured wilcoxon path
-/// produces identical results to the direct path. Wilcoxon's
-/// captureable kernels (scatter / block_sort / tie / searchsorted /
-/// ranksum) are deterministic given fixed input — atomicAdd lives
-/// only in `gpu_de_pseudobulk_all_groups`, which runs OUTSIDE the
-/// captured region — so we can assert fp32-tight tolerance on U /
-/// p / score, same shape as
-/// `test_pdex_ref_gpu_graph_vs_direct_parity`.
+/// Both CUDA streams give the same 1-vs-rest wilcoxon answer.
+///
+/// Same non-claim as `test_pdex_ref_gpu_per_thread_stream_vs_default_parity`
+/// above: the switch selects a stream, not a graph, and DE captures nothing.
+/// Wilcoxon's kernels (scatter / block_sort / tie / searchsorted / ranksum) are
+/// deterministic given fixed input — the only atomicAdd is in
+/// `gpu_de_pseudobulk_all_groups` — so the bar is fp32-tight.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
+fn test_wilcoxon_gpu_one_vs_rest_per_thread_stream_vs_default_parity() {
     require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, _reference) = make_fixture();
@@ -479,17 +493,17 @@ fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
     }
 }
 
-/// G10.5 parity (ref-mode): graph-captured wilcoxon path matches
-/// direct in ref-mode. Same kernel determinism contract as the
-/// 1-vs-rest test above, but exercises ref-mode (`mode=1`) and the
+/// Both CUDA streams give the same ref-mode wilcoxon answer.
+///
+/// Same non-claim as the two above. Exercises ref-mode (`mode = 1`) and the
 /// per-tg combined-tie + tie_per_group staging path.
 ///
-/// The shared `make_fixture` provides a reference group via its
-/// last return value; passing it as `reference: Some(...)` routes
-/// the GPU driver into the ref-mode capture path.
+/// The shared `make_fixture` provides a reference group via its last return
+/// value; passing it as `reference: Some(...)` routes the GPU driver into
+/// ref-mode.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
+fn test_wilcoxon_gpu_ref_mode_per_thread_stream_vs_default_parity() {
     require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();

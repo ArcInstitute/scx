@@ -544,19 +544,27 @@ mod tests {
         }
     }
 
-    /// Regression guard for the CUDA-graph-capture htod bug: the GPU pdex path
-    /// over a **backed multi-shard** reader (no CSC sidecar → CSR-direct
-    /// `gpu_csr_v3`), **multi-chunk**, with graph capture **forced on**. Before
-    /// the device-side-scatter fix, the captured per-chunk sequence did a
-    /// host→device copy of the cell permutations, invalidating the capture
-    /// (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`) and erroring out. `csc: None`.
-    /// Must complete and match the CPU streaming reference. (The in-memory
-    /// single-shard multi-chunk tests did not catch this — the failure needs
-    /// the backed streaming path.)
+    /// GPU pdex over a **backed multi-shard** reader with no CSC sidecar
+    /// (CSR-direct `gpu_csr_v3`), **multi-chunk**, on the per-thread stream —
+    /// matched against the CPU streaming reference.
+    ///
+    /// The fixture's shape is historical and worth keeping: it was written for
+    /// a CUDA-graph-capture htod bug, where the captured per-chunk sequence
+    /// copied the cell permutations host→device and invalidated the capture
+    /// with `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. The in-memory
+    /// single-shard multi-chunk tests did not catch it; the failure needed the
+    /// backed streaming path, which is why this one exists.
+    ///
+    /// ⚠️ **DE no longer captures a graph at all** — `grep capture_graph
+    /// scx-accel/src/diffexp/` returns nothing — so `cuda_graphs_enabled()`
+    /// here selects the per-thread stream and nothing more. Renamed from
+    /// `…_graph_capture` to stop the name asserting a mechanism this code does
+    /// not have; a CI guard (ORG-8.20-5) fires if capture returns, so the
+    /// original claim would be restored deliberately rather than inherited.
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture() {
+    fn test_pdex_ref_gpu_v3_csr_backed_multichunk_per_thread_stream() {
         require_gpu_or_skip!();
         let n_obs = 64usize;
         let n_vars = 20usize;
@@ -565,7 +573,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_csr_csc_test_file(
             dir.path(),
-            "pdex_gpu_v1_graph_capture",
+            "pdex_gpu_v3_csr_backed_multichunk",
             n_obs,
             n_vars,
             &dense,
@@ -640,22 +648,27 @@ mod tests {
         }
     }
 
-    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture`.
-    /// The Wilcoxon GPU chunk sequence had the same CUDA-graph-capture htod bug
-    /// (its scatter calls copied the pool + per-test-group permutations
-    /// host→device inside the captured region), fixed by the pre-upload-once +
-    /// device-side scatter change. A backed input with no CSC sidecar runs the
-    /// CSR-direct `gpu_csr_v3` driver. Exercised in
-    /// **ref-mode** (`reference = Some(0)`) to cover the per-test-group
-    /// combined-tie + `tie_per_group` staging branch of the captured sequence.
-    /// Backed multi-shard + multi-chunk (`gene_chunk_size=7`, `n_vars=20`) +
-    /// graphs forced ON; must match the CPU streaming reference. (The dense
-    /// `test_wilcoxon_gpu_*_graph_vs_direct_parity` tests are single-chunk and
-    /// never trigger capture.)
+    /// Wilcoxon counterpart of
+    /// `test_pdex_ref_gpu_v3_csr_backed_multichunk_per_thread_stream`, with the
+    /// same historical origin: the Wilcoxon chunk sequence carried the same
+    /// capture-era htod bug (its scatter calls copied the pool + per-test-group
+    /// permutations host→device inside what was then a captured region), fixed
+    /// by pre-upload-once + device-side scatter.
+    ///
+    /// A backed input with no CSC sidecar runs the CSR-direct `gpu_csr_v3`
+    /// driver. Exercised in **ref-mode** (`reference = Some(0)`) to cover the
+    /// per-test-group combined-tie + `tie_per_group` staging branch. Backed
+    /// multi-shard + multi-chunk (`gene_chunk_size = 7`, `n_vars = 20`); must
+    /// match the CPU streaming reference.
+    ///
+    /// ⚠️ As above, nothing here captures a graph today; the switch selects the
+    /// per-thread stream. The dense
+    /// `test_wilcoxon_gpu_*_per_thread_stream_vs_default_parity` tests are
+    /// single-chunk, so this is still the only multi-chunk backed coverage.
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_wilcoxon_gpu_v3_csr_backed_multichunk_graph_capture() {
+    fn test_wilcoxon_gpu_v3_csr_backed_multichunk_per_thread_stream() {
         use crate::diffexp::wilcoxon_rank_sum_streaming;
         require_gpu_or_skip!();
         let n_obs = 64usize;
@@ -665,7 +678,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_csr_csc_test_file(
             dir.path(),
-            "wilcoxon_gpu_v1_graph_capture",
+            "wilcoxon_gpu_v3_csr_backed_multichunk",
             n_obs,
             n_vars,
             &dense,
