@@ -336,10 +336,19 @@ impl<'a> RawGpuShardSource<'a> {
     }
 
     /// Set the validation policy — how deeply each shard is checked, and the
-    /// operation name its errors speak in. See
-    /// [`RawGpuCscShardSource::with_validation`](crate::gpu_csc_shard_source::RawGpuCscShardSource::with_validation).
+    /// operation name its errors speak in.
+    ///
+    /// **Resets the validation memo.** The memo records only *that* a shard
+    /// passed, not at which rung, so carrying it across a policy change lets a
+    /// weaker pass satisfy a stronger one: drive at `Bounds` (on CSR, no scan
+    /// at all), call `with_validation(Ranking)`, drive again — every shard is
+    /// already marked seen and the finiteness scan never runs. Found by
+    /// codex - gpt-5.6-sol. Resetting unconditionally is cheaper to reason
+    /// about than tracking a high-water rung, and re-validating after a policy
+    /// change is the conservative direction.
     pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
         self.validation = validation;
+        self.memo = ValidationMemo::new(self.source.n_shards());
         self
     }
 
@@ -1378,5 +1387,78 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The ladder is ordered, so "a weaker pass satisfies a stronger policy" is
+    /// a real ordering question rather than a hypothetical. The premise the
+    /// behavioural test below rests on, and it runs everywhere.
+    #[test]
+    fn a_policy_can_strictly_strengthen_what_must_be_checked() {
+        let weak = ValidationPolicy::new(ValidationLevel::Bounds, "normalize_total");
+        let strong = ValidationPolicy::new(ValidationLevel::Ranking, "rank_genes_groups");
+        assert!(!weak.runs(ValidationLevel::Ranking));
+        assert!(!weak.runs(ValidationLevel::Scatter));
+        assert!(strong.runs(ValidationLevel::Ranking));
+        assert!(strong.runs(ValidationLevel::Scatter));
+        assert!(strong.runs(ValidationLevel::Bounds));
+    }
+
+    /// Driving at `Bounds`, then upgrading to `Ranking`, must re-validate.
+    ///
+    /// Found by codex - gpt-5.6-sol. The memo is a bare `Vec<bool>` recording
+    /// *that* a shard passed, never at which rung, so carrying it across a
+    /// policy change lets a weaker pass satisfy a stronger one — and the
+    /// weakest pass on a row-major shard is **no scan at all**:
+    ///
+    /// ```text
+    /// drive at Bounds          → CSR runs zero scans, every shard marked seen
+    /// with_validation(Ranking)
+    /// drive again              → memo says validated → finiteness never runs
+    /// ```
+    ///
+    /// A NaN then reaches `block_radix_sort_per_gene_kernel` — the exact silent
+    /// corruption `Ranking` exists to prevent, reached by *asking for more*
+    /// validation.
+    ///
+    /// GPU-gated because `RawGpuShardSource` cannot be built without a device.
+    /// The cheap structural half — that both `with_validation` bodies reset the
+    /// memo — is an `ORG-8.20-1` CI grep, so a revert is caught on a CPU runner
+    /// even though this behaviour is not.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn upgrading_the_policy_revalidates_shards_the_weaker_policy_waved_through() {
+        let dev = require_gpu!();
+        let mut csr = make_csr(64, 8, 1.0);
+        csr.data[7] = f32::NAN;
+        let src = InMemorySource {
+            shards: vec![csr],
+            n_obs: 64,
+            n_vars: 8,
+        };
+
+        let mut gpu =
+            RawGpuShardSource::new(&dev, &src)
+                .unwrap()
+                .with_validation(ValidationPolicy::new(
+                    ValidationLevel::Bounds,
+                    "normalize_total",
+                ));
+        gpu.for_each_gpu_shard(|_, _| Ok(()))
+            .expect("premise: Bounds runs no CSR scan, so the NaN is accepted");
+
+        let mut gpu = gpu.with_validation(ValidationPolicy::new(
+            ValidationLevel::Ranking,
+            "rank_genes_groups",
+        ));
+        let err = gpu
+            .for_each_gpu_shard(|_, _| Ok(()))
+            .expect_err("Ranking must re-scan a shard the Bounds pass never looked at");
+        let GpuError::InvalidShard(msg) = err else {
+            panic!("expected InvalidShard, got {err:?}");
+        };
+        assert!(
+            msg.contains("non-finite") && msg.contains("rank_genes_groups"),
+            "message must name the non-finite value and the upgraded op, got: {msg}"
+        );
     }
 }

@@ -1757,6 +1757,24 @@ jobs:
           # and it missed. `every_message_names_the_calling_op_and_never_says_de`
           # does catch it (it checks four different ops against four rungs and
           # three of the four then fail), which is where that guarantee lives.
+          # Positive half 5 (PR C, review round 1): a policy change clears the
+          # validation memo. The memo records only THAT a shard passed, never at
+          # which rung, so carrying it across `with_validation` lets a Bounds
+          # pass — which on CSR runs no scan at all — satisfy a later Ranking
+          # policy, and the finiteness scan never runs. Found by
+          # codex - gpt-5.6-sol.
+          #
+          # This is the CPU-runnable half. The behavioural test
+          # (`upgrading_the_policy_revalidates_shards_the_weaker_policy_waved_through`)
+          # needs a device, so on a CPU runner this grep is the only thing
+          # standing between a revert and a silent NaN in the radix sort.
+          for f in "$csr" "$csc"; do
+            awk '/pub fn with_validation/,/^    \}/' "$f" | grep -q 'self\.memo = ValidationMemo::new' || {
+              echo "::error::$f's with_validation no longer resets the validation memo. A Bounds pass (no scan at all on CSR) would then satisfy a later Ranking policy and the finiteness scan would never run (ORG-8.20-1, review round 1)."
+              exit 1
+            }
+          done
+
           n=$(grep -c '{op}' "$val" || true)
           if [ "${n:-0}" -lt 4 ]; then
             echo "::error::$val interpolates ValidationPolicy::op into only ${n:-0} message(s), expected at least 4 (CSR scatter + CSR ranking + CSC bounds + CSC scatter + CSC ranking). A message that names no operation is the §8.14 defect in a new place (ORG-8.20-1)."

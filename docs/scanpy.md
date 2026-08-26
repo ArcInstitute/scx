@@ -1950,18 +1950,42 @@ numbers. Two invariants the kernels cannot enforce themselves:
   statistic, the tie counts and every p-value in the gene — silently. Filter or
   QC NaN / Inf before DE; the CPU paths reject the same input.
 
-  This check is scoped to the operations whose kernels need it. `pca`,
-  `highly_variable_genes`, `normalize_total` / `log1p` and `pseudobulk` do
-  **not** reject a non-finite value at the GPU staging boundary — their kernels
-  do not rank on the bit pattern, and the CPU paths accept the same input — so a
-  NaN reaches them and propagates the way it would on the CPU. `rank_genes_groups`
-  and `pdex_ref` do reject it, and the error names the operation you called.
+  This check is scoped to the operations whose kernels need it, and the scoping
+  is decided per entry point rather than per op:
+
+  | GPU entry point | non-finite input |
+  |---|---|
+  | `rank_genes_groups`, `pdex_ref` | **rejected** at the staging boundary; the error names the op |
+  | `highly_variable_genes` — the clipped-sum reducers, and the batched mean/variance | **rejected** at the staging boundary |
+  | `highly_variable_genes` — plain and CSC mean/variance | rejected *after* accumulation, naming the offending gene column |
+  | `pca`, `normalize_total` / `log1p`, `pseudobulk` | accepted; propagates as it would on the CPU |
+
+  The split inside `highly_variable_genes` is not arbitrary. Plain mean/variance
+  can afford to skip the O(nnz) input scan because a non-finite value survives
+  into its column's sums, where `first_non_finite_column` still catches it. The
+  clipped reducers cannot: the clip kernel evaluates `v > clip ? clip : v`, so
+  `+Inf` compares true and is **replaced by the clip value** before it is ever
+  accumulated — the sums come out finite and plausible, and no post-hoc check on
+  the output can tell. The batched mean/variance is excluded for a different
+  reason: its kernel returns early on a row belonging to no batch, so a
+  non-finite value in an excluded row never reaches the sums either.
+
+  Note this differs from the CPU HVG path, which rejects **every** non-finite
+  input up front via `ensure_finite_values`, including for the plain
+  mean/variance reducers where the GPU defers to the post-accumulation check.
 - **One value per `(cell, gene)`.** The scatter runs one thread per nonzero, so
   a duplicated entry would put two threads on one output cell with a
   nondeterministic winner. On the CSC side this is checked as *strictly
   increasing* row indices per column, which is what `scx build-csc` and every
   other sidecar writer emits; a hand-built sidecar with distinct-but-unordered
   rows is refused conservatively rather than raced.
+
+  This check is likewise scoped. DE and `pca` enforce it (`pca` because cuSPARSE
+  SpMM is undefined on unsorted column indices), and `pseudobulk` enforces it
+  because its kernel binary-searches each row's column window. `highly_variable_genes`
+  and `normalize_total` / `log1p` do **not**: they accumulate atomically or
+  rewrite values in place, neither of which races a unique output cell. On a
+  row-major matrix those two therefore run no staging scan at all.
 
 Both surface as a `RuntimeError` naming the offending gene column or nonzero
 index. The CSC-direct route previously ran neither check, so a NaN in a file

@@ -295,11 +295,17 @@ impl<'a> RawGpuCscShardSource<'a> {
     /// Set the validation policy — how deeply each shard is checked, and the
     /// operation name its errors speak in.
     ///
-    /// Builder rather than a `new` parameter so the fail-closed default costs
-    /// no call-site churn: a consumer that says nothing gets full DE-strength
-    /// checking, exactly as every consumer did before §8.14.
+    /// **Resets the validation memo.** The memo records only *that* a shard
+    /// passed, not at which rung, so carrying it across a policy change lets a
+    /// weaker pass satisfy a stronger one: drive at `Bounds` (on CSR, no scan
+    /// at all), call `with_validation(Ranking)`, drive again — every shard is
+    /// already marked seen and the finiteness scan never runs. Found by
+    /// codex - gpt-5.6-sol. Resetting unconditionally is cheaper to reason
+    /// about than tracking a high-water rung, and re-validating after a policy
+    /// change is the conservative direction.
     pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
         self.validation = validation;
+        self.memo = ValidationMemo::new(self.source.n_csc_shards());
         self
     }
 
