@@ -18,7 +18,7 @@ use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_diffexp::{gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csr_direct};
 use crate::gpu_matrix_source::GpuMatrixSource;
-use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 
 /// Divide row-major `[n_groups × n_cols]` f64 sums in place by per-group cell
 /// counts, turning group sums into arithmetic means. Groups with a zero count

@@ -1,9 +1,16 @@
-//! [`GpuMatrixSource`] impl over a CPU-side CSR shard source plus an optional
-//! CSC sidecar.
+//! [`GpuMatrixSource`] impl over a CPU-side CSR shard source, a CSC sidecar, or
+//! either one alone.
 //!
 //! [`BackedGpuMatrixSource`] covers every untransformed input the GPU DE /
-//! column-algorithm paths see today — they all reduce to "a CSR
-//! [`ShardSource`] + an optional CSC [`ColumnShardSource`]":
+//! column-algorithm paths see today. Most reduce to "a CSR [`ShardSource`] +
+//! an optional CSC [`ColumnShardSource`]", but **not all**: HVG's column-major
+//! reduces are handed a [`ColumnShardSource`] and nothing else, and construct a
+//! CSR-less source via [`BackedGpuMatrixSource::csc_only`]. So
+//! `available_layouts()` can be `CSC` alone and the CSR iterator can return
+//! [`GpuError::UnsupportedLayout`] — see the struct docs for the
+//! constructor → layouts table. (Round-1 review fixed the struct contract and
+//! left this module header saying the old thing; Cursor Agent - Grok 4.6 High
+//! caught that in round 2.)
 //!
 //! - backed SCX with a CSC sidecar → [`with_csc`](BackedGpuMatrixSource::with_csc)
 //!   (reports `CSR | CSC`);
