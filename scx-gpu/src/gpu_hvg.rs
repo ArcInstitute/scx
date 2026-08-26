@@ -745,20 +745,47 @@ mod tests {
         (s, sq)
     }
 
-    /// The bar the GPU arms are held to, stated once so the five call sites
-    /// cannot drift apart. Means are asserted **exactly**: `Σx / n` is one
-    /// division of an exactly-represented integer, so both arms must produce
-    /// the same bits as the oracle. Variances are allowed `1e-15` relative —
-    /// measured worst case on the integer fixture is 2.1e-16 (≈1 ULP), which is
-    /// the closed form's own rounding in `mean = Σx/n`, not a disagreement.
+    /// Variance bar for a well-conditioned fixture (`residual/Σx²` ≈ 1).
+    /// Measured worst case 2.1e-16, ≈1 ULP; one decimal order of headroom.
+    const VAR_REL_WELL_CONDITIONED: f64 = 1e-15;
+
+    /// Variance bar for the f32-accumulator probe, whose fixture is
+    /// deliberately less well conditioned (`residual/Σx²` = 1.95e-03) so that
+    /// its column sums can clear 2²⁴. Measured f64 noise there reaches 4.4e-14;
+    /// the f32-accumulator signal it must catch is 2.7e-07. 1e-10 sits ~3.4
+    /// orders above the noise and ~3.4 below the signal — the separation is the
+    /// point, not the round number.
+    const VAR_REL_LARGE_MAGNITUDE: f64 = 1e-10;
+
+    /// Compare an arm against the oracle. One routine for every call site, but
+    /// the variance bar is a **parameter**, because it is a property of the
+    /// fixture's conditioning rather than of the code under test.
+    ///
+    /// Means are always asserted **exactly**: `Σx / n` is a single division of
+    /// an exactly-represented integer, so it neither cancels nor depends on
+    /// summation order, whatever the magnitudes.
+    ///
+    /// Variances do not have one bar, and assuming they did cost a red hardware
+    /// run. The closed form loses about `eps / (residual/Σx²)` relatively, so
+    /// its accuracy is set by how near-constant the column is:
+    ///
+    /// | fixture | residual/Σx² | measured worst rel |
+    /// |---|---|---|
+    /// | [`integer_csr`], values `1..=20` | ~1 | 2.1e-16 (≈1 ULP) |
+    /// | the f32 probe, values `60_000..=70_000` | 1.95e-03 | 4.4e-14 |
+    ///
+    /// [`VAR_REL_WELL_CONDITIONED`] was measured on the first and then applied
+    /// to the second, which is three orders too tight for it — the probe failed
+    /// on an H100 at 1.245e-14 against a 1e-15 bar. The kernel was right and the
+    /// bar was wrong.
     fn assert_matches_exact(
         got_means: &[f64],
         got_vars: &[f64],
         want_means: &[f64],
         want_vars: &[f64],
+        var_rel_bar: f64,
         what: &str,
     ) {
-        const VAR_REL_BAR: f64 = 1e-15;
         assert_eq!(got_means.len(), want_means.len(), "{what}: mean length");
         assert_eq!(got_vars.len(), want_vars.len(), "{what}: var length");
         for j in 0..want_means.len() {
@@ -773,8 +800,8 @@ mod tests {
                 d / want_vars[j].abs()
             };
             assert!(
-                rel < VAR_REL_BAR,
-                "{what}: var col {j} = {} vs exact {} (rel {rel:.3e} >= {VAR_REL_BAR:.0e})",
+                rel < var_rel_bar,
+                "{what}: var col {j} = {} vs exact {} (rel {rel:.3e} >= {var_rel_bar:.0e})",
                 got_vars[j],
                 want_vars[j]
             );
@@ -857,6 +884,7 @@ mod tests {
             &m.variances,
             &want_means,
             &want_vars,
+            VAR_REL_WELL_CONDITIONED,
             "finalize_column_moments on exact integer moments",
         );
     }
@@ -1000,7 +1028,14 @@ mod tests {
         };
         let (gm, gv) = gpu_streaming_mean_var(&dev, &source).expect("gpu streaming mean/var");
         let (want_means, want_vars) = exact_moments(&s, &sq, n_rows);
-        assert_matches_exact(&gm, &gv, &want_means, &want_vars, "f32-accumulator probe");
+        assert_matches_exact(
+            &gm,
+            &gv,
+            &want_means,
+            &want_vars,
+            VAR_REL_LARGE_MAGNITUDE,
+            "f32-accumulator probe",
+        );
     }
 
     /// The GPU CSR mean/variance arm against the exact-integer oracle.
@@ -1033,6 +1068,7 @@ mod tests {
             &gpu_vars,
             &want_means,
             &want_vars,
+            VAR_REL_WELL_CONDITIONED,
             "gpu_streaming_mean_var",
         );
     }
@@ -1411,6 +1447,7 @@ mod tests {
             &gv,
             &want_means,
             &want_vars,
+            VAR_REL_WELL_CONDITIONED,
             "gpu_streaming_mean_var_csc",
         );
 
@@ -1491,7 +1528,14 @@ mod tests {
         let (gm, gv) = gpu_streaming_mean_var_csc(&dev, &src).unwrap();
         let (s, sq) = integer_moments_dense(&dense, n_cols);
         let (cm, cv) = exact_moments(&s, &sq, n_rows);
-        assert_matches_exact(&gm, &gv, &cm, &cv, "gpu_streaming_mean_var_csc hot gene");
+        assert_matches_exact(
+            &gm,
+            &gv,
+            &cm,
+            &cv,
+            VAR_REL_WELL_CONDITIONED,
+            "gpu_streaming_mean_var_csc hot gene",
+        );
         assert_eq!(gm[1], 0.0, "all-zero gene mean");
         assert_eq!(gv[1], 0.0, "all-zero gene var");
     }
