@@ -1543,6 +1543,93 @@ jobs:
             exit 1
           }
 
+      # ORG-8.20-1: the staging lifecycle exists once, behind a testable seam.
+      #
+      # `RawGpuShardSource::run` and `RawGpuCscShardSource::run_shards` each
+      # hand-rolled the same seven-step lifecycle and drifted: the CSC copy
+      # never gained the decode prefetch, the host-RAM budget, the staging
+      # pre-size or the profiling hooks the CSR copy got in Phase 4.2, and it
+      # classified a host-side read failure as `CudaError` where `error.rs`
+      # says `InvalidShard`.
+      #
+      # The thing that makes the rewiring reviewable is that the ordering
+      # policy is CUDA-free and therefore testable on a CPU host: this crate
+      # ignores 166 of its lib tests for want of a device, and the whole
+      # lifecycle used to be inside that set. So the checks below are mostly
+      # about the *seam* holding, not about any one assertion.
+      #
+      # Scope note: PR A lands the seam and the prerequisites. PR B routes both
+      # layouts through it (and must delete `staging_driver.rs`'s temporary
+      # `#![allow(dead_code)]`), PR C adds `ValidationLevel`, PR D migrates the
+      # consumers. Each extends this step rather than adding another.
+      - name: The GPU staging lifecycle is written once and stays CUDA-free
+        run: |
+          set -euo pipefail
+          drv=scx-gpu/src/staging_driver.rs
+          fake=scx-gpu/src/staging_driver_tests.rs
+          pf=scx-format-io/src/prefetch.rs
+          ss=scx-format-io/src/shard_source.rs
+          # Assert the inputs exist before asserting anything about them: a
+          # guard keyed on a path that has moved passes vacuously, and a `grep`
+          # over a missing file exits non-zero, which an `if` reads as "clean".
+          for f in "$drv" "$fake" "$pf" "$ss"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-1)."; exit 1; }
+          done
+
+          # Positive half 1: the driver still declares the policy. Every symbol
+          # is anchored on its opening delimiter — an unanchored `fn
+          # drive_shards` also matches `fn drive_shardsV2`, which is exactly how
+          # ORG-8.20-5's guard passed on a tree that had deleted what it
+          # guarded.
+          grep -qE '^ *pub\(crate\) fn drive_shards[<(]' "$drv" || { echo "::error::$drv no longer declares \`fn drive_shards\` — the shard staging lifecycle has gone back to being written once per layout, which is what ORG-8.20-1 exists to undo."; exit 1; }
+          for t in 'trait ShardStager' 'trait ShardFeeder'; do
+            grep -qE "^ *pub\(crate\) $t *\{" "$drv" || { echo "::error::$drv no longer declares \`$t\` — without both halves of the seam the driver would have to touch CUDA itself, and the CPU tests below become untestable (ORG-8.20-1)."; exit 1; }
+          done
+          grep -qE '^ *pub\(crate\) struct ValidationMemo *\{' "$drv" || { echo "::error::$drv no longer declares \`struct ValidationMemo\` — validate-then-mark is back to existing once per layout, and only one of the two had it (ORG-8.20-1)."; exit 1; }
+
+          # Positive half 2: the prerequisites the CSC path adopts. Without the
+          # position-indexed core it cannot use the shared prefetch at all
+          # (it iterates a prefiltered subset); without the size hint,
+          # SCX_GPU_STAGING_MEMORY_BUDGET prices nothing on the path whose
+          # decode depth goes 1 -> 4.
+          grep -qE '^fn for_each_ordered_by[<(]' "$pf" || { echo "::error::$pf no longer declares \`for_each_ordered_by\` — the decode-prefetch core is dense-indexed again, so the GPU CSC path cannot share it and grows back its own sync_channel(1) (ORG-8.20-1)."; exit 1; }
+          grep -qE '^pub fn for_each_csc_shard_ordered_selected[<(]' "$pf" || { echo "::error::$pf no longer declares \`for_each_csc_shard_ordered_selected\` (ORG-8.20-1)."; exit 1; }
+          for m in 'csc_shard_size_hint' 'csc_shards_for_col_range'; do
+            grep -qE "^ *fn $m\(" "$ss" || { echo "::error::ColumnShardSource no longer declares \`$m\` in $ss — the GPU CSC staging path re-derives it locally, which is the duplication ORG-8.20-1 removes."; exit 1; }
+          done
+
+          # Negative half 1: the driver names no CUDA. This is the seam. If a
+          # device call lands in here the policy stops being reachable from a
+          # CPU host, the tests below become `#[ignore]`d, and the refactor goes
+          # back to being unwatchable.
+          # Comment lines are stripped first: the module doc explains what the
+          # seam keeps out, in these words. Note the `(^|:)` anchor — `grep -n`
+          # over a SINGLE file emits `line:text`, not `file:line:text`, so
+          # ORG-8.20-5's `:[0-9]+:` spelling (written for `grep -rn` over a
+          # directory) matches nothing here and strips no comments. Caught by
+          # running this step against a clean tree, where it failed.
+          if grep -nE 'cudarc|CudaStream|CudaEvent|CudaSlice|alloc_zeros|record_event|synchronize\(' "$drv" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$drv touches CUDA at the line(s) above. The driver holds ordering policy only — every device interaction belongs behind a ShardStager method, or this stops being testable without a GPU (ORG-8.20-1)."
+            exit 1
+          fi
+
+          # Negative half 2: and the fake does not open a device either. A fake
+          # that acquired one would put the whole lifecycle back behind the
+          # sbatch queue, which is the single thing the seam exists to prevent.
+          # Same comment-stripping: the module doc names `require_gpu!()` and
+          # `GpuDevice::new` while explaining why neither appears.
+          if grep -nE 'require_gpu!|GpuDevice::new|#\[ignore' "$fake" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$fake gates on a device at the line(s) above. Its tests must run on every CPU host — that is the entire point of the seam, and 166 of this crate's lib tests already do not (ORG-8.20-1)."
+            exit 1
+          fi
+          # ...and it is not empty: a fake that implements neither trait would
+          # satisfy both negative halves by containing nothing at all.
+          for t in 'ShardStager for' 'ShardFeeder for'; do
+            grep -qE "^impl $t " "$fake" || { echo "::error::$fake no longer implements \`$t\` — the negative halves above pass vacuously on a file with no fake in it (ORG-8.20-1)."; exit 1; }
+          done
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
