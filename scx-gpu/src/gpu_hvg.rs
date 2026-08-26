@@ -745,7 +745,7 @@ mod tests {
         (s, sq)
     }
 
-    /// The bar the GPU arms are held to, stated once so the four call sites
+    /// The bar the GPU arms are held to, stated once so the five call sites
     /// cannot drift apart. Means are asserted **exactly**: `Σx / n` is one
     /// division of an exactly-represented integer, so both arms must produce
     /// the same bits as the oracle. Variances are allowed `1e-15` relative —

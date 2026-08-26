@@ -509,7 +509,7 @@ fn test_wilcoxon_gpu_ref_mode_per_thread_stream_vs_default_parity() {
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
     // `reference` is a `usize` (group index) — make_fixture always
     // supplies one for pdex_ref. For wilcoxon we wrap it in `Some`
-    // to drive the ref-mode capture path (mode = 1).
+    // to drive the ref-mode path (mode = 1). Nothing here captures a graph.
 
     let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
     let direct = wilcoxon_rank_sum_gpu_dense(

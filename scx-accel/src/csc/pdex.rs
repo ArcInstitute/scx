@@ -708,7 +708,8 @@ mod tests {
         .expect("CPU streaming wilcoxon failed");
 
         // Force the per-thread stream ON over the backed multi-shard reader (Wilcoxon
-        // is always the v1 dense-chunk driver — no v2/v3/CSC override needed).
+        // dispatches through wilcoxon_rank_sum_gpu_chunked_v3_csr here, since the
+        // backed input has no CSC sidecar).
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
         let gpu_res = crate::diffexp::wilcoxon_rank_sum_gpu(

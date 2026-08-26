@@ -48,13 +48,18 @@ fn main() {
     // in any job that intends to *run* GPU kernels; the stub branch stays the
     // default so a CPU-only `cargo check` still works.
     println!("cargo:rerun-if-env-changed=SCX_GPU_REQUIRE_NVCC");
-    // Whether `nvcc` resolves depends on PATH and CUDA_HOME, and neither is in
-    // this script's fingerprint by default — which is the *mechanism* behind
-    // the trap above, not merely an aggravator. Declaring them means moving
-    // from a CPU node to a GPU node re-runs this script instead of replaying
-    // the stub branch from cache. PATH changes more often than the toolchain
-    // does, so this costs the occasional needless kernel rebuild; that is a
-    // better trade than a wheel full of 41-byte PTX.
+    // Discovery below is `Command::new("nvcc")`, so **PATH alone** decides
+    // whether nvcc resolves — this script never reads CUDA_HOME. PATH is not in
+    // the fingerprint by default, which is the *mechanism* behind the trap
+    // above, not merely an aggravator: declaring it means moving from a CPU node
+    // to a GPU node re-runs this script instead of replaying the stub branch
+    // from cache. PATH changes often, so this costs the occasional needless
+    // kernel rebuild; that is a better trade than a wheel full of 41-byte PTX.
+    //
+    // CUDA_HOME is declared too, but as belt-and-braces only: nothing here
+    // consults it, so on its own it cannot change whether nvcc is found. It is
+    // listed because a toolchain move that edits CUDA_HOME usually edits PATH as
+    // well, and a spurious rerun is cheap next to a silent stub.
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     let require_nvcc = std::env::var("SCX_GPU_REQUIRE_NVCC").is_ok_and(|v| v != "0");

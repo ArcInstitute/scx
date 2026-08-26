@@ -3514,8 +3514,8 @@ it says so rather than implying a gate that does not exist.
 | Test | Metric | Threshold | Enforced by |
 |------|--------|-----------|-------------|
 | **Native** GPU PCA vs CPU PCA | Per-PC cosine, leading `n_clusters - 1` PCs | ≥ 0.99 | `test_gpu_randomized_householder_vs_cpu_randomized` — pins `SCX_FORCE_NATIVE_GPU=1`, so it does **not** cover the `device="gpu"` default, which is rapids-singlecell |
-| GPU PCA, Cholesky QR vs Householder QR | Per-PC cosine | ≥ 0.999 | `test_gpu_cholesky_matches_householder` — GPU vs GPU, not a CPU comparison |
-| Backed lazy pipeline (`normalize_total`→`log1p`→`pca`, `device="gpu"`) vs scanpy | Per-PC cosine, top 10 PCs | ≥ 0.99 | `test_lazy_normalize_log1p_pca_matches_scanpy` |
+| **Native** GPU PCA, Cholesky QR vs Householder QR | Per-PC cosine | ≥ 0.999 | `test_gpu_cholesky_matches_householder` — GPU vs GPU, not a CPU comparison, and it pins `SCX_FORCE_NATIVE_GPU=1` too: rapids ignores `qr_method`, so without the pin both arms are the same path and the comparison is vacuous |
+| `normalize_total`→`log1p`→`pca` at `device="gpu"` on an SCX-round-tripped **in-memory** AnnData, vs scanpy | Per-PC cosine, top 10 PCs | ≥ 0.99 | `test_lazy_normalize_log1p_pca_matches_scanpy` — despite the name it calls `to_anndata()`, whose `backed` defaults to `false`, so `X` is a materialized scipy CSR and the run does **not** exercise the backed/lazy streaming route |
 | GPU normalize + log1p vs CPU | Element-wise relative | < 1e-5 | `scx-gpu/src/gpu_preprocess_tests.rs::test_gpu_normalize_log1p_matches_cpu` |
 | GPU Leiden vs CPU Leiden | ARI | ≥ 0.10, plus a cluster-count bound | `test_gpu_leiden_not_degenerate` |
 | GPU kNN vs CPU HNSW | Recall@k | **not enforced** | — |
@@ -3535,6 +3535,9 @@ context:
   `pyscx/tests/test_accel.py` asserts HNSW recall ≥ 0.90 against brute force and
   UMAP trustworthiness > 0.75, both on `device="cpu"`. Neither compares a GPU
   result to anything, so neither backs a GPU tolerance.
+- **Two of these rows pin `SCX_FORCE_NATIVE_GPU=1`, and that is not a detail.**
+  The `device="gpu"` default routes in-memory PCA to rapids-singlecell; both
+  native-path bars are invisible to it. No row here gates the default path.
 - **The PCA rows are split three ways on purpose.** An earlier revision of this
   table had one "GPU PCA vs CPU PCA" row claiming "≥ 0.999 (GPU arms), ≥ 0.99 (vs
   scanpy)". The 0.999 bar is `test_gpu_cholesky_matches_householder`, which
