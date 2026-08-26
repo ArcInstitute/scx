@@ -14,7 +14,9 @@
 //! [`RawGpuCscShardSource`] mirrors [`crate::gpu_shard_source::RawGpuShardSource`]'s
 //! G3-shaped pipelining: a 2-slot pinned host ring, a dedicated copy
 //! stream, a bounded rayon decode-prefetch (`scx_format_io::prefetch`,
-//! depth 4 by default and derated by `SCX_GPU_STAGING_MEMORY_BUDGET`), and
+//! depth 4 by default, derated to fit `SCX_GPU_STAGING_MEMORY_BUDGET` **when
+//! the source supplies a size hint** — without one there is nothing to price
+//! the budget against and the requested depth stands), and
 //! an event-driven handshake between the copy and compute streams. The
 //! synchronous baseline from G4.3 has been replaced because it
 //! serialised decode + H→D + compute and regressed wall time at
@@ -163,10 +165,16 @@ pub trait GpuCscShardSource {
 ///   compute reads of the prior shard's device buffers).
 ///
 /// The decode loop is `scx_format_io::prefetch`'s bounded rayon pipeline —
-/// depth 4 by default, derated to fit `SCX_GPU_STAGING_MEMORY_BUDGET` — and
-/// not the single scoped worker thread this said before ORG-8.20-1 PR B. The
-/// difference is the live decoded-shard set, and so the host RSS, which is a
-/// blast-radius item rather than a detail.
+/// depth 4 by default — and not the single scoped worker thread this said
+/// before ORG-8.20-1 PR B. The difference is the live decoded-shard set, and
+/// so the host RSS, which is a blast-radius item rather than a detail.
+///
+/// `SCX_GPU_STAGING_MEMORY_BUDGET` derates that depth only when the source also
+/// supplies a `csc_shard_size_hint`: `resolve_staging_prefetch_depth_for`
+/// returns the requested depth unchanged if either the budget or the hint is
+/// absent, because there is nothing to price the budget against. A
+/// `ColumnShardSource` that does not override the hint is therefore **not**
+/// bounded by that env var (codex - gpt-5.6-sol).
 ///
 /// CSC kernels in this pipeline (`csc_shard_pseudobulk_kernel`,
 /// `csc_shard_to_gene_major_kernel`) are custom — no cuSPARSE descriptor

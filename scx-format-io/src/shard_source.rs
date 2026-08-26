@@ -308,6 +308,17 @@ pub trait ColumnShardSource {
     }
 
     /// Read and decode a single CSC shard.
+    ///
+    /// # Stability contract
+    ///
+    /// Same rule as [`ShardSource::read_shard`], for the same reason: the GPU
+    /// staging adapters memoise host-side validation per shard index, so a
+    /// shard validated once is not re-scanned. Repeated reads of one index must
+    /// stay structurally equivalent — same row ordering, same finiteness, same
+    /// row bounds — for the lifetime of a shared borrow. Values may differ.
+    ///
+    /// The round-2 fix stated this on the row-major trait only, while the memo
+    /// covers both layouts (codex - gpt-5.6-sol).
     fn read_csc_shard(&self, shard_idx: usize) -> Result<ScxCsc>;
 
     /// Read a contiguous column slice across shards.
