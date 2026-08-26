@@ -303,6 +303,39 @@ where
     for_each_ordered(n_shards, depth, &read, consume)
 }
 
+/// [`for_each_csc_shard_ordered`] restricted to an explicit ascending list of
+/// shard indices.
+///
+/// The GPU CSC staging path never sweeps every shard: it iterates the shards
+/// whose column range overlaps the gene chunk being processed, which at census
+/// scale is one or two out of thirteen. Handing that subset here is what lets
+/// it share the bounded, ordered pipeline instead of the hand-rolled
+/// `sync_channel(1)` it used before — the difference is a decode depth of 4
+/// rather than 1, and a `SCX_GPU_STAGING_MEMORY_BUDGET` that binds.
+///
+/// `indices` must be strictly ascending (see [`for_each_ordered_selected`]).
+/// Duplicates are not rejected but decode the same shard twice, which is never
+/// what a caller means.
+pub fn for_each_csc_shard_ordered_selected<S, F, E>(
+    source: &S,
+    indices: &[usize],
+    depth: usize,
+    consume: F,
+) -> Result<(), E>
+where
+    S: ColumnShardSource + Sync + ?Sized,
+    F: FnMut(usize, Arc<ScxCsc>) -> Result<(), E>,
+    E: PrefetchError,
+{
+    let read = move |idx: usize| {
+        source
+            .read_csc_shard(idx)
+            .map(Arc::new)
+            .map_err(|e| E::from_shard_read(idx, e))
+    };
+    for_each_ordered_selected(indices, depth, &read, consume)
+}
+
 /// Generic bounded ordered decode-prefetch core shared by the CSR and CSC
 /// front-ends. Decodes up to `depth` shards concurrently on the rayon pool via
 /// `read`, delivering to `consume` on the **calling thread in strict shard
@@ -312,7 +345,7 @@ fn for_each_ordered<T, R, F, E>(
     n_shards: usize,
     depth: usize,
     read: &R,
-    mut consume: F,
+    consume: F,
 ) -> Result<(), E>
 where
     T: Send + Sync + 'static,
@@ -320,6 +353,60 @@ where
     F: FnMut(usize, Arc<T>) -> Result<(), E>,
     E: PrefetchError,
 {
+    for_each_ordered_by(n_shards, |p| p, depth, read, consume)
+}
+
+/// [`for_each_ordered`] over an explicit, already-ascending list of shard
+/// indices instead of `0..n_shards`.
+///
+/// The GPU CSC path iterates a **prefiltered subset** — the shards whose column
+/// range overlaps a gene chunk — so the dense form cannot serve it. Rather than
+/// grow a second copy of the pipeline, the core below is position-indexed and
+/// this is the second `idx_of` it is given; the dense form passes the identity
+/// and allocates nothing.
+///
+/// `indices` must be strictly ascending: "strict shard order" is defined by
+/// position here, so a caller that shuffles the list gets its own order back,
+/// not a sorted one. Every production caller derives it from a catalog scan
+/// that is ascending by construction.
+fn for_each_ordered_selected<T, R, F, E>(
+    indices: &[usize],
+    depth: usize,
+    read: &R,
+    consume: F,
+) -> Result<(), E>
+where
+    T: Send + Sync + 'static,
+    R: Fn(usize) -> Result<Arc<T>, E> + Sync,
+    F: FnMut(usize, Arc<T>) -> Result<(), E>,
+    E: PrefetchError,
+{
+    for_each_ordered_by(indices.len(), |p| indices[p], depth, read, consume)
+}
+
+/// The position-indexed core. `n_items` counts *positions*; `idx_of` maps a
+/// position to the shard index handed to `read` and `consume`.
+///
+/// Splitting position from shard index is what lets one pipeline serve both a
+/// dense `0..n` sweep and a prefiltered subset: the reorder buffer and the
+/// in-flight window are keyed on position (always `0..n_items`, always
+/// contiguous), while the shard index only ever appears at the two boundaries
+/// where it means something.
+fn for_each_ordered_by<T, R, M, F, E>(
+    n_items: usize,
+    idx_of: M,
+    depth: usize,
+    read: &R,
+    mut consume: F,
+) -> Result<(), E>
+where
+    T: Send + Sync + 'static,
+    R: Fn(usize) -> Result<Arc<T>, E> + Sync,
+    M: Fn(usize) -> usize + Sync,
+    F: FnMut(usize, Arc<T>) -> Result<(), E>,
+    E: PrefetchError,
+{
+    let n_shards = n_items;
     if n_shards == 0 {
         return Ok(());
     }
@@ -343,12 +430,13 @@ where
         && rayon::current_num_threads() > 1
         && rayon::current_thread_index().is_none()
     {
-        return for_each_ordered_prefetched(n_shards, depth, read, consume);
+        return for_each_ordered_prefetched(n_shards, &idx_of, depth, read, consume);
     }
     #[cfg(not(feature = "parallel"))]
     let _ = depth;
 
-    for idx in 0..n_shards {
+    for pos in 0..n_shards {
+        let idx = idx_of(pos);
         let shard = read(idx)?;
         consume(idx, shard)?;
     }
@@ -363,8 +451,9 @@ where
 /// and this whole body disappears without the `parallel` feature. Callers must
 /// already have ruled out the fallback conditions.
 #[cfg(feature = "parallel")]
-fn for_each_ordered_prefetched<T, R, F, E>(
+fn for_each_ordered_prefetched<T, R, M, F, E>(
     n_shards: usize,
+    idx_of: &M,
     depth: usize,
     read: &R,
     mut consume: F,
@@ -372,6 +461,7 @@ fn for_each_ordered_prefetched<T, R, F, E>(
 where
     T: Send + Sync + 'static,
     R: Fn(usize) -> Result<Arc<T>, E> + Sync,
+    M: Fn(usize) -> usize + Sync,
     F: FnMut(usize, Arc<T>) -> Result<(), E>,
     E: PrefetchError,
 {
@@ -385,9 +475,15 @@ where
     // captures need no synchronisation. `read` is `&R` (Copy) so each spawn
     // captures the shared reference; `R: Sync` makes concurrent calls sound.
     rayon::in_place_scope(move |s| -> Result<(), E> {
+        // `$pos` is a *position* in the plan; the shard index it names is
+        // `idx_of($pos)`. Everything the pipeline bounds — the channel, the
+        // reorder buffer, the spawn window — is keyed on position, so the two
+        // may not be interchanged: for a prefiltered plan the shard indices are
+        // sparse and would leave `next_idx` waiting forever on a gap.
         macro_rules! spawn_shard {
-            ($scope:expr, $idx:expr) => {{
-                let idx_ = $idx;
+            ($scope:expr, $pos:expr) => {{
+                let pos_ = $pos;
+                let idx_ = idx_of(pos_);
                 let tx = tx.clone();
                 let read = read;
                 $scope.spawn(move |_| {
@@ -405,7 +501,7 @@ where
                             panic_message(payload)
                         ))),
                     };
-                    let _ = tx.send((idx_, res));
+                    let _ = tx.send((pos_, res));
                 });
             }};
         }
@@ -426,22 +522,22 @@ where
         }
 
         let mut buffer: BTreeMap<usize, Result<Arc<T>, E>> = BTreeMap::new();
-        let mut next_idx = 0usize;
+        let mut next_pos = 0usize;
         let mut received = 0usize;
         while received < n_shards {
-            let (idx, res) = rx.recv().map_err(|_| {
+            let (pos, res) = rx.recv().map_err(|_| {
                 E::prefetch_internal(
                     "decode-prefetch channel closed before all shards arrived".into(),
                 )
             })?;
             received += 1;
-            buffer.insert(idx, res);
+            buffer.insert(pos, res);
             #[cfg(test)]
             MAX_REORDER_BUFFER.with(|m| m.set(m.get().max(buffer.len())));
-            while let Some(res) = buffer.remove(&next_idx) {
+            while let Some(res) = buffer.remove(&next_pos) {
                 let shard = res?;
-                consume(next_idx, shard)?;
-                next_idx += 1;
+                consume(idx_of(next_pos), shard)?;
+                next_pos += 1;
                 // Spawn the next shard only as one drains, bounding the live set.
                 if next_to_spawn < n_shards {
                     spawn_shard!(s, next_to_spawn);

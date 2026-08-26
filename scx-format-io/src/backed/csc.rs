@@ -18,6 +18,12 @@ use super::*;
 struct CscShardRange {
     col_start: u64,
     col_end: u64,
+    /// Nonzeros in this shard, from the same `ShardStats` block the column
+    /// range is read from. Carried so `ColumnShardSource::csc_shard_size_hint`
+    /// can price a decoded shard without opening one — the row-major side has
+    /// had this since 4.5; the column-major side read the field and threw it
+    /// away.
+    nnz: u64,
     /// Position in the sorted-and-filtered CSC shard list. Equal to the
     /// shard index used by `ScxReader::read_csc_shard`.
     sorted_shard_idx: usize,
@@ -57,6 +63,7 @@ impl BackedCscIndex {
                 e.stats.as_ref().map(|s| CscShardRange {
                     col_start: s.major_start(e.section_type),
                     col_end: s.major_end(e.section_type),
+                    nnz: s.nnz,
                     sorted_shard_idx: 0,
                 })
             })
@@ -94,6 +101,7 @@ impl BackedCscIndex {
                 e.stats.as_ref().map(|s| CscShardRange {
                     col_start: s.major_start(e.section_type),
                     col_end: s.major_end(e.section_type),
+                    nnz: s.nnz,
                     sorted_shard_idx: 0,
                 })
             })
@@ -142,6 +150,34 @@ impl BackedCscIndex {
             result.push(r.sorted_shard_idx);
         }
         result
+    }
+
+    /// Upper bounds on the largest CSC shard, or `None` when the catalog
+    /// carries nothing to bound with.
+    ///
+    /// `max_rows` is the **major axis** — columns on this layout; see
+    /// [`ColumnShardSource::csc_shard_size_hint`](crate::ColumnShardSource::csc_shard_size_hint).
+    ///
+    /// Declines on `max_nnz == 0` for the same reason the row-major override
+    /// does: reporting zero would be an *under*-estimate, which the hint
+    /// contract forbids, and the caller then grows its buffers on demand
+    /// exactly as it did before. A genuinely all-empty sidecar is
+    /// indistinguishable here and also declines — harmless.
+    fn size_hint(&self) -> Option<crate::ShardSizeHint> {
+        let max_nnz = self.shard_ranges.iter().map(|r| r.nnz).max().unwrap_or(0);
+        if max_nnz == 0 {
+            return None;
+        }
+        let max_cols = self
+            .shard_ranges
+            .iter()
+            .map(|r| r.col_end.saturating_sub(r.col_start))
+            .max()
+            .unwrap_or(0);
+        Some(crate::ShardSizeHint {
+            max_rows: usize::try_from(max_cols).ok()?,
+            max_nnz: usize::try_from(max_nnz).ok()?,
+        })
     }
 
     /// Get the shard column range `(col_start, col_end)`.
@@ -586,6 +622,22 @@ impl crate::shard_source::ColumnShardSource for BackedCscReader {
         let lo = u32::try_from(lo).ok()?;
         let hi = u32::try_from(hi).ok()?;
         Some((lo, hi))
+    }
+
+    fn csc_shard_size_hint(&self) -> Option<crate::ShardSizeHint> {
+        self.index.size_hint()
+    }
+
+    /// Delegates to the precomputed column index's binary search rather than
+    /// re-running the trait default's O(n_shards) scan. Same boundary
+    /// condition — `shards_for_col_range` is half-open on both ends — which is
+    /// what the shared-predicate test in `shard_source.rs` pins.
+    fn csc_shards_for_col_range(&self, col_range: std::ops::Range<u32>) -> Vec<usize> {
+        if col_range.start >= col_range.end {
+            return Vec::new();
+        }
+        self.index
+            .shards_for_col_range(col_range.start as u64, col_range.end as u64)
     }
 }
 
