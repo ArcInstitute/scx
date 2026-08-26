@@ -364,11 +364,11 @@ pub fn gpu_apply_fused_ops(
 ///
 /// This is the eager GPU path used by `pyscx.accel.normalize_total(device="gpu")`
 /// and `log1p(device="gpu")`. It runs the transforms on a
-/// [`GpuPreprocessedShardSource`] (device-resident) and downloads each
-/// transformed shard's `(indptr, indices, data)` triple at the end — a
-/// **terminal D→H copy** sitting on top of the device-resident
-/// abstraction. New consumers that don't need a host CSR should consume
-/// `GpuPreprocessedShardSource` directly to avoid the download.
+/// [`PreprocessedGpuMatrixSource`](crate::PreprocessedGpuMatrixSource)
+/// (device-resident) and downloads each transformed shard's
+/// `(indptr, indices, data)` triple at the end — a **terminal D→H copy**
+/// sitting on top of the device-resident abstraction. New consumers that don't
+/// need a host CSR should consume that source directly to avoid the download.
 ///
 /// The implementation drops the legacy per-shard `dev.synchronize()`:
 /// `memcpy_dtoh` for pageable host destinations already blocks on the

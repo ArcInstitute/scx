@@ -1775,8 +1775,15 @@ jobs:
           # (`upgrading_the_policy_revalidates_shards_the_weaker_policy_waved_through`)
           # needs a device, so on a CPU runner this grep is the only thing
           # standing between a revert and a silent NaN in the radix sort.
+          # NB: `grep` without `-q`, output redirected. `grep -q` exits on its
+          # first match and closes the pipe; under `set -o pipefail` — which is
+          # GitHub Actions' default shell — the upstream `awk`/`sed` then dies
+          # with SIGPIPE and the pipeline reports FAILURE on a successful match.
+          # That inverts both of these checks on the real runner while they pass
+          # locally under a plain `bash script.sh`. Caught by falsifying this
+          # step under `set -eo pipefail`, which is what CI actually runs.
           for f in "$csr" "$csc"; do
-            awk '/pub fn with_validation/,/^    \}/' "$f" | grep -q 'self\.memo = ValidationMemo::new' || {
+            awk '/pub fn with_validation/,/^    \}/' "$f" | grep 'self\.memo = ValidationMemo::new' >/dev/null || {
               echo "::error::$f's with_validation no longer resets the validation memo. A Bounds pass (no scan at all on CSR) would then satisfy a later Ranking policy and the finiteness scan would never run (ORG-8.20-1, review round 1)."
               exit 1
             }
@@ -1811,9 +1818,26 @@ jobs:
           #   * `*_tests.rs` — a test of an adapter constructs the adapter. The
           #     allowlist already covers the inline `mod tests` in the staging
           #     modules themselves; this covers the extracted ones.
-          stragglers=$(grep -rln --include='*.rs' -e 'RawGpuShardSource::new' -e 'RawGpuCscShardSource::new' -e 'GpuPreprocessedShardSource::new' scx-gpu/src \
-            | grep -vE '_tests\.rs$' \
-            | grep -vE '^scx-gpu/src/(gpu_shard_source|gpu_csc_shard_source|backed_gpu_matrix_source|preprocessed_gpu_matrix_source|linear_operator)\.rs$' || true)
+          # Any associated-function CALL on the low-level adapters, not just
+          # `::new`. The first version listed only `::new`, and
+          # `RawGpuShardSource::with_max_shard_rows` is a second crate-visible
+          # constructor — a production file outside the allowlist could build
+          # the adapter with it, bypass `GpuMatrixSource`, and leave this guard
+          # green (codex - gpt-5.6-sol).
+          #
+          # `Type::ident(` and not a bare `Type::`: the bare form matched
+          # doc-comment prose in `error.rs`, `staging_driver.rs` and
+          # `resident_gpu_csr_source.rs` and failed on a clean tree. Comment
+          # lines are stripped for the same reason — that is three times in this
+          # one guard that prose describing a rule tripped the check enforcing
+          # it, so it is now the default assumption rather than a surprise.
+          stragglers=$(for f in $(find scx-gpu/src -name '*.rs' \
+                | grep -vE '_tests\.rs$' \
+                | grep -vE '^scx-gpu/src/(gpu_shard_source|gpu_csc_shard_source|backed_gpu_matrix_source|preprocessed_gpu_matrix_source|linear_operator)\.rs$'); do
+            sed -e 's#//.*##' "$f" \
+              | grep -E '(RawGpuShardSource|RawGpuCscShardSource|GpuPreprocessedShardSource)::[a-z_]+\(' >/dev/null \
+              && echo "$f"
+          done || true)
           if [ -n "$stragglers" ]; then
             echo "::error::$stragglers construct a low-level staging adapter directly. Go through BackedGpuMatrixSource / PreprocessedGpuMatrixSource — reaching past GpuMatrixSource is the split ORG-8.20-1 D4 closed. (linear_operator.rs is the one sanctioned exception; ORG-8.20-2 migrates it.)"
             exit 1

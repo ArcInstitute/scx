@@ -23,9 +23,22 @@ use crate::gpu_matrix_source::{GpuMatrixSource, LayoutSet, ValidationPolicy};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 use crate::staging::GpuCsrSlot;
 
-/// A [`GpuMatrixSource`] backed by a CSR shard source and, optionally, a CSC
-/// sidecar source. CSR is always available; CSC is available iff a CSC source
-/// was supplied via [`with_csc`](Self::with_csc).
+/// A [`GpuMatrixSource`] backed by a CSR shard source, a CSC sidecar source, or
+/// both.
+///
+/// Which layouts [`available_layouts`](GpuMatrixSource::available_layouts)
+/// reports follows the constructor, and **CSR is not guaranteed**:
+///
+/// | constructor | layouts |
+/// |---|---|
+/// | [`new`](Self::new) | `CSR` |
+/// | [`with_csc`](Self::with_csc) | `CSR \| CSC` |
+/// | [`csc_only`](Self::csc_only) | `CSC` |
+///
+/// A `csc_only` source returns [`GpuError::UnsupportedLayout`] from the CSR
+/// iterator. It exists because the column-major HVG reduces are handed a
+/// [`ColumnShardSource`] and nothing else; before it, those two call sites
+/// could not reach `GpuMatrixSource` at all and so reached past it.
 pub struct BackedGpuMatrixSource<'a> {
     csr: Option<RawGpuShardSource<'a>>,
     csc: Option<RawGpuCscShardSource<'a>>,
@@ -105,7 +118,15 @@ impl GpuMatrixSource for BackedGpuMatrixSource<'_> {
         match (&self.csr, self.csc_shape) {
             (Some(csr), _) => csr.shape(),
             (None, Some(shape)) => shape,
-            (None, None) => (0, 0),
+            // Unreachable: every constructor supplies at least one adapter,
+            // and `csc_shape` is `Some` exactly when `csr` is `None`. Panicking
+            // rather than answering `(0, 0)` because a silently empty matrix is
+            // the worst possible way for an invariant slip to surface — every
+            // downstream loop would just do nothing and report success.
+            (None, None) => unreachable!(
+                "BackedGpuMatrixSource has neither a CSR adapter nor a CSC shape; \
+                 every constructor establishes one of the two"
+            ),
         }
     }
 
@@ -245,6 +266,47 @@ mod tests {
         // CSC iteration on a CSR-only source errors (no panic).
         let err = src.for_each_gpu_csc_shard_in_range(0..4, &mut |_, _| Ok(()));
         assert!(matches!(err, Err(GpuError::UnsupportedLayout(_))));
+    }
+
+    /// The mirror of `csr_only_reports_csr_and_rejects_csc`, for the
+    /// constructor this PR added.
+    ///
+    /// Missing until review (Cursor Agent - Grok 4.6 High): the HVG CSC reduces
+    /// exercise `csc_only`'s happy path, but nothing pinned its layout bits or
+    /// its rejection of the CSR iterator — the two properties that make it a
+    /// `GpuMatrixSource` rather than a way to smuggle a CSC adapter through one.
+    ///
+    /// `shape()` is asserted because a `csc_only` source has no CSR adapter to
+    /// ask, so it answers from `csc_shape`; getting that wrong yields an empty
+    /// matrix rather than an error, and every downstream loop would quietly do
+    /// nothing.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn csc_only_reports_csc_and_rejects_csr() {
+        let dev = require_gpu!();
+        let csc = csc_fixture();
+        let mut src = BackedGpuMatrixSource::csc_only(&dev, &csc).unwrap();
+        assert_eq!(src.available_layouts(), LayoutSet::CSC);
+        assert!(src.route_metadata().csc_available);
+        assert_eq!(
+            src.shape(),
+            (5, 4),
+            "shape must come from the CSC source when there is no CSR adapter"
+        );
+
+        // CSR iteration on a CSC-only source errors (no panic).
+        let err = src.for_each_gpu_csr_shard(&mut |_, _| Ok(()));
+        assert!(matches!(err, Err(GpuError::UnsupportedLayout(_))));
+
+        // ...and the CSC side still works, so the rejection above is about the
+        // missing layout and not a source that is broken outright.
+        let mut seen = 0usize;
+        src.for_each_gpu_csc_shard_in_range(0..4, &mut |_, _| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 1, "the one CSC shard must still be delivered");
     }
 
     #[test]
