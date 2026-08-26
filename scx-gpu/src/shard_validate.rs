@@ -7,16 +7,22 @@
 //! reported as [`GpuError::InvalidShard`] rather than a `debug_assert!` that
 //! vanishes in release builds.
 //!
-//! Two validators sit on top of the scanners:
-//! `gpu_shard_source::validate_shard_for_gpu_de` for row-major CSR, and
-//! [`validate_csc_shard_for_gpu`] for the column-major sidecar. They share the
-//! scan **implementations** — so the ordering, the parallel threshold and the
-//! choice of which offender gets named cannot drift between layouts — but they
-//! do **not** run the same set: CSR runs [`first_unsorted_major`] and
+//! One entry point sits on top of the scanners: [`validate_shard`], over both
+//! layouts and over an ordered [`ValidationLevel`]. Sharing it means the
+//! ordering, the parallel threshold and the choice of which offender gets named
+//! cannot drift between layouts — but the two layouts do **not** run the same
+//! set, and are not meant to: CSR runs [`first_unsorted_major`] and
 //! [`first_non_finite`]; CSC runs those plus [`first_out_of_range`]. CSR has
 //! never range-checked its minor-axis (column) indices and this module does not
 //! add one — its kernels bound the column window themselves, and the shard
-//! decoder already rejects an out-of-range minor index on either layout.
+//! decoder already rejects an out-of-range minor index on either layout. That
+//! asymmetry is why [`ValidationLevel::Bounds`] is a real check on one layout
+//! and a no-op on the other.
+//!
+//! It used to be two validators run unconditionally at full depth, which is
+//! both wasted work on the ops that need less and the reason a
+//! `normalize_total` caller could be handed an error about DE ranking
+//! (review §8.14).
 //!
 //! Before this module existed only the CSR path validated at all, so the
 //! CSC-direct DE route — the *default* whenever a CSC sidecar is present —
@@ -37,6 +43,7 @@
 use rayon::prelude::*;
 
 use crate::error::GpuError;
+use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
 
 /// Default nnz below which the scanners run serially. Real shards are orders of
 /// magnitude above this (a census_500k shard carries ~24 M nnz); the threshold
@@ -117,30 +124,106 @@ pub(crate) fn first_non_finite(data: &[f32]) -> Option<usize> {
     }
 }
 
-/// Release-active validation of a CSC sidecar shard at the host-side GPU
-/// staging boundary.
+/// A decoded shard, with whatever extra addressing its layout needs in order
+/// to be checked and to name an offender a user can look up.
+pub(crate) enum ShardToValidate<'a> {
+    /// Row-major. Carries nothing extra: the CSR checks are all intra-shard.
+    Csr(&'a scx_sparse::ScxCsr),
+    /// Column-major. `n_obs` is the file-wide cell count the shard's **global**
+    /// row indices are numbered against; `col_start` is its first global
+    /// column, used only so an error names a gene column rather than a
+    /// shard-local offset.
+    Csc {
+        csc: &'a scx_sparse::ScxCsc,
+        n_obs: usize,
+        col_start: usize,
+    },
+}
+
+/// Release-active validation of a decoded shard at the host-side GPU staging
+/// boundary, to the depth `policy` asks for.
 ///
-/// `n_obs` is the file-wide cell count the shard's **global** row indices are
-/// numbered against; `col_start` is the shard's first global column, used only
-/// so the error names the gene column a user can look up rather than a
-/// shard-local offset.
+/// One entry point for both layouts, so the ordering, the parallel threshold
+/// and the choice of which offender gets named cannot drift between them. The
+/// two do **not** run the same set and are not meant to — see
+/// [`ValidationLevel::Bounds`], which is a no-op on CSR by design.
 ///
-/// Three invariants the CSC kernels require but cannot themselves enforce:
+/// | rung | CSR | CSC |
+/// |---|---|---|
+/// | `Bounds` | — | row indices within `[0, n_obs)` |
+/// | `Scatter` | sorted per-row columns | strictly-increasing per-column rows |
+/// | `Ranking` | finite values | finite values |
 ///
-/// 1. **In-range row indices.** `csc_shard_pseudobulk_kernel`,
-///    `csc_shard_pseudobulk_global_kernel` and `csc_shard_to_gene_major_kernel`
-///    all read `cell_to_group[row_indices[e]]` — an out-of-range row is an
-///    out-of-bounds device read, which on CUDA poisons the whole context.
+/// Every message interpolates `policy.op`, so the operation a user actually
+/// called is the one the error names. Before this, a `normalize_total` caller
+/// on a NaN-bearing file was told that "GPU DE ranking requires finite input"
+/// and to "sanitise/QC before DE" (review §8.14).
+pub(crate) fn validate_shard(
+    shard: ShardToValidate<'_>,
+    policy: &ValidationPolicy,
+) -> Result<(), GpuError> {
+    match shard {
+        ShardToValidate::Csr(csr) => validate_csr(csr, policy),
+        ShardToValidate::Csc {
+            csc,
+            n_obs,
+            col_start,
+        } => validate_csc(csc, n_obs, col_start, policy),
+    }
+}
+
+/// Row-major half of [`validate_shard`].
+///
+/// Note the absent bounds check: CSR has never range-checked its minor-axis
+/// (column) indices, because its kernels bound the column window themselves and
+/// the shard decoder already rejects an out-of-range minor index. This does not
+/// add one — so a CSR consumer at [`ValidationLevel::Bounds`] runs no scan.
+fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(), GpuError> {
+    let op = policy.op;
+    if policy.runs(ValidationLevel::Scatter) {
+        if let Some((r, a, b)) = first_unsorted_major(&csr.indptr, &csr.indices, csr.n_rows()) {
+            return Err(GpuError::InvalidShard(format!(
+                "ScxCsr row {r} has unsorted or duplicate column indices ({a} >= {b}): the GPU \
+                 shard scatter behind {op} requires strictly-increasing per-row indices for \
+                 deterministic output"
+            )));
+        }
+    }
+
+    if policy.runs(ValidationLevel::Ranking) {
+        if let Some(pos) = first_non_finite(&csr.data) {
+            return Err(GpuError::InvalidShard(format!(
+                "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: {op} ranks \
+                 values on the GPU by their raw bit pattern, where a NaN sorts above +Inf and \
+                 corrupts the result silently (sanitise/QC before running {op})",
+                csr.data[pos]
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Column-major half of [`validate_shard`].
+///
+/// The three invariants the CSC kernels require but cannot themselves enforce,
+/// one per rung:
+///
+/// 1. **In-range row indices** ([`ValidationLevel::Bounds`]).
+///    `csc_shard_pseudobulk_kernel`, `csc_shard_pseudobulk_global_kernel` and
+///    `csc_shard_to_gene_major_kernel` all read `cell_to_group[row_indices[e]]`
+///    — an out-of-range row is an out-of-bounds device read, which on CUDA
+///    poisons the whole context.
 ///
 ///    This is **not** the primary guard against that: on any backed file the
 ///    shard decoder's `check_minor_indices` already bounds CSC row indices
 ///    against the shard header's `n_minor` (= `n_obs`) and refuses to hand one
 ///    back, and the kernels carry their own `cell` bound as a last line. What
-///    this check adds is coverage of `ColumnShardSource` impls that do not
-///    decode through that seam, and an actionable error rather than the
-///    kernels' silent skip.
+///    this adds is coverage of `ColumnShardSource` impls that do not decode
+///    through that seam, and an actionable error rather than the kernels'
+///    silent skip.
 ///
-/// 2. **Strictly-increasing per-column row indices.**
+/// 2. **Strictly-increasing per-column row indices**
+///    ([`ValidationLevel::Scatter`]).
 ///    `csc_shard_to_gene_major_kernel` writes `slab[gene, pos]` with one thread
 ///    per nonzero, so a duplicate `(cell, gene)` pair is two threads racing one
 ///    output cell with a nondeterministic winner.
@@ -154,43 +237,52 @@ pub(crate) fn first_non_finite(data: &[f32]) -> Option<usize> {
 ///    the check is a fail-closed false negative on a shape SCX never emits, the
 ///    same trade the CSR validator already makes.
 ///
-/// 3. **Finite values.** `block_radix_sort_per_gene_kernel` pads with `+INF` and
-///    sorts on the raw IEEE-754 bit pattern, so a NaN lands above `+INF` and
-///    corrupts the U statistic and tie counts with no error. The CPU CSC DE path
-///    rejects the same input (`scx_accel`'s `ensure_finite_values`).
-pub(crate) fn validate_csc_shard_for_gpu(
+/// 3. **Finite values** ([`ValidationLevel::Ranking`]).
+///    `block_radix_sort_per_gene_kernel` pads with `+INF` and sorts on the raw
+///    IEEE-754 bit pattern, so a NaN lands above `+INF` and corrupts the U
+///    statistic and tie counts with no error. The CPU CSC DE path rejects the
+///    same input (`scx_accel`'s `ensure_finite_values`).
+fn validate_csc(
     csc: &scx_sparse::ScxCsc,
     n_obs: usize,
     col_start: usize,
+    policy: &ValidationPolicy,
 ) -> Result<(), GpuError> {
-    if let Some(pos) = first_out_of_range(&csc.indices, n_obs) {
-        return Err(GpuError::InvalidShard(format!(
-            "ScxCsc row index {} at nonzero index {pos} is outside [0, {n_obs}): GPU shard \
-             kernels index the per-cell group and position tables with it directly, so an \
-             out-of-range row is an out-of-bounds device read",
-            csc.indices[pos]
-        )));
+    let op = policy.op;
+    if policy.runs(ValidationLevel::Bounds) {
+        if let Some(pos) = first_out_of_range(&csc.indices, n_obs) {
+            return Err(GpuError::InvalidShard(format!(
+                "ScxCsc row index {} at nonzero index {pos} is outside [0, {n_obs}): the GPU \
+                 shard kernels behind {op} index the per-cell group and position tables with it \
+                 directly, so an out-of-range row is an out-of-bounds device read",
+                csc.indices[pos]
+            )));
+        }
     }
 
-    let n_cols = csc.indptr.len().saturating_sub(1);
-    if let Some((c, a, b)) = first_unsorted_major(&csc.indptr, &csc.indices, n_cols) {
-        return Err(GpuError::InvalidShard(format!(
-            "ScxCsc column {} has unsorted or duplicate row indices ({a} >= {b}): GPU shard \
-             scatter requires strictly-increasing per-column row indices so every (gene, cell) \
-             has exactly one writer (SCX-written CSC sidecars are strictly increasing by \
-             construction)",
-            col_start + c
-        )));
+    if policy.runs(ValidationLevel::Scatter) {
+        let n_cols = csc.indptr.len().saturating_sub(1);
+        if let Some((c, a, b)) = first_unsorted_major(&csc.indptr, &csc.indices, n_cols) {
+            return Err(GpuError::InvalidShard(format!(
+                "ScxCsc column {} has unsorted or duplicate row indices ({a} >= {b}): the GPU \
+                 shard scatter behind {op} requires strictly-increasing per-column row indices \
+                 so every (gene, cell) has exactly one writer (SCX-written CSC sidecars are \
+                 strictly increasing by construction)",
+                col_start + c
+            )));
+        }
     }
 
-    if let Some(pos) = first_non_finite(&csc.data) {
-        return Err(GpuError::InvalidShard(format!(
-            "ScxCsc contains a non-finite value ({}) at nonzero index {pos}: GPU shard kernels \
-             require finite input (NaN corrupts the radix sort; sanitise/QC before running)",
-            csc.data[pos]
-        )));
+    if policy.runs(ValidationLevel::Ranking) {
+        if let Some(pos) = first_non_finite(&csc.data) {
+            return Err(GpuError::InvalidShard(format!(
+                "ScxCsc contains a non-finite value ({}) at nonzero index {pos}: {op} ranks \
+                 values on the GPU by their raw bit pattern, where a NaN sorts above +Inf and \
+                 corrupts the result silently (sanitise/QC before running {op})",
+                csc.data[pos]
+            )));
+        }
     }
-
     Ok(())
 }
 

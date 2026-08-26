@@ -1949,6 +1949,13 @@ numbers. Two invariants the kernels cannot enforce themselves:
   IEEE-754 bit pattern, so a NaN would land above `+INF` and corrupt the U
   statistic, the tie counts and every p-value in the gene — silently. Filter or
   QC NaN / Inf before DE; the CPU paths reject the same input.
+
+  This check is scoped to the operations whose kernels need it. `pca`,
+  `highly_variable_genes`, `normalize_total` / `log1p` and `pseudobulk` do
+  **not** reject a non-finite value at the GPU staging boundary — their kernels
+  do not rank on the bit pattern, and the CPU paths accept the same input — so a
+  NaN reaches them and propagates the way it would on the CPU. `rank_genes_groups`
+  and `pdex_ref` do reject it, and the error names the operation you called.
 - **One value per `(cell, gene)`.** The scatter runs one thread per nonzero, so
   a duplicated entry would put two threads on one output cell with a
   nondeterministic winner. On the CSC side this is checked as *strictly

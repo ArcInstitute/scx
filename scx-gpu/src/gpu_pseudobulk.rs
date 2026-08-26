@@ -16,6 +16,7 @@ use scx_format_io::ShardSource;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_diffexp::{gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csr_direct};
+use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 
 /// Divide row-major `[n_groups × n_cols]` f64 sums in place by per-group cell
@@ -59,7 +60,15 @@ pub fn gpu_pseudobulk_means_csr(
     let cell_to_group_dev = dev.htod_copy(cell_to_group)?;
     let mut sums = dev.alloc_zeros::<f64>(n_groups * n_cols)?;
 
-    let mut src = RawGpuShardSource::new(dev, source)?;
+    // `Scatter`, not `Bounds`: the accumulation is `atomicAdd`, so duplicate
+    // `(cell, gene)` pairs would sum correctly — but `csr_shard_pseudobulk_kernel`
+    // first narrows each row to its `[c0, c1)` window with `scx_row_lower_bound`,
+    // a binary search that silently returns the wrong window on unsorted column
+    // indices. Reasoning from the accumulator alone gets this rung wrong.
+    let mut src = RawGpuShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
+        ValidationLevel::Scatter,
+        "pseudobulk",
+    ));
     let mut global_row = 0usize;
     src.for_each_gpu_shard(|_idx, slot| {
         let view = slot.view();

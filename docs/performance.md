@@ -752,7 +752,7 @@ what it saw while streaming: same shard indices, shapes, launch geometry, argume
 VRAM is the same either way (~6 GB at census_500k, 8 B/nnz).
 
 **2. Gene-chunk windowing.** Every one of those kernels already requires
-strictly-increasing per-row column indices — `validate_shard_for_gpu_de` enforces it
+strictly-increasing per-row column indices — `shard_validate::validate_shard` enforces it
 release-active, because a duplicate column races the scatter. Sorted indices make a
 chunk's columns a contiguous sub-range of the row, so two `lower_bound` searches replace
 the linear scan and the per-chunk term becomes `O(nnz / n_chunks + log(row_len))`.
@@ -788,7 +788,7 @@ the decision is stamped on `uns["scx_accel"][<op>]["resident_csr"]` and floored 
 `shards_decoded` is *not* the signal: it counts slab passes, which residency does not
 change.
 
-**Also in 4.5.** `validate_shard_for_gpu_de`'s two O(nnz) scans go parallel above 65 536
+**Also in 4.5.** The staging validator's O(nnz) scans go parallel above 65 536
 nnz — they were amortised into irrelevance when the same shard was re-validated 123 times
 beside 123 re-decodes, and are on the critical path once each shard is decoded once. The
 parallel form reduces by *minimum row index* rather than first-hit, so the error names the

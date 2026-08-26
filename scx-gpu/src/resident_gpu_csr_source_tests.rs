@@ -47,7 +47,7 @@ impl ShardSource for MultiShardCsr {
 
 /// One shard with `rows` rows over `n_vars` columns, deterministic sparsity.
 /// Column indices are strictly increasing per row (the GPU-DE contract that
-/// `validate_shard_for_gpu_de` enforces), and values are distinct per nonzero
+/// `shard_validate::validate_shard` enforces), and values are distinct per nonzero
 /// so a mis-ordered comparison cannot pass by coincidence.
 fn make_shard(rows: usize, n_vars: usize, seed: u64) -> ScxCsr {
     let mut indptr: Vec<i64> = vec![0];

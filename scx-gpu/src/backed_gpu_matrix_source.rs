@@ -19,7 +19,7 @@ use scx_format_io::{ColumnShardSource, ShardSource};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
-use crate::gpu_matrix_source::{GpuMatrixSource, LayoutSet};
+use crate::gpu_matrix_source::{GpuMatrixSource, LayoutSet, ValidationPolicy};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 use crate::staging::GpuCsrSlot;
 
@@ -57,6 +57,18 @@ impl<'a> BackedGpuMatrixSource<'a> {
             csr: RawGpuShardSource::new(dev, csr_source)?,
             csc: Some(RawGpuCscShardSource::new(dev, csc_source)?),
         })
+    }
+
+    /// Set the validation policy on whichever layouts this source provides.
+    ///
+    /// Applied to both inner adapters, so a consumer cannot end up validating a
+    /// CSR shard to one depth and the CSC sidecar of the same matrix to
+    /// another — which is the second half of §8.14: HVG's CSR and CSC entry
+    /// points used to disagree about whether a given file was valid.
+    pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
+        self.csr = self.csr.with_validation(validation);
+        self.csc = self.csc.map(|c| c.with_validation(validation));
+        self
     }
 }
 

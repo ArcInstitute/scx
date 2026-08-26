@@ -9,6 +9,29 @@
 use super::*;
 use scx_sparse::ScxCsc;
 
+/// The pre-§8.14 CSC entry point, as a test shim at the default policy.
+///
+/// The twenty scanner tests below predate `ValidationLevel` and assert its
+/// arithmetic, not its gating: which offender is named, that columns are
+/// scanned independently, that the parallel and serial arms agree. Routing them
+/// through the default policy — which runs every rung, exactly as the old
+/// entry point did — keeps them covering what they covered. The gating itself
+/// is tested separately, in `validation_level_tests.rs`.
+fn validate_csc_shard_for_gpu(
+    csc: &ScxCsc,
+    n_obs: usize,
+    col_start: usize,
+) -> Result<(), GpuError> {
+    validate_shard(
+        ShardToValidate::Csc {
+            csc,
+            n_obs,
+            col_start,
+        },
+        &ValidationPolicy::default(),
+    )
+}
+
 /// `n_cols` columns, each holding rows `0..per_col` in strictly increasing
 /// order — the shape `scx_sparse::transpose` emits. Every column restarts at
 /// row 0, so a validator that ran `windows(2)` over the flat `indices` array
@@ -103,10 +126,10 @@ fn rejects_duplicate_row_in_a_column_and_names_the_global_column() {
     let msg = expect_invalid(&csc, 8, 500);
     assert_eq!(
         msg,
-        "ScxCsc column 502 has unsorted or duplicate row indices (2 >= 2): GPU shard \
-         scatter requires strictly-increasing per-column row indices so every (gene, cell) \
-         has exactly one writer (SCX-written CSC sidecars are strictly increasing by \
-         construction)"
+        "ScxCsc column 502 has unsorted or duplicate row indices (2 >= 2): the GPU shard \
+         scatter behind this GPU operation requires strictly-increasing per-column row \
+         indices so every (gene, cell) has exactly one writer (SCX-written CSC sidecars are \
+         strictly increasing by construction)"
     );
 }
 
@@ -229,4 +252,178 @@ fn accepts_a_large_clean_shard_whose_columns_restart_at_row_zero() {
         return;
     }
     assert!(validate_csc_shard_for_gpu(&csc, 16, 0).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// ValidationLevel — the §8.14 fix
+// ---------------------------------------------------------------------------
+
+use scx_sparse::ScxCsr;
+
+/// One CSR row `[0, 1, 2]`, with `data[1]` replaced by `bad`.
+fn csr_with(bad: f32) -> ScxCsr {
+    ScxCsr::new_unchecked((1, 4), vec![0i64, 3], vec![0i32, 1, 2], vec![1.0, bad, 3.0])
+}
+
+fn policy(level: ValidationLevel, op: &'static str) -> ValidationPolicy {
+    ValidationPolicy::new(level, op)
+}
+
+/// The structural half of the fix: a consumer at `Bounds` never reaches the
+/// finiteness scan, so a NaN is simply not its problem.
+///
+/// This is the behaviour change the PR body has to declare — a NaN now reaches
+/// the HVG / preprocess / pseudobulk kernels — and it is the intended one: the
+/// CPU paths accept it, and HVG still rejects post-accumulation with a better
+/// message.
+#[test]
+fn bounds_and_scatter_accept_a_non_finite_csr_shard() {
+    let nan = csr_with(f32::NAN);
+    for level in [ValidationLevel::Bounds, ValidationLevel::Scatter] {
+        assert!(
+            validate_shard(
+                ShardToValidate::Csr(&nan),
+                &policy(level, "normalize_total")
+            )
+            .is_ok(),
+            "{level:?} must not run the finiteness scan"
+        );
+    }
+    assert!(validate_shard(
+        ShardToValidate::Csr(&nan),
+        &policy(ValidationLevel::Ranking, "rank_genes_groups")
+    )
+    .is_err());
+}
+
+/// The textual half: even at the rung that *does* reject, the message names the
+/// operation the user called.
+///
+/// Both halves are needed. A message can be reworded back and a level can be
+/// raised back, and each failure is invisible to a test that only checks the
+/// other.
+#[test]
+fn every_message_names_the_calling_op_and_never_says_de() {
+    let cases: Vec<(String, &str)> = vec![
+        // CSR, unsorted -> Scatter rung
+        {
+            let csr =
+                ScxCsr::new_unchecked((1, 4), vec![0i64, 2], vec![1i32, 1], vec![1.0f32, 2.0]);
+            let e = validate_shard(
+                ShardToValidate::Csr(&csr),
+                &policy(ValidationLevel::Scatter, "pca"),
+            )
+            .unwrap_err();
+            (format!("{e}"), "pca")
+        },
+        // CSR, non-finite -> Ranking rung
+        {
+            let e = validate_shard(
+                ShardToValidate::Csr(&csr_with(f32::NAN)),
+                &policy(ValidationLevel::Ranking, "rank_genes_groups"),
+            )
+            .unwrap_err();
+            (format!("{e}"), "rank_genes_groups")
+        },
+        // CSC, out of range -> Bounds rung
+        {
+            let mut csc = make_csc(4, 8);
+            csc.indices[3] = 99;
+            let e = validate_shard(
+                ShardToValidate::Csc {
+                    csc: &csc,
+                    n_obs: 8,
+                    col_start: 0,
+                },
+                &policy(ValidationLevel::Bounds, "highly_variable_genes"),
+            )
+            .unwrap_err();
+            (format!("{e}"), "highly_variable_genes")
+        },
+        // CSC, non-finite -> Ranking rung
+        {
+            let mut csc = make_csc(4, 8);
+            csc.data[5] = f32::NAN;
+            let e = validate_shard(
+                ShardToValidate::Csc {
+                    csc: &csc,
+                    n_obs: 8,
+                    col_start: 0,
+                },
+                &policy(ValidationLevel::Ranking, "pseudobulk"),
+            )
+            .unwrap_err();
+            (format!("{e}"), "pseudobulk")
+        },
+    ];
+
+    for (msg, op) in &cases {
+        assert!(
+            msg.contains(op),
+            "message does not name the calling op `{op}`: {msg}"
+        );
+        // The literals review §8.14 named. A `normalize_total` caller was told
+        // that "GPU DE ranking requires finite input (… sanitise/QC before DE)".
+        for banned in ["GPU DE ranking requires", "before DE", "GPU DE "] {
+            assert!(
+                !msg.contains(banned),
+                "message still contains the DE-specific literal `{banned}`: {msg}"
+            );
+        }
+    }
+    assert_eq!(cases.len(), 4, "all four rung/layout combinations covered");
+}
+
+/// The rungs are cumulative and ordered, so `runs()` is a `>=` and not a match.
+///
+/// Pinned because the whole dispatcher is written as `if policy.runs(rung)`:
+/// were the ordering to change, `Ranking` would silently stop running the
+/// bounds check and a CSC consumer would lose its out-of-bounds guard while
+/// asking for *more* validation.
+#[test]
+fn levels_are_ordered_and_cumulative() {
+    use ValidationLevel::*;
+    assert!(Bounds < Scatter && Scatter < Ranking);
+    assert!(policy(Ranking, "x").runs(Bounds));
+    assert!(policy(Ranking, "x").runs(Scatter));
+    assert!(policy(Scatter, "x").runs(Bounds));
+    assert!(!policy(Bounds, "x").runs(Scatter));
+    assert!(!policy(Scatter, "x").runs(Ranking));
+    // The default must be the strictest rung: a consumer that forgets to choose
+    // fails closed, at the cost of work rather than of a kernel precondition.
+    assert_eq!(ValidationPolicy::default().level, Ranking);
+}
+
+/// `Bounds` is a no-op on CSR and a real check on CSC — the asymmetry that
+/// makes "every consumer at Bounds" the wrong mental model.
+#[test]
+fn bounds_is_a_no_op_on_csr_and_a_real_check_on_csc() {
+    // A CSR shard that is unsorted AND non-finite passes at `Bounds`, because
+    // CSR has no minor-axis range check to run.
+    let mut csr = ScxCsr::new_unchecked(
+        (1, 4),
+        vec![0i64, 3],
+        vec![2i32, 1, 0],
+        vec![1.0f32, f32::NAN, 3.0],
+    );
+    csr.indices[0] = 2;
+    assert!(validate_shard(
+        ShardToValidate::Csr(&csr),
+        &policy(ValidationLevel::Bounds, "normalize_total")
+    )
+    .is_ok());
+
+    // The same rung on CSC does run: an out-of-range row is an out-of-bounds
+    // device read, which poisons the CUDA context.
+    let mut csc = make_csc(4, 8);
+    csc.indices[3] = 99;
+    assert!(validate_shard(
+        ShardToValidate::Csc {
+            csc: &csc,
+            n_obs: 8,
+            col_start: 0
+        },
+        &policy(ValidationLevel::Bounds, "highly_variable_genes")
+    )
+    .is_err());
 }

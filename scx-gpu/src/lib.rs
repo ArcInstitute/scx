@@ -167,7 +167,10 @@ pub use gpu_hvg::{
     gpu_streaming_mean_var_csc,
 };
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra_device, GpuKnnResult};
-pub use gpu_matrix_source::{GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata};
+pub use gpu_matrix_source::{
+    GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata, ValidationLevel,
+    ValidationPolicy,
+};
 pub use gpu_nb_glm::{
     gpu_nb_glm_fit, GpuNbGlmFit, GpuNbGlmOpts, GpuNbGlmPass, GPU_NB_GLM_METHOD_CR_MLE,
     GPU_NB_GLM_METHOD_CR_SHRUNK, GPU_NB_GLM_METHOD_MOMENTS, GPU_NB_GLM_NSUB_MAX, GPU_NB_GLM_PMAX,

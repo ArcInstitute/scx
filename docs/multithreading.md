@@ -535,10 +535,12 @@ on the first shard. The same hint gives the depth clamp a real per-shard byte
 estimate, so `SCX_GPU_STAGING_MEMORY_BUDGET` (bytes) can bound the
 decoded-but-unconsumed set. Unset, nothing is derated.
 
-Per-shard validation (`validate_shard_for_gpu_de`, two O(nnz) host scans
-enforcing the strictly-increasing-columns and finiteness contracts the DE
-kernels depend on) runs on the consuming thread and is rayon-parallel above
-65 536 nnz. It reduces by **minimum row index** rather than stopping at the
+Per-shard validation (`shard_validate::validate_shard`, up to three O(nnz)
+host scans enforcing the in-range, strictly-increasing and finiteness contracts
+the kernels depend on) runs on the consuming thread and is rayon-parallel above
+65 536 nnz. How many of the three run is the consumer's `ValidationLevel`: DE
+asks for all of them, HVG and preprocessing for the bottom rung only — which on
+a row-major shard is no scan at all. It reduces by **minimum row index** rather than stopping at the
 first offender any worker finds, so the error still names the same position the
 serial scan named — an error message that changes under load is not one a user
 can act on.

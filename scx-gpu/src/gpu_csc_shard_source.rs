@@ -33,9 +33,10 @@ use scx_format_io::shard_source::ColumnShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_matrix_source::ValidationPolicy;
 use crate::gpu_shard_source::resolve_staging_prefetch_depth_for;
 use crate::profile::{self, CodecClass};
-use crate::shard_validate::validate_csc_shard_for_gpu;
+use crate::shard_validate::{validate_shard, ShardToValidate};
 use crate::staging::PinnedCscSlot;
 use crate::staging_driver::{
     drive_shards, ShardConsumer, ShardFeeder, ShardStager, StagingPlan, ValidationMemo,
@@ -180,7 +181,7 @@ pub trait GpuCscShardSource {
 /// `csc_shard_to_gene_major_kernel`) are custom — no cuSPARSE descriptor
 /// cache is needed.
 ///
-/// Every shard is run through [`validate_csc_shard_for_gpu`] before it is
+/// Every shard is run through [`crate::shard_validate::validate_shard`] before it is
 /// staged, the column-major counterpart of what the CSR pipeline has always
 /// done. Until review §8.3 this path validated nothing at all, so the
 /// CSC-direct DE route — the default whenever a sidecar exists — fed NaN,
@@ -195,6 +196,10 @@ pub struct RawGpuCscShardSource<'a> {
     /// adapter's whole lifetime: the bytes behind a given shard index cannot
     /// change underneath it.
     memo: ValidationMemo,
+    /// How deeply to validate, and what to call the operation in an error.
+    /// Defaults to full DE-strength checking so a consumer that forgets to
+    /// choose fails closed.
+    validation: ValidationPolicy,
     pinned: [PinnedCscSlot; 2],
     /// Per-pinned-slot copy-stream events captured immediately after the
     /// slot's most recent `upload_to`. Host-waited on before the slot is
@@ -272,6 +277,7 @@ impl<'a> RawGpuCscShardSource<'a> {
             dev,
             source,
             memo: ValidationMemo::new(source.n_csc_shards()),
+            validation: ValidationPolicy::default(),
             pinned,
             pinned_events: [None, None],
             col_indptr,
@@ -284,6 +290,17 @@ impl<'a> RawGpuCscShardSource<'a> {
             n_obs,
             n_vars,
         })
+    }
+
+    /// Set the validation policy — how deeply each shard is checked, and the
+    /// operation name its errors speak in.
+    ///
+    /// Builder rather than a `new` parameter so the fail-closed default costs
+    /// no call-site churn: a consumer that says nothing gets full DE-strength
+    /// checking, exactly as every consumer did before §8.14.
+    pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
+        self.validation = validation;
+        self
     }
 
     /// Number of shards this adapter has validated so far. Test-only: lets the
@@ -334,6 +351,7 @@ impl<'a> RawGpuCscShardSource<'a> {
             col_indptr_cap: &mut self.col_indptr_cap,
             nnz_cap: &mut self.nnz_cap,
             memo: &mut self.memo,
+            validation: self.validation,
             copy_stream: &self.copy_stream,
             n_obs: self.n_obs,
             f,
@@ -417,6 +435,7 @@ struct CscStaging<'r, F> {
     col_indptr_cap: &'r mut usize,
     nnz_cap: &'r mut usize,
     memo: &'r mut ValidationMemo,
+    validation: ValidationPolicy,
     copy_stream: &'r Arc<CudaStream>,
     n_obs: usize,
     f: F,
@@ -475,7 +494,14 @@ where
 
     fn validate(&mut self, idx: usize, shard: &Self::Shard) -> Result<(), GpuError> {
         let (col_start, _) = self.col_range(idx)?;
-        validate_csc_shard_for_gpu(shard, self.n_obs, col_start)
+        validate_shard(
+            ShardToValidate::Csc {
+                csc: shard,
+                n_obs: self.n_obs,
+                col_start,
+            },
+            &self.validation,
+        )
     }
 
     fn memo(&mut self) -> &mut ValidationMemo {

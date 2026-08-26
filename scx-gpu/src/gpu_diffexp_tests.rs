@@ -1499,7 +1499,7 @@ fn test_combined_tie_term_overflow_regression() {
 /// row's whole nonzero range and predicating per element.
 ///
 /// The narrowing is only sound because per-row column indices are strictly
-/// increasing — enforced release-active by `validate_shard_for_gpu_de`. This
+/// increasing — enforced release-active by `shard_validate::validate_shard`. This
 /// pins the equivalence against a host reference over column windows chosen to
 /// hit every edge of the search: before the first column, after the last,
 /// exactly on a stored column, and in the gap between two adjacent ones.

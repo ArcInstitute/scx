@@ -68,6 +68,97 @@ impl std::ops::BitOr for LayoutSet {
     }
 }
 
+/// How much of the host-side shard validation a consumer needs, as an ordered,
+/// **cumulative** ladder. Each rung names the *kernel hazard* it removes.
+///
+/// Validation is not free: the scans are O(nnz) on the consuming thread, which
+/// on a decode-bound op competes with the very decode-prefetch workers feeding
+/// it. Before this existed every consumer paid the full DE set unconditionally,
+/// which is both wasted work and — the reason it is a review finding (§8.14) —
+/// why a `normalize_total` caller could be handed an error explaining that "GPU
+/// DE ranking requires finite input".
+///
+/// ⚠️ **`Bounds` is a no-op on CSR, by design.** The row-major validator
+/// has never range-checked minor-axis (column) indices: the CSR kernels bound
+/// the column window themselves, and the shard decoder already rejects an
+/// out-of-range minor index (see [`crate::shard_validate`]'s module doc). So a
+/// CSR consumer at `Bounds` runs no scan at all, and any CSR consumer whose
+/// kernel has a real precondition must ask for a higher rung — the PCA operator
+/// does, because cuSPARSE SpMM is undefined on unsorted column indices.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum ValidationLevel {
+    /// Minor-axis indices are in range.
+    ///
+    /// CSC only. `csc_shard_pseudobulk_kernel`,
+    /// `csc_shard_pseudobulk_global_kernel` and `csc_shard_to_gene_major_kernel`
+    /// all index `cell_to_group[row_indices[e]]` directly, so an out-of-range
+    /// row is an out-of-bounds device read — which on CUDA poisons the whole
+    /// context, not just the kernel. Nothing below this rung exists because
+    /// nothing below it is optional.
+    Bounds,
+    /// Adds: one writer per output cell.
+    ///
+    /// `csc_shard_to_gene_major_kernel` writes `slab[gene, pos]` with one thread
+    /// per nonzero, so a duplicate `(cell, gene)` pair is two threads racing one
+    /// cell with a nondeterministic winner. The same scan is what cuSPARSE SpMM
+    /// needs on the row-major side, where sorted column indices are a
+    /// precondition rather than a preference.
+    Scatter,
+    /// Adds: values are finite.
+    ///
+    /// `block_radix_sort_per_gene_kernel` pads with `+INF` and sorts on the raw
+    /// IEEE-754 bit pattern, so a NaN lands *above* `+INF` and corrupts the U
+    /// statistic and the tie counts with no error anywhere.
+    ///
+    /// The default, so a consumer that forgets to choose fails closed — at the
+    /// cost of some work, never at the cost of a kernel reading something it
+    /// cannot handle.
+    #[default]
+    Ranking,
+}
+
+/// A consumer's validation level plus the operation name its errors should
+/// speak in.
+///
+/// `op` is the **user-facing** operation — `"normalize_total"`, `"pca"`,
+/// `"rank_genes_groups"` — not the kernel or the crate function. It is
+/// interpolated into every message the scanners raise, which is the textual
+/// half of the §8.14 fix; the structural half is that a consumer at `Bounds`
+/// never reaches the finiteness scan at all. Either alone is fragile: a message
+/// can be reworded back, and a level can be raised back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ValidationPolicy {
+    /// How much to check.
+    pub level: ValidationLevel,
+    /// What to call the operation in an error.
+    pub op: &'static str,
+}
+
+impl ValidationPolicy {
+    /// A policy at `level`, speaking as `op`.
+    pub fn new(level: ValidationLevel, op: &'static str) -> Self {
+        Self { level, op }
+    }
+
+    /// True when this policy runs `want` (levels are cumulative).
+    pub fn runs(&self, want: ValidationLevel) -> bool {
+        self.level >= want
+    }
+}
+
+impl Default for ValidationPolicy {
+    /// Full DE-strength checking, attributed to no particular op.
+    ///
+    /// The pre-§8.14 behaviour, and the fail-closed default: a source built
+    /// without an explicit policy validates everything.
+    fn default() -> Self {
+        Self {
+            level: ValidationLevel::default(),
+            op: "this GPU operation",
+        }
+    }
+}
+
 /// Record of which transforms a source applies on the device before yielding
 /// shard data.
 ///

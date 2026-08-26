@@ -1558,8 +1558,8 @@ jobs:
       # lifecycle used to be inside that set. So the checks below are mostly
       # about the *seam* holding, not about any one assertion.
       #
-      # Scope note: PR A landed the seam and the prerequisites; PR B routes both
-      # layouts through it. PR C adds `ValidationLevel`, PR D migrates the
+      # Scope note: PR A landed the seam and the prerequisites; PR B routed both
+      # layouts through it; PR C added `ValidationLevel`. PR D migrates the
       # consumers. Each extends this step rather than adding another.
       - name: The GPU staging lifecycle is written once and stays CUDA-free
         run: |
@@ -1570,10 +1570,12 @@ jobs:
           ss=scx-format-io/src/shard_source.rs
           csr=scx-gpu/src/gpu_shard_source.rs
           csc=scx-gpu/src/gpu_csc_shard_source.rs
+          val=scx-gpu/src/shard_validate.rs
+          gms=scx-gpu/src/gpu_matrix_source.rs
           # Assert the inputs exist before asserting anything about them: a
           # guard keyed on a path that has moved passes vacuously, and a `grep`
           # over a missing file exits non-zero, which an `if` reads as "clean".
-          for f in "$drv" "$fake" "$pf" "$ss" "$csr" "$csc"; do
+          for f in "$drv" "$fake" "$pf" "$ss" "$csr" "$csc" "$val" "$gms"; do
             test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-1)."; exit 1; }
           done
 
@@ -1717,6 +1719,49 @@ jobs:
             echo "::error::$csc no longer builds its shard plan from csc_shards_for_col_range — the prefilter is what keeps a non-overlapping CSC shard from being decoded and uploaded once per gene chunk (13 shards x 123 chunks at census_500k). If this moved rather than went away, retarget this grep (ORG-8.20-1)."
             exit 1
           }
+
+          # Positive half 4 (PR C): validation has a consumer-set level, and one
+          # entry point over both layouts.
+          grep -qE '^pub enum ValidationLevel *\{' "$gms" || { echo "::error::$gms no longer declares \`enum ValidationLevel\` — every consumer is back to paying full DE-strength validation per shard, and a normalize_total caller is back to being told about DE ranking (review §8.14, ORG-8.20-1)."; exit 1; }
+          grep -qE '^pub struct ValidationPolicy *\{' "$gms" || { echo "::error::$gms no longer declares \`struct ValidationPolicy\` — without the op name there is nothing to interpolate into a message (ORG-8.20-1)."; exit 1; }
+          grep -qE '^pub\(crate\) fn validate_shard\(' "$val" || { echo "::error::$val no longer declares \`fn validate_shard\` — the two layouts have separate validators again, which is how their scan sets and error wording drifted (review §8.3, ORG-8.20-1)."; exit 1; }
+
+          # Negative half 6 (PR C): the DE-specific literals do not come back in
+          # the messages themselves. §8.14 is that a `normalize_total` caller was
+          # told "GPU DE ranking requires finite input ... sanitise/QC before
+          # DE". The structural half of the fix is that such a caller no longer
+          # reaches the finiteness scan; this is the textual half, and both are
+          # needed because either alone can be undone without the other
+          # noticing.
+          #
+          # Scoped to $val, where the message strings live, and comment lines
+          # are stripped. Both narrowings were forced: the first version of this
+          # branch swept all of scx-gpu/src without stripping comments and
+          # failed on a clean tree, flagging (a) the doc comment that explains
+          # WHY the wording is banned and (b) the test that asserts it is
+          # banned. That is the third time in this guard that prose describing a
+          # rule tripped the check enforcing it. The stronger assertion is the
+          # test — `every_message_names_the_calling_op_and_never_says_de` —
+          # which reads the messages the code actually produces rather than the
+          # source that produces them.
+          if grep -n -e 'GPU DE ranking requires' -e 'sanitise/QC before DE' "$val" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::the DE-specific error wording is back at the line(s) above. Interpolate ValidationPolicy::op so the message names the operation the user actually called (review §8.14, ORG-8.20-1)."
+            exit 1
+          fi
+          # ...and the op is genuinely interpolated somewhere, so the negative
+          # half above cannot pass on a validator with no `{op}` at all.
+          #
+          # This counts `{op}` occurrences and therefore CANNOT catch a
+          # validator that shadows `op` with a hard-coded literal — falsified,
+          # and it missed. `every_message_names_the_calling_op_and_never_says_de`
+          # does catch it (it checks four different ops against four rungs and
+          # three of the four then fail), which is where that guarantee lives.
+          n=$(grep -c '{op}' "$val" || true)
+          if [ "${n:-0}" -lt 4 ]; then
+            echo "::error::$val interpolates ValidationPolicy::op into only ${n:-0} message(s), expected at least 4 (CSR scatter + CSR ranking + CSC bounds + CSC scatter + CSC ranking). A message that names no operation is the §8.14 defect in a new place (ORG-8.20-1)."
+            exit 1
+          fi
 
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
