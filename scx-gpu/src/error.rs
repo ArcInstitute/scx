@@ -52,8 +52,8 @@ impl GpuError {
     /// False means the input itself is the problem, so no other path helps:
     ///
     /// * [`GpuError::InvalidShard`] — the shard is malformed, and the CPU
-    ///   kernels reject exactly the same shards (`validate_shard_for_gpu_de` /
-    ///   `validate_csc_shard_for_gpu` exist precisely because a NaN or a
+    ///   kernels reject exactly the same shards (`shard_validate::validate_shard`
+    ///   exists precisely because a NaN or a
     ///   duplicate `(row, col)` is not computable anywhere). It also carries
     ///   the *host-side* read/decode failures via
     ///   [`scx_format_io::PrefetchError`] below, which no device would fix

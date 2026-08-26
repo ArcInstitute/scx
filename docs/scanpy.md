@@ -1949,12 +1949,55 @@ numbers. Two invariants the kernels cannot enforce themselves:
   IEEE-754 bit pattern, so a NaN would land above `+INF` and corrupt the U
   statistic, the tie counts and every p-value in the gene — silently. Filter or
   QC NaN / Inf before DE; the CPU paths reject the same input.
+
+  This check is scoped to the operations whose kernels need it, and the scoping
+  is decided per entry point rather than per op:
+
+  | GPU entry point | non-finite input |
+  |---|---|
+  | `rank_genes_groups`, `pdex_ref` | **rejected** at the staging boundary; the error names the op |
+  | `highly_variable_genes` — the clipped-sum reducers, and the batched mean/variance | **rejected** at the staging boundary |
+  | `highly_variable_genes` — plain and CSC mean/variance | rejected *after* accumulation, naming the offending gene column |
+  | `pca`, `normalize_total` / `log1p`, `pseudobulk` | accepted; propagates as it would on the CPU |
+
+  The split inside `highly_variable_genes` is not arbitrary. Plain mean/variance
+  can afford to skip the O(nnz) input scan because a non-finite value survives
+  into its column's sums, where `first_non_finite_column` still catches it. The
+  clipped reducers cannot: the clip kernel evaluates `v > clip ? clip : v`, so
+  `+Inf` compares true and is **replaced by the clip value** before it is ever
+  accumulated — the sums come out finite and plausible, and no post-hoc check on
+  the output can tell. The batched mean/variance is excluded for a different
+  reason: its kernel returns early on a row belonging to no batch, so a
+  non-finite value in an excluded row never reaches the sums either.
+
+  Note this differs from the CPU HVG path, which rejects **every** non-finite
+  input up front via `ensure_finite_values`, including for the plain
+  mean/variance reducers where the GPU defers to the post-accumulation check.
 - **One value per `(cell, gene)`.** The scatter runs one thread per nonzero, so
   a duplicated entry would put two threads on one output cell with a
   nondeterministic winner. On the CSC side this is checked as *strictly
   increasing* row indices per column, which is what `scx build-csc` and every
   other sidecar writer emits; a hand-built sidecar with distinct-but-unordered
   rows is refused conservatively rather than raced.
+
+  This check is likewise scoped, and **independently** of the finiteness check
+  above — the two are separate switches, not a strictness ladder, precisely
+  because they do not nest:
+
+  | GPU entry point | sorted indices required |
+  |---|---|
+  | `rank_genes_groups`, `pdex_ref` | yes — the scatter races a duplicate `(cell, gene)` |
+  | `pca` | yes — cuSPARSE SpMM is undefined on unsorted column indices |
+  | `pseudobulk` | yes — the kernel binary-searches each row's column window |
+  | `highly_variable_genes` (all entry points) | **no** — it accumulates atomically or clips in place |
+  | `normalize_total` / `log1p` | **no** — it rewrites values in place |
+
+  So `highly_variable_genes` accepts an unsorted `scipy.sparse.csr_matrix`
+  (`has_sorted_indices == False`) exactly as the CPU path does, while still
+  rejecting a non-finite value on the entry points listed in the previous
+  table. An earlier design made these a cumulative ladder, which meant asking
+  for the finiteness check silently also demanded sorted indices — and GPU HVG
+  then refused input its own kernels handle fine.
 
 Both surface as a `RuntimeError` naming the offending gene column or nonzero
 index. The CSC-direct route previously ran neither check, so a NaN in a file

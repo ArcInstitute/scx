@@ -42,9 +42,10 @@ use scx_format_io::{prefetch, ShardSource};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::profile::{self, CodecClass};
-use crate::shard_validate::{first_non_finite, first_unsorted_major};
+use crate::shard_validate::{validate_shard, ShardToValidate};
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
 use crate::staging_driver::{
     drive_shards, ShardConsumer, ShardFeeder, ShardStager, StagingPlan, ValidationMemo,
@@ -55,68 +56,6 @@ use crate::staging_driver::{
 #[inline]
 fn csr_htod_bytes(csr: &scx_sparse::ScxCsr) -> usize {
     csr.data.len() * 4 + csr.indices.len() * 4 + (csr.n_rows() + 1) * 8
-}
-
-/// Release-active validation of a CSR shard at the host-side GPU DE staging
-/// boundary. Returns [`GpuError::InvalidShard`] rather than relying on a
-/// `debug_assert!` that vanishes in release builds (findings ACC3 + ACC11 /
-/// the always-on-boundary-validation policy).
-///
-/// Two invariants the GPU DE kernels require but cannot themselves enforce:
-///
-/// 1. **Strictly-increasing per-row columns (ACC3).** The CSR-to-dense scatter
-///    (`csr_shard_to_dense_chunk_kernel`) writes `dense[row, col - c0] =
-///    data[e]` with one thread per nonzero, so a duplicate `(row, col)` pair
-///    races on the same output cell and the winning value is nondeterministic.
-///    SCX canonicalisation sorts but does not dedup columns.
-///
-/// 2. **Finite values (ACC11).** `block_radix_sort_per_gene_kernel` pads with
-///    `+INF` and sorts on the raw IEEE-754 bit pattern, so a NaN lands at the
-///    wrong position and corrupts the U statistic and tie counts.
-///
-/// Two 2×O(nnz) host scans that sit on the staging thread, so they are the
-/// serial section between two parallel ones (the decode-prefetch pool feeding
-/// this shard, and the device kernels consuming it). Before §9.11 this was
-/// amortised away — the same shard was re-validated once per gene chunk, so it
-/// was a rounding error beside the 123 re-decodes. Now that
-/// [`ResidentGpuCsrSource`](crate::ResidentGpuCsrSource) makes each shard's
-/// decode happen exactly once, this scan is one of the few things left on the
-/// critical path, hence the parallel form (§9.13).
-///
-/// Both scans keep the serial version's *exact* answer, not just the same
-/// accept/reject decision: the sortedness check reduces by **minimum row
-/// index** rather than taking whichever offending row a worker reaches first,
-/// and the finiteness check uses `position_first`. So the error message names
-/// the same offending position it always did — a first-hit early exit would
-/// have made the message nondeterministic under load.
-///
-/// Small shards run serially: below `VALIDATE_PAR_MIN_NNZ` the rayon
-/// split/join costs more than the scan.
-///
-/// The scans themselves live in [`crate::shard_validate`]. The CSC sidecar's
-/// validator calls the same implementations, so the ordering, the parallel
-/// threshold and the choice of which offender gets named cannot drift between
-/// the layouts — but the two do **not** run the same set, and are not meant to:
-/// CSC additionally range-checks its minor-axis (row) indices, because its
-/// kernels index the per-cell tables with them directly. CSR never has, and
-/// this does not add one.
-pub(crate) fn validate_shard_for_gpu_de(csr: &scx_sparse::ScxCsr) -> Result<(), GpuError> {
-    if let Some((r, a, b)) = first_unsorted_major(&csr.indptr, &csr.indices, csr.n_rows()) {
-        return Err(GpuError::InvalidShard(format!(
-            "ScxCsr row {r} has unsorted or duplicate column indices ({a} >= {b}): \
-             GPU shard scatter requires strictly-increasing per-row indices for \
-             deterministic output"
-        )));
-    }
-
-    if let Some(pos) = first_non_finite(&csr.data) {
-        return Err(GpuError::InvalidShard(format!(
-            "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: GPU DE ranking \
-             requires finite input (NaN corrupts the radix sort; sanitise/QC before DE)",
-            csr.data[pos]
-        )));
-    }
-    Ok(())
 }
 
 /// Host-RAM budget, in bytes, for the shards the GPU staging path holds
@@ -308,6 +247,10 @@ pub struct RawGpuShardSource<'a> {
     /// finiteness. Raised by codex - gpt-5.6-sol, who noted that a shared
     /// borrow does not imply repeatable output.
     memo: ValidationMemo,
+    /// How deeply to validate, and what to call the operation in an error.
+    /// Defaults to full DE-strength checking so a consumer that forgets to
+    /// choose fails closed.
+    validation: ValidationPolicy,
 }
 
 impl<'a> RawGpuShardSource<'a> {
@@ -388,7 +331,25 @@ impl<'a> RawGpuShardSource<'a> {
             copy_stream,
             prefetch_depth,
             memo: ValidationMemo::new(source.n_shards()),
+            validation: ValidationPolicy::default(),
         })
+    }
+
+    /// Set the validation policy — how deeply each shard is checked, and the
+    /// operation name its errors speak in.
+    ///
+    /// **Resets the validation memo.** The memo records only *that* a shard
+    /// passed, not at which rung, so carrying it across a policy change lets a
+    /// weaker pass satisfy a stronger one: drive at `Bounds` (on CSR, no scan
+    /// at all), call `with_validation(Ranking)`, drive again — every shard is
+    /// already marked seen and the finiteness scan never runs. Found by
+    /// codex - gpt-5.6-sol. Resetting unconditionally is cheaper to reason
+    /// about than tracking a high-water rung, and re-validating after a policy
+    /// change is the conservative direction.
+    pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
+        self.validation = validation;
+        self.memo = ValidationMemo::new(self.source.n_shards());
+        self
     }
 
     /// Capacity of the reusable device CSR slot. Test-only: lets the
@@ -427,6 +388,7 @@ impl<'a> RawGpuShardSource<'a> {
             pinned_events: &mut self.pinned_events,
             slot: &mut self.slot,
             memo: &mut self.memo,
+            validation: self.validation,
             copy_stream: &self.copy_stream,
             f,
             transform,
@@ -471,6 +433,7 @@ struct CsrStaging<'r, F, T> {
     pinned_events: &'r mut [Option<CudaEvent>; 2],
     slot: &'r mut GpuCsrSlot,
     memo: &'r mut ValidationMemo,
+    validation: ValidationPolicy,
     copy_stream: &'r Arc<CudaStream>,
     f: F,
     transform: T,
@@ -491,7 +454,7 @@ where
     }
 
     fn validate(&mut self, _idx: usize, shard: &Self::Shard) -> Result<(), GpuError> {
-        validate_shard_for_gpu_de(shard)
+        validate_shard(ShardToValidate::Csr(shard), &self.validation)
     }
 
     fn memo(&mut self) -> &mut ValidationMemo {
@@ -636,7 +599,15 @@ impl<'a> GpuPreprocessedShardSource<'a> {
             None => None,
         };
         Ok(Self {
-            inner: RawGpuShardSource::new(dev, source)?,
+            // `Bounds`: the fused kernels rewrite `data` per row in place and
+            // never index by column, so neither sortedness nor finiteness is a
+            // precondition — `normalize_total` on a NaN-bearing matrix is the
+            // CPU behaviour too. On CSR `Bounds` runs no scan at all, which is
+            // the point: this path used to pay both DE scans per shard.
+            inner: RawGpuShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
+                ValidationChecks::IN_RANGE,
+                "normalize_total/log1p",
+            )),
             normalize,
             log1p,
             row_scale,
@@ -702,6 +673,18 @@ mod tests {
     use super::*;
     use crate::shard_validate::validate_par_min_nnz;
     use scx_sparse::ScxCsr;
+
+    /// The pre-§8.14 CSR entry point, as a test shim at the default policy.
+    ///
+    /// The eight scanner tests below predate `ValidationChecks` and assert
+    /// things that have nothing to do with it — that the parallel and serial
+    /// arms name the same offender, that `position_first` is used, that rows
+    /// are scanned independently. Routing them through the default policy keeps
+    /// them asserting exactly what they did, and keeps the level work from
+    /// quietly reducing what they cover.
+    fn validate_shard_for_gpu_de(csr: &ScxCsr) -> Result<(), GpuError> {
+        validate_shard(ShardToValidate::Csr(csr), &ValidationPolicy::default())
+    }
 
     struct InMemorySource {
         shards: Vec<ScxCsr>,
@@ -1069,9 +1052,9 @@ mod tests {
         };
         assert_eq!(
             msg,
-            "ScxCsr row 977 has unsorted or duplicate column indices (4 >= 4): \
-             GPU shard scatter requires strictly-increasing per-row indices for \
-             deterministic output",
+            "ScxCsr row 977 has unsorted or duplicate column indices (4 >= 4): the GPU shard \
+             scatter behind this GPU operation requires strictly-increasing per-row indices \
+             for deterministic output",
             "parallel scan must report the same first offending row as the serial one"
         );
 
@@ -1404,5 +1387,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A policy can require a check another policy does not, in **either**
+    /// direction — which is the premise the behavioural test below rests on,
+    /// and the reason these are independent switches rather than a ladder.
+    ///
+    /// The `FINITE` / `SORTED` pair is the case an ordered ladder could not
+    /// express: neither is a superset of the other, so under a ladder the only
+    /// way to reach `finite` was to also demand `sorted`
+    /// (codex - gpt-5.6-sol).
+    #[test]
+    fn check_sets_are_independent_and_neither_implies_the_other() {
+        let finite = ValidationChecks::FINITE;
+        let sorted = ValidationChecks::SORTED;
+        assert!(finite.finite && !finite.sorted);
+        assert!(sorted.sorted && !sorted.finite);
+        // Both keep the floor, which is the only check that is genuinely common.
+        assert!(finite.in_range && sorted.in_range);
+        // ALL is the fail-closed default and is a superset of both.
+        let all = ValidationChecks::ALL;
+        assert!(all.in_range && all.sorted && all.finite);
+        assert_eq!(ValidationPolicy::default().checks, all);
+        // IN_RANGE runs no scan on a row-major shard.
+        let floor = ValidationChecks::IN_RANGE;
+        assert!(!floor.sorted && !floor.finite);
+    }
+
+    /// Driving at `Bounds`, then upgrading to `Ranking`, must re-validate.
+    ///
+    /// Found by codex - gpt-5.6-sol. The memo is a bare `Vec<bool>` recording
+    /// *that* a shard passed, never at which rung, so carrying it across a
+    /// policy change lets a weaker pass satisfy a stronger one — and the
+    /// weakest pass on a row-major shard is **no scan at all**:
+    ///
+    /// ```text
+    /// drive at Bounds          → CSR runs zero scans, every shard marked seen
+    /// with_validation(Ranking)
+    /// drive again              → memo says validated → finiteness never runs
+    /// ```
+    ///
+    /// A NaN then reaches `block_radix_sort_per_gene_kernel` — the exact silent
+    /// corruption `Ranking` exists to prevent, reached by *asking for more*
+    /// validation.
+    ///
+    /// GPU-gated because `RawGpuShardSource` cannot be built without a device.
+    /// The cheap structural half — that both `with_validation` bodies reset the
+    /// memo — is an `ORG-8.20-1` CI grep, so a revert is caught on a CPU runner
+    /// even though this behaviour is not.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn upgrading_the_policy_revalidates_shards_the_weaker_policy_waved_through() {
+        let dev = require_gpu!();
+        let mut csr = make_csr(64, 8, 1.0);
+        csr.data[7] = f32::NAN;
+        let src = InMemorySource {
+            shards: vec![csr],
+            n_obs: 64,
+            n_vars: 8,
+        };
+
+        let mut gpu =
+            RawGpuShardSource::new(&dev, &src)
+                .unwrap()
+                .with_validation(ValidationPolicy::new(
+                    ValidationChecks::IN_RANGE,
+                    "normalize_total",
+                ));
+        gpu.for_each_gpu_shard(|_, _| Ok(()))
+            .expect("premise: Bounds runs no CSR scan, so the NaN is accepted");
+
+        let mut gpu = gpu.with_validation(ValidationPolicy::new(
+            ValidationChecks::FINITE,
+            "rank_genes_groups",
+        ));
+        let err = gpu
+            .for_each_gpu_shard(|_, _| Ok(()))
+            .expect_err("Ranking must re-scan a shard the Bounds pass never looked at");
+        let GpuError::InvalidShard(msg) = err else {
+            panic!("expected InvalidShard, got {err:?}");
+        };
+        assert!(
+            msg.contains("non-finite") && msg.contains("rank_genes_groups"),
+            "message must name the non-finite value and the upgraded op, got: {msg}"
+        );
     }
 }

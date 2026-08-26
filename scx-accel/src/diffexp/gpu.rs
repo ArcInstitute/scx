@@ -31,7 +31,8 @@ use scx_gpu::{
     gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct, gpu_de_pvalues,
     gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
     gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term,
-    BackedGpuMatrixSource, CudaSlice, GpuDevice, GpuMatrixSource,
+    BackedGpuMatrixSource, CudaSlice, GpuDevice, GpuMatrixSource, ValidationChecks,
+    ValidationPolicy,
 };
 
 use super::cpu::{benjamini_hochberg, merge_diff_exp_results, DiffExpResult, PdexRefResult};
@@ -236,7 +237,15 @@ pub fn pdex_ref_gpu(
         GpuDeShardInput::Csr(csr) => {
             let src = scx_gpu::InMemoryCsrShardSource::new(csr);
             let mut source = BackedGpuMatrixSource::new(&dev, &src)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?
+                // Fail-closed rung (the default) made explicit, and the op name wired.
+                //
+                // Without this the source keeps `ValidationPolicy::default()`, whose `op`
+                // is the placeholder "this GPU operation" — so a malformed file produced
+                // an error naming nothing, while `docs/scanpy.md` claimed the message
+                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // and codex - gpt-5.6-sol.
+                .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -255,7 +264,15 @@ pub fn pdex_ref_gpu(
         }
         GpuDeShardInput::Lazy(source_dyn) => {
             let mut source = BackedGpuMatrixSource::new(&dev, source_dyn)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?
+                // Fail-closed rung (the default) made explicit, and the op name wired.
+                //
+                // Without this the source keeps `ValidationPolicy::default()`, whose `op`
+                // is the placeholder "this GPU operation" — so a malformed file produced
+                // an error naming nothing, while `docs/scanpy.md` claimed the message
+                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // and codex - gpt-5.6-sol.
+                .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -277,7 +294,15 @@ pub fn pdex_ref_gpu(
                 Some(csc) => BackedGpuMatrixSource::with_csc(&dev, csr, csc),
                 None => BackedGpuMatrixSource::new(&dev, csr),
             }
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?
+            // Fail-closed rung (the default) made explicit, and the op name wired.
+            //
+            // Without this the source keeps `ValidationPolicy::default()`, whose `op`
+            // is the placeholder "this GPU operation" — so a malformed file produced
+            // an error naming nothing, while `docs/scanpy.md` claimed the message
+            // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+            // and codex - gpt-5.6-sol.
+            .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -430,7 +455,18 @@ pub fn wilcoxon_rank_sum_gpu(
         GpuDeShardInput::Csr(csr) => {
             let src = scx_gpu::InMemoryCsrShardSource::new(csr);
             let mut source = BackedGpuMatrixSource::new(&dev, &src)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?
+                // Fail-closed rung (the default) made explicit, and the op name wired.
+                //
+                // Without this the source keeps `ValidationPolicy::default()`, whose `op`
+                // is the placeholder "this GPU operation" — so a malformed file produced
+                // an error naming nothing, while `docs/scanpy.md` claimed the message
+                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // and codex - gpt-5.6-sol.
+                .with_validation(ValidationPolicy::new(
+                    ValidationChecks::ALL,
+                    "rank_genes_groups",
+                ));
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -449,7 +485,18 @@ pub fn wilcoxon_rank_sum_gpu(
         }
         GpuDeShardInput::Lazy(source_dyn) => {
             let mut source = BackedGpuMatrixSource::new(&dev, source_dyn)
-                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+                .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?
+                // Fail-closed rung (the default) made explicit, and the op name wired.
+                //
+                // Without this the source keeps `ValidationPolicy::default()`, whose `op`
+                // is the placeholder "this GPU operation" — so a malformed file produced
+                // an error naming nothing, while `docs/scanpy.md` claimed the message
+                // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+                // and codex - gpt-5.6-sol.
+                .with_validation(ValidationPolicy::new(
+                    ValidationChecks::ALL,
+                    "rank_genes_groups",
+                ));
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -478,7 +525,18 @@ pub fn wilcoxon_rank_sum_gpu(
                 Some(csc) => BackedGpuMatrixSource::with_csc(&dev, csr, csc),
                 None => BackedGpuMatrixSource::new(&dev, csr),
             }
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?;
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE matrix source init: {e}")))?
+            // Fail-closed rung (the default) made explicit, and the op name wired.
+            //
+            // Without this the source keeps `ValidationPolicy::default()`, whose `op`
+            // is the placeholder "this GPU operation" — so a malformed file produced
+            // an error naming nothing, while `docs/scanpy.md` claimed the message
+            // named the operation you called. Found by Cursor Agent - Grok 4.6 High
+            // and codex - gpt-5.6-sol.
+            .with_validation(ValidationPolicy::new(
+                ValidationChecks::ALL,
+                "rank_genes_groups",
+            ));
             wilcoxon_rank_sum_gpu_dispatch(
                 &dev,
                 &mut source,

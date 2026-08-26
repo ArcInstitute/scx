@@ -49,7 +49,7 @@
 // removes on the decode side.
 //
 // Every one of those kernels already requires **strictly increasing per-row
-// column indices** (each documents it; `validate_shard_for_gpu_de` enforces it
+// column indices** (each documents it; `shard_validate::validate_shard` enforces it
 // release-active at the host staging boundary, since a duplicate column races
 // the scatter). Sorted indices mean the chunk's columns are a contiguous
 // sub-range of the row, so two binary searches replace the linear scan and the
@@ -128,7 +128,7 @@ extern "C" __global__ void scatter_perm_to_gene_major_kernel(
 // (no duplicates). Threads write `dense[...] = data[e]` in parallel, so
 // duplicate `(row, col)` entries race and the winning value is
 // nondeterministic. The Rust wrapper enforces this via
-// `validate_shard_for_gpu_de` at the host-side staging boundary as a
+// `shard_validate::validate_shard` at the host-side staging boundary as a
 // release-active check (returns `GpuError::InvalidShard`), not a
 // debug_assert.
 //
@@ -346,7 +346,7 @@ extern "C" __global__ void pseudobulk_all_groups_kernel(
 //
 // `n_obs` bounds `cell_to_group`. Two host-side layers already reject a row
 // index outside it — the shard decoder's `check_minor_indices` on any backed
-// file, then `validate_csc_shard_for_gpu` before staging — so this guard is
+// file, then `shard_validate::validate_shard` before staging — so this guard is
 // unreachable in practice and deliberately kept anyway: an out-of-bounds device
 // read poisons the whole CUDA context, and review §8.3 was precisely a
 // host-side check that existed but had never been wired to this route.
@@ -584,10 +584,11 @@ extern "C" __global__ void csr_shard_pseudobulk_kernel(
 // wrong position and corrupt the downstream U statistic and tie counts.
 // Callers must guarantee finite input. This kernel sorts slabs filled from
 // EITHER layout, so both host-side staging validators enforce it release-active
-// (`GpuError::InvalidShard`): `validate_shard_for_gpu_de` for CSR and
-// `validate_csc_shard_for_gpu` for the CSC sidecar. Naming only the first is
-// what review §8.3 was — the CSC-direct route reached this kernel without ever
-// passing the validator its comment cited. The CPU DE entry point rejects
+// (`GpuError::InvalidShard`): one `shard_validate::validate_shard` covers both
+// layouts, at the `ValidationLevel::Ranking` rung the DE routes ask for. Two
+// separate validators, with only the CSR one named here, is what review §8.3
+// was — the CSC-direct route reached this kernel without ever passing the
+// validator its comment cited. The CPU DE entry point rejects
 // non-finite input symmetrically.
 // ---------------------------------------------------------------------------
 // `__launch_bounds__(BLOCK_THREADS)` is REQUIRED, not an optimization hint.

@@ -27,6 +27,7 @@ use crate::cusparse::{
 };
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 use crate::gpu_pca::{gpu_column_sums, gpu_mean_correct_colmajor_strided, gpu_outer_sub};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 use crate::math_policy::SpmmAlgPolicy;
@@ -141,7 +142,16 @@ impl<'a> CenteredSparseOperator<'a> {
             None
         };
 
-        let mut src = RawGpuShardSource::new(self.dev, self.source)?;
+        // `Scatter`: cuSPARSE SpMM is undefined on unsorted CSR column indices,
+        // so sortedness is a precondition here, not a preference. `Bounds` would
+        // be a no-op on this layout and leave the SpMM unguarded.
+        //
+        // ORG-8.20-2 owns this file's rewrite (one operator trait, one power
+        // loop) and migrates these two sites onto `GpuMatrixSource` there; the
+        // policy is set here so the level is decided by whoever read the kernel,
+        // not inherited by whoever moves the call.
+        let mut src = RawGpuShardSource::new(self.dev, self.source)?
+            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
         let mut global_row = 0usize;
 
         src.for_each_gpu_shard(|_idx, slot| {
@@ -229,7 +239,16 @@ impl<'a> CenteredSparseOperator<'a> {
             .memset_zeros(d_out)
             .map_err(|e| GpuError::KernelLaunchFailed(format!("rmatmat: zero out: {e}")))?;
 
-        let mut src = RawGpuShardSource::new(self.dev, self.source)?;
+        // `Scatter`: cuSPARSE SpMM is undefined on unsorted CSR column indices,
+        // so sortedness is a precondition here, not a preference. `Bounds` would
+        // be a no-op on this layout and leave the SpMM unguarded.
+        //
+        // ORG-8.20-2 owns this file's rewrite (one operator trait, one power
+        // loop) and migrates these two sites onto `GpuMatrixSource` there; the
+        // policy is set here so the level is decided by whoever read the kernel,
+        // not inherited by whoever moves the call.
+        let mut src = RawGpuShardSource::new(self.dev, self.source)?
+            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
         let mut global_row = 0usize;
 
         src.for_each_gpu_shard(|_idx, slot| {
