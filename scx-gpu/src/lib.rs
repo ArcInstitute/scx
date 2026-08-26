@@ -100,7 +100,10 @@ pub mod device;
 pub mod device_resident;
 pub mod error;
 pub mod forbp_gpu;
-pub mod gpu_csc_shard_source;
+// `pub(crate)`: the trait and adapter in here are internal; only
+// `GpuCscShardView` is public API, and it is re-exported below (a `pub use`
+// out of a private module is the normal way to expose exactly one item).
+pub(crate) mod gpu_csc_shard_source;
 pub mod gpu_csr_assemble;
 pub mod gpu_diffexp;
 pub mod gpu_graph;
@@ -114,7 +117,12 @@ pub mod gpu_pca;
 pub mod gpu_pca_resident;
 pub mod gpu_preprocess;
 pub mod gpu_pseudobulk;
-pub mod gpu_shard_source;
+// `pub(crate)`: nothing outside this crate names anything in here any more.
+// `GpuMatrixSource` (and `BackedGpuMatrixSource` / `PreprocessedGpuMatrixSource`
+// over it) is the surface consumers use; the row-major staging adapters below it
+// are an implementation detail, and leaving them public is what let three
+// overlapping iteration contracts coexist (ORG-8.20-1).
+pub(crate) mod gpu_shard_source;
 pub mod linear_operator;
 pub mod math_policy;
 pub mod nvcomp;
@@ -142,7 +150,9 @@ pub use device::{flat_launch_1d, GpuDevice};
 pub use device_resident::{DeviceEmbedding, DeviceKnnGraph};
 pub use error::{decline_on_runtime_failure, GpuError, Result};
 pub use forbp_gpu::forbp_decode_gpu;
-pub use gpu_csc_shard_source::{GpuCscShardSource, GpuCscShardView, RawGpuCscShardSource};
+// `GpuCscShardView` stays public: it appears in `GpuMatrixSource`'s signature.
+// The trait and the adapter behind it do not.
+pub use gpu_csc_shard_source::GpuCscShardView;
 pub use gpu_csr_assemble::{decode_csr_shards_to_device, decode_csr_shards_to_device_with_stats};
 pub use gpu_diffexp::{
     build_cell_to_group_dev, build_cell_to_pos_dev, default_gpu_de_gene_chunk_size,
@@ -183,7 +193,6 @@ pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
 pub use gpu_pseudobulk::{gpu_pseudobulk_means_csr, gpu_pseudobulk_means_dense};
-pub use gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource, RawGpuShardSource};
 pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;

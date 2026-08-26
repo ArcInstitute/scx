@@ -86,22 +86,12 @@ impl<'a> GpuCscShardView<'a> {
 /// not part of that trait because the slot layouts are incompatible (CSR
 /// stores row-major indptr + col indices; CSC stores col-major indptr +
 /// row indices).
-pub trait GpuCscShardSource {
-    /// Number of CSC shards in this source.
-    fn n_csc_shards(&self) -> usize;
-
-    /// Total observation count (rows). Same across all shards by CSC's
-    /// column-only sharding invariant.
-    fn n_obs(&self) -> usize;
-
-    /// Variable count (columns) across all shards combined.
-    fn n_vars(&self) -> usize;
-
-    /// `(n_obs, n_vars)`.
-    fn shape(&self) -> (usize, usize) {
-        (self.n_obs(), self.n_vars())
-    }
-
+/// Shape and shard-count accessors used to live here. Demoting the trait to
+/// `pub(crate)` (ORG-8.20-1 D4) revealed that nothing called them: every
+/// consumer asks `GpuMatrixSource::shape`, and the adapter reads the source's
+/// own `ColumnShardSource::shape` at construction. They were reachable only
+/// because the trait was public, which is the shape of API that accumulates.
+pub(crate) trait GpuCscShardSource {
     /// Iterate over each non-empty CSC shard, invoking the callback with
     /// `(shard_idx, &GpuCscShardView)` positioned at the live shard.
     ///
@@ -187,7 +177,7 @@ pub trait GpuCscShardSource {
 /// CSC-direct DE route — the default whenever a sidecar exists — fed NaN,
 /// duplicate `(cell, gene)` pairs and out-of-range cell ids straight to the
 /// kernels.
-pub struct RawGpuCscShardSource<'a> {
+pub(crate) struct RawGpuCscShardSource<'a> {
     dev: &'a GpuDevice,
     source: &'a (dyn ColumnShardSource + Sync),
     /// Shard indices already validated by this adapter, so a source iterated
@@ -218,7 +208,6 @@ pub struct RawGpuCscShardSource<'a> {
     /// one shard was ever decoded ahead, and the budget knob priced nothing.
     prefetch_depth: usize,
     n_obs: usize,
-    n_vars: usize,
 }
 
 impl<'a> RawGpuCscShardSource<'a> {
@@ -237,7 +226,7 @@ impl<'a> RawGpuCscShardSource<'a> {
         dev: &'a GpuDevice,
         source: &'a (dyn ColumnShardSource + Sync),
     ) -> Result<Self, GpuError> {
-        let (n_obs, n_vars) = source.shape();
+        let (n_obs, _n_vars) = source.shape();
         let ctx = dev.context();
         let hint = source.csc_shard_size_hint();
         // `max_rows` is the major axis on this layout, i.e. columns — so the
@@ -288,7 +277,6 @@ impl<'a> RawGpuCscShardSource<'a> {
             copy_stream,
             prefetch_depth: resolve_staging_prefetch_depth_for(hint),
             n_obs,
-            n_vars,
         })
     }
 
@@ -597,18 +585,6 @@ fn csc_htod_bytes(csc: &scx_sparse::ScxCsc) -> usize {
 }
 
 impl<'a> GpuCscShardSource for RawGpuCscShardSource<'a> {
-    fn n_csc_shards(&self) -> usize {
-        self.source.n_csc_shards()
-    }
-
-    fn n_obs(&self) -> usize {
-        self.n_obs
-    }
-
-    fn n_vars(&self) -> usize {
-        self.n_vars
-    }
-
     fn for_each_gpu_csc_shard<F>(&mut self, f: F) -> Result<(), GpuError>
     where
         F: FnMut(usize, &GpuCscShardView<'_>) -> Result<(), GpuError>,

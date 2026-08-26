@@ -27,8 +27,11 @@ use crate::staging::GpuCsrSlot;
 /// sidecar source. CSR is always available; CSC is available iff a CSC source
 /// was supplied via [`with_csc`](Self::with_csc).
 pub struct BackedGpuMatrixSource<'a> {
-    csr: RawGpuShardSource<'a>,
+    csr: Option<RawGpuShardSource<'a>>,
     csc: Option<RawGpuCscShardSource<'a>>,
+    /// Shape when there is no CSR adapter to ask. `None` whenever `csr` is
+    /// `Some`, so the two can never disagree.
+    csc_shape: Option<(usize, usize)>,
 }
 
 impl<'a> BackedGpuMatrixSource<'a> {
@@ -40,8 +43,32 @@ impl<'a> BackedGpuMatrixSource<'a> {
         csr_source: &'a (dyn ShardSource + Sync),
     ) -> Result<Self, GpuError> {
         Ok(Self {
-            csr: RawGpuShardSource::new(dev, csr_source)?,
+            csr: Some(RawGpuShardSource::new(dev, csr_source)?),
             csc: None,
+            csc_shape: None,
+        })
+    }
+
+    /// CSC-only source. Reports `CSC` and returns
+    /// [`GpuError::UnsupportedLayout`] from the CSR iterator.
+    ///
+    /// Exists because the column-major HVG reduces are handed a
+    /// [`ColumnShardSource`] and nothing else — there is no CSR side to pair
+    /// with. Without it those two sites cannot reach `GpuMatrixSource` at all,
+    /// which is what kept them calling `RawGpuCscShardSource` directly while
+    /// the CSR reduces two functions above went through the unified surface
+    /// (review §8.20: *the same file using both conventions*).
+    ///
+    /// `shape()` comes from the CSC source, so `n_obs` is the file-wide cell
+    /// count the sidecar's global row indices are numbered against.
+    pub fn csc_only(
+        dev: &'a GpuDevice,
+        csc_source: &'a (dyn ColumnShardSource + Sync),
+    ) -> Result<Self, GpuError> {
+        Ok(Self {
+            csr: None,
+            csc: Some(RawGpuCscShardSource::new(dev, csc_source)?),
+            csc_shape: Some(csc_source.shape()),
         })
     }
 
@@ -54,8 +81,9 @@ impl<'a> BackedGpuMatrixSource<'a> {
         csc_source: &'a (dyn ColumnShardSource + Sync),
     ) -> Result<Self, GpuError> {
         Ok(Self {
-            csr: RawGpuShardSource::new(dev, csr_source)?,
+            csr: Some(RawGpuShardSource::new(dev, csr_source)?),
             csc: Some(RawGpuCscShardSource::new(dev, csc_source)?),
+            csc_shape: None,
         })
     }
 
@@ -66,7 +94,7 @@ impl<'a> BackedGpuMatrixSource<'a> {
     /// another — which is the second half of §8.14: HVG's CSR and CSC entry
     /// points used to disagree about whether a given file was valid.
     pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
-        self.csr = self.csr.with_validation(validation);
+        self.csr = self.csr.map(|c| c.with_validation(validation));
         self.csc = self.csc.map(|c| c.with_validation(validation));
         self
     }
@@ -74,22 +102,34 @@ impl<'a> BackedGpuMatrixSource<'a> {
 
 impl GpuMatrixSource for BackedGpuMatrixSource<'_> {
     fn shape(&self) -> (usize, usize) {
-        self.csr.shape()
+        match (&self.csr, self.csc_shape) {
+            (Some(csr), _) => csr.shape(),
+            (None, Some(shape)) => shape,
+            (None, None) => (0, 0),
+        }
     }
 
     fn available_layouts(&self) -> LayoutSet {
-        if self.csc.is_some() {
-            LayoutSet::CSR | LayoutSet::CSC
-        } else {
-            LayoutSet::CSR
+        let mut set = LayoutSet::EMPTY;
+        if self.csr.is_some() {
+            set = set | LayoutSet::CSR;
         }
+        if self.csc.is_some() {
+            set = set | LayoutSet::CSC;
+        }
+        set
     }
 
     fn for_each_gpu_csr_shard(
         &mut self,
         f: &mut dyn FnMut(usize, &mut GpuCsrSlot) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
-        self.csr.for_each_gpu_shard(|idx, slot| f(idx, slot))
+        match self.csr.as_mut() {
+            Some(csr) => csr.for_each_gpu_shard(|idx, slot| f(idx, slot)),
+            None => Err(GpuError::UnsupportedLayout(
+                "BackedGpuMatrixSource was constructed CSC-only".to_string(),
+            )),
+        }
     }
 
     fn for_each_gpu_csc_shard_in_range(

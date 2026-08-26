@@ -13,11 +13,12 @@
 
 use scx_format_io::ShardSource;
 
+use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_diffexp::{gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csr_direct};
-use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
-use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
+use crate::gpu_matrix_source::GpuMatrixSource;
+use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
 
 /// Divide row-major `[n_groups × n_cols]` f64 sums in place by per-group cell
 /// counts, turning group sums into arithmetic means. Groups with a zero count
@@ -43,7 +44,7 @@ fn divide_by_counts(sums: &mut [f64], n_groups: usize, n_cols: usize, counts: &[
 /// number of cells in group `g` (the mean divisor). Returns row-major
 /// `[n_groups × n_cols]` f64 means.
 ///
-/// Streams shards via [`RawGpuShardSource`]; each shard's nonzeros are
+/// Streams shards via [`BackedGpuMatrixSource`]; each shard's nonzeros are
 /// scatter-added into a pre-zeroed device `sums` buffer by
 /// [`gpu_de_pseudobulk_csr_direct`] over the full column range.
 pub fn gpu_pseudobulk_means_csr(
@@ -65,12 +66,12 @@ pub fn gpu_pseudobulk_means_csr(
     // first narrows each row to its `[c0, c1)` window with `scx_row_lower_bound`,
     // a binary search that silently returns the wrong window on unsorted column
     // indices. Reasoning from the accumulator alone gets this rung wrong.
-    let mut src = RawGpuShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
+    let mut src = BackedGpuMatrixSource::new(dev, source)?.with_validation(ValidationPolicy::new(
         ValidationChecks::SORTED,
         "pseudobulk",
     ));
     let mut global_row = 0usize;
-    src.for_each_gpu_shard(|_idx, slot| {
+    src.for_each_gpu_csr_shard(&mut |_idx, slot| {
         let view = slot.view();
         let n_rows = view.shape.0;
         gpu_de_pseudobulk_csr_direct(

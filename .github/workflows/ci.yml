@@ -1559,8 +1559,8 @@ jobs:
       # about the *seam* holding, not about any one assertion.
       #
       # Scope note: PR A landed the seam and the prerequisites; PR B routed both
-      # layouts through it; PR C added `ValidationLevel`. PR D migrates the
-      # consumers. Each extends this step rather than adding another.
+      # layouts through it; PR C added `ValidationLevel`; PR D migrated the
+      # consumers onto `GpuMatrixSource` and demoted what is left.
       - name: The GPU staging lifecycle is written once and stays CUDA-free
         run: |
           set -euo pipefail
@@ -1785,6 +1785,37 @@ jobs:
           n=$(grep -c '{op}' "$val" || true)
           if [ "${n:-0}" -lt 4 ]; then
             echo "::error::$val interpolates ValidationPolicy::op into only ${n:-0} message(s), expected at least 4 (CSR scatter + CSR ranking + CSC bounds + CSC scatter + CSC ranking). A message that names no operation is the §8.14 defect in a new place (ORG-8.20-1)."
+            exit 1
+          fi
+
+          # Negative half 7 (PR D): the low-level staging traits are internal.
+          # Three overlapping iteration contracts coexisted precisely because
+          # all three were public — a consumer could reach past
+          # `GpuMatrixSource` to `RawGpuCscShardSource` (and one file did, for
+          # two of its four entry points, while the other two went through the
+          # unified surface).
+          if grep -nE '^pub (trait|struct) (GpuShardSource|GpuCscShardSource|RawGpuShardSource|RawGpuCscShardSource|GpuPreprocessedShardSource)\b' "$csr" "$csc"; then
+            echo "::error::the item(s) above are public again. They are the low-level staging adapters; GpuMatrixSource is the consumer surface, and re-exporting these is what let consumers split three ways (ORG-8.20-1 D4)."
+            exit 1
+          fi
+          if grep -nE '^pub use (gpu_shard_source|gpu_csc_shard_source)::.*(GpuShardSource|GpuCscShardSource|RawGpuShardSource|RawGpuCscShardSource|GpuPreprocessedShardSource)' scx-gpu/src/lib.rs; then
+            echo "::error::scx-gpu/src/lib.rs re-exports a demoted staging adapter at the line(s) above (ORG-8.20-1 D4). GpuCscShardView is the only item from those modules that belongs in the public API — it is in GpuMatrixSource's signature."
+            exit 1
+          fi
+          # ...and the consumers really did move: no production file outside the
+          # staging modules constructs a Raw adapter. Two exclusions, both with
+          # a reason:
+          #   * `linear_operator.rs` — the documented deferral. ORG-8.20-2 owns
+          #     that file's rewrite (one operator trait, one power loop) and
+          #     migrates it there. Listed by name so it reads as a decision.
+          #   * `*_tests.rs` — a test of an adapter constructs the adapter. The
+          #     allowlist already covers the inline `mod tests` in the staging
+          #     modules themselves; this covers the extracted ones.
+          stragglers=$(grep -rln --include='*.rs' -e 'RawGpuShardSource::new' -e 'RawGpuCscShardSource::new' -e 'GpuPreprocessedShardSource::new' scx-gpu/src \
+            | grep -vE '_tests\.rs$' \
+            | grep -vE '^scx-gpu/src/(gpu_shard_source|gpu_csc_shard_source|backed_gpu_matrix_source|preprocessed_gpu_matrix_source|linear_operator)\.rs$' || true)
+          if [ -n "$stragglers" ]; then
+            echo "::error::$stragglers construct a low-level staging adapter directly. Go through BackedGpuMatrixSource / PreprocessedGpuMatrixSource — reaching past GpuMatrixSource is the split ORG-8.20-1 D4 closed. (linear_operator.rs is the one sanctioned exception; ORG-8.20-2 migrates it.)"
             exit 1
           fi
 

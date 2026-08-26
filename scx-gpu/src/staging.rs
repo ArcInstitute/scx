@@ -1,7 +1,7 @@
 //! Shard staging primitives for asynchronous host→device CSR upload.
 //!
 //! `PinnedCsrSlot` and `GpuCsrSlot` are paired grow-only buffers used by the
-//! `GpuShardSource` adapters (see [`crate::gpu_shard_source`]) to amortise
+//! `GpuShardSource` adapters (see `gpu_shard_source`) to amortise
 //! per-shard allocation and unblock truly-async H→D copies.
 //!
 //! ## Pinned host staging
@@ -272,7 +272,7 @@ impl PinnedCsrSlot {
 /// `(col_indptr, row_indices, data)` arrays.
 ///
 /// Column-major counterpart to [`PinnedCsrSlot`]. Used by the pipelined
-/// [`crate::gpu_csc_shard_source::RawGpuCscShardSource`] adapter to
+/// `RawGpuCscShardSource` adapter to
 /// overlap shard decode + H→D copy with the previous shard's GPU
 /// compute, in the same shape as the CSR `RawGpuShardSource`.
 ///
@@ -692,7 +692,7 @@ impl GpuCsrSlot {
 /// (`pdex_ref_gpu` / `wilcoxon_rank_sum_gpu` with `GpuDeShardInput::Csr`) feed
 /// the refactored chunked driver,
 /// which consumes any `&dyn ShardSource + Sync` through
-/// [`crate::gpu_shard_source::RawGpuShardSource`]. The driver's per-shard
+/// `RawGpuShardSource`. The driver's per-shard
 /// device-resident gene-major scatter replaced the per-chunk host
 /// materialise + dense-upload path, which has since been deleted.
 ///

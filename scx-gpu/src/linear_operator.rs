@@ -8,7 +8,7 @@
 //! * [`rmatmat`](CenteredSparseOperator::rmatmat) — `out = (X − μ)ᵀ · Y` for
 //!   an `n_obs × k` right-hand side (the "transpose" power-iteration step).
 //!
-//! All routines stream shards via [`RawGpuShardSource`] (the G3 staging path,
+//! All routines stream shards via `RawGpuShardSource` (the G3 staging path,
 //! with a cached cuSPARSE descriptor per reusable slot), reuse the
 //! existing column-major helpers from `gpu_pca.rs`, and — critically for
 //! later phases — compute the mean-correction pre-factor `mc = Vᵀ · μ` via

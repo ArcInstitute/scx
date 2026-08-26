@@ -41,7 +41,8 @@ use scx_sparse::{concatenate_csr, ScxCsr};
 
 use crate::device::{flat_launch_1d, GpuDevice};
 use crate::error::GpuError;
-use crate::gpu_shard_source::{GpuPreprocessedShardSource, GpuShardSource};
+use crate::gpu_matrix_source::GpuMatrixSource;
+use crate::preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 
 /// PTX source for the normalize+log1p kernels, compiled at build time.
 const NORMALIZE_LOG1P_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/normalize_log1p.ptx"));
@@ -411,8 +412,13 @@ pub fn gpu_preprocess_to_csr(
     // needing a Mutex or post-hoc sort.
     let mut shard_csrs = Vec::<ScxCsr>::with_capacity(n_shards);
 
-    let mut gpu_source = GpuPreprocessedShardSource::new(dev, source, normalize, log1p, row_scale)?;
-    gpu_source.for_each_gpu_shard(|_shard_idx, slot| {
+    // `PreprocessedGpuMatrixSource` rather than `GpuPreprocessedShardSource`
+    // directly: it is the `GpuMatrixSource` face of the same thing, and giving
+    // it this consumer is what lets `GpuShardSource` be demoted to
+    // `pub(crate)`. Until now it was a wrapper with no non-test users at all.
+    let mut gpu_source =
+        PreprocessedGpuMatrixSource::new(dev, source, normalize, log1p, row_scale)?;
+    gpu_source.for_each_gpu_csr_shard(&mut |_shard_idx, slot| {
         let view = slot.view();
         let n_rows = view.shape.0;
 
