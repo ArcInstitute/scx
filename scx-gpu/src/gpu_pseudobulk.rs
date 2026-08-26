@@ -16,7 +16,7 @@ use scx_format_io::ShardSource;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_diffexp::{gpu_de_pseudobulk_all_groups, gpu_de_pseudobulk_csr_direct};
-use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 
 /// Divide row-major `[n_groups × n_cols]` f64 sums in place by per-group cell
@@ -66,7 +66,7 @@ pub fn gpu_pseudobulk_means_csr(
     // a binary search that silently returns the wrong window on unsorted column
     // indices. Reasoning from the accumulator alone gets this rung wrong.
     let mut src = RawGpuShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Scatter,
+        ValidationChecks::SORTED,
         "pseudobulk",
     ));
     let mut global_row = 0usize;

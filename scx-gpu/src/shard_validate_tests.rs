@@ -7,11 +7,12 @@
 //! end-to-end route coverage lives in `scx-accel`.
 
 use super::*;
-use scx_sparse::ScxCsc;
+use crate::gpu_matrix_source::ValidationChecks;
+use scx_sparse::{ScxCsc, ScxCsr};
 
 /// The pre-§8.14 CSC entry point, as a test shim at the default policy.
 ///
-/// The twenty scanner tests below predate `ValidationLevel` and assert its
+/// The twenty scanner tests below predate `ValidationChecks` and assert its
 /// arithmetic, not its gating: which offender is named, that columns are
 /// scanned independently, that the parallel and serial arms agree. Routing them
 /// through the default policy — which runs every rung, exactly as the old
@@ -255,43 +256,46 @@ fn accepts_a_large_clean_shard_whose_columns_restart_at_row_zero() {
 }
 
 // ---------------------------------------------------------------------------
-// ValidationLevel — the §8.14 fix
+// ValidationChecks — the §8.14 fix
 // ---------------------------------------------------------------------------
-
-use scx_sparse::ScxCsr;
 
 /// One CSR row `[0, 1, 2]`, with `data[1]` replaced by `bad`.
 fn csr_with(bad: f32) -> ScxCsr {
     ScxCsr::new_unchecked((1, 4), vec![0i64, 3], vec![0i32, 1, 2], vec![1.0, bad, 3.0])
 }
 
-fn policy(level: ValidationLevel, op: &'static str) -> ValidationPolicy {
-    ValidationPolicy::new(level, op)
+fn policy(checks: ValidationChecks, op: &'static str) -> ValidationPolicy {
+    ValidationPolicy::new(checks, op)
 }
 
 /// The structural half of the fix: a consumer at `Bounds` never reaches the
 /// finiteness scan, so a NaN is simply not its problem.
 ///
-/// This is the behaviour change the PR body has to declare — a NaN now reaches
-/// the HVG / preprocess / pseudobulk kernels — and it is the intended one: the
-/// CPU paths accept it, and HVG still rejects post-accumulation with a better
-/// message.
+/// The behaviour this pins is per-consumer, and the consumer list matters more
+/// than the switch: a NaN reaches the `normalize_total` / `log1p` and
+/// `pseudobulk` kernels, and HVG's *plain* mean/variance, which catches it
+/// after accumulation. It does **not** reach HVG's clipped reducers or its
+/// batched mean/variance — those ask for `ValidationChecks::FINITE`, because
+/// the clip kernel launders `+Inf` into the clip value before anything can
+/// check it (review round 1). An earlier version of this comment claimed the
+/// CPU paths accept the same input; CPU HVG does not, and that wording was the
+/// PR body's, not the test's.
 #[test]
 fn bounds_and_scatter_accept_a_non_finite_csr_shard() {
     let nan = csr_with(f32::NAN);
-    for level in [ValidationLevel::Bounds, ValidationLevel::Scatter] {
+    for checks in [ValidationChecks::IN_RANGE, ValidationChecks::SORTED] {
         assert!(
             validate_shard(
                 ShardToValidate::Csr(&nan),
-                &policy(level, "normalize_total")
+                &policy(checks, "normalize_total")
             )
             .is_ok(),
-            "{level:?} must not run the finiteness scan"
+            "{checks:?} must not run the finiteness scan"
         );
     }
     assert!(validate_shard(
         ShardToValidate::Csr(&nan),
-        &policy(ValidationLevel::Ranking, "rank_genes_groups")
+        &policy(ValidationChecks::FINITE, "rank_genes_groups")
     )
     .is_err());
 }
@@ -311,7 +315,7 @@ fn every_message_names_the_calling_op_and_never_says_de() {
                 ScxCsr::new_unchecked((1, 4), vec![0i64, 2], vec![1i32, 1], vec![1.0f32, 2.0]);
             let e = validate_shard(
                 ShardToValidate::Csr(&csr),
-                &policy(ValidationLevel::Scatter, "pca"),
+                &policy(ValidationChecks::SORTED, "pca"),
             )
             .unwrap_err();
             (format!("{e}"), "pca")
@@ -320,7 +324,7 @@ fn every_message_names_the_calling_op_and_never_says_de() {
         {
             let e = validate_shard(
                 ShardToValidate::Csr(&csr_with(f32::NAN)),
-                &policy(ValidationLevel::Ranking, "rank_genes_groups"),
+                &policy(ValidationChecks::FINITE, "rank_genes_groups"),
             )
             .unwrap_err();
             (format!("{e}"), "rank_genes_groups")
@@ -335,7 +339,7 @@ fn every_message_names_the_calling_op_and_never_says_de() {
                     n_obs: 8,
                     col_start: 0,
                 },
-                &policy(ValidationLevel::Bounds, "highly_variable_genes"),
+                &policy(ValidationChecks::IN_RANGE, "highly_variable_genes"),
             )
             .unwrap_err();
             (format!("{e}"), "highly_variable_genes")
@@ -350,7 +354,7 @@ fn every_message_names_the_calling_op_and_never_says_de() {
                     n_obs: 8,
                     col_start: 0,
                 },
-                &policy(ValidationLevel::Ranking, "pseudobulk"),
+                &policy(ValidationChecks::FINITE, "pseudobulk"),
             )
             .unwrap_err();
             (format!("{e}"), "pseudobulk")
@@ -374,24 +378,62 @@ fn every_message_names_the_calling_op_and_never_says_de() {
     assert_eq!(cases.len(), 4, "all four rung/layout combinations covered");
 }
 
-/// The rungs are cumulative and ordered, so `runs()` is a `>=` and not a match.
+/// Each check runs **iff** it was asked for — no check implies another.
 ///
-/// Pinned because the whole dispatcher is written as `if policy.runs(rung)`:
-/// were the ordering to change, `Ranking` would silently stop running the
-/// bounds check and a CSC consumer would lose its out-of-bounds guard while
-/// asking for *more* validation.
+/// This is the property the ordered-ladder version could not have. Under
+/// `Bounds < Scatter < Ranking`, asking for finiteness silently also demanded
+/// sortedness, so GPU HVG rejected an unsorted `scipy.sparse.csr_matrix` its
+/// own kernels handle and the CPU path accepts (codex - gpt-5.6-sol).
+///
+/// Falsify by making any one check unconditional in `validate_shard`: the
+/// matching arm below turns red.
 #[test]
-fn levels_are_ordered_and_cumulative() {
-    use ValidationLevel::*;
-    assert!(Bounds < Scatter && Scatter < Ranking);
-    assert!(policy(Ranking, "x").runs(Bounds));
-    assert!(policy(Ranking, "x").runs(Scatter));
-    assert!(policy(Scatter, "x").runs(Bounds));
-    assert!(!policy(Bounds, "x").runs(Scatter));
-    assert!(!policy(Scatter, "x").runs(Ranking));
-    // The default must be the strictest rung: a consumer that forgets to choose
-    // fails closed, at the cost of work rather than of a kernel precondition.
-    assert_eq!(ValidationPolicy::default().level, Ranking);
+fn each_check_runs_only_when_requested() {
+    // A CSR shard that is BOTH unsorted and non-finite, so each policy below is
+    // rejected only by the check it actually enables.
+    let bad = ScxCsr::new_unchecked(
+        (1, 4),
+        vec![0i64, 3],
+        vec![2i32, 1, 0],
+        vec![1.0f32, f32::NAN, 3.0],
+    );
+    let run =
+        |c: ValidationChecks| validate_shard(ShardToValidate::Csr(&bad), &policy(c, "op")).is_err();
+
+    assert!(!run(ValidationChecks::IN_RANGE), "no scan at all on CSR");
+    assert!(
+        run(ValidationChecks::SORTED),
+        "sorted must reject the disorder"
+    );
+    assert!(run(ValidationChecks::FINITE), "finite must reject the NaN");
+    assert!(run(ValidationChecks::ALL));
+
+    // ...and each rejects for its OWN reason, which is what proves neither
+    // implies the other. A sorted-but-non-finite shard passes SORTED.
+    let unsorted_only =
+        ScxCsr::new_unchecked((1, 3), vec![0i64, 2], vec![1i32, 0], vec![1.0f32, 2.0]);
+    assert!(
+        validate_shard(
+            ShardToValidate::Csr(&unsorted_only),
+            &policy(ValidationChecks::FINITE, "highly_variable_genes")
+        )
+        .is_ok(),
+        "FINITE must NOT reject unsorted input — the regression this replaced"
+    );
+
+    let nan_only = ScxCsr::new_unchecked((1, 3), vec![0i64, 2], vec![0i32, 1], vec![f32::NAN, 2.0]);
+    assert!(
+        validate_shard(
+            ShardToValidate::Csr(&nan_only),
+            &policy(ValidationChecks::SORTED, "pca")
+        )
+        .is_ok(),
+        "SORTED must NOT reject a NaN — PCA propagates it like the CPU does"
+    );
+
+    // The default must be everything: a consumer that forgets to choose fails
+    // closed, at the cost of work rather than of a kernel precondition.
+    assert_eq!(ValidationPolicy::default().checks, ValidationChecks::ALL);
 }
 
 /// `Bounds` is a no-op on CSR and a real check on CSC — the asymmetry that
@@ -409,7 +451,7 @@ fn bounds_is_a_no_op_on_csr_and_a_real_check_on_csc() {
     csr.indices[0] = 2;
     assert!(validate_shard(
         ShardToValidate::Csr(&csr),
-        &policy(ValidationLevel::Bounds, "normalize_total")
+        &policy(ValidationChecks::IN_RANGE, "normalize_total")
     )
     .is_ok());
 
@@ -423,7 +465,7 @@ fn bounds_is_a_no_op_on_csr_and_a_real_check_on_csc() {
             n_obs: 8,
             col_start: 0
         },
-        &policy(ValidationLevel::Bounds, "highly_variable_genes")
+        &policy(ValidationChecks::IN_RANGE, "highly_variable_genes")
     )
     .is_err());
 }

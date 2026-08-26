@@ -538,9 +538,11 @@ decoded-but-unconsumed set. Unset, nothing is derated.
 Per-shard validation (`shard_validate::validate_shard`, up to three O(nnz)
 host scans enforcing the in-range, strictly-increasing and finiteness contracts
 the kernels depend on) runs on the consuming thread and is rayon-parallel above
-65 536 nnz. How many of the three run is the consumer's `ValidationLevel`: DE
-asks for all of them, HVG and preprocessing for the bottom rung only — which on
-a row-major shard is no scan at all. It reduces by **minimum row index** rather than stopping at the
+65 536 nnz. Which of the three run is the consumer's `ValidationChecks` — three
+independent switches, not a ladder, because the requirements do not nest: DE
+asks for all three; PCA and pseudobulk for sorted-without-finite; HVG's clipped
+reducers for finite-without-sorted; `normalize_total` / `log1p` and HVG's plain
+mean/variance for neither, which on a row-major shard is no scan at all. It reduces by **minimum row index** rather than stopping at the
 first offender any worker finds, so the error still names the same position the
 serial scan named — an error message that changes under load is not one a user
 can act on.

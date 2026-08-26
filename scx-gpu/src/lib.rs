@@ -168,7 +168,7 @@ pub use gpu_hvg::{
 };
 pub use gpu_knn::{cuvs_available, gpu_knn_cagra_device, GpuKnnResult};
 pub use gpu_matrix_source::{
-    GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata, ValidationLevel,
+    GpuMatrixSource, GpuTransformSpec, LayoutSet, SourceRouteMetadata, ValidationChecks,
     ValidationPolicy,
 };
 pub use gpu_nb_glm::{

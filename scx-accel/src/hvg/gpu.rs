@@ -131,13 +131,17 @@ pub fn streaming_mean_var_batched_with_device<S: ShardSource + Sync>(
         // than O(nnz). Before Phase 7a `.max(0.0)` absorbed a NaN variance to 0.0
         // here, so the gene silently looked constant.
         //
-        // Narrower than the CPU scan in one way, deliberately documented rather
-        // than papered over: the device kernel returns early on
-        // `row_to_batch[row] < 0` before reading values, so a non-finite value in
-        // a row excluded from every batch never reaches these sums. CPU rejects
-        // that input, GPU accepts and ignores it. Closing the gap needs a
-        // device-side flag independent of batch inclusion; see
-        // `scx_sparse::first_non_finite_column`.
+        // This check used to be narrower than the CPU scan: the device kernel
+        // returns early on `row_to_batch[row] < 0` before reading values, so a
+        // non-finite value in a row excluded from every batch never reaches
+        // these sums, and GPU accepted input CPU rejected.
+        //
+        // That gap is now closed upstream rather than here.
+        // `gpu_streaming_mean_var_batched` asks for `ValidationChecks::FINITE`,
+        // so the staging validator scans the whole shard — excluded rows
+        // included — before any kernel runs. This post-accumulation check is
+        // now the second line, not the only one; do not lower that entry
+        // point's checks on the assumption that this one covers it.
         if let Some(j) = scx_sparse::first_non_finite_column(&batch_sum[b], &batch_sum_sq[b]) {
             return Err(crate::error::AccelError::InvalidInput(format!(
                 "streaming_mean_var_batched_with_device: batch {b}, column {j} accumulated \

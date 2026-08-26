@@ -1722,7 +1722,14 @@ jobs:
 
           # Positive half 4 (PR C): validation has a consumer-set level, and one
           # entry point over both layouts.
-          grep -qE '^pub enum ValidationLevel *\{' "$gms" || { echo "::error::$gms no longer declares \`enum ValidationLevel\` — every consumer is back to paying full DE-strength validation per shard, and a normalize_total caller is back to being told about DE ranking (review §8.14, ORG-8.20-1)."; exit 1; }
+          grep -qE '^pub struct ValidationChecks *\{' "$gms" || { echo "::error::$gms no longer declares \`struct ValidationChecks\` — every consumer is back to paying full validation per shard, and a normalize_total caller is back to being told about DE ranking (review §8.14, ORG-8.20-1)."; exit 1; }
+          # The three checks must stay INDEPENDENT fields, not an ordered ladder.
+          # A ladder cannot express finite-without-sorted, which is what HVG's
+          # clip reducers need, and reintroducing one made GPU HVG reject an
+          # unsorted scipy CSR that the CPU path accepts (codex - gpt-5.6-sol).
+          for fld in in_range sorted finite; do
+            grep -qE "^ *pub $fld: bool," "$gms" || { echo "::error::$gms: ValidationChecks lost the independent \`$fld\` field. If this became an ordered level again, asking for one check silently demands the others (ORG-8.20-1, review round 2)."; exit 1; }
+          done
           grep -qE '^pub struct ValidationPolicy *\{' "$gms" || { echo "::error::$gms no longer declares \`struct ValidationPolicy\` — without the op name there is nothing to interpolate into a message (ORG-8.20-1)."; exit 1; }
           grep -qE '^pub\(crate\) fn validate_shard\(' "$val" || { echo "::error::$val no longer declares \`fn validate_shard\` — the two layouts have separate validators again, which is how their scan sets and error wording drifted (review §8.3, ORG-8.20-1)."; exit 1; }
 

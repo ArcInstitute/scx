@@ -8,7 +8,7 @@
 //! vanishes in release builds.
 //!
 //! One entry point sits on top of the scanners: [`validate_shard`], over both
-//! layouts and over an ordered [`ValidationLevel`]. Sharing it means the
+//! layouts and over an independent [`ValidationChecks`] set. Sharing it means the
 //! ordering, the parallel threshold and the choice of which offender gets named
 //! cannot drift between layouts — but the two layouts do **not** run the same
 //! set, and are not meant to: CSR runs [`first_unsorted_major`] and
@@ -16,7 +16,7 @@
 //! never range-checked its minor-axis (column) indices and this module does not
 //! add one — its kernels bound the column window themselves, and the shard
 //! decoder already rejects an out-of-range minor index on either layout. That
-//! asymmetry is why [`ValidationLevel::Bounds`] is a real check on one layout
+//! asymmetry is why [`ValidationChecks::in_range`] is a real check on one layout
 //! and a no-op on the other.
 //!
 //! It used to be two validators run unconditionally at full depth, which is
@@ -43,7 +43,9 @@
 use rayon::prelude::*;
 
 use crate::error::GpuError;
-use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
+#[allow(unused_imports)] // used only by intra-doc links below
+use crate::gpu_matrix_source::ValidationChecks;
+use crate::gpu_matrix_source::ValidationPolicy;
 
 /// Default nnz below which the scanners run serially. Real shards are orders of
 /// magnitude above this (a census_500k shard carries ~24 M nnz); the threshold
@@ -146,7 +148,7 @@ pub(crate) enum ShardToValidate<'a> {
 /// One entry point for both layouts, so the ordering, the parallel threshold
 /// and the choice of which offender gets named cannot drift between them. The
 /// two do **not** run the same set and are not meant to — see
-/// [`ValidationLevel::Bounds`], which is a no-op on CSR by design.
+/// [`ValidationChecks::in_range`], which is a no-op on CSR by design.
 ///
 /// | rung | CSR | CSC |
 /// |---|---|---|
@@ -177,10 +179,11 @@ pub(crate) fn validate_shard(
 /// Note the absent bounds check: CSR has never range-checked its minor-axis
 /// (column) indices, because its kernels bound the column window themselves and
 /// the shard decoder already rejects an out-of-range minor index. This does not
-/// add one — so a CSR consumer at [`ValidationLevel::Bounds`] runs no scan.
+/// add one — so a CSR consumer asking only for [`ValidationChecks::in_range`]
+/// runs no scan.
 fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(), GpuError> {
     let op = policy.op;
-    if policy.runs(ValidationLevel::Scatter) {
+    if policy.checks.sorted {
         if let Some((r, a, b)) = first_unsorted_major(&csr.indptr, &csr.indices, csr.n_rows()) {
             return Err(GpuError::InvalidShard(format!(
                 "ScxCsr row {r} has unsorted or duplicate column indices ({a} >= {b}): the GPU \
@@ -190,13 +193,16 @@ fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(
         }
     }
 
-    if policy.runs(ValidationLevel::Ranking) {
+    if policy.checks.finite {
         if let Some(pos) = first_non_finite(&csr.data) {
+            let val = csr.data[pos];
             return Err(GpuError::InvalidShard(format!(
-                "ScxCsr contains a non-finite value ({}) at nonzero index {pos}: {op} ranks \
-                 values on the GPU by their raw bit pattern, where a NaN sorts above +Inf and \
-                 corrupts the result silently (sanitise/QC before running {op})",
-                csr.data[pos]
+                "ScxCsr contains a non-finite value ({val}) at nonzero index {pos}: the GPU \
+                 kernels behind {op} corrupt a non-finite value silently rather than failing \
+                 — a rank sorts on the raw IEEE-754 bit pattern, where a NaN lands above +Inf, \
+                 and a clip evaluates `v > threshold ? threshold : v`, where +Inf becomes the \
+                 threshold and no check on the output can tell (sanitise/QC before running \
+                 {op})"
             )));
         }
     }
@@ -208,7 +214,7 @@ fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(
 /// The three invariants the CSC kernels require but cannot themselves enforce,
 /// one per rung:
 ///
-/// 1. **In-range row indices** ([`ValidationLevel::Bounds`]).
+/// 1. **In-range row indices** ([`ValidationChecks::in_range`]).
 ///    `csc_shard_pseudobulk_kernel`, `csc_shard_pseudobulk_global_kernel` and
 ///    `csc_shard_to_gene_major_kernel` all read `cell_to_group[row_indices[e]]`
 ///    — an out-of-range row is an out-of-bounds device read, which on CUDA
@@ -223,7 +229,7 @@ fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(
 ///    silent skip.
 ///
 /// 2. **Strictly-increasing per-column row indices**
-///    ([`ValidationLevel::Scatter`]).
+///    ([`ValidationChecks::sorted`]).
 ///    `csc_shard_to_gene_major_kernel` writes `slab[gene, pos]` with one thread
 ///    per nonzero, so a duplicate `(cell, gene)` pair is two threads racing one
 ///    output cell with a nondeterministic winner.
@@ -237,7 +243,7 @@ fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(
 ///    the check is a fail-closed false negative on a shape SCX never emits, the
 ///    same trade the CSR validator already makes.
 ///
-/// 3. **Finite values** ([`ValidationLevel::Ranking`]).
+/// 3. **Finite values** ([`ValidationChecks::finite`]).
 ///    `block_radix_sort_per_gene_kernel` pads with `+INF` and sorts on the raw
 ///    IEEE-754 bit pattern, so a NaN lands above `+INF` and corrupts the U
 ///    statistic and tie counts with no error. The CPU CSC DE path rejects the
@@ -249,7 +255,7 @@ fn validate_csc(
     policy: &ValidationPolicy,
 ) -> Result<(), GpuError> {
     let op = policy.op;
-    if policy.runs(ValidationLevel::Bounds) {
+    if policy.checks.in_range {
         if let Some(pos) = first_out_of_range(&csc.indices, n_obs) {
             return Err(GpuError::InvalidShard(format!(
                 "ScxCsc row index {} at nonzero index {pos} is outside [0, {n_obs}): the GPU \
@@ -260,7 +266,7 @@ fn validate_csc(
         }
     }
 
-    if policy.runs(ValidationLevel::Scatter) {
+    if policy.checks.sorted {
         let n_cols = csc.indptr.len().saturating_sub(1);
         if let Some((c, a, b)) = first_unsorted_major(&csc.indptr, &csc.indices, n_cols) {
             return Err(GpuError::InvalidShard(format!(
@@ -273,13 +279,16 @@ fn validate_csc(
         }
     }
 
-    if policy.runs(ValidationLevel::Ranking) {
+    if policy.checks.finite {
         if let Some(pos) = first_non_finite(&csc.data) {
+            let val = csc.data[pos];
             return Err(GpuError::InvalidShard(format!(
-                "ScxCsc contains a non-finite value ({}) at nonzero index {pos}: {op} ranks \
-                 values on the GPU by their raw bit pattern, where a NaN sorts above +Inf and \
-                 corrupts the result silently (sanitise/QC before running {op})",
-                csc.data[pos]
+                "ScxCsc contains a non-finite value ({val}) at nonzero index {pos}: the GPU \
+                 kernels behind {op} corrupt a non-finite value silently rather than failing \
+                 — a rank sorts on the raw IEEE-754 bit pattern, where a NaN lands above +Inf, \
+                 and a clip evaluates `v > threshold ? threshold : v`, where +Inf becomes the \
+                 threshold and no check on the output can tell (sanitise/QC before running \
+                 {op})"
             )));
         }
     }

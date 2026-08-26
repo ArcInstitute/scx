@@ -1980,12 +1980,24 @@ numbers. Two invariants the kernels cannot enforce themselves:
   other sidecar writer emits; a hand-built sidecar with distinct-but-unordered
   rows is refused conservatively rather than raced.
 
-  This check is likewise scoped. DE and `pca` enforce it (`pca` because cuSPARSE
-  SpMM is undefined on unsorted column indices), and `pseudobulk` enforces it
-  because its kernel binary-searches each row's column window. `highly_variable_genes`
-  and `normalize_total` / `log1p` do **not**: they accumulate atomically or
-  rewrite values in place, neither of which races a unique output cell. On a
-  row-major matrix those two therefore run no staging scan at all.
+  This check is likewise scoped, and **independently** of the finiteness check
+  above — the two are separate switches, not a strictness ladder, precisely
+  because they do not nest:
+
+  | GPU entry point | sorted indices required |
+  |---|---|
+  | `rank_genes_groups`, `pdex_ref` | yes — the scatter races a duplicate `(cell, gene)` |
+  | `pca` | yes — cuSPARSE SpMM is undefined on unsorted column indices |
+  | `pseudobulk` | yes — the kernel binary-searches each row's column window |
+  | `highly_variable_genes` (all entry points) | **no** — it accumulates atomically or clips in place |
+  | `normalize_total` / `log1p` | **no** — it rewrites values in place |
+
+  So `highly_variable_genes` accepts an unsorted `scipy.sparse.csr_matrix`
+  (`has_sorted_indices == False`) exactly as the CPU path does, while still
+  rejecting a non-finite value on the entry points listed in the previous
+  table. An earlier design made these a cumulative ladder, which meant asking
+  for the finiteness check silently also demanded sorted indices — and GPU HVG
+  then refused input its own kernels handle fine.
 
 Both surface as a `RuntimeError` naming the offending gene column or nonzero
 index. The CSC-direct route previously ran neither check, so a NaN in a file

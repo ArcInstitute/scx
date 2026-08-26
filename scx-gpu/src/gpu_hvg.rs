@@ -31,7 +31,7 @@ use crate::device::{flat_launch_1d, GpuDevice};
 use crate::error::GpuError;
 use crate::gpu_csc_shard_source::{GpuCscShardSource, RawGpuCscShardSource};
 use crate::gpu_matrix_source::GpuMatrixSource;
-use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 
 /// PTX for the HVG atomicAdd kernels. Reuses the same `colmajor_ops` module
 /// (shared with PCA helpers) to avoid a second PTX load.
@@ -85,7 +85,7 @@ pub fn gpu_streaming_mean_var(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("col_sum_sq_nonzeros: {e}")))?;
 
     let mut src = BackedGpuMatrixSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Bounds,
+        ValidationChecks::IN_RANGE,
         "highly_variable_genes",
     ));
     src.for_each_gpu_csr_shard(&mut |_idx, slot| {
@@ -173,7 +173,7 @@ pub fn gpu_streaming_clip_square_sum(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("col_clip_sq_nonzeros: {e}")))?;
 
     let mut src = BackedGpuMatrixSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Ranking,
+        ValidationChecks::FINITE,
         "highly_variable_genes",
     ));
     src.for_each_gpu_csr_shard(&mut |_idx, slot| {
@@ -237,7 +237,7 @@ pub fn gpu_streaming_mean_var_csc(
 
     let n_vars_i32 = n_vars as i32;
     let mut gpu = RawGpuCscShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Bounds,
+        ValidationChecks::IN_RANGE,
         "highly_variable_genes",
     ));
     gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, |_idx, view| {
@@ -327,7 +327,7 @@ pub fn gpu_streaming_clip_square_sum_csc(
 
     let n_vars_i32 = n_vars as i32;
     let mut gpu = RawGpuCscShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Ranking,
+        ValidationChecks::FINITE,
         "highly_variable_genes",
     ));
     gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, |_idx, view| {
@@ -420,7 +420,7 @@ pub fn gpu_streaming_mean_var_batched(
     let d_cell_batch: CudaSlice<i32> = dev.htod_copy(cell_batch)?;
 
     let mut src = BackedGpuMatrixSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Ranking,
+        ValidationChecks::FINITE,
         "highly_variable_genes",
     ));
     src.for_each_gpu_csr_shard(&mut |_idx, slot| {
@@ -548,7 +548,7 @@ pub fn gpu_streaming_clip_square_sum_batched(
     let d_cell_batch: CudaSlice<i32> = dev.htod_copy(cell_batch)?;
 
     let mut src = BackedGpuMatrixSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationLevel::Ranking,
+        ValidationChecks::FINITE,
         "highly_variable_genes",
     ));
     src.for_each_gpu_csr_shard(&mut |_idx, slot| {

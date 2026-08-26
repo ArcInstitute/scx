@@ -68,92 +68,137 @@ impl std::ops::BitOr for LayoutSet {
     }
 }
 
-/// How much of the host-side shard validation a consumer needs, as an ordered,
-/// **cumulative** ladder. Each rung names the *kernel hazard* it removes.
+/// Which host-side shard checks a consumer needs, as three **independent**
+/// switches.
 ///
-/// Validation is not free: the scans are O(nnz) on the consuming thread, which
-/// on a decode-bound op competes with the very decode-prefetch workers feeding
-/// it. Before this existed every consumer paid the full DE set unconditionally,
-/// which is both wasted work and — the reason it is a review finding (§8.14) —
-/// why a `normalize_total` caller could be handed an error explaining that "GPU
-/// DE ranking requires finite input".
+/// Independent, not a ladder. An ordered `Bounds < Scatter < Ranking` ladder was
+/// the first shape of this and it was wrong, because the requirements do not
+/// nest: HVG's clipped reducers need **finite without sorted**, while PCA and
+/// pseudobulk need **sorted without finite**. Under a cumulative ladder the only
+/// way to ask for finiteness was to also demand sortedness, which made GPU HVG
+/// reject an unsorted `scipy.sparse.csr_matrix` that its own kernels handle fine
+/// and that the CPU path accepts (found by codex - gpt-5.6-sol).
 ///
-/// ⚠️ **`Bounds` is a no-op on CSR, by design.** The row-major validator
-/// has never range-checked minor-axis (column) indices: the CSR kernels bound
-/// the column window themselves, and the shard decoder already rejects an
-/// out-of-range minor index (see [`crate::shard_validate`]'s module doc). So a
-/// CSR consumer at `Bounds` runs no scan at all, and any CSR consumer whose
-/// kernel has a real precondition must ask for a higher rung — the PCA operator
-/// does, because cuSPARSE SpMM is undefined on unsorted column indices.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
-pub enum ValidationLevel {
+/// Validation is not free — each enabled check is an O(nnz) scan on the
+/// consuming thread, competing with the decode-prefetch workers feeding it — so
+/// asking for a check a kernel does not need costs throughput, and asking for
+/// one it does need is a silent corruption. Each field below names the kernel
+/// hazard it removes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ValidationChecks {
     /// Minor-axis indices are in range.
     ///
-    /// CSC only. `csc_shard_pseudobulk_kernel`,
+    /// **CSC only** — the row-major validator has never range-checked column
+    /// indices, because the CSR kernels bound the column window themselves and
+    /// the shard decoder already rejects an out-of-range minor index. So this
+    /// switch is a no-op on CSR, and a CSR consumer that enables only this runs
+    /// no scan at all.
+    ///
+    /// On CSC it matters: `csc_shard_pseudobulk_kernel`,
     /// `csc_shard_pseudobulk_global_kernel` and `csc_shard_to_gene_major_kernel`
-    /// all index `cell_to_group[row_indices[e]]` directly, so an out-of-range
-    /// row is an out-of-bounds device read — which on CUDA poisons the whole
-    /// context, not just the kernel. Nothing below this rung exists because
-    /// nothing below it is optional.
-    Bounds,
-    /// Adds: one writer per output cell.
+    /// index `cell_to_group[row_indices[e]]` directly, so an out-of-range row is
+    /// an out-of-bounds device read — which on CUDA poisons the whole context.
+    pub in_range: bool,
+
+    /// Major-axis indices are strictly increasing (hence unique).
     ///
+    /// Three distinct kernels need this and none of them rank:
     /// `csc_shard_to_gene_major_kernel` writes `slab[gene, pos]` with one thread
-    /// per nonzero, so a duplicate `(cell, gene)` pair is two threads racing one
-    /// cell with a nondeterministic winner. The same scan is what cuSPARSE SpMM
-    /// needs on the row-major side, where sorted column indices are a
-    /// precondition rather than a preference.
-    Scatter,
-    /// Adds: values are finite.
+    /// per nonzero, so a duplicate pair is two threads racing one cell;
+    /// cuSPARSE SpMM (streaming PCA) is undefined on unsorted column indices;
+    /// and `csr_shard_pseudobulk_kernel` narrows each row with
+    /// `scx_row_lower_bound`, a binary search.
+    pub sorted: bool,
+
+    /// Values are finite.
     ///
+    /// Two independent ways a non-finite value corrupts a result silently:
     /// `block_radix_sort_per_gene_kernel` pads with `+INF` and sorts on the raw
-    /// IEEE-754 bit pattern, so a NaN lands *above* `+INF` and corrupts the U
-    /// statistic and the tie counts with no error anywhere.
-    ///
-    /// The default, so a consumer that forgets to choose fails closed — at the
-    /// cost of some work, never at the cost of a kernel reading something it
-    /// cannot handle.
-    #[default]
-    Ranking,
+    /// IEEE-754 bit pattern, so a NaN lands above `+INF`; and the HVG clip
+    /// kernels evaluate `v > cv ? cv : v`, so `+Inf` compares true and is
+    /// **replaced by the clip value** before accumulation, which no check on the
+    /// output can detect.
+    pub finite: bool,
 }
 
-/// A consumer's validation level plus the operation name its errors should
-/// speak in.
+impl ValidationChecks {
+    /// Everything. The fail-closed default.
+    pub const ALL: Self = Self {
+        in_range: true,
+        sorted: true,
+        finite: true,
+    };
+
+    /// In-range only — the floor. On CSR this runs no scan.
+    ///
+    /// For kernels that neither index by a bound table nor rank nor binary
+    /// search: the fused preprocessing rewrites, and the HVG mean/variance
+    /// reducers whose non-finite input is caught after accumulation instead.
+    pub const IN_RANGE: Self = Self {
+        in_range: true,
+        sorted: false,
+        finite: false,
+    };
+
+    /// In-range and sorted, **without** the finiteness scan.
+    ///
+    /// Streaming PCA and pseudobulk: their kernels require ordered indices but
+    /// propagate a NaN exactly as the CPU would.
+    pub const SORTED: Self = Self {
+        in_range: true,
+        sorted: true,
+        finite: false,
+    };
+
+    /// In-range and finite, **without** the sortedness scan.
+    ///
+    /// The combination a ladder could not express, and the reason this is a set:
+    /// HVG's clipped reducers and its batched mean/variance must reject a
+    /// non-finite value, and accept whatever index order the caller had.
+    pub const FINITE: Self = Self {
+        in_range: true,
+        sorted: false,
+        finite: true,
+    };
+}
+
+impl Default for ValidationChecks {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+/// A consumer's validation checks plus the operation name its errors speak in.
 ///
 /// `op` is the **user-facing** operation — `"normalize_total"`, `"pca"`,
 /// `"rank_genes_groups"` — not the kernel or the crate function. It is
-/// interpolated into every message the scanners raise, which is the textual
-/// half of the §8.14 fix; the structural half is that a consumer at `Bounds`
-/// never reaches the finiteness scan at all. Either alone is fragile: a message
-/// can be reworded back, and a level can be raised back.
+/// interpolated into every message the scanners raise, which is the textual half
+/// of the §8.14 fix; the structural half is that a consumer never runs a check
+/// it did not ask for. Either alone is fragile: a message can be reworded back,
+/// and a check can be re-enabled back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ValidationPolicy {
-    /// How much to check.
-    pub level: ValidationLevel,
+    /// Which checks to run.
+    pub checks: ValidationChecks,
     /// What to call the operation in an error.
     pub op: &'static str,
 }
 
 impl ValidationPolicy {
-    /// A policy at `level`, speaking as `op`.
-    pub fn new(level: ValidationLevel, op: &'static str) -> Self {
-        Self { level, op }
-    }
-
-    /// True when this policy runs `want` (levels are cumulative).
-    pub fn runs(&self, want: ValidationLevel) -> bool {
-        self.level >= want
+    /// A policy running `checks`, speaking as `op`.
+    pub fn new(checks: ValidationChecks, op: &'static str) -> Self {
+        Self { checks, op }
     }
 }
 
 impl Default for ValidationPolicy {
-    /// Full DE-strength checking, attributed to no particular op.
+    /// Every check, attributed to no particular op.
     ///
-    /// The pre-§8.14 behaviour, and the fail-closed default: a source built
+    /// The pre-§8.14 behaviour and the fail-closed default: a source built
     /// without an explicit policy validates everything.
     fn default() -> Self {
         Self {
-            level: ValidationLevel::default(),
+            checks: ValidationChecks::ALL,
             op: "this GPU operation",
         }
     }

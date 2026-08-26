@@ -27,7 +27,7 @@ use crate::cusparse::{
 };
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 use crate::gpu_pca::{gpu_column_sums, gpu_mean_correct_colmajor_strided, gpu_outer_sub};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 use crate::math_policy::SpmmAlgPolicy;
@@ -151,7 +151,7 @@ impl<'a> CenteredSparseOperator<'a> {
         // policy is set here so the level is decided by whoever read the kernel,
         // not inherited by whoever moves the call.
         let mut src = RawGpuShardSource::new(self.dev, self.source)?
-            .with_validation(ValidationPolicy::new(ValidationLevel::Scatter, "pca"));
+            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
         let mut global_row = 0usize;
 
         src.for_each_gpu_shard(|_idx, slot| {
@@ -248,7 +248,7 @@ impl<'a> CenteredSparseOperator<'a> {
         // policy is set here so the level is decided by whoever read the kernel,
         // not inherited by whoever moves the call.
         let mut src = RawGpuShardSource::new(self.dev, self.source)?
-            .with_validation(ValidationPolicy::new(ValidationLevel::Scatter, "pca"));
+            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
         let mut global_row = 0usize;
 
         src.for_each_gpu_shard(|_idx, slot| {

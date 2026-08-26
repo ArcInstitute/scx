@@ -31,7 +31,7 @@ use scx_gpu::{
     gpu_de_pseudobulk_csc_direct, gpu_de_pseudobulk_csr_direct, gpu_de_pvalues,
     gpu_de_scatter_csc_to_gene_major, gpu_de_scatter_csr_to_gene_major_filtered,
     gpu_de_searchsorted_ranksum, gpu_de_searchsorted_u_stat, gpu_de_tie_term,
-    BackedGpuMatrixSource, CudaSlice, GpuDevice, GpuMatrixSource, ValidationLevel,
+    BackedGpuMatrixSource, CudaSlice, GpuDevice, GpuMatrixSource, ValidationChecks,
     ValidationPolicy,
 };
 
@@ -245,7 +245,7 @@ pub fn pdex_ref_gpu(
                 // an error naming nothing, while `docs/scanpy.md` claimed the message
                 // named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
-                .with_validation(ValidationPolicy::new(ValidationLevel::Ranking, "pdex_ref"));
+                .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -272,7 +272,7 @@ pub fn pdex_ref_gpu(
                 // an error naming nothing, while `docs/scanpy.md` claimed the message
                 // named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
-                .with_validation(ValidationPolicy::new(ValidationLevel::Ranking, "pdex_ref"));
+                .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -302,7 +302,7 @@ pub fn pdex_ref_gpu(
             // an error naming nothing, while `docs/scanpy.md` claimed the message
             // named the operation you called. Found by Cursor Agent - Grok 4.6 High
             // and codex - gpt-5.6-sol.
-            .with_validation(ValidationPolicy::new(ValidationLevel::Ranking, "pdex_ref"));
+            .with_validation(ValidationPolicy::new(ValidationChecks::ALL, "pdex_ref"));
             pdex_ref_gpu_dispatch(
                 &dev,
                 &mut source,
@@ -464,7 +464,7 @@ pub fn wilcoxon_rank_sum_gpu(
                 // named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
                 .with_validation(ValidationPolicy::new(
-                    ValidationLevel::Ranking,
+                    ValidationChecks::ALL,
                     "rank_genes_groups",
                 ));
             wilcoxon_rank_sum_gpu_dispatch(
@@ -494,7 +494,7 @@ pub fn wilcoxon_rank_sum_gpu(
                 // named the operation you called. Found by Cursor Agent - Grok 4.6 High
                 // and codex - gpt-5.6-sol.
                 .with_validation(ValidationPolicy::new(
-                    ValidationLevel::Ranking,
+                    ValidationChecks::ALL,
                     "rank_genes_groups",
                 ));
             wilcoxon_rank_sum_gpu_dispatch(
@@ -534,7 +534,7 @@ pub fn wilcoxon_rank_sum_gpu(
             // named the operation you called. Found by Cursor Agent - Grok 4.6 High
             // and codex - gpt-5.6-sol.
             .with_validation(ValidationPolicy::new(
-                ValidationLevel::Ranking,
+                ValidationChecks::ALL,
                 "rank_genes_groups",
             ));
             wilcoxon_rank_sum_gpu_dispatch(

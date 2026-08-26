@@ -42,7 +42,7 @@ use scx_format_io::{prefetch, ShardSource};
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
-use crate::gpu_matrix_source::{ValidationLevel, ValidationPolicy};
+use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::profile::{self, CodecClass};
 use crate::shard_validate::{validate_shard, ShardToValidate};
@@ -605,7 +605,7 @@ impl<'a> GpuPreprocessedShardSource<'a> {
             // CPU behaviour too. On CSR `Bounds` runs no scan at all, which is
             // the point: this path used to pay both DE scans per shard.
             inner: RawGpuShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-                ValidationLevel::Bounds,
+                ValidationChecks::IN_RANGE,
                 "normalize_total/log1p",
             )),
             normalize,
@@ -676,7 +676,7 @@ mod tests {
 
     /// The pre-§8.14 CSR entry point, as a test shim at the default policy.
     ///
-    /// The eight scanner tests below predate `ValidationLevel` and assert
+    /// The eight scanner tests below predate `ValidationChecks` and assert
     /// things that have nothing to do with it — that the parallel and serial
     /// arms name the same offender, that `position_first` is used, that rows
     /// are scanned independently. Routing them through the default policy keeps
@@ -1389,18 +1389,29 @@ mod tests {
         }
     }
 
-    /// The ladder is ordered, so "a weaker pass satisfies a stronger policy" is
-    /// a real ordering question rather than a hypothetical. The premise the
-    /// behavioural test below rests on, and it runs everywhere.
+    /// A policy can require a check another policy does not, in **either**
+    /// direction — which is the premise the behavioural test below rests on,
+    /// and the reason these are independent switches rather than a ladder.
+    ///
+    /// The `FINITE` / `SORTED` pair is the case an ordered ladder could not
+    /// express: neither is a superset of the other, so under a ladder the only
+    /// way to reach `finite` was to also demand `sorted`
+    /// (codex - gpt-5.6-sol).
     #[test]
-    fn a_policy_can_strictly_strengthen_what_must_be_checked() {
-        let weak = ValidationPolicy::new(ValidationLevel::Bounds, "normalize_total");
-        let strong = ValidationPolicy::new(ValidationLevel::Ranking, "rank_genes_groups");
-        assert!(!weak.runs(ValidationLevel::Ranking));
-        assert!(!weak.runs(ValidationLevel::Scatter));
-        assert!(strong.runs(ValidationLevel::Ranking));
-        assert!(strong.runs(ValidationLevel::Scatter));
-        assert!(strong.runs(ValidationLevel::Bounds));
+    fn check_sets_are_independent_and_neither_implies_the_other() {
+        let finite = ValidationChecks::FINITE;
+        let sorted = ValidationChecks::SORTED;
+        assert!(finite.finite && !finite.sorted);
+        assert!(sorted.sorted && !sorted.finite);
+        // Both keep the floor, which is the only check that is genuinely common.
+        assert!(finite.in_range && sorted.in_range);
+        // ALL is the fail-closed default and is a superset of both.
+        let all = ValidationChecks::ALL;
+        assert!(all.in_range && all.sorted && all.finite);
+        assert_eq!(ValidationPolicy::default().checks, all);
+        // IN_RANGE runs no scan on a row-major shard.
+        let floor = ValidationChecks::IN_RANGE;
+        assert!(!floor.sorted && !floor.finite);
     }
 
     /// Driving at `Bounds`, then upgrading to `Ranking`, must re-validate.
@@ -1440,14 +1451,14 @@ mod tests {
             RawGpuShardSource::new(&dev, &src)
                 .unwrap()
                 .with_validation(ValidationPolicy::new(
-                    ValidationLevel::Bounds,
+                    ValidationChecks::IN_RANGE,
                     "normalize_total",
                 ));
         gpu.for_each_gpu_shard(|_, _| Ok(()))
             .expect("premise: Bounds runs no CSR scan, so the NaN is accepted");
 
         let mut gpu = gpu.with_validation(ValidationPolicy::new(
-            ValidationLevel::Ranking,
+            ValidationChecks::FINITE,
             "rank_genes_groups",
         ));
         let err = gpu
