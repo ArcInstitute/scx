@@ -671,21 +671,36 @@ absolute_floors:
   # tolerances, and these numbers are re-measured on THAT configuration —
   # the earlier ones described a comparison that no longer exists.
   #
-  # Re-measured post-M-step with all three arms aligned:
+  # ⚠️ A SECOND correction. The re-measurement these floors were waiting on was
+  # itself measured wrong, twice over, and both were found in review:
   #
-  #     pbmc3k     cpu 0.999   (local, seed 42 both sides, K=90)
-  #     census_1m  job 2842829, 618 real donors via `donor_id`
+  #   * `lamb` was never aligned. Both calls omitted it, and the omissions mean
+  #     OPPOSITE things — pyscx's `None` is dynamic `alpha*E[k,b]`, harmonypy's
+  #     is a fixed lambda of 1. harmonypy spells dynamic `lamb=-1`.
+  #   * The measuring job built its PCA over ALL genes, while the gate's
+  #     `load_preprocessed` subsets to 2000 seurat_v3 HVGs first. A 50-PC
+  #     embedding of 32k genes is not the 50-PC embedding of 2k HVGs.
   #
-  # pbmc3k moved 0.9996 -> 0.999 once the seeds matched, so 0.99 still holds
-  # with 0.009 of headroom. The census_1m floor below is the pre-alignment
-  # measurement (0.9891 cpu / 0.9902 gpu) until 2842829 reports; it is the
-  # looser of the two bars and the arm most likely to move, because 618 batches
-  # give k-means++ far more room to diverge from sklearn's init.
+  # Those two together moved census_1m from 0.9697 to 0.9987 — the earlier
+  # number was not a slightly-off measurement, it was of something else.
   #
-  # Run-to-run spread is exactly zero: both implementations are deterministic
-  # given the seed, so this metric has no sampling noise for a floor to absorb.
-  # The floors are therefore sized for cross-ENVIRONMENT drift (a different
-  # BLAS, node, or harmonypy build), not for run-to-run variance.
+  # FINAL, job 2843742, gate preprocessing + all four parameters aligned:
+  #
+  #     dataset    n_vars  K    harmonypy   pyscx_cpu   pyscx_gpu
+  #     pbmc3k     2000    90   1.0 (self)  0.9996      0.9996
+  #     census_1m  2000    100  1.0 (self)  0.9987      0.9987
+  #
+  # Both floors are 0.99. Sizing, since the number that matters is not the
+  # measurement but the slack: run-to-run spread is EXACTLY zero (both
+  # implementations are deterministic given the seed), so there is no sampling
+  # noise to absorb and the bar is sized purely for cross-ENVIRONMENT drift.
+  # The only cross-machine figure available is pbmc3k, which measured 0.9991 on
+  # a login node and 0.9996 on the GPU node — 5e-04. A 0.99 floor is ~19x that
+  # on pbmc3k and ~17x on census_1m.
+  #
+  # census_1m is the harder fixture (618 real donors via `donor_id` vs 3
+  # synthetic batches) and is the arm to watch, but it is NOT the looser one:
+  # once measured correctly the two datasets agree to 1e-03.
   - benchmark: accel_harmony
     format: accel_harmony__pyscx_cpu
     dataset: pbmc3k
@@ -700,12 +715,12 @@ absolute_floors:
     format: accel_harmony__pyscx_cpu
     dataset: census_1m
     metric: mean_per_pc_r_vs_harmonypy
-    min: 0.97
+    min: 0.99
   - benchmark: accel_harmony
     format: accel_harmony__pyscx_gpu
     dataset: census_1m
     metric: mean_per_pc_r_vs_harmonypy
-    min: 0.97
+    min: 0.99
 
   # --- accel_preprocess: numerical equivalence to scanpy ---
   # GPU f32 vs CPU f64 intermediate drift on normalize+log1p is ~1e-5

@@ -1485,10 +1485,16 @@ Rust-native re-implementation of the Harmony2 algorithm (Korsunsky et al., 2019)
 > withdrawn for the same reason; these were left standing by mistake and are
 > withdrawn on the same grounds.
 >
-> First aligned measurement on the gate fixtures, for scale (harmonypy pinned to
-> the same seed, cluster count, tolerances and dynamic-lambda policy):
-> census_1m (1M cells, 618 donors) — harmonypy 1697 s, scx-accel CPU 565 s,
-> scx-accel GPU 125 s. Not a replacement for the sweep; a single point.
+> First aligned measurement on the gate fixtures, for scale — census_1m, 1M
+> cells, 2000 seurat_v3 HVGs, 618 real donors, K=100, all arms pinned to the
+> same seed, cluster count, tolerances and dynamic-lambda policy (job 2843742):
+> **harmonypy 1083 s, scx-accel CPU 423 s, scx-accel GPU 121 s** — 2.6× and
+> 8.9× against harmonypy. A single point, not a replacement for the sweep.
+>
+> (An earlier revision of this note quoted 1697 / 565 / 125 s. Those came from a
+> run that skipped the HVG subset and left `lamb` unaligned, so it timed Harmony
+> over 32k genes under a different ridge policy — a different computation, not a
+> noisier measurement of this one.)
 >
 > The **peak-RSS** table is retained: the M-step allocates no new host memory
 > (`update_y` writes into the existing `y` buffer, and the device gemm targets
