@@ -32,7 +32,7 @@
 //!
 //! The prefetch pipeline mirrors the ingest coordinator
 //! (`scx-convert::pipeline::streaming_writer_coordinator_parallel`): a bounded
-//! `crossbeam_channel` + a `BTreeMap` reorder buffer keyed by shard index +
+//! `crossbeam_channel` + a `BTreeMap` reorder buffer keyed by **plan position** +
 //! rolling-window spawn (`in_flight_cap = depth`) + per-worker `catch_unwind`
 //! (a worker panic becomes a delivered `Err`, never a hung drain loop).
 //!
@@ -444,7 +444,7 @@ where
 }
 
 /// The bounded ordered decode-prefetch pipeline itself: a bounded
-/// `crossbeam_channel`, a `BTreeMap` reorder buffer keyed by shard index, and
+/// `crossbeam_channel`, a `BTreeMap` reorder buffer keyed by **plan position**, and
 /// rolling-window spawn so the live set never exceeds `depth`.
 ///
 /// Split out of [`for_each_ordered`] so the sequential fallback needs no `cfg`

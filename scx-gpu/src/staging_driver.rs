@@ -35,8 +35,13 @@
 // the CPU tests that must be watched red *before* either layout is rewired onto
 // it, per the series' first ground rule. PR B routes `RawGpuShardSource` and
 // `RawGpuCscShardSource` through `drive_shards`, at which point this attribute
-// must come off; the `ORG-8.20-1` CI guard asserts it is gone, so it cannot
-// quietly outlive its reason.
+// must come off, and PR B is where the `ORG-8.20-1` CI guard grows the branch
+// that asserts it is gone.
+//
+// There is no enforced check in THIS PR -- the only things bounding this allow
+// are the scope note in `ci.yml` and this comment. Stated plainly because the
+// earlier wording said the guard already asserted it, which would let a reader
+// believe the attribute was mechanically bounded when it was bounded by intent.
 #![allow(dead_code)]
 
 use crate::error::GpuError;
