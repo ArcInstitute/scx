@@ -275,6 +275,50 @@ pub trait ColumnShardSource {
     /// want to plan a query (chunk size, skip count) before issuing
     /// `read_csc_columns`.
     fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)>;
+
+    /// Column-major twin of [`ShardSource::shard_size_hint`]: cheap upper
+    /// bounds on the largest CSC shard, or `None` when the implementor cannot
+    /// answer without decoding.
+    ///
+    /// ⚠️ **`max_rows` counts the major axis, which on this layout is
+    /// columns.** `ShardSizeHint` is shared with the row-major side, where the
+    /// major axis is rows; the field name follows that side. So a CSC consumer
+    /// sizing an `indptr` buffer wants `max_rows + 1` here just as a CSR one
+    /// does — the arrays are laid out identically, only the axis they index
+    /// differs. `decoded_bytes()` is correct on either layout for the same
+    /// reason.
+    ///
+    /// Exists because the GPU CSC staging path derates its decode-prefetch
+    /// depth to a host-RAM budget, and a budget it cannot price is a budget
+    /// that silently does nothing.
+    fn csc_shard_size_hint(&self) -> Option<ShardSizeHint> {
+        None
+    }
+
+    /// Every shard index whose `[col_start, col_end)` intersects `col_range`,
+    /// **ascending**.
+    ///
+    /// The default is an O(n_shards) scan over [`csc_shard_col_range`], which
+    /// is the same predicate three call sites had each spelled out for
+    /// themselves. An implementor holding a sorted column index overrides this
+    /// with a binary search; the two then differ only in complexity, not in the
+    /// boundary condition — half-open on both ends, so a shard ending exactly
+    /// at `col_range.start` does not overlap.
+    ///
+    /// An empty or inverted `col_range` selects nothing.
+    ///
+    /// [`csc_shard_col_range`]: ColumnShardSource::csc_shard_col_range
+    fn csc_shards_for_col_range(&self, col_range: Range<u32>) -> Vec<usize> {
+        if col_range.start >= col_range.end {
+            return Vec::new();
+        }
+        (0..self.n_csc_shards())
+            .filter(|&i| {
+                self.csc_shard_col_range(i)
+                    .is_some_and(|(s, e)| e > col_range.start && s < col_range.end)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -434,5 +478,71 @@ mod tests {
         // ColumnShardSource — uncommenting the line below should fail
         // at compile time:
         //     requires_csc(&StubSource { shards: vec![], n_obs: 0, n_vars: 0 });
+    }
+
+    /// Column-major stub whose shard `i` covers `[3i, 3i+3)`, except a short
+    /// tail shard — the shape `write_csc_test_file` produces.
+    struct StubCscRanges {
+        ranges: Vec<(u32, u32)>,
+    }
+
+    impl ColumnShardSource for StubCscRanges {
+        fn n_csc_shards(&self) -> usize {
+            self.ranges.len()
+        }
+        fn n_obs(&self) -> usize {
+            12
+        }
+        fn n_vars(&self) -> usize {
+            self.ranges.last().map(|r| r.1 as usize).unwrap_or(0)
+        }
+        fn read_csc_shard(&self, _i: usize) -> Result<ScxCsc> {
+            unreachable!("range planning does not decode")
+        }
+        fn read_csc_columns(&self, _r: Range<u32>) -> Result<ScxCsc> {
+            unreachable!("range planning does not decode")
+        }
+        fn csc_shard_col_range(&self, i: usize) -> Option<(u32, u32)> {
+            self.ranges.get(i).copied()
+        }
+    }
+
+    fn stub_csc() -> StubCscRanges {
+        StubCscRanges {
+            ranges: vec![(0, 3), (3, 6), (6, 9), (9, 10)],
+        }
+    }
+
+    /// The default `csc_shards_for_col_range` is half-open on **both** ends.
+    ///
+    /// Hand-computed, not derived from the implementation: a shard ending
+    /// exactly at `col_range.start` does not overlap, and one starting exactly
+    /// at `col_range.end` does not either. Both are the boundary the GPU
+    /// prefilter and `BackedCscIndex`'s binary search must agree with.
+    #[test]
+    fn csc_shards_for_col_range_default_is_half_open_at_both_ends() {
+        let src = stub_csc();
+        assert_eq!(src.csc_shards_for_col_range(4..8), vec![1, 2]);
+        assert_eq!(src.csc_shards_for_col_range(0..10), vec![0, 1, 2, 3]);
+        // [0,3) touches shard 0 only — shard 1 starts exactly at 3.
+        assert_eq!(src.csc_shards_for_col_range(0..3), vec![0]);
+        // [3,3) is empty; [3,4) is shard 1 alone.
+        assert!(src.csc_shards_for_col_range(3..3).is_empty());
+        assert_eq!(src.csc_shards_for_col_range(3..4), vec![1]);
+        // A range that ends exactly where a shard begins excludes it.
+        assert_eq!(src.csc_shards_for_col_range(2..6), vec![0, 1]);
+        // Past the end, and inverted. The inverted range is built rather than
+        // written as a literal because clippy rejects a reversed literal range
+        // outright — which would delete the case, not fix it.
+        assert!(src.csc_shards_for_col_range(100..200).is_empty());
+        let inverted = std::ops::Range { start: 8, end: 2 };
+        assert!(src.csc_shards_for_col_range(inverted).is_empty());
+    }
+
+    /// A source that does not override reports no size hint, rather than a
+    /// fabricated zero — an under-estimate is what the hint contract forbids.
+    #[test]
+    fn csc_shard_size_hint_defaults_to_none() {
+        assert_eq!(stub_csc().csc_shard_size_hint(), None);
     }
 }

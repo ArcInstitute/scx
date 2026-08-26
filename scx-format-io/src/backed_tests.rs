@@ -2075,6 +2075,112 @@ fn backed_csc_column_shard_source_trait_dispatch() {
     assert_eq!(s0.n_cols(), 4);
 }
 
+/// `BackedCscReader`'s binary-search override and the trait's linear default
+/// must select the **same** shards for every column range, including the
+/// degenerate ones.
+///
+/// The two are separate implementations of one predicate — the whole point of
+/// putting the predicate on the trait is that the GPU staging path stops
+/// carrying a third copy. So the property to pin is not "the override returns
+/// something sensible" but "the override and the default cannot disagree", and
+/// the range space here is small enough to check exhaustively rather than
+/// sampled.
+///
+/// The reference below is written out in the test rather than reached through
+/// the trait, because `BackedCscReader` overrides the default — calling
+/// `csc_shards_for_col_range` on it can only ever exercise the override.
+#[test]
+fn backed_csc_shards_for_col_range_matches_the_trait_default_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    // 8 rows x 12 cols, 4 cols per shard -> 3 shards: [0,4), [4,8), [8,12).
+    let (path, _) = write_csc_test_file(&dir, 8, 12, 4);
+    let reader = ScxReader::open(&path).unwrap();
+    let csc = BackedCscReader::new(reader, 0).unwrap();
+    let src: &dyn crate::ColumnShardSource = &csc;
+
+    let ranges: Vec<(u32, u32)> = (0..src.n_csc_shards())
+        .map(|i| src.csc_shard_col_range(i).unwrap())
+        .collect();
+    // Independent statement of the overlap rule: half-open on both ends.
+    let reference = |lo: u32, hi: u32| -> Vec<usize> {
+        if lo >= hi {
+            return Vec::new();
+        }
+        (0..ranges.len())
+            .filter(|&i| ranges[i].1 > lo && ranges[i].0 < hi)
+            .collect()
+    };
+
+    // Exhaustive over a window that runs past n_vars on both ends.
+    for lo in 0..=14u32 {
+        for hi in 0..=14u32 {
+            assert_eq!(
+                src.csc_shards_for_col_range(lo..hi),
+                reference(lo, hi),
+                "override and default disagree on [{lo}, {hi})"
+            );
+        }
+    }
+
+    // Hand-computed anchors, so the exhaustive loop above cannot pass by both
+    // sides being wrong in the same direction.
+    assert_eq!(src.csc_shards_for_col_range(0..4), vec![0]);
+    assert_eq!(src.csc_shards_for_col_range(3..5), vec![0, 1]);
+    assert_eq!(src.csc_shards_for_col_range(4..8), vec![1]);
+    assert_eq!(src.csc_shards_for_col_range(0..12), vec![0, 1, 2]);
+    assert!(src.csc_shards_for_col_range(12..14).is_empty());
+    assert!(src.csc_shards_for_col_range(5..5).is_empty());
+}
+
+/// The CSC size hint is a true upper bound on every shard, and tight on a file
+/// we wrote (catalog stats are exact there).
+///
+/// `max_rows` is the major axis, which on this layout is **columns** — asserting
+/// it against `n_cols()` rather than `n_rows()` is the point, since the field
+/// name comes from the row-major side and reading it as rows would size the
+/// `indptr` buffer against the wrong axis.
+#[test]
+fn backed_csc_shard_size_hint_bounds_and_matches_every_decoded_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = write_csc_test_file(&dir, 8, 12, 4);
+    let reader = ScxReader::open(&path).unwrap();
+    let csc = BackedCscReader::new(reader, 0).unwrap();
+    let src: &dyn crate::ColumnShardSource = &csc;
+
+    let hint = src
+        .csc_shard_size_hint()
+        .expect("catalog carries CSC stats");
+
+    let mut observed_cols = 0usize;
+    let mut observed_nnz = 0usize;
+    for i in 0..src.n_csc_shards() {
+        let shard = src.read_csc_shard(i).unwrap();
+        assert!(
+            shard.n_cols() <= hint.max_rows,
+            "shard {i} has {} columns, above the hint's major-axis bound {}",
+            shard.n_cols(),
+            hint.max_rows
+        );
+        assert!(
+            shard.data.len() <= hint.max_nnz,
+            "shard {i} has {} nonzeros, above the hint's bound {}",
+            shard.data.len(),
+            hint.max_nnz
+        );
+        observed_cols = observed_cols.max(shard.n_cols());
+        observed_nnz = observed_nnz.max(shard.data.len());
+    }
+    assert_eq!(
+        hint.max_rows, observed_cols,
+        "hint is looser than it needs to be on the major axis"
+    );
+    assert_eq!(
+        hint.max_nnz, observed_nnz,
+        "hint is looser than it needs to be on nnz"
+    );
+    assert!(hint.decoded_bytes() > 0);
+}
+
 /// Phase 5b regression: when bitmaps are missing on a multimodal
 /// file, the CSR fallback in `gene_detection_counts` /
 /// `cells_expressing_gene` must read only the requested modality's

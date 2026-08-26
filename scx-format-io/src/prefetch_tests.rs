@@ -326,10 +326,35 @@ fn budgeted_reduction_matches_sequential_within_tolerance() {
 }
 
 /// Minimal in-memory `ColumnShardSource` for the CSC prefetch smoke test.
+///
+/// `reads` records every shard index actually decoded, which is what lets the
+/// selected-plan tests below assert the negative half — that a shard outside
+/// the plan is never touched, not merely never delivered.
 struct StubCscSource {
     shards: Vec<ScxCsc>,
     n_obs: usize,
     n_vars: usize,
+    reads: std::sync::Mutex<Vec<usize>>,
+}
+
+impl StubCscSource {
+    fn new(shards: Vec<ScxCsc>, n_obs: usize, n_vars: usize) -> Self {
+        Self {
+            shards,
+            n_obs,
+            n_vars,
+            reads: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Decoded shard indices, ascending. Sorted because decode order is
+    /// concurrent and therefore nondeterministic — only the *set* is a
+    /// property of the plan; the delivery order is asserted separately.
+    fn reads_sorted(&self) -> Vec<usize> {
+        let mut v = self.reads.lock().unwrap().clone();
+        v.sort_unstable();
+        v
+    }
 }
 
 impl ColumnShardSource for StubCscSource {
@@ -343,6 +368,7 @@ impl ColumnShardSource for StubCscSource {
         self.n_vars
     }
     fn read_csc_shard(&self, idx: usize) -> Result<ScxCsc> {
+        self.reads.lock().unwrap().push(idx);
         Ok(self.shards[idx].clone())
     }
     fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> Result<ScxCsc> {
@@ -359,11 +385,7 @@ fn csc_ordered_delivery_is_in_shard_order() {
     let shards: Vec<ScxCsc> = (0..16)
         .map(|_| ScxCsc::new_unchecked((4, 1), vec![0, 1], vec![0], vec![1.0]))
         .collect();
-    let src = StubCscSource {
-        shards,
-        n_obs: 4,
-        n_vars: 16,
-    };
+    let src = StubCscSource::new(shards, 4, 16);
     let mut seen = Vec::new();
     for_each_csc_shard_ordered(&src, 8, |idx, _csc| -> Result<()> {
         seen.push(idx);
@@ -371,6 +393,138 @@ fn csc_ordered_delivery_is_in_shard_order() {
     })
     .unwrap();
     assert_eq!(seen, (0..16).collect::<Vec<_>>());
+}
+
+/// Sixteen single-column CSC shards over a 4-row axis.
+fn csc_stub(n: usize) -> StubCscSource {
+    let shards: Vec<ScxCsc> = (0..n)
+        .map(|_| ScxCsc::new_unchecked((4, 1), vec![0, 1], vec![0], vec![1.0]))
+        .collect();
+    StubCscSource::new(shards, 4, n)
+}
+
+/// A selected plan delivers exactly the shards it names, in the plan's order,
+/// and decodes nothing else.
+///
+/// The second half is the one that matters: the GPU CSC path adopts this
+/// precisely so a non-overlapping shard is never decoded or uploaded, so a
+/// version that decoded all sixteen and filtered on delivery would satisfy
+/// `seen` while throwing away the entire benefit.
+#[test]
+fn csc_selected_delivers_and_decodes_only_the_named_shards() {
+    let src = csc_stub(16);
+    let plan = [1usize, 5, 11];
+    let mut seen = Vec::new();
+    for_each_csc_shard_ordered_selected(&src, &plan, 8, |idx, _csc| -> Result<()> {
+        seen.push(idx);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, plan.to_vec(), "delivery order must follow the plan");
+    assert_eq!(
+        src.reads_sorted(),
+        plan.to_vec(),
+        "a shard outside the plan was decoded"
+    );
+}
+
+#[test]
+fn csc_selected_empty_plan_decodes_nothing() {
+    let src = csc_stub(16);
+    let mut n = 0usize;
+    for_each_csc_shard_ordered_selected(&src, &[], 8, |_idx, _csc| -> Result<()> {
+        n += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(n, 0);
+    assert!(src.reads_sorted().is_empty());
+}
+
+/// `ColumnShardSource` whose shard `stall_shard` spins until `stall_until`
+/// *other* shards have decoded. The CSC twin of `StallHeadSource`.
+#[cfg(feature = "parallel")]
+struct StallHeadCscSource {
+    n: usize,
+    stall_shard: usize,
+    stall_until: usize,
+    others_done: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "parallel")]
+impl ColumnShardSource for StallHeadCscSource {
+    fn n_csc_shards(&self) -> usize {
+        self.n
+    }
+    fn n_obs(&self) -> usize {
+        4
+    }
+    fn n_vars(&self) -> usize {
+        self.n
+    }
+    fn read_csc_shard(&self, idx: usize) -> Result<ScxCsc> {
+        use std::sync::atomic::Ordering;
+        if idx == self.stall_shard {
+            while self.others_done.load(Ordering::Acquire) < self.stall_until {
+                std::thread::yield_now();
+            }
+        } else {
+            self.others_done.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(ScxCsc::new_unchecked(
+            (4, 1),
+            vec![0, 1],
+            vec![0],
+            vec![1.0],
+        ))
+    }
+    fn read_csc_columns(&self, _r: std::ops::Range<u32>) -> Result<ScxCsc> {
+        unreachable!("prefetch does not call read_csc_columns")
+    }
+    fn csc_shard_col_range(&self, idx: usize) -> Option<(u32, u32)> {
+        Some((idx as u32, idx as u32 + 1))
+    }
+}
+
+/// The bounded-memory contract holds on a **sparse** plan, not just a dense
+/// sweep — and, more sharply, the pipeline terminates at all.
+///
+/// This is the test that pins the position-vs-shard-index split introduced when
+/// the core was generalized. The reorder buffer and the in-flight window are
+/// keyed on *position*, which is always contiguous; if either were keyed on the
+/// shard index instead, a plan with a gap (`[3, 9, 15, ...]`) would leave the
+/// drain waiting on an index nothing will ever send, and this test hangs rather
+/// than fails. The stall makes the buffer actually fill, so the `<= depth`
+/// assertion has something to measure.
+#[cfg(feature = "parallel")]
+#[test]
+fn head_stall_keeps_reorder_buffer_bounded_on_a_selected_plan() {
+    if rayon::current_num_threads() <= 1 {
+        return;
+    }
+    let depth = 4usize;
+    // A deliberately gappy plan over a much larger shard space.
+    let plan: Vec<usize> = (0..20).map(|p| p * 3 + 1).collect();
+    let src = StallHeadCscSource {
+        n: 64,
+        stall_shard: plan[0],
+        stall_until: depth - 1,
+        others_done: std::sync::atomic::AtomicUsize::new(0),
+    };
+    MAX_REORDER_BUFFER.with(|m| m.set(0));
+    let mut seen = Vec::new();
+    for_each_csc_shard_ordered_selected(&src, &plan, depth, |idx, _csc| -> Result<()> {
+        seen.push(idx);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, plan, "delivery must follow the plan in order");
+    let peak = MAX_REORDER_BUFFER.with(|m| m.get());
+    assert!(
+        peak <= depth,
+        "reorder buffer peaked at {peak} shards, exceeding depth {depth} — \
+         the bounded-memory contract is violated on a selected plan"
+    );
 }
 
 #[test]

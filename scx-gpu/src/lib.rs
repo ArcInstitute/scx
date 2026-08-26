@@ -127,6 +127,7 @@ pub(crate) mod shard_validate;
 pub mod shufdelta_gpu;
 pub mod sparse_dense;
 pub mod staging;
+pub(crate) mod staging_driver;
 pub mod test_gate;
 
 // Re-export primary types for convenience.
