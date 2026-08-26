@@ -3508,15 +3508,35 @@ GPU and CPU accelerators may produce slightly different results due to:
 
 ### Tolerance thresholds (correctness tests)
 
-The GPU test suite (`pyscx/tests/test_accel_gpu.py`) enforces these thresholds vs the CPU reference:
+Each row below names the test that enforces it. Where nothing enforces a row,
+it says so rather than implying a gate that does not exist.
 
-| Test | Metric | Threshold | Notes |
-|------|--------|-----------|-------|
-| GPU PCA vs CPU PCA | Cosine similarity per PC | > 0.99 | Sign-invariant; GPU=f32, CPU=f64 |
-| GPU kNN vs CPU HNSW | Recall@k | > 0.95 | Different algorithms (rapids vs HNSW); exact match not expected |
-| GPU UMAP | Trustworthiness | > 0.95 | Non-deterministic (rapids_singlecell GPU UMAP) |
-| GPU Leiden vs CPU Leiden | ARI | > 0.90 | Graph partitioning is inherently non-deterministic |
-| GPU normalize + log1p | Element-wise | rtol=1e-7 | Possible f32 rounding differences vs CPU |
+| Test | Metric | Threshold | Enforced by |
+|------|--------|-----------|-------------|
+| GPU PCA vs CPU PCA | Cosine similarity per PC | ≥ 0.999 (GPU arms), ≥ 0.99 (vs scanpy) | `pyscx/tests/test_accel_pca_gpu.py` |
+| GPU normalize + log1p vs CPU | Element-wise relative | < 1e-5 | `scx-gpu/src/gpu_preprocess_tests.rs::test_gpu_normalize_log1p_matches_cpu` |
+| GPU Leiden vs CPU Leiden | ARI | ≥ 0.10, plus a cluster-count bound | `pyscx/tests/test_accel_leiden.py` |
+| GPU kNN vs CPU HNSW | Recall@k | **not enforced** | — |
+| GPU UMAP | Trustworthiness | **not enforced** | — |
+
+Three notes on why those numbers are what they are, since two of them look
+alarming out of context:
+
+- **Leiden's ARI floor is 0.10 on purpose, not by neglect.** GPU label stability
+  differs from `leidenalg` by design (see the note above and README's Known
+  Limitations), so a high ARI would be asserting a property SCX explicitly does
+  not promise. The test pairs the loose ARI — a degeneracy canary, against an
+  observed 0.0002 for a collapsed partition — with a cluster-count bound, which
+  is the assertion that actually has teeth. Pin `device="cpu"` when you need
+  label stability.
+- **kNN recall and UMAP trustworthiness have CPU-path tests, not GPU ones.**
+  `pyscx/tests/test_accel.py` asserts HNSW recall ≥ 0.90 against brute force and
+  UMAP trustworthiness > 0.75, both on `device="cpu"`. Neither compares a GPU
+  result to anything, so neither backs a GPU tolerance.
+- Earlier revisions of this table cited `pyscx/tests/test_accel_gpu.py` as the
+  enforcement mechanism for all five rows. **That file has never existed**, and
+  four of the five thresholds it was said to enforce did not match any
+  assertion in the tree.
 
 ### Checking which backend was used
 
