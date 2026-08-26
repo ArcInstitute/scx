@@ -3515,7 +3515,7 @@ it says so rather than implying a gate that does not exist.
 |------|--------|-----------|-------------|
 | **Native** GPU PCA vs CPU PCA | Per-PC cosine, leading `n_clusters - 1` PCs | ≥ 0.99 | `test_gpu_randomized_householder_vs_cpu_randomized` — pins `SCX_FORCE_NATIVE_GPU=1`, so it does **not** cover the `device="gpu"` default, which is rapids-singlecell |
 | **Native** GPU PCA, Cholesky QR vs Householder QR | Per-PC cosine | ≥ 0.999 | `test_gpu_cholesky_matches_householder` — GPU vs GPU, not a CPU comparison, and it pins `SCX_FORCE_NATIVE_GPU=1` too: rapids ignores `qr_method`, so without the pin both arms are the same path and the comparison is vacuous |
-| `normalize_total`→`log1p`→`pca` at `device="gpu"` on an SCX-round-tripped **in-memory** AnnData, vs scanpy | Per-PC cosine, top 10 PCs | ≥ 0.99 | `test_lazy_normalize_log1p_pca_matches_scanpy` — despite the name it calls `to_anndata()`, whose `backed` defaults to `false`, so `X` is a materialized scipy CSR and the run does **not** exercise the backed/lazy streaming route |
+| `normalize_total`→`log1p`→`pca` at `device="gpu"` on an SCX-round-tripped **in-memory** AnnData, vs scanpy | Per-PC cosine, top 10 PCs | ≥ 0.99 — but see below: this is **not** a GPU-route gate | `test_normalize_log1p_pca_matches_scanpy` |
 | GPU normalize + log1p vs CPU | Element-wise relative | < 1e-5 | `scx-gpu/src/gpu_preprocess_tests.rs::test_gpu_normalize_log1p_matches_cpu` |
 | GPU Leiden vs CPU Leiden | ARI | ≥ 0.10, plus a cluster-count bound | `test_gpu_leiden_not_degenerate` |
 | GPU kNN vs CPU HNSW | Recall@k | **not enforced** | — |
@@ -3536,8 +3536,20 @@ context:
   UMAP trustworthiness > 0.75, both on `device="cpu"`. Neither compares a GPU
   result to anything, so neither backs a GPU tolerance.
 - **Two of these rows pin `SCX_FORCE_NATIVE_GPU=1`, and that is not a detail.**
-  The `device="gpu"` default routes in-memory PCA to rapids-singlecell; both
-  native-path bars are invisible to it. No row here gates the default path.
+  The `device="gpu"` default routes in-memory PCA to rapids-singlecell, so both
+  native-path bars are invisible to it.
+- **The third PCA row asks for the default path but does not gate it.** It calls
+  `normalize_total` / `log1p` / `pca` at `device="gpu"` on a materialized AnnData
+  — which is the rapids route — and its numeric bar is real. What it never does
+  is assert *which route served the request*: none of the three ops has its
+  `uns["scx_accel"][op]["route"]` checked. On a CUDA host without
+  rapids-singlecell installed, every one of them takes the documented
+  `NoRapidsCpu` fallback (`pyscx/src/accel/pca.rs`) and the whole SCX side runs
+  on the **CPU** while the test still passes. Read it as a correctness check of
+  the op chain, not as evidence that a GPU kernel ran.
+  ⚠️ An earlier revision of this note said "no row here gates the default path",
+  which was wrong in the other direction — this row does target it. Both
+  statements were mis-citations of the kind this table exists to remove.
 - **The PCA rows are split three ways on purpose.** An earlier revision of this
   table had one "GPU PCA vs CPU PCA" row claiming "≥ 0.999 (GPU arms), ≥ 0.99 (vs
   scanpy)". The 0.999 bar is `test_gpu_cholesky_matches_householder`, which

@@ -1452,9 +1452,13 @@ jobs:
           for t in 'test_gpu_streaming_mean_var_matches_exact' \
                    'test_gpu_streaming_mean_var_csc_matches_exact' \
                    'test_gpu_streaming_mean_var_detects_an_f32_accumulator'; do
+            # Comment lines are stripped before matching: `case` is a substring
+            # test, so a body that merely SAYS `// exact_moments(` in an
+            # explanatory comment satisfied it while calling the shared finalize.
+            # Found in review by codex.
             body=$(awk -v fn="    fn $t()" '
               index($0, fn) == 1 {inside=1}
-              inside {print}
+              inside && $0 !~ /^[[:space:]]*\/\// {print}
               inside && /^    \}$/ {exit}' "$hvg")
             test -n "$body" || { echo "::error::could not extract the body of \`fn $t\` from $hvg — this guard cannot verify it uses the oracle; retarget it rather than deleting it (ORG-8.20-5)."; exit 1; }
             for call in 'exact_moments(' 'assert_matches_exact('; do
