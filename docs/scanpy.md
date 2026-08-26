@@ -3501,22 +3501,67 @@ GPU and CPU accelerators may produce slightly different results due to:
 
 | Factor | Impact | When it matters |
 |--------|--------|-----------------|
-| **PCA precision** | GPU uses f32 throughout; CPU uses f64 | Cosine similarity per PC > 0.99 — no biological impact |
-| **kNN algorithm** | GPU uses CAGRA (graph-based ANN); CPU uses HNSW | Both are approximate; recall@k > 0.95 |
+| **PCA precision** | GPU uses f32 throughout; CPU uses f64 | Native GPU vs CPU: per-PC cosine ≥ 0.99 on the leading PCs — no biological impact |
+| **kNN algorithm** | GPU uses CAGRA (graph-based ANN); CPU uses HNSW | Both are approximate; exact agreement is not expected. **No GPU-vs-CPU recall bar is enforced** — see the table below |
 | **UMAP non-determinism** | GPU uses `atomicAdd` (race conditions are intentional) | Embedding coordinates differ; cluster structure preserved |
-| **Leiden** | Rust-native vs cuGraph vs leidenalg may produce different partitions | ARI > 0.90; biological conclusions equivalent |
+| **Leiden** | Rust-native vs cuGraph vs leidenalg may produce different partitions | Label stability differs **by design**; the enforced GPU-vs-CPU bar is a degeneracy floor, not agreement — see the table below |
 
 ### Tolerance thresholds (correctness tests)
 
-The GPU test suite (`pyscx/tests/test_accel_gpu.py`) enforces these thresholds vs the CPU reference:
+Each row below names the test that enforces it. Where nothing enforces a row,
+it says so rather than implying a gate that does not exist.
 
-| Test | Metric | Threshold | Notes |
-|------|--------|-----------|-------|
-| GPU PCA vs CPU PCA | Cosine similarity per PC | > 0.99 | Sign-invariant; GPU=f32, CPU=f64 |
-| GPU kNN vs CPU HNSW | Recall@k | > 0.95 | Different algorithms (rapids vs HNSW); exact match not expected |
-| GPU UMAP | Trustworthiness | > 0.95 | Non-deterministic (rapids_singlecell GPU UMAP) |
-| GPU Leiden vs CPU Leiden | ARI | > 0.90 | Graph partitioning is inherently non-deterministic |
-| GPU normalize + log1p | Element-wise | rtol=1e-7 | Possible f32 rounding differences vs CPU |
+| Test | Metric | Threshold | Enforced by |
+|------|--------|-----------|-------------|
+| **Native** GPU PCA vs CPU PCA | Per-PC cosine, leading `n_clusters - 1` PCs | ≥ 0.99 | `test_gpu_randomized_householder_vs_cpu_randomized` — pins `SCX_FORCE_NATIVE_GPU=1`, so it does **not** cover the `device="gpu"` default, which is rapids-singlecell |
+| **Native** GPU PCA, Cholesky QR vs Householder QR | Per-PC cosine | ≥ 0.999 | `test_gpu_cholesky_matches_householder` — GPU vs GPU, not a CPU comparison, and it pins `SCX_FORCE_NATIVE_GPU=1` too: rapids ignores `qr_method`, so without the pin both arms are the same path and the comparison is vacuous |
+| `normalize_total`→`log1p`→`pca` at `device="gpu"` on an SCX-round-tripped **in-memory** AnnData, vs scanpy | Per-PC cosine, top 10 PCs | ≥ 0.99 — but see below: this is **not** a GPU-route gate | `test_normalize_log1p_pca_matches_scanpy` |
+| GPU normalize + log1p vs CPU | Element-wise relative | < 1e-5 | `scx-gpu/src/gpu_preprocess_tests.rs::test_gpu_normalize_log1p_matches_cpu` |
+| GPU Leiden vs CPU Leiden | ARI | ≥ 0.10, plus a cluster-count bound | `test_gpu_leiden_not_degenerate` |
+| GPU kNN vs CPU HNSW | Recall@k | **not enforced** | — |
+| GPU UMAP | Trustworthiness | **not enforced** | — |
+
+Four notes on why these are what they are, since several look alarming out of
+context:
+
+- **Leiden's ARI floor is 0.10 on purpose, not by neglect.** GPU label stability
+  differs from `leidenalg` by design (see the note above and README's Known
+  Limitations), so a high ARI would be asserting a property SCX explicitly does
+  not promise. The test pairs the loose ARI — a degeneracy canary, against an
+  observed 0.0002 for a collapsed partition — with a cluster-count bound, which
+  is the assertion that actually has teeth. Pin `device="cpu"` when you need
+  label stability.
+- **kNN recall and UMAP trustworthiness have CPU-path tests, not GPU ones.**
+  `pyscx/tests/test_accel.py` asserts HNSW recall ≥ 0.90 against brute force and
+  UMAP trustworthiness > 0.75, both on `device="cpu"`. Neither compares a GPU
+  result to anything, so neither backs a GPU tolerance.
+- **Two of these rows pin `SCX_FORCE_NATIVE_GPU=1`, and that is not a detail.**
+  The `device="gpu"` default routes in-memory PCA to rapids-singlecell, so both
+  native-path bars are invisible to it.
+- **The third PCA row asks for the default path but does not gate it.** It calls
+  `normalize_total` / `log1p` / `pca` at `device="gpu"` on a materialized AnnData
+  — which is the rapids route — and its numeric bar is real. What it never does
+  is assert *which route served the request*: none of the three ops has its
+  `uns["scx_accel"][op]["route"]` checked. On a CUDA host without
+  rapids-singlecell installed, every one of them takes the documented
+  `NoRapidsCpu` fallback (`pyscx/src/accel/pca.rs`) and the whole SCX side runs
+  on the **CPU** while the test still passes. Read it as a correctness check of
+  the op chain, not as evidence that a GPU kernel ran.
+  ⚠️ An earlier revision of this note said "no row here gates the default path",
+  which was wrong in the other direction — this row does target it. Both
+  statements were mis-citations of the kind this table exists to remove.
+- **The PCA rows are split three ways on purpose.** An earlier revision of this
+  table had one "GPU PCA vs CPU PCA" row claiming "≥ 0.999 (GPU arms), ≥ 0.99 (vs
+  scanpy)". The 0.999 bar is `test_gpu_cholesky_matches_householder`, which
+  compares two **GPU** QR methods to each other — attributing it to a GPU-vs-CPU
+  row overstated what is gated, which is the same mis-citation this table exists
+  to remove. The real GPU-vs-CPU bar is ≥ 0.99 on the leading `n_clusters - 1`
+  PCs, and it pins `SCX_FORCE_NATIVE_GPU=1`, so it says nothing about the
+  `device="gpu"` default path (rapids-singlecell) that most users actually take.
+- Earlier revisions of this table cited `pyscx/tests/test_accel_gpu.py` as the
+  enforcement mechanism for all five rows. **That file has never existed**, and
+  four of the five thresholds it was said to enforce did not match any
+  assertion in the tree.
 
 ### Checking which backend was used
 

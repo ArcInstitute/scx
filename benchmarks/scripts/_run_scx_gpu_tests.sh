@@ -41,6 +41,18 @@ echo "=== preflight: $(nvidia-smi -L | wc -l) device(s) visible ==="
 echo
 
 export SCX_REQUIRE_GPU=1
+# And require real kernels, not placeholders. `build.rs` writes comment-only PTX
+# stubs when nvcc is absent, and until this series neither PATH nor CUDA_HOME was
+# in its fingerprint -- so a CARGO_TARGET_DIR that once saw a CPU-only build
+# replays the stub branch on a node that HAS nvcc. That is what killed the
+# Phase 7 gate (job 2839940: CUDA_ERROR_INVALID_IMAGE, 82s, nothing measured).
+#
+# This job is the one place the GPU suites execute, so it is the last place that
+# should run against stubs: without the variable the build succeeds, every test
+# is selected, and 200+ of them fail at their first kernel launch with an opaque
+# "named symbol not found" -- which reads as 200 broken kernels rather than one
+# broken build. With it, the build fails in ~20 seconds and says why.
+export SCX_GPU_REQUIRE_NVCC=1
 # Default the free-VRAM gate ON, for the same reason SCX_REQUIRE_GPU is on: this
 # job holds a whole H100 via --gres=gpu:1, so the ~10 GiB of headroom the >2^31
 # indexing test needs is a property of the allocation, not a gamble. Left opt-in,

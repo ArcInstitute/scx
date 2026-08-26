@@ -544,19 +544,27 @@ mod tests {
         }
     }
 
-    /// Regression guard for the CUDA-graph-capture htod bug: the GPU pdex path
-    /// over a **backed multi-shard** reader (no CSC sidecar → CSR-direct
-    /// `gpu_csr_v3`), **multi-chunk**, with graph capture **forced on**. Before
-    /// the device-side-scatter fix, the captured per-chunk sequence did a
-    /// host→device copy of the cell permutations, invalidating the capture
-    /// (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`) and erroring out. `csc: None`.
-    /// Must complete and match the CPU streaming reference. (The in-memory
-    /// single-shard multi-chunk tests did not catch this — the failure needs
-    /// the backed streaming path.)
+    /// GPU pdex over a **backed multi-shard** reader with no CSC sidecar
+    /// (CSR-direct `gpu_csr_v3`), **multi-chunk**, on the per-thread stream —
+    /// matched against the CPU streaming reference.
+    ///
+    /// The fixture's shape is historical and worth keeping: it was written for
+    /// a CUDA-graph-capture htod bug, where the captured per-chunk sequence
+    /// copied the cell permutations host→device and invalidated the capture
+    /// with `CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. The in-memory
+    /// single-shard multi-chunk tests did not catch it; the failure needed the
+    /// backed streaming path, which is why this one exists.
+    ///
+    /// ⚠️ **DE no longer captures a graph at all** — `grep capture_graph
+    /// scx-accel/src/diffexp/` returns nothing — so `cuda_graphs_enabled()`
+    /// here selects the per-thread stream and nothing more. Renamed from
+    /// `…_graph_capture` to stop the name asserting a mechanism this code does
+    /// not have; a CI guard (ORG-8.20-5) fires if capture returns, so the
+    /// original claim would be restored deliberately rather than inherited.
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture() {
+    fn test_pdex_ref_gpu_v3_csr_backed_multichunk_per_thread_stream() {
         require_gpu_or_skip!();
         let n_obs = 64usize;
         let n_vars = 20usize;
@@ -565,7 +573,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_csr_csc_test_file(
             dir.path(),
-            "pdex_gpu_v1_graph_capture",
+            "pdex_gpu_v3_csr_backed_multichunk",
             n_obs,
             n_vars,
             &dense,
@@ -593,7 +601,7 @@ mod tests {
         )
         .expect("CPU streaming pdex_ref failed");
 
-        // Force graph capture ON (deterministic) so the captured CSR-direct v3
+        // Force the per-thread stream ON (deterministic) so the CSR-direct v3
         // sequence runs over the backed multi-shard reader.
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
@@ -613,8 +621,8 @@ mod tests {
             None,
         );
         scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
-        let gpu_res =
-            gpu_res.expect("GPU v1 backed multi-chunk pdex_ref under graph capture failed");
+        let gpu_res = gpu_res
+            .expect("GPU v3 CSR backed multi-chunk pdex_ref on the per-thread stream failed");
 
         assert_eq!(cpu_res.group_names, gpu_res.group_names);
         assert_eq!(cpu_res.feature_names, gpu_res.feature_names);
@@ -626,7 +634,7 @@ mod tests {
                 if u_cpu.is_finite() && u_gpu.is_finite() {
                     assert!(
                         (u_cpu - u_gpu).abs() < 1e-3,
-                        "U mismatch (v1 graph) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                        "U mismatch (v3 csr, per-thread stream) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
                     );
                 }
                 let p_cpu = cpu_res.p_values[tg][var];
@@ -634,28 +642,33 @@ mod tests {
                 let pdiff = (p_cpu - p_gpu).abs();
                 assert!(
                     pdiff < 1e-6 || pdiff / p_cpu.abs().max(1e-30) < 1e-3,
-                    "p mismatch (v1 graph) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
+                    "p mismatch (v3 csr, per-thread stream) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
                 );
             }
         }
     }
 
-    /// Wilcoxon counterpart of `test_pdex_ref_gpu_v3_csr_backed_multichunk_graph_capture`.
-    /// The Wilcoxon GPU chunk sequence had the same CUDA-graph-capture htod bug
-    /// (its scatter calls copied the pool + per-test-group permutations
-    /// host→device inside the captured region), fixed by the pre-upload-once +
-    /// device-side scatter change. A backed input with no CSC sidecar runs the
-    /// CSR-direct `gpu_csr_v3` driver. Exercised in
-    /// **ref-mode** (`reference = Some(0)`) to cover the per-test-group
-    /// combined-tie + `tie_per_group` staging branch of the captured sequence.
-    /// Backed multi-shard + multi-chunk (`gene_chunk_size=7`, `n_vars=20`) +
-    /// graphs forced ON; must match the CPU streaming reference. (The dense
-    /// `test_wilcoxon_gpu_*_graph_vs_direct_parity` tests are single-chunk and
-    /// never trigger capture.)
+    /// Wilcoxon counterpart of
+    /// `test_pdex_ref_gpu_v3_csr_backed_multichunk_per_thread_stream`, with the
+    /// same historical origin: the Wilcoxon chunk sequence carried the same
+    /// capture-era htod bug (its scatter calls copied the pool + per-test-group
+    /// permutations host→device inside what was then a captured region), fixed
+    /// by pre-upload-once + device-side scatter.
+    ///
+    /// A backed input with no CSC sidecar runs the CSR-direct `gpu_csr_v3`
+    /// driver. Exercised in **ref-mode** (`reference = Some(0)`) to cover the
+    /// per-test-group combined-tie + `tie_per_group` staging branch. Backed
+    /// multi-shard + multi-chunk (`gene_chunk_size = 7`, `n_vars = 20`); must
+    /// match the CPU streaming reference.
+    ///
+    /// ⚠️ As above, nothing here captures a graph today; the switch selects the
+    /// per-thread stream. The dense
+    /// `test_wilcoxon_gpu_*_per_thread_stream_vs_default_parity` tests are
+    /// single-chunk, so this is still the only multi-chunk backed coverage.
     #[cfg(feature = "gpu")]
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_wilcoxon_gpu_v3_csr_backed_multichunk_graph_capture() {
+    fn test_wilcoxon_gpu_v3_csr_backed_multichunk_per_thread_stream() {
         use crate::diffexp::wilcoxon_rank_sum_streaming;
         require_gpu_or_skip!();
         let n_obs = 64usize;
@@ -665,7 +678,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = write_csr_csc_test_file(
             dir.path(),
-            "wilcoxon_gpu_v1_graph_capture",
+            "wilcoxon_gpu_v3_csr_backed_multichunk",
             n_obs,
             n_vars,
             &dense,
@@ -694,8 +707,9 @@ mod tests {
         )
         .expect("CPU streaming wilcoxon failed");
 
-        // Force graph capture ON over the backed multi-shard reader (Wilcoxon
-        // is always the v1 dense-chunk driver — no v2/v3/CSC override needed).
+        // Force the per-thread stream ON over the backed multi-shard reader (Wilcoxon
+        // dispatches through wilcoxon_rank_sum_gpu_chunked_v3_csr here, since the
+        // backed input has no CSC sidecar).
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
         let gpu_res = crate::diffexp::wilcoxon_rank_sum_gpu(
@@ -714,8 +728,8 @@ mod tests {
             tie_correct,
         );
         scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
-        let gpu_res =
-            gpu_res.expect("GPU v1 backed multi-chunk wilcoxon under graph capture failed");
+        let gpu_res = gpu_res
+            .expect("GPU v3 CSR backed multi-chunk wilcoxon on the per-thread stream failed");
 
         assert_eq!(cpu_res.group_names, gpu_res.group_names);
 
@@ -738,14 +752,14 @@ mod tests {
                 if s_c.is_finite() && s_g.is_finite() {
                     assert!(
                         (s_c - s_g).abs() < 1e-3,
-                        "score mismatch (v1 graph) group={} gene={gene}: cpu={s_c}, gpu={s_g}",
+                        "score mismatch (v3 csr, per-thread stream) group={} gene={gene}: cpu={s_c}, gpu={s_g}",
                         cpu_res.group_names[g]
                     );
                 }
                 let pdiff = (p_c - p_g).abs();
                 assert!(
                     pdiff < 1e-6 || pdiff / p_c.abs().max(1e-30) < 1e-3,
-                    "p mismatch (v1 graph) group={} gene={gene}: cpu={p_c}, gpu={p_g}",
+                    "p mismatch (v3 csr, per-thread stream) group={} gene={gene}: cpu={p_c}, gpu={p_g}",
                     cpu_res.group_names[g]
                 );
             }

@@ -658,29 +658,190 @@ mod tests {
         out
     }
 
-    /// CPU reference: streaming mean / variance with Bessel's correction.
-    fn cpu_mean_var(csr: &ScxCsr) -> (Vec<f64>, Vec<f64>) {
-        let (n_obs, n_vars) = (csr.n_rows(), csr.n_cols());
-        let mut col_sum = vec![0.0f64; n_vars];
-        let mut col_sum_sq = vec![0.0f64; n_vars];
-        for (&c, &v) in csr.indices.iter().zip(csr.data.iter()) {
-            let c = c as usize;
-            let v = v as f64;
-            col_sum[c] += v;
-            col_sum_sq[c] += v * v;
+    /// Exact per-column mean and Bessel-corrected variance of **integer-valued**
+    /// input, computed in integer arithmetic.
+    ///
+    /// This is the third-party oracle the GPU arms are measured against, and it
+    /// is deliberately *not* the shipped formula. It shares no line with
+    /// [`scx_sparse::finalize_column_moments`]: the variance here is
+    ///
+    /// ```text
+    ///     var = (n·Σx² − (Σx)²) / (n·(n−1))
+    /// ```
+    ///
+    /// — a ratio of two **exact `i128` integers**, converted to `f64` once, so
+    /// the answer is correctly rounded rather than the closed form
+    /// `(Σx² − n·mean²)/(n−1)` re-derived a third time. The two private copies
+    /// that used to live here (one for the CSR arm, one for the dense/CSC arm)
+    /// *were* that re-derivation, down to a `.max(0.0)` clamp where production
+    /// uses `if var < 0.0` — so a NaN variance was silently zeroed on the
+    /// reference side and passed through on the production side, and the test
+    /// compared the shared finalize against a copy of itself (review §8.17).
+    ///
+    /// # Why an integer fixture makes an `abs = 0` GPU bar legitimate
+    ///
+    /// [`gpu_streaming_mean_var`] accumulates via cross-block f64 `atomicAdd`
+    /// and therefore sums in a nondeterministic order (finding ACC6, module
+    /// header above). That would normally rule out an exact bar. It does not
+    /// here: when every value and every partial sum is exactly representable in
+    /// f64, addition is exact, and exact addition is associative — so the
+    /// accumulated moments are bit-identical whatever order the blocks land in.
+    /// Keep the fixture's magnitudes under 2⁵³ or the assertion below fires.
+    ///
+    /// # Panics
+    ///
+    /// If an intermediate exceeds 2⁵³, where `f64` stops representing integers
+    /// exactly and the "exact" claim above quietly stops holding. A fixture
+    /// that grows past this must shrink, not widen the tolerance.
+    fn exact_moments(col_sum: &[i128], col_sum_sq: &[i128], n: usize) -> (Vec<f64>, Vec<f64>) {
+        const EXACT_F64_MAX: i128 = 1i128 << 53;
+        let ni = n as i128;
+        let denom = ni * (ni - 1).max(1);
+        assert!(
+            denom < EXACT_F64_MAX,
+            "n·(n−1) = {denom} exceeds 2^53; this oracle is only exact below it"
+        );
+        let mut means = Vec::with_capacity(col_sum.len());
+        let mut vars = Vec::with_capacity(col_sum.len());
+        for (&s, &sq) in col_sum.iter().zip(col_sum_sq.iter()) {
+            assert!(
+                s.checked_mul(s).is_some_and(|s2| s2 < EXACT_F64_MAX) && ni * sq < EXACT_F64_MAX,
+                "column moments exceed 2^53 (Σx = {s}, Σx² = {sq}, n = {n}); \
+                 shrink the fixture rather than loosening the bar"
+            );
+            means.push(s as f64 / n as f64);
+            // One rounding, on a division of two exactly-represented integers.
+            vars.push((ni * sq - s * s) as f64 / denom as f64);
         }
-        let n = n_obs as f64;
-        let denom = (n - 1.0).max(1.0);
-        let mut means = vec![0.0f64; n_vars];
-        let mut variances = vec![0.0f64; n_vars];
-        for j in 0..n_vars {
-            let m = col_sum[j] / n;
-            means[j] = m;
-            variances[j] = ((col_sum_sq[j] - n * m * m) / denom).max(0.0);
-        }
-        (means, variances)
+        (means, vars)
     }
 
+    /// Exact integer moments of a CSR fixture. Panics if a value is not an
+    /// integer — the caller's fixture, not the code under test, is wrong.
+    fn integer_moments_csr(csr: &ScxCsr) -> (Vec<i128>, Vec<i128>) {
+        let mut s = vec![0i128; csr.n_cols()];
+        let mut sq = vec![0i128; csr.n_cols()];
+        for (&c, &v) in csr.indices.iter().zip(csr.data.iter()) {
+            let iv = v as i128;
+            assert_eq!(iv as f32, v, "fixture value {v} is not an integer");
+            s[c as usize] += iv;
+            sq[c as usize] += iv * iv;
+        }
+        (s, sq)
+    }
+
+    /// Exact integer moments of a dense fixture, for the CSC arm.
+    fn integer_moments_dense(dense: &[Vec<f64>], n_cols: usize) -> (Vec<i128>, Vec<i128>) {
+        let mut s = vec![0i128; n_cols];
+        let mut sq = vec![0i128; n_cols];
+        for row in dense {
+            for (c, &v) in row.iter().enumerate().take(n_cols) {
+                let iv = v as i128;
+                assert_eq!(iv as f64, v, "fixture value {v} is not an integer");
+                s[c] += iv;
+                sq[c] += iv * iv;
+            }
+        }
+        (s, sq)
+    }
+
+    /// Variance bar for a well-conditioned fixture (`residual/Σx²` ≈ 1).
+    /// Measured worst case 2.1e-16, ≈1 ULP; one decimal order of headroom.
+    const VAR_REL_WELL_CONDITIONED: f64 = 1e-15;
+
+    /// Variance bar for the f32-accumulator probe, whose fixture is
+    /// deliberately less well conditioned (`residual/Σx²` = 1.95e-03) so that
+    /// its column sums can clear 2²⁴. Measured f64 noise there reaches 4.4e-14;
+    /// the f32-accumulator signal it must catch is 2.7e-07. 1e-10 sits ~3.4
+    /// orders above the noise and ~3.4 below the signal — the separation is the
+    /// point, not the round number.
+    const VAR_REL_LARGE_MAGNITUDE: f64 = 1e-10;
+
+    /// Compare an arm against the oracle. One routine for every call site, but
+    /// the variance bar is a **parameter**, because it is a property of the
+    /// fixture's conditioning rather than of the code under test.
+    ///
+    /// Means are always asserted **exactly**: `Σx / n` is a single division of
+    /// an exactly-represented integer, so it neither cancels nor depends on
+    /// summation order, whatever the magnitudes.
+    ///
+    /// Variances do not have one bar, and assuming they did cost a red hardware
+    /// run. The closed form loses about `eps / (residual/Σx²)` relatively, so
+    /// its accuracy is set by how near-constant the column is:
+    ///
+    /// | fixture | residual/Σx² | measured worst rel |
+    /// |---|---|---|
+    /// | [`integer_csr`], values `1..=20` | ~1 | 2.1e-16 (≈1 ULP) |
+    /// | the f32 probe, values `60_000..=70_000` | 1.95e-03 | 4.4e-14 |
+    ///
+    /// [`VAR_REL_WELL_CONDITIONED`] was measured on the first and then applied
+    /// to the second, which is three orders too tight for it — the probe failed
+    /// on an H100 at 1.245e-14 against a 1e-15 bar. The kernel was right and the
+    /// bar was wrong.
+    fn assert_matches_exact(
+        got_means: &[f64],
+        got_vars: &[f64],
+        want_means: &[f64],
+        want_vars: &[f64],
+        var_rel_bar: f64,
+        what: &str,
+    ) {
+        assert_eq!(got_means.len(), want_means.len(), "{what}: mean length");
+        assert_eq!(got_vars.len(), want_vars.len(), "{what}: var length");
+        for j in 0..want_means.len() {
+            assert_eq!(
+                got_means[j], want_means[j],
+                "{what}: mean col {j} is not exactly the integer oracle's value"
+            );
+            let d = (got_vars[j] - want_vars[j]).abs();
+            let rel = if want_vars[j] == 0.0 {
+                d
+            } else {
+                d / want_vars[j].abs()
+            };
+            assert!(
+                rel < var_rel_bar,
+                "{what}: var col {j} = {} vs exact {} (rel {rel:.3e} >= {var_rel_bar:.0e})",
+                got_vars[j],
+                want_vars[j]
+            );
+        }
+    }
+
+    /// Integer-valued CSR fixture: every value, every `Σx` and every `Σx²` is
+    /// exactly representable in f64, which is what lets the GPU arms be held to
+    /// an exact bar despite `atomicAdd` ordering. See [`exact_moments`].
+    fn integer_csr(n_rows: usize, n_cols: usize, density: f32, seed: u64) -> ScxCsr {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        indptr.push(0);
+        for _ in 0..n_rows {
+            for c in 0..n_cols {
+                if rng.gen_bool(density as f64) {
+                    indices.push(c as i32);
+                    data.push(rng.gen_range(1..=20) as f32);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new_unchecked((n_rows, n_cols), indptr, indices, data)
+    }
+
+    /// Integer-valued dense fixture, for the CSC arm.
+    fn integer_dense(n_rows: usize, n_cols: usize, density: f64, seed: u64) -> Vec<Vec<f64>> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut dense = vec![vec![0.0f64; n_cols]; n_rows];
+        for row in dense.iter_mut() {
+            for v in row.iter_mut() {
+                if rng.gen_bool(density) {
+                    *v = rng.gen_range(1..=20) as f64;
+                }
+            }
+        }
+        dense
+    }
     fn cpu_clip_square_sum(csr: &ScxCsr, clip_val: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let n_vars = csr.n_cols();
         let mut bcs = vec![0.0f64; n_vars];
@@ -694,13 +855,203 @@ mod tests {
         (bcs, sbcs)
     }
 
+    /// The bar the GPU tests use, justified on the CPU where it can be watched
+    /// red without a device.
+    ///
+    /// On a fixture whose moments are exactly representable, the shipped closed
+    /// form and the exact-integer oracle agree to ~1 ULP. Measured worst case
+    /// 2.1e-16, so the GPU bar of 1e-15 has one decimal order of headroom and
+    /// is a statement about f64, not a guess. If this fails, the GPU tests'
+    /// tolerance is wrong and no amount of GPU debugging will show it.
+    #[test]
+    fn the_exact_oracle_and_the_closed_form_agree_to_one_ulp() {
+        let csr = integer_csr(500, 100, 0.1, 55);
+        let (s, sq) = integer_moments_csr(&csr);
+        let (want_means, want_vars) = exact_moments(&s, &sq, 500);
+
+        // The moments a kernel would hand the shared finalize.
+        let cs: Vec<f64> = s.iter().map(|&v| v as f64).collect();
+        let csq: Vec<f64> = sq.iter().map(|&v| v as f64).collect();
+        let m = scx_sparse::finalize_column_moments(&cs, &csq, 500);
+
+        assert!(
+            m.unstable.is_empty(),
+            "a well-conditioned fixture must not report cancellation; got {:?}",
+            m.unstable
+        );
+        assert_matches_exact(
+            &m.means,
+            &m.variances,
+            &want_means,
+            &want_vars,
+            VAR_REL_WELL_CONDITIONED,
+            "finalize_column_moments on exact integer moments",
+        );
+    }
+
+    /// Where the closed form *does* lose, and what the old `rel < 1e-5` bar
+    /// could not see.
+    ///
+    /// ⚠️ The shape matters and the review's own example has it wrong. §8.17
+    /// proposes "a gene at constant 8192.0 in 1000 of 1 M cells". Measured,
+    /// that column's mean is 8.192, so `n·mean² = 6.7e7` against `Sx² = 6.7e10`
+    /// — the subtraction cancels nothing and the closed form is exact. A
+    /// *sparse spike* has a tiny mean by construction; the sibling test below
+    /// pins that, so this fixture cannot quietly drift into it.
+    ///
+    /// What cancels is a **dense, near-constant column at large magnitude**.
+    /// Here every one of 5000 cells is 8192.0 except five at 8193.0:
+    /// `residual / Sx² = 1.5e-11`, about eleven decimal digits gone.
+    ///
+    /// [`scx_sparse::finalize_column_moments`] **reports** that and does not
+    /// repair it, so this asserts the documented behaviour rather than a wish.
+    #[test]
+    fn the_closed_form_reports_cancellation_on_a_dense_near_constant_column() {
+        const N: usize = 5_000;
+        // 4995 cells at 8192, five at 8193 — accumulated exactly, so the only
+        // error under test is the finalize's own subtraction.
+        let (a, b) = (8192i128, 8193i128);
+        let s = 4_995 * a + 5 * b;
+        let sq = 4_995 * a * a + 5 * b * b;
+        let (want_means, want_vars) = exact_moments(&[s], &[sq], N);
+
+        let m = scx_sparse::finalize_column_moments(&[s as f64], &[sq as f64], N);
+
+        assert_eq!(
+            m.unstable,
+            vec![0u32],
+            "a dense near-constant column at large magnitude must be reported \
+             unstable — that report is the whole contract, since the closed \
+             form does not repair the loss"
+        );
+        assert_eq!(m.means[0], want_means[0], "the mean does not cancel");
+
+        let rel = (m.variances[0] - want_vars[0]).abs() / want_vars[0].abs();
+        assert!(
+            rel > 1e-7,
+            "this fixture is supposed to lose precision; rel = {rel:.3e} means \
+             it no longer does and the test has stopped testing cancellation"
+        );
+        assert!(
+            rel < 1e-5,
+            "the point of this test: the loss ({rel:.3e}) is INSIDE the \
+             `rel < 1e-5` bar these GPU tests used to carry, so that bar could \
+             not see an eleven-digit cancellation even on a fixture that has one"
+        );
+    }
+
+    /// Premise for the test above: the review's sparse-spike shape does **not**
+    /// cancel, so a fixture that drifts into it would pass vacuously.
+    #[test]
+    fn a_sparse_spike_column_does_not_cancel() {
+        // 100 hits in 100k rows, not the review's 1000-in-1M: same mean
+        // (8.192), same non-cancellation, and `n·Σx²` stays under 2⁵³ so the
+        // oracle itself is exact. `exact_moments` refuses the larger shape
+        // rather than silently rounding — which is how this size was chosen.
+        const N: usize = 100_000;
+        let (hits, v) = (100i128, 8_192i128);
+        let (s, sq) = (hits * v, hits * v * v);
+        let (want_means, want_vars) = exact_moments(&[s], &[sq], N);
+
+        let m = scx_sparse::finalize_column_moments(&[s as f64], &[sq as f64], N);
+
+        assert!(
+            m.unstable.is_empty(),
+            "a sparse spike at 8192 is not a cancellation fixture — the mean \
+             is 8.192, so n*mean^2 is three orders below Sx^2 and nothing \
+             cancels (review SS8.17's example)"
+        );
+        assert_eq!(m.means[0], want_means[0]);
+        assert_eq!(
+            m.variances[0], want_vars[0],
+            "with nothing to cancel the closed form is exact"
+        );
+    }
+
+    /// A fixture whose column sums clear 2²⁴, so a kernel that switched its
+    /// accumulator from f64 back to f32 is detectable.
+    ///
+    /// The other integer fixtures here cannot see that regression, and it is
+    /// worth being explicit about why: their values are `1..=20` over 400–500
+    /// rows, so a column sum is ~500 and every partial sum is exact in **f32**
+    /// as well as f64. Both accumulators would agree to the last bit and the
+    /// test would pass. Raised in review by Cursor Agent as a residual risk.
+    ///
+    /// The magnitudes are measured, not chosen. Four properties have to hold at
+    /// once, and most obvious fixtures fail one of them:
+    ///
+    /// - values f32-exact (integers ≤ 2²⁴), since `ScxCsr::data` is `f32`;
+    /// - column sum **above** 2²⁴ ≈ 1.68e7, or an f32 accumulator stays exact
+    ///   and this test proves nothing. Two candidate fixtures with wider value
+    ///   ranges were rejected for exactly this — their sums came to 1.4e7 and
+    ///   an f32 accumulator reproduced them with zero error;
+    /// - value **spread** wide enough that the closed form stays
+    ///   well-conditioned. A near-constant column at this magnitude gets
+    ///   flagged `unstable` instead, which is a different test (see
+    ///   `the_closed_form_reports_cancellation_on_a_dense_near_constant_column`);
+    /// - `n·Σx²` and `(Σx)²` under 2⁵³, or [`exact_moments`] refuses the
+    ///   fixture rather than silently rounding.
+    ///
+    /// 400 dense rows of `60_000..=70_000` satisfies all four: measured f32
+    /// accumulation error 2.7e-07 — eight orders above this test's `1e-15` bar
+    /// — at `residual/Σx² = 1.9e-3`, comfortably clear of the 1e-7
+    /// cancellation threshold.
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_gpu_streaming_mean_var_matches_cpu() {
+    fn test_gpu_streaming_mean_var_detects_an_f32_accumulator() {
+        let dev = require_gpu!();
+        let (n_rows, n_cols) = (400usize, 16usize);
+        let mut rng = StdRng::seed_from_u64(7);
+        let dense: Vec<Vec<f64>> = (0..n_rows)
+            .map(|_| {
+                (0..n_cols)
+                    .map(|_| rng.gen_range(60_000..=70_000) as f64)
+                    .collect()
+            })
+            .collect();
+        let csr = dense_to_csr(&dense, n_cols);
+
+        // Premise: the sums really do clear the f32 exact-integer boundary. A
+        // fixture that drifts below it passes while testing nothing.
+        let (s, sq) = integer_moments_dense(&dense, n_cols);
+        assert!(
+            s.iter().all(|&v| v > (1i128 << 24)),
+            "every column sum must exceed 2^24 for an f32 accumulator to lose; \
+             got min {:?}",
+            s.iter().min()
+        );
+
+        let source = InMemorySource {
+            shards: split_into_shards(&csr, 4),
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+        let (gm, gv) = gpu_streaming_mean_var(&dev, &source).expect("gpu streaming mean/var");
+        let (want_means, want_vars) = exact_moments(&s, &sq, n_rows);
+        assert_matches_exact(
+            &gm,
+            &gv,
+            &want_means,
+            &want_vars,
+            VAR_REL_LARGE_MAGNITUDE,
+            "f32-accumulator probe",
+        );
+    }
+
+    /// The GPU CSR mean/variance arm against the exact-integer oracle.
+    ///
+    /// Bars are `abs = 0` on means and `rel < 1e-15` on variances, not the
+    /// `rel < 1e-5` this used to carry. The old bar was nine orders looser than
+    /// the arms actually are, and — measured — it could not see an eleven-digit
+    /// cancellation loss either (see
+    /// `the_closed_form_reports_cancellation_on_a_dense_near_constant_column`).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_gpu_streaming_mean_var_matches_exact() {
         let dev = require_gpu!();
         let n_rows = 500;
         let n_cols = 100;
-        let csr = random_pos_csr(n_rows, n_cols, 0.1, 55);
+        let csr = integer_csr(n_rows, n_cols, 0.1, 55);
         let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
             shards,
@@ -710,28 +1061,16 @@ mod tests {
 
         let (gpu_means, gpu_vars) =
             gpu_streaming_mean_var(&dev, &source).expect("gpu streaming mean/var");
-        let (cpu_means, cpu_vars) = cpu_mean_var(&csr);
-
-        for j in 0..n_cols {
-            let dm = (gpu_means[j] - cpu_means[j]).abs();
-            let dv = (gpu_vars[j] - cpu_vars[j]).abs();
-            let denom_m = cpu_means[j].abs().max(1e-10);
-            let denom_v = cpu_vars[j].abs().max(1e-10);
-            assert!(
-                dm / denom_m < 1e-5,
-                "mean mismatch col {j}: gpu={} cpu={} rel={}",
-                gpu_means[j],
-                cpu_means[j],
-                dm / denom_m
-            );
-            assert!(
-                dv / denom_v < 1e-5,
-                "var mismatch col {j}: gpu={} cpu={} rel={}",
-                gpu_vars[j],
-                cpu_vars[j],
-                dv / denom_v
-            );
-        }
+        let (s, sq) = integer_moments_csr(&csr);
+        let (want_means, want_vars) = exact_moments(&s, &sq, n_rows);
+        assert_matches_exact(
+            &gpu_means,
+            &gpu_vars,
+            &want_means,
+            &want_vars,
+            VAR_REL_WELL_CONDITIONED,
+            "gpu_streaming_mean_var",
+        );
     }
 
     #[test]
@@ -1010,6 +1349,24 @@ mod tests {
         dense
     }
 
+    /// Row-major CSR view of the same dense fixture, so one matrix can be fed
+    /// to both the CSR and the CSC arm and the two compared bit for bit.
+    fn dense_to_csr(dense: &[Vec<f64>], n_cols: usize) -> ScxCsr {
+        let mut indptr = vec![0i64];
+        let mut indices: Vec<i32> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        for row in dense {
+            for (c, &v) in row.iter().enumerate().take(n_cols) {
+                if v != 0.0 {
+                    indices.push(c as i32);
+                    data.push(v as f32);
+                }
+            }
+            indptr.push(indices.len() as i64);
+        }
+        ScxCsr::new_unchecked((dense.len(), n_cols), indptr, indices, data)
+    }
+
     /// Column-shard the dense matrix into `n_shards` contiguous column ranges
     /// (CSC, global row ids), so shards after the first have a non-zero
     /// `col_start` — exercising the kernel's `col_start + local_col` mapping.
@@ -1050,23 +1407,6 @@ mod tests {
         }
     }
 
-    fn cpu_mean_var_dense(dense: &[Vec<f64>], n_cols: usize) -> (Vec<f64>, Vec<f64>) {
-        let n = dense.len() as f64;
-        let denom = (n - 1.0).max(1.0);
-        let mut means = vec![0.0; n_cols];
-        let mut vars = vec![0.0; n_cols];
-        for (c, (mean, var)) in means.iter_mut().zip(vars.iter_mut()).enumerate() {
-            let (mut s, mut sq) = (0.0f64, 0.0f64);
-            for drow in dense {
-                s += drow[c];
-                sq += drow[c] * drow[c];
-            }
-            *mean = s / n;
-            *var = ((sq - n * *mean * *mean) / denom).max(0.0);
-        }
-        (means, vars)
-    }
-
     fn cpu_clip_dense(dense: &[Vec<f64>], n_cols: usize, clip: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let mut s = vec![0.0; n_cols];
         let mut sq = vec![0.0; n_cols];
@@ -1082,21 +1422,45 @@ mod tests {
         (s, sq)
     }
 
+    /// The GPU CSC reduce against the same exact-integer oracle, and against
+    /// the CSR arm **bit for bit**.
+    ///
+    /// The cross-arm half is the one that would catch a staging refactor: the
+    /// two paths share nothing but the finalize, so identical bits mean both
+    /// accumulated the same values from the same shards. It is legitimate to
+    /// demand identity here even though the CSR arm sums via `atomicAdd` in a
+    /// nondeterministic order — on an integer fixture every partial sum is
+    /// exact, and exact addition is associative.
     #[test]
     #[ignore = "requires a CUDA GPU"]
-    fn test_gpu_streaming_mean_var_csc_matches_cpu() {
+    fn test_gpu_streaming_mean_var_csc_matches_exact() {
         let dev = require_gpu!();
         let (n_rows, n_cols) = (400usize, 90usize);
-        let dense = build_dense(n_rows, n_cols, 0.15, 123);
+        let dense = integer_dense(n_rows, n_cols, 0.15, 123);
         let src = dense_to_csc_shards(&dense, n_cols, 4); // multi-shard
         let (gm, gv) = gpu_streaming_mean_var_csc(&dev, &src).expect("gpu csc mean/var");
-        let (cm, cv) = cpu_mean_var_dense(&dense, n_cols);
-        for j in 0..n_cols {
-            let dm = (gm[j] - cm[j]).abs() / cm[j].abs().max(1e-10);
-            let dv = (gv[j] - cv[j]).abs() / cv[j].abs().max(1e-10);
-            assert!(dm < 1e-5, "mean col {j}: gpu={} cpu={}", gm[j], cm[j]);
-            assert!(dv < 1e-5, "var col {j}: gpu={} cpu={}", gv[j], cv[j]);
-        }
+
+        let (s, sq) = integer_moments_dense(&dense, n_cols);
+        let (want_means, want_vars) = exact_moments(&s, &sq, n_rows);
+        assert_matches_exact(
+            &gm,
+            &gv,
+            &want_means,
+            &want_vars,
+            VAR_REL_WELL_CONDITIONED,
+            "gpu_streaming_mean_var_csc",
+        );
+
+        // Same matrix through the CSR arm: bit-identical, not merely close.
+        let csr = dense_to_csr(&dense, n_cols);
+        let csr_src = InMemorySource {
+            shards: split_into_shards(&csr, 4),
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+        let (rm, rv) = gpu_streaming_mean_var(&dev, &csr_src).expect("gpu csr mean/var");
+        assert_eq!(rm, gm, "CSR and CSC means must be bit-identical");
+        assert_eq!(rv, gv, "CSR and CSC variances must be bit-identical");
     }
 
     #[test]
@@ -1162,21 +1526,16 @@ mod tests {
         }
         let src = dense_to_csc_shards(&dense, n_cols, 1);
         let (gm, gv) = gpu_streaming_mean_var_csc(&dev, &src).unwrap();
-        let (cm, cv) = cpu_mean_var_dense(&dense, n_cols);
-        for j in 0..n_cols {
-            assert!(
-                (gm[j] - cm[j]).abs() / cm[j].abs().max(1e-10) < 1e-5,
-                "mean col {j}: gpu={} cpu={}",
-                gm[j],
-                cm[j]
-            );
-            assert!(
-                (gv[j] - cv[j]).abs() / cv[j].abs().max(1e-10) < 1e-5,
-                "var col {j}: gpu={} cpu={}",
-                gv[j],
-                cv[j]
-            );
-        }
+        let (s, sq) = integer_moments_dense(&dense, n_cols);
+        let (cm, cv) = exact_moments(&s, &sq, n_rows);
+        assert_matches_exact(
+            &gm,
+            &gv,
+            &cm,
+            &cv,
+            VAR_REL_WELL_CONDITIONED,
+            "gpu_streaming_mean_var_csc hot gene",
+        );
         assert_eq!(gm[1], 0.0, "all-zero gene mean");
         assert_eq!(gv[1], 0.0, "all-zero gene var");
     }

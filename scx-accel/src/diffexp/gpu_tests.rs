@@ -212,22 +212,37 @@ fn test_pdex_ref_gpu_dense_matches_cpu() {
     }
 }
 
-/// G10.4 parity: graph-captured per-chunk path produces identical
-/// results to the direct per-chunk path under the same fixture.
-/// Unlike UMAP (where atomicAdd races create irreducible run-to-run
-/// jitter), pdex_ref's kernels are deterministic given fixed input
-/// — sort + searchsorted + tie-correct + pvalues — so the two
-/// paths should agree to fp32 tolerance bit-for-bit on U / p /
-/// log2_fc / means. Any divergence implies the graph-replay path
-/// is feeding stale buffer pointers or missing a kernel.
+/// Both CUDA streams give the same pdex_ref answer.
 ///
-/// Uses `set_cuda_graphs_enabled_override` to flip the kill switch
-/// in-process so both branches run in the same test invocation
-/// (the `SCX_DISABLE_CUDA_GRAPHS=1` env var is `OnceLock`-cached
-/// at process start and can't be re-read).
+/// ⚠️ **This is not a graph-capture test, despite what the switch is called.**
+/// DE never captures a graph: `grep capture_graph scx-accel/src/diffexp/`
+/// returns nothing, and the workspace's only production `capture_graph` call is
+/// `scx-accel/src/harmony/gpu.rs`. What `set_cuda_graphs_enabled_override`
+/// selects here is a *stream* — `diffexp/gpu.rs` reads
+/// `let target_dev = if cuda_graphs_enabled() { &dev_pts } else { dev };` at
+/// three places, `dev_pts` being the per-thread stream — with the reason stated
+/// beside it: "Mode 4 reserved for v3 CSR if graph capture is later re-enabled;
+/// for now skip capture (shard loop count is dynamic so the per-chunk kernel
+/// count diverges from v2)."
+///
+/// So both arms run the identical kernel sequence and the test cannot detect a
+/// stale-pointer replay, which is what its previous name and docstring claimed.
+/// It is still worth having: it is the only coverage that the per-thread-stream
+/// arm — the one every `device="gpu"` DE call takes — produces the same numbers
+/// as the default stream. Renamed to say that, rather than deleted. A CI guard
+/// (ORG-8.20-5) fails if `scx-accel/src/diffexp/` ever gains a `capture_graph`
+/// call, so if capture returns this test gets its original claim back on
+/// purpose rather than by inheritance.
+///
+/// pdex_ref's kernels are deterministic given fixed input — sort +
+/// searchsorted + tie-correct + pvalues — so the bar is fp32-tight.
+///
+/// Uses `set_cuda_graphs_enabled_override` to flip the switch in-process so
+/// both branches run in one test invocation (the `SCX_DISABLE_CUDA_GRAPHS=1`
+/// env var is `OnceLock`-cached at process start and can't be re-read).
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_pdex_ref_gpu_graph_vs_direct_parity() {
+fn test_pdex_ref_gpu_per_thread_stream_vs_default_parity() {
     require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
@@ -251,7 +266,7 @@ fn test_pdex_ref_gpu_graph_vs_direct_parity() {
     .expect("direct pdex_ref_gpu_dense failed");
 
     scx_gpu::set_cuda_graphs_enabled_override(Some(true));
-    let graph = pdex_ref_gpu_dense(
+    let pts = pdex_ref_gpu_dense(
         0,
         &data,
         n_obs,
@@ -264,14 +279,14 @@ fn test_pdex_ref_gpu_graph_vs_direct_parity() {
         epsilon,
         None,
     )
-    .expect("graph pdex_ref_gpu_dense failed");
+    .expect("per-thread-stream pdex_ref_gpu_dense failed");
 
     scx_gpu::set_cuda_graphs_enabled_override(prev);
 
-    assert_eq!(direct.group_names, graph.group_names);
-    assert_eq!(direct.feature_names, graph.feature_names);
+    assert_eq!(direct.group_names, pts.group_names);
+    assert_eq!(direct.feature_names, pts.feature_names);
 
-    // The graph path should produce bit-for-bit identical outputs
+    // The per-thread-stream path should produce bit-for-bit identical outputs
     // to the direct path (same kernels, same inputs, deterministic
     // sort/searchsort/pvalues — no atomics in this DE family).
     // A modest tolerance accommodates kernel-launch reordering
@@ -280,32 +295,32 @@ fn test_pdex_ref_gpu_graph_vs_direct_parity() {
     for tg in 0..direct.group_names.len() {
         for var in 0..n_vars {
             let u_d = direct.statistics[tg][var];
-            let u_g = graph.statistics[tg][var];
-            if u_d.is_finite() && u_g.is_finite() {
+            let u_pts = pts.statistics[tg][var];
+            if u_d.is_finite() && u_pts.is_finite() {
                 assert!(
-                    (u_d - u_g).abs() < 1e-6,
-                    "U mismatch tg={tg} gene={var}: direct={u_d}, graph={u_g}"
+                    (u_d - u_pts).abs() < 1e-6,
+                    "U mismatch tg={tg} gene={var}: direct={u_d}, per_thread={u_pts}"
                 );
             }
             let p_d = direct.p_values[tg][var];
-            let p_g = graph.p_values[tg][var];
+            let p_pts = pts.p_values[tg][var];
             assert!(
-                (p_d - p_g).abs() < 1e-9 || (p_d - p_g).abs() / p_d.abs().max(1e-12) < 1e-6,
-                "p-value mismatch tg={tg} gene={var}: direct={p_d}, graph={p_g}"
+                (p_d - p_pts).abs() < 1e-9 || (p_d - p_pts).abs() / p_d.abs().max(1e-12) < 1e-6,
+                "p-value mismatch tg={tg} gene={var}: direct={p_d}, per_thread={p_pts}"
             );
             let tm_d = direct.target_means[tg][var];
-            let tm_g = graph.target_means[tg][var];
+            let tm_g = pts.target_means[tg][var];
             assert!(
                 (tm_d - tm_g).abs() < 1e-6 || (tm_d - tm_g).abs() / tm_d.abs().max(1e-9) < 1e-6,
-                "target_mean mismatch tg={tg} gene={var}: direct={tm_d}, graph={tm_g}"
+                "target_mean mismatch tg={tg} gene={var}: direct={tm_d}, per_thread={tm_g}"
             );
         }
         for var in 0..n_vars {
             let r_d = direct.ref_means[var];
-            let r_g = graph.ref_means[var];
+            let r_pts = pts.ref_means[var];
             assert!(
-                (r_d - r_g).abs() < 1e-6 || (r_d - r_g).abs() / r_d.abs().max(1e-9) < 1e-6,
-                "ref_mean mismatch gene={var}: direct={r_d}, graph={r_g}"
+                (r_d - r_pts).abs() < 1e-6 || (r_d - r_pts).abs() / r_d.abs().max(1e-9) < 1e-6,
+                "ref_mean mismatch gene={var}: direct={r_d}, per_thread={r_pts}"
             );
         }
     }
@@ -391,17 +406,16 @@ fn test_wilcoxon_gpu_dense_matches_cpu_one_vs_rest() {
     }
 }
 
-/// G10.5 parity (1-vs-rest): graph-captured wilcoxon path
-/// produces identical results to the direct path. Wilcoxon's
-/// captureable kernels (scatter / block_sort / tie / searchsorted /
-/// ranksum) are deterministic given fixed input — atomicAdd lives
-/// only in `gpu_de_pseudobulk_all_groups`, which runs OUTSIDE the
-/// captured region — so we can assert fp32-tight tolerance on U /
-/// p / score, same shape as
-/// `test_pdex_ref_gpu_graph_vs_direct_parity`.
+/// Both CUDA streams give the same 1-vs-rest wilcoxon answer.
+///
+/// Same non-claim as `test_pdex_ref_gpu_per_thread_stream_vs_default_parity`
+/// above: the switch selects a stream, not a graph, and DE captures nothing.
+/// Wilcoxon's kernels (scatter / block_sort / tie / searchsorted / ranksum) are
+/// deterministic given fixed input — the only atomicAdd is in
+/// `gpu_de_pseudobulk_all_groups` — so the bar is fp32-tight.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
+fn test_wilcoxon_gpu_one_vs_rest_per_thread_stream_vs_default_parity() {
     require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, _reference) = make_fixture();
@@ -423,7 +437,7 @@ fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
     .expect("direct wilcoxon 1-vs-rest failed");
 
     scx_gpu::set_cuda_graphs_enabled_override(Some(true));
-    let graph = wilcoxon_rank_sum_gpu_dense(
+    let pts = wilcoxon_rank_sum_gpu_dense(
         0,
         &data,
         n_obs,
@@ -436,11 +450,11 @@ fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
         false,
         true,
     )
-    .expect("graph wilcoxon 1-vs-rest failed");
+    .expect("per-thread-stream wilcoxon 1-vs-rest failed");
 
     scx_gpu::set_cuda_graphs_enabled_override(prev);
 
-    assert_eq!(direct.group_names, graph.group_names);
+    assert_eq!(direct.group_names, pts.group_names);
 
     use std::collections::HashMap;
     let group_to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
@@ -453,49 +467,49 @@ fn test_wilcoxon_gpu_one_vs_rest_graph_vs_direct_parity() {
 
     for g in 0..direct.group_names.len() {
         let d_map = group_to_map(&direct, g);
-        let g_map = group_to_map(&graph, g);
+        let pts_map = group_to_map(&pts, g);
         for gene in &gene_names {
             let (s_d, p_d) = d_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
-            let (s_g, p_g) = g_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
-            if s_d.is_finite() && s_g.is_finite() {
+            let (s_pts, p_pts) = pts_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+            if s_d.is_finite() && s_pts.is_finite() {
                 assert!(
-                    (s_d - s_g).abs() < 1e-6,
-                    "score mismatch group={} gene={}: direct={}, graph={}",
+                    (s_d - s_pts).abs() < 1e-6,
+                    "score mismatch group={} gene={}: direct={}, per_thread={}",
                     direct.group_names[g],
                     gene,
                     s_d,
-                    s_g
+                    s_pts
                 );
             }
             assert!(
-                (p_d - p_g).abs() < 1e-9 || (p_d - p_g).abs() / p_d.abs().max(1e-12) < 1e-6,
-                "pval mismatch group={} gene={}: direct={}, graph={}",
+                (p_d - p_pts).abs() < 1e-9 || (p_d - p_pts).abs() / p_d.abs().max(1e-12) < 1e-6,
+                "pval mismatch group={} gene={}: direct={}, per_thread={}",
                 direct.group_names[g],
                 gene,
                 p_d,
-                p_g
+                p_pts
             );
         }
     }
 }
 
-/// G10.5 parity (ref-mode): graph-captured wilcoxon path matches
-/// direct in ref-mode. Same kernel determinism contract as the
-/// 1-vs-rest test above, but exercises ref-mode (`mode=1`) and the
+/// Both CUDA streams give the same ref-mode wilcoxon answer.
+///
+/// Same non-claim as the two above. Exercises ref-mode (`mode = 1`) and the
 /// per-tg combined-tie + tie_per_group staging path.
 ///
-/// The shared `make_fixture` provides a reference group via its
-/// last return value; passing it as `reference: Some(...)` routes
-/// the GPU driver into the ref-mode capture path.
+/// The shared `make_fixture` provides a reference group via its last return
+/// value; passing it as `reference: Some(...)` routes the GPU driver into
+/// ref-mode.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
+fn test_wilcoxon_gpu_ref_mode_per_thread_stream_vs_default_parity() {
     require_gpu_or_skip!();
 
     let (data, n_obs, n_vars, gene_names, groups, group_names, reference) = make_fixture();
     // `reference` is a `usize` (group index) — make_fixture always
     // supplies one for pdex_ref. For wilcoxon we wrap it in `Some`
-    // to drive the ref-mode capture path (mode = 1).
+    // to drive the ref-mode path (mode = 1). Nothing here captures a graph.
 
     let prev = scx_gpu::set_cuda_graphs_enabled_override(Some(false));
     let direct = wilcoxon_rank_sum_gpu_dense(
@@ -514,7 +528,7 @@ fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
     .expect("direct wilcoxon ref-mode failed");
 
     scx_gpu::set_cuda_graphs_enabled_override(Some(true));
-    let graph = wilcoxon_rank_sum_gpu_dense(
+    let pts = wilcoxon_rank_sum_gpu_dense(
         0,
         &data,
         n_obs,
@@ -527,11 +541,11 @@ fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
         false,
         true,
     )
-    .expect("graph wilcoxon ref-mode failed");
+    .expect("per-thread-stream wilcoxon ref-mode failed");
 
     scx_gpu::set_cuda_graphs_enabled_override(prev);
 
-    assert_eq!(direct.group_names, graph.group_names);
+    assert_eq!(direct.group_names, pts.group_names);
 
     use std::collections::HashMap;
     let group_to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64)> {
@@ -544,27 +558,27 @@ fn test_wilcoxon_gpu_ref_mode_graph_vs_direct_parity() {
 
     for g in 0..direct.group_names.len() {
         let d_map = group_to_map(&direct, g);
-        let g_map = group_to_map(&graph, g);
+        let pts_map = group_to_map(&pts, g);
         for gene in &gene_names {
             let (s_d, p_d) = d_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
-            let (s_g, p_g) = g_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
-            if s_d.is_finite() && s_g.is_finite() {
+            let (s_pts, p_pts) = pts_map.get(gene).copied().unwrap_or((f64::NAN, 1.0));
+            if s_d.is_finite() && s_pts.is_finite() {
                 assert!(
-                    (s_d - s_g).abs() < 1e-6,
-                    "ref-mode score mismatch group={} gene={}: direct={}, graph={}",
+                    (s_d - s_pts).abs() < 1e-6,
+                    "ref-mode score mismatch group={} gene={}: direct={}, per_thread={}",
                     direct.group_names[g],
                     gene,
                     s_d,
-                    s_g
+                    s_pts
                 );
             }
             assert!(
-                (p_d - p_g).abs() < 1e-9 || (p_d - p_g).abs() / p_d.abs().max(1e-12) < 1e-6,
-                "ref-mode pval mismatch group={} gene={}: direct={}, graph={}",
+                (p_d - p_pts).abs() < 1e-9 || (p_d - p_pts).abs() / p_d.abs().max(1e-12) < 1e-6,
+                "ref-mode pval mismatch group={} gene={}: direct={}, per_thread={}",
                 direct.group_names[g],
                 gene,
                 p_d,
-                p_g
+                p_pts
             );
         }
     }

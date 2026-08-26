@@ -10,8 +10,9 @@ Covered scenarios:
   (`qr_method="householder"`) (cosine ≥ 0.999)
 * `qr_method="cholesky"` on a deliberately ill-conditioned input raises
   `RuntimeError` wrapping the cuSOLVER non-SPD error
-* Lazy-path parity: backed SCX → normalize_total → log1p → pca(device="gpu")
-  agrees with scanpy reference (cosine ≥ 0.99)
+* Op-chain parity: SCX round-trip → normalize_total → log1p → pca(device="gpu")
+  agrees with scanpy reference (cosine ≥ 0.99). NOT a route gate — see the note
+  in that test; it asserts numbers, never which backend served them.
 """
 
 from __future__ import annotations
@@ -291,9 +292,22 @@ def test_gpu_cholesky_ill_conditioned_raises(monkeypatch):
 # --------------------------------------------------------------------- #
 
 @gpu_only
-def test_lazy_normalize_log1p_pca_matches_scanpy(tmp_path):
-    """normalize_total → log1p → pca(device="gpu") on a backed SCX file
-    agrees with scanpy's reference pipeline at cosine ≥ 0.99 on top PCs.
+def test_normalize_log1p_pca_matches_scanpy(tmp_path):
+    """normalize_total → log1p → pca(device="gpu") on an SCX round-trip agrees
+    with scanpy's reference pipeline at cosine ≥ 0.99 on the top PCs.
+
+    Renamed from `test_lazy_…`: the `lazy` in the old name is the claim this
+    docstring exists to retract.
+
+    ⚠️ Two things this does NOT do, both of which were once claimed of it:
+
+    * It is not a *backed* or *lazy* run. `to_anndata()` below leaves `backed`
+      at its default of False, so `X` is a materialized scipy CSR.
+    * It is not a *GPU-route* gate. Nothing here asserts
+      `uns["scx_accel"][op]["route"]`, and `gpu_only` proves only that CUDA is
+      visible — not that rapids-singlecell is installed. Without rapids, all
+      three ops take the `NoRapidsCpu` fallback and this passes having run the
+      SCX side entirely on the CPU.
     """
     import anndata
     import pyscx
@@ -311,12 +325,18 @@ def test_lazy_normalize_log1p_pca_matches_scanpy(tmp_path):
     sc.pp.log1p(a_ref)
     sc.pp.pca(a_ref, n_comps=30, random_state=0)
 
-    # SCX backed + GPU lazy pipeline.
+    # Round-trip through SCX, then run the GPU accel pipeline on the result.
+    # NOTE: `to_anndata()` below leaves `backed` at its default of False, so `X`
+    # is a materialized scipy CSR and this does NOT exercise the backed/lazy
+    # streaming route — an earlier version of this comment said "backed + lazy"
+    # and that wording was copied into docs/scanpy.md's tolerance table as a
+    # route claim it does not support.
     scx_path = str(tmp_path / "pipeline_test.scx")
     pyscx.from_anndata(adata_src.copy(), scx_path)
     a_gpu = pyscx.open(scx_path).to_anndata()
-    # normalize_total(device="gpu") eager-materializes; log1p then gets the
-    # fusion-marker path and re-runs fused over the backed source.
+    # `X` here is an in-memory scipy CSR (see the docstring), so these are the
+    # in-memory routers: rapids-singlecell when it is installed, the NoRapidsCpu
+    # fallback when it is not.
     pyscx.accel.normalize_total(a_gpu, target_sum=1e4, device="gpu")
     pyscx.accel.log1p(a_gpu, device="gpu")
     pyscx.accel.pca(a_gpu, n_comps=30, device="gpu", random_state=0)

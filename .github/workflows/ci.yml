@@ -1386,6 +1386,163 @@ jobs:
               raise SystemExit(1)
           PYEOF
 
+      # ORG-8.20-5: the GPU parity gates say what they actually check.
+      # Three claims went into this guard, each of which had gone quietly false:
+      # the HVG parity test compared the shared column-moments finalize against
+      # two private re-derivations of the same cancellation-prone expression;
+      # five DE tests were named after CUDA-graph capture, which DE does not do;
+      # and a placeholder PTX reached the first kernel launch instead of being
+      # refused at load.
+      - name: The GPU parity gates check what their names claim
+        run: |
+          set -euo pipefail
+          hvg=scx-gpu/src/gpu_hvg.rs
+          dev=scx-gpu/src/device.rs
+          build=scx-gpu/build.rs
+          de=scx-accel/src/diffexp
+          csc=scx-accel/src/csc
+          # Assert the inputs exist before asserting anything about them: a
+          # guard keyed on a path that has moved passes vacuously.
+          for f in "$hvg" "$dev" "$build"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-5)."; exit 1; }
+          done
+          for d in "$de" "$csc"; do
+            test -d "$d" || { echo "::error::$d is missing — this guard's paths moved; retarget it (ORG-8.20-5). Asserting BOTH matters: the capture search below spans them, and a `grep` over a missing directory exits non-zero, so an unasserted path silently shrinks the scope instead of failing (found in review by codex)."; exit 1; }
+          done
+
+          # Positive half 1: the HVG oracle is independent of the code it checks.
+          # Anchored on the `(`: without it a rename to `exact_momentsX` still
+          # prefix-matches and this half passes on a tree that deleted the
+          # oracle. Measured — it did.
+          for sym in 'exact_moments' 'integer_moments_csr' 'integer_moments_dense'; do
+            grep -qE "^ *fn $sym\\(" "$hvg" || {
+              echo "::error::$hvg no longer declares \`fn $sym\` — the GPU HVG parity tests are back to checking scx_sparse::finalize_column_moments against a copy of itself, which passes when both are equally wrong (review §8.17, ORG-8.20-5)."
+              exit 1
+            }
+          done
+          # Positive half 2: the cancellation case, and the premise that keeps
+          # its fixture honest, both still exist. The review's own example does
+          # NOT cancel (a sparse spike has a tiny mean, so n·mean² never
+          # approaches Σx²), so without the premise test a fixture can drift
+          # into a shape that proves nothing and stays green.
+          for t in 'the_closed_form_reports_cancellation_on_a_dense_near_constant_column' \
+                   'a_sparse_spike_column_does_not_cancel' \
+                   'the_exact_oracle_and_the_closed_form_agree_to_one_ulp' \
+                   'test_gpu_streaming_mean_var_matches_exact' \
+                   'test_gpu_streaming_mean_var_csc_matches_exact' \
+                   'test_gpu_streaming_mean_var_detects_an_f32_accumulator'; do
+            grep -qE "^ *fn $t\\(\\)" "$hvg" || {
+              echo "::error::$hvg no longer defines \`fn $t\` (ORG-8.20-5). Three of these six run on CPU and are what make the GPU tolerance a measured number rather than a guess; the other three ARE the GPU arms that bar applies to. Deleting any of them re-opens the gate."
+              exit 1
+            }
+          done
+
+          # Positive half 3: and each GPU arm actually goes THROUGH the oracle.
+          # Naming the tests is not enough on its own -- a body rewired back to
+          # `finalize_column_moments` keeps the name, keeps the helpers alive
+          # (the three CPU meta-tests above call them), and satisfies every
+          # other check here. Measured while writing this guard: deleting BOTH
+          # GPU tests outright left the whole step green, which is the exact
+          # vacuous-gate failure ORG-8.20-5 exists to close, reproduced inside
+          # the guard meant to close it. Found in review by codex and Cursor
+          # Agent, independently.
+          #
+          # `awk` rather than `grep -A`: a fixed context window silently stops
+          # covering a body the moment someone adds a line to it.
+          for t in 'test_gpu_streaming_mean_var_matches_exact' \
+                   'test_gpu_streaming_mean_var_csc_matches_exact' \
+                   'test_gpu_streaming_mean_var_detects_an_f32_accumulator'; do
+            # Comment lines are stripped before matching: `case` is a substring
+            # test, so a body that merely SAYS `// exact_moments(` in an
+            # explanatory comment satisfied it while calling the shared finalize.
+            # Found in review by codex.
+            body=$(awk -v fn="    fn $t()" '
+              index($0, fn) == 1 {inside=1}
+              inside && $0 !~ /^[[:space:]]*\/\// {print}
+              inside && /^    \}$/ {exit}' "$hvg")
+            test -n "$body" || { echo "::error::could not extract the body of \`fn $t\` from $hvg — this guard cannot verify it uses the oracle; retarget it rather than deleting it (ORG-8.20-5)."; exit 1; }
+            for call in 'exact_moments(' 'assert_matches_exact('; do
+              case "$body" in
+                *"$call"*) ;;
+                *) echo "::error::\`fn $t\` no longer calls \`$call\` — it has been rewired off the independent oracle and back onto the code it is supposed to check, which is how this test passed while being worthless before (review §8.17, ORG-8.20-5)."; exit 1 ;;
+              esac
+            done
+          done
+
+          # Negative half 1: nothing in scx-gpu re-derives the closed-form
+          # variance, INCLUDING its test modules. ORG-7.21-1 exempts `*_tests.rs`
+          # because a test re-implementing a formula to check a kernel is
+          # normally the point — but gpu_hvg.rs's tests live in an inline `mod
+          # tests`, so they were never covered by that exemption OR by that
+          # guard's pattern, which binds the mean to the literal name `mean`.
+          # Both deleted copies bound it to `m` and to `*mean`. This pattern was
+          # measured against both: it matches them and matches nothing on a
+          # clean tree.
+          if grep -rEn --include='*.rs' -e '-[[:space:]]*[a-z_0-9]+[[:space:]]*\*[[:space:]]*\*?[a-z_0-9]+[[:space:]]*\*[[:space:]]*\*?[a-z_0-9]+' scx-gpu/src \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::the scx-gpu site(s) above re-derive a closed-form variance. Production must call scx_sparse::finalize_column_moments; a TEST must use gpu_hvg.rs's exact-integer oracle, because a reference that re-implements the code under test cannot falsify it (review §8.17, ORG-8.20-5)."
+            exit 1
+          fi
+          # Positive counterpart: the primitive is still actually called, so the
+          # negative half above cannot pass on a tree where HVG stopped
+          # computing moments at all.
+          # PRODUCTION call sites only — everything above `#[cfg(test)]`. The
+          # three calls inside `mod tests` are the CPU tests that justify the
+          # bar, and counting them satisfied an "at least 2" threshold on a tree
+          # where BOTH production reduces had stopped calling the primitive.
+          # Measured: that is how this check first passed a deliberate break.
+          cut=$(grep -nE '^#\[cfg\(test\)\]' "$hvg" | head -1 | cut -d: -f1)
+          test -n "$cut" || { echo "::error::$hvg has no #[cfg(test)] marker — this guard cannot separate production call sites from test ones; retarget it (ORG-8.20-5)."; exit 1; }
+          n=$(head -n "$((cut - 1))" "$hvg" | grep -cE 'finalize_column_moments\(' || true)
+          if [ "${n:-0}" -lt 2 ]; then
+            echo "::error::$hvg has $n PRODUCTION finalize_column_moments call sites, expected at least 2 (the CSR and CSC reduces). A kernel that stopped calling it has its own finalize again (ORG-8.20-5)."
+            exit 1
+          fi
+
+          # Negative half 2: DE still captures no CUDA graph. Five tests were
+          # renamed on that premise (they toggle a switch that selects a stream,
+          # not a graph, so both arms ran identical kernels). If capture comes
+          # back, the graph-parity claim has to be restored deliberately rather
+          # than inherited from a stale name.
+          # A CALL, not a mention: this guard's own rationale is written into
+          # gpu_tests.rs's docstrings, which say the words `capture_graph`.
+          # A bare substring grep matched those and failed on a correct tree.
+          # Scoped to $de AND csc/ -- the same scope as the test-name half
+          # below. codex flagged the asymmetry; its example (a capture on the
+          # CSC/v3 DE path) does not hold, because both CSC v3 drivers live in
+          # diffexp/gpu.rs (:1325, :2160) and csc/ holds no DE driver at all.
+          # The asymmetry itself is real though: two of the five renamed tests
+          # live under csc/, so a capture introduced beside them would leave
+          # this half green while their names went stale. Matching the scopes
+          # costs nothing.
+          if grep -rEn --include='*.rs' 'capture_graph\(' "$de" "$csc" \
+               | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$de or scx-accel/src/csc now calls capture_graph. The *_per_thread_stream_vs_default_parity tests were renamed because DE captured nothing — give them a real graph-vs-direct arm again, and update this guard in the same commit (review §8.17, ORG-8.20-5)."
+            exit 1
+          fi
+          # Negative half 3: and no test name claims capture either. Scoped to
+          # the DE modules — harmony/tests.rs's graph_vs_direct test is accurate,
+          # since Harmony is the one production capture site.
+          if grep -rEn --include='*.rs' 'fn +test_[a-z_0-9]*graph_(vs_direct|capture)' "$de" "$csc"; then
+            echo "::error::the test(s) above are named for CUDA-graph capture, which the DE path does not do (see negative half 2). Name them for the thing they compare — the per-thread stream against the default stream (ORG-8.20-5)."
+            exit 1
+          fi
+
+          # Negative half 4: a placeholder PTX cannot reach a kernel launch.
+          # The marker is declared in two files that cannot import each other,
+          # so both halves are checked here as well as by device.rs's own unit
+          # test — two spellings of one sentinel is how this check would
+          # silently stop firing.
+          grep -qE '^pub const PTX_STUB_MARKER *:' "$dev" || { echo "::error::$dev no longer declares PTX_STUB_MARKER — a build with comment-only PTX would again fail at the first kernel launch with an opaque CUDA_ERROR_INVALID_IMAGE instead of at load (review §8.15, ORG-8.20-5)."; exit 1; }
+          grep -qE 'reject_ptx_stub\(ptx_src\)' "$dev" || { echo "::error::$dev's load_module_cached no longer calls reject_ptx_stub — the sentinel is declared but unread, which is worse than absent because it reads as covered (ORG-8.20-5)."; exit 1; }
+          grep -q 'SCX_PTX_IS_STUB' "$build" || { echo "::error::$build no longer writes the SCX_PTX_IS_STUB sentinel — the load-time check can never fire (ORG-8.20-5)."; exit 1; }
+          harness=benchmarks/scripts/_run_scx_gpu_tests.sh
+          test -f "$harness" || { echo "::error::$harness is missing — retarget this guard (ORG-8.20-5)."; exit 1; }
+          grep -qE '^export SCX_GPU_REQUIRE_NVCC=1' "$harness" || {
+            echo "::error::$harness no longer requires nvcc. It is the only job where the GPU suites execute, so it is the last place that should run against stub PTX — without it the build succeeds and 200+ tests fail at their first kernel launch, which reads as broken kernels rather than a broken build (review §8.15, ORG-8.20-5)."
+            exit 1
+          }
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
