@@ -48,6 +48,15 @@ fn main() {
     // in any job that intends to *run* GPU kernels; the stub branch stays the
     // default so a CPU-only `cargo check` still works.
     println!("cargo:rerun-if-env-changed=SCX_GPU_REQUIRE_NVCC");
+    // Whether `nvcc` resolves depends on PATH and CUDA_HOME, and neither is in
+    // this script's fingerprint by default — which is the *mechanism* behind
+    // the trap above, not merely an aggravator. Declaring them means moving
+    // from a CPU node to a GPU node re-runs this script instead of replaying
+    // the stub branch from cache. PATH changes more often than the toolchain
+    // does, so this costs the occasional needless kernel rebuild; that is a
+    // better trade than a wheel full of 41-byte PTX.
+    println!("cargo:rerun-if-env-changed=PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
     let require_nvcc = std::env::var("SCX_GPU_REQUIRE_NVCC").is_ok_and(|v| v != "0");
 
     // Check if nvcc is available
@@ -75,8 +84,18 @@ fn main() {
         for cu_file in &cu_files {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap();
             let ptx_path = out_path.join(format!("{stem}.ptx"));
-            std::fs::write(&ptx_path, "// nvcc not available — empty PTX stub\n")
-                .expect("failed to write PTX stub");
+            // The first line is a sentinel `GpuDevice::load_module_cached`
+            // checks, so a stub is refused at load with an actionable message
+            // instead of surfacing four steps later as an opaque
+            // `CUDA_ERROR_INVALID_IMAGE` from whichever kernel ran first.
+            // Keep it byte-identical to `scx_gpu::device::PTX_STUB_MARKER`;
+            // `device.rs`'s `the_stub_marker_matches_the_one_build_rs_writes`
+            // reads this file and asserts they agree.
+            std::fs::write(
+                &ptx_path,
+                "// SCX_PTX_IS_STUB — nvcc not available at build time\n",
+            )
+            .expect("failed to write PTX stub");
         }
     } else {
         // Compile each .cu file to PTX
