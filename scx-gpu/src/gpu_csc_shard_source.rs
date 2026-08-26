@@ -13,8 +13,9 @@
 //!
 //! [`RawGpuCscShardSource`] mirrors [`crate::gpu_shard_source::RawGpuShardSource`]'s
 //! G3-shaped pipelining: a 2-slot pinned host ring, a dedicated copy
-//! stream, a scoped worker thread that pre-decodes the next shard, and
-//! event-driven handshake between the copy and compute streams. The
+//! stream, a bounded rayon decode-prefetch (`scx_format_io::prefetch`,
+//! depth 4 by default and derated by `SCX_GPU_STAGING_MEMORY_BUDGET`), and
+//! an event-driven handshake between the copy and compute streams. The
 //! synchronous baseline from G4.3 has been replaced because it
 //! serialised decode + H→D + compute and regressed wall time at
 //! scale (smartseq2 / tabula) where it dominates the per-shard
@@ -161,8 +162,11 @@ pub trait GpuCscShardSource {
 ///   device-side handshake (compute waits on copy; next copy waits on
 ///   compute reads of the prior shard's device buffers).
 ///
-/// The decode loop runs on a scoped worker thread that pre-decodes the
-/// next shard while the main thread processes the current one.
+/// The decode loop is `scx_format_io::prefetch`'s bounded rayon pipeline —
+/// depth 4 by default, derated to fit `SCX_GPU_STAGING_MEMORY_BUDGET` — and
+/// not the single scoped worker thread this said before ORG-8.20-1 PR B. The
+/// difference is the live decoded-shard set, and so the host RSS, which is a
+/// blast-radius item rather than a detail.
 ///
 /// CSC kernels in this pipeline (`csc_shard_pseudobulk_kernel`,
 /// `csc_shard_to_gene_major_kernel`) are custom — no cuSPARSE descriptor

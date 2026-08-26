@@ -98,6 +98,27 @@ pub trait ShardSource {
 
     /// Read and decode shard `shard_idx`.
     ///
+    /// # Stability contract
+    ///
+    /// For the lifetime of a given shared borrow, repeated calls with the same
+    /// `shard_idx` must yield **structurally equivalent** shards: the same
+    /// index ordering, the same finiteness, the same minor-axis bounds. Values
+    /// may differ — a source that recomputes or re-decodes is fine — but a
+    /// source must not return a sorted, finite shard on one call and an
+    /// unsorted or NaN-bearing one on the next.
+    ///
+    /// This is load-bearing, not advisory. `scx-gpu`'s staging adapters memoise
+    /// host-side validation per shard index for the adapter's lifetime, so a
+    /// shard that passes once is not re-scanned; a source that violated this
+    /// could feed a later drive straight past checks whose absence the kernels
+    /// cannot survive (a NaN into a radix sort, an out-of-range row into an
+    /// indexed device read). Raised by codex - gpt-5.6-sol, who observed that a
+    /// shared borrow alone does not imply repeatable output.
+    ///
+    /// Every in-tree implementation satisfies this: the backed and lazy readers
+    /// decode deterministically from an immutable file mapping. A source that
+    /// cannot must not be handed to the GPU staging adapters.
+    ///
     /// Implementations may apply transforms (e.g., NormalizeTotal, Log1p)
     /// and/or deletion vector filtering before returning.
     fn read_shard(&self, shard_idx: usize) -> Result<ScxCsr>;

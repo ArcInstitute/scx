@@ -296,8 +296,17 @@ pub struct RawGpuShardSource<'a> {
     /// New on this layout: the CSC adapter has had it since §8.3, but the CSR
     /// one re-ran both O(nnz) scans on every drive — and GPU DE drives a CSR
     /// source once per gene chunk. Sound for the same reason it is sound there:
-    /// `source` is a shared borrow held for the adapter's whole lifetime, so
-    /// the bytes behind a given shard index cannot change underneath it.
+    /// `source` is a shared borrow held for the adapter's whole lifetime, and
+    /// `ShardSource::read_shard`'s stability contract requires structurally
+    /// equivalent output for a given index across calls.
+    ///
+    /// The borrow alone would **not** be enough — a `&self` method may return
+    /// whatever it likes, and this crate's own `GenerationalCsrSource` test
+    /// fixture returns different values on every call. What makes the memo
+    /// sound is the documented contract on the trait, which that fixture
+    /// honours: it varies values only, never index order, bounds or
+    /// finiteness. Raised by codex - gpt-5.6-sol, who noted that a shared
+    /// borrow does not imply repeatable output.
     memo: ValidationMemo,
 }
 
@@ -868,7 +877,7 @@ mod tests {
     /// Driving one adapter repeatedly stages each drive's own bytes.
     ///
     /// The hardware half of §8.18, and the row-major twin of
-    /// `driving_a_single_shard_csc_source_twice_stages_own_bytes`. Both layouts
+    /// `driving_a_single_shard_csc_source_repeatedly_stages_own_bytes`. Both layouts
     /// used to special-case a single-shard drive: no ring, no copy stream, and
     /// **no event recorded**, on the stated grounds that "there is no successor
     /// `stage()` that could race the in-flight DMA". True within one drive.
