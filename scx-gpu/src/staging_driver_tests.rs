@@ -103,6 +103,8 @@ struct RecordingStager {
     fail_validate_at: Option<usize>,
     /// Shard index whose dispatch fails.
     fail_dispatch_at: Option<usize>,
+    /// If set, `drain` fails once with this message.
+    drain_error: Option<String>,
 }
 
 impl RecordingStager {
@@ -114,6 +116,7 @@ impl RecordingStager {
             slot_events: [None; RING],
             fail_validate_at: None,
             fail_dispatch_at: None,
+            drain_error: None,
         }
     }
 
@@ -207,7 +210,14 @@ impl ShardStager for RecordingStager {
             *e = None;
         }
         self.push(Op::Drain { awaited });
-        Ok(())
+        // Configurable so the error-precedence policy can be tested in both
+        // directions. With drain always returning `Ok`, a mutation that gave
+        // `drain_result` priority over `feed_result` still passed every test
+        // (codex - gpt-5.6-sol).
+        match self.drain_error.take() {
+            Some(msg) => Err(GpuError::CudaError(msg)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -596,4 +606,47 @@ fn an_empty_plan_touches_nothing() {
     drive_shards(&feeder, &mut stager, &plan_selected(&[], 4)).unwrap();
     assert!(stager.ops().is_empty(), "an empty plan must not even drain");
     assert!(feeder.reads.borrow().is_empty());
+}
+
+/// Drain's error surfaces when the feed succeeded, and does **not** displace a
+/// feed error when both fail.
+///
+/// `drive_shards` states the policy as `feed_result.and(drain_result)`, and
+/// `drain_runs_on_every_error_path_and_does_not_mask_the_error` was written to
+/// pin it — but that test's fake always drained `Ok`, so it only ever proved
+/// "drain runs after a feed failure". A mutation giving `drain_result` priority
+/// passed it (codex - gpt-5.6-sol). Both halves are asserted here.
+#[test]
+fn drain_error_surfaces_alone_but_never_displaces_a_feed_error() {
+    // Feed succeeds, drain fails -> the drain error is returned.
+    let feeder = RecordingFeeder::all_stageable(3);
+    let mut stager = RecordingStager::new(3);
+    stager.drain_error = Some("drain blew up".to_string());
+    let err = drive_shards(&feeder, &mut stager, &plan_all(3, 3)).unwrap_err();
+    assert!(
+        format!("{err}").contains("drain blew up"),
+        "a drain failure on a clean feed must be surfaced, got: {err}"
+    );
+
+    // Feed fails AND drain fails -> the FEED error wins; the drain error must
+    // not mask the original diagnosis.
+    let feeder = RecordingFeeder::all_stageable(3);
+    let mut stager = RecordingStager::new(3);
+    stager.fail_validate_at = Some(1);
+    stager.drain_error = Some("drain blew up".to_string());
+    let err = drive_shards(&feeder, &mut stager, &plan_all(3, 3)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        !msg.contains("drain blew up"),
+        "the drain error masked the feed error, got: {msg}"
+    );
+    // ...and drain still ran, which is the other half of the policy.
+    assert!(
+        stager
+            .ops
+            .borrow()
+            .iter()
+            .any(|o| matches!(o, Op::Drain { .. })),
+        "drain must run even when the feed failed"
+    );
 }

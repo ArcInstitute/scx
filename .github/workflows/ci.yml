@@ -1608,7 +1608,15 @@ jobs:
           # ORG-8.20-5's `:[0-9]+:` spelling (written for `grep -rn` over a
           # directory) matches nothing here and strips no comments. Caught by
           # running this step against a clean tree, where it failed.
-          if grep -nE 'cudarc|CudaStream|CudaEvent|CudaSlice|alloc_zeros|record_event|synchronize\(' "$drv" \
+          # The denylist must cover how a device call is actually SPELLED here,
+          # not just the cudarc type names. The first version matched only
+          # `cudarc|CudaStream|CudaEvent|CudaSlice|alloc_zeros|record_event|
+          # synchronize(`, and codex - gpt-5.6-sol showed five spellings already
+          # used elsewhere in this crate that slipped through: `GpuDevice`,
+          # `GpuDevice::new(0)`, `dev.stream()`, `stream.memcpy_htod(...)` and
+          # `stream.launch(...)`. A real device acquisition, stream op, copy or
+          # kernel launch could land in the policy module with this step green.
+          if grep -nE 'cudarc|CudaStream|CudaEvent|CudaSlice|GpuDevice|alloc_zeros|record_event|synchronize\(|\.stream\(\)|memcpy_[dh]to[dh]|\.launch\(' "$drv" \
                | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
             echo "::error::$drv touches CUDA at the line(s) above. The driver holds ordering policy only — every device interaction belongs behind a ShardStager method, or this stops being testable without a GPU (ORG-8.20-1)."
             exit 1
