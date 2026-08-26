@@ -940,6 +940,69 @@ mod tests {
         );
     }
 
+    /// A fixture whose column sums clear 2²⁴, so a kernel that switched its
+    /// accumulator from f64 back to f32 is detectable.
+    ///
+    /// The other integer fixtures here cannot see that regression, and it is
+    /// worth being explicit about why: their values are `1..=20` over 400–500
+    /// rows, so a column sum is ~500 and every partial sum is exact in **f32**
+    /// as well as f64. Both accumulators would agree to the last bit and the
+    /// test would pass. Raised in review by Cursor Agent as a residual risk.
+    ///
+    /// The magnitudes are measured, not chosen. Four properties have to hold at
+    /// once, and most obvious fixtures fail one of them:
+    ///
+    /// - values f32-exact (integers ≤ 2²⁴), since `ScxCsr::data` is `f32`;
+    /// - column sum **above** 2²⁴ ≈ 1.68e7, or an f32 accumulator stays exact
+    ///   and this test proves nothing. Two candidate fixtures with wider value
+    ///   ranges were rejected for exactly this — their sums came to 1.4e7 and
+    ///   an f32 accumulator reproduced them with zero error;
+    /// - value **spread** wide enough that the closed form stays
+    ///   well-conditioned. A near-constant column at this magnitude gets
+    ///   flagged `unstable` instead, which is a different test (see
+    ///   `the_closed_form_reports_cancellation_on_a_dense_near_constant_column`);
+    /// - `n·Σx²` and `(Σx)²` under 2⁵³, or [`exact_moments`] refuses the
+    ///   fixture rather than silently rounding.
+    ///
+    /// 400 dense rows of `60_000..=70_000` satisfies all four: measured f32
+    /// accumulation error 2.7e-07 — eight orders above this test's `1e-15` bar
+    /// — at `residual/Σx² = 1.9e-3`, comfortably clear of the 1e-7
+    /// cancellation threshold.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_gpu_streaming_mean_var_detects_an_f32_accumulator() {
+        let dev = require_gpu!();
+        let (n_rows, n_cols) = (400usize, 16usize);
+        let mut rng = StdRng::seed_from_u64(7);
+        let dense: Vec<Vec<f64>> = (0..n_rows)
+            .map(|_| {
+                (0..n_cols)
+                    .map(|_| rng.gen_range(60_000..=70_000) as f64)
+                    .collect()
+            })
+            .collect();
+        let csr = dense_to_csr(&dense, n_cols);
+
+        // Premise: the sums really do clear the f32 exact-integer boundary. A
+        // fixture that drifts below it passes while testing nothing.
+        let (s, sq) = integer_moments_dense(&dense, n_cols);
+        assert!(
+            s.iter().all(|&v| v > (1i128 << 24)),
+            "every column sum must exceed 2^24 for an f32 accumulator to lose; \
+             got min {:?}",
+            s.iter().min()
+        );
+
+        let source = InMemorySource {
+            shards: split_into_shards(&csr, 4),
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+        let (gm, gv) = gpu_streaming_mean_var(&dev, &source).expect("gpu streaming mean/var");
+        let (want_means, want_vars) = exact_moments(&s, &sq, n_rows);
+        assert_matches_exact(&gm, &gv, &want_means, &want_vars, "f32-accumulator probe");
+    }
+
     /// The GPU CSR mean/variance arm against the exact-integer oracle.
     ///
     /// Bars are `abs = 0` on means and `rel < 1e-15` on variances, not the

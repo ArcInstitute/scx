@@ -1386,22 +1386,6 @@ jobs:
               raise SystemExit(1)
           PYEOF
 
-      # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
-      # call. `export_obs_keep_mask` / `export_min_counts` live on
-      # `ExportOptions` and nowhere else. The runtime helper that used to police
-      # this -- `reject_export_row_filter_on_import`, called at the top of all
-      # five ingest entry points purely to turn a nonsensical combination into
-      # an error string -- is deleted, because the type now expresses the
-      # distinction.
-      #
-      # The convention the grep keys on: an export-only option is named
-      # `export_*`. Declaring one on `IngestOptions` re-creates the whole "flag
-      # silently ignored on the wrong direction" class (review 1.1, 11.12).
-      #
-      # This step used to name `scx-convert/src/pipeline.rs` and `sed` the struct
-      # out of it. ORG-11.16-6 moved `IngestOptions` to `options.rs` (beside
-      # `ExportOptions`) and turned `pipeline.rs` into `pipeline/mod.rs`, and
-      # EITHER change silently disarmed the guard: `sed` on a file that no longer
       # ORG-8.20-5: the GPU parity gates say what they actually check.
       # Three claims went into this guard, each of which had gone quietly false:
       # the HVG parity test compared the shared column-moments finalize against
@@ -1440,11 +1424,42 @@ jobs:
           # into a shape that proves nothing and stays green.
           for t in 'the_closed_form_reports_cancellation_on_a_dense_near_constant_column' \
                    'a_sparse_spike_column_does_not_cancel' \
-                   'the_exact_oracle_and_the_closed_form_agree_to_one_ulp'; do
+                   'the_exact_oracle_and_the_closed_form_agree_to_one_ulp' \
+                   'test_gpu_streaming_mean_var_matches_exact' \
+                   'test_gpu_streaming_mean_var_csc_matches_exact' \
+                   'test_gpu_streaming_mean_var_detects_an_f32_accumulator'; do
             grep -qE "^ *fn $t\\(\\)" "$hvg" || {
-              echo "::error::$hvg no longer defines \`fn $t\` (ORG-8.20-5). These three run on CPU and are what make the GPU tolerance a measured number rather than a guess; do not delete one without the others."
+              echo "::error::$hvg no longer defines \`fn $t\` (ORG-8.20-5). Three of these five run on CPU and are what make the GPU tolerance a measured number rather than a guess; the other two ARE the GPU arms that bar applies to. Deleting any of them re-opens the gate."
               exit 1
             }
+          done
+
+          # Positive half 3: and each GPU arm actually goes THROUGH the oracle.
+          # Naming the tests is not enough on its own -- a body rewired back to
+          # `finalize_column_moments` keeps the name, keeps the helpers alive
+          # (the three CPU meta-tests above call them), and satisfies every
+          # other check here. Measured while writing this guard: deleting BOTH
+          # GPU tests outright left the whole step green, which is the exact
+          # vacuous-gate failure ORG-8.20-5 exists to close, reproduced inside
+          # the guard meant to close it. Found in review by codex and Cursor
+          # Agent, independently.
+          #
+          # `awk` rather than `grep -A`: a fixed context window silently stops
+          # covering a body the moment someone adds a line to it.
+          for t in 'test_gpu_streaming_mean_var_matches_exact' \
+                   'test_gpu_streaming_mean_var_csc_matches_exact' \
+                   'test_gpu_streaming_mean_var_detects_an_f32_accumulator'; do
+            body=$(awk -v fn="    fn $t()" '
+              index($0, fn) == 1 {inside=1}
+              inside {print}
+              inside && /^    \}$/ {exit}' "$hvg")
+            test -n "$body" || { echo "::error::could not extract the body of \`fn $t\` from $hvg — this guard cannot verify it uses the oracle; retarget it rather than deleting it (ORG-8.20-5)."; exit 1; }
+            for call in 'exact_moments(' 'assert_matches_exact('; do
+              case "$body" in
+                *"$call"*) ;;
+                *) echo "::error::\`fn $t\` no longer calls \`$call\` — it has been rewired off the independent oracle and back onto the code it is supposed to check, which is how this test passed while being worthless before (review §8.17, ORG-8.20-5)."; exit 1 ;;
+              esac
+            done
           done
 
           # Negative half 1: nothing in scx-gpu re-derives the closed-form
@@ -1485,9 +1500,17 @@ jobs:
           # A CALL, not a mention: this guard's own rationale is written into
           # gpu_tests.rs's docstrings, which say the words `capture_graph`.
           # A bare substring grep matched those and failed on a correct tree.
-          if grep -rEn --include='*.rs' 'capture_graph\(' "$de" \
+          # Scoped to $de AND csc/ -- the same scope as the test-name half
+          # below. codex flagged the asymmetry; its example (a capture on the
+          # CSC/v3 DE path) does not hold, because both CSC v3 drivers live in
+          # diffexp/gpu.rs (:1325, :2160) and csc/ holds no DE driver at all.
+          # The asymmetry itself is real though: two of the five renamed tests
+          # live under csc/, so a capture introduced beside them would leave
+          # this half green while their names went stale. Matching the scopes
+          # costs nothing.
+          if grep -rEn --include='*.rs' 'capture_graph\(' "$de" scx-accel/src/csc \
                | grep -vE ':[0-9]+:[[:space:]]*(//|///|//!)'; then
-            echo "::error::$de now calls capture_graph. The *_per_thread_stream_vs_default_parity tests were renamed because DE captured nothing — give them a real graph-vs-direct arm again, and update this guard in the same commit (review §8.17, ORG-8.20-5)."
+            echo "::error::$de or scx-accel/src/csc now calls capture_graph. The *_per_thread_stream_vs_default_parity tests were renamed because DE captured nothing — give them a real graph-vs-direct arm again, and update this guard in the same commit (review §8.17, ORG-8.20-5)."
             exit 1
           fi
           # Negative half 3: and no test name claims capture either. Scoped to
@@ -1513,6 +1536,22 @@ jobs:
             exit 1
           }
 
+      # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
+      # call. `export_obs_keep_mask` / `export_min_counts` live on
+      # `ExportOptions` and nowhere else. The runtime helper that used to police
+      # this -- `reject_export_row_filter_on_import`, called at the top of all
+      # five ingest entry points purely to turn a nonsensical combination into
+      # an error string -- is deleted, because the type now expresses the
+      # distinction.
+      #
+      # The convention the grep keys on: an export-only option is named
+      # `export_*`. Declaring one on `IngestOptions` re-creates the whole "flag
+      # silently ignored on the wrong direction" class (review 1.1, 11.12).
+      #
+      # This step used to name `scx-convert/src/pipeline.rs` and `sed` the struct
+      # out of it. ORG-11.16-6 moved `IngestOptions` to `options.rs` (beside
+      # `ExportOptions`) and turned `pipeline.rs` into `pipeline/mod.rs`, and
+      # EITHER change silently disarmed the guard: `sed` on a file that no longer
       # holds the struct emits nothing, `grep` on empty input exits 1, and the
       # `if` is therefore false. Green. Measured on the 6e branch with a real
       # `pub export_bogus` field added to `IngestOptions`: the old guard passed.

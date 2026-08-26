@@ -601,7 +601,7 @@ mod tests {
         )
         .expect("CPU streaming pdex_ref failed");
 
-        // Force graph capture ON (deterministic) so the captured CSR-direct v3
+        // Force the per-thread stream ON (deterministic) so the CSR-direct v3
         // sequence runs over the backed multi-shard reader.
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
@@ -621,8 +621,8 @@ mod tests {
             None,
         );
         scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
-        let gpu_res =
-            gpu_res.expect("GPU v1 backed multi-chunk pdex_ref under graph capture failed");
+        let gpu_res = gpu_res
+            .expect("GPU v3 CSR backed multi-chunk pdex_ref on the per-thread stream failed");
 
         assert_eq!(cpu_res.group_names, gpu_res.group_names);
         assert_eq!(cpu_res.feature_names, gpu_res.feature_names);
@@ -634,7 +634,7 @@ mod tests {
                 if u_cpu.is_finite() && u_gpu.is_finite() {
                     assert!(
                         (u_cpu - u_gpu).abs() < 1e-3,
-                        "U mismatch (v1 graph) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
+                        "U mismatch (v3 csr, per-thread stream) tg={tg} gene={var}: cpu={u_cpu}, gpu={u_gpu}"
                     );
                 }
                 let p_cpu = cpu_res.p_values[tg][var];
@@ -642,7 +642,7 @@ mod tests {
                 let pdiff = (p_cpu - p_gpu).abs();
                 assert!(
                     pdiff < 1e-6 || pdiff / p_cpu.abs().max(1e-30) < 1e-3,
-                    "p mismatch (v1 graph) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
+                    "p mismatch (v3 csr, per-thread stream) tg={tg} gene={var}: cpu={p_cpu}, gpu={p_gpu}"
                 );
             }
         }
@@ -707,7 +707,7 @@ mod tests {
         )
         .expect("CPU streaming wilcoxon failed");
 
-        // Force graph capture ON over the backed multi-shard reader (Wilcoxon
+        // Force the per-thread stream ON over the backed multi-shard reader (Wilcoxon
         // is always the v1 dense-chunk driver — no v2/v3/CSC override needed).
         let prev_graphs = scx_gpu::set_cuda_graphs_enabled_override(Some(true));
         let csr_reader_gpu = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);
@@ -727,8 +727,8 @@ mod tests {
             tie_correct,
         );
         scx_gpu::set_cuda_graphs_enabled_override(prev_graphs);
-        let gpu_res =
-            gpu_res.expect("GPU v1 backed multi-chunk wilcoxon under graph capture failed");
+        let gpu_res = gpu_res
+            .expect("GPU v3 CSR backed multi-chunk wilcoxon on the per-thread stream failed");
 
         assert_eq!(cpu_res.group_names, gpu_res.group_names);
 
@@ -751,14 +751,14 @@ mod tests {
                 if s_c.is_finite() && s_g.is_finite() {
                     assert!(
                         (s_c - s_g).abs() < 1e-3,
-                        "score mismatch (v1 graph) group={} gene={gene}: cpu={s_c}, gpu={s_g}",
+                        "score mismatch (v3 csr, per-thread stream) group={} gene={gene}: cpu={s_c}, gpu={s_g}",
                         cpu_res.group_names[g]
                     );
                 }
                 let pdiff = (p_c - p_g).abs();
                 assert!(
                     pdiff < 1e-6 || pdiff / p_c.abs().max(1e-30) < 1e-3,
-                    "p mismatch (v1 graph) group={} gene={gene}: cpu={p_c}, gpu={p_g}",
+                    "p mismatch (v3 csr, per-thread stream) group={} gene={gene}: cpu={p_c}, gpu={p_g}",
                     cpu_res.group_names[g]
                 );
             }
