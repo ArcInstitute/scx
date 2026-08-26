@@ -49,6 +49,23 @@ impl ShardSizeHint {
     }
 }
 
+/// Whether a shard spanning `[shard_start, shard_end)` intersects `range`.
+///
+/// **Half-open on both ends**: a shard ending exactly at `range.start` does not
+/// overlap, and one starting exactly at `range.end` does not either.
+///
+/// A free function because this one boundary condition had four hand-written
+/// copies — `FullCatalog::csc_shards_for_col_range`,
+/// `BackedCscIndex::shards_for_col_range`, an inline loop in `scx-gpu`'s CSC
+/// staging path, and `GpuCscShardSource`'s post-decode filter — which is three
+/// more places for an off-by-one to live than the rule deserves. The binary
+/// search in `BackedCscIndex` necessarily states it differently; an exhaustive
+/// differential test pins it to this.
+#[inline]
+pub fn col_range_overlaps(shard_start: u32, shard_end: u32, range: &Range<u32>) -> bool {
+    shard_end > range.start && shard_start < range.end
+}
+
 /// A source of CSR shards for streaming computation.
 ///
 /// Implementations provide sequential shard access for algorithms like
@@ -315,7 +332,7 @@ pub trait ColumnShardSource {
         (0..self.n_csc_shards())
             .filter(|&i| {
                 self.csc_shard_col_range(i)
-                    .is_some_and(|(s, e)| e > col_range.start && s < col_range.end)
+                    .is_some_and(|(s, e)| col_range_overlaps(s, e, &col_range))
             })
             .collect()
     }

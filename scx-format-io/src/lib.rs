@@ -67,8 +67,8 @@ pub use mem::MemoryBudget;
 pub use prefetch::{
     accumulate_shards, clamp_prefetch_depth, col_means_and_sum_sq_prefetched,
     for_each_csc_shard_ordered, for_each_csc_shard_ordered_selected, for_each_shard_ordered,
-    for_each_shard_ordered_uncached, prefetch_depth, reduce_shards_budgeted, reduction_mode,
-    PrefetchError, ReductionMode, DEFAULT_PREFETCH_DEPTH,
+    for_each_shard_ordered_uncached, for_each_shard_ordered_uncached_selected, prefetch_depth,
+    reduce_shards_budgeted, reduction_mode, PrefetchError, ReductionMode, DEFAULT_PREFETCH_DEPTH,
 };
 pub use profile::{
     record_decode_since, record_io_since, record_marshalling_since, record_reduction_since,
@@ -83,7 +83,7 @@ pub use shard_decode::{
     decode_shard_regions_native, decode_shard_regions_scipy,
 };
 pub use shard_report::{codec_id_histogram, distinct_sorted_shard_field, total_shard_bytes};
-pub use shard_source::{ColumnShardSource, ShardSizeHint, ShardSource};
+pub use shard_source::{col_range_overlaps, ColumnShardSource, ShardSizeHint, ShardSource};
 pub use writer::{
     assign_csr_shard_column_stats, carry_csr_shard_column_stats, chmod_to_umask,
     clear_all_csr_shard_column_stats, clear_csr_shard_column_stats_for, compute_shard_stats,

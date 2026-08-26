@@ -284,6 +284,36 @@ where
     for_each_ordered(n_shards, depth, &read, consume)
 }
 
+/// [`for_each_shard_ordered_uncached`] restricted to an explicit ascending list
+/// of shard indices.
+///
+/// The GPU CSR staging path builds its plan as a list even when that list is
+/// `0..n_shards`, so that it and the CSC path run the *same* driver over the
+/// same plan type. A `StagingPlan` variant meaning "all of them" would have
+/// been an enum arm only one layout could ever produce — coverage that reads as
+/// real and is not.
+///
+/// `indices` must be strictly ascending (see [`for_each_ordered_selected`]).
+pub fn for_each_shard_ordered_uncached_selected<S, F, E>(
+    source: &S,
+    indices: &[usize],
+    depth: usize,
+    consume: F,
+) -> Result<(), E>
+where
+    S: ShardSource + Sync + ?Sized,
+    F: FnMut(usize, Arc<ScxCsr>) -> Result<(), E>,
+    E: PrefetchError,
+{
+    let read = move |idx: usize| {
+        source
+            .read_shard(idx)
+            .map(Arc::new)
+            .map_err(|e| E::from_shard_read(idx, e))
+    };
+    for_each_ordered_selected(indices, depth, &read, consume)
+}
+
 /// Column-major (`ColumnShardSource`) sibling of [`for_each_shard_ordered`]:
 /// bounded ordered decode-prefetch over CSC shards. Same StableOrder /
 /// bit-exact guarantee — used by the CSC mean/var kernels.

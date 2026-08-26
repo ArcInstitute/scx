@@ -73,11 +73,7 @@ impl ShardFeeder for RecordingFeeder {
         plan: &StagingPlan,
         consume: ShardConsumer<'_, FakeShard>,
     ) -> Result<(), GpuError> {
-        let order: Vec<usize> = match &plan.indices {
-            PlanIndices::All(n) => (0..*n).collect(),
-            PlanIndices::Selected(v) => v.clone(),
-        };
-        for idx in order {
+        for &idx in &plan.indices {
             if self.fail_read_at == Some(idx) {
                 // Mirrors the production classification: the host could not
                 // produce the shard, which is a bad input, not a device fault.
@@ -222,17 +218,11 @@ impl ShardStager for RecordingStager {
 }
 
 fn plan_all(n: usize, depth: usize) -> StagingPlan {
-    StagingPlan {
-        indices: PlanIndices::All(n),
-        depth,
-    }
+    StagingPlan::all(n, depth)
 }
 
 fn plan_selected(v: &[usize], depth: usize) -> StagingPlan {
-    StagingPlan {
-        indices: PlanIndices::Selected(v.to_vec()),
-        depth,
-    }
+    StagingPlan::selected(v.to_vec(), depth)
 }
 
 /// True when some pinned slot is written twice with no host-wait in between —
