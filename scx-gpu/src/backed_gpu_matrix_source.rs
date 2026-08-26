@@ -1,9 +1,16 @@
-//! [`GpuMatrixSource`] impl over a CPU-side CSR shard source plus an optional
-//! CSC sidecar.
+//! [`GpuMatrixSource`] impl over a CPU-side CSR shard source, a CSC sidecar, or
+//! either one alone.
 //!
 //! [`BackedGpuMatrixSource`] covers every untransformed input the GPU DE /
-//! column-algorithm paths see today — they all reduce to "a CSR
-//! [`ShardSource`] + an optional CSC [`ColumnShardSource`]":
+//! column-algorithm paths see today. Most reduce to "a CSR [`ShardSource`] +
+//! an optional CSC [`ColumnShardSource`]", but **not all**: HVG's column-major
+//! reduces are handed a [`ColumnShardSource`] and nothing else, and construct a
+//! CSR-less source via [`BackedGpuMatrixSource::csc_only`]. So
+//! `available_layouts()` can be `CSC` alone and the CSR iterator can return
+//! [`GpuError::UnsupportedLayout`] — see the struct docs for the
+//! constructor → layouts table. (Round-1 review fixed the struct contract and
+//! left this module header saying the old thing; Cursor Agent - Grok 4.6 High
+//! caught that in round 2.)
 //!
 //! - backed SCX with a CSC sidecar → [`with_csc`](BackedGpuMatrixSource::with_csc)
 //!   (reports `CSR | CSC`);
@@ -23,12 +30,28 @@ use crate::gpu_matrix_source::{GpuMatrixSource, LayoutSet, ValidationPolicy};
 use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
 use crate::staging::GpuCsrSlot;
 
-/// A [`GpuMatrixSource`] backed by a CSR shard source and, optionally, a CSC
-/// sidecar source. CSR is always available; CSC is available iff a CSC source
-/// was supplied via [`with_csc`](Self::with_csc).
+/// A [`GpuMatrixSource`] backed by a CSR shard source, a CSC sidecar source, or
+/// both.
+///
+/// Which layouts [`available_layouts`](GpuMatrixSource::available_layouts)
+/// reports follows the constructor, and **CSR is not guaranteed**:
+///
+/// | constructor | layouts |
+/// |---|---|
+/// | [`new`](Self::new) | `CSR` |
+/// | [`with_csc`](Self::with_csc) | `CSR \| CSC` |
+/// | [`csc_only`](Self::csc_only) | `CSC` |
+///
+/// A `csc_only` source returns [`GpuError::UnsupportedLayout`] from the CSR
+/// iterator. It exists because the column-major HVG reduces are handed a
+/// [`ColumnShardSource`] and nothing else; before it, those two call sites
+/// could not reach `GpuMatrixSource` at all and so reached past it.
 pub struct BackedGpuMatrixSource<'a> {
-    csr: RawGpuShardSource<'a>,
+    csr: Option<RawGpuShardSource<'a>>,
     csc: Option<RawGpuCscShardSource<'a>>,
+    /// Shape when there is no CSR adapter to ask. `None` whenever `csr` is
+    /// `Some`, so the two can never disagree.
+    csc_shape: Option<(usize, usize)>,
 }
 
 impl<'a> BackedGpuMatrixSource<'a> {
@@ -40,8 +63,32 @@ impl<'a> BackedGpuMatrixSource<'a> {
         csr_source: &'a (dyn ShardSource + Sync),
     ) -> Result<Self, GpuError> {
         Ok(Self {
-            csr: RawGpuShardSource::new(dev, csr_source)?,
+            csr: Some(RawGpuShardSource::new(dev, csr_source)?),
             csc: None,
+            csc_shape: None,
+        })
+    }
+
+    /// CSC-only source. Reports `CSC` and returns
+    /// [`GpuError::UnsupportedLayout`] from the CSR iterator.
+    ///
+    /// Exists because the column-major HVG reduces are handed a
+    /// [`ColumnShardSource`] and nothing else — there is no CSR side to pair
+    /// with. Without it those two sites cannot reach `GpuMatrixSource` at all,
+    /// which is what kept them calling `RawGpuCscShardSource` directly while
+    /// the CSR reduces two functions above went through the unified surface
+    /// (review §8.20: *the same file using both conventions*).
+    ///
+    /// `shape()` comes from the CSC source, so `n_obs` is the file-wide cell
+    /// count the sidecar's global row indices are numbered against.
+    pub fn csc_only(
+        dev: &'a GpuDevice,
+        csc_source: &'a (dyn ColumnShardSource + Sync),
+    ) -> Result<Self, GpuError> {
+        Ok(Self {
+            csr: None,
+            csc: Some(RawGpuCscShardSource::new(dev, csc_source)?),
+            csc_shape: Some(csc_source.shape()),
         })
     }
 
@@ -54,8 +101,9 @@ impl<'a> BackedGpuMatrixSource<'a> {
         csc_source: &'a (dyn ColumnShardSource + Sync),
     ) -> Result<Self, GpuError> {
         Ok(Self {
-            csr: RawGpuShardSource::new(dev, csr_source)?,
+            csr: Some(RawGpuShardSource::new(dev, csr_source)?),
             csc: Some(RawGpuCscShardSource::new(dev, csc_source)?),
+            csc_shape: None,
         })
     }
 
@@ -66,7 +114,7 @@ impl<'a> BackedGpuMatrixSource<'a> {
     /// another — which is the second half of §8.14: HVG's CSR and CSC entry
     /// points used to disagree about whether a given file was valid.
     pub fn with_validation(mut self, validation: ValidationPolicy) -> Self {
-        self.csr = self.csr.with_validation(validation);
+        self.csr = self.csr.map(|c| c.with_validation(validation));
         self.csc = self.csc.map(|c| c.with_validation(validation));
         self
     }
@@ -74,22 +122,42 @@ impl<'a> BackedGpuMatrixSource<'a> {
 
 impl GpuMatrixSource for BackedGpuMatrixSource<'_> {
     fn shape(&self) -> (usize, usize) {
-        self.csr.shape()
+        match (&self.csr, self.csc_shape) {
+            (Some(csr), _) => csr.shape(),
+            (None, Some(shape)) => shape,
+            // Unreachable: every constructor supplies at least one adapter,
+            // and `csc_shape` is `Some` exactly when `csr` is `None`. Panicking
+            // rather than answering `(0, 0)` because a silently empty matrix is
+            // the worst possible way for an invariant slip to surface — every
+            // downstream loop would just do nothing and report success.
+            (None, None) => unreachable!(
+                "BackedGpuMatrixSource has neither a CSR adapter nor a CSC shape; \
+                 every constructor establishes one of the two"
+            ),
+        }
     }
 
     fn available_layouts(&self) -> LayoutSet {
-        if self.csc.is_some() {
-            LayoutSet::CSR | LayoutSet::CSC
-        } else {
-            LayoutSet::CSR
+        let mut set = LayoutSet::EMPTY;
+        if self.csr.is_some() {
+            set = set | LayoutSet::CSR;
         }
+        if self.csc.is_some() {
+            set = set | LayoutSet::CSC;
+        }
+        set
     }
 
     fn for_each_gpu_csr_shard(
         &mut self,
         f: &mut dyn FnMut(usize, &mut GpuCsrSlot) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
-        self.csr.for_each_gpu_shard(|idx, slot| f(idx, slot))
+        match self.csr.as_mut() {
+            Some(csr) => csr.for_each_gpu_shard(|idx, slot| f(idx, slot)),
+            None => Err(GpuError::UnsupportedLayout(
+                "BackedGpuMatrixSource was constructed CSC-only".to_string(),
+            )),
+        }
     }
 
     fn for_each_gpu_csc_shard_in_range(
@@ -205,6 +273,47 @@ mod tests {
         // CSC iteration on a CSR-only source errors (no panic).
         let err = src.for_each_gpu_csc_shard_in_range(0..4, &mut |_, _| Ok(()));
         assert!(matches!(err, Err(GpuError::UnsupportedLayout(_))));
+    }
+
+    /// The mirror of `csr_only_reports_csr_and_rejects_csc`, for the
+    /// constructor this PR added.
+    ///
+    /// Missing until review (Cursor Agent - Grok 4.6 High): the HVG CSC reduces
+    /// exercise `csc_only`'s happy path, but nothing pinned its layout bits or
+    /// its rejection of the CSR iterator — the two properties that make it a
+    /// `GpuMatrixSource` rather than a way to smuggle a CSC adapter through one.
+    ///
+    /// `shape()` is asserted because a `csc_only` source has no CSR adapter to
+    /// ask, so it answers from `csc_shape`; getting that wrong yields an empty
+    /// matrix rather than an error, and every downstream loop would quietly do
+    /// nothing.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn csc_only_reports_csc_and_rejects_csr() {
+        let dev = require_gpu!();
+        let csc = csc_fixture();
+        let mut src = BackedGpuMatrixSource::csc_only(&dev, &csc).unwrap();
+        assert_eq!(src.available_layouts(), LayoutSet::CSC);
+        assert!(src.route_metadata().csc_available);
+        assert_eq!(
+            src.shape(),
+            (5, 4),
+            "shape must come from the CSC source when there is no CSR adapter"
+        );
+
+        // CSR iteration on a CSC-only source errors (no panic).
+        let err = src.for_each_gpu_csr_shard(&mut |_, _| Ok(()));
+        assert!(matches!(err, Err(GpuError::UnsupportedLayout(_))));
+
+        // ...and the CSC side still works, so the rejection above is about the
+        // missing layout and not a source that is broken outright.
+        let mut seen = 0usize;
+        src.for_each_gpu_csc_shard_in_range(0..4, &mut |_, _| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 1, "the one CSC shard must still be delivered");
     }
 
     #[test]

@@ -29,7 +29,6 @@ use scx_format_io::{ColumnShardSource, ShardSource};
 use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
 use crate::device::{flat_launch_1d, GpuDevice};
 use crate::error::GpuError;
-use crate::gpu_csc_shard_source::{GpuCscShardSource, RawGpuCscShardSource};
 use crate::gpu_matrix_source::GpuMatrixSource;
 use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
 
@@ -236,11 +235,10 @@ pub fn gpu_streaming_mean_var_csc(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_col_mean_sq_reduce: {e}")))?;
 
     let n_vars_i32 = n_vars as i32;
-    let mut gpu = RawGpuCscShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationChecks::IN_RANGE,
-        "highly_variable_genes",
-    ));
-    gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, |_idx, view| {
+    let mut gpu = BackedGpuMatrixSource::csc_only(dev, source)?.with_validation(
+        ValidationPolicy::new(ValidationChecks::IN_RANGE, "highly_variable_genes"),
+    );
+    gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, &mut |_idx, view| {
         let n_cols = view.n_cols();
         if n_cols == 0 {
             return Ok(());
@@ -326,11 +324,10 @@ pub fn gpu_streaming_clip_square_sum_csc(
         .map_err(|e| GpuError::KernelLaunchFailed(format!("csc_col_clip_sq_reduce: {e}")))?;
 
     let n_vars_i32 = n_vars as i32;
-    let mut gpu = RawGpuCscShardSource::new(dev, source)?.with_validation(ValidationPolicy::new(
-        ValidationChecks::FINITE,
-        "highly_variable_genes",
-    ));
-    gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, |_idx, view| {
+    let mut gpu = BackedGpuMatrixSource::csc_only(dev, source)?.with_validation(
+        ValidationPolicy::new(ValidationChecks::FINITE, "highly_variable_genes"),
+    );
+    gpu.for_each_gpu_csc_shard_in_range(0..n_vars as u32, &mut |_idx, view| {
         let n_cols = view.n_cols();
         if n_cols == 0 {
             return Ok(());

@@ -164,10 +164,7 @@ impl ShardSource for ProfiledDecode<'_> {
 /// [`GpuCsrShardView`]s over the slot's live shard. The callback's
 /// `&GpuCsrShardView` is invalidated when the iterator advances to the
 /// next shard (the slot is mutated in place).
-pub trait GpuShardSource {
-    /// Number of shards in this source (0 when empty).
-    fn n_shards(&self) -> usize;
-
+pub(crate) trait GpuShardSource {
     /// Total observation count `n_obs` across all shards.
     fn n_obs(&self) -> usize;
 
@@ -216,7 +213,7 @@ pub trait GpuShardSource {
 ///
 /// The decode loop runs on a scoped worker thread that pre-decodes the
 /// next shard while the main thread processes the current one.
-pub struct RawGpuShardSource<'a> {
+pub(crate) struct RawGpuShardSource<'a> {
     dev: &'a GpuDevice,
     source: &'a (dyn ShardSource + Sync),
     pinned: [PinnedCsrSlot; 2],
@@ -525,10 +522,6 @@ where
 }
 
 impl<'a> GpuShardSource for RawGpuShardSource<'a> {
-    fn n_shards(&self) -> usize {
-        self.source.n_shards()
-    }
-
     fn n_obs(&self) -> usize {
         self.source.n_obs()
     }
@@ -561,7 +554,7 @@ impl<'a> GpuShardSource for RawGpuShardSource<'a> {
 ///
 /// This is the input contract for [`crate::gpu_preprocess::gpu_preprocess_to_csr`]
 /// and, in future, the scVI device-resident dataloader (G12).
-pub struct GpuPreprocessedShardSource<'a> {
+pub(crate) struct GpuPreprocessedShardSource<'a> {
     inner: RawGpuShardSource<'a>,
     normalize: Option<f32>,
     log1p: bool,
@@ -616,10 +609,6 @@ impl<'a> GpuPreprocessedShardSource<'a> {
 }
 
 impl<'a> GpuShardSource for GpuPreprocessedShardSource<'a> {
-    fn n_shards(&self) -> usize {
-        self.inner.n_shards()
-    }
-
     fn n_obs(&self) -> usize {
         self.inner.n_obs()
     }

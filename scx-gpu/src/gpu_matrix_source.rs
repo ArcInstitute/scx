@@ -1,7 +1,7 @@
 //! Unified device-side sparse matrix source.
 //!
-//! [`GpuShardSource`](crate::gpu_shard_source::GpuShardSource) (row-major CSR)
-//! and [`GpuCscShardSource`](crate::gpu_csc_shard_source::GpuCscShardSource)
+//! `GpuShardSource` (row-major CSR)
+//! and `GpuCscShardSource`
 //! (column-major CSC) are two parallel, un-unified iteration contracts: a
 //! consumer that wants "DE on whatever layout this source can provide" has to
 //! know the concrete source type and branch on it. `GpuMatrixSource` composes
@@ -10,8 +10,8 @@
 //! matching iterator, without downcasting.
 //!
 //! This trait does **not** replace the low-level traits — concrete impls wrap a
-//! [`RawGpuShardSource`](crate::gpu_shard_source::RawGpuShardSource) and/or
-//! [`RawGpuCscShardSource`](crate::gpu_csc_shard_source::RawGpuCscShardSource)
+//! `RawGpuShardSource` and/or
+//! `RawGpuCscShardSource`
 //! and delegate. The `&mut GpuCsrSlot` (CSR) vs `&GpuCscShardView` (CSC)
 //! callback asymmetry is preserved — unifying them into one enum view would
 //! force every callback to pattern-match and lose the cuSPARSE descriptor cache

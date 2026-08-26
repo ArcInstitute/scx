@@ -2,7 +2,7 @@
 //!
 //! The streaming randomized-PCA core (`gpu_pca::randomized_pca_core`) drives the
 //! power loop through [`crate::linear_operator::CenteredSparseOperator`], which
-//! re-runs the host-orchestrated [`crate::gpu_shard_source::RawGpuShardSource`]
+//! re-runs the host-orchestrated `RawGpuShardSource`
 //! streaming pipeline on **every** `matmat`/`rmatmat` — re-reading, re-decoding
 //! and re-uploading the entire matrix once per call (≈7 full passes for the
 //! default 2 power iterations). For inputs whose full CSR fits device memory,

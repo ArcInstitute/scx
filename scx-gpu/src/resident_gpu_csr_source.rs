@@ -76,7 +76,7 @@ pub const DEFAULT_RESIDENT_MAX_FRAC: f64 = 0.5;
 /// so a streaming source can hand over its reusable staging slot — but here
 /// the slot is the **retained** shard, not a scratch buffer refilled on the
 /// next iteration. An in-place transform (the shape
-/// [`GpuPreprocessedShardSource`](crate::gpu_shard_source::GpuPreprocessedShardSource)
+/// `GpuPreprocessedShardSource`
 /// uses) would persist into every later pass and compound: normalize applied
 /// once per gene chunk instead of once.
 ///
