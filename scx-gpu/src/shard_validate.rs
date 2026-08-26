@@ -150,11 +150,16 @@ pub(crate) enum ShardToValidate<'a> {
 /// two do **not** run the same set and are not meant to — see
 /// [`ValidationChecks::in_range`], which is a no-op on CSR by design.
 ///
-/// | rung | CSR | CSC |
+/// | check | CSR | CSC |
 /// |---|---|---|
-/// | `Bounds` | — | row indices within `[0, n_obs)` |
-/// | `Scatter` | sorted per-row columns | strictly-increasing per-column rows |
-/// | `Ranking` | finite values | finite values |
+/// | `in_range` | — (no scan) | row indices within `[0, n_obs)` |
+/// | `sorted` | sorted per-row columns | strictly-increasing per-column rows |
+/// | `finite` | finite values | finite values |
+///
+/// The three are **independent**: enabling one never enables another. An
+/// earlier ordered `Bounds < Scatter < Ranking` ladder is what this replaced,
+/// because HVG needs finite-without-sorted while PCA and pseudobulk need
+/// sorted-without-finite.
 ///
 /// Every message interpolates `policy.op`, so the operation a user actually
 /// called is the one the error names. Before this, a `normalize_total` caller
@@ -198,11 +203,10 @@ fn validate_csr(csr: &scx_sparse::ScxCsr, policy: &ValidationPolicy) -> Result<(
             let val = csr.data[pos];
             return Err(GpuError::InvalidShard(format!(
                 "ScxCsr contains a non-finite value ({val}) at nonzero index {pos}: the GPU \
-                 kernels behind {op} corrupt a non-finite value silently rather than failing \
-                 — a rank sorts on the raw IEEE-754 bit pattern, where a NaN lands above +Inf, \
-                 and a clip evaluates `v > threshold ? threshold : v`, where +Inf becomes the \
-                 threshold and no check on the output can tell (sanitise/QC before running \
-                 {op})"
+                 kernels behind {op} cannot represent it and will corrupt the result silently \
+                 rather than failing, so it is rejected here (sanitise/QC before running \
+                 {op}; see docs/scanpy.md for which kernel does what with a NaN or an \
+                 infinity)"
             )));
         }
     }
@@ -284,11 +288,10 @@ fn validate_csc(
             let val = csc.data[pos];
             return Err(GpuError::InvalidShard(format!(
                 "ScxCsc contains a non-finite value ({val}) at nonzero index {pos}: the GPU \
-                 kernels behind {op} corrupt a non-finite value silently rather than failing \
-                 — a rank sorts on the raw IEEE-754 bit pattern, where a NaN lands above +Inf, \
-                 and a clip evaluates `v > threshold ? threshold : v`, where +Inf becomes the \
-                 threshold and no check on the output can tell (sanitise/QC before running \
-                 {op})"
+                 kernels behind {op} cannot represent it and will corrupt the result silently \
+                 rather than failing, so it is rejected here (sanitise/QC before running \
+                 {op}; see docs/scanpy.md for which kernel does what with a NaN or an \
+                 infinity)"
             )));
         }
     }
