@@ -1558,9 +1558,8 @@ jobs:
       # lifecycle used to be inside that set. So the checks below are mostly
       # about the *seam* holding, not about any one assertion.
       #
-      # Scope note: PR A lands the seam and the prerequisites. PR B routes both
-      # layouts through it (and must delete `staging_driver.rs`'s temporary
-      # `#![allow(dead_code)]`), PR C adds `ValidationLevel`, PR D migrates the
+      # Scope note: PR A landed the seam and the prerequisites; PR B routes both
+      # layouts through it. PR C adds `ValidationLevel`, PR D migrates the
       # consumers. Each extends this step rather than adding another.
       - name: The GPU staging lifecycle is written once and stays CUDA-free
         run: |
@@ -1569,10 +1568,12 @@ jobs:
           fake=scx-gpu/src/staging_driver_tests.rs
           pf=scx-format-io/src/prefetch.rs
           ss=scx-format-io/src/shard_source.rs
+          csr=scx-gpu/src/gpu_shard_source.rs
+          csc=scx-gpu/src/gpu_csc_shard_source.rs
           # Assert the inputs exist before asserting anything about them: a
           # guard keyed on a path that has moved passes vacuously, and a `grep`
           # over a missing file exits non-zero, which an `if` reads as "clean".
-          for f in "$drv" "$fake" "$pf" "$ss"; do
+          for f in "$drv" "$fake" "$pf" "$ss" "$csr" "$csc"; do
             test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-1)."; exit 1; }
           done
 
@@ -1637,6 +1638,85 @@ jobs:
           for t in 'ShardStager for' 'ShardFeeder for'; do
             grep -qE "^impl $t " "$fake" || { echo "::error::$fake no longer implements \`$t\` — the negative halves above pass vacuously on a file with no fake in it (ORG-8.20-1)."; exit 1; }
           done
+
+          # Positive half 3 (PR B): BOTH layouts go through the driver. One
+          # layout on the driver and one hand-rolled is the state this task
+          # exists to end, and it is the state that would read as "mostly
+          # done" in a diff.
+          for f in "$csr" "$csc"; do
+            grep -qE '^impl.*ShardStager for ' "$f" || { echo "::error::$f no longer implements ShardStager — its staging lifecycle has gone back to being hand-rolled, which is how the two copies drifted in the first place (ORG-8.20-1)."; exit 1; }
+            grep -qE '^impl.*ShardFeeder for ' "$f" || { echo "::error::$f no longer implements ShardFeeder (ORG-8.20-1)."; exit 1; }
+          done
+          n=$(grep -rEc --include='*.rs' 'drive_shards\(' "$csr" "$csc" | awk -F: '{s+=$2} END {print s+0}')
+          if [ "$n" -lt 2 ]; then
+            echo "::error::only $n drive_shards( call site(s) across the two layout files, expected at least 2 (one per layout). A layout that stopped calling the driver has its own lifecycle again (ORG-8.20-1)."
+            exit 1
+          fi
+
+          # Negative half 3 (PR B): the driver's temporary dead-code allow is
+          # gone. It existed only because PR A landed the seam before any
+          # caller; an `allow(dead_code)` that outlives its reason hides the
+          # next thing that stops being called.
+          if grep -nE 'allow\(dead_code\)' "$drv"; then
+            echo "::error::$drv still carries an allow(dead_code). PR A's note said PR B removes it once both layouts call the driver; if something in there is genuinely unused now, delete it rather than silencing it (ORG-8.20-1)."
+            exit 1
+          fi
+
+          # Negative half 4 (PR B): no layout hand-rolls its own decode
+          # pipeline again. The CSC path ran a `thread::scope` + `sync_channel(1)`
+          # for four phases while the CSR path had a bounded depth-4 prefetch,
+          # and nothing said so. Comment lines stripped -- `run_shards`'s
+          # docstring describes what it replaced, in these words.
+          if grep -nE 'thread::scope|sync_channel' "$csr" "$csc" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::the line(s) above hand-roll a decode pipeline. Both layouts feed from scx_format_io::prefetch through ShardFeeder, which is what gives them one depth, one host-RAM budget and one panic-to-Err path (ORG-8.20-1)."
+            exit 1
+          fi
+          # And the ring index belongs to the driver, not to a layout.
+          if grep -nE 'pinned_idx' "$csr" "$csc" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::the line(s) above rotate a pinned-slot index inside a layout file. The ring is drive_shards' — a layout that tracks its own slot can skip a host-wait without any test noticing (ORG-8.20-1)."
+            exit 1
+          fi
+
+          # Negative half 5 (PR B): the shard/column-range overlap predicate is
+          # not re-derived in scx-gpu. It had four hand-written copies; the rule
+          # is `scx_format_io::col_range_overlaps` now, and an exhaustive
+          # differential test pins `BackedCscIndex`'s binary search to it.
+          #
+          # This is a NEGATIVE check, and deliberately so. The positive form —
+          # "the file calls csc_shards_for_col_range" — was written first and
+          # MISSED its own falsification: `ProfiledCscDecode` *delegates* the
+          # method, so the grep matched a declaration while the production call
+          # site had been replaced by a hand-written loop. Same class as
+          # ORG-8.20-5's "a grep cannot tell a call from a sentence", one layer
+          # over: it could not tell a call from an impl. So forbid the
+          # comparison itself, which no correct version of this file contains.
+          # No `col_range_overlaps` exemption: nothing in scx-gpu/src has a
+          # legitimate reason to name `col_range.start` / `.end` at all, and an
+          # exemption keyed on the helper's name let a mutation that put a
+          # hand-written comparison on the SAME LINE as the helper call pass —
+          # found by falsifying this branch.
+          if grep -rnE --include='*.rs' 'col_range\.(start|end)' scx-gpu/src \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::the line(s) above compare against a column range by hand. Use scx_format_io::col_range_overlaps (or ColumnShardSource::csc_shards_for_col_range, which is built on it) so the half-open boundary exists once (ORG-8.20-1)."
+            exit 1
+          fi
+          # And the plan is still built from the shared predicate, so the
+          # negative half above cannot pass on a file that dropped prefiltering
+          # entirely. Anchored on the production expression rather than the bare
+          # method name, because `ProfiledCscDecode` *delegates* that method and
+          # a name-only grep matched the delegation while the real call site was
+          # gone (this branch missed its own falsification in exactly that way).
+          #
+          # Belt-and-braces: the behavioural guarantee is
+          # `csc_range_drive_decodes_only_overlapping_shards`, which counts
+          # decodes on the source. If this grep goes stale, retarget it — the
+          # test is what actually holds the line.
+          grep -qE 'run_shards\(self\.source\.csc_shards_for_col_range\(' "$csc" || {
+            echo "::error::$csc no longer builds its shard plan from csc_shards_for_col_range — the prefilter is what keeps a non-overlapping CSC shard from being decoded and uploaded once per gene chunk (13 shards x 123 chunks at census_500k). If this moved rather than went away, retarget this grep (ORG-8.20-1)."
+            exit 1
+          }
 
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on

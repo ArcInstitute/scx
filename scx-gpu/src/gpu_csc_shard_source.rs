@@ -13,8 +13,11 @@
 //!
 //! [`RawGpuCscShardSource`] mirrors [`crate::gpu_shard_source::RawGpuShardSource`]'s
 //! G3-shaped pipelining: a 2-slot pinned host ring, a dedicated copy
-//! stream, a scoped worker thread that pre-decodes the next shard, and
-//! event-driven handshake between the copy and compute streams. The
+//! stream, a bounded rayon decode-prefetch (`scx_format_io::prefetch`,
+//! depth 4 by default, derated to fit `SCX_GPU_STAGING_MEMORY_BUDGET` **when
+//! the source supplies a size hint** — without one there is nothing to price
+//! the budget against and the requested depth stands), and
+//! an event-driven handshake between the copy and compute streams. The
 //! synchronous baseline from G4.3 has been replaced because it
 //! serialised decode + H→D + compute and regressed wall time at
 //! scale (smartseq2 / tabula) where it dominates the per-shard
@@ -25,12 +28,18 @@ use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaEvent, CudaSlice, CudaStream, CudaView};
 
+use scx_format_io::prefetch;
 use scx_format_io::shard_source::ColumnShardSource;
 
 use crate::device::GpuDevice;
 use crate::error::GpuError;
+use crate::gpu_shard_source::resolve_staging_prefetch_depth_for;
+use crate::profile::{self, CodecClass};
 use crate::shard_validate::validate_csc_shard_for_gpu;
 use crate::staging::PinnedCscSlot;
+use crate::staging_driver::{
+    drive_shards, ShardConsumer, ShardFeeder, ShardStager, StagingPlan, ValidationMemo,
+};
 
 /// Borrowed CSC view backed by a device-resident CSC shard slot.
 ///
@@ -119,9 +128,17 @@ pub trait GpuCscShardSource {
     where
         F: FnMut(usize, &GpuCscShardView<'_>) -> Result<(), GpuError>,
     {
+        // Post-decode filter, for an impl that cannot plan which shards to
+        // read. `RawGpuCscShardSource` overrides this with a real prefilter.
+        // The boundary condition is `scx_format_io`'s, not a local restatement
+        // of it — this used to be the fourth hand-written copy of the same
+        // half-open rule.
         self.for_each_gpu_csc_shard(|idx, view| {
-            if (view.col_end as u32) <= col_range.start || (view.col_start as u32) >= col_range.end
-            {
+            if !scx_format_io::col_range_overlaps(
+                view.col_start as u32,
+                view.col_end as u32,
+                &col_range,
+            ) {
                 return Ok(());
             }
             f(idx, view)
@@ -147,8 +164,17 @@ pub trait GpuCscShardSource {
 ///   device-side handshake (compute waits on copy; next copy waits on
 ///   compute reads of the prior shard's device buffers).
 ///
-/// The decode loop runs on a scoped worker thread that pre-decodes the
-/// next shard while the main thread processes the current one.
+/// The decode loop is `scx_format_io::prefetch`'s bounded rayon pipeline —
+/// depth 4 by default — and not the single scoped worker thread this said
+/// before ORG-8.20-1 PR B. The difference is the live decoded-shard set, and
+/// so the host RSS, which is a blast-radius item rather than a detail.
+///
+/// `SCX_GPU_STAGING_MEMORY_BUDGET` derates that depth only when the source also
+/// supplies a `csc_shard_size_hint`: `resolve_staging_prefetch_depth_for`
+/// returns the requested depth unchanged if either the budget or the hint is
+/// absent, because there is nothing to price the budget against. A
+/// `ColumnShardSource` that does not override the hint is therefore **not**
+/// bounded by that env var (codex - gpt-5.6-sol).
 ///
 /// CSC kernels in this pipeline (`csc_shard_pseudobulk_kernel`,
 /// `csc_shard_to_gene_major_kernel`) are custom — no cuSPARSE descriptor
@@ -168,7 +194,7 @@ pub struct RawGpuCscShardSource<'a> {
     /// once per chunk. Sound because `source` is a shared borrow held for the
     /// adapter's whole lifetime: the bytes behind a given shard index cannot
     /// change underneath it.
-    validated: Vec<bool>,
+    memo: ValidationMemo,
     pinned: [PinnedCscSlot; 2],
     /// Per-pinned-slot copy-stream events captured immediately after the
     /// slot's most recent `upload_to`. Host-waited on before the slot is
@@ -181,6 +207,11 @@ pub struct RawGpuCscShardSource<'a> {
     col_indptr_cap: usize,
     nnz_cap: usize,
     copy_stream: Arc<CudaStream>,
+    /// Decode-prefetch depth, resolved once at construction and derated to
+    /// `SCX_GPU_STAGING_MEMORY_BUDGET` when one is set. Before ORG-8.20-1 this
+    /// path had no depth at all: it hand-rolled a `sync_channel(1)`, so exactly
+    /// one shard was ever decoded ahead, and the budget knob priced nothing.
+    prefetch_depth: usize,
     n_obs: usize,
     n_vars: usize,
 }
@@ -189,22 +220,46 @@ impl<'a> RawGpuCscShardSource<'a> {
     /// Construct with lazy-grow staging buffers and a dedicated copy
     /// stream when more than one shard is present.
     ///
-    /// Deliberately does **not** pre-size from per-shard catalog stats:
-    /// the trait doesn't expose them and the grow-on-demand path is
-    /// cheap (one-time alloc per buffer, amortised across all shards).
+    /// Pre-sizes the pinned and device buffers from
+    /// [`ColumnShardSource::csc_shard_size_hint`] when the source offers one,
+    /// growing on demand when it does not.
+    ///
+    /// It used to say pre-sizing was impossible here because "the trait doesn't
+    /// expose them". The trait didn't; `BackedCscReader` did, and threw the
+    /// `nnz` away while reading the column range out of the same stats block.
+    /// The row-major side has pre-sized since Phase 4.5.
     pub fn new(
         dev: &'a GpuDevice,
         source: &'a (dyn ColumnShardSource + Sync),
     ) -> Result<Self, GpuError> {
         let (n_obs, n_vars) = source.shape();
         let ctx = dev.context();
-        let pinned = [PinnedCscSlot::new(ctx, 1, 1), PinnedCscSlot::new(ctx, 1, 1)];
-        let col_indptr = dev.alloc_zeros::<i64>(1)?;
-        let row_indices = dev.alloc_zeros::<i32>(1)?;
-        let data = dev.alloc_zeros::<f32>(1)?;
+        let hint = source.csc_shard_size_hint();
+        // `max_rows` is the major axis on this layout, i.e. columns — so the
+        // indptr wants one more than that. Over-estimating costs pinned host
+        // memory and one device alloc; under-estimating costs a realloc.
+        let (col_indptr_cap, nnz_cap) = match hint {
+            Some(h) => (h.max_rows.saturating_add(1).max(1), h.max_nnz.max(1)),
+            None => (1, 1),
+        };
+        let pinned = [
+            PinnedCscSlot::new(ctx, col_indptr_cap, nnz_cap),
+            PinnedCscSlot::new(ctx, col_indptr_cap, nnz_cap),
+        ];
+        let col_indptr = dev.alloc_zeros::<i64>(col_indptr_cap)?;
+        let row_indices = dev.alloc_zeros::<i32>(nnz_cap)?;
+        let data = dev.alloc_zeros::<f32>(nnz_cap)?;
 
         // Dedicated copy stream — used only when n_csc_shards > 1
-        // (single-shard fast path reuses the compute stream).
+        // A single-shard file aliases this to the compute stream: with one
+        // shard there is no second slot to overlap with, so a dedicated copy
+        // stream buys nothing.
+        //
+        // This is NOT the deleted single-shard *fast path* — that one skipped
+        // the event record entirely, which is the §8.18 bug. Every drive still
+        // records and waits on its upload event whatever this alias resolves
+        // to. Spelled out because the earlier wording named the fast path and
+        // would invite the next reader to put it back.
         let copy_stream = if source.n_csc_shards() > 1 {
             dev.context()
                 .new_stream()
@@ -216,15 +271,16 @@ impl<'a> RawGpuCscShardSource<'a> {
         Ok(Self {
             dev,
             source,
-            validated: vec![false; source.n_csc_shards()],
+            memo: ValidationMemo::new(source.n_csc_shards()),
             pinned,
             pinned_events: [None, None],
             col_indptr,
             row_indices,
             data,
-            col_indptr_cap: 1,
-            nnz_cap: 1,
+            col_indptr_cap,
+            nnz_cap,
             copy_stream,
+            prefetch_depth: resolve_staging_prefetch_depth_for(hint),
             n_obs,
             n_vars,
         })
@@ -235,276 +291,277 @@ impl<'a> RawGpuCscShardSource<'a> {
     /// nothing, and that a pass did not skip a shard it staged.
     #[cfg(test)]
     pub(crate) fn validated_count(&self) -> usize {
-        self.validated.iter().filter(|v| **v).count()
+        self.memo.validated_count()
     }
 
-    /// Grow device buffers to fit a shard's `col_indptr_len` / `nnz`.
-    /// No-op when current capacity already suffices.
+    /// Device buffer capacities `(col_indptr, nnz)`. Test-only: lets the
+    /// pre-sizing test assert the staging buffers never grow-and-realloc when
+    /// the source offered a `csc_shard_size_hint`.
+    #[cfg(test)]
+    pub(crate) fn device_capacity(&self) -> (usize, usize) {
+        (self.col_indptr_cap, self.nnz_cap)
+    }
+
+    /// Shared driver for both trait methods, via the
+    /// [`drive_shards`](crate::staging_driver::drive_shards) lifecycle.
+    ///
+    /// `indices` is the list of shard indices to process in order — either
+    /// `0..n_csc_shards()` (for `for_each_gpu_csc_shard`) or the pre-filtered
+    /// subset (for `for_each_gpu_csc_shard_in_range`).
+    ///
+    /// This used to hand-roll the whole thing: a `std::thread::scope` with a
+    /// `sync_channel(1)`, so exactly **one** shard was decoded ahead where the
+    /// row-major path has decoded four since Phase 4.2; a duplicated
+    /// capacity-growth closure shadowing the method beside it; a single-shard
+    /// fast path that recorded no event; no profiling; and a read failure
+    /// classified as `CudaError` where `error.rs` says `InvalidShard`. All of
+    /// that is gone — the ordering is the shared driver's and the decode is
+    /// `scx_format_io::prefetch`'s.
+    fn run_shards<F>(&mut self, indices: Vec<usize>, f: F) -> Result<(), GpuError>
+    where
+        F: FnMut(usize, &GpuCscShardView<'_>) -> Result<(), GpuError>,
+    {
+        let plan = StagingPlan::selected(indices, self.prefetch_depth);
+        let feeder = CscFeeder(ProfiledCscDecode(self.source));
+        let mut stager = CscStaging {
+            dev: self.dev,
+            source: self.source,
+            pinned: &mut self.pinned,
+            pinned_events: &mut self.pinned_events,
+            col_indptr: &mut self.col_indptr,
+            row_indices: &mut self.row_indices,
+            data: &mut self.data,
+            col_indptr_cap: &mut self.col_indptr_cap,
+            nnz_cap: &mut self.nnz_cap,
+            memo: &mut self.memo,
+            copy_stream: &self.copy_stream,
+            n_obs: self.n_obs,
+            f,
+        };
+        drive_shards(&feeder, &mut stager, &plan)
+    }
+}
+
+/// `ColumnShardSource` adapter that times every decode into the GPU profiler's
+/// host-decode bucket.
+///
+/// The column-major twin of `gpu_shard_source::ProfiledDecode`, and the reason
+/// this path reports host-decode time at all: it previously made zero
+/// `profile::` calls, so "GPU CSC DE is host-decode-bound" was not a claim the
+/// profiler could confirm or refute.
+struct ProfiledCscDecode<'a>(&'a (dyn ColumnShardSource + Sync));
+
+impl ColumnShardSource for ProfiledCscDecode<'_> {
+    fn n_csc_shards(&self) -> usize {
+        self.0.n_csc_shards()
+    }
+    fn n_obs(&self) -> usize {
+        self.0.n_obs()
+    }
+    fn n_vars(&self) -> usize {
+        self.0.n_vars()
+    }
+    fn read_csc_shard(&self, shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsc> {
+        let t_decode = profile::start();
+        let out = self.0.read_csc_shard(shard_idx);
+        profile::record_host_decode_since(CodecClass::Generic, t_decode);
+        out
+    }
+    fn read_csc_columns(&self, col_range: Range<u32>) -> scx_format_io::Result<scx_sparse::ScxCsc> {
+        self.0.read_csc_columns(col_range)
+    }
+    fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {
+        self.0.csc_shard_col_range(shard_idx)
+    }
+    fn csc_shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+        self.0.csc_shard_size_hint()
+    }
+    fn csc_shards_for_col_range(&self, col_range: Range<u32>) -> Vec<usize> {
+        self.0.csc_shards_for_col_range(col_range)
+    }
+}
+
+/// Column-major [`ShardFeeder`]: the bounded, ordered decode-prefetch over the
+/// planned CSC shards.
+struct CscFeeder<'a>(ProfiledCscDecode<'a>);
+
+impl ShardFeeder for CscFeeder<'_> {
+    type Shard = scx_sparse::ScxCsc;
+
+    fn feed(
+        &self,
+        plan: &StagingPlan,
+        consume: ShardConsumer<'_, Self::Shard>,
+    ) -> Result<(), GpuError> {
+        prefetch::for_each_csc_shard_ordered_selected(
+            &self.0,
+            &plan.indices,
+            plan.depth,
+            |i, csc| consume(i, &csc),
+        )
+    }
+}
+
+/// Column-major [`ShardStager`].
+struct CscStaging<'r, F> {
+    dev: &'r GpuDevice,
+    /// Held for the O(1) `csc_shard_col_range` lookup: the view a consumer
+    /// receives is addressed in **global** column space, and the decoded shard
+    /// does not carry its own offset.
+    source: &'r (dyn ColumnShardSource + Sync),
+    pinned: &'r mut [PinnedCscSlot; 2],
+    pinned_events: &'r mut [Option<CudaEvent>; 2],
+    col_indptr: &'r mut CudaSlice<i64>,
+    row_indices: &'r mut CudaSlice<i32>,
+    data: &'r mut CudaSlice<f32>,
+    col_indptr_cap: &'r mut usize,
+    nnz_cap: &'r mut usize,
+    memo: &'r mut ValidationMemo,
+    copy_stream: &'r Arc<CudaStream>,
+    n_obs: usize,
+    f: F,
+}
+
+impl<F> CscStaging<'_, F> {
+    /// This shard's global `[col_start, col_end)`.
+    ///
+    /// `InvalidShard`, not `CudaError`: a catalog that cannot say where a shard
+    /// starts is a bad input, and `error.rs` reserves the runtime classes for
+    /// device failures — which is what `decline_on_runtime_failure` keys on.
+    fn col_range(&self, idx: usize) -> Result<(usize, usize), GpuError> {
+        let (s, e) = self.source.csc_shard_col_range(idx).ok_or_else(|| {
+            GpuError::InvalidShard(format!(
+                "csc_shard_col_range({idx}) returned None: the CSC sidecar's catalog does not \
+                 record this shard's column range, so its columns cannot be placed in the global \
+                 gene axis"
+            ))
+        })?;
+        Ok((s as usize, e as usize))
+    }
+
+    /// Grow the device buffers to fit `col_indptr_len` / `nnz`. No-op when the
+    /// current capacity already suffices.
     fn ensure_device_capacity(
         &mut self,
         col_indptr_len: usize,
         nnz: usize,
     ) -> Result<(), GpuError> {
-        if col_indptr_len > self.col_indptr_cap {
+        if col_indptr_len > *self.col_indptr_cap {
             let new_cap = col_indptr_len.next_power_of_two().max(col_indptr_len);
-            self.col_indptr = self.dev.alloc_zeros::<i64>(new_cap)?;
-            self.col_indptr_cap = new_cap;
+            *self.col_indptr = self.dev.alloc_zeros::<i64>(new_cap)?;
+            *self.col_indptr_cap = new_cap;
         }
-        if nnz > self.nnz_cap {
+        if nnz > *self.nnz_cap {
             let new_cap = nnz.next_power_of_two().max(nnz);
-            self.row_indices = self.dev.alloc_zeros::<i32>(new_cap)?;
-            self.data = self.dev.alloc_zeros::<f32>(new_cap)?;
-            self.nnz_cap = new_cap;
+            *self.row_indices = self.dev.alloc_zeros::<i32>(new_cap)?;
+            *self.data = self.dev.alloc_zeros::<f32>(new_cap)?;
+            *self.nnz_cap = new_cap;
+        }
+        Ok(())
+    }
+}
+
+impl<F> ShardStager for CscStaging<'_, F>
+where
+    F: FnMut(usize, &GpuCscShardView<'_>) -> Result<(), GpuError>,
+{
+    type Shard = scx_sparse::ScxCsc;
+
+    /// Nonzeros **and** columns: unlike the row-major side, an empty CSC shard
+    /// carries no addressing the consumer needs, so skipping it is free.
+    fn is_stageable(&self, shard: &Self::Shard) -> bool {
+        !shard.data.is_empty() && shard.shape.1 != 0
+    }
+
+    fn validate(&mut self, idx: usize, shard: &Self::Shard) -> Result<(), GpuError> {
+        let (col_start, _) = self.col_range(idx)?;
+        validate_csc_shard_for_gpu(shard, self.n_obs, col_start)
+    }
+
+    fn memo(&mut self) -> &mut ValidationMemo {
+        self.memo
+    }
+
+    fn host_wait(&mut self, slot: usize) -> Result<(), GpuError> {
+        if let Some(evt) = self.pinned_events[slot].take() {
+            evt.synchronize()
+                .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
         }
         Ok(())
     }
 
-    /// Shared driver for both trait methods. `indices` is the list of
-    /// shard indices to process in order — either `0..n_csc_shards()`
-    /// (for `for_each_gpu_csc_shard`) or the pre-filtered subset (for
-    /// `for_each_gpu_csc_shard_in_range`).
-    ///
-    /// Single-shard fast path is taken when `indices.len() == 1` to
-    /// avoid spinning up a worker thread + dedicated copy stream when
-    /// there's nothing to overlap.
-    fn run_shards<F>(&mut self, indices: Vec<usize>, mut f: F) -> Result<(), GpuError>
-    where
-        F: FnMut(usize, &GpuCscShardView<'_>) -> Result<(), GpuError>,
-    {
-        if indices.is_empty() {
-            return Ok(());
-        }
+    fn stage_and_upload(&mut self, slot: usize, shard: &Self::Shard) -> Result<(), GpuError> {
+        let col_indptr_len = shard.indptr.len();
+        let nnz = shard.data.len();
+        self.ensure_device_capacity(col_indptr_len, nnz)?;
+        let t_stage = profile::start();
+        self.pinned[slot].stage(shard)?;
+        profile::record_htod_since(CodecClass::Generic, t_stage, csc_htod_bytes(shard));
+        self.pinned[slot].upload_to(
+            self.copy_stream,
+            self.col_indptr,
+            self.row_indices,
+            self.data,
+            col_indptr_len,
+            nnz,
+        )
+    }
 
-        // Single-shard fast path (no worker, no copy stream, no ring).
-        // Safe because there is no successor `stage()` that could race
-        // the in-flight DMA — once `f` returns, the caller's next host
-        // action implicitly orders against the compute stream and the
-        // pinned buffer is free to reuse.
-        if indices.len() == 1 {
-            let i = indices[0];
-            let shard = self
-                .source
-                .read_csc_shard(i)
-                .map_err(|e| GpuError::CudaError(format!("read_csc_shard({i}) failed: {e}")))?;
-            let col_indptr_len = shard.indptr.len();
-            let nnz = shard.data.len();
-            let n_cols = shard.shape.1;
-            if nnz == 0 || n_cols == 0 {
-                return Ok(());
-            }
-            let (col_start, col_end) = self.source.csc_shard_col_range(i).ok_or_else(|| {
-                GpuError::CudaError(format!("csc_shard_col_range({i}) returned None"))
-            })?;
-            let col_start = col_start as usize;
-            let col_end = col_end as usize;
+    fn gate_copy_to_compute(&mut self, slot: usize) -> Result<(), GpuError> {
+        let upload_event = self
+            .copy_stream
+            .record_event(None)
+            .map_err(|e| GpuError::CudaError(format!("record upload event: {e}")))?;
+        self.dev
+            .stream()
+            .wait(&upload_event)
+            .map_err(|e| GpuError::CudaError(format!("compute wait: {e}")))?;
+        self.pinned_events[slot] = Some(upload_event);
+        Ok(())
+    }
 
-            if !self.validated.get(i).copied().unwrap_or(false) {
-                validate_csc_shard_for_gpu(&shard, self.n_obs, col_start)?;
-                if let Some(v) = self.validated.get_mut(i) {
-                    *v = true;
-                }
-            }
-
-            self.ensure_device_capacity(col_indptr_len, nnz)?;
-            self.pinned[0].stage(&shard)?;
-            self.pinned[0].upload_to(
-                self.dev.stream(),
-                &mut self.col_indptr,
-                &mut self.row_indices,
-                &mut self.data,
-                col_indptr_len,
-                nnz,
-            )?;
-
-            let view = GpuCscShardView {
-                col_indptr: self.col_indptr.slice(..col_indptr_len),
-                row_indices: self.row_indices.slice(..nnz),
-                data: self.data.slice(..nnz),
-                col_start,
-                col_end,
-                n_obs: self.n_obs,
-            };
-            return f(i, &view);
-        }
-
-        // Multi-shard pipelined path. Borrow split: hoist references to
-        // inner fields up-front so the scoped thread closure can
-        // capture `source` without going through `&mut self`.
-        let source = self.source;
-        let dev = self.dev;
-        let pinned = &mut self.pinned;
-        let pinned_events = &mut self.pinned_events;
-        let copy_stream = &self.copy_stream;
-        let compute_stream = dev.stream();
-        let col_indptr_buf = &mut self.col_indptr;
-        let row_indices_buf = &mut self.row_indices;
-        let data_buf = &mut self.data;
-        let col_indptr_cap = &mut self.col_indptr_cap;
-        let nnz_cap = &mut self.nnz_cap;
-        let n_obs = self.n_obs;
-        let validated = &mut self.validated;
-
-        // Local grow helper — same logic as `ensure_device_capacity`
-        // but operates on the hoisted field references.
-        let ensure_capacity_local = |col_indptr_buf: &mut CudaSlice<i64>,
-                                     row_indices_buf: &mut CudaSlice<i32>,
-                                     data_buf: &mut CudaSlice<f32>,
-                                     col_indptr_cap: &mut usize,
-                                     nnz_cap: &mut usize,
-                                     col_indptr_len: usize,
-                                     nnz: usize|
-         -> Result<(), GpuError> {
-            if col_indptr_len > *col_indptr_cap {
-                let new_cap = col_indptr_len.next_power_of_two().max(col_indptr_len);
-                *col_indptr_buf = dev.alloc_zeros::<i64>(new_cap)?;
-                *col_indptr_cap = new_cap;
-            }
-            if nnz > *nnz_cap {
-                let new_cap = nnz.next_power_of_two().max(nnz);
-                *row_indices_buf = dev.alloc_zeros::<i32>(new_cap)?;
-                *data_buf = dev.alloc_zeros::<f32>(new_cap)?;
-                *nnz_cap = new_cap;
-            }
-            Ok(())
+    fn dispatch(&mut self, idx: usize, shard: &Self::Shard) -> Result<(), GpuError> {
+        let (col_start, col_end) = self.col_range(idx)?;
+        let col_indptr_len = shard.indptr.len();
+        let nnz = shard.data.len();
+        let view = GpuCscShardView {
+            col_indptr: self.col_indptr.slice(..col_indptr_len),
+            row_indices: self.row_indices.slice(..nnz),
+            data: self.data.slice(..nnz),
+            col_start,
+            col_end,
+            n_obs: self.n_obs,
         };
+        (self.f)(idx, &view)
+    }
 
-        let scope_result = std::thread::scope(|scope| -> Result<(), GpuError> {
-            use std::sync::mpsc;
-            type Msg = Result<(usize, scx_sparse::ScxCsc, u32, u32), scx_format_io::ScxError>;
-            let (tx, rx) = mpsc::sync_channel::<Msg>(1);
+    fn gate_compute_to_copy(&mut self) -> Result<(), GpuError> {
+        let compute_event = self
+            .dev
+            .stream()
+            .record_event(None)
+            .map_err(|e| GpuError::CudaError(format!("record compute event: {e}")))?;
+        self.copy_stream
+            .wait(&compute_event)
+            .map_err(|e| GpuError::CudaError(format!("copy wait: {e}")))
+    }
 
-            let indices_for_worker = indices.clone();
-            scope.spawn(move || {
-                for &i in indices_for_worker.iter() {
-                    let csc = match source.read_csc_shard(i) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            break;
-                        }
-                    };
-                    let range = match source.csc_shard_col_range(i) {
-                        Some(r) => r,
-                        None => {
-                            let _ = tx.send(Err(scx_format_io::ScxError::InvalidCatalog(format!(
-                                "csc_shard_col_range({i}) returned None"
-                            ))));
-                            break;
-                        }
-                    };
-                    if tx.send(Ok((i, csc, range.0, range.1))).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let mut pinned_idx: usize = 0;
-            while let Ok(msg) = rx.recv() {
-                let (i, csc, col_start_u32, col_end_u32) = match msg {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return Err(GpuError::CudaError(format!(
-                            "CSC read error during streaming decode: {e}"
-                        )))
-                    }
-                };
-                let col_indptr_len = csc.indptr.len();
-                let nnz = csc.data.len();
-                let n_cols = csc.shape.1;
-                if nnz == 0 || n_cols == 0 {
-                    continue;
-                }
-                let col_start = col_start_u32 as usize;
-                let col_end = col_end_u32 as usize;
-
-                if !validated.get(i).copied().unwrap_or(false) {
-                    validate_csc_shard_for_gpu(&csc, n_obs, col_start)?;
-                    if let Some(v) = validated.get_mut(i) {
-                        *v = true;
-                    }
-                }
-
-                // Host-side gate: if this pinned slot still has an
-                // outstanding copy-stream event from a previous shard,
-                // we must wait for that DMA to drain on the host before
-                // overwriting the pinned buffer. The device-side gates
-                // below only order device streams against each other;
-                // they do not prevent the CPU from racing the DMA's
-                // source memory.
-                if let Some(evt) = pinned_events[pinned_idx].take() {
-                    evt.synchronize()
-                        .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
-                }
-
-                ensure_capacity_local(
-                    col_indptr_buf,
-                    row_indices_buf,
-                    data_buf,
-                    col_indptr_cap,
-                    nnz_cap,
-                    col_indptr_len,
-                    nnz,
-                )?;
-
-                pinned[pinned_idx].stage(&csc)?;
-                pinned[pinned_idx].upload_to(
-                    copy_stream,
-                    col_indptr_buf,
-                    row_indices_buf,
-                    data_buf,
-                    col_indptr_len,
-                    nnz,
-                )?;
-                // Device-side gate (copy → compute): kernel reads must
-                // observe the just-uploaded shard data.
-                let upload_event = copy_stream
-                    .record_event(None)
-                    .map_err(|e| GpuError::CudaError(format!("record upload event: {e}")))?;
-                compute_stream
-                    .wait(&upload_event)
-                    .map_err(|e| GpuError::CudaError(format!("compute wait: {e}")))?;
-                // Stash the same event against this pinned slot so the
-                // next iteration that recycles it can host-wait.
-                pinned_events[pinned_idx] = Some(upload_event);
-
-                let view = GpuCscShardView {
-                    col_indptr: col_indptr_buf.slice(..col_indptr_len),
-                    row_indices: row_indices_buf.slice(..nnz),
-                    data: data_buf.slice(..nnz),
-                    col_start,
-                    col_end,
-                    n_obs,
-                };
-                f(i, &view)?;
-
-                // Device-side gate (compute → copy): the next shard's
-                // upload (which writes into the device buffers) must
-                // wait for the current shard's compute reads to finish.
-                let compute_event = compute_stream
-                    .record_event(None)
-                    .map_err(|e| GpuError::CudaError(format!("record compute event: {e}")))?;
-                copy_stream
-                    .wait(&compute_event)
-                    .map_err(|e| GpuError::CudaError(format!("copy wait: {e}")))?;
-
-                pinned_idx ^= 1;
-            }
-            Ok(())
-        });
-
-        // Drain any remaining pinned events so the caller may safely
-        // mutate or drop the pinned host buffers immediately after this
-        // function returns. Cheap in the common case — by the time we
-        // reach this point the DMAs are typically already complete.
+    fn drain(&mut self) -> Result<(), GpuError> {
         for evt in self.pinned_events.iter_mut() {
             if let Some(e) = evt.take() {
                 e.synchronize()
                     .map_err(|err| GpuError::CudaError(format!("pinned drain sync: {err}")))?;
             }
         }
-
-        scope_result
+        Ok(())
     }
+}
+
+/// Bytes one CSC shard moves host->device: `indptr` i64 + `indices` i32 +
+/// `data` f32. Mirrors `gpu_shard_source::csr_htod_bytes` (same three arrays,
+/// major axis differs).
+fn csc_htod_bytes(csc: &scx_sparse::ScxCsc) -> usize {
+    csc.data.len() * 4 + csc.indices.len() * 4 + csc.indptr.len() * 8
 }
 
 impl<'a> GpuCscShardSource for RawGpuCscShardSource<'a> {
@@ -536,21 +593,19 @@ impl<'a> GpuCscShardSource for RawGpuCscShardSource<'a> {
     where
         F: FnMut(usize, &GpuCscShardView<'_>) -> Result<(), GpuError>,
     {
-        // Pre-filter shard indices using the cheap O(1) catalog lookup,
-        // so non-overlapping shards never get decoded or uploaded. At
-        // smartseq2 / tabula scale with many CSC shards (13+) and small
-        // gene chunks, most shards skip — eliminating decode + H→D for
-        // them collapses cache thrashing (default `cache_shards=4`)
-        // and the per-chunk fixed cost.
-        let mut indices: Vec<usize> = Vec::new();
-        for i in 0..self.source.n_csc_shards() {
-            if let Some((s, e)) = self.source.csc_shard_col_range(i) {
-                if e > col_range.start && s < col_range.end {
-                    indices.push(i);
-                }
-            }
-        }
-        self.run_shards(indices, f)
+        // Pre-filter shard indices so non-overlapping shards are never decoded
+        // or uploaded. At smartseq2 / tabula scale with many CSC shards (13+)
+        // and small gene chunks most shards skip, and eliminating decode + H→D
+        // for them collapses cache thrashing (default `cache_shards=4`) and the
+        // per-chunk fixed cost.
+        //
+        // The overlap predicate used to be spelled out here, making a fourth
+        // copy of a rule that already existed on `FullCatalog` and on
+        // `BackedCscIndex`. `ColumnShardSource::csc_shards_for_col_range` now
+        // owns it: a backed reader answers by binary search, everyone else by
+        // the trait's linear default, and an exhaustive differential test in
+        // `scx-format-io` pins the two to the same boundary condition.
+        self.run_shards(self.source.csc_shards_for_col_range(col_range), f)
     }
 }
 
@@ -568,6 +623,43 @@ mod tests {
         ranges: Vec<(u32, u32)>,
         n_obs: usize,
         n_vars: usize,
+        /// `None` reproduces a source that cannot answer cheaply — the state
+        /// every `ColumnShardSource` was in before ORG-8.20-1.
+        hint: Option<scx_format_io::ShardSizeHint>,
+        /// Every shard index actually decoded. The range prefilter's whole
+        /// purpose is that a non-overlapping shard never reaches here.
+        reads: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl InMemoryCscSource {
+        fn new(shards: Vec<ScxCsc>, ranges: Vec<(u32, u32)>, n_obs: usize, n_vars: usize) -> Self {
+            Self {
+                shards,
+                ranges,
+                n_obs,
+                n_vars,
+                hint: None,
+                reads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Decoded shard indices, ascending. Sorted because decode order is
+        /// concurrent and so nondeterministic — only the *set* is a property of
+        /// the plan; delivery order is asserted separately.
+        fn reads_sorted(&self) -> Vec<usize> {
+            let mut v = self.reads.lock().unwrap().clone();
+            v.sort_unstable();
+            v
+        }
+
+        /// Attach the exact bounds of the shards held, as a real catalog would.
+        fn hinted(mut self) -> Self {
+            self.hint = Some(scx_format_io::ShardSizeHint {
+                max_rows: self.shards.iter().map(|c| c.shape.1).max().unwrap_or(0),
+                max_nnz: self.shards.iter().map(|c| c.data.len()).max().unwrap_or(0),
+            });
+            self
+        }
     }
 
     impl ColumnShardSource for InMemoryCscSource {
@@ -581,6 +673,7 @@ mod tests {
             self.n_vars
         }
         fn read_csc_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsc> {
+            self.reads.lock().unwrap().push(shard_idx);
             Ok(self.shards[shard_idx].clone())
         }
         fn read_csc_columns(
@@ -591,6 +684,9 @@ mod tests {
         }
         fn csc_shard_col_range(&self, shard_idx: usize) -> Option<(u32, u32)> {
             self.ranges.get(shard_idx).copied()
+        }
+        fn csc_shard_size_hint(&self) -> Option<scx_format_io::ShardSizeHint> {
+            self.hint
         }
     }
 
@@ -656,12 +752,7 @@ mod tests {
             ("duplicate row", duplicate),
             ("out-of-range row", out_of_range),
         ] {
-            let src = InMemoryCscSource {
-                shards: vec![shard],
-                ranges: vec![(0, 3)],
-                n_obs: 8,
-                n_vars: 3,
-            };
+            let src = InMemoryCscSource::new(vec![shard], vec![(0, 3)], 8, 3);
             let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
             let mut calls = 0usize;
             let err = gpu
@@ -690,16 +781,16 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn test_csc_source_validates_every_staged_shard() {
         let dev = require_gpu!();
-        let src = InMemoryCscSource {
-            shards: vec![
+        let src = InMemoryCscSource::new(
+            vec![
                 make_dense_csc(8, 3, 4),
                 make_dense_csc(8, 4, 4),
                 make_dense_csc(8, 3, 4),
             ],
-            ranges: vec![(0, 3), (3, 7), (7, 10)],
-            n_obs: 8,
-            n_vars: 10,
-        };
+            vec![(0, 3), (3, 7), (7, 10)],
+            8,
+            10,
+        );
         let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
         gpu.for_each_gpu_csc_shard(|_, _| Ok(())).unwrap();
         dev.synchronize().unwrap();
@@ -727,12 +818,12 @@ mod tests {
             s.data[2] = f32::NAN;
             s
         };
-        let src = InMemoryCscSource {
-            shards: vec![make_dense_csc(8, 3, 4), bad, make_dense_csc(8, 3, 4)],
-            ranges: vec![(0, 3), (3, 7), (7, 10)],
-            n_obs: 8,
-            n_vars: 10,
-        };
+        let src = InMemoryCscSource::new(
+            vec![make_dense_csc(8, 3, 4), bad, make_dense_csc(8, 3, 4)],
+            vec![(0, 3), (3, 7), (7, 10)],
+            8,
+            10,
+        );
         let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
         let mut seen: Vec<usize> = Vec::new();
         let err = gpu
@@ -748,6 +839,263 @@ mod tests {
         assert_eq!(seen, vec![0], "iteration must stop at the malformed shard");
     }
 
+    /// `for_each_gpu_csc_shard_in_range` **decodes** only the shards whose
+    /// column range overlaps, not merely delivers only those.
+    ///
+    /// There was no test for this at all before ORG-8.20-1 — on the path whose
+    /// entire reason for prefiltering is that GPU DE drives it once per gene
+    /// chunk (123× at census_500k) against a 13-shard sidecar. A version that
+    /// decoded all thirteen and filtered on delivery would have produced
+    /// identical numbers and thrown away the whole benefit, silently.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn csc_range_drive_decodes_only_overlapping_shards() {
+        let dev = require_gpu!();
+        // Four shards over [0,3) [3,7) [7,10) [10,14).
+        let src = InMemoryCscSource::new(
+            vec![
+                make_csc(8, 3, 1.0),
+                make_csc(8, 4, 100.0),
+                make_csc(8, 3, 200.0),
+                make_csc(8, 4, 300.0),
+            ],
+            vec![(0, 3), (3, 7), (7, 10), (10, 14)],
+            8,
+            14,
+        );
+        let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+
+        let mut delivered: Vec<usize> = Vec::new();
+        gpu.for_each_gpu_csc_shard_in_range(4..8, |idx, _view| {
+            delivered.push(idx);
+            Ok(())
+        })
+        .unwrap();
+
+        // [4,8) meets shard 1 = [3,7) and shard 2 = [7,10); it does not meet
+        // shard 0 (ends at 3) or shard 3 (starts at 10).
+        assert_eq!(delivered, vec![1, 2]);
+        assert_eq!(
+            src.reads_sorted(),
+            vec![1, 2],
+            "a non-overlapping shard was decoded — the prefilter plans which \
+             shards to read, it does not filter after reading them"
+        );
+    }
+
+    /// The half-open boundary, on the surface a consumer actually calls.
+    ///
+    /// Hand-computed against the same four shards: a range that ends exactly
+    /// where a shard begins excludes it, and one that begins exactly where a
+    /// shard ends excludes that one.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn csc_range_drive_is_half_open_at_both_ends() {
+        let dev = require_gpu!();
+        let ranges = vec![(0u32, 3u32), (3, 7), (7, 10), (10, 14)];
+        for (range, want) in [
+            (0..3u32, vec![0usize]),
+            (3..7, vec![1]),
+            (2..4, vec![0, 1]),
+            (0..14, vec![0, 1, 2, 3]),
+            (10..14, vec![3]),
+            (14..20, vec![]),
+        ] {
+            let src = InMemoryCscSource::new(
+                vec![
+                    make_csc(8, 3, 1.0),
+                    make_csc(8, 4, 100.0),
+                    make_csc(8, 3, 200.0),
+                    make_csc(8, 4, 300.0),
+                ],
+                ranges.clone(),
+                8,
+                14,
+            );
+            let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+            let mut delivered: Vec<usize> = Vec::new();
+            gpu.for_each_gpu_csc_shard_in_range(range.clone(), |idx, _view| {
+                delivered.push(idx);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(delivered, want, "range {range:?}");
+            assert_eq!(
+                src.reads_sorted(),
+                want,
+                "range {range:?} decoded the wrong set"
+            );
+        }
+    }
+
+    /// A hinted source pre-sizes the device buffers at construction, so no
+    /// shard grows-and-reallocs during the drive.
+    ///
+    /// The column-major twin of `hinted_source_presizes_the_staging_slot`.
+    /// Before ORG-8.20-1 this path always started at `(1, 1)` and the doc said
+    /// pre-sizing was impossible because "the trait doesn't expose"
+    /// per-shard stats — the trait didn't, `BackedCscReader` did, and it read
+    /// the `nnz` out of the same stats block it read the column range from and
+    /// discarded it.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn hinted_csc_source_presizes_the_device_buffers() {
+        let dev = require_gpu!();
+        let src = InMemoryCscSource::new(
+            vec![make_dense_csc(8, 3, 4), make_dense_csc(8, 5, 4)],
+            vec![(0, 3), (3, 8)],
+            8,
+            8,
+        )
+        .hinted();
+
+        let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+        let at_construction = gpu.device_capacity();
+        assert!(
+            at_construction.0 >= 6 && at_construction.1 >= 20,
+            "device buffers must be pre-sized for the largest shard (5 cols / 20 nnz), got \
+             {at_construction:?}"
+        );
+
+        gpu.for_each_gpu_csc_shard(|_idx, _view| Ok(())).unwrap();
+        assert_eq!(
+            gpu.device_capacity(),
+            at_construction,
+            "pre-sized device buffers must not grow during the drive"
+        );
+
+        // The accept-side half: an unhinted source still works, it just starts
+        // small. Without this the assertion above would pass on a build that
+        // had made the hint mandatory.
+        let unhinted = InMemoryCscSource::new(
+            vec![make_dense_csc(8, 3, 4), make_dense_csc(8, 5, 4)],
+            vec![(0, 3), (3, 8)],
+            8,
+            8,
+        );
+        let mut gpu2 = RawGpuCscShardSource::new(&dev, &unhinted).unwrap();
+        assert_eq!(gpu2.device_capacity(), (1, 1));
+        gpu2.for_each_gpu_csc_shard(|_idx, _view| Ok(())).unwrap();
+    }
+
+    /// A CSC source whose single shard carries a **different payload on every
+    /// read**, tagged by a generation counter. Column-major twin of
+    /// `GenerationalCsrSource`; see that type for why a fixed fixture makes the
+    /// cross-drive test unable to fail.
+    struct GenerationalCscSource {
+        n_obs: usize,
+        n_cols: usize,
+        per_col: usize,
+        generation: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GenerationalCscSource {
+        /// Offset added to every value on read `g`. Spaced wider than one
+        /// shard's value span so no two generations share a value.
+        fn offset_for(g: usize) -> f32 {
+            (100_000 * (g + 1)) as f32
+        }
+        fn shard_for(&self, g: usize) -> ScxCsc {
+            let mut csc = make_dense_csc(self.n_obs, self.n_cols, self.per_col);
+            let off = Self::offset_for(g);
+            for v in csc.data.iter_mut() {
+                *v += off;
+            }
+            csc
+        }
+    }
+
+    impl ColumnShardSource for GenerationalCscSource {
+        fn n_csc_shards(&self) -> usize {
+            1
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            self.n_cols
+        }
+        fn read_csc_shard(&self, _shard_idx: usize) -> scx_format_io::Result<ScxCsc> {
+            let g = self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.shard_for(g))
+        }
+        fn read_csc_columns(
+            &self,
+            _col_range: std::ops::Range<u32>,
+        ) -> scx_format_io::Result<ScxCsc> {
+            unimplemented!("test stub does not implement read_csc_columns")
+        }
+        fn csc_shard_col_range(&self, _shard_idx: usize) -> Option<(u32, u32)> {
+            Some((0, self.n_cols as u32))
+        }
+    }
+
+    /// Driving one adapter repeatedly stages each drive's own bytes.
+    ///
+    /// Column-major twin of
+    /// `driving_a_single_shard_csr_source_repeatedly_stages_own_bytes`; the
+    /// reasoning, and the two properties that make it able to fail at all, are
+    /// documented there.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn driving_a_single_shard_csc_source_repeatedly_stages_own_bytes() {
+        let dev = require_gpu!();
+        const N_OBS: usize = 4096;
+        const N_COLS: usize = 4;
+        const PER_COL: usize = 512;
+        const DRIVES: usize = 8;
+        const NNZ: usize = N_COLS * PER_COL;
+
+        let src = GenerationalCscSource {
+            n_obs: N_OBS,
+            n_cols: N_COLS,
+            per_col: PER_COL,
+            generation: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
+
+        // Allocated up front: `cudaMalloc` is device-synchronising, so
+        // allocating inside the loop would insert the barrier this test exists
+        // to do without.
+        let mut captures: Vec<cudarc::driver::safe::CudaSlice<f32>> = (0..DRIVES)
+            .map(|_| dev.alloc_zeros::<f32>(NNZ).unwrap())
+            .collect();
+
+        for dst in captures.iter_mut() {
+            gpu.for_each_gpu_csc_shard(|_idx, view| {
+                assert_eq!(view.data.len(), NNZ, "fixture nnz must be stable");
+                dev.stream()
+                    .memcpy_dtod(&view.data, dst)
+                    .map_err(|e| GpuError::CudaError(format!("dtod: {e}")))?;
+                Ok(())
+            })
+            .unwrap();
+            // Deliberately no synchronisation here.
+        }
+        dev.synchronize().unwrap();
+
+        for (g, dst) in captures.iter().enumerate() {
+            let mut host = vec![0.0f32; NNZ];
+            dev.stream().memcpy_dtoh(dst, &mut host).unwrap();
+            dev.synchronize().unwrap();
+            let expected = GenerationalCscSource {
+                n_obs: N_OBS,
+                n_cols: N_COLS,
+                per_col: PER_COL,
+                generation: std::sync::atomic::AtomicUsize::new(0),
+            }
+            .shard_for(g)
+            .data;
+            assert_eq!(
+                host, expected,
+                "drive {g} did not stage its own generation — the pinned slot was rewritten \
+                 while this drive's DMA was still reading it"
+            );
+        }
+    }
+
     /// Pipelined source yields the staged shards verbatim — dtoh of
     /// the view's `data` returns each shard's tagged values.
     #[test]
@@ -755,12 +1103,7 @@ mod tests {
     fn test_raw_csc_source_round_trip() {
         let dev = require_gpu!();
         let shards = vec![make_csc(8, 3, 1.0), make_csc(8, 4, 100.0)];
-        let src = InMemoryCscSource {
-            shards,
-            ranges: vec![(0, 3), (3, 7)],
-            n_obs: 8,
-            n_vars: 7,
-        };
+        let src = InMemoryCscSource::new(shards, vec![(0, 3), (3, 7)], 8, 7);
         let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
 
         let mut seen: Vec<f32> = Vec::new();
@@ -837,12 +1180,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let src = InMemoryCscSource {
-                shards,
-                ranges,
-                n_obs,
-                n_vars: n_shards * cols_per_shard,
-            };
+            let src = InMemoryCscSource::new(shards, ranges, n_obs, n_shards * cols_per_shard);
             let mut gpu = RawGpuCscShardSource::new(&dev, &src).unwrap();
 
             // Per-shard device capture buffers. Filled via dtod on the

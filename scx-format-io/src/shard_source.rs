@@ -49,6 +49,33 @@ impl ShardSizeHint {
     }
 }
 
+/// Whether a shard spanning `[shard_start, shard_end)` intersects `range`.
+///
+/// **Half-open on both ends**: a shard ending exactly at `range.start` does not
+/// overlap, and one starting exactly at `range.end` does not either.
+///
+/// A free function because this one boundary condition had four hand-written
+/// copies — `FullCatalog::csc_shards_for_col_range`,
+/// `BackedCscIndex::shards_for_col_range`, an inline loop in `scx-gpu`'s CSC
+/// staging path, and `GpuCscShardSource`'s post-decode filter — which is three
+/// more places for an off-by-one to live than the rule deserves. The binary
+/// search in `BackedCscIndex` necessarily states it differently; an exhaustive
+/// differential test pins it to this.
+#[inline]
+pub fn col_range_overlaps(shard_start: u32, shard_end: u32, range: &Range<u32>) -> bool {
+    // The empty/inverted guard is not redundant with the half-open comparisons.
+    // Without it `col_range_overlaps(4, 8, &(5..5))` is `true` (`8 > 5 && 4 < 5`)
+    // while `BackedCscIndex::shards_for_col_range` returns nothing for the same
+    // input, because it guards `c_lo >= c_hi` up front — so the trait default
+    // and the backed override disagreed on an interior empty range, in a
+    // function this PR made the single named boundary rule.
+    //
+    // Latent rather than live (production GPU DE passes non-empty gene chunks),
+    // and found by Cursor Agent - Grok 4.6 High and Antigravity - Gemini 3.7
+    // Flash independently.
+    range.start < range.end && shard_end > range.start && shard_start < range.end
+}
+
 /// A source of CSR shards for streaming computation.
 ///
 /// Implementations provide sequential shard access for algorithms like
@@ -70,6 +97,27 @@ pub trait ShardSource {
     }
 
     /// Read and decode shard `shard_idx`.
+    ///
+    /// # Stability contract
+    ///
+    /// For the lifetime of a given shared borrow, repeated calls with the same
+    /// `shard_idx` must yield **structurally equivalent** shards: the same
+    /// index ordering, the same finiteness, the same minor-axis bounds. Values
+    /// may differ — a source that recomputes or re-decodes is fine — but a
+    /// source must not return a sorted, finite shard on one call and an
+    /// unsorted or NaN-bearing one on the next.
+    ///
+    /// This is load-bearing, not advisory. `scx-gpu`'s staging adapters memoise
+    /// host-side validation per shard index for the adapter's lifetime, so a
+    /// shard that passes once is not re-scanned; a source that violated this
+    /// could feed a later drive straight past checks whose absence the kernels
+    /// cannot survive (a NaN into a radix sort, an out-of-range row into an
+    /// indexed device read). Raised by codex - gpt-5.6-sol, who observed that a
+    /// shared borrow alone does not imply repeatable output.
+    ///
+    /// Every in-tree implementation satisfies this: the backed and lazy readers
+    /// decode deterministically from an immutable file mapping. A source that
+    /// cannot must not be handed to the GPU staging adapters.
     ///
     /// Implementations may apply transforms (e.g., NormalizeTotal, Log1p)
     /// and/or deletion vector filtering before returning.
@@ -260,6 +308,17 @@ pub trait ColumnShardSource {
     }
 
     /// Read and decode a single CSC shard.
+    ///
+    /// # Stability contract
+    ///
+    /// Same rule as [`ShardSource::read_shard`], for the same reason: the GPU
+    /// staging adapters memoise host-side validation per shard index, so a
+    /// shard validated once is not re-scanned. Repeated reads of one index must
+    /// stay structurally equivalent — same row ordering, same finiteness, same
+    /// row bounds — for the lifetime of a shared borrow. Values may differ.
+    ///
+    /// The round-2 fix stated this on the row-major trait only, while the memo
+    /// covers both layouts (codex - gpt-5.6-sol).
     fn read_csc_shard(&self, shard_idx: usize) -> Result<ScxCsc>;
 
     /// Read a contiguous column slice across shards.
@@ -315,7 +374,7 @@ pub trait ColumnShardSource {
         (0..self.n_csc_shards())
             .filter(|&i| {
                 self.csc_shard_col_range(i)
-                    .is_some_and(|(s, e)| e > col_range.start && s < col_range.end)
+                    .is_some_and(|(s, e)| col_range_overlaps(s, e, &col_range))
             })
             .collect()
     }

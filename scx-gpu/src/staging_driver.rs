@@ -31,19 +31,6 @@
 //! invalidated when pointers move, and that staged data is numerically
 //! identical.
 
-// Nothing in production calls this yet — PR A of ORG-8.20-1 lands the seam and
-// the CPU tests that must be watched red *before* either layout is rewired onto
-// it, per the series' first ground rule. PR B routes `RawGpuShardSource` and
-// `RawGpuCscShardSource` through `drive_shards`, at which point this attribute
-// must come off, and PR B is where the `ORG-8.20-1` CI guard grows the branch
-// that asserts it is gone.
-//
-// There is no enforced check in THIS PR -- the only things bounding this allow
-// are the scope note in `ci.yml` and this comment. Stated plainly because the
-// earlier wording said the guard already asserted it, which would let a reader
-// believe the attribute was mechanically bounded when it was bounded by intent.
-#![allow(dead_code)]
-
 use crate::error::GpuError;
 
 /// Pinned staging slots in the ring. Two is enough to overlap one shard's DMA
@@ -51,47 +38,40 @@ use crate::error::GpuError;
 /// compute→copy gate already serialises against the live device slot.
 pub(crate) const RING: usize = 2;
 
-/// Which shards a drive covers, and in what order.
-///
-/// `All` and `Selected` are distinct rather than `Selected(0..n)` because they
-/// route to different prefetch front-ends: the dense sweep allocates no index
-/// vector, and only the selected form pays for one. Production CSR always
-/// sweeps; production CSC always selects (it iterates the shards overlapping a
-/// gene chunk).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PlanIndices {
-    /// Every shard, `0..n`.
-    All(usize),
-    /// An explicit ascending list. Must be ascending: "in plan order" is what
-    /// the prefetch pipeline preserves, so a shuffled list is delivered
-    /// shuffled, not sorted.
-    Selected(Vec<usize>),
-}
-
-impl PlanIndices {
-    /// Number of shards the plan covers.
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::All(n) => *n,
-            Self::Selected(v) => v.len(),
-        }
-    }
-
-    /// True when the plan covers nothing.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// A drive's shard list plus the decode-prefetch depth to run it at.
+///
+/// `indices` is always an explicit list, even on the CSR path where it is
+/// exactly `0..n_shards`. An earlier revision had an `All(n)` / `Selected(v)`
+/// enum so the dense sweep could skip the allocation; it was collapsed because
+/// only one layout could ever produce each arm, which is coverage that reads as
+/// real and is not. The cost is one `Vec<usize>` per drive — tens of `usize`
+/// against a shard decode.
+///
+/// The list must be strictly ascending: "in plan order" is what the prefetch
+/// pipeline preserves, so a shuffled list is delivered shuffled, not sorted.
 #[derive(Debug, Clone)]
 pub(crate) struct StagingPlan {
     /// Which shards, in what order.
-    pub(crate) indices: PlanIndices,
+    pub(crate) indices: Vec<usize>,
     /// Max shards decoded-but-unconsumed. Resolved by the caller from
-    /// `resolve_staging_prefetch_depth`, which derates
+    /// `resolve_staging_prefetch_depth_for`, which derates
     /// `SCX_ACCEL_PREFETCH_DEPTH` to `SCX_GPU_STAGING_MEMORY_BUDGET`.
     pub(crate) depth: usize,
+}
+
+impl StagingPlan {
+    /// Plan covering every shard of a source, in order.
+    pub(crate) fn all(n_shards: usize, depth: usize) -> Self {
+        Self {
+            indices: (0..n_shards).collect(),
+            depth,
+        }
+    }
+
+    /// Plan covering an explicit ascending subset.
+    pub(crate) fn selected(indices: Vec<usize>, depth: usize) -> Self {
+        Self { indices, depth }
+    }
 }
 
 /// Which shard indices a stager has already host-validated.

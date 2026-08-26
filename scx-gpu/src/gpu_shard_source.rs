@@ -46,6 +46,9 @@ use crate::gpu_preprocess::apply_fused_ops_inner;
 use crate::profile::{self, CodecClass};
 use crate::shard_validate::{first_non_finite, first_unsorted_major};
 use crate::staging::{GpuCsrSlot, PinnedCsrSlot};
+use crate::staging_driver::{
+    drive_shards, ShardConsumer, ShardFeeder, ShardStager, StagingPlan, ValidationMemo,
+};
 
 /// Approximate the host→device bytes a staged CSR shard moves (data f32 +
 /// indices i32 + indptr i64). Used only for the Phase 0.2 GPU profiler.
@@ -152,8 +155,22 @@ fn staging_memory_budget() -> Option<u64> {
 /// be budgeted (there is no per-shard byte estimate to divide by) and keep the
 /// unclamped depth.
 fn resolve_staging_prefetch_depth(source: &(dyn ShardSource + Sync)) -> usize {
+    resolve_staging_prefetch_depth_for(source.shard_size_hint())
+}
+
+/// The layout-agnostic half of [`resolve_staging_prefetch_depth`].
+///
+/// Takes the hint rather than the source so the column-major staging path can
+/// share it: `ColumnShardSource::csc_shard_size_hint` reports the same
+/// `ShardSizeHint` shape (its `max_rows` counts columns, but `decoded_bytes()`
+/// is the same arithmetic either way, because a `ScxCsc` has the same three
+/// arrays as a `ScxCsr`). Before this the budget existed on one layout only —
+/// and CSC is the layout whose decode depth this phase raises from 1 to 4.
+pub(crate) fn resolve_staging_prefetch_depth_for(
+    hint: Option<scx_format_io::ShardSizeHint>,
+) -> usize {
     let requested = prefetch::prefetch_depth();
-    let (Some(budget), Some(hint)) = (staging_memory_budget(), source.shard_size_hint()) else {
+    let (Some(budget), Some(hint)) = (staging_memory_budget(), hint) else {
         return requested;
     };
     let depth = prefetch::clamp_prefetch_depth(requested, hint.decoded_bytes(), budget);
@@ -274,6 +291,23 @@ pub struct RawGpuShardSource<'a> {
     /// Decode-prefetch depth for the multi-shard path, resolved once at
     /// construction by [`resolve_staging_prefetch_depth`].
     prefetch_depth: usize,
+    /// Shard indices already host-validated by this adapter.
+    ///
+    /// New on this layout: the CSC adapter has had it since §8.3, but the CSR
+    /// one re-ran both O(nnz) scans on every drive — and GPU DE drives a CSR
+    /// source once per gene chunk. Sound for the same reason it is sound there:
+    /// `source` is a shared borrow held for the adapter's whole lifetime, and
+    /// `ShardSource::read_shard`'s stability contract requires structurally
+    /// equivalent output for a given index across calls.
+    ///
+    /// The borrow alone would **not** be enough — a `&self` method may return
+    /// whatever it likes, and this crate's own `GenerationalCsrSource` test
+    /// fixture returns different values on every call. What makes the memo
+    /// sound is the documented contract on the trait, which that fixture
+    /// honours: it varies values only, never index order, bounds or
+    /// finiteness. Raised by codex - gpt-5.6-sol, who noted that a shared
+    /// borrow does not imply repeatable output.
+    memo: ValidationMemo,
 }
 
 impl<'a> RawGpuShardSource<'a> {
@@ -353,6 +387,7 @@ impl<'a> RawGpuShardSource<'a> {
             slot,
             copy_stream,
             prefetch_depth,
+            memo: ValidationMemo::new(source.n_shards()),
         })
     }
 
@@ -364,159 +399,165 @@ impl<'a> RawGpuShardSource<'a> {
         self.slot.capacity()
     }
 
-    /// Run `f` over each non-empty shard. Internal driver shared between
-    /// the raw and preprocessed sources — the `transform` closure is
-    /// invoked AFTER the upload event handshake but BEFORE the user
-    /// callback, giving preprocessing variants a hook to modify the
-    /// slot's `data` in place.
-    fn run<F, T>(&mut self, mut f: F, mut transform: T) -> Result<(), GpuError>
+    /// Run `f` over each non-empty shard, via the shared
+    /// [`drive_shards`](crate::staging_driver::drive_shards) lifecycle.
+    ///
+    /// The `transform` closure is invoked AFTER the upload event handshake but
+    /// BEFORE the user callback, giving preprocessing variants a hook to
+    /// modify the slot's `data` in place.
+    ///
+    /// Everything about the ordering — the pinned ring, the host-side DMA gate,
+    /// both device-side event gates, the empty-shard skip, the drain — now
+    /// lives in the driver, which the CSC adapter shares and which
+    /// `staging_driver_tests.rs` exercises on a CPU host. What is left here is
+    /// what the *layout* means.
+    fn run<F, T>(&mut self, f: F, transform: T) -> Result<(), GpuError>
     where
         F: FnMut(usize, &mut GpuCsrSlot) -> Result<(), GpuError>,
         T: FnMut(&GpuDevice, &mut GpuCsrSlot) -> Result<(), GpuError>,
     {
-        let n_shards = self.source.n_shards();
-        if n_shards == 0 {
-            return Ok(());
+        let plan = StagingPlan::all(self.source.n_shards(), self.prefetch_depth);
+        // `ProfiledDecode` still wraps the source, because the prefetch
+        // pipeline owns the decode call and inline timing would silently stop
+        // reporting host-decode time on the multi-shard path.
+        let feeder = CsrFeeder(ProfiledDecode(self.source));
+        let mut stager = CsrStaging {
+            dev: self.dev,
+            pinned: &mut self.pinned,
+            pinned_events: &mut self.pinned_events,
+            slot: &mut self.slot,
+            memo: &mut self.memo,
+            copy_stream: &self.copy_stream,
+            f,
+            transform,
+        };
+        drive_shards(&feeder, &mut stager, &plan)
+    }
+}
+
+/// Row-major [`ShardFeeder`]: the bounded, ordered decode-prefetch over CSR
+/// shards.
+struct CsrFeeder<'a>(ProfiledDecode<'a>);
+
+impl ShardFeeder for CsrFeeder<'_> {
+    type Shard = scx_sparse::ScxCsr;
+
+    fn feed(
+        &self,
+        plan: &StagingPlan,
+        consume: ShardConsumer<'_, Self::Shard>,
+    ) -> Result<(), GpuError> {
+        // `_uncached`: a single staging pass over a caching source gains
+        // nothing from warming its LRU and would only evict a co-resident
+        // reader's entries.
+        prefetch::for_each_shard_ordered_uncached_selected(
+            &self.0,
+            &plan.indices,
+            plan.depth,
+            |i, csr| consume(i, &csr),
+        )
+    }
+}
+
+/// Row-major [`ShardStager`]: every CUDA call one CSR shard's staging needs.
+///
+/// Holds field references rather than `&mut RawGpuShardSource` because the
+/// feeder needs the source shared while the ring and the device slot are
+/// exclusive — the same split the hand-rolled loop performed by hoisting these
+/// exact bindings out of `&mut self`, now checked by the compiler.
+struct CsrStaging<'r, F, T> {
+    dev: &'r GpuDevice,
+    pinned: &'r mut [PinnedCsrSlot; 2],
+    pinned_events: &'r mut [Option<CudaEvent>; 2],
+    slot: &'r mut GpuCsrSlot,
+    memo: &'r mut ValidationMemo,
+    copy_stream: &'r Arc<CudaStream>,
+    f: F,
+    transform: T,
+}
+
+impl<F, T> ShardStager for CsrStaging<'_, F, T>
+where
+    F: FnMut(usize, &mut GpuCsrSlot) -> Result<(), GpuError>,
+    T: FnMut(&GpuDevice, &mut GpuCsrSlot) -> Result<(), GpuError>,
+{
+    type Shard = scx_sparse::ScxCsr;
+
+    /// Rows, not nonzeros: a CSR shard with rows but no nonzeros must still be
+    /// dispatched, because `GpuPreprocessedShardSource` advances a
+    /// `global_row_offset` per dispatched shard.
+    fn is_stageable(&self, shard: &Self::Shard) -> bool {
+        shard.n_rows() != 0
+    }
+
+    fn validate(&mut self, _idx: usize, shard: &Self::Shard) -> Result<(), GpuError> {
+        validate_shard_for_gpu_de(shard)
+    }
+
+    fn memo(&mut self) -> &mut ValidationMemo {
+        self.memo
+    }
+
+    fn host_wait(&mut self, slot: usize) -> Result<(), GpuError> {
+        if let Some(evt) = self.pinned_events[slot].take() {
+            evt.synchronize()
+                .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
         }
+        Ok(())
+    }
 
-        // Single-shard fast path (no worker thread, no extra copy stream,
-        // no pinned-ring rotation). Safe because there is no successor
-        // `stage()` that could race the in-flight DMA — once `f` returns,
-        // the caller's next host action implicitly orders against the
-        // compute stream and the pinned buffer is free to reuse.
-        if n_shards == 1 {
-            let t_decode = profile::start();
-            let csr = self
-                .source
-                .read_shard(0)
-                .map_err(|e| GpuError::InvalidShard(format!("shard 0: {e}")))?;
-            profile::record_host_decode_since(CodecClass::Generic, t_decode);
-            if csr.n_rows() == 0 {
-                return Ok(());
-            }
-            validate_shard_for_gpu_de(&csr)?;
-            let t_stage = profile::start();
-            self.pinned[0].stage(&csr)?;
-            profile::record_htod_since(CodecClass::Generic, t_stage, csr_htod_bytes(&csr));
-            self.pinned[0].upload_to(
-                self.dev.stream(),
-                &mut self.slot,
-                csr.n_rows(),
-                csr.data.len(),
-                csr.n_cols(),
-            )?;
-            transform(self.dev, &mut self.slot)?;
-            f(0, &mut self.slot)?;
-            return Ok(());
-        }
+    fn stage_and_upload(&mut self, slot: usize, shard: &Self::Shard) -> Result<(), GpuError> {
+        let t_stage = profile::start();
+        self.pinned[slot].stage(shard)?;
+        profile::record_htod_since(CodecClass::Generic, t_stage, csr_htod_bytes(shard));
+        self.pinned[slot].upload_to(
+            self.copy_stream,
+            self.slot,
+            shard.n_rows(),
+            shard.data.len(),
+            shard.n_cols(),
+        )
+    }
 
-        // Multi-shard: a bounded parallel decode feeds the pinned ring.
-        //
-        // Until Phase 4.2 this was a single scoped worker decoding one shard
-        // ahead through a `sync_channel(1)` — one CPU decode thread feeding an
-        // H100, which made every GPU streaming op host-decode-bound (§9.12).
-        // `for_each_shard_ordered_uncached` widens that to `depth` concurrent
-        // decodes on the rayon pool while still delivering shards to the
-        // consumer **on this thread in strict shard order**, which is exactly
-        // the contract the staging body below already assumed — so the pinned
-        // 2-slot ring, the host-side `pinned_events` gate and both device-side
-        // event gates are unchanged.
-        //
-        // Two deliberate consequences:
-        //
-        // * `depth` decoded shards are now live in host RAM instead of ~2.
-        // * Where the pipeline declines to engage — `RAYON_NUM_THREADS=1`, or a
-        //   caller that is itself a rayon worker — decode is now fully
-        //   sequential, whereas the old dedicated `std::thread` overlapped one
-        //   shard ahead unconditionally. Accepted: both cases are an explicit
-        //   "no ambient parallelism" configuration, and the pipeline's
-        //   worker-thread guard is what keeps a nested call from deadlocking.
-        //
-        // An early worker failure now propagates as an `Err` instead of ending
-        // the old `while let Ok(msg) = rx.recv()` loop, which would silently
-        // stage fewer shards than the source has.
-        let dev = self.dev;
-        let pinned = &mut self.pinned;
-        let pinned_events = &mut self.pinned_events;
-        let slot = &mut self.slot;
-        let copy_stream = &self.copy_stream;
-        let compute_stream = dev.stream();
-        let mut pinned_idx: usize = 0;
+    fn gate_copy_to_compute(&mut self, slot: usize) -> Result<(), GpuError> {
+        let upload_event = self
+            .copy_stream
+            .record_event(None)
+            .map_err(|e| GpuError::CudaError(format!("record upload event: {e}")))?;
+        self.dev
+            .stream()
+            .wait(&upload_event)
+            .map_err(|e| GpuError::CudaError(format!("compute wait: {e}")))?;
+        // The same event is stashed against this slot so the next drive that
+        // recycles it has something to host-wait on.
+        self.pinned_events[slot] = Some(upload_event);
+        Ok(())
+    }
 
-        let profiled = ProfiledDecode(self.source);
-        let scope_result = prefetch::for_each_shard_ordered_uncached(
-            &profiled,
-            self.prefetch_depth,
-            |i, csr| -> Result<(), GpuError> {
-                if csr.n_rows() == 0 {
-                    return Ok(());
-                }
+    fn dispatch(&mut self, idx: usize, _shard: &Self::Shard) -> Result<(), GpuError> {
+        (self.transform)(self.dev, self.slot)?;
+        (self.f)(idx, self.slot)
+    }
 
-                // Host-side gate: if this pinned slot still has an
-                // outstanding copy-stream event from a previous shard, we
-                // must wait for that DMA to drain on the host before
-                // overwriting the pinned buffer. The device-side gates
-                // below only order device streams against each other;
-                // they do not prevent the CPU from racing the DMA's
-                // source memory.
-                if let Some(evt) = pinned_events[pinned_idx].take() {
-                    evt.synchronize()
-                        .map_err(|e| GpuError::CudaError(format!("pinned event sync: {e}")))?;
-                }
+    fn gate_compute_to_copy(&mut self) -> Result<(), GpuError> {
+        let compute_event = self
+            .dev
+            .stream()
+            .record_event(None)
+            .map_err(|e| GpuError::CudaError(format!("record compute event: {e}")))?;
+        self.copy_stream
+            .wait(&compute_event)
+            .map_err(|e| GpuError::CudaError(format!("copy wait: {e}")))
+    }
 
-                validate_shard_for_gpu_de(&csr)?;
-                let t_stage = profile::start();
-                pinned[pinned_idx].stage(&csr)?;
-                profile::record_htod_since(CodecClass::Generic, t_stage, csr_htod_bytes(&csr));
-                pinned[pinned_idx].upload_to(
-                    copy_stream,
-                    slot,
-                    csr.n_rows(),
-                    csr.data.len(),
-                    csr.n_cols(),
-                )?;
-                // Device-side gate (copy → compute): kernel reads must
-                // observe the just-uploaded shard data.
-                let upload_event = copy_stream
-                    .record_event(None)
-                    .map_err(|e| GpuError::CudaError(format!("record upload event: {e}")))?;
-                compute_stream
-                    .wait(&upload_event)
-                    .map_err(|e| GpuError::CudaError(format!("compute wait: {e}")))?;
-                // Stash the same event against this pinned slot so the
-                // next iteration that recycles it can host-wait.
-                pinned_events[pinned_idx] = Some(upload_event);
-
-                transform(dev, slot)?;
-                f(i, slot)?;
-
-                // Device-side gate (compute → copy): the next shard's
-                // upload (which writes into `slot`) must wait for the
-                // current shard's compute reads of `slot` to finish.
-                let compute_event = compute_stream
-                    .record_event(None)
-                    .map_err(|e| GpuError::CudaError(format!("record compute event: {e}")))?;
-                copy_stream
-                    .wait(&compute_event)
-                    .map_err(|e| GpuError::CudaError(format!("copy wait: {e}")))?;
-
-                pinned_idx ^= 1;
-                Ok(())
-            },
-        );
-
-        // Drain any remaining pinned events so the caller may safely
-        // mutate or drop the pinned host buffers immediately after this
-        // function returns. Cheap in the common case — by the time we
-        // reach this point the DMAs are typically already complete.
+    fn drain(&mut self) -> Result<(), GpuError> {
         for evt in self.pinned_events.iter_mut() {
             if let Some(e) = evt.take() {
                 e.synchronize()
                     .map_err(|err| GpuError::CudaError(format!("pinned drain sync: {err}")))?;
             }
         }
-
-        scope_result
+        Ok(())
     }
 }
 
@@ -790,6 +831,122 @@ mod tests {
             prefetch::clamp_prefetch_depth(2, per_shard, per_shard * 100),
             2
         );
+    }
+
+    /// A CSR source whose single shard carries a **different payload on every
+    /// read**, tagged by a generation counter.
+    ///
+    /// This is the load-bearing half of the cross-drive test below. With a
+    /// fixed fixture, a pinned slot overwritten mid-DMA is overwritten with the
+    /// *same* bytes, so the readback matches and the assertion cannot fail —
+    /// which is what the first version of that test did (found by
+    /// codex - gpt-5.6-sol in review).
+    struct GenerationalCsrSource {
+        rows: usize,
+        n_vars: usize,
+        generation: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GenerationalCsrSource {
+        /// Value base for read `g`. Spaced so two generations share no value,
+        /// and small enough that every value is an exactly-representable f32
+        /// integer (< 2^24).
+        fn base_for(g: usize) -> f32 {
+            (100_000 * (g + 1)) as f32
+        }
+    }
+
+    impl ShardSource for GenerationalCsrSource {
+        fn n_shards(&self) -> usize {
+            1
+        }
+        fn n_obs(&self) -> usize {
+            self.rows
+        }
+        fn n_vars(&self) -> usize {
+            self.n_vars
+        }
+        fn read_shard(&self, _shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            let g = self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(make_csr(self.rows, self.n_vars, Self::base_for(g)))
+        }
+    }
+
+    /// Driving one adapter repeatedly stages each drive's own bytes.
+    ///
+    /// The hardware half of §8.18, and the row-major twin of
+    /// `driving_a_single_shard_csc_source_repeatedly_stages_own_bytes`. Both layouts
+    /// used to special-case a single-shard drive: no ring, no copy stream, and
+    /// **no event recorded**, on the stated grounds that "there is no successor
+    /// `stage()` that could race the in-flight DMA". True within one drive.
+    /// Across two, the second drive re-entered `pinned[0]` while the first
+    /// drive's `memcpy_htod_async` could still be reading it, with nothing on
+    /// the host having synchronised.
+    ///
+    /// `staging_driver_tests.rs` proves the driver *orders* the host-wait; only
+    /// a device can show the bytes survive.
+    ///
+    /// Two properties make this able to fail, and the first version of this
+    /// test had neither (codex - gpt-5.6-sol):
+    ///
+    /// 1. **Every drive carries distinct bytes** (`GenerationalCsrSource`), so
+    ///    a slot overwritten mid-DMA shows up as another generation's values.
+    /// 2. **No host synchronisation between drives.** Device buffers are
+    ///    allocated up front — `cudaMalloc` is itself device-synchronising, so
+    ///    allocating inside the loop would silently insert the very barrier the
+    ///    eventless path lacked — and the single `dev.synchronize()` comes only
+    ///    after all `DRIVES` drives are queued. Readback happens afterwards.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn driving_a_single_shard_csr_source_repeatedly_stages_own_bytes() {
+        let dev = require_gpu!();
+        const ROWS: usize = 65_536;
+        const N_VARS: usize = 16;
+        const DRIVES: usize = 8;
+
+        // `make_csr` emits exactly one nonzero per row.
+        const NNZ: usize = ROWS;
+
+        let src = GenerationalCsrSource {
+            rows: ROWS,
+            n_vars: N_VARS,
+            generation: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut gpu = RawGpuShardSource::new(&dev, &src).unwrap();
+
+        // Pre-allocated: no allocation, and therefore no implicit device
+        // synchronisation, inside the drive loop.
+        let mut captures: Vec<CudaSlice<f32>> = (0..DRIVES)
+            .map(|_| dev.alloc_zeros::<f32>(NNZ).unwrap())
+            .collect();
+
+        for dst in captures.iter_mut() {
+            gpu.for_each_gpu_shard(|_idx, slot| {
+                let view = slot.view();
+                assert_eq!(view.data.len(), NNZ, "fixture nnz must be stable");
+                dev.stream()
+                    .memcpy_dtod(&view.data, dst)
+                    .map_err(|e| GpuError::CudaError(format!("dtod: {e}")))?;
+                Ok(())
+            })
+            .unwrap();
+            // Deliberately no synchronisation here.
+        }
+        dev.synchronize().unwrap();
+
+        for (g, dst) in captures.iter().enumerate() {
+            let mut host = vec![0.0f32; NNZ];
+            dev.stream().memcpy_dtoh(dst, &mut host).unwrap();
+            dev.synchronize().unwrap();
+            let expected = make_csr(ROWS, N_VARS, GenerationalCsrSource::base_for(g)).data;
+            assert_eq!(
+                host, expected,
+                "drive {g} did not stage its own generation — the pinned slot was rewritten \
+                 while this drive's DMA was still reading it"
+            );
+        }
     }
 
     /// A hinted source pre-sizes the staging slot at construction, so the drain
