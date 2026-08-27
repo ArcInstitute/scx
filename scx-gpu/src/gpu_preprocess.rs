@@ -22,7 +22,8 @@
 //! let mut gpu_csr = decode_shard_gpu(&dev, shard_bytes)?;
 //!
 //! // Apply fused normalize+log1p in-place
-//! gpu_normalize_log1p(&dev, &gpu_csr.indptr, &mut gpu_csr.data, gpu_csr.shape.0, 1e4)?;
+//! let (indptr, mut data) = gpu_csr.indptr_and_data_mut();
+//! gpu_normalize_log1p(&dev, &indptr, &mut data, n_rows, 1e4)?;
 //! ```
 //!
 //! ## Numerical differences

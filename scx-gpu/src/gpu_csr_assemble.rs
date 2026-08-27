@@ -130,26 +130,26 @@ pub fn decode_csr_shards_to_device_with_stats(
         // errors, not `debug_assert`s: these bound the `slice_mut` extents used
         // by the `memcpy_dtod` calls below, so a stat-drifted or corrupt shard
         // would otherwise reach a mismatched-extent copy in release.
-        check_device_len(shard.shape.0, rows, &format!("shard {i} rows"))?;
-        check_device_len(shard.indices.len(), nnz, &format!("shard {i} indices"))?;
+        check_device_len(shard.shape().0, rows, &format!("shard {i} rows"))?;
+        check_device_len(shard.indices().len(), nnz, &format!("shard {i} indices"))?;
 
         if nnz > 0 {
             // memcpy_dtod into the [nnz_base, nnz_base + nnz) sub-range — the
             // slice / slice_mut + memcpy_dtod idiom mirrors cusparse.rs:520.
             let mut data_dst = combined_data.slice_mut(nnz_base..nnz_base + nnz);
             dev.stream()
-                .memcpy_dtod(&shard.data, &mut data_dst)
+                .memcpy_dtod(shard.data(), &mut data_dst)
                 .map_err(|e| GpuError::CudaError(format!("dtod data (shard {i}): {e}")))?;
             let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + nnz);
             dev.stream()
-                .memcpy_dtod(&shard.indices, &mut idx_dst)
+                .memcpy_dtod(shard.indices(), &mut idx_dst)
                 .map_err(|e| GpuError::CudaError(format!("dtod indices (shard {i}): {e}")))?;
         }
 
         // Fold the shard's indptr (shard-local, starts at 0) into the global
         // array, offset by the running nnz base. The small indptr is the only
         // array that round-trips to the host.
-        let shard_indptr = dev.dtoh_copy(&shard.indptr)?;
+        let shard_indptr = dev.dtoh_copy(shard.indptr())?;
         check_device_len(shard_indptr.len(), rows + 1, &format!("shard {i} indptr"))?;
         for &v in &shard_indptr[1..=rows] {
             combined_indptr.push(nnz_base as i64 + v);
@@ -173,12 +173,13 @@ pub fn decode_csr_shards_to_device_with_stats(
     dev.synchronize()?;
 
     Ok((
-        GpuCsr {
-            indptr: combined_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (total_rows, n_cols),
-        },
+        GpuCsr::new(
+            combined_indptr,
+            combined_indices,
+            combined_data,
+            (total_rows, n_cols),
+            "assembled CSR",
+        )?,
         stats,
     ))
 }
@@ -292,18 +293,18 @@ mod tests {
         let gpu_csr = decode_csr_shards_to_device(&dev, &refs).unwrap();
 
         let total_rows: usize = shard_specs.iter().map(|s| s.len()).sum();
-        assert_eq!(gpu_csr.shape, (total_rows, n_cols as usize));
+        assert_eq!(gpu_csr.shape(), (total_rows, n_cols as usize));
         assert_eq!(
-            dev.dtoh_copy(&gpu_csr.indptr).unwrap(),
+            dev.dtoh_copy(gpu_csr.indptr()).unwrap(),
             exp_indptr,
             "indptr"
         );
         assert_eq!(
-            dev.dtoh_copy(&gpu_csr.indices).unwrap(),
+            dev.dtoh_copy(gpu_csr.indices()).unwrap(),
             exp_indices,
             "indices"
         );
-        assert_eq!(dev.dtoh_copy(&gpu_csr.data).unwrap(), exp_data, "data");
+        assert_eq!(dev.dtoh_copy(gpu_csr.data()).unwrap(), exp_data, "data");
     }
 
     /// A single shard round-trips identically to a direct `decode_shard_gpu`.
@@ -319,18 +320,18 @@ mod tests {
 
         let direct = decode_shard_gpu(&dev, &bytes).unwrap();
         let assembled = decode_csr_shards_to_device(&dev, &[bytes.as_slice()]).unwrap();
-        assert_eq!(direct.shape, assembled.shape);
+        assert_eq!(direct.shape(), assembled.shape());
         assert_eq!(
-            dev.dtoh_copy(&direct.indptr).unwrap(),
-            dev.dtoh_copy(&assembled.indptr).unwrap()
+            dev.dtoh_copy(direct.indptr()).unwrap(),
+            dev.dtoh_copy(assembled.indptr()).unwrap()
         );
         assert_eq!(
-            dev.dtoh_copy(&direct.indices).unwrap(),
-            dev.dtoh_copy(&assembled.indices).unwrap()
+            dev.dtoh_copy(direct.indices()).unwrap(),
+            dev.dtoh_copy(assembled.indices()).unwrap()
         );
         assert_eq!(
-            dev.dtoh_copy(&direct.data).unwrap(),
-            dev.dtoh_copy(&assembled.data).unwrap()
+            dev.dtoh_copy(direct.data()).unwrap(),
+            dev.dtoh_copy(assembled.data()).unwrap()
         );
     }
 

@@ -1124,12 +1124,13 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
         let d_indptr = dev.htod_copy(&plan.combined_indptr)?;
         dev.synchronize()?;
         return Ok((
-            GpuCsr {
-                indptr: d_indptr,
-                indices: combined_indices,
-                data: combined_data,
-                shape: (total_rows, n_cols),
-            },
+            GpuCsr::new(
+                d_indptr,
+                combined_indices,
+                combined_data,
+                (total_rows, n_cols),
+                "nvcomp cross-shard batch (empty)",
+            )?,
             DeviceDecodeStats {
                 host_uploaded_bytes,
                 device_decoded_bytes: 0,
@@ -1208,12 +1209,13 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
     dev.synchronize()?;
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (total_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (total_rows, n_cols),
+            "nvcomp cross-shard batch",
+        )?,
         DeviceDecodeStats {
             host_uploaded_bytes,
             device_decoded_bytes: (total_nnz as u64) * 8,

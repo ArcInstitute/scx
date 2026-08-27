@@ -92,6 +92,10 @@ pub mod test_utils;
 
 pub mod backed_gpu_matrix_source;
 pub mod cast_gpu;
+// `pub(crate)`: the CSR length and placement invariants are internal machinery.
+// They are deliberately CUDA-free so `cargo test` reaches them on a host with no
+// GPU; every caller is a decode path inside this crate.
+pub(crate) mod csr_placement;
 pub mod cublas;
 pub mod curand;
 pub mod cusolver;

@@ -1629,7 +1629,7 @@ impl PyExperiment {
             let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode, n_shufdelta_gpu) =
                 match fast {
                     Some((adata, n_cols, gpu_csr, decode_stats)) => {
-                        let n_rows = gpu_csr.shape.0;
+                        let n_rows = gpu_csr.shape().0;
                         let holder = crate::accel::gpu_handoff::adopt_device_csr(dev, gpu_csr)?;
                         // Honest transfer mode: a genuine fully-in-VRAM Scx1 decode (only the
                         // tiny indptr uploaded — framed Scx1 shards decode group-by-group in

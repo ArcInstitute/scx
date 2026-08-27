@@ -131,7 +131,7 @@ pub fn sparse_to_dense_gpu(
     hvg_map: Option<&CudaSlice<u32>>,
     n_output_cols: usize,
 ) -> Result<CudaSlice<f32>, GpuError> {
-    let (n_rows, _n_cols) = gpu_csr.shape;
+    let (n_rows, _n_cols) = gpu_csr.shape();
 
     if n_rows == 0 || n_output_cols == 0 {
         return device.alloc_zeros::<f32>(0);
@@ -172,16 +172,16 @@ pub fn sparse_to_dense_gpu_into(
     n_output_cols: usize,
     scratch: &mut CudaSlice<f32>,
 ) -> Result<(), GpuError> {
-    let (n_rows, _n_cols) = gpu_csr.shape;
+    let (n_rows, _n_cols) = gpu_csr.shape();
     if n_rows == 0 {
         return Ok(());
     }
-    let nnz = gpu_csr.data.len();
+    let nnz = gpu_csr.data().len();
     sparse_to_dense_gpu_into_view(
         device,
-        &gpu_csr.indptr.slice(..n_rows + 1),
-        &gpu_csr.indices.slice(..nnz),
-        &gpu_csr.data.slice(..nnz),
+        &gpu_csr.indptr().slice(..n_rows + 1),
+        &gpu_csr.indices().slice(..nnz),
+        &gpu_csr.data().slice(..nnz),
         n_rows,
         hvg_map,
         n_output_cols,
@@ -364,7 +364,7 @@ mod tests {
 
         // GPU decode to GpuCsr
         let gpu_csr = decode_shard_gpu(&dev, &shard_bytes).unwrap();
-        assert_eq!(gpu_csr.shape, (5, 100));
+        assert_eq!(gpu_csr.shape(), (5, 100));
 
         // GPU sparse → dense (no HVG)
         let d_dense = sparse_to_dense_gpu(&dev, &gpu_csr, None, n_cols as usize).unwrap();

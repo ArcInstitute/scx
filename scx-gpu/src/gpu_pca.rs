@@ -1634,12 +1634,14 @@ mod tests {
             "fixture premise: row 3 must have no nonzeros"
         );
 
-        let gpu_csr = crate::shard_decode::GpuCsr {
-            indptr: dev.htod_copy(&indptr).unwrap(),
-            indices: dev.htod_copy(&indices).unwrap(),
-            data: dev.htod_copy(&data).unwrap(),
-            shape: (n_obs, n_vars),
-        };
+        let gpu_csr = crate::shard_decode::GpuCsr::new(
+            dev.htod_copy(&indptr).unwrap(),
+            dev.htod_copy(&indices).unwrap(),
+            dev.htod_copy(&data).unwrap(),
+            (n_obs, n_vars),
+            "beta-zero test fixture",
+        )
+        .unwrap();
         let desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
 
         // V = all ones (n_vars × k), so a written row is non-zero exactly when

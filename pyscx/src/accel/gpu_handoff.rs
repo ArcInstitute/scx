@@ -218,17 +218,22 @@ pub(crate) fn upload_host_csr(
     let d_data = dev
         .htod_copy(data)
         .map_err(|e| PyRuntimeError::new_err(format!("HtoD data: {e}")))?;
-    let csr = scx_accel::GpuCsr {
-        indptr: d_indptr,
-        indices: d_indices,
-        data: d_data,
-        shape: (n_rows, n_cols),
-    };
+    let csr = scx_accel::GpuCsr::new(
+        d_indptr,
+        d_indices,
+        d_data,
+        (n_rows, n_cols),
+        "host CSR upload",
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
     // Synchronize so the (async) uploads complete before a cuPy consumer reads
     // the exposed device pointers.
     dev.synchronize()
         .map_err(|e| PyRuntimeError::new_err(format!("GPU upload synchronize: {e}")))?;
     let ptrs = csr.device_pointers(dev.stream());
+    // `GpuCsr::new` has established that indices and data agree, so this is the
+    // matrix's nnz and not merely one buffer's length. Read before the move.
+    let nnz = csr.nnz();
     Ok(GpuCsrMatrix {
         csr,
         _dev: dev,
@@ -237,7 +242,7 @@ pub(crate) fn upload_host_csr(
         indptr_ptr: ptrs.indptr_ptr,
         n_rows,
         n_cols,
-        nnz: indices.len(),
+        nnz,
     })
 }
 
@@ -257,8 +262,8 @@ pub(crate) fn adopt_device_csr(
 ) -> PyResult<GpuCsrMatrix> {
     dev.synchronize()
         .map_err(|e| PyRuntimeError::new_err(format!("GPU device-CSR synchronize: {e}")))?;
-    let (n_rows, n_cols) = csr.shape;
-    let nnz = csr.indices.len();
+    let (n_rows, n_cols) = csr.shape();
+    let nnz = csr.nnz();
     let ptrs = csr.device_pointers(dev.stream());
     Ok(GpuCsrMatrix {
         csr,
@@ -321,8 +326,8 @@ pub fn gpu_decode_shard(
         dev.synchronize()
             .map_err(|e| PyRuntimeError::new_err(format!("GPU decode synchronize: {e}")))?;
 
-        let (n_rows, n_cols) = csr.shape;
-        let nnz = csr.indices.len();
+        let (n_rows, n_cols) = csr.shape();
+        let nnz = csr.nnz();
         let ptrs = csr.device_pointers(dev.stream());
 
         Ok(GpuShardCsr {

@@ -6,7 +6,7 @@
 
 use std::io::Cursor;
 
-use cudarc::driver::safe::CudaSlice;
+use cudarc::driver::safe::{CudaSlice, CudaView, CudaViewMut};
 
 use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
@@ -47,15 +47,134 @@ pub(crate) fn check_device_len(got: usize, declared: usize, what: &str) -> Resul
 ///
 /// Type layout matches scipy CSR conventions: i64 indptr, i32 indices, f32 data.
 /// Binary-compatible with cuSPARSE and cupy `__cuda_array_interface__`.
+///
+/// The fields are **private** and [`GpuCsr::new`] is the only way to build one:
+/// the constructor's length check is worth nothing if a holder can put the
+/// buffers back out of agreement afterwards, and `to_cusparse_csr` /
+/// `device_pointers` hand their raw pointers to cuSPARSE and cuPy sized from a
+/// single `nnz`. `#[non_exhaustive]` in addition, so the compile error a
+/// downstream crate gets names the reason rather than a private field.
+///
+/// Read them through [`GpuCsr::indptr`] / [`indices`](GpuCsr::indices) /
+/// [`data`](GpuCsr::data) / [`shape`](GpuCsr::shape), and mutate the values
+/// through [`GpuCsr::data_mut`] or [`GpuCsr::indptr_and_data_mut`], which hand
+/// out **views** — a `&mut` to the field would let a holder replace the whole
+/// allocation and change its length.
+#[non_exhaustive]
 pub struct GpuCsr {
     /// Compressed row pointer array (`n_rows + 1` elements, i64).
-    pub indptr: CudaSlice<i64>,
+    indptr: CudaSlice<i64>,
     /// Column indices array (`nnz` elements, i32).
-    pub indices: CudaSlice<i32>,
+    indices: CudaSlice<i32>,
     /// Non-zero values array (`nnz` elements, f32).
-    pub data: CudaSlice<f32>,
+    data: CudaSlice<f32>,
     /// Matrix dimensions `(n_rows, n_cols)`.
-    pub shape: (usize, usize),
+    shape: (usize, usize),
+}
+
+impl GpuCsr {
+    /// Build a `GpuCsr`, rejecting a triple whose buffers do not describe the
+    /// same matrix.
+    ///
+    /// **This is the only way one is constructed, and the only way the buffers
+    /// are ever set.** The fields are private, so no holder can replace one
+    /// afterwards and put the triple back out of agreement — which is what a
+    /// constructor check alone would have left open, and what
+    /// `to_cusparse_csr` / `device_pointers` would then have trusted.
+    ///
+    /// An earlier version of this kept the fields public on the grounds that
+    /// they were read "in hundreds of places across three crates". Measured, it
+    /// was 34 sites in this crate alone — the estimate had swept in `GpuCsrSlot`
+    /// and the host `ScxCsr`. `#[non_exhaustive]` stays as well, so a downstream
+    /// crate's compile error names the reason rather than a private field.
+    ///
+    /// It matters because nothing used to check it. Every decode path built one
+    /// by struct literal from two separately-derived buffers, and `pyscx`'s
+    /// device-CSR handoff then took `nnz = indices.len()`, ignored
+    /// `data.len()`, and handed both raw pointers to a `cupyx` CSR — which
+    /// reads `nnz` elements out of each. A shorter `data` was an out-of-bounds
+    /// device read with nothing in between to notice.
+    ///
+    /// `what` names the caller for the error message; it is never appended to
+    /// on the success path.
+    pub fn new(
+        indptr: CudaSlice<i64>,
+        indices: CudaSlice<i32>,
+        data: CudaSlice<f32>,
+        shape: (usize, usize),
+        what: &str,
+    ) -> Result<Self, GpuError> {
+        crate::csr_placement::check_csr_lengths(
+            indptr.len(),
+            indices.len(),
+            data.len(),
+            shape.0,
+            what,
+        )?;
+        Ok(Self {
+            indptr,
+            indices,
+            data,
+            shape,
+        })
+    }
+
+    /// Compressed row pointer, `n_rows + 1` elements.
+    pub fn indptr(&self) -> &CudaSlice<i64> {
+        &self.indptr
+    }
+
+    /// Column indices, [`nnz`](GpuCsr::nnz) elements.
+    pub fn indices(&self) -> &CudaSlice<i32> {
+        &self.indices
+    }
+
+    /// Values, [`nnz`](GpuCsr::nnz) elements.
+    pub fn data(&self) -> &CudaSlice<f32> {
+        &self.data
+    }
+
+    /// Values, mutably — for in-place transforms such as normalize / log1p.
+    ///
+    /// Returns a **view**, not `&mut CudaSlice<f32>`. An `&mut` to the field
+    /// would let safe downstream Rust replace the whole allocation
+    /// (`*csr.data_mut() = shorter`, `mem::swap(a.data_mut(), b.data_mut())`)
+    /// and so change the length — reopening exactly the out-of-bounds device
+    /// read private fields were introduced to close, since `to_cusparse_csr`
+    /// and `device_pointers` still size the matrix from `indices().len()` while
+    /// handing over the `data` pointer. A `CudaViewMut` borrows the allocation
+    /// rather than owning it, so a kernel can rewrite the contents and nothing
+    /// can swap the buffer out from under the invariant.
+    ///
+    /// `GpuCsrSlot::data_mut` in `staging.rs` had this shape already.
+    pub fn data_mut(&mut self) -> CudaViewMut<'_, f32> {
+        self.data.slice_mut(..)
+    }
+
+    /// The row pointer and the values together, for an in-place transform that
+    /// needs both — `gpu_normalize_log1p` and friends.
+    ///
+    /// One method rather than `indptr()` + `data_mut()`, because those cannot
+    /// be live at once: NLL does not see disjoint fields through method calls,
+    /// so the two-call form is `error[E0502]`. Inside one method the borrows
+    /// are of distinct fields and are fine.
+    pub fn indptr_and_data_mut(&mut self) -> (CudaView<'_, i64>, CudaViewMut<'_, f32>) {
+        (self.indptr.slice(..), self.data.slice_mut(..))
+    }
+
+    /// Matrix dimensions `(n_rows, n_cols)`.
+    pub fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+
+    /// Number of stored non-zeros.
+    ///
+    /// Equal to both `indices.len()` and `data.len()`: [`GpuCsr::new`] refuses
+    /// to build one where they differ, which is what makes this a fact about
+    /// the matrix rather than a property of whichever buffer was asked.
+    pub fn nnz(&self) -> usize {
+        self.indices.len()
+    }
 }
 
 /// Host→device transfer accounting for a device decode, surfaced for the
@@ -355,12 +474,13 @@ fn decode_scx1_gpu(
 
     stats.n_shards_scx1_gpu = 1;
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: d_indices,
-            data: d_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            d_indices,
+            d_data,
+            (n_rows, n_cols),
+            "unframed Scx1 shard",
+        )?,
         stats,
     ))
 }
@@ -415,12 +535,13 @@ fn decode_host_bounce(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: d_indices,
-            data: d_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            d_indices,
+            d_data,
+            (n_rows, n_cols),
+            "host-bounced shard",
+        )?,
         stats,
     ))
 }
@@ -534,12 +655,13 @@ fn decode_framed_scx1_gpu(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (n_rows, n_cols),
+            "framed Scx1 shard",
+        )?,
         stats,
     ))
 }
@@ -623,12 +745,13 @@ fn decode_framed_shufdelta_gpu(
             ..DeviceDecodeStats::default()
         };
         return Ok((
-            GpuCsr {
-                indptr: pcsr.indptr,
-                indices: pcsr.indices,
-                data: pcsr.data,
-                shape: (n_rows, n_cols),
-            },
+            GpuCsr::new(
+                pcsr.indptr,
+                pcsr.indices,
+                pcsr.data,
+                (n_rows, n_cols),
+                "framed ShufDeltaZstd shard (nvcomp)",
+            )?,
             stats,
         ));
     }
@@ -652,12 +775,13 @@ fn decode_framed_shufdelta_gpu(
             ..DeviceDecodeStats::default()
         };
         return Ok((
-            GpuCsr {
-                indptr: pcsr.indptr,
-                indices: pcsr.indices,
-                data: pcsr.data,
-                shape: (n_rows, n_cols),
-            },
+            GpuCsr::new(
+                pcsr.indptr,
+                pcsr.indices,
+                pcsr.data,
+                (n_rows, n_cols),
+                "framed ShufDeltaZstd shard (pipelined)",
+            )?,
             stats,
         ));
     }
@@ -726,12 +850,13 @@ fn decode_framed_shufdelta_gpu(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (n_rows, n_cols),
+            "framed ShufDeltaZstd shard (sequential)",
+        )?,
         stats,
     ))
 }
@@ -802,12 +927,13 @@ fn decode_shufdelta_gpu(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (n_rows, n_cols),
+            "unframed ShufDeltaZstd shard",
+        )?,
         stats,
     ))
 }

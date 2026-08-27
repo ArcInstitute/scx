@@ -161,12 +161,13 @@ pub(crate) fn try_build_resident_csr(
     let d_indptr = dev.htod_copy(&indptr)?;
     let d_indices = dev.htod_copy(&indices)?;
     let d_data = dev.htod_copy(&data)?;
-    Ok(Some(GpuCsr {
-        indptr: d_indptr,
-        indices: d_indices,
-        data: d_data,
-        shape: (n_obs, n_vars),
-    }))
+    Ok(Some(GpuCsr::new(
+        d_indptr,
+        d_indices,
+        d_data,
+        (n_obs, n_vars),
+        "resident PCA CSR",
+    )?))
 }
 
 /// [`PcaOperator`] over a device-resident CSR.
