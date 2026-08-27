@@ -58,6 +58,57 @@ pub struct GpuCsr {
     pub shape: (usize, usize),
 }
 
+impl GpuCsr {
+    /// Build a `GpuCsr`, rejecting a triple whose buffers do not describe the
+    /// same matrix.
+    ///
+    /// **This is the only way one is constructed.** The fields stay public —
+    /// they are read in hundreds of places across three crates — so the
+    /// invariant is held by routing every construction through here and by a CI
+    /// guard that rejects a re-introduced `GpuCsr { .. }` literal, the same
+    /// arrangement `FileHeader` uses in `scx-format`.
+    ///
+    /// It matters because nothing used to check it. Every decode path built one
+    /// by struct literal from two separately-derived buffers, and `pyscx`'s
+    /// device-CSR handoff then took `nnz = indices.len()`, ignored
+    /// `data.len()`, and handed both raw pointers to a `cupyx` CSR — which
+    /// reads `nnz` elements out of each. A shorter `data` was an out-of-bounds
+    /// device read with nothing in between to notice.
+    ///
+    /// `what` names the caller for the error message; it is never appended to
+    /// on the success path.
+    pub fn new(
+        indptr: CudaSlice<i64>,
+        indices: CudaSlice<i32>,
+        data: CudaSlice<f32>,
+        shape: (usize, usize),
+        what: &str,
+    ) -> Result<Self, GpuError> {
+        crate::csr_placement::check_csr_lengths(
+            indptr.len(),
+            indices.len(),
+            data.len(),
+            shape.0,
+            what,
+        )?;
+        Ok(Self {
+            indptr,
+            indices,
+            data,
+            shape,
+        })
+    }
+
+    /// Number of stored non-zeros.
+    ///
+    /// Equal to both `indices.len()` and `data.len()`: [`GpuCsr::new`] refuses
+    /// to build one where they differ, which is what makes this a fact about
+    /// the matrix rather than a property of whichever buffer was asked.
+    pub fn nnz(&self) -> usize {
+        self.indices.len()
+    }
+}
+
 /// Host→device transfer accounting for a device decode, surfaced for the
 /// `transfer_mode` / `bytes_uploaded` route metadata.
 ///
@@ -355,12 +406,13 @@ fn decode_scx1_gpu(
 
     stats.n_shards_scx1_gpu = 1;
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: d_indices,
-            data: d_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            d_indices,
+            d_data,
+            (n_rows, n_cols),
+            "unframed Scx1 shard",
+        )?,
         stats,
     ))
 }
@@ -415,12 +467,13 @@ fn decode_host_bounce(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: d_indices,
-            data: d_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            d_indices,
+            d_data,
+            (n_rows, n_cols),
+            "host-bounced shard",
+        )?,
         stats,
     ))
 }
@@ -534,12 +587,13 @@ fn decode_framed_scx1_gpu(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (n_rows, n_cols),
+            "framed Scx1 shard",
+        )?,
         stats,
     ))
 }
@@ -623,12 +677,13 @@ fn decode_framed_shufdelta_gpu(
             ..DeviceDecodeStats::default()
         };
         return Ok((
-            GpuCsr {
-                indptr: pcsr.indptr,
-                indices: pcsr.indices,
-                data: pcsr.data,
-                shape: (n_rows, n_cols),
-            },
+            GpuCsr::new(
+                pcsr.indptr,
+                pcsr.indices,
+                pcsr.data,
+                (n_rows, n_cols),
+                "framed ShufDeltaZstd shard (nvcomp)",
+            )?,
             stats,
         ));
     }
@@ -652,12 +707,13 @@ fn decode_framed_shufdelta_gpu(
             ..DeviceDecodeStats::default()
         };
         return Ok((
-            GpuCsr {
-                indptr: pcsr.indptr,
-                indices: pcsr.indices,
-                data: pcsr.data,
-                shape: (n_rows, n_cols),
-            },
+            GpuCsr::new(
+                pcsr.indptr,
+                pcsr.indices,
+                pcsr.data,
+                (n_rows, n_cols),
+                "framed ShufDeltaZstd shard (pipelined)",
+            )?,
             stats,
         ));
     }
@@ -726,12 +782,13 @@ fn decode_framed_shufdelta_gpu(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (n_rows, n_cols),
+            "framed ShufDeltaZstd shard (sequential)",
+        )?,
         stats,
     ))
 }
@@ -802,12 +859,13 @@ fn decode_shufdelta_gpu(
     };
 
     Ok((
-        GpuCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (n_rows, n_cols),
-        },
+        GpuCsr::new(
+            d_indptr,
+            combined_indices,
+            combined_data,
+            (n_rows, n_cols),
+            "unframed ShufDeltaZstd shard",
+        )?,
         stats,
     ))
 }

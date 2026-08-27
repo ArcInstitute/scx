@@ -173,12 +173,13 @@ pub fn decode_csr_shards_to_device_with_stats(
     dev.synchronize()?;
 
     Ok((
-        GpuCsr {
-            indptr: combined_indptr,
-            indices: combined_indices,
-            data: combined_data,
-            shape: (total_rows, n_cols),
-        },
+        GpuCsr::new(
+            combined_indptr,
+            combined_indices,
+            combined_data,
+            (total_rows, n_cols),
+            "assembled CSR",
+        )?,
         stats,
     ))
 }

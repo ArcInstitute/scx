@@ -1989,6 +1989,98 @@ jobs:
             exit 1
           fi
 
+      # ORG-8.20-3: the GPU CSR length invariants exist once, CUDA-free, and no
+      # `GpuCsr` is built without them.
+      #
+      # Six decode loops assemble a combined device CSR by copying each
+      # row-group's (or shard's) decoded buffers into `combined[base..base+len]`,
+      # and the placement was written out five times for indices and five for
+      # values. The invariant that binds the finished matrix together was in
+      # none of them: nothing checked that a `GpuCsr`'s two nnz-sized arrays had
+      # the same length, while `pyscx`'s device-CSR handoff took
+      # `nnz = indices.len()`, ignored `data.len()`, and handed both raw pointers
+      # to a `cupyx` CSR that reads `nnz` out of each (review §8.9).
+      #
+      # The checks live CUDA-free in their own module for the same reason
+      # ORG-8.20-1's driver and ORG-8.20-2's power loop do: 20 of
+      # `shard_decode.rs`'s 22 tests and all 3 of `gpu_csr_assemble.rs`'s are
+      # `#[ignore = "requires a CUDA GPU"]`, so arithmetic that lives beside them
+      # has no reachable test on any CI runner.
+      - name: Guard — one set of GPU CSR length invariants, CUDA-free (ORG-8.20-3)
+        run: |
+          set -eo pipefail
+          chk=scx-gpu/src/csr_placement.rs
+          chk_tests=scx-gpu/src/csr_placement_tests.rs
+          dec=scx-gpu/src/shard_decode.rs
+          handoff=pyscx/src/accel/gpu_handoff.rs
+          for f in "$chk" "$chk_tests" "$dec" "$handoff"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-3)."; exit 1; }
+          done
+
+          # Test regions must not satisfy a claim about production. Every file
+          # here puts `#[cfg(test)]` at column 0, so truncating there is exact.
+          # Consumers must spell the match `grep … >/dev/null`, never `grep -q`:
+          # under `set -o pipefail`, `-q` closes the pipe on the first hit, `sed`
+          # dies of SIGPIPE, and the pipeline reports failure *because it
+          # matched* — a check that can then only fail.
+          prod() { sed '/^#\[cfg(test)\]/,$d' "$1"; }
+
+          # 1. The check exists.
+          grep -qE '^pub\(crate\) fn check_csr_lengths\(' "$chk" || { echo "::error::$chk no longer declares \`fn check_csr_lengths\` — the CSR length invariants are back to being restated per construction site, which is the state in which none of them stated the one that mattered (review §8.9, ORG-8.20-3)."; exit 1; }
+
+          # 2. ...and it is CUDA-free, which is what makes it testable without a
+          #    GPU. Same denylist as the ORG-8.20-1/-2 driver guards, including
+          #    the spellings that slip past a type-name-only list. Comments are
+          #    stripped: this module's docs name `CudaSlice` while explaining why
+          #    it never holds one, and prose describing a rule tripping the check
+          #    that enforces it has happened repeatedly in these guards.
+          if grep -nE 'cudarc|CudaStream|CudaEvent|CudaSlice|GpuDevice|alloc_zeros|record_event|synchronize\(|\.stream\(\)|memcpy_[dh]to[dh]|\.launch\(' "$chk" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$chk touches CUDA at the line(s) above. It holds arithmetic only — a device type here puts these invariants back behind the sbatch queue (ORG-8.20-3)."
+            exit 1
+          fi
+
+          # 3. And its tests do not open a device. Both halves: the negative, and
+          #    that the file actually exercises the check — a file containing
+          #    nothing satisfies the negative, and ORG-8.20-5 shipped three
+          #    branches that passed exactly that way.
+          if grep -nE 'require_gpu!|GpuDevice::new|#\[ignore' "$chk_tests" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$chk_tests gates on a device at the line(s) above. These tests must run on every CPU host — that is the entire point of keeping the arithmetic out of the CUDA files (ORG-8.20-3)."
+            exit 1
+          fi
+          grep -E 'check_csr_lengths\(' "$chk_tests" >/dev/null || { echo "::error::$chk_tests no longer calls check_csr_lengths — the negative half above passes vacuously on a file that tests nothing (ORG-8.20-3)."; exit 1; }
+
+          # 4. Nothing builds a `GpuCsr` by struct literal. The fields stay
+          #    public (they are read in hundreds of places across three crates),
+          #    so this grep is what holds the constructor's invariant — the same
+          #    arrangement the `FileHeader` guard above uses. Excluded: the
+          #    `struct`/`impl` lines, a `-> GpuCsr {` return type, and comments
+          #    (`GpuCsr::new`'s own docs quote the literal they forbid).
+          if grep -rnE --include='*.rs' --exclude-dir=target '[A-Za-z_:]*GpuCsr[[:space:]]*\{' . \
+               | grep -vE ':[[:space:]]*(//|///|//!)' \
+               | grep -vE '(struct|impl|->)[[:space:]]+[A-Za-z_:]*GpuCsr[[:space:]]*\{'; then
+            echo "::error::a GpuCsr is built by struct literal at the line(s) above. Use GpuCsr::new(..), which rejects a triple whose indices and data disagree — the check nothing performed while pyscx handed both pointers to a cupyx CSR sized from one of them (review §8.9, ORG-8.20-3)."
+            exit 1
+          fi
+
+          # 5. ...and the constructor actually applies the check, rather than
+          #    being a rename of the literal. Plus `nnz()`, which is the whole
+          #    point of the invariant: it is a fact about the matrix only because
+          #    `new` refused to build one where the two buffers disagree.
+          grep -qE '^    pub fn new\(' "$dec" || { echo "::error::$dec no longer declares \`GpuCsr::new\` — branch 4 above then forbids every construction rather than routing it (ORG-8.20-3)."; exit 1; }
+          prod "$dec" | grep -E 'check_csr_lengths\(' >/dev/null || { echo "::error::$dec no longer calls check_csr_lengths — GpuCsr::new has become a rename of the struct literal it replaced, and branch 4 is now enforcing nothing (ORG-8.20-3)."; exit 1; }
+          grep -qE '^    pub fn nnz\(&self\)' "$dec" || { echo "::error::$dec no longer declares \`GpuCsr::nnz\` (ORG-8.20-3)."; exit 1; }
+
+          # 6. The downstream half of §8.9: pyscx's device-CSR handoff reads the
+          #    matrix's nnz, not one buffer's length. `indices.len()` there was
+          #    an out-of-bounds device read the moment `data` was shorter.
+          if prod "$handoff" | sed -e 's#//.*##' | grep -nE 'nnz:?[[:space:]]*=?[[:space:]]*(csr\.)?indices\.len\(\)'; then
+            echo "::error::$handoff derives nnz from indices.len() at the line(s) above. Use csr.nnz(), which GpuCsr::new has established equals data.len() too (review §8.9, ORG-8.20-3)."
+            exit 1
+          fi
+          prod "$handoff" | grep -E 'csr\.nnz\(\)' >/dev/null || { echo "::error::$handoff no longer reads csr.nnz() — the negative half above passes vacuously if the handoff stopped recording an nnz at all (ORG-8.20-3)."; exit 1; }
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police

@@ -1017,12 +1017,14 @@ mod tests {
         let d_indptr = dev.htod_copy(indptr).unwrap();
         let d_indices = dev.htod_copy(indices).unwrap();
         let d_data = dev.htod_copy(data).unwrap();
-        GpuCsr {
-            indptr: d_indptr,
-            indices: d_indices,
-            data: d_data,
-            shape: (n_rows, n_cols),
-        }
+        GpuCsr::new(
+            d_indptr,
+            d_indices,
+            d_data,
+            (n_rows, n_cols),
+            "SpMM test fixture",
+        )
+        .unwrap()
     }
 
     /// Strided SpMM view parity vs a host CSR×dense reference.
