@@ -21,6 +21,8 @@ use std::io::Cursor;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::shard::{ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION};
 
+use crate::combined_csr::CombinedCsr;
+use crate::csr_placement::Placement;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::shard_decode::{
@@ -69,6 +71,8 @@ pub fn decode_csr_shards_to_device_with_stats(
     let mut n_cols: usize = 0;
     let mut per_shard: Vec<(usize, usize)> = Vec::with_capacity(shards.len()); // (rows, nnz)
     let mut all_framed_shufdelta_int = true;
+    // What `clamped_reserve` measures the untrusted `total_rows` against.
+    let mut indptr_encoded_bytes: usize = 0;
     for (i, bytes) in shards.iter().enumerate() {
         let header = ShardHeader::read_from(&mut Cursor::new(bytes))
             .map_err(|e| GpuError::InvalidShard(format!("shard {i} header: {e}")))?;
@@ -91,6 +95,7 @@ pub fn decode_csr_shards_to_device_with_stats(
             .map(|v| v.is_integer())
             .unwrap_or(false);
         all_framed_shufdelta_int &= framed && is_shufdelta && is_integer;
+        indptr_encoded_bytes += header.indptr_length as usize;
         total_rows += rows;
         total_nnz += nnz;
         per_shard.push((rows, nnz));
@@ -110,15 +115,14 @@ pub fn decode_csr_shards_to_device_with_stats(
         return crate::shufdelta_gpu::decode_shufdelta_shards_nvcomp_batched(dev, shards);
     }
 
-    // 2. Allocate the combined nnz-sized device buffers once.
-    let mut combined_data = dev.alloc_zeros::<f32>(total_nnz)?;
-    let mut combined_indices = dev.alloc_zeros::<i32>(total_nnz)?;
+    // 2. Allocate the combined nnz-sized device buffers and the host indptr.
+    //    `total_rows` is summed out of unauthenticated shard headers, so the
+    //    reservation goes through `clamped_reserve` — `Vec::with_capacity`
+    //    calls `handle_alloc_error`, which aborts rather than returning. This
+    //    was the last production reservation in the crate not doing so.
+    let mut combined = CombinedCsr::new(dev, total_nnz, total_rows, indptr_encoded_bytes)?;
 
-    // Host-assembled indptr (tiny: total_rows + 1 elements).
-    let mut combined_indptr: Vec<i64> = Vec::with_capacity(total_rows + 1);
-    combined_indptr.push(0);
-
-    // 3. Decode each shard onto the device, dtod-copy into the combined buffer
+    // 3. Decode each shard onto the device, place it into the combined buffer
     //    at the running nnz offset, and fold its indptr into the host array.
     let mut nnz_base: usize = 0;
     let mut stats = DeviceDecodeStats::default();
@@ -126,25 +130,24 @@ pub fn decode_csr_shards_to_device_with_stats(
         let (rows, nnz) = per_shard[i];
         let (shard, shard_stats) = decode_shard_gpu_with_stats(dev, bytes)?;
         stats.merge(&shard_stats);
-        // Catalog stats vs. what the shard actually decoded to. Returned
-        // errors, not `debug_assert`s: these bound the `slice_mut` extents used
-        // by the `memcpy_dtod` calls below, so a stat-drifted or corrupt shard
-        // would otherwise reach a mismatched-extent copy in release.
+        // Catalog stats vs. what the shard actually decoded to. This is one of
+        // only two places the length half of the placement check has content —
+        // the other is framed Scx1's per-row varint sizing; everywhere else the
+        // decoded buffer was sized by `alloc_zeros` from the declared length.
         check_device_len(shard.shape().0, rows, &format!("shard {i} rows"))?;
-        check_device_len(shard.indices().len(), nnz, &format!("shard {i} indices"))?;
 
-        if nnz > 0 {
-            // memcpy_dtod into the [nnz_base, nnz_base + nnz) sub-range — the
-            // slice / slice_mut + memcpy_dtod idiom mirrors cusparse.rs:520.
-            let mut data_dst = combined_data.slice_mut(nnz_base..nnz_base + nnz);
-            dev.stream()
-                .memcpy_dtod(shard.data(), &mut data_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod data (shard {i}): {e}")))?;
-            let mut idx_dst = combined_indices.slice_mut(nnz_base..nnz_base + nnz);
-            dev.stream()
-                .memcpy_dtod(shard.indices(), &mut idx_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod indices (shard {i}): {e}")))?;
-        }
+        // Unconditional, including `nnz == 0`: the check is the point, and the
+        // old code ran it for every shard. Gating the whole call on `nnz > 0`
+        // narrowed it to non-empty shards, which is a quieter gate than the
+        // comment above claims. `place` skips the memcpy itself when the unit is
+        // empty, so nothing issues a zero-length copy.
+        let at = Placement {
+            base: nnz_base,
+            len: nnz,
+            op: "shard",
+            index: i,
+        };
+        combined.place(dev, at, shard.indices(), shard.data())?;
 
         // Fold the shard's indptr (shard-local, starts at 0) into the global
         // array, offset by the running nnz base. The small indptr is the only
@@ -152,36 +155,19 @@ pub fn decode_csr_shards_to_device_with_stats(
         let shard_indptr = dev.dtoh_copy(shard.indptr())?;
         check_device_len(shard_indptr.len(), rows + 1, &format!("shard {i} indptr"))?;
         for &v in &shard_indptr[1..=rows] {
-            combined_indptr.push(nnz_base as i64 + v);
+            combined.indptr.push(nnz_base as i64 + v);
         }
 
         nnz_base += nnz;
         // `shard` (its device buffers) is dropped here, before the next shard.
     }
     check_device_len(nnz_base, total_nnz, "assembled CSR nnz")?;
-    check_device_len(
-        combined_indptr.len(),
-        total_rows + 1,
-        "assembled CSR indptr",
-    )?;
 
-    let combined_indptr = dev.htod_copy(&combined_indptr)?;
-
-    // The per-shard Scx1 path launches async Rice/FOR-BP/cast kernels; the dtod
-    // copies are queued on the same stream. Synchronize so a downstream consumer
-    // (a cuPy CSR adopting these buffers) cannot race the still-running work.
-    dev.synchronize()?;
-
-    Ok((
-        GpuCsr::new(
-            combined_indptr,
-            combined_indices,
-            combined_data,
-            (total_rows, n_cols),
-            "assembled CSR",
-        )?,
-        stats,
-    ))
+    // `finish` synchronizes: the per-shard Scx1 path launches async
+    // Rice/FOR-BP/cast kernels and the placements are queued on the same
+    // stream, so a downstream cuPy consumer adopting these buffers must not
+    // race the still-running work.
+    Ok((combined.finish(dev, n_cols, "assembled CSR")?, stats))
 }
 
 #[cfg(test)]
