@@ -18,6 +18,7 @@
 //! Peak GPU memory: ~500 MB for 1M cells (Y, Q matrices + 1 decoded shard).
 
 use cudarc::cublas::sys as cbs;
+use cudarc::cusparse::sys as csp;
 use cudarc::driver::safe::CudaSlice;
 use cudarc::driver::safe::LaunchConfig;
 use cudarc::driver::PushKernelArg;
@@ -26,10 +27,13 @@ use faer::Mat;
 use scx_format_io::ShardSource;
 use scx_sparse::total_variance_from_col_sq;
 
-use crate::cublas::{gpu_sgemm, gpu_transpose_f32, CublasHandle};
+use crate::cublas::{gpu_sgemm, gpu_sgemv, gpu_transpose_f32, CublasHandle};
 use crate::curand::random_gaussian_gpu;
 use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
-use crate::cusparse::{CuSparseWorkspacePool, CusparseHandle};
+use crate::cusparse::{
+    spmm_csr_transpose_view_with_alg, spmm_csr_view_with_alg, CuSparseWorkspacePool,
+    CusparseHandle, CusparseSpMatDescr, DnMatView, DnMatViewMut,
+};
 use crate::device::{flat_launch_1d, GpuDevice};
 use crate::device_resident::DeviceEmbedding;
 use crate::error::GpuError;
@@ -143,6 +147,189 @@ struct RandomizedPcaCore {
     resident_csr: bool,
 }
 
+/// A contiguous run of the matrix's rows, in the global row space.
+///
+/// The streaming path produces one of these per shard; the resident path
+/// produces exactly one, `(0, n_obs)`. Passed as a pair rather than two loose
+/// `usize`s so an offset and a length cannot be swapped at a call site — they
+/// have the same type and, on the resident path, `offset` is always 0, which is
+/// precisely the shape that makes a transposition invisible in testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowSegment {
+    /// First global row this segment covers.
+    pub(crate) offset: usize,
+    /// How many rows it covers.
+    pub(crate) rows: usize,
+}
+
+impl RowSegment {
+    /// The single segment covering every row — what a device-resident matrix
+    /// has, and what a one-shard source degenerates to.
+    pub(crate) fn whole(n_obs: usize) -> Self {
+        Self {
+            offset: 0,
+            rows: n_obs,
+        }
+    }
+}
+
+/// Everything a centered multiply needs that does not depend on which segment
+/// it is working on.
+///
+/// Held as a struct rather than spread across parameters because the two
+/// segment functions below are called from both `PcaOperator` implementations,
+/// and a positional argument list that long is exactly how the streaming and
+/// resident copies of this arithmetic came to disagree about `spmm_policy`
+/// (review §8.11).
+pub(crate) struct PcaMultiplyCtx<'a> {
+    pub(crate) dev: &'a GpuDevice,
+    pub(crate) cusparse: &'a CusparseHandle,
+    /// Rows of the full matrix, and the leading dimension of every `n_obs × k`
+    /// col-major buffer — including a view of only one segment's rows.
+    pub(crate) n_obs: usize,
+    pub(crate) n_vars: usize,
+    pub(crate) k: usize,
+    /// The cuSPARSE SpMM algorithm the caller's [`SpmmAlgPolicy`] resolved to.
+    ///
+    /// [`SpmmAlgPolicy`]: crate::math_policy::SpmmAlgPolicy
+    pub(crate) alg: csp::cusparseSpMMAlg_t,
+}
+
+/// `mc = Vᵀ·μ` (length `k`) — the forward multiply's mean pre-factor.
+///
+/// Computed once per multiply, not once per segment: it depends only on `V` and
+/// `μ`. cuBLAS `sgemv` on the device replaces the D→H round-trip the pre-G2
+/// streaming implementation used.
+pub(crate) fn forward_mean_prefactor(
+    ctx: &PcaMultiplyCtx<'_>,
+    cublas: &CublasHandle,
+    d_v: &CudaSlice<f32>,
+    d_mu: &CudaSlice<f32>,
+    d_mc: &mut CudaSlice<f32>,
+) -> Result<(), GpuError> {
+    gpu_sgemv(
+        cublas,
+        ctx.dev.stream(),
+        d_v,
+        d_mu,
+        d_mc,
+        ctx.n_vars,
+        ctx.k,
+        1.0,
+        0.0,
+        cbs::cublasOperation_t::CUBLAS_OP_T,
+    )
+}
+
+/// One segment of `out = (X − μ)·V`: `out[seg.offset .. seg.offset + seg.rows, :]`.
+///
+/// `V` is contiguous col-major `(n_vars × k)`; the output is a **strided** view
+/// into the full `(n_obs × k)` buffer at `seg.offset` with `ld = n_obs`, so the
+/// SpMM writes its rows in place and no per-segment dense temporary exists.
+/// `β = 0`, so this segment's rows are overwritten rather than accumulated —
+/// segments are disjoint by construction.
+///
+/// `d_mc` is [`forward_mean_prefactor`]'s output, or `None` when
+/// `zero_center == false`.
+///
+/// The resident path is this with a single segment `(0, n_obs)`, where the
+/// strided view degenerates to `DnMatViewMut::contiguous` — the same numbers,
+/// which is why one function serves both.
+pub(crate) fn spmm_forward_segment(
+    ctx: &PcaMultiplyCtx<'_>,
+    pool: &mut CuSparseWorkspacePool,
+    desc: &CusparseSpMatDescr,
+    d_v: &CudaSlice<f32>,
+    d_out: &mut CudaSlice<f32>,
+    d_mc: Option<&CudaSlice<f32>>,
+    seg: RowSegment,
+) -> Result<(), GpuError> {
+    let b_view = DnMatView::contiguous(d_v, ctx.n_vars as i64, ctx.k as i64);
+    let c_view = DnMatViewMut {
+        buf: d_out,
+        offset_elems: seg.offset,
+        rows: seg.rows as i64,
+        cols: ctx.k as i64,
+        ld: ctx.n_obs as i64,
+    };
+    spmm_csr_view_with_alg(
+        ctx.cusparse,
+        ctx.dev.stream(),
+        ctx.dev,
+        Some(pool),
+        desc,
+        b_view,
+        c_view,
+        1.0,
+        0.0,
+        ctx.alg,
+    )?;
+
+    if let Some(mc) = d_mc {
+        gpu_mean_correct_colmajor_strided(
+            ctx.dev, d_out, mc, seg.rows, ctx.k, seg.offset, ctx.n_obs,
+        )?;
+    }
+    Ok(())
+}
+
+/// One segment of `out = (X − μ)ᵀ·Y`, **accumulating** into the contiguous
+/// `(n_vars × k)` output.
+///
+/// `Y` is read as a strided view at `seg.offset` with `ld = n_obs`; the output
+/// is contiguous and every segment adds to the same elements, so `β = 1` and the
+/// caller must zero `d_out` before the first segment. That is the one memset in
+/// this file which is load-bearing rather than defensive.
+///
+/// Centering is **not** applied here: `out[v, j] −= μ[v]·Σ_r Y[r, j]` needs the
+/// column sums of the whole `Y`, so it runs once after every segment — see
+/// [`transpose_centering_correction`].
+pub(crate) fn spmm_transpose_segment(
+    ctx: &PcaMultiplyCtx<'_>,
+    pool: &mut CuSparseWorkspacePool,
+    desc: &CusparseSpMatDescr,
+    d_y: &CudaSlice<f32>,
+    d_out: &mut CudaSlice<f32>,
+    seg: RowSegment,
+) -> Result<(), GpuError> {
+    let b_view = DnMatView {
+        buf: d_y,
+        offset_elems: seg.offset,
+        rows: seg.rows as i64,
+        cols: ctx.k as i64,
+        ld: ctx.n_obs as i64,
+    };
+    let c_view = DnMatViewMut::contiguous(d_out, ctx.n_vars as i64, ctx.k as i64);
+    spmm_csr_transpose_view_with_alg(
+        ctx.cusparse,
+        ctx.dev.stream(),
+        ctx.dev,
+        Some(pool),
+        desc,
+        b_view,
+        c_view,
+        1.0,
+        1.0,
+        ctx.alg,
+    )
+}
+
+/// `out[v, j] −= μ[v] · (Σ_r Y[r, j])` — the transpose multiply's centering
+/// correction, applied once after every segment has accumulated.
+///
+/// `d_sum_q` (length `k`) is caller-owned scratch, reused across power
+/// iterations rather than allocated per multiply.
+pub(crate) fn transpose_centering_correction(
+    ctx: &PcaMultiplyCtx<'_>,
+    d_y: &CudaSlice<f32>,
+    d_out: &mut CudaSlice<f32>,
+    d_mu: &CudaSlice<f32>,
+    d_sum_q: &mut CudaSlice<f32>,
+) -> Result<(), GpuError> {
+    gpu_column_sums_into(ctx.dev, d_y, d_sum_q, ctx.n_obs, ctx.k)?;
+    gpu_outer_sub(ctx.dev, d_out, d_mu, d_sum_q, ctx.n_vars, ctx.k)
+}
+
 /// `slot ← qr(slot)`, keeping the caller's buffer allocation alive.
 ///
 /// QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in). Both
@@ -153,13 +340,16 @@ struct RandomizedPcaCore {
 /// `n_vars × k` transpose output is re-allocated per iteration. Net cost: one
 /// `std::mem::swap` per QR call, no allocation, no copy.
 ///
-/// The resident path **still carries a second adapter** as of this commit:
-/// `qr_into_stable` (`gpu_pca_resident.rs`) allocates a scratch copy and
-/// round-trips `Q` through two D2D copies purely to hold the slot's device
-/// *pointer* fixed for a CUDA-graph capture PCA no longer performs. PR B of
-/// ORG-8.20-2 moves the resident loop onto this one and deletes it. Two
-/// adapters for one operation is how the two power loops drifted apart in the
-/// first place, so this note should not outlive the stack.
+/// This is the **only** QR adapter. The resident path carried a second one,
+/// `qr_into_stable`, which allocated a scratch copy and round-tripped `Q`
+/// through two device-to-device copies purely to hold the slot's device
+/// *pointer* fixed for a CUDA-graph capture PCA no longer performs — paid on
+/// every one of the `1 + 2·n_power_iterations` factorisations the loop runs, so
+/// five times at the default. Nothing in the resident path holds a pointer into
+/// `d_y` / `d_z`: the cuSPARSE descriptor is built over the resident CSR, and
+/// both buffers are only ever passed by reference. Two adapters for one
+/// operation is how the two power loops drifted apart in the first place
+/// (ORG-8.20-2).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qr_swap_into(
     dev: &GpuDevice,

@@ -24,24 +24,21 @@
 //! The [`GpuPcaTuning`] math mode is applied to the shared cuBLAS handle by the
 //! caller. The SpMM algorithm follows the `SpmmAlgPolicy` math policy.
 
-use cudarc::cublas::sys as cbs;
-use cudarc::cusparse::sys as csp;
 use cudarc::driver::safe::CudaSlice;
 
 use scx_format_io::ShardSource;
 
-use crate::cublas::{gpu_sgemv, CublasHandle};
-use crate::cusolver::{gpu_cholesky_qr2, gpu_qr_q, CusolverHandle, QrMethod};
-use crate::cusparse::{
-    spmm_csr_transpose_view_with_alg, spmm_csr_view_with_alg, CuSparseWorkspacePool,
-    CusparseHandle, CusparseSpMatDescr, DnMatView, DnMatViewMut,
-};
+use crate::cublas::CublasHandle;
+use crate::cusolver::{CusolverHandle, QrMethod};
+use crate::cusparse::{CuSparseWorkspacePool, CusparseHandle, CusparseSpMatDescr};
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::gpu_pca::{
-    gpu_column_sums_into, gpu_mean_correct_colmajor_strided, gpu_outer_sub, GpuPcaScratch,
+    forward_mean_prefactor, qr_swap_into, spmm_forward_segment, spmm_transpose_segment,
+    transpose_centering_correction, GpuPcaScratch, PcaMultiplyCtx, RowSegment,
 };
 use crate::math_policy::GpuPcaTuning;
+use crate::pca_operator::{run_power_loop, ForwardOperand, PcaBuf, PcaOperator};
 use crate::shard_decode::GpuCsr;
 
 /// VRAM headroom factor applied to the resident-CSR + scratch estimate before
@@ -172,205 +169,104 @@ pub(crate) fn try_build_resident_csr(
     }))
 }
 
-/// Forward segment: `d_out (n_obs × k) = (X − μ)·d_v`, single SpMM on the
-/// resident descriptor + mean correction. No device allocations (capture-safe);
-/// `d_mc` (length `k`) is a caller-provided scratch reused across replays.
-#[allow(clippy::too_many_arguments)]
-fn matmat_resident(
-    dev: &GpuDevice,
-    cusparse: &CusparseHandle,
-    cublas: &CublasHandle,
-    desc: &CusparseSpMatDescr,
-    d_means: Option<&CudaSlice<f32>>,
-    d_v: &CudaSlice<f32>,
-    d_out: &mut CudaSlice<f32>,
-    d_mc: &mut CudaSlice<f32>,
-    pool: &mut CuSparseWorkspacePool,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-    alg: csp::cusparseSpMMAlg_t,
-) -> Result<(), GpuError> {
-    dev.stream()
-        .memset_zeros(d_out)
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("resident matmat zero: {e}")))?;
+/// [`PcaOperator`] over a device-resident CSR.
+///
+/// The whole matrix is one segment, `(0, n_obs)`, against a fixed cuSPARSE
+/// descriptor — so every method here is the shared segment function called once.
+/// The streaming operator calls the same functions once per shard. That is the
+/// entire difference between the two paths, and stating it this way is what
+/// stops the next divergence: review §8.11 was `spmm_policy` reaching one of
+/// these two multiplies and not the other, and there is now one place for it to
+/// reach.
+///
+/// `d_mc` and `d_sum_q` are length-`k` scratch held across the power loop rather
+/// than allocated per multiply.
+struct ResidentPcaOperator<'a> {
+    ctx: PcaMultiplyCtx<'a>,
+    cublas: &'a CublasHandle,
+    cusolver: &'a CusolverHandle,
+    qr_method: QrMethod,
+    desc: CusparseSpMatDescr,
+    d_means: Option<&'a CudaSlice<f32>>,
+    d_omega: &'a CudaSlice<f32>,
+    scratch: &'a mut GpuPcaScratch,
+    d_mc: CudaSlice<f32>,
+    d_sum_q: CudaSlice<f32>,
+    pool: CuSparseWorkspacePool,
+}
 
-    if let Some(d_mu) = d_means {
-        // mc = Vᵀ·μ (length k), recomputed each call from the current d_v.
-        gpu_sgemv(
+impl PcaOperator for ResidentPcaOperator<'_> {
+    fn matmat(&mut self, src: ForwardOperand) -> Result<(), GpuError> {
+        let Self {
+            ctx,
             cublas,
-            dev.stream(),
-            d_v,
-            d_mu,
+            desc,
+            d_means,
+            d_omega,
+            scratch,
             d_mc,
-            n_vars,
-            k,
-            1.0,
-            0.0,
-            cbs::cublasOperation_t::CUBLAS_OP_T,
-        )?;
+            pool,
+            ..
+        } = self;
+        let GpuPcaScratch { d_y, d_z } = &mut **scratch;
+        let d_v: &CudaSlice<f32> = match src {
+            ForwardOperand::Omega => d_omega,
+            ForwardOperand::Z => d_z,
+        };
+
+        ctx.dev
+            .stream()
+            .memset_zeros(d_y)
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("resident matmat zero: {e}")))?;
+        if let Some(d_mu) = d_means {
+            forward_mean_prefactor(ctx, cublas, d_v, d_mu, d_mc)?;
+        }
+        let mc = d_means.is_some().then_some(&*d_mc);
+        spmm_forward_segment(ctx, pool, desc, d_v, d_y, mc, RowSegment::whole(ctx.n_obs))
     }
 
-    let b_view = DnMatView::contiguous(d_v, n_vars as i64, k as i64);
-    let c_view = DnMatViewMut::contiguous(d_out, n_obs as i64, k as i64);
-    spmm_csr_view_with_alg(
-        cusparse,
-        dev.stream(),
-        dev,
-        Some(pool),
-        desc,
-        b_view,
-        c_view,
-        1.0,
-        0.0,
-        alg,
-    )?;
+    fn rmatmat(&mut self) -> Result<(), GpuError> {
+        let Self {
+            ctx,
+            desc,
+            d_means,
+            scratch,
+            d_sum_q,
+            pool,
+            ..
+        } = self;
+        let GpuPcaScratch { d_y, d_z } = &mut **scratch;
 
-    if d_means.is_some() {
-        gpu_mean_correct_colmajor_strided(dev, d_out, d_mc, n_obs, k, 0, n_obs)?;
+        // Required, not defensive: the segment function accumulates with β = 1
+        // so that a multi-shard streaming drive can sum across shards. With one
+        // segment the accumulation is into zeros, which is the same arithmetic
+        // the pre-unification `β = 0` did.
+        ctx.dev
+            .stream()
+            .memset_zeros(d_z)
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("resident rmatmat zero: {e}")))?;
+        spmm_transpose_segment(ctx, pool, desc, d_y, d_z, RowSegment::whole(ctx.n_obs))?;
+        if let Some(d_mu) = d_means {
+            transpose_centering_correction(ctx, d_y, d_z, d_mu, d_sum_q)?;
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-/// Transpose segment: `d_out (n_vars × k) = (X − μ)ᵀ·d_y`, single transposed
-/// SpMM on the resident descriptor + centering correction. No device
-/// allocations (capture-safe); `d_sum_q` (length `k`) is reused across replays.
-#[allow(clippy::too_many_arguments)]
-fn rmatmat_resident(
-    dev: &GpuDevice,
-    cusparse: &CusparseHandle,
-    desc: &CusparseSpMatDescr,
-    d_means: Option<&CudaSlice<f32>>,
-    d_y: &CudaSlice<f32>,
-    d_out: &mut CudaSlice<f32>,
-    d_sum_q: &mut CudaSlice<f32>,
-    pool: &mut CuSparseWorkspacePool,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-    alg: csp::cusparseSpMMAlg_t,
-) -> Result<(), GpuError> {
-    dev.stream()
-        .memset_zeros(d_out)
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("resident rmatmat zero: {e}")))?;
-
-    let b_view = DnMatView::contiguous(d_y, n_obs as i64, k as i64);
-    let c_view = DnMatViewMut::contiguous(d_out, n_vars as i64, k as i64);
-    // Single SpMM over the whole matrix → β = 0 (overwrite), unlike the
-    // streaming path that accumulates β = 1 across shards.
-    spmm_csr_transpose_view_with_alg(
-        cusparse,
-        dev.stream(),
-        dev,
-        Some(pool),
-        desc,
-        b_view,
-        c_view,
-        1.0,
-        0.0,
-        alg,
-    )?;
-
-    if let Some(d_mu) = d_means {
-        gpu_column_sums_into(dev, d_y, d_sum_q, n_obs, k)?;
-        gpu_outer_sub(dev, d_out, d_mu, d_sum_q, n_vars, k)?;
+    fn qr(&mut self, buf: PcaBuf) -> Result<(), GpuError> {
+        let Self {
+            ctx,
+            cublas,
+            cusolver,
+            qr_method,
+            scratch,
+            ..
+        } = self;
+        let (slot, rows) = match buf {
+            PcaBuf::Y => (&mut scratch.d_y, ctx.n_obs),
+            PcaBuf::Z => (&mut scratch.d_z, ctx.n_vars),
+        };
+        qr_swap_into(ctx.dev, cusolver, cublas, *qr_method, slot, rows, ctx.k)
     }
-    Ok(())
-}
-
-/// QR that preserves the pointer of `stable` (capture-safe). `gpu_qr_q` /
-/// `gpu_cholesky_qr2` swap-and-return a fresh buffer, so we QR a copy and copy
-/// the `Q` factor back into `stable`, leaving its device pointer unchanged.
-fn qr_into_stable(
-    dev: &GpuDevice,
-    cusolver: &CusolverHandle,
-    cublas: &CublasHandle,
-    qr_method: QrMethod,
-    stable: &mut CudaSlice<f32>,
-    rows: usize,
-    cols: usize,
-) -> Result<(), GpuError> {
-    let mut qr_in = dev.alloc_zeros::<f32>(rows * cols)?;
-    dev.stream()
-        .memcpy_dtod(stable, &mut qr_in)
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("qr copy-in: {e}")))?;
-    let q = match qr_method {
-        QrMethod::Householder => gpu_qr_q(cusolver, dev.stream(), dev, &mut qr_in, rows, cols)?,
-        QrMethod::Cholesky => gpu_cholesky_qr2(cublas, cusolver, dev, &mut qr_in, rows, cols)?,
-    };
-    dev.stream()
-        .memcpy_dtod(&q, stable)
-        .map_err(|e| GpuError::KernelLaunchFailed(format!("qr copy-back: {e}")))?;
-    Ok(())
-}
-
-/// One non-captured power iteration on `active`: transpose → QR → forward → QR.
-#[allow(clippy::too_many_arguments)]
-fn power_iter_direct(
-    active: &GpuDevice,
-    cusparse: &CusparseHandle,
-    cublas: &CublasHandle,
-    cusolver: &CusolverHandle,
-    desc: &CusparseSpMatDescr,
-    d_means: Option<&CudaSlice<f32>>,
-    scratch: &mut GpuPcaScratch,
-    d_mc: &mut CudaSlice<f32>,
-    d_sum_q: &mut CudaSlice<f32>,
-    pool: &mut CuSparseWorkspacePool,
-    qr_method: QrMethod,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-    alg: csp::cusparseSpMMAlg_t,
-) -> Result<(), GpuError> {
-    rmatmat_resident(
-        active,
-        cusparse,
-        desc,
-        d_means,
-        &scratch.d_y,
-        &mut scratch.d_z,
-        d_sum_q,
-        pool,
-        n_obs,
-        n_vars,
-        k,
-        alg,
-    )?;
-    qr_into_stable(
-        active,
-        cusolver,
-        cublas,
-        qr_method,
-        &mut scratch.d_z,
-        n_vars,
-        k,
-    )?;
-    matmat_resident(
-        active,
-        cusparse,
-        cublas,
-        desc,
-        d_means,
-        &scratch.d_z,
-        &mut scratch.d_y,
-        d_mc,
-        pool,
-        n_obs,
-        n_vars,
-        k,
-        alg,
-    )?;
-    qr_into_stable(
-        active,
-        cusolver,
-        cublas,
-        qr_method,
-        &mut scratch.d_y,
-        n_obs,
-        k,
-    )?;
-    Ok(())
 }
 
 /// Run the randomized-PCA power loop on a device-resident CSR, filling
@@ -378,8 +274,10 @@ fn power_iter_direct(
 /// with the final `B = (X − μ)ᵀ·Q` (`n_vars × k`, col-major) — exactly the two
 /// buffers the streaming core leaves for the downstream SVD.
 ///
-/// SpMM-segment CUDA-graph capture was removed; this loop dispatches kernels
-/// directly.
+/// The loop itself is [`run_power_loop`]; this function only assembles the
+/// operator. SpMM-segment CUDA-graph capture was removed, so nothing here
+/// requires a fixed device pointer across iterations — which is why the QR
+/// adapter is the shared swap form and not a second, copy-based one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resident_power_loop(
     dev: &GpuDevice,
@@ -401,111 +299,37 @@ pub(crate) fn run_resident_power_loop(
     // poisons the CUDA context on the cuSPARSE versions tested (CUDA 12.x on
     // H100) and was never a measured win. The residency benefit (single upload +
     // one SpMM per segment, no per-iteration re-decode) is delivered by the
-    // direct loop below regardless.
+    // direct loop regardless.
     //
     // Resident scratch + cuSPARSE descriptor are built on the default stream.
     // The descriptor downcasts indptr i64→i32.
-    let mut d_mc = dev.alloc_zeros::<f32>(k)?;
-    let mut d_sum_q = dev.alloc_zeros::<f32>(k)?;
-    let mut pool = CuSparseWorkspacePool::new();
+    let d_mc = dev.alloc_zeros::<f32>(k)?;
+    let d_sum_q = dev.alloc_zeros::<f32>(k)?;
     let desc = gpu_csr.to_cusparse_csr(dev, dev.stream())?;
     dev.synchronize()?;
 
-    // Direct resident loop on the default stream — streams the CSR once, then
-    // runs the power loop as plain cusparseSpMM calls honouring the SpMM policy.
-    run_direct_resident_loop(
-        dev,
-        cusparse,
+    let mut op = ResidentPcaOperator {
+        ctx: PcaMultiplyCtx {
+            dev,
+            cusparse,
+            n_obs,
+            n_vars,
+            k,
+            alg: tuning.spmm_policy.to_alg(),
+        },
         cublas,
         cusolver,
-        &desc,
+        qr_method,
+        desc,
         d_means,
+        d_omega,
         scratch,
-        d_omega,
-        &mut d_mc,
-        &mut d_sum_q,
-        &mut pool,
-        qr_method,
-        n_obs,
-        n_vars,
-        k,
-        n_power_iterations,
-        tuning.spmm_policy.to_alg(),
-    )?;
-    Ok(())
-}
-
-/// Direct (non-captured) resident power loop on `active`, filling `scratch.d_y`
-/// with the final `Q` and `scratch.d_z` with the final `B`. A clean recompute
-/// from `d_omega`, so it is safe to call after a partial captured attempt.
-#[allow(clippy::too_many_arguments)]
-fn run_direct_resident_loop(
-    active: &GpuDevice,
-    cusparse: &CusparseHandle,
-    cublas: &CublasHandle,
-    cusolver: &CusolverHandle,
-    desc: &CusparseSpMatDescr,
-    d_means: Option<&CudaSlice<f32>>,
-    scratch: &mut GpuPcaScratch,
-    d_omega: &CudaSlice<f32>,
-    d_mc: &mut CudaSlice<f32>,
-    d_sum_q: &mut CudaSlice<f32>,
-    pool: &mut CuSparseWorkspacePool,
-    qr_method: QrMethod,
-    n_obs: usize,
-    n_vars: usize,
-    k: usize,
-    n_power_iterations: usize,
-    alg: csp::cusparseSpMMAlg_t,
-) -> Result<(), GpuError> {
-    // Step 3-4: Y = (X − μ)·Ω; Q = qr(Y).
-    matmat_resident(
-        active,
-        cusparse,
-        cublas,
-        desc,
-        d_means,
-        d_omega,
-        &mut scratch.d_y,
         d_mc,
-        pool,
-        n_obs,
-        n_vars,
-        k,
-        alg,
-    )?;
-    qr_into_stable(
-        active,
-        cusolver,
-        cublas,
-        qr_method,
-        &mut scratch.d_y,
-        n_obs,
-        k,
-    )?;
-    // Step 5: power iterations.
-    for _ in 0..n_power_iterations {
-        power_iter_direct(
-            active, cusparse, cublas, cusolver, desc, d_means, scratch, d_mc, d_sum_q, pool,
-            qr_method, n_obs, n_vars, k, alg,
-        )?;
-    }
-    // Step 6: final B = (X − μ)ᵀ·Q.
-    rmatmat_resident(
-        active,
-        cusparse,
-        desc,
-        d_means,
-        &scratch.d_y,
-        &mut scratch.d_z,
         d_sum_q,
-        pool,
-        n_obs,
-        n_vars,
-        k,
-        alg,
-    )?;
-    active.synchronize()?;
+        pool: CuSparseWorkspacePool::new(),
+    };
+    run_power_loop(&mut op, n_power_iterations)?;
+    dev.synchronize()?;
     Ok(())
 }
 
