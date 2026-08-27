@@ -12,11 +12,12 @@ use scx_codec::delta_golomb::delta_golomb_decode;
 use scx_codec::rice::B_VAL;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::shard::{
-    clamped_reserve, resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION,
-    SHARD_HEADER_SIZE,
+    resolve_block_index, ShardHeader, DEFAULT_WRITE_SHARD_FORMAT_VERSION, SHARD_HEADER_SIZE,
 };
 
 use crate::cast_gpu::{cast_u32_to_f32_gpu, cast_u32_to_i32_gpu};
+use crate::combined_csr::CombinedCsr;
+use crate::csr_placement::Placement;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::forbp_gpu::forbp_decode_gpu;
@@ -584,16 +585,7 @@ fn decode_framed_scx1_gpu(
     let spans = resolve_block_index(header, block_index_bytes)
         .map_err(|e| GpuError::InvalidShard(format!("framed Scx1 block index: {e}")))?;
 
-    // Combined nnz-sized device buffers, filled per group at the running offset.
-    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
-    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
-    // Host-assembled global indptr (tiny: n_rows + 1 elements). `n_rows` is
-    // untrusted header data, so reserve through `clamped_reserve` — a ~45 KB
-    // block index can declare 134M rows, and `Vec::with_capacity` aborts on
-    // allocation failure instead of returning.
-    let mut combined_indptr: Vec<i64> =
-        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
-    combined_indptr.push(0);
+    let mut combined = CombinedCsr::new(dev, nnz, n_rows, indptr_bytes.len())?;
 
     // Pass 1: host-assemble the global indptr + per-group nnz base offsets
     // (indices/values frames are never host-decoded). Pass 2 below decodes each
@@ -603,12 +595,11 @@ fn decode_framed_scx1_gpu(
         &spans,
         indptr_bytes,
         0,
-        &mut combined_indptr,
+        &mut combined.indptr,
     )?;
     for (gi, span) in spans.iter().enumerate() {
         let g_rows = span.n_rows as usize;
         let g_nnz = span.nnz as usize;
-        let base = offsets[gi];
 
         if g_nnz > 0 {
             // Decode this group's index + value frames on the device.
@@ -619,31 +610,29 @@ fn decode_framed_scx1_gpu(
             let d_indices = cast_u32_to_i32_gpu(dev, &d_indices_u32)?;
             let d_values_u32 = rice_decode_gpu(dev, vv_frame, g_nnz, B_VAL)?;
             let d_data = cast_u32_to_f32_gpu(dev, &d_values_u32)?;
-            // The block index already guarantees Σ nnz == header.nnz; these
-            // localize a corrupt frame that decoded a different length before it
-            // becomes a mismatched-length dtod copy (mirrors gpu_csr_assemble).
-            check_device_len(d_indices.len(), g_nnz, "framed Scx1 group indices")?;
-            check_device_len(d_data.len(), g_nnz, "framed Scx1 group values")?;
-
-            let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-            dev.stream()
-                .memcpy_dtod(&d_indices, &mut idx_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod indices (framed group): {e}")))?;
-            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-            dev.stream()
-                .memcpy_dtod(&d_data, &mut data_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod data (framed group): {e}")))?;
+            // `place` carries the length check: this is one of only two paths
+            // where it has content, because `forbp_decode_gpu` sizes its output
+            // from the bitstream's own per-row nnz varints rather than from
+            // `g_nnz`. It also carries the bounds check, which was a
+            // `slice_mut` panic here before.
+            combined.place(
+                dev,
+                Placement {
+                    base: offsets[gi],
+                    len: g_nnz,
+                    op: "framed Scx1 group",
+                    index: gi,
+                },
+                &d_indices,
+                &d_data,
+            )?;
         }
     }
+    // The placement tally in `finish` covers this too, but this names the block
+    // index rather than the placement, which is where a disagreement comes from.
     check_device_len(nnz_final, nnz, "framed shard block-index nnz")?;
-    check_device_len(combined_indptr.len(), n_rows + 1, "framed shard indptr")?;
 
-    let indptr_bytes_uploaded = (combined_indptr.len() * 8) as u64;
-    let d_indptr = dev.htod_copy(&combined_indptr)?;
-    // The per-group FOR-BP/Rice/cast kernels and dtod copies are queued async on
-    // the stream; sync so a downstream cuPy consumer cannot race unfinished work.
-    dev.synchronize()?;
-
+    let indptr_bytes_uploaded = (combined.indptr.len() * 8) as u64;
     let stats = DeviceDecodeStats {
         // Only the assembled indptr round-trips host→device; indices+values
         // decode in VRAM (like the unframed Scx1 device path).
@@ -654,16 +643,7 @@ fn decode_framed_scx1_gpu(
         ..DeviceDecodeStats::default()
     };
 
-    Ok((
-        GpuCsr::new(
-            d_indptr,
-            combined_indices,
-            combined_data,
-            (n_rows, n_cols),
-            "framed Scx1 shard",
-        )?,
-        stats,
-    ))
+    Ok((combined.finish(dev, n_cols, "framed Scx1 shard")?, stats))
 }
 
 /// GPU decode of a **framed (v2) ShufDeltaZstd** shard. Selects the fastest
@@ -786,14 +766,7 @@ fn decode_framed_shufdelta_gpu(
         ));
     }
 
-    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
-    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
-    // Untrusted `n_rows` — clamp as above. (The device buffers keep the exact
-    // `nnz`: groups are placed at computed offsets, and `alloc_zeros` surfaces
-    // an over-large request as a `Result`, not a process abort.)
-    let mut combined_indptr: Vec<i64> =
-        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
-    combined_indptr.push(0);
+    let mut combined = CombinedCsr::new(dev, nnz, n_rows, indptr_bytes.len())?;
 
     let mut host_uploaded_bytes: u64 = 0;
     // Pass 1: host-assemble the rebased global indptr + per-group nnz offsets;
@@ -803,11 +776,10 @@ fn decode_framed_shufdelta_gpu(
         &spans,
         indptr_bytes,
         0,
-        &mut combined_indptr,
+        &mut combined.indptr,
     )?;
     for (gi, span) in spans.iter().enumerate() {
         let g_nnz = span.nnz as usize;
-        let base = offsets[gi];
 
         if g_nnz > 0 {
             let ix_frame = &indices_bytes[span.indices.clone()];
@@ -817,28 +789,26 @@ fn decode_framed_shufdelta_gpu(
             let (d_data, up_v) =
                 decode_values_frame_to_device(dev, vv_frame, g_nnz, value_encoding)?;
             host_uploaded_bytes += up_i + up_v;
-            check_device_len(d_indices.len(), g_nnz, "framed ShufDeltaZstd group indices")?;
-            check_device_len(d_data.len(), g_nnz, "framed ShufDeltaZstd group values")?;
-
-            let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-            dev.stream()
-                .memcpy_dtod(&d_indices, &mut idx_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod indices (shufdelta group): {e}")))?;
-            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-            dev.stream()
-                .memcpy_dtod(&d_data, &mut data_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod data (shufdelta group): {e}")))?;
+            // Here the length half is tautological — both buffers were sized
+            // `g_nnz` by `alloc_zeros`, and `decompress_frame` already rejected
+            // a frame that decompressed to the wrong length. The bounds half is
+            // not: `base + g_nnz` past the end used to be a `slice_mut` panic.
+            combined.place(
+                dev,
+                Placement {
+                    base: offsets[gi],
+                    len: g_nnz,
+                    op: "framed ShufDeltaZstd group",
+                    index: gi,
+                },
+                &d_indices,
+                &d_data,
+            )?;
         }
     }
     check_device_len(nnz_final, nnz, "framed shard block-index nnz")?;
-    check_device_len(combined_indptr.len(), n_rows + 1, "framed shard indptr")?;
 
-    host_uploaded_bytes += (combined_indptr.len() * 8) as u64;
-    let d_indptr = dev.htod_copy(&combined_indptr)?;
-    // Per-group kernels + dtod copies are queued async on the stream; sync so a
-    // downstream cuPy consumer cannot race unfinished work.
-    dev.synchronize()?;
-
+    host_uploaded_bytes += (combined.indptr.len() * 8) as u64;
     let stats = DeviceDecodeStats {
         host_uploaded_bytes,
         device_decoded_bytes: (nnz as u64) * 8,
@@ -850,13 +820,7 @@ fn decode_framed_shufdelta_gpu(
     };
 
     Ok((
-        GpuCsr::new(
-            d_indptr,
-            combined_indices,
-            combined_data,
-            (n_rows, n_cols),
-            "framed ShufDeltaZstd shard (sequential)",
-        )?,
+        combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (sequential)")?,
         stats,
     ))
 }
