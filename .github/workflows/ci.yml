@@ -1957,6 +1957,29 @@ jobs:
           #    straggler scan by doing nothing.
           prod scx-gpu/src/linear_operator.rs | grep -E 'BackedGpuMatrixSource::new\(' >/dev/null || { echo "::error::scx-gpu/src/linear_operator.rs no longer builds a BackedGpuMatrixSource in production code — the streaming PCA operator has gone back to a low-level staging adapter (ORG-8.20-1 D4, ORG-8.20-2)."; exit 1; }
 
+          # 9. The streaming drive still checks that its shards tiled the row
+          #    range. Without it a source covering fewer rows than it declares
+          #    returns a full-shaped result with a silently zero-filled tail —
+          #    the up-front memset supplying zeros for rows no shard wrote — and
+          #    nothing downstream can tell that from a real answer. Both halves:
+          #    the check exists, and the drive actually calls it.
+          lin=scx-gpu/src/linear_operator.rs
+          grep -qE '^fn check_row_coverage\(' "$lin" || { echo "::error::$lin no longer declares \`fn check_row_coverage\` — a short source is back to producing a zero-filled tail instead of an error (ORG-8.20-2)."; exit 1; }
+          #    The call half must exclude the declaration itself. Its first
+          #    spelling grepped `check_row_coverage(covered`, which matched the
+          #    function's own parameter list — so deleting the call left the
+          #    guard green. Found by falsifying it; strip comments, then drop
+          #    any line that is the `fn` line.
+          #
+          #    Known limit, stated rather than papered over: a grep cannot tell a
+          #    correct argument from a wrong one, so a call rewritten to
+          #    `check_row_coverage(n_obs, n_obs, op)` — always satisfied — keeps
+          #    this branch green. That mutation is caught instead by
+          #    `a_source_whose_shards_do_not_tile_is_rejected`, which needs a GPU.
+          #    Structure here, behaviour there.
+          prod "$lin" | sed -e 's#//.*##' | grep -E 'check_row_coverage\(' | grep -vqE '^ *fn ' \
+            || { echo "::error::$lin declares check_row_coverage but nothing calls it — the check is dead and the declaration branch above passes on its name alone (ORG-8.20-2)."; exit 1; }
+
           # 7. The seam carries no dead-code silencer. PR A landed one, said PR B
           #    would remove it, and this is what makes that non-optional: if
           #    something in the driver is genuinely unused now, delete it rather

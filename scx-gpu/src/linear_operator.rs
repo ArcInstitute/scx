@@ -43,6 +43,7 @@ use crate::gpu_pca::{
 };
 use crate::math_policy::SpmmAlgPolicy;
 use crate::pca_operator::{ForwardOperand, PcaBuf, PcaOperator};
+use crate::staging::GpuCsrSlot;
 
 /// [`PcaOperator`] that streams the matrix from a [`ShardSource`], one segment
 /// per CSR shard.
@@ -123,6 +124,57 @@ impl<'a> StreamingPcaOperator<'a> {
     }
 }
 
+/// Drive every CSR shard of `source`, handing `f` each shard's slot and the
+/// global row range it occupies, then verify the shards tiled `[0, n_obs)`.
+///
+/// Both multiplies need the identical walk — decode a shard, work out where its
+/// rows sit in the global output, advance — and both need the check, so it is
+/// written once. Extracting it also puts the skip rule in one place: a shard
+/// with zero rows is skipped and contributes nothing to the running offset,
+/// which is safe precisely because `ShardStager::is_stageable` skips on **rows**
+/// and not on nonzeros (a rows-but-no-nonzeros shard is still dispatched, so its
+/// rows still advance the offset).
+///
+/// The tiling check is new. A source whose shards cover fewer rows than
+/// `n_obs` previously produced a silently zero-filled tail — the up-front memset
+/// supplying zeros for rows no shard ever wrote — and a PCA computed against a
+/// matrix the caller did not supply. `error.rs`' rule is that a reader returns
+/// `InvalidShard` on malformed input rather than answering; a short source is
+/// malformed input.
+fn drive_row_segments(
+    source: &mut BackedGpuMatrixSource<'_>,
+    n_obs: usize,
+    op: &str,
+    f: &mut dyn FnMut(RowSegment, &mut GpuCsrSlot) -> Result<(), GpuError>,
+) -> Result<(), GpuError> {
+    let mut offset = 0usize;
+    source.for_each_gpu_csr_shard(&mut |_idx, slot| {
+        let rows = slot.view().shape.0;
+        if rows == 0 {
+            return Ok(());
+        }
+        f(RowSegment { offset, rows }, slot)?;
+        offset += rows;
+        Ok(())
+    })?;
+    check_row_coverage(offset, n_obs, op)
+}
+
+/// The tiling check itself, separated from the drive so it is reachable without
+/// a device — the arithmetic is the part that can be wrong, and the drive is the
+/// part that needs a GPU.
+fn check_row_coverage(covered: usize, n_obs: usize, op: &str) -> Result<(), GpuError> {
+    if covered == n_obs {
+        return Ok(());
+    }
+    Err(GpuError::InvalidShard(format!(
+        "streaming PCA {op}: the source's shards cover {covered} rows but it \
+         declares n_obs = {n_obs}. Shards must tile the whole row range; \
+         short coverage would leave the remaining rows unwritten, and over-coverage \
+         would write past the end of the output"
+    )))
+}
+
 impl PcaOperator for StreamingPcaOperator<'_> {
     fn matmat(&mut self, src: ForwardOperand) -> Result<(), GpuError> {
         let Self {
@@ -142,10 +194,27 @@ impl PcaOperator for StreamingPcaOperator<'_> {
             ForwardOperand::Z => d_z,
         };
 
-        // Zero up front: each shard's SpMM writes only its own row window, so
-        // any row no shard covers would otherwise keep the previous multiply's
-        // values. (ORG-8.20-2 PR D decides whether a tiling check makes this
-        // removable; until it is measured, it stays.)
+        // Kept deliberately, and the decision is measured rather than assumed.
+        //
+        // With `check_row_coverage` proving the segments tile `[0, n_obs)`, and
+        // with `cusparseSpMM` observed to write every row of `C` under β = 0
+        // including the all-zero ones (`spmm_beta_zero_writes_rows_that_have_no_nonzeros`,
+        // H100 / CUDA 12.x), this memset is redundant *today*. ORG-8.20-2's task
+        // text called it redundant outright; it stays anyway, because:
+        //
+        //   * cuSPARSE documents that β = 0 means `C` is not **read**. It does
+        //     not promise `C` is fully **written**, so the redundancy rests on
+        //     observed behaviour, not on a contract.
+        //   * The failure if that behaviour ever changes is a silently wrong
+        //     PCA — an all-zero row keeping the previous power iteration's
+        //     values — which no downstream check can see.
+        //   * The cost is one extra write of the `n_obs × k` output per forward
+        //     multiply, against an SpMM that streams the whole matrix. The
+        //     matrix is the larger term whenever a row averages more than `k`
+        //     nonzeros, which is every single-cell matrix at the default k = 60.
+        //
+        // The test is what makes this a decision instead of a habit: if a future
+        // cuSPARSE stops writing empty rows, it fails and says so.
         ctx.dev
             .stream()
             .memset_zeros(d_y)
@@ -155,18 +224,11 @@ impl PcaOperator for StreamingPcaOperator<'_> {
         }
         let mc = d_means.is_some().then_some(&*d_mc);
 
-        let mut offset = 0usize;
-        source.for_each_gpu_csr_shard(&mut |_idx, slot| {
-            let rows = slot.view().shape.0;
-            if rows == 0 {
-                return Ok(());
-            }
+        drive_row_segments(source, ctx.n_obs, "matmat", &mut |seg, slot| {
             // Cached per slot: reused across power iterations while the slot's
             // pointers and shape are unchanged.
             let desc = slot.cached_sp_descr(ctx.dev, ctx.dev.stream())?;
-            spmm_forward_segment(ctx, pool, desc, d_v, d_y, mc, RowSegment { offset, rows })?;
-            offset += rows;
-            Ok(())
+            spmm_forward_segment(ctx, pool, desc, d_v, d_y, mc, seg)
         })
     }
 
@@ -188,16 +250,9 @@ impl PcaOperator for StreamingPcaOperator<'_> {
             .memset_zeros(d_z)
             .map_err(|e| GpuError::KernelLaunchFailed(format!("rmatmat: zero out: {e}")))?;
 
-        let mut offset = 0usize;
-        source.for_each_gpu_csr_shard(&mut |_idx, slot| {
-            let rows = slot.view().shape.0;
-            if rows == 0 {
-                return Ok(());
-            }
+        drive_row_segments(source, ctx.n_obs, "rmatmat", &mut |seg, slot| {
             let desc = slot.cached_sp_descr(ctx.dev, ctx.dev.stream())?;
-            spmm_transpose_segment(ctx, pool, desc, d_y, d_z, RowSegment { offset, rows })?;
-            offset += rows;
-            Ok(())
+            spmm_transpose_segment(ctx, pool, desc, d_y, d_z, seg)
         })?;
 
         // Once, after every shard: the correction needs Y's column sums over all
@@ -877,5 +932,78 @@ mod tests {
             rev_err < 1e-4,
             "rmatmat under Deterministic diverged from Default: rel_error = {rev_err}"
         );
+    }
+
+    // ---- Row coverage ----
+
+    /// The tiling check's arithmetic, on any host. Ungated and un-`#[ignore]`d
+    /// deliberately: it opens no device, and `tests/gpu_test_gating.rs` rule 1
+    /// is an *iff*.
+    #[test]
+    fn row_coverage_accepts_an_exact_tiling_and_rejects_anything_else() {
+        assert!(check_row_coverage(500, 500, "matmat").is_ok());
+        assert!(check_row_coverage(0, 0, "matmat").is_ok());
+
+        // Short: the case that used to produce a silently zero-filled tail.
+        let err = check_row_coverage(499, 500, "matmat").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            matches!(err, GpuError::InvalidShard(_)),
+            "a source that does not tile is malformed input, not a device failure: {err:?}"
+        );
+        assert!(
+            msg.contains("499") && msg.contains("500") && msg.contains("matmat"),
+            "the message must name both counts and the operation: {msg}"
+        );
+
+        // Over: caught too, because it means the next segment would write past
+        // the end of the output buffer.
+        assert!(check_row_coverage(501, 500, "rmatmat").is_err());
+    }
+
+    /// End to end: a source declaring more rows than its shards carry is
+    /// rejected rather than answered.
+    ///
+    /// Before the check, the up-front memset supplied zeros for every row no
+    /// shard wrote, so this returned a full-shaped result whose tail was zeros —
+    /// a PCA of a matrix the caller never supplied. The failure was invisible
+    /// precisely because the output had the right shape.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn a_source_whose_shards_do_not_tile_is_rejected() {
+        let dev = require_gpu!();
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (200usize, 40usize, 6usize);
+        let csr = random_csr(n_rows, n_cols, 0.1, 5501);
+        // Shards cover `n_rows`; the source claims 40 rows more than that.
+        let source = InMemorySource {
+            shards: split_into_shards(&csr, 4),
+            n_obs: n_rows + 40,
+            n_vars: n_cols,
+        };
+
+        let d_v = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
+        let mut scratch = GpuPcaScratch::new(&dev, n_rows + 40, n_cols, k).unwrap();
+        let mut op = StreamingPcaOperator::new(
+            rig.handles(&dev),
+            &source,
+            None,
+            &d_v,
+            &mut scratch,
+            k,
+            QrMethod::Householder,
+            SpmmAlgPolicy::Default,
+        )
+        .unwrap();
+
+        let err = op.matmat(ForwardOperand::Omega).unwrap_err();
+        assert!(
+            matches!(err, GpuError::InvalidShard(_)),
+            "expected InvalidShard for a source that covers {n_rows} of {} rows, got {err:?}",
+            n_rows + 40
+        );
+        // ...and the transpose direction is checked too, not just the forward.
+        let err = op.rmatmat().unwrap_err();
+        assert!(matches!(err, GpuError::InvalidShard(_)), "rmatmat: {err:?}");
     }
 }

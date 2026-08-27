@@ -214,6 +214,10 @@ impl PcaOperator for ResidentPcaOperator<'_> {
             ForwardOperand::Z => d_z,
         };
 
+        // Kept for the same measured reason as the streaming operator's — see
+        // the note there. One segment covers every row here, so the only thing
+        // this insures against is cuSPARSE ceasing to write `C`'s all-zero rows
+        // under β = 0, which it does write today and does not promise to.
         ctx.dev
             .stream()
             .memset_zeros(d_y)
