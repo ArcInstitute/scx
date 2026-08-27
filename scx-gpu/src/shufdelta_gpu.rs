@@ -3,8 +3,15 @@
 //! The CPU host runs zstd (inherently sequential within a frame); these
 //! launchers take over the two byte-plane transforms that Phase-0 profiling
 //! showed dominate the CPU decode: the per-plane wrapping-u8 delta prefix scan
-//! (`undelta_planes_gpu`) and the plane-major → element-major transpose fused
-//! with the widen-to-i32/f32 convert (`unshuffle_convert_*_gpu`).
+//! (`undelta_planes`) and the plane-major → element-major transpose fused with
+//! the widen-to-i32/f32 convert (`unshuffle_convert_indices` /
+//! `unshuffle_convert_values`).
+//!
+//! Those three are private, so the names are code spans rather than intra-doc
+//! links: this is a `pub mod`, and rustdoc warns on a public doc linking to a
+//! private item. The names still have to be right — they were `undelta_planes_gpu`
+//! and `unshuffle_convert_*_gpu`, one of which this module deleted and the other
+//! of which never existed.
 //!
 //! The two frame helpers ([`decode_indices_frame_to_device`] /
 //! [`decode_values_frame_to_device`]) tie them together: zstd-decompress one
@@ -82,13 +89,22 @@ pub(crate) fn prescan_framed_group_indptr(
 }
 
 // ---------------------------------------------------------------------------
-// Kernel-launch primitives. cudarc's `PushKernelArg` has separate concrete
-// impls for `&CudaSlice`, `&mut CudaSlice`, `&CudaView`, `&mut CudaViewMut`
-// (no blanket `DevicePtr` impl), so the four launchers below cannot share one
-// generic body — the `.arg(buf/src)` line is irreducibly per-type. What *is*
-// shared (and was previously copy-pasted) is the module load + kernel resolve
-// and the `LaunchConfig` constants; those live in these helpers so a kernel
-// name, block size, or grid formula is spelled out exactly once.
+// Kernel-launch primitives. Two kernels, two launch bodies.
+//
+// cudarc's `PushKernelArg` really does have separate concrete impls for
+// `&CudaSlice`, `&mut CudaSlice`, `&CudaView` and `&mut CudaViewMut` with no
+// blanket `DevicePtr` impl, so a single `.arg(buf)` line cannot be generic over
+// all four. This module used to conclude from that that the launchers were
+// irreducibly per-type, and grew six functions for the two kernels — one pair
+// for callers holding a `CudaSlice` (the framed/pipelined paths) and one for
+// callers holding a view into the nvcomp concat buffer.
+//
+// The conclusion does not follow. `CudaSlice::as_view()` / `as_view_mut()` are
+// pure pointer copies — a struct literal, no CUDA call — and the view
+// `PushKernelArg` impls are line-for-line identical to the slice ones, event
+// bookkeeping included. So the view form is canonical here and a slice-holding
+// caller spells `&buf.as_view()`; the kernel name, block size and grid formula
+// are each written once, as before, and now so is each launch.
 // ---------------------------------------------------------------------------
 
 /// Resolve `undelta_planes_kernel` from the cached shufdelta PTX module.
@@ -130,15 +146,32 @@ fn unshuffle_cfg(n: u32) -> LaunchConfig {
 ///
 /// `buf` is plane-major `[width][n]`; each of the `width` planes is scanned
 /// independently. Launches one thread block per plane (`grid_dim.x == width`).
-fn undelta_planes_gpu(
+///
+/// Takes a `CudaViewMut` so the nvcomp paths can pass a sub-range of the concat
+/// buffer directly; a caller holding a whole `CudaSlice` passes
+/// `&mut buf.as_view_mut()`, which costs a pointer copy.
+fn undelta_planes(
     dev: &GpuDevice,
-    buf: &mut CudaSlice<u8>,
-    n: u32,
-    width: u32,
+    buf: &mut CudaViewMut<u8>,
+    n: usize,
+    width: usize,
 ) -> Result<(), GpuError> {
     if n == 0 || width == 0 {
         return Ok(());
     }
+    // Checked for the same reason as in `launch_unshuffle_convert`: the kernel
+    // takes both as `u32` and a truncating cast would scan only the wrapped
+    // prefix of each plane, leaving the tail still delta-encoded.
+    let n = u32::try_from(n).map_err(|_| {
+        GpuError::InvalidShard(format!(
+            "undelta_planes: {n} elements exceeds the kernel's u32 element count"
+        ))
+    })?;
+    let width = u32::try_from(width).map_err(|_| {
+        GpuError::InvalidShard(format!(
+            "undelta_planes: plane width {width} exceeds the kernel's u32 width"
+        ))
+    })?;
     let kernel = undelta_kernel(dev)?;
     unsafe {
         dev.stream()
@@ -152,33 +185,75 @@ fn undelta_planes_gpu(
     Ok(())
 }
 
-/// Unshuffle (plane-major → element-major) fused with widen-to-i32/f32.
+/// Unshuffle (plane-major → element-major) fused with widen-to-i32/f32, into a
+/// freshly allocated `n`-element output.
 ///
-/// `out_is_float == 0` writes `i32` (indices), `1` writes `f32` (values). The
-/// kernel treats `out` as an opaque device pointer, so it is generic over the
-/// output element type `T` — the caller allocates `out` as `i32` or `f32` to
-/// match `out_is_float` and the pointer is forwarded type-agnostically.
-fn launch_unshuffle_convert<T: cudarc::driver::DeviceRepr>(
+/// The kernel treats `out` as an opaque device pointer, so this is generic over
+/// the output element type — but `T` and `out_is_float` **must** agree or the
+/// kernel writes one type's bits through the other's pointer. Nothing in the
+/// signature enforces that, which is why the only two callers are the typed
+/// wrappers below: they are what binds `i32` to `0` and `f32` to `1`, and they
+/// are the only two places the flag is spelled.
+fn launch_unshuffle_convert<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
     dev: &GpuDevice,
-    src: &CudaSlice<u8>,
-    out: &mut CudaSlice<T>,
-    n: u32,
-    width: u32,
+    src: &CudaView<u8>,
+    n: usize,
+    width: usize,
     out_is_float: u32,
-) -> Result<(), GpuError> {
+) -> Result<CudaSlice<T>, GpuError> {
+    let mut out = dev.alloc_zeros::<T>(n)?;
     let kernel = unshuffle_kernel(dev)?;
+    // Checked, not `as`: the kernel takes `n` and `width` as `u32`, and this
+    // function allocates `n` output elements before launching. A truncating
+    // cast would leave the kernel processing only the wrapped prefix — or
+    // receiving a zero-sized grid — while the returned slice still has length
+    // `n`, i.e. a silently short decode. The row-group callers derive `n` from a
+    // `u32` nnz and the widths are small codec constants, but the two public
+    // whole-frame helpers take `usize`, so the cast is not universally safe and
+    // is better failed loudly than proved by inspection of today's callers.
+    let n_u32 = u32::try_from(n).map_err(|_| {
+        GpuError::InvalidShard(format!(
+            "unshuffle_convert: {n} elements exceeds the kernel's u32 element count"
+        ))
+    })?;
+    let w_u32 = u32::try_from(width).map_err(|_| {
+        GpuError::InvalidShard(format!(
+            "unshuffle_convert: element width {width} exceeds the kernel's u32 width"
+        ))
+    })?;
     unsafe {
         dev.stream()
             .launch_builder(&kernel)
             .arg(src)
-            .arg(out)
-            .arg(&n)
-            .arg(&width)
+            .arg(&mut out)
+            .arg(&n_u32)
+            .arg(&w_u32)
             .arg(&out_is_float)
-            .launch(unshuffle_cfg(n))
+            .launch(unshuffle_cfg(n_u32))
     }
     .map_err(|e| GpuError::KernelLaunchFailed(format!("unshuffle_convert_kernel: {e}")))?;
-    Ok(())
+    Ok(out)
+}
+
+/// `unshuffle_convert` → `i32` (column indices).
+fn unshuffle_convert_indices(
+    dev: &GpuDevice,
+    src: &CudaView<u8>,
+    n: usize,
+    width: usize,
+) -> Result<CudaSlice<i32>, GpuError> {
+    launch_unshuffle_convert(dev, src, n, width, 0)
+}
+
+/// `unshuffle_convert` → `f32` (integer values, no undelta — integer values are
+/// shuffle-only on encode).
+fn unshuffle_convert_values(
+    dev: &GpuDevice,
+    src: &CudaView<u8>,
+    n: usize,
+    width: usize,
+) -> Result<CudaSlice<f32>, GpuError> {
+    launch_unshuffle_convert(dev, src, n, width, 1)
 }
 
 /// zstd-decompress one sub-stream frame to its intermediate plane bytes and
@@ -214,9 +289,8 @@ pub fn decode_indices_frame_to_device(
     let expected = nnz * index_width;
     let planes = decompress_frame(compressed, expected, "indices")?;
     let mut d_planes = dev.htod_copy(&planes)?;
-    undelta_planes_gpu(dev, &mut d_planes, nnz as u32, index_width as u32)?;
-    let mut out = dev.alloc_zeros::<i32>(nnz)?;
-    launch_unshuffle_convert(dev, &d_planes, &mut out, nnz as u32, index_width as u32, 0)?;
+    undelta_planes(dev, &mut d_planes.as_view_mut(), nnz, index_width)?;
+    let out = unshuffle_convert_indices(dev, &d_planes.as_view(), nnz, index_width)?;
     Ok((out, expected as u64))
 }
 
@@ -243,9 +317,7 @@ pub fn decode_values_frame_to_device(
     let expected = nnz * width;
     let planes = decompress_frame(compressed, expected, "values")?;
     let d_planes = dev.htod_copy(&planes)?;
-    // `unshuffle_convert_kernel` writes f32 when out_is_float == 1.
-    let mut out = dev.alloc_zeros::<f32>(nnz)?;
-    launch_unshuffle_convert(dev, &d_planes, &mut out, nnz as u32, width as u32, 1)?;
+    let out = unshuffle_convert_values(dev, &d_planes.as_view(), nnz, width)?;
     Ok((out, expected as u64))
 }
 
@@ -468,11 +540,16 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
             // buffers are oversized, so pass the actual g_nnz — the kernels only
             // touch the [0, width*g_nnz) prefix.
             let t_gpu = profile::start();
-            undelta_planes_gpu(dev, &mut dev_idx[slot], g_nnz as u32, index_width as u32)?;
+            undelta_planes(
+                dev,
+                &mut dev_idx[slot].as_view_mut(),
+                g_nnz,
+                index_width,
+            )?;
             let out_indices =
-                unshuffle_convert_indices(dev, &dev_idx[slot], g_nnz, index_width)?;
+                unshuffle_convert_indices(dev, &dev_idx[slot].as_view(), g_nnz, index_width)?;
             let out_data =
-                unshuffle_convert_values(dev, &dev_val[slot], g_nnz, value_width)?;
+                unshuffle_convert_values(dev, &dev_val[slot].as_view(), g_nnz, value_width)?;
             // `place` copies on `dev.stream()`, which *is* `compute_stream`:
             // `GpuDevice::stream` hands back the same `Arc<CudaStream>` bound
             // above, so the ordering against the upload event is unchanged.
@@ -565,86 +642,11 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     })
 }
 
-/// `unshuffle_convert` → i32 (indices). Thin wrapper over the shared launcher.
-fn unshuffle_convert_indices(
-    dev: &GpuDevice,
-    src: &CudaSlice<u8>,
-    n: usize,
-    width: usize,
-) -> Result<CudaSlice<i32>, GpuError> {
-    let mut out = dev.alloc_zeros::<i32>(n)?;
-    launch_unshuffle_convert(dev, src, &mut out, n as u32, width as u32, 0)?;
-    Ok(out)
-}
-
-/// `unshuffle_convert` → f32 (integer values, no undelta).
-fn unshuffle_convert_values(
-    dev: &GpuDevice,
-    src: &CudaSlice<u8>,
-    n: usize,
-    width: usize,
-) -> Result<CudaSlice<f32>, GpuError> {
-    let mut out = dev.alloc_zeros::<f32>(n)?;
-    launch_unshuffle_convert(dev, src, &mut out, n as u32, width as u32, 1)?;
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Phase 2: nvcomp full in-VRAM decode (upload compressed, GPU zstd, then the
 // same undelta/unshuffle/convert kernels). View-based launchers operate on the
 // per-group sub-ranges of the single big nvcomp output buffer (no extra copies).
 // ---------------------------------------------------------------------------
-
-/// In-place per-plane undelta on a `CudaViewMut` sub-range (plane-major
-/// `[width][n]`). Same kernel as [`undelta_planes_gpu`], view-typed for the
-/// nvcomp concat buffer.
-fn undelta_planes_view(
-    dev: &GpuDevice,
-    buf: &mut CudaViewMut<u8>,
-    n: u32,
-    width: u32,
-) -> Result<(), GpuError> {
-    if n == 0 || width == 0 {
-        return Ok(());
-    }
-    let kernel = undelta_kernel(dev)?;
-    unsafe {
-        dev.stream()
-            .launch_builder(&kernel)
-            .arg(buf)
-            .arg(&n)
-            .arg(&width)
-            .launch(undelta_cfg(width))
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("undelta_planes_kernel (view): {e}")))?;
-    Ok(())
-}
-
-/// Unshuffle+convert reading a `CudaView` sub-range → newly allocated i32/f32.
-fn unshuffle_convert_view<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
-    dev: &GpuDevice,
-    src: &CudaView<u8>,
-    n: usize,
-    width: usize,
-    out_is_float: u32,
-) -> Result<CudaSlice<T>, GpuError> {
-    let mut out = dev.alloc_zeros::<T>(n)?;
-    let kernel = unshuffle_kernel(dev)?;
-    let n_u32 = n as u32;
-    let w_u32 = width as u32;
-    unsafe {
-        dev.stream()
-            .launch_builder(&kernel)
-            .arg(src)
-            .arg(&mut out)
-            .arg(&n_u32)
-            .arg(&w_u32)
-            .arg(&out_is_float)
-            .launch(unshuffle_cfg(n_u32))
-    }
-    .map_err(|e| GpuError::KernelLaunchFailed(format!("unshuffle_convert_kernel (view): {e}")))?;
-    Ok(out)
-}
 
 // ---------------------------------------------------------------------------
 // Per-group assembly from batched nvcomp plane buffers into the combined CSR.
@@ -673,11 +675,11 @@ fn assemble_group_indices_view(
     let ilen = g_nnz * index_width;
     {
         let mut idx_view = d_idx_planes.slice_mut(idx_off..idx_off + ilen);
-        undelta_planes_view(dev, &mut idx_view, g_nnz as u32, index_width as u32)?;
+        undelta_planes(dev, &mut idx_view, g_nnz, index_width)?;
     }
-    let out_i: CudaSlice<i32> = {
+    let out_i = {
         let idx_view = d_idx_planes.slice(idx_off..idx_off + ilen);
-        unshuffle_convert_view(dev, &idx_view, g_nnz, index_width, 0)?
+        unshuffle_convert_indices(dev, &idx_view, g_nnz, index_width)?
     };
     combined.place_indices(dev, at, &out_i)
 }
@@ -696,9 +698,9 @@ fn assemble_group_values_view(
 ) -> Result<(), GpuError> {
     let g_nnz = at.len;
     let vlen = g_nnz * value_width;
-    let out_v: CudaSlice<f32> = {
+    let out_v = {
         let val_view = d_val_planes.slice(val_off..val_off + vlen);
-        unshuffle_convert_view(dev, &val_view, g_nnz, value_width, 1)?
+        unshuffle_convert_values(dev, &val_view, g_nnz, value_width)?
     };
     combined.place_values(dev, at, &out_v)
 }
