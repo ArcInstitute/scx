@@ -102,12 +102,25 @@ absolute_floors:
   # silently fell back to re-decoding every shard for every chunk — the
   # quadratic that made GPU DE 98.6 % host-decode-bound at census_500k.
   #
-  # Emitted only on CSR because the CSC-direct route prefilters by column
-  # range and has no residency decision to make; scoring it would be
-  # meaningless rather than N/A. `check_absolute_floors` skips a triple whose
-  # metric is absent, so on a run that takes the CSC route these floors are
-  # simply inert — which is the same "no CSC fixture this run" shape the
-  # `*_csc_direct` gates above rely on, only mirrored.
+  # ALWAYS emitted on a GPU run: 1.0 means "held resident OR not applicable",
+  # 0.0 means a CSR route silently lost residency. The CSC-direct route makes
+  # no residency decision, so it reports the vacuous 1.0 — the same convention
+  # `de_route_csc_direct` uses above.
+  #
+  # ⚠️ An earlier version emitted this ONLY on a `gpu_csr*` route, on the
+  # premise that "`check_absolute_floors` skips a triple whose metric is
+  # absent, so on a run that takes the CSC route these floors are simply
+  # inert". **That premise was false.** `check_absolute_floors` skips a triple
+  # whose RESULT is missing (`_triple_was_run`); a triple that ran and lacks
+  # the metric is a violation — its docstring reads "missing, NaN, or violates
+  # the configured threshold". And because `accel_de` always builds a CSC
+  # sidecar, every GPU run takes `gpu_csc_v3`, so the metric was never emitted
+  # and these two floors were structurally unsatisfiable: they could only fail,
+  # or be silently scoped out on a run that did not schedule the triple. Phase
+  # 7's gate ran pbmc3k + census_1m and never exposed it; the Phase 8b gate ran
+  # tabula_sapiens_100k and failed on both (job 2850131) while the DE routes
+  # were entirely correct (`de_route_csc_direct` = `wilcoxon_route_csc_direct`
+  # = 1.0). Fixed in `accel_de.py` by always emitting.
   #
   # A 0.0 means one of: the VRAM pre-flight refused (the matrix outgrew
   # `SCX_GPU_DE_RESIDENT_MAX_FRAC` of free memory — real, and worth knowing
