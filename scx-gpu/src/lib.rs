@@ -126,6 +126,10 @@ pub(crate) mod gpu_shard_source;
 pub mod linear_operator;
 pub mod math_policy;
 pub mod nvcomp;
+// `pub(crate)`: the randomized-PCA power-loop driver and its operator trait are
+// internal machinery. `gpu_randomized_pca` (in `gpu_pca`) is the public entry
+// point; exposing the loop would invite a third copy of it.
+pub(crate) mod pca_operator;
 pub mod preprocessed_gpu_matrix_source;
 pub mod profile;
 pub mod resident_gpu_csr_source;

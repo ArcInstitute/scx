@@ -1843,6 +1843,79 @@ jobs:
             exit 1
           fi
 
+      # ORG-8.20-2: the randomized-PCA power loop exists once, behind a seam a
+      # CPU host can test.
+      #
+      # GPU randomized PCA was implemented twice end to end — streaming
+      # (`linear_operator.rs` + the loop in `gpu_pca.rs`) and resident
+      # (`gpu_pca_resident.rs`) — and the copies drifted: review §8.11 is
+      # `spmm_policy="deterministic"` honoured by one and silently dropped by
+      # the other, on the out-of-VRAM path that is the whole point of streaming.
+      #
+      # The seam is shaped like ORG-8.20-1's: ordering on one side, CUDA on the
+      # other. It has to be, for the same reason — `gpu_pca.rs`,
+      # `gpu_pca_resident.rs` and `linear_operator.rs` hold 16 tests between
+      # them and all 16 are `#[ignore = "requires a CUDA GPU"]`, so the power
+      # loop had no coverage reachable on any CI runner and a rewrite of it
+      # could not be watched red.
+      - name: Guard — one PCA power loop, CUDA-free and CPU-tested (ORG-8.20-2)
+        run: |
+          set -eo pipefail
+          drv=scx-gpu/src/pca_operator.rs
+          fake=scx-gpu/src/pca_operator_tests.rs
+          pca=scx-gpu/src/gpu_pca.rs
+          for f in "$drv" "$fake" "$pca"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-2)."; exit 1; }
+          done
+
+          # 1. The seam exists. Both halves: without the trait the loop has
+          #    nothing to dispatch through, and without the driver each path
+          #    writes its own loop again.
+          grep -qE '^pub\(crate\) trait PcaOperator \{' "$drv" || { echo "::error::$drv no longer declares \`trait PcaOperator\` — the two PCA paths have no shared contract, which is how spmm_policy ended up honoured by one of them and dropped by the other (review §8.11, ORG-8.20-2)."; exit 1; }
+          grep -qE '^pub\(crate\) fn run_power_loop[<(]' "$drv" || { echo "::error::$drv no longer declares \`fn run_power_loop\` — the power loop is back to being written once per path (ORG-8.20-2)."; exit 1; }
+
+          # 2. ...and the driver is CUDA-free, which is what makes it testable
+          #    without a GPU. Same denylist as the ORG-8.20-1 driver guard,
+          #    including the five spellings codex found slipping past a
+          #    type-name-only list (`GpuDevice`, `dev.stream()`,
+          #    `stream.memcpy_htod`, `stream.launch`, `GpuDevice::new(0)`).
+          #    Comments are stripped: this module's own docs name `CudaSlice`
+          #    while explaining why it never holds one, and prose describing a
+          #    rule tripping the check that enforces it has now happened four
+          #    times in these guards.
+          if grep -nE 'cudarc|CudaStream|CudaEvent|CudaSlice|GpuDevice|alloc_zeros|record_event|synchronize\(|\.stream\(\)|memcpy_[dh]to[dh]|\.launch\(' "$drv" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$drv touches CUDA at the line(s) above. The driver holds ordering only — every device interaction belongs behind a PcaOperator method, or this stops being testable without a GPU (ORG-8.20-2)."
+            exit 1
+          fi
+
+          # 3. And the fake does not open a device. A fake that did would put
+          #    the loop back behind the sbatch queue, which is the one thing
+          #    this seam exists to prevent.
+          if grep -nE 'require_gpu!|GpuDevice::new|#\[ignore' "$fake" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$fake gates on a device at the line(s) above. Its tests must run on every CPU host — all 16 tests across gpu_pca.rs, gpu_pca_resident.rs and linear_operator.rs already do not (ORG-8.20-2)."
+            exit 1
+          fi
+          # ...and it is not empty. Checks 2 and 3 are both negatives: a file
+          # containing nothing at all satisfies them, and so does one whose
+          # fakes stopped implementing the trait. ORG-8.20-5 shipped three
+          # branches that passed exactly this way.
+          grep -qE '^impl PcaOperator for ' "$fake" || { echo "::error::$fake no longer implements PcaOperator — the negative halves above pass vacuously on a file with no fake in it (ORG-8.20-2)."; exit 1; }
+
+          # 4. One QR adapter. The resident path used to carry a second one
+          #    (`qr_into_stable`) that allocated a scratch copy and round-tripped
+          #    Q through two D2D copies to hold a device pointer fixed for
+          #    CUDA-graph capture — capture PCA no longer does. Two adapters for
+          #    one operation is the shape that drifted.
+          #    The absence half — that no *second* adapter exists — cannot be
+          #    asserted yet: `qr_into_stable` is still live in
+          #    `gpu_pca_resident.rs` until the resident path moves onto the seam.
+          #    PR B deletes it and adds that branch here. Written down rather
+          #    than left implicit, so a stack that stops after PR A leaves a
+          #    visible gap instead of a silently half-enforced rule.
+          grep -qE '^pub\(crate\) fn qr_swap_into\(' "$pca" || { echo "::error::$pca no longer declares \`fn qr_swap_into\` — the QR adapter is back to existing once per power loop (ORG-8.20-2)."; exit 1; }
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
