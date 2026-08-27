@@ -31,11 +31,10 @@
 //! combined buffer panicked inside a library rather than returning
 //! `InvalidShard`. Both operands descend from unauthenticated block-index and
 //! shard-header fields. That upgrade is the reason to have one placement rather
-//! than five; it reaches all six loops once the migration finishes, and at this
-//! commit two of them are through — the framed Scx1 and framed
-//! ShufDeltaZstd-sequential paths in `shard_decode.rs`. The pipelined, both
-//! nvcomp, and `gpu_csr_assemble` loops still place by hand until the next
-//! commit in this series.
+//! than five, and it now reaches **all six** loops: framed Scx1 and framed
+//! ShufDeltaZstd-sequential in `shard_decode.rs`, the pipelined and both nvcomp
+//! loops in `shufdelta_gpu.rs`, and the per-shard concat in
+//! `gpu_csr_assemble.rs`.
 
 use cudarc::driver::safe::CudaSlice;
 
@@ -89,6 +88,24 @@ impl CombinedCsr {
         let mut indptr: Vec<i64> =
             Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_encoded_bytes, 8));
         indptr.push(0);
+        Self::with_indptr(dev, nnz, n_rows, indptr)
+    }
+
+    /// Allocate the combined buffers around an `indptr` the caller has already
+    /// assembled, complete with its leading `0`.
+    ///
+    /// The cross-shard nvcomp path builds its global `indptr` during the
+    /// pre-scan that flattens every shard's row groups, before it knows the
+    /// totals this builder needs — so it hands the finished vector over rather
+    /// than reserving a second one. It needs no clamp: that vector grew by
+    /// `push` as real decoded data arrived, never by reserving against a
+    /// declared count.
+    pub(crate) fn with_indptr(
+        dev: &GpuDevice,
+        nnz: usize,
+        n_rows: usize,
+        indptr: Vec<i64>,
+    ) -> Result<Self, GpuError> {
         Ok(Self {
             indices: dev.alloc_zeros::<i32>(nnz)?,
             data: dev.alloc_zeros::<f32>(nnz)?,

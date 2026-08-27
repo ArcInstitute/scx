@@ -712,6 +712,7 @@ fn decode_framed_shufdelta_gpu(
             indices_bytes,
             values_bytes,
             n_rows,
+            n_cols,
             nnz,
             value_encoding,
             index_width,
@@ -724,16 +725,7 @@ fn decode_framed_shufdelta_gpu(
             n_shards_shufdelta_gpu: 1,
             ..DeviceDecodeStats::default()
         };
-        return Ok((
-            GpuCsr::new(
-                pcsr.indptr,
-                pcsr.indices,
-                pcsr.data,
-                (n_rows, n_cols),
-                "framed ShufDeltaZstd shard (nvcomp)",
-            )?,
-            stats,
-        ));
+        return Ok((pcsr.csr, stats));
     }
     if spans.len() >= 2 && !force_sequential {
         let pcsr = crate::shufdelta_gpu::decode_framed_shufdelta_gpu_pipelined(
@@ -743,6 +735,7 @@ fn decode_framed_shufdelta_gpu(
             indices_bytes,
             values_bytes,
             n_rows,
+            n_cols,
             nnz,
             value_encoding,
             index_width,
@@ -754,16 +747,7 @@ fn decode_framed_shufdelta_gpu(
             n_shards_shufdelta_gpu: 1,
             ..DeviceDecodeStats::default()
         };
-        return Ok((
-            GpuCsr::new(
-                pcsr.indptr,
-                pcsr.indices,
-                pcsr.data,
-                (n_rows, n_cols),
-                "framed ShufDeltaZstd shard (pipelined)",
-            )?,
-            stats,
-        ));
+        return Ok((pcsr.csr, stats));
     }
 
     let mut combined = CombinedCsr::new(dev, nnz, n_rows, indptr_bytes.len())?;
@@ -869,7 +853,9 @@ fn decode_shufdelta_gpu(
         .map_err(|e| GpuError::InvalidShard(format!("unframed ShufDeltaZstd indptr: {e}")))?;
     let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
 
-    let (combined_indices, combined_data) = if nnz > 0 {
+    // Whole shard as one frame pair, so there is no placement loop and no
+    // CombinedCsr: the frame helpers produce the full nnz-sized buffers.
+    let (d_indices, d_data) = if nnz > 0 {
         let (d_indices, up_i) =
             decode_indices_frame_to_device(dev, indices_bytes, nnz, index_width)?;
         let (d_data, up_v) = decode_values_frame_to_device(dev, values_bytes, nnz, value_encoding)?;
@@ -893,8 +879,8 @@ fn decode_shufdelta_gpu(
     Ok((
         GpuCsr::new(
             d_indptr,
-            combined_indices,
-            combined_data,
+            d_indices,
+            d_data,
             (n_rows, n_cols),
             "unframed ShufDeltaZstd shard",
         )?,

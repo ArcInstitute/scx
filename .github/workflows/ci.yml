@@ -2013,10 +2013,12 @@ jobs:
           chk_tests=scx-gpu/src/csr_placement_tests.rs
           dec=scx-gpu/src/shard_decode.rs
           handoff=pyscx/src/accel/gpu_handoff.rs
-          # Every file that assembles a combined device CSR. Grows as the
-          # remaining decode loops migrate; a loop dropped from this list stops
-          # being checked, so removing one is the edit to look at.
-          MIGRATED="scx-gpu/src/shard_decode.rs"
+          # Every file that assembles a combined device CSR: all four, holding
+          # six decode loops between them (framed Scx1, framed ShufDeltaZstd
+          # sequential, pipelined, nvcomp per-shard, nvcomp cross-shard, and
+          # gpu_csr_assemble's per-shard concat). A file dropped from this list
+          # stops being checked, so removing one is the edit to look at.
+          MIGRATED="scx-gpu/src/shard_decode.rs scx-gpu/src/shufdelta_gpu.rs scx-gpu/src/gpu_csr_assemble.rs"
           for f in "$chk" "$chk_tests" "$dec" "$handoff"; do
             test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-3)."; exit 1; }
           done
@@ -2184,9 +2186,35 @@ jobs:
               echo "::error::$f slices a combined buffer by hand at the line(s) above. Placement is CombinedCsr's — five copies of it is how all five came to skip the bounds check (ORG-8.20-3)."
               exit 1
             fi
-            prod "$f" | grep -E 'CombinedCsr::new\(' >/dev/null || { echo "::error::$f no longer builds a CombinedCsr — the negative half above passes vacuously on a file that assembles nothing (ORG-8.20-3)."; exit 1; }
+            prod "$f" | grep -E 'CombinedCsr::(new|with_indptr)\(' >/dev/null || { echo "::error::$f no longer builds a CombinedCsr — the negative half above passes vacuously on a file that assembles nothing (ORG-8.20-3)."; exit 1; }
             prod "$f" | grep -E '\.place(_indices|_values)?\(' >/dev/null || { echo "::error::$f builds a CombinedCsr but never places into it (ORG-8.20-3)."; exit 1; }
           done
+
+          # 12. The framed ShufDeltaZstd paths hand back a finished CSR, not
+          #     three loose buffers. Returning the parts is what let each caller
+          #     re-assemble them itself, and re-assert (or not) the invariants
+          #     `finish` has already established.
+          #     Scoped to production and to PipelinedCsr's own body: an unscoped
+          #     raw-file grep passes if ANY struct in the file — including a test
+          #     fixture — has that field, so it would stay green after
+          #     PipelinedCsr reverted to loose buffers. `>/dev/null`, not
+          #     `grep -q`, per this guard's own rule (found by codex round 2).
+          shuf=scx-gpu/src/shufdelta_gpu.rs
+          prod "$shuf" | awk '/^pub struct PipelinedCsr \{/{s=1} s{print} s&&/^\}$/{exit}' \
+            | grep -E '^    pub csr: GpuCsr,' >/dev/null \
+            || { echo "::error::$shuf's PipelinedCsr no longer carries a finished GpuCsr — its callers are back to re-assembling loose buffers past the coverage and length checks (ORG-8.20-3)."; exit 1; }
+
+          # 13. And the cross-shard assembler's host indptr reservation is
+          #     clamped. `total_rows` there is summed out of unauthenticated
+          #     shard headers, and `Vec::with_capacity` calls handle_alloc_error,
+          #     which *aborts* rather than returning — this was the last
+          #     production reservation in the crate not going through
+          #     clamped_reserve.
+          asm=scx-gpu/src/gpu_csr_assemble.rs
+          if prod "$asm" | sed -e 's#//.*##' | grep -nE 'Vec::with_capacity\((total_rows|total_nnz)'; then
+            echo "::error::$asm reserves from an untrusted header-derived count at the line(s) above. Go through CombinedCsr::new, which clamps (ORG-8.20-3)."
+            exit 1
+          fi
 
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on

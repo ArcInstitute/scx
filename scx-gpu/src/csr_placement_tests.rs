@@ -139,8 +139,9 @@ fn a_values_decode_of_the_wrong_length_is_rejected_in_both_directions() {
 
 /// An empty unit is placeable anywhere inside the buffer — including at its
 /// very end, which is where the offset of a trailing zero-nnz row-group lands.
-/// Every loop migrated so far skips `len == 0` before calling `place`, so this
-/// pins that the skipping stays an optimisation rather than a requirement.
+/// The framed loops skip `len == 0` before calling `place`; `gpu_csr_assemble`
+/// deliberately does not, so an empty shard's declared length still goes
+/// through `check_placement`. Both must be fine, which is what this pins.
 #[test]
 fn an_empty_group_is_accepted_up_to_and_including_the_end() {
     check_placement(at(0, 0), 0, 0, 100).unwrap();
@@ -305,10 +306,11 @@ fn a_doubly_placed_unit_is_rejected() {
     assert!(check_coverage(&mut i, &mut v, 40, "double-placed indices").is_err());
 }
 
-/// Zero-length units are placeable and must not disturb the tiling. Every loop
-/// migrated *so far* skips `len == 0` before calling `place`, so this pins that
-/// the skipping is an optimisation rather than a requirement — which is what
-/// lets a later caller hand over an empty unit and keep its length checked.
+/// Zero-length units are placeable and must not disturb the tiling. The framed
+/// loops skip `len == 0` before calling `place`; `gpu_csr_assemble` calls it
+/// unconditionally so an empty shard's declared length is still checked. Both
+/// are correct, which is exactly what makes the skipping an optimisation rather
+/// than a requirement.
 #[test]
 fn zero_length_units_do_not_disturb_the_tiling() {
     let mut i = spans(&[(0, 10), (10, 0), (10, 30)]);

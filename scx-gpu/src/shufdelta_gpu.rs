@@ -21,8 +21,10 @@ use cudarc::driver::safe::{
 use cudarc::driver::PushKernelArg;
 
 use scx_codec::{zstd_decompress_bounded, RowGroupSpan, ValueEncoding};
-use scx_format_io::shard::{clamped_reserve, resolve_block_index, ShardHeader};
+use scx_format_io::shard::{resolve_block_index, ShardHeader};
 
+use crate::combined_csr::CombinedCsr;
+use crate::csr_placement::Placement;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::profile::{self, CodecClass};
@@ -322,11 +324,16 @@ impl HostPlaneBuf {
 /// Decompressed plane bytes for one row-group, produced by a worker thread.
 type GroupPlanes = (usize, Vec<u8>, Vec<u8>); // (group_idx, indices_planes, values_planes)
 
-/// Combined device CSR buffers from the pipelined decode + the H2D byte total.
+/// A finished device CSR from one of the framed ShufDeltaZstd decode paths,
+/// plus the host→device byte total its caller stamps into
+/// [`DeviceDecodeStats`].
+///
+/// Carries a whole [`GpuCsr`] rather than three loose buffers: they only become
+/// a CSR once `CombinedCsr::finish` has established that the placed units cover
+/// the matrix and that the three lengths agree, and handing back the parts
+/// invited each caller to re-assert that for itself.
 pub struct PipelinedCsr {
-    pub indptr: CudaSlice<i64>,
-    pub indices: CudaSlice<i32>,
-    pub data: CudaSlice<f32>,
+    pub csr: GpuCsr,
     pub host_uploaded_bytes: u64,
 }
 
@@ -341,6 +348,7 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     indices_bytes: &[u8],
     values_bytes: &[u8],
     n_rows: usize,
+    n_cols: usize,
     nnz: usize,
     value_encoding: ValueEncoding,
     index_width: usize,
@@ -350,38 +358,24 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // Precompute per-group nnz offsets + the full global indptr on the host
     // (tiny; the large index/value frames go to the device). Offsets let the
     // GPU consumer place each group independently, so producers can run ahead
-    // and out of order. `n_rows` is untrusted header data, so the reservation
-    // goes through `clamped_reserve` (`Vec::with_capacity` aborts on failure).
-    let mut combined_indptr: Vec<i64> =
-        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
-    combined_indptr.push(0);
+    // and out of order.
+    let mut combined = CombinedCsr::new(dev, nnz, n_rows, indptr_bytes.len())?;
     let t_indptr = profile::start();
     let (offsets, nnz_final) = prescan_framed_group_indptr(
         scx_codec::CodecId::ShufDeltaZstd,
         spans,
         indptr_bytes,
         0,
-        &mut combined_indptr,
+        &mut combined.indptr,
     )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
     check_device_len(nnz_final, nnz, "framed ShufDeltaZstd block-index nnz")?;
-    check_device_len(
-        combined_indptr.len(),
-        n_rows + 1,
-        "framed ShufDeltaZstd indptr",
-    )?;
 
-    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
-    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
-    let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
+    let mut host_uploaded_bytes = (combined.indptr.len() * 8) as u64;
 
     if nnz == 0 {
-        let d_indptr = dev.htod_copy(&combined_indptr)?;
-        dev.synchronize()?;
         return Ok(PipelinedCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
+            csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (pipelined)")?,
             host_uploaded_bytes,
         });
     }
@@ -479,14 +473,20 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
                 unshuffle_convert_indices(dev, &dev_idx[slot], g_nnz, index_width)?;
             let out_data =
                 unshuffle_convert_values(dev, &dev_val[slot], g_nnz, value_width)?;
-            let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-            compute_stream
-                .memcpy_dtod(&out_indices, &mut idx_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod indices: {e}")))?;
-            let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-            compute_stream
-                .memcpy_dtod(&out_data, &mut data_dst)
-                .map_err(|e| GpuError::CudaError(format!("dtod data: {e}")))?;
+            // `place` copies on `dev.stream()`, which *is* `compute_stream`:
+            // `GpuDevice::stream` hands back the same `Arc<CudaStream>` bound
+            // above, so the ordering against the upload event is unchanged.
+            combined.place(
+                dev,
+                Placement {
+                    base,
+                    len: g_nnz,
+                    op: "pipelined ShufDeltaZstd group",
+                    index: g,
+                },
+                &out_indices,
+                &out_data,
+            )?;
             profile::record_gpu_decode_since(t_gpu);
 
             // compute → copy: the next upload reusing this slot must wait for
@@ -559,12 +559,8 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
         }
     }
 
-    let d_indptr = dev.htod_copy(&combined_indptr)?;
-    dev.synchronize()?;
     Ok(PipelinedCsr {
-        indptr: d_indptr,
-        indices: combined_indices,
-        data: combined_data,
+        csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (pipelined)")?,
         host_uploaded_bytes,
     })
 }
@@ -663,16 +659,17 @@ fn unshuffle_convert_view<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidA
 
 /// Undelta (in place) + unshuffle/convert one group's **indices** plane
 /// sub-range `[idx_off .. idx_off + g_nnz*index_width)`, then `memcpy_dtod` the
-/// widened `i32` into `combined_indices[base .. base + g_nnz]`.
+/// widened `i32` into `combined[base .. base + g_nnz]` via
+/// [`CombinedCsr::place_indices`].
 fn assemble_group_indices_view(
     dev: &GpuDevice,
     d_idx_planes: &mut CudaSlice<u8>,
     idx_off: usize,
-    base: usize,
-    g_nnz: usize,
+    at: Placement<'_>,
     index_width: usize,
-    combined_indices: &mut CudaSlice<i32>,
+    combined: &mut CombinedCsr,
 ) -> Result<(), GpuError> {
+    let g_nnz = at.len;
     let ilen = g_nnz * index_width;
     {
         let mut idx_view = d_idx_planes.slice_mut(idx_off..idx_off + ilen);
@@ -682,36 +679,28 @@ fn assemble_group_indices_view(
         let idx_view = d_idx_planes.slice(idx_off..idx_off + ilen);
         unshuffle_convert_view(dev, &idx_view, g_nnz, index_width, 0)?
     };
-    let mut idx_dst = combined_indices.slice_mut(base..base + g_nnz);
-    dev.stream()
-        .memcpy_dtod(&out_i, &mut idx_dst)
-        .map_err(|e| GpuError::CudaError(format!("dtod indices (shufdelta assemble): {e}")))?;
-    Ok(())
+    combined.place_indices(dev, at, &out_i)
 }
 
 /// unshuffle/convert one group's **values** plane sub-range (no undelta —
 /// values are shuffle-only) → `memcpy_dtod` the widened `f32` into
-/// `combined_data[base .. base + g_nnz]`. Sibling of
+/// `combined[base .. base + g_nnz]` via [`CombinedCsr::place_values`]. Sibling of
 /// [`assemble_group_indices_view`].
 fn assemble_group_values_view(
     dev: &GpuDevice,
     d_val_planes: &CudaSlice<u8>,
     val_off: usize,
-    base: usize,
-    g_nnz: usize,
+    at: Placement<'_>,
     value_width: usize,
-    combined_data: &mut CudaSlice<f32>,
+    combined: &mut CombinedCsr,
 ) -> Result<(), GpuError> {
+    let g_nnz = at.len;
     let vlen = g_nnz * value_width;
     let out_v: CudaSlice<f32> = {
         let val_view = d_val_planes.slice(val_off..val_off + vlen);
         unshuffle_convert_view(dev, &val_view, g_nnz, value_width, 1)?
     };
-    let mut data_dst = combined_data.slice_mut(base..base + g_nnz);
-    dev.stream()
-        .memcpy_dtod(&out_v, &mut data_dst)
-        .map_err(|e| GpuError::CudaError(format!("dtod data (shufdelta assemble): {e}")))?;
-    Ok(())
+    combined.place_values(dev, at, &out_v)
 }
 
 /// Assemble one group's indices then values into the combined CSR at nnz offset
@@ -725,32 +714,13 @@ fn assemble_group_view(
     d_val_planes: &CudaSlice<u8>,
     idx_off: usize,
     val_off: usize,
-    base: usize,
-    g_nnz: usize,
+    at: Placement<'_>,
     index_width: usize,
     value_width: usize,
-    combined_indices: &mut CudaSlice<i32>,
-    combined_data: &mut CudaSlice<f32>,
+    combined: &mut CombinedCsr,
 ) -> Result<(), GpuError> {
-    assemble_group_indices_view(
-        dev,
-        d_idx_planes,
-        idx_off,
-        base,
-        g_nnz,
-        index_width,
-        combined_indices,
-    )?;
-    assemble_group_values_view(
-        dev,
-        d_val_planes,
-        val_off,
-        base,
-        g_nnz,
-        value_width,
-        combined_data,
-    )?;
-    Ok(())
+    assemble_group_indices_view(dev, d_idx_planes, idx_off, at, index_width, combined)?;
+    assemble_group_values_view(dev, d_val_planes, val_off, at, value_width, combined)
 }
 
 /// **Phase 2**: full in-VRAM decode of a framed ShufDeltaZstd shard via nvcomp.
@@ -769,46 +739,31 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
     indices_bytes: &[u8],
     values_bytes: &[u8],
     n_rows: usize,
+    n_cols: usize,
     nnz: usize,
     value_encoding: ValueEncoding,
     index_width: usize,
 ) -> Result<PipelinedCsr, GpuError> {
     let value_width = value_encoding.byte_width();
 
-    // Host-decode the tiny indptr per group + per-group nnz offsets. Untrusted
-    // `n_rows`, so clamp the reservation (see the pipelined path above).
-    let mut combined_indptr: Vec<i64> =
-        Vec::with_capacity(clamped_reserve(n_rows + 1, indptr_bytes.len(), 8));
-    combined_indptr.push(0);
+    // Host-decode the tiny indptr per group + per-group nnz offsets.
+    let mut combined = CombinedCsr::new(dev, nnz, n_rows, indptr_bytes.len())?;
     let t_indptr = profile::start();
     let (offsets, nnz_final) = prescan_framed_group_indptr(
         scx_codec::CodecId::ShufDeltaZstd,
         spans,
         indptr_bytes,
         0,
-        &mut combined_indptr,
+        &mut combined.indptr,
     )?;
     profile::record_host_decode_since(CodecClass::Generic, t_indptr);
     check_device_len(nnz_final, nnz, "nvcomp ShufDeltaZstd block-index nnz")?;
-    // Paired with the nnz check, matching the pipelined twin — this arm had only
-    // the nnz half.
-    check_device_len(
-        combined_indptr.len(),
-        n_rows + 1,
-        "nvcomp ShufDeltaZstd indptr",
-    )?;
 
-    let mut combined_indices = dev.alloc_zeros::<i32>(nnz)?;
-    let mut combined_data = dev.alloc_zeros::<f32>(nnz)?;
-    let mut host_uploaded_bytes = (combined_indptr.len() * 8) as u64;
+    let mut host_uploaded_bytes = (combined.indptr.len() * 8) as u64;
 
     if nnz == 0 {
-        let d_indptr = dev.htod_copy(&combined_indptr)?;
-        dev.synchronize()?;
         return Ok(PipelinedCsr {
-            indptr: d_indptr,
-            indices: combined_indices,
-            data: combined_data,
+            csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (nvcomp)")?,
             host_uploaded_bytes,
         });
     }
@@ -849,23 +804,21 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
             &d_val_planes,
             idx_off[k],
             val_off[k],
-            offsets[gi],
-            spans[gi].nnz as usize,
+            Placement {
+                base: offsets[gi],
+                len: spans[gi].nnz as usize,
+                op: "nvcomp ShufDeltaZstd group",
+                index: gi,
+            },
             index_width,
             value_width,
-            &mut combined_indices,
-            &mut combined_data,
+            &mut combined,
         )?;
     }
     profile::record_gpu_decode_since(t_gpu);
 
-    let d_indptr = dev.htod_copy(&combined_indptr)?;
-    dev.synchronize()?;
-
     Ok(PipelinedCsr {
-        indptr: d_indptr,
-        indices: combined_indices,
-        data: combined_data,
+        csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (nvcomp)")?,
         host_uploaded_bytes,
     })
 }
@@ -1116,21 +1069,16 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
     let total_rows = plan.total_rows;
     let n_cols = plan.n_cols;
 
-    let mut combined_indices = dev.alloc_zeros::<i32>(total_nnz)?;
-    let mut combined_data = dev.alloc_zeros::<f32>(total_nnz)?;
-    let mut host_uploaded_bytes = (plan.combined_indptr.len() * 8) as u64;
+    // The pre-scan already assembled the global indptr — it had to, to compute
+    // the per-group global offsets — so hand it over rather than reserving a
+    // second one, and let the builder own the placement, the coverage tally and
+    // the upload from here.
+    let mut combined = CombinedCsr::with_indptr(dev, total_nnz, total_rows, plan.combined_indptr)?;
+    let mut host_uploaded_bytes = (combined.indptr.len() * 8) as u64;
 
     if total_nnz == 0 {
-        let d_indptr = dev.htod_copy(&plan.combined_indptr)?;
-        dev.synchronize()?;
         return Ok((
-            GpuCsr::new(
-                d_indptr,
-                combined_indices,
-                combined_data,
-                (total_rows, n_cols),
-                "nvcomp cross-shard batch (empty)",
-            )?,
+            combined.finish(dev, n_cols, "nvcomp cross-shard batch")?,
             DeviceDecodeStats {
                 host_uploaded_bytes,
                 device_decoded_bytes: 0,
@@ -1176,10 +1124,14 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
                     dev,
                     &mut d_idx_planes,
                     idx_off[k],
-                    g.global_nnz_base,
-                    g.g_nnz,
+                    Placement {
+                        base: g.global_nnz_base,
+                        len: g.g_nnz,
+                        op: "nvcomp ShufDeltaZstd group",
+                        index: chunk.start + k,
+                    },
                     g.index_width,
-                    &mut combined_indices,
+                    &mut combined,
                 )?;
             }
             // `d_idx_planes` dropped here — its plane buffer frees before the
@@ -1196,26 +1148,21 @@ pub fn decode_shufdelta_shards_nvcomp_batched(
                 dev,
                 &d_val_planes,
                 val_off[k],
-                g.global_nnz_base,
-                g.g_nnz,
+                Placement {
+                    base: g.global_nnz_base,
+                    len: g.g_nnz,
+                    op: "nvcomp ShufDeltaZstd group",
+                    index: chunk.start + k,
+                },
                 g.value_width,
-                &mut combined_data,
+                &mut combined,
             )?;
         }
     }
     profile::record_gpu_decode_since(t_gpu);
 
-    let d_indptr = dev.htod_copy(&plan.combined_indptr)?;
-    dev.synchronize()?;
-
     Ok((
-        GpuCsr::new(
-            d_indptr,
-            combined_indices,
-            combined_data,
-            (total_rows, n_cols),
-            "nvcomp cross-shard batch",
-        )?,
+        combined.finish(dev, n_cols, "nvcomp cross-shard batch")?,
         DeviceDecodeStats {
             host_uploaded_bytes,
             device_decoded_bytes: (total_nnz as u64) * 8,
