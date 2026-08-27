@@ -29,14 +29,6 @@
 //! paths agree numerically, and that the cuSPARSE algorithm actually launched
 //! is the one the policy asked for.
 
-// PR A of ORG-8.20-2 lands the seam with no production caller: the ordering is
-// testable on CPU from the moment it exists, and the two migrations that consume
-// it are separately reviewable. PR B (resident) is the first consumer and
-// **deletes this attribute**; a CI branch then asserts it is gone, so "temporary"
-// is enforced rather than asserted. If something in here is genuinely unused
-// after both migrations, delete it — do not re-silence it.
-#![allow(dead_code)]
-
 use crate::error::GpuError;
 
 /// Which of the two power-loop work buffers a step operates on.
