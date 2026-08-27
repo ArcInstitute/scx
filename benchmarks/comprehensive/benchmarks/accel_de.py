@@ -700,21 +700,42 @@ def run(
             shards_decoded = _extract_shards_decoded(a, op_key)
             if shards_decoded is not None:
                 extras["shards_decoded"] = float(shards_decoded)
-            if requires_gpu and route.startswith("gpu_csr"):
+            if requires_gpu:
                 # Numeric gate signal for §9.11 device residency, in the same
                 # shape as `de_route_csc_direct`: 1.0 when the CSR route held
                 # the matrix device-resident across gene chunks, 0.0 on a
                 # *silent* fall back to re-decoding every shard per chunk.
                 #
-                # Only emitted on a CSR route — the CSC-direct route prefilters
-                # by column range and has no residency decision, so scoring it
-                # would be meaningless rather than N/A. Residency is also
-                # correctly declined for a single gene chunk, which at bench
-                # scale (tens of thousands of genes, a 500-gene chunk) never
-                # happens; if a future fixture makes it happen this reads 0.0
-                # and the floor should be revisited rather than the code.
-                resident = _extract_resident_csr(a, op_key)
-                extras["de_route_resident_csr"] = 1.0 if resident else 0.0
+                # ALWAYS emitted on a GPU run, with 1.0 meaning "held resident
+                # OR not applicable" — the same convention `de_route_csc_direct`
+                # uses twenty lines below, and for the same reason.
+                #
+                # This used to be emitted only under `route.startswith("gpu_csr")`,
+                # on the stated grounds that the CSC-direct route "has no
+                # residency decision, so scoring it would be meaningless rather
+                # than N/A", and that an absent metric leaves the floor "simply
+                # inert". That second half was false: `check_absolute_floors`
+                # skips a triple whose RESULT is missing (`_triple_was_run`), but
+                # a triple that ran and lacks the metric is a *violation* — its
+                # docstring says "missing, NaN, or violates". Since `accel_de`
+                # always builds a CSC sidecar, every GPU run takes `gpu_csc_v3`
+                # and the metric was never emitted at all, making the two
+                # `tabula_sapiens_100k` floors structurally unsatisfiable: they
+                # could only fail, or be silently scoped out on a run that did
+                # not schedule that triple. Phase 7's gate ran pbmc3k +
+                # census_1m and so never exposed it; the Phase 8b gate ran
+                # tabula and failed on both (job 2850131).
+                #
+                # Residency is also correctly declined for a single gene chunk,
+                # which at bench scale (tens of thousands of genes, a 500-gene
+                # chunk) never happens; if a future fixture makes it happen this
+                # reads 0.0 and the floor should be revisited, not the code.
+                if route.startswith("gpu_csr"):
+                    resident = _extract_resident_csr(a, op_key)
+                    extras["de_route_resident_csr"] = 1.0 if resident else 0.0
+                else:
+                    # Not applicable: no CSR residency decision was made.
+                    extras["de_route_resident_csr"] = 1.0
             if requires_gpu and kind == "pdex_ref":
                 # Numeric gate signal for the GPU pdex_ref triple. Always
                 # emitted (so the absolute-floor gate never sees a missing
