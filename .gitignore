@@ -39,6 +39,13 @@ benchmarks/comprehensive/results/v*/
 benchmarks/comprehensive/results/opt*/
 benchmarks/comprehensive/results/phase*/
 benchmarks/scripts/phase*_*
+# Two one-off gate/verification wrappers kept on disk but not tracked. Named
+# individually on purpose: 27 of the 31 `benchmarks/scripts/_run_*.sh` ARE
+# tracked, so a blanket `_run_*.sh` pattern would silently hide future wrappers
+# that the repo's own convention says to commit (e.g. _run_phase7_gate.sh,
+# _run_4_2_gpu_staging_only.sh). Ignoring by name keeps that signal intact.
+benchmarks/scripts/_run_gpu_runtime_fallback_check.sh
+benchmarks/scripts/_run_phase6_gate.sh
 benchmarks/scripts/g4*
 # Benchmark run logs (regenerable SLURM/orchestrator output; keep the scripts)
 benchmarks/scripts/*.log

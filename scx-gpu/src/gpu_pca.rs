@@ -143,6 +143,51 @@ struct RandomizedPcaCore {
     resident_csr: bool,
 }
 
+/// `slot ← qr(slot)`, keeping the caller's buffer allocation alive.
+///
+/// QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in). Both
+/// backends use `gpu_qr_q`'s swap-and-return pattern: the input buffer is left
+/// as a zero-length dummy and `Q` comes back in a fresh `CudaSlice`. Swapping
+/// `Q` back into the caller's slot keeps `scratch.d_y` / `scratch.d_z` alive
+/// across the power loop, so neither the `n_obs × k` forward output nor the
+/// `n_vars × k` transpose output is re-allocated per iteration. Net cost: one
+/// `std::mem::swap` per QR call, no allocation, no copy.
+///
+/// The resident path **still carries a second adapter** as of this commit:
+/// `qr_into_stable` (`gpu_pca_resident.rs`) allocates a scratch copy and
+/// round-trips `Q` through two D2D copies purely to hold the slot's device
+/// *pointer* fixed for a CUDA-graph capture PCA no longer performs. PR B of
+/// ORG-8.20-2 moves the resident loop onto this one and deletes it. Two
+/// adapters for one operation is how the two power loops drifted apart in the
+/// first place, so this note should not outlive the stack.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qr_swap_into(
+    dev: &GpuDevice,
+    cusolver: &CusolverHandle,
+    cublas: &CublasHandle,
+    qr_method: QrMethod,
+    slot: &mut CudaSlice<f32>,
+    rows: usize,
+    cols: usize,
+) -> Result<(), GpuError> {
+    let mut q = match qr_method {
+        QrMethod::Householder => gpu_qr_q(cusolver, dev.stream(), dev, slot, rows, cols)?,
+        QrMethod::Cholesky => gpu_cholesky_qr2(cublas, cusolver, dev, slot, rows, cols)?,
+    };
+    // After the backend's internal swap, `slot` holds the empty dummy and `q`
+    // owns the `rows × cols` buffer of Q. Swap so the caller's slot reclaims it.
+    debug_assert_eq!(
+        slot.len(),
+        0,
+        "QR backend must leave its input as a zero-length dummy via \
+         std::mem::swap; see cusolver::gpu_qr_q / gpu_cholesky_qr2 \
+         for the contract",
+    );
+    std::mem::swap(slot, &mut q);
+    // `q` (now the empty dummy) drops here.
+    Ok(())
+}
+
 /// Shared randomized-PCA core: runs the full streaming SpMM / QR / SVD pipeline
 /// and returns the scaled embedding `U·Σ` **col-major on the device** plus the
 /// host-side loadings/variance. Both public entry points
@@ -316,48 +361,18 @@ fn randomized_pca_core(
         // on each matmat / rmatmat. No CUDA-graph capture on this path.
         op.matmat_pooled(&d_omega, &mut scratch.d_y, k, &mut pool)?;
 
-        // QR dispatch — Householder (default) or CholeskyQR2 (Phase 4 opt-in).
-        // Both backends use `gpu_qr_q`'s swap-and-return pattern: the input
-        // buffer is left as a zero-length dummy and Q is returned in a new
-        // CudaSlice. To keep `scratch.d_y` / `scratch.d_z` alive across the
-        // power loop (avoiding a per-iter re-allocation of the n_obs × k
-        // forward output and n_vars × k transpose output), this closure
-        // swaps the returned Q back into the scratch field and returns the
-        // empty dummy for drop. The caller then reads Q from the scratch
-        // slot. Net cost: two `std::mem::swap`s per QR call (no allocations).
+        // QR dispatch — see `qr_swap_into`, which both power-loop paths share.
         let qr_into =
             |scratch_slot: &mut CudaSlice<f32>, rows: usize, cols: usize| -> Result<(), GpuError> {
-                let mut q = match qr_method {
-                    QrMethod::Householder => gpu_qr_q(
-                        &cusolver_handle,
-                        dev.stream(),
-                        dev,
-                        scratch_slot,
-                        rows,
-                        cols,
-                    )?,
-                    QrMethod::Cholesky => gpu_cholesky_qr2(
-                        &cublas_handle,
-                        &cusolver_handle,
-                        dev,
-                        scratch_slot,
-                        rows,
-                        cols,
-                    )?,
-                };
-                // After gpu_qr_q's internal swap, `scratch_slot` holds the empty
-                // dummy and `q` owns the n_obs * k buffer of Q. Swap so the
-                // scratch field reclaims the Q buffer.
-                debug_assert_eq!(
-                    scratch_slot.len(),
-                    0,
-                    "QR backend must leave its input as a zero-length dummy via \
-                 std::mem::swap; see cusolver::gpu_qr_q / gpu_cholesky_qr2 \
-                 for the contract",
-                );
-                std::mem::swap(scratch_slot, &mut q);
-                // `q` (now the empty dummy) drops here.
-                Ok(())
+                qr_swap_into(
+                    dev,
+                    &cusolver_handle,
+                    &cublas_handle,
+                    qr_method,
+                    scratch_slot,
+                    rows,
+                    cols,
+                )
             };
 
         // Step 4: scratch.d_y ← qr(scratch.d_y); Q now lives in scratch.d_y.
