@@ -2013,6 +2013,10 @@ jobs:
           chk_tests=scx-gpu/src/csr_placement_tests.rs
           dec=scx-gpu/src/shard_decode.rs
           handoff=pyscx/src/accel/gpu_handoff.rs
+          # Every file that assembles a combined device CSR. Grows as the
+          # remaining decode loops migrate; a loop dropped from this list stops
+          # being checked, so removing one is the edit to look at.
+          MIGRATED="scx-gpu/src/shard_decode.rs"
           for f in "$chk" "$chk_tests" "$dec" "$handoff"; do
             test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-3)."; exit 1; }
           done
@@ -2049,7 +2053,15 @@ jobs:
             echo "::error::$chk_tests gates on a device at the line(s) above. These tests must run on every CPU host — that is the entire point of keeping the arithmetic out of the CUDA files (ORG-8.20-3)."
             exit 1
           fi
-          grep -E 'check_csr_lengths\(' "$chk_tests" >/dev/null || { echo "::error::$chk_tests no longer calls check_csr_lengths — the negative half above passes vacuously on a file that tests nothing (ORG-8.20-3)."; exit 1; }
+          #    Every check in $chk must be exercised by $chk_tests, not just the
+          #    first one. Branches 1/7 require the checks to EXIST and branches
+          #    9/5 require production to CALL them — none of that notices the
+          #    tests being deleted, which is how this file could have gone to
+          #    zero coverage while every other branch stayed green (found by
+          #    Cursor Agent).
+          for sym in $(prod "$chk" | grep -oE '^pub\(crate\) fn [a-z_]+' | awk '{print $3}'); do
+            grep -E "$sym\(" "$chk_tests" >/dev/null || { echo "::error::$chk declares \`$sym\` but $chk_tests never calls it — the arithmetic seam exists to be CPU-testable, and an untested check is the state it was extracted from (ORG-8.20-3)."; exit 1; }
+          done
 
           # 4. Nothing builds a `GpuCsr` by struct literal. The fields stay
           #    public (they are read in hundreds of places across three crates),
@@ -2125,6 +2137,56 @@ jobs:
             exit 1
           fi
           prod "$handoff" | grep -E 'csr\.nnz\(\)' >/dev/null || { echo "::error::$handoff no longer reads csr.nnz() — the negative half above passes vacuously if the handoff stopped recording an nnz at all (ORG-8.20-3)."; exit 1; }
+          # 7. The placement half of the seam, and the coverage check that ends
+          #    it. Both CUDA-free for the same reason as branch 2 above.
+          for sym in check_placement check_coverage; do
+            grep -qE "^pub\(crate\) fn $sym\(" "$chk" || { echo "::error::$chk no longer declares \`fn $sym\` — the placement invariants are back to being restated per decode loop, which is the state in which none of the five copies bounds-checked at all (ORG-8.20-3)."; exit 1; }
+          done
+
+          # 8. ...and the device layer over them exists.
+          comb=scx-gpu/src/combined_csr.rs
+          test -f "$comb" || { echo "::error::$comb is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-3)."; exit 1; }
+          grep -qE '^pub\(crate\) struct CombinedCsr \{' "$comb" || { echo "::error::$comb no longer declares \`struct CombinedCsr\` — the combined-buffer placement has gone back to being written once per decode loop (ORG-8.20-3)."; exit 1; }
+          for m in place_indices place_values finish; do
+            grep -qE "^    pub\(crate\) fn $m\(" "$comb" || { echo "::error::$comb no longer declares \`CombinedCsr::$m\` (ORG-8.20-3)."; exit 1; }
+          done
+
+          # 9. ...and it applies the checks rather than being a rename of the
+          #    five copies. Every branch above is satisfied by a CombinedCsr
+          #    that copies bytes and validates nothing.
+          prod "$comb" | grep -E 'check_placement\(' >/dev/null || { echo "::error::$comb no longer calls check_placement — CombinedCsr has become a rename of the hand-written slice_mut + memcpy_dtod it replaced (ORG-8.20-3)."; exit 1; }
+          prod "$comb" | grep -E 'check_coverage\(' >/dev/null || { echo "::error::$comb's finish no longer calls check_coverage — a decode that skips a unit is back to returning a full-shaped CSR whose gap reads as alloc_zeros' zeros (ORG-8.20-3)."; exit 1; }
+
+          # 10. And it views the destination fallibly. `CudaSlice::slice_mut` is
+          #     `try_slice_mut(..).unwrap()`, so using it here re-introduces the
+          #     library panic that having one placement exists to remove — the
+          #     crate's own policy (`gpu_shard_source.rs`) is to return
+          #     InvalidShard rather than rely on something that vanishes in
+          #     release.
+          prod "$comb" | grep -E 'try_slice_mut\(' >/dev/null || { echo "::error::$comb no longer uses try_slice_mut (ORG-8.20-3)."; exit 1; }
+          if prod "$comb" | sed -e 's#//.*##' | grep -nE '[^_]slice_mut\('; then
+            echo "::error::$comb calls the panicking slice_mut at the line(s) above. Use try_slice_mut and return InvalidShard — an out-of-range base is unauthenticated block-index data, not a programming error (ORG-8.20-3)."
+            exit 1
+          fi
+
+          # 11. No decode loop in $MIGRATED places by hand. The list grows as the
+          #     migration lands, so at an intermediate commit this covers the
+          #     loops migrated SO FAR rather than all six — saying "no decode
+          #     loop places by hand any more" while the list held one file was
+          #     the overclaim this series keeps having to walk back (found by
+          #     codex in round 3). Both halves: nothing
+          #     slices a combined buffer directly, and the migrated files do
+          #     call the placement — a file that stopped assembling anything at
+          #     all would satisfy the negative.
+          for f in $MIGRATED; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it (ORG-8.20-3)."; exit 1; }
+            if prod "$f" | sed -e 's#//.*##' | grep -nE 'combined_(indices|data)\.(try_)?slice_mut\('; then
+              echo "::error::$f slices a combined buffer by hand at the line(s) above. Placement is CombinedCsr's — five copies of it is how all five came to skip the bounds check (ORG-8.20-3)."
+              exit 1
+            fi
+            prod "$f" | grep -E 'CombinedCsr::new\(' >/dev/null || { echo "::error::$f no longer builds a CombinedCsr — the negative half above passes vacuously on a file that assembles nothing (ORG-8.20-3)."; exit 1; }
+            prod "$f" | grep -E '\.place(_indices|_values)?\(' >/dev/null || { echo "::error::$f builds a CombinedCsr but never places into it (ORG-8.20-3)."; exit 1; }
+          done
 
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on

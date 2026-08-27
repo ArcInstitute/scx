@@ -92,6 +92,9 @@ pub mod test_utils;
 
 pub mod backed_gpu_matrix_source;
 pub mod cast_gpu;
+// `pub(crate)`: the combined-CSR builder every decode path fills. Internal — the
+// public surface is `decode_shard_gpu` / `decode_csr_shards_to_device`.
+pub(crate) mod combined_csr;
 // `pub(crate)`: the CSR length and placement invariants are internal machinery.
 // They are deliberately CUDA-free so `cargo test` reaches them on a host with no
 // GPU; every caller is a decode path inside this crate.
