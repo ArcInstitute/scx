@@ -2216,6 +2216,46 @@ jobs:
             exit 1
           fi
 
+          # 14. Two shufdelta kernels, two launches. The module grew six
+          #     launchers for them — one pair for callers holding a `CudaSlice`,
+          #     one for callers holding a view into the nvcomp concat buffer —
+          #     on the premise that cudarc's per-type `PushKernelArg` impls made
+          #     a shared body impossible. They do not: `as_view`/`as_view_mut`
+          #     are pointer copies and the view impls are identical to the slice
+          #     ones, event bookkeeping included. Counting `launch_builder` is
+          #     what pins that, because a seventh launcher would have to call it.
+          n=$(prod "$shuf" | grep -cE 'launch_builder\(' || true)
+          if [ "${n:-0}" -ne 2 ]; then
+            echo "::error::$shuf has ${n:-0} production kernel launches, expected exactly 2 (undelta_planes_kernel, unshuffle_convert_kernel). A launcher split by argument type is how this file came to have six for two kernels (ORG-8.20-3)."
+            exit 1
+          fi
+          #     ...and the retired spellings do not come back anywhere.
+          if grep -rnE --include='*.rs' 'fn (undelta_planes_gpu|undelta_planes_view|unshuffle_convert_view)\(' scx-gpu/src; then
+            echo "::error::a per-argument-type launcher is back at the line(s) above. The view form is canonical; a caller holding a CudaSlice passes &buf.as_view() (ORG-8.20-3)."
+            exit 1
+          fi
+          #     Both surviving launchers take a view, which is what makes one
+          #     body serve both kinds of caller.
+          prod "$shuf" | grep -E 'buf: &mut CudaViewMut<u8>' >/dev/null || { echo "::error::$shuf's undelta launcher no longer takes a CudaViewMut — a slice-typed one cannot serve the nvcomp sub-range callers, which is how the second copy appeared (ORG-8.20-3)."; exit 1; }
+          prod "$shuf" | grep -E 'src: &CudaView<u8>' >/dev/null || { echo "::error::$shuf's unshuffle launcher no longer takes a CudaView (ORG-8.20-3)."; exit 1; }
+
+          # 15. And `out_is_float` is bound in exactly the two typed wrappers.
+          #     T and the flag must agree or the kernel writes one type's bits
+          #     through the other's pointer, and nothing in the generic
+          #     signature enforces it — the wrappers are the enforcement, so a
+          #     third caller of the raw launcher is a third place to get it
+          #     wrong.
+          #     Counted by NAME, not by `launch_unshuffle_convert\(dev`: a third
+          #     caller spelled with a turbofish — `launch_unshuffle_convert::<i32>(dev, …)`
+          #     — does not match the `\(dev` form, so the count would stay 2 while a
+          #     third place binds the flag to a `T` that may not match it (found by
+          #     Cursor Agent). Subtract the `fn` declaration line instead.
+          n=$(prod "$shuf" | sed -e 's#//.*##' | grep -E 'launch_unshuffle_convert' | grep -vcE '^fn |^ *fn ' || true)
+          if [ "${n:-0}" -ne 2 ]; then
+            echo "::error::$shuf has ${n:-0} calls to the raw launch_unshuffle_convert, expected exactly 2 (unshuffle_convert_indices and unshuffle_convert_values). Those two wrappers are the only thing binding the out_is_float flag to the output type (ORG-8.20-3)."
+            exit 1
+          fi
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police
