@@ -1,305 +1,244 @@
-//! Implicit-centering sparse LinearOperator used by covariance and randomized PCA.
+//! Implicit-centering sparse operator over a streamed `ShardSource`.
 //!
-//! [`CenteredSparseOperator`] exposes the three operations we need without
-//! materializing the mean-centered matrix `(X − μ)`:
+//! [`StreamingPcaOperator`] is the [`PcaOperator`] for inputs whose CSR does not
+//! fit device memory: each multiply drives the source shard by shard, and each
+//! shard is one call to the same segment function
+//! ([`spmm_forward_segment`] / [`spmm_transpose_segment`]) the device-resident
+//! operator calls once. Neither file owns a copy of the centered arithmetic and
+//! neither owns a power loop — [`run_power_loop`] owns the sequence.
 //!
-//! * [`matmat`](CenteredSparseOperator::matmat) — `out = (X − μ) · V` for an
-//!   `n_vars × k` right-hand side (the "forward" power-iteration step).
-//! * [`rmatmat`](CenteredSparseOperator::rmatmat) — `out = (X − μ)ᵀ · Y` for
-//!   an `n_obs × k` right-hand side (the "transpose" power-iteration step).
+//! # The source is built once, not once per multiply
 //!
-//! All routines stream shards via `RawGpuShardSource` (the G3 staging path,
-//! with a cached cuSPARSE descriptor per reusable slot), reuse the
-//! existing column-major helpers from `gpu_pca.rs`, and — critically for
-//! later phases — compute the mean-correction pre-factor `mc = Vᵀ · μ` via
-//! cuBLAS `sgemv` on the GPU, avoiding the D→H round-trip at
-//! `gpu_pca.rs:326-327` in the current randomized-PCA implementation.
+//! Before ORG-8.20-2 this file constructed a fresh `RawGpuShardSource` inside
+//! every `matmat` / `rmatmat`. A default two-power-iteration PCA runs seven
+//! multiplies, so it built the pinned ring, the copy stream and the event pair
+//! seven times — and, because `ValidationMemo` lives on the adapter, re-ran the
+//! O(nnz) sortedness scan on all seven drives instead of the first. Holding one
+//! [`BackedGpuMatrixSource`] for the operator's lifetime collapses both to one.
+//!
+//! What has **not** changed: the matrix is still decoded and re-uploaded on
+//! every multiply. Residency is what avoids that, and it is the other operator.
+//!
+//! # Validation
+//!
+//! `ValidationChecks::SORTED`, attributed to `"pca"`. cuSPARSE SpMM is undefined
+//! on unsorted CSR column indices, so sortedness is a precondition here rather
+//! than a preference — and `in_range` alone would be a no-op on this layout
+//! (the row-major validator does not range-check minor indices), leaving the
+//! SpMM entirely unguarded. Finiteness is deliberately **not** requested: this
+//! path propagates a NaN exactly as the CPU one does.
 
-use cudarc::cublas::sys as cbs;
 use cudarc::cusparse::sys as csp;
 use cudarc::driver::safe::CudaSlice;
 use scx_format_io::ShardSource;
 
-use crate::cublas::{gpu_sgemv, CublasHandle};
-use crate::cusparse::{
-    spmm_csr_transpose_view_with_alg, spmm_csr_view_with_alg, CuSparseWorkspacePool,
-    CusparseHandle, DnMatView, DnMatViewMut,
-};
-use crate::device::GpuDevice;
+use crate::backed_gpu_matrix_source::BackedGpuMatrixSource;
+use crate::cusolver::QrMethod;
+use crate::cusparse::CuSparseWorkspacePool;
 use crate::error::GpuError;
-use crate::gpu_matrix_source::{ValidationChecks, ValidationPolicy};
-use crate::gpu_pca::{gpu_column_sums, gpu_mean_correct_colmajor_strided, gpu_outer_sub};
-use crate::gpu_shard_source::{GpuShardSource, RawGpuShardSource};
+use crate::gpu_matrix_source::{GpuMatrixSource, ValidationChecks, ValidationPolicy};
+use crate::gpu_pca::{
+    forward_mean_prefactor, qr_swap_into, spmm_forward_segment, spmm_transpose_segment,
+    transpose_centering_correction, GpuPcaScratch, PcaHandles, PcaMultiplyCtx, RowSegment,
+};
 use crate::math_policy::SpmmAlgPolicy;
+use crate::pca_operator::{ForwardOperand, PcaBuf, PcaOperator};
 
-/// Implicit-centering sparse operator over a `&dyn ShardSource`.
+/// [`PcaOperator`] that streams the matrix from a [`ShardSource`], one segment
+/// per CSR shard.
 ///
-/// `d_means` is `None` when `zero_center == false`; all three ops then
-/// reduce to their non-centered equivalents (`X · V`, `Xᵀ · Y`, `Xᵀ X`).
+/// `d_means` is `None` when `zero_center == false`; both multiplies then reduce
+/// to their uncentered equivalents.
 ///
-/// `spmm_policy` is the caller's [`SpmmAlgPolicy`] — held as the *policy*, not
-/// the resolved cuSPARSE enum, so the operator carries the caller's intent and
-/// resolves it at each launch. It applies to both [`Self::matmat`] and
-/// [`Self::rmatmat`]. Before this field existed the streaming PCA path hardcoded
-/// `CUSPARSE_SPMM_ALG_DEFAULT` while the resident path honoured the policy, so
-/// a `>VRAM` run reported the caller's requested policy having actually used
-/// cuSPARSE's heuristic pick.
-pub struct CenteredSparseOperator<'a> {
-    dev: &'a GpuDevice,
-    cusparse: &'a CusparseHandle,
-    cublas: &'a CublasHandle,
-    source: &'a (dyn ShardSource + Sync),
-    d_means: Option<&'a CudaSlice<f32>>,
+/// `spmm_policy` is held as the *policy*, not the resolved cuSPARSE enum, so the
+/// operator carries the caller's intent — but it is resolved once, into
+/// [`PcaMultiplyCtx::alg`], and that is the only value any launch reads. Review
+/// §8.11 was this path hardcoding `CUSPARSE_SPMM_ALG_DEFAULT` while
+/// `uns["scx_accel"]["pca"]["spmm_policy"]` reported whatever the caller asked
+/// for; there is now one field for it to be wrong in, shared with the resident
+/// operator.
+pub struct StreamingPcaOperator<'a> {
+    ctx: PcaMultiplyCtx<'a>,
+    handles: PcaHandles<'a>,
+    qr_method: QrMethod,
     spmm_policy: SpmmAlgPolicy,
+    source: BackedGpuMatrixSource<'a>,
+    d_means: Option<&'a CudaSlice<f32>>,
+    d_omega: &'a CudaSlice<f32>,
+    scratch: &'a mut GpuPcaScratch,
+    d_mc: CudaSlice<f32>,
+    d_sum_q: CudaSlice<f32>,
+    pool: CuSparseWorkspacePool,
 }
 
-impl<'a> CenteredSparseOperator<'a> {
-    /// Construct from borrowed components. `d_means`, when provided, must
-    /// have length `source.n_vars()`.
-    pub fn new(
-        dev: &'a GpuDevice,
-        cusparse: &'a CusparseHandle,
-        cublas: &'a CublasHandle,
+impl<'a> StreamingPcaOperator<'a> {
+    /// Build the operator, taking the source's staging adapter with it.
+    ///
+    /// `d_omega` is the `(n_vars × k)` seed matrix the first forward multiply
+    /// reads; `scratch` supplies the `Y` and `Z` buffers the loop rewrites. `k`
+    /// is passed rather than inferred from `scratch` — the buffers' lengths
+    /// happen to determine it, and a constructor that quietly re-derives a
+    /// caller's parameter is one shape change away from being silently wrong.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        handles: PcaHandles<'a>,
         source: &'a (dyn ShardSource + Sync),
         d_means: Option<&'a CudaSlice<f32>>,
+        d_omega: &'a CudaSlice<f32>,
+        scratch: &'a mut GpuPcaScratch,
+        k: usize,
+        qr_method: QrMethod,
         spmm_policy: SpmmAlgPolicy,
-    ) -> Self {
-        Self {
-            dev,
-            cusparse,
-            cublas,
+    ) -> Result<Self, GpuError> {
+        let (n_obs, n_vars) = source.shape();
+        let source = BackedGpuMatrixSource::new(handles.dev, source)?
+            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
+        Ok(Self {
+            ctx: PcaMultiplyCtx {
+                dev: handles.dev,
+                cusparse: handles.cusparse,
+                n_obs,
+                n_vars,
+                k,
+                alg: spmm_policy.to_alg(),
+            },
+            handles,
+            qr_method,
+            spmm_policy,
             source,
             d_means,
-            spmm_policy,
-        }
+            d_omega,
+            d_mc: handles.dev.alloc_zeros::<f32>(k)?,
+            d_sum_q: handles.dev.alloc_zeros::<f32>(k)?,
+            scratch,
+            pool: CuSparseWorkspacePool::new(),
+        })
     }
 
     /// The cuSPARSE SpMM algorithm this operator launches with — the resolution
     /// of the [`SpmmAlgPolicy`] it was constructed with.
     pub fn spmm_alg(&self) -> csp::cusparseSpMMAlg_t {
-        self.spmm_policy.to_alg()
+        debug_assert_eq!(self.spmm_policy.to_alg(), self.ctx.alg);
+        self.ctx.alg
     }
+}
 
-    /// `out (n_obs × k, col-major) = (X − μ) · V`.
-    ///
-    /// `V` is col-major `(n_vars × k)`. `d_out` is overwritten (no accumulate).
-    ///
-    /// Each shard's SpMM writes directly into a strided view of `d_out` at row
-    /// offset `global_row` with `ld = n_obs`, avoiding the per-shard
-    /// `(shard_rows × k)` dense temporary that the pre-G2 implementation
-    /// scatter-kernelled into `d_out`. A single-shot `CuSparseWorkspacePool`
-    /// is constructed inside the call so the cuSPARSE SpMM workspace is
-    /// reused across shards within one matmat (~N shards × one shape).
-    /// Iterative callers (PCA power loop) should prefer
-    /// [`Self::matmat_pooled`] so the pool also amortises across iterations.
-    pub fn matmat(
-        &self,
-        d_v: &CudaSlice<f32>,
-        d_out: &mut CudaSlice<f32>,
-        k: usize,
-    ) -> Result<(), GpuError> {
-        let mut pool = CuSparseWorkspacePool::new();
-        self.matmat_pooled(d_v, d_out, k, &mut pool)
-    }
-
-    /// Pool-driven variant of [`Self::matmat`]. Reuses `pool`'s SpMM workspace
-    /// across all shards in this call (and across calls if the caller threads
-    /// the same pool through, e.g. PCA power iterations).
-    pub fn matmat_pooled(
-        &self,
-        d_v: &CudaSlice<f32>,
-        d_out: &mut CudaSlice<f32>,
-        k: usize,
-        pool: &mut CuSparseWorkspacePool,
-    ) -> Result<(), GpuError> {
-        let (n_obs, n_vars) = self.source.shape();
-
-        // Zero `d_out` — the strided SpMM writes only the populated row range
-        // for each shard, so we must zero rows outside any shard up-front.
-        self.dev
-            .stream()
-            .memset_zeros(d_out)
-            .map_err(|e| GpuError::KernelLaunchFailed(format!("matmat: zero out: {e}")))?;
-
-        // Precompute `mc = Vᵀ · μ` on GPU (length k) — cuBLAS sgemv replaces
-        // the D→H round-trip used in the legacy `streaming_gpu_spmm_forward`.
-        let d_mc: Option<CudaSlice<f32>> = if let Some(d_mu) = self.d_means {
-            let mut mc = self.dev.alloc_zeros::<f32>(k)?;
-            gpu_sgemv(
-                self.cublas,
-                self.dev.stream(),
-                d_v,
-                d_mu,
-                &mut mc,
-                n_vars,
-                k,
-                1.0,
-                0.0,
-                cbs::cublasOperation_t::CUBLAS_OP_T,
-            )?;
-            Some(mc)
-        } else {
-            None
+impl PcaOperator for StreamingPcaOperator<'_> {
+    fn matmat(&mut self, src: ForwardOperand) -> Result<(), GpuError> {
+        let Self {
+            ctx,
+            handles,
+            source,
+            d_means,
+            d_omega,
+            scratch,
+            d_mc,
+            pool,
+            ..
+        } = self;
+        let GpuPcaScratch { d_y, d_z } = &mut **scratch;
+        let d_v: &CudaSlice<f32> = match src {
+            ForwardOperand::Omega => d_omega,
+            ForwardOperand::Z => d_z,
         };
 
-        // `Scatter`: cuSPARSE SpMM is undefined on unsorted CSR column indices,
-        // so sortedness is a precondition here, not a preference. `Bounds` would
-        // be a no-op on this layout and leave the SpMM unguarded.
-        //
-        // ORG-8.20-2 owns this file's rewrite (one operator trait, one power
-        // loop) and migrates these two sites onto `GpuMatrixSource` there; the
-        // policy is set here so the level is decided by whoever read the kernel,
-        // not inherited by whoever moves the call.
-        let mut src = RawGpuShardSource::new(self.dev, self.source)?
-            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
-        let mut global_row = 0usize;
+        // Zero up front: each shard's SpMM writes only its own row window, so
+        // any row no shard covers would otherwise keep the previous multiply's
+        // values. (ORG-8.20-2 PR D decides whether a tiling check makes this
+        // removable; until it is measured, it stays.)
+        ctx.dev
+            .stream()
+            .memset_zeros(d_y)
+            .map_err(|e| GpuError::KernelLaunchFailed(format!("matmat: zero out: {e}")))?;
+        if let Some(d_mu) = d_means {
+            forward_mean_prefactor(ctx, handles.cublas, d_v, d_mu, d_mc)?;
+        }
+        let mc = d_means.is_some().then_some(&*d_mc);
 
-        src.for_each_gpu_shard(|_idx, slot| {
-            let shard_rows = slot.view().shape.0;
-            if shard_rows == 0 {
+        let mut offset = 0usize;
+        source.for_each_gpu_csr_shard(&mut |_idx, slot| {
+            let rows = slot.view().shape.0;
+            if rows == 0 {
                 return Ok(());
             }
-
-            // Get-or-build the cached cuSPARSE descriptor for this slot's live
-            // shard (the descriptor is reused across power iterations when the
-            // slot's pointers/shape are unchanged).
-            let a_desc = slot.cached_sp_descr(self.dev, self.dev.stream())?;
-
-            // V is col-major (n_vars × k); SpMM B operand stays contiguous.
-            let b_view = DnMatView::contiguous(d_v, n_vars as i64, k as i64);
-            // Strided view into d_out: write rows [global_row, global_row +
-            // shard_rows) of the (n_obs × k) col-major output buffer. `ld =
-            // n_obs` because that's the stride between columns in d_out.
-            let c_view = DnMatViewMut {
-                buf: d_out,
-                offset_elems: global_row,
-                rows: shard_rows as i64,
-                cols: k as i64,
-                ld: n_obs as i64,
-            };
-            // Y_shard = A · V   (β = 0 → overwrite the strided sub-region)
-            spmm_csr_view_with_alg(
-                self.cusparse,
-                self.dev.stream(),
-                self.dev,
-                Some(pool),
-                a_desc,
-                b_view,
-                c_view,
-                1.0,
-                0.0,
-                self.spmm_policy.to_alg(),
-            )?;
-
-            if let Some(ref mc) = d_mc {
-                gpu_mean_correct_colmajor_strided(
-                    self.dev, d_out, mc, shard_rows, k, global_row, n_obs,
-                )?;
-            }
-
-            global_row += shard_rows;
+            // Cached per slot: reused across power iterations while the slot's
+            // pointers and shape are unchanged.
+            let desc = slot.cached_sp_descr(ctx.dev, ctx.dev.stream())?;
+            spmm_forward_segment(ctx, pool, desc, d_v, d_y, mc, RowSegment { offset, rows })?;
+            offset += rows;
             Ok(())
-        })?;
-
-        Ok(())
+        })
     }
 
-    /// `out (n_vars × k, col-major) = (X − μ)ᵀ · Y`.
-    ///
-    /// `Y` is col-major `(n_obs × k)`. `d_out` is overwritten.
-    ///
-    /// Each shard's transposed SpMM reads a strided view of `d_y` at row
-    /// offset `global_row` with `ld = n_obs` and accumulates (β = 1) into the
-    /// contiguous `(n_vars × k)` output. Mirrors the matmat scatter-removal
-    /// for the transpose direction. Iterative callers should prefer
-    /// [`Self::rmatmat_pooled`].
-    pub fn rmatmat(
-        &self,
-        d_y: &CudaSlice<f32>,
-        d_out: &mut CudaSlice<f32>,
-        k: usize,
-    ) -> Result<(), GpuError> {
-        let mut pool = CuSparseWorkspacePool::new();
-        self.rmatmat_pooled(d_y, d_out, k, &mut pool)
-    }
+    fn rmatmat(&mut self) -> Result<(), GpuError> {
+        let Self {
+            ctx,
+            source,
+            d_means,
+            scratch,
+            d_sum_q,
+            pool,
+            ..
+        } = self;
+        let GpuPcaScratch { d_y, d_z } = &mut **scratch;
 
-    /// Pool-driven variant of [`Self::rmatmat`]. See [`Self::matmat_pooled`].
-    pub fn rmatmat_pooled(
-        &self,
-        d_y: &CudaSlice<f32>,
-        d_out: &mut CudaSlice<f32>,
-        k: usize,
-        pool: &mut CuSparseWorkspacePool,
-    ) -> Result<(), GpuError> {
-        let (n_obs, n_vars) = self.source.shape();
-
-        // Zero `d_out` — the per-shard SpMM uses β = 1 to accumulate.
-        self.dev
+        // Required: the segment function accumulates with β = 1 across shards.
+        ctx.dev
             .stream()
-            .memset_zeros(d_out)
+            .memset_zeros(d_z)
             .map_err(|e| GpuError::KernelLaunchFailed(format!("rmatmat: zero out: {e}")))?;
 
-        // `Scatter`: cuSPARSE SpMM is undefined on unsorted CSR column indices,
-        // so sortedness is a precondition here, not a preference. `Bounds` would
-        // be a no-op on this layout and leave the SpMM unguarded.
-        //
-        // ORG-8.20-2 owns this file's rewrite (one operator trait, one power
-        // loop) and migrates these two sites onto `GpuMatrixSource` there; the
-        // policy is set here so the level is decided by whoever read the kernel,
-        // not inherited by whoever moves the call.
-        let mut src = RawGpuShardSource::new(self.dev, self.source)?
-            .with_validation(ValidationPolicy::new(ValidationChecks::SORTED, "pca"));
-        let mut global_row = 0usize;
-
-        src.for_each_gpu_shard(|_idx, slot| {
-            let shard_rows = slot.view().shape.0;
-            if shard_rows == 0 {
+        let mut offset = 0usize;
+        source.for_each_gpu_csr_shard(&mut |_idx, slot| {
+            let rows = slot.view().shape.0;
+            if rows == 0 {
                 return Ok(());
             }
-
-            let a_desc = slot.cached_sp_descr(self.dev, self.dev.stream())?;
-
-            // Strided view into d_y: read rows [global_row, global_row +
-            // shard_rows) of the (n_obs × k) col-major buffer. SpMM walks
-            // columns with stride `ld = n_obs`.
-            let b_view = DnMatView {
-                buf: d_y,
-                offset_elems: global_row,
-                rows: shard_rows as i64,
-                cols: k as i64,
-                ld: n_obs as i64,
-            };
-            // out += Aᵀ · Y_shard   (β = 1 → accumulate into contiguous out)
-            let c_view = DnMatViewMut::contiguous(d_out, n_vars as i64, k as i64);
-            spmm_csr_transpose_view_with_alg(
-                self.cusparse,
-                self.dev.stream(),
-                self.dev,
-                Some(pool),
-                a_desc,
-                b_view,
-                c_view,
-                1.0,
-                1.0,
-                self.spmm_policy.to_alg(),
-            )?;
-            global_row += shard_rows;
+            let desc = slot.cached_sp_descr(ctx.dev, ctx.dev.stream())?;
+            spmm_transpose_segment(ctx, pool, desc, d_y, d_z, RowSegment { offset, rows })?;
+            offset += rows;
             Ok(())
         })?;
 
-        // Centering correction: out[v, j] −= μ[v] · (Σ_r Y[r, j]).
-        if let Some(d_mu) = self.d_means {
-            let d_sum_q = gpu_column_sums(self.dev, d_y, n_obs, k)?;
-            gpu_outer_sub(self.dev, d_out, d_mu, &d_sum_q, n_vars, k)?;
+        // Once, after every shard: the correction needs Y's column sums over all
+        // rows, so it cannot be folded into the per-shard segment.
+        if let Some(d_mu) = d_means {
+            transpose_centering_correction(ctx, d_y, d_z, d_mu, d_sum_q)?;
         }
-
         Ok(())
+    }
+
+    fn qr(&mut self, buf: PcaBuf) -> Result<(), GpuError> {
+        let Self {
+            ctx,
+            handles,
+            qr_method,
+            scratch,
+            ..
+        } = self;
+        let (slot, rows) = match buf {
+            PcaBuf::Y => (&mut scratch.d_y, ctx.n_obs),
+            PcaBuf::Z => (&mut scratch.d_z, ctx.n_vars),
+        };
+        qr_swap_into(
+            handles.dev,
+            handles.cusolver,
+            handles.cublas,
+            *qr_method,
+            slot,
+            rows,
+            ctx.k,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cublas::CublasHandle;
+    use crate::cusolver::CusolverHandle;
+    use crate::cusparse::CusparseHandle;
+    use crate::device::GpuDevice;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use scx_sparse::ScxCsr;
@@ -413,57 +352,177 @@ mod tests {
         (num.sqrt()) / (denom.sqrt().max(1e-12))
     }
 
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn test_matmat_matches_cpu_centered() {
-        let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
+    // ---- Rig ----
 
-        let n_rows = 500;
-        let n_cols = 80;
-        let k = 8;
-        let csr = random_csr(n_rows, n_cols, 0.1, 42);
-        let x_dense = densify(&csr);
-        let means = col_means(&x_dense, n_rows, n_cols);
-        let shards = split_into_shards(&csr, 4);
-        let source = InMemorySource {
-            shards,
-            n_obs: n_rows,
-            n_vars: n_cols,
-        };
+    /// The three handles every operator needs, owned so a test can hand out a
+    /// [`PcaHandles`] without three `let` bindings per test.
+    struct Rig {
+        cusparse: CusparseHandle,
+        cublas: CublasHandle,
+        cusolver: CusolverHandle,
+    }
 
-        // Random V (n_cols × k), col-major.
-        let mut rng = StdRng::seed_from_u64(7);
-        let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let d_v = dev.htod_copy(&v_host).unwrap();
-        let d_mu = dev.htod_copy(&means).unwrap();
+    impl Rig {
+        fn new() -> Self {
+            Self {
+                cusparse: CusparseHandle::new().unwrap(),
+                cublas: CublasHandle::new().unwrap(),
+                cusolver: CusolverHandle::new().unwrap(),
+            }
+        }
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            Some(&d_mu),
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
-        op.matmat(&d_v, &mut d_out, k).unwrap();
+        fn handles<'a>(&'a self, dev: &'a GpuDevice) -> PcaHandles<'a> {
+            PcaHandles {
+                dev,
+                cusparse: &self.cusparse,
+                cublas: &self.cublas,
+                cusolver: &self.cusolver,
+            }
+        }
+    }
+
+    /// `Y = (X − μ)·V` through the operator, returned host-side col-major.
+    ///
+    /// `V` is supplied as the operator's Ω, which is what the seed multiply
+    /// reads — so this exercises exactly the call `run_power_loop` makes first.
+    fn forward(
+        dev: &GpuDevice,
+        rig: &Rig,
+        source: &(dyn ShardSource + Sync),
+        d_means: Option<&CudaSlice<f32>>,
+        v_host: &[f32],
+        k: usize,
+    ) -> Vec<f32> {
+        let (n_obs, n_vars) = source.shape();
+        let d_v = dev.htod_copy(v_host).unwrap();
+        let mut scratch = GpuPcaScratch::new(dev, n_obs, n_vars, k).unwrap();
+        {
+            let mut op = StreamingPcaOperator::new(
+                rig.handles(dev),
+                source,
+                d_means,
+                &d_v,
+                &mut scratch,
+                k,
+                QrMethod::Householder,
+                SpmmAlgPolicy::Default,
+            )
+            .unwrap();
+            op.matmat(ForwardOperand::Omega).unwrap();
+        }
         dev.synchronize().unwrap();
-        let out_gpu = dev.dtoh_copy(&d_out).unwrap();
+        dev.dtoh_copy(&scratch.d_y).unwrap()
+    }
 
-        // CPU ref: out (n_rows × k) col-major: out[r, j] = Σ_c (x[r,c] − μ[c]) * V[c, j].
-        // V is col-major (n_cols × k): V[c, j] = v_host[j * n_cols + c].
-        let mut out_cpu = vec![0.0f32; n_rows * k];
+    /// `Z = (X − μ)ᵀ·Y` through the operator, returned host-side col-major.
+    ///
+    /// `Y` is seeded straight into the scratch slot the operator reads, which is
+    /// how the power loop supplies it — the transpose multiply has no operand
+    /// parameter precisely because there is only ever one source for it.
+    fn transpose(
+        dev: &GpuDevice,
+        rig: &Rig,
+        source: &(dyn ShardSource + Sync),
+        d_means: Option<&CudaSlice<f32>>,
+        y_host: &[f32],
+        k: usize,
+    ) -> Vec<f32> {
+        let (n_obs, n_vars) = source.shape();
+        let d_omega = dev.alloc_zeros::<f32>(n_vars * k).unwrap();
+        let mut scratch = GpuPcaScratch::new(dev, n_obs, n_vars, k).unwrap();
+        scratch.d_y = dev.htod_copy(y_host).unwrap();
+        {
+            let mut op = StreamingPcaOperator::new(
+                rig.handles(dev),
+                source,
+                d_means,
+                &d_omega,
+                &mut scratch,
+                k,
+                QrMethod::Householder,
+                SpmmAlgPolicy::Default,
+            )
+            .unwrap();
+            op.rmatmat().unwrap();
+        }
+        dev.synchronize().unwrap();
+        dev.dtoh_copy(&scratch.d_z).unwrap()
+    }
+
+    /// CPU reference for `(X − μ)·V`, col-major `(n_rows × k)`.
+    fn cpu_forward(
+        x_dense: &[f32],
+        means: Option<&[f32]>,
+        v_host: &[f32],
+        n_rows: usize,
+        n_cols: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_rows * k];
         for j in 0..k {
             for r in 0..n_rows {
                 let mut acc = 0.0f32;
                 for c in 0..n_cols {
-                    acc += (x_dense[r * n_cols + c] - means[c]) * v_host[j * n_cols + c];
+                    let mu = means.map_or(0.0, |m| m[c]);
+                    acc += (x_dense[r * n_cols + c] - mu) * v_host[j * n_cols + c];
                 }
-                out_cpu[j * n_rows + r] = acc;
+                out[j * n_rows + r] = acc;
             }
         }
+        out
+    }
+
+    /// CPU reference for `(X − μ)ᵀ·Y`, col-major `(n_cols × k)`.
+    fn cpu_transpose(
+        x_dense: &[f32],
+        means: &[f32],
+        y_host: &[f32],
+        n_rows: usize,
+        n_cols: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_cols * k];
+        for j in 0..k {
+            for c in 0..n_cols {
+                let mut acc = 0.0f32;
+                for r in 0..n_rows {
+                    acc += (x_dense[r * n_cols + c] - means[c]) * y_host[j * n_rows + r];
+                }
+                out[j * n_cols + c] = acc;
+            }
+        }
+        out
+    }
+
+    // ---- Numerical oracle ----
+    //
+    // These are the only CPU↔GPU comparison the streaming path has. They were
+    // written against `CenteredSparseOperator::matmat` / `::rmatmat` and are
+    // ported, not folded into the loop tests: a power-loop test compares a
+    // composition, and would pass on two multiplies that are individually wrong
+    // in cancelling ways.
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_matmat_matches_cpu_centered() {
+        let dev = require_gpu!();
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (500usize, 80usize, 8usize);
+        let csr = random_csr(n_rows, n_cols, 0.1, 42);
+        let x_dense = densify(&csr);
+        let means = col_means(&x_dense, n_rows, n_cols);
+        let source = InMemorySource {
+            shards: split_into_shards(&csr, 4),
+            n_obs: n_rows,
+            n_vars: n_cols,
+        };
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let d_mu = dev.htod_copy(&means).unwrap();
+
+        let out_gpu = forward(&dev, &rig, &source, Some(&d_mu), &v_host, k);
+        let out_cpu = cpu_forward(&x_dense, Some(&means), &v_host, n_rows, n_cols, k);
         let err = rel_error(&out_gpu, &out_cpu);
         assert!(err < 1e-4, "matmat centered rel_error = {err}");
     }
@@ -472,48 +531,21 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn test_matmat_matches_cpu_not_centered() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 300;
-        let n_cols = 50;
-        let k = 6;
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (300usize, 50usize, 6usize);
         let csr = random_csr(n_rows, n_cols, 0.08, 13);
         let x_dense = densify(&csr);
-        let shards = split_into_shards(&csr, 3);
         let source = InMemorySource {
-            shards,
+            shards: split_into_shards(&csr, 3),
             n_obs: n_rows,
             n_vars: n_cols,
         };
 
         let mut rng = StdRng::seed_from_u64(11);
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let d_v = dev.htod_copy(&v_host).unwrap();
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            None,
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
-        op.matmat(&d_v, &mut d_out, k).unwrap();
-        dev.synchronize().unwrap();
-        let out_gpu = dev.dtoh_copy(&d_out).unwrap();
-
-        let mut out_cpu = vec![0.0f32; n_rows * k];
-        for j in 0..k {
-            for r in 0..n_rows {
-                let mut acc = 0.0f32;
-                for c in 0..n_cols {
-                    acc += x_dense[r * n_cols + c] * v_host[j * n_cols + c];
-                }
-                out_cpu[j * n_rows + r] = acc;
-            }
-        }
+        let out_gpu = forward(&dev, &rig, &source, None, &v_host, k);
+        let out_cpu = cpu_forward(&x_dense, None, &v_host, n_rows, n_cols, k);
         let err = rel_error(&out_gpu, &out_cpu);
         assert!(err < 1e-4, "matmat uncentered rel_error = {err}");
     }
@@ -522,87 +554,55 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn test_rmatmat_matches_cpu_centered() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 400;
-        let n_cols = 60;
-        let k = 7;
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (400usize, 60usize, 7usize);
         let csr = random_csr(n_rows, n_cols, 0.1, 23);
         let x_dense = densify(&csr);
         let means = col_means(&x_dense, n_rows, n_cols);
-        let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
-            shards,
+            shards: split_into_shards(&csr, 4),
             n_obs: n_rows,
             n_vars: n_cols,
         };
 
         let mut rng = StdRng::seed_from_u64(31);
         let y_host: Vec<f32> = (0..n_rows * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let d_y = dev.htod_copy(&y_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            Some(&d_mu),
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_out = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
-        op.rmatmat(&d_y, &mut d_out, k).unwrap();
-        dev.synchronize().unwrap();
-        let out_gpu = dev.dtoh_copy(&d_out).unwrap();
-
-        // CPU ref: out (n_cols × k) col-major: out[c, j] = Σ_r (x[r,c] − μ[c]) * Y[r, j].
-        // Y col-major (n_rows × k): Y[r, j] = y_host[j * n_rows + r].
-        let mut out_cpu = vec![0.0f32; n_cols * k];
-        for j in 0..k {
-            for c in 0..n_cols {
-                let mut acc = 0.0f32;
-                for r in 0..n_rows {
-                    acc += (x_dense[r * n_cols + c] - means[c]) * y_host[j * n_rows + r];
-                }
-                out_cpu[j * n_cols + c] = acc;
-            }
-        }
+        let out_gpu = transpose(&dev, &rig, &source, Some(&d_mu), &y_host, k);
+        let out_cpu = cpu_transpose(&x_dense, &means, &y_host, n_rows, n_cols, k);
         let err = rel_error(&out_gpu, &out_cpu);
         assert!(err < 1e-4, "rmatmat centered rel_error = {err}");
     }
 
-    /// G2 regression: the strided SpMM path writes shard SpMM results
-    /// directly into `d_out` at row offset `global_row` with `ld = n_obs`.
-    /// Uneven shard sizes + odd `k` exercise the ld/offset arithmetic in
-    /// `mean_correct_colmajor_strided_kernel` — any off-by-one would
-    /// corrupt the last shard's rows or leak into untouched rows.
+    /// G2 regression: each shard's SpMM writes directly into the output at row
+    /// offset `RowSegment::offset` with `ld = n_obs`. Uneven shard sizes + odd
+    /// `k` exercise the ld/offset arithmetic in
+    /// `mean_correct_colmajor_strided_kernel` — any off-by-one would corrupt the
+    /// last shard's rows or leak into untouched ones.
     ///
-    /// n_rows = 503 (prime) split into 4 shards → 126+126+126+125. The
-    /// last shard is undersized by 1 row, so its strided SpMM writes to
-    /// rows `[378, 503)` only and the mean-correct touches a shorter
-    /// `(shard_rows × k)` region than the others.
+    /// n_rows = 503 (prime) split into 4 shards → 126+126+126+125. The last
+    /// shard is undersized by 1 row, so its strided SpMM writes rows
+    /// `[378, 503)` only and the mean-correct touches a shorter region.
+    ///
+    /// This is also the test that distinguishes the two operators: the resident
+    /// one has a single segment at offset 0, so it cannot observe an offset bug
+    /// at all.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn test_matmat_uneven_shards_centered() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 503;
-        let n_cols = 73;
-        let k = 15; // not a multiple of 32 (warp size)
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (503usize, 73usize, 15usize); // k not a multiple of 32
         let csr = random_csr(n_rows, n_cols, 0.1, 1009);
         let x_dense = densify(&csr);
         let means = col_means(&x_dense, n_rows, n_cols);
         let shards = split_into_shards(&csr, 4);
-        // Sanity: confirm the last shard is smaller than the others.
         assert!(
             shards.last().unwrap().n_rows() < shards.first().unwrap().n_rows(),
             "uneven-shard test requires a strictly smaller last shard; shard sizes = {:?}",
             shards.iter().map(|s| s.n_rows()).collect::<Vec<_>>()
         );
-
         let source = InMemorySource {
             shards,
             n_obs: n_rows,
@@ -611,119 +611,63 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(2027);
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let d_v = dev.htod_copy(&v_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            Some(&d_mu),
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
-        op.matmat(&d_v, &mut d_out, k).unwrap();
-        dev.synchronize().unwrap();
-        let out_gpu = dev.dtoh_copy(&d_out).unwrap();
-
-        let mut out_cpu = vec![0.0f32; n_rows * k];
-        for j in 0..k {
-            for r in 0..n_rows {
-                let mut acc = 0.0f32;
-                for c in 0..n_cols {
-                    acc += (x_dense[r * n_cols + c] - means[c]) * v_host[j * n_cols + c];
-                }
-                out_cpu[j * n_rows + r] = acc;
-            }
-        }
+        let out_gpu = forward(&dev, &rig, &source, Some(&d_mu), &v_host, k);
+        let out_cpu = cpu_forward(&x_dense, Some(&means), &v_host, n_rows, n_cols, k);
         let err = rel_error(&out_gpu, &out_cpu);
         assert!(err < 1e-4, "matmat uneven shards rel_error = {err}");
     }
 
-    /// G2 regression mirror of `test_matmat_uneven_shards_centered` for the
-    /// transpose path. Strided B view reads `d_y` at row offset `global_row`
-    /// with `ld = n_obs`; an off-by-one in the view's offset/ld would either
-    /// read past the end of `d_y` (silently zero or garbage) or skip rows.
+    /// Mirror of the above for the transpose path. The strided B view reads `Y`
+    /// at `RowSegment::offset` with `ld = n_obs`; an off-by-one would either
+    /// read past the end of `Y` or skip rows.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn test_rmatmat_uneven_shards_centered() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 503;
-        let n_cols = 73;
-        let k = 15; // not a multiple of 32
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (503usize, 73usize, 15usize);
         let csr = random_csr(n_rows, n_cols, 0.1, 4099);
         let x_dense = densify(&csr);
         let means = col_means(&x_dense, n_rows, n_cols);
-        let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
-            shards,
+            shards: split_into_shards(&csr, 4),
             n_obs: n_rows,
             n_vars: n_cols,
         };
 
         let mut rng = StdRng::seed_from_u64(8191);
         let y_host: Vec<f32> = (0..n_rows * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let d_y = dev.htod_copy(&y_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
-            &source,
-            Some(&d_mu),
-            SpmmAlgPolicy::Default,
-        );
-        let mut d_out = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
-        op.rmatmat(&d_y, &mut d_out, k).unwrap();
-        dev.synchronize().unwrap();
-        let out_gpu = dev.dtoh_copy(&d_out).unwrap();
-
-        let mut out_cpu = vec![0.0f32; n_cols * k];
-        for j in 0..k {
-            for c in 0..n_cols {
-                let mut acc = 0.0f32;
-                for r in 0..n_rows {
-                    acc += (x_dense[r * n_cols + c] - means[c]) * y_host[j * n_rows + r];
-                }
-                out_cpu[j * n_cols + c] = acc;
-            }
-        }
+        let out_gpu = transpose(&dev, &rig, &source, Some(&d_mu), &y_host, k);
+        let out_cpu = cpu_transpose(&x_dense, &means, &y_host, n_rows, n_cols, k);
         let err = rel_error(&out_gpu, &out_cpu);
         assert!(err < 1e-4, "rmatmat uneven shards rel_error = {err}");
     }
 
-    /// G2 power-iteration pool reuse: mimic the `gpu_randomized_pca` shape —
-    /// alternating `matmat_pooled` (forward, n_obs × k output) and
-    /// `rmatmat_pooled` (transpose, n_vars × k output) across `n_power_iters`
-    /// iterations sharing one pool. Each iteration shape stays constant, so
-    /// the pool's `alloc_count` should bump at most twice (once for the
-    /// forward workspace shape, once for the transpose shape) regardless of
-    /// the iteration count.
+    // ---- Workspace pool ----
+
+    /// G2 power-iteration pool reuse: alternating forward and transpose
+    /// multiplies across `n_power_iters` iterations on one operator. Each
+    /// iteration's shapes are constant, so the pool should grow at most twice
+    /// (once per multiply direction) regardless of the iteration count.
     ///
-    /// This is the matmat-equivalent of the plan's
-    /// `test_randomized_pca_pool_no_realloc_across_power_iters` — it
-    /// exercises the same SpMM pattern without dragging in cuSOLVER QR.
+    /// Driven through `matmat` / `rmatmat` rather than `run_power_loop` on
+    /// purpose: this is a test of the SpMM workspace, and the loop would drag
+    /// cuSOLVER QR into it for no added coverage.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn test_matmat_rmatmat_pool_no_realloc_across_power_iters() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 800;
-        let n_cols = 120;
-        let k = 12;
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (800usize, 120usize, 12usize);
         let n_power_iters = 8;
         let csr = random_csr(n_rows, n_cols, 0.1, 271);
         let means = col_means(&densify(&csr), n_rows, n_cols);
-        let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
-            shards,
+            shards: split_into_shards(&csr, 4),
             n_obs: n_rows,
             n_vars: n_cols,
         };
@@ -732,42 +676,36 @@ mod tests {
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let d_v = dev.htod_copy(&v_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
+        let mut scratch = GpuPcaScratch::new(&dev, n_rows, n_cols, k).unwrap();
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
+        let mut op = StreamingPcaOperator::new(
+            rig.handles(&dev),
             &source,
             Some(&d_mu),
+            &d_v,
+            &mut scratch,
+            k,
+            QrMethod::Householder,
             SpmmAlgPolicy::Default,
-        );
-        let mut pool = CuSparseWorkspacePool::new();
-        let mut d_y = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
-        let mut d_z = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
+        )
+        .unwrap();
 
-        // First forward to populate d_y; then n_power_iters of (rmatmat into
-        // d_z, matmat back into d_y) — exactly the SpMM pattern the GPU
-        // randomized PCA power loop runs.
-        op.matmat_pooled(&d_v, &mut d_y, k, &mut pool).unwrap();
+        op.matmat(ForwardOperand::Omega).unwrap();
         for _ in 0..n_power_iters {
-            op.rmatmat_pooled(&d_y, &mut d_z, k, &mut pool).unwrap();
-            op.matmat_pooled(&d_z, &mut d_y, k, &mut pool).unwrap();
+            op.rmatmat().unwrap();
+            op.matmat(ForwardOperand::Z).unwrap();
         }
         dev.synchronize().unwrap();
 
-        let metrics = pool.metrics();
-        // Total SpMM calls: 1 + 2 * n_power_iters = 17. Each shard run = 4
-        // SpMM calls, total = 17 × 4 = 68 SpMM invocations of the pool.
+        let metrics = op.pool.metrics();
+        // 1 + 2·n_power_iters = 17 multiplies, each over 4 shards = 68 SpMM
+        // invocations of the pool.
         let expected_calls = (1 + 2 * n_power_iters) * 4;
         assert_eq!(
             metrics.alloc_count + metrics.reuse_count,
             expected_calls as u64,
             "pool counters should sum to total SpMM invocations"
         );
-        // The matmat and rmatmat workspace sizes may differ (different B/C
-        // dimensions for forward vs transpose), so the pool can grow at
-        // most twice. In practice on most hardware both fit the same
-        // bucket and we see exactly 1 alloc.
         assert!(
             metrics.alloc_count <= 2,
             "expected ≤ 2 grow events over {} power iters, got {} (capacity {} bytes)",
@@ -777,25 +715,18 @@ mod tests {
         );
     }
 
-    /// G2 pool-threading: `matmat_pooled` with the caller's pool reuses
-    /// workspace across the 4 shards; the second invocation reuses it
-    /// across another 4 shards without re-allocating. Asserts that the
-    /// pool's `alloc_count` is at most 1 after both calls (single grow
-    /// event for cuSPARSE's largest workspace shape).
+    /// The pool is an operator field, so it is reused across calls as well as
+    /// across the shards within one call: two same-shape forward multiplies over
+    /// 4 shards should allocate at most once and reuse for the other 7.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn test_matmat_pooled_reuses_workspace_across_calls() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 400;
-        let n_cols = 60;
-        let k = 8;
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (400usize, 60usize, 8usize);
         let csr = random_csr(n_rows, n_cols, 0.1, 7);
-        let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
-            shards,
+            shards: split_into_shards(&csr, 4),
             n_obs: n_rows,
             n_vars: n_cols,
         };
@@ -803,27 +734,24 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(3);
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let d_v = dev.htod_copy(&v_host).unwrap();
+        let mut scratch = GpuPcaScratch::new(&dev, n_rows, n_cols, k).unwrap();
 
-        let op = CenteredSparseOperator::new(
-            &dev,
-            &cusparse,
-            &cublas,
+        let mut op = StreamingPcaOperator::new(
+            rig.handles(&dev),
             &source,
             None,
+            &d_v,
+            &mut scratch,
+            k,
+            QrMethod::Householder,
             SpmmAlgPolicy::Default,
-        );
-        let mut pool = CuSparseWorkspacePool::new();
-        let mut d_out = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
-
-        // Two back-to-back invocations on the same shape.
-        op.matmat_pooled(&d_v, &mut d_out, k, &mut pool).unwrap();
-        op.matmat_pooled(&d_v, &mut d_out, k, &mut pool).unwrap();
+        )
+        .unwrap();
+        op.matmat(ForwardOperand::Omega).unwrap();
+        op.matmat(ForwardOperand::Omega).unwrap();
         dev.synchronize().unwrap();
 
-        let metrics = pool.metrics();
-        // Two calls × 4 shards = 8 SpMM invocations. Workspace shape is
-        // the same for every shard (same V, same n_vars, same k), so the
-        // pool should allocate at most once and reuse for the other 7.
+        let metrics = op.pool.metrics();
         assert!(
             metrics.alloc_count <= 1,
             "pool alloc_count = {} (capacity {} bytes); expected ≤ 1 across 8 same-shape SpMM calls",
@@ -839,49 +767,42 @@ mod tests {
         );
     }
 
+    // ---- SpMM policy ----
+
     /// The streaming operator must launch the algorithm its `SpmmAlgPolicy`
-    /// resolves to, on **both** multiplies.
-    ///
-    /// This is the path a `>VRAM` PCA takes. Before the policy was threaded in
-    /// it hardcoded `CUSPARSE_SPMM_ALG_DEFAULT` while
-    /// `uns["scx_accel"]["pca"]["spmm_policy"]` reported whatever the caller
-    /// asked for, so a caller who asked to pin `CUSPARSE_SPMM_CSR_ALG2` got the
-    /// heuristic and was told otherwise. (Note the policy pins an *algorithm*,
-    /// not the bits — cuSPARSE guarantees no reproducibility for the transpose
-    /// multiply this loop issues. See `SpmmAlgPolicy::Deterministic`.)
+    /// resolves to, on **both** multiplies. This is the path a `>VRAM` PCA
+    /// takes; review §8.11 is it hardcoding `CUSPARSE_SPMM_ALG_DEFAULT` while
+    /// `uns["scx_accel"]["pca"]["spmm_policy"]` reported the caller's request.
+    /// (The policy pins an *algorithm*, not the bits — cuSPARSE guarantees no
+    /// reproducibility for the transpose multiply this loop issues. See
+    /// `SpmmAlgPolicy::Deterministic`.)
     ///
     /// Two things are checked, and it is worth being precise about which is
-    /// which. The `spmm_alg()` assertion is a real regression guard: it fails
-    /// if the field stops being wired to the policy. The numeric halves are
+    /// which. The `spmm_alg()` assertion is a real regression guard: it fails if
+    /// the field stops being wired to the policy. The numeric halves are
     /// **acceptance** checks — they catch `CUSPARSE_STATUS_NOT_SUPPORTED` for
-    /// `CSR_ALG2` (notably under `CUSPARSE_OPERATION_TRANSPOSE`, which the
-    /// resident loop already relies on but this operator never exercised) and
-    /// confirm the two algorithms agree. They would pass even if the operator
-    /// ignored the policy entirely; nothing observable from the host reports
-    /// which algorithm cuSPARSE actually ran.
+    /// `CSR_ALG2` (notably under `CUSPARSE_OPERATION_TRANSPOSE`) and confirm the
+    /// two algorithms agree. They would pass even if the operator ignored the
+    /// policy entirely; nothing observable from the host reports which algorithm
+    /// cuSPARSE actually ran.
     ///
     /// The structural guard is what carries the wiring, and it is narrower than
     /// "unbypassable": with no algorithm-less strided-SpMM entry point left, a
     /// call site can no longer *omit* the algorithm and inherit a hidden
-    /// default. It can still pass `CUSPARSE_SPMM_ALG_DEFAULT` deliberately —
-    /// the `cusparse.rs` tests do. The guard is against an invisible default,
-    /// not against a wrong choice.
+    /// default. It can still pass `CUSPARSE_SPMM_ALG_DEFAULT` deliberately — the
+    /// `cusparse.rs` tests do. The guard is against an invisible default, not
+    /// against a wrong choice.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn streaming_operator_honours_the_spmm_policy() {
         let dev = require_gpu!();
-        let cusparse = CusparseHandle::new().unwrap();
-        let cublas = CublasHandle::new().unwrap();
-
-        let n_rows = 400;
-        let n_cols = 70;
-        let k = 6;
+        let rig = Rig::new();
+        let (n_rows, n_cols, k) = (400usize, 70usize, 6usize);
         let csr = random_csr(n_rows, n_cols, 0.12, 91);
         let x_dense = densify(&csr);
         let means = col_means(&x_dense, n_rows, n_cols);
-        let shards = split_into_shards(&csr, 4);
         let source = InMemorySource {
-            shards,
+            shards: split_into_shards(&csr, 4),
             n_obs: n_rows,
             n_vars: n_cols,
         };
@@ -890,41 +811,68 @@ mod tests {
         let v_host: Vec<f32> = (0..n_cols * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let y_host: Vec<f32> = (0..n_rows * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let d_v = dev.htod_copy(&v_host).unwrap();
-        let d_y = dev.htod_copy(&y_host).unwrap();
         let d_mu = dev.htod_copy(&means).unwrap();
 
-        let mut forward = Vec::new();
-        let mut transpose = Vec::new();
+        let mut forward_out = Vec::new();
+        let mut transpose_out = Vec::new();
         for policy in [SpmmAlgPolicy::Default, SpmmAlgPolicy::Deterministic] {
-            let op =
-                CenteredSparseOperator::new(&dev, &cusparse, &cublas, &source, Some(&d_mu), policy);
-            assert_eq!(
-                op.spmm_alg(),
-                policy.to_alg(),
-                "operator launches {:?} but was constructed with {policy:?}",
-                op.spmm_alg()
-            );
-
-            // Forward: (X − μ) · V, n_rows × k col-major.
-            let mut d_fwd = dev.alloc_zeros::<f32>(n_rows * k).unwrap();
-            op.matmat(&d_v, &mut d_fwd, k).unwrap();
-            // Transpose: (X − μ)ᵀ · Y, n_cols × k col-major. `CSR_ALG2` under
-            // CUSPARSE_OPERATION_TRANSPOSE is the combination this operator
-            // had never issued.
-            let mut d_rev = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
-            op.rmatmat(&d_y, &mut d_rev, k).unwrap();
+            let mut scratch = GpuPcaScratch::new(&dev, n_rows, n_cols, k).unwrap();
+            {
+                let mut op = StreamingPcaOperator::new(
+                    rig.handles(&dev),
+                    &source,
+                    Some(&d_mu),
+                    &d_v,
+                    &mut scratch,
+                    k,
+                    QrMethod::Householder,
+                    policy,
+                )
+                .unwrap();
+                assert_eq!(
+                    op.spmm_alg(),
+                    policy.to_alg(),
+                    "operator launches {:?} but was constructed with {policy:?}",
+                    op.spmm_alg()
+                );
+                op.matmat(ForwardOperand::Omega).unwrap();
+            }
             dev.synchronize().unwrap();
+            forward_out.push(dev.dtoh_copy(&scratch.d_y).unwrap());
 
-            forward.push(dev.dtoh_copy(&d_fwd).unwrap());
-            transpose.push(dev.dtoh_copy(&d_rev).unwrap());
+            // A second operator for the transpose: `Y` has to be seeded into the
+            // scratch the operator borrows, and the forward multiply above
+            // overwrote it. `CSR_ALG2` under `CUSPARSE_OPERATION_TRANSPOSE` is
+            // the combination this operator had never issued.
+            transpose_out.push({
+                let d_omega = dev.alloc_zeros::<f32>(n_cols * k).unwrap();
+                let mut scratch = GpuPcaScratch::new(&dev, n_rows, n_cols, k).unwrap();
+                scratch.d_y = dev.htod_copy(&y_host).unwrap();
+                {
+                    let mut op = StreamingPcaOperator::new(
+                        rig.handles(&dev),
+                        &source,
+                        Some(&d_mu),
+                        &d_omega,
+                        &mut scratch,
+                        k,
+                        QrMethod::Householder,
+                        policy,
+                    )
+                    .unwrap();
+                    op.rmatmat().unwrap();
+                }
+                dev.synchronize().unwrap();
+                dev.dtoh_copy(&scratch.d_z).unwrap()
+            });
         }
 
-        let fwd_err = rel_error(&forward[0], &forward[1]);
+        let fwd_err = rel_error(&forward_out[0], &forward_out[1]);
         assert!(
             fwd_err < 1e-4,
             "matmat under Deterministic diverged from Default: rel_error = {fwd_err}"
         );
-        let rev_err = rel_error(&transpose[0], &transpose[1]);
+        let rev_err = rel_error(&transpose_out[0], &transpose_out[1]);
         assert!(
             rev_err < 1e-4,
             "rmatmat under Deterministic diverged from Default: rel_error = {rev_err}"

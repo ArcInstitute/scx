@@ -1345,7 +1345,9 @@ Complete GPU-accelerated randomized PCA. Streams SpMM shard-by-shard via cuSPARS
 
 > **Row-major `mean_correct_gpu`** — removed. It had no caller after the GPU PCA
 > path moved to the col-major operator; centering now happens inside
-> `CenteredSparseOperator` via `mean_correct_colmajor_strided_kernel`.
+> `spmm_forward_segment` via `mean_correct_colmajor_strided_kernel`, which both
+> the streaming and the device-resident PCA operators call (the streaming one
+> once per shard, the resident one once).
 
 ### GPU kNN
 
