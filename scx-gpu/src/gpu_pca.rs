@@ -37,8 +37,9 @@ use crate::cusparse::{
 use crate::device::{flat_launch_1d, GpuDevice};
 use crate::device_resident::DeviceEmbedding;
 use crate::error::GpuError;
-use crate::linear_operator::CenteredSparseOperator;
+use crate::linear_operator::StreamingPcaOperator;
 use crate::math_policy::GpuPcaTuning;
+use crate::pca_operator::run_power_loop;
 
 /// PTX source for col-major scatter/gather/mean-correct/column-sum kernels.
 const COLMAJOR_OPS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/colmajor_ops.ptx"));
@@ -145,6 +146,20 @@ struct RandomizedPcaCore {
     /// Whether the whole matrix was held device-resident across the power loop.
     /// See [`GpuPcaResult::resident_csr`].
     resident_csr: bool,
+}
+
+/// The four cuBLAS/cuSOLVER/cuSPARSE handles a PCA operator needs, plus the
+/// device they belong to.
+///
+/// Grouped because a constructor taking them positionally alongside the source,
+/// the buffers and the tuning runs past clippy's argument limit — and because
+/// they always travel together.
+#[derive(Clone, Copy)]
+pub(crate) struct PcaHandles<'a> {
+    pub(crate) dev: &'a GpuDevice,
+    pub(crate) cusparse: &'a CusparseHandle,
+    pub(crate) cublas: &'a CublasHandle,
+    pub(crate) cusolver: &'a CusolverHandle,
 }
 
 /// A contiguous run of the matrix's rows, in the global row space.
@@ -396,7 +411,7 @@ pub(crate) fn qr_swap_into(
 /// 8. Embeddings = Q @ V × Σ (GPU cuBLAS sgemm + column scaling) — kept on GPU
 ///
 /// Steps 3-6 stream from any `ShardSource` without materializing full X.
-/// The `Sync` bound is required so the streaming `CenteredSparseOperator`
+/// The `Sync` bound is required so the streaming `StreamingPcaOperator`
 /// (which iterates via `RawGpuShardSource` on the G3 staging path) can borrow
 /// `source` across its scoped pre-decode worker thread.
 /// Peak GPU memory: ~500 MB for 1M cells (dominated by Y and Q matrices).
@@ -473,26 +488,19 @@ fn randomized_pca_core(
     let d_omega = random_gaussian_gpu(dev, dev.stream(), n_vars, k, seed)?;
 
     // G2: hoist the (n_obs × k) and (n_vars × k) dense SpMM outputs into a
-    // single reusable scratch struct + share one cuSPARSE workspace across
-    // every SpMM call in the entire PCA run. Pre-G2 each call inside
+    // single reusable scratch struct. Pre-G2 each call inside
     // streaming_gpu_spmm_forward / _transpose allocated d_y / d_z / d_y_shard
-    // / d_sum_q fresh; the strided matmat_pooled / rmatmat_pooled path on
-    // CenteredSparseOperator now writes directly into scratch.d_y / scratch.d_z
-    // with cuSPARSE workspace served by `pool`.
+    // / d_sum_q fresh; the segment functions now write directly into
+    // scratch.d_y / scratch.d_z. The cuSPARSE workspace pool is owned by
+    // whichever operator runs, so it is shared across every SpMM in the run
+    // either way.
     let mut scratch = GpuPcaScratch::new(dev, n_obs, n_vars, k)?;
-    let mut pool = CuSparseWorkspacePool::new();
-    // `tuning.spmm_policy` reaches the streaming operator here, not just the
-    // resident loop below: both power-loop paths must run the algorithm the
-    // caller asked for, because `uns["scx_accel"]["pca"]["spmm_policy"]` is
-    // stamped from that request either way.
-    let op = CenteredSparseOperator::new(
+    let handles = PcaHandles {
         dev,
-        &cusparse_handle,
-        &cublas_handle,
-        source,
-        d_means.as_ref(),
-        tuning.spmm_policy,
-    );
+        cusparse: &cusparse_handle,
+        cublas: &cublas_handle,
+        cusolver: &cusolver_handle,
+    };
 
     // Task 2.5: when the full matrix fits device memory, run the power loop on
     // a single device-resident CSR (one upload, two SpMM/iter, optional CUDA-
@@ -546,43 +554,21 @@ fn randomized_pca_core(
             tuning,
         )?
     } else {
-        // Streaming fallback: the matrix does not fit device memory. The
-        // pre-2.5 streaming operator re-decodes + re-uploads the whole matrix
-        // on each matmat / rmatmat. No CUDA-graph capture on this path.
-        op.matmat_pooled(&d_omega, &mut scratch.d_y, k, &mut pool)?;
-
-        // QR dispatch — see `qr_swap_into`, which both power-loop paths share.
-        let qr_into =
-            |scratch_slot: &mut CudaSlice<f32>, rows: usize, cols: usize| -> Result<(), GpuError> {
-                qr_swap_into(
-                    dev,
-                    &cusolver_handle,
-                    &cublas_handle,
-                    qr_method,
-                    scratch_slot,
-                    rows,
-                    cols,
-                )
-            };
-
-        // Step 4: scratch.d_y ← qr(scratch.d_y); Q now lives in scratch.d_y.
-        qr_into(&mut scratch.d_y, n_obs, k)?;
-
-        // Step 5: Power iterations. Each iter does:
-        //   B = (X − μ)ᵀ · Q   →  scratch.d_z   (Q lives in scratch.d_y)
-        //   Q_B = qr(scratch.d_z)                (Q_B now in scratch.d_z)
-        //   Y = (X − μ) · Q_B  →  scratch.d_y   (overwrites Q)
-        //   Q = qr(scratch.d_y)                  (new Q in scratch.d_y)
-        for _ in 0..n_power_iterations {
-            op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
-            qr_into(&mut scratch.d_z, n_vars, k)?;
-
-            op.matmat_pooled(&scratch.d_z, &mut scratch.d_y, k, &mut pool)?;
-            qr_into(&mut scratch.d_y, n_obs, k)?;
-        }
-
-        // Step 6: B = (X − μ)ᵀ · Q  (final, n_vars × k) — written into scratch.d_z
-        op.rmatmat_pooled(&scratch.d_y, &mut scratch.d_z, k, &mut pool)?;
+        // Streaming fallback: the matrix does not fit device memory, so every
+        // multiply re-decodes and re-uploads it. Same sequence as the resident
+        // arm above — `run_power_loop` runs both — and the same segment
+        // arithmetic; only the number of segments differs.
+        let mut op = StreamingPcaOperator::new(
+            handles,
+            source,
+            d_means.as_ref(),
+            &d_omega,
+            &mut scratch,
+            k,
+            qr_method,
+            tuning.spmm_policy,
+        )?;
+        run_power_loop(&mut op, n_power_iterations)?;
     }
     let d_b_final = &scratch.d_z;
 
@@ -894,24 +880,14 @@ pub(crate) fn gpu_mean_correct_colmajor_strided(
     Ok(())
 }
 
-/// Compute column sums of a col-major matrix on GPU.
+/// Column sums of a col-major `(m × k)` matrix, into a caller-provided `out` of
+/// length `k`.
 ///
-/// Returns a vector of k column sums.
-pub(crate) fn gpu_column_sums(
-    dev: &GpuDevice,
-    x: &CudaSlice<f32>, // (m × k) col-major
-    m: usize,
-    k: usize,
-) -> Result<CudaSlice<f32>, GpuError> {
-    let mut out = dev.alloc_zeros::<f32>(k)?;
-    gpu_column_sums_into(dev, x, &mut out, m, k)?;
-    Ok(out)
-}
-
-/// [`gpu_column_sums`] writing into a caller-provided `out` (length `k`)
-/// instead of allocating. Required inside CUDA-graph capture (Task 2.5), where
-/// device allocations are forbidden — the resident PCA transpose segment
-/// pre-allocates the column-sum buffer once and reuses it across replays.
+/// The allocating wrapper this used to have (`gpu_column_sums`) is gone: once
+/// both PCA operators held their column-sum buffer as a field, its only
+/// remaining callers were tests, and two entry points to one reduction is the
+/// shape ORG-8.20-2 exists to remove. A caller that wants a fresh buffer writes
+/// the `alloc_zeros` itself, which is all the wrapper did.
 ///
 /// `column_sum_kernel` uses exactly one block per column and writes each
 /// `out[col]` with a single plain store, so for `m > 0` it fully overwrites

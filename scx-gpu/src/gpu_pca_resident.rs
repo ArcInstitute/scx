@@ -337,7 +337,7 @@ pub(crate) fn run_resident_power_loop(
 mod tests {
     use crate::cusolver::QrMethod;
     use crate::gpu_graph::set_cuda_graphs_enabled_override;
-    use crate::gpu_pca::{gpu_column_sums, gpu_column_sums_into, gpu_randomized_pca};
+    use crate::gpu_pca::{gpu_column_sums_into, gpu_randomized_pca};
     use crate::math_policy::GpuPcaTuning;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -666,9 +666,9 @@ mod tests {
         let d_a = dev.htod_copy(&host_a).unwrap();
 
         // (1) Precision vs exact f64 reference.
-        let sums_a = dev
-            .dtoh_copy(&gpu_column_sums(&dev, &d_a, m, k).unwrap())
-            .unwrap();
+        let mut out_a = dev.alloc_zeros::<f32>(k).unwrap();
+        gpu_column_sums_into(&dev, &d_a, &mut out_a, m, k).unwrap();
+        let sums_a = dev.dtoh_copy(&out_a).unwrap();
         for c in 0..k {
             let rel = (sums_a[c] as f64 - refs_a[c]).abs() / refs_a[c].abs().max(1e-12);
             assert!(
@@ -680,9 +680,9 @@ mod tests {
         }
 
         // (2) Determinism: identical input → bit-identical output across runs.
-        let sums_a2 = dev
-            .dtoh_copy(&gpu_column_sums(&dev, &d_a, m, k).unwrap())
-            .unwrap();
+        let mut out_a2 = dev.alloc_zeros::<f32>(k).unwrap();
+        gpu_column_sums_into(&dev, &d_a, &mut out_a2, m, k).unwrap();
+        let sums_a2 = dev.dtoh_copy(&out_a2).unwrap();
         assert_eq!(
             sums_a, sums_a2,
             "column sums must be deterministic run-to-run"
@@ -698,9 +698,9 @@ mod tests {
         gpu_column_sums_into(&dev, &d_a, &mut reused, m, k).unwrap();
         gpu_column_sums_into(&dev, &d_b, &mut reused, m, k).unwrap();
         let reused_host = dev.dtoh_copy(&reused).unwrap();
-        let fresh_b = dev
-            .dtoh_copy(&gpu_column_sums(&dev, &d_b, m, k).unwrap())
-            .unwrap();
+        let mut out_b = dev.alloc_zeros::<f32>(k).unwrap();
+        gpu_column_sums_into(&dev, &d_b, &mut out_b, m, k).unwrap();
+        let fresh_b = dev.dtoh_copy(&out_b).unwrap();
         assert_eq!(
             reused_host, fresh_b,
             "reused buffer must be fully overwritten by the second call"

@@ -197,7 +197,6 @@ pub use gpu_preprocess::{
     gpu_apply_fused_ops, gpu_log1p, gpu_normalize, gpu_normalize_log1p, gpu_preprocess_to_csr,
 };
 pub use gpu_pseudobulk::{gpu_pseudobulk_means_csr, gpu_pseudobulk_means_dense};
-pub use linear_operator::CenteredSparseOperator;
 pub use math_policy::{GpuMathMode, GpuPcaTuning, SpmmAlgPolicy};
 pub use preprocessed_gpu_matrix_source::PreprocessedGpuMatrixSource;
 pub use profile::{ProfileSnapshot, StageStat};

@@ -1810,14 +1810,17 @@ jobs:
             exit 1
           fi
           # ...and the consumers really did move: no production file outside the
-          # staging modules constructs a Raw adapter. Two exclusions, both with
-          # a reason:
-          #   * `linear_operator.rs` — the documented deferral. ORG-8.20-2 owns
-          #     that file's rewrite (one operator trait, one power loop) and
-          #     migrates it there. Listed by name so it reads as a decision.
+          # staging modules constructs a Raw adapter. One exclusion:
           #   * `*_tests.rs` — a test of an adapter constructs the adapter. The
           #     allowlist already covers the inline `mod tests` in the staging
           #     modules themselves; this covers the extracted ones.
+          # `linear_operator.rs` used to be a second, named exclusion — the
+          # deferral ORG-8.20-1 PR D recorded, because migrating it changed the
+          # operator's borrow shape across a power loop ORG-8.20-2 was going to
+          # rewrite anyway. ORG-8.20-2 PR C did that, so the exemption is gone.
+          # It is deliberately not left behind as a harmless no-op: an exemption
+          # that outlives its reason keeps permitting the thing it was granted
+          # for.
           # Any associated-function CALL on the low-level adapters, not just
           # `::new`. The first version listed only `::new`, and
           # `RawGpuShardSource::with_max_shard_rows` is a second crate-visible
@@ -1833,13 +1836,13 @@ jobs:
           # it, so it is now the default assumption rather than a surprise.
           stragglers=$(for f in $(find scx-gpu/src -name '*.rs' \
                 | grep -vE '_tests\.rs$' \
-                | grep -vE '^scx-gpu/src/(gpu_shard_source|gpu_csc_shard_source|backed_gpu_matrix_source|preprocessed_gpu_matrix_source|linear_operator)\.rs$'); do
+                | grep -vE '^scx-gpu/src/(gpu_shard_source|gpu_csc_shard_source|backed_gpu_matrix_source|preprocessed_gpu_matrix_source)\.rs$'); do
             sed -e 's#//.*##' "$f" \
               | grep -E '(RawGpuShardSource|RawGpuCscShardSource|GpuPreprocessedShardSource)::[a-z_]+\(' >/dev/null \
               && echo "$f"
           done || true)
           if [ -n "$stragglers" ]; then
-            echo "::error::$stragglers construct a low-level staging adapter directly. Go through BackedGpuMatrixSource / PreprocessedGpuMatrixSource — reaching past GpuMatrixSource is the split ORG-8.20-1 D4 closed. (linear_operator.rs is the one sanctioned exception; ORG-8.20-2 migrates it.)"
+            echo "::error::$stragglers construct a low-level staging adapter directly. Go through BackedGpuMatrixSource / PreprocessedGpuMatrixSource — reaching past GpuMatrixSource is the split ORG-8.20-1 D4 closed. There are no sanctioned exceptions left; the last one (linear_operator.rs) was retired by ORG-8.20-2."
             exit 1
           fi
 
@@ -1867,6 +1870,19 @@ jobs:
           for f in "$drv" "$fake" "$pca"; do
             test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-2)."; exit 1; }
           done
+
+          # Several branches below must not see the inline `mod tests`: the pool
+          # test drives the operator directly and legitimately writes its own
+          # `for _ in 0..n_power_iters`, and a test that builds a source would
+          # otherwise satisfy a check about what production builds. Every file
+          # here puts `#[cfg(test)]` at column 0, so truncating there is exact.
+          #
+          # Consumers of `prod` must spell the match `grep … >/dev/null`, never
+          # `grep -q`: under `set -o pipefail`, `-q` closes the pipe on the first
+          # hit, `sed` dies of SIGPIPE, and the pipeline reports failure *because
+          # it matched*. That inverts the check into one that can only fail, and
+          # it is how a guard in this file was silently green for a whole PR.
+          prod() { sed '/^#\[cfg(test)\]/,$d' "$1"; }
 
           # 1. The seam exists. Both halves: without the trait the loop has
           #    nothing to dispatch through, and without the driver each path
@@ -1918,15 +1934,28 @@ jobs:
           #    Named per file, not counted: two impls in one file would satisfy a
           #    count while leaving the other path un-migrated, which is the exact
           #    state ORG-8.20-2 exists to end.
-          grep -qE '^impl PcaOperator for ' scx-gpu/src/gpu_pca_resident.rs || { echo "::error::scx-gpu/src/gpu_pca_resident.rs no longer implements PcaOperator — the resident path has its own power loop again (ORG-8.20-2)."; exit 1; }
+          for f in scx-gpu/src/gpu_pca_resident.rs scx-gpu/src/linear_operator.rs; do
+            grep -qE '^impl PcaOperator for ' "$f" || { echo "::error::$f no longer implements PcaOperator — that PCA path has its own power loop again (ORG-8.20-2)."; exit 1; }
+          done
 
           # 6. ...and neither PCA path writes a power loop of its own. The only
           #    `for _ in 0..n_power_iterations` in this crate belongs to the
           #    driver.
-          if grep -nE 'for [_a-z]+ in 0\.\.n_power_iterations' scx-gpu/src/gpu_pca_resident.rs; then
-            echo "::error::scx-gpu/src/gpu_pca_resident.rs iterates power iterations itself at the line(s) above. run_power_loop owns the sequence (ORG-8.20-2)."
-            exit 1
-          fi
+          for f in scx-gpu/src/gpu_pca_resident.rs scx-gpu/src/linear_operator.rs "$pca"; do
+            if prod "$f" | grep -nE 'for [_a-z]+ in 0\.\.n_power_iter'; then
+              echo "::error::$f iterates power iterations itself at the line(s) above. run_power_loop owns the sequence (ORG-8.20-2)."
+              exit 1
+            fi
+          done
+
+          # 8. And nothing reaches the streaming operator's staging adapter
+          #    around GpuMatrixSource. This is the deferral ORG-8.20-1 PR D left
+          #    behind and PR C here closed; the ORG-8.20-1 straggler scan's
+          #    named exemption for this file is deleted in the same commit, so
+          #    that guard now covers it. Asserted positively as well, because a
+          #    file that stopped constructing *any* source would satisfy the
+          #    straggler scan by doing nothing.
+          prod scx-gpu/src/linear_operator.rs | grep -E 'BackedGpuMatrixSource::new\(' >/dev/null || { echo "::error::scx-gpu/src/linear_operator.rs no longer builds a BackedGpuMatrixSource in production code — the streaming PCA operator has gone back to a low-level staging adapter (ORG-8.20-1 D4, ORG-8.20-2)."; exit 1; }
 
           # 7. The seam carries no dead-code silencer. PR A landed one, said PR B
           #    would remove it, and this is what makes that non-optional: if
