@@ -194,10 +194,27 @@ impl PcaOperator for StreamingPcaOperator<'_> {
             ForwardOperand::Z => d_z,
         };
 
-        // Zero up front: each shard's SpMM writes only its own row window, so
-        // any row no shard covers would otherwise keep the previous multiply's
-        // values. (ORG-8.20-2 PR D decides whether a tiling check makes this
-        // removable; until it is measured, it stays.)
+        // Kept deliberately, and the decision is measured rather than assumed.
+        //
+        // With `check_row_coverage` proving the segments tile `[0, n_obs)`, and
+        // with `cusparseSpMM` observed to write every row of `C` under β = 0
+        // including the all-zero ones (`spmm_beta_zero_writes_rows_that_have_no_nonzeros`,
+        // H100 / CUDA 12.x), this memset is redundant *today*. ORG-8.20-2's task
+        // text called it redundant outright; it stays anyway, because:
+        //
+        //   * cuSPARSE documents that β = 0 means `C` is not **read**. It does
+        //     not promise `C` is fully **written**, so the redundancy rests on
+        //     observed behaviour, not on a contract.
+        //   * The failure if that behaviour ever changes is a silently wrong
+        //     PCA — an all-zero row keeping the previous power iteration's
+        //     values — which no downstream check can see.
+        //   * The cost is one extra write of the `n_obs × k` output per forward
+        //     multiply, against an SpMM that streams the whole matrix. The
+        //     matrix is the larger term whenever a row averages more than `k`
+        //     nonzeros, which is every single-cell matrix at the default k = 60.
+        //
+        // The test is what makes this a decision instead of a habit: if a future
+        // cuSPARSE stops writing empty rows, it fails and says so.
         ctx.dev
             .stream()
             .memset_zeros(d_y)

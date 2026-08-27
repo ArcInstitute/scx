@@ -1601,12 +1601,17 @@ mod tests {
     /// its output, including the all-zero ones. cuSPARSE documents that `β = 0`
     /// means `C` is not **read**; it does not say `C` is fully **written**.
     ///
-    /// So this asserts the observed behaviour rather than a specification, and
-    /// the memsets stay until it is observed. If a future cuSPARSE changes the
-    /// answer, this test is what says so — and the memsets are what keep the
-    /// result correct in the meantime. Poisoning `C` with a sentinel is the only
-    /// way to tell "written as zero" from "left alone and happened to be zero";
-    /// a freshly allocated buffer cannot distinguish them.
+    /// **Measured answer: yes.** On an H100 under CUDA 12.x, rows 2 and 3 below
+    /// come back as `0.0`, not as the sentinel — so the memsets are redundant.
+    /// They are kept anyway; the reasoning is at the memset in
+    /// `linear_operator.rs`, and it turns on the difference between "observed"
+    /// and "promised". That makes this a **characterisation** test: it pins
+    /// today's behaviour so that a change becomes visible here, rather than
+    /// licensing the removal of the thing that would absorb the change.
+    ///
+    /// Poisoning `C` with a sentinel is the whole design — a freshly allocated
+    /// buffer cannot tell "written as zero" from "left alone and happened to be
+    /// zero".
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn spmm_beta_zero_writes_rows_that_have_no_nonzeros() {
