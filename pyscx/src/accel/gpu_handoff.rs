@@ -262,7 +262,7 @@ pub(crate) fn adopt_device_csr(
 ) -> PyResult<GpuCsrMatrix> {
     dev.synchronize()
         .map_err(|e| PyRuntimeError::new_err(format!("GPU device-CSR synchronize: {e}")))?;
-    let (n_rows, n_cols) = csr.shape;
+    let (n_rows, n_cols) = csr.shape();
     let nnz = csr.nnz();
     let ptrs = csr.device_pointers(dev.stream());
     Ok(GpuCsrMatrix {
@@ -326,7 +326,7 @@ pub fn gpu_decode_shard(
         dev.synchronize()
             .map_err(|e| PyRuntimeError::new_err(format!("GPU decode synchronize: {e}")))?;
 
-        let (n_rows, n_cols) = csr.shape;
+        let (n_rows, n_cols) = csr.shape();
         let nnz = csr.nnz();
         let ptrs = csr.device_pointers(dev.stream());
 

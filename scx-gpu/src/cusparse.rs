@@ -775,21 +775,21 @@ impl GpuCsr {
         dev: &GpuDevice,
         stream: &CudaStream,
     ) -> Result<CusparseSpMatDescr, GpuError> {
-        let (n_rows, n_cols) = self.shape;
-        let nnz = self.indices.len();
+        let (n_rows, n_cols) = self.shape();
+        let nnz = self.indices().len();
 
         // Downcast indptr i64 → i32 on-device (cheap — O(n_rows+1), one pass).
         // Stored inside the descriptor so cuSPARSE's captured pointer remains
         // valid for the descriptor's lifetime.
-        let i32_indptr = cast_i64_to_i32_gpu(dev, stream, &self.indptr)?;
+        let i32_indptr = cast_i64_to_i32_gpu(dev, stream, self.indptr())?;
 
         // Capture the raw device pointers inside an inner scope so the
         // SyncOnDrop guards (which borrow from `i32_indptr` / `self.*`)
         // are released before we move `i32_indptr` into the descriptor.
         let desc_raw = {
             let (indptr_ptr, _guard_indptr) = i32_indptr.device_ptr(stream);
-            let (indices_ptr, _guard_indices) = self.indices.device_ptr(stream);
-            let (data_ptr, _guard_data) = self.data.device_ptr(stream);
+            let (indices_ptr, _guard_indices) = self.indices().device_ptr(stream);
+            let (data_ptr, _guard_data) = self.data().device_ptr(stream);
             let mut desc = MaybeUninit::uninit();
             unsafe {
                 csp::cusparseCreateCsr(
@@ -829,16 +829,16 @@ impl GpuCsr {
     /// The `SyncOnDrop` guards from `device_ptr()` are dropped at the end of
     /// this method, recording read events for synchronization tracking.
     pub fn device_pointers(&self, stream: &CudaStream) -> GpuCsrPointers {
-        let (indptr_ptr, _g1) = self.indptr.device_ptr(stream);
-        let (indices_ptr, _g2) = self.indices.device_ptr(stream);
-        let (data_ptr, _g3) = self.data.device_ptr(stream);
+        let (indptr_ptr, _g1) = self.indptr().device_ptr(stream);
+        let (indices_ptr, _g2) = self.indices().device_ptr(stream);
+        let (data_ptr, _g3) = self.data().device_ptr(stream);
 
         GpuCsrPointers {
             indptr_ptr,
             indices_ptr,
             data_ptr,
-            nnz: self.indices.len(),
-            shape: self.shape,
+            nnz: self.indices().len(),
+            shape: self.shape(),
         }
     }
 }
@@ -907,9 +907,9 @@ mod tests {
         );
 
         // Verify shape
-        assert_eq!(gpu_csr.shape, (5, 100));
-        assert_eq!(gpu_csr.indices.len(), 12);
-        assert_eq!(gpu_csr.indptr.len(), 6); // n_rows + 1
+        assert_eq!(gpu_csr.shape(), (5, 100));
+        assert_eq!(gpu_csr.indices().len(), 12);
+        assert_eq!(gpu_csr.indptr().len(), 6); // n_rows + 1
 
         // Descriptor is dropped here, calling cusparseDestroySpMat
     }

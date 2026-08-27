@@ -46,10 +46,20 @@ pub(crate) fn check_csr_lengths(
              the two nnz-sized arrays must agree"
         )));
     }
-    if indptr_len != n_rows + 1 {
+    // `n_rows + 1` rather than a bare `+`: `n_rows` is unauthenticated in every
+    // caller, and in release Rust `usize::MAX + 1` wraps to 0 — which would make
+    // an *empty* indptr the expected length for a `usize::MAX`-row matrix and
+    // let the check pass on a shape that cannot exist. Debug builds would panic
+    // instead, so the failure mode differs by profile, which is worse.
+    let expected = n_rows.checked_add(1).ok_or_else(|| {
+        GpuError::InvalidShard(format!(
+            "{what}: CSR row count {n_rows} + 1 overflows usize"
+        ))
+    })?;
+    if indptr_len != expected {
         return Err(GpuError::InvalidShard(format!(
-            "{what}: CSR indptr has {indptr_len} elements but {} were expected for {n_rows} rows",
-            n_rows + 1
+            "{what}: CSR indptr has {indptr_len} elements but {expected} were expected for \
+             {n_rows} rows"
         )));
     }
     Ok(())

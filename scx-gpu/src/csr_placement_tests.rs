@@ -56,3 +56,20 @@ fn an_empty_matrix_needs_a_one_element_indptr() {
     check_csr_lengths(1, 0, 0, 0, "empty").unwrap();
     assert!(check_csr_lengths(0, 0, 0, 0, "empty with no indptr").is_err());
 }
+
+/// `n_rows + 1` wraps in release Rust, so an unauthenticated `usize::MAX` row
+/// count would make the *expected* indptr length zero and accept an empty
+/// indptr for a matrix that cannot exist. Debug builds would panic instead —
+/// a failure mode that differs by profile is worse than either one alone.
+///
+/// No current caller can reach it (`n_major` is a `u32`, and a host `shape[0]`
+/// that large could never have allocated the buffers being checked), so this
+/// pins the arm rather than reproducing a live bug. Found by **codex**.
+#[test]
+fn a_row_count_whose_successor_overflows_is_rejected() {
+    let e = msg(check_csr_lengths(0, 0, 0, usize::MAX, "hostile shape").unwrap_err());
+    assert!(e.contains("overflows usize"), "{e}");
+    assert!(e.contains("hostile shape"), "{e}");
+    // The neighbouring value still behaves normally rather than being swept up.
+    assert!(check_csr_lengths(0, 0, 0, usize::MAX - 1, "large but representable").is_err());
+}
