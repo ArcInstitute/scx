@@ -1049,6 +1049,7 @@ fn format_scx_error(e: scx_format_io::ScxError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math_policy::SpmmAlgPolicy;
 
     #[test]
     #[ignore = "requires a CUDA GPU"]
@@ -1586,6 +1587,109 @@ mod tests {
                 (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
                 "device embedding {a} vs host {b} differ beyond tol"
             );
+        }
+    }
+
+    /// **A measurement, not an invariant of ours.** Does `cusparseSpMM` with
+    /// `β = 0` write zeros into the rows of `C` that correspond to CSR rows with
+    /// no nonzeros?
+    ///
+    /// Both forward multiplies zero their whole output before the first SpMM.
+    /// With `β = 0` the SpMM overwrites rather than accumulates, so — provided
+    /// the segments tile the row range, which `check_row_coverage` now enforces
+    /// — that memset is redundant *if and only if* cuSPARSE writes every row of
+    /// its output, including the all-zero ones. cuSPARSE documents that `β = 0`
+    /// means `C` is not **read**; it does not say `C` is fully **written**.
+    ///
+    /// So this asserts the observed behaviour rather than a specification, and
+    /// the memsets stay until it is observed. If a future cuSPARSE changes the
+    /// answer, this test is what says so — and the memsets are what keep the
+    /// result correct in the meantime. Poisoning `C` with a sentinel is the only
+    /// way to tell "written as zero" from "left alone and happened to be zero";
+    /// a freshly allocated buffer cannot distinguish them.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn spmm_beta_zero_writes_rows_that_have_no_nonzeros() {
+        let dev = require_gpu!();
+        let cusparse = CusparseHandle::new().unwrap();
+
+        // 6 × 4 CSR. Rows 2 and 3 are empty; every other row has one nonzero.
+        let (n_obs, n_vars, k) = (6usize, 4usize, 3usize);
+        let indptr: Vec<i64> = vec![0, 1, 2, 2, 2, 3, 4];
+        let indices: Vec<i32> = vec![0, 1, 2, 3];
+        let data: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+        assert_eq!(
+            indptr[3] - indptr[2],
+            0,
+            "fixture premise: row 2 must have no nonzeros"
+        );
+        assert_eq!(
+            indptr[4] - indptr[3],
+            0,
+            "fixture premise: row 3 must have no nonzeros"
+        );
+
+        let gpu_csr = crate::shard_decode::GpuCsr {
+            indptr: dev.htod_copy(&indptr).unwrap(),
+            indices: dev.htod_copy(&indices).unwrap(),
+            data: dev.htod_copy(&data).unwrap(),
+            shape: (n_obs, n_vars),
+        };
+        let desc = gpu_csr.to_cusparse_csr(&dev, dev.stream()).unwrap();
+
+        // V = all ones (n_vars × k), so a written row is non-zero exactly when
+        // its CSR row has a nonzero — no accidental cancellation.
+        let d_v = dev.htod_copy(&vec![1.0f32; n_vars * k]).unwrap();
+
+        // Poison C. SENTINEL is what survives if cuSPARSE leaves a row alone.
+        const SENTINEL: f32 = -7.5;
+        let mut d_out = dev.htod_copy(&vec![SENTINEL; n_obs * k]).unwrap();
+
+        let ctx = PcaMultiplyCtx {
+            dev: &dev,
+            cusparse: &cusparse,
+            n_obs,
+            n_vars,
+            k,
+            alg: SpmmAlgPolicy::Default.to_alg(),
+        };
+        let mut pool = CuSparseWorkspacePool::new();
+        spmm_forward_segment(
+            &ctx,
+            &mut pool,
+            &desc,
+            &d_v,
+            &mut d_out,
+            None,
+            RowSegment::whole(n_obs),
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        let out = dev.dtoh_copy(&d_out).unwrap();
+
+        // Premise: the non-empty rows really were written, so a sentinel in an
+        // empty row means "not written" and not "the SpMM did nothing at all".
+        for r in [0usize, 1, 4, 5] {
+            for j in 0..k {
+                assert_eq!(
+                    out[j * n_obs + r],
+                    1.0,
+                    "row {r} col {j} has a nonzero and must have been written"
+                );
+            }
+        }
+
+        for r in [2usize, 3] {
+            for j in 0..k {
+                let v = out[j * n_obs + r];
+                assert_eq!(
+                    v, 0.0,
+                    "row {r} col {j} came back as {v}. If this is {SENTINEL}, cuSPARSE \
+                     leaves all-zero rows untouched under β = 0 and the forward multiply's \
+                     up-front memset is load-bearing — record that here and keep it \
+                     (ORG-8.20-2)."
+                );
+            }
         }
     }
 }
