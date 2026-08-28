@@ -480,7 +480,7 @@ pub(crate) fn announce_route(
          adata.uns[\"scx_accel\"][\"{op}\"].",
         info.route.as_str(),
     );
-    if let Ok(warnings) = py.import("warnings") {
+    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
@@ -550,7 +550,7 @@ pub(crate) fn warn_materialized_csc_sidecar(
          to_anndata(backed=True) to engage the gpu_csc_v3 fast route. The final route is \
          recorded in adata.uns[\"scx_accel\"][\"{op}\"]."
     );
-    if let Ok(warnings) = py.import("warnings") {
+    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),

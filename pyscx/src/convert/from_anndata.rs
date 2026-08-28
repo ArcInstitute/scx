@@ -48,7 +48,7 @@ pub(crate) fn build_and_write_bitmap_for_shard_python(
     const SIZE_PERCENT: usize = 15;
 
     let emit_warning = |msg: String| -> PyResult<()> {
-        py.import("warnings")?.call_method1("warn", (msg,))?;
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
         Ok(())
     };
 
@@ -134,7 +134,7 @@ pub(crate) fn build_and_write_predicate_indexes_inline(
     })?;
 
     let emit_warning = |msg: String| -> PyResult<()> {
-        py.import("warnings")?.call_method1("warn", (msg,))?;
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
         Ok(())
     };
     // Drop pyarrow-internal `__*` columns
@@ -456,7 +456,7 @@ pub(crate) fn decompose_scipy_csr_with<F, R>(
 where
     F: FnOnce(&[u64], &[u32], &[f32]) -> PyResult<R>,
 {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     let indptr_obj = csr.getattr("indptr")?;
     let indptr_arr = astype_if_needed(&indptr_obj, &np, "int64")?;
@@ -750,7 +750,7 @@ pub fn from_anndata_impl(
     }
 
     // Extract CSR arrays — skip .astype() when dtypes already match (1C.1)
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     let indptr_obj = x_csr.getattr("indptr")?;
     let indptr_arr = astype_if_needed(&indptr_obj, &np, "int64")?;
@@ -781,15 +781,11 @@ pub fn from_anndata_impl(
     // T3.7: warn on lossy float64 → float32 value downcast at the write
     // boundary so the precision loss recorded in the round-trip fidelity
     // table is also visible at runtime, not just in docs.
-    if let Ok(name) = data_obj
-        .getattr("dtype")
-        .and_then(|d| d.getattr("name"))
-        .and_then(|n| n.extract::<String>())
-    {
+    if let Ok(name) = crate::pyimport::dtype_name_of(&data_obj) {
         if name == "float64" || name == "float128" {
             // stacklevel=2 so `-W error` points at the user's
             // `write()` / `from_anndata()` call, not the PyO3 bridge frame.
-            let warn_fn = py.import("warnings")?.getattr("warn")?;
+            let warn_fn = crate::pyimport::import_module(py, "warnings")?.getattr("warn")?;
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("stacklevel", 2)?;
             warn_fn.call(
@@ -1051,8 +1047,7 @@ pub fn from_anndata_impl(
     // This bounds peak RSS to one key's payload at a time instead of
     // the full sum of all mappings.
     let obsm = adata.getattr("obsm")?;
-    let obsm_keys: Vec<String> = py
-        .import("builtins")?
+    let obsm_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (obsm.call_method0("keys")?,))?
         .extract()?;
     for key in &obsm_keys {
@@ -1087,8 +1082,7 @@ pub fn from_anndata_impl(
     // varm — same pattern. Duck-typed AnnData-likes may omit
     // `varm`/`obsp`/`varp` entirely; missing attrs are treated as empty.
     if let Ok(varm) = adata.getattr("varm") {
-        let varm_keys: Vec<String> = py
-            .import("builtins")?
+        let varm_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
             .call_method1("list", (varm.call_method0("keys")?,))?
             .extract()?;
         for key in &varm_keys {
@@ -1123,8 +1117,7 @@ pub fn from_anndata_impl(
 
     // obsp — sparse COO, one key at a time.
     if let Ok(obsp) = adata.getattr("obsp") {
-        let obsp_keys: Vec<String> = py
-            .import("builtins")?
+        let obsp_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
             .call_method1("list", (obsp.call_method0("keys")?,))?
             .extract()?;
         for key in &obsp_keys {
@@ -1166,8 +1159,7 @@ pub fn from_anndata_impl(
 
     // varp — sparse COO, one key at a time.
     if let Ok(varp) = adata.getattr("varp") {
-        let varp_keys: Vec<String> = py
-            .import("builtins")?
+        let varp_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
             .call_method1("list", (varp.call_method0("keys")?,))?
             .extract()?;
         for key in &varp_keys {
@@ -1219,7 +1211,7 @@ pub fn from_anndata_impl(
     // persists into the on-disk file — it describes the in-memory materialization,
     // not the data. Shallow-copy so the caller's `adata.uns` is left untouched.
     let uns = if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
-        let copy = py.import("builtins")?.call_method1("dict", (&uns,))?;
+        let copy = crate::pyimport::import_module(py, "builtins")?.call_method1("dict", (&uns,))?;
         copy.del_item("scx_source_has_csc_sidecar")?;
         copy
     } else {
@@ -1242,8 +1234,7 @@ pub fn from_anndata_impl(
 
     // Write layers
     let layers = adata.getattr("layers")?;
-    let layer_keys: Vec<String> = py
-        .import("builtins")?
+    let layer_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (layers.call_method0("keys")?,))?
         .extract()?;
     for layer_name in &layer_keys {

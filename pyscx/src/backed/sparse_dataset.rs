@@ -461,7 +461,7 @@ impl ScxBackedSparseDataset {
 
     #[getter]
     pub(crate) fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         np.call_method1("dtype", ("float32",))
     }
 
@@ -1498,7 +1498,7 @@ impl ScxBackedSparseDataset {
         }
 
         // Numpy array or list
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         let arr = np.call_method1("asarray", (row_idx,))?;
         let dtype_str: String = arr.getattr("dtype")?.call_method0("__str__")?.extract()?;
 
@@ -1670,7 +1670,7 @@ impl ScxBackedSparseDataset {
 
         // Apply column selection: row_csr[:, col_idx]
         // scipy sparse needs slice(None) for "all rows", not Python None
-        let builtins = py.import("builtins")?;
+        let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_none = builtins.call_method1("slice", (py.None(),))?;
         let col_tuple = PyTuple::new(py, &[slice_none.unbind(), col_idx.clone().unbind()])?;
         row_csr.get_item(col_tuple)
@@ -1702,7 +1702,7 @@ impl ScxBackedSparseDataset {
         py: Python<'_>,
         col_idx: &Bound<'_, PyAny>,
     ) -> PyResult<Option<Vec<u32>>> {
-        let numpy = py.import("numpy")?;
+        let numpy = crate::pyimport::import_module(py, "numpy")?;
         let is_ndarray = col_idx.is_instance(&numpy.getattr("ndarray")?)?;
         if !is_ndarray {
             return Ok(None);

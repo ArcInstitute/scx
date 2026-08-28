@@ -588,6 +588,16 @@ export per-batch h5ads, how to combine several tools — see
 [docs/scanpy.md § Landing external per-cell annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
 This section covers the operational invariants.
 
+`obs_import` is the recommended way to **add or patch obs columns on an
+existing SCX file** — including from pipeline steps. A step whose only output
+is a new per-cell column (a batch key, a score, a QC flag) should
+`obs_import` it in place rather than rewrite the whole file through
+`from_anndata`: no re-encode of `X` at all, everything the file carries
+survives (see the invariants below), and `scx rollback` undoes it. It is also
+sandbox-safe — callable from restricted-exec `python` steps whose builtins
+lack `__import__` (see
+[docs/api.md § Restricted-exec (sandbox) safety](api.md#restricted-exec-sandbox-safety)).
+
 ### In place, via the same harness as append
 
 The import writes through `prepare_in_place` / `commit_in_place`: new sections

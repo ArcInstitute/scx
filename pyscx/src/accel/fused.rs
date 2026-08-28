@@ -289,7 +289,7 @@ pub fn pca_neighbors(
         } else {
             // GPU requested but cuVS missing — warn, then fall through to the
             // sequential path (GPU PCA + CPU HNSW neighbors).
-            let warnings = py.import("warnings")?;
+            let warnings = crate::pyimport::import_module(py, "warnings")?;
             warnings.call_method1(
                 "warn",
                 (

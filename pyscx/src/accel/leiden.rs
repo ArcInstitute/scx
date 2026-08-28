@@ -148,8 +148,8 @@ fn run_rust_leiden(
     theta: f64,
     device: &str,
 ) -> PyResult<()> {
-    let numpy = py.import("numpy")?;
-    let pd = py.import("pandas")?;
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
 
     // Extract CSR components from connectivities sparse matrix.
     let shape: (usize, usize) = conn.getattr("shape")?.extract()?;
@@ -263,7 +263,7 @@ fn try_cugraph_leiden(
     gpu_id: usize,
 ) -> PyResult<()> {
     // Import cuGraph — if not installed, return error immediately. No fallback.
-    let cugraph = py.import("cugraph").map_err(|_| {
+    let cugraph = crate::pyimport::import_module(py, "cugraph").map_err(|_| {
         PyRuntimeError::new_err(
             "cugraph not available. Install for GPU Leiden: \
              conda install -c rapidsai -c conda-forge cugraph",
@@ -272,7 +272,7 @@ fn try_cugraph_leiden(
 
     // Pin cuPy / cuDF / cuGraph allocations to GPU `gpu_id`. cuPy ships with
     // every RAPIDS install, so this never fails when cugraph imported.
-    let cupy_cuda = py.import("cupy.cuda").map_err(|e| {
+    let cupy_cuda = crate::pyimport::import_module(py, "cupy.cuda").map_err(|e| {
         PyRuntimeError::new_err(format!(
             "cupy.cuda not importable (required to honor device='{device}'): {e}"
         ))
@@ -283,11 +283,11 @@ fn try_cugraph_leiden(
     // Body factored into a closure so __exit__ runs even when the body
     // errors (Rust has no try/finally; this matches Python `with` semantics).
     let body_result: PyResult<()> = (|| {
-        let numpy = py.import("numpy")?;
-        let pd = py.import("pandas")?;
+        let numpy = crate::pyimport::import_module(py, "numpy")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
 
         // Extract COO from connectivities CSR: cuGraph works with edge lists
-        let scipy_sparse = py.import("scipy.sparse")?;
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
         let coo = scipy_sparse
             .call_method1("triu", (conn,))?
             .call_method0("tocoo")?;
@@ -310,9 +310,9 @@ fn try_cugraph_leiden(
         let edge_df = pd.call_method1("DataFrame", (edge_dict,))?;
 
         // Try cudf for GPU acceleration, fall back to pandas
-        let cudf_available = py.import("cudf").is_ok();
+        let cudf_available = crate::pyimport::import_module(py, "cudf").is_ok();
         let edge_df = if cudf_available {
-            let cudf = py.import("cudf")?;
+            let cudf = crate::pyimport::import_module(py, "cudf")?;
             cudf.call_method1("DataFrame", (&edge_df,))?
         } else {
             edge_df
@@ -431,7 +431,7 @@ fn try_cugraph_leiden(
 /// (Rust-native) ignores it.
 fn warn_if_ignored_theta(py: Python<'_>, theta: f64, use_gpu: bool) -> PyResult<()> {
     if !use_gpu && (theta - 1.0).abs() > f64::EPSILON {
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         let category = py.get_type::<pyo3::exceptions::PyUserWarning>();
         warnings.call_method1(
             "warn",
@@ -448,7 +448,7 @@ fn warn_if_ignored_theta(py: Python<'_>, theta: f64, use_gpu: bool) -> PyResult<
 /// (cuGraph) ignores it.
 fn warn_if_ignored_parallel(py: Python<'_>, parallel: bool, use_gpu: bool) -> PyResult<()> {
     if use_gpu && parallel {
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         let category = py.get_type::<pyo3::exceptions::PyUserWarning>();
         warnings.call_method1(
             "warn",

@@ -82,7 +82,7 @@ pub(crate) fn query_result_to_anndata_with_plan<'py>(
     result: QueryResult,
     plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let anndata_mod = py.import("anndata")?;
+    let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
 
     // Fail loud on the silent u32→f32 decode loss over the shards that survived
     // pushdown, before consuming `result.x`.

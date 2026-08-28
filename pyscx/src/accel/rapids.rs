@@ -96,7 +96,7 @@ fn warn_no_rapids_once(py: Python<'_>, op: &str) {
          then on a GPU node: pip install --no-deps 'rapids-singlecell>=0.12'), or set \
          SCX_FORCE_NATIVE_GPU=1 to use the native SCX GPU kernels. See docs/gpu-setup.md."
     );
-    if let Ok(warnings) = py.import("warnings") {
+    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
@@ -106,7 +106,7 @@ fn warn_no_rapids_once(py: Python<'_>, op: &str) {
 
 /// True if `x` is a `cupyx.scipy.sparse` matrix already resident on device.
 pub(crate) fn is_cupy_sparse(py: Python<'_>, x: &Bound<'_, PyAny>) -> bool {
-    py.import("cupyx.scipy.sparse")
+    crate::pyimport::import_module(py, "cupyx.scipy.sparse")
         .and_then(|m| m.getattr("issparse"))
         .and_then(|f| f.call1((x,)))
         .and_then(|r| r.extract::<bool>())
@@ -121,8 +121,7 @@ pub(crate) fn with_device<R>(
     gpu_id: usize,
     f: impl FnOnce() -> PyResult<R>,
 ) -> PyResult<R> {
-    let device_ctx = py
-        .import("cupy.cuda")?
+    let device_ctx = crate::pyimport::import_module(py, "cupy.cuda")?
         .getattr("Device")?
         .call1((gpu_id,))?;
     device_ctx.call_method0("__enter__")?;
@@ -144,7 +143,7 @@ pub(crate) fn ensure_gpu_anndata(
     if is_cupy_sparse(py, &x) {
         return Ok("scx_device_handoff");
     }
-    let rsc_get = py.import("rapids_singlecell")?.getattr("get")?;
+    let rsc_get = crate::pyimport::import_module(py, "rapids_singlecell")?.getattr("get")?;
     with_device(py, gpu_id, || {
         rsc_get.call_method1("anndata_to_GPU", (adata,))?;
         Ok(())
@@ -162,7 +161,7 @@ pub(crate) fn restore_host_anndata(
     adata: &Bound<'_, PyAny>,
     gpu_id: usize,
 ) -> PyResult<()> {
-    let rsc_get = py.import("rapids_singlecell")?.getattr("get")?;
+    let rsc_get = crate::pyimport::import_module(py, "rapids_singlecell")?.getattr("get")?;
     with_device(py, gpu_id, || {
         let kw = PyDict::new(py);
         kw.set_item("convert_all", true)?;
@@ -326,7 +325,7 @@ pub(crate) fn rsc_fn<'py>(
     submodule: &str,
     func: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    py.import("rapids_singlecell")?
+    crate::pyimport::import_module(py, "rapids_singlecell")?
         .getattr(submodule)?
         .getattr(func)
 }

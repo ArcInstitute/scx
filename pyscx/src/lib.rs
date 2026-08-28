@@ -18,6 +18,7 @@ mod ops;
 pub(crate) mod optional_deps;
 mod preprocess;
 pub(crate) mod projected_agg;
+pub(crate) mod pyimport;
 mod query;
 
 #[cfg(feature = "cloud")]
@@ -1152,7 +1153,7 @@ fn from_mtx(
     // Surface that as a catchable warning — if the input was already
     // cells × genes, obs/var are now swapped.
     if orientation == scx_mtx::MtxOrientation::Ambiguous {
-        py.import("warnings")?.call_method1(
+        crate::pyimport::import_module(py, "warnings")?.call_method1(
             "warn",
             (
                 "MTX matrix is square, so its orientation is ambiguous; assumed the Cell \
@@ -1199,9 +1200,26 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
             .sum::<u64>();
     }
 
+    // Prime rust-numpy's lazy C-API init (it imports `numpy` /
+    // `numpy.lib` / `numpy._core.multiarray` via the frame-sensitive
+    // `PyModule::import` on first array use). Module import always runs
+    // under real builtins; a first use inside restricted-exec globals (no
+    // `__import__`) would die with `KeyError: '__import__'` instead. See
+    // pyimport.rs and pyscx/tests/test_sandbox_exec.py.
+    // The `zeros` call primes the array C-API; the `readonly` borrow primes
+    // the separate borrow-checking capsule (`insert_shared`), which imports
+    // `numpy.core.multiarray` the same frame-sensitive way on first borrow.
+    {
+        use numpy::PyArrayMethods;
+        let _ = numpy::PyArray1::<f32>::zeros(m.py(), 0, false).readonly();
+    }
+
     // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
+    // Test-only: exercises the frame-insensitive import helper from
+    // restricted-exec globals (test_sandbox_exec.py).
+    m.add_function(wrap_pyfunction!(pyimport::_sandbox_import_probe, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     #[cfg(feature = "hdf5")]
     m.add_function(wrap_pyfunction!(from_h5ad, m)?)?;
@@ -1355,7 +1373,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // we surface the error via `log::warn!` so a user debugging why
     // `ad.AnnData(X=scx_backed)` rejects the object has actionable output.
     let py = m.py();
-    match py.import("anndata.abc") {
+    match crate::pyimport::import_module(py, "anndata.abc") {
         Ok(abc) => match abc.getattr("CSRDataset") {
             Ok(csr_dataset) => {
                 for cls_name in [

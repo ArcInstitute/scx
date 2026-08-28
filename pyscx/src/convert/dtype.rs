@@ -69,7 +69,7 @@ pub(crate) fn pandas_to_record_batch(
     py: Python<'_>,
     df: &Bound<'_, PyAny>,
 ) -> PyResult<RecordBatch> {
-    let pa = py.import("pyarrow")?;
+    let pa = crate::pyimport::import_module(py, "pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     let table = table_cls.call_method1("from_pandas", (df,))?;
 
@@ -122,7 +122,7 @@ fn ordered_categorical_columns_from_df(df: &Bound<'_, PyAny>) -> PyResult<HashSe
             continue; // non-string column label — cannot be an obs/var field name
         };
         let series = df.get_item(&col)?;
-        let dtype_name: String = series.getattr("dtype")?.getattr("name")?.extract()?;
+        let dtype_name: String = crate::pyimport::dtype_name_of(&series)?;
         if dtype_name != "category" {
             continue;
         }
@@ -183,17 +183,17 @@ pub(crate) fn numpy_or_pandas_to_record_batch(
     use arrow::datatypes::{DataType, Field, Schema};
     use pyo3::types::PyBytes;
 
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let np_ndarray = np.getattr("ndarray")?;
     let is_ndarray: bool = arr.is_instance(&np_ndarray)?;
     if !is_ndarray {
-        let pd = py.import("pandas")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
         let df = pd.call_method1("DataFrame", (arr,))?;
         return pandas_to_record_batch(py, &df);
     }
     let ndim: usize = arr.getattr("ndim")?.extract()?;
     if ndim != 2 {
-        let pd = py.import("pandas")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
         let df = pd.call_method1("DataFrame", (arr,))?;
         return pandas_to_record_batch(py, &df);
     }
@@ -225,7 +225,7 @@ pub(crate) fn numpy_or_pandas_to_record_batch(
             }
         }
         _ => {
-            let pd = py.import("pandas")?;
+            let pd = crate::pyimport::import_module(py, "pandas")?;
             let df = pd.call_method1("DataFrame", (arr,))?;
             return pandas_to_record_batch(py, &df);
         }
@@ -364,7 +364,7 @@ pub(crate) fn ensure_csr<'py>(
     x: &Bound<'py, PyAny>,
     in_place: bool,
 ) -> PyResult<(Bound<'py, PyAny>, bool)> {
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let is_sparse = scipy_sparse
         .call_method1("issparse", (x,))?
         .extract::<bool>()?;
@@ -406,7 +406,7 @@ pub(crate) fn astype_if_needed<'py>(
     np: &Bound<'py, PyModule>,
     target_dtype: &str,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let dtype_name: String = arr.getattr("dtype")?.getattr("name")?.extract()?;
+    let dtype_name: String = crate::pyimport::dtype_name_of(arr)?;
     if dtype_name == target_dtype {
         Ok(arr.clone())
     } else {

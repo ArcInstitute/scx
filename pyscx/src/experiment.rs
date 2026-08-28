@@ -239,7 +239,7 @@ fn warn_device_decode_fallback(py: Python<'_>, e: &str) {
          uns[\"scx_accel\"][\"to_gpu_anndata\"] records transfer_mode=\"scx_device_handoff\" \
          with fallback_reason=\"gpu_runtime_error\"."
     );
-    if let Ok(warnings) = py.import("warnings") {
+    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
@@ -1674,7 +1674,7 @@ impl PyExperiment {
                         // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
                         // they fit, so coerce to the GpuCsr layout (f32 data / i32 indices /
                         // i64 indptr) via astype(copy=False) — a no-op when already correct.
-                        let np = py.import("numpy")?;
+                        let np = crate::pyimport::import_module(py, "numpy")?;
                         let f32_ty = np.getattr("float32")?;
                         let i32_ty = np.getattr("int32")?;
                         let i64_ty = np.getattr("int64")?;
@@ -1746,8 +1746,8 @@ impl PyExperiment {
 
             // Adopt the device buffers into a cupyx CSR and assign as X.
             let holder = Bound::new(py, holder)?;
-            let cupy = py.import("cupy")?;
-            let cupyx_sparse = py.import("cupyx.scipy.sparse")?;
+            let cupy = crate::pyimport::import_module(py, "cupy")?;
+            let cupyx_sparse = crate::pyimport::import_module(py, "cupyx.scipy.sparse")?;
             let adopt = |method: &str| -> PyResult<Bound<'py, PyAny>> {
                 // cupy.asarray adopts the CAI view without copy and sets .base to
                 // it, transitively keeping `holder` (and its device memory) alive.

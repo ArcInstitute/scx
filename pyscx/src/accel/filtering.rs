@@ -608,7 +608,7 @@ fn keep_mask_from_selector(
     n: usize,
     axis_name: &str,
 ) -> PyResult<Vec<bool>> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let arr = np.call_method1("asarray", (mask_or_indices,))?;
     let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
 

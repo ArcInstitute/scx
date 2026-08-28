@@ -47,7 +47,7 @@ pub fn neighbors(
     // copy-on-write. No var-order guard: this op is gene-order agnostic.
     super::prepare_target_no_var_guard(py, adata, "neighbors")?;
 
-    let numpy = py.import("numpy")?;
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
 
     // Determine effective device
     let _device = resolve_device(device)?;
@@ -189,7 +189,7 @@ pub(crate) fn write_neighbors_to_adata(
     method: &str,
 ) -> PyResult<()> {
     let t_marshal = scx_accel::cpu_profile::start();
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let n_obs = result.n_obs;
     let scx_accel::KnnResult {
         conn_indptr,

@@ -124,7 +124,7 @@ pub fn harmony_integrate(
         ))
     })?;
 
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let emb_f32 = np
         .call_method1("ascontiguousarray", (&emb_obj,))?
         .call_method1("astype", ("float32",))?;
@@ -359,7 +359,7 @@ fn factorize_obs_column(
     col: &Bound<'_, PyAny>,
     col_name: &str,
 ) -> PyResult<(Vec<u32>, usize)> {
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("sort", false)?;
     let tup = pd.call_method("factorize", (col,), Some(&kwargs))?;

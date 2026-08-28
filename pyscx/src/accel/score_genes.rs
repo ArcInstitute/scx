@@ -110,7 +110,7 @@ pub fn score_genes<'py>(
     if !missing.is_empty() {
         let shown: Vec<&String> = missing.iter().take(10).collect();
         let suffix = if missing.len() > 10 { ", …" } else { "" };
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         warnings.call_method1(
             "warn",
             (format!(
@@ -141,7 +141,7 @@ pub fn score_genes<'py>(
             // An explicit pool that mostly fails to resolve usually means
             // wrong/typo'd symbols — surface it (gene_list already warns).
             if !pool.is_empty() && resolved.len() * 2 < pool.len() {
-                let warnings = py.import("warnings")?;
+                let warnings = crate::pyimport::import_module(py, "warnings")?;
                 warnings.call_method1(
                     "warn",
                     (format!(

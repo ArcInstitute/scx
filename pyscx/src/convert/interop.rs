@@ -50,7 +50,7 @@ pub(crate) fn record_batch_to_pyarrow<'py>(
     }
 
     let py_bytes = PyBytes::new(py, &buf);
-    let pa = py.import("pyarrow")?;
+    let pa = crate::pyimport::import_module(py, "pyarrow")?;
     let ipc = pa.getattr("ipc")?;
     let reader = ipc.call_method1("open_file", (py_bytes,))?;
     let table = reader.call_method0("read_all")?;
@@ -132,7 +132,7 @@ pub(crate) fn boolean_columns(table: &Bound<'_, PyAny>) -> PyResult<Vec<String>>
     let py = table.py();
     let schema = table.getattr("schema")?;
     let names: Vec<String> = schema.getattr("names")?.extract()?;
-    let is_boolean = py.import("pyarrow.types")?.getattr("is_boolean")?;
+    let is_boolean = crate::pyimport::import_module(py, "pyarrow.types")?.getattr("is_boolean")?;
     let mut out = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let field = schema.call_method1("field", (i,))?;
@@ -175,7 +175,7 @@ pub(crate) fn apply_nullable_boolean(df: &Bound<'_, PyAny>, bool_cols: &[String]
             continue;
         }
         let series = df.get_item(col)?;
-        let dtype_name: String = series.getattr("dtype")?.getattr("name")?.extract()?;
+        let dtype_name: String = crate::pyimport::dtype_name_of(&series)?;
         if dtype_name == "boolean" {
             continue; // a full pyarrow envelope already restored it
         }
@@ -244,7 +244,7 @@ pub(crate) fn apply_categorical_ordered(
             continue;
         }
         let series = df.get_item(col)?;
-        let dtype_name: String = series.getattr("dtype")?.getattr("name")?.extract()?;
+        let dtype_name: String = crate::pyimport::dtype_name_of(&series)?;
         if dtype_name != "category" {
             continue;
         }
@@ -366,7 +366,7 @@ pub(crate) fn csr_to_scipy<'py>(
     let indices = PyArray1::from_vec(py, csr.indices);
     let data = PyArray1::from_vec(py, csr.data);
 
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let args = ((data, indices, indptr),);
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("shape", shape)?;
@@ -426,7 +426,7 @@ pub(crate) fn typed_csr_to_scipy<'py>(
     let indices = index_buffer_to_numpy(py, csr.indices);
     let indptr = PyArray1::from_vec(py, csr.indptr).into_any();
 
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let args = ((data, indices, indptr),);
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("shape", shape)?;
@@ -504,7 +504,7 @@ pub(crate) fn csr_to_scipy_typed<'py>(
             // indptr stays i64 (scipy-canonical, keeps zero-copy on the common CSR).
             let indptr = PyArray1::from_vec(py, csr_indptr).into_any();
 
-            let scipy_sparse = py.import("scipy.sparse")?;
+            let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
             let args = ((data, indices, indptr),);
             let kwargs = pyo3::types::PyDict::new(py);
             kwargs.set_item("shape", (n_rows, n_cols))?;
@@ -622,7 +622,7 @@ fn warn_large_copy(
         return Ok(());
     }
     let gb = bytes as f64 / 1e9;
-    py.import("warnings")?.call_method1(
+    crate::pyimport::import_module(py, "warnings")?.call_method1(
         "warn",
         (format!(
             "{label}: copying {what} ({gb:.1} GB) so the kernel can run with the GIL \
@@ -662,8 +662,8 @@ pub(crate) fn owned_csr(
 ) -> PyResult<scx_sparse::ScxCsr> {
     use numpy::PyReadonlyArray1;
 
-    let np = py.import("numpy")?;
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     // Handles dense ndarrays and every sparse format; a no-op view when the
     // input is already CSR (which is exactly why the borrow was unsafe).
     let csr = scipy_sparse.call_method1("csr_matrix", (x,))?;
@@ -718,7 +718,7 @@ pub(crate) fn owned_dense2_f32(
     x: &Bound<'_, PyAny>,
     warn_label: Option<&str>,
 ) -> PyResult<(Vec<f32>, (usize, usize))> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let arr = if x.hasattr("toarray")? {
         x.call_method0("toarray")?
     } else {
@@ -1092,10 +1092,10 @@ pub(crate) fn sparse_to_coo_record_batch(
     use arrow::datatypes::{DataType, Field, Schema};
     use std::collections::HashMap;
 
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let coo = scipy_sparse.call_method1("coo_matrix", (mat,))?;
     let shape: (usize, usize) = coo.getattr("shape")?.extract()?;
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     let need_i64 = coo_needs_int64_coords(shape.0, shape.1);
 
@@ -1195,7 +1195,7 @@ pub(crate) fn coo_record_batch_to_scipy<'py>(
     };
     let data_np = PyArray1::from_slice(py, data_arr.values());
 
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let kwargs = pyo3::types::PyDict::new(py);
     kwargs.set_item("shape", (n_rows, n_cols))?;
     scipy_sparse.call_method("csr_matrix", ((data_np, (row_np, col_np)),), Some(&kwargs))

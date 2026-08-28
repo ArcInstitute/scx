@@ -25,8 +25,8 @@ pub(super) fn extract_strata<'py>(
     forbidden_cols: &[&str],
 ) -> PyResult<(Vec<Stratum>, Vec<Bound<'py, PyAny>>)> {
     let obs = adata.getattr("obs")?;
-    let warnings = py.import("warnings")?;
-    let pd = py.import("pandas")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
 
     // Validate each stratify_by column exists and doesn't collide.
     for col in stratify_by {
@@ -308,8 +308,8 @@ fn run_rank_genes_groups_inner(
     use_raw: bool,
     layer: Option<&str>,
 ) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
-    let numpy = py.import("numpy")?;
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
 
     // Extract group labels from adata.obs[groupby].
     let obs = adata.getattr("obs")?;
@@ -660,7 +660,7 @@ fn run_rank_genes_groups_inner(
             // on inputs with unsorted CSRs (e.g. pbmc10k.h5ad).
             let (csr_obj, _) = crate::convert::ensure_csr(py, &x, /* in_place */ false)?;
             let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
-            let np = py.import("numpy")?;
+            let np = crate::pyimport::import_module(py, "numpy")?;
             let indptr: Vec<i64> = np
                 .call_method1("asarray", (csr_obj.getattr("indptr")?,))?
                 .call_method1("astype", ("int64",))?
@@ -797,7 +797,7 @@ fn de_result_to_dataframe<'py>(
     result: &scx_accel::DiffExpResult,
     n_genes: Option<usize>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let mut all_frames: Vec<Bound<'py, PyAny>> = Vec::new();
 
     for (i, group_name) in result.group_names.iter().enumerate() {
@@ -942,7 +942,7 @@ pub fn rank_genes_groups(
             ));
         }
         if device == "auto" && super::route::gpu_available() {
-            py.import("warnings")?.call_method1(
+            crate::pyimport::import_module(py, "warnings")?.call_method1(
                 "warn",
                 (
                     "rank_genes_groups(device=\"auto\", prefer_format=\"csc\") runs on the \
@@ -965,8 +965,8 @@ pub fn rank_genes_groups(
         let (strata, masks) =
             extract_strata(py, adata, strat_cols, min_cells_per_stratum, &forbidden)?;
 
-        let pd = py.import("pandas")?;
-        let warnings = py.import("warnings")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         let mut all_frames: Vec<Bound<'_, PyAny>> = Vec::new();
 
         for (stratum, mask) in strata.iter().zip(masks.iter()) {
@@ -1090,7 +1090,7 @@ fn write_de_to_adata(
     use_raw: bool,
     layer: Option<&str>,
 ) -> PyResult<()> {
-    let numpy = py.import("numpy")?;
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
     // The builder closures below iterate `result.group_names` (length n_groups)
     // and index `field_data[i]`, so every outer field vector must have at least
     // n_groups rows or that indexing panics. Rectangular by construction, but
@@ -1242,7 +1242,7 @@ pub(super) fn build_de_dataframe<'py>(
             df.call_method1("select", (order,))
         }
         "pandas" => {
-            let pd = py.import("pandas").map_err(|_| {
+            let pd = crate::pyimport::import_module(py, "pandas").map_err(|_| {
                 PyRuntimeError::new_err("output='pandas' requires pandas (pip install pandas).")
             })?;
             let df = pd.call_method1("DataFrame", (columns,))?;
@@ -1808,8 +1808,8 @@ fn detect_is_log1p(
     }
 
     // In-memory scipy sparse / dense.
-    let np = py.import("numpy")?;
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let is_sparse = scipy_sparse
         .call_method1("issparse", (x,))?
         .extract::<bool>()
@@ -1915,7 +1915,7 @@ fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, grou
          excluded from the test",
         groups.len()
     );
-    if let Ok(warnings) = py.import("warnings") {
+    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (
@@ -1952,8 +1952,8 @@ fn run_pdex_ref_inner(
     use_raw: bool,
     layer: Option<&str>,
 ) -> PyResult<scx_accel::PdexRefResult> {
-    let numpy = py.import("numpy")?;
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
 
     let (groups, unique_groups, ref_idx) = resolve_groups_and_reference(adata, groupby, reference)?;
 
@@ -2214,7 +2214,7 @@ fn run_pdex_ref_inner(
         // CSR inputs silently return U = n_g·n_ref/2 for every gene.
         let (csr_obj, _) = crate::convert::ensure_csr(py, &x, /* in_place */ false)?;
         let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         let indptr: Vec<i64> = np
             .call_method1("asarray", (csr_obj.getattr("indptr")?,))?
             .call_method1("astype", ("int64",))?
@@ -2352,7 +2352,7 @@ fn pdex_x_has_negative(py: Python<'_>, adata: &Bound<'_, PyAny>) -> bool {
     let Ok(x) = adata.getattr("X") else {
         return false;
     };
-    if let Ok(scipy_sparse) = py.import("scipy.sparse") {
+    if let Ok(scipy_sparse) = crate::pyimport::import_module(py, "scipy.sparse") {
         if let Ok(true) = scipy_sparse
             .call_method1("issparse", (&x,))
             .and_then(|r| r.extract::<bool>())
@@ -2365,7 +2365,7 @@ fn pdex_x_has_negative(py: Python<'_>, adata: &Bound<'_, PyAny>) -> bool {
                 .unwrap_or(false);
         }
     }
-    if let Ok(numpy) = py.import("numpy") {
+    if let Ok(numpy) = crate::pyimport::import_module(py, "numpy") {
         if let Ok(ndarray_ty) = numpy.getattr("ndarray") {
             if let Ok(true) = x.is_instance(&ndarray_ty) {
                 return x
@@ -2568,7 +2568,7 @@ pub fn pdex_ref(
         // pdex warns (does not error) when counts contain negatives, since CPM
         // assumes non-negative expression. Only checked for cheap in-memory X.
         if pdex_x_has_negative(py, adata) {
-            py.import("warnings")?.call_method1(
+            crate::pyimport::import_module(py, "warnings")?.call_method1(
                 "warn",
                 (
                     "cpm_filter is set but adata.X contains negative values; \
@@ -2624,7 +2624,7 @@ pub fn pdex_ref(
             ));
         }
         if device == "auto" && super::route::gpu_available() {
-            py.import("warnings")?.call_method1(
+            crate::pyimport::import_module(py, "warnings")?.call_method1(
                 "warn",
                 (
                     "pdex_ref(device=\"auto\", prefer_format=\"csc\") runs on the CPU: \

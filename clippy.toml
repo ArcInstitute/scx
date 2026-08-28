@@ -1,0 +1,14 @@
+# Workspace-wide clippy configuration.
+
+# pyo3's `Python::import` / `PyModule::import` lower to CPython's
+# `PyImport_Import`, which resolves `__import__` from the innermost Python
+# frame's builtins. A native entry point called directly from restricted-exec
+# globals (a pipeline runner's sandbox with no `__import__`) then dies with
+# `KeyError: '__import__'` at its first call-time import. All call-time
+# imports in pyscx must go through the frame-insensitive
+# `crate::pyimport::import_module` instead (pyscx/src/pyimport.rs).
+# Regression coverage: pyscx/tests/test_sandbox_exec.py.
+disallowed-methods = [
+    { path = "pyo3::marker::Python::import", reason = "frame-sensitive: breaks under restricted-exec globals (no `__import__`); use crate::pyimport::import_module" },
+    { path = "pyo3::types::module::PyModule::import", reason = "frame-sensitive: breaks under restricted-exec globals (no `__import__`); use crate::pyimport::import_module" },
+]

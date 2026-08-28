@@ -175,7 +175,7 @@ impl ScxComparisonResult {
 
     #[getter]
     fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         np.call_method1("dtype", ("bool",))
     }
 
@@ -267,7 +267,7 @@ impl ScxComparisonResult {
                     .map_err(PyRuntimeError::new_err)?;
                     // Return a numpy int64 scalar (not a bare Python int) so this
                     // shortcut matches the materialized fallback's scalar type.
-                    let np = py.import("numpy")?;
+                    let np = crate::pyimport::import_module(py, "numpy")?;
                     np.call_method1("int64", (total as i64,))
                 }
                 Some(_) => Err(PyValueError::new_err("axis must be 0, 1, or None")),
@@ -429,7 +429,7 @@ pub(crate) fn try_extract_row_factors(
     n_obs: usize,
     n_vars: usize,
 ) -> PyResult<Option<Vec<f64>>> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     // Convert to numpy array, handling scipy matrices, lists, scalars, etc.
     let arr = match np.call_method1("asarray", (other,)) {

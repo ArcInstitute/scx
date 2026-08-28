@@ -893,7 +893,7 @@ impl ScxLazyTransformedDataset {
 
     #[getter]
     fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         np.call_method1("dtype", ("float32",))
     }
 
@@ -1352,7 +1352,7 @@ impl ScxLazyTransformedDataset {
                 // means here are an `np.matrix` (axis=1) or a Python float
                 // (axis=None), neither of which has it — squaring the mean used
                 // to raise `AttributeError` and made both arms unreachable.
-                let np = py.import("numpy")?;
+                let np = crate::pyimport::import_module(py, "numpy")?;
                 let mat = self.to_memory(py)?;
                 let (mean, mean_sq) = match axis {
                     Some(1) => (
@@ -1630,7 +1630,7 @@ impl ScxLazyTransformedDataset {
         }
 
         // Numpy array or list
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         let arr = np.call_method1("asarray", (row_idx,))?;
         let dtype_str: String = arr.getattr("dtype")?.call_method0("__str__")?.extract()?;
 
@@ -1782,7 +1782,7 @@ impl ScxLazyTransformedDataset {
         }
 
         // Apply column selection
-        let builtins = py.import("builtins")?;
+        let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_none = builtins.call_method1("slice", (py.None(),))?;
         let col_tuple = PyTuple::new(py, &[slice_none.unbind(), col_idx.clone().unbind()])?;
         row_csr.get_item(col_tuple)
@@ -1809,7 +1809,7 @@ impl ScxLazyTransformedDataset {
         py: Python<'_>,
         col_idx: &Bound<'_, PyAny>,
     ) -> PyResult<Option<Vec<u32>>> {
-        let numpy = py.import("numpy")?;
+        let numpy = crate::pyimport::import_module(py, "numpy")?;
         let is_ndarray = col_idx.is_instance(&numpy.getattr("ndarray")?)?;
         if !is_ndarray {
             return Ok(None);

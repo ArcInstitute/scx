@@ -910,6 +910,35 @@ The full transform list is also surfaced on the wrapper itself via
 `ScxLazyTransformedDataset.transforms_repr() → list[{"name","params"}]`,
 which the writer uses to build the `lazy_transforms` payload.
 
+## Restricted-exec (sandbox) safety
+
+pyscx entry points work when called from code `exec`'d under **restricted
+globals whose `__builtins__` lack `__import__`** — the sandbox shape pipeline
+runners use for escape-hatch `python` steps (imports forbidden, modules
+pre-injected). This is a maintained guarantee, not an accident:
+
+- CPython resolves `__import__` for C-level imports (`PyImport_Import`) from
+  the **innermost Python frame's builtins**, so a native function called
+  directly from such a frame would otherwise die with
+  `KeyError: '__import__'` at its first call-time import.
+- All call-time imports in pyscx and scx-loader go through the
+  frame-insensitive `scx_loader::pyimport::import_module` (`sys.modules`
+  lookup, then the core import machinery — neither consults frame builtins).
+  A workspace `clippy.toml` `disallowed-methods` entry rejects bare
+  `Python::import` / `PyModule::import`.
+- Third-party lazy imports are handled too: rust-numpy's C-API and
+  borrow-capsule inits are primed at `import pyscx` time, and dtype-name
+  reads (numpy re-imports `numpy._core._dtype` on **every** `dtype.name` /
+  `str(dtype)`) route through the pure-Python trampoline
+  `pyscx._frame_safe`, whose frame carries real builtins.
+
+Covered surfaces (regression-tested in `pyscx/tests/test_sandbox_exec.py`,
+which runs each one inside `exec(code, {"__builtins__": <no __import__>})`):
+`pyscx.write`, the native `pyscx.pyscx.from_anndata`, `pyscx.obs_import`,
+`pyscx.modify_metadata` / `pyscx.set_uns`, and `open(...).to_anndata()`.
+Note that numpy itself is *not* sandbox-safe (`str(x.dtype)` in step code
+will still raise); the guarantee covers pyscx's own entry points.
+
 ## BackedCsrReader (`scx-format-io/src/backed/csr.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache

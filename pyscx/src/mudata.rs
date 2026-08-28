@@ -248,7 +248,7 @@ pub fn to_mudata<'py>(
 
     let modality_names = reader.modality_names();
 
-    let anndata_mod = py.import("anndata")?;
+    let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
     let mudata_mod = import_mudata(py)?;
 
     // Build the global obs once; per-modality AnnData objects share it.
@@ -648,7 +648,7 @@ pub fn from_mudata_impl(
 
         // X — convert to scipy CSR via the AnnData object's
         // adata.X.tocsr() (or just use as-is if already CSR).
-        let scipy_sparse = py.import("scipy.sparse")?;
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
         let x_attr = adata.getattr("X")?;
         // Materialise to CSR (covers dense AnnData too).
         let x_csr = scipy_sparse.call_method1("csr_matrix", (x_attr,))?;
@@ -691,7 +691,7 @@ pub fn from_mudata_impl(
             .collect::<PyResult<Vec<_>>>()?;
         for key in keys {
             let arr = obsm_attr.get_item(&key)?;
-            let pd_mod = py.import("pandas")?;
+            let pd_mod = crate::pyimport::import_module(py, "pandas")?;
             let df = pd_mod.call_method1("DataFrame", (arr,))?;
             let batch = pandas_to_record_batch(py, &df)?;
             obsm.insert(key, batch);
