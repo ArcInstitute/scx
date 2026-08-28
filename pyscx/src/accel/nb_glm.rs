@@ -139,7 +139,7 @@ fn fit_one(
 
 /// Copy a 2-D array-like into a row-major `Vec<f64>` plus its `(rows, cols)`.
 fn dense2d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usize, usize)> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let a = np.call_method1("asarray", (obj,))?;
     let a = super::util::astype_no_copy(py, &a, "float64")?; // no copy if already f64
     let a = np.call_method1("ascontiguousarray", (a,))?;
@@ -157,7 +157,7 @@ fn dense2d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, us
 
 /// Copy a 1-D array-like into a `Vec<f64>`.
 fn dense1d_f64(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let a = np.call_method1("asarray", (obj,))?;
     let a = super::util::astype_no_copy(py, &a, "float64")?; // no copy if already f64
     let a = np.call_method1("ascontiguousarray", (a,))?;
@@ -454,7 +454,7 @@ pub(super) fn fit_targets_nbglm(
     // it speeds the CPU baseline (whose fit overlaps across targets) far more than
     // the GPU path (whose fit is off-CPU), and nests rayon. The GPU device handle
     // is `!Sync` and must stay serial regardless.
-    let warnings = py.import("warnings")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
     let mut fits = Vec::with_capacity(targets.len());
     for target in &targets {
         let sub: Vec<usize> = (0..n_groups)
@@ -591,7 +591,7 @@ fn fits_to_pandas<'py>(
     dict.set_item("target", target_col)?;
     dict.set_item("reference", ref_col)?;
 
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let df = pd.call_method1("DataFrame", (&dict,))?;
     let order = PyList::new(
         py,
@@ -673,7 +673,7 @@ pub(super) fn fit_targets_nbglm_with_design(
     let targets: Vec<String> = ordered_levels[1..].iter().map(|s| s.to_string()).collect();
 
     // --- metadata_df: rows = pseudobulk samples, cols = groupby columns. ---
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let meta_dict = PyDict::new(py);
     for (col_idx, col_name) in result.groupby_columns.iter().enumerate() {
         let vals: Vec<String> = (0..n_groups)
@@ -794,7 +794,7 @@ pub(super) fn fit_targets_nbglm_with_design(
     // dispersion fit is contrast-independent, so every call after the first re-runs an
     // identical deterministic fit — a fit-once/test-many CPU seam (mirroring the GPU
     // `gpu_nb_glm_fit_states` + `finalize_nb_glm` split) would remove the O(k) waste.
-    let warnings = py.import("warnings")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
     let mut fits = Vec::with_capacity(contrast_specs.len());
     for (label, contrast) in contrast_specs {
         match fit_one(
@@ -981,7 +981,7 @@ pub fn nb_glm(
     dict.set_item("converged", res.converged)?;
     dict.set_item("n_iter", res.n_iter)?;
 
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let df = pd.call_method1("DataFrame", (&dict,))?;
     let order = PyList::new(
         py,
@@ -1131,7 +1131,7 @@ pub fn pdex_nb_glm(
     // `gene_chunk_size` is reserved for a future out-of-core fit; v1 holds all
     // genes in memory. Warn rather than silently ignore a caller-set value.
     if gene_chunk_size.is_some() {
-        py.import("warnings")?.call_method1(
+        crate::pyimport::import_module(py, "warnings")?.call_method1(
             "warn",
             (
                 "pdex_nb_glm: gene_chunk_size is not implemented in v1 (all genes are \

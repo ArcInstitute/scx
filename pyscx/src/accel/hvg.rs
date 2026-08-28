@@ -286,7 +286,7 @@ pub fn highly_variable_genes<'py>(
     let effective_gpu_id: Option<usize> = if let Some(gid) = resolved.gpu_id() {
         let seurat_v3 = matches!(flavor, "seurat_v3" | "seurat_v3_paper");
         if !seurat_v3 {
-            let warnings = py.import("warnings")?;
+            let warnings = crate::pyimport::import_module(py, "warnings")?;
             warnings.call_method1(
                 "warn",
                 (
@@ -470,8 +470,8 @@ pub fn highly_variable_genes<'py>(
     // scanpy's pd.cut bin-edge fragility on sparse Census data). Python's
     // default warning filter dedupes by (message, category, location), so
     // repeated calls only emit once per site.
-    let warnings = py.import("warnings")?;
-    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     let core = format!(
         "highly_variable_genes(flavor={flavor:?}) is not implemented natively in \
          scx and is delegated to scanpy.pp.highly_variable_genes. flavor=\"seurat_v3\", \
@@ -722,7 +722,7 @@ fn emit_hvg_loess_singularity_warning(
         batch_key,
         batch_labels,
     );
-    py.import("warnings")?.call_method1(
+    crate::pyimport::import_module(py, "warnings")?.call_method1(
         "warn",
         (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
     )?;
@@ -852,8 +852,8 @@ fn hvg_seurat_v3<'py, S: scx_format_io::ShardSource + Sync>(
             let batch_col = obs.get_item(bk)?;
             // Handle both categorical and non-categorical columns:
             // wrap in pd.Categorical() which is a no-op for already-categorical data.
-            let pd = py.import("pandas")?;
-            let np = py.import("numpy")?;
+            let pd = crate::pyimport::import_module(py, "pandas")?;
+            let np = crate::pyimport::import_module(py, "numpy")?;
             let cat = pd.call_method1("Categorical", (&batch_col,))?;
             let codes = cat.getattr("codes")?;
             let cat_codes: Vec<i64> = np
@@ -1439,7 +1439,7 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
     let log_means_np = numpy::PyArray::from_vec(py, log_means.clone());
     let log_disp_np = numpy::PyArray::from_vec(py, log_dispersions.clone());
 
-    let helpers = py.import("pyscx._hvg_helpers")?;
+    let helpers = crate::pyimport::import_module(py, "pyscx._hvg_helpers")?;
     let dispersions_norm: Vec<f64> = helpers
         .call_method1(
             "binned_dispersion_norm",

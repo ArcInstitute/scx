@@ -20,7 +20,7 @@ fn factorize_obs_column(
     col: &Bound<'_, PyAny>,
     col_name: &str,
 ) -> PyResult<(Vec<u32>, usize)> {
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("sort", false)?;
     let tup = pd.call_method("factorize", (col,), Some(&kwargs))?;
@@ -121,7 +121,7 @@ pub fn compute_lisi<'py>(
             "'{basis}' not found in adata.obsm. Run PCA first: pyscx.accel.pca(adata)",
         ))
     })?;
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let emb_f32 = np
         .call_method1("ascontiguousarray", (&emb_obj,))?
         .call_method1("astype", ("float32",))?;
@@ -184,7 +184,7 @@ pub fn compute_lisi<'py>(
     // Write to adata.obs[f"lisi_{key}"]. We round-trip through a pandas
     // Series so the column lands with a sensible index rather than being
     // a bare numpy array in AnnData's obs frame.
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let obs_index = obs.getattr("index")?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("index", &obs_index)?;

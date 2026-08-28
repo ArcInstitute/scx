@@ -163,7 +163,7 @@ impl ScxBackedObsmDataset {
         }
 
         // numpy array or list
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         let arr = np.call_method1("asarray", (row_idx,))?;
         // Detect boolean masks via the dtype `kind` ('b'), which is stable
         // across numpy versions/platforms (unlike the `str(dtype)` text,
@@ -269,7 +269,7 @@ impl ScxBackedObsmDataset {
             // Fallback: let numpy infer from the gathered array's dtype.
             _ => "float32",
         };
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         np.call_method1("dtype", (name,))
     }
 
@@ -298,7 +298,7 @@ impl ScxBackedObsmDataset {
                 let col_idx = tuple.get_item(1)?;
                 let (rows, single) = self.resolve_rows(py, &row_idx)?;
                 let arr2d = self.gather_rows_2d(py, &rows)?;
-                let builtins = py.import("builtins")?;
+                let builtins = crate::pyimport::import_module(py, "builtins")?;
                 let slice_all = builtins.call_method1("slice", (py.None(),))?;
                 // arr2d[:, col_idx]
                 let col_indexed =

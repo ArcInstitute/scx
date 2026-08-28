@@ -13,6 +13,8 @@ pub mod plan_engine;
 pub mod pool;
 pub mod projection;
 #[cfg(feature = "python")]
+pub mod pyimport;
+#[cfg(feature = "python")]
 pub mod python;
 pub(crate) mod runtime;
 pub(crate) mod seed;

@@ -1258,8 +1258,9 @@ impl IndexPlanDataset {
             && scx_format_io::backed::scatter_block_index_enabled()
             && !loader.any_shard_framed()
         {
-            let warnings = py.import("warnings")?;
-            let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+            let warnings = crate::pyimport::import_module(py, "warnings")?;
+            let user_warning =
+                crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
             let msg = format!(
                 "IndexPlanDataset opened '{path}' with scatter_block_index=True, but no \
                  CSR shard is row-group framed (unframed legacy file). Scattered reads \
@@ -1738,8 +1739,8 @@ fn warn_cache_sizing(
     dataset: &str,
     v: &crate::budget::CacheSizingVerdict,
 ) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
-    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     let consequence = if v.below_floor {
         format!(
             " That is below the {} shards a gather batch typically touches, so \
@@ -1780,8 +1781,8 @@ fn warn_hvg_panel(
     dataset: &str,
     v: &crate::projection::HvgPanelVerdict,
 ) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
-    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     let mut parts: Vec<String> = Vec::new();
     if v.was_reordered {
         parts.push(
@@ -1919,8 +1920,8 @@ fn warn_cache_thrash(
     if latch.swap(true, Ordering::Relaxed) {
         return Ok(());
     }
-    let warnings = py.import("warnings")?;
-    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     // Lead with the knob that can actually fix it. When the byte budget is the
     // limiter, `cache_shards` is already at or above what is resident-capable and
     // raising it changes nothing — advising it first is a false diagnosis even
@@ -2073,8 +2074,8 @@ fn resolve_modality_id_with_warning(
         ))
     })?;
 
-    let warnings = py.import("warnings")?;
-    let user_warning = py.import("builtins")?.getattr("UserWarning")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     let msg = format!(
         "file is multimodal; loading modality '{chosen}' only — use \
          MultimodalTrainingDataset for full coverage"

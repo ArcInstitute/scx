@@ -156,7 +156,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     };
     use std::sync::Arc;
 
-    let anndata_mod = py.import("anndata")?;
+    let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
 
     // Phase 4d: catalog-only estimate of the full-assembly bytes. If
     // the estimate exceeds the budget (caller's `memory_budget` kwarg,
@@ -543,7 +543,7 @@ pub fn to_anndata_filtered<'py>(
         // (e.g. pandas accepts `&` / `|` / `~`; SCX accepts only
         // `and` / `or` / `not`). Users opted into preserve_slots=True, so
         // one warning per call is appropriate.
-        py.import("warnings")?.call_method1(
+        crate::pyimport::import_module(py, "warnings")?.call_method1(
             "warn",
             (format!(
                 "preserve_slots=True evaluated obs_filter {expr:?} via pandas.eval; \
@@ -552,7 +552,7 @@ pub fn to_anndata_filtered<'py>(
             ),),
         )?;
 
-        let builtins = py.import("builtins")?;
+        let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
         let col_idx = if let Some(names) = var_names {
             // Fancy column indexing honours order, so request order is preserved
@@ -599,7 +599,7 @@ pub fn to_anndata_filtered<'py>(
         // the in-decode narrow (G2) lands on the eager path only.
         guard_decode_loss(result.max_value, plan.allow_lossy)?;
 
-        let anndata_mod = py.import("anndata")?;
+        let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
         // Narrow to the requested container/dtype (no-op for the default plan).
         let x = csr_to_scipy_typed(py, result.x, plan)?;
         let obs_table = record_batch_to_pyarrow(py, &result.obs)?;
@@ -638,7 +638,7 @@ pub fn to_anndata_filtered<'py>(
             .unwrap_or(false);
         let has_layers = !reader.layer_names().is_empty();
         if has_obsm || has_varm || has_obsp || has_varp || has_layers {
-            let warnings = py.import("warnings")?;
+            let warnings = crate::pyimport::import_module(py, "warnings")?;
             let mut parts = Vec::new();
             if has_obsm {
                 parts.push("obsm");
@@ -710,7 +710,7 @@ pub fn to_anndata_filtered<'py>(
             resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
         let np_indices = PyArray1::from_vec(py, indices);
 
-        let builtins = py.import("builtins")?;
+        let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
         let idx =
             pyo3::types::PyTuple::new(py, &[slice_all.unbind(), np_indices.into_any().unbind()])?;
@@ -869,7 +869,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     use scx_format_io::BackedCsrReader;
     use std::sync::Arc;
 
-    let anndata_mod = py.import("anndata")?;
+    let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
     let reader = crate::open_handle_reader(path).map_err(to_pyerr)?;
     // Share one parsed `FullCatalog` across the N+3 `ScxReader`
     // instances this function constructs (main reader + X CSR + CSC
@@ -923,7 +923,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             let filtered_idx = filtered.getattr("index")?;
 
             // Get positional indices of kept rows in the (already deletion-filtered) obs
-            let np = py.import("numpy")?;
+            let np = crate::pyimport::import_module(py, "numpy")?;
             let isin_mask = original_idx.call_method1("isin", (&filtered_idx,))?;
             let where_result = np.call_method1("where", (&isin_mask,))?;
             // np.where returns a tuple; first element is array of indices

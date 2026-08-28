@@ -65,7 +65,7 @@ fn build_index_options(
 /// rewrite ops surface the same errors / warnings as `from_anndata`.
 fn process_index_summary(py: Python<'_>, summary: PredicateIndexBuildSummary) -> PyResult<()> {
     let emit_warning = |msg: String| -> PyResult<()> {
-        py.import("warnings")?.call_method1("warn", (msg,))?;
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
         Ok(())
     };
 
@@ -390,7 +390,7 @@ pub fn append_from_anndata(
     drop(target_reader);
 
     // Extract numpy arrays
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     let indptr_obj = x_csr.getattr("indptr")?;
     let indptr_arr = convert::astype_if_needed(&indptr_obj, &np, "int64")?;
@@ -1379,7 +1379,7 @@ fn obs_var_to_record_batch(
     obj: &Bound<'_, PyAny>,
     param: &str,
 ) -> PyResult<RecordBatch> {
-    let pa = py.import("pyarrow")?;
+    let pa = crate::pyimport::import_module(py, "pyarrow")?;
     let table_cls = pa.getattr("Table")?;
     if obj.is_instance(&table_cls)? {
         let df = obj.call_method0("to_pandas")?;
@@ -1390,7 +1390,7 @@ fn obs_var_to_record_batch(
     // `AttributeError: 'dict' object has no attribute 'columns'` deep inside
     // pyarrow, with no mention of `modify_metadata`, the parameter, or the
     // expected type (report E2).
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
     let df_cls = pd.getattr("DataFrame")?;
     if !obj.is_instance(&df_cls)? {
         let got = obj
@@ -1663,7 +1663,7 @@ fn report_modify_metadata_index(
         if columns.is_empty() {
             continue;
         }
-        py.import("warnings")?.call_method1(
+        crate::pyimport::import_module(py, "warnings")?.call_method1(
             "warn",
             (format!(
                 "the {axis} predicate index no longer covers {columns:?}: this file indexed \
@@ -2245,7 +2245,7 @@ pub fn doublet_import(
             format!("{key}_predicted"),
             key,
         );
-        py.import("warnings")?.call_method1("warn", (msg,))?;
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
     }
 
     let d = PyDict::new(py);

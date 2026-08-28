@@ -458,7 +458,7 @@ fn pseudobulk_means_impl<'py>(
         // `scipy.sparse.csr_matrix(dense)` path was 22 s — dominated by
         // densify-then-CSR-construct churn, not the actual aggregation.
         // The dense kernel skips that.
-        let scipy_sparse = py.import("scipy.sparse")?;
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
             .extract::<bool>()?;
@@ -552,7 +552,7 @@ fn compute_aligned_pseudobulk_means<'py>(
     min_cells_per_group: usize,
     gpu_dev: &EvalGpuDev,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<String>, usize, Vec<String>)> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     // Validate no NaN in perturbation labels (NaN → "nan" is silent and wrong).
     for (label, adata) in [("real", adata_real), ("pred", adata_pred)] {
@@ -560,7 +560,7 @@ fn compute_aligned_pseudobulk_means<'py>(
         let series = obs.get_item(pert_col).map_err(|_| {
             PyValueError::new_err(format!("column '{}' not found in adata.obs", pert_col))
         })?;
-        let pd = py.import("pandas")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
         let isna = pd.call_method1("isna", (&series,))?;
         let any_na: bool = isna.call_method0("any")?.extract()?;
         if any_na {
@@ -954,7 +954,7 @@ where
         arr.call_method1("astype", (F::NUMPY_NAME,))?
     } else {
         // Check for scipy sparse.
-        let scipy_sparse = py.import("scipy.sparse")?;
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
         let is_sparse: bool = scipy_sparse
             .call_method1("issparse", (&matrix_obj,))?
             .extract()?;
@@ -974,7 +974,7 @@ where
     let estimated_bytes = shape.0 * shape.1 * F::BYTES;
     if estimated_bytes > 2_000_000_000 {
         let gb = estimated_bytes as f64 / 1e9;
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         warnings.call_method1(
             "warn",
             (format!(
@@ -1012,7 +1012,7 @@ fn extract_obs_column<'py>(
         .map_err(|_| PyValueError::new_err(format!("column '{}' not found in adata.obs", col)))?;
 
     // Detect NaN values before string conversion (NaN → "nan" is silent and wrong).
-    let pd = _py.import("pandas")?;
+    let pd = crate::pyimport::import_module(_py, "pandas")?;
     let isna = pd.call_method1("isna", (&series,))?;
     let any_na: bool = isna.call_method0("any")?.extract()?;
     if any_na {
@@ -1367,7 +1367,7 @@ fn run_energy_distance<'py>(
     dtype: Option<&str>,
     gpu_dev: &EvalGpuDev,
 ) -> PyResult<scx_accel::EDistanceResult> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     // Parse distance metric.
     let dist_metric = match metric.to_lowercase().as_str() {
@@ -1780,7 +1780,7 @@ pub fn knockdown_efficiency<'py>(
     // copy-on-write. Gene-order agnostic, so no var-order guard.
     super::prepare_target_no_var_guard(py, adata, "knockdown_efficiency")?;
     let route = scaffold_device_route(py, adata, "knockdown_efficiency", device)?;
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
 
     // ── Extract perturbation labels ─────────────────────────────────
     let pert_labels = extract_obs_column(py, adata, pert_col)?;
@@ -1794,7 +1794,7 @@ pub fn knockdown_efficiency<'py>(
 
     // ── Extract CSR data from adata.X ───────────────────────────────
     let x = adata.getattr("X")?;
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
 
     // Get CSR matrix — handle backed, lazy-transformed, sparse, and dense inputs.
     let csr_obj = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
@@ -2057,7 +2057,7 @@ pub fn clustering_agreement<'py>(
         }
     }
     if overflow_seen {
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         warnings.call_method1(
             "warn",
             (
@@ -2193,7 +2193,7 @@ pub fn clustering_agreement<'py>(
 /// independently), so this is exact. Negative codes are rejected (pandas uses
 /// `-1` for NA).
 fn extract_u32_labels(py: Python<'_>, labels: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let arr = np.call_method1("asarray", (labels,))?;
     let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
 
@@ -2204,7 +2204,7 @@ fn extract_u32_labels(py: Python<'_>, labels: &Bound<'_, PyAny>) -> PyResult<Vec
     let codes = if matches!(kind.as_str(), "i" | "u" | "b") {
         arr.call_method1("astype", ("int64",))?
     } else {
-        let pd = py.import("pandas")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
         let kwargs = PyDict::new(py);
         kwargs.set_item("sort", false)?;
         // factorize(arr, sort=False) -> (codes, uniques); codes are int64

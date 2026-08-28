@@ -51,7 +51,7 @@ pub fn umap(
     // copy-on-write. No var-order guard: this op is gene-order agnostic.
     super::prepare_target_no_var_guard(py, adata, "umap")?;
 
-    let numpy = py.import("numpy")?;
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
 
     // Determine effective device
     let _device = resolve_device(device)?;
@@ -172,7 +172,7 @@ pub fn umap(
             return Ok(());
         }
         // cuML unavailable — fall through to CPU with a warning.
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         warnings.call_method1(
             "warn",
             (concat!(
@@ -257,8 +257,7 @@ fn try_cuml_umap(
     random_state: u64,
 ) -> PyResult<()> {
     // Try importing cuML
-    let cuml_umap = py
-        .import("cuml.manifold")
+    let cuml_umap = crate::pyimport::import_module(py, "cuml.manifold")
         .map_err(|_| PyRuntimeError::new_err("cuML not available"))?;
 
     let umap_cls = cuml_umap.getattr("UMAP")?;

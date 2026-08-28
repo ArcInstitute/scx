@@ -278,7 +278,7 @@ fn positional_from_index(
         return Ok(Some(vec![i]));
     }
 
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let arr = np.call_method1("asarray", (idx,))?;
     // Detect boolean masks via the dtype `kind`, which is stable across numpy
     // versions (unlike `str(dtype)`, which can be "bool" / "bool_" / "bool8").
@@ -363,7 +363,7 @@ const SEAMS: [Seam; 3] = [
 /// instead of anndata's.
 pub(crate) fn register_anndata_subset_hooks(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    if py.import("anndata").is_err() {
+    if crate::pyimport::import_module(py, "anndata").is_err() {
         // anndata not installed — scx is usable without it, no warning.
         return Ok(());
     }
@@ -376,8 +376,7 @@ pub(crate) fn register_anndata_subset_hooks(m: &Bound<'_, PyModule>) -> PyResult
 
     let mut all_ok = true;
     for (seam, hook_impl) in SEAMS.iter().zip(impls.iter()) {
-        let dispatcher = match py
-            .import(seam.module)
+        let dispatcher = match crate::pyimport::import_module(py, seam.module)
             .and_then(|module| module.getattr(seam.attr))
         {
             Ok(d) => d,

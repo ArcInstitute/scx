@@ -76,8 +76,7 @@ fn warn_default_backend_changed(py: Python<'_>) {
     // `find_spec` can itself raise (a missing parent package, a module whose
     // `__spec__` is None, a custom meta-path finder). Treat "cannot tell" as
     // "not available" and stay quiet.
-    let available = py
-        .import("importlib.util")
+    let available = crate::pyimport::import_module(py, "importlib.util")
         .and_then(|m| m.call_method1("find_spec", ("pydeseq2",)))
         .map(|spec| !spec.is_none())
         .unwrap_or(false);
@@ -89,7 +88,7 @@ fn warn_default_backend_changed(py: Python<'_>) {
     if DEFAULT_BACKEND_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if let Ok(warnings) = py.import("warnings") {
+    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (
@@ -365,7 +364,7 @@ pub(super) fn aggregate_pseudobulk(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
     } else {
         // In-memory: extract scipy CSR → ScxCsr.
-        let scipy_sparse = py.import("scipy.sparse")?;
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
         let is_sparse = scipy_sparse
             .call_method1("issparse", (&x,))?
             .extract::<bool>()?;
@@ -377,7 +376,7 @@ pub(super) fn aggregate_pseudobulk(
             let arr = x.call_method0("toarray")?;
             scipy_sparse.call_method1("csr_matrix", (&arr,))?
         } else {
-            let np = py.import("numpy")?;
+            let np = crate::pyimport::import_module(py, "numpy")?;
             let arr = np
                 .call_method1("asarray", (&x,))?
                 .call_method1("astype", ("float32",))?;
@@ -385,7 +384,7 @@ pub(super) fn aggregate_pseudobulk(
         };
 
         let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         let indptr: Vec<i64> = np
             .call_method1("asarray", (csr_obj.getattr("indptr")?,))?
             .call_method1("astype", ("int64",))?
@@ -683,8 +682,8 @@ pub fn pseudobulk_dex(
         let (strata, masks) =
             extract_strata(py, adata, strat_cols, min_cells_per_stratum, &forbidden)?;
 
-        let pd = py.import("pandas")?;
-        let warnings = py.import("warnings")?;
+        let pd = crate::pyimport::import_module(py, "pandas")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         let mut all_frames: Vec<Bound<'_, PyAny>> = Vec::new();
 
         for (stratum, mask) in strata.iter().zip(masks.iter()) {
@@ -840,7 +839,7 @@ pub fn pseudobulk_dex(
     }
 
     // Build counts DataFrame and metadata DataFrame for pydeseq2.
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
 
     // counts_df: rows = pseudobulk samples, columns = genes
     let counts_array = numpy::PyArray1::from_slice(py, &result.counts);

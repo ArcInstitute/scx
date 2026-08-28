@@ -117,7 +117,7 @@ pub(crate) fn build_plan(
 
     // Dense output has no column-index array; warn if the caller asked for one.
     if container == Container::Dense && index_dtype.is_some() {
-        let warnings = py.import("warnings")?;
+        let warnings = crate::pyimport::import_module(py, "warnings")?;
         warnings.call_method1(
             "warn",
             (

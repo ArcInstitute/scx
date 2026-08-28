@@ -106,7 +106,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
     // Open the source h5ad through h5py. We only ever read group
     // `.keys()` — never any dataset value — so anndata's lazy
     // `obsm[key]` materialisation path stays untriggered.
-    let h5py = py.import("h5py")?;
+    let h5py = crate::pyimport::import_module(py, "h5py")?;
     let h5_kwargs = pyo3::types::PyDict::new(py);
     h5_kwargs.set_item("mode", "r")?;
     let h5_file = h5py.call_method("File", (&filename,), Some(&h5_kwargs))?;
@@ -161,8 +161,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
                          will be lost. Use pyscx.from_h5ad(path, out) on a \
                          freshly-written h5ad if you need mutated layers preserved.",
                     );
-                    let _ = py
-                        .import("warnings")
+                    let _ = crate::pyimport::import_module(py, "warnings")
                         .and_then(|w| w.call_method1("warn", (msg,)));
                 }
             }
@@ -189,8 +188,7 @@ pub(crate) fn route_backed_anndata_to_streaming(
              the key under a fresh name to force the Python value through.",
             routed_from_disk.join(", ")
         );
-        let _ = py
-            .import("warnings")
+        let _ = crate::pyimport::import_module(py, "warnings")
             .and_then(|w| w.call_method1("warn", (msg,)));
     }
 

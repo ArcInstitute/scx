@@ -721,8 +721,7 @@ pub(crate) fn stream_write_layers(
         Ok(l) => l,
         Err(_) => return Ok(()),
     };
-    let keys: Vec<String> = py
-        .import("builtins")?
+    let keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (layers.call_method0("keys")?,))?
         .extract()?;
     if keys.is_empty() {
@@ -803,8 +802,7 @@ pub(crate) fn section_keys_match(
 ) -> PyResult<bool> {
     let py_keys: Vec<String> = match adata.getattr(attr) {
         Ok(section) => match section.call_method0("keys") {
-            Ok(keys_obj) => py
-                .import("builtins")?
+            Ok(keys_obj) => crate::pyimport::import_module(py, "builtins")?
                 .call_method1("list", (keys_obj,))?
                 .extract()
                 .unwrap_or_default(),
@@ -814,8 +812,7 @@ pub(crate) fn section_keys_match(
     };
     let disk_keys: Vec<String> = match h5_file.get_item(attr) {
         Ok(group) => match group.call_method0("keys") {
-            Ok(keys_obj) => py
-                .import("builtins")?
+            Ok(keys_obj) => crate::pyimport::import_module(py, "builtins")?
                 .call_method1("list", (keys_obj,))?
                 .extract()
                 .unwrap_or_default(),
@@ -1023,14 +1020,13 @@ pub(crate) fn extract_dense_mapping(
         Ok(g) => g,
         Err(_) => return Ok(Vec::new()),
     };
-    let keys: Vec<String> = py
-        .import("builtins")?
+    let keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (group.call_method0("keys")?,))?
         .extract()?;
     keys.iter()
         .map(|key| {
             let arr = group.call_method1("__getitem__", (key,))?;
-            let pd = py.import("pandas")?;
+            let pd = crate::pyimport::import_module(py, "pandas")?;
             let df = pd.call_method1("DataFrame", (&arr,))?;
             let batch = pandas_to_record_batch(py, &df)?;
             Ok((key.clone(), batch))
@@ -1050,8 +1046,7 @@ pub(crate) fn extract_coo_mapping(
         Ok(g) => g,
         Err(_) => return Ok(Vec::new()),
     };
-    let keys: Vec<String> = py
-        .import("builtins")?
+    let keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (group.call_method0("keys")?,))?
         .extract()?;
     keys.iter()
@@ -1077,7 +1072,7 @@ pub(crate) fn extract_uns_value(
     if uns_len == 0 {
         return Ok(None);
     }
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let np_generic = np.getattr("generic")?;
     let np_ndarray = np.getattr("ndarray")?;
     let mut ctx = UnsWriteCtx::new(uns_format_parsed, &np_generic, &np_ndarray);

@@ -445,6 +445,15 @@ Nothing in this path is doublet-specific except one lookup table of column
 names. `pyscx.obs_import` lands any per-cell annotation table; `doublet_import`
 is a thin wrapper that normalises each tool's spellings.
 
+More generally: whenever the thing you computed is **per-cell columns on a
+file that already exists** — a batch key for a downstream tool, a QC flag, a
+cluster label — reach for `obs_import`, not a `from_anndata` rewrite. It
+patches obs in place with no re-encode of `X` (seconds, not minutes, at atlas
+scale), preserves the CSC sidecar / `.raw` / deletion vectors / bitmaps, and
+is `scx rollback`-able. Pipeline runners can call it from restricted
+(`no __import__`) `python` steps — see
+[docs/api.md § Restricted-exec (sandbox) safety](api.md#restricted-exec-sandbox-safety).
+
 ### The per-tool column table
 
 This is that lookup table. Read it before writing the import, not after it

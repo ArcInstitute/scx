@@ -41,7 +41,7 @@ pub(crate) fn uns_py_to_json<'py>(
     obj: &Bound<'py, PyAny>,
     uns_format: UnsFormat,
 ) -> PyResult<serde_json::Value> {
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let np_generic = np.getattr("generic")?;
     let np_ndarray = np.getattr("ndarray")?;
     let mut ctx = UnsWriteCtx::new(uns_format, &np_generic, &np_ndarray);
@@ -79,7 +79,7 @@ impl<'a, 'py> UnsWriteCtx<'a, 'py> {
     /// actually contains a pandas object under tagged mode.
     fn pandas(&mut self, py: Python<'py>) -> PyResult<&Bound<'py, PyModule>> {
         if self.pd_lazy.is_none() {
-            self.pd_lazy = Some(py.import("pandas")?);
+            self.pd_lazy = Some(crate::pyimport::import_module(py, "pandas")?);
         }
         Ok(self.pd_lazy.as_ref().unwrap())
     }
@@ -327,7 +327,7 @@ pub(crate) fn encode_np_scalar_tagged<'py>(
     // the dtype from this label rather than relying on native byte order.
     let dtype_str: String = dtype.getattr("str")?.extract()?;
     // Wrap the scalar in a 0-d array so we can reuse ndarray byte conversion.
-    let np = ctx.np_generic.py().import("numpy")?;
+    let np = crate::pyimport::import_module(ctx.np_generic.py(), "numpy")?;
     let arr = np.call_method1("asarray", (obj,))?;
     let bytes = ndarray_bytes_le(&arr, key_path)?;
     use base64::Engine;
@@ -650,7 +650,7 @@ pub(crate) fn ndarray_bytes_le<'py>(arr: &Bound<'py, PyAny>, key_path: &str) -> 
     let dtype = arr.getattr("dtype")?;
     let le_dtype = dtype.call_method1("newbyteorder", ("<",))?;
     let arr_le = arr.call_method1("astype", (le_dtype,))?;
-    let np = arr.py().import("numpy")?;
+    let np = crate::pyimport::import_module(arr.py(), "numpy")?;
     let arr_c = np.call_method1("ascontiguousarray", (arr_le,))?;
     let bytes_obj = arr_c.call_method0("tobytes")?;
     let pybytes = bytes_obj.cast::<PyBytes>().map_err(|_| {
@@ -784,7 +784,7 @@ impl<'py> UnsReadCtx<'py> {
     fn new(py: Python<'py>) -> PyResult<Self> {
         Ok(Self {
             py,
-            np: py.import("numpy")?,
+            np: crate::pyimport::import_module(py, "numpy")?,
             pd_lazy: None,
             depth: 0,
         })
@@ -792,7 +792,7 @@ impl<'py> UnsReadCtx<'py> {
 
     fn pandas(&mut self) -> PyResult<&Bound<'py, PyModule>> {
         if self.pd_lazy.is_none() {
-            self.pd_lazy = Some(self.py.import("pandas")?);
+            self.pd_lazy = Some(crate::pyimport::import_module(self.py, "pandas")?);
         }
         Ok(self.pd_lazy.as_ref().unwrap())
     }
@@ -898,7 +898,7 @@ pub(crate) fn json_object_to_py<'py>(
                 // notice files written by a newer pyscx. The dict still
                 // comes back verbatim for introspection.
                 let py = ctx.py;
-                let warnings = py.import("warnings")?;
+                let warnings = crate::pyimport::import_module(py, "warnings")?;
                 let msg = format!(
                     "uns: unknown __scx_type__ tag '{tag}' — returning the raw tagged dict; \
                      upgrade pyscx if you wrote this file with a newer version"

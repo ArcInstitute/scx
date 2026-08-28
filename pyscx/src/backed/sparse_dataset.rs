@@ -461,7 +461,7 @@ impl ScxBackedSparseDataset {
 
     #[getter]
     pub(crate) fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         np.call_method1("dtype", ("float32",))
     }
 
@@ -1498,11 +1498,16 @@ impl ScxBackedSparseDataset {
         }
 
         // Numpy array or list
-        let np = py.import("numpy")?;
+        let np = crate::pyimport::import_module(py, "numpy")?;
         let arr = np.call_method1("asarray", (row_idx,))?;
-        let dtype_str: String = arr.getattr("dtype")?.call_method0("__str__")?.extract()?;
+        // `dtype.kind` — never `str(dtype)`/`dtype.name`: numpy's C code imports
+        // `numpy._core._dtype` on every dtype stringification via the
+        // frame-sensitive `PyImport_Import`, which detonates when this
+        // __getitem__ is called from restricted-exec globals (no `__import__`).
+        // `kind` is a plain C descriptor char. Matches the column-index helper.
+        let dtype_kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
 
-        if dtype_str == "bool" {
+        if dtype_kind == "b" {
             // Boolean mask → extract True indices
             let nonzero = arr.call_method0("nonzero")?;
             // nonzero returns a tuple of arrays; for 1D, it's (array_of_indices,)
@@ -1670,7 +1675,7 @@ impl ScxBackedSparseDataset {
 
         // Apply column selection: row_csr[:, col_idx]
         // scipy sparse needs slice(None) for "all rows", not Python None
-        let builtins = py.import("builtins")?;
+        let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_none = builtins.call_method1("slice", (py.None(),))?;
         let col_tuple = PyTuple::new(py, &[slice_none.unbind(), col_idx.clone().unbind()])?;
         row_csr.get_item(col_tuple)
@@ -1702,7 +1707,7 @@ impl ScxBackedSparseDataset {
         py: Python<'_>,
         col_idx: &Bound<'_, PyAny>,
     ) -> PyResult<Option<Vec<u32>>> {
-        let numpy = py.import("numpy")?;
+        let numpy = crate::pyimport::import_module(py, "numpy")?;
         let is_ndarray = col_idx.is_instance(&numpy.getattr("ndarray")?)?;
         if !is_ndarray {
             return Ok(None);

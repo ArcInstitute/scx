@@ -249,13 +249,13 @@ pub(super) fn try_extract_borrowed_csr<'py>(
     py: Python<'py>,
     x: &Bound<'py, PyAny>,
 ) -> PyResult<Option<(GilHeldCsrSlices<'py>, (usize, usize))>> {
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let csr_py = match scipy_sparse.call_method1("csr_matrix", (x,)) {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
     let shape: (usize, usize) = csr_py.getattr("shape")?.extract()?;
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let slices = borrow_csr_slices_gil_held(py, &np, &csr_py)?;
     Ok(Some((slices, shape)))
 }
@@ -399,7 +399,7 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
 /// cudarc's lazy `dlsym` panic deep in an FFI call.
 #[cfg(feature = "gpu")]
 pub(crate) fn emit_cusparse_abi_warning(py: Python<'_>, device: &str) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
     warnings.call_method1(
         "warn",
         (
@@ -494,7 +494,7 @@ fn extract_bool_vec(obj: &Bound<'_, PyAny>) -> PyResult<Vec<bool>> {
     // Coerce any sequence (numpy array, pandas Series, list, tuple, or a
     // non-contiguous view/slice) to a C-contiguous bool array so `as_slice()`
     // below cannot fail with AsSliceError on a non-contiguous input.
-    let np = obj.py().import("numpy")?;
+    let np = crate::pyimport::import_module(obj.py(), "numpy")?;
     let kwargs = PyDict::new(obj.py());
     kwargs.set_item("dtype", "bool")?;
     let arr = np

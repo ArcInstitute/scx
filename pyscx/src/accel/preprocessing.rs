@@ -610,7 +610,7 @@ pub fn calculate_qc_metrics<'py>(
 
     // --- Streaming path for SCX-backed / lazy data ---
 
-    let pd = py.import("pandas")?;
+    let pd = crate::pyimport::import_module(py, "pandas")?;
 
     // Resolve every qc_var gene subset up front, as one bitmask per visible
     // column, so the row pass below can accumulate all of them alongside
@@ -796,7 +796,7 @@ fn validate_device_or_default(device: &str) -> PyResult<super::gpu::ResolvedDevi
 
 #[cfg(feature = "gpu")]
 fn emit_laziness_break_warning(py: Python<'_>) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
     warnings.call_method1(
         "warn",
         (
@@ -810,7 +810,7 @@ fn emit_laziness_break_warning(py: Python<'_>) -> PyResult<()> {
 
 #[cfg(feature = "gpu")]
 fn emit_gpu_log1p_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
     warnings.call_method1(
         "warn",
         (
@@ -836,7 +836,7 @@ fn emit_gpu_log1p_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()>
 /// warnings side-by-side sees the same "open backed" recommendation.
 #[cfg(feature = "gpu")]
 fn emit_gpu_normalize_fallback_warning(py: Python<'_>, device: &str) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
     warnings.call_method1(
         "warn",
         (
@@ -858,7 +858,7 @@ fn emit_gpu_normalize_fallback_warning(py: Python<'_>, device: &str) -> PyResult
 /// Build a scipy `csr_matrix((data, indices, indptr), shape=...)` on the Python side.
 #[cfg(feature = "gpu")]
 fn scx_csr_to_scipy<'py>(py: Python<'py>, csr: scx_sparse::ScxCsr) -> PyResult<Bound<'py, PyAny>> {
-    let scipy_sparse = py.import("scipy.sparse")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
     let data = numpy::PyArray::from_vec(py, csr.data);
     let indices = numpy::PyArray::from_vec(py, csr.indices);
     let indptr = numpy::PyArray::from_vec(py, csr.indptr);
@@ -1155,8 +1155,8 @@ fn emit_qc_advisories(
     adata: &Bound<'_, PyAny>,
     qc_vars: &[String],
 ) -> PyResult<()> {
-    let warnings = py.import("warnings")?;
-    let builtins = py.import("builtins")?;
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let builtins = crate::pyimport::import_module(py, "builtins")?;
     let user_warning = builtins.getattr("UserWarning")?;
 
     // The MT-prefix counts cost a pandas
@@ -1366,7 +1366,7 @@ fn resolve_qc_masks(
     }
 
     let n_visible = visible_n_vars(x)?;
-    let np = py.import("numpy")?;
+    let np = crate::pyimport::import_module(py, "numpy")?;
     let var_df = adata.getattr("var")?;
     let mut empty = Vec::with_capacity(qc_vars.len());
     let mut chunks: Vec<QcMaskChunk> = Vec::new();

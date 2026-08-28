@@ -284,7 +284,7 @@ pub(crate) struct RapidsInfo {
 
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 fn module_version(py: Python<'_>, module: &str) -> Option<String> {
-    py.import(module)
+    crate::pyimport::import_module(py, module)
         .ok()
         .and_then(|m| m.getattr("__version__").ok())
         .and_then(|v| v.extract::<String>().ok())

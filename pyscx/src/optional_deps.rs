@@ -83,7 +83,7 @@ pub(crate) fn import_optional_with_hint<'py>(
     dist: &str,
     hint: Option<&str>,
 ) -> PyResult<Bound<'py, PyModule>> {
-    py.import(module).map_err(|e| {
+    crate::pyimport::import_module(py, module).map_err(|e| {
         if !is_missing_module(py, &e, module) {
             // A transitive dependency, or the submodule itself, failed to
             // import. That is a real diagnosis; do not relabel it.

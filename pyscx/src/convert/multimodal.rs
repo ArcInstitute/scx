@@ -28,7 +28,7 @@ pub fn build_backed_anndata_for_modality<'py>(
     use crate::backed::ScxBackedSparseDataset;
     use scx_format_io::BackedCsrReader;
 
-    let anndata_mod = py.import("anndata")?;
+    let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
 
     // Meta reader for var / obsm / modality_info introspection.
     let meta =

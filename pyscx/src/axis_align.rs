@@ -419,16 +419,15 @@ pub(crate) fn devirtualize_scx_view(
              pyscx.accel.subset_var / subset_obs to subset a backed AnnData in place and avoid \
              the transition."
         );
-        let warned = py
-            .import("anndata")
+        let warned = crate::pyimport::import_module(py, "anndata")
             .and_then(|m| m.getattr("ImplicitModificationWarning"))
             .and_then(|cls| {
-                py.import("warnings")?
+                crate::pyimport::import_module(py, "warnings")?
                     .call_method1("warn", (msg.as_str(), cls))
             })
             .is_ok();
         if !warned {
-            if let Ok(warnings) = py.import("warnings") {
+            if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
                 let _ = warnings.call_method1(
                     "warn",
                     (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
@@ -464,7 +463,7 @@ fn subset_mapping_keeping_handles<'py>(
         } else {
             // anndata reaches for `copy.copy` on the one value type without a
             // `.copy()` method (awkward arrays, whose buffers are immutable).
-            py.import("copy")?.call_method1("copy", (&value,))?
+            crate::pyimport::import_module(py, "copy")?.call_method1("copy", (&value,))?
         };
         out.set_item(key, value)?;
     }
