@@ -231,6 +231,7 @@ def test_core_import_fallback_under_restricted_exec(sandbox_env, synthetic_adata
     # would leave scipy.sparse missing for the rest of the session. Restore
     # the original object no matter what happens inside the sandbox.
     orig_scipy_sparse = sys.modules.pop("scipy.sparse", None)
+    scipy_pkg = sys.modules.get("scipy")
     try:
         glb = run_sandboxed(
             "result = pyscx.open(path).to_anndata()\nn = result.n_obs",
@@ -242,3 +243,9 @@ def test_core_import_fallback_under_restricted_exec(sandbox_env, synthetic_adata
     finally:
         if orig_scipy_sparse is not None:
             sys.modules["scipy.sparse"] = orig_scipy_sparse
+            # The re-import also rebound the parent package's `sparse`
+            # attribute to the NEW module object; `import scipy.sparse as sp`
+            # follows that attribute, so restore it too or later tests see
+            # two different module objects.
+            if scipy_pkg is not None:
+                scipy_pkg.sparse = orig_scipy_sparse
