@@ -19,6 +19,14 @@
 //!   capture mode rejects these APIs. G2's `GpuPcaScratch` /
 //!   `GpuDeChunkScratch` provide stable pre-grown scratch addresses; the
 //!   stable-buffer prerequisite is already in place.
+//!
+//!   This one is **enforced**, not merely stated: [`capture_graph`] arms
+//!   [`crate::capture_guard`] for the span of the capture, and every device
+//!   allocation, host sync and module load in the crate funnels through
+//!   [`crate::device::GpuDevice`], which checks it. A violation returns
+//!   [`GpuError::CaptureViolation`] naming the operation — where before, CUDA
+//!   invalidated the capture and the only symptom was `end_capture` returning
+//!   no graph, several frames away from the cause.
 //! - Capture MUST run on a non-NULL stream, and specifically on
 //!   `CudaContext::per_thread_stream()`. cudarc's
 //!   `CudaContext::default_stream()` returns the NULL stream (`cu_stream
@@ -70,7 +78,15 @@ where
         .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
         .map_err(|e| GpuError::CudaError(format!("begin_capture: {e}")))?;
 
-    let build_result = build(stream);
+    // Arm the capture contract for exactly the span the driver considers
+    // captured. `capture_guard::enter` mirrors THREAD_LOCAL's scope, and its
+    // guard disarms on `Drop` — so the `build_result?` below, and any panic
+    // inside `build`, cannot leave this thread armed. Scoped to end before
+    // `end_capture`, which is itself a legal call.
+    let build_result = {
+        let _capture_scope = crate::capture_guard::enter();
+        build(stream)
+    };
 
     // `end_capture` requires a `CUgraphInstantiate_flags` enum value;
     // the cuda-12.x enum has no "zero flags" variant, and transmuting
@@ -232,6 +248,75 @@ mod tests {
         stream.synchronize().unwrap();
         let replay = stream.clone_dtoh(&buf_graph).unwrap();
         assert_eq!(direct, replay);
+    }
+
+    /// The capture contract, on real hardware: an allocation inside the
+    /// capture region is refused **by name**, and the thread is left disarmed.
+    ///
+    /// This is the arm the CPU tests in `capture_guard_tests.rs` cannot reach —
+    /// they exercise the state machine, this proves it is actually wired to
+    /// `begin_capture` and to `GpuDevice`. Before the guard, this same code
+    /// returned `Ok(None)`: CUDA invalidated the capture, `end_capture` handed
+    /// back no graph, and the only symptom was Harmony logging "capture
+    /// produced no graph" and running slow for the rest of the call.
+    ///
+    /// Note what is deliberately *not* refused: `test_capture_replay_memset_
+    /// parity` above allocates on the capture stream immediately before
+    /// `capture_graph`, which is legal and must stay legal — the contract is
+    /// about the region, not about the stream.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn an_allocation_inside_a_capture_region_is_refused_by_name() {
+        let dev = require_gpu!();
+        let stream = capturable_stream(&dev);
+        // Kernels inside a capture run on the capture stream, so the device
+        // handle a captured region would hold is this one.
+        let dev_pts = dev.with_stream(stream.clone());
+
+        let err = match capture_graph(&stream, |_s| dev_pts.alloc_zeros::<f32>(16).map(|_| ())) {
+            Err(e) => e,
+            Ok(_) => panic!("an allocation inside the capture region must be refused"),
+        };
+        assert!(
+            matches!(err, GpuError::CaptureViolation(_)),
+            "expected CaptureViolation, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("GpuDevice::alloc_zeros"),
+            "the refused operation must be named: {err}"
+        );
+
+        // The region is over, so the same call must now succeed. A guard that
+        // failed to disarm here would break every later allocation on this
+        // thread, which is a far worse failure than the one it prevents.
+        dev.alloc_zeros::<f32>(16)
+            .expect("the guard must disarm once the capture region ends");
+    }
+
+    /// The other half: a host sync inside the region is refused too, and a
+    /// legal capture on the same stream still works afterwards. Without the
+    /// second half this test would pass against a guard that armed and never
+    /// disarmed.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn a_host_sync_inside_a_capture_region_is_refused_and_a_later_capture_still_works() {
+        let dev = require_gpu!();
+        let stream = capturable_stream(&dev);
+        let dev_pts = dev.with_stream(stream.clone());
+
+        let err = match capture_graph(&stream, |_s| dev_pts.synchronize()) {
+            Err(e) => e,
+            Ok(_) => panic!("a host sync inside the capture region must be refused"),
+        };
+        assert!(
+            err.to_string().contains("GpuDevice::synchronize"),
+            "the refused operation must be named: {err}"
+        );
+
+        let graph = capture_graph(&stream, |_s| Ok(()))
+            .expect("a legal capture after a refused one must still work")
+            .expect("an empty capture yields an empty graph");
+        graph.launch().expect("empty graph replay");
     }
 
     /// `cuda_graphs_enabled()` honours the in-process override (used by

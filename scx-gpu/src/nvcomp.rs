@@ -290,8 +290,7 @@ pub fn batch_decompress_concat(
         }
 
         // Await completion before the guards (and staging buffers) drop.
-        stream
-            .synchronize()
+        dev.synchronize_stream(stream)
             .map_err(|e| GpuError::CudaError(format!("nvcomp stream sync: {e}")))?;
     }
 

@@ -624,7 +624,7 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // use-after-free. Best-effort sync the copy stream before propagating so any
     // outstanding DMA out of the pinned buffers has completed first.
     if scope_result.is_err() {
-        let _ = copy_stream.synchronize();
+        let _ = dev.synchronize_stream(&copy_stream);
     }
     scope_result?;
 

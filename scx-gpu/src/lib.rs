@@ -92,6 +92,9 @@ pub mod test_utils;
 
 pub mod backed_gpu_matrix_source;
 pub mod cast_gpu;
+// `pub(crate)`: the CUDA-graph capture contract. Armed by `gpu_graph`, checked
+// by `device`; CUDA-free so its state machine is testable without a GPU.
+pub(crate) mod capture_guard;
 // `pub(crate)`: the combined-CSR builder every decode path fills. Internal — the
 // public surface is `decode_shard_gpu` / `decode_csr_shards_to_device`.
 pub(crate) mod combined_csr;

@@ -471,6 +471,7 @@ where
         self.pinned[slot].stage(shard)?;
         profile::record_htod_since(CodecClass::Generic, t_stage, csr_htod_bytes(shard));
         self.pinned[slot].upload_to(
+            self.dev,
             self.copy_stream,
             self.slot,
             shard.n_rows(),

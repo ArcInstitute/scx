@@ -519,8 +519,10 @@ fn spmm_impl_view(
         }
     }
     if t_compute.is_some() {
-        stream
-            .synchronize()
+        // Capture-illegal by construction, which is why it goes through the
+        // device: a host sync here under SCX_GPU_PROFILE=1 inside a capture
+        // region used to invalidate the graph silently.
+        dev.synchronize_stream(stream)
             .map_err(|e| GpuError::CudaError(format!("profile spmm synchronize: {e}")))?;
     }
     crate::profile::record_compute_since(t_compute);

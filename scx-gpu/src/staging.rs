@@ -215,13 +215,14 @@ impl PinnedCsrSlot {
     /// expected to already contain a valid shard from `stage()`.
     pub fn upload_to(
         &self,
+        dev: &GpuDevice,
         stream: &Arc<CudaStream>,
         dst: &mut GpuCsrSlot,
         n_rows: usize,
         nnz: usize,
         n_cols: usize,
     ) -> Result<(), GpuError> {
-        dst.ensure_capacity(stream, n_rows + 1, nnz)?;
+        dst.ensure_capacity(dev, stream, n_rows + 1, nnz)?;
 
         macro_rules! upload {
             ($src:expr, $dst:expr, $len:expr) => {{
@@ -545,29 +546,24 @@ impl GpuCsrSlot {
     /// buffers have different device pointers).
     pub fn ensure_capacity(
         &mut self,
+        dev: &GpuDevice,
         stream: &Arc<CudaStream>,
         indptr_len: usize,
         nnz: usize,
     ) -> Result<(), GpuError> {
         if self.indptr.len() < indptr_len {
             let new_cap = indptr_len.next_power_of_two();
-            self.indptr = stream
-                .alloc_zeros::<i64>(new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow indptr: {e}")))?;
+            self.indptr = dev.alloc_zeros_on::<i64>(stream, new_cap)?;
             self.cached_desc = None;
         }
         if self.indices.len() < nnz {
             let new_cap = nnz.next_power_of_two();
-            self.indices = stream
-                .alloc_zeros::<i32>(new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow indices: {e}")))?;
+            self.indices = dev.alloc_zeros_on::<i32>(stream, new_cap)?;
             self.cached_desc = None;
         }
         if self.data.len() < nnz {
             let new_cap = nnz.next_power_of_two();
-            self.data = stream
-                .alloc_zeros::<f32>(new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow data: {e}")))?;
+            self.data = dev.alloc_zeros_on::<f32>(stream, new_cap)?;
             self.cached_desc = None;
         }
         Ok(())
@@ -863,7 +859,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         host.stage(&csr).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 4, 6, 8).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 4, 6, 8)
+            .unwrap();
         dev.synchronize().unwrap();
 
         assert_eq!(slot.shape(), (4, 8));
@@ -901,7 +898,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         host.stage(&csr).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 4, 6, 8).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 4, 6, 8)
+            .unwrap();
 
         assert!(!slot.has_cached_descr());
         let p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
@@ -933,7 +931,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
         );
         host.stage(&csr_a).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 3, 5, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 3, 5, 5)
+            .unwrap();
         let _p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
         assert!(slot.has_cached_descr());
 
@@ -945,7 +944,8 @@ mod tests {
             vec![10.0f32, 11.0, 12.0, 13.0],
         );
         host.stage(&csr_b).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 3, 4, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 3, 4, 5)
+            .unwrap();
         assert!(
             !slot.has_cached_descr(),
             "nnz change must invalidate descr cache even when n_rows/n_cols are unchanged"
@@ -967,7 +967,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
         );
         host.stage(&csr_a).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 3, 5, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 3, 5, 5)
+            .unwrap();
         let p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
         assert!(slot.has_cached_descr());
 
@@ -979,7 +980,8 @@ mod tests {
             vec![10.0f32, 11.0, 12.0, 13.0],
         );
         host.stage(&csr_b).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 4, 4, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 4, 4, 5)
+            .unwrap();
         // Cache should have been invalidated by the shape change.
         assert!(
             !slot.has_cached_descr(),
