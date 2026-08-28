@@ -25,7 +25,7 @@
 use pyo3::exceptions::PyModuleNotFoundError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyModule, PyString};
+use pyo3::types::{IntoPyDict, PyModule, PyString};
 
 /// Import `name`, immune to the calling frame's (possibly restricted)
 /// builtins. Drop-in replacement for `py.import(name)`.
@@ -64,10 +64,21 @@ pub fn import_module<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, Py
         Some(module) => Ok(module),
         // The import "succeeded" but the leaf is absent from sys.modules —
         // e.g. `pkg` imported fine but never registers `pkg.sub`. The real
-        // `__import__` raises ModuleNotFoundError here too.
-        None => Err(PyModuleNotFoundError::new_err(format!(
-            "No module named '{name}'"
-        ))),
+        // `__import__` raises ModuleNotFoundError here too — WITH its `.name`
+        // attribute set, which `pyscx::optional_deps::is_missing_module` keys
+        // on to rewrite "not installed" errors. `new_err(msg)` alone would
+        // leave `.name` as None and silently fork that behaviour (found in
+        // review, PR #471), so construct the exception with the kwarg.
+        None => {
+            let exc = py
+                .get_type::<PyModuleNotFoundError>()
+                .call(
+                    (format!("No module named '{name}'"),),
+                    Some(&[("name", name)].into_py_dict(py)?),
+                )?
+                .unbind();
+            Err(PyErr::from_value(exc.into_bound(py)))
+        }
     }
 }
 
@@ -92,5 +103,27 @@ fn sys_modules_get<'py>(
         // `ImportError: import of X halted; None in sys.modules`.
         return Ok(None);
     }
+    // A module can sit in sys.modules while another thread is still executing
+    // its body (`__spec__._initializing`). Real import semantics block on the
+    // per-module lock until initialization finishes; handing the entry out
+    // here would let a concurrent first import of a big optional stack
+    // (scanpy, CuPy, rapids) observe a half-initialized module and die with a
+    // misleading AttributeError (found in review, PR #471). Fall through to
+    // the core import, which honors the lock.
+    if module_is_initializing(&module) {
+        return Ok(None);
+    }
     Ok(Some(module.cast_into::<PyModule>()?))
+}
+
+/// `module.__spec__._initializing`, defaulting to false when either
+/// attribute is missing or unreadable.
+fn module_is_initializing(module: &Bound<'_, PyAny>) -> bool {
+    module
+        .getattr("__spec__")
+        .ok()
+        .filter(|spec| !spec.is_none())
+        .and_then(|spec| spec.getattr("_initializing").ok())
+        .and_then(|v| v.extract::<bool>().ok())
+        .unwrap_or(false)
 }

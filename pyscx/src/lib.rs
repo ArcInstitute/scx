@@ -1217,9 +1217,6 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
-    // Test-only: exercises the frame-insensitive import helper from
-    // restricted-exec globals (test_sandbox_exec.py).
-    m.add_function(wrap_pyfunction!(pyimport::_sandbox_import_probe, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     #[cfg(feature = "hdf5")]
     m.add_function(wrap_pyfunction!(from_h5ad, m)?)?;

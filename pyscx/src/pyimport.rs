@@ -14,7 +14,6 @@
 //! `pyscx/tests/test_sandbox_exec.py`.
 
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
 
 pub(crate) use scx_loader::pyimport::import_module;
 
@@ -34,13 +33,12 @@ pub(crate) fn dtype_name_of(obj: &Bound<'_, PyAny>) -> PyResult<String> {
         .extract()
 }
 
-/// Test-only hook so `test_sandbox_exec.py` can exercise both branches of
-/// [`import_module`] (a `sys.modules` hit and the core-import fallback) from
-/// inside restricted-exec globals. Not public API.
-#[pyfunction]
-pub(crate) fn _sandbox_import_probe<'py>(
-    py: Python<'py>,
-    name: &str,
-) -> PyResult<Bound<'py, PyModule>> {
-    import_module(py, name)
-}
+// NOTE: no `_sandbox_import_probe` pyfunction here, deliberately. An earlier
+// revision registered one on the production module so tests could call the
+// helper directly — and a probe that imports an arbitrary module name IS an
+// `__import__` replacement, handed to exactly the sandboxed code this crate
+// promises to contain (`pyscx.pyscx._sandbox_import_probe("os")` worked from
+// inside the restricted frame; found in review, PR #471). The helper's two
+// branches are instead covered through real entry points in
+// `test_sandbox_exec.py`, by evicting a lazily-imported module from
+// `sys.modules` before the sandboxed call.

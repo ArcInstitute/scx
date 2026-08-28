@@ -927,15 +927,23 @@ pre-injected). This is a maintained guarantee, not an accident:
   A workspace `clippy.toml` `disallowed-methods` entry rejects bare
   `Python::import` / `PyModule::import`.
 - Third-party lazy imports are handled too: rust-numpy's C-API and
-  borrow-capsule inits are primed at `import pyscx` time, and dtype-name
-  reads (numpy re-imports `numpy._core._dtype` on **every** `dtype.name` /
-  `str(dtype)`) route through the pure-Python trampoline
-  `pyscx._frame_safe`, whose frame carries real builtins.
+  borrow-capsule inits are primed at `import pyscx` time. numpy re-imports
+  `numpy._core._dtype` on **every** `dtype.name` / `str(dtype)` /
+  `repr(dtype)`, so pyscx never stringifies a dtype on a native path: the
+  write-path dtype-name reads route through the pure-Python trampoline
+  `pyscx._frame_safe.dtype_name` (whose frame carries real builtins), and
+  the backed/lazy `__getitem__` selector paths read `dtype.kind`, a plain C
+  descriptor that triggers no import.
 
 Covered surfaces (regression-tested in `pyscx/tests/test_sandbox_exec.py`,
 which runs each one inside `exec(code, {"__builtins__": <no __import__>})`):
 `pyscx.write`, the native `pyscx.pyscx.from_anndata`, `pyscx.obs_import`,
-`pyscx.modify_metadata` / `pyscx.set_uns`, and `open(...).to_anndata()`.
+`pyscx.modify_metadata` (with an obs replacement) / `pyscx.set_uns`,
+`open(...).to_anndata()` eager and `backed=True`, boolean-mask and
+integer-array indexing on backed and lazy `X`, and the import helper's
+core-import fallback (via `sys.modules` eviction — there is deliberately no
+importable probe hook, since an arbitrary-name importer on the module would
+re-create the `__import__` the sandbox removed).
 Note that numpy itself is *not* sandbox-safe (`str(x.dtype)` in step code
 will still raise); the guarantee covers pyscx's own entry points.
 

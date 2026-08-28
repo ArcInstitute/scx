@@ -153,35 +153,82 @@ def test_set_uns_and_modify_metadata_under_restricted_exec(
     exp = pyscx.open(path)
     assert exp.read_uns()["sandboxed"] is True
 
+    # modify_metadata too — with an actual obs replacement, so the
+    # pandas/pyarrow interop path runs inside the sandbox (an earlier
+    # revision claimed this entry point was covered while only set_uns was
+    # called; found in review, PR #471).
+    obs = pyscx.open(path).read_obs()
+    obs["sandbox_flag"] = np.arange(len(obs), dtype=np.int32)
+    run_sandboxed(
+        "pyscx.modify_metadata(path, obs=obs)",
+        pyscx=pyscx,
+        path=path,
+        obs=obs,
+    )
+    assert "sandbox_flag" in pyscx.open(path).read_obs().columns
 
-def test_sandbox_import_probe_both_branches(tmp_path):
-    """Unit-test the Rust helper's two branches through the probe hook.
 
-    Branch 1 (sys.modules hit): numpy is already imported.
-    Branch 2 (core-import fallback): a stdlib module we evict from
-    sys.modules first — the fallback must import it without consulting the
-    restricted frame's builtins.
+def test_backed_and_lazy_fancy_indexing_under_restricted_exec(
+    sandbox_env, synthetic_adata
+):
+    """Boolean-mask and integer-array __getitem__ on backed / lazy X.
+
+    These selector paths stringified the numpy dtype (`str(dtype)`), which
+    makes numpy's C code import `numpy._core._dtype` through the
+    frame-sensitive path on every call — reproduced as KeyError:
+    '__import__' by review on PR #471. They now read `dtype.kind` instead.
+    """
+    path = sandbox_env["outputs"]["result"]
+    pyscx.write(synthetic_adata, path)
+    mask = np.zeros(synthetic_adata.n_obs, dtype=bool)
+    mask[:7] = True
+    glb = run_sandboxed(
+        # normalize_total on a backed AnnData swaps X for the lazy dataset
+        # in place, so backed.X exercises ScxBackedSparseDataset first and
+        # ScxLazyTransformedDataset after.
+        "backed = pyscx.open(path).to_anndata(backed=True)\n"
+        "sub_mask = backed.X[mask]\n"
+        "sub_list = backed.X[[0, 3, 5]]\n"
+        "pyscx.accel.normalize_total(backed, target_sum=10000.0)\n"
+        "lazy_list = backed.X[[1, 2]]\n"
+        "shapes = (sub_mask.shape, sub_list.shape, lazy_list.shape)",
+        pyscx=pyscx,
+        path=path,
+        mask=mask,
+    )
+    n_vars = synthetic_adata.n_vars
+    assert glb["shapes"] == ((7, n_vars), (3, n_vars), (2, n_vars))
+
+
+def test_core_import_fallback_under_restricted_exec(sandbox_env, synthetic_adata):
+    """The helper's core-import fallback branch, driven through real entry
+    points (there is deliberately no importable probe hook — an
+    arbitrary-name importer on the production module would BE the
+    `__import__` the sandbox removed; found in review, PR #471).
+
+    Evicting a lazily-imported module from sys.modules forces the next
+    sandboxed call through `PyImport_ImportModuleLevelObject`:
+    `pyscx._frame_safe` (dotted, package child — also proves leaf-module
+    semantics: the write only succeeds if the leaf came back) and
+    `scipy.sparse` (dotted, third-party) both re-import from inside the
+    restricted frame.
     """
     import sys
 
-    probe = pyscx.pyscx._sandbox_import_probe
+    path = sandbox_env["outputs"]["result"]
 
-    # Branch 1: already-imported module resolves from sys.modules.
-    glb = run_sandboxed("m = probe('numpy')", probe=probe)
-    assert glb["m"] is np or glb["m"].__name__ == "numpy"
+    sys.modules.pop("pyscx._frame_safe", None)
+    run_sandboxed(
+        "pyscx.pyscx.from_anndata(adata, outputs['result'])", **sandbox_env
+    )
+    assert pyscx.validate(path)
+    assert "pyscx._frame_safe" in sys.modules
 
-    # Branch 2: evict a small, safely re-importable stdlib module. `colorsys`
-    # is dependency-free and nothing in pyscx or the test stack holds it.
-    sys.modules.pop("colorsys", None)
-    glb = run_sandboxed("m = probe('colorsys')", probe=probe)
-    assert glb["m"].__name__ == "colorsys"
-    assert "colorsys" in sys.modules
-
-    # Dotted names return the leaf module (importlib.import_module
-    # semantics), matching what py.import gave callers before.
-    glb = run_sandboxed("m = probe('scipy.sparse')", probe=probe)
-    assert glb["m"].__name__ == "scipy.sparse"
-
-    # A missing module raises ModuleNotFoundError, not KeyError.
-    with pytest.raises(ModuleNotFoundError):
-        run_sandboxed("probe('pyscx_no_such_module')", probe=probe)
+    sys.modules.pop("scipy.sparse", None)
+    glb = run_sandboxed(
+        "result = pyscx.open(path).to_anndata()\nn = result.n_obs",
+        pyscx=pyscx,
+        path=path,
+    )
+    assert glb["n"] == synthetic_adata.n_obs
+    assert "scipy.sparse" in sys.modules
