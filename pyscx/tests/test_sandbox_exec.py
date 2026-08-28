@@ -190,14 +190,15 @@ def test_backed_and_lazy_fancy_indexing_under_restricted_exec(
         "sub_mask = backed.X[mask]\n"
         "sub_list = backed.X[[0, 3, 5]]\n"
         "pyscx.accel.normalize_total(backed, target_sum=10000.0)\n"
+        "lazy_mask = backed.X[mask]\n"
         "lazy_list = backed.X[[1, 2]]\n"
-        "shapes = (sub_mask.shape, sub_list.shape, lazy_list.shape)",
+        "shapes = (sub_mask.shape, sub_list.shape, lazy_mask.shape, lazy_list.shape)",
         pyscx=pyscx,
         path=path,
         mask=mask,
     )
     n_vars = synthetic_adata.n_vars
-    assert glb["shapes"] == ((7, n_vars), (3, n_vars), (2, n_vars))
+    assert glb["shapes"] == ((7, n_vars), (3, n_vars), (7, n_vars), (2, n_vars))
 
 
 def test_core_import_fallback_under_restricted_exec(sandbox_env, synthetic_adata):
@@ -224,11 +225,20 @@ def test_core_import_fallback_under_restricted_exec(sandbox_env, synthetic_adata
     assert pyscx.validate(path)
     assert "pyscx._frame_safe" in sys.modules
 
-    sys.modules.pop("scipy.sparse", None)
-    glb = run_sandboxed(
-        "result = pyscx.open(path).to_anndata()\nn = result.n_obs",
-        pyscx=pyscx,
-        path=path,
-    )
-    assert glb["n"] == synthetic_adata.n_obs
-    assert "scipy.sparse" in sys.modules
+    # The pop is process-global: other test modules imported at collection
+    # hold the original module object as a type-identity oracle
+    # (`isinstance(x, sp.csr_matrix)`), and a raise before the re-import
+    # would leave scipy.sparse missing for the rest of the session. Restore
+    # the original object no matter what happens inside the sandbox.
+    orig_scipy_sparse = sys.modules.pop("scipy.sparse", None)
+    try:
+        glb = run_sandboxed(
+            "result = pyscx.open(path).to_anndata()\nn = result.n_obs",
+            pyscx=pyscx,
+            path=path,
+        )
+        assert glb["n"] == synthetic_adata.n_obs
+        assert "scipy.sparse" in sys.modules
+    finally:
+        if orig_scipy_sparse is not None:
+            sys.modules["scipy.sparse"] = orig_scipy_sparse
