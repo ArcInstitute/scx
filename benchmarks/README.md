@@ -1690,6 +1690,59 @@ violation, `2` pre-flight failure / missing inputs.
 - Filters cross-products so `accel_<bench>` only pairs with
   `accel_<bench>__*` formats (one accel module never schedules another
   module's variants).
+- Exports the **arm knob** a variant names, into the worker's shell
+  before the process starts (`_FORMAT_ARM_ENV` /`_arm_env_exports`). Two
+  variants select their code path with an environment variable rather
+  than an argument, and one of those variables is read once per process
+  — see below.
+
+### Arm variants: measuring a path a default run does not take
+
+Three GPU variants exist to reach code a default gate run never
+executes. Each records a **label** in `runs[].extra` saying which arm
+actually ran, and `thresholds.yaml` floors that label in *both*
+directions — so a run that silently took the other arm fails rather
+than reporting the wrong arm's number under the right arm's name.
+
+| variant | arm knob | label metric | floors |
+|---|---|---|---|
+| `accel_to_gpu_anndata__shufdelta_gpu` | — (fixture is `--codec shufdelta`) | `shufdelta_fully_device_decoded` | `max 0.0` |
+| `accel_to_gpu_anndata__shufdelta_gpu_nvcomp` | `SCX_SHUFDELTA_NVCOMP=1` | `shufdelta_fully_device_decoded` | `min 1.0` |
+| `accel_pca__pyscx_gpu_rand_hh` | — (residency is automatic) | `pca_resident_csr` | `min 1.0` |
+| `accel_pca__pyscx_gpu_streaming` | `SCX_GPU_PCA_RESIDENT=0` | `pca_resident_csr` | `max 0.0` |
+
+Two things about this are easy to get wrong:
+
+1. **An env var is not enough to select the ShufDeltaZstd arms.** The
+   decode path is a property of the *file*: Scx1 shards never enter the
+   ShufDeltaZstd paths at all, so `SCX_SHUFDELTA_NVCOMP=1` against the
+   `__scx1_gpu` variant is a no-op. The two shufdelta arms prepare their
+   fixture with `scx optimize --codec shufdelta --row-group-rows 256`.
+2. **`SCX_GPU_PCA_RESIDENT` is read once per process** (a deliberate
+   `OnceLock`, mirrored by `pyscx/tests/test_gpu_pca_resident.py` running
+   its arms as subprocesses). Setting it inside the benchmark module is
+   not sufficient on its own, which is why `run_parallel.py` exports it
+   into the worker's shell.
+
+Running the arms:
+
+```bash
+# The GPU data-load arms (ShufDeltaZstd pipelined vs nvcomp).
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only \
+    --benchmarks accel_to_gpu_anndata \
+    --datasets pbmc3k tabula_sapiens_100k
+
+# The GPU PCA arms (device-resident vs streaming power loop).
+python benchmarks/comprehensive/scripts/gate_candidate.py --accel-only \
+    --benchmarks accel_pca --datasets pbmc3k tabula_sapiens_100k
+```
+
+Reading the result: a **new** variant has no rows in `LATEST`, so
+`compare_against_baseline.py` treats it as an appearing benchmark and
+reports it informationally. A gate over these arms therefore checks
+**absolute floors only** and says nothing about regressions — quote the
+`[baseline] archived N result files` line and confirm every
+(variant × dataset) cell ran before drawing any conclusion.
 
 ### Promoting a new baseline
 

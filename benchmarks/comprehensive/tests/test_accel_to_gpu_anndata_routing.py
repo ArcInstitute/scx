@@ -10,7 +10,10 @@ Hermetic — no GPU, no datasets read, no submitit. Asserts:
     `accel_to_gpu_anndata__*` only (and isolates it from other accel
     benchmarks / non-accel benches).
   * `_env_for_format` routes the GPU variant to `scx-bench-gpu`.
-  * `SUPPORTED_DATASETS` is scoped to pbmc3k + tabula_sapiens_100k.
+  * `SUPPORTED_DATASETS` matches the scx1 arm's declared dataset set.
+
+The arm-specific assertions (three variants, per-arm fixture/codec/env) live in
+`test_gpu_arm_labels.py`.
 """
 
 from __future__ import annotations
@@ -56,9 +59,21 @@ def test_gpu_variant_routes_to_gpu_env():
     assert _env_for_format(_VARIANT_KEY) == "scx-bench-gpu"
 
 
-def test_supported_datasets_scoped_to_gate_tiers():
+def test_supported_datasets_is_the_scx1_arms_scope():
+    """`SUPPORTED_DATASETS` and the scx1 arm's `datasets` are the same object.
+
+    This assertion used to pin the pair {pbmc3k, tabula_sapiens_100k} and had
+    been failing on `main` since the set was widened to the census tiers — a
+    stale test asserting a scope the code had already left. Pinning the literal
+    again would just re-arm the same trap, so it now pins the *relationship*
+    that has to hold: `run()` scopes each arm by `arm.datasets`, and the scx1
+    arm's is the module-level set the rest of the suite reads.
+    """
     from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import (
+        ARMS,
         SUPPORTED_DATASETS,
     )
 
-    assert SUPPORTED_DATASETS == frozenset({"pbmc3k", "tabula_sapiens_100k"})
+    assert ARMS[_VARIANT_KEY].datasets == SUPPORTED_DATASETS
+    # The gate tiers are in scope whatever else has been added.
+    assert {"pbmc3k", "tabula_sapiens_100k"} <= SUPPORTED_DATASETS
