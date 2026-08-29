@@ -272,8 +272,7 @@ def main() -> int:
         "default_matches_off": premises["the default agrees with the explicit False"],
         "premises": premises,
         "provenance": {
-            "loader_commit": _git_rev("scx-loader/src/python.rs"),
-            "driver_commit": _git_rev(str(Path(__file__).relative_to(REPO_ROOT))),
+            **_checkout_provenance(),
             "hostname": os.uname().nodename,
             "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
             "slurm_partition": os.environ.get("SLURM_JOB_PARTITION"),
