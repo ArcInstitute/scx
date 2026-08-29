@@ -1085,3 +1085,117 @@ class TestCloseAndTeardown:
         # The bound is `SHUTDOWN_DEADLINE` (5 s) plus slack; a hang or a
         # missing `shutdown_timeout` is what this catches, not latency.
         assert elapsed < 10.0, f"mid-flight teardown took {elapsed:.2f}s"
+
+
+class TestGilDuringTeardown:
+    """ORG-9.10-6: `IndexPlanDataset` teardown must release the GIL.
+
+    `IndexPlanDataset::close` / `Drop` and `IndexPlanBatchIter::drop` all wrap
+    the runtime teardown in `Python::attach(|py| py.detach(...))` precisely so
+    the rest of the interpreter keeps running while already-started
+    `spawn_blocking` shard decodes finish (§9.3). Nothing asserted it —
+    `TestTeardownOrdering::test_teardown_mid_flight_is_bounded` says so in its
+    own docstring, and it is right that a *duration* threshold cannot see the
+    property: the whole teardown is single-digit milliseconds.
+
+    What is measurable is whether another Python thread ran **at all** during
+    that window. With the switch interval dropped to 100 us, a few milliseconds
+    of detached teardown gives a spinning thread tens of acquisitions; a
+    teardown holding the GIL gives it exactly zero. That is a ratio, not a
+    margin, so it does not need a tuned threshold — and the premise (the
+    teardown was long enough to be observable at all) is asserted rather than
+    assumed, so the test skips instead of passing vacuously.
+    """
+
+    @staticmethod
+    def _write_prefetch_fixture(path, *, n_obs=30000, n_vars=800, n_shards=4):
+        import anndata as ad
+        import scipy.sparse as sp
+
+        X = sp.random(n_obs, n_vars, density=0.05, format="csr", random_state=0)
+        X.data = np.round(X.data * 10 + 1).astype(np.float32)
+        adata = ad.AnnData(X=X)
+        adata.obs["cell_id"] = [f"c{i}" for i in range(n_obs)]
+        # Unframed: a framed shard is block-index eligible, and the prefetch
+        # deliberately skips warming those — so there would be no in-flight
+        # decode to tear down and nothing to observe.
+        pyscx.from_anndata(
+            adata, path, shard_size=n_obs // n_shards, row_group_rows=0
+        )
+        return n_obs
+
+    def test_teardown_with_prefetches_in_flight_releases_the_gil(self, tmp_path):
+        import sys
+        import threading
+        import time
+
+        path = str(tmp_path / "gil_teardown.scx")
+        n_obs = self._write_prefetch_fixture(path)
+
+        ds = pyscx.IndexPlanDataset(
+            path,
+            normalize=False,
+            log1p=False,
+            obs_columns=[],
+            cache_shards=8,
+            lookahead=8,
+            scatter_block_index=False,
+        )
+        # Every plan lands in a different shard, so the lookahead queue holds
+        # several distinct `read_shard_cached_arc` tasks at once.
+        step = n_obs // 8
+        plans = [[(i * step, (i * step) + 1)] for i in range(8)]
+        it = ds.iter_with_plans(iter(plans), lookahead=8)
+        next(it)  # runtime built; the remaining plans' prefetches are in flight
+
+        ticks = []
+        stop = threading.Event()
+
+        def ticker():
+            while not stop.is_set():
+                ticks.append(time.perf_counter())
+
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(0.0001)
+        worker = threading.Thread(target=ticker, daemon=True)
+        worker.start()
+        try:
+            # Let the ticker prove it is running before the window opens.
+            deadline = time.perf_counter() + 2.0
+            while not ticks and time.perf_counter() < deadline:
+                time.sleep(0.001)
+            assert ticks, "premise: the ticker thread never ran"
+
+            del ds  # not the last reference — `it` still holds one
+            t0 = time.perf_counter()
+            del it  # this is the drop that tears the runtime down
+            t1 = time.perf_counter()
+            # Let the ticker run past the window so `ticks[-1] > t1` can act as
+            # a liveness premise: a ticker that died mid-window would otherwise
+            # look exactly like a GIL that was never released.
+            time.sleep(0.005)
+        finally:
+            stop.set()
+            worker.join(timeout=5)
+            sys.setswitchinterval(old_interval)
+
+        # Count by *timestamp*, not by a `len(ticks)` delta taken around the
+        # window. The delta is racy in the direction that hides the bug: between
+        # `t1` and reading `len(ticks)` the main thread can be preempted for a
+        # switch interval, during which the ticker appends thousands of entries.
+        # Measured that way a teardown that held the GIL for its entire 1 ms
+        # still scored ~1500 "ticks during", i.e. it passed on broken code.
+        during = sum(1 for t in ticks if t0 <= t <= t1)
+        teardown_s = t1 - t0
+
+        assert ticks[-1] > t1, "premise: the ticker must outlive the window"
+        if teardown_s < 2e-4:
+            pytest.skip(
+                f"teardown took {teardown_s * 1e3:.3f} ms — too short for another "
+                "thread to be scheduled, so this run cannot distinguish a "
+                "GIL-holding teardown from a GIL-releasing one"
+            )
+        assert during > 0, (
+            f"no other Python thread ran during a {teardown_s * 1e3:.2f} ms "
+            "teardown — the GIL was held for its whole duration"
+        )

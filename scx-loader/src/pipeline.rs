@@ -2414,4 +2414,127 @@ mod tests {
         // Drop — must not panic or deadlock
         drop(pipeline);
     }
+    // -----------------------------------------------------------------------
+    // ORG-9.10-6 / §9.7 — what a mid-epoch `break` does and does not release.
+    //
+    // The review asks for a test that "a mid-epoch `break` releases the ring".
+    // It does not, and §9.7 is still open: nothing observes that the consumer
+    // stopped, so `batch_rx` stays `Some`, the decode thread stays parked in
+    // `tx.send` and the I/O thread behind it, holding the full high-water
+    // allocation for as long as the object lives. These two tests pin what is
+    // actually true on both sides of that line, so the §9.7 fix has a stated
+    // baseline to invert rather than a blank page.
+    // -----------------------------------------------------------------------
+
+    /// `shutdown()` is the escape: it drops the batch receiver, joins both
+    /// worker threads within the bounded deadline, and releases the rayon pool.
+    #[test]
+    fn shutdown_after_a_mid_epoch_break_releases_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        // 40 shards at `shard_group_size = 2` → 20 shard groups against an
+        // io→decode channel of capacity 2, so the I/O worker is genuinely
+        // back-pressured rather than finished. With the 5-shard/`sgs = 8`
+        // fixtures used elsewhere in this module there is exactly one group and
+        // the I/O thread exits immediately — which is why §9.7's "both worker
+        // threads" claim needs a fixture that can actually show it.
+        let path = write_test_file(&dir, "test.scx", 400, 10, 40);
+
+        let config = LoaderConfig {
+            batch_size: 5,
+            shard_group_size: 2,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+        let mut pipeline = TrainingPipeline::new(&path, config).unwrap();
+        pipeline.start_epoch().unwrap();
+
+        // Two of 80 batches, then stop consuming — the Python `break`.
+        let _ = pipeline.next_batch().unwrap().expect("first batch");
+        let _ = pipeline.next_batch().unwrap().expect("second batch");
+        assert!(
+            pipeline.decode_handle.is_some(),
+            "premise: the epoch must still be live before shutdown"
+        );
+
+        pipeline.shutdown();
+
+        assert!(
+            pipeline.batch_rx.is_none(),
+            "shutdown must drop the batch receiver — that is what unblocks the \
+             decode stage's parked `tx.send`"
+        );
+        assert!(
+            pipeline.io_handle.is_none() && pipeline.decode_handle.is_none(),
+            "shutdown must join (and clear) both worker handles"
+        );
+        assert!(
+            pipeline.decode_pool.is_none(),
+            "shutdown must release the per-pipeline rayon pool"
+        );
+
+        // Idempotent, per its doc comment.
+        pipeline.shutdown();
+    }
+
+    /// **§9.7, pinned as it stands.** A `break` on its own releases nothing:
+    /// the ring, both worker threads and the rayon pool are all still held.
+    ///
+    /// This test states the defect, not the desired behaviour. **When §9.7 is
+    /// fixed — by splitting the epoch iterator out of the dataset so dropping
+    /// the iterator drops the epoch — this test is expected to fail, and the
+    /// fix should invert it rather than delete it.**
+    #[test]
+    fn a_break_alone_does_not_release_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        // 40 shards at `shard_group_size = 2` → 20 shard groups against an
+        // io→decode channel of capacity 2, so the I/O worker is genuinely
+        // back-pressured rather than finished. With the 5-shard/`sgs = 8`
+        // fixtures used elsewhere in this module there is exactly one group and
+        // the I/O thread exits immediately — which is why §9.7's "both worker
+        // threads" claim needs a fixture that can actually show it.
+        let path = write_test_file(&dir, "test.scx", 400, 10, 40);
+
+        let config = LoaderConfig {
+            batch_size: 5,
+            shard_group_size: 2,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+        let mut pipeline = TrainingPipeline::new(&path, config).unwrap();
+        pipeline.start_epoch().unwrap();
+
+        let _ = pipeline.next_batch().unwrap().expect("first batch");
+        let _ = pipeline.next_batch().unwrap().expect("second batch");
+        // ... and now the consumer walks away.
+
+        assert!(
+            pipeline.batch_rx.is_some(),
+            "§9.7: the batch ring is still held after a mid-epoch break"
+        );
+        assert!(
+            pipeline.decode_pool.is_some(),
+            "§9.7: the rayon pool is still held after a mid-epoch break"
+        );
+
+        let decode = pipeline
+            .decode_handle
+            .as_ref()
+            .expect("§9.7: the decode worker handle is still held");
+        let io = pipeline
+            .io_handle
+            .as_ref()
+            .expect("§9.7: the I/O worker handle is still held");
+        assert!(
+            !decode.is_finished(),
+            "§9.7: the decode worker is still alive — parked in `tx.send` against \
+             a ring nobody is draining, not exited"
+        );
+        assert!(
+            !io.is_finished(),
+            "§9.7: the I/O worker is still alive, back-pressured behind the decode \
+             stage"
+        );
+    }
 }
