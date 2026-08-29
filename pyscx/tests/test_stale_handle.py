@@ -288,6 +288,10 @@ def test_mark_deleted_through_the_handle_does_not_strand_it(tmp_path):
                                                               source_key="barcode",
                                                               score_column="score"),
                      id="doublet_import"),
+        pytest.param(lambda p, exp, csv: pyscx.attach_obs_columns(
+                         exp, pd.DataFrame({"s": [1.0, 2.0, 3.0, 4.0]}),
+                         positional=True),
+                     id="attach_obs_columns"),
     ],
 )
 def test_mutating_through_a_handle_leaves_it_usable(tmp_path, call):

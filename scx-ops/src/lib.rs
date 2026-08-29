@@ -51,7 +51,7 @@ pub use external_layer::{
     ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
 };
 pub use external_obs::{
-    attach_external_obs, build_composite_key, diagnose_obs_key, obs_key_values,
+    attach_external_obs, build_composite_key, diagnose_obs_key, drop_batch_columns, obs_key_values,
     resolve_obs_key_column, AttachObsOptions, AttachObsSummary, ExternalObsData, KeyDiagnosis,
     ObsJoinKey, ObsRewrite, COMPOSITE_KEY_SEPARATOR,
 };

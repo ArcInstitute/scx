@@ -730,8 +730,8 @@ defaults to 4 GiB when no budget is given.
 Some ops are bounded structurally rather than by a `memory_budget=`, because
 there is nothing to trade off — they stream, or they do not.
 
-`pyscx.obs_import` / `doublet_import` / `cellbender_import` (and their `scx`
-subcommands) rewrite the target's `obs` **one shard at a time** whenever the
+`pyscx.obs_import` / `attach_obs_columns` / `doublet_import` / `cellbender_import`
+(and their `scx` subcommands) rewrite the target's `obs` **one shard at a time** whenever the
 target's obs is sharded — anything `from_anndata` wrote above
 `shard_target_rows`, and anything `merge` or `append` produced. Peak is one obs
 shard plus one row index and one key string per target cell, so landing a
@@ -938,6 +938,7 @@ pre-injected). This is a maintained guarantee, not an accident:
 Covered surfaces (regression-tested in `pyscx/tests/test_sandbox_exec.py`,
 which runs each one inside `exec(code, {"__builtins__": <no __import__>})`):
 `pyscx.write`, the native `pyscx.pyscx.from_anndata`, `pyscx.obs_import`,
+`pyscx.attach_obs_columns` (a positional DataFrame attach),
 `pyscx.modify_metadata` (with an obs replacement) / `pyscx.set_uns`,
 `open(...).to_anndata()` eager and `backed=True`, boolean-mask and
 integer-array indexing on backed and lazy `X`, and the import helper's
@@ -1620,6 +1621,31 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   whole — see [Ops that bound themselves without a budget knob](#ops-that-bound-themselves-without-a-budget-knob).
   Undone by `pyscx.rollback`. See
   [docs/operations.md § External obs import](operations.md#external-obs-import).
+- `pyscx.attach_obs_columns(path, df, *, key=None, positional=False, status_column=None, uns=None, uns_key=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` —
+  The DataFrame twin of `obs_import`, on the same `attach_external_obs` seam:
+  land an in-memory pandas `DataFrame` (or pyarrow `Table`) as obs columns, in
+  place, without writing a temp CSV or replacing the whole frame through
+  `modify_metadata`. Key-joined by default — `key=None` resolves each side
+  independently, exactly as `obs_import` with no `key=` (the source uses `df`'s
+  index, named or not, then the barcode-style fallbacks; the target its own obs
+  index / fallbacks); a str names one column (matched to the **same name** on
+  the target, as rscx's `scx_attach_obs`), a list builds a composite; key
+  columns and the pandas index are consumed by the join, not re-imported. `positional=True` (mutually exclusive with `key`)
+  skips the join: row `i` annotates **physical** obs row `i`, for frames
+  computed in-process from this file's own `read_obs()` — never for external
+  tool output — and requires exactly `n_obs_physical` rows; `status_column` is
+  rejected there. `uns=`/`uns_key=` (which go together) merge one payload under
+  one `uns` key in the same commit, leaving the rest of `uns` byte-identical,
+  so one `pyscx.rollback` undoes obs and uns together. Same policies, summary
+  dict and index behaviour as `obs_import` (`obs_key_column` is
+  `"<positional>"` under positional; a pure add keeps the predicate index).
+  Ungated (no libhdf5). This is `doublet_consensus`'s first-run write path
+  (its overwriting re-runs take `modify_metadata` — see below). Known
+  limitation, shared with every in-place obs edit (`modify_metadata(obs=…)`
+  included; only `from_anndata`'s writer preserves it): a pandas categorical
+  column is attached as plain strings — the category list and `ordered` bit do
+  not survive; re-derive with `.astype("category")` after reading, or land
+  categoricals through `from_anndata`.
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
   `unique_columns`, `unusable_unique_columns`, `unique_pairs` (two-column
@@ -1686,10 +1712,17 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   consensus key explicitly in `keys` is still allowed (combining two disjoint
   tool panels is coherent) but warns, and is recorded in the returned
   `keys_that_are_consensus`; `keys_excluded` records what discovery skipped. On
-  a file target the write goes through `modify_metadata`, so the file's obs
-  predicate index is **carried forward** — `index_obs` / `index_preset` are for
-  changing the indexed column set, not for restoring it. Pure Python — nothing
-  in it knows what a doublet is.
+  a file target a **first run** writes through
+  `attach_obs_columns(positional=True)` — a pure column add plus a one-key uns
+  merge in one commit, so the file's obs predicate index (and every other obs
+  column's stats) survives untouched and the rest of `uns` stays
+  byte-identical. Passing `index_obs` / `index_preset` — or **overwriting
+  existing consensus columns** on a re-run — selects the whole-frame
+  `modify_metadata` route instead, the only seam that can rebuild the
+  predicate index in the same commit: an index covering a rewritten consensus
+  column is rebuilt over the new values, never silently dropped. The `index_*`
+  kwargs change the indexed column set; they are not needed to preserve it.
+  Pure Python — nothing in it knows what a doublet is.
 - `pyscx.export_batches(path, out_dir, *, batch_key, key=None, batches=None, on_ambiguous_key="error", overwrite=False, **kwargs)` —
   Write one h5ad per batch, ready to run a per-sample tool on, without
   materialising the pooled file (peak RSS is one library). `**kwargs` pass
@@ -1769,7 +1802,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.optimize(input, output, codec="auto", shard_obs="auto")` — Re-encode + canonicalize every CSR shard (X / layers / obsp graphs) and row-group-frame it (codec-agnostic random access via the row-group `BlockIndex`), stamping `format_version=4` — the Python equivalent of `scx optimize`. Single-modality files only (multimodal → `RuntimeError`; use `compact`). `codec="auto"` (default) keeps the per-shard codec choice; `codec="scx1"` forces Scx1 on every integer shard (full `to_gpu_anndata` device-decode coverage — framed Scx1 shards decode in VRAM); any other value → `ValueError`. `shard_obs` (`"off"|"auto"|"always"`, default `"auto"`) migrates a legacy single-section obs to the sharded `ObsMetadataShard` layout — `"auto"` shards when `n_obs > shard_target_rows` (the `from_anndata` threshold), `"always"` unconditionally, `"off"` keeps the single section; an already-sharded obs is preserved regardless; an invalid value → `ValueError`. No `force` kwarg — pass `output == input` for an in-place upgrade (atomic rename) or remove the target first. Drops the CSC sidecar (rerun `build_csc`). See [docs/operations.md § Optimize](operations.md#optimize).
 - `pyscx.rollback(path, to_seq=None)` — Revert to previous manifest
 - `pyscx.set_uns(path, uns)` — Replace the whole `uns` block in place, **without re-encoding `X`** (cost O(uns bytes)). Replace semantics, not merge. The CSC sidecar and `data_generation` are preserved. Rollback-able via `pyscx.rollback`. **`set_uns` is a strict subset of `modify_metadata`** — `pyscx.modify_metadata(path, uns=...)` does the same thing and also reaches `obs`/`var`/`obsm`/`varm`; prefer `modify_metadata` unless you only need the one-arg `uns` convenience.
-- `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. **A replaced `obs`/`var` keeps the predicate index it had** — rebuilt over the same columns, which also re-derives the per-shard column stats, so `filter_obs` pushdown survives an ordinary obs edit. `index_*` kwargs name a different column set instead, **per axis** (`index_obs` does not change what a same-call var replacement carries; `index_preset` / `index_auto_threshold` span both); a column the file indexed and the new set omits raises a `UserWarning` rather than vanishing silently. Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error).
+- `pyscx.modify_metadata(path, *, uns=None, obs=None, var=None, obsm=None, varm=None, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, modality=None)` — Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place without touching `X`. `obs`/`var` accept a pandas `DataFrame` (or pyarrow `Table`) and must match `n_obs` / `n_vars` (wrong shape → `ValueError`); `obsm`/`varm` accept `dict[str, np.ndarray]`. Any omitted arg is left untouched. **A replaced `obs`/`var` keeps the predicate index it had** — rebuilt over the same columns, which also re-derives the per-shard column stats, so `filter_obs` pushdown survives an ordinary obs edit. `index_*` kwargs name a different column set instead, **per axis** (`index_obs` does not change what a same-call var replacement carries; `index_preset` / `index_auto_threshold` span both); a column the file indexed and the new set omits raises a `UserWarning` rather than vanishing silently. Replace semantics, not merge; for a shallow `uns` merge, read-modify-write (`adata = pyscx.open(path).to_anndata(); adata.uns[...] = ...; pyscx.set_uns(path, dict(adata.uns))`). Only the global modality is supported today (`modality != 0` → error). For a **pure obs column add**, prefer `pyscx.attach_obs_columns` (or `obs_import`): it knows which columns it writes, so the predicate index and untouched columns' stats survive without the rebuild.
 - `pyscx.sort(input, output, by, reverse=False, shard_size=None, codec="auto", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, memory_budget=None, temp_dir=None, bitmap="off", rebuild_csc=False, csc_cols_per_shard=5000, csc_memory_limit="4G", group_by=None, reference=None, group_target_bytes=None, group_max_bytes=None, group_write_block_bytes=None)` — Globally reorder cells by an obs key for X-read locality and contiguous predicate-index shard ranges. `codec` (`auto`/`none`/`scx1`/`zstd`/`lz4`/`pcodec`/`shufdelta`) pins the output encoding — without it the writer re-selects per shard, so a reorder can change file size for reasons unrelated to the reorder. Pass `memory_budget` (e.g. `"4G"`) to force the bounded external partition sort. Drops the CSC sidecar and detection bitmap (`rebuild_csc=True` / `bitmap=` to re-emit); `adata.raw` is not preserved; deletions are materialized away. See [sharding.md § Sorting for read locality](sharding.md#sorting-for-read-locality-scx-sort).
 - `pyscx.shuffle(input, output, seed=42, shard_size=None, codec="auto", index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, memory_budget=None, temp_dir=None, bitmap="off", rebuild_csc=False, csc_cols_per_shard=5000, csc_memory_limit="4G")` — Globally reorder cells by a **seeded random permutation** (`scx sort --shuffle`), so a training loader gets i.i.d. batches at any `shard_group_size`. Same engine and same drop semantics as `sort`, minus the key arguments — shuffle is an order *source*, not a modifier, so `by` / `reverse` / `group_by` are not offered. `seed` is recorded in provenance and is the only record of the permutation; the same seed on the same input always reproduces the same file. The permutation runs over **live** rows, so a file with deletion vectors shuffles differently from the same file without them. Two consequences worth knowing: the output is the inverse of a sorted file for queries (it maximally scatters predicate-index shard ranges), and a permutation inherently costs some cross-row redundancy for codecs whose compression spans rows — ~6–12% for `zstd`, under 1% for `lz4`/`shufdelta`. **Leave `codec="auto"`**: it runs the same adaptive per-shard selection `scx convert` does. (Earlier releases told you to pin the input's own codec because `auto` grew X 1.86–2.09×. That was a derived-file bug, not a property of shuffling, and is fixed — pinning now selects a specific encoding, it does not hold size. See [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).) The provenance entry's `action` stays `"sort"` — the seed lives at `params.shuffle.seed`, so a consumer looking for `action == "shuffle"` will not find it. See [sharding.md § Shuffling for training](sharding.md#shuffling-for-training-scx-sort---shuffle).
 - `pyscx.merge(inputs, output, index_obs=None, index_var=None, index_preset=None, index_auto_threshold=None, assume_identical_var=False, assume_identical_obs=False, uns_policy=None, sort_by=None, reverse=False)` — Merge multiple files. `index_*` kwargs rebuild predicate indexes against the merged output — without them, pushdown silently regresses to a full obs scan on the merged file. `assume_identical_var` (default `False`) validates var identity (index, column names, values) across all inputs; set `True` to check only `n_vars` (breaking change from pre-branch where var was unchecked). `assume_identical_obs` (default `False`) validates each input's obs schema (column names + dtypes) against input 0; set `True` to skip. `uns_policy` controls conflicting uns sections: `None` / `"first"` (keep first input), `"require-equal"` (error on difference), `"namespace"` (prefix keys with input filename), `"summary"` (keep first input and record a `_scx_uns_conflicts` array). `sort_by` / `reverse` optionally sort the merged obs by a column (a sorted merge refuses `obsm` and COO `obsp` — merge without `sort_by`, then `scx sort`). **An `obsm` / `obsp` key that some inputs carry and others lack is a hard error** (`RuntimeError`) naming the axis, the key and the input — the same answer a missing layer has always had; it used to be a silent drop. An `obsp` key whose `data` column disagrees in dtype or nullability across inputs is refused too, since the merged shards are read back under one schema. File-scope COO `obsp` is carried and rebased into the merged obs space, and `varp` comes from input 0; the **CSR-backed** `obsp` encoding and modality-scoped pairwise graphs are dropped with a warning. Merge streams obs shard-by-shard and builds predicate indexes incrementally from the shard stream.

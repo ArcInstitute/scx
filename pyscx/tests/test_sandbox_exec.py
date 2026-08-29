@@ -168,6 +168,25 @@ def test_set_uns_and_modify_metadata_under_restricted_exec(
     assert "sandbox_flag" in pyscx.open(path).read_obs().columns
 
 
+def test_attach_obs_columns_under_restricted_exec(sandbox_env, synthetic_adata):
+    """The DataFrame attach seam — same pandas/pyarrow interop path as
+    modify_metadata's obs, through the positional attach instead."""
+    import pandas as pd
+
+    path = sandbox_env["outputs"]["result"]
+    pyscx.write(synthetic_adata, path)
+    df = pd.DataFrame(
+        {"attached_flag": np.arange(synthetic_adata.n_obs, dtype=np.int32)}
+    )
+    run_sandboxed(
+        "pyscx.attach_obs_columns(path, df, positional=True)",
+        pyscx=pyscx,
+        path=path,
+        df=df,
+    )
+    assert "attached_flag" in pyscx.open(path).read_obs().columns
+
+
 def test_backed_and_lazy_fancy_indexing_under_restricted_exec(
     sandbox_env, synthetic_adata
 ):

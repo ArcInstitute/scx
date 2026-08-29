@@ -2107,3 +2107,369 @@ fn a_composite_key_joins_across_obs_shards() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Positional mode
+// ---------------------------------------------------------------------------
+//
+// `ObsJoinKey::Positional` exists for exactly one caller shape: columns
+// computed in-process from this file's own `read_obs()` output, which is
+// already in physical row order — `doublet_consensus` being the motivating
+// case, on files whose obs index is fully duplicated so no key join is
+// possible. The key-join tests above (and `positional_probe`'s deliberately
+// reversed keys) are untouched: they remain the proof that a *key* join is
+// really keyed.
+
+/// Row-index-encoding scores with NO keys: `score(i) = i * 10`, so a driver
+/// that lands shard rows at the wrong global offset produces wrong values,
+/// not just a wrong row count.
+fn positional_data(n: usize) -> ExternalObsData {
+    let scores: Vec<f32> = (0..n).map(|i| i as f32 * 10.0).collect();
+    let schema = Schema::new(vec![Field::new("dbl_score", DataType::Float32, true)]);
+    let batch =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Float32Array::from(scores))]).unwrap();
+    ExternalObsData {
+        row_keys: Vec::new(),
+        row_annotations: batch,
+        row_embeddings: Vec::new(),
+        uns: None,
+        source_checksum: None,
+        source_name: Some("<DataFrame>".to_string()),
+    }
+}
+
+fn positional_opts() -> AttachObsOptions {
+    AttachObsOptions {
+        join_key: ObsJoinKey::Positional,
+        status_column: None,
+        provenance_action: "test_positional_attach".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn positional_attach_lands_values_in_physical_row_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+
+    let s = attach_external_obs(&path, &positional_data(10), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+    assert_eq!(s.n_target_rows_absent, 0);
+    assert_eq!(s.n_source_rows_absent, 0);
+    assert_eq!(s.obs_key_column, "<positional>");
+    assert!(s.obs_streamed);
+
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let scores = f32_col(&obs, "dbl_score");
+    for i in 0..10 {
+        assert_eq!(
+            scores.value(i),
+            i as f32 * 10.0,
+            "row {i} got the value for row {} — positional scatter used the \
+             wrong global row offset",
+            scores.value(i) / 10.0
+        );
+    }
+}
+
+/// The capability the mode exists for: a file whose obs index is fully
+/// duplicated, where the key join is structurally impossible.
+#[test]
+fn positional_attach_survives_duplicate_obs_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let ids: Vec<String> = (0..4).map(|_| "dup".to_string()).collect();
+    let schema = Schema::new(vec![Field::new("barcode", DataType::Utf8, false)]);
+    let obs =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(ids))]).unwrap();
+    let path = write_fixture_with_obs(dir.path(), "a.scx", obs, 2, 1);
+
+    // The key join is refused outright…
+    let keyed = score_data(
+        vec!["dup".into(), "dup".into(), "dup".into(), "dup".into()],
+        |i| i as f32,
+    );
+    let err = attach_external_obs(&path, &keyed, &opts()).unwrap_err();
+    assert!(matches!(err, OpsError::DuplicateJoinKey { .. }), "{err}");
+
+    // …and positional lands each row on its own cell.
+    let s = attach_external_obs(&path, &positional_data(4), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 4);
+    let scores = f32_col(
+        &ScxReader::open(&path).unwrap().read_obs().unwrap(),
+        "dbl_score",
+    );
+    for i in 0..4 {
+        assert_eq!(scores.value(i), i as f32 * 10.0);
+    }
+}
+
+#[test]
+fn positional_attach_rejects_row_count_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx"); // n_obs = 10
+    let before = std::fs::read(&path).unwrap();
+
+    let err = attach_external_obs(&path, &positional_data(9), &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("physical") && msg.contains("read_obs()"),
+        "the error must say rows are counted in physical obs space, got: {msg}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read(&path).unwrap(),
+        "a rejected positional attach must not write a byte"
+    );
+}
+
+#[test]
+fn positional_attach_requires_empty_row_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+
+    let mut data = positional_data(4);
+    data.row_keys = keys("cell_", 4); // a caller who built keys meant a key join
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(
+        err.to_string().contains("row_keys"),
+        "positional with keys present must be refused by name, got: {err}"
+    );
+}
+
+#[test]
+fn positional_attach_rejects_status_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+
+    let err = attach_external_obs(
+        &path,
+        &positional_data(4),
+        &AttachObsOptions {
+            status_column: Some("dbl_status".to_string()),
+            ..positional_opts()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("status_column"),
+        "a status column is a constant under positional and must be refused, got: {err}"
+    );
+}
+
+/// A positional dry run must reach the same verdict the real attach would —
+/// including on the cancelling-stamps fixture only the payload-vs-stamp check
+/// can see. Skipping the preflight because "there is no key to read" is the
+/// regression this pins.
+#[test]
+fn positional_dry_run_is_honest() {
+    // Clean file: exact summary, no bytes written.
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    let before = std::fs::read(&path).unwrap();
+    let s = attach_external_obs(
+        &path,
+        &positional_data(10),
+        &AttachObsOptions {
+            dry_run: true,
+            ..positional_opts()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.n_matched, 10);
+    assert_eq!(s.obs_columns_added, vec!["dbl_score"]);
+    assert_eq!(before, std::fs::read(&path).unwrap(), "dry run wrote bytes");
+
+    // Mis-stamped file (stamps tile [0, 10), payloads disagree, totals cancel):
+    // the dry run must refuse it, exactly as the keyed dry run does.
+    let path = dir.path().join("mis-stamped.scx");
+    let obs = obs_batch(10);
+    let header = FileHeader::new_single_modality(10, 3, 0, 5, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs_shard(0, 0, 6, 10, &obs.slice(0, 4))
+        .unwrap();
+    writer
+        .write_obs_shard(1, 6, 4, 10, &obs.slice(4, 6))
+        .unwrap();
+    writer.write_var(&var_batch(3)).unwrap();
+    writer
+        .write_csr_shard(
+            &[0u64; 11],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let before = std::fs::read(&path).unwrap();
+    let err = attach_external_obs(
+        &path,
+        &positional_data(10),
+        &AttachObsOptions {
+            dry_run: true,
+            ..positional_opts()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("carries"),
+        "a positional dry run must run the payload-vs-stamp preflight, got: {err}"
+    );
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
+
+/// §10.5 at the ops layer: a positional pure add is still a pure add, so the
+/// obs predicate index (and every shard column stat) survives.
+#[test]
+fn positional_pure_add_keeps_obs_predicate_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_obs_index(dir.path(), "a.scx");
+    assert!(has_obs_index(&path));
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string(), "n_counts".to_string()]
+    );
+
+    let s = attach_external_obs(&path, &positional_data(4), &positional_opts()).unwrap();
+
+    assert!(!s.obs_index_dropped);
+    assert!(
+        has_obs_index(&path),
+        "a positional pure add keeps the index"
+    );
+    assert_eq!(
+        columns_with_shard_stats(&path, &["cell_type", "n_counts"]),
+        vec!["cell_type".to_string(), "n_counts".to_string()],
+        "a positional pure add keeps every shard column stat"
+    );
+}
+
+/// The one-key uns merge under positional — the exact combination the
+/// `doublet_consensus` repoint uses: columns + one uns key, one commit.
+#[test]
+fn positional_attach_merges_one_uns_key_and_one_rollback_undoes_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+
+    let mut data = positional_data(4);
+    data.uns = Some(serde_json::json!({"method": "majority"}));
+    let s = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            uns_key: Some("dbl_consensus".to_string()),
+            ..positional_opts()
+        },
+    )
+    .unwrap();
+    assert_eq!(s.obs_columns_added, vec!["dbl_score"]);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let uns = reader.read_uns().unwrap();
+    assert_eq!(uns["dbl_consensus"]["method"], "majority");
+    assert_eq!(
+        uns["state"], "v0",
+        "pre-existing uns keys must survive the merge"
+    );
+    drop(reader);
+
+    crate::rollback(&path).unwrap();
+    let reader = ScxReader::open(&path).unwrap();
+    let obs = reader.read_obs().unwrap();
+    assert!(obs.column_by_name("dbl_score").is_none());
+    let uns = reader.read_uns().unwrap();
+    assert!(
+        uns.get("dbl_consensus").is_none(),
+        "one rollback must undo obs and uns together — the attach is one commit"
+    );
+}
+
+#[test]
+fn positional_attach_provenance_records_positional_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+
+    attach_external_obs(&path, &positional_data(4), &positional_opts()).unwrap();
+
+    let prov = ScxReader::open(&path).unwrap().read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert_eq!(last.action, "test_positional_attach");
+    assert!(
+        last.params_json
+            .contains("\"obs_key_column\":\"<positional>\""),
+        "{}",
+        last.params_json
+    );
+    assert!(
+        last.params_json.contains("\"n_matched\":4"),
+        "{}",
+        last.params_json
+    );
+}
+
+#[test]
+fn positional_attach_leaves_var_x_and_uns_sections_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 3, 2);
+
+    let section_spans = |path: &Path| -> Vec<(String, u64, u64)> {
+        ScxReader::open(path)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.section_type,
+                    SectionType::VarMetadata
+                        | SectionType::VarMetadataShard
+                        | SectionType::CsrShard
+                        | SectionType::UnsBlob
+                )
+            })
+            .map(|e| (e.name.clone(), e.offset, e.length))
+            .collect()
+    };
+    let before = section_spans(&path);
+    assert!(!before.is_empty());
+
+    attach_external_obs(&path, &positional_data(4), &positional_opts()).unwrap();
+
+    assert_eq!(
+        before,
+        section_spans(&path),
+        "a positional obs-only attach (no uns_key) must not rewrite or move \
+         var / X / uns sections"
+    );
+}
+
+/// A status column sharing a name with an annotation would write TWO obs
+/// columns with that name — `check_collisions` only compares planned names
+/// against the OLD schema. (Round-2 finding: codex.)
+#[test]
+fn a_status_column_matching_an_annotation_name_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+    let before = std::fs::read(&path).unwrap();
+
+    let data = score_data(keys("cell_", 4), |i| i as f32);
+    let err = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            status_column: Some("dbl_score".to_string()), // = an annotation name
+            ..opts()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("dbl_score") && err.to_string().contains("same name"),
+        "{err}"
+    );
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}

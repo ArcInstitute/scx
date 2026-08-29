@@ -309,6 +309,18 @@ are not exposed in R and are tracked here rather than implemented:
 - Framing granularity: `from_*` expose `row_group_rows` but hardcode
   `target_nnz = None` (no `row_group_target_nnz` byte/nnz-aware sizing knob that
   pyscx/CLI carry).
+- `positional=` on `scx_attach_obs` (`ObsJoinKey::Positional`): no in-process
+  positional consumer exists in R yet, and for external tables positional is
+  exactly the footgun the key join prevents.
+- `obsm` embeddings on `pyscx.attach_obs_columns`: deferred on the Python side
+  too (`build_obsm` materializes at `n_obs` scale; no caller needs it).
+- Categorical fidelity through in-place obs edits: `attach_obs_columns`,
+  `scx_attach_obs` (R factors) and `modify_metadata(obs=…)` all demote a
+  categorical column to plain strings (category list and `ordered` bit lost);
+  only `from_anndata`'s writer preserves them. Pre-existing across the family
+  (surfaced in review of the attach seam); fixing it means carrying dictionary
+  arrays + the `scx.categorical.ordered` stamp through the in-place obs write
+  path as one work item.
 
 ### 3.4 Multimodal Support — SHIPPED
 - [x] Format v2 bump; carve `n_modalities` /
@@ -442,6 +454,12 @@ count *matrix*; this is the obs-column half.
   spellings onto `<K>_score` / `<K>_predicted` / `<K>_status` + `uns["<K>"]`. A
   score-only tool gets no `<K>_predicted`: thresholding is a scientific
   decision the importer does not make.
+- [x] `pyscx.attach_obs_columns` — an in-memory pandas `DataFrame` straight
+  onto the file, on the same seam (key-joined by default, `positional=True`
+  for frames computed row-for-row from the file's own `read_obs()` — the
+  `ObsJoinKey::Positional` mode in `scx_ops`). `doublet_consensus`'s default
+  write path, retiring its whole-frame `modify_metadata` route for pure adds
+  (review §10.5 / ORG-10.16-2).
 - [x] `rscx::scx_attach_obs` — an R `data.frame` straight onto the file, so
   scDblFinder / scds need no intermediate file in either direction.
 - [x] `pyscx.export_batches` — one h5ad per batch without materialising the

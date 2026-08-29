@@ -159,6 +159,22 @@ pub enum ObsJoinKey {
     /// Ordered obs columns fused with [`COMPOSITE_KEY_SEPARATOR`]. The source
     /// must carry columns of the same names; both sides are built identically.
     Composite { columns: Vec<String> },
+    /// No join at all: source row `i` annotates physical obs row `i`.
+    ///
+    /// **For frames computed in-process from this file's own obs axis** — e.g.
+    /// columns derived from `read_obs()` output, which is already in physical
+    /// row order. External tool output must never use this: a tool returns rows
+    /// in its own order, which is the whole reason the key join exists (see the
+    /// module doc). What makes positional necessary at all is the file the key
+    /// join *cannot* serve — a merged atlas whose obs index is duplicated with
+    /// no unique column, where an in-process caller still needs to land columns
+    /// it just computed.
+    ///
+    /// Requires [`ExternalObsData::row_keys`] to be empty and
+    /// `row_annotations.num_rows()` to equal the file's physical `n_obs`
+    /// (deleted rows keep their place). A `status_column` is rejected: every
+    /// row matches by construction, so the marker would be a constant.
+    Positional,
 }
 
 impl ObsJoinKey {
@@ -168,6 +184,7 @@ impl ObsJoinKey {
             ObsJoinKey::Auto => "<auto>".to_string(),
             ObsJoinKey::Column(c) => c.clone(),
             ObsJoinKey::Composite { columns } => columns.join(","),
+            ObsJoinKey::Positional => "<positional>".to_string(),
         }
     }
 }
@@ -431,6 +448,38 @@ pub fn obs_key_values(batch: &RecordBatch, column: &str) -> Result<Vec<String>> 
     string_column(batch, column)
 }
 
+/// Remove the named columns from `batch`, forcing what remains nullable — the
+/// shape [`ExternalObsData::row_annotations`] wants once the join-key columns
+/// have been consumed (they are already on the target's obs axis, so
+/// re-importing them would only duplicate them).
+///
+/// Exported for the bindings that build the source side from an in-memory
+/// frame (pyscx `attach_obs_columns`, rscx `scx_attach_obs`), so they cannot
+/// drift on which columns an attach keeps. A name in `drop` that no column
+/// carries is ignored, deliberately: the physical `__index_level_0__` is
+/// always dropped and not every frame has one.
+pub fn drop_batch_columns(batch: &RecordBatch, drop: &[String]) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut fields = Vec::new();
+    let mut arrays = Vec::new();
+    for (i, f) in schema.fields().iter().enumerate() {
+        if drop.iter().any(|d| d == f.name()) {
+            continue;
+        }
+        // Nullable regardless: the attach op scatters nulls into every target
+        // row the source does not cover.
+        fields.push(Field::new(f.name(), f.data_type().clone(), true));
+        arrays.push(Arc::clone(batch.column(i)));
+    }
+    if fields.is_empty() {
+        return Err(OpsError::InvalidInput(
+            "no columns left to attach after removing the key column(s)".into(),
+        ));
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|e| OpsError::InvalidInput(format!("failed to build annotation columns: {e}")))
+}
+
 /// Resolve `join_key` against the obs **schema**, returning the spec to report
 /// and the physical column(s) the keys are built from.
 ///
@@ -494,6 +543,12 @@ fn resolve_target_key_spec(
             }
             Ok((physical.join(","), physical))
         }
+        // Handled by the positional branch in `attach_external_obs_inner`
+        // before this is ever called; an error beats an unreachable!() panic if
+        // a future caller reaches it anyway.
+        ObsJoinKey::Positional => Err(OpsError::InvalidInput(
+            "positional join has no key columns to resolve".into(),
+        )),
     }
 }
 
@@ -1221,8 +1276,21 @@ fn build_obsm(data: &ExternalObsData, join: &ObsRowJoin) -> Result<Vec<(String, 
 // Validation and catalog bookkeeping
 // ---------------------------------------------------------------------------
 
-fn validate_shape(data: &ExternalObsData) -> Result<()> {
-    let n_rows = data.row_keys.len();
+fn validate_shape(data: &ExternalObsData, positional: bool) -> Result<()> {
+    if positional && !data.row_keys.is_empty() {
+        return Err(OpsError::InvalidInput(format!(
+            "positional attach takes no row_keys ({} supplied) — a caller that \
+             built keys almost certainly meant a key join",
+            data.row_keys.len()
+        )));
+    }
+    // Under positional the annotations ARE the row count; keyed mode measures
+    // everything against the keys.
+    let n_rows = if positional {
+        data.row_annotations.num_rows()
+    } else {
+        data.row_keys.len()
+    };
     if data.row_annotations.num_rows() != n_rows {
         return Err(OpsError::ShapeMismatch {
             detail: format!(
@@ -1447,7 +1515,36 @@ fn attach_external_obs_inner(
     data: &ExternalObsData,
     opts: &AttachObsOptions,
 ) -> Result<AttachObsSummary> {
-    validate_shape(data)?;
+    let positional = opts.join_key == ObsJoinKey::Positional;
+    validate_shape(data, positional)?;
+
+    if positional && opts.status_column.is_some() {
+        return Err(OpsError::InvalidInput(
+            "status_column is meaningless under a positional attach — every row \
+             matches by construction, so the marker would be a constant; drop \
+             status_column or use a key join"
+                .into(),
+        ));
+    }
+    // A status column that shares a name with an annotation would produce TWO
+    // obs columns with the same name: `check_collisions` compares planned
+    // names against the OLD schema only, and `build_new_obs` pushes the
+    // status field and the annotation field independently. (Round-2 finding:
+    // codex.)
+    if let Some(status) = &opts.status_column {
+        if data
+            .row_annotations
+            .schema()
+            .field_with_name(status)
+            .is_ok()
+        {
+            return Err(OpsError::InvalidInput(format!(
+                "status_column '{status}' is also an annotation column in the \
+                 source; writing both would leave two obs columns with the \
+                 same name. Rename one of them."
+            )));
+        }
+    }
 
     let planned_obs = planned_obs_columns(data, opts);
     if planned_obs.is_empty() && data.row_embeddings.is_empty() && data.uns.is_none() {
@@ -1501,22 +1598,71 @@ fn attach_external_obs_inner(
     // before the first byte is written" contract intact — including the
     // n_obs-vs-header shape check below.
     let obs_schema = reader.read_obs_schema_physical()?;
-    let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;
-    let key_batch = read_obs_keys_validated(reader, &obs_schema, &key_columns, n_obs)?;
-    if key_batch.num_rows() as u64 != n_obs {
-        return Err(OpsError::ShapeMismatch {
-            detail: format!(
-                "obs has {} rows but the header declares n_obs = {n_obs}",
-                key_batch.num_rows()
-            ),
-        });
-    }
-    let target_keys = materialize_target_keys(&key_batch, &key_columns)?;
-    // The key diagnosis costs the whole obs table, so `build_obs_row_join`
-    // takes the reader and pays for it only on the arms that print it.
-    let row_join = build_obs_row_join(reader, &key_spec, &target_keys, &data.row_keys, opts)?;
-    drop(key_batch);
-    drop(target_keys);
+    let (key_spec, row_join) = if positional {
+        // No key to read — but the keyed path's projected read doubles as the
+        // payload-vs-stamp preflight that keeps `dry_run` honest (see
+        // `read_obs_keys_validated`), and positional must not lose it. Project
+        // obs column 0: obs always carries at least its index column, and one
+        // column is the cheapest read that still walks every shard.
+        let n_rows = data.row_annotations.num_rows() as u64;
+        if n_rows != n_obs {
+            return Err(OpsError::ShapeMismatch {
+                detail: format!(
+                    "positional attach needs one row per physical obs row: \
+                     row_annotations has {n_rows} rows but the file has \
+                     n_obs = {n_obs}. Rows are counted in physical obs space — \
+                     deleted rows keep their place; read them with read_obs()"
+                ),
+            });
+        }
+        if n_obs > u32::MAX as u64 {
+            return Err(OpsError::InvalidInput(format!(
+                "positional attach supports at most {} obs rows (source rows \
+                 are indexed by u32); the file has {n_obs}",
+                u32::MAX
+            )));
+        }
+        if obs_schema.fields().is_empty() {
+            return Err(OpsError::InvalidInput(
+                "obs has no columns to validate the shard cover against".into(),
+            ));
+        }
+        let probe_columns = vec![obs_schema.field(0).name().clone()];
+        let probe = read_obs_keys_validated(reader, &obs_schema, &probe_columns, n_obs)?;
+        if probe.num_rows() as u64 != n_obs {
+            return Err(OpsError::ShapeMismatch {
+                detail: format!(
+                    "obs has {} rows but the header declares n_obs = {n_obs}",
+                    probe.num_rows()
+                ),
+            });
+        }
+        (
+            opts.join_key.describe(),
+            ObsRowJoin {
+                source_of_target: (0..n_obs).map(|i| Some(i as u32)).collect(),
+                n_matched: n_obs,
+                n_target_absent: 0,
+                n_source_absent: 0,
+            },
+        )
+    } else {
+        let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;
+        let key_batch = read_obs_keys_validated(reader, &obs_schema, &key_columns, n_obs)?;
+        if key_batch.num_rows() as u64 != n_obs {
+            return Err(OpsError::ShapeMismatch {
+                detail: format!(
+                    "obs has {} rows but the header declares n_obs = {n_obs}",
+                    key_batch.num_rows()
+                ),
+            });
+        }
+        let target_keys = materialize_target_keys(&key_batch, &key_columns)?;
+        // The key diagnosis costs the whole obs table, so `build_obs_row_join`
+        // takes the reader and pays for it only on the arms that print it.
+        let row_join = build_obs_row_join(reader, &key_spec, &target_keys, &data.row_keys, opts)?;
+        (key_spec, row_join)
+    };
 
     // --- Collision checks ---------------------------------------------------
     if !opts.overwrite {

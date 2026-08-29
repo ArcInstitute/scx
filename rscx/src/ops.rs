@@ -643,7 +643,8 @@ fn scx_attach_obs_impl(
     // the pandas index it renames.
     let mut drop = drop;
     drop.push("__index_level_0__".to_string());
-    let annotations = drop_columns(&batch, drop, prefix)?;
+    let annotations = scx_ops::drop_batch_columns(&batch, &drop).map_err(to_r_err)?;
+    let annotations = apply_prefix(&annotations, prefix)?;
 
     let data = ExternalObsData {
         row_keys,
@@ -709,37 +710,26 @@ fn to_r_err(e: scx_ops::OpsError) -> Error {
     Error::Other(e.to_string())
 }
 
-/// Drop the join-key columns and apply `prefix` to what remains.
-fn drop_columns(
+/// Apply `prefix` to every column name. A rename only — the drop half lives
+/// in the shared `scx_ops::drop_batch_columns`, so pyscx and rscx cannot
+/// drift on which columns an attach keeps.
+fn apply_prefix(
     batch: &arrow::array::RecordBatch,
-    drop: Vec<String>,
     prefix: &str,
 ) -> Result<arrow::array::RecordBatch> {
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
+    if prefix.is_empty() {
+        return Ok(batch.clone());
+    }
     let schema = batch.schema();
-    let mut fields = Vec::new();
-    let mut arrays = Vec::new();
-    for (i, f) in schema.fields().iter().enumerate() {
-        if drop.iter().any(|d| d == f.name()) {
-            continue;
-        }
-        // Nullable regardless: the attach op scatters nulls into every target
-        // row this table does not cover.
-        fields.push(Field::new(
-            format!("{prefix}{}", f.name()),
-            f.data_type().clone(),
-            true,
-        ));
-        arrays.push(Arc::clone(batch.column(i)));
-    }
-    if fields.is_empty() {
-        return Err(Error::Other(
-            "no columns left to attach after removing the key column(s)".into(),
-        ));
-    }
-    arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| Field::new(format!("{prefix}{}", f.name()), f.data_type().clone(), true))
+        .collect();
+    arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec())
         .map_err(|e| Error::Other(format!("failed to build annotation columns: {e}")))
 }
 
