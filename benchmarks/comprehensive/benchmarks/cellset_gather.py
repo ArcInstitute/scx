@@ -326,9 +326,14 @@ def _supports_scatter_block_index() -> bool:
     """
     import pyscx
 
-    return "scatter_block_index" in (
-        pyscx.SparseCellSetDataset.__text_signature__ or ""
-    )
+    # `getattr` with a default for the attribute ONLY: a test double or a
+    # non-pyo3 stand-in is a plain function with no signature metadata, and that
+    # genuinely means "cannot offer the kwarg". An ImportError, or
+    # `SparseCellSetDataset` missing outright, still raises — those are broken
+    # environments, not old builds, and were what the previous blanket
+    # `except Exception` wrongly reported as "your pyscx predates the kwarg".
+    sig = getattr(pyscx.SparseCellSetDataset, "__text_signature__", None)
+    return "scatter_block_index" in (sig or "")
 
 
 def _cache_hit_rate(ds: Any) -> float | None:
