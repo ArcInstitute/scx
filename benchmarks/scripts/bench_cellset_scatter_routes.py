@@ -47,25 +47,39 @@ from benchmarks.comprehensive.cache_control import drop_file_cache  # noqa: E402
 from benchmarks.comprehensive.results import BenchmarkResult  # noqa: E402
 
 
-def _git_rev(path: str) -> str | None:
-    """The last commit that touched `path`, or `None` on a dirty/absent file.
+def _checkout_provenance() -> dict:
+    """The revision of the **checkout**, plus exactly what was dirty in it.
 
-    Published numbers have to name the revision of the **driver** as well as the
-    code under test: citing only the loader commit points a reader at a tree in
-    which this script does not exist.
+    One SHA, not one per file. An earlier version reported the last commit
+    touching `scx-loader/src/python.rs` as the "loader commit" and the last
+    commit touching this script as the "driver commit"; those are two different
+    answers to a question that has one — which tree was measured — and they
+    disagreed with each other and with `system.provenance.git_sha`.
+
+    `git_dirty` is only useful with the paths attached: `docs/benchmark_manifest.md`
+    accepts a dirty capture when the dirtiness is documented, and that is not
+    possible unless the capture records what it was.
     """
+    def _run(*args: str) -> str:
+        return subprocess.run(
+            args, capture_output=True, text=True, check=True, cwd=REPO_ROOT
+        ).stdout.strip()
+
     try:
-        rev = subprocess.run(
-            ["git", "log", "-1", "--format=%H", "--", path],
-            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--", path],
-            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
-        ).stdout.strip()
-        return f"{rev}-dirty" if dirty else (rev or None)
+        status = _run("git", "status", "--porcelain")
+        dirty = [ln[3:] for ln in status.splitlines() if ln.strip()]
+        return {
+            "checkout_sha": _run("git", "rev-parse", "HEAD"),
+            "branch": _run("git", "rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": bool(dirty),
+            "dirty_paths": dirty,
+            # Tracked dirt invalidates a capture; untracked scratch does not.
+            "dirty_tracked_paths": [
+                ln[3:] for ln in status.splitlines() if ln and not ln.startswith("??")
+            ],
+        }
     except Exception:  # noqa: BLE001
-        return None
+        return {"checkout_sha": None, "dirty": None}
 
 
 def _scx_info(scx_bin: str, path: str) -> dict:
@@ -111,9 +125,13 @@ def _arm(scx_path: str, n_obs: int, gate, n_runs: int, n_batches: int, cold: boo
     # Warm the code paths (tokio/rayon) with a tiny pass; timed reads are cold.
     cg._run_gather(scx_path, lambda: plans(cg._WARMUP_BATCHES), scatter_block_index=gate)
 
-    sps, rss, ttfb, routes, wall = [], [], [], [], []
+    sps, rss, ttfb, routes, wall, policies = [], [], [], [], [], []
     for _ in range(n_runs):
         policy = drop_file_cache(scx_path) if cold else "warm"
+        # Per sample, not per arm: `drop_file_cache` decides run by run and can
+        # fall back to "warm", so one overwritten variable hides a warm sample
+        # inside a median published as cold.
+        policies.append(policy)
         out = cg._run_gather(
             scx_path, lambda: plans(n_batches), scatter_block_index=gate
         )
@@ -124,13 +142,18 @@ def _arm(scx_path: str, n_obs: int, gate, n_runs: int, n_batches: int, cold: boo
         routes.append((out.full_shard_groups, out.block_index_groups,
                        out.shard_cache_hit_rate))
     last = routes[-1]
+    if cold and any(pol != "cold_fadvise" for pol in policies):
+        raise SystemExit(
+            f"arm scatter_block_index={gate}: {policies.count('warm')} of "
+            f"{len(policies)} samples fell back to a warm cache "
+            f"({policies}). Refusing to publish a median labelled cold."
+        )
     return {
         "samples": [
             {"cellsets_per_sec": round(s, 2), "peak_rss_mb": round(r, 1),
-             "ttfb_s": round(tt, 4)}
-            for s, r, tt in zip(sps, rss, ttfb)
+             "ttfb_s": round(tt, 4), "wall_s": round(w, 4), "cache_policy": pol}
+            for s, r, tt, w, pol in zip(sps, rss, ttfb, wall, policies)
         ],
-        "wall_s": wall,
         "scatter_block_index": gate,
         "cache_policy": policy,
         "n_runs": n_runs,
@@ -267,40 +290,61 @@ def main() -> int:
             "(the speedup fields are null, deliberately)."
         )
 
-    # A schema-valid `BenchmarkResult` beside the raw payload: `docs/benchmark_manifest.md`
-    # requires every `docs/performance.md` claim that can be a
-    # benchmark/format/dataset triple to be backed by a checked-in result. This
-    # one can be, on a distinct `*_v4reframed` dataset name so it is never
-    # mistaken for a capture of the registered v3 fixture and cannot collide
-    # with a `gate_candidate.py` row.
-    manifest = BenchmarkResult(
-        benchmark="cellset_gather_scatter_routes",
-        format="scx_v4reframed",
-        dataset=f"{Path(args.source).stem.removesuffix('_auto')}_v4reframed",
-        file_size_bytes=os.path.getsize(framed),
-        metadata={k: v for k, v in payload.items() if k != "arms"},
-    )
+    # Schema-v2 `BenchmarkResult`s at the canonical raw path/name, per
+    # `docs/benchmark_manifest.md`: every `docs/performance.md` claim that can be
+    # a benchmark/format/dataset triple must be backed by one. `results/raw/` is
+    # gitignored, so these are force-added — four tracked files already sit there
+    # for exactly this reason.
+    #
+    # ⚠️ **One result per ARM**, never one pooled result. `median_wall_s` and
+    # `wall_s_iqr` are computed over `runs[]`, so folding a 2.8 cellsets/s arm in
+    # with a 511 cellsets/s arm produces a median that describes neither and an
+    # IQR that is just the gap between them. That is the same pooling defect this
+    # PR removed from `cellset_gather.py`; putting it back inside the artifact
+    # that *is* the performance contract would be worse, not better.
+    stem = Path(args.source).stem.removesuffix("_auto")
+    raw_dir = REPO_ROOT / "benchmarks" / "comprehensive" / "results" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    written = []
     for label, arm in arms.items():
-        for s, wall_s in zip(arm["samples"], arm["wall_s"]):
-            manifest.add_run(
-                wall_s=wall_s,
+        fmt = f"scx_v4reframed_{label}"
+        man = BenchmarkResult(
+            benchmark="cellset_gather_scatter_routes",
+            format=fmt,
+            dataset=f"{stem}_v4reframed",
+            file_size_bytes=os.path.getsize(framed),
+            metadata={
+                "arm": label,
+                "scatter_block_index": arm["scatter_block_index"],
+                "median_cellsets_per_sec": arm["median_cellsets_per_sec"],
+                "full_shard_groups": arm["full_shard_groups"],
+                "block_index_groups": arm["block_index_groups"],
+                "shard_cache_hit_rate": arm["shard_cache_hit_rate"],
+                **{k: v for k, v in payload.items() if k != "arms"},
+            },
+        )
+        for s in arm["samples"]:
+            man.add_run(
+                wall_s=s["wall_s"],
                 peak_rss_mb=s["peak_rss_mb"],
-                scenario=f"gather_random__{label}",
+                scenario="gather_random",
+                set_size=cg._SET_SIZE_S64,
+                cache_policy=s["cache_policy"],
                 scatter_block_index=arm["scatter_block_index"],
-                **{
-                    f"cellsets_per_sec__{label}": s["cellsets_per_sec"],
-                    f"peak_rss_mb__{label}": s["peak_rss_mb"],
-                    f"full_shard_groups__{label}": arm["full_shard_groups"],
-                    f"block_index_groups__{label}": arm["block_index_groups"],
-                },
+                cellsets_per_sec=s["cellsets_per_sec"],
+                ttfb_first_set_s=s["ttfb_s"],
+                full_shard_groups=arm["full_shard_groups"],
+                block_index_groups=arm["block_index_groups"],
             )
-    man_path = Path(args.out).with_name(Path(args.out).stem + "__manifest.json")
-    man_path.write_text(json.dumps(manifest.to_dict(), indent=2))
+        out = raw_dir / f"cellset_gather_scatter_routes__{fmt}__{stem}_v4reframed.json"
+        out.write_text(json.dumps(man.to_dict(), indent=2))
+        written.append(str(out.relative_to(REPO_ROOT)))
 
     print(json.dumps({k: payload[k] for k in
                       ("block_index_reachable", "speedup_off_over_on",
                        "speedup_default_over_on", "default_matches_off")}, indent=2))
-    print(f"manifest: {man_path}")
+    for w in written:
+        print(f"manifest: {w}")
     return 0
 
 
