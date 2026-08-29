@@ -390,12 +390,23 @@ _FRAMED_PLAN = ([0] * 8, _FRAMED_ROWS, [0] * 8, [0, 8])
 
 
 def _drive(path, **kwargs):
-    """Two identical batches, so a warmed shard shows up as a cache *hit*."""
+    """Two identical batches, so a warmed shard shows up as a cache *hit*.
+
+    One batch cannot tell the routes apart on the cache counters: the first pass
+    misses either way, and only the second shows whether anything was retained.
+    """
     import pyscx
 
     ds = pyscx.SparseCellSetDataset([path], cache_shards=16, **kwargs)
-    rows = [b["indptr"][-1] for b in ds.iter_with_plans(iter([_FRAMED_PLAN] * 2))]
-    assert len(rows) == 2, "premise: both plans must yield a batch"
+    nnz_per_batch = [
+        int(b["indptr"][-1]) for b in ds.iter_with_plans(iter([_FRAMED_PLAN] * 2))
+    ]
+    assert len(nnz_per_batch) == 2, "premise: both plans must yield a batch"
+    assert all(n > 0 for n in nnz_per_batch), (
+        "premise: the plan must actually read data — an all-empty gather would "
+        "leave every counter at zero and both assertions below would hold "
+        "vacuously"
+    )
     return ds.cache_metrics()
 
 
