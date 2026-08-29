@@ -2256,6 +2256,249 @@ jobs:
             exit 1
           fi
 
+      # ORG-8.20-4: the CUDA-graph capture contract is enforced, not merely
+      # stated, and `GpuDevice` is the only way to allocate or host-sync.
+      #
+      # The rule — "captured regions MUST NOT allocate device memory or do host
+      # syncs" — lived in three doc comments and was checked by nothing. Its
+      # failure mode is silent at the point of the mistake: CUDA invalidates the
+      # capture, `cuStreamEndCapture` returns no graph, and the only symptom is
+      # `harmony/gpu.rs` logging "capture produced no graph; running the kernels
+      # directly" and running at a multi-x slowdown, naming no cause.
+      #
+      # Two halves, and both are load-bearing:
+      #   1. `capture_guard` is armed by the one `begin_capture` and checked by
+      #      every `GpuDevice` allocation / host sync / module load.
+      #   2. Nothing allocates or host-syncs OUTSIDE that funnel. Before this,
+      #      `staging.rs`'s slot grow called `stream.alloc_zeros` directly —
+      #      three allocations a `GpuDevice`-level hook could not see, which is
+      #      exactly why the funnel invariant is a guard and not a convention.
+      - name: Guard — the CUDA-graph capture contract, and one allocation funnel (ORG-8.20-4)
+        run: |
+          set -eo pipefail
+          gd=scx-gpu/src/capture_guard.rs
+          gd_tests=scx-gpu/src/capture_guard_tests.rs
+          graph=scx-gpu/src/gpu_graph.rs
+          dev=scx-gpu/src/device.rs
+          for f in "$gd" "$gd_tests" "$graph" "$dev"; do
+            test -f "$f" || { echo "::error::$f is missing — this guard's paths moved; retarget it rather than deleting it (ORG-8.20-4)."; exit 1; }
+          done
+
+          # Test regions must not satisfy a claim about production — but
+          # `sed '/^#\[cfg(test)\]/,$d'` deletes from the FIRST such attribute to
+          # EOF, which is correct only when the test module is last. It is not,
+          # in 24 files here. `scx-accel/src/harmony/gpu.rs` puts a test-only
+          # counter at line 25 and would lose 1118 of its 1142 lines — including
+          # the workspace's ONLY production CUDA-graph capture site, the precise
+          # place these scans exist to inspect. Found by **codex** on PR #473;
+          # the original falsifications missed it because every violation they
+          # injected went into a file whose `#[cfg(test)]` is trailing.
+          #
+          # `prod_filter.awk` skips exactly the attributed item instead. Its own
+          # unit tests are `.github/scripts/prod_filter_test.sh`, run below.
+          # Consumers still spell every match `grep … >/dev/null`, never
+          # `grep -q`: under `set -o pipefail`, `-q` closes the pipe on the first
+          # hit, `sed` dies of SIGPIPE, and the pipeline reports failure
+          # *because it matched*.
+          bash .github/scripts/prod_filter_test.sh \
+            || { echo "::error::prod_filter.awk's own unit tests fail — the production/test splitter every scan below depends on is broken, and a broken splitter makes those scans vacuously green (ORG-8.20-4)."; exit 1; }
+          prod() { awk -f .github/scripts/prod_filter.awk "$1"; }
+          # Self-check against the one file that matters most: the capture site
+          # must survive the filter and the test-only counter must not. A filter
+          # that truncates this file makes every scan below vacuous while green.
+          prod scx-accel/src/harmony/gpu.rs | grep -E 'capture_graph\(' >/dev/null \
+            || { echo "::error::prod() no longer keeps harmony/gpu.rs's capture site — every funnel scan below would be vacuous (ORG-8.20-4)."; exit 1; }
+          if prod scx-accel/src/harmony/gpu.rs | grep -E '^pub\(super\) static HARMONY_CAPTURE_ATTEMPTS' >/dev/null; then
+            echo "::error::prod() no longer strips the #[cfg(test)] counter in harmony/gpu.rs — test code could satisfy a production claim (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 1. The state machine still exists, by name.
+          for fn in enter in_capture check; do
+            grep -E "^pub\(crate\) fn ${fn}[(<]" "$gd" >/dev/null || { echo "::error::$gd no longer declares \`fn ${fn}\` — the capture contract has no arm/check surface left (ORG-8.20-4)."; exit 1; }
+          done
+          grep -E '^\s*static CAPTURE_DEPTH' "$gd" >/dev/null || { echo "::error::$gd no longer keeps a CAPTURE_DEPTH counter. It must be thread-local and depth-counted: CU_STREAM_CAPTURE_MODE_THREAD_LOCAL restricts the capturing thread only, so a process-global flag would reject allocations CUDA permits on sibling threads — the decode and shard-source paths allocate on their own threads while Harmony captures (ORG-8.20-4)."; exit 1; }
+          grep -E '^thread_local!' "$gd" >/dev/null || { echo "::error::$gd no longer declares its depth counter with thread_local! — see the CAPTURE_DEPTH message above (ORG-8.20-4)."; exit 1; }
+
+          # 2. The check module stays CUDA-free, for the same reason ORG-8.20-1's
+          #    driver and ORG-8.20-2's power loop do: every test that can reach a
+          #    real capture region is `#[ignore = "requires a CUDA GPU"]`, so
+          #    logic that lives beside the driver calls has no reachable test on
+          #    any CI runner.
+          #    Comments are stripped, as in the ORG-8.20-2 block: this module's
+          #    own docs name `GpuDevice` and `cuStreamEndCapture` while
+          #    explaining why it never touches either, and prose describing a
+          #    rule tripping the check that enforces it has now happened five
+          #    times in these guards.
+          if prod "$gd" | grep -nE 'cudarc|CudaStream|CudaSlice|CudaContext|GpuDevice|alloc_zeros|memcpy_[dh]to[dh]|\.launch\(|\.stream\(\)' \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$gd touches CUDA at the line(s) above. It holds the arm/disarm/check state machine only — anything that needs a device belongs in device.rs or gpu_graph.rs, or this stops being testable without a GPU (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 3. Its tests run everywhere. A capture-contract test that needs an
+          #    H100 is the state ORG-8.20-4 exists to end.
+          #    Comments stripped for the same reason as above: this file's own
+          #    header explains that every OTHER capture test is
+          #    `#[ignore = "requires a CUDA GPU"]`, and naming the thing it
+          #    forbids must not trip the check that forbids it.
+          if grep -nE 'require_gpu!|#\[ignore' "$gd_tests" \
+               | grep -vE '(^|:)[0-9]+:[[:space:]]*(//|///|//!)'; then
+            echo "::error::$gd_tests gates on a device at the line(s) above. Its tests must run on every CPU host (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 4. The arm is wired to the capture, and there is exactly one capture
+          #    to wire it to. A second `begin_capture` that skipped the arm would
+          #    leave a whole capture region unguarded while this guard stayed
+          #    green.
+          prod "$graph" | grep -E 'capture_guard::enter\(\)' >/dev/null || { echo "::error::$graph no longer arms capture_guard::enter() — capture_graph is back to running its build closure with the contract unchecked (ORG-8.20-4)."; exit 1; }
+          # Through `prod`, not an inline sed. Round 2 caught this line still
+          # running the delete-to-EOF filter this block replaced, so a second
+          # `begin_capture` after harmony's early test counter stayed invisible
+          # and the count stayed at 1. Measured on that head: inline sed 1,
+          # prod_filter.awk 2. Today's `n == 1` was an accident of
+          # gpu_graph.rs's file shape (codex, Cursor Agent).
+          n=0
+          for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
+            k=$(prod "$f" | grep -cE '\.begin_capture\(' || true)
+            n=$((n + k))
+          done
+          if [ "${n:-0}" -ne 1 ]; then
+            echo "::error::the workspace has ${n:-0} production begin_capture call(s), expected exactly 1 (gpu_graph.rs::capture_graph). Every capture must arm capture_guard, and a second entry point silently would not (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 5. Every funnel checks. Named one by one rather than counted, so a
+          #    method losing its check is a message that says which one.
+          for m in alloc_zeros alloc_zeros_on htod_copy dtoh_copy clone_dtoh_from memcpy_dtoh_into load_module synchronize synchronize_stream reclaim_memory_pool; do
+            grep -E "capture_guard::check\(\"GpuDevice::${m}\"\)" "$dev" >/dev/null || { echo "::error::$dev: GpuDevice::${m} no longer calls capture_guard::check. A device allocation, host sync or module load inside a capture region would go back to invalidating the graph silently (ORG-8.20-4)."; exit 1; }
+          done
+
+          # 6. THE FUNNEL — by OPERATION FAMILY, not by method spelling.
+          #
+          #    The first version of this branch rejected only `.alloc_zeros` and
+          #    only `.synchronize()` on a `*stream`-named receiver. **codex** and
+          #    **Cursor Agent** both flagged the same hole on PR #473: CUDA
+          #    prohibits *families* during capture — every allocation, every host
+          #    sync, every readback, every module load — and the reviewed tree
+          #    already carried 13 unfunnelled device-to-host readbacks (9
+          #    `clone_dtoh` in diffexp/gpu.rs, 4 `memcpy_dtoh` including one in
+          #    harmony/gpu.rs itself). None sat in the captured closure, so
+          #    nothing was broken; the fence simply did not cover the family most
+          #    likely to be added to a k-means loop next.
+          #
+          #    Receivers are extracted after joining lines, because the real
+          #    spelling is often
+          #        let mut row_sum = dev
+          #            .alloc_zeros::<f32>(k)
+          #    and a line-oriented grep sees only `.alloc_zeros::<f32>(k)`.
+          #    A receiver is acceptable iff its binding NAMES it a device
+          #    handle — the name must contain `dev` or `device`. That is a
+          #    convention the codebase already follows (`dev`, `self.dev`,
+          #    `handles.dev`, `dev_pts`, `dev_for_sync`), and making the guard
+          #    depend on it is what keeps the check honest in both directions:
+          #    an anonymous `s.synchronize()` or `pts.synchronize()` fails, and a
+          #    genuine device handle only has to be named for what it is. The
+          #    earlier `(^|[._])(dev|device)$` rule was wrong both ways — it let
+          #    `pts.synchronize()` through (Cursor Agent) and rejected
+          #    harmony's `active_for_sync`, a real `&GpuDevice`, which is why
+          #    that local is now `dev_for_sync`.
+          # `alloc_pinned` is `cuMemHostAlloc` and a pageable `memcpy_htod` is
+          # the synchronous copy — both capture-illegal, both missed by the
+          # round-1 family list (codex, Cursor Agent). PINNED_ALLOC_SITES carves
+          # out the two constructor-time host allocations, enumerated so it
+          # cannot grow in silence, exactly like EVENT_SYNC_SITES below.
+          PINNED_ALLOC_SITES="scx-gpu/src/staging.rs scx-gpu/src/shufdelta_gpu.rs"
+          for op in alloc alloc_zeros alloc_pinned clone_htod clone_dtoh memcpy_dtoh memcpy_htod load_module; do
+            bad=""
+            for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
+              [ "$f" = "$dev" ] && continue
+              if [ "$op" = "alloc_pinned" ]; then
+                case " $PINNED_ALLOC_SITES " in *" $f "*) continue;; esac
+              fi
+              recv=$(prod "$f" | tr '\n' ' ' | grep -oE "[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*(\(\))?[[:space:]]*\.[[:space:]]*${op}[(:]" | sed -E "s/[[:space:]]*\.[[:space:]]*${op}[(:]\$//" | grep -vE '^([A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z0-9_]*(dev|device)[A-Za-z0-9_]*$' || true)
+              [ -n "$recv" ] && bad="$bad $f($(echo $recv | tr ' ' ','))"
+            done
+            if [ -n "$bad" ]; then
+              echo "::error::production .${op} outside the GpuDevice funnel:$bad. Every device allocation, host-blocking copy and module load must go through a checked GpuDevice method (alloc_zeros / alloc_zeros_on / htod_copy / dtoh_copy / clone_dtoh_from / memcpy_dtoh_into / load_module), or capture_guard cannot see it — which is how staging.rs's three slot-grows and 13 device-to-host readbacks sat inside the contract unchecked (ORG-8.20-4)."
+              exit 1
+            fi
+          done
+
+          # 7. Host syncs. Same receiver rule: a device handle is fine, anything
+          #    else is a bypass — so `pts.synchronize()` and `s.synchronize()`
+          #    are caught, not just `*stream`.
+          #
+          #    `CudaEvent::synchronize` is the ONE deliberate carve-out: an event
+          #    is not a stream, and the four shard-source sites that wait on
+          #    per-slot events are outside any capture region. It is enumerated
+          #    below rather than pattern-excluded, so the carve-out cannot grow
+          #    in silence — a new event sync anywhere else fails this branch and
+          #    has to be justified here.
+          EVENT_SYNC_SITES="scx-gpu/src/gpu_shard_source.rs scx-gpu/src/gpu_csc_shard_source.rs scx-gpu/src/shufdelta_gpu.rs"
+          bad=""
+          for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
+            [ "$f" = "$dev" ] && continue
+            case " $EVENT_SYNC_SITES " in *" $f "*) allow_events=1;; *) allow_events=0;; esac
+            # Comments stripped (see branch 2): the doc comments that explain
+            # WHY `PinnedHostSlice::as_slice` is a host wait quote
+            # `event.synchronize()`, and tripped this branch on a correct tree.
+            recv=$(prod "$f" | sed -e 's#//.*##' | tr '\n' ' ' | grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*(\(\))?[[:space:]]*\.[[:space:]]*synchronize\(\)' | sed -E 's/[[:space:]]*\.[[:space:]]*synchronize\(\)$//' | grep -vE '^([A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z0-9_]*(dev|device)[A-Za-z0-9_]*$' || true)
+            if [ "$allow_events" = "1" ]; then
+              recv=$(printf '%s\n' $recv | grep -vE '^(evt|e|event)$' || true)
+            fi
+            [ -n "$recv" ] && bad="$bad $f($(echo $recv | tr '\n' ',' | tr ' ' ','))"
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::production host sync(s) outside the GpuDevice funnel:$bad. Use dev.synchronize() / dev.synchronize_stream(stream) — cusparse.rs's SCX_GPU_PROFILE=1 sync was one of the capture-illegal operations §8.20-4 named. If this is a CudaEvent sync outside a capture region, add the file to EVENT_SYNC_SITES above and say why (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 7a. Third-party host syncs the funnel cannot reach. cudarc's
+          #     `PinnedHostSlice::as_slice` / `as_mut_slice` each OPEN with
+          #     `event.synchronize()`, so the host wait is at the accessor and
+          #     the copy that follows is the async, capture-legal half. Round 2
+          #     guarded the copy and missed the wait (codex, round 3). Every
+          #     call must be preceded by `check_foreign_sync`.
+          for acc in as_slice as_mut_slice; do
+            n_call=$(prod scx-gpu/src/staging.rs | grep -cE "\.${acc}\(\)" || true)
+            n_guard=$(prod scx-gpu/src/staging.rs | grep -cE "check_foreign_sync\(\s*$" || true)
+            :
+          done
+          n_acc=$(prod scx-gpu/src/staging.rs | grep -cE '\.(as_slice|as_mut_slice)\(\)' || true)
+          n_grd=$(prod scx-gpu/src/staging.rs | grep -cE 'check_foreign_sync\(' || true)
+          if [ "${n_grd:-0}" -lt "${n_acc:-0}" ]; then
+            echo "::error::scx-gpu/src/staging.rs has ${n_acc:-0} PinnedHostSlice accessor call(s) but only ${n_grd:-0} check_foreign_sync guard(s). Those accessors open with event.synchronize() in cudarc — a capture-illegal host wait the GpuDevice funnel cannot see, because it lives on a third-party type (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 7b. `enter()`'s guard must be bound to a NAMED local. `let _ =
+          #     capture_guard::enter();` satisfies branch 4 and disarms
+          #     immediately — `#[must_use]` only warns (Cursor Agent, #473).
+          if prod "$graph" | grep -E 'let[[:space:]]+_[[:space:]]*=[[:space:]]*(crate::)?capture_guard::enter\(\)' >/dev/null; then
+            echo "::error::$graph binds capture_guard::enter() to \`_\`, which drops the guard immediately and disarms the region it was meant to arm. Bind a named local (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 8. The error variant is constructed in one place. A CaptureViolation
+          #    raised anywhere else means some other code grew its own opinion
+          #    about what a capture region permits.
+          #    A construction is `CaptureViolation(format!(…))`; `(_)` is a match
+          #    pattern and `(String::new())` in a test is not production, so both
+          #    are excluded — error.rs classifies the variant in
+          #    `is_runtime_failure` and gpu_graph.rs matches on it in its GPU
+          #    tests, and neither is code deciding what a capture region permits.
+          bad=""
+          for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
+            [ "$f" = "$gd" ] && continue
+            prod "$f" | sed -e 's#//.*##' | grep -E 'GpuError::CaptureViolation\(' | grep -vE 'CaptureViolation\(_\)' >/dev/null && bad="$bad $f"
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::GpuError::CaptureViolation is constructed outside $gd (in:$bad). capture_guard::check is the only thing that decides a violation (ORG-8.20-4)."
+            exit 1
+          fi
+
       # ORG-11.16-3: an export-only convert option cannot be NAMED on an ingest
       # call. `export_obs_keep_mask` / `export_min_counts` live on
       # `ExportOptions` and nowhere else. The runtime helper that used to police

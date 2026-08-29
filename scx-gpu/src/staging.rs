@@ -104,6 +104,10 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Clone + D
     fn fill_from(&mut self, src: &[T]) -> Result<(), GpuError> {
         match self {
             HostBuf::Pinned(p) => {
+                // `as_mut_slice()` opens with `event.synchronize()` in cudarc —
+                // a host wait, capture-illegal, and invisible to the GpuDevice
+                // funnel because it lives on a third-party type (codex).
+                crate::capture_guard::check_foreign_sync("PinnedHostSlice::as_mut_slice")?;
                 let slice = p
                     .as_mut_slice()
                     .map_err(|e| GpuError::CudaError(format!("pinned as_mut_slice: {e}")))?;
@@ -215,13 +219,14 @@ impl PinnedCsrSlot {
     /// expected to already contain a valid shard from `stage()`.
     pub fn upload_to(
         &self,
+        dev: &GpuDevice,
         stream: &Arc<CudaStream>,
         dst: &mut GpuCsrSlot,
         n_rows: usize,
         nnz: usize,
         n_cols: usize,
     ) -> Result<(), GpuError> {
-        dst.ensure_capacity(stream, n_rows + 1, nnz)?;
+        dst.ensure_capacity(dev, stream, n_rows + 1, nnz)?;
 
         macro_rules! upload {
             ($src:expr, $dst:expr, $len:expr) => {{
@@ -231,18 +236,21 @@ impl PinnedCsrSlot {
                         // device buffer, but cudarc's `memcpy_htod` copies
                         // src.len() elements; we need to wrap the pinned
                         // slot in a slice of the live length.
+                        // BEFORE the accessor, not after: `as_slice()` opens
+                        // with `event.synchronize()` in cudarc, so the host wait
+                        // is here and the copy below is the async, capture-legal
+                        // half (codex, round 3).
+                        crate::capture_guard::check_foreign_sync("PinnedHostSlice::as_slice")?;
                         let host_slice = p
                             .as_slice()
                             .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &host_slice[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
                     }
                     HostBuf::Pageable(v) => {
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&v[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &v[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
                     }
                 }
@@ -364,8 +372,12 @@ impl PinnedCscSlot {
     /// `col_indptr_len` (for `dst_col_indptr`) / `nnz` (for
     /// `dst_row_indices` and `dst_data`). Callers grow them via the
     /// outer source's own capacity tracking before invoking this method.
+    #[allow(clippy::too_many_arguments)] // `dev` is the capture-guard funnel;
+                                         // the three destination buffers are the CSC triple and cannot be collapsed
+                                         // without an owning slot type this path does not have.
     pub fn upload_to(
         &self,
+        dev: &GpuDevice,
         stream: &Arc<CudaStream>,
         dst_col_indptr: &mut CudaSlice<i64>,
         dst_row_indices: &mut CudaSlice<i32>,
@@ -377,18 +389,21 @@ impl PinnedCscSlot {
             ($src:expr, $dst:expr, $len:expr) => {{
                 match $src {
                     HostBuf::Pinned(p) => {
+                        // BEFORE the accessor, not after: `as_slice()` opens
+                        // with `event.synchronize()` in cudarc, so the host wait
+                        // is here and the copy below is the async, capture-legal
+                        // half (codex, round 3).
+                        crate::capture_guard::check_foreign_sync("PinnedHostSlice::as_slice")?;
                         let host_slice = p
                             .as_slice()
                             .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &host_slice[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
                     }
                     HostBuf::Pageable(v) => {
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&v[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &v[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
                     }
                 }
@@ -545,29 +560,54 @@ impl GpuCsrSlot {
     /// buffers have different device pointers).
     pub fn ensure_capacity(
         &mut self,
+        dev: &GpuDevice,
         stream: &Arc<CudaStream>,
         indptr_len: usize,
         nnz: usize,
     ) -> Result<(), GpuError> {
         if self.indptr.len() < indptr_len {
             let new_cap = indptr_len.next_power_of_two();
-            self.indptr = stream
-                .alloc_zeros::<i64>(new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow indptr: {e}")))?;
+            // Name the buffer WITHOUT retyping the variant: `alloc_zeros_on`
+            // already maps a driver failure to `OutOfMemory`, so a blanket
+            // `map_err(OutOfMemory)` would swallow the one other error it can
+            // return — `CaptureViolation` — and flip
+            // `alternate_route_may_succeed()` from true to false (Cursor Agent).
+            self.indptr = dev
+                .alloc_zeros_on::<i64>(stream, new_cap)
+                .map_err(|e| match e {
+                    GpuError::OutOfMemory(m) => GpuError::OutOfMemory(format!("grow indptr: {m}")),
+                    other => other,
+                })?;
             self.cached_desc = None;
         }
         if self.indices.len() < nnz {
             let new_cap = nnz.next_power_of_two();
-            self.indices = stream
-                .alloc_zeros::<i32>(new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow indices: {e}")))?;
+            // Name the buffer WITHOUT retyping the variant: `alloc_zeros_on`
+            // already maps a driver failure to `OutOfMemory`, so a blanket
+            // `map_err(OutOfMemory)` would swallow the one other error it can
+            // return — `CaptureViolation` — and flip
+            // `alternate_route_may_succeed()` from true to false (Cursor Agent).
+            self.indices = dev
+                .alloc_zeros_on::<i32>(stream, new_cap)
+                .map_err(|e| match e {
+                    GpuError::OutOfMemory(m) => GpuError::OutOfMemory(format!("grow indices: {m}")),
+                    other => other,
+                })?;
             self.cached_desc = None;
         }
         if self.data.len() < nnz {
             let new_cap = nnz.next_power_of_two();
-            self.data = stream
-                .alloc_zeros::<f32>(new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow data: {e}")))?;
+            // Name the buffer WITHOUT retyping the variant: `alloc_zeros_on`
+            // already maps a driver failure to `OutOfMemory`, so a blanket
+            // `map_err(OutOfMemory)` would swallow the one other error it can
+            // return — `CaptureViolation` — and flip
+            // `alternate_route_may_succeed()` from true to false (Cursor Agent).
+            self.data = dev
+                .alloc_zeros_on::<f32>(stream, new_cap)
+                .map_err(|e| match e {
+                    GpuError::OutOfMemory(m) => GpuError::OutOfMemory(format!("grow data: {m}")),
+                    other => other,
+                })?;
             self.cached_desc = None;
         }
         Ok(())
@@ -863,7 +903,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         host.stage(&csr).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 4, 6, 8).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 4, 6, 8)
+            .unwrap();
         dev.synchronize().unwrap();
 
         assert_eq!(slot.shape(), (4, 8));
@@ -901,7 +942,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
         );
         host.stage(&csr).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 4, 6, 8).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 4, 6, 8)
+            .unwrap();
 
         assert!(!slot.has_cached_descr());
         let p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
@@ -933,7 +975,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
         );
         host.stage(&csr_a).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 3, 5, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 3, 5, 5)
+            .unwrap();
         let _p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
         assert!(slot.has_cached_descr());
 
@@ -945,7 +988,8 @@ mod tests {
             vec![10.0f32, 11.0, 12.0, 13.0],
         );
         host.stage(&csr_b).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 3, 4, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 3, 4, 5)
+            .unwrap();
         assert!(
             !slot.has_cached_descr(),
             "nnz change must invalidate descr cache even when n_rows/n_cols are unchanged"
@@ -967,7 +1011,8 @@ mod tests {
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
         );
         host.stage(&csr_a).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 3, 5, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 3, 5, 5)
+            .unwrap();
         let p1 = slot.cached_sp_descr(&dev, dev.stream()).unwrap().raw();
         assert!(slot.has_cached_descr());
 
@@ -979,7 +1024,8 @@ mod tests {
             vec![10.0f32, 11.0, 12.0, 13.0],
         );
         host.stage(&csr_b).unwrap();
-        host.upload_to(dev.stream(), &mut slot, 4, 4, 5).unwrap();
+        host.upload_to(&dev, dev.stream(), &mut slot, 4, 4, 5)
+            .unwrap();
         // Cache should have been invalidated by the shape change.
         assert!(
             !slot.has_cached_descr(),

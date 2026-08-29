@@ -372,8 +372,7 @@ pub fn harmony_integrate_gpu(
     // `update_r` would read from `state.dist_mat`. After iter 0,
     // d_dist is overwritten by GPU distance at the iter > 0
     // cold-start branch.
-    dev.stream()
-        .memcpy_htod(&state.dist_mat, &mut d_dist)
+    dev.memcpy_htod_from(dev.stream(), &state.dist_mat, &mut d_dist)
         .map_err(|e| AccelError::LinAlg(format!("upload dist (iter 0 cold-start): {e}")))?;
 
     // Seed `d_y` with the k-means++ centroids `HarmonyState::new` computed.
@@ -392,8 +391,7 @@ pub fn harmony_integrate_gpu(
     // branch re-uploaded `state.y` every outer iteration, which masked this;
     // removing that upload is what exposed it. Found in review by codex.
     let y_init = f64_to_f32(&state.y);
-    dev.stream()
-        .memcpy_htod(&y_init, &mut d_y)
+    dev.memcpy_htod_from(dev.stream(), &y_init, &mut d_y)
         .map_err(|e| AccelError::LinAlg(format!("seed Y from k-means++ init: {e}")))?;
 
     // `Z_cos = l2_normalize(Z_corr)`. Previously only the `iter > 0`
@@ -636,8 +634,7 @@ pub fn harmony_integrate_gpu(
             } else {
                 dev.stream()
             };
-            upload_stream
-                .memcpy_htod(&order_i32, &mut d_order)
+            dev.memcpy_htod_from(upload_stream, &order_i32, &mut d_order)
                 .map_err(|e| AccelError::LinAlg(format!("upload order: {e}")))?;
 
             // ── M-step (§7.4), OUTSIDE the captured region ───────────
@@ -831,11 +828,11 @@ pub fn harmony_integrate_gpu(
             // enabled the kernels ran on per_thread_stream; sync
             // there. dtoh through dev_pts uses the same stream
             // so ordering is correct.
-            let active_for_sync = if graphs_enabled { &dev_pts } else { &dev };
-            active_for_sync
+            let dev_for_sync = if graphs_enabled { &dev_pts } else { &dev };
+            dev_for_sync
                 .synchronize()
                 .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
-            let obj = compute_objective_gpu(active_for_sync, &d_obj_cell, &d_cross_kgb, n)?;
+            let obj = compute_objective_gpu(dev_for_sync, &d_obj_cell, &d_cross_kgb, n)?;
             local_obj.push(obj);
             state.objective_kmeans.push(obj);
             if check_convergence_kmeans(
@@ -958,8 +955,7 @@ pub fn harmony_integrate_gpu(
                 let mut off_dst = d_offsets_scratch
                     .try_slice_mut(0..batch_offsets.len())
                     .ok_or_else(|| AccelError::LinAlg("offsets scratch slice oob".into()))?;
-                dev.stream()
-                    .memcpy_htod(&batch_offsets, &mut off_dst)
+                dev.memcpy_htod_from(dev.stream(), &batch_offsets, &mut off_dst)
                     .map_err(|e| AccelError::LinAlg(format!("upload batch_offsets: {e}")))?;
             }
 
@@ -996,8 +992,7 @@ pub fn harmony_integrate_gpu(
                     .try_slice(0..b_prime * d)
                     .ok_or_else(|| AccelError::LinAlg("z_sum scratch slice oob".into()))?;
                 let mut host = vec![0f32; b_prime * d];
-                dev.stream()
-                    .memcpy_dtoh(&view, &mut host)
+                dev.memcpy_dtoh_into(dev.stream(), &view, &mut host)
                     .map_err(|e| AccelError::LinAlg(format!("download z_sum: {e}")))?;
                 dev.synchronize()
                     .map_err(|e| AccelError::LinAlg(format!("sync z_sum: {e}")))?;
@@ -1063,8 +1058,7 @@ pub fn harmony_integrate_gpu(
                 let mut w_dst = d_w_scratch
                     .try_slice_mut(0..w_flat.len())
                     .ok_or_else(|| AccelError::LinAlg("W scratch slice oob".into()))?;
-                dev.stream()
-                    .memcpy_htod(&w_flat, &mut w_dst)
+                dev.memcpy_htod_from(dev.stream(), &w_flat, &mut w_dst)
                     .map_err(|e| AccelError::LinAlg(format!("upload W: {e}")))?;
             }
             gpu_harmony_correction_grouped(

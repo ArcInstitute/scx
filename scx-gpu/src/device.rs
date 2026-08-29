@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::safe::{
-    CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits,
+    CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, HostSlice,
+    ValidAsZeroBits,
 };
 use cudarc::driver::LaunchConfig;
 use cudarc::nvrtc::Ptx;
 
+use crate::capture_guard;
 use crate::error::GpuError;
 
 /// Map a cudarc driver error onto the right [`GpuError`] variant, keeping an
@@ -194,9 +196,35 @@ impl GpuDevice {
         &self,
         n: usize,
     ) -> Result<CudaSlice<T>, GpuError> {
+        capture_guard::check("GpuDevice::alloc_zeros")?;
         self.stream
             .alloc_zeros::<T>(n)
             .map_err(|e| GpuError::OutOfMemory(format!("alloc_zeros({n}) failed: {e}")))
+    }
+
+    /// Allocate zero-initialized device memory **on a caller-supplied stream**.
+    ///
+    /// [`Self::alloc_zeros`] allocates on this device's own stream. A few
+    /// callers must allocate on the stream that will use the buffer instead —
+    /// `staging.rs`'s slot grow, whose buffers are then read by kernels on the
+    /// caller's stream, and where allocating elsewhere makes cudarc insert a
+    /// cross-stream wait.
+    ///
+    /// This exists so that those callers do not reach past `GpuDevice` to
+    /// `stream.alloc_zeros` directly. Doing so used to be the one production
+    /// allocation the CUDA-graph capture guard could not see; routing it here
+    /// makes `GpuDevice` the crate's sole allocation funnel, which is what lets
+    /// one [`capture_guard::check`] cover all of it. A CI guard rejects any new
+    /// bare `.alloc_zeros(` outside this file.
+    pub fn alloc_zeros_on<T: DeviceRepr + ValidAsZeroBits>(
+        &self,
+        stream: &Arc<CudaStream>,
+        n: usize,
+    ) -> Result<CudaSlice<T>, GpuError> {
+        capture_guard::check("GpuDevice::alloc_zeros_on")?;
+        stream
+            .alloc_zeros::<T>(n)
+            .map_err(|e| GpuError::OutOfMemory(format!("alloc_zeros_on({n}) failed: {e}")))
     }
 
     /// Query free and total GPU memory in bytes.
@@ -243,6 +271,7 @@ impl GpuDevice {
     /// Allocates a new device buffer and copies all elements from the host
     /// slice into it.
     pub fn htod_copy<T: DeviceRepr>(&self, data: &[T]) -> Result<CudaSlice<T>, GpuError> {
+        capture_guard::check("GpuDevice::htod_copy")?;
         self.stream
             .clone_htod(data)
             .map_err(|e| classify_driver_error("host-to-device copy failed", e))
@@ -253,6 +282,7 @@ impl GpuDevice {
     /// Allocates a new `Vec<T>` and copies all elements from the device
     /// buffer into it.
     pub fn dtoh_copy<T: DeviceRepr>(&self, buf: &CudaSlice<T>) -> Result<Vec<T>, GpuError> {
+        capture_guard::check("GpuDevice::dtoh_copy")?;
         self.stream
             .clone_dtoh(buf)
             .map_err(|e| GpuError::CudaError(format!("device-to-host copy failed: {e}")))
@@ -263,6 +293,7 @@ impl GpuDevice {
     /// The returned [`CudaModule`] can be used to look up kernel functions
     /// via `module.load_function("kernel_name")`.
     pub fn load_module(&self, ptx: Ptx) -> Result<Arc<CudaModule>, GpuError> {
+        capture_guard::check("GpuDevice::load_module")?;
         self.ctx
             .load_module(ptx)
             .map_err(|e| GpuError::ModuleLoadError(format!("{e}")))
@@ -324,7 +355,101 @@ impl GpuDevice {
 
     /// Synchronize the default stream, blocking until all queued GPU work completes.
     pub fn synchronize(&self) -> Result<(), GpuError> {
+        capture_guard::check("GpuDevice::synchronize")?;
         self.stream
+            .synchronize()
+            .map_err(|e| GpuError::CudaError(format!("stream synchronize: {e}")))
+    }
+
+    /// Copy device data to host from any device pointer, on a caller-supplied
+    /// stream, returning a fresh `Vec`.
+    ///
+    /// [`Self::dtoh_copy`] takes a whole `CudaSlice` on this device's own
+    /// stream. Nine sites in `scx-accel/src/diffexp/gpu.rs` read back a **view**
+    /// (`&d_sums.slice(..)`) on a chunk stream instead, so they need the generic
+    /// form.
+    ///
+    /// This is a **host sync**, and that is why it is funnelled: `clone_dtoh`
+    /// blocks the calling thread until the copy completes, which is
+    /// capture-illegal exactly like an allocation. Missing this family is what
+    /// **codex** and **Cursor Agent** both flagged on PR #473 — the funnel
+    /// checked method spellings (`alloc_zeros`, `synchronize`) rather than the
+    /// operation families CUDA prohibits during capture.
+    pub fn clone_dtoh_from<T: DeviceRepr, S: DevicePtr<T>>(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &S,
+    ) -> Result<Vec<T>, GpuError> {
+        capture_guard::check("GpuDevice::clone_dtoh_from")?;
+        stream
+            .clone_dtoh(src)
+            .map_err(|e| GpuError::CudaError(format!("device-to-host copy failed: {e}")))
+    }
+
+    /// Copy device data into an existing host buffer, on a caller-supplied
+    /// stream. The in-place sibling of [`Self::clone_dtoh_from`], and a host
+    /// sync for the same reason — see that method.
+    pub fn memcpy_dtoh_into<T: DeviceRepr, S: DevicePtr<T>, D: HostSlice<T> + ?Sized>(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &S,
+        dst: &mut D,
+    ) -> Result<(), GpuError> {
+        capture_guard::check("GpuDevice::memcpy_dtoh_into")?;
+        stream
+            .memcpy_dtoh(src, dst)
+            .map_err(|e| GpuError::CudaError(format!("device-to-host copy failed: {e}")))
+    }
+
+    /// Copy host data into an existing device buffer, on a caller-supplied
+    /// stream.
+    ///
+    /// A pageable `memcpy_htod` is the *synchronous* copy — it blocks the host
+    /// thread — so it belongs to the same capture-illegal family as the D→H
+    /// readbacks. Round 1 funnelled D→H and left this one out; Cursor Agent
+    /// found it still raw in Harmony's k-means sub-iter loop, immediately
+    /// before the capture region.
+    pub fn memcpy_htod_from<T: DeviceRepr, S: HostSlice<T> + ?Sized, D: DevicePtrMut<T>>(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &S,
+        dst: &mut D,
+    ) -> Result<(), GpuError> {
+        // Deliberately unconditional, and therefore CONSERVATIVE on the pinned
+        // path: a `memcpy_htod` out of pinned host memory is the async copy and
+        // *is* capture-legal, so this rejects one operation CUDA would allow
+        // (codex, round 3). The cost of that is a warned fallback to direct
+        // dispatch, never a wrong answer; the cost of the opposite error is a
+        // silently invalidated graph. The genuinely illegal half of the pinned
+        // path — `PinnedHostSlice::as_slice`'s `event.synchronize()` — is
+        // guarded at its call site in `staging.rs`.
+        capture_guard::check("GpuDevice::memcpy_htod_from")?;
+        stream
+            .memcpy_htod(src, dst)
+            .map_err(|e| classify_driver_error("host-to-device copy failed", e))
+    }
+
+    /// Block until all work queued on a **caller-supplied** stream completes.
+    ///
+    /// [`Self::synchronize`] waits on this device's own stream. Three callers
+    /// wait on a stream they were handed instead: `cusparse`'s profiling
+    /// timer, whose measurement is meaningless without it; `nvcomp`'s
+    /// decompress, which must not drop its staging buffers with a DMA in
+    /// flight; and `shufdelta_gpu`'s error path, draining a copy stream before
+    /// pinned host buffers go out of scope.
+    ///
+    /// Routed here for the same reason as [`Self::alloc_zeros_on`]: a host sync
+    /// inside a CUDA-graph capture region is as illegal as an allocation, and a
+    /// raw `stream.synchronize()` is invisible to [`capture_guard`]. A CI guard
+    /// rejects any new `.synchronize()` on a stream receiver outside this file.
+    ///
+    /// Note the boundary: `CudaEvent::synchronize` is *not* funnelled through
+    /// here — the shard sources wait on per-slot events, and an event is not a
+    /// stream. Those sites are outside any capture region today; if one ever
+    /// moves inside, this is where the equivalent helper belongs.
+    pub fn synchronize_stream(&self, stream: &CudaStream) -> Result<(), GpuError> {
+        capture_guard::check("GpuDevice::synchronize_stream")?;
+        stream
             .synchronize()
             .map_err(|e| GpuError::CudaError(format!("stream synchronize: {e}")))
     }
@@ -355,6 +480,11 @@ impl GpuDevice {
     /// allocation caching on every drop; cache the matrices/handles, not the
     /// device, in that case.
     pub fn reclaim_memory_pool(&self) -> Result<(), GpuError> {
+        // Checked even though `Drop` discards the result, and that combination
+        // is the point: a `GpuDevice` dropped inside a capture region used to
+        // reach `self.synchronize()` below and invalidate the capture. It now
+        // declines instead, and the trim happens at the next drop outside one.
+        capture_guard::check("GpuDevice::reclaim_memory_pool")?;
         if !self.ctx.has_async_alloc() {
             return Ok(());
         }

@@ -37,6 +37,12 @@ pub enum GpuError {
     LibraryNotFound(String),
     #[error("unsupported device layout: {0}")]
     UnsupportedLayout(String),
+    /// A device allocation, host synchronization or module load was attempted
+    /// inside a CUDA-graph capture region. Raised by
+    /// [`crate::capture_guard::check`]; see that module for why the contract is
+    /// enforced by a returned error rather than a `debug_assert!`.
+    #[error("CUDA-graph capture contract violated: {0}")]
+    CaptureViolation(String),
 }
 
 pub type Result<T> = std::result::Result<T, GpuError>;
@@ -82,7 +88,12 @@ impl GpuError {
             | GpuError::OutOfMemory(_)
             | GpuError::ModuleLoadError(_)
             | GpuError::CuVsError(_)
-            | GpuError::LibraryNotFound(_) => true,
+            | GpuError::LibraryNotFound(_)
+            // A capture violation is a defect in *our* code, not in the input —
+            // and by the rule above that puts it here: the same input run
+            // without graph capture produces the answer, which is exactly the
+            // fallback `harmony/gpu.rs` already takes when a capture fails.
+            | GpuError::CaptureViolation(_) => true,
 
             GpuError::InvalidShard(_)
             | GpuError::ShapeMismatch { .. }
@@ -183,6 +194,7 @@ mod tests {
             GpuError::ModuleLoadError(s()),
             GpuError::CuVsError(s()),
             GpuError::LibraryNotFound(s()),
+            GpuError::CaptureViolation(s()),
         ] {
             assert!(e.is_runtime_failure(), "{e} should be a runtime failure");
         }

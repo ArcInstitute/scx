@@ -518,12 +518,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
 
             let t_htod = profile::start();
             let h_idx = pinned_idx[slot].stage(&idx_planes)?;
-            copy_stream
-                .memcpy_htod(h_idx, &mut dev_idx[slot].slice_mut(0..idx_len))
+            dev
+                .memcpy_htod_from(&copy_stream, h_idx, &mut dev_idx[slot].slice_mut(0..idx_len))
                 .map_err(|e| GpuError::CudaError(format!("h2d indices: {e}")))?;
             let h_val = pinned_val[slot].stage(&val_planes)?;
-            copy_stream
-                .memcpy_htod(h_val, &mut dev_val[slot].slice_mut(0..val_len))
+            dev
+                .memcpy_htod_from(&copy_stream, h_val, &mut dev_val[slot].slice_mut(0..val_len))
                 .map_err(|e| GpuError::CudaError(format!("h2d values: {e}")))?;
             host_uploaded_bytes += (idx_len + val_len) as u64;
 
@@ -624,7 +624,15 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // use-after-free. Best-effort sync the copy stream before propagating so any
     // outstanding DMA out of the pinned buffers has completed first.
     if scope_result.is_err() {
-        let _ = copy_stream.synchronize();
+        if let Err(e) = dev.synchronize_stream(&copy_stream) {
+            // Best-effort, but no longer silent: since the capture guard landed,
+            // the error this can now carry is `CaptureViolation`, and swallowing
+            // it would drop pinned buffers with a DMA in flight AND hide why.
+            log::warn!(
+                "shufdelta error-path copy-stream drain failed ({e}); \
+                        pinned host buffers may be released with a copy in flight"
+            );
+        }
     }
     scope_result?;
 
