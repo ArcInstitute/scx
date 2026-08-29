@@ -8,8 +8,9 @@ pub mod cpu;
 pub mod gpu;
 
 pub use cpu::{
-    streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
-    streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats, HvgStats,
+    binned_dispersion_norm, streaming_clip_square_sum, streaming_clip_square_sum_batched,
+    streaming_mean_var, streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats,
+    HvgStats,
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{

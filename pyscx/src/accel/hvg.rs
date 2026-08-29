@@ -1399,6 +1399,30 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         return Ok(());
     }
 
+    // Native-path validation, deliberately AFTER the batch_key delegation so
+    // the scanpy-delegated branch keeps scanpy's own n_bins behavior (and the
+    // in-memory rapids branch, which never reaches this function, keeps
+    // rapids'). Two guards for the two failure modes the Rust kernel changed:
+    // n_bins == 0 was pandas' opaque "Cannot cut empty array"-adjacent
+    // ValueError (the kernel would silently answer all-NaN → zero genes
+    // selected); an absurd n_bins was pandas' survivable MemoryError, where
+    // Rust's infallible per-bin allocations would ABORT the process. 2^20 is
+    // far beyond any meaningful binning of a gene axis (scanpy's default is
+    // 20; a bin count above n_vars only adds empty bins). (Round-1 finding:
+    // codex; scoped to the native path in round 2, also codex.)
+    if n_bins == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "n_bins must be at least 1 (scanpy's default is 20)",
+        ));
+    }
+    const N_BINS_MAX: usize = 1 << 20;
+    if n_bins > N_BINS_MAX {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "n_bins = {n_bins} is not a meaningful binning (max {N_BINS_MAX}); \
+             scanpy's default is 20"
+        )));
+    }
+
     // ── 1. Streaming mean/var in COUNT space ───────────────────────────
     // scanpy's seurat flavor un-`log1p`s the matrix before computing moments:
     // `x *= ln(base)` (identity for natural-log / no recorded base), then
@@ -1434,18 +1458,33 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         log_means[j] = means_for_disp[j].ln_1p();
     }
 
-    // ── 3. Bin by mean, z-score dispersion within bins (via Python) ────
-    // Clone: `log_means` / `log_dispersions` are also published to `var` below.
-    let log_means_np = numpy::PyArray::from_vec(py, log_means.clone());
-    let log_disp_np = numpy::PyArray::from_vec(py, log_dispersions.clone());
+    // `expm1` overflows to Inf around x ≈ 709, which is what running
+    // flavor="seurat" on raw counts (a MALAT1-scale UMI value) produces. The
+    // pandas reference RAISED on an Inf mean ("cannot specify integer `bins`
+    // when input data contains infinity"); the Rust kernel instead answers
+    // all-NaN, which the -inf selection floor below would turn into ZERO
+    // genes selected — and subset=True would then drop the whole var axis,
+    // silently. Keep the failure loud at the boundary, like n_bins == 0
+    // above. (Round-1 finding: Cursor Agent.)
+    if log_means.iter().any(|v| !v.is_finite()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "count-space means overflowed to infinity: flavor=\"seurat\" \
+             un-log1ps X before computing moments, so it expects \
+             log-normalized input (sc.pp.log1p / pyscx.accel.log1p), not raw \
+             counts",
+        ));
+    }
 
-    let helpers = crate::pyimport::import_module(py, "pyscx._hvg_helpers")?;
-    let dispersions_norm: Vec<f64> = helpers
-        .call_method1(
-            "binned_dispersion_norm",
-            (log_means_np, log_disp_np, n_bins),
-        )?
-        .extract()?;
+    // ── 3. Bin by mean, z-score dispersion within bins ──────────────────
+    // Rust-native since ORG-10.16-5 (previously a Python callback into the
+    // shipped `pyscx._hvg_helpers`, the one file a Rust accelerator's
+    // correctness depended on): the scanpy `pd.cut` + groupby semantics —
+    // right-closed equal-width bins, NaN-skipping ddof-1 stats, the
+    // singleton-bin `exactly 1.0` rule, NaN preserved — live in
+    // `scx_accel::binned_dispersion_norm`, golden-pinned against the pandas
+    // reference and held to scanpy by `test_column_parity_with_scanpy`.
+    let dispersions_norm: Vec<f64> =
+        py.detach(|| scx_accel::binned_dispersion_norm(&log_means, &log_dispersions, n_bins));
 
     // ── 4. Select top genes by normalized dispersion ────────────────────
     // scanpy selects via `nan_to_num(dispersion_norm, nan=-inf) >= cutoff`, so

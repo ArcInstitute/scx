@@ -164,6 +164,173 @@ pub fn streaming_mean_var_expm1<S: ShardSource + Sync>(source: &S, scale: f64) -
     })
 }
 
+/// Z-score-normalize log-dispersions within equal-width mean-expression bins —
+/// the binning half of the scanpy `seurat` HVG flavor (its moments half is
+/// [`streaming_mean_var_expm1`]). A faithful port of the pandas reference
+/// (scanpy `_get_disp_stats` / `_postprocess_dispersions_seurat`, previously
+/// shipped as pyscx's `_hvg_helpers.py`):
+///
+/// 1. **Binning** = `pd.cut(log_means, bins=n_bins)`: equal-width edges over
+///    `[nanmin, nanmax]`, computed exactly as `np.linspace` does
+///    (`i·step + mn`, last edge set to `mx`), then the leftmost edge widened
+///    by `0.001·(mx − mn)`; when `mn == mx` both ends are widened first by
+///    `0.001·|v|` (or `0.001` when `v == 0`) and no post-adjustment happens.
+///    Intervals are **right-closed**, so a gene exactly on an interior edge
+///    lands in the bin to its left (searchsorted `side="left"`).
+/// 2. Per-bin **NaN-skipping mean** (`avg`) and **ddof=1 std** (`dev`) of the
+///    dispersions.
+/// 3. **Singleton-bin rule**, a scanpy quirk pinned by a past P0 fix
+///    (commit 87f1d937): a bin whose `dev` is NaN gets `dev = avg; avg = 0`,
+///    so its gene's normalized dispersion is EXACTLY `1.0` — not `0`, which
+///    the tempting `dev = 1` would give.
+/// 4. Per-gene `(dispersion − avg) / dev`, with **NaN preserved as NaN** (the
+///    caller floors NaN to `−inf` for selection, matching scanpy's
+///    `nan_to_num(nan=-inf)`).
+///
+/// Degenerate inputs return all-NaN rather than erroring: an empty input
+/// yields an empty vec, and `n_bins == 0` or all-NaN `log_means` yield NaN
+/// per gene (the pandas reference raises on those; callers validate
+/// `n_bins ≥ 1` at their own boundary, and the accel finiteness guard
+/// upstream keeps means finite).
+pub fn binned_dispersion_norm(
+    log_means: &[f64],
+    log_dispersions: &[f64],
+    n_bins: usize,
+) -> Vec<f64> {
+    let n = log_means.len();
+    debug_assert_eq!(n, log_dispersions.len());
+    // `checked_add` closes the one arithmetic wrap (`usize::MAX + 1`); the
+    // per-bin vectors below still allocate O(n_bins), so callers bound n_bins
+    // to something meaningful — pyscx rejects > 2^20 at its boundary. An
+    // unbounded direct caller risks the ordinary infallible-alloc abort any
+    // `vec![0; huge]` carries, which is not a contract this kernel can lift.
+    let Some(n_edges) = n_bins.checked_add(1) else {
+        return vec![f64::NAN; n];
+    };
+    if n == 0 || n_bins == 0 {
+        return vec![f64::NAN; n];
+    }
+
+    // --- 1. pd.cut bin edges ------------------------------------------------
+    let mut mn = f64::INFINITY;
+    let mut mx = f64::NEG_INFINITY;
+    for &v in log_means {
+        if v.is_nan() {
+            continue;
+        }
+        if v < mn {
+            mn = v;
+        }
+        if v > mx {
+            mx = v;
+        }
+    }
+    if !mn.is_finite() || !mx.is_finite() {
+        return vec![f64::NAN; n];
+    }
+    let mut edges = Vec::with_capacity(n_edges);
+    if mn == mx {
+        // pandas widens a zero-width range on both ends *before* binning, and
+        // then skips the leftmost-edge adjustment below.
+        let widen = |v: f64| {
+            if v == 0.0 {
+                0.001
+            } else {
+                0.001 * v.abs()
+            }
+        };
+        let (lo, hi) = (mn - widen(mn), mx + widen(mx));
+        let step = (hi - lo) / n_bins as f64;
+        for i in 0..n_bins {
+            edges.push(i as f64 * step + lo);
+        }
+        edges.push(hi);
+    } else {
+        let step = (mx - mn) / n_bins as f64;
+        for i in 0..n_bins {
+            edges.push(i as f64 * step + mn);
+        }
+        edges.push(mx);
+        // Right-closed intervals leave `mn` itself outside `(e0, e1]`; pandas
+        // pulls the leftmost edge down so the minimum is included.
+        edges[0] -= 0.001 * (mx - mn);
+    }
+
+    // searchsorted(edges, x, side="left"): the first edge ≥ x; bin = idx − 1.
+    // idx == 0 (x at/below the widened leftmost edge) and idx past the last
+    // edge are both "no bin" — unreachable for finite x in [mn, mx], kept for
+    // exact pandas parity.
+    let bin_of = |x: f64| -> Option<usize> {
+        if x.is_nan() {
+            return None;
+        }
+        let idx = edges.partition_point(|e| *e < x);
+        if idx == 0 || idx == edges.len() {
+            return None;
+        }
+        Some(idx - 1)
+    };
+    let bins: Vec<Option<usize>> = log_means.iter().map(|&m| bin_of(m)).collect();
+
+    // --- 2. per-bin NaN-skipping mean + ddof=1 std (two-pass) ---------------
+    let mut cnt = vec![0usize; n_bins];
+    let mut sum = vec![0f64; n_bins];
+    for (b, &d) in bins.iter().zip(log_dispersions) {
+        if let Some(b) = *b {
+            if !d.is_nan() {
+                cnt[b] += 1;
+                sum[b] += d;
+            }
+        }
+    }
+    let mut avg: Vec<f64> = (0..n_bins)
+        .map(|b| {
+            if cnt[b] > 0 {
+                sum[b] / cnt[b] as f64
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let mut sq = vec![0f64; n_bins];
+    for (b, &d) in bins.iter().zip(log_dispersions) {
+        if let Some(b) = *b {
+            if !d.is_nan() {
+                let r = d - avg[b];
+                sq[b] += r * r;
+            }
+        }
+    }
+    let mut dev: Vec<f64> = (0..n_bins)
+        .map(|b| {
+            if cnt[b] > 1 {
+                (sq[b] / (cnt[b] - 1) as f64).sqrt()
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+
+    // --- 3. singleton-bin rule ----------------------------------------------
+    // A bin with zero non-NaN members also lands here (avg is NaN, so the
+    // division below still yields NaN for its genes — same as pandas).
+    for b in 0..n_bins {
+        if dev[b].is_nan() {
+            dev[b] = avg[b];
+            avg[b] = 0.0;
+        }
+    }
+
+    // --- 4. map back per gene, NaN preserved ---------------------------------
+    bins.iter()
+        .zip(log_dispersions)
+        .map(|(b, &d)| match b {
+            Some(b) => (d - avg[*b]) / dev[*b],
+            None => f64::NAN,
+        })
+        .collect()
+}
+
 /// Single-pass streaming clipped accumulation for seurat_v3 normalized variance.
 ///
 /// For each nonzero value in the matrix, clips it to `min(val, clip_val[col])`,
@@ -425,6 +592,13 @@ impl ShardSource for InMemorySource {
 #[cfg(test)]
 #[path = "moments_golden_tests.rs"]
 mod moments_golden;
+
+/// Golden values for [`binned_dispersion_norm`], pinned from the pandas
+/// reference it replaces (pyscx `_hvg_helpers.py`) so the ORG-10.16-5 port is
+/// provably behaviour-preserving.
+#[cfg(test)]
+#[path = "binned_dispersion_tests.rs"]
+mod binned_dispersion_golden;
 
 #[cfg(test)]
 mod tests {
