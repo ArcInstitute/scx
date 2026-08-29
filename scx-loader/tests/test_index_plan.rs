@@ -588,6 +588,146 @@ fn iter_skips_prefetch_when_cached() {
         "iter2 should record skipped_cache_hit > 0 (got skipped_hit={skipped_hit})"
     );
 }
+/// **Pre-refactor pin (ORG-9.10-1, drift (b)).** Every shard the plan touches
+/// is accounted for exactly once across the four `IterMetrics` counters:
+///
+/// ```text
+/// spawned + skipped_cache_hit + skipped_in_flight + skipped_block_index
+///     == distinct shards touched by the plan
+/// ```
+///
+/// `spawn_prefetches` is one `filter().map()` over a per-shard map, so the law
+/// is structural — which is exactly why it is the right thing to pin before
+/// `IndexPlanIter` is folded into `PlanPrefetchIter`. That arm has **no**
+/// counters at all today, so "port the counters across" is otherwise an
+/// unchecked claim: dropping one increment during the move would leave every
+/// existing assertion green (`iter_skips_prefetch_when_cached` above reads two
+/// of the four; nothing reads the other two).
+///
+/// Both arms of the law are exercised: a cold cache, where every shard is
+/// spawned, and a warm one, where every shard is skipped. The unframed fixture
+/// keeps `skipped_block_index` at zero here — that counter is pinned by
+/// `pyscx/tests/test_index_plan_dataset.py::test_scatter_block_index_flag_gates_prefetch_skip`
+/// on this arm and by
+/// `plan_engine_tests::engine_does_not_warm_a_block_index_eligible_shard` on the
+/// other.
+#[test]
+fn iter_prefetch_counters_account_for_every_touched_shard() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+    // `cache_shards = 8` (the shared helpers pin 4) so all five touched shards
+    // stay resident between the two arms — under a 4-shard LRU the warm arm
+    // re-spawns the two evicted shards, which is a cache property, not the
+    // accounting property under test. The law holds either way; the per-counter
+    // assertions below would not.
+    let loader = Arc::new(
+        scx_loader::IndexPlanLoader::new(
+            &path,
+            scx_loader::LoaderConfig {
+                normalize: false,
+                log1p: false,
+                obs_columns: vec!["cell_id".to_string()],
+                max_memory_mb: 1024,
+                ..Default::default()
+            },
+            /*cache_shards=*/ 8,
+            /*sort_by_shard=*/ true,
+            /*lookahead=*/ 4,
+            /*max_plan_size=*/ 16384,
+        )
+        .unwrap(),
+    );
+
+    // Two rows in each of the five 20-row shards → 5 distinct shards, 10 rows.
+    let plan: Vec<(u64, u64)> = vec![(0, 1), (25, 30), (45, 50), (65, 70), (85, 90)];
+    const TOUCHED_SHARDS: u64 = 5;
+
+    let drain = |loader: &Arc<scx_loader::IndexPlanLoader>| -> [u64; 4] {
+        let mut it = Arc::clone(loader)
+            .iter_with_plans(std::iter::once(Ok(plan.clone())), /*lookahead=*/ 1);
+        let im = it.iter_metrics();
+        let _ = it.next().expect("one batch").expect("gather");
+        assert!(it.next().is_none(), "iter should be drained");
+        [
+            im.prefetch_tasks_spawned.load(Ordering::Relaxed),
+            im.prefetch_skipped_cache_hit.load(Ordering::Relaxed),
+            im.prefetch_skipped_in_flight.load(Ordering::Relaxed),
+            im.prefetch_skipped_block_index.load(Ordering::Relaxed),
+        ]
+    };
+
+    let cold = drain(&loader);
+    assert_eq!(
+        cold.iter().sum::<u64>(),
+        TOUCHED_SHARDS,
+        "cold: counters must account for all {TOUCHED_SHARDS} touched shards, got {cold:?}"
+    );
+    assert_eq!(
+        cold[0], TOUCHED_SHARDS,
+        "cold: every touched shard must be spawned, got {cold:?}"
+    );
+
+    let warm = drain(&loader);
+    assert_eq!(
+        warm.iter().sum::<u64>(),
+        TOUCHED_SHARDS,
+        "warm: counters must account for all {TOUCHED_SHARDS} touched shards, got {warm:?}"
+    );
+    assert_eq!(
+        warm[1], TOUCHED_SHARDS,
+        "warm: every touched shard must be skipped as a cache hit, got {warm:?}"
+    );
+}
+
+/// **Pre-refactor pin (ORG-9.10-1).** `sort_by_shard = true` emits pairs in
+/// `min(shard_of(p), shard_of(c))` order, **stably** — ties keep the caller's
+/// order.
+///
+/// `process_plan` takes `Vec<(u64,u64)>` **by value** and does this sort in
+/// place; `PlanPrefetchIter`'s `ProcFn` takes `&P`, and its module docs say the
+/// engine deliberately preserves plan order ("no `sort_by_shard` reorder"). So
+/// the fold has to re-sign `process_plan` — to `&[(u64,u64)]` plus an internal
+/// copy, or to a caller-side clone — and that is a change this test can see.
+///
+/// The two existing sort tests cannot: `sort_by_shard_pairs_align_with_rows`
+/// only checks `pairs[i]` against row `i`, and `sort_by_shard_is_pure_permutation`
+/// sorts both sides before comparing. Both stay green if the sort silently stops
+/// happening.
+#[test]
+fn sort_by_shard_emits_pairs_in_shard_order_stably() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture(&dir);
+
+    // 100 obs / 5 shards → 20 rows each. Sort keys, in input order:
+    //   (95, 0)  -> min(shard 4, shard 0) = 0
+    //   (40, 50) -> min(shard 2, shard 2) = 2
+    //   (80, 90) -> min(shard 4, shard 4) = 4
+    //   (3, 12)  -> min(shard 0, shard 0) = 0
+    //   (60, 11) -> min(shard 3, shard 0) = 0
+    //   (1, 2)   -> min(shard 0, shard 0) = 0
+    let plan: Vec<(u64, u64)> = vec![(95, 0), (40, 50), (80, 90), (3, 12), (60, 11), (1, 2)];
+
+    let sorted = open_loader(&path, /*sort_by_shard=*/ true)
+        .process_plan(plan.clone())
+        .unwrap();
+    assert_eq!(
+        sorted.pairs,
+        vec![(95, 0), (3, 12), (60, 11), (1, 2), (40, 50), (80, 90)],
+        "keys 0,0,0,0,2,4 — and the four key-0 pairs keep their input order \
+         (the sort is stable)"
+    );
+
+    let unsorted = open_loader(&path, /*sort_by_shard=*/ false)
+        .process_plan(plan.clone())
+        .unwrap();
+    assert_eq!(
+        unsorted.pairs, plan,
+        "with the flag off, caller order survives"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // BudgetBreakdown + peak_bytes_in_cache

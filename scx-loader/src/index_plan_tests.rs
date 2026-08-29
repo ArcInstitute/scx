@@ -495,6 +495,122 @@ fn iter_with_plans_drop_mid_iteration() {
     drop(it); // must not hang
 }
 
+/// **Pre-refactor pin (ORG-9.10-1).** `IndexPlanIter::next` loops so an empty
+/// plan yields no batch and iteration continues — the SCX-DATA-LOADER spec's
+/// "plan list is empty → yield no batch for that plan; continue to the next".
+///
+/// `PlanPrefetchIter`, the engine this iterator is scheduled to be folded into,
+/// does the **opposite** by design (`plan_engine.rs`: "Empty plans are NOT
+/// skipped — `process` is called for every plan"). That divergence is a fourth
+/// drift the review's list of three does not name, and it is the constraint the
+/// fold has to satisfy. Until now it was pinned only from Python
+/// (`pyscx/tests/test_index_plan_dataset.py::test_empty_plan_inside_stream_is_skipped`),
+/// so a Rust-side fold would have gone green here and red only in the Python
+/// suite. See `plan_engine_tests::engine_calls_process_for_every_plan_including_empty`
+/// for the mirror-image pin on the other arm.
+#[test]
+fn iter_skips_empty_plans_mid_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+    let loader = open_loader_arc(&path);
+
+    // Empty plans at the head, in the middle, at the tail, and back to back:
+    // the skip is a `continue` inside `next`, so consecutive empties must all
+    // be consumed within one `next` call rather than each ending the stream.
+    let plans = vec![
+        vec![],
+        vec![(0u64, 1u64)],
+        vec![],
+        vec![],
+        vec![(2u64, 3u64)],
+        vec![],
+    ];
+    let batches: Vec<_> = loader
+        .iter_with_plans(into_plan_iter(plans), 2)
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        batches.len(),
+        2,
+        "four empty plans must yield no batches; got {} batches",
+        batches.len()
+    );
+    assert_eq!(batches[0].pairs, vec![(0, 1)]);
+    assert_eq!(batches[1].pairs, vec![(2, 3)]);
+}
+
+/// **Pre-refactor pin (ORG-9.10-1, drift (c)).** Dropping the iterator
+/// mid-stream must release the plan-pull worker *promptly*, not eventually.
+///
+/// This is the observable contract behind `IndexPlanIter::drop`'s
+/// `while self.plan_rx.try_recv().is_ok() {}` drain, which nothing asserted:
+/// both existing drop tests only require "does not hang", which passes with or
+/// without the drain. The generator here blocks forever once it has produced
+/// `PRODUCED_BEFORE_DROP + lookahead + 1` plans unless someone releases it, so a
+/// worker that stays parked in `send` keeps `EXITED` false and the test fails on
+/// the deadline instead of hanging CI.
+///
+/// `plan_engine_tests::engine_pull_worker_exits_promptly_after_drop` pins the
+/// same contract on the other arm, which reaches it *without* the drain — so the
+/// fold has to make that a deliberate choice rather than an omission.
+#[test]
+fn pull_worker_exits_promptly_after_iter_drop() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+    let loader = open_loader_arc(&path);
+
+    static EXITED: AtomicBool = AtomicBool::new(false);
+    static PRODUCED: AtomicUsize = AtomicUsize::new(0);
+    EXITED.store(false, AtomicOrdering::Release);
+    PRODUCED.store(0, AtomicOrdering::Release);
+
+    /// Sets `EXITED` when the pull worker drops it — which happens when the
+    /// worker's `for item in plans` loop ends, i.e. when its `send` fails.
+    struct ExitFlagPlans {
+        remaining: usize,
+    }
+    impl Iterator for ExitFlagPlans {
+        type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.remaining == 0 {
+                return None;
+            }
+            self.remaining -= 1;
+            PRODUCED.fetch_add(1, AtomicOrdering::Relaxed);
+            Some(Ok(vec![(0u64, 1u64)]))
+        }
+    }
+    impl Drop for ExitFlagPlans {
+        fn drop(&mut self) {
+            EXITED.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    let mut it = loader.iter_with_plans(ExitFlagPlans { remaining: 100_000 }, 4);
+    let _first = it.next().unwrap().unwrap();
+    assert!(
+        !EXITED.load(AtomicOrdering::Acquire),
+        "premise: the worker must still be alive while the iterator is"
+    );
+    drop(it);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if EXITED.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!(
+        "plan-pull worker still alive 5 s after the iterator dropped \
+         (produced {} plans)",
+        PRODUCED.load(AtomicOrdering::Relaxed)
+    );
+}
+
 // ---------------------------------------------------------------------
 // Phase 5 — memory budget + auto-tuning
 // ---------------------------------------------------------------------
