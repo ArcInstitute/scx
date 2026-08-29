@@ -2441,7 +2441,10 @@ jobs:
           for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
             [ "$f" = "$dev" ] && continue
             case " $EVENT_SYNC_SITES " in *" $f "*) allow_events=1;; *) allow_events=0;; esac
-            recv=$(prod "$f" | tr '\n' ' ' | grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*(\(\))?[[:space:]]*\.[[:space:]]*synchronize\(\)' | sed -E 's/[[:space:]]*\.[[:space:]]*synchronize\(\)$//' | grep -vE '^([A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z0-9_]*(dev|device)[A-Za-z0-9_]*$' || true)
+            # Comments stripped (see branch 2): the doc comments that explain
+            # WHY `PinnedHostSlice::as_slice` is a host wait quote
+            # `event.synchronize()`, and tripped this branch on a correct tree.
+            recv=$(prod "$f" | sed -e 's#//.*##' | tr '\n' ' ' | grep -oE '[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*(\(\))?[[:space:]]*\.[[:space:]]*synchronize\(\)' | sed -E 's/[[:space:]]*\.[[:space:]]*synchronize\(\)$//' | grep -vE '^([A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z0-9_]*(dev|device)[A-Za-z0-9_]*$' || true)
             if [ "$allow_events" = "1" ]; then
               recv=$(printf '%s\n' $recv | grep -vE '^(evt|e|event)$' || true)
             fi
@@ -2449,6 +2452,24 @@ jobs:
           done
           if [ -n "$bad" ]; then
             echo "::error::production host sync(s) outside the GpuDevice funnel:$bad. Use dev.synchronize() / dev.synchronize_stream(stream) — cusparse.rs's SCX_GPU_PROFILE=1 sync was one of the capture-illegal operations §8.20-4 named. If this is a CudaEvent sync outside a capture region, add the file to EVENT_SYNC_SITES above and say why (ORG-8.20-4)."
+            exit 1
+          fi
+
+          # 7a. Third-party host syncs the funnel cannot reach. cudarc's
+          #     `PinnedHostSlice::as_slice` / `as_mut_slice` each OPEN with
+          #     `event.synchronize()`, so the host wait is at the accessor and
+          #     the copy that follows is the async, capture-legal half. Round 2
+          #     guarded the copy and missed the wait (codex, round 3). Every
+          #     call must be preceded by `check_foreign_sync`.
+          for acc in as_slice as_mut_slice; do
+            n_call=$(prod scx-gpu/src/staging.rs | grep -cE "\.${acc}\(\)" || true)
+            n_guard=$(prod scx-gpu/src/staging.rs | grep -cE "check_foreign_sync\(\s*$" || true)
+            :
+          done
+          n_acc=$(prod scx-gpu/src/staging.rs | grep -cE '\.(as_slice|as_mut_slice)\(\)' || true)
+          n_grd=$(prod scx-gpu/src/staging.rs | grep -cE 'check_foreign_sync\(' || true)
+          if [ "${n_grd:-0}" -lt "${n_acc:-0}" ]; then
+            echo "::error::scx-gpu/src/staging.rs has ${n_acc:-0} PinnedHostSlice accessor call(s) but only ${n_grd:-0} check_foreign_sync guard(s). Those accessors open with event.synchronize() in cudarc — a capture-illegal host wait the GpuDevice funnel cannot see, because it lives on a third-party type (ORG-8.20-4)."
             exit 1
           fi
 

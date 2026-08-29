@@ -415,6 +415,14 @@ impl GpuDevice {
         src: &S,
         dst: &mut D,
     ) -> Result<(), GpuError> {
+        // Deliberately unconditional, and therefore CONSERVATIVE on the pinned
+        // path: a `memcpy_htod` out of pinned host memory is the async copy and
+        // *is* capture-legal, so this rejects one operation CUDA would allow
+        // (codex, round 3). The cost of that is a warned fallback to direct
+        // dispatch, never a wrong answer; the cost of the opposite error is a
+        // silently invalidated graph. The genuinely illegal half of the pinned
+        // path — `PinnedHostSlice::as_slice`'s `event.synchronize()` — is
+        // guarded at its call site in `staging.rs`.
         capture_guard::check("GpuDevice::memcpy_htod_from")?;
         stream
             .memcpy_htod(src, dst)

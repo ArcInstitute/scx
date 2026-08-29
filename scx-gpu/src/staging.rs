@@ -104,6 +104,10 @@ impl<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Clone + D
     fn fill_from(&mut self, src: &[T]) -> Result<(), GpuError> {
         match self {
             HostBuf::Pinned(p) => {
+                // `as_mut_slice()` opens with `event.synchronize()` in cudarc —
+                // a host wait, capture-illegal, and invisible to the GpuDevice
+                // funnel because it lives on a third-party type (codex).
+                crate::capture_guard::check_foreign_sync("PinnedHostSlice::as_mut_slice")?;
                 let slice = p
                     .as_mut_slice()
                     .map_err(|e| GpuError::CudaError(format!("pinned as_mut_slice: {e}")))?;
@@ -232,6 +236,11 @@ impl PinnedCsrSlot {
                         // device buffer, but cudarc's `memcpy_htod` copies
                         // src.len() elements; we need to wrap the pinned
                         // slot in a slice of the live length.
+                        // BEFORE the accessor, not after: `as_slice()` opens
+                        // with `event.synchronize()` in cudarc, so the host wait
+                        // is here and the copy below is the async, capture-legal
+                        // half (codex, round 3).
+                        crate::capture_guard::check_foreign_sync("PinnedHostSlice::as_slice")?;
                         let host_slice = p
                             .as_slice()
                             .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
@@ -380,6 +389,11 @@ impl PinnedCscSlot {
             ($src:expr, $dst:expr, $len:expr) => {{
                 match $src {
                     HostBuf::Pinned(p) => {
+                        // BEFORE the accessor, not after: `as_slice()` opens
+                        // with `event.synchronize()` in cudarc, so the host wait
+                        // is here and the copy below is the async, capture-legal
+                        // half (codex, round 3).
+                        crate::capture_guard::check_foreign_sync("PinnedHostSlice::as_slice")?;
                         let host_slice = p
                             .as_slice()
                             .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;

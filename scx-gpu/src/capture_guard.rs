@@ -114,6 +114,23 @@ pub(crate) fn check(op: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
+/// Refuse a **third-party** host synchronization that no `GpuDevice` method
+/// wraps, at its call site.
+///
+/// `cudarc`'s `PinnedHostSlice::as_slice` / `as_mut_slice` each begin with
+/// `self.event.synchronize()`, and its `Drop` does the same before `free_host`.
+/// Those are host waits — capture-illegal — inside a type this crate does not
+/// own, so the funnel cannot reach them: `staging.rs` was calling the accessor
+/// *before* the checked copy, which meant the guard covered the copy (async and
+/// legal on the pinned path) and missed the wait. Found by **codex** on PR #473
+/// round 3, quoting cudarc 0.19.4 `core.rs:1402-1412` and `:1331-1337`.
+///
+/// `Drop` remains outside the guard: it is `cudarc`'s, it cannot fail, and a
+/// pinned slot is not dropped inside a capture region in any current path.
+pub(crate) fn check_foreign_sync(what: &str) -> Result<(), GpuError> {
+    check(what)
+}
+
 #[cfg(test)]
 #[path = "capture_guard_tests.rs"]
 mod tests;
