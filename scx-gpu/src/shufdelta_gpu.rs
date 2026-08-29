@@ -518,12 +518,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
 
             let t_htod = profile::start();
             let h_idx = pinned_idx[slot].stage(&idx_planes)?;
-            copy_stream
-                .memcpy_htod(h_idx, &mut dev_idx[slot].slice_mut(0..idx_len))
+            dev
+                .memcpy_htod_from(&copy_stream, h_idx, &mut dev_idx[slot].slice_mut(0..idx_len))
                 .map_err(|e| GpuError::CudaError(format!("h2d indices: {e}")))?;
             let h_val = pinned_val[slot].stage(&val_planes)?;
-            copy_stream
-                .memcpy_htod(h_val, &mut dev_val[slot].slice_mut(0..val_len))
+            dev
+                .memcpy_htod_from(&copy_stream, h_val, &mut dev_val[slot].slice_mut(0..val_len))
                 .map_err(|e| GpuError::CudaError(format!("h2d values: {e}")))?;
             host_uploaded_bytes += (idx_len + val_len) as u64;
 

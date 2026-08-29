@@ -2353,7 +2353,17 @@ jobs:
           #    leave a whole capture region unguarded while this guard stayed
           #    green.
           prod "$graph" | grep -E 'capture_guard::enter\(\)' >/dev/null || { echo "::error::$graph no longer arms capture_guard::enter() — capture_graph is back to running its build closure with the contract unchecked (ORG-8.20-4)."; exit 1; }
-          n=$(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)' | xargs -r -n1 sh -c 'sed "/^#\[cfg(test)\]/,\$d" "$0"' | grep -cE '\.begin_capture\(' || true)
+          # Through `prod`, not an inline sed. Round 2 caught this line still
+          # running the delete-to-EOF filter this block replaced, so a second
+          # `begin_capture` after harmony's early test counter stayed invisible
+          # and the count stayed at 1. Measured on that head: inline sed 1,
+          # prod_filter.awk 2. Today's `n == 1` was an accident of
+          # gpu_graph.rs's file shape (codex, Cursor Agent).
+          n=0
+          for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
+            k=$(prod "$f" | grep -cE '\.begin_capture\(' || true)
+            n=$((n + k))
+          done
           if [ "${n:-0}" -ne 1 ]; then
             echo "::error::the workspace has ${n:-0} production begin_capture call(s), expected exactly 1 (gpu_graph.rs::capture_graph). Every capture must arm capture_guard, and a second entry point silently would not (ORG-8.20-4)."
             exit 1
@@ -2394,10 +2404,19 @@ jobs:
           #    `pts.synchronize()` through (Cursor Agent) and rejected
           #    harmony's `active_for_sync`, a real `&GpuDevice`, which is why
           #    that local is now `dev_for_sync`.
-          for op in alloc alloc_zeros clone_htod clone_dtoh memcpy_dtoh load_module; do
+          # `alloc_pinned` is `cuMemHostAlloc` and a pageable `memcpy_htod` is
+          # the synchronous copy — both capture-illegal, both missed by the
+          # round-1 family list (codex, Cursor Agent). PINNED_ALLOC_SITES carves
+          # out the two constructor-time host allocations, enumerated so it
+          # cannot grow in silence, exactly like EVENT_SYNC_SITES below.
+          PINNED_ALLOC_SITES="scx-gpu/src/staging.rs scx-gpu/src/shufdelta_gpu.rs"
+          for op in alloc alloc_zeros alloc_pinned clone_htod clone_dtoh memcpy_dtoh memcpy_htod load_module; do
             bad=""
             for f in $(git ls-files '*.rs' | grep -vE '(_tests\.rs$|/tests/|/benches/|^tests/)'); do
               [ "$f" = "$dev" ] && continue
+              if [ "$op" = "alloc_pinned" ]; then
+                case " $PINNED_ALLOC_SITES " in *" $f "*) continue;; esac
+              fi
               recv=$(prod "$f" | tr '\n' ' ' | grep -oE "[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*(\(\))?[[:space:]]*\.[[:space:]]*${op}[(:]" | sed -E "s/[[:space:]]*\.[[:space:]]*${op}[(:]\$//" | grep -vE '^([A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z0-9_]*(dev|device)[A-Za-z0-9_]*$' || true)
               [ -n "$recv" ] && bad="$bad $f($(echo $recv | tr ' ' ','))"
             done

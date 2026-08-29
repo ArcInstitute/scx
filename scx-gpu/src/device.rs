@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::safe::{
-    CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DeviceRepr, HostSlice,
+    CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, HostSlice,
     ValidAsZeroBits,
 };
 use cudarc::driver::LaunchConfig;
@@ -399,6 +399,26 @@ impl GpuDevice {
         stream
             .memcpy_dtoh(src, dst)
             .map_err(|e| GpuError::CudaError(format!("device-to-host copy failed: {e}")))
+    }
+
+    /// Copy host data into an existing device buffer, on a caller-supplied
+    /// stream.
+    ///
+    /// A pageable `memcpy_htod` is the *synchronous* copy — it blocks the host
+    /// thread — so it belongs to the same capture-illegal family as the D→H
+    /// readbacks. Round 1 funnelled D→H and left this one out; Cursor Agent
+    /// found it still raw in Harmony's k-means sub-iter loop, immediately
+    /// before the capture region.
+    pub fn memcpy_htod_from<T: DeviceRepr, S: HostSlice<T> + ?Sized, D: DevicePtrMut<T>>(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &S,
+        dst: &mut D,
+    ) -> Result<(), GpuError> {
+        capture_guard::check("GpuDevice::memcpy_htod_from")?;
+        stream
+            .memcpy_htod(src, dst)
+            .map_err(|e| classify_driver_error("host-to-device copy failed", e))
     }
 
     /// Block until all work queued on a **caller-supplied** stream completes.

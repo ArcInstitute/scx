@@ -236,14 +236,12 @@ impl PinnedCsrSlot {
                             .as_slice()
                             .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &host_slice[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
                     }
                     HostBuf::Pageable(v) => {
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&v[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &v[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
                     }
                 }
@@ -365,8 +363,12 @@ impl PinnedCscSlot {
     /// `col_indptr_len` (for `dst_col_indptr`) / `nnz` (for
     /// `dst_row_indices` and `dst_data`). Callers grow them via the
     /// outer source's own capacity tracking before invoking this method.
+    #[allow(clippy::too_many_arguments)] // `dev` is the capture-guard funnel;
+                                         // the three destination buffers are the CSC triple and cannot be collapsed
+                                         // without an owning slot type this path does not have.
     pub fn upload_to(
         &self,
+        dev: &GpuDevice,
         stream: &Arc<CudaStream>,
         dst_col_indptr: &mut CudaSlice<i64>,
         dst_row_indices: &mut CudaSlice<i32>,
@@ -382,14 +384,12 @@ impl PinnedCscSlot {
                             .as_slice()
                             .map_err(|e| GpuError::CudaError(format!("pinned slice: {e}")))?;
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&host_slice[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &host_slice[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod async: {e}")))?;
                     }
                     HostBuf::Pageable(v) => {
                         let mut dst_view = $dst.slice_mut(..$len);
-                        stream
-                            .memcpy_htod(&v[..$len], &mut dst_view)
+                        dev.memcpy_htod_from(stream, &v[..$len], &mut dst_view)
                             .map_err(|e| GpuError::CudaError(format!("htod sync: {e}")))?;
                     }
                 }
@@ -553,23 +553,47 @@ impl GpuCsrSlot {
     ) -> Result<(), GpuError> {
         if self.indptr.len() < indptr_len {
             let new_cap = indptr_len.next_power_of_two();
+            // Name the buffer WITHOUT retyping the variant: `alloc_zeros_on`
+            // already maps a driver failure to `OutOfMemory`, so a blanket
+            // `map_err(OutOfMemory)` would swallow the one other error it can
+            // return — `CaptureViolation` — and flip
+            // `alternate_route_may_succeed()` from true to false (Cursor Agent).
             self.indptr = dev
                 .alloc_zeros_on::<i64>(stream, new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow indptr: {e}")))?;
+                .map_err(|e| match e {
+                    GpuError::OutOfMemory(m) => GpuError::OutOfMemory(format!("grow indptr: {m}")),
+                    other => other,
+                })?;
             self.cached_desc = None;
         }
         if self.indices.len() < nnz {
             let new_cap = nnz.next_power_of_two();
+            // Name the buffer WITHOUT retyping the variant: `alloc_zeros_on`
+            // already maps a driver failure to `OutOfMemory`, so a blanket
+            // `map_err(OutOfMemory)` would swallow the one other error it can
+            // return — `CaptureViolation` — and flip
+            // `alternate_route_may_succeed()` from true to false (Cursor Agent).
             self.indices = dev
                 .alloc_zeros_on::<i32>(stream, new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow indices: {e}")))?;
+                .map_err(|e| match e {
+                    GpuError::OutOfMemory(m) => GpuError::OutOfMemory(format!("grow indices: {m}")),
+                    other => other,
+                })?;
             self.cached_desc = None;
         }
         if self.data.len() < nnz {
             let new_cap = nnz.next_power_of_two();
+            // Name the buffer WITHOUT retyping the variant: `alloc_zeros_on`
+            // already maps a driver failure to `OutOfMemory`, so a blanket
+            // `map_err(OutOfMemory)` would swallow the one other error it can
+            // return — `CaptureViolation` — and flip
+            // `alternate_route_may_succeed()` from true to false (Cursor Agent).
             self.data = dev
                 .alloc_zeros_on::<f32>(stream, new_cap)
-                .map_err(|e| GpuError::OutOfMemory(format!("grow data: {e}")))?;
+                .map_err(|e| match e {
+                    GpuError::OutOfMemory(m) => GpuError::OutOfMemory(format!("grow data: {m}")),
+                    other => other,
+                })?;
             self.cached_desc = None;
         }
         Ok(())
