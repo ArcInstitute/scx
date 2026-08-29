@@ -1625,10 +1625,12 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   The DataFrame twin of `obs_import`, on the same `attach_external_obs` seam:
   land an in-memory pandas `DataFrame` (or pyarrow `Table`) as obs columns, in
   place, without writing a temp CSV or replacing the whole frame through
-  `modify_metadata`. Key-joined by default — `key=None` uses `df`'s index, a
-  str names one column (matched to the **same name** on the target, as rscx's
-  `scx_attach_obs`), a list builds a composite; key columns are consumed by the
-  join, not re-imported. `positional=True` (mutually exclusive with `key`)
+  `modify_metadata`. Key-joined by default — `key=None` resolves each side
+  independently, exactly as `obs_import` with no `key=` (the source uses `df`'s
+  index, named or not, then the barcode-style fallbacks; the target its own obs
+  index / fallbacks); a str names one column (matched to the **same name** on
+  the target, as rscx's `scx_attach_obs`), a list builds a composite; key
+  columns and the pandas index are consumed by the join, not re-imported. `positional=True` (mutually exclusive with `key`)
   skips the join: row `i` annotates **physical** obs row `i`, for frames
   computed in-process from this file's own `read_obs()` — never for external
   tool output — and requires exactly `n_obs_physical` rows; `status_column` is
@@ -1637,7 +1639,13 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   so one `pyscx.rollback` undoes obs and uns together. Same policies, summary
   dict and index behaviour as `obs_import` (`obs_key_column` is
   `"<positional>"` under positional; a pure add keeps the predicate index).
-  Ungated (no libhdf5). This is `doublet_consensus`'s default write path.
+  Ungated (no libhdf5). This is `doublet_consensus`'s first-run write path
+  (its overwriting re-runs take `modify_metadata` — see below). Known
+  limitation, shared with every in-place obs edit (`modify_metadata(obs=…)`
+  included; only `from_anndata`'s writer preserves it): a pandas categorical
+  column is attached as plain strings — the category list and `ordered` bit do
+  not survive; re-derive with `.astype("category")` after reading, or land
+  categoricals through `from_anndata`.
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
   `unique_columns`, `unusable_unique_columns`, `unique_pairs` (two-column

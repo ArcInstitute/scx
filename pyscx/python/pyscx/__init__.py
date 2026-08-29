@@ -964,6 +964,14 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
         `obs_streamed`, `dry_run`, and (on a key-mode dry run)
         `key_diagnosis`.
 
+    Note:
+        A pandas categorical column is attached as plain strings — the
+        category list and `ordered` bit do not survive. That limitation is
+        shared by every in-place obs edit (`modify_metadata(obs=...)`
+        included); only `from_anndata`'s writer preserves categoricals.
+        Re-derive with `.astype("category")` after reading, or land
+        categorical columns through `from_anndata`.
+
     Example:
         scores = pd.DataFrame({"my_score": model(exp.read_obs())})
         pyscx.attach_obs_columns("atlas.scx", scores, positional=True)

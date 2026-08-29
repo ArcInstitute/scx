@@ -1526,6 +1526,25 @@ fn attach_external_obs_inner(
                 .into(),
         ));
     }
+    // A status column that shares a name with an annotation would produce TWO
+    // obs columns with the same name: `check_collisions` compares planned
+    // names against the OLD schema only, and `build_new_obs` pushes the
+    // status field and the annotation field independently. (Round-2 finding:
+    // codex.)
+    if let Some(status) = &opts.status_column {
+        if data
+            .row_annotations
+            .schema()
+            .field_with_name(status)
+            .is_ok()
+        {
+            return Err(OpsError::InvalidInput(format!(
+                "status_column '{status}' is also an annotation column in the \
+                 source; writing both would leave two obs columns with the \
+                 same name. Rename one of them."
+            )));
+        }
+    }
 
     let planned_obs = planned_obs_columns(data, opts);
     if planned_obs.is_empty() && data.row_embeddings.is_empty() && data.uns.is_none() {

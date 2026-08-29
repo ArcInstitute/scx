@@ -295,3 +295,12 @@ def test_key_none_with_a_named_index_joins_against_the_target_obs_index(tmp_path
     assert "my_cells" not in got.columns, "the named source index is consumed, not attached"
     by_cell = dict(zip(got.index, got["grp"]))
     assert by_cell["AAAT-1"] == "c" and by_cell["AAAC-1"] == "a"
+
+
+def test_status_column_matching_an_annotation_name_is_rejected(tmp_path):
+    """Round-2 finding (codex): the collision check compares planned names
+    against the OLD schema only, so this used to write TWO 'score' columns."""
+    scx = _fixture(tmp_path)
+    df = pd.DataFrame({"score": [0.1, 0.2]}, index=["AAAT-1", "AAAC-1"])
+    with pytest.raises(ValueError, match="same name"):
+        pyscx.attach_obs_columns(str(scx), df, status_column="score")

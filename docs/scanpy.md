@@ -687,11 +687,14 @@ decision the helper does not own.
 
 Every one of these ops is in place and undoable — `pyscx.rollback("atlas.scx")`
 reverts the last one. `X`, layers, `var`, the CSC sidecar, `.raw` and deletion
-vectors are never touched. On a file target the consensus writes through
-`pyscx.attach_obs_columns(positional=True)` — a pure column add plus a one-key
-uns merge in one commit — so the file's predicate index and the rest of its
-obs and `uns` survive byte-identical. Full behaviour and the predicate-index
-interaction:
+vectors are never touched. On a file target a **first** consensus writes
+through `pyscx.attach_obs_columns(positional=True)` — a pure column add plus a
+one-key uns merge in one commit — so the file's predicate index and the rest
+of its obs and `uns` survive byte-identical. A re-run that overwrites existing
+consensus columns (and any call passing `index_obs`/`index_preset`) takes the
+whole-frame `modify_metadata` route instead, the seam that rebuilds a
+predicate index over the rewritten values rather than dropping it. Full
+behaviour and the predicate-index interaction:
 [docs/operations.md § External obs import](operations.md#external-obs-import).
 
 ## Validating files after write or transfer

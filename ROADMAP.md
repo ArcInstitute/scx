@@ -314,6 +314,13 @@ are not exposed in R and are tracked here rather than implemented:
   exactly the footgun the key join prevents.
 - `obsm` embeddings on `pyscx.attach_obs_columns`: deferred on the Python side
   too (`build_obsm` materializes at `n_obs` scale; no caller needs it).
+- Categorical fidelity through in-place obs edits: `attach_obs_columns`,
+  `scx_attach_obs` (R factors) and `modify_metadata(obs=…)` all demote a
+  categorical column to plain strings (category list and `ordered` bit lost);
+  only `from_anndata`'s writer preserves them. Pre-existing across the family
+  (surfaced in review of the attach seam); fixing it means carrying dictionary
+  arrays + the `scx.categorical.ordered` stamp through the in-place obs write
+  path as one work item.
 
 ### 3.4 Multimodal Support — SHIPPED
 - [x] Format v2 bump; carve `n_modalities` /

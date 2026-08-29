@@ -2447,3 +2447,29 @@ fn positional_attach_leaves_var_x_and_uns_sections_untouched() {
          var / X / uns sections"
     );
 }
+
+/// A status column sharing a name with an annotation would write TWO obs
+/// columns with that name — `check_collisions` only compares planned names
+/// against the OLD schema. (Round-2 finding: codex.)
+#[test]
+fn a_status_column_matching_an_annotation_name_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+    let before = std::fs::read(&path).unwrap();
+
+    let data = score_data(keys("cell_", 4), |i| i as f32);
+    let err = attach_external_obs(
+        &path,
+        &data,
+        &AttachObsOptions {
+            status_column: Some("dbl_score".to_string()), // = an annotation name
+            ..opts()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("dbl_score") && err.to_string().contains("same name"),
+        "{err}"
+    );
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
