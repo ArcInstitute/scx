@@ -254,3 +254,44 @@ def test_an_experiment_handle_is_accepted_and_reloaded(tmp_path):
     pyscx.attach_obs_columns(exp, df, positional=True)
     # The handle was reloaded by the wrapper, so it answers without raising.
     assert "score" in exp.read_obs().columns
+
+
+def test_positional_ignores_a_named_pandas_index(tmp_path):
+    """Round-1 finding (Cursor/codex/Antigravity): pyarrow materializes a NAMED
+    index under its own name, not `__index_level_0__` — it must still be
+    dropped, or it collides with the target's same-named column."""
+    obs = pd.DataFrame(
+        {"barcode": ["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"]},
+        index=[f"c{i}" for i in range(4)],
+    )
+    scx = _fixture(tmp_path, obs=obs)
+    df = pd.DataFrame(
+        {"score": [0.1, 0.2, 0.3, 0.4]},
+        index=pd.Index(["x", "y", "z", "w"], name="barcode"),
+    )
+
+    r = pyscx.attach_obs_columns(str(scx), df, positional=True)
+    assert r["obs_columns_added"] == ["score"]
+    got = _obs(scx)
+    assert got["score"].tolist() == pytest.approx([0.1, 0.2, 0.3, 0.4])
+    assert got["barcode"].tolist() == ["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"], (
+        "the df's named index must be ignored, not attached over the target's column"
+    )
+
+
+def test_key_none_with_a_named_index_joins_against_the_target_obs_index(tmp_path):
+    """key=None resolves each side independently (as obs_import does): the
+    source uses its index whatever its name; the target uses its own obs
+    index — not a column named after the source index."""
+    scx = _fixture(tmp_path)  # target obs index: AAAC-1 …
+    df = pd.DataFrame(
+        {"grp": ["c", "a", "g"]},
+        index=pd.Index(["AAAT-1", "AAAC-1", "AAAG-1"], name="my_cells"),
+    )
+
+    r = pyscx.attach_obs_columns(str(scx), df)
+    assert r["n_matched"] == 3
+    got = _obs(scx)
+    assert "my_cells" not in got.columns, "the named source index is consumed, not attached"
+    by_cell = dict(zip(got.index, got["grp"]))
+    assert by_cell["AAAT-1"] == "c" and by_cell["AAAC-1"] == "a"

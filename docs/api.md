@@ -1704,14 +1704,17 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   consensus key explicitly in `keys` is still allowed (combining two disjoint
   tool panels is coherent) but warns, and is recorded in the returned
   `keys_that_are_consensus`; `keys_excluded` records what discovery skipped. On
-  a file target the write goes through `attach_obs_columns(positional=True)` —
-  a pure column add plus a one-key uns merge in one commit, so the file's obs
-  predicate index (and every other obs column's stats) survives untouched and
-  the rest of `uns` stays byte-identical. Passing `index_obs` / `index_preset`
-  selects the whole-frame `modify_metadata` route instead — the only seam that
-  can rebuild the predicate index in the same commit; they change the indexed
-  column set, they are not needed to preserve it. Pure Python — nothing
-  in it knows what a doublet is.
+  a file target a **first run** writes through
+  `attach_obs_columns(positional=True)` — a pure column add plus a one-key uns
+  merge in one commit, so the file's obs predicate index (and every other obs
+  column's stats) survives untouched and the rest of `uns` stays
+  byte-identical. Passing `index_obs` / `index_preset` — or **overwriting
+  existing consensus columns** on a re-run — selects the whole-frame
+  `modify_metadata` route instead, the only seam that can rebuild the
+  predicate index in the same commit: an index covering a rewritten consensus
+  column is rebuilt over the new values, never silently dropped. The `index_*`
+  kwargs change the indexed column set; they are not needed to preserve it.
+  Pure Python — nothing in it knows what a doublet is.
 - `pyscx.export_batches(path, out_dir, *, batch_key, key=None, batches=None, on_ambiguous_key="error", overwrite=False, **kwargs)` —
   Write one h5ad per batch, ready to run a per-sample tool on, without
   materialising the pooled file (peak RSS is one library). `**kwargs` pass

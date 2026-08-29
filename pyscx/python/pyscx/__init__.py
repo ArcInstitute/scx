@@ -930,11 +930,14 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
         df: pandas DataFrame or pyarrow Table holding the columns to attach.
-        key: Join key, resolved against `df`'s columns and matched to the same
-            names on the target. None (default) uses `df`'s index (then the
-            usual `barcode`/`cell_id`/… fallbacks); a str names one column
-            (`"obs_names"` names the index); a list builds a composite key.
-            Key columns are consumed by the join, not re-imported.
+        key: Join key. None (default) resolves each side independently,
+            exactly as `obs_import` with no `key=`: the source uses `df`'s
+            index — named or not — then the usual `barcode`/`cell_id`/…
+            fallbacks, and the target its own obs index / fallbacks. A str
+            names one column, matched to the **same name** on the target
+            (`"obs_names"` names the index on both sides); a list builds a
+            composite key. Key columns (and the pandas index) are consumed by
+            the join, not re-imported.
         positional: Attach by physical row position instead of a key.
             Mutually exclusive with `key`.
         status_column: Obs column recording "present"/"absent" per row.
@@ -1430,16 +1433,21 @@ def doublet_consensus(target, *, keys=None, method="majority",
             cutoff is a scientific decision this helper does not own — if you
             want the tools' own thresholds to decide, use "majority".
         overwrite: Replace existing `<K>_*` columns. Without it a collision is
-            an error, so a second run cannot silently rewrite the first.
+            an error, so a second run cannot silently rewrite the first. A
+            file-target run that does rewrite existing columns takes the
+            whole-frame `modify_metadata` route, so a predicate index covering
+            a consensus column is rebuilt over the new values rather than
+            dropped.
         index_obs / index_preset: Rebuild the obs predicate index over these
             columns as part of the same commit, instead of the columns the file
             already indexes. Relevant only for a file target, and rarely
-            needed: by default the consensus is a pure column *add* (via
+            needed: a first run is a pure column *add* (via
             `attach_obs_columns`), which leaves the existing index — and the
             rest of obs — untouched, so pushdown survives this call. Passing
             either kwarg selects the whole-frame `modify_metadata` route
             instead, the only seam that can (re)build an index in the same
-            commit. Naming columns here *narrows* the index to them, and any
+            commit (an overwriting re-run takes it too — see `overwrite`).
+            Naming columns here *narrows* the index to them, and any
             column the file indexed that this list omits is reported as a
             `UserWarning`.
 
@@ -1635,13 +1643,23 @@ def doublet_consensus(target, *, keys=None, method="majority",
         target.uns[f"{key_added}_consensus"] = record
         return record
 
-    if index_obs is not None or index_preset is not None:
-        # Index respec: only `modify_metadata` can (re)build the predicate
-        # index in the same commit, so an explicit `index_obs`/`index_preset`
-        # keeps the whole-frame route. `uns` was already read (and defaulted
-        # to {}) before key resolution, and nothing has mutated the file
-        # since, so reuse it rather than re-reading. obs and uns go in ONE
-        # commit, so `pyscx.rollback` undoes the whole thing.
+    if index_obs is not None or index_preset is not None or existing:
+        # Whole-frame route, for the two cases only `modify_metadata` handles:
+        #
+        # * an explicit `index_obs`/`index_preset` — it is the one seam that
+        #   can (re)build the predicate index in the same commit;
+        # * a re-run that REWRITES existing consensus columns (`existing` is
+        #   non-empty, so `overwrite=True` was vetted above). The attach seam
+        #   DROPS a predicate index covering an overwritten column
+        #   (`obs_index_would_go_stale`), where this route rebuilds it over
+        #   the new values — so a consensus column someone indexed keeps its
+        #   pushdown across a re-run, exactly as before the attach repoint.
+        #   (Round-1 finding: Cursor Agent.)
+        #
+        # `uns` was already read (and defaulted to {}) before key resolution,
+        # and nothing has mutated the file since, so reuse it rather than
+        # re-reading. obs and uns go in ONE commit, so `pyscx.rollback` undoes
+        # the whole thing.
         for name, values in columns.items():
             obs[name] = values
         uns[f"{key_added}_consensus"] = record
@@ -1649,16 +1667,16 @@ def doublet_consensus(target, *, keys=None, method="majority",
                         index_obs=index_obs, index_preset=index_preset)
         return record
 
-    # Default path: a consensus is a pure column add computed from this file's
-    # own physical-row obs, so it takes the attach seam — the predicate index
-    # survives (nothing it covers is touched), the rest of uns stays
-    # byte-identical, and obs is rewritten one shard at a time instead of
-    # round-tripping the whole frame through Python. Positional is safe here
-    # and only here: `columns` was computed row-for-row from `read_obs()`.
-    # `overwrite=True` is not a widening: the frame carries only the 3-4
-    # columns the collision check above already vetted (or the caller passed
-    # overwrite=True), and the only uns key is `<K>_consensus` — exactly what
-    # the whole-frame route replaced unconditionally.
+    # Default (first-run) path: a consensus is a pure column ADD computed from
+    # this file's own physical-row obs, so it takes the attach seam — the
+    # predicate index survives untouched (nothing it covers is written), the
+    # rest of uns stays byte-identical, and obs is rewritten one shard at a
+    # time instead of round-tripping the whole frame through Python.
+    # Positional is safe here and only here: `columns` was computed
+    # row-for-row from `read_obs()`. `existing` is empty on this branch, so
+    # every column is new and `overwrite` has nothing left to widen; True is
+    # passed only so the uns re-merge of `<K>_consensus` cannot trip the
+    # collision check on a rollback-then-rerun file.
     import pandas as _pd
     df = _pd.DataFrame(columns)  # RangeIndex: values are positional already
     attach_obs_columns(path, df, positional=True,

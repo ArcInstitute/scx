@@ -709,3 +709,37 @@ def test_consensus_with_index_obs_still_routes_through_modify_metadata(tmp_path)
     q = pyscx.open(path).query()
     q.filter_obs("grp == 'A'")
     assert q.collect().n_obs == 2, "the requested index must actually be built"
+
+
+def test_consensus_overwrite_rerun_keeps_an_index_over_a_consensus_column(tmp_path):
+    """Round-1 finding (Cursor Agent): the attach seam DROPS a predicate index
+    covering an overwritten column, where the whole-frame route rebuilds it.
+    A re-run that rewrites existing consensus columns must therefore take the
+    modify_metadata route, or someone's index over `doublet_n_tools_calling`
+    silently reverts filter_obs to a full scan."""
+    a = _adata({"one": [T, F, T, F]})
+    path = _scx(tmp_path, a)
+
+    # Run 1: index a consensus column via the respec route.
+    pyscx.doublet_consensus(path, keys=["one"], method="any",
+                            index_obs=["doublet_n_tools_calling"])
+
+    def sections():
+        return [name for name, _ in pyscx.open(path).validate()]
+
+    assert "obs_predicate_index" in sections()
+
+    # Run 2: plain overwrite re-run — no index kwargs.
+    pyscx.doublet_consensus(path, keys=["one"], method="any", overwrite=True)
+
+    entry = pyscx.open(path).provenance()[-1]
+    assert entry["action"] == "modify_metadata", (
+        "an overwriting re-run must take the route that rebuilds the index"
+    )
+    assert "obs_predicate_index" in sections(), (
+        "the index over the rewritten consensus column must survive the re-run"
+    )
+    # calls [T, F, T, F] under method="any": two cells have one tool calling.
+    q = pyscx.open(path).query()
+    q.filter_obs("doublet_n_tools_calling == 1")
+    assert q.collect().n_obs == 2

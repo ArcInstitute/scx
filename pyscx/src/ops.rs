@@ -1400,8 +1400,8 @@ fn obs_var_to_record_batch(
             .map(|n| n.to_string())
             .unwrap_or_else(|_| "object".to_string());
         return Err(PyTypeError::new_err(format!(
-            "{func}({param}=...) expects a pandas DataFrame (got {got}); \
-             wrap your columns with pd.DataFrame({{...}})."
+            "{func}({param}=...) expects a pandas DataFrame or pyarrow Table \
+             (got {got}); wrap your columns with pd.DataFrame({{...}})."
         )));
     }
     convert::pandas_to_record_batch(py, obj)
@@ -2144,10 +2144,16 @@ pub fn attach_obs_columns(
         } else {
             match key.len() {
                 0 => {
+                    // Both sides resolve independently, exactly as `obs_import`
+                    // with no `key=`: the source uses its own index (named or
+                    // not) / fallbacks, the target its own obs index /
+                    // fallbacks. `Column(col)` here would send the SOURCE
+                    // index's field name to the target — wrong the moment the
+                    // df's index is named. (Round-1 finding: codex.)
                     let col =
                         scx_ops::resolve_obs_key_column(&batch, None).map_err(ops_to_pyerr)?;
                     let values = scx_ops::obs_key_values(&batch, &col).map_err(ops_to_pyerr)?;
-                    (values, scx_ops::ObsJoinKey::Column(col.clone()), vec![col])
+                    (values, scx_ops::ObsJoinKey::Auto, vec![col])
                 }
                 1 => {
                     // Alias-resolved (`obs_names` names the df index), same as
@@ -2173,10 +2179,15 @@ pub fn attach_obs_columns(
                 }
             }
         };
-    // `dataframe → RecordBatch` synthesises `__index_level_0__` from the pandas
-    // index; under a key join it is either the key itself or a RangeIndex that
-    // is not data, and under positional the row order already carries the
-    // identity. Keeping it would collide with the target's own index column.
+    // The pandas index is never data to attach: under a key join it is either
+    // the key itself or a RangeIndex, and under positional the row order
+    // already carries the identity. `pyarrow.Table.from_pandas` materializes a
+    // NAMED index under its own name — only an unnamed one becomes
+    // `__index_level_0__` — so the drop list comes from the schema's pandas
+    // `index_columns` metadata, with the literal kept as the fallback for an
+    // envelope-less batch. (Round-1 finding: Cursor Agent / codex /
+    // Antigravity, independently.)
+    drop.extend(scx_format_io::pandas_index_columns(&batch.schema()));
     drop.push("__index_level_0__".to_string());
     let annotations = scx_ops::drop_batch_columns(&batch, &drop).map_err(ops_to_pyerr)?;
 
