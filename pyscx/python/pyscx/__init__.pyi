@@ -308,10 +308,16 @@ class SparseCellSetDataset:
         ...
 
     def cache_metrics(self) -> dict[str, Any]:
-        """Cumulative shard-cache counters since construction (hits, misses,
-        evictions, bytes, peak) — the multi-file sibling of
-        `IndexPlanDataset.cache_metrics`. For runtime hit/miss/eviction
-        observability."""
+        """Cumulative shard-cache counters since construction: `hits`,
+        `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
+        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups` — the
+        multi-file sibling of `IndexPlanDataset.cache_metrics`.
+
+        The last two report which scattered-read route the gathers took, and on
+        this class they are the only confirmation available: there is no
+        preflight warning here, so `scatter_block_index=True` against a file
+        with no row-group-framed shards is a silent no-op.
+        `block_index_groups > 0` proves the row-group path ran."""
         ...
 
     def memory_budget(self) -> dict[str, int]:

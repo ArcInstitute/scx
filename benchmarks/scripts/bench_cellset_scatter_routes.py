@@ -130,7 +130,20 @@ def main() -> int:
 
     import pyscx
 
+    # `block_index_eligible` ANDs the process-global switch, read once per
+    # process via `OnceLock`. With it off, the `on` arm silently takes the
+    # full-shard path and the A/B compares one route with itself — a plausible
+    # number that means nothing. Refuse rather than measure it.
+    env_switch = os.environ.get("SCX_SCATTER_BLOCK_INDEX")
+    if env_switch is not None and (env_switch == "0" or env_switch.lower() == "false"):
+        raise SystemExit(
+            f"SCX_SCATTER_BLOCK_INDEX={env_switch!r} is set: the process-global "
+            "kill-switch forces every reader onto the full-shard path, so both "
+            "arms of this A/B would measure the same route. Unset it and re-run."
+        )
+
     Path(args.workdir).mkdir(parents=True, exist_ok=True)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     framed = str(Path(args.workdir) / (Path(args.source).stem + "_framed.scx"))
 
     src_info = _scx_info(args.scx_bin, args.source)
@@ -155,7 +168,22 @@ def main() -> int:
               f"block_index={arms[label]['block_index_groups']} "
               f"hit_rate={arms[label]['shard_cache_hit_rate']}", flush=True)
 
+    # Premise checks, all three of them, before any ratio is reported. The
+    # docstring promises this script refuses a vacuous comparison; verifying the
+    # output is v4 is necessary but not sufficient — the routes have to have
+    # actually differed at run time.
     capable = arms["on"]["block_index_groups"] > 0
+    premises = {
+        "on arm reached the block-index route": capable,
+        "off arm took the full-shard route": arms["off"]["full_shard_groups"] > 0,
+        "off arm did not reach the block-index route":
+            arms["off"]["block_index_groups"] == 0,
+        "the default agrees with the explicit False": (
+            arms["default"]["block_index_groups"] == arms["off"]["block_index_groups"]
+            and arms["default"]["full_shard_groups"] == arms["off"]["full_shard_groups"]
+        ),
+    }
+    failed = [k for k, ok in premises.items() if not ok]
     on = arms["on"]["median_cellsets_per_sec"]
     payload = {
         "source": args.source,
@@ -171,15 +199,19 @@ def main() -> int:
         "speedup_default_over_on": (
             round(arms["default"]["median_cellsets_per_sec"] / on, 3) if on > 0 else None
         ),
-        "default_matches_off": (
-            arms["default"]["block_index_groups"] == arms["off"]["block_index_groups"]
-            and arms["default"]["full_shard_groups"] == arms["off"]["full_shard_groups"]
-        ),
+        "default_matches_off": premises["the default agrees with the explicit False"],
+        "premises": premises,
     }
     Path(args.out).write_text(json.dumps(payload, indent=2))
     print(json.dumps({k: payload[k] for k in
                       ("block_index_reachable", "speedup_default_over_on",
                        "default_matches_off")}, indent=2))
+    if failed:
+        raise SystemExit(
+            "refusing to report this A/B — the routes did not differ as required:\n  "
+            + "\n  ".join(f"FAILED: {k}" for k in failed)
+            + f"\nrun-level counters are in {args.out} for diagnosis."
+        )
     return 0
 
 

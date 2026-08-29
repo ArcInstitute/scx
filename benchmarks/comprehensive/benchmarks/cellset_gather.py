@@ -312,6 +312,25 @@ class _Outcome:
     block_index_groups: int = 0
 
 
+def _supports_scatter_block_index() -> bool:
+    """Whether this pyscx build accepts the `scatter_block_index` kwarg.
+
+    Asked once, from the pyo3 text signature, rather than by catching the
+    `TypeError` a missing kwarg raises: that catch also swallows a genuine type
+    bug anywhere inside the gather or the plan iterator and reports it as
+    "your build is old", which is the same silent-miscoverage failure the route
+    counters exist to eliminate.
+    """
+    try:
+        import pyscx
+
+        return "scatter_block_index" in (
+            pyscx.SparseCellSetDataset.__text_signature__ or ""
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _route_counters(ds: Any) -> tuple[int, int]:
     """`(full_shard_groups, block_index_groups)`, or `(0, 0)` if unreadable."""
     try:
@@ -368,14 +387,24 @@ def _run_gather(
             n_sets += len(set_offsets) - 1
             n_cells += int(batch["shape"][0])
         wall_s = time.perf_counter() - t0
+    # Read every counter BEFORE closing: `close()` is terminal on this class and
+    # the accessors raise afterwards.
     full_shard, block_index = _route_counters(ds)
+    hit_rate = _cache_hit_rate(ds)
+    # This helper is called several times per scenario per run; without the
+    # close, each call's reader mmaps and file descriptors stay live until the
+    # collector happens to run.
+    try:
+        ds.close()
+    except Exception:  # noqa: BLE001
+        pass
     return _Outcome(
         n_sets=n_sets,
         n_cells=n_cells,
         wall_s=wall_s,
         ttfb_s=ttfb_s,
         peak_rss_mb=sampler.peak_mb,
-        shard_cache_hit_rate=_cache_hit_rate(ds),
+        shard_cache_hit_rate=hit_rate,
         full_shard_groups=full_shard,
         block_index_groups=block_index,
     )
@@ -908,9 +937,12 @@ def run(
             "  cache-sizing arm: the whole-shard LRU is BYPASSED on this path "
             "(block_index_groups=%d, hits+misses=0) — `cache_shards` cannot "
             "affect throughput here. That is not the shipped default for this "
-            "class, so something forced it: SCX_SCATTER_BLOCK_INDEX=1 in the "
-            "environment, or a build predating the `scatter_block_index=False` "
-            "default.",
+            "class. `SCX_SCATTER_BLOCK_INDEX` cannot explain it either — the "
+            "env var is an off-switch (`block_index_eligible` ANDs it with the "
+            "per-reader flag), so it can only force the full-shard path, never "
+            "this one. The remaining explanations are a pyscx predating the "
+            "`scatter_block_index` kwarg (reader default `true`) or the "
+            "per-reader setter being dropped.",
             read_path.get("block_index_groups", 0),
         )
     if suggested is None:
@@ -1036,113 +1068,69 @@ def run(
                 speedup,
             )
 
-    # --- data-load 9b: the scattered-read route A/B -----------------------
+    # --- the scattered-read route: a capability probe, NOT a timed A/B ----
     # `SparseCellSetDataset` picks between two scattered-read routes, and until
-    # 9b the choice was neither settable per dataset nor visible to the gate:
-    # the shipped default silently flipped in the sidecar removal (#330) and no
-    # benchmark, floor or test noticed for two months.
+    # the kwarg was restored the choice was neither settable per dataset nor
+    # visible to the gate: the shipped default silently flipped in the sidecar
+    # removal and no benchmark, floor or test noticed for two months.
     #
-    #   blockidx_off  full-shard decode into the shared LRU, served from cache
-    #                 on reuse. The shipped default: the cell-set regime is
-    #                 cache-friendly (sorted data + a reused control pool), and
-    #                 eligibility keys on `not cache.contains()`, so the other
-    #                 route re-decodes a hot shard every batch and never lets
-    #                 the LRU populate.
-    #   blockidx_on   decode only the touched row groups, bypassing the LRU.
-    #                 Bounded peak RAM; the right choice when the working set
-    #                 genuinely exceeds the cache.
+    #   default / False   full-shard decode into the shared LRU, served from
+    #                     cache on reuse. The shipped default.
+    #   True              decode only the touched row groups, bypassing the LRU.
+    #                     Bounded peak RAM; for a working set that exceeds the
+    #                     cache.
     #
-    # The `blockidx_on` arm doubles as the capability probe: the route needs
-    # row-group-framed (v4) shards, so `block_index_groups == 0` there means
-    # this fixture cannot reach it at all and the A/B is not a comparison. That
-    # is reported rather than folded into a degenerate 1.00×, the same way the
-    # cache-sizing arm reports its own inapplicability above.
-    route_sc = _SCENARIOS[0]  # gather_random @ S=64
-    route_plans = _plans_for(route_sc)
-    route_rates: dict[str, float] = {}
-    route_counts: dict[str, tuple[int, int]] = {}
-    for arm_name, gate in (("blockidx_off", False), ("blockidx_on", True)):
-        try:
-            _run_gather(scx_path, lambda: route_plans(warmup), scatter_block_index=gate)
-        except TypeError:
-            # A pyscx predating the kwarg. Skip the arm rather than silently
-            # measuring the default twice and reporting it as an A/B.
-            logger.warning(
-                "  route arm unavailable: this pyscx has no `scatter_block_index` "
-                "kwarg on SparseCellSetDataset (pre-9b build)"
-            )
-            route_rates.clear()
-            break
-        except Exception as e:  # noqa: BLE001
-            logger.error("  warmup failed for %s: %s", arm_name, e)
-            continue
-        arm_sps = []
-        for i in range(n_runs):
-            cache_policy = drop_file_cache(scx_path) if cold_cache else "warm"
-            try:
-                out = _run_gather(
-                    scx_path, lambda: route_plans(n_batches), scatter_block_index=gate
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.error("  run %d/%d failed for %s: %s", i + 1, n_runs, arm_name, e)
-                continue
-            sps = out.n_sets / out.wall_s if out.wall_s > 0 else 0.0
-            result.add_run(
-                wall_s=out.wall_s,
-                peak_rss_mb=out.peak_rss_mb,
-                scenario=arm_name,
-                set_size=route_sc.set_size,
-                n_sets=out.n_sets,
-                n_cells=out.n_cells,
-                cache_policy=cache_policy,
-                scatter_block_index=gate,
-                **{
-                    f"cellsets_per_sec__{arm_name}": round(sps, 1),
-                    f"peak_rss_mb__{arm_name}": round(out.peak_rss_mb, 1),
-                    f"shard_cache_hit_rate__{arm_name}": out.shard_cache_hit_rate,
-                    f"full_shard_groups__{arm_name}": out.full_shard_groups,
-                    f"block_index_groups__{arm_name}": out.block_index_groups,
-                },
-            )
-            arm_sps.append(sps)
-            route_counts[arm_name] = (out.full_shard_groups, out.block_index_groups)
-            logger.info(
-                "    %s: sets/s=%.1f rss=%.1fMB full_shard=%d block_index=%d",
-                arm_name,
-                sps,
-                out.peak_rss_mb,
-                out.full_shard_groups,
-                out.block_index_groups,
-            )
-        if arm_sps:
-            route_rates[arm_name] = statistics.median(arm_sps)
-        gc.collect()
-
-    if len(route_rates) == 2:
-        capable = route_counts.get("blockidx_on", (0, 0))[1] > 0
-        result.metadata["scatter_block_index_ab"] = {
-            "applicable": capable,
-            "reason": None if capable else (
-                "the file has no row-group-framed shards, so the block-index "
-                "route is unreachable and both arms take the full-shard path; "
-                "reframe with `scx optimize --row-group-rows 256` to compare"
-            ),
-            "blockidx_off_cellsets_per_sec": round(route_rates["blockidx_off"], 1),
-            "blockidx_on_cellsets_per_sec": round(route_rates["blockidx_on"], 1),
-            "speedup_off_over_on": (
-                round(route_rates["blockidx_off"] / route_rates["blockidx_on"], 3)
-                if route_rates["blockidx_on"] > 0
-                else None
-            ),
-            "route_counts": {k: {"full_shard": v[0], "block_index": v[1]}
-                             for k, v in route_counts.items()},
-        }
-        logger.info(
-            "  scatter_block_index A/B: off=%.1f on=%.1f sets/s (applicable=%s)",
-            route_rates["blockidx_off"],
-            route_rates["blockidx_on"],
-            capable,
+    # The gateable signal is the per-scenario `full_shard_groups__*` /
+    # `block_index_groups__*` extras already emitted above, on the runs that
+    # execute anyway. This block adds only a capability bit.
+    #
+    # ⚠️ It deliberately does NOT time both routes and `add_run` them. Those
+    # samples would land in the same `runs[]` that `BenchmarkResult.median_wall_s`
+    # and `peak_rss_mb_median` are computed over, and that
+    # `compare_against_baseline.py` gates — so a diagnostic arm would move this
+    # triple's timing and RSS rows. That is not hypothetical: the committed
+    # `cellset_gather_s512_raises_pooled_rss.md` justification exists precisely
+    # because adding the S=512 arms moved pooled `peak_rss_mb_median` +19.47%.
+    # It would also become a wall-clock trap the moment the fixtures are
+    # reframed to v4: on framed tabula the block-index route runs at 3.19 vs
+    # 587.5 cellsets/s, so a timed 50-batch arm costs ~4 minutes per run. The
+    # priced comparison lives in `benchmarks/scripts/bench_cellset_scatter_routes.py`,
+    # which reframes a copy so the two routes actually differ.
+    probe_sc = _SCENARIOS[0]  # gather_random @ S=64
+    if not _supports_scatter_block_index():
+        logger.warning(
+            "  route probe unavailable: this pyscx has no `scatter_block_index` "
+            "kwarg on SparseCellSetDataset"
         )
+    else:
+        try:
+            probe_out = _run_gather(
+                scx_path, lambda: _plans_for(probe_sc)(1), scatter_block_index=True
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("  route probe failed: %s", e)
+        else:
+            capable = probe_out.block_index_groups > 0
+            result.metadata["scatter_block_index_route"] = {
+                # Whether this file can reach the block-index route at all.
+                # `False` means the shards are not row-group-framed (v4), so
+                # both settings collapse to the full-shard path and the
+                # per-scenario route counters above say nothing about the
+                # default. Reframe with `scx optimize --row-group-rows 256`.
+                "block_index_reachable": capable,
+                "probe_full_shard_groups": probe_out.full_shard_groups,
+                "probe_block_index_groups": probe_out.block_index_groups,
+                "n_batches": 1,
+                "timed": False,
+            }
+            logger.info(
+                "  route probe: block_index_reachable=%s "
+                "(full_shard=%d block_index=%d, 1 batch, untimed)",
+                capable,
+                probe_out.full_shard_groups,
+                probe_out.block_index_groups,
+            )
+
 
     # --- data-load 1B: native downsample vs the Python per-cell draw -------
     # The capability 1B ships is that `scx_rust_collate` and count-depth

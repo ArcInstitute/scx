@@ -2489,8 +2489,16 @@ impl SparseCellSetDataset {
     /// Snapshot of the readers' shared shard-cache counters, cumulative since
     /// construction (the multi-file sibling of `IndexPlanDataset.cache_metrics`).
     /// Returns a dict with keys: `hits`, `misses` (= shard decodes), `evictions`,
-    /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`. All `int`;
-    /// atomic, lock-free — sample as often as you like.
+    /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`,
+    /// `full_shard_groups`, `block_index_groups`. All `int`; atomic, lock-free —
+    /// sample as often as you like.
+    ///
+    /// The last two are the **route** this dataset's gathers actually took, and
+    /// they are the only way to confirm it on this class: unlike
+    /// `IndexPlanDataset`, it has no preflight warning, so
+    /// `scatter_block_index=True` against a file with no row-group-framed
+    /// shards is a silent no-op. `block_index_groups > 0` proves the row-group
+    /// path ran; `full_shard_groups > 0` is the warm-into-the-LRU default.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }
