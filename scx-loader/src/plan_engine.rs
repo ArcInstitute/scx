@@ -74,11 +74,24 @@ impl PrefetchEngine {
 
     /// Convenience: build the shared cache and wrap each `ScxReader` as a
     /// CSR reader sharing it, in slice order (`file_id = index`).
+    ///
+    /// `scatter_block_index` sets every reader's per-reader block-index gate
+    /// ([`BackedCsrReader::set_scatter_block_index`]) before its `Arc` is
+    /// shared, which is the only window in which it can be set. Because
+    /// [`BackedCsrReader::block_index_eligible`] ANDs that flag, setting it here
+    /// gates **both** consumers at once: the L1 gather in `read_rows_with` and
+    /// the L2 prefetch warm-skip in [`PlanPrefetchIter`]. `false` means "always
+    /// warm the whole shard into the LRU and serve from cache" — the right
+    /// choice for a cache-friendly working set, where the block-index path's
+    /// `!cache.contains()` predicate would keep a hot shard eligible forever and
+    /// re-decode it every batch. The process-wide `SCX_SCATTER_BLOCK_INDEX=0`
+    /// kill-switch remains a hard master override over this argument.
     pub fn from_scx_readers(
         scx_readers: Vec<ScxReader>,
         cache_shards: usize,
         bytes_budget: usize,
         default_lookahead: usize,
+        scatter_block_index: bool,
     ) -> Arc<Self> {
         let shared = SharedShardCache::new(cache_shards, bytes_budget);
         let readers = scx_readers
@@ -87,6 +100,9 @@ impl PrefetchEngine {
             .map(|(fid, r)| {
                 let mut backed =
                     BackedCsrReader::with_shared_cache(r, fid as u32, Arc::clone(&shared));
+                // Set before the `Arc`: `BackedCsrReader` exposes no interior
+                // mutability for this, and `PrefetchEngine` hands out `&` only.
+                backed.set_scatter_block_index(scatter_block_index);
                 // One pool for every reader, not one each: `cpu_pool()` is
                 // process-wide, so an N-file engine does not spawn N pools.
                 // Same fork rationale as `IndexPlanLoader` — see `crate::pool`.
@@ -433,4 +449,7 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
 
 #[cfg(test)]
 #[path = "plan_engine_tests.rs"]
-mod tests;
+// `pub(crate)` only so `sparse_cellset_tests` can borrow the framed fixture
+// writer instead of duplicating it; every test in here stays private to the
+// module by default.
+pub(crate) mod tests;

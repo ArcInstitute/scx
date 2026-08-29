@@ -169,14 +169,17 @@ Two things to know:
   bytes than the adaptive default affords (census_500k wants 31 shards while the
   4 GB adaptive cap holds 22), so `cache_shards=31` alone under-delivers.
   `memory_budget()` reports `affordable_cache_shards` so you can see it.
-- **On framed files (the v4 default) this mostly doesn't matter.** A scattered
-  gather routes through the row-group block-index path, which decodes only the
-  touched row-groups and never populates the whole-shard LRU — so `cache_shards`
-  is not on the critical path at all. It becomes load-bearing on unframed/legacy
-  layouts and when you pass `scatter_block_index=False`, where sizing the cache
-  correctly is worth **2,486×** and halves peak RSS (cold capture; an earlier warm
-  probe of the same comparison gave 269× — see
+- **On `SparseCellSetDataset` this is load-bearing by default.** The class
+  defaults `scatter_block_index=False`, so a scattered gather decodes whole
+  shards into the LRU and serves reuse from cache — sizing it correctly is worth
+  **2,486×** and halves peak RSS (cold capture; an earlier warm probe of the same
+  comparison gave 269× — see
   [performance.md § Shard-cache sizing](performance.md#shard-cache-sizing-on-the-gather-path-data-load-phase-1-1a)).
+  Pass `scatter_block_index=True` and the opposite holds: on a framed (v4) file
+  the gather then routes through the row-group block-index path, which decodes
+  only the touched row-groups and never populates the whole-shard LRU, so
+  `cache_shards` drops off the critical path entirely. `IndexPlanDataset`
+  defaults the other way, so that is its normal regime rather than its opt-in.
 
 Both gather loaders sample their cache counters while iterating and emit a
 one-shot `UserWarning` if the observed miss/eviction pattern indicates the

@@ -2645,6 +2645,48 @@ absolute_floors:
 #        exceeds the SLURM wall limit on the pre-optimization raw-local path
 #        (that slowness is the Phase-1 target). Re-enable a floor once the
 #        in-Rust gather assembly lands and the epoch fits the budget.
+#      * cellset_gather scattered-READ-ROUTE floors: the route the cell-set
+#        gather takes is now emitted into runs[].extra per scenario, precisely
+#        so it can be floored — the shape `accel_de`'s `de_route_csc_direct`
+#        uses above, which turns a silent dispatch flip into a hard failure.
+#        Deferred because it cannot discriminate anything yet: all three floored
+#        fixtures (tabula_sapiens_100k / census_500k / census_1m `_auto.scx`)
+#        are `format_version = 3`, i.e. UNFRAMED, and `block_index_eligible`
+#        requires `shard_is_framed` — so the full-shard route is forced by the
+#        fixture, not chosen by the code, and a floor would read as coverage
+#        while providing none. That is exactly the failure this block exists to
+#        prevent.
+#
+#        ACTIVATION, precisely (this is not a "move two rows up" — the rows
+#        below do not exist as YAML, they have to be authored):
+#          1. Regenerate the fixtures at v4 via
+#             `benchmarks/scripts/reconvert_fixtures.py`, and CONFIRM with
+#             `scx info <f> --json` that `format_version` is 4. Without that the
+#             floors are still vacuous, just less obviously.
+#          2. Confirm the route is actually reachable on the new fixtures by
+#             reading `metadata.scatter_block_index_route.block_index_reachable`
+#             from a capture — the benchmark writes it from a 1-batch untimed
+#             probe. A `false` there is NOT by itself proof the reframe failed:
+#             `block_index_eligible` also ANDs the process-global
+#             `SCX_SCATTER_BLOCK_INDEX` switch and a row-range cost window.
+#             Check `env_kill_switch_engaged` in the same metadata block first;
+#             only once that is false does `block_index_reachable: false` point
+#             back at step 1.
+#          3. THEN add, under `absolute_floors` above, for each of the three
+#             datasets at `format: scx_auto`:
+#                 metric: full_shard_groups__gather_random   ->  min: 1.0
+#                 metric: full_shard_groups__gather_grouped  ->  min: 1.0
+#             i.e. "the shipped default must still warm whole shards". A flip
+#             back to the block-index route drives these to 0 and fails.
+#          4. Expect NO wall-clock or `median_wall_s` rebase from this: the
+#             probe is untimed and never calls `add_run`, deliberately. Do not
+#             reintroduce a timed both-routes arm here — those samples pool into
+#             `BenchmarkResult.median_wall_s` / `peak_rss_mb_median`, which the
+#             gate compares (the `cellset_gather_s512_raises_pooled_rss.md`
+#             justification exists because exactly that happened once), and on
+#             v4 fixtures the block-index arm runs ~180x slower, so a timed
+#             50-batch arm would add minutes per cohort. Price the two routes in
+#             `benchmarks/scripts/bench_cellset_scatter_routes.py` instead.
 #      * obs_open / h5ad_none / {census_1m,census_5m}: the eager-obs baseline
 #        wasn't run at census_1m/5m (Wave B was SCX-only to avoid the 60–80s
 #        per-file anndata cost dominating the job). Add the h5ad_none obs floor

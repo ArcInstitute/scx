@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -303,9 +304,40 @@ class _Outcome:
     ttfb_s: float
     peak_rss_mb: float
     shard_cache_hit_rate: float | None
+    # Which scattered-read route the gather actually took. `full_shard_groups`
+    # = decoded a whole shard into the LRU and served from cache;
+    # `block_index_groups` = decoded only the touched row groups and bypassed
+    # the LRU. Exactly one of the two is non-zero for a given setting, so the
+    # pair is a route label, not two independent counters.
+    full_shard_groups: int = 0
+    block_index_groups: int = 0
+
+
+def _supports_scatter_block_index() -> bool:
+    """Whether this pyscx build accepts the `scatter_block_index` kwarg.
+
+    Read from the pyo3 text signature rather than inferred from the `TypeError`
+    a missing kwarg raises: that catch also swallows a genuine type bug anywhere
+    inside the gather or the plan iterator and reports it as "your build is
+    old", which is the same silent-miscoverage failure the route counters exist
+    to eliminate. Nothing is caught here either — by the time this is called the
+    main scenarios have already imported pyscx and constructed the class, so an
+    ImportError or AttributeError is a real failure, not an old build.
+    """
+    import pyscx
+
+    # `getattr` with a default for the attribute ONLY: a test double or a
+    # non-pyo3 stand-in is a plain function with no signature metadata, and that
+    # genuinely means "cannot offer the kwarg". An ImportError, or
+    # `SparseCellSetDataset` missing outright, still raises — those are broken
+    # environments, not old builds, and were what the previous blanket
+    # `except Exception` wrongly reported as "your pyscx predates the kwarg".
+    sig = getattr(pyscx.SparseCellSetDataset, "__text_signature__", None)
+    return "scatter_block_index" in (sig or "")
 
 
 def _cache_hit_rate(ds: Any) -> float | None:
+    """Hit rate alone, for the three arms that do not need the route counters."""
     try:
         cm = ds.cache_metrics()
         hits = float(cm.get("hits", 0))
@@ -317,11 +349,29 @@ def _cache_hit_rate(ds: Any) -> float | None:
     return None
 
 
+def _cache_snapshot(ds: Any) -> tuple[int, int, float | None]:
+    """`(full_shard_groups, block_index_groups, hit_rate)` from ONE metrics read.
+
+    One read, not three: `cache_metrics()` crosses the Python boundary and the
+    counters must describe the same instant to be interpretable together.
+    """
+    cm = ds.cache_metrics()
+    hits = float(cm.get("hits", 0))
+    misses = float(cm.get("misses", 0))
+    hit_rate = round(hits / (hits + misses), 4) if hits + misses > 0 else None
+    return (
+        int(cm.get("full_shard_groups", 0)),
+        int(cm.get("block_index_groups", 0)),
+        hit_rate,
+    )
+
+
 def _run_gather(
     scx_path: str,
     plans_factory: Callable[[], Iterator[tuple]],
     cache_shards: int | None = None,
     max_memory_mb: int | None = None,
+    scatter_block_index: bool | None = None,
 ) -> _Outcome:
     import pyscx
 
@@ -331,28 +381,45 @@ def _run_gather(
         kwargs["cache_shards"] = cache_shards
     if max_memory_mb is not None:
         kwargs["max_memory_mb"] = max_memory_mb
+    if scatter_block_index is not None:
+        # Left unset by every other caller *on purpose*: the shipped default is
+        # the thing under measurement, and passing it explicitly everywhere
+        # would make the benchmark blind to a change in it.
+        kwargs["scatter_block_index"] = scatter_block_index
     ds = pyscx.SparseCellSetDataset([scx_path], **kwargs)
     n_sets = 0
     n_cells = 0
     ttfb_s = 0.0
-    with PeakRssSampler() as sampler:
-        t0 = time.perf_counter()
-        first = True
-        for batch in ds.iter_with_plans(plans_factory()):
-            if first:
-                ttfb_s = time.perf_counter() - t0
-                first = False
-            set_offsets = batch["set_offsets"]
-            n_sets += len(set_offsets) - 1
-            n_cells += int(batch["shape"][0])
-        wall_s = time.perf_counter() - t0
+    # `try/finally`, not a trailing close: this helper is called several times
+    # per scenario per run and its callers catch and continue, so a gather that
+    # raises would otherwise leak that reader's mmap and descriptors for the
+    # rest of the job.
+    try:
+        with PeakRssSampler() as sampler:
+            t0 = time.perf_counter()
+            first = True
+            for batch in ds.iter_with_plans(plans_factory()):
+                if first:
+                    ttfb_s = time.perf_counter() - t0
+                    first = False
+                set_offsets = batch["set_offsets"]
+                n_sets += len(set_offsets) - 1
+                n_cells += int(batch["shape"][0])
+            wall_s = time.perf_counter() - t0
+        # Read the counters BEFORE closing: `close()` is terminal on this class
+        # and the accessors raise afterwards.
+        full_shard, block_index, hit_rate = _cache_snapshot(ds)
+    finally:
+        ds.close()
     return _Outcome(
         n_sets=n_sets,
         n_cells=n_cells,
         wall_s=wall_s,
         ttfb_s=ttfb_s,
         peak_rss_mb=sampler.peak_mb,
-        shard_cache_hit_rate=_cache_hit_rate(ds),
+        shard_cache_hit_rate=hit_rate,
+        full_shard_groups=full_shard,
+        block_index_groups=block_index,
     )
 
 
@@ -556,14 +623,20 @@ def _shard_count(scx_path: str) -> int | None:
 def _read_path_probe(scx_path: str, plans_factory: Callable[[], Iterator[tuple]]) -> dict:
     """Which scattered-read path this process actually takes, from counters.
 
-    On a **framed** file (v4 default) a scattered gather routes through the
-    codec-agnostic block-index path, which decodes only the touched row-groups and
-    **never populates the whole-shard LRU** — `hits + misses == 0` and
-    `block_index_groups > 0`. `cache_shards` is then irrelevant by construction,
-    so a ~1.0× cache-sizing ratio means "the cache was bypassed", not "sizing
-    doesn't help". The distinction is measured here rather than inferred from the
-    file's framing, because the process-global `SCX_SCATTER_BLOCK_INDEX` switch
-    (read once per process via `OnceLock`) also decides it.
+    `SparseCellSetDataset` defaults to the full-shard warm+cache route, so on a
+    default-constructed dataset this normally reports `full_shard_groups > 0`
+    and `hits + misses > 0` — the regime the cache-sizing arm below needs to be
+    meaningful. It can still report the other route: `scatter_block_index=True`
+    on a **framed** (v4) file decodes only the touched row groups and **never
+    populates the whole-shard LRU** (`hits + misses == 0`,
+    `block_index_groups > 0`), and there `cache_shards` is irrelevant by
+    construction — a ~1.0× cache-sizing ratio then means "the cache was
+    bypassed", not "sizing doesn't help".
+
+    Measured here rather than inferred from the file's framing, because the
+    route is decided by three things at once: framing, the per-dataset
+    `scatter_block_index` kwarg, and the process-global
+    `SCX_SCATTER_BLOCK_INDEX` switch (read once per process via `OnceLock`).
     """
     import pyscx
 
@@ -820,6 +893,16 @@ def run(
                     f"ttfb_first_set_s__{sc.name}": round(out.ttfb_s, 4),
                     f"peak_rss_mb__{sc.name}": round(out.peak_rss_mb, 1),
                     f"shard_cache_hit_rate__{sc.name}": out.shard_cache_hit_rate,
+                    # Route label for THIS run, at the shipped default — the
+                    # same keys `index_plan.py` already emits per scenario.
+                    # These are what make a silent route flip gateable: the
+                    # counters were previously computed once, by
+                    # `_read_path_probe`, into
+                    # `metadata["cache_sizing"]["read_path"]`, and
+                    # `compare_against_baseline.py` only ever reads
+                    # `runs[].extra` — so no threshold could see them.
+                    f"full_shard_groups__{sc.name}": out.full_shard_groups,
+                    f"block_index_groups__{sc.name}": out.block_index_groups,
                 },
             )
             run_sps.append(sps)
@@ -866,8 +949,13 @@ def run(
         logger.info(
             "  cache-sizing arm: the whole-shard LRU is BYPASSED on this path "
             "(block_index_groups=%d, hits+misses=0) — `cache_shards` cannot "
-            "affect throughput here. Run with SCX_SCATTER_BLOCK_INDEX=0 to "
-            "measure the legacy full-shard-decode regime.",
+            "affect throughput here. That is not the shipped default for this "
+            "class. `SCX_SCATTER_BLOCK_INDEX` cannot explain it either — the "
+            "env var is an off-switch (`block_index_eligible` ANDs it with the "
+            "per-reader flag), so it can only force the full-shard path, never "
+            "this one. The remaining explanations are a pyscx predating the "
+            "`scatter_block_index` kwarg (reader default `true`) or the "
+            "per-reader setter being dropped.",
             read_path.get("block_index_groups", 0),
         )
     if suggested is None:
@@ -992,6 +1080,81 @@ def run(
                 suggested,
                 speedup,
             )
+
+    # --- the scattered-read route: a capability probe, NOT a timed A/B ----
+    # `SparseCellSetDataset` picks between two scattered-read routes, and until
+    # the kwarg was restored the choice was neither settable per dataset nor
+    # visible to the gate: the shipped default silently flipped in the sidecar
+    # removal and no benchmark, floor or test noticed for two months.
+    #
+    #   default / False   full-shard decode into the shared LRU, served from
+    #                     cache on reuse. The shipped default.
+    #   True              decode only the touched row groups, bypassing the LRU.
+    #                     Bounded peak RAM; for a working set that exceeds the
+    #                     cache.
+    #
+    # The gateable signal is the per-scenario `full_shard_groups__*` /
+    # `block_index_groups__*` extras already emitted above, on the runs that
+    # execute anyway. This block adds only a capability bit.
+    #
+    # ⚠️ It deliberately does NOT time both routes and `add_run` them. Those
+    # samples would land in the same `runs[]` that `BenchmarkResult.median_wall_s`
+    # and `peak_rss_mb_median` are computed over, and that
+    # `compare_against_baseline.py` gates — so a diagnostic arm would move this
+    # triple's timing and RSS rows. That is not hypothetical: the committed
+    # `cellset_gather_s512_raises_pooled_rss.md` justification exists precisely
+    # because adding the S=512 arms moved pooled `peak_rss_mb_median` +19.47%.
+    # It would also become a wall-clock trap the moment the fixtures are
+    # reframed to v4: on framed tabula the block-index route runs at 3.19 vs
+    # 587.5 cellsets/s, so a timed 50-batch arm costs ~4 minutes per run. The
+    # priced comparison lives in `benchmarks/scripts/bench_cellset_scatter_routes.py`,
+    # which reframes a copy so the two routes actually differ.
+    probe_sc = _SCENARIOS[0]  # gather_random @ S=64
+    if not _supports_scatter_block_index():
+        logger.warning(
+            "  route probe unavailable: this pyscx has no `scatter_block_index` "
+            "kwarg on SparseCellSetDataset"
+        )
+    else:
+        try:
+            probe_out = _run_gather(
+                scx_path, lambda: _plans_for(probe_sc)(1), scatter_block_index=True
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("  route probe failed: %s", e)
+        else:
+            capable = probe_out.block_index_groups > 0
+            env_switch = os.environ.get("SCX_SCATTER_BLOCK_INDEX")
+            killed = env_switch is not None and (
+                env_switch == "0" or env_switch.lower() == "false"
+            )
+            result.metadata["scatter_block_index_route"] = {
+                # Whether the block-index route was reached with the kwarg on.
+                # `False` does NOT mean "unframed" on its own: the predicate
+                # `block_index_eligible` ANDs three more things — the
+                # process-global `SCX_SCATTER_BLOCK_INDEX` switch, the row-range
+                # cost window, and `shard_is_framed`. The env value is recorded
+                # beside the verdict so a `false` can be attributed rather than
+                # guessed at; if it is off, that alone explains this and nothing
+                # about the fixture follows.
+                "block_index_reachable": capable,
+                "env_scatter_block_index": env_switch,
+                "env_kill_switch_engaged": killed,
+                "probe_full_shard_groups": probe_out.full_shard_groups,
+                "probe_block_index_groups": probe_out.block_index_groups,
+                "n_batches": 1,
+                "timed": False,
+            }
+            logger.info(
+                "  route probe: block_index_reachable=%s "
+                "(full_shard=%d block_index=%d, 1 batch, untimed%s)",
+                capable,
+                probe_out.full_shard_groups,
+                probe_out.block_index_groups,
+                "; SCX_SCATTER_BLOCK_INDEX kill-switch is ENGAGED, which alone "
+                "explains an unreachable route" if killed else "",
+            )
+
 
     # --- data-load 1B: native downsample vs the Python per-cell draw -------
     # The capability 1B ships is that `scx_rust_collate` and count-depth

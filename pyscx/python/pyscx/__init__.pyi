@@ -236,8 +236,24 @@ class SparseCellSetDataset:
         downsample_target_library_size: int | None = None,
         downsample_method: Literal["binomial", "multinomial"] | None = None,
         downsample_seed: int | None = None,
+        scatter_block_index: bool | None = None,
     ) -> None:
-        """``downsample_target_library_size`` enables a seeded per-row count
+        """``scatter_block_index`` (default ``False`` — the opposite of
+        ``IndexPlanDataset``) gates the block-index (row-group) scattered gather
+        and its prefetch warm-skip on row-group-framed files. It is off by
+        default because the typical cell-set workload is cache-friendly (sorted
+        data + a reused control pool → a small working set that fits the shard
+        cache): decoding each hot shard once into the LRU and reusing it across
+        batches beats re-decoding the touched row groups every batch, because the
+        eligibility predicate keys on ``not cache.contains()`` and so never lets
+        the LRU populate. Measured on a 50-file Tahoe atlas: 2.80 → 4.55 steps/s
+        and 337 ms → ~5 ms per gather with it off, at ≈ ``.h5ad`` parity. Pass
+        ``True`` for cache-hostile runs (working set ≫ cache, low shard reuse),
+        where the row-group decode's bounded peak RAM is the memory-safe choice.
+        The process-wide ``SCX_SCATTER_BLOCK_INDEX=0`` env var remains a hard
+        kill-switch that forces the full-shard path regardless of this argument.
+
+        ``downsample_target_library_size`` enables a seeded per-row count
         downsample applied **inside the gather**, before the batch is returned —
         which is what keeps a caller's query sampling (drawn from ``counts > 0``)
         consistent with the counts the collate kernel then sees.
@@ -292,10 +308,16 @@ class SparseCellSetDataset:
         ...
 
     def cache_metrics(self) -> dict[str, Any]:
-        """Cumulative shard-cache counters since construction (hits, misses,
-        evictions, bytes, peak) — the multi-file sibling of
-        `IndexPlanDataset.cache_metrics`. For runtime hit/miss/eviction
-        observability."""
+        """Cumulative shard-cache counters since construction: `hits`,
+        `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
+        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups` — the
+        multi-file sibling of `IndexPlanDataset.cache_metrics`.
+
+        The last two report which scattered-read route the gathers took, and on
+        this class they are the only confirmation available: there is no
+        preflight warning here, so `scatter_block_index=True` against a file
+        with no row-group-framed shards is a silent no-op.
+        `block_index_groups > 0` proves the row-group path ran."""
         ...
 
     def memory_budget(self) -> dict[str, int]:

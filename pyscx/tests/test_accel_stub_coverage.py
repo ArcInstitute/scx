@@ -124,3 +124,36 @@ def test_lifecycle_members_exist_at_runtime(cls):
     obj = getattr(pyscx, cls)
     for member in ("close", "closed"):
         assert hasattr(obj, member), f"{cls}.{member} is stubbed but missing at runtime"
+
+
+@pytest.mark.parametrize("cls", _LIFECYCLE_CLASSES)
+def test_constructor_kwargs_are_all_in_the_init_stub(cls):
+    """Every constructor keyword appears in the class's `__init__` stub.
+
+    The attribute guard above cannot see this: a kwarg is not an attribute, so
+    adding one to the pyo3 signature and forgetting the stub is invisible to
+    every test — and silently wrong for `py.typed` users, who get "unexpected
+    keyword argument" from the type checker on code the runtime accepts. That is
+    exactly how `SparseCellSetDataset` lost `scatter_block_index` from its stub
+    when the kwarg itself was dropped in the sidecar removal, leaving two docs
+    describing a knob no signature had.
+
+    pyo3 exposes the keywords in the class's `text_signature`; there is no
+    `inspect.signature` for a native `__new__`.
+    """
+    pyi = (pathlib.Path(pyscx.__file__).parent / "__init__.pyi").read_text()
+    body = _class_stub_body(pyi, cls)
+
+    sig = getattr(pyscx, cls).__text_signature__
+    assert sig, f"{cls} has no __text_signature__ to check against"
+    kwargs = [
+        tok.split("=", 1)[0].strip()
+        for tok in sig.strip("()").split(",")
+        if "=" in tok
+    ]
+    assert kwargs, f"parsed no keywords out of {cls}.__text_signature__ = {sig!r}"
+    missing = sorted(k for k in kwargs if not re.search(rf"^\s*{re.escape(k)}\s*:", body, re.M))
+    assert not missing, (
+        f"{cls}.__init__ accepts {missing} at runtime but they are absent from "
+        f"its __init__.pyi stub"
+    )

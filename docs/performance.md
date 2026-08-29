@@ -2138,7 +2138,65 @@ on most batches). There the block-index "skip the warm, decode O(rows) each batc
 strategy is a net loss: the hot shard is re-decoded every batch and the LRU never
 populates. So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
 recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, gather
-337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_block_index=true` for a
+337 → ~5 ms, cache populated to ~8 GB). ⚠️ **Provenance**: those Tahoe figures were
+measured on the *scx1 decode-sidecar* gather this knob replaced, not on the
+block-index gather, and were relabelled onto `scatter_block_index` when the
+sidecar was removed. The mechanism carries over exactly — both routes skip the
+warm and key eligibility on `!cache.contains()` — and the block-index gather has
+now been measured directly:
+
+| tabula_sapiens_100k, reframed to v4, S=64 random cell sets, cold | cellsets/s (median of 3) | peak RSS (median) |
+|---|---|---|
+| `scatter_block_index=false` (the default) | 541.3 | 3233 MB |
+| `scatter_block_index=true` | 2.63 | 977 MB |
+
+**206×** on this fixture, with peak RSS running the other way — 977 MB against
+3.2 GB, 3.3× less. A 1-shard `pbmc10k` reframed the same way gives 988.1 vs 5.26
+cellsets/s (**188×**) at 462 vs 411 MB: the throughput gap holds while the memory
+gap nearly vanishes, because the block-index route's bounded peak buys nothing
+until a whole shard is large.
+
+Treat the ratio as an order of magnitude, not a constant — three captures of the
+same tabula arm pair landed at 184×, 187× and 206×, since the `on` arm's absolute
+rate (2.6–3.2 cellsets/s) is small enough that ordinary node variance moves the
+quotient by ~10%. What is stable is the direction and the scale.
+
+Read it as the *extreme* of the cache-friendly regime. tabula's 7 shards sit
+inside the 128-shard default cache, so the working set is fully resident after
+the first pass (hit rate 0.9987) — exactly where re-decoding row groups per batch
+costs everything, because eligibility keys on `!cache.contains()` and the LRU
+therefore never populates. Tahoe's 1.6× is the same mechanism where the working
+set does not trivially fit.
+
+Captured 2026-08-29 on Lambda `standard`-partition node `vci-steady-state-node-022`
+at commit `15bac541`, one SLURM job per dataset (188733, 188734), via
+
+```bash
+for f in tabula_sapiens_100k pbmc10k; do
+  SOURCE=$SCX_DATA_DIR/${f}_auto.scx WORKDIR=$SCRATCH/$f OUT_DIR=$SCRATCH N_RUNS=3 \
+      sbatch --job-name=cr-$f benchmarks/scripts/bench_cellset_scatter_routes.sbatch
+done
+```
+
+> [!NOTE]
+> Manifest entries are the six schema-v2 results
+> `results/raw/cellset_gather_scatter_routes__scx_v4reframed_{default,off,on}__{tabula_sapiens_100k,pbmc10k}_v4reframed.json`
+> — **one per arm**, because a `BenchmarkResult` pooling a 2.6 cellsets/s route
+> with a 541 cellsets/s one yields a `median_wall_s` describing neither and a
+> `wall_s_iqr` that is merely the gap between them. They are force-added
+> (`results/raw/` is gitignored) and deliberately **not promoted**: the subject
+> is a reframed *copy* of a registered fixture, so no `gate_candidate.py` run
+> reproduces these rows. `system.provenance.git_dirty` is `true` and
+> `provenance.dirty_tracked_paths` is `[]` — the only dirt was untracked scratch
+> markdown in the repo root, which is the documented-as-acceptable case in
+> [`docs/benchmark_manifest.md` § Workflow](benchmark_manifest.md#workflow).
+> Every sample records `cache_policy: cold_fadvise`; the driver refuses to
+> publish a median labelled cold if any sample fell back to warm, and refuses to
+> report a ratio at all unless the `on` arm reached the block-index route, the
+> `off` arm took the full-shard route, and the default agreed with the explicit
+> `false`.
+
+Pass `scatter_block_index=true` for a
 genuinely cache-hostile cell-set run (working set ≫ cache), where the
 row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate is
 per-reader: the `IndexPlanDataset` defaults above are unchanged, and

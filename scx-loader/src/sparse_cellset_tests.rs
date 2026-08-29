@@ -93,6 +93,89 @@ fn open(path: &std::path::Path) -> ScxReader {
     ScxReader::open(path).unwrap()
 }
 
+/// **Pin (9b).** `SparseCellSetLoader::new` must pass `scatter_block_index`
+/// through to the engine rather than hard-coding either value.
+///
+/// `plan_engine_tests::from_scx_readers_applies_the_block_index_gate_to_every_reader`
+/// pins the engine end; nothing pinned this hop, so a `new` that dropped the
+/// argument and passed a literal would have stayed green. Multi-file on purpose
+/// — that is the shape the cell-set loader is for, and it is the shape in which
+/// a partially-applied gate hides.
+///
+/// The fixture must be **framed**: `block_index_eligible` requires
+/// `shard_is_framed`, so on this module's default `write_fixture` output both
+/// arms take the full-shard path and the test would pass vacuously. Hence the
+/// borrowed `write_framed_fixture` (256 rows × 4 shards, row groups of 16).
+#[test]
+fn loader_threads_the_block_index_gate_into_the_engine() {
+    use crate::plan_engine::tests::{framed_expected, write_framed_fixture};
+
+    for gate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("f0.scx");
+        let p1 = dir.path().join("f1.scx");
+        write_framed_fixture(&p0);
+        write_framed_fixture(&p1);
+
+        let loader = SparseCellSetLoader::new(
+            vec![open(&p0), open(&p1)],
+            /*cache_shards*/ 16,
+            None,
+            /*lookahead*/ 4,
+            /*remap*/ None,
+            /*n_global_genes*/ None,
+            false,
+            false,
+            0.0,
+            /*downsample*/ None,
+            gate,
+        )
+        .unwrap();
+
+        // One row in each of shards 0..3 (64 rows/shard) of both files, so every
+        // touched group is cost-eligible (`group_len * 4 < 64`).
+        let rows = [5u64, 70, 140, 200];
+        let plan = SparseCellSetPlan {
+            file_ids: vec![0, 0, 0, 0, 1, 1, 1, 1],
+            rows: rows.iter().chain(rows.iter()).copied().collect(),
+            role_tags: vec![0, 0, 0, 0, 1, 1, 1, 1],
+            set_offsets: vec![0, 4, 8],
+        };
+        let batches: Vec<_> = StdArc::clone(&loader)
+            .iter_with_plans(vec![Ok(plan.clone())].into_iter(), 4)
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(batches.len(), 1);
+        for (j, &row) in plan.rows.iter().enumerate() {
+            let (idx, dat) = batch_row(&batches[0], j);
+            let (ecol, eval) = framed_expected(row);
+            assert_eq!(
+                (idx, dat),
+                (&[ecol][..], &[eval][..]),
+                "gate={gate} row {j}"
+            );
+        }
+
+        let m = loader.cache_metrics();
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        let block_index = m.block_index_groups.load(AtomicOrdering::Relaxed);
+        let full_shard = m.full_shard_groups.load(AtomicOrdering::Relaxed);
+        if gate {
+            assert!(
+                block_index > 0 && full_shard == 0,
+                "gate=true must reach the row-group path \
+                 (block_index={block_index}, full_shard={full_shard})"
+            );
+        } else {
+            assert!(
+                full_shard > 0 && block_index == 0,
+                "gate=false must warm whole shards into the LRU \
+                 (block_index={block_index}, full_shard={full_shard})"
+            );
+        }
+    }
+}
+
 #[test]
 fn gather_single_file_sets_matches_reference_in_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -112,6 +195,7 @@ fn gather_single_file_sets_matches_reference_in_order() {
         false,
         0.0,
         /*downsample*/ None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -172,6 +256,7 @@ fn empty_set_keeps_boundary_without_rows() {
         false,
         0.0,
         None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
     // set 0: two rows; set 1: empty; set 2: one row.
@@ -225,6 +310,7 @@ fn gather_cross_file_set_concatenates_in_global_space() {
         false,
         0.0,
         /*downsample*/ None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -281,6 +367,7 @@ fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
         false,
         0.0,
         None,
+        /*scatter_block_index*/ false,
     )
     .unwrap()
 }
@@ -314,6 +401,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         false,
         0.0,
         /*downsample*/ None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -467,6 +555,7 @@ fn budget_loader(
         false,
         0.0,
         /*downsample*/ None,
+        /*scatter_block_index*/ false,
     )
     .unwrap()
 }
@@ -806,6 +895,7 @@ fn gather_clips_negatives_in_the_emitted_csr() {
         false,
         0.0,
         None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -841,6 +931,7 @@ fn gather_clip_runs_after_coalescing_not_before() {
         false,
         0.0,
         None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -877,6 +968,7 @@ fn gather_downsamples_to_the_target_with_multinomial() {
             7,
             vec![ident],
         )),
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -907,6 +999,7 @@ fn gather_without_downsample_leaves_counts_untouched() {
         false,
         0.0,
         None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
     let (_, dat) = {
@@ -945,6 +1038,7 @@ fn gather_downsample_is_reproducible_across_loader_instances() {
                 11,
                 vec![ident],
             )),
+            /*scatter_block_index*/ false,
         )
         .unwrap()
     };
@@ -980,6 +1074,7 @@ fn gather_downsample_is_invariant_to_row_order_within_a_plan() {
             3,
             vec![ident],
         )),
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 
@@ -1024,6 +1119,7 @@ fn gather_downsample_is_invariant_to_manifest_order() {
                 5,
                 idents,
             )),
+            /*scatter_block_index*/ false,
         )
         .unwrap()
     };
@@ -1064,6 +1160,7 @@ fn gather_rejects_an_invalid_downsample_config() {
             false,
             0.0,
             Some(cfg),
+            /*scatter_block_index*/ false,
         )
     };
 
@@ -1128,6 +1225,7 @@ fn gather_rejects_an_empty_identity_table_across_multiple_files() {
             1,
             vec![],
         )),
+        /*scatter_block_index*/ false,
     )
     .err()
     .expect("multi-file downsample without identities must be rejected")
@@ -1246,6 +1344,7 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
         /*log1p*/ false,
         /*target_sum*/ 1e4,
         /*downsample*/ None,
+        /*scatter_block_index*/ false,
     )
     .unwrap();
 

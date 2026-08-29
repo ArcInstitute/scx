@@ -343,3 +343,110 @@ def test_closed_dataset_raises_before_running_user_code(two_scx):
     # Same for the argument-validation path: closed beats ValueError.
     with pytest.raises(RuntimeError, match="closed"):
         ds.suggested_cache_shards([0, 0], [1])
+
+
+# ---------------------------------------------------------------------------
+# The per-dataset block-index escape hatch.
+#
+# `SparseCellSetDataset` had this knob (as `scatter_sidecar=`, PR #299) and lost
+# it when the Scx1 decode sidecar was removed: the kwarg was deleted and the
+# equivalent `scatter_block_index=` was never carried over, so every reader the
+# cell-set engine builds inherited the process default (`True`). The two docs
+# describing the `False` default went on describing behaviour the code no longer
+# had, and nothing failed — there was no test on either side.
+# ---------------------------------------------------------------------------
+
+_FRAMED_N_OBS = 400
+_FRAMED_N_VARS = 60
+
+
+@pytest.fixture
+def framed_scx(tmp_dir):
+    """A row-group-framed (v4) single-shard file, which is the *only* shape on
+    which this flag is observable.
+
+    `block_index_eligible` requires `shard_is_framed`, so on an unframed file
+    both settings take the full-shard path and a test written against one would
+    pass in both directions while asserting nothing. Framed `shufdelta` (no Scx1
+    sidecar) leaves the block index as the only random-access route, and 8 plan
+    rows against 400 shard rows clears the `group_len * 4 < shard_rows` window
+    the predicate also requires.
+    """
+    import anndata as ad
+    import pyscx
+
+    path = str(tmp_dir / "framed.scx")
+    X = sp.random(_FRAMED_N_OBS, _FRAMED_N_VARS, density=0.05, format="csr",
+                  random_state=0)
+    X.data = np.round(X.data * 10 + 1).astype(np.float32)
+    adata = ad.AnnData(X=X)
+    adata.obs["cell_id"] = [f"c{i}" for i in range(_FRAMED_N_OBS)]
+    pyscx.from_anndata(adata, path, codec="shufdelta", row_group_rows=16)
+    return path
+
+
+_FRAMED_ROWS = [5, 70, 140, 200, 250, 300, 350, 399]
+_FRAMED_PLAN = ([0] * 8, _FRAMED_ROWS, [0] * 8, [0, 8])
+
+
+def _drive(path, **kwargs):
+    """Two identical batches, so a warmed shard shows up as a cache *hit*.
+
+    One batch cannot tell the routes apart on the cache counters: the first pass
+    misses either way, and only the second shows whether anything was retained.
+    """
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset([path], cache_shards=16, **kwargs)
+    try:
+        nnz_per_batch = [
+            int(b["indptr"][-1]) for b in ds.iter_with_plans(iter([_FRAMED_PLAN] * 2))
+        ]
+        assert len(nnz_per_batch) == 2, "premise: both plans must yield a batch"
+        assert all(n > 0 for n in nnz_per_batch), (
+            "premise: the plan must actually read data — an all-empty gather "
+            "would leave every counter at zero and both assertions below would "
+            "hold vacuously"
+        )
+        # Read before closing: `close()` is terminal and the accessors raise
+        # afterwards.
+        return ds.cache_metrics()
+    finally:
+        ds.close()
+
+
+def test_scatter_block_index_defaults_off(framed_scx):
+    """Constructed with no kwarg, the gather warms whole shards into the LRU.
+
+    This is the assertion the class lost. It is about the *default*, so it must
+    not pass the kwarg — passing `scatter_block_index=False` here would still be
+    green against a build whose default is `True`.
+    """
+    m = _drive(framed_scx)
+    assert m["block_index_groups"] == 0, (
+        "the cell-set loader must default to the full-shard warm+cache path; "
+        f"block_index_groups={m['block_index_groups']} means it took the "
+        "row-group path, which re-decodes a hot shard every batch"
+    )
+    assert m["full_shard_groups"] > 0
+    assert m["hits"] > 0, (
+        "the point of the default: the second batch is served from the LRU the "
+        "first one populated. The block-index path keys on `not "
+        "cache.contains()`, so it never populates and never hits."
+    )
+
+
+def test_scatter_block_index_true_opts_into_the_block_index_path(framed_scx):
+    """The escape hatch, in the other direction — and the fixture's own guard.
+
+    If this arm went green with `block_index_groups == 0` the fixture would be
+    silently ineligible (unframed, or too many rows per group), and its sibling
+    above would be asserting nothing at all.
+    """
+    m = _drive(framed_scx, scatter_block_index=True)
+    assert m["block_index_groups"] > 0
+    assert m["full_shard_groups"] == 0
+    assert m["hits"] + m["misses"] == 0, (
+        "the row-group path bypasses the whole-shard LRU entirely, so "
+        "`cache_shards` is off the critical path here"
+    )
