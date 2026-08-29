@@ -414,18 +414,25 @@ fn engine_prefetch_depth_survives_when_the_generator_keeps_up() {
 ///
 /// Row `r` has one non-zero at column `r % n_vars` with value `(r % 250 + 1)`
 /// (never 0, so the fixture stays valid for codecs that reject a zero value).
-fn write_framed_fixture(
-    path: &std::path::Path,
-    n_obs: usize,
-    n_vars: usize,
-    n_shards: usize,
-    row_group_rows: u32,
-) {
+/// Fixture shape, fixed rather than parameterised: `framed_expected` below is
+/// the gather oracle and hard-codes the same `N_VARS`, so a caller varying the
+/// shape independently would silently corrupt it.
+const FRAMED_N_OBS: usize = 256;
+const FRAMED_N_VARS: usize = 8;
+const FRAMED_N_SHARDS: usize = 4;
+const FRAMED_ROW_GROUP_ROWS: u32 = 16;
+
+fn write_framed_fixture(path: &std::path::Path) {
     use scx_format_io::modality::ModalityType;
     use scx_format_io::SectionType;
     use scx_format_io::{encode_one_shard, FramingConfig};
 
-    assert!(n_obs.is_multiple_of(n_shards), "n_obs must divide n_shards");
+    let (n_obs, n_vars, n_shards, row_group_rows) = (
+        FRAMED_N_OBS,
+        FRAMED_N_VARS,
+        FRAMED_N_SHARDS,
+        FRAMED_ROW_GROUP_ROWS,
+    );
     let rows_per_shard = n_obs / n_shards;
 
     let mut header = FileHeader::new_single_modality(
@@ -494,9 +501,12 @@ fn write_framed_fixture(
     writer.finish().unwrap();
 }
 
-/// Expected `(col, value)` for a `write_framed_fixture` row (n_vars = 8).
+/// Expected `(col, value)` for a `write_framed_fixture` row.
 fn framed_expected(row: u64) -> (i32, f32) {
-    ((row % 8) as i32, ((row % 250) + 1) as f32)
+    (
+        (row % FRAMED_N_VARS as u64) as i32,
+        ((row % 250) + 1) as f32,
+    )
 }
 
 /// A one-file engine over a framed fixture, with the reader's per-reader
@@ -506,16 +516,12 @@ fn framed_expected(row: u64) -> (i32, f32) {
 /// CPU pool, metrics on) but goes through `PrefetchEngine::new` so the gate can
 /// be set on the reader before the `Arc` is shared — the engine exposes no
 /// knob for it, which is ORG-9.10-1 drift (a) seen from the other side.
-fn framed_engine(
-    dir: &std::path::Path,
-    cache_shards: usize,
-    scatter_block_index: bool,
-) -> Arc<PrefetchEngine> {
+fn framed_engine(dir: &std::path::Path, scatter_block_index: bool) -> Arc<PrefetchEngine> {
     let path = dir.join("framed.scx");
-    write_framed_fixture(
-        &path, /*n_obs*/ 256, /*n_vars*/ 8, /*n_shards*/ 4, 16,
-    );
-    let shared = SharedShardCache::new(cache_shards, usize::MAX);
+    write_framed_fixture(&path);
+    // Large enough to hold every shard the plans touch, so the reader gate is
+    // the only thing that decides whether they warm.
+    let shared = SharedShardCache::new(/*cache_shards*/ 8, usize::MAX);
     let mut backed = BackedCsrReader::with_shared_cache(ScxReader::open(&path).unwrap(), 0, shared);
     backed.set_cpu_pool(crate::pool::cpu_pool());
     backed.enable_metrics();
@@ -538,7 +544,7 @@ fn framed_engine(
 #[test]
 fn engine_does_not_warm_a_block_index_eligible_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = framed_engine(dir.path(), /*cache_shards*/ 8, true);
+    let engine = framed_engine(dir.path(), /*scatter_block_index*/ true);
 
     // One row in each of shards 0..3 (64 rows per shard). group_len = 1, so
     // `1 * ROW_RANGE_WINDOW_DIVISOR < 64` — cost-eligible on every shard.
@@ -582,7 +588,7 @@ fn engine_does_not_warm_a_block_index_eligible_shard() {
 #[test]
 fn engine_warms_the_same_shards_when_the_reader_gate_is_off() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = framed_engine(dir.path(), /*cache_shards*/ 8, false);
+    let engine = framed_engine(dir.path(), /*scatter_block_index*/ false);
 
     let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
     let out: Vec<_> = Arc::clone(&engine)
@@ -654,11 +660,13 @@ fn engine_pull_worker_exits_promptly_after_drop() {
     let dir = tempfile::tempdir().unwrap();
     let engine = two_file_engine(dir.path(), 8);
 
-    static EXITED: AtomicBool = AtomicBool::new(false);
-    EXITED.store(false, AtomicOrdering::Release);
+    // Owned by the test, not `static` — see the sibling pin in
+    // `index_plan_tests::pull_worker_exits_promptly_after_iter_drop`.
+    let exited = Arc::new(AtomicBool::new(false));
 
     struct ExitFlagPlans {
         remaining: usize,
+        exited: Arc<AtomicBool>,
     }
     impl Iterator for ExitFlagPlans {
         type Item = Result<Plan>;
@@ -672,21 +680,29 @@ fn engine_pull_worker_exits_promptly_after_drop() {
     }
     impl Drop for ExitFlagPlans {
         fn drop(&mut self) {
-            EXITED.store(true, AtomicOrdering::Release);
+            self.exited.store(true, AtomicOrdering::Release);
         }
     }
 
-    let mut it = engine.iter_with_plans(ExitFlagPlans { remaining: 100_000 }, 4, rows_of, gather);
+    let mut it = engine.iter_with_plans(
+        ExitFlagPlans {
+            remaining: 100_000,
+            exited: Arc::clone(&exited),
+        },
+        4,
+        rows_of,
+        gather,
+    );
     let _first = it.next().expect("first batch").expect("gather");
     assert!(
-        !EXITED.load(AtomicOrdering::Acquire),
+        !exited.load(AtomicOrdering::Acquire),
         "premise: the worker must still be alive while the iterator is"
     );
     drop(it);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if EXITED.load(AtomicOrdering::Acquire) {
+        if exited.load(AtomicOrdering::Acquire) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));

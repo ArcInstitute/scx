@@ -194,9 +194,10 @@ fn fork_construct_and_iterate_one_epoch() {
 /// `(pert, ctrl)` pairs.
 const SPANNING_PLAN: [(u64, u64); 4] = [(0, 70), (10, 140), (20, 190), (30, 80)];
 
-/// Build the `IndexPlanLoader` used on both sides of the fork.
+/// Drive `SPANNING_PLAN` once through a fresh loader and report
+/// `(full_shard_groups, prefetch_tasks_spawned)`.
 ///
-/// Every argument here is load-bearing for the premise, not tuning:
+/// Every loader argument below is load-bearing for the premise, not tuning:
 /// * `lookahead = 0` — with prefetch on, `IndexPlanIter` warms every touched
 ///   shard through `tokio::spawn_blocking` first and `warm_shards` then sees no
 ///   misses at all;
@@ -205,9 +206,20 @@ const SPANNING_PLAN: [(u64, u64); 4] = [(0, 70), (10, 140), (20, 190), (30, 80)]
 /// * `set_scatter_block_index(false)` — a block-index-eligible group never
 ///   enters `full_shards`, so it never reaches `warm_shards` either.
 ///
-/// These are the same three conditions `pyscx/tests/test_fork_safety.py`'s
+/// These are the same conditions `pyscx/tests/test_fork_safety.py`'s
 /// `test_gather_premise_holds_in_parent` documents, transcribed to Rust.
-fn open_spanning_loader(path: &std::path::Path) -> scx_loader::IndexPlanLoader {
+///
+/// The returned pair is what makes the premise checkable rather than assumed.
+/// `full_shard_groups >= 2` alone is not enough: with prefetch on, the shards
+/// are warmed by `spawn_blocking`, `warm_shards`' `filter_misses` then finds
+/// nothing to do and returns before the `par_iter` — yet the gather still
+/// records two full-shard groups. Pairing it with `prefetch_tasks_spawned == 0`
+/// closes that hole: no shard was pre-warmed, so `warm_shards` is the only
+/// thing that can have decoded them, and it saw >= 2 misses.
+fn drive_spanning_plan(path: &std::path::Path) -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
     let config = LoaderConfig {
         normalize: false,
         log1p: false,
@@ -221,23 +233,8 @@ fn open_spanning_loader(path: &std::path::Path) -> scx_loader::IndexPlanLoader {
     )
     .expect("IndexPlanLoader::new");
     loader.set_scatter_block_index(false);
-    loader
-}
+    let loader = Arc::new(loader);
 
-/// Drive `SPANNING_PLAN` once and report `(full_shard_groups, prefetch_tasks_spawned)`.
-///
-/// The pair is what makes the premise checkable rather than assumed.
-/// `full_shard_groups >= 2` alone is not enough: with prefetch on, the shards
-/// are warmed by `spawn_blocking` first, `warm_shards`' `filter_misses` then
-/// finds nothing to do and returns before the `par_iter` — yet the gather still
-/// records two full-shard groups. Pairing it with `prefetch_tasks_spawned == 0`
-/// closes that hole: no shard was pre-warmed, so `warm_shards` is the only
-/// thing that can have decoded them, and it saw >= 2 misses.
-fn drive_spanning_plan(path: &std::path::Path) -> (u64, u64) {
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
-
-    let loader = Arc::new(open_spanning_loader(path));
     let metrics = loader.cache_metrics();
     let mut it = loader.iter_with_plans(std::iter::once(Ok(SPANNING_PLAN.to_vec())), 0);
     let iter_metrics = it.iter_metrics();

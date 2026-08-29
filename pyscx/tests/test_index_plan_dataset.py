@@ -1107,12 +1107,20 @@ class TestGilDuringTeardown:
     assumed, so the test skips instead of passing vacuously.
     """
 
+    N_OBS = 30000
+    N_VARS = 800
+    N_SHARDS = 4
+
     @staticmethod
-    def _write_prefetch_fixture(path, *, n_obs=30000, n_vars=800, n_shards=4):
+    def _write_prefetch_fixture(path):
         import anndata as ad
         import scipy.sparse as sp
 
-        X = sp.random(n_obs, n_vars, density=0.05, format="csr", random_state=0)
+        n_obs = TestGilDuringTeardown.N_OBS
+        X = sp.random(
+            n_obs, TestGilDuringTeardown.N_VARS, density=0.05,
+            format="csr", random_state=0,
+        )
         X.data = np.round(X.data * 10 + 1).astype(np.float32)
         adata = ad.AnnData(X=X)
         adata.obs["cell_id"] = [f"c{i}" for i in range(n_obs)]
@@ -1120,9 +1128,10 @@ class TestGilDuringTeardown:
         # deliberately skips warming those — so there would be no in-flight
         # decode to tear down and nothing to observe.
         pyscx.from_anndata(
-            adata, path, shard_size=n_obs // n_shards, row_group_rows=0
+            adata, path,
+            shard_size=n_obs // TestGilDuringTeardown.N_SHARDS,
+            row_group_rows=0,
         )
-        return n_obs
 
     def test_teardown_with_prefetches_in_flight_releases_the_gil(self, tmp_path):
         import sys
@@ -1130,7 +1139,7 @@ class TestGilDuringTeardown:
         import time
 
         path = str(tmp_path / "gil_teardown.scx")
-        n_obs = self._write_prefetch_fixture(path)
+        self._write_prefetch_fixture(path)
 
         ds = pyscx.IndexPlanDataset(
             path,
@@ -1138,15 +1147,13 @@ class TestGilDuringTeardown:
             log1p=False,
             obs_columns=[],
             cache_shards=8,
-            lookahead=8,
+            lookahead=self.N_SHARDS,
             scatter_block_index=False,
         )
-        # Every plan lands in a different shard, so the lookahead queue holds
-        # several distinct `read_shard_cached_arc` tasks at once.
-        step = n_obs // 8
-        plans = [[(i * step, (i * step) + 1)] for i in range(8)]
-        it = ds.iter_with_plans(iter(plans), lookahead=8)
-        next(it)  # runtime built; the remaining plans' prefetches are in flight
+        # One plan per shard, so consuming the first still leaves N_SHARDS - 1
+        # distinct `read_shard_cached_arc` tasks queued.
+        step = self.N_OBS // self.N_SHARDS
+        plans = [[(i * step, (i * step) + 1)] for i in range(self.N_SHARDS)]
 
         ticks = []
         stop = threading.Event()
@@ -1160,11 +1167,17 @@ class TestGilDuringTeardown:
         worker = threading.Thread(target=ticker, daemon=True)
         worker.start()
         try:
-            # Let the ticker prove it is running before the window opens.
+            # Start the ticker BEFORE the prefetches are scheduled. Warming it
+            # up afterwards spends the in-flight window on the warmup wait, and
+            # on a fast host the decodes finish inside it — leaving a teardown
+            # too short to measure and a test that skips instead of pinning.
             deadline = time.perf_counter() + 2.0
             while not ticks and time.perf_counter() < deadline:
                 time.sleep(0.001)
             assert ticks, "premise: the ticker thread never ran"
+
+            it = ds.iter_with_plans(iter(plans), lookahead=self.N_SHARDS)
+            next(it)  # runtime built; the rest of the plans are prefetching
 
             del ds  # not the last reference — `it` still holds one
             t0 = time.perf_counter()
@@ -1179,14 +1192,32 @@ class TestGilDuringTeardown:
             worker.join(timeout=5)
             sys.setswitchinterval(old_interval)
 
-        # Count by *timestamp*, not by a `len(ticks)` delta taken around the
-        # window. The delta is racy in the direction that hides the bug: between
-        # `t1` and reading `len(ticks)` the main thread can be preempted for a
-        # switch interval, during which the ticker appends thousands of entries.
-        # Measured that way a teardown that held the GIL for its entire 1 ms
-        # still scored ~1500 "ticks during", i.e. it passed on broken code.
-        during = sum(1 for t in ticks if t0 <= t <= t1)
+        # Count ticks in the **leading half** of the window, by timestamp.
+        #
+        # Two boundary races make the obvious counts pass on broken code, and
+        # both were measured on this host before this form was settled on:
+        #
+        #  * a `len(ticks)` delta read around the window is racy on the far
+        #    side — between `t1` and the read, the main thread can be preempted
+        #    for a switch interval and the ticker appends thousands of entries.
+        #    A teardown that held the GIL for its entire 1 ms scored ~1500.
+        #  * counting the *whole* `[t0, t1]` window by timestamp is racy on the
+        #    same side for a subtler reason: `t1` is recorded by Python only
+        #    after the destructor returns, so a destructor that held the GIL
+        #    start to finish releases it on return and CPython can schedule the
+        #    waiting ticker *before* the `t1` store. Those ticks are genuinely
+        #    after the teardown and still land inside `[t0, t1]`. Reproduced
+        #    with a `ctypes.PyDLL(None).usleep(5000)` destructor — which holds
+        #    the GIL by construction — at 1098–39794 ticks in 50/50 runs.
+        #
+        # The leading half closes both: a teardown that never releases the GIL
+        # cannot produce a tick before it returns, and it returns at ~`t1`, so
+        # every tick it can manufacture is crowded into the tail. The same
+        # `usleep` shape scores 0 in the leading half in 50/50 runs.
         teardown_s = t1 - t0
+        midpoint = t0 + teardown_s / 2
+        leading = sum(1 for t in ticks if t0 <= t <= midpoint)
+        whole = sum(1 for t in ticks if t0 <= t <= t1)
 
         assert ticks[-1] > t1, "premise: the ticker must outlive the window"
         if teardown_s < 2e-4:
@@ -1195,7 +1226,9 @@ class TestGilDuringTeardown:
                 "thread to be scheduled, so this run cannot distinguish a "
                 "GIL-holding teardown from a GIL-releasing one"
             )
-        assert during > 0, (
-            f"no other Python thread ran during a {teardown_s * 1e3:.2f} ms "
-            "teardown — the GIL was held for its whole duration"
+        assert leading > 0, (
+            f"no other Python thread ran in the first half of a "
+            f"{teardown_s * 1e3:.2f} ms teardown ({whole} tick(s) in the whole "
+            "window, all in the tail) — the GIL was held for its duration and "
+            "released only on return"
         )

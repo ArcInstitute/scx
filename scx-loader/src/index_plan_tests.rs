@@ -562,15 +562,18 @@ fn pull_worker_exits_promptly_after_iter_drop() {
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
     let loader = open_loader_arc(&path);
 
-    static EXITED: AtomicBool = AtomicBool::new(false);
-    static PRODUCED: AtomicUsize = AtomicUsize::new(0);
-    EXITED.store(false, AtomicOrdering::Release);
-    PRODUCED.store(0, AtomicOrdering::Release);
+    // Owned by the test, not `static`: cargo runs this module's tests on shared
+    // threads within one process, so process-global counters would couple this
+    // test to any future sibling that reuses them.
+    let exited = Arc::new(AtomicBool::new(false));
+    let produced = Arc::new(AtomicUsize::new(0));
 
-    /// Sets `EXITED` when the pull worker drops it — which happens when the
+    /// Sets `exited` when the pull worker drops it — which happens when the
     /// worker's `for item in plans` loop ends, i.e. when its `send` fails.
     struct ExitFlagPlans {
         remaining: usize,
+        exited: Arc<AtomicBool>,
+        produced: Arc<AtomicUsize>,
     }
     impl Iterator for ExitFlagPlans {
         type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
@@ -579,27 +582,34 @@ fn pull_worker_exits_promptly_after_iter_drop() {
                 return None;
             }
             self.remaining -= 1;
-            PRODUCED.fetch_add(1, AtomicOrdering::Relaxed);
+            self.produced.fetch_add(1, AtomicOrdering::Relaxed);
             Some(Ok(vec![(0u64, 1u64)]))
         }
     }
     impl Drop for ExitFlagPlans {
         fn drop(&mut self) {
-            EXITED.store(true, AtomicOrdering::Release);
+            self.exited.store(true, AtomicOrdering::Release);
         }
     }
 
-    let mut it = loader.iter_with_plans(ExitFlagPlans { remaining: 100_000 }, 4);
+    let mut it = loader.iter_with_plans(
+        ExitFlagPlans {
+            remaining: 100_000,
+            exited: Arc::clone(&exited),
+            produced: Arc::clone(&produced),
+        },
+        4,
+    );
     let _first = it.next().unwrap().unwrap();
     assert!(
-        !EXITED.load(AtomicOrdering::Acquire),
+        !exited.load(AtomicOrdering::Acquire),
         "premise: the worker must still be alive while the iterator is"
     );
     drop(it);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if EXITED.load(AtomicOrdering::Acquire) {
+        if exited.load(AtomicOrdering::Acquire) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -607,7 +617,7 @@ fn pull_worker_exits_promptly_after_iter_drop() {
     panic!(
         "plan-pull worker still alive 5 s after the iterator dropped \
          (produced {} plans)",
-        PRODUCED.load(AtomicOrdering::Relaxed)
+        produced.load(AtomicOrdering::Relaxed)
     );
 }
 

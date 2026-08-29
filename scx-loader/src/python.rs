@@ -2891,6 +2891,13 @@ pub fn downsample_counts_csr<'py>(
 }
 
 #[cfg(test)]
+// These compile only under `--features python`, which a bare
+// `cargo test -p scx-loader` does not enable — that run is 315 tests, not 320.
+// CI's `cargo test --workspace --exclude rscx` *does* run them: pyscx is a
+// workspace member depending on `scx-loader` with `features = ["python"]`, and
+// resolver-v2 unification turns the feature on for this crate's test target
+// too. Verified by name in that job's output. If pyscx ever stops being built
+// alongside, this module goes silently unrun.
 mod layout_check_tests {
     use super::*;
     use arrow::array::StringArray;

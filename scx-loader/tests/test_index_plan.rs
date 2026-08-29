@@ -604,13 +604,21 @@ fn iter_skips_prefetch_when_cached() {
 /// existing assertion green (`iter_skips_prefetch_when_cached` above reads two
 /// of the four; nothing reads the other two).
 ///
-/// Both arms of the law are exercised: a cold cache, where every shard is
-/// spawned, and a warm one, where every shard is skipped. The unframed fixture
-/// keeps `skipped_block_index` at zero here — that counter is pinned by
-/// `pyscx/tests/test_index_plan_dataset.py::test_scatter_block_index_flag_gates_prefetch_skip`
-/// on this arm and by
-/// `plan_engine_tests::engine_does_not_warm_a_block_index_eligible_shard` on the
-/// other.
+/// Two arms of the law are exercised: a cold cache, where every shard is
+/// spawned, and a warm one, where every shard is skipped as a cache hit. Be
+/// precise about what that does **not** cover — the conservation law holds
+/// whatever the split, so a zero term is not evidence about its increment path:
+///
+/// * `prefetch_skipped_block_index` stays zero here (the fixture is unframed).
+///   Its increment is pinned only from Python, by
+///   `pyscx/tests/test_index_plan_dataset.py::test_scatter_block_index_flag_gates_prefetch_skip`.
+///   `plan_engine_tests::engine_does_not_warm_a_block_index_eligible_shard` is
+///   *not* a second pin for it: that test asserts `CacheMetrics`'
+///   `block_index_groups`, and the engine arm has no `IterMetrics` at all —
+///   which is drift (b) itself.
+/// * `prefetch_skipped_in_flight` is never shown to increment anywhere. Closing
+///   that needs a concurrent peer decode mid-`spawn_prefetches`; it is a real
+///   remaining gap, not something this test covers.
 #[test]
 fn iter_prefetch_counters_account_for_every_touched_shard() {
     use std::sync::atomic::Ordering;

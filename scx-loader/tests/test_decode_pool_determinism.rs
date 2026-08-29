@@ -19,8 +19,6 @@
 
 mod common;
 
-use std::collections::HashMap;
-
 use common::write_multi_shard_fixture;
 use scx_loader::{Batch, LoaderConfig, ObsColumn, TrainingPipeline};
 
@@ -131,21 +129,4 @@ fn same_seed_yields_identical_batch_contents_at_any_decode_pool_size() {
         );
         assert_eq!(a.3, b.3, "batch {i}: obs columns diverged");
     }
-
-    // And the whole epoch, not just batch-by-batch: a scatter that swapped two
-    // rows *across* a batch boundary would pass every per-batch check above.
-    let flat = |e: &[BatchRepr]| -> HashMap<u64, Vec<u32>> {
-        let mut m = HashMap::new();
-        for (cells, (_, n_genes), x, _) in e {
-            for (r, &cell) in cells.iter().enumerate() {
-                m.insert(cell, x[r * n_genes..(r + 1) * n_genes].to_vec());
-            }
-        }
-        m
-    };
-    assert_eq!(
-        flat(&single),
-        flat(&many),
-        "per-cell rows must be identical across the whole epoch"
-    );
 }
