@@ -1372,29 +1372,6 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
     subset: bool,
     n_bins: usize,
 ) -> PyResult<()> {
-    // The Python-callback era surfaced n_bins == 0 as pandas' opaque
-    // "Cannot cut empty array"-adjacent ValueError; say it plainly instead
-    // (the Rust kernel would silently answer all-NaN → zero genes selected).
-    if n_bins == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "n_bins must be at least 1 (scanpy's default is 20)",
-        ));
-    }
-    // Upper bound, because the failure mode changed with the Rust port: the
-    // pandas era raised MemoryError on an absurd n_bins and the interpreter
-    // survived; Rust's infallible per-bin allocations would ABORT the process
-    // instead. 2^20 bins is far beyond any meaningful binning of a gene axis
-    // (scanpy's default is 20; a bin count above n_vars already only adds
-    // empty bins) while keeping the kernel's working set trivially small.
-    // (Round-1 finding: codex.)
-    const N_BINS_MAX: usize = 1 << 20;
-    if n_bins > N_BINS_MAX {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "n_bins = {n_bins} is not a meaningful binning (max {N_BINS_MAX}); \
-             scanpy's default is 20"
-        )));
-    }
-
     // For batched seurat, fall back to scanpy (complex aggregation logic)
     if batch_key.is_some() {
         let sc = import_optional_with_hint(
@@ -1420,6 +1397,30 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         sc.getattr("pp")?
             .call_method("highly_variable_genes", (adata,), Some(&kwargs))?;
         return Ok(());
+    }
+
+    // Native-path validation, deliberately AFTER the batch_key delegation so
+    // the scanpy-delegated branch keeps scanpy's own n_bins behavior (and the
+    // in-memory rapids branch, which never reaches this function, keeps
+    // rapids'). Two guards for the two failure modes the Rust kernel changed:
+    // n_bins == 0 was pandas' opaque "Cannot cut empty array"-adjacent
+    // ValueError (the kernel would silently answer all-NaN → zero genes
+    // selected); an absurd n_bins was pandas' survivable MemoryError, where
+    // Rust's infallible per-bin allocations would ABORT the process. 2^20 is
+    // far beyond any meaningful binning of a gene axis (scanpy's default is
+    // 20; a bin count above n_vars only adds empty bins). (Round-1 finding:
+    // codex; scoped to the native path in round 2, also codex.)
+    if n_bins == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "n_bins must be at least 1 (scanpy's default is 20)",
+        ));
+    }
+    const N_BINS_MAX: usize = 1 << 20;
+    if n_bins > N_BINS_MAX {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "n_bins = {n_bins} is not a meaningful binning (max {N_BINS_MAX}); \
+             scanpy's default is 20"
+        )));
     }
 
     // ── 1. Streaming mean/var in COUNT space ───────────────────────────

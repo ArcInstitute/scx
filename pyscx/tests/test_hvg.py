@@ -441,7 +441,8 @@ class TestSeuratBoundaryErrors:
 
         with pytest.raises(ValueError, match="n_bins"):
             pyscx.accel.highly_variable_genes(
-                self._adata(), n_top_genes=2, flavor="seurat", n_bins=0
+                self._adata(), n_top_genes=2, flavor="seurat", n_bins=0,
+                device="cpu"
             )
 
     def test_absurd_n_bins_raises_instead_of_aborting(self):
@@ -454,7 +455,7 @@ class TestSeuratBoundaryErrors:
         with pytest.raises(ValueError, match="n_bins"):
             pyscx.accel.highly_variable_genes(
                 self._adata(), n_top_genes=2, flavor="seurat",
-                n_bins=sys.maxsize,
+                n_bins=sys.maxsize, device="cpu",
             )
 
     def test_raw_count_scale_values_raise_not_select_nothing(self):
@@ -465,5 +466,6 @@ class TestSeuratBoundaryErrors:
 
         with pytest.raises(ValueError, match="log-normalized"):
             pyscx.accel.highly_variable_genes(
-                self._adata(values=800.0), n_top_genes=2, flavor="seurat"
+                self._adata(values=800.0), n_top_genes=2, flavor="seurat",
+                device="cpu"
             )
