@@ -1370,8 +1370,9 @@ fn value_max_folds_are_section_family_isolated() {
     ]);
     assert_eq!(cat.csr_max_value(None), 10);
     assert_eq!(cat.raw_csr_max_value(), 500);
-    // The layer fold must see only LayerCsrShard — not the CSC (900), raw
-    // (500), or X (10) entries.
+    // The layer fold must not leak the larger CSC entry (900). Smaller-valued
+    // leaks are pinned elsewhere: an X entry larger than every layer exists in
+    // `layer_csr_max_value_scopes_by_modality_and_name` (999 vs 80).
     assert_eq!(cat.layer_csr_max_value(0, None), 700);
 }
 

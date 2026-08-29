@@ -2100,11 +2100,13 @@ the large-count shard:
 For those ungated paths, a `> 2²⁴` count still rounds silently on access; pass
 `allow_lossy` where available, or read eagerly to get the guard.
 
-The R bindings (`rscx`) wire the same guard on their eager reads — `x_matrix()`,
-`layer()`, `scx_to_seurat()` / `scx_to_mae()` (per modality), and the query
-path — behind the same `allow_lossy` opt-out. Both bindings share one
-implementation: the catalog `value_max` folds on `FullCatalog`
-(`csr_max_value` / `raw_csr_max_value` / `layer_csr_max_value`).
+The R bindings (`rscx`) wire the same guard behind the same `allow_lossy`
+opt-out: eager reads — `$x_matrix()`, `$layer()`, `$to_seurat()` / `$to_mae()`
+(per modality) — use the shared catalog `value_max` folds on `FullCatalog`
+(`csr_max_value` / `layer_csr_max_value`), the same implementation pyscx's
+eager reads use; the R query path, like Python's, guards on the
+engine-computed max over the shards the query actually selected, not a
+catalog-wide fold.
 
 > **Note.** A scipy `csr_matrix` with `float16` `data` is valid but cannot be
 > densified by scipy's own `.toarray()` (a scipy limitation) — call
