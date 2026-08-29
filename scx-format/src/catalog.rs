@@ -1059,10 +1059,15 @@ impl FullCatalog {
     /// strong as the catalog it reads. Walks the catalog only — no payload
     /// reads, O(shards).
     pub fn csr_max_value(&self, modality_id: Option<u8>) -> u32 {
-        Self::fold_value_max(self.entries.iter().filter(|e| {
-            e.section_type == SectionType::CsrShard
-                && modality_id.is_none_or(|m| e.modality_id == m)
-        }))
+        // Fold the listing helpers rather than re-stating their predicates:
+        // if the selection rule ever changes, the guard follows it instead of
+        // silently diverging. Max is order-independent, so their sort is
+        // harmless.
+        let shards = match modality_id {
+            Some(m) => self.csr_shards_for_modality(m),
+            None => self.csr_shards_sorted(),
+        };
+        Self::fold_value_max(shards.into_iter())
     }
 
     /// Maximum `value_max` over the `adata.raw` CSR shards
@@ -1070,11 +1075,7 @@ impl FullCatalog {
     /// most likely >2²⁴ holder) live. Not modality-scoped; raw is a
     /// single-modality concept. Same semantics as [`Self::csr_max_value`].
     pub fn raw_csr_max_value(&self) -> u32 {
-        Self::fold_value_max(
-            self.entries
-                .iter()
-                .filter(|e| e.section_type == SectionType::RawCsrShard),
-        )
+        Self::fold_value_max(self.raw_csr_shards_sorted().into_iter())
     }
 
     /// Maximum `value_max` over the Layer-CSR shards of `modality_id` — every

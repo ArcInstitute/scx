@@ -1370,6 +1370,9 @@ fn value_max_folds_are_section_family_isolated() {
     ]);
     assert_eq!(cat.csr_max_value(None), 10);
     assert_eq!(cat.raw_csr_max_value(), 500);
+    // The layer fold must see only LayerCsrShard — not the CSC (900), raw
+    // (500), or X (10) entries.
+    assert_eq!(cat.layer_csr_max_value(0, None), 700);
 }
 
 #[test]
@@ -1412,21 +1415,46 @@ fn layer_csr_max_value_scopes_by_modality_and_name() {
 /// semantics; every current writer path emits stats.
 #[test]
 fn value_max_folds_treat_missing_stats_as_zero() {
+    // A stats-less entry beside a stats-bearing sibling, in EACH family the
+    // folds cover — pinning "skipped", not "no matching section existed".
     let cat = catalog_with(vec![
         max_value_entry("X_shard_0", SectionType::CsrShard, 0, None),
         max_value_entry("X_shard_1", SectionType::CsrShard, 0, Some(7)),
+        max_value_entry("raw/X_shard_0", SectionType::RawCsrShard, 0, None),
+        max_value_entry("raw/X_shard_1", SectionType::RawCsrShard, 0, Some(11)),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            None,
+        ),
+        max_value_entry(
+            "layer/rna/counts/shard_1",
+            SectionType::LayerCsrShard,
+            0,
+            Some(13),
+        ),
     ]);
     assert_eq!(cat.csr_max_value(None), 7);
+    assert_eq!(cat.raw_csr_max_value(), 11);
+    assert_eq!(cat.layer_csr_max_value(0, None), 13);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 13);
 
-    let all_statless = catalog_with(vec![max_value_entry(
-        "X_shard_0",
-        SectionType::CsrShard,
-        0,
-        None,
-    )]);
+    // All matching entries stats-less (per family) → 0, not an error.
+    let all_statless = catalog_with(vec![
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, None),
+        max_value_entry("raw/X_shard_0", SectionType::RawCsrShard, 0, None),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            None,
+        ),
+    ]);
     assert_eq!(all_statless.csr_max_value(None), 0);
     assert_eq!(all_statless.raw_csr_max_value(), 0);
     assert_eq!(all_statless.layer_csr_max_value(0, None), 0);
+    assert_eq!(all_statless.layer_csr_max_value(0, Some("counts")), 0);
 
     let empty = catalog_with(vec![]);
     assert_eq!(empty.csr_max_value(None), 0);
