@@ -297,3 +297,91 @@ def test_both_shufdelta_arms_gate_decode_correctness(floors):
         specs = _floors_for(floors, fmt, "to_gpu_anndata_decode_correct")
         assert specs, f"{fmt} does not gate decode correctness"
         assert all(f.get("min") == 1.0 for f in specs)
+
+
+# ---------------------------------------------------------------------------
+# Round-1 review fixes (PR #474)
+# ---------------------------------------------------------------------------
+
+
+def test_the_scx1_arm_does_not_claim_a_shufdelta_metric():
+    """`shufdelta_fully_device_decoded` must be ABSENT on an arm that decoded no
+    ShufDeltaZstd shards.
+
+    Scx1 also stamps `transfer_mode == "scx_device_decode_gpu"`, so emitting the
+    metric unconditionally recorded `1.0` next to `shufdelta_n_shards_gpu = 0`
+    on `__scx1_gpu` — the name was a lie on the variant this benchmark already
+    shipped, visible in the job-2858457 snapshot. Found by Cursor Agent.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as m
+
+    src = inspect.getsource(m._run_arm)
+    assert 'if n_shufdelta_gpu > 0:' in src, (
+        "the metric is emitted unconditionally again; Scx1 rows will claim a "
+        "ShufDeltaZstd device decode they never performed"
+    )
+    # …and it is guarded, not merely present: the assignment must sit inside the
+    # conditional, which a plain `in` check on the key cannot tell.
+    guarded = src.split("if n_shufdelta_gpu > 0:")[1]
+    assert '"shufdelta_fully_device_decoded"' in guarded.split("\n\n")[0]
+
+
+def test_every_arm_variant_declares_a_dataset_scope_the_orchestrator_reads():
+    """Scope must live where cohorts are BUILT, not inside `run()`.
+
+    Stubbing an out-of-scope dataset inside `run()` is a typed result, but only
+    after SLURM has started a preemptible GPU task, activated conda and imported
+    pyscx. And the streaming PCA arm had no scope at all, so a default capture
+    scheduled the forced-slow power loop on census_1m — a different, ungated
+    experiment. Both found by Cursor Agent.
+    """
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+    from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as tga
+
+    assert tga.FORMAT_DATASET_SCOPE[SHUF] == tga.ARMS[SHUF].datasets
+    assert tga.FORMAT_DATASET_SCOPE[SHUF_NVCOMP] == tga.ARMS[SHUF_NVCOMP].datasets
+    assert PCA_STREAMING in pca.FORMAT_DATASET_SCOPE
+    assert "census_1m" not in pca.FORMAT_DATASET_SCOPE[PCA_STREAMING]
+
+
+def test_the_orchestrator_refuses_out_of_scope_triples_before_submitting():
+    from benchmarks.comprehensive.scripts.run_parallel import _triple_compatible
+
+    assert not _triple_compatible("accel_pca", "census_1m", PCA_STREAMING)
+    assert _triple_compatible("accel_pca", "tabula_sapiens_100k", PCA_STREAMING)
+    assert not _triple_compatible("accel_to_gpu_anndata", "census_1m", SHUF)
+    assert not _triple_compatible("accel_to_gpu_anndata", "census_1m", SHUF_NVCOMP)
+    # An unscoped variant is untouched — the hook must not narrow anything else.
+    assert _triple_compatible("accel_pca", "census_1m", PCA_RESIDENT)
+    assert _triple_compatible("accel_to_gpu_anndata", "census_1m", SCX1)
+
+
+def test_the_arm_env_has_one_source_of_truth():
+    """`run_parallel` derives the decode arms' env from `ARMS` rather than
+    keeping a second copy that a later edit could update alone (Cursor Agent)."""
+    from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as tga
+    from benchmarks.comprehensive.scripts.run_parallel import _FORMAT_ARM_ENV
+
+    for key, arm in tga.ARMS.items():
+        if arm.env:
+            assert _FORMAT_ARM_ENV[key] == arm.env, key
+
+
+def test_dispatch_env_does_not_mutate_the_environment_before_with_entry():
+    """A pre-entered `ExitStack` mutated `os.environ` at call time, so a bare
+    call — or an exception between two `enter_context()`s — leaked
+    `SCX_FORCE_NATIVE_GPU` into the rest of the process. Every native GPU accel
+    module reaches this path. Found by Antigravity and Cursor Agent."""
+    from benchmarks.comprehensive.benchmarks.accel_pca import dispatch_env
+
+    before = os.environ.get("SCX_FORCE_NATIVE_GPU")
+    cm = dispatch_env(PCA_STREAMING, requires_gpu=True)  # not entered
+    assert os.environ.get("SCX_FORCE_NATIVE_GPU") == before, (
+        "dispatch_env mutated the environment before `with` entry"
+    )
+    with cm:
+        assert os.environ["SCX_FORCE_NATIVE_GPU"] == "1"
+        assert os.environ["SCX_GPU_PCA_RESIDENT"] == "0"
+    assert os.environ.get("SCX_FORCE_NATIVE_GPU") == before

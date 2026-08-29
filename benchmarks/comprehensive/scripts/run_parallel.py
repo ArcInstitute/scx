@@ -400,7 +400,45 @@ def _triple_compatible(bench_name: str, ds_name: str, format_key: str) -> bool:
         return False
     if bench_is_multimodal != fmt_is_multimodal:
         return False
+
+    # A format that declares a dataset scope only pairs inside it. Filtering
+    # here rather than stubbing inside `run()` is what stops the job being
+    # submitted at all.
+    scope = _bench_format_dataset_scope(bench_name).get(format_key)
+    if scope is not None and ds_name not in scope:
+        return False
     return True
+
+
+@functools.lru_cache(maxsize=None)
+def _bench_format_dataset_scope(bench_name: str) -> dict[str, frozenset[str]]:
+    """Per-format dataset allow-lists a bench module declares, or `{}`.
+
+    Reads the module-level ``FORMAT_DATASET_SCOPE`` mapping, in the same shape
+    as :func:`_bench_supported_formats` — the constraint is owned by the bench,
+    not duplicated in the orchestrator.
+
+    This exists because an **arm** variant is not meaningful on every tier.
+    `accel_pca__pyscx_gpu_streaming` forces the slow power loop
+    (`SCX_GPU_PCA_RESIDENT=0`, 3.2x the resident arm on tabula) and is floored
+    only on pbmc3k + tabula_sapiens_100k; without a scope the orchestrator
+    scheduled it on census_1m too — a different, ungated, much slower
+    experiment. The shufdelta arms had the same gap in the other direction:
+    they stubbed out-of-scope datasets *inside* `run()`, which is a typed
+    result but only after Chimera has started a preemptible GPU task, activated
+    conda and imported pyscx — eight wasted GPU jobs per full accel capture.
+    Both found by **Cursor Agent** on PR #474.
+    """
+    try:
+        mod = importlib.import_module(
+            f"benchmarks.comprehensive.benchmarks.{bench_name}"
+        )
+    except ImportError:
+        return {}
+    val = getattr(mod, "FORMAT_DATASET_SCOPE", None)
+    if not val:
+        return {}
+    return {k: frozenset(v) for k, v in val.items()}
 
 
 @functools.lru_cache(maxsize=None)
@@ -693,9 +731,30 @@ def _env_for_format(format_key: str | None) -> str | None:
 # `SCX_SHUFDELTA_NVCOMP` is read per call and does not need this; it is
 # exported anyway so both arms are selected the same way, and so a run driven
 # through some other entry point still lands on the arm its name claims.
+def _decode_arm_env() -> dict[str, dict[str, str]]:
+    """The decode arms' env, read from the benchmark module that defines them.
+
+    Not a second copy. `accel_to_gpu_anndata.ARMS` already carries each arm's
+    env for the in-process path; duplicating it here meant a later edit could
+    update one side and silently re-open the nvcomp-fallback hole these arms
+    exist to close (Cursor Agent, #474). Falls back to an empty map when the
+    module cannot be imported, which is the same posture as
+    `_bench_supported_formats`.
+    """
+    try:
+        mod = importlib.import_module(
+            "benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata"
+        )
+    except ImportError:
+        return {}
+    return {k: dict(a.env) for k, a in mod.ARMS.items() if a.env}
+
+
 _FORMAT_ARM_ENV: dict[str, dict[str, str]] = {
+    # The PCA arm's knob lives here because `accel_pca` selects it through
+    # `dispatch_env`, not through a data table the way the decode arms do.
     "accel_pca__pyscx_gpu_streaming": {"SCX_GPU_PCA_RESIDENT": "0"},
-    "accel_to_gpu_anndata__shufdelta_gpu_nvcomp": {"SCX_SHUFDELTA_NVCOMP": "1"},
+    **_decode_arm_env(),
 }
 
 

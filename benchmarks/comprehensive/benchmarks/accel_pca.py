@@ -325,6 +325,7 @@ def streaming_pca_env():
     return env_var("SCX_GPU_PCA_RESIDENT", "0")
 
 
+@contextlib.contextmanager
 def dispatch_env(variant_key: str, requires_gpu: bool):
     """The env context a variant's impl must run under:
     - no-rapids variant  → SCX_DISABLE_RAPIDS=1 (exercise the CPU fallback)
@@ -332,16 +333,27 @@ def dispatch_env(variant_key: str, requires_gpu: bool):
     - native gpu variant → SCX_FORCE_NATIVE_GPU=1 (pin native kernels)
     - streaming variant  → the above, plus SCX_GPU_PCA_RESIDENT=0
     - cpu variant        → nothing
+
+    A real generator context manager, not a pre-entered `ExitStack`. The stack
+    form called `enter_context()` during `dispatch_env(...)` evaluation rather
+    than at `with` entry, so a bare call — or an exception raised between the
+    two `enter_context()`s — leaked `SCX_FORCE_NATIVE_GPU` into the rest of the
+    process. Every native GPU accel module (kNN / UMAP / Leiden / HVG /
+    preprocess / pipeline) reaches this, not only PCA. Flagged by **Antigravity**
+    and **Cursor Agent** on PR #474.
     """
     if is_no_rapids_variant(variant_key):
-        return disable_rapids_env()
-    if requires_gpu and not is_rapids_variant(variant_key):
-        stack = contextlib.ExitStack()
-        stack.enter_context(force_native_gpu_env())
-        if is_streaming_variant(variant_key):
-            stack.enter_context(streaming_pca_env())
-        return stack
-    return contextlib.nullcontext()
+        with disable_rapids_env():
+            yield
+    elif requires_gpu and not is_rapids_variant(variant_key):
+        with force_native_gpu_env():
+            if is_streaming_variant(variant_key):
+                with streaming_pca_env():
+                    yield
+            else:
+                yield
+    else:
+        yield
 
 
 def emit_route_signal(
@@ -375,6 +387,17 @@ def emit_route_signal(
             )
     elif requires_gpu:
         extras[gpu_metric] = 1.0 if route.startswith("gpu_") else 0.0
+
+
+# The streaming arm forces the slow power loop (SCX_GPU_PCA_RESIDENT=0 —
+# re-decode and re-upload on every multiply, 3.2x the resident arm on tabula)
+# and is floored only on these two tiers. Without a scope the orchestrator
+# schedules it on census_1m as well: a different, ungated, much slower
+# experiment than the one this PR measured (Cursor Agent, #474). Read by
+# `run_parallel._bench_format_dataset_scope`.
+FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
+    "accel_pca__pyscx_gpu_streaming": frozenset({"pbmc3k", "tabula_sapiens_100k"}),
+}
 
 
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {

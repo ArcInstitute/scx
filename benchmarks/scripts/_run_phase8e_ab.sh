@@ -25,10 +25,25 @@
 
 set -uo pipefail
 
-SCX_DIR=/home/nickyoungblut/dev/rust/scx
-CONDA=/home/nickyoungblut/miniforge3
-ENV="${CONDA}/envs/scx-bench-gpu"
-WORK=/home/nickyoungblut/scx-bench-8e
+# Derived, with this author's layout as the fallback — the gate script does the
+# same, and doing it here too was flagged by **Cursor Agent** on PR #474: a
+# committed script that hard-codes one home directory is a lab note wearing the
+# clothes of repo surface. `sbatch` copies the batch script into slurmd's spool
+# and runs it from there, so `${BASH_SOURCE[0]}` is /var/spool/slurmd/job<N>/…
+# and `dirname/../..` is /var/spool — which EXISTS, so a naive `||` fallback
+# never fires. Validate the candidate instead of trusting the exit status.
+REPO_FALLBACK=/home/nickyoungblut/dev/rust/scx
+SCX_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd || true)
+if [ ! -f "${SCX_DIR:-/nonexistent}/pyscx/Cargo.toml" ]; then
+  SCX_DIR=$REPO_FALLBACK
+fi
+if [ ! -f "$SCX_DIR/pyscx/Cargo.toml" ]; then
+  echo "cannot locate the scx checkout (tried \"$SCX_DIR\"); set REPO_FALLBACK" >&2
+  exit 1
+fi
+CONDA=${CONDA_BASE:-$( { conda info --base 2>/dev/null || echo "$HOME/miniforge3"; } )}
+ENV="${CONDA}/envs/${BENCH_CONDA_ENV:-scx-bench-gpu}"
+WORK=${SCX_AB_WORK:-$HOME/scx-bench-8e}
 WT="${WORK}/wt-main"
 BASE=${BASE_REF:-github/main}
 BRANCH_DIR="${SCX_DIR}"
@@ -113,7 +128,7 @@ PY
 
 run_arm() {
     local name="$1" dir="$2"
-    local target="/home/nickyoungblut/.cargo-target-8eab-${name}"
+    local target="${WORK}/cargo-target-8eab-${name}"
     echo ""
     echo "########## ARM ${name} (${dir}) ##########"
     rm -rf "${target}"

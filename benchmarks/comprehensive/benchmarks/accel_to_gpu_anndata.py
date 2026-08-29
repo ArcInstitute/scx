@@ -197,6 +197,15 @@ def accel_to_gpu_anndata_variants() -> list[FormatVariant]:
     ]
 
 
+# Read by `run_parallel._bench_format_dataset_scope` so an arm's tiers are
+# honoured at COHORT CONSTRUCTION, not by stubbing inside `run()` after Chimera
+# has already started a preemptible GPU task (Cursor Agent, #474). Derived from
+# `ARMS` so the two cannot drift.
+FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
+    key: arm.datasets for key, arm in ARMS.items()
+}
+
+
 @contextlib.contextmanager
 def _arm_env(env: dict[str, str]):
     """Apply an arm's env for the duration, restoring the prior values.
@@ -489,11 +498,22 @@ def _run_arm(
                     # its name claims — nvcomp is runtime-dlopen'd and falls
                     # back to the pipeline in silence when libnvcomp is absent.
                     "shufdelta_n_shards_gpu": float(n_shufdelta_gpu),
-                    "shufdelta_fully_device_decoded": (
-                        1.0 if transfer_mode == "scx_device_decode_gpu" else 0.0
-                    ),
                     "decode_arm": variant_key,
                 }
+                # ...but ONLY on an arm that actually decoded ShufDeltaZstd
+                # shards. Scx1 also stamps `scx_device_decode_gpu`, so emitting
+                # this unconditionally recorded
+                # `shufdelta_fully_device_decoded = 1.0` alongside
+                # `shufdelta_n_shards_gpu = 0` on the `__scx1_gpu` arm — the
+                # name was a lie on the variant this benchmark already shipped
+                # (Cursor Agent, #474; confirmed in the job-2858457 snapshot).
+                # Absent is the honest answer for an arm the metric is not about,
+                # and `check_absolute_floors` only reads it where a floor names
+                # it, which is the two ShufDeltaZstd arms.
+                if n_shufdelta_gpu > 0:
+                    extras["shufdelta_fully_device_decoded"] = (
+                        1.0 if transfer_mode == "scx_device_decode_gpu" else 0.0
+                    )
                 logger.info(
                     "%s run %d/%d: transfer_mode=%s bytes_uploaded=%d correct=%s",
                     variant_key,
