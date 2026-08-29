@@ -1085,3 +1085,207 @@ class TestCloseAndTeardown:
         # The bound is `SHUTDOWN_DEADLINE` (5 s) plus slack; a hang or a
         # missing `shutdown_timeout` is what this catches, not latency.
         assert elapsed < 10.0, f"mid-flight teardown took {elapsed:.2f}s"
+
+
+class TestGilDuringTeardown:
+    """ORG-9.10-6: `IndexPlanDataset` teardown must release the GIL.
+
+    `IndexPlanDataset::close` / `Drop` and `IndexPlanBatchIter::drop` all wrap
+    the runtime teardown in `Python::attach(|py| py.detach(...))` precisely so
+    the rest of the interpreter keeps running while already-started
+    `spawn_blocking` shard decodes finish (§9.3). Nothing asserted it —
+    `TestTeardownOrdering::test_teardown_mid_flight_is_bounded` says so in its
+    own docstring, and it is right that a *duration* threshold cannot see the
+    property: the whole teardown is single-digit milliseconds.
+
+    What is measurable is whether another Python thread ran in the **leading
+    half** of that window. Getting to an oracle that cannot false-pass took
+    three tries, and the two rejected forms are recorded in
+    `_leading_ticks` because both looked correct:
+
+    1. a `len(ticks)` delta read around the window — racy on the far side;
+    2. counting the whole `[t0, t1]` window by timestamp — still racy on the
+       far side, because `t1` is recorded only after the destructor returns;
+    3. counting the leading half — sound in the regime this test runs in, but
+       *not* unconditionally: if the post-return scheduling delay exceeds the
+       teardown itself, the midpoint moves past the return and post-teardown
+       ticks re-enter the leading half.
+
+    (3) is what this test asserts. Its residual is why the test also runs a
+    **negative control**: the same measurement around a `ctypes.PyDLL(None).usleep`
+    of the *same duration as the teardown it just measured* — a call that holds
+    the GIL by construction. A control that scores any leading tick means the
+    rule is not discriminating on this host at this duration, and the test skips
+    rather than trusting it.
+
+    **The control narrows the residual; it does not eliminate it.** The two
+    observations are separate scheduling trials, so a teardown trial that leaks
+    and a control trial that does not would still pass. Measured on this host the
+    leak is 1/200 at 200 us and 0/200 from 250 us up, and `MIN_MEASURABLE_S`
+    keeps the test out of that regime — but that is a probability, not a proof.
+    The sound close is to record start/end markers *inside* the native teardown
+    and count only between them; that needs a test hook in the binding, so it is
+    deferred rather than done here. Do not read a green here as a guarantee the
+    GIL was released — read it as: it was released, or a 1-in-many scheduling
+    coincidence occurred that the control did not catch.
+    """
+
+    N_OBS = 30000
+    N_VARS = 800
+    N_SHARDS = 4
+
+    # Below this, the post-return scheduling delay is a large enough fraction of
+    # the window that the leading-half rule starts to leak: a GIL-holding
+    # control scored a leading tick in 1/200 runs at 200 us on this host, and
+    # 0/200 at every duration from 250 us up.
+    MIN_MEASURABLE_S = 3e-4
+
+    @staticmethod
+    def _leading_ticks(action, setup=None):
+        """Run `action` with a GIL-hungry ticker thread alive, and report
+        `(duration_s, leading, whole)` — ticks in the leading half of the window
+        and in all of it.
+
+        `setup` runs *after* the ticker is confirmed live and before the window
+        opens; the prefetches have to be scheduled there, not before, or the
+        ticker's own warmup is spent inside the very window being measured.
+
+        Ticks are counted by **timestamp**, never as a `len(ticks)` delta taken
+        around the window: between `t1` and the read the main thread can be
+        preempted for a switch interval, during which the ticker appends
+        thousands of entries. Measured that way, a teardown that held the GIL
+        for its entire 1 ms scored ~1500 "ticks during".
+        """
+        import sys
+        import threading
+        import time
+
+        ticks = []
+        stop = threading.Event()
+
+        def ticker():
+            while not stop.is_set():
+                ticks.append(time.perf_counter())
+
+        old_interval = sys.getswitchinterval()
+        worker = None
+        try:
+            sys.setswitchinterval(0.0001)
+            worker = threading.Thread(target=ticker, daemon=True)
+            worker.start()
+
+            deadline = time.perf_counter() + 2.0
+            while not ticks and time.perf_counter() < deadline:
+                time.sleep(0.001)
+            assert ticks, "premise: the ticker thread never ran"
+
+            if setup is not None:
+                setup()
+
+            t0 = time.perf_counter()
+            action()
+            t1 = time.perf_counter()
+            # Let the ticker run past the window so `ticks[-1] > t1` can act as
+            # a liveness premise: a ticker that died mid-window would otherwise
+            # look exactly like a GIL that was never released.
+            time.sleep(0.005)
+        finally:
+            stop.set()
+            if worker is not None:
+                worker.join(timeout=5)
+            sys.setswitchinterval(old_interval)
+
+        assert ticks[-1] > t1, "premise: the ticker must outlive the window"
+        midpoint = t0 + (t1 - t0) / 2
+        return (
+            t1 - t0,
+            sum(1 for t in ticks if t0 <= t <= midpoint),
+            sum(1 for t in ticks if t0 <= t <= t1),
+        )
+
+    def test_teardown_with_prefetches_in_flight_releases_the_gil(self, tmp_path):
+        import ctypes
+
+        import anndata as ad
+        import scipy.sparse as sp
+
+        path = str(tmp_path / "gil_teardown.scx")
+        X = sp.random(
+            self.N_OBS, self.N_VARS, density=0.05, format="csr", random_state=0
+        )
+        X.data = np.round(X.data * 10 + 1).astype(np.float32)
+        adata = ad.AnnData(X=X)
+        adata.obs["cell_id"] = [f"c{i}" for i in range(self.N_OBS)]
+        # Unframed: a framed shard is block-index eligible, and the prefetch
+        # deliberately skips warming those — so there would be no in-flight
+        # decode to tear down and nothing to observe.
+        pyscx.from_anndata(
+            adata, path, shard_size=self.N_OBS // self.N_SHARDS, row_group_rows=0
+        )
+
+        ds = pyscx.IndexPlanDataset(
+            path,
+            normalize=False,
+            log1p=False,
+            obs_columns=[],
+            cache_shards=8,
+            lookahead=self.N_SHARDS,
+            scatter_block_index=False,
+        )
+        # One plan per shard, so consuming the first still leaves N_SHARDS - 1
+        # distinct `read_shard_cached_arc` tasks queued.
+        step = self.N_OBS // self.N_SHARDS
+        plans = [[(i * step, (i * step) + 1)] for i in range(self.N_SHARDS)]
+
+        box = {"ds": ds}
+        del ds  # the box holds the only name now
+
+        def schedule():
+            box["it"] = box["ds"].iter_with_plans(
+                iter(plans), lookahead=self.N_SHARDS
+            )
+            next(box["it"])  # runtime built; the rest of the plans are prefetching
+            # Release the dataset's reference here, *inside* setup: the iterator
+            # holds one of its own, so this tears nothing down — but it has to
+            # happen before the window opens, or the iterator drop below is not
+            # the last-reference drop and the window measures nothing. (It
+            # measured 0.2 ms of nothing when this line lived after the window.)
+            box.pop("ds")
+
+        def teardown():
+            box.pop("it")  # the drop that tears the runtime down
+
+        teardown_s, leading, whole = self._leading_ticks(teardown, setup=schedule)
+
+        if teardown_s < self.MIN_MEASURABLE_S:
+            pytest.skip(
+                f"teardown took {teardown_s * 1e3:.3f} ms — below the window in "
+                "which the leading-half rule is measurably leak-free, so this "
+                "run cannot distinguish a GIL-holding teardown from a "
+                "GIL-releasing one"
+            )
+
+        # Negative control: hold the GIL for the same duration, by construction,
+        # and apply the identical rule. It must score zero — if it does not, the
+        # rule is leaking on this host right now and no verdict from it is worth
+        # anything.
+        libc = ctypes.PyDLL(None)  # PyDLL keeps the GIL across the call
+        hold_us = max(int(teardown_s * 1e6), 1)
+        _, control_leading, control_whole = self._leading_ticks(
+            lambda: libc.usleep(hold_us)
+        )
+        if control_leading > 0:
+            pytest.skip(
+                f"negative control leaked {control_leading} tick(s) into the "
+                f"leading half of a {hold_us} us GIL-holding call — the rule is "
+                "not discriminating on this host at this duration, so a pass "
+                "here would prove nothing"
+            )
+
+        assert leading > 0, (
+            f"no other Python thread ran in the first half of a "
+            f"{teardown_s * 1e3:.2f} ms teardown ({whole} tick(s) in the whole "
+            "window, all in the tail) — the GIL was held for its duration and "
+            f"released only on return. Same-duration GIL-holding control scored "
+            f"{control_leading} leading / {control_whole} whole, as expected."
+        )

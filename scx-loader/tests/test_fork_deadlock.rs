@@ -108,10 +108,7 @@ fn wait_with_timeout(child: Pid, timeout: Duration) -> WaitStatus {
                     let _ = kill(child, Signal::SIGKILL);
                     // Reap so we don't leave a zombie.
                     let _ = waitpid(child, None);
-                    panic!(
-                        "child process hung in TrainingPipeline iteration \
-                         (>{timeout:?})"
-                    );
+                    panic!("child process hung (>{timeout:?})");
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
@@ -131,6 +128,12 @@ fn wait_with_timeout(child: Pid, timeout: Duration) -> WaitStatus {
 /// `wait_with_timeout` panics after `CHILD_TIMEOUT` because the child is
 /// stuck in `start_epoch` (tokio runtime construction in the child) or
 /// `next_batch` (I/O / decode / channel deadlock).
+///
+/// Lives in its own binary, apart from the index-plan fork test: that one
+/// deliberately primes rayon's *global* pool in the parent, and cargo runs a
+/// binary's tests on shared threads — so co-locating them would let this
+/// child inherit live-registry state from a sibling rather than from its own
+/// fixture.
 #[test]
 fn fork_construct_and_iterate_one_epoch() {
     init_tracing_once();
@@ -147,24 +150,23 @@ fn fork_construct_and_iterate_one_epoch() {
             // Child branch: do all the work in a closure that catches
             // panics so we can exit with a meaningful status code instead
             // of triggering a Rust unwind through fork-inherited state.
+            // No printing from the child: `fork()` from cargo's multithreaded
+            // harness copies whatever state Rust's stderr lock was in, without
+            // the thread that would release it, so an `eprintln!` here can park
+            // until CHILD_TIMEOUT — a deadlock in the shape this file exists to
+            // detect. The exit code carries everything the parent needs.
+            // Silence the panic hook first: `catch_unwind` runs it *before*
+            // returning `Err`, and the default hook prints to stderr — so a
+            // child that panics would still reach for the inherited stderr
+            // lock and could park until CHILD_TIMEOUT, turning a clean
+            // `exit(1)` into a spurious hang. Safe here: this runs after
+            // `fork()`, in a single-threaded child.
+            std::panic::set_hook(Box::new(|_| {}));
             let result = std::panic::catch_unwind(|| run_one_epoch(&path));
             let exit_code = match result {
-                Ok(n_batches) => {
-                    eprintln!(
-                        "[child {}] produced {} batches",
-                        std::process::id(),
-                        n_batches
-                    );
-                    if n_batches == 0 {
-                        2
-                    } else {
-                        0
-                    }
-                }
-                Err(_) => {
-                    eprintln!("[child {}] panicked in run_one_epoch", std::process::id());
-                    1
-                }
+                Ok(0) => 2,
+                Ok(_) => 0,
+                Err(_) => 1,
             };
             // Use `_exit` rather than `std::process::exit` to skip atexit
             // handlers — we don't want fork-inherited Drop impls (e.g. the
@@ -175,9 +177,9 @@ fn fork_construct_and_iterate_one_epoch() {
             let status = wait_with_timeout(child, CHILD_TIMEOUT);
             match status {
                 WaitStatus::Exited(_, 0) => { /* success */ }
-                WaitStatus::Exited(_, code) => {
-                    panic!("child exited non-zero ({code}); see stderr for child diagnostics");
-                }
+                WaitStatus::Exited(_, 2) => panic!("child produced no batches"),
+                WaitStatus::Exited(_, 1) => panic!("child panicked in run_one_epoch"),
+                WaitStatus::Exited(_, code) => panic!("child exited non-zero ({code})"),
                 WaitStatus::Signaled(_, sig, _) => {
                     panic!("child killed by signal {sig:?}");
                 }

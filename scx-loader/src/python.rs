@@ -455,6 +455,11 @@ fn resolve_loader_config(
 /// human-readable error naming the first disagreeing pair. Pure (no Python),
 /// so it is unit-testable without a Python interpreter.
 ///
+/// Takes the `FullCatalog` rather than the `ScxReader` it came from: that is
+/// all the body reads, and it is the difference between the sentinel branch
+/// below being testable and not. No writer emits a CSR entry without `stats`,
+/// so the only way to reach that branch from a test is to hand it a catalog.
+///
 /// Assumes per-shard `stats` are present (always true for single-writer v2+
 /// files). A shard missing `stats` maps to a `(u64::MAX, u64::MAX)` sentinel:
 /// two such shards compare equal (degenerate files pass, then the per-batch
@@ -463,14 +468,13 @@ fn resolve_loader_config(
 /// loader never silently emits mis-aligned batches; a missing-stats shard is
 /// logged so a corrupt/legacy file is diagnosable.
 fn check_uniform_modality_layouts(
-    reader: &scx_format_io::ScxReader,
+    catalog: &scx_format_io::FullCatalog,
     modalities: &[(String, u8, u64)],
 ) -> Result<(), String> {
     let layouts: Vec<(&str, Vec<(u64, u64)>)> = modalities
         .iter()
         .map(|(name, mid, _)| {
-            let ranges = reader
-                .catalog()
+            let ranges = catalog
                 .csr_shards_for_modality(*mid)
                 .iter()
                 .map(|e| match e.stats.as_ref() {
@@ -664,7 +668,7 @@ impl MultimodalTrainingDataset {
         // shufflers can only agree on row ordering when the shard
         // layouts match; a genuine layout mismatch (different shard
         // counts or row ranges) can never produce aligned batches.
-        check_uniform_modality_layouts(&reader, &resolved)
+        check_uniform_modality_layouts(reader.catalog(), &resolved)
             .map_err(|e| PyRuntimeError::new_err(format!("MultimodalTrainingDataset: {e}")))?;
 
         // Build one pipeline per modality. All pipelines share the same
@@ -2887,6 +2891,13 @@ pub fn downsample_counts_csr<'py>(
 }
 
 #[cfg(test)]
+// These compile only under `--features python`, which a bare
+// `cargo test -p scx-loader` does not enable — that run is 315 tests, not 320.
+// CI's `cargo test --workspace --exclude rscx` *does* run them: pyscx is a
+// workspace member depending on `scx-loader` with `features = ["python"]`, and
+// resolver-v2 unification turns the feature on for this crate's test target
+// too. Verified by name in that job's output. If pyscx ever stops being built
+// alongside, this module goes silently unrun.
 mod layout_check_tests {
     use super::*;
     use arrow::array::StringArray;
@@ -2998,7 +3009,7 @@ mod layout_check_tests {
         let path = dir.path().join("uniform.scx");
         build_two_modality(&path, 10, &[10]);
         let reader = ScxReader::open(&path).unwrap();
-        assert!(check_uniform_modality_layouts(&reader, &resolved(&reader)).is_ok());
+        assert!(check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).is_ok());
     }
 
     #[test]
@@ -3007,7 +3018,7 @@ mod layout_check_tests {
         let path = dir.path().join("divergent.scx");
         build_two_modality(&path, 10, &[5, 5]);
         let reader = ScxReader::open(&path).unwrap();
-        let err = check_uniform_modality_layouts(&reader, &resolved(&reader)).unwrap_err();
+        let err = check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).unwrap_err();
         assert!(
             err.contains("different per-modality CSR shard layouts"),
             "unexpected error: {err}"
@@ -3015,6 +3026,90 @@ mod layout_check_tests {
         assert!(
             err.contains("rna") && err.contains("atac"),
             "error names pair: {err}"
+        );
+    }
+    /// Strip `stats` from the single CSR shard of each named modality — the
+    /// shape no writer produces (v2+ single-writer files always carry stats)
+    /// but which a corrupt or hand-edited catalog can present, and which the
+    /// function has a dedicated sentinel branch for.
+    fn without_stats(reader: &ScxReader, modalities: &[u8]) -> scx_format_io::FullCatalog {
+        let mut catalog = reader.catalog().clone();
+        for entry in catalog.entries.iter_mut() {
+            if entry.section_type == scx_format_io::SectionType::CsrShard
+                && modalities.contains(&entry.modality_id)
+            {
+                entry.stats = None;
+            }
+        }
+        catalog
+    }
+
+    /// ORG-9.10-6: the sentinel path, agreeing arm. Two shards that both lack
+    /// `stats` map to `(u64::MAX, u64::MAX)` and compare **equal**, so a
+    /// degenerate file is allowed through — the per-batch `cell_indices` check
+    /// in `__next__` is the backstop. Nothing exercised this branch.
+    #[test]
+    fn shards_without_stats_compare_equal_via_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both_stats_less.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+        let atac = reader.modality_id("atac").unwrap();
+
+        // Premise: with stats present this file is uniform, so a failure below
+        // would be about the sentinel and not about the fixture.
+        assert!(check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).is_ok());
+
+        let catalog = without_stats(&reader, &[rna, atac]);
+        assert!(
+            check_uniform_modality_layouts(&catalog, &resolved(&reader)).is_ok(),
+            "two sentinel row ranges must compare equal"
+        );
+    }
+
+    /// ORG-9.10-6: the sentinel must preserve **cardinality**. Stripping stats
+    /// from a genuinely divergent file (1 shard vs 2) must still be caught: one
+    /// sentinel range is not two.
+    ///
+    /// This is the arm that fails if a future edit quiets the missing-stats
+    /// `log::warn!` by dropping such entries (`filter_map`) instead of mapping
+    /// them to the sentinel — at which point both layouts become empty, compare
+    /// equal, and a mis-sharded multimodal file trains on mis-aligned batches.
+    #[test]
+    fn stats_less_shards_still_count_toward_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergent_stats_less.scx");
+        build_two_modality(&path, 10, &[5, 5]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+        let atac = reader.modality_id("atac").unwrap();
+
+        let catalog = without_stats(&reader, &[rna, atac]);
+        let err = check_uniform_modality_layouts(&catalog, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "1 sentinel range must not equal 2 sentinel ranges: {err}"
+        );
+    }
+
+    /// ORG-9.10-6: the sentinel path, disagreeing arm. A **mix** of present and
+    /// absent `stats` compares unequal and must fail loud here rather than
+    /// silently emitting mis-aligned batches — the half of the documented
+    /// contract that decides whether the sentinel is safe.
+    #[test]
+    fn a_mix_of_present_and_absent_stats_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed_stats.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+
+        let catalog = without_stats(&reader, &[rna]);
+        let err = check_uniform_modality_layouts(&catalog, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "unexpected error: {err}"
         );
     }
 }
