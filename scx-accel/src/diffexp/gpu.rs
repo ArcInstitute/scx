@@ -889,8 +889,7 @@ fn compute_pdex_means_from_sums(
     let n_test = target_memberships.len();
     let n_groups = 1 + n_test;
     let host_sums = dev
-        .stream()
-        .clone_dtoh(&d_sums.slice(..n_groups * chunk_size))
+        .clone_dtoh_from(dev.stream(), &d_sums.slice(..n_groups * chunk_size))
         .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 dtoh sums: {e}")))?;
     let ref_means: Vec<f64> = host_sums
         .iter()
@@ -1288,8 +1287,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
                 .u_per_group
                 .try_slice(..u_batch_len)
                 .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB (v3csr)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh U batch (v3csr): {e}")))?
         };
         let p_batch = if n_test == 0 {
@@ -1299,8 +1297,7 @@ fn pdex_ref_gpu_chunked_v3_csr(
                 .p_per_group
                 .try_slice(..p_batch_len)
                 .ok_or_else(|| AccelError::LinAlg("p_per_group batch slice OOB (v3csr)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh p batch (v3csr): {e}")))?
         };
 
@@ -1690,8 +1687,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
                 .u_per_group
                 .try_slice(..u_batch_len)
                 .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB (v3csc)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh U batch (v3csc): {e}")))?
         };
         let p_batch = if n_test == 0 {
@@ -1701,8 +1697,7 @@ fn pdex_ref_gpu_chunked_v3_csc(
                 .p_per_group
                 .try_slice(..p_batch_len)
                 .ok_or_else(|| AccelError::LinAlg("p_per_group batch slice OOB (v3csc)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh p batch (v3csc): {e}")))?
         };
 
@@ -2043,8 +2038,7 @@ where
                 .sums
                 .try_slice(..n_slots * sz)
                 .ok_or_else(|| AccelError::LinAlg("sums slice OOB (wil v3)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh sums (wil v3): {e}")))?
         };
         let mut group_gene_sums: Vec<Vec<f64>> = vec![vec![0.0f64; sz]; n_groups];
@@ -2091,8 +2085,7 @@ where
                 .tie_term
                 .try_slice(..sz)
                 .ok_or_else(|| AccelError::LinAlg("tie_term pool slice OOB (wil v3)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh pool tie (wil v3): {e}")))?
         } else {
             Vec::new()
@@ -2106,8 +2099,7 @@ where
                 .u_per_group
                 .try_slice(..u_batch_len)
                 .ok_or_else(|| AccelError::LinAlg("u_per_group batch slice OOB (wil v3)".into()))?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh U batch (wil v3): {e}")))?
         };
         let tie_batch: Vec<f64> = if is_ref_mode && n_test > 0 {
@@ -2117,8 +2109,7 @@ where
                 .ok_or_else(|| {
                     AccelError::LinAlg("tie_per_group batch slice OOB (wil v3)".into())
                 })?;
-            dev.stream()
-                .clone_dtoh(&view)
+            dev.clone_dtoh_from(dev.stream(), &view)
                 .map_err(|e| AccelError::LinAlg(format!("dtoh tie batch (wil v3): {e}")))?
         } else {
             Vec::new()

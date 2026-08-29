@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cudarc::driver::safe::{
-    CudaContext, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits,
+    CudaContext, CudaModule, CudaSlice, CudaStream, DevicePtr, DeviceRepr, HostSlice,
+    ValidAsZeroBits,
 };
 use cudarc::driver::LaunchConfig;
 use cudarc::nvrtc::Ptx;
@@ -358,6 +359,46 @@ impl GpuDevice {
         self.stream
             .synchronize()
             .map_err(|e| GpuError::CudaError(format!("stream synchronize: {e}")))
+    }
+
+    /// Copy device data to host from any device pointer, on a caller-supplied
+    /// stream, returning a fresh `Vec`.
+    ///
+    /// [`Self::dtoh_copy`] takes a whole `CudaSlice` on this device's own
+    /// stream. Nine sites in `scx-accel/src/diffexp/gpu.rs` read back a **view**
+    /// (`&d_sums.slice(..)`) on a chunk stream instead, so they need the generic
+    /// form.
+    ///
+    /// This is a **host sync**, and that is why it is funnelled: `clone_dtoh`
+    /// blocks the calling thread until the copy completes, which is
+    /// capture-illegal exactly like an allocation. Missing this family is what
+    /// **codex** and **Cursor Agent** both flagged on PR #473 — the funnel
+    /// checked method spellings (`alloc_zeros`, `synchronize`) rather than the
+    /// operation families CUDA prohibits during capture.
+    pub fn clone_dtoh_from<T: DeviceRepr, S: DevicePtr<T>>(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &S,
+    ) -> Result<Vec<T>, GpuError> {
+        capture_guard::check("GpuDevice::clone_dtoh_from")?;
+        stream
+            .clone_dtoh(src)
+            .map_err(|e| GpuError::CudaError(format!("device-to-host copy failed: {e}")))
+    }
+
+    /// Copy device data into an existing host buffer, on a caller-supplied
+    /// stream. The in-place sibling of [`Self::clone_dtoh_from`], and a host
+    /// sync for the same reason — see that method.
+    pub fn memcpy_dtoh_into<T: DeviceRepr, S: DevicePtr<T>, D: HostSlice<T> + ?Sized>(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &S,
+        dst: &mut D,
+    ) -> Result<(), GpuError> {
+        capture_guard::check("GpuDevice::memcpy_dtoh_into")?;
+        stream
+            .memcpy_dtoh(src, dst)
+            .map_err(|e| GpuError::CudaError(format!("device-to-host copy failed: {e}")))
     }
 
     /// Block until all work queued on a **caller-supplied** stream completes.

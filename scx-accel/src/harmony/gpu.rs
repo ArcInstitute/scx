@@ -831,11 +831,11 @@ pub fn harmony_integrate_gpu(
             // enabled the kernels ran on per_thread_stream; sync
             // there. dtoh through dev_pts uses the same stream
             // so ordering is correct.
-            let active_for_sync = if graphs_enabled { &dev_pts } else { &dev };
-            active_for_sync
+            let dev_for_sync = if graphs_enabled { &dev_pts } else { &dev };
+            dev_for_sync
                 .synchronize()
                 .map_err(|e| AccelError::LinAlg(format!("sync: {e}")))?;
-            let obj = compute_objective_gpu(active_for_sync, &d_obj_cell, &d_cross_kgb, n)?;
+            let obj = compute_objective_gpu(dev_for_sync, &d_obj_cell, &d_cross_kgb, n)?;
             local_obj.push(obj);
             state.objective_kmeans.push(obj);
             if check_convergence_kmeans(
@@ -996,8 +996,7 @@ pub fn harmony_integrate_gpu(
                     .try_slice(0..b_prime * d)
                     .ok_or_else(|| AccelError::LinAlg("z_sum scratch slice oob".into()))?;
                 let mut host = vec![0f32; b_prime * d];
-                dev.stream()
-                    .memcpy_dtoh(&view, &mut host)
+                dev.memcpy_dtoh_into(dev.stream(), &view, &mut host)
                     .map_err(|e| AccelError::LinAlg(format!("download z_sum: {e}")))?;
                 dev.synchronize()
                     .map_err(|e| AccelError::LinAlg(format!("sync z_sum: {e}")))?;

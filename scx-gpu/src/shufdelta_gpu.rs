@@ -624,7 +624,15 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     // use-after-free. Best-effort sync the copy stream before propagating so any
     // outstanding DMA out of the pinned buffers has completed first.
     if scope_result.is_err() {
-        let _ = dev.synchronize_stream(&copy_stream);
+        if let Err(e) = dev.synchronize_stream(&copy_stream) {
+            // Best-effort, but no longer silent: since the capture guard landed,
+            // the error this can now carry is `CaptureViolation`, and swallowing
+            // it would drop pinned buffers with a DMA in flight AND hide why.
+            log::warn!(
+                "shufdelta error-path copy-stream drain failed ({e}); \
+                        pinned host buffers may be released with a copy in flight"
+            );
+        }
     }
     scope_result?;
 

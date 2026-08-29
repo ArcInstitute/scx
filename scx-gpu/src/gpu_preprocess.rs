@@ -431,14 +431,11 @@ pub fn gpu_preprocess_to_csr(
         let mut indptr = vec![0i64; n_rows + 1];
         let mut indices = vec![0i32; view.nnz()];
         let mut data = vec![0.0f32; view.nnz()];
-        dev.stream()
-            .memcpy_dtoh(&view.indptr, &mut indptr)
+        dev.memcpy_dtoh_into(dev.stream(), &view.indptr, &mut indptr)
             .map_err(|e| GpuError::CudaError(format!("dtoh indptr: {e}")))?;
-        dev.stream()
-            .memcpy_dtoh(&view.indices, &mut indices)
+        dev.memcpy_dtoh_into(dev.stream(), &view.indices, &mut indices)
             .map_err(|e| GpuError::CudaError(format!("dtoh indices: {e}")))?;
-        dev.stream()
-            .memcpy_dtoh(&view.data, &mut data)
+        dev.memcpy_dtoh_into(dev.stream(), &view.data, &mut data)
             .map_err(|e| GpuError::CudaError(format!("dtoh data: {e}")))?;
 
         shard_csrs.push(ScxCsr::new_unchecked(

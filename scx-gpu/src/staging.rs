@@ -553,17 +553,23 @@ impl GpuCsrSlot {
     ) -> Result<(), GpuError> {
         if self.indptr.len() < indptr_len {
             let new_cap = indptr_len.next_power_of_two();
-            self.indptr = dev.alloc_zeros_on::<i64>(stream, new_cap)?;
+            self.indptr = dev
+                .alloc_zeros_on::<i64>(stream, new_cap)
+                .map_err(|e| GpuError::OutOfMemory(format!("grow indptr: {e}")))?;
             self.cached_desc = None;
         }
         if self.indices.len() < nnz {
             let new_cap = nnz.next_power_of_two();
-            self.indices = dev.alloc_zeros_on::<i32>(stream, new_cap)?;
+            self.indices = dev
+                .alloc_zeros_on::<i32>(stream, new_cap)
+                .map_err(|e| GpuError::OutOfMemory(format!("grow indices: {e}")))?;
             self.cached_desc = None;
         }
         if self.data.len() < nnz {
             let new_cap = nnz.next_power_of_two();
-            self.data = dev.alloc_zeros_on::<f32>(stream, new_cap)?;
+            self.data = dev
+                .alloc_zeros_on::<f32>(stream, new_cap)
+                .map_err(|e| GpuError::OutOfMemory(format!("grow data: {e}")))?;
             self.cached_desc = None;
         }
         Ok(())
