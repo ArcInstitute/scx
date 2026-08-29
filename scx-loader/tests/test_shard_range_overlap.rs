@@ -178,7 +178,7 @@ fn the_cell_set_loader_refuses_a_multimodal_file() {
     let readers = vec![ScxReader::open(&path).unwrap()];
     let err = SparseCellSetLoader::new(
         readers, 4, None, 4, None, None, /*normalize=*/ false, /*log1p=*/ false, 1e4,
-        None,
+        None, /*scatter_block_index*/ false,
     )
     .err()
     .expect("SparseCellSetLoader must refuse a multimodal file");
@@ -198,8 +198,11 @@ fn the_cell_set_loader_still_opens_a_single_modality_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = common::write_multi_shard_fixture(&dir.path().join("ok.scx"), 16, 16, 4);
     let readers = vec![ScxReader::open(&path).unwrap()];
-    SparseCellSetLoader::new(readers, 4, None, 4, None, None, false, false, 1e4, None)
-        .expect("a clean file must still open");
+    SparseCellSetLoader::new(
+        readers, 4, None, 4, None, None, false, false, 1e4, None,
+        /*scatter_block_index*/ false,
+    )
+    .expect("a clean file must still open");
 }
 
 /// Overlap is only half of "exactly once". A cover with a **gap** passes
@@ -259,8 +262,11 @@ fn accepts_a_file_whose_only_modality_is_registered_as_id_1() {
         .expect("IndexPlanLoader must accept a sole registered modality");
 
     let readers = vec![ScxReader::open(&path).unwrap()];
-    SparseCellSetLoader::new(readers, 4, None, 4, None, None, false, false, 1e4, None)
-        .expect("SparseCellSetLoader must accept a sole registered modality");
+    SparseCellSetLoader::new(
+        readers, 4, None, 4, None, None, false, false, 1e4, None,
+        /*scatter_block_index*/ false,
+    )
+    .expect("SparseCellSetLoader must accept a sole registered modality");
 }
 
 /// The control for the test above: a single-modality file still opens.

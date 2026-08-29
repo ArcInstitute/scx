@@ -81,7 +81,16 @@ fn two_file_engine(dir: &std::path::Path, cache_shards: usize) -> Arc<PrefetchEn
     write_multi_shard_fixture(&p0, 32, 8, 4);
     write_multi_shard_fixture(&p1, 32, 8, 4);
     let readers = vec![ScxReader::open(&p0).unwrap(), ScxReader::open(&p1).unwrap()];
-    PrefetchEngine::from_scx_readers(readers, cache_shards, usize::MAX, /*lookahead*/ 4)
+    PrefetchEngine::from_scx_readers(
+        readers,
+        cache_shards,
+        usize::MAX,
+        /*lookahead*/ 4,
+        // These fixtures are unframed, so the gate is inert here either way;
+        // `false` states the intent (warm + cache) rather than relying on that.
+        /*scatter_block_index*/
+        false,
+    )
 }
 
 /// Plan = list of `(file_id, row)`; `rows_of` just clones it.
@@ -417,12 +426,12 @@ fn engine_prefetch_depth_survives_when_the_generator_keeps_up() {
 /// Fixture shape, fixed rather than parameterised: `framed_expected` below is
 /// the gather oracle and hard-codes the same `N_VARS`, so a caller varying the
 /// shape independently would silently corrupt it.
-const FRAMED_N_OBS: usize = 256;
-const FRAMED_N_VARS: usize = 8;
+pub(crate) const FRAMED_N_OBS: usize = 256;
+pub(crate) const FRAMED_N_VARS: usize = 8;
 const FRAMED_N_SHARDS: usize = 4;
 const FRAMED_ROW_GROUP_ROWS: u32 = 16;
 
-fn write_framed_fixture(path: &std::path::Path) {
+pub(crate) fn write_framed_fixture(path: &std::path::Path) {
     use scx_format_io::modality::ModalityType;
     use scx_format_io::SectionType;
     use scx_format_io::{encode_one_shard, FramingConfig};
@@ -502,7 +511,7 @@ fn write_framed_fixture(path: &std::path::Path) {
 }
 
 /// Expected `(col, value)` for a `write_framed_fixture` row.
-fn framed_expected(row: u64) -> (i32, f32) {
+pub(crate) fn framed_expected(row: u64) -> (i32, f32) {
     (
         (row % FRAMED_N_VARS as u64) as i32,
         ((row % 250) + 1) as f32,
@@ -512,21 +521,23 @@ fn framed_expected(row: u64) -> (i32, f32) {
 /// A one-file engine over a framed fixture, with the reader's per-reader
 /// block-index gate set explicitly.
 ///
-/// Mirrors `PrefetchEngine::from_scx_readers` (shared cache, one process-wide
-/// CPU pool, metrics on) but goes through `PrefetchEngine::new` so the gate can
-/// be set on the reader before the `Arc` is shared — the engine exposes no
-/// knob for it, which is ORG-9.10-1 drift (a) seen from the other side.
+/// This used to hand-roll `PrefetchEngine::new` because `from_scx_readers`
+/// exposed no knob for the gate — ORG-9.10-1 drift (a) seen from the other
+/// side. It has one now (9b), so this is the production constructor with the
+/// gate passed through, which is what makes these tests cover the real path.
 fn framed_engine(dir: &std::path::Path, scatter_block_index: bool) -> Arc<PrefetchEngine> {
     let path = dir.join("framed.scx");
     write_framed_fixture(&path);
-    // Large enough to hold every shard the plans touch, so the reader gate is
-    // the only thing that decides whether they warm.
-    let shared = SharedShardCache::new(/*cache_shards*/ 8, usize::MAX);
-    let mut backed = BackedCsrReader::with_shared_cache(ScxReader::open(&path).unwrap(), 0, shared);
-    backed.set_cpu_pool(crate::pool::cpu_pool());
-    backed.enable_metrics();
-    backed.set_scatter_block_index(scatter_block_index);
-    PrefetchEngine::new(vec![Arc::new(backed)], /*default_lookahead*/ 4)
+    PrefetchEngine::from_scx_readers(
+        vec![ScxReader::open(&path).unwrap()],
+        // Large enough to hold every shard the plans touch, so the reader gate
+        // is the only thing that decides whether they warm.
+        /*cache_shards*/
+        8,
+        usize::MAX,
+        /*default_lookahead*/ 4,
+        scatter_block_index,
+    )
 }
 
 /// **Pin (ORG-9.10-1, drift (a)/L2).** The engine's prefetch must NOT warm a
@@ -612,6 +623,71 @@ fn engine_warms_the_same_shards_when_the_reader_gate_is_off() {
             engine.reader(0).cache_contains(sidx),
             "shard {sidx} must be warm with the gate off"
         );
+    }
+}
+
+/// **Pin (9b).** `from_scx_readers` must apply the gate to **every** reader,
+/// not just the first.
+///
+/// The two tests above are one-file, so they stay green if the setter is
+/// applied only to `fid == 0` — and the one production caller,
+/// `SparseCellSetLoader`, is *multi*-file by design (that is the whole point of
+/// the cell-set loader). A gate that reached reader 0 only would leave every
+/// other file on the opposite path, and the aggregate counters would still show
+/// both routes exercised, which reads as success.
+///
+/// Asserted per reader through `cache_contains`, because `cache_metrics()` is a
+/// single aggregate over the shared cache and cannot attribute a group to a
+/// file.
+#[test]
+fn from_scx_readers_applies_the_block_index_gate_to_every_reader() {
+    for gate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("f0.scx");
+        let p1 = dir.path().join("f1.scx");
+        write_framed_fixture(&p0);
+        write_framed_fixture(&p1);
+        let engine = PrefetchEngine::from_scx_readers(
+            vec![ScxReader::open(&p0).unwrap(), ScxReader::open(&p1).unwrap()],
+            /*cache_shards*/ 16,
+            usize::MAX,
+            /*default_lookahead*/ 4,
+            gate,
+        );
+
+        // One row in each of shards 0..3 of *both* files.
+        let plan: Plan = vec![
+            (0u32, 5u64),
+            (0, 70),
+            (0, 140),
+            (0, 200),
+            (1, 5),
+            (1, 70),
+            (1, 140),
+            (1, 200),
+        ];
+        let out: Vec<_> = Arc::clone(&engine)
+            .iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather)
+            .map(|r| r.unwrap())
+            .collect();
+        let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+        assert_eq!(
+            out,
+            vec![want],
+            "gate={gate}: the gather must still be correct"
+        );
+
+        for fid in 0..2u32 {
+            for sidx in 0..4 {
+                assert_eq!(
+                    engine.reader(fid).cache_contains(sidx),
+                    !gate,
+                    "gate={gate}: file {fid} shard {sidx} — with the gate off every \
+                     touched shard warms into the LRU; with it on none of them do. A \
+                     gate applied to reader 0 only fails here on file 1."
+                );
+            }
+        }
     }
 }
 

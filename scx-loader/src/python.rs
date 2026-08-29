@@ -2243,6 +2243,23 @@ impl SparseCellSetDataset {
 
 #[pymethods]
 impl SparseCellSetDataset {
+    /// Args:
+    ///     scatter_block_index: Per-dataset escape hatch (default: **False** —
+    ///         the opposite of `IndexPlanDataset`) gating the block-index-aware
+    ///         gather and its prefetch warm-skip for row-group-framed (v4)
+    ///         files. False warms whole shards into the LRU and serves batches
+    ///         from cache; True decodes only the touched row-groups per batch.
+    ///         Off by default because the cell-set regime is cache-*friendly*
+    ///         (sorted data + a reused control pool → a small working set that
+    ///         fits the shard cache and is touched most batches), and the
+    ///         block-index predicate keys on `!cache.contains()`, so a hot shard
+    ///         stays eligible forever, is re-decoded every batch, and the LRU
+    ///         never populates. Measured on a 50-file Tahoe atlas: steps/s
+    ///         2.80 → 4.55 and gather 337 ms → ~5 ms with it off, at ≈ .h5ad
+    ///         parity. Pass True for a genuinely cache-hostile run (working set
+    ///         ≫ cache), where the row-group-scoped decode's bounded peak RAM is
+    ///         the memory-safe choice. `SCX_SCATTER_BLOCK_INDEX=0` is the
+    ///         process-wide reader-layer kill-switch over both settings.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -2258,6 +2275,7 @@ impl SparseCellSetDataset {
         downsample_target_library_size=None,
         downsample_method=None,
         downsample_seed=None,
+        scatter_block_index=None,
     ))]
     fn new(
         py: Python<'_>,
@@ -2273,6 +2291,7 @@ impl SparseCellSetDataset {
         downsample_target_library_size: Option<u64>,
         downsample_method: Option<String>,
         downsample_seed: Option<u64>,
+        scatter_block_index: Option<bool>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -2286,6 +2305,16 @@ impl SparseCellSetDataset {
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
+        // Default OFF, unlike `IndexPlanDataset`. The cell-set workload is
+        // cache-friendly (sorted data + a reused control pool → high shard
+        // reuse), and the block-index gather keys on `!cache.contains()`, so a
+        // hot shard stays eligible forever: it is re-decoded every batch and the
+        // LRU never populates. Measured on a 50-file Tahoe atlas (PR #299, on
+        // the equivalent gather this knob replaced): steps/s 2.80 → 4.55, gather
+        // 337 ms → ~5 ms, cache populated to 8.25 GB — at ≈ .h5ad parity.
+        // Pass `scatter_block_index=True` for a cache-hostile run (working set
+        // ≫ cache), where the row-group decode's bounded peak RAM wins.
+        let scatter_block_index = scatter_block_index.unwrap_or(false);
         let downsample = resolve_downsample(
             &paths,
             downsample_target_library_size,
@@ -2312,6 +2341,7 @@ impl SparseCellSetDataset {
             log1p,
             target_sum,
             downsample,
+            scatter_block_index,
         )
         .map_err(loader_err_to_py)?;
 

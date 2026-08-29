@@ -167,6 +167,13 @@ impl SparseCellSetLoader {
     /// `usize::MAX`, which left peak RSS unbounded (STATE3 observed ~23 GB).
     /// This matches how `TrainingDataset` and `IndexPlanDataset` resolve a
     /// `None` budget, so all three loader classes share one policy.
+    ///
+    /// `scatter_block_index` is a pure pass-through to
+    /// [`PrefetchEngine::from_scx_readers`] — deliberately not stored, because
+    /// the flag's only consumer is the reader it is set on, and a second copy
+    /// here could disagree with it. `SparseCellSetDataset` passes `false`; see
+    /// that constructor for why the cell-set regime wants the full-shard
+    /// warm+cache path.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         scx_readers: Vec<ScxReader>,
@@ -179,6 +186,7 @@ impl SparseCellSetLoader {
         log1p: bool,
         target_sum: f64,
         downsample: Option<crate::downsample::DownsampleConfig>,
+        scatter_block_index: bool,
     ) -> Result<Arc<Self>> {
         // Same reason as `IndexPlanLoader`: this loader resolves cells by global
         // obs row through `BackedCsrReader`, so a multimodal file's flattened
@@ -281,6 +289,7 @@ impl SparseCellSetLoader {
             cache_shards,
             cache_bytes_budget,
             lookahead,
+            scatter_block_index,
         );
         Ok(Arc::new(SparseCellSetLoader {
             engine,
