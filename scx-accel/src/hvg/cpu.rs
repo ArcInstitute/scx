@@ -199,6 +199,14 @@ pub fn binned_dispersion_norm(
 ) -> Vec<f64> {
     let n = log_means.len();
     debug_assert_eq!(n, log_dispersions.len());
+    // `checked_add` closes the one arithmetic wrap (`usize::MAX + 1`); the
+    // per-bin vectors below still allocate O(n_bins), so callers bound n_bins
+    // to something meaningful — pyscx rejects > 2^20 at its boundary. An
+    // unbounded direct caller risks the ordinary infallible-alloc abort any
+    // `vec![0; huge]` carries, which is not a contract this kernel can lift.
+    let Some(n_edges) = n_bins.checked_add(1) else {
+        return vec![f64::NAN; n];
+    };
     if n == 0 || n_bins == 0 {
         return vec![f64::NAN; n];
     }
@@ -220,7 +228,7 @@ pub fn binned_dispersion_norm(
     if !mn.is_finite() || !mx.is_finite() {
         return vec![f64::NAN; n];
     }
-    let mut edges = Vec::with_capacity(n_bins + 1);
+    let mut edges = Vec::with_capacity(n_edges);
     if mn == mx {
         // pandas widens a zero-width range on both ends *before* binning, and
         // then skips the leftmost-edge adjustment below.

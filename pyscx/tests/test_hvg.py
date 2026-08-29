@@ -408,3 +408,62 @@ def test_gpu_fallback_warning_includes_device_string(scx_path):
             flavor="seurat",
             device="gpu:0",
         )
+
+
+# ---------------------------------------------------------------------------
+# seurat flavor — boundary errors (round-1 review, PR #478)
+# ---------------------------------------------------------------------------
+
+
+class TestSeuratBoundaryErrors:
+    """The Rust binning kernel answers degenerate inputs with all-NaN, which
+    the -inf selection floor would silently turn into ZERO genes selected —
+    so the pyscx boundary must refuse them loudly instead, the way the pandas
+    era did (it raised)."""
+
+    def _adata(self, values=None):
+        import anndata
+        import numpy as np
+        import pandas as pd
+        from scipy import sparse
+
+        X = np.arange(12, dtype=np.float32).reshape(4, 3) % 5 + 0.1
+        if values is not None:
+            X[0, 0] = values
+        return anndata.AnnData(
+            X=sparse.csr_matrix(X),
+            obs=pd.DataFrame(index=[f"c{i}" for i in range(4)]),
+            var=pd.DataFrame(index=[f"g{i}" for i in range(3)]),
+        )
+
+    def test_n_bins_zero_raises(self):
+        import pyscx
+
+        with pytest.raises(ValueError, match="n_bins"):
+            pyscx.accel.highly_variable_genes(
+                self._adata(), n_top_genes=2, flavor="seurat", n_bins=0
+            )
+
+    def test_absurd_n_bins_raises_instead_of_aborting(self):
+        """Pandas raised MemoryError and the interpreter survived; Rust's
+        infallible per-bin allocations would abort the whole process."""
+        import sys
+
+        import pyscx
+
+        with pytest.raises(ValueError, match="n_bins"):
+            pyscx.accel.highly_variable_genes(
+                self._adata(), n_top_genes=2, flavor="seurat",
+                n_bins=sys.maxsize,
+            )
+
+    def test_raw_count_scale_values_raise_not_select_nothing(self):
+        """expm1 overflows to Inf around x ≈ 709 — the raw-counts mix-up. One
+        overflowing gene used to make every dispersions_norm NaN, selecting
+        zero genes with no error (and subset=True would drop every gene)."""
+        import pyscx
+
+        with pytest.raises(ValueError, match="log-normalized"):
+            pyscx.accel.highly_variable_genes(
+                self._adata(values=800.0), n_top_genes=2, flavor="seurat"
+            )

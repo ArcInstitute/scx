@@ -1380,6 +1380,20 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
             "n_bins must be at least 1 (scanpy's default is 20)",
         ));
     }
+    // Upper bound, because the failure mode changed with the Rust port: the
+    // pandas era raised MemoryError on an absurd n_bins and the interpreter
+    // survived; Rust's infallible per-bin allocations would ABORT the process
+    // instead. 2^20 bins is far beyond any meaningful binning of a gene axis
+    // (scanpy's default is 20; a bin count above n_vars already only adds
+    // empty bins) while keeping the kernel's working set trivially small.
+    // (Round-1 finding: codex.)
+    const N_BINS_MAX: usize = 1 << 20;
+    if n_bins > N_BINS_MAX {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "n_bins = {n_bins} is not a meaningful binning (max {N_BINS_MAX}); \
+             scanpy's default is 20"
+        )));
+    }
 
     // For batched seurat, fall back to scanpy (complex aggregation logic)
     if batch_key.is_some() {
@@ -1441,6 +1455,23 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         // scanpy: mean = log1p(mean) — count-space mean, logged for binning
         // and for the published `means` column.
         log_means[j] = means_for_disp[j].ln_1p();
+    }
+
+    // `expm1` overflows to Inf around x ≈ 709, which is what running
+    // flavor="seurat" on raw counts (a MALAT1-scale UMI value) produces. The
+    // pandas reference RAISED on an Inf mean ("cannot specify integer `bins`
+    // when input data contains infinity"); the Rust kernel instead answers
+    // all-NaN, which the -inf selection floor below would turn into ZERO
+    // genes selected — and subset=True would then drop the whole var axis,
+    // silently. Keep the failure loud at the boundary, like n_bins == 0
+    // above. (Round-1 finding: Cursor Agent.)
+    if log_means.iter().any(|v| !v.is_finite()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "count-space means overflowed to infinity: flavor=\"seurat\" \
+             un-log1ps X before computing moments, so it expects \
+             log-normalized input (sc.pp.log1p / pyscx.accel.log1p), not raw \
+             counts",
+        ));
     }
 
     // ── 3. Bin by mean, z-score dispersion within bins ──────────────────
