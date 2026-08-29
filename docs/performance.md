@@ -2142,8 +2142,22 @@ recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, g
 measured on the *scx1 decode-sidecar* gather this knob replaced, not on the
 block-index gather, and were relabelled onto `scatter_block_index` when the
 sidecar was removed. The mechanism carries over exactly — both routes skip the
-warm and key eligibility on `!cache.contains()` — but treat the magnitude as
-indicative until re-measured. Pass `scatter_block_index=true` for a
+warm and key eligibility on `!cache.contains()` — and the block-index gather has
+now been measured directly:
+
+| tabula_sapiens_100k, reframed to v4, S=64 random cell sets, cold | cellsets/s (median of 3) | peak RSS | route |
+|---|---|---|---|
+| `scatter_block_index=false` (the default) | 587.5 | 3333 MB | `full_shard_groups=5339` |
+| `scatter_block_index=true` | 3.19 | 939 MB | `block_index_groups=5339` |
+
+**177×** — but read it as the *extreme* of the cache-friendly regime rather than a
+typical figure: 7 shards against the 128-shard default cache means the working
+set is fully resident after the first pass (hit rate 0.9987), which is exactly
+where re-decoding per batch costs everything. Tahoe's 1.6× is the same effect
+with a working set that does not trivially fit. Note the trade runs the other way
+on memory — 939 MB against 3.3 GB, a 3.5× reduction — which is why the knob
+exists rather than the route being hard-coded. Driver:
+`benchmarks/scripts/bench_cellset_scatter_routes.py`. Pass `scatter_block_index=true` for a
 genuinely cache-hostile cell-set run (working set ≫ cache), where the
 row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate is
 per-reader: the `IndexPlanDataset` defaults above are unchanged, and
