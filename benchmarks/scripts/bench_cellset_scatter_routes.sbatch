@@ -6,8 +6,8 @@
 # where both routes collapse to the same path) and prices the two routes.
 #
 # Usage:
-#     SOURCE=/data/scx-dev/benchmarks/datasets/tabula_sapiens_100k_auto.scx \
-#     WORKDIR=$HOME/tmp/cellset-routes OUT=$HOME/tmp/cellset-routes/tabula.json \
+#     SOURCE="/data/scx-dev/benchmarks/datasets/tabula_sapiens_100k_auto.scx" \
+#     WORKDIR=$HOME/tmp/cellset-routes OUT_DIR=$HOME/tmp/cellset-routes \
 #         sbatch --job-name=cellset-routes-tabula \
 #         benchmarks/scripts/bench_cellset_scatter_routes.sbatch
 # =============================================================================
@@ -27,7 +27,8 @@ mkdir -p benchmarks/comprehensive/logs
 
 SOURCE="${SOURCE:?set SOURCE=<path to .scx>}"
 WORKDIR="${WORKDIR:?set WORKDIR=<scratch dir>}"
-OUT="${OUT:?set OUT=<result .json>}"
+OUT_DIR="${OUT_DIR:?set OUT_DIR=<dir for result .json files>}"
+mkdir -p "$OUT_DIR"
 N_RUNS="${N_RUNS:-3}"
 N_BATCHES="${N_BATCHES:-50}"   # the `on` route re-decodes per batch, so this is
                                # the knob that decides whether the job fits its wall
@@ -53,6 +54,10 @@ assert 'scatter_block_index' in sig, 'this pyscx predates the kwarg; rebuild wit
 print('scatter_block_index kwarg: present')
 "
 
-python benchmarks/scripts/bench_cellset_scatter_routes.py \
-    --source "$SOURCE" --workdir "$WORKDIR" --out "$OUT" \
-    --n-runs "$N_RUNS" --n-batches "$N_BATCHES"
+# SOURCE may name several files; each gets its own result + manifest.
+for src in $SOURCE; do
+    stem=$(basename "$src" .scx)
+    python benchmarks/scripts/bench_cellset_scatter_routes.py \
+        --source "$src" --workdir "$WORKDIR" --out "$OUT_DIR/$stem.json" \
+        --n-runs "$N_RUNS" --n-batches "$N_BATCHES"
+done

@@ -44,6 +44,28 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.comprehensive.benchmarks import cellset_gather as cg  # noqa: E402
 from benchmarks.comprehensive.cache_control import drop_file_cache  # noqa: E402
+from benchmarks.comprehensive.results import BenchmarkResult  # noqa: E402
+
+
+def _git_rev(path: str) -> str | None:
+    """The last commit that touched `path`, or `None` on a dirty/absent file.
+
+    Published numbers have to name the revision of the **driver** as well as the
+    code under test: citing only the loader commit points a reader at a tree in
+    which this script does not exist.
+    """
+    try:
+        rev = subprocess.run(
+            ["git", "log", "-1", "--format=%H", "--", path],
+            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--", path],
+            capture_output=True, text=True, check=True, cwd=REPO_ROOT,
+        ).stdout.strip()
+        return f"{rev}-dirty" if dirty else (rev or None)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _scx_info(scx_bin: str, path: str) -> dict:
@@ -89,7 +111,7 @@ def _arm(scx_path: str, n_obs: int, gate, n_runs: int, n_batches: int, cold: boo
     # Warm the code paths (tokio/rayon) with a tiny pass; timed reads are cold.
     cg._run_gather(scx_path, lambda: plans(cg._WARMUP_BATCHES), scatter_block_index=gate)
 
-    sps, rss, ttfb, routes = [], [], [], []
+    sps, rss, ttfb, routes, wall = [], [], [], [], []
     for _ in range(n_runs):
         policy = drop_file_cache(scx_path) if cold else "warm"
         out = cg._run_gather(
@@ -98,10 +120,17 @@ def _arm(scx_path: str, n_obs: int, gate, n_runs: int, n_batches: int, cold: boo
         sps.append(out.n_sets / out.wall_s if out.wall_s > 0 else 0.0)
         rss.append(out.peak_rss_mb)
         ttfb.append(out.ttfb_s)
+        wall.append(out.wall_s)
         routes.append((out.full_shard_groups, out.block_index_groups,
                        out.shard_cache_hit_rate))
     last = routes[-1]
     return {
+        "samples": [
+            {"cellsets_per_sec": round(s, 2), "peak_rss_mb": round(r, 1),
+             "ttfb_s": round(tt, 4)}
+            for s, r, tt in zip(sps, rss, ttfb)
+        ],
+        "wall_s": wall,
         "scatter_block_index": gate,
         "cache_policy": policy,
         "n_runs": n_runs,
@@ -154,7 +183,11 @@ def main() -> int:
           f"n_csr_shards={framed_info.get('n_csr_shards')} "
           f"({framed_info['_reframe_wall_s']}s)", flush=True)
 
-    n_obs = int(pyscx.open(framed).n_obs)
+    probe = pyscx.open(framed)
+    try:
+        n_obs = int(probe.n_obs)
+    finally:
+        probe.close()
     arms = {}
     # `None` first: it measures the *shipped default*, which is the claim under
     # test. `False` is the same setting passed explicitly — if the two disagree
@@ -185,6 +218,18 @@ def main() -> int:
     }
     failed = [k for k, ok in premises.items() if not ok]
     on = arms["on"]["median_cellsets_per_sec"]
+    # No ratio unless every premise held: a speedup computed from two arms that
+    # took the same route is a plausible number that means nothing, and writing
+    # it into the artifact (even alongside a nonzero exit) invites it being
+    # quoted later.
+    speedup_off = (
+        round(arms["off"]["median_cellsets_per_sec"] / on, 3)
+        if not failed and on > 0 else None
+    )
+    speedup_default = (
+        round(arms["default"]["median_cellsets_per_sec"] / on, 3)
+        if not failed and on > 0 else None
+    )
     payload = {
         "source": args.source,
         "framed_path": framed,
@@ -196,22 +241,66 @@ def main() -> int:
         "arms": arms,
         # The whole point: is the difference attributable to the route at all?
         "block_index_reachable": capable,
-        "speedup_default_over_on": (
-            round(arms["default"]["median_cellsets_per_sec"] / on, 3) if on > 0 else None
-        ),
+        # Both ratios, each against the arm it is actually computed from. One
+        # ratio next to a table showing the *other* arm's rate is how a
+        # published number ends up disagreeing with its own operands.
+        "speedup_off_over_on": speedup_off,
+        "speedup_default_over_on": speedup_default,
         "default_matches_off": premises["the default agrees with the explicit False"],
         "premises": premises,
+        "provenance": {
+            "loader_commit": _git_rev("scx-loader/src/python.rs"),
+            "driver_commit": _git_rev(str(Path(__file__).relative_to(REPO_ROOT))),
+            "hostname": os.uname().nodename,
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "slurm_partition": os.environ.get("SLURM_JOB_PARTITION"),
+            "argv": sys.argv[1:],
+        },
     }
     Path(args.out).write_text(json.dumps(payload, indent=2))
-    print(json.dumps({k: payload[k] for k in
-                      ("block_index_reachable", "speedup_default_over_on",
-                       "default_matches_off")}, indent=2))
+
     if failed:
         raise SystemExit(
             "refusing to report this A/B — the routes did not differ as required:\n  "
             + "\n  ".join(f"FAILED: {k}" for k in failed)
-            + f"\nrun-level counters are in {args.out} for diagnosis."
+            + f"\nrun-level counters are in {args.out} for diagnosis "
+            "(the speedup fields are null, deliberately)."
         )
+
+    # A schema-valid `BenchmarkResult` beside the raw payload: `docs/benchmark_manifest.md`
+    # requires every `docs/performance.md` claim that can be a
+    # benchmark/format/dataset triple to be backed by a checked-in result. This
+    # one can be, on a distinct `*_v4reframed` dataset name so it is never
+    # mistaken for a capture of the registered v3 fixture and cannot collide
+    # with a `gate_candidate.py` row.
+    manifest = BenchmarkResult(
+        benchmark="cellset_gather_scatter_routes",
+        format="scx_v4reframed",
+        dataset=f"{Path(args.source).stem.removesuffix('_auto')}_v4reframed",
+        file_size_bytes=os.path.getsize(framed),
+        metadata={k: v for k, v in payload.items() if k != "arms"},
+    )
+    for label, arm in arms.items():
+        for s, wall_s in zip(arm["samples"], arm["wall_s"]):
+            manifest.add_run(
+                wall_s=wall_s,
+                peak_rss_mb=s["peak_rss_mb"],
+                scenario=f"gather_random__{label}",
+                scatter_block_index=arm["scatter_block_index"],
+                **{
+                    f"cellsets_per_sec__{label}": s["cellsets_per_sec"],
+                    f"peak_rss_mb__{label}": s["peak_rss_mb"],
+                    f"full_shard_groups__{label}": arm["full_shard_groups"],
+                    f"block_index_groups__{label}": arm["block_index_groups"],
+                },
+            )
+    man_path = Path(args.out).with_name(Path(args.out).stem + "__manifest.json")
+    man_path.write_text(json.dumps(manifest.to_dict(), indent=2))
+
+    print(json.dumps({k: payload[k] for k in
+                      ("block_index_reachable", "speedup_off_over_on",
+                       "speedup_default_over_on", "default_matches_off")}, indent=2))
+    print(f"manifest: {man_path}")
     return 0
 
 

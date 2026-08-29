@@ -398,16 +398,21 @@ def _drive(path, **kwargs):
     import pyscx
 
     ds = pyscx.SparseCellSetDataset([path], cache_shards=16, **kwargs)
-    nnz_per_batch = [
-        int(b["indptr"][-1]) for b in ds.iter_with_plans(iter([_FRAMED_PLAN] * 2))
-    ]
-    assert len(nnz_per_batch) == 2, "premise: both plans must yield a batch"
-    assert all(n > 0 for n in nnz_per_batch), (
-        "premise: the plan must actually read data — an all-empty gather would "
-        "leave every counter at zero and both assertions below would hold "
-        "vacuously"
-    )
-    return ds.cache_metrics()
+    try:
+        nnz_per_batch = [
+            int(b["indptr"][-1]) for b in ds.iter_with_plans(iter([_FRAMED_PLAN] * 2))
+        ]
+        assert len(nnz_per_batch) == 2, "premise: both plans must yield a batch"
+        assert all(n > 0 for n in nnz_per_batch), (
+            "premise: the plan must actually read data — an all-empty gather "
+            "would leave every counter at zero and both assertions below would "
+            "hold vacuously"
+        )
+        # Read before closing: `close()` is terminal and the accessors raise
+        # afterwards.
+        return ds.cache_metrics()
+    finally:
+        ds.close()
 
 
 def test_scatter_block_index_defaults_off(framed_scx):

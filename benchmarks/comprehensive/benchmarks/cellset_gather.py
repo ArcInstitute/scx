@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import statistics
 import time
 from dataclasses import dataclass
@@ -315,32 +316,23 @@ class _Outcome:
 def _supports_scatter_block_index() -> bool:
     """Whether this pyscx build accepts the `scatter_block_index` kwarg.
 
-    Asked once, from the pyo3 text signature, rather than by catching the
-    `TypeError` a missing kwarg raises: that catch also swallows a genuine type
-    bug anywhere inside the gather or the plan iterator and reports it as
-    "your build is old", which is the same silent-miscoverage failure the route
-    counters exist to eliminate.
+    Read from the pyo3 text signature rather than inferred from the `TypeError`
+    a missing kwarg raises: that catch also swallows a genuine type bug anywhere
+    inside the gather or the plan iterator and reports it as "your build is
+    old", which is the same silent-miscoverage failure the route counters exist
+    to eliminate. Nothing is caught here either — by the time this is called the
+    main scenarios have already imported pyscx and constructed the class, so an
+    ImportError or AttributeError is a real failure, not an old build.
     """
-    try:
-        import pyscx
+    import pyscx
 
-        return "scatter_block_index" in (
-            pyscx.SparseCellSetDataset.__text_signature__ or ""
-        )
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _route_counters(ds: Any) -> tuple[int, int]:
-    """`(full_shard_groups, block_index_groups)`, or `(0, 0)` if unreadable."""
-    try:
-        cm = ds.cache_metrics()
-        return int(cm.get("full_shard_groups", 0)), int(cm.get("block_index_groups", 0))
-    except Exception:  # noqa: BLE001
-        return 0, 0
+    return "scatter_block_index" in (
+        pyscx.SparseCellSetDataset.__text_signature__ or ""
+    )
 
 
 def _cache_hit_rate(ds: Any) -> float | None:
+    """Hit rate alone, for the three arms that do not need the route counters."""
     try:
         cm = ds.cache_metrics()
         hits = float(cm.get("hits", 0))
@@ -350,6 +342,23 @@ def _cache_hit_rate(ds: Any) -> float | None:
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _cache_snapshot(ds: Any) -> tuple[int, int, float | None]:
+    """`(full_shard_groups, block_index_groups, hit_rate)` from ONE metrics read.
+
+    One read, not three: `cache_metrics()` crosses the Python boundary and the
+    counters must describe the same instant to be interpretable together.
+    """
+    cm = ds.cache_metrics()
+    hits = float(cm.get("hits", 0))
+    misses = float(cm.get("misses", 0))
+    hit_rate = round(hits / (hits + misses), 4) if hits + misses > 0 else None
+    return (
+        int(cm.get("full_shard_groups", 0)),
+        int(cm.get("block_index_groups", 0)),
+        hit_rate,
+    )
 
 
 def _run_gather(
@@ -376,28 +385,27 @@ def _run_gather(
     n_sets = 0
     n_cells = 0
     ttfb_s = 0.0
-    with PeakRssSampler() as sampler:
-        t0 = time.perf_counter()
-        first = True
-        for batch in ds.iter_with_plans(plans_factory()):
-            if first:
-                ttfb_s = time.perf_counter() - t0
-                first = False
-            set_offsets = batch["set_offsets"]
-            n_sets += len(set_offsets) - 1
-            n_cells += int(batch["shape"][0])
-        wall_s = time.perf_counter() - t0
-    # Read every counter BEFORE closing: `close()` is terminal on this class and
-    # the accessors raise afterwards.
-    full_shard, block_index = _route_counters(ds)
-    hit_rate = _cache_hit_rate(ds)
-    # This helper is called several times per scenario per run; without the
-    # close, each call's reader mmaps and file descriptors stay live until the
-    # collector happens to run.
+    # `try/finally`, not a trailing close: this helper is called several times
+    # per scenario per run and its callers catch and continue, so a gather that
+    # raises would otherwise leak that reader's mmap and descriptors for the
+    # rest of the job.
     try:
+        with PeakRssSampler() as sampler:
+            t0 = time.perf_counter()
+            first = True
+            for batch in ds.iter_with_plans(plans_factory()):
+                if first:
+                    ttfb_s = time.perf_counter() - t0
+                    first = False
+                set_offsets = batch["set_offsets"]
+                n_sets += len(set_offsets) - 1
+                n_cells += int(batch["shape"][0])
+            wall_s = time.perf_counter() - t0
+        # Read the counters BEFORE closing: `close()` is terminal on this class
+        # and the accessors raise afterwards.
+        full_shard, block_index, hit_rate = _cache_snapshot(ds)
+    finally:
         ds.close()
-    except Exception:  # noqa: BLE001
-        pass
     return _Outcome(
         n_sets=n_sets,
         n_cells=n_cells,
@@ -1111,13 +1119,22 @@ def run(
             logger.error("  route probe failed: %s", e)
         else:
             capable = probe_out.block_index_groups > 0
+            env_switch = os.environ.get("SCX_SCATTER_BLOCK_INDEX")
+            killed = env_switch is not None and (
+                env_switch == "0" or env_switch.lower() == "false"
+            )
             result.metadata["scatter_block_index_route"] = {
-                # Whether this file can reach the block-index route at all.
-                # `False` means the shards are not row-group-framed (v4), so
-                # both settings collapse to the full-shard path and the
-                # per-scenario route counters above say nothing about the
-                # default. Reframe with `scx optimize --row-group-rows 256`.
+                # Whether the block-index route was reached with the kwarg on.
+                # `False` does NOT mean "unframed" on its own: the predicate
+                # `block_index_eligible` ANDs three more things — the
+                # process-global `SCX_SCATTER_BLOCK_INDEX` switch, the row-range
+                # cost window, and `shard_is_framed`. The env value is recorded
+                # beside the verdict so a `false` can be attributed rather than
+                # guessed at; if it is off, that alone explains this and nothing
+                # about the fixture follows.
                 "block_index_reachable": capable,
+                "env_scatter_block_index": env_switch,
+                "env_kill_switch_engaged": killed,
                 "probe_full_shard_groups": probe_out.full_shard_groups,
                 "probe_block_index_groups": probe_out.block_index_groups,
                 "n_batches": 1,
@@ -1125,10 +1142,12 @@ def run(
             }
             logger.info(
                 "  route probe: block_index_reachable=%s "
-                "(full_shard=%d block_index=%d, 1 batch, untimed)",
+                "(full_shard=%d block_index=%d, 1 batch, untimed%s)",
                 capable,
                 probe_out.full_shard_groups,
                 probe_out.block_index_groups,
+                "; SCX_SCATTER_BLOCK_INDEX kill-switch is ENGAGED, which alone "
+                "explains an unreachable route" if killed else "",
             )
 
 

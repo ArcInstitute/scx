@@ -2666,7 +2666,12 @@ absolute_floors:
 #          2. Confirm the route is actually reachable on the new fixtures by
 #             reading `metadata.scatter_block_index_route.block_index_reachable`
 #             from a capture — the benchmark writes it from a 1-batch untimed
-#             probe. `false` there means step 1 did not take.
+#             probe. A `false` there is NOT by itself proof the reframe failed:
+#             `block_index_eligible` also ANDs the process-global
+#             `SCX_SCATTER_BLOCK_INDEX` switch and a row-range cost window.
+#             Check `env_kill_switch_engaged` in the same metadata block first;
+#             only once that is false does `block_index_reachable: false` point
+#             back at step 1.
 #          3. THEN add, under `absolute_floors` above, for each of the three
 #             datasets at `format: scx_auto`:
 #                 metric: full_shard_groups__gather_random   ->  min: 1.0
