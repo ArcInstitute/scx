@@ -31,9 +31,9 @@ use scx_format_io::ScxReader;
 use scx_sparse::{Container, MaterializePlan};
 
 use crate::convert::{
-    build_plan, csr_max_value, csr_to_scipy, guard_decode_loss_dtype, obsm_batch_to_numpy,
-    pandas_to_record_batch, parse_uns_format, pyarrow_table_to_pandas, record_batch_to_pyarrow,
-    typed_csr_to_scipy, typed_read_to_pyerr, uns_py_to_json, UnsFormat,
+    build_plan, csr_to_scipy, guard_decode_loss_dtype, obsm_batch_to_numpy, pandas_to_record_batch,
+    parse_uns_format, pyarrow_table_to_pandas, record_batch_to_pyarrow, typed_csr_to_scipy,
+    typed_read_to_pyerr, uns_py_to_json, UnsFormat,
 };
 use crate::to_pyerr;
 
@@ -297,7 +297,7 @@ pub fn to_mudata<'py>(
         // X — fail loud on the decode loss for this modality's shards before
         // decoding, keyed on the target dtype (f32 for a default plan).
         guard_decode_loss_dtype(
-            csr_max_value(reader, Some(modality_id)),
+            reader.catalog().csr_max_value(Some(modality_id)),
             plan.data_dtype,
             plan.allow_lossy,
         )?;

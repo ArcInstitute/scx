@@ -71,58 +71,11 @@ pub(crate) fn estimate_eager_assembly_bytes(reader: &ScxReader) -> u64 {
         .saturating_add(meta_bytes)
 }
 
-// The decode-loss guard folds `ShardStats::value_max` over the shards in scope.
-// Integer encodings record the true max; float encodings record 0. An entry
-// missing `ShardStats` contributes 0 (it is skipped), so a > 2²⁴ shard written
-// without stats would slip the guard — acceptable pre-1.0 (every current writer
-// path emits stats), but the guard is only as strong as the catalog it reads.
-
-/// Maximum `ShardStats::value_max` over the CSR X shards in scope — all
-/// modalities when `modality_id` is `None`, else just that modality. Used to
-/// fail loud on the silent `u32 → f32` decode loss (see
-/// [`super::guard_decode_loss`]) before returning a corrupted matrix. Walks the
-/// catalog only — no payload reads, so it is O(shards).
-pub(crate) fn csr_max_value(reader: &ScxReader, modality_id: Option<u8>) -> u32 {
-    let cat = reader.catalog();
-    let shards = match modality_id {
-        Some(m) => cat.csr_shards_for_modality(m),
-        None => cat.csr_shards_sorted(),
-    };
-    shards
-        .iter()
-        .filter_map(|e| e.stats.as_ref())
-        .map(|s| s.value_max)
-        .max()
-        .unwrap_or(0)
-}
-
-/// Maximum `value_max` over the `adata.raw` CSR shards — where pre-normalization
-/// counts (the most likely `> 2²⁴` holder) live.
-pub(crate) fn raw_csr_max_value(reader: &ScxReader) -> u32 {
-    reader
-        .catalog()
-        .raw_csr_shards_sorted()
-        .iter()
-        .filter_map(|e| e.stats.as_ref())
-        .map(|s| s.value_max)
-        .max()
-        .unwrap_or(0)
-}
-
-/// Maximum `value_max` over the layer CSR shards for `modality_id` (across all
-/// layers). Walks the catalog entries directly since the per-layer helper
-/// requires a layer name.
-pub(crate) fn layer_csr_max_value(reader: &ScxReader, modality_id: u8) -> u32 {
-    reader
-        .catalog()
-        .entries
-        .iter()
-        .filter(|e| e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id)
-        .filter_map(|e| e.stats.as_ref())
-        .map(|s| s.value_max)
-        .max()
-        .unwrap_or(0)
-}
+// The decode-loss guard folds `ShardStats::value_max` over the shards in scope
+// via `FullCatalog::{csr_max_value, raw_csr_max_value, layer_csr_max_value}`
+// (scx-format), the shared implementation consumed by both bindings; the fold
+// semantics (float shards record 0, a stats-less entry contributes 0) are
+// documented there.
 
 /// Build an AnnData object from an ScxReader with optional layer filtering.
 ///
@@ -182,7 +135,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // even when `skip_x` defers the host X decode to `to_gpu_anndata`'s
     // f32-native device path.
     guard_decode_loss_dtype(
-        csr_max_value(reader, None),
+        reader.catalog().csr_max_value(None),
         plan.data_dtype,
         plan.allow_lossy,
     )?;
@@ -360,7 +313,10 @@ pub(crate) fn to_anndata_with_layers<'py>(
             // non-eager narrow path is guarded symmetrically in `experiment.rs`
             // before the retype loop; X/raw, by contrast, narrow in-decode and are
             // exact for `>2²⁴` integer targets.
-            guard_decode_loss(layer_csr_max_value(reader, 0), plan.allow_lossy)?;
+            guard_decode_loss(
+                reader.catalog().layer_csr_max_value(0, None),
+                plan.allow_lossy,
+            )?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
         }
     }
@@ -382,7 +338,11 @@ pub(crate) fn to_anndata_with_layers<'py>(
         } else {
             // adata.raw holds pre-normalization counts — the most likely place
             // a > 2²⁴ integer lives. Guard before decode (dtype-aware).
-            guard_decode_loss_dtype(raw_csr_max_value(reader), plan.data_dtype, plan.allow_lossy)?;
+            guard_decode_loss_dtype(
+                reader.catalog().raw_csr_max_value(),
+                plan.data_dtype,
+                plan.allow_lossy,
+            )?;
             // Non-default plans narrow raw in-decode too (raw stays CSR even for
             // `container="dense"` — the conventional raw representation). This
             // also fixes the pre-existing gap where raw stayed f32 under a

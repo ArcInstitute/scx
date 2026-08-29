@@ -2096,7 +2096,12 @@ the large-count shard:
 - **Backed reads** (`backed=True`, including `to_mudata(backed=True)`).
 - **Lazy `layers`** on the default (`eager=False`) `to_anndata()` — the layer
   is decoded only on later `adata.layers[...]` access.
-- The R bindings (`rscx`) do not yet wire the guard.
+
+The R bindings (`rscx`) wire the same guard on their eager reads — `x_matrix()`,
+`layer()`, `scx_to_seurat()` / `scx_to_mae()` (per modality), and the query
+path — behind the same `allow_lossy` opt-out. Both bindings share one
+implementation: the catalog `value_max` folds on `FullCatalog`
+(`csr_max_value` / `raw_csr_max_value` / `layer_csr_max_value`).
 
 For those, a `> 2²⁴` count still rounds silently on access; pass `allow_lossy`
 where available, or read eagerly to get the guard.
@@ -2116,9 +2121,11 @@ Backed reads (`backed=True`) are lazy and f32-native, so a non-default plan with
   upcast back to `int32` and delivers no reliable memory saving for CSR output.
   The `int64` widen sticks. For a guaranteed narrow-index layout, use
   `container="dense"` (no index array) instead.
-- **`adata.raw` is not retyped.** When the file carries a raw count matrix, the
-  reconstructed `adata.raw.X` stays `float32` CSR regardless of `data_dtype` —
-  only `X` and `layers` are materialized in the requested dtype.
+- **`adata.raw` is retyped in-decode.** When the file carries a raw count
+  matrix, the reconstructed `adata.raw.X` is assembled directly at the
+  requested `data_dtype` (same typed reader as `X`) and gated by the same
+  decode-loss check; it stays CSR even under `container="dense"` (the
+  conventional raw representation).
 - **Scope.** The kwargs are surfaced on the three read entry points above. Other
   read surfaces (the grouped-shard read helpers, the flat `pyscx.read_cloud(...)`
   cloud helper) are f32-native for now; the cloud *query* path
