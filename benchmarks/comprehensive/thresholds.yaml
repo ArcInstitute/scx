@@ -2645,6 +2645,24 @@ absolute_floors:
 #        exceeds the SLURM wall limit on the pre-optimization raw-local path
 #        (that slowness is the Phase-1 target). Re-enable a floor once the
 #        in-Rust gather assembly lands and the epoch fits the budget.
+#      * cellset_gather scattered-READ-ROUTE floors
+#        (`full_shard_groups__gather_random >= 1`, and the same on
+#        `gather_grouped`): the route the cell-set gather takes is now emitted
+#        into runs[].extra per scenario (9b) precisely so it can be floored —
+#        the shape `accel_de`'s `de_route_csc_direct` uses above, which turns a
+#        silent dispatch flip into a hard failure. Deferred because it cannot
+#        discriminate anything yet: all three floored fixtures
+#        (tabula_sapiens_100k / census_500k / census_1m `_auto.scx`) are
+#        `format_version = 3`, i.e. UNFRAMED, and `block_index_eligible`
+#        requires `shard_is_framed` — so the full-shard route is forced by the
+#        fixture, not chosen by the code, and the floor would read as coverage
+#        while providing none. That is exactly the failure this block exists to
+#        prevent. Activate by moving these two rows up once
+#        `benchmarks/scripts/reconvert_fixtures.py` has regenerated the
+#        fixtures at v4 (verify with `scx info <f> --json`); no benchmark change
+#        is needed, the metrics already ship. Until then the discriminating
+#        evidence is the `scatter_block_index_ab` arm's metadata, which reports
+#        `applicable: false` on an unframed file rather than a degenerate 1.00x.
 #      * obs_open / h5ad_none / {census_1m,census_5m}: the eager-obs baseline
 #        wasn't run at census_1m/5m (Wave B was SCX-only to avoid the 60–80s
 #        per-file anndata cost dominating the job). Add the h5ad_none obs floor
