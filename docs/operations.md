@@ -44,7 +44,7 @@ first if you want a way back.
 | **sort** | New file (`<OUTPUT>` required) | Rewrites all shards with cells reordered by obs key(s) | Rewritten in sorted order | Unchanged | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deletions are materialized away by the reorder |
 | **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
 | **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), and the per-shard catalog column stats are **carried from the input**, so **Level-1** shard pruning survives. See the note below | **Carried** verbatim (a 1:1 re-emit; the CSC sidecar is built over the physical rows, which the vector still indexes correctly) |
-| **obs-import** / **doublet-import** | In place (`<FILE> <SOURCE>`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below | **Preserved** (X untouched) |
+| **obs-import** / **doublet-import** / **attach_obs_columns** | In place (`<FILE> <SOURCE>` / `pyscx.attach_obs_columns(path, df)`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below | **Preserved** (X untouched) |
 | **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | Same as **obs-import**: preserved on a pure column *add*, dropped when `overwrite` rewrites an indexed obs column, and the column stats cleared per rewritten column | **Preserved** (X untouched) |
 | **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored | Restored (as of the previous catalog) |
 
@@ -338,7 +338,7 @@ The three in-place ops therefore clear what they invalidate:
 | op | scope of the clear |
 |---|---|
 | `modify_metadata` with `obs=` | **all** columns — obs is replaced wholesale and the op cannot tell an added column from a rewritten one. Re-derived instead of cleared whenever an index is built — which now includes the carry-forward, so an indexed file keeps its pruning — **and** that build can be mapped onto the CSR shards (see below). |
-| `obs-import` / `doublet-import` | only the columns the import writes. It joins by key and never reorders rows, so an untouched column's stats stay true. |
+| `obs-import` / `doublet-import` / `attach_obs_columns` | only the columns the import writes. It joins by key (or lands rows positionally) and never reorders rows, so an untouched column's stats stay true. |
 | `cellbender-import` | the same, over `status_column` / row annotations / `row_sum_column`. |
 
 The scoped clears are **not** conditional on whether an `ObsPredicateIndex` is
@@ -380,13 +380,17 @@ which is reported as a warning naming each one.
 > stats with any of the rebuild paths above — `scx info` will not flag it, because
 > a stale bound is indistinguishable from a live one.
 
-**Adding an obs column: `obs_import` is still the cheaper route.** Both keep an
+**Adding an obs column: the attach seam is the cheaper route.** Both keep an
 unrelated `cell_type` index pruning, but they get there differently.
-`obs_import` joins by key, knows exactly which columns it writes, and clears
-nothing else — O(new columns). `modify_metadata(obs=…)` replaces the whole frame
-and cannot tell an add from a rewrite, so it re-earns the index by rebuilding it,
-which is O(n_obs) over the indexed columns on top of the obs write it was already
-doing. Prefer `obs_import` when the shape of the edit allows it.
+`obs_import` (a table on disk) and `pyscx.attach_obs_columns` (an in-memory
+DataFrame) join by key — or, for a frame computed from this file's own
+`read_obs()`, land rows positionally — know exactly which columns they write,
+and clear nothing else — O(new columns). `modify_metadata(obs=…)` replaces the
+whole frame and cannot tell an add from a rewrite, so it re-earns the index by
+rebuilding it, which is O(n_obs) over the indexed columns on top of the obs
+write it was already doing. Prefer the attach seam when the shape of the edit
+allows it; `modify_metadata(obs=…)` is for edits that change existing values,
+drop or retype columns, or respec the predicate index.
 
 ## Append Complexity
 
@@ -441,7 +445,11 @@ sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place. It appends only the
 replaced section bytes at EOF and repoints the catalog — **the matrix is never
 read or rewritten**, so the cost is O(size of the replaced sections), not
 O(matrix). This is the key difference from `from_anndata` / `from_h5ad`, which
-re-encode all of `X`.
+re-encode all of `X`. For a **pure obs column add**, prefer the attach seam
+(`pyscx.attach_obs_columns` / `obs_import`) — it knows which columns it writes,
+so the predicate index and every untouched column's stats survive instead of
+being re-earned by a rebuild; `modify_metadata(obs=…)` is for edits that change
+existing values, drop or retype columns, or respec the index.
 
 | Component | Complexity | Notes |
 |-----------|-----------|-------|
@@ -580,8 +588,10 @@ full all-droplet output on a very wide feature axis still costs several GB.
 annotations computed outside SCX — doublet scores, cell-type calls, anything with
 one value per cell — onto an existing file as `obs` columns. `scx doublet-import`
 / `pyscx.doublet_import` are the doublet-caller wrapper over the same machinery,
-and `rscx::scx_attach_obs` takes an R `data.frame` directly. The delimited-table
-reader is **ungated** (no libhdf5); an `.h5ad` source needs `--features hdf5`.
+`pyscx.attach_obs_columns` takes an in-memory pandas `DataFrame` (or pyarrow
+`Table`) directly, and `rscx::scx_attach_obs` an R `data.frame`. The
+delimited-table reader is **ungated** (no libhdf5); an `.h5ad` source needs
+`--features hdf5`.
 
 For the analyst-facing walkthrough — which caller writes which column, how to
 export per-batch h5ads, how to combine several tools — see
@@ -679,6 +689,17 @@ producing a perfectly well-shaped column. So:
   one column that is may be one no fallback list would guess.
 
 `--dry-run` runs the join and the diagnosis and writes nothing.
+
+The one qualified exception is `pyscx.attach_obs_columns(path, df,
+positional=True)`: no join at all — row `i` of `df` annotates **physical** obs
+row `i` (deleted rows keep their place), and `df` must have exactly
+`n_obs_physical` rows. That mode exists for frames computed **in-process from
+this file's own `read_obs()` output**, which is already in physical row order —
+the shape a key join structurally cannot serve when the obs index is duplicated
+with no unique column (`doublet_consensus`'s default write path). External tool
+output must never use it, for exactly the row-order reason above. A
+`status_column` is rejected under positional (every row matches by
+construction), and the row-order rationale for keyed joins is unchanged.
 
 ### Uncovered rows get `null`, never `0.0`
 

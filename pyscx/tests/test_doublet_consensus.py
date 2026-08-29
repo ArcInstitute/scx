@@ -675,3 +675,37 @@ def test_consensus_on_a_file_keeps_the_obs_predicate_index(tmp_path):
     q = pyscx.open(path).query()
     q.filter_obs("grp == 'A'")
     assert q.collect().n_obs == 2
+
+
+# ---------------------------------------------------------------------------
+# Which seam the file write goes through
+# ---------------------------------------------------------------------------
+
+
+def test_consensus_default_path_writes_via_attach_not_modify_metadata(tmp_path):
+    """A consensus is a pure column add computed from the file's own obs, so
+    the default path takes the attach seam (positional, one-key uns merge) —
+    not the whole-frame `modify_metadata` replace."""
+    a = _adata({"one": [T, F, T, F]})
+    path = _scx(tmp_path, a)
+
+    pyscx.doublet_consensus(path, keys=["one"], method="any")
+
+    entry = pyscx.open(path).provenance()[-1]
+    assert entry["action"] == "attach_obs_columns", entry["action"]
+
+
+def test_consensus_with_index_obs_still_routes_through_modify_metadata(tmp_path):
+    """`index_obs` / `index_preset` request an index (re)build, which only
+    `modify_metadata` can do in the same commit — the documented respec route."""
+    a = _adata({"one": [T, F, T, F]},
+               extra={"grp": pd.Categorical(["A", "B", "A", "B"])})
+    path = _scx(tmp_path, a)
+
+    pyscx.doublet_consensus(path, keys=["one"], method="any", index_obs=["grp"])
+
+    entry = pyscx.open(path).provenance()[-1]
+    assert entry["action"] == "modify_metadata", entry["action"]
+    q = pyscx.open(path).query()
+    q.filter_obs("grp == 'A'")
+    assert q.collect().n_obs == 2, "the requested index must actually be built"

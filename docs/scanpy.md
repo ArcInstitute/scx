@@ -447,10 +447,14 @@ is a thin wrapper that normalises each tool's spellings.
 
 More generally: whenever the thing you computed is **per-cell columns on a
 file that already exists** — a batch key for a downstream tool, a QC flag, a
-cluster label — reach for `obs_import`, not a `from_anndata` rewrite. It
-patches obs in place with no re-encode of `X` (seconds, not minutes, at atlas
-scale), preserves the CSC sidecar / `.raw` / deletion vectors / bitmaps, and
-is `scx rollback`-able. Pipeline runners can call it from restricted
+cluster label — reach for the attach seam, not a `from_anndata` rewrite:
+`obs_import` for a table on disk, `pyscx.attach_obs_columns(path, df)` for a
+DataFrame already in memory (key-joined by default; `positional=True` for
+columns you computed row-for-row from this file's own `read_obs()`, where the
+obs index may not be unique). Either patches obs in place with no re-encode of
+`X` (seconds, not minutes, at atlas scale), preserves the CSC sidecar /
+`.raw` / deletion vectors / bitmaps / predicate indexes, and is
+`scx rollback`-able. Pipeline runners can call both from restricted
 (`no __import__`) `python` steps — see
 [docs/api.md § Restricted-exec (sandbox) safety](api.md#restricted-exec-sandbox-safety).
 
@@ -683,7 +687,11 @@ decision the helper does not own.
 
 Every one of these ops is in place and undoable — `pyscx.rollback("atlas.scx")`
 reverts the last one. `X`, layers, `var`, the CSC sidecar, `.raw` and deletion
-vectors are never touched. Full behaviour and the predicate-index interaction:
+vectors are never touched. On a file target the consensus writes through
+`pyscx.attach_obs_columns(positional=True)` — a pure column add plus a one-key
+uns merge in one commit — so the file's predicate index and the rest of its
+obs and `uns` survive byte-identical. Full behaviour and the predicate-index
+interaction:
 [docs/operations.md § External obs import](operations.md#external-obs-import).
 
 ## Validating files after write or transfer

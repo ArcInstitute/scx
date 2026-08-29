@@ -1377,6 +1377,7 @@ pub fn merge(
 fn obs_var_to_record_batch(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
+    func: &str,
     param: &str,
 ) -> PyResult<RecordBatch> {
     let pa = crate::pyimport::import_module(py, "pyarrow")?;
@@ -1388,7 +1389,7 @@ fn obs_var_to_record_batch(
     // Require a pandas DataFrame. Without this guard a dict (a natural thing to
     // try) falls through to `pyarrow.Table.from_pandas` and surfaces an opaque
     // `AttributeError: 'dict' object has no attribute 'columns'` deep inside
-    // pyarrow, with no mention of `modify_metadata`, the parameter, or the
+    // pyarrow, with no mention of the calling function, the parameter, or the
     // expected type (report E2).
     let pd = crate::pyimport::import_module(py, "pandas")?;
     let df_cls = pd.getattr("DataFrame")?;
@@ -1399,7 +1400,7 @@ fn obs_var_to_record_batch(
             .map(|n| n.to_string())
             .unwrap_or_else(|_| "object".to_string());
         return Err(PyTypeError::new_err(format!(
-            "modify_metadata({param}=...) expects a pandas DataFrame (got {got}); \
+            "{func}({param}=...) expects a pandas DataFrame (got {got}); \
              wrap your columns with pd.DataFrame({{...}})."
         )));
     }
@@ -1590,11 +1591,11 @@ pub fn modify_metadata(
         None => None,
     };
     let obs_batch = match obs {
-        Some(o) => Some(obs_var_to_record_batch(py, o, "obs")?),
+        Some(o) => Some(obs_var_to_record_batch(py, o, "modify_metadata", "obs")?),
         None => None,
     };
     let var_batch = match var {
-        Some(v) => Some(obs_var_to_record_batch(py, v, "var")?),
+        Some(v) => Some(obs_var_to_record_batch(py, v, "modify_metadata", "var")?),
         None => None,
     };
     let obsm_batches = match obsm {
@@ -2071,6 +2072,166 @@ pub fn obs_import(
     // Whether the obs rewrite streamed shard-by-shard or had to assemble the
     // whole table (which a legacy single-section obs forces). Not inferable
     // from the output file: both paths write a sharded obs.
+    d.set_item("obs_streamed", summary.obs_streamed)?;
+    if let Some(diag) = diagnosis {
+        d.set_item("key_diagnosis", key_diagnosis_dict(py, &diag)?)?;
+    }
+    Ok(d.into())
+}
+
+// ---------------------------------------------------------------------------
+// Generic in-memory obs-column attach (DataFrame)
+// ---------------------------------------------------------------------------
+
+/// Land an in-memory pandas `DataFrame` (or pyarrow `Table`) as `obs` columns
+/// on an existing file, **in place** — the DataFrame twin of [`obs_import`],
+/// driving the same `scx_ops::attach_external_obs` seam rscx's
+/// `scx_attach_obs` uses. Ungated, like `obs_import`: no libhdf5 involved.
+///
+/// Full user-facing documentation lives on the `pyscx.attach_obs_columns`
+/// Python wrapper, which is what `help()` shows.
+#[pyfunction]
+#[pyo3(signature = (
+    path, df, *, key=None, positional=false, status_column=None, uns=None,
+    uns_key=None, overwrite=false, on_missing_rows="null", on_extra_rows="warn",
+    dry_run=false
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn attach_obs_columns(
+    py: Python<'_>,
+    path: &str,
+    df: &Bound<'_, PyAny>,
+    key: Option<Vec<String>>,
+    positional: bool,
+    status_column: Option<&str>,
+    uns: Option<&Bound<'_, PyAny>>,
+    uns_key: Option<&str>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> PyResult<Py<PyDict>> {
+    if positional && key.is_some() {
+        return Err(PyValueError::new_err(
+            "key= and positional=True are mutually exclusive: positional means \
+             row i of df annotates physical obs row i, so there is no key to \
+             join on",
+        ));
+    }
+    if uns.is_some() != uns_key.is_some() {
+        return Err(PyValueError::new_err(
+            "uns= and uns_key= go together: uns is the payload, uns_key names \
+             the single uns key it is merged under",
+        ));
+    }
+
+    let batch = obs_var_to_record_batch(py, df, "attach_obs_columns", "df")?;
+    if batch.num_rows() == 0 {
+        return Err(PyValueError::new_err(
+            "df has no rows; there is nothing to attach",
+        ));
+    }
+
+    // Both sides of a key join are built by the same ops-crate helpers the CSV
+    // reader and rscx use, so a DataFrame attach and an imported table cannot
+    // disagree about what a key is. `drop` names the columns of `df` the key
+    // consumed — they are already on the target's obs axis, so re-importing
+    // them would only duplicate them.
+    let key = key.unwrap_or_default();
+    let (row_keys, join_key, mut drop): (Vec<String>, scx_ops::ObsJoinKey, Vec<String>) =
+        if positional {
+            (Vec::new(), scx_ops::ObsJoinKey::Positional, Vec::new())
+        } else {
+            match key.len() {
+                0 => {
+                    let col =
+                        scx_ops::resolve_obs_key_column(&batch, None).map_err(ops_to_pyerr)?;
+                    let values = scx_ops::obs_key_values(&batch, &col).map_err(ops_to_pyerr)?;
+                    (values, scx_ops::ObsJoinKey::Column(col.clone()), vec![col])
+                }
+                1 => {
+                    // Alias-resolved (`obs_names` names the df index), same as
+                    // the delimited reader's source side.
+                    let col = scx_ops::resolve_obs_key_column(&batch, Some(&key[0]))
+                        .map_err(ops_to_pyerr)?;
+                    let values = scx_ops::obs_key_values(&batch, &col).map_err(ops_to_pyerr)?;
+                    (
+                        values,
+                        scx_ops::ObsJoinKey::Column(key[0].clone()),
+                        vec![col],
+                    )
+                }
+                _ => {
+                    let fused = scx_ops::build_composite_key(&batch, &key).map_err(ops_to_pyerr)?;
+                    (
+                        fused,
+                        scx_ops::ObsJoinKey::Composite {
+                            columns: key.clone(),
+                        },
+                        key.clone(),
+                    )
+                }
+            }
+        };
+    // `dataframe → RecordBatch` synthesises `__index_level_0__` from the pandas
+    // index; under a key join it is either the key itself or a RangeIndex that
+    // is not data, and under positional the row order already carries the
+    // identity. Keeping it would collide with the target's own index column.
+    drop.push("__index_level_0__".to_string());
+    let annotations = scx_ops::drop_batch_columns(&batch, &drop).map_err(ops_to_pyerr)?;
+
+    let uns_json = match uns {
+        Some(u) => Some(convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)?),
+        None => None,
+    };
+
+    let data = scx_ops::ExternalObsData {
+        row_keys,
+        row_annotations: annotations,
+        row_embeddings: Vec::new(),
+        uns: uns_json,
+        source_checksum: None,
+        source_name: Some("<DataFrame>".to_string()),
+    };
+    let attach_opts = scx_ops::AttachObsOptions {
+        join_key,
+        missing_row_policy: parse_obs_missing_rows(on_missing_rows)?,
+        extra_row_policy: parse_obs_extra_rows(on_extra_rows)?,
+        status_column: status_column.map(str::to_string),
+        uns_key: uns_key.map(str::to_string),
+        overwrite,
+        provenance_action: "attach_obs_columns".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let scx_path = PathBuf::from(path);
+    let (summary, diagnosis) = py.detach(|| -> PyResult<_> {
+        let summary =
+            scx_ops::attach_external_obs(&scx_path, &data, &attach_opts).map_err(ops_to_pyerr)?;
+        // Only on a key-mode dry run: the diagnosis costs a pass per obs
+        // column, and under positional there is no key to diagnose.
+        let diagnosis = if dry_run && !positional {
+            scx_ops::diagnose_obs_key(&scx_path, Some(&attach_opts.join_key)).ok()
+        } else {
+            None
+        };
+        Ok((summary, diagnosis))
+    })?;
+
+    let d = PyDict::new(py);
+    d.set_item("dry_run", dry_run)?;
+    d.set_item("n_obs", summary.n_obs)?;
+    d.set_item("n_matched", summary.n_matched)?;
+    d.set_item("n_target_rows_absent", summary.n_target_rows_absent)?;
+    d.set_item("n_source_rows_absent", summary.n_source_rows_absent)?;
+    d.set_item(
+        "obs_key_column",
+        scx_ops::display_key_name("obs", &summary.obs_key_column),
+    )?;
+    d.set_item("obs_columns_added", summary.obs_columns_added)?;
+    d.set_item("obsm_keys_added", summary.obsm_keys_added)?;
+    d.set_item("obs_index_dropped", summary.obs_index_dropped)?;
     d.set_item("obs_streamed", summary.obs_streamed)?;
     if let Some(diag) = diagnosis {
         d.set_item("key_diagnosis", key_diagnosis_dict(py, &diag)?)?;

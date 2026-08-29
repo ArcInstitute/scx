@@ -103,6 +103,7 @@ from .pyscx import open as _open_native            # noqa: E402
 from .pyscx import validate as _validate_native    # noqa: E402
 from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
 from .pyscx import obs_import as _obs_import_native  # noqa: E402
+from .pyscx import attach_obs_columns as _attach_obs_columns_native  # noqa: E402
 from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
 from .pyscx import doublet_import as _doublet_import_native  # noqa: E402
 from .pyscx import modify_metadata as _modify_metadata_native  # noqa: E402
@@ -903,6 +904,73 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
     return result
 
 
+def attach_obs_columns(path, df, *, key=None, **kwargs):
+    """Land an in-memory DataFrame as `obs` columns on an existing file, in place.
+
+    The DataFrame twin of `obs_import`, on the same seam: when the per-cell
+    annotation you computed is already a pandas DataFrame (or pyarrow Table),
+    attach it directly instead of writing a temp CSV or replacing the whole obs
+    frame with `modify_metadata`. `X`, layers, `var`, the CSC sidecar, `.raw`,
+    deletion vectors and predicate indexes are preserved (a pure column add
+    keeps the index); `pyscx.rollback(path)` undoes the whole attach.
+
+    Joins **by key** by default, exactly as `obs_import` does: target rows the
+    frame does not cover get `null`, never a fabricated `0`.
+
+    `positional=True` skips the join: row `i` of `df` annotates physical obs
+    row `i`. That is for frames computed in-process from THIS file's own
+    `read_obs()` output, which is already in physical row order (deleted rows
+    keep their place) — the shape a key join structurally cannot serve when
+    the obs index is duplicated with no unique column. External tool output
+    must never use it: a tool returns rows in its own order, and a positional
+    attach would put every value on the wrong cell while still producing a
+    correctly-shaped column. `df` must then have exactly `n_obs_physical`
+    rows, and its pandas index is ignored.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        df: pandas DataFrame or pyarrow Table holding the columns to attach.
+        key: Join key, resolved against `df`'s columns and matched to the same
+            names on the target. None (default) uses `df`'s index (then the
+            usual `barcode`/`cell_id`/… fallbacks); a str names one column
+            (`"obs_names"` names the index); a list builds a composite key.
+            Key columns are consumed by the join, not re-imported.
+        positional: Attach by physical row position instead of a key.
+            Mutually exclusive with `key`.
+        status_column: Obs column recording "present"/"absent" per row.
+            Rejected under `positional` (every row matches by construction).
+        uns: JSON-serialisable payload merged into `uns` under `uns_key`, in
+            the same commit as the columns — one `rollback` undoes both. The
+            rest of `uns` is left byte-identical. `uns` and `uns_key` go
+            together.
+        uns_key: The single `uns` key `uns` is merged under.
+        overwrite: **Replaces, never merges** a colliding obs column or uns
+            key, exactly as `obs_import`. Without it, a collision is an error.
+        on_missing_rows: "null" (default) leaves uncovered target rows NULL;
+            "error" refuses. "zero" is an accepted legacy alias for "null".
+            Vacuous under `positional` (every row is covered).
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses. Vacuous under `positional`.
+        dry_run: Run the join and every validation, then return the summary
+            without writing. A key-mode dry run also attaches `key_diagnosis`.
+
+    Returns:
+        dict with `n_obs`, `n_matched`, `n_target_rows_absent`,
+        `n_source_rows_absent`, `obs_key_column` (`"<positional>"` under
+        `positional`), `obs_columns_added`, `obs_index_dropped`,
+        `obs_streamed`, `dry_run`, and (on a key-mode dry run)
+        `key_diagnosis`.
+
+    Example:
+        scores = pd.DataFrame({"my_score": model(exp.read_obs())})
+        pyscx.attach_obs_columns("atlas.scx", scores, positional=True)
+    """
+    result = _attach_obs_columns_native(_coerce_path(path), df,
+                                        key=_coerce_key(key), **kwargs)
+    _reload_if_experiment(path)
+    return result
+
+
 def diagnose_obs_key(path, key=None):
     """Report which obs columns could serve as an `obs_import` join key.
 
@@ -1363,12 +1431,15 @@ def doublet_consensus(target, *, keys=None, method="majority",
             want the tools' own thresholds to decide, use "majority".
         overwrite: Replace existing `<K>_*` columns. Without it a collision is
             an error, so a second run cannot silently rewrite the first.
-        index_obs / index_preset: Index the obs predicate index over these
+        index_obs / index_preset: Rebuild the obs predicate index over these
             columns as part of the same commit, instead of the columns the file
             already indexes. Relevant only for a file target, and rarely
-            needed: writing the consensus replaces obs, and a replaced obs
-            carries its existing index forward, so pushdown survives this call
-            untouched. Naming columns here *narrows* the index to them, and any
+            needed: by default the consensus is a pure column *add* (via
+            `attach_obs_columns`), which leaves the existing index — and the
+            rest of obs — untouched, so pushdown survives this call. Passing
+            either kwarg selects the whole-frame `modify_metadata` route
+            instead, the only seam that can (re)build an index in the same
+            commit. Naming columns here *narrows* the index to them, and any
             column the file indexed that this list omits is reported as a
             `UserWarning`.
 
@@ -1564,15 +1635,35 @@ def doublet_consensus(target, *, keys=None, method="majority",
         target.uns[f"{key_added}_consensus"] = record
         return record
 
-    for name, values in columns.items():
-        obs[name] = values
-    # `uns` was already read (and defaulted to {}) before key resolution, and
-    # nothing has mutated the file since, so reuse it rather than re-reading.
-    uns[f"{key_added}_consensus"] = record
-    # obs and uns in ONE commit, so `pyscx.rollback` undoes the whole thing.
-    # Two calls would leave a file that had been half-rolled-back.
-    modify_metadata(path, obs=obs, uns=uns,
-                    index_obs=index_obs, index_preset=index_preset)
+    if index_obs is not None or index_preset is not None:
+        # Index respec: only `modify_metadata` can (re)build the predicate
+        # index in the same commit, so an explicit `index_obs`/`index_preset`
+        # keeps the whole-frame route. `uns` was already read (and defaulted
+        # to {}) before key resolution, and nothing has mutated the file
+        # since, so reuse it rather than re-reading. obs and uns go in ONE
+        # commit, so `pyscx.rollback` undoes the whole thing.
+        for name, values in columns.items():
+            obs[name] = values
+        uns[f"{key_added}_consensus"] = record
+        modify_metadata(path, obs=obs, uns=uns,
+                        index_obs=index_obs, index_preset=index_preset)
+        return record
+
+    # Default path: a consensus is a pure column add computed from this file's
+    # own physical-row obs, so it takes the attach seam — the predicate index
+    # survives (nothing it covers is touched), the rest of uns stays
+    # byte-identical, and obs is rewritten one shard at a time instead of
+    # round-tripping the whole frame through Python. Positional is safe here
+    # and only here: `columns` was computed row-for-row from `read_obs()`.
+    # `overwrite=True` is not a widening: the frame carries only the 3-4
+    # columns the collision check above already vetted (or the caller passed
+    # overwrite=True), and the only uns key is `<K>_consensus` — exactly what
+    # the whole-frame route replaced unconditionally.
+    import pandas as _pd
+    df = _pd.DataFrame(columns)  # RangeIndex: values are positional already
+    attach_obs_columns(path, df, positional=True,
+                       uns=record, uns_key=f"{key_added}_consensus",
+                       overwrite=True)
     return record
 
 
