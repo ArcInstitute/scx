@@ -2145,43 +2145,41 @@ sidecar was removed. The mechanism carries over exactly — both routes skip the
 warm and key eligibility on `!cache.contains()` — and the block-index gather has
 now been measured directly:
 
-| tabula_sapiens_100k, reframed to v4, S=64 random cell sets, cold | cellsets/s (median of 3) | peak RSS | route |
-|---|---|---|---|
-| `scatter_block_index=false` (the default) | 587.5 | 3333 MB | `full_shard_groups=5339` |
-| `scatter_block_index=true` | 3.19 | 939 MB | `block_index_groups=5339` |
+| tabula_sapiens_100k, reframed to v4, S=64 random cell sets, cold | cellsets/s (median of 3) | peak RSS |
+|---|---|---|
+| `scatter_block_index=false` (the default) | 511.6 | 3261 MB |
+| `scatter_block_index=true` | 2.78 | 912 MB |
 
-Captured 2026-08-29 on Lambda `standard`-partition node `vci-steady-state-node-020`
-(16 CPU, 64 GB), loader commit `ed8aafd1`, via
+**184×** on this fixture, with peak RSS running the other way — 912 MB against
+3.3 GB, 3.6× less. A 1-shard `pbmc10k` reframed the same way gives 905.2 vs 5.60
+cellsets/s (**162×**) at 460 vs 418 MB, i.e. the throughput gap holds while the
+memory gap all but vanishes on a small file: the block-index route's bounded
+peak only buys something once a whole shard is large.
+
+Read the ratio as the *extreme* of the cache-friendly regime, not a typical
+figure. tabula's 7 shards sit inside the 128-shard default cache, so the working
+set is fully resident after the first pass (hit rate 0.9987) — exactly where
+re-decoding row groups per batch costs everything, because eligibility keys on
+`!cache.contains()` and the LRU therefore never populates. Tahoe's 1.6× is the
+same mechanism where the working set does not trivially fit.
+
+Captured 2026-08-29 on Lambda `standard`-partition node `vci-steady-state-node-022`
+(SLURM job 188724), loader and driver at commit `6563575e`, via
 
 ```bash
-python benchmarks/scripts/bench_cellset_scatter_routes.py \
-    --source $SCX_DATA_DIR/tabula_sapiens_100k_auto.scx \
-    --workdir $SCRATCH --out $SCRATCH/tabula.json --n-runs 3
+SOURCE="$SCX_DATA_DIR/tabula_sapiens_100k_auto.scx $SCX_DATA_DIR/pbmc10k_auto.scx" \
+WORKDIR=$SCRATCH OUT_DIR=$SCRATCH N_RUNS=3 \
+    sbatch --job-name=cellset-routes benchmarks/scripts/bench_cellset_scatter_routes.sbatch
 ```
 
-> [!NOTE]
-> **No manifest entry** under `benchmarks/comprehensive/results/`. This is the
-> second tier of
-> [`docs/benchmark_manifest.md` § Scope](benchmark_manifest.md#scope-which-claims-this-covers),
-> for the specific reason that tier exists: the subject is a **reframed copy** of
-> `tabula_sapiens_100k`, not a registered dataset, so a
-> `benchmark`/`format`/`dataset` triple for it would put a row into the baseline
-> that no `gate_candidate.py` run could ever reproduce. The registered
-> `cellset_gather` fixtures are all `format_version = 3`, where both routes
-> collapse to the full-shard path and the comparison cannot be made at all — see
-> [sharding.md § Loader adoption](sharding.md). The command, node, date and
-> commit above stand in for a manifest entry, and the driver re-runs it. Once the
-> fixtures are regenerated at v4 this becomes a normal captured triple.
+Manifest entries (schema v2, **not** promoted into a baseline — a reframed copy
+is not a registered fixture, so no `gate_candidate.py` run reproduces these rows):
+[`results/cellset_scatter_routes/`](../benchmarks/comprehensive/results/cellset_scatter_routes/).
+The driver refuses to report a ratio unless the `on` arm actually reached the
+block-index route, the `off` arm actually took the full-shard route, and the
+default agreed with the explicit `false`; all three held for both captures.
 
-**177×** — but read it as the *extreme* of the cache-friendly regime rather than a
-typical figure: 7 shards against the 128-shard default cache means the working
-set is fully resident after the first pass (hit rate 0.9987), which is exactly
-where re-decoding per batch costs everything. Tahoe's 1.6× is the same effect
-with a working set that does not trivially fit. A 1-shard `pbmc10k`, reframed the
-same way, gives 165.4 vs 5.90 cellsets/s (27×) — the ratio tracks how completely
-the working set fits, exactly as the mechanism predicts. Note the trade runs the
-other way on memory — 939 MB against 3.3 GB, a 3.5× reduction — which is why the
-knob exists rather than the route being hard-coded. Pass `scatter_block_index=true` for a
+Pass `scatter_block_index=true` for a
 genuinely cache-hostile cell-set run (working set ≫ cache), where the
 row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate is
 per-reader: the `IndexPlanDataset` defaults above are unchanged, and
