@@ -29,6 +29,8 @@ SOURCE="${SOURCE:?set SOURCE=<path to .scx>}"
 WORKDIR="${WORKDIR:?set WORKDIR=<scratch dir>}"
 OUT="${OUT:?set OUT=<result .json>}"
 N_RUNS="${N_RUNS:-3}"
+N_BATCHES="${N_BATCHES:-50}"   # the `on` route re-decodes per batch, so this is
+                               # the knob that decides whether the job fits its wall
 
 eval "$(/home/nickyoungblut/miniforge3/bin/conda shell.bash hook)"
 conda activate scx-bench
@@ -52,4 +54,5 @@ print('scatter_block_index kwarg: present')
 "
 
 python benchmarks/scripts/bench_cellset_scatter_routes.py \
-    --source "$SOURCE" --workdir "$WORKDIR" --out "$OUT" --n-runs "$N_RUNS"
+    --source "$SOURCE" --workdir "$WORKDIR" --out "$OUT" \
+    --n-runs "$N_RUNS" --n-batches "$N_BATCHES"
