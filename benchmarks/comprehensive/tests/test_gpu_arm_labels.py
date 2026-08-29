@@ -471,3 +471,46 @@ def test_the_arm_env_is_lazy_and_does_not_swallow_an_import_failure():
     for key, arm in tga.ARMS.items():
         if arm.env:
             assert env[key] == arm.env, key
+
+
+def test_a_second_residency_arm_in_one_process_is_refused_not_mislabelled():
+    """`SCX_GPU_PCA_RESIDENT` is latched by a Rust OnceLock on first use, so the
+    serial `run_all.py` path cannot produce both arms — the second would report
+    the first's numbers under its own name. The opposing floors diagnose that
+    after the fact; refusing the combination stops it being recorded (codex)."""
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as m
+
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(m.run)))
+    # Structural, not a substring: `if False:` leaves every name in place, which
+    # is exactly how a first version of this test let the mutation through.
+    guards = [
+        ast.unparse(n.test)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If) and "pca_residency_arm_latched" in ast.unparse(n)
+    ]
+    assert guards, "a mislabelled second arm must be refused with a typed stub"
+    # At least one enclosing condition must actually consult which arm ran —
+    # `if False:` leaves every name in place and satisfies a substring check.
+    assert any("_RESIDENCY_ARM_RUN" in g for g in guards), (
+        f"the refusal is guarded only by {guards}, none of which depends on "
+        "which arm already ran in this process"
+    )
+
+
+def test_a_non_arm_format_does_not_resolve_the_arm_map():
+    """Resolving it imports the decode benchmark, which probes CUDA; a
+    CPU-only capture must not pay for that (codex)."""
+    from benchmarks.comprehensive.scripts import run_parallel as rp
+
+    rp._format_arm_env.cache_clear()
+    assert rp._arm_env_exports("scx_auto") == []
+    assert rp._format_arm_env.cache_info().misses == 0, (
+        "a non-arm format resolved the arm map anyway"
+    )
+    # …and an arm format still gets its knob.
+    assert rp._arm_env_exports(SHUF_NVCOMP) == ["export SCX_SHUFDELTA_NVCOMP='1'"]

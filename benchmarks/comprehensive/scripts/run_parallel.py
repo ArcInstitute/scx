@@ -770,6 +770,14 @@ def _arm_env_exports(format_key: str | None) -> list[str]:
     """
     if not format_key:
         return []
+    # Cheap gate first: only an arm variant can carry a knob, and resolving the
+    # map imports the decode benchmark, which probes CUDA. Without this, a
+    # `--benchmarks compression` capture on a CPU-only host still paid for it
+    # (codex, round 3).
+    if not (
+        format_key in _PCA_ARM_ENV or format_key.startswith("accel_to_gpu_anndata__")
+    ):
+        return []
     return [
         f"export {var}='{val}'"
         for var, val in sorted(_format_arm_env().get(format_key, {}).items())

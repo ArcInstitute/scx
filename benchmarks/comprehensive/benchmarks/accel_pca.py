@@ -477,6 +477,18 @@ def _subspace_principal_cosines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 # Main entry point — framework contract
 # ---------------------------------------------------------------------------
 
+# Which PCA residency arm has already run in THIS process.
+#
+# `SCX_GPU_PCA_RESIDENT` is latched by a Rust `OnceLock` on the first native GPU
+# PCA call, and no amount of `os.environ` juggling can reset it. So in a serial
+# `run_all.py` pass the second arm silently produces the first arm's numbers
+# under its own name. The opposing floors diagnose that *after* the capture is
+# recorded; refusing the combination is what stops it being recorded at all.
+# Found by **codex** on PR #474 (rounds 2 and 3). `run_parallel` is unaffected:
+# one cohort per format_key, one process each, env exported before exec.
+_RESIDENCY_ARM_RUN: str | None = None
+
+
 def run(
     dataset: DatasetConfig,
     format_variant: FormatVariant,
@@ -497,6 +509,29 @@ def run(
         return None
 
     impl, requires_gpu = _VARIANT_IMPLS[variant_key]
+
+    # Refuse a second residency arm in a process that already latched one.
+    global _RESIDENCY_ARM_RUN
+    if requires_gpu and not is_rapids_variant(variant_key):
+        arm = "streaming" if is_streaming_variant(variant_key) else "resident"
+        if _RESIDENCY_ARM_RUN is not None and _RESIDENCY_ARM_RUN != arm:
+            logger.warning(
+                "%s cannot run after the %s arm in the same process — "
+                "SCX_GPU_PCA_RESIDENT is latched by a OnceLock on first use, so "
+                "this cell would report the %s arm's numbers under the %s name",
+                variant_key, _RESIDENCY_ARM_RUN, _RESIDENCY_ARM_RUN, arm,
+            )
+            write_missing_result(
+                benchmark="accel_pca", format_key=variant_key, dataset=dataset.name,
+                missing_reason="pca_residency_arm_latched",
+                notes=(
+                    f"the {_RESIDENCY_ARM_RUN} arm already ran in this process; "
+                    "SCX_GPU_PCA_RESIDENT is read once per process. Use "
+                    "run_parallel.py (one process per format_key) to measure both."
+                ),
+            )
+            return None
+        _RESIDENCY_ARM_RUN = arm
 
     if variant_key.startswith("accel_pca__pyscx") and not _HAS_PYSCX:
         logger.warning("pyscx not installed — skipping %s", variant_key)
