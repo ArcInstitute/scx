@@ -411,6 +411,10 @@ impl GpuDevice {
     /// allocation caching on every drop; cache the matrices/handles, not the
     /// device, in that case.
     pub fn reclaim_memory_pool(&self) -> Result<(), GpuError> {
+        // Checked even though `Drop` discards the result, and that combination
+        // is the point: a `GpuDevice` dropped inside a capture region used to
+        // reach `self.synchronize()` below and invalidate the capture. It now
+        // declines instead, and the trim happens at the next drop outside one.
         capture_guard::check("GpuDevice::reclaim_memory_pool")?;
         if !self.ctx.has_async_alloc() {
             return Ok(());

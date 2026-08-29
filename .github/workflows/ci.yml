@@ -2353,7 +2353,7 @@ jobs:
           bad=""
           for f in $(git ls-files '*.rs' | grep -vE '_tests\.rs$'); do
             [ "$f" = "$dev" ] && continue
-            recv=$(prod "$f" | tr '\n' ' ' | grep -oE '[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\.[[:space:]]*alloc_zeros' | sed -E 's/[[:space:]]*\.[[:space:]]*alloc_zeros$//' | grep -vE '(^|\.)(dev|device)$' || true)
+            recv=$(prod "$f" | tr '\n' ' ' | grep -oE '[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*\.[[:space:]]*alloc_zeros' | sed -E 's/[[:space:]]*\.[[:space:]]*alloc_zeros$//' | grep -vE '(^|[._])(dev|device)$' || true)
             [ -n "$recv" ] && bad="$bad $f($(echo $recv | tr ' ' ','))"
           done
           if [ -n "$bad" ]; then
