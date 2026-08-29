@@ -105,6 +105,11 @@ def accel_pca_variants() -> list[FormatVariant]:
             key="accel_pca__pyscx_gpu_no_rapids",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="pyscx PCA (GPU randomized, streaming power loop)",
+            key="accel_pca__pyscx_gpu_streaming",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -175,6 +180,45 @@ def _run_pyscx_gpu_rand_chol(adata: Any, n_comps: int, seed: int) -> str:
     return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
 
 
+def _extract_resident_csr(adata: Any, op: str) -> bool | None:
+    """Read ``adata.uns["scx_accel"][op]["resident_csr"]``, or None if absent.
+
+    Absent (or `None`) means the route had no residency decision to make — a
+    CPU or rapids route — and the caller records no arm label rather than
+    guessing one.
+    """
+    try:
+        value = adata.uns["scx_accel"][op]["resident_csr"]
+    except (KeyError, TypeError, AttributeError):
+        return None
+    return None if value is None else bool(value)
+
+
+def _run_pyscx_gpu_streaming(adata: Any, n_comps: int, seed: int) -> str:
+    """The streaming GPU power loop — identical call to `_run_pyscx_gpu_rand_hh`,
+    run under `SCX_GPU_PCA_RESIDENT=0`.
+
+    Residency is decided dynamically against *free* VRAM, and on an 80 GB H100
+    every gate dataset fits, so a default `accel_pca` run measures the resident
+    arm on all three tiers. The streaming operator — the one Phase 8c's
+    `PcaOperator` seam rewrote — has no coverage at all without this variant.
+
+    `SCX_GPU_PCA_RESIDENT` is read **once per process** (`gpu_pca_resident.rs`
+    documents this deliberately, and `pyscx/tests/test_gpu_pca_resident.py`
+    uses subprocesses because of it), so the in-process context manager below is
+    not sufficient on its own — `run_parallel.py` exports it in the worker's
+    shell, and `pca_resident_csr` records which arm actually ran so a latched
+    OnceLock fails the floor instead of silently mislabelling the number.
+    """
+    import pyscx
+
+    pyscx.accel.pca(
+        adata, n_comps=n_comps, device="gpu",
+        method="randomized", qr_method="householder", random_state=seed,
+    )
+    return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
+
+
 def _run_rapids_singlecell(adata: Any, n_comps: int, seed: int) -> str:
     """rapids-singlecell PCA route: drives the pyscx
     in-VRAM `device="gpu"` path, which after Phase 1 hands off to
@@ -240,6 +284,11 @@ def is_no_rapids_variant(variant_key: str) -> bool:
     return variant_key.endswith("__pyscx_gpu_no_rapids")
 
 
+def is_streaming_variant(variant_key: str) -> bool:
+    """True for the `accel_*__pyscx_gpu_streaming` arm (SCX_GPU_PCA_RESIDENT=0)."""
+    return variant_key.endswith("__pyscx_gpu_streaming")
+
+
 @contextlib.contextmanager
 def env_var(name: str, value: str):
     """Set ``os.environ[name]=value`` for the duration, restoring the prior value."""
@@ -266,18 +315,45 @@ def disable_rapids_env():
     return env_var("SCX_DISABLE_RAPIDS", "1")
 
 
+def streaming_pca_env():
+    """Force the streaming GPU PCA power loop instead of the device-resident one.
+
+    Composed with `force_native_gpu_env` rather than replacing it: the streaming
+    arm is still a *native* GPU arm, so it needs the same rapids pin as its
+    resident sibling.
+    """
+    return env_var("SCX_GPU_PCA_RESIDENT", "0")
+
+
+@contextlib.contextmanager
 def dispatch_env(variant_key: str, requires_gpu: bool):
     """The env context a variant's impl must run under:
     - no-rapids variant  → SCX_DISABLE_RAPIDS=1 (exercise the CPU fallback)
     - rapids variant     → no override (default in-VRAM route → rapids)
     - native gpu variant → SCX_FORCE_NATIVE_GPU=1 (pin native kernels)
+    - streaming variant  → the above, plus SCX_GPU_PCA_RESIDENT=0
     - cpu variant        → nothing
+
+    A real generator context manager, not a pre-entered `ExitStack`. The stack
+    form called `enter_context()` during `dispatch_env(...)` evaluation rather
+    than at `with` entry, so a bare call — or an exception raised between the
+    two `enter_context()`s — leaked `SCX_FORCE_NATIVE_GPU` into the rest of the
+    process. Every native GPU accel module (kNN / UMAP / Leiden / HVG /
+    preprocess / pipeline) reaches this, not only PCA. Flagged by **Antigravity**
+    and **Cursor Agent** on PR #474.
     """
     if is_no_rapids_variant(variant_key):
-        return disable_rapids_env()
-    if requires_gpu and not is_rapids_variant(variant_key):
-        return force_native_gpu_env()
-    return contextlib.nullcontext()
+        with disable_rapids_env():
+            yield
+    elif requires_gpu and not is_rapids_variant(variant_key):
+        with force_native_gpu_env():
+            if is_streaming_variant(variant_key):
+                with streaming_pca_env():
+                    yield
+            else:
+                yield
+    else:
+        yield
 
 
 def emit_route_signal(
@@ -313,6 +389,17 @@ def emit_route_signal(
         extras[gpu_metric] = 1.0 if route.startswith("gpu_") else 0.0
 
 
+# The streaming arm forces the slow power loop (SCX_GPU_PCA_RESIDENT=0 —
+# re-decode and re-upload on every multiply, 3.2x the resident arm on tabula)
+# and is floored only on these two tiers. Without a scope the orchestrator
+# schedules it on census_1m as well: a different, ungated, much slower
+# experiment than the one this PR measured (Cursor Agent, #474). Read by
+# `run_parallel._bench_format_dataset_scope`.
+FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
+    "accel_pca__pyscx_gpu_streaming": frozenset({"pbmc3k", "tabula_sapiens_100k"}),
+}
+
+
 _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     # key: (implementation, requires_gpu)
     "accel_pca__scanpy_cpu": (_run_scanpy_cpu, False),
@@ -321,6 +408,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_pca__pyscx_gpu_rand_chol": (_run_pyscx_gpu_rand_chol, True),
     "accel_pca__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
     "accel_pca__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
+    "accel_pca__pyscx_gpu_streaming": (_run_pyscx_gpu_streaming, True),
 }
 
 
@@ -389,6 +477,18 @@ def _subspace_principal_cosines(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 # Main entry point — framework contract
 # ---------------------------------------------------------------------------
 
+# Which PCA residency arm has already run in THIS process.
+#
+# `SCX_GPU_PCA_RESIDENT` is latched by a Rust `OnceLock` on the first native GPU
+# PCA call, and no amount of `os.environ` juggling can reset it. So in a serial
+# `run_all.py` pass the second arm silently produces the first arm's numbers
+# under its own name. The opposing floors diagnose that *after* the capture is
+# recorded; refusing the combination is what stops it being recorded at all.
+# Found by **codex** on PR #474 (rounds 2 and 3). `run_parallel` is unaffected:
+# one cohort per format_key, one process each, env exported before exec.
+_RESIDENCY_ARM_RUN: str | None = None
+
+
 def run(
     dataset: DatasetConfig,
     format_variant: FormatVariant,
@@ -409,6 +509,29 @@ def run(
         return None
 
     impl, requires_gpu = _VARIANT_IMPLS[variant_key]
+
+    # Refuse a second residency arm in a process that already latched one.
+    global _RESIDENCY_ARM_RUN
+    if requires_gpu and not is_rapids_variant(variant_key):
+        arm = "streaming" if is_streaming_variant(variant_key) else "resident"
+        if _RESIDENCY_ARM_RUN is not None and _RESIDENCY_ARM_RUN != arm:
+            logger.warning(
+                "%s cannot run after the %s arm in the same process — "
+                "SCX_GPU_PCA_RESIDENT is latched by a OnceLock on first use, so "
+                "this cell would report the %s arm's numbers under the %s name",
+                variant_key, _RESIDENCY_ARM_RUN, _RESIDENCY_ARM_RUN, arm,
+            )
+            write_missing_result(
+                benchmark="accel_pca", format_key=variant_key, dataset=dataset.name,
+                missing_reason="pca_residency_arm_latched",
+                notes=(
+                    f"the {_RESIDENCY_ARM_RUN} arm already ran in this process; "
+                    "SCX_GPU_PCA_RESIDENT is read once per process. Use "
+                    "run_parallel.py (one process per format_key) to measure both."
+                ),
+            )
+            return None
+        _RESIDENCY_ARM_RUN = arm
 
     if variant_key.startswith("accel_pca__pyscx") and not _HAS_PYSCX:
         logger.warning("pyscx not installed — skipping %s", variant_key)
@@ -532,6 +655,24 @@ def run(
             fallback_reason=_extract_fallback_reason(t_adata, "pca"),
             no_rapids_metric="pca_fallback_no_rapids_correct",
         )
+
+        # Which power loop actually ran, as a number.
+        #
+        # `resident_csr` is True when the whole matrix was held device-resident
+        # and False when the operator streamed (re-decoding and re-uploading on
+        # every multiply). It is `None` where there is no residency decision —
+        # CPU and rapids routes — so those variants record nothing.
+        #
+        # This is the arm label. Residency is decided against *free* VRAM at
+        # call time, so the same input can go either way run to run and the
+        # variant name alone cannot say which arm produced a wall. It is also
+        # the only thing that catches `SCX_GPU_PCA_RESIDENT`'s OnceLock having
+        # latched before the streaming variant's env was applied: the floors
+        # pin `min 1.0` on the resident arm and `max 0.0` on the streaming one,
+        # so a mislabelled run fails rather than reporting the wrong arm's number.
+        resident = _extract_resident_csr(t_adata, "pca")
+        if resident is not None:
+            extras["pca_resident_csr"] = 1.0 if resident else 0.0
 
         result.add_run(
             wall_s=wall,

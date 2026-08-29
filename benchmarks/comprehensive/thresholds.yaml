@@ -837,39 +837,196 @@ absolute_floors:
   #   metric: scx_format_pipeline_devdecode_route
   #   min: 1.0
 
-  # --- GPU ShufDeltaZstd decode route floor ---
-  # Phase 1 added a GPU decode path for framed/unframed ShufDeltaZstd shards
-  # (CPU zstd + GPU undelta/unshuffle/convert). `to_gpu_anndata` now stamps
-  # `uns["scx_accel"]["to_gpu_anndata"]["n_shards_shufdelta_gpu"]` — the count of
-  # shards that took that GPU path (> 0 proves compact-trial/shufdelta shards no
-  # longer host-bounce). The standalone `benchmarks/scripts/bench_gpu_codec.py`
-  # already reports it. This floor is DEFERRED (commented) until both hold:
-  #   1. the comprehensive `accel_to_gpu_anndata` benchmark runs a shufdelta /
-  #      compact-trial format variant and emits `n_shards_shufdelta_gpu` via
-  #      `add_run` (today it runs only the `scx1` variant), and
-  #   2. a clean `scx-bench-gpu` baseline carries the metric (a floor on a
-  #      metric the baseline lacks reads as a violation).
-  # - benchmark: accel_to_gpu_anndata
-  #   format: accel_to_gpu_anndata__shufdelta_gpu
-  #   dataset: census_1m
-  #   metric: shufdelta_n_shards_gpu
-  #   min: 1.0
+  # --- GPU ShufDeltaZstd decode arms: route + arm-engaged floors ---
+  #
+  # ACTIVE as of ORG-8.20-3's owed gate. The precondition both of these blocks
+  # were deferred on — "the comprehensive `accel_to_gpu_anndata` benchmark runs
+  # a shufdelta format variant and emits the metric via `add_run`" — is now met:
+  # `accel_to_gpu_anndata` has three arms (see its module docstring), two of
+  # them ShufDeltaZstd.
+  #
+  # The other stated blocker, "a clean baseline carries the metric", turned out
+  # not to apply. `compare_against_baseline.py` calls
+  # `check_absolute_floors(args.current, floors)` — absolute floors read the
+  # CANDIDATE snapshot only. A floor gates from the first capture that carries
+  # its metric; no promoted baseline is required. (Regression rows do need a
+  # baseline, and these three variants have none, so a gate over them reports
+  # floors only and says nothing about regressions.)
+  #
+  # Scoped to pbmc3k + tabula_sapiens_100k, matching the fixtures the arms run
+  # on and the tiers the existing scx1 route/decode floors already gate.
+  # census_1m — where the ~1.4x nvcomp slowdown was originally measured — is a
+  # 2.7 GB `scx optimize` per arm per run and is added once one has run.
+  #
+  # Three floors, not two, and the third is the point. Phase 1's floor
+  # (`shufdelta_n_shards_gpu >= 1`) proves the shards took a GPU ShufDeltaZstd
+  # path at all rather than host-bouncing. Phase 2's
+  # (`shufdelta_fully_device_decoded`) separates the two arms: `shard_decode.rs`
+  # sets `fully_device_decoded` true ONLY on the nvcomp path, where just the
+  # compressed bytes cross PCIe, and false on the Phase-1.5 pipelined path.
+  # nvcomp is runtime-`dlopen`'d and falls back to the pipeline in SILENCE when
+  # `libnvcomp.so.5` is absent, so without the `max: 0.0` half the two arms
+  # could report identical numbers under different names and both pass.
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: pbmc3k
+    metric: shufdelta_n_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_n_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: pbmc3k
+    metric: shufdelta_n_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_n_shards_gpu
+    min: 1.0
+  # ...and EVERY shard must have taken it. `>= 1` is satisfied by one GPU shard
+  # plus six host bounces on tabula's seven-shard fixture, which would label a
+  # mostly-host-bounce wall as the GPU arm (Cursor Agent, #474).
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: pbmc3k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: pbmc3k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
 
-  # --- Phase 2 (nvcomp) full-device-decode floor  ---
-  # Phase 2 decodes framed ShufDeltaZstd fully in VRAM via nvcomp (upload
-  # compressed, GPU zstd), so `to_gpu_anndata` reports
-  # `transfer_mode == "scx_device_decode_gpu"` (fully_device_decoded) for a
-  # shufdelta/compact-trial file — Scx1 route parity. nvcomp is runtime-dlopen'd
-  # (present in scx-bench-gpu); where it is absent the pipeline path runs and
-  # this route would be false, so the floor must only gate GPU hosts that carry
-  # nvcomp. DEFERRED (commented) until the comprehensive suite runs a shufdelta
-  # variant emitting `shufdelta_fully_device_decoded` AND a clean nvcomp-enabled
-  # baseline carries it (same rationale as the Phase-1 block above).
-  # - benchmark: accel_to_gpu_anndata
-  #   format: accel_to_gpu_anndata__shufdelta_gpu
-  #   dataset: census_1m
-  #   metric: shufdelta_fully_device_decoded
-  #   min: 1.0
+  # The nvcomp arm must actually be the nvcomp arm.
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: pbmc3k
+    metric: shufdelta_fully_device_decoded
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_fully_device_decoded
+    min: 1.0
+  # ...and the pipelined arm must not be. A `max` floor, so an arm that
+  # silently became the other one fails instead of looking like an upgrade.
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: pbmc3k
+    metric: shufdelta_fully_device_decoded
+    max: 0.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_fully_device_decoded
+    max: 0.0
+  # Both ShufDeltaZstd arms decode to the same matrix as the host does.
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: pbmc3k
+    metric: to_gpu_anndata_decode_correct
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: tabula_sapiens_100k
+    metric: to_gpu_anndata_decode_correct
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: pbmc3k
+    metric: to_gpu_anndata_decode_correct
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: tabula_sapiens_100k
+    metric: to_gpu_anndata_decode_correct
+    min: 1.0
+
+  # --- GPU PCA power-loop arms ---
+  #
+  # ORG-8.20-2's owed gate. Residency is decided dynamically against *free*
+  # VRAM, and on an 80 GB H100 every gate dataset fits — so a default
+  # `accel_pca` run measures the RESIDENT arm on all three tiers, and the
+  # streaming power loop that Phase 8c's `PcaOperator` seam rewrote had no
+  # coverage at all. `accel_pca__pyscx_gpu_streaming` runs the same call under
+  # `SCX_GPU_PCA_RESIDENT=0`.
+  #
+  # `pca_resident_csr` is the arm label, and these two floors are what make the
+  # label trustworthy: the knob is read once per process (a deliberate
+  # OnceLock), so a run whose env arrived late would silently produce the
+  # resident number under the streaming name. `max: 0.0` turns that into a
+  # failure.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: pbmc3k
+    metric: pca_resident_csr
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_rand_hh
+    dataset: tabula_sapiens_100k
+    metric: pca_resident_csr
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: pbmc3k
+    metric: pca_resident_csr
+    max: 0.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: tabula_sapiens_100k
+    metric: pca_resident_csr
+    max: 0.0
+  # The streaming arm is still a native GPU arm and still has to be correct.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: pbmc3k
+    metric: pca_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: tabula_sapiens_100k
+    metric: pca_route_gpu_correct
+    min: 1.0
+  # Subspace bars INHERITED verbatim from the resident arm above, not measured
+  # on this one. The two arms run the same randomized PCA and differ only in
+  # where the matrix lives between multiplies, so they should agree; if the
+  # first capture says otherwise that is a finding about the streaming operator,
+  # which is exactly what this arm exists to surface. Adjust from a measurement
+  # if it fires, never from a guess.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: pbmc3k
+    metric: subspace_cos_mean
+    min: 0.7
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: pbmc3k
+    metric: subspace_cos_min
+    min: 0.01
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_mean
+    min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_streaming
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.01
   - benchmark: accel_pca
     format: accel_pca__pyscx_gpu_rand_hh
     dataset: pbmc3k

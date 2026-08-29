@@ -400,7 +400,45 @@ def _triple_compatible(bench_name: str, ds_name: str, format_key: str) -> bool:
         return False
     if bench_is_multimodal != fmt_is_multimodal:
         return False
+
+    # A format that declares a dataset scope only pairs inside it. Filtering
+    # here rather than stubbing inside `run()` is what stops the job being
+    # submitted at all.
+    scope = _bench_format_dataset_scope(bench_name).get(format_key)
+    if scope is not None and ds_name not in scope:
+        return False
     return True
+
+
+@functools.lru_cache(maxsize=None)
+def _bench_format_dataset_scope(bench_name: str) -> dict[str, frozenset[str]]:
+    """Per-format dataset allow-lists a bench module declares, or `{}`.
+
+    Reads the module-level ``FORMAT_DATASET_SCOPE`` mapping, in the same shape
+    as :func:`_bench_supported_formats` — the constraint is owned by the bench,
+    not duplicated in the orchestrator.
+
+    This exists because an **arm** variant is not meaningful on every tier.
+    `accel_pca__pyscx_gpu_streaming` forces the slow power loop
+    (`SCX_GPU_PCA_RESIDENT=0`, 3.2x the resident arm on tabula) and is floored
+    only on pbmc3k + tabula_sapiens_100k; without a scope the orchestrator
+    scheduled it on census_1m too — a different, ungated, much slower
+    experiment. The shufdelta arms had the same gap in the other direction:
+    they stubbed out-of-scope datasets *inside* `run()`, which is a typed
+    result but only after Chimera has started a preemptible GPU task, activated
+    conda and imported pyscx — eight wasted GPU jobs per full accel capture.
+    Both found by **Cursor Agent** on PR #474.
+    """
+    try:
+        mod = importlib.import_module(
+            f"benchmarks.comprehensive.benchmarks.{bench_name}"
+        )
+    except ImportError:
+        return {}
+    val = getattr(mod, "FORMAT_DATASET_SCOPE", None)
+    if not val:
+        return {}
+    return {k: frozenset(v) for k, v in val.items()}
 
 
 @functools.lru_cache(maxsize=None)
@@ -556,7 +594,7 @@ def _determine_cohort_resources(
         # executor.update_parameters() calls (see §5 note on merge semantics).
         "slurm_gres": gres if gres else "",
         # slurm_setup is a pure function of format_key via _env_for_format
-        "slurm_setup": _slurm_setup_cmds(_env_for_format(fmt_key)),
+        "slurm_setup": _slurm_setup_cmds(_env_for_format(fmt_key), fmt_key),
     }
 
 
@@ -678,7 +716,75 @@ def _env_for_format(format_key: str | None) -> str | None:
     return "scx-bench"
 
 
-def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
+# Runtime knobs a *variant* selects, exported into the worker's shell.
+#
+# Two of these arms are chosen by an environment variable, and one of those
+# variables is read **once per process**: `SCX_GPU_PCA_RESIDENT`
+# (`gpu_pca_resident.rs` caches it in a OnceLock on purpose, and
+# `pyscx/tests/test_gpu_pca_resident.py` runs its two arms as subprocesses
+# because of it). An in-process context manager inside the benchmark module is
+# therefore not sufficient on its own — by the time it runs, an earlier GPU PCA
+# call in the same process may already have latched the value. Exporting here
+# sets it before the worker starts, which is the only placement that is right
+# for a cached knob.
+#
+# `SCX_SHUFDELTA_NVCOMP` is read per call and does not need this; it is
+# exported anyway so both arms are selected the same way, and so a run driven
+# through some other entry point still lands on the arm its name claims.
+# The PCA arm's knob is a literal because `accel_pca` selects it through
+# `dispatch_env`, not through a data table the way the decode arms do.
+_PCA_ARM_ENV: dict[str, dict[str, str]] = {
+    "accel_pca__pyscx_gpu_streaming": {"SCX_GPU_PCA_RESIDENT": "0"},
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _format_arm_env() -> dict[str, dict[str, str]]:
+    """Runtime knobs a *variant* selects, exported into the worker's shell.
+
+    The decode arms' half is read from `accel_to_gpu_anndata.ARMS` rather than
+    copied: duplicating it meant a later edit could update one side and silently
+    re-open the nvcomp-fallback hole these arms exist to close.
+
+    **Lazy, and it raises.** An eager module-level version of this — the shape
+    the first fix shipped — imported `accel_to_gpu_anndata` at import of the
+    orchestrator, which evaluates `_HAS_PYSCX` / `_HAS_PYSCX_GPU` and probes
+    CUDA. Every `run_parallel` invocation paid for that, including
+    `--benchmarks compression` on a CPU-only login node. Worse, it swallowed
+    `ImportError` into an empty map, which would drop `SCX_SHUFDELTA_NVCOMP=1`
+    from the nvcomp worker *in silence* — the exact failure the arm exists to
+    make impossible. A hard-coded dict could not do that, so the lazy form must
+    not either: an import failure here is a real error, not a default.
+    Regression found by **Cursor Agent** on PR #474 round 2.
+    """
+    mod = importlib.import_module(
+        "benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata"
+    )
+    return {**_PCA_ARM_ENV, **{k: dict(a.env) for k, a in mod.ARMS.items() if a.env}}
+
+
+def _arm_env_exports(format_key: str | None) -> list[str]:
+    """`export VAR=...` lines selecting the decode/compute arm this format names.
+
+    Empty for every format that is not an arm — which is all but two.
+    """
+    if not format_key:
+        return []
+    # Cheap gate first: only an arm variant can carry a knob, and resolving the
+    # map imports the decode benchmark, which probes CUDA. Without this, a
+    # `--benchmarks compression` capture on a CPU-only host still paid for it
+    # (codex, round 3).
+    if not (
+        format_key in _PCA_ARM_ENV or format_key.startswith("accel_to_gpu_anndata__")
+    ):
+        return []
+    return [
+        f"export {var}='{val}'"
+        for var, val in sorted(_format_arm_env().get(format_key, {}).items())
+    ]
+
+
+def _slurm_setup_cmds(env_name: str | None = None, format_key: str | None = None) -> list[str]:
     """Per-job shell setup: activate the right Python env and clear inherited SLURM vars.
 
     `env_name` overrides the orchestrator's ``CONDA_PREFIX`` so each
@@ -706,6 +812,7 @@ def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
     # but submitit doesn't propagate process-environment vars to
     # SLURM workers, so we inject an explicit export here. Also
     # tilde-expand the path because gcsfs / google-auth don't.
+    arm_setup = _arm_env_exports(format_key)
     cloud_setup: list[str] = []
     gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if gac:
@@ -774,6 +881,7 @@ def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
             env_cleanup,
             mpi_none,
             *cloud_setup,
+            *arm_setup,
             f'eval "$({conda_base}/bin/conda shell.bash hook)"',
             f"conda activate {env_name}",
         ]
@@ -781,6 +889,7 @@ def _slurm_setup_cmds(env_name: str | None = None) -> list[str]:
         env_cleanup,
         mpi_none,
         *cloud_setup,
+        *arm_setup,
         f"export PATH={PROJECT_ROOT}/.venv/bin:$PATH",
     ]
 
@@ -915,7 +1024,7 @@ def _per_job_slurm_params(
         # cuvs), slaf in scx-bench-slaf (slafdb), bpcells in
         # scx-bench-r, everything else in scx-bench. See
         # `_env_for_format` for the mapping rationale.
-        "slurm_setup": _slurm_setup_cmds(_env_for_format(format_key)),
+        "slurm_setup": _slurm_setup_cmds(_env_for_format(format_key), format_key),
         # Submitit's ``executor.update_parameters`` mutates the
         # executor's persistent state; values from a previous submit
         # carry over to the next one unless explicitly cleared. This

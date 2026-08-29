@@ -22,13 +22,45 @@ dense (≥128-nnz) rows too, so a count file decodes entirely on-device.
 | `bytes_uploaded` | real host→device byte count |
 | `to_gpu_anndata_route_device_decode` | 1.0 iff transfer_mode == `scx_device_decode_gpu` |
 | `to_gpu_anndata_decode_correct` | 1.0 iff device CSR == host CSR (indptr/indices/data) |
+| `shufdelta_n_shards_gpu` | shards that took the GPU ShufDeltaZstd path |
+| `shufdelta_fully_device_decoded` | 1.0 iff only compressed bytes crossed PCIe |
+| `decode_arm` | the variant key, so a row carries its arm |
 
-The route floor (`to_gpu_anndata_route_device_decode >= 1.0`) is staged in
-`thresholds.yaml` and activates once a baseline carries the metric.
+## The three arms
+
+`Scx1` and `ShufDeltaZstd` are different decode paths, and ShufDeltaZstd has
+two of them. Which one runs is a property of the **file**, not just the env,
+so each arm pins its own codec via `scx optimize --codec`:
+
+| variant | fixture | codec | env | decode path |
+|---|---|---|---|---|
+| `__scx1_gpu` | `_scx1` | `scx1` | — | framed Scx1, FOR-BP/Rice in VRAM |
+| `__shufdelta_gpu` | `_shufdelta` | `shufdelta` | — | Phase 1.5: CPU zstd pipelined, planes uploaded |
+| `__shufdelta_gpu_nvcomp` | `_shufdelta` | `shufdelta` | `SCX_SHUFDELTA_NVCOMP=1` | Phase 2: nvcomp zstd in VRAM |
+
+`SCX_SHUFDELTA_NVCOMP=1` against the `scx1` fixture is a **no-op** — Scx1
+shards never reach the ShufDeltaZstd paths — which is why the nvcomp arm has
+its own fixture and not merely its own env. Without that, the two "arms" would
+report identical numbers under different names.
+
+`shufdelta_fully_device_decoded` is what separates the two ShufDeltaZstd arms:
+`shard_decode.rs` sets `fully_device_decoded` true only on the nvcomp path
+(only compressed bytes cross PCIe) and false on the pipelined path. nvcomp is
+runtime-`dlopen`'d and falls back to the pipeline *silently* when
+`libnvcomp.so.5` is absent, so the `_nvcomp` arm carries a `min: 1.0` floor on
+that metric and the pipelined arm a `max: 0.0` — between them they assert that
+each run took the arm its name claims.
+
+The route floor (`to_gpu_anndata_route_device_decode >= 1.0`) and the two
+ShufDeltaZstd floors live in `thresholds.yaml`. Absolute floors are evaluated
+against the **candidate** snapshot only (`check_absolute_floors(args.current,
+…)`), so they gate from the first capture that carries the metric — no
+promoted baseline required.
 """
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import logging
 import os
@@ -36,6 +68,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +90,37 @@ _HAS_PYSCX = AcceleratorRunner.instance().has_pyscx()
 _HAS_PYSCX_GPU = AcceleratorRunner.instance().has_gpu()
 
 _VARIANT_KEY = "accel_to_gpu_anndata__scx1_gpu"
+_SHUFDELTA_KEY = "accel_to_gpu_anndata__shufdelta_gpu"
+_SHUFDELTA_NVCOMP_KEY = "accel_to_gpu_anndata__shufdelta_gpu_nvcomp"
+
+
+@dataclass(frozen=True)
+class _Arm:
+    """One decode arm: which fixture it reads, and what env it reads it under.
+
+    The arm is what a number on this benchmark has to be labelled with, because
+    three different decode paths produce three different walls from the same
+    logical matrix, and `transfer_mode` alone does not separate the two
+    ShufDeltaZstd ones — `shufdelta_fully_device_decoded` does (see
+    `_METRIC_NOTES` below).
+    """
+
+    #: `DatasetConfig` attribute holding the pre-built source fixture.
+    fixture_attr: str
+    #: `scx optimize --codec` value. Pins the on-disk codec, which is what
+    #: selects the decode path — `auto` would re-decide per shard and could
+    #: silently move a run onto a different arm than its name claims.
+    codec: str
+    #: Env applied for the whole timed section.
+    env: dict[str, str]
+    #: Datasets this arm runs on.
+    datasets: frozenset[str]
+
+
+# `--row-group-rows` is required for `--codec shufdelta` and produces the v4
+# BlockIndex the GPU framed decode needs; 256 is `scx optimize`'s own default
+# and the value the fixtures were built at.
+_SHUFDELTA_TIERS: frozenset[str] = frozenset({"pbmc3k", "tabula_sapiens_100k"})
 
 # Single-modality full-tier datasets. The sidecar'd fixture is now prepared by
 # `scx optimize` on the pre-built `_scx1` fixture — a streaming CSR decode →
@@ -68,12 +132,9 @@ _VARIANT_KEY = "accel_to_gpu_anndata__scx1_gpu"
 # of `run()` (defense-in-depth for direct invocation; the orchestrator has no
 # per-dataset cohort filter).
 #
-# NOTE: the staged `thresholds.yaml` route/decode floors stay on pbmc3k +
-# tabula_sapiens_100k only — a floor on a metric a baseline does not yet carry
-# reads as a violation, and the promoted baseline captured before this widening
-# carries device-decode metrics only for those two. Census device-decode
-# metrics populate on the next full capture; their floors are added in a
-# follow-up once a baseline carries them.
+# NOTE: the `thresholds.yaml` route/decode floors stay on pbmc3k +
+# tabula_sapiens_100k only. Census device-decode metrics populate on the next
+# full capture; their floors are added in a follow-up once one has run.
 SUPPORTED_DATASETS: frozenset[str] = frozenset(
     {
         "pbmc3k",
@@ -86,6 +147,33 @@ SUPPORTED_DATASETS: frozenset[str] = frozenset(
 )
 
 
+# The three arms, keyed by variant. Scx1 shards never enter the ShufDeltaZstd
+# decode paths at all, so `SCX_SHUFDELTA_NVCOMP=1` on the scx1 variant is a
+# literal no-op — running it as an "nvcomp arm" would report the pipelined
+# numbers under the nvcomp name. That is why the nvcomp arm needs its own
+# fixture rather than just its own env.
+ARMS: dict[str, _Arm] = {
+    _VARIANT_KEY: _Arm(
+        fixture_attr="scx_scx1_path",
+        codec="scx1",
+        env={},
+        datasets=SUPPORTED_DATASETS,
+    ),
+    _SHUFDELTA_KEY: _Arm(
+        fixture_attr="scx_shufdelta_path",
+        codec="shufdelta",
+        env={},
+        datasets=_SHUFDELTA_TIERS,
+    ),
+    _SHUFDELTA_NVCOMP_KEY: _Arm(
+        fixture_attr="scx_shufdelta_path",
+        codec="shufdelta",
+        env={"SCX_SHUFDELTA_NVCOMP": "1"},
+        datasets=_SHUFDELTA_TIERS,
+    ),
+}
+
+
 def accel_to_gpu_anndata_variants() -> list[FormatVariant]:
     return [
         FormatVariant(
@@ -94,7 +182,50 @@ def accel_to_gpu_anndata_variants() -> list[FormatVariant]:
             category="accel",
             runner="accel_runner",
         ),
+        FormatVariant(
+            name="pyscx to_gpu_anndata (ShufDeltaZstd, pipelined CPU zstd)",
+            key=_SHUFDELTA_KEY,
+            category="accel",
+            runner="accel_runner",
+        ),
+        FormatVariant(
+            name="pyscx to_gpu_anndata (ShufDeltaZstd, nvcomp in-VRAM zstd)",
+            key=_SHUFDELTA_NVCOMP_KEY,
+            category="accel",
+            runner="accel_runner",
+        ),
     ]
+
+
+# Read by `run_parallel._bench_format_dataset_scope` so an arm's tiers are
+# honoured at COHORT CONSTRUCTION, not by stubbing inside `run()` after Chimera
+# has already started a preemptible GPU task (Cursor Agent, #474). Derived from
+# `ARMS` so the two cannot drift.
+FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
+    key: arm.datasets for key, arm in ARMS.items()
+}
+
+
+@contextlib.contextmanager
+def _arm_env(env: dict[str, str]):
+    """Apply an arm's env for the duration, restoring the prior values.
+
+    In-process is sound for `SCX_SHUFDELTA_NVCOMP` specifically: `nvcomp.rs`
+    documents it as read **per call**, not cached, "so it can be toggled
+    in-process for A/B benchmarking". `run_parallel.py` also exports it in the
+    worker's shell, which is what makes the arm right even for a knob that
+    caches — and belt-and-braces here.
+    """
+    prev = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _has_cupy() -> bool:
@@ -139,8 +270,10 @@ def _resolve_scx_optimize_bin() -> str | None:
     return None
 
 
-def _prepare_sidecar_scx(dataset: DatasetConfig, tmpdir: str) -> tuple[Path, int, int]:
-    """Produce an Scx1 + decode-sidecar SCX file for the dataset.
+def _prepare_sidecar_scx(
+    dataset: DatasetConfig, tmpdir: str, arm: _Arm
+) -> tuple[Path, int, int]:
+    """Produce a decode-sidecar SCX file for the dataset, in the arm's codec.
 
     Preferred path: `scx optimize` on the pre-built `_scx1` fixture
     (`dataset.scx_scx1_path`) — a streaming CSR decode → re-encode that adds
@@ -162,17 +295,24 @@ def _prepare_sidecar_scx(dataset: DatasetConfig, tmpdir: str) -> tuple[Path, int
 
     scx_path = Path(tmpdir) / f"{dataset.name}.scx"
 
-    fixture = dataset.scx_scx1_path
+    fixture = getattr(dataset, arm.fixture_attr)
     opt_bin = _resolve_scx_optimize_bin()
     if fixture.exists() and opt_bin is not None:
         logger.info(
-            "preparing sidecar fixture via `scx optimize --codec scx1` (%s) from %s",
+            "preparing sidecar fixture via `scx optimize --codec %s` (%s) from %s",
+            arm.codec,
             opt_bin,
             fixture,
         )
-        # `--codec scx1` forces Scx1 on every integer shard so all shards carry
-        # a decode sidecar (high-median shards that auto would route to Zstd
-        # otherwise host-fall-back, defeating the device-decode route).
+        # The codec is pinned, never `auto`. `--codec scx1` forces Scx1 on every
+        # integer shard so all shards carry a decode sidecar (high-median shards
+        # that auto would route to Zstd otherwise host-fall-back, defeating the
+        # device-decode route); `--codec shufdelta` pins the arm whose decode
+        # path this variant exists to measure. `--row-group-rows 256` is
+        # required for shufdelta and produces the v4 BlockIndex the GPU framed
+        # decode reads; it is also `scx optimize`'s own default, so passing it
+        # explicitly changes nothing for the scx1 arm and documents the
+        # requirement for the other two.
         subprocess.run(
             [
                 opt_bin,
@@ -180,7 +320,9 @@ def _prepare_sidecar_scx(dataset: DatasetConfig, tmpdir: str) -> tuple[Path, int
                 str(fixture),
                 str(scx_path),
                 "--codec",
-                "scx1",
+                arm.codec,
+                "--row-group-rows",
+                "256",
             ],
             check=True,
             capture_output=True,
@@ -196,7 +338,7 @@ def _prepare_sidecar_scx(dataset: DatasetConfig, tmpdir: str) -> tuple[Path, int
     import anndata
 
     adata = anndata.read_h5ad(str(dataset.h5ad_path))
-    pyscx.from_anndata(adata, str(scx_path), codec="scx1")
+    pyscx.from_anndata(adata, str(scx_path), codec=arm.codec)
     n_obs = int(adata.n_obs)
     n_shards = int(pyscx.open(str(scx_path)).shard_count)
     return scx_path, n_obs, n_shards
@@ -209,14 +351,27 @@ def run(
     cold_cache: bool = False,
     converted_path: Path | None = None,  # unused — fixture is self-converted
 ) -> BenchmarkResult | None:
-    variant_key = format_variant.key
-    if variant_key != _VARIANT_KEY:
+    """Entry point. Applies the arm's env around everything the arm affects."""
+    arm = ARMS.get(format_variant.key)
+    if arm is None:
         return None
-    if dataset.name not in SUPPORTED_DATASETS:
+    with _arm_env(arm.env):
+        return _run_arm(dataset, format_variant, arm, n_runs, cold_cache)
+
+
+def _run_arm(
+    dataset: DatasetConfig,
+    format_variant: FormatVariant,
+    arm: _Arm,
+    n_runs: int,
+    cold_cache: bool,
+) -> BenchmarkResult | None:
+    variant_key = format_variant.key
+    if dataset.name not in arm.datasets:
         logger.info(
             "%s gate scoped to %s — recording stub for %s",
             variant_key,
-            sorted(SUPPORTED_DATASETS),
+            sorted(arm.datasets),
             dataset.name,
         )
         write_missing_result(
@@ -224,7 +379,7 @@ def run(
             format_key=variant_key,
             dataset=dataset.name,
             missing_reason="dataset_out_of_gate_scope",
-            notes="to_gpu_anndata gate scoped to pbmc3k + tabula_sapiens_100k",
+            notes=f"{variant_key} scoped to {sorted(arm.datasets)}",
         )
         return None
     if not _HAS_PYSCX:
@@ -248,7 +403,7 @@ def run(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            scx_path, n_obs, n_shards = _prepare_sidecar_scx(dataset, tmpdir)
+            scx_path, n_obs, n_shards = _prepare_sidecar_scx(dataset, tmpdir, arm)
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or b"").decode("utf-8", "replace")[-400:]
             logger.warning(
@@ -309,6 +464,7 @@ def run(
                 info = adata_gpu.uns["scx_accel"]["to_gpu_anndata"]
                 transfer_mode = info.get("transfer_mode")
                 bytes_uploaded = int(info.get("bytes_uploaded") or 0)
+                n_shufdelta_gpu = int(info.get("n_shards_shufdelta_gpu") or 0)
 
                 # Byte-exact parity vs the host decode.
                 gpu_x = adata_gpu.X.get()  # cupyx CSR -> scipy CSR
@@ -327,7 +483,48 @@ def run(
                         1.0 if transfer_mode == "scx_device_decode_gpu" else 0.0
                     ),
                     "to_gpu_anndata_decode_correct": 1.0 if correct else 0.0,
+                    # --- arm labels -------------------------------------------
+                    # Which decode path actually ran, recorded rather than
+                    # inferred from the variant name. `n_shards_shufdelta_gpu`
+                    # counts shards that took the GPU ShufDeltaZstd path at all
+                    # (0 on the scx1 arm, and 0 on a shufdelta file whose shards
+                    # host-bounced). `fully_device_decoded` — which
+                    # `transfer_mode == "scx_device_decode_gpu"` reports — is
+                    # what separates the two ShufDeltaZstd arms: `shard_decode.rs`
+                    # sets it true only on the nvcomp path, where just the
+                    # compressed bytes cross PCIe, and false on the Phase-1.5
+                    # pipelined path, which uploads decompressed planes. So a
+                    # `_nvcomp` run that reports 0.0 here did NOT take the arm
+                    # its name claims — nvcomp is runtime-dlopen'd and falls
+                    # back to the pipeline in silence when libnvcomp is absent.
+                    "shufdelta_n_shards_gpu": float(n_shufdelta_gpu),
+                    "decode_arm": variant_key,
                 }
+                # `n_shards_gpu >= 1` is a weak floor: tabula's fixture is seven
+                # shards, and one GPU ShufDeltaZstd shard plus six
+                # `decode_host_bounce` satisfies it while most of the measured
+                # wall was host bounce — labelled as the GPU arm (Cursor Agent).
+                # `n_shards` is the fixture's own shard count, so this needs no
+                # Rust change; `DeviceDecodeStats` tracks `n_shards_host_bounced`
+                # but pyscx does not surface it.
+                if n_shufdelta_gpu > 0:
+                    extras["shufdelta_all_shards_gpu"] = (
+                        1.0 if n_shufdelta_gpu == n_shards else 0.0
+                    )
+                # ...but ONLY on an arm that actually decoded ShufDeltaZstd
+                # shards. Scx1 also stamps `scx_device_decode_gpu`, so emitting
+                # this unconditionally recorded
+                # `shufdelta_fully_device_decoded = 1.0` alongside
+                # `shufdelta_n_shards_gpu = 0` on the `__scx1_gpu` arm — the
+                # name was a lie on the variant this benchmark already shipped
+                # (Cursor Agent, #474; confirmed in the job-2858457 snapshot).
+                # Absent is the honest answer for an arm the metric is not about,
+                # and `check_absolute_floors` only reads it where a floor names
+                # it, which is the two ShufDeltaZstd arms.
+                if n_shufdelta_gpu > 0:
+                    extras["shufdelta_fully_device_decoded"] = (
+                        1.0 if transfer_mode == "scx_device_decode_gpu" else 0.0
+                    )
                 logger.info(
                     "%s run %d/%d: transfer_mode=%s bytes_uploaded=%d correct=%s",
                     variant_key,
