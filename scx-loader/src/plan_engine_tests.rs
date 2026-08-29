@@ -648,11 +648,14 @@ fn engine_calls_process_for_every_plan_including_empty() {
 /// mid-stream releases the plan-pull worker promptly.
 ///
 /// `IndexPlanIter::drop` drains `plan_rx` first so a worker parked in `send`
-/// fails fast; this arm does not, and reaches the same outcome only because
-/// dropping the struct's `plan_rx` field wakes the sender anyway. Pinning the
-/// *contract* on both arms means the fold has to keep it deliberately rather
-/// than inherit it — see
-/// `index_plan_tests::pull_worker_exits_promptly_after_iter_drop`.
+/// fails fast; this arm does not, and reaches the same outcome because dropping
+/// the struct's `plan_rx` field wakes the sender anyway. Both arms therefore
+/// satisfy this test, which is exactly what it is here to record: the two
+/// implementations of drift (c) are **observably identical** from outside, so
+/// the fold's question is whether the drain earns its place, not how to port
+/// it. See `index_plan_tests::pull_worker_exits_promptly_after_iter_drop` for
+/// the same statement on the other arm and what would be needed to tell them
+/// apart.
 #[test]
 fn engine_pull_worker_exits_promptly_after_drop() {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};

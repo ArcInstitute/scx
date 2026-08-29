@@ -1111,12 +1111,23 @@ class TestGilDuringTeardown:
        teardown itself, the midpoint moves past the return and post-teardown
        ticks re-enter the leading half.
 
-    (3) is what this test asserts, and the residual in (3) is why it also runs a
+    (3) is what this test asserts. Its residual is why the test also runs a
     **negative control**: the same measurement around a `ctypes.PyDLL(None).usleep`
-    of the *same duration*, which holds the GIL by construction. If the control
-    scores any leading tick, the rule is not trustworthy on this host at this
-    duration and the test skips rather than trusting it. That turns the residual
-    from a silent false-pass into a visible skip.
+    of the *same duration as the teardown it just measured* — a call that holds
+    the GIL by construction. A control that scores any leading tick means the
+    rule is not discriminating on this host at this duration, and the test skips
+    rather than trusting it.
+
+    **The control narrows the residual; it does not eliminate it.** The two
+    observations are separate scheduling trials, so a teardown trial that leaks
+    and a control trial that does not would still pass. Measured on this host the
+    leak is 1/200 at 200 us and 0/200 from 250 us up, and `MIN_MEASURABLE_S`
+    keeps the test out of that regime — but that is a probability, not a proof.
+    The sound close is to record start/end markers *inside* the native teardown
+    and count only between them; that needs a test hook in the binding, so it is
+    deferred rather than done here. Do not read a green here as a guarantee the
+    GIL was released — read it as: it was released, or a 1-in-many scheduling
+    coincidence occurred that the control did not catch.
     """
 
     N_OBS = 30000
@@ -1128,28 +1139,6 @@ class TestGilDuringTeardown:
     # control scored a leading tick in 1/200 runs at 200 us on this host, and
     # 0/200 at every duration from 250 us up.
     MIN_MEASURABLE_S = 3e-4
-
-    @staticmethod
-    def _write_prefetch_fixture(path):
-        import anndata as ad
-        import scipy.sparse as sp
-
-        n_obs = TestGilDuringTeardown.N_OBS
-        X = sp.random(
-            n_obs, TestGilDuringTeardown.N_VARS, density=0.05,
-            format="csr", random_state=0,
-        )
-        X.data = np.round(X.data * 10 + 1).astype(np.float32)
-        adata = ad.AnnData(X=X)
-        adata.obs["cell_id"] = [f"c{i}" for i in range(n_obs)]
-        # Unframed: a framed shard is block-index eligible, and the prefetch
-        # deliberately skips warming those — so there would be no in-flight
-        # decode to tear down and nothing to observe.
-        pyscx.from_anndata(
-            adata, path,
-            shard_size=n_obs // TestGilDuringTeardown.N_SHARDS,
-            row_group_rows=0,
-        )
 
     @staticmethod
     def _leading_ticks(action, setup=None):
@@ -1217,8 +1206,22 @@ class TestGilDuringTeardown:
     def test_teardown_with_prefetches_in_flight_releases_the_gil(self, tmp_path):
         import ctypes
 
+        import anndata as ad
+        import scipy.sparse as sp
+
         path = str(tmp_path / "gil_teardown.scx")
-        self._write_prefetch_fixture(path)
+        X = sp.random(
+            self.N_OBS, self.N_VARS, density=0.05, format="csr", random_state=0
+        )
+        X.data = np.round(X.data * 10 + 1).astype(np.float32)
+        adata = ad.AnnData(X=X)
+        adata.obs["cell_id"] = [f"c{i}" for i in range(self.N_OBS)]
+        # Unframed: a framed shard is block-index eligible, and the prefetch
+        # deliberately skips warming those — so there would be no in-flight
+        # decode to tear down and nothing to observe.
+        pyscx.from_anndata(
+            adata, path, shard_size=self.N_OBS // self.N_SHARDS, row_group_rows=0
+        )
 
         ds = pyscx.IndexPlanDataset(
             path,

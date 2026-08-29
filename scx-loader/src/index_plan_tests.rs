@@ -543,17 +543,26 @@ fn iter_skips_empty_plans_mid_stream() {
 /// **Pre-refactor pin (ORG-9.10-1, drift (c)).** Dropping the iterator
 /// mid-stream must release the plan-pull worker *promptly*, not eventually.
 ///
-/// This is the observable contract behind `IndexPlanIter::drop`'s
-/// `while self.plan_rx.try_recv().is_ok() {}` drain, which nothing asserted:
-/// both existing drop tests only require "does not hang", which passes with or
-/// without the drain. The generator here blocks forever once it has produced
-/// `PRODUCED_BEFORE_DROP + lookahead + 1` plans unless someone releases it, so a
-/// worker that stays parked in `send` keeps `EXITED` false and the test fails on
-/// the deadline instead of hanging CI.
+/// **Be precise about which contract this pins**, because the obvious reading is
+/// wrong: it is *not* a pin on `IndexPlanIter::drop`'s
+/// `while self.plan_rx.try_recv().is_ok() {}` drain. The observation starts only
+/// after `drop(it)` has returned, and by then field destruction has closed
+/// `plan_rx` regardless — so deleting the drain leaves this green. What it does
+/// pin is that the receiver is *released at all*: it fails if something retains
+/// it past the iterator's lifetime, which is how it was watched red (a leaked
+/// `plan_rx` clone in `Drop`).
 ///
-/// `plan_engine_tests::engine_pull_worker_exits_promptly_after_drop` pins the
-/// same contract on the other arm, which reaches it *without* the drain — so the
-/// fold has to make that a deliberate choice rather than an omission.
+/// That distinction is the point rather than a caveat. Drift (c) is that this
+/// arm drains and `PlanPrefetchIter` does not, and both reach the same
+/// observable outcome — so the fold's real question is whether the drain buys
+/// anything at all, not whether to port it. Answering that needs a rendezvous
+/// observable from *inside* `Drop::drop`, before field destruction; until then
+/// the honest statement is that no test distinguishes the two.
+///
+/// The generator blocks in `send` once the bounded channel fills, so a worker
+/// that stays parked keeps `exited` false and the test fails on its deadline
+/// rather than hanging CI. `plan_engine_tests::engine_pull_worker_exits_promptly_after_drop`
+/// pins the same receiver-release contract on the other arm.
 #[test]
 fn pull_worker_exits_promptly_after_iter_drop() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};

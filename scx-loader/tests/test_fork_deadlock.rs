@@ -155,6 +155,13 @@ fn fork_construct_and_iterate_one_epoch() {
             // the thread that would release it, so an `eprintln!` here can park
             // until CHILD_TIMEOUT — a deadlock in the shape this file exists to
             // detect. The exit code carries everything the parent needs.
+            // Silence the panic hook first: `catch_unwind` runs it *before*
+            // returning `Err`, and the default hook prints to stderr — so a
+            // child that panics would still reach for the inherited stderr
+            // lock and could park until CHILD_TIMEOUT, turning a clean
+            // `exit(1)` into a spurious hang. Safe here: this runs after
+            // `fork()`, in a single-threaded child.
+            std::panic::set_hook(Box::new(|_| {}));
             let result = std::panic::catch_unwind(|| run_one_epoch(&path));
             let exit_code = match result {
                 Ok(0) => 2,

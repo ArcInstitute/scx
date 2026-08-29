@@ -108,7 +108,8 @@ fn drive_spanning_plan(path: &std::path::Path) -> (u64, u64) {
 /// already initialised rayon's *global* registry.
 ///
 /// This is §9.1's hang, and until now nothing could observe it from Rust.
-/// `fork_construct_and_iterate_one_epoch` above drives `TrainingPipeline`,
+/// `fork_construct_and_iterate_one_epoch`, in the sibling binary
+/// `test_fork_deadlock.rs`, drives `TrainingPipeline`,
 /// which never calls `warm_shards` at all; the Python fork fixture that does
 /// was, at the time of the review, a 16-cell single-shard file, so
 /// `warm_shards` short-circuited on `misses.len() == 1` and the assertion was
@@ -151,14 +152,22 @@ fn fork_index_plan_child_survives_a_plan_spanning_cold_shards() {
          to dispatch in parallel, got {full_shard_groups}"
     );
 
-    // SAFETY: as in `fork_construct_and_iterate_one_epoch` above — the parent
-    // only polls `waitpid`, and the child branch runs one closure and `_exit`s.
+    // SAFETY: as in `fork_construct_and_iterate_one_epoch` (sibling binary
+    // `test_fork_deadlock.rs`) — the parent only polls `waitpid`, and the child
+    // branch runs one closure and `_exit`s.
     match unsafe { fork() }.expect("fork") {
         ForkResult::Child => {
             // No printing from the child — see the sibling binary
             // `test_fork_deadlock.rs` for why an `eprintln!` after `fork()` from
             // a multithreaded parent can park until CHILD_TIMEOUT. The exit code
             // distinguishes all three outcomes the parent cares about.
+            // Silence the panic hook first: `catch_unwind` runs it *before*
+            // returning `Err`, and the default hook prints to stderr — so a
+            // child that panics would still reach for the inherited stderr
+            // lock and could park until CHILD_TIMEOUT, turning a clean
+            // `exit(1)` into a spurious hang. Safe here: this runs after
+            // `fork()`, in a single-threaded child.
+            std::panic::set_hook(Box::new(|_| {}));
             let result = std::panic::catch_unwind(|| drive_spanning_plan(&path));
             let exit_code = match result {
                 Ok((groups, prefetched)) if groups >= 2 && prefetched == 0 => 0,
