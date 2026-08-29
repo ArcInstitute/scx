@@ -112,8 +112,9 @@ pub use eval_metrics::{
 pub use gene_score::{score_genes, ScoreMethod};
 pub use harmony::{harmony_integrate, BatchCovariate, HarmonyConfig, HarmonyResult};
 pub use hvg::{
-    streaming_clip_square_sum, streaming_clip_square_sum_batched, streaming_mean_var,
-    streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats, HvgStats,
+    binned_dispersion_norm, streaming_clip_square_sum, streaming_clip_square_sum_batched,
+    streaming_mean_var, streaming_mean_var_batched, streaming_mean_var_expm1, BatchedHvgStats,
+    HvgStats,
 };
 pub use leiden::{leiden, LeidenConfig, LeidenResult};
 pub use lisi::{compute_lisi, LisiConfig, LisiResult};

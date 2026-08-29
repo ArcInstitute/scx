@@ -1372,6 +1372,15 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
     subset: bool,
     n_bins: usize,
 ) -> PyResult<()> {
+    // The Python-callback era surfaced n_bins == 0 as pandas' opaque
+    // "Cannot cut empty array"-adjacent ValueError; say it plainly instead
+    // (the Rust kernel would silently answer all-NaN → zero genes selected).
+    if n_bins == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "n_bins must be at least 1 (scanpy's default is 20)",
+        ));
+    }
+
     // For batched seurat, fall back to scanpy (complex aggregation logic)
     if batch_key.is_some() {
         let sc = import_optional_with_hint(
@@ -1434,18 +1443,16 @@ fn hvg_seurat<'py, S: scx_format_io::ShardSource + Sync>(
         log_means[j] = means_for_disp[j].ln_1p();
     }
 
-    // ── 3. Bin by mean, z-score dispersion within bins (via Python) ────
-    // Clone: `log_means` / `log_dispersions` are also published to `var` below.
-    let log_means_np = numpy::PyArray::from_vec(py, log_means.clone());
-    let log_disp_np = numpy::PyArray::from_vec(py, log_dispersions.clone());
-
-    let helpers = crate::pyimport::import_module(py, "pyscx._hvg_helpers")?;
-    let dispersions_norm: Vec<f64> = helpers
-        .call_method1(
-            "binned_dispersion_norm",
-            (log_means_np, log_disp_np, n_bins),
-        )?
-        .extract()?;
+    // ── 3. Bin by mean, z-score dispersion within bins ──────────────────
+    // Rust-native since ORG-10.16-5 (previously a Python callback into the
+    // shipped `pyscx._hvg_helpers`, the one file a Rust accelerator's
+    // correctness depended on): the scanpy `pd.cut` + groupby semantics —
+    // right-closed equal-width bins, NaN-skipping ddof-1 stats, the
+    // singleton-bin `exactly 1.0` rule, NaN preserved — live in
+    // `scx_accel::binned_dispersion_norm`, golden-pinned against the pandas
+    // reference and held to scanpy by `test_column_parity_with_scanpy`.
+    let dispersions_norm: Vec<f64> =
+        py.detach(|| scx_accel::binned_dispersion_norm(&log_means, &log_dispersions, n_bins));
 
     // ── 4. Select top genes by normalized dispersion ────────────────────
     // scanpy selects via `nan_to_num(dispersion_norm, nan=-inf) >= cutoff`, so
