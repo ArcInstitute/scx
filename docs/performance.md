@@ -2138,7 +2138,12 @@ on most batches). There the block-index "skip the warm, decode O(rows) each batc
 strategy is a net loss: the hot shard is re-decoded every batch and the LRU never
 populates. So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
 recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, gather
-337 → ~5 ms, cache populated to ~8 GB). Pass `scatter_block_index=true` for a
+337 → ~5 ms, cache populated to ~8 GB). ⚠️ **Provenance**: those Tahoe figures were
+measured on the *scx1 decode-sidecar* gather this knob replaced, not on the
+block-index gather, and were relabelled onto `scatter_block_index` when the
+sidecar was removed. The mechanism carries over exactly — both routes skip the
+warm and key eligibility on `!cache.contains()` — but treat the magnitude as
+indicative until re-measured. Pass `scatter_block_index=true` for a
 genuinely cache-hostile cell-set run (working set ≫ cache), where the
 row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate is
 per-reader: the `IndexPlanDataset` defaults above are unchanged, and
