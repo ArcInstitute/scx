@@ -93,7 +93,7 @@ impl ScxExperiment {
 
     /// Fallible body of `x_matrix` (see B3 / `throw_on_err`).
     fn x_matrix_impl(&self, allow_lossy: bool) -> Result<Robj> {
-        guard::guard_decode_loss(guard::csr_max_value(&self.reader, None), allow_lossy)?;
+        guard::guard_decode_loss(self.reader.catalog().csr_max_value(None), allow_lossy)?;
         // Deletion-aware: `scx_delete()` marks cells logically deleted, and a
         // materialising read must honour that or rscx contradicts its own
         // `scx_query()` on the same file.
@@ -106,7 +106,10 @@ impl ScxExperiment {
 
     /// Fallible body of `layer` (see B3 / `throw_on_err`).
     fn layer_impl(&self, name: &str, allow_lossy: bool) -> Result<Robj> {
-        guard::guard_decode_loss(guard::layer_max_value(&self.reader, name), allow_lossy)?;
+        guard::guard_decode_loss(
+            self.reader.catalog().layer_csr_max_value(0, Some(name)),
+            allow_lossy,
+        )?;
         let csr = self
             .reader
             .read_layer_filtered(name)
@@ -228,7 +231,7 @@ impl ScxExperiment {
             // This path builds the QueryResult manually (it does not go through
             // the engine), so fold the catalog value_max here and fail loud on
             // the silent u32→f32 decode loss before decoding.
-            let max_value = guard::csr_max_value(&self.reader, None);
+            let max_value = self.reader.catalog().csr_max_value(None);
             guard::guard_decode_loss(max_value, allow_lossy)?;
             // X and obs are filtered by the same deletion mask, and must be:
             // an obs frame longer than the matrix is worse than either half

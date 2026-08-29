@@ -1311,7 +1311,7 @@ impl PyExperiment {
                 // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
                 // layer reader.
                 convert::guard_decode_loss(
-                    convert::layer_csr_max_value(self.reader()?, 0),
+                    self.reader()?.catalog().layer_csr_max_value(0, None),
                     plan.allow_lossy,
                 )?;
                 let layers_obj = adata.getattr("layers")?;

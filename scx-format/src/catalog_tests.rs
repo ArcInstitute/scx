@@ -1311,3 +1311,153 @@ fn non_utf8_name_on_a_dropped_entry_is_tolerated() {
     crate::catalog_view::CatalogView::read_from_bytes(&bytes, true)
         .expect("the lightweight parser already tolerates it");
 }
+
+// -----------------------------------------------------------------------
+// value_max folds (csr_max_value / raw_csr_max_value / layer_csr_max_value)
+// -----------------------------------------------------------------------
+
+/// A catalog entry with just the fields the value_max folds look at.
+fn max_value_entry(
+    name: &str,
+    stype: SectionType,
+    modality_id: u8,
+    value_max: Option<u32>,
+) -> FullCatalogEntry {
+    FullCatalogEntry {
+        modality_id,
+        stats: value_max.map(|m| ShardStats {
+            value_max: m,
+            ..sample_stats()
+        }),
+        ..sample_full_entry(name, stype, false)
+    }
+}
+
+fn catalog_with(entries: Vec<FullCatalogEntry>) -> FullCatalog {
+    FullCatalog {
+        entries,
+        ..sample_full_catalog()
+    }
+}
+
+#[test]
+fn csr_max_value_scopes_by_modality() {
+    let cat = catalog_with(vec![
+        max_value_entry("rna/X_shard_0", SectionType::CsrShard, 0, Some(10)),
+        max_value_entry("rna/X_shard_1", SectionType::CsrShard, 0, Some(4)),
+        max_value_entry("atac/X_shard_0", SectionType::CsrShard, 1, Some(99)),
+    ]);
+    assert_eq!(cat.csr_max_value(None), 99);
+    assert_eq!(cat.csr_max_value(Some(0)), 10);
+    assert_eq!(cat.csr_max_value(Some(1)), 99);
+    assert_eq!(cat.csr_max_value(Some(2)), 0);
+}
+
+/// A larger `value_max` on any other section family must not leak into the
+/// X fold, and the raw fold must see only `RawCsrShard`.
+#[test]
+fn value_max_folds_are_section_family_isolated() {
+    let cat = catalog_with(vec![
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(10)),
+        max_value_entry("raw/X_shard_0", SectionType::RawCsrShard, 0, Some(500)),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(700),
+        ),
+        max_value_entry("csc_shard_0", SectionType::CscShard, 0, Some(900)),
+    ]);
+    assert_eq!(cat.csr_max_value(None), 10);
+    assert_eq!(cat.raw_csr_max_value(), 500);
+    // The layer fold must not leak the larger CSC entry (900). Smaller-valued
+    // leaks are pinned elsewhere: an X entry larger than every layer exists in
+    // `layer_csr_max_value_scopes_by_modality_and_name` (999 vs 80).
+    assert_eq!(cat.layer_csr_max_value(0, None), 700);
+}
+
+#[test]
+fn layer_csr_max_value_scopes_by_modality_and_name() {
+    let cat = catalog_with(vec![
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(50),
+        ),
+        // Trap: contains "counts" as a substring but is a different layer.
+        max_value_entry(
+            "layer/rna/counts_sq/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(80),
+        ),
+        max_value_entry(
+            "layer/atac/counts/shard_0",
+            SectionType::LayerCsrShard,
+            1,
+            Some(200),
+        ),
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(999)),
+    ]);
+    // None = every layer of the modality; X shards never contribute.
+    assert_eq!(cat.layer_csr_max_value(0, None), 80);
+    assert_eq!(cat.layer_csr_max_value(1, None), 200);
+    assert_eq!(cat.layer_csr_max_value(2, None), 0);
+    // Some(name) = that layer only, matched as a whole path component.
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 50);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts_sq")), 80);
+    assert_eq!(cat.layer_csr_max_value(0, Some("missing")), 0);
+    assert_eq!(cat.layer_csr_max_value(1, Some("counts")), 200);
+}
+
+/// An entry without `ShardStats` contributes 0 to the fold (it is skipped) —
+/// the guard is only as strong as the catalog it reads. Deliberate pre-1.0
+/// semantics; every current writer path emits stats.
+#[test]
+fn value_max_folds_treat_missing_stats_as_zero() {
+    // A stats-less entry beside a stats-bearing sibling, in EACH family the
+    // folds cover — pinning "skipped", not "no matching section existed".
+    let cat = catalog_with(vec![
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, None),
+        max_value_entry("X_shard_1", SectionType::CsrShard, 0, Some(7)),
+        max_value_entry("raw/X_shard_0", SectionType::RawCsrShard, 0, None),
+        max_value_entry("raw/X_shard_1", SectionType::RawCsrShard, 0, Some(11)),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            None,
+        ),
+        max_value_entry(
+            "layer/rna/counts/shard_1",
+            SectionType::LayerCsrShard,
+            0,
+            Some(13),
+        ),
+    ]);
+    assert_eq!(cat.csr_max_value(None), 7);
+    assert_eq!(cat.raw_csr_max_value(), 11);
+    assert_eq!(cat.layer_csr_max_value(0, None), 13);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 13);
+
+    // All matching entries stats-less (per family) → 0, not an error.
+    let all_statless = catalog_with(vec![
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, None),
+        max_value_entry("raw/X_shard_0", SectionType::RawCsrShard, 0, None),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            None,
+        ),
+    ]);
+    assert_eq!(all_statless.csr_max_value(None), 0);
+    assert_eq!(all_statless.raw_csr_max_value(), 0);
+    assert_eq!(all_statless.layer_csr_max_value(0, None), 0);
+    assert_eq!(all_statless.layer_csr_max_value(0, Some("counts")), 0);
+
+    let empty = catalog_with(vec![]);
+    assert_eq!(empty.csr_max_value(None), 0);
+    assert_eq!(empty.raw_csr_max_value(), 0);
+}

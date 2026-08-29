@@ -1849,10 +1849,7 @@ pub fn to_seurat_multimodal(reader: &ScxReader, allow_lossy: bool) -> Result<Rob
         let mid = reader.modality_id(name).ok_or_else(|| {
             Error::Other(format!("modality '{name}' missing from modality table"))
         })?;
-        crate::guard::guard_decode_loss(
-            crate::guard::csr_max_value(reader, Some(mid)),
-            allow_lossy,
-        )?;
+        crate::guard::guard_decode_loss(reader.catalog().csr_max_value(Some(mid)), allow_lossy)?;
         let csr = reader
             .read_all_csr_shards_for_filtered(mid)
             .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {}", e)))?;
@@ -2261,10 +2258,7 @@ pub fn to_mae(reader: &ScxReader, allow_lossy: bool) -> Result<Robj> {
         let mid = reader.modality_id(name).ok_or_else(|| {
             Error::Other(format!("modality '{name}' missing from modality table"))
         })?;
-        crate::guard::guard_decode_loss(
-            crate::guard::csr_max_value(reader, Some(mid)),
-            allow_lossy,
-        )?;
+        crate::guard::guard_decode_loss(reader.catalog().csr_max_value(Some(mid)), allow_lossy)?;
         let csr = reader
             .read_all_csr_shards_for_filtered(mid)
             .map_err(|e| Error::Other(format!("read_all_csr_shards_for({name}): {e}")))?;

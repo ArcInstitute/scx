@@ -1045,6 +1045,68 @@ impl FullCatalog {
         shards
     }
 
+    /// Maximum [`ShardStats::value_max`] over the CSR X shards in scope — all
+    /// modalities when `modality_id` is `None`, else just that modality.
+    ///
+    /// This fold feeds the >2²⁴ decode-loss guards
+    /// (`scx_codec::guard_f32_decode_loss` / `scx_codec::guard_decode_loss_for`,
+    /// via the bindings): integer
+    /// encodings record the true max, float encodings record `value_max = 0`,
+    /// so continuous data never trips a guard built on this. An entry missing
+    /// `ShardStats` contributes 0 (it is skipped), so a >2²⁴ shard written
+    /// without stats would slip the guard — deliberate pre-1.0 semantics
+    /// (every current writer path emits stats), but the guard is only as
+    /// strong as the catalog it reads. Walks the catalog only — no payload
+    /// reads, O(shards).
+    pub fn csr_max_value(&self, modality_id: Option<u8>) -> u32 {
+        // Fold the listing helpers rather than re-stating their predicates:
+        // if the selection rule ever changes, the guard follows it instead of
+        // silently diverging. Max is order-independent, so their sort is
+        // harmless.
+        let shards = match modality_id {
+            Some(m) => self.csr_shards_for_modality(m),
+            None => self.csr_shards_sorted(),
+        };
+        Self::fold_value_max(shards.into_iter())
+    }
+
+    /// Maximum `value_max` over the `adata.raw` CSR shards
+    /// ([`SectionType::RawCsrShard`]) — where pre-normalization counts (the
+    /// most likely >2²⁴ holder) live. Not modality-scoped; raw is a
+    /// single-modality concept. Same semantics as [`Self::csr_max_value`].
+    pub fn raw_csr_max_value(&self) -> u32 {
+        Self::fold_value_max(self.raw_csr_shards_sorted().into_iter())
+    }
+
+    /// Maximum `value_max` over the Layer-CSR shards of `modality_id` — every
+    /// layer when `layer_name` is `None`, else just the named layer (matched
+    /// as a whole `/{layer_name}/` path component of the
+    /// `layer/{modality}/{layer}/shard_{idx}` section name, mirroring
+    /// [`Self::layer_csr_shards_for_modality`]). Same semantics as
+    /// [`Self::csr_max_value`].
+    pub fn layer_csr_max_value(&self, modality_id: u8, layer_name: Option<&str>) -> u32 {
+        match layer_name {
+            Some(name) => Self::fold_value_max(
+                self.layer_csr_shards_for_modality(modality_id, name)
+                    .into_iter(),
+            ),
+            None => Self::fold_value_max(self.entries.iter().filter(|e| {
+                e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id
+            })),
+        }
+    }
+
+    /// Shared fold behind the `*_max_value` helpers: max `value_max` over the
+    /// given entries, skipping entries without stats; 0 when nothing
+    /// contributes.
+    fn fold_value_max<'a>(entries: impl Iterator<Item = &'a FullCatalogEntry>) -> u32 {
+        entries
+            .filter_map(|e| e.stats.as_ref())
+            .map(|s| s.value_max)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Return CSC shard entries sorted by `stats.col_start`. Entries
     /// without stats go at the end.
     pub fn csc_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
