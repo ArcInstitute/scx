@@ -44,6 +44,18 @@ def floors() -> list[dict]:
     return raw["absolute_floors"]
 
 
+def _scope_for(fmt: str) -> frozenset[str] | None:
+    """The dataset scope the orchestrator actually honours for a format."""
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+    from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as tga
+
+    for mod in (tga, pca):
+        scope = getattr(mod, "FORMAT_DATASET_SCOPE", {}).get(fmt)
+        if scope is not None:
+            return frozenset(scope)
+    return None
+
+
 def _floors_for(floors, fmt, metric):
     return [f for f in floors if f.get("format") == fmt and f.get("metric") == metric]
 
@@ -253,11 +265,16 @@ def test_every_arm_floor_names_a_triple_that_actually_runs(floors):
         for spec in specs:
             ds = spec["dataset"]
             assert "*" not in ds, "these arms use explicit datasets, not globs"
-            if fmt in ARMS:
-                assert ds in ARMS[fmt].datasets, (
-                    f"{fmt} is floored on {ds}, which its arm does not run — "
-                    "the floor would be skipped in silence"
-                )
+            # Consult the SCOPE the orchestrator honours, not just `ARMS` —
+            # `PCA_STREAMING` is not in `ARMS`, so keying on that alone left its
+            # floors unchecked against the scope that decides whether they run
+            # at all (Cursor Agent, #474).
+            scope = _scope_for(fmt)
+            assert scope is not None, f"{fmt} declares no dataset scope"
+            assert ds in scope, (
+                f"{fmt} is floored on {ds}, which its scope does not run — "
+                "the floor would be skipped in silence"
+            )
 
 
 def test_the_two_shufdelta_arms_are_floored_in_opposite_directions(floors):
@@ -304,28 +321,62 @@ def test_both_shufdelta_arms_gate_decode_correctness(floors):
 # ---------------------------------------------------------------------------
 
 
-def test_the_scx1_arm_does_not_claim_a_shufdelta_metric():
-    """`shufdelta_fully_device_decoded` must be ABSENT on an arm that decoded no
-    ShufDeltaZstd shards.
+def _guarded_extras_keys() -> dict[str, str]:
+    """Map each `extras[...] = ...` key in `_run_arm` to the `if` test guarding it.
 
-    Scx1 also stamps `transfer_mode == "scx_device_decode_gpu"`, so emitting the
-    metric unconditionally recorded `1.0` next to `shufdelta_n_shards_gpu = 0`
-    on `__scx1_gpu` — the name was a lie on the variant this benchmark already
-    shipped, visible in the job-2858457 snapshot. Found by Cursor Agent.
+    Structural, via `ast`, because a substring check cannot tell
+    `if n_shufdelta_gpu > 0:` from `if True:` once a second guarded block exists
+    in the same function — a weakness that let a mutation through on first
+    writing.
     """
+    import ast
     import inspect
+    import textwrap
 
     from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as m
 
-    src = inspect.getsource(m._run_arm)
-    assert 'if n_shufdelta_gpu > 0:' in src, (
-        "the metric is emitted unconditionally again; Scx1 rows will claim a "
-        "ShufDeltaZstd device decode they never performed"
-    )
-    # …and it is guarded, not merely present: the assignment must sit inside the
-    # conditional, which a plain `in` check on the key cannot tell.
-    guarded = src.split("if n_shufdelta_gpu > 0:")[1]
-    assert '"shufdelta_fully_device_decoded"' in guarded.split("\n\n")[0]
+    tree = ast.parse(textwrap.dedent(inspect.getsource(m._run_arm)))
+    out: dict[str, str] = {}
+
+    def walk(node, guard):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If):
+                walk(child, ast.unparse(child.test))
+                for h in child.orelse:
+                    walk(h, guard)
+                continue
+            if isinstance(child, ast.Assign):
+                for t in child.targets:
+                    if (
+                        isinstance(t, ast.Subscript)
+                        and isinstance(t.value, ast.Name)
+                        and t.value.id == "extras"
+                        and isinstance(t.slice, ast.Constant)
+                    ):
+                        out[t.slice.value] = guard
+            walk(child, guard)
+
+    walk(tree, "")
+    return out
+
+
+def test_the_shufdelta_metrics_are_guarded_by_an_actual_shufdelta_decode():
+    """Both ShufDeltaZstd metrics must be emitted only when the run decoded
+    ShufDeltaZstd shards.
+
+    Scx1 also stamps `transfer_mode == "scx_device_decode_gpu"`, so an
+    unconditional `shufdelta_fully_device_decoded` recorded `1.0` next to
+    `shufdelta_n_shards_gpu = 0` on `__scx1_gpu` — the name was a lie on the
+    variant this benchmark already shipped (Cursor Agent, confirmed in the
+    job-2858457 snapshot).
+    """
+    guards = _guarded_extras_keys()
+    for key in ("shufdelta_fully_device_decoded", "shufdelta_all_shards_gpu"):
+        assert key in guards, f"{key} is no longer emitted at all"
+        assert "n_shufdelta_gpu" in guards[key], (
+            f"{key} is emitted under `{guards[key] or '<no guard>'}`, which does "
+            "not depend on whether any ShufDeltaZstd shard was decoded"
+        )
 
 
 def test_every_arm_variant_declares_a_dataset_scope_the_orchestrator_reads():
@@ -362,11 +413,11 @@ def test_the_arm_env_has_one_source_of_truth():
     """`run_parallel` derives the decode arms' env from `ARMS` rather than
     keeping a second copy that a later edit could update alone (Cursor Agent)."""
     from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as tga
-    from benchmarks.comprehensive.scripts.run_parallel import _FORMAT_ARM_ENV
+    from benchmarks.comprehensive.scripts.run_parallel import _format_arm_env
 
     for key, arm in tga.ARMS.items():
         if arm.env:
-            assert _FORMAT_ARM_ENV[key] == arm.env, key
+            assert _format_arm_env()[key] == arm.env, key
 
 
 def test_dispatch_env_does_not_mutate_the_environment_before_with_entry():
@@ -385,3 +436,38 @@ def test_dispatch_env_does_not_mutate_the_environment_before_with_entry():
         assert os.environ["SCX_FORCE_NATIVE_GPU"] == "1"
         assert os.environ["SCX_GPU_PCA_RESIDENT"] == "0"
     assert os.environ.get("SCX_FORCE_NATIVE_GPU") == before
+
+
+def test_the_all_shards_floor_is_stronger_than_at_least_one(floors):
+    """`shufdelta_n_shards_gpu >= 1` is satisfied by one GPU shard plus six host
+    bounces on tabula's seven-shard fixture — a mostly-host-bounce wall labelled
+    as the GPU arm. Both ShufDeltaZstd arms carry the stronger floor too."""
+    for fmt in (SHUF, SHUF_NVCOMP):
+        specs = _floors_for(floors, fmt, "shufdelta_all_shards_gpu")
+        assert specs, f"{fmt} does not gate that EVERY shard took the GPU path"
+        assert all(f.get("min") == 1.0 for f in specs)
+        assert {f["dataset"] for f in specs} == _scope_for(fmt)
+
+
+def test_the_arm_env_is_lazy_and_does_not_swallow_an_import_failure():
+    """An eager module-level map imported the decode benchmark at orchestrator
+    import — probing CUDA on every run, including CPU-only ones — and turned an
+    ImportError into an empty map, silently dropping SCX_SHUFDELTA_NVCOMP=1
+    (Cursor Agent). It is `lru_cache`d now, and it raises."""
+    import inspect
+
+    from benchmarks.comprehensive.scripts import run_parallel as rp
+
+    src = inspect.getsource(rp._format_arm_env)
+    assert "except ImportError" not in src, (
+        "an import failure must not become an empty map — that drops the arm "
+        "knob in silence, which a hard-coded dict could never do"
+    )
+    assert hasattr(rp._format_arm_env, "cache_info"), "must be lru_cache'd (lazy)"
+    # And it still resolves to the same thing the eager form did.
+    from benchmarks.comprehensive.benchmarks import accel_to_gpu_anndata as tga
+
+    env = rp._format_arm_env()
+    for key, arm in tga.ARMS.items():
+        if arm.env:
+            assert env[key] == arm.env, key

@@ -887,6 +887,30 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: shufdelta_n_shards_gpu
     min: 1.0
+  # ...and EVERY shard must have taken it. `>= 1` is satisfied by one GPU shard
+  # plus six host bounces on tabula's seven-shard fixture, which would label a
+  # mostly-host-bounce wall as the GPU arm (Cursor Agent, #474).
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: pbmc3k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: pbmc3k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+  - benchmark: accel_to_gpu_anndata
+    format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp
+    dataset: tabula_sapiens_100k
+    metric: shufdelta_all_shards_gpu
+    min: 1.0
+
   # The nvcomp arm must actually be the nvcomp arm.
   - benchmark: accel_to_gpu_anndata
     format: accel_to_gpu_anndata__shufdelta_gpu_nvcomp

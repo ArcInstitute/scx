@@ -731,31 +731,36 @@ def _env_for_format(format_key: str | None) -> str | None:
 # `SCX_SHUFDELTA_NVCOMP` is read per call and does not need this; it is
 # exported anyway so both arms are selected the same way, and so a run driven
 # through some other entry point still lands on the arm its name claims.
-def _decode_arm_env() -> dict[str, dict[str, str]]:
-    """The decode arms' env, read from the benchmark module that defines them.
-
-    Not a second copy. `accel_to_gpu_anndata.ARMS` already carries each arm's
-    env for the in-process path; duplicating it here meant a later edit could
-    update one side and silently re-open the nvcomp-fallback hole these arms
-    exist to close (Cursor Agent, #474). Falls back to an empty map when the
-    module cannot be imported, which is the same posture as
-    `_bench_supported_formats`.
-    """
-    try:
-        mod = importlib.import_module(
-            "benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata"
-        )
-    except ImportError:
-        return {}
-    return {k: dict(a.env) for k, a in mod.ARMS.items() if a.env}
-
-
-_FORMAT_ARM_ENV: dict[str, dict[str, str]] = {
-    # The PCA arm's knob lives here because `accel_pca` selects it through
-    # `dispatch_env`, not through a data table the way the decode arms do.
+# The PCA arm's knob is a literal because `accel_pca` selects it through
+# `dispatch_env`, not through a data table the way the decode arms do.
+_PCA_ARM_ENV: dict[str, dict[str, str]] = {
     "accel_pca__pyscx_gpu_streaming": {"SCX_GPU_PCA_RESIDENT": "0"},
-    **_decode_arm_env(),
 }
+
+
+@functools.lru_cache(maxsize=1)
+def _format_arm_env() -> dict[str, dict[str, str]]:
+    """Runtime knobs a *variant* selects, exported into the worker's shell.
+
+    The decode arms' half is read from `accel_to_gpu_anndata.ARMS` rather than
+    copied: duplicating it meant a later edit could update one side and silently
+    re-open the nvcomp-fallback hole these arms exist to close.
+
+    **Lazy, and it raises.** An eager module-level version of this — the shape
+    the first fix shipped — imported `accel_to_gpu_anndata` at import of the
+    orchestrator, which evaluates `_HAS_PYSCX` / `_HAS_PYSCX_GPU` and probes
+    CUDA. Every `run_parallel` invocation paid for that, including
+    `--benchmarks compression` on a CPU-only login node. Worse, it swallowed
+    `ImportError` into an empty map, which would drop `SCX_SHUFDELTA_NVCOMP=1`
+    from the nvcomp worker *in silence* — the exact failure the arm exists to
+    make impossible. A hard-coded dict could not do that, so the lazy form must
+    not either: an import failure here is a real error, not a default.
+    Regression found by **Cursor Agent** on PR #474 round 2.
+    """
+    mod = importlib.import_module(
+        "benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata"
+    )
+    return {**_PCA_ARM_ENV, **{k: dict(a.env) for k, a in mod.ARMS.items() if a.env}}
 
 
 def _arm_env_exports(format_key: str | None) -> list[str]:
@@ -767,7 +772,7 @@ def _arm_env_exports(format_key: str | None) -> list[str]:
         return []
     return [
         f"export {var}='{val}'"
-        for var, val in sorted(_FORMAT_ARM_ENV.get(format_key, {}).items())
+        for var, val in sorted(_format_arm_env().get(format_key, {}).items())
     ]
 
 

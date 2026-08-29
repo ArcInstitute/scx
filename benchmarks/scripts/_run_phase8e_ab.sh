@@ -59,7 +59,7 @@ unset VIRTUAL_ENV
 unset PYTHONHOME PYTHONPATH
 # shellcheck disable=SC1091
 source "${CONDA}/etc/profile.d/conda.sh"
-conda activate scx-bench-gpu
+conda activate "${BENCH_CONDA_ENV:-scx-bench-gpu}"
 
 # The `main` arm runs from a worktree, which has no `.env` of its own —
 # `bench_env` then raises before a single measurement. Export the paths the
@@ -143,8 +143,23 @@ run_arm() {
     grep -h PROBE_JSON "${WORK}/${name}.log" | sed 's/^PROBE_JSON //' > "${WORK}/${name}.json"
 }
 
-run_arm main   "${WT}"          || echo "main arm failed"
-run_arm branch "${BRANCH_DIR}"  || echo "branch arm failed"
+# An arm that fails must fail the JOB. Without this the batch job ends
+# COMPLETED on a build failure, a missing PROBE_JSON or malformed JSON, and the
+# checked-in reproducer becomes evidence for a measurement that never happened
+# (Cursor Agent, #474).
+arm_failed=0
+run_arm main   "${WT}"          || { echo "FATAL: main arm failed" >&2; arm_failed=1; }
+run_arm branch "${BRANCH_DIR}"  || { echo "FATAL: branch arm failed" >&2; arm_failed=1; }
+for a in main branch; do
+    if [ ! -s "${WORK}/${a}.json" ]; then
+        echo "FATAL: ${a} arm produced no PROBE_JSON" >&2
+        arm_failed=1
+    fi
+done
+if [ "$arm_failed" -ne 0 ]; then
+    echo "=== A/B ABORTED: at least one arm did not produce a measurement" >&2
+    exit 1
+fi
 
 echo ""
 echo "########## A/B ##########"
@@ -169,6 +184,11 @@ for k in keys:
 print(f"\nworst branch-vs-main delta: {worst:+.1f}%")
 PY
 
+ab_rc=$?
 cd "${SCX_DIR}"
 git worktree remove --force "${WT}" 2>/dev/null || true
+if [ "$ab_rc" -ne 0 ]; then
+    echo "=== A/B comparison failed (rc=$ab_rc)" >&2
+    exit "$ab_rc"
+fi
 echo "=== done"

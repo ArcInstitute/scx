@@ -500,6 +500,17 @@ def _run_arm(
                     "shufdelta_n_shards_gpu": float(n_shufdelta_gpu),
                     "decode_arm": variant_key,
                 }
+                # `n_shards_gpu >= 1` is a weak floor: tabula's fixture is seven
+                # shards, and one GPU ShufDeltaZstd shard plus six
+                # `decode_host_bounce` satisfies it while most of the measured
+                # wall was host bounce — labelled as the GPU arm (Cursor Agent).
+                # `n_shards` is the fixture's own shard count, so this needs no
+                # Rust change; `DeviceDecodeStats` tracks `n_shards_host_bounced`
+                # but pyscx does not surface it.
+                if n_shufdelta_gpu > 0:
+                    extras["shufdelta_all_shards_gpu"] = (
+                        1.0 if n_shufdelta_gpu == n_shards else 0.0
+                    )
                 # ...but ONLY on an arm that actually decoded ShufDeltaZstd
                 # shards. Scx1 also stamps `scx_device_decode_gpu`, so emitting
                 # this unconditionally recorded
