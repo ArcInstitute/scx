@@ -154,28 +154,8 @@ pub(crate) fn convert_to_pyerr_with_path(e: scx_convert::ConvertError, path: &st
 
 /// Open an SCX file and return an `Experiment` handle.
 ///
-/// Args:
-///     path: Path to the SCX file.
-///     verify: Verifies the file header and catalog checksum only.
-///         Does NOT re-hash section payload bytes — for full payload
-///         integrity (after write, after cloud pull, after transfer)
-///         call `pyscx.validate(path)` (or `scx validate`). Default: True.
-///
-///         More precisely, with `verify=True` pyscx checks the header
-///         magic/version and the trailing BLAKE3 checksum over the full
-///         catalog. This authenticates the catalog payload (offsets,
-///         lengths, per-section checksums) but does not touch section
-///         bytes. Set to False for performance-sensitive paths where the
-///         file is trusted (e.g., repeated reads of a file that was
-///         already validated).
-///
-/// Example:
-///     exp = pyscx.open("data.scx")
-///     adata = exp.to_anndata()
-///     # Fast open for trusted files:
-///     exp = pyscx.open("data.scx", verify=False)
-///     # Full per-section integrity check:
-///     pyscx.validate("data.scx")
+/// Full user-facing documentation lives on the `pyscx.open` Python wrapper,
+/// which is what `help()` shows.
 #[pyfunction]
 #[pyo3(signature = (path, verify=true))]
 fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
@@ -195,26 +175,8 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
 
 /// Validate section checksums (and, with `deep`, decode-level integrity) in an SCX file.
 ///
-/// Opens the file with full catalog verification, then computes BLAKE3 of
-/// every section's payload bytes and compares against the catalog's stored
-/// checksum. This is the section-level integrity check — `pyscx.open()`
-/// only verifies the catalog itself. Cost is proportional to the file's
-/// total section bytes.
-///
-/// When `deep=True`, additionally decodes every sparse shard to verify the
-/// v3 canonical CSR invariant (sorted column indices, no explicit zeros,
-/// consistent indptr). Mirrors `scx validate --deep`. Canonical-CSR checks run
-/// only on v3+ files (pre-v3 may legitimately carry unsorted shards). Deep
-/// results are appended with `canonical-csr ` prefixed names and report `False`
-/// rather than raising.
-///
-/// Returns a list of (section_name, passed) tuples. Raises RuntimeError if
-/// any essential section (obs, var, CsrShard) checksum fails.
-///
-/// Example:
-///     results = pyscx.validate("data.scx", deep=True)
-///     for name, passed in results:
-///         print(f"{name}: {'OK' if passed else 'FAIL'}")
+/// Full user-facing documentation lives on the `pyscx.validate` Python
+/// wrapper, which is what `help()` shows.
 #[pyfunction]
 #[pyo3(signature = (path, deep=false))]
 fn validate(py: Python<'_>, path: &str, deep: bool) -> PyResult<Vec<(String, bool)>> {
@@ -412,98 +374,13 @@ fn from_anndata(
 /// Stream an h5ad file directly to SCX without materialising the full
 /// X matrix in Python or Rust.
 ///
-/// `pyscx.from_h5ad(path, out)` reads `path` from disk through the
-/// `scx-convert` streaming pipeline and writes `out` shard-by-shard.
-/// Peak memory is bounded by one X shard plus one row-shard per
-/// `obsm` / `varm` / `obsp` / `varp` matrix (plus the always-resident
-/// `indptr`, ~80 MB at 10M cells), so this is the recommended entry
-/// point for h5ad files larger than node RAM. `obsm` / `varm` /
-/// `obsp` / `varp` are read by hyperslab from h5py one row-range at a
-/// time, then emitted as row-sharded sections — `obsm`-heavy inputs
-/// (e.g. embeddings totalling tens of GB) no longer materialise their
-/// matrices in memory. For files that comfortably fit in memory,
-/// `from_anndata` remains a touch faster.
+/// Routes straight to `scx_convert::h5ad_to_scx_streaming` with the on-disk
+/// h5ad path — no `anndata.read_h5ad` call, no backed-AnnData round-trip;
+/// obs / var / uns come through the pure-Rust HDF5 readers
+/// (`scx-convert/src/h5ad/read.rs`) unless an override is supplied.
 ///
-/// `codec`, `shard_size`, `csc`, and `csc_cols_per_shard` mirror
-/// `from_anndata` exactly.
-///
-/// Internally this routes straight to `scx_convert::h5ad_to_scx_streaming`
-/// with the on-disk h5ad path — no `anndata.read_h5ad` call, no
-/// backed-AnnData round-trip. obs / var / uns are read via pure-Rust
-/// HDF5 (`scx-convert/src/h5ad/read.rs`) when no override is supplied,
-/// which dodges anndata's eager `obsm` materialisation on `read_h5ad`
-/// (anndata 0.12 reads `obsm` into Python heap on every call, including
-/// in `backed='r'` mode). The pure-Rust path stamps the same pandas
-/// `index_columns` schema metadata used by the rest of the pipeline so
-/// `obs.index` still round-trips through `to_anndata()`.
-///
-/// Supply `obs_override` / `var_override` / `uns_override` to inject
-/// caller-mutated values (typically from
-/// `pyscx.read_h5ad_metadata(path)`): row counts are validated against
-/// the on-disk X shape; `uns_override` is a full-section replacement.
-/// `obsm` / `varm` / `obsp` / `varp` are deliberately *not* exposed as
-/// overrides — accepting them would re-introduce the eager-materialisation
-/// OOM class this entrypoint exists to avoid.
-///
-/// `csc="always"` (or `csc="auto"` over a dataset above the size
-/// thresholds — `n_obs >= 50000` and `n_vars >= 5000` by default, tunable
-/// via `SCX_CSC_AUTO_OBS_THRESHOLD` / `SCX_CSC_AUTO_VARS_THRESHOLD`)
-/// performs a two-pass write: the streaming converter emits CSR shards,
-/// then `scx_ops::rebuild_csc_inplace` regenerates the CSC sidecar over the
-/// just-written file. Peak disk briefly reaches ~2× the output size during
-/// the rebuild.
-///
-/// Source-layout handling:
-///   * CSR-on-disk h5ad: native streaming path.
-///   * Dense-on-disk h5ad: row-slab streaming with per-shard
-///     sparsification (zero-drop). Use `dense_zero_epsilon` to
-///     threshold near-zero values; default `0.0` matches
-///     scipy's `csr_matrix(dense)` behaviour.
-///   * CSC-on-disk h5ad: in-memory transpose when the file fits the
-///     `memory_budget`; otherwise an external bucketed transpose to
-///     `temp_dir` (`scipy.sum_duplicates` semantics on duplicate
-///     coordinates).
-///   * `varm` is preserved; `obsp` / `varp` come through only when
-///     the on-disk h5ad has them in a form anndata exposes (matches
-///     the non-streaming CLI converter).
-///
-/// Hardening / index kwargs:
-///   * `shard_obs` (`"off"` | `"auto"` | `"always"`, default
-///     `"auto"`): write obs as row-sharded `ObsMetadataShard`
-///     sections. `"auto"` shards when `n_obs > shard_size`, the same
-///     threshold `pyscx.from_anndata` and `pyscx.optimize(shard_obs=)`
-///     use. Obs axis only — var is always a single section on import.
-///     Sharded obs is what the streaming h5ad export path consumes;
-///     it does not lower conversion peak memory.
-///   * `strict_uns`: when `True`, the first unrepresentable `uns`
-///     entry raises; default `False` emits a `UserWarning` per
-///     skipped key (`SkippedUnsKey`).
-///   * `memory_budget`: caps dense slabs and the CSC external-
-///     transpose buffers. Accepts an int byte count or a binary-
-///     prefixed size — `K`/`M`/`G`/`T` or `KiB`/`MiB`/`GiB`/`TiB`
-///     (powers of 1024); decimal `KB`/`MB`/`GB`/`TB` is rejected to
-///     avoid 1000-vs-1024 ambiguity. E.g. `"4G"` / `"512M"` / `"2GiB"`.
-///   * `temp_dir`: directory for CSC external transpose runs.
-///     Cleaned on success and on drop; defaults to the system temp.
-///   * `index_obs` / `index_var` / `index_preset`
-///     (`cellxgene` | `perturbseq` | `training`) /
-///     `index_auto_threshold`: materialise predicate indexes at
-///     conversion time so `pyscx.open(...).query()` and
-///     `scx pull --filter` can pushdown. Forced missing/unsupported
-///     columns hard-error; preset misses emit
-///     `MissingPresetIndexColumn`. Skipped for multimodal inputs.
-///   * `bitmap`: `"off"` | `"auto"` | `"always"`. Writes per-shard
-///     gene→local-row roaring bitmap sidecars (`SCXB`). `auto`
-///     opts in for sparse X with `n_vars <= 1_000_000` and bitmap
-///     size <= 15% of encoded CSR; ATAC modalities are eager under
-///     `auto`.
-///
-/// Example:
-///     pyscx.from_h5ad("big.h5ad", "big.scx")
-///     pyscx.from_h5ad("big.h5ad", "big.scx", csc="always")
-///     pyscx.from_h5ad("big.h5ad", "big.scx",
-///                     memory_budget="4G", temp_dir="/scratch",
-///                     index_preset="cellxgene", bitmap="auto")
+/// Full user-facing documentation lives on the `pyscx.from_h5ad` Python
+/// wrapper, which is what `help()` shows.
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
@@ -786,41 +663,10 @@ fn from_10x(
 }
 
 /// Convert an h5mu file to a multimodal SCX v2 file (path-based,
-/// streaming by default).
+/// streaming by default) via `scx_convert::h5mu_to_scx_streaming`.
 ///
-/// Mirrors `pyscx.from_h5ad` for h5mu inputs. When `stream=True`
-/// (default) this calls `scx_convert::h5mu_to_scx_streaming`, which
-/// processes one shard at a time per modality. Peak memory is
-/// bounded by `shard_target_rows × max_n_vars × density × ~16`
-/// bytes plus the always-resident outer obs.
-///
-/// `shard_obs` (`"off"` | `"auto"` | `"always"`, default `"auto"`):
-/// write the shared outer obs as row-sharded `ObsMetadataShard`
-/// sections; `"auto"` shards when `n_obs > shard_size`. Same knob and
-/// same threshold as `pyscx.from_h5ad`. Per-modality `var` is always a
-/// single section.
-///
-/// `modalities`: optional list of modality names to include
-/// (case-sensitive match against `/mod/{name}`). Unknown names
-/// raise `ValueError` with the available list. `None` (default)
-/// keeps every modality.
-///
-/// `modality_types`: optional dict mapping modality name → type
-/// string (`"rna"`, `"protein"`, `"atac"`, `"spatial"`,
-/// `"methylation"`, `"custom"`). Modalities not listed fall back
-/// to inference and trigger a `UserWarning` per modality.
-///
-/// `csc`: the streaming path (default) cannot build per-modality CSC
-/// sidecars — `csc="always"` raises and `csc="auto"` degrades to no-CSC
-/// with a `UserWarning` when a modality would have qualified. Pass
-/// `stream=False` to build per-modality CSC via the non-streaming path
-/// (it materializes each modality's X). `csc="off"` (default) is unaffected.
-///
-/// Example:
-///     pyscx.from_h5mu("cite_seq.h5mu", "out.scx")
-///     pyscx.from_h5mu("multiome.h5mu", "out.scx",
-///                     modalities=["rna", "atac"],
-///                     modality_types={"adt": "protein"})
+/// Full user-facing documentation lives on the `pyscx.from_h5mu` Python
+/// wrapper, which is what `help()` shows.
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (
@@ -883,40 +729,14 @@ fn from_h5mu(
     )
 }
 
-/// Convert an SCX file to h5ad.
+/// Convert an SCX file to h5ad, streaming by default.
 ///
-/// Mirrors `pyscx.from_h5ad` in the opposite direction. Streams by
-/// default — peak RSS is bounded by one shard's worth of CSR plus
-/// encode buffers, matching the ingestion direction. For multimodal
-/// SCX files, pass `modality="rna"` to extract a single modality as
-/// h5ad; otherwise multimodal inputs raise (use `pyscx.to_h5mu`).
+/// This native takes `obs_mask` as a numpy bool array; the wrapper's
+/// `_coerce_obs_mask` is what widens the accepted types (pandas boolean
+/// Series, list of bool) and rejects non-bool dtypes.
 ///
-/// Args:
-///     path: Source SCX file.
-///     out: Destination h5ad file.
-///     stream: Stream the conversion (default True). Set False for
-///         the legacy materializing path.
-///     modality: Modality name to extract (only valid on multimodal
-///         SCX inputs).
-///     obs_mask: Boolean numpy array selecting observations to keep.
-///         Indexed in the GLOBAL / physical obs row space — its length
-///         must equal `pyscx.open(path).n_obs_physical` (the file header
-///         count), NOT `.n_obs` (the live, post-deletion count). Rows
-///         already logically deleted stay dropped regardless of their
-///         entry here: the mask is ANDed with the deletion-vector mask,
-///         never substituted for it. Requires stream=True.
-///     min_counts: Per-cell total-UMI floor. Keeps rows where
-///         `X[i, :].sum() >= min_counts`, computed with one streaming
-///         pass over the CSR shards (no materialization) in the same
-///         global row space as obs_mask, and ANDed with it. Sums `X`,
-///         not a layer — meaningless on an already-normalized matrix.
-///         Requires stream=True.
-///
-/// Example:
-///     pyscx.to_h5ad("data.scx", "data.h5ad")
-///     pyscx.to_h5ad("cite.scx", "rna.h5ad", modality="rna")
-///     # Result-preserving CellBender pre-trim on a raw all-droplet file.
-///     pyscx.to_h5ad("raw.scx", "raw_trimmed.h5ad", min_counts=5)
+/// Full user-facing documentation lives on the `pyscx.to_h5ad` Python
+/// wrapper, which is what `help()` shows.
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (path, out, stream=true, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None, obs_mask=None, min_counts=None))]
@@ -1028,14 +848,10 @@ fn to_h5ad(
     .map_err(convert_to_pyerr)
 }
 
-/// Convert an SCX file to h5mu.
+/// Convert a multimodal SCX file to h5mu, streaming by default.
 ///
-/// Mirrors `pyscx.from_h5mu` in the opposite direction. Streams by
-/// default; per-modality `/mod/{name}/X` and any layers are written
-/// shard-by-shard. Requires a multimodal SCX file.
-///
-/// Example:
-///     pyscx.to_h5mu("cite.scx", "cite.h5mu")
+/// Full user-facing documentation lives on the `pyscx.to_h5mu` Python
+/// wrapper, which is what `help()` shows.
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (path, out, stream=true, reader_threads=None, writer_queue_depth=4, memory_budget=None))]

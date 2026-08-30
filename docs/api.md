@@ -1437,9 +1437,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 ## Python API (`pyscx`)
 
 > [!NOTE]
-> For the most up-to-date function signatures and type annotations, see the
-> [auto-generated Python API reference](python_api.rst) built from the Rust
-> docstrings via autodoc.
+> For the most up-to-date function signatures, see the
+> [auto-generated Python API reference](python_api.rst). For wrapped functions
+> (`open`, `from_h5ad`, `obs_import`, …) the canonical docstring is the one on
+> the **Python wrapper** — it is what `help()` and the rendered site show, and
+> the wrapper's input coercions (`Experiment` paths, pandas Series masks) are
+> part of the contract; the Rust `///` docs on those natives are pointers back
+> at it. Unwrapped functions (`from_anndata`, `merge`, `compact`, …) render
+> from the Rust docstrings via autodoc. A pytest guard
+> (`pyscx/tests/test_docstring_coverage.py`) pins every native kwarg to an
+> `Args:` entry on the wrapper docstring.
 
 ### Module-level functions
 
@@ -1605,12 +1612,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   side's column for each `key` component when the table spells the key
   differently, pairing positionally like pandas `left_on` / `right_on`:
   `key=["sample_id", "obs_names"], source_key=["sample_id", "barcode"]`. Omitted,
-  both sides use the `key` names. `on_missing_rows`
-  accepts `"null"` (the default), `"zero"` or `"error"`; `"null"` and `"zero"`
-  are the **same policy** (leave the row NULL) — `zero` is the spelling the
-  shared `MissingRowPolicy` enum carries from the CellBender importer, where a
-  missing *matrix* row genuinely is zeros, so `cellbender_import` still spells
-  its default `"zero"` and rejects `"null"`.
+  both sides use the `key` names. `on_missing_rows`: `"null"` (default) leaves
+  uncovered target rows NULL; `"error"` refuses. `"zero"` is an accepted legacy
+  alias for `"null"` — the shared policy's zero is literal only where the
+  missing thing is a matrix row (`cellbender_import`, which still spells its
+  default `"zero"` and rejects `"null"`), which really is zeros.
   **`overwrite` replaces, it does not merge** — importing several
   per-batch tables in turn keeps only the last. Returns a summary dict
   (`n_obs`, `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,

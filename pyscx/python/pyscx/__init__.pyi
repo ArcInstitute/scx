@@ -828,21 +828,26 @@ class Experiment:
 
 
 def open(path: Any, verify: bool = ...) -> Experiment:  # noqa: A001
-    """Open an SCX file as an `Experiment`."""
+    """Open an SCX file as an `Experiment` handle."""
     ...
 
 
 def read(path: Any, *, verify: bool = ..., **kwargs: Any) -> Any:
-    """Read an SCX file into an AnnData (= `open(path).to_anndata(**kwargs)`)."""
+    """Read an SCX file into an `anndata.AnnData` in one call
+    (= `open(path, verify=verify).to_anndata(**kwargs)`)."""
     ...
 
 
 def write(adata: Any, path: Any, **kwargs: Any) -> None:
-    """Write an AnnData to an SCX file (= `from_anndata(adata, path, **kwargs)`)."""
+    """Write an `anndata.AnnData` to an SCX file in one call
+    (= `from_anndata(adata, path, **kwargs)`)."""
     ...
 
 
-def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]: ...
+def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]:
+    """Validate an SCX file's catalog + per-section BLAKE3 checksums
+    (`deep=` additionally re-decodes every sparse shard)."""
+    ...
 
 
 def build_csc(

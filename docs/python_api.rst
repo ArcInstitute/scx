@@ -1,10 +1,13 @@
 Python API (``pyscx``)
 ======================
 
-Auto-generated reference for the ``pyscx`` Python package. Most symbols
-are defined in the compiled Rust extension (PyO3); the docstrings shown
-on each subpage are the Rust ``///`` doc comments that PyO3 surfaces as
-Python docstrings at runtime.
+Auto-generated reference for the ``pyscx`` Python package. Symbols with a
+pure-Python wrapper in ``pyscx/__init__.py`` (``open``, ``from_h5ad``,
+``obs_import``, …) show the **wrapper's** docstring — the canonical one, since
+the wrapper's input coercions are part of the contract; their Rust ``///``
+docs are two-line pointers back at it. Symbols with no wrapper
+(``from_anndata``, ``merge``, ``compact``, …) show the Rust ``///`` doc
+comments that PyO3 surfaces as Python docstrings at runtime.
 
 Click any name in the tables below to jump to its dedicated page. For
 prose-style narrative covering the same surface (with diagrams, worked
@@ -32,6 +35,8 @@ I/O & file lifecycle
    to_mtx
    to_h5ad
    to_h5mu
+   read_h5ad_metadata
+   export_batches
 
 Mutating operations
 -------------------
@@ -49,6 +54,28 @@ Mutating operations
    rollback
    save_layer
    preprocess
+   modify_metadata
+   set_uns
+
+External annotation import
+--------------------------
+
+In-place, key-joined landing of externally computed per-cell annotations
+(doublet callers, CellBender, any CSV/DataFrame). See :doc:`operations`
+§ External obs import for the prose guide.
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   obs_import
+   attach_obs_columns
+   diagnose_obs_key
+   doublet_import
+   doublet_consensus
+   doublet_tools
+   doublet_profiles
+   cellbender_import
 
 Cloud operations (requires ``--features cloud``)
 -------------------------------------------------
@@ -85,7 +112,7 @@ Datasets & readers
    ScxBackedMuDataset
    ScxBackedMuModality
    ScxLazyTransformedDataset
-   ScxComparisonResult
+   _ComparisonResult
 
 ML training datasets
 --------------------
@@ -124,6 +151,7 @@ Pure-Python helpers
    :nosignatures:
 
    iter_chunks
+   pflog_reconstruct
 
 Analysis accelerators (``pyscx.accel``)
 ---------------------------------------

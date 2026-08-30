@@ -266,13 +266,16 @@ enum Commands {
         /// layers, obs, and obsm; obsp is dropped with a warning.
         #[arg(long, value_name = "CSV")]
         sort_by: Option<String>,
-        /// Descending order for `--sort-by`.
+        /// Descending order for `--sort-by`. Ignored with `--group-by`
+        /// (reference rows must sort first; secondary keys sort ascending).
         #[arg(long)]
         sort_reverse: bool,
-        /// Convert-time grouping: cluster cells by this obs column
-        /// into contiguous, never-split CSR shards (reference-first), writing a
-        /// grouped layout directly — byte-equivalent to convert-then-`scx sort
-        /// --group-by`, but a single write. Requires a CSR or dense h5ad X
+        /// Convert-time grouping: cluster cells by this obs column into
+        /// group-aligned CSR shards (reference-first) — byte-equivalent to
+        /// convert-then-`scx sort --group-by`, one pass for CSR without obsp,
+        /// the two-step route otherwise (see `--group-pass`). Shards split only
+        /// at group edges, except a group larger than the writer's block
+        /// (default 256M) sub-flushes across shards. Requires a CSR or dense h5ad X
         /// (CSC errors) and a single-modality input. `--sort-by`, if also set,
         /// supplies secondary keys after the group key. Read back with
         /// `pyscx.open(...).read_group(...)`.
@@ -286,8 +289,9 @@ enum Commands {
         reference: Option<String>,
         /// Byte-budget grouped sharding for `--group-by`: target shard size in
         /// bytes (group edges only) instead of `--shard-size` rows. Same size
-        /// syntax as `--memory-budget`. CSR inputs only — dense/CSC fall back to
-        /// row-count with a warning.
+        /// syntax as `--memory-budget`. Byte planning runs on the CSR one-pass
+        /// route and on any two-pass route (`scx sort` sizes there);
+        /// `--group-pass one` over a non-CSR source with a byte budget errors.
         #[arg(long, value_name = "SIZE")]
         group_target_bytes: Option<String>,
         /// Oversize threshold for `--group-target-bytes`: a single group above
@@ -295,10 +299,13 @@ enum Commands {
         /// `--memory-budget`. Defaults to 4× `--group-target-bytes`.
         #[arg(long, value_name = "SIZE")]
         group_max_bytes: Option<String>,
-        /// How to realize `--group-by`. `auto` (default) routes by source
-        /// density: CSR → one-pass streaming (cheaper); dense → two-pass
-        /// (plain convert + `scx sort`, ~4–5× faster than the one-pass
-        /// random-row gather over a dense matrix). `one` / `two` force it.
+        /// How to realize `--group-by`. `auto` (default) picks two-pass (plain
+        /// convert + `scx sort`) for a dense X (~4–5× faster than the one-pass
+        /// random-row gather over dense) and whenever the file carries obsp
+        /// (one-pass cannot remap pairwise graphs); CSR without obsp streams
+        /// in one pass. `one` / `two` force it; a forced `one` rejects the
+        /// combinations it cannot honor (non-CSR + `--group-target-bytes`,
+        /// any source with obsp).
         #[arg(long, default_value = "auto", value_parser = ["auto", "one", "two"])]
         group_pass: String,
     },
@@ -1026,7 +1033,10 @@ enum Commands {
         /// Replace an existing layer / columns / uns key
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: zero-fill or fail
+        /// Target rows with no matching source row: `zero` (default) writes an
+        /// all-zero matrix row — literal here, unlike the obs importers' `null`
+        /// alias, because a droplet CellBender never analyzed really is zeros —
+        /// and `error` refuses.
         #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
@@ -1096,7 +1106,10 @@ enum Commands {
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: leave them NULL (not 0) or fail
+        /// Target rows with no matching source row: `null` (default) leaves them
+        /// NULL; `error` refuses. `zero` is an accepted legacy alias for `null` —
+        /// the shared policy's zero is literal only where the missing thing is a
+        /// matrix row (`scx cellbender-import`), which really is zeros.
         #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
@@ -1169,7 +1182,10 @@ enum Commands {
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: leave them NULL (not 0) or fail
+        /// Target rows with no matching source row: `null` (default) leaves them
+        /// NULL; `error` refuses. `zero` is an accepted legacy alias for `null` —
+        /// the shared policy's zero is literal only where the missing thing is a
+        /// matrix row (`scx cellbender-import`), which really is zeros.
         #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail

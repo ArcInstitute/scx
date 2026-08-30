@@ -264,21 +264,64 @@ def _reload_if_experiment(p):
 
 
 def open(path, verify=True):  # noqa: A001 — intentional shadowing of builtins.open within the pyscx namespace
-    """Open an SCX file as an `Experiment`. Accepts str or
-    `os.PathLike` (e.g. `pathlib.Path`)."""
+    """Open an SCX file as an `Experiment` handle.
+
+    Args:
+        path: Path to the SCX file (str or `os.PathLike`, e.g.
+            `pathlib.Path`).
+        verify: Verifies the file header and catalog checksum only.
+            Does NOT re-hash section payload bytes — for full payload
+            integrity (after write, after cloud pull, after transfer)
+            call `pyscx.validate(path)` (or `scx validate`). Default: True.
+
+            More precisely, with `verify=True` pyscx checks the header
+            magic/version and the trailing BLAKE3 checksum over the full
+            catalog. This authenticates the catalog payload (offsets,
+            lengths, per-section checksums) but does not touch section
+            bytes. Set to False for performance-sensitive paths where the
+            file is trusted (e.g., repeated reads of a file that was
+            already validated).
+
+    Example:
+        exp = pyscx.open("data.scx")
+        adata = exp.to_anndata()
+        # Fast open for trusted files:
+        exp = pyscx.open("data.scx", verify=False)
+        # Full per-section integrity check:
+        pyscx.validate("data.scx")
+    """
     return _open_native(_coerce_path(path), verify=verify)
 
 
 def validate(path, deep=False):
     """Validate an SCX file by walking its catalog and checking BLAKE3
-    checksums. Accepts str or `os.PathLike`.
+    checksums.
 
-    When ``deep=True``, additionally decodes every sparse shard to verify the
-    v3 canonical CSR invariant (sorted column indices, no explicit zeros,
-    consistent indptr) and verifies every decode sidecar (structural linkage
-    + decode-parity). Mirrors ``scx validate --deep``. Deep-check results are
-    appended with ``canonical-csr ``/``decode-sidecar `` prefixed names; they
-    report ``False`` rather than raising."""
+    Opens the file with full catalog verification, then computes BLAKE3 of
+    every section's payload bytes and compares against the catalog's stored
+    checksum. This is the section-level integrity check — `pyscx.open()`
+    only verifies the catalog itself. Cost is proportional to the file's
+    total section bytes.
+
+    Args:
+        path: Path to the SCX file (str or `os.PathLike`).
+        deep: When True, additionally decodes every sparse shard to verify
+            the v3 canonical CSR invariant (sorted column indices, no
+            explicit zeros, consistent indptr). Mirrors
+            ``scx validate --deep``. Canonical-CSR checks run only on v3+
+            files (pre-v3 may legitimately carry unsorted shards).
+            Deep-check results are appended with ``canonical-csr ``
+            prefixed names; they report ``False`` rather than raising.
+
+    Returns:
+        A list of (section_name, passed) tuples. Raises RuntimeError if any
+        essential section (obs, var, CsrShard) checksum fails.
+
+    Example:
+        results = pyscx.validate("data.scx", deep=True)
+        for name, passed in results:
+            print(f"{name}: {'OK' if passed else 'FAIL'}")
+    """
     return _validate_native(_coerce_path(path), deep)
 
 
@@ -333,17 +376,47 @@ def write(adata, path, **kwargs):
 
 
 def modify_metadata(path, **kwargs):
-    """Replace metadata sections in place, without re-encoding `X`.
+    """Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) of
+    an existing `.scx` file in place, without re-encoding `X`.
 
-    Thin `os.PathLike`-accepting wrapper; see the native docstring
-    (`help(pyscx.pyscx.modify_metadata)`) for the full contract. Every other
-    path-taking entry point coerces, and this one did not — a `pathlib.Path`
-    raised `TypeError: 'PosixPath' object is not an instance of 'str'`.
+    Any omitted argument is left untouched (its sections pass through
+    verbatim). Cost is O(size of the replaced sections); the matrix shards
+    are never read or rewritten, so a pre-existing CSC sidecar and
+    `data_generation` are preserved (no `--rebuild-csc` needed). One atomic
+    commit; rollback-able via `pyscx.rollback`.
+
+    **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
+    the section and `num_rows` must match the file's `n_obs` / `n_vars`
+    (changing cell/gene count is out of scope — use `append` / `subset`).
+    `obsm` / `varm` replace only the named matrices.
+
+    **A replaced axis keeps the predicate index it had.** The old section
+    describes values that are gone, so it is rebuilt over the same columns the
+    file already indexed — which also re-derives the per-shard column stats, so
+    `filter_obs` pushdown survives an ordinary obs edit. Naming `index_obs` /
+    `index_var` / `index_preset` overrides that; a column the file indexed and
+    the new request does not is reported as a `UserWarning` rather than dropped
+    in silence.
+
+    The override is **per axis**: `index_obs` changes only the obs axis's
+    column set, and a var replacement in the same call still carries its own
+    index forward. `index_preset` and `index_auto_threshold` genuinely span
+    both axes and so override both.
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
-        **kwargs: Forwarded to the native `modify_metadata` (`uns=`, `obs=`,
-            `var=`, `obsm=`, `varm=`, `index_obs=`, …).
+        uns: dict replacing the whole `uns` block.
+        obs / var: pandas `DataFrame` (or pyarrow `Table`); `num_rows` must
+            equal `n_obs` / `n_vars`.
+        obsm / varm: `dict[str, np.ndarray]` of named dense matrices.
+        index_obs / index_var: obs / var column lists for the rebuilt
+            predicate index (only consulted when obs/var change). Omitted,
+            the file's existing indexed column set is carried forward.
+        index_preset: Curated column list ("cellxgene", "perturbseq", or
+            "training") — spans both axes.
+        index_auto_threshold: Max cardinality for automatic categorical
+            indexing — spans both axes.
+        modality: integer modality id (only `0` / global is supported today).
     """
     result = _modify_metadata_native(_coerce_path(path), **kwargs)
     _reload_if_experiment(path)
@@ -351,11 +424,24 @@ def modify_metadata(path, **kwargs):
 
 
 def set_uns(path, uns):
-    """Replace the whole `uns` block in place. `os.PathLike`-accepting wrapper.
+    """Replace the whole `uns` block of an existing `.scx` file in place,
+    without re-encoding `X`.
+
+    **Replace semantics, not merge** — `uns` fully supersedes the existing
+    block (consistent with `from_h5ad(..., uns_override=)`). The matrix
+    (`X` / CSR / CSC shards) is never read or rewritten, so a pre-existing
+    CSC sidecar stays valid. The change is atomic and rollback-able
+    (`pyscx.rollback`).
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
         uns: dict replacing the whole `uns` block (replace, not merge).
+
+    Example:
+        # For a shallow merge, read-modify-write:
+        adata = pyscx.open(path).to_anndata()
+        adata.uns["descriptions"] = {...}
+        pyscx.set_uns(path, dict(adata.uns))
     """
     result = _set_uns_native(_coerce_path(path), uns)
     _reload_if_experiment(path)
@@ -389,7 +475,8 @@ def from_h5ad(path, out, **kwargs):
             When omitted, an accel-ready index_preset ("training" /
             "perturbseq") upgrades the default to "auto"; otherwise "off".
             An explicit value always wins.
-        csc_cols_per_shard: Columns per CSC shard when csc="always"
+        csc_cols_per_shard: Columns per CSC shard when a CSC sidecar is
+            built — csc="always", or "auto" over a qualifying dataset
             (default 5000); 0 = single CSC shard.
         uns_format: "tagged" (default) wraps NumPy/pandas containers in
             __scx_type__ envelopes for bit-exact round-trip; "plain"
@@ -397,6 +484,8 @@ def from_h5ad(path, out, **kwargs):
             uns_override; a no-op for the on-disk uns read.
         stream: Stream the conversion (default True). False falls back to
             the legacy materializing path (does not apply overrides).
+            `sort_by` / `group_by` force the streaming route regardless —
+            a reorder-on-convert never runs the materializing path.
         strict_uns: True raises on the first unrepresentable uns entry;
             False (default) emits a UserWarning per skipped key.
         dense_zero_epsilon: Threshold for dropping near-zero values when
@@ -431,6 +520,54 @@ def from_h5ad(path, out, **kwargs):
         writer_queue_depth: Backpressure window between the encoder pool
             and the ordered writer (default 4); outstanding shards are
             capped at reader_threads + writer_queue_depth.
+        sort_by: Sort-on-convert: list of obs column names globally
+            reordering the cell (obs) axis (lexicographic; leading key
+            first) so output CSR shards — and the predicate index — are
+            contiguous per key. Requires a CSR or dense h5ad X (CSC
+            errors). Applies to X, layers, obs, and obsm; obsp is dropped
+            with a warning, and `adata.raw` is not carried (raw streams in
+            source order, so a reorder would misalign it).
+        reverse: Descending order for `sort_by`. Ignored when `group_by`
+            is set (reference rows must sort first; the secondary keys sort
+            ascending — same rule as `scx sort --group-by`).
+        group_by: Convert-time grouping: cluster cells by this obs column
+            into group-aligned CSR shards (reference-first) — byte-
+            equivalent to convert-then-`scx sort --group-by`, in one pass
+            for a CSR X without obsp and via that two-step route otherwise
+            (see `group_pass`). Shards split only at group edges, except
+            that a group larger than the writer's block (default 256M) is
+            sub-flushed across multiple shards. Requires a CSR or dense
+            h5ad X and a single-modality input.
+            `sort_by`, if also set, supplies secondary keys after the
+            group key. Read back with `pyscx.open(...).read_group(...)`.
+        reference: Reference cells for `group_by` (e.g. non-targeting
+            controls): packed first and isolated in shard 0. Either a
+            comma-separated list of `group_by` labels, or "col:NAME"
+            (alias "column:NAME") naming a boolean obs column. Requires
+            `group_by`.
+        group_target_bytes: Byte-budget grouped sharding for `group_by`:
+            target shard size in bytes (split at group edges only) instead
+            of `shard_size` rows. Same size syntax as `memory_budget`. Byte
+            planning runs on the CSR one-pass route (per-row nnz from the
+            h5ad indptr) and on any two-pass route (`scx sort` does the
+            sizing there); forcing `group_pass="one"` over a non-CSR source
+            with a byte budget is an error, not a silent row-count
+            fallback.
+        group_max_bytes: Oversize threshold for `group_target_bytes`: a
+            single group above this is emitted on its own (with a warning)
+            rather than packed with neighbors — still subject to the
+            writer's sub-flush for very large groups. Same size syntax as
+            `memory_budget`. Defaults to 4x `group_target_bytes`.
+        group_pass: How to realize `group_by`: "auto" (default) picks
+            two-pass (plain convert + `scx sort --group-by`) for a dense X
+            (~4-5x faster than a one-pass random-row gather over dense) and
+            whenever the file carries `obsp` (the one-pass route cannot
+            remap pairwise graphs); a CSR X without obsp streams the
+            grouped layout in one pass. "one" / "two" force a strategy; a
+            forced "one" rejects the combinations it cannot honor
+            (non-CSR source with `group_target_bytes`; any source with
+            obsp) rather than diverging from what "auto"/"two" would
+            write.
         obs_override: Optional pandas DataFrame used in place of the
             on-disk obs (shape[0] must equal on-disk n_obs), for
             read-mutate-write flows via pyscx.read_h5ad_metadata. Requires
@@ -440,6 +577,15 @@ def from_h5ad(path, out, **kwargs):
             stream=True.
         uns_override: Optional dict replacing the entire uns section (not
             merged). Requires stream=True.
+        row_group_rows: Row-group-frame each shard into groups of at most N
+            rows, producing a v4 file with a multi-entry BlockIndex for
+            codec-agnostic sub-shard random access. Framing is ON BY
+            DEFAULT (N=256); pass 0 for the legacy unframed v3 layout
+            (old-reader compatibility). Works with any codec at no extra
+            encode cost.
+        row_group_target_nnz: Byte/nnz-aware row-group cap: also close a
+            group once it reaches this many non-zeros. Only meaningful
+            with row_group_rows.
     """
     _require_hdf5("from_h5ad")
     return _from_h5ad_native(
@@ -451,14 +597,33 @@ def from_h5ad(path, out, **kwargs):
 
 def read_h5ad_metadata(path, strict_uns=False):
     """Read obs / var / uns / X shape from an h5ad file via pure-Rust
-    HDF5 readers, without going through `anndata.read_h5ad` (which
-    eagerly materialises `obsm` on every call). Accepts str or
-    `os.PathLike` for `path`. Returns an `H5adMetadata` object whose
-    `obs`, `var`, `uns`, `n_obs`, `n_vars`, and `x_format` attributes
-    can be inspected / mutated and passed back to
-    `pyscx.from_h5ad(path, out, obs_override=..., uns_override=...)`
-    for read-mutate-write flows that need to stay under tight memory
-    budgets."""
+    HDF5 readers — no `anndata` import, no `obsm` allocation.
+
+    Skips `anndata.read_h5ad`, which eagerly materialises `obsm` on every
+    call. Made for read-mutate-write flows that must stay under tight
+    memory budgets: mutate the returned attributes and pass them back to
+    `pyscx.from_h5ad(path, out, obs_override=..., uns_override=...)`.
+
+    Args:
+        path: Path to the h5ad file (str or `os.PathLike`).
+        strict_uns: If True, fail on the first unsupported `uns` key.
+            Default False matches the convert behaviour (skip-and-warn).
+
+    Returns:
+        `H5adMetadata` with attributes `obs` (pandas.DataFrame), `var`
+        (pandas.DataFrame), `uns` (dict), `n_obs` (int), `n_vars` (int),
+        `x_format` ("csr" / "csc" / "dense").
+
+    Example:
+        meta = pyscx.read_h5ad_metadata("big.h5ad")
+        meta.obs["condition_id"] = ...
+        meta.uns["pipeline_version"] = "1.2.3"
+        pyscx.from_h5ad(
+            "big.h5ad", "big.scx",
+            obs_override=meta.obs,
+            uns_override=meta.uns,
+        )
+    """
     _require_hdf5("read_h5ad_metadata")
     return _read_h5ad_metadata_native(
         _coerce_path(path, allow_experiment=False),
@@ -872,11 +1037,12 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
             rebuilt from this table alone, so importing several per-batch tables
             one after another keeps only the last. Concatenate them and import
             once. Without this, a collision is an error.
-        on_missing_rows: "null" (default) leaves uncovered target rows NULL and
-            marks them absent; "error" refuses. "zero" is an accepted alias for
-            "null" — it names the shared policy enum, whose `zero` is literal
-            only on `cellbender_import`, where a missing *matrix* row really is
-            zeros.
+        on_missing_rows: "null" (default) leaves uncovered target rows NULL;
+            "error" refuses. "zero" is an accepted legacy alias for "null" —
+            the shared policy's zero is literal only where the missing thing
+            is a matrix row (cellbender_import), which really is zeros.
+            When a `status_column` is requested, uncovered rows are also
+            marked absent there.
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses.
         dry_run: Run the join and every validation that does not require
@@ -950,7 +1116,9 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
         overwrite: **Replaces, never merges** a colliding obs column or uns
             key, exactly as `obs_import`. Without it, a collision is an error.
         on_missing_rows: "null" (default) leaves uncovered target rows NULL;
-            "error" refuses. "zero" is an accepted legacy alias for "null".
+            "error" refuses. "zero" is an accepted legacy alias for "null" —
+            the shared policy's zero is literal only where the missing thing
+            is a matrix row (cellbender_import), which really is zeros.
             Vacuous under `positional` (every row is covered).
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses. Vacuous under `positional`.
@@ -997,9 +1165,16 @@ def diagnose_obs_key(path, key=None):
     whose text form is not guaranteed to agree across two independently written
     sides) is listed separately under `unusable_unique_columns`.
 
-    Returns a dict with `resolved_key`, `resolved_cardinality`,
-    `unique_columns`, `unusable_unique_columns`, `unique_pairs`, `suggestion`
-    and a printable `summary`.
+    Args:
+        path: SCX file to inspect (str, os.PathLike, or an open Experiment).
+        key: Optional key to diagnose specifically, in any form
+            `obs_import(key=...)` accepts (a str, `"obs_names"`, or a list
+            for a composite). None diagnoses the auto-resolved key.
+
+    Returns:
+        dict with `resolved_key`, `resolved_cardinality`, `unique_columns`,
+        `unusable_unique_columns`, `unique_pairs`, `suggestion` and a
+        printable `summary`.
     """
     return _diagnose_obs_key_native(_coerce_path(path), _coerce_key(key))
 
@@ -1059,9 +1234,11 @@ def doublet_import(path, table, *, tool, key=None, source_key=None, **kwargs):
             that is not there is an error.
         overwrite: **Replaces, never merges.** Re-importing per-batch tables one
             after another keeps only the last — concatenate them and import once.
-        on_missing_rows: "null" (default) leaves uncovered cells NULL and marks
-            them absent ("zero" is an accepted alias for the same policy); "error"
-            refuses.
+        on_missing_rows: "null" (default) leaves uncovered target rows NULL;
+            "error" refuses. "zero" is an accepted legacy alias for "null" —
+            the shared policy's zero is literal only where the missing thing
+            is a matrix row (cellbender_import), which really is zeros.
+            An uncovered cell is also marked absent in `<K>_status`.
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses.
         dry_run: Validate and join without writing; also returns a
@@ -1711,10 +1888,13 @@ def from_h5mu(path, out, **kwargs):
         csc: "off", "auto", or "always" (column-major sidecar). When
             omitted, an accel-ready index_preset ("training" / "perturbseq")
             upgrades the default to "auto"; otherwise "off". An explicit
-            value always wins. (Streaming h5mu cannot build per-modality
-            CSC: "auto" degrades to no-CSC with a warning.)
-        csc_cols_per_shard: Columns per CSC shard when csc="always"
-            (default 5000).
+            value always wins. The streaming path (the default) cannot
+            build per-modality CSC: csc="always" raises there, and "auto"
+            degrades to no-CSC with a warning when a modality would have
+            qualified. Pass stream=False to build per-modality CSC via the
+            non-streaming path (it materializes each modality's X).
+        csc_cols_per_shard: Columns per CSC shard when a CSC sidecar is
+            built (default 5000).
         stream: Stream the conversion (default True).
         strict_uns: True raises on the first unrepresentable uns entry;
             False (default) warns per skipped key.
@@ -1738,6 +1918,9 @@ def from_h5mu(path, out, **kwargs):
         reader_threads: Parallel reader worker count (see pyscx.from_h5ad);
             >1 requires a thread-safe libhdf5.
         writer_queue_depth: Encoder->writer backpressure window (default 4).
+        row_group_rows: Row-group-frame each shard into groups of at most N
+            rows (v4 BlockIndex sub-shard random access; see
+            pyscx.from_h5ad). ON BY DEFAULT (N=256); 0 = legacy unframed v3.
     """
     _require_hdf5("from_h5mu")
     return _from_h5mu_native(
