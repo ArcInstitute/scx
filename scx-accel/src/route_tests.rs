@@ -326,17 +326,23 @@ fn device_request_parses_intent_without_collapsing_auto() {
 fn cpu_only_exec_info_reasons() {
     // No GPU kernel exists at all: a forced-CPU request records the user's
     // choice; a GPU request on any host records a non-none reason.
-    let info = cpu_only_exec_info("cpu");
+    let info = cpu_only_exec_info(DeviceRequest::Cpu);
     assert_eq!(info.route, AccelRoute::CpuCsr);
     assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    let info = cpu_only_exec_info("gpu");
+    let info = cpu_only_exec_info(DeviceRequest::Gpu);
     assert_eq!(info.route, AccelRoute::CpuCsr);
     assert_ne!(info.fallback_reason, FallbackReason::None);
 }
 
 #[test]
 fn cpu_exec_info_carries_chunk_size() {
-    let info = cpu_exec_info("cpu", InputLayout::BackedCsr, false, false, Some(512));
+    let info = cpu_exec_info(
+        DeviceRequest::Cpu,
+        InputLayout::BackedCsr,
+        false,
+        false,
+        Some(512),
+    );
     assert_eq!(info.route, AccelRoute::CpuCsr);
     assert_eq!(info.chunk_size, Some(512));
     assert_eq!(info.csc_available, Some(false));
@@ -494,4 +500,126 @@ fn a_runtime_failure_landing_on_cpu_warns() {
         "gpu",
         &AccelExecutionInfo::new(AccelRoute::GpuCsr, FallbackReason::GpuRuntimeError)
     ));
+}
+
+// --- Restored from the pre-extraction inline module: the HVG and
+// simple-planner matrices are live production planners and keep their
+// full route/reason coverage (review round 1, Cursor Agent + codex).
+
+// --- HVG planner (plan_hvg_route) ---
+
+#[test]
+fn hvg_gpu_seurat_v3_is_gpu_csr() {
+    // seurat_v3 on a GPU host → the atomic-CSR GPU kernel.
+    let info = plan_hvg_route(DeviceRequest::Gpu, true, true, false);
+    assert_eq!(info.route, AccelRoute::GpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::None);
+    assert!(info.route.is_gpu());
+}
+
+#[test]
+fn hvg_cpu_forced_records_user_forced() {
+    let info = plan_hvg_route(DeviceRequest::Cpu, true, true, false);
+    assert_eq!(info.route, AccelRoute::CpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
+}
+
+#[test]
+fn hvg_no_cuda_records_no_cuda() {
+    let info = plan_hvg_route(DeviceRequest::Auto, false, true, false);
+    assert!(!info.route.is_gpu());
+    assert_eq!(info.route, AccelRoute::CpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
+}
+
+#[test]
+fn hvg_seurat_flavor_ineligible_on_gpu() {
+    // A non-seurat_v3 flavor on a GPU host: GPU present but no kernel.
+    let info = plan_hvg_route(DeviceRequest::Gpu, true, false, false);
+    assert!(!info.route.is_gpu());
+    assert_eq!(info.route, AccelRoute::CpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
+}
+
+#[test]
+fn hvg_csc_ineligible_flavor_is_cpu_csc() {
+    // A CSC sidecar is present but the flavor has no GPU kernel
+    // (gpu_eligible=false): run CPU CSC, record the layout reason.
+    let info = plan_hvg_route(DeviceRequest::Auto, true, false, true);
+    assert_eq!(info.route, AccelRoute::CpuCsc);
+    assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
+    assert_eq!(info.csc_available, Some(true));
+}
+
+#[test]
+fn hvg_gpu_csc_sidecar_is_gpu_csc_v3() {
+    // seurat_v3 on a GPU host with a reachable CSC sidecar → the
+    // column-major CSC reduce route (mirrors DE's gpu_csc_v3).
+    let info = plan_hvg_route(DeviceRequest::Gpu, true, true, true);
+    assert_eq!(info.route, AccelRoute::GpuCscV3);
+    assert_eq!(info.fallback_reason, FallbackReason::None);
+    assert!(info.route.is_gpu());
+    assert_eq!(info.csc_available, Some(true));
+}
+
+#[test]
+fn hvg_cpu_forced_with_sidecar_is_cpu_csc() {
+    let info = plan_hvg_route(DeviceRequest::Cpu, true, true, true);
+    assert_eq!(info.route, AccelRoute::CpuCsc);
+    assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
+}
+
+// --- Generic single-route planner (plan_simple_gpu_route) ---
+
+#[test]
+fn simple_gpu_auto_runs_gpu() {
+    let info = plan_simple_gpu_route(
+        DeviceRequest::Auto,
+        true,
+        true,
+        AccelRoute::GpuCsr,
+        AccelRoute::CpuCsr,
+    );
+    assert_eq!(info.route, AccelRoute::GpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::None);
+}
+
+#[test]
+fn simple_gpu_lib_missing_is_unsupported_layout() {
+    // CUDA present but the op's GPU library (e.g. cuVS) is unavailable.
+    let info = plan_simple_gpu_route(
+        DeviceRequest::Gpu,
+        true,
+        false,
+        AccelRoute::GpuDense,
+        AccelRoute::CpuDense,
+    );
+    assert_eq!(info.route, AccelRoute::CpuDense);
+    assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
+}
+
+#[test]
+fn simple_no_cuda_records_no_cuda() {
+    let info = plan_simple_gpu_route(
+        DeviceRequest::Auto,
+        false,
+        true,
+        AccelRoute::GpuCsr,
+        AccelRoute::CpuCsr,
+    );
+    assert_eq!(info.route, AccelRoute::CpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
+}
+
+#[test]
+fn simple_forced_cpu() {
+    let info = plan_simple_gpu_route(
+        DeviceRequest::Cpu,
+        true,
+        true,
+        AccelRoute::GpuCsr,
+        AccelRoute::CpuCsr,
+    );
+    assert_eq!(info.route, AccelRoute::CpuCsr);
+    assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
 }

@@ -676,14 +676,14 @@ pub fn gpu_runtime_available() -> bool {
 /// request on a GPU host records [`FallbackReason::UnsupportedInputLayout`]
 /// rather than implying CUDA was absent.
 pub fn cpu_exec_info(
-    device: &str,
+    device: DeviceRequest,
     layout: InputLayout,
     gpu_eligible: bool,
     csc_available: bool,
     chunk_size: Option<usize>,
 ) -> AccelExecutionInfo {
     let mut info = plan_de_route(
-        DeviceRequest::from_device_str(device),
+        device,
         layout,
         gpu_runtime_available(),
         gpu_eligible,
@@ -698,16 +698,15 @@ pub fn cpu_exec_info(
 /// `gpu_eligible` is `true` only for the `seurat_v3` flavor family (the one
 /// flavor with a GPU kernel). `csc_available` is `true` when a CSC sidecar is
 /// reachable for a single-batch run, routing GPU to the column-major reduce
-/// (`gpu_csc_v3`) and CPU to `cpu_csc`. The caller passes the resolved `device`
-/// string and the actual flavor/layout so the recorded route matches the code
-/// that ran.
-pub fn hvg_exec_info(device: &str, gpu_eligible: bool, csc_available: bool) -> AccelExecutionInfo {
-    plan_hvg_route(
-        DeviceRequest::from_device_str(device),
-        gpu_runtime_available(),
-        gpu_eligible,
-        csc_available,
-    )
+/// (`gpu_csc_v3`) and CPU to `cpu_csc`. The caller passes the validated
+/// device request and the actual flavor/layout so the recorded route matches
+/// the code that ran.
+pub fn hvg_exec_info(
+    device: DeviceRequest,
+    gpu_eligible: bool,
+    csc_available: bool,
+) -> AccelExecutionInfo {
+    plan_hvg_route(device, gpu_runtime_available(), gpu_eligible, csc_available)
 }
 
 /// Build the execution info for a single-route op (PCA / kNN / UMAP / Leiden /
@@ -716,13 +715,13 @@ pub fn hvg_exec_info(device: &str, gpu_eligible: bool, csc_available: bool) -> A
 /// cuSPARSE present); `gpu_route` / `cpu_route` are the op's CSR- or
 /// dense-shaped route pair.
 pub fn simple_exec_info(
-    device: &str,
+    device: DeviceRequest,
     gpu_eligible: bool,
     gpu_route: AccelRoute,
     cpu_route: AccelRoute,
 ) -> AccelExecutionInfo {
     plan_simple_gpu_route(
-        DeviceRequest::from_device_str(device),
+        device,
         gpu_runtime_available(),
         gpu_eligible,
         gpu_route,
@@ -735,19 +734,15 @@ pub fn simple_exec_info(
 /// sample count exceeds the kernel's register bounds (`scx_gpu::GPU_NB_GLM_PMAX`
 /// / `GPU_NB_GLM_NSUB_MAX`) — recorded as `UnsupportedDimensions`. Stage A is
 /// always CSR (host-fed dense); never a rapids fallback.
-pub fn nb_glm_exec_info(device: &str, gpu_eligible: bool) -> AccelExecutionInfo {
-    plan_nb_glm_route(
-        DeviceRequest::from_device_str(device),
-        gpu_runtime_available(),
-        gpu_eligible,
-    )
+pub fn nb_glm_exec_info(device: DeviceRequest, gpu_eligible: bool) -> AccelExecutionInfo {
+    plan_nb_glm_route(device, gpu_runtime_available(), gpu_eligible)
 }
 
 /// Build the execution info for a CPU-only op that has no GPU kernel at all
 /// (gene-set scoring). `gpu_eligible=false` records `UserForcedCpu` for
 /// `device="cpu"`, `NoCuda` when no GPU is present, and `UnsupportedInputLayout`
 /// for an explicit GPU request on a GPU host — there is no GPU kernel to take.
-pub fn cpu_only_exec_info(device: &str) -> AccelExecutionInfo {
+pub fn cpu_only_exec_info(device: DeviceRequest) -> AccelExecutionInfo {
     simple_exec_info(device, false, AccelRoute::CpuCsr, AccelRoute::CpuCsr)
 }
 
