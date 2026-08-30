@@ -4,7 +4,9 @@ Each function in this table exists twice: a pure-Python wrapper in
 `pyscx/python/pyscx/__init__.py` (what `help()` and Sphinx show — the wrapper
 shadows the native after `from .pyscx import *`) and a pyo3 native in
 `pyscx.pyscx`. The convention is **Python-canonical**: the wrapper carries the
-one full docstring, and the native's `///` doc is a two-line pointer at it.
+one full docstring, and the native's `///` doc is a pointer at it (a short
+summary plus the pointer sentence, never an ``Args:`` block — brief
+Rust-reader notes are allowed).
 The wrapper is the right holder because its coercions are part of the
 user-visible contract (`_coerce_path` accepts an open `Experiment`,
 `_coerce_obs_mask` accepts a pandas Series, `_coerce_key` accepts a bare str)

@@ -266,13 +266,16 @@ enum Commands {
         /// layers, obs, and obsm; obsp is dropped with a warning.
         #[arg(long, value_name = "CSV")]
         sort_by: Option<String>,
-        /// Descending order for `--sort-by`.
+        /// Descending order for `--sort-by`. Ignored with `--group-by`
+        /// (reference rows must sort first; secondary keys sort ascending).
         #[arg(long)]
         sort_reverse: bool,
-        /// Convert-time grouping: cluster cells by this obs column
-        /// into contiguous, never-split CSR shards (reference-first), writing a
-        /// grouped layout directly — byte-equivalent to convert-then-`scx sort
-        /// --group-by`, but a single write. Requires a CSR or dense h5ad X
+        /// Convert-time grouping: cluster cells by this obs column into
+        /// group-aligned CSR shards (reference-first) — byte-equivalent to
+        /// convert-then-`scx sort --group-by`, one pass for CSR without obsp,
+        /// the two-step route otherwise (see `--group-pass`). Shards split only
+        /// at group edges, except a group larger than the writer's block
+        /// (default 256M) sub-flushes across shards. Requires a CSR or dense h5ad X
         /// (CSC errors) and a single-modality input. `--sort-by`, if also set,
         /// supplies secondary keys after the group key. Read back with
         /// `pyscx.open(...).read_group(...)`.
