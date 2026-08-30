@@ -39,20 +39,6 @@ fn gpu_dims_ok(n_features: usize, n_samples: usize) -> bool {
     }
 }
 
-/// Extract the GPU device id from a [`ResolvedDevice`] (always `None` without
-/// the `gpu` feature, where a GPU device cannot be resolved).
-fn resolve_gpu_id(resolved: super::gpu::ResolvedDevice) -> Option<usize> {
-    #[cfg(feature = "gpu")]
-    {
-        resolved.gpu_id()
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        let _ = resolved;
-        None
-    }
-}
-
 /// A resolved GPU device for an NB-GLM op, held once and reused across a
 /// many-target loop (creating a CUDA context per target would be ruinous).
 /// Carries nothing without the `gpu` feature.
@@ -294,17 +280,9 @@ pub(super) fn nbglm_options_from_dict(
 
     if let Some(v) = d.get_item("dispersion")? {
         let s: String = v.extract()?;
-        o.dispersion = match s.as_str() {
-            "moments" => DispersionMethod::Moments,
-            "cox_reid_mle" => DispersionMethod::CoxReidMle,
-            "cox_reid_shrunk" => DispersionMethod::CoxReidShrunk,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "invalid dispersion={other:?}; expected 'moments', \
-                     'cox_reid_mle', or 'cox_reid_shrunk'"
-                )))
-            }
-        };
+        // Shared vocabulary + error text (`DispersionMethod::parse`).
+        o.dispersion =
+            DispersionMethod::parse(&s).map_err(|e| PyValueError::new_err(e.to_string()))?;
     }
     if let Some(v) = d.get_item("min_disp")? {
         o.min_disp = v.extract()?;
@@ -934,7 +912,7 @@ pub fn nb_glm(
     // AnnData), so there is no `uns` to stamp — but we still announce a silent
     // GPU→CPU fallback so an explicit `device="gpu"` with over-large dims warns.
     let resolved = super::gpu::resolve_device(device)?;
-    let gpu_device_id = resolve_gpu_id(resolved);
+    let gpu_device_id = resolved.gpu_id();
     let gpu_eligible = gpu_dims_ok(n_features, n_samples);
     let info = super::route::nb_glm_exec_info(device, gpu_eligible);
     super::route::announce_route(py, "nb_glm", device, &info);
@@ -1182,7 +1160,7 @@ pub fn pdex_nb_glm(
     let info = super::route::nb_glm_exec_info(device, !design_aware);
     super::route::announce_route(py, "pdex_nb_glm", device, &info);
     let gpu_device_id = if info.route.is_gpu() {
-        resolve_gpu_id(resolved)
+        resolved.gpu_id()
     } else {
         None
     };

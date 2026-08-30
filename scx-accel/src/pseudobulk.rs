@@ -25,6 +25,21 @@ pub enum AggregationMethod {
     Mean,
 }
 
+impl AggregationMethod {
+    /// Parse the user-facing `aggr_method=` string — the single vocabulary +
+    /// error text for every binding (the message is pinned by the pyscx test
+    /// suite, which surfaces it as `RuntimeError`).
+    pub fn parse(aggr_method: &str) -> std::result::Result<Self, crate::error::InvalidArgument> {
+        match aggr_method {
+            "sum" => Ok(AggregationMethod::Sum),
+            "mean" => Ok(AggregationMethod::Mean),
+            other => Err(crate::error::InvalidArgument(format!(
+                "unsupported aggr_method '{other}': use 'sum' or 'mean'"
+            ))),
+        }
+    }
+}
+
 /// pdex-style pseudobulk mode controlling per-cell and per-group-mean transforms.
 ///
 /// Encodes the four `(geometric_mean × is_log1p)` combinations from
@@ -1168,5 +1183,23 @@ mod tests {
                 );
             }
         }
+    }
+    /// The parse vocabulary and its exact error text are a cross-binding
+    /// contract (pyscx surfaces the message as `RuntimeError`, rscx as an R
+    /// error) — pinned here so `cargo test -p scx-accel` catches drift.
+    #[test]
+    fn aggregation_method_parse_vocabulary_and_error_text() {
+        assert!(matches!(
+            AggregationMethod::parse("sum"),
+            Ok(AggregationMethod::Sum)
+        ));
+        assert!(matches!(
+            AggregationMethod::parse("mean"),
+            Ok(AggregationMethod::Mean)
+        ));
+        assert_eq!(
+            AggregationMethod::parse("median").unwrap_err().to_string(),
+            "unsupported aggr_method 'median': use 'sum' or 'mean'"
+        );
     }
 }

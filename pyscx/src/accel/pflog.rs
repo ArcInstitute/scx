@@ -122,6 +122,10 @@ pub fn pflog(
     // Builds a ShardSource over the sorted projection; a presentation-ordered
     // backed X (preserve_var_order=True) would misalign the result against var.
     super::prepare_target(py, adata, "pflog")?;
+    // Validate `device=` like every other accel op (round-2 review: this op
+    // previously skipped `resolve_device`, so an invalid string was silently
+    // treated as GPU intent in the route stamp instead of raising).
+    let _device = super::gpu::resolve_device(device)?;
     let (want_pca, want_dense) = match store {
         "pca" => (true, false),
         "baseline" => (false, false),

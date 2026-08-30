@@ -1591,6 +1591,75 @@ fn build_pca_result(
 /// Default threshold: use covariance method when n_vars <= this value.
 pub const COVARIANCE_PCA_THRESHOLD: usize = 5_000;
 
+/// The CPU PCA solver family, resolved from the user's `method=` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuPcaMethod {
+    /// Exact covariance eigendecomposition (`X^T X`); optimal when
+    /// `n_vars <= COVARIANCE_PCA_THRESHOLD` (e.g. HVG-selected data).
+    Covariance,
+    /// Randomized (Halko) SVD; the wide-matrix route.
+    Randomized,
+}
+
+impl CpuPcaMethod {
+    /// The identifier used in provenance params and route metadata.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CpuPcaMethod::Covariance => "covariance",
+            CpuPcaMethod::Randomized => "randomized",
+        }
+    }
+}
+
+/// The user's `method=` request, parsed from the `auto|covariance|randomized`
+/// vocabulary by [`PcaMethodRequest::parse`] — so an unknown string is an
+/// error at the boundary rather than a silent auto-route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcaMethodRequest {
+    /// Route by the [`COVARIANCE_PCA_THRESHOLD`] column-count rule.
+    Auto,
+    /// Force the exact covariance solver.
+    Covariance,
+    /// Force the randomized (Halko) solver.
+    Randomized,
+}
+
+impl PcaMethodRequest {
+    /// Parse the user-facing `method=` string — the single vocabulary +
+    /// error text for every binding (the message is pinned by the pyscx test
+    /// suite, which surfaces it as `ValueError`).
+    pub fn parse(method: &str) -> std::result::Result<Self, crate::error::InvalidArgument> {
+        match method {
+            "auto" => Ok(PcaMethodRequest::Auto),
+            "covariance" => Ok(PcaMethodRequest::Covariance),
+            "randomized" => Ok(PcaMethodRequest::Randomized),
+            other => Err(crate::error::InvalidArgument(format!(
+                "Invalid method={other:?}; expected 'auto', 'covariance', or 'randomized'"
+            ))),
+        }
+    }
+}
+
+/// Resolve the CPU PCA solver from the parsed `method=` request and the
+/// effective column count — **the** auto-routing rule, shared by both
+/// bindings so R and Python cannot drift on the threshold. Taking the parsed
+/// [`PcaMethodRequest`] (not a raw string) means a typo cannot silently
+/// become an auto-route: the vocabulary error happens at
+/// [`PcaMethodRequest::parse`].
+pub fn resolve_cpu_pca_method(requested: PcaMethodRequest, n_vars: usize) -> CpuPcaMethod {
+    match requested {
+        PcaMethodRequest::Covariance => CpuPcaMethod::Covariance,
+        PcaMethodRequest::Randomized => CpuPcaMethod::Randomized,
+        PcaMethodRequest::Auto => {
+            if n_vars <= COVARIANCE_PCA_THRESHOLD {
+                CpuPcaMethod::Covariance
+            } else {
+                CpuPcaMethod::Randomized
+            }
+        }
+    }
+}
+
 /// Compute PCA via the covariance method, streaming from a [`ShardSource`].
 ///
 /// Algorithm (2 passes over data):
@@ -3642,5 +3711,46 @@ mod tests {
                 assert_bits_eq(&got, &want, "covariance embeddings scatter");
             }
         }
+    }
+    /// The parse vocabulary + exact error text, and the auto rule flipping at
+    /// the shared threshold, are cross-binding contracts — pinned without a
+    /// Python or R harness.
+    #[test]
+    fn pca_method_request_parse_and_auto_rule() {
+        assert!(matches!(
+            PcaMethodRequest::parse("auto"),
+            Ok(PcaMethodRequest::Auto)
+        ));
+        assert!(matches!(
+            PcaMethodRequest::parse("covariance"),
+            Ok(PcaMethodRequest::Covariance)
+        ));
+        assert!(matches!(
+            PcaMethodRequest::parse("randomized"),
+            Ok(PcaMethodRequest::Randomized)
+        ));
+        assert_eq!(
+            PcaMethodRequest::parse("typo").unwrap_err().to_string(),
+            "Invalid method=\"typo\"; expected 'auto', 'covariance', or 'randomized'"
+        );
+        // Explicit requests win regardless of width; auto flips at the
+        // threshold boundary.
+        let t = COVARIANCE_PCA_THRESHOLD;
+        assert_eq!(
+            resolve_cpu_pca_method(PcaMethodRequest::Randomized, 10),
+            CpuPcaMethod::Randomized
+        );
+        assert_eq!(
+            resolve_cpu_pca_method(PcaMethodRequest::Covariance, t + 1),
+            CpuPcaMethod::Covariance
+        );
+        assert_eq!(
+            resolve_cpu_pca_method(PcaMethodRequest::Auto, t),
+            CpuPcaMethod::Covariance
+        );
+        assert_eq!(
+            resolve_cpu_pca_method(PcaMethodRequest::Auto, t + 1),
+            CpuPcaMethod::Randomized
+        );
     }
 }

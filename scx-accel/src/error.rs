@@ -1,6 +1,19 @@
 use scx_engine::EngineError;
 use scx_format_io::ScxError;
 
+/// A user-facing argument-vocabulary error whose `Display` is exactly the
+/// canonical cross-binding message, with no category prefix.
+///
+/// Returned by the shared `parse` constructors (`ScoreMethod::parse`,
+/// `AggregationMethod::parse`, `DispersionMethod::parse`) so each binding can
+/// surface the text verbatim — pyscx as `ValueError`/`RuntimeError`, rscx as
+/// an R error — without stripping the `"invalid input: "` prefix
+/// [`AccelError::InvalidInput`] would add. The message text is a contract:
+/// the pyscx test suite pins it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidArgument(pub String);
+
 /// Errors from accelerator operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AccelError {

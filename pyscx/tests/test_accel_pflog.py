@@ -425,3 +425,15 @@ class TestPcaOptions:
         re_ad = pyscx.open(out).to_anndata()
         Z = pyscx.accel.pflog_reconstruct(re_ad)
         np.testing.assert_allclose(Z, reference_dense(X, ALPHA), rtol=1e-5, atol=1e-5)
+
+
+class TestDeviceValidation:
+    def test_invalid_device_raises_value_error(self):
+        # Round-2 review (codex + Cursor): pflog previously skipped
+        # resolve_device, so an invalid device string was silently treated as
+        # GPU intent in the route stamp instead of raising like every other
+        # accel op.
+        ad, _ = small_adata()
+        with pytest.raises(ValueError, match="unknown device"):
+            pyscx.accel.pflog(ad, alpha=ALPHA, store="baseline", device="tpu")
+        assert "pflog_baseline" not in ad.obs

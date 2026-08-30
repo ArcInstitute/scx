@@ -71,7 +71,7 @@ pub enum AccelRoute {
     /// GPU compute handed off to rapids-singlecell (cuML/cuVS/cuGraph) on a
     /// device-resident matrix. The in-VRAM route for the ops rapids supersedes
     /// (UMAP / in-VRAM PCA / in-VRAM kNN / extra HVG flavors / preprocess);
-    /// see `plan_rapids_route`.
+    /// see [`plan_rapids_decision`].
     RapidsSinglecell,
 }
 
@@ -135,8 +135,8 @@ pub enum FallbackReason {
     /// A performance policy chose CPU/another route despite GPU availability.
     PerfPolicy,
     /// A rapids-routed op was requested on GPU but rapids-singlecell is not
-    /// importable, so the op fell back to CPU. See `plan_rapids_route` and
-    /// `docs/gpu-setup.md` (rapids analysis backend).
+    /// importable, so the op fell back to CPU. See [`plan_rapids_decision`]
+    /// and `docs/gpu-setup.md` (rapids analysis backend).
     NoRapids,
     /// The op reached a *slower* path because the faster one failed on the
     /// device at run time — not because the request or the input ruled it out.
@@ -266,6 +266,72 @@ impl AccelExecutionInfo {
             ..Default::default()
         }
     }
+
+    /// The record as `(key, value)` pairs — the single definition of the
+    /// `uns["scx_accel"][<op>]` wire serialization.
+    ///
+    /// Every binding's sink is a loop over this (pyscx → a Python dict, rscx →
+    /// a named R list), so the key set and order cannot drift between
+    /// bindings. Unset optionals are emitted as explicit
+    /// `None`/`NULL` entries, not omitted — a gate distinguishing "not
+    /// tracked" from "key missing entirely" depends on that.
+    pub fn fields(&self) -> [(&'static str, RouteValue<'_>); 17] {
+        [
+            ("route", RouteValue::Str(self.route.as_str())),
+            (
+                "fallback_reason",
+                RouteValue::Str(self.fallback_reason.as_str()),
+            ),
+            ("chunk_size", RouteValue::OptUsize(self.chunk_size)),
+            ("graph_replay", RouteValue::OptBool(self.graph_replay)),
+            ("csc_available", RouteValue::OptBool(self.csc_available)),
+            ("shards_decoded", RouteValue::OptUsize(self.shards_decoded)),
+            (
+                "shards_uploaded",
+                RouteValue::OptUsize(self.shards_uploaded),
+            ),
+            ("math_mode", RouteValue::OptStr(self.math_mode)),
+            ("spmm_policy", RouteValue::OptStr(self.spmm_policy)),
+            (
+                "rapids_version",
+                RouteValue::OptStr(self.rapids_version.as_deref()),
+            ),
+            (
+                "cuml_version",
+                RouteValue::OptStr(self.cuml_version.as_deref()),
+            ),
+            (
+                "cupy_version",
+                RouteValue::OptStr(self.cupy_version.as_deref()),
+            ),
+            ("transfer_mode", RouteValue::OptStr(self.transfer_mode)),
+            ("device_id", RouteValue::OptUsize(self.device_id)),
+            ("bytes_uploaded", RouteValue::OptU64(self.bytes_uploaded)),
+            (
+                "n_shards_shufdelta_gpu",
+                RouteValue::OptU32(self.n_shards_shufdelta_gpu),
+            ),
+            ("resident_csr", RouteValue::OptBool(self.resident_csr)),
+        ]
+    }
+}
+
+/// One serialized [`AccelExecutionInfo`] field value, typed so each binding's
+/// sink can map it to its native scalar without re-knowing the field list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteValue<'a> {
+    /// Always-present string (route / fallback_reason).
+    Str(&'a str),
+    /// Optional string (versions, modes).
+    OptStr(Option<&'a str>),
+    /// Optional boolean flag.
+    OptBool(Option<bool>),
+    /// Optional count/index.
+    OptUsize(Option<usize>),
+    /// Optional 32-bit counter.
+    OptU32(Option<u32>),
+    /// Optional byte count.
+    OptU64(Option<u64>),
 }
 
 /// User device intent, decoupled from runtime availability.
@@ -287,6 +353,27 @@ pub enum DeviceRequest {
     /// fact. The error names the shortfall and the remedy instead
     /// (`device="cpu"`).
     Auto,
+}
+
+impl DeviceRequest {
+    /// Map a `device=` string to the user's [`DeviceRequest`] intent.
+    ///
+    /// Deliberately infallible and grammar-blind: full validation (including
+    /// the `gpu:N` suffix and runtime availability) is
+    /// [`resolve_device`](crate::device::resolve_device)'s job, and resolution
+    /// collapses `"auto"` to CPU when no GPU is present — losing the intent
+    /// the planners need to distinguish `NoCuda` from `UserForcedCpu`. This
+    /// re-parses the raw string for the planner instead.
+    pub fn from_device_str(device: &str) -> DeviceRequest {
+        if device == "cpu" {
+            DeviceRequest::Cpu
+        } else if device == "auto" {
+            DeviceRequest::Auto
+        } else {
+            // "gpu" / "gpu:N"
+            DeviceRequest::Gpu
+        }
+    }
 }
 
 /// The layout the input matrix is presented in to the accelerator.
@@ -491,50 +578,202 @@ pub fn plan_simple_gpu_route(
     AccelExecutionInfo::new(route, reason)
 }
 
-/// Decide the route for an op that hands in-VRAM GPU compute to
-/// rapids-singlecell: UMAP, in-VRAM PCA/kNN, extra HVG flavors, preprocess.
-/// The decision is a pure function of the dispatch facts so it is
-/// it is unit-testable without a GPU; the pyscx caller supplies the runtime
-/// signals (`gpu_available`, `rapids_available` from an import probe, `fits_vram`
-/// from the VRAM pre-flight).
+/// How a GPU-eligible standalone op should dispatch in the in-VRAM regime.
 ///
-/// * `Cpu` → `cpu_route`, [`FallbackReason::UserForcedCpu`].
-/// * no CUDA → `cpu_route`, [`FallbackReason::NoCuda`].
-/// * **>VRAM** (`!fits_vram`) → `native_gpu_route`, [`FallbackReason::None`]: the
-///   streaming moat. rapids has no automatic out-of-core fallback (it OOMs), so
-///   the >VRAM regime stays on SCX's native streaming path regardless of whether
-///   rapids is installed.
-/// * ≤VRAM **and** rapids importable → [`AccelRoute::RapidsSinglecell`],
-///   [`FallbackReason::None`].
-/// * ≤VRAM **and** rapids absent → `cpu_route`, [`FallbackReason::NoRapids`]
-///   (the detected-dependency contract, §4.3). The native in-VRAM GPU path is
-///   reachable only via the transitional `SCX_FORCE_NATIVE_GPU` override (wired
-///   in 1.3/1.4), so the default rapids-absent behaviour is a CPU fallback.
-pub fn plan_rapids_route(
+/// Produced by [`plan_rapids_decision`]; the binding's dispatch site matches
+/// on it to select between the rapids-singlecell handoff, the existing
+/// native/CPU dispatch, and the rapids-absent CPU fallback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RapidsDecision {
+    /// Hand off to rapids-singlecell on this device.
+    Rapids(usize),
+    /// Proceed with the existing native / CPU dispatch unchanged — `device="cpu"`,
+    /// or `SCX_FORCE_NATIVE_GPU=1` selecting the native GPU kernels.
+    Native,
+    /// GPU requested + rapids absent + not forcing native → route CPU and stamp
+    /// `no_rapids` (the binding emits its one-shot diagnostic on this arm).
+    NoRapidsCpu,
+}
+
+/// `SCX_FORCE_NATIVE_GPU` override — keep the native SCX GPU kernels instead of
+/// routing in-VRAM GPU compute to rapids-singlecell. After Phase 3 it pins only
+/// the surviving native paths (streaming preprocess kernels, randomized PCA);
+/// the in-VRAM UMAP / covariance-PCA / CAGRA-kNN kernels it also used to pin were
+/// removed, so for those ops it now falls through to the CPU path.
+pub fn force_native_gpu() -> bool {
+    matches!(std::env::var("SCX_FORCE_NATIVE_GPU"), Ok(v) if v != "0" && !v.is_empty())
+}
+
+/// `SCX_DISABLE_RAPIDS` override — treat rapids-singlecell as if it were not
+/// importable, so a GPU op takes the `no_rapids` CPU-fallback path even on a host
+/// where rapids *is* installed. Exists so the Phase 2.2 fallback gate can exercise
+/// the rapids-absent contract without uninstalling rapids; honored ahead of the
+/// `force_native` override so the fallback (not the native kernels) is what runs.
+pub fn rapids_disabled() -> bool {
+    matches!(std::env::var("SCX_DISABLE_RAPIDS"), Ok(v) if v != "0" && !v.is_empty())
+}
+
+/// Decide how a GPU-eligible in-VRAM op dispatches between rapids-singlecell,
+/// the native path, and the rapids-absent CPU fallback.
+///
+/// Pure given its inputs, so the whole decision matrix — including the
+/// override precedence — is unit-testable without a GPU or a rapids install.
+/// The binding supplies the runtime facts: `gpu_id` from device resolution
+/// (`None` = CPU), the two env overrides (usually [`rapids_disabled`] /
+/// [`force_native_gpu`]), and `rapids_available` as a **lazy** probe — it is
+/// consulted only when the decision actually depends on it, so
+/// `SCX_DISABLE_RAPIDS=1` (or `device="cpu"`) never triggers the rapids
+/// import and the CUDA init it would cause.
+///
+/// Precedence: `rapids_disabled` is honored **ahead of** `force_native`, so
+/// the Phase-2.2 fallback gate pins the `no_rapids` CPU path rather than the
+/// native kernels.
+///
+/// The out-of-VRAM streaming moat never reaches this function: a backed/lazy
+/// `X` stays on the native streaming dispatch, enforced by the caller's
+/// layout check before this decision is consulted.
+pub fn plan_rapids_decision(
+    gpu_id: Option<usize>,
+    rapids_disabled: bool,
+    force_native: bool,
+    rapids_available: impl FnOnce() -> bool,
+) -> RapidsDecision {
+    let Some(gpu_id) = gpu_id else {
+        return RapidsDecision::Native; // device="cpu" → existing CPU path
+    };
+    if rapids_disabled {
+        return RapidsDecision::NoRapidsCpu;
+    }
+    if force_native {
+        return RapidsDecision::Native;
+    }
+    if rapids_available() {
+        RapidsDecision::Rapids(gpu_id)
+    } else {
+        RapidsDecision::NoRapidsCpu
+    }
+}
+
+/// Whether a CUDA GPU is available at runtime (always `false` when this crate
+/// is built without the `gpu` feature). The availability input the exec-info
+/// builders below feed to the planners, shared so each binding does not carry
+/// its own cfg shim.
+pub fn gpu_runtime_available() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_available()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
+
+/// Build the execution info for a CPU DE dispatch via the single planner.
+///
+/// `gpu_eligible` is `false` for layouts the GPU has no kernel for (e.g.
+/// `prefer_format="csc"` → no GPU CSC kernel), so a `device="auto"`/`"gpu"`
+/// request on a GPU host records [`FallbackReason::UnsupportedInputLayout`]
+/// rather than implying CUDA was absent.
+pub fn cpu_exec_info(
     device: DeviceRequest,
-    gpu_available: bool,
-    rapids_available: bool,
-    fits_vram: bool,
-    native_gpu_route: AccelRoute,
+    layout: InputLayout,
+    gpu_eligible: bool,
+    csc_available: bool,
+    chunk_size: Option<usize>,
+) -> AccelExecutionInfo {
+    let mut info = plan_de_route(
+        device,
+        layout,
+        gpu_runtime_available(),
+        gpu_eligible,
+        csc_available,
+    );
+    info.chunk_size = chunk_size;
+    info
+}
+
+/// Build the execution info for an HVG dispatch via the single planner.
+///
+/// `gpu_eligible` is `true` only for the `seurat_v3` flavor family (the one
+/// flavor with a GPU kernel). `csc_available` is `true` when a CSC sidecar is
+/// reachable for a single-batch run, routing GPU to the column-major reduce
+/// (`gpu_csc_v3`) and CPU to `cpu_csc`. The caller passes the validated
+/// device request and the actual flavor/layout so the recorded route matches
+/// the code that ran.
+pub fn hvg_exec_info(
+    device: DeviceRequest,
+    gpu_eligible: bool,
+    csc_available: bool,
+) -> AccelExecutionInfo {
+    plan_hvg_route(device, gpu_runtime_available(), gpu_eligible, csc_available)
+}
+
+/// Build the execution info for a single-route op (PCA / kNN / UMAP / Leiden /
+/// preprocessing) via the generic planner. `gpu_eligible` reflects whether the
+/// op's GPU library was actually usable at dispatch (cuVS / cuML / cuGraph /
+/// cuSPARSE present); `gpu_route` / `cpu_route` are the op's CSR- or
+/// dense-shaped route pair.
+pub fn simple_exec_info(
+    device: DeviceRequest,
+    gpu_eligible: bool,
+    gpu_route: AccelRoute,
     cpu_route: AccelRoute,
 ) -> AccelExecutionInfo {
-    let (route, reason) = match device {
-        DeviceRequest::Cpu => (cpu_route, FallbackReason::UserForcedCpu),
-        DeviceRequest::Gpu | DeviceRequest::Auto => {
-            if !gpu_available {
-                (cpu_route, FallbackReason::NoCuda)
-            } else if !fits_vram {
-                // >VRAM: the streaming moat — rapids OOMs in-VRAM with no
-                // automatic fallback, so stay native-streaming.
-                (native_gpu_route, FallbackReason::None)
-            } else if rapids_available {
-                (AccelRoute::RapidsSinglecell, FallbackReason::None)
-            } else {
-                (cpu_route, FallbackReason::NoRapids)
-            }
-        }
-    };
-    AccelExecutionInfo::new(route, reason)
+    plan_simple_gpu_route(
+        device,
+        gpu_runtime_available(),
+        gpu_eligible,
+        gpu_route,
+        cpu_route,
+    )
+}
+
+/// Build the execution info for a pseudobulk NB-GLM dispatch via
+/// [`plan_nb_glm_route`]. `gpu_eligible` is `false` when the design width or
+/// sample count exceeds the kernel's register bounds (`scx_gpu::GPU_NB_GLM_PMAX`
+/// / `GPU_NB_GLM_NSUB_MAX`) — recorded as `UnsupportedDimensions`. Stage A is
+/// always CSR (host-fed dense); never a rapids fallback.
+pub fn nb_glm_exec_info(device: DeviceRequest, gpu_eligible: bool) -> AccelExecutionInfo {
+    plan_nb_glm_route(device, gpu_runtime_available(), gpu_eligible)
+}
+
+/// Build the execution info for a CPU-only op that has no GPU kernel at all
+/// (gene-set scoring). `gpu_eligible=false` records `UserForcedCpu` for
+/// `device="cpu"`, `NoCuda` when no GPU is present, and `UnsupportedInputLayout`
+/// for an explicit GPU request on a GPU host — there is no GPU kernel to take.
+pub fn cpu_only_exec_info(device: DeviceRequest) -> AccelExecutionInfo {
+    simple_exec_info(device, false, AccelRoute::CpuCsr, AccelRoute::CpuCsr)
+}
+
+/// Whether a planned route warrants a default-visible GPU→CPU fallback
+/// warning at the binding's dispatch point. Pure (no binding types) so it is
+/// unit-testable and shared.
+///
+/// True only when the user **explicitly** asked for a GPU (`"gpu"` / `"gpu:N"`,
+/// not `"auto"` — `auto`→CPU on a CPU host is expected), the planned route is a
+/// CPU route, and the reason is a GPU-was-unusable reason. `NoRapids` is excluded
+/// (the rapids path already emits its own richer one-shot warning); `UserForcedCpu`
+/// / `None` / `NoCscSidecar` (still a GPU route) are not fallbacks worth warning
+/// about. Note device resolution already hard-errors an explicit `device="gpu"`
+/// when no CUDA GPU is present, so in practice this fires for
+/// GPU-present-but-unsupported-layout/-dimensions cases.
+pub fn should_warn_gpu_fallback(device: &str, info: &AccelExecutionInfo) -> bool {
+    // Negative match (forward-compatible): a *new* `FallbackReason` variant
+    // warns by default rather than silently passing through. The excluded
+    // reasons are the non-fallbacks: `None` (took the GPU), `UserForcedCpu`
+    // (the user asked for CPU), `NoRapids` (the rapids path emits its own
+    // richer one-shot warning), and `NoCscSidecar` (still a GPU route —
+    // CSR-direct instead of CSC-direct).
+    device.starts_with("gpu")
+        && !info.route.is_gpu()
+        && !matches!(
+            info.fallback_reason,
+            FallbackReason::None
+                | FallbackReason::UserForcedCpu
+                | FallbackReason::NoRapids
+                | FallbackReason::NoCscSidecar
+        )
 }
 
 /// Convenience wrapper over [`plan_de_route`] that reads CSC capability from a
@@ -563,469 +802,5 @@ pub fn plan_de_route_from_source(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `plan_de_route_from_source` reads CSC capability from the source's
-    /// `available_layouts()` (not a separate flag). Asserts only
-    /// `csc_available`, which `plan_de_route` sets unconditionally — so the
-    /// test is independent of whether the host happens to have CUDA.
-    #[cfg(feature = "gpu")]
-    #[test]
-    fn plan_from_source_reads_csc_capability() {
-        use scx_gpu::{GpuMatrixSource, LayoutSet};
-
-        struct FakeSource(LayoutSet);
-        impl GpuMatrixSource for FakeSource {
-            fn shape(&self) -> (usize, usize) {
-                (100, 50)
-            }
-            fn available_layouts(&self) -> LayoutSet {
-                self.0
-            }
-        }
-
-        let csr_only = FakeSource(LayoutSet::CSR);
-        let info = plan_de_route_from_source(DeviceRequest::Gpu, &csr_only, InputLayout::BackedCsr);
-        assert_eq!(info.csc_available, Some(false));
-
-        let with_csc = FakeSource(LayoutSet::CSR | LayoutSet::CSC);
-        let info = plan_de_route_from_source(DeviceRequest::Gpu, &with_csc, InputLayout::BackedCsc);
-        assert_eq!(info.csc_available, Some(true));
-    }
-
-    #[test]
-    fn dense_never_routes_to_csc() {
-        // Dense host on GPU → CSR-direct v3 (the entry point densifies to CSR),
-        // never CSC, even with the csc flag on.
-        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::DenseHost, true, true, true);
-        assert_eq!(info.route, AccelRoute::GpuCsrV3);
-        assert_ne!(info.route, AccelRoute::GpuCscV3);
-
-        // Dense host on CPU → cpu_dense.
-        let info = plan_de_route(
-            DeviceRequest::Cpu,
-            InputLayout::DenseHost,
-            true,
-            true,
-            false,
-        );
-        assert_eq!(info.route, AccelRoute::CpuDense);
-    }
-
-    #[test]
-    fn in_memory_csr_is_csr_direct_not_csc() {
-        // In-memory CSR has no CSC sidecar: v3 CSR-direct.
-        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::CsrHost, true, true, false);
-        assert_eq!(info.route, AccelRoute::GpuCsrV3);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCscSidecar);
-    }
-
-    #[test]
-    fn backed_csc_with_sidecar_is_csc_direct() {
-        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::BackedCsc, true, true, true);
-        assert_eq!(info.route, AccelRoute::GpuCscV3);
-        assert_eq!(info.fallback_reason, FallbackReason::None);
-        assert_eq!(info.csc_available, Some(true));
-    }
-
-    #[test]
-    fn lazy_csr_falls_back_to_csr_direct() {
-        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::LazyCsr, true, true, false);
-        assert_eq!(info.route, AccelRoute::GpuCsrV3);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCscSidecar);
-    }
-
-    #[test]
-    fn backed_csr_without_csc_falls_back() {
-        // A backed CSR reader with no CSC sidecar → CSR-direct.
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::BackedCsr,
-            true,
-            true,
-            false,
-        );
-        assert_eq!(info.route, AccelRoute::GpuCsrV3);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCscSidecar);
-    }
-
-    #[test]
-    fn forced_cpu_records_user_forced() {
-        let info = plan_de_route(DeviceRequest::Cpu, InputLayout::BackedCsr, true, true, true);
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    }
-
-    #[test]
-    fn no_cuda_auto_records_no_cuda_and_cpu_route() {
-        let info = plan_de_route(
-            DeviceRequest::Auto,
-            InputLayout::BackedCsc,
-            false,
-            true,
-            true,
-        );
-        assert!(!info.route.is_gpu());
-        assert_eq!(info.route, AccelRoute::CpuCsc);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
-    }
-
-    #[test]
-    fn gpu_present_but_layout_ineligible_records_unsupported_layout() {
-        // prefer_format="csc" on a GPU host: GPU is available but there is no
-        // GPU CSC kernel, so dispatch runs CPU CSC. The reason must be the
-        // layout, not NoCuda (CUDA is present) or UserForcedCpu (user asked
-        // for gpu/auto). This is the case `finalize_exec_info` used to infer.
-        for device in [DeviceRequest::Gpu, DeviceRequest::Auto] {
-            let info = plan_de_route(
-                device,
-                InputLayout::BackedCsc,
-                true,  // gpu_available
-                false, // gpu_eligible — no GPU CSC kernel
-                true,  // csc_available
-            );
-            assert!(!info.route.is_gpu());
-            assert_eq!(info.route, AccelRoute::CpuCsc);
-            assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
-            assert_eq!(info.csc_available, Some(true));
-        }
-    }
-
-    #[test]
-    fn sparse_gpu_is_unconditionally_v3() {
-        // After the V1b default-flip the planner has no v2/v1 GPU route for
-        // sparse inputs: CSC sidecar → CSC-direct, otherwise CSR-direct.
-        let info = plan_de_route(DeviceRequest::Gpu, InputLayout::BackedCsc, true, true, true);
-        assert_eq!(info.route, AccelRoute::GpuCscV3);
-        let info = plan_de_route(
-            DeviceRequest::Gpu,
-            InputLayout::BackedCsr,
-            true,
-            true,
-            false,
-        );
-        assert_eq!(info.route, AccelRoute::GpuCsrV3);
-    }
-
-    #[test]
-    fn nb_glm_gpu_eligible_routes_to_gpu_csr() {
-        for device in [DeviceRequest::Gpu, DeviceRequest::Auto] {
-            let info = plan_nb_glm_route(device, true, true);
-            assert_eq!(info.route, AccelRoute::GpuNbGlmCsr);
-            assert!(info.route.is_gpu());
-            assert_eq!(info.fallback_reason, FallbackReason::None);
-        }
-    }
-
-    #[test]
-    fn nb_glm_forced_cpu_records_user_forced() {
-        let info = plan_nb_glm_route(DeviceRequest::Cpu, true, true);
-        assert_eq!(info.route, AccelRoute::CpuNbGlm);
-        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    }
-
-    #[test]
-    fn nb_glm_no_cuda_falls_back_to_cpu() {
-        let info = plan_nb_glm_route(DeviceRequest::Auto, false, true);
-        assert_eq!(info.route, AccelRoute::CpuNbGlm);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
-    }
-
-    #[test]
-    fn nb_glm_ineligible_dims_fall_back_to_cpu() {
-        // p / n_sub beyond the kernel register bounds → CPU, not NoCuda.
-        let info = plan_nb_glm_route(DeviceRequest::Gpu, true, false);
-        assert_eq!(info.route, AccelRoute::CpuNbGlm);
-        assert_eq!(info.fallback_reason, FallbackReason::UnsupportedDimensions);
-        // NB-GLM is native — never a rapids fallback.
-        assert_ne!(info.fallback_reason, FallbackReason::NoRapids);
-    }
-
-    #[test]
-    fn route_strings_are_stable() {
-        assert_eq!(AccelRoute::GpuCscV3.as_str(), "gpu_csc_v3");
-        assert_eq!(AccelRoute::CpuCsr.as_str(), "cpu_csr");
-        // The fused device-resident pipeline route string is a wire contract:
-        // the accel_pipeline residency benchmark's `pipeline_route_gpu_correct`
-        // gate (V3 task 2.7) matches on exactly this value.
-        assert_eq!(
-            AccelRoute::GpuDeviceResident.as_str(),
-            "gpu_device_resident"
-        );
-        assert_eq!(FallbackReason::NoCscSidecar.as_str(), "no_csc_sidecar");
-        assert_eq!(FallbackReason::None.as_str(), "none");
-        // Wire contracts: the rapids route + no_rapids reason are matched by
-        // the `*_route_rapids_correct` gates.
-        assert_eq!(
-            AccelRoute::RapidsSinglecell.as_str(),
-            "rapids_singlecell_gpu"
-        );
-        assert!(AccelRoute::RapidsSinglecell.is_gpu());
-        assert_eq!(FallbackReason::NoRapids.as_str(), "no_rapids");
-        // Read back out of `uns["scx_accel"]["to_gpu_anndata"]` by
-        // `pyscx/tests/test_gpu_device_handoff.py`.
-        assert_eq!(
-            FallbackReason::GpuRuntimeError.as_str(),
-            "gpu_runtime_error"
-        );
-    }
-
-    /// No two reasons may serialise to the same string: the value is what a
-    /// gate and a user branch on, so a collision would make two different
-    /// diagnoses indistinguishable on the wire.
-    #[test]
-    fn fallback_reason_strings_are_distinct() {
-        let all = [
-            FallbackReason::None,
-            FallbackReason::NoCuda,
-            FallbackReason::NoCscSidecar,
-            FallbackReason::UnsupportedDimensions,
-            FallbackReason::UnsupportedInputLayout,
-            FallbackReason::UserForcedCpu,
-            FallbackReason::PerfPolicy,
-            FallbackReason::NoRapids,
-            FallbackReason::GpuRuntimeError,
-        ];
-        let mut seen = std::collections::HashSet::new();
-        for r in all {
-            assert!(seen.insert(r.as_str()), "duplicate string for {r:?}");
-        }
-    }
-
-    /// A runtime fallback is never a *planned* route: every planner decides
-    /// from pre-flight facts only, and this reason is recorded after the fact
-    /// by the op that survived. If a planner ever starts returning it, the
-    /// contract in its doc comment (and this test) needs revisiting.
-    #[test]
-    fn no_planner_returns_the_runtime_reason() {
-        for device in [DeviceRequest::Cpu, DeviceRequest::Gpu, DeviceRequest::Auto] {
-            for gpu_available in [false, true] {
-                for gpu_eligible in [false, true] {
-                    for csc_available in [false, true] {
-                        for layout in [
-                            InputLayout::DenseHost,
-                            InputLayout::CsrHost,
-                            InputLayout::BackedCsr,
-                            InputLayout::BackedCsc,
-                            InputLayout::LazyCsr,
-                        ] {
-                            let info = plan_de_route(
-                                device,
-                                layout,
-                                gpu_available,
-                                gpu_eligible,
-                                csc_available,
-                            );
-                            assert_ne!(info.fallback_reason, FallbackReason::GpuRuntimeError);
-                        }
-                        let info =
-                            plan_hvg_route(device, gpu_available, gpu_eligible, csc_available);
-                        assert_ne!(info.fallback_reason, FallbackReason::GpuRuntimeError);
-                    }
-                    let info = plan_nb_glm_route(device, gpu_available, gpu_eligible);
-                    assert_ne!(info.fallback_reason, FallbackReason::GpuRuntimeError);
-                }
-            }
-        }
-    }
-
-    // --- rapids router (plan_rapids_route) ---
-
-    #[test]
-    fn rapids_in_vram_with_rapids_routes_to_rapids() {
-        for device in [DeviceRequest::Gpu, DeviceRequest::Auto] {
-            let info = plan_rapids_route(
-                device,
-                true, // gpu_available
-                true, // rapids_available
-                true, // fits_vram
-                AccelRoute::GpuCsr,
-                AccelRoute::CpuCsr,
-            );
-            assert_eq!(info.route, AccelRoute::RapidsSinglecell);
-            assert_eq!(info.fallback_reason, FallbackReason::None);
-        }
-    }
-
-    #[test]
-    fn rapids_in_vram_without_rapids_falls_back_to_cpu() {
-        // ≤VRAM but rapids absent → CPU fallback with no_rapids (the §4.3
-        // detected-dependency contract). The native in-VRAM path is reachable
-        // only via the transitional override, wired later.
-        let info = plan_rapids_route(
-            DeviceRequest::Gpu,
-            true,
-            false, // rapids_available
-            true,  // fits_vram
-            AccelRoute::GpuCsr,
-            AccelRoute::CpuCsr,
-        );
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::NoRapids);
-    }
-
-    #[test]
-    fn rapids_over_vram_stays_native_streaming() {
-        // >VRAM: rapids OOMs with no auto-fallback, so the streaming moat keeps
-        // the native GPU route regardless of whether rapids is installed.
-        for rapids in [true, false] {
-            let info = plan_rapids_route(
-                DeviceRequest::Auto,
-                true,
-                rapids,
-                false, // !fits_vram → >VRAM
-                AccelRoute::GpuCsr,
-                AccelRoute::CpuCsr,
-            );
-            assert_eq!(info.route, AccelRoute::GpuCsr);
-            assert_eq!(info.fallback_reason, FallbackReason::None);
-        }
-    }
-
-    #[test]
-    fn rapids_no_cuda_records_no_cuda() {
-        let info = plan_rapids_route(
-            DeviceRequest::Auto,
-            false, // gpu_available
-            true,
-            true,
-            AccelRoute::GpuCsr,
-            AccelRoute::CpuCsr,
-        );
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
-    }
-
-    #[test]
-    fn rapids_forced_cpu_records_user_forced() {
-        let info = plan_rapids_route(
-            DeviceRequest::Cpu,
-            true,
-            true,
-            true,
-            AccelRoute::GpuCsr,
-            AccelRoute::CpuCsr,
-        );
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    }
-
-    // --- HVG planner (plan_hvg_route) ---
-
-    #[test]
-    fn hvg_gpu_seurat_v3_is_gpu_csr() {
-        // seurat_v3 on a GPU host → the atomic-CSR GPU kernel.
-        let info = plan_hvg_route(DeviceRequest::Gpu, true, true, false);
-        assert_eq!(info.route, AccelRoute::GpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::None);
-        assert!(info.route.is_gpu());
-    }
-
-    #[test]
-    fn hvg_cpu_forced_records_user_forced() {
-        let info = plan_hvg_route(DeviceRequest::Cpu, true, true, false);
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    }
-
-    #[test]
-    fn hvg_no_cuda_records_no_cuda() {
-        let info = plan_hvg_route(DeviceRequest::Auto, false, true, false);
-        assert!(!info.route.is_gpu());
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
-    }
-
-    #[test]
-    fn hvg_seurat_flavor_ineligible_on_gpu() {
-        // A non-seurat_v3 flavor on a GPU host: GPU present but no kernel.
-        let info = plan_hvg_route(DeviceRequest::Gpu, true, false, false);
-        assert!(!info.route.is_gpu());
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
-    }
-
-    #[test]
-    fn hvg_csc_ineligible_flavor_is_cpu_csc() {
-        // A CSC sidecar is present but the flavor has no GPU kernel
-        // (gpu_eligible=false): run CPU CSC, record the layout reason.
-        let info = plan_hvg_route(DeviceRequest::Auto, true, false, true);
-        assert_eq!(info.route, AccelRoute::CpuCsc);
-        assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
-        assert_eq!(info.csc_available, Some(true));
-    }
-
-    #[test]
-    fn hvg_gpu_csc_sidecar_is_gpu_csc_v3() {
-        // seurat_v3 on a GPU host with a reachable CSC sidecar → the
-        // column-major CSC reduce route (mirrors DE's gpu_csc_v3).
-        let info = plan_hvg_route(DeviceRequest::Gpu, true, true, true);
-        assert_eq!(info.route, AccelRoute::GpuCscV3);
-        assert_eq!(info.fallback_reason, FallbackReason::None);
-        assert!(info.route.is_gpu());
-        assert_eq!(info.csc_available, Some(true));
-    }
-
-    #[test]
-    fn hvg_cpu_forced_with_sidecar_is_cpu_csc() {
-        let info = plan_hvg_route(DeviceRequest::Cpu, true, true, true);
-        assert_eq!(info.route, AccelRoute::CpuCsc);
-        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    }
-
-    // --- Generic single-route planner (plan_simple_gpu_route) ---
-
-    #[test]
-    fn simple_gpu_auto_runs_gpu() {
-        let info = plan_simple_gpu_route(
-            DeviceRequest::Auto,
-            true,
-            true,
-            AccelRoute::GpuCsr,
-            AccelRoute::CpuCsr,
-        );
-        assert_eq!(info.route, AccelRoute::GpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::None);
-    }
-
-    #[test]
-    fn simple_gpu_lib_missing_is_unsupported_layout() {
-        // CUDA present but the op's GPU library (e.g. cuVS) is unavailable.
-        let info = plan_simple_gpu_route(
-            DeviceRequest::Gpu,
-            true,
-            false,
-            AccelRoute::GpuDense,
-            AccelRoute::CpuDense,
-        );
-        assert_eq!(info.route, AccelRoute::CpuDense);
-        assert_eq!(info.fallback_reason, FallbackReason::UnsupportedInputLayout);
-    }
-
-    #[test]
-    fn simple_no_cuda_records_no_cuda() {
-        let info = plan_simple_gpu_route(
-            DeviceRequest::Auto,
-            false,
-            true,
-            AccelRoute::GpuCsr,
-            AccelRoute::CpuCsr,
-        );
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::NoCuda);
-    }
-
-    #[test]
-    fn simple_forced_cpu() {
-        let info = plan_simple_gpu_route(
-            DeviceRequest::Cpu,
-            true,
-            true,
-            AccelRoute::GpuCsr,
-            AccelRoute::CpuCsr,
-        );
-        assert_eq!(info.route, AccelRoute::CpuCsr);
-        assert_eq!(info.fallback_reason, FallbackReason::UserForcedCpu);
-    }
-}
+#[path = "route_tests.rs"]
+mod tests;

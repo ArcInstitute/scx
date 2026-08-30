@@ -183,3 +183,14 @@ class TestRouteMetadata:
         assert "scx_accel" in adata.uns
         assert "score_genes" in adata.uns["scx_accel"]
         assert adata.uns["scx_accel"]["score_genes"]["route"] == "cpu_csr"
+
+
+class TestDeviceValidation:
+    def test_invalid_device_raises_value_error(self, synthetic_adata):
+        # Round-2 review (codex + Cursor): score_genes previously skipped
+        # resolve_device, so device="tpu" was silently treated as GPU intent
+        # in the route stamp instead of raising like every other accel op.
+        adata = synthetic_adata.copy()
+        with pytest.raises(ValueError, match="unknown device"):
+            pyscx.accel.score_genes(adata, GENES, method="mean", device="tpu")
+        assert "score" not in adata.obs

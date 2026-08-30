@@ -123,6 +123,23 @@ pub enum DispersionMethod {
     CoxReidShrunk,
 }
 
+impl DispersionMethod {
+    /// Parse the user-facing `dispersion=` string — the single vocabulary +
+    /// error text for every binding (the message is pinned by the pyscx test
+    /// suite, which surfaces it as `ValueError`).
+    pub fn parse(dispersion: &str) -> Result<Self, crate::error::InvalidArgument> {
+        match dispersion {
+            "moments" => Ok(DispersionMethod::Moments),
+            "cox_reid_mle" => Ok(DispersionMethod::CoxReidMle),
+            "cox_reid_shrunk" => Ok(DispersionMethod::CoxReidShrunk),
+            other => Err(crate::error::InvalidArgument(format!(
+                "invalid dispersion={other:?}; expected 'moments', \
+                 'cox_reid_mle', or 'cox_reid_shrunk'"
+            ))),
+        }
+    }
+}
+
 /// The hypothesis tested by the Wald step (spec §4.2).
 #[derive(Debug, Clone)]
 pub enum NbGlmContrast {
@@ -219,4 +236,32 @@ pub struct NbGlmResult {
     /// `[n_genes, n_samples]` fitted means if `store_fitted_means`.
     pub fitted_means: Option<Vec<f64>>,
     pub diagnostics: NbGlmDiagnostics,
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::DispersionMethod;
+
+    /// The parse vocabulary and its exact error text are a cross-binding
+    /// contract (pyscx surfaces the message as `ValueError`, rscx as an R
+    /// error) — pinned here so `cargo test -p scx-accel` catches drift.
+    #[test]
+    fn dispersion_method_parse_vocabulary_and_error_text() {
+        assert!(matches!(
+            DispersionMethod::parse("moments"),
+            Ok(DispersionMethod::Moments)
+        ));
+        assert!(matches!(
+            DispersionMethod::parse("cox_reid_mle"),
+            Ok(DispersionMethod::CoxReidMle)
+        ));
+        assert!(matches!(
+            DispersionMethod::parse("cox_reid_shrunk"),
+            Ok(DispersionMethod::CoxReidShrunk)
+        ));
+        assert_eq!(
+            DispersionMethod::parse("typo").unwrap_err().to_string(),
+            "invalid dispersion=\"typo\"; expected 'moments', 'cox_reid_mle', or 'cox_reid_shrunk'"
+        );
+    }
 }
