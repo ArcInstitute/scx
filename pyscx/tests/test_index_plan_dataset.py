@@ -225,6 +225,27 @@ class TestErrorPaths:
             list(ds.iter_with_plans(bad(), lookahead=2))
         assert "plan iterator raised" in str(excinfo.value)
 
+    def test_plan_extraction_failure_names_the_pair_shape(self, scx_path):
+        """A non-plan object from the generator must surface the *pair* arm's
+        extraction diagnostic, not the cell-set one.
+
+        Pinned because ORG-9.10-3 folds the two Python->Rust plan adapters into
+        one generic: the two arms' extraction messages are the only thing that
+        distinguishes them for a user, and nothing asserted either before this.
+        A dedup that collapsed both onto one message would otherwise be silent.
+        """
+        ds = pyscx.IndexPlanDataset(scx_path)
+
+        def bad():
+            yield "not a plan at all"
+
+        with pytest.raises(RuntimeError) as excinfo:
+            list(ds.iter_with_plans(bad(), lookahead=2))
+        msg = str(excinfo.value)
+        assert "plan extraction failed" in msg, msg
+        # The pair arm must NOT borrow the cell-set arm's tuple description.
+        assert "file_ids" not in msg, msg
+
 
 # ---------------------------------------------------------------------------
 # Fork detection

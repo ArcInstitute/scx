@@ -139,6 +139,27 @@ def test_row_out_of_range_raises_indexerror(two_scx):
         list(ds.iter_with_plans(iter([bad])))
 
 
+def test_plan_extraction_failure_names_the_expected_tuple(two_scx):
+    """A plan of the wrong *shape* must name the four-array layout it wanted.
+
+    Pinned because ORG-9.10-3 folds the two Python->Rust plan adapters into one
+    generic. This message is the only thing distinguishing the cell-set arm's
+    diagnostic from the pair arm's, and nothing asserted it before — so a dedup
+    that collapsed both onto pyo3's generic extract error would be silent.
+    """
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    # A two-array plan: the pair arm's shape, not this class's.
+    with pytest.raises(RuntimeError) as excinfo:
+        list(ds.iter_with_plans(iter([([0], [0])])))
+    msg = str(excinfo.value)
+    assert "sparse plan extraction failed" in msg, msg
+    for field in ("file_ids", "rows", "role_tags", "set_offsets"):
+        assert field in msg, f"{field} missing from: {msg}"
+
+
 # --- fork-safety -----------------------------------------------------------
 
 
@@ -539,4 +560,107 @@ def test_block_index_prefetch_skip_is_counted_on_the_sparse_arm(framed_scx):
     )
     assert off["prefetch_tasks_spawned"] > 0, (
         "the default route warms the whole shard, which is a spawned prefetch"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ORG-9.10-4 / the 9b finding: the unframed-file preflight.
+#
+# `IndexPlanDataset` warns when `scatter_block_index=True` meets a file with no
+# row-group-framed shard — the fast path cannot fire, so every batch
+# full-shard-decodes. `SparseCellSetDataset` took the same kwarg and said
+# nothing, so the flag was a silent no-op there and the only way to find out was
+# to read `cache_metrics()["block_index_groups"]` afterwards.
+#
+# The aggregate is deliberately ANY-across-readers, not all: one framed file in
+# the set means the route can fire for that file's rows, so warning would be
+# wrong.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_unframed_scx(synthetic_adata, tmp_dir):
+    """Two all-unframed (v3) files — `row_group_rows=0`.
+
+    Load-bearing: `pyscx.from_anndata` writes `format_version = 4` for every
+    codec, so simply omitting `row_group_rows=` yields a *framed* file and every
+    assertion below would invert. `codec="shufdelta"` refuses `row_group_rows=0`,
+    so this fixture must leave the codec at the default.
+    """
+    import pyscx
+
+    p0 = str(tmp_dir / "u0.scx")
+    p1 = str(tmp_dir / "u1.scx")
+    pyscx.from_anndata(synthetic_adata, p0, row_group_rows=0)
+    pyscx.from_anndata(synthetic_adata, p1, row_group_rows=0)
+    return p0, p1
+
+
+def test_unframed_scatter_emits_preflight_warning(two_unframed_scx):
+    """Opting into the block-index route on an all-unframed set must say so."""
+    import pyscx
+
+    p0, p1 = two_unframed_scx
+    with pytest.warns(UserWarning, match="row-group framed") as rec:
+        ds = pyscx.SparseCellSetDataset([p0, p1], scatter_block_index=True)
+    msg = str(rec[0].message)
+    assert "SparseCellSetDataset" in msg, msg
+    assert "2 files" in msg, f"a multi-file set must be described as such: {msg}"
+    assert "scx optimize" in msg, f"must name the fix: {msg}"
+
+    # Warn-and-continue, never a refusal: it still gathers.
+    plan = ([0, 1], [0, 5], [0, 0], [0, 2])
+    b = next(iter(ds.iter_with_plans(iter([plan]))))
+    assert b["shape"][0] == 2
+    assert ds.cache_metrics()["block_index_groups"] == 0
+    ds.close()
+
+
+def test_unframed_scatter_off_is_silent(two_unframed_scx):
+    """The default (`False`) and an explicit `False` are the intended
+    full-shard path on an unframed file, not a footgun to warn about."""
+    import warnings as _w
+
+    import pyscx
+
+    p0, p1 = two_unframed_scx
+    with _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        pyscx.SparseCellSetDataset([p0, p1]).close()
+        pyscx.SparseCellSetDataset([p0, p1], scatter_block_index=False).close()
+
+
+def test_framed_scatter_has_no_preflight_warning(framed_scx):
+    """The fast path is available, so there is nothing to warn about."""
+    import warnings as _w
+
+    import pyscx
+
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        pyscx.SparseCellSetDataset([framed_scx], scatter_block_index=True).close()
+    assert not [w for w in caught if "row-group framed" in str(w.message)], (
+        [str(w.message) for w in caught]
+    )
+
+
+def test_one_framed_file_in_the_set_suppresses_the_warning(framed_scx,
+                                                           two_unframed_scx):
+    """ANY reader framed, not ALL: the route can still fire for that file's rows.
+
+    This is the assertion that distinguishes the aggregate from a per-reader
+    check — the three tests above all hold under `all()` as well.
+    """
+    import warnings as _w
+
+    import pyscx
+
+    unframed0, _ = two_unframed_scx
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        pyscx.SparseCellSetDataset(
+            [unframed0, framed_scx], scatter_block_index=True
+        ).close()
+    assert not [w for w in caught if "row-group framed" in str(w.message)], (
+        [str(w.message) for w in caught]
     )

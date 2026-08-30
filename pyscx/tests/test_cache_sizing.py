@@ -173,6 +173,71 @@ class TestBudgetReconciliation:
         assert ds.memory_budget()["max_memory_mb"] == 64
 
 
+_BREAKDOWN_KEYS = {
+    "cache_bytes",
+    "batch_buffer_bytes",
+    "lookahead_overhead_bytes",
+    "transient_bytes",
+    "python_overhead_bytes",
+    "total_bytes",
+}
+
+
+class TestMemoryBudgetEnvelope:
+    """Every class that reports a budget reports it in the same envelope.
+
+    ORG-9.10-4: the three `memory_budget()` dicts had an **empty** three-way
+    top-level key intersection. `TrainingDataset` nested the six
+    `BudgetBreakdown` components under `breakdown`, `IndexPlanDataset` spread
+    the same six across the top level, and `SparseCellSetDataset` reported four
+    cache-only keys and no breakdown at all — so no caller could read
+    `total_bytes` off an arbitrary dataset, and the divergence was invisible
+    because nothing tested more than one class's shape.
+
+    Class-specific keys stay class-specific; it is the *breakdown* that must be
+    one thing.
+    """
+
+    def _datasets(self, multishard_path):
+        return {
+            "TrainingDataset": pyscx.TrainingDataset(multishard_path),
+            "IndexPlanDataset": pyscx.IndexPlanDataset(
+                multishard_path, scatter_block_index=False
+            ),
+            "SparseCellSetDataset": pyscx.SparseCellSetDataset([multishard_path]),
+        }
+
+    def test_every_budget_carries_the_same_breakdown(self, multishard_path):
+        for name, ds in self._datasets(multishard_path).items():
+            b = ds.memory_budget()
+            assert "breakdown" in b, (
+                f"{name}.memory_budget() has no 'breakdown' key: {sorted(b)}"
+            )
+            assert set(b["breakdown"]) == _BREAKDOWN_KEYS, (
+                f"{name} breakdown keys: {sorted(b['breakdown'])}"
+            )
+
+    def test_breakdown_components_sum_to_total(self, multishard_path):
+        for name, ds in self._datasets(multishard_path).items():
+            bd = ds.memory_budget()["breakdown"]
+            components = sum(
+                bd[k] for k in _BREAKDOWN_KEYS if k != "total_bytes"
+            )
+            assert components == bd["total_bytes"], name
+            assert all(isinstance(v, int) and v >= 0 for v in bd.values()), name
+
+    def test_python_overhead_is_counted_on_every_path(self, multishard_path):
+        """The 50 MB interpreter/numpy/Arrow constant is not path-specific.
+
+        The sparse loader omitted it entirely — it never built a breakdown — so
+        its reported budget was the only one that pretended the interpreter was
+        free.
+        """
+        for name, ds in self._datasets(multishard_path).items():
+            bd = ds.memory_budget()["breakdown"]
+            assert bd["python_overhead_bytes"] > 0, name
+
+
 class TestCacheSizingWarning:
     """Construction-time warning when the budget cannot afford the cache."""
 

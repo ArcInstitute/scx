@@ -86,6 +86,31 @@ def test_multimodal_dataset_dict_batches(cite_seq_path):
     ds.close()
 
 
+def test_multimodal_close_then_iterate_starts_a_fresh_epoch(cite_seq_path):
+    """`close()` is re-openable here too — the sibling of
+    `TestCloseIsReopenable` in `test_training_loader.py`.
+
+    Asserted nowhere before: all seven `ds.close()` calls in this file are
+    end-of-body teardown. It is the pin for ORG-9.10-4's `closed` getter, which
+    on this class can only mean "torn down right now".
+    """
+    import pyscx
+
+    path, n_obs, _, _ = cite_seq_path
+    ds = pyscx.MultimodalTrainingDataset(
+        path, modalities=["rna", "adt"], batch_size=16, normalize=False,
+        log1p=False, seed=42,
+    )
+
+    def epoch_rows():
+        return sum(b["cell_indices"].shape[0] for b in ds)
+
+    assert epoch_rows() == n_obs
+    ds.close()
+    assert epoch_rows() == n_obs
+    ds.close()
+
+
 def test_multimodal_uniform_batch_across_wide_and_narrow_modalities(tmp_path):
     """Regression: a wide modality (many genes) and a narrow one must not
     desync their per-batch row ordering.

@@ -86,9 +86,19 @@ def test_user_facing_accelerators_have_stubs():
 # fine, which is what makes the drift invisible. `close()` / `closed` reached
 # `__init__.pyi` only because a reviewer noticed; this makes the next one fail
 # a test instead.
+#
+# ORG-9.10-4 widened this from the two plan-driven classes to all four dataset
+# classes. The two training ones were outside it, which is how
+# `MultimodalTrainingDataset` came to have no `__init__.pyi` entry **at all** —
+# not a missing method, the whole class — with a green suite the entire time.
 # ---------------------------------------------------------------------------
 
-_LIFECYCLE_CLASSES = ["IndexPlanDataset", "SparseCellSetDataset"]
+_LIFECYCLE_CLASSES = [
+    "IndexPlanDataset",
+    "SparseCellSetDataset",
+    "TrainingDataset",
+    "MultimodalTrainingDataset",
+]
 
 
 def _class_stub_body(text: str, cls: str) -> str:
