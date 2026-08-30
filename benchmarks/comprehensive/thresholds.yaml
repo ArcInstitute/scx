@@ -1068,6 +1068,44 @@ absolute_floors:
     metric: hvg_route_csc_direct
     min: 1.0
 
+  # --- accel_r_route: rscx route-metadata gate (ORG-10.16-3b) -----------
+  #
+  # The R analogue of the `*_route_*_correct` family above: rscx stamps the
+  # same scx-accel planner record pyscx writes to uns["scx_accel"], and these
+  # floors turn a silent regression in rscx's dispatch or stamping into a
+  # gate failure (rscx has no CI lane, so this local gate is its only
+  # automated signal). `accel_r_route.py` shells `scripts/r_route_probe.R`
+  # into the rscx conda env on synthetic matrices — routing facts are
+  # dataset-independent, so pbmc3k is a scheduling slot, not an input. All
+  # five are deterministic exact-match checks, floored from first principles.
+  # An absent rscx env writes a typed missing result (`no_rscx_env`), which
+  # `check_absolute_floors` skips.
+  - benchmark: accel_r_route
+    format: accel_r_route__rscx_cpu
+    dataset: pbmc3k
+    metric: r_pca_route_cpu_correct
+    min: 1.0
+  - benchmark: accel_r_route
+    format: accel_r_route__rscx_cpu
+    dataset: pbmc3k
+    metric: r_pca_method_arms_correct
+    min: 1.0
+  - benchmark: accel_r_route
+    format: accel_r_route__rscx_cpu
+    dataset: pbmc3k
+    metric: r_wilcoxon_route_cpu_correct
+    min: 1.0
+  - benchmark: accel_r_route
+    format: accel_r_route__rscx_cpu
+    dataset: pbmc3k
+    metric: r_pseudobulk_dex_route_correct
+    min: 1.0
+  - benchmark: accel_r_route
+    format: accel_r_route__rscx_cpu
+    dataset: pbmc3k
+    metric: r_harmony_route_cpu_correct
+    min: 1.0
+
   # (ACC-RUST-OPT-V4 Phase 3.1 removed the device-resident fused
   # `pca_neighbors_umap` native path — it depended on native UMAP — so the
   # `accel_pipeline__pyscx_gpu_resident` route + per-stage correctness floors

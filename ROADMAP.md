@@ -303,7 +303,13 @@ are not exposed in R and are tracked here rather than implemented:
   streaming-convert entry (the `from_*` importers materialize in memory).
 - Grouped-write args (`group_by` / `reference`): R exposes the F2 *reads*
   (`read_group` / `read_reference` / `group_labels`) but not the write side.
-- Accel `device=` selector: `rscx` accelerators are CPU-only.
+- Accel `device=` selector: `rscx` accelerators are CPU-only. (Route *metadata*
+  is no longer a gap: since ORG-10.16-3b every rscx accelerator with a pyscx
+  route stamp records the same `scx-accel` planner record pyscx writes to
+  `uns["scx_accel"]` — `object@misc$scx_accel[[op]]` on Seurat input, a
+  `scx_accel` list element / attribute on matrix input — gated by the
+  `accel_r_route` benchmark floors. The one exception is `scx_pseudobulk`:
+  pyscx stamps no plain `"pseudobulk"` op either, deliberately.)
 - `scx_append(codec=)` accepts `Auto`/explicit only (not the `fast`/`compact`
   intent axis, which is a rewrite-path concern in `scx-ops`).
 - Framing granularity: `from_*` expose `row_group_rows` but hardcode

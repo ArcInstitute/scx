@@ -10,8 +10,13 @@ test_that("scx_harmony_integrate returns list with correct dimensions", {
   expect_type(res, "list")
   expect_named(
     res,
-    c("embeddings", "converged", "n_iterations", "n_clusters", "objective")
+    c("embeddings", "converged", "n_iterations", "n_clusters", "objective",
+      "scx_accel")
   )
+  # Route metadata (ORG-10.16-3b review round 1): pyscx parity — the same
+  # cpu_dense / user_forced_cpu pair pyscx stamps for device="cpu".
+  expect_equal(res$scx_accel$route, "cpu_dense")
+  expect_equal(res$scx_accel$fallback_reason, "user_forced_cpu")
   expect_equal(nrow(res$embeddings), n)
   expect_equal(ncol(res$embeddings), d)
   expect_true(is.logical(res$converged))
@@ -72,6 +77,7 @@ test_that("RunHarmony_scx writes a new reduction onto a Seurat object", {
                        max_iter = 2L, random_state = 0L)
 
   expect_true("harmony" %in% names(obj@reductions))
+  expect_equal(obj@misc$scx_accel[["harmony_integrate"]]$route, "cpu_dense")
   emb <- Embeddings(obj[["harmony"]])
   expect_equal(nrow(emb), n)
   expect_equal(ncol(emb), 10L)

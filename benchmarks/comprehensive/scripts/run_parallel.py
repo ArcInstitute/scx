@@ -87,6 +87,9 @@ BENCHMARK_NAMES = list(ALL_BENCHMARKS)
 _NO_CONVERSION = {
     "write", "parallel_write_scaling", "cell_eval_parity_perf", "accel_de_nb_glm",
     "accel_eval_metrics",
+    # accel_r_route probes rscx route stamps on synthetic matrices built inside
+    # the R subprocess — the scheduled dataset is a slot, not an input.
+    "accel_r_route",
     # grouped_sort makes its own plain .scx in-process (and synthetic datasets
     # self-materialize via _pert_synth) — it must not depend on a Phase-A
     # conversion, which would fail for synthetic datasets that have no on-disk

@@ -151,6 +151,10 @@ ALL_BENCHMARKS: list[str] = [
     # with route correctness, CPU↔GPU concordance, and a pdex_ref anchor. Runs
     # only on synthetic datasets (`nb_glm_synth`). See accel_de_nb_glm.py.
     "accel_de_nb_glm",
+    # rscx accelerator route-metadata gate (ORG-10.16-3b): shells an R probe
+    # into the rscx conda env and floors the stamped routes — the R analogue
+    # of the `*_route_gpu_correct` family. Synthetic in-process fixtures.
+    "accel_r_route",
     # to_gpu_anndata device-decode route + parity.
     # Self-converts the count h5ad to Scx1 and asserts the decode runs
     # fully in VRAM (transfer_mode=scx_device_decode_gpu).

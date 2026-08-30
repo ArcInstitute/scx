@@ -11,6 +11,28 @@
 #' Normalize -> `scx_highly_variable_genes` -> `scx_pca` -> `scx_neighbors`
 #' -> `scx_umap` -> `scx_leiden` -> `scx_rank_genes_groups`.
 #'
+#' @section Route metadata:
+#' Every accelerator with a `pyscx` route stamp records the same record here —
+#' produced by the same `scx-accel` planner, with the same keys (`route`,
+#' `fallback_reason`, `csc_available`, ...). The one exception is
+#' [scx_pseudobulk] (plain aggregation), which records nothing **by design**:
+#' `pyscx` stamps no `"pseudobulk"` op either, and rscx does not invent keys
+#' Python never writes. Where the record lands depends on the input:
+#' on a `Seurat` object it is written to `object@misc$scx_accel[[op]]`
+#' (mirroring `object@misc$pflog`); a matrix-form call returns it as the
+#' `scx_accel` element of the result list, or as the `"scx_accel"` attribute
+#' when the result is a `data.frame` / vector (`scx_rank_genes_groups`,
+#' `scx_pseudobulk_dex`, `scx_nb_glm`, `scx_highly_variable_genes`,
+#' `scx_score_genes`). Note the attribute on `scx_score_genes`'s numeric
+#' vector is visible to `all.equal()` / `testthat::expect_equal()` — compare
+#' scores via `as.numeric()` if you diff against a plain reference vector.
+#' rscx is CPU-only, so routes are `cpu_*` with
+#' `fallback_reason = "user_forced_cpu"` — the pair a `pyscx` call with
+#' `device="cpu"` records (`scx_pseudobulk_dex` stamps
+#' `cpu_nb_glm`/`"none"`, exactly as `pyscx.accel.pseudobulk_dex` does: the
+#' NB-GLM is a first-class native CPU route, not a fallback).
+#' [scx_harmony_integrate] stamps `harmony_integrate` the same way.
+#'
 #' @name scx-accelerators
 NULL
 
@@ -65,6 +87,11 @@ scx_pca <- function(object, assay = NULL, layer = "data", features = NULL,
     assay = assay
   )
   object[[reduction.name]] <- red
+  object@misc$scx_accel[["pca"]] <- res$scx_accel
+  # The solver arm the shared auto rule picked (covariance vs randomized) —
+  # a sibling of the 17-key record, not one of its keys, so Seurat users can
+  # see which solver ran without a second matrix-form call.
+  object@misc$scx_accel[["pca_method"]] <- res$method
   invisible(object)
 }
 
@@ -126,6 +153,7 @@ scx_pflog <- function(object, assay = NULL, layer = "counts",
   object@misc$pflog <- list(
     alpha = res$alpha, pseudocount = res$pseudocount, version = res$version
   )
+  object@misc$scx_accel[["pflog"]] <- res$scx_accel
   invisible(object)
 }
 
@@ -162,6 +190,7 @@ scx_neighbors <- function(object, reduction = "pca", dims = 1:30, k = 20L,
     paste0(graph.name.prefix, "_nn")
   }
   object[[graph.name]] <- g
+  object@misc$scx_accel[["neighbors"]] <- res$scx_accel
   invisible(object)
 }
 
@@ -220,6 +249,7 @@ scx_umap <- function(object, reduction = "pca", dims = 1:30,
     embeddings = um$embeddings, key = reduction.key, assay = assay
   )
   object[[reduction.name]] <- red
+  object@misc$scx_accel[["umap"]] <- um$scx_accel
   invisible(object)
 }
 
@@ -255,6 +285,7 @@ scx_leiden <- function(object, reduction = "pca", dims = 1:30,
   names(clusters) <- rownames(emb)
   object$seurat_clusters <- clusters
   SeuratObject::Idents(object) <- clusters
+  object@misc$scx_accel[["leiden"]] <- res$scx_accel
   invisible(object)
 }
 
@@ -313,7 +344,9 @@ scx_rank_genes_groups <- function(object, group.by = NULL, assay = NULL,
 
   res <- scx_rank_genes(mat, gene_names, labels, reference, log_transformed,
                         rankby_abs = rankby_abs, tie_correct = tie_correct)
-  .scx_de_to_dataframe(res)
+  df <- .scx_de_to_dataframe(res)
+  attr(df, "scx_accel") <- res$scx_accel
+  df
 }
 
 # Internal: flatten the per-group DE lists into one long data.frame.
@@ -403,10 +436,14 @@ scx_highly_variable_genes <- function(object, assay = NULL, layer = "counts",
     row.names = rownames(mat),
     stringsAsFactors = FALSE
   )
-  if (!.is_seurat(object)) return(df)
+  if (!.is_seurat(object)) {
+    attr(df, "scx_accel") <- stats$scx_accel
+    return(df)
+  }
 
   hvg_names <- rownames(mat)[highly_variable]
   SeuratObject::VariableFeatures(object, assay = assay) <- hvg_names
+  object@misc$scx_accel[["highly_variable_genes"]] <- stats$scx_accel
   invisible(object)
 }
 
@@ -471,14 +508,17 @@ scx_score_genes <- function(object, gene_list, method = "control",
     gene_pool_idx <- integer(0)
   }
 
-  scores <- scx_score_genes_matrix(mat, gene_list_idx, gene_pool_idx, method,
-                                   ctrl_size, n_bins, random_state)
+  res <- scx_score_genes_matrix(mat, gene_list_idx, gene_pool_idx, method,
+                                ctrl_size, n_bins, random_state)
+  scores <- res$scores
 
   if (!.is_seurat(object)) {
     names(scores) <- colnames(mat)
+    attr(scores, "scx_accel") <- res$scx_accel
     return(scores)
   }
   object[[score_name]] <- scores
+  object@misc$scx_accel[["score_genes"]] <- res$scx_accel
   invisible(object)
 }
 
@@ -634,7 +674,7 @@ scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
       length(res$skipped), paste(res$skipped, collapse = ", ")), call. = FALSE)
   }
 
-  data.frame(
+  df <- data.frame(
     gene = res$gene,
     baseMean = res$baseMean,
     log2FoldChange = res$log2FoldChange,
@@ -646,6 +686,8 @@ scx_pseudobulk_dex <- function(object, group_by, test_col, reference,
     reference = res$reference,
     stringsAsFactors = FALSE
   )
+  attr(df, "scx_accel") <- res$scx_accel
+  df
 }
 
 #' @describeIn scx-accelerators Direct negative-binomial GLM on a pre-aggregated
@@ -677,7 +719,7 @@ scx_nb_glm <- function(counts, design, contrast = NULL, size_factors = NULL,
   res <- scx_nb_glm_matrix(counts, design, contrast, size_factors, gene_names,
                            dispersion, cooks_filtering, independent_filtering)
 
-  data.frame(
+  df <- data.frame(
     gene = res$gene,
     baseMean = res$baseMean,
     log2FoldChange = res$log2FoldChange,
@@ -689,4 +731,6 @@ scx_nb_glm <- function(counts, design, contrast = NULL, size_factors = NULL,
     converged = res$converged,
     stringsAsFactors = FALSE
   )
+  attr(df, "scx_accel") <- res$scx_accel
+  df
 }
