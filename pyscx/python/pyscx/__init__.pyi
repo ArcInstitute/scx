@@ -130,10 +130,12 @@ class IndexPlanDataset:
         `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`."""
         ...
 
-    def memory_budget(self) -> dict[str, int]:
-        """Per-component budget breakdown from the construction auto-tune,
-        plus `max_memory_mb` (the resolved value in force — adaptive when the
-        constructor was passed none), `effective_cache_shards`, and
+    def memory_budget(self) -> dict[str, Any]:
+        """`breakdown` — the six-key per-component estimate from the
+        construction auto-tune, in the shape every class that reports a budget
+        uses — plus
+        `max_memory_mb` (the resolved value in force, adaptive when the
+        constructor was passed none), `effective_cache_shards` and
         `effective_lookahead`."""
         ...
 
@@ -218,8 +220,10 @@ class SparseCellSetBatchIter:
 
         ``prefetch["prefetch_skipped_block_index"]`` counts the L2
         *prefetch-time* decision: shards left undecoded so the gather could
-        take the block-index path. It stays 0 against an unframed file, where
-        the kwarg is a silent no-op. It is **not** interchangeable with
+        take the block-index path. It stays 0 against an unframed file — and
+        constructing one *with* ``scatter_block_index=True`` also emits a
+        preflight ``UserWarning``, though this class defaults that kwarg off, so
+        the default path is silent. It is **not** interchangeable with
         ``cache_metrics()["block_index_groups"]``, which is the route the
         gather took — at ``lookahead=0`` no prefetch runs, so every counter
         here is 0 while ``block_index_groups`` is positive."""
@@ -331,35 +335,45 @@ class SparseCellSetDataset:
         `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups` — the
         multi-file sibling of `IndexPlanDataset.cache_metrics`.
 
-        The last two report which scattered-read route the gathers took. They
-        matter because there is still no preflight warning on this class, so
-        `scatter_block_index=True` against a file with no row-group-framed
-        shards is a silent no-op; `block_index_groups > 0` proves the row-group
-        path ran and remains the authority on which route was taken. The
+        The last two report which scattered-read route the gathers took.
+        `block_index_groups > 0` proves the row-group path ran and remains the
+        authority on which route was taken. Opening an all-unframed set with
+        `scatter_block_index=True` warns at construction; the warning's
+        *absence* establishes only that at least one file is framed, never that
+        a gather took the route. The
         prefetcher's own decisions are visible separately, via
         `SparseCellSetBatchIter.metrics()["prefetch"]`."""
         ...
 
-    def memory_budget(self) -> dict[str, int]:
-        """Resolved shard-cache budget: `max_memory_mb` (the value in force —
-        adaptive when the constructor was passed none), `cache_shards`,
-        `affordable_cache_shards`, `shard_decoded_bytes`.
+    def memory_budget(self) -> dict[str, Any]:
+        """Resolved shard-cache budget: `breakdown` (the six-key
+        `BudgetBreakdown` every class that reports a budget uses), plus `max_memory_mb`
+        (the value in force — adaptive when the constructor was passed none),
+        `cache_shards`, `effective_cache_shards` and `shard_decoded_bytes`.
 
-        Unlike `IndexPlanDataset.memory_budget` there is no batch-buffer term:
-        on the sparse path the shard cache *is* the budget."""
+        Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
+        breakdown: on the sparse path the shard cache *is* the budget, so there
+        is no batch-buffer or plan-tuple term. `total_bytes` can exceed
+        `max_memory_mb` here — the auto-tune does not yet count the interpreter
+        constant this reports (ORG-9.10-5)."""
         ...
 
     def suggested_cache_shards(
-        self, file_ids: Sequence[int], rows: Sequence[int]
+        self,
+        plan: tuple[
+            Sequence[int], Sequence[int], Sequence[int], Sequence[int]
+        ],
     ) -> int:
         """Distinct ``(file_id, shard)`` pairs a plan touches — the
         `cache_shards` that would let the whole batch stay resident.
 
-        `file_ids` and `rows` are the first two elements of the plan tuple
-        `iter_with_plans` consumes. Pure index arithmetic: no I/O, no decode::
+        Takes one plan in the same `(file_ids, rows, role_tags, set_offsets)`
+        shape `iter_with_plans` consumes; the last two are ignored (and not
+        even converted). A tuple of the wrong arity raises `ValueError`. Pure
+        index arithmetic: no I/O, no decode::
 
             probe = pyscx.SparseCellSetDataset(paths)
-            need = max(probe.suggested_cache_shards(f, r) for f, r, _, _ in plans[:64])
+            need = max(probe.suggested_cache_shards(p) for p in plans[:64])
             ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
         """
         ...
@@ -420,10 +434,102 @@ class TrainingDataset:
     @property
     def effective_batch_size(self) -> int: ...
 
+    @property
+    def closed(self) -> bool:
+        """True from `close()` until the next `__iter__` rebuilds.
+
+        Deliberately not the terminal flag `IndexPlanDataset.closed` is — see
+        `close()`. Never raises.
+        """
+        ...
+
     def __iter__(self) -> "TrainingDataset": ...
     def __next__(self) -> _TrainingBatchDict: ...
-    def memory_budget(self) -> dict[str, Any]: ...
-    def close(self) -> None: ...
+
+    def memory_budget(self) -> dict[str, Any]:
+        """Memory budget diagnostics.
+
+        `breakdown` is the six-key `BudgetBreakdown` every class that reports a
+        budget uses (`cache_bytes`, `batch_buffer_bytes`,
+        `lookahead_overhead_bytes`, `transient_bytes`, `python_overhead_bytes`,
+        `total_bytes`); alongside it are this class's own
+        `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`,
+        `mmap_mb` and `budget_exceeded`. `mmap_mb` is reported here and nowhere
+        else: the plan-driven loaders treat page cache as evictable and exclude
+        it from their budgets.
+        """
+        ...
+
+    def close(self) -> None:
+        """Shut the pipeline down: join the I/O + decode threads and release the
+        rayon pool, with the GIL detached.
+
+        Idempotent, and **not** terminal — unlike `IndexPlanDataset.close()`,
+        the next `__iter__` rebuilds the pool and starts a fresh epoch, because
+        this class's pool and runtime are per-epoch anyway.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+
+class MultimodalTrainingDataset:
+    """Sequential streaming dataset over several modalities of one SCX file.
+
+    One `TrainingPipeline` per requested modality, iterated in lockstep: each
+    batch carries the same `cell_indices` row ordering across modalities, and
+    the wrapper raises `RuntimeError` if the per-modality shufflers diverge
+    (usually a file-construction bug — differing shard layouts).
+
+    Transforms are ON by default, exactly as on `TrainingDataset`: pass
+    `normalize=False, log1p=False` for raw counts.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        modalities: Sequence[str],
+        batch_size: int | None = None,
+        hvg_indices: Sequence[int] | np.ndarray | None = None,
+        obs_columns: list[str] | None = None,
+        return_dict: bool | None = None,
+        normalize: bool | None = None,  # default True — see class docstring
+        log1p: bool | None = None,  # default True — see class docstring
+        target_sum: float | None = None,
+        pflog: bool | None = None,
+        pflog_alpha: float | None = None,
+        shard_group_size: int | None = None,
+        prefetch_batches: int | None = None,
+        seed: int | None = None,
+        max_memory_mb: int | None = None,
+    ) -> None: ...
+
+    @property
+    def n_obs(self) -> int: ...
+    @property
+    def n_vars(self) -> dict[str, int]:
+        """Per-modality gene counts, keyed by modality name."""
+        ...
+
+    @property
+    def modality_names(self) -> list[str]: ...
+    @property
+    def closed(self) -> bool:
+        """True from `close()` until the next `__iter__` rebuilds. Never raises."""
+        ...
+
+    def __iter__(self) -> "MultimodalTrainingDataset": ...
+    def __next__(self) -> Any:
+        """A dict `{"X": {modality: ndarray}, "obs": {...}, "cell_indices": ...}`
+        when built with `return_dict=True` (the default), else a tuple of the
+        per-modality X arrays."""
+        ...
+
+    def close(self) -> None:
+        """Shut every modality's pipeline down, GIL detached. Idempotent, and
+        **not** terminal — see `TrainingDataset.close`."""
+        ...
+
     def __repr__(self) -> str: ...
 
 

@@ -100,7 +100,10 @@ pub struct SparseCellSetLoader {
     /// Requested shard-cache count cap.
     cache_shards: usize,
     /// `min(cache_shards, budget / avg_shard)` — the count that is actually
-    /// resident-capable, i.e. **the binding constraint**. `cache_shards` alone is
+    /// resident-capable, i.e. **the binding constraint**. Surfaced through
+    /// [`Self::effective_cache_shards`] and reported as `effective_cache_shards`,
+    /// the name the paired loader uses for the same quantity; the field keeps
+    /// the more descriptive spelling. `cache_shards` alone is
     /// misleading on a large-shard file where the byte budget binds first, which
     /// is exactly the STATE3 regime this loader targets.
     affordable_cache_shards: usize,
@@ -171,9 +174,9 @@ impl SparseCellSetLoader {
     /// `scatter_block_index` is a pure pass-through to
     /// [`PrefetchEngine::from_scx_readers`] — deliberately not stored, because
     /// the flag's only consumer is the reader it is set on, and a second copy
-    /// here could disagree with it. `SparseCellSetDataset` passes `false`; see
-    /// that constructor for why the cell-set regime wants the full-shard
-    /// warm+cache path.
+    /// here could disagree with it. `SparseCellSetDataset` *defaults* it to
+    /// `false` and passes the caller's kwarg; see that constructor for why the
+    /// cell-set regime wants the full-shard warm+cache path by default.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         scx_readers: Vec<ScxReader>,
@@ -337,6 +340,33 @@ impl SparseCellSetLoader {
         self.shard_decoded_bytes
     }
 
+    /// Per-component memory estimate, in the one shape every class that reports
+    /// a budget uses (ORG-9.10-4; `MultimodalTrainingDataset` reports none).
+    ///
+    /// Only two terms are non-zero, and that is the model, not an omission: the
+    /// shard cache **is** this loader's budget — there is no batch buffer,
+    /// no plan-tuple staging and no per-batch obs scratch on the gather path —
+    /// plus the interpreter/numpy/Arrow constant every path pays.
+    ///
+    /// ⚠️ The constant is reported but **not** yet subtracted from the budget:
+    /// [`Self::new`] passes `non_cache_bytes: 0` to
+    /// [`crate::budget::assess_cache_sizing`], so `total_bytes` here can exceed
+    /// `cache_bytes_budget` — which it cannot on `IndexPlanLoader`, whose tuner
+    /// counts the same term. That is the tuner disagreeing with the report, and
+    /// it is what ORG-9.10-5's single `BudgetModel` exists to remove; changing
+    /// the tuner would move a user-visible warning threshold and does not belong
+    /// in a surface change.
+    pub fn budget_breakdown(&self) -> crate::budget::BudgetBreakdown {
+        crate::budget::BudgetBreakdown::new(
+            self.affordable_cache_shards
+                .saturating_mul(self.shard_decoded_bytes),
+            0,
+            0,
+            0,
+            crate::budget::PYTHON_OVERHEAD_BYTES,
+        )
+    }
+
     /// Total CSR shards across every file — the cap on distinct entries in the
     /// shared cache, which is keyed `(file_id, shard)`.
     pub fn total_shards(&self) -> usize {
@@ -371,6 +401,16 @@ impl SparseCellSetLoader {
     /// Number of readers (`file_id` range).
     pub fn n_files(&self) -> usize {
         self.engine.n_readers()
+    }
+
+    /// True if any file in the set has a row-group-framed CSR shard.
+    ///
+    /// The multi-file sibling of [`crate::IndexPlanLoader::any_shard_framed`],
+    /// and the same consumer: the Python constructor warns when the caller
+    /// asked for `scatter_block_index=True` against a set where the route can
+    /// never fire.
+    pub fn any_shard_framed(&self) -> bool {
+        self.engine.any_shard_framed()
     }
 
     /// Shared handle to the readers' one `SharedShardCache` counters

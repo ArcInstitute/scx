@@ -110,6 +110,9 @@ use scx_format_io::ScxReader;
 pub struct TrainingDataset {
     pipeline: TrainingPipeline,
     epoch_started: bool,
+    /// `close()` was the last lifecycle action — see the `closed` getter. Not a
+    /// terminal state on this class: `__iter__` clears it and rebuilds.
+    closed: bool,
     /// PID at construction time — used to detect forking (num_workers > 0).
     creation_pid: u32,
 }
@@ -243,16 +246,22 @@ impl TrainingDataset {
         Ok(TrainingDataset {
             pipeline,
             epoch_started: false,
+            closed: false,
             creation_pid: std::process::id(),
         })
     }
 
     /// Start a new epoch. Called automatically by `for batch in dataset`.
+    ///
+    /// Legal after `close()` — that is the difference from the two plan-driven
+    /// classes, whose `close()` is terminal. `start_epoch` rebuilds the rayon
+    /// pool through `ensure_decode_pool`, so this clears `closed`.
     fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
         slf.pipeline
             .start_epoch()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         slf.epoch_started = true;
+        slf.closed = false;
         Ok(slf)
     }
 
@@ -365,6 +374,20 @@ impl TrainingDataset {
     /// (where `Drop`'s GIL probe might still be too late).
     fn close(&mut self, py: Python<'_>) {
         py.detach(|| self.pipeline.shutdown());
+        self.closed = true;
+    }
+
+    /// True from [`Self::close`] until the next `__iter__` rebuilds. Never raises.
+    ///
+    /// Deliberately **not** the terminal flag `IndexPlanDataset.closed` is.
+    /// `close()` on this class releases the rayon pool and joins the epoch
+    /// threads, and the next `__iter__` builds them again — so the honest
+    /// reading is "torn down right now", not "unusable from here on". It cannot
+    /// be derived from pipeline state either: a freshly constructed dataset has
+    /// no pool yet and would report `True` before it had ever been closed.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed
     }
 
     fn __repr__(&self) -> String {
@@ -535,6 +558,9 @@ pub struct MultimodalTrainingDataset {
     /// True → batches are dicts. False → batches are tuples of X arrays.
     return_dict: bool,
     epoch_started: bool,
+    /// `close()` was the last lifecycle action — see the `closed` getter.
+    /// Not terminal here either: `__iter__` clears it and rebuilds.
+    closed: bool,
     creation_pid: u32,
 }
 
@@ -804,16 +830,20 @@ impl MultimodalTrainingDataset {
             modality_names: names,
             return_dict: return_dict.unwrap_or(true),
             epoch_started: false,
+            closed: false,
             creation_pid: std::process::id(),
         })
     }
 
+    /// Start a new epoch across every modality. Legal after `close()` — see
+    /// [`TrainingDataset::__iter__`].
     fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
         for p in slf.pipelines.iter_mut() {
             p.start_epoch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         slf.epoch_started = true;
+        slf.closed = false;
         Ok(slf)
     }
 
@@ -922,12 +952,28 @@ impl MultimodalTrainingDataset {
             .collect()
     }
 
+    /// Shut every modality's pipeline down, GIL detached. Idempotent, and — as
+    /// on [`TrainingDataset`] — **not** terminal: the next `__iter__` rebuilds.
     fn close(&mut self, py: Python<'_>) {
         py.detach(|| {
             for p in self.pipelines.iter_mut() {
                 p.shutdown();
             }
         });
+        self.closed = true;
+    }
+
+    /// True from [`Self::close`] until the next `__iter__` rebuilds. Never raises.
+    ///
+    /// Deliberately **not** the terminal flag `IndexPlanDataset.closed` is.
+    /// `close()` on this class releases the rayon pool and joins the epoch
+    /// threads, and the next `__iter__` builds them again — so the honest
+    /// reading is "torn down right now", not "unusable from here on". It cannot
+    /// be derived from pipeline state either: a freshly constructed dataset has
+    /// no pool yet and would report `True` before it had ever been closed.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed
     }
 
     fn __repr__(&self) -> String {
@@ -1250,30 +1296,12 @@ impl IndexPlanDataset {
             warn_hvg_panel(py, "IndexPlanDataset", &v)?;
         }
 
-        // Preflight: the scattered block-index fast path can only fire on
-        // row-group-framed shards, and only when the process-global switch is on
-        // (`SCX_SCATTER_BLOCK_INDEX`). If the caller asked for it (default), the
-        // switch is enabled, but the file is an all-unframed legacy layout, every
-        // batch full-shard-decodes with no other signal — warn loudly and point
-        // at the reframe command. When the switch is off, reframing can't enable
-        // the path, so there is nothing to warn about.
-        // (One-shot per path: Python's default warning filter dedupes per call
-        // site + message text, and the message embeds `{path}`.)
-        if scatter_block_index
-            && scx_format_io::backed::scatter_block_index_enabled()
-            && !loader.any_shard_framed()
-        {
-            let warnings = crate::pyimport::import_module(py, "warnings")?;
-            let user_warning =
-                crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
-            let msg = format!(
-                "IndexPlanDataset opened '{path}' with scatter_block_index=True, but no \
-                 CSR shard is row-group framed (unframed legacy file). Scattered reads \
-                 will full-shard-decode every batch — the block-index fast path cannot \
-                 fire. Reframe with `scx optimize --row-group-rows 256 <file>`, or pass \
-                 scatter_block_index=False to silence this warning."
-            );
-            warnings.call_method1("warn", (msg, user_warning))?;
+        if should_warn_unframed_scatter(
+            scatter_block_index,
+            scx_format_io::backed::scatter_block_index_enabled(),
+            || loader.any_shard_framed(),
+        ) {
+            warn_unframed_scatter(py, "IndexPlanDataset", &format!("'{path}'"))?;
         }
 
         Ok(Self {
@@ -1374,7 +1402,10 @@ impl IndexPlanDataset {
             Ok(plans.bind(py).call_method0("__iter__")?.unbind())
         })?;
 
-        let plan_stream = PyPlanIterator { py_iter };
+        let plan_stream = PyPlanIterator {
+            py_iter,
+            extract: extract_pair_plan,
+        };
         let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         let iter_metrics = inner.iter_metrics();
         let cache_metrics = loader.cache_metrics();
@@ -1446,27 +1477,32 @@ impl IndexPlanDataset {
         cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }
 
-    /// Per-component memory breakdown estimated at construction. Returns a
-    /// dict with the keys:
+    /// Memory budget diagnostics as a dict:
     ///
     /// ```text
-    /// cache_bytes              - decoded shard cache budget
-    /// batch_buffer_bytes       - dense X / X_paired buffers
-    /// lookahead_overhead_bytes - plan-tuple staging in the iter
-    /// transient_bytes          - per-batch obs Vecs + PairRequest scratch
-    /// python_overhead_bytes    - constant Python/Arrow/numpy overhead
-    /// total_bytes              - sum of the above
+    /// breakdown                - per-component estimate (see below)
     /// max_memory_mb            - user-supplied budget (LoaderConfig)
     /// effective_cache_shards   - post-auto-tune cache count cap
     /// effective_lookahead      - post-auto-tune iter lookahead
+    ///
+    /// breakdown:
+    ///   cache_bytes              - decoded shard cache budget
+    ///   batch_buffer_bytes       - dense X / X_paired buffers
+    ///   lookahead_overhead_bytes - plan-tuple staging in the iter
+    ///   transient_bytes          - per-batch obs Vecs + PairRequest scratch
+    ///   python_overhead_bytes    - constant Python/Arrow/numpy overhead
+    ///   total_bytes              - sum of the above
     /// ```
     ///
-    /// All byte values are `int`. Mirrors `TrainingDataset.memory_budget()`'s
-    /// `breakdown` sub-dict shape, plus the index-plan-specific
-    /// `effective_*` fields.
+    /// All byte values are `int`. ORG-9.10-4 moved the six components **under**
+    /// `breakdown`, where `TrainingDataset` had always reported them, so that
+    /// `memory_budget()["breakdown"]["total_bytes"]` reads the same on every
+    /// class that reports a budget (`MultimodalTrainingDataset` reports none);
+    /// the keys beside it stay class-specific.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let loader = self.loader()?;
-        let dict = loader.budget_breakdown().to_pydict(py)?;
+        let dict = PyDict::new(py);
+        dict.set_item("breakdown", loader.budget_breakdown().to_pydict(py)?)?;
         dict.set_item("max_memory_mb", loader.max_memory_mb())?;
         dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("effective_lookahead", loader.effective_lookahead())?;
@@ -1534,28 +1570,68 @@ impl Drop for IndexPlanDataset {
     }
 }
 
-/// Adapter: Python iterator → Rust `Iterator<Item = Result<Vec<(u64,u64)>, _>>`.
+/// How one plan type is read out of the object a Python generator yielded.
 ///
-/// `Py<PyAny>` is `Send` + `Sync`, so this struct can cross the thread boundary
-/// to the plan-pull worker. Each `next` reacquires the GIL just for the
-/// `__next__` call so the GIL is freely available between pulls.
-struct PyPlanIterator {
-    py_iter: Py<PyAny>,
+/// A function pointer, not a `T: for<'py> FromPyObject<'py>` bound: the two plan
+/// types differ in the *diagnostic* they owe a caller who yields the wrong
+/// shape, and that bound would collapse both onto pyo3's generic extract error.
+/// The cell-set arm in particular names its four arrays and their dtypes, which
+/// is the difference between a usable message and "expected tuple of length 4".
+type PlanExtract<T> = fn(&Bound<'_, PyAny>) -> std::result::Result<T, LoaderError>;
+
+/// `[(pert_row, ctrl_row), ...]` — the pair loader's plan.
+fn extract_pair_plan(obj: &Bound<'_, PyAny>) -> std::result::Result<Vec<(u64, u64)>, LoaderError> {
+    obj.extract::<Vec<(u64, u64)>>()
+        .map_err(|e| LoaderError::ConfigError {
+            reason: format!("plan extraction failed: {e}"),
+        })
 }
 
-impl Iterator for PyPlanIterator {
-    type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+/// `(file_ids, rows, role_tags, set_offsets)` — the cell-set loader's plan.
+fn extract_cellset_plan(
+    obj: &Bound<'_, PyAny>,
+) -> std::result::Result<SparseCellSetPlan, LoaderError> {
+    let (file_ids, rows, role_tags, set_offsets) = obj
+        .extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>()
+        .map_err(|e| LoaderError::ConfigError {
+            reason: format!(
+                "sparse plan extraction failed (expected a tuple \
+                 (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[])): {e}"
+            ),
+        })?;
+    Ok(SparseCellSetPlan {
+        file_ids,
+        rows,
+        role_tags,
+        set_offsets,
+    })
+}
+
+/// Adapter: Python iterator → Rust `Iterator<Item = Result<T, LoaderError>>`,
+/// for both plan-driven loaders.
+///
+/// `Py<PyAny>` and `fn` pointers are `Send` + `Sync`, so this struct crosses the
+/// thread boundary to the plan-pull worker without a `PhantomData` or an
+/// `unsafe` impl. Each `next` reacquires the GIL just for the `__next__` call so
+/// the GIL is freely available between pulls.
+///
+/// What is shared is the awkward part — the `__next__` call, telling
+/// `StopIteration` from a real exception, and the fact that a `PyErr` cannot
+/// cross the plan channel into the consumer's `Result`, so it travels as
+/// message text. What stays per-plan-type is the extraction, in [`PlanExtract`].
+struct PyPlanIterator<T> {
+    py_iter: Py<PyAny>,
+    extract: PlanExtract<T>,
+}
+
+impl<T> Iterator for PyPlanIterator<T> {
+    type Item = std::result::Result<T, LoaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Python::attach(|py| {
             let bound = self.py_iter.bind(py);
             match bound.call_method0("__next__") {
-                Ok(obj) => match obj.extract::<Vec<(u64, u64)>>() {
-                    Ok(plan) => Some(Ok(plan)),
-                    Err(e) => Some(Err(LoaderError::ConfigError {
-                        reason: format!("plan extraction failed: {e}"),
-                    })),
-                },
+                Ok(obj) => Some((self.extract)(&obj)),
                 Err(e) => {
                     if e.is_instance_of::<PyStopIteration>(py) {
                         None
@@ -1730,10 +1806,75 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
     Ok(dict)
 }
 
+/// Should the unframed-scatter preflight warn — and, just as importantly, should
+/// the framing scan run at all?
+///
+/// `any_framed` is a closure, and the conjunct order is the whole point.
+/// `BackedCsrReader::any_shard_framed` reads a shard header per shard, and on an
+/// all-unframed file — the one case that cannot short-circuit — it reads every
+/// one. With the caller's kwarg off, or the process-global
+/// `SCX_SCATTER_BLOCK_INDEX` switch off, there is no warning to emit *and*
+/// reframing could not enable the route either, so that scan is pure cost.
+///
+/// Extracted rather than spelled out at the two constructors so a test can
+/// assert the closure was never called. From Python it is not observable: the
+/// switch is memoized in a `OnceLock`, so a subprocess can only show that no
+/// warning was emitted — which was already true when the check sat *after* the
+/// scan (found by codex in review round 2, against a test of mine that could
+/// not fail).
+fn should_warn_unframed_scatter(
+    requested: bool,
+    globally_enabled: bool,
+    any_framed: impl FnOnce() -> bool,
+) -> bool {
+    requested && globally_enabled && !any_framed()
+}
+
+/// Preflight `UserWarning` for `scatter_block_index=True` against a file (or a
+/// set of files) where no CSR shard is row-group framed.
+///
+/// The block-index fast path can only fire on framed shards, and only when the
+/// process-global `SCX_SCATTER_BLOCK_INDEX` switch is on. If the caller asked
+/// for it, the switch is enabled, and the data is an all-unframed legacy
+/// layout, then every batch full-shard-decodes with no other signal — warn and
+/// point at the reframe command. When the switch is off, reframing cannot
+/// enable the path either, so there is nothing to warn about.
+///
+/// `target` describes what was opened — a quoted path on the single-file
+/// classes, a count plus a sample on the multi-file one — and carries the
+/// deduplication: Python's default filter keys on (message, category, module,
+/// lineno), so embedding the paths makes this one-shot per dataset rather than
+/// per process.
+///
+/// Callers reach this through [`should_warn_unframed_scatter`], which is what
+/// keeps the process-global switch ahead of the framing scan. The switch is
+/// re-checked here as a live backstop — a `OnceLock` read — so a future caller
+/// that forgets the precheck emits nothing rather than warning while the route
+/// is globally disabled. It is a backstop, not the gate: it cannot un-spend the
+/// scan a caller has already paid for.
+///
+/// Same house style as [`warn_cache_sizing`]: warn and continue, never refuse.
+fn warn_unframed_scatter(py: Python<'_>, dataset: &str, target: &str) -> PyResult<()> {
+    if !scx_format_io::backed::scatter_block_index_enabled() {
+        return Ok(());
+    }
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
+    let msg = format!(
+        "{dataset} opened {target} with scatter_block_index=True, but no \
+         CSR shard is row-group framed (unframed legacy file). Scattered reads \
+         will full-shard-decode every batch — the block-index fast path cannot \
+         fire. Reframe with `scx optimize --row-group-rows 256 <file>`, or pass \
+         scatter_block_index=False to silence this warning."
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
+}
+
 /// Emit the construction-time `UserWarning` for a shard cache the memory budget
 /// could not afford.
 ///
-/// Follows the house style of the `scatter_block_index` preflight below: warn and
+/// Follows the house style of the `scatter_block_index` preflight above: warn and
 /// continue (never refuse), name the observed numbers, name the knob, and name
 /// the exact value that would fix it. Deduping is left to CPython's
 /// `__warningregistry__`, which is correct here because the message text is
@@ -2156,49 +2297,6 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: Batch) -> PyResult<Bound<'py, PyDi
 // SparseCellSetDataset — native sparse cell-set loader (SCX-DATA-LOADER §4)
 // ---------------------------------------------------------------------------
 
-/// Adapter: Python iterator of `(file_ids, rows, role_tags, set_offsets)`
-/// tuples → Rust `Iterator<Item = Result<SparseCellSetPlan>>`. Mirrors
-/// [`PyPlanIterator`]: `Py<PyAny>` is `Send`, and each `next` reacquires the
-/// GIL only for the `__next__` call.
-struct PySparseCellSetPlanIterator {
-    py_iter: Py<PyAny>,
-}
-
-impl Iterator for PySparseCellSetPlanIterator {
-    type Item = std::result::Result<SparseCellSetPlan, LoaderError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Python::attach(|py| {
-            let bound = self.py_iter.bind(py);
-            match bound.call_method0("__next__") {
-                Ok(obj) => match obj.extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>() {
-                    Ok((file_ids, rows, role_tags, set_offsets)) => Some(Ok(SparseCellSetPlan {
-                        file_ids,
-                        rows,
-                        role_tags,
-                        set_offsets,
-                    })),
-                    Err(e) => Some(Err(LoaderError::ConfigError {
-                        reason: format!(
-                            "sparse plan extraction failed (expected a tuple \
-                             (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[])): {e}"
-                        ),
-                    })),
-                },
-                Err(e) => {
-                    if e.is_instance_of::<PyStopIteration>(py) {
-                        None
-                    } else {
-                        Some(Err(LoaderError::ChannelError(format!(
-                            "plan iterator raised: {e}"
-                        ))))
-                    }
-                }
-            }
-        })
-    }
-}
-
 /// Plan-driven native sparse cell-set reader. Each plan item is one batch of
 /// cell sets (delimited by `set_offsets`); each yielded dict carries the
 /// SCX-DATA-LOADER §4.4 sparse contract. Sibling to `IndexPlanDataset` but
@@ -2350,6 +2448,25 @@ impl SparseCellSetDataset {
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
         }
+        if should_warn_unframed_scatter(
+            scatter_block_index,
+            scx_format_io::backed::scatter_block_index_enabled(),
+            || loader.any_shard_framed(),
+        ) {
+            // A count plus up to two names: actionable without being a wall of
+            // paths, and enough text for Python's per-message dedup to make the
+            // warning one-shot per dataset.
+            let target = match paths.as_slice() {
+                [one] => format!("'{one}'"),
+                _ => {
+                    let shown: Vec<String> =
+                        paths.iter().take(2).map(|p| format!("'{p}'")).collect();
+                    let ellipsis = if paths.len() > 2 { ", …" } else { "" };
+                    format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
+                }
+            };
+            warn_unframed_scatter(py, "SparseCellSetDataset", &target)?;
+        }
 
         Ok(Self {
             loader: Some(loader),
@@ -2410,7 +2527,10 @@ impl SparseCellSetDataset {
             Ok(plans.bind(py).call_method0("__iter__")?.unbind())
         })?;
 
-        let plan_stream = PySparseCellSetPlanIterator { py_iter };
+        let plan_stream = PyPlanIterator {
+            py_iter,
+            extract: extract_cellset_plan,
+        };
         let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         let iter_metrics = inner.iter_metrics();
         Ok(SparseCellSetBatchIter {
@@ -2435,28 +2555,43 @@ impl SparseCellSetDataset {
     /// `cache_shards` that would let the whole batch stay resident.
     ///
     /// Pure index arithmetic from the catalogs' shard row ranges: no I/O, no
-    /// decode. `file_ids` and `rows` are the first two elements of the plan tuple
-    /// `iter_with_plans` consumes, so a caller can size the cache from the plans
-    /// it is about to issue:
+    /// decode. Takes **one plan**, in the same
+    /// `(file_ids, rows, role_tags, set_offsets)` shape `iter_with_plans`
+    /// consumes — `role_tags` and `set_offsets` are ignored, since shard
+    /// residency depends only on which rows of which files are read — so a
+    /// caller can size the cache from the plans it is about to issue without
+    /// destructuring them (ORG-9.10-4; it used to take `file_ids` and `rows` as
+    /// two separate arrays, which was the same method under a different arity
+    /// from the one `IndexPlanDataset` exposes). A plan of the wrong arity — the
+    /// pair loader's two-array shape, say — raises `ValueError` from pyo3's
+    /// tuple extraction:
     ///
     /// ```python
     /// probe = pyscx.SparseCellSetDataset(paths)
-    /// need = max(probe.suggested_cache_shards(fids, rows) for fids, rows, _, _ in plans[:64])
+    /// need = max(probe.suggested_cache_shards(p) for p in plans[:64])
     /// ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
     /// ```
     ///
     /// This is the measurement STATE3's 143 s/batch regime needed: its scattered
     /// perturbation gather touched far more shards than the `cache_shards=16` it
     /// was passing, and raising the cache to 48 was worth ~19×.
-    fn suggested_cache_shards(
+    fn suggested_cache_shards<'py>(
         &self,
-        py: Python<'_>,
-        file_ids: Vec<u32>,
-        rows: Vec<u64>,
+        py: Python<'py>,
+        plan: (Vec<u32>, Vec<u64>, Bound<'py, PyAny>, Bound<'py, PyAny>),
     ) -> PyResult<usize> {
-        // Closed-state check first, so a closed dataset reports that rather
-        // than a ValueError about its arguments.
+        // Closed-state check before the manual same-length validation below,
+        // so a closed dataset reports that rather than a ValueError about its
+        // arguments. It cannot precede *all* argument checking: pyo3 converts
+        // the tuple parameter before this body runs, so a closed dataset handed
+        // a two-tuple still gets the arity `ValueError`.
         let loader = self.loader()?;
+        // `role_tags` / `set_offsets` are taken as bare objects, not extracted:
+        // the tuple arity is still checked (a 2-tuple is rejected, which is the
+        // shape mistake worth catching), but nothing copies two Python
+        // sequences the touch count never reads. The documented recipe runs
+        // this over 64 plans.
+        let (file_ids, rows, _role_tags, _set_offsets) = plan;
         if file_ids.len() != rows.len() {
             return Err(PyValueError::new_err(format!(
                 "file_ids and rows must be the same length, got {} and {}",
@@ -2470,22 +2605,32 @@ impl SparseCellSetDataset {
     /// Resolved shard-cache budget:
     ///
     /// ```text
-    /// max_memory_mb           - byte budget in force (adaptive when not passed)
-    /// cache_shards            - requested count cap
-    /// affordable_cache_shards - shards the byte budget holds at average size
-    /// shard_decoded_bytes     - average decoded bytes per CSR shard
+    /// breakdown              - per-component estimate, same six keys as every
+    ///                          other class that reports a budget
+    /// max_memory_mb          - byte budget in force (adaptive when not passed)
+    /// cache_shards           - requested count cap
+    /// effective_cache_shards - shards the byte budget holds at average size
+    /// shard_decoded_bytes    - average decoded bytes per CSR shard
     /// ```
     ///
-    /// Unlike `IndexPlanDataset.memory_budget()` there is no batch-buffer or
-    /// plan-tuple term: on the sparse path the shard cache *is* the budget.
+    /// Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
+    /// breakdown: on this path the shard cache *is* the budget — there is no
+    /// batch-buffer or plan-tuple term. See
+    /// [`SparseCellSetLoader::budget_breakdown`] for why `total_bytes` here can
+    /// exceed `max_memory_mb`, which it cannot on `IndexPlanDataset`.
+    ///
+    /// ORG-9.10-4 renamed `affordable_cache_shards` to `effective_cache_shards`:
+    /// it is the same quantity `IndexPlanDataset` reports under that name, and
+    /// both are `loader.effective_cache_shards()`.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         let loader = self.loader()?;
         let budget = loader.cache_bytes_budget();
         let per_shard = loader.shard_decoded_bytes();
+        dict.set_item("breakdown", loader.budget_breakdown().to_pydict(py)?)?;
         dict.set_item("max_memory_mb", budget / (1024 * 1024))?;
         dict.set_item("cache_shards", loader.cache_shards())?;
-        dict.set_item("affordable_cache_shards", loader.effective_cache_shards())?;
+        dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
         Ok(dict)
     }
@@ -2497,12 +2642,14 @@ impl SparseCellSetDataset {
     /// `full_shard_groups`, `block_index_groups`. All `int`; atomic, lock-free —
     /// sample as often as you like.
     ///
-    /// The last two are the **route** this dataset's gathers actually took.
-    /// They matter because this class still has no preflight warning (unlike
-    /// `IndexPlanDataset`), so `scatter_block_index=True` against a file with
-    /// no row-group-framed shards is a silent no-op:
+    /// The last two are the **route** this dataset's gathers actually took:
     /// `block_index_groups > 0` proves the row-group path ran, and
-    /// `full_shard_groups > 0` is the warm-into-the-LRU default.
+    /// `full_shard_groups > 0` is the warm-into-the-LRU default. Opening an
+    /// all-unframed set with `scatter_block_index=True` now warns at
+    /// construction (ORG-9.10-4), so these are a confirmation rather than the
+    /// only way to find out — but they stay the authority. The warning fires
+    /// when *no* file is framed; its **absence** establishes only that at least
+    /// one is, never that a gather actually took the route.
     ///
     /// Since ORG-9.10-1 the prefetch half is visible too, through
     /// `SparseCellSetBatchIter.metrics()["prefetch"]`. That is a different
@@ -2984,6 +3131,68 @@ pub fn downsample_counts_csr<'py>(
 // resolver-v2 unification turns the feature on for this crate's test target
 // too. Verified by name in that job's output. If pyscx ever stops being built
 // alongside, this module goes silently unrun.
+#[cfg(test)]
+mod preflight_decision_tests {
+    use super::should_warn_unframed_scatter;
+    use std::cell::Cell;
+
+    /// The framing scan must not run when the process-global switch is off.
+    ///
+    /// This is the property the Python-side subprocess test cannot establish.
+    /// Before review round 2 the switch was checked *inside* the warning helper,
+    /// i.e. after the scan: no warning was emitted either way, so the subprocess
+    /// test passed on the broken ordering too. Asserting the closure went
+    /// uncalled is what actually pins it.
+    #[test]
+    fn the_framing_scan_does_not_run_when_the_global_switch_is_off() {
+        let scanned = Cell::new(false);
+        let warn = should_warn_unframed_scatter(true, false, || {
+            scanned.set(true);
+            false
+        });
+        assert!(!warn, "the global switch off means nothing to warn about");
+        assert!(
+            !scanned.get(),
+            "any_shard_framed() reads a shard header per shard; with the route \
+             globally disabled that scan buys nothing and must be skipped"
+        );
+    }
+
+    /// ...and not when the caller never asked for the route either.
+    #[test]
+    fn the_framing_scan_does_not_run_when_the_caller_did_not_ask() {
+        let scanned = Cell::new(false);
+        let warn = should_warn_unframed_scatter(false, true, || {
+            scanned.set(true);
+            false
+        });
+        assert!(!warn);
+        assert!(!scanned.get());
+    }
+
+    /// The positive arm: both gates open, nothing framed → scan runs, warn.
+    /// Without this the two negatives above are satisfied by a function that
+    /// always returns false and never calls the closure at all.
+    #[test]
+    fn an_unframed_file_the_caller_asked_about_warns_after_scanning() {
+        let scanned = Cell::new(false);
+        let warn = should_warn_unframed_scatter(true, true, || {
+            scanned.set(true);
+            false
+        });
+        assert!(warn);
+        assert!(scanned.get(), "the scan is what decides this case");
+    }
+
+    /// And a framed file is silent — the `any`-across-readers answer is what
+    /// suppresses the warning, not a second gate.
+    #[test]
+    fn a_framed_file_is_silent() {
+        assert!(!should_warn_unframed_scatter(true, true, || true));
+    }
+}
+
+#[cfg(test)]
 mod layout_check_tests {
     use super::*;
     use arrow::array::StringArray;

@@ -669,9 +669,11 @@ def _suggested_cache_shards(scx_path: str, plans: list[tuple]) -> int | None:
         probe = pyscx.SparseCellSetDataset([scx_path])
         if not hasattr(probe, "suggested_cache_shards"):
             return None
+        # One plan argument, in the shape `iter_with_plans` consumes
+        # (ORG-9.10-4 folded the former `(file_ids, rows)` arity into it).
         best = 0
-        for file_ids, rows, _roles, _offsets in plans:
-            best = max(best, int(probe.suggested_cache_shards(file_ids, rows)))
+        for plan in plans:
+            best = max(best, int(probe.suggested_cache_shards(plan)))
         return best or None
     except Exception as e:  # noqa: BLE001
         logger.warning("  cache-sizing arm unavailable: %s", e)

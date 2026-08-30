@@ -2726,8 +2726,12 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 
 **Methods**
 
-- `close()` — Explicitly shut the pipeline down (join I/O + decode threads, release rayon pool). Idempotent. Recommended before process exit; see [Fork safety](#fork-safety-under-pytorch-dataloadernum_workers--0).
-- `memory_budget()` → `dict` — Memory budget diagnostics including `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`, and a nested `breakdown` dict.
+- `close()` — Explicitly shut the pipeline down (join I/O + decode threads, release rayon pool). Idempotent, and **not** terminal: the next `__iter__` rebuilds and starts a fresh epoch. Recommended before process exit; see [Fork safety](#fork-safety-under-pytorch-dataloadernum_workers--0) and **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
+- `memory_budget()` → `dict` — `breakdown` (the six-key per-component estimate every class that reports a budget uses — `MultimodalTrainingDataset` reports none) plus this class's own `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`. `mmap_mb` appears here and nowhere else — the plan-driven loaders treat page cache as evictable and exclude it.
+
+**Properties (lifecycle)**
+
+- `closed` → `bool` — True from `close()` until the next `__iter__` rebuilds. Never raises.
 
 **Batch dict schema**
 
@@ -2904,17 +2908,27 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 
 **Lifecycle — `close()` and `closed`**
 
-`IndexPlanDataset` and `SparseCellSetDataset` both expose `close()` and a
-`closed` property. `close()` releases the loader's tokio runtime with the GIL
-detached and a 5 s bound, so tearing the dataset down cannot stall other Python
-threads while an in-flight shard decode finishes. Dropping the object does the
-same, so `close()` buys determinism rather than correctness.
+All four dataset classes expose `close()` and a `closed` property, and all four
+release the GIL around teardown, so tearing a dataset down cannot stall other
+Python threads while an in-flight shard decode finishes. The bound is not one
+number: the plan-driven pair drop a tokio runtime under a single 5 s deadline,
+while the training pair bound-join two threads *sequentially* (`~2 ×
+SHUTDOWN_DEADLINE`), and `MultimodalTrainingDataset` repeats that per modality.
+Dropping the object does the same, so `close()` buys determinism rather than
+correctness. `closed` and `repr()` never raise on any of them.
 
-Unlike `TrainingDataset.close()`, **it is terminal on these two classes**: their
-tokio runtime is built exactly once so that a forked child can never inherit
-live tokio threads, which also means it cannot be rebuilt. Every method raises
-`RuntimeError` afterwards; construct a new dataset. `closed` and `repr()` never
-raise.
+`close()` is **terminal on `IndexPlanDataset` and `SparseCellSetDataset`**:
+their tokio runtime is built exactly once so that a forked child can never
+inherit live tokio threads, which also means it cannot be rebuilt. Every other
+method raises `RuntimeError` afterwards; construct a new dataset. On
+`TrainingDataset` and `MultimodalTrainingDataset` it is not — their pool and
+runtime are per-epoch anyway, so the next `__iter__` rebuilds them.
+
+`closed` follows that split rather than papering over it: on the terminal pair
+it means closed for good, on the re-usable pair it means torn down *right now*
+and returns to `False` after the next `__iter__`. So `if not ds.closed:
+ds.close()` is portable across all four; `assert ds.closed` after an epoch is
+not.
 
 A still-alive `IndexPlanBatchIter` / `SparseCellSetBatchIter` holds its own
 reference, so `close()` releases only the dataset's. The iterator then does the
@@ -2948,8 +2962,10 @@ call after the iterator has been drained.
 `prefetch_skipped_block_index` counts the **L2 prefetch-time** decision: shards
 left undecoded so the gather could take the row-group path. It is a useful
 confirmation that `scatter_block_index=True` had an effect — it stays 0 against
-an unframed file, where the kwarg is a silent no-op on `SparseCellSetDataset`,
-which has no preflight warning.
+an unframed file. Both classes now warn at construction when the kwarg is set
+and no shard is framed, so this is a confirmation rather than the only signal;
+on `SparseCellSetDataset` the warning tests *any file in the set*, so a mixed
+set is silent and these counters are still what tell you the route ran.
 
 It is **not** the same signal as `cache_metrics()["block_index_groups"]`, and
 the two can legitimately differ. `block_index_groups` is the route the *gather*
@@ -3030,6 +3046,52 @@ processes either; it owns thread handles that don't survive transfer.
 > to wedge `DataLoader(num_workers=2)` indefinitely; the per-pipeline
 > rayon pool in `scx-loader` removed that hazard. See
 > `pyscx/tests/test_fork_safety.py` for the durable regression test.
+
+### SparseCellSetDataset
+
+Plan-driven **sparse** reader for role-tagged cell sets spanning several `.scx`
+files — the shape perturbation screens and contrastive set-based models want.
+Where `IndexPlanDataset` yields a dense paired batch from one file,
+`SparseCellSetDataset` gathers flat CSR rows across files and delimits each set
+with `set_offsets`.
+
+**Constructor kwargs**
+
+| Argument | Default | Notes |
+|---|---|---|
+| `paths` | — | List of `.scx` paths. `file_id` in a plan is the index into this list. |
+| `cache_shards` | `None` → 128 | Shard-cache count cap. Size it with `suggested_cache_shards`, not by guessing — see [Sizing the shard cache](training.md#sizing-the-shard-cache). |
+| `max_memory_mb` | `None` | Byte cap on the shard cache; `None` resolves adaptively (never unbounded). Both caps are enforced, and on large-shard files the byte cap binds first. |
+| `remap_tables` / `n_global_genes` | `None` | Per-file `local → global` gene tables. Required for a cell **set** that spans files: raw-local indices from different files are not comparable. |
+| `normalize` / `log1p` / `target_sum` | `None` → off | Off by default here, unlike the training classes. |
+| `lookahead` | `None` → tuned | Prefetch depth; `0` disables prefetch. |
+| `scatter_block_index` | `False` | Opt into the row-group block-index scattered route. Defaulted **off**: this class's regime is cache-friendly, where the route costs throughput and buys bounded RSS. See [sharding.md § Row-group framing & scattered reads](sharding.md#row-group-framing--scattered-reads) and [performance.md](performance.md). |
+| `downsample_target_library_size` / `downsample_method` / `downsample_seed` | `None` | Seeded per-row count downsample, applied before the batch leaves Rust. |
+
+**Plans.** Each plan is a tuple `(file_ids, rows, role_tags, set_offsets)`:
+`file_ids` and `rows` are parallel per-row arrays, `role_tags` labels each row
+(perturbed / control / …), and `set_offsets` has length `n_sets + 1` and
+delimits each set's row range in the flat batch.
+
+**Properties**
+
+- `n_files` → `int`, `n_cols` → `int` — reader count and CSR column count.
+- `closed` → `bool` — True once `close()` has run. Terminal on this class; never raises.
+
+**Methods**
+
+- `iter_with_plans(plans, lookahead=None)` → `SparseCellSetBatchIter` — stream plans into §4.4 sparse batch dicts.
+- `suggested_cache_shards(plan)` → `int` — distinct `(file_id, shard)` pairs one plan touches. Takes the same four-tuple `iter_with_plans` consumes; `role_tags` / `set_offsets` are ignored.
+- `cache_metrics()` → `dict` — cumulative shard-cache counters, including `full_shard_groups` / `block_index_groups`, which report the scattered-read route the gathers actually took.
+- `memory_budget()` → `dict` — `breakdown` plus `max_memory_mb`, `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`. Only `cache_bytes` and `python_overhead_bytes` are non-zero in the breakdown: on this path the shard cache *is* the budget.
+- `close()` — release the prefetch engine's tokio runtime, GIL detached, 5 s bound. Idempotent and **terminal** — see **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
+
+> [!NOTE]
+> `memory_budget()["breakdown"]["total_bytes"]` can exceed `max_memory_mb` on
+> this class, which cannot happen on `IndexPlanDataset`. The breakdown reports
+> the constant interpreter/numpy/Arrow overhead every path pays; this loader's
+> auto-tune does not yet subtract it from the budget. Unifying the two budget
+> models is tracked as its own piece of work.
 
 ## CLI (`scx`)
 

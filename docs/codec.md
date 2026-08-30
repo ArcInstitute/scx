@@ -301,10 +301,12 @@ floors run against **both** the shipped write default **G=256** (`scx_compact_tr
 fixture default **G=512**, so a regression that drops framing or unwires the loader
 block-index path fails the gate at the default G too.
 
-Opening an `IndexPlanDataset` with `scatter_block_index=True` on an **all-unframed**
-(legacy v1) file emits a one-shot `UserWarning`: the block-index fast path cannot fire,
-so every batch full-shard-decodes. Reframe with `scx optimize --row-group-rows 256
-<file>` (or pass `scatter_block_index=False` to silence).
+Opening an `IndexPlanDataset` or a `SparseCellSetDataset` with
+`scatter_block_index=True` on **all-unframed** (legacy v1) data emits a one-shot
+`UserWarning`: the block-index fast path cannot fire, so every batch full-shard-decodes.
+Reframe with `scx optimize --row-group-rows 256 <file>` (or pass
+`scatter_block_index=False` to silence). On the multi-file class the test is *any file
+framed* — one framed file means the route is live for that file's rows.
 
 **Choosing `row_group_rows` (G).** The `compression` + `read_scattered` sweep over
 `G ∈ {128, 256, 512, 1024}` (2026-07-04, pbmc3k/pbmc10k/smartseq2/tabula_sapiens_100k):

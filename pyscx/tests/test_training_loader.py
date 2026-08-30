@@ -381,6 +381,59 @@ class TestNumWorkersSafety:
             assert result == "detected_fork", f"Expected fork detection, got: {result}"
 
 
+class TestCloseIsReopenable:
+    """`close()` is **not** terminal on the training classes: the next
+    `__iter__` rebuilds the rayon pool and starts a fresh epoch.
+
+    That is documented in three places (`TrainingPipeline::shutdown`,
+    `TrainingDataset::close`, `docs/training.md`) and asserted in none — every
+    existing `close()` call in the suite is a teardown at the end of a test
+    body, so nothing would have noticed the semantics flipping to the terminal
+    behaviour the two plan-driven classes have.
+
+    It is the pin for ORG-9.10-4's `closed` getter: `closed` can only mean
+    "torn down right now" on these classes precisely because iterating again
+    is legal and rebuilds.
+    """
+
+    def _epoch_rows(self, ds):
+        return sum(b["cell_indices"].shape[0] for b in ds)
+
+    def test_close_then_iterate_starts_a_fresh_epoch(self, scx_path):
+        ds = pyscx.TrainingDataset(
+            scx_path, batch_size=32, normalize=False, log1p=False
+        )
+        assert ds.closed is False, "a fresh dataset has never been closed"
+        assert self._epoch_rows(ds) == ds.n_obs
+        ds.close()
+        assert ds.closed is True
+        # The whole point: a second full epoch after an explicit close(), and
+        # `closed` going back to False because the pool really was rebuilt.
+        assert self._epoch_rows(ds) == ds.n_obs
+        assert ds.closed is False
+
+    def test_close_mid_epoch_then_iterate_starts_a_fresh_epoch(self, scx_path):
+        """The harder direction — close() while an epoch is live, which is what
+        a `finally: ds.close()` around a `break` actually does."""
+        ds = pyscx.TrainingDataset(
+            scx_path, batch_size=16, normalize=False, log1p=False
+        )
+        it = iter(ds)
+        _ = next(it)
+        del it
+        ds.close()
+        assert self._epoch_rows(ds) == ds.n_obs
+
+    def test_close_is_idempotent_on_a_reopenable_dataset(self, scx_path):
+        ds = pyscx.TrainingDataset(
+            scx_path, batch_size=32, normalize=False, log1p=False
+        )
+        ds.close()
+        ds.close()
+        assert ds.closed is True
+        assert self._epoch_rows(ds) == ds.n_obs
+
+
 class TestDropShutdown:
     """L3: dropping a dataset without close() runs the wrapper Drop (which
     releases the GIL around the pipeline join) cleanly — no hang, crash, or
