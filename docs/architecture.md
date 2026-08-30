@@ -765,7 +765,8 @@ and the forward/backward pass.
 | `projection.rs` | `HvgProjection` — gene subset at decode time (~15× data reduction) |
 | `normalize.rs` | Dense-row fused normalize + log1p |
 | `batch.rs` | `Batch` struct — dense f32 matrix + obs columns |
-| `index_plan.rs` | `IndexPlanLoader` + `IndexPlanIter` — plan-driven paired-batch reader (sibling row-source model; see above) |
+| `index_plan.rs` | `IndexPlanLoader` — plan-driven paired-batch reader (sibling row-source model; see above). Its `IndexPlanIter` is a thin adapter over `plan_engine`'s iterator, not a second implementation |
+| `plan_engine.rs` | `PrefetchEngine` + `PlanPrefetchIter` — the one plan-driven prefetch iterator (plan-pull thread, bounded lookahead, per-plan shard prefetch, `IterMetrics`). Both the paired and the sparse cell-set loaders run on it |
 | `python.rs` | `TrainingDataset` + `IndexPlanDataset` PyO3 classes (both implement `__iter__`/`__next__`) |
 
 ### Memory Budget
