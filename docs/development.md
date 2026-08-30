@@ -407,7 +407,7 @@ cargo +nightly fuzz run fuzz_modality_table -- -max_total_time=120
 
 The `.github/workflows/fuzz.yml` workflow exposes both modes:
 
-- **Build check** runs on every PR and push to `main`: `cargo +nightly fuzz build` in each of the three fuzz crates. This catches API bitrot — if a refactor breaks a fuzz target's call site, the PR fails before merging.
+- **Build check** runs `cargo +nightly check` in each of the three fuzz crates, on PRs and pushes to `main` **that touch the fuzzed crates** (path-filtered to `scx-codec`/`scx-format`/`scx-format-io`/`scx-engine`/`scx-sparse`, the workspace `Cargo.toml`/`Cargo.lock`, and the workflow itself) plus a weekly scheduled run as a bitrot backstop. This catches API bitrot — if a refactor breaks a fuzz target's call site, the PR fails before merging. An absent Fuzz run on an untouched-path PR is expected, not a failure.
 - **Run on demand** runs only via `workflow_dispatch`. Trigger from the GitHub Actions tab → Fuzz → Run workflow, with inputs `duration_seconds` (default 120) and an optional `target` filter (e.g. `fuzz_modality_table` to run a single target). Crash inputs are uploaded as workflow artifacts when a target fails.
 
 > **Note**: `cargo fuzz` requires the nightly toolchain. Install with `rustup toolchain install nightly`. Corpus files accumulate in `fuzz/corpus/<target>/`; check in interesting specimens as regression fixtures.
@@ -434,19 +434,24 @@ Quick smoke test:
 ## CI Overview
 
 The GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and PR
-to `main`. Superseded PR pushes cancel their in-flight run, and a `changes`
-gate skips the build/test jobs on docs-only PRs (`fmt` and the dedup guards
-always run; the merge push to main always runs everything):
+to `main`. Superseded PR pushes cancel their in-flight run. A `changes` gate
+splits jobs three ways: the expensive jobs (`test`, `test-hdf5`, `clippy`,
+both `feature-check` jobs, `python`, `base-install`) run only when the PR's
+diff contains code (`code=true`, which every push to main reports
+unconditionally); `fmt` and `dedup-guard` always run; `docs-anchors` runs
+only on docs-only PRs (`code=false`), where it replaces the anchor coverage
+the skipped `python` job would have provided:
 
 | Job | What it does |
 |-----|-------------|
-| `changes` | Classifies the PR's changed paths; docs-only PRs skip the jobs below |
+| `changes` | Classifies the PR's whole diff (fails closed on renames, truncated listings, and the 3,000-file API cap) |
+| `docs-anchors` | Docs-only PRs only: `pytest --noconftest pyscx/tests/test_docs_anchors.py` (stdlib-only) |
 | `test` | `cargo test --workspace --exclude rscx` — default features only |
 | `test-hdf5` | `cargo test -p scx-convert --features hdf5` + `-p scx-cli --features hdf5` — the h5ad/h5mu suites the `test` job cannot reach |
 | `clippy` | `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` — `--all-targets` lints test and bench code too |
-| `fmt` | `cargo fmt --check` |
-| `feature-check` / `feature-check-hdf5` | `cargo clippy --all-targets` legs for feature combos (cloud, hdf5, gpu, scx-format-io no-default) as sequential steps in two jobs |
-| `docs-anchors` | Runs `pyscx/tests/test_docs_anchors.py` (stdlib-only) on docs-only PRs, which skip the jobs above |
+| `fmt` | `cargo fmt --check` (always runs) |
+| `dedup-guard` | Structural grep/awk guards over the source tree (always runs) |
+| `feature-check` / `feature-check-hdf5` | `cargo clippy --all-targets` for the 11 feature combos (cloud, hdf5, gpu, scx-format-io no-default), accumulated in two jobs so one broken leg does not hide the others |
 | `python` | `maturin develop --profile ci` + `pytest -n 2 --dist loadfile` (with cloud features, fork-safety tests) |
 | `base-install` | Builds the wheel with `--profile ci`, installs it into an empty venv, runs the packaging assertions |
 

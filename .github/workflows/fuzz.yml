@@ -9,10 +9,20 @@ name: Fuzz
 # nightly-toolchain compile entirely. This is not a required check; an absent
 # run reads as green.
 #
-# Run-on-demand only via workflow_dispatch — no cron schedule. Trigger
-# from the Actions tab before a release or after touching a parser.
+# Documented residual of GitHub's native paths filter: on a diff of more than
+# 3,000 files whose matching paths are not in the first 3,000, the workflow
+# does NOT run (docs: "Git diff comparisons") — i.e. it fails open, silently.
+# The weekly schedule below is the bitrot backstop for that hole and for long
+# stretches where no PR touches the fuzzed crates.
+#
+# Fuzz *runs* are on-demand only via workflow_dispatch. Trigger from the
+# Actions tab before a release or after touching a parser.
 
 on:
+  schedule:
+    # Weekly fuzz-build bitrot check (Mondays 06:17 UTC; fuzz-run stays
+    # dispatch-only — its job-level `if` already excludes schedule events).
+    - cron: "17 6 * * 1"
   push:
     branches: [main]
     paths:

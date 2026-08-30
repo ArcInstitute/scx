@@ -63,10 +63,11 @@ jobs:
             echo "changed_files=$expected (missing or at the 3000-file API cap): code=true"
             exit 0
           fi
-          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --paginate --jq '.[].filename')
-          renamed_from=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --paginate --jq '.[].previous_filename // empty')
+          # One paginated fetch; --paginate without --jq emits one JSON array
+          # per page, which jq consumes as a multi-document stream.
+          resp=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --paginate)
+          files=$(jq -r '.[].filename' <<< "$resp")
+          renamed_from=$(jq -r '.[].previous_filename // empty' <<< "$resp")
           listed=$(grep -c . <<< "$files" || true)
           to_classify=$(printf '%s\n%s\n' "$files" "$renamed_from")
           code=false
@@ -2796,7 +2797,7 @@ jobs:
           fi
 
   # The feature legs run inside two jobs (split by whether libhdf5 is needed)
-  # instead of a 12-leg matrix: one runner spin-up, checkout, toolchain and
+  # instead of an 11-leg matrix: one runner spin-up, checkout, toolchain and
   # cache per group, one shared target/ so the common dependency closure
   # compiles once per group instead of per leg, and no per-job billable-minute
   # rounding on eleven ~1-2 minute legs. Each leg is `cargo clippy` only —
