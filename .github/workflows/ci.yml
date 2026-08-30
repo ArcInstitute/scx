@@ -2101,7 +2101,16 @@ jobs:
           #    matched with `>/dev/null` rather than `grep -q` — under pipefail
           #    `-q` closes the pipe and SIGPIPEs the upstream, which this file
           #    tells every other consumer not to do (found by Cursor Agent).
-          gpucsr=$(prod "$dec" | awk '/^#\[non_exhaustive\]$/{a=1} /^pub struct GpuCsr \{/{s=1} s{print} /^\}$/{if(s){exit}} END{}' )
+          #    awk must read to EOF rather than `exit`-ing at the struct's
+          #    closing brace: `exit` closes the pipe while `sed` is still
+          #    writing the remaining ~90 KB, GNU sed then fails with "couldn't
+          #    flush stdout: Broken pipe" and exits 4, and `pipefail` turns that
+          #    into a guard failure that depends on scheduling. Measured before
+          #    the fix: 2/10 locally on shard_decode.rs and 4/8 on
+          #    shufdelta_gpu.rs below; it took down PR #486, whose diff does not
+          #    touch scx-gpu at all. Same hazard this file already warns about
+          #    for `grep -q`, in a form the warning did not name.
+          gpucsr=$(prod "$dec" | awk '/^pub struct GpuCsr \{/{s=1} (s && !d){print} (s && /^\}$/){d=1}')
           prod "$dec" | grep -E '^#\[non_exhaustive\]$' >/dev/null \
             || { echo "::error::$dec no longer marks GpuCsr #[non_exhaustive] — a downstream crate can build one by struct literal again (ORG-8.20-3, found by codex)."; exit 1; }
           if printf '%s\n' "$gpucsr" | grep -nE '^ +pub (indptr|indices|data|shape):'; then
@@ -2200,7 +2209,7 @@ jobs:
           #     PipelinedCsr reverted to loose buffers. `>/dev/null`, not
           #     `grep -q`, per this guard's own rule (found by codex round 2).
           shuf=scx-gpu/src/shufdelta_gpu.rs
-          prod "$shuf" | awk '/^pub struct PipelinedCsr \{/{s=1} s{print} s&&/^\}$/{exit}' \
+          prod "$shuf" | awk '/^pub struct PipelinedCsr \{/{s=1} (s && !d){print} (s && /^\}$/){d=1}' \
             | grep -E '^    pub csr: GpuCsr,' >/dev/null \
             || { echo "::error::$shuf's PipelinedCsr no longer carries a finished GpuCsr — its callers are back to re-assembling loose buffers past the coverage and length checks (ORG-8.20-3)."; exit 1; }
 

@@ -340,8 +340,8 @@ impl SparseCellSetLoader {
         self.shard_decoded_bytes
     }
 
-    /// Per-component memory estimate, in the one shape every dataset class
-    /// reports (ORG-9.10-4).
+    /// Per-component memory estimate, in the one shape every class that reports
+    /// a budget uses (ORG-9.10-4; `MultimodalTrainingDataset` reports none).
     ///
     /// Only two terms are non-zero, and that is the model, not an omission: the
     /// shard cache **is** this loader's budget — there is no batch buffer,

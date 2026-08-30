@@ -1296,7 +1296,11 @@ impl IndexPlanDataset {
             warn_hvg_panel(py, "IndexPlanDataset", &v)?;
         }
 
-        if scatter_block_index && !loader.any_shard_framed() {
+        // Global switch before the scan — see `warn_unframed_scatter`.
+        if scatter_block_index
+            && scx_format_io::backed::scatter_block_index_enabled()
+            && !loader.any_shard_framed()
+        {
             warn_unframed_scatter(py, "IndexPlanDataset", &format!("'{path}'"))?;
         }
 
@@ -1801,9 +1805,6 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
     Ok(dict)
 }
 
-/// Emit the construction-time `UserWarning` for a shard cache the memory budget
-/// could not afford.
-///
 /// Preflight `UserWarning` for `scatter_block_index=True` against a file (or a
 /// set of files) where no CSR shard is row-group framed.
 ///
@@ -1820,11 +1821,18 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
 /// lineno), so embedding the paths makes this one-shot per dataset rather than
 /// per process.
 ///
+/// ⚠️ Callers check `scatter_block_index_enabled()` **before** the
+/// `any_shard_framed()` scan, not here: the scan reads a shard header per shard
+/// on an all-unframed file — exactly the case that cannot short-circuit — and
+/// with the process-global switch off there is no warning to emit anyway. This
+/// helper repeats the check only as a backstop.
+///
 /// Same house style as [`warn_cache_sizing`]: warn and continue, never refuse.
 fn warn_unframed_scatter(py: Python<'_>, dataset: &str, target: &str) -> PyResult<()> {
-    if !scx_format_io::backed::scatter_block_index_enabled() {
-        return Ok(());
-    }
+    debug_assert!(
+        scx_format_io::backed::scatter_block_index_enabled(),
+        "callers must gate on scatter_block_index_enabled() before scanning for framing"
+    );
     let warnings = crate::pyimport::import_module(py, "warnings")?;
     let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     let msg = format!(
@@ -1836,19 +1844,6 @@ fn warn_unframed_scatter(py: Python<'_>, dataset: &str, target: &str) -> PyResul
     );
     warnings.call_method1("warn", (msg, user_warning))?;
     Ok(())
-}
-
-/// Describe a multi-file open for [`warn_unframed_scatter`]: a count, plus up
-/// to two names so the message is actionable without being a wall of paths.
-fn describe_paths(paths: &[String]) -> String {
-    match paths {
-        [one] => format!("'{one}'"),
-        _ => {
-            let shown: Vec<String> = paths.iter().take(2).map(|p| format!("'{p}'")).collect();
-            let ellipsis = if paths.len() > 2 { ", …" } else { "" };
-            format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
-        }
-    }
 }
 
 /// Follows the house style of the `scatter_block_index` preflight below: warn and
@@ -2425,8 +2420,26 @@ impl SparseCellSetDataset {
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
         }
-        if scatter_block_index && !loader.any_shard_framed() {
-            warn_unframed_scatter(py, "SparseCellSetDataset", &describe_paths(&paths))?;
+        // The process-global switch is checked first, before the per-shard
+        // framing scan: with it off no warning can be emitted and reframing
+        // could not enable the route either, so the scan would be pure cost.
+        if scatter_block_index
+            && scx_format_io::backed::scatter_block_index_enabled()
+            && !loader.any_shard_framed()
+        {
+            // A count plus up to two names: actionable without being a wall of
+            // paths, and enough text for Python's per-message dedup to make the
+            // warning one-shot per dataset.
+            let target = match paths.as_slice() {
+                [one] => format!("'{one}'"),
+                _ => {
+                    let shown: Vec<String> =
+                        paths.iter().take(2).map(|p| format!("'{p}'")).collect();
+                    let ellipsis = if paths.len() > 2 { ", …" } else { "" };
+                    format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
+                }
+            };
+            warn_unframed_scatter(py, "SparseCellSetDataset", &target)?;
         }
 
         Ok(Self {
@@ -2523,7 +2536,9 @@ impl SparseCellSetDataset {
     /// caller can size the cache from the plans it is about to issue without
     /// destructuring them (ORG-9.10-4; it used to take `file_ids` and `rows` as
     /// two separate arrays, which was the same method under a different arity
-    /// from the one `IndexPlanDataset` exposes):
+    /// from the one `IndexPlanDataset` exposes). A plan of the wrong arity — the
+    /// pair loader's two-array shape, say — raises `ValueError` from pyo3's
+    /// tuple extraction:
     ///
     /// ```python
     /// probe = pyscx.SparseCellSetDataset(paths)
@@ -2534,14 +2549,19 @@ impl SparseCellSetDataset {
     /// This is the measurement STATE3's 143 s/batch regime needed: its scattered
     /// perturbation gather touched far more shards than the `cache_shards=16` it
     /// was passing, and raising the cache to 48 was worth ~19×.
-    fn suggested_cache_shards(
+    fn suggested_cache_shards<'py>(
         &self,
-        py: Python<'_>,
-        plan: (Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>),
+        py: Python<'py>,
+        plan: (Vec<u32>, Vec<u64>, Bound<'py, PyAny>, Bound<'py, PyAny>),
     ) -> PyResult<usize> {
         // Closed-state check first, so a closed dataset reports that rather
         // than a ValueError about its arguments.
         let loader = self.loader()?;
+        // `role_tags` / `set_offsets` are taken as bare objects, not extracted:
+        // the tuple arity is still checked (a 2-tuple is rejected, which is the
+        // shape mistake worth catching), but nothing copies two Python
+        // sequences the touch count never reads. The documented recipe runs
+        // this over 64 plans.
         let (file_ids, rows, _role_tags, _set_offsets) = plan;
         if file_ids.len() != rows.len() {
             return Err(PyValueError::new_err(format!(

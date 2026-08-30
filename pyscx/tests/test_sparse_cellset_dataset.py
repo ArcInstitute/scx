@@ -645,6 +645,58 @@ def test_framed_scatter_has_no_preflight_warning(framed_scx):
     )
 
 
+def test_global_kill_switch_suppresses_the_preflight(two_unframed_scx):
+    """`SCX_SCATTER_BLOCK_INDEX=0` must silence the preflight entirely.
+
+    With the route globally off, reframing could not enable it either, so the
+    warning would send the caller to do something useless — and the framing
+    scan behind it is pure cost. The switch is memoized in a `OnceLock`, so this
+    has to run in a fresh interpreter; nothing pinned it before.
+    """
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    p0, p1 = two_unframed_scx
+    src = textwrap.dedent(
+        f"""
+        import warnings
+        warnings.simplefilter("error", UserWarning)
+        import pyscx
+        pyscx.SparseCellSetDataset([{p0!r}, {p1!r}], scatter_block_index=True).close()
+        pyscx.IndexPlanDataset({p0!r}, scatter_block_index=True).close()
+        print("silent")
+        """
+    )
+    env = {**os.environ, "SCX_SCATTER_BLOCK_INDEX": "0"}
+    r = subprocess.run(
+        [sys.executable, "-c", src], capture_output=True, text=True, env=env
+    )
+    assert r.returncode == 0, r.stderr
+    assert "silent" in r.stdout, (r.stdout, r.stderr)
+
+
+def test_suggested_cache_shards_rejects_a_two_tuple_plan(two_scx):
+    """The plan argument keeps its arity check.
+
+    `role_tags` / `set_offsets` are taken as bare objects so the probe does not
+    copy two sequences it never reads — but a two-array plan (the *pair*
+    loader's shape) is still the shape mistake worth catching, and dropping the
+    element types must not drop the arity with them.
+    """
+    import pyscx
+
+    p0, p1 = two_scx
+    ds = pyscx.SparseCellSetDataset([p0, p1])
+    # pyo3 reports a tuple-arity mismatch as ValueError, not TypeError.
+    with pytest.raises(ValueError, match="tuple of length 4"):
+        ds.suggested_cache_shards(([0, 0], [0, 5]))
+    # ...and the four-tuple still works, so the check is not rejecting everything.
+    assert ds.suggested_cache_shards(([0, 0], [0, 5], [0, 0], [0, 2])) >= 1
+    ds.close()
+
+
 def test_one_framed_file_in_the_set_suppresses_the_warning(framed_scx,
                                                            two_unframed_scx):
     """ANY reader framed, not ALL: the route can still fire for that file's rows.

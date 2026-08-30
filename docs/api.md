@@ -2727,7 +2727,7 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 **Methods**
 
 - `close()` — Explicitly shut the pipeline down (join I/O + decode threads, release rayon pool). Idempotent, and **not** terminal: the next `__iter__` rebuilds and starts a fresh epoch. Recommended before process exit; see [Fork safety](#fork-safety-under-pytorch-dataloadernum_workers--0) and **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
-- `memory_budget()` → `dict` — `breakdown` (the six-key per-component estimate every dataset class reports) plus this class's own `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`. `mmap_mb` appears here and nowhere else — the plan-driven loaders treat page cache as evictable and exclude it.
+- `memory_budget()` → `dict` — `breakdown` (the six-key per-component estimate every class that reports a budget uses — `MultimodalTrainingDataset` reports none) plus this class's own `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`. `mmap_mb` appears here and nowhere else — the plan-driven loaders treat page cache as evictable and exclude it.
 
 **Properties (lifecycle)**
 

@@ -132,7 +132,8 @@ class IndexPlanDataset:
 
     def memory_budget(self) -> dict[str, Any]:
         """`breakdown` — the six-key per-component estimate from the
-        construction auto-tune, in the shape every dataset class reports — plus
+        construction auto-tune, in the shape every class that reports a budget
+        uses — plus
         `max_memory_mb` (the resolved value in force, adaptive when the
         constructor was passed none), `effective_cache_shards` and
         `effective_lookahead`."""
@@ -343,7 +344,7 @@ class SparseCellSetDataset:
 
     def memory_budget(self) -> dict[str, Any]:
         """Resolved shard-cache budget: `breakdown` (the six-key
-        `BudgetBreakdown` every dataset class reports), plus `max_memory_mb`
+        `BudgetBreakdown` every class that reports a budget uses), plus `max_memory_mb`
         (the value in force — adaptive when the constructor was passed none),
         `cache_shards`, `effective_cache_shards` and `shard_decoded_bytes`.
 
@@ -364,8 +365,9 @@ class SparseCellSetDataset:
         `cache_shards` that would let the whole batch stay resident.
 
         Takes one plan in the same `(file_ids, rows, role_tags, set_offsets)`
-        shape `iter_with_plans` consumes; the last two are ignored. Pure index
-        arithmetic: no I/O, no decode::
+        shape `iter_with_plans` consumes; the last two are ignored (and not
+        even converted). A tuple of the wrong arity raises `ValueError`. Pure
+        index arithmetic: no I/O, no decode::
 
             probe = pyscx.SparseCellSetDataset(paths)
             need = max(probe.suggested_cache_shards(p) for p in plans[:64])
@@ -444,8 +446,8 @@ class TrainingDataset:
     def memory_budget(self) -> dict[str, Any]:
         """Memory budget diagnostics.
 
-        `breakdown` is the six-key `BudgetBreakdown` every dataset class
-        reports (`cache_bytes`, `batch_buffer_bytes`,
+        `breakdown` is the six-key `BudgetBreakdown` every class that reports a
+        budget uses (`cache_bytes`, `batch_buffer_bytes`,
         `lookahead_overhead_bytes`, `transient_bytes`, `python_overhead_bytes`,
         `total_bytes`); alongside it are this class's own
         `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`,
