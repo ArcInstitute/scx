@@ -1,6 +1,6 @@
 //! File-operations Python bindings — wraps scx-ops for Python.
 //!
-//! Split into operation-family submodules (ORG-10.16-6): `append` (append /
+//! Split into operation-family submodules (ORG-10.16-6): `append_delete` (append /
 //! append_from_anndata / mark_deleted), `rewrite` (the copy-out rewrites:
 //! compact, optimize, sort, shuffle, build_csc, rollback, merge),
 //! `metadata` (in-place set_uns / modify_metadata), `obs_attach` (the

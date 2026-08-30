@@ -1027,9 +1027,9 @@ impl PyExperiment {
     /// Validate section checksums (and, with `deep`, decode-level integrity).
     ///
     /// With `deep=True`, additionally decodes every sparse shard to verify the
-    /// v3 canonical CSR invariant and verifies every decode sidecar; results
-    /// are appended with `canonical-csr `/`decode-sidecar ` prefixed names.
-    /// Mirrors `scx validate --deep`.
+    /// v3 canonical CSR invariant; results are appended with `canonical-csr `
+    /// prefixed names. Mirrors `scx validate --deep`. (The decode-sidecar
+    /// representation was removed, so there is no sidecar check.)
     ///
     /// Returns a list of (section_name, passed) tuples.
     #[pyo3(signature = (deep=false))]
