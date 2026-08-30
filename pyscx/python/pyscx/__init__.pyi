@@ -204,7 +204,25 @@ class SparseCellSetBatchIter:
 
     def cache_metrics(self) -> dict[str, int]:
         """Shared shard-cache counters — same keys as
-        `SparseCellSetDataset.cache_metrics`. Safe after exhaustion."""
+        `SparseCellSetDataset.cache_metrics`. The flat, cache-only half of
+        `metrics()`, kept because it predates it. Safe after exhaustion."""
+        ...
+
+    def metrics(self) -> dict[str, dict[str, int]]:
+        """Cache- and prefetch-side counters as
+        ``{"cache": {...}, "prefetch": {...}}`` — the same shape
+        `IndexPlanBatchIter.metrics()` returns. ``cache`` is
+        loader-cumulative (shared with `SparseCellSetDataset.cache_metrics`);
+        ``prefetch`` is per-iter and resets on each `iter_with_plans` call.
+        Safe after exhaustion.
+
+        ``prefetch["prefetch_skipped_block_index"]`` counts the L2
+        *prefetch-time* decision: shards left undecoded so the gather could
+        take the block-index path. It stays 0 against an unframed file, where
+        the kwarg is a silent no-op. It is **not** interchangeable with
+        ``cache_metrics()["block_index_groups"]``, which is the route the
+        gather took — at ``lookahead=0`` no prefetch runs, so every counter
+        here is 0 while ``block_index_groups`` is positive."""
         ...
 
 
@@ -313,11 +331,13 @@ class SparseCellSetDataset:
         `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups` — the
         multi-file sibling of `IndexPlanDataset.cache_metrics`.
 
-        The last two report which scattered-read route the gathers took, and on
-        this class they are the only confirmation available: there is no
-        preflight warning here, so `scatter_block_index=True` against a file
-        with no row-group-framed shards is a silent no-op.
-        `block_index_groups > 0` proves the row-group path ran."""
+        The last two report which scattered-read route the gathers took. They
+        matter because there is still no preflight warning on this class, so
+        `scatter_block_index=True` against a file with no row-group-framed
+        shards is a silent no-op; `block_index_groups > 0` proves the row-group
+        path ran and remains the authority on which route was taken. The
+        prefetcher's own decisions are visible separately, via
+        `SparseCellSetBatchIter.metrics()["prefetch"]`."""
         ...
 
     def memory_budget(self) -> dict[str, int]:

@@ -597,12 +597,14 @@ fn iter_skips_prefetch_when_cached() {
 /// ```
 ///
 /// `spawn_prefetches` is one `filter().map()` over a per-shard map, so the law
-/// is structural — which is exactly why it is the right thing to pin before
-/// `IndexPlanIter` is folded into `PlanPrefetchIter`. That arm has **no**
-/// counters at all today, so "port the counters across" is otherwise an
-/// unchecked claim: dropping one increment during the move would leave every
-/// existing assertion green (`iter_skips_prefetch_when_cached` above reads two
-/// of the four; nothing reads the other two).
+/// is structural — which is why it was the right thing to pin before
+/// `IndexPlanIter` was folded into `PlanPrefetchIter` (ORG-9.10-1). At the time
+/// the engine arm had **no** counters, so "port the counters across" was
+/// otherwise an unchecked claim: dropping one increment during the move would
+/// have left every existing assertion green (`iter_skips_prefetch_when_cached`
+/// above reads two of the four; nothing read the other two). It did its job —
+/// deleting one attributed arm from the folded `spawn_prefetches` reddens this
+/// test with "counters must account for all 5 touched shards, got [0, 0, 0, 0]".
 ///
 /// Two arms of the law are exercised: a cold cache, where every shard is
 /// spawned, and a warm one, where every shard is skipped as a cache hit. Be
@@ -610,15 +612,15 @@ fn iter_skips_prefetch_when_cached() {
 /// whatever the split, so a zero term is not evidence about its increment path:
 ///
 /// * `prefetch_skipped_block_index` stays zero here (the fixture is unframed).
-///   Its increment is pinned only from Python, by
-///   `pyscx/tests/test_index_plan_dataset.py::test_scatter_block_index_flag_gates_prefetch_skip`.
-///   `plan_engine_tests::engine_does_not_warm_a_block_index_eligible_shard` is
-///   *not* a second pin for it: that test asserts `CacheMetrics`'
-///   `block_index_groups`, and the engine arm has no `IterMetrics` at all —
-///   which is drift (b) itself.
-/// * `prefetch_skipped_in_flight` is never shown to increment anywhere. Closing
-///   that needs a concurrent peer decode mid-`spawn_prefetches`; it is a real
-///   remaining gap, not something this test covers.
+///   Its increment is pinned by
+///   `plan_engine_tests::engine_does_not_warm_a_block_index_eligible_shard`,
+///   which since the fold asserts the counter directly rather than only
+///   `CacheMetrics::block_index_groups`, and from Python on both loaders.
+/// * `prefetch_skipped_in_flight`'s increment is pinned by
+///   `index_plan::tests::prefetch_skips_and_counts_a_shard_a_peer_is_already_decoding`,
+///   which holds a shard in the singleflight table with `scx-format-io`'s
+///   `test-hooks` decode barrier. Before that seam existed there was no way to
+///   observe the window without racing a sleep against a decode.
 #[test]
 fn iter_prefetch_counters_account_for_every_touched_shard() {
     use std::sync::atomic::Ordering;
@@ -695,10 +697,15 @@ fn iter_prefetch_counters_account_for_every_touched_shard() {
 /// order.
 ///
 /// `process_plan` takes `Vec<(u64,u64)>` **by value** and does this sort in
-/// place; `PlanPrefetchIter`'s `ProcFn` takes `&P`, and its module docs say the
-/// engine deliberately preserves plan order ("no `sort_by_shard` reorder"). So
-/// the fold has to re-sign `process_plan` — to `&[(u64,u64)]` plus an internal
-/// copy, or to a caller-side clone — and that is a change this test can see.
+/// place, then moves the sorted plan into the batch's `pairs`.
+///
+/// Written as a pre-refactor pin on the assumption that ORG-9.10-1 would have
+/// to re-sign it — `PlanPrefetchIter`'s `ProcFn` took `&P`, and the engine's
+/// module docs say it preserves plan order ("no `sort_by_shard` reorder"). The
+/// fold went the other way instead: `ProcFn` now takes the plan **by value**,
+/// because the in-flight queue is its last owner, so `process_plan` is
+/// untouched and there is no per-batch clone. The pin still earns its place —
+/// it is the only test here that can see the sort stop happening.
 ///
 /// The two existing sort tests cannot: `sort_by_shard_pairs_align_with_rows`
 /// only checks `pairs[i]` against row `i`, and `sort_by_shard_is_pure_permutation`

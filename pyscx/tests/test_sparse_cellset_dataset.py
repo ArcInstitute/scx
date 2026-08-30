@@ -450,3 +450,93 @@ def test_scatter_block_index_true_opts_into_the_block_index_path(framed_scx):
         "the row-group path bypasses the whole-shard LRU entirely, so "
         "`cache_shards` is off the critical path here"
     )
+
+
+# ---------------------------------------------------------------------------
+# Prefetch counters on the sparse arm (ORG-9.10-1 drift (b))
+# ---------------------------------------------------------------------------
+#
+# Until the fold, `PlanPrefetchIter` had no `IterMetrics` at all, so this class
+# could only *infer* the L2 warm-skip from the gather-side `block_index_groups`.
+# `SparseCellSetBatchIter.metrics()` now reports it directly, which is the half
+# of ORG-9.10-4 that was blocked on ORG-9.10-1.
+
+_PREFETCH_KEYS = {
+    "prefetch_tasks_spawned",
+    "prefetch_skipped_cache_hit",
+    "prefetch_skipped_in_flight",
+    "prefetch_skipped_block_index",
+}
+
+
+def _drive_iter(path, **kwargs):
+    """Same two-batch drive as `_drive`, but returning the *iterator's*
+    `metrics()` rather than the dataset's cache counters.
+
+    The iterator has to be held in a local: the counters are per-iter, and
+    reading them off a temporary that has already been collected would sample a
+    fresh, zeroed handle.
+    """
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset([path], cache_shards=16, **kwargs)
+    try:
+        it = ds.iter_with_plans(iter([_FRAMED_PLAN] * 2))
+        nnz_per_batch = [int(b["indptr"][-1]) for b in it]
+        assert len(nnz_per_batch) == 2, "premise: both plans must yield a batch"
+        assert all(n > 0 for n in nnz_per_batch), (
+            "premise: the plan must actually read data — an all-empty gather "
+            "would leave every counter at zero and the assertions below would "
+            "hold vacuously"
+        )
+        return it.metrics()
+    finally:
+        ds.close()
+
+
+def test_batch_iter_metrics_match_the_index_plan_shape(framed_scx):
+    """`metrics()` is dict-of-dicts with the same keys as the pair loader's.
+
+    A schema pin, not a value pin: the two classes are meant to be readable by
+    the same diagnostic code, and this is what stops one of them drifting a key
+    name.
+    """
+    m = _drive_iter(framed_scx)
+    assert set(m) == {"cache", "prefetch"}
+    assert set(m["prefetch"]) == _PREFETCH_KEYS
+    # The cache half is the same dict `cache_metrics()` returns.
+    assert set(m["cache"]) >= {"hits", "misses", "full_shard_groups", "block_index_groups"}
+
+
+def test_block_index_prefetch_skip_is_counted_on_the_sparse_arm(framed_scx):
+    """`scatter_block_index=True` leaves the framed shard undecoded, and says so.
+
+    The value of this over `cache_metrics()["block_index_groups"]` is that it
+    reports the *prefetch* decision (L2) rather than the gather's (L1); before
+    the fold only the latter was observable here. They are **not** required to
+    agree: at `lookahead=0` the prefetch never runs and every counter here is 0
+    while the gather still adopts the route, and a peer sharing the cache can
+    warm a shard in between. `block_index_groups` stays the route authority.
+
+    The `False` arm is the fixture's own guard: if the file were unframed, or
+    the plan too wide for the `group_len * 4 < shard_rows` window, both arms
+    would read 0 and this test would assert nothing.
+    """
+    on = _drive_iter(framed_scx, scatter_block_index=True)["prefetch"]
+    off = _drive_iter(framed_scx, scatter_block_index=False)["prefetch"]
+
+    assert on["prefetch_skipped_block_index"] > 0, (
+        "scatter_block_index=True on a framed file must skip warming the shard "
+        "so the gather can take the row-group path"
+    )
+    assert on["prefetch_tasks_spawned"] == 0, (
+        "nothing should have been warmed: the only shard the plan touches was "
+        "left to the block index"
+    )
+    assert off["prefetch_skipped_block_index"] == 0, (
+        "with the gate off the shard is warmed, not skipped — a non-zero count "
+        "here means the per-reader flag is not reaching block_index_eligible"
+    )
+    assert off["prefetch_tasks_spawned"] > 0, (
+        "the default route warms the whole shard, which is a spawned prefetch"
+    )

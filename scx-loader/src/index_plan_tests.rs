@@ -4,7 +4,13 @@
 
 use super::*;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc as StdArc;
+
+// Named explicitly since ORG-9.10-1: the iterator machinery these tests drive
+// now lives in `plan_engine`, so `index_plan` no longer re-exports the channel
+// and atomic types through `use super::*`.
+use crossbeam_channel::{bounded, Receiver};
 
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -499,11 +505,16 @@ fn iter_with_plans_drop_mid_iteration() {
 /// plan yields no batch and iteration continues — the SCX-DATA-LOADER spec's
 /// "plan list is empty → yield no batch for that plan; continue to the next".
 ///
-/// `PlanPrefetchIter`, the engine this iterator is scheduled to be folded into,
-/// does the **opposite** by design (`plan_engine.rs`: "Empty plans are NOT
-/// skipped — `process` is called for every plan"). That divergence is a fourth
-/// drift the review's list of three does not name, and it is the constraint the
-/// fold has to satisfy. Until now it was pinned only from Python
+/// `PlanPrefetchIter`, the engine this iterator is now an adapter over, does
+/// the **opposite** by design (`plan_engine.rs`: "Empty plans are NOT skipped —
+/// `process` is called for every plan"). That divergence was a fourth drift the
+/// review's list of three did not name, and it was the constraint the fold had
+/// to satisfy: it is met in `IndexPlanIter::next`, which discards the zero-row
+/// batch `process_plan` returns for an empty plan, leaving the engine's contract
+/// alone. Not by filtering the plan *stream* — that was tried, and it put the
+/// skip upstream of the pull worker's only cancellation point (see
+/// `dropping_the_iter_stops_an_endless_empty_plan_generator`).
+/// Before the fold it was pinned only from Python
 /// (`pyscx/tests/test_index_plan_dataset.py::test_empty_plan_inside_stream_is_skipped`),
 /// so a Rust-side fold would have gone green here and red only in the Python
 /// suite. See `plan_engine_tests::engine_calls_process_for_every_plan_including_empty`
@@ -552,12 +563,14 @@ fn iter_skips_empty_plans_mid_stream() {
 /// it past the iterator's lifetime, which is how it was watched red (a leaked
 /// `plan_rx` clone in `Drop`).
 ///
-/// That distinction is the point rather than a caveat. Drift (c) is that this
-/// arm drains and `PlanPrefetchIter` does not, and both reach the same
-/// observable outcome — so the fold's real question is whether the drain buys
-/// anything at all, not whether to port it. Answering that needs a rendezvous
-/// observable from *inside* `Drop::drop`, before field destruction; until then
-/// the honest statement is that no test distinguishes the two.
+/// That distinction is the point rather than a caveat. Drift (c) was that this
+/// arm drained and `PlanPrefetchIter` did not, and both reached the same
+/// observable outcome here — so the fold's real question was whether the drain
+/// bought anything at all. It did not, and it was not neutral either: it
+/// advances the user's plan generator during teardown, which
+/// `plan_engine_tests::drop_does_not_keep_pulling_from_an_endless_plan_generator`
+/// measures and which this test cannot see. The drain is gone; both arms now
+/// rely on field destruction to wake the sender.
 ///
 /// The generator blocks in `send` once the bounded channel fills, so a worker
 /// that stays parked keeps `exited` false and the test fails on its deadline
@@ -1097,12 +1110,26 @@ fn process_plan_rejects_oversize_plan() {
 
 // ─── Lazy runtime / fork safety (Patch 11 § P1 #16) ──────────────
 //
-// The loader holds a `OnceLock<Runtime>` and defers tokio runtime
-// construction to the first `iter_with_plans` call. The contract is
-// checked here by inspecting `loader.runtime.get()` before and after
-// touching the iter; constructing the loader must not build a
-// runtime, since that runtime would otherwise be inherited by
-// `DataLoader` worker processes after fork.
+// The loader defers building its `PrefetchEngine` — and with it the tokio
+// runtime — to the first `iter_with_plans` call. Constructing a loader must
+// not build a runtime: it would otherwise be inherited by `DataLoader` worker
+// processes after fork, which is §9.1.
+//
+// Since ORG-9.10-1 the runtime belongs to the engine, so the probe is
+// `PrefetchEngine::runtime_is_built()` rather than a field of this module.
+// `lazy_runtime_idempotent_under_concurrent_init` moved with it, as
+// `plan_engine_tests::engine_runtime_idempotent_under_concurrent_init` — after
+// the fold there is exactly one `OnceLock` and one test for it.
+
+/// Whether the loader has materialised its engine *and* that engine's runtime.
+/// Two states are distinct and both matter: no engine at all (what `new` must
+/// leave behind) and an engine whose runtime is still unbuilt.
+fn runtime_is_built(loader: &IndexPlanLoader) -> bool {
+    loader
+        .engine
+        .get()
+        .is_some_and(|engine| engine.runtime_is_built())
+}
 
 #[test]
 fn lazy_runtime_not_built_at_construction() {
@@ -1110,10 +1137,11 @@ fn lazy_runtime_not_built_at_construction() {
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
     let loader = open_loader(&path, false);
     assert!(
-        loader.runtime.get().is_none(),
-        "IndexPlanLoader::new must not eagerly build the tokio runtime — \
-             that would defeat the DataLoader fork-safety contract"
+        loader.engine.get().is_none(),
+        "IndexPlanLoader::new must not eagerly build the prefetch engine — \
+             its tokio runtime would defeat the DataLoader fork-safety contract"
     );
+    assert!(!runtime_is_built(&loader));
 }
 
 #[test]
@@ -1123,45 +1151,18 @@ fn lazy_runtime_built_after_iter_with_plans_consumed() {
     let loader = Arc::new(open_loader(&path, false));
 
     // Sanity-check the precondition.
-    assert!(loader.runtime.get().is_none());
+    assert!(!runtime_is_built(&loader));
 
     let plans = vec![Ok(vec![(0u64, 1u64), (2, 3)])].into_iter();
     let iter = Arc::clone(&loader).iter_with_plans(plans, /*lookahead*/ 2);
     // Consume one batch — this drives `refill` → `spawn_prefetches`
-    // → the lazy `runtime()` accessor.
+    // → the engine's lazy `runtime()` accessor.
     let mut iter = iter;
     let _ = iter.next();
     assert!(
-        loader.runtime.get().is_some(),
+        runtime_is_built(&loader),
         "first iter consumption should materialize the runtime via OnceLock"
     );
-}
-
-#[test]
-fn lazy_runtime_idempotent_under_concurrent_init() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-    let loader = Arc::new(open_loader(&path, false));
-
-    // Spawn several threads that each grab the runtime through the
-    // private accessor. Compare pointer addresses to confirm all
-    // observers see the same Runtime instance.
-    let mut handles = Vec::new();
-    for _ in 0..4 {
-        let l = Arc::clone(&loader);
-        handles.push(std::thread::spawn(move || {
-            let rt = l.runtime().expect("runtime build must succeed");
-            rt as *const Runtime as usize
-        }));
-    }
-    let addrs: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let first = addrs[0];
-    for a in &addrs[1..] {
-        assert_eq!(
-            *a, first,
-            "all threads must observe the same Runtime instance"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1291,47 +1292,13 @@ fn a_slow_generator_does_not_end_the_epoch() {
     assert_eq!(got, want, "a slow generator must not truncate the epoch");
 }
 
-/// Over-fix guard: when the generator keeps up, the queue still fills to
-/// `lookahead`. A "fix" that pulled one plan at a time would pass every test
-/// above and quietly delete the prefetch.
-#[test]
-fn prefetch_depth_survives_when_the_generator_keeps_up() {
-    const LOOKAHEAD: usize = 4;
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-    let loader = open_loader_arc(&path);
-
-    let plans: Vec<Vec<(u64, u64)>> = (0..LOOKAHEAD as u64)
-        .map(|i| vec![(i * 2, i * 2 + 1)])
-        .collect();
-
-    // Exactly `LOOKAHEAD` plans, and the plan channel is `bounded(LOOKAHEAD)`,
-    // so the pull thread buffers all of them and then runs to exhaustion
-    // without needing the consumer. Waiting on `drained` before the first
-    // `next()` is what makes the `try_recv` arms below race-free.
-    let (drained_tx, drained_rx) = bounded(1);
-    let gen = into_plan_iter(plans).chain(std::iter::from_fn(
-        move || -> Option<std::result::Result<Vec<(u64, u64)>, LoaderError>> {
-            let _ = drained_tx.send(());
-            None
-        },
-    ));
-
-    let mut it = loader.iter_with_plans(gen, LOOKAHEAD);
-    drained_rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("plan generator must drain into the bounded channel");
-
-    it.next()
-        .expect("first batch")
-        .expect("first batch must decode");
-
-    assert_eq!(
-        it.in_flight.len(),
-        LOOKAHEAD - 1,
-        "the queue must still be prefetched to depth when the generator is ahead"
-    );
-}
+// The over-fix guard for §9.4 — "when the generator keeps up, the queue still
+// fills to `lookahead`" — is now
+// `plan_engine_tests::engine_prefetch_depth_survives_when_the_generator_keeps_up`.
+// It reads `PlanPrefetchIter::in_flight`, and since ORG-9.10-1 that queue is
+// the only one: `IndexPlanIter` is an adapter with no queue of its own, so a
+// copy here could only re-assert what the engine's test already asserts about
+// the same code. Deleted rather than weakened to a proxy.
 
 // ---------------------------------------------------------------------
 // §9.3 — bounded, GIL-free teardown.
@@ -1357,6 +1324,12 @@ fn prefetch_depth_survives_when_the_generator_keeps_up() {
 /// same way on a loaded machine: no task started, nothing held, count clean.
 /// The gate now announces entry before parking, and the test fails outright if
 /// no task announces.
+///
+/// Since ORG-9.10-1 the spawning code lives in `PlanPrefetchIter` and has no
+/// path to the loader at all, so the loader count alone can no longer go wrong
+/// — the reachable owner is now the `Arc<PrefetchEngine>`, and a task holding
+/// *that* reproduces the identical hazard one level down. Both counts are
+/// therefore asserted, and the engine count is the one with teeth.
 #[test]
 fn a_prefetch_task_does_not_capture_the_loader() {
     let dir = tempfile::tempdir().unwrap();
@@ -1372,9 +1345,13 @@ fn a_prefetch_task_does_not_capture_the_loader() {
         ..Default::default()
     };
     let mut raw = IndexPlanLoader::new(&path, config, 4, true, 4, 16384).unwrap();
+    // Order matters: `set_scatter_block_index` reaches the reader through
+    // `Arc::get_mut`, and `engine()` clones that `Arc` into the engine. Install
+    // the gate on the engine itself — there is exactly one `OnceLock` for it,
+    // rather than a loader-side stash copied across at engine construction.
     raw.set_scatter_block_index(false);
-    let gate = Arc::new(PrefetchGate::new());
-    raw.set_prefetch_gate(Arc::clone(&gate));
+    let gate = Arc::new(crate::plan_engine::PrefetchGate::new());
+    raw.engine().set_prefetch_gate(Arc::clone(&gate));
     let loader = Arc::new(raw);
 
     let mut it = Arc::clone(&loader).iter_with_plans(
@@ -1404,6 +1381,9 @@ fn a_prefetch_task_does_not_capture_the_loader() {
     // no task is holding anything, so the count looks clean.
     let entered = gate.wait_for_entry(std::time::Duration::from_secs(30));
     let held = Arc::strong_count(&loader);
+    // Two owners: the loader's own `OnceLock` and the live iterator. A third
+    // means a `spawn_blocking` task captured it.
+    let held_engine = loader.engine.get().map(Arc::strong_count).unwrap_or(0);
     gate.release();
 
     let (it, batch) = handle.join().expect("worker must not panic");
@@ -1420,6 +1400,13 @@ fn a_prefetch_task_does_not_capture_the_loader() {
         "a prefetch task in flight is holding an Arc<IndexPlanLoader> \
          (strong_count={held}); such a task can outlive the iterator and drop \
          the runtime from a runtime thread"
+    );
+    assert_eq!(
+        held_engine, 2,
+        "a prefetch task in flight is holding an Arc<PrefetchEngine> \
+         (strong_count={held_engine}); the engine owns the runtime, so an \
+         unabortable blocking task that holds it can release the last reference \
+         from one of that runtime's own threads — see `crate::runtime`"
     );
 }
 
@@ -1449,5 +1436,309 @@ fn the_iterator_as_last_owner_still_gets_a_bounded_teardown() {
         before + 1,
         "the iterator released the last reference, so the runtime must have \
          gone down through BoundedRuntime::drop"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `prefetch_skipped_in_flight` — the one `IterMetrics` counter with no pin
+// ---------------------------------------------------------------------
+
+/// **Pre-refactor pin (ORG-9.10-1, drift (b)).** A shard that a *peer* is
+/// already decoding must be skipped by the prefetch and attributed to
+/// `prefetch_skipped_in_flight` — not spawned again, and not charged to one of
+/// the other three counters.
+///
+/// This is the counter 9a left unpinned, and the reason is structural: the
+/// in-flight table is published by the singleflight leader inside
+/// `SharedShardCache::get_or_decode` and torn down the instant the decode
+/// returns, so from `scx-loader` there was no way to observe the window without
+/// racing a sleep against a decode. `test_index_plan.rs`'s conservation law
+/// covers the *sum*, so a bug that mis-attributed an in-flight skip as a
+/// cache-hit skip would leave every existing test green.
+///
+/// The premise is established by a predicate, never by timing:
+/// `scx-format-io`'s `test-hooks` `set_decode_barrier` parks the leader at the
+/// top of `decode_shard` — after the in-flight publish, before the decode — and
+/// the test waits on `in_flight_contains`, failing loudly if it never becomes
+/// true rather than asserting against an empty table.
+///
+/// `next()` runs on a worker because it cannot complete while the barrier is
+/// held: after the prefetch skip, `process_plan`'s own gather joins the
+/// singleflight as a *follower* and blocks on the same leader.
+#[test]
+fn prefetch_skips_and_counts_a_shard_a_peer_is_already_decoding() {
+    const HELD_SHARD: usize = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    // 32 rows / 4 shards → 8 rows each; shard 2 is rows 16..24.
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        ..Default::default()
+    };
+    let mut raw = IndexPlanLoader::new(&path, config, 8, true, 4, 16384).unwrap();
+    // Unframed fixture, but pin the gate off anyway so a future framed default
+    // cannot turn this into a block-index skip and quietly retarget the test.
+    raw.set_scatter_block_index(false);
+
+    let release = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = StdArc::new(AtomicU64::new(0));
+    {
+        let release = StdArc::clone(&release);
+        let entered = StdArc::clone(&entered);
+        Arc::get_mut(&mut raw.backed)
+            .expect("reader is unshared before the loader is wrapped")
+            .set_decode_barrier(Arc::new(move |sidx: usize| {
+                if sidx != HELD_SHARD {
+                    return;
+                }
+                entered.fetch_add(1, Ordering::AcqRel);
+                while !release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+    }
+    let loader = Arc::new(raw);
+
+    // The peer: becomes singleflight leader for HELD_SHARD and parks.
+    let peer_reader = Arc::clone(&loader.backed);
+    let peer = std::thread::spawn(move || peer_reader.read_shard_cached_arc(HELD_SHARD));
+
+    // Premise, by predicate: the shard really is in the in-flight table.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !loader.backed.in_flight_contains(HELD_SHARD) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer never published shard {HELD_SHARD} in the in-flight table \
+             ({} barrier entries) — the premise failed, so the assertion below \
+             would have been vacuous",
+            entered.load(Ordering::Acquire)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // Both rows live in HELD_SHARD, so it is the only shard the plan touches.
+    let mut it = Arc::clone(&loader).iter_with_plans(into_plan_iter(vec![vec![(16u64, 17u64)]]), 1);
+    let metrics = it.iter_metrics();
+    let consumer = std::thread::spawn(move || {
+        let b = it.next();
+        (it, b)
+    });
+
+    // `spawn_prefetches` has run once the counter moves; releasing before that
+    // would let the leader finish and reopen the race this test exists to close.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while metrics.prefetch_skipped_in_flight.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "prefetch_skipped_in_flight never incremented for a shard that was \
+             demonstrably in flight: spawned={} cache_hit={} block_index={}",
+            metrics.prefetch_tasks_spawned.load(Ordering::Relaxed),
+            metrics.prefetch_skipped_cache_hit.load(Ordering::Relaxed),
+            metrics.prefetch_skipped_block_index.load(Ordering::Relaxed),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        metrics.prefetch_tasks_spawned.load(Ordering::Relaxed),
+        0,
+        "the only shard the plan touches was already in flight, so nothing \
+         should have been spawned"
+    );
+    assert_eq!(
+        metrics.prefetch_skipped_cache_hit.load(Ordering::Relaxed),
+        0,
+        "the shard was in flight, not cached — mis-attributing the skip is \
+         exactly what the conservation law cannot see"
+    );
+
+    release.store(true, Ordering::Release);
+    peer.join().expect("peer thread").expect("peer decode");
+    let (it, batch) = consumer.join().expect("consumer thread");
+    batch.expect("a batch").expect("must decode");
+    drop(it);
+
+    assert_eq!(
+        metrics.prefetch_skipped_in_flight.load(Ordering::Relaxed),
+        1,
+        "exactly one shard was skipped as in-flight"
+    );
+}
+
+/// **Dropping the iterator must stop the plan generator even when every plan is
+/// empty.**
+///
+/// The empty-plan skip is this loader's contract, not the engine's, so the fold
+/// first expressed it as `plans.filter(..)` on the stream handed to the engine.
+/// That put the filter *upstream* of the only place cancellation is observed:
+///
+/// ```ignore
+/// for item in plans {
+///     if plan_tx.send(item).is_err() { break; }   // the sole cancellation point
+/// }
+/// ```
+///
+/// `Filter::next` discards non-matching items internally and never returns to
+/// that loop body, so a stream of empty plans never reaches `send` and never
+/// learns the receiver is gone. An endless empty stream spins the detached
+/// worker forever — on the Python path, calling `PyPlanIterator` long after the
+/// batch iterator was dropped — and a long finite empty prefix is pulled with no
+/// backpressure at all, since it never occupies a channel slot.
+///
+/// Skipping inside `next` instead keeps every plan going through the bounded
+/// channel, which is what the pre-fold loop did.
+///
+/// # Both halves are rendezvous, not sleeps
+///
+/// An earlier version of this test dropped immediately and treated "the pull
+/// count did not move for 50 ms" as proof the worker had stopped. That reading
+/// is also what a worker that has *not started yet* produces, so on a slow
+/// scheduler the test would declare success, set `stop`, and let a late-starting
+/// broken worker exit quietly — passing on exactly the bug it exists to catch.
+///
+/// So: wait for `pulled >= 1` before dropping, which proves the worker really is
+/// pulling; and after the drop wait on `exited`, set by the producer's own
+/// `Drop`. That fires only when the worker's `for item in plans` loop ends, i.e.
+/// when `send` observed the disconnect — a real completion signal rather than an
+/// inference from silence.
+#[test]
+fn dropping_the_iter_stops_an_endless_empty_plan_generator() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+    let loader = open_loader_arc(&path);
+
+    struct EndlessEmptyPlans {
+        pulled: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
+    }
+    impl Iterator for EndlessEmptyPlans {
+        type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            // The escape hatch exists so a *failing* run cleans up instead of
+            // leaking a hot spin loop for the rest of the suite.
+            if self.stop.load(AtomicOrdering::Acquire) {
+                return None;
+            }
+            self.pulled.fetch_add(1, AtomicOrdering::AcqRel);
+            Some(Ok(Vec::new()))
+        }
+    }
+    impl Drop for EndlessEmptyPlans {
+        fn drop(&mut self) {
+            self.exited.store(true, AtomicOrdering::Release);
+        }
+    }
+
+    let pulled = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
+    let it = loader.iter_with_plans(
+        EndlessEmptyPlans {
+            pulled: Arc::clone(&pulled),
+            stop: Arc::clone(&stop),
+            exited: Arc::clone(&exited),
+        },
+        /*lookahead*/ 4,
+    );
+
+    // Premise: the worker is actually pulling. Without this the drop below can
+    // race ahead of the thread ever starting, and "quiet" would prove nothing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pulled.load(AtomicOrdering::Acquire) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pull worker never pulled a single plan — premise failed, so the \
+             assertion below would have been vacuous"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Deliberately not consumed: with every plan empty there is no batch to
+    // wait for, and `next` would block. The worker is already running.
+    drop(it);
+
+    // Conclusion: the producer was dropped, which happens only when the worker's
+    // `for item in plans` loop ended — i.e. `send` saw the disconnect.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut released = false;
+    while std::time::Instant::now() < deadline {
+        if exited.load(AtomicOrdering::Acquire) {
+            released = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Set only after the verdict is decided, so a broken worker cannot be
+    // rescued by the escape hatch before we have looked.
+    stop.store(true, AtomicOrdering::Release);
+
+    assert!(
+        released,
+        "10s after the iterator was dropped the plan generator had still not \
+         been released ({} pulls and counting) — dropping `plan_rx` cannot \
+         cancel a worker that never reaches `send`",
+        pulled.load(AtomicOrdering::Acquire)
+    );
+}
+
+/// Empty plans must not reorder or swallow a plan-stream error.
+///
+/// `iter_with_plans_propagates_plan_errors` puts non-empty plans on both sides
+/// of the error, so it never exercises the interaction the empty-plan skip
+/// actually introduces: `IndexPlanIter::next` now `continue`s past zero-row
+/// batches, and the engine latches a plan-stream error and surfaces it one-shot
+/// *after* the already-queued plans drain. Skipping is only safe if `Err` never
+/// matches the `continue` arm and the latch is not consumed by the loop.
+///
+/// Found while checking round 4's own claim rather than reported by a reviewer;
+/// the property held on inspection, but nothing pinned it.
+#[test]
+fn empty_plans_before_an_error_do_not_reorder_or_swallow_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 8, 4, 2);
+    let loader = open_loader_arc(&path);
+
+    // Empty plans immediately either side of the error, and a trailing
+    // non-empty plan that must never be reached (the error is sticky).
+    let plans: Vec<std::result::Result<Vec<(u64, u64)>, LoaderError>> = vec![
+        Ok(vec![]),
+        Ok(vec![(0, 1)]),
+        Ok(vec![]),
+        Ok(vec![]),
+        Err(LoaderError::ChannelError("synthetic".into())),
+        Ok(vec![(2, 3)]),
+    ];
+    let mut it = loader.iter_with_plans(plans.into_iter(), 2);
+
+    // The leading empty is skipped, so the first item is the real batch.
+    let first = it.next().expect("a first item").expect("must decode");
+    assert_eq!(
+        first.pairs,
+        vec![(0, 1)],
+        "leading empty plan must be skipped"
+    );
+
+    // Two more empties are skipped *within* this call, and the latched error
+    // surfaces next rather than being consumed by the skip loop.
+    match it.next().expect("a second item") {
+        Err(LoaderError::ChannelError(s)) => assert!(s.contains("synthetic")),
+        Err(other) => panic!("expected the ChannelError, got {other}"),
+        Ok(b) => panic!(
+            "empty plans between the batch and the error were not skipped, or \
+             the error was reordered behind one: got a batch with {} pairs",
+            b.pairs.len()
+        ),
+    }
+
+    assert!(
+        it.next().is_none(),
+        "the plan-stream error is sticky — nothing after it may be yielded"
     );
 }

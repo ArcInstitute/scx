@@ -102,9 +102,13 @@ fn rows_of(plan: &Plan) -> Vec<(u32, u64)> {
 
 /// Gather the single non-zero `(col, value)` of each plan row through the
 /// engine's readers — exercises the real `read_rows_with` path.
-fn gather(engine: &PrefetchEngine, plan: &Plan) -> Result<Vec<(i32, f32)>> {
+///
+/// Takes the plan **by value**, matching `ProcFn` since ORG-9.10-1: the queue
+/// is the plan's last owner, so a consumer that needs to consume or reorder it
+/// (the pair loader sorts in place) does not have to clone per batch.
+fn gather(engine: &PrefetchEngine, plan: Plan) -> Result<Vec<(i32, f32)>> {
     let mut out = Vec::with_capacity(plan.len());
-    for &(fid, row) in plan {
+    for &(fid, row) in &plan {
         let mut got: Option<(i32, f32)> = None;
         engine
             .reader(fid)
@@ -545,13 +549,18 @@ fn framed_engine(dir: &std::path::Path, scatter_block_index: bool) -> Arc<Prefet
 /// lets the gather take the O(rows) row-group path instead of having the win
 /// negated by an eager full-shard warm.
 ///
-/// Nothing tested this branch. `plan_engine.rs`'s
-/// `|| reader.block_index_eligible(sidx, group_len)` could be deleted and the
-/// whole suite stayed green — the L2 adoption is observable only through
-/// `IterMetrics`, which this arm of the fork does not have (drift (b)).
-/// `block_index_groups` is the proxy that works without it: the gather takes
-/// the block-index path **only** if the shard is still cold when it runs, so a
-/// prefetch that warmed it would show up as `full_shard_groups` instead.
+/// Nothing tested this branch: `plan_engine.rs`'s
+/// `reader.block_index_eligible(sidx, group_len)` arm could be deleted and the
+/// whole suite stayed green. When this pin was written the engine had no
+/// `IterMetrics` (drift (b)), so `block_index_groups` was the only available
+/// proxy — the gather takes the block-index path **only** if the shard is still
+/// cold when it runs, so a prefetch that warmed it shows up as
+/// `full_shard_groups` instead.
+///
+/// Since the fold this arm *does* have counters, so the assertion below reads
+/// `prefetch_skipped_block_index` directly as well. Both are kept deliberately:
+/// the counter is the prefetch-time decision, `block_index_groups` is the route
+/// the gather took, and asserting only one of them would let the other drift.
 #[test]
 fn engine_does_not_warm_a_block_index_eligible_shard() {
     let dir = tempfile::tempdir().unwrap();
@@ -560,16 +569,36 @@ fn engine_does_not_warm_a_block_index_eligible_shard() {
     // One row in each of shards 0..3 (64 rows per shard). group_len = 1, so
     // `1 * ROW_RANGE_WINDOW_DIVISOR < 64` — cost-eligible on every shard.
     let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
-    let out: Vec<_> = Arc::clone(&engine)
-        .iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather)
-        .map(|r| r.unwrap())
-        .collect();
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
 
     let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
     assert_eq!(out, vec![want], "the gather must still be correct");
 
     let m = engine.cache_metrics();
     use std::sync::atomic::Ordering as AtomicOrdering;
+    // The prefetch-side half of the claim, asserted directly since ORG-9.10-1
+    // gave this arm `IterMetrics`. Before that this test could only reach for
+    // `CacheMetrics::block_index_groups`, which is the *gather's* route — so a
+    // prefetch that warmed the shard for some unrelated reason, leaving the
+    // gather to take the block-index path anyway, would have read identically.
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_block_index
+            .load(AtomicOrdering::Relaxed),
+        4,
+        "all four touched shards must be skipped *as block-index eligible*, not          merely left unwarmed for some other reason (spawned={}, cache_hit={},          in_flight={})",
+        iter_metrics
+            .prefetch_tasks_spawned
+            .load(AtomicOrdering::Relaxed),
+        iter_metrics
+            .prefetch_skipped_cache_hit
+            .load(AtomicOrdering::Relaxed),
+        iter_metrics
+            .prefetch_skipped_in_flight
+            .load(AtomicOrdering::Relaxed),
+    );
     assert!(
         m.block_index_groups.load(AtomicOrdering::Relaxed) > 0,
         "premise + claim: every group is framed, cold and sparse, so the gather \
@@ -723,15 +752,17 @@ fn engine_calls_process_for_every_plan_including_empty() {
 /// **Pre-refactor pin (ORG-9.10-1, drift (c)).** Dropping the iterator
 /// mid-stream releases the plan-pull worker promptly.
 ///
-/// `IndexPlanIter::drop` drains `plan_rx` first so a worker parked in `send`
-/// fails fast; this arm does not, and reaches the same outcome because dropping
-/// the struct's `plan_rx` field wakes the sender anyway. Both arms therefore
-/// satisfy this test, which is exactly what it is here to record: the two
-/// implementations of drift (c) are **observably identical** from outside, so
-/// the fold's question is whether the drain earns its place, not how to port
-/// it. See `index_plan_tests::pull_worker_exits_promptly_after_iter_drop` for
-/// the same statement on the other arm and what would be needed to tell them
-/// apart.
+/// Drift (c) was that the pair arm drained `plan_rx` in `Drop` and this one did
+/// not, while both satisfied this test — dropping the `plan_rx` field wakes a
+/// parked sender on its own. That is what this pin records: the two were
+/// **observably identical here**, so the fold's question was whether the drain
+/// earned its place, not how to port it.
+///
+/// It did not. The drain was carried over briefly and then removed, because it
+/// is *not* neutral in a way this test cannot see: it advances the user's plan
+/// generator during teardown. See
+/// `drop_does_not_keep_pulling_from_an_endless_plan_generator`, which measures
+/// exactly that (0 extra pulls without the drain, `lookahead` with it).
 #[test]
 fn engine_pull_worker_exits_promptly_after_drop() {
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -792,3 +823,178 @@ fn engine_pull_worker_exits_promptly_after_drop() {
 // ---------------------------------------------------------------------
 // §9.3 — bounded, GIL-free teardown.
 // ---------------------------------------------------------------------
+
+/// **The limit of the prefetch counters**, pinned so the docs cannot overstate
+/// them again.
+///
+/// `spawn_prefetches` returns early when `lookahead == 0`, so every
+/// `IterMetrics` counter stays zero — while the *gather* still takes the
+/// block-index route and increments `CacheMetrics::block_index_groups`. The two
+/// therefore measure different things: `prefetch_skipped_block_index` is an L2
+/// prefetch-time decision that only exists when prefetching is enabled, and
+/// `block_index_groups` is the route the gather actually took.
+///
+/// This was documented the wrong way round — as "a disagreement between them is
+/// a bug" — which would have made `lookahead=0` read as a defect.
+#[test]
+fn lookahead_zero_leaves_prefetch_counters_zero_while_the_gather_still_adopts() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine(dir.path(), /*scatter_block_index*/ true);
+
+    let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 0, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want], "the gather must still be correct");
+
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    for (name, v) in [
+        (
+            "prefetch_tasks_spawned",
+            iter_metrics
+                .prefetch_tasks_spawned
+                .load(AtomicOrdering::Relaxed),
+        ),
+        (
+            "prefetch_skipped_cache_hit",
+            iter_metrics
+                .prefetch_skipped_cache_hit
+                .load(AtomicOrdering::Relaxed),
+        ),
+        (
+            "prefetch_skipped_in_flight",
+            iter_metrics
+                .prefetch_skipped_in_flight
+                .load(AtomicOrdering::Relaxed),
+        ),
+        (
+            "prefetch_skipped_block_index",
+            iter_metrics
+                .prefetch_skipped_block_index
+                .load(AtomicOrdering::Relaxed),
+        ),
+    ] {
+        assert_eq!(v, 0, "{name} must be 0 at lookahead=0 — no prefetch ran");
+    }
+
+    let m = engine.cache_metrics();
+    assert!(
+        m.block_index_groups.load(AtomicOrdering::Relaxed) > 0,
+        "the gather still adopts the block-index route with no prefetch at all, \
+         which is precisely why a zero prefetch counter is not evidence that it \
+         did not (block_index={}, full_shard={})",
+        m.block_index_groups.load(AtomicOrdering::Relaxed),
+        m.full_shard_groups.load(AtomicOrdering::Relaxed),
+    );
+}
+
+/// **Dropping an iterator must not keep pulling from the user's plan
+/// generator.**
+///
+/// The `plan_rx` drain this PR briefly carried over from the pair arm —
+/// `while self.plan_rx.try_recv().is_ok() {}` inside `Drop` — was justified as
+/// "bounded by the channel capacity". It is not: the receiver is still
+/// *connected* while the loop runs, so every successful `try_recv` frees a slot,
+/// the parked pull worker wakes, calls `plans.next()` again and refills it. A
+/// large, infinite or side-effecting producer can therefore be advanced far
+/// past the lookahead during destruction, and the `BoundedRuntime` deadline
+/// does not apply — it is reached only *after* this `Drop` body returns.
+///
+/// Dropping `plan_rx` with the struct's fields disconnects the channel and
+/// wakes a blocked sender on its own, which is what the engine did before the
+/// fold. So the drain bought nothing and cost an unbounded pull.
+///
+/// The existing `engine_pull_worker_exits_promptly_after_drop` cannot see this:
+/// its producer is finite (100k) and it only observes that the worker eventually
+/// exits *after* `drop` has already returned.
+#[test]
+fn drop_does_not_keep_pulling_from_an_endless_plan_generator() {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = two_file_engine(dir.path(), 8);
+
+    /// Never ends, counts every pull, and announces its own release.
+    struct EndlessPlans {
+        pulled: Arc<AtomicU64>,
+        exited: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Iterator for EndlessPlans {
+        type Item = Result<Plan>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.pulled.fetch_add(1, AtomicOrdering::AcqRel);
+            Some(Ok(vec![(0u32, 1u64)]))
+        }
+    }
+    impl Drop for EndlessPlans {
+        fn drop(&mut self) {
+            self.exited
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    const LOOKAHEAD: usize = 4;
+    let pulled = Arc::new(AtomicU64::new(0));
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut it = engine.iter_with_plans(
+        EndlessPlans {
+            pulled: Arc::clone(&pulled),
+            exited: Arc::clone(&exited),
+        },
+        LOOKAHEAD,
+        rows_of,
+        gather,
+    );
+    it.next().expect("first batch").expect("gather");
+
+    // Premise, by count rather than by silence: the worker has pulled more than
+    // the channel can hold, so at least one `send` is parked. "The counter did
+    // not move for 25 ms" would also describe a merely descheduled worker, and
+    // taking `before` in that state would miscount ordinary pre-drop filling as
+    // teardown pulls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pulled.load(AtomicOrdering::Acquire) < (LOOKAHEAD as u64) + 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never filled the channel (pulled={}) — premise failed",
+            pulled.load(AtomicOrdering::Acquire)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let before = pulled.load(AtomicOrdering::Acquire);
+
+    let t0 = std::time::Instant::now();
+    drop(it);
+    let elapsed = t0.elapsed();
+
+    // Conclusion, by completion signal: the producer's `Drop` fires only when
+    // the worker's `for item in plans` loop ends. Measured: 0 extra pulls on
+    // 8/8 runs without the drain, exactly `LOOKAHEAD` (4) with it — the drain
+    // frees one slot per `try_recv` and the worker refills each one. Allow 1
+    // for the worker being mid-`next` when the channel disconnects.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !exited.load(AtomicOrdering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pull worker was still running 10s after drop (pulled={})",
+            pulled.load(AtomicOrdering::Acquire)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let after = pulled.load(AtomicOrdering::Acquire);
+    let extra = after - before;
+
+    assert!(
+        extra <= 1,
+        "dropping the iterator pulled {extra} more plans from an endless \
+         generator (before={before}, after={after}, lookahead={LOOKAHEAD}). \
+         Drop must disconnect and let the worker fail its next `send`, not free \
+         slots for it to refill — on the ML path that generator is Python."
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "drop took {elapsed:?}"
+    );
+}
