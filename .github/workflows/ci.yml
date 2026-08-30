@@ -107,6 +107,14 @@ jobs:
       # DWARF debuginfo; `[profile.dev] debug = "line-tables-only"` (root
       # Cargo.toml) shrinks target/ enough to save safely.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - run: cargo test --workspace --exclude rscx
       # Headroom telemetry for retiring the free-disk-space step above once
       # line-tables-only demonstrably leaves multi-GB slack.
@@ -158,6 +166,14 @@ jobs:
         uses: rui314/setup-mold@v1
       # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
       - run: cargo test -p scx-convert --features hdf5
@@ -194,6 +210,14 @@ jobs:
           components: clippy
       # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       # `--all-targets` lints tests, benches and examples too. Without it a
       # whole class of test-code defect is invisible to CI, and test code is
       # where the correctness reasoning lives.
@@ -2749,6 +2773,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       # scx-cli cloud feature only
       - name: clippy scx-cli --features cloud
         run: cargo clippy -p scx-cli --features cloud --all-targets -- -D warnings
@@ -2805,6 +2837,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       # hdf5 feature needs the system library.
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
@@ -2847,6 +2887,14 @@ jobs:
       # job previously had no Rust cache at all, so every run cold-compiled the
       # whole workspace dependency closure through `maturin develop`.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -2910,6 +2958,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
