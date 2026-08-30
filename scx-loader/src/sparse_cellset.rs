@@ -204,16 +204,29 @@ fn resolve_enforced_cache_bytes(
 
 /// The one knob the sparse auto-tune reduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SparseCellSetParams {
-    pub cache_shards: usize,
+pub(crate) struct SparseCellSetParams {
+    pub(crate) cache_shards: usize,
 }
 
 /// The `SparseCellSetLoader` arm of [`crate::budget::BudgetModel`].
 ///
-/// Only two terms are non-zero, and that is the model rather than an omission:
-/// the shard cache **is** this loader's budget — there is no batch buffer, no
-/// plan-tuple staging and no per-batch obs scratch on the gather path — plus
-/// the interpreter/numpy/Arrow constant every path pays.
+/// Only two terms are non-zero. **What that does and does not buy is worth
+/// being exact about**, because ORG-9.10-5 made the budget cover the
+/// interpreter constant and it would be easy to over-read that as a hard
+/// ceiling on the process:
+///
+/// * **Charged**: the decoded shard cache, sized and enforced from this model,
+///   plus the interpreter/numpy/Arrow constant every path pays.
+/// * **Not charged**: the gathered batch itself and its transients. Unlike
+///   `IndexPlanLoader`, this path has no `max_plan_size`, so a plan's output
+///   size is caller-controlled and unbounded — there is nothing fixed to cost.
+/// * **Not a hard cap**: `WeightedLruCache::put_with_budget` deliberately keeps
+///   a single entry that exceeds the byte budget on its own (refusing would
+///   defeat the cache for any outsized shard), so one above-average shard can
+///   sit above the cap. The model tunes on the *average* shard size.
+///
+/// So `budget_exceeded == false` means "the cache this loader sizes fits the
+/// budget", not "the process will stay under `max_memory_mb`".
 ///
 /// The floor is 1, not 0, for the reason `IndexPlanLoader` refuses below 1: a
 /// cache that can hold nothing re-decodes every shard on every batch, and the

@@ -165,9 +165,9 @@ pub struct IndexPlanLoader {
 
 /// Knobs the plan-driven auto-tune reduces, in reduction order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexPlanParams {
-    pub cache_shards: usize,
-    pub lookahead: usize,
+pub(crate) struct IndexPlanParams {
+    pub(crate) cache_shards: usize,
+    pub(crate) lookahead: usize,
 }
 
 /// The `IndexPlanLoader` arm of [`crate::budget::BudgetModel`].

@@ -2519,7 +2519,10 @@ things that were quietly different:
 
   **The cost, measured.** A two-arm A/B on the small tier (`ml_loader`, `scx_auto`, 4
   datasets, main-arm capture as the baseline) found **no timing regression** and a real
-  peak-RSS rise on the large-file datasets: `tabula_sapiens_100k` **+10.4%**. The mechanism
+  peak-RSS rise on the large-file datasets: `tabula_sapiens_100k` **+10.4%**. Both captures
+  are checked in — `results/mainarm_9e_20260830/` and `results/branch_9e_20260830/` — per
+  [benchmark_manifest.md](benchmark_manifest.md); note they are an **A/B against each other**
+  on a partial-fixture Lambda node, not a promoted `baselines/LATEST` capture. The mechanism
   is the intended one and is visible in the tuned config — the mmap term no longer forces a
   reduction, so `shard_group_size` goes 3 → 4 (default) and 4 → 5 (`hvg_indices`), holding
   more decoded shard buffers resident. Files small enough that the mmap term never bound

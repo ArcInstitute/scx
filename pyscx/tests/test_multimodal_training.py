@@ -270,6 +270,64 @@ def test_multimodal_memory_budget_reports_the_uniform_pin(tmp_path):
     ds.close()
 
 
+def test_multimodal_warns_per_modality_when_a_budget_is_exceeded(tmp_path):
+    """A modality that cannot fit even at its minimums must say so in Python.
+
+    ``TrainingDataset`` warns on ``budget_exceeded``; ``MultimodalTrainingDataset``
+    builds ``TrainingPipeline`` values directly, so before this it only wrote a
+    Rust log line — the exact notebook-invisible failure the change set out to
+    close. Raised in review (Cursor Agent).
+
+    The warning must fire **after** the uniform pin, not before: the pin shrinks
+    knobs further and can clear the flag on a modality the tuner had flagged.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, narrow_n_vars, wide_n_vars = 100, 20, 25_000
+    narrow = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, narrow_n_vars)).astype(np.float32))
+    )
+    narrow.var_names = [f"g{i}" for i in range(narrow_n_vars)]
+    wide = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.05, size=(n_obs, wide_n_vars)).astype(np.float32))
+    )
+    wide.var_names = [f"p{i}" for i in range(wide_n_vars)]
+    mu = mudata.MuData({"rna": narrow, "prot": wide})
+    mu.obs_names = [f"c{i}" for i in range(n_obs)]
+    path = str(tmp_path / "exceeded.scx")
+    pyscx.from_mudata(mu, path)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ds = pyscx.MultimodalTrainingDataset(
+            path,
+            modalities=["rna", "prot"],
+            batch_size=256,
+            max_memory_mb=64,
+            normalize=False,
+            log1p=False,
+            seed=1,
+        )
+    msgs = [str(w.message) for w in caught]
+    budget = ds.memory_budget()
+    exceeded = [n for n, m in budget["modalities"].items() if m["budget_exceeded"]]
+    # Premise: the wide modality really is exhausted, else nothing to warn about.
+    assert exceeded == ["prot"], budget
+
+    named = [m for m in msgs if "cannot hold this file" in m and "'prot'" in m]
+    assert named, (
+        f"the exhausted modality must be named in a UserWarning: {msgs}"
+    )
+    assert not any("'rna'" in m for m in named), (
+        "a modality that fits must not be warned about"
+    )
+    ds.close()
+
+
 def test_multimodal_default_budget_does_not_warn_about_floors(cite_seq_path):
     """An *adaptive* budget resolving above the request is the policy working.
 

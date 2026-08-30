@@ -3067,7 +3067,7 @@ with `set_offsets`.
 |---|---|---|
 | `paths` | — | List of `.scx` paths. `file_id` in a plan is the index into this list. |
 | `cache_shards` | `None` → 128 | Shard-cache count cap. Size it with `suggested_cache_shards`, not by guessing — see [Sizing the shard cache](training.md#sizing-the-shard-cache). |
-| `max_memory_mb` | `None` | Memory budget, the same process envelope the other loader classes use — **not** a bare cache cap: the constant interpreter/numpy/Arrow overhead is subtracted before the cache is sized. `None` resolves adaptively (never unbounded). Both the count cap and the byte cap are enforced, and on large-shard files the byte cap binds first. |
+| `max_memory_mb` | `None` | Memory budget. Since ORG-9.10-5 the constant interpreter/numpy/Arrow overhead is subtracted before the cache is sized, so this is no longer a bare cache cap — but it is **not** a hard ceiling on the process either: the gathered batch and its transients are not charged (this path has no `max_plan_size`, so plan output size is caller-controlled), and one above-average shard can sit above the byte cap because the LRU keeps an oversize entry rather than refusing to cache it. `None` resolves adaptively (never unbounded). Both the count cap and the byte cap are enforced, and on large-shard files the byte cap binds first. |
 | `remap_tables` / `n_global_genes` | `None` | Per-file `local → global` gene tables. Required for a cell **set** that spans files: raw-local indices from different files are not comparable. |
 | `normalize` / `log1p` / `target_sum` | `None` → off | Off by default here, unlike the training classes. |
 | `lookahead` | `None` → tuned | Prefetch depth; `0` disables prefetch. |
@@ -3089,7 +3089,7 @@ delimits each set's row range in the flat batch.
 - `iter_with_plans(plans, lookahead=None)` → `SparseCellSetBatchIter` — stream plans into §4.4 sparse batch dicts.
 - `suggested_cache_shards(plan)` → `int` — distinct `(file_id, shard)` pairs one plan touches. Takes the same four-tuple `iter_with_plans` consumes; `role_tags` / `set_offsets` are ignored.
 - `cache_metrics()` → `dict` — cumulative shard-cache counters, including `full_shard_groups` / `block_index_groups`, which report the scattered-read route the gathers actually took.
-- `memory_budget()` → `dict` — `breakdown` plus `max_memory_mb`, `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`, `budget_exceeded`. Only `cache_bytes` and `python_overhead_bytes` are non-zero in the breakdown: on this path the shard cache *is* the budget. `budget_exceeded` means even a one-shard cache does not fit, which is the only case where `breakdown["total_bytes"]` exceeds `max_memory_mb`.
+- `memory_budget()` → `dict` — `breakdown` plus `max_memory_mb`, `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`, `budget_exceeded`. Only `cache_bytes` and `python_overhead_bytes` are non-zero in the breakdown: on this path the shard cache *is* the budget. `budget_exceeded` means even a one-shard cache does not fit. It is a statement about the **cache this loader sizes**, not a guarantee about process RSS — see the `max_memory_mb` row for the two terms it does not cover.
 - `close()` — release the prefetch engine's tokio runtime, GIL detached, 5 s bound. Idempotent and **terminal** — see **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
 
 ## CLI (`scx`)

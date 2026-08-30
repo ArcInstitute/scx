@@ -356,7 +356,13 @@ class SparseCellSetDataset:
         breakdown: on the sparse path the shard cache *is* the budget, so there
         is no batch-buffer or plan-tuple term. `total_bytes` fits
         `max_memory_mb` unless `budget_exceeded` is True, which means even a
-        one-shard cache does not fit."""
+        one-shard cache does not fit.
+
+        That is a statement about the cache this loader sizes, not a ceiling on
+        process RSS: the gathered batch and its transients are not charged (this
+        path has no `max_plan_size`), and the LRU keeps a single oversize shard
+        rather than refusing to cache it, so one above-average shard can sit
+        above the byte cap."""
         ...
 
     def suggested_cache_shards(

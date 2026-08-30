@@ -7,10 +7,11 @@
 //! per-path lookahead/prefetch overhead, transient temporaries, and
 //! constant Python overhead.
 //!
-//! [`BudgetBreakdown`] is the shared component type that both paths produce
-//! at construction time. The auto-tune algorithms remain in the respective
-//! modules — only the breakdown shape and its Python representation are
-//! shared here.
+//! [`BudgetBreakdown`] is the shared component type every path produces at
+//! construction time. Since ORG-9.10-5 the auto-tune *algorithm* is shared too:
+//! [`tune`] drives the descent for all three loaders and each module supplies
+//! only its own knobs and reduction order through [`BudgetModel`]. What stays
+//! per-module is the **exhaustion policy** — see [`Tuned::exhausted`].
 //!
 //! This module also owns the two **cache-sizing verdicts** the plan-driven
 //! loaders warn from — [`assess_cache_sizing`] (construction time, from the
@@ -323,7 +324,7 @@ pub(crate) fn profiling_enabled() -> bool {
 /// minimum. [`tune`] `debug_assert`s the property on every step and
 /// [`assert_monotone_reduction_chain`] checks the whole chain in tests, so it is
 /// a checked property rather than the unstated assumption it used to be.
-pub trait BudgetModel {
+pub(crate) trait BudgetModel {
     /// The knobs this model tunes.
     type Params: Copy + std::fmt::Debug;
 
@@ -339,22 +340,23 @@ pub trait BudgetModel {
 
 /// The outcome of an auto-tune.
 #[derive(Debug, Clone, Copy)]
-pub struct Tuned<P> {
+pub(crate) struct Tuned<P> {
     /// The knob setting that fits, or the floor when `exhausted`.
-    pub params: P,
+    pub(crate) params: P,
     /// `estimate(params)` — what the caller should report.
-    pub breakdown: BudgetBreakdown,
+    pub(crate) breakdown: BudgetBreakdown,
     /// `true` when the model ran out of knobs before fitting. **What to do
     /// about it is the caller's decision, deliberately**: the sequential path
-    /// flags it and continues, `IndexPlanLoader` refuses construction, and
-    /// `SparseCellSetLoader` keeps an empty cache and warns. Collapsing those
-    /// into one policy would change three user-visible behaviours to no end.
-    pub exhausted: bool,
+    /// flags it and continues (and raises a `UserWarning`), `IndexPlanLoader`
+    /// refuses construction, and `SparseCellSetLoader` bottoms out at its
+    /// one-shard floor and warns. Collapsing those into one policy would change
+    /// three user-visible behaviours to no end.
+    pub(crate) exhausted: bool,
 }
 
 /// Shrink `requested` along the model's reduction order until it fits
 /// `budget_bytes`, or until the model runs out of knobs.
-pub fn tune<M: BudgetModel>(
+pub(crate) fn tune<M: BudgetModel>(
     model: &M,
     requested: M::Params,
     budget_bytes: usize,

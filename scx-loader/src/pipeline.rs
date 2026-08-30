@@ -222,9 +222,13 @@ pub struct MemoryBudget {
     pub prefetch_batches: usize,
     /// Effective batch_size (may be reduced to fit budget for large gene counts).
     pub batch_size: usize,
-    /// Estimated total memory in bytes (includes mmap file size).
+    /// Estimated total memory in bytes. Equal to `breakdown.total_bytes`, and
+    /// **excludes** the mmap'd file (ORG-9.10-5) — do not subtract
+    /// [`Self::mmap_bytes`] from it.
     pub estimated_bytes: usize,
-    /// Size of the mmap'd SCX file in bytes (included in estimated_bytes).
+    /// Size of the mmap'd SCX file in bytes. **Reported, never budgeted**: the
+    /// kernel page cache is evictable under pressure, so no loader class counts
+    /// it against `max_memory_mb`. Not included in [`Self::estimated_bytes`].
     pub mmap_bytes: usize,
     /// True if estimated memory exceeds the budget even at all minimums.
     pub budget_exceeded: bool,
@@ -420,10 +424,10 @@ pub(crate) fn ensure_csr_ranges_are_readable(
 
 /// Knobs the sequential auto-tune reduces, in reduction order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SequentialParams {
-    pub shard_group_size: usize,
-    pub prefetch_batches: usize,
-    pub batch_size: usize,
+pub(crate) struct SequentialParams {
+    pub(crate) shard_group_size: usize,
+    pub(crate) prefetch_batches: usize,
+    pub(crate) batch_size: usize,
 }
 
 impl SequentialParams {
@@ -546,8 +550,26 @@ pub fn compute_memory_budget(
         shard_target_rows as usize,
         avg_nnz_per_cell,
     );
+    compute_memory_budget_with(&model, config, n_vars, file_size_bytes)
+}
+
+/// [`compute_memory_budget`] against a model the caller already built.
+///
+/// `TrainingPipeline::new` needs the same model twice — once to resolve an
+/// adaptive budget from the requested config's own need, once to tune — and
+/// then keeps it for [`TrainingPipeline::pin_effective_config`]. Building it
+/// once is not just cheaper: the adaptive path reads the output width off the
+/// `HvgProjection` while `n_output_genes_for` re-derives it from
+/// `config.hvg_indices`, and those are two sources for one number that must
+/// agree. Now there is one.
+pub(crate) fn compute_memory_budget_with(
+    model: &SequentialBudgetModel,
+    config: &LoaderConfig,
+    n_vars: u64,
+    file_size_bytes: usize,
+) -> MemoryBudget {
     let tuned = crate::budget::tune(
-        &model,
+        model,
         SequentialParams::from_config(config),
         config.max_memory_mb.saturating_mul(1024 * 1024),
     );
@@ -581,11 +603,9 @@ pub fn compute_memory_budget(
 
 /// Estimate the per-component memory breakdown for given parameters.
 ///
-/// Returns a `BudgetBreakdown` that follows the index-plan convention of
-/// excluding mmap from the budget; the mmap term is returned separately so
-/// the caller can include it in `MemoryBudget.estimated_bytes` for the
-/// sequential path (where the entire file faults into RSS during an
-/// epoch).
+/// Excludes mmap, like every other budget model. The file's pages do fault
+/// into RSS during an epoch, but they are evictable page cache and are
+/// reported on `MemoryBudget::mmap_bytes` rather than charged (ORG-9.10-5).
 fn estimate_breakdown(
     shard_group_size: usize,
     prefetch_batches: usize,
@@ -886,23 +906,25 @@ impl TrainingPipeline {
         // `ADAPTIVE_BUDGET_CAP_MB` (genuinely huge files still fall through to
         // the hard-ceiling auto-tune + warnings rather than reserving unbounded
         // RAM). Only ever raises, never lowers.
-        if config.auto_memory_budget {
-            // Read the width off the projection built above rather than the raw
-            // panel: they differ whenever the panel had duplicates, and the
-            // projection's answer is the one the batch is allocated at.
-            let n_output_genes = match &projection {
+        // One model for the whole constructor: the adaptive raise below, the
+        // tune after it, and `pin_effective_config` later all use this one.
+        // Read the width off the projection built above rather than the raw
+        // panel: they differ whenever the panel had duplicates, and the
+        // projection's answer is the one the batch is allocated at.
+        let budget_model = SequentialBudgetModel::new(
+            match &projection {
                 Some(proj) => proj.n_output_cols(),
                 None => n_vars as usize,
-            };
+            },
+            shard_target_rows as usize,
+            avg_nnz_per_cell,
+        );
+
+        if config.auto_memory_budget {
             // One `adaptive_budget_mb`, in `crate::budget` — this path used to
             // carry a second copy of the same arithmetic (ORG-9.10-5).
-            let model = SequentialBudgetModel::new(
-                n_output_genes,
-                shard_target_rows as usize,
-                avg_nnz_per_cell,
-            );
             let adaptive_mb = crate::budget::adaptive_budget_mb(
-                model
+                budget_model
                     .estimate(SequentialParams::from_config(&config))
                     .total_bytes,
                 config.max_memory_mb,
@@ -910,26 +932,20 @@ impl TrainingPipeline {
             if adaptive_mb > config.max_memory_mb {
                 log::info!(
                     "loader auto-budget: raised max_memory_mb {} -> {} MB to fit the \
-                     requested configuration (batch_size={}, shard_group_size={}, \
-                     n_output_genes={}) without shrinking the batch. Pass an explicit \
-                     max_memory_mb to pin a hard ceiling instead.",
+                     requested configuration (batch_size={}, shard_group_size={}) \
+                     without shrinking the batch. Pass an explicit max_memory_mb to pin \
+                     a hard ceiling instead.",
                     config.max_memory_mb,
                     adaptive_mb,
                     config.batch_size,
                     config.shard_group_size,
-                    n_output_genes,
                 );
                 config.max_memory_mb = adaptive_mb;
             }
         }
 
-        let memory_budget = compute_memory_budget(
-            &config,
-            n_vars,
-            shard_target_rows,
-            avg_nnz_per_cell,
-            file_size_bytes,
-        );
+        let memory_budget =
+            compute_memory_budget_with(&budget_model, &config, n_vars, file_size_bytes);
 
         // Propagate effective batch_size back into config
         config.batch_size = memory_budget.batch_size;
@@ -954,11 +970,7 @@ impl TrainingPipeline {
         }
 
         Ok(TrainingPipeline {
-            budget_model: SequentialBudgetModel::new(
-                n_output_genes_for(&config, n_vars),
-                shard_target_rows as usize,
-                avg_nnz_per_cell,
-            ),
+            budget_model,
             n_csr_shards,
             config,
             reader,
@@ -2169,6 +2181,71 @@ mod tests {
         // The premise: this config genuinely fits the 512 MB default, so the
         // old failure really was the mmap term and nothing else.
         assert!(budget.breakdown.fits_within(config.max_memory_mb));
+    }
+
+    /// `pin_effective_config` must refuse to **raise** a knob.
+    ///
+    /// This is what replaced §9.6's `debug_assert!` and makes
+    /// `MultimodalTrainingDataset`'s uniform pin structural rather than
+    /// assumed: "the pinned config always fits" holds because the pin only ever
+    /// shrinks and the model is monotone. A regression that allowed a raise
+    /// would not fail the Python-level test, which only observes the happy path.
+    #[test]
+    fn pin_effective_config_refuses_to_raise_a_knob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "pin.scx", 64, 20, 4);
+        let config = LoaderConfig {
+            batch_size: 16,
+            shard_group_size: 2,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+        let mut p = TrainingPipeline::new(&path, config).unwrap();
+        let (bs, sgs) = {
+            let mb = p.memory_budget_info();
+            (mb.batch_size, mb.shard_group_size)
+        };
+
+        // Shrinking is fine, and is what the multimodal pin does.
+        p.pin_effective_config(bs / 2, sgs)
+            .expect("shrinking must be allowed");
+        assert_eq!(p.memory_budget_info().batch_size, bs / 2);
+        assert_eq!(p.effective_batch_size(), bs / 2);
+
+        // Raising either knob is an error, not a silent no-op.
+        let err = p.pin_effective_config(bs, sgs).unwrap_err();
+        assert!(
+            err.to_string().contains("may only shrink"),
+            "unexpected error: {err}"
+        );
+        let err = p.pin_effective_config(bs / 2, sgs + 1).unwrap_err();
+        assert!(
+            err.to_string().contains("may only shrink"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Pinning mid-epoch would swap the shuffler out from under a live
+    /// iteration, so it is refused rather than silently reordering rows.
+    #[test]
+    fn pin_effective_config_refuses_mid_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "pin_epoch.scx", 64, 20, 4);
+        let config = LoaderConfig {
+            batch_size: 16,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+        let mut p = TrainingPipeline::new(&path, config).unwrap();
+        p.start_epoch().unwrap();
+        let err = p.pin_effective_config(8, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("epoch in flight"),
+            "unexpected error: {err}"
+        );
+        p.shutdown();
     }
 
     // ---- ORG-9.10-5 pre-refactor pins ------------------------------------

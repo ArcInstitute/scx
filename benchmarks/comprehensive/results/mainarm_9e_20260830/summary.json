@@ -1,0 +1,111 @@
+{
+  "schema_version": 2,
+  "snapshot_name": "mainarm_9e_20260830",
+  "tier": "small",
+  "datasets": [
+    "pbmc3k",
+    "pbmc10k",
+    "smartseq2",
+    "tabula_sapiens_100k",
+    "cite_seq_pbmc",
+    "multiome_pbmc"
+  ],
+  "rows": {
+    "cellset_gather__scx_auto__pbmc10k": {
+      "median_wall_s": 0.5908442530781031,
+      "wall_s_iqr": 4.626734989695251,
+      "n_runs": 18,
+      "peak_rss_mb_median": 453.90625,
+      "file_size_bytes": 42046258,
+      "source_file": "cellset_gather__scx_auto__pbmc10k.json"
+    },
+    "cellset_gather__scx_auto__pbmc3k": {
+      "median_wall_s": 0.16023596562445164,
+      "wall_s_iqr": 2.110367698594928,
+      "n_runs": 18,
+      "peak_rss_mb_median": 241.076171875,
+      "file_size_bytes": 5054198,
+      "source_file": "cellset_gather__scx_auto__pbmc3k.json"
+    },
+    "cellset_gather__scx_auto__smartseq2": {
+      "median_wall_s": 1.3170448187738657,
+      "wall_s_iqr": 3.2130233328789473,
+      "n_runs": 18,
+      "peak_rss_mb_median": 2130.6015625,
+      "file_size_bytes": 555068019,
+      "source_file": "cellset_gather__scx_auto__smartseq2.json"
+    },
+    "cellset_gather__scx_auto__tabula_sapiens_100k": {
+      "median_wall_s": 1.5575192859396338,
+      "wall_s_iqr": 4.663572380319238,
+      "n_runs": 18,
+      "peak_rss_mb_median": 3805.958984375,
+      "file_size_bytes": 691151132,
+      "source_file": "cellset_gather__scx_auto__tabula_sapiens_100k.json"
+    },
+    "index_plan__scx_auto__pbmc10k": {
+      "median_wall_s": 21.7465953938663,
+      "wall_s_iqr": 1.8874268140643835,
+      "n_runs": 25,
+      "peak_rss_mb_median": 1246.8046875,
+      "file_size_bytes": 42046258,
+      "source_file": "index_plan__scx_auto__pbmc10k.json"
+    },
+    "index_plan__scx_auto__pbmc3k": {
+      "median_wall_s": 7.967727282084525,
+      "wall_s_iqr": 10.539540203288198,
+      "n_runs": 25,
+      "peak_rss_mb_median": 790.2890625,
+      "file_size_bytes": 5054198,
+      "source_file": "index_plan__scx_auto__pbmc3k.json"
+    },
+    "index_plan__scx_auto__smartseq2": {
+      "median_wall_s": 1.9197491686791182,
+      "wall_s_iqr": 5.012737849727273,
+      "n_runs": 10,
+      "peak_rss_mb_median": 3129.68359375,
+      "file_size_bytes": 555068019,
+      "source_file": "index_plan__scx_auto__smartseq2.json"
+    },
+    "index_plan__scx_auto__tabula_sapiens_100k": {
+      "median_wall_s": 2.9517773911356926,
+      "wall_s_iqr": 34.76898856414482,
+      "n_runs": 10,
+      "peak_rss_mb_median": 3692.90234375,
+      "file_size_bytes": 691151132,
+      "source_file": "index_plan__scx_auto__tabula_sapiens_100k.json"
+    },
+    "ml_loader__scx_auto__pbmc10k": {
+      "median_wall_s": 0.3815159685909748,
+      "wall_s_iqr": 0.21790074976161122,
+      "n_runs": 30,
+      "peak_rss_mb_median": 389.4375,
+      "file_size_bytes": 42046258,
+      "source_file": "ml_loader__scx_auto__pbmc10k.json"
+    },
+    "ml_loader__scx_auto__pbmc3k": {
+      "median_wall_s": 0.07094907853752375,
+      "wall_s_iqr": 0.07400476187467575,
+      "n_runs": 30,
+      "peak_rss_mb_median": 395.27734375,
+      "file_size_bytes": 5054198,
+      "source_file": "ml_loader__scx_auto__pbmc3k.json"
+    },
+    "ml_loader__scx_auto__smartseq2": {
+      "median_wall_s": 2.5572020849213004,
+      "wall_s_iqr": 2.2848329273983836,
+      "n_runs": 30,
+      "peak_rss_mb_median": 498.49609375,
+      "file_size_bytes": 555068019,
+      "source_file": "ml_loader__scx_auto__smartseq2.json"
+    },
+    "ml_loader__scx_auto__tabula_sapiens_100k": {
+      "median_wall_s": 4.183752450160682,
+      "wall_s_iqr": 4.224619784858078,
+      "n_runs": 18,
+      "peak_rss_mb_median": 595.533203125,
+      "file_size_bytes": 691151132,
+      "source_file": "ml_loader__scx_auto__tabula_sapiens_100k.json"
+    }
+  }
+}

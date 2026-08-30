@@ -508,6 +508,34 @@ fn split_budget_across_modalities(total_mb: usize, per_modality_nnz: &[u64]) -> 
 /// accepts, which is what makes it a floor rather than a preference.
 const MIN_MODALITY_BUDGET_MB: usize = 64;
 
+/// The smallest `max_memory_mb` whose *proportional* shares all clear the floor,
+/// i.e. the smallest request `split_budget_across_modalities` returns unchanged.
+///
+/// `None` when no such total exists: a modality with zero nnz gets a zero share
+/// at every budget, so raising the request can never lift it off the floor.
+///
+/// This is what the warning must quote. Advising the current *effective sum*
+/// instead does not converge — the floor is re-applied after the new split, so
+/// with a 1:99 nnz ratio a 64 MB request reports 128, and passing 128 reports
+/// 190, and so on. The fixed point is `max_i(ceil(floor × total_nnz / nnz_i))`.
+fn min_total_mb_clearing_the_floor(per_modality_nnz: &[u64]) -> Option<usize> {
+    let total_nnz: u64 = per_modality_nnz.iter().sum();
+    if total_nnz == 0 {
+        return None;
+    }
+    let mut required = 0usize;
+    for &nnz in per_modality_nnz {
+        if nnz == 0 {
+            return None;
+        }
+        let need = (MIN_MODALITY_BUDGET_MB as u128)
+            .saturating_mul(total_nnz as u128)
+            .div_ceil(nnz as u128);
+        required = required.max(need.min(usize::MAX as u128) as usize);
+    }
+    Some(required)
+}
+
 /// Verify that all requested modalities share identical per-modality CSR
 /// shard layouts (shard counts + row ranges). The multimodal loader chunks
 /// each modality independently but assembles batches positionally, so
@@ -855,7 +883,23 @@ impl MultimodalTrainingDataset {
         // working, and warning there would fire on every default construction.
         // Same don't-cry-wolf rule `assess_cache_sizing` applies.
         if max_memory_mb.is_some() && effective_total_mb > total_mb {
-            warn_modality_budget_floors(py, total_mb, effective_total_mb, pipelines.len())?;
+            warn_modality_budget_floors(py, total_mb, effective_total_mb, &per_modality_nnz)?;
+        }
+
+        // Per-modality `budget_exceeded`, for the same reason `TrainingDataset`
+        // warns: a modality that cannot fit even at its minimums will exceed the
+        // budget it was given, and a `log::warn!` is invisible in a notebook.
+        // **After** the pin, never before — the pin shrinks knobs further and can
+        // clear the flag on a modality the tuner had already flagged.
+        for (name, p) in names.iter().zip(pipelines.iter()) {
+            if p.memory_budget_info().budget_exceeded {
+                warn_budget_exceeded(
+                    py,
+                    &format!("MultimodalTrainingDataset modality '{name}'"),
+                    p.max_memory_mb(),
+                    p.memory_budget_info(),
+                )?;
+            }
         }
 
         Ok(MultimodalTrainingDataset {
@@ -2024,17 +2068,28 @@ fn warn_modality_budget_floors(
     py: Python<'_>,
     requested_mb: usize,
     effective_mb: usize,
-    n_modalities: usize,
+    per_modality_nnz: &[u64],
 ) -> PyResult<()> {
     let warnings = crate::pyimport::import_module(py, "warnings")?;
     let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
+    let n_modalities = per_modality_nnz.len();
+    // Quote the fixed point, not the current effective sum: the floor is
+    // re-applied after the new split, so echoing `effective_mb` back would
+    // advise a value that fires this same warning again.
+    let advice = match min_total_mb_clearing_the_floor(per_modality_nnz) {
+        Some(mb) => {
+            format!("Pass max_memory_mb>={mb} for a split that clears the floor on its own.")
+        }
+        None => "A modality with no recorded nnz gets a zero proportional share at \
+             every budget, so raising max_memory_mb cannot lift it off the floor."
+            .to_string(),
+    };
     let msg = format!(
         "MultimodalTrainingDataset: max_memory_mb={requested_mb} cannot be split across \
          {n_modalities} modalities without a share falling below the \
          {MIN_MODALITY_BUDGET_MB} MB per-modality floor, so the effective total is \
          {effective_mb} MB. Peak RSS is budgeted against that number, not the one you \
-         passed; see memory_budget()['effective_total_mb']. Pass \
-         max_memory_mb>={effective_mb} to make the real budget explicit."
+         passed; see memory_budget()['effective_total_mb']. {advice}"
     );
     warnings.call_method1("warn", (msg, user_warning))?;
     Ok(())
@@ -3410,6 +3465,48 @@ mod modality_budget_split_tests {
 
     /// The degenerate inputs the constructor can hand it: an all-zero nnz
     /// census (a file whose catalog carries no stats) must not divide by zero.
+    /// The warning has to name a budget that actually stops it firing.
+    ///
+    /// Echoing the current effective sum back does **not** converge: the floor
+    /// is re-applied after the new split, so with a 1:99 ratio 64 MB reports
+    /// 128, 128 reports 190, 190 reports 252 … Found by review; this pins the
+    /// fixed point instead.
+    #[test]
+    fn the_recommended_total_is_a_fixed_point() {
+        let nnz = [1u64, 99];
+        let mb = super::min_total_mb_clearing_the_floor(&nnz)
+            .expect("a positive-nnz split always has a fixed point");
+        let split = split_budget_across_modalities(mb, &nnz);
+        assert!(
+            split.iter().all(|&s| s >= MIN_MODALITY_BUDGET_MB),
+            "every share must clear the floor: {split:?}"
+        );
+        assert_eq!(
+            split.iter().sum::<usize>(),
+            mb,
+            "at the fixed point the shares sum to the request, so the warning stops"
+        );
+        // And the value the old message quoted does NOT converge.
+        let naive: usize = split_budget_across_modalities(64, &nnz).iter().sum();
+        assert!(
+            split_budget_across_modalities(naive, &nnz)
+                .iter()
+                .sum::<usize>()
+                > naive,
+            "premise: echoing the effective sum back re-fires the warning"
+        );
+    }
+
+    /// A modality with no recorded nnz gets a zero share at every budget, so no
+    /// total lifts it off the floor — the message must say that rather than
+    /// quoting a number that cannot work.
+    #[test]
+    fn a_zero_nnz_modality_has_no_fixed_point() {
+        assert!(super::min_total_mb_clearing_the_floor(&[0, 100]).is_none());
+        assert!(super::min_total_mb_clearing_the_floor(&[0, 0]).is_none());
+        assert!(super::min_total_mb_clearing_the_floor(&[]).is_none());
+    }
+
     #[test]
     fn zero_nnz_does_not_divide_by_zero() {
         let split = split_budget_across_modalities(4000, &[0, 0]);
