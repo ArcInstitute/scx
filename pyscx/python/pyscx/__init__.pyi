@@ -329,11 +329,12 @@ class SparseCellSetDataset:
         `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups` — the
         multi-file sibling of `IndexPlanDataset.cache_metrics`.
 
-        The last two report which scattered-read route the gathers took, and on
-        this class they are the only confirmation available: there is no
-        preflight warning here, so `scatter_block_index=True` against a file
-        with no row-group-framed shards is a silent no-op.
-        `block_index_groups > 0` proves the row-group path ran."""
+        The last two report which scattered-read route the gathers took. They
+        matter because there is still no preflight warning on this class, so
+        `scatter_block_index=True` against a file with no row-group-framed
+        shards is a silent no-op; `block_index_groups > 0` proves the row-group
+        path ran. The prefetch half is visible too, via
+        `SparseCellSetBatchIter.metrics()["prefetch"]`."""
         ...
 
     def memory_budget(self) -> dict[str, int]:

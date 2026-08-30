@@ -2495,12 +2495,18 @@ impl SparseCellSetDataset {
     /// `full_shard_groups`, `block_index_groups`. All `int`; atomic, lock-free —
     /// sample as often as you like.
     ///
-    /// The last two are the **route** this dataset's gathers actually took, and
-    /// they are the only way to confirm it on this class: unlike
-    /// `IndexPlanDataset`, it has no preflight warning, so
-    /// `scatter_block_index=True` against a file with no row-group-framed
-    /// shards is a silent no-op. `block_index_groups > 0` proves the row-group
-    /// path ran; `full_shard_groups > 0` is the warm-into-the-LRU default.
+    /// The last two are the **route** this dataset's gathers actually took.
+    /// They matter because this class still has no preflight warning (unlike
+    /// `IndexPlanDataset`), so `scatter_block_index=True` against a file with
+    /// no row-group-framed shards is a silent no-op:
+    /// `block_index_groups > 0` proves the row-group path ran, and
+    /// `full_shard_groups > 0` is the warm-into-the-LRU default.
+    ///
+    /// Since ORG-9.10-1 this is no longer the *only* confirmation — the
+    /// prefetch half is now visible too, through
+    /// `SparseCellSetBatchIter.metrics()["prefetch"]`, whose
+    /// `prefetch_skipped_block_index` counts the L2 warm-skips directly rather
+    /// than inferring them from the gather-side totals here.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }

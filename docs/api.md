@@ -2926,6 +2926,31 @@ ds.close()      # releases the dataset's reference only
 list(it)        # the iterator's own teardown, bounded and off-GIL
 ```
 
+**Iterator metrics — `metrics()`**
+
+Both `IndexPlanBatchIter` and `SparseCellSetBatchIter` expose `metrics()`,
+returning `{"cache": {...}, "prefetch": {...}}`. The `cache` half is
+loader-cumulative and identical to the dataset's `cache_metrics()`; the
+`prefetch` half is per-iter and resets on each `iter_with_plans` call:
+
+| key | meaning |
+|---|---|
+| `prefetch_tasks_spawned` | shards warmed into the LRU ahead of the gather |
+| `prefetch_skipped_cache_hit` | already resident |
+| `prefetch_skipped_in_flight` | a peer was already decoding it |
+| `prefetch_skipped_block_index` | left cold on purpose, so the gather takes the row-group path |
+
+Both handles are cloned when the iterator is built, so `metrics()` is safe to
+call after the iterator has been drained.
+
+`prefetch_skipped_block_index` is the direct answer to "did
+`scatter_block_index=True` do anything on this file?". It is non-zero only when
+a cold, sparse, row-group-framed shard was left undecoded, and stays 0 against
+an unframed file — where the kwarg is a silent no-op on `SparseCellSetDataset`,
+which has no preflight warning. `cache_metrics()["block_index_groups"]` reports
+the same adoption from the gather side; the two share one eligibility
+predicate, so a disagreement between them is a bug.
+
 ```python
 ds = pyscx.IndexPlanDataset("atlas.scx")
 try:
