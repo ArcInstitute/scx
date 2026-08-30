@@ -434,18 +434,24 @@ Quick smoke test:
 ## CI Overview
 
 The GitHub Actions CI (`.github/workflows/ci.yml`) runs on every push and PR
-to `main`:
+to `main`. Superseded PR pushes cancel their in-flight run, and a `changes`
+gate skips the build/test jobs on docs-only PRs (`fmt` and the dedup guards
+always run; the merge push to main always runs everything):
 
 | Job | What it does |
 |-----|-------------|
-| `build-cpu-only` | `cargo build --workspace --exclude rscx` — pins the CPU-only build contract |
+| `changes` | Classifies the PR's changed paths; docs-only PRs skip the jobs below |
 | `test` | `cargo test --workspace --exclude rscx` — default features only |
 | `test-hdf5` | `cargo test -p scx-convert --features hdf5` + `-p scx-cli --features hdf5` — the h5ad/h5mu suites the `test` job cannot reach |
 | `clippy` | `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` — `--all-targets` lints test and bench code too |
 | `fmt` | `cargo fmt --check` |
-| `feature-check` | Matrix of `cargo check`/`clippy --all-targets` for feature combos (cloud, hdf5, gpu) |
-| `python` | maturin develop + pytest (with cloud features, fork-safety tests) |
+| `feature-check` / `feature-check-hdf5` | `cargo clippy --all-targets` legs for feature combos (cloud, hdf5, gpu, scx-format-io no-default) as sequential steps in two jobs |
+| `python` | `maturin develop --profile ci` + `pytest -n 2` (with cloud features, fork-safety tests) |
+| `base-install` | Builds the wheel with `--profile ci`, installs it into an empty venv, runs the packaging assertions |
 
-The `build-cpu-only` job explicitly validates that the entire workspace
-(including `scx-gpu`) compiles on machines without CUDA installed. This is
-the CI-side guarantee that the CPU-only developer experience is never broken.
+The CPU-only build contract — the entire workspace (including `scx-gpu`)
+compiles on machines without CUDA installed — is pinned by the `clippy` and
+`test` jobs, which both build the full workspace on CUDA-less runners. The
+`python` and `base-install` jobs build pyscx with the `ci` cargo profile
+(root `Cargo.toml`): opt-level 2 with debug-assertions kept, so the pytest
+suite runs against optimized kernels without losing the debug-only checks.

@@ -7,7 +7,8 @@ members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", 
 # (it only fails at runtime when no GPU is present). Its GPU tests are
 # `#[ignore]`d and gated by require_gpu!(), so a CPU-only run reports them as
 # ignored instead of as passes; `scx-gpu/tests/gpu_test_gating.rs` enforces the
-# pairing. The CI `build-cpu-only` job pins the compile half of this contract.
+# pairing. The CI `test` and `clippy` jobs pin the compile half of this contract
+# (both build the full workspace on a runner without CUDA).
 default-members = ["scx-format", "scx-format-io", "scx-codec", "scx-sparse", "scx-cli", "scx-convert", "scx-ops", "scx-engine", "scx-loader", "scx-cloud", "scx-gpu", "scx-mtx", "scx-accel", "scx-testkit", "pyscx", "tests/scx-integration-tests"]
 resolver = "2"
 
@@ -22,6 +23,25 @@ resolver = "2"
 # the per-batch training critical path of the sparse cell-set loader.
 [profile.release]
 lto = "thin"
+
+# Full DWARF (`debug = true`, the dev default) is what made target/debug tens of
+# GB — big enough to fill CI runner disks mid-link (the SIGBUS history in
+# ci.yml's `test` job) and to bloat every rust-cache entry. Line tables keep
+# file:line in backtraces; only interactive-debugger variable inspection loses
+# fidelity. Set `CARGO_PROFILE_DEV_DEBUG=true` for a one-off full-debuginfo build.
+[profile.dev]
+debug = "line-tables-only"
+
+# CI profile for the pyscx extension module under pytest: optimized codegen
+# (the suite is numeric Rust — debug-built kernels are 5-30x slower) while
+# keeping dev's debug-assertions and overflow-checks, which release turns off
+# and some tests rely on. No LTO, so it compiles much faster than release.
+# Used by ci.yml's `python` and `base-install` jobs via `maturin --profile ci`.
+[profile.ci]
+inherits = "dev"
+opt-level = 2
+debug = "line-tables-only"
+incremental = false
 
 [profile.release.package.scx-codec]
 overflow-checks = true

@@ -53,7 +53,7 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 
 **Fuzzing** (run before any release that touches `scx-codec`, `scx-format`, or `scx-engine` parsers; recommended on every synchronized minor regardless):
 
-- [ ] CI's `Fuzz / fuzz-build` job ran green on the release commit. This job is automatic on every PR and push to `main` and verifies all 12 targets across `scx-codec/fuzz`, `scx-format/fuzz`, and `scx-engine/fuzz` still compile on nightly — catches bitrot from a parser refactor that would otherwise go unnoticed (the fuzz crates are separate cargo workspaces, so the main CI's `cargo --workspace` walks past them).
+- [ ] CI's `Fuzz / fuzz-build` job ran green on the release commit. This job is automatic on PRs and pushes to `main` that touch the fuzzed crates (path-filtered to `scx-codec`/`scx-format`/`scx-format-io`/`scx-engine`/`scx-sparse` + the lockfile — an untouched-path commit legitimately has no Fuzz run) and verifies the fuzz targets across `scx-codec/fuzz`, `scx-format/fuzz`, and `scx-engine/fuzz` still compile on nightly — catches bitrot from a parser refactor that would otherwise go unnoticed (the fuzz crates are separate cargo workspaces, so the main CI's `cargo --workspace` walks past them).
 - [ ] Manually trigger the `Fuzz / fuzz-run` workflow against the release commit via the Actions tab → Fuzz → "Run workflow". Use `duration_seconds=600` (10 min / target, ~2 h matrix wall clock) and leave `target` empty to fan out across all 12 targets. Any crash input is uploaded as a workflow artifact named `fuzz-<crate>-<target>-crashes`; investigate before tagging. Full target list and local invocation in [docs/development.md § Fuzzing](../../../docs/development.md#fuzzing).
 - [ ] For an urgent / targeted release, instead run a single target locally: `cd <crate>/fuzz && cargo +nightly fuzz run <target> -- -max_total_time=600`. Requires `cargo install cargo-fuzz` and the nightly toolchain.
 
@@ -162,7 +162,7 @@ Full details live in `docs/development.md`. The bits that come up often:
 - **Always use `.venv/`** (uv-managed) for Python work — never system Python or `pip`.
 - **`pyscx` features:** `hdf5` (h5ad/h5mu ingest), `hdf5-static` (bundles libhdf5 for wheel builds), `cloud`, `gpu`. Build with e.g. `maturin develop --features hdf5,cloud,gpu`.
 - **`scx-cli` features:** `hdf5`, `hdf5-static`, `cloud`. The release workflow uses `hdf5-static` so downloaded binaries have no system libhdf5 requirement.
-- **GPU:** `scx-gpu` compiles without CUDA installed; runtime falls back to CPU when no GPU is present. CI's `build-cpu-only` job pins this contract.
+- **GPU:** `scx-gpu` compiles without CUDA installed; runtime falls back to CPU when no GPU is present. CI's `clippy` and `test` jobs (full-workspace builds on CUDA-less runners) pin this contract.
 - **GDS** (GPUDirect Storage) needs local NVMe + nvidia-fs + ext4/XFS; always has a CPU fallback.
 
 For the full crate dependency graph and feature flag rules, see [docs/architecture.md § Crate Dependency Graph](../../../docs/architecture.md#crate-dependency-graph). Test matrix is in [docs/testing.md](../../../docs/testing.md).
