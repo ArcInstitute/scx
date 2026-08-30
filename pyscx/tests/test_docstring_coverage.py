@@ -4,7 +4,9 @@ Each function in this table exists twice: a pure-Python wrapper in
 `pyscx/python/pyscx/__init__.py` (what `help()` and Sphinx show — the wrapper
 shadows the native after `from .pyscx import *`) and a pyo3 native in
 `pyscx.pyscx`. The convention is **Python-canonical**: the wrapper carries the
-one full docstring, and the native's `///` doc is a two-line pointer at it.
+one full docstring, and the native's `///` doc is a pointer at it (a short
+summary plus the pointer sentence, never an ``Args:`` block — brief
+Rust-reader notes are allowed).
 The wrapper is the right holder because its coercions are part of the
 user-visible contract (`_coerce_path` accepts an open `Experiment`,
 `_coerce_obs_mask` accepts a pandas Series, `_coerce_key` accepts a bare str)
@@ -152,6 +154,16 @@ def test_native_docstring_is_the_pointer(name):
         f"pyscx.pyscx.{name}'s Rust /// doc must point at the canonical "
         f"Python wrapper docstring (expected: …{POINTER_SENTENCE!r}). A full "
         "second copy WILL drift — that is the bug class this convention ended."
+    )
+    # The pointer sentence alone would pass on a doc that KEPT the full second
+    # copy and merely appended the sentence. An `Args:` block is the signature
+    # of a full contract, so its absence is what actually enforces
+    # "pointer, not copy" (short Rust-reader notes without an Args block are
+    # fine — e.g. to_h5ad's numpy-vs-wrapper coercion note).
+    assert "Args:" not in ndoc, (
+        f"pyscx.pyscx.{name}'s Rust /// doc carries an Args: block — that is a "
+        "second copy of the contract, not a pointer. Move the content to the "
+        "Python wrapper docstring."
     )
 
 

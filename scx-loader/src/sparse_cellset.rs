@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use scx_format_io::{CacheMetrics, ScxReader};
 
 use crate::error::{LoaderError, Result};
-use crate::plan_engine::PrefetchEngine;
+use crate::plan_engine::{IterMetrics, PrefetchEngine};
 use crate::sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode};
 
 /// One batch of cell sets to gather. Rows are flat across all sets in the
@@ -100,7 +100,10 @@ pub struct SparseCellSetLoader {
     /// Requested shard-cache count cap.
     cache_shards: usize,
     /// `min(cache_shards, budget / avg_shard)` — the count that is actually
-    /// resident-capable, i.e. **the binding constraint**. `cache_shards` alone is
+    /// resident-capable, i.e. **the binding constraint**. Surfaced through
+    /// [`Self::effective_cache_shards`] and reported as `effective_cache_shards`,
+    /// the name the paired loader uses for the same quantity; the field keeps
+    /// the more descriptive spelling. `cache_shards` alone is
     /// misleading on a large-shard file where the byte budget binds first, which
     /// is exactly the STATE3 regime this loader targets.
     affordable_cache_shards: usize,
@@ -171,9 +174,9 @@ impl SparseCellSetLoader {
     /// `scatter_block_index` is a pure pass-through to
     /// [`PrefetchEngine::from_scx_readers`] — deliberately not stored, because
     /// the flag's only consumer is the reader it is set on, and a second copy
-    /// here could disagree with it. `SparseCellSetDataset` passes `false`; see
-    /// that constructor for why the cell-set regime wants the full-shard
-    /// warm+cache path.
+    /// here could disagree with it. `SparseCellSetDataset` *defaults* it to
+    /// `false` and passes the caller's kwarg; see that constructor for why the
+    /// cell-set regime wants the full-shard warm+cache path by default.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         scx_readers: Vec<ScxReader>,
@@ -337,6 +340,33 @@ impl SparseCellSetLoader {
         self.shard_decoded_bytes
     }
 
+    /// Per-component memory estimate, in the one shape every class that reports
+    /// a budget uses (ORG-9.10-4; `MultimodalTrainingDataset` reports none).
+    ///
+    /// Only two terms are non-zero, and that is the model, not an omission: the
+    /// shard cache **is** this loader's budget — there is no batch buffer,
+    /// no plan-tuple staging and no per-batch obs scratch on the gather path —
+    /// plus the interpreter/numpy/Arrow constant every path pays.
+    ///
+    /// ⚠️ The constant is reported but **not** yet subtracted from the budget:
+    /// [`Self::new`] passes `non_cache_bytes: 0` to
+    /// [`crate::budget::assess_cache_sizing`], so `total_bytes` here can exceed
+    /// `cache_bytes_budget` — which it cannot on `IndexPlanLoader`, whose tuner
+    /// counts the same term. That is the tuner disagreeing with the report, and
+    /// it is what ORG-9.10-5's single `BudgetModel` exists to remove; changing
+    /// the tuner would move a user-visible warning threshold and does not belong
+    /// in a surface change.
+    pub fn budget_breakdown(&self) -> crate::budget::BudgetBreakdown {
+        crate::budget::BudgetBreakdown::new(
+            self.affordable_cache_shards
+                .saturating_mul(self.shard_decoded_bytes),
+            0,
+            0,
+            0,
+            crate::budget::PYTHON_OVERHEAD_BYTES,
+        )
+    }
+
     /// Total CSR shards across every file — the cap on distinct entries in the
     /// shared cache, which is keyed `(file_id, shard)`.
     pub fn total_shards(&self) -> usize {
@@ -373,6 +403,16 @@ impl SparseCellSetLoader {
         self.engine.n_readers()
     }
 
+    /// True if any file in the set has a row-group-framed CSR shard.
+    ///
+    /// The multi-file sibling of [`crate::IndexPlanLoader::any_shard_framed`],
+    /// and the same consumer: the Python constructor warns when the caller
+    /// asked for `scatter_block_index=True` against a set where the route can
+    /// never fire.
+    pub fn any_shard_framed(&self) -> bool {
+        self.engine.any_shard_framed()
+    }
+
     /// Shared handle to the readers' one `SharedShardCache` counters
     /// (hits / misses / evictions / …), cumulative since construction.
     pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
@@ -385,13 +425,8 @@ impl SparseCellSetLoader {
     }
 
     /// Stream `plans` (each one batch) into gathered §4.4 batches, pipelining
-    /// shard prefetch via the engine. Boxed so a PyO3 wrapper can hold it
-    /// (the engine iterator is generic over closures).
-    pub fn iter_with_plans<I>(
-        self: Arc<Self>,
-        plans: I,
-        lookahead: usize,
-    ) -> Box<dyn Iterator<Item = Result<SparseCellSetBatch>> + Send + Sync>
+    /// shard prefetch via the engine.
+    pub fn iter_with_plans<I>(self: Arc<Self>, plans: I, lookahead: usize) -> SparseCellSetIter
     where
         I: Iterator<Item = Result<SparseCellSetPlan>> + Send + 'static,
     {
@@ -407,9 +442,16 @@ impl SparseCellSetLoader {
                     .zip(plan.rows.iter().copied())
                     .collect()
             },
-            move |eng: &PrefetchEngine, plan: &SparseCellSetPlan| loader.gather(eng, plan),
+            move |eng: &PrefetchEngine, plan: SparseCellSetPlan| loader.gather(eng, &plan),
         );
-        Box::new(iter)
+        // Taken before boxing: `Box<dyn Iterator>` erases the inherent method,
+        // and the counters are per-iter (they reset every `iter_with_plans`
+        // call), so the handle cannot come from the loader instead.
+        let iter_metrics = iter.iter_metrics();
+        SparseCellSetIter {
+            inner: Box::new(iter),
+            iter_metrics,
+        }
     }
 
     /// Gather one batch of cell sets into the §4.4 contract. The `process`
@@ -845,6 +887,42 @@ fn apply_sparse_transforms(data: &mut [f32], normalize: bool, log1p: bool, targe
     }
     if log1p {
         crate::normalize::log1p_dense_row(data);
+    }
+}
+
+/// Iterator returned by [`SparseCellSetLoader::iter_with_plans`].
+///
+/// **An adapter, not an implementation** — the sibling of
+/// [`crate::index_plan::IndexPlanIter`], and for the same two reasons. The
+/// plan-pull thread, the lookahead queue, the per-plan shard prefetch and the
+/// counters all live in [`crate::plan_engine`]; this exists because
+/// `PlanPrefetchIter`'s closure type parameters are unnameable (the `process`
+/// closure captures an `Arc<SparseCellSetLoader>`), and because boxing to
+/// `dyn Iterator` would erase the inherent `iter_metrics()` that
+/// `SparseCellSetBatchIter.metrics()` needs.
+///
+/// Being a named `Iterator` rather than a `(Box<dyn Iterator>, Arc<IterMetrics>)`
+/// tuple keeps `for batch in loader.iter_with_plans(..)` working for Rust
+/// callers, which the tuple form broke.
+pub struct SparseCellSetIter {
+    inner: Box<dyn Iterator<Item = Result<SparseCellSetBatch>> + Send + Sync>,
+    iter_metrics: Arc<IterMetrics>,
+}
+
+impl SparseCellSetIter {
+    /// Cloneable handle to this iter's prefetch counters. Sample at any time —
+    /// atomics are `Relaxed`, no locks. Stays valid after the iterator is
+    /// drained and dropped.
+    pub fn iter_metrics(&self) -> Arc<IterMetrics> {
+        Arc::clone(&self.iter_metrics)
+    }
+}
+
+impl Iterator for SparseCellSetIter {
+    type Item = Result<SparseCellSetBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
     }
 }
 

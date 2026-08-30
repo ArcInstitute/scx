@@ -34,7 +34,7 @@ Per-scenario metric keys emitted into ``RunRecord.extra``:
         ``BackedCsrReader`` does not expose a hit-rate counter today; will
         appear once that lands).
     ``memory_budget_total_mb__<scenario>`` — float;
-        ``IndexPlanDataset.memory_budget()["total_bytes"]`` in MB; ``None``
+        ``IndexPlanDataset.memory_budget()["breakdown"]["total_bytes"]`` in MB; ``None``
         for non-IndexPlan scenarios. Lets the harness validate the loader's
         per-component memory model against the actual RSS at scenario end.
     ``estimate_overshoot_mb__<scenario>`` — float; scenario-local
@@ -196,7 +196,7 @@ class _ScenarioOutcome:
     wall_s: float
     peak_rss_mb: float
     # Estimator validation: `memory_budget_total_mb` mirrors the loader's
-    # `IndexPlanDataset.memory_budget()["total_bytes"]` in MB;
+    # `IndexPlanDataset.memory_budget()["breakdown"]["total_bytes"]` in MB;
     # `estimate_overshoot_mb` is `(scenario-local ru_maxrss growth) -
     # memory_budget_total_mb`. The growth term is `max(0, ru_maxrss_after -
     # ru_maxrss_before)`, NOT `peak_rss_mb` — `ru_maxrss` is process-wide
@@ -269,7 +269,13 @@ def _run_index_plan(
     # Snapshot the estimator's per-component breakdown right after ctor so
     # the auto-tune output (post-reduction) drives the overshoot delta.
     budget = ds.memory_budget()
-    budget_total_mb = budget["total_bytes"] / (1024 * 1024)
+    # The six per-component byte keys live under `breakdown` (ORG-9.10-4 gave
+    # every class that reports a budget the same envelope). This read is inside
+    # the warm-up that `run()` wraps in `except Exception: continue`, so getting
+    # it wrong drops both IndexPlan scenarios — including the floored `locality`
+    # one — while the job stays green. Confirmed: the old key raises
+    # `KeyError: 'total_bytes'` here.
+    budget_total_mb = budget["breakdown"]["total_bytes"] / (1024 * 1024)
 
     t0 = time.perf_counter()
     seen = 0

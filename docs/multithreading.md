@@ -306,13 +306,16 @@ here you could not —
   `Arc::into_inner` failed **deterministically** on the production path.
 * `IndexPlanIter`'s prefetch tasks captured the whole loader. An already-started
   `spawn_blocking` cannot be aborted, so the task outlived the drop and released
-  the final reference itself — from a runtime thread.
+  the final reference itself — from a runtime thread. (That iterator is gone;
+  the pair loader runs on `PlanPrefetchIter` too. The hazard is not — it just
+  moved down a level, to a task capturing the `Arc<PrefetchEngine>` that owns
+  the runtime.)
 
 With the deadline in the runtime's own `Drop`, every release path bounds itself,
 including ones nobody enumerated. The remaining obligation is narrow and local:
 a runtime must not be dropped from one of its own threads, which is why
-prefetch tasks now capture `Arc<BackedCsrReader>` and never the loader
-(`a_prefetch_task_does_not_capture_the_loader` pins it).
+prefetch tasks now capture `Arc<BackedCsrReader>` and never the loader or the
+engine (`a_prefetch_task_does_not_capture_the_loader` pins both counts).
 
 `pyscx/tests/test_fork_safety.py` is the durable regression test;
 post-fix Lambda HPC measurements confirm the workers0 / workers2 paths

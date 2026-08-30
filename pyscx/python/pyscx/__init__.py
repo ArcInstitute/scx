@@ -307,13 +307,11 @@ def validate(path, deep=False):
         path: Path to the SCX file (str or `os.PathLike`).
         deep: When True, additionally decodes every sparse shard to verify
             the v3 canonical CSR invariant (sorted column indices, no
-            explicit zeros, consistent indptr) and verifies every decode
-            sidecar (structural linkage + decode-parity). Mirrors
+            explicit zeros, consistent indptr). Mirrors
             ``scx validate --deep``. Canonical-CSR checks run only on v3+
             files (pre-v3 may legitimately carry unsorted shards).
-            Deep-check results are appended with ``canonical-csr `` /
-            ``decode-sidecar `` prefixed names; they report ``False``
-            rather than raising.
+            Deep-check results are appended with ``canonical-csr ``
+            prefixed names; they report ``False`` rather than raising.
 
     Returns:
         A list of (section_name, passed) tuples. Raises RuntimeError if any
@@ -477,7 +475,8 @@ def from_h5ad(path, out, **kwargs):
             When omitted, an accel-ready index_preset ("training" /
             "perturbseq") upgrades the default to "auto"; otherwise "off".
             An explicit value always wins.
-        csc_cols_per_shard: Columns per CSC shard when csc="always"
+        csc_cols_per_shard: Columns per CSC shard when a CSC sidecar is
+            built — csc="always", or "auto" over a qualifying dataset
             (default 5000); 0 = single CSC shard.
         uns_format: "tagged" (default) wraps NumPy/pandas containers in
             __scx_type__ envelopes for bit-exact round-trip; "plain"
@@ -485,6 +484,8 @@ def from_h5ad(path, out, **kwargs):
             uns_override; a no-op for the on-disk uns read.
         stream: Stream the conversion (default True). False falls back to
             the legacy materializing path (does not apply overrides).
+            `sort_by` / `group_by` force the streaming route regardless —
+            a reorder-on-convert never runs the materializing path.
         strict_uns: True raises on the first unrepresentable uns entry;
             False (default) emits a UserWarning per skipped key.
         dense_zero_epsilon: Threshold for dropping near-zero values when
@@ -526,12 +527,17 @@ def from_h5ad(path, out, **kwargs):
             errors). Applies to X, layers, obs, and obsm; obsp is dropped
             with a warning, and `adata.raw` is not carried (raw streams in
             source order, so a reorder would misalign it).
-        reverse: Descending order for `sort_by`.
+        reverse: Descending order for `sort_by`. Ignored when `group_by`
+            is set (reference rows must sort first; the secondary keys sort
+            ascending — same rule as `scx sort --group-by`).
         group_by: Convert-time grouping: cluster cells by this obs column
-            into contiguous, never-split CSR shards (reference-first),
-            writing a grouped layout directly — byte-equivalent to
-            convert-then-`scx sort --group-by`, but a single write.
-            Requires a CSR or dense h5ad X and a single-modality input.
+            into group-aligned CSR shards (reference-first) — byte-
+            equivalent to convert-then-`scx sort --group-by`, in one pass
+            for a CSR X without obsp and via that two-step route otherwise
+            (see `group_pass`). Shards split only at group edges, except
+            that a group larger than the writer's block (default 256M) is
+            sub-flushed across multiple shards. Requires a CSR or dense
+            h5ad X and a single-modality input.
             `sort_by`, if also set, supplies secondary keys after the
             group key. Read back with `pyscx.open(...).read_group(...)`.
         reference: Reference cells for `group_by` (e.g. non-targeting
@@ -541,18 +547,27 @@ def from_h5ad(path, out, **kwargs):
             `group_by`.
         group_target_bytes: Byte-budget grouped sharding for `group_by`:
             target shard size in bytes (split at group edges only) instead
-            of `shard_size` rows. Same size syntax as `memory_budget`.
-            CSR inputs only — dense/CSC fall back to row-count with a
-            warning.
+            of `shard_size` rows. Same size syntax as `memory_budget`. Byte
+            planning runs on the CSR one-pass route (per-row nnz from the
+            h5ad indptr) and on any two-pass route (`scx sort` does the
+            sizing there); forcing `group_pass="one"` over a non-CSR source
+            with a byte budget is an error, not a silent row-count
+            fallback.
         group_max_bytes: Oversize threshold for `group_target_bytes`: a
-            single group above this becomes its own shard with a warning.
-            Same size syntax as `memory_budget`. Defaults to 4x
-            `group_target_bytes`.
-        group_pass: How to realize `group_by`: "auto" (default) routes by
-            source density — CSR streams the grouped layout in one pass
-            (cheaper); dense goes two-pass (plain convert + sort, ~4-5x
-            faster than a one-pass random-row gather over dense). "one" /
-            "two" force a strategy.
+            single group above this is emitted on its own (with a warning)
+            rather than packed with neighbors — still subject to the
+            writer's sub-flush for very large groups. Same size syntax as
+            `memory_budget`. Defaults to 4x `group_target_bytes`.
+        group_pass: How to realize `group_by`: "auto" (default) picks
+            two-pass (plain convert + `scx sort --group-by`) for a dense X
+            (~4-5x faster than a one-pass random-row gather over dense) and
+            whenever the file carries `obsp` (the one-pass route cannot
+            remap pairwise graphs); a CSR X without obsp streams the
+            grouped layout in one pass. "one" / "two" force a strategy; a
+            forced "one" rejects the combinations it cannot honor
+            (non-CSR source with `group_target_bytes`; any source with
+            obsp) rather than diverging from what "auto"/"two" would
+            write.
         obs_override: Optional pandas DataFrame used in place of the
             on-disk obs (shape[0] must equal on-disk n_obs), for
             read-mutate-write flows via pyscx.read_h5ad_metadata. Requires
@@ -1026,7 +1041,8 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
             "error" refuses. "zero" is an accepted legacy alias for "null" —
             the shared policy's zero is literal only where the missing thing
             is a matrix row (cellbender_import), which really is zeros.
-            Uncovered rows are also marked absent in `status_column`.
+            When a `status_column` is requested, uncovered rows are also
+            marked absent there.
         on_extra_rows: "warn" (default) skips source rows the target lacks;
             "error" refuses.
         dry_run: Run the join and every validation that does not require
@@ -1872,10 +1888,13 @@ def from_h5mu(path, out, **kwargs):
         csc: "off", "auto", or "always" (column-major sidecar). When
             omitted, an accel-ready index_preset ("training" / "perturbseq")
             upgrades the default to "auto"; otherwise "off". An explicit
-            value always wins. (Streaming h5mu cannot build per-modality
-            CSC: "auto" degrades to no-CSC with a warning.)
-        csc_cols_per_shard: Columns per CSC shard when csc="always"
-            (default 5000).
+            value always wins. The streaming path (the default) cannot
+            build per-modality CSC: csc="always" raises there, and "auto"
+            degrades to no-CSC with a warning when a modality would have
+            qualified. Pass stream=False to build per-modality CSC via the
+            non-streaming path (it materializes each modality's X).
+        csc_cols_per_shard: Columns per CSC shard when a CSC sidecar is
+            built (default 5000).
         stream: Stream the conversion (default True).
         strict_uns: True raises on the first unrepresentable uns entry;
             False (default) warns per skipped key.

@@ -59,6 +59,13 @@ python = ["pyo3", "numpy"]
 gpu = ["dep:scx-gpu"]
 
 [dev-dependencies]
+# Re-declared purely to turn on `test-hooks`, which gives the tests
+# `BackedCsrReader::set_decode_barrier` — the only way to hold a shard in the
+# singleflight in-flight table on purpose, and therefore the only way to pin
+# `IterMetrics::prefetch_skipped_in_flight` with a predicate instead of a sleep.
+# Cargo unifies this with the `[dependencies]` entry above, so the feature is on
+# for `cargo test` and off for every shipped build.
+scx-format-io = { path = "../scx-format-io", features = ["test-hooks"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 nix = { workspace = true }

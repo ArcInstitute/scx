@@ -113,15 +113,24 @@ class TestSuggestedCacheShards:
         ds = pyscx.SparseCellSetDataset([multishard_path, multishard_path])
         # Same shard index in two files = two distinct cache entries, because
         # the shared cache is keyed (file_id, shard).
-        assert ds.suggested_cache_shards([0, 0], [0, 5]) == 1
-        assert ds.suggested_cache_shards([0, 1], [0, 0]) == 2
-        assert ds.suggested_cache_shards([0, 0, 1, 1], [0, 199, 0, 199]) == 4
-        assert ds.suggested_cache_shards([], []) == 0
+        # One plan, in the shape `iter_with_plans` consumes — role_tags and
+        # set_offsets are ignored, so they only have to be well-formed.
+        assert ds.suggested_cache_shards(([0, 0], [0, 5], [0, 0], [0, 2])) == 1
+        assert ds.suggested_cache_shards(([0, 1], [0, 0], [0, 0], [0, 2])) == 2
+        assert (
+            ds.suggested_cache_shards(
+                ([0, 0, 1, 1], [0, 199, 0, 199], [0] * 4, [0, 4])
+            )
+            == 4
+        )
+        assert ds.suggested_cache_shards(([], [], [], [0])) == 0
 
     def test_sparse_cellset_rejects_mismatched_lengths(self, multishard_path):
+        """A four-tuple can still be ragged, so the guard outlives the arity
+        change that folded the two arrays into one plan argument."""
         ds = pyscx.SparseCellSetDataset([multishard_path])
         with pytest.raises(ValueError, match="same length"):
-            ds.suggested_cache_shards([0, 0], [0])
+            ds.suggested_cache_shards(([0, 0], [0], [0, 0], [0, 2]))
 
 
 class TestBudgetReconciliation:
@@ -137,7 +146,7 @@ class TestBudgetReconciliation:
         )
         assert budget["cache_shards"] == 128, "documented default"
         # A tiny fixture must not be tightened below the floor.
-        assert budget["affordable_cache_shards"] == 128
+        assert budget["effective_cache_shards"] == 128
 
     def test_index_plan_none_budget_reports_the_resolved_value(self, multishard_path):
         ds = pyscx.IndexPlanDataset(multishard_path, scatter_block_index=False)
@@ -148,7 +157,7 @@ class TestBudgetReconciliation:
         )
 
     def test_memory_budget_reports_the_binding_constraint(self, multishard_path):
-        """`affordable_cache_shards` must reflect the BYTE cap when it binds.
+        """`effective_cache_shards` must reflect the BYTE cap when it binds.
 
         Round-1 review (Cursor, P2): diagnostics on the sparse path were phrased
         against the requested `cache_shards` while the byte budget is what caps
@@ -161,16 +170,81 @@ class TestBudgetReconciliation:
         )
         b = ds.memory_budget()
         assert b["cache_shards"] == 4096, "the request is reported unchanged"
-        assert b["affordable_cache_shards"] < 4096, (
+        assert b["effective_cache_shards"] < 4096, (
             "a 1 MB budget cannot afford 4096 shards"
         )
         # And it must be derived from the byte budget, not invented.
         expected = min(4096, (1 * 1024 * 1024) // b["shard_decoded_bytes"])
-        assert b["affordable_cache_shards"] == expected
+        assert b["effective_cache_shards"] == expected
 
     def test_explicit_budget_is_respected(self, multishard_path):
         ds = pyscx.SparseCellSetDataset([multishard_path], max_memory_mb=64)
         assert ds.memory_budget()["max_memory_mb"] == 64
+
+
+_BREAKDOWN_KEYS = {
+    "cache_bytes",
+    "batch_buffer_bytes",
+    "lookahead_overhead_bytes",
+    "transient_bytes",
+    "python_overhead_bytes",
+    "total_bytes",
+}
+
+
+class TestMemoryBudgetEnvelope:
+    """Every class that reports a budget reports it in the same envelope.
+
+    ORG-9.10-4: the three `memory_budget()` dicts had an **empty** three-way
+    top-level key intersection. `TrainingDataset` nested the six
+    `BudgetBreakdown` components under `breakdown`, `IndexPlanDataset` spread
+    the same six across the top level, and `SparseCellSetDataset` reported four
+    cache-only keys and no breakdown at all — so no caller could read
+    `total_bytes` off an arbitrary dataset, and the divergence was invisible
+    because nothing tested more than one class's shape.
+
+    Class-specific keys stay class-specific; it is the *breakdown* that must be
+    one thing.
+    """
+
+    def _datasets(self, multishard_path):
+        return {
+            "TrainingDataset": pyscx.TrainingDataset(multishard_path),
+            "IndexPlanDataset": pyscx.IndexPlanDataset(
+                multishard_path, scatter_block_index=False
+            ),
+            "SparseCellSetDataset": pyscx.SparseCellSetDataset([multishard_path]),
+        }
+
+    def test_every_budget_carries_the_same_breakdown(self, multishard_path):
+        for name, ds in self._datasets(multishard_path).items():
+            b = ds.memory_budget()
+            assert "breakdown" in b, (
+                f"{name}.memory_budget() has no 'breakdown' key: {sorted(b)}"
+            )
+            assert set(b["breakdown"]) == _BREAKDOWN_KEYS, (
+                f"{name} breakdown keys: {sorted(b['breakdown'])}"
+            )
+
+    def test_breakdown_components_sum_to_total(self, multishard_path):
+        for name, ds in self._datasets(multishard_path).items():
+            bd = ds.memory_budget()["breakdown"]
+            components = sum(
+                bd[k] for k in _BREAKDOWN_KEYS if k != "total_bytes"
+            )
+            assert components == bd["total_bytes"], name
+            assert all(isinstance(v, int) and v >= 0 for v in bd.values()), name
+
+    def test_python_overhead_is_counted_on_every_path(self, multishard_path):
+        """The 50 MB interpreter/numpy/Arrow constant is not path-specific.
+
+        The sparse loader omitted it entirely — it never built a breakdown — so
+        its reported budget was the only one that pretended the interpreter was
+        free.
+        """
+        for name, ds in self._datasets(multishard_path).items():
+            bd = ds.memory_budget()["breakdown"]
+            assert bd["python_overhead_bytes"] > 0, name
 
 
 class TestCacheSizingWarning:
@@ -345,7 +419,7 @@ class TestThrashWarning:
         ds = pyscx.SparseCellSetDataset(
             [bigshard_path], cache_shards=4096, max_memory_mb=1
         )
-        affordable = ds.memory_budget()["affordable_cache_shards"]
+        affordable = ds.memory_budget()["effective_cache_shards"]
         n_shards = pyscx.open(bigshard_path).shard_count
         assert affordable < n_shards, (
             f"premise: the byte cap must afford fewer ({affordable}) than the "

@@ -14,6 +14,12 @@ default = ["parallel", "deletion-vectors"]
 # falls back to a plain sequential loop.
 parallel = ["rayon", "crossbeam-channel"]
 deletion-vectors = ["roaring"]
+# Opt-in seams that exist only so a *downstream* crate's tests can establish a
+# premise it otherwise cannot: `BackedCsrReader::set_decode_barrier` lets
+# `scx-loader` hold a shard in the singleflight in-flight table deterministically
+# instead of racing a sleep against a decode. Never enable it in a shipped build
+# — nothing under this feature is part of the public contract.
+test-hooks = []
 
 [dependencies]
 rayon = { workspace = true, optional = true }
