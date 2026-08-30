@@ -9,7 +9,7 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::BackedCsrReader;
 
 use crate::batch::Batch;
-use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
+use crate::budget::{profiling_enabled, BudgetBreakdown, BudgetModel, PYTHON_OVERHEAD_BYTES};
 use crate::decode_stage::{build_category_dicts, decode_stage, CategoryDict};
 use crate::error::{LoaderError, Result};
 use crate::io_stage::io_stage;
@@ -418,6 +418,99 @@ pub(crate) fn ensure_csr_ranges_are_readable(
     Ok(())
 }
 
+/// Knobs the sequential auto-tune reduces, in reduction order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequentialParams {
+    pub shard_group_size: usize,
+    pub prefetch_batches: usize,
+    pub batch_size: usize,
+}
+
+impl SequentialParams {
+    fn from_config(config: &LoaderConfig) -> Self {
+        SequentialParams {
+            shard_group_size: config.shard_group_size,
+            prefetch_batches: config.prefetch_batches,
+            batch_size: config.batch_size,
+        }
+    }
+}
+
+/// The sequential (`TrainingPipeline`) arm of [`crate::budget::BudgetModel`].
+///
+/// Reduction order — `prefetch_batches` to 2, then `shard_group_size` to 1,
+/// then `batch_size` **halved** to 64 — is deliberate and pinned
+/// (`budget_reduces_prefetch_then_shard_group_then_batch`): `batch_size` is the
+/// only one of the three a caller picks for statistical rather than memory
+/// reasons, so it gives last.
+pub(crate) struct SequentialBudgetModel {
+    n_output_genes: usize,
+    shard_target_rows: usize,
+    avg_nnz_per_cell: f64,
+}
+
+impl SequentialBudgetModel {
+    pub(crate) fn new(
+        n_output_genes: usize,
+        shard_target_rows: usize,
+        avg_nnz_per_cell: f64,
+    ) -> Self {
+        SequentialBudgetModel {
+            n_output_genes,
+            shard_target_rows,
+            avg_nnz_per_cell,
+        }
+    }
+}
+
+impl BudgetModel for SequentialBudgetModel {
+    type Params = SequentialParams;
+
+    fn estimate(&self, p: SequentialParams) -> BudgetBreakdown {
+        estimate_breakdown(
+            p.shard_group_size,
+            p.prefetch_batches,
+            p.batch_size,
+            self.n_output_genes,
+            self.shard_target_rows,
+            self.avg_nnz_per_cell,
+        )
+    }
+
+    fn reduce(&self, p: SequentialParams) -> Option<SequentialParams> {
+        if p.prefetch_batches > 2 {
+            Some(SequentialParams {
+                prefetch_batches: p.prefetch_batches - 1,
+                ..p
+            })
+        } else if p.shard_group_size > 1 {
+            Some(SequentialParams {
+                shard_group_size: p.shard_group_size - 1,
+                ..p
+            })
+        } else if p.batch_size > 64 {
+            Some(SequentialParams {
+                batch_size: (p.batch_size / 2).max(64),
+                ..p
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Number of output columns the batch is actually allocated at.
+///
+/// The **deduplicated** panel width, not `hvg.len()`: costing the raw length
+/// over-reserves for any panel with duplicates and can auto-tune `batch_size`
+/// down to afford memory that is never used.
+fn n_output_genes_for(config: &LoaderConfig, n_vars: u64) -> usize {
+    match &config.hvg_indices {
+        Some(hvg) => HvgProjection::output_cols_for(hvg),
+        None => n_vars as usize,
+    }
+}
+
 /// Compute the memory budget for the training pipeline.
 ///
 /// Memory model:
@@ -425,7 +518,6 @@ pub(crate) fn ensure_csr_ranges_are_readable(
 /// n_output_genes     = unique genes in hvg_indices if present, else n_vars
 /// shard_buffer       = (shard_group_size + 1) × decoded_shard_bytes
 /// batch_buffer       = (max(prefetch_batches, 2) + 1) × batch_size × n_output_genes × 4
-/// mmap_resident      = file_size_bytes (entire file faulted into RSS during epoch)
 /// overhead           = ~50 MB (Python interpreter, numpy, Arrow, thread stacks)
 /// ```
 ///
@@ -433,6 +525,15 @@ pub(crate) fn ensure_csr_ranges_are_readable(
 /// 1. `prefetch_batches` (minimum 2)
 /// 2. `shard_group_size` (minimum 1)
 /// 3. `batch_size` (halve each step, minimum 64)
+///
+/// **`file_size_bytes` is reported, never budgeted** (ORG-9.10-5). The mmap'd
+/// file lives in the kernel page cache, which is evictable under pressure; the
+/// two plan-driven loaders have always excluded it, and counting it here made
+/// this path mean something different by the same name. It also made the
+/// auto-tune useless on exactly the files it matters for: any file above
+/// [`ADAPTIVE_BUDGET_CAP_MB`] exceeded its budget on the mmap term alone,
+/// collapsing to `batch_size=64, shard_group_size=1, prefetch_batches=2` with
+/// `budget_exceeded` set, whatever the caller asked for.
 pub fn compute_memory_budget(
     config: &LoaderConfig,
     n_vars: u64,
@@ -440,96 +541,41 @@ pub fn compute_memory_budget(
     avg_nnz_per_cell: f64,
     file_size_bytes: usize,
 ) -> MemoryBudget {
-    // The deduplicated width, not `hvg.len()` — the batch is allocated at
-    // `HvgProjection::n_output_cols()`, so costing the raw length over-reserves
-    // for any panel with duplicates and can auto-tune `batch_size` down to
-    // afford memory that is never used.
-    let n_output_genes = match &config.hvg_indices {
-        Some(hvg) => HvgProjection::output_cols_for(hvg),
-        None => n_vars as usize,
-    };
+    let model = SequentialBudgetModel::new(
+        n_output_genes_for(config, n_vars),
+        shard_target_rows as usize,
+        avg_nnz_per_cell,
+    );
+    let tuned = crate::budget::tune(
+        &model,
+        SequentialParams::from_config(config),
+        config.max_memory_mb.saturating_mul(1024 * 1024),
+    );
 
-    let max_bytes = config.max_memory_mb * 1024 * 1024;
-
-    let mut shard_group_size = config.shard_group_size;
-    let mut prefetch_batches = config.prefetch_batches;
-    let mut batch_size = config.batch_size;
-
-    loop {
-        let estimated = estimate_memory(
-            shard_group_size,
-            prefetch_batches,
-            batch_size,
-            n_output_genes,
-            shard_target_rows as usize,
-            avg_nnz_per_cell,
-            file_size_bytes,
+    if tuned.exhausted {
+        log::warn!(
+            "estimated memory ({} MB) exceeds budget ({} MB) even at minimums \
+             (batch_size={}, shard_group_size=1, prefetch_batches=2). \
+             Consider setting hvg_indices to reduce n_output_genes from {}.",
+            tuned.breakdown.total_bytes / (1024 * 1024),
+            config.max_memory_mb,
+            tuned.params.batch_size,
+            n_vars,
         );
+    }
 
-        if estimated <= max_bytes {
-            let breakdown = estimate_breakdown(
-                shard_group_size,
-                prefetch_batches,
-                batch_size,
-                n_output_genes,
-                shard_target_rows as usize,
-                avg_nnz_per_cell,
-            );
-            return MemoryBudget {
-                shard_group_size,
-                prefetch_batches,
-                batch_size,
-                estimated_bytes: estimated,
-                mmap_bytes: file_size_bytes,
-                budget_exceeded: false,
-                breakdown,
-                shuffle_quality_degraded: shuffle_quality_degraded(
-                    config.shard_group_size,
-                    shard_group_size,
-                ),
-            };
-        }
-
-        // Reduce prefetch_batches first (to minimum 2)
-        if prefetch_batches > 2 {
-            prefetch_batches -= 1;
-            continue;
-        }
-
-        // Then reduce shard_group_size (to minimum 1)
-        if shard_group_size > 1 {
-            shard_group_size -= 1;
-            continue;
-        }
-
-        // Then halve batch_size (to minimum 64)
-        if batch_size > 64 {
-            batch_size = (batch_size / 2).max(64);
-            continue;
-        }
-
-        // All at minimums — return best-effort estimate with warning
-        let breakdown = estimate_breakdown(
-            shard_group_size,
-            prefetch_batches,
-            batch_size,
-            n_output_genes,
-            shard_target_rows as usize,
-            avg_nnz_per_cell,
-        );
-        return MemoryBudget {
-            shard_group_size,
-            prefetch_batches,
-            batch_size,
-            estimated_bytes: estimated,
-            mmap_bytes: file_size_bytes,
-            budget_exceeded: true,
-            breakdown,
-            shuffle_quality_degraded: shuffle_quality_degraded(
-                config.shard_group_size,
-                shard_group_size,
-            ),
-        };
+    MemoryBudget {
+        shard_group_size: tuned.params.shard_group_size,
+        prefetch_batches: tuned.params.prefetch_batches,
+        batch_size: tuned.params.batch_size,
+        estimated_bytes: tuned.breakdown.total_bytes,
+        mmap_bytes: file_size_bytes,
+        budget_exceeded: tuned.exhausted,
+        breakdown: tuned.breakdown,
+        shuffle_quality_degraded: shuffle_quality_degraded(
+            config.shard_group_size,
+            tuned.params.shard_group_size,
+        ),
     }
 }
 
@@ -583,73 +629,6 @@ fn estimate_breakdown(
         /* transient_bytes */ 0,
         PYTHON_OVERHEAD_BYTES,
     )
-}
-
-/// Estimate total memory usage including the mmap-resident term, used by
-/// the auto-tune to decide when to reduce parameters.
-///
-/// **Mmap note**: the OS faults pages into RSS as shards are read
-/// sequentially; with MADV_SEQUENTIAL the kernel may reclaim pages, but we
-/// conservatively include the full file size since `ru_maxrss` captures
-/// the high-water mark. Intentional over-estimate — a caller that sees
-/// this fit will nearly always fit at runtime.
-fn estimate_memory(
-    shard_group_size: usize,
-    prefetch_batches: usize,
-    batch_size: usize,
-    n_output_genes: usize,
-    shard_target_rows: usize,
-    avg_nnz_per_cell: f64,
-    file_size_bytes: usize,
-) -> usize {
-    let breakdown = estimate_breakdown(
-        shard_group_size,
-        prefetch_batches,
-        batch_size,
-        n_output_genes,
-        shard_target_rows,
-        avg_nnz_per_cell,
-    );
-    breakdown.total_bytes.saturating_add(file_size_bytes)
-}
-
-/// Adaptive default budget (MB) for [`LoaderConfig::auto_memory_budget`].
-///
-/// Returns the memory the **requested** configuration needs (the same model
-/// [`compute_memory_budget`] auto-tunes against) rounded up to whole MB with
-/// ~12 % headroom, clamped to `[floor_mb, ADAPTIVE_BUDGET_CAP_MB]`. Because the
-/// floor is the lower clamp bound this never lowers the budget — a small file
-/// whose need is below `floor_mb` keeps `floor_mb`, while a full-width file is
-/// raised just enough to fit without the auto-tune shrinking `batch_size` /
-/// `shard_group_size`. A need above the cap is clamped to the cap, leaving the
-/// hard-ceiling auto-tune (and its warnings) to handle genuinely huge files.
-#[allow(clippy::too_many_arguments)]
-fn adaptive_budget_mb(
-    floor_mb: usize,
-    shard_group_size: usize,
-    prefetch_batches: usize,
-    batch_size: usize,
-    n_output_genes: usize,
-    shard_target_rows: usize,
-    avg_nnz_per_cell: f64,
-    file_size_bytes: usize,
-) -> usize {
-    let requested_need = estimate_memory(
-        shard_group_size,
-        prefetch_batches,
-        batch_size,
-        n_output_genes,
-        shard_target_rows,
-        avg_nnz_per_cell,
-        file_size_bytes,
-    );
-    let need_mb = requested_need.div_ceil(1024 * 1024);
-    let with_headroom = need_mb.saturating_add(need_mb / 8);
-    // `clamp` panics if min > max. Today the auto path always supplies
-    // floor_mb = the 512 MB default (< cap), but guard defensively against a
-    // caller that sets `auto_memory_budget` with a budget above the cap so a
-    // misconfiguration never panics the interpreter.
-    with_headroom.clamp(floor_mb, ADAPTIVE_BUDGET_CAP_MB.max(floor_mb))
 }
 
 // ---------------------------------------------------------------------------
@@ -909,15 +888,18 @@ impl TrainingPipeline {
                 Some(proj) => proj.n_output_cols(),
                 None => n_vars as usize,
             };
-            let adaptive_mb = adaptive_budget_mb(
-                config.max_memory_mb,
-                config.shard_group_size,
-                config.prefetch_batches,
-                config.batch_size,
+            // One `adaptive_budget_mb`, in `crate::budget` — this path used to
+            // carry a second copy of the same arithmetic (ORG-9.10-5).
+            let model = SequentialBudgetModel::new(
                 n_output_genes,
                 shard_target_rows as usize,
                 avg_nnz_per_cell,
-                file_size_bytes,
+            );
+            let adaptive_mb = crate::budget::adaptive_budget_mb(
+                model
+                    .estimate(SequentialParams::from_config(&config))
+                    .total_bytes,
+                config.max_memory_mb,
             );
             if adaptive_mb > config.max_memory_mb {
                 log::info!(
@@ -945,18 +927,6 @@ impl TrainingPipeline {
 
         // Propagate effective batch_size back into config
         config.batch_size = memory_budget.batch_size;
-
-        if memory_budget.budget_exceeded {
-            log::warn!(
-                "estimated memory ({} MB) exceeds budget ({} MB) even at minimums \
-                 (batch_size={}, shard_group_size=1, prefetch_batches=2). \
-                 Consider setting hvg_indices to reduce n_output_genes from {}.",
-                memory_budget.estimated_bytes / (1024 * 1024),
-                config.max_memory_mb,
-                memory_budget.batch_size,
-                n_vars,
-            );
-        }
 
         // Create shard shuffler
         let shuffler =
@@ -1700,6 +1670,34 @@ mod tests {
 
     // --- Memory budget tests ---
 
+    /// The four adaptive-budget tests below were written against
+    /// `pipeline::adaptive_budget_mb`, the second copy of arithmetic
+    /// `budget::adaptive_budget_mb` already owned. ORG-9.10-5 deleted the copy;
+    /// this keeps the tests' call shape while routing them through the survivor,
+    /// so what they assert is unchanged. `file_size_bytes` is gone from the
+    /// signature because the sequential model no longer budgets mmap.
+    fn adaptive_budget_mb(
+        floor_mb: usize,
+        shard_group_size: usize,
+        prefetch_batches: usize,
+        batch_size: usize,
+        n_output_genes: usize,
+        shard_target_rows: usize,
+        avg_nnz_per_cell: f64,
+    ) -> usize {
+        let model = SequentialBudgetModel::new(n_output_genes, shard_target_rows, avg_nnz_per_cell);
+        crate::budget::adaptive_budget_mb(
+            model
+                .estimate(SequentialParams {
+                    shard_group_size,
+                    prefetch_batches,
+                    batch_size,
+                })
+                .total_bytes,
+            floor_mb,
+        )
+    }
+
     #[test]
     fn test_memory_budget_2k_hvg_within_512mb() {
         let config = LoaderConfig {
@@ -1845,14 +1843,13 @@ mod tests {
         // A tiny file needs far less than the 512 MB floor → budget unchanged,
         // so small-file behaviour is identical to the fixed default.
         let mb = adaptive_budget_mb(
-            512,         /* floor */
-            1,           /* shard_group_size */
-            4,           /* prefetch */
-            64,          /* batch_size */
-            100,         /* n_output_genes */
-            1024,        /* shard_target_rows */
-            5.0,         /* avg_nnz_per_cell */
-            1024 * 1024, /* 1 MB file */
+            512,  /* floor */
+            1,    /* shard_group_size */
+            4,    /* prefetch */
+            64,   /* batch_size */
+            100,  /* n_output_genes */
+            1024, /* shard_target_rows */
+            5.0,  /* avg_nnz_per_cell */
         );
         assert_eq!(mb, 512, "small file should keep the 512 MB floor");
     }
@@ -1867,17 +1864,7 @@ mod tests {
         let n_genes = 33_538usize;
         let shard_target_rows = 16_384usize;
         let avg_nnz = 2_246.0f64;
-        let file_size = 280 * 1024 * 1024usize;
-        let mb = adaptive_budget_mb(
-            512,
-            1,
-            4,
-            512,
-            n_genes,
-            shard_target_rows,
-            avg_nnz,
-            file_size,
-        );
+        let mb = adaptive_budget_mb(512, 1, 4, 512, n_genes, shard_target_rows, avg_nnz);
         assert!(
             mb > 512,
             "full-width file should raise above the 512 MB floor (got {mb})"
@@ -1898,7 +1885,7 @@ mod tests {
             n_genes as u64,
             shard_target_rows as u32,
             avg_nnz,
-            file_size,
+            /*file_size_bytes*/ 280 * 1024 * 1024,
         );
         assert_eq!(
             budget.batch_size, 512,
@@ -1920,14 +1907,9 @@ mod tests {
         // the cap so we never silently reserve unbounded RAM — the hard-ceiling
         // auto-tune + warnings take over above the cap.
         let mb = adaptive_budget_mb(
-            512,
-            8,
-            4,
-            1024,
-            33_538,                 /* n_output_genes */
-            16_384,                 /* shard_target_rows */
-            33_538.0,               /* fully dense: avg_nnz == n_genes */
-            2 * 1024 * 1024 * 1024, /* 2 GB file */
+            512, 8, 4, 1024, 33_538,   /* n_output_genes */
+            16_384,   /* shard_target_rows */
+            33_538.0, /* fully dense: avg_nnz == n_genes */
         );
         assert_eq!(
             mb, ADAPTIVE_BUDGET_CAP_MB,
@@ -1947,7 +1929,6 @@ mod tests {
             30_000,
             16_384,
             10.0,
-            0,
         );
         assert!(
             mb >= ADAPTIVE_BUDGET_CAP_MB + 4096,
@@ -2039,37 +2020,72 @@ mod tests {
         );
     }
 
+    /// **Inverted by ORG-9.10-5.** This test previously asserted the opposite —
+    /// that a 2.5 GB file raised `estimated_bytes` by roughly the file size —
+    /// because the sequential model counted mmap-resident pages against the
+    /// budget and the two plan-driven models did not.
+    ///
+    /// `mmap_bytes` is still *reported*, because the pages are real and a
+    /// caller reading `ru_maxrss` will see them. It is no longer *budgeted*:
+    /// the kernel page cache is evictable under pressure, and counting it made
+    /// every file above `ADAPTIVE_BUDGET_CAP_MB` exceed its budget on that term
+    /// alone.
     #[test]
-    fn test_memory_budget_includes_mmap_size() {
-        // A large file should increase the estimate proportionally
+    fn mmap_is_reported_but_not_budgeted() {
         let config = LoaderConfig {
             hvg_indices: Some((0..2000).collect()),
             ..LoaderConfig::default()
         };
-        let budget_no_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
         let file_2gb = 2_500 * 1024 * 1024; // 2.5 GB
-        let budget_large_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
+        let no_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
+        let large = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
 
-        assert_eq!(budget_large_file.mmap_bytes, file_2gb);
-        assert!(
-            budget_large_file.estimated_bytes > budget_no_file.estimated_bytes + file_2gb / 2,
-            "large file should significantly increase estimate"
+        assert_eq!(
+            large.mmap_bytes, file_2gb,
+            "the file size is still reported"
+        );
+        assert_eq!(no_file.mmap_bytes, 0);
+        assert_eq!(
+            large.estimated_bytes, no_file.estimated_bytes,
+            "the estimate must not move with the file size"
+        );
+        assert_eq!(
+            large.estimated_bytes, large.breakdown.total_bytes,
+            "`estimated_bytes` and the breakdown's total are now the same number \
+             on every loader class"
         );
     }
 
+    /// **Inverted by ORG-9.10-5**, and the reason the change is worth making:
+    /// a 2.5 GB file used to force `batch_size` / `shard_group_size` /
+    /// `prefetch_batches` down purely because of its size.
+    /// `benchmarks/comprehensive/benchmarks/ml_loader.py` carried a
+    /// SLURM-memory-scaling workaround for exactly this collapse.
     #[test]
-    fn test_memory_budget_large_file_reduces_batch_size() {
-        // A 2.5 GB file with 2K HVG should force parameter reductions
+    fn a_large_file_no_longer_forces_a_reduction() {
         let config = LoaderConfig {
             hvg_indices: Some((0..2000).collect()),
             ..LoaderConfig::default()
         };
         let file_2gb = 2_500 * 1024 * 1024;
         let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
-        assert!(
-            budget.shard_group_size < 8 || budget.prefetch_batches < 4 || budget.batch_size < 1024,
-            "2.5 GB file should force parameter reduction even with 2K HVG"
+        assert_eq!(
+            (
+                budget.shard_group_size,
+                budget.prefetch_batches,
+                budget.batch_size
+            ),
+            (
+                config.shard_group_size,
+                config.prefetch_batches,
+                config.batch_size
+            ),
+            "a large file must not shrink a config that fits in anonymous memory"
         );
+        assert!(!budget.budget_exceeded);
+        // The premise: this config genuinely fits the 512 MB default, so the
+        // old failure really was the mmap term and nothing else.
+        assert!(budget.breakdown.fits_within(config.max_memory_mb));
     }
 
     // ---- ORG-9.10-5 pre-refactor pins ------------------------------------
@@ -2152,6 +2168,27 @@ mod tests {
         );
     }
 
+    /// The whole reduction chain, through the shared harness — the same check
+    /// `crate::budget::tune` `debug_assert`s per step, run end to end with no
+    /// file and no fixture.
+    #[test]
+    fn the_sequential_reduction_chain_is_monotone() {
+        for &(n_genes, rows, nnz) in &[
+            (30_000usize, 16_384usize, 10.0f64),
+            (2_000, 4_096, 3.0),
+            (61_497, 16_384, 40.0),
+        ] {
+            crate::budget::assert_monotone_reduction_chain(
+                &SequentialBudgetModel::new(n_genes, rows, nnz),
+                SequentialParams {
+                    shard_group_size: 8,
+                    prefetch_batches: 4,
+                    batch_size: 1024,
+                },
+            );
+        }
+    }
+
     /// `estimate_memory` must be monotone non-increasing in every knob the
     /// auto-tune reduces.
     ///
@@ -2169,8 +2206,15 @@ mod tests {
             (2_000, 4_096, 3.0),
             (61_497, 16_384, 40.0),
         ] {
+            let model = SequentialBudgetModel::new(n_genes, rows, nnz);
             let est = |sgs: usize, pf: usize, bs: usize| {
-                estimate_memory(sgs, pf, bs, n_genes, rows, nnz, 0)
+                model
+                    .estimate(SequentialParams {
+                        shard_group_size: sgs,
+                        prefetch_batches: pf,
+                        batch_size: bs,
+                    })
+                    .total_bytes
             };
 
             for sgs in (1..64usize).rev() {

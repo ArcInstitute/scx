@@ -1073,6 +1073,30 @@ fn budget_lookahead_zero_honored_when_fits() {
 
 // ---- ORG-9.10-5 pre-refactor pins ------------------------------------
 
+/// The whole reduction chain, through the shared harness. Needs no file: the
+/// model is a plain value type, which is half the point of extracting it.
+#[test]
+fn the_index_plan_reduction_chain_is_monotone() {
+    for &(shard, batch, transient, plan) in &[
+        (2_100_000usize, 33_000_000usize, 8_000_000usize, 1024usize),
+        (128, 0, 0, 1),
+        (usize::MAX / 4, 0, 0, 1),
+    ] {
+        crate::budget::assert_monotone_reduction_chain(
+            &IndexPlanBudgetModel {
+                shard_decoded_bytes: shard,
+                batch_buffer_bytes: batch,
+                transient_bytes: transient,
+                max_plan_size: plan,
+            },
+            IndexPlanParams {
+                cache_shards: 16,
+                lookahead: 8,
+            },
+        );
+    }
+}
+
 /// The **model** is monotone: shrinking a knob may not raise the estimate.
 ///
 /// Read under a budget generous enough that no tuning happens, so
