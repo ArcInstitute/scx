@@ -420,10 +420,102 @@ class TrainingDataset:
     @property
     def effective_batch_size(self) -> int: ...
 
+    @property
+    def closed(self) -> bool:
+        """True from `close()` until the next `__iter__` rebuilds.
+
+        Deliberately not the terminal flag `IndexPlanDataset.closed` is — see
+        `close()`. Never raises.
+        """
+        ...
+
     def __iter__(self) -> "TrainingDataset": ...
     def __next__(self) -> _TrainingBatchDict: ...
-    def memory_budget(self) -> dict[str, Any]: ...
-    def close(self) -> None: ...
+
+    def memory_budget(self) -> dict[str, Any]:
+        """Memory budget diagnostics.
+
+        `breakdown` is the six-key `BudgetBreakdown` every dataset class
+        reports (`cache_bytes`, `batch_buffer_bytes`,
+        `lookahead_overhead_bytes`, `transient_bytes`, `python_overhead_bytes`,
+        `total_bytes`); alongside it are this class's own
+        `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`,
+        `mmap_mb` and `budget_exceeded`. `mmap_mb` is reported here and nowhere
+        else: the plan-driven loaders treat page cache as evictable and exclude
+        it from their budgets.
+        """
+        ...
+
+    def close(self) -> None:
+        """Shut the pipeline down: join the I/O + decode threads and release the
+        rayon pool, with the GIL detached.
+
+        Idempotent, and **not** terminal — unlike `IndexPlanDataset.close()`,
+        the next `__iter__` rebuilds the pool and starts a fresh epoch, because
+        this class's pool and runtime are per-epoch anyway.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+
+class MultimodalTrainingDataset:
+    """Sequential streaming dataset over several modalities of one SCX file.
+
+    One `TrainingPipeline` per requested modality, iterated in lockstep: each
+    batch carries the same `cell_indices` row ordering across modalities, and
+    the wrapper raises `RuntimeError` if the per-modality shufflers diverge
+    (usually a file-construction bug — differing shard layouts).
+
+    Transforms are ON by default, exactly as on `TrainingDataset`: pass
+    `normalize=False, log1p=False` for raw counts.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        modalities: Sequence[str],
+        batch_size: int | None = None,
+        hvg_indices: Sequence[int] | np.ndarray | None = None,
+        obs_columns: list[str] | None = None,
+        return_dict: bool | None = None,
+        normalize: bool | None = None,  # default True — see class docstring
+        log1p: bool | None = None,  # default True — see class docstring
+        target_sum: float | None = None,
+        pflog: bool | None = None,
+        pflog_alpha: float | None = None,
+        shard_group_size: int | None = None,
+        prefetch_batches: int | None = None,
+        seed: int | None = None,
+        max_memory_mb: int | None = None,
+    ) -> None: ...
+
+    @property
+    def n_obs(self) -> int: ...
+    @property
+    def n_vars(self) -> dict[str, int]:
+        """Per-modality gene counts, keyed by modality name."""
+        ...
+
+    @property
+    def modality_names(self) -> list[str]: ...
+    @property
+    def closed(self) -> bool:
+        """True from `close()` until the next `__iter__` rebuilds. Never raises."""
+        ...
+
+    def __iter__(self) -> "MultimodalTrainingDataset": ...
+    def __next__(self) -> Any:
+        """A dict `{"X": {modality: ndarray}, "obs": {...}, "cell_indices": ...}`
+        when built with `return_dict=True` (the default), else a tuple of the
+        per-modality X arrays."""
+        ...
+
+    def close(self) -> None:
+        """Shut every modality's pipeline down, GIL detached. Idempotent, and
+        **not** terminal — see `TrainingDataset.close`."""
+        ...
+
     def __repr__(self) -> str: ...
 
 

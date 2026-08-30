@@ -403,10 +403,14 @@ class TestCloseIsReopenable:
         ds = pyscx.TrainingDataset(
             scx_path, batch_size=32, normalize=False, log1p=False
         )
+        assert ds.closed is False, "a fresh dataset has never been closed"
         assert self._epoch_rows(ds) == ds.n_obs
         ds.close()
-        # The whole point: a second full epoch after an explicit close().
+        assert ds.closed is True
+        # The whole point: a second full epoch after an explicit close(), and
+        # `closed` going back to False because the pool really was rebuilt.
         assert self._epoch_rows(ds) == ds.n_obs
+        assert ds.closed is False
 
     def test_close_mid_epoch_then_iterate_starts_a_fresh_epoch(self, scx_path):
         """The harder direction — close() while an epoch is live, which is what
@@ -426,6 +430,7 @@ class TestCloseIsReopenable:
         )
         ds.close()
         ds.close()
+        assert ds.closed is True
         assert self._epoch_rows(ds) == ds.n_obs
 
 

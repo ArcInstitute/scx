@@ -105,9 +105,12 @@ def test_multimodal_close_then_iterate_starts_a_fresh_epoch(cite_seq_path):
     def epoch_rows():
         return sum(b["cell_indices"].shape[0] for b in ds)
 
+    assert ds.closed is False, "a fresh dataset has never been closed"
     assert epoch_rows() == n_obs
     ds.close()
+    assert ds.closed is True
     assert epoch_rows() == n_obs
+    assert ds.closed is False
     ds.close()
 
 

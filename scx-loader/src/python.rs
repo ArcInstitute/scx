@@ -110,6 +110,9 @@ use scx_format_io::ScxReader;
 pub struct TrainingDataset {
     pipeline: TrainingPipeline,
     epoch_started: bool,
+    /// `close()` was the last lifecycle action — see the `closed` getter. Not a
+    /// terminal state on this class: `__iter__` clears it and rebuilds.
+    closed: bool,
     /// PID at construction time — used to detect forking (num_workers > 0).
     creation_pid: u32,
 }
@@ -243,16 +246,22 @@ impl TrainingDataset {
         Ok(TrainingDataset {
             pipeline,
             epoch_started: false,
+            closed: false,
             creation_pid: std::process::id(),
         })
     }
 
     /// Start a new epoch. Called automatically by `for batch in dataset`.
+    ///
+    /// Legal after `close()` — that is the difference from the two plan-driven
+    /// classes, whose `close()` is terminal. `start_epoch` rebuilds the rayon
+    /// pool through `ensure_decode_pool`, so this clears `closed`.
     fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
         slf.pipeline
             .start_epoch()
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         slf.epoch_started = true;
+        slf.closed = false;
         Ok(slf)
     }
 
@@ -365,6 +374,20 @@ impl TrainingDataset {
     /// (where `Drop`'s GIL probe might still be too late).
     fn close(&mut self, py: Python<'_>) {
         py.detach(|| self.pipeline.shutdown());
+        self.closed = true;
+    }
+
+    /// True from [`Self::close`] until the next `__iter__` rebuilds. Never raises.
+    ///
+    /// Deliberately **not** the terminal flag `IndexPlanDataset.closed` is.
+    /// `close()` on this class releases the rayon pool and joins the epoch
+    /// threads, and the next `__iter__` builds them again — so the honest
+    /// reading is "torn down right now", not "unusable from here on". It cannot
+    /// be derived from pipeline state either: a freshly constructed dataset has
+    /// no pool yet and would report `True` before it had ever been closed.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed
     }
 
     fn __repr__(&self) -> String {
@@ -535,6 +558,9 @@ pub struct MultimodalTrainingDataset {
     /// True → batches are dicts. False → batches are tuples of X arrays.
     return_dict: bool,
     epoch_started: bool,
+    /// `close()` was the last lifecycle action — see the `closed` getter.
+    /// Not terminal here either: `__iter__` clears it and rebuilds.
+    closed: bool,
     creation_pid: u32,
 }
 
@@ -804,16 +830,20 @@ impl MultimodalTrainingDataset {
             modality_names: names,
             return_dict: return_dict.unwrap_or(true),
             epoch_started: false,
+            closed: false,
             creation_pid: std::process::id(),
         })
     }
 
+    /// Start a new epoch across every modality. Legal after `close()` — see
+    /// [`TrainingDataset::__iter__`].
     fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
         for p in slf.pipelines.iter_mut() {
             p.start_epoch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         }
         slf.epoch_started = true;
+        slf.closed = false;
         Ok(slf)
     }
 
@@ -922,12 +952,28 @@ impl MultimodalTrainingDataset {
             .collect()
     }
 
+    /// Shut every modality's pipeline down, GIL detached. Idempotent, and — as
+    /// on [`TrainingDataset`] — **not** terminal: the next `__iter__` rebuilds.
     fn close(&mut self, py: Python<'_>) {
         py.detach(|| {
             for p in self.pipelines.iter_mut() {
                 p.shutdown();
             }
         });
+        self.closed = true;
+    }
+
+    /// True from [`Self::close`] until the next `__iter__` rebuilds. Never raises.
+    ///
+    /// Deliberately **not** the terminal flag `IndexPlanDataset.closed` is.
+    /// `close()` on this class releases the rayon pool and joins the epoch
+    /// threads, and the next `__iter__` builds them again — so the honest
+    /// reading is "torn down right now", not "unusable from here on". It cannot
+    /// be derived from pipeline state either: a freshly constructed dataset has
+    /// no pool yet and would report `True` before it had ever been closed.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed
     }
 
     fn __repr__(&self) -> String {
