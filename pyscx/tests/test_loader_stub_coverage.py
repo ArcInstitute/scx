@@ -96,11 +96,17 @@ def runtime_classes(tmp_path, synthetic_adata):
 
     index_plan_ds = pyscx.IndexPlanDataset(path)
     index_plan_iter = index_plan_ds.iter_with_plans(iter([[(0, 1)]]))
-    classes["IndexPlanBatchIter"] = type(index_plan_iter)
-
     cellset_ds = pyscx.SparseCellSetDataset([path])
     cellset_iter = cellset_ds.iter_with_plans(iter([([0], [0], [0], [0, 1])]))
-    classes["SparseCellSetBatchIter"] = type(cellset_iter)
+
+    # Prefer the module-level name; fall back to the live instance. The iterators
+    # are not `add_class`-registered today, so the fallback is what runs — but if
+    # they ever are, this keeps working instead of needing an edit.
+    for name, instance in (
+        ("IndexPlanBatchIter", index_plan_iter),
+        ("SparseCellSetBatchIter", cellset_iter),
+    ):
+        classes[name] = getattr(pyscx, name, None) or type(instance)
 
     # Keep the owners (and the live iterators) referenced for the test's duration.
     classes["_keepalive"] = (index_plan_ds, index_plan_iter, cellset_ds, cellset_iter)
@@ -149,19 +155,6 @@ def test_iterator_public_methods_are_all_in_the_init_stub(cls, runtime_classes):
     )
 
 
-def test_iterator_classes_are_not_module_level_names():
-    """Pins the asymmetry the fixture above works around.
-
-    If either iterator ever *is* registered with `add_class`, the fixture's
-    instance dance becomes dead weight and should be replaced by `getattr`.
-    """
-    for cls in _ITERATOR_CLASSES:
-        assert not hasattr(pyscx, cls), (
-            f"{cls} is now a module-level name — simplify runtime_classes() to "
-            f"getattr(pyscx, {cls!r}) and drop this test"
-        )
-
-
 def test_loader_free_functions_are_importable():
     """The `#[pyfunction]` half of `scx-loader`'s re-export list.
 
@@ -201,7 +194,18 @@ def test_public_methods_are_all_in_the_init_stub(cls):
 
 @pytest.mark.parametrize("cls", _LIFECYCLE_CLASSES)
 def test_lifecycle_members_exist_at_runtime(cls):
-    """The other direction: no dead stubs for a lifecycle API that got removed."""
+    """`close` / `closed` exist, independently of what the stub says.
+
+    NOT subsumed by `test_stubbed_members_exist_at_runtime`, though it looks it:
+    that test takes its expectation *from the stub*, so deleting `close` from
+    `__init__.pyi` and from the Rust in one change leaves it with nothing to
+    check and it passes. Verified — removing the `close` stub drops it from
+    `_stubbed_defs`, and the parameterised test goes green without it.
+
+    This one hard-codes the two names, so it is the only thing standing between a
+    co-ordinated stub+runtime removal and a green suite. Two reviewers have called
+    it redundant; it is here on purpose.
+    """
     obj = getattr(pyscx, cls)
     for member in ("close", "closed"):
         assert hasattr(obj, member), f"{cls}.{member} is stubbed but missing at runtime"

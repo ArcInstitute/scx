@@ -352,11 +352,18 @@ fn write_back(indices: &mut Vec<i32>, data: &mut Vec<f32>, counts: &[u64]) {
 
 /// Resolve the three `downsample_*` kwargs into a config, or `None`.
 ///
-/// Validation lives here — at the public entry, not at the routing site — so both
-/// Python surfaces reject the same shapes with the same message. Supplying a
-/// method or a seed without a target is a config error rather than a silent
-/// no-op: it is exactly the typo that would leave a training run un-augmented
-/// while looking configured.
+/// Its one caller is `SparseCellSetDataset::new`. The other Python downsample
+/// surface, `downsample_counts_csr`, deliberately does **not** route through
+/// here: it takes a required `u64` target rather than the three optional kwargs,
+/// so it has no method-without-target shape to reject and its own message reads
+/// `target_library_size must be > 0`. What the two do share is the exception —
+/// both map an unknown method name to `ValueError` — and that is duplicated on
+/// purpose rather than unified through `loader_err_to_py`, whose `_` arm sends
+/// every other `ConfigError` to `RuntimeError`.
+///
+/// Supplying a method or a seed without a target is a config error rather than a
+/// silent no-op: it is exactly the typo that would leave a training run
+/// un-augmented while looking configured.
 pub(crate) fn resolve_downsample_config(
     paths: &[String],
     target: Option<u64>,

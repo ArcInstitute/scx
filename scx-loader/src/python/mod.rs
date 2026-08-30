@@ -40,10 +40,10 @@ use crate::error::LoaderError;
 // layout as a second set of API paths (`python::training::TrainingDataset`)
 // alongside the `python::TrainingDataset` this module preserves. `pub use` on
 // the five that define names `lib.rs` re-exports.
-// The other three hold `pub(super)` items only — siblings reach them through
-// their own `use super::*`, so a plain private re-export is the right
-// visibility; `pub(crate) use` cannot re-export a `pub(super)` item and only
-// earns a "doesn't reexport anything" warning.
+//
+// A child that does `use super::*` must NOT also `use pyo3::prelude::*`: the
+// glob already supplies it, and rustc 1.98 (what CI runs) rejects the duplicate
+// as an unused import while 1.95 does not.
 mod collate;
 mod convert;
 mod diagnostics;
@@ -53,14 +53,22 @@ mod plan_iter;
 mod sparse_cellset;
 mod training;
 
-pub use collate::*;
+// Named, never globbed: a `pub use child::*` would silently publish any `pub`
+// item a later edit adds to a child. These nine are exactly the pre-split public
+// surface — the eight `lib.rs` re-exports plus `IndexPlanBatchIter`, which is
+// reachable at `python::` but not at the crate root.
+pub use collate::{collate_cellset_gathered, downsample_counts_csr, downsample_file_identity};
+pub use index_plan::{IndexPlanBatchIter, IndexPlanDataset};
+pub use multimodal::MultimodalTrainingDataset;
+pub use sparse_cellset::{SparseCellSetBatchIter, SparseCellSetDataset};
+pub use training::TrainingDataset;
+
+// The remaining three hold `pub(super)` items only, reached by siblings through
+// their own `use super::*`; a private re-export is the right visibility, and
+// `pub(crate) use` cannot re-export a `pub(super)` item at all.
 use convert::*;
 use diagnostics::*;
-pub use index_plan::*;
-pub use multimodal::*;
 use plan_iter::*;
-pub use sparse_cellset::*;
-pub use training::*;
 
 /// Map `LoaderError` → Python exception, picking the most precise type.
 fn loader_err_to_py(err: LoaderError) -> PyErr {

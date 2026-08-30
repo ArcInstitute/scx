@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use scx_format_io::CacheMetrics;
 
 use super::*;
+// Named explicitly rather than arriving through a parent glob: this is the
+// one cross-sibling dependency in the warning layer, and it should be visible
+// at the top of the file that has it.
+use super::multimodal::{min_total_mb_clearing_the_floor, MIN_MODALITY_BUDGET_MB};
 
 /// Should the unframed-scatter preflight warn — and, just as importantly, should
 /// the framing scan run at all?
