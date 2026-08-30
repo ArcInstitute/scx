@@ -1002,6 +1002,7 @@ impl PyExperiment {
                 memory_budget,
                 preserve_var_order,
                 strict_var_names,
+                &plan,
             )
         }
         #[cfg(not(feature = "gpu"))]

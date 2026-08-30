@@ -9,6 +9,8 @@
 //! `#[pyfunction]` so `lib.rs`'s `accel::eval_metrics::<fn>` registration
 //! paths are unchanged.
 
+#[cfg(feature = "gpu")]
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 

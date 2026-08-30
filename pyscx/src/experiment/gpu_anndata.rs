@@ -1,7 +1,14 @@
 //! The cfg(gpu) `to_gpu_anndata` device path — minimal-copy shard decode
 //! straight onto the device — plus its decode-fallback diagnostics.
 
-// PyExperiment — lazy handle for SCX files
+#[cfg(feature = "gpu")]
+use super::PyExperiment;
+#[cfg(feature = "gpu")]
+use crate::convert;
+#[cfg(feature = "gpu")]
+use numpy::PyReadonlyArray1;
+#[cfg(feature = "gpu")]
+use pyo3::prelude::*;
 
 /// Fault-injection hook for the host-assemble fallback below.
 ///
@@ -78,6 +85,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
     memory_budget: Option<Bound<'_, PyAny>>,
     preserve_var_order: bool,
     strict_var_names: bool,
+    plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
 
@@ -153,7 +161,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
                 true,  // skip_x
                 false, // preserve_var_order (fast path: var_names is None)
                 false, // strict_var_names (no names to check)
-                &plan, // default plan (non-default rejected above); GPU X is f32-native
+                plan,  // default plan (non-default rejected above); GPU X is f32-native
             )?;
 
             // Raw shard bytes (borrow the reader's mmap) + a cheap header
@@ -356,7 +364,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
                 false, // skip_x
                 preserve_var_order,
                 strict_var_names,
-                &plan, // default plan (non-default rejected above); GPU X is f32-native
+                plan, // default plan (non-default rejected above); GPU X is f32-native
             )?;
 
             // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
