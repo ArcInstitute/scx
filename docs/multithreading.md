@@ -216,7 +216,8 @@ current-thread runtime (per-epoch, lives on the I/O thread) and the
 per-pipeline rayon `ThreadPool` (lazily built on first `start_epoch`) are both
 constructed inside the worker process, so a forked child inherits no
 fork-hostile state from the parent. The eager-construct-then-fork case is
-caught by the PID check in `__next__` (`scx-loader/src/python.rs`).
+caught by the PID check in `__next__` (`scx-loader/src/python/`, one per
+dataset class).
 
 `TrainingPipeline::new` is **not** thread-free, though: it runs `read_obs` (and
 the PFlog α estimate) through `cpu_pool()`, which builds that pool. So a

@@ -119,7 +119,7 @@ def fixture_paths(tmp_path_factory: pytest.TempPathFactory) -> list[str]:
 # Mirrors `state-scx/src/state/emb/data/_scx_adapter.py:86-112` (per-file
 # sharding via `worker_info.id :: num_workers`). The inner
 # `pyscx.TrainingDataset` is constructed lazily inside `__iter__` so the
-# fork-detection PID check at `scx-loader/src/python.rs:134-141` does not
+# fork-detection PID check in `scx-loader/src/python/training.rs` does not
 # fire — the dataset's `creation_pid` matches the worker's PID. This is
 # the configuration that hung indefinitely before Phase 2 landed.
 
@@ -766,7 +766,7 @@ def test_fork_index_plan_multi_shard_gather(unframed_multi_shard_path: str) -> N
 
 def test_fork_collate_cellset_gathered(fixture_paths: list[str]) -> None:
     """`pyscx.collate_cellset_gathered` — reachable from a forked worker with no
-    dataset in hand, so none of the PID checks in `python.rs` apply.
+    dataset in hand, so none of the PID checks in `python/` apply.
 
     Depends on `fixture_paths` only to guarantee the parent has run
     `from_anndata` and armed the global registry first; without that the child

@@ -386,14 +386,17 @@ fn warn_cache_thrash(
     Ok(())
 }
 
-#[cfg(test)]
 // These compile only under `--features python`, which a bare
-// `cargo test -p scx-loader` does not enable — that run is 315 tests, not 320.
+// `cargo test -p scx-loader` does not enable — that run is 339 tests, not 350.
 // CI's `cargo test --workspace --exclude rscx` *does* run them: pyscx is a
 // workspace member depending on `scx-loader` with `features = ["python"]`, and
 // resolver-v2 unification turns the feature on for this crate's test target
 // too. Verified by name in that job's output. If pyscx ever stops being built
 // alongside, this module goes silently unrun.
+//
+// The gap was 16 before Phase 9f and is 11 now: `layout_check_tests` moved to
+// `pipeline.rs` with the pure function it tests, so those five no longer need
+// the feature. The 11 that remain genuinely exercise binding code.
 #[cfg(test)]
 mod preflight_decision_tests {
     use super::should_warn_unframed_scatter;

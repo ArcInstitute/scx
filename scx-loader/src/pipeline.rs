@@ -2486,7 +2486,7 @@ mod tests {
     /// `estimate_memory` must be monotone non-increasing in every knob the
     /// auto-tune reduces.
     ///
-    /// This is the property `python.rs`'s multimodal guard rests on — "a
+    /// This is the property `python/multimodal.rs`'s guard rests on — "a
     /// smaller pinned config always fits within the same budget" — and which
     /// nothing asserted. `MultimodalTrainingDataset` pins every modality to the
     /// **minimum** effective `(batch_size, shard_group_size)` across
