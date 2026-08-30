@@ -1071,6 +1071,166 @@ fn budget_lookahead_zero_honored_when_fits() {
     assert_eq!(loader.effective_lookahead(), 0);
 }
 
+// ---- ORG-9.10-5 pre-refactor pins ------------------------------------
+
+/// The **model** is monotone: shrinking a knob may not raise the estimate.
+///
+/// Read under a budget generous enough that no tuning happens, so
+/// `budget_breakdown()` is `estimate(requested)` verbatim — the only way to
+/// observe the model itself before `ORG-9.10-5` extracts it behind
+/// `BudgetModel::estimate`. This is the property the shared `tune()` driver
+/// will `debug_assert` on every reduction step, and the one §9.6's multimodal
+/// guard has always rested on without asserting.
+///
+/// Note what this does *not* follow from: "a tighter budget never raises an
+/// effective knob" holds even for a non-monotone model, because the descent
+/// simply runs longer. Checking the descent's output cannot catch this.
+#[test]
+fn the_budget_model_is_monotone_in_every_tuned_knob() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_dense_fixture(&dir.path().join("f.scx"), 1024, 4096, 8, 2048);
+
+    // 4096 MB is far above the ~115 MB this fixture needs at the requested
+    // config, so nothing is tuned and the breakdown is the raw estimate.
+    let estimate = |cache: usize, lookahead: usize| {
+        let loader = IndexPlanLoader::new(
+            &path,
+            LoaderConfig {
+                max_memory_mb: 4096,
+                ..Default::default()
+            },
+            cache,
+            /*sort_by_shard*/ true,
+            lookahead,
+            /*max_plan_size*/ 1024,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                loader.effective_cache_shards(),
+                loader.effective_lookahead()
+            ),
+            (cache, lookahead),
+            "premise: the budget must be generous enough that nothing is tuned"
+        );
+        loader.budget_breakdown().total_bytes
+    };
+
+    for cache in (1..16usize).rev() {
+        assert!(
+            estimate(cache, 4) <= estimate(cache + 1, 4),
+            "cache_shards {cache} estimates more than {}",
+            cache + 1
+        );
+    }
+    for la in (1..8usize).rev() {
+        assert!(
+            estimate(8, la) <= estimate(8, la + 1),
+            "lookahead {la} estimates more than {}",
+            la + 1
+        );
+    }
+    assert!(
+        estimate(1, 1) <= estimate(16, 8),
+        "the joint floor estimates more than the requested config"
+    );
+}
+
+/// Tightening the budget may never *raise* an effective knob — a property of
+/// the **descent**, not of the model (see
+/// `the_budget_model_is_monotone_in_every_tuned_knob` for why the two are
+/// independent). Pinned because `ORG-9.10-5`'s shared driver replaces the
+/// hand-written loop that produces it.
+#[test]
+fn a_tighter_budget_never_raises_an_effective_knob() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_dense_fixture(&dir.path().join("f.scx"), 1024, 4096, 8, 2048);
+
+    let tune = |mb: usize| {
+        IndexPlanLoader::new(
+            &path,
+            LoaderConfig {
+                max_memory_mb: mb,
+                ..Default::default()
+            },
+            /*cache_shards*/ 16,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 4,
+            /*max_plan_size*/ 1024,
+        )
+        .ok()
+        .map(|l| (l.effective_lookahead(), l.effective_cache_shards()))
+    };
+
+    let mut prev: Option<(usize, usize)> = None;
+    let mut saw_reduction = false;
+    // Descending, so each step is "the budget got tighter".
+    for mb in (88..=256).rev().step_by(4) {
+        let Some(cur) = tune(mb) else { continue };
+        if let Some(p) = prev {
+            assert!(
+                cur.0 <= p.0 && cur.1 <= p.1,
+                "budget {mb} MB tuned to (lookahead={}, cache={}) which exceeds the \
+                 looser budget's (lookahead={}, cache={})",
+                cur.0,
+                cur.1,
+                p.0,
+                p.1
+            );
+        }
+        if cur.0 < 4 || cur.1 < 16 {
+            saw_reduction = true;
+        }
+        prev = Some(cur);
+    }
+    assert!(
+        saw_reduction,
+        "no budget in the sweep engaged the auto-tune, so this proves nothing"
+    );
+}
+
+/// A loader that constructed must fit the breakdown it reports.
+///
+/// `BudgetBreakdown::fits_within` exists and no loop uses it as its
+/// terminator. This is the Rust-side twin of
+/// `test_index_plan_dataset.py::test_memory_budget_matches_max_memory_mb`, and
+/// the shape `SparseCellSetLoader` does *not* satisfy today (ORG-9.10-5).
+#[test]
+fn a_constructed_loader_fits_the_breakdown_it_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_dense_fixture(&dir.path().join("f.scx"), 1024, 4096, 8, 2048);
+    let mut saw_tuned = false;
+    for mb in (88..=256).step_by(4) {
+        let Ok(loader) = IndexPlanLoader::new(
+            &path,
+            LoaderConfig {
+                max_memory_mb: mb,
+                ..Default::default()
+            },
+            /*cache_shards*/ 16,
+            /*sort_by_shard*/ true,
+            /*lookahead*/ 4,
+            /*max_plan_size*/ 1024,
+        ) else {
+            continue;
+        };
+        assert!(
+            loader
+                .budget_breakdown()
+                .fits_within(loader.max_memory_mb()),
+            "budget {mb} MB constructed but its breakdown totals {} bytes",
+            loader.budget_breakdown().total_bytes
+        );
+        if loader.effective_lookahead() < 4 || loader.effective_cache_shards() < 16 {
+            saw_tuned = true;
+        }
+    }
+    assert!(
+        saw_tuned,
+        "no budget in the sweep engaged the auto-tune, so this proves nothing"
+    );
+}
+
 /// `process_plan` must reject plans larger than `max_plan_size` so a
 /// misbehaving consumer cannot silently exceed the memory budget.
 /// Plans at or below the ceiling are accepted as before.

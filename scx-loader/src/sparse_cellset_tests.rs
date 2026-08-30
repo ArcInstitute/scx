@@ -754,6 +754,103 @@ fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
     assert_eq!(avg_shard_decoded_bytes(&[]), 0);
 }
 
+// ---- ORG-9.10-5 pre-refactor pins ------------------------------------
+
+/// Two files whose shards are large enough that the cache term dominates the
+/// 50 MB interpreter constant — the regime where the sparse budget model's
+/// answer actually differs from the paired loader's.
+fn sized_budget_loader(
+    dir: &std::path::Path,
+    cache_shards: usize,
+    bytes_budget: Option<usize>,
+) -> StdArc<SparseCellSetLoader> {
+    let p0 = dir.join("s0.scx");
+    let p1 = dir.join("s1.scx");
+    // 2048 rows/shard x 16 B/row = 32 KB per shard.
+    write_fixture(&p0, 8192, 64, 4);
+    write_fixture(&p1, 8192, 64, 4);
+    SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        cache_shards,
+        bytes_budget,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+    )
+    .unwrap()
+}
+
+/// A loader that kept a non-empty cache must fit the breakdown it reports.
+///
+/// ⚠️ **Red before `ORG-9.10-5`, by design.** `SparseCellSetLoader::new` sizes
+/// the cache by plain division and passes `non_cache_bytes: 0` to
+/// `assess_cache_sizing`, so the 50 MB constant it *reports* is not one it
+/// budgets for. `IndexPlanLoader` cannot violate this
+/// (`a_constructed_loader_fits_the_breakdown_it_reports`) and neither can the
+/// sequential path
+/// (`pipeline::tests::a_budget_that_was_not_exceeded_fits_the_breakdown_it_reports`).
+///
+/// The implication is guarded on a non-empty cache because exhaustion is not an
+/// error here: a budget below the interpreter constant alone leaves 0 shards
+/// and warns, rather than refusing construction the way the paired loader does.
+#[test]
+#[ignore = "red by design until ORG-9.10-5 makes the sparse tuner count the \
+            interpreter constant it reports; un-ignored by that commit"]
+fn a_nonempty_sparse_cache_fits_the_breakdown_it_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut saw_nonempty = false;
+    for mb in [1usize, 8, 32, 64, 96, 128, 192] {
+        let loader = sized_budget_loader(dir.path(), 4096, Some(mb * 1024 * 1024));
+        if loader.effective_cache_shards() == 0 {
+            continue;
+        }
+        saw_nonempty = true;
+        assert!(
+            loader.budget_breakdown().fits_within(mb),
+            "budget {mb} MB kept {} cache shards but its breakdown totals {} bytes",
+            loader.effective_cache_shards(),
+            loader.budget_breakdown().total_bytes
+        );
+    }
+    assert!(
+        saw_nonempty,
+        "every budget in the sweep emptied the cache, so this proves nothing"
+    );
+}
+
+/// The **model** is monotone: fewer cache shards may not estimate more.
+///
+/// Read under a budget generous enough that nothing is tuned, so
+/// `budget_breakdown()` is the raw estimate. The sparse arm of the property
+/// the shared `tune()` driver will assert on every reduction step.
+#[test]
+fn the_sparse_budget_model_is_monotone_in_cache_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let estimate = |cache: usize| {
+        // 4 GB over a fixture needing ~50 MB: nothing is tuned.
+        let loader = sized_budget_loader(dir.path(), cache, Some(4096 * 1024 * 1024));
+        assert_eq!(
+            loader.effective_cache_shards(),
+            cache,
+            "premise: the budget must be generous enough that nothing is tuned"
+        );
+        loader.budget_breakdown().total_bytes
+    };
+    for cache in (1..32usize).rev() {
+        assert!(
+            estimate(cache) <= estimate(cache + 1),
+            "cache_shards {cache} estimates more than {}",
+            cache + 1
+        );
+    }
+    assert!(estimate(0) <= estimate(32));
+}
+
 // ==========================================================================
 // Gather-stage clip + seeded downsample (Phase 1B)
 //

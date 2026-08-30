@@ -2072,6 +2072,179 @@ mod tests {
         );
     }
 
+    // ---- ORG-9.10-5 pre-refactor pins ------------------------------------
+
+    /// The reduction **order**, not merely that something was reduced.
+    ///
+    /// `test_memory_budget_128mb_reduced` asserts only that *some* knob moved
+    /// and `test_memory_budget_64mb_all_minimums` only pins the terminal state,
+    /// so a loop that halved `batch_size` before touching `prefetch_batches`
+    /// would pass both — and `batch_size` is the one knob a caller picks for
+    /// statistical rather than memory reasons, so it must give last.
+    #[test]
+    fn budget_reduces_prefetch_then_shard_group_then_batch() {
+        let base = LoaderConfig::default();
+        let (req_sgs, req_pf, req_bs) = (
+            base.shard_group_size,
+            base.prefetch_batches,
+            base.batch_size,
+        );
+        assert_eq!(
+            (req_sgs, req_pf, req_bs),
+            (8, 4, 1024),
+            "premise: the defaults this test reasons about"
+        );
+
+        let mut saw_prefetch_alone = false;
+        let mut saw_group_without_batch = false;
+
+        for mb in (64..=2048).step_by(8) {
+            let b = compute_memory_budget(
+                &LoaderConfig {
+                    max_memory_mb: mb,
+                    ..base.clone()
+                },
+                30_000,
+                16_384,
+                10.0,
+                0,
+            );
+
+            if b.shard_group_size < req_sgs {
+                assert_eq!(
+                    b.prefetch_batches, 2,
+                    "at {mb} MB shard_group_size fell to {} while prefetch_batches was \
+                     still {} — prefetch must reach its floor first",
+                    b.shard_group_size, b.prefetch_batches
+                );
+            }
+            if b.batch_size < req_bs {
+                assert_eq!(
+                    (b.prefetch_batches, b.shard_group_size),
+                    (2, 1),
+                    "at {mb} MB batch_size fell to {} before prefetch_batches and \
+                     shard_group_size reached their floors (got {}, {})",
+                    b.batch_size,
+                    b.prefetch_batches,
+                    b.shard_group_size
+                );
+            }
+
+            if b.prefetch_batches < req_pf
+                && b.shard_group_size == req_sgs
+                && b.batch_size == req_bs
+            {
+                saw_prefetch_alone = true;
+            }
+            if b.shard_group_size < req_sgs && b.batch_size == req_bs {
+                saw_group_without_batch = true;
+            }
+        }
+
+        // Without these the ordering assertions above are vacuously true.
+        assert!(
+            saw_prefetch_alone,
+            "no budget in the sweep reduced prefetch_batches alone"
+        );
+        assert!(
+            saw_group_without_batch,
+            "no budget in the sweep reduced shard_group_size while batch_size survived"
+        );
+    }
+
+    /// `estimate_memory` must be monotone non-increasing in every knob the
+    /// auto-tune reduces.
+    ///
+    /// This is the property `python.rs`'s multimodal guard rests on — "a
+    /// smaller pinned config always fits within the same budget" — and which
+    /// nothing asserted. `MultimodalTrainingDataset` pins every modality to the
+    /// **minimum** effective `(batch_size, shard_group_size)` across
+    /// modalities; a term that grew as a knob shrank would desync per-modality
+    /// batching and surface mid-epoch as a `RuntimeError` blaming the file's
+    /// sharding, which is the wrong diagnosis.
+    #[test]
+    fn estimate_is_monotone_in_every_tuned_knob() {
+        for &(n_genes, rows, nnz) in &[
+            (30_000usize, 16_384usize, 10.0f64),
+            (2_000, 4_096, 3.0),
+            (61_497, 16_384, 40.0),
+        ] {
+            let est = |sgs: usize, pf: usize, bs: usize| {
+                estimate_memory(sgs, pf, bs, n_genes, rows, nnz, 0)
+            };
+
+            for sgs in (1..64usize).rev() {
+                assert!(
+                    est(sgs, 4, 1024) <= est(sgs + 1, 4, 1024),
+                    "shard_group_size {sgs} estimates more than {} at {n_genes} genes",
+                    sgs + 1
+                );
+            }
+            for pf in (2..64usize).rev() {
+                assert!(
+                    est(8, pf, 1024) <= est(8, pf + 1, 1024),
+                    "prefetch_batches {pf} estimates more than {} at {n_genes} genes",
+                    pf + 1
+                );
+            }
+            let mut bs = 1024usize;
+            while bs > 64 {
+                let half = bs / 2;
+                assert!(
+                    est(8, 4, half) <= est(8, 4, bs),
+                    "batch_size {half} estimates more than {bs} at {n_genes} genes"
+                );
+                bs = half;
+            }
+
+            // The joint reduction the multimodal repin actually performs: both
+            // knobs drop to the cross-modality minimum at once.
+            assert!(
+                est(1, 4, 64) <= est(8, 4, 1024),
+                "the pinned (batch_size, shard_group_size) minimum estimates more \
+                 than the requested config at {n_genes} genes"
+            );
+        }
+    }
+
+    /// A budget the tuner accepted must actually hold the breakdown it reports.
+    ///
+    /// `BudgetBreakdown::fits_within` exists and no loop uses it as its
+    /// terminator; this pins the postcondition on the sequential path, matching
+    /// `test_index_plan_dataset.py::test_memory_budget_matches_max_memory_mb`
+    /// on the plan-driven one.
+    #[test]
+    fn a_budget_that_was_not_exceeded_fits_the_breakdown_it_reports() {
+        let mut saw_tuned = false;
+        for mb in (64..=2048).step_by(8) {
+            let b = compute_memory_budget(
+                &LoaderConfig {
+                    max_memory_mb: mb,
+                    ..LoaderConfig::default()
+                },
+                30_000,
+                16_384,
+                10.0,
+                0,
+            );
+            if b.budget_exceeded {
+                continue;
+            }
+            assert!(
+                b.breakdown.fits_within(mb),
+                "budget {mb} MB reported not-exceeded but its breakdown totals {} bytes",
+                b.breakdown.total_bytes
+            );
+            if b.batch_size < 1024 || b.shard_group_size < 8 || b.prefetch_batches < 4 {
+                saw_tuned = true;
+            }
+        }
+        assert!(
+            saw_tuned,
+            "the sweep never engaged the auto-tune, so this proves nothing"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // E1 Tests: TrainingPipeline
     // -----------------------------------------------------------------------

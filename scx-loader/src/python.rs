@@ -472,6 +472,34 @@ fn resolve_loader_config(
     }
 }
 
+/// Split a total `max_memory_mb` across modalities in proportion to their nnz,
+/// with a per-modality floor.
+///
+/// The floor is load-bearing, not slack: `LoaderConfig::validate` rejects
+/// anything below `MIN_MODALITY_BUDGET_MB`, so a modality whose proportional
+/// share falls under it would fail construction outright. The consequence is
+/// that **the shares can sum to more than `total_mb`** — three modalities under
+/// a 64 MB request budget 192 MB between them. That is a real over-budget, it
+/// is the price of not refusing the file, and
+/// `MultimodalTrainingDataset.memory_budget()` reports it rather than leaving
+/// it silent.
+///
+/// Pure (no Python), so it is unit-testable without a Python interpreter.
+fn split_budget_across_modalities(total_mb: usize, per_modality_nnz: &[u64]) -> Vec<usize> {
+    let total_nnz: u64 = per_modality_nnz.iter().sum::<u64>().max(1);
+    per_modality_nnz
+        .iter()
+        .map(|nnz| {
+            let share = (total_mb as f64) * (*nnz as f64) / (total_nnz as f64);
+            (share as usize).max(MIN_MODALITY_BUDGET_MB)
+        })
+        .collect()
+}
+
+/// Per-modality budget floor. Equal to the minimum `LoaderConfig::validate`
+/// accepts, which is what makes it a floor rather than a preference.
+const MIN_MODALITY_BUDGET_MB: usize = 64;
+
 /// Verify that all requested modalities share identical per-modality CSR
 /// shard layouts (shard counts + row ranges). The multimodal loader chunks
 /// each modality independently but assembles batches positionally, so
@@ -681,14 +709,8 @@ impl MultimodalTrainingDataset {
         // prefetch_batches values.
         let defaults = LoaderConfig::default();
         let total_mb = max_memory_mb.unwrap_or(defaults.max_memory_mb);
-        let total_nnz: u64 = resolved.iter().map(|(_, _, n)| *n).sum::<u64>().max(1);
-        let per_modality_mb: Vec<usize> = resolved
-            .iter()
-            .map(|(_, _, nnz)| {
-                let share = (total_mb as f64) * (*nnz as f64) / (total_nnz as f64);
-                (share as usize).max(64)
-            })
-            .collect();
+        let per_modality_nnz: Vec<u64> = resolved.iter().map(|(_, _, n)| *n).collect();
+        let per_modality_mb = split_budget_across_modalities(total_mb, &per_modality_nnz);
 
         // Per-modality shard-layout alignment check (fail loud at
         // construction rather than mid-`__next__`). The per-modality
@@ -3189,6 +3211,66 @@ mod preflight_decision_tests {
     #[test]
     fn a_framed_file_is_silent() {
         assert!(!should_warn_unframed_scatter(true, true, || true));
+    }
+}
+
+/// ORG-9.10-5 pre-refactor pins for the multimodal budget split
+/// (`split_budget_across_modalities`), which was inline in the constructor and
+/// therefore asserted nowhere.
+#[cfg(test)]
+mod modality_budget_split_tests {
+    use super::{split_budget_across_modalities, MIN_MODALITY_BUDGET_MB};
+
+    #[test]
+    fn shares_are_proportional_to_nnz() {
+        // 1:3 nnz over a budget far above the floor.
+        let split = split_budget_across_modalities(4000, &[1_000, 3_000]);
+        assert_eq!(split, vec![1000, 3000]);
+    }
+
+    #[test]
+    fn a_single_modality_receives_the_whole_budget() {
+        assert_eq!(split_budget_across_modalities(4000, &[7]), vec![4000]);
+    }
+
+    /// The floor is what keeps a starved modality from failing
+    /// `LoaderConfig::validate`, so it must survive any refactor of the split.
+    #[test]
+    fn a_starved_modality_is_raised_to_the_floor() {
+        // 1:999 — the small modality's proportional share is 4 MB.
+        let split = split_budget_across_modalities(4000, &[4, 3_996]);
+        assert_eq!(split[0], MIN_MODALITY_BUDGET_MB);
+        assert_eq!(split[1], 3996, "the large modality keeps its own share");
+    }
+
+    /// **The over-budget the floor buys.** Two modalities under a 64 MB request
+    /// budget 128 MB between them; nothing reports this today. Pinned as
+    /// observed fact so `memory_budget()` can surface it without the arithmetic
+    /// shifting underneath.
+    #[test]
+    fn the_floor_lets_the_shares_exceed_the_request() {
+        let total_mb = 64;
+        let split = split_budget_across_modalities(total_mb, &[1_000, 1_000]);
+        assert_eq!(split, vec![MIN_MODALITY_BUDGET_MB, MIN_MODALITY_BUDGET_MB]);
+        assert_eq!(
+            split.iter().sum::<usize>(),
+            2 * MIN_MODALITY_BUDGET_MB,
+            "two modalities at a {total_mb} MB request budget {} MB",
+            2 * MIN_MODALITY_BUDGET_MB
+        );
+        assert!(
+            split.iter().sum::<usize>() > total_mb,
+            "premise of the whole pin: the floors exceed the request"
+        );
+    }
+
+    /// The degenerate inputs the constructor can hand it: an all-zero nnz
+    /// census (a file whose catalog carries no stats) must not divide by zero.
+    #[test]
+    fn zero_nnz_does_not_divide_by_zero() {
+        let split = split_budget_across_modalities(4000, &[0, 0]);
+        assert_eq!(split, vec![MIN_MODALITY_BUDGET_MB; 2]);
+        assert!(split_budget_across_modalities(4000, &[]).is_empty());
     }
 }
 
