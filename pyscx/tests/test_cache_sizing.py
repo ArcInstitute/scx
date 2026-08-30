@@ -165,17 +165,33 @@ class TestBudgetReconciliation:
         4 GB) the byte cap binds long before the count does, so naming
         `cache_shards` sends the caller to raise a knob that cannot help.
         """
+        budget_mb = 64
         ds = pyscx.SparseCellSetDataset(
-            [multishard_path], cache_shards=4096, max_memory_mb=1
+            [multishard_path], cache_shards=4096, max_memory_mb=budget_mb
         )
         b = ds.memory_budget()
         assert b["cache_shards"] == 4096, "the request is reported unchanged"
         assert b["effective_cache_shards"] < 4096, (
-            "a 1 MB budget cannot afford 4096 shards"
+            f"a {budget_mb} MB budget cannot afford 4096 shards"
         )
         # And it must be derived from the byte budget, not invented.
-        expected = min(4096, (1 * 1024 * 1024) // b["shard_decoded_bytes"])
+        #
+        # ORG-9.10-5 rewrote this expectation. It used to read
+        # `min(4096, 1 MiB // shard_decoded_bytes)` under `max_memory_mb=1`:
+        # arithmetic that only held while the tuner ignored the 50 MB
+        # interpreter constant the very same dict reported, and which under a
+        # process-budget reading means "no cache at all". The budget is now an
+        # envelope on all three loader classes, so the cache gets what is left
+        # after the non-cache terms.
+        non_cache = b["breakdown"]["total_bytes"] - b["breakdown"]["cache_bytes"]
+        expected = min(
+            4096, (budget_mb * 1024 * 1024 - non_cache) // b["shard_decoded_bytes"]
+        )
         assert b["effective_cache_shards"] == expected
+        assert not b["budget_exceeded"]
+        assert b["breakdown"]["total_bytes"] <= budget_mb * 1024 * 1024, (
+            "the report must fit the budget the tuner checked"
+        )
 
     def test_explicit_budget_is_respected(self, multishard_path):
         ds = pyscx.SparseCellSetDataset([multishard_path], max_memory_mb=64)

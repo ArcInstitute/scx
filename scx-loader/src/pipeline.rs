@@ -674,6 +674,12 @@ pub struct TrainingPipeline {
     shard_target_rows: u32,
     projection: Option<HvgProjection>,
     memory_budget: MemoryBudget,
+    /// The budget model this pipeline was tuned against. Kept so
+    /// [`Self::pin_effective_config`] can re-estimate without re-opening the
+    /// file — three numbers, no I/O.
+    budget_model: SequentialBudgetModel,
+    /// CSR shard count, for rebuilding the shuffler on a pin.
+    n_csr_shards: usize,
     // Runtime state — all lazy / per-epoch:
     batch_rx: Option<crossbeam_channel::Receiver<Batch>>,
     /// I/O stage runs on a dedicated `std::thread` that owns a
@@ -948,6 +954,12 @@ impl TrainingPipeline {
         }
 
         Ok(TrainingPipeline {
+            budget_model: SequentialBudgetModel::new(
+                n_output_genes_for(&config, n_vars),
+                shard_target_rows as usize,
+                avg_nnz_per_cell,
+            ),
+            n_csr_shards,
             config,
             reader,
             obs_metadata,
@@ -1314,6 +1326,77 @@ impl TrainingPipeline {
     }
 
     /// Memory budget diagnostics.
+    /// Pin `(batch_size, shard_group_size)` **after** the budget auto-tune has
+    /// already run.
+    ///
+    /// `MultimodalTrainingDataset` runs one pipeline per modality and must
+    /// batch them in lockstep, so it forces every modality onto the
+    /// cross-modality *minimum* effective config. It used to do that by
+    /// building every pipeline a second time with the minimum pre-set and then
+    /// `debug_assert`ing that the tuner had landed on the same answer — an
+    /// assertion compiled out of the release wheels users run, guarding a
+    /// property (`estimate` is monotone, so a smaller config always still fits)
+    /// that nothing checked. Setting the values directly makes the property
+    /// structural, and skips N full reconstructions — each of which re-opened
+    /// the file and re-ran pflog α estimation over the raw CSR shards.
+    ///
+    /// Refuses to *raise* either knob: "the pinned config always fits" holds
+    /// because the pin only ever shrinks and the model is monotone (asserted
+    /// per step by [`crate::budget::tune`] and end to end by
+    /// `the_sequential_reduction_chain_is_monotone`). Raising would need a
+    /// fresh tune, so it is an error rather than a silent no-op.
+    ///
+    /// `shuffle_quality_degraded` is deliberately **not** recomputed: it
+    /// records what *this modality's own* tuner did, and recomputing it here
+    /// would both erase that and emit a second `log::warn!` per modality, where
+    /// the caller already emits one cross-modality `log::info!`.
+    pub fn pin_effective_config(
+        &mut self,
+        batch_size: usize,
+        shard_group_size: usize,
+    ) -> Result<()> {
+        if self.batch_rx.is_some() {
+            return Err(LoaderError::ConfigError {
+                reason: "pin_effective_config called with an epoch in flight".to_string(),
+            });
+        }
+        if batch_size > self.memory_budget.batch_size
+            || shard_group_size > self.memory_budget.shard_group_size
+        {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "pin_effective_config may only shrink: asked for \
+                     (batch_size={batch_size}, shard_group_size={shard_group_size}) \
+                     against an effective (batch_size={}, shard_group_size={})",
+                    self.memory_budget.batch_size, self.memory_budget.shard_group_size,
+                ),
+            });
+        }
+
+        let params = SequentialParams {
+            shard_group_size,
+            prefetch_batches: self.memory_budget.prefetch_batches,
+            batch_size,
+        };
+        let breakdown = self.budget_model.estimate(params);
+        self.config.batch_size = batch_size;
+        self.config.shard_group_size = shard_group_size;
+        self.memory_budget.batch_size = batch_size;
+        self.memory_budget.shard_group_size = shard_group_size;
+        self.memory_budget.estimated_bytes = breakdown.total_bytes;
+        self.memory_budget.breakdown = breakdown;
+        self.memory_budget.budget_exceeded = !breakdown.fits_within(self.config.max_memory_mb);
+        self.shuffler = ShardShuffler::new(self.n_csr_shards, shard_group_size, self.config.seed)?;
+        Ok(())
+    }
+
+    /// The memory budget in force, in MB — the value the auto-tune ran
+    /// against, which is the *resolved* one when `auto_memory_budget` raised
+    /// it. Same accessor name and meaning as `IndexPlanLoader::max_memory_mb`.
+    pub fn max_memory_mb(&self) -> usize {
+        self.config.max_memory_mb
+    }
+
     pub fn memory_budget_info(&self) -> &MemoryBudget {
         &self.memory_budget
     }

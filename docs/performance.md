@@ -2504,6 +2504,36 @@ stops working. An *explicit* `max_memory_mb` that conflicts with an explicit `ca
 is always reported: the caller asked for two things that don't fit, and only they can decide
 which gives.
 
+**One budget model (ORG-9.10-5).** Resolving `None` the same way left the three classes
+still *meaning* three different things by `max_memory_mb`, because each kept its own tune
+loop. They now share one `BudgetModel` trait and one `tune()` driver, which unified three
+things that were quietly different:
+
+- **The mmap'd file is no longer budgeted anywhere.** The sequential model counted the whole
+  file against the budget while the two plan-driven models never did. Since the adaptive cap
+  is 4 GB, *any* file above it exceeded its budget on that term alone and collapsed to
+  `batch_size=64, shard_group_size=1, prefetch_batches=2` with `budget_exceeded` set,
+  whatever the caller asked for — `benchmarks/comprehensive/benchmarks/ml_loader.py` carries
+  a SLURM-memory-scaling workaround written for exactly that. Page cache is evictable under
+  pressure; it is now reported (`mmap_mb`) and never budgeted. Note the honest consequence:
+  a measured `ru_maxrss` still counts resident file pages, so the reported budget is a bound
+  on *anonymous* memory, not on RSS.
+- **`SparseCellSetDataset` now budgets the interpreter constant it reports.** Its tuner
+  passed `non_cache_bytes: 0`, so `memory_budget()["breakdown"]["total_bytes"]` could exceed
+  the budget the tuner had just checked, and it handed the cache the raw request and raw
+  byte budget rather than the tuned ones. The cache is correspondingly smaller — sized as a
+  process envelope, like `IndexPlanDataset`'s.
+- **`MultimodalTrainingDataset` reports its per-modality split.** The nnz-proportional
+  division has a 64 MB floor (a share below it fails validation), so two modalities at
+  `max_memory_mb=64` budget 128 MB between them. That was always true and never reported;
+  `memory_budget()["effective_total_mb"]` now says so, and an explicit request that gets
+  rounded up warns.
+
+The exhaustion *policy* stays per class, deliberately: the sequential path flags
+`budget_exceeded` and continues (and now raises a `UserWarning`, where it used to only write
+a log line), `IndexPlanLoader` refuses construction, and `SparseCellSetLoader` bottoms out at
+a one-shard cache and warns.
+
 ### Obs categorical codes without pandas (data-load Phase 1, 1C)
 
 The Phase-0 cold breakdown put **96–99.8% of per-file obs cost in obs reading**, not in

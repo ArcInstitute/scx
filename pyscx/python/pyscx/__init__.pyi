@@ -349,13 +349,14 @@ class SparseCellSetDataset:
         """Resolved shard-cache budget: `breakdown` (the six-key
         `BudgetBreakdown` every class that reports a budget uses), plus `max_memory_mb`
         (the value in force — adaptive when the constructor was passed none),
-        `cache_shards`, `effective_cache_shards` and `shard_decoded_bytes`.
+        `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes` and
+        `budget_exceeded`.
 
         Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
         breakdown: on the sparse path the shard cache *is* the budget, so there
-        is no batch-buffer or plan-tuple term. `total_bytes` can exceed
-        `max_memory_mb` here — the auto-tune does not yet count the interpreter
-        constant this reports (ORG-9.10-5)."""
+        is no batch-buffer or plan-tuple term. `total_bytes` fits
+        `max_memory_mb` unless `budget_exceeded` is True, which means even a
+        one-shard cache does not fit."""
         ...
 
     def suggested_cache_shards(
@@ -454,9 +455,14 @@ class TrainingDataset:
         `lookahead_overhead_bytes`, `transient_bytes`, `python_overhead_bytes`,
         `total_bytes`); alongside it are this class's own
         `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`,
-        `mmap_mb` and `budget_exceeded`. `mmap_mb` is reported here and nowhere
-        else: the plan-driven loaders treat page cache as evictable and exclude
-        it from their budgets.
+        `mmap_mb` and `budget_exceeded`.
+
+        `mmap_mb` is reported here and nowhere else, but it is **not** budgeted
+        on any class: every loader treats the mmap'd file as evictable kernel
+        page cache and excludes it, so `estimated_mb` and
+        `breakdown["total_bytes"]` are the same number. `budget_exceeded` means
+        the auto-tune could not fit even at its minimums, and it also raises a
+        `UserWarning` at construction.
         """
         ...
 
@@ -523,6 +529,20 @@ class MultimodalTrainingDataset:
         """A dict `{"X": {modality: ndarray}, "obs": {...}, "cell_indices": ...}`
         when built with `return_dict=True` (the default), else a tuple of the
         per-modality X arrays."""
+        ...
+
+    def memory_budget(self) -> dict[str, Any]:
+        """Memory budget diagnostics.
+
+        `batch_size` and `shard_group_size` are the values pinned uniformly
+        across modalities (the loader forces every modality onto the
+        cross-modality minimum so their batches stay row-aligned).
+        `max_memory_mb` is what you asked for; `effective_total_mb` is what the
+        per-modality split actually budgets, and **it can be larger** — the
+        split is proportional to per-modality nnz with a floor, and a share
+        below that floor cannot be constructed at all. `modalities` maps each
+        modality name to the same envelope `TrainingDataset.memory_budget()`
+        returns, `breakdown` included."""
         ...
 
     def close(self) -> None:

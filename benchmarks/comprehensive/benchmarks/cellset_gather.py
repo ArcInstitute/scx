@@ -591,19 +591,27 @@ def _downsample_supported(scx_path: str, plan: tuple) -> tuple[bool, str | None]
 def _budget_mb_for(scx_path: str, cache_shards: int) -> int | None:
     """``max_memory_mb`` that holds ``cache_shards`` average shards, +12% headroom.
 
-    Derived from the loader's own model (``memory_budget()['shard_decoded_bytes']``)
-    rather than guessed, so the "sized correctly" arm is configured the way the
-    warning tells a user to configure it. ``None`` ⇒ leave the budget adaptive.
+    Derived from the loader's own model (``memory_budget()``) rather than
+    guessed, so the "sized correctly" arm is configured the way the warning
+    tells a user to configure it. ``None`` ⇒ leave the budget adaptive.
+
+    The **non-cache** terms are part of the need, not slack. Since ORG-9.10-5
+    ``max_memory_mb`` is a process envelope on every loader class rather than a
+    bare cache cap on this one, so a budget sized for the shards alone is short
+    by the interpreter constant and the auto-tune shrinks the cache back below
+    what this arm is trying to test. Both terms are read off the same
+    ``memory_budget()`` call so this cannot drift from the model again.
     """
     try:
         import pyscx
 
-        per_shard = int(
-            pyscx.SparseCellSetDataset([scx_path]).memory_budget()["shard_decoded_bytes"]
-        )
+        budget = pyscx.SparseCellSetDataset([scx_path]).memory_budget()
+        per_shard = int(budget["shard_decoded_bytes"])
         if per_shard <= 0:
             return None
-        need_mb = (cache_shards * per_shard) // (1024 * 1024)
+        breakdown = budget["breakdown"]
+        non_cache = int(breakdown["total_bytes"]) - int(breakdown["cache_bytes"])
+        need_mb = (cache_shards * per_shard + non_cache) // (1024 * 1024)
         return max(64, need_mb + need_mb // 8)
     except Exception as e:  # noqa: BLE001
         logger.warning("  could not derive a budget for %d shards: %s", cache_shards, e)

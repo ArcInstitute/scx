@@ -17,6 +17,18 @@ import warnings
 import numpy as np
 import pytest
 
+#: The six `BudgetBreakdown` components every class that reports a budget
+#: carries. Mirrors `test_cache_sizing._BREAKDOWN_KEYS`; duplicated rather than
+#: imported so this module keeps no cross-test-file dependency.
+_BREAKDOWN_KEYS = {
+    "cache_bytes",
+    "batch_buffer_bytes",
+    "lookahead_overhead_bytes",
+    "transient_bytes",
+    "python_overhead_bytes",
+    "total_bytes",
+}
+
 
 @pytest.fixture
 def cite_seq_path():
@@ -172,6 +184,107 @@ def test_multimodal_uniform_batch_across_wide_and_narrow_modalities(tmp_path):
     # The wide modality forced the pinned batch below the requested 256,
     # so this run genuinely exercised the uniform-batch reconciliation.
     assert first_rows is not None and first_rows < 256
+    ds.close()
+
+
+def test_multimodal_memory_budget_reports_the_uniform_pin(tmp_path):
+    """The cross-modality pin must be observable in a **release** build.
+
+    ORG-9.10-5. The loader forces every modality onto the minimum effective
+    ``(batch_size, shard_group_size)`` so their batches stay row-aligned. That
+    property used to be guarded by a Rust ``debug_assert!``, which is compiled
+    out of the wheels users actually run, and by nothing on the Python side —
+    ``MultimodalTrainingDataset`` had no ``memory_budget()`` at all. The
+    existing wide/narrow test checks the *outcome* (aligned row counts); this
+    checks the mechanism, which is what a repin regression would break first.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import scipy.sparse as sp
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    n_obs, rna_n_vars, wide_n_vars = 400, 20, 8000
+    rna = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, rna_n_vars)).astype(np.float32))
+    )
+    rna.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    wide = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(0.4, size=(n_obs, wide_n_vars)).astype(np.float32))
+    )
+    wide.var_names = [f"p{i}" for i in range(wide_n_vars)]
+    mu = mudata.MuData({"rna": rna, "prot": wide})
+    mu.obs_names = [f"c{i}" for i in range(n_obs)]
+    path = str(tmp_path / "wide.scx")
+    pyscx.from_mudata(mu, path)
+
+    with pytest.warns(UserWarning, match="per-modality floor"):
+        ds = pyscx.MultimodalTrainingDataset(
+            path,
+            modalities=["rna", "prot"],
+            batch_size=256,
+            max_memory_mb=64,
+            normalize=False,
+            log1p=False,
+            seed=1,
+        )
+    b = ds.memory_budget()
+
+    assert set(b) == {
+        "batch_size",
+        "shard_group_size",
+        "max_memory_mb",
+        "effective_total_mb",
+        "modalities",
+    }
+    assert set(b["modalities"]) == {"rna", "prot"}
+
+    # The mechanism first, so a skipped repin fails on the property rather than
+    # on the premise below.
+    per = b["modalities"]
+    assert {m["batch_size"] for m in per.values()} == {b["batch_size"]}, (
+        f"every modality must report the pinned batch_size: {per}"
+    )
+    assert {m["shard_group_size"] for m in per.values()} == {b["shard_group_size"]}, (
+        f"every modality must report the pinned shard_group_size: {per}"
+    )
+    # And the premise, without which a repin that pinned everything to the
+    # *requested* 256 would satisfy the two assertions above.
+    assert b["batch_size"] < 256, b
+
+    # The per-modality envelope is the TrainingDataset one, breakdown included.
+    for name, m in per.items():
+        assert set(m["breakdown"]) == _BREAKDOWN_KEYS, name
+        assert sum(m["breakdown"][k] for k in _BREAKDOWN_KEYS - {"total_bytes"}) == (
+            m["breakdown"]["total_bytes"]
+        ), name
+        assert m["estimated_mb"] == m["breakdown"]["total_bytes"] // (1024 * 1024), (
+            f"{name}: mmap is reported, never budgeted"
+        )
+
+    # The over-budget the per-modality floor buys, now reported rather than silent.
+    assert b["max_memory_mb"] == 64
+    assert b["effective_total_mb"] == 128, (
+        "two modalities cannot be given less than the 64 MB floor each"
+    )
+    ds.close()
+
+
+def test_multimodal_default_budget_does_not_warn_about_floors(cite_seq_path):
+    """An *adaptive* budget resolving above the request is the policy working.
+
+    The floors warning must fire only on an explicit `max_memory_mb`, or it
+    fires on every default construction and stops being read — the same
+    don't-cry-wolf rule the cache-sizing verdict follows.
+    """
+    import pyscx
+
+    path, _, _, _ = cite_seq_path
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        ds = pyscx.MultimodalTrainingDataset(
+            path, modalities=["rna", "adt"], batch_size=16, normalize=False, log1p=False
+        )
     ds.close()
 
 

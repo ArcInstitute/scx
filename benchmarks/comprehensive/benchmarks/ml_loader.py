@@ -166,13 +166,21 @@ def _scx_memory_budget_mb() -> int | None:
     """Loader `max_memory_mb` scaled to the SLURM allocation.
 
     The default (4096 MB) is too small for atlas-scale full-width datasets
-    (1M × 61,497): the loader's memory-budget auto-tune then collapses
-    ``batch_size`` to its 64 minimum, which both makes batches/sec
-    incomparable across codecs (a larger-on-disk codec tips over the
-    threshold first) and inflates the epoch to ~16× more tiny batches
-    (a cause of the census `workers2` time-outs). Use most of whatever
-    ``--mem`` the SLURM job got so ``batch_size`` stays at 1024. Returns
-    ``None`` off-SLURM so local/CI runs keep the built-in default.
+    (1M × 61,497): the loader's memory-budget auto-tune shrinks
+    ``shard_group_size`` and, historically, ``batch_size`` to its 64 minimum,
+    which both makes batches/sec incomparable across codecs (a larger-on-disk
+    codec tips over the threshold first) and inflates the epoch to ~16× more
+    tiny batches (a cause of the census `workers2` time-outs). Use most of
+    whatever ``--mem`` the SLURM job got. Returns ``None`` off-SLURM so
+    local/CI runs keep the built-in default.
+
+    The ``batch_size`` half of that rationale is **historical**: it was caused
+    by the sequential model counting the whole mmap'd file against the budget,
+    so any file above the 4096 MB adaptive cap exceeded it on that term alone.
+    ORG-9.10-5 removed the mmap term. This scaling is kept because it still
+    protects ``shard_group_size`` (hence shuffle entropy), and because dropping
+    it in the same change would confound the A/B that validates the change.
+    Retiring it is a follow-up, once a capture at the default budget exists.
     """
     per_node = os.environ.get("SLURM_MEM_PER_NODE")
     if per_node:

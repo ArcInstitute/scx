@@ -2720,7 +2720,7 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 | `shard_group_size` | `8` | Shards per I/O group. Sequential I/O within each group for disk efficiency. |
 | `prefetch_batches` | `4` | Ring buffer depth — number of pre-built batches to buffer ahead. |
 | `seed` | `42` | RNG seed for reproducibility. Deterministic shuffle via `(seed, epoch)`. |
-| `max_memory_mb` | adaptive (≥512) | Memory budget. **When omitted**, the budget is *adaptive*: it scales up to fit the file's requested configuration (so a full-width ~33k-gene file keeps its requested `batch_size` instead of silently shrinking), floored at 512 MB and capped at 4096 MB. Pass an explicit value to pin a **hard ceiling** — then the pipeline auto-tunes `shard_group_size`, `prefetch_batches`, and `batch_size` down to fit (the prior behaviour). |
+| `max_memory_mb` | adaptive (≥512) | Memory budget, and the **same envelope on every loader class**: anonymous memory only — the mmap'd file is kernel page cache, evictable under pressure, and is reported (`mmap_mb`) but never budgeted. **When omitted**, the budget is *adaptive*: it scales up to fit the file's requested configuration (so a full-width ~33k-gene file keeps its requested `batch_size` instead of silently shrinking), floored at 512 MB and capped at 4096 MB. Pass an explicit value to pin a **hard ceiling** — then the pipeline auto-tunes `prefetch_batches` (to 2), then `shard_group_size` (to 1), then `batch_size` (halved, to 64), in that order. If it still does not fit, `budget_exceeded` is set and a `UserWarning` is raised. |
 | `modality` | `None` | For multimodal v2 files: name of the modality to load (e.g. `"rna"`). Ignored on single-modality files. |
 
 **Properties**
@@ -2733,7 +2733,7 @@ loop is one epoch; shards are reshuffled between epochs for training randomizati
 **Methods**
 
 - `close()` — Explicitly shut the pipeline down (join I/O + decode threads, release rayon pool). Idempotent, and **not** terminal: the next `__iter__` rebuilds and starts a fresh epoch. Recommended before process exit; see [Fork safety](#fork-safety-under-pytorch-dataloadernum_workers--0) and **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
-- `memory_budget()` → `dict` — `breakdown` (the six-key per-component estimate every class that reports a budget uses — `MultimodalTrainingDataset` reports none) plus this class's own `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`. `mmap_mb` appears here and nowhere else — the plan-driven loaders treat page cache as evictable and exclude it.
+- `memory_budget()` → `dict` — `breakdown` (the six-key per-component estimate every class that reports a budget uses) plus this class's own `shard_group_size`, `prefetch_batches`, `batch_size`, `estimated_mb`, `mmap_mb`, `budget_exceeded`. `mmap_mb` appears here and nowhere else, but it is **not** budgeted anywhere: `estimated_mb` equals `breakdown["total_bytes"]`. `budget_exceeded` means the auto-tune could not fit even at its minimums, and also raises a `UserWarning` at construction.
 
 **Properties (lifecycle)**
 
@@ -3067,7 +3067,7 @@ with `set_offsets`.
 |---|---|---|
 | `paths` | — | List of `.scx` paths. `file_id` in a plan is the index into this list. |
 | `cache_shards` | `None` → 128 | Shard-cache count cap. Size it with `suggested_cache_shards`, not by guessing — see [Sizing the shard cache](training.md#sizing-the-shard-cache). |
-| `max_memory_mb` | `None` | Byte cap on the shard cache; `None` resolves adaptively (never unbounded). Both caps are enforced, and on large-shard files the byte cap binds first. |
+| `max_memory_mb` | `None` | Memory budget, the same process envelope the other loader classes use — **not** a bare cache cap: the constant interpreter/numpy/Arrow overhead is subtracted before the cache is sized. `None` resolves adaptively (never unbounded). Both the count cap and the byte cap are enforced, and on large-shard files the byte cap binds first. |
 | `remap_tables` / `n_global_genes` | `None` | Per-file `local → global` gene tables. Required for a cell **set** that spans files: raw-local indices from different files are not comparable. |
 | `normalize` / `log1p` / `target_sum` | `None` → off | Off by default here, unlike the training classes. |
 | `lookahead` | `None` → tuned | Prefetch depth; `0` disables prefetch. |
@@ -3089,15 +3089,8 @@ delimits each set's row range in the flat batch.
 - `iter_with_plans(plans, lookahead=None)` → `SparseCellSetBatchIter` — stream plans into §4.4 sparse batch dicts.
 - `suggested_cache_shards(plan)` → `int` — distinct `(file_id, shard)` pairs one plan touches. Takes the same four-tuple `iter_with_plans` consumes; `role_tags` / `set_offsets` are ignored.
 - `cache_metrics()` → `dict` — cumulative shard-cache counters, including `full_shard_groups` / `block_index_groups`, which report the scattered-read route the gathers actually took.
-- `memory_budget()` → `dict` — `breakdown` plus `max_memory_mb`, `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`. Only `cache_bytes` and `python_overhead_bytes` are non-zero in the breakdown: on this path the shard cache *is* the budget.
+- `memory_budget()` → `dict` — `breakdown` plus `max_memory_mb`, `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`, `budget_exceeded`. Only `cache_bytes` and `python_overhead_bytes` are non-zero in the breakdown: on this path the shard cache *is* the budget. `budget_exceeded` means even a one-shard cache does not fit, which is the only case where `breakdown["total_bytes"]` exceeds `max_memory_mb`.
 - `close()` — release the prefetch engine's tokio runtime, GIL detached, 5 s bound. Idempotent and **terminal** — see **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
-
-> [!NOTE]
-> `memory_budget()["breakdown"]["total_bytes"]` can exceed `max_memory_mb` on
-> this class, which cannot happen on `IndexPlanDataset`. The breakdown reports
-> the constant interpreter/numpy/Arrow overhead every path pays; this loader's
-> auto-tune does not yet subtract it from the budget. Unifying the two budget
-> models is tracked as its own piece of work.
 
 ## CLI (`scx`)
 
