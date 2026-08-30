@@ -1451,3 +1451,133 @@ fn the_iterator_as_last_owner_still_gets_a_bounded_teardown() {
          gone down through BoundedRuntime::drop"
     );
 }
+
+// ---------------------------------------------------------------------
+// `prefetch_skipped_in_flight` — the one `IterMetrics` counter with no pin
+// ---------------------------------------------------------------------
+
+/// **Pre-refactor pin (ORG-9.10-1, drift (b)).** A shard that a *peer* is
+/// already decoding must be skipped by the prefetch and attributed to
+/// `prefetch_skipped_in_flight` — not spawned again, and not charged to one of
+/// the other three counters.
+///
+/// This is the counter 9a left unpinned, and the reason is structural: the
+/// in-flight table is published by the singleflight leader inside
+/// `SharedShardCache::get_or_decode` and torn down the instant the decode
+/// returns, so from `scx-loader` there was no way to observe the window without
+/// racing a sleep against a decode. `test_index_plan.rs`'s conservation law
+/// covers the *sum*, so a bug that mis-attributed an in-flight skip as a
+/// cache-hit skip would leave every existing test green.
+///
+/// The premise is established by a predicate, never by timing:
+/// `scx-format-io`'s `test-hooks` `set_decode_barrier` parks the leader at the
+/// top of `decode_shard` — after the in-flight publish, before the decode — and
+/// the test waits on `in_flight_contains`, failing loudly if it never becomes
+/// true rather than asserting against an empty table.
+///
+/// `next()` runs on a worker because it cannot complete while the barrier is
+/// held: after the prefetch skip, `process_plan`'s own gather joins the
+/// singleflight as a *follower* and blocks on the same leader.
+#[test]
+fn prefetch_skips_and_counts_a_shard_a_peer_is_already_decoding() {
+    const HELD_SHARD: usize = 2;
+
+    let dir = tempfile::tempdir().unwrap();
+    // 32 rows / 4 shards → 8 rows each; shard 2 is rows 16..24.
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 32, 8, 4);
+
+    let config = LoaderConfig {
+        normalize: false,
+        log1p: false,
+        obs_columns: vec!["cell_id".to_string()],
+        ..Default::default()
+    };
+    let mut raw = IndexPlanLoader::new(&path, config, 8, true, 4, 16384).unwrap();
+    // Unframed fixture, but pin the gate off anyway so a future framed default
+    // cannot turn this into a block-index skip and quietly retarget the test.
+    raw.set_scatter_block_index(false);
+
+    let release = StdArc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered = StdArc::new(AtomicU64::new(0));
+    {
+        let release = StdArc::clone(&release);
+        let entered = StdArc::clone(&entered);
+        Arc::get_mut(&mut raw.backed)
+            .expect("reader is unshared before the loader is wrapped")
+            .set_decode_barrier(Arc::new(move |sidx: usize| {
+                if sidx != HELD_SHARD {
+                    return;
+                }
+                entered.fetch_add(1, Ordering::AcqRel);
+                while !release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+    }
+    let loader = Arc::new(raw);
+
+    // The peer: becomes singleflight leader for HELD_SHARD and parks.
+    let peer_reader = Arc::clone(&loader.backed);
+    let peer = std::thread::spawn(move || peer_reader.read_shard_cached_arc(HELD_SHARD));
+
+    // Premise, by predicate: the shard really is in the in-flight table.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !loader.backed.in_flight_contains(HELD_SHARD) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer never published shard {HELD_SHARD} in the in-flight table \
+             ({} barrier entries) — the premise failed, so the assertion below \
+             would have been vacuous",
+            entered.load(Ordering::Acquire)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // Both rows live in HELD_SHARD, so it is the only shard the plan touches.
+    let mut it = Arc::clone(&loader).iter_with_plans(into_plan_iter(vec![vec![(16u64, 17u64)]]), 1);
+    let metrics = it.iter_metrics();
+    let consumer = std::thread::spawn(move || {
+        let b = it.next();
+        (it, b)
+    });
+
+    // `spawn_prefetches` has run once the counter moves; releasing before that
+    // would let the leader finish and reopen the race this test exists to close.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while metrics.prefetch_skipped_in_flight.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "prefetch_skipped_in_flight never incremented for a shard that was \
+             demonstrably in flight: spawned={} cache_hit={} block_index={}",
+            metrics.prefetch_tasks_spawned.load(Ordering::Relaxed),
+            metrics.prefetch_skipped_cache_hit.load(Ordering::Relaxed),
+            metrics.prefetch_skipped_block_index.load(Ordering::Relaxed),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        metrics.prefetch_tasks_spawned.load(Ordering::Relaxed),
+        0,
+        "the only shard the plan touches was already in flight, so nothing \
+         should have been spawned"
+    );
+    assert_eq!(
+        metrics.prefetch_skipped_cache_hit.load(Ordering::Relaxed),
+        0,
+        "the shard was in flight, not cached — mis-attributing the skip is \
+         exactly what the conservation law cannot see"
+    );
+
+    release.store(true, Ordering::Release);
+    peer.join().expect("peer thread").expect("peer decode");
+    let (it, batch) = consumer.join().expect("consumer thread");
+    batch.expect("a batch").expect("must decode");
+    drop(it);
+
+    assert_eq!(
+        metrics.prefetch_skipped_in_flight.load(Ordering::Relaxed),
+        1,
+        "exactly one shard was skipped as in-flight"
+    );
+}

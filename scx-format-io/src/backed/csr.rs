@@ -90,6 +90,17 @@ pub struct BackedCsrReader {
     /// `warm_shards` is a sequential loop anyway.
     #[cfg(feature = "parallel")]
     cpu_pool: Option<Arc<rayon::ThreadPool>>,
+    /// Test-only barrier invoked at the top of [`Self::decode_shard`], i.e.
+    /// **after** the singleflight leader has published the shard in the
+    /// in-flight table and **before** the decode runs. That window is the only
+    /// place a test can hold a shard in-flight deterministically, which is what
+    /// `scx-loader`'s prefetch-skip counters need in order to be pinned by a
+    /// predicate rather than by a sleep.
+    ///
+    /// Behind the opt-in `test-hooks` feature, so the field, the `Option` check
+    /// and the call site all vanish from a default build.
+    #[cfg(feature = "test-hooks")]
+    decode_barrier: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 }
 
 impl BackedCsrReader {
@@ -166,6 +177,8 @@ impl BackedCsrReader {
             framed_cache: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(feature = "test-hooks")]
+            decode_barrier: None,
         }
     }
 
@@ -205,6 +218,8 @@ impl BackedCsrReader {
             framed_cache: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(feature = "test-hooks")]
+            decode_barrier: None,
         }
     }
 
@@ -246,6 +261,8 @@ impl BackedCsrReader {
             framed_cache: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(feature = "test-hooks")]
+            decode_barrier: None,
         }
     }
 
@@ -303,6 +320,8 @@ impl BackedCsrReader {
             framed_cache: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
+            #[cfg(feature = "test-hooks")]
+            decode_barrier: None,
         }
     }
 
@@ -405,6 +424,18 @@ impl BackedCsrReader {
     #[cfg(feature = "parallel")]
     pub fn set_cpu_pool(&mut self, pool: Arc<rayon::ThreadPool>) {
         self.cpu_pool = Some(pool);
+    }
+
+    /// Install the test-only decode barrier described on
+    /// [`Self::decode_barrier`]. `f` is called with the shard index at the top
+    /// of every singleflight-leader decode; parking inside it holds that shard
+    /// in the in-flight table for as long as the test needs.
+    ///
+    /// Takes `&mut self` deliberately: like [`Self::set_cpu_pool`], it must be
+    /// set before the reader is shared behind an `Arc`.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_decode_barrier(&mut self, f: Arc<dyn Fn(usize) + Send + Sync>) {
+        self.decode_barrier = Some(f);
     }
 
     /// Whether a shard request-group should be served by the block-index
@@ -1198,6 +1229,13 @@ impl BackedCsrReader {
     /// touch the cache — the [`SharedShardCache`] inserts the result under the
     /// budget on the singleflight leader path.
     fn decode_shard(&self, shard_idx: usize) -> Result<Arc<ScxCsr>> {
+        // The singleflight leader has already published `(file_id, shard_idx)`
+        // in the in-flight table by the time this runs — see
+        // `SharedShardCache::get_or_decode`. Compiled out without `test-hooks`.
+        #[cfg(feature = "test-hooks")]
+        if let Some(barrier) = self.decode_barrier.as_ref() {
+            barrier(shard_idx);
+        }
         // Same per-modality-correct dispatch as `read_shard_uncached`:
         // address shards by their catalog offset via `shard_entry`, not by
         // global CSR index.
