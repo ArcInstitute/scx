@@ -802,7 +802,7 @@ One difference worth knowing:
 
 | | `TrainingDataset`, `MultimodalTrainingDataset` | `IndexPlanDataset`, `SparseCellSetDataset` |
 |---|---|---|
-| after `close()` | re-usable — the next `__iter__` rebuilds the pool and runtime | **terminal** — every method raises `RuntimeError`; construct a new dataset |
+| after `close()` | re-usable — the next `__iter__` rebuilds the pool and runtime | **terminal** — every *other* method raises `RuntimeError`; construct a new dataset |
 | why | its pool and runtime are rebuilt per epoch anyway | the runtime is built exactly once, so a forked child can never inherit live tokio threads; that also means it cannot be rebuilt |
 | `closed` means | torn down right now; back to `False` after the next `__iter__` | closed for good |
 
@@ -813,11 +813,17 @@ re-usable pair it answers "is this torn down right now", so
 `assert ds.closed` after an epoch does not.
 
 Whichever object ends up holding the last reference does the teardown, and every
-one of them bounds it at 5 s and detaches the GIL first — the dataset's
-`close()`/`Drop`, and the batch iterator's `Drop` *and* its end-of-stream branch
-in `__next__`. So `ds.close()` followed by draining an outstanding iterator is
-safe: `close()` releases only the dataset's reference, and the iterator's own
-teardown finishes the job under the same guarantees.
+one of them detaches the GIL first — the dataset's `close()`/`Drop`, and the
+batch iterator's `Drop` *and* its end-of-stream branch in `__next__`. So
+`ds.close()` followed by draining an outstanding iterator is safe: `close()`
+releases only the dataset's reference, and the iterator's own teardown finishes
+the job under the same guarantees.
+
+The **bound** is not one number, though it is often quoted as one. The
+plan-driven pair (and their iterators) drop a tokio runtime under a single
+`SHUTDOWN_DEADLINE` of 5 s. `TrainingDataset` bound-joins its I/O and decode
+threads *sequentially*, so ~2 × that, and `MultimodalTrainingDataset` repeats
+the whole shutdown per modality.
 
 > [!TIP]
 > Use `multiprocessing.set_start_method("spawn")` if your workload allows.

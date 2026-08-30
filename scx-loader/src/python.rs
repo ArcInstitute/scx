@@ -2580,8 +2580,11 @@ impl SparseCellSetDataset {
         py: Python<'py>,
         plan: (Vec<u32>, Vec<u64>, Bound<'py, PyAny>, Bound<'py, PyAny>),
     ) -> PyResult<usize> {
-        // Closed-state check first, so a closed dataset reports that rather
-        // than a ValueError about its arguments.
+        // Closed-state check before the manual same-length validation below,
+        // so a closed dataset reports that rather than a ValueError about its
+        // arguments. It cannot precede *all* argument checking: pyo3 converts
+        // the tuple parameter before this body runs, so a closed dataset handed
+        // a two-tuple still gets the arity `ValueError`.
         let loader = self.loader()?;
         // `role_tags` / `set_offsets` are taken as bare objects, not extracted:
         // the tuple arity is still checked (a 2-tuple is rejected, which is the

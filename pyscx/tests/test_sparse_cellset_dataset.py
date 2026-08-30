@@ -361,7 +361,10 @@ def test_closed_dataset_raises_before_running_user_code(two_scx):
     with pytest.raises(RuntimeError, match="closed"):
         ds.iter_with_plans(Exploding())
 
-    # Same for the argument-validation path: closed beats ValueError.
+    # Same for the manual same-length validation: closed beats that ValueError.
+    # Only that one — pyo3 converts the tuple parameter before the Rust body
+    # runs, so a closed dataset handed a *wrong-arity* plan still gets the arity
+    # ValueError, which is why this plan is well-formed apart from its lengths.
     with pytest.raises(RuntimeError, match="closed"):
         ds.suggested_cache_shards(([0, 0], [1], [0, 0], [0, 2]))
 

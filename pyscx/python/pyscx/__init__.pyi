@@ -220,9 +220,10 @@ class SparseCellSetBatchIter:
 
         ``prefetch["prefetch_skipped_block_index"]`` counts the L2
         *prefetch-time* decision: shards left undecoded so the gather could
-        take the block-index path. It stays 0 against an unframed file, whose
-        construction now also emits a preflight ``UserWarning``. It is **not**
-        interchangeable with
+        take the block-index path. It stays 0 against an unframed file — and
+        constructing one *with* ``scatter_block_index=True`` also emits a
+        preflight ``UserWarning``, though this class defaults that kwarg off, so
+        the default path is silent. It is **not** interchangeable with
         ``cache_metrics()["block_index_groups"]``, which is the route the
         gather took — at ``lookahead=0`` no prefetch runs, so every counter
         here is 0 while ``block_index_groups`` is positive."""
