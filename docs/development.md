@@ -446,7 +446,8 @@ always run; the merge push to main always runs everything):
 | `clippy` | `cargo clippy --workspace --exclude rscx --all-targets -- -D warnings` — `--all-targets` lints test and bench code too |
 | `fmt` | `cargo fmt --check` |
 | `feature-check` / `feature-check-hdf5` | `cargo clippy --all-targets` legs for feature combos (cloud, hdf5, gpu, scx-format-io no-default) as sequential steps in two jobs |
-| `python` | `maturin develop --profile ci` + `pytest -n 2` (with cloud features, fork-safety tests) |
+| `docs-anchors` | Runs `pyscx/tests/test_docs_anchors.py` (stdlib-only) on docs-only PRs, which skip the jobs above |
+| `python` | `maturin develop --profile ci` + `pytest -n 2 --dist loadfile` (with cloud features, fork-safety tests) |
 | `base-install` | Builds the wheel with `--profile ci`, installs it into an empty venv, runs the packaging assertions |
 
 The CPU-only build contract — the entire workspace (including `scx-gpu`)

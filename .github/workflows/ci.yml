@@ -23,13 +23,21 @@ env:
 # pairing), so a dedicated `cargo build` job produced nothing unique.
 
 jobs:
-  # Classifies the PR's changed files so docs-only rounds (a common auto-review
-  # fix-round shape) skip the expensive build/test jobs. Push events always
-  # report code=true — the merge commit to main runs everything, which is also
-  # the backstop for the one thing a docs-only PR skips (pyscx's
-  # test_docs_anchors.py reads docs/). fmt and dedup-guard stay unconditional.
-  # Uses the pulls/files API instead of a checkout: no third-party action, no
-  # fetch-depth cost.
+  # Classifies the PR's changed files so a PR whose ENTIRE diff is docs skips
+  # the expensive build/test jobs. (A doc-fix push to a PR that also contains
+  # code still runs everything — the classification is of the PR's whole diff,
+  # never the individual push.) Push events always report code=true, so the
+  # merge commit to main runs everything. fmt and dedup-guard stay
+  # unconditional, and the docs-anchors job below covers the one test a
+  # docs-only PR would otherwise skip. Uses the pulls/files API instead of a
+  # checkout: no third-party action, no fetch-depth cost.
+  #
+  # Every ambiguity fails CLOSED (code=true): an empty listing, a listing whose
+  # length disagrees with the event payload's changed_files, and any PR at or
+  # above the API's 3,000-file listing cap (GET /pulls/{n}/files truncates
+  # there — a 3,001st code file would otherwise be invisible). Renames are
+  # classified by BOTH sides: a `git mv src/foo.rs docs/foo.md` must count as
+  # code, and only previous_filename shows the .rs side.
   changes:
     name: Changed-path gate
     runs-on: ubuntu-latest
@@ -49,8 +57,18 @@ jobs:
             echo "push event: code=true"
             exit 0
           fi
+          expected='${{ github.event.pull_request.changed_files }}'
+          if [ -z "$expected" ] || [ "$expected" -ge 3000 ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "changed_files=$expected (missing or at the 3000-file API cap): code=true"
+            exit 0
+          fi
           files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
             --paginate --jq '.[].filename')
+          renamed_from=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[].previous_filename // empty')
+          listed=$(grep -c . <<< "$files" || true)
+          to_classify=$(printf '%s\n%s\n' "$files" "$renamed_from")
           code=false
           while IFS= read -r f; do
             [ -z "$f" ] && continue
@@ -60,11 +78,37 @@ jobs:
               LICENSE*) ;;
               *) code=true ;;
             esac
-          done <<< "$files"
-          # Fail safe: an empty file list (API hiccup) must not skip CI.
-          [ -z "$files" ] && code=true
+          done <<< "$to_classify"
+          # Fail safe: an empty or truncated listing must not skip CI.
+          if [ -z "$files" ] || [ "$listed" -ne "$expected" ]; then
+            echo "listing ($listed) != changed_files ($expected): failing closed"
+            code=true
+          fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "changed files:"; echo "$files"; echo "code=$code"
+
+  # The one meaningful check a docs-only PR would otherwise skip: the markdown
+  # anchor/link validator is stdlib-only pytest (no maturin, no pyscx import),
+  # so a docs-only PR gets it in under a minute instead of the full python job.
+  # main carries no required-check ruleset, so without this a broken doc link
+  # would merge first and only go red on main afterwards. Code PRs skip this
+  # job — the python job runs the same test as part of the full suite.
+  docs-anchors:
+    name: Docs anchors (docs-only PRs)
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest
+      # --noconftest: pyscx/tests/conftest.py imports numpy/pandas/scipy at
+      # module level; the anchors test itself is stdlib-only and uses no
+      # conftest fixture (verified in a pytest-only venv).
+      - run: pytest --noconftest pyscx/tests/test_docs_anchors.py -v
 
   test:
     needs: changes
@@ -2751,17 +2795,16 @@ jobs:
             exit 1
           fi
 
-  # The feature legs run as sequential steps in two jobs (split by whether
-  # libhdf5 is needed) instead of a 12-leg matrix: one runner spin-up,
-  # checkout, toolchain and cache per group, one shared target/ so the common
-  # dependency closure compiles once per group instead of per leg, and no
-  # per-job billable-minute rounding on eleven ~1-2 minute legs. Each leg is
-  # `cargo clippy` only — clippy performs the full type-check, so a separate
-  # `cargo check` on the same flags was a second compile of the same closure
-  # for no additional signal. `fail-fast` semantics are preserved in spirit by
-  # keeping the two groups independent; within a group a broken leg fails the
-  # job at that step and later legs are skipped (acceptable: legs in a group
-  # rarely break independently, and the fix loop is per-PR anyway).
+  # The feature legs run inside two jobs (split by whether libhdf5 is needed)
+  # instead of a 12-leg matrix: one runner spin-up, checkout, toolchain and
+  # cache per group, one shared target/ so the common dependency closure
+  # compiles once per group instead of per leg, and no per-job billable-minute
+  # rounding on eleven ~1-2 minute legs. Each leg is `cargo clippy` only —
+  # clippy performs the full type-check, so a separate `cargo check` on the
+  # same flags was a second compile of the same closure for no additional
+  # signal. The legs run through a small accumulate-failures loop so one broken
+  # leg does not hide whether the others are broken too (the old matrix was
+  # `fail-fast: false`; naive sequential steps would have lost that).
   feature-check:
     name: Feature matrix (clippy, no-hdf5 legs)
     needs: changes
@@ -2781,50 +2824,52 @@ jobs:
           # new prefix starts a clean namespace; v0 entries age out via the
           # 7-day cache GC.
           prefix-key: v1-rust
-      # scx-cli cloud feature only
-      - name: clippy scx-cli --features cloud
-        run: cargo clippy -p scx-cli --features cloud --all-targets -- -D warnings
-      # scx-accel gpu feature — requires cudarc stubs only, no CUDA toolkit
-      - name: clippy scx-accel --features gpu
-        run: cargo clippy -p scx-accel --features gpu --all-targets -- -D warnings
-      # pyscx gpu feature — the rapids-absent lane (ACC-RUST-OPT-V4 §4.3).
-      # Compiles + clippy-checks the gpu-gated rapids routing on a CPU runner
-      # with neither CUDA nor rapids-singlecell present (cudarc stubs compile);
-      # the detected-dependency contract (pyscx imports + CPU/streaming/loader
-      # run with rapids absent) holds by construction, and the planner's
-      # no_rapids branch is unit-tested in `cargo test` (scx-accel route).
-      # The runtime no_rapids→CPU assertion on a GPU host without rapids is a
-      # Phase 2.2 GPU gate (needs hardware CI does not have).
-      - name: clippy pyscx --features gpu
-        run: cargo clippy -p pyscx --features gpu --all-targets -- -D warnings
-      # pyscx cloud — covered by the python job; also check standalone
-      - name: clippy pyscx --features cloud
-        run: cargo clippy -p pyscx --features cloud --all-targets -- -D warnings
-      # scx-gpu's benchmark binary is `required-features = ["bench"]`, so no
-      # default-feature lane ever compiles it — a `scx-codec` signature change
-      # broke it and every GPU lane here still passed. It is the binary
-      # `benchmarks/scripts/slurm_gpu_bench.sh` runs, so the break would have
-      # surfaced hours into a SLURM job instead of in CI.
-      - name: clippy scx-gpu --features bench (gpu_bench bin)
-        run: cargo clippy -p scx-gpu --features bench --bin gpu_bench -- -D warnings
-      # scx-format-io's three non-default feature configurations. The `test`
-      # job runs default features (`parallel` + `deletion-vectors`), so
-      # without these no CI job compiles the sequential reader or the
-      # deletion-vector-free build at all.
-      #
-      # `--all-targets`, not the `--lib` the first of these used to carry:
-      # without `--all-targets` clippy never reaches the test target. `--lib`
-      # was there because the test target did not compile with `parallel` off;
-      # it does now, and compiling it is the point -- that is what surfaced
-      # three dead-code warnings and two tests that *fail* without `parallel`
-      # (the prefetch bit-identity pair, on their own vacuity guard, now gated
-      # with it).
-      - name: clippy scx-format-io (parallel off)
-        run: cargo clippy -p scx-format-io --no-default-features --features deletion-vectors --all-targets -- -D warnings
-      - name: clippy scx-format-io (deletion-vectors off)
-        run: cargo clippy -p scx-format-io --no-default-features --features parallel --all-targets -- -D warnings
-      - name: clippy scx-format-io (neither feature)
-        run: cargo clippy -p scx-format-io --no-default-features --all-targets -- -D warnings
+      # Leg rationale:
+      # - scx-cli cloud: the cloud feature alone.
+      # - scx-accel gpu: requires cudarc stubs only, no CUDA toolkit.
+      # - pyscx gpu: the rapids-absent lane (ACC-RUST-OPT-V4 §4.3). Compiles +
+      #   clippy-checks the gpu-gated rapids routing on a CPU runner with
+      #   neither CUDA nor rapids-singlecell present (cudarc stubs compile);
+      #   the detected-dependency contract (pyscx imports + CPU/streaming/
+      #   loader run with rapids absent) holds by construction, and the
+      #   planner's no_rapids branch is unit-tested in `cargo test` (scx-accel
+      #   route). The runtime no_rapids→CPU assertion on a GPU host without
+      #   rapids is a Phase 2.2 GPU gate (needs hardware CI does not have).
+      # - pyscx cloud: covered by the python job; also check standalone.
+      # - scx-gpu bench: the benchmark binary is `required-features =
+      #   ["bench"]`, so no default-feature lane ever compiles it — a
+      #   `scx-codec` signature change broke it and every GPU lane here still
+      #   passed. It is the binary `benchmarks/scripts/slurm_gpu_bench.sh`
+      #   runs, so the break would have surfaced hours into a SLURM job
+      #   instead of in CI.
+      # - scx-format-io ×3: the three non-default feature configurations. The
+      #   `test` job runs default features (`parallel` + `deletion-vectors`),
+      #   so without these no CI job compiles the sequential reader or the
+      #   deletion-vector-free build at all. `--all-targets`, not `--lib`:
+      #   without it clippy never reaches the test target; compiling it is the
+      #   point — that is what surfaced three dead-code warnings and two tests
+      #   that *fail* without `parallel` (the prefetch bit-identity pair, on
+      #   their own vacuity guard, now gated with it).
+      - name: clippy all no-hdf5 feature legs
+        run: |
+          fail=0
+          leg() {
+            echo "::group::cargo clippy $*"
+            if ! cargo clippy "$@" -- -D warnings; then
+              echo "::error::leg failed: cargo clippy $*"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          leg -p scx-cli --features cloud --all-targets
+          leg -p scx-accel --features gpu --all-targets
+          leg -p pyscx --features gpu --all-targets
+          leg -p pyscx --features cloud --all-targets
+          leg -p scx-gpu --features bench --bin gpu_bench
+          leg -p scx-format-io --no-default-features --features deletion-vectors --all-targets
+          leg -p scx-format-io --no-default-features --features parallel --all-targets
+          leg -p scx-format-io --no-default-features --all-targets
+          exit $fail
 
   feature-check-hdf5:
     name: Feature matrix (clippy, hdf5 legs)
@@ -2848,22 +2893,32 @@ jobs:
       # hdf5 feature needs the system library.
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
-      # scx-cli cloud + hdf5 — pulls in the hdf5-rust bindings
-      - name: clippy scx-cli --features hdf5,cloud
-        run: cargo clippy -p scx-cli --features hdf5,cloud --all-targets -- -D warnings
-      # scx-convert hdf5 — the ingest/export path. The `test` job runs
-      # default features only, so before this lane existed the hdf5-gated
-      # half of scx-convert (including its test modules) was compiled by no
-      # CI job at all.
-      - name: clippy scx-convert --features hdf5
-        run: cargo clippy -p scx-convert --features hdf5 --all-targets -- -D warnings
-      # pyscx hdf5 + gpu — the documented GPU build combo (report F2).
-      # maturin's `--features` REPLACES the pyproject default set (which
-      # includes hdf5), so the docs/skills build with `--features hdf5,gpu`;
-      # this guards that the combo compiles + clippy-checks so the h5ad I/O
-      # path can't silently regress under a GPU build.
-      - name: clippy pyscx --features hdf5,gpu
-        run: cargo clippy -p pyscx --features hdf5,gpu --all-targets -- -D warnings
+      # Leg rationale:
+      # - scx-cli hdf5,cloud: pulls in the hdf5-rust bindings.
+      # - scx-convert hdf5: the ingest/export path. The `test` job runs
+      #   default features only, so before this lane existed the hdf5-gated
+      #   half of scx-convert (including its test modules) was compiled by no
+      #   CI job at all.
+      # - pyscx hdf5,gpu: the documented GPU build combo (report F2).
+      #   maturin's `--features` REPLACES the pyproject default set (which
+      #   includes hdf5), so the docs/skills build with `--features hdf5,gpu`;
+      #   this guards that the combo compiles + clippy-checks so the h5ad I/O
+      #   path can't silently regress under a GPU build.
+      - name: clippy all hdf5 feature legs
+        run: |
+          fail=0
+          leg() {
+            echo "::group::cargo clippy $*"
+            if ! cargo clippy "$@" -- -D warnings; then
+              echo "::error::leg failed: cargo clippy $*"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          leg -p scx-cli --features hdf5,cloud --all-targets
+          leg -p scx-convert --features hdf5 --all-targets
+          leg -p pyscx --features hdf5,gpu --all-targets
+          exit $fail
 
   python:
     name: Python bindings
