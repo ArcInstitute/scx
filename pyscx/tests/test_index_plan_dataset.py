@@ -1147,12 +1147,21 @@ class TestGilDuringTeardown:
        teardown itself, the midpoint moves past the return and post-teardown
        ticks re-enter the leading half.
 
-    (3) is what this test asserts. Its residual is why the test also runs a
-    **negative control**: the same measurement around a `ctypes.PyDLL(None).usleep`
-    of the *same duration as the teardown it just measured* — a call that holds
-    the GIL by construction. A control that scores any leading tick means the
-    rule is not discriminating on this host at this duration, and the test skips
-    rather than trusting it.
+    (3) is what this test asserts. Its residual is why the test also runs two
+    controls at the measured duration, and skips (never fails) when either
+    shows the rule is not discriminating on this host right now:
+
+    - a **positive control** — a `hashlib.sha256` over a buffer sized to the
+      same duration, which releases the GIL by construction (buffers > 2 KiB)
+      while burning a core like the teardown does, must score a leading tick.
+      Zero means the ticker thread is not schedulable next to busy native work
+      inside a window this short (a loaded 2-core CI runner starved it out of
+      a 0.32 ms window entirely), and a starved ticker is indistinguishable
+      from a held GIL. It must burn CPU rather than sleep: a sleeping control
+      yields its core and gets ticks the CPU-busy teardown cannot;
+    - a **negative control** — `ctypes.PyDLL(None).usleep` of the same
+      duration, which holds the GIL by construction, must score zero. A
+      leading tick here means the leading-half rule itself is leaking.
 
     **The control narrows the residual; it does not eliminate it.** The two
     observations are separate scheduling trials, so a teardown trial that leaks
@@ -1299,6 +1308,37 @@ class TestGilDuringTeardown:
                 "which the leading-half rule is measurably leak-free, so this "
                 "run cannot distinguish a GIL-holding teardown from a "
                 "GIL-releasing one"
+            )
+
+        # Positive control: a GIL-RELEASING but CPU-CONSUMING call of the same
+        # duration must score at least one leading tick. If it does not, the
+        # ticker thread is simply not schedulable next to busy native work
+        # inside a window this short on this host right now — a loaded 2-core
+        # CI runner left a 0.32 ms teardown with zero ticks in the WHOLE window
+        # even though the GIL was free throughout, which the assertion below
+        # misread as "the GIL was held". The control must burn CPU, not sleep:
+        # `time.sleep` yields its core, so under load it gets ticks that the
+        # CPU-busy teardown cannot, and the control stops being load-equivalent
+        # (measured on 2 contended cores: sleep-control passed while a
+        # GIL-free teardown still scored zero). `hashlib.sha256` releases the
+        # GIL for buffers over 2 KiB and burns a core for its duration.
+        import hashlib
+        import time as _time
+
+        buf = bytearray(1 << 20)
+        h0 = _time.perf_counter()
+        hashlib.sha256(buf).digest()
+        per_mib = max(_time.perf_counter() - h0, 1e-6)
+        burn = bytearray(max(int(len(buf) * teardown_s / per_mib), 1 << 12))
+        _, release_leading, _ = self._leading_ticks(
+            lambda: hashlib.sha256(burn).digest()
+        )
+        if release_leading == 0:
+            pytest.skip(
+                f"positive control: a GIL-releasing, CPU-burning hash of the "
+                f"same ~{teardown_s * 1e3:.2f} ms scored no leading tick — the "
+                "ticker is not schedulable at this duration on this host, so a "
+                "zero here cannot distinguish a held GIL from a starved ticker"
             )
 
         # Negative control: hold the GIL for the same duration, by construction,
