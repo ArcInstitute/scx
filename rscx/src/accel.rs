@@ -119,20 +119,15 @@ use scx_format_io::shard_source::SingleShardSource;
 pub(crate) fn exec_info_to_rlist(info: &AccelExecutionInfo) -> Result<Robj> {
     let fields = info.fields();
     let names: Vec<&'static str> = fields.iter().map(|(k, _)| *k).collect();
-    // Counters serialise as R doubles (R has no native 64-bit integer; every
-    // value this record can hold is exactly representable in f64).
+    // Counters serialise as R doubles (R has no native 64-bit integer). Exact
+    // up to 2^53; a counter beyond that (a `bytes_uploaded` past ~9 PB) would
+    // round — accepted, since R offers no lossless alternative scalar.
     let values: Vec<Robj> = fields
         .iter()
         .map(|(_, v)| match v {
             RouteValue::Str(s) => (*s).into_robj(),
             RouteValue::OptStr(o) => o.map(|s| s.into_robj()).unwrap_or_else(|| ().into_robj()),
             RouteValue::OptBool(o) => o.map(|b| b.into_robj()).unwrap_or_else(|| ().into_robj()),
-            RouteValue::OptUsize(o) => o
-                .map(|u| (u as f64).into_robj())
-                .unwrap_or_else(|| ().into_robj()),
-            RouteValue::OptU32(o) => o
-                .map(|u| (u as f64).into_robj())
-                .unwrap_or_else(|| ().into_robj()),
             RouteValue::OptU64(o) => o
                 .map(|u| (u as f64).into_robj())
                 .unwrap_or_else(|| ().into_robj()),

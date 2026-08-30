@@ -392,8 +392,8 @@ def _cosine_sign_agnostic(a, b):
 
     The repo-standard GPU/CPU PCA comparison (see `test_accel_pca_gpu.py`).
     Elementwise `allclose` is the wrong tool here: the two paths run different
-    algorithms — `pick_cpu_method` chooses covariance for a narrow var axis
-    while `resolve_gpu_method` always yields randomized — so they agree on the
+    algorithms — `resolve_cpu_pca_method` chooses covariance for a narrow var
+    axis while the native GPU path is always randomized — so they agree on the
     subspace, not on the digits.
     """
     a = np.asarray(a, dtype=np.float64)

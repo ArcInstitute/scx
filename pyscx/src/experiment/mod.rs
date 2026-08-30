@@ -1,22 +1,35 @@
 // PyExperiment — lazy handle for SCX files
+//
+// Split into submodules (ORG-10.16-6): `lookup` (gene/column resolution and
+// repr plumbing shared with the cloud reader), `gpu_anndata` (the cfg(gpu)
+// to_gpu_anndata device path), `group_shard` (PyGroupShard + the shared
+// error adapters). This module keeps the pyclass, its single #[pymethods]
+// block (pyo3 without `multiple-pymethods` allows exactly one), and the
+// inherent impls; the submodule items are re-exported so existing
+// `crate::experiment::*` paths are unchanged.
+
+// PyExperiment — lazy handle for SCX files
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::Array;
 use numpy::{PyArray1, PyReadonlyArray1};
 
-/// One obs column's `(codes, categories)` as handed to Python: an `int32` numpy
-/// array plus the category strings. Shared by the local and cloud accessors.
-pub(crate) type PyCategorical<'py> = (Bound<'py, PyArray1<i32>>, Vec<String>);
 use pyo3::prelude::*;
 use scx_engine::QueryPipeline;
-use scx_format_io::backed::BackedCsrReader;
 use scx_format_io::ScxReader;
 
 use crate::convert;
 use crate::query::PyQueryPipeline;
 use crate::to_pyerr;
+
+pub(crate) mod gpu_anndata;
+pub(crate) mod group_shard;
+pub(crate) mod lookup;
+pub(crate) mod materialize;
+
+pub(crate) use group_shard::*;
+pub(crate) use lookup::*;
 
 /// A handle to an open SCX file.
 ///
@@ -135,319 +148,6 @@ impl PyExperiment {
             }),
         }
     }
-}
-
-/// Project a decoded batch down to `cols`, keeping the pandas index column(s).
-///
-/// The index columns are retained for the same reason `read_obs`'s pushed-down
-/// projection retains them: dropping them loses the frame's index, and the
-/// schema's pandas envelope still advertises an `index_columns` entry that
-/// pyarrow would then fail to resolve.
-///
-/// An unknown column name is a `KeyError` naming what is available, rather
-/// than a silently narrower frame.
-pub(crate) fn project_batch_columns(
-    batch: &arrow::record_batch::RecordBatch,
-    cols: &[String],
-) -> PyResult<arrow::record_batch::RecordBatch> {
-    let schema = batch.schema();
-    let mut indices: Vec<usize> = Vec::new();
-    for idx_col in scx_format_io::resolve_index_columns(&schema) {
-        if let Ok(i) = schema.index_of(&idx_col) {
-            if !cols.contains(&idx_col) {
-                indices.push(i);
-            }
-        }
-    }
-    for name in cols {
-        let i = schema.index_of(name).map_err(|_| {
-            // List only the columns a caller could meaningfully ask for. The
-            // pandas index column is retained unconditionally and is often an
-            // internal name (`__index_level_0__`), so offering it as a
-            // suggestion is noise.
-            // Same resolver as the retention loop above, so a file with no
-            // envelope does not offer `__index_level_0__` as a suggestion
-            // here while silently retaining it there.
-            let index_cols = scx_format_io::resolve_index_columns(&schema);
-            let available = schema
-                .fields()
-                .iter()
-                .map(|f| f.name().as_str())
-                .filter(|n| !index_cols.iter().any(|ic| ic == n))
-                .collect::<Vec<_>>()
-                .join(", ");
-            pyo3::exceptions::PyKeyError::new_err(format!(
-                "column '{name}' not found; available columns: {available}"
-            ))
-        })?;
-        if !indices.contains(&i) {
-            indices.push(i);
-        }
-    }
-    batch.project(&indices).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("column projection failed: {e}"))
-    })
-}
-
-/// Fault-injection hook for the host-assemble fallback below.
-///
-/// `SCX_FORCE_DEVICE_DECODE_FAILURE=1` makes the in-VRAM decode report a
-/// module-load failure — the realistic trigger, since a build whose PTX did not
-/// compile bakes empty stubs that fail exactly here. Without it the fallback
-/// can only be exercised by breaking a build on purpose, which is not something
-/// a test can do. Same role `SCX_DISABLE_RAPIDS=1` already plays for the
-/// rapids-absent path.
-///
-/// Returns `None` in the normal case, leaving the real decode to run.
-///
-/// Read per call, **not** cached in a `OnceLock` like the workspace's other
-/// `SCX_*` knobs. Those are cached because they sit on hot paths and are meant
-/// to be process-stable; this one is read once per `to_gpu_anndata` (never in a
-/// loop), and caching it would silently pin whichever value the first call in
-/// the process happened to see — making the two tests that exercise the on and
-/// off states order-dependent, and `monkeypatch.setenv` a no-op.
-#[cfg(feature = "gpu")]
-fn force_device_decode_failure(
-) -> Option<Result<(scx_accel::GpuCsr, scx_accel::DeviceDecodeStats), scx_accel::GpuError>> {
-    match std::env::var("SCX_FORCE_DEVICE_DECODE_FAILURE").as_deref() {
-        Ok("1") => Some(Err(scx_accel::GpuError::ModuleLoadError(
-            "forced by SCX_FORCE_DEVICE_DECODE_FAILURE=1".to_string(),
-        ))),
-        _ => None,
-    }
-}
-
-/// Announce that `to_gpu_anndata` reached the device the slow way because the
-/// fast way failed.
-///
-/// Always visible, and not one-shot-suppressed: a device decode that stopped
-/// working is a real problem — a broken build, a driver mismatch — and the only
-/// other trace of it is a `fallback_reason` nobody thinks to read when the call
-/// appeared to succeed. Once per call is the right frequency for an op a user
-/// invokes deliberately, not in a loop.
-///
-/// **Called only after the host route has actually produced the result.** The
-/// message is in the past tense and asserts the result is correct; emitting it
-/// at the point of failure would hand that reassurance to a caller who is about
-/// to receive an exception instead. Takes the error's text rather than the error
-/// itself, since by then the `GpuError` is long out of scope.
-#[cfg(feature = "gpu")]
-fn warn_device_decode_fallback(py: Python<'_>, e: &str) {
-    let msg = format!(
-        "to_gpu_anndata: the in-VRAM shard decode failed ({e}); assembled X on the host and \
-         uploaded it instead. The result is correct but the fast path did not run — \
-         uns[\"scx_accel\"][\"to_gpu_anndata\"] records transfer_mode=\"scx_device_handoff\" \
-         with fallback_reason=\"gpu_runtime_error\"."
-    );
-    if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
-        let _ = warnings.call_method1(
-            "warn",
-            (msg, py.get_type::<pyo3::exceptions::PyUserWarning>()),
-        );
-    }
-}
-
-/// Phase 5b: open a fresh `BackedCsrReader` for the requested modality
-/// from a file path. `modality = None` → modality_id 0 (the unimodal /
-/// global X) on non-multimodal files; on multimodal files we require an
-/// explicit modality unless there is exactly one.
-fn open_backed_csr(
-    path: &PathBuf,
-    modality: Option<&str>,
-    cache_shards: usize,
-) -> PyResult<BackedCsrReader> {
-    let opened = crate::open_handle_reader(path).map_err(to_pyerr)?;
-    if !opened.is_multimodal() {
-        return Ok(BackedCsrReader::new(opened, cache_shards));
-    }
-    let modality_id = match modality {
-        Some(name) => opened.modality_id(name).ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{name}'"))
-        })?,
-        None => {
-            let names = opened.modality_names();
-            if names.len() == 1 {
-                opened.modality_id(names[0]).unwrap_or(1)
-            } else {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "file is multimodal with {} modalities; pass modality=... \
-                     (one of {:?})",
-                    names.len(),
-                    names
-                )));
-            }
-        }
-    };
-    Ok(BackedCsrReader::for_modality(
-        opened,
-        modality_id,
-        cache_shards,
-    ))
-}
-
-/// Resolve a gene name against the appropriate modality's `var`.
-fn resolve_gene_name(reader: &ScxReader, modality: Option<&str>, name: &str) -> PyResult<u32> {
-    use scx_format_io::SectionType;
-    let modality_id = if reader.is_multimodal() {
-        match modality {
-            Some(m) => reader.modality_id(m).ok_or_else(|| {
-                pyo3::exceptions::PyKeyError::new_err(format!("unknown modality '{m}'"))
-            })?,
-            None => {
-                let names = reader.modality_names();
-                if names.len() == 1 {
-                    reader.modality_id(names[0]).unwrap_or(1)
-                } else {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "file is multimodal; pass modality=... to resolve gene name",
-                    ));
-                }
-            }
-        }
-    } else {
-        0
-    };
-    let var_section_name = if modality_id == 0 {
-        "var".to_string()
-    } else {
-        match reader.modality_info(modality_id) {
-            Some(info) => format!("var/{}", info.name),
-            None => "var".to_string(),
-        }
-    };
-    let entry = reader
-        .catalog()
-        .entries
-        .iter()
-        .find(|e| e.section_type == SectionType::VarMetadata && e.name == var_section_name)
-        .ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err(format!(
-                "var section '{var_section_name}' not found"
-            ))
-        })?;
-    let bytes = reader.section_bytes(entry).map_err(to_pyerr)?;
-    let cursor = std::io::Cursor::new(bytes);
-    let mut arrow_reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    let batch = arrow_reader
-        .next()
-        .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("var record batch is empty"))?
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    // Probe column order:
-    //   1. Columns named in the Arrow IPC `pandas` schema metadata's
-    //      `index_columns` array (the authoritative source from
-    //      `Table.from_pandas`, including named indexes like
-    //      `var.index.name = "gene_symbols"`).
-    //   2. `__index_level_0__` — the canonical pyarrow name for an
-    //      unnamed pandas index.
-    //   3. The original heuristic list, kept so any files that pre-date
-    //      pandas-metadata-aware writes still resolve.
-    lookup_gene_in_batch(&batch, name).ok_or_else(|| {
-        pyo3::exceptions::PyKeyError::new_err(format!("gene name '{name}' not found in var index"))
-    })
-}
-
-/// Resolve a single gene name to its row index within a `var`
-/// `RecordBatch`, probing the pandas index column(s) first and then a
-/// fallback list of conventional gene-id column names. Shared by the
-/// local `resolve_gene_name` and the cloud `read_cloud` paths.
-pub(crate) fn lookup_gene_in_batch(
-    batch: &arrow::record_batch::RecordBatch,
-    name: &str,
-) -> Option<u32> {
-    let pandas_index_cols = scx_format_io::pandas_index_columns(batch.schema().as_ref());
-    let fallback_columns = [
-        "__index_level_0__",
-        "_index",
-        "gene_name",
-        "feature_name",
-        "gene_id",
-        "name",
-    ];
-    let probe = pandas_index_cols
-        .iter()
-        .map(String::as_str)
-        .chain(fallback_columns.iter().copied());
-    for col_name in probe {
-        if let Some(idx) = lookup_string_in_column(batch, col_name, name) {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-/// Scan a single string column of a `RecordBatch` for an exact match
-/// and return the row index. Handles both `Utf8` (`StringArray`) and
-/// `LargeUtf8` (`LargeStringArray`). Returns `None` when the column
-/// is absent, has a non-string dtype, or contains no match.
-fn lookup_string_in_column(
-    batch: &arrow::record_batch::RecordBatch,
-    col_name: &str,
-    target: &str,
-) -> Option<u32> {
-    let (idx, _) = batch.schema().column_with_name(col_name)?;
-    let col = batch.column(idx);
-    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
-        for i in 0..arr.len() {
-            if !arr.is_null(i) && arr.value(i) == target {
-                return Some(i as u32);
-            }
-        }
-    }
-    if let Some(arr) = col
-        .as_any()
-        .downcast_ref::<arrow::array::LargeStringArray>()
-    {
-        for i in 0..arr.len() {
-            if !arr.is_null(i) && arr.value(i) == target {
-                return Some(i as u32);
-            }
-        }
-    }
-    None
-}
-
-/// Field names of an Arrow schema, dropping the pandas index column(s)
-/// so the result mirrors `adata.obs.columns` / `adata.var.columns`
-/// rather than including the `_index` / `__index_level_0__` field.
-pub(crate) fn schema_data_columns(schema: Option<arrow::datatypes::Schema>) -> Vec<String> {
-    let Some(schema) = schema else {
-        return Vec::new();
-    };
-    let index_cols = scx_format_io::pandas_index_columns(&schema);
-    schema
-        .fields()
-        .iter()
-        .map(|f| f.name().to_string())
-        .filter(|name| {
-            !index_cols.contains(name) && name != "__index_level_0__" && name != "_index"
-        })
-        .collect()
-}
-
-/// Render the AnnData-style `repr` lines shared by `Experiment` and
-/// `CloudExperiment`: a header line plus one indented line per non-empty
-/// metadata group (`obs: 'a', 'b'`). Mirrors `anndata.AnnData.__repr__`.
-pub(crate) fn format_anndata_repr(
-    kind: &str,
-    n_obs: u64,
-    n_vars: u64,
-    groups: &[(&str, Vec<String>)],
-) -> String {
-    let mut out = format!("{kind} object with n_obs × n_vars = {n_obs} × {n_vars}");
-    for (label, keys) in groups {
-        if keys.is_empty() {
-            continue;
-        }
-        let joined = keys
-            .iter()
-            .map(|k| format!("'{k}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("\n    {label}: {joined}"));
-    }
-    out
 }
 
 impl PyExperiment {
@@ -1210,123 +910,26 @@ impl PyExperiment {
         index_dtype: Option<&str>,
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-        // F3: resolve the container/dtype materialization plan. The default
-        // (csr / f32 / i32) keeps the exact zero-copy path; any non-default plan
-        // triggers a post-assembly retype of X (and layers).
-        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
-        // F3 Phase 1: dtype/container materialization applies to the eager
-        // (in-memory) path only. Backed X is a lazy dataset and the device path
-        // stays f32-native for now — reject a non-default plan loudly rather
-        // than silently ignoring it.
-        if !plan.is_default_csr_f32() && backed {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "container / data_dtype / index_dtype are only supported with backed=False \
-                 (eager materialization); backed reads produce a lazy f32 dataset",
-            ));
-        }
-        if let Some(name) = modality.as_deref() {
-            if !backed {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "to_anndata(modality=...) currently requires backed=True; \
-                     use to_mudata() for eager multimodal extraction",
-                ));
-            }
-            if var_names.is_some() || obs_filter.is_some() || layers.is_some() || obsm.is_some() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "to_anndata(modality=..., backed=True) does not support \
-                     var_names / obs_filter / layers / obsm; use \
-                     `scx subset --modality NAME --filter ...` to materialise \
-                     a filtered single-modality file first",
-                ));
-            }
-            return convert::to_anndata_backed_for_modality(py, &self.path, name, cache_shards);
-        }
-        // NOTE: backed reads are *not* gated for the u32→f32 decode loss.
-        // A backed AnnData decodes lazily per-slice, so a whole-catalog check
-        // here would spuriously error on a partial read that never touches the
-        // big-value shard. Gating the lazy-slice decode in the backed sparse
-        // dataset is a deferred follow-up.
-        if backed {
-            convert::to_anndata_backed(
-                py,
-                &self.path,
-                cache_shards,
-                var_names.as_deref(),
-                obs_filter,
-                layers.as_deref(),
-                obsm.as_deref(),
-                eager,
-                preserve_var_order,
-                strict_var_names,
-            )
-        } else {
-            let adata = convert::to_anndata_filtered(
-                py,
-                &self.path,
-                self.reader()?,
-                var_names.as_deref(),
-                obs_filter,
-                layers.as_deref(),
-                obsm.as_deref(),
-                preserve_slots,
-                eager,
-                memory_budget_bytes,
-                false,
-                preserve_var_order,
-                strict_var_names,
-                &plan,
-            )?;
-            // F10: a materialized (in-memory CSR) AnnData drops the on-disk CSC
-            // sidecar, so a later GPU DE call silently falls back to the slower
-            // gpu_csr_v3 route. Stamp a hint when the source file has a sidecar so
-            // the DE op can point the user at `to_anndata(backed=True)` (which
-            // preserves the sidecar and engages gpu_csc_v3). See
-            // `accel::route::warn_materialized_csc_sidecar`.
-            //
-            // Authoritative for the file just opened: set the hint when this file
-            // has a sidecar, and *remove* any stale flag inherited from a prior
-            // round-trip when it does not — so a sidecar-less file can never carry
-            // a leftover `True` that would trigger a misleading warning.
-            let uns = adata.getattr("uns")?;
-            if self.has_csc()? {
-                uns.set_item("scx_source_has_csc_sidecar", true)?;
-            } else if uns.contains("scx_source_has_csc_sidecar").unwrap_or(false) {
-                let _ = uns.del_item("scx_source_has_csc_sidecar");
-            }
-
-            // X (and raw) now narrow **in-decode** inside
-            // `to_anndata_filtered` (the typed reader assembles directly at the
-            // target dtype — see `read_all_csr_shards_typed`), so no post-assembly
-            // X retype is needed. **Layers** still materialize to f32 and are
-            // narrowed here via `retype_matrix` (a DV-filtered typed layer reader
-            // is a Phase-5 follow-up). No-op for the default plan.
-            if !plan.is_default_csr_f32() {
-                // Layers go through f32 before this cast, so a layer count > 2²⁴
-                // cannot be delivered losslessly regardless of the requested
-                // dtype — fail loud here rather than silently round (the eager
-                // path guards the same value_max inside `to_anndata_with_layers`;
-                // this covers the non-eager narrow path, which materializes layers
-                // lazily via the retype loop below). Matches the X/raw fail-loud
-                // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
-                // layer reader.
-                convert::guard_decode_loss(
-                    self.reader()?.catalog().layer_csr_max_value(0, None),
-                    plan.allow_lossy,
-                )?;
-                let layers_obj = adata.getattr("layers")?;
-                let mut keys: Vec<String> = Vec::new();
-                for k in layers_obj.call_method0("keys")?.try_iter()? {
-                    keys.push(k?.extract()?);
-                }
-                for key in keys {
-                    let layer = layers_obj.get_item(&key)?;
-                    let new_layer = convert::retype_matrix(py, layer, &plan)?;
-                    layers_obj.set_item(&key, new_layer)?;
-                }
-            }
-            Ok(adata)
-        }
+        materialize::to_anndata_impl(
+            self,
+            py,
+            backed,
+            cache_shards,
+            var_names,
+            obs_filter,
+            layers,
+            preserve_slots,
+            modality,
+            eager,
+            memory_budget,
+            obsm,
+            preserve_var_order,
+            strict_var_names,
+            container,
+            data_dtype,
+            index_dtype,
+            allow_lossy,
+        )
     }
 
     /// Return a **GPU-resident** AnnData whose `X` is a
@@ -1388,412 +991,19 @@ impl PyExperiment {
         }
         #[cfg(feature = "gpu")]
         {
-            use pyo3::exceptions::{PyRuntimeError, PyValueError};
-
-            // cuPy is the hard requirement — the returned X is cupyx-sparse.
-            let cupy_version = crate::accel::gpu::cupy_info(py).ok_or_else(|| {
-                PyRuntimeError::new_err(
-                    "to_gpu_anndata requires cuPy (cupyx.scipy.sparse). Install the rapids \
-                     analysis backend — see docs/gpu-setup.md.",
-                )
-            })?;
-            // Resolve to a concrete GPU ordinal; reject device="cpu".
-            let resolved = crate::accel::gpu::resolve_device(device)?;
-            let gpu_id = resolved.gpu_id().ok_or_else(|| {
-                PyValueError::new_err(
-                    "to_gpu_anndata requires a GPU device ('gpu', 'gpu:N', or 'auto' on a GPU host)",
-                )
-            })?;
-
-            let dev = scx_accel::GpuDevice::new(gpu_id)
-                .map_err(|e| PyRuntimeError::new_err(format!("GPU device {gpu_id}: {e}")))?;
-            const HEADROOM: f64 = 1.2;
-            let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
-
-            // Fast path: a full-matrix handoff with no row/column reshaping decodes
-            // X straight onto the device (no host scipy CSR, no re-upload — the
-            // decode→host→re-upload trip Phase 0.2 measured as ~92% of census_1m
-            // PCA wall). Any var_names / obs_filter / layer projection, a deletion
-            // vector, or a multimodal source falls back to the host-assemble path
-            // below — on-device filtered decode is Phase 4 format work.
-            let n_csr_shards = self.reader()?.csr_shard_count_for(0) as usize;
-            let fast_path = var_names.is_none()
-                && obs_filter.is_none()
-                && layers.is_none()
-                && !self.reader()?.is_multimodal()
-                && !self.reader()?.header().has_deletion_vectors()
-                && n_csr_shards > 0;
-
-            // Set when the in-VRAM decode failed on the device and the
-            // host-assemble path below is being asked to produce the result
-            // instead — recorded as `fallback_reason` so a degraded handoff is
-            // distinguishable from host-assemble chosen up front for a filtered
-            // request. Holds the device error's text so the warning, which
-            // fires only once the fallback has actually worked, can still name
-            // what failed.
-            let mut device_decode_error: Option<String> = None;
-
-            // Yields the decoded CSR rather than a finished handoff: adopting
-            // it consumes `dev`, and `dev` must survive for the host-assemble
-            // arm below. Moving the adopt into the `match` puts the move in one
-            // arm of two exclusive branches, which is what lets the borrow
-            // checker see that only one of them takes the device.
-            #[allow(clippy::type_complexity)]
-            let fast: Option<(
-                Bound<'py, PyAny>,
-                usize,
-                scx_accel::GpuCsr,
-                scx_accel::DeviceDecodeStats,
-            )> = if fast_path {
-                'fast: {
-                    // X-less skeleton (obs / var / obsm / uns / layers assembled eagerly;
-                    // X is assigned after the device decode below).
-                    let adata = convert::to_anndata_filtered(
-                        py,
-                        &self.path,
-                        self.reader()?,
-                        None,
-                        None,
-                        None,
-                        obsm.as_deref(),
-                        false, // preserve_slots
-                        true,  // eager
-                        memory_budget_bytes,
-                        true,  // skip_x
-                        false, // preserve_var_order (fast path: var_names is None)
-                        false, // strict_var_names (no names to check)
-                        &plan, // default plan (non-default rejected above); GPU X is f32-native
-                    )?;
-
-                    // Raw shard bytes (borrow the reader's mmap) + a cheap header
-                    // pre-scan for the VRAM gate and the honest HtoD byte count.
-                    let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n_csr_shards);
-                    let mut total_rows: usize = 0;
-                    let mut total_nnz: usize = 0;
-                    // Phase-2.x batched-nvcomp VRAM accounting: whether every shard is
-                    // framed ShufDeltaZstd-integer (batched path eligible) + the total
-                    // compressed idx/val bytes and the max index/value width — used to
-                    // size the all-shards-decompressed transient below.
-                    let mut all_framed_shufdelta_int = true;
-                    let mut total_compressed_bytes: u64 = 0;
-                    let mut max_index_width: u64 = 2;
-                    let mut max_value_width: u64 = 1;
-                    for i in 0..n_csr_shards {
-                        let bytes =
-                            self.reader()?
-                                .read_raw_csr_shard_bytes_for(0, i)
-                                .map_err(|e| {
-                                    PyRuntimeError::new_err(format!("read CSR shard {i}: {e}"))
-                                })?;
-                        let header = scx_format_io::shard::ShardHeader::read_from(
-                            &mut std::io::Cursor::new(bytes),
-                        )
-                        .map_err(|e| PyRuntimeError::new_err(format!("shard {i} header: {e}")))?;
-                        total_rows += header.n_major as usize;
-                        total_nnz += header.nnz as usize;
-                        let framed = header.shard_format_version
-                            > scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION;
-                        let is_shufdelta = matches!(
-                            scx_codec::CodecId::from_u8(header.codec_id),
-                            Some(scx_codec::CodecId::ShufDeltaZstd)
-                        );
-                        let is_integer = scx_codec::ValueEncoding::from_u8(header.value_encoding)
-                            .map(|v| v.is_integer())
-                            .unwrap_or(false);
-                        all_framed_shufdelta_int &= framed && is_shufdelta && is_integer;
-                        total_compressed_bytes +=
-                            header.indices_length as u64 + header.values_length as u64;
-                        let iw = if header.index_dtype == 0 { 2u64 } else { 4 };
-                        max_index_width = max_index_width.max(iw);
-                        if let Some(ve) = scx_codec::ValueEncoding::from_u8(header.value_encoding) {
-                            max_value_width = max_value_width.max(ve.byte_width() as u64);
-                        }
-                        shard_refs.push(bytes);
-                    }
-
-                    let n_cols: usize = adata.getattr("n_vars")?.extract()?;
-                    if n_cols > i32::MAX as usize {
-                        return Err(PyValueError::new_err(format!(
-                        "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
-                         the cupyx CSR handoff requires i32 indices."
-                    )));
-                    }
-
-                    // ≤VRAM pre-flight on the device-resident CSR size (HEADROOM covers
-                    // the transient single-shard decode buffer during concat).
-                    let csr_bytes = (total_nnz as u64) * 8 + (total_rows as u64 + 1) * 8;
-                    // The Phase-2.x batched nvcomp path (2x-e) holds three buffers at
-                    // peak: the compressed blob (all shards' idx+val frames), the
-                    // decompressed plane buffers (nnz × index_width + nnz × value_width),
-                    // and the final CSR — vs the per-shard path's CSR + one shard's
-                    // transient. Size the gate on that transient when the batched path
-                    // will actually run so a card that fits the CSR but not the transient
-                    // is rejected up front rather than OOMing mid-decode.
-                    let no_batch = std::env::var("SCX_NVCOMP_NO_BATCH")
-                        .map(|v| v == "1")
-                        .unwrap_or(false);
-                    let device_bytes =
-                        if all_framed_shufdelta_int && !no_batch && scx_accel::nvcomp_enabled() {
-                            let plane_bytes = (total_nnz as u64) * max_index_width
-                                + (total_nnz as u64) * max_value_width;
-                            csr_bytes + total_compressed_bytes + plane_bytes
-                        } else {
-                            // Per-shard fallback (mixed-codec / Scx1 / float, or the
-                            // batched path forced off): the nvcomp/pipeline transient is
-                            // bounded by a *single* shard's compressed + plane buffers
-                            // (one shard is decoded then dropped before the next), which
-                            // HEADROOM's 20% slack on the full CSR comfortably absorbs.
-                            csr_bytes
-                        };
-                    let (free, total) = dev
-                        .free_memory()
-                        .map_err(|e| PyRuntimeError::new_err(format!("query free VRAM: {e}")))?;
-                    if (device_bytes as f64) * HEADROOM > free as f64 {
-                        return Err(PyValueError::new_err(format!(
-                            "to_gpu_anndata needs ~{:.1} GB device memory for X ({} nnz) but only \
-                         {:.1} GB of {:.1} GB is free on GPU {}. This is the >VRAM regime: use a \
-                         backed/streaming workflow (open(...).to_anndata(backed=True) + \
-                         pyscx.accel.*), not to_gpu_anndata.",
-                            device_bytes as f64 / 1e9,
-                            total_nnz,
-                            free as f64 / 1e9,
-                            total as f64 / 1e9,
-                            gpu_id,
-                        )));
-                    }
-
-                    let decoded = force_device_decode_failure().unwrap_or_else(|| {
-                        scx_accel::decode_csr_shards_to_device_with_stats(&dev, &shard_refs)
-                    });
-                    let (gpu_csr, decode_stats) = match decoded {
-                        Ok(v) => v,
-                        // §8.10: the device could not assemble the CSR, but the
-                        // host-assemble path below reaches the same cupy `X` by a
-                        // different road. Take it rather than failing the call —
-                        // the realistic trigger is a module that will not load
-                        // (a stub-PTX build), which host-assemble does not touch.
-                        //
-                        // `alternate_route_may_succeed` is what excludes an
-                        // out-of-memory failure (both roads end with the same
-                        // CSR in the same VRAM) and an input defect (the host
-                        // decode rejects the same shard). See its doc.
-                        Err(e) if e.alternate_route_may_succeed() => {
-                            // Deliberately does NOT warn here. The warning says
-                            // the result was assembled on the host and is
-                            // correct; the host route has not run yet, and if it
-                            // fails the caller would get that reassurance
-                            // followed by an exception. Recorded now, announced
-                            // after it is true.
-                            device_decode_error = Some(e.to_string());
-                            // The partial device buffers are dropped by now, but
-                            // cudarc frees into a memory pool that keeps them
-                            // charged to the process until trimmed — and the
-                            // host-assemble arm's first act is a free-VRAM
-                            // pre-flight, which would otherwise pay for memory
-                            // nothing holds. Best-effort: a failing trim must not
-                            // replace the fallback with an error.
-                            let _ = dev.reclaim_memory_pool();
-                            break 'fast None;
-                        }
-                        // An out-of-memory failure is *not* worth retrying: both
-                        // arms end with the same CSR resident on the device, so
-                        // host-assemble cannot conjure the VRAM — it would pay a
-                        // full host materialization to fail again, and with a worse
-                        // message than this one.
-                        //
-                        // "With a worse message" is only true if this one carries
-                        // the remedy, so an OOM here gets the same `>VRAM`
-                        // guidance the up-front gate gives. It is appended only
-                        // for an OOM: the same arm also catches malformed shards
-                        // and unsupported layouts, where "use a backed workflow"
-                        // would be advice for a problem the caller does not have.
-                        Err(e) => {
-                            let remedy = if matches!(e, scx_accel::GpuError::OutOfMemory(_)) {
-                                " — this is the >VRAM regime: use a backed/streaming \
-                                 workflow (open(...).to_anndata(backed=True) + \
-                                 pyscx.accel.*), not to_gpu_anndata"
-                            } else {
-                                ""
-                            };
-                            return Err(PyRuntimeError::new_err(format!(
-                                "GPU shard assembly failed: {e}{remedy}"
-                            )));
-                        }
-                    };
-                    Some((adata, n_cols, gpu_csr, decode_stats))
-                }
-            } else {
-                None
-            };
-
-            let (adata, holder, n_rows, n_cols, bytes_uploaded, transfer_mode, n_shufdelta_gpu) =
-                match fast {
-                    Some((adata, n_cols, gpu_csr, decode_stats)) => {
-                        let n_rows = gpu_csr.shape().0;
-                        let holder = crate::accel::gpu_handoff::adopt_device_csr(dev, gpu_csr)?;
-                        // Honest transfer mode: a genuine fully-in-VRAM Scx1 decode (only the
-                        // tiny indptr uploaded — framed Scx1 shards decode group-by-group in
-                        // VRAM) vs a path where some shard bounced through the host because it
-                        // is a non-Scx1 codec. `bytes_uploaded` is the real HtoD total from
-                        // the decode, not a header estimate.
-                        let transfer_mode = if decode_stats.fully_device_decoded {
-                            "scx_device_decode_gpu"
-                        } else {
-                            "scx_device_handoff_streamed"
-                        };
-                        (
-                            adata,
-                            holder,
-                            n_rows,
-                            n_cols,
-                            decode_stats.host_uploaded_bytes,
-                            transfer_mode,
-                            Some(decode_stats.n_shards_shufdelta_gpu),
-                        )
-                    }
-                    None => {
-                        // Host-assemble fallback (filtered / projected / multimodal inputs):
-                        // the full option surface via the eager path, then a single HtoD.
-                        let adata = convert::to_anndata_filtered(
-                            py,
-                            &self.path,
-                            self.reader()?,
-                            var_names.as_deref(),
-                            obs_filter,
-                            layers.as_deref(),
-                            obsm.as_deref(),
-                            false, // preserve_slots
-                            true,  // eager
-                            memory_budget_bytes,
-                            false, // skip_x
-                            preserve_var_order,
-                            strict_var_names,
-                            &plan, // default plan (non-default rejected above); GPU X is f32-native
-                        )?;
-
-                        // Pull X's CSR arrays. scipy may store indptr/indices as int32 when
-                        // they fit, so coerce to the GpuCsr layout (f32 data / i32 indices /
-                        // i64 indptr) via astype(copy=False) — a no-op when already correct.
-                        let np = crate::pyimport::import_module(py, "numpy")?;
-                        let f32_ty = np.getattr("float32")?;
-                        let i32_ty = np.getattr("int32")?;
-                        let i64_ty = np.getattr("int64")?;
-                        let x = adata.getattr("X")?;
-                        let (n_rows, n_cols): (usize, usize) = x.getattr("shape")?.extract()?;
-                        if n_cols > i32::MAX as usize {
-                            return Err(PyValueError::new_err(format!(
-                        "to_gpu_anndata: n_cols ({n_cols}) exceeds the i32 column-index range; \
-                         the cupyx CSR handoff requires i32 indices."
-                    )));
-                        }
-                        let astype = |arr: Bound<'py, PyAny>,
-                                      ty: &Bound<'py, PyAny>|
-                         -> PyResult<Bound<'py, PyAny>> {
-                            let kw = pyo3::types::PyDict::new(py);
-                            kw.set_item("copy", false)?;
-                            arr.call_method("astype", (ty,), Some(&kw))
-                        };
-                        let data_arr = astype(x.getattr("data")?, &f32_ty)?;
-                        let indices_arr = astype(x.getattr("indices")?, &i32_ty)?;
-                        let indptr_arr = astype(x.getattr("indptr")?, &i64_ty)?;
-                        let data: Vec<f32> = data_arr
-                            .extract::<PyReadonlyArray1<f32>>()?
-                            .as_slice()?
-                            .to_vec();
-                        let indices: Vec<i32> = indices_arr
-                            .extract::<PyReadonlyArray1<i32>>()?
-                            .as_slice()?
-                            .to_vec();
-                        let indptr: Vec<i64> = indptr_arr
-                            .extract::<PyReadonlyArray1<i64>>()?
-                            .as_slice()?
-                            .to_vec();
-
-                        let bytes_uploaded = (data.len() as u64) * 4
-                            + (indices.len() as u64) * 4
-                            + (indptr.len() as u64) * 8;
-                        let (free, total) = dev.free_memory().map_err(|e| {
-                            PyRuntimeError::new_err(format!("query free VRAM: {e}"))
-                        })?;
-                        if (bytes_uploaded as f64) * HEADROOM > free as f64 {
-                            return Err(PyValueError::new_err(format!(
-                        "to_gpu_anndata needs ~{:.1} GB device memory for X ({} nnz) but only \
-                         {:.1} GB of {:.1} GB is free on GPU {}. This is the >VRAM regime: use a \
-                         backed/streaming workflow (open(...).to_anndata(backed=True) + \
-                         pyscx.accel.*), not to_gpu_anndata.",
-                        bytes_uploaded as f64 / 1e9,
-                        indices.len(),
-                        free as f64 / 1e9,
-                        total as f64 / 1e9,
-                        gpu_id,
-                    )));
-                        }
-
-                        let holder = crate::accel::gpu_handoff::upload_host_csr(
-                            dev, &indptr, &indices, &data, n_rows, n_cols,
-                        )?;
-                        (
-                            adata,
-                            holder,
-                            n_rows,
-                            n_cols,
-                            bytes_uploaded,
-                            "scx_device_handoff",
-                            None,
-                        )
-                    }
-                };
-
-            // Adopt the device buffers into a cupyx CSR and assign as X.
-            let holder = Bound::new(py, holder)?;
-            let cupy = crate::pyimport::import_module(py, "cupy")?;
-            let cupyx_sparse = crate::pyimport::import_module(py, "cupyx.scipy.sparse")?;
-            let adopt = |method: &str| -> PyResult<Bound<'py, PyAny>> {
-                // cupy.asarray adopts the CAI view without copy and sets .base to
-                // it, transitively keeping `holder` (and its device memory) alive.
-                cupy.call_method1("asarray", (holder.call_method0(method)?,))
-            };
-            let data_cp = adopt("data")?;
-            let indices_cp = adopt("indices")?;
-            let indptr_cp = adopt("indptr")?;
-            let kwargs = pyo3::types::PyDict::new(py);
-            kwargs.set_item("shape", (n_rows, n_cols))?;
-            kwargs.set_item("copy", false)?;
-            let gpu_x = cupyx_sparse.call_method(
-                "csr_matrix",
-                ((data_cp, indices_cp, indptr_cp),),
-                Some(&kwargs),
-            )?;
-            adata.setattr("X", gpu_x)?;
-
-            // Honest device-handoff metadata. `transfer_mode` alone cannot say
-            // *why* a host-assembled handoff happened — the request needing a
-            // filter and the device decode having failed produce the same
-            // string — so the reason carries that distinction.
-            let mut info = scx_accel::route::AccelExecutionInfo::new(
-                scx_accel::route::AccelRoute::GpuCsr,
-                if device_decode_error.is_some() {
-                    scx_accel::route::FallbackReason::GpuRuntimeError
-                } else {
-                    scx_accel::route::FallbackReason::None
-                },
-            );
-            info.transfer_mode = Some(transfer_mode);
-            info.device_id = Some(gpu_id);
-            info.bytes_uploaded = Some(bytes_uploaded);
-            info.cupy_version = Some(cupy_version);
-            info.n_shards_shufdelta_gpu = n_shufdelta_gpu;
-            crate::accel::route::write_accel_route(py, &adata, "to_gpu_anndata", &info)?;
-
-            // Announce the degraded path only now — every step it claims
-            // succeeded (host assembly, its own VRAM gate, the upload, the cuPy
-            // adoption, the stamp) is behind us, so the past tense is true and
-            // the route it points the reader at exists to be read.
-            if let Some(err) = device_decode_error {
-                warn_device_decode_fallback(py, &err);
-            }
-
-            Ok(adata)
+            gpu_anndata::to_gpu_anndata_impl(
+                self,
+                py,
+                var_names,
+                obs_filter,
+                layers,
+                obsm,
+                device,
+                memory_budget,
+                preserve_var_order,
+                strict_var_names,
+                &plan,
+            )
         }
         #[cfg(not(feature = "gpu"))]
         {
@@ -1817,9 +1027,9 @@ impl PyExperiment {
     /// Validate section checksums (and, with `deep`, decode-level integrity).
     ///
     /// With `deep=True`, additionally decodes every sparse shard to verify the
-    /// v3 canonical CSR invariant and verifies every decode sidecar; results
-    /// are appended with `canonical-csr `/`decode-sidecar ` prefixed names.
-    /// Mirrors `scx validate --deep`.
+    /// v3 canonical CSR invariant; results are appended with `canonical-csr `
+    /// prefixed names. Mirrors `scx validate --deep`. (The decode-sidecar
+    /// representation was removed, so there is no sidecar check.)
     ///
     /// Returns a list of (section_name, passed) tuples.
     #[pyo3(signature = (deep=false))]
@@ -1972,23 +1182,7 @@ impl PyExperiment {
         axis: &str,
         modality: Option<&str>,
     ) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        if axis != "var" {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "detection_counts: only axis='var' is supported (got '{axis}')"
-            )));
-        }
-        // Re-opens from `self.path`, and a fresh reader is fresh by definition
-        // — so without this the handle would answer here while refusing
-        // everywhere else. Gate on *this* handle's view first.
-        self.reader()?;
-        let backed = open_backed_csr(&self.path, modality, 4)?;
-        let counts: Vec<i64> = py
-            .detach(|| backed.gene_detection_counts())
-            .map_err(to_pyerr)?
-            .into_iter()
-            .map(|c| c as i64)
-            .collect();
-        Ok(PyArray1::from_vec(py, counts))
+        materialize::detection_counts_impl(self, py, axis, modality)
     }
 
     /// Phase 5b: global row indices of cells expressing the given gene.
@@ -2003,27 +1197,7 @@ impl PyExperiment {
         gene: &Bound<'_, PyAny>,
         modality: Option<&str>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
-        // Re-opens from `self.path`, and a fresh reader is fresh by definition
-        // — so without this the handle would answer here while refusing
-        // everywhere else. Gate on *this* handle's view first.
-        self.reader()?;
-        let backed = open_backed_csr(&self.path, modality, 4)?;
-        // Resolve gene → gene_idx. Integer fast path; string falls
-        // through to a var.index lookup.
-        let gene_idx: u32 = if let Ok(idx) = gene.extract::<u32>() {
-            idx
-        } else {
-            let name: String = gene.extract().map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err(
-                    "gene must be an integer index or a string name",
-                )
-            })?;
-            resolve_gene_name(self.reader()?, modality, &name)?
-        };
-        let rows = py
-            .detach(|| backed.cells_expressing_gene(gene_idx))
-            .map_err(to_pyerr)?;
-        Ok(PyArray1::from_vec(py, rows))
+        materialize::cells_expressing_impl(self, py, gene, modality)
     }
 
     /// Gather specific rows as a sparse `scipy.sparse.csr_matrix`, in the
@@ -2056,59 +1230,7 @@ impl PyExperiment {
         modality: Option<&str>,
         cache_shards: usize,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Snapshot the row ids while the GIL is held. A `PyReadonlyArray`
-        // borrow is not GIL-bound and does not clear numpy's WRITEABLE flag,
-        // so reading it inside the `py.detach` below would race any other
-        // Python thread that touches the caller's array — and would defeat
-        // the bounds check two statements down, which is the whole reason
-        // this method can promise an `IndexError`.
-        let rows: Vec<u64> = rows.as_slice()?.to_vec();
-        let n_rows = rows.len();
-        // Re-opens from `self.path`, and a fresh reader is fresh by definition
-        // — so without this the handle would answer here while refusing
-        // everywhere else. Gate on *this* handle's view first.
-        self.reader()?;
-        let backed = open_backed_csr(&self.path, modality, cache_shards)?;
-        let n_vars = backed.n_vars();
-        let n_obs = backed.n_obs() as u64;
-
-        // Bounds-check up front so out-of-range ids surface as a clean
-        // IndexError rather than a generic read error from the gather loop.
-        if let Some(&bad) = rows.iter().find(|&&r| r >= n_obs) {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "row index {bad} out of range for {n_obs} cells"
-            )));
-        }
-
-        // Scatter each row's CSR into its request position (GIL released).
-        let mut per_row: Vec<Option<(Vec<i32>, Vec<f32>)>> = (0..n_rows).map(|_| None).collect();
-        py.detach(|| {
-            backed.read_rows_with(&rows, |orig_pos, indices, data| {
-                per_row[orig_pos] = Some((indices.to_vec(), data.to_vec()));
-                Ok(())
-            })
-        })
-        .map_err(to_pyerr)?;
-
-        // Assemble the CSR in request order.
-        let nnz: usize = per_row
-            .iter()
-            .map(|r| r.as_ref().map_or(0, |(idx, _)| idx.len()))
-            .sum();
-        let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
-        indptr.push(0);
-        let mut indices: Vec<i32> = Vec::with_capacity(nnz);
-        let mut data: Vec<f32> = Vec::with_capacity(nnz);
-        for row in &per_row {
-            if let Some((idx, val)) = row {
-                indices.extend_from_slice(idx);
-                data.extend_from_slice(val);
-            }
-            indptr.push(indices.len() as i64);
-        }
-
-        let csr = scx_sparse::ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
-        convert::csr_to_scipy(py, csr)
+        materialize::gather_rows_sparse_impl(self, py, rows, modality, cache_shards)
     }
 
     /// Never raises. A repr that throws turns every later traceback into a
@@ -2147,128 +1269,6 @@ impl PyExperiment {
                 ("varm", self.varm_keys().unwrap_or_default()),
                 ("layers", self.layer_names().unwrap_or_default()),
             ],
-        )
-    }
-}
-
-/// The one-clause "why" out of a `FileChangedOnDisk`, for the repr.
-///
-/// The full message ends with the how-to-recover sentence, which is right for
-/// an exception and noise inside `<Experiment '…' [stale: …]>`.
-fn stale_repr_detail(e: &scx_format_io::ScxError) -> String {
-    match e {
-        scx_format_io::ScxError::FileChangedOnDisk { detail, .. } => detail.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// Map an `scx_engine::EngineError` to the right Python exception for the
-/// grouped-read API: unknown label → `KeyError` (with close matches in the
-/// message), not-grouped → `ValueError`, everything else → `RuntimeError`.
-pub(crate) fn engine_to_pyerr(e: scx_engine::EngineError) -> PyErr {
-    use scx_engine::EngineError as E;
-    match e {
-        E::UnknownGroupLabel { .. } => pyo3::exceptions::PyKeyError::new_err(e.to_string()),
-        E::NotGrouped => pyo3::exceptions::PyValueError::new_err(e.to_string()),
-        other => pyo3::exceptions::PyRuntimeError::new_err(other.to_string()),
-    }
-}
-
-/// F2: a non-reference shard's grouped contents, with deferred I/O.
-///
-/// Holds a shared `Arc<QueryPipeline>` (cloned from the parent `Experiment`), so
-/// streaming over `iter_group_shards()` opens/parses the file once rather than
-/// re-opening per shard.
-#[pyclass(name = "GroupShard")]
-pub struct PyGroupShard {
-    pipeline: Arc<QueryPipeline>,
-    handle: scx_engine::GroupShardHandle,
-}
-
-impl PyGroupShard {
-    /// Construct from a shared pipeline + engine handle (Rust-only). Shared by
-    /// the local and cloud `iter_group_shards` surfaces.
-    pub(crate) fn new(pipeline: Arc<QueryPipeline>, handle: scx_engine::GroupShardHandle) -> Self {
-        Self { pipeline, handle }
-    }
-}
-
-#[pymethods]
-impl PyGroupShard {
-    /// This shard's index in the grouped layout.
-    #[getter]
-    fn shard_index(&self) -> u32 {
-        self.handle.shard_index
-    }
-
-    /// First global output row in this shard (inclusive).
-    #[getter]
-    fn global_start(&self) -> u64 {
-        self.handle.global_start
-    }
-
-    /// One past the last global output row in this shard (exclusive).
-    #[getter]
-    fn global_stop(&self) -> u64 {
-        self.handle.global_stop
-    }
-
-    /// Labels present in this shard.
-    #[getter]
-    fn labels(&self) -> Vec<String> {
-        self.handle
-            .groups
-            .iter()
-            .map(|(l, _, _)| l.clone())
-            .collect()
-    }
-
-    /// Per-label **shard-local** `(start, stop)` row ranges as a dict
-    /// `{label: (start, stop)}` (offsets relative to this shard's start).
-    #[getter]
-    fn groups(&self) -> std::collections::HashMap<String, (u64, u64)> {
-        self.handle
-            .groups
-            .iter()
-            .map(|(l, ls, le)| (l.clone(), (*ls, *le)))
-            .collect()
-    }
-
-    /// Read this shard's rows as an AnnData (deferred I/O — decodes only this
-    /// shard's range).
-    fn to_anndata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let pipeline = Arc::clone(&self.pipeline);
-        let (start, stop) = (self.handle.global_start, self.handle.global_stop);
-        let result = py
-            .detach(|| pipeline.read_row_range(start, stop))
-            .map_err(engine_to_pyerr)?;
-        crate::query::query_result_to_anndata(py, result)
-    }
-
-    /// Read just the cells of `label` within this shard as an AnnData (deferred
-    /// I/O — decodes only the label's sub-range). Raises `KeyError` if the label
-    /// is not resident in this shard.
-    fn read_group<'py>(&self, py: Python<'py>, label: &str) -> PyResult<Bound<'py, PyAny>> {
-        let (start, stop) = self.handle.range(label).ok_or_else(|| {
-            pyo3::exceptions::PyKeyError::new_err(format!(
-                "label '{label}' is not in shard {}",
-                self.handle.shard_index
-            ))
-        })?;
-        let pipeline = Arc::clone(&self.pipeline);
-        let result = py
-            .detach(|| pipeline.read_row_range(start, stop))
-            .map_err(engine_to_pyerr)?;
-        crate::query::query_result_to_anndata(py, result)
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "GroupShard(shard_index={}, rows={}..{}, labels={})",
-            self.handle.shard_index,
-            self.handle.global_start,
-            self.handle.global_stop,
-            self.handle.groups.len()
         )
     }
 }
