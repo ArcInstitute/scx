@@ -154,13 +154,17 @@ Don't guess `cache_shards` — measure what your plans touch:
 
 ```python
 probe = pyscx.SparseCellSetDataset(paths)
-need = max(probe.suggested_cache_shards(fids, rows) for fids, rows, _, _ in plans[:64])
+need = max(probe.suggested_cache_shards(p) for p in plans[:64])
 ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
 ```
 
 `suggested_cache_shards` counts the distinct `(file_id, shard)` pairs a plan
-touches, from the catalog's shard row ranges — no I/O and no decode.
-`IndexPlanDataset.suggested_cache_shards(plan)` is the paired-plan equivalent.
+touches, from the catalog's shard row ranges — no I/O and no decode. Both
+plan-driven classes take **one plan**, in whatever shape that class's
+`iter_with_plans` consumes: `[(pert, ctrl), ...]` on `IndexPlanDataset`,
+`(file_ids, rows, role_tags, set_offsets)` here (the last two are ignored, since
+residency depends only on which rows of which files are read). So the line above
+is the same on both.
 
 Two things to know:
 
@@ -168,7 +172,9 @@ Two things to know:
   is a byte cap, and both are enforced. A file with large shards can want more
   bytes than the adaptive default affords (census_500k wants 31 shards while the
   4 GB adaptive cap holds 22), so `cache_shards=31` alone under-delivers.
-  `memory_budget()` reports `affordable_cache_shards` so you can see it.
+  `memory_budget()` reports `effective_cache_shards` so you can see it — the
+  same key `IndexPlanDataset` uses, and the same
+  `loader.effective_cache_shards()` behind both.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class
   defaults `scatter_block_index=False`, so a scattered gather decodes whole
   shards into the LRU and serves reuse from cache — sizing it correctly is worth
@@ -792,17 +798,19 @@ def __iter__(self):
         ds.close()
 ```
 
-Two differences worth knowing:
+One difference worth knowing:
 
 | | `TrainingDataset`, `MultimodalTrainingDataset` | `IndexPlanDataset`, `SparseCellSetDataset` |
 |---|---|---|
 | after `close()` | re-usable — the next `__iter__` rebuilds the pool and runtime | **terminal** — every method raises `RuntimeError`; construct a new dataset |
 | why | its pool and runtime are rebuilt per epoch anyway | the runtime is built exactly once, so a forked child can never inherit live tokio threads; that also means it cannot be rebuilt |
+| `closed` means | torn down right now; back to `False` after the next `__iter__` | closed for good |
 
-`repr()` never raises on any of them. The `closed` property exists on the two
-terminal classes only — `TrainingDataset` and `MultimodalTrainingDataset` have
-`close()` but no `closed`, because for them close is not a state change worth
-querying.
+`repr()` never raises on any of them, and neither does `closed`, which all four
+expose. It is deliberately not the same predicate on both halves: on the
+re-usable pair it answers "is this torn down right now", so
+`if not ds.closed: ds.close()` works everywhere while
+`assert ds.closed` after an epoch does not.
 
 Whichever object ends up holding the last reference does the teardown, and every
 one of them bounds it at 5 s and detaches the GIL first — the dataset's

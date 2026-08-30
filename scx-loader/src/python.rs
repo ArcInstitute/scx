@@ -1575,9 +1575,7 @@ impl Drop for IndexPlanDataset {
 type PlanExtract<T> = fn(&Bound<'_, PyAny>) -> std::result::Result<T, LoaderError>;
 
 /// `[(pert_row, ctrl_row), ...]` — the pair loader's plan.
-fn extract_pair_plan(
-    obj: &Bound<'_, PyAny>,
-) -> std::result::Result<Vec<(u64, u64)>, LoaderError> {
+fn extract_pair_plan(obj: &Bound<'_, PyAny>) -> std::result::Result<Vec<(u64, u64)>, LoaderError> {
     obj.extract::<Vec<(u64, u64)>>()
         .map_err(|e| LoaderError::ConfigError {
             reason: format!("plan extraction failed: {e}"),
@@ -2595,12 +2593,14 @@ impl SparseCellSetDataset {
     /// `full_shard_groups`, `block_index_groups`. All `int`; atomic, lock-free —
     /// sample as often as you like.
     ///
-    /// The last two are the **route** this dataset's gathers actually took.
-    /// They matter because this class still has no preflight warning (unlike
-    /// `IndexPlanDataset`), so `scatter_block_index=True` against a file with
-    /// no row-group-framed shards is a silent no-op:
+    /// The last two are the **route** this dataset's gathers actually took:
     /// `block_index_groups > 0` proves the row-group path ran, and
-    /// `full_shard_groups > 0` is the warm-into-the-LRU default.
+    /// `full_shard_groups > 0` is the warm-into-the-LRU default. Opening an
+    /// all-unframed set with `scatter_block_index=True` now warns at
+    /// construction (ORG-9.10-4), so these are a confirmation rather than the
+    /// only way to find out — but they stay the authority, because the warning
+    /// only reports that *some* file is framed, not that any gather took the
+    /// route.
     ///
     /// Since ORG-9.10-1 the prefetch half is visible too, through
     /// `SparseCellSetBatchIter.metrics()["prefetch"]`. That is a different

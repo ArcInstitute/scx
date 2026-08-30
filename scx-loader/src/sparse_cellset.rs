@@ -100,7 +100,10 @@ pub struct SparseCellSetLoader {
     /// Requested shard-cache count cap.
     cache_shards: usize,
     /// `min(cache_shards, budget / avg_shard)` — the count that is actually
-    /// resident-capable, i.e. **the binding constraint**. `cache_shards` alone is
+    /// resident-capable, i.e. **the binding constraint**. Surfaced through
+    /// [`Self::effective_cache_shards`] and reported as `effective_cache_shards`,
+    /// the name the paired loader uses for the same quantity; the field keeps
+    /// the more descriptive spelling. `cache_shards` alone is
     /// misleading on a large-shard file where the byte budget binds first, which
     /// is exactly the STATE3 regime this loader targets.
     affordable_cache_shards: usize,

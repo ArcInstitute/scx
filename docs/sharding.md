@@ -526,12 +526,13 @@ group-level path; `SparseCellSetDataset` takes the same kwarg and defaults it of
 its regime is cache-friendly (see [performance.md](performance.md) for the measurement).
 The process-wide kill-switch is `SCX_SCATTER_BLOCK_INDEX=0`. Adoption is observable on
 **both** classes via `cache_metrics()["block_index_groups"]` (> 0 ⇒ framed path taken;
-`full_shard_groups` is the fallback). Opening an **all-unframed** file with
-`scatter_block_index=True` emits a one-shot `UserWarning` **on `IndexPlanDataset`** — the
-fast path is inert on that file, so reframe it with
-`scx optimize --row-group-rows 256 <file>`. `SparseCellSetDataset` has no such preflight
-yet, so `scatter_block_index=True` on an unframed file there is a silent no-op; check
-`cache_metrics()["block_index_groups"] > 0` to confirm the route was actually taken.
+`full_shard_groups` is the fallback). Opening **all-unframed** data with
+`scatter_block_index=True` emits a one-shot `UserWarning` on **both** classes — the fast
+path is inert there, so reframe with `scx optimize --row-group-rows 256 <file>`. On
+`SparseCellSetDataset` the check is *any file in the set*, since one framed file means the
+route is live for that file's rows; a mixed set therefore does not warn, and
+`cache_metrics()["block_index_groups"] > 0` remains the way to confirm a gather actually
+took the route.
 
 ## Condition/label-grouped sharding (F1) + grouped reads (F2)
 
