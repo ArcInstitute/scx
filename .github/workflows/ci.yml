@@ -6,33 +6,117 @@ on:
   pull_request:
     branches: [main]
 
+# Superseded pushes to a PR cancel their in-flight run (each full run is
+# ~50 billable job-minutes); pushes to main always run to completion so the
+# cache-save path and the post-merge verdict are never truncated.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
+# There is deliberately NO `build-cpu-only` job: `clippy --workspace
+# --all-targets` type-checks and `cargo test --workspace` codegens the same
+# CPU-only surface (including scx-gpu without CUDA — cudarc compiles CPU-only,
+# GPU tests are `#[ignore]`d; scx-gpu/tests/gpu_test_gating.rs enforces the
+# pairing), so a dedicated `cargo build` job produced nothing unique.
+
 jobs:
-  build-cpu-only:
-    name: Build (CPU-only workspace)
+  # Classifies the PR's changed files so a PR whose ENTIRE diff is docs skips
+  # the expensive build/test jobs. (A doc-fix push to a PR that also contains
+  # code still runs everything — the classification is of the PR's whole diff,
+  # never the individual push.) Push events always report code=true, so the
+  # merge commit to main runs everything. fmt and dedup-guard stay
+  # unconditional, and the docs-anchors job below covers the one test a
+  # docs-only PR would otherwise skip. Uses the pulls/files API instead of a
+  # checkout: no third-party action, no fetch-depth cost.
+  #
+  # Every ambiguity fails CLOSED (code=true): an empty listing, a listing whose
+  # length disagrees with the event payload's changed_files, and any PR at or
+  # above the API's 3,000-file listing cap (GET /pulls/{n}/files truncates
+  # there — a 3,001st code file would otherwise be invisible). Renames are
+  # classified by BOTH sides: a `git mv src/foo.rs docs/foo.md` must count as
+  # code, and only previous_filename shows the .rs side.
+  changes:
+    name: Changed-path gate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Classify changed paths
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "push event: code=true"
+            exit 0
+          fi
+          expected='${{ github.event.pull_request.changed_files }}'
+          if [ -z "$expected" ] || [ "$expected" -ge 3000 ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "changed_files=$expected (missing or at the 3000-file API cap): code=true"
+            exit 0
+          fi
+          # One paginated fetch; --paginate without --jq emits one JSON array
+          # per page, which jq consumes as a multi-document stream.
+          resp=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --paginate)
+          files=$(jq -r '.[].filename' <<< "$resp")
+          renamed_from=$(jq -r '.[].previous_filename // empty' <<< "$resp")
+          listed=$(grep -c . <<< "$files" || true)
+          to_classify=$(printf '%s\n%s\n' "$files" "$renamed_from")
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md) ;;
+              docs/*) ;;
+              LICENSE*) ;;
+              *) code=true ;;
+            esac
+          done <<< "$to_classify"
+          # Fail safe: an empty or truncated listing must not skip CI.
+          if [ -z "$files" ] || [ "$listed" -ne "$expected" ]; then
+            echo "listing ($listed) != changed_files ($expected): failing closed"
+            code=true
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "changed files:"; echo "$files"; echo "code=$code"
+
+  # The one meaningful check a docs-only PR would otherwise skip: the markdown
+  # anchor/link validator is stdlib-only pytest (no maturin, no pyscx import),
+  # so a docs-only PR gets it in under a minute instead of the full python job.
+  # main carries no required-check ruleset, so without this a broken doc link
+  # would merge first and only go red on main afterwards. Code PRs skip this
+  # job — the python job runs the same test as part of the full suite.
+  docs-anchors:
+    name: Docs anchors (docs-only PRs)
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
-          # PR branches restore-only; only main saves the cache. The post-job
-          # cache-save step packs the whole-workspace target/ and was running the
-          # runner out of disk on PRs ("No space left on device" — tests passed,
-          # only the save failed). main keeps the cache fresh.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Validates that the entire workspace — including scx-gpu (cudarc) —
-      # compiles on machines without CUDA installed. GPU tests are `#[ignore]`d
-      # and gated, so the Test job reports them as ignored rather than as passes
-      # that did nothing; scx-gpu/tests/gpu_test_gating.rs enforces the pairing.
-      - name: Verify CPU-only workspace build
-        run: cargo build --workspace --exclude rscx
+          python-version: "3.11"
+      - run: pip install pytest
+      # --noconftest: pyscx/tests/conftest.py imports numpy/pandas/scipy at
+      # module level; the anchors test itself is stdlib-only and uses no
+      # conftest fixture (verified in a pytest-only venv).
+      - run: pytest --noconftest pyscx/tests/test_docs_anchors.py -v
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       # Link with mold (installed below): far lower peak memory/temp per link
       # than the default rust-lld, and faster. `cargo test --workspace` links a
@@ -61,14 +145,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install mold linker
         uses: rui314/setup-mold@v1
+      # Saves on PR branches too (default), not just main: successive pushes to
+      # the same PR — the auto-review fix-round pattern — restore the previous
+      # round's warm cache instead of compiling cold every round. The disk-full
+      # save failures that once forced `save-if: main` were a symptom of full
+      # DWARF debuginfo; `[profile.dev] debug = "line-tables-only"` (root
+      # Cargo.toml) shrinks target/ enough to save safely.
       - uses: Swatinem/rust-cache@v2
         with:
-          # PR branches restore-only; only main saves the cache. The post-job
-          # cache-save step packs the whole-workspace target/ and was running the
-          # runner out of disk on PRs ("No space left on device" — tests passed,
-          # only the save failed). main keeps the cache fresh.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - run: cargo test --workspace --exclude rscx
+      # Headroom telemetry for retiring the free-disk-space step above once
+      # line-tables-only demonstrably leaves multi-GB slack.
+      - name: Report disk headroom after build
+        if: always()
+        run: df -h /
 
   # `cargo test --workspace` above runs at DEFAULT features, and nothing in the
   # workspace enables `scx-convert/hdf5` by default — `scx-cli` declares
@@ -84,7 +181,10 @@ jobs:
   # tests that could not fail.
   test-hdf5:
     name: Test (hdf5 features)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # Assert rather than skip: the parallel streaming coordinator's tests
@@ -109,9 +209,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install mold linker
         uses: rui314/setup-mold@v1
+      # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
       - run: cargo test -p scx-convert --features hdf5
@@ -131,30 +238,43 @@ jobs:
       # things. Serialising keeps libhdf5's locking fully enforced. Measured
       # cost: 203 tests in 7.2 s.
       - run: cargo test -p scx-cli --features hdf5 -- --test-threads=1
+      - name: Report disk headroom after build
+        if: always()
+        run: df -h /
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
         with:
-          # PR branches restore-only; only main saves the cache. The post-job
-          # cache-save step packs the whole-workspace target/ and was running the
-          # runner out of disk on PRs ("No space left on device" — tests passed,
-          # only the save failed). main keeps the cache fresh.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       # `--all-targets` lints tests, benches and examples too. Without it a
       # whole class of test-code defect is invisible to CI, and test code is
       # where the correctness reasoning lives.
+      #
+      # This is also the CPU-only compile gate: clippy type-checks the entire
+      # workspace (scx-gpu included) on a runner without CUDA.
       - run: cargo clippy --workspace --exclude rscx --all-targets -- -D warnings
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -165,6 +285,7 @@ jobs:
   dedup-guard:
     name: I-ORG-1 dedup guards
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       # T5.11: every FileHeader must be built via FileHeader::new_single_modality(...)
@@ -2675,95 +2796,137 @@ jobs:
             exit 1
           fi
 
+  # The feature legs run inside two jobs (split by whether libhdf5 is needed)
+  # instead of an 11-leg matrix: one runner spin-up, checkout, toolchain and
+  # cache per group, one shared target/ so the common dependency closure
+  # compiles once per group instead of per leg, and no per-job billable-minute
+  # rounding on eleven ~1-2 minute legs. Each leg is `cargo clippy` only —
+  # clippy performs the full type-check, so a separate `cargo check` on the
+  # same flags was a second compile of the same closure for no additional
+  # signal. The legs run through a small accumulate-failures loop so one broken
+  # leg does not hide whether the others are broken too (the old matrix was
+  # `fail-fast: false`; naive sequential steps would have lost that).
   feature-check:
-    name: Feature matrix (cargo check)
+    name: Feature matrix (clippy, no-hdf5 legs)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # scx-cli cloud feature only
-          - flags: "-p scx-cli --features cloud --all-targets"
-            name: "scx-cli --features cloud"
-          # scx-cli cloud + hdf5 — pulls in the hdf5-rust bindings
-          - flags: "-p scx-cli --features hdf5,cloud --all-targets"
-            name: "scx-cli --features hdf5,cloud"
-          # scx-accel gpu feature — requires cudarc stubs only, no CUDA toolkit
-          - flags: "-p scx-accel --features gpu --all-targets"
-            name: "scx-accel --features gpu"
-          # scx-convert hdf5 — the ingest/export path. The `test` job runs
-          # default features only, so before this lane existed the hdf5-gated
-          # half of scx-convert (including its test modules) was compiled by no
-          # CI job at all.
-          - flags: "-p scx-convert --features hdf5 --all-targets"
-            name: "scx-convert --features hdf5"
-          # pyscx gpu feature — the rapids-absent lane (ACC-RUST-OPT-V4 §4.3).
-          # Compiles + clippy-checks the gpu-gated rapids routing on a CPU runner
-          # with neither CUDA nor rapids-singlecell present (cudarc stubs compile);
-          # the detected-dependency contract (pyscx imports + CPU/streaming/loader
-          # run with rapids absent) holds by construction, and the planner's
-          # no_rapids branch is unit-tested in `cargo test` (scx-accel route).
-          # The runtime no_rapids→CPU assertion on a GPU host without rapids is a
-          # Phase 2.2 GPU gate (needs hardware CI does not have).
-          - flags: "-p pyscx --features gpu --all-targets"
-            name: "pyscx --features gpu"
-          # pyscx hdf5 + gpu — the documented GPU build combo (report F2).
-          # maturin's `--features` REPLACES the pyproject default set (which
-          # includes hdf5), so the docs/skills build with `--features hdf5,gpu`;
-          # this guards that the combo compiles + clippy-checks so the h5ad I/O
-          # path can't silently regress under a GPU build.
-          - flags: "-p pyscx --features hdf5,gpu --all-targets"
-            name: "pyscx --features hdf5,gpu"
-          # pyscx cloud — covered by the python job; also check standalone
-          - flags: "-p pyscx --features cloud --all-targets"
-            name: "pyscx --features cloud"
-          # scx-gpu's benchmark binary is `required-features = ["bench"]`, so no
-          # default-feature lane ever compiles it — a `scx-codec` signature change
-          # broke it and every GPU lane here still passed. It is the binary
-          # `benchmarks/scripts/slurm_gpu_bench.sh` runs, so the break would have
-          # surfaced hours into a SLURM job instead of in CI.
-          - flags: "-p scx-gpu --features bench --bin gpu_bench"
-            name: "scx-gpu --features bench (gpu_bench bin)"
-          # scx-format-io's three non-default feature configurations. The `test`
-          # job runs default features (`parallel` + `deletion-vectors`), so
-          # without these no CI job compiles the sequential reader or the
-          # deletion-vector-free build at all.
-          #
-          # `--all-targets`, not the `--lib` the first of these used to carry:
-          # this job runs check + clippy, and without `--all-targets` neither
-          # reaches the test target. `--lib` was there because the test target
-          # did not compile with `parallel` off; it does now, and compiling it
-          # is the point -- that is what surfaced three dead-code warnings and
-          # two tests that *fail* without `parallel` (the prefetch bit-identity
-          # pair, on their own vacuity guard, now gated with it).
-          - flags: "-p scx-format-io --no-default-features --features deletion-vectors --all-targets"
-            name: "scx-format-io (parallel off)"
-          - flags: "-p scx-format-io --no-default-features --features parallel --all-targets"
-            name: "scx-format-io (deletion-vectors off)"
-          - flags: "-p scx-format-io --no-default-features --all-targets"
-            name: "scx-format-io (neither feature)"
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Saves on PR branches too — see the cache note on the `test` job.
       - uses: Swatinem/rust-cache@v2
         with:
-          # PR branches restore-only; only main saves the cache. The post-job
-          # cache-save step packs the whole-workspace target/ and was running the
-          # runner out of disk on PRs ("No space left on device" — tests passed,
-          # only the save failed). main keeps the cache fresh.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # hdf5 feature needs the system library. Install on demand.
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
+      # Leg rationale:
+      # - scx-cli cloud: the cloud feature alone.
+      # - scx-accel gpu: requires cudarc stubs only, no CUDA toolkit.
+      # - pyscx gpu: the rapids-absent lane (ACC-RUST-OPT-V4 §4.3). Compiles +
+      #   clippy-checks the gpu-gated rapids routing on a CPU runner with
+      #   neither CUDA nor rapids-singlecell present (cudarc stubs compile);
+      #   the detected-dependency contract (pyscx imports + CPU/streaming/
+      #   loader run with rapids absent) holds by construction, and the
+      #   planner's no_rapids branch is unit-tested in `cargo test` (scx-accel
+      #   route). The runtime no_rapids→CPU assertion on a GPU host without
+      #   rapids is a Phase 2.2 GPU gate (needs hardware CI does not have).
+      # - pyscx cloud: covered by the python job; also check standalone.
+      # - scx-gpu bench: the benchmark binary is `required-features =
+      #   ["bench"]`, so no default-feature lane ever compiles it — a
+      #   `scx-codec` signature change broke it and every GPU lane here still
+      #   passed. It is the binary `benchmarks/scripts/slurm_gpu_bench.sh`
+      #   runs, so the break would have surfaced hours into a SLURM job
+      #   instead of in CI.
+      # - scx-format-io ×3: the three non-default feature configurations. The
+      #   `test` job runs default features (`parallel` + `deletion-vectors`),
+      #   so without these no CI job compiles the sequential reader or the
+      #   deletion-vector-free build at all. `--all-targets`, not `--lib`:
+      #   without it clippy never reaches the test target; compiling it is the
+      #   point — that is what surfaced three dead-code warnings and two tests
+      #   that *fail* without `parallel` (the prefetch bit-identity pair, on
+      #   their own vacuity guard, now gated with it).
+      - name: clippy all no-hdf5 feature legs
+        run: |
+          fail=0
+          leg() {
+            echo "::group::cargo clippy $*"
+            if ! cargo clippy "$@" -- -D warnings; then
+              echo "::error::leg failed: cargo clippy $*"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          leg -p scx-cli --features cloud --all-targets
+          leg -p scx-accel --features gpu --all-targets
+          leg -p pyscx --features gpu --all-targets
+          leg -p pyscx --features cloud --all-targets
+          leg -p scx-gpu --features bench --bin gpu_bench
+          leg -p scx-format-io --no-default-features --features deletion-vectors --all-targets
+          leg -p scx-format-io --no-default-features --features parallel --all-targets
+          leg -p scx-format-io --no-default-features --all-targets
+          exit $fail
+
+  feature-check-hdf5:
+    name: Feature matrix (clippy, hdf5 legs)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Saves on PR branches too — see the cache note on the `test` job.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
+      # hdf5 feature needs the system library.
       - name: Install hdf5 dev headers
-        if: contains(matrix.flags, 'hdf5')
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
-      - name: cargo check ${{ matrix.name }}
-        run: cargo check ${{ matrix.flags }}
-      - name: cargo clippy ${{ matrix.name }}
-        run: cargo clippy ${{ matrix.flags }} -- -D warnings
+      # Leg rationale:
+      # - scx-cli hdf5,cloud: pulls in the hdf5-rust bindings.
+      # - scx-convert hdf5: the ingest/export path. The `test` job runs
+      #   default features only, so before this lane existed the hdf5-gated
+      #   half of scx-convert (including its test modules) was compiled by no
+      #   CI job at all.
+      # - pyscx hdf5,gpu: the documented GPU build combo (report F2).
+      #   maturin's `--features` REPLACES the pyproject default set (which
+      #   includes hdf5), so the docs/skills build with `--features hdf5,gpu`;
+      #   this guards that the combo compiles + clippy-checks so the h5ad I/O
+      #   path can't silently regress under a GPU build.
+      - name: clippy all hdf5 feature legs
+        run: |
+          fail=0
+          leg() {
+            echo "::group::cargo clippy $*"
+            if ! cargo clippy "$@" -- -D warnings; then
+              echo "::error::leg failed: cargo clippy $*"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          leg -p scx-cli --features hdf5,cloud --all-targets
+          leg -p scx-convert --features hdf5 --all-targets
+          leg -p pyscx --features hdf5,gpu --all-targets
+          exit $fail
 
   python:
     name: Python bindings
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # Fork-safety regression tests run inside the same job.
     # `OMP_NUM_THREADS=1` keeps OpenMP-using deps (scanpy, numpy via
     # OpenBLAS) from spawning extra threads in the parent that would
@@ -2776,9 +2939,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Saves on PR branches too — see the cache note on the `test` job. This
+      # job previously had no Rust cache at all, so every run cold-compiled the
+      # whole workspace dependency closure through `maturin develop`.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # Caches ~/.cache/pip (wheel downloads — torch-cpu alone is large).
+          cache: pip
+          cache-dependency-path: pyscx/pyproject.toml
       # Pin pyarrow to the new upper bound of the supported range
       # (pyscx/pyproject.toml: pyarrow>=14,<24) so CI exercises the
       # widened cap rather than whatever pyarrow pip happens to resolve.
@@ -2799,13 +2977,21 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0;sys_platform=='linux'"
-          pip install maturin pytest numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars pydeseq2
+          pip install maturin pytest pytest-xdist numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars pydeseq2
       # libhdf5 is needed by the `hdf5` pyscx feature, which exposes
       # `pyscx.from_h5ad` and the backed-AnnData → streaming router that
       # `tests/test_streaming_conversion.py` exercises.
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
-      - run: . .venv/bin/activate && cd pyscx && maturin develop --features cloud,hdf5 && pytest --ignore=tests/test_scvi_integration.py
+      # `--profile ci` (root Cargo.toml): opt-level=2 with debug-assertions —
+      # the suite is numeric Rust, and the previous debug (opt-level=0) .so made
+      # pytest the longest job in the workflow. `-n 2` matches the 2-core
+      # runner; `--dist loadfile` keeps each test file inside one worker
+      # process, which is what makes the fork-heavy (test_fork_*.py) and
+      # process-global-env files (test_pseudobulk_thread_env.py) safe to
+      # parallelise. OMP_NUM_THREADS=1 above keeps the two workers from
+      # oversubscribing the cores.
+      - run: . .venv/bin/activate && cd pyscx && maturin develop --profile ci --features cloud,hdf5 && pytest -n 2 --dist loadfile --ignore=tests/test_scvi_integration.py
 
   # The `python` job above hand-installs every optional package, so it has never
   # exercised what `pip install pyscx` actually produces. That gap is exactly how
@@ -2819,13 +3005,28 @@ jobs:
   # `test_base_install_*` subset plus the packaging assertions.
   base-install:
     name: Base install (no extras)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Saves on PR branches too — see the cache note on the `test` job.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Generation bump (v0 → v1): rust-cache's key hashes lockfiles, not
+          # cargo profiles, and it never overwrites an exact-key hit — so the
+          # profile change (line-tables-only dev, new ci profile) would forever
+          # restore stale full-DWARF artifacts and recompile on every run. The
+          # new prefix starts a clean namespace; v0 entries age out via the
+          # 7-day cache GC.
+          prefix-key: v1-rust
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyscx/pyproject.toml
       # `[tool.maturin] features` includes `hdf5`, which links dynamically
       # against libhdf5 — same reason the `python` and `feature-check` jobs
       # install this. Building without it fails in `hdf5-metno-sys`'s build
@@ -2833,12 +3034,16 @@ jobs:
       # invisible on a dev box that already has the headers.
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+      # `--profile ci`, not `--release`: this job asserts packaging metadata
+      # (extras resolve, no optional package leaks into the base venv), and
+      # nothing about those assertions needs thin-LTO release codegen — which
+      # was a guaranteed-cold full-closure LTO build on every run.
       - name: Build the wheel
         run: |
           python -m venv .build-venv
           . .build-venv/bin/activate
           pip install maturin
-          cd pyscx && maturin build --release --out ../dist
+          cd pyscx && maturin build --profile ci --out ../dist
       # A separate interpreter with ONLY pyscx's declared hard dependencies —
       # whatever the wheel itself resolves. Nothing is installed by name here on
       # purpose: naming a package would recreate the blind spot this job exists
