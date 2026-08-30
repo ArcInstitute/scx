@@ -14,6 +14,8 @@
 // call sites and the `add_class` registration in lib.rs are unchanged.
 
 pub(crate) mod dataset;
+pub(crate) mod dataset_agg;
+pub(crate) mod dataset_index;
 pub(crate) mod shard_source;
 pub(crate) mod transform;
 pub(crate) mod transforms;
