@@ -1565,3 +1565,92 @@ fn prefetch_skips_and_counts_a_shard_a_peer_is_already_decoding() {
         "exactly one shard was skipped as in-flight"
     );
 }
+
+/// **Dropping the iterator must stop the plan generator even when every plan is
+/// empty.**
+///
+/// The empty-plan skip is this loader's contract, not the engine's, so the fold
+/// first expressed it as `plans.filter(..)` on the stream handed to the engine.
+/// That put the filter *upstream* of the only place cancellation is observed:
+///
+/// ```ignore
+/// for item in plans {
+///     if plan_tx.send(item).is_err() { break; }   // the sole cancellation point
+/// }
+/// ```
+///
+/// `Filter::next` discards non-matching items internally and never returns to
+/// that loop body, so a stream of empty plans never reaches `send` and never
+/// learns the receiver is gone. An endless empty stream spins the detached
+/// worker forever — on the Python path, calling `PyPlanIterator` long after the
+/// batch iterator was dropped — and a long finite empty prefix is pulled with no
+/// backpressure at all, since it never occupies a channel slot.
+///
+/// Skipping inside `next` instead keeps every plan going through the bounded
+/// channel, which is what the pre-fold loop did.
+#[test]
+fn dropping_the_iter_stops_an_endless_empty_plan_generator() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
+    let loader = open_loader_arc(&path);
+
+    struct EndlessEmptyPlans {
+        pulled: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+    }
+    impl Iterator for EndlessEmptyPlans {
+        type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+        fn next(&mut self) -> Option<Self::Item> {
+            // The escape hatch exists so a *failing* run cleans up instead of
+            // leaking a hot spin loop for the rest of the suite.
+            if self.stop.load(AtomicOrdering::Acquire) {
+                return None;
+            }
+            self.pulled.fetch_add(1, AtomicOrdering::AcqRel);
+            Some(Ok(Vec::new()))
+        }
+    }
+
+    let pulled = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let it = loader.iter_with_plans(
+        EndlessEmptyPlans {
+            pulled: Arc::clone(&pulled),
+            stop: Arc::clone(&stop),
+        },
+        /*lookahead*/ 4,
+    );
+
+    // Deliberately not consumed: with every plan empty there is no batch to
+    // wait for, and `next` would block. The worker is already running.
+    drop(it);
+
+    // Wait for the pull count to go quiet rather than sleeping a fixed span:
+    // "two consecutive samples agree" is the observable that the worker has
+    // actually stopped, and it neither false-fails on a loaded machine nor
+    // false-passes on a fast one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last = pulled.load(AtomicOrdering::Acquire);
+    let settled = loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = pulled.load(AtomicOrdering::Acquire);
+        if now == last {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        last = now;
+    };
+    stop.store(true, AtomicOrdering::Release);
+
+    assert!(
+        settled,
+        "the plan generator was still being pulled 10s after the iterator was \
+         dropped ({} pulls and counting) — dropping `plan_rx` cannot cancel a \
+         worker that never reaches `send`",
+        pulled.load(AtomicOrdering::Acquire)
+    );
+}

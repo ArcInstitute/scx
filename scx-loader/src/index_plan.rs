@@ -965,10 +965,18 @@ impl IndexPlanLoader {
     /// **Empty plans yield no batch** (SCX-DATA-LOADER: "Plan list is empty →
     /// yield no batch for that plan; continue to the next"). That is this
     /// loader's contract, not the engine's — [`PrefetchEngine::iter_with_plans`]
-    /// deliberately calls `process` for every plan — so the skip is expressed
-    /// as a filter on the plan stream. Filtering here rather than inside `next`
-    /// also keeps an empty plan from occupying a lookahead slot, which the
-    /// hand-rolled loop it replaces could not avoid.
+    /// deliberately calls `process` for every plan — so the skip lives in
+    /// [`IndexPlanIter::next`], which discards the zero-row batch `process_plan`
+    /// returns for an empty plan.
+    ///
+    /// It must **not** be a `filter` on the plan stream, however tempting: the
+    /// pull worker observes cancellation only through `plan_tx.send`, and
+    /// `Filter::next` discards items before reaching it. An all-empty stream
+    /// would then never learn the receiver was dropped and would spin forever
+    /// (measured: ~300M pulls in the 10s after drop), and even a finite empty
+    /// prefix would be pulled with no backpressure, since it never occupies a
+    /// channel slot. Pinned by
+    /// `dropping_the_iter_stops_an_endless_empty_plan_generator`.
     pub fn iter_with_plans<I>(self: Arc<Self>, plans: I, lookahead: usize) -> IndexPlanIter
     where
         I: Iterator<Item = std::result::Result<Vec<(u64, u64)>, LoaderError>> + Send + 'static,
@@ -976,7 +984,7 @@ impl IndexPlanLoader {
         let engine = Arc::clone(self.engine());
         let loader = Arc::clone(&self);
         let iter = engine.iter_with_plans(
-            plans.filter(|item| !matches!(item, Ok(plan) if plan.is_empty())),
+            plans,
             lookahead,
             // Single file, so every row is `file_id = 0`. Both sides of a pair
             // are reported: the gather passes the same deduped row set to
@@ -1040,7 +1048,17 @@ impl Iterator for IndexPlanIter {
     type Item = Result<IndexPlanBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        // Skip the zero-row batches an empty plan produces — the loader's
+        // contract, which the engine deliberately does not implement. This is
+        // exact rather than a heuristic: `process_plan` moves the (sorted) plan
+        // into `pairs`, so `pairs.is_empty()` holds precisely when the plan was
+        // empty. Errors pass through untouched and in order.
+        loop {
+            match self.inner.next()? {
+                Ok(batch) if batch.pairs.is_empty() => continue,
+                item => return Some(item),
+            }
+        }
     }
 }
 
