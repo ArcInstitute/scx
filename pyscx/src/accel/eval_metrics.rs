@@ -61,19 +61,6 @@ fn scaffold_device_route<'py>(
 // fallbacks release it via `py.detach`.
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// GPU device id from a resolved device (always `None` without the gpu feature).
-fn eval_resolve_gpu_id(resolved: super::gpu::ResolvedDevice) -> Option<usize> {
-    #[cfg(feature = "gpu")]
-    {
-        resolved.gpu_id()
-    }
-    #[cfg(not(feature = "gpu"))]
-    {
-        let _ = resolved;
-        None
-    }
-}
-
 #[cfg(feature = "gpu")]
 type EvalGpuDev = Option<scx_accel::GpuDevice>;
 #[cfg(not(feature = "gpu"))]
@@ -131,7 +118,7 @@ fn edist_device_dispatch(
     );
     super::route::announce_route(py, op, device, &info);
     let gpu_id = if info.route.is_gpu() {
-        eval_resolve_gpu_id(resolved)
+        resolved.gpu_id()
     } else {
         None
     };
@@ -348,7 +335,7 @@ pub fn pseudobulk_means<'py>(
     // Rolled back if the aggregation below raises — see RouteStamp.
     let route = super::route::RouteStamp::write(py, adata, "pseudobulk_means", &info)?;
     let gpu_id = if info.route.is_gpu() {
-        eval_resolve_gpu_id(resolved)
+        resolved.gpu_id()
     } else {
         None
     };
@@ -1100,7 +1087,7 @@ pub fn perturbation_metrics<'py>(
     );
     super::route::announce_route(py, "perturbation_metrics", device, &info);
     let gpu_id = if info.route.is_gpu() {
-        eval_resolve_gpu_id(resolved)
+        resolved.gpu_id()
     } else {
         None
     };

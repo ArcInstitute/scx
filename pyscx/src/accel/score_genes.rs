@@ -66,6 +66,11 @@ pub fn score_genes<'py>(
     // backed X would score the wrong physical columns. Reject loudly.
     super::prepare_target(py, adata, "score_genes")?;
 
+    // Validate `device=` like every other accel op (round-2 review: this op
+    // previously skipped `resolve_device`, so `device="tpu"` was silently
+    // treated as GPU intent in the route stamp instead of raising).
+    let _device = super::gpu::resolve_device(device)?;
+
     // ── Parse the scoring method (shared vocabulary + error text) ───────
     let method_enum = ScoreMethod::parse(method, ctrl_size, n_bins, random_state)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;

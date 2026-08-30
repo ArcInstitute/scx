@@ -330,7 +330,8 @@ pub(crate) use scx_accel::device::ResolvedDevice;
 /// [`DeviceError`](scx_accel::device::DeviceError) taxonomy onto the Python
 /// exception types the error messages were written for: grammar/vocabulary
 /// errors → `ValueError`; well-formed-but-unsatisfiable requests (no CUDA
-/// device, out-of-range ordinal, non-gpu build) → `RuntimeError`.
+/// device, out-of-range ordinal) and the dedicated feature-disabled variant
+/// (non-gpu build) → `RuntimeError`.
 pub(crate) fn resolve_device(device: &str) -> PyResult<ResolvedDevice> {
     scx_accel::device::resolve_device(device).map_err(|e| match e {
         scx_accel::device::DeviceError::Invalid(msg) => PyValueError::new_err(msg),

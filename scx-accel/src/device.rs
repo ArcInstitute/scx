@@ -60,8 +60,10 @@ impl ResolvedDevice {
 /// The split mirrors the Python exception taxonomy the messages were written
 /// for: `Invalid` is a vocabulary/grammar error (pyscx `ValueError`);
 /// `Unavailable` is a well-formed request the runtime cannot satisfy — no
-/// CUDA device, out-of-range ordinal, or a build without the `gpu` feature
-/// (pyscx `RuntimeError`).
+/// CUDA device, or an out-of-range ordinal (pyscx `RuntimeError`); and
+/// `GpuFeatureDisabled` is the build-time case — an explicit GPU request on a
+/// build compiled without the `gpu` feature (also pyscx `RuntimeError`, with
+/// the binding naming itself in the re-formatted text).
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
     /// The string is not in the `auto|cpu|gpu|gpu:N` vocabulary.
