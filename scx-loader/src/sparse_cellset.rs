@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use scx_format_io::{CacheMetrics, ScxReader};
 
 use crate::error::{LoaderError, Result};
-use crate::plan_engine::PrefetchEngine;
+use crate::plan_engine::{IterMetrics, PrefetchEngine};
 use crate::sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode};
 
 /// One batch of cell sets to gather. Rows are flat across all sets in the
@@ -386,12 +386,18 @@ impl SparseCellSetLoader {
 
     /// Stream `plans` (each one batch) into gathered §4.4 batches, pipelining
     /// shard prefetch via the engine. Boxed so a PyO3 wrapper can hold it
-    /// (the engine iterator is generic over closures).
+    /// (the engine iterator is generic over closures), and paired with the
+    /// iterator's own [`IterMetrics`] handle, which boxing would otherwise
+    /// erase — that handle is what lets `SparseCellSetBatchIter.metrics()`
+    /// report the prefetch counters.
     pub fn iter_with_plans<I>(
         self: Arc<Self>,
         plans: I,
         lookahead: usize,
-    ) -> Box<dyn Iterator<Item = Result<SparseCellSetBatch>> + Send + Sync>
+    ) -> (
+        Box<dyn Iterator<Item = Result<SparseCellSetBatch>> + Send + Sync>,
+        Arc<IterMetrics>,
+    )
     where
         I: Iterator<Item = Result<SparseCellSetPlan>> + Send + 'static,
     {
@@ -407,9 +413,13 @@ impl SparseCellSetLoader {
                     .zip(plan.rows.iter().copied())
                     .collect()
             },
-            move |eng: &PrefetchEngine, plan: &SparseCellSetPlan| loader.gather(eng, plan),
+            move |eng: &PrefetchEngine, plan: SparseCellSetPlan| loader.gather(eng, &plan),
         );
-        Box::new(iter)
+        // Taken before boxing: `Box<dyn Iterator>` erases the inherent method,
+        // and the counters are per-iter (they reset every `iter_with_plans`
+        // call), so the handle cannot come from the loader instead.
+        let iter_metrics = iter.iter_metrics();
+        (Box::new(iter), iter_metrics)
     }
 
     /// Gather one batch of cell sets into the §4.4 contract. The `process`

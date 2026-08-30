@@ -143,6 +143,7 @@ fn loader_threads_the_block_index_gate_into_the_engine() {
         };
         let batches: Vec<_> = StdArc::clone(&loader)
             .iter_with_plans(vec![Ok(plan.clone())].into_iter(), 4)
+            .0
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(batches.len(), 1);
@@ -208,6 +209,7 @@ fn gather_single_file_sets_matches_reference_in_order() {
     };
     let batches: Vec<_> = loader
         .iter_with_plans(vec![Ok(plan.clone())].into_iter(), 4)
+        .0
         .map(|r| r.unwrap())
         .collect();
     assert_eq!(batches.len(), 1);
@@ -268,6 +270,7 @@ fn empty_set_keeps_boundary_without_rows() {
     };
     let b = loader
         .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .0
         .next()
         .unwrap()
         .unwrap();
@@ -323,6 +326,7 @@ fn gather_cross_file_set_concatenates_in_global_space() {
     };
     let b = loader
         .iter_with_plans(vec![Ok(plan)].into_iter(), 4)
+        .0
         .next()
         .unwrap()
         .unwrap();
@@ -379,6 +383,7 @@ fn run_one(
 ) -> Result<SparseCellSetBatch> {
     loader
         .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .0
         .next()
         .unwrap()
 }
@@ -418,6 +423,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
             .into_iter(),
             4,
         )
+        .0
         .next()
         .unwrap()
         .unwrap();
@@ -857,6 +863,7 @@ fn gather_rows(loader: Arc<SparseCellSetLoader>, fid: u32, rows: &[u64]) -> Spar
     };
     loader
         .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .0
         .next()
         .unwrap()
         .unwrap()
@@ -1364,7 +1371,7 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
     ];
     // The production constructor: `process` closes over an
     // `Arc<SparseCellSetLoader>`, which owns another engine Arc.
-    let mut it = Arc::clone(&loader).iter_with_plans(plans.into_iter().map(Ok), 4);
+    let (mut it, _iter_metrics) = Arc::clone(&loader).iter_with_plans(plans.into_iter().map(Ok), 4);
     it.next().expect("first batch").expect("must gather"); // forces the runtime
 
     // The `ds.close()` half: the dataset's loader reference goes away while the

@@ -102,9 +102,13 @@ fn rows_of(plan: &Plan) -> Vec<(u32, u64)> {
 
 /// Gather the single non-zero `(col, value)` of each plan row through the
 /// engine's readers — exercises the real `read_rows_with` path.
-fn gather(engine: &PrefetchEngine, plan: &Plan) -> Result<Vec<(i32, f32)>> {
+///
+/// Takes the plan **by value**, matching `ProcFn` since ORG-9.10-1: the queue
+/// is the plan's last owner, so a consumer that needs to consume or reorder it
+/// (the pair loader sorts in place) does not have to clone per batch.
+fn gather(engine: &PrefetchEngine, plan: Plan) -> Result<Vec<(i32, f32)>> {
     let mut out = Vec::with_capacity(plan.len());
-    for &(fid, row) in plan {
+    for &(fid, row) in &plan {
         let mut got: Option<(i32, f32)> = None;
         engine
             .reader(fid)

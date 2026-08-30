@@ -204,7 +204,23 @@ class SparseCellSetBatchIter:
 
     def cache_metrics(self) -> dict[str, int]:
         """Shared shard-cache counters — same keys as
-        `SparseCellSetDataset.cache_metrics`. Safe after exhaustion."""
+        `SparseCellSetDataset.cache_metrics`. The flat, cache-only half of
+        `metrics()`, kept because it predates it. Safe after exhaustion."""
+        ...
+
+    def metrics(self) -> dict[str, dict[str, int]]:
+        """Cache- and prefetch-side counters as
+        ``{"cache": {...}, "prefetch": {...}}`` — the same shape
+        `IndexPlanBatchIter.metrics()` returns. ``cache`` is
+        loader-cumulative (shared with `SparseCellSetDataset.cache_metrics`);
+        ``prefetch`` is per-iter and resets on each `iter_with_plans` call.
+        Safe after exhaustion.
+
+        ``prefetch["prefetch_skipped_block_index"]`` is what answers "did
+        ``scatter_block_index=True`` do anything on this file?" — it is
+        non-zero only when a cold, sparse, row-group-framed shard was left
+        undecoded so the gather could take the block-index path, and stays 0
+        against an unframed file, where the kwarg is a silent no-op."""
         ...
 
 

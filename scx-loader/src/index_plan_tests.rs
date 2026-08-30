@@ -4,7 +4,13 @@
 
 use super::*;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc as StdArc;
+
+// Named explicitly since ORG-9.10-1: the iterator machinery these tests drive
+// now lives in `plan_engine`, so `index_plan` no longer re-exports the channel
+// and atomic types through `use super::*`.
+use crossbeam_channel::{bounded, Receiver};
 
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -1097,12 +1103,26 @@ fn process_plan_rejects_oversize_plan() {
 
 // ─── Lazy runtime / fork safety (Patch 11 § P1 #16) ──────────────
 //
-// The loader holds a `OnceLock<Runtime>` and defers tokio runtime
-// construction to the first `iter_with_plans` call. The contract is
-// checked here by inspecting `loader.runtime.get()` before and after
-// touching the iter; constructing the loader must not build a
-// runtime, since that runtime would otherwise be inherited by
-// `DataLoader` worker processes after fork.
+// The loader defers building its `PrefetchEngine` — and with it the tokio
+// runtime — to the first `iter_with_plans` call. Constructing a loader must
+// not build a runtime: it would otherwise be inherited by `DataLoader` worker
+// processes after fork, which is §9.1.
+//
+// Since ORG-9.10-1 the runtime belongs to the engine, so the probe is
+// `PrefetchEngine::runtime_is_built()` rather than a field of this module.
+// `lazy_runtime_idempotent_under_concurrent_init` moved with it, as
+// `plan_engine_tests::engine_runtime_idempotent_under_concurrent_init` — after
+// the fold there is exactly one `OnceLock` and one test for it.
+
+/// Whether the loader has materialised its engine *and* that engine's runtime.
+/// Two states are distinct and both matter: no engine at all (what `new` must
+/// leave behind) and an engine whose runtime is still unbuilt.
+fn runtime_is_built(loader: &IndexPlanLoader) -> bool {
+    loader
+        .engine
+        .get()
+        .is_some_and(|engine| engine.runtime_is_built())
+}
 
 #[test]
 fn lazy_runtime_not_built_at_construction() {
@@ -1110,10 +1130,11 @@ fn lazy_runtime_not_built_at_construction() {
     let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
     let loader = open_loader(&path, false);
     assert!(
-        loader.runtime.get().is_none(),
-        "IndexPlanLoader::new must not eagerly build the tokio runtime — \
-             that would defeat the DataLoader fork-safety contract"
+        loader.engine.get().is_none(),
+        "IndexPlanLoader::new must not eagerly build the prefetch engine — \
+             its tokio runtime would defeat the DataLoader fork-safety contract"
     );
+    assert!(!runtime_is_built(&loader));
 }
 
 #[test]
@@ -1123,45 +1144,18 @@ fn lazy_runtime_built_after_iter_with_plans_consumed() {
     let loader = Arc::new(open_loader(&path, false));
 
     // Sanity-check the precondition.
-    assert!(loader.runtime.get().is_none());
+    assert!(!runtime_is_built(&loader));
 
     let plans = vec![Ok(vec![(0u64, 1u64), (2, 3)])].into_iter();
     let iter = Arc::clone(&loader).iter_with_plans(plans, /*lookahead*/ 2);
     // Consume one batch — this drives `refill` → `spawn_prefetches`
-    // → the lazy `runtime()` accessor.
+    // → the engine's lazy `runtime()` accessor.
     let mut iter = iter;
     let _ = iter.next();
     assert!(
-        loader.runtime.get().is_some(),
+        runtime_is_built(&loader),
         "first iter consumption should materialize the runtime via OnceLock"
     );
-}
-
-#[test]
-fn lazy_runtime_idempotent_under_concurrent_init() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-    let loader = Arc::new(open_loader(&path, false));
-
-    // Spawn several threads that each grab the runtime through the
-    // private accessor. Compare pointer addresses to confirm all
-    // observers see the same Runtime instance.
-    let mut handles = Vec::new();
-    for _ in 0..4 {
-        let l = Arc::clone(&loader);
-        handles.push(std::thread::spawn(move || {
-            let rt = l.runtime().expect("runtime build must succeed");
-            rt as *const Runtime as usize
-        }));
-    }
-    let addrs: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let first = addrs[0];
-    for a in &addrs[1..] {
-        assert_eq!(
-            *a, first,
-            "all threads must observe the same Runtime instance"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1291,47 +1285,13 @@ fn a_slow_generator_does_not_end_the_epoch() {
     assert_eq!(got, want, "a slow generator must not truncate the epoch");
 }
 
-/// Over-fix guard: when the generator keeps up, the queue still fills to
-/// `lookahead`. A "fix" that pulled one plan at a time would pass every test
-/// above and quietly delete the prefetch.
-#[test]
-fn prefetch_depth_survives_when_the_generator_keeps_up() {
-    const LOOKAHEAD: usize = 4;
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 16, 8, 4);
-    let loader = open_loader_arc(&path);
-
-    let plans: Vec<Vec<(u64, u64)>> = (0..LOOKAHEAD as u64)
-        .map(|i| vec![(i * 2, i * 2 + 1)])
-        .collect();
-
-    // Exactly `LOOKAHEAD` plans, and the plan channel is `bounded(LOOKAHEAD)`,
-    // so the pull thread buffers all of them and then runs to exhaustion
-    // without needing the consumer. Waiting on `drained` before the first
-    // `next()` is what makes the `try_recv` arms below race-free.
-    let (drained_tx, drained_rx) = bounded(1);
-    let gen = into_plan_iter(plans).chain(std::iter::from_fn(
-        move || -> Option<std::result::Result<Vec<(u64, u64)>, LoaderError>> {
-            let _ = drained_tx.send(());
-            None
-        },
-    ));
-
-    let mut it = loader.iter_with_plans(gen, LOOKAHEAD);
-    drained_rx
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .expect("plan generator must drain into the bounded channel");
-
-    it.next()
-        .expect("first batch")
-        .expect("first batch must decode");
-
-    assert_eq!(
-        it.in_flight.len(),
-        LOOKAHEAD - 1,
-        "the queue must still be prefetched to depth when the generator is ahead"
-    );
-}
+// The over-fix guard for §9.4 — "when the generator keeps up, the queue still
+// fills to `lookahead`" — is now
+// `plan_engine_tests::engine_prefetch_depth_survives_when_the_generator_keeps_up`.
+// It reads `PlanPrefetchIter::in_flight`, and since ORG-9.10-1 that queue is
+// the only one: `IndexPlanIter` is an adapter with no queue of its own, so a
+// copy here could only re-assert what the engine's test already asserts about
+// the same code. Deleted rather than weakened to a proxy.
 
 // ---------------------------------------------------------------------
 // §9.3 — bounded, GIL-free teardown.
@@ -1357,6 +1317,12 @@ fn prefetch_depth_survives_when_the_generator_keeps_up() {
 /// same way on a loaded machine: no task started, nothing held, count clean.
 /// The gate now announces entry before parking, and the test fails outright if
 /// no task announces.
+///
+/// Since ORG-9.10-1 the spawning code lives in `PlanPrefetchIter` and has no
+/// path to the loader at all, so the loader count alone can no longer go wrong
+/// — the reachable owner is now the `Arc<PrefetchEngine>`, and a task holding
+/// *that* reproduces the identical hazard one level down. Both counts are
+/// therefore asserted, and the engine count is the one with teeth.
 #[test]
 fn a_prefetch_task_does_not_capture_the_loader() {
     let dir = tempfile::tempdir().unwrap();
@@ -1404,6 +1370,9 @@ fn a_prefetch_task_does_not_capture_the_loader() {
     // no task is holding anything, so the count looks clean.
     let entered = gate.wait_for_entry(std::time::Duration::from_secs(30));
     let held = Arc::strong_count(&loader);
+    // Two owners: the loader's own `OnceLock` and the live iterator. A third
+    // means a `spawn_blocking` task captured it.
+    let held_engine = loader.engine.get().map(Arc::strong_count).unwrap_or(0);
     gate.release();
 
     let (it, batch) = handle.join().expect("worker must not panic");
@@ -1420,6 +1389,13 @@ fn a_prefetch_task_does_not_capture_the_loader() {
         "a prefetch task in flight is holding an Arc<IndexPlanLoader> \
          (strong_count={held}); such a task can outlive the iterator and drop \
          the runtime from a runtime thread"
+    );
+    assert_eq!(
+        held_engine, 2,
+        "a prefetch task in flight is holding an Arc<PrefetchEngine> \
+         (strong_count={held_engine}); the engine owns the runtime, so an \
+         unabortable blocking task that holds it can release the last reference \
+         from one of that runtime's own threads — see `crate::runtime`"
     );
 }
 
