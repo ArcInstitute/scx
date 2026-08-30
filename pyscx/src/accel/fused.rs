@@ -14,8 +14,8 @@ use super::gpu::resolve_device;
 
 #[cfg(feature = "gpu")]
 use super::pca::{
-    emit_cusparse_abi_warning, parse_qr_method, resolve_gpu_method, try_extract_borrowed_csr,
-    write_pca_to_adata, BorrowedCsrSource, ScxCsrSource,
+    emit_cusparse_abi_warning, parse_qr_method, try_extract_borrowed_csr, write_pca_to_adata,
+    BorrowedCsrSource, ScxCsrSource,
 };
 #[cfg(feature = "gpu")]
 #[cfg(feature = "gpu")]
@@ -206,7 +206,6 @@ pub fn pca_neighbors(
                     zero_center,
                     random_state,
                     qr,
-                    method,
                     n_neighbors,
                     use_rep,
                     device,
@@ -225,7 +224,6 @@ pub fn pca_neighbors(
                     zero_center,
                     random_state,
                     qr,
-                    method,
                     n_neighbors,
                     use_rep,
                     device,
@@ -249,7 +247,6 @@ pub fn pca_neighbors(
                     zero_center,
                     random_state,
                     qr,
-                    method,
                     n_neighbors,
                     use_rep,
                     device,
@@ -269,7 +266,6 @@ pub fn pca_neighbors(
                     zero_center,
                     random_state,
                     qr,
-                    method,
                     n_neighbors,
                     use_rep,
                     device,
@@ -552,16 +548,10 @@ fn run_fused_gpu<S: ShardSource + Sync>(
     zero_center: bool,
     random_state: u64,
     qr: scx_accel::QrMethod,
-    method: &str,
     n_neighbors: usize,
     use_rep: &str,
     device: &str,
 ) -> PyResult<()> {
-    let n_vars = source.n_vars();
-    // The covariance GPU PCA path was removed; `resolve_gpu_method` validates
-    // the method string and always resolves the native fused path to randomized.
-    resolve_gpu_method(method, n_vars)?;
-
     let (pca_res, knn_res) = fused_dispatch_unwind_safe(
         device_id,
         source,

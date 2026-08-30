@@ -260,23 +260,6 @@ pub(super) fn try_extract_borrowed_csr<'py>(
     Ok(Some((slices, shape)))
 }
 
-/// Resolve the native GPU PCA method.
-///
-/// The in-VRAM covariance-PCA kernels were removed: in-VRAM `device="gpu"` PCA
-/// now routes to rapids-singlecell, and the only surviving native GPU path is
-/// randomized (the streaming / device-resident moat). All accepted `method`
-/// values therefore resolve to `"randomized"` here; `method="covariance"` is
-/// still honored on the **CPU** path (`covariance_pca`).
-#[cfg(feature = "gpu")]
-pub(crate) fn resolve_gpu_method(method: &str, _n_vars: usize) -> PyResult<&'static str> {
-    match method {
-        "auto" | "covariance" | "randomized" => Ok("randomized"),
-        other => Err(PyValueError::new_err(format!(
-            "Invalid method={other:?}; expected 'auto', 'covariance', or 'randomized'"
-        ))),
-    }
-}
-
 /// Parse a `qr_method` string into a [`scx_gpu::QrMethod`]. Both values are
 /// valid now (Phase 4 wired up CholeskyQR2 behind `"cholesky"`).
 #[cfg(feature = "gpu")]
@@ -302,10 +285,11 @@ fn build_pca_tuning(allow_tf32: bool, spmm_policy: &str) -> scx_accel::GpuPcaTun
     scx_accel::GpuPcaTuning::new(scx_accel::GpuMathMode::from_allow_tf32(allow_tf32), policy)
 }
 
-/// Dispatch native GPU PCA. The in-VRAM covariance path was removed, so
-/// `resolve_gpu_method` always yields `"randomized"` and this helper routes to
-/// `randomized_pca_gpu`. All GPU-branch call-sites funnel through here.
-/// `qr_method` selects the QR step (Householder default, Cholesky opt-in).
+/// Dispatch native GPU PCA. The in-VRAM covariance path was removed, so every
+/// accepted `method` (validated once by `PcaMethodRequest::parse` at the entry
+/// points) runs `randomized_pca_gpu` — the streaming / device-resident moat.
+/// All GPU-branch call-sites funnel through here. `qr_method` selects the QR
+/// step (Householder default, Cholesky opt-in).
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn gpu_pca_dispatch<S: ShardSource + Sync>(
@@ -316,27 +300,20 @@ fn gpu_pca_dispatch<S: ShardSource + Sync>(
     n_power_iterations: usize,
     zero_center: bool,
     random_state: u64,
-    method: &str,
     qr_method: scx_accel::QrMethod,
     tuning: scx_accel::GpuPcaTuning,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
-    match method {
-        "randomized" => scx_accel::randomized_pca_gpu(
-            device_id,
-            source,
-            n_comps,
-            n_oversamples,
-            n_power_iterations,
-            zero_center,
-            random_state,
-            qr_method,
-            tuning,
-        ),
-        // Unreachable after resolve_gpu_method() normalisation.
-        _ => Err(scx_accel::AccelError::LinAlg(format!(
-            "internal: unknown resolved method {method:?}"
-        ))),
-    }
+    scx_accel::randomized_pca_gpu(
+        device_id,
+        source,
+        n_comps,
+        n_oversamples,
+        n_power_iterations,
+        zero_center,
+        random_state,
+        qr_method,
+        tuning,
+    )
 }
 
 /// Catch any cudarc dlsym / FFI panic that escapes `gpu_pca_dispatch` and
@@ -355,7 +332,6 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
     n_power_iterations: usize,
     zero_center: bool,
     random_state: u64,
-    method: &str,
     qr_method: scx_accel::QrMethod,
     tuning: scx_accel::GpuPcaTuning,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
@@ -368,7 +344,6 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
             n_power_iterations,
             zero_center,
             random_state,
-            method,
             qr_method,
             tuning,
         )
@@ -843,15 +818,17 @@ pub fn pca(
         // recorded only for the randomized route that actually consumes them
         // (covariance passes `None`); `stamp_pca_route` itself drops every knob
         // on a non-GPU route.
-        let stamp = |resident_csr: Option<bool>, m: &str| -> PyResult<()> {
-            let is_rand = m == "randomized";
+        // Every accepted `method` runs the randomized kernel on the GPU path
+        // (the in-VRAM covariance kernels were removed), so the math-mode /
+        // spmm labels are unconditionally relevant here.
+        let stamp = |resident_csr: Option<bool>| -> PyResult<()> {
             stamp_pca_route(
                 py,
                 adata,
                 device,
                 pca_gpu_eligible,
-                is_rand.then_some(math_mode_label),
-                is_rand.then_some(spmm_policy_lbl),
+                Some(math_mode_label),
+                Some(spmm_policy_lbl),
                 resident_csr,
             )
         };
@@ -868,8 +845,6 @@ pub fn pca(
             // below), so the LRU would stay at the open-time `cache_shards` and
             // thrash. Uncached matches the pre-existing behaviour exactly.
             let source = backed.as_shard_source();
-            let n_vars = ShardSource::n_vars(&source);
-            let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
             let result = match mask_cols {
                 Some(cols) => {
                     let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
@@ -881,7 +856,6 @@ pub fn pca(
                         n_power_iterations,
                         zero_center,
                         random_state,
-                        m,
                         qr,
                         tuning,
                     )
@@ -894,13 +868,12 @@ pub fn pca(
                     n_power_iterations,
                     zero_center,
                     random_state,
-                    m,
                     qr,
                     tuning,
                 ),
             }
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp(result.resident_csr, m)?;
+            stamp(result.resident_csr)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
             route.commit();
             return Ok(());
@@ -908,8 +881,6 @@ pub fn pca(
 
         if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
             let source = lazy.as_shard_source();
-            let (_n_obs, n_vars) = source.shape();
-            let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
             let result = match mask_cols {
                 Some(cols) => {
                     let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
@@ -921,7 +892,6 @@ pub fn pca(
                         n_power_iterations,
                         zero_center,
                         random_state,
-                        m,
                         qr,
                         tuning,
                     )
@@ -934,13 +904,12 @@ pub fn pca(
                     n_power_iterations,
                     zero_center,
                     random_state,
-                    m,
                     qr,
                     tuning,
                 ),
             }
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp(result.resident_csr, m)?;
+            stamp(result.resident_csr)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
             route.commit();
             return Ok(());
@@ -967,8 +936,6 @@ pub fn pca(
                 data: slices.data(),
                 shape,
             };
-            let n_vars = source.n_vars();
-            let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
             let result = match mask_cols {
                 Some(cols) => {
                     let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
@@ -980,7 +947,6 @@ pub fn pca(
                         n_power_iterations,
                         zero_center,
                         random_state,
-                        m,
                         qr,
                         tuning,
                     )
@@ -993,13 +959,12 @@ pub fn pca(
                     n_power_iterations,
                     zero_center,
                     random_state,
-                    m,
                     qr,
                     tuning,
                 ),
             }
             .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            stamp(result.resident_csr, m)?;
+            stamp(result.resident_csr)?;
             write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
             route.commit();
             return Ok(());
@@ -1008,8 +973,6 @@ pub fn pca(
         // Fallback: owned-Vec path (e.g. exotic X types scipy can't view).
         let csr = crate::convert::owned_csr(py, &x, None)?;
         let source = ScxCsrSource { csr: &csr };
-        let n_vars = source.n_vars();
-        let m = resolve_gpu_method(method, mask_cols.map(|c| c.len()).unwrap_or(n_vars))?;
         let result = match mask_cols {
             Some(cols) => {
                 let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
@@ -1021,7 +984,6 @@ pub fn pca(
                     n_power_iterations,
                     zero_center,
                     random_state,
-                    m,
                     qr,
                     tuning,
                 )
@@ -1034,13 +996,12 @@ pub fn pca(
                 n_power_iterations,
                 zero_center,
                 random_state,
-                m,
                 qr,
                 tuning,
             ),
         }
         .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-        stamp(result.resident_csr, m)?;
+        stamp(result.resident_csr)?;
         write_pca_to_adata(py, adata, &result, "scx-gpu-cusparse", Some(&write_params))?;
         route.commit();
         return Ok(());
