@@ -57,8 +57,14 @@ not a blocker.
 | Python | numpy | scipy | pyarrow | anndata | scanpy | OS | Status |
 |---|---|---|---|---|---|---|---|
 | 3.11 | pip-resolved (≥1.24) | pip-resolved (≥1.10) | 23.0.1 (pinned) | pip-resolved (≥0.11,<0.13) | pip-resolved (≥1.10) | ubuntu-latest | ✅ `ci.yml::python` job |
-| 3.11 | n/a (wheel build) | n/a | n/a | n/a | n/a | manylinux x86_64 | ✅ `pyscx-release.yml` |
-| 3.12 | n/a (wheel build) | n/a | n/a | n/a | n/a | manylinux x86_64 | ✅ `pyscx-release.yml` |
+| 3.11+ | n/a (abi3 wheel build) | n/a | n/a | n/a | n/a | manylinux x86_64 + aarch64 | ✅ `pyscx-release.yml` |
+
+Release wheels are built against the CPython stable ABI (`pyo3/abi3-py311`),
+so one `cp311-abi3` wheel per architecture installs on every CPython ≥ 3.11 —
+there is no per-minor wheel matrix. Each release leg additionally installs the
+wheel into a host Python 3.13 and imports it, proving the cross-version
+install path on every run. The abi3 build was gated on the full pytest suite
+passing against the abi3 wheel on both 3.11 and 3.13.
 
 `pyarrow==23.0.1` is pinned in `ci.yml` to exercise the widened upper
 bound rather than whatever pip happens to resolve — see the comment at
