@@ -282,13 +282,19 @@ impl AccelExecutionInfo {
                 "fallback_reason",
                 RouteValue::Str(self.fallback_reason.as_str()),
             ),
-            ("chunk_size", RouteValue::OptUsize(self.chunk_size)),
+            (
+                "chunk_size",
+                RouteValue::OptU64(self.chunk_size.map(|v| v as u64)),
+            ),
             ("graph_replay", RouteValue::OptBool(self.graph_replay)),
             ("csc_available", RouteValue::OptBool(self.csc_available)),
-            ("shards_decoded", RouteValue::OptUsize(self.shards_decoded)),
+            (
+                "shards_decoded",
+                RouteValue::OptU64(self.shards_decoded.map(|v| v as u64)),
+            ),
             (
                 "shards_uploaded",
-                RouteValue::OptUsize(self.shards_uploaded),
+                RouteValue::OptU64(self.shards_uploaded.map(|v| v as u64)),
             ),
             ("math_mode", RouteValue::OptStr(self.math_mode)),
             ("spmm_policy", RouteValue::OptStr(self.spmm_policy)),
@@ -305,11 +311,14 @@ impl AccelExecutionInfo {
                 RouteValue::OptStr(self.cupy_version.as_deref()),
             ),
             ("transfer_mode", RouteValue::OptStr(self.transfer_mode)),
-            ("device_id", RouteValue::OptUsize(self.device_id)),
+            (
+                "device_id",
+                RouteValue::OptU64(self.device_id.map(|v| v as u64)),
+            ),
             ("bytes_uploaded", RouteValue::OptU64(self.bytes_uploaded)),
             (
                 "n_shards_shufdelta_gpu",
-                RouteValue::OptU32(self.n_shards_shufdelta_gpu),
+                RouteValue::OptU64(self.n_shards_shufdelta_gpu.map(u64::from)),
             ),
             ("resident_csr", RouteValue::OptBool(self.resident_csr)),
         ]
@@ -326,11 +335,10 @@ pub enum RouteValue<'a> {
     OptStr(Option<&'a str>),
     /// Optional boolean flag.
     OptBool(Option<bool>),
-    /// Optional count/index.
-    OptUsize(Option<usize>),
-    /// Optional 32-bit counter.
-    OptU32(Option<u32>),
-    /// Optional byte count.
+    /// Optional integer counter/index (counts, ids, byte totals). One wire
+    /// width for every integer field: both binding sinks flatten to a single
+    /// numeric type anyway (Python int / R double), and every value this
+    /// record can hold is exactly representable in both.
     OptU64(Option<u64>),
 }
 

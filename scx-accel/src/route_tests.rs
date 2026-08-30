@@ -401,7 +401,7 @@ fn fields_carries_the_values_not_defaults() {
         RouteValue::Str("rapids_singlecell_gpu")
     ));
     assert!(matches!(get("fallback_reason"), RouteValue::Str("none")));
-    assert!(matches!(get("device_id"), RouteValue::OptUsize(Some(2))));
+    assert!(matches!(get("device_id"), RouteValue::OptU64(Some(2))));
     assert!(matches!(
         get("rapids_version"),
         RouteValue::OptStr(Some("0.12.1"))
@@ -416,7 +416,7 @@ fn fields_carries_the_values_not_defaults() {
     ));
     // Unset optionals serialise as explicit None entries, not omissions.
     assert!(matches!(get("cuml_version"), RouteValue::OptStr(None)));
-    assert!(matches!(get("chunk_size"), RouteValue::OptUsize(None)));
+    assert!(matches!(get("chunk_size"), RouteValue::OptU64(None)));
 }
 
 // --- GPU-fallback warning predicate (moved from pyscx) ---

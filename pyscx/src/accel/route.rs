@@ -90,8 +90,6 @@ pub(crate) fn exec_info_to_pydict<'py>(
             RouteValue::Str(v) => d.set_item(key, v)?,
             RouteValue::OptStr(v) => d.set_item(key, v)?,
             RouteValue::OptBool(v) => d.set_item(key, v)?,
-            RouteValue::OptUsize(v) => d.set_item(key, v)?,
-            RouteValue::OptU32(v) => d.set_item(key, v)?,
             RouteValue::OptU64(v) => d.set_item(key, v)?,
         }
     }

@@ -127,12 +127,6 @@ pub(crate) fn exec_info_to_rlist(info: &AccelExecutionInfo) -> Result<Robj> {
             RouteValue::Str(s) => (*s).into_robj(),
             RouteValue::OptStr(o) => o.map(|s| s.into_robj()).unwrap_or_else(|| ().into_robj()),
             RouteValue::OptBool(o) => o.map(|b| b.into_robj()).unwrap_or_else(|| ().into_robj()),
-            RouteValue::OptUsize(o) => o
-                .map(|u| (u as f64).into_robj())
-                .unwrap_or_else(|| ().into_robj()),
-            RouteValue::OptU32(o) => o
-                .map(|u| (u as f64).into_robj())
-                .unwrap_or_else(|| ().into_robj()),
             RouteValue::OptU64(o) => o
                 .map(|u| (u as f64).into_robj())
                 .unwrap_or_else(|| ().into_robj()),
