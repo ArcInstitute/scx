@@ -153,6 +153,16 @@ def test_native_docstring_is_the_pointer(name):
         f"Python wrapper docstring (expected: …{POINTER_SENTENCE!r}). A full "
         "second copy WILL drift — that is the bug class this convention ended."
     )
+    # The pointer sentence alone would pass on a doc that KEPT the full second
+    # copy and merely appended the sentence. An `Args:` block is the signature
+    # of a full contract, so its absence is what actually enforces
+    # "pointer, not copy" (short Rust-reader notes without an Args block are
+    # fine — e.g. to_h5ad's numpy-vs-wrapper coercion note).
+    assert "Args:" not in ndoc, (
+        f"pyscx.pyscx.{name}'s Rust /// doc carries an Args: block — that is a "
+        "second copy of the contract, not a pointer. Move the content to the "
+        "Python wrapper docstring."
+    )
 
 
 @pytest.mark.parametrize("name", list(_pairs()) + ["read", "write"])

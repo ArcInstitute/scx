@@ -286,8 +286,9 @@ enum Commands {
         reference: Option<String>,
         /// Byte-budget grouped sharding for `--group-by`: target shard size in
         /// bytes (group edges only) instead of `--shard-size` rows. Same size
-        /// syntax as `--memory-budget`. CSR inputs only — dense/CSC fall back to
-        /// row-count with a warning.
+        /// syntax as `--memory-budget`. Byte planning runs on the CSR one-pass
+        /// route and on any two-pass route (`scx sort` sizes there);
+        /// `--group-pass one` over a non-CSR source with a byte budget errors.
         #[arg(long, value_name = "SIZE")]
         group_target_bytes: Option<String>,
         /// Oversize threshold for `--group-target-bytes`: a single group above
@@ -295,10 +296,13 @@ enum Commands {
         /// `--memory-budget`. Defaults to 4× `--group-target-bytes`.
         #[arg(long, value_name = "SIZE")]
         group_max_bytes: Option<String>,
-        /// How to realize `--group-by`. `auto` (default) routes by source
-        /// density: CSR → one-pass streaming (cheaper); dense → two-pass
-        /// (plain convert + `scx sort`, ~4–5× faster than the one-pass
-        /// random-row gather over a dense matrix). `one` / `two` force it.
+        /// How to realize `--group-by`. `auto` (default) picks two-pass (plain
+        /// convert + `scx sort`) for a dense X (~4–5× faster than the one-pass
+        /// random-row gather over dense) and whenever the file carries obsp
+        /// (one-pass cannot remap pairwise graphs); CSR without obsp streams
+        /// in one pass. `one` / `two` force it; a forced `one` rejects the
+        /// combinations it cannot honor (non-CSR + `--group-target-bytes`,
+        /// any source with obsp).
         #[arg(long, default_value = "auto", value_parser = ["auto", "one", "two"])]
         group_pass: String,
     },

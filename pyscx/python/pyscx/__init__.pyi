@@ -702,8 +702,7 @@ class Experiment:
 
 
 def open(path: Any, verify: bool = ...) -> Experiment:  # noqa: A001
-    """Open an SCX file as an `Experiment` handle. Canonical docstring on the
-    `pyscx.open` wrapper (`help(pyscx.open)`)."""
+    """Open an SCX file as an `Experiment` handle."""
     ...
 
 
@@ -720,8 +719,8 @@ def write(adata: Any, path: Any, **kwargs: Any) -> None:
 
 
 def validate(path: Any, deep: bool = ...) -> list[tuple[str, bool]]:
-    """Validate catalog + section BLAKE3 checksums (`deep=` re-decodes shards).
-    Canonical docstring on the `pyscx.validate` wrapper."""
+    """Validate an SCX file's catalog + per-section BLAKE3 checksums
+    (`deep=` additionally re-decodes every sparse shard)."""
     ...
 
 

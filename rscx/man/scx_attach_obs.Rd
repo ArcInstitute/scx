@@ -54,8 +54,8 @@ them into one \code{data.frame} and attach once.}
 \code{NA}; \code{"error"} refuses. \code{"zero"} is an accepted legacy
 alias for \code{"null"} — the shared policy's zero is literal only where
 the missing thing is a matrix row (pyscx's \code{cellbender_import}),
-which really is zeros. Uncovered rows are also marked absent in
-\code{status_column}.}
+which really is zeros. When a \code{status_column} is requested,
+uncovered rows are also marked absent there.}
 
 \item{on_extra_rows}{\code{"warn"} (default) skips source rows the target
 lacks; \code{"error"} refuses.}
