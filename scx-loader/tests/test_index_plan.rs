@@ -695,10 +695,15 @@ fn iter_prefetch_counters_account_for_every_touched_shard() {
 /// order.
 ///
 /// `process_plan` takes `Vec<(u64,u64)>` **by value** and does this sort in
-/// place; `PlanPrefetchIter`'s `ProcFn` takes `&P`, and its module docs say the
-/// engine deliberately preserves plan order ("no `sort_by_shard` reorder"). So
-/// the fold has to re-sign `process_plan` — to `&[(u64,u64)]` plus an internal
-/// copy, or to a caller-side clone — and that is a change this test can see.
+/// place, then moves the sorted plan into the batch's `pairs`.
+///
+/// Written as a pre-refactor pin on the assumption that ORG-9.10-1 would have
+/// to re-sign it — `PlanPrefetchIter`'s `ProcFn` took `&P`, and the engine's
+/// module docs say it preserves plan order ("no `sort_by_shard` reorder"). The
+/// fold went the other way instead: `ProcFn` now takes the plan **by value**,
+/// because the in-flight queue is its last owner, so `process_plan` is
+/// untouched and there is no per-batch clone. The pin still earns its place —
+/// it is the only test here that can see the sort stop happening.
 ///
 /// The two existing sort tests cannot: `sort_by_shard_pairs_align_with_rows`
 /// only checks `pairs[i]` against row `i`, and `sort_by_shard_is_pure_permutation`
