@@ -1250,30 +1250,8 @@ impl IndexPlanDataset {
             warn_hvg_panel(py, "IndexPlanDataset", &v)?;
         }
 
-        // Preflight: the scattered block-index fast path can only fire on
-        // row-group-framed shards, and only when the process-global switch is on
-        // (`SCX_SCATTER_BLOCK_INDEX`). If the caller asked for it (default), the
-        // switch is enabled, but the file is an all-unframed legacy layout, every
-        // batch full-shard-decodes with no other signal — warn loudly and point
-        // at the reframe command. When the switch is off, reframing can't enable
-        // the path, so there is nothing to warn about.
-        // (One-shot per path: Python's default warning filter dedupes per call
-        // site + message text, and the message embeds `{path}`.)
-        if scatter_block_index
-            && scx_format_io::backed::scatter_block_index_enabled()
-            && !loader.any_shard_framed()
-        {
-            let warnings = crate::pyimport::import_module(py, "warnings")?;
-            let user_warning =
-                crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
-            let msg = format!(
-                "IndexPlanDataset opened '{path}' with scatter_block_index=True, but no \
-                 CSR shard is row-group framed (unframed legacy file). Scattered reads \
-                 will full-shard-decode every batch — the block-index fast path cannot \
-                 fire. Reframe with `scx optimize --row-group-rows 256 <file>`, or pass \
-                 scatter_block_index=False to silence this warning."
-            );
-            warnings.call_method1("warn", (msg, user_warning))?;
+        if scatter_block_index && !loader.any_shard_framed() {
+            warn_unframed_scatter(py, "IndexPlanDataset", &format!("'{path}'"))?;
         }
 
         Ok(Self {
@@ -1374,7 +1352,10 @@ impl IndexPlanDataset {
             Ok(plans.bind(py).call_method0("__iter__")?.unbind())
         })?;
 
-        let plan_stream = PyPlanIterator { py_iter };
+        let plan_stream = PyPlanIterator {
+            py_iter,
+            extract: extract_pair_plan,
+        };
         let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         let iter_metrics = inner.iter_metrics();
         let cache_metrics = loader.cache_metrics();
@@ -1534,28 +1515,70 @@ impl Drop for IndexPlanDataset {
     }
 }
 
-/// Adapter: Python iterator → Rust `Iterator<Item = Result<Vec<(u64,u64)>, _>>`.
+/// How one plan type is read out of the object a Python generator yielded.
 ///
-/// `Py<PyAny>` is `Send` + `Sync`, so this struct can cross the thread boundary
-/// to the plan-pull worker. Each `next` reacquires the GIL just for the
-/// `__next__` call so the GIL is freely available between pulls.
-struct PyPlanIterator {
-    py_iter: Py<PyAny>,
+/// A function pointer, not a `T: for<'py> FromPyObject<'py>` bound: the two plan
+/// types differ in the *diagnostic* they owe a caller who yields the wrong
+/// shape, and that bound would collapse both onto pyo3's generic extract error.
+/// The cell-set arm in particular names its four arrays and their dtypes, which
+/// is the difference between a usable message and "expected tuple of length 4".
+type PlanExtract<T> = fn(&Bound<'_, PyAny>) -> std::result::Result<T, LoaderError>;
+
+/// `[(pert_row, ctrl_row), ...]` — the pair loader's plan.
+fn extract_pair_plan(
+    obj: &Bound<'_, PyAny>,
+) -> std::result::Result<Vec<(u64, u64)>, LoaderError> {
+    obj.extract::<Vec<(u64, u64)>>()
+        .map_err(|e| LoaderError::ConfigError {
+            reason: format!("plan extraction failed: {e}"),
+        })
 }
 
-impl Iterator for PyPlanIterator {
-    type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
+/// `(file_ids, rows, role_tags, set_offsets)` — the cell-set loader's plan.
+fn extract_cellset_plan(
+    obj: &Bound<'_, PyAny>,
+) -> std::result::Result<SparseCellSetPlan, LoaderError> {
+    let (file_ids, rows, role_tags, set_offsets) = obj
+        .extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>()
+        .map_err(|e| LoaderError::ConfigError {
+            reason: format!(
+                "sparse plan extraction failed (expected a tuple \
+                 (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[])): {e}"
+            ),
+        })?;
+    Ok(SparseCellSetPlan {
+        file_ids,
+        rows,
+        role_tags,
+        set_offsets,
+    })
+}
+
+/// Adapter: Python iterator → Rust `Iterator<Item = Result<T, LoaderError>>`,
+/// for both plan-driven loaders.
+///
+/// `Py<PyAny>` and `fn` pointers are `Send` + `Sync`, so this struct crosses the
+/// thread boundary to the plan-pull worker without a `PhantomData` or an
+/// `unsafe` impl. Each `next` reacquires the GIL just for the `__next__` call so
+/// the GIL is freely available between pulls.
+///
+/// What is shared is the awkward part — the `__next__` call, telling
+/// `StopIteration` from a real exception, and the fact that a `PyErr` cannot
+/// cross the plan channel into the consumer's `Result`, so it travels as
+/// message text. What stays per-plan-type is the extraction, in [`PlanExtract`].
+struct PyPlanIterator<T> {
+    py_iter: Py<PyAny>,
+    extract: PlanExtract<T>,
+}
+
+impl<T> Iterator for PyPlanIterator<T> {
+    type Item = std::result::Result<T, LoaderError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Python::attach(|py| {
             let bound = self.py_iter.bind(py);
             match bound.call_method0("__next__") {
-                Ok(obj) => match obj.extract::<Vec<(u64, u64)>>() {
-                    Ok(plan) => Some(Ok(plan)),
-                    Err(e) => Some(Err(LoaderError::ConfigError {
-                        reason: format!("plan extraction failed: {e}"),
-                    })),
-                },
+                Ok(obj) => Some((self.extract)(&obj)),
                 Err(e) => {
                     if e.is_instance_of::<PyStopIteration>(py) {
                         None
@@ -1733,6 +1756,53 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
 /// Emit the construction-time `UserWarning` for a shard cache the memory budget
 /// could not afford.
 ///
+/// Preflight `UserWarning` for `scatter_block_index=True` against a file (or a
+/// set of files) where no CSR shard is row-group framed.
+///
+/// The block-index fast path can only fire on framed shards, and only when the
+/// process-global `SCX_SCATTER_BLOCK_INDEX` switch is on. If the caller asked
+/// for it, the switch is enabled, and the data is an all-unframed legacy
+/// layout, then every batch full-shard-decodes with no other signal — warn and
+/// point at the reframe command. When the switch is off, reframing cannot
+/// enable the path either, so there is nothing to warn about.
+///
+/// `target` describes what was opened — a quoted path on the single-file
+/// classes, a count plus a sample on the multi-file one — and carries the
+/// deduplication: Python's default filter keys on (message, category, module,
+/// lineno), so embedding the paths makes this one-shot per dataset rather than
+/// per process.
+///
+/// Same house style as [`warn_cache_sizing`]: warn and continue, never refuse.
+fn warn_unframed_scatter(py: Python<'_>, dataset: &str, target: &str) -> PyResult<()> {
+    if !scx_format_io::backed::scatter_block_index_enabled() {
+        return Ok(());
+    }
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
+    let msg = format!(
+        "{dataset} opened {target} with scatter_block_index=True, but no \
+         CSR shard is row-group framed (unframed legacy file). Scattered reads \
+         will full-shard-decode every batch — the block-index fast path cannot \
+         fire. Reframe with `scx optimize --row-group-rows 256 <file>`, or pass \
+         scatter_block_index=False to silence this warning."
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
+}
+
+/// Describe a multi-file open for [`warn_unframed_scatter`]: a count, plus up
+/// to two names so the message is actionable without being a wall of paths.
+fn describe_paths(paths: &[String]) -> String {
+    match paths {
+        [one] => format!("'{one}'"),
+        _ => {
+            let shown: Vec<String> = paths.iter().take(2).map(|p| format!("'{p}'")).collect();
+            let ellipsis = if paths.len() > 2 { ", …" } else { "" };
+            format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
+        }
+    }
+}
+
 /// Follows the house style of the `scatter_block_index` preflight below: warn and
 /// continue (never refuse), name the observed numbers, name the knob, and name
 /// the exact value that would fix it. Deduping is left to CPython's
@@ -2156,49 +2226,6 @@ fn batch_to_dict<'py>(py: Python<'py>, batch: Batch) -> PyResult<Bound<'py, PyDi
 // SparseCellSetDataset — native sparse cell-set loader (SCX-DATA-LOADER §4)
 // ---------------------------------------------------------------------------
 
-/// Adapter: Python iterator of `(file_ids, rows, role_tags, set_offsets)`
-/// tuples → Rust `Iterator<Item = Result<SparseCellSetPlan>>`. Mirrors
-/// [`PyPlanIterator`]: `Py<PyAny>` is `Send`, and each `next` reacquires the
-/// GIL only for the `__next__` call.
-struct PySparseCellSetPlanIterator {
-    py_iter: Py<PyAny>,
-}
-
-impl Iterator for PySparseCellSetPlanIterator {
-    type Item = std::result::Result<SparseCellSetPlan, LoaderError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        Python::attach(|py| {
-            let bound = self.py_iter.bind(py);
-            match bound.call_method0("__next__") {
-                Ok(obj) => match obj.extract::<(Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>)>() {
-                    Ok((file_ids, rows, role_tags, set_offsets)) => Some(Ok(SparseCellSetPlan {
-                        file_ids,
-                        rows,
-                        role_tags,
-                        set_offsets,
-                    })),
-                    Err(e) => Some(Err(LoaderError::ConfigError {
-                        reason: format!(
-                            "sparse plan extraction failed (expected a tuple \
-                             (file_ids:u32[], rows:u64[], role_tags:i32[], set_offsets:i64[])): {e}"
-                        ),
-                    })),
-                },
-                Err(e) => {
-                    if e.is_instance_of::<PyStopIteration>(py) {
-                        None
-                    } else {
-                        Some(Err(LoaderError::ChannelError(format!(
-                            "plan iterator raised: {e}"
-                        ))))
-                    }
-                }
-            }
-        })
-    }
-}
-
 /// Plan-driven native sparse cell-set reader. Each plan item is one batch of
 /// cell sets (delimited by `set_offsets`); each yielded dict carries the
 /// SCX-DATA-LOADER §4.4 sparse contract. Sibling to `IndexPlanDataset` but
@@ -2350,6 +2377,9 @@ impl SparseCellSetDataset {
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
         }
+        if scatter_block_index && !loader.any_shard_framed() {
+            warn_unframed_scatter(py, "SparseCellSetDataset", &describe_paths(&paths))?;
+        }
 
         Ok(Self {
             loader: Some(loader),
@@ -2410,7 +2440,10 @@ impl SparseCellSetDataset {
             Ok(plans.bind(py).call_method0("__iter__")?.unbind())
         })?;
 
-        let plan_stream = PySparseCellSetPlanIterator { py_iter };
+        let plan_stream = PyPlanIterator {
+            py_iter,
+            extract: extract_cellset_plan,
+        };
         let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
         let iter_metrics = inner.iter_metrics();
         Ok(SparseCellSetBatchIter {

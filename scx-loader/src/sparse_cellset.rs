@@ -171,9 +171,9 @@ impl SparseCellSetLoader {
     /// `scatter_block_index` is a pure pass-through to
     /// [`PrefetchEngine::from_scx_readers`] — deliberately not stored, because
     /// the flag's only consumer is the reader it is set on, and a second copy
-    /// here could disagree with it. `SparseCellSetDataset` passes `false`; see
-    /// that constructor for why the cell-set regime wants the full-shard
-    /// warm+cache path.
+    /// here could disagree with it. `SparseCellSetDataset` *defaults* it to
+    /// `false` and passes the caller's kwarg; see that constructor for why the
+    /// cell-set regime wants the full-shard warm+cache path by default.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         scx_readers: Vec<ScxReader>,
@@ -371,6 +371,16 @@ impl SparseCellSetLoader {
     /// Number of readers (`file_id` range).
     pub fn n_files(&self) -> usize {
         self.engine.n_readers()
+    }
+
+    /// True if any file in the set has a row-group-framed CSR shard.
+    ///
+    /// The multi-file sibling of [`crate::IndexPlanLoader::any_shard_framed`],
+    /// and the same consumer: the Python constructor warns when the caller
+    /// asked for `scatter_block_index=True` against a set where the route can
+    /// never fire.
+    pub fn any_shard_framed(&self) -> bool {
+        self.engine.any_shard_framed()
     }
 
     /// Shared handle to the readers' one `SharedShardCache` counters

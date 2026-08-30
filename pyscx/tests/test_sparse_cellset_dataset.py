@@ -608,8 +608,9 @@ def test_unframed_scatter_emits_preflight_warning(two_unframed_scx):
     assert "2 files" in msg, f"a multi-file set must be described as such: {msg}"
     assert "scx optimize" in msg, f"must name the fix: {msg}"
 
-    # Warn-and-continue, never a refusal: it still gathers.
-    plan = ([0, 1], [0, 5], [0, 0], [0, 2])
+    # Warn-and-continue, never a refusal: it still gathers. Two single-file
+    # sets — a set spanning files needs remap tables, which is a different error.
+    plan = ([0, 1], [0, 5], [0, 1], [0, 1, 2])
     b = next(iter(ds.iter_with_plans(iter([plan]))))
     assert b["shape"][0] == 2
     assert ds.cache_metrics()["block_index_groups"] == 0

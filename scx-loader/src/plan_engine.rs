@@ -152,6 +152,20 @@ impl PrefetchEngine {
         &self.readers[file_id as usize]
     }
 
+    /// True if **any** reader has at least one row-group-framed CSR shard, i.e.
+    /// the scattered block-index fast path can fire somewhere in this set.
+    ///
+    /// Any, not all, and that is the whole semantic: one framed file among
+    /// twenty means the route is live for that file's rows, so treating the set
+    /// as inert would be wrong. Callers use it at open time to warn that
+    /// `scatter_block_index=True` bought them nothing —
+    /// [`BackedCsrReader::any_shard_framed`] reads shard *headers* only,
+    /// memoized per shard, and both this and it short-circuit on the first
+    /// framed shard, so the cost is paid in full only by an all-unframed set.
+    pub fn any_shard_framed(&self) -> bool {
+        self.readers.iter().any(|r| r.any_shard_framed())
+    }
+
     /// Default lookahead depth.
     pub fn default_lookahead(&self) -> usize {
         self.default_lookahead
