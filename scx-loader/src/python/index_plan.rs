@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use scx_format_io::CacheMetrics;
 

@@ -4,7 +4,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pyo3::prelude::*;
 use scx_format_io::CacheMetrics;
 
 use super::*;

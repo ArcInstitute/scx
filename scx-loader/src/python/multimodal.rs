@@ -6,7 +6,6 @@ use std::collections::HashMap;
 
 use numpy::PyArrayMethods;
 use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
 use crate::batch::{Batch, ObsColumn};

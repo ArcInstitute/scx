@@ -76,4 +76,3 @@ def test_user_facing_accelerators_have_stubs():
     runtime = _runtime_functions()
     absent = sorted(required - runtime)
     assert not absent, f"declared accelerators absent from pyscx.accel at runtime: {absent}"
-

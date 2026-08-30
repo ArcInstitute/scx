@@ -4,7 +4,6 @@
 
 use numpy::{PyArray1, PyReadonlyArray1};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::sparse_cellset::{CollateScalars, CollatedCellSetBatch};
@@ -181,9 +180,13 @@ pub fn downsample_counts_csr<'py>(
     if target_library_size == 0 {
         return Err(PyValueError::new_err("target_library_size must be > 0"));
     }
+    // `ValueError`, matching the `target_library_size` check directly above and
+    // the `SparseCellSetDataset` constructor: an unknown method name is a bad
+    // argument value, and a caller catching malformed input should not have to
+    // know which of the two downsample entry points it called.
     let method =
         crate::downsample::DownsampleMethod::parse(method.as_deref().unwrap_or("multinomial"))
-            .map_err(loader_err_to_py)?;
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let err = |e| PyRuntimeError::new_err(format!("array not contiguous: {e}"));
     let indptr = indptr.as_slice().map_err(err)?;

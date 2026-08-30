@@ -522,6 +522,32 @@ def test_unknown_method_names_the_accepted_set(two_scx):
         )
 
 
+def test_standalone_primitive_rejects_an_unknown_method_with_valueerror(two_scx):
+    """`ValueError`, matching the constructor and the zero-target check beside it.
+
+    `downsample_counts_csr` is the second public downsample surface. Its
+    `target_library_size == 0` check already raised `ValueError` while an unknown
+    method fell through `loader_err_to_py`'s default arm to `RuntimeError` — two
+    exception types for two argument checks in one function. Phase 9f made the
+    `SparseCellSetDataset` constructor consistent; without this the two entry
+    points disagreed with each other instead. Found by Cursor Agent in review.
+    """
+    import pyscx
+
+    p0, _ = two_scx
+    plain = _gather(pyscx.SparseCellSetDataset([p0]), [0, 0], [0, 1])
+    with pytest.raises(ValueError, match="hypergeometric"):
+        pyscx.downsample_counts_csr(
+            plain["indptr"],
+            plain["indices"],
+            plain["data"],
+            np.array([0, 1], dtype=np.uint64),
+            np.array([1, 2], dtype=np.uint64),
+            _TARGET,
+            method="hypergeometric",
+        )
+
+
 def test_standalone_primitive_validates_its_array_lengths(two_scx):
     import pyscx
 

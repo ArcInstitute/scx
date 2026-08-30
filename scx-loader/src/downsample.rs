@@ -357,7 +357,7 @@ fn write_back(indices: &mut Vec<i32>, data: &mut Vec<f32>, counts: &[u64]) {
 /// method or a seed without a target is a config error rather than a silent
 /// no-op: it is exactly the typo that would leave a training run un-augmented
 /// while looking configured.
-pub fn resolve_downsample_config(
+pub(crate) fn resolve_downsample_config(
     paths: &[String],
     target: Option<u64>,
     method: Option<&str>,

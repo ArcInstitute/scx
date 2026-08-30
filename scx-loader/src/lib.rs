@@ -26,8 +26,7 @@ pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
 pub use decode_stage::{build_category_dicts, decode_stage, extract_obs_columns, CategoryDict};
 pub use downsample::{
-    clip_negatives, downsample_row, file_identity, resolve_downsample_config, DownsampleConfig,
-    DownsampleMethod,
+    clip_negatives, downsample_row, file_identity, DownsampleConfig, DownsampleMethod,
 };
 pub use error::{LoaderError, Result};
 pub use index_plan::{IndexPlanBatch, IndexPlanIter, IndexPlanLoader};
