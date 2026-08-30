@@ -2834,10 +2834,17 @@ impl SparseCellSetDataset {
     /// breakdown: on this path the shard cache *is* the budget — there is no
     /// batch-buffer or plan-tuple term.
     ///
-    /// `budget_exceeded` is `True` when even a one-shard cache does not fit,
-    /// which is the only case where `total_bytes` exceeds `max_memory_mb`.
-    /// Before ORG-9.10-5 it could exceed it routinely, because the tuner did
-    /// not count the interpreter constant the report included.
+    /// `budget_exceeded` is `True` when even a one-shard cache does not fit.
+    /// Before ORG-9.10-5 `total_bytes` could exceed `max_memory_mb` routinely,
+    /// because the tuner did not count the interpreter constant the report
+    /// included.
+    ///
+    /// That is a statement about **the cache this loader sizes**, not a ceiling
+    /// on process RSS: the gathered batch and its transients are not charged
+    /// (this path has no `max_plan_size`, so plan output size is
+    /// caller-controlled), and the shared LRU keeps a single oversize shard
+    /// rather than refusing to cache it, so one above-average shard can sit
+    /// above the byte cap.
     ///
     /// ORG-9.10-4 renamed `affordable_cache_shards` to `effective_cache_shards`:
     /// it is the same quantity `IndexPlanDataset` reports under that name, and

@@ -180,9 +180,10 @@ class TestBudgetReconciliation:
         # `min(4096, 1 MiB // shard_decoded_bytes)` under `max_memory_mb=1`:
         # arithmetic that only held while the tuner ignored the 50 MB
         # interpreter constant the very same dict reported, and which under a
-        # process-budget reading means "no cache at all". The budget is now an
-        # envelope on all three loader classes, so the cache gets what is left
-        # after the non-cache terms.
+        # process-budget reading means "no cache at all". The tuner now charges
+        # the non-cache terms it reports, so the cache gets what is left after
+        # them. (That bounds the cache this loader sizes, not process RSS — the
+        # gathered batch is uncharged and the LRU keeps one oversize shard.)
         non_cache = b["breakdown"]["total_bytes"] - b["breakdown"]["cache_bytes"]
         expected = min(
             4096, (budget_mb * 1024 * 1024 - non_cache) // b["shard_decoded_bytes"]

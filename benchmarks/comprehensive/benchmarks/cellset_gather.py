@@ -596,11 +596,12 @@ def _budget_mb_for(scx_path: str, cache_shards: int) -> int | None:
     tells a user to configure it. ``None`` ⇒ leave the budget adaptive.
 
     The **non-cache** terms are part of the need, not slack. Since ORG-9.10-5
-    ``max_memory_mb`` is a process envelope on every loader class rather than a
-    bare cache cap on this one, so a budget sized for the shards alone is short
-    by the interpreter constant and the auto-tune shrinks the cache back below
-    what this arm is trying to test. Both terms are read off the same
-    ``memory_budget()`` call so this cannot drift from the model again.
+    the tuner charges the interpreter constant it reports, so a budget sized for
+    the shards alone is short by that constant and the auto-tune shrinks the
+    cache back below what this arm is trying to test. Both terms are read off
+    the same ``memory_budget()`` call so this cannot drift from the model again.
+    (It sizes the loader's *cache*; the gathered batch is not charged, so this
+    is not a bound on the process.)
     """
     try:
         import pyscx

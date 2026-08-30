@@ -874,6 +874,53 @@ fn an_unexceeded_sparse_budget_fits_the_breakdown_it_reports() {
     );
 }
 
+/// The closed form must return exactly what the shared driver would.
+///
+/// `SparseCellSetLoader` resolves its one knob by division rather than by
+/// walking `tune`'s descent, because the knob is caller-controlled and the
+/// descent is O(cache_shards) — 0.7 s at `cache_shards=1e9`, unbounded at
+/// `usize::MAX` (review, round 2). That is only safe while the two agree, so
+/// this sweeps budgets across the interesting range and compares them
+/// element-for-element. It also covers the boundaries the division gets wrong
+/// most easily: an exact fit, a zero budget, and an explicit `cache_shards=0`,
+/// which must stay 0 rather than being floored up to 1.
+#[test]
+fn closed_form_agrees_with_the_shared_driver() {
+    const SHARD: usize = 32_768;
+    let model = SparseCellSetBudgetModel {
+        shard_decoded_bytes: SHARD,
+    };
+    let py = crate::budget::PYTHON_OVERHEAD_BYTES;
+    let budgets = [
+        0,
+        1,
+        py - 1,
+        py,
+        py + 1,
+        py + SHARD - 1,
+        py + SHARD,
+        py + 4 * SHARD,
+        py + 448 * SHARD,
+        512 * 1024 * 1024,
+        4096 * 1024 * 1024,
+    ];
+    for requested in [0usize, 1, 8, 128, 4096] {
+        let req = SparseCellSetParams {
+            cache_shards: requested,
+        };
+        for &budget in &budgets {
+            let closed = resolve_sparse_cache_shards(&model, req, budget);
+            let driven = crate::budget::tune(&model, req, budget);
+            assert_eq!(
+                (closed.params.cache_shards, closed.exhausted),
+                (driven.params.cache_shards, driven.exhausted),
+                "closed form and driver disagree at requested={requested}, budget={budget}"
+            );
+            assert_eq!(closed.breakdown.total_bytes, driven.breakdown.total_bytes);
+        }
+    }
+}
+
 /// The whole reduction chain, through the shared harness. Fixture-free.
 #[test]
 fn the_sparse_reduction_chain_is_monotone() {

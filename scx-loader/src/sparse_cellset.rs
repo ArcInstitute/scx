@@ -172,6 +172,46 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
 
 use crate::budget::BudgetModel;
 
+/// Resolve the cache count in **closed form**, and return it in the same
+/// [`crate::budget::Tuned`] shape [`crate::budget::tune`] would.
+///
+/// This model is affine in its single knob — `n × shard_decoded_bytes +
+/// PYTHON_OVERHEAD_BYTES` — so the largest `n` that fits is a division, not a
+/// search. Running the shared descent here would step down one shard at a time
+/// from a **caller-controlled** `cache_shards`: measured at ~0.73 ns/step, that
+/// is 0.7 s of pure spinning at `cache_shards=1e9` and does not terminate in
+/// any useful time at `usize::MAX`. The pre-ORG-9.10-5 code was O(1) arithmetic
+/// and this restores that. (Raised in review — codex, round 2.)
+///
+/// It must agree with the driver exactly, and
+/// `closed_form_agrees_with_the_shared_driver` pins that across a budget sweep;
+/// the model keeps its [`crate::budget::BudgetModel`] impl so the two are
+/// comparable and so the monotonicity harness still covers it.
+fn resolve_sparse_cache_shards(
+    model: &SparseCellSetBudgetModel,
+    requested: SparseCellSetParams,
+    budget_bytes: usize,
+) -> crate::budget::Tuned<SparseCellSetParams> {
+    let non_cache = model
+        .estimate(SparseCellSetParams { cache_shards: 0 })
+        .total_bytes;
+    let affordable = budget_bytes
+        .saturating_sub(non_cache)
+        .checked_div(model.shard_decoded_bytes)
+        .unwrap_or(requested.cache_shards);
+    // The descent floors at one shard and never rises above the request — and
+    // an explicit request of 0 stays 0, because `reduce` only ever *reduces*.
+    let ceiling = requested.cache_shards;
+    let cache_shards = affordable.clamp(ceiling.min(1), ceiling);
+    let params = SparseCellSetParams { cache_shards };
+    let breakdown = model.estimate(params);
+    crate::budget::Tuned {
+        exhausted: !breakdown.fits_within_bytes(budget_bytes),
+        params,
+        breakdown,
+    }
+}
+
 /// The byte cap actually handed to the shared shard cache.
 ///
 /// With a known per-shard size this is the tuned cache, the same tightening
@@ -379,7 +419,7 @@ impl SparseCellSetLoader {
                 exhausted: false,
             }
         } else {
-            crate::budget::tune(&model, requested, cache_bytes_budget)
+            resolve_sparse_cache_shards(&model, requested, cache_bytes_budget)
         };
         let affordable_cache_shards = tuned.params.cache_shards;
         let budget_breakdown = tuned.breakdown;

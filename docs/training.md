@@ -175,9 +175,12 @@ Two things to know:
   `memory_budget()` reports `effective_cache_shards` so you can see it — the
   same key `IndexPlanDataset` uses, and the same
   `loader.effective_cache_shards()` behind both.
-  `max_memory_mb` is a **process envelope**, not a bare cache cap: the constant
-  interpreter/numpy/Arrow overhead (~50 MB) is subtracted before the cache is
-  sized, on every loader class. Sizing a budget by hand therefore means
+  Since ORG-9.10-5 the constant interpreter/numpy/Arrow overhead (~50 MB) is
+  subtracted before the cache is sized, on every loader class — so
+  `max_memory_mb` is no longer a bare cache cap. It is **not** a hard ceiling on
+  process RSS either: on `SparseCellSetDataset` the gathered batch and its
+  transients are not charged, and the LRU keeps one oversize shard rather than
+  refusing to cache it. Sizing a budget by hand therefore means
   `cache_shards × shard_decoded_bytes + non-cache terms`; both are in
   `memory_budget()`, and the sizing `UserWarning` already quotes the total in
   its "pass `max_memory_mb>=…`" advice.
@@ -196,8 +199,9 @@ Two things to know:
 Both gather loaders sample their cache counters while iterating and emit a
 one-shot `UserWarning` if the observed miss/eviction pattern indicates the
 working set exceeds the cache. `max_memory_mb=None` resolves to a **bounded**
-adaptive budget on all three loader classes (512 MB floor → 4 GB cap), so peak
-RSS is capped by default rather than open-ended.
+adaptive budget on all three loader classes (512 MB floor → 4 GB cap), so the
+budget is bounded by default rather than open-ended — a bound on what the
+loaders *size themselves to*, not a hard cap on process RSS.
 
 > [!TIP]
 > On cloud storage (S3 / GCS), each shard access is a separate HTTP

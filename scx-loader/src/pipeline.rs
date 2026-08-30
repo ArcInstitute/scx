@@ -1358,11 +1358,15 @@ impl TrainingPipeline {
     /// `the_sequential_reduction_chain_is_monotone`). Raising would need a
     /// fresh tune, so it is an error rather than a silent no-op.
     ///
+    /// `pub(crate)`: the only caller is the multimodal wrapper in this crate,
+    /// and it is not a documented Rust extension point — exporting it would
+    /// commit to input contracts nothing external needs (review, round 2).
+    ///
     /// `shuffle_quality_degraded` is deliberately **not** recomputed: it
     /// records what *this modality's own* tuner did, and recomputing it here
     /// would both erase that and emit a second `log::warn!` per modality, where
     /// the caller already emits one cross-modality `log::info!`.
-    pub fn pin_effective_config(
+    pub(crate) fn pin_effective_config(
         &mut self,
         batch_size: usize,
         shard_group_size: usize,
@@ -1385,6 +1389,20 @@ impl TrainingPipeline {
             });
         }
 
+        // Everything that can fail is built *before* `self` is touched, so a
+        // refused pin leaves the pipeline exactly as it was rather than
+        // half-updated. `ShardShuffler::new` rejects a zero group size, and a
+        // zero `batch_size` would yield an epoch of empty batches.
+        if batch_size == 0 || shard_group_size == 0 {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "pin_effective_config requires non-zero knobs, got \
+                     (batch_size={batch_size}, shard_group_size={shard_group_size})"
+                ),
+            });
+        }
+        let shuffler = ShardShuffler::new(self.n_csr_shards, shard_group_size, self.config.seed)?;
+
         let params = SequentialParams {
             shard_group_size,
             prefetch_batches: self.memory_budget.prefetch_batches,
@@ -1398,7 +1416,7 @@ impl TrainingPipeline {
         self.memory_budget.estimated_bytes = breakdown.total_bytes;
         self.memory_budget.breakdown = breakdown;
         self.memory_budget.budget_exceeded = !breakdown.fits_within(self.config.max_memory_mb);
-        self.shuffler = ShardShuffler::new(self.n_csr_shards, shard_group_size, self.config.seed)?;
+        self.shuffler = shuffler;
         Ok(())
     }
 
