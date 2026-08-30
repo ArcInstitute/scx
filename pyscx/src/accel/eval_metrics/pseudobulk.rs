@@ -610,7 +610,7 @@ fn compute_obsm_pseudobulk<'py>(
     let n_bytes = n_obs * n_dims * 8; // f64 = 8 bytes
     if n_bytes > 500_000_000 {
         let mb = n_bytes / (1024 * 1024);
-        log::warn!("materializing obsm['{embed_key}'] ({n_obs}×{n_dims}) into {mb} MB of memory");
+        log::warn!(target: "pyscx::accel::eval_metrics", "materializing obsm['{embed_key}'] ({n_obs}×{n_dims}) into {mb} MB of memory");
     }
 
     let labels = extract_obs_column(py, adata, pert_col)?;

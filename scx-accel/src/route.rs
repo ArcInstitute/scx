@@ -337,8 +337,9 @@ pub enum RouteValue<'a> {
     OptBool(Option<bool>),
     /// Optional integer counter/index (counts, ids, byte totals). One wire
     /// width for every integer field: both binding sinks flatten to a single
-    /// numeric type anyway (Python int / R double), and every value this
-    /// record can hold is exactly representable in both.
+    /// numeric type anyway (Python's arbitrary-precision int loses nothing;
+    /// R has no 64-bit integer, so its sink casts to double, which is exact
+    /// only up to 2^53 — a `bytes_uploaded` beyond ~9 PB would round there).
     OptU64(Option<u64>),
 }
 

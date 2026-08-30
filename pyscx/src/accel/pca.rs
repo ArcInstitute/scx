@@ -285,39 +285,12 @@ fn build_pca_tuning(allow_tf32: bool, spmm_policy: &str) -> scx_accel::GpuPcaTun
     scx_accel::GpuPcaTuning::new(scx_accel::GpuMathMode::from_allow_tf32(allow_tf32), policy)
 }
 
-/// Dispatch native GPU PCA. The in-VRAM covariance path was removed, so every
-/// accepted `method` (validated once by `PcaMethodRequest::parse` at the entry
-/// points) runs `randomized_pca_gpu` — the streaming / device-resident moat.
-/// All GPU-branch call-sites funnel through here. `qr_method` selects the QR
-/// step (Householder default, Cholesky opt-in).
-#[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
-fn gpu_pca_dispatch<S: ShardSource + Sync>(
-    device_id: usize,
-    source: &S,
-    n_comps: usize,
-    n_oversamples: usize,
-    n_power_iterations: usize,
-    zero_center: bool,
-    random_state: u64,
-    qr_method: scx_accel::QrMethod,
-    tuning: scx_accel::GpuPcaTuning,
-) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
-    scx_accel::randomized_pca_gpu(
-        device_id,
-        source,
-        n_comps,
-        n_oversamples,
-        n_power_iterations,
-        zero_center,
-        random_state,
-        qr_method,
-        tuning,
-    )
-}
-
-/// Catch any cudarc dlsym / FFI panic that escapes `gpu_pca_dispatch` and
-/// translate it to a normal `AccelError::LinAlg`. The proactive
+/// Run native GPU PCA with a panic net: any cudarc dlsym / FFI panic that
+/// escapes the kernel is translated to a normal `AccelError::LinAlg`. The
+/// in-VRAM covariance path was removed, so every accepted `method` (validated
+/// once by `PcaMethodRequest::parse` at the entry points) runs
+/// `randomized_pca_gpu` — the streaming / device-resident moat — and all
+/// GPU-branch call-sites funnel through here. The proactive
 /// `cusparse_modern_abi_available()` probe at the GPU branch entry handles the
 /// *known* `cusparseBsrSetStridedBatch`-missing failure; this wrapper is a
 /// backstop for any other future cudarc symbol surprise so users never see a
@@ -336,7 +309,7 @@ fn gpu_pca_dispatch_unwind_safe<S: ShardSource + Sync>(
     tuning: scx_accel::GpuPcaTuning,
 ) -> Result<scx_accel::PcaResult, scx_accel::AccelError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        gpu_pca_dispatch(
+        scx_accel::randomized_pca_gpu(
             device_id,
             source,
             n_comps,
@@ -432,12 +405,10 @@ fn spmm_policy_label(spmm_policy: &str) -> &'static str {
 
 /// Stamp the PCA route + Task 2.5 tuning metadata on
 /// `adata.uns["scx_accel"]["pca"]`. Called once before dispatch (everything
-/// `None`) and re-stamped on the GPU branch after dispatch. `math_mode` /
-/// `spmm_policy` are passed `Some` only by the route that actually consumes
-/// them — the **randomized** GPU path (which runs the cuBLAS math mode and the
-/// cuSPARSE SpMM). The **covariance** path passes `None` for both (it applies no
-/// SpMM, and does not thread the math mode), so the metadata never claims a knob
-/// that wasn't used. All fields stay `None` on a CPU route regardless.
+/// `None`) and re-stamped on the GPU branch after dispatch. The native GPU
+/// path is unconditionally randomized (the in-VRAM covariance kernels were
+/// removed), so the GPU re-stamp always records `math_mode` / `spmm_policy` —
+/// the knobs that path consumes. All fields stay `None` on a CPU route.
 #[allow(clippy::too_many_arguments)]
 fn stamp_pca_route(
     py: Python<'_>,
@@ -806,21 +777,19 @@ pub fn pca(
     if let Some(device_id) = gpu_device_id {
         let qr = parse_qr_method(qr_method)?;
         let tuning = build_pca_tuning(allow_tf32, spmm_policy);
-        // Task 2.5 metadata labels — recorded only for the randomized route that
-        // actually consumes them (see the per-branch re-stamp below).
+        // Task 2.5 metadata labels for the GPU re-stamp below (the native GPU
+        // path is always randomized, which consumes both knobs).
         let math_mode_label = if allow_tf32 {
             "allow_tf32"
         } else {
             "strict_fp32"
         };
         let spmm_policy_lbl = spmm_policy_label(spmm_policy);
-        // Re-stamp the route after dispatch. `math_mode` / `spmm_policy` are
-        // recorded only for the randomized route that actually consumes them
-        // (covariance passes `None`); `stamp_pca_route` itself drops every knob
-        // on a non-GPU route.
-        // Every accepted `method` runs the randomized kernel on the GPU path
-        // (the in-VRAM covariance kernels were removed), so the math-mode /
-        // spmm labels are unconditionally relevant here.
+        // Re-stamp the route after dispatch. Every accepted `method` runs the
+        // randomized kernel on the GPU path (the in-VRAM covariance kernels
+        // were removed), so the math-mode / spmm labels are unconditionally
+        // relevant here; `stamp_pca_route` itself drops every knob on a
+        // non-GPU route.
         let stamp = |resident_csr: Option<bool>| -> PyResult<()> {
             stamp_pca_route(
                 py,
