@@ -778,6 +778,33 @@ fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
     assert_eq!(avg_shard_decoded_bytes(&[]), 0);
 }
 
+/// The **byte** half of that fallback, which the test above never covered.
+///
+/// ORG-9.10-5 began handing the engine the tuned cache bytes instead of the raw
+/// budget. On a stats-less file the model's cache term is `n × 0 = 0`, so the
+/// tightening would cap the shared cache at zero bytes — "we cannot size the
+/// cache" turned into "no cache", strictly worse than the behaviour it
+/// replaced. No writer emits a stats-less CSR entry, so this is asserted on the
+/// decision rather than through a file that cannot be built.
+#[test]
+fn an_unknown_shard_size_keeps_the_raw_byte_budget() {
+    const RAW: usize = 512 * 1024 * 1024;
+
+    // Known size: the tuned cache binds, as on the paired loader.
+    assert_eq!(
+        resolve_enforced_cache_bytes(32_768, 14_680_064, RAW),
+        14_680_064
+    );
+
+    // Unknown size: the model says 0 bytes, which must NOT reach the cache.
+    assert_eq!(resolve_enforced_cache_bytes(0, 0, RAW), RAW);
+    assert_ne!(
+        resolve_enforced_cache_bytes(0, 0, RAW),
+        0,
+        "a stats-less file must not end up with a zero-byte shard cache"
+    );
+}
+
 // ---- ORG-9.10-5 pre-refactor pins ------------------------------------
 
 /// Two files whose shards are large enough that the cache term dominates the

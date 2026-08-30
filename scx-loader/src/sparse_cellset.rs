@@ -113,6 +113,10 @@ pub struct SparseCellSetLoader {
     /// `estimate(effective_cache_shards)` from the shared auto-tune — the
     /// number the loader reports *and* the one it enforced.
     budget_breakdown: crate::budget::BudgetBreakdown,
+    /// Byte cap actually handed to the shared shard cache. Equals
+    /// `budget_breakdown.cache_bytes` whenever the shard size is known, and the
+    /// raw budget when it is not — see [`Self::enforced_cache_bytes`].
+    enforced_cache_bytes: usize,
     /// The auto-tune ran out of knobs before fitting: even a one-shard cache
     /// exceeds the budget. Reported rather than refused, matching
     /// `MemoryBudget::budget_exceeded` on the sequential path
@@ -167,6 +171,36 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
 }
 
 use crate::budget::BudgetModel;
+
+/// The byte cap actually handed to the shared shard cache.
+///
+/// With a known per-shard size this is the tuned cache, the same tightening
+/// `IndexPlanLoader` performs so the cache cannot overshoot the budget when
+/// real shard sizes diverge from the average.
+///
+/// With an **unknown** one it must be the raw budget. `avg_shard_decoded_bytes`
+/// returns 0 when no shard in any catalog carries stats, which means "the byte
+/// cap tells us nothing" — and the model's cache term is then `n × 0 = 0`, so
+/// tightening to it would cap the cache at **zero bytes**: "we cannot size the
+/// cache" silently becoming "no cache", and strictly worse than the budget this
+/// path passed before ORG-9.10-5. `affordable_cache_shards` already falls back
+/// to the count cap in exactly this case; this is the byte half of the same
+/// rule.
+///
+/// Pure, and separated from `new` deliberately: no writer emits a stats-less
+/// CSR entry, so the branch is unreachable from any file a test can build. The
+/// decision is asserted directly instead of through a fixture that cannot exist.
+fn resolve_enforced_cache_bytes(
+    shard_decoded_bytes: usize,
+    model_cache_bytes: usize,
+    raw_budget_bytes: usize,
+) -> usize {
+    if shard_decoded_bytes == 0 {
+        raw_budget_bytes
+    } else {
+        model_cache_bytes
+    }
+}
 
 /// The one knob the sparse auto-tune reduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +370,11 @@ impl SparseCellSetLoader {
         };
         let affordable_cache_shards = tuned.params.cache_shards;
         let budget_breakdown = tuned.breakdown;
+        let enforced_cache_bytes = resolve_enforced_cache_bytes(
+            shard_decoded_bytes,
+            budget_breakdown.cache_bytes,
+            cache_bytes_budget,
+        );
         // ORG-9.10-5: the non-cache term is the interpreter constant, not 0.
         // Passing 0 here is what let the reported `total_bytes` exceed the
         // budget the tuner had just checked — the tuner disagreeing with the
@@ -359,7 +398,7 @@ impl SparseCellSetLoader {
         let engine = PrefetchEngine::from_scx_readers(
             scx_readers,
             affordable_cache_shards,
-            budget_breakdown.cache_bytes,
+            enforced_cache_bytes,
             lookahead,
             scatter_block_index,
         );
@@ -375,6 +414,7 @@ impl SparseCellSetLoader {
             affordable_cache_shards,
             shard_decoded_bytes,
             budget_breakdown,
+            enforced_cache_bytes,
             budget_exceeded: tuned.exhausted,
             cache_sizing,
             downsample,
@@ -426,6 +466,16 @@ impl SparseCellSetLoader {
     /// did not.
     pub fn budget_breakdown(&self) -> crate::budget::BudgetBreakdown {
         self.budget_breakdown
+    }
+
+    /// Byte cap the shared shard cache is actually running under.
+    ///
+    /// Normally `budget_breakdown().cache_bytes`. On a file whose catalog
+    /// carries no shard stats the per-shard size is unknown, the model's cache
+    /// term collapses to zero, and this falls back to the resolved budget —
+    /// otherwise "we cannot size the cache" would silently mean "no cache".
+    pub fn enforced_cache_bytes(&self) -> usize {
+        self.enforced_cache_bytes
     }
 
     /// `true` when even a one-shard cache exceeds the budget, so
