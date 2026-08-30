@@ -79,11 +79,7 @@ pub fn pca_neighbors(
     let _device = resolve_device(device)?;
 
     // Validate user args regardless of device (mirrors pca()).
-    if !matches!(method, "auto" | "covariance" | "randomized") {
-        return Err(PyValueError::new_err(format!(
-            "Invalid method={method:?}; expected 'auto', 'covariance', or 'randomized'"
-        )));
-    }
+    scx_accel::PcaMethodRequest::parse(method).map_err(|e| PyValueError::new_err(e.to_string()))?;
     if !matches!(qr_method, "householder" | "cholesky") {
         return Err(PyValueError::new_err(format!(
             "Invalid qr_method={qr_method:?}; expected 'householder' or 'cholesky'"
@@ -399,11 +395,7 @@ pub fn pca_neighbors_umap(
 ) -> PyResult<()> {
     let _device = resolve_device(device)?;
 
-    if !matches!(method, "auto" | "covariance" | "randomized") {
-        return Err(PyValueError::new_err(format!(
-            "Invalid method={method:?}; expected 'auto', 'covariance', or 'randomized'"
-        )));
-    }
+    scx_accel::PcaMethodRequest::parse(method).map_err(|e| PyValueError::new_err(e.to_string()))?;
     if !matches!(qr_method, "householder" | "cholesky") {
         return Err(PyValueError::new_err(format!(
             "Invalid qr_method={qr_method:?}; expected 'householder' or 'cholesky'"

@@ -127,7 +127,7 @@ pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
     covariance_pca, covariance_pca_inmemory, covariance_pca_with_depth, pca_prefetch_depth,
     pflog_pca, pflog_pca_with_depth, randomized_pca, randomized_pca_inmemory,
-    randomized_pca_with_depth, resolve_cpu_pca_method, CpuPcaMethod, PcaResult,
+    randomized_pca_with_depth, resolve_cpu_pca_method, CpuPcaMethod, PcaMethodRequest, PcaResult,
     COVARIANCE_PCA_THRESHOLD,
 };
 pub use pflog::{

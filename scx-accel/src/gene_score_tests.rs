@@ -261,3 +261,31 @@ fn non_finite_input_rejected() {
     let src = source_from_dense_shards(&[&rows], 2);
     assert!(score_genes(&src, &[0, 1], &[], &ScoreMethod::Mean).is_err());
 }
+
+/// The parse vocabulary and its exact error text are a cross-binding
+/// contract (pyscx surfaces the message as `ValueError`, rscx as an R
+/// error) — pin both here so `cargo test -p scx-accel` catches drift
+/// without a Python or R harness.
+#[test]
+fn score_method_parse_vocabulary_and_error_text() {
+    assert!(matches!(
+        ScoreMethod::parse("control", 50, 25, 0),
+        Ok(ScoreMethod::Control {
+            ctrl_size: 50,
+            n_bins: 25,
+            random_state: 0
+        })
+    ));
+    assert!(matches!(
+        ScoreMethod::parse("mean", 0, 0, 0),
+        Ok(ScoreMethod::Mean)
+    ));
+    assert!(matches!(
+        ScoreMethod::parse("zscore", 0, 0, 0),
+        Ok(ScoreMethod::Zscore)
+    ));
+    assert_eq!(
+        ScoreMethod::parse("typo", 0, 0, 0).unwrap_err().to_string(),
+        "score_genes: unknown method \"typo\"; expected \"control\", \"mean\", or \"zscore\""
+    );
+}

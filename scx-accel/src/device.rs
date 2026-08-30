@@ -40,9 +40,15 @@ impl ResolvedDevice {
     }
 
     /// The CUDA device ordinal, or `None` for CPU.
-    #[cfg(feature = "gpu")]
+    ///
+    /// Unconditionally available (like [`is_gpu`](Self::is_gpu)) so a
+    /// CPU-only consumer — rscx, or pyscx built without `gpu` — gets one
+    /// feature-stable interface instead of cfg-wrapping every call site; a
+    /// build without the `gpu` feature has no `Gpu` variant, so this is
+    /// always `None` there.
     pub fn gpu_id(self) -> Option<usize> {
         match self {
+            #[cfg(feature = "gpu")]
             ResolvedDevice::Gpu(i) => Some(i),
             ResolvedDevice::Cpu => None,
         }
@@ -64,6 +70,15 @@ pub enum DeviceError {
     /// The request is well-formed but cannot be satisfied at runtime.
     #[error("{0}")]
     Unavailable(String),
+    /// An explicit GPU request on a build compiled without the `gpu` feature.
+    ///
+    /// A distinct variant (rather than an [`Unavailable`](Self::Unavailable)
+    /// message) so each binding can name **itself** in the diagnostic: the
+    /// shared `Display` is binding-neutral, and pyscx re-formats it to its
+    /// historical text ("… but pyscx was built without the 'gpu' feature"),
+    /// which its test suite pins. Carries the requested device string.
+    #[error("device='{0}' requested but this build of scx does not include the 'gpu' feature")]
+    GpuFeatureDisabled(String),
 }
 
 /// Resolve the device string to a [`ResolvedDevice`].
@@ -117,9 +132,7 @@ pub fn resolve_device(device: &str) -> Result<ResolvedDevice, DeviceError> {
         #[cfg(not(feature = "gpu"))]
         {
             let _ = device_id;
-            return Err(DeviceError::Unavailable(format!(
-                "device='{device}' requested but pyscx was built without the 'gpu' feature"
-            )));
+            return Err(DeviceError::GpuFeatureDisabled(device.to_string()));
         }
     }
     Err(DeviceError::Invalid(format!(
@@ -191,20 +204,31 @@ mod tests {
         ));
     }
 
-    /// An explicit GPU request on a host/build without one is `Unavailable`
-    /// (pyscx `RuntimeError`), never silently CPU. Only assertable on a
-    /// non-gpu build here; the gpu-build arm is covered by the pyscx GPU
-    /// test suite on a GPU node.
+    /// An explicit GPU request on a build without the feature is the
+    /// dedicated `GpuFeatureDisabled` variant (pyscx re-formats it to its
+    /// pinned `RuntimeError` text; the shared `Display` stays
+    /// binding-neutral), never silently CPU. Only assertable on a non-gpu
+    /// build here; the gpu-build arm is covered by the pyscx GPU test suite
+    /// on a GPU node.
     #[cfg(not(feature = "gpu"))]
     #[test]
-    fn explicit_gpu_without_the_feature_is_unavailable() {
+    fn explicit_gpu_without_the_feature_is_a_dedicated_variant() {
         for d in ["gpu", "gpu:1"] {
             let err = resolve_device(d).unwrap_err();
-            assert!(matches!(err, DeviceError::Unavailable(_)));
+            assert!(matches!(err, DeviceError::GpuFeatureDisabled(_)));
             assert_eq!(
                 err.to_string(),
-                format!("device='{d}' requested but pyscx was built without the 'gpu' feature")
+                format!(
+                    "device='{d}' requested but this build of scx does not include the 'gpu' feature"
+                )
             );
         }
+    }
+
+    /// `gpu_id()` is feature-stable: on any build, CPU resolves to `None`
+    /// (a non-gpu build has no `Gpu` variant, so it is always `None` there).
+    #[test]
+    fn gpu_id_is_available_on_every_build() {
+        assert_eq!(resolve_device("cpu").unwrap().gpu_id(), None);
     }
 }

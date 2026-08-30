@@ -17,13 +17,64 @@ use pyo3::types::PyDict;
 use scx_accel::route::{should_warn_gpu_fallback, AccelExecutionInfo, FallbackReason, RouteValue};
 
 // The binding-agnostic routing layer lives in `scx_accel::route` (ORG-10.16-3):
-// the exec-info builders that feed the planners, and the runtime GPU
-// availability flag. Re-exported so the ~30 pyscx dispatch sites read
-// unchanged; rscx consumes the same functions.
-pub(crate) use scx_accel::route::{
-    cpu_exec_info, cpu_only_exec_info, gpu_runtime_available as gpu_available, hvg_exec_info,
-    nb_glm_exec_info, simple_exec_info,
-};
+// the exec-info builders (which take a validated [`DeviceRequest`], so the
+// shared public API cannot be fed an unparsed string) and the runtime GPU
+// availability flag. The `&str` shims below keep the ~30 pyscx dispatch sites
+// reading unchanged; their precondition is that `resolve_device` already
+// validated the string at the op entry — every pyscx accel op does, so the
+// grammar-blind `DeviceRequest::from_device_str` intent parse is safe here.
+pub(crate) use scx_accel::route::gpu_runtime_available as gpu_available;
+use scx_accel::route::{DeviceRequest, InputLayout};
+
+pub(crate) fn cpu_exec_info(
+    device: &str,
+    layout: InputLayout,
+    gpu_eligible: bool,
+    csc_available: bool,
+    chunk_size: Option<usize>,
+) -> AccelExecutionInfo {
+    scx_accel::route::cpu_exec_info(
+        DeviceRequest::from_device_str(device),
+        layout,
+        gpu_eligible,
+        csc_available,
+        chunk_size,
+    )
+}
+
+pub(crate) fn hvg_exec_info(
+    device: &str,
+    gpu_eligible: bool,
+    csc_available: bool,
+) -> AccelExecutionInfo {
+    scx_accel::route::hvg_exec_info(
+        DeviceRequest::from_device_str(device),
+        gpu_eligible,
+        csc_available,
+    )
+}
+
+pub(crate) fn simple_exec_info(
+    device: &str,
+    gpu_eligible: bool,
+    gpu_route: scx_accel::AccelRoute,
+    cpu_route: scx_accel::AccelRoute,
+) -> AccelExecutionInfo {
+    scx_accel::route::simple_exec_info(
+        DeviceRequest::from_device_str(device),
+        gpu_eligible,
+        gpu_route,
+        cpu_route,
+    )
+}
+
+pub(crate) fn nb_glm_exec_info(device: &str, gpu_eligible: bool) -> AccelExecutionInfo {
+    scx_accel::route::nb_glm_exec_info(DeviceRequest::from_device_str(device), gpu_eligible)
+}
+
+pub(crate) fn cpu_only_exec_info(device: &str) -> AccelExecutionInfo {
+    scx_accel::route::cpu_only_exec_info(DeviceRequest::from_device_str(device))
+}
 
 /// Serialise an [`AccelExecutionInfo`] into a Python dict — a loop over
 /// [`AccelExecutionInfo::fields`], the shared wire serialization, so the key

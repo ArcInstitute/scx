@@ -1184,4 +1184,22 @@ mod tests {
             }
         }
     }
+    /// The parse vocabulary and its exact error text are a cross-binding
+    /// contract (pyscx surfaces the message as `RuntimeError`, rscx as an R
+    /// error) — pinned here so `cargo test -p scx-accel` catches drift.
+    #[test]
+    fn aggregation_method_parse_vocabulary_and_error_text() {
+        assert!(matches!(
+            AggregationMethod::parse("sum"),
+            Ok(AggregationMethod::Sum)
+        ));
+        assert!(matches!(
+            AggregationMethod::parse("mean"),
+            Ok(AggregationMethod::Mean)
+        ));
+        assert_eq!(
+            AggregationMethod::parse("median").unwrap_err().to_string(),
+            "unsupported aggr_method 'median': use 'sum' or 'mean'"
+        );
+    }
 }

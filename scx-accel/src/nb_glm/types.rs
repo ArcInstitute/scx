@@ -237,3 +237,31 @@ pub struct NbGlmResult {
     pub fitted_means: Option<Vec<f64>>,
     pub diagnostics: NbGlmDiagnostics,
 }
+
+#[cfg(test)]
+mod parse_tests {
+    use super::DispersionMethod;
+
+    /// The parse vocabulary and its exact error text are a cross-binding
+    /// contract (pyscx surfaces the message as `ValueError`, rscx as an R
+    /// error) — pinned here so `cargo test -p scx-accel` catches drift.
+    #[test]
+    fn dispersion_method_parse_vocabulary_and_error_text() {
+        assert!(matches!(
+            DispersionMethod::parse("moments"),
+            Ok(DispersionMethod::Moments)
+        ));
+        assert!(matches!(
+            DispersionMethod::parse("cox_reid_mle"),
+            Ok(DispersionMethod::CoxReidMle)
+        ));
+        assert!(matches!(
+            DispersionMethod::parse("cox_reid_shrunk"),
+            Ok(DispersionMethod::CoxReidShrunk)
+        ));
+        assert_eq!(
+            DispersionMethod::parse("typo").unwrap_err().to_string(),
+            "invalid dispersion=\"typo\"; expected 'moments', 'cox_reid_mle', or 'cox_reid_shrunk'"
+        );
+    }
+}

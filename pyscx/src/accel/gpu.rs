@@ -335,5 +335,10 @@ pub(crate) fn resolve_device(device: &str) -> PyResult<ResolvedDevice> {
     scx_accel::device::resolve_device(device).map_err(|e| match e {
         scx_accel::device::DeviceError::Invalid(msg) => PyValueError::new_err(msg),
         scx_accel::device::DeviceError::Unavailable(msg) => PyRuntimeError::new_err(msg),
+        // The shared Display is binding-neutral; this binding names itself,
+        // keeping the historical pyscx text byte-identical.
+        scx_accel::device::DeviceError::GpuFeatureDisabled(dev) => PyRuntimeError::new_err(
+            format!("device='{dev}' requested but pyscx was built without the 'gpu' feature"),
+        ),
     })
 }
