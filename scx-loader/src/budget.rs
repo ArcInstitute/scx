@@ -7,10 +7,11 @@
 //! per-path lookahead/prefetch overhead, transient temporaries, and
 //! constant Python overhead.
 //!
-//! [`BudgetBreakdown`] is the shared component type that both paths produce
-//! at construction time. The auto-tune algorithms remain in the respective
-//! modules — only the breakdown shape and its Python representation are
-//! shared here.
+//! [`BudgetBreakdown`] is the shared component type every path produces at
+//! construction time. Since ORG-9.10-5 the auto-tune *algorithm* is shared too:
+//! [`tune`] drives the descent for all three loaders and each module supplies
+//! only its own knobs and reduction order through [`BudgetModel`]. What stays
+//! per-module is the **exhaustion policy** — see [`Tuned::exhausted`].
 //!
 //! This module also owns the two **cache-sizing verdicts** the plan-driven
 //! loaders warn from — [`assess_cache_sizing`] (construction time, from the
@@ -261,7 +262,17 @@ impl BudgetBreakdown {
 
     /// Returns `true` iff `total_bytes <= max_memory_mb × 1 MiB`.
     pub fn fits_within(&self, max_memory_mb: usize) -> bool {
-        self.total_bytes <= max_memory_mb.saturating_mul(1024 * 1024)
+        self.fits_within_bytes(max_memory_mb.saturating_mul(1024 * 1024))
+    }
+
+    /// Byte-granularity form of [`Self::fits_within`], and the predicate
+    /// [`tune`] terminates on.
+    ///
+    /// Bytes rather than MB is not a stylistic choice: `SparseCellSetLoader`
+    /// takes its budget in bytes and its tests exercise budgets far below
+    /// 1 MiB, which whole-MB rounding would collapse to zero.
+    pub fn fits_within_bytes(&self, budget_bytes: usize) -> bool {
+        self.total_bytes <= budget_bytes
     }
 
     /// Render as a Python dict with keys
@@ -291,6 +302,122 @@ pub(crate) fn profiling_enabled() -> bool {
     std::env::var("SCX_LOADER_PROFILE")
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// The shared auto-tune driver (ORG-9.10-5)
+// ---------------------------------------------------------------------------
+
+/// What a loader configuration costs, and how to make it cheaper.
+///
+/// The three loader classes disagree about *which* knobs they tune, in what
+/// order, and what to do when the knobs run out — those are real differences
+/// and stay with the implementations. What they had also forked was the loop
+/// itself, the comparison against the budget, and whether the model was
+/// monotone at all; [`tune`] owns all three.
+///
+/// **Contract: `estimate` must be monotone under `reduce`.** A step that raises
+/// the estimate would make the descent non-terminating in spirit (it can only
+/// ever bottom out at the floor) and, worse, breaks
+/// `MultimodalTrainingDataset`'s pin, which relies on "a smaller config always
+/// fits within the same budget" to force every modality onto the cross-modality
+/// minimum. [`tune`] `debug_assert`s the property on every step and
+/// [`assert_monotone_reduction_chain`] checks the whole chain in tests, so it is
+/// a checked property rather than the unstated assumption it used to be.
+pub(crate) trait BudgetModel {
+    /// The knobs this model tunes.
+    type Params: Copy + std::fmt::Debug;
+
+    /// Per-component cost of `params`. Must not count mmap-resident pages —
+    /// every path treats the kernel page cache as evictable and excludes it
+    /// (see [`BudgetBreakdown`]).
+    fn estimate(&self, params: Self::Params) -> BudgetBreakdown;
+
+    /// The next-cheaper knob setting in this model's reduction order, or `None`
+    /// at the floor. Must not raise [`Self::estimate`].
+    fn reduce(&self, params: Self::Params) -> Option<Self::Params>;
+}
+
+/// The outcome of an auto-tune.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Tuned<P> {
+    /// The knob setting that fits, or the floor when `exhausted`.
+    pub(crate) params: P,
+    /// `estimate(params)` — what the caller should report.
+    pub(crate) breakdown: BudgetBreakdown,
+    /// `true` when the model ran out of knobs before fitting. **What to do
+    /// about it is the caller's decision, deliberately**: the sequential path
+    /// flags it and continues (and raises a `UserWarning`), `IndexPlanLoader`
+    /// refuses construction, and `SparseCellSetLoader` bottoms out at its
+    /// one-shard floor and warns. Collapsing those into one policy would change
+    /// three user-visible behaviours to no end.
+    pub(crate) exhausted: bool,
+}
+
+/// Shrink `requested` along the model's reduction order until it fits
+/// `budget_bytes`, or until the model runs out of knobs.
+pub(crate) fn tune<M: BudgetModel>(
+    model: &M,
+    requested: M::Params,
+    budget_bytes: usize,
+) -> Tuned<M::Params> {
+    let mut params = requested;
+    let mut breakdown = model.estimate(params);
+    loop {
+        if breakdown.fits_within_bytes(budget_bytes) {
+            return Tuned {
+                params,
+                breakdown,
+                exhausted: false,
+            };
+        }
+        let Some(next) = model.reduce(params) else {
+            return Tuned {
+                params,
+                breakdown,
+                exhausted: true,
+            };
+        };
+        let next_breakdown = model.estimate(next);
+        debug_assert!(
+            next_breakdown.total_bytes <= breakdown.total_bytes,
+            "BudgetModel is not monotone: {params:?} -> {next:?} raised the estimate \
+             from {} to {} bytes",
+            breakdown.total_bytes,
+            next_breakdown.total_bytes,
+        );
+        params = next;
+        breakdown = next_breakdown;
+    }
+}
+
+/// Walk `model`'s entire reduction chain from `requested` and assert the
+/// estimate never rises.
+///
+/// The shared harness behind every model's monotonicity test. Models are plain
+/// value types, so this runs with no fixture, no file and no interpreter.
+#[cfg(test)]
+pub(crate) fn assert_monotone_reduction_chain<M: BudgetModel>(model: &M, requested: M::Params) {
+    let mut params = requested;
+    let mut prev = model.estimate(params);
+    let mut steps = 0usize;
+    while let Some(next) = model.reduce(params) {
+        let cur = model.estimate(next);
+        assert!(
+            cur.total_bytes <= prev.total_bytes,
+            "not monotone: {params:?} ({} bytes) -> {next:?} ({} bytes)",
+            prev.total_bytes,
+            cur.total_bytes,
+        );
+        params = next;
+        prev = cur;
+        steps += 1;
+        assert!(steps < 5_000_000, "reduction chain did not terminate");
+    }
+    assert!(
+        steps > 0,
+        "the chain had no steps from {requested:?}, so this proves nothing"
+    );
 }
 
 #[cfg(test)]

@@ -110,6 +110,18 @@ pub struct SparseCellSetLoader {
     /// Average decoded bytes per CSR shard across every file, the unit the
     /// budget model counts in.
     shard_decoded_bytes: usize,
+    /// `estimate(effective_cache_shards)` from the shared auto-tune — the
+    /// number the loader reports *and* the one it enforced.
+    budget_breakdown: crate::budget::BudgetBreakdown,
+    /// Byte cap actually handed to the shared shard cache. Equals
+    /// `budget_breakdown.cache_bytes` whenever the shard size is known, and the
+    /// raw budget when it is not — see [`Self::enforced_cache_bytes`].
+    enforced_cache_bytes: usize,
+    /// The auto-tune ran out of knobs before fitting: even a one-shard cache
+    /// exceeds the budget. Reported rather than refused, matching
+    /// `MemoryBudget::budget_exceeded` on the sequential path
+    /// (`IndexPlanLoader` is the one class that refuses instead).
+    budget_exceeded: bool,
     /// `Some` iff `cache_bytes_budget` cannot hold `cache_shards` average
     /// shards. Consumed by the Python constructor to warn; see
     /// [`crate::budget::assess_cache_sizing`].
@@ -156,6 +168,133 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
         .saturating_add(total_rows.saturating_mul(8))
         .checked_div(n_counted)
         .unwrap_or(0) as usize
+}
+
+use crate::budget::BudgetModel;
+
+/// Resolve the cache count in **closed form**, and return it in the same
+/// [`crate::budget::Tuned`] shape [`crate::budget::tune`] would.
+///
+/// This model is affine in its single knob — `n × shard_decoded_bytes +
+/// PYTHON_OVERHEAD_BYTES` — so the largest `n` that fits is a division, not a
+/// search. Running the shared descent here would step down one shard at a time
+/// from a **caller-controlled** `cache_shards`: measured at ~0.73 ns/step, that
+/// is 0.7 s of pure spinning at `cache_shards=1e9` and does not terminate in
+/// any useful time at `usize::MAX`. The pre-ORG-9.10-5 code was O(1) arithmetic
+/// and this restores that. (Raised in review — codex, round 2.)
+///
+/// It must agree with the driver exactly, and
+/// `closed_form_agrees_with_the_shared_driver` pins that across a budget sweep;
+/// the model keeps its [`crate::budget::BudgetModel`] impl so the two are
+/// comparable and so the monotonicity harness still covers it.
+fn resolve_sparse_cache_shards(
+    model: &SparseCellSetBudgetModel,
+    requested: SparseCellSetParams,
+    budget_bytes: usize,
+) -> crate::budget::Tuned<SparseCellSetParams> {
+    let non_cache = model
+        .estimate(SparseCellSetParams { cache_shards: 0 })
+        .total_bytes;
+    let affordable = budget_bytes
+        .saturating_sub(non_cache)
+        .checked_div(model.shard_decoded_bytes)
+        .unwrap_or(requested.cache_shards);
+    // The descent floors at one shard and never rises above the request — and
+    // an explicit request of 0 stays 0, because `reduce` only ever *reduces*.
+    let ceiling = requested.cache_shards;
+    let cache_shards = affordable.clamp(ceiling.min(1), ceiling);
+    let params = SparseCellSetParams { cache_shards };
+    let breakdown = model.estimate(params);
+    crate::budget::Tuned {
+        exhausted: !breakdown.fits_within_bytes(budget_bytes),
+        params,
+        breakdown,
+    }
+}
+
+/// The byte cap actually handed to the shared shard cache.
+///
+/// With a known per-shard size this is the tuned cache, the same tightening
+/// `IndexPlanLoader` performs so the cache cannot overshoot the budget when
+/// real shard sizes diverge from the average.
+///
+/// With an **unknown** one it must be the raw budget. `avg_shard_decoded_bytes`
+/// returns 0 when no shard in any catalog carries stats, which means "the byte
+/// cap tells us nothing" — and the model's cache term is then `n × 0 = 0`, so
+/// tightening to it would cap the cache at **zero bytes**: "we cannot size the
+/// cache" silently becoming "no cache", and strictly worse than the budget this
+/// path passed before ORG-9.10-5. `affordable_cache_shards` already falls back
+/// to the count cap in exactly this case; this is the byte half of the same
+/// rule.
+///
+/// Pure, and separated from `new` deliberately: no writer emits a stats-less
+/// CSR entry, so the branch is unreachable from any file a test can build. The
+/// decision is asserted directly instead of through a fixture that cannot exist.
+fn resolve_enforced_cache_bytes(
+    shard_decoded_bytes: usize,
+    model_cache_bytes: usize,
+    raw_budget_bytes: usize,
+) -> usize {
+    if shard_decoded_bytes == 0 {
+        raw_budget_bytes
+    } else {
+        model_cache_bytes
+    }
+}
+
+/// The one knob the sparse auto-tune reduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SparseCellSetParams {
+    pub(crate) cache_shards: usize,
+}
+
+/// The `SparseCellSetLoader` arm of [`crate::budget::BudgetModel`].
+///
+/// Only two terms are non-zero. **What that does and does not buy is worth
+/// being exact about**, because ORG-9.10-5 made the budget cover the
+/// interpreter constant and it would be easy to over-read that as a hard
+/// ceiling on the process:
+///
+/// * **Charged**: the decoded shard cache, sized and enforced from this model,
+///   plus the interpreter/numpy/Arrow constant every path pays.
+/// * **Not charged**: the gathered batch itself and its transients. Unlike
+///   `IndexPlanLoader`, this path has no `max_plan_size`, so a plan's output
+///   size is caller-controlled and unbounded — there is nothing fixed to cost.
+/// * **Not a hard cap**: `WeightedLruCache::put_with_budget` deliberately keeps
+///   a single entry that exceeds the byte budget on its own (refusing would
+///   defeat the cache for any outsized shard), so one above-average shard can
+///   sit above the cap. The model tunes on the *average* shard size.
+///
+/// So `budget_exceeded == false` means "the cache this loader sizes fits the
+/// budget", not "the process will stay under `max_memory_mb`".
+///
+/// The floor is 1, not 0, for the reason `IndexPlanLoader` refuses below 1: a
+/// cache that can hold nothing re-decodes every shard on every batch, and the
+/// engine's own `cache_shards.max(2)` would override a 0 anyway. Exhaustion
+/// here is reported (a below-floor `CacheSizingVerdict`), not refused — an
+/// absurd budget must keep warning rather than start raising.
+pub(crate) struct SparseCellSetBudgetModel {
+    shard_decoded_bytes: usize,
+}
+
+impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
+    type Params = SparseCellSetParams;
+
+    fn estimate(&self, p: SparseCellSetParams) -> crate::budget::BudgetBreakdown {
+        crate::budget::BudgetBreakdown::new(
+            p.cache_shards.saturating_mul(self.shard_decoded_bytes),
+            0,
+            0,
+            0,
+            crate::budget::PYTHON_OVERHEAD_BYTES,
+        )
+    }
+
+    fn reduce(&self, p: SparseCellSetParams) -> Option<SparseCellSetParams> {
+        (p.cache_shards > 1).then(|| SparseCellSetParams {
+            cache_shards: p.cache_shards - 1,
+        })
+    }
 }
 
 impl SparseCellSetLoader {
@@ -258,39 +397,61 @@ impl SparseCellSetLoader {
         // Resolve the cache byte budget before the readers are moved into the
         // engine: the adaptive path needs their catalog stats.
         let shard_decoded_bytes = avg_shard_decoded_bytes(&scx_readers);
+        let model = SparseCellSetBudgetModel {
+            shard_decoded_bytes,
+        };
+        let requested = SparseCellSetParams { cache_shards };
         let cache_bytes_budget = match bytes_budget {
             Some(b) => b,
-            None => {
-                let need = cache_shards.saturating_mul(shard_decoded_bytes);
-                crate::budget::adaptive_budget_mb(
-                    need,
-                    crate::pipeline::LoaderConfig::default().max_memory_mb,
-                )
-                .saturating_mul(1024 * 1024)
-            }
+            None => crate::budget::adaptive_budget_mb(
+                model.estimate(requested).total_bytes,
+                crate::pipeline::LoaderConfig::default().max_memory_mb,
+            )
+            .saturating_mul(1024 * 1024),
         };
-        // Shards the byte budget can actually hold at average size. This cache is
-        // the loader's whole budget — there is no batch buffer or plan-tuple term
-        // on the sparse path — so the non-cache term is 0. `checked_div` rather
-        // than a guarded `/`: an unknown-shard-size file (no catalog stats) means
-        // "the byte cap tells us nothing", which is the count cap, not zero.
-        let affordable_cache_shards = cache_bytes_budget
-            .checked_div(shard_decoded_bytes)
-            .map(|n| n.min(cache_shards))
-            .unwrap_or(cache_shards);
+        // An unknown shard size (no catalog stats anywhere) means "the byte cap
+        // tells us nothing", which is the count cap — never a fabricated
+        // average and never a descent driven by the interpreter constant alone.
+        let tuned = if shard_decoded_bytes == 0 {
+            crate::budget::Tuned {
+                params: requested,
+                breakdown: model.estimate(requested),
+                exhausted: false,
+            }
+        } else {
+            resolve_sparse_cache_shards(&model, requested, cache_bytes_budget)
+        };
+        let affordable_cache_shards = tuned.params.cache_shards;
+        let budget_breakdown = tuned.breakdown;
+        let enforced_cache_bytes = resolve_enforced_cache_bytes(
+            shard_decoded_bytes,
+            budget_breakdown.cache_bytes,
+            cache_bytes_budget,
+        );
+        // ORG-9.10-5: the non-cache term is the interpreter constant, not 0.
+        // Passing 0 here is what let the reported `total_bytes` exceed the
+        // budget the tuner had just checked — the tuner disagreeing with the
+        // report, which `IndexPlanLoader` never did.
         let cache_sizing = crate::budget::assess_cache_sizing(
             cache_shards,
             affordable_cache_shards,
             shard_decoded_bytes,
             cache_bytes_budget / (1024 * 1024),
-            0,
+            budget_breakdown
+                .total_bytes
+                .saturating_sub(budget_breakdown.cache_bytes),
             bytes_budget.is_some(),
         );
 
+        // Hand the engine the *tuned* caps, both of them — the same tightening
+        // `IndexPlanLoader` performs, so the cache cannot overshoot the budget
+        // when actual shard sizes diverge from the average. Before ORG-9.10-5
+        // this path handed over the raw request and the raw byte budget, so the
+        // numbers it reported described a cache it was not enforcing.
         let engine = PrefetchEngine::from_scx_readers(
             scx_readers,
-            cache_shards,
-            cache_bytes_budget,
+            affordable_cache_shards,
+            enforced_cache_bytes,
             lookahead,
             scatter_block_index,
         );
@@ -305,6 +466,9 @@ impl SparseCellSetLoader {
             cache_shards,
             affordable_cache_shards,
             shard_decoded_bytes,
+            budget_breakdown,
+            enforced_cache_bytes,
+            budget_exceeded: tuned.exhausted,
             cache_sizing,
             downsample,
         }))
@@ -341,30 +505,42 @@ impl SparseCellSetLoader {
     }
 
     /// Per-component memory estimate, in the one shape every class that reports
-    /// a budget uses (ORG-9.10-4; `MultimodalTrainingDataset` reports none).
+    /// a budget uses (ORG-9.10-4).
     ///
     /// Only two terms are non-zero, and that is the model, not an omission: the
     /// shard cache **is** this loader's budget — there is no batch buffer,
     /// no plan-tuple staging and no per-batch obs scratch on the gather path —
     /// plus the interpreter/numpy/Arrow constant every path pays.
     ///
-    /// ⚠️ The constant is reported but **not** yet subtracted from the budget:
-    /// [`Self::new`] passes `non_cache_bytes: 0` to
-    /// [`crate::budget::assess_cache_sizing`], so `total_bytes` here can exceed
-    /// `cache_bytes_budget` — which it cannot on `IndexPlanLoader`, whose tuner
-    /// counts the same term. That is the tuner disagreeing with the report, and
-    /// it is what ORG-9.10-5's single `BudgetModel` exists to remove; changing
-    /// the tuner would move a user-visible warning threshold and does not belong
-    /// in a surface change.
+    /// Since ORG-9.10-5 the interpreter constant is **budgeted**, not merely
+    /// reported: the auto-tune subtracts it before sizing the cache, so
+    /// `total_bytes` fits `cache_bytes_budget` whenever the tune was not
+    /// exhausted — the invariant `IndexPlanLoader` always held and this path
+    /// did not.
     pub fn budget_breakdown(&self) -> crate::budget::BudgetBreakdown {
-        crate::budget::BudgetBreakdown::new(
-            self.affordable_cache_shards
-                .saturating_mul(self.shard_decoded_bytes),
-            0,
-            0,
-            0,
-            crate::budget::PYTHON_OVERHEAD_BYTES,
-        )
+        self.budget_breakdown
+    }
+
+    /// Byte cap the shared shard cache is actually running under.
+    ///
+    /// Normally `budget_breakdown().cache_bytes`. On a file whose catalog
+    /// carries no shard stats the per-shard size is unknown, the model's cache
+    /// term collapses to zero, and this falls back to the resolved budget —
+    /// otherwise "we cannot size the cache" would silently mean "no cache".
+    pub fn enforced_cache_bytes(&self) -> usize {
+        self.enforced_cache_bytes
+    }
+
+    /// `true` when even a one-shard cache exceeds the budget, so
+    /// [`Self::budget_breakdown`] is over budget by construction.
+    ///
+    /// The sparse counterpart of `MemoryBudget::budget_exceeded`. Reported, not
+    /// refused: an absurd `max_memory_mb` must keep warning rather than start
+    /// raising, which is the one place this path's exhaustion policy differs
+    /// from `IndexPlanLoader`'s (and it is a deliberate difference, see
+    /// `crate::budget::Tuned::exhausted`).
+    pub fn budget_exceeded(&self) -> bool {
+        self.budget_exceeded
     }
 
     /// Total CSR shards across every file — the cap on distinct entries in the

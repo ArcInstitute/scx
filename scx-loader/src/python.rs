@@ -242,6 +242,14 @@ impl TrainingDataset {
         if let Some(v) = pipeline.hvg_panel() {
             warn_hvg_panel(py, "TrainingDataset", &v)?;
         }
+        if pipeline.memory_budget_info().budget_exceeded {
+            warn_budget_exceeded(
+                py,
+                "TrainingDataset",
+                pipeline.max_memory_mb(),
+                pipeline.memory_budget_info(),
+            )?;
+        }
 
         Ok(TrainingDataset {
             pipeline,
@@ -472,6 +480,62 @@ fn resolve_loader_config(
     }
 }
 
+/// Split a total `max_memory_mb` across modalities in proportion to their nnz,
+/// with a per-modality floor.
+///
+/// The floor is load-bearing, not slack: `LoaderConfig::validate` rejects
+/// anything below `MIN_MODALITY_BUDGET_MB`, so a modality whose proportional
+/// share falls under it would fail construction outright. The consequence is
+/// that **the shares can sum to more than `total_mb`** — three modalities under
+/// a 64 MB request budget 192 MB between them. That is a real over-budget, it
+/// is the price of not refusing the file, and
+/// `MultimodalTrainingDataset.memory_budget()` reports it rather than leaving
+/// it silent.
+///
+/// Pure (no Python), so it is unit-testable without a Python interpreter.
+fn split_budget_across_modalities(total_mb: usize, per_modality_nnz: &[u64]) -> Vec<usize> {
+    let total_nnz: u64 = per_modality_nnz.iter().sum::<u64>().max(1);
+    per_modality_nnz
+        .iter()
+        .map(|nnz| {
+            let share = (total_mb as f64) * (*nnz as f64) / (total_nnz as f64);
+            (share as usize).max(MIN_MODALITY_BUDGET_MB)
+        })
+        .collect()
+}
+
+/// Per-modality budget floor. Equal to the minimum `LoaderConfig::validate`
+/// accepts, which is what makes it a floor rather than a preference.
+const MIN_MODALITY_BUDGET_MB: usize = 64;
+
+/// The smallest `max_memory_mb` whose *proportional* shares all clear the floor,
+/// i.e. the smallest request `split_budget_across_modalities` returns unchanged.
+///
+/// `None` when no such total exists: a modality with zero nnz gets a zero share
+/// at every budget, so raising the request can never lift it off the floor.
+///
+/// This is what the warning must quote. Advising the current *effective sum*
+/// instead does not converge — the floor is re-applied after the new split, so
+/// with a 1:99 nnz ratio a 64 MB request reports 128, and passing 128 reports
+/// 190, and so on. The fixed point is `max_i(ceil(floor × total_nnz / nnz_i))`.
+fn min_total_mb_clearing_the_floor(per_modality_nnz: &[u64]) -> Option<usize> {
+    let total_nnz: u64 = per_modality_nnz.iter().sum();
+    if total_nnz == 0 {
+        return None;
+    }
+    let mut required = 0usize;
+    for &nnz in per_modality_nnz {
+        if nnz == 0 {
+            return None;
+        }
+        let need = (MIN_MODALITY_BUDGET_MB as u128)
+            .saturating_mul(total_nnz as u128)
+            .div_ceil(nnz as u128);
+        required = required.max(need.min(usize::MAX as u128) as usize);
+    }
+    Some(required)
+}
+
 /// Verify that all requested modalities share identical per-modality CSR
 /// shard layouts (shard counts + row ranges). The multimodal loader chunks
 /// each modality independently but assembles batches positionally, so
@@ -561,6 +625,10 @@ pub struct MultimodalTrainingDataset {
     /// `close()` was the last lifecycle action — see the `closed` getter.
     /// Not terminal here either: `__iter__` clears it and rebuilds.
     closed: bool,
+    /// `max_memory_mb` **as requested**, before the per-modality split. Kept so
+    /// `memory_budget()` can report the request beside what the floors actually
+    /// budgeted — the two are not the same number and nothing used to say so.
+    requested_max_memory_mb: usize,
     creation_pid: u32,
 }
 
@@ -681,14 +749,8 @@ impl MultimodalTrainingDataset {
         // prefetch_batches values.
         let defaults = LoaderConfig::default();
         let total_mb = max_memory_mb.unwrap_or(defaults.max_memory_mb);
-        let total_nnz: u64 = resolved.iter().map(|(_, _, n)| *n).sum::<u64>().max(1);
-        let per_modality_mb: Vec<usize> = resolved
-            .iter()
-            .map(|(_, _, nnz)| {
-                let share = (total_mb as f64) * (*nnz as f64) / (total_nnz as f64);
-                (share as usize).max(64)
-            })
-            .collect();
+        let per_modality_nnz: Vec<u64> = resolved.iter().map(|(_, _, n)| *n).collect();
+        let per_modality_mb = split_budget_across_modalities(total_mb, &per_modality_nnz);
 
         // Per-modality shard-layout alignment check (fail loud at
         // construction rather than mid-`__next__`). The per-modality
@@ -746,9 +808,11 @@ impl MultimodalTrainingDataset {
             })
             .collect();
 
+        // Consumed, not borrowed-and-cloned: nothing rebuilds from these any
+        // more now that the uniform pin happens in place.
         let mut pipelines = Vec::with_capacity(base_configs.len());
-        for config in &base_configs {
-            let pipeline = TrainingPipeline::new(path, config.clone())
+        for config in base_configs {
+            let pipeline = TrainingPipeline::new(path, config)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             pipelines.push(pipeline);
         }
@@ -760,9 +824,12 @@ impl MultimodalTrainingDataset {
         }
 
         // Pin uniform effective batch_size + shard_group_size (min across
-        // modalities). Rebuilding at the common minimum never over-shrinks
-        // because each modality already fit its own effective (>=) config,
-        // so a smaller pinned config always fits within the same budget.
+        // modalities), in place. Each modality already fit its own effective
+        // (>=) config and the model is monotone, so the minimum always still
+        // fits — `TrainingPipeline::pin_effective_config` enforces the "only
+        // shrink" half of that as a real error rather than the release-stripped
+        // `debug_assert` this block used to end with, and the reduction chain is
+        // asserted monotone per step inside `budget::tune`.
         let common_batch = pipelines
             .iter()
             .map(|p| p.effective_batch_size())
@@ -800,30 +867,40 @@ impl MultimodalTrainingDataset {
                      larger max_memory_mb to keep a larger shard_group_size.",
                 );
             }
-            pipelines.clear();
-            for mut config in base_configs {
-                config.batch_size = common_batch;
-                config.shard_group_size = common_sgs;
-                let pipeline = TrainingPipeline::new(path, config)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                pipelines.push(pipeline);
+            for p in pipelines.iter_mut() {
+                p.pin_effective_config(common_batch, common_sgs)
+                    .map_err(loader_err_to_py)?;
             }
         }
 
-        // Loud-at-construction guard: every pipeline must now report the pinned
-        // effective `(batch_size, shard_group_size)`. This holds by construction
-        // (rebuild forces it; when `!needs_repin` they already matched the min),
-        // but a future non-monotonic `estimate_memory` term could break the
-        // "pinned config always fits" assumption and silently reintroduce the
-        // per-modality desync — fail here rather than mid-epoch in `__next__`.
-        debug_assert!(
-            pipelines.iter().all(|p| {
-                p.effective_batch_size() == common_batch
-                    && p.memory_budget_info().shard_group_size == common_sgs
-            }),
-            "MultimodalTrainingDataset: repin failed to pin uniform \
-             (batch_size={common_batch}, shard_group_size={common_sgs}) across modalities",
-        );
+        let effective_total_mb: usize = pipelines
+            .iter()
+            .map(|p| p.max_memory_mb())
+            .fold(0usize, |a, b| a.saturating_add(b));
+        // Only on an *explicit* request. With `max_memory_mb=None` every
+        // modality's pipeline resolves its own adaptive budget and the sum
+        // routinely exceeds the 512 MB default — that is the adaptive policy
+        // working, and warning there would fire on every default construction.
+        // Same don't-cry-wolf rule `assess_cache_sizing` applies.
+        if max_memory_mb.is_some() && effective_total_mb > total_mb {
+            warn_modality_budget_floors(py, total_mb, effective_total_mb, &per_modality_nnz)?;
+        }
+
+        // Per-modality `budget_exceeded`, for the same reason `TrainingDataset`
+        // warns: a modality that cannot fit even at its minimums will exceed the
+        // budget it was given, and a `log::warn!` is invisible in a notebook.
+        // **After** the pin, never before — the pin shrinks knobs further and can
+        // clear the flag on a modality the tuner had already flagged.
+        for (name, p) in names.iter().zip(pipelines.iter()) {
+            if p.memory_budget_info().budget_exceeded {
+                warn_budget_exceeded(
+                    py,
+                    &format!("MultimodalTrainingDataset modality '{name}'"),
+                    p.max_memory_mb(),
+                    p.memory_budget_info(),
+                )?;
+            }
+        }
 
         Ok(MultimodalTrainingDataset {
             pipelines,
@@ -831,6 +908,7 @@ impl MultimodalTrainingDataset {
             return_dict: return_dict.unwrap_or(true),
             epoch_started: false,
             closed: false,
+            requested_max_memory_mb: total_mb,
             creation_pid: std::process::id(),
         })
     }
@@ -950,6 +1028,67 @@ impl MultimodalTrainingDataset {
             .zip(self.pipelines.iter())
             .map(|(n, p)| (n.clone(), p.n_vars()))
             .collect()
+    }
+
+    /// Memory budget diagnostics as a dict.
+    ///
+    /// ```text
+    /// batch_size          - pinned, uniform across modalities
+    /// shard_group_size    - pinned, uniform across modalities
+    /// max_memory_mb       - the budget as REQUESTED
+    /// effective_total_mb  - the sum the per-modality floors actually budgeted
+    /// modalities          - {name: <TrainingDataset-shaped envelope>}
+    /// ```
+    ///
+    /// ORG-9.10-4 deferred this class's accessor to ORG-9.10-5 because its
+    /// budget is split per modality and there was no surface to report a split
+    /// through. This is that surface, and it says two things nothing else did:
+    ///
+    /// * **`batch_size` / `shard_group_size` are uniform by construction.** The
+    ///   loader pins every modality to the cross-modality minimum so their
+    ///   batches stay row-aligned; that used to be guarded by a `debug_assert`,
+    ///   i.e. by nothing at all in the release wheels users run. It is now a
+    ///   checked property of `TrainingPipeline::pin_effective_config`, and
+    ///   readable from Python.
+    /// * **`effective_total_mb` can exceed `max_memory_mb`.** Two causes, both
+    ///   real: the per-modality floor (the split is nnz-proportional, and a
+    ///   share below the floor fails `LoaderConfig::validate`, so two
+    ///   modalities under a 64 MB request budget 128 MB between them), and the
+    ///   adaptive resolution when no budget was passed at all. Only the first
+    ///   warns — an adaptive raise is the policy working.
+    ///
+    /// Each per-modality value carries the same keys as
+    /// `TrainingDataset.memory_budget()`, including the six-key `breakdown`
+    /// every class that reports a budget shares.
+    fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        let modalities = PyDict::new(py);
+        let mut effective_total_mb = 0usize;
+        for (name, p) in self.modality_names.iter().zip(self.pipelines.iter()) {
+            let mb = p.memory_budget_info();
+            let per = PyDict::new(py);
+            per.set_item("shard_group_size", mb.shard_group_size)?;
+            per.set_item("prefetch_batches", mb.prefetch_batches)?;
+            per.set_item("batch_size", mb.batch_size)?;
+            per.set_item("max_memory_mb", p.max_memory_mb())?;
+            per.set_item("estimated_mb", mb.estimated_bytes / (1024 * 1024))?;
+            per.set_item("mmap_mb", mb.mmap_bytes / (1024 * 1024))?;
+            per.set_item("budget_exceeded", mb.budget_exceeded)?;
+            per.set_item("breakdown", mb.breakdown.to_pydict(py)?)?;
+            modalities.set_item(name, per)?;
+            effective_total_mb = effective_total_mb.saturating_add(p.max_memory_mb());
+        }
+        // Uniform by construction; reading the first is reading all of them.
+        let first = self.pipelines.first().map(|p| p.memory_budget_info());
+        dict.set_item("batch_size", first.map(|b| b.batch_size).unwrap_or(0))?;
+        dict.set_item(
+            "shard_group_size",
+            first.map(|b| b.shard_group_size).unwrap_or(0),
+        )?;
+        dict.set_item("max_memory_mb", self.requested_max_memory_mb)?;
+        dict.set_item("effective_total_mb", effective_total_mb)?;
+        dict.set_item("modalities", modalities)?;
+        Ok(dict)
     }
 
     /// Shut every modality's pipeline down, GIL detached. Idempotent, and — as
@@ -1497,8 +1636,9 @@ impl IndexPlanDataset {
     /// All byte values are `int`. ORG-9.10-4 moved the six components **under**
     /// `breakdown`, where `TrainingDataset` had always reported them, so that
     /// `memory_budget()["breakdown"]["total_bytes"]` reads the same on every
-    /// class that reports a budget (`MultimodalTrainingDataset` reports none);
-    /// the keys beside it stay class-specific.
+    /// class that reports a budget; the keys beside it stay class-specific.
+    /// `MultimodalTrainingDataset` nests one such envelope per modality
+    /// (ORG-9.10-5).
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let loader = self.loader()?;
         let dict = PyDict::new(py);
@@ -1909,6 +2049,83 @@ fn warn_cache_sizing(
         v.shard_decoded_bytes / 1024,
         v.budget_mb_for_requested,
         v.effective_cache_shards,
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
+}
+
+/// Emit the construction-time `UserWarning` for per-modality budget floors that
+/// sum to more than the caller asked for.
+///
+/// ORG-9.10-5. `MultimodalTrainingDataset` divides `max_memory_mb` across
+/// modalities in proportion to their nnz, then raises each share to the floor
+/// `LoaderConfig::validate` requires — so a request that cannot be divided
+/// without starving someone is silently rounded *up*, by up to
+/// `MIN_MODALITY_BUDGET_MB` per modality. The split is not the thing to change
+/// (a share below the floor fails construction outright); being silent about it
+/// was.
+fn warn_modality_budget_floors(
+    py: Python<'_>,
+    requested_mb: usize,
+    effective_mb: usize,
+    per_modality_nnz: &[u64],
+) -> PyResult<()> {
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
+    let n_modalities = per_modality_nnz.len();
+    // Quote the fixed point, not the current effective sum: the floor is
+    // re-applied after the new split, so echoing `effective_mb` back would
+    // advise a value that fires this same warning again.
+    let advice = match min_total_mb_clearing_the_floor(per_modality_nnz) {
+        Some(mb) => {
+            format!("Pass max_memory_mb>={mb} for a split that clears the floor on its own.")
+        }
+        None => "A modality with no recorded nnz gets a zero proportional share at \
+             every budget, so raising max_memory_mb cannot lift it off the floor."
+            .to_string(),
+    };
+    let msg = format!(
+        "MultimodalTrainingDataset: max_memory_mb={requested_mb} cannot be split across \
+         {n_modalities} modalities without a share falling below the \
+         {MIN_MODALITY_BUDGET_MB} MB per-modality floor, so the effective total is \
+         {effective_mb} MB. Peak RSS is budgeted against that number, not the one you \
+         passed; see memory_budget()['effective_total_mb']. {advice}"
+    );
+    warnings.call_method1("warn", (msg, user_warning))?;
+    Ok(())
+}
+
+/// Emit the construction-time `UserWarning` for a budget the auto-tune could
+/// not meet even at its minimums.
+///
+/// ORG-9.10-5. This fact was only ever a `log::warn!`, which a notebook or a
+/// training script does not show, while the two plan-driven classes have always
+/// raised a `UserWarning` for the equivalent (`warn_cache_sizing`) — so the one
+/// class that *silently exceeds the budget it was given* was the quiet one.
+///
+/// Deliberately **not** extended to `shuffle_quality_degraded`: that is a
+/// shuffle-entropy quality note rather than a memory verdict, it fires on
+/// ordinary tight-budget runs, and a warning users learn to filter stops
+/// working. It stays a `log::warn!`.
+fn warn_budget_exceeded(
+    py: Python<'_>,
+    dataset: &str,
+    max_memory_mb: usize,
+    budget: &crate::pipeline::MemoryBudget,
+) -> PyResult<()> {
+    let warnings = crate::pyimport::import_module(py, "warnings")?;
+    let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
+    let msg = format!(
+        "{dataset}: max_memory_mb={} cannot hold this file even at the auto-tune's \
+         minimums (batch_size={}, shard_group_size={}, prefetch_batches={}); the \
+         estimate is {} MB. Peak RSS will exceed the budget. Pass \
+         max_memory_mb>={} to fit, or set hvg_indices to shrink the batch.",
+        max_memory_mb,
+        budget.batch_size,
+        budget.shard_group_size,
+        budget.prefetch_batches,
+        budget.estimated_bytes.div_ceil(1024 * 1024),
+        budget.estimated_bytes.div_ceil(1024 * 1024),
     );
     warnings.call_method1("warn", (msg, user_warning))?;
     Ok(())
@@ -2615,9 +2832,19 @@ impl SparseCellSetDataset {
     ///
     /// Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
     /// breakdown: on this path the shard cache *is* the budget — there is no
-    /// batch-buffer or plan-tuple term. See
-    /// [`SparseCellSetLoader::budget_breakdown`] for why `total_bytes` here can
-    /// exceed `max_memory_mb`, which it cannot on `IndexPlanDataset`.
+    /// batch-buffer or plan-tuple term.
+    ///
+    /// `budget_exceeded` is `True` when even a one-shard cache does not fit.
+    /// Before ORG-9.10-5 `total_bytes` could exceed `max_memory_mb` routinely,
+    /// because the tuner did not count the interpreter constant the report
+    /// included.
+    ///
+    /// That is a statement about **the cache this loader sizes**, not a ceiling
+    /// on process RSS: the gathered batch and its transients are not charged
+    /// (this path has no `max_plan_size`, so plan output size is
+    /// caller-controlled), and the shared LRU keeps a single oversize shard
+    /// rather than refusing to cache it, so one above-average shard can sit
+    /// above the byte cap.
     ///
     /// ORG-9.10-4 renamed `affordable_cache_shards` to `effective_cache_shards`:
     /// it is the same quantity `IndexPlanDataset` reports under that name, and
@@ -2632,6 +2859,7 @@ impl SparseCellSetDataset {
         dict.set_item("cache_shards", loader.cache_shards())?;
         dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
+        dict.set_item("budget_exceeded", loader.budget_exceeded())?;
         Ok(dict)
     }
 
@@ -3189,6 +3417,108 @@ mod preflight_decision_tests {
     #[test]
     fn a_framed_file_is_silent() {
         assert!(!should_warn_unframed_scatter(true, true, || true));
+    }
+}
+
+/// ORG-9.10-5 pre-refactor pins for the multimodal budget split
+/// (`split_budget_across_modalities`), which was inline in the constructor and
+/// therefore asserted nowhere.
+#[cfg(test)]
+mod modality_budget_split_tests {
+    use super::{split_budget_across_modalities, MIN_MODALITY_BUDGET_MB};
+
+    #[test]
+    fn shares_are_proportional_to_nnz() {
+        // 1:3 nnz over a budget far above the floor.
+        let split = split_budget_across_modalities(4000, &[1_000, 3_000]);
+        assert_eq!(split, vec![1000, 3000]);
+    }
+
+    #[test]
+    fn a_single_modality_receives_the_whole_budget() {
+        assert_eq!(split_budget_across_modalities(4000, &[7]), vec![4000]);
+    }
+
+    /// The floor is what keeps a starved modality from failing
+    /// `LoaderConfig::validate`, so it must survive any refactor of the split.
+    #[test]
+    fn a_starved_modality_is_raised_to_the_floor() {
+        // 1:999 — the small modality's proportional share is 4 MB.
+        let split = split_budget_across_modalities(4000, &[4, 3_996]);
+        assert_eq!(split[0], MIN_MODALITY_BUDGET_MB);
+        assert_eq!(split[1], 3996, "the large modality keeps its own share");
+    }
+
+    /// **The over-budget the floor buys.** Two modalities under a 64 MB request
+    /// budget 128 MB between them; nothing reports this today. Pinned as
+    /// observed fact so `memory_budget()` can surface it without the arithmetic
+    /// shifting underneath.
+    #[test]
+    fn the_floor_lets_the_shares_exceed_the_request() {
+        let total_mb = 64;
+        let split = split_budget_across_modalities(total_mb, &[1_000, 1_000]);
+        assert_eq!(split, vec![MIN_MODALITY_BUDGET_MB, MIN_MODALITY_BUDGET_MB]);
+        assert_eq!(
+            split.iter().sum::<usize>(),
+            2 * MIN_MODALITY_BUDGET_MB,
+            "two modalities at a {total_mb} MB request budget {} MB",
+            2 * MIN_MODALITY_BUDGET_MB
+        );
+        assert!(
+            split.iter().sum::<usize>() > total_mb,
+            "premise of the whole pin: the floors exceed the request"
+        );
+    }
+
+    /// The degenerate inputs the constructor can hand it: an all-zero nnz
+    /// census (a file whose catalog carries no stats) must not divide by zero.
+    /// The warning has to name a budget that actually stops it firing.
+    ///
+    /// Echoing the current effective sum back does **not** converge: the floor
+    /// is re-applied after the new split, so with a 1:99 ratio 64 MB reports
+    /// 128, 128 reports 190, 190 reports 252 … Found by review; this pins the
+    /// fixed point instead.
+    #[test]
+    fn the_recommended_total_is_a_fixed_point() {
+        let nnz = [1u64, 99];
+        let mb = super::min_total_mb_clearing_the_floor(&nnz)
+            .expect("a positive-nnz split always has a fixed point");
+        let split = split_budget_across_modalities(mb, &nnz);
+        assert!(
+            split.iter().all(|&s| s >= MIN_MODALITY_BUDGET_MB),
+            "every share must clear the floor: {split:?}"
+        );
+        assert_eq!(
+            split.iter().sum::<usize>(),
+            mb,
+            "at the fixed point the shares sum to the request, so the warning stops"
+        );
+        // And the value the old message quoted does NOT converge.
+        let naive: usize = split_budget_across_modalities(64, &nnz).iter().sum();
+        assert!(
+            split_budget_across_modalities(naive, &nnz)
+                .iter()
+                .sum::<usize>()
+                > naive,
+            "premise: echoing the effective sum back re-fires the warning"
+        );
+    }
+
+    /// A modality with no recorded nnz gets a zero share at every budget, so no
+    /// total lifts it off the floor — the message must say that rather than
+    /// quoting a number that cannot work.
+    #[test]
+    fn a_zero_nnz_modality_has_no_fixed_point() {
+        assert!(super::min_total_mb_clearing_the_floor(&[0, 100]).is_none());
+        assert!(super::min_total_mb_clearing_the_floor(&[0, 0]).is_none());
+        assert!(super::min_total_mb_clearing_the_floor(&[]).is_none());
+    }
+
+    #[test]
+    fn zero_nnz_does_not_divide_by_zero() {
+        let split = split_budget_across_modalities(4000, &[0, 0]);
+        assert_eq!(split, vec![MIN_MODALITY_BUDGET_MB; 2]);
+        assert!(split_budget_across_modalities(4000, &[]).is_empty());
     }
 }
 
