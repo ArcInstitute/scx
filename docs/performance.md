@@ -2515,9 +2515,19 @@ things that were quietly different:
   `batch_size=64, shard_group_size=1, prefetch_batches=2` with `budget_exceeded` set,
   whatever the caller asked for — `benchmarks/comprehensive/benchmarks/ml_loader.py` carries
   a SLURM-memory-scaling workaround written for exactly that. Page cache is evictable under
-  pressure; it is now reported (`mmap_mb`) and never budgeted. Note the honest consequence:
-  a measured `ru_maxrss` still counts resident file pages, so the reported budget is a bound
-  on *anonymous* memory, not on RSS.
+  pressure; it is now reported (`mmap_mb`) and never budgeted.
+
+  **The cost, measured.** A two-arm A/B on the small tier (`ml_loader`, `scx_auto`, 4
+  datasets, main-arm capture as the baseline) found **no timing regression** and a real
+  peak-RSS rise on the large-file datasets: `tabula_sapiens_100k` **+10.4%**. The mechanism
+  is the intended one and is visible in the tuned config — the mmap term no longer forces a
+  reduction, so `shard_group_size` goes 3 → 4 (default) and 4 → 5 (`hvg_indices`), holding
+  more decoded shard buffers resident. Files small enough that the mmap term never bound
+  (pbmc3k, pbmc10k at 4 MB / 40 MB) tune identically on both arms and measure within ±1%.
+  So the trade is explicit: the loader stops shrinking the buffers a caller asked for in
+  order to pay for evictable page cache, and uses more anonymous memory for it. A caller who
+  wants the old footprint sets `max_memory_mb` to the value they actually want enforced,
+  which is now what that argument means.
 - **`SparseCellSetDataset` now budgets the interpreter constant it reports.** Its tuner
   passed `non_cache_bytes: 0`, so `memory_budget()["breakdown"]["total_bytes"]` could exceed
   the budget the tuner had just checked, and it handed the cache the raw request and raw
