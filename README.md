@@ -852,7 +852,7 @@ codebase by **Nick Youngblut**:
 | **F14** | **PFlog (v4) / shifted-log normalization** | Booeshaghi et al. method (raw counts, matrix-wide Anscombe pseudocount `1/(4α)`, α estimated once): sparse delta + per-cell baseline decomposition → out-of-core baseline-aware PCA, streaming materialize-to-SCX in compact `delta_baseline` / `dense` representations; integrated across accel, format, loader, and rscx. |
 | **F15** | **Multimodal** | CITE-seq, 10x Multiome, TEA-seq support in a single v2 file with per-modality codec routing and h5mu streaming. |
 | **F16** | **Perturbation evaluation metrics (cell-eval / arc-bench parity)** | Rust-accelerated pseudobulk means, bulk metrics (pearson_delta / mse / mae), discrimination score, energy distance, knockdown efficiency, and clustering agreement — 5–52× speedups, 32/32 numerical parity. |
-| **F17** | **Fuzzing & property-based testing** | 13 libfuzzer targets + 7 proptest suites; CI fuzz build check on every PR. |
+| **F17** | **Fuzzing & property-based testing** | 13 libfuzzer targets + 7 proptest suites; CI fuzz build check on every PR touching the fuzzed crates, plus a weekly scheduled run. |
 | **F18** | **R bindings (rscx)** | Seurat v5 + SingleCellExperiment integration via extendr. |
 | **F19** | **Comprehensive benchmarking framework** | 42 benchmark modules, 9 format runners, regression gating, SLURM integration, dashboard — ~60K lines across 216 files. |
 | **F20** | **Comprehensive documentation** | 23 docs (~14K lines): format spec, codec spec, architecture, API reference, migration guides, GPU setup, and more. |

@@ -21,6 +21,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    # CI runs the suite with `pytest -n 2 --dist loadfile`; loadfile keeps each
+    # test file inside one worker process, which is what makes the fork-heavy
+    # and thread-env-mutating files safe to parallelise.
+    "pytest-xdist>=3.0",
     "scanpy>=1.10",
     # The suite imports both: `test_hvg_loess_singularity.py` monkeypatches
     # `skmisc.loess`, and several `test_accel.py` / `test_pseudobulk_thread_env.py`
@@ -102,3 +106,10 @@ pydeseq2 = [
 features = ["pyo3/extension-module", "hdf5"]
 python-source = "python"
 include = [{ path = "python/pyscx/py.typed", format = "sdist" }]
+
+[tool.pytest.ini_options]
+# Registration only (silences PytestUnknownMarkWarning). CI does NOT deselect
+# `slow` today — it is a lever for marking large informational benchmarks.
+markers = [
+    "slow: large informational benchmark; not an assertion of correctness",
+]
