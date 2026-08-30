@@ -25,59 +25,30 @@ use scx_accel::route::{AccelExecutionInfo, AccelRoute, FallbackReason};
 use super::gpu::{rapids_singlecell_info, ResolvedDevice};
 use super::route::write_accel_route;
 
-/// `SCX_FORCE_NATIVE_GPU` override — keep the native SCX GPU kernels instead of
-/// routing in-VRAM GPU compute to rapids-singlecell. After Phase 3 it pins only
-/// the surviving native paths (streaming preprocess kernels, randomized PCA);
-/// the in-VRAM UMAP / covariance-PCA / CAGRA-kNN kernels it also used to pin were
-/// removed, so for those ops it now falls through to the CPU path.
-pub(crate) fn force_native_gpu() -> bool {
-    matches!(std::env::var("SCX_FORCE_NATIVE_GPU"), Ok(v) if v != "0" && !v.is_empty())
-}
-
-/// `SCX_DISABLE_RAPIDS` override — treat rapids-singlecell as if it were not
-/// importable, so a GPU op takes the `no_rapids` CPU-fallback path even on a host
-/// where rapids *is* installed. Exists so the Phase 2.2 fallback gate can exercise
-/// the rapids-absent contract without uninstalling rapids; honored ahead of the
-/// `force_native` override so the fallback (not the native kernels) is what runs.
-pub(crate) fn rapids_disabled() -> bool {
-    matches!(std::env::var("SCX_DISABLE_RAPIDS"), Ok(v) if v != "0" && !v.is_empty())
-}
-
-/// How a GPU-eligible standalone op should dispatch in the in-VRAM regime.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RapidsDecision {
-    /// Hand off to rapids-singlecell on this device.
-    Rapids(usize),
-    /// Proceed with the existing native / CPU dispatch unchanged — `device="cpu"`,
-    /// or `SCX_FORCE_NATIVE_GPU=1` selecting the native GPU kernels.
-    Native,
-    /// GPU requested + rapids absent + not forcing native → route CPU and stamp
-    /// `no_rapids` (a one-shot diagnostic has been emitted).
-    NoRapidsCpu,
-}
+// The rapids dispatch policy — the decision matrix, the env overrides
+// (`SCX_FORCE_NATIVE_GPU` / `SCX_DISABLE_RAPIDS`), and their precedence — is
+// shared with rscx via `scx_accel::route` (ORG-10.16-3). This module keeps
+// only the Python facts (the rapids import probe) and effects (the one-shot
+// diagnostic, the rsc.* calls).
+pub(crate) use scx_accel::route::{force_native_gpu, rapids_disabled, RapidsDecision};
 
 /// Decide how a GPU-eligible op dispatches. `op` names the op for the one-shot
 /// rapids-absent diagnostic.
+///
+/// A thin binding over [`scx_accel::route::plan_rapids_decision`]: the import
+/// probe is passed lazily, so `device="cpu"` and `SCX_DISABLE_RAPIDS=1` never
+/// trigger the rapids import (and the CUDA init it would cause).
 pub(crate) fn decide(py: Python<'_>, resolved: ResolvedDevice, op: &str) -> RapidsDecision {
-    let gpu_id = match resolved.gpu_id() {
-        Some(i) => i,
-        None => return RapidsDecision::Native, // device="cpu" → existing CPU path
-    };
-    // SCX_DISABLE_RAPIDS forces the rapids-absent fallback (Phase 2.2 gate),
-    // checked before force_native so it pins the `no_rapids` CPU path.
-    if rapids_disabled() {
+    let decision = scx_accel::route::plan_rapids_decision(
+        resolved.gpu_id(),
+        rapids_disabled(),
+        force_native_gpu(),
+        || rapids_singlecell_info(py).available,
+    );
+    if decision == RapidsDecision::NoRapidsCpu {
         warn_no_rapids_once(py, op);
-        return RapidsDecision::NoRapidsCpu;
     }
-    if force_native_gpu() {
-        return RapidsDecision::Native;
-    }
-    if rapids_singlecell_info(py).available {
-        RapidsDecision::Rapids(gpu_id)
-    } else {
-        warn_no_rapids_once(py, op);
-        RapidsDecision::NoRapidsCpu
-    }
+    decision
 }
 
 static NO_RAPIDS_WARNED: AtomicBool = AtomicBool::new(false);

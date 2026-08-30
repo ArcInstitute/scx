@@ -294,17 +294,9 @@ pub(super) fn nbglm_options_from_dict(
 
     if let Some(v) = d.get_item("dispersion")? {
         let s: String = v.extract()?;
-        o.dispersion = match s.as_str() {
-            "moments" => DispersionMethod::Moments,
-            "cox_reid_mle" => DispersionMethod::CoxReidMle,
-            "cox_reid_shrunk" => DispersionMethod::CoxReidShrunk,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "invalid dispersion={other:?}; expected 'moments', \
-                     'cox_reid_mle', or 'cox_reid_shrunk'"
-                )))
-            }
-        };
+        // Shared vocabulary + error text (`DispersionMethod::parse`).
+        o.dispersion =
+            DispersionMethod::parse(&s).map_err(|e| PyValueError::new_err(e.to_string()))?;
     }
     if let Some(v) = d.get_item("min_disp")? {
         o.min_disp = v.extract()?;

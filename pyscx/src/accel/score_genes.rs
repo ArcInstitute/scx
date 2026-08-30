@@ -66,21 +66,9 @@ pub fn score_genes<'py>(
     // backed X would score the wrong physical columns. Reject loudly.
     super::prepare_target(py, adata, "score_genes")?;
 
-    // ── Parse the scoring method ────────────────────────────────────────
-    let method_enum = match method {
-        "control" => ScoreMethod::Control {
-            ctrl_size,
-            n_bins,
-            random_state,
-        },
-        "mean" => ScoreMethod::Mean,
-        "zscore" => ScoreMethod::Zscore,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "score_genes: unknown method {other:?}; expected \"control\", \"mean\", or \"zscore\""
-            )));
-        }
-    };
+    // ── Parse the scoring method (shared vocabulary + error text) ───────
+    let method_enum = ScoreMethod::parse(method, ctrl_size, n_bins, random_state)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     // ── Resolve gene symbols → var-index positions ──────────────────────
     let var = adata.getattr("var")?;

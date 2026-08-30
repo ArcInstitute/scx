@@ -50,6 +50,33 @@ pub enum ScoreMethod {
     Zscore,
 }
 
+impl ScoreMethod {
+    /// Parse the user-facing `method=` string, carrying the `Control`
+    /// sampler parameters (ignored for `"mean"` / `"zscore"`).
+    ///
+    /// The single vocabulary + error text for every binding; the message is
+    /// pinned by the pyscx test suite.
+    pub fn parse(
+        method: &str,
+        ctrl_size: usize,
+        n_bins: usize,
+        random_state: u64,
+    ) -> std::result::Result<Self, crate::error::InvalidArgument> {
+        match method {
+            "control" => Ok(ScoreMethod::Control {
+                ctrl_size,
+                n_bins,
+                random_state,
+            }),
+            "mean" => Ok(ScoreMethod::Mean),
+            "zscore" => Ok(ScoreMethod::Zscore),
+            other => Err(crate::error::InvalidArgument(format!(
+                "score_genes: unknown method {other:?}; expected \"control\", \"mean\", or \"zscore\""
+            ))),
+        }
+    }
+}
+
 /// Reject non-finite values at the scoring boundary (mirrors the HVG/DE
 /// boundary checks): a NaN/Inf would silently poison the per-cell sums.
 fn ensure_finite(data: &[f32]) -> Result<()> {

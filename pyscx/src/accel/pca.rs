@@ -1050,19 +1050,10 @@ pub fn pca(
 
     // ------- CPU path (fallback) -------
     // Auto-route: covariance when n_vars <= threshold (faster for HVG data).
-    let cov_threshold = scx_accel::COVARIANCE_PCA_THRESHOLD;
+    // The rule is the shared `resolve_cpu_pca_method`, so R and Python cannot
+    // drift on the threshold.
     let pick_cpu_method = |n_vars: usize| -> &'static str {
-        match method {
-            "covariance" => "covariance",
-            "randomized" => "randomized",
-            _ => {
-                if n_vars <= cov_threshold {
-                    "covariance"
-                } else {
-                    "randomized"
-                }
-            }
-        }
+        scx_accel::resolve_cpu_pca_method(method, n_vars).as_str()
     };
 
     // RAM ceiling for the backed-PCA shard cache. `None` → a conservative

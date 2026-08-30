@@ -25,6 +25,21 @@ pub enum AggregationMethod {
     Mean,
 }
 
+impl AggregationMethod {
+    /// Parse the user-facing `aggr_method=` string — the single vocabulary +
+    /// error text for every binding (the message is pinned by the pyscx test
+    /// suite, which surfaces it as `RuntimeError`).
+    pub fn parse(aggr_method: &str) -> std::result::Result<Self, crate::error::InvalidArgument> {
+        match aggr_method {
+            "sum" => Ok(AggregationMethod::Sum),
+            "mean" => Ok(AggregationMethod::Mean),
+            other => Err(crate::error::InvalidArgument(format!(
+                "unsupported aggr_method '{other}': use 'sum' or 'mean'"
+            ))),
+        }
+    }
+}
+
 /// pdex-style pseudobulk mode controlling per-cell and per-group-mean transforms.
 ///
 /// Encodes the four `(geometric_mean × is_log1p)` combinations from

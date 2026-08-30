@@ -1591,6 +1591,47 @@ fn build_pca_result(
 /// Default threshold: use covariance method when n_vars <= this value.
 pub const COVARIANCE_PCA_THRESHOLD: usize = 5_000;
 
+/// The CPU PCA solver family, resolved from the user's `method=` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuPcaMethod {
+    /// Exact covariance eigendecomposition (`X^T X`); optimal when
+    /// `n_vars <= COVARIANCE_PCA_THRESHOLD` (e.g. HVG-selected data).
+    Covariance,
+    /// Randomized (Halko) SVD; the wide-matrix route.
+    Randomized,
+}
+
+impl CpuPcaMethod {
+    /// The identifier used in provenance params and route metadata.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CpuPcaMethod::Covariance => "covariance",
+            CpuPcaMethod::Randomized => "randomized",
+        }
+    }
+}
+
+/// Resolve the CPU PCA solver from the user's `method=` request and the
+/// effective column count — **the** auto-routing rule, shared by both
+/// bindings so R and Python cannot drift on the threshold.
+///
+/// An explicit `"covariance"` / `"randomized"` wins; anything else (the
+/// documented value is `"auto"`; entry points validate the vocabulary before
+/// calling) routes by `n_vars <= COVARIANCE_PCA_THRESHOLD`.
+pub fn resolve_cpu_pca_method(requested: &str, n_vars: usize) -> CpuPcaMethod {
+    match requested {
+        "covariance" => CpuPcaMethod::Covariance,
+        "randomized" => CpuPcaMethod::Randomized,
+        _ => {
+            if n_vars <= COVARIANCE_PCA_THRESHOLD {
+                CpuPcaMethod::Covariance
+            } else {
+                CpuPcaMethod::Randomized
+            }
+        }
+    }
+}
+
 /// Compute PCA via the covariance method, streaming from a [`ShardSource`].
 ///
 /// Algorithm (2 passes over data):

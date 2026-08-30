@@ -12,7 +12,8 @@ pub mod gpu;
 pub use cpu::{
     covariance_pca, covariance_pca_inmemory, covariance_pca_with_depth, pca_prefetch_depth,
     pflog_pca, pflog_pca_with_depth, randomized_pca, randomized_pca_inmemory,
-    randomized_pca_with_depth, PcaResult, COVARIANCE_PCA_THRESHOLD,
+    randomized_pca_with_depth, resolve_cpu_pca_method, CpuPcaMethod, PcaResult,
+    COVARIANCE_PCA_THRESHOLD,
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{gpu_available, gpu_info, randomized_pca_gpu, GpuInfo};

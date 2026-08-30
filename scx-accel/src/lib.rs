@@ -52,6 +52,7 @@ macro_rules! require_gpu_cap {
 }
 
 pub mod csc;
+pub mod device;
 pub mod diffexp;
 pub mod error;
 pub mod eval_metrics;
@@ -94,7 +95,7 @@ pub use diffexp::{
     pdex_ref_streaming, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming,
     DiffExpResult, PdexRefResult,
 };
-pub use error::{AccelError, Result};
+pub use error::{AccelError, InvalidArgument, Result};
 #[cfg(feature = "gpu")]
 pub use eval_metrics::edistance::compute_energy_distance_gpu;
 pub use eval_metrics::{
@@ -126,7 +127,8 @@ pub use neighbors::{build_knn_graph, KnnResult};
 pub use pca::{
     covariance_pca, covariance_pca_inmemory, covariance_pca_with_depth, pca_prefetch_depth,
     pflog_pca, pflog_pca_with_depth, randomized_pca, randomized_pca_inmemory,
-    randomized_pca_with_depth, PcaResult, COVARIANCE_PCA_THRESHOLD,
+    randomized_pca_with_depth, resolve_cpu_pca_method, CpuPcaMethod, PcaResult,
+    COVARIANCE_PCA_THRESHOLD,
 };
 pub use pflog::{
     estimate_alpha, pflog_baseline_from_delta, pflog_baseline_from_raw, AlphaEstimate,
@@ -145,8 +147,9 @@ pub use pseudobulk::{
 #[cfg(feature = "gpu")]
 pub use route::plan_de_route_from_source;
 pub use route::{
-    plan_de_route, plan_hvg_route, plan_nb_glm_route, plan_simple_gpu_route, AccelExecutionInfo,
-    AccelRoute, DeviceRequest, FallbackReason, InputLayout,
+    plan_de_route, plan_hvg_route, plan_nb_glm_route, plan_rapids_decision, plan_simple_gpu_route,
+    AccelExecutionInfo, AccelRoute, DeviceRequest, FallbackReason, InputLayout, RapidsDecision,
+    RouteValue,
 };
 pub use umap::{compute_umap, UmapResult};
 

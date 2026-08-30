@@ -123,6 +123,23 @@ pub enum DispersionMethod {
     CoxReidShrunk,
 }
 
+impl DispersionMethod {
+    /// Parse the user-facing `dispersion=` string — the single vocabulary +
+    /// error text for every binding (the message is pinned by the pyscx test
+    /// suite, which surfaces it as `ValueError`).
+    pub fn parse(dispersion: &str) -> Result<Self, crate::error::InvalidArgument> {
+        match dispersion {
+            "moments" => Ok(DispersionMethod::Moments),
+            "cox_reid_mle" => Ok(DispersionMethod::CoxReidMle),
+            "cox_reid_shrunk" => Ok(DispersionMethod::CoxReidShrunk),
+            other => Err(crate::error::InvalidArgument(format!(
+                "invalid dispersion={other:?}; expected 'moments', \
+                 'cox_reid_mle', or 'cox_reid_shrunk'"
+            ))),
+        }
+    }
+}
+
 /// The hypothesis tested by the Wald step (spec §4.2).
 #[derive(Debug, Clone)]
 pub enum NbGlmContrast {

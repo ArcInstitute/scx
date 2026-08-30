@@ -626,12 +626,10 @@ pub fn pseudobulk_dex(
     // Reject a value that is not an aggregation method at all *before* the
     // backend guard below. Otherwise `aggr_method="tpyo"` is answered with a
     // paragraph about the negative-binomial count model, which is true and
-    // completely beside the point.
-    if !matches!(aggr_method, "sum" | "mean") {
-        return Err(PyRuntimeError::new_err(format!(
-            "unsupported aggr_method '{aggr_method}': use 'sum' or 'mean'"
-        )));
-    }
+    // completely beside the point. Parsing to the enum here also makes an
+    // unvalidated string unrepresentable at the dispatch below.
+    let parsed_aggr_method = scx_accel::AggregationMethod::parse(aggr_method)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     // §2.5: the NB count likelihood requires replicate-level *summed* counts.
     // Fractional aggregates (mean/median) are not valid inputs to the model, so
     // the count backend accepts only aggr_method="sum".
@@ -764,20 +762,10 @@ pub fn pseudobulk_dex(
         )));
     }
 
-    // Already validated up front (before the backend guards), so the catch-all
-    // here is unreachable rather than a second error message to keep in sync.
-    // Asserted rather than assumed: if that guard is ever moved or removed, an
-    // unrecognised `aggr_method` would silently become `Mean` instead of
-    // erroring, which is the kind of default nobody would notice.
-    debug_assert!(
-        matches!(aggr_method, "sum" | "mean"),
-        "aggr_method {aggr_method:?} reached the dispatch match — the up-front \
-         validation guard is gone or was bypassed"
-    );
-    let method = match aggr_method {
-        "sum" => scx_accel::AggregationMethod::Sum,
-        _ => scx_accel::AggregationMethod::Mean,
-    };
+    // Parsed up front (before the backend guards) by the shared
+    // `AggregationMethod::parse`, so an unrecognised value can no longer
+    // reach this point as a silently-defaulted string.
+    let method = parsed_aggr_method;
 
     let result = aggregate_pseudobulk(
         py,
