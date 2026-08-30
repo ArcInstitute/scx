@@ -363,7 +363,7 @@ def test_closed_dataset_raises_before_running_user_code(two_scx):
 
     # Same for the argument-validation path: closed beats ValueError.
     with pytest.raises(RuntimeError, match="closed"):
-        ds.suggested_cache_shards([0, 0], [1])
+        ds.suggested_cache_shards(([0, 0], [1], [0, 0], [0, 2]))
 
 
 # ---------------------------------------------------------------------------

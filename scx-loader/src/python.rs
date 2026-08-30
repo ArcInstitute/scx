@@ -1473,27 +1473,31 @@ impl IndexPlanDataset {
         cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }
 
-    /// Per-component memory breakdown estimated at construction. Returns a
-    /// dict with the keys:
+    /// Memory budget diagnostics as a dict:
     ///
     /// ```text
-    /// cache_bytes              - decoded shard cache budget
-    /// batch_buffer_bytes       - dense X / X_paired buffers
-    /// lookahead_overhead_bytes - plan-tuple staging in the iter
-    /// transient_bytes          - per-batch obs Vecs + PairRequest scratch
-    /// python_overhead_bytes    - constant Python/Arrow/numpy overhead
-    /// total_bytes              - sum of the above
+    /// breakdown                - per-component estimate (see below)
     /// max_memory_mb            - user-supplied budget (LoaderConfig)
     /// effective_cache_shards   - post-auto-tune cache count cap
     /// effective_lookahead      - post-auto-tune iter lookahead
+    ///
+    /// breakdown:
+    ///   cache_bytes              - decoded shard cache budget
+    ///   batch_buffer_bytes       - dense X / X_paired buffers
+    ///   lookahead_overhead_bytes - plan-tuple staging in the iter
+    ///   transient_bytes          - per-batch obs Vecs + PairRequest scratch
+    ///   python_overhead_bytes    - constant Python/Arrow/numpy overhead
+    ///   total_bytes              - sum of the above
     /// ```
     ///
-    /// All byte values are `int`. Mirrors `TrainingDataset.memory_budget()`'s
-    /// `breakdown` sub-dict shape, plus the index-plan-specific
-    /// `effective_*` fields.
+    /// All byte values are `int`. ORG-9.10-4 moved the six components **under**
+    /// `breakdown`, where `TrainingDataset` had always reported them, so that
+    /// `memory_budget()["breakdown"]["total_bytes"]` reads the same on every
+    /// dataset class; the keys beside it stay class-specific.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let loader = self.loader()?;
-        let dict = loader.budget_breakdown().to_pydict(py)?;
+        let dict = PyDict::new(py);
+        dict.set_item("breakdown", loader.budget_breakdown().to_pydict(py)?)?;
         dict.set_item("max_memory_mb", loader.max_memory_mb())?;
         dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("effective_lookahead", loader.effective_lookahead())?;
@@ -2514,13 +2518,18 @@ impl SparseCellSetDataset {
     /// `cache_shards` that would let the whole batch stay resident.
     ///
     /// Pure index arithmetic from the catalogs' shard row ranges: no I/O, no
-    /// decode. `file_ids` and `rows` are the first two elements of the plan tuple
-    /// `iter_with_plans` consumes, so a caller can size the cache from the plans
-    /// it is about to issue:
+    /// decode. Takes **one plan**, in the same
+    /// `(file_ids, rows, role_tags, set_offsets)` shape `iter_with_plans`
+    /// consumes — `role_tags` and `set_offsets` are ignored, since shard
+    /// residency depends only on which rows of which files are read — so a
+    /// caller can size the cache from the plans it is about to issue without
+    /// destructuring them (ORG-9.10-4; it used to take `file_ids` and `rows` as
+    /// two separate arrays, which was the same method under a different arity
+    /// from the one `IndexPlanDataset` exposes):
     ///
     /// ```python
     /// probe = pyscx.SparseCellSetDataset(paths)
-    /// need = max(probe.suggested_cache_shards(fids, rows) for fids, rows, _, _ in plans[:64])
+    /// need = max(probe.suggested_cache_shards(p) for p in plans[:64])
     /// ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
     /// ```
     ///
@@ -2530,12 +2539,12 @@ impl SparseCellSetDataset {
     fn suggested_cache_shards(
         &self,
         py: Python<'_>,
-        file_ids: Vec<u32>,
-        rows: Vec<u64>,
+        plan: (Vec<u32>, Vec<u64>, Vec<i32>, Vec<i64>),
     ) -> PyResult<usize> {
         // Closed-state check first, so a closed dataset reports that rather
         // than a ValueError about its arguments.
         let loader = self.loader()?;
+        let (file_ids, rows, _role_tags, _set_offsets) = plan;
         if file_ids.len() != rows.len() {
             return Err(PyValueError::new_err(format!(
                 "file_ids and rows must be the same length, got {} and {}",
@@ -2549,22 +2558,32 @@ impl SparseCellSetDataset {
     /// Resolved shard-cache budget:
     ///
     /// ```text
-    /// max_memory_mb           - byte budget in force (adaptive when not passed)
-    /// cache_shards            - requested count cap
-    /// affordable_cache_shards - shards the byte budget holds at average size
-    /// shard_decoded_bytes     - average decoded bytes per CSR shard
+    /// breakdown              - per-component estimate, same six keys as every
+    ///                          other dataset class
+    /// max_memory_mb          - byte budget in force (adaptive when not passed)
+    /// cache_shards           - requested count cap
+    /// effective_cache_shards - shards the byte budget holds at average size
+    /// shard_decoded_bytes    - average decoded bytes per CSR shard
     /// ```
     ///
-    /// Unlike `IndexPlanDataset.memory_budget()` there is no batch-buffer or
-    /// plan-tuple term: on the sparse path the shard cache *is* the budget.
+    /// Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
+    /// breakdown: on this path the shard cache *is* the budget — there is no
+    /// batch-buffer or plan-tuple term. See
+    /// [`SparseCellSetLoader::budget_breakdown`] for why `total_bytes` here can
+    /// exceed `max_memory_mb`, which it cannot on `IndexPlanDataset`.
+    ///
+    /// ORG-9.10-4 renamed `affordable_cache_shards` to `effective_cache_shards`:
+    /// it is the same quantity `IndexPlanDataset` reports under that name, and
+    /// both are `loader.effective_cache_shards()`.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         let loader = self.loader()?;
         let budget = loader.cache_bytes_budget();
         let per_shard = loader.shard_decoded_bytes();
+        dict.set_item("breakdown", loader.budget_breakdown().to_pydict(py)?)?;
         dict.set_item("max_memory_mb", budget / (1024 * 1024))?;
         dict.set_item("cache_shards", loader.cache_shards())?;
-        dict.set_item("affordable_cache_shards", loader.effective_cache_shards())?;
+        dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
         Ok(dict)
     }

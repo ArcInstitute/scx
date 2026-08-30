@@ -704,32 +704,45 @@ class TestMetrics:
 class TestMemoryBudget:
     def test_memory_budget_keys_and_total(self, scx_path):
         """Schema: every documented key is present, all `int`, and the
-        per-component bytes sum to `total_bytes`."""
+        per-component bytes sum to `total_bytes`.
+
+        ORG-9.10-4 moved the six components under `breakdown` — where
+        `TrainingDataset` had always reported them — so that
+        `memory_budget()["breakdown"]` reads the same on every dataset class.
+        The exact-key-set assertion below is what made that move visible rather
+        than silent; the cross-class invariant lives in
+        `test_cache_sizing.py::TestMemoryBudgetEnvelope`.
+        """
         ds = pyscx.IndexPlanDataset(scx_path)
         b = ds.memory_budget()
-        expected_keys = {
+        assert set(b) == {
+            "breakdown",
+            "max_memory_mb",
+            "effective_cache_shards",
+            "effective_lookahead",
+        }
+        assert set(b["breakdown"]) == {
             "cache_bytes",
             "batch_buffer_bytes",
             "lookahead_overhead_bytes",
             "transient_bytes",
             "python_overhead_bytes",
             "total_bytes",
-            "max_memory_mb",
-            "effective_cache_shards",
-            "effective_lookahead",
         }
-        assert set(b) == expected_keys
-        for k, v in b.items():
+        for k, v in b["breakdown"].items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
             assert v >= 0
+        for k in ("max_memory_mb", "effective_cache_shards", "effective_lookahead"):
+            assert isinstance(b[k], int) and b[k] >= 0, k
+        bd = b["breakdown"]
         component_sum = (
-            b["cache_bytes"]
-            + b["batch_buffer_bytes"]
-            + b["lookahead_overhead_bytes"]
-            + b["transient_bytes"]
-            + b["python_overhead_bytes"]
+            bd["cache_bytes"]
+            + bd["batch_buffer_bytes"]
+            + bd["lookahead_overhead_bytes"]
+            + bd["transient_bytes"]
+            + bd["python_overhead_bytes"]
         )
-        assert component_sum == b["total_bytes"]
+        assert component_sum == bd["total_bytes"]
 
     def test_memory_budget_matches_max_memory_mb(self, scx_path):
         """`total_bytes` must fit inside the user-configured budget — if
@@ -737,8 +750,9 @@ class TestMemoryBudget:
         ds = pyscx.IndexPlanDataset(scx_path, max_memory_mb=256)
         b = ds.memory_budget()
         max_bytes = b["max_memory_mb"] * 1024 * 1024
-        assert b["total_bytes"] <= max_bytes, (
-            f"total_bytes ({b['total_bytes']}) exceeds budget "
+        total = b["breakdown"]["total_bytes"]
+        assert total <= max_bytes, (
+            f"total_bytes ({total}) exceeds budget "
             f"({max_bytes}) — auto-tune is broken"
         )
         # Effective values mirror the loader's accessors.

@@ -130,10 +130,11 @@ class IndexPlanDataset:
         `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`."""
         ...
 
-    def memory_budget(self) -> dict[str, int]:
-        """Per-component budget breakdown from the construction auto-tune,
-        plus `max_memory_mb` (the resolved value in force — adaptive when the
-        constructor was passed none), `effective_cache_shards`, and
+    def memory_budget(self) -> dict[str, Any]:
+        """`breakdown` — the six-key per-component estimate from the
+        construction auto-tune, in the shape every dataset class reports — plus
+        `max_memory_mb` (the resolved value in force, adaptive when the
+        constructor was passed none), `effective_cache_shards` and
         `effective_lookahead`."""
         ...
 
@@ -340,26 +341,34 @@ class SparseCellSetDataset:
         `SparseCellSetBatchIter.metrics()["prefetch"]`."""
         ...
 
-    def memory_budget(self) -> dict[str, int]:
-        """Resolved shard-cache budget: `max_memory_mb` (the value in force —
-        adaptive when the constructor was passed none), `cache_shards`,
-        `affordable_cache_shards`, `shard_decoded_bytes`.
+    def memory_budget(self) -> dict[str, Any]:
+        """Resolved shard-cache budget: `breakdown` (the six-key
+        `BudgetBreakdown` every dataset class reports), plus `max_memory_mb`
+        (the value in force — adaptive when the constructor was passed none),
+        `cache_shards`, `effective_cache_shards` and `shard_decoded_bytes`.
 
-        Unlike `IndexPlanDataset.memory_budget` there is no batch-buffer term:
-        on the sparse path the shard cache *is* the budget."""
+        Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
+        breakdown: on the sparse path the shard cache *is* the budget, so there
+        is no batch-buffer or plan-tuple term. `total_bytes` can exceed
+        `max_memory_mb` here — the auto-tune does not yet count the interpreter
+        constant this reports (ORG-9.10-5)."""
         ...
 
     def suggested_cache_shards(
-        self, file_ids: Sequence[int], rows: Sequence[int]
+        self,
+        plan: tuple[
+            Sequence[int], Sequence[int], Sequence[int], Sequence[int]
+        ],
     ) -> int:
         """Distinct ``(file_id, shard)`` pairs a plan touches — the
         `cache_shards` that would let the whole batch stay resident.
 
-        `file_ids` and `rows` are the first two elements of the plan tuple
-        `iter_with_plans` consumes. Pure index arithmetic: no I/O, no decode::
+        Takes one plan in the same `(file_ids, rows, role_tags, set_offsets)`
+        shape `iter_with_plans` consumes; the last two are ignored. Pure index
+        arithmetic: no I/O, no decode::
 
             probe = pyscx.SparseCellSetDataset(paths)
-            need = max(probe.suggested_cache_shards(f, r) for f, r, _, _ in plans[:64])
+            need = max(probe.suggested_cache_shards(p) for p in plans[:64])
             ds = pyscx.SparseCellSetDataset(paths, cache_shards=need)
         """
         ...

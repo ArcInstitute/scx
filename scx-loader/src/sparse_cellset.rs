@@ -337,6 +337,33 @@ impl SparseCellSetLoader {
         self.shard_decoded_bytes
     }
 
+    /// Per-component memory estimate, in the one shape every dataset class
+    /// reports (ORG-9.10-4).
+    ///
+    /// Only two terms are non-zero, and that is the model, not an omission: the
+    /// shard cache **is** this loader's budget — there is no batch buffer,
+    /// no plan-tuple staging and no per-batch obs scratch on the gather path —
+    /// plus the interpreter/numpy/Arrow constant every path pays.
+    ///
+    /// ⚠️ The constant is reported but **not** yet subtracted from the budget:
+    /// [`Self::new`] passes `non_cache_bytes: 0` to
+    /// [`crate::budget::assess_cache_sizing`], so `total_bytes` here can exceed
+    /// `cache_bytes_budget` — which it cannot on `IndexPlanLoader`, whose tuner
+    /// counts the same term. That is the tuner disagreeing with the report, and
+    /// it is what ORG-9.10-5's single `BudgetModel` exists to remove; changing
+    /// the tuner would move a user-visible warning threshold and does not belong
+    /// in a surface change.
+    pub fn budget_breakdown(&self) -> crate::budget::BudgetBreakdown {
+        crate::budget::BudgetBreakdown::new(
+            self.affordable_cache_shards
+                .saturating_mul(self.shard_decoded_bytes),
+            0,
+            0,
+            0,
+            crate::budget::PYTHON_OVERHEAD_BYTES,
+        )
+    }
+
     /// Total CSR shards across every file — the cap on distinct entries in the
     /// shared cache, which is keyed `(file_id, shard)`.
     pub fn total_shards(&self) -> usize {
