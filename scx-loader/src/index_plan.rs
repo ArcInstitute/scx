@@ -580,10 +580,12 @@ impl IndexPlanLoader {
         self.effective_lookahead
     }
 
-    /// Whether the L2 block-index-aware prefetch skip is enabled for this dataset
-    /// (default `true`). Gates only the prefetch skip in `IndexPlanIter`; L1
-    /// block-index adoption is governed by the reader's own env-derived gate. See
-    /// [`Self::scatter_block_index`] field docs.
+    /// Whether block-index adoption is enabled for this dataset (default
+    /// `true`). Reports the value [`Self::set_scatter_block_index`] pushed into
+    /// the backed reader, which is where the decision actually lives:
+    /// `BackedCsrReader::block_index_eligible` ANDs it, so it gates **both** the
+    /// L1 gather adoption and the L2 prefetch warm-skip. The prefetch path does
+    /// not consult this getter — it asks the reader.
     pub fn scatter_block_index(&self) -> bool {
         self.scatter_block_index
     }
@@ -981,9 +983,16 @@ impl IndexPlanLoader {
             // `read_rows_with`, so the engine's per-shard `group_len` matches
             // what the gather's block-index decision sees.
             |plan: &Vec<(u64, u64)>| {
-                plan.iter()
-                    .flat_map(|&(p, c)| [(0u32, p), (0u32, c)])
-                    .collect()
+                // `with_capacity` + push rather than `flat_map(..).collect()`:
+                // the length is exactly `2 * plan.len()`, but `FlatMap`'s
+                // `size_hint` lower bound is not, so `collect` grows the Vec on
+                // the training hot path.
+                let mut rows = Vec::with_capacity(plan.len() * 2);
+                for &(p, c) in plan {
+                    rows.push((0u32, p));
+                    rows.push((0u32, c));
+                }
+                rows
             },
             // The plan arrives by value, so `process_plan` keeps its in-place
             // `sort_by_shard` and moves the sorted plan straight into the

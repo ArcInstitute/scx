@@ -505,11 +505,13 @@ fn iter_with_plans_drop_mid_iteration() {
 /// plan yields no batch and iteration continues — the SCX-DATA-LOADER spec's
 /// "plan list is empty → yield no batch for that plan; continue to the next".
 ///
-/// `PlanPrefetchIter`, the engine this iterator is scheduled to be folded into,
-/// does the **opposite** by design (`plan_engine.rs`: "Empty plans are NOT
-/// skipped — `process` is called for every plan"). That divergence is a fourth
-/// drift the review's list of three does not name, and it is the constraint the
-/// fold has to satisfy. Until now it was pinned only from Python
+/// `PlanPrefetchIter`, the engine this iterator is now an adapter over, does
+/// the **opposite** by design (`plan_engine.rs`: "Empty plans are NOT skipped —
+/// `process` is called for every plan"). That divergence was a fourth drift the
+/// review's list of three did not name, and it was the constraint the fold had
+/// to satisfy: it is met by filtering empties out of the plan *stream* in
+/// `IndexPlanLoader::iter_with_plans`, leaving the engine's contract alone.
+/// Before the fold it was pinned only from Python
 /// (`pyscx/tests/test_index_plan_dataset.py::test_empty_plan_inside_stream_is_skipped`),
 /// so a Rust-side fold would have gone green here and red only in the Python
 /// suite. See `plan_engine_tests::engine_calls_process_for_every_plan_including_empty`
@@ -558,12 +560,14 @@ fn iter_skips_empty_plans_mid_stream() {
 /// it past the iterator's lifetime, which is how it was watched red (a leaked
 /// `plan_rx` clone in `Drop`).
 ///
-/// That distinction is the point rather than a caveat. Drift (c) is that this
-/// arm drains and `PlanPrefetchIter` does not, and both reach the same
-/// observable outcome — so the fold's real question is whether the drain buys
-/// anything at all, not whether to port it. Answering that needs a rendezvous
-/// observable from *inside* `Drop::drop`, before field destruction; until then
-/// the honest statement is that no test distinguishes the two.
+/// That distinction is the point rather than a caveat. Drift (c) was that this
+/// arm drained and `PlanPrefetchIter` did not, and both reached the same
+/// observable outcome here — so the fold's real question was whether the drain
+/// bought anything at all. It did not, and it was not neutral either: it
+/// advances the user's plan generator during teardown, which
+/// `plan_engine_tests::drop_does_not_keep_pulling_from_an_endless_plan_generator`
+/// measures and which this test cannot see. The drain is gone; both arms now
+/// rely on field destruction to wake the sender.
 ///
 /// The generator blocks in `send` once the bounded channel fills, so a worker
 /// that stays parked keeps `exited` false and the test fails on its deadline

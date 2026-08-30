@@ -512,9 +512,11 @@ def test_block_index_prefetch_skip_is_counted_on_the_sparse_arm(framed_scx):
     """`scatter_block_index=True` leaves the framed shard undecoded, and says so.
 
     The value of this over `cache_metrics()["block_index_groups"]` is that it
-    reports the *prefetch* decision (L2) rather than the gather's (L1). Those
-    are supposed to agree — they share `block_index_eligible` — and before the
-    fold only one of them was observable here.
+    reports the *prefetch* decision (L2) rather than the gather's (L1); before
+    the fold only the latter was observable here. They are **not** required to
+    agree: at `lookahead=0` the prefetch never runs and every counter here is 0
+    while the gather still adopts the route, and a peer sharing the cache can
+    warm a shard in between. `block_index_groups` stays the route authority.
 
     The `False` arm is the fixture's own guard: if the file were unframed, or
     the plan too wide for the `group_len * 4 < shard_rows` window, both arms

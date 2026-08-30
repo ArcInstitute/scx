@@ -377,7 +377,7 @@ def test_spawn_num_workers_2(fixture_paths: list[str]) -> None:
 #
 # IndexPlanDataset shares the tokio multi-thread runtime + std::thread +
 # crossbeam primitives with TrainingDataset (it owns its own runtime built
-# lazily in `IndexPlanLoader::runtime()`); its prefetch goes via
+# lazily by the loader's `PrefetchEngine`); its prefetch goes via
 # `tokio::spawn_blocking` and `std::thread::spawn`.
 #
 # It *does* reach rayon, though — through `scx-format-io`, not directly — which

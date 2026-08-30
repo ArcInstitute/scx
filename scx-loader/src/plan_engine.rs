@@ -130,7 +130,7 @@ impl PrefetchEngine {
                 // process-wide, so an N-file engine does not spawn N pools.
                 // Same fork rationale as `IndexPlanLoader` — see `crate::pool`.
                 backed.set_cpu_pool(crate::pool::cpu_pool());
-                // Always-on metrics, mirroring `IndexPlanLoader`. `enable_metrics`
+                // Always-on metrics. `enable_metrics`
                 // is idempotent on the shared cache, so doing it per reader installs
                 // one aggregate handle that `new` reads back via `metrics()`.
                 backed.enable_metrics();
@@ -177,7 +177,7 @@ impl PrefetchEngine {
     }
 
     /// Lazily build the prefetch runtime (2 blocking-friendly worker threads),
-    /// mirroring `IndexPlanLoader::runtime`. Never built at construction, so a
+    /// Never built at construction, so a
     /// forked child starts with an empty `OnceLock`.
     fn runtime(&self) -> Result<&Runtime> {
         if let Some(rt) = self.runtime.get() {
@@ -264,9 +264,13 @@ impl PrefetchEngine {
 /// All atomics use `Relaxed` ordering — values are statistical and not used for
 /// synchronization.
 ///
-/// The four counters partition every shard a plan touches: each is either
-/// spawned or skipped for exactly one reason, which is what
-/// `tests/test_index_plan.rs`'s conservation law checks.
+/// **With prefetch enabled**, the four counters partition every shard a valid
+/// plan touches: each is either spawned or skipped for exactly one reason,
+/// which is what `tests/test_index_plan.rs`'s conservation law checks. At
+/// `lookahead == 0` there is no partition — `spawn_prefetches` returns before
+/// any of them, so all four stay zero while the gather still picks a route.
+/// These are prefetch-time decisions; `CacheMetrics::block_index_groups` is the
+/// route the gather actually took, and the two are not interchangeable.
 #[derive(Default, Debug)]
 pub struct IterMetrics {
     /// `tokio::spawn_blocking` tasks queued onto the runtime's blocking pool.
@@ -464,8 +468,11 @@ where
             };
             // Dedup rows + count unique rows per shard. The gather passes the
             // same deduped set to `read_rows_with`, so this `group_len` is the
-            // one its block-index decision sees — the skip below and the gather
-            // must agree, or the metric proves an adoption that did not happen.
+            // one its block-index decision sees. Deciding on the same input is
+            // what keeps the skip below meaningful as evidence about the gather
+            // — though not a guarantee it agrees: a peer sharing the cache can
+            // warm the shard in between, and at `lookahead == 0` this code does
+            // not run at all.
             let mut seen: HashSet<u64> = HashSet::with_capacity(rs.len());
             let mut per_shard: HashMap<usize, usize> = HashMap::new();
             for row in rs {
@@ -485,8 +492,11 @@ where
                 // framed shard undecoded is what lets `read_rows_with` take the
                 // group-level block-index path instead of being negated by a
                 // full-shard warm. Both sides call the same
-                // `block_index_eligible`, so they cannot drift. Dense or large
-                // groups fall through and warm as before.
+                // `block_index_eligible` on the same `group_len`, so neither
+                // drifts from the other's *predicate* — but the cache can change
+                // under them, so this counter is the prefetch-time decision, not
+                // proof of the gather's route. Dense or large groups fall
+                // through and warm as before.
                 if reader.cache_contains(sidx) {
                     self.iter_metrics
                         .prefetch_skipped_cache_hit
@@ -592,7 +602,7 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
     /// attempted here fails deterministically. The deadline lives in
     /// `BoundedRuntime::drop` instead — see [`crate::runtime`].
     fn drop(&mut self) {
-        // Abort every in-flight shard prefetch, mirroring `IndexPlanLoader::drop`.
+        // Abort every in-flight shard prefetch.
         // Without this, up to `lookahead` `spawn_blocking` decodes keep running on
         // the shared runtime after the iterator is gone, holding blocking-pool
         // threads and cache budget. state3 rebuilds the loader per worker per epoch
@@ -603,15 +613,6 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
                 handle.abort();
             }
         }
-        // Drain `plan_rx` so a worker parked in `send` on the bounded channel
-        // unparks here rather than waiting for field destruction to disconnect
-        // it. Deliberately kept from the pair arm on the fold: no test can tell
-        // the two apart (the observation only starts after `drop` returns, by
-        // which point the channel is closed either way), so the choice is
-        // whether the drain buys anything — and a non-blocking `try_recv` loop
-        // bounded by the channel capacity is cheap enough that keeping the
-        // earlier-unpark behaviour is the conservative unification.
-        while self.plan_rx.try_recv().is_ok() {}
 
         // Detach the pull worker: dropping `plan_rx` (on struct drop) makes its
         // next `send` fail, so the worker exits on its own. We don't join — a
