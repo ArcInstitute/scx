@@ -440,6 +440,122 @@ impl SequentialParams {
     }
 }
 
+/// Verify that all requested modalities share identical per-modality CSR
+/// shard layouts (shard counts + row ranges). The multimodal loader chunks
+/// each modality independently but assembles batches positionally, so
+/// divergent layouts can never yield aligned `cell_indices`. Returns a
+/// human-readable error naming the first disagreeing pair. Pure (no Python),
+/// so it is unit-testable without a Python interpreter.
+///
+/// Takes the `FullCatalog` rather than the `ScxReader` it came from: that is
+/// all the body reads, and it is the difference between the sentinel branch
+/// below being testable and not. No writer emits a CSR entry without `stats`,
+/// so the only way to reach that branch from a test is to hand it a catalog.
+///
+/// Assumes per-shard `stats` are present (always true for single-writer v2+
+/// files). A shard missing `stats` maps to a `(u64::MAX, u64::MAX)` sentinel:
+/// two such shards compare equal (degenerate files pass, then the per-batch
+/// `cell_indices` check in `__next__` is the backstop), while a mix of
+/// present/absent stats compares unequal and fails loud here. Either way the
+/// loader never silently emits mis-aligned batches; a missing-stats shard is
+/// logged so a corrupt/legacy file is diagnosable.
+// Its only production caller is the `python` binding layer, so a default-feature
+// `cargo check` sees no use of it. It lives here rather than there because it is
+// pure Rust: that is what lets its tests run without the `python` feature.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub(crate) fn check_uniform_modality_layouts(
+    catalog: &scx_format_io::FullCatalog,
+    modalities: &[(String, u8, u64)],
+) -> std::result::Result<(), String> {
+    // `std::result::Result`, not this module's one-argument `Result` alias
+    // (`crate::error::Result`). The error side is a human-readable string the
+    // caller wraps in its own error type, not a `LoaderError`.
+    let layouts: Vec<(&str, Vec<(u64, u64)>)> = modalities
+        .iter()
+        .map(|(name, mid, _)| {
+            let ranges = catalog
+                .csr_shards_for_modality(*mid)
+                .iter()
+                .map(|e| match e.stats.as_ref() {
+                    Some(s) => (s.row_start, s.row_end),
+                    None => {
+                        log::warn!(
+                            "MultimodalTrainingDataset: modality '{name}' has a CSR shard with no \
+                             stats; layout-uniformity check falls back to a sentinel row range."
+                        );
+                        (u64::MAX, u64::MAX)
+                    }
+                })
+                .collect();
+            (name.as_str(), ranges)
+        })
+        .collect();
+    if let Some((first_name, first_ranges)) = layouts.first() {
+        for (name, ranges) in layouts.iter().skip(1) {
+            if ranges != first_ranges {
+                return Err(format!(
+                    "modalities '{first_name}' and '{name}' have different per-modality CSR \
+                     shard layouts (shard counts or row ranges disagree). The multimodal loader \
+                     requires uniform per-modality sharding; reshard the file with a uniform \
+                     shard_target_rows before training."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the shared user overrides against [`LoaderConfig::default()`],
+/// filling the fields that vary per construction site (`hvg_indices`,
+/// `obs_columns`, `max_memory_mb`, `auto_memory_budget`, `modality_id`) from
+/// the caller. Shared by `TrainingDataset::new` and the per-modality
+/// `MultimodalTrainingDataset::new` construction so the default-resolution is
+/// spelled out in exactly one place (otherwise a new `LoaderConfig` field must
+/// be wired through two field-for-field literal blocks that silently drift).
+#[allow(clippy::too_many_arguments)]
+// Its only production caller is the `python` binding layer, so a default-feature
+// `cargo check` sees no use of it. It lives here rather than there because it is
+// pure Rust: that is what lets its tests run without the `python` feature.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub(crate) fn resolve_loader_config(
+    batch_size: Option<usize>,
+    shard_group_size: Option<usize>,
+    prefetch_batches: Option<usize>,
+    normalize: Option<bool>,
+    log1p: Option<bool>,
+    target_sum: Option<f64>,
+    pflog: Option<bool>,
+    pflog_alpha: Option<f64>,
+    seed: Option<u64>,
+    hvg_indices: Option<Vec<u32>>,
+    obs_columns: Vec<String>,
+    max_memory_mb: usize,
+    auto_memory_budget: bool,
+    modality_id: Option<u8>,
+    // `true` only from `MultimodalTrainingDataset`, which shares one panel
+    // across modalities of differing widths — see `LoaderConfig::shared_hvg_panel`.
+    shared_hvg_panel: bool,
+) -> LoaderConfig {
+    let defaults = LoaderConfig::default();
+    LoaderConfig {
+        batch_size: batch_size.unwrap_or(defaults.batch_size),
+        shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
+        prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
+        hvg_indices,
+        obs_columns,
+        normalize: normalize.unwrap_or(defaults.normalize),
+        log1p: log1p.unwrap_or(defaults.log1p),
+        target_sum: target_sum.unwrap_or(defaults.target_sum),
+        pflog: pflog.unwrap_or(defaults.pflog),
+        pflog_alpha: pflog_alpha.or(defaults.pflog_alpha),
+        seed: seed.unwrap_or(defaults.seed),
+        max_memory_mb,
+        auto_memory_budget,
+        modality_id,
+        shared_hvg_panel,
+    }
+}
+
 /// The sequential (`TrainingPipeline`) arm of [`crate::budget::BudgetModel`].
 ///
 /// Reduction order — `prefetch_batches` to 2, then `shard_group_size` to 1,
@@ -2370,7 +2486,7 @@ mod tests {
     /// `estimate_memory` must be monotone non-increasing in every knob the
     /// auto-tune reduces.
     ///
-    /// This is the property `python.rs`'s multimodal guard rests on — "a
+    /// This is the property `python/multimodal.rs`'s guard rests on — "a
     /// smaller pinned config always fits within the same budget" — and which
     /// nothing asserted. `MultimodalTrainingDataset` pins every modality to the
     /// **minimum** effective `(batch_size, shard_group_size)` across
@@ -2930,6 +3046,223 @@ mod tests {
             !io.is_finished(),
             "§9.7: the I/O worker is still alive, back-pressured behind the decode \
              stage"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layout_check_tests {
+    use super::check_uniform_modality_layouts;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::modality::ModalityType;
+    use scx_format_io::reader::ScxReader;
+    use scx_format_io::writer::ScxWriter;
+    use std::sync::Arc as StdArc;
+
+    /// Build a two-modality (`rna`, `atac`) `.scx`. `rna` is always a single
+    /// CSR shard over all `n_obs` rows; `atac` is written as one shard per
+    /// entry in `atac_shard_rows` (so passing `&[n_obs]` yields an identical
+    /// layout, and e.g. `&[5, 5]` yields a divergent one).
+    fn build_two_modality(path: &std::path::Path, n_obs: usize, atac_shard_rows: &[usize]) {
+        let n_vars = 4usize;
+        let header =
+            FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, n_obs as u32, 0, 0);
+        let mut writer = ScxWriter::new(path, header).unwrap();
+
+        let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let obs = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(obs_schema),
+            vec![StdArc::new(StringArray::from(
+                cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+
+        let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+        let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+        let var = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(var_schema),
+            vec![StdArc::new(StringArray::from(
+                gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &var).unwrap();
+        writer.write_var_for(atac_id, &var).unwrap();
+        writer.set_modality_n_vars(rna_id, n_vars as u64).unwrap();
+        writer.set_modality_n_vars(atac_id, n_vars as u64).unwrap();
+
+        let write_shard = |writer: &mut ScxWriter, mid: u8, row_offset: usize, rows: usize| {
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for local in 0..rows {
+                let row = row_offset + local;
+                indices.push((row % n_vars) as u32);
+                values.push(((row + 1) & 0xFF) as u8);
+                indptr.push(*indptr.last().unwrap() + 1);
+            }
+            writer
+                .write_csr_shard_for(
+                    mid,
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+        };
+
+        write_shard(&mut writer, rna_id, 0, n_obs);
+        let mut off = 0usize;
+        for &rows in atac_shard_rows {
+            write_shard(&mut writer, atac_id, off, rows);
+            off += rows;
+        }
+        assert_eq!(off, n_obs, "atac shard rows must sum to n_obs");
+        writer.finish().unwrap();
+    }
+
+    fn resolved(reader: &ScxReader) -> Vec<(String, u8, u64)> {
+        vec![
+            ("rna".to_string(), reader.modality_id("rna").unwrap(), 0),
+            ("atac".to_string(), reader.modality_id("atac").unwrap(), 0),
+        ]
+    }
+
+    #[test]
+    fn uniform_layout_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uniform.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        assert!(check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).is_ok());
+    }
+
+    #[test]
+    fn divergent_layout_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergent.scx");
+        build_two_modality(&path, 10, &[5, 5]);
+        let reader = ScxReader::open(&path).unwrap();
+        let err = check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("rna") && err.contains("atac"),
+            "error names pair: {err}"
+        );
+    }
+    /// Strip `stats` from the single CSR shard of each named modality — the
+    /// shape no writer produces (v2+ single-writer files always carry stats)
+    /// but which a corrupt or hand-edited catalog can present, and which the
+    /// function has a dedicated sentinel branch for.
+    fn without_stats(reader: &ScxReader, modalities: &[u8]) -> scx_format_io::FullCatalog {
+        let mut catalog = reader.catalog().clone();
+        for entry in catalog.entries.iter_mut() {
+            if entry.section_type == scx_format_io::SectionType::CsrShard
+                && modalities.contains(&entry.modality_id)
+            {
+                entry.stats = None;
+            }
+        }
+        catalog
+    }
+
+    /// ORG-9.10-6: the sentinel path, agreeing arm. Two shards that both lack
+    /// `stats` map to `(u64::MAX, u64::MAX)` and compare **equal**, so a
+    /// degenerate file is allowed through — the per-batch `cell_indices` check
+    /// in `__next__` is the backstop. Nothing exercised this branch.
+    #[test]
+    fn shards_without_stats_compare_equal_via_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both_stats_less.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+        let atac = reader.modality_id("atac").unwrap();
+
+        // Premise: with stats present this file is uniform, so a failure below
+        // would be about the sentinel and not about the fixture.
+        assert!(check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).is_ok());
+
+        let catalog = without_stats(&reader, &[rna, atac]);
+        assert!(
+            check_uniform_modality_layouts(&catalog, &resolved(&reader)).is_ok(),
+            "two sentinel row ranges must compare equal"
+        );
+    }
+
+    /// ORG-9.10-6: the sentinel must preserve **cardinality**. Stripping stats
+    /// from a genuinely divergent file (1 shard vs 2) must still be caught: one
+    /// sentinel range is not two.
+    ///
+    /// This is the arm that fails if a future edit quiets the missing-stats
+    /// `log::warn!` by dropping such entries (`filter_map`) instead of mapping
+    /// them to the sentinel — at which point both layouts become empty, compare
+    /// equal, and a mis-sharded multimodal file trains on mis-aligned batches.
+    #[test]
+    fn stats_less_shards_still_count_toward_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergent_stats_less.scx");
+        build_two_modality(&path, 10, &[5, 5]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+        let atac = reader.modality_id("atac").unwrap();
+
+        let catalog = without_stats(&reader, &[rna, atac]);
+        let err = check_uniform_modality_layouts(&catalog, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "1 sentinel range must not equal 2 sentinel ranges: {err}"
+        );
+    }
+
+    /// ORG-9.10-6: the sentinel path, disagreeing arm. A **mix** of present and
+    /// absent `stats` compares unequal and must fail loud here rather than
+    /// silently emitting mis-aligned batches — the half of the documented
+    /// contract that decides whether the sentinel is safe.
+    #[test]
+    fn a_mix_of_present_and_absent_stats_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed_stats.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+
+        let catalog = without_stats(&reader, &[rna]);
+        let err = check_uniform_modality_layouts(&catalog, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "unexpected error: {err}"
         );
     }
 }

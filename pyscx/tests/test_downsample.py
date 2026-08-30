@@ -501,14 +501,50 @@ def test_zero_target_is_an_error(two_scx):
 
 
 def test_unknown_method_names_the_accepted_set(two_scx):
+    """`ValueError`, like every other argument check on this constructor.
+
+    It used to be `RuntimeError` — not by design, but because this one error
+    came from `DownsampleMethod::parse` and fell through `loader_err_to_py`'s
+    default arm while the three checks beside it raised `ValueError` directly.
+    Phase 9f moved the whole resolver into `downsample.rs` and maps its errors
+    at the binding site, which made all four consistent. Pinned as `ValueError`
+    rather than the bare `Exception` this asserted before, so the consistency
+    cannot regress unnoticed.
+    """
     import pyscx
 
     p0, _ = two_scx
-    with pytest.raises(Exception, match="hypergeometric"):
+    with pytest.raises(ValueError, match="hypergeometric"):
         pyscx.SparseCellSetDataset(
             [p0],
             downsample_target_library_size=_TARGET,
             downsample_method="hypergeometric",
+        )
+
+
+def test_standalone_primitive_rejects_an_unknown_method_with_valueerror(two_scx):
+    """`ValueError`, matching the constructor and the zero-target check beside it.
+
+    `downsample_counts_csr` is the second public downsample surface. Its
+    `target_library_size == 0` check already raised `ValueError` while an unknown
+    method fell through `loader_err_to_py`'s default arm to `RuntimeError` — two
+    exception types for two argument checks in one function. Phase 9f made the
+    `SparseCellSetDataset` constructor consistent; without this the two entry
+    points disagreed with each other instead. Found by Cursor Agent in review.
+    """
+    import pyscx
+
+    p0, _ = two_scx
+    plain = _gather(pyscx.SparseCellSetDataset([p0]), [0, 0], [0, 1])
+    with pytest.raises(ValueError, match="hypergeometric"):
+        pyscx.downsample_counts_csr(
+            plain["indptr"],
+            plain["indices"],
+            plain["data"],
+            np.array([0, 1], dtype=np.uint64),
+            np.array([1, 2], dtype=np.uint64),
+            _TARGET,
+            method="hypergeometric",
         )
 
 

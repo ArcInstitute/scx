@@ -433,7 +433,7 @@ impl IndexPlanLoader {
             .saturating_mul(1024);
 
         // Shrinking `cache_shards` is *reported* (see `cache_sizing` below and
-        // the warning in `python.rs`) rather than silent: against the ~470 MB
+        // the warning in `python/diagnostics.rs`) rather than silent: against the ~470 MB
         // Pcodec shards STATE3 hit, the historical hard 512 MB default drove
         // the descent to `cache_shards = 1` and manufactured the 143 s/batch
         // thrash regime with no signal to the caller. The descent's *behaviour*

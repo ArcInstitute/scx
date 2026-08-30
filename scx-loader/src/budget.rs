@@ -18,7 +18,7 @@
 //! budget model) and [`assess_cache_thrash`] (runtime, from observed
 //! [`CacheMetrics`]). Both are deliberately pure so they can be unit-tested
 //! without a Python interpreter or a fixture file; only the `warnings.warn`
-//! call lives in `python.rs`.
+//! call lives in `python/diagnostics.rs`.
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
