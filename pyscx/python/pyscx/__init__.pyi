@@ -220,8 +220,9 @@ class SparseCellSetBatchIter:
 
         ``prefetch["prefetch_skipped_block_index"]`` counts the L2
         *prefetch-time* decision: shards left undecoded so the gather could
-        take the block-index path. It stays 0 against an unframed file, where
-        the kwarg is a silent no-op. It is **not** interchangeable with
+        take the block-index path. It stays 0 against an unframed file, whose
+        construction now also emits a preflight ``UserWarning``. It is **not**
+        interchangeable with
         ``cache_metrics()["block_index_groups"]``, which is the route the
         gather took — at ``lookahead=0`` no prefetch runs, so every counter
         here is 0 while ``block_index_groups`` is positive."""
@@ -335,9 +336,10 @@ class SparseCellSetDataset:
 
         The last two report which scattered-read route the gathers took.
         `block_index_groups > 0` proves the row-group path ran and remains the
-        authority on which route was taken: opening an all-unframed set with
-        `scatter_block_index=True` warns at construction, but that warning only
-        says some file is framed, not that any gather took the route. The
+        authority on which route was taken. Opening an all-unframed set with
+        `scatter_block_index=True` warns at construction; the warning's
+        *absence* establishes only that at least one file is framed, never that
+        a gather took the route. The
         prefetcher's own decisions are visible separately, via
         `SparseCellSetBatchIter.metrics()["prefetch"]`."""
         ...

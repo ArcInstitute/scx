@@ -708,7 +708,8 @@ class TestMemoryBudget:
 
         ORG-9.10-4 moved the six components under `breakdown` — where
         `TrainingDataset` had always reported them — so that
-        `memory_budget()["breakdown"]` reads the same on every dataset class.
+        `memory_budget()["breakdown"]` reads the same on every class that
+        reports a budget.
         The exact-key-set assertion below is what made that move visible rather
         than silent; the cross-class invariant lives in
         `test_cache_sizing.py::TestMemoryBudgetEnvelope`.

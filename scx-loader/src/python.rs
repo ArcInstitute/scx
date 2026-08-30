@@ -1296,11 +1296,11 @@ impl IndexPlanDataset {
             warn_hvg_panel(py, "IndexPlanDataset", &v)?;
         }
 
-        // Global switch before the scan — see `warn_unframed_scatter`.
-        if scatter_block_index
-            && scx_format_io::backed::scatter_block_index_enabled()
-            && !loader.any_shard_framed()
-        {
+        if should_warn_unframed_scatter(
+            scatter_block_index,
+            scx_format_io::backed::scatter_block_index_enabled(),
+            || loader.any_shard_framed(),
+        ) {
             warn_unframed_scatter(py, "IndexPlanDataset", &format!("'{path}'"))?;
         }
 
@@ -1497,7 +1497,8 @@ impl IndexPlanDataset {
     /// All byte values are `int`. ORG-9.10-4 moved the six components **under**
     /// `breakdown`, where `TrainingDataset` had always reported them, so that
     /// `memory_budget()["breakdown"]["total_bytes"]` reads the same on every
-    /// dataset class; the keys beside it stay class-specific.
+    /// class that reports a budget (`MultimodalTrainingDataset` reports none);
+    /// the keys beside it stay class-specific.
     fn memory_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let loader = self.loader()?;
         let dict = PyDict::new(py);
@@ -1805,6 +1806,30 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
     Ok(dict)
 }
 
+/// Should the unframed-scatter preflight warn — and, just as importantly, should
+/// the framing scan run at all?
+///
+/// `any_framed` is a closure, and the conjunct order is the whole point.
+/// `BackedCsrReader::any_shard_framed` reads a shard header per shard, and on an
+/// all-unframed file — the one case that cannot short-circuit — it reads every
+/// one. With the caller's kwarg off, or the process-global
+/// `SCX_SCATTER_BLOCK_INDEX` switch off, there is no warning to emit *and*
+/// reframing could not enable the route either, so that scan is pure cost.
+///
+/// Extracted rather than spelled out at the two constructors so a test can
+/// assert the closure was never called. From Python it is not observable: the
+/// switch is memoized in a `OnceLock`, so a subprocess can only show that no
+/// warning was emitted — which was already true when the check sat *after* the
+/// scan (found by codex in review round 2, against a test of mine that could
+/// not fail).
+fn should_warn_unframed_scatter(
+    requested: bool,
+    globally_enabled: bool,
+    any_framed: impl FnOnce() -> bool,
+) -> bool {
+    requested && globally_enabled && !any_framed()
+}
+
 /// Preflight `UserWarning` for `scatter_block_index=True` against a file (or a
 /// set of files) where no CSR shard is row-group framed.
 ///
@@ -1821,18 +1846,18 @@ fn iter_metrics_to_pydict<'py>(py: Python<'py>, m: &IterMetrics) -> PyResult<Bou
 /// lineno), so embedding the paths makes this one-shot per dataset rather than
 /// per process.
 ///
-/// ⚠️ Callers check `scatter_block_index_enabled()` **before** the
-/// `any_shard_framed()` scan, not here: the scan reads a shard header per shard
-/// on an all-unframed file — exactly the case that cannot short-circuit — and
-/// with the process-global switch off there is no warning to emit anyway. This
-/// helper repeats the check only as a backstop.
+/// Callers reach this through [`should_warn_unframed_scatter`], which is what
+/// keeps the process-global switch ahead of the framing scan. The switch is
+/// re-checked here as a live backstop — a `OnceLock` read — so a future caller
+/// that forgets the precheck emits nothing rather than warning while the route
+/// is globally disabled. It is a backstop, not the gate: it cannot un-spend the
+/// scan a caller has already paid for.
 ///
 /// Same house style as [`warn_cache_sizing`]: warn and continue, never refuse.
 fn warn_unframed_scatter(py: Python<'_>, dataset: &str, target: &str) -> PyResult<()> {
-    debug_assert!(
-        scx_format_io::backed::scatter_block_index_enabled(),
-        "callers must gate on scatter_block_index_enabled() before scanning for framing"
-    );
+    if !scx_format_io::backed::scatter_block_index_enabled() {
+        return Ok(());
+    }
     let warnings = crate::pyimport::import_module(py, "warnings")?;
     let user_warning = crate::pyimport::import_module(py, "builtins")?.getattr("UserWarning")?;
     let msg = format!(
@@ -1846,7 +1871,10 @@ fn warn_unframed_scatter(py: Python<'_>, dataset: &str, target: &str) -> PyResul
     Ok(())
 }
 
-/// Follows the house style of the `scatter_block_index` preflight below: warn and
+/// Emit the construction-time `UserWarning` for a shard cache the memory budget
+/// could not afford.
+///
+/// Follows the house style of the `scatter_block_index` preflight above: warn and
 /// continue (never refuse), name the observed numbers, name the knob, and name
 /// the exact value that would fix it. Deduping is left to CPython's
 /// `__warningregistry__`, which is correct here because the message text is
@@ -2420,13 +2448,11 @@ impl SparseCellSetDataset {
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
         }
-        // The process-global switch is checked first, before the per-shard
-        // framing scan: with it off no warning can be emitted and reframing
-        // could not enable the route either, so the scan would be pure cost.
-        if scatter_block_index
-            && scx_format_io::backed::scatter_block_index_enabled()
-            && !loader.any_shard_framed()
-        {
+        if should_warn_unframed_scatter(
+            scatter_block_index,
+            scx_format_io::backed::scatter_block_index_enabled(),
+            || loader.any_shard_framed(),
+        ) {
             // A count plus up to two names: actionable without being a wall of
             // paths, and enough text for Python's per-message dedup to make the
             // warning one-shot per dataset.
@@ -2577,7 +2603,7 @@ impl SparseCellSetDataset {
     ///
     /// ```text
     /// breakdown              - per-component estimate, same six keys as every
-    ///                          other dataset class
+    ///                          other class that reports a budget
     /// max_memory_mb          - byte budget in force (adaptive when not passed)
     /// cache_shards           - requested count cap
     /// effective_cache_shards - shards the byte budget holds at average size
@@ -2618,9 +2644,9 @@ impl SparseCellSetDataset {
     /// `full_shard_groups > 0` is the warm-into-the-LRU default. Opening an
     /// all-unframed set with `scatter_block_index=True` now warns at
     /// construction (ORG-9.10-4), so these are a confirmation rather than the
-    /// only way to find out — but they stay the authority, because the warning
-    /// only reports that *some* file is framed, not that any gather took the
-    /// route.
+    /// only way to find out — but they stay the authority. The warning fires
+    /// when *no* file is framed; its **absence** establishes only that at least
+    /// one is, never that a gather actually took the route.
     ///
     /// Since ORG-9.10-1 the prefetch half is visible too, through
     /// `SparseCellSetBatchIter.metrics()["prefetch"]`. That is a different
@@ -3102,6 +3128,68 @@ pub fn downsample_counts_csr<'py>(
 // resolver-v2 unification turns the feature on for this crate's test target
 // too. Verified by name in that job's output. If pyscx ever stops being built
 // alongside, this module goes silently unrun.
+#[cfg(test)]
+mod preflight_decision_tests {
+    use super::should_warn_unframed_scatter;
+    use std::cell::Cell;
+
+    /// The framing scan must not run when the process-global switch is off.
+    ///
+    /// This is the property the Python-side subprocess test cannot establish.
+    /// Before review round 2 the switch was checked *inside* the warning helper,
+    /// i.e. after the scan: no warning was emitted either way, so the subprocess
+    /// test passed on the broken ordering too. Asserting the closure went
+    /// uncalled is what actually pins it.
+    #[test]
+    fn the_framing_scan_does_not_run_when_the_global_switch_is_off() {
+        let scanned = Cell::new(false);
+        let warn = should_warn_unframed_scatter(true, false, || {
+            scanned.set(true);
+            false
+        });
+        assert!(!warn, "the global switch off means nothing to warn about");
+        assert!(
+            !scanned.get(),
+            "any_shard_framed() reads a shard header per shard; with the route \
+             globally disabled that scan buys nothing and must be skipped"
+        );
+    }
+
+    /// ...and not when the caller never asked for the route either.
+    #[test]
+    fn the_framing_scan_does_not_run_when_the_caller_did_not_ask() {
+        let scanned = Cell::new(false);
+        let warn = should_warn_unframed_scatter(false, true, || {
+            scanned.set(true);
+            false
+        });
+        assert!(!warn);
+        assert!(!scanned.get());
+    }
+
+    /// The positive arm: both gates open, nothing framed → scan runs, warn.
+    /// Without this the two negatives above are satisfied by a function that
+    /// always returns false and never calls the closure at all.
+    #[test]
+    fn an_unframed_file_the_caller_asked_about_warns_after_scanning() {
+        let scanned = Cell::new(false);
+        let warn = should_warn_unframed_scatter(true, true, || {
+            scanned.set(true);
+            false
+        });
+        assert!(warn);
+        assert!(scanned.get(), "the scan is what decides this case");
+    }
+
+    /// And a framed file is silent — the `any`-across-readers answer is what
+    /// suppresses the warning, not a second gate.
+    #[test]
+    fn a_framed_file_is_silent() {
+        assert!(!should_warn_unframed_scatter(true, true, || true));
+    }
+}
+
+#[cfg(test)]
 mod layout_check_tests {
     use super::*;
     use arrow::array::StringArray;

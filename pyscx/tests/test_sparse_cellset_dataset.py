@@ -649,9 +649,16 @@ def test_global_kill_switch_suppresses_the_preflight(two_unframed_scx):
     """`SCX_SCATTER_BLOCK_INDEX=0` must silence the preflight entirely.
 
     With the route globally off, reframing could not enable it either, so the
-    warning would send the caller to do something useless — and the framing
-    scan behind it is pure cost. The switch is memoized in a `OnceLock`, so this
-    has to run in a fresh interpreter; nothing pinned it before.
+    warning would send the caller to do something useless. The switch is
+    memoized in a `OnceLock`, so this has to run in a fresh interpreter; nothing
+    pinned the suppression before.
+
+    ⚠️ It pins the *suppression*, not the ordering. The framing scan skipping
+    when the switch is off is invisible from here — a version that scanned first
+    and suppressed afterwards passes this test too, which is what it did before
+    review round 2. That ordering is pinned in Rust, by
+    `python::preflight_decision_tests`, which asserts the scan closure went
+    uncalled.
     """
     import os
     import subprocess

@@ -2909,8 +2909,11 @@ print(ds.effective_cache_shards(), ds.effective_lookahead())
 **Lifecycle — `close()` and `closed`**
 
 All four dataset classes expose `close()` and a `closed` property, and all four
-release the GIL around teardown under a 5 s bound, so tearing a dataset down
-cannot stall other Python threads while an in-flight shard decode finishes.
+release the GIL around teardown, so tearing a dataset down cannot stall other
+Python threads while an in-flight shard decode finishes. The bound is not one
+number: the plan-driven pair drop a tokio runtime under a single 5 s deadline,
+while the training pair bound-join two threads *sequentially* (`~2 ×
+SHUTDOWN_DEADLINE`), and `MultimodalTrainingDataset` repeats that per modality.
 Dropping the object does the same, so `close()` buys determinism rather than
 correctness. `closed` and `repr()` never raise on any of them.
 
