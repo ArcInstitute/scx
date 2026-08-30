@@ -53,26 +53,8 @@ impl PyH5adMetadata {
 /// Read obs, var, uns, and shape from an h5ad file via the scx-convert
 /// pure-Rust HDF5 readers — no `anndata` import, no `obsm` allocation.
 ///
-/// Args:
-///     path: Path to the h5ad file.
-///     strict_uns: If True, fail on the first unsupported `uns` key.
-///         Default False matches the existing convert behaviour
-///         (skip-and-warn).
-///
-/// Returns:
-///     `H5adMetadata` with attributes `obs` (pandas.DataFrame),
-///     `var` (pandas.DataFrame), `uns` (dict), `n_obs` (int),
-///     `n_vars` (int), `x_format` (`"csr"` / `"csc"` / `"dense"`).
-///
-/// Example:
-///     meta = pyscx.read_h5ad_metadata("big.h5ad")
-///     meta.obs["condition_id"] = ...
-///     meta.uns["pipeline_version"] = "1.2.3"
-///     pyscx.from_h5ad(
-///         "big.h5ad", "big.scx",
-///         obs_override=meta.obs,
-///         uns_override=meta.uns,
-///     )
+/// Full user-facing documentation lives on the `pyscx.read_h5ad_metadata`
+/// Python wrapper, which is what `help()` shows.
 #[cfg(feature = "hdf5")]
 #[pyfunction]
 #[pyo3(signature = (path, strict_uns=false))]

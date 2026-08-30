@@ -1026,7 +1026,10 @@ enum Commands {
         /// Replace an existing layer / columns / uns key
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: zero-fill or fail
+        /// Target rows with no matching source row: `zero` (default) writes an
+        /// all-zero matrix row — literal here, unlike the obs importers' `null`
+        /// alias, because a droplet CellBender never analyzed really is zeros —
+        /// and `error` refuses.
         #[arg(long, default_value = "zero", value_parser = ["zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
@@ -1096,7 +1099,10 @@ enum Commands {
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: leave them NULL (not 0) or fail
+        /// Target rows with no matching source row: `null` (default) leaves them
+        /// NULL; `error` refuses. `zero` is an accepted legacy alias for `null` —
+        /// the shared policy's zero is literal only where the missing thing is a
+        /// matrix row (`scx cellbender-import`), which really is zeros.
         #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
@@ -1169,7 +1175,10 @@ enum Commands {
         /// per-batch tables in turn keeps only the last. Concatenate first.
         #[arg(long)]
         overwrite: bool,
-        /// Target rows with no matching source row: leave them NULL (not 0) or fail
+        /// Target rows with no matching source row: `null` (default) leaves them
+        /// NULL; `error` refuses. `zero` is an accepted legacy alias for `null` —
+        /// the shared policy's zero is literal only where the missing thing is a
+        /// matrix row (`scx cellbender-import`), which really is zeros.
         #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail

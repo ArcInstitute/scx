@@ -1506,19 +1506,10 @@ fn resolve_modality_id(modality: Option<&Bound<'_, PyAny>>) -> PyResult<u8> {
 }
 
 /// Replace the whole `uns` block of an existing `.scx` file in place,
-/// without re-encoding `X`.
+/// without re-encoding `X`. Replace semantics, not merge.
 ///
-/// **Replace semantics, not merge** — `uns` fully supersedes the existing
-/// block (consistent with `from_h5ad(..., uns_override=)`). The matrix
-/// (`X` / CSR / CSC shards) is never read or rewritten, so a pre-existing
-/// CSC sidecar stays valid. The change is atomic and rollback-able
-/// (`pyscx.rollback`).
-///
-/// For a shallow merge, read-modify-write::
-///
-///     adata = pyscx.open(path).to_anndata()
-///     adata.uns["descriptions"] = {...}
-///     pyscx.set_uns(path, dict(adata.uns))
+/// Full user-facing documentation lives on the `pyscx.set_uns` Python
+/// wrapper, which is what `help()` shows.
 #[pyfunction]
 pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<()> {
     let json = convert::uns_py_to_json(py, uns, convert::UnsFormat::Tagged)?;
@@ -1529,42 +1520,11 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
 }
 
 /// Replace metadata sections (`uns` / `obs` / `var` / `obsm` / `varm`) of an
-/// existing `.scx` file in place, without re-encoding `X`.
+/// existing `.scx` file in place, without re-encoding `X`. Replace semantics,
+/// not merge; a replaced axis keeps (rebuilds) the predicate index it had.
 ///
-/// Any omitted argument is left untouched (its sections pass through
-/// verbatim). Cost is O(size of the replaced sections); the matrix shards
-/// are never read or rewritten, so a pre-existing CSC sidecar and
-/// `data_generation` are preserved (no `--rebuild-csc` needed). One atomic
-/// commit; rollback-able via `pyscx.rollback`.
-///
-/// **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
-/// the section and `num_rows` must match the file's `n_obs` / `n_vars`
-/// (changing cell/gene count is out of scope — use `append` / `subset`).
-/// `obsm` / `varm` replace only the named matrices.
-///
-/// **A replaced axis keeps the predicate index it had.** The old section
-/// describes values that are gone, so it is rebuilt over the same columns the
-/// file already indexed — which also re-derives the per-shard column stats, so
-/// `filter_obs` pushdown survives an ordinary obs edit. Naming `index_obs` /
-/// `index_var` / `index_preset` overrides that; a column the file indexed and
-/// the new request does not is reported as a `UserWarning` rather than dropped
-/// in silence.
-///
-/// The override is **per axis**: `index_obs` changes only the obs axis's column
-/// set, and a var replacement in the same call still carries its own index
-/// forward. `index_preset` and `index_auto_threshold` genuinely span both axes
-/// and so override both.
-///
-/// Args:
-///     path: target `.scx` file.
-///     uns: dict replacing the whole `uns` block.
-///     obs / var: pandas `DataFrame` (or pyarrow `Table`); `num_rows` must
-///         equal `n_obs` / `n_vars`.
-///     obsm / varm: `dict[str, np.ndarray]` of named dense matrices.
-///     index_obs / index_var / index_preset / index_auto_threshold:
-///         predicate-index policy (only consulted when obs/var change).
-///         Omitted, the file's existing index is carried forward.
-///     modality: integer modality id (only `0` / global is supported today).
+/// Full user-facing documentation lives on the `pyscx.modify_metadata`
+/// Python wrapper, which is what `help()` shows.
 #[pyfunction]
 #[pyo3(signature = (
     path, *, uns=None, obs=None, var=None, obsm=None, varm=None,
@@ -1947,24 +1907,12 @@ fn key_diagnosis_dict<'py>(
     Ok(out)
 }
 
-/// Import a delimited annotation table (CSV / TSV) as `obs` columns.
+/// Import a delimited annotation table (CSV / TSV) as `obs` columns, in
+/// place, joined to the target's own obs axis by key string — never by row
+/// position.
 ///
-/// Reads `table` and lands its columns on `path`, **in place**, joined to the
-/// target's own obs axis by key. X, layers, `var`, the CSC sidecar, `.raw`,
-/// deletion vectors and predicate indexes are preserved; the whole import is
-/// undoable with `pyscx.rollback`.
-///
-/// The join is always by key string, never by position — a doublet caller run
-/// per library returns rows in whatever order it pleased, and a positional
-/// import would put every score on the wrong cell while still producing a
-/// correctly-shaped column.
-///
-/// **`overwrite` replaces, it does not merge.** Importing several per-batch
-/// tables one after another would keep only the last; concatenate them and
-/// import once.
-///
-/// Returns a dict summarising the read and the join — inspect `n_matched`
-/// before trusting the result, and prefer `dry_run=True` on a large file.
+/// Full user-facing documentation lives on the `pyscx.obs_import` Python
+/// wrapper, which is what `help()` shows.
 #[pyfunction]
 #[pyo3(signature = (
     path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="",
@@ -2254,26 +2202,12 @@ pub fn attach_obs_columns(
 // Doublet-caller wrapper
 // ---------------------------------------------------------------------------
 
-/// Import a doublet caller's output table, normalising it to canonical columns.
+/// Import a doublet caller's output table, normalising it to canonical
+/// columns (`<K>_score` / `<K>_predicted` / `<K>_status` + `uns["<K>"]`) —
+/// the doublet-specific wrapper over [`obs_import`].
 ///
-/// The doublet-specific wrapper over [`obs_import`]. Everything the generic
-/// importer does — key-joined, in place, `pyscx.rollback`-able, `null` for cells
-/// the tool did not cover — plus the one thing that needs per-tool knowledge:
-/// each caller names its score and call differently, and downstream consensus
-/// code should not have to branch on which tool ran.
-///
-/// Emits, for `key_added="<K>"` (defaulting to the tool name):
-///
-/// * `obs["<K>_score"]` — f32, nullable, higher = more doublet-like
-/// * `obs["<K>_predicted"]` — bool, nullable; **omitted** for a tool that emits
-///   no call (scds), because thresholding a score is a scientific decision this
-///   importer does not own
-/// * `obs["<K>_status"]` — `"present"` / `"absent"`
-/// * `obs["<K>_<native>"]` — every other source column, unchanged
-/// * `uns["<K>"]` — tool, resolved source columns, join report
-///
-/// The canonical names match what a native SCX doublet run would write, so an
-/// imported result and a native one are drop-in comparable.
+/// Full user-facing documentation lives on the `pyscx.doublet_import`
+/// Python wrapper, which is what `help()` shows.
 #[pyfunction]
 #[pyo3(signature = (
     path, table, *, tool, key=None, source_key=None, key_added=None, score_column=None,
@@ -2510,10 +2444,10 @@ pub fn doublet_profiles(py: Python<'_>) -> PyResult<Py<PyAny>> {
 }
 
 /// Report which obs columns could serve as a join key for `obs_import`.
+/// Read-only.
 ///
-/// Read-only. Useful when an import fails on a duplicated key: on a merged
-/// atlas the obvious candidates are often *not* unique and the one that is may
-/// be a column no fallback list would guess.
+/// Full user-facing documentation lives on the `pyscx.diagnose_obs_key`
+/// Python wrapper, which is what `help()` shows.
 #[pyfunction]
 #[pyo3(signature = (path, key=None))]
 pub fn diagnose_obs_key(

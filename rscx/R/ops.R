@@ -226,9 +226,11 @@ scx_merge <- function(inputs, output, index_obs = NULL, index_var = NULL,
 #'   attaching several per-batch results in turn keeps only the last. Combine
 #'   them into one \code{data.frame} and attach once.
 #' @param on_missing_rows \code{"null"} (default) leaves uncovered target rows
-#'   \code{NA} and marks them absent; \code{"error"} refuses. \code{"zero"} is
-#'   an accepted alias for \code{"null"} — it names the shared policy enum,
-#'   whose \code{zero} is literal only for a matrix layer.
+#'   \code{NA}; \code{"error"} refuses. \code{"zero"} is an accepted legacy
+#'   alias for \code{"null"} — the shared policy's zero is literal only where
+#'   the missing thing is a matrix row (pyscx's \code{cellbender_import}),
+#'   which really is zeros. Uncovered rows are also marked absent in
+#'   \code{status_column}.
 #' @param on_extra_rows \code{"warn"} (default) skips source rows the target
 #'   lacks; \code{"error"} refuses.
 #' @param dry_run Run every validation and the join, then return the summary
