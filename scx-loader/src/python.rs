@@ -2529,12 +2529,18 @@ impl SparseCellSetDataset {
         // Pass `scatter_block_index=True` for a cache-hostile run (working set
         // ≫ cache), where the row-group decode's bounded peak RAM wins.
         let scatter_block_index = scatter_block_index.unwrap_or(false);
-        let downsample = resolve_downsample(
+        // Raised as `ValueError`, not the `loader_err_to_py` default of
+        // `RuntimeError`: every argument check on this path is a bad *value*,
+        // and a caller catching malformed input would otherwise have to catch
+        // two exception types to cover one constructor. Same reasoning, and the
+        // same shape, as the `validate_indptr` call in `downsample_counts_csr`.
+        let downsample = crate::downsample::resolve_downsample_config(
             &paths,
             downsample_target_library_size,
             downsample_method.as_deref(),
             downsample_seed,
-        )?;
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let mut readers = Vec::with_capacity(paths.len());
         for p in &paths {
@@ -3059,48 +3065,6 @@ pub fn collate_cellset_gathered<'py>(
         })
         .map_err(loader_err_to_py)?;
     collated_cellset_batch_to_dict(py, batch)
-}
-
-/// Resolve the three `downsample_*` kwargs into a config, or `None`.
-///
-/// Validation lives here — at the public entry, not at the routing site — so both
-/// Python surfaces reject the same shapes with the same message. Supplying a
-/// method or a seed without a target is a config error rather than a silent
-/// no-op: it is exactly the typo that would leave a training run un-augmented
-/// while looking configured.
-fn resolve_downsample(
-    paths: &[String],
-    target: Option<u64>,
-    method: Option<&str>,
-    seed: Option<u64>,
-) -> PyResult<Option<crate::downsample::DownsampleConfig>> {
-    let Some(target) = target else {
-        if method.is_some() || seed.is_some() {
-            return Err(PyValueError::new_err(
-                "downsample_method / downsample_seed require \
-                 downsample_target_library_size; without a target nothing is \
-                 downsampled",
-            ));
-        }
-        return Ok(None);
-    };
-    if target == 0 {
-        return Err(PyValueError::new_err(
-            "downsample_target_library_size must be > 0",
-        ));
-    }
-    // Default matches the Python reference's DownsampleConfig default.
-    let method = crate::downsample::DownsampleMethod::parse(method.unwrap_or("multinomial"))
-        .map_err(loader_err_to_py)?;
-    Ok(Some(crate::downsample::DownsampleConfig {
-        target_library_size: target,
-        method,
-        seed: seed.unwrap_or(0),
-        file_identities: paths
-            .iter()
-            .map(|p| crate::downsample::file_identity(p))
-            .collect(),
-    }))
 }
 
 /// Stable 64-bit RNG-key identity for an `.scx` path.

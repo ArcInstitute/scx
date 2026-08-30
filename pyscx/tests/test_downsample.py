@@ -501,10 +501,20 @@ def test_zero_target_is_an_error(two_scx):
 
 
 def test_unknown_method_names_the_accepted_set(two_scx):
+    """`ValueError`, like every other argument check on this constructor.
+
+    It used to be `RuntimeError` — not by design, but because this one error
+    came from `DownsampleMethod::parse` and fell through `loader_err_to_py`'s
+    default arm while the three checks beside it raised `ValueError` directly.
+    Phase 9f moved the whole resolver into `downsample.rs` and maps its errors
+    at the binding site, which made all four consistent. Pinned as `ValueError`
+    rather than the bare `Exception` this asserted before, so the consistency
+    cannot regress unnoticed.
+    """
     import pyscx
 
     p0, _ = two_scx
-    with pytest.raises(Exception, match="hypergeometric"):
+    with pytest.raises(ValueError, match="hypergeometric"):
         pyscx.SparseCellSetDataset(
             [p0],
             downsample_target_library_size=_TARGET,

@@ -350,6 +350,45 @@ fn write_back(indices: &mut Vec<i32>, data: &mut Vec<f32>, counts: &[u64]) {
     data.truncate(w);
 }
 
+/// Resolve the three `downsample_*` kwargs into a config, or `None`.
+///
+/// Validation lives here — at the public entry, not at the routing site — so both
+/// Python surfaces reject the same shapes with the same message. Supplying a
+/// method or a seed without a target is a config error rather than a silent
+/// no-op: it is exactly the typo that would leave a training run un-augmented
+/// while looking configured.
+pub fn resolve_downsample_config(
+    paths: &[String],
+    target: Option<u64>,
+    method: Option<&str>,
+    seed: Option<u64>,
+) -> Result<Option<DownsampleConfig>> {
+    let Some(target) = target else {
+        if method.is_some() || seed.is_some() {
+            return Err(LoaderError::ConfigError {
+                reason: "downsample_method / downsample_seed require \
+                         downsample_target_library_size; without a target nothing is \
+                         downsampled"
+                    .to_string(),
+            });
+        }
+        return Ok(None);
+    };
+    if target == 0 {
+        return Err(LoaderError::ConfigError {
+            reason: "downsample_target_library_size must be > 0".to_string(),
+        });
+    }
+    // Default matches the Python reference's DownsampleConfig default.
+    let method = DownsampleMethod::parse(method.unwrap_or("multinomial"))?;
+    Ok(Some(DownsampleConfig {
+        target_library_size: target,
+        method,
+        seed: seed.unwrap_or(0),
+        file_identities: paths.iter().map(|p| file_identity(p)).collect(),
+    }))
+}
+
 #[cfg(test)]
 #[path = "downsample_tests.rs"]
 mod tests;
