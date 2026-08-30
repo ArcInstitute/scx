@@ -24,7 +24,7 @@ test_that("scx_pca_matrix returns finite embeddings + loadings of the right shap
   res <- scx_pca(counts, n_components = 10L, seed = 0L)
   expect_type(res, "list")
   expect_named(res, c("embeddings", "loadings", "variance_explained",
-                      "variance_ratio", "n_components"))
+                      "variance_ratio", "n_components", "method", "scx_accel"))
   expect_equal(nrow(res$embeddings), ncol(counts)) # cells
   expect_equal(ncol(res$embeddings), 10L)
   expect_equal(nrow(res$loadings), nrow(counts))   # genes
@@ -40,7 +40,7 @@ test_that("scx_pflog returns embeddings + a per-cell baseline matching the refer
   expect_type(res, "list")
   expect_named(res, c("embeddings", "loadings", "variance_explained",
                       "variance_ratio", "n_components", "baseline",
-                      "alpha", "pseudocount", "version"))
+                      "alpha", "pseudocount", "version", "scx_accel"))
   expect_equal(res$version, "v4")
   expect_equal(nrow(res$embeddings), ncol(counts)) # cells
   expect_equal(ncol(res$embeddings), 10L)
@@ -147,7 +147,7 @@ test_that("kNN -> UMAP -> Leiden chain runs on a dense embedding", {
 
   knn <- scx_neighbors(emb, k = 10L, seed = 0L)
   expect_named(knn, c("n_obs", "n_neighbors", "indices", "distances",
-                      "conn_indptr", "conn_indices", "conn_data"))
+                      "conn_indptr", "conn_indices", "conn_data", "scx_accel"))
   expect_equal(knn$n_obs, nrow(emb))
   expect_equal(knn$n_neighbors, 10L)
 
@@ -250,6 +250,15 @@ test_that("the accelerators write into Seurat slots end to end", {
 
   de <- scx_rank_genes_groups(obj, group.by = "seurat_clusters")
   expect_s3_class(de, "data.frame")
+
+  # Route metadata lands in @misc$scx_accel, one record per op, mirroring
+  # pyscx's uns[["scx_accel"]] (ORG-10.16-3b).
+  ra <- obj@misc$scx_accel
+  expect_true(all(c("highly_variable_genes", "pca", "neighbors", "umap",
+                    "leiden") %in% names(ra)))
+  expect_equal(ra$pca$route, "cpu_csr")
+  expect_equal(ra$umap$route, "cpu_dense")
+  expect_equal(ra$leiden$fallback_reason, "user_forced_cpu")
 })
 
 # ─── score_genes ────────────────────────────────────────────────────────
@@ -263,10 +272,11 @@ test_that("scx_score_genes method='mean' equals the per-cell mean over the set",
   expect_length(scores, ncol(counts)) # one score per cell
   expect_equal(names(scores), colnames(counts))
 
-  # Reference: mean of the selected gene rows, per cell.
+  # Reference: mean of the selected gene rows, per cell. `as.numeric` strips
+  # the `scx_accel` route attribute the wrapper now carries alongside names.
   idx <- match(gene_list, rownames(counts))
   ref <- colMeans(as.matrix(counts[idx, , drop = FALSE]))
-  expect_equal(unname(scores), unname(ref), tolerance = 1e-5)
+  expect_equal(as.numeric(scores), as.numeric(ref), tolerance = 1e-5)
 })
 
 test_that("scx_score_genes control method is deterministic for a fixed seed", {
@@ -512,4 +522,88 @@ test_that("scx_pseudobulk_dex_matrix refuses 'mean' at the extendr entry too", {
     "requires aggr_method='sum'",
     fixed = TRUE
   )
+})
+
+# ── Route metadata (ORG-10.16-3b) ─────────────────────────────────────
+# rscx stamps the same scx-accel planner record pyscx writes to
+# adata.uns[["scx_accel"]]: matrix-form calls carry it as a list element /
+# attribute; the Seurat path (covered by the guarded Seurat tests) writes
+# object@misc$scx_accel[[op]].
+
+test_that("scx_pca stamps the shared route record with the wire keys in order", {
+  counts <- make_counts()
+  res <- scx_pca(counts, n_components = 5L, seed = 0L)
+  ra <- res$scx_accel
+  expect_type(ra, "list")
+  expect_length(ra, 17L)
+  # Key list + order = AccelExecutionInfo::fields(), the cross-binding wire
+  # contract (pinned in scx-accel's route_tests.rs; re-pinned here from R).
+  expect_equal(names(ra), c(
+    "route", "fallback_reason", "chunk_size", "graph_replay", "csc_available",
+    "shards_decoded", "shards_uploaded", "math_mode", "spmm_policy",
+    "rapids_version", "cuml_version", "cupy_version", "transfer_mode",
+    "device_id", "bytes_uploaded", "n_shards_shufdelta_gpu", "resident_csr"
+  ))
+  expect_equal(ra$route, "cpu_csr")
+  expect_equal(ra$fallback_reason, "user_forced_cpu")
+  expect_null(ra$rapids_version)
+})
+
+test_that("the PCA auto rule's arm is observable and flips at the threshold", {
+  # 40 genes <= COVARIANCE_PCA_THRESHOLD (5000) -> covariance.
+  small <- make_counts(n_genes = 40L)
+  expect_equal(scx_pca(small, n_components = 5L, seed = 0L)$method, "covariance")
+  # 5001 genes -> randomized. Sparse and few cells to keep this cheap.
+  set.seed(7)
+  big <- Matrix::rsparsematrix(5001L, 30L, density = 0.01,
+                               rand.x = function(n) rep(1, n))
+  big <- methods::as(abs(big), "CsparseMatrix")
+  expect_equal(scx_pca(big, n_components = 3L, seed = 0L)$method, "randomized")
+})
+
+test_that("scx_rank_genes_groups honestly stamps cpu_dense (the kernel densifies)", {
+  counts <- make_counts(n_genes = 30L, n_cells = 100L)
+  groups <- rep(c("A", "B"), each = 50L)
+  de <- scx_rank_genes_groups(counts, groups = groups, log_transformed = FALSE)
+  ra <- attr(de, "scx_accel")
+  expect_equal(ra$route, "cpu_dense")
+  expect_equal(ra$fallback_reason, "user_forced_cpu")
+  expect_false(isTRUE(ra$csc_available))
+})
+
+test_that("scx_pseudobulk_dex stamps cpu_nb_glm with fallback 'none' (pyscx parity)", {
+  d <- .make_replicated()
+  de <- scx_pseudobulk_dex(d$counts, group_by = d$meta, test_col = "condition",
+                           reference = "ctrl", min_cells_per_group = 5L)
+  ra <- attr(de, "scx_accel")
+  expect_equal(ra$route, "cpu_nb_glm")
+  # NB-GLM is a first-class native CPU route, not a fallback — pyscx stamps
+  # the same pair on pseudobulk_dex.
+  expect_equal(ra$fallback_reason, "none")
+})
+
+test_that("HVG, UMAP, Leiden, score_genes and nb_glm all carry route records", {
+  counts <- make_counts()
+  hvg <- scx_highly_variable_genes(counts, n_top_genes = 10L)
+  expect_equal(attr(hvg, "scx_accel")$route, "cpu_csr")
+
+  pca <- scx_pca(counts, n_components = 5L, seed = 0L)
+  knn <- scx_neighbors(pca$embeddings, k = 8L, seed = 0L)
+  expect_equal(knn$scx_accel$route, "cpu_csr")
+  um <- scx_umap(pca$embeddings, neighbors = knn, n_epochs = 20L, seed = 0L)
+  expect_equal(um$scx_accel$route, "cpu_dense")
+  cl <- scx_leiden(pca$embeddings, neighbors = knn, seed = 0L)
+  expect_equal(cl$scx_accel$route, "cpu_csr")
+
+  sc <- scx_score_genes(counts, gene_list = c("g1", "g2"), method = "mean")
+  expect_equal(attr(sc, "scx_accel")$route, "cpu_csr")
+  expect_length(sc, ncol(counts))
+
+  d <- .make_replicated()
+  pb <- scx_pseudobulk(d$counts, group_by = d$meta, method = "sum")
+  glm <- scx_nb_glm(pb$counts,
+                    design = stats::model.matrix(~ condition, pb$samples),
+                    gene_names = rownames(pb$counts))
+  expect_equal(attr(glm, "scx_accel")$route, "cpu_nb_glm")
+  expect_equal(attr(glm, "scx_accel")$fallback_reason, "user_forced_cpu")
 })

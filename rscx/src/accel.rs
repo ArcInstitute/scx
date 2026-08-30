@@ -13,12 +13,16 @@
 
 use extendr_api::prelude::*;
 
+use scx_accel::route::{
+    cpu_exec_info, cpu_only_exec_info, hvg_exec_info, nb_glm_exec_info, simple_exec_info,
+    AccelExecutionInfo, AccelRoute, FallbackReason, InputLayout, RouteValue,
+};
 use scx_accel::{
     build_knn_graph, compute_umap, covariance_pca_inmemory, estimate_alpha, leiden,
     pflog_baseline_from_delta, pflog_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm,
-    randomized_pca_inmemory, score_genes, streaming_clip_square_sum, streaming_mean_var,
-    wilcoxon_rank_sum, AggregationMethod, AlphaOptions, DispersionMethod, NbGlmContrast,
-    NbGlmOptions, NbGlmResult, ScoreMethod, COVARIANCE_PCA_THRESHOLD,
+    randomized_pca_inmemory, resolve_cpu_pca_method, score_genes, streaming_clip_square_sum,
+    streaming_mean_var, wilcoxon_rank_sum, AggregationMethod, AlphaOptions, CpuPcaMethod,
+    DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, ScoreMethod,
 };
 use scx_sparse::ScxCsr;
 
@@ -100,6 +104,46 @@ fn dgc_genes_by_cells_to_csr(dgc: &Robj) -> Result<ScxCsr> {
 // `SingleShardSource`, shared with pyscx.
 use scx_format_io::shard_source::SingleShardSource;
 
+/// Serialise an [`AccelExecutionInfo`] into a named R list — a loop over
+/// [`AccelExecutionInfo::fields`], the shared wire serialization, so the key
+/// set and order cannot drift from what pyscx writes to
+/// `adata.uns["scx_accel"]`. Unset optionals become R `NULL` entries (present,
+/// not omitted), mirroring the Python dict's explicit `None`s.
+///
+/// rscx is CPU-only (no `scx-accel/gpu` feature), so every stamp built here
+/// records a `cpu_*` route with `fallback_reason = "user_forced_cpu"` — the
+/// same pair a pyscx call with `device="cpu"` records — except where pyscx
+/// itself stamps differently for the op (`pseudobulk_dex` stamps
+/// `cpu_nb_glm`/`none`: the NB-GLM is a first-class native CPU route, not a
+/// fallback).
+fn exec_info_to_rlist(info: &AccelExecutionInfo) -> Result<Robj> {
+    let fields = info.fields();
+    let names: Vec<&'static str> = fields.iter().map(|(k, _)| *k).collect();
+    // Counters serialise as R doubles (R has no native 64-bit integer; every
+    // value this record can hold is exactly representable in f64).
+    let values: Vec<Robj> = fields
+        .iter()
+        .map(|(_, v)| match v {
+            RouteValue::Str(s) => (*s).into_robj(),
+            RouteValue::OptStr(o) => o.map(|s| s.into_robj()).unwrap_or_else(|| ().into_robj()),
+            RouteValue::OptBool(o) => o.map(|b| b.into_robj()).unwrap_or_else(|| ().into_robj()),
+            RouteValue::OptUsize(o) => o
+                .map(|u| (u as f64).into_robj())
+                .unwrap_or_else(|| ().into_robj()),
+            RouteValue::OptU32(o) => o
+                .map(|u| (u as f64).into_robj())
+                .unwrap_or_else(|| ().into_robj()),
+            RouteValue::OptU64(o) => o
+                .map(|u| (u as f64).into_robj())
+                .unwrap_or_else(|| ().into_robj()),
+        })
+        .collect();
+    let mut list = List::from_values(values);
+    list.set_names(names)
+        .map_err(|e| Error::Other(format!("scx_accel route list names: {e}")))?;
+    Ok(list.into_robj())
+}
+
 /// Repack a column-major `RMatrix<f64>` (R layout) into row-major `f32`
 /// of shape `n_rows × n_cols`, rejecting non-finite entries.
 fn rmatrix_to_row_major_f32(m: &RMatrix<f64>) -> Result<(Vec<f32>, usize, usize)> {
@@ -150,7 +194,8 @@ fn row_major_to_rmatrix(data: &[f64], n_rows: usize, n_cols: usize) -> Result<Ro
 /// @param seed RNG seed.
 ///
 /// Routes to the exact covariance solver when `n_vars <= 5000`
-/// ([`COVARIANCE_PCA_THRESHOLD`]) and the randomized solver otherwise,
+/// ([`scx_accel::COVARIANCE_PCA_THRESHOLD`], via the shared
+/// [`resolve_cpu_pca_method`]) and the randomized solver otherwise,
 /// mirroring the Python accelerator.
 ///
 /// @return list(`embeddings` = cells × n_components, `loadings` =
@@ -193,17 +238,20 @@ fn scx_pca_matrix_impl(
     let n_comp = n_components as usize;
     let seed = seed as u64;
 
-    let result = if csr.n_cols() <= COVARIANCE_PCA_THRESHOLD {
-        covariance_pca_inmemory(&csr, n_comp, zero_center)
-    } else {
-        randomized_pca_inmemory(
+    // The covariance-vs-randomized auto rule is the shared resolver, so R and
+    // Python cannot drift on the threshold. rscx exposes no `method=` knob —
+    // always auto.
+    let cpu_method = resolve_cpu_pca_method("auto", csr.n_cols());
+    let result = match cpu_method {
+        CpuPcaMethod::Covariance => covariance_pca_inmemory(&csr, n_comp, zero_center),
+        CpuPcaMethod::Randomized => randomized_pca_inmemory(
             &csr,
             n_comp,
             n_oversamples.max(0) as usize,
             n_power_iterations.max(0) as usize,
             zero_center,
             seed,
-        )
+        ),
     }
     .map_err(|e| Error::Other(format!("pca: {e}")))?;
 
@@ -222,13 +270,22 @@ fn scx_pca_matrix_impl(
     let variance_explained = result.variance_explained.clone();
     let variance_ratio = result.variance_ratio.clone();
     let n_comp_i = result.n_components as i32;
+    let method_str = cpu_method.as_str();
+    let scx_accel = exec_info_to_rlist(&simple_exec_info(
+        "cpu",
+        false,
+        AccelRoute::GpuCsr,
+        AccelRoute::CpuCsr,
+    ))?;
 
     R!("list(
         embeddings = {{embeddings}},
         loadings = {{loadings}},
         variance_explained = {{variance_explained}},
         variance_ratio = {{variance_ratio}},
-        n_components = {{n_comp_i}}
+        n_components = {{n_comp_i}},
+        method = {{method_str}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -377,6 +434,7 @@ fn scx_pflog_matrix_impl(
     let variance_ratio = result.variance_ratio.clone();
     let n_comp_i = result.n_components as i32;
 
+    let scx_accel = exec_info_to_rlist(&cpu_only_exec_info("cpu"))?;
     R!("list(
         embeddings = {{embeddings}},
         loadings = {{loadings}},
@@ -386,7 +444,8 @@ fn scx_pflog_matrix_impl(
         baseline = {{baseline}},
         alpha = {{alpha}},
         pseudocount = {{pseudocount}},
-        version = \"v4\"
+        version = \"v4\",
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -458,6 +517,12 @@ fn scx_knn_matrix_impl(
     let n_obs_i = n_obs as i32;
     let k_i = k as i32;
 
+    let scx_accel = exec_info_to_rlist(&simple_exec_info(
+        "cpu",
+        false,
+        AccelRoute::GpuCsr,
+        AccelRoute::CpuCsr,
+    ))?;
     R!("list(
         n_obs = {{n_obs_i}},
         n_neighbors = {{k_i}},
@@ -465,7 +530,8 @@ fn scx_knn_matrix_impl(
         distances = {{distances}},
         conn_indptr = {{conn_indptr}},
         conn_indices = {{conn_indices}},
-        conn_data = {{conn_data}}
+        conn_data = {{conn_data}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -546,7 +612,14 @@ fn scx_umap_graph_impl(
     .map_err(|e| Error::Other(format!("compute_umap: {e}")))?;
 
     let embeddings = row_major_to_rmatrix(&result.embeddings, result.n_obs, result.n_components)?;
-    R!("list(embeddings = {{embeddings}})").map_err(|e| Error::Other(e.to_string()))
+    let scx_accel = exec_info_to_rlist(&simple_exec_info(
+        "cpu",
+        false,
+        AccelRoute::GpuDense,
+        AccelRoute::CpuDense,
+    ))?;
+    R!("list(embeddings = {{embeddings}}, scx_accel = {{scx_accel}})")
+        .map_err(|e| Error::Other(e.to_string()))
 }
 
 // ─── Leiden ─────────────────────────────────────────────────────────────
@@ -611,10 +684,17 @@ fn scx_leiden_graph_impl(
     let membership: Vec<i32> = result.membership.iter().map(|&m| m as i32 + 1).collect();
     let modularity = result.modularity;
     let n_communities = result.n_communities as i32;
+    let scx_accel = exec_info_to_rlist(&simple_exec_info(
+        "cpu",
+        false,
+        AccelRoute::GpuCsr,
+        AccelRoute::CpuCsr,
+    ))?;
     R!("list(
         membership = {{membership}},
         modularity = {{modularity}},
-        n_communities = {{n_communities}}
+        n_communities = {{n_communities}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -743,13 +823,24 @@ fn scx_rank_genes_impl(
     let pvals_adj_robj: Robj = pvals_adj_list.into();
     let lfc_robj: Robj = lfc_list.into();
 
+    // The honest layout: this entry point densifies (`to_dense` above), so the
+    // planner is fed `DenseHost` and the stamp reads `cpu_dense` — not the
+    // `cpu_csr` a caller might assume from the dgCMatrix input.
+    let scx_accel = exec_info_to_rlist(&cpu_exec_info(
+        "cpu",
+        InputLayout::DenseHost,
+        false,
+        false,
+        None,
+    ))?;
     R!("list(
         group_names = {{group_names_out}},
         names = {{names_robj}},
         scores = {{scores_robj}},
         pvals = {{pvals_robj}},
         pvals_adj = {{pvals_adj_robj}},
-        logfoldchanges = {{lfc_robj}}
+        logfoldchanges = {{lfc_robj}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -770,7 +861,10 @@ fn scx_hvg_mean_var(counts: Robj) -> Robj {
             streaming_mean_var(&source).map_err(|e| Error::Other(format!("hvg pass 1: {e}")))?;
         let means = stats.means;
         let variances = stats.variances;
-        R!("list(means = {{means}}, variances = {{variances}})")
+        // One stamp per op: pass 1 carries it; the clipped-sums pass 2 is the
+        // same op's second half and stamps nothing.
+        let scx_accel = exec_info_to_rlist(&hvg_exec_info("cpu", false, false))?;
+        R!("list(means = {{means}}, variances = {{variances}}, scx_accel = {{scx_accel}})")
             .map_err(|e| Error::Other(e.to_string()))
     })())
 }
@@ -854,24 +948,21 @@ fn scx_score_genes_matrix_impl(
     let gene_list: Vec<u32> = gene_list_idx.iter().map(|&i| i as u32).collect();
     let gene_pool: Vec<u32> = gene_pool_idx.iter().map(|&i| i as u32).collect();
 
-    let score_method = match method {
-        "control" => ScoreMethod::Control {
-            ctrl_size: ctrl_size as usize,
-            n_bins: n_bins as usize,
-            random_state: random_state as u64,
-        },
-        "mean" => ScoreMethod::Mean,
-        "zscore" => ScoreMethod::Zscore,
-        other => {
-            return Err(Error::Other(format!(
-                "unknown score_genes method '{other}' (expected 'control', 'mean', or 'zscore')"
-            )))
-        }
-    };
+    // Shared vocabulary + error text (`ScoreMethod::parse`, same message as
+    // pyscx raises).
+    let score_method = ScoreMethod::parse(
+        method,
+        ctrl_size as usize,
+        n_bins as usize,
+        random_state as u64,
+    )
+    .map_err(|e| Error::Other(e.to_string()))?;
 
     let scores = score_genes(&source, &gene_list, &gene_pool, &score_method)
         .map_err(|e| Error::Other(format!("score_genes: {e}")))?;
-    Ok(scores.into_robj())
+    let scx_accel = exec_info_to_rlist(&cpu_only_exec_info("cpu"))?;
+    R!("list(scores = {{scores}}, scx_accel = {{scx_accel}})")
+        .map_err(|e| Error::Other(e.to_string()))
 }
 
 // ─── Pseudobulk aggregation ─────────────────────────────────────────────
@@ -956,15 +1047,9 @@ fn scx_pseudobulk_matrix_impl(
         )));
     }
 
-    let agg = match method {
-        "sum" => AggregationMethod::Sum,
-        "mean" => AggregationMethod::Mean,
-        other => {
-            return Err(Error::Other(format!(
-                "unknown pseudobulk method '{other}' (expected 'sum' or 'mean')"
-            )))
-        }
-    };
+    // Shared vocabulary + error text (`AggregationMethod::parse`, same message
+    // as pyscx raises).
+    let agg = AggregationMethod::parse(method).map_err(|e| Error::Other(e.to_string()))?;
 
     let result = pseudobulk_aggregate_inmemory(
         &csr,
@@ -1011,16 +1096,9 @@ fn nbglm_options(
     cooks_filtering: bool,
     independent_filtering: bool,
 ) -> Result<NbGlmOptions> {
-    let disp = match dispersion {
-        "cox_reid_shrunk" => DispersionMethod::CoxReidShrunk,
-        "cox_reid_mle" => DispersionMethod::CoxReidMle,
-        "moments" => DispersionMethod::Moments,
-        other => {
-            return Err(Error::Other(format!(
-                "unknown dispersion '{other}' (expected 'cox_reid_shrunk', 'cox_reid_mle', or 'moments')"
-            )))
-        }
-    };
+    // Shared vocabulary + error text (`DispersionMethod::parse`, same message
+    // as pyscx raises).
+    let disp = DispersionMethod::parse(dispersion).map_err(|e| Error::Other(e.to_string()))?;
     Ok(NbGlmOptions {
         dispersion: disp,
         cooks_filtering,
@@ -1142,24 +1220,19 @@ fn scx_pseudobulk_dex_matrix_impl(
     // it names an interior coordinate rather than the argument at fault.
     // pyscx draws the same line, and its `backend="pydeseq2"` is the way to get
     // mean aggregation.
-    let agg = match aggr_method {
-        "sum" => AggregationMethod::Sum,
-        "mean" => {
-            return Err(Error::Other(
-                "scx_pseudobulk_dex requires aggr_method='sum' (got 'mean'): the \
-                 negative-binomial count model is defined on summed replicate counts, \
-                 not fractional mean aggregates. Use aggr_method='sum', or for mean \
-                 aggregation use pyscx pseudobulk_dex(backend='pydeseq2', \
-                 aggr_method='mean'), which rscx does not expose."
-                    .to_string(),
-            ))
-        }
-        other => {
-            return Err(Error::Other(format!(
-                "unknown aggr_method '{other}' (expected 'sum' or 'mean')"
-            )))
-        }
-    };
+    // Vocabulary via the shared parse; the semantic 'mean' refusal stays
+    // bespoke (it is a valid aggregation method, just not for the NB model).
+    let agg = AggregationMethod::parse(aggr_method).map_err(|e| Error::Other(e.to_string()))?;
+    if agg == AggregationMethod::Mean {
+        return Err(Error::Other(
+            "scx_pseudobulk_dex requires aggr_method='sum' (got 'mean'): the \
+             negative-binomial count model is defined on summed replicate counts, \
+             not fractional mean aggregates. Use aggr_method='sum', or for mean \
+             aggregation use pyscx pseudobulk_dex(backend='pydeseq2', \
+             aggr_method='mean'), which rscx does not expose."
+                .to_string(),
+        ));
+    }
     let opts = nbglm_options(dispersion, cooks_filtering, independent_filtering)?;
 
     let pb = pseudobulk_aggregate_inmemory(
@@ -1262,6 +1335,12 @@ fn scx_pseudobulk_dex_matrix_impl(
         }
     }
 
+    // Mirror pyscx's `pseudobulk_dex` stamp exactly: `cpu_nb_glm` with
+    // `fallback_reason = "none"` — the NB-GLM is a first-class native CPU
+    // route, not a fallback from anything.
+    let mut info = AccelExecutionInfo::new(AccelRoute::CpuNbGlm, FallbackReason::None);
+    info.csc_available = Some(false);
+    let scx_accel = exec_info_to_rlist(&info)?;
     R!("list(
         gene = {{out_gene}},
         baseMean = {{out_base}},
@@ -1272,7 +1351,8 @@ fn scx_pseudobulk_dex_matrix_impl(
         padj = {{out_padj}},
         target = {{out_target}},
         reference = {{out_ref}},
-        skipped = {{skipped}}
+        skipped = {{skipped}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }
@@ -1422,6 +1502,9 @@ fn scx_nb_glm_matrix_impl(
     let disp = res.dispersion;
     let converged = res.converged;
 
+    // Same shape pyscx announces for `nb_glm` with `device="cpu"`
+    // (`plan_nb_glm_route(Cpu, ..)` → `cpu_nb_glm` / `user_forced_cpu`).
+    let scx_accel = exec_info_to_rlist(&nb_glm_exec_info("cpu", false))?;
     R!("list(
         gene = {{genes}},
         baseMean = {{base}},
@@ -1431,7 +1514,8 @@ fn scx_nb_glm_matrix_impl(
         pvalue = {{p}},
         padj = {{padj}},
         dispersion = {{disp}},
-        converged = {{converged}}
+        converged = {{converged}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }

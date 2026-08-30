@@ -366,6 +366,7 @@ bash benchmarks/comprehensive/scripts/install_dependencies.sh --rebuild --gpu
 | BPCells benchmark workers (auto-routed) | `scx-bench-r` | per-job, via `_env_for_format` |
 | SLAF benchmark workers (auto-routed) | `scx-bench-slaf` | per-job, via `_env_for_format` |
 | `doublet_interop` tool runners | `rscx` (scDblFinder), `scx-bench` (Scrublet) | per-tool subprocess, via `scripts/doublet/_tool_env.py` |
+| `accel_r_route` probe (rscx route-metadata gate) | `rscx` | subprocess `Rscript scripts/r_route_probe.R` (override: `SCX_RSCX_ENV_PREFIX`) |
 
 
 #### Doublet-caller benchmarks (`doublet_interop`)

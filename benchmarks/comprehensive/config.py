@@ -882,6 +882,13 @@ def accel_formats() -> list[FormatVariant]:
     except ImportError:
         pass
     try:
+        from benchmarks.comprehensive.benchmarks.accel_r_route import (
+            accel_r_route_variants,
+        )
+        out.extend(accel_r_route_variants())
+    except ImportError:
+        pass
+    try:
         from benchmarks.comprehensive.benchmarks.bench_csc_dispatch import (
             bench_csc_dispatch_variants,
         )
