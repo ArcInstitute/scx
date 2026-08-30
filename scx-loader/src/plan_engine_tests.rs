@@ -890,29 +890,6 @@ fn lookahead_zero_leaves_prefetch_counters_zero_while_the_gather_still_adopts() 
     );
 }
 
-/// Block until `counter` stops changing across two consecutive samples, and
-/// return the settled value. Panics on a 10s deadline rather than returning a
-/// value that was still moving — a "quiet" reading taken while the thing under
-/// test is still running is what makes a teardown assertion meaningless.
-#[cfg(test)]
-fn settle(counter: &Arc<std::sync::atomic::AtomicU64>, what: &str) -> u64 {
-    use std::sync::atomic::Ordering as AtomicOrdering;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut last = counter.load(AtomicOrdering::Acquire);
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        let now = counter.load(AtomicOrdering::Acquire);
-        if now == last {
-            return now;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what} (still climbing: {last} -> {now})"
-        );
-        last = now;
-    }
-}
-
 /// **Dropping an iterator must not keep pulling from the user's plan
 /// generator.**
 ///
@@ -939,9 +916,10 @@ fn drop_does_not_keep_pulling_from_an_endless_plan_generator() {
     let dir = tempfile::tempdir().unwrap();
     let engine = two_file_engine(dir.path(), 8);
 
-    /// Never ends, and counts every pull.
+    /// Never ends, counts every pull, and announces its own release.
     struct EndlessPlans {
         pulled: Arc<AtomicU64>,
+        exited: Arc<std::sync::atomic::AtomicBool>,
     }
     impl Iterator for EndlessPlans {
         type Item = Result<Plan>;
@@ -950,12 +928,20 @@ fn drop_does_not_keep_pulling_from_an_endless_plan_generator() {
             Some(Ok(vec![(0u32, 1u64)]))
         }
     }
+    impl Drop for EndlessPlans {
+        fn drop(&mut self) {
+            self.exited
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 
     const LOOKAHEAD: usize = 4;
     let pulled = Arc::new(AtomicU64::new(0));
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut it = engine.iter_with_plans(
         EndlessPlans {
             pulled: Arc::clone(&pulled),
+            exited: Arc::clone(&exited),
         },
         LOOKAHEAD,
         rows_of,
@@ -963,22 +949,41 @@ fn drop_does_not_keep_pulling_from_an_endless_plan_generator() {
     );
     it.next().expect("first batch").expect("gather");
 
-    // Establish the premise by observation, not by sleeping: the worker is
-    // parked in `send` exactly when the pull count stops moving. A fixed sleep
-    // proves nothing on a loaded machine — ordinary pre-drop filling would then
-    // be miscounted as teardown pulls (false fail), and a slow scheduler could
-    // let the drain finish before the sender wakes (false pass).
-    let before = settle(&pulled, "worker to park in `send` before drop");
+    // Premise, by count rather than by silence: the worker has pulled more than
+    // the channel can hold, so at least one `send` is parked. "The counter did
+    // not move for 25 ms" would also describe a merely descheduled worker, and
+    // taking `before` in that state would miscount ordinary pre-drop filling as
+    // teardown pulls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pulled.load(AtomicOrdering::Acquire) < (LOOKAHEAD as u64) + 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never filled the channel (pulled={}) — premise failed",
+            pulled.load(AtomicOrdering::Acquire)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let before = pulled.load(AtomicOrdering::Acquire);
 
     let t0 = std::time::Instant::now();
     drop(it);
     let elapsed = t0.elapsed();
 
-    // Measured: 0 extra pulls on 8/8 runs without the drain, exactly
-    // `LOOKAHEAD` (4) on 8/8 runs with it — the drain frees one slot per
-    // `try_recv` and the worker refills each one. Allow 1 for the worker being
-    // legitimately mid-`next` when the channel disconnects.
-    let after = settle(&pulled, "pull count to go quiet after drop");
+    // Conclusion, by completion signal: the producer's `Drop` fires only when
+    // the worker's `for item in plans` loop ends. Measured: 0 extra pulls on
+    // 8/8 runs without the drain, exactly `LOOKAHEAD` (4) with it — the drain
+    // frees one slot per `try_recv` and the worker refills each one. Allow 1
+    // for the worker being mid-`next` when the channel disconnects.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !exited.load(AtomicOrdering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pull worker was still running 10s after drop (pulled={})",
+            pulled.load(AtomicOrdering::Acquire)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let after = pulled.load(AtomicOrdering::Acquire);
     let extra = after - before;
 
     assert!(

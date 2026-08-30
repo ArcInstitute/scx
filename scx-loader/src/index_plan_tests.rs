@@ -509,8 +509,11 @@ fn iter_with_plans_drop_mid_iteration() {
 /// the **opposite** by design (`plan_engine.rs`: "Empty plans are NOT skipped —
 /// `process` is called for every plan"). That divergence was a fourth drift the
 /// review's list of three did not name, and it was the constraint the fold had
-/// to satisfy: it is met by filtering empties out of the plan *stream* in
-/// `IndexPlanLoader::iter_with_plans`, leaving the engine's contract alone.
+/// to satisfy: it is met in `IndexPlanIter::next`, which discards the zero-row
+/// batch `process_plan` returns for an empty plan, leaving the engine's contract
+/// alone. Not by filtering the plan *stream* — that was tried, and it put the
+/// skip upstream of the pull worker's only cancellation point (see
+/// `dropping_the_iter_stops_an_endless_empty_plan_generator`).
 /// Before the fold it was pinned only from Python
 /// (`pyscx/tests/test_index_plan_dataset.py::test_empty_plan_inside_stream_is_skipped`),
 /// so a Rust-side fold would have gone green here and red only in the Python
@@ -1588,6 +1591,20 @@ fn prefetch_skips_and_counts_a_shard_a_peer_is_already_decoding() {
 ///
 /// Skipping inside `next` instead keeps every plan going through the bounded
 /// channel, which is what the pre-fold loop did.
+///
+/// # Both halves are rendezvous, not sleeps
+///
+/// An earlier version of this test dropped immediately and treated "the pull
+/// count did not move for 50 ms" as proof the worker had stopped. That reading
+/// is also what a worker that has *not started yet* produces, so on a slow
+/// scheduler the test would declare success, set `stop`, and let a late-starting
+/// broken worker exit quietly — passing on exactly the bug it exists to catch.
+///
+/// So: wait for `pulled >= 1` before dropping, which proves the worker really is
+/// pulling; and after the drop wait on `exited`, set by the producer's own
+/// `Drop`. That fires only when the worker's `for item in plans` loop ends, i.e.
+/// when `send` observed the disconnect — a real completion signal rather than an
+/// inference from silence.
 #[test]
 fn dropping_the_iter_stops_an_endless_empty_plan_generator() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -1599,6 +1616,7 @@ fn dropping_the_iter_stops_an_endless_empty_plan_generator() {
     struct EndlessEmptyPlans {
         pulled: Arc<AtomicU64>,
         stop: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
     }
     impl Iterator for EndlessEmptyPlans {
         type Item = std::result::Result<Vec<(u64, u64)>, LoaderError>;
@@ -1612,45 +1630,115 @@ fn dropping_the_iter_stops_an_endless_empty_plan_generator() {
             Some(Ok(Vec::new()))
         }
     }
+    impl Drop for EndlessEmptyPlans {
+        fn drop(&mut self) {
+            self.exited.store(true, AtomicOrdering::Release);
+        }
+    }
 
     let pulled = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
+    let exited = Arc::new(AtomicBool::new(false));
     let it = loader.iter_with_plans(
         EndlessEmptyPlans {
             pulled: Arc::clone(&pulled),
             stop: Arc::clone(&stop),
+            exited: Arc::clone(&exited),
         },
         /*lookahead*/ 4,
     );
+
+    // Premise: the worker is actually pulling. Without this the drop below can
+    // race ahead of the thread ever starting, and "quiet" would prove nothing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pulled.load(AtomicOrdering::Acquire) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pull worker never pulled a single plan — premise failed, so the \
+             assertion below would have been vacuous"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 
     // Deliberately not consumed: with every plan empty there is no batch to
     // wait for, and `next` would block. The worker is already running.
     drop(it);
 
-    // Wait for the pull count to go quiet rather than sleeping a fixed span:
-    // "two consecutive samples agree" is the observable that the worker has
-    // actually stopped, and it neither false-fails on a loaded machine nor
-    // false-passes on a fast one.
+    // Conclusion: the producer was dropped, which happens only when the worker's
+    // `for item in plans` loop ended — i.e. `send` saw the disconnect.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut last = pulled.load(AtomicOrdering::Acquire);
-    let settled = loop {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let now = pulled.load(AtomicOrdering::Acquire);
-        if now == last {
-            break true;
+    let mut released = false;
+    while std::time::Instant::now() < deadline {
+        if exited.load(AtomicOrdering::Acquire) {
+            released = true;
+            break;
         }
-        if std::time::Instant::now() > deadline {
-            break false;
-        }
-        last = now;
-    };
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Set only after the verdict is decided, so a broken worker cannot be
+    // rescued by the escape hatch before we have looked.
     stop.store(true, AtomicOrdering::Release);
 
     assert!(
-        settled,
-        "the plan generator was still being pulled 10s after the iterator was \
-         dropped ({} pulls and counting) — dropping `plan_rx` cannot cancel a \
-         worker that never reaches `send`",
+        released,
+        "10s after the iterator was dropped the plan generator had still not \
+         been released ({} pulls and counting) — dropping `plan_rx` cannot \
+         cancel a worker that never reaches `send`",
         pulled.load(AtomicOrdering::Acquire)
+    );
+}
+
+/// Empty plans must not reorder or swallow a plan-stream error.
+///
+/// `iter_with_plans_propagates_plan_errors` puts non-empty plans on both sides
+/// of the error, so it never exercises the interaction the empty-plan skip
+/// actually introduces: `IndexPlanIter::next` now `continue`s past zero-row
+/// batches, and the engine latches a plan-stream error and surfaces it one-shot
+/// *after* the already-queued plans drain. Skipping is only safe if `Err` never
+/// matches the `continue` arm and the latch is not consumed by the loop.
+///
+/// Found while checking round 4's own claim rather than reported by a reviewer;
+/// the property held on inspection, but nothing pinned it.
+#[test]
+fn empty_plans_before_an_error_do_not_reorder_or_swallow_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_multi_shard_fixture(&dir.path().join("f.scx"), 8, 4, 2);
+    let loader = open_loader_arc(&path);
+
+    // Empty plans immediately either side of the error, and a trailing
+    // non-empty plan that must never be reached (the error is sticky).
+    let plans: Vec<std::result::Result<Vec<(u64, u64)>, LoaderError>> = vec![
+        Ok(vec![]),
+        Ok(vec![(0, 1)]),
+        Ok(vec![]),
+        Ok(vec![]),
+        Err(LoaderError::ChannelError("synthetic".into())),
+        Ok(vec![(2, 3)]),
+    ];
+    let mut it = loader.iter_with_plans(plans.into_iter(), 2);
+
+    // The leading empty is skipped, so the first item is the real batch.
+    let first = it.next().expect("a first item").expect("must decode");
+    assert_eq!(
+        first.pairs,
+        vec![(0, 1)],
+        "leading empty plan must be skipped"
+    );
+
+    // Two more empties are skipped *within* this call, and the latched error
+    // surfaces next rather than being consumed by the skip loop.
+    match it.next().expect("a second item") {
+        Err(LoaderError::ChannelError(s)) => assert!(s.contains("synthetic")),
+        Err(other) => panic!("expected the ChannelError, got {other}"),
+        Ok(b) => panic!(
+            "empty plans between the batch and the error were not skipped, or \
+             the error was reordered behind one: got a batch with {} pairs",
+            b.pairs.len()
+        ),
+    }
+
+    assert!(
+        it.next().is_none(),
+        "the plan-stream error is sticky — nothing after it may be yielded"
     );
 }

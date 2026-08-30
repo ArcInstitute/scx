@@ -31,8 +31,10 @@
 //!   gather recovers intra-call shard locality inside
 //!   `BackedCsrReader::read_rows_with`; the pair loader sorts inside `process`.
 //! * **Empty plans are not skipped** — `process` is called for every plan. The
-//!   pair loader, whose spec says an empty plan yields no batch, filters them
-//!   out of the plan stream before handing it over.
+//!   pair loader, whose spec says an empty plan yields no batch, discards the
+//!   zero-row result afterwards in `IndexPlanIter::next`. It must **not** filter
+//!   them out of the stream first: the pull worker learns the receiver is gone
+//!   only from `plan_tx.send`, and `Filter::next` never reaches it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
