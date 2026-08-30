@@ -1050,9 +1050,6 @@ pub fn pca(
     // Auto-route: covariance when n_vars <= threshold (faster for HVG data).
     // The rule is the shared `resolve_cpu_pca_method`, so R and Python cannot
     // drift on the threshold; `method_request` was parsed up front.
-    let pick_cpu_method = |n_vars: usize| -> &'static str {
-        scx_accel::resolve_cpu_pca_method(method_request, n_vars).as_str()
-    };
 
     // RAM ceiling for the backed-PCA shard cache. `None` → a conservative
     // default so the common case gets the multi-pass speedup without
@@ -1081,7 +1078,7 @@ pub fn pca(
         let (depth, lru_bytes) =
             resolve_pca_prefetch(per_shard_estimate(&source), pca_cache_bytes as u64);
         reader.ensure_cache_capacity(reader.n_shards(), lru_bytes as usize);
-        let m = pick_cpu_method(n_vars_eff(full_vars));
+        let m = scx_accel::resolve_cpu_pca_method(method_request, n_vars_eff(full_vars)).as_str();
         match mask_cols {
             Some(cols) => {
                 let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
@@ -1125,7 +1122,7 @@ pub fn pca(
         // `memory_budget` was documented as covering prefetch. It only did on
         // the backed branch.
         let (depth, _) = resolve_pca_prefetch(per_shard_estimate(&source), pca_cache_bytes as u64);
-        let m = pick_cpu_method(n_vars_eff(full_vars));
+        let m = scx_accel::resolve_cpu_pca_method(method_request, n_vars_eff(full_vars)).as_str();
         match mask_cols {
             Some(cols) => {
                 let proj = scx_accel::ProjectedShardSource::new(&source, cols.to_vec());
@@ -1177,7 +1174,7 @@ pub fn pca(
             None => csr0,
         };
         let n_vars = csr.n_cols();
-        let m = pick_cpu_method(n_vars);
+        let m = scx_accel::resolve_cpu_pca_method(method_request, n_vars).as_str();
         py.detach(|| match m {
             "covariance" => scx_accel::covariance_pca_inmemory(&csr, n_comps, zero_center),
             _ => scx_accel::randomized_pca_inmemory(
