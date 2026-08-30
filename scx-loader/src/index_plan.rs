@@ -30,8 +30,6 @@ use crate::decode_stage::{build_category_dicts, extract_obs_columns, CategoryDic
 use crate::error::{LoaderError, Result};
 use crate::normalize::apply_dense_transforms;
 use crate::pipeline::LoaderConfig;
-#[cfg(test)]
-use crate::plan_engine::PrefetchGate;
 use crate::plan_engine::{IterMetrics, PrefetchEngine};
 use crate::projection::{pflog_row_full, scatter_row_full, HvgProjection};
 
@@ -87,8 +85,9 @@ struct PairedDenseGather {
 ///
 /// # Fork safety
 ///
-/// The tokio runtime is built lazily on first use (see [`Self::runtime`]),
-/// not in [`Self::new`]. This matches the lazy-init pattern in
+/// The tokio runtime is built lazily on first use — it belongs to the
+/// [`PrefetchEngine`], which this loader itself only builds on the first
+/// [`Self::iter_with_plans`] call — never in [`Self::new`]. This matches the lazy-init pattern in
 /// `TrainingPipeline` and is the contract that lets a parent process
 /// construct an `IndexPlanLoader` and then have a PyTorch `DataLoader`
 /// fork worker processes: the runtime threads never exist in the parent
@@ -162,14 +161,6 @@ pub struct IndexPlanLoader {
     /// full-shard-decodes. The process-wide reader default still comes from
     /// `SCX_SCATTER_BLOCK_INDEX`.
     scatter_block_index: bool,
-    /// Test-only: when set, every prefetch task announces itself and then parks
-    /// until released. Holding a task *in flight* is the only way to observe
-    /// whether its closure captured the loader; without it the task finishes
-    /// before the assertion runs and the test passes on the broken code.
-    /// Per-loader rather than a global so parallel tests do not stall each
-    /// other's prefetches.
-    #[cfg(test)]
-    prefetch_gate: Option<Arc<PrefetchGate>>,
 }
 
 impl IndexPlanLoader {
@@ -532,17 +523,7 @@ impl IndexPlanLoader {
             // Default on; the Python layer overrides via
             // `set_scatter_block_index` when the caller passes the kwarg.
             scatter_block_index: true,
-            #[cfg(test)]
-            prefetch_gate: None,
         })
-    }
-
-    /// Test-only: park every prefetch task on `gate` until it is released.
-    /// Stashed here and handed to the engine when it is built, since the engine
-    /// does not exist yet at the point a test can reach a `&mut` loader.
-    #[cfg(test)]
-    pub(crate) fn set_prefetch_gate(&mut self, gate: Arc<PrefetchGate>) {
-        self.prefetch_gate = Some(gate);
     }
 
     /// Override the block-index adoption gate (default `true`). Called by the
@@ -962,13 +943,7 @@ impl IndexPlanLoader {
     /// shard cache and discard both.
     fn engine(&self) -> &Arc<PrefetchEngine> {
         self.engine.get_or_init(|| {
-            let engine =
-                PrefetchEngine::new(vec![Arc::clone(&self.backed)], self.effective_lookahead);
-            #[cfg(test)]
-            if let Some(gate) = self.prefetch_gate.clone() {
-                engine.set_prefetch_gate(gate);
-            }
-            engine
+            PrefetchEngine::new(vec![Arc::clone(&self.backed)], self.effective_lookahead)
         })
     }
 

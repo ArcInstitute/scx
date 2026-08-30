@@ -385,19 +385,8 @@ impl SparseCellSetLoader {
     }
 
     /// Stream `plans` (each one batch) into gathered §4.4 batches, pipelining
-    /// shard prefetch via the engine. Boxed so a PyO3 wrapper can hold it
-    /// (the engine iterator is generic over closures), and paired with the
-    /// iterator's own [`IterMetrics`] handle, which boxing would otherwise
-    /// erase — that handle is what lets `SparseCellSetBatchIter.metrics()`
-    /// report the prefetch counters.
-    pub fn iter_with_plans<I>(
-        self: Arc<Self>,
-        plans: I,
-        lookahead: usize,
-    ) -> (
-        Box<dyn Iterator<Item = Result<SparseCellSetBatch>> + Send + Sync>,
-        Arc<IterMetrics>,
-    )
+    /// shard prefetch via the engine.
+    pub fn iter_with_plans<I>(self: Arc<Self>, plans: I, lookahead: usize) -> SparseCellSetIter
     where
         I: Iterator<Item = Result<SparseCellSetPlan>> + Send + 'static,
     {
@@ -419,7 +408,10 @@ impl SparseCellSetLoader {
         // and the counters are per-iter (they reset every `iter_with_plans`
         // call), so the handle cannot come from the loader instead.
         let iter_metrics = iter.iter_metrics();
-        (Box::new(iter), iter_metrics)
+        SparseCellSetIter {
+            inner: Box::new(iter),
+            iter_metrics,
+        }
     }
 
     /// Gather one batch of cell sets into the §4.4 contract. The `process`
@@ -855,6 +847,42 @@ fn apply_sparse_transforms(data: &mut [f32], normalize: bool, log1p: bool, targe
     }
     if log1p {
         crate::normalize::log1p_dense_row(data);
+    }
+}
+
+/// Iterator returned by [`SparseCellSetLoader::iter_with_plans`].
+///
+/// **An adapter, not an implementation** — the sibling of
+/// [`crate::index_plan::IndexPlanIter`], and for the same two reasons. The
+/// plan-pull thread, the lookahead queue, the per-plan shard prefetch and the
+/// counters all live in [`crate::plan_engine`]; this exists because
+/// `PlanPrefetchIter`'s closure type parameters are unnameable (the `process`
+/// closure captures an `Arc<SparseCellSetLoader>`), and because boxing to
+/// `dyn Iterator` would erase the inherent `iter_metrics()` that
+/// `SparseCellSetBatchIter.metrics()` needs.
+///
+/// Being a named `Iterator` rather than a `(Box<dyn Iterator>, Arc<IterMetrics>)`
+/// tuple keeps `for batch in loader.iter_with_plans(..)` working for Rust
+/// callers, which the tuple form broke.
+pub struct SparseCellSetIter {
+    inner: Box<dyn Iterator<Item = Result<SparseCellSetBatch>> + Send + Sync>,
+    iter_metrics: Arc<IterMetrics>,
+}
+
+impl SparseCellSetIter {
+    /// Cloneable handle to this iter's prefetch counters. Sample at any time —
+    /// atomics are `Relaxed`, no locks. Stays valid after the iterator is
+    /// drained and dropped.
+    pub fn iter_metrics(&self) -> Arc<IterMetrics> {
+        Arc::clone(&self.iter_metrics)
+    }
+}
+
+impl Iterator for SparseCellSetIter {
+    type Item = Result<SparseCellSetBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
     }
 }
 

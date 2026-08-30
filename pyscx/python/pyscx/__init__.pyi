@@ -216,11 +216,13 @@ class SparseCellSetBatchIter:
         ``prefetch`` is per-iter and resets on each `iter_with_plans` call.
         Safe after exhaustion.
 
-        ``prefetch["prefetch_skipped_block_index"]`` is what answers "did
-        ``scatter_block_index=True`` do anything on this file?" — it is
-        non-zero only when a cold, sparse, row-group-framed shard was left
-        undecoded so the gather could take the block-index path, and stays 0
-        against an unframed file, where the kwarg is a silent no-op."""
+        ``prefetch["prefetch_skipped_block_index"]`` counts the L2
+        *prefetch-time* decision: shards left undecoded so the gather could
+        take the block-index path. It stays 0 against an unframed file, where
+        the kwarg is a silent no-op. It is **not** interchangeable with
+        ``cache_metrics()["block_index_groups"]``, which is the route the
+        gather took — at ``lookahead=0`` no prefetch runs, so every counter
+        here is 0 while ``block_index_groups`` is positive."""
         ...
 
 
@@ -333,7 +335,8 @@ class SparseCellSetDataset:
         matter because there is still no preflight warning on this class, so
         `scatter_block_index=True` against a file with no row-group-framed
         shards is a silent no-op; `block_index_groups > 0` proves the row-group
-        path ran. The prefetch half is visible too, via
+        path ran and remains the authority on which route was taken. The
+        prefetcher's own decisions are visible separately, via
         `SparseCellSetBatchIter.metrics()["prefetch"]`."""
         ...
 

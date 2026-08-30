@@ -1,24 +1,38 @@
-//! Multi-reader plan-driven prefetch engine.
+//! Multi-reader plan-driven prefetch engine — **the** plan-prefetch iterator.
 //!
-//! Generalizes the prefetch scaffolding of [`crate::index_plan::IndexPlanLoader`]
-//! (plan-pull thread, bounded lookahead queue, lazy tokio runtime, per-plan
-//! shard prefetch via `spawn_blocking`) from one `BackedCsrReader` to a
-//! `file_id → reader` map whose readers share one [`SharedShardCache`] budget.
-//! It is the reusable substrate for the Phase 2 native sparse cell-set loader
-//! (SCX-DATA-LOADER §4.3); the pair loader stays on its own copy until the
-//! optional Phase 6.1 rewire.
+//! Owns the plan-pull thread, the bounded lookahead queue, the lazy tokio
+//! runtime, the per-plan shard prefetch via `spawn_blocking`, and the
+//! [`IterMetrics`] counters, over a `file_id → reader` map whose readers share
+//! one [`SharedShardCache`] budget.
+//!
+//! Both loaders run on it (ORG-9.10-1): [`crate::sparse_cellset::SparseCellSetLoader`]
+//! multi-file, and [`crate::index_plan::IndexPlanLoader`] with a single reader.
+//! The pair loader used to carry a fork of this file — identical `refill`,
+//! `await_head` and `Drop`, drifted five ways — and `index_plan::IndexPlanIter`
+//! is now a thin adapter over this iterator. **If you are about to add prefetch
+//! logic to a caller, it belongs here instead**; re-forking is what this module
+//! exists to prevent.
 //!
 //! The engine is deliberately **concrete**, parameterized by two closures
-//! rather than a `PlanGather` trait (CLAUDE.md §2 — the sparse loader is the
-//! only consumer):
+//! rather than a `PlanGather` trait (CLAUDE.md §2 — two consumers, one shape):
 //!
 //! * `rows_of(&plan) -> Vec<(file_id, row)>` — which rows the plan touches, so
 //!   the engine can warm their shards across the right readers.
-//! * `process(&engine, &plan) -> Result<T>` — the actual gather, run on the
-//!   consumer thread once the head plan's shards are warm.
+//! * `process(&engine, plan) -> Result<T>` — the actual gather, run on the
+//!   consumer thread once the head plan's shards are warm. The plan arrives
+//!   **by value**: the in-flight queue is its last owner, so a consumer that
+//!   needs to consume or reorder it (`IndexPlanLoader::process_plan` sorts in
+//!   place) does not pay a defensive clone per batch.
 //!
-//! Plan order is preserved (no `sort_by_shard` reorder): the sparse gather
-//! recovers intra-call shard locality inside `BackedCsrReader::read_rows_with`.
+//! Two contracts the engine deliberately does **not** impose, both of which are
+//! the caller's to add if it wants them:
+//!
+//! * **Plan order is preserved** (no `sort_by_shard` reorder). The sparse
+//!   gather recovers intra-call shard locality inside
+//!   `BackedCsrReader::read_rows_with`; the pair loader sorts inside `process`.
+//! * **Empty plans are not skipped** — `process` is called for every plan. The
+//!   pair loader, whose spec says an empty plan yields no batch, filters them
+//!   out of the plan stream before handing it over.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;

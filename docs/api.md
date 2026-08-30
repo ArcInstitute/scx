@@ -2943,13 +2943,20 @@ loader-cumulative and identical to the dataset's `cache_metrics()`; the
 Both handles are cloned when the iterator is built, so `metrics()` is safe to
 call after the iterator has been drained.
 
-`prefetch_skipped_block_index` is the direct answer to "did
-`scatter_block_index=True` do anything on this file?". It is non-zero only when
-a cold, sparse, row-group-framed shard was left undecoded, and stays 0 against
-an unframed file — where the kwarg is a silent no-op on `SparseCellSetDataset`,
-which has no preflight warning. `cache_metrics()["block_index_groups"]` reports
-the same adoption from the gather side; the two share one eligibility
-predicate, so a disagreement between them is a bug.
+`prefetch_skipped_block_index` counts the **L2 prefetch-time** decision: shards
+left undecoded so the gather could take the row-group path. It is a useful
+confirmation that `scatter_block_index=True` had an effect — it stays 0 against
+an unframed file, where the kwarg is a silent no-op on `SparseCellSetDataset`,
+which has no preflight warning.
+
+It is **not** the same signal as `cache_metrics()["block_index_groups"]`, and
+the two can legitimately differ. `block_index_groups` is the route the *gather*
+actually took; the prefetch counter only exists when prefetching runs. At
+`lookahead=0` no prefetch runs at all, so every counter here is 0 while
+`block_index_groups` is still positive — and with concurrent iterators sharing
+one cache, a peer can warm a shard between the prefetch decision and the
+gather. **Use `block_index_groups` as the route signal**; use these counters to
+see what the prefetcher decided.
 
 ```python
 ds = pyscx.IndexPlanDataset("atlas.scx")

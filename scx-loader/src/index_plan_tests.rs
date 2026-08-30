@@ -1338,9 +1338,13 @@ fn a_prefetch_task_does_not_capture_the_loader() {
         ..Default::default()
     };
     let mut raw = IndexPlanLoader::new(&path, config, 4, true, 4, 16384).unwrap();
+    // Order matters: `set_scatter_block_index` reaches the reader through
+    // `Arc::get_mut`, and `engine()` clones that `Arc` into the engine. Install
+    // the gate on the engine itself — there is exactly one `OnceLock` for it,
+    // rather than a loader-side stash copied across at engine construction.
     raw.set_scatter_block_index(false);
-    let gate = Arc::new(PrefetchGate::new());
-    raw.set_prefetch_gate(Arc::clone(&gate));
+    let gate = Arc::new(crate::plan_engine::PrefetchGate::new());
+    raw.engine().set_prefetch_gate(Arc::clone(&gate));
     let loader = Arc::new(raw);
 
     let mut it = Arc::clone(&loader).iter_with_plans(

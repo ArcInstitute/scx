@@ -564,16 +564,36 @@ fn engine_does_not_warm_a_block_index_eligible_shard() {
     // One row in each of shards 0..3 (64 rows per shard). group_len = 1, so
     // `1 * ROW_RANGE_WINDOW_DIVISOR < 64` — cost-eligible on every shard.
     let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
-    let out: Vec<_> = Arc::clone(&engine)
-        .iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather)
-        .map(|r| r.unwrap())
-        .collect();
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
 
     let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
     assert_eq!(out, vec![want], "the gather must still be correct");
 
     let m = engine.cache_metrics();
     use std::sync::atomic::Ordering as AtomicOrdering;
+    // The prefetch-side half of the claim, asserted directly since ORG-9.10-1
+    // gave this arm `IterMetrics`. Before that this test could only reach for
+    // `CacheMetrics::block_index_groups`, which is the *gather's* route — so a
+    // prefetch that warmed the shard for some unrelated reason, leaving the
+    // gather to take the block-index path anyway, would have read identically.
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_block_index
+            .load(AtomicOrdering::Relaxed),
+        4,
+        "all four touched shards must be skipped *as block-index eligible*, not          merely left unwarmed for some other reason (spawned={}, cache_hit={},          in_flight={})",
+        iter_metrics
+            .prefetch_tasks_spawned
+            .load(AtomicOrdering::Relaxed),
+        iter_metrics
+            .prefetch_skipped_cache_hit
+            .load(AtomicOrdering::Relaxed),
+        iter_metrics
+            .prefetch_skipped_in_flight
+            .load(AtomicOrdering::Relaxed),
+    );
     assert!(
         m.block_index_groups.load(AtomicOrdering::Relaxed) > 0,
         "premise + claim: every group is framed, cold and sparse, so the gather \
@@ -796,3 +816,69 @@ fn engine_pull_worker_exits_promptly_after_drop() {
 // ---------------------------------------------------------------------
 // §9.3 — bounded, GIL-free teardown.
 // ---------------------------------------------------------------------
+
+/// **The limit of the prefetch counters**, pinned so the docs cannot overstate
+/// them again.
+///
+/// `spawn_prefetches` returns early when `lookahead == 0`, so every
+/// `IterMetrics` counter stays zero — while the *gather* still takes the
+/// block-index route and increments `CacheMetrics::block_index_groups`. The two
+/// therefore measure different things: `prefetch_skipped_block_index` is an L2
+/// prefetch-time decision that only exists when prefetching is enabled, and
+/// `block_index_groups` is the route the gather actually took.
+///
+/// This was documented the wrong way round — as "a disagreement between them is
+/// a bug" — which would have made `lookahead=0` read as a defect.
+#[test]
+fn lookahead_zero_leaves_prefetch_counters_zero_while_the_gather_still_adopts() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine(dir.path(), /*scatter_block_index*/ true);
+
+    let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 0, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want], "the gather must still be correct");
+
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    for (name, v) in [
+        (
+            "prefetch_tasks_spawned",
+            iter_metrics
+                .prefetch_tasks_spawned
+                .load(AtomicOrdering::Relaxed),
+        ),
+        (
+            "prefetch_skipped_cache_hit",
+            iter_metrics
+                .prefetch_skipped_cache_hit
+                .load(AtomicOrdering::Relaxed),
+        ),
+        (
+            "prefetch_skipped_in_flight",
+            iter_metrics
+                .prefetch_skipped_in_flight
+                .load(AtomicOrdering::Relaxed),
+        ),
+        (
+            "prefetch_skipped_block_index",
+            iter_metrics
+                .prefetch_skipped_block_index
+                .load(AtomicOrdering::Relaxed),
+        ),
+    ] {
+        assert_eq!(v, 0, "{name} must be 0 at lookahead=0 — no prefetch ran");
+    }
+
+    let m = engine.cache_metrics();
+    assert!(
+        m.block_index_groups.load(AtomicOrdering::Relaxed) > 0,
+        "the gather still adopts the block-index route with no prefetch at all, \
+         which is precisely why a zero prefetch counter is not evidence that it \
+         did not (block_index={}, full_shard={})",
+        m.block_index_groups.load(AtomicOrdering::Relaxed),
+        m.full_shard_groups.load(AtomicOrdering::Relaxed),
+    );
+}

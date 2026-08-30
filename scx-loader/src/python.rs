@@ -1037,10 +1037,10 @@ fn build_multimodal_batch_dict<'py>(
 /// `TrainingDataset`.
 ///
 /// The multi-threaded tokio runtime is **not** built eagerly in
-/// `IndexPlanLoader::new()` — it is constructed lazily on first use in
-/// `IndexPlanLoader::runtime()` (a `OnceLock<Runtime>` in
-/// `scx-loader/src/index_plan.rs`), whose first touch is always from an
-/// `IndexPlanIter`, post-fork in the `DataLoader` worker. So the loader never
+/// `IndexPlanLoader::new()`. It belongs to the `PrefetchEngine` the loader
+/// builds on its first `iter_with_plans` call, and the engine builds it lazily
+/// in turn — two nested `OnceLock`s, neither touched by `new`, so the first
+/// touch is always post-fork in the `DataLoader` worker. So the loader never
 /// owns runtime threads at the moment a child is forked, and each worker builds
 /// its own runtime fresh; the parent's runtime threads are never inherited. The
 /// construct-then-fork case is additionally caught by the PID check in
@@ -1667,8 +1667,9 @@ impl Drop for IndexPlanBatchIter {
     /// `for b in ds.iter_with_plans(...)` shape it outlives `ds.close()` in the
     /// caller's frame and becomes the *last* reference — which would put the
     /// whole runtime teardown back under the GIL that `close` just took care to
-    /// detach. `IndexPlanIter::drop` also aborts in-flight prefetches, but an
-    /// abort cannot stop a `spawn_blocking` task that has already started.
+    /// detach. Dropping the inner iterator also aborts in-flight prefetches
+    /// (`PlanPrefetchIter::drop`, which `IndexPlanIter` boxes), but an abort
+    /// cannot stop a `spawn_blocking` task that has already started.
     fn drop(&mut self) {
         let inner = self.inner.take();
         if unsafe { pyo3::ffi::Py_IsInitialized() } != 0 {
@@ -2410,7 +2411,8 @@ impl SparseCellSetDataset {
         })?;
 
         let plan_stream = PySparseCellSetPlanIterator { py_iter };
-        let (inner, iter_metrics) = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
+        let inner = Arc::clone(loader).iter_with_plans(plan_stream, lookahead);
+        let iter_metrics = inner.iter_metrics();
         Ok(SparseCellSetBatchIter {
             inner: Some(inner),
             iter_metrics,
@@ -2502,11 +2504,12 @@ impl SparseCellSetDataset {
     /// `block_index_groups > 0` proves the row-group path ran, and
     /// `full_shard_groups > 0` is the warm-into-the-LRU default.
     ///
-    /// Since ORG-9.10-1 this is no longer the *only* confirmation — the
-    /// prefetch half is now visible too, through
-    /// `SparseCellSetBatchIter.metrics()["prefetch"]`, whose
-    /// `prefetch_skipped_block_index` counts the L2 warm-skips directly rather
-    /// than inferring them from the gather-side totals here.
+    /// Since ORG-9.10-1 the prefetch half is visible too, through
+    /// `SparseCellSetBatchIter.metrics()["prefetch"]`. That is a different
+    /// signal, not a second reading of this one: it records what the
+    /// *prefetcher* decided, and is all-zero when prefetching is off
+    /// (`lookahead=0`) even though the gather still adopts the route. These
+    /// counters remain the authority on which route ran.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
     }
@@ -2541,7 +2544,7 @@ impl Drop for SparseCellSetDataset {
 /// `SparseCellSetBatch` into the §4.4 dict.
 #[pyclass]
 pub struct SparseCellSetBatchIter {
-    inner: Option<Box<dyn Iterator<Item = crate::error::Result<SparseCellSetBatch>> + Send + Sync>>,
+    inner: Option<crate::sparse_cellset::SparseCellSetIter>,
     /// Shared-cache counters, cloned at construction so sampling survives the
     /// inner iterator being dropped on exhaustion.
     cache_metrics: Arc<CacheMetrics>,
@@ -2609,13 +2612,14 @@ impl SparseCellSetBatchIter {
     /// `SparseCellSetDataset.cache_metrics`); `prefetch` is per-iter and resets
     /// on every `iter_with_plans` call.
     ///
-    /// `prefetch_skipped_block_index` is the one that answers "did
-    /// `scatter_block_index=True` actually do anything on this file?" — it is
-    /// non-zero only when a cold, sparse, row-group-framed shard was left
-    /// undecoded so the gather could take the block-index path. Against an
-    /// unframed file it stays 0, which is what makes the silent no-op visible.
-    /// Both handles are cloned at construction, so this is safe after the
-    /// iterator has been drained.
+    /// `prefetch_skipped_block_index` counts the **L2 prefetch-time** decision
+    /// — shards left undecoded so the gather could take the block-index path.
+    /// Against an unframed file it stays 0, which is what makes the silent
+    /// no-op visible. It is **not** interchangeable with `cache_metrics`'
+    /// `block_index_groups`, which is the route the *gather* took: at
+    /// `lookahead=0` no prefetch runs, so every counter here is 0 while
+    /// `block_index_groups` is positive. Both handles are cloned at
+    /// construction, so this is safe after the iterator has been drained.
     fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("cache", cache_metrics_to_pydict(py, &self.cache_metrics)?)?;
