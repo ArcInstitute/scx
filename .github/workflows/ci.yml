@@ -173,12 +173,19 @@ jobs:
   # through its own `hdf5` feature (`pyscx`'s comes from `[tool.maturin]
   # features`, which affects `maturin` and not `cargo test`). The
   # `feature-check` lane compiles and clippy-checks the gated half but never runs
-  # it. So before this job existed, ~210 `#[test]`s in
-  # `scx-convert/src/convert_tests_*.rs` plus every hdf5-gated `scx-cli`
-  # integration test were built by CI and executed by nothing — which is how two
-  # Criticals — the streaming h5ad exporter's categorical vocabulary, and the
-  # unbounded ingest reorder buffer this PR fixes — shipped with regression
-  # tests that could not fail.
+  # it. So before this job existed, the ~236 `#[test]`s in
+  # `scx-convert/src/convert_tests_*.rs` (287 hdf5-gated scx-convert tests in
+  # all) plus every hdf5-gated `scx-cli` integration test were built by CI and
+  # executed by nothing — which is how two Criticals — the streaming h5ad
+  # exporter's categorical vocabulary, and the unbounded ingest reorder
+  # buffer — shipped with regression tests that could not fail.
+  #
+  # This lane runs ONLY the hdf5-gated tests. `--features hdf5` is additive, so
+  # a bare `cargo test` here would re-run every default-feature test the `test`
+  # job already ran (296 duplicates measured, 185 of them needlessly
+  # serialized). The selection lists below are pinned by a dedup-guard step
+  # ("test-hdf5 lane selection lists") so they cannot silently drift from the
+  # crates' test layout.
   test-hdf5:
     name: Test (hdf5 features)
     needs: changes
@@ -221,23 +228,52 @@ jobs:
           prefix-key: v1-rust
       - name: Install hdf5 dev headers
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
-      - run: cargo test -p scx-convert --features hdf5
-      # `--test-threads=1`, and NOT `HDF5_USE_FILE_LOCKING=FALSE`.
+      # The skip list is the complement: scx-convert's hdf5-gated tests span 20+
+      # module paths (convert_tests_* plus gated parents like h5ad_obs,
+      # cellbender, hdf5_threadsafe), while the UNGATED side is exactly these 7
+      # stable prefixes. Skipping is fail-safe — a new gated module runs
+      # automatically; a new ungated module costs duplication, never coverage.
+      # The `::tests::` qualifier is load-bearing: bare `direction`/`budget`
+      # collide with helper/test fn names inside convert_tests_*. Doctests (the
+      # two hdf5-gated ExportOptions ones) are unaffected by --skip.
+      - name: Test scx-convert (hdf5-gated tests only)
+        run: |
+          cargo test -p scx-convert --features hdf5 -- \
+            --skip 'direction::tests::' --skip 'budget::tests::' \
+            --skip 'doublet::tests::' --skip 'annotation_table::tests::' \
+            --skip 'warnings::tests::' --skip 'parallel_drain::tests::' \
+            --skip 'mtx_tests::'
+      # The one hdf5-gated test living inside the (skipped, otherwise ungated)
+      # doublet module. Same build, no recompile.
+      - name: Test scx-convert (hdf5-gated doublet test)
+        run: cargo test -p scx-convert --features hdf5 doublet::tests::an_h5ad_source_is_read_rather_than_refused_on_its_extension
+      # `--test <bin>` selection + `--test-threads=1`, and NOT
+      # `HDF5_USE_FILE_LOCKING=FALSE`.
       #
-      # `scx-cli`'s integration tests build an h5ad with `hdf5::File::create` in
-      # the test process and then spawn the `scx` binary to open it. Run in
-      # parallel, sibling tests' open files make libhdf5 refuse the child's
-      # `H5Fopen` with `unable to lock file, errno = 11`. This is not a
-      # network-filesystem quirk: measured locally on ext4, 11-13 of the 18
-      # tests in `convert_stream.rs` fail this way in parallel and all 18 pass
+      # These three files are the only scx-cli test targets that reference the
+      # `hdf5` crate at all — every other target runs (in parallel) in the
+      # `test` job. They build an h5ad with `hdf5::File::create` in the test
+      # process and then spawn the `scx` binary to open it. Run in parallel,
+      # sibling tests' open files make libhdf5 refuse the child's `H5Fopen`
+      # with `unable to lock file, errno = 11`. This is not a
+      # network-filesystem quirk: measured locally on ext4, most of the tests
+      # in `convert_stream.rs` fail this way in parallel and all pass
       # serialised. The first run of this job caught it on `ubuntu-latest`.
       #
       # Disabling the lock would make the whole suite pass too, and that is what
       # every developer does locally — but it would also hide any future
       # *genuine* locking failure, on the one lane that exists to stop hiding
-      # things. Serialising keeps libhdf5's locking fully enforced. Measured
-      # cost: 203 tests in 7.2 s.
-      - run: cargo test -p scx-cli --features hdf5 -- --test-threads=1
+      # things. Serialising keeps libhdf5's locking fully enforced (and now
+      # covers 30 tests instead of serialising all 216).
+      - name: Test scx-cli (hdf5-gated test binaries, serialized)
+        run: |
+          cargo test -p scx-cli --features hdf5 \
+            --test convert_stream --test cellbender_cli --test convert_subset \
+            -- --test-threads=1
+      # The one hdf5-gated test inside the (otherwise ungated) doublet_import_cli
+      # binary. Same build, no recompile.
+      - name: Test scx-cli (hdf5-gated doublet_import test)
+        run: cargo test -p scx-cli --features hdf5 --test doublet_import_cli a_non_hdf5_h5ad_source_fails_as_an_unreadable_file
       - name: Report disk headroom after build
         if: always()
         run: df -h /
@@ -2795,6 +2831,37 @@ jobs:
             echo "::error::expected at least 4 crate::budget::dense_* CALLS in $f (slab cap, refusal message, per_worker_bytes estimate), found ${n:-0} (comment lines excluded). Re-deriving any of them locally is the 11.5 double-count (ORG-11.16-5)."
             exit 1
           fi
+
+      # test-hdf5 lane selection lists: the lane runs only hdf5-gated tests via
+      # a --test list (scx-cli) and a --skip list (scx-convert). The fail-OPEN
+      # direction is scx-cli: a new `#![cfg(feature = "hdf5")]` integration
+      # test file not named in the ci.yml --test list would run in NEITHER
+      # lane (the `test` job compiles it to an empty binary; this lane never
+      # selects it). The scx-convert direction fails safe — a new hdf5-gated
+      # module runs automatically because the skip list is the complement —
+      # but a stale skip prefix would silently stop filtering, so pin those to
+      # real module files too.
+      - name: test-hdf5 lane selection lists
+        run: |
+          set -euo pipefail
+          ci=.github/workflows/ci.yml
+          fail=0
+          for f in scx-cli/tests/*.rs; do
+            if grep -q '^#!\[cfg(feature = "hdf5")\]' "$f"; then
+              stem=$(basename "$f" .rs)
+              if ! grep -q -- "--test $stem" "$ci"; then
+                echo "::error::$f is hdf5-gated but '--test $stem' is missing from the test-hdf5 job in $ci — it would run in neither CI lane"
+                fail=1
+              fi
+            fi
+          done
+          for name in $(grep -o -- "--skip '[a-z_]*::" "$ci" | sed "s/--skip '//; s/:://"); do
+            if [ ! -e "scx-convert/src/$name.rs" ]; then
+              echo "::error::test-hdf5 --skip prefix '$name' names no scx-convert/src/$name.rs — stale skip list"
+              fail=1
+            fi
+          done
+          exit $fail
 
   # The feature legs run inside two jobs (split by whether libhdf5 is needed)
   # instead of an 11-leg matrix: one runner spin-up, checkout, toolchain and

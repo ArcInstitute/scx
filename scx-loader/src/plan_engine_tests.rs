@@ -949,13 +949,22 @@ fn drop_does_not_keep_pulling_from_an_endless_plan_generator() {
     );
     it.next().expect("first batch").expect("gather");
 
-    // Premise, by count rather than by silence: the worker has pulled more than
-    // the channel can hold, so at least one `send` is parked. "The counter did
-    // not move for 25 ms" would also describe a merely descheduled worker, and
-    // taking `before` in that state would miscount ordinary pre-drop filling as
-    // teardown pulls.
+    // Premise, by channel occupancy rather than by pull count: `before` must be
+    // sampled at quiescence, and a count threshold cannot see quiescence. The
+    // pipeline absorbs anywhere from 6 to 10 pulls before the worker parks
+    // (1 handed to `process` + 0..=LOOKAHEAD retained in `in_flight` +
+    // LOOKAHEAD in the channel + 1 in the worker's hands), so any fixed count
+    // below that range can be satisfied mid-fill on a loaded runner — and the
+    // remaining ordinary fill pulls then land after `before` and get miscounted
+    // as teardown pulls (observed on 2-core CI: before=8, after=10, extra=2).
+    //
+    // `plan_rx.is_full()` is the quiescence predicate: once the channel is at
+    // capacity the only agent that can free a slot is the consumer, and this
+    // thread never calls `next()` again. At most ONE later pull is possible —
+    // the worker taking its next item before parking in `send` — which is
+    // exactly the `extra <= 1` slack asserted below.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while pulled.load(AtomicOrdering::Acquire) < (LOOKAHEAD as u64) + 1 {
+    while !it.plan_rx.is_full() {
         assert!(
             std::time::Instant::now() < deadline,
             "worker never filled the channel (pulled={}) — premise failed",

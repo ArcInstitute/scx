@@ -43,13 +43,20 @@ cargo fmt --check
 
 # The line above runs at DEFAULT features, and nothing in the workspace enables
 # `scx-convert/hdf5` by default — so it runs NONE of the h5ad/h5mu tests. Those
-# need their own invocation (CI job `Test (hdf5 features)`):
+# need their own invocation (locally the simple additive commands below are fine;
+# duplication with the default run doesn't matter on a dev box):
 cargo test -p scx-convert --features hdf5
 cargo test -p scx-cli --features hdf5 -- --test-threads=1
-# `--test-threads=1` is required, not tuning: the scx-cli tests spawn the `scx`
-# binary to open an h5ad the test process just created, and in parallel libhdf5
-# refuses the child's H5Fopen with `unable to lock file, errno = 11`. Measured on
-# ext4 — it is cargo's parallel harness, not a network-filesystem quirk.
+# CI's `Test (hdf5 features)` job runs only the hdf5-GATED subset instead — a
+# --skip list of the 7 ungated scx-convert module prefixes plus `--test`
+# selection of the 3 hdf5-gated scx-cli test binaries (see ci.yml; a dedup-guard
+# step pins both lists to the crates' layout).
+# `--test-threads=1` is required, not tuning: the scx-cli hdf5 tests spawn the
+# `scx` binary to open an h5ad the test process just created, and in parallel
+# libhdf5 refuses the child's H5Fopen with `unable to lock file, errno = 11`.
+# Measured on ext4 — it is cargo's parallel harness, not a network-filesystem
+# quirk. Only the three hdf5-gated binaries need it (CI serializes just those);
+# every other scx-cli target never touches libhdf5.
 # `HDF5_USE_FILE_LOCKING=FALSE` also works and is the convenient local escape on
 # Weka/NFS/Lustre, but it hides real locking failures, so CI does not set it.
 
