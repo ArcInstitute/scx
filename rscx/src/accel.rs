@@ -15,14 +15,14 @@ use extendr_api::prelude::*;
 
 use scx_accel::route::{
     cpu_exec_info, cpu_only_exec_info, hvg_exec_info, nb_glm_exec_info, simple_exec_info,
-    AccelExecutionInfo, AccelRoute, FallbackReason, InputLayout, RouteValue,
+    AccelExecutionInfo, AccelRoute, DeviceRequest, FallbackReason, InputLayout, RouteValue,
 };
 use scx_accel::{
     build_knn_graph, compute_umap, covariance_pca_inmemory, estimate_alpha, leiden,
     pflog_baseline_from_delta, pflog_pca, pseudobulk_aggregate_inmemory, pseudobulk_nb_glm,
     randomized_pca_inmemory, resolve_cpu_pca_method, score_genes, streaming_clip_square_sum,
     streaming_mean_var, wilcoxon_rank_sum, AggregationMethod, AlphaOptions, CpuPcaMethod,
-    DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, ScoreMethod,
+    DispersionMethod, NbGlmContrast, NbGlmOptions, NbGlmResult, PcaMethodRequest, ScoreMethod,
 };
 use scx_sparse::ScxCsr;
 
@@ -116,7 +116,7 @@ use scx_format_io::shard_source::SingleShardSource;
 /// itself stamps differently for the op (`pseudobulk_dex` stamps
 /// `cpu_nb_glm`/`none`: the NB-GLM is a first-class native CPU route, not a
 /// fallback).
-fn exec_info_to_rlist(info: &AccelExecutionInfo) -> Result<Robj> {
+pub(crate) fn exec_info_to_rlist(info: &AccelExecutionInfo) -> Result<Robj> {
     let fields = info.fields();
     let names: Vec<&'static str> = fields.iter().map(|(k, _)| *k).collect();
     // Counters serialise as R doubles (R has no native 64-bit integer; every
@@ -241,7 +241,7 @@ fn scx_pca_matrix_impl(
     // The covariance-vs-randomized auto rule is the shared resolver, so R and
     // Python cannot drift on the threshold. rscx exposes no `method=` knob —
     // always auto.
-    let cpu_method = resolve_cpu_pca_method("auto", csr.n_cols());
+    let cpu_method = resolve_cpu_pca_method(PcaMethodRequest::Auto, csr.n_cols());
     let result = match cpu_method {
         CpuPcaMethod::Covariance => covariance_pca_inmemory(&csr, n_comp, zero_center),
         CpuPcaMethod::Randomized => randomized_pca_inmemory(
@@ -272,7 +272,7 @@ fn scx_pca_matrix_impl(
     let n_comp_i = result.n_components as i32;
     let method_str = cpu_method.as_str();
     let scx_accel = exec_info_to_rlist(&simple_exec_info(
-        "cpu",
+        DeviceRequest::Cpu,
         false,
         AccelRoute::GpuCsr,
         AccelRoute::CpuCsr,
@@ -434,7 +434,7 @@ fn scx_pflog_matrix_impl(
     let variance_ratio = result.variance_ratio.clone();
     let n_comp_i = result.n_components as i32;
 
-    let scx_accel = exec_info_to_rlist(&cpu_only_exec_info("cpu"))?;
+    let scx_accel = exec_info_to_rlist(&cpu_only_exec_info(DeviceRequest::Cpu))?;
     R!("list(
         embeddings = {{embeddings}},
         loadings = {{loadings}},
@@ -518,7 +518,7 @@ fn scx_knn_matrix_impl(
     let k_i = k as i32;
 
     let scx_accel = exec_info_to_rlist(&simple_exec_info(
-        "cpu",
+        DeviceRequest::Cpu,
         false,
         AccelRoute::GpuCsr,
         AccelRoute::CpuCsr,
@@ -613,7 +613,7 @@ fn scx_umap_graph_impl(
 
     let embeddings = row_major_to_rmatrix(&result.embeddings, result.n_obs, result.n_components)?;
     let scx_accel = exec_info_to_rlist(&simple_exec_info(
-        "cpu",
+        DeviceRequest::Cpu,
         false,
         AccelRoute::GpuDense,
         AccelRoute::CpuDense,
@@ -685,7 +685,7 @@ fn scx_leiden_graph_impl(
     let modularity = result.modularity;
     let n_communities = result.n_communities as i32;
     let scx_accel = exec_info_to_rlist(&simple_exec_info(
-        "cpu",
+        DeviceRequest::Cpu,
         false,
         AccelRoute::GpuCsr,
         AccelRoute::CpuCsr,
@@ -827,7 +827,7 @@ fn scx_rank_genes_impl(
     // planner is fed `DenseHost` and the stamp reads `cpu_dense` — not the
     // `cpu_csr` a caller might assume from the dgCMatrix input.
     let scx_accel = exec_info_to_rlist(&cpu_exec_info(
-        "cpu",
+        DeviceRequest::Cpu,
         InputLayout::DenseHost,
         false,
         false,
@@ -863,7 +863,7 @@ fn scx_hvg_mean_var(counts: Robj) -> Robj {
         let variances = stats.variances;
         // One stamp per op: pass 1 carries it; the clipped-sums pass 2 is the
         // same op's second half and stamps nothing.
-        let scx_accel = exec_info_to_rlist(&hvg_exec_info("cpu", false, false))?;
+        let scx_accel = exec_info_to_rlist(&hvg_exec_info(DeviceRequest::Cpu, false, false))?;
         R!("list(means = {{means}}, variances = {{variances}}, scx_accel = {{scx_accel}})")
             .map_err(|e| Error::Other(e.to_string()))
     })())
@@ -960,7 +960,7 @@ fn scx_score_genes_matrix_impl(
 
     let scores = score_genes(&source, &gene_list, &gene_pool, &score_method)
         .map_err(|e| Error::Other(format!("score_genes: {e}")))?;
-    let scx_accel = exec_info_to_rlist(&cpu_only_exec_info("cpu"))?;
+    let scx_accel = exec_info_to_rlist(&cpu_only_exec_info(DeviceRequest::Cpu))?;
     R!("list(scores = {{scores}}, scx_accel = {{scx_accel}})")
         .map_err(|e| Error::Other(e.to_string()))
 }
@@ -1504,7 +1504,7 @@ fn scx_nb_glm_matrix_impl(
 
     // Same shape pyscx announces for `nb_glm` with `device="cpu"`
     // (`plan_nb_glm_route(Cpu, ..)` → `cpu_nb_glm` / `user_forced_cpu`).
-    let scx_accel = exec_info_to_rlist(&nb_glm_exec_info("cpu", false))?;
+    let scx_accel = exec_info_to_rlist(&nb_glm_exec_info(DeviceRequest::Cpu, false))?;
     R!("list(
         gene = {{genes}},
         baseMean = {{base}},

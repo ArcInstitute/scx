@@ -123,5 +123,6 @@ RunHarmony_scx <- function(object,
     assay = Seurat::DefaultAssay(object)
   )
   object[[reduction.save]] <- new_red
+  object@misc$scx_accel[["harmony_integrate"]] <- result$scx_accel
   invisible(object)
 }

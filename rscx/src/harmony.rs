@@ -210,12 +210,22 @@ fn scx_harmony_integrate_impl(
     let n_clusters_out = result.n_clusters as i32;
     let objective = result.objective_harmony.clone();
 
+    // Same stamp pyscx records for `harmony_integrate` with `device="cpu"`
+    // (`simple_exec_info(Cpu, .., GpuDense, CpuDense)` -> cpu_dense /
+    // user_forced_cpu); rscx is CPU-only.
+    let scx_accel = crate::accel::exec_info_to_rlist(&scx_accel::route::simple_exec_info(
+        scx_accel::route::DeviceRequest::Cpu,
+        false,
+        scx_accel::AccelRoute::GpuDense,
+        scx_accel::AccelRoute::CpuDense,
+    ))?;
     R!("list(
         embeddings = matrix({{col_major_out}}, nrow = {{n_obs_i}}, ncol = {{n_pcs_i}}),
         converged = {{converged}},
         n_iterations = {{n_iterations}},
         n_clusters = {{n_clusters_out}},
-        objective = {{objective}}
+        objective = {{objective}},
+        scx_accel = {{scx_accel}}
     )")
     .map_err(|e| Error::Other(e.to_string()))
 }

@@ -26,6 +26,9 @@ Gated metrics (all deterministic, floored at 1.0):
   stamps ``cpu_dense`` (the kernel densifies).
 * ``r_pseudobulk_dex_route_correct`` — ``cpu_nb_glm`` with fallback
   ``"none"`` (pyscx parity: a first-class native CPU route).
+* ``r_harmony_route_cpu_correct`` — ``scx_harmony_integrate`` stamps
+  ``cpu_dense`` / ``user_forced_cpu`` (pyscx stamps ``harmony_integrate``;
+  round-1 review found rscx did not).
 
 Env absent → a typed missing result (``no_rscx_env``), mirroring the doublet
 runners: an operator without the R env gets a skip they can see, not a red
@@ -108,17 +111,33 @@ def run(
         )
         return None
 
+    # Mirror `bpcells_runner._call_r`: the orchestrator schedules this in
+    # whatever env `_env_for_format` picked (scx-bench), so prepend the rscx
+    # env's bin/lib to keep the right libR/libstdc++ bound to its Rscript, and
+    # run --vanilla so a user .Rprofile cannot pollute stdout or the session.
+    env = os.environ.copy()
+    env["PATH"] = str(prefix / "bin") + os.pathsep + env.get("PATH", "")
+    env["LD_LIBRARY_PATH"] = (
+        str(prefix / "lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    )
+
     t0 = time.perf_counter()
     proc = subprocess.run(
-        [str(rscript), str(_PROBE)],
-        capture_output=True, text=True, timeout=600,
+        [str(rscript), "--vanilla", str(_PROBE)],
+        capture_output=True, text=True, timeout=600, env=env,
     )
     wall_s = time.perf_counter() - t0
     if proc.returncode != 0:
-        # A broken rscx install (library() fails) is a missing env, not a red
-        # gate; a probe that *ran* and stamped wrong values fails below.
+        # A broken/uninstalled *rscx* (library(rscx) fails) is a missing env,
+        # not a red gate. Match rscx by name only: any other package's load
+        # failure — or a broken rscx.so — must raise, not skip, or the floors
+        # silently vacate (review round 1, Cursor Agent).
         tail = (proc.stderr or "").strip().splitlines()[-5:]
-        if "there is no package called" in (proc.stderr or ""):
+        stderr = proc.stderr or ""
+        if (
+            "there is no package called ‘rscx’" in stderr
+            or "there is no package called 'rscx'" in stderr
+        ):
             write_missing_result(
                 benchmark="accel_r_route", format_key=format_variant.key,
                 dataset=dataset.name, missing_reason="no_rscx_env",
@@ -129,7 +148,17 @@ def run(
             f"r_route_probe.R failed (rc={proc.returncode}): " + " | ".join(tail)
         )
 
-    probe = json.loads(proc.stdout)
+    # The probe prints one JSON object as its last stdout line; parse the
+    # final {...} so R warnings above it cannot corrupt the read (same shape
+    # as bpcells_runner).
+    stdout = proc.stdout.strip()
+    brace_start = stdout.rfind("{")
+    if brace_start == -1:
+        raise RuntimeError(
+            f"r_route_probe.R produced no JSON output.\n--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{proc.stderr}"
+        )
+    probe = json.loads(stdout[brace_start:])
 
     pca_ok = (
         probe.get("pca_route") == "cpu_csr"
@@ -148,6 +177,10 @@ def run(
         probe.get("dex_route") == "cpu_nb_glm"
         and probe.get("dex_fallback") == "none"
     )
+    harmony_ok = (
+        probe.get("harmony_route") == "cpu_dense"
+        and probe.get("harmony_fallback") == "user_forced_cpu"
+    )
 
     result = BenchmarkResult(
         benchmark="accel_r_route",
@@ -165,5 +198,6 @@ def run(
         r_pca_method_arms_correct=1.0 if arms_ok else 0.0,
         r_wilcoxon_route_cpu_correct=1.0 if wilcoxon_ok else 0.0,
         r_pseudobulk_dex_route_correct=1.0 if dex_ok else 0.0,
+        r_harmony_route_cpu_correct=1.0 if harmony_ok else 0.0,
     )
     return result

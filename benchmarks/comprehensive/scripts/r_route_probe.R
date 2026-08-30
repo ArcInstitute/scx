@@ -17,11 +17,18 @@
 # Runs inside the `rscx` conda env (see TOOL ENV resolution in
 # `benchmarks/comprehensive/benchmarks/accel_r_route.py`).
 
+# Deliberately no jsonlite (or any package outside rscx's own Imports): the
+# gate maps a load failure of *rscx* to a typed `no_rscx_env` skip, and a
+# missing convenience package must not be able to masquerade as that skip
+# and silently vacate the floors (review round 1, Cursor Agent). The JSON is
+# a handful of scalars plus one string array — base R emits it directly.
 suppressPackageStartupMessages({
   library(rscx)
   library(Matrix)
-  library(jsonlite)
 })
+
+json_str <- function(x) paste0('"', gsub('"', '\\"', x, fixed = TRUE), '"')
+json_arr <- function(v) paste0("[", paste(vapply(v, json_str, ""), collapse = ","), "]")
 
 make_counts <- function(n_genes, n_cells, seed = 1L) {
   set.seed(seed)
@@ -67,18 +74,30 @@ dex <- scx_pseudobulk_dex(dex_counts, group_by = meta, test_col = "condition",
                           reference = "ctrl", min_cells_per_group = 5L)
 dex_route <- attr(dex, "scx_accel")
 
+# --- harmony: pyscx stamps harmony_integrate; rscx must too ----------------
+set.seed(3)
+hm <- scx_harmony_integrate(matrix(rnorm(80 * 6), nrow = 80, ncol = 6),
+                            rep(c("A", "B"), each = 40L), max_iter = 2L)
+
 wall_s <- proc.time()[["elapsed"]] - t0
 
-result <- list(
-  pca_route = pca_small$scx_accel$route,
-  pca_fallback = pca_small$scx_accel$fallback_reason,
-  pca_method_small = pca_small$method,
-  pca_method_big = pca_big$method,
-  pca_record_keys = names(pca_small$scx_accel),
-  wilcoxon_route = de_route$route,
-  wilcoxon_fallback = de_route$fallback_reason,
-  dex_route = dex_route$route,
-  dex_fallback = dex_route$fallback_reason,
-  wall_s = wall_s
-)
-cat(toJSON(result, auto_unbox = TRUE))
+# One JSON object on the LAST stdout line (the gate parses the final {...}
+# from stdout, so R warnings or profile chatter above cannot corrupt it).
+cat(sprintf(
+  paste0('{"pca_route":%s,"pca_fallback":%s,"pca_method_small":%s,',
+         '"pca_method_big":%s,"pca_record_keys":%s,"wilcoxon_route":%s,',
+         '"wilcoxon_fallback":%s,"dex_route":%s,"dex_fallback":%s,',
+         '"harmony_route":%s,"harmony_fallback":%s,"wall_s":%.3f}'),
+  json_str(pca_small$scx_accel$route),
+  json_str(pca_small$scx_accel$fallback_reason),
+  json_str(pca_small$method),
+  json_str(pca_big$method),
+  json_arr(names(pca_small$scx_accel)),
+  json_str(de_route$route),
+  json_str(de_route$fallback_reason),
+  json_str(dex_route$route),
+  json_str(dex_route$fallback_reason),
+  json_str(hm$scx_accel$route),
+  json_str(hm$scx_accel$fallback_reason),
+  wall_s
+))

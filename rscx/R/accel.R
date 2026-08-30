@@ -12,20 +12,26 @@
 #' -> `scx_umap` -> `scx_leiden` -> `scx_rank_genes_groups`.
 #'
 #' @section Route metadata:
-#' Every accelerator records the execution route it took — the same record
-#' `pyscx` writes to `adata.uns[["scx_accel"]][[op]]`, produced by the same
-#' `scx-accel` planner, with the same keys (`route`, `fallback_reason`,
-#' `csc_available`, ...). Where it lands depends on the input:
+#' Every accelerator with a `pyscx` route stamp records the same record here —
+#' produced by the same `scx-accel` planner, with the same keys (`route`,
+#' `fallback_reason`, `csc_available`, ...). The one exception is
+#' [scx_pseudobulk] (plain aggregation), which records nothing **by design**:
+#' `pyscx` stamps no `"pseudobulk"` op either, and rscx does not invent keys
+#' Python never writes. Where the record lands depends on the input:
 #' on a `Seurat` object it is written to `object@misc$scx_accel[[op]]`
 #' (mirroring `object@misc$pflog`); a matrix-form call returns it as the
 #' `scx_accel` element of the result list, or as the `"scx_accel"` attribute
 #' when the result is a `data.frame` / vector (`scx_rank_genes_groups`,
 #' `scx_pseudobulk_dex`, `scx_nb_glm`, `scx_highly_variable_genes`,
-#' `scx_score_genes`). rscx is CPU-only, so routes are `cpu_*` with
+#' `scx_score_genes`). Note the attribute on `scx_score_genes`'s numeric
+#' vector is visible to `all.equal()` / `testthat::expect_equal()` — compare
+#' scores via `as.numeric()` if you diff against a plain reference vector.
+#' rscx is CPU-only, so routes are `cpu_*` with
 #' `fallback_reason = "user_forced_cpu"` — the pair a `pyscx` call with
 #' `device="cpu"` records (`scx_pseudobulk_dex` stamps
 #' `cpu_nb_glm`/`"none"`, exactly as `pyscx.accel.pseudobulk_dex` does: the
 #' NB-GLM is a first-class native CPU route, not a fallback).
+#' [scx_harmony_integrate] stamps `harmony_integrate` the same way.
 #'
 #' @name scx-accelerators
 NULL
@@ -82,6 +88,10 @@ scx_pca <- function(object, assay = NULL, layer = "data", features = NULL,
   )
   object[[reduction.name]] <- red
   object@misc$scx_accel[["pca"]] <- res$scx_accel
+  # The solver arm the shared auto rule picked (covariance vs randomized) —
+  # a sibling of the 17-key record, not one of its keys, so Seurat users can
+  # see which solver ran without a second matrix-form call.
+  object@misc$scx_accel[["pca_method"]] <- res$method
   invisible(object)
 }
 

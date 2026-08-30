@@ -257,6 +257,7 @@ test_that("the accelerators write into Seurat slots end to end", {
   expect_true(all(c("highly_variable_genes", "pca", "neighbors", "umap",
                     "leiden") %in% names(ra)))
   expect_equal(ra$pca$route, "cpu_csr")
+  expect_equal(ra$pca_method, "covariance")  # 60 genes <= threshold
   expect_equal(ra$umap$route, "cpu_dense")
   expect_equal(ra$leiden$fallback_reason, "user_forced_cpu")
 })

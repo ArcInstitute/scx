@@ -1100,6 +1100,11 @@ absolute_floors:
     dataset: pbmc3k
     metric: r_pseudobulk_dex_route_correct
     min: 1.0
+  - benchmark: accel_r_route
+    format: accel_r_route__rscx_cpu
+    dataset: pbmc3k
+    metric: r_harmony_route_cpu_correct
+    min: 1.0
 
   # (ACC-RUST-OPT-V4 Phase 3.1 removed the device-resident fused
   # `pca_neighbors_umap` native path — it depended on native UMAP — so the
