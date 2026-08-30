@@ -1077,7 +1077,7 @@ absolute_floors:
   # automated signal). `accel_r_route.py` shells `scripts/r_route_probe.R`
   # into the rscx conda env on synthetic matrices — routing facts are
   # dataset-independent, so pbmc3k is a scheduling slot, not an input. All
-  # four are deterministic exact-match checks, floored from first principles.
+  # five are deterministic exact-match checks, floored from first principles.
   # An absent rscx env writes a typed missing result (`no_rscx_env`), which
   # `check_absolute_floors` skips.
   - benchmark: accel_r_route

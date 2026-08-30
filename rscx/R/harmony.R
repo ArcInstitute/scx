@@ -43,6 +43,9 @@
 #'   * `n_iterations`: integer.
 #'   * `n_clusters`: integer — the resolved `K`.
 #'   * `objective`: numeric vector of per-iteration Harmony objectives.
+#'   * `scx_accel`: the shared route record (see the Route metadata section
+#'     in ?`scx-accelerators`) — `cpu_dense` / `user_forced_cpu` on this
+#'     CPU-only binding.
 #'
 #' @examples
 #' \dontrun{
@@ -79,8 +82,9 @@ NULL
 #'   `n_clusters`, `theta`, `sigma`, `max_iter`, `random_state`, etc.
 #'
 #' @return The Seurat object with a new reduction added at
-#'   `object[[reduction.save]]`. Also returns invisibly so the function
-#'   composes cleanly in pipelines.
+#'   `object[[reduction.save]]` and the route record written to
+#'   `object@misc$scx_accel[["harmony_integrate"]]`. Also returns invisibly
+#'   so the function composes cleanly in pipelines.
 #' @export
 RunHarmony_scx <- function(object,
                            group.by.vars,
