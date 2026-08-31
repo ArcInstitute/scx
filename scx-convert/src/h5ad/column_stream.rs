@@ -269,7 +269,7 @@ where
     let mut coerced_nulls: Vec<u64> = vec![0; col_writers.len()];
 
     // Drain shards. Each shard's stamped `row_start` schema metadata
-    // (set by the writer via `stamp_dense_shard_metadata`) gives its
+    // (set by the writer via `stamp_dense_shard_meta`) gives its
     // global row offset; the cumulative shard row count is verified
     // against it for defense-in-depth against producers that might
     // emit shards out of order.

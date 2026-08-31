@@ -28,6 +28,54 @@ enum FramedPick {
     V2(DecodeTarget),
 }
 
+/// Options and metadata for encoding a single CSR shard via
+/// [`encode_one_shard`] / [`encode_one_shard_from_bytes`].
+#[derive(Debug, Clone)]
+pub struct EncodeShardOptions {
+    pub explicit_codec: Option<CodecId>,
+    pub index_dtype: u8,
+    pub n_vars: u64,
+    pub global_row_offset: u64,
+    pub section_type: SectionType,
+    pub modality_type: ModalityType,
+    pub name: String,
+    pub framing: Option<FramingConfig>,
+    pub value_encoding: Option<ValueEncoding>,
+}
+
+impl EncodeShardOptions {
+    /// `index_dtype` is a required argument, not a field set after
+    /// construction: it is a correctness-required, file-wide choice (u16 vs
+    /// u32 index packing) with no safe default — silently defaulting it to
+    /// `0` let a forgetful call site encode u16 indices for a file with
+    /// `n_vars > 65535` with no error. Pass the same value every existing
+    /// call site already derives (typically `if n_vars <= 65535 { 0 } else
+    /// { 1 }`, or an input file's carried `index_dtype`).
+    ///
+    /// There is deliberately no `Default` impl: one would have to pick a
+    /// value for `index_dtype`, reopening exactly the hazard above via
+    /// `EncodeShardOptions { n_vars: 70_000, ..Default::default() }`.
+    pub fn new(
+        name: impl Into<String>,
+        section_type: SectionType,
+        n_vars: u64,
+        global_row_offset: u64,
+        index_dtype: u8,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            section_type,
+            n_vars,
+            global_row_offset,
+            index_dtype,
+            explicit_codec: None,
+            modality_type: ModalityType::Rna,
+            framing: None,
+            value_encoding: None,
+        }
+    }
+}
+
 /// Encode a single shard's CSR triplet into a `PreEncodedSection`
 /// ready for sequential write via
 /// [`crate::ScxWriter::write_preencoded_shard`].
@@ -56,72 +104,17 @@ enum FramedPick {
 /// (`0` → u16 indices, `1` → u32). This drives the codec's index
 /// packing path and is recorded in the shard header for the reader.
 ///
-/// # Examples
+/// `opts.value_encoding`: when `Some(enc)`, the shard's values are encoded
+/// with `enc` instead of the per-shard auto-detected narrowest encoding —
+/// this is what lets a parallel encode reproduce a *file-wide* value
+/// encoding and thus produce byte-identical output to a path that fixed
+/// the encoding up front (e.g. `scx-ops` grouped-write fast path vs.
+/// `CsrEmitter`). `None` preserves the auto-detect behaviour. The
+/// byte-oriented [`encode_one_shard_from_bytes`] sibling takes its value
+/// encoding from its own `shard_value_encoding` argument instead and does
+/// **not** consult this field.
 ///
-/// Options and metadata for encoding a single CSR shard.
-#[derive(Debug, Clone)]
-pub struct EncodeShardOptions {
-    pub explicit_codec: Option<CodecId>,
-    pub index_dtype: u8,
-    pub n_vars: u64,
-    pub global_row_offset: u64,
-    pub section_type: SectionType,
-    pub modality_type: ModalityType,
-    pub name: String,
-    pub framing: Option<FramingConfig>,
-    pub value_encoding: Option<ValueEncoding>,
-}
-
-impl Default for EncodeShardOptions {
-    fn default() -> Self {
-        Self {
-            explicit_codec: None,
-            index_dtype: 0,
-            n_vars: 0,
-            global_row_offset: 0,
-            section_type: SectionType::CsrShard,
-            modality_type: ModalityType::Rna,
-            name: String::new(),
-            framing: None,
-            value_encoding: None,
-        }
-    }
-}
-
-impl EncodeShardOptions {
-    /// `index_dtype` is a required argument, not a field set after
-    /// construction: it is a correctness-required, file-wide choice (u16 vs
-    /// u32 index packing) with no safe default — silently defaulting it to
-    /// `0` let a forgetful call site encode u16 indices for a file with
-    /// `n_vars > 65535` with no error. Pass the same value every existing
-    /// call site already derives (typically `if n_vars <= 65535 { 0 } else
-    /// { 1 }`, or an input file's carried `index_dtype`).
-    pub fn new(
-        name: impl Into<String>,
-        section_type: SectionType,
-        n_vars: u64,
-        global_row_offset: u64,
-        index_dtype: u8,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            section_type,
-            n_vars,
-            global_row_offset,
-            index_dtype,
-            ..Default::default()
-        }
-    }
-}
-
-/// Also the [`encode_one_shard_from_bytes`] byte-oriented sibling's
-/// caller-supplied `opts.value_encoding` override: when `Some(enc)`, the
-/// shard's values are encoded with `enc` instead of the per-shard
-/// auto-detected narrowest encoding — this is what lets a parallel encode
-/// reproduce a *file-wide* value encoding and thus produce byte-identical
-/// output to a path that fixed the encoding up front (e.g. `scx-ops`
-/// grouped-write fast path vs. `CsrEmitter`). `None` preserves the
-/// auto-detect behaviour.
+/// # Examples
 ///
 /// ```
 /// use scx_format_io::encoder::{encode_one_shard, EncodeShardOptions};
@@ -882,6 +875,26 @@ mod adaptive_codec_tests {
                 "section length diverged for framing {framing:?}"
             );
             assert_eq!(f32_sec.codec_id(), bytes_sec.codec_id());
+        }
+    }
+
+    /// `opts.n_vars` is `u64` (matching `FileHeader`), but the shard header's
+    /// `n_minor` is `u32`. A value past `u32::MAX` must be rejected with
+    /// `NVarsOverflow`, not silently truncated into a header/stats mismatch.
+    #[test]
+    fn n_vars_past_u32_max_is_rejected_not_truncated() {
+        let mut opts = EncodeShardOptions::new(
+            "X_shard_0",
+            SectionType::CsrShard,
+            u32::MAX as u64 + 1,
+            0,
+            1,
+        );
+        opts.value_encoding = Some(ValueEncoding::Uint8);
+        match encode_one_shard(&[0u64, 1], &[0u32], &[1.0f32], &opts) {
+            Err(ScxError::NVarsOverflow(n)) => assert_eq!(n, u32::MAX as u64 + 1),
+            Err(other) => panic!("expected NVarsOverflow, got {other:?}"),
+            Ok(_) => panic!("n_vars past u32::MAX must be refused, not truncated"),
         }
     }
 }
