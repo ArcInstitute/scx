@@ -245,6 +245,54 @@ fn obs_var_layout_from_entries(
     }
 }
 
+/// Borrowed raw buffers and metadata for a sparse shard payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardBuffers<'a> {
+    pub indptr: &'a [u64],
+    pub indices: &'a [u32],
+    pub values: &'a [u8],
+    pub codec_id: CodecId,
+    pub value_encoding: ValueEncoding,
+}
+
+impl<'a> ShardBuffers<'a> {
+    pub fn new(
+        indptr: &'a [u64],
+        indices: &'a [u32],
+        values: &'a [u8],
+        codec_id: CodecId,
+        value_encoding: ValueEncoding,
+    ) -> Self {
+        Self {
+            indptr,
+            indices,
+            values,
+            codec_id,
+            value_encoding,
+        }
+    }
+}
+
+/// Position and dimension metadata for a row-sharded dense matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseShardMetadata {
+    pub shard_idx: u32,
+    pub row_start: u64,
+    pub n_shard_rows: u64,
+    pub n_rows_total: u64,
+}
+
+impl DenseShardMetadata {
+    pub fn new(shard_idx: u32, row_start: u64, n_shard_rows: u64, n_rows_total: u64) -> Self {
+        Self {
+            shard_idx,
+            row_start,
+            n_shard_rows,
+            n_rows_total,
+        }
+    }
+}
+
 /// Stamp a sharded `obsm` / `varm` / `obsp` / `varp` batch with the
 /// per-shard metadata the reader uses to verify a contiguous, ordered
 /// cover of the logical matrix and reassemble it. Stamped fields
@@ -256,18 +304,12 @@ fn obs_var_layout_from_entries(
 /// is redundant; for sparse shards `batch.num_rows()` counts COO
 /// triples (= nnz in the shard's row range) rather than the row span,
 /// so the stamped value is the only authoritative source.
-fn stamp_dense_shard_metadata(
-    batch: &RecordBatch,
-    shard_idx: u32,
-    row_start: u64,
-    n_shard_rows: u64,
-    n_rows_total: u64,
-) -> RecordBatch {
+fn stamp_dense_shard_meta(batch: &RecordBatch, meta: DenseShardMetadata) -> RecordBatch {
     let mut metadata = batch.schema_ref().metadata().clone();
-    metadata.insert("shard_idx".to_string(), shard_idx.to_string());
-    metadata.insert("row_start".to_string(), row_start.to_string());
-    metadata.insert("n_shard_rows".to_string(), n_shard_rows.to_string());
-    metadata.insert("n_rows_total".to_string(), n_rows_total.to_string());
+    metadata.insert("shard_idx".to_string(), meta.shard_idx.to_string());
+    metadata.insert("row_start".to_string(), meta.row_start.to_string());
+    metadata.insert("n_shard_rows".to_string(), meta.n_shard_rows.to_string());
+    metadata.insert("n_rows_total".to_string(), meta.n_rows_total.to_string());
     let new_schema = Arc::new(Schema::new_with_metadata(
         batch.schema_ref().fields().clone(),
         metadata,
@@ -478,12 +520,18 @@ impl ScxWriter {
     ) -> Result<()> {
         let name = name.into();
 
-        // Central uniqueness guard (SCX-015): readers resolve a section name to
+        // Uniqueness guard (SCX-015): readers resolve a section name to
         // the first catalog match, so a duplicate (modality_id, section_type,
         // name) triple produces a file whose extra section is silently
-        // unreachable. Reject it at the single write choke-point. Legitimate
-        // shard families are unaffected because their names carry distinct
-        // `_shard_N` suffixes.
+        // unreachable. Reject it at this write path. This is not the single
+        // choke-point for every section write, though: the CSR/CSC/layer-shard
+        // data writers (write_shard_inner and its callers), write_raw_shard,
+        // write_csr_shard_raw_copy_inner, write_preencoded_shard, and
+        // copy_section_verbatim push `FullCatalogEntry` directly and skip this
+        // check; they rely on callers not generating a colliding
+        // (modality_id, section_type, name) triple (shard names carry a
+        // `_shard_N` suffix by convention, but that convention isn't enforced
+        // here).
         let modality_id = self.current_modality_id;
         if self.entries.iter().any(|e| {
             e.name == name && e.section_type == section_type && e.modality_id == modality_id
@@ -611,8 +659,10 @@ impl ScxWriter {
             }
             ObsVarLayout::Pending | ObsVarLayout::Sharded(_) => {}
         }
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         // Stamp the shard's global row range into the catalog so the query
         // engine can map this shard to its rows — and skip decoding it when
@@ -657,8 +707,10 @@ impl ScxWriter {
             }
             ObsVarLayout::Pending | ObsVarLayout::Sharded(_) => {}
         }
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         // Mirror of `write_obs_shard`: stamp the row range for symmetry and
         // future var-axis pushdown.
@@ -758,8 +810,10 @@ impl ScxWriter {
         batch: &RecordBatch,
     ) -> Result<()> {
         self.has_obsm = true;
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("obsm/{name}_shard_{shard_idx}"),
@@ -781,8 +835,10 @@ impl ScxWriter {
         n_rows_total: u64,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("varm/{name}_shard_{shard_idx}"),
@@ -814,8 +870,10 @@ impl ScxWriter {
         batch: &RecordBatch,
     ) -> Result<()> {
         self.has_obsp = true;
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("obsp/{name}_shard_{shard_idx}"),
@@ -836,8 +894,10 @@ impl ScxWriter {
         n_rows_total: u64,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("varp/{name}_shard_{shard_idx}"),
@@ -878,16 +938,8 @@ impl ScxWriter {
         let shard_idx = self.csr_shard_count;
         let name = format!("X_shard_{shard_idx}");
         let nnz = *indptr.last().unwrap_or(&0);
-        self.write_shard_inner(
-            indptr,
-            indices,
-            values,
-            codec_id,
-            value_encoding,
-            row_start,
-            &name,
-            SectionType::CsrShard,
-        )?;
+        let shard = ShardBuffers::new(indptr, indices, values, codec_id, value_encoding);
+        self.write_shard_inner(shard, row_start, &name, SectionType::CsrShard)?;
         self.csr_shard_count += 1;
         self.total_nnz += nnz;
         Ok(())
@@ -918,16 +970,8 @@ impl ScxWriter {
     ) -> Result<()> {
         let shard_idx = self.raw_csr_shard_count;
         let name = format!("raw/X_shard_{shard_idx}");
-        self.write_shard_inner(
-            indptr,
-            indices,
-            values,
-            codec_id,
-            value_encoding,
-            row_start,
-            &name,
-            SectionType::RawCsrShard,
-        )?;
+        let shard = ShardBuffers::new(indptr, indices, values, codec_id, value_encoding);
+        self.write_shard_inner(shard, row_start, &name, SectionType::RawCsrShard)?;
         self.raw_csr_shard_count += 1;
         Ok(())
     }
@@ -982,44 +1026,22 @@ impl ScxWriter {
     ) -> Result<()> {
         let shard_idx = self.csc_shard_count;
         let name = format!("X_csc_shard_{shard_idx}");
-        self.write_shard_inner(
-            indptr,
-            indices,
-            values,
-            codec_id,
-            value_encoding,
-            col_start,
-            &name,
-            SectionType::CscShard,
-        )?;
+        let shard = ShardBuffers::new(indptr, indices, values, codec_id, value_encoding);
+        self.write_shard_inner(shard, col_start, &name, SectionType::CscShard)?;
         self.csc_shard_count += 1;
         Ok(())
     }
 
     /// Write a layer CSR shard.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_layer_csr_shard(
         &mut self,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
-        row_start: u64,
         layer_name: &str,
         shard_idx: u32,
+        row_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         let name = format!("{layer_name}_shard_{shard_idx}");
-        self.write_shard_inner(
-            indptr,
-            indices,
-            values,
-            codec_id,
-            value_encoding,
-            row_start,
-            &name,
-            SectionType::LayerCsrShard,
-        )
+        self.write_shard_inner(shard, row_start, &name, SectionType::LayerCsrShard)
     }
 
     /// Write an obsp CSR shard.
@@ -1029,45 +1051,31 @@ impl ScxWriter {
     /// canonical CSR (per-row indices strictly increasing, duplicate
     /// coordinates summed, explicit zeros dropped — see
     /// [`scx_sparse::canonicalize_csr`]); this writer does not canonicalize.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_obsp_shard(
         &mut self,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
-        row_start: u64,
         obsp_name: &str,
         shard_idx: u32,
+        row_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         self.has_obsp = true;
         let name = format!("obsp/{obsp_name}_shard_{shard_idx}");
-        self.write_shard_inner(
-            indptr,
-            indices,
-            values,
-            codec_id,
-            value_encoding,
-            row_start,
-            &name,
-            SectionType::ObspCsrShard,
-        )
+        self.write_shard_inner(shard, row_start, &name, SectionType::ObspCsrShard)
     }
 
     /// Core shard writing logic shared by write_csr_shard, write_layer_csr_shard, write_obsp_shard.
-    #[allow(clippy::too_many_arguments)]
     fn write_shard_inner(
         &mut self,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
+        shard: ShardBuffers<'_>,
         row_start: u64,
         name: &str,
         section_type: SectionType,
     ) -> Result<()> {
+        let indptr = shard.indptr;
+        let indices = shard.indices;
+        let values = shard.values;
+        let codec_id = shard.codec_id;
+        let value_encoding = shard.value_encoding;
         // Any CSC sidecar shard (X or layer, single- or multi-modality)
         // funnels through here, so this is the one place to record that
         // the sidecar was built against the current `data_generation`.
@@ -1313,7 +1321,6 @@ impl ScxWriter {
     /// The section-level BLAKE3 checksum is recomputed from the raw bytes for
     /// the catalog entry. The inner shard-level checksum (in the 76-byte
     /// header) is preserved as-is.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_raw_shard(
         &mut self,
         raw_bytes: &[u8],
@@ -1934,16 +1941,11 @@ impl ScxWriter {
     /// namespace. Shard counts accumulate on the registered
     /// `ModalityInfo` and are flushed to the modality table at
     /// `finish()` time.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_csr_shard_for(
         &mut self,
         modality_id: u8,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
         row_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let shard_idx = self
@@ -1952,18 +1954,9 @@ impl ScxWriter {
             .map(|m| m.n_csr_shards)
             .unwrap_or(0);
         let name = format!("X/{mname}/shard_{shard_idx}");
-        let nnz = *indptr.last().unwrap_or(&0);
+        let nnz = *shard.indptr.last().unwrap_or(&0);
         self.with_modality(modality_id, |this| {
-            this.write_shard_inner(
-                indptr,
-                indices,
-                values,
-                codec_id,
-                value_encoding,
-                row_start,
-                &name,
-                SectionType::CsrShard,
-            )
+            this.write_shard_inner(shard, row_start, &name, SectionType::CsrShard)
         })?;
         if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
             info.n_csr_shards += 1;
@@ -1974,16 +1967,11 @@ impl ScxWriter {
 
     /// Per-modality `write_csc_shard`. Section names are
     /// `X_csc/{modality_name}/shard_{idx}`.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_csc_shard_for(
         &mut self,
         modality_id: u8,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
         col_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let shard_idx = self
@@ -1993,16 +1981,7 @@ impl ScxWriter {
             .unwrap_or(0);
         let name = format!("X_csc/{mname}/shard_{shard_idx}");
         self.with_modality(modality_id, |this| {
-            this.write_shard_inner(
-                indptr,
-                indices,
-                values,
-                codec_id,
-                value_encoding,
-                col_start,
-                &name,
-                SectionType::CscShard,
-            )
+            this.write_shard_inner(shard, col_start, &name, SectionType::CscShard)
         })?;
         // Phase 6: increment the file-wide CSC counter so `finish()`
         // sets the header `has_csc` flag and `n_csc_shards` field.
@@ -2019,32 +1998,18 @@ impl ScxWriter {
 
     /// Per-modality `write_layer_csr_shard`. Section name is
     /// `layer/{modality_name}/{layer_name}/shard_{idx}`.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_layer_csr_shard_for(
         &mut self,
         modality_id: u8,
         layer_name: &str,
         shard_idx: u32,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
         row_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let name = format!("layer/{mname}/{layer_name}/shard_{shard_idx}");
         self.with_modality(modality_id, |this| {
-            this.write_shard_inner(
-                indptr,
-                indices,
-                values,
-                codec_id,
-                value_encoding,
-                row_start,
-                &name,
-                SectionType::LayerCsrShard,
-            )
+            this.write_shard_inner(shard, row_start, &name, SectionType::LayerCsrShard)
         })?;
         if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
             info.flags.set_layers();
@@ -2055,32 +2020,18 @@ impl ScxWriter {
     /// Per-modality `write_layer_csc_shard`. Section name is
     /// `layer_csc/{modality_name}/{layer_name}/shard_{idx}`.
     /// Emits `SectionType::LayerCscShard` (id 16, new in v2).
-    #[allow(clippy::too_many_arguments)]
     pub fn write_layer_csc_shard_for(
         &mut self,
         modality_id: u8,
         layer_name: &str,
         shard_idx: u32,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
         col_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let name = format!("layer_csc/{mname}/{layer_name}/shard_{shard_idx}");
         self.with_modality(modality_id, |this| {
-            this.write_shard_inner(
-                indptr,
-                indices,
-                values,
-                codec_id,
-                value_encoding,
-                col_start,
-                &name,
-                SectionType::LayerCscShard,
-            )
+            this.write_shard_inner(shard, col_start, &name, SectionType::LayerCscShard)
         })?;
         if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
             info.flags.set_layers();
@@ -2115,22 +2066,17 @@ impl ScxWriter {
     /// with `SectionType::ObsmEmbeddingShard`. Mirrors the single-modality
     /// [`Self::write_obsm_shard`] but stamps the modality_id on the catalog
     /// entry via [`Self::with_modality`].
-    #[allow(clippy::too_many_arguments)]
     pub fn write_obsm_shard_for(
         &mut self,
         modality_id: u8,
         key: &str,
-        shard_idx: u32,
-        row_start: u64,
-        n_shard_rows: u64,
-        n_rows_total: u64,
+        meta: DenseShardMetadata,
         batch: &RecordBatch,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(batch, meta);
         let data = Self::write_arrow_ipc(&stamped)?;
-        let name = format!("obsm/{mname}/{key}_shard_{shard_idx}");
+        let name = format!("obsm/{mname}/{key}_shard_{}", meta.shard_idx);
         self.with_modality(modality_id, |this| {
             this.has_obsm = true;
             this.write_section_bytes(name, SectionType::ObsmEmbeddingShard, &data, None)
@@ -2145,22 +2091,17 @@ impl ScxWriter {
     /// embedding. Section name is `varm/{modality_name}/{key}_shard_{shard_idx}`
     /// with `SectionType::VarmEmbeddingShard`. Mirrors the single-modality
     /// [`Self::write_varm_shard`].
-    #[allow(clippy::too_many_arguments)]
     pub fn write_varm_shard_for(
         &mut self,
         modality_id: u8,
         key: &str,
-        shard_idx: u32,
-        row_start: u64,
-        n_shard_rows: u64,
-        n_rows_total: u64,
+        meta: DenseShardMetadata,
         batch: &RecordBatch,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(batch, meta);
         let data = Self::write_arrow_ipc(&stamped)?;
-        let name = format!("varm/{mname}/{key}_shard_{shard_idx}");
+        let name = format!("varm/{mname}/{key}_shard_{}", meta.shard_idx);
         self.with_modality(modality_id, |this| {
             this.write_section_bytes(name, SectionType::VarmEmbeddingShard, &data, None)
         })
@@ -2172,33 +2113,19 @@ impl ScxWriter {
     /// Emits a [`SectionType::ObspCsrShard`] checked by `scx validate --deep`
     /// against the v3 canonical-CSR invariant; the caller MUST pass canonical
     /// CSR (see [`Self::write_obsp_shard`]). This writer does not canonicalize.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_obsp_shard_for(
         &mut self,
         modality_id: u8,
         obsp_name: &str,
         shard_idx: u32,
-        indptr: &[u64],
-        indices: &[u32],
-        values: &[u8],
-        codec_id: CodecId,
-        value_encoding: ValueEncoding,
         row_start: u64,
+        shard: ShardBuffers<'_>,
     ) -> Result<()> {
         let mname = self.modality_name_for(modality_id)?;
         let name = format!("obsp/{mname}/{obsp_name}/shard_{shard_idx}");
         self.with_modality(modality_id, |this| {
             this.has_obsp = true;
-            this.write_shard_inner(
-                indptr,
-                indices,
-                values,
-                codec_id,
-                value_encoding,
-                row_start,
-                &name,
-                SectionType::ObspCsrShard,
-            )
+            this.write_shard_inner(shard, row_start, &name, SectionType::ObspCsrShard)
         })?;
         if let Some(info) = self.modalities.get_mut((modality_id - 1) as usize) {
             info.flags.set_obsp();
@@ -2397,16 +2324,14 @@ impl ScxWriter {
                 let csc_raw_values = value_encoding.encode_f32_batch(&chunk.data).map_err(|e| {
                     ScxError::InvalidCatalog(format!("auto_emit_csc encode_f32_batch failed: {e}"))
                 })?;
-
-                self.write_csc_shard_for(
-                    modality_id,
+                let shard = ShardBuffers::new(
                     &csc_indptr_u64,
                     &csc_indices_u32,
                     &csc_raw_values,
                     codec,
                     value_encoding,
-                    col_start,
-                )?;
+                );
+                self.write_csc_shard_for(modality_id, col_start, shard)?;
             }
         }
         // `csc_build_generation` is recorded inside `write_shard_inner`

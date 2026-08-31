@@ -292,17 +292,15 @@ fn generate_v1_layers_obsm_uns(out: &Path) {
     // Layer shard: a second CSR for the "raw_counts" layer.
     let (l_indptr, l_indices, l_data) = make_csr(n_obs, n_vars, 31);
     let l_values_bytes = encode_u16(&l_data);
+    let layer_shard = scx_format_io::ShardBuffers::new(
+        &l_indptr,
+        &l_indices,
+        &l_values_bytes,
+        CodecId::Scx1,
+        ValueEncoding::Uint16,
+    );
     writer
-        .write_layer_csr_shard(
-            &l_indptr,
-            &l_indices,
-            &l_values_bytes,
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-            "raw_counts",
-            0,
-        )
+        .write_layer_csr_shard("raw_counts", 0, 0, layer_shard)
         .unwrap();
 
     // obsm: 2-D PCA-like embedding.
@@ -449,30 +447,26 @@ fn generate_v2_multimodal_citeseq(out: &Path) {
 
     // Per-modality CSR
     let (r_indptr, r_indices, r_data) = make_csr(n_obs, rna_n_vars, 61);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &r_indptr,
-            &r_indices,
-            &encode_u16(&r_data),
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
+    let rna_bytes = encode_u16(&r_data);
+    let rna_shard = scx_format_io::ShardBuffers::new(
+        &r_indptr,
+        &r_indices,
+        &rna_bytes,
+        CodecId::Scx1,
+        ValueEncoding::Uint16,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
 
     let (a_indptr, a_indices, a_data) = make_csr(n_obs, adt_n_vars, 62);
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &a_indptr,
-            &a_indices,
-            &encode_u16(&a_data),
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
+    let adt_bytes = encode_u16(&a_data);
+    let adt_shard = scx_format_io::ShardBuffers::new(
+        &a_indptr,
+        &a_indices,
+        &adt_bytes,
+        CodecId::Scx1,
+        ValueEncoding::Uint16,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
     writer.finish().unwrap();
 }
@@ -508,30 +502,26 @@ fn generate_v2_multimodal_partial_csc(out: &Path) {
     writer.write_var_for(adt_id, &make_var(adt_n_vars)).unwrap();
 
     let (r_indptr, r_indices, r_data) = make_csr(n_obs, rna_n_vars, 71);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &r_indptr,
-            &r_indices,
-            &encode_u16(&r_data),
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
+    let rna_bytes = encode_u16(&r_data);
+    let rna_shard = scx_format_io::ShardBuffers::new(
+        &r_indptr,
+        &r_indices,
+        &rna_bytes,
+        CodecId::Scx1,
+        ValueEncoding::Uint16,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
 
     let (a_indptr, a_indices, a_data) = make_csr(n_obs, adt_n_vars, 72);
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &a_indptr,
-            &a_indices,
-            &encode_u16(&a_data),
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
+    let adt_bytes = encode_u16(&a_data);
+    let adt_shard = scx_format_io::ShardBuffers::new(
+        &a_indptr,
+        &a_indices,
+        &adt_bytes,
+        CodecId::Scx1,
+        ValueEncoding::Uint16,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
     // Build ADT CSC by transposing.
     let mut csc_indptr = vec![0u64];
@@ -552,17 +542,15 @@ fn generate_v2_multimodal_partial_csc(out: &Path) {
         }
         csc_indptr.push(csc_indptr.last().unwrap() + col_rows.len() as u64);
     }
-    writer
-        .write_csc_shard_for(
-            adt_id,
-            &csc_indptr,
-            &csc_indices,
-            &encode_u16(&csc_data),
-            CodecId::Scx1,
-            ValueEncoding::Uint16,
-            0,
-        )
-        .unwrap();
+    let csc_bytes = encode_u16(&csc_data);
+    let csc_shard = scx_format_io::ShardBuffers::new(
+        &csc_indptr,
+        &csc_indices,
+        &csc_bytes,
+        CodecId::Scx1,
+        ValueEncoding::Uint16,
+    );
+    writer.write_csc_shard_for(adt_id, 0, csc_shard).unwrap();
 
     writer.finish().unwrap();
 }

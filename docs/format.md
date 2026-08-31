@@ -1040,28 +1040,38 @@ catches it), or proactively via `pyscx.validate()`.
 ### 9.2 File checksum semantics
 
 The header field `file_checksum` is a **BLAKE3 hash truncated to 64 bits**
-computed over the entire active file extent. Concretely, the writer feeds the
-hasher (in order):
+computed over the header plus **every byte of the physical file body, to true
+EOF** — not merely up to `full_catalog_offset + full_catalog_length`.
+Concretely, the writer feeds the hasher (in order):
 
 1. The 256-byte header, serialised with the `file_checksum` field (bytes
    100..108) set to zero.
-2. The root catalog at offset 256, padded with zeros to 4096 bytes (so bytes
-   `256 + root_catalog_length` through 4351 are zero in the hash, matching the
-   zero-padding on disk).
-3. All section bytes from offset 4352 (`SECTIONS_START_OFFSET`) up to
-   `full_catalog_offset`.
-4. The full catalog (length = `full_catalog_length`).
+2. Every remaining byte of the file, from offset 256 through the physical end
+   of the file, exactly as it sits on disk (root catalog, sections, and the
+   full catalog included, with no truncation at `full_catalog_offset` or
+   `full_catalog_length`).
 
-The result is a fast, single-number integrity signal for the entire file
-extent. Bytes past `full_catalog_offset + full_catalog_length` (e.g. trailing
-garbage from a crashed append) are not covered.
+This is deliberate, not an oversight: after `rollback`, the header repoints at
+an older, smaller catalog while the newer, now-superseded catalog and its
+sections remain physically present past that boundary (`rollback` does not
+truncate the file). Hashing only up to the active catalog's end would make a
+validly rolled-back file report as corrupt. `ScxWriter::finish`,
+`scx_ops::checksum::finalize_header_with_checksum` (used by `append`/
+`delete`/`rollback`/in-place commits), and `ScxReader::verify_file_checksum`
+all hash to true EOF for exactly this reason — see
+`scx-format-io/src/reader/integrity.rs::verify_file_checksum`'s doc comment
+for the canonical statement of this contract. `ScxWriter::finish` builds a
+brand-new file with nothing physically beyond the catalog anyway, so there
+"to catalog end" and "to EOF" coincide; it's the in-place ops that can leave a
+file with genuine trailing bytes past its active catalog, and it is exactly
+those bytes this hash covers.
 
 | Event | `file_checksum` behaviour |
 |-------|--------------------------|
 | Initial write | Set during the final header `pwrite()` (step 5 of §7.1). |
-| After `append` | Updated to cover the new file extent (new sections + new catalog). |
-| After `rollback` | Recomputed over the rolled-back extent (header through the reverted catalog). |
-| Trailing garbage after crash | Irrelevant — `file_checksum` covers only bytes up to `full_catalog_offset + full_catalog_length`; bytes beyond are ignored by readers and excluded from the hash. |
+| After `append` | Updated to cover the new file extent (new sections + new catalog) through EOF. |
+| After `rollback` | Recomputed over the header through true EOF, which still includes the now-superseded catalog/sections left behind by the rollback. |
+| Trailing garbage after crash | **Covered, not irrelevant** — a subsequent successful op re-hashes to the file's current physical EOF, which includes any bytes left over from an earlier crashed or superseded write. |
 
 **Relationship to per-section checksums**: `file_checksum` and per-section BLAKE3
 checksums are independent. A valid `file_checksum` with a corrupt per-section

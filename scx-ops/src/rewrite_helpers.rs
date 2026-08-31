@@ -636,24 +636,24 @@ fn copy_csr_class_aux(
             // Framing is `None`: `upgrade` emits unframed v3 (`scx optimize
             // --row-group-rows` is the framed path), matching the X loop.
             //
-            // The `_with_value_encoding` form rather than plain
-            // `encode_one_shard`, so the widening above is not silently
-            // replaced by the encoder's own per-shard auto-detect — and so the
-            // source's per-shard codec is preserved, which is what the X and
-            // layer loops do.
-            let pre = scx_format_io::encoder::encode_one_shard_with_value_encoding(
+            // `enc_opts.value_encoding` is fixed to `widened` so it is not
+            // silently replaced by the encoder's own per-shard auto-detect —
+            // preserving the source's per-shard codec, which is what the X
+            // and layer loops do.
+            let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                entry.name.clone(),
+                entry.section_type,
+                sh.n_minor as u64,
+                row_start,
+                sh.index_dtype,
+            );
+            enc_opts.explicit_codec = Some(codec);
+            enc_opts.value_encoding = Some(widened);
+            let pre = scx_format_io::encoder::encode_one_shard(
                 &indptr_u64,
                 &indices_u32,
                 &data,
-                Some(codec),
-                sh.index_dtype,
-                sh.n_minor,
-                row_start,
-                entry.section_type,
-                scx_format_io::modality::ModalityType::Rna,
-                entry.name.clone(),
-                None,
-                Some(widened),
+                &enc_opts,
             )?;
             writer.write_preencoded_shard(pre)?;
             return Ok(());
@@ -699,7 +699,7 @@ fn copy_raw(
     // writer's own `raw_n_vars` view of the file stays truthful for anything
     // added later. The verbatim arm carries the source's header bytes; the
     // re-encoding arm passes the source shard's `n_minor` straight to
-    // `encode_one_shard_with_value_encoding` (see `copy_csr_class_aux`) rather
+    // `encode_one_shard` (see `copy_csr_class_aux`) rather
     // than reading this field, which is exactly the change that stopped it
     // stamping the wrong extent. `ScxReader::raw_n_vars` recovers the extent
     // from the shards' own stats regardless.
@@ -860,16 +860,9 @@ fn copy_layers(
             for &v in &data {
                 ve.encode_f32(&mut raw_values, v)?;
             }
-            writer.write_layer_csr_shard(
-                &indptr_u64,
-                &indices_u32,
-                &raw_values,
-                ci,
-                ve,
-                row_start,
-                layer_name,
-                shard_idx as u32,
-            )?;
+            let shard =
+                scx_format_io::ShardBuffers::new(&indptr_u64, &indices_u32, &raw_values, ci, ve);
+            writer.write_layer_csr_shard(layer_name, shard_idx as u32, row_start, shard)?;
         }
     }
     Ok(())
@@ -1064,28 +1057,25 @@ mod tests {
             .unwrap();
         w.write_var_for(rna, &sample_var(n_vars)).unwrap();
         w.set_modality_n_vars(rna, n_vars as u64).unwrap();
-        w.write_csr_shard_for(
-            rna,
-            &vec![0u64; n_obs + 1],
+        let rna_indptr = vec![0u64; n_obs + 1];
+        let rna_shard = scx_format_io::ShardBuffers::new(
+            &rna_indptr,
             &[],
             &[],
             CodecId::None,
             ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-        w.write_layer_csc_shard_for(
-            rna,
-            "spliced",
-            0,
-            &vec![0u64; n_vars + 1],
+        );
+        w.write_csr_shard_for(rna, 0, rna_shard).unwrap();
+        let csc_indptr = vec![0u64; n_vars + 1];
+        let csc_shard = scx_format_io::ShardBuffers::new(
+            &csc_indptr,
             &[],
             &[],
             CodecId::None,
             ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+        );
+        w.write_layer_csc_shard_for(rna, "spliced", 0, 0, csc_shard)
+            .unwrap();
         w.finish().unwrap();
         assert_eq!(
             dropped_section_labels(&ScxReader::open(&with_layer_csc).unwrap()),

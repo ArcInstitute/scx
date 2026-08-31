@@ -56,12 +56,13 @@ pub use bitmap::{
 };
 #[cfg(feature = "deletion-vectors")]
 pub use categorical::GlobalCategoryAccum;
+pub use csc_sidecar::{write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_BYTES};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;
 pub use encoder::{
-    encode_one_shard, encode_one_shard_from_bytes, encode_one_shard_with_value_encoding,
-    encode_shard_adaptive, encode_shard_framed, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
+    encode_one_shard, encode_one_shard_from_bytes, encode_shard_adaptive, encode_shard_framed,
+    EncodeShardOptions, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
 pub use mem::MemoryBudget;
 pub use prefetch::{
@@ -88,6 +89,6 @@ pub use typed_read::guard_decode_loss_dtype;
 pub use writer::{
     assign_csr_shard_column_stats, carry_csr_shard_column_stats, chmod_to_umask,
     clear_all_csr_shard_column_stats, clear_csr_shard_column_stats_for, compute_shard_stats,
-    fsync_parent_dir, make_sibling_tempfile, write_obs_section, MajorAxis, PreEncodedSection,
-    ScxWriter, SECTIONS_START_OFFSET,
+    fsync_parent_dir, make_sibling_tempfile, write_obs_section, DenseShardMetadata, MajorAxis,
+    PreEncodedSection, ScxWriter, ShardBuffers, SECTIONS_START_OFFSET,
 };

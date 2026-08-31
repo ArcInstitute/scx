@@ -438,17 +438,14 @@ pub fn write_multimodal_fixture(
             values.push(1u8);
             indptr.push(*indptr.last().unwrap() + 1);
         }
-        writer
-            .write_csr_shard_for(
-                id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
     }
     writer.finish().unwrap();
     path.to_path_buf()
@@ -508,16 +505,15 @@ pub fn write_single_registered_modality_fixture(
             values.push(1u8);
             indptr.push(*indptr.last().unwrap() + 1);
         }
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
         writer
-            .write_csr_shard_for(
-                rna,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                row_start as u64,
-            )
+            .write_csr_shard_for(rna, row_start as u64, shard)
             .unwrap();
     }
     writer.finish().unwrap();
@@ -577,17 +573,14 @@ pub fn write_multimodal_overlapping_fixture(
         .unwrap();
     writer.set_modality_n_vars(adt, n_vars as u64).unwrap();
     let (indptr, indices, values) = one_row_shard(0, n_obs);
-    writer
-        .write_csr_shard_for(
-            adt,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let adt_shard = scx_format_io::ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt, 0, adt_shard).unwrap();
 
     // id 2 — malformed: [0, n_obs/2 + 1) and [n_obs/2 - 1, n_obs), overlapping
     // on two rows.
@@ -607,16 +600,15 @@ pub fn write_multimodal_overlapping_fixture(
     let half = n_obs / 2;
     for (row_start, rows) in [(0usize, half + 1), (half - 1, n_obs - half + 1)] {
         let (indptr, indices, values) = one_row_shard(row_start, rows);
+        let rna_shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
         writer
-            .write_csr_shard_for(
-                rna,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                row_start as u64,
-            )
+            .write_csr_shard_for(rna, row_start as u64, rna_shard)
             .unwrap();
     }
 

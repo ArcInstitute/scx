@@ -466,15 +466,18 @@ pub fn compact_with_options(
 
             if layer_row_count >= shard_target as u64 {
                 let layer_shard_codec = seed_codec(opts.codec, &layer_values, layer_value_encoding);
-                writer.write_layer_csr_shard(
+                let shard = scx_format_io::ShardBuffers::new(
                     &layer_indptr,
                     &layer_indices,
                     &layer_values,
                     layer_shard_codec,
                     layer_value_encoding,
-                    emitted_layer_rows,
+                );
+                writer.write_layer_csr_shard(
                     layer_name,
                     layer_shard_idx,
+                    emitted_layer_rows,
+                    shard,
                 )?;
                 emitted_layer_rows += layer_row_count;
                 layer_indptr = vec![0];
@@ -487,16 +490,14 @@ pub fn compact_with_options(
 
         if layer_row_count > 0 {
             let layer_shard_codec = seed_codec(opts.codec, &layer_values, layer_value_encoding);
-            writer.write_layer_csr_shard(
+            let shard = scx_format_io::ShardBuffers::new(
                 &layer_indptr,
                 &layer_indices,
                 &layer_values,
                 layer_shard_codec,
                 layer_value_encoding,
-                emitted_layer_rows,
-                layer_name,
-                layer_shard_idx,
-            )?;
+            );
+            writer.write_layer_csr_shard(layer_name, layer_shard_idx, emitted_layer_rows, shard)?;
         }
     }
 
@@ -1261,15 +1262,14 @@ fn compact_multimodal(
 
                 if acc_rows >= shard_target as u64 {
                     let codec = seed_codec(codec_intent, &acc_values, value_encoding);
-                    writer.write_csr_shard_for(
-                        out_modality_id,
+                    let shard = scx_format_io::ShardBuffers::new(
                         &acc_indptr,
                         &acc_indices,
                         &acc_values,
                         codec,
                         value_encoding,
-                        emitted_rows,
-                    )?;
+                    );
+                    writer.write_csr_shard_for(out_modality_id, emitted_rows, shard)?;
                     emitted_rows += acc_rows;
                     acc_indptr = vec![0];
                     acc_indices.clear();
@@ -1281,15 +1281,14 @@ fn compact_multimodal(
 
         if acc_rows > 0 {
             let codec = seed_codec(codec_intent, &acc_values, value_encoding);
-            writer.write_csr_shard_for(
-                out_modality_id,
+            let shard = scx_format_io::ShardBuffers::new(
                 &acc_indptr,
                 &acc_indices,
                 &acc_values,
                 codec,
                 value_encoding,
-                emitted_rows,
-            )?;
+            );
+            writer.write_csr_shard_for(out_modality_id, emitted_rows, shard)?;
         }
 
         // Per-modality obsm — row-filter by keep_mask. Section names are
@@ -1328,7 +1327,8 @@ fn compact_multimodal(
         ) {
             let batch = reader.read_varm_for(in_modality_id, &key)?;
             let n = batch.num_rows() as u64;
-            writer.write_varm_shard_for(out_modality_id, &key, 0, 0, n, n, &batch)?;
+            let meta = scx_format_io::DenseShardMetadata::new(0, 0, n, n);
+            writer.write_varm_shard_for(out_modality_id, &key, meta, &batch)?;
         }
 
         // Per-modality obsp/varp are not preserved: the format has no
@@ -1405,6 +1405,9 @@ fn compact_multimodal(
 
             // Stream layer shards one at a time (peak memory: one shard,
             // not the whole layer) — mirrors the X-stream pattern above.
+            // Shards must be visited in row_start order (not catalog-table
+            // order, which is not a documented invariant): `layer_csr_shards_for_modality`
+            // sorts on that key, matching `sort_engine.rs`/`merge.rs`.
             for shard_entry in reader
                 .catalog()
                 .layer_csr_shards_for_modality(in_modality_id, &layer_name)
@@ -1422,6 +1425,7 @@ fn compact_multimodal(
                     }
                     let row_start = indptr[local_row] as usize;
                     let row_end = indptr[local_row + 1] as usize;
+
                     for j in row_start..row_end {
                         l_indices.push(indices[j] as u32);
                         encode_value(&mut l_values, data[j], layer_value_encoding)?;
@@ -1432,16 +1436,19 @@ fn compact_multimodal(
 
                     if l_rows >= shard_target as u64 {
                         let codec = seed_codec(codec_intent, &l_values, layer_value_encoding);
-                        writer.write_layer_csr_shard_for(
-                            out_modality_id,
-                            &layer_name,
-                            l_shard_idx,
+                        let shard = scx_format_io::ShardBuffers::new(
                             &l_indptr,
                             &l_indices,
                             &l_values,
                             codec,
                             layer_value_encoding,
+                        );
+                        writer.write_layer_csr_shard_for(
+                            out_modality_id,
+                            &layer_name,
+                            l_shard_idx,
                             l_emitted,
+                            shard,
                         )?;
                         l_emitted += l_rows;
                         l_indptr = vec![0];
@@ -1454,16 +1461,19 @@ fn compact_multimodal(
             }
             if l_rows > 0 {
                 let codec = seed_codec(codec_intent, &l_values, layer_value_encoding);
-                writer.write_layer_csr_shard_for(
-                    out_modality_id,
-                    &layer_name,
-                    l_shard_idx,
+                let shard = scx_format_io::ShardBuffers::new(
                     &l_indptr,
                     &l_indices,
                     &l_values,
                     codec,
                     layer_value_encoding,
+                );
+                writer.write_layer_csr_shard_for(
+                    out_modality_id,
+                    &layer_name,
+                    l_shard_idx,
                     l_emitted,
+                    shard,
                 )?;
             }
         }

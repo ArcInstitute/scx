@@ -1002,16 +1002,14 @@ mod tests {
                 values.push(((r + 1) % 256) as u8);
                 indptr.push(indptr.last().unwrap() + 1);
             }
-            w.write_csr_shard_for(
-                id,
+            let shard = scx_format_io::ShardBuffers::new(
                 &indptr,
                 &indices,
                 &values,
                 CodecId::None,
                 ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+            );
+            w.write_csr_shard_for(id, 0, shard).unwrap();
         }
         w.finish().unwrap();
 
@@ -1170,17 +1168,14 @@ mod tests {
         .unwrap();
         let half = 2_500_000_000u32;
         let raw: Vec<u8> = [half, half].iter().flat_map(|v| v.to_le_bytes()).collect();
-        w.write_layer_csr_shard(
+        let shard = scx_format_io::ShardBuffers::new(
             &[0u64, 2],
             &[1u32, 1],
             &raw,
             CodecId::Scx1,
             ValueEncoding::Uint32,
-            0,
-            "counts",
-            0,
-        )
-        .unwrap();
+        );
+        w.write_layer_csr_shard("counts", 0, 0, shard).unwrap();
         w.finish().unwrap();
 
         let output = dir.path().join("upgraded.scx");
@@ -1905,17 +1900,14 @@ mod tests {
         w.write_raw_var(&sample_var(n_vars)).unwrap();
 
         // Row 0 stores an explicit zero, which canonicalizing removes.
-        w.write_obsp_shard(
+        let shard = scx_format_io::ShardBuffers::new(
             &[0u64, 2, 3],
             &[0u32, 1, 0],
             &[0u8, 5, 6],
             CodecId::None,
             ValueEncoding::Uint8,
-            0,
-            "connectivities",
-            0,
-        )
-        .unwrap();
+        );
+        w.write_obsp_shard("connectivities", 0, 0, shard).unwrap();
         w.finish().unwrap();
 
         // Premise: the input really is invalid under the invariant v3 asserts,
@@ -2040,27 +2032,28 @@ mod tests {
 
         // An obs x obs graph with an endpoint at column 5 — beyond `n_vars`.
         //
-        // Written through `encode_one_shard_with_value_encoding` rather than
-        // `write_obsp_shard`, because that writer derives `n_minor` from the
-        // header's `n_vars` and so **cannot express** an obs x obs graph on a
-        // file where `n_obs > n_vars` — it rejects this very shard with
+        // Written through `encode_one_shard` rather than `write_obsp_shard`,
+        // because that writer derives `n_minor` from the header's `n_vars`
+        // and so **cannot express** an obs x obs graph on a file where
+        // `n_obs > n_vars` — it rejects this very shard with
         // `ShardIndexOutOfRange { index: 5, n_minor: 3 }`. That is the same
         // defect on the write side, and it is why `optimize` uses this API for
         // this section type. Row 0 also stores an explicit zero, so the graph
         // is non-canonical and takes the re-encode arm.
-        let pre = scx_format_io::encoder::encode_one_shard_with_value_encoding(
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+            "obsp/connectivities_shard_0".to_string(),
+            SectionType::ObspCsrShard,
+            n_obs as u64,
+            0,
+            0,
+        );
+        enc_opts.explicit_codec = Some(CodecId::None);
+        enc_opts.value_encoding = Some(ValueEncoding::Uint8);
+        let pre = scx_format_io::encoder::encode_one_shard(
             &[0u64, 2, 3, 4, 5, 6],
             &[0u32, 5, 5, 0, 1, 2],
             &[1.0f32, 1.0, 2.0, 3.0, 4.0, 5.0],
-            Some(CodecId::None),
-            0,
-            n_obs as u32,
-            0,
-            SectionType::ObspCsrShard,
-            scx_format_io::modality::ModalityType::Rna,
-            "obsp/connectivities_shard_0".to_string(),
-            None,
-            Some(ValueEncoding::Uint8),
+            &enc_opts,
         )
         .unwrap();
         w.write_preencoded_shard(pre).unwrap();

@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 use scx_codec::{CodecId, CodecSelection, ValueEncoding};
 use scx_format_io::header::FileHeader;
 use scx_format_io::provenance::ProvenanceEntry;
-use scx_format_io::writer::ScxWriter;
+use scx_format_io::writer::{DenseShardMetadata, ScxWriter, ShardBuffers};
 use scx_format_io::{ScxReader, ShardHeader, SHARD_HEADER_SIZE};
 use scx_ops::AppendOptions;
 use std::num::NonZeroU32;
@@ -1132,17 +1132,15 @@ fn write_test_file_with_layers_obsm(
     for &v in &values {
         layer_values.extend_from_slice(&(v as f32 * 1.5).to_le_bytes());
     }
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &layer_values,
+        CodecId::None,
+        ValueEncoding::Float32,
+    );
     writer
-        .write_layer_csr_shard(
-            &indptr,
-            &indices,
-            &layer_values,
-            CodecId::None,
-            ValueEncoding::Float32,
-            0,
-            "normalized",
-            0,
-        )
+        .write_layer_csr_shard("normalized", 0, 0, shard)
         .unwrap();
 
     // Write obsm
@@ -1509,17 +1507,14 @@ fn write_multimodal_with_per_modality_mappings(
         .unwrap();
     writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
     let (indptr, indices, values) = sample_shard_data(n_obs, rna_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
 
     // Per-modality obsm as a SHARDED section (forces ObsmEmbeddingShard).
     let emb: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.1).collect();
@@ -1534,8 +1529,9 @@ fn write_multimodal_with_per_modality_mappings(
         ],
     )
     .unwrap();
+    let obsm_meta = DenseShardMetadata::new(0, 0, n_obs as u64, n_obs as u64);
     writer
-        .write_obsm_shard_for(rna_id, "X_umap", 0, 0, n_obs as u64, n_obs as u64, &obsm)
+        .write_obsm_shard_for(rna_id, "X_umap", obsm_meta, &obsm)
         .unwrap();
 
     // Per-modality varm.
@@ -1552,8 +1548,9 @@ fn write_multimodal_with_per_modality_mappings(
         ],
     )
     .unwrap();
+    let varm_meta = DenseShardMetadata::new(0, 0, rna_n_vars, rna_n_vars);
     writer
-        .write_varm_shard_for(rna_id, "PCs", 0, 0, rna_n_vars, rna_n_vars, &varm)
+        .write_varm_shard_for(rna_id, "PCs", varm_meta, &varm)
         .unwrap();
 
     writer.finish().unwrap();
@@ -1624,17 +1621,14 @@ fn write_multimodal_with_global_and_per_modality_mappings(
         .unwrap();
     writer.set_modality_n_vars(rna_id, rna_n_vars).unwrap();
     let (indptr, indices, values) = sample_shard_data(n_obs, rna_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
 
     // Per-modality sharded obsm + varm on the RNA modality (modality_id 1).
     let emb: Vec<f64> = (0..n_obs * 2).map(|i| i as f64 * 0.1).collect();
@@ -1649,8 +1643,9 @@ fn write_multimodal_with_global_and_per_modality_mappings(
         ],
     )
     .unwrap();
+    let obsm_meta = DenseShardMetadata::new(0, 0, n_obs as u64, n_obs as u64);
     writer
-        .write_obsm_shard_for(rna_id, "X_umap", 0, 0, n_obs as u64, n_obs as u64, &pm_obsm)
+        .write_obsm_shard_for(rna_id, "X_umap", obsm_meta, &pm_obsm)
         .unwrap();
     let nv = rna_n_vars as usize;
     let pm_vemb: Vec<f64> = (0..nv * 2).map(|i| i as f64 * 0.3).collect();
@@ -1665,8 +1660,9 @@ fn write_multimodal_with_global_and_per_modality_mappings(
         ],
     )
     .unwrap();
+    let varm_meta = DenseShardMetadata::new(0, 0, rna_n_vars, rna_n_vars);
     writer
-        .write_varm_shard_for(rna_id, "PCs", 0, 0, rna_n_vars, rna_n_vars, &pm_varm)
+        .write_varm_shard_for(rna_id, "PCs", varm_meta, &pm_varm)
         .unwrap();
 
     // Global mappings (modality_id 0) — written at top level.
@@ -2189,17 +2185,9 @@ fn write_test_file_with_layer_enc(
         let v = if j == 0 { peak } else { 1.0 };
         scx_ops::helpers::encode_value(&mut layer_bytes, v, layer_enc).unwrap();
     }
+    let shard = ShardBuffers::new(&indptr, &indices, &layer_bytes, CodecId::None, layer_enc);
     writer
-        .write_layer_csr_shard(
-            &indptr,
-            &indices,
-            &layer_bytes,
-            CodecId::None,
-            layer_enc,
-            0,
-            "normalized",
-            0,
-        )
+        .write_layer_csr_shard("normalized", 0, 0, shard)
         .unwrap();
 
     writer
@@ -2867,29 +2855,23 @@ fn test_append_for_modality_rejected() {
         // Seed each modality with one CSR shard so the file is well-
         // formed before the append attempt.
         let (rna_indptr, rna_indices, rna_values) = sample_shard_data(4, rna_n_vars as usize);
-        writer
-            .write_csr_shard_for(
-                rna_id,
-                &rna_indptr,
-                &rna_indices,
-                &rna_values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let rna_shard = ShardBuffers::new(
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
         let (adt_indptr, adt_indices, adt_values) = sample_shard_data(4, adt_n_vars as usize);
-        writer
-            .write_csr_shard_for(
-                adt_id,
-                &adt_indptr,
-                &adt_indices,
-                &adt_values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let adt_shard = ShardBuffers::new(
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
         writer.finish().unwrap();
     }
@@ -3383,17 +3365,14 @@ fn test_streaming_append_from_a_multimodal_source_is_supported() {
         writer.set_modality_n_vars(adt_id, n_vars).unwrap();
         for (mid, nv) in [(rna_id, 30usize), (adt_id, n_vars as usize)] {
             let (indptr, indices, values) = sample_shard_data(2, nv);
-            writer
-                .write_csr_shard_for(
-                    mid,
-                    &indptr,
-                    &indices,
-                    &values,
-                    CodecId::None,
-                    ValueEncoding::Uint8,
-                    0,
-                )
-                .unwrap();
+            let shard = ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
+            writer.write_csr_shard_for(mid, 0, shard).unwrap();
         }
         writer.finish().unwrap();
     }
@@ -3458,29 +3437,23 @@ fn test_streaming_append_multimodal_rejected() {
         writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
 
         let (rna_indptr, rna_indices, rna_values) = sample_shard_data(4, rna_n_vars as usize);
-        writer
-            .write_csr_shard_for(
-                rna_id,
-                &rna_indptr,
-                &rna_indices,
-                &rna_values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let rna_shard = ShardBuffers::new(
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
         let (adt_indptr, adt_indices, adt_values) = sample_shard_data(4, adt_n_vars as usize);
-        writer
-            .write_csr_shard_for(
-                adt_id,
-                &adt_indptr,
-                &adt_indices,
-                &adt_values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let adt_shard = ShardBuffers::new(
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
         writer.finish().unwrap();
     }
@@ -3580,29 +3553,23 @@ fn write_multimodal_with_csc(
     writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
 
     let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &rna_indptr,
-            &rna_indices,
-            &rna_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &adt_indptr,
-            &adt_indices,
-            &adt_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let adt_shard = ShardBuffers::new(
+        &adt_indptr,
+        &adt_indices,
+        &adt_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
     if with_adt_csc {
         // Build a single CSC shard for adt covering all its columns.
@@ -3628,17 +3595,14 @@ fn write_multimodal_with_csc(
             }
             csc_indptr.push(csc_indices.len() as u64);
         }
-        writer
-            .write_csc_shard_for(
-                adt_id,
-                &csc_indptr,
-                &csc_indices,
-                &csc_values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let csc_shard = ShardBuffers::new(
+            &csc_indptr,
+            &csc_indices,
+            &csc_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csc_shard_for(adt_id, 0, csc_shard).unwrap();
     }
 
     writer.finish().unwrap();
@@ -3797,47 +3761,38 @@ fn write_multimodal_with_layers_and_obsm(
     writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
 
     let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &rna_indptr,
-            &rna_indices,
-            &rna_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &adt_indptr,
-            &adt_indices,
-            &adt_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let adt_shard = ShardBuffers::new(
+        &adt_indptr,
+        &adt_indices,
+        &adt_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
     // RNA `counts` layer: Float32, value = csr_value * 1.5.
     let mut rna_layer_values = Vec::new();
     for &v in &rna_values {
         rna_layer_values.extend_from_slice(&(v as f32 * 1.5_f32).to_le_bytes());
     }
+    let rna_layer_shard = ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_layer_values,
+        CodecId::None,
+        ValueEncoding::Float32,
+    );
     writer
-        .write_layer_csr_shard_for(
-            rna_id,
-            "counts",
-            0,
-            &rna_indptr,
-            &rna_indices,
-            &rna_layer_values,
-            CodecId::None,
-            ValueEncoding::Float32,
-            0,
-        )
+        .write_layer_csr_shard_for(rna_id, "counts", 0, 0, rna_layer_shard)
         .unwrap();
 
     // ADT `centered` layer: Float32, value = csr_value - 1.0.
@@ -3845,18 +3800,15 @@ fn write_multimodal_with_layers_and_obsm(
     for &v in &adt_values {
         adt_layer_values.extend_from_slice(&(v as f32 - 1.0_f32).to_le_bytes());
     }
+    let adt_layer_shard = ShardBuffers::new(
+        &adt_indptr,
+        &adt_indices,
+        &adt_layer_values,
+        CodecId::None,
+        ValueEncoding::Float32,
+    );
     writer
-        .write_layer_csr_shard_for(
-            adt_id,
-            "centered",
-            0,
-            &adt_indptr,
-            &adt_indices,
-            &adt_layer_values,
-            CodecId::None,
-            ValueEncoding::Float32,
-            0,
-        )
+        .write_layer_csr_shard_for(adt_id, "centered", 0, 0, adt_layer_shard)
         .unwrap();
 
     writer.finish().unwrap();
@@ -3958,29 +3910,23 @@ fn write_multimodal_with_options_fixture(
         .set_modality_n_vars(adt_id, adt_var.num_rows() as u64)
         .unwrap();
     let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_var.num_rows());
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &rna_indptr,
-            &rna_indices,
-            &rna_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_var.num_rows());
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &adt_indptr,
-            &adt_indices,
-            &adt_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let adt_shard = ShardBuffers::new(
+        &adt_indptr,
+        &adt_indices,
+        &adt_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
     if let Some(g) = global_uns {
         writer.write_uns(g).unwrap();
     }
@@ -4182,6 +4128,94 @@ fn test_compact_multimodal_layers_streaming() {
     assert_eq!(adt_centered.shape.0, n_obs - 2);
 }
 
+/// `compact_multimodal`'s per-modality layer stream must order shards by
+/// `row_start` (via `FullCatalog::layer_csr_shards_for_modality`), not by
+/// catalog-table order — catalog order is not a documented invariant. This
+/// pins a regression where the layer loop was rewritten as a raw
+/// `catalog().entries.iter().filter(...)`, which iterates in whatever order
+/// entries were written; `test_compact_multimodal_layers_streaming` above
+/// writes its layer as a single shard and so cannot catch this (there is
+/// nothing to reorder).
+#[test]
+fn test_compact_multimodal_layer_shards_out_of_catalog_order() {
+    use scx_format_io::modality::ModalityType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_obs = 6usize;
+    let n_vars = 4u64;
+    let path = dir.path().join("layer_catalog_order.scx");
+    let header = sample_header(n_obs as u64, n_vars);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, n_vars).unwrap();
+
+    let (x_indptr, x_indices, x_values) = sample_shard_data(n_obs, n_vars as usize);
+    let x_shard = ShardBuffers::new(
+        &x_indptr,
+        &x_indices,
+        &x_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, x_shard).unwrap();
+
+    // Layer `counts`: one nonzero per row at column 0, value = row + 1, so a
+    // scrambled row order is directly visible in the decoded value. Shards
+    // are written to the catalog in the OPPOSITE order from their
+    // `row_start` (rows 3..6 first, then rows 0..3).
+    let shard_hi = ShardBuffers::new(
+        &[0u64, 1, 2, 3],
+        &[0u32, 0, 0],
+        &[4u8, 5, 6],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer
+        .write_layer_csr_shard_for(rna_id, "counts", 1, 3, shard_hi)
+        .unwrap();
+    let shard_lo = ShardBuffers::new(
+        &[0u64, 1, 2, 3],
+        &[0u32, 0, 0],
+        &[1u8, 2, 3],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer
+        .write_layer_csr_shard_for(rna_id, "counts", 0, 0, shard_lo)
+        .unwrap();
+    writer.finish().unwrap();
+
+    let out = dir.path().join("layer_catalog_order_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let counts = reader.read_layer_for(rna_id, "counts").unwrap();
+    assert_eq!(counts.shape.0, n_obs);
+    for row in 0..n_obs {
+        let start = counts.indptr[row] as usize;
+        let end = counts.indptr[row + 1] as usize;
+        assert_eq!(end - start, 1, "row {row} must have exactly one nonzero");
+        assert_eq!(
+            counts.data[start],
+            (row + 1) as f32,
+            "row {row}'s layer value was scrambled by catalog-table iteration order"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // compact --reshape-obs (task 6c): legacy single-section obs → sharded
 // ---------------------------------------------------------------------------
@@ -4340,29 +4374,23 @@ fn write_multimodal_single_section_obs_file(
     writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
 
     let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, rna_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &rna_indptr,
-            &rna_indices,
-            &rna_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, adt_n_vars as usize);
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &adt_indptr,
-            &adt_indices,
-            &adt_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let adt_shard = ShardBuffers::new(
+        &adt_indptr,
+        &adt_indices,
+        &adt_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
     writer.finish().unwrap();
     path
 }
@@ -4536,13 +4564,11 @@ fn write_multimodal_sharded_obs_file(
     writer.set_modality_n_vars(adt_id, adt_n_vars).unwrap();
 
     let (i, j, v) = sample_shard_data(n_obs, rna_n_vars as usize);
-    writer
-        .write_csr_shard_for(rna_id, &i, &j, &v, CodecId::None, ValueEncoding::Uint8, 0)
-        .unwrap();
+    let rna_shard = ShardBuffers::new(&i, &j, &v, CodecId::None, ValueEncoding::Uint8);
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     let (i, j, v) = sample_shard_data(n_obs, adt_n_vars as usize);
-    writer
-        .write_csr_shard_for(adt_id, &i, &j, &v, CodecId::None, ValueEncoding::Uint8, 0)
-        .unwrap();
+    let adt_shard = ShardBuffers::new(&i, &j, &v, CodecId::None, ValueEncoding::Uint8);
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
     writer.finish().unwrap();
     path
 }

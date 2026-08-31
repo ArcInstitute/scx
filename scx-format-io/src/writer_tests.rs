@@ -556,14 +556,16 @@ fn test_all_section_types() {
     // Layer shard
     writer
         .write_layer_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
             "raw",
             0,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
         )
         .unwrap();
 
@@ -1197,20 +1199,11 @@ fn v4_guard_rejects_unframed_v1_shard() {
     let (indptr, indices, values) = tiny_csr();
 
     // (1) Unframed (explicit Zstd) v1 shard → rejected in v4.
-    let zstd_unframed = crate::encoder::encode_one_shard(
-        &indptr,
-        &indices,
-        &values,
-        Some(CodecId::Zstd),
-        0,
-        3,
-        0,
-        SectionType::CsrShard,
-        ModalityType::Rna,
-        "X_shard_0".to_string(),
-        None,
-    )
-    .unwrap();
+    let mut zstd_opts =
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
+    zstd_opts.explicit_codec = Some(CodecId::Zstd);
+    let zstd_unframed =
+        crate::encoder::encode_one_shard(&indptr, &indices, &values, &zstd_opts).unwrap();
     let (_w, res) = write("v4_reject.scx", v4(), zstd_unframed);
     let err = res.unwrap_err();
     assert!(
@@ -1219,44 +1212,25 @@ fn v4_guard_rejects_unframed_v1_shard() {
     );
 
     // (2) Framed shard → allowed in v4.
-    let framed = crate::encoder::encode_one_shard(
-        &indptr,
-        &indices,
-        &values,
-        None,
-        0,
-        3,
-        0,
-        SectionType::CsrShard,
-        ModalityType::Rna,
-        "X_shard_0".to_string(),
-        Some(crate::encoder::FramingConfig {
-            row_group_rows: 1,
-            target_nnz: None,
-            trial: false,
-            decode_target: None,
-        }),
-    )
-    .unwrap();
+    let mut framed_opts =
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
+    framed_opts.framing = Some(crate::encoder::FramingConfig {
+        row_group_rows: 1,
+        target_nnz: None,
+        trial: false,
+        decode_target: None,
+    });
+    let framed =
+        crate::encoder::encode_one_shard(&indptr, &indices, &values, &framed_opts).unwrap();
     let (w, res) = write("v4_framed.scx", v4(), framed);
     res.unwrap();
     w.finish().unwrap();
 
     // (3) Unframed shard into a v3 file → accepted (the ordinary path).
-    let plain = crate::encoder::encode_one_shard(
-        &indptr,
-        &indices,
-        &values,
-        Some(CodecId::Zstd),
-        0,
-        3,
-        0,
-        SectionType::CsrShard,
-        ModalityType::Rna,
-        "X_shard_0".to_string(),
-        None,
-    )
-    .unwrap();
+    let mut plain_opts =
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
+    plain_opts.explicit_codec = Some(CodecId::Zstd);
+    let plain = crate::encoder::encode_one_shard(&indptr, &indices, &values, &plain_opts).unwrap();
     let (w, res) = write("v3.scx", sample_header(), plain);
     res.unwrap();
     w.finish().unwrap();
@@ -1275,21 +1249,10 @@ fn copy_section_verbatim_rejects_legacy_shard_in_v4_file() {
     let mut w = ScxWriter::new(&src_path, sample_header()).unwrap();
     w.write_obs(&sample_obs()).unwrap();
     w.write_var(&sample_var()).unwrap();
+    let legacy_opts =
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
     w.write_preencoded_shard(
-        crate::encoder::encode_one_shard(
-            &indptr,
-            &indices,
-            &values,
-            None,
-            0,
-            3,
-            0,
-            SectionType::CsrShard,
-            ModalityType::Rna,
-            "X_shard_0".to_string(),
-            None,
-        )
-        .unwrap(),
+        crate::encoder::encode_one_shard(&indptr, &indices, &values, &legacy_opts).unwrap(),
     )
     .unwrap();
     let src_final = w.finish().unwrap();
@@ -1963,39 +1926,16 @@ fn test_phase_b_three_modality_round_trip() {
 
     // One CSR shard per modality.
     let (indptr, indices, values) = sample_shard_data();
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csr_shard_for(
-            atac_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
+    writer.write_csr_shard_for(adt_id, 0, shard).unwrap();
+    writer.write_csr_shard_for(atac_id, 0, shard).unwrap();
 
     let final_path = writer.finish().unwrap();
 
@@ -2100,18 +2040,15 @@ fn test_multimodal_shard_stats_use_per_modality_n_vars() {
     }
 
     let (indptr, indices, values) = sample_shard_data();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
     for (id, _) in expected {
-        writer
-            .write_csr_shard_for(
-                id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
     }
 
     let final_path = writer.finish().unwrap();
@@ -2238,41 +2175,18 @@ fn test_phase_b_per_modality_csc() {
     writer.set_modality_n_vars(adt_id, 50).unwrap();
 
     let (indptr, indices, values) = sample_shard_data();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
     // RNA gets a CSR shard only.
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
     // ADT gets BOTH CSR and CSC.
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csc_shard_for(
-            adt_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    writer.write_csr_shard_for(adt_id, 0, shard).unwrap();
+    writer.write_csc_shard_for(adt_id, 0, shard).unwrap();
 
     let final_path = writer.finish().unwrap();
     let reader = ScxReader::open(&final_path).unwrap();
@@ -2340,28 +2254,15 @@ fn test_phase_b3_auto_emit_csc() {
     // `build_csc=true`, so only its CSC sidecar should
     // auto-emit.
     let (indptr, indices, values) = sample_shard_data();
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
+    writer.write_csr_shard_for(adt_id, 0, shard).unwrap();
 
     let final_path = writer.finish().unwrap();
     let reader = ScxReader::open(&final_path).unwrap();
@@ -2430,29 +2331,16 @@ fn test_phase_b4_read_csc_columns_for() {
     writer.write_var_for(adt_id, &sample_var()).unwrap();
 
     let (indptr, indices, values) = sample_shard_data();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
     // Both modalities get one CSC shard at col_start=0.
-    writer
-        .write_csc_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csc_shard_for(
-            adt_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    writer.write_csc_shard_for(rna_id, 0, shard).unwrap();
+    writer.write_csc_shard_for(adt_id, 0, shard).unwrap();
 
     let final_path = writer.finish().unwrap();
     let reader = ScxReader::open(&final_path).unwrap();
@@ -2700,20 +2588,10 @@ fn preencoded_and_verbatim_shards_accumulate_per_modality_stats() {
 
     // rna: parallel/pre-encoded path.
     let f32_vals: Vec<f32> = values.iter().map(|&v| v as f32).collect();
-    let pre = crate::encoder::encode_one_shard(
-        &indptr,
-        &indices,
-        &f32_vals,
-        Some(CodecId::None),
-        0,
-        50,
-        0,
-        SectionType::CsrShard,
-        ModalityType::Rna,
-        "X/rna/shard_0".to_string(),
-        None,
-    )
-    .unwrap();
+    let mut pre_opts =
+        crate::encoder::EncodeShardOptions::new("X/rna/shard_0", SectionType::CsrShard, 50, 0, 0);
+    pre_opts.explicit_codec = Some(CodecId::None);
+    let pre = crate::encoder::encode_one_shard(&indptr, &indices, &f32_vals, &pre_opts).unwrap();
     let pre_nnz = pre.nnz;
     writer
         .with_modality::<_, _, ScxError>(rna_id, |w| w.write_preencoded_shard(pre))
@@ -3030,32 +2908,19 @@ fn layer_csc_shards_are_column_major_end_to_end() {
     writer.set_modality_n_vars(rna_id, 50).unwrap();
 
     let (indptr, indices, values) = sample_shard_data();
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
     // Two layer CSC shards covering disjoint column ranges. Distinct starts
     // are the point: a row-axis stat collapses both to 0.
     for col_start in [0u64, 20] {
         writer
-            .write_layer_csc_shard_for(
-                rna_id,
-                "counts",
-                (col_start / 20) as u32,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                col_start,
-            )
+            .write_layer_csc_shard_for(rna_id, "counts", (col_start / 20) as u32, col_start, shard)
             .unwrap();
     }
 
@@ -3179,18 +3044,15 @@ fn bulk_csr_shard_column_stats_refuses_a_multimodal_file() {
     // One CSR shard per modality, both covering the same obs rows — the
     // multimodal layout. Neither is a modality-0 entry.
     let (indptr, indices, values) = sample_shard_data();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
     for m in [rna_id, adt_id] {
-        writer
-            .write_csr_shard_for(
-                m,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        writer.write_csr_shard_for(m, 0, shard).unwrap();
     }
 
     // An index built over the single global obs axis produces one stat vec per

@@ -938,16 +938,15 @@ fn write_modality_csr_shards(
         shard_target_rows,
         value_encoding,
         |_shard_idx, row_start, shard_indptr, shard_indices, raw_values| {
+            let shard = scx_format_io::ShardBuffers::new(
+                shard_indptr,
+                shard_indices,
+                raw_values,
+                codec_id,
+                value_encoding,
+            );
             writer
-                .write_csr_shard_for(
-                    modality_id,
-                    shard_indptr,
-                    shard_indices,
-                    raw_values,
-                    codec_id,
-                    value_encoding,
-                    row_start,
-                )
+                .write_csr_shard_for(modality_id, row_start, shard)
                 .map_err(ConvertError::from)
         },
     )
@@ -981,6 +980,12 @@ fn write_modality_csc_shards_from_csr(
         indices.to_vec(),
         data.to_vec(),
     );
+    let sidecar_opts = scx_format_io::CscSidecarOptions {
+        cols_per_shard: csc_cols_per_shard,
+        memory_budget_bytes: crate::budget::csc_sidecar_bytes(memory_budget) as usize,
+        modality_id: Some(modality_id),
+        framing, // frame the CSC sidecar to match the v4 default (None = v3)
+    };
     scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
@@ -988,10 +993,7 @@ fn write_modality_csc_shards_from_csr(
         n_vars,
         value_encoding,
         codec_id,
-        csc_cols_per_shard,
-        crate::budget::csc_sidecar_bytes(memory_budget) as usize,
-        Some(modality_id),
-        framing, // frame the CSC sidecar to match the v4 default (None = v3)
+        sidecar_opts,
     )?;
     Ok(())
 }
@@ -1019,18 +1021,15 @@ fn write_modality_layer_shards(
         shard_target_rows,
         value_encoding,
         |shard_idx, row_start, shard_indptr, shard_indices, raw_values| {
+            let shard = scx_format_io::ShardBuffers::new(
+                shard_indptr,
+                shard_indices,
+                raw_values,
+                codec_id,
+                value_encoding,
+            );
             writer
-                .write_layer_csr_shard_for(
-                    modality_id,
-                    layer_name,
-                    shard_idx,
-                    shard_indptr,
-                    shard_indices,
-                    raw_values,
-                    codec_id,
-                    value_encoding,
-                    row_start,
-                )
+                .write_layer_csr_shard_for(modality_id, layer_name, shard_idx, row_start, shard)
                 .map_err(ConvertError::from)
         },
     )

@@ -305,6 +305,12 @@ pub(crate) fn write_csc_shards_from_owned(
     );
 
     // Shared transpose-and-write loop (single-modality → modality_id None).
+    let csc_opts = scx_format_io::CscSidecarOptions {
+        cols_per_shard: csc_cols_per_shard,
+        memory_budget_bytes: scx_convert::csc_sidecar_bytes(memory_budget) as usize,
+        modality_id: None,
+        framing,
+    };
     scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
@@ -312,10 +318,7 @@ pub(crate) fn write_csc_shards_from_owned(
         n_vars,
         value_encoding,
         codec_id,
-        csc_cols_per_shard,
-        scx_convert::csc_sidecar_bytes(memory_budget) as usize,
-        None,
-        framing,
+        csc_opts,
     )
 }
 
@@ -415,20 +418,17 @@ pub(crate) fn parallel_encode_csr_shards(
                 // canonical (the common case); only materialize + canonicalize
                 // a genuinely non-canonical shard.
                 let encode = |indptr: &[u64], indices: &[u32], data: &[f32]| {
-                    scx_format_io::encode_one_shard(
-                        indptr,
-                        indices,
-                        data,
-                        explicit_codec,
-                        index_dtype,
-                        n_vars,
-                        b.row_start as u64,
-                        section_type,
-                        ModalityType::Rna,
+                    let mut enc_opts = scx_format_io::EncodeShardOptions::new(
                         name.clone(),
-                        framing,
-                    )
-                    .map_err(|e| e.to_string())
+                        section_type,
+                        n_vars as u64,
+                        b.row_start as u64,
+                        index_dtype,
+                    );
+                    enc_opts.explicit_codec = explicit_codec;
+                    enc_opts.framing = framing;
+                    scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts)
+                        .map_err(|e| e.to_string())
                 };
                 if scx_sparse::is_canonical_csr(&shard_indptr, &shard_indices, data_borrow) {
                     encode(&shard_indptr, &shard_indices, data_borrow)

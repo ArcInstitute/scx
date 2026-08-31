@@ -77,7 +77,14 @@ fn prescan_rice_blocks(
 /// The bitstream is uploaded to GPU, metadata is pre-scanned on CPU,
 /// and the kernel is launched with one thread per Rice block (256 values).
 ///
-/// Produces **bit-identical** output to `scx_codec::rice::rice_decode`.
+/// Bit-identical to `scx_codec::rice::rice_decode` for well-formed input. A
+/// stream that runs past the encoded data is caught by
+/// `prescan_rice_blocks`'s validation before the kernel launches (returns
+/// `Err`, matching CPU). Two CPU-side corruption checks are not mirrored
+/// here, though: a non-zero reserved high nibble in the block header is
+/// silently masked rather than rejected, and a value that would overflow
+/// `u32` is not range-checked before the kernel's 32-bit `(q << k) | r`,
+/// which wraps silently instead of erroring.
 pub fn rice_decode_gpu(
     dev: &GpuDevice,
     data: &[u8],

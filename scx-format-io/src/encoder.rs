@@ -28,6 +28,54 @@ enum FramedPick {
     V2(DecodeTarget),
 }
 
+/// Options and metadata for encoding a single CSR shard via
+/// [`encode_one_shard`] / [`encode_one_shard_from_bytes`].
+#[derive(Debug, Clone)]
+pub struct EncodeShardOptions {
+    pub explicit_codec: Option<CodecId>,
+    pub index_dtype: u8,
+    pub n_vars: u64,
+    pub global_row_offset: u64,
+    pub section_type: SectionType,
+    pub modality_type: ModalityType,
+    pub name: String,
+    pub framing: Option<FramingConfig>,
+    pub value_encoding: Option<ValueEncoding>,
+}
+
+impl EncodeShardOptions {
+    /// `index_dtype` is a required argument, not a field set after
+    /// construction: it is a correctness-required, file-wide choice (u16 vs
+    /// u32 index packing) with no safe default — silently defaulting it to
+    /// `0` let a forgetful call site encode u16 indices for a file with
+    /// `n_vars > 65535` with no error. Pass the same value every existing
+    /// call site already derives (typically `if n_vars <= 65535 { 0 } else
+    /// { 1 }`, or an input file's carried `index_dtype`).
+    ///
+    /// There is deliberately no `Default` impl: one would have to pick a
+    /// value for `index_dtype`, reopening exactly the hazard above via
+    /// `EncodeShardOptions { n_vars: 70_000, ..Default::default() }`.
+    pub fn new(
+        name: impl Into<String>,
+        section_type: SectionType,
+        n_vars: u64,
+        global_row_offset: u64,
+        index_dtype: u8,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            section_type,
+            n_vars,
+            global_row_offset,
+            index_dtype,
+            explicit_codec: None,
+            modality_type: ModalityType::Rna,
+            framing: None,
+            value_encoding: None,
+        }
+    }
+}
+
 /// Encode a single shard's CSR triplet into a `PreEncodedSection`
 /// ready for sequential write via
 /// [`crate::ScxWriter::write_preencoded_shard`].
@@ -56,10 +104,20 @@ enum FramedPick {
 /// (`0` → u16 indices, `1` → u32). This drives the codec's index
 /// packing path and is recorded in the shard header for the reader.
 ///
+/// `opts.value_encoding`: when `Some(enc)`, the shard's values are encoded
+/// with `enc` instead of the per-shard auto-detected narrowest encoding —
+/// this is what lets a parallel encode reproduce a *file-wide* value
+/// encoding and thus produce byte-identical output to a path that fixed
+/// the encoding up front (e.g. `scx-ops` grouped-write fast path vs.
+/// `CsrEmitter`). `None` preserves the auto-detect behaviour. The
+/// byte-oriented [`encode_one_shard_from_bytes`] sibling takes its value
+/// encoding from its own `shard_value_encoding` argument instead and does
+/// **not** consult this field.
+///
 /// # Examples
 ///
 /// ```
-/// use scx_format_io::encoder::encode_one_shard;
+/// use scx_format_io::encoder::{encode_one_shard, EncodeShardOptions};
 /// use scx_format_io::section::SectionType;
 /// use scx_format_io::modality::ModalityType;
 ///
@@ -67,69 +125,16 @@ enum FramedPick {
 /// let indptr = [0u64, 2];
 /// let indices = [0u32, 2];
 /// let values = [1.0f32, 3.0];
-/// let section = encode_one_shard(
-///     &indptr, &indices, &values, None, 1, 3, 0,
-///     SectionType::CsrShard, ModalityType::Rna, "X".to_string(),
-///     None, // framing: unframed
-/// )
-/// .unwrap();
+/// let mut opts = EncodeShardOptions::new("X", SectionType::CsrShard, 3, 0, 1);
+/// opts.modality_type = ModalityType::Rna;
+/// let section = encode_one_shard(&indptr, &indices, &values, &opts).unwrap();
 /// assert!(section.section_length > 0);
 /// ```
-#[allow(clippy::too_many_arguments)]
 pub fn encode_one_shard(
     shard_indptr: &[u64],
     shard_indices: &[u32],
     shard_values: &[f32],
-    explicit_codec: Option<CodecId>,
-    index_dtype: u8,
-    n_vars: u32,
-    global_row_offset: u64,
-    section_type: SectionType,
-    modality_type: ModalityType,
-    name: String,
-    framing: Option<FramingConfig>,
-) -> Result<PreEncodedSection, ScxError> {
-    // Default: auto-detect the value encoding per shard (the narrowest that fits
-    // this shard's values). Callers needing a caller-fixed encoding (e.g. the
-    // sort engine's file-wide encoding, for byte-identical output) use
-    // [`encode_one_shard_with_value_encoding`].
-    encode_one_shard_with_value_encoding(
-        shard_indptr,
-        shard_indices,
-        shard_values,
-        explicit_codec,
-        index_dtype,
-        n_vars,
-        global_row_offset,
-        section_type,
-        modality_type,
-        name,
-        framing,
-        None,
-    )
-}
-
-/// Like [`encode_one_shard`], but with an optional caller-supplied
-/// `value_encoding` override. When `Some(enc)`, the shard's values are encoded
-/// with `enc` instead of the per-shard auto-detected narrowest encoding — this
-/// is what lets a parallel encode reproduce a *file-wide* value encoding and
-/// thus produce byte-identical output to a path that fixed the encoding up
-/// front (e.g. `scx-ops` grouped-write fast path vs. `CsrEmitter`). `None`
-/// preserves the auto-detect behaviour.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_one_shard_with_value_encoding(
-    shard_indptr: &[u64],
-    shard_indices: &[u32],
-    shard_values: &[f32],
-    explicit_codec: Option<CodecId>,
-    index_dtype: u8,
-    n_vars: u32,
-    global_row_offset: u64,
-    section_type: SectionType,
-    modality_type: ModalityType,
-    name: String,
-    framing: Option<FramingConfig>,
-    value_encoding: Option<ValueEncoding>,
+    opts: &EncodeShardOptions,
 ) -> Result<PreEncodedSection, ScxError> {
     // Enforce the canonical-CSR contract in debug builds. Release builds
     // trust the caller (callers canonicalize upstream); this catches a
@@ -142,8 +147,9 @@ pub fn encode_one_shard_with_value_encoding(
     );
 
     // 3. Determine value encoding (caller override wins) and encode values.
-    let shard_value_encoding: ValueEncoding =
-        value_encoding.unwrap_or_else(|| detect_value_encoding(shard_values));
+    let shard_value_encoding: ValueEncoding = opts
+        .value_encoding
+        .unwrap_or_else(|| detect_value_encoding(shard_values));
     let shard_values_bytes = values_to_raw_bytes(shard_values, shard_value_encoding)?;
 
     // The remaining steps (codec selection, framed/unframed encode, block index,
@@ -155,14 +161,7 @@ pub fn encode_one_shard_with_value_encoding(
         shard_indices,
         &shard_values_bytes,
         shard_value_encoding,
-        explicit_codec,
-        index_dtype,
-        n_vars,
-        global_row_offset,
-        section_type,
-        modality_type,
-        name,
-        framing,
+        opts,
     )
 }
 
@@ -171,34 +170,25 @@ pub fn encode_one_shard_with_value_encoding(
 /// [`ValueEncoding`]. This is the shared adaptive core — codec selection
 /// (heuristic or explicit), row-group framing with the `auto`/`compact` adaptive
 /// [`pick_codec_v2`] bias (or `compact-trial` dual-encode), block index,
-/// checksums, and shard stats — reused by the f32 entry points
-/// ([`encode_one_shard`] / [`encode_one_shard_with_value_encoding`]) and by
-/// callers that hold raw bytes directly (e.g. rscx, which serializes counts
+/// checksums, and shard stats — reused by the f32 entry point
+/// ([`encode_one_shard`]) and by callers that hold raw bytes directly (e.g. rscx, which serializes counts
 /// f64→uN and would lose >2^24 counts on an f32 round-trip).
 ///
 /// `shard_values_bytes` MUST equal
 /// `values_to_raw_bytes(values, shard_value_encoding)` for canonical CSR values;
 /// the caller owns canonicalization (this fn does not re-validate, unlike the f32
 /// [`encode_one_shard`] debug assert).
-#[allow(clippy::too_many_arguments)]
 pub fn encode_one_shard_from_bytes(
     shard_indptr: &[u64],
     shard_indices: &[u32],
     shard_values_bytes: &[u8],
     shard_value_encoding: ValueEncoding,
-    explicit_codec: Option<CodecId>,
-    index_dtype: u8,
-    n_vars: u32,
-    global_row_offset: u64,
-    section_type: SectionType,
-    modality_type: ModalityType,
-    name: String,
-    framing: Option<FramingConfig>,
+    opts: &EncodeShardOptions,
 ) -> Result<PreEncodedSection, ScxError> {
-    let index_dtype_u16 = index_dtype == 0;
+    let index_dtype_u16 = opts.index_dtype == 0;
 
     // 4. Select codec (heuristic when not explicit).
-    let mut shard_codec = match explicit_codec {
+    let mut shard_codec = match opts.explicit_codec {
         Some(codec_id) => {
             if codec_id == CodecId::Scx1 && !shard_value_encoding.is_integer() {
                 CodecId::Zstd
@@ -206,7 +196,9 @@ pub fn encode_one_shard_from_bytes(
                 codec_id
             }
         }
-        None => select_codec_for_modality(shard_values_bytes, shard_value_encoding, modality_type),
+        None => {
+            select_codec_for_modality(shard_values_bytes, shard_value_encoding, opts.modality_type)
+        }
     };
 
     // 5–6. Encode shard + build block index. Two layouts:
@@ -227,7 +219,7 @@ pub fn encode_one_shard_from_bytes(
         shard_codec,
         shard_value_encoding,
         index_dtype_u16,
-        framing,
+        opts.framing,
     )?;
     shard_codec = chosen_codec;
     let mut block_index_bytes = Vec::new();
@@ -265,18 +257,27 @@ pub fn encode_one_shard_from_bytes(
     let block_index_rel_offset = add_u32(values_rel_offset, values_length, "block_index")?;
     let block_index_length = len_u32(block_index_bytes.len(), "block_index")?;
 
+    // `n_vars` is `u64` on `EncodeShardOptions` (matching `FileHeader`), but the
+    // shard header's `n_minor` is `u32` — mirror the same guard `ScxWriter`'s
+    // internal shard writers use rather than truncating silently, which would
+    // desync the header's column count from the `u64` value `compute_shard_stats`
+    // below records unchanged.
+    if opts.n_vars > u32::MAX as u64 {
+        return Err(ScxError::NVarsOverflow(opts.n_vars));
+    }
+
     let shard_header = ShardHeader {
         magic: SHARD_MAGIC,
         shard_format_version: shard_version,
         shard_type: 0, // CSR
         codec_id: shard_codec as u8,
         value_encoding: shard_value_encoding as u8,
-        index_dtype,
+        index_dtype: opts.index_dtype,
         reserved_flags: [0; 3],
         n_major,
-        n_minor: n_vars,
+        n_minor: opts.n_vars as u32,
         nnz,
-        global_offset: global_row_offset,
+        global_offset: opts.global_row_offset,
         indptr_rel_offset,
         indptr_length,
         indices_rel_offset,
@@ -312,9 +313,9 @@ pub fn encode_one_shard_from_bytes(
         shard_values_bytes,
         shard_value_encoding,
         MajorAxis::Row,
-        global_row_offset,
+        opts.global_row_offset,
         n_major as u64,
-        n_vars as u64,
+        opts.n_vars,
         nnz,
     );
 
@@ -325,23 +326,12 @@ pub fn encode_one_shard_from_bytes(
         section_checksum,
         section_length,
         stats,
-        name,
-        section_type,
+        name: opts.name.clone(),
+        section_type: opts.section_type,
         nnz,
     })
 }
 
-/// Frame a `CodecId::None` CSR shard into row-groups for codec-agnostic
-/// sub-shard random access.
-///
-/// Returns the re-framed **indptr sub-stream** (a concatenation of per-group
-/// *local-rebased* indptrs — each group `[r0, r1)` contributes `r1-r0+1` u64s
-/// starting at 0) and the multi-entry [`BlockIndex`]. The indices and values
-/// sub-streams are left contiguous (None stores them as fixed-width LE arrays,
-/// so a group's slice is `[indptr[r0]·w, indptr[r1]·w)`); their entry offsets
-/// point into those global streams. Groups are capped at `min(row_group_rows,
-/// MAX_BLOCK_ROWS)` rows. This is exactly the layout [`resolve_block_index`]
-/// validates and `scx_codec::decode_row_group` consumes.
 /// Config controlling row-group framing (F5-b). `row_group_rows` caps a group's
 /// row count; `target_nnz` (if set) additionally caps its nnz (byte/nnz-aware
 /// sizing, §4.3); `trial` selects the smaller of {heuristic winner,
@@ -374,7 +364,7 @@ pub fn encode_one_shard_from_bytes(
 /// `scx_ops::rewrite_helpers::copy_layers` both rely on this: they re-write
 /// shards at the codec read off the source header, and re-selection would
 /// silently defeat that.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramingConfig {
     pub row_group_rows: u32,
     pub target_nnz: Option<u64>,
@@ -409,24 +399,9 @@ fn framed_size(e: &EncodedShard) -> usize {
     e.indptr_bytes.len() + e.indices_bytes.len() + e.values_bytes.len()
 }
 
-/// Encode one shard and report the codec actually used.
+/// Encode a shard with adaptive codec selection under optional framing.
 ///
-/// This is the **single place the per-shard codec is finalised**, shared by
-/// [`encode_one_shard_from_bytes`] and [`crate::ScxWriter::write_csr_shard`] (via
-/// `write_shard_inner`) so both honour the codec intent axis identically. Two
-/// layouts, unchanged from the pre-extraction behaviour:
-///
-/// - **Unframed** (`framing` is `None` or `row_group_rows == 0`): monolithic
-///   per-stream encode plus a single whole-shard [`BlockIndex`] entry (or a
-///   `≤MAX_BLOCK_ROWS` split) with zero byte offsets — byte-identical to the
-///   legacy layout; shard v1.
-/// - **Row-group-framed**: each row group is encoded independently and the
-///   multi-entry [`BlockIndex`] records per-group byte offsets, enabling
-///   codec-agnostic sub-shard random access; shard v2.
-///
-/// `seed_codec` is a *candidate*, not a decision: the heuristic winner or an
-/// explicit force. When the framing config carries `decode_target` (the
-/// `auto` / `compact` intent profiles) or `trial` (`compact-trial`), an integer
+/// Under framing, when `fc.decode_target` is `auto` or `compact`, an integer
 /// shard is dual-encoded against `ShufDeltaZstd` and **the returned codec may
 /// differ from `seed_codec`**. With `decode_target: None` and `trial: false` —
 /// the `fast` profile, and every explicit codec — the returned codec always
@@ -454,8 +429,7 @@ pub fn encode_shard_adaptive(
                     codec,
                     value_encoding,
                     index_dtype_u16,
-                    fc.row_group_rows,
-                    fc.target_nnz,
+                    fc,
                 )
             };
             // Decide whether to trial-encode ShufDeltaZstd as a second candidate.
@@ -519,15 +493,14 @@ pub fn encode_shard_adaptive(
 }
 
 /// Encode a shard **row-group-framed** (F5-b):
-/// partition the major axis into groups (≤ `row_group_rows` rows and, if set,
-/// ≤ `target_nnz` nnz — always ≥1 row), encode each group independently as a
+/// partition the major axis into groups (≤ `framing.row_group_rows` rows and, if set,
+/// ≤ `framing.target_nnz` nnz — always ≥1 row), encode each group independently as a
 /// standalone sub-shard via [`encode_shard`], and concatenate the three
 /// sub-streams while recording per-group byte offsets in a multi-entry
 /// [`BlockIndex`]. Codec-agnostic: a group decodes via
 /// `scx_codec::decode_row_group` (→ the ordinary per-shard decoder). For
 /// `CodecId::None` this is byte-identical to the legacy contiguous layout with a
 /// framed indptr.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_shard_framed(
     indptr: &[u64],
     indices: &[u32],
@@ -535,8 +508,7 @@ pub fn encode_shard_framed(
     codec: CodecId,
     value_encoding: ValueEncoding,
     index_dtype_u16: bool,
-    row_group_rows: u32,
-    target_nnz: Option<u64>,
+    framing: FramingConfig,
 ) -> Result<(EncodedShard, BlockIndex), ScxError> {
     let n_rows = indptr.len().saturating_sub(1);
     // The group loop below runs once per row group, so zero rows means zero
@@ -553,8 +525,8 @@ pub fn encode_shard_framed(
         return Err(ScxError::ZeroRowFramedShard);
     }
     let w_v = value_encoding.byte_width();
-    let g = row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
-    let nnz_cap = target_nnz.unwrap_or(u64::MAX);
+    let g = framing.row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
+    let nnz_cap = framing.target_nnz.unwrap_or(u64::MAX);
 
     let mut indptr_stream: Vec<u8> = Vec::new();
     let mut indices_stream: Vec<u8> = Vec::new();
@@ -628,7 +600,6 @@ pub fn encode_shard_framed(
 #[cfg(test)]
 mod adaptive_codec_tests {
     use super::*;
-    use crate::modality::ModalityType;
     use scx_codec::CodecId;
 
     /// Framing emits one `BlockIndexEntry` per row group, so a zero-row shard
@@ -650,8 +621,10 @@ mod adaptive_codec_tests {
             CodecId::None,
             ValueEncoding::Uint8,
             false,
-            4,
-            None,
+            FramingConfig {
+                row_group_rows: 4,
+                ..Default::default()
+            },
         )
         .expect_err("framing a zero-row shard must be refused");
         assert!(
@@ -750,21 +723,11 @@ mod adaptive_codec_tests {
         n_cols: u32,
         framing: FramingConfig,
     ) -> PreEncodedSection {
-        encode_one_shard_with_value_encoding(
-            indptr,
-            indices,
-            values,
-            None, // auto-select heuristic
-            0,    // u16 indices
-            n_cols,
-            0,
-            SectionType::CsrShard,
-            ModalityType::Rna,
-            "X_shard_0".to_string(),
-            Some(framing),
-            Some(ValueEncoding::Uint8),
-        )
-        .expect("encode")
+        let mut opts =
+            EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, n_cols as u64, 0, 0);
+        opts.framing = Some(framing);
+        opts.value_encoding = Some(ValueEncoding::Uint8);
+        encode_one_shard(indptr, indices, values, &opts).expect("encode")
     }
 
     /// The `fast` profile resolves to `decode_target: None` — a plain heuristic
@@ -853,24 +816,13 @@ mod adaptive_codec_tests {
             decode_target: None,
         };
         for dt in [DecodeTarget::Auto, DecodeTarget::Storage] {
-            let sec = encode_one_shard_with_value_encoding(
-                &indptr,
-                &indices,
-                &values,
-                None,
-                0,
-                5000,
-                0,
-                SectionType::CsrShard,
-                ModalityType::Rna,
-                "X_shard_0".to_string(),
-                Some(FramingConfig {
-                    decode_target: Some(dt),
-                    ..base
-                }),
-                Some(ValueEncoding::Float32),
-            )
-            .expect("encode");
+            let mut opts = EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 5000, 0, 0);
+            opts.framing = Some(FramingConfig {
+                decode_target: Some(dt),
+                ..base
+            });
+            opts.value_encoding = Some(ValueEncoding::Float32);
+            let sec = encode_one_shard(&indptr, &indices, &values, &opts).expect("encode");
             assert_eq!(
                 sec.codec_id(),
                 CodecId::Pcodec as u8,
@@ -880,7 +832,7 @@ mod adaptive_codec_tests {
     }
 
     /// The byte-oriented [`encode_one_shard_from_bytes`] must produce a
-    /// byte-identical `PreEncodedSection` to the f32 [`encode_one_shard_with_value_encoding`]
+    /// byte-identical `PreEncodedSection` to the f32 [`encode_one_shard`]
     /// for the same canonical CSR + value encoding, proving the extraction is a
     /// no-op refactor. Checked across unframed, `fast`, and adaptive `auto`/`compact`
     /// framings so the shared adaptive core is exercised on both paths.
@@ -908,36 +860,12 @@ mod adaptive_codec_tests {
             }),
         ];
         for framing in framings {
-            let f32_sec = encode_one_shard_with_value_encoding(
-                &indptr,
-                &indices,
-                &values,
-                None,
-                0,
-                20000,
-                0,
-                SectionType::CsrShard,
-                ModalityType::Rna,
-                "X_shard_0".to_string(),
-                framing,
-                Some(enc),
-            )
-            .expect("f32 encode");
-            let bytes_sec = encode_one_shard_from_bytes(
-                &indptr,
-                &indices,
-                &bytes,
-                enc,
-                None,
-                0,
-                20000,
-                0,
-                SectionType::CsrShard,
-                ModalityType::Rna,
-                "X_shard_0".to_string(),
-                framing,
-            )
-            .expect("bytes encode");
+            let mut opts = EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 20000, 0, 0);
+            opts.framing = framing;
+            opts.value_encoding = Some(enc);
+            let f32_sec = encode_one_shard(&indptr, &indices, &values, &opts).expect("f32 encode");
+            let bytes_sec = encode_one_shard_from_bytes(&indptr, &indices, &bytes, enc, &opts)
+                .expect("bytes encode");
             assert_eq!(
                 f32_sec.section_checksum, bytes_sec.section_checksum,
                 "section checksum diverged for framing {framing:?}"
@@ -947,6 +875,26 @@ mod adaptive_codec_tests {
                 "section length diverged for framing {framing:?}"
             );
             assert_eq!(f32_sec.codec_id(), bytes_sec.codec_id());
+        }
+    }
+
+    /// `opts.n_vars` is `u64` (matching `FileHeader`), but the shard header's
+    /// `n_minor` is `u32`. A value past `u32::MAX` must be rejected with
+    /// `NVarsOverflow`, not silently truncated into a header/stats mismatch.
+    #[test]
+    fn n_vars_past_u32_max_is_rejected_not_truncated() {
+        let mut opts = EncodeShardOptions::new(
+            "X_shard_0",
+            SectionType::CsrShard,
+            u32::MAX as u64 + 1,
+            0,
+            1,
+        );
+        opts.value_encoding = Some(ValueEncoding::Uint8);
+        match encode_one_shard(&[0u64, 1], &[0u32], &[1.0f32], &opts) {
+            Err(ScxError::NVarsOverflow(n)) => assert_eq!(n, u32::MAX as u64 + 1),
+            Err(other) => panic!("expected NVarsOverflow, got {other:?}"),
+            Ok(_) => panic!("n_vars past u32::MAX must be refused, not truncated"),
         }
     }
 }

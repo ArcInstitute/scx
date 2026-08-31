@@ -436,10 +436,6 @@ const FRAMED_N_SHARDS: usize = 4;
 const FRAMED_ROW_GROUP_ROWS: u32 = 16;
 
 pub(crate) fn write_framed_fixture(path: &std::path::Path) {
-    use scx_format_io::modality::ModalityType;
-    use scx_format_io::SectionType;
-    use scx_format_io::{encode_one_shard, FramingConfig};
-
     let (n_obs, n_vars, n_shards, row_group_rows) = (
         FRAMED_N_OBS,
         FRAMED_N_VARS,
@@ -492,23 +488,19 @@ pub(crate) fn write_framed_fixture(path: &std::path::Path) {
             values.push(framed_expected(row as u64).1);
             indptr.push(*indptr.last().unwrap() + 1);
         }
-        let pre = encode_one_shard(
-            &indptr,
-            &indices,
-            &values,
-            Some(CodecId::None),
-            /*index_dtype = u16*/ 0,
-            n_vars as u32,
-            row_start as u64,
-            SectionType::CsrShard,
-            ModalityType::Rna,
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
             format!("X_shard_{s}"),
-            Some(FramingConfig {
-                row_group_rows,
-                ..Default::default()
-            }),
-        )
-        .unwrap();
+            scx_format_io::section::SectionType::CsrShard,
+            n_vars as u64,
+            row_start as u64,
+            0,
+        );
+        enc_opts.explicit_codec = Some(CodecId::None);
+        enc_opts.framing = Some(scx_format_io::FramingConfig {
+            row_group_rows,
+            ..Default::default()
+        });
+        let pre = scx_format_io::encode_one_shard(&indptr, &indices, &values, &enc_opts).unwrap();
         writer.write_preencoded_shard(pre).unwrap();
     }
     writer.finish().unwrap();

@@ -24,28 +24,47 @@ use crate::writer::ScxWriter;
 /// `cols_per_shard`.
 pub const DEFAULT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Configuration options for writing a CSC sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CscSidecarOptions {
+    /// Bounds each emitted shard's column count, together with
+    /// `memory_budget_bytes` (whichever is smaller).
+    pub cols_per_shard: usize,
+    pub memory_budget_bytes: usize,
+    /// - `None` → single-modality file; shards written via
+    ///   [`ScxWriter::write_csc_shard`] (`X_csc_shard_*`).
+    /// - `Some(id)` → multimodal file; shards written via
+    ///   [`ScxWriter::write_csc_shard_for`] under modality `id`.
+    pub modality_id: Option<u8>,
+    /// When `Some`, the emitted CSC shards are row-group-framed (shard v2,
+    /// column-major — the "row" axis is columns for CSC), enabling the
+    /// scattered per-gene-group CSC reader. When `None`, unframed (v1). This
+    /// overrides the writer's framing for the scope of the call and restores
+    /// it afterward, so CSC framing no longer depends on hidden writer state
+    /// (the caller need not `set_framing` first). The caller is responsible
+    /// for the file `format_version` being v4 when framing (see
+    /// `IngestOptions`/`from_anndata`).
+    pub framing: Option<FramingConfig>,
+}
+
+impl Default for CscSidecarOptions {
+    fn default() -> Self {
+        Self {
+            cols_per_shard: 5000,
+            memory_budget_bytes: DEFAULT_CSC_MEMORY_BYTES,
+            modality_id: None,
+            framing: None,
+        }
+    }
+}
+
 /// Stream a CSR→CSC transpose over `csr_shards` and write the result as a CSC
-/// sidecar, one shard per chunk, via the writer.
+/// sidecar, one shard per chunk, via the writer. See [`CscSidecarOptions`]
+/// for what each option controls.
 ///
-/// Each emitted shard's column count is bounded by `cols_per_shard` (or
-/// `memory_budget_bytes`, whichever is smaller). `csr_shards` must already be
-/// canonical — this helper does not sort/dedup/drop-zeros (callers do so
-/// upstream when their source requires it).
-///
-/// `modality_id`:
-/// - `None` → single-modality file; shards written via
-///   [`ScxWriter::write_csc_shard`] (`X_csc_shard_*`).
-/// - `Some(id)` → multimodal file; shards written via
-///   [`ScxWriter::write_csc_shard_for`] under modality `id`.
-///
-/// `framing`: when `Some`, the emitted CSC shards are row-group-framed (shard v2,
-/// column-major — the "row" axis is columns for CSC), enabling the scattered
-/// per-gene-group CSC reader. When `None`, unframed (v1). This overrides the
-/// writer's framing for the scope of this call and restores it afterward, so CSC
-/// framing no longer depends on hidden writer state (the caller need not
-/// `set_framing` first). The caller is responsible for the file `format_version`
-/// being v4 when framing (see `IngestOptions`/`from_anndata`).
-#[allow(clippy::too_many_arguments)]
+/// `csr_shards` must already be canonical — this helper does not
+/// sort/dedup/drop-zeros (callers do so upstream when their source requires
+/// it).
 pub fn write_csc_sidecar(
     writer: &mut ScxWriter,
     csr_shards: &[ScxCsr],
@@ -53,15 +72,12 @@ pub fn write_csc_sidecar(
     n_vars: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
-    cols_per_shard: usize,
-    memory_budget_bytes: usize,
-    modality_id: Option<u8>,
-    framing: Option<FramingConfig>,
+    opts: CscSidecarOptions,
 ) -> Result<(), ScxError> {
     // Scope framing to this batch: override, write, restore. CSC framing is thus
     // explicit per-call rather than dependent on prior `set_framing` state.
     let prev_framing = writer.framing();
-    writer.set_framing(framing);
+    writer.set_framing(opts.framing);
     let result = write_csc_sidecar_inner(
         writer,
         csr_shards,
@@ -69,15 +85,12 @@ pub fn write_csc_sidecar(
         n_vars,
         value_encoding,
         codec_id,
-        cols_per_shard,
-        memory_budget_bytes,
-        modality_id,
+        &opts,
     );
     writer.set_framing(prev_framing);
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn write_csc_sidecar_inner(
     writer: &mut ScxWriter,
     csr_shards: &[ScxCsr],
@@ -85,18 +98,18 @@ fn write_csc_sidecar_inner(
     n_vars: usize,
     value_encoding: ValueEncoding,
     codec_id: CodecId,
-    cols_per_shard: usize,
-    memory_budget_bytes: usize,
-    modality_id: Option<u8>,
+    opts: &CscSidecarOptions,
 ) -> Result<(), ScxError> {
     let mut iter = streaming_csr_to_csc_iter_with_cap(
         csr_shards,
         n_obs,
         n_vars,
-        memory_budget_bytes,
-        cols_per_shard,
+        opts.memory_budget_bytes,
+        opts.cols_per_shard,
     )
     .map_err(|e| ScxError::CscTranspose(e.to_string()))?;
+
+    let modality_id = opts.modality_id;
 
     loop {
         let col_start = iter.current_col_start() as u64;
@@ -120,16 +133,16 @@ fn write_csc_sidecar_inner(
         let csc_indices_u32: Vec<u32> = chunk.indices.iter().map(|&i| i as u32).collect();
         let raw_values = values_to_raw_bytes(&chunk.data, value_encoding)?;
 
+        let shard = crate::writer::ShardBuffers::new(
+            &csc_indptr_u64,
+            &csc_indices_u32,
+            &raw_values,
+            codec_id,
+            value_encoding,
+        );
+
         match modality_id {
-            Some(mid) => writer.write_csc_shard_for(
-                mid,
-                &csc_indptr_u64,
-                &csc_indices_u32,
-                &raw_values,
-                codec_id,
-                value_encoding,
-                col_start,
-            )?,
+            Some(mid) => writer.write_csc_shard_for(mid, col_start, shard)?,
             None => writer.write_csc_shard(
                 &csc_indptr_u64,
                 &csc_indices_u32,
@@ -188,10 +201,10 @@ mod tests {
             3,
             ValueEncoding::Uint8,
             CodecId::None,
-            8, // cols_per_shard ≥ n_cols → one CSC shard
-            DEFAULT_CSC_MEMORY_BYTES,
-            None,
-            None, // framing: unframed
+            CscSidecarOptions {
+                cols_per_shard: 8,
+                ..Default::default()
+            },
         )
         .unwrap();
         let final_path = writer.finish().unwrap();
@@ -249,10 +262,11 @@ mod tests {
                 4,
                 ValueEncoding::Uint8,
                 CodecId::ShufDeltaZstd,
-                8,
-                DEFAULT_CSC_MEMORY_BYTES,
-                None,
-                framing,
+                CscSidecarOptions {
+                    cols_per_shard: 8,
+                    framing,
+                    ..Default::default()
+                },
             )
             .unwrap();
             // Framing is call-scoped: the writer's framing is restored afterward.

@@ -456,18 +456,21 @@ pub(crate) fn write_csr_shards_auto(
             .collect();
         let shard_values = &data[idx_start..idx_end];
 
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+            format!("X_shard_{shard_idx}"),
+            SectionType::CsrShard,
+            n_vars as u64,
+            row_offset as u64,
+            index_dtype,
+        );
+        enc_opts.explicit_codec = explicit_codec;
+        enc_opts.modality_type = modality_type;
+        enc_opts.framing = framing;
         let pre = scx_format_io::encode_one_shard(
             &shard_indptr,
             &shard_indices,
             shard_values,
-            explicit_codec,
-            index_dtype,
-            n_vars,
-            row_offset as u64,
-            SectionType::CsrShard,
-            modality_type,
-            format!("X_shard_{shard_idx}"),
-            framing,
+            &enc_opts,
         )?;
         writer.write_preencoded_shard(pre)?;
 
@@ -1491,28 +1494,22 @@ mod tests {
         let indptr = vec![0u64, 1, 2, 3];
         let indices = vec![0u32, 1, 2];
         let values = vec![1u8, 2, 3];
-        writer
-            .write_csr_shard_for(
-                rna_id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                scx_codec::ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
-        writer
-            .write_csr_shard_for(
-                adt_id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                scx_codec::ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            scx_codec::ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            scx_codec::ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(adt_id, 0, shard).unwrap();
 
         if let Some(u) = &global_uns {
             writer.write_uns(u).unwrap();

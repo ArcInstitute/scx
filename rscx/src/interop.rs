@@ -1148,19 +1148,22 @@ fn write_csr_to_scx(
         // Route through the shared adaptive encoder so R participates in the
         // codec intent axis (cost-aware `auto`, `fast`, `compact`) identically to
         // pyscx/CLI. Byte-oriented so counts serialized f64→uN keep >2^24 values.
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+            format!("X_shard_{shard_idx}"),
+            SectionType::CsrShard,
+            n_vars as u64,
+            row_start as u64,
+            index_dtype,
+        );
+        enc_opts.explicit_codec = explicit_codec;
+        enc_opts.modality_type = ModalityType::Rna;
+        enc_opts.framing = framing;
         let section = encode_one_shard_from_bytes(
             &shard_indptr,
             &shard_indices,
             shard_values,
             value_encoding,
-            explicit_codec,
-            index_dtype,
-            n_vars as u32,
-            row_start as u64,
-            SectionType::CsrShard,
-            ModalityType::Rna,
-            format!("X_shard_{shard_idx}"),
-            framing,
+            &enc_opts,
         )
         .map_err(|e| Error::Other(format!("encode X shard {shard_idx} failed: {}", e)))?;
         writer
@@ -1225,6 +1228,15 @@ fn write_csc_shards_from_csr_r(
     let indices_i32: Vec<i32> = csr_indices.iter().map(|&v| v as i32).collect();
 
     let csr = scx_sparse::ScxCsr::new_unchecked((n_obs, n_vars), indptr_i64, indices_i32, data_f32);
+    let csc_opts = scx_format_io::csc_sidecar::CscSidecarOptions {
+        cols_per_shard: csc_cols_per_shard,
+        memory_budget_bytes: scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
+        modality_id: None,
+        // Keep the CSC sidecar's framing consistent with the CSR X shards (both
+        // framed under v4). The v4 write-guard exempts CscShard, so this is for
+        // layout parity with pyscx, not a correctness requirement.
+        framing,
+    };
     scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
@@ -1232,13 +1244,7 @@ fn write_csc_shards_from_csr_r(
         n_vars,
         value_encoding,
         codec_id,
-        csc_cols_per_shard,
-        scx_format_io::csc_sidecar::DEFAULT_CSC_MEMORY_BYTES,
-        None,
-        // Keep the CSC sidecar's framing consistent with the CSR X shards (both
-        // framed under v4). The v4 write-guard exempts CscShard, so this is for
-        // layout parity with pyscx, not a correctness requirement.
-        framing,
+        csc_opts,
     )
     .map_err(|e| Error::Other(format!("CSC sidecar write failed: {}", e)))
 }
@@ -1763,19 +1769,22 @@ fn from_seurat_multi_assay(
             // Adaptive framed encode per modality (name mirrors
             // `write_csr_shard_for`), then a modality-scoped preencoded write so
             // R's multimodal path shares the codec intent axis with pyscx/CLI.
+            let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                format!("X/{}/shard_{}", payload.name, shard_idx),
+                SectionType::CsrShard,
+                payload.n_vars as u64,
+                row_start as u64,
+                index_dtype,
+            );
+            enc_opts.explicit_codec = explicit_codec;
+            enc_opts.modality_type = payload.modality_type;
+            enc_opts.framing = framing;
             let section = encode_one_shard_from_bytes(
                 &shard_indptr,
                 &shard_indices,
                 shard_values,
                 payload.value_encoding,
-                explicit_codec,
-                index_dtype,
-                payload.n_vars as u32,
-                row_start as u64,
-                SectionType::CsrShard,
-                payload.modality_type,
-                format!("X/{}/shard_{}", payload.name, shard_idx),
-                framing,
+                &enc_opts,
             )
             .map_err(|e| Error::Other(format!("encode modality shard failed: {}", e)))?;
             writer
@@ -2177,19 +2186,22 @@ fn from_mae_impl(
             // Adaptive framed encode per modality (name mirrors
             // `write_csr_shard_for`), then a modality-scoped preencoded write so
             // R's multimodal path shares the codec intent axis with pyscx/CLI.
+            let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                format!("X/{}/shard_{}", payload.name, shard_idx),
+                SectionType::CsrShard,
+                payload.n_vars as u64,
+                row_start as u64,
+                index_dtype,
+            );
+            enc_opts.explicit_codec = explicit_codec;
+            enc_opts.modality_type = payload.modality_type;
+            enc_opts.framing = framing;
             let section = encode_one_shard_from_bytes(
                 &shard_indptr,
                 &shard_indices,
                 shard_values,
                 payload.value_encoding,
-                explicit_codec,
-                index_dtype,
-                payload.n_vars as u32,
-                row_start as u64,
-                SectionType::CsrShard,
-                payload.modality_type,
-                format!("X/{}/shard_{}", payload.name, shard_idx),
-                framing,
+                &enc_opts,
             )
             .map_err(|e| Error::Other(format!("encode modality shard failed: {}", e)))?;
             writer

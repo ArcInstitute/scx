@@ -1,7 +1,7 @@
 use super::*;
 use crate::provenance::ProvenanceEntry;
 use crate::shard::SHARD_HEADER_SIZE;
-use crate::writer::ScxWriter;
+use crate::writer::{ScxWriter, ShardBuffers};
 use arrow::array::{Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
@@ -1500,18 +1500,14 @@ fn test_layer_read() {
 
     // Write "raw" layer shard
     let (indptr, indices, values) = sample_shard_data(6, 10);
-    writer
-        .write_layer_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-            "raw",
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_layer_csr_shard("raw", 0, 0, shard).unwrap();
 
     writer.finish().unwrap();
 
@@ -2251,17 +2247,14 @@ fn open_with_shared_catalog_parses_the_modality_table() {
     writer.write_var_for(adt_id, &sample_var(2)).unwrap();
     writer.set_modality_n_vars(rna_id, 4).unwrap();
     writer.set_modality_n_vars(adt_id, 2).unwrap();
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &[0u64, 1, 2],
-            &[0u32, 1],
-            &[1u8, 2],
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let shard = ShardBuffers::new(
+        &[0u64, 1, 2],
+        &[0u32, 1],
+        &[1u8, 2],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
     writer.finish().unwrap();
 
     let primary = ScxReader::open(&path).unwrap();

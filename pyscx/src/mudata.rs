@@ -849,17 +849,15 @@ pub fn from_mudata_impl(
             let val_start = idx_start * value_byte_size;
             let val_end = idx_end * value_byte_size;
             let shard_values = &raw_values_bytes[val_start..val_end];
-
+            let shard = scx_format_io::ShardBuffers::new(
+                &shard_indptr,
+                &shard_indices,
+                shard_values,
+                codec_id,
+                value_encoding,
+            );
             writer
-                .write_csr_shard_for(
-                    modality_id,
-                    &shard_indptr,
-                    &shard_indices,
-                    shard_values,
-                    codec_id,
-                    value_encoding,
-                    row_offset as u64,
-                )
+                .write_csr_shard_for(modality_id, row_offset as u64, shard)
                 .map_err(to_pyerr)?;
 
             row_offset += shard_rows;

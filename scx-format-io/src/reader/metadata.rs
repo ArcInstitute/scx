@@ -7,7 +7,7 @@
 use super::*;
 
 /// Per-shard metadata stamped by the writer
-/// (see `crate::writer::stamp_dense_shard_metadata`). Parsed by the
+/// (see `crate::writer::stamp_dense_shard_meta`). Parsed by the
 /// sharded reader path to verify a contiguous, ordered cover of the
 /// logical matrix. Distinct from `crate::shard::ShardHeader`, which is
 /// the on-disk 76-byte CSR/CSC shard header.
@@ -772,7 +772,7 @@ impl ScxReader {
     /// Unlike CSR shards, `ObsmEmbeddingShard` catalog entries carry no
     /// `stats` block, so the per-shard row ranges live only in each
     /// shard's Arrow schema metadata (`row_start` / `n_shard_rows` /
-    /// `n_rows_total`, stamped by `writer::stamp_dense_shard_metadata`).
+    /// `n_rows_total`, stamped by `writer::stamp_dense_shard_meta`).
     /// We read each shard's IPC **footer schema only** (no batch
     /// deserialisation) and validate a contiguous, ordered cover with
     /// the same invariant as [`assemble_sharded_metadata`].
@@ -1643,7 +1643,7 @@ impl ScxReader {
     ///
     /// Concatenation is row-axis. The per-shard `shard_idx` /
     /// `row_start` / `n_shard_rows` / `n_rows_total` metadata stamped
-    /// by the writer (see `stamp_dense_shard_metadata`) is used to
+    /// by the writer (see `stamp_dense_shard_meta`) is used to
     /// verify that the catalog entries form a contiguous, ordered cover
     /// of the logical matrix; any gap, duplicate, mismatch, or missing
     /// metadata returns `ScxError::InvalidCatalog` rather than silently

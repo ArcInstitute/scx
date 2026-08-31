@@ -166,17 +166,15 @@ fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
 
     // --- a layer ---------------------------------------------------------
     let (l_indptr, l_indices, l_values) = csr_rows(0, N_OBS, N_VARS, 3);
+    let layer_shard = scx_format_io::ShardBuffers::new(
+        &l_indptr,
+        &l_indices,
+        &l_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
     writer
-        .write_layer_csr_shard(
-            &l_indptr,
-            &l_indices,
-            &l_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-            "spliced",
-            0,
-        )
+        .write_layer_csr_shard("spliced", 0, 0, layer_shard)
         .unwrap();
 
     // --- obsm / varm -----------------------------------------------------
@@ -341,17 +339,15 @@ pub fn fixture_with_csr_obsp(dir: &Path, name: &str) -> PathBuf {
         values.push((row + 1) as u8);
         indptr.push(indptr.last().unwrap() + 1);
     }
+    let shard = scx_format_io::ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
     writer
-        .write_obsp_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-            "connectivities",
-            0,
-        )
+        .write_obsp_shard("connectivities", 0, 0, shard)
         .unwrap();
     writer.finish().unwrap();
     path
@@ -555,17 +551,14 @@ pub fn fixture_multimodal_per_modality_obsp(dir: &Path, name: &str) -> PathBuf {
 
     for &(id, n_vars) in &ids {
         let (indptr, indices, values) = csr_rows(0, N_OBS, n_vars, 1);
-        writer
-            .write_csr_shard_for(
-                id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
     }
 
     // The point of the fixture: an obsp graph on the rna modality and none at
@@ -627,17 +620,14 @@ pub fn fixture_multimodal_both_obsp_scopes(dir: &Path, name: &str) -> PathBuf {
 
     for &(id, n_vars) in &ids {
         let (indptr, indices, values) = csr_rows(0, N_OBS, n_vars, 1);
-        writer
-            .write_csr_shard_for(
-                id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
     }
 
     let rna_id = ids[0].0;
