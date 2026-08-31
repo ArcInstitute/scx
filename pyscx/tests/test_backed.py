@@ -402,6 +402,8 @@ _MATRIX_SPECIALS = frozenset(
         "__getitem__",
         "__len__",
         "__array__",
+        "__eq__",
+        "__ne__",
         "__lt__",
         "__le__",
         "__gt__",
@@ -456,7 +458,20 @@ def test_handle_stubs_declare_every_runtime_special(cls_name):
     cls = getattr(pyscx, cls_name)
     body = _stub_class_body(cls_name)
 
-    runtime = {name for name in _MATRIX_SPECIALS if hasattr(cls, name)}
+    # `hasattr` is the wrong probe and was the bug in this test's first
+    # version: `object` supplies `__eq__`, `__ne__` and all four ordering
+    # slots, so `hasattr(cls, "__lt__")` is True for a class that implements no
+    # comparison at all. That blinded the check in both directions at once --
+    # it credited `ScxBackedObsmDataset` with comparisons it does not have
+    # (letting `obsm > 0` type-check and then raise) while the real
+    # `__eq__`/`__ne__` on the sparse classes went unnoticed. Count a special
+    # as implemented only when it is not the inherited slot.
+    runtime = {
+        name
+        for name in _MATRIX_SPECIALS
+        if getattr(cls, name, None) is not None
+        and getattr(cls, name, None) is not getattr(object, name, None)
+    }
     stubbed = {name for name in _MATRIX_SPECIALS if f"def {name}(" in body}
 
     assert runtime - stubbed == set(), (

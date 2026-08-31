@@ -1463,11 +1463,17 @@ impl ScxWriter {
     /// Record a `CsrShard`'s codec for the file-header default when the shard
     /// arrives as already-serialized bytes.
     ///
-    /// The byte-copy paths (`write_csr_shard_raw_copy*`, `copy_section_verbatim`)
-    /// never reach `write_shard_inner`, so without this a writer that populates
-    /// its CSR shards exclusively by copying — a merge, or the backed rewrite's
-    /// byte-passthrough branch — kept whatever placeholder the caller built the
-    /// header with. That is how a `codec_id = 0` header survives on top of
+    /// The byte-copy paths never reach `write_shard_inner`, so without this a
+    /// writer that populates its CSR shards exclusively by copying — a merge,
+    /// the backed rewrite's byte-passthrough branch, or `save_layer` — kept
+    /// whatever placeholder the caller built the header with.
+    ///
+    /// All three call it: `write_csr_shard_raw_copy*`, `copy_section_verbatim`,
+    /// and `write_raw_shard`. That last one is listed explicitly because an
+    /// earlier version of this comment named only the first two, and the
+    /// omission was then read as deliberate on the strength of the method's
+    /// name — it takes `section_type` as an argument, and `scx-engine` passes
+    /// `CsrShard` through it. Do not carve it back out. That is how a `codec_id = 0` header survives on top of
     /// compressed shards, i.e. it re-mints the very lie
     /// [`Self::first_csr_codec`] exists to stop, and passes it to the next
     /// consumer that trusts the file header.
