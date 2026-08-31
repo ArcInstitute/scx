@@ -230,27 +230,41 @@ workspace member enables `scx-convert/hdf5` by default — `scx-cli` declares
 `[tool.maturin] features`, which affects `maturin` and not `cargo test`). The
 h5ad / h5mu ingest, export and dataframe tests are
 `#[cfg(all(test, feature = "hdf5"))]`, so the line above runs none of them. They
-have their own CI job, `Test (hdf5 features)`:
+have their own CI job, `Test (hdf5 features)`. Locally the simple additive
+commands are fine (re-running the default-feature tests too costs nothing on a
+dev box):
 
 ```bash
 cargo test -p scx-convert --features hdf5
 cargo test -p scx-cli --features hdf5 -- --test-threads=1
 ```
 
+CI runs only the hdf5-**gated** subset instead — `--features hdf5` is additive,
+so the bare commands re-run ~296 tests the default `test` job already covered.
+The job skips scx-convert's 7 ungated module prefixes and selects scx-cli's 4
+hdf5-gated test binaries (`convert_stream`, `cellbender_cli`, `convert_subset`,
+`doublet_import_hdf5`); a dedup-guard step pins both selection lists against
+the crates' layout — and enforces the layout rule that hdf5-gated tests live in
+hdf5-gated homes — so a new hdf5-gated test cannot silently fall out of both
+lanes.
+
 (The concurrency *invariants* of the shared parallel drain are a separate,
 feature-free matter — `scx-convert/src/parallel_drain_tests.rs` is deliberately
 ungated and does run in the default workspace job. What the hdf5 lane adds is the
 coordinators' end-to-end behaviour against real libhdf5.)
 
-**`--test-threads=1` on the `scx-cli` suite is required, not tuning.** Those
-tests build an h5ad with `hdf5::File::create` in the test process and then spawn
-the `scx` binary to open it; run in parallel, sibling tests' open files make
-libhdf5 refuse the child's `H5Fopen` with
-`unable to lock file, errno = 11`. Measured on ext4: 11–13 of the 18 tests in
-`convert_stream.rs` fail that way in parallel, and all 18 pass serialised — so
-this is cargo's parallel harness, **not** a network-filesystem quirk.
-`scx-convert`'s suite is unaffected (its tests spawn no child processes) and runs
-in parallel.
+**`--test-threads=1` on the `scx-cli` hdf5 binaries is required, not tuning.**
+Those tests build an h5ad with `hdf5::File::create` in the test process and then
+spawn the `scx` binary to open it; run in parallel, sibling tests' open files
+make libhdf5 refuse the child's `H5Fopen` with
+`unable to lock file, errno = 11`. Measured on ext4: most of the tests in
+`convert_stream.rs` fail that way in parallel, and all pass serialised — so
+this is cargo's parallel harness, **not** a network-filesystem quirk. The lock
+serialization exists for the three binaries that reference the `hdf5` crate
+(`convert_stream`, `cellbender_cli`, `convert_subset`); `doublet_import_hdf5`
+never links it and merely rides in the same serialized invocation.
+`scx-convert`'s suite is unaffected (its tests spawn no child processes) and
+runs in parallel.
 
 `HDF5_USE_FILE_LOCKING=FALSE` also makes the suite pass, and is the convenient
 thing to do locally on a network filesystem (Weka / NFS / Lustre), where genuine
