@@ -3,7 +3,9 @@
 This file is intentionally narrow — currently it stubs `TrainingDataset`,
 `IndexPlanDataset`, and its iterator, since those are the most error-prone
 callers will run into (kwarg-heavy constructor, plan iterator protocol,
-batch dict schema).
+batch dict schema), plus the backed handle classes' materialization surface
+(`to_memory` / `toarray` / `tocsr` / `tocsc`), which is undiscoverable
+otherwise because `scipy.sparse.issparse` is False for a handle.
 
 Other pyscx symbols re-exported via `from .pyscx import *` are typed as
 `Any` to type-checkers until / unless someone needs more coverage.
@@ -583,6 +585,69 @@ class GroupShard:
     def __repr__(self) -> str: ...
 
 
+# ---------------------------------------------------------------------------
+# Backed handle classes — the lazy matrices that appear as `X`, a layer, or an
+# aligned value after `pyscx.open(path).to_anndata(backed=True)`.
+#
+# Stubbed for the materialization surface only, because that is what callers
+# reach for and what is otherwise undiscoverable: `scipy.sparse.issparse` is
+# False for these, so the usual "is this sparse?" reflex misroutes and nothing
+# points at `to_memory()`. See `pyscx.is_backed_handle`.
+# ---------------------------------------------------------------------------
+
+
+class ScxBackedSparseDataset:
+    """Lazy CSR handle over an SCX file's `X`."""
+
+    @property
+    def shape(self) -> Tuple[int, int]: ...
+    @property
+    def nnz(self) -> int: ...
+    def to_memory(self) -> Any: ...
+    def toarray(self) -> np.ndarray: ...
+    def tocsr(self) -> Any: ...
+    def tocsc(self) -> Any: ...
+
+
+class ScxBackedLayerDataset:
+    """Lazy CSR handle over one of an SCX file's layers."""
+
+    @property
+    def shape(self) -> Tuple[int, int]: ...
+    @property
+    def nnz(self) -> int: ...
+    def to_memory(self) -> Any: ...
+    def toarray(self) -> np.ndarray: ...
+    def tocsr(self) -> Any: ...
+    def tocsc(self) -> Any: ...
+
+
+class ScxBackedObsmDataset:
+    """Lazy handle over a dense aligned store (`obsm` / `varm`).
+
+    Dense, so it exposes no `tocsr` / `tocsc` / `nnz` — deliberately absent
+    rather than missing.
+    """
+
+    @property
+    def shape(self) -> Tuple[int, int]: ...
+    def to_memory(self) -> Any: ...
+    def toarray(self) -> np.ndarray: ...
+
+
+class ScxLazyTransformedDataset:
+    """Lazy handle carrying stacked transforms (e.g. normalize_total, log1p)."""
+
+    @property
+    def shape(self) -> Tuple[int, int]: ...
+    @property
+    def nnz(self) -> int: ...
+    def to_memory(self) -> Any: ...
+    def toarray(self) -> np.ndarray: ...
+    def tocsr(self) -> Any: ...
+    def tocsc(self) -> Any: ...
+
+
 class Experiment:
     """Handle to an open SCX file. Returned by `pyscx.open(path)`."""
 
@@ -855,6 +920,16 @@ class Experiment:
 
 def open(path: Any, verify: bool = ...) -> Experiment:  # noqa: A001
     """Open an SCX file as an `Experiment` handle."""
+    ...
+
+
+def is_backed_handle(obj: Any) -> bool:
+    """Is `obj` a lazy SCX handle rather than an in-memory matrix?
+
+    True for `ScxBackedSparseDataset`, `ScxBackedLayerDataset`,
+    `ScxBackedObsmDataset` and `ScxLazyTransformedDataset`. Note that
+    `scipy.sparse.issparse` is False for all of them.
+    """
     ...
 
 
