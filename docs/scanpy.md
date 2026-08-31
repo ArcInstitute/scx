@@ -1217,6 +1217,32 @@ Each access to `adata.X[rows, cols]` decompresses only the CSR shards that
 overlap the requested rows. For a 1M-cell file with 64 shards, slicing 1K
 cells touches ≤ 1 shard.
 
+### Testing whether a matrix is lazy: `pyscx.is_backed_handle`
+
+```python
+if pyscx.is_backed_handle(adata.X):
+    adata.X = adata.X.to_memory()   # scipy CSR
+```
+
+True for all four handle classes — `ScxBackedSparseDataset`,
+`ScxBackedLayerDataset`, `ScxBackedObsmDataset`,
+`ScxLazyTransformedDataset` — and False for anything already in memory.
+
+**Do not reach for `scipy.sparse.issparse` here.** It returns `False` for a
+handle and cannot be made to return `True`: scipy's `sparray` / `spmatrix` are
+concrete classes rather than ABCs, so there is no `register()` seam. Two
+consequences, neither of which raises:
+
+```python
+sp.issparse(adata.X)          # False  -> the usual guard takes the DENSE arm
+np.asarray(adata.X).shape     # ()     -> a 0-d object array, not an error
+```
+
+The dense arm is the wrong arm, and the 0-d array surfaces as an unrelated
+failure much later ("setting an array element with a sequence"). Slicing a
+handle *does* yield genuine scipy sparse, so `sp.issparse(adata.X[0:10])` is
+`True` — test the slice, or use this predicate on the matrix.
+
 ### Indexing patterns
 
 | Access | Behavior |

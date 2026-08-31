@@ -334,6 +334,24 @@ const HANDLE_CLASSES: [&str; 4] = [
     "ScxLazyTransformedDataset",
 ];
 
+/// Is `value` one of the [`HANDLE_CLASSES`]?
+///
+/// Backs the public `pyscx.is_backed_handle`. Kept beside the list it must
+/// agree with, since the two drift silently otherwise: a fifth handle class
+/// added to `HANDLE_CLASSES` would get its anndata seams registered while
+/// every caller branching on the predicate quietly took the wrong arm.
+/// `pyscx/tests/test_anndata_hooks_compat.py` asserts the two agree.
+///
+/// Not to be confused with [`crate::axis_align`]'s private `is_scx_handle`,
+/// which deliberately covers only the three `X`-shaped classes because its
+/// callers handle `ScxBackedObsmDataset` on a separate path.
+pub(crate) fn is_handle_class(value: &Bound<'_, PyAny>) -> bool {
+    value.cast::<ScxBackedSparseDataset>().is_ok()
+        || value.cast::<ScxBackedLayerDataset>().is_ok()
+        || value.cast::<ScxBackedObsmDataset>().is_ok()
+        || value.cast::<ScxLazyTransformedDataset>().is_ok()
+}
+
 /// One `singledispatch` seam: where it lives and which implementation it takes.
 struct Seam {
     module: &'static str,

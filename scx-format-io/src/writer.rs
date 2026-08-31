@@ -86,6 +86,25 @@ pub struct ScxWriter {
     #[cfg(feature = "deletion-vectors")]
     modality_bitmap_counts: Vec<u32>,
     total_nnz: u64,
+    /// Codec of the first `CsrShard` written, so [`Self::finish`] can stamp a
+    /// file-header `codec_id` that some shard actually uses.
+    ///
+    /// The file header's `codec_id` is a **default** and each shard header
+    /// overrides it (`docs/codec.md` §1), so nothing here can be true of every
+    /// shard once selection is adaptive. But it must not be an outright
+    /// fiction: callers construct the header before any shard is encoded and
+    /// therefore pass a placeholder — the streaming h5ad → SCX pipeline passes
+    /// `0` and documented this field as being "overwritten by
+    /// `ScxWriter::finish()` from running accumulators", which was never
+    /// implemented. Files consequently claimed `codec_id = 0` (`none`, raw
+    /// little-endian) over compressed shards. Any consumer that trusted the
+    /// file header then wrote raw: see `SourceCsrCodec` in
+    /// `pyscx/src/convert/scx_to_scx.rs`, where it cost an 8x file.
+    ///
+    /// Only `CsrShard` counts — the main matrix is what the file header
+    /// describes. Layers, CSC sidecars and obsp legitimately differ and carry
+    /// their own shard headers.
+    first_csr_codec: Option<u8>,
     has_obsm: bool,
     has_obsp: bool,
     /// Per-axis layout state for obs / var metadata. Mutually exclusive
@@ -302,6 +321,7 @@ impl ScxWriter {
             #[cfg(feature = "deletion-vectors")]
             modality_bitmap_counts: Vec::new(),
             total_nnz: 0,
+            first_csr_codec: None,
             has_obsm: false,
             has_obsp: false,
             obs_layout: ObsVarLayout::Pending,
@@ -389,6 +409,7 @@ impl ScxWriter {
             #[cfg(feature = "deletion-vectors")]
             modality_bitmap_counts: Vec::new(),
             total_nnz: 0,
+            first_csr_codec: None,
             has_obsm: false,
             has_obsp: false,
             obs_layout,
@@ -1163,6 +1184,15 @@ impl ScxWriter {
         let block_index_rel_offset = add_u32(values_rel_offset, values_length, "block_index")?;
         let block_index_length = len_u32(block_index_bytes.len(), "block_index")?;
 
+        // Record the main matrix's first codec for the file-header default.
+        // `chosen_codec`, not the caller's candidate: the candidate may have
+        // been overridden (Scx1 asked for on float data, or an adaptive trial
+        // picking ShufDeltaZstd), and a header naming a codec no shard uses is
+        // exactly the fiction this guards against. See `Self::first_csr_codec`.
+        if matches!(section_type, SectionType::CsrShard) && self.first_csr_codec.is_none() {
+            self.first_csr_codec = Some(chosen_codec as u8);
+        }
+
         let shard_header = ShardHeader {
             magic: crate::shard::SHARD_MAGIC,
             shard_format_version: shard_version,
@@ -1292,6 +1322,13 @@ impl ScxWriter {
         stats: ShardStats,
         nnz: u64,
     ) -> Result<()> {
+        // `section_type` is a parameter, not a fixed `RawCsrShard`: the only
+        // production caller (`scx-engine`'s `streaming_save_layer`, via
+        // `fused_ops`) byte-copies the MAIN matrix through here as
+        // `SectionType::CsrShard`. Skipping the stamp on the strength of the
+        // method's name left `save_layer` minting a `codec_id = 0` header over
+        // copied compressed shards. The helper still ignores `RawCsrShard`.
+        self.record_copied_csr_codec(section_type, raw_bytes);
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
@@ -1423,6 +1460,32 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Record a `CsrShard`'s codec for the file-header default when the shard
+    /// arrives as already-serialized bytes.
+    ///
+    /// The byte-copy paths never reach `write_shard_inner`, so without this a
+    /// writer that populates its CSR shards exclusively by copying — a merge,
+    /// the backed rewrite's byte-passthrough branch, or `save_layer` — kept
+    /// whatever placeholder the caller built the header with.
+    ///
+    /// All three call it: `write_csr_shard_raw_copy*`, `copy_section_verbatim`,
+    /// and `write_raw_shard`. That last one is listed explicitly because an
+    /// earlier version of this comment named only the first two, and the
+    /// omission was then read as deliberate on the strength of the method's
+    /// name — it takes `section_type` as an argument, and `scx-engine` passes
+    /// `CsrShard` through it. Do not carve it back out. That is how a `codec_id = 0` header survives on top of
+    /// compressed shards, i.e. it re-mints the very lie
+    /// [`Self::first_csr_codec`] exists to stop, and passes it to the next
+    /// consumer that trusts the file header.
+    fn record_copied_csr_codec(&mut self, section_type: SectionType, shard_bytes: &[u8]) {
+        if !matches!(section_type, SectionType::CsrShard) || self.first_csr_codec.is_some() {
+            return;
+        }
+        if let Ok(h) = ShardHeader::read_from(&mut &shard_bytes[..]) {
+            self.first_csr_codec = Some(h.codec_id);
+        }
+    }
+
     fn write_csr_shard_raw_copy_inner(
         &mut self,
         section_bytes: &[u8],
@@ -1430,6 +1493,7 @@ impl ScxWriter {
         stats: ShardStats,
     ) -> Result<()> {
         self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes)?;
+        self.record_copied_csr_codec(SectionType::CsrShard, section_bytes);
         self.write_padding()?;
         let shard_global_offset = self.current_offset;
         let section_length = section_bytes.len() as u64;
@@ -1467,6 +1531,15 @@ impl ScxWriter {
         self.guard_no_legacy_shard_in_v4(section.section_type, &section.header_buf)?;
         self.write_padding()?;
 
+        // Read off the serialized header before `section` is partially moved
+        // into the catalog entry below. This path never reaches
+        // `write_shard_inner` — the shard was encoded elsewhere (parallel
+        // encode, or the SCX → SCX rewrite) — so it is the only place the
+        // file-header default can learn this shard's codec.
+        // See `Self::first_csr_codec`.
+        let preencoded_csr_codec =
+            matches!(section.section_type, SectionType::CsrShard).then(|| section.codec_id());
+
         let shard_global_offset = self.current_offset;
 
         let w = self.writer()?;
@@ -1498,6 +1571,9 @@ impl ScxWriter {
             SectionType::CsrShard => {
                 self.csr_shard_count += 1;
                 self.total_nnz += section.nnz;
+                if self.first_csr_codec.is_none() {
+                    self.first_csr_codec = preencoded_csr_codec;
+                }
             }
             SectionType::CscShard => {
                 // CSC shards count toward `n_csc_shards` so that
@@ -1571,6 +1647,7 @@ impl ScxWriter {
         // A v4 file requires framed (shard v2) CSR-class shards; reject an
         // unframed verbatim copy into one.
         self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes)?;
+        self.record_copied_csr_codec(src_entry.section_type, raw_bytes);
 
         self.write_padding()?;
 
@@ -2543,6 +2620,19 @@ impl ScxWriter {
         // CsrShard `stats.nnz` (== each shard's `*indptr.last()`), and
         // each flag is presence-derived exactly as before.
         self.header.sync_from_catalog(&full_catalog);
+        // `sync_from_catalog` cannot derive `codec_id`: the catalog carries no
+        // codec, only the shard headers do. Stamp the codec a `CsrShard`
+        // actually used, replacing whatever placeholder the caller built the
+        // header with before any shard existed. Every path that emits a
+        // main-matrix CSR shard feeds this — encoded (`write_shard_inner`),
+        // pre-encoded (`write_preencoded_shard`), and byte-copied (via
+        // `record_copied_csr_codec`, from `write_csr_shard_raw_copy*`,
+        // `copy_section_verbatim` and `write_raw_shard`). Left alone only when
+        // the writer emitted no CSR shard at all (metadata-only files), where
+        // the caller's value is the only information available.
+        if let Some(codec_id) = self.first_csr_codec {
+            self.header.codec_id = codec_id;
+        }
         self.header.file_checksum = 0;
 
         // 4. Compute file checksum: hash header + root catalog from memory,

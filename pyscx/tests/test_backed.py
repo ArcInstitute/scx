@@ -297,3 +297,189 @@ def test_backed_cache_config(synthetic_adata, tmp_dir):
 
     # Both should return the same data
     np.testing.assert_array_equal(slice0.toarray(), slice16.toarray())
+
+
+# ---------------------------------------------------------------------------
+# is_backed_handle — the public "is this lazy?" predicate
+# ---------------------------------------------------------------------------
+
+
+def test_is_backed_handle_covers_all_four_handle_classes(tmp_dir):
+    """The predicate covers every handle class that can appear on an AnnData —
+    `X`, a layer, an aligned `obsm` store, and a lazily-transformed `X`.
+
+    These drift silently otherwise: a fifth handle class would get its anndata
+    seams registered (`HANDLE_CLASSES` in `pyscx/src/anndata_hooks.rs`) while
+    every caller branching on this predicate quietly took the wrong arm.
+    """
+    import anndata
+    import pyscx
+
+    rng = np.random.RandomState(1)
+    x = (rng.random_sample((60, 20)) * 100).astype(np.float32)
+    x[rng.random_sample((60, 20)) > 0.5] = 0.0
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(x),
+        layers={"counts": sp.csr_matrix(x)},
+        obsm={"X_emb": rng.random_sample((60, 4)).astype(np.float32)},
+    )
+    path = str(tmp_dir / "handles.scx")
+    pyscx.from_anndata(adata, path)
+
+    # `obsm=[…]` is what keeps an aligned store lazy; without it obsm
+    # materializes to an ndarray and the third assertion below would be vacuous.
+    backed = pyscx.open(path).to_anndata(backed=True, obsm=["X_emb"])
+    seen = {
+        type(backed.X).__name__,
+        type(backed.layers["counts"]).__name__,
+        type(backed.obsm["X_emb"]).__name__,
+    }
+    assert seen == {
+        "ScxBackedSparseDataset",
+        "ScxBackedLayerDataset",
+        "ScxBackedObsmDataset",
+    }, f"fixture no longer yields the three handle types, got {seen}"
+    assert pyscx.is_backed_handle(backed.X)
+    assert pyscx.is_backed_handle(backed.layers["counts"])
+    assert pyscx.is_backed_handle(backed.obsm["X_emb"])
+
+    # The fourth: stacking a lazy transform swaps X for a different class.
+    transformed = pyscx.open(path).to_anndata(backed=True)
+    pyscx.accel.normalize_total(transformed, target_sum=1e4)
+    assert type(transformed.X).__name__ == "ScxLazyTransformedDataset"
+    assert pyscx.is_backed_handle(transformed.X)
+
+
+def test_is_backed_handle_false_for_in_memory_matrices(adata_non_backed):
+    """A materialized matrix is not a handle — this is the whole point of the
+    predicate, so the negative case matters as much as the positive."""
+    import pyscx
+
+    x = adata_non_backed.X
+    assert not pyscx.is_backed_handle(x)
+    assert not pyscx.is_backed_handle(x.toarray())
+    assert not pyscx.is_backed_handle(None)
+    assert not pyscx.is_backed_handle("not a matrix")
+
+
+def test_issparse_is_false_on_the_handle_but_true_on_a_slice(adata_backed):
+    """Pins the trap the predicate exists for.
+
+    `scipy.sparse.issparse` cannot be made true for a handle — `sparray` /
+    `spmatrix` are concrete classes, not ABCs, so there is no `register()`
+    seam. The idiomatic `if sp.issparse(X)` guard therefore takes the *dense*
+    arm for a handle, silently. Slicing yields genuine scipy sparse, so the
+    reliable tests are: this predicate on the matrix, `issparse` on a slice.
+    """
+    import pyscx
+
+    x = adata_backed.X
+    assert pyscx.is_backed_handle(x)
+    assert not sp.issparse(x)
+    assert sp.issparse(x[0:5])
+    # And the documented escape from a handle to something `issparse` accepts.
+    assert sp.issparse(x.to_memory())
+
+
+def test_asarray_on_a_handle_returns_a_0d_object_array(adata_backed):
+    """The other half of the trap: `np.asarray` does not raise on a handle, it
+    returns a 0-d object array, so the failure surfaces far away from here."""
+    arr = np.asarray(adata_backed.X)
+    assert arr.shape == ()
+    assert arr.dtype == object
+
+
+# ---------------------------------------------------------------------------
+# The .pyi stubs vs the runtime classes
+# ---------------------------------------------------------------------------
+
+# Specials a caller can plausibly reach on a matrix-like handle. Anything in
+# this set that a Rust class implements must be declared in the stub, because
+# `__getattr__` does not reach special methods — Python looks them up on the
+# type, so an omitted one is a type error on documented usage (`X[0:10]`).
+_MATRIX_SPECIALS = frozenset(
+    {
+        "__getitem__",
+        "__len__",
+        "__array__",
+        "__eq__",
+        "__ne__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__matmul__",
+        "__rmatmul__",
+    }
+)
+
+_HANDLE_CLASSES_FOR_STUBS = (
+    "ScxBackedSparseDataset",
+    "ScxBackedLayerDataset",
+    "ScxBackedObsmDataset",
+    "ScxLazyTransformedDataset",
+)
+
+
+def _stub_class_body(cls_name):
+    """The lines of one `class <cls_name>:` block in `__init__.pyi`."""
+    import pathlib
+
+    import pyscx
+
+    pyi = pathlib.Path(pyscx.__file__).with_name("__init__.pyi")
+    text = pyi.read_text()
+    start = text.index(f"class {cls_name}:")
+    rest = text[start + 1 :]
+    # Ends at the next top-level `class `/`def ` declaration.
+    ends = [i for i in (rest.find("\nclass "), rest.find("\ndef ")) if i != -1]
+    return rest[: min(ends)] if ends else rest
+
+
+@pytest.mark.parametrize("cls_name", _HANDLE_CLASSES_FOR_STUBS)
+def test_handle_stubs_declare_every_runtime_special(cls_name):
+    """Both directions, because each failure mode is silent in its own way.
+
+    Missing a special the class really has → a type error on working code (the
+    `X[0:10]` regression). Declaring one it does not have → a type checker
+    green-lights a call that raises at runtime. The repo has no mypy gate, so
+    this pytest is what pins it.
+    """
+    import pyscx
+
+    cls = getattr(pyscx, cls_name)
+    body = _stub_class_body(cls_name)
+
+    # `hasattr` is the wrong probe and was the bug in this test's first
+    # version: `object` supplies `__eq__`, `__ne__` and all four ordering
+    # slots, so `hasattr(cls, "__lt__")` is True for a class that implements no
+    # comparison at all. That blinded the check in both directions at once --
+    # it credited `ScxBackedObsmDataset` with comparisons it does not have
+    # (letting `obsm > 0` type-check and then raise) while the real
+    # `__eq__`/`__ne__` on the sparse classes went unnoticed. Count a special
+    # as implemented only when it is not the inherited slot.
+    runtime = {
+        name
+        for name in _MATRIX_SPECIALS
+        if getattr(cls, name, None) is not None
+        and getattr(cls, name, None) is not getattr(object, name, None)
+    }
+    stubbed = {name for name in _MATRIX_SPECIALS if f"def {name}(" in body}
+
+    assert runtime - stubbed == set(), (
+        f"{cls_name} implements {sorted(runtime - stubbed)} but __init__.pyi "
+        "does not declare them; `__getattr__` does not cover special methods, "
+        "so these are type errors on valid code"
+    )
+    assert stubbed - runtime == set(), (
+        f"__init__.pyi declares {sorted(stubbed - runtime)} on {cls_name}, "
+        "which the Rust class does not implement"
+    )

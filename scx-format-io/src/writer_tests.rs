@@ -3210,3 +3210,158 @@ fn bulk_csr_shard_column_stats_refuses_a_multimodal_file() {
         "expected a loud refusal naming zero modality-0 shards, got {err:?}"
     );
 }
+
+/// `finish()` stamps the file-header `codec_id` from a codec a `CsrShard`
+/// actually used, rather than leaving the caller's pre-encode placeholder.
+///
+/// The header is only a *default* — each shard header overrides it
+/// (`docs/codec.md` §1) — but it must not be a fiction. Callers build the
+/// header before any shard is encoded, so they pass a placeholder: the
+/// streaming h5ad → SCX pipeline passes `0` and documented this field as
+/// "overwritten by `ScxWriter::finish()` from running accumulators", which was
+/// never implemented. Files therefore claimed `codec_id = 0` (`none`, raw
+/// little-endian) over compressed shards, and a consumer that trusted the file
+/// header re-encoded everything raw — an 8x file on a real dataset. See
+/// `SourceCsrCodec` in `pyscx/src/convert/scx_to_scx.rs`.
+#[test]
+fn finish_stamps_a_codec_some_csr_shard_actually_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("header_codec.scx");
+
+    // `sample_header()` carries codec_id = 0, standing in for the placeholder
+    // every streaming caller passes.
+    let header = sample_header();
+    assert_eq!(
+        header.codec_id,
+        CodecId::None as u8,
+        "premise: placeholder 0"
+    );
+
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = crate::ScxReader::open(&final_path).unwrap();
+    let entry = reader.catalog().csr_shards_sorted()[0];
+    let shard_codec = reader.read_shard_header(entry).unwrap().codec_id;
+
+    // Compared against the shard rather than a hardcoded id, so an adaptive
+    // override of the requested codec keeps the invariant meaningful.
+    assert_eq!(
+        reader.header().codec_id,
+        shard_codec,
+        "file-header codec_id {} does not match the CSR shard's {}",
+        reader.header().codec_id,
+        shard_codec
+    );
+    assert_ne!(
+        reader.header().codec_id,
+        CodecId::None as u8,
+        "placeholder 0 survived into a file whose shard is compressed"
+    );
+}
+
+/// The raw-copy path stamps the header too — not just `write_csr_shard`.
+///
+/// `write_csr_shard_raw_copy` (the merge path, `scx-ops/src/merge.rs`) and
+/// `copy_section_verbatim` (the backed rewrite's byte-passthrough) never reach
+/// `write_shard_inner`, so a writer whose CSR shards arrive only as copied
+/// bytes used to keep the caller's placeholder — re-minting the `codec_id = 0`
+/// lie over compressed shards that this PR exists to stop.
+#[test]
+fn raw_copy_paths_also_stamp_the_header_codec() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A source whose shard is genuinely Scx1.
+    let src_path = dir.path().join("raw_copy_src.scx");
+    let mut writer = ScxWriter::new(&src_path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let src_final = writer.finish().unwrap();
+
+    let reader = crate::ScxReader::open(&src_final).unwrap();
+    let entry = reader.catalog().csr_shards_sorted()[0];
+    let shard_codec = reader.read_shard_header(entry).unwrap().codec_id;
+    assert_ne!(
+        shard_codec,
+        CodecId::None as u8,
+        "premise: source is compressed"
+    );
+    let section_bytes = reader.read_raw_shard_bytes(entry).unwrap();
+    let stats = entry.stats.clone().unwrap();
+    let nnz = stats.nnz;
+
+    // Copy that shard into a writer whose header carries the placeholder.
+    let dst_path = dir.path().join("raw_copy_dst.scx");
+    let mut header = sample_header();
+    header.codec_id = CodecId::None as u8;
+    let mut dst = ScxWriter::new(&dst_path, header).unwrap();
+    dst.write_obs(&sample_obs()).unwrap();
+    dst.write_var(&sample_var()).unwrap();
+    dst.write_csr_shard_raw_copy(section_bytes, stats.clone(), nnz)
+        .unwrap();
+    let dst_final = dst.finish().unwrap();
+
+    let out = crate::ScxReader::open(&dst_final).unwrap();
+    assert_eq!(
+        out.header().codec_id,
+        shard_codec,
+        "raw-copy output header claims {} over a shard encoded {}",
+        out.header().codec_id,
+        shard_codec
+    );
+
+    // `write_raw_shard` is the other byte-copy entry point, and the one the
+    // round-2 review caught: it takes `section_type` as an ARGUMENT, and
+    // `scx-engine`'s `streaming_save_layer` passes `CsrShard` through it to
+    // copy the main matrix. Skipping the stamp because the method is *named*
+    // "raw" left `save_layer` re-minting the `codec_id = 0` lie.
+    let via_raw_path = dir.path().join("raw_copy_via_write_raw_shard.scx");
+    let mut header2 = sample_header();
+    header2.codec_id = CodecId::None as u8;
+    let mut dst2 = ScxWriter::new(&via_raw_path, header2).unwrap();
+    dst2.write_obs(&sample_obs()).unwrap();
+    dst2.write_var(&sample_var()).unwrap();
+    dst2.write_raw_shard(
+        section_bytes,
+        SectionType::CsrShard,
+        "X_shard_0",
+        stats,
+        nnz,
+    )
+    .unwrap();
+    let via_raw_final = dst2.finish().unwrap();
+
+    let out2 = crate::ScxReader::open(&via_raw_final).unwrap();
+    assert_eq!(
+        out2.header().codec_id,
+        shard_codec,
+        "write_raw_shard(CsrShard) output header claims {} over a shard \
+         encoded {}",
+        out2.header().codec_id,
+        shard_codec
+    );
+}

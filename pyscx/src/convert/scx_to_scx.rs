@@ -41,6 +41,82 @@ fn warn_source_raw_dropped(py: Python<'_>, src_reader: &ScxReader) -> PyResult<(
     Ok(())
 }
 
+/// How a source file's CSR shards are *actually* encoded.
+///
+/// The file header's `codec_id` is only a **default**: `ShardHeader::codec_id`
+/// "overrides file header" (`scx-format/src/shard.rs`), and `docs/codec.md` §1
+/// requires a reader to use the shard header, not the file header. Two
+/// consequences make the file header unsafe to inherit as an encode codec:
+///
+/// * a writer that selects per shard (`codec="auto"`, the default) leaves a
+///   file header that need not describe any shard; and
+/// * the streaming h5ad → SCX converter builds its header with a `0`
+///   placeholder and nothing ever replaces it, so its files claim
+///   `codec_id = 0` (`none`, raw little-endian) over genuinely compressed
+///   shards.
+///
+/// Inheriting that value re-encoded every shard **raw**. Measured on the
+/// 2026-08-29 Replogle artifact (966,728 × 6,143, nnz 2,671,238,445, file
+/// header `none`): dropping 537 rows turned a 2.19 GB source into a 10.85 GB
+/// output — 4 bytes/nnz, exactly its uncompressed size. A far larger subset of
+/// a *different* source whose header said `scx1` stayed compact, which is why
+/// the blowup looked like it depended on the subset.
+///
+/// So resolve the default against the shards themselves.
+struct SourceCsrCodec {
+    /// The first CSR shard's codec — a truthful *default* for the output
+    /// header, which is a hint rather than a per-shard contract.
+    first: Option<CodecId>,
+    /// Whether every CSR shard shares [`Self::first`]. When they differ, no
+    /// single codec describes the source and the adaptive per-shard heuristic
+    /// should choose again rather than have one imposed on it.
+    uniform: bool,
+}
+
+/// Read the source's CSR shard codecs.
+///
+/// Cheap: 76-byte shard-header reads off the mmap — the same reads the framing
+/// precondition in [`route_scx_backed_to_scx`] already performs.
+///
+/// `modality_id` scopes the scan when the wrapper addresses a single modality
+/// of a multimodal source. Without it, an RNA-`Scx1` / ADT-`Zstd` file reports
+/// non-uniform for *either* slice — safe (it falls back to adaptive) but blind
+/// to the fact that each modality is internally uniform.
+fn source_csr_codec(src_reader: &ScxReader, modality_id: Option<u8>) -> SourceCsrCodec {
+    let mut first: Option<CodecId> = None;
+    let mut uniform = true;
+    for entry in src_reader.catalog().entries.iter().filter(|e| {
+        matches!(e.section_type, SectionType::CsrShard)
+            && modality_id.is_none_or(|m| e.modality_id == m)
+    }) {
+        let Ok(shard) = src_reader.read_shard_header(entry) else {
+            // An unreadable shard header means we cannot claim uniformity;
+            // fall back to adaptive selection rather than guess.
+            return SourceCsrCodec {
+                first,
+                uniform: false,
+            };
+        };
+        let Some(codec) = CodecId::from_u8(shard.codec_id) else {
+            return SourceCsrCodec {
+                first,
+                uniform: false,
+            };
+        };
+        match first {
+            None => first = Some(codec),
+            // Nothing later can restore uniformity, and `first` is already
+            // recorded, so stop reading shard headers here.
+            Some(seen) if seen != codec => {
+                uniform = false;
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    SourceCsrCodec { first, uniform }
+}
+
 /// Route an AnnData with `adata.X = ScxBackedSparseDataset` through
 /// an SCX → SCX streaming writer.
 ///
@@ -103,10 +179,22 @@ pub(crate) fn route_scx_backed_to_scx(
     let (out_n_obs_visible, out_n_vars_visible) =
         (backed.shape_val.0 as u64, backed.shape_val.1 as u64);
 
+    // What the source's shards actually use, as opposed to what its file
+    // header claims. Needed before the passthrough gate below, not just for
+    // the encode codec. See `SourceCsrCodec`.
+    let src_shard_codec = source_csr_codec(&src_reader, modality_id);
+
     // Passthrough preconditions. Any false → fall through to
     // decode-encode.
     let target_codec_for_passthrough = match explicit_codec {
-        Some(c) => c as u8 == src_codec_id,
+        // An explicit codec has to hold for every shard we would copy
+        // verbatim. Comparing it against the *file header* let
+        // `codec="scx1"` pass through a source whose shards were half
+        // `zstd`, silently ignoring the request and returning a file that
+        // does not honour it. `codec="none"` — the GDS fast path — is where
+        // that matters most. A source with no CSR shard has nothing to copy,
+        // so `first == None` correctly refuses passthrough here.
+        Some(c) => src_shard_codec.uniform && src_shard_codec.first == Some(c),
         None => true,
     };
     let target_shard_rows_matches = if shard_size_overridden {
@@ -160,11 +248,26 @@ pub(crate) fn route_scx_backed_to_scx(
     // (preserves Scx1/Pcodec/etc — only override when the caller
     // passes `codec=`).
     let out_codec_id: u8 = if passthrough_ok {
-        src_codec_id
+        // Seed from the shards, not `src_codec_id`. This is only a
+        // pre-encode placeholder either way — `ScxWriter::finish` restamps it
+        // from the first CSR shard the writer sees, and on this branch that is
+        // the verbatim copy — but seeding it from the source's file header
+        // would mean carrying forward the very value the rest of this function
+        // argues is untrustworthy.
+        src_shard_codec
+            .first
+            .map(|c| c as u8)
+            .unwrap_or(src_codec_id)
     } else {
         match explicit_codec {
             Some(c) => c as u8,
-            None => src_codec_id,
+            // Deliberately NOT `src_codec_id`: a file-header codec need not
+            // describe any shard, and inheriting a `none` header wrote every
+            // shard raw. See `SourceCsrCodec`.
+            None => src_shard_codec
+                .first
+                .map(|c| c as u8)
+                .unwrap_or(src_codec_id),
         }
     };
     let out_shard_rows = if passthrough_ok {
@@ -251,12 +354,24 @@ pub(crate) fn route_scx_backed_to_scx(
 
     let n_vars_u32 = u32::try_from(out_n_vars)
         .map_err(|_| PyRuntimeError::new_err(format!("n_vars {out_n_vars} exceeds u32::MAX")))?;
-    // Pin the per-shard encode codec to the header's codec so the
-    // recorded `codec_id` and the actual shard encodings stay
-    // consistent. When the user passed an explicit codec we use it;
-    // otherwise we use the source's codec (which `out_codec_id` now
-    // mirrors).
-    let codec_for_encode = Some(codec_for_header);
+    // The codec every re-encoded shard is forced to. An explicit `codec=`
+    // wins outright. Otherwise the source's *shards* decide:
+    //
+    // * all CSR shards agree -> reuse it, which preserves a deliberate
+    //   `codec="none"` (the GDS fast path) and a uniform Scx1/Pcodec source;
+    // * they disagree, or the source has no readable CSR shard -> `None`, so
+    //   `encode_one_shard` re-runs the per-shard adaptive heuristic instead of
+    //   having one shard's choice imposed on every other shard.
+    //
+    // Pinning this to the *file header* is what produced the 5x blowup
+    // (`SourceCsrCodec`). The header stays a hint: per `docs/codec.md` §1 a
+    // reader takes each shard's codec from that shard's own header, so an
+    // adaptive mix needs no single header value to be true of every shard.
+    let codec_for_encode = match explicit_codec {
+        Some(_) => Some(codec_for_header),
+        None if src_shard_codec.uniform => src_shard_codec.first,
+        None => None,
+    };
 
     if passthrough_ok {
         // Byte-passthrough. Iterate source CSR shards in row order;
@@ -442,30 +557,36 @@ pub(crate) fn route_scx_lazy_to_scx(
     // Resolve `Auto` against the (lazy) source shape.
     let csc_build = csc_policy.should_build_csc(n_obs, n_vars);
 
-    // Default codec to the source SCX's choice when known (preserves
-    // Scx1 / Pcodec / etc through the rewrite). Falls back to Zstd
-    // when no source path is recorded (the lazy wrapper can in
-    // principle be built without one).
-    // Open the source once for both codec and format_version. The lazy
-    // per-shard re-encode applies value transforms only (no column reorder),
-    // so it preserves a canonical source but cannot canonicalize a pre-v3
-    // one — gate the v3 stamp on the source version.
+    // Open the source once for format_version. The lazy per-shard re-encode
+    // applies value transforms only (no column reorder), so it preserves a
+    // canonical source but cannot canonicalize a pre-v3 one — gate the v3
+    // stamp on the source version.
     let src_reader = lazy.source_path().and_then(|p| ScxReader::open(p).ok());
     if let Some(ref r) = src_reader {
         warn_source_raw_dropped(py, r)?;
     }
-    let src_header_meta: Option<(Option<CodecId>, u16)> = src_reader.as_ref().map(|r| {
-        (
-            CodecId::from_u8(r.header().codec_id),
-            r.header().format_version,
-        )
-    });
-    let src_codec: Option<CodecId> = src_header_meta.and_then(|(c, _)| c);
-    let src_format_version: u16 = src_header_meta
-        .map(|(_, v)| v)
+    let src_format_version: u16 = src_reader
+        .as_ref()
+        .map(|r| r.header().format_version)
         // Unframed rewrite fallback: the default (v3), not the max-readable v4.
         .unwrap_or(scx_format_io::DEFAULT_WRITE_FORMAT_VERSION);
-    let out_codec = explicit_codec.or(src_codec).unwrap_or(CodecId::Zstd);
+    // The source codec is NOT a default here, for two independent reasons.
+    //
+    // 1. It used to be read from the *file header*, which need not describe any
+    //    shard — the same defect `SourceCsrCodec` documents for the backed
+    //    route. A source whose header says `none` forced every transformed
+    //    shard to be written raw.
+    // 2. Even a truthful source codec is the wrong default on this route: the
+    //    transforms have already rewritten the values (`normalize_total` /
+    //    `log1p` produce f32 from integer counts), so the codec that suited the
+    //    source's integers does not suit the output's floats.
+    //
+    // So an explicit `codec=` wins, and otherwise each output shard re-selects
+    // adaptively from what it actually holds. The header value below is only the
+    // pre-encode placeholder; `ScxWriter::finish` restamps it from the first
+    // shard actually written.
+    let codec_for_encode = explicit_codec;
+    let out_codec = explicit_codec.unwrap_or(CodecId::Zstd);
     let index_dtype: u8 = if n_vars <= 65535 { 0 } else { 1 };
     let n_vars_u32 = u32::try_from(n_vars)
         .map_err(|_| PyRuntimeError::new_err(format!("n_vars {n_vars} exceeds u32::MAX")))?;
@@ -499,10 +620,8 @@ pub(crate) fn route_scx_lazy_to_scx(
 
     // Lazy transforms always force decode + encode. Iterate the
     // wrapper's user-visible shard boundaries so any deletion vector
-    // already applies. Pin per-shard encode codec to the header
-    // codec so the recorded `codec_id` and the actual encodings
-    // stay consistent.
-    let codec_for_encode = Some(out_codec);
+    // already applies. `codec_for_encode` was resolved above: explicit
+    // `codec=` or per-shard adaptive, never the source's file header.
     let bounds = compute_wrapper_boundaries_lazy(lazy, shard_target_rows);
     let adata_x = adata.getattr("X")?;
     for (i, (start, end)) in bounds.iter().enumerate() {

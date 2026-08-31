@@ -12,7 +12,7 @@
     "n_csr_shards": 16,
     "n_csc_shards": 0,
     "shard_target_rows": 4,
-    "codec_id": 0,
+    "codec_id": 2,
     "index_dtype": 0,
     "manifest_sequence": 1,
     "n_modalities": 0

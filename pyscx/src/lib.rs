@@ -173,6 +173,37 @@ fn open(path: &str, verify: bool) -> PyResult<PyExperiment> {
     Ok(PyExperiment::new(reader, std::path::PathBuf::from(path)))
 }
 
+/// Is `obj` a lazy SCX handle rather than an in-memory matrix?
+///
+/// True for every SCX handle class that can appear as ``X``, a layer, or an
+/// aligned value: ``ScxBackedSparseDataset``, ``ScxBackedLayerDataset``,
+/// ``ScxBackedObsmDataset`` and ``ScxLazyTransformedDataset``. False for
+/// anything else, including a scipy sparse matrix or a numpy array.
+///
+/// Use it to decide whether to materialize before handing a matrix to code
+/// that needs one in memory::
+///
+///     if pyscx.is_backed_handle(adata.X):
+///         adata.X = adata.X.to_memory()
+///
+/// **`scipy.sparse.issparse` is False for these handles**, and cannot be made
+/// true — scipy's ``sparray``/``spmatrix`` are concrete classes, not ABCs, so
+/// there is no ``register()`` seam. Two consequences worth knowing, because
+/// neither raises:
+///
+/// * the idiomatic ``if sp.issparse(X): ... else: <dense path>`` guard takes
+///   the dense arm for a handle, which is the wrong arm;
+/// * ``np.asarray(handle)`` returns a **0-dimensional object array** rather
+///   than failing, so the error surfaces much later and unrecognizably.
+///
+/// Slicing a handle *does* yield genuine scipy sparse, so the reliable test on
+/// a value you did not create is this predicate, and the reliable test on a
+/// slice is ``sp.issparse``. ``to_memory()`` converts a handle in full.
+#[pyfunction]
+fn is_backed_handle(obj: &Bound<'_, PyAny>) -> bool {
+    crate::anndata_hooks::is_handle_class(obj)
+}
+
 /// Validate section checksums (and, with `deep`, decode-level integrity) in an SCX file.
 ///
 /// Full user-facing documentation lives on the `pyscx.validate` Python
@@ -1032,6 +1063,7 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Core I/O
     m.add_function(wrap_pyfunction!(open, m)?)?;
+    m.add_function(wrap_pyfunction!(is_backed_handle, m)?)?;
     m.add_function(wrap_pyfunction!(validate, m)?)?;
     m.add_function(wrap_pyfunction!(from_anndata, m)?)?;
     #[cfg(feature = "hdf5")]
