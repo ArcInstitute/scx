@@ -13,6 +13,7 @@ deletions, column projection, and lazy transforms.
 """
 
 import json
+import os
 import warnings
 
 import anndata
@@ -449,3 +450,130 @@ def test_column_projection_uses_visible_n_vars(tmp_dir):
         out.to_anndata().X.toarray(),
         src_x[:, keep_idx],
     )
+
+
+# ---------------------------------------------------------------------------
+# Codec inherited from the source's SHARDS, not its file header
+# ---------------------------------------------------------------------------
+
+
+def _mixed_codec_source(tmp_dir, name="mixed_codec.scx", shard_size=100):
+    """An SCX file whose CSR shards do NOT all share one codec.
+
+    First half tiny counts, second half large ones, written unframed with a
+    small `shard_size`, so `select_codec`'s median rule lands some shards on
+    `scx1` and others on `zstd`.
+    """
+    import pyscx
+
+    rng = np.random.RandomState(7)
+    n_obs, n_vars = 800, 60
+    lo = rng.randint(1, 4, size=(n_obs // 2, n_vars)).astype(np.float32)
+    hi = rng.randint(20000, 60000, size=(n_obs // 2, n_vars)).astype(np.float32)
+    dense = np.vstack([lo, hi])
+    dense[rng.random_sample((n_obs, n_vars)) > 0.5] = 0.0
+    adata = anndata.AnnData(X=sp.csr_matrix(dense))
+    path = str(tmp_dir / name)
+    pyscx.from_anndata(adata, path, shard_size=shard_size, row_group_rows=0)
+    return path, n_obs
+
+
+def test_subset_rewrite_reselects_per_shard_for_a_mixed_codec_source(tmp_dir):
+    """A row subset must not force one codec onto every re-encoded shard.
+
+    The file header's `codec_id` is only a default — each shard header
+    overrides it (`docs/codec.md` §1) — so it cannot describe a source whose
+    shards were chosen adaptively. This path used to inherit it anyway and pin
+    every output shard to it. Both arms here are decode-encode (`shard_size`
+    overridden away from the source's, so neither can byte-passthrough), which
+    is what makes the comparison fair: a passthrough baseline would be copying
+    bytes and would show a difference that says nothing about encoding.
+    """
+    import pyscx
+
+    src, n_obs = _mixed_codec_source(tmp_dir)
+    backed = pyscx.open(src).to_anndata(backed=True)
+
+    no_subset = str(tmp_dir / "de_nosubset.scx")
+    pyscx.from_anndata(backed, no_subset, shard_size=128, row_group_rows=0)
+
+    keep = np.ones(n_obs, dtype=bool)
+    keep[0] = False
+    subset = str(tmp_dir / "de_subset.scx")
+    pyscx.from_anndata(backed[keep], subset, shard_size=128, row_group_rows=0)
+
+    a, b = os.path.getsize(no_subset), os.path.getsize(subset)
+    # Dropping one row of 800 must not change the encoded size materially.
+    assert b < a * 1.25, (
+        f"subset rewrite {b} is disproportionate to the same rewrite without a "
+        f"subset {a} (ratio {b / a:.2f}); a codec is being forced on shards it "
+        f"does not suit"
+    )
+
+
+def test_subset_rewrite_preserves_a_uniform_source_codec(tmp_dir, synthetic_adata):
+    """The converse guard: when every source shard agrees, keep that codec.
+
+    Resolving against the shards must not become "always re-select" — a source
+    written with an explicit codec should still round-trip through a subset
+    rewrite with that codec, including `none` (the GDS fast path), which a
+    blanket "ignore uninformative headers" rule would have silently compressed.
+    """
+    import pyscx
+
+    for codec, expected in (("scx1", 1), ("none", 0)):
+        src = str(tmp_dir / f"uniform_{codec}.scx")
+        pyscx.from_anndata(synthetic_adata, src, codec=codec)
+        assert pyscx.open(src).codec_id == expected
+
+        backed = pyscx.open(src).to_anndata(backed=True)
+        n_obs = backed.n_obs
+        keep = np.ones(n_obs, dtype=bool)
+        keep[0] = False
+        dst = str(tmp_dir / f"uniform_{codec}_subset.scx")
+        pyscx.from_anndata(backed[keep], dst, shard_size=32)
+
+        out = pyscx.open(dst)
+        assert out.n_obs == n_obs - 1
+        assert out.codec_id == expected, (
+            f"a uniform {codec} source should stay {codec} through a subset "
+            f"rewrite; got codec_id {out.codec_id}"
+        )
+
+
+@pytest.mark.xfail(
+    reason="Separate, pre-existing defect in `select_codec` "
+    "(scx-format/src/codec_select.rs): it picks Scx1 on the sampled MEDIAN "
+    "alone, and adaptive Rice has no escape code for outliers, so a shard "
+    "whose median is small but which holds a few very large values encodes at "
+    "O(value / 2**k) bits each. Shifting the row boundaries by one row is "
+    "enough to put such a mix in one shard. Not the cause of the reported "
+    "post-subset blowup (that was the file-header codec, fixed above) and not "
+    "fixed here: the heuristic governs every write in the repo and changing it "
+    "needs the benchmark gate.",
+    strict=False,
+)
+def test_low_median_shard_with_large_outliers_does_not_blow_up(tmp_dir):
+    """Reproducer for the Rice-coding outlier pathology, kept executable.
+
+    With `shard_size=100` the subset shifts every row by one, so one shard
+    ends up holding mostly 1-3 counts plus a few ~50,000 ones. Its median
+    still routes it to Scx1, which then spends hundreds of bits per outlier.
+    """
+    import pyscx
+
+    src, n_obs = _mixed_codec_source(tmp_dir, name="outlier.scx", shard_size=100)
+    backed = pyscx.open(src).to_anndata(backed=True)
+
+    no_subset = str(tmp_dir / "outlier_nosubset.scx")
+    pyscx.from_anndata(backed, no_subset, shard_size=128, row_group_rows=0)
+
+    keep = np.ones(n_obs, dtype=bool)
+    keep[0] = False
+    subset = str(tmp_dir / "outlier_subset.scx")
+    # shard_size=100 keeps the source's boundaries, so the -1 row shift is
+    # what creates the mixed-magnitude shard.
+    pyscx.from_anndata(backed[keep], subset, shard_size=100, row_group_rows=0)
+
+    a, b = os.path.getsize(no_subset), os.path.getsize(subset)
+    assert b < a * 1.25, f"ratio {b / a:.2f} ({b} vs {a})"

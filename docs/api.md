@@ -884,6 +884,26 @@ For shape 2 the writer chooses between two modes:
   `encode_one_shard` + `write_preencoded_shard`. The output `n_obs`
   / `n_vars` reflect the user-visible shape.
 
+### Which codec a decode + encode rewrite uses
+
+With an explicit `codec=`, that codec. Without one, the codec is resolved
+against the **source's shard headers**, never against its file header:
+
+- every source CSR shard shares one codec → reuse it, so an explicit
+  `codec="scx1"` / `"pcodec"` / `"none"` source round-trips unchanged;
+- they differ → the per-shard adaptive heuristic
+  (`select_codec_for_modality`) chooses again for each output shard.
+
+The file header's `codec_id` is only a *default* and each shard header
+overrides it (see *Codec Selection* above, and `docs/codec.md` §1), so it can
+describe no shard at all — a `codec="auto"` write leaves whichever codec its
+first shard picked, and files written by older versions of the streaming
+h5ad → SCX converter carry a `0` (`none`) placeholder over compressed shards.
+Inheriting it wrote every shard raw: on a 966,728 × 6,143 source
+(nnz 2.67 × 10⁹) with such a header, dropping 537 rows turned 2.19 GB into
+10.85 GB. Any row deletion disables byte-passthrough, so this reached every
+subset rewrite of an affected file.
+
 For shape 3 the rewrite is always decode + encode; transforms are
 applied per shard inside `wrapper[start:end]`. The same
 `csc="always"` two-pass rebuild is honoured (matches `from_h5ad`).
