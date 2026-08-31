@@ -7,24 +7,43 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag name to attach the release to (e.g. pyscx-v0.1.0). Required for workflow_dispatch."
-        required: true
+        description: "Tag name to attach the release to (e.g. pyscx-v0.1.0). Required for a real (non-dry-run) dispatch; ignored on dry runs, which build the dispatched ref."
+        required: false
+        default: ""
         type: string
+      dry_run:
+        description: "Build wheels + upload artifacts from the dispatched ref, but do NOT publish a GitHub release. Use to verify workflow changes before a real tag."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
+# One release run per tag; never cancel a release mid-flight. Dry runs get a
+# unique group per run id so repeated probes don't queue behind each other.
+# `github.ref_name` (not `github.ref`) so a tag push (`pyscx-vX.Y.Z`) and a
+# real dispatch naming the same tag collapse to the SAME group instead of
+# `refs/tags/pyscx-vX.Y.Z` vs `pyscx-vX.Y.Z`.
+concurrency:
+  group: pyscx-release-${{ inputs.dry_run && github.run_id || (inputs.tag || github.ref_name) }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Build ${{ matrix.target }} wheel (py${{ matrix.python-version }})
+    name: Build ${{ matrix.target }} abi3 wheel
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
+      # One abi3 wheel per architecture, NOT one per Python version: the wheels
+      # are built against the stable ABI (`pyo3/abi3-py311`, matching
+      # `requires-python = ">=3.11"`), so a single cp311-abi3 wheel installs on
+      # every CPython >= 3.11. This replaced a 4-Python x 2-arch matrix (8 legs,
+      # each CMake-building libhdf5 from source under thin LTO) and removes the
+      # need to add a leg per new Python release. Verified before adoption: the
+      # abi3 wheel passed the full pytest suite on 3.11 and 3.13.
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
         # Attach a runner to each target. aarch64 builds natively on an arm
         # runner inside the manylinux2014 aarch64 container (no QEMU). Pin to
         # ubuntu-22.04 for parity with scx-cli-release.yml; the manylinux
@@ -37,13 +56,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # On workflow_dispatch, build the requested tag — not the default
-          # branch. The release job attaches wheels to inputs.tag, so without
-          # this the wheels would be built from the wrong revision. Mirrors
-          # scx-cli-release.yml.
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          # On a real workflow_dispatch, build the requested tag — not the
+          # default branch (the release job attaches wheels to inputs.tag, so
+          # without this the wheels would be built from the wrong revision;
+          # mirrors scx-cli-release.yml). A DRY run builds the dispatched ref
+          # itself — that is the point: verifying workflow + code changes on a
+          # branch before any tag exists.
+          ref: ${{ (github.event_name == 'workflow_dispatch' && !inputs.dry_run) && inputs.tag || github.ref }}
 
+      # Skipped on dry runs: a dry run builds the dispatched ref (often a
+      # branch with no tag yet), so there is no tag to be consistent with —
+      # requiring one contradicted the input's whole purpose. A real dispatch
+      # with an empty tag still fails here, loudly.
       - name: Verify tag matches package version
+        if: ${{ !inputs.dry_run }}
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -59,10 +85,32 @@ jobs:
             exit 1
           fi
 
+      # Host Python for the cross-version install smoke below. Deliberately a
+      # DIFFERENT minor (3.13) than the build interpreter (3.11): installing
+      # the cp311-abi3 wheel into it proves the abi3 tag really is
+      # version-portable, per leg, on every release.
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.13"
 
+      # CACHE PROBE (evaluate after two dry runs, keep or strip): the compile
+      # runs inside the manylinux container, so the host ~/.cargo half of this
+      # cache may be invisible to it, while the workspace ./target half is
+      # mounted and should carry the 480-crate closure plus the hdf5-src CMake
+      # artifacts between runs. Key includes target+runner for the same reason
+      # as scx-cli-release.yml: C artifacts (libhdf5 from hdf5-src) compiled
+      # against one image's glibc must not be reused on another.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          key: ${{ matrix.target }}-${{ matrix.runner }}
+
+      # `--interpreter python3.11` must point at a Python >= the abi3 floor:
+      # maturin silently falls back to a version-specific wheel when the build
+      # interpreter is older (observed locally with a 3.10 /usr/bin/python3 —
+      # the wheel came out cp310-cp310, not cp311-abi3). The manylinux2014
+      # container ships /opt/python/cp311 so this resolves correctly here; the
+      # shape assert below turns any regression into a hard failure.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -74,22 +122,58 @@ jobs:
             --release
             --strip
             --out dist
-            --interpreter python${{ matrix.python-version }}
-            --features hdf5-static,cloud
+            --interpreter python3.11
+            --features hdf5-static,cloud,pyo3/extension-module,pyo3/abi3-py311
 
       - name: List built wheels
         run: ls -lh pyscx/dist
 
+      - name: Assert abi3 wheel shape
+        shell: bash
+        run: |
+          shopt -s nullglob
+          whls=(pyscx/dist/*cp311-abi3-manylinux*.whl)
+          all=(pyscx/dist/*.whl)
+          if [ "${#whls[@]}" -ne 1 ] || [ "${#all[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one cp311-abi3 manylinux wheel, got: ${all[*]}" >&2
+            exit 1
+          fi
+
+      # Behavioral smoke, not just an import: a representative pytest slice
+      # runs against the installed wheel from an environment that cannot import
+      # the checkout's editable package — real encode/decode round trips and
+      # the packaging assertions, through the exact abi3 artifact being
+      # released, on a different minor (3.13) than it was built against
+      # (3.11). Kept to a slice per leg (the full suite ran as the abi3
+      # adoption gate); hard deps only, so optional-dep tests skip themselves.
+      - name: Install wheel into host Python 3.13 and smoke-test
+        shell: bash
+        run: |
+          python -m venv .smoke-venv
+          . .smoke-venv/bin/activate
+          # Only the wheel + pytest: the hard deps (numpy/scipy/pyarrow/anndata)
+          # must arrive via the wheel's own Requires-Dist — naming them here
+          # would mask a wheel that forgot to declare one (the base-install
+          # job's discipline).
+          pip install pyscx/dist/*.whl pytest
+          python -c "import sys, pyscx; print(sys.version.split()[0], 'pyscx', pyscx.__version__)"
+          cd pyscx && python -m pytest -q -p no:cacheprovider \
+            tests/test_round_trip.py tests/test_optional_deps.py
+
       - uses: actions/upload-artifact@v4
         with:
-          name: pyscx-wheel-${{ matrix.target }}-py${{ matrix.python-version }}
+          name: pyscx-wheel-${{ matrix.target }}
           path: pyscx/dist/*.whl
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
     needs: build
+    # Skipped on dry runs. On tag pushes `inputs` is empty, so `!inputs.dry_run`
+    # evaluates true and the release publishes as before.
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:

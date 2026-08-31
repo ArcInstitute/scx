@@ -30,10 +30,11 @@ directory):
 **End users** — install the wheel; no Rust toolchain needed:
 
 ```bash
-# Download the wheel for your Python version + arch (x86_64 / aarch64) from
-# GitHub Releases: https://github.com/ArcInstitute/scx/releases (pyscx-v* tags).
-# Replace <version> with the release you downloaded (e.g. 0.7.1).
-pip install ./pyscx-<version>-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# Download the wheel for your architecture (x86_64 / aarch64) from GitHub
+# Releases: https://github.com/ArcInstitute/scx/releases (pyscx-v* tags).
+# Releases after v0.15.0 ship one cp311-abi3 wheel per arch (any CPython
+# >= 3.11); v0.15.0 and earlier ship per-minor cp3XX wheels.
+pip install ./pyscx-*.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
@@ -41,7 +42,7 @@ Add extras only when needed — attach them to the resolved wheel filename via
 `pip install "$(ls ./pyscx-*.whl)[mudata]"` (a quoted `*` glob reaches pip
 verbatim and fails); e.g. `[mudata]`, `[10x]`, `[gpu]` (cupy only — GPU kernels
 need a source build). Pre-built wheels bundle libhdf5 **and** cloud I/O (Linux
-x86_64, py ≥ 3.11); they do **not** include GPU.
+x86_64 and aarch64, CPython ≥ 3.11); they do **not** include GPU.
 
 **Developers** — clone the repo and compile the extension (a bare clone does
 *not* work like `pip install`):
