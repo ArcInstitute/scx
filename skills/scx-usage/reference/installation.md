@@ -22,18 +22,22 @@ has no compiled extension until you run `maturin develop`.
 
 pyscx is **not** published on PyPI. The `pypi.org/project/pyscx/` package is
 **unrelated**. Pre-built wheels are attached to GitHub Releases tagged `pyscx-v*`
-at <https://github.com/ArcInstitute/scx/releases>. One abi3 wheel per
-architecture (Linux x86_64 and aarch64) installs on every CPython >= 3.11.
+at <https://github.com/ArcInstitute/scx/releases>. Releases **after v0.15.0**
+ship one abi3 wheel per architecture (Linux x86_64 and aarch64) that installs
+on every CPython >= 3.11; **v0.15.0 and earlier** ship per-minor cp311..cp314
+wheels — pick the one matching your Python.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate   # or: . .venv/bin/activate
 # Download the wheel for your architecture from GitHub Releases:
 # https://github.com/ArcInstitute/scx/releases (look for pyscx-v* tags).
-# The cp311-abi3 wheel installs on every CPython >= 3.11.
-# Replace <version> with the release you downloaded (e.g. 0.7.1); the aarch64
-# twin ends in _aarch64.manylinux2014_aarch64.whl.
-pip install ./pyscx-<version>-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# Post-v0.15.0 the x86_64 filename is
+#   pyscx-<version>-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# (aarch64 twin ends in _aarch64.manylinux2014_aarch64.whl) and installs on
+# every CPython >= 3.11; older releases use per-minor cp3XX-cp3XX names. The
+# glob form installs whichever you downloaded:
+pip install ./pyscx-*.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
@@ -43,7 +47,7 @@ python -c "import pyscx; print(pyscx.__version__)"
   `to_h5mu` work without system HDF5 libraries.
 - **cloud** (Rust) — `open_cloud`, cloud query pipeline, and related native
   cloud I/O are compiled in.
-- **Platform** — manylinux x86_64 and aarch64 (Linux). One stable-ABI (abi3) wheel per arch, CPython >= 3.11.
+- **Platform** — manylinux x86_64 and aarch64 (Linux). CPython >= 3.11; one stable-ABI (abi3) wheel per arch after v0.15.0, per-minor wheels before.
 - **Not included** — GPU acceleration. For `device="gpu"` you must build from
   source with `--features gpu` (see below).
 
@@ -65,7 +69,7 @@ pip install "$(ls ./pyscx-*.whl)[cloud,gpu]"  # combine as needed
 ```
 
 Or just spell out the full filename, e.g.
-`pip install './pyscx-0.7.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'`.
+`pip install './pyscx-0.7.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl[cloud]'` (a v0.7.0 per-minor wheel; post-v0.15.0 the filename segment is `cp311-abi3`).
 
 Notes on extras:
 

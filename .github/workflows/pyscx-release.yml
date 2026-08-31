@@ -151,7 +151,11 @@ jobs:
         run: |
           python -m venv .smoke-venv
           . .smoke-venv/bin/activate
-          pip install pyscx/dist/*.whl pytest numpy scipy "pyarrow<24" anndata
+          # Only the wheel + pytest: the hard deps (numpy/scipy/pyarrow/anndata)
+          # must arrive via the wheel's own Requires-Dist — naming them here
+          # would mask a wheel that forgot to declare one (the base-install
+          # job's discipline).
+          pip install pyscx/dist/*.whl pytest
           python -c "import sys, pyscx; print(sys.version.split()[0], 'pyscx', pyscx.__version__)"
           cd pyscx && python -m pytest -q -p no:cacheprovider \
             tests/test_round_trip.py tests/test_optional_deps.py

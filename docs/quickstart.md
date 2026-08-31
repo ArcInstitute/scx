@@ -46,10 +46,12 @@ PyPI / crates.io). Set `VERSION` to the latest release tag.
 VERSION=0.7.1
 
 # Python bindings — download the wheel for your architecture from GitHub
-# Releases (pyscx-v* tags). One abi3 wheel per arch (Linux x86_64 and aarch64)
-# installs on every CPython >= 3.11. See
-# skills/scx-usage/reference/installation.md for resolving the exact filename.
-uv pip install ./pyscx-${VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+# Releases (pyscx-v* tags): releases after v0.15.0 ship one abi3 wheel per
+# arch (cp311-abi3, installs on every CPython >= 3.11); v0.15.0 and earlier
+# ship per-minor cp311..cp314 wheels — pick the one matching your Python. The
+# glob form below installs whichever you downloaded. See
+# skills/scx-usage/reference/installation.md for the exact filenames.
+uv pip install ./pyscx-${VERSION}-*.whl
 
 # CLI — download the pre-built binary (Linux x86_64 / arm64):
 TARGET=x86_64-unknown-linux-gnu   # or: aarch64-unknown-linux-gnu

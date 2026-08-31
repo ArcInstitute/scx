@@ -62,8 +62,10 @@ not a blocker.
 Release wheels are built against the CPython stable ABI (`pyo3/abi3-py311`),
 so one `cp311-abi3` wheel per architecture installs on every CPython ≥ 3.11 —
 there is no per-minor wheel matrix. Each release leg additionally installs the
-wheel into a host Python 3.13 and imports it, proving the cross-version
-install path on every run. The abi3 build was gated on the full pytest suite
+wheel into a host Python 3.13 and runs a behavioral pytest slice
+(`test_round_trip.py` + `test_optional_deps.py`) against it, proving the
+cross-version install path and real encode/decode round trips on every run —
+so 3.13 is exercised by the release legs (PR CI's `python` job remains 3.11). The abi3 build was gated on the full pytest suite
 passing against the abi3 wheel on both 3.11 and 3.13.
 
 `pyarrow==23.0.1` is pinned in `ci.yml` to exercise the widened upper
@@ -78,9 +80,10 @@ Run on the `release/pyscx-v0.3.2` branch as of 2026-05-14:
 |---|---|---|---|---|---|---|---|
 | 3.13.3 | 2.4.4 | 1.17.1 | 23.0.1 | 0.12.10 | 1.12 | Linux 5.15 | ✅ Full test suite green |
 
-This row is informative — Python 3.13 is not yet exercised in CI, but
-the maintainer's environment treats it as a known-good point inside the
-declared bounds.
+This row is informative for the full-suite claim — PR CI's `python` job runs
+3.11; 3.13 is exercised by the release legs' behavioral smoke (see the CI
+matrix above) and by the maintainer's environment as a known-good point
+inside the declared bounds.
 
 ## Private anndata APIs pyscx depends on
 
