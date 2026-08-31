@@ -1129,7 +1129,6 @@ mod tests {
         n_cols: u32,
         row_group_rows: u32,
     ) -> Vec<u8> {
-        use scx_format_io::modality::ModalityType;
         use scx_format_io::section::SectionType;
         let index_dtype = if n_cols <= 65535 { 0u8 } else { 1u8 };
         let framing = scx_format_io::FramingConfig {
@@ -1138,20 +1137,17 @@ mod tests {
             trial: false,
             decode_target: None,
         };
-        let section = scx_format_io::encode_one_shard(
-            indptr,
-            indices,
-            values_f32,
-            Some(explicit_codec),
-            index_dtype,
-            n_cols,
-            0,
-            SectionType::CsrShard,
-            ModalityType::Rna,
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
             "X_shard_0".to_string(),
-            Some(framing),
-        )
-        .expect("encode_one_shard (framed) failed");
+            SectionType::CsrShard,
+            n_cols as u64,
+            0,
+        );
+        enc_opts.explicit_codec = Some(explicit_codec);
+        enc_opts.index_dtype = index_dtype;
+        enc_opts.framing = Some(framing);
+        let section = scx_format_io::encode_one_shard(indptr, indices, values_f32, &enc_opts)
+            .expect("encode_one_shard (framed) failed");
         // Framing must actually have kicked in (shard v2), else the test would
         // vacuously pass on an unframed shard.
         assert_eq!(

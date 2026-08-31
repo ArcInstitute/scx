@@ -838,20 +838,20 @@ fn attach_external_layer_inner(
         // re-derived from the values, which would scan every shard twice.
         summary.value_encoding = widest_written(summary.value_encoding, shard_ve);
 
-        let section = encode_one_shard_with_value_encoding(
-            &s_indptr,
-            &s_indices,
-            &s_values,
-            opts.codec,
-            index_dtype,
-            n_vars as u32,
-            *row_start,
-            SectionType::LayerCsrShard,
-            modality_type,
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
             format!("{}_shard_{}", opts.layer_name, shard_idx),
-            framing,
-            Some(shard_ve),
-        )?;
+            SectionType::LayerCsrShard,
+            n_vars,
+            *row_start,
+        );
+        enc_opts.explicit_codec = opts.codec;
+        enc_opts.index_dtype = index_dtype;
+        enc_opts.modality_type = modality_type;
+        enc_opts.framing = framing;
+        enc_opts.value_encoding = Some(shard_ve);
+
+        let section =
+            encode_one_shard_with_value_encoding(&s_indptr, &s_indices, &s_values, &enc_opts)?;
         writer.write_preencoded_shard(section)?;
     }
 

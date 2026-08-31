@@ -322,17 +322,15 @@ mod tests {
 
         // Layer shard
         let (indptr2, indices2, values2) = sample_shard_data(n_obs, n_vars);
+        let layer_shard = scx_format_io::ShardBuffers::new(
+            &indptr2,
+            &indices2,
+            &values2,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
         writer
-            .write_layer_csr_shard(
-                &indptr2,
-                &indices2,
-                &values2,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-                "raw_counts",
-                0,
-            )
+            .write_layer_csr_shard("raw_counts", 0, 0, layer_shard)
             .unwrap();
 
         // obsm
@@ -713,17 +711,14 @@ mod tests {
         writer.set_modality_n_vars(rna_id, 12).unwrap();
         writer.write_var_for(rna_id, &sample_var(12)).unwrap();
         let (rna_indptr, rna_indices, rna_values) = sample_shard_data(n_obs, 12);
-        writer
-            .write_csr_shard_for(
-                rna_id,
-                &rna_indptr,
-                &rna_indices,
-                &rna_values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let rna_shard = scx_format_io::ShardBuffers::new(
+            &rna_indptr,
+            &rna_indices,
+            &rna_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
 
         let adt_id = writer
             .add_modality(
@@ -737,17 +732,14 @@ mod tests {
         writer.set_modality_n_vars(adt_id, 4).unwrap();
         writer.write_var_for(adt_id, &sample_var(4)).unwrap();
         let (adt_indptr, adt_indices, adt_values) = sample_shard_data(n_obs, 4);
-        writer
-            .write_csr_shard_for(
-                adt_id,
-                &adt_indptr,
-                &adt_indices,
-                &adt_values,
-                CodecId::Zstd,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let adt_shard = scx_format_io::ShardBuffers::new(
+            &adt_indptr,
+            &adt_indices,
+            &adt_values,
+            CodecId::Zstd,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
         writer.finish().unwrap();
         path

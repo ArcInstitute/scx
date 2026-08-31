@@ -50,20 +50,15 @@ fn decode_both(codec: CodecId, values: &[f32], framing: Option<FramingConfig>) -
     let indices = [0u32, 3, 1, 4, 9, 2, 8];
     let n_cols: u32 = 16;
 
-    let s = encode_one_shard(
-        &indptr,
-        &indices,
-        values,
-        Some(codec),
-        0,
-        n_cols,
-        0,
+    let mut opts = crate::encoder::EncodeShardOptions::new(
+        "X_shard_0",
         SectionType::CsrShard,
-        ModalityType::Rna,
-        "X_shard_0".to_string(),
-        framing,
-    )
-    .expect("encode_one_shard");
+        n_cols as u64,
+        0,
+    );
+    opts.explicit_codec = Some(codec);
+    opts.framing = framing;
+    let s = encode_one_shard(&indptr, &indices, values, &opts).expect("encode_one_shard");
     let sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
 
     let native = decode_shard_regions_native(
@@ -269,9 +264,8 @@ fn write_multimodal_file(
         writer.set_modality_n_vars(mid, *n_vars as u64).unwrap();
         writer.write_var_for(mid, &var_batch(*n_vars)).unwrap();
         for (indptr, indices, values, senc, row_start) in shards {
-            writer
-                .write_csr_shard_for(mid, indptr, indices, values, codec, *senc, *row_start)
-                .unwrap();
+            let shard = crate::writer::ShardBuffers::new(indptr, indices, values, codec, *senc);
+            writer.write_csr_shard_for(mid, *row_start, shard).unwrap();
         }
     }
     writer.finish().unwrap();

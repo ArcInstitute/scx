@@ -19,7 +19,6 @@ use std::path::Path;
 use scx_codec::CodecId;
 use scx_format_io::encoder::{encode_one_shard, FramingConfig};
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
-use scx_format_io::modality::ModalityType;
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{ObsShardPolicy, ScxReader, DEFAULT_SHARD_TARGET_ROWS};
@@ -273,19 +272,16 @@ pub fn optimize_with_framing(
         }
         canonicalize_csr(&mut indptr, &mut indices, &mut values);
 
-        let pre = encode_one_shard(
-            &indptr,
-            &indices,
-            &values,
-            codec, // None = auto-codec; Some(Scx1) forces Scx1 on every integer shard
-            index_dtype,
-            n_minor,
-            row_start,
-            entry.section_type,
-            ModalityType::Rna,
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
             entry.name.clone(),
-            framing, // Some => row-group-frame this shard (F5-b, shard v2)
-        )?;
+            entry.section_type,
+            n_minor as u64,
+            row_start,
+        );
+        enc_opts.explicit_codec = codec;
+        enc_opts.index_dtype = index_dtype;
+        enc_opts.framing = framing;
+        let pre = encode_one_shard(&indptr, &indices, &values, &enc_opts)?;
         stats.shards_total += 1;
         if pre.shard_format_version() > scx_format_io::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
             stats.shards_framed += 1;
@@ -882,17 +878,15 @@ mod tests {
                 0,
             )
             .unwrap();
-            w.write_obsp_shard(
+            let obsp_shard = scx_format_io::ShardBuffers::new(
                 &op_indptr,
                 &op_indices,
                 &op_values,
                 CodecId::None,
                 ValueEncoding::Uint8,
-                0,
-                "connectivities",
-                0,
-            )
-            .unwrap();
+            );
+            w.write_obsp_shard("connectivities", 0, 0, obsp_shard)
+                .unwrap();
             w.finish().unwrap();
         }
 

@@ -43,7 +43,7 @@ use scx_accel::{estimate_alpha, pflog_baseline_from_delta, AlphaOptions, PcaResu
 use scx_codec::CodecId;
 use scx_format_io::section::SectionType;
 use scx_format_io::shard_source::SingleShardSource;
-use scx_format_io::{ModalityType, ProvenanceEntry, ScxWriter, ShardSource};
+use scx_format_io::{ProvenanceEntry, ScxWriter, ShardSource};
 use scx_sparse::ScxCsr;
 
 use crate::backed::ScxBackedSparseDataset;
@@ -739,22 +739,16 @@ fn write_pflog_x_shards<S: ShardSource>(
                 build_delta_window(&csr, r0, r1)
             };
             let name = format!("X_shard_{out_idx}");
+            let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                name,
+                SectionType::CsrShard,
+                n_vars_u32 as u64,
+                global_row,
+            );
+            enc_opts.explicit_codec = Some(codec);
+            enc_opts.index_dtype = index_dtype;
             let pre = py
-                .detach(|| {
-                    scx_format_io::encode_one_shard(
-                        &indptr,
-                        &indices,
-                        &values,
-                        Some(codec),
-                        index_dtype,
-                        n_vars_u32,
-                        global_row,
-                        SectionType::CsrShard,
-                        ModalityType::Rna,
-                        name,
-                        None,
-                    )
-                })
+                .detach(|| scx_format_io::encode_one_shard(&indptr, &indices, &values, &enc_opts))
                 .map_err(to_pyerr)?;
             py.detach(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;

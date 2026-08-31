@@ -3126,16 +3126,15 @@ mod layout_check_tests {
                 values.push(((row + 1) & 0xFF) as u8);
                 indptr.push(*indptr.last().unwrap() + 1);
             }
+            let shard = scx_format_io::ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
             writer
-                .write_csr_shard_for(
-                    mid,
-                    &indptr,
-                    &indices,
-                    &values,
-                    CodecId::None,
-                    ValueEncoding::Uint8,
-                    row_offset as u64,
-                )
+                .write_csr_shard_for(mid, row_offset as u64, shard)
                 .unwrap();
         };
 

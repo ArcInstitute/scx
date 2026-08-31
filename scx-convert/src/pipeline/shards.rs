@@ -90,6 +90,12 @@ pub(super) fn write_csc_shards_from_csr(
         values,
     );
     // Shared transpose-and-write loop (single-modality → modality_id None).
+    let sidecar_opts = scx_format_io::CscSidecarOptions {
+        cols_per_shard: csc_cols_per_shard,
+        memory_budget_bytes: crate::budget::csc_sidecar_bytes(memory_budget) as usize,
+        modality_id: None,
+        framing,
+    };
     scx_format_io::csc_sidecar::write_csc_sidecar(
         writer,
         std::slice::from_ref(&csr),
@@ -97,10 +103,7 @@ pub(super) fn write_csc_shards_from_csr(
         n_vars,
         value_encoding,
         codec_id,
-        csc_cols_per_shard,
-        crate::budget::csc_sidecar_bytes(memory_budget) as usize,
-        None,
-        framing,
+        sidecar_opts,
     )?;
     Ok(())
 }
@@ -154,19 +157,17 @@ pub(super) fn write_csr_shards(
         // post-codec section length (matches streaming + python in-memory
         // paths). Section name `X_shard_{idx}` mirrors the name that
         // `ScxWriter::write_csr_shard` constructs internally.
-        let pre = encode_one_shard(
-            &shard_indptr,
-            &shard_indices,
-            &shard_data,
-            Some(codec_id),
-            index_dtype,
-            n_vars_u32,
-            row_start as u64,
-            SectionType::CsrShard,
-            modality_type,
+        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
             format!("X_shard_{shard_idx}"),
-            framing,
-        )?;
+            SectionType::CsrShard,
+            n_vars_u32 as u64,
+            row_start as u64,
+        );
+        enc_opts.explicit_codec = Some(codec_id);
+        enc_opts.index_dtype = index_dtype;
+        enc_opts.modality_type = modality_type;
+        enc_opts.framing = framing;
+        let pre = encode_one_shard(&shard_indptr, &shard_indices, &shard_data, &enc_opts)?;
         let encoded_csr_size = pre.section_length as usize;
         writer.write_preencoded_shard(pre)?;
 
@@ -418,17 +419,15 @@ pub(super) fn write_layer_shards(
         })?;
         let shard_data = &data[nnz_start..nnz_end];
         let raw_values = values_to_raw_bytes(shard_data, value_encoding).map_err(ScxError::from)?;
-
-        writer.write_layer_csr_shard(
+        let layer_shard = scx_format_io::ShardBuffers::new(
             &shard_indptr,
             &shard_indices,
             &raw_values,
             codec_id,
             value_encoding,
-            row_start as u64,
-            layer_name,
-            shard_idx,
-        )?;
+        );
+
+        writer.write_layer_csr_shard(layer_name, shard_idx, row_start as u64, layer_shard)?;
 
         row_start = row_end;
         shard_idx += 1;

@@ -1575,28 +1575,22 @@ mod streaming_obs_hdf5 {
             }
             // One zero-nnz CSR shard per modality covering all rows.
             let indptr: Vec<u64> = vec![0u64; (n_obs + 1) as usize];
-            writer
-                .write_csr_shard_for(
-                    rna_id,
-                    &indptr,
-                    &[],
-                    &[],
-                    CodecId::None,
-                    ValueEncoding::Uint8,
-                    0,
-                )
-                .unwrap();
-            writer
-                .write_csr_shard_for(
-                    adt_id,
-                    &indptr,
-                    &[],
-                    &[],
-                    CodecId::None,
-                    ValueEncoding::Uint8,
-                    0,
-                )
-                .unwrap();
+            let shard = scx_format_io::ShardBuffers::new(
+                &indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
+            writer.write_csr_shard_for(rna_id, 0, shard).unwrap();
+            let shard = scx_format_io::ShardBuffers::new(
+                &indptr,
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
+            writer.write_csr_shard_for(adt_id, 0, shard).unwrap();
             writer.finish().unwrap();
         }
 

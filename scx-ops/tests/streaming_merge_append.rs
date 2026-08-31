@@ -1768,17 +1768,15 @@ fn write_sharded_input(
             let indptr: Vec<u64> = vec![0u64; (n_rows + 1) as usize];
             let indices: Vec<u32> = Vec::new();
             let values: Vec<u8> = Vec::new();
+            let shard = scx_format_io::ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
             writer
-                .write_layer_csr_shard(
-                    &indptr,
-                    &indices,
-                    &values,
-                    CodecId::None,
-                    ValueEncoding::Uint8,
-                    row_start,
-                    "spliced",
-                    shard_idx as u32,
-                )
+                .write_layer_csr_shard("spliced", shard_idx as u32, row_start, shard)
                 .unwrap();
             row_start += n_rows;
         }
@@ -2191,28 +2189,22 @@ fn write_multimodal_with_per_modality_obsm(
     let indptr: Vec<u64> = vec![0u64; (n_obs + 1) as usize];
     let indices: Vec<u32> = Vec::new();
     let values: Vec<u8> = Vec::new();
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = scx_format_io::ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
+    let adt_shard = scx_format_io::ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
     // Sharded per-modality obsm for the rna modality.
     let mut start: u64 = 0;
@@ -2221,8 +2213,9 @@ fn write_multimodal_with_per_modality_obsm(
         let end = (start + rna_obsm_shard_rows).min(n_obs);
         let n = end - start;
         let batch = obsm_batch(start as usize, n as usize);
+        let meta = scx_format_io::DenseShardMetadata::new(shard_idx, start, n, n_obs);
         writer
-            .write_obsm_shard_for(rna_id, "X_umap", shard_idx, start, n, n_obs, &batch)
+            .write_obsm_shard_for(rna_id, "X_umap", meta, &batch)
             .unwrap();
         start = end;
         shard_idx += 1;

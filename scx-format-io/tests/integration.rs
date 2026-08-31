@@ -307,18 +307,14 @@ fn test_18_3_full_sections_round_trip() {
 
     // Layer "raw"
     let (l_indptr, l_indices, l_values) = sample_shard_data(n_obs, n_vars);
-    writer
-        .write_layer_csr_shard(
-            &l_indptr,
-            &l_indices,
-            &l_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-            "raw",
-            0,
-        )
-        .unwrap();
+    let l_shard = scx_format_io::ShardBuffers::new(
+        &l_indptr,
+        &l_indices,
+        &l_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_layer_csr_shard("raw", 0, 0, l_shard).unwrap();
 
     // obsm "X_pca"
     let obsm_schema = Schema::new(vec![

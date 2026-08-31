@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use scx_codec::CodecId;
 use scx_format_io::section::SectionType;
-use scx_format_io::{ModalityType, ProvenanceEntry, ScxReader, ScxWriter};
+use scx_format_io::{ProvenanceEntry, ScxReader, ScxWriter};
 
 use crate::to_pyerr;
 
@@ -400,22 +400,16 @@ pub(crate) fn route_scx_backed_to_scx(
             // the wrapper's __getitem__ (returns scipy CSR).
             let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
             let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
-                py.detach(|| {
-                    scx_format_io::encode_one_shard(
-                        indptr,
-                        indices,
-                        data,
-                        codec_for_encode,
-                        out_index_dtype,
-                        n_vars_u32,
-                        *start as u64,
-                        SectionType::CsrShard,
-                        ModalityType::Rna,
-                        format!("X_shard_{i}"),
-                        None,
-                    )
-                })
-                .map_err(to_pyerr)
+                let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                    format!("X_shard_{i}"),
+                    SectionType::CsrShard,
+                    n_vars_u32 as u64,
+                    *start as u64,
+                );
+                enc_opts.explicit_codec = codec_for_encode;
+                enc_opts.index_dtype = out_index_dtype;
+                py.detach(|| scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts))
+                    .map_err(to_pyerr)
             })?;
             py.detach(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;
@@ -628,22 +622,16 @@ pub(crate) fn route_scx_lazy_to_scx(
         let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
         let shard_obj = adata_x.call_method1("__getitem__", (py_slice,))?;
         let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
-            py.detach(|| {
-                scx_format_io::encode_one_shard(
-                    indptr,
-                    indices,
-                    data,
-                    codec_for_encode,
-                    index_dtype,
-                    n_vars_u32,
-                    *start as u64,
-                    SectionType::CsrShard,
-                    ModalityType::Rna,
-                    format!("X_shard_{i}"),
-                    None,
-                )
-            })
-            .map_err(to_pyerr)
+            let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                format!("X_shard_{i}"),
+                SectionType::CsrShard,
+                n_vars_u32 as u64,
+                *start as u64,
+            );
+            enc_opts.explicit_codec = codec_for_encode;
+            enc_opts.index_dtype = index_dtype;
+            py.detach(|| scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts))
+                .map_err(to_pyerr)
         })?;
         py.detach(|| writer.write_preencoded_shard(pre))
             .map_err(to_pyerr)?;
@@ -865,22 +853,17 @@ pub(crate) fn stream_write_layers(
             let py_slice = pyo3::types::PySlice::new(py, *start as isize, *end as isize, 1);
             let shard_obj = layer.call_method1("__getitem__", (py_slice,))?;
             let pre = decompose_scipy_csr_with(py, &shard_obj, |indptr, indices, data| {
-                py.detach(|| {
-                    scx_format_io::encode_one_shard(
-                        indptr,
-                        indices,
-                        data,
-                        codec_for_encode,
-                        index_dtype,
-                        n_vars_u32,
-                        *start as u64,
-                        SectionType::LayerCsrShard,
-                        ModalityType::Rna,
-                        format!("{layer_name}_shard_{i}"),
-                        framing,
-                    )
-                })
-                .map_err(to_pyerr)
+                let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                    format!("{layer_name}_shard_{i}"),
+                    SectionType::LayerCsrShard,
+                    n_vars_u32 as u64,
+                    *start as u64,
+                );
+                enc_opts.explicit_codec = codec_for_encode;
+                enc_opts.index_dtype = index_dtype;
+                enc_opts.framing = framing;
+                py.detach(|| scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts))
+                    .map_err(to_pyerr)
             })?;
             py.detach(|| writer.write_preencoded_shard(pre))
                 .map_err(to_pyerr)?;

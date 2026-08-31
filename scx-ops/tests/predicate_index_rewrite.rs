@@ -406,29 +406,23 @@ fn write_multimodal_test_file(
         .unwrap();
 
     let (rna_indptr, rna_indices, rna_values) = sample_shard(n_obs, rna_n_vars);
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &rna_indptr,
-            &rna_indices,
-            &rna_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = scx_format_io::ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     let (adt_indptr, adt_indices, adt_values) = sample_shard(n_obs, adt_n_vars);
-    writer
-        .write_csr_shard_for(
-            adt_id,
-            &adt_indptr,
-            &adt_indices,
-            &adt_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let adt_shard = scx_format_io::ShardBuffers::new(
+        &adt_indptr,
+        &adt_indices,
+        &adt_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
 
     writer
         .write_provenance(vec![ProvenanceEntry {

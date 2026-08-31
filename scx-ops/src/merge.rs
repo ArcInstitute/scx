@@ -738,15 +738,18 @@ pub fn merge_with_options(
                     if layer_row_count >= shard_target as u64 {
                         let layer_shard_codec =
                             seed_codec(options.codec, &layer_values, layer_value_encoding);
-                        writer.write_layer_csr_shard(
+                        let shard = scx_format_io::ShardBuffers::new(
                             &layer_indptr,
                             &layer_indices,
                             &layer_values,
                             layer_shard_codec,
                             layer_value_encoding,
-                            emitted_layer_rows,
+                        );
+                        writer.write_layer_csr_shard(
                             layer_name,
                             layer_shard_idx,
+                            emitted_layer_rows,
+                            shard,
                         )?;
                         emitted_layer_rows += layer_row_count;
                         layer_indptr = vec![0];
@@ -763,16 +766,14 @@ pub fn merge_with_options(
         if layer_row_count > 0 {
             // Auto-select codec for remaining layer shard
             let layer_shard_codec = seed_codec(options.codec, &layer_values, layer_value_encoding);
-            writer.write_layer_csr_shard(
+            let shard = scx_format_io::ShardBuffers::new(
                 &layer_indptr,
                 &layer_indices,
                 &layer_values,
                 layer_shard_codec,
                 layer_value_encoding,
-                emitted_layer_rows,
-                layer_name,
-                layer_shard_idx,
-            )?;
+            );
+            writer.write_layer_csr_shard(layer_name, layer_shard_idx, emitted_layer_rows, shard)?;
         }
     }
 
@@ -1267,15 +1268,14 @@ fn merge_multimodal(
                     encode_value(&mut values_bytes, v, shard_value_encoding)?;
                 }
                 let shard_codec = seed_codec(options.codec, &values_bytes, shard_value_encoding);
-                writer.write_csr_shard_for(
-                    modality_id,
+                let shard = scx_format_io::ShardBuffers::new(
                     &indptr_u64,
                     &indices_u32,
                     &values_bytes,
                     shard_codec,
                     shard_value_encoding,
-                    row_start,
-                )?;
+                );
+                writer.write_csr_shard_for(modality_id, row_start, shard)?;
             }
             input_offset += reader.n_obs();
         }
@@ -1396,16 +1396,19 @@ fn merge_multimodal(
 
                         if l_rows >= shard_target as u64 {
                             let codec = seed_codec(options.codec, &l_values, layer_value_encoding);
-                            writer.write_layer_csr_shard_for(
-                                modality_id,
-                                layer_name,
-                                l_shard_idx,
+                            let shard = scx_format_io::ShardBuffers::new(
                                 &l_indptr,
                                 &l_indices,
                                 &l_values,
                                 codec,
                                 layer_value_encoding,
+                            );
+                            writer.write_layer_csr_shard_for(
+                                modality_id,
+                                layer_name,
+                                l_shard_idx,
                                 l_emitted,
+                                shard,
                             )?;
                             l_emitted += l_rows;
                             l_indptr = vec![0];
@@ -1420,16 +1423,19 @@ fn merge_multimodal(
 
             if l_rows > 0 {
                 let codec = seed_codec(options.codec, &l_values, layer_value_encoding);
-                writer.write_layer_csr_shard_for(
-                    modality_id,
-                    layer_name,
-                    l_shard_idx,
+                let shard = scx_format_io::ShardBuffers::new(
                     &l_indptr,
                     &l_indices,
                     &l_values,
                     codec,
                     layer_value_encoding,
+                );
+                writer.write_layer_csr_shard_for(
+                    modality_id,
+                    layer_name,
+                    l_shard_idx,
                     l_emitted,
+                    shard,
                 )?;
             }
         }
@@ -2145,25 +2151,19 @@ fn merge_per_modality_dense_mapping_sharded(
                     .read_dense_mapping_entry(entry)
                     .map_err(OpsError::Format)?;
                 let n = batch.num_rows() as u64;
+                let meta = scx_format_io::DenseShardMetadata::new(
+                    out_shard_idx,
+                    cumulative_rows,
+                    n,
+                    n_rows_total,
+                );
                 match axis {
-                    DenseMappingAxis::Obsm => writer.write_obsm_shard_for(
-                        modality_id,
-                        key,
-                        out_shard_idx,
-                        cumulative_rows,
-                        n,
-                        n_rows_total,
-                        &batch,
-                    )?,
-                    DenseMappingAxis::Varm => writer.write_varm_shard_for(
-                        modality_id,
-                        key,
-                        out_shard_idx,
-                        cumulative_rows,
-                        n,
-                        n_rows_total,
-                        &batch,
-                    )?,
+                    DenseMappingAxis::Obsm => {
+                        writer.write_obsm_shard_for(modality_id, key, meta, &batch)?
+                    }
+                    DenseMappingAxis::Varm => {
+                        writer.write_varm_shard_for(modality_id, key, meta, &batch)?
+                    }
                 }
                 cumulative_rows += n;
                 out_shard_idx += 1;
@@ -2174,25 +2174,19 @@ fn merge_per_modality_dense_mapping_sharded(
                         .read_dense_mapping_entry(shard_entry)
                         .map_err(OpsError::Format)?;
                     let n = batch.num_rows() as u64;
+                    let meta = scx_format_io::DenseShardMetadata::new(
+                        out_shard_idx,
+                        cumulative_rows,
+                        n,
+                        n_rows_total,
+                    );
                     match axis {
-                        DenseMappingAxis::Obsm => writer.write_obsm_shard_for(
-                            modality_id,
-                            key,
-                            out_shard_idx,
-                            cumulative_rows,
-                            n,
-                            n_rows_total,
-                            &batch,
-                        )?,
-                        DenseMappingAxis::Varm => writer.write_varm_shard_for(
-                            modality_id,
-                            key,
-                            out_shard_idx,
-                            cumulative_rows,
-                            n,
-                            n_rows_total,
-                            &batch,
-                        )?,
+                        DenseMappingAxis::Obsm => {
+                            writer.write_obsm_shard_for(modality_id, key, meta, &batch)?
+                        }
+                        DenseMappingAxis::Varm => {
+                            writer.write_varm_shard_for(modality_id, key, meta, &batch)?
+                        }
                     }
                     cumulative_rows += n;
                     out_shard_idx += 1;

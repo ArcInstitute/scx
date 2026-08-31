@@ -382,16 +382,14 @@ pub fn streaming_save_layer(
         let out_values = encode_f32_values(&csr.data, layer_encoding)?;
 
         let row_start = shard_entry.stats.as_ref().map_or(0u64, |s| s.row_start);
-        writer.write_layer_csr_shard(
+        let shard = scx_format_io::ShardBuffers::new(
             &out_indptr,
             &out_indices,
             &out_values,
             layer_codec,
             layer_encoding,
-            row_start,
-            layer_name,
-            shard_idx as u32,
-        )?;
+        );
+        writer.write_layer_csr_shard(layer_name, shard_idx as u32, row_start, shard)?;
     }
 
     let n_shards = shards.len();

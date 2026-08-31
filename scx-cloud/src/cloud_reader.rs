@@ -1485,29 +1485,23 @@ mod tests {
         writer.set_modality_n_vars(adt_id, 50).unwrap();
 
         let (indptr, indices, values) = sample_shard_data(20, 50);
-        writer
-            .write_csr_shard_for(
-                rna_id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let rna_shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
         let (indptr2, indices2, values2) = sample_shard_data(10, 50);
-        writer
-            .write_csr_shard_for(
-                adt_id,
-                &indptr2,
-                &indices2,
-                &values2,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let adt_shard = scx_format_io::ShardBuffers::new(
+            &indptr2,
+            &indices2,
+            &values2,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(adt_id, 0, adt_shard).unwrap();
         writer.finish().unwrap();
         path
     }

@@ -290,17 +290,14 @@ pub fn fixture_multimodal(dir: &tempfile::TempDir) -> PathBuf {
             values.push(((row + 2) % 256) as u8);
             indptr.push(indptr.last().unwrap() + 2);
         }
-        writer
-            .write_csr_shard_for(
-                mod_id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(mod_id, 0, shard).unwrap();
     }
     writer.finish().unwrap();
     path
@@ -364,16 +361,15 @@ pub fn fixture_multimodal_multishard(dir: &tempfile::TempDir) -> PathBuf {
                 values.push(((row + 2) % 256) as u8);
                 indptr.push(indptr.last().unwrap() + 2);
             }
+            let shard = scx_format_io::ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            );
             writer
-                .write_csr_shard_for(
-                    mod_id,
-                    &indptr,
-                    &indices,
-                    &values,
-                    CodecId::None,
-                    ValueEncoding::Uint8,
-                    start as u64,
-                )
+                .write_csr_shard_for(mod_id, start as u64, shard)
                 .unwrap();
         }
     }
@@ -405,18 +401,14 @@ pub fn fixture_obsp_layers(dir: &tempfile::TempDir) -> PathBuf {
         values.push(((row + 5) % 256) as u8);
         indptr.push(indptr.last().unwrap() + 2);
     }
-    writer
-        .write_layer_csr_shard(
-            &indptr,
-            &indices,
-            &values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-            "raw",
-            0,
-        )
-        .unwrap();
+    let shard = scx_format_io::ShardBuffers::new(
+        &indptr,
+        &indices,
+        &values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_layer_csr_shard("raw", 0, 0, shard).unwrap();
 
     // A small cell×cell obsp as a v2 Int64 COO: each cell linked to its
     // successor (mod n_obs).

@@ -558,9 +558,8 @@ pub(crate) fn emit_sorted(
             |indptr, indices, bytes, e, row_start| {
                 let n = indptr.len() as u64 - 1;
                 let codec = select_codec(bytes, e);
-                writer.write_layer_csr_shard(
-                    indptr, indices, bytes, codec, e, row_start, layer_name, shard_idx,
-                )?;
+                let shard = scx_format_io::ShardBuffers::new(indptr, indices, bytes, codec, e);
+                writer.write_layer_csr_shard(layer_name, shard_idx, row_start, shard)?;
                 shard_idx += 1;
                 Ok(n)
             },

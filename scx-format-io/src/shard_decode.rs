@@ -263,6 +263,11 @@ pub fn decode_shard_regions_scipy(
     let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
         .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
     let index_dtype_u16 = sh.index_dtype == 0;
+    let encoded = EncodedShardRef {
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+    };
 
     // Row-group-framed (v2) shards reassemble from the block index; legacy (v1)
     // shards take the direct whole-shard path. Both fall through to the same
@@ -271,20 +276,13 @@ pub fn decode_shard_regions_scipy(
     let (indptr, indices, data) = if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION {
         decode_framed_shard_scipy(
             sh,
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
+            &encoded,
             block_index_bytes,
             codec_id,
             value_encoding,
             index_dtype_u16,
         )?
     } else {
-        let encoded = EncodedShardRef {
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
-        };
         scx_codec::decode_shard_scipy(
             &encoded,
             codec_id,
@@ -418,12 +416,9 @@ impl MinorIndexBits for u32 {
 /// (`indptr[0] == 0`); we rebase the group indptrs into a single monotonic
 /// global indptr and concatenate indices/values. Output is byte-identical to a
 /// legacy whole-shard decode of the same matrix.
-#[allow(clippy::too_many_arguments)]
 fn decode_framed_shard_scipy(
     sh: &ShardHeader,
-    indptr_bytes: &[u8],
-    indices_bytes: &[u8],
-    values_bytes: &[u8],
+    encoded: &EncodedShardRef<'_>,
     block_index_bytes: &[u8],
     codec_id: CodecId,
     value_encoding: ValueEncoding,
@@ -439,19 +434,20 @@ fn decode_framed_shard_scipy(
     // `nnz = u32::MAX`. Honest shards are unaffected (the declared count wins);
     // a hostile one under-reserves and then fails in `decode_row_group` below,
     // which length-checks every frame against its own bytes.
-    let mut indptr = Vec::with_capacity(clamped_reserve(n_major + 1, indptr_bytes.len(), 8));
+    let mut indptr =
+        Vec::with_capacity(clamped_reserve(n_major + 1, encoded.indptr_bytes.len(), 8));
     indptr.push(0i64);
-    let mut indices = Vec::with_capacity(clamped_reserve(nnz, indices_bytes.len(), 4));
-    let mut data = Vec::with_capacity(clamped_reserve(nnz, values_bytes.len(), 4));
+    let mut indices = Vec::with_capacity(clamped_reserve(nnz, encoded.indices_bytes.len(), 4));
+    let mut data = Vec::with_capacity(clamped_reserve(nnz, encoded.values_bytes.len(), 4));
     let mut running: i64 = 0;
 
     for span in &spans {
         let decoded = scx_codec::decode_row_group(
             codec_id,
             span,
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
+            encoded.indptr_bytes,
+            encoded.indices_bytes,
+            encoded.values_bytes,
             value_encoding,
             index_dtype_u16,
         )?;
@@ -555,26 +551,24 @@ pub fn decode_shard_regions_native(
     let value_encoding = ValueEncoding::from_u8(sh.value_encoding)
         .ok_or(ScxError::UnknownValueEncoding(sh.value_encoding))?;
     let index_dtype_u16 = sh.index_dtype == 0;
+    let encoded = EncodedShardRef {
+        indptr_bytes,
+        indices_bytes,
+        values_bytes,
+    };
 
     // Both layouts fall through to the same bound check — see the scipy twin.
     let (indptr, indices, values) = if sh.shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION
     {
         decode_framed_shard_native(
             sh,
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
+            &encoded,
             block_index_bytes,
             codec_id,
             value_encoding,
             index_dtype_u16,
         )?
     } else {
-        let encoded = EncodedShardRef {
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
-        };
         scx_codec::decode_shard_native(
             &encoded,
             codec_id,
@@ -593,12 +587,9 @@ pub fn decode_shard_regions_native(
 /// shard from its block index, keeping integer values as `u32`. The value
 /// accumulator variant is fixed by `value_encoding.is_integer()` (a shard is
 /// uniformly integer- or float-encoded).
-#[allow(clippy::too_many_arguments)]
 fn decode_framed_shard_native(
     sh: &ShardHeader,
-    indptr_bytes: &[u8],
-    indices_bytes: &[u8],
-    values_bytes: &[u8],
+    encoded: &EncodedShardRef<'_>,
     block_index_bytes: &[u8],
     codec_id: CodecId,
     value_encoding: ValueEncoding,
@@ -609,10 +600,11 @@ fn decode_framed_shard_native(
     let nnz = sh.nnz as usize;
 
     // Same untrusted-header clamp as `decode_framed_shard_scipy` — see there.
-    let mut indptr = Vec::with_capacity(clamped_reserve(n_major + 1, indptr_bytes.len(), 8));
+    let mut indptr =
+        Vec::with_capacity(clamped_reserve(n_major + 1, encoded.indptr_bytes.len(), 8));
     indptr.push(0i64);
-    let mut indices = Vec::with_capacity(clamped_reserve(nnz, indices_bytes.len(), 4));
-    let values_reserve = clamped_reserve(nnz, values_bytes.len(), 4);
+    let mut indices = Vec::with_capacity(clamped_reserve(nnz, encoded.indices_bytes.len(), 4));
+    let values_reserve = clamped_reserve(nnz, encoded.values_bytes.len(), 4);
     let mut values_u32: Vec<u32> = if value_encoding.is_integer() {
         Vec::with_capacity(values_reserve)
     } else {
@@ -629,9 +621,9 @@ fn decode_framed_shard_native(
         let decoded = scx_codec::decode_row_group(
             codec_id,
             span,
-            indptr_bytes,
-            indices_bytes,
-            values_bytes,
+            encoded.indptr_bytes,
+            encoded.indices_bytes,
+            encoded.values_bytes,
             value_encoding,
             index_dtype_u16,
         )?;
@@ -929,24 +921,19 @@ mod tests {
         framing: Option<crate::encoder::FramingConfig>,
     ) -> SeamOutcome {
         use crate::encoder::encode_one_shard;
-        use crate::modality::ModalityType;
 
         let indptr: Vec<u64> = vec![0, indices.len() as u64];
         let values: Vec<f32> = (0..indices.len()).map(|i| (i + 1) as f32).collect();
-        let s = encode_one_shard(
-            &indptr,
-            indices,
-            &values,
-            Some(CodecId::None),
-            index_dtype,
-            encoded_n_cols,
-            0,
+        let mut opts = crate::encoder::EncodeShardOptions::new(
+            "X_shard_0",
             SectionType::CsrShard,
-            ModalityType::Rna,
-            "X_shard_0".to_string(),
-            framing,
-        )
-        .expect("encode_one_shard");
+            encoded_n_cols as u64,
+            0,
+        );
+        opts.explicit_codec = Some(CodecId::None);
+        opts.index_dtype = index_dtype;
+        opts.framing = framing;
+        let s = encode_one_shard(&indptr, indices, &values, &opts).expect("encode_one_shard");
         let mut sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
         sh.n_minor = claimed_n_minor;
 
@@ -1114,7 +1101,6 @@ mod tests {
     #[test]
     fn decode_shard_regions_framed_matches_unframed() {
         use crate::encoder::{encode_one_shard, FramingConfig};
-        use crate::modality::ModalityType;
 
         // Canonical CSR: strictly increasing indices per row, integer values.
         let indptr = [0u64, 2, 2, 5, 7];
@@ -1123,20 +1109,15 @@ mod tests {
         let n_cols: u32 = 16;
 
         let assemble = |framing: Option<FramingConfig>| {
-            let s = encode_one_shard(
-                &indptr,
-                &indices,
-                &values,
-                Some(CodecId::ShufDeltaZstd),
-                0,
-                n_cols,
-                0,
+            let mut opts = crate::encoder::EncodeShardOptions::new(
+                "X_shard_0",
                 SectionType::CsrShard,
-                ModalityType::Rna,
-                "X_shard_0".to_string(),
-                framing,
-            )
-            .expect("encode_one_shard");
+                n_cols as u64,
+                0,
+            );
+            opts.explicit_codec = Some(CodecId::ShufDeltaZstd);
+            opts.framing = framing;
+            let s = encode_one_shard(&indptr, &indices, &values, &opts).expect("encode_one_shard");
             let sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
             let regions = decode_shard_regions_scipy(
                 &sh,
@@ -1176,33 +1157,23 @@ mod tests {
     /// frames (never the indices/values).
     #[test]
     fn decode_shard_indptr_only_framed_matches_full() {
-        use crate::encoder::{encode_one_shard, FramingConfig};
-        use crate::modality::ModalityType;
+        use crate::encoder::{encode_one_shard, EncodeShardOptions, FramingConfig};
 
         let indptr = [0u64, 2, 2, 5, 7];
         let indices = [0u32, 3, 1, 4, 9, 2, 8];
         let values: Vec<f32> = vec![1.0, 4.0, 2.0, 5.0, 9.0, 3.0, 7.0];
         let n_cols: u32 = 16;
 
-        let s = encode_one_shard(
-            &indptr,
-            &indices,
-            &values,
-            Some(CodecId::ShufDeltaZstd),
-            0,
-            n_cols,
-            0,
-            SectionType::CsrShard,
-            ModalityType::Rna,
-            "X_shard_0".to_string(),
-            Some(FramingConfig {
-                row_group_rows: 2,
-                target_nnz: None,
-                trial: false,
-                decode_target: None,
-            }),
-        )
-        .expect("encode_one_shard");
+        let mut opts =
+            EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, n_cols as u64, 0);
+        opts.explicit_codec = Some(CodecId::ShufDeltaZstd);
+        opts.framing = Some(FramingConfig {
+            row_group_rows: 2,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        });
+        let s = encode_one_shard(&indptr, &indices, &values, &opts).expect("encode_one_shard");
 
         let sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
         assert_eq!(sh.shard_format_version, 2, "fixture must be framed (v2)");

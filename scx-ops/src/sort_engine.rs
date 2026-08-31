@@ -90,7 +90,7 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{
     encode_one_shard_with_value_encoding, BitmapPolicy, BitmapShard, FullCatalogEntry,
-    ModalityType, PreEncodedSection, ScxReader, ShardHeader, SHARD_HEADER_SIZE,
+    PreEncodedSection, ScxReader, ShardHeader, SHARD_HEADER_SIZE,
 };
 
 use crate::error::{OpsError, Result};
@@ -1168,7 +1168,8 @@ fn sort_multimodal(
         ) {
             let batch = reader.read_varm_for(in_id, &key)?;
             let n = batch.num_rows() as u64;
-            writer.write_varm_shard_for(out_id, &key, 0, 0, n, n, &batch)?;
+            let meta = scx_format_io::DenseShardMetadata::new(0, 0, n, n);
+            writer.write_varm_shard_for(out_id, &key, meta, &batch)?;
         }
 
         // Per-modality uns.
@@ -1501,6 +1502,13 @@ impl CsrEmitter {
         let row_start = self.emitted_rows;
         let n_rows = self.acc_row_count;
         let nnz = self.acc_indices.len();
+        let shard = scx_format_io::ShardBuffers::new(
+            &self.acc_indptr,
+            &self.acc_indices,
+            &self.acc_values,
+            codec,
+            self.value_encoding,
+        );
         match (&self.target, self.modality_id) {
             (EmitTarget::X, None) => writer.write_csr_shard(
                 &self.acc_indptr,
@@ -1510,36 +1518,13 @@ impl CsrEmitter {
                 self.value_encoding,
                 row_start,
             )?,
-            (EmitTarget::X, Some(id)) => writer.write_csr_shard_for(
-                id,
-                &self.acc_indptr,
-                &self.acc_indices,
-                &self.acc_values,
-                codec,
-                self.value_encoding,
-                row_start,
-            )?,
-            (EmitTarget::Layer(name), None) => writer.write_layer_csr_shard(
-                &self.acc_indptr,
-                &self.acc_indices,
-                &self.acc_values,
-                codec,
-                self.value_encoding,
-                row_start,
-                name,
-                self.shard_idx,
-            )?,
-            (EmitTarget::Layer(name), Some(id)) => writer.write_layer_csr_shard_for(
-                id,
-                name,
-                self.shard_idx,
-                &self.acc_indptr,
-                &self.acc_indices,
-                &self.acc_values,
-                codec,
-                self.value_encoding,
-                row_start,
-            )?,
+            (EmitTarget::X, Some(id)) => writer.write_csr_shard_for(id, row_start, shard)?,
+            (EmitTarget::Layer(name), None) => {
+                writer.write_layer_csr_shard(name, self.shard_idx, row_start, shard)?
+            }
+            (EmitTarget::Layer(name), Some(id)) => {
+                writer.write_layer_csr_shard_for(id, name, self.shard_idx, row_start, shard)?
+            }
         }
         // Detection bitmap (X only) — one sidecar per X shard, written in shard
         // order so its index aligns with the CSR shard (matches convert).
@@ -1797,19 +1782,21 @@ fn emit_x_in_memory_grouped_fast(
                         local_indptr.push(local_indices.len() as u64);
                     }
                     let nnz = local_indices.len();
+                    let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                        format!("X_shard_{idx}"),
+                        SectionType::CsrShard,
+                        n_vars_u32 as u64,
+                        r0 as u64,
+                    );
+                    enc_opts.explicit_codec = explicit_codec;
+                    enc_opts.index_dtype = index_dtype;
+                    enc_opts.framing = framing;
+                    enc_opts.value_encoding = Some(value_encoding);
                     let section = encode_one_shard_with_value_encoding(
                         &local_indptr,
                         &local_indices,
                         &local_values,
-                        explicit_codec,
-                        index_dtype,
-                        n_vars_u32,
-                        r0 as u64,
-                        SectionType::CsrShard,
-                        ModalityType::Rna,
-                        format!("X_shard_{idx}"),
-                        framing,
-                        Some(value_encoding),
+                        &enc_opts,
                     )?;
                     let bm = if bitmap_should_build(bitmap, n_rows as u64, nnz, n_vars_u32) {
                         Some(BitmapShard::build_from_csr(

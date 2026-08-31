@@ -1,11 +1,10 @@
 use super::cache::WeightedLruCache;
 use super::csc::check_csc_sidecar_fresh;
 use super::*;
-use crate::encoder::encode_one_shard;
+use crate::encoder::{encode_one_shard, EncodeShardOptions};
 use crate::header::FileHeader;
-use crate::modality::ModalityType;
 use crate::section::SectionType;
-use crate::writer::ScxWriter;
+use crate::writer::{ScxWriter, ShardBuffers};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
@@ -139,25 +138,20 @@ fn write_framed_file(
         };
         let (indptr, indices, values_u8) = sample_shard_data(shard_rows, n_vars);
         let values_f32: Vec<f32> = values_u8.iter().map(|&v| v as f32).collect();
-        let pre = encode_one_shard(
-            &indptr,
-            &indices,
-            &values_f32,
-            Some(codec),
-            0, // u16 indices
-            n_vars as u32,
-            (s * rows_per_shard) as u64,
-            SectionType::CsrShard,
-            ModalityType::Rna,
+        let mut opts = EncodeShardOptions::new(
             format!("X_shard_{s}"),
-            Some(crate::encoder::FramingConfig {
-                row_group_rows,
-                target_nnz: None,
-                trial: false,
-                decode_target: None,
-            }),
-        )
-        .unwrap();
+            SectionType::CsrShard,
+            n_vars as u64,
+            (s * rows_per_shard) as u64,
+        );
+        opts.explicit_codec = Some(codec);
+        opts.framing = Some(crate::encoder::FramingConfig {
+            row_group_rows,
+            target_nnz: None,
+            trial: false,
+            decode_target: None,
+        });
+        let pre = encode_one_shard(&indptr, &indices, &values_f32, &opts).unwrap();
         writer.write_preencoded_shard(pre).unwrap();
     }
     writer.finish().unwrap();
@@ -2253,32 +2247,26 @@ fn multimodal_fallback_does_not_mix_modalities() {
     let rna_indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
     let rna_indices: Vec<u32> = vec![0, 0, 0, 0];
     let rna_values: Vec<u8> = vec![1, 1, 1, 1];
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &rna_indptr,
-            &rna_indices,
-            &rna_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = ShardBuffers::new(
+        &rna_indptr,
+        &rna_indices,
+        &rna_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
     // ATAC: cells 0..4 all express only gene 3.
     let atac_indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
     let atac_indices: Vec<u32> = vec![3, 3, 3, 3];
     let atac_values: Vec<u8> = vec![1, 1, 1, 1];
-    writer
-        .write_csr_shard_for(
-            atac_id,
-            &atac_indptr,
-            &atac_indices,
-            &atac_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let atac_shard = ShardBuffers::new(
+        &atac_indptr,
+        &atac_indices,
+        &atac_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(atac_id, 0, atac_shard).unwrap();
     writer.finish().unwrap();
 
     // No bitmap shards were written → both methods hit the
@@ -2378,28 +2366,22 @@ fn backed_csr_reader_new_on_a_multimodal_file_folds_every_modality() {
 
     // RNA values 11..=14 at column 0; ATAC values 21..=24 at column 4. The
     // disjoint value ranges make "whose rows came back?" answerable.
-    writer
-        .write_csr_shard_for(
-            rna_id,
-            &[0, 1, 2, 3, 4],
-            &[0, 0, 0, 0],
-            &[11, 12, 13, 14],
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer
-        .write_csr_shard_for(
-            atac_id,
-            &[0, 1, 2, 3, 4],
-            &[4, 4, 4, 4],
-            &[21, 22, 23, 24],
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
+    let rna_shard = ShardBuffers::new(
+        &[0, 1, 2, 3, 4],
+        &[0, 0, 0, 0],
+        &[11, 12, 13, 14],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, rna_shard).unwrap();
+    let atac_shard = ShardBuffers::new(
+        &[0, 1, 2, 3, 4],
+        &[4, 4, 4, 4],
+        &[21, 22, 23, 24],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(atac_id, 0, atac_shard).unwrap();
     writer.finish().unwrap();
 
     let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 0);

@@ -152,17 +152,14 @@ pub fn write_multimodal_test_file(
             values.push(((r + 1) % 256) as u8);
             indptr.push(indptr.last().unwrap() + 1);
         }
-        writer
-            .write_csr_shard_for(
-                id,
-                &indptr,
-                &indices,
-                &values,
-                CodecId::None,
-                ValueEncoding::Uint8,
-                0,
-            )
-            .unwrap();
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
     }
 
     writer.finish().unwrap();
