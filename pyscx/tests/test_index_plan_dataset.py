@@ -1156,7 +1156,7 @@ class TestGilDuringTeardown:
     right now:
 
     - a **positive control** — a wall-clock-capped `hashlib.sha256` loop over
-      a fixed 1 MiB buffer for the same duration, which releases the GIL by
+      a fixed 4 KiB buffer for the same duration, which releases the GIL by
       construction (buffers > 2 KiB) while burning a core like the teardown
       does, must score a leading tick. Zero means the ticker thread is not
       schedulable next to busy native work inside a window this short (a
@@ -1368,7 +1368,12 @@ class TestGilDuringTeardown:
         # `hashlib.sha256` releases the GIL for buffers over 2 KiB; the loop
         # reacquires it between iterations, exactly like a teardown that
         # releases around its blocking waits. Duration is capped: past ~1 s of
-        # burn, schedulability is long since proven either way.
+        # burn, schedulability is long since proven either way. The buffer must
+        # be barely above the 2 KiB release threshold, never larger: the GIL is
+        # released only DURING each digest call, so the hash quantum sets the
+        # control's granularity — a 1 MiB digest is ~0.7 ms/call, 2x the
+        # 0.3 ms minimum window, making the control's release window longer
+        # than the teardown's and un-load-equivalent again (4 KiB is ~3 us).
         # Only consulted when every teardown trial was tickless: when a trial
         # ticked, the assertion below passes on the measurement itself and a
         # coincidentally starved control must not convert that pass to a skip.
@@ -1376,7 +1381,7 @@ class TestGilDuringTeardown:
             import hashlib
             import time as _time
 
-            burn = bytes(1 << 20)
+            burn = bytes(1 << 12)
             burn_s = min(teardown_s, 1.0)
 
             def _burn_gil_free():

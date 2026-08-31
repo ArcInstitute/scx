@@ -250,8 +250,11 @@ jobs:
       # `--test <bin>` selection + `--test-threads=1`, and NOT
       # `HDF5_USE_FILE_LOCKING=FALSE`.
       #
-      # These files are the only scx-cli test targets that reference the
-      # `hdf5` crate at all — every other target runs (in parallel) in the
+      # convert_stream, cellbender_cli and convert_subset are the only scx-cli
+      # targets that reference the `hdf5` crate (they are what the lock
+      # serialization below exists for); doublet_import_hdf5 never links it —
+      # it is feature-gated *behavior* — and merely rides in the same
+      # serialized invocation. Every other target runs (in parallel) in the
       # `test` job. They build an h5ad with `hdf5::File::create` in the test
       # process and then spawn the `scx` binary to open it. Run in parallel,
       # sibling tests' open files make libhdf5 refuse the child's `H5Fopen`
@@ -2846,8 +2849,15 @@ jobs:
           # disappeared while a comment still mentioned its flag must fail.
           live=$(grep -v '^\s*#' "$ci")
           fail=0
+          # "Positive hdf5 cfg" = a cfg attribute line naming feature = "hdf5"
+          # outside a not(...) — matching the crate's real idioms including
+          # #[cfg(all(test, feature = "hdf5"))] and flexible spacing, which the
+          # first version's prefix-anchored regex missed.
+          pos_file='^#!\[cfg\(.*feature *= *"hdf5"'
+          pos_item='^[[:space:]]*#\[cfg\(.*feature *= *"hdf5"'
+          neg='not *[(] *feature *= *"hdf5"'
           for f in scx-cli/tests/*.rs; do
-            if grep -q '^#!\[cfg(feature = "hdf5")\]' "$f"; then
+            if grep -E "$pos_file" "$f" | grep -Evq "$neg"; then
               stem=$(basename "$f" .rs)
               if ! grep -q -- "--test $stem" <<< "$live"; then
                 echo "::error::$f is hdf5-gated but '--test $stem' is missing from the test-hdf5 job in $ci — it would run in neither CI lane"
@@ -2860,13 +2870,13 @@ jobs:
               # compiles it out and the hdf5 lane's --test list never selects
               # it, so it runs in NEITHER lane. (`not(feature = "hdf5")` items
               # are fine: they run in the default lane by construction.)
-              if grep -Eq '^\s*#\[cfg\((all\()?feature = "hdf5"' "$f"; then
+              if grep -E "$pos_item" "$f" | grep -Evq "$neg"; then
                 echo "::error::$f has an hdf5-gated item inside an ungated test binary — move it to a #![cfg(feature = \"hdf5\")] file (see doublet_import_hdf5.rs) or it runs in neither CI lane"
                 fail=1
               fi
             fi
           done
-          for name in $(grep -o -- "--skip '[a-z_]*::" "$ci" | sed "s/--skip '//; s/:://"); do
+          for name in $(grep -o -- "--skip '[a-z_]*::" <<< "$live" | sed "s/--skip '//; s/:://"); do
             if [ ! -e "scx-convert/src/$name.rs" ]; then
               echo "::error::test-hdf5 --skip prefix '$name' names no scx-convert/src/$name.rs — stale skip list"
               fail=1
@@ -2883,7 +2893,7 @@ jobs:
               *_tests) tf="scx-convert/src/$name.rs" ;;
               *) tf="scx-convert/src/${name}_tests.rs" ;;
             esac
-            if [ -e "$tf" ] && grep -Eq '^\s*#\[cfg\((all\()?feature = "hdf5"' "$tf"; then
+            if [ -e "$tf" ] && grep -E "$pos_item" "$tf" | grep -Evq "$neg"; then
               echo "::error::$tf has an hdf5-gated test inside the skipped ungated '$name' module — move it to an hdf5-gated module (see convert_tests_h5ad.rs) or it runs in neither CI lane"
               fail=1
             fi
