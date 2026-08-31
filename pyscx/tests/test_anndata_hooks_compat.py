@@ -222,3 +222,81 @@ def test_registration_reports_success():
     )
     pyscx.accel.subset_obs(adata, np.array([True, True, False]))
     assert adata.n_obs == 2
+
+
+# ---------------------------------------------------------------------------
+# is_backed_handle vs HANDLE_CLASSES — the drift guard
+# ---------------------------------------------------------------------------
+
+
+def _handle_instances(tmp_dir):
+    """One live instance per handle class, keyed by class name.
+
+    Deliberately a hand-written mapping: a newly registered handle class with
+    no entry here makes the guard below fail loudly, which is the point.
+    """
+    import anndata
+    import numpy as np
+    import pyscx
+    import scipy.sparse as sp
+
+    rng = np.random.RandomState(5)
+    x = (rng.random_sample((30, 10)) * 20).astype(np.float32)
+    x[rng.random_sample((30, 10)) > 0.6] = 0.0
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(x),
+        layers={"counts": sp.csr_matrix(x)},
+        obsm={"X_emb": rng.random_sample((30, 3)).astype(np.float32)},
+    )
+    path = str(tmp_dir / "handle_instances.scx")
+    pyscx.from_anndata(adata, path)
+
+    # `obsm=[…]` is what keeps an aligned store lazy rather than materializing.
+    backed = pyscx.open(path).to_anndata(backed=True, obsm=["X_emb"])
+    transformed = pyscx.open(path).to_anndata(backed=True)
+    pyscx.accel.normalize_total(transformed, target_sum=1e4)
+
+    out = {}
+    for obj in (backed.X, backed.layers["counts"], backed.obsm["X_emb"], transformed.X):
+        out[type(obj).__name__] = obj
+    return out
+
+
+def test_is_backed_handle_agrees_with_the_registered_handle_classes(tmp_dir):
+    """`pyscx.is_backed_handle` must accept exactly the classes that
+    `HANDLE_CLASSES` registers with anndata's seams.
+
+    The Rust `HANDLE_CLASSES` list drives seam registration, while the
+    predicate is a separate cast chain beside it. Those can drift silently: a
+    fifth handle class added to the list would get its `as_view` / `_subset` /
+    `to_memory` hooks registered and still be rejected by `is_backed_handle`,
+    so every caller branching on it would take the wrong arm. The seam
+    registry is used as the authority here precisely because it is the list's
+    own output, not a second copy of it.
+    """
+    import pyscx
+
+    hook = getattr(importlib.import_module("anndata._core.index"), "_subset")
+    # pyo3 classes report `__module__ == "builtins"`, so key off the name.
+    registered = {
+        cls.__name__ for cls in hook.registry if cls.__name__.startswith("Scx")
+    }
+    assert registered == set(HANDLE_CLASS_NAMES), (
+        "the SCX classes registered with anndata's _subset seam have changed; "
+        f"registered={sorted(registered)} vs HANDLE_CLASS_NAMES="
+        f"{sorted(HANDLE_CLASS_NAMES)}"
+    )
+
+    instances = _handle_instances(tmp_dir)
+    missing = registered - set(instances)
+    assert not missing, (
+        f"no instance factory in this test for {sorted(missing)}; a handle "
+        "class was added to HANDLE_CLASSES — extend `_handle_instances` and "
+        "confirm `is_backed_handle` accepts it"
+    )
+    for name in sorted(registered):
+        assert pyscx.is_backed_handle(instances[name]), (
+            f"{name} is registered with anndata's seams but "
+            "`is_backed_handle` rejects it — the cast chain in "
+            "`anndata_hooks.rs` is out of sync with `HANDLE_CLASSES`"
+        )

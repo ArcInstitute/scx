@@ -1453,6 +1453,26 @@ impl ScxWriter {
         Ok(())
     }
 
+    /// Record a `CsrShard`'s codec for the file-header default when the shard
+    /// arrives as already-serialized bytes.
+    ///
+    /// The byte-copy paths (`write_csr_shard_raw_copy*`, `copy_section_verbatim`)
+    /// never reach `write_shard_inner`, so without this a writer that populates
+    /// its CSR shards exclusively by copying — a merge, or the backed rewrite's
+    /// byte-passthrough branch — kept whatever placeholder the caller built the
+    /// header with. That is how a `codec_id = 0` header survives on top of
+    /// compressed shards, i.e. it re-mints the very lie
+    /// [`Self::first_csr_codec`] exists to stop, and passes it to the next
+    /// consumer that trusts the file header.
+    fn record_copied_csr_codec(&mut self, section_type: SectionType, shard_bytes: &[u8]) {
+        if !matches!(section_type, SectionType::CsrShard) || self.first_csr_codec.is_some() {
+            return;
+        }
+        if let Ok(h) = ShardHeader::read_from(&mut &shard_bytes[..]) {
+            self.first_csr_codec = Some(h.codec_id);
+        }
+    }
+
     fn write_csr_shard_raw_copy_inner(
         &mut self,
         section_bytes: &[u8],
@@ -1460,6 +1480,7 @@ impl ScxWriter {
         stats: ShardStats,
     ) -> Result<()> {
         self.guard_no_legacy_shard_in_v4(SectionType::CsrShard, section_bytes)?;
+        self.record_copied_csr_codec(SectionType::CsrShard, section_bytes);
         self.write_padding()?;
         let shard_global_offset = self.current_offset;
         let section_length = section_bytes.len() as u64;
@@ -1613,6 +1634,7 @@ impl ScxWriter {
         // A v4 file requires framed (shard v2) CSR-class shards; reject an
         // unframed verbatim copy into one.
         self.guard_no_legacy_shard_in_v4(src_entry.section_type, raw_bytes)?;
+        self.record_copied_csr_codec(src_entry.section_type, raw_bytes);
 
         self.write_padding()?;
 

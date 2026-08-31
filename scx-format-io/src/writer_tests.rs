@@ -3272,3 +3272,65 @@ fn finish_stamps_a_codec_some_csr_shard_actually_used() {
         "placeholder 0 survived into a file whose shard is compressed"
     );
 }
+
+/// The raw-copy path stamps the header too — not just `write_csr_shard`.
+///
+/// `write_csr_shard_raw_copy` (the merge path, `scx-ops/src/merge.rs`) and
+/// `copy_section_verbatim` (the backed rewrite's byte-passthrough) never reach
+/// `write_shard_inner`, so a writer whose CSR shards arrive only as copied
+/// bytes used to keep the caller's placeholder — re-minting the `codec_id = 0`
+/// lie over compressed shards that this PR exists to stop.
+#[test]
+fn raw_copy_paths_also_stamp_the_header_codec() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A source whose shard is genuinely Scx1.
+    let src_path = dir.path().join("raw_copy_src.scx");
+    let mut writer = ScxWriter::new(&src_path, sample_header()).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let src_final = writer.finish().unwrap();
+
+    let reader = crate::ScxReader::open(&src_final).unwrap();
+    let entry = reader.catalog().csr_shards_sorted()[0];
+    let shard_codec = reader.read_shard_header(entry).unwrap().codec_id;
+    assert_ne!(
+        shard_codec,
+        CodecId::None as u8,
+        "premise: source is compressed"
+    );
+    let section_bytes = reader.read_raw_shard_bytes(entry).unwrap();
+    let stats = entry.stats.clone().unwrap();
+    let nnz = stats.nnz;
+
+    // Copy that shard into a writer whose header carries the placeholder.
+    let dst_path = dir.path().join("raw_copy_dst.scx");
+    let mut header = sample_header();
+    header.codec_id = CodecId::None as u8;
+    let mut dst = ScxWriter::new(&dst_path, header).unwrap();
+    dst.write_obs(&sample_obs()).unwrap();
+    dst.write_var(&sample_var()).unwrap();
+    dst.write_csr_shard_raw_copy(section_bytes, stats, nnz)
+        .unwrap();
+    let dst_final = dst.finish().unwrap();
+
+    let out = crate::ScxReader::open(&dst_final).unwrap();
+    assert_eq!(
+        out.header().codec_id,
+        shard_codec,
+        "raw-copy output header claims {} over a shard encoded {}",
+        out.header().codec_id,
+        shard_codec
+    );
+}

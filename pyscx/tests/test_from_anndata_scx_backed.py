@@ -14,6 +14,7 @@ deletions, column projection, and lazy transforms.
 
 import json
 import os
+import shutil
 import warnings
 
 import anndata
@@ -577,3 +578,177 @@ def test_low_median_shard_with_large_outliers_does_not_blow_up(tmp_dir):
 
     a, b = os.path.getsize(no_subset), os.path.getsize(subset)
     assert b < a * 1.25, f"ratio {b / a:.2f} ({b} vs {a})"
+
+
+# ---------------------------------------------------------------------------
+# The production case: a file header that lies about compressed shards
+# ---------------------------------------------------------------------------
+
+# Byte offset of `codec_id` in the file header: magic[4] + format_version[2] +
+# header_length[2] + flags[4] + n_obs[8] + n_vars[8] + nnz[8] + n_csr_shards[4]
+# + n_csc_shards[4] + shard_target_rows[4]. See `FileHeader::write_to`.
+_HEADER_CODEC_ID_OFFSET = 48
+
+
+def _plant_lying_header(src, dst, claimed_codec=0):
+    """Copy `src` to `dst` with the file header's `codec_id` overwritten.
+
+    This is the shape the 2026-08-29 Replogle artifact had and the one no
+    current writer can produce any more: header `none` over compressed shards.
+    Reproducing it needs a byte poke, which is exactly why the regression
+    shipped without a test. The reader dispatches on per-shard headers
+    (`docs/codec.md` §1), so the file stays fully readable.
+    """
+    shutil.copy(src, dst)
+    with open(dst, "r+b") as f:
+        f.seek(_HEADER_CODEC_ID_OFFSET)
+        f.write(bytes([claimed_codec]))
+    return dst
+
+
+def _lying_header_source(tmp_dir, name):
+    """A compressed `scx1` file whose header claims `none`."""
+    import pyscx
+
+    rng = np.random.RandomState(21)
+    n_obs, n_vars = 600, 40
+    dense = rng.randint(1, 6, size=(n_obs, n_vars)).astype(np.float32)
+    dense[rng.random_sample((n_obs, n_vars)) > 0.5] = 0.0
+    adata = anndata.AnnData(X=sp.csr_matrix(dense))
+
+    honest = str(tmp_dir / f"{name}_honest.scx")
+    pyscx.from_anndata(adata, honest, codec="scx1", shard_size=100)
+    assert pyscx.open(honest).codec_id == 1, "premise: shards are scx1"
+
+    lying = _plant_lying_header(honest, str(tmp_dir / f"{name}_lying.scx"))
+    assert pyscx.open(lying).codec_id == 0, "premise: header now claims none"
+    return honest, lying, n_obs
+
+
+def test_subset_rewrite_ignores_a_header_that_claims_none(tmp_dir):
+    """The Replogle case, as a test.
+
+    Header says `none`, every shard is compressed. Inheriting the header wrote
+    the whole matrix raw — 2.19 GB became 10.79 GB on the real artifact. The
+    honest source and the lying one differ by one header byte, so their
+    rewrites must come out the same size.
+    """
+    import pyscx
+
+    honest, lying, n_obs = _lying_header_source(tmp_dir, "subset")
+    keep = np.ones(n_obs, dtype=bool)
+    keep[0] = False
+
+    sizes = {}
+    for tag, src in (("honest", honest), ("lying", lying)):
+        backed = pyscx.open(src).to_anndata(backed=True)
+        dst = str(tmp_dir / f"subset_out_{tag}.scx")
+        pyscx.from_anndata(backed[keep], dst)
+        out = pyscx.open(dst)
+        assert out.n_obs == n_obs - 1
+        assert out.codec_id != 0, (
+            f"{tag}: output header claims `none`; the rewrite inherited a "
+            "file-header codec instead of reading the source's shards"
+        )
+        sizes[tag] = os.path.getsize(dst)
+
+    assert sizes["lying"] < sizes["honest"] * 1.25, (
+        f"a one-byte header lie changed the output size: "
+        f"lying={sizes['lying']} vs honest={sizes['honest']}"
+    )
+
+
+def test_lazy_rewrite_ignores_a_header_that_claims_none(tmp_dir):
+    """Same fixture through the *lazy* route.
+
+    `normalize_total` / `log1p` then `from_anndata` takes
+    `route_scx_lazy_to_scx`, which pinned the encode codec to the file header
+    exactly as the backed route did. A transformed rewrite of any
+    streaming-converted file therefore wrote raw values.
+    """
+    import pyscx
+
+    honest, lying, _ = _lying_header_source(tmp_dir, "lazy")
+
+    sizes = {}
+    for tag, src in (("honest", honest), ("lying", lying)):
+        backed = pyscx.open(src).to_anndata(backed=True)
+        pyscx.accel.normalize_total(backed, target_sum=1e4)
+        assert type(backed.X).__name__ == "ScxLazyTransformedDataset", (
+            "premise: the transform should leave X lazy"
+        )
+        dst = str(tmp_dir / f"lazy_out_{tag}.scx")
+        pyscx.from_anndata(backed, dst)
+        out = pyscx.open(dst)
+        assert out.codec_id != 0, (
+            f"{tag}: lazy rewrite output header claims `none` — the lazy route "
+            "is still inheriting the source's file header"
+        )
+        sizes[tag] = os.path.getsize(dst)
+
+    assert sizes["lying"] < sizes["honest"] * 1.25, (
+        f"lazy: a one-byte header lie changed the output size: "
+        f"lying={sizes['lying']} vs honest={sizes['honest']}"
+    )
+
+
+def test_explicit_codec_is_not_silently_dropped_by_passthrough(tmp_dir):
+    """An explicit `codec=` must hold for every shard in the output.
+
+    The passthrough gate compared the request against the *file header*, so on
+    a mixed-codec source `codec="scx1"` took the byte-copy path and returned a
+    file still holding `zstd` shards — the request silently ignored. `none`
+    (the GDS fast path) is the case where that matters most.
+    """
+    import pyscx
+
+    src, n_obs = _mixed_codec_source(tmp_dir, name="explicit_mixed.scx")
+    # The bug needs the requested codec to EQUAL the source's file header while
+    # the shards disagree with it: that is what made the gate say "already this
+    # codec, copy the bytes". Requesting a codec the header does not name never
+    # reached passthrough, so it would not have caught this.
+    assert pyscx.open(src).codec_id == 1, "premise: header names scx1"
+    backed = pyscx.open(src).to_anndata(backed=True)
+
+    dst = str(tmp_dir / "explicit_forced.scx")
+    pyscx.from_anndata(backed, dst, codec="scx1", row_group_rows=0)
+    out = pyscx.open(dst)
+    assert out.n_obs == n_obs
+
+    # Provenance is the observable: a mixed source cannot honour an explicit
+    # codec by copying bytes, so it must decode-encode.
+    payload = next(
+        json.loads(p["params_json"])
+        for p in out.provenance()
+        if json.loads(p["params_json"]).get("x_source") == "backed"
+    )
+    assert payload["passthrough"] is False, (
+        "codec='scx1' was requested on a source whose shards are only half "
+        "scx1, yet the rewrite byte-copied them; the explicit codec was "
+        "silently dropped"
+    )
+
+
+def test_passthrough_does_not_carry_a_lying_header_forward(tmp_dir):
+    """Byte-passthrough must not re-mint the false header.
+
+    A no-subset backed rewrite copies shards verbatim and used to copy the
+    source's `codec_id` with them, so a `none`-claiming header survived into
+    the new file — which then fed the same bug to the next consumer. The copy
+    paths now record the codec they copied, so `finish()` stamps the truth.
+    """
+    import pyscx
+
+    honest, lying, n_obs = _lying_header_source(tmp_dir, "passthrough")
+
+    backed = pyscx.open(lying).to_anndata(backed=True)
+    dst = str(tmp_dir / "passthrough_out.scx")
+    pyscx.from_anndata(backed, dst)
+
+    out = pyscx.open(dst)
+    assert out.n_obs == n_obs
+    _assert_passthrough(dst)
+    assert out.codec_id == 1, (
+        "a verbatim copy of scx1 shards produced a header claiming "
+        f"{out.codec_id}; the copy path is not recording the codec it copied"
+    )
