@@ -27,9 +27,23 @@ pub const DEFAULT_CSC_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// Configuration options for writing a CSC sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CscSidecarOptions {
+    /// Bounds each emitted shard's column count, together with
+    /// `memory_budget_bytes` (whichever is smaller).
     pub cols_per_shard: usize,
     pub memory_budget_bytes: usize,
+    /// - `None` → single-modality file; shards written via
+    ///   [`ScxWriter::write_csc_shard`] (`X_csc_shard_*`).
+    /// - `Some(id)` → multimodal file; shards written via
+    ///   [`ScxWriter::write_csc_shard_for`] under modality `id`.
     pub modality_id: Option<u8>,
+    /// When `Some`, the emitted CSC shards are row-group-framed (shard v2,
+    /// column-major — the "row" axis is columns for CSC), enabling the
+    /// scattered per-gene-group CSC reader. When `None`, unframed (v1). This
+    /// overrides the writer's framing for the scope of the call and restores
+    /// it afterward, so CSC framing no longer depends on hidden writer state
+    /// (the caller need not `set_framing` first). The caller is responsible
+    /// for the file `format_version` being v4 when framing (see
+    /// `IngestOptions`/`from_anndata`).
     pub framing: Option<FramingConfig>,
 }
 
@@ -45,12 +59,12 @@ impl Default for CscSidecarOptions {
 }
 
 /// Stream a CSR→CSC transpose over `csr_shards` and write the result as a CSC
-/// sidecar, one shard per chunk, via the writer.
+/// sidecar, one shard per chunk, via the writer. See [`CscSidecarOptions`]
+/// for what each option controls.
 ///
-/// Each emitted shard's column count is bounded by `opts.cols_per_shard` (or
-/// `opts.memory_budget_bytes`, whichever is smaller). `csr_shards` must already be
-/// canonical — this helper does not sort/dedup/drop-zeros (callers do so
-/// upstream when their source requires it).
+/// `csr_shards` must already be canonical — this helper does not
+/// sort/dedup/drop-zeros (callers do so upstream when their source requires
+/// it).
 pub fn write_csc_sidecar(
     writer: &mut ScxWriter,
     csr_shards: &[ScxCsr],
