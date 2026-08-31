@@ -478,12 +478,18 @@ impl ScxWriter {
     ) -> Result<()> {
         let name = name.into();
 
-        // Central uniqueness guard (SCX-015): readers resolve a section name to
+        // Uniqueness guard (SCX-015): readers resolve a section name to
         // the first catalog match, so a duplicate (modality_id, section_type,
         // name) triple produces a file whose extra section is silently
-        // unreachable. Reject it at the single write choke-point. Legitimate
-        // shard families are unaffected because their names carry distinct
-        // `_shard_N` suffixes.
+        // unreachable. Reject it at this write path. This is not the single
+        // choke-point for every section write, though: the CSR/CSC/layer-shard
+        // data writers (write_shard_inner and its callers), write_raw_shard,
+        // write_csr_shard_raw_copy_inner, write_preencoded_shard, and
+        // copy_section_verbatim push `FullCatalogEntry` directly and skip this
+        // check; they rely on callers not generating a colliding
+        // (modality_id, section_type, name) triple (shard names carry a
+        // `_shard_N` suffix by convention, but that convention isn't enforced
+        // here).
         let modality_id = self.current_modality_id;
         if self.entries.iter().any(|e| {
             e.name == name && e.section_type == section_type && e.modality_id == modality_id
