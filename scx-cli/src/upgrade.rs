@@ -2032,10 +2032,10 @@ mod tests {
 
         // An obs x obs graph with an endpoint at column 5 — beyond `n_vars`.
         //
-        // Written through `encode_one_shard_with_value_encoding` rather than
-        // `write_obsp_shard`, because that writer derives `n_minor` from the
-        // header's `n_vars` and so **cannot express** an obs x obs graph on a
-        // file where `n_obs > n_vars` — it rejects this very shard with
+        // Written through `encode_one_shard` rather than `write_obsp_shard`,
+        // because that writer derives `n_minor` from the header's `n_vars`
+        // and so **cannot express** an obs x obs graph on a file where
+        // `n_obs > n_vars` — it rejects this very shard with
         // `ShardIndexOutOfRange { index: 5, n_minor: 3 }`. That is the same
         // defect on the write side, and it is why `optimize` uses this API for
         // this section type. Row 0 also stores an explicit zero, so the graph
@@ -2045,10 +2045,11 @@ mod tests {
             SectionType::ObspCsrShard,
             n_obs as u64,
             0,
+            0,
         );
         enc_opts.explicit_codec = Some(CodecId::None);
         enc_opts.value_encoding = Some(ValueEncoding::Uint8);
-        let pre = scx_format_io::encoder::encode_one_shard_with_value_encoding(
+        let pre = scx_format_io::encoder::encode_one_shard(
             &[0u64, 2, 3, 4, 5, 6],
             &[0u32, 5, 5, 0, 1, 2],
             &[1.0f32, 1.0, 2.0, 3.0, 4.0, 5.0],

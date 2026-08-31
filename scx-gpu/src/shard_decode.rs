@@ -1142,9 +1142,9 @@ mod tests {
             SectionType::CsrShard,
             n_cols as u64,
             0,
+            index_dtype,
         );
         enc_opts.explicit_codec = Some(explicit_codec);
-        enc_opts.index_dtype = index_dtype;
         enc_opts.framing = Some(framing);
         let section = scx_format_io::encode_one_shard(indptr, indices, values_f32, &enc_opts)
             .expect("encode_one_shard (framed) failed");

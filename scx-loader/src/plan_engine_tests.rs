@@ -493,9 +493,9 @@ pub(crate) fn write_framed_fixture(path: &std::path::Path) {
             scx_format_io::section::SectionType::CsrShard,
             n_vars as u64,
             row_start as u64,
+            0,
         );
         enc_opts.explicit_codec = Some(CodecId::None);
-        enc_opts.index_dtype = 0;
         enc_opts.framing = Some(scx_format_io::FramingConfig {
             row_group_rows,
             ..Default::default()

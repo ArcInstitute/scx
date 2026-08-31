@@ -304,19 +304,6 @@ impl DenseShardMetadata {
 /// is redundant; for sparse shards `batch.num_rows()` counts COO
 /// triples (= nnz in the shard's row range) rather than the row span,
 /// so the stamped value is the only authoritative source.
-fn stamp_dense_shard_metadata(
-    batch: &RecordBatch,
-    shard_idx: u32,
-    row_start: u64,
-    n_shard_rows: u64,
-    n_rows_total: u64,
-) -> RecordBatch {
-    stamp_dense_shard_meta(
-        batch,
-        DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
-    )
-}
-
 fn stamp_dense_shard_meta(batch: &RecordBatch, meta: DenseShardMetadata) -> RecordBatch {
     let mut metadata = batch.schema_ref().metadata().clone();
     metadata.insert("shard_idx".to_string(), meta.shard_idx.to_string());
@@ -672,8 +659,10 @@ impl ScxWriter {
             }
             ObsVarLayout::Pending | ObsVarLayout::Sharded(_) => {}
         }
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         // Stamp the shard's global row range into the catalog so the query
         // engine can map this shard to its rows — and skip decoding it when
@@ -718,8 +707,10 @@ impl ScxWriter {
             }
             ObsVarLayout::Pending | ObsVarLayout::Sharded(_) => {}
         }
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         // Mirror of `write_obs_shard`: stamp the row range for symmetry and
         // future var-axis pushdown.
@@ -819,8 +810,10 @@ impl ScxWriter {
         batch: &RecordBatch,
     ) -> Result<()> {
         self.has_obsm = true;
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("obsm/{name}_shard_{shard_idx}"),
@@ -842,8 +835,10 @@ impl ScxWriter {
         n_rows_total: u64,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("varm/{name}_shard_{shard_idx}"),
@@ -875,8 +870,10 @@ impl ScxWriter {
         batch: &RecordBatch,
     ) -> Result<()> {
         self.has_obsp = true;
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("obsp/{name}_shard_{shard_idx}"),
@@ -897,8 +894,10 @@ impl ScxWriter {
         n_rows_total: u64,
         batch: &RecordBatch,
     ) -> Result<()> {
-        let stamped =
-            stamp_dense_shard_metadata(batch, shard_idx, row_start, n_shard_rows, n_rows_total);
+        let stamped = stamp_dense_shard_meta(
+            batch,
+            DenseShardMetadata::new(shard_idx, row_start, n_shard_rows, n_rows_total),
+        );
         let data = Self::write_arrow_ipc(&stamped)?;
         self.write_section_bytes(
             format!("varp/{name}_shard_{shard_idx}"),

@@ -277,9 +277,9 @@ pub fn optimize_with_framing(
             entry.section_type,
             n_minor as u64,
             row_start,
+            index_dtype,
         );
         enc_opts.explicit_codec = codec;
-        enc_opts.index_dtype = index_dtype;
         enc_opts.framing = framing;
         let pre = encode_one_shard(&indptr, &indices, &values, &enc_opts)?;
         stats.shards_total += 1;

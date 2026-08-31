@@ -636,17 +636,20 @@ fn copy_csr_class_aux(
             // Framing is `None`: `upgrade` emits unframed v3 (`scx optimize
             // --row-group-rows` is the framed path), matching the X loop.
             //
-            // The `_with_value_encoding` form rather than plain
+            // `enc_opts.value_encoding` is fixed to `widened` so it is not
+            // silently replaced by the encoder's own per-shard auto-detect —
+            // preserving the source's per-shard codec, which is what the X
+            // and layer loops do.
             let mut enc_opts = scx_format_io::EncodeShardOptions::new(
                 entry.name.clone(),
                 entry.section_type,
                 sh.n_minor as u64,
                 row_start,
+                sh.index_dtype,
             );
             enc_opts.explicit_codec = Some(codec);
-            enc_opts.index_dtype = sh.index_dtype;
             enc_opts.value_encoding = Some(widened);
-            let pre = scx_format_io::encoder::encode_one_shard_with_value_encoding(
+            let pre = scx_format_io::encoder::encode_one_shard(
                 &indptr_u64,
                 &indices_u32,
                 &data,
@@ -696,7 +699,7 @@ fn copy_raw(
     // writer's own `raw_n_vars` view of the file stays truthful for anything
     // added later. The verbatim arm carries the source's header bytes; the
     // re-encoding arm passes the source shard's `n_minor` straight to
-    // `encode_one_shard_with_value_encoding` (see `copy_csr_class_aux`) rather
+    // `encode_one_shard` (see `copy_csr_class_aux`) rather
     // than reading this field, which is exactly the change that stopped it
     // stamping the wrong extent. `ScxReader::raw_n_vars` recovers the extent
     // from the shards' own stats regardless.

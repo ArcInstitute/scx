@@ -61,9 +61,8 @@ pub use csc_sidecar::{write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_B
 pub use deletion_vectors::DeletionVectors;
 pub use distinct::DistinctAccumulator;
 pub use encoder::{
-    encode_one_shard, encode_one_shard_from_bytes, encode_one_shard_with_value_encoding,
-    encode_shard_adaptive, encode_shard_framed, EncodeShardOptions, FramingConfig,
-    DEFAULT_ROW_GROUP_ROWS,
+    encode_one_shard, encode_one_shard_from_bytes, encode_shard_adaptive, encode_shard_framed,
+    EncodeShardOptions, FramingConfig, DEFAULT_ROW_GROUP_ROWS,
 };
 pub use mem::MemoryBudget;
 pub use prefetch::{

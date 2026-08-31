@@ -191,61 +191,7 @@ pub struct ScxCsr {
     pub data: Vec<f32>,
 }
 
-/// Borrowed reference to CSR (Compressed Sparse Row) arrays.
-///
-/// Same dtypes as ScxCsr (i64 indptr, i32 indices, f32 data).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CsrArrays<'a> {
-    pub shape: (usize, usize),
-    pub indptr: &'a [i64],
-    pub indices: &'a [i32],
-    pub data: &'a [f32],
-}
-
-impl<'a> CsrArrays<'a> {
-    #[inline]
-    pub fn new(
-        shape: (usize, usize),
-        indptr: &'a [i64],
-        indices: &'a [i32],
-        data: &'a [f32],
-    ) -> Self {
-        Self {
-            shape,
-            indptr,
-            indices,
-            data,
-        }
-    }
-
-    #[inline]
-    pub fn n_rows(&self) -> usize {
-        self.shape.0
-    }
-
-    #[inline]
-    pub fn n_cols(&self) -> usize {
-        self.shape.1
-    }
-
-    #[inline]
-    pub fn nnz(&self) -> usize {
-        self.data.len()
-    }
-}
-
 impl ScxCsr {
-    /// Return a borrowed [`CsrArrays`] view of this CSR matrix.
-    #[inline]
-    pub fn as_arrays(&self) -> CsrArrays<'_> {
-        CsrArrays {
-            shape: self.shape,
-            indptr: &self.indptr,
-            indices: &self.indices,
-            data: &self.data,
-        }
-    }
-
     /// Create a new ScxCsr with full validation.
     pub fn new(
         shape: (usize, usize),

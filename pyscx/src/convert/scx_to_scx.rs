@@ -405,9 +405,9 @@ pub(crate) fn route_scx_backed_to_scx(
                     SectionType::CsrShard,
                     n_vars_u32 as u64,
                     *start as u64,
+                    out_index_dtype,
                 );
                 enc_opts.explicit_codec = codec_for_encode;
-                enc_opts.index_dtype = out_index_dtype;
                 py.detach(|| scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts))
                     .map_err(to_pyerr)
             })?;
@@ -627,9 +627,9 @@ pub(crate) fn route_scx_lazy_to_scx(
                 SectionType::CsrShard,
                 n_vars_u32 as u64,
                 *start as u64,
+                index_dtype,
             );
             enc_opts.explicit_codec = codec_for_encode;
-            enc_opts.index_dtype = index_dtype;
             py.detach(|| scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts))
                 .map_err(to_pyerr)
         })?;
@@ -858,9 +858,9 @@ pub(crate) fn stream_write_layers(
                     SectionType::LayerCsrShard,
                     n_vars_u32 as u64,
                     *start as u64,
+                    index_dtype,
                 );
                 enc_opts.explicit_codec = codec_for_encode;
-                enc_opts.index_dtype = index_dtype;
                 enc_opts.framing = framing;
                 py.detach(|| scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts))
                     .map_err(to_pyerr)

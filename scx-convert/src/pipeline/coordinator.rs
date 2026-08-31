@@ -75,9 +75,9 @@ pub fn streaming_writer_coordinator(
             section_type,
             n_vars_u32 as u64,
             row_start,
+            index_dtype,
         );
         enc_opts.explicit_codec = opts.codec;
-        enc_opts.index_dtype = index_dtype;
         enc_opts.modality_type = modality_type;
         enc_opts.framing = opts.framing();
         let pre = encode_one_shard(&shard.indptr, &shard.indices, &shard.values, &enc_opts)?;
@@ -346,9 +346,9 @@ fn encode_one_shard_worker(
         section_type,
         n_vars_u32 as u64,
         shard.row_start,
+        index_dtype,
     );
     enc_opts.explicit_codec = codec;
-    enc_opts.index_dtype = index_dtype;
     enc_opts.modality_type = modality_type;
     enc_opts.framing = framing;
     let pre = encode_one_shard(&shard.indptr, &shard.indices, &shard.values, &enc_opts)?;

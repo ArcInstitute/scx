@@ -89,8 +89,8 @@ use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
 use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::{
-    encode_one_shard_with_value_encoding, BitmapPolicy, BitmapShard, FullCatalogEntry,
-    PreEncodedSection, ScxReader, ShardHeader, SHARD_HEADER_SIZE,
+    encode_one_shard, BitmapPolicy, BitmapShard, FullCatalogEntry, PreEncodedSection, ScxReader,
+    ShardHeader, SHARD_HEADER_SIZE,
 };
 
 use crate::error::{OpsError, Result};
@@ -1640,7 +1640,7 @@ fn grouped_fast_concurrency(
 ///
 /// Reads the source CSR once, computes the output shard/block boundaries up
 /// front, then gathers + encodes each block **in parallel** via
-/// [`encode_one_shard_with_value_encoding`], writing the pre-encoded bytes (and
+/// [`encode_one_shard`] (with `opts.value_encoding` fixed), writing the pre-encoded bytes (and
 /// detection bitmaps) sequentially in block order. It bypasses the row-by-row
 /// [`CsrEmitter::push_row`] copy and parallelizes the encode, yet is
 /// **byte-identical** to the emitter path because it:
@@ -1787,17 +1787,13 @@ fn emit_x_in_memory_grouped_fast(
                         SectionType::CsrShard,
                         n_vars_u32 as u64,
                         r0 as u64,
+                        index_dtype,
                     );
                     enc_opts.explicit_codec = explicit_codec;
-                    enc_opts.index_dtype = index_dtype;
                     enc_opts.framing = framing;
                     enc_opts.value_encoding = Some(value_encoding);
-                    let section = encode_one_shard_with_value_encoding(
-                        &local_indptr,
-                        &local_indices,
-                        &local_values,
-                        &enc_opts,
-                    )?;
+                    let section =
+                        encode_one_shard(&local_indptr, &local_indices, &local_values, &enc_opts)?;
                     let bm = if bitmap_should_build(bitmap, n_rows as u64, nnz, n_vars_u32) {
                         Some(BitmapShard::build_from_csr(
                             r0 as u64,

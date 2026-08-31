@@ -4128,6 +4128,94 @@ fn test_compact_multimodal_layers_streaming() {
     assert_eq!(adt_centered.shape.0, n_obs - 2);
 }
 
+/// `compact_multimodal`'s per-modality layer stream must order shards by
+/// `row_start` (via `FullCatalog::layer_csr_shards_for_modality`), not by
+/// catalog-table order — catalog order is not a documented invariant. This
+/// pins a regression where the layer loop was rewritten as a raw
+/// `catalog().entries.iter().filter(...)`, which iterates in whatever order
+/// entries were written; `test_compact_multimodal_layers_streaming` above
+/// writes its layer as a single shard and so cannot catch this (there is
+/// nothing to reorder).
+#[test]
+fn test_compact_multimodal_layer_shards_out_of_catalog_order() {
+    use scx_format_io::modality::ModalityType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_obs = 6usize;
+    let n_vars = 4u64;
+    let path = dir.path().join("layer_catalog_order.scx");
+    let header = sample_header(n_obs as u64, n_vars);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer
+        .write_var_for(rna_id, &sample_var(n_vars as usize))
+        .unwrap();
+    writer.set_modality_n_vars(rna_id, n_vars).unwrap();
+
+    let (x_indptr, x_indices, x_values) = sample_shard_data(n_obs, n_vars as usize);
+    let x_shard = ShardBuffers::new(
+        &x_indptr,
+        &x_indices,
+        &x_values,
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer.write_csr_shard_for(rna_id, 0, x_shard).unwrap();
+
+    // Layer `counts`: one nonzero per row at column 0, value = row + 1, so a
+    // scrambled row order is directly visible in the decoded value. Shards
+    // are written to the catalog in the OPPOSITE order from their
+    // `row_start` (rows 3..6 first, then rows 0..3).
+    let shard_hi = ShardBuffers::new(
+        &[0u64, 1, 2, 3],
+        &[0u32, 0, 0],
+        &[4u8, 5, 6],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer
+        .write_layer_csr_shard_for(rna_id, "counts", 1, 3, shard_hi)
+        .unwrap();
+    let shard_lo = ShardBuffers::new(
+        &[0u64, 1, 2, 3],
+        &[0u32, 0, 0],
+        &[1u8, 2, 3],
+        CodecId::None,
+        ValueEncoding::Uint8,
+    );
+    writer
+        .write_layer_csr_shard_for(rna_id, "counts", 0, 0, shard_lo)
+        .unwrap();
+    writer.finish().unwrap();
+
+    let out = dir.path().join("layer_catalog_order_out.scx");
+    scx_ops::compact(&path, &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    let counts = reader.read_layer_for(rna_id, "counts").unwrap();
+    assert_eq!(counts.shape.0, n_obs);
+    for row in 0..n_obs {
+        let start = counts.indptr[row] as usize;
+        let end = counts.indptr[row + 1] as usize;
+        assert_eq!(end - start, 1, "row {row} must have exactly one nonzero");
+        assert_eq!(
+            counts.data[start],
+            (row + 1) as f32,
+            "row {row}'s layer value was scrambled by catalog-table iteration order"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // compact --reshape-obs (task 6c): legacy single-section obs → sharded
 // ---------------------------------------------------------------------------

@@ -39,7 +39,7 @@
 //!   sets `framing: None`, and `guard_no_legacy_shard_in_v4` is wired into
 //!   `write_preencoded_shard` but not `write_shard_inner`. Writing a layer the
 //!   obvious way into a v4 file silently produces an unframed shard-v1 section,
-//!   so this op encodes with [`encode_one_shard_with_value_encoding`] and writes
+//!   so this op encodes with [`encode_one_shard`] (`opts.value_encoding` fixed) and writes
 //!   through [`ScxWriter::write_preencoded_shard`] instead.
 //!
 //! # Memory
@@ -73,7 +73,7 @@ use scx_codec::value_encoding::detect_value_encoding;
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::catalog::{FullCatalog, FullCatalogEntry};
 use scx_format_io::checksum::blake3_hash;
-use scx_format_io::encoder::encode_one_shard_with_value_encoding;
+use scx_format_io::encoder::encode_one_shard;
 use scx_format_io::provenance::{Provenance, ProvenanceEntry};
 use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
@@ -843,15 +843,14 @@ fn attach_external_layer_inner(
             SectionType::LayerCsrShard,
             n_vars,
             *row_start,
+            index_dtype,
         );
         enc_opts.explicit_codec = opts.codec;
-        enc_opts.index_dtype = index_dtype;
         enc_opts.modality_type = modality_type;
         enc_opts.framing = framing;
         enc_opts.value_encoding = Some(shard_ve);
 
-        let section =
-            encode_one_shard_with_value_encoding(&s_indptr, &s_indices, &s_values, &enc_opts)?;
+        let section = encode_one_shard(&s_indptr, &s_indices, &s_values, &enc_opts)?;
         writer.write_preencoded_shard(section)?;
     }
 

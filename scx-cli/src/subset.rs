@@ -461,9 +461,9 @@ pub(crate) fn write_csr_shards_auto(
             SectionType::CsrShard,
             n_vars as u64,
             row_offset as u64,
+            index_dtype,
         );
         enc_opts.explicit_codec = explicit_codec;
-        enc_opts.index_dtype = index_dtype;
         enc_opts.modality_type = modality_type;
         enc_opts.framing = framing;
         let pre = scx_format_io::encode_one_shard(

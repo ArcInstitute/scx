@@ -55,6 +55,7 @@ fn decode_both(codec: CodecId, values: &[f32], framing: Option<FramingConfig>) -
         SectionType::CsrShard,
         n_cols as u64,
         0,
+        0,
     );
     opts.explicit_codec = Some(codec);
     opts.framing = framing;

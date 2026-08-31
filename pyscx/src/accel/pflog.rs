@@ -744,9 +744,9 @@ fn write_pflog_x_shards<S: ShardSource>(
                 SectionType::CsrShard,
                 n_vars_u32 as u64,
                 global_row,
+                index_dtype,
             );
             enc_opts.explicit_codec = Some(codec);
-            enc_opts.index_dtype = index_dtype;
             let pre = py
                 .detach(|| scx_format_io::encode_one_shard(&indptr, &indices, &values, &enc_opts))
                 .map_err(to_pyerr)?;

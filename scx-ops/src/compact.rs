@@ -1380,17 +1380,9 @@ fn compact_multimodal(
 
         for layer_name in layer_names {
             let layer_value_encoding = {
-                let shards: Vec<_> = reader
+                let shards = reader
                     .catalog()
-                    .entries
-                    .iter()
-                    .filter(|e| {
-                        e.section_type == SectionType::LayerCsrShard
-                            && e.modality_id == in_modality_id
-                            && e.name
-                                .starts_with(&format!("layer/{}/{}/shard_", info.name, layer_name))
-                    })
-                    .collect();
+                    .layer_csr_shards_for_modality(in_modality_id, &layer_name);
                 if let Some(first) = shards.first() {
                     let section = reader.section_bytes(first)?;
                     let sh = scx_format_io::ShardHeader::read_from(&mut std::io::Cursor::new(
@@ -1413,12 +1405,13 @@ fn compact_multimodal(
 
             // Stream layer shards one at a time (peak memory: one shard,
             // not the whole layer) — mirrors the X-stream pattern above.
-            for shard_entry in reader.catalog().entries.iter().filter(|e| {
-                e.section_type == SectionType::LayerCsrShard
-                    && e.modality_id == in_modality_id
-                    && e.name
-                        .starts_with(&format!("layer/{}/{}/shard_", info.name, layer_name))
-            }) {
+            // Shards must be visited in row_start order (not catalog-table
+            // order, which is not a documented invariant): `layer_csr_shards_for_modality`
+            // sorts on that key, matching `sort_engine.rs`/`merge.rs`.
+            for shard_entry in reader
+                .catalog()
+                .layer_csr_shards_for_modality(in_modality_id, &layer_name)
+            {
                 let (indptr, indices, data) = reader.read_shard_from_entry(shard_entry)?;
                 let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
                 let shard_n_rows = indptr.len() - 1;

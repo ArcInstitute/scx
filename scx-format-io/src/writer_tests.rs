@@ -1200,7 +1200,7 @@ fn v4_guard_rejects_unframed_v1_shard() {
 
     // (1) Unframed (explicit Zstd) v1 shard → rejected in v4.
     let mut zstd_opts =
-        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0);
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
     zstd_opts.explicit_codec = Some(CodecId::Zstd);
     let zstd_unframed =
         crate::encoder::encode_one_shard(&indptr, &indices, &values, &zstd_opts).unwrap();
@@ -1213,7 +1213,7 @@ fn v4_guard_rejects_unframed_v1_shard() {
 
     // (2) Framed shard → allowed in v4.
     let mut framed_opts =
-        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0);
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
     framed_opts.framing = Some(crate::encoder::FramingConfig {
         row_group_rows: 1,
         target_nnz: None,
@@ -1228,7 +1228,7 @@ fn v4_guard_rejects_unframed_v1_shard() {
 
     // (3) Unframed shard into a v3 file → accepted (the ordinary path).
     let mut plain_opts =
-        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0);
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
     plain_opts.explicit_codec = Some(CodecId::Zstd);
     let plain = crate::encoder::encode_one_shard(&indptr, &indices, &values, &plain_opts).unwrap();
     let (w, res) = write("v3.scx", sample_header(), plain);
@@ -1250,7 +1250,7 @@ fn copy_section_verbatim_rejects_legacy_shard_in_v4_file() {
     w.write_obs(&sample_obs()).unwrap();
     w.write_var(&sample_var()).unwrap();
     let legacy_opts =
-        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0);
+        crate::encoder::EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, 3, 0, 0);
     w.write_preencoded_shard(
         crate::encoder::encode_one_shard(&indptr, &indices, &values, &legacy_opts).unwrap(),
     )
@@ -2589,7 +2589,7 @@ fn preencoded_and_verbatim_shards_accumulate_per_modality_stats() {
     // rna: parallel/pre-encoded path.
     let f32_vals: Vec<f32> = values.iter().map(|&v| v as f32).collect();
     let mut pre_opts =
-        crate::encoder::EncodeShardOptions::new("X/rna/shard_0", SectionType::CsrShard, 50, 0);
+        crate::encoder::EncodeShardOptions::new("X/rna/shard_0", SectionType::CsrShard, 50, 0, 0);
     pre_opts.explicit_codec = Some(CodecId::None);
     let pre = crate::encoder::encode_one_shard(&indptr, &indices, &f32_vals, &pre_opts).unwrap();
     let pre_nnz = pre.nnz;

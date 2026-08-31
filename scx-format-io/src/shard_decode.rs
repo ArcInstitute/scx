@@ -929,9 +929,9 @@ mod tests {
             SectionType::CsrShard,
             encoded_n_cols as u64,
             0,
+            index_dtype,
         );
         opts.explicit_codec = Some(CodecId::None);
-        opts.index_dtype = index_dtype;
         opts.framing = framing;
         let s = encode_one_shard(&indptr, indices, &values, &opts).expect("encode_one_shard");
         let mut sh = ShardHeader::read_from(&mut Cursor::new(&s.header_buf[..])).unwrap();
@@ -1114,6 +1114,7 @@ mod tests {
                 SectionType::CsrShard,
                 n_cols as u64,
                 0,
+                0,
             );
             opts.explicit_codec = Some(CodecId::ShufDeltaZstd);
             opts.framing = framing;
@@ -1165,7 +1166,7 @@ mod tests {
         let n_cols: u32 = 16;
 
         let mut opts =
-            EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, n_cols as u64, 0);
+            EncodeShardOptions::new("X_shard_0", SectionType::CsrShard, n_cols as u64, 0, 0);
         opts.explicit_codec = Some(CodecId::ShufDeltaZstd);
         opts.framing = Some(FramingConfig {
             row_group_rows: 2,

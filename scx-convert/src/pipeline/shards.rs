@@ -162,9 +162,9 @@ pub(super) fn write_csr_shards(
             SectionType::CsrShard,
             n_vars_u32 as u64,
             row_start as u64,
+            index_dtype,
         );
         enc_opts.explicit_codec = Some(codec_id);
-        enc_opts.index_dtype = index_dtype;
         enc_opts.modality_type = modality_type;
         enc_opts.framing = framing;
         let pre = encode_one_shard(&shard_indptr, &shard_indices, &shard_data, &enc_opts)?;

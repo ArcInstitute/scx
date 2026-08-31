@@ -143,6 +143,7 @@ fn write_framed_file(
             SectionType::CsrShard,
             n_vars as u64,
             (s * rows_per_shard) as u64,
+            0,
         );
         opts.explicit_codec = Some(codec);
         opts.framing = Some(crate::encoder::FramingConfig {

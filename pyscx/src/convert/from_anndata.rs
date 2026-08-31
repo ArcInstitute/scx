@@ -423,9 +423,9 @@ pub(crate) fn parallel_encode_csr_shards(
                         section_type,
                         n_vars as u64,
                         b.row_start as u64,
+                        index_dtype,
                     );
                     enc_opts.explicit_codec = explicit_codec;
-                    enc_opts.index_dtype = index_dtype;
                     enc_opts.framing = framing;
                     scx_format_io::encode_one_shard(indptr, indices, data, &enc_opts)
                         .map_err(|e| e.to_string())
