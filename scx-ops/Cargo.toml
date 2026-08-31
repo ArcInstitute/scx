@@ -1,6 +1,6 @@
 [package]
 name = "scx-ops"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "File lifecycle operations (append, delete, compact, rollback, merge) for SCX files"
 license.workspace = true
