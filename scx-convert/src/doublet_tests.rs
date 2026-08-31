@@ -560,22 +560,11 @@ fn an_h5ad_source_without_the_feature_says_what_to_do_instead() {
     assert!(m.contains("no HDF5 support"), "{m}");
 }
 
-#[cfg(feature = "hdf5")]
-#[test]
-fn an_h5ad_source_is_read_rather_than_refused_on_its_extension() {
-    // The extension no longer decides the outcome; the file's contents do.
-    // This one is not HDF5 at all, so it fails as an unreadable file rather
-    // than as an unsupported format.
-    let dir = tempfile::tempdir().unwrap();
-    let p = write(&dir, "scrublet_out.h5ad", "not really hdf5");
-    let e = read_doublet_table(&p, &opts("scrublet")).unwrap_err();
-    let m = e.to_string();
-    assert!(m.contains("as HDF5"), "{m}");
-    assert!(
-        !m.contains("not implemented"),
-        "the Phase-4 deferral message must be gone: {m}"
-    );
-}
+// The `--features hdf5` counterpart of the test above lives in
+// `convert_tests_h5ad.rs` (`an_h5ad_doublet_source_is_read_rather_than_refused_
+// on_its_extension`): hdf5-gated tests live in hdf5-gated modules so the CI
+// hdf5 lane's complement --skip selection covers them without per-name
+// recovery invocations; the dedup-guard enforces the layout rule.
 
 #[test]
 fn an_h5mu_source_is_refused_with_the_modality_route() {

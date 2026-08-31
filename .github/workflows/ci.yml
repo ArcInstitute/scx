@@ -233,6 +233,10 @@ jobs:
       # cellbender, hdf5_threadsafe), while the UNGATED side is exactly these 7
       # stable prefixes. Skipping is fail-safe — a new gated module runs
       # automatically; a new ungated module costs duplication, never coverage.
+      # The complement is exact because of a layout rule the dedup-guard
+      # enforces: hdf5-gated TESTS live in hdf5-gated modules, never as
+      # `#[cfg(feature = "hdf5")]` items inside these skipped ungated modules
+      # (which this lane would skip and the default lane would compile out).
       # The `::tests::` qualifier is load-bearing: bare `direction`/`budget`
       # collide with helper/test fn names inside convert_tests_*. Doctests (the
       # two hdf5-gated ExportOptions ones) are unaffected by --skip.
@@ -243,14 +247,10 @@ jobs:
             --skip 'doublet::tests::' --skip 'annotation_table::tests::' \
             --skip 'warnings::tests::' --skip 'parallel_drain::tests::' \
             --skip 'mtx_tests::'
-      # The one hdf5-gated test living inside the (skipped, otherwise ungated)
-      # doublet module. Same build, no recompile.
-      - name: Test scx-convert (hdf5-gated doublet test)
-        run: cargo test -p scx-convert --features hdf5 doublet::tests::an_h5ad_source_is_read_rather_than_refused_on_its_extension
       # `--test <bin>` selection + `--test-threads=1`, and NOT
       # `HDF5_USE_FILE_LOCKING=FALSE`.
       #
-      # These three files are the only scx-cli test targets that reference the
+      # These files are the only scx-cli test targets that reference the
       # `hdf5` crate at all — every other target runs (in parallel) in the
       # `test` job. They build an h5ad with `hdf5::File::create` in the test
       # process and then spawn the `scx` binary to open it. Run in parallel,
@@ -264,16 +264,13 @@ jobs:
       # every developer does locally — but it would also hide any future
       # *genuine* locking failure, on the one lane that exists to stop hiding
       # things. Serialising keeps libhdf5's locking fully enforced (and now
-      # covers 30 tests instead of serialising all 216).
+      # covers ~30 tests instead of serialising all 216).
       - name: Test scx-cli (hdf5-gated test binaries, serialized)
         run: |
           cargo test -p scx-cli --features hdf5 \
             --test convert_stream --test cellbender_cli --test convert_subset \
+            --test doublet_import_hdf5 \
             -- --test-threads=1
-      # The one hdf5-gated test inside the (otherwise ungated) doublet_import_cli
-      # binary. Same build, no recompile.
-      - name: Test scx-cli (hdf5-gated doublet_import test)
-        run: cargo test -p scx-cli --features hdf5 --test doublet_import_cli a_non_hdf5_h5ad_source_fails_as_an_unreadable_file
       - name: Report disk headroom after build
         if: always()
         run: df -h /
@@ -2845,12 +2842,26 @@ jobs:
         run: |
           set -euo pipefail
           ci=.github/workflows/ci.yml
+          # Comment lines can't satisfy the checks below — a run step that
+          # disappeared while a comment still mentioned its flag must fail.
+          live=$(grep -v '^\s*#' "$ci")
           fail=0
           for f in scx-cli/tests/*.rs; do
             if grep -q '^#!\[cfg(feature = "hdf5")\]' "$f"; then
               stem=$(basename "$f" .rs)
-              if ! grep -q -- "--test $stem" "$ci"; then
+              if ! grep -q -- "--test $stem" <<< "$live"; then
                 echo "::error::$f is hdf5-gated but '--test $stem' is missing from the test-hdf5 job in $ci — it would run in neither CI lane"
+                fail=1
+              fi
+            else
+              # Layout rule: an hdf5-gated TEST must live in a file-level
+              # `#![cfg(feature = "hdf5")]` binary, never as a `#[cfg(feature =
+              # "hdf5")]` item inside an ungated one — there the default lane
+              # compiles it out and the hdf5 lane's --test list never selects
+              # it, so it runs in NEITHER lane. (`not(feature = "hdf5")` items
+              # are fine: they run in the default lane by construction.)
+              if grep -Eq '^\s*#\[cfg\((all\()?feature = "hdf5"' "$f"; then
+                echo "::error::$f has an hdf5-gated item inside an ungated test binary — move it to a #![cfg(feature = \"hdf5\")] file (see doublet_import_hdf5.rs) or it runs in neither CI lane"
                 fail=1
               fi
             fi
@@ -2858,6 +2869,22 @@ jobs:
           for name in $(grep -o -- "--skip '[a-z_]*::" "$ci" | sed "s/--skip '//; s/:://"); do
             if [ ! -e "scx-convert/src/$name.rs" ]; then
               echo "::error::test-hdf5 --skip prefix '$name' names no scx-convert/src/$name.rs — stale skip list"
+              fail=1
+            fi
+            # Same layout rule for the skipped ungated scx-convert modules'
+            # test files: a gated test hiding there is skipped by this lane's
+            # complement selection and compiled out of the default lane.
+            # Checked on the *_tests.rs sibling (and mtx_tests.rs itself, a
+            # pure test module); the parent $name.rs may legitimately carry
+            # gated PRODUCTION dispatch (annotation_table.rs does), so it is
+            # exempt — its inline tests are hdf5-free by the same rule, kept
+            # by review rather than grep.
+            case "$name" in
+              *_tests) tf="scx-convert/src/$name.rs" ;;
+              *) tf="scx-convert/src/${name}_tests.rs" ;;
+            esac
+            if [ -e "$tf" ] && grep -Eq '^\s*#\[cfg\((all\()?feature = "hdf5"' "$tf"; then
+              echo "::error::$tf has an hdf5-gated test inside the skipped ungated '$name' module — move it to an hdf5-gated module (see convert_tests_h5ad.rs) or it runs in neither CI lane"
               fail=1
             fi
           done

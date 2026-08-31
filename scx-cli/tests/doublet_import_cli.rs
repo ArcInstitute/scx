@@ -506,33 +506,10 @@ fn an_h5ad_source_is_refused_with_the_convert_hint() {
     assert!(msg.contains("to_csv"), "{msg}");
 }
 
-/// The `--features hdf5` counterpart: a file named `.h5ad` that is not HDF5
-/// fails as an unreadable file, naming the format it tried.
-#[cfg(feature = "hdf5")]
-#[test]
-fn a_non_hdf5_h5ad_source_fails_as_an_unreadable_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let scx_path = simple_fixture(dir.path(), "t.scx");
-    let h5 = write_text(dir.path(), "scrublet_out.h5ad", "not really hdf5");
-
-    let out = scx()
-        .args([
-            "doublet-import",
-            scx_path.to_str().unwrap(),
-            h5.to_str().unwrap(),
-            "--tool",
-            "scrublet",
-        ])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let msg = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(msg.contains("as HDF5"), "{msg}");
-}
+// The `--features hdf5` counterpart lives in `doublet_import_hdf5.rs`, a
+// file-level `#![cfg(feature = "hdf5")]` binary: hdf5-gated tests live in
+// hdf5-gated test binaries so CI's hdf5 lane selects them wholesale (see the
+// dedup-guard's "test-hdf5 lane selection lists" step).
 
 #[test]
 fn a_declared_call_column_absent_warns_and_still_imports() {
