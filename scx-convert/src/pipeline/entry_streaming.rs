@@ -216,7 +216,7 @@ pub fn h5ad_to_scx_streaming(
 
     // Placeholder header. `nnz`, `n_csr_shards`, `n_csc_shards`, and
     // `codec_id` are overwritten by `ScxWriter::finish()` from
-    // running accumulators (see scx-format/src/writer.rs).
+    // running accumulators (see scx-format-io/src/writer.rs).
     let mut header = FileHeader::new_single_modality(
         n_obs as u64,
         n_vars as u64,

@@ -3210,3 +3210,65 @@ fn bulk_csr_shard_column_stats_refuses_a_multimodal_file() {
         "expected a loud refusal naming zero modality-0 shards, got {err:?}"
     );
 }
+
+/// `finish()` stamps the file-header `codec_id` from a codec a `CsrShard`
+/// actually used, rather than leaving the caller's pre-encode placeholder.
+///
+/// The header is only a *default* — each shard header overrides it
+/// (`docs/codec.md` §1) — but it must not be a fiction. Callers build the
+/// header before any shard is encoded, so they pass a placeholder: the
+/// streaming h5ad → SCX pipeline passes `0` and documented this field as
+/// "overwritten by `ScxWriter::finish()` from running accumulators", which was
+/// never implemented. Files therefore claimed `codec_id = 0` (`none`, raw
+/// little-endian) over compressed shards, and a consumer that trusted the file
+/// header re-encoded everything raw — an 8x file on a real dataset. See
+/// `SourceCsrCodec` in `pyscx/src/convert/scx_to_scx.rs`.
+#[test]
+fn finish_stamps_a_codec_some_csr_shard_actually_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("header_codec.scx");
+
+    // `sample_header()` carries codec_id = 0, standing in for the placeholder
+    // every streaming caller passes.
+    let header = sample_header();
+    assert_eq!(
+        header.codec_id,
+        CodecId::None as u8,
+        "premise: placeholder 0"
+    );
+
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs()).unwrap();
+    writer.write_var(&sample_var()).unwrap();
+    let (indptr, indices, values) = sample_shard_data();
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::Scx1,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    let final_path = writer.finish().unwrap();
+
+    let reader = crate::ScxReader::open(&final_path).unwrap();
+    let entry = reader.catalog().csr_shards_sorted()[0];
+    let shard_codec = reader.read_shard_header(entry).unwrap().codec_id;
+
+    // Compared against the shard rather than a hardcoded id, so an adaptive
+    // override of the requested codec keeps the invariant meaningful.
+    assert_eq!(
+        reader.header().codec_id,
+        shard_codec,
+        "file-header codec_id {} does not match the CSR shard's {}",
+        reader.header().codec_id,
+        shard_codec
+    );
+    assert_ne!(
+        reader.header().codec_id,
+        CodecId::None as u8,
+        "placeholder 0 survived into a file whose shard is compressed"
+    );
+}
