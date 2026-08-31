@@ -1322,6 +1322,13 @@ impl ScxWriter {
         stats: ShardStats,
         nnz: u64,
     ) -> Result<()> {
+        // `section_type` is a parameter, not a fixed `RawCsrShard`: the only
+        // production caller (`scx-engine`'s `streaming_save_layer`, via
+        // `fused_ops`) byte-copies the MAIN matrix through here as
+        // `SectionType::CsrShard`. Skipping the stamp on the strength of the
+        // method's name left `save_layer` minting a `codec_id = 0` header over
+        // copied compressed shards. The helper still ignores `RawCsrShard`.
+        self.record_copied_csr_codec(section_type, raw_bytes);
         self.write_padding()?;
 
         let shard_global_offset = self.current_offset;
@@ -2610,8 +2617,12 @@ impl ScxWriter {
         // `sync_from_catalog` cannot derive `codec_id`: the catalog carries no
         // codec, only the shard headers do. Stamp the codec a `CsrShard`
         // actually used, replacing whatever placeholder the caller built the
-        // header with before any shard existed. Left alone when this writer
-        // emitted no CSR shard (metadata-only files, verbatim copies), where
+        // header with before any shard existed. Every path that emits a
+        // main-matrix CSR shard feeds this — encoded (`write_shard_inner`),
+        // pre-encoded (`write_preencoded_shard`), and byte-copied (via
+        // `record_copied_csr_codec`, from `write_csr_shard_raw_copy*`,
+        // `copy_section_verbatim` and `write_raw_shard`). Left alone only when
+        // the writer emitted no CSR shard at all (metadata-only files), where
         // the caller's value is the only information available.
         if let Some(codec_id) = self.first_csr_codec {
             self.header.codec_id = codec_id;

@@ -387,3 +387,84 @@ def test_asarray_on_a_handle_returns_a_0d_object_array(adata_backed):
     arr = np.asarray(adata_backed.X)
     assert arr.shape == ()
     assert arr.dtype == object
+
+
+# ---------------------------------------------------------------------------
+# The .pyi stubs vs the runtime classes
+# ---------------------------------------------------------------------------
+
+# Specials a caller can plausibly reach on a matrix-like handle. Anything in
+# this set that a Rust class implements must be declared in the stub, because
+# `__getattr__` does not reach special methods — Python looks them up on the
+# type, so an omitted one is a type error on documented usage (`X[0:10]`).
+_MATRIX_SPECIALS = frozenset(
+    {
+        "__getitem__",
+        "__len__",
+        "__array__",
+        "__lt__",
+        "__le__",
+        "__gt__",
+        "__ge__",
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__matmul__",
+        "__rmatmul__",
+    }
+)
+
+_HANDLE_CLASSES_FOR_STUBS = (
+    "ScxBackedSparseDataset",
+    "ScxBackedLayerDataset",
+    "ScxBackedObsmDataset",
+    "ScxLazyTransformedDataset",
+)
+
+
+def _stub_class_body(cls_name):
+    """The lines of one `class <cls_name>:` block in `__init__.pyi`."""
+    import pathlib
+
+    import pyscx
+
+    pyi = pathlib.Path(pyscx.__file__).with_name("__init__.pyi")
+    text = pyi.read_text()
+    start = text.index(f"class {cls_name}:")
+    rest = text[start + 1 :]
+    # Ends at the next top-level `class `/`def ` declaration.
+    ends = [i for i in (rest.find("\nclass "), rest.find("\ndef ")) if i != -1]
+    return rest[: min(ends)] if ends else rest
+
+
+@pytest.mark.parametrize("cls_name", _HANDLE_CLASSES_FOR_STUBS)
+def test_handle_stubs_declare_every_runtime_special(cls_name):
+    """Both directions, because each failure mode is silent in its own way.
+
+    Missing a special the class really has → a type error on working code (the
+    `X[0:10]` regression). Declaring one it does not have → a type checker
+    green-lights a call that raises at runtime. The repo has no mypy gate, so
+    this pytest is what pins it.
+    """
+    import pyscx
+
+    cls = getattr(pyscx, cls_name)
+    body = _stub_class_body(cls_name)
+
+    runtime = {name for name in _MATRIX_SPECIALS if hasattr(cls, name)}
+    stubbed = {name for name in _MATRIX_SPECIALS if f"def {name}(" in body}
+
+    assert runtime - stubbed == set(), (
+        f"{cls_name} implements {sorted(runtime - stubbed)} but __init__.pyi "
+        "does not declare them; `__getattr__` does not cover special methods, "
+        "so these are type errors on valid code"
+    )
+    assert stubbed - runtime == set(), (
+        f"__init__.pyi declares {sorted(stubbed - runtime)} on {cls_name}, "
+        "which the Rust class does not implement"
+    )

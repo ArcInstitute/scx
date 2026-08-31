@@ -456,7 +456,9 @@ fn subset_mapping_keeping_handles<'py>(
     for key in mapping.try_iter()? {
         let key = key?;
         let value = mapping.get_item(&key)?;
-        let value = if is_scx_handle(&value) || value.cast::<ScxBackedObsmDataset>().is_ok() {
+        // Exactly the four-class predicate, so use the one that names the
+        // four. `is_scx_handle` stays at three for its X-only callers.
+        let value = if crate::anndata_hooks::is_handle_class(&value) {
             value
         } else if value.hasattr("copy")? {
             value.call_method0("copy")?

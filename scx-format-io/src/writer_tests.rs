@@ -3321,7 +3321,7 @@ fn raw_copy_paths_also_stamp_the_header_codec() {
     let mut dst = ScxWriter::new(&dst_path, header).unwrap();
     dst.write_obs(&sample_obs()).unwrap();
     dst.write_var(&sample_var()).unwrap();
-    dst.write_csr_shard_raw_copy(section_bytes, stats, nnz)
+    dst.write_csr_shard_raw_copy(section_bytes, stats.clone(), nnz)
         .unwrap();
     let dst_final = dst.finish().unwrap();
 
@@ -3331,6 +3331,37 @@ fn raw_copy_paths_also_stamp_the_header_codec() {
         shard_codec,
         "raw-copy output header claims {} over a shard encoded {}",
         out.header().codec_id,
+        shard_codec
+    );
+
+    // `write_raw_shard` is the other byte-copy entry point, and the one the
+    // round-2 review caught: it takes `section_type` as an ARGUMENT, and
+    // `scx-engine`'s `streaming_save_layer` passes `CsrShard` through it to
+    // copy the main matrix. Skipping the stamp because the method is *named*
+    // "raw" left `save_layer` re-minting the `codec_id = 0` lie.
+    let via_raw_path = dir.path().join("raw_copy_via_write_raw_shard.scx");
+    let mut header2 = sample_header();
+    header2.codec_id = CodecId::None as u8;
+    let mut dst2 = ScxWriter::new(&via_raw_path, header2).unwrap();
+    dst2.write_obs(&sample_obs()).unwrap();
+    dst2.write_var(&sample_var()).unwrap();
+    dst2.write_raw_shard(
+        section_bytes,
+        SectionType::CsrShard,
+        "X_shard_0",
+        stats,
+        nnz,
+    )
+    .unwrap();
+    let via_raw_final = dst2.finish().unwrap();
+
+    let out2 = crate::ScxReader::open(&via_raw_final).unwrap();
+    assert_eq!(
+        out2.header().codec_id,
+        shard_codec,
+        "write_raw_shard(CsrShard) output header claims {} over a shard \
+         encoded {}",
+        out2.header().codec_id,
         shard_codec
     );
 }

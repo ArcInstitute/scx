@@ -105,7 +105,12 @@ fn source_csr_codec(src_reader: &ScxReader, modality_id: Option<u8>) -> SourceCs
         };
         match first {
             None => first = Some(codec),
-            Some(seen) if seen != codec => uniform = false,
+            // Nothing later can restore uniformity, and `first` is already
+            // recorded, so stop reading shard headers here.
+            Some(seen) if seen != codec => {
+                uniform = false;
+                break;
+            }
             Some(_) => {}
         }
     }
@@ -243,10 +248,16 @@ pub(crate) fn route_scx_backed_to_scx(
     // (preserves Scx1/Pcodec/etc — only override when the caller
     // passes `codec=`).
     let out_codec_id: u8 = if passthrough_ok {
-        // X shards are byte-copied, so their own shard headers carry the
-        // source's real codecs and the source's file-header default remains
-        // the honest hint for them.
-        src_codec_id
+        // Seed from the shards, not `src_codec_id`. This is only a
+        // pre-encode placeholder either way — `ScxWriter::finish` restamps it
+        // from the first CSR shard the writer sees, and on this branch that is
+        // the verbatim copy — but seeding it from the source's file header
+        // would mean carrying forward the very value the rest of this function
+        // argues is untrustworthy.
+        src_shard_codec
+            .first
+            .map(|c| c as u8)
+            .unwrap_or(src_codec_id)
     } else {
         match explicit_codec {
             Some(c) => c as u8,

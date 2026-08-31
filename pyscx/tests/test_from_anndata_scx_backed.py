@@ -752,3 +752,30 @@ def test_passthrough_does_not_carry_a_lying_header_forward(tmp_dir):
         "a verbatim copy of scx1 shards produced a header claiming "
         f"{out.codec_id}; the copy path is not recording the codec it copied"
     )
+
+
+def test_save_layer_does_not_carry_a_lying_header_forward(tmp_dir):
+    """`pyscx.save_layer` byte-copies X through `write_raw_shard`.
+
+    That method takes `section_type` as an argument and `streaming_save_layer`
+    passes `CsrShard`, so it copies the MAIN matrix — but the first fix round
+    skipped it on the reasoning that the method is "for RawCsrShard", which is
+    the method's name rather than what it does. `save_layer` therefore kept
+    minting `codec_id = 0` over copied compressed shards. Round 2 caught it by
+    running exactly this.
+    """
+    import pyscx
+
+    honest, lying, _ = _lying_header_source(tmp_dir, "save_layer")
+
+    out_honest = str(tmp_dir / "save_layer_honest.scx")
+    out_lying = str(tmp_dir / "save_layer_lying.scx")
+    pyscx.save_layer(honest, out_honest, "normalized", ["normalize_total"])
+    pyscx.save_layer(lying, out_lying, "normalized", ["normalize_total"])
+
+    assert pyscx.open(out_honest).codec_id == 1
+    assert pyscx.open(out_lying).codec_id == 1, (
+        "save_layer copied scx1 X shards but stamped a header claiming "
+        f"{pyscx.open(out_lying).codec_id}; write_raw_shard is not recording "
+        "the codec it copied"
+    )

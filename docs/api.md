@@ -884,7 +884,10 @@ For shape 2 the writer chooses between two modes:
   `encode_one_shard` + `write_preencoded_shard`. The output `n_obs`
   / `n_vars` reflect the user-visible shape.
 
-### Which codec a decode + encode rewrite uses
+### Which codec a shape-2 (backed) decode + encode rewrite uses
+
+Shape 3 (lazy) is different and is covered below — do not read this subsection
+as the rule for both.
 
 With an explicit `codec=`, that codec. Without one, the codec is resolved
 against the **source's shard headers**, never against its file header:
@@ -905,7 +908,13 @@ Inheriting it wrote every shard raw: on a 966,728 × 6,143 source
 subset rewrite of an affected file.
 
 For shape 3 the rewrite is always decode + encode; transforms are
-applied per shard inside `wrapper[start:end]`. The same
+applied per shard inside `wrapper[start:end]`. **Its codec rule differs from
+shape 2's:** an explicit `codec=`, otherwise per-shard adaptive selection —
+never the source's codec, from its shard headers or anywhere else. The
+transforms have already rewritten the values (`normalize_total` / `log1p` turn
+integer counts into f32), so the codec that suited the source's integers does
+not suit the output's floats; a uniform `scx1` or `none` source therefore does
+**not** round-trip its codec through a transformed write. The same
 `csc="always"` two-pass rebuild is honoured (matches `from_h5ad`).
 Any source CSC sidecar that would be invalidated by the rewrite is
 dropped with a `UserWarning` unless `csc="always"` opts into a
