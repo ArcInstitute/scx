@@ -274,6 +274,44 @@ jobs:
             --test convert_stream --test cellbender_cli --test convert_subset \
             --test doublet_import_hdf5 \
             -- --test-threads=1
+      # Authoritative coverage backstop, compiler-derived: the dedup-guard's
+      # grep layout rule cannot see a gated test inline in a skipped module's
+      # parent file (direction.rs holds its tests inline) or a multiline cfg
+      # attribute. This asks the compiler instead: diff the test lists at
+      # default vs hdf5 features; every hdf5-only scx-convert test must not
+      # sit under a prefix this job --skips (mirroring the skip semantics
+      # verbatim — the prefixes are read from this file's own live command),
+      # and every hdf5-only scx-cli test must be listed by one of the selected
+      # --test binaries. Costs one default-features test-binary compile of the
+      # two crates (deps shared with the hdf5 build above). Falsified red: a
+      # #[cfg(feature = "hdf5")] test appended to doublet_tests.rs surfaces as
+      # doublet::tests::… in the hdf5-only diff and trips the prefix match.
+      - name: hdf5-only tests are covered by this lane (compiler-derived)
+        run: |
+          set -euo pipefail
+          list() { cargo test "$@" -- --list --format terse 2>/dev/null | grep ': test$' | sort -u; }
+          prefixes=$(grep -v '^[[:space:]]*#' .github/workflows/ci.yml \
+            | grep -o -- "--skip '[a-z_:]*'" | sed "s/--skip '//; s/'\$//" | sort -u)
+          re="^($(printf '%s|' $prefixes | sed 's/|$//'))"
+          list -p scx-convert --features hdf5 > /tmp/conv_hdf5.list
+          list -p scx-convert > /tmp/conv_default.list
+          comm -23 /tmp/conv_hdf5.list /tmp/conv_default.list > /tmp/conv_only.list
+          if bad=$(grep -E "$re" /tmp/conv_only.list); then
+            echo "::error::hdf5-only scx-convert tests under a --skip prefix — they run in NEITHER CI lane:"
+            echo "$bad"
+            exit 1
+          fi
+          list -p scx-cli --features hdf5 > /tmp/cli_hdf5.list
+          list -p scx-cli > /tmp/cli_default.list
+          comm -23 /tmp/cli_hdf5.list /tmp/cli_default.list > /tmp/cli_only.list
+          list -p scx-cli --features hdf5 \
+            --test convert_stream --test cellbender_cli --test convert_subset \
+            --test doublet_import_hdf5 > /tmp/cli_selected.list
+          if bad=$(comm -23 /tmp/cli_only.list /tmp/cli_selected.list | grep .); then
+            echo "::error::hdf5-only scx-cli tests not listed by any selected --test binary — they run in NEITHER CI lane:"
+            echo "$bad"
+            exit 1
+          fi
       - name: Report disk headroom after build
         if: always()
         run: df -h /
