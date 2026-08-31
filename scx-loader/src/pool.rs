@@ -21,7 +21,7 @@
 //! A plain `OnceLock` would reproduce the bug one level down. A parent that
 //! touches *any* loader path before forking would fill it, and the child would
 //! then inherit a private pool whose worker threads do not exist — identical
-//! symptom, new owner. The `python.rs` PID checks catch a *dataset* reused
+//! symptom, new owner. The `python/` PID checks catch a *dataset* reused
 //! across a fork; they cannot catch a dataset freshly constructed in the child
 //! drawing on a stale process-global pool. So the pool is stored with the PID
 //! that built it and rebuilt whenever `std::process::id()` disagrees.

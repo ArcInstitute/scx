@@ -582,22 +582,31 @@ fn none_budget_resolves_to_a_bounded_adaptive_value() {
 }
 
 /// An explicit budget too small for the requested cache must be reported.
+///
+/// **Rewritten by ORG-9.10-5.** It used to run on a 1 KB budget over 128 B
+/// shards and assert exactly 8 affordable shards — arithmetic that only worked
+/// while the tuner ignored the 50 MB interpreter constant it reported. A 1 KB
+/// *process* budget affords no cache at all, so the case now runs on a budget
+/// that is small relative to the request but not absurd in absolute terms,
+/// which is the regime the diagnostic is actually for.
 #[test]
 fn explicit_tight_budget_reports_a_sizing_verdict() {
     let dir = tempfile::tempdir().unwrap();
-    // Each shard here is 8 rows × 1 nnz ⇒ (8 × 8) + (8 × 8) = 128 B.
-    // A 1 KB budget affords 8 shards, so a 128-shard request is cut.
-    let loader = budget_loader(dir.path(), 128, Some(1024));
+    // 32 KB shards; 64 MiB budget − 50 MiB interpreter = 448 shards affordable.
+    let loader = sized_budget_loader(dir.path(), 4096, Some(64 * 1024 * 1024));
     let v = loader
         .cache_sizing()
         .expect("a budget that cannot hold the request must be reported");
-    assert_eq!(v.requested_cache_shards, 128);
-    assert_eq!(v.effective_cache_shards, 8);
+    assert_eq!(v.requested_cache_shards, 4096);
+    assert_eq!(v.effective_cache_shards, 448);
+    assert!(!v.below_floor, "448 is far above MIN_CACHE_SHARDS");
+    assert_eq!(v.shard_decoded_bytes, 32_768);
     assert!(
-        !v.below_floor,
-        "8 is exactly MIN_CACHE_SHARDS, which is not below it"
+        loader
+            .budget_breakdown()
+            .fits_within_bytes(64 * 1024 * 1024),
+        "the reported total must fit the budget the tuner checked"
     );
-    assert_eq!(v.shard_decoded_bytes, 128);
 }
 
 /// Below MIN_CACHE_SHARDS the verdict escalates, so the warning can say the
@@ -605,7 +614,9 @@ fn explicit_tight_budget_reports_a_sizing_verdict() {
 #[test]
 fn very_tight_budget_flags_below_floor() {
     let dir = tempfile::tempdir().unwrap();
-    let loader = budget_loader(dir.path(), 128, Some(512)); // 4 shards
+    // 50 MiB (the interpreter constant) + room for exactly 4 of the 32 KB shards.
+    let budget = 50 * 1024 * 1024 + 4 * 32_768;
+    let loader = sized_budget_loader(dir.path(), 4096, Some(budget));
     let v = loader.cache_sizing().expect("must be reported");
     assert_eq!(v.effective_cache_shards, 4);
     assert!(v.below_floor);
@@ -672,13 +683,13 @@ fn plan_shard_touch_count_ignores_unknown_file_ids() {
 #[test]
 fn effective_cache_shards_reports_the_byte_cap_when_it_binds() {
     let dir = tempfile::tempdir().unwrap();
-    // Shard bytes here are 128 B (8 rows x 1 nnz). A 1 KB budget affords 8, so a
-    // 128-count request is bound by BYTES, not by the count.
-    let loader = budget_loader(dir.path(), 128, Some(1024));
-    assert_eq!(loader.cache_shards(), 128, "the request is unchanged");
+    // 32 KB shards; a 64 MiB budget affords 448 after the interpreter constant,
+    // so a 4096-count request is bound by BYTES, not by the count.
+    let loader = sized_budget_loader(dir.path(), 4096, Some(64 * 1024 * 1024));
+    assert_eq!(loader.cache_shards(), 4096, "the request is unchanged");
     assert_eq!(
         loader.effective_cache_shards(),
-        8,
+        448,
         "the byte cap is what actually binds"
     );
     assert!(
@@ -695,8 +706,14 @@ fn effective_cache_shards_equals_request_when_the_count_binds() {
     assert_eq!(loader.effective_cache_shards(), loader.cache_shards());
 }
 
-/// A zero byte budget affords zero shards — the shard size here is *known*, so
-/// there is nothing to fall back to.
+/// A zero byte budget bottoms the cache out at **one** shard, not zero.
+///
+/// **Inverted by ORG-9.10-5**, deliberately: the shared descent floors at 1 for
+/// the same reason `IndexPlanLoader` refuses below 1 — a cache that can hold
+/// nothing re-decodes every shard of every batch, and `BackedCsrReader` applies
+/// its own `cache_shards.max(2)` to a 0 anyway, so reporting 0 described a
+/// cache that never existed. The budget is still hopeless and still says so:
+/// the verdict is `below_floor`, which is what the warning escalates on.
 ///
 /// Round-2 review (Cursor, P2) caught that this test was previously named
 /// `..._falls_back_to_the_count_when_shard_size_is_unknown` while asserting
@@ -705,7 +722,7 @@ fn effective_cache_shards_equals_request_when_the_count_binds() {
 /// `avg_shard_decoded_bytes_returns_zero_when_no_shard_has_stats` +
 /// `effective_cache_shards_falls_back_to_the_count_when_size_is_unknown` below.
 #[test]
-fn effective_cache_shards_is_zero_under_a_zero_budget() {
+fn effective_cache_shards_floors_at_one_under_a_zero_budget() {
     let dir = tempfile::tempdir().unwrap();
     let loader = budget_loader(dir.path(), 8, Some(0));
     assert_eq!(
@@ -713,7 +730,14 @@ fn effective_cache_shards_is_zero_under_a_zero_budget() {
         128,
         "premise: the shard size is KNOWN here"
     );
-    assert_eq!(loader.effective_cache_shards(), 0);
+    assert_eq!(loader.effective_cache_shards(), 1);
+    assert!(
+        loader
+            .cache_sizing()
+            .expect("a zero budget must be reported")
+            .below_floor,
+        "a hopeless budget must still escalate, not be silently floored"
+    );
 }
 
 /// Stat-less shards must not be averaged into the per-shard size.
@@ -752,6 +776,190 @@ fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
     // helper must survive; `SparseCellSetLoader::new` rejects zero files, so the
     // helper is exercised directly.
     assert_eq!(avg_shard_decoded_bytes(&[]), 0);
+}
+
+/// The **byte** half of that fallback, which the test above never covered.
+///
+/// ORG-9.10-5 began handing the engine the tuned cache bytes instead of the raw
+/// budget. On a stats-less file the model's cache term is `n × 0 = 0`, so the
+/// tightening would cap the shared cache at zero bytes — "we cannot size the
+/// cache" turned into "no cache", strictly worse than the behaviour it
+/// replaced. No writer emits a stats-less CSR entry, so this is asserted on the
+/// decision rather than through a file that cannot be built.
+#[test]
+fn an_unknown_shard_size_keeps_the_raw_byte_budget() {
+    const RAW: usize = 512 * 1024 * 1024;
+
+    // Known size: the tuned cache binds, as on the paired loader.
+    assert_eq!(
+        resolve_enforced_cache_bytes(32_768, 14_680_064, RAW),
+        14_680_064
+    );
+
+    // Unknown size: the model says 0 bytes, which must NOT reach the cache.
+    assert_eq!(resolve_enforced_cache_bytes(0, 0, RAW), RAW);
+    assert_ne!(
+        resolve_enforced_cache_bytes(0, 0, RAW),
+        0,
+        "a stats-less file must not end up with a zero-byte shard cache"
+    );
+}
+
+// ---- ORG-9.10-5 pre-refactor pins ------------------------------------
+
+/// Two files whose shards are large enough that the cache term dominates the
+/// 50 MB interpreter constant — the regime where the sparse budget model's
+/// answer actually differs from the paired loader's.
+fn sized_budget_loader(
+    dir: &std::path::Path,
+    cache_shards: usize,
+    bytes_budget: Option<usize>,
+) -> StdArc<SparseCellSetLoader> {
+    let p0 = dir.join("s0.scx");
+    let p1 = dir.join("s1.scx");
+    // 2048 rows/shard x 16 B/row = 32 KB per shard.
+    write_fixture(&p0, 8192, 64, 4);
+    write_fixture(&p1, 8192, 64, 4);
+    SparseCellSetLoader::new(
+        vec![open(&p0), open(&p1)],
+        cache_shards,
+        bytes_budget,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+    )
+    .unwrap()
+}
+
+/// A loader whose budget was not exceeded must fit the breakdown it reports.
+///
+/// ⚠️ **Red before `ORG-9.10-5`, by design.** `SparseCellSetLoader::new` sizes
+/// the cache by plain division and passes `non_cache_bytes: 0` to
+/// `assess_cache_sizing`, so the 50 MB constant it *reports* is not one it
+/// budgets for. `IndexPlanLoader` cannot violate this
+/// (`a_constructed_loader_fits_the_breakdown_it_reports`) and neither can the
+/// sequential path
+/// (`pipeline::tests::a_budget_that_was_not_exceeded_fits_the_breakdown_it_reports`).
+///
+/// The implication is guarded on `budget_exceeded` because exhaustion is not an
+/// error here: a budget below the interpreter constant alone bottoms out at the
+/// one-shard floor and warns, rather than refusing construction the way the
+/// paired loader does.
+#[test]
+fn an_unexceeded_sparse_budget_fits_the_breakdown_it_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut saw_nonempty = false;
+    for mb in [1usize, 8, 32, 64, 96, 128, 192] {
+        let loader = sized_budget_loader(dir.path(), 4096, Some(mb * 1024 * 1024));
+        if loader.budget_exceeded() {
+            continue;
+        }
+        saw_nonempty = true;
+        assert!(
+            loader.budget_breakdown().fits_within(mb),
+            "budget {mb} MB was not exceeded but its breakdown totals {} bytes over \
+             {} cache shards",
+            loader.budget_breakdown().total_bytes,
+            loader.effective_cache_shards(),
+        );
+    }
+    assert!(
+        saw_nonempty,
+        "every budget in the sweep was exceeded, so this proves nothing"
+    );
+}
+
+/// The closed form must return exactly what the shared driver would.
+///
+/// `SparseCellSetLoader` resolves its one knob by division rather than by
+/// walking `tune`'s descent, because the knob is caller-controlled and the
+/// descent is O(cache_shards) — 0.7 s at `cache_shards=1e9`, unbounded at
+/// `usize::MAX` (review, round 2). That is only safe while the two agree, so
+/// this sweeps budgets across the interesting range and compares them
+/// element-for-element. It also covers the boundaries the division gets wrong
+/// most easily: an exact fit, a zero budget, and an explicit `cache_shards=0`,
+/// which must stay 0 rather than being floored up to 1.
+#[test]
+fn closed_form_agrees_with_the_shared_driver() {
+    const SHARD: usize = 32_768;
+    let model = SparseCellSetBudgetModel {
+        shard_decoded_bytes: SHARD,
+    };
+    let py = crate::budget::PYTHON_OVERHEAD_BYTES;
+    let budgets = [
+        0,
+        1,
+        py - 1,
+        py,
+        py + 1,
+        py + SHARD - 1,
+        py + SHARD,
+        py + 4 * SHARD,
+        py + 448 * SHARD,
+        512 * 1024 * 1024,
+        4096 * 1024 * 1024,
+    ];
+    for requested in [0usize, 1, 8, 128, 4096] {
+        let req = SparseCellSetParams {
+            cache_shards: requested,
+        };
+        for &budget in &budgets {
+            let closed = resolve_sparse_cache_shards(&model, req, budget);
+            let driven = crate::budget::tune(&model, req, budget);
+            assert_eq!(
+                (closed.params.cache_shards, closed.exhausted),
+                (driven.params.cache_shards, driven.exhausted),
+                "closed form and driver disagree at requested={requested}, budget={budget}"
+            );
+            assert_eq!(closed.breakdown.total_bytes, driven.breakdown.total_bytes);
+        }
+    }
+}
+
+/// The whole reduction chain, through the shared harness. Fixture-free.
+#[test]
+fn the_sparse_reduction_chain_is_monotone() {
+    for &shard_decoded_bytes in &[128usize, 32_768, 470 * 1024 * 1024, 0] {
+        crate::budget::assert_monotone_reduction_chain(
+            &SparseCellSetBudgetModel {
+                shard_decoded_bytes,
+            },
+            SparseCellSetParams { cache_shards: 128 },
+        );
+    }
+}
+
+/// The **model** is monotone: fewer cache shards may not estimate more.
+///
+/// Read under a budget generous enough that nothing is tuned, so
+/// `budget_breakdown()` is the raw estimate. The sparse arm of the property
+/// the shared `tune()` driver will assert on every reduction step.
+#[test]
+fn the_sparse_budget_model_is_monotone_in_cache_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let estimate = |cache: usize| {
+        // 4 GB over a fixture needing ~50 MB: nothing is tuned.
+        let loader = sized_budget_loader(dir.path(), cache, Some(4096 * 1024 * 1024));
+        assert_eq!(
+            loader.effective_cache_shards(),
+            cache,
+            "premise: the budget must be generous enough that nothing is tuned"
+        );
+        loader.budget_breakdown().total_bytes
+    };
+    for cache in (1..32usize).rev() {
+        assert!(
+            estimate(cache) <= estimate(cache + 1),
+            "cache_shards {cache} estimates more than {}",
+            cache + 1
+        );
+    }
+    assert!(estimate(0) <= estimate(32));
 }
 
 // ==========================================================================

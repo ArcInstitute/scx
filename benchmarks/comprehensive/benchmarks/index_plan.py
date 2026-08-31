@@ -411,7 +411,7 @@ if _HAS_TORCH:
         """Top-level (picklable under spawn) IterableDataset shim around
         `pyscx.IndexPlanDataset`. Constructs the inner dataset lazily
         inside `__iter__` so the eager fork-detection check at
-        `python.rs:416-421` does not fire."""
+        `python/index_plan.rs` does not fire."""
 
         def __init__(
             self,

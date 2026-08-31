@@ -2504,6 +2504,70 @@ stops working. An *explicit* `max_memory_mb` that conflicts with an explicit `ca
 is always reported: the caller asked for two things that don't fit, and only they can decide
 which gives.
 
+**One budget model (ORG-9.10-5).** Resolving `None` the same way left the three classes
+still *meaning* three different things by `max_memory_mb`, because each kept its own tune
+loop. They now share one `BudgetModel` trait and one `tune()` driver, which unified three
+things that were quietly different:
+
+- **The mmap'd file is no longer budgeted anywhere.** The sequential model counted the whole
+  file against the budget while the two plan-driven models never did. Since the adaptive cap
+  is 4 GB, *any* file above it exceeded its budget on that term alone and collapsed to
+  `batch_size=64, shard_group_size=1, prefetch_batches=2` with `budget_exceeded` set,
+  whatever the caller asked for — `benchmarks/comprehensive/benchmarks/ml_loader.py` carries
+  a SLURM-memory-scaling workaround written for exactly that. Page cache is evictable under
+  pressure; it is now reported (`mmap_mb`) and never budgeted.
+
+  **The cost, measured.** A two-arm A/B on the small tier (`ml_loader`, `scx_auto`, 4
+  datasets, main-arm capture as the baseline). Both captures are checked in —
+  `results/mainarm_9e_20260830/` and `results/branch_9e_20260830/` — per
+  [benchmark_manifest.md](benchmark_manifest.md); they are an **A/B against each other** on a
+  partial-fixture Lambda node, not a promoted `baselines/LATEST` capture, and their
+  `environment.json` records `git_dirty: true`. What those two summaries report:
+
+  | `ml_loader` / `scx_auto` | main arm | branch arm | Δ peak RSS |
+  |---|---:|---:|---:|
+  | `tabula_sapiens_100k` | 595.53 MB | 657.55 MB | **+10.4%** |
+  | `pbmc3k` | 395.28 MB | 449.01 MB | **+13.6%** |
+  | `pbmc10k` | 389.44 MB | 394.25 MB | +1.2% |
+  | `smartseq2` | 498.50 MB | 483.22 MB | −3.1% |
+
+  **0 timing regressions, 0 file-size, 0 fingerprint mismatches** across all four.
+
+  The `tabula_sapiens_100k` rise is the intended mechanism, visible in the tuned config: the
+  mmap term no longer forces a reduction, so `shard_group_size` goes 3 → 4 (default) and
+  4 → 5 (`hvg_indices`), holding more decoded shard buffers resident.
+
+  The `pbmc3k` row is **not** attributable to the change: at 4 MB the mmap term never bound,
+  and both arms tune to an identical `(shard_group_size, prefetch_batches, batch_size)` of
+  `(1, 4, 1024)`. A separate controlled measurement — three fresh processes per arm on one
+  node — put the two within ±1% (422.3 → 422.9 MB default, 189.8 → 188.0 MB with
+  `hvg_indices`). ⚠️ **That control is not one of the checked-in captures**: it is a local
+  measurement, not a manifest entry, and +13.6% is what the committed A/B says.
+
+  So the trade is explicit: the loader stops shrinking the buffers a caller asked for in
+  order to pay for evictable page cache, and uses more anonymous memory for it. A caller who
+  wants the old footprint sets `max_memory_mb` to the value they actually want enforced,
+  which is now what that argument means.
+
+- **`SparseCellSetDataset` now budgets the interpreter constant it reports.** Its tuner
+  passed `non_cache_bytes: 0`, so `memory_budget()["breakdown"]["total_bytes"]` could exceed
+  the budget the tuner had just checked, and it handed the cache the raw request and raw
+  byte budget rather than the tuned ones. The cache is correspondingly smaller. Note what
+  this does **not** buy: the gathered batch and its transients are still uncharged (this
+  path has no `max_plan_size`), and `WeightedLruCache` keeps a single oversize shard rather
+  than refusing to cache it, so `max_memory_mb` bounds the cache this loader sizes, not
+  process RSS.
+- **`MultimodalTrainingDataset` reports its per-modality split.** The nnz-proportional
+  division has a 64 MB floor (a share below it fails validation), so two modalities at
+  `max_memory_mb=64` budget 128 MB between them. That was always true and never reported;
+  `memory_budget()["effective_total_mb"]` now says so, and an explicit request that gets
+  rounded up warns.
+
+The exhaustion *policy* stays per class, deliberately: the sequential path flags
+`budget_exceeded` and continues (and now raises a `UserWarning`, where it used to only write
+a log line), `IndexPlanLoader` refuses construction, and `SparseCellSetLoader` bottoms out at
+a one-shard cache and warns.
+
 ### Obs categorical codes without pandas (data-load Phase 1, 1C)
 
 The Phase-0 cold breakdown put **96–99.8% of per-file obs cost in obs reading**, not in

@@ -9,7 +9,7 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::BackedCsrReader;
 
 use crate::batch::Batch;
-use crate::budget::{profiling_enabled, BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
+use crate::budget::{profiling_enabled, BudgetBreakdown, BudgetModel, PYTHON_OVERHEAD_BYTES};
 use crate::decode_stage::{build_category_dicts, decode_stage, CategoryDict};
 use crate::error::{LoaderError, Result};
 use crate::io_stage::io_stage;
@@ -222,9 +222,13 @@ pub struct MemoryBudget {
     pub prefetch_batches: usize,
     /// Effective batch_size (may be reduced to fit budget for large gene counts).
     pub batch_size: usize,
-    /// Estimated total memory in bytes (includes mmap file size).
+    /// Estimated total memory in bytes. Equal to `breakdown.total_bytes`, and
+    /// **excludes** the mmap'd file (ORG-9.10-5) — do not subtract
+    /// [`Self::mmap_bytes`] from it.
     pub estimated_bytes: usize,
-    /// Size of the mmap'd SCX file in bytes (included in estimated_bytes).
+    /// Size of the mmap'd SCX file in bytes. **Reported, never budgeted**: the
+    /// kernel page cache is evictable under pressure, so no loader class counts
+    /// it against `max_memory_mb`. Not included in [`Self::estimated_bytes`].
     pub mmap_bytes: usize,
     /// True if estimated memory exceeds the budget even at all minimums.
     pub budget_exceeded: bool,
@@ -418,6 +422,215 @@ pub(crate) fn ensure_csr_ranges_are_readable(
     Ok(())
 }
 
+/// Knobs the sequential auto-tune reduces, in reduction order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SequentialParams {
+    pub(crate) shard_group_size: usize,
+    pub(crate) prefetch_batches: usize,
+    pub(crate) batch_size: usize,
+}
+
+impl SequentialParams {
+    fn from_config(config: &LoaderConfig) -> Self {
+        SequentialParams {
+            shard_group_size: config.shard_group_size,
+            prefetch_batches: config.prefetch_batches,
+            batch_size: config.batch_size,
+        }
+    }
+}
+
+/// Verify that all requested modalities share identical per-modality CSR
+/// shard layouts (shard counts + row ranges). The multimodal loader chunks
+/// each modality independently but assembles batches positionally, so
+/// divergent layouts can never yield aligned `cell_indices`. Returns a
+/// human-readable error naming the first disagreeing pair. Pure (no Python),
+/// so it is unit-testable without a Python interpreter.
+///
+/// Takes the `FullCatalog` rather than the `ScxReader` it came from: that is
+/// all the body reads, and it is the difference between the sentinel branch
+/// below being testable and not. No writer emits a CSR entry without `stats`,
+/// so the only way to reach that branch from a test is to hand it a catalog.
+///
+/// Assumes per-shard `stats` are present (always true for single-writer v2+
+/// files). A shard missing `stats` maps to a `(u64::MAX, u64::MAX)` sentinel:
+/// two such shards compare equal (degenerate files pass, then the per-batch
+/// `cell_indices` check in `__next__` is the backstop), while a mix of
+/// present/absent stats compares unequal and fails loud here. Either way the
+/// loader never silently emits mis-aligned batches; a missing-stats shard is
+/// logged so a corrupt/legacy file is diagnosable.
+// Its only production caller is the `python` binding layer, so a default-feature
+// `cargo check` sees no use of it. It lives here rather than there because it is
+// pure Rust: that is what lets its tests run without the `python` feature.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub(crate) fn check_uniform_modality_layouts(
+    catalog: &scx_format_io::FullCatalog,
+    modalities: &[(String, u8, u64)],
+) -> std::result::Result<(), String> {
+    // `std::result::Result`, not this module's one-argument `Result` alias
+    // (`crate::error::Result`). The error side is a human-readable string the
+    // caller wraps in its own error type, not a `LoaderError`.
+    let layouts: Vec<(&str, Vec<(u64, u64)>)> = modalities
+        .iter()
+        .map(|(name, mid, _)| {
+            let ranges = catalog
+                .csr_shards_for_modality(*mid)
+                .iter()
+                .map(|e| match e.stats.as_ref() {
+                    Some(s) => (s.row_start, s.row_end),
+                    None => {
+                        log::warn!(
+                            "MultimodalTrainingDataset: modality '{name}' has a CSR shard with no \
+                             stats; layout-uniformity check falls back to a sentinel row range."
+                        );
+                        (u64::MAX, u64::MAX)
+                    }
+                })
+                .collect();
+            (name.as_str(), ranges)
+        })
+        .collect();
+    if let Some((first_name, first_ranges)) = layouts.first() {
+        for (name, ranges) in layouts.iter().skip(1) {
+            if ranges != first_ranges {
+                return Err(format!(
+                    "modalities '{first_name}' and '{name}' have different per-modality CSR \
+                     shard layouts (shard counts or row ranges disagree). The multimodal loader \
+                     requires uniform per-modality sharding; reshard the file with a uniform \
+                     shard_target_rows before training."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the shared user overrides against [`LoaderConfig::default()`],
+/// filling the fields that vary per construction site (`hvg_indices`,
+/// `obs_columns`, `max_memory_mb`, `auto_memory_budget`, `modality_id`) from
+/// the caller. Shared by `TrainingDataset::new` and the per-modality
+/// `MultimodalTrainingDataset::new` construction so the default-resolution is
+/// spelled out in exactly one place (otherwise a new `LoaderConfig` field must
+/// be wired through two field-for-field literal blocks that silently drift).
+#[allow(clippy::too_many_arguments)]
+// Its only production caller is the `python` binding layer, so a default-feature
+// `cargo check` sees no use of it. It lives here rather than there because it is
+// pure Rust: that is what lets its tests run without the `python` feature.
+#[cfg_attr(not(feature = "python"), allow(dead_code))]
+pub(crate) fn resolve_loader_config(
+    batch_size: Option<usize>,
+    shard_group_size: Option<usize>,
+    prefetch_batches: Option<usize>,
+    normalize: Option<bool>,
+    log1p: Option<bool>,
+    target_sum: Option<f64>,
+    pflog: Option<bool>,
+    pflog_alpha: Option<f64>,
+    seed: Option<u64>,
+    hvg_indices: Option<Vec<u32>>,
+    obs_columns: Vec<String>,
+    max_memory_mb: usize,
+    auto_memory_budget: bool,
+    modality_id: Option<u8>,
+    // `true` only from `MultimodalTrainingDataset`, which shares one panel
+    // across modalities of differing widths — see `LoaderConfig::shared_hvg_panel`.
+    shared_hvg_panel: bool,
+) -> LoaderConfig {
+    let defaults = LoaderConfig::default();
+    LoaderConfig {
+        batch_size: batch_size.unwrap_or(defaults.batch_size),
+        shard_group_size: shard_group_size.unwrap_or(defaults.shard_group_size),
+        prefetch_batches: prefetch_batches.unwrap_or(defaults.prefetch_batches),
+        hvg_indices,
+        obs_columns,
+        normalize: normalize.unwrap_or(defaults.normalize),
+        log1p: log1p.unwrap_or(defaults.log1p),
+        target_sum: target_sum.unwrap_or(defaults.target_sum),
+        pflog: pflog.unwrap_or(defaults.pflog),
+        pflog_alpha: pflog_alpha.or(defaults.pflog_alpha),
+        seed: seed.unwrap_or(defaults.seed),
+        max_memory_mb,
+        auto_memory_budget,
+        modality_id,
+        shared_hvg_panel,
+    }
+}
+
+/// The sequential (`TrainingPipeline`) arm of [`crate::budget::BudgetModel`].
+///
+/// Reduction order — `prefetch_batches` to 2, then `shard_group_size` to 1,
+/// then `batch_size` **halved** to 64 — is deliberate and pinned
+/// (`budget_reduces_prefetch_then_shard_group_then_batch`): `batch_size` is the
+/// only one of the three a caller picks for statistical rather than memory
+/// reasons, so it gives last.
+pub(crate) struct SequentialBudgetModel {
+    n_output_genes: usize,
+    shard_target_rows: usize,
+    avg_nnz_per_cell: f64,
+}
+
+impl SequentialBudgetModel {
+    pub(crate) fn new(
+        n_output_genes: usize,
+        shard_target_rows: usize,
+        avg_nnz_per_cell: f64,
+    ) -> Self {
+        SequentialBudgetModel {
+            n_output_genes,
+            shard_target_rows,
+            avg_nnz_per_cell,
+        }
+    }
+}
+
+impl BudgetModel for SequentialBudgetModel {
+    type Params = SequentialParams;
+
+    fn estimate(&self, p: SequentialParams) -> BudgetBreakdown {
+        estimate_breakdown(
+            p.shard_group_size,
+            p.prefetch_batches,
+            p.batch_size,
+            self.n_output_genes,
+            self.shard_target_rows,
+            self.avg_nnz_per_cell,
+        )
+    }
+
+    fn reduce(&self, p: SequentialParams) -> Option<SequentialParams> {
+        if p.prefetch_batches > 2 {
+            Some(SequentialParams {
+                prefetch_batches: p.prefetch_batches - 1,
+                ..p
+            })
+        } else if p.shard_group_size > 1 {
+            Some(SequentialParams {
+                shard_group_size: p.shard_group_size - 1,
+                ..p
+            })
+        } else if p.batch_size > 64 {
+            Some(SequentialParams {
+                batch_size: (p.batch_size / 2).max(64),
+                ..p
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Number of output columns the batch is actually allocated at.
+///
+/// The **deduplicated** panel width, not `hvg.len()`: costing the raw length
+/// over-reserves for any panel with duplicates and can auto-tune `batch_size`
+/// down to afford memory that is never used.
+fn n_output_genes_for(config: &LoaderConfig, n_vars: u64) -> usize {
+    match &config.hvg_indices {
+        Some(hvg) => HvgProjection::output_cols_for(hvg),
+        None => n_vars as usize,
+    }
+}
+
 /// Compute the memory budget for the training pipeline.
 ///
 /// Memory model:
@@ -425,7 +638,6 @@ pub(crate) fn ensure_csr_ranges_are_readable(
 /// n_output_genes     = unique genes in hvg_indices if present, else n_vars
 /// shard_buffer       = (shard_group_size + 1) × decoded_shard_bytes
 /// batch_buffer       = (max(prefetch_batches, 2) + 1) × batch_size × n_output_genes × 4
-/// mmap_resident      = file_size_bytes (entire file faulted into RSS during epoch)
 /// overhead           = ~50 MB (Python interpreter, numpy, Arrow, thread stacks)
 /// ```
 ///
@@ -433,6 +645,15 @@ pub(crate) fn ensure_csr_ranges_are_readable(
 /// 1. `prefetch_batches` (minimum 2)
 /// 2. `shard_group_size` (minimum 1)
 /// 3. `batch_size` (halve each step, minimum 64)
+///
+/// **`file_size_bytes` is reported, never budgeted** (ORG-9.10-5). The mmap'd
+/// file lives in the kernel page cache, which is evictable under pressure; the
+/// two plan-driven loaders have always excluded it, and counting it here made
+/// this path mean something different by the same name. It also made the
+/// auto-tune useless on exactly the files it matters for: any file above
+/// [`ADAPTIVE_BUDGET_CAP_MB`] exceeded its budget on the mmap term alone,
+/// collapsing to `batch_size=64, shard_group_size=1, prefetch_batches=2` with
+/// `budget_exceeded` set, whatever the caller asked for.
 pub fn compute_memory_budget(
     config: &LoaderConfig,
     n_vars: u64,
@@ -440,106 +661,67 @@ pub fn compute_memory_budget(
     avg_nnz_per_cell: f64,
     file_size_bytes: usize,
 ) -> MemoryBudget {
-    // The deduplicated width, not `hvg.len()` — the batch is allocated at
-    // `HvgProjection::n_output_cols()`, so costing the raw length over-reserves
-    // for any panel with duplicates and can auto-tune `batch_size` down to
-    // afford memory that is never used.
-    let n_output_genes = match &config.hvg_indices {
-        Some(hvg) => HvgProjection::output_cols_for(hvg),
-        None => n_vars as usize,
-    };
+    let model = SequentialBudgetModel::new(
+        n_output_genes_for(config, n_vars),
+        shard_target_rows as usize,
+        avg_nnz_per_cell,
+    );
+    compute_memory_budget_with(&model, config, n_vars, file_size_bytes)
+}
 
-    let max_bytes = config.max_memory_mb * 1024 * 1024;
+/// [`compute_memory_budget`] against a model the caller already built.
+///
+/// `TrainingPipeline::new` needs the same model twice — once to resolve an
+/// adaptive budget from the requested config's own need, once to tune — and
+/// then keeps it for [`TrainingPipeline::pin_effective_config`]. Building it
+/// once is not just cheaper: the adaptive path reads the output width off the
+/// `HvgProjection` while `n_output_genes_for` re-derives it from
+/// `config.hvg_indices`, and those are two sources for one number that must
+/// agree. Now there is one.
+pub(crate) fn compute_memory_budget_with(
+    model: &SequentialBudgetModel,
+    config: &LoaderConfig,
+    n_vars: u64,
+    file_size_bytes: usize,
+) -> MemoryBudget {
+    let tuned = crate::budget::tune(
+        model,
+        SequentialParams::from_config(config),
+        config.max_memory_mb.saturating_mul(1024 * 1024),
+    );
 
-    let mut shard_group_size = config.shard_group_size;
-    let mut prefetch_batches = config.prefetch_batches;
-    let mut batch_size = config.batch_size;
-
-    loop {
-        let estimated = estimate_memory(
-            shard_group_size,
-            prefetch_batches,
-            batch_size,
-            n_output_genes,
-            shard_target_rows as usize,
-            avg_nnz_per_cell,
-            file_size_bytes,
+    if tuned.exhausted {
+        log::warn!(
+            "estimated memory ({} MB) exceeds budget ({} MB) even at minimums \
+             (batch_size={}, shard_group_size=1, prefetch_batches=2). \
+             Consider setting hvg_indices to reduce n_output_genes from {}.",
+            tuned.breakdown.total_bytes / (1024 * 1024),
+            config.max_memory_mb,
+            tuned.params.batch_size,
+            n_vars,
         );
+    }
 
-        if estimated <= max_bytes {
-            let breakdown = estimate_breakdown(
-                shard_group_size,
-                prefetch_batches,
-                batch_size,
-                n_output_genes,
-                shard_target_rows as usize,
-                avg_nnz_per_cell,
-            );
-            return MemoryBudget {
-                shard_group_size,
-                prefetch_batches,
-                batch_size,
-                estimated_bytes: estimated,
-                mmap_bytes: file_size_bytes,
-                budget_exceeded: false,
-                breakdown,
-                shuffle_quality_degraded: shuffle_quality_degraded(
-                    config.shard_group_size,
-                    shard_group_size,
-                ),
-            };
-        }
-
-        // Reduce prefetch_batches first (to minimum 2)
-        if prefetch_batches > 2 {
-            prefetch_batches -= 1;
-            continue;
-        }
-
-        // Then reduce shard_group_size (to minimum 1)
-        if shard_group_size > 1 {
-            shard_group_size -= 1;
-            continue;
-        }
-
-        // Then halve batch_size (to minimum 64)
-        if batch_size > 64 {
-            batch_size = (batch_size / 2).max(64);
-            continue;
-        }
-
-        // All at minimums — return best-effort estimate with warning
-        let breakdown = estimate_breakdown(
-            shard_group_size,
-            prefetch_batches,
-            batch_size,
-            n_output_genes,
-            shard_target_rows as usize,
-            avg_nnz_per_cell,
-        );
-        return MemoryBudget {
-            shard_group_size,
-            prefetch_batches,
-            batch_size,
-            estimated_bytes: estimated,
-            mmap_bytes: file_size_bytes,
-            budget_exceeded: true,
-            breakdown,
-            shuffle_quality_degraded: shuffle_quality_degraded(
-                config.shard_group_size,
-                shard_group_size,
-            ),
-        };
+    MemoryBudget {
+        shard_group_size: tuned.params.shard_group_size,
+        prefetch_batches: tuned.params.prefetch_batches,
+        batch_size: tuned.params.batch_size,
+        estimated_bytes: tuned.breakdown.total_bytes,
+        mmap_bytes: file_size_bytes,
+        budget_exceeded: tuned.exhausted,
+        breakdown: tuned.breakdown,
+        shuffle_quality_degraded: shuffle_quality_degraded(
+            config.shard_group_size,
+            tuned.params.shard_group_size,
+        ),
     }
 }
 
 /// Estimate the per-component memory breakdown for given parameters.
 ///
-/// Returns a `BudgetBreakdown` that follows the index-plan convention of
-/// excluding mmap from the budget; the mmap term is returned separately so
-/// the caller can include it in `MemoryBudget.estimated_bytes` for the
-/// sequential path (where the entire file faults into RSS during an
-/// epoch).
+/// Excludes mmap, like every other budget model. The file's pages do fault
+/// into RSS during an epoch, but they are evictable page cache and are
+/// reported on `MemoryBudget::mmap_bytes` rather than charged (ORG-9.10-5).
 fn estimate_breakdown(
     shard_group_size: usize,
     prefetch_batches: usize,
@@ -585,73 +767,6 @@ fn estimate_breakdown(
     )
 }
 
-/// Estimate total memory usage including the mmap-resident term, used by
-/// the auto-tune to decide when to reduce parameters.
-///
-/// **Mmap note**: the OS faults pages into RSS as shards are read
-/// sequentially; with MADV_SEQUENTIAL the kernel may reclaim pages, but we
-/// conservatively include the full file size since `ru_maxrss` captures
-/// the high-water mark. Intentional over-estimate — a caller that sees
-/// this fit will nearly always fit at runtime.
-fn estimate_memory(
-    shard_group_size: usize,
-    prefetch_batches: usize,
-    batch_size: usize,
-    n_output_genes: usize,
-    shard_target_rows: usize,
-    avg_nnz_per_cell: f64,
-    file_size_bytes: usize,
-) -> usize {
-    let breakdown = estimate_breakdown(
-        shard_group_size,
-        prefetch_batches,
-        batch_size,
-        n_output_genes,
-        shard_target_rows,
-        avg_nnz_per_cell,
-    );
-    breakdown.total_bytes.saturating_add(file_size_bytes)
-}
-
-/// Adaptive default budget (MB) for [`LoaderConfig::auto_memory_budget`].
-///
-/// Returns the memory the **requested** configuration needs (the same model
-/// [`compute_memory_budget`] auto-tunes against) rounded up to whole MB with
-/// ~12 % headroom, clamped to `[floor_mb, ADAPTIVE_BUDGET_CAP_MB]`. Because the
-/// floor is the lower clamp bound this never lowers the budget — a small file
-/// whose need is below `floor_mb` keeps `floor_mb`, while a full-width file is
-/// raised just enough to fit without the auto-tune shrinking `batch_size` /
-/// `shard_group_size`. A need above the cap is clamped to the cap, leaving the
-/// hard-ceiling auto-tune (and its warnings) to handle genuinely huge files.
-#[allow(clippy::too_many_arguments)]
-fn adaptive_budget_mb(
-    floor_mb: usize,
-    shard_group_size: usize,
-    prefetch_batches: usize,
-    batch_size: usize,
-    n_output_genes: usize,
-    shard_target_rows: usize,
-    avg_nnz_per_cell: f64,
-    file_size_bytes: usize,
-) -> usize {
-    let requested_need = estimate_memory(
-        shard_group_size,
-        prefetch_batches,
-        batch_size,
-        n_output_genes,
-        shard_target_rows,
-        avg_nnz_per_cell,
-        file_size_bytes,
-    );
-    let need_mb = requested_need.div_ceil(1024 * 1024);
-    let with_headroom = need_mb.saturating_add(need_mb / 8);
-    // `clamp` panics if min > max. Today the auto path always supplies
-    // floor_mb = the 512 MB default (< cap), but guard defensively against a
-    // caller that sets `auto_memory_budget` with a budget above the cap so a
-    // misconfiguration never panics the interpreter.
-    with_headroom.clamp(floor_mb, ADAPTIVE_BUDGET_CAP_MB.max(floor_mb))
-}
-
 // ---------------------------------------------------------------------------
 // E1: TrainingPipeline — triple-buffered pipeline coordinator
 // ---------------------------------------------------------------------------
@@ -695,6 +810,12 @@ pub struct TrainingPipeline {
     shard_target_rows: u32,
     projection: Option<HvgProjection>,
     memory_budget: MemoryBudget,
+    /// The budget model this pipeline was tuned against. Kept so
+    /// [`Self::pin_effective_config`] can re-estimate without re-opening the
+    /// file — three numbers, no I/O.
+    budget_model: SequentialBudgetModel,
+    /// CSR shard count, for rebuilding the shuffler on a pin.
+    n_csr_shards: usize,
     // Runtime state — all lazy / per-epoch:
     batch_rx: Option<crossbeam_channel::Receiver<Batch>>,
     /// I/O stage runs on a dedicated `std::thread` that owns a
@@ -901,62 +1022,49 @@ impl TrainingPipeline {
         // `ADAPTIVE_BUDGET_CAP_MB` (genuinely huge files still fall through to
         // the hard-ceiling auto-tune + warnings rather than reserving unbounded
         // RAM). Only ever raises, never lowers.
-        if config.auto_memory_budget {
-            // Read the width off the projection built above rather than the raw
-            // panel: they differ whenever the panel had duplicates, and the
-            // projection's answer is the one the batch is allocated at.
-            let n_output_genes = match &projection {
+        // One model for the whole constructor: the adaptive raise below, the
+        // tune after it, and `pin_effective_config` later all use this one.
+        // Read the width off the projection built above rather than the raw
+        // panel: they differ whenever the panel had duplicates, and the
+        // projection's answer is the one the batch is allocated at.
+        let budget_model = SequentialBudgetModel::new(
+            match &projection {
                 Some(proj) => proj.n_output_cols(),
                 None => n_vars as usize,
-            };
-            let adaptive_mb = adaptive_budget_mb(
+            },
+            shard_target_rows as usize,
+            avg_nnz_per_cell,
+        );
+
+        if config.auto_memory_budget {
+            // One `adaptive_budget_mb`, in `crate::budget` — this path used to
+            // carry a second copy of the same arithmetic (ORG-9.10-5).
+            let adaptive_mb = crate::budget::adaptive_budget_mb(
+                budget_model
+                    .estimate(SequentialParams::from_config(&config))
+                    .total_bytes,
                 config.max_memory_mb,
-                config.shard_group_size,
-                config.prefetch_batches,
-                config.batch_size,
-                n_output_genes,
-                shard_target_rows as usize,
-                avg_nnz_per_cell,
-                file_size_bytes,
             );
             if adaptive_mb > config.max_memory_mb {
                 log::info!(
                     "loader auto-budget: raised max_memory_mb {} -> {} MB to fit the \
-                     requested configuration (batch_size={}, shard_group_size={}, \
-                     n_output_genes={}) without shrinking the batch. Pass an explicit \
-                     max_memory_mb to pin a hard ceiling instead.",
+                     requested configuration (batch_size={}, shard_group_size={}) \
+                     without shrinking the batch. Pass an explicit max_memory_mb to pin \
+                     a hard ceiling instead.",
                     config.max_memory_mb,
                     adaptive_mb,
                     config.batch_size,
                     config.shard_group_size,
-                    n_output_genes,
                 );
                 config.max_memory_mb = adaptive_mb;
             }
         }
 
-        let memory_budget = compute_memory_budget(
-            &config,
-            n_vars,
-            shard_target_rows,
-            avg_nnz_per_cell,
-            file_size_bytes,
-        );
+        let memory_budget =
+            compute_memory_budget_with(&budget_model, &config, n_vars, file_size_bytes);
 
         // Propagate effective batch_size back into config
         config.batch_size = memory_budget.batch_size;
-
-        if memory_budget.budget_exceeded {
-            log::warn!(
-                "estimated memory ({} MB) exceeds budget ({} MB) even at minimums \
-                 (batch_size={}, shard_group_size=1, prefetch_batches=2). \
-                 Consider setting hvg_indices to reduce n_output_genes from {}.",
-                memory_budget.estimated_bytes / (1024 * 1024),
-                config.max_memory_mb,
-                memory_budget.batch_size,
-                n_vars,
-            );
-        }
 
         // Create shard shuffler
         let shuffler =
@@ -978,6 +1086,8 @@ impl TrainingPipeline {
         }
 
         Ok(TrainingPipeline {
+            budget_model,
+            n_csr_shards,
             config,
             reader,
             obs_metadata,
@@ -1344,6 +1454,95 @@ impl TrainingPipeline {
     }
 
     /// Memory budget diagnostics.
+    /// Pin `(batch_size, shard_group_size)` **after** the budget auto-tune has
+    /// already run.
+    ///
+    /// `MultimodalTrainingDataset` runs one pipeline per modality and must
+    /// batch them in lockstep, so it forces every modality onto the
+    /// cross-modality *minimum* effective config. It used to do that by
+    /// building every pipeline a second time with the minimum pre-set and then
+    /// `debug_assert`ing that the tuner had landed on the same answer — an
+    /// assertion compiled out of the release wheels users run, guarding a
+    /// property (`estimate` is monotone, so a smaller config always still fits)
+    /// that nothing checked. Setting the values directly makes the property
+    /// structural, and skips N full reconstructions — each of which re-opened
+    /// the file and re-ran pflog α estimation over the raw CSR shards.
+    ///
+    /// Refuses to *raise* either knob: "the pinned config always fits" holds
+    /// because the pin only ever shrinks and the model is monotone (asserted
+    /// per step by [`crate::budget::tune`] and end to end by
+    /// `the_sequential_reduction_chain_is_monotone`). Raising would need a
+    /// fresh tune, so it is an error rather than a silent no-op.
+    ///
+    /// `pub(crate)`: the only caller is the multimodal wrapper in this crate,
+    /// and it is not a documented Rust extension point — exporting it would
+    /// commit to input contracts nothing external needs (review, round 2).
+    ///
+    /// `shuffle_quality_degraded` is deliberately **not** recomputed: it
+    /// records what *this modality's own* tuner did, and recomputing it here
+    /// would both erase that and emit a second `log::warn!` per modality, where
+    /// the caller already emits one cross-modality `log::info!`.
+    pub(crate) fn pin_effective_config(
+        &mut self,
+        batch_size: usize,
+        shard_group_size: usize,
+    ) -> Result<()> {
+        if self.batch_rx.is_some() {
+            return Err(LoaderError::ConfigError {
+                reason: "pin_effective_config called with an epoch in flight".to_string(),
+            });
+        }
+        if batch_size > self.memory_budget.batch_size
+            || shard_group_size > self.memory_budget.shard_group_size
+        {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "pin_effective_config may only shrink: asked for \
+                     (batch_size={batch_size}, shard_group_size={shard_group_size}) \
+                     against an effective (batch_size={}, shard_group_size={})",
+                    self.memory_budget.batch_size, self.memory_budget.shard_group_size,
+                ),
+            });
+        }
+
+        // Everything that can fail is built *before* `self` is touched, so a
+        // refused pin leaves the pipeline exactly as it was rather than
+        // half-updated. `ShardShuffler::new` rejects a zero group size, and a
+        // zero `batch_size` would yield an epoch of empty batches.
+        if batch_size == 0 || shard_group_size == 0 {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "pin_effective_config requires non-zero knobs, got \
+                     (batch_size={batch_size}, shard_group_size={shard_group_size})"
+                ),
+            });
+        }
+        let shuffler = ShardShuffler::new(self.n_csr_shards, shard_group_size, self.config.seed)?;
+
+        let params = SequentialParams {
+            shard_group_size,
+            prefetch_batches: self.memory_budget.prefetch_batches,
+            batch_size,
+        };
+        let breakdown = self.budget_model.estimate(params);
+        self.config.batch_size = batch_size;
+        self.config.shard_group_size = shard_group_size;
+        self.memory_budget.batch_size = batch_size;
+        self.memory_budget.shard_group_size = shard_group_size;
+        self.memory_budget.estimated_bytes = breakdown.total_bytes;
+        self.memory_budget.breakdown = breakdown;
+        self.memory_budget.budget_exceeded = !breakdown.fits_within(self.config.max_memory_mb);
+        self.shuffler = shuffler;
+        Ok(())
+    }
+
+    /// The memory budget in force, in MB — the value the auto-tune ran
+    /// against, which is the *resolved* one when `auto_memory_budget` raised
+    /// it. Same accessor name and meaning as `IndexPlanLoader::max_memory_mb`.
+    pub fn max_memory_mb(&self) -> usize {
+        self.config.max_memory_mb
+    }
+
     pub fn memory_budget_info(&self) -> &MemoryBudget {
         &self.memory_budget
     }
@@ -1700,6 +1899,34 @@ mod tests {
 
     // --- Memory budget tests ---
 
+    /// The four adaptive-budget tests below were written against
+    /// `pipeline::adaptive_budget_mb`, the second copy of arithmetic
+    /// `budget::adaptive_budget_mb` already owned. ORG-9.10-5 deleted the copy;
+    /// this keeps the tests' call shape while routing them through the survivor,
+    /// so what they assert is unchanged. `file_size_bytes` is gone from the
+    /// signature because the sequential model no longer budgets mmap.
+    fn adaptive_budget_mb(
+        floor_mb: usize,
+        shard_group_size: usize,
+        prefetch_batches: usize,
+        batch_size: usize,
+        n_output_genes: usize,
+        shard_target_rows: usize,
+        avg_nnz_per_cell: f64,
+    ) -> usize {
+        let model = SequentialBudgetModel::new(n_output_genes, shard_target_rows, avg_nnz_per_cell);
+        crate::budget::adaptive_budget_mb(
+            model
+                .estimate(SequentialParams {
+                    shard_group_size,
+                    prefetch_batches,
+                    batch_size,
+                })
+                .total_bytes,
+            floor_mb,
+        )
+    }
+
     #[test]
     fn test_memory_budget_2k_hvg_within_512mb() {
         let config = LoaderConfig {
@@ -1845,14 +2072,13 @@ mod tests {
         // A tiny file needs far less than the 512 MB floor → budget unchanged,
         // so small-file behaviour is identical to the fixed default.
         let mb = adaptive_budget_mb(
-            512,         /* floor */
-            1,           /* shard_group_size */
-            4,           /* prefetch */
-            64,          /* batch_size */
-            100,         /* n_output_genes */
-            1024,        /* shard_target_rows */
-            5.0,         /* avg_nnz_per_cell */
-            1024 * 1024, /* 1 MB file */
+            512,  /* floor */
+            1,    /* shard_group_size */
+            4,    /* prefetch */
+            64,   /* batch_size */
+            100,  /* n_output_genes */
+            1024, /* shard_target_rows */
+            5.0,  /* avg_nnz_per_cell */
         );
         assert_eq!(mb, 512, "small file should keep the 512 MB floor");
     }
@@ -1867,17 +2093,7 @@ mod tests {
         let n_genes = 33_538usize;
         let shard_target_rows = 16_384usize;
         let avg_nnz = 2_246.0f64;
-        let file_size = 280 * 1024 * 1024usize;
-        let mb = adaptive_budget_mb(
-            512,
-            1,
-            4,
-            512,
-            n_genes,
-            shard_target_rows,
-            avg_nnz,
-            file_size,
-        );
+        let mb = adaptive_budget_mb(512, 1, 4, 512, n_genes, shard_target_rows, avg_nnz);
         assert!(
             mb > 512,
             "full-width file should raise above the 512 MB floor (got {mb})"
@@ -1898,7 +2114,7 @@ mod tests {
             n_genes as u64,
             shard_target_rows as u32,
             avg_nnz,
-            file_size,
+            /*file_size_bytes*/ 280 * 1024 * 1024,
         );
         assert_eq!(
             budget.batch_size, 512,
@@ -1920,14 +2136,9 @@ mod tests {
         // the cap so we never silently reserve unbounded RAM — the hard-ceiling
         // auto-tune + warnings take over above the cap.
         let mb = adaptive_budget_mb(
-            512,
-            8,
-            4,
-            1024,
-            33_538,                 /* n_output_genes */
-            16_384,                 /* shard_target_rows */
-            33_538.0,               /* fully dense: avg_nnz == n_genes */
-            2 * 1024 * 1024 * 1024, /* 2 GB file */
+            512, 8, 4, 1024, 33_538,   /* n_output_genes */
+            16_384,   /* shard_target_rows */
+            33_538.0, /* fully dense: avg_nnz == n_genes */
         );
         assert_eq!(
             mb, ADAPTIVE_BUDGET_CAP_MB,
@@ -1947,7 +2158,6 @@ mod tests {
             30_000,
             16_384,
             10.0,
-            0,
         );
         assert!(
             mb >= ADAPTIVE_BUDGET_CAP_MB + 4096,
@@ -2039,36 +2249,337 @@ mod tests {
         );
     }
 
+    /// **Inverted by ORG-9.10-5.** This test previously asserted the opposite —
+    /// that a 2.5 GB file raised `estimated_bytes` by roughly the file size —
+    /// because the sequential model counted mmap-resident pages against the
+    /// budget and the two plan-driven models did not.
+    ///
+    /// `mmap_bytes` is still *reported*, because the pages are real and a
+    /// caller reading `ru_maxrss` will see them. It is no longer *budgeted*:
+    /// the kernel page cache is evictable under pressure, and counting it made
+    /// every file above `ADAPTIVE_BUDGET_CAP_MB` exceed its budget on that term
+    /// alone.
     #[test]
-    fn test_memory_budget_includes_mmap_size() {
-        // A large file should increase the estimate proportionally
+    fn mmap_is_reported_but_not_budgeted() {
         let config = LoaderConfig {
             hvg_indices: Some((0..2000).collect()),
             ..LoaderConfig::default()
         };
-        let budget_no_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
         let file_2gb = 2_500 * 1024 * 1024; // 2.5 GB
-        let budget_large_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
+        let no_file = compute_memory_budget(&config, 30_000, 16_384, 10.0, 0);
+        let large = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
 
-        assert_eq!(budget_large_file.mmap_bytes, file_2gb);
-        assert!(
-            budget_large_file.estimated_bytes > budget_no_file.estimated_bytes + file_2gb / 2,
-            "large file should significantly increase estimate"
+        assert_eq!(
+            large.mmap_bytes, file_2gb,
+            "the file size is still reported"
+        );
+        assert_eq!(no_file.mmap_bytes, 0);
+        assert_eq!(
+            large.estimated_bytes, no_file.estimated_bytes,
+            "the estimate must not move with the file size"
+        );
+        assert_eq!(
+            large.estimated_bytes, large.breakdown.total_bytes,
+            "`estimated_bytes` and the breakdown's total are now the same number \
+             on every loader class"
         );
     }
 
+    /// **Inverted by ORG-9.10-5**, and the reason the change is worth making:
+    /// a 2.5 GB file used to force `batch_size` / `shard_group_size` /
+    /// `prefetch_batches` down purely because of its size.
+    /// `benchmarks/comprehensive/benchmarks/ml_loader.py` carried a
+    /// SLURM-memory-scaling workaround for exactly this collapse.
     #[test]
-    fn test_memory_budget_large_file_reduces_batch_size() {
-        // A 2.5 GB file with 2K HVG should force parameter reductions
+    fn a_large_file_no_longer_forces_a_reduction() {
         let config = LoaderConfig {
             hvg_indices: Some((0..2000).collect()),
             ..LoaderConfig::default()
         };
         let file_2gb = 2_500 * 1024 * 1024;
         let budget = compute_memory_budget(&config, 30_000, 16_384, 10.0, file_2gb);
+        assert_eq!(
+            (
+                budget.shard_group_size,
+                budget.prefetch_batches,
+                budget.batch_size
+            ),
+            (
+                config.shard_group_size,
+                config.prefetch_batches,
+                config.batch_size
+            ),
+            "a large file must not shrink a config that fits in anonymous memory"
+        );
+        assert!(!budget.budget_exceeded);
+        // The premise: this config genuinely fits the 512 MB default, so the
+        // old failure really was the mmap term and nothing else.
+        assert!(budget.breakdown.fits_within(config.max_memory_mb));
+    }
+
+    /// `pin_effective_config` must refuse to **raise** a knob.
+    ///
+    /// This is what replaced §9.6's `debug_assert!` and makes
+    /// `MultimodalTrainingDataset`'s uniform pin structural rather than
+    /// assumed: "the pinned config always fits" holds because the pin only ever
+    /// shrinks and the model is monotone. A regression that allowed a raise
+    /// would not fail the Python-level test, which only observes the happy path.
+    #[test]
+    fn pin_effective_config_refuses_to_raise_a_knob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "pin.scx", 64, 20, 4);
+        let config = LoaderConfig {
+            batch_size: 16,
+            shard_group_size: 2,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+        let mut p = TrainingPipeline::new(&path, config).unwrap();
+        let (bs, sgs) = {
+            let mb = p.memory_budget_info();
+            (mb.batch_size, mb.shard_group_size)
+        };
+
+        // Shrinking is fine, and is what the multimodal pin does.
+        p.pin_effective_config(bs / 2, sgs)
+            .expect("shrinking must be allowed");
+        assert_eq!(p.memory_budget_info().batch_size, bs / 2);
+        assert_eq!(p.effective_batch_size(), bs / 2);
+
+        // Raising either knob is an error, not a silent no-op.
+        let err = p.pin_effective_config(bs, sgs).unwrap_err();
         assert!(
-            budget.shard_group_size < 8 || budget.prefetch_batches < 4 || budget.batch_size < 1024,
-            "2.5 GB file should force parameter reduction even with 2K HVG"
+            err.to_string().contains("may only shrink"),
+            "unexpected error: {err}"
+        );
+        let err = p.pin_effective_config(bs / 2, sgs + 1).unwrap_err();
+        assert!(
+            err.to_string().contains("may only shrink"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Pinning mid-epoch would swap the shuffler out from under a live
+    /// iteration, so it is refused rather than silently reordering rows.
+    #[test]
+    fn pin_effective_config_refuses_mid_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, "pin_epoch.scx", 64, 20, 4);
+        let config = LoaderConfig {
+            batch_size: 16,
+            normalize: false,
+            log1p: false,
+            ..LoaderConfig::default()
+        };
+        let mut p = TrainingPipeline::new(&path, config).unwrap();
+        p.start_epoch().unwrap();
+        let err = p.pin_effective_config(8, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("epoch in flight"),
+            "unexpected error: {err}"
+        );
+        p.shutdown();
+    }
+
+    // ---- ORG-9.10-5 pre-refactor pins ------------------------------------
+
+    /// The reduction **order**, not merely that something was reduced.
+    ///
+    /// `test_memory_budget_128mb_reduced` asserts only that *some* knob moved
+    /// and `test_memory_budget_64mb_all_minimums` only pins the terminal state,
+    /// so a loop that halved `batch_size` before touching `prefetch_batches`
+    /// would pass both — and `batch_size` is the one knob a caller picks for
+    /// statistical rather than memory reasons, so it must give last.
+    #[test]
+    fn budget_reduces_prefetch_then_shard_group_then_batch() {
+        let base = LoaderConfig::default();
+        let (req_sgs, req_pf, req_bs) = (
+            base.shard_group_size,
+            base.prefetch_batches,
+            base.batch_size,
+        );
+        assert_eq!(
+            (req_sgs, req_pf, req_bs),
+            (8, 4, 1024),
+            "premise: the defaults this test reasons about"
+        );
+
+        let mut saw_prefetch_alone = false;
+        let mut saw_group_without_batch = false;
+
+        for mb in (64..=2048).step_by(8) {
+            let b = compute_memory_budget(
+                &LoaderConfig {
+                    max_memory_mb: mb,
+                    ..base.clone()
+                },
+                30_000,
+                16_384,
+                10.0,
+                0,
+            );
+
+            if b.shard_group_size < req_sgs {
+                assert_eq!(
+                    b.prefetch_batches, 2,
+                    "at {mb} MB shard_group_size fell to {} while prefetch_batches was \
+                     still {} — prefetch must reach its floor first",
+                    b.shard_group_size, b.prefetch_batches
+                );
+            }
+            if b.batch_size < req_bs {
+                assert_eq!(
+                    (b.prefetch_batches, b.shard_group_size),
+                    (2, 1),
+                    "at {mb} MB batch_size fell to {} before prefetch_batches and \
+                     shard_group_size reached their floors (got {}, {})",
+                    b.batch_size,
+                    b.prefetch_batches,
+                    b.shard_group_size
+                );
+            }
+
+            if b.prefetch_batches < req_pf
+                && b.shard_group_size == req_sgs
+                && b.batch_size == req_bs
+            {
+                saw_prefetch_alone = true;
+            }
+            if b.shard_group_size < req_sgs && b.batch_size == req_bs {
+                saw_group_without_batch = true;
+            }
+        }
+
+        // Without these the ordering assertions above are vacuously true.
+        assert!(
+            saw_prefetch_alone,
+            "no budget in the sweep reduced prefetch_batches alone"
+        );
+        assert!(
+            saw_group_without_batch,
+            "no budget in the sweep reduced shard_group_size while batch_size survived"
+        );
+    }
+
+    /// The whole reduction chain, through the shared harness — the same check
+    /// `crate::budget::tune` `debug_assert`s per step, run end to end with no
+    /// file and no fixture.
+    #[test]
+    fn the_sequential_reduction_chain_is_monotone() {
+        for &(n_genes, rows, nnz) in &[
+            (30_000usize, 16_384usize, 10.0f64),
+            (2_000, 4_096, 3.0),
+            (61_497, 16_384, 40.0),
+        ] {
+            crate::budget::assert_monotone_reduction_chain(
+                &SequentialBudgetModel::new(n_genes, rows, nnz),
+                SequentialParams {
+                    shard_group_size: 8,
+                    prefetch_batches: 4,
+                    batch_size: 1024,
+                },
+            );
+        }
+    }
+
+    /// `estimate_memory` must be monotone non-increasing in every knob the
+    /// auto-tune reduces.
+    ///
+    /// This is the property `python/multimodal.rs`'s guard rests on — "a
+    /// smaller pinned config always fits within the same budget" — and which
+    /// nothing asserted. `MultimodalTrainingDataset` pins every modality to the
+    /// **minimum** effective `(batch_size, shard_group_size)` across
+    /// modalities; a term that grew as a knob shrank would desync per-modality
+    /// batching and surface mid-epoch as a `RuntimeError` blaming the file's
+    /// sharding, which is the wrong diagnosis.
+    #[test]
+    fn estimate_is_monotone_in_every_tuned_knob() {
+        for &(n_genes, rows, nnz) in &[
+            (30_000usize, 16_384usize, 10.0f64),
+            (2_000, 4_096, 3.0),
+            (61_497, 16_384, 40.0),
+        ] {
+            let model = SequentialBudgetModel::new(n_genes, rows, nnz);
+            let est = |sgs: usize, pf: usize, bs: usize| {
+                model
+                    .estimate(SequentialParams {
+                        shard_group_size: sgs,
+                        prefetch_batches: pf,
+                        batch_size: bs,
+                    })
+                    .total_bytes
+            };
+
+            for sgs in (1..64usize).rev() {
+                assert!(
+                    est(sgs, 4, 1024) <= est(sgs + 1, 4, 1024),
+                    "shard_group_size {sgs} estimates more than {} at {n_genes} genes",
+                    sgs + 1
+                );
+            }
+            for pf in (2..64usize).rev() {
+                assert!(
+                    est(8, pf, 1024) <= est(8, pf + 1, 1024),
+                    "prefetch_batches {pf} estimates more than {} at {n_genes} genes",
+                    pf + 1
+                );
+            }
+            let mut bs = 1024usize;
+            while bs > 64 {
+                let half = bs / 2;
+                assert!(
+                    est(8, 4, half) <= est(8, 4, bs),
+                    "batch_size {half} estimates more than {bs} at {n_genes} genes"
+                );
+                bs = half;
+            }
+
+            // The joint reduction the multimodal repin actually performs: both
+            // knobs drop to the cross-modality minimum at once.
+            assert!(
+                est(1, 4, 64) <= est(8, 4, 1024),
+                "the pinned (batch_size, shard_group_size) minimum estimates more \
+                 than the requested config at {n_genes} genes"
+            );
+        }
+    }
+
+    /// A budget the tuner accepted must actually hold the breakdown it reports.
+    ///
+    /// `BudgetBreakdown::fits_within` exists and no loop uses it as its
+    /// terminator; this pins the postcondition on the sequential path, matching
+    /// `test_index_plan_dataset.py::test_memory_budget_matches_max_memory_mb`
+    /// on the plan-driven one.
+    #[test]
+    fn a_budget_that_was_not_exceeded_fits_the_breakdown_it_reports() {
+        let mut saw_tuned = false;
+        for mb in (64..=2048).step_by(8) {
+            let b = compute_memory_budget(
+                &LoaderConfig {
+                    max_memory_mb: mb,
+                    ..LoaderConfig::default()
+                },
+                30_000,
+                16_384,
+                10.0,
+                0,
+            );
+            if b.budget_exceeded {
+                continue;
+            }
+            assert!(
+                b.breakdown.fits_within(mb),
+                "budget {mb} MB reported not-exceeded but its breakdown totals {} bytes",
+                b.breakdown.total_bytes
+            );
+            if b.batch_size < 1024 || b.shard_group_size < 8 || b.prefetch_batches < 4 {
+                saw_tuned = true;
+            }
+        }
+        assert!(
+            saw_tuned,
+            "the sweep never engaged the auto-tune, so this proves nothing"
         );
     }
 
@@ -2535,6 +3046,223 @@ mod tests {
             !io.is_finished(),
             "§9.7: the I/O worker is still alive, back-pressured behind the decode \
              stage"
+        );
+    }
+}
+
+#[cfg(test)]
+mod layout_check_tests {
+    use super::check_uniform_modality_layouts;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use scx_codec::{CodecId, ValueEncoding};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::modality::ModalityType;
+    use scx_format_io::reader::ScxReader;
+    use scx_format_io::writer::ScxWriter;
+    use std::sync::Arc as StdArc;
+
+    /// Build a two-modality (`rna`, `atac`) `.scx`. `rna` is always a single
+    /// CSR shard over all `n_obs` rows; `atac` is written as one shard per
+    /// entry in `atac_shard_rows` (so passing `&[n_obs]` yields an identical
+    /// layout, and e.g. `&[5, 5]` yields a divergent one).
+    fn build_two_modality(path: &std::path::Path, n_obs: usize, atac_shard_rows: &[usize]) {
+        let n_vars = 4usize;
+        let header =
+            FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, n_obs as u32, 0, 0);
+        let mut writer = ScxWriter::new(path, header).unwrap();
+
+        let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+        let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+        let obs = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(obs_schema),
+            vec![StdArc::new(StringArray::from(
+                cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        writer.write_obs(&obs).unwrap();
+
+        let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+        let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+        let var = arrow::record_batch::RecordBatch::try_new(
+            StdArc::new(var_schema),
+            vec![StdArc::new(StringArray::from(
+                gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        let rna_id = writer
+            .add_modality(
+                "rna",
+                ModalityType::Rna,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        let atac_id = writer
+            .add_modality(
+                "atac",
+                ModalityType::Atac,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                false,
+            )
+            .unwrap();
+        writer.write_var_for(rna_id, &var).unwrap();
+        writer.write_var_for(atac_id, &var).unwrap();
+        writer.set_modality_n_vars(rna_id, n_vars as u64).unwrap();
+        writer.set_modality_n_vars(atac_id, n_vars as u64).unwrap();
+
+        let write_shard = |writer: &mut ScxWriter, mid: u8, row_offset: usize, rows: usize| {
+            let mut indptr = vec![0u64];
+            let mut indices = Vec::new();
+            let mut values = Vec::new();
+            for local in 0..rows {
+                let row = row_offset + local;
+                indices.push((row % n_vars) as u32);
+                values.push(((row + 1) & 0xFF) as u8);
+                indptr.push(*indptr.last().unwrap() + 1);
+            }
+            writer
+                .write_csr_shard_for(
+                    mid,
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    row_offset as u64,
+                )
+                .unwrap();
+        };
+
+        write_shard(&mut writer, rna_id, 0, n_obs);
+        let mut off = 0usize;
+        for &rows in atac_shard_rows {
+            write_shard(&mut writer, atac_id, off, rows);
+            off += rows;
+        }
+        assert_eq!(off, n_obs, "atac shard rows must sum to n_obs");
+        writer.finish().unwrap();
+    }
+
+    fn resolved(reader: &ScxReader) -> Vec<(String, u8, u64)> {
+        vec![
+            ("rna".to_string(), reader.modality_id("rna").unwrap(), 0),
+            ("atac".to_string(), reader.modality_id("atac").unwrap(), 0),
+        ]
+    }
+
+    #[test]
+    fn uniform_layout_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uniform.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        assert!(check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).is_ok());
+    }
+
+    #[test]
+    fn divergent_layout_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergent.scx");
+        build_two_modality(&path, 10, &[5, 5]);
+        let reader = ScxReader::open(&path).unwrap();
+        let err = check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("rna") && err.contains("atac"),
+            "error names pair: {err}"
+        );
+    }
+    /// Strip `stats` from the single CSR shard of each named modality — the
+    /// shape no writer produces (v2+ single-writer files always carry stats)
+    /// but which a corrupt or hand-edited catalog can present, and which the
+    /// function has a dedicated sentinel branch for.
+    fn without_stats(reader: &ScxReader, modalities: &[u8]) -> scx_format_io::FullCatalog {
+        let mut catalog = reader.catalog().clone();
+        for entry in catalog.entries.iter_mut() {
+            if entry.section_type == scx_format_io::SectionType::CsrShard
+                && modalities.contains(&entry.modality_id)
+            {
+                entry.stats = None;
+            }
+        }
+        catalog
+    }
+
+    /// ORG-9.10-6: the sentinel path, agreeing arm. Two shards that both lack
+    /// `stats` map to `(u64::MAX, u64::MAX)` and compare **equal**, so a
+    /// degenerate file is allowed through — the per-batch `cell_indices` check
+    /// in `__next__` is the backstop. Nothing exercised this branch.
+    #[test]
+    fn shards_without_stats_compare_equal_via_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both_stats_less.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+        let atac = reader.modality_id("atac").unwrap();
+
+        // Premise: with stats present this file is uniform, so a failure below
+        // would be about the sentinel and not about the fixture.
+        assert!(check_uniform_modality_layouts(reader.catalog(), &resolved(&reader)).is_ok());
+
+        let catalog = without_stats(&reader, &[rna, atac]);
+        assert!(
+            check_uniform_modality_layouts(&catalog, &resolved(&reader)).is_ok(),
+            "two sentinel row ranges must compare equal"
+        );
+    }
+
+    /// ORG-9.10-6: the sentinel must preserve **cardinality**. Stripping stats
+    /// from a genuinely divergent file (1 shard vs 2) must still be caught: one
+    /// sentinel range is not two.
+    ///
+    /// This is the arm that fails if a future edit quiets the missing-stats
+    /// `log::warn!` by dropping such entries (`filter_map`) instead of mapping
+    /// them to the sentinel — at which point both layouts become empty, compare
+    /// equal, and a mis-sharded multimodal file trains on mis-aligned batches.
+    #[test]
+    fn stats_less_shards_still_count_toward_the_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergent_stats_less.scx");
+        build_two_modality(&path, 10, &[5, 5]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+        let atac = reader.modality_id("atac").unwrap();
+
+        let catalog = without_stats(&reader, &[rna, atac]);
+        let err = check_uniform_modality_layouts(&catalog, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "1 sentinel range must not equal 2 sentinel ranges: {err}"
+        );
+    }
+
+    /// ORG-9.10-6: the sentinel path, disagreeing arm. A **mix** of present and
+    /// absent `stats` compares unequal and must fail loud here rather than
+    /// silently emitting mis-aligned batches — the half of the documented
+    /// contract that decides whether the sentinel is safe.
+    #[test]
+    fn a_mix_of_present_and_absent_stats_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed_stats.scx");
+        build_two_modality(&path, 10, &[10]);
+        let reader = ScxReader::open(&path).unwrap();
+        let rna = reader.modality_id("rna").unwrap();
+
+        let catalog = without_stats(&reader, &[rna]);
+        let err = check_uniform_modality_layouts(&catalog, &resolved(&reader)).unwrap_err();
+        assert!(
+            err.contains("different per-modality CSR shard layouts"),
+            "unexpected error: {err}"
         );
     }
 }

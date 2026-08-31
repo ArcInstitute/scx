@@ -302,6 +302,64 @@ class TestAdaptiveMemoryBudget:
         assert mb["batch_size"] == 512
         assert not mb["budget_exceeded"], f"default budget should fit: {mb}"
 
+    def test_budget_exceeded_raises_a_user_warning(self, wide_scx_path):
+        """ORG-9.10-5: the one class that silently blows its budget was the
+        quiet one.
+
+        `budget_exceeded` means the auto-tune could not fit even at its
+        minimums, so peak RSS *will* exceed what the caller asked for. That was
+        a `log::warn!` — invisible in a notebook or a training script — while
+        `IndexPlanDataset` and `SparseCellSetDataset` have always raised a
+        `UserWarning` for the equivalent.
+        """
+        with pytest.warns(UserWarning, match="cannot hold this file"):
+            ds = pyscx.TrainingDataset(
+                wide_scx_path,
+                batch_size=512,
+                normalize=True,
+                log1p=True,
+                max_memory_mb=64,
+            )
+        mb = ds.memory_budget()
+        assert mb["budget_exceeded"], mb
+        # The premise: it really is at the minimums, not merely tuned.
+        assert (mb["batch_size"], mb["shard_group_size"], mb["prefetch_batches"]) == (
+            64,
+            1,
+            2,
+        ), mb
+
+    def test_a_fitting_budget_does_not_warn(self, wide_scx_path):
+        """The anti-tautology partner: the warning must not fire on a healthy
+        default construction."""
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            ds = pyscx.TrainingDataset(
+                wide_scx_path, batch_size=512, normalize=True, log1p=True
+            )
+        assert not ds.memory_budget()["budget_exceeded"]
+
+    def test_mmap_is_reported_but_not_budgeted(self, wide_scx_path):
+        """ORG-9.10-5 unified what `max_memory_mb` means across the three loader
+        classes: no path budgets the mmap'd file any more.
+
+        `mmap_mb` is still reported — the pages are real and `ru_maxrss` counts
+        them — but it is kernel page cache, evictable under pressure, and the
+        two plan-driven loaders always excluded it. Counting it here made the
+        sequential auto-tune collapse to its minimums on any file above the
+        4 GB adaptive cap, whatever the caller asked for.
+        """
+        ds = pyscx.TrainingDataset(
+            wide_scx_path, batch_size=512, normalize=True, log1p=True
+        )
+        mb = ds.memory_budget()
+        assert mb["mmap_mb"] >= 0, "still reported"
+        assert mb["estimated_mb"] == mb["breakdown"]["total_bytes"] // (1024 * 1024), (
+            f"the estimate must be the breakdown, mmap excluded: {mb}"
+        )
+
     def test_explicit_budget_is_hard_ceiling(self, wide_scx_path):
         # An explicit (too-small) budget must still behave as before: a hard
         # ceiling that auto-tunes the batch_size down rather than being raised.

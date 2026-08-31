@@ -12,7 +12,7 @@ that ``cell-load-scx``'s ``ScxTrainingDataset`` and ``state-scx``'s
 The IterableDataset shim defers ``pyscx.TrainingDataset`` construction
 until inside the worker's ``__iter__``, so the worker's PID matches the
 TrainingDataset's ``creation_pid`` and the eager-fork PID check at
-``scx-loader/src/python.rs:134-141`` does *not* fire. That is the
+``scx-loader/src/python/training.rs`` does *not* fire. That is the
 documented workaround pattern; this test confirms whether it actually
 keeps the worker alive at runtime.
 
@@ -68,7 +68,7 @@ class _LazyShim(torch_data.IterableDataset):
     pattern: ``__init__`` only stores the path; ``__iter__`` constructs the
     underlying ``pyscx.TrainingDataset`` so its ``creation_pid`` matches
     the *worker's* PID, defeating the eager-fork PID gate at
-    ``python.rs:134-141``.
+    ``python/training.rs``.
     """
 
     def __init__(self, scx_path: str, batch_size: int = 32) -> None:

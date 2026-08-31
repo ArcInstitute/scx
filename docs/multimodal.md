@@ -200,6 +200,26 @@ requested value under the default budget; pass a larger `max_memory_mb`
 to keep a larger batch across all modalities (a one-shot `log::info` fires
 when the batch is reduced).
 
+The floor is load-bearing — a share below it fails `LoaderConfig` validation
+outright — so a request that cannot be divided without starving a modality is
+rounded **up**: two modalities at `max_memory_mb=64` budget 64 MB *each*.
+`memory_budget()` reports both numbers, `max_memory_mb` beside
+`effective_total_mb`, and an explicit request that gets rounded up raises a
+`UserWarning` (an adaptive budget resolving higher does not — that is the
+adaptive policy working):
+
+```python
+b = ds.memory_budget()
+b["batch_size"], b["shard_group_size"]   # pinned, uniform across modalities
+b["max_memory_mb"], b["effective_total_mb"]
+b["modalities"]["rna"]["breakdown"]      # the TrainingDataset envelope, per modality
+```
+
+The pinned `batch_size` / `shard_group_size` are uniform *by construction*:
+the loader sets them on each already-built pipeline
+(`TrainingPipeline::pin_effective_config`) rather than rebuilding every
+pipeline at the minimum and checking afterwards.
+
 `pyscx.TrainingDataset(path)` on a multimodal file falls back to the
 alphabetically-first modality and emits a `UserWarning` directing the
 user to `MultimodalTrainingDataset`. Pass `modality="rna"` explicitly

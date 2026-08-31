@@ -169,12 +169,21 @@ is the same on both.
 Two things to know:
 
 - **Raise the byte budget too.** `cache_shards` is a count cap; `max_memory_mb`
-  is a byte cap, and both are enforced. A file with large shards can want more
+  is a byte budget, and both are enforced. A file with large shards can want more
   bytes than the adaptive default affords (census_500k wants 31 shards while the
   4 GB adaptive cap holds 22), so `cache_shards=31` alone under-delivers.
   `memory_budget()` reports `effective_cache_shards` so you can see it — the
   same key `IndexPlanDataset` uses, and the same
   `loader.effective_cache_shards()` behind both.
+  Since ORG-9.10-5 the constant interpreter/numpy/Arrow overhead (~50 MB) is
+  subtracted before the cache is sized, on every loader class — so
+  `max_memory_mb` is no longer a bare cache cap. It is **not** a hard ceiling on
+  process RSS either: on `SparseCellSetDataset` the gathered batch and its
+  transients are not charged, and the LRU keeps one oversize shard rather than
+  refusing to cache it. Sizing a budget by hand therefore means
+  `cache_shards × shard_decoded_bytes + non-cache terms`; both are in
+  `memory_budget()`, and the sizing `UserWarning` already quotes the total in
+  its "pass `max_memory_mb>=…`" advice.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class
   defaults `scatter_block_index=False`, so a scattered gather decodes whole
   shards into the LRU and serves reuse from cache — sizing it correctly is worth
@@ -190,8 +199,9 @@ Two things to know:
 Both gather loaders sample their cache counters while iterating and emit a
 one-shot `UserWarning` if the observed miss/eviction pattern indicates the
 working set exceeds the cache. `max_memory_mb=None` resolves to a **bounded**
-adaptive budget on all three loader classes (512 MB floor → 4 GB cap), so peak
-RSS is capped by default rather than open-ended.
+adaptive budget on all three loader classes (512 MB floor → 4 GB cap), so the
+budget is bounded by default rather than open-ended — a bound on what the
+loaders *size themselves to*, not a hard cap on process RSS.
 
 > [!TIP]
 > On cloud storage (S3 / GCS), each shard access is a separate HTTP
@@ -991,10 +1001,16 @@ You're calling `next(dataset)` without first calling `iter(dataset)`. Use
 
 ### Memory budget exceeded
 
-If you see `budget_exceeded: True` in `dataset.memory_budget()`, the
-pipeline auto-tuned `shard_group_size`, `prefetch_batches`, and/or
-`batch_size` downward. Check `effective_batch_size` and increase
-`max_memory_mb` if needed:
+If you see `budget_exceeded: True` in `dataset.memory_budget()`, the pipeline
+auto-tuned `prefetch_batches`, `shard_group_size` and `batch_size` all the way
+to their minimums and **still** does not fit — peak RSS will exceed the budget
+you asked for. A `UserWarning` says so at construction. Check
+`effective_batch_size` and increase `max_memory_mb`:
+
+The budget covers anonymous memory only. The mmap'd file is kernel page cache,
+evictable under pressure, so it is reported as `mmap_mb` and never budgeted —
+on any loader class. That means a file far larger than `max_memory_mb` is
+normal and does not by itself shrink the batch.
 
 ```python
 ds = pyscx.TrainingDataset("atlas.scx", max_memory_mb=1024, ...)

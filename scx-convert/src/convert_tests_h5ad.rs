@@ -2884,3 +2884,29 @@ fn uns_f16_array_round_trips() {
     assert!(got[1].is_nan(), "f16 NaN lost");
     assert_eq!(got[2].to_f32(), -3.0);
 }
+
+/// Moved here from `doublet_tests.rs`: hdf5-gated tests live in hdf5-gated
+/// modules, so the CI hdf5 lane's complement `--skip` selection covers every
+/// gated test with no per-name recovery invocation, and the dedup-guard's
+/// layout rule (no `feature = "hdf5"` markers inside the skipped ungated
+/// modules) stays enforceable.
+#[test]
+fn an_h5ad_doublet_source_is_read_rather_than_refused_on_its_extension() {
+    // The extension no longer decides the outcome; the file's contents do.
+    // This one is not HDF5 at all, so it fails as an unreadable file rather
+    // than as an unsupported format.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("scrublet_out.h5ad");
+    std::fs::write(&p, "not really hdf5").unwrap();
+    let opts = crate::doublet::DoubletImportOptions {
+        tool: "scrublet".to_string(),
+        ..Default::default()
+    };
+    let e = crate::doublet::read_doublet_table(&p, &opts).unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains("as HDF5"), "{m}");
+    assert!(
+        !m.contains("not implemented"),
+        "the Phase-4 deferral message must be gone: {m}"
+    );
+}

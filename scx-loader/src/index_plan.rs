@@ -25,7 +25,7 @@ use arrow::record_batch::RecordBatch;
 use scx_format_io::{BackedCsrReader, ScxReader};
 
 use crate::batch::ObsColumn;
-use crate::budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
+use crate::budget::{BudgetBreakdown, BudgetModel, PYTHON_OVERHEAD_BYTES};
 use crate::decode_stage::{build_category_dicts, extract_obs_columns, CategoryDict};
 use crate::error::{LoaderError, Result};
 use crate::normalize::apply_dense_transforms;
@@ -161,6 +161,67 @@ pub struct IndexPlanLoader {
     /// full-shard-decodes. The process-wide reader default still comes from
     /// `SCX_SCATTER_BLOCK_INDEX`.
     scatter_block_index: bool,
+}
+
+/// Knobs the plan-driven auto-tune reduces, in reduction order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IndexPlanParams {
+    pub(crate) cache_shards: usize,
+    pub(crate) lookahead: usize,
+}
+
+/// The `IndexPlanLoader` arm of [`crate::budget::BudgetModel`].
+///
+/// Holds only numbers, so its monotonicity is testable with no file and no
+/// fixture (`crate::budget::assert_monotone_reduction_chain`).
+///
+/// `lookahead` gives before `cache_shards` so the iterator stays functional
+/// under tight memory, and both floor at 1 rather than 0 for the same reason.
+/// An explicit `lookahead == 0` (prefetch disabled) is preserved: `reduce`
+/// never decrements below 1, so it cannot walk a deliberate 0 upward or
+/// downward.
+pub(crate) struct IndexPlanBudgetModel {
+    shard_decoded_bytes: usize,
+    batch_buffer_bytes: usize,
+    transient_bytes: usize,
+    max_plan_size: usize,
+}
+
+impl IndexPlanBudgetModel {
+    /// `sizeof((u64, u64))` — one plan tuple staged per lookahead slot.
+    const PLAN_TUPLE_BYTES: usize = 16;
+}
+
+impl BudgetModel for IndexPlanBudgetModel {
+    type Params = IndexPlanParams;
+
+    fn estimate(&self, p: IndexPlanParams) -> BudgetBreakdown {
+        BudgetBreakdown::new(
+            p.cache_shards.saturating_mul(self.shard_decoded_bytes),
+            self.batch_buffer_bytes,
+            p.lookahead
+                .saturating_mul(self.max_plan_size)
+                .saturating_mul(Self::PLAN_TUPLE_BYTES),
+            self.transient_bytes,
+            PYTHON_OVERHEAD_BYTES,
+        )
+    }
+
+    fn reduce(&self, p: IndexPlanParams) -> Option<IndexPlanParams> {
+        if p.lookahead > 1 {
+            Some(IndexPlanParams {
+                lookahead: p.lookahead - 1,
+                ..p
+            })
+        } else if p.cache_shards > 1 {
+            Some(IndexPlanParams {
+                cache_shards: p.cache_shards - 1,
+                ..p
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl IndexPlanLoader {
@@ -310,16 +371,15 @@ impl IndexPlanLoader {
             .saturating_mul(max_plan_size)
             .saturating_mul(n_output_cols)
             .saturating_mul(4);
-        const PLAN_TUPLE_BYTES: usize = 16; // sizeof((u64, u64))
-                                            // `gather_pairs_dense` deduplicates the 2 × max_plan_size (pert+ctrl)
-                                            // rows into `unique_rows: Vec<u64>`, a `row_to_requests:
-                                            // Vec<Vec<PairRequest>>` fan-out map, and a `row_to_pos:
-                                            // HashMap<u64, usize>`. Worst case (all rows distinct) holds
-                                            // 2 × max_plan_size entries across these structures. Use `size_of`
-                                            // for each so the term tracks struct churn automatically instead of
-                                            // drifting against a hand-derived constant. (HashMap load-factor
-                                            // slack is ignored — it's a small, transient term dominated by the
-                                            // shard cache and dense batch buffers.)
+        // `gather_pairs_dense` deduplicates the 2 × max_plan_size (pert+ctrl)
+        // rows into `unique_rows: Vec<u64>`, a `row_to_requests:
+        // Vec<Vec<PairRequest>>` fan-out map, and a `row_to_pos:
+        // HashMap<u64, usize>`. Worst case (all rows distinct) holds
+        // 2 × max_plan_size entries across these structures. Use `size_of`
+        // for each so the term tracks struct churn automatically instead of
+        // drifting against a hand-derived constant. (HashMap load-factor
+        // slack is ignored — it's a small, transient term dominated by the
+        // shard cache and dense batch buffers.)
         const GATHER_SCRATCH_BYTES_PER_ROW: usize = std::mem::size_of::<u64>()           // unique_rows entry
             + std::mem::size_of::<Vec<PairRequest>>()                          // row_to_requests outer Vec header
             + std::mem::size_of::<PairRequest>()                               // one PairRequest (inner, all-distinct)
@@ -343,18 +403,15 @@ impl IndexPlanLoader {
             obs_bytes.saturating_add(request_bytes)
         };
 
-        let mut effective_cache_shards = cache_shards;
-        let mut effective_lookahead = lookahead;
-
-        let breakdown = |cache: usize, la: usize| -> BudgetBreakdown {
-            BudgetBreakdown::new(
-                cache.saturating_mul(shard_decoded_bytes),
-                batch_buffer_bytes,
-                la.saturating_mul(max_plan_size)
-                    .saturating_mul(PLAN_TUPLE_BYTES),
-                transient_bytes,
-                PYTHON_OVERHEAD_BYTES,
-            )
+        let model = IndexPlanBudgetModel {
+            shard_decoded_bytes,
+            batch_buffer_bytes,
+            transient_bytes,
+            max_plan_size,
+        };
+        let requested = IndexPlanParams {
+            cache_shards,
+            lookahead,
         };
 
         // `auto_memory_budget` (set by the Python binding when the caller passed
@@ -366,7 +423,7 @@ impl IndexPlanLoader {
         // `max_memory_mb()` / `memory_budget()` report what is actually in force.
         if config.auto_memory_budget {
             config.max_memory_mb = crate::budget::adaptive_budget_mb(
-                breakdown(cache_shards, lookahead).total_bytes,
+                model.estimate(requested).total_bytes,
                 config.max_memory_mb,
             );
         }
@@ -375,42 +432,37 @@ impl IndexPlanLoader {
             .saturating_mul(1024)
             .saturating_mul(1024);
 
-        // Reduce lookahead first (down to 1 — we want the iterator path to
-        // remain functional even under tight memory; an explicit
-        // `lookahead == 0` is preserved through the loop because the
-        // `> 1` guard never decrements it). Then reduce cache_shards down
-        // to 1.
-        //
         // Shrinking `cache_shards` is *reported* (see `cache_sizing` below and
-        // the warning in `python.rs`) rather than silent: against the ~470 MB
+        // the warning in `python/diagnostics.rs`) rather than silent: against the ~470 MB
         // Pcodec shards STATE3 hit, the historical hard 512 MB default drove
-        // this loop to `cache_shards = 1` and manufactured the 143 s/batch
-        // thrash regime with no signal to the caller. The loop's *behaviour* is
-        // deliberately unchanged — it may still reach 1 — because refusing
+        // the descent to `cache_shards = 1` and manufactured the 143 s/batch
+        // thrash regime with no signal to the caller. The descent's *behaviour*
+        // is deliberately unchanged — it may still reach 1 — because refusing
         // would turn configurations that work today into hard errors.
-        while breakdown(effective_cache_shards, effective_lookahead).total_bytes > budget_bytes {
-            if effective_lookahead > 1 {
-                effective_lookahead -= 1;
-            } else if effective_cache_shards > 1 {
-                effective_cache_shards -= 1;
-            } else {
-                let b = breakdown(effective_cache_shards, effective_lookahead);
-                return Err(LoaderError::ConfigError {
-                    reason: format!(
-                        "max_memory_mb={} is below the floor for this file: \
-                         estimated {} MB at cache_shards=1, lookahead=1 \
-                         (shard_decoded={} KB, batch_buffer={} MB, transient={} KB, \
-                         py_overhead=50 MB). Increase max_memory_mb.",
-                        config.max_memory_mb,
-                        b.total_bytes / (1024 * 1024),
-                        shard_decoded_bytes / 1024,
-                        batch_buffer_bytes / (1024 * 1024),
-                        transient_bytes / 1024,
-                    ),
-                });
-            }
+        //
+        // Exhaustion, on the other hand, *is* refused here, and that stays a
+        // per-loader decision rather than something the shared driver imposes:
+        // a plan-driven loader that cannot hold one shard has nothing useful to
+        // do, whereas the sequential path flags it and continues.
+        let tuned = crate::budget::tune(&model, requested, budget_bytes);
+        if tuned.exhausted {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "max_memory_mb={} is below the floor for this file: \
+                     estimated {} MB at cache_shards=1, lookahead=1 \
+                     (shard_decoded={} KB, batch_buffer={} MB, transient={} KB, \
+                     py_overhead=50 MB). Increase max_memory_mb.",
+                    config.max_memory_mb,
+                    tuned.breakdown.total_bytes / (1024 * 1024),
+                    shard_decoded_bytes / 1024,
+                    batch_buffer_bytes / (1024 * 1024),
+                    transient_bytes / 1024,
+                ),
+            });
         }
-        let budget_breakdown = breakdown(effective_cache_shards, effective_lookahead);
+        let effective_cache_shards = tuned.params.cache_shards;
+        let effective_lookahead = tuned.params.lookahead;
+        let budget_breakdown = tuned.breakdown;
 
         // Construction-time verdict for the caller-facing warning. `None` when
         // the requested cache survived the auto-tune, which is the common case.
