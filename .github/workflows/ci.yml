@@ -2991,7 +2991,12 @@ jobs:
       # process-global-env files (test_pseudobulk_thread_env.py) safe to
       # parallelise. OMP_NUM_THREADS=1 above keeps the two workers from
       # oversubscribing the cores.
-      - run: . .venv/bin/activate && cd pyscx && maturin develop --profile ci --features cloud,hdf5 && pytest -n 2 --dist loadfile --ignore=tests/test_scvi_integration.py
+      # `pyo3/abi3-py311` matches the release wheels (pyscx-release.yml), so
+      # the full suite here continuously exercises the exact ABI configuration
+      # that ships — an abi3-only runtime break fails PR CI instead of
+      # surfacing at release time. Local `maturin develop` stays
+      # version-specific ABI; only CI pins the release's configuration.
+      - run: . .venv/bin/activate && cd pyscx && maturin develop --profile ci --features cloud,hdf5,pyo3/abi3-py311 && pytest -n 2 --dist loadfile --ignore=tests/test_scvi_integration.py
 
   # The `python` job above hand-installs every optional package, so it has never
   # exercised what `pip install pyscx` actually produces. That gap is exactly how

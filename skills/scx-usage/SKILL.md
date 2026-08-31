@@ -33,7 +33,7 @@ directory):
 # Download the wheel for your Python version + arch (x86_64 / aarch64) from
 # GitHub Releases: https://github.com/ArcInstitute/scx/releases (pyscx-v* tags).
 # Replace <version> with the release you downloaded (e.g. 0.7.1).
-pip install ./pyscx-<version>-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+pip install ./pyscx-<version>-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 python -c "import pyscx; print(pyscx.__version__)"
 ```
 
