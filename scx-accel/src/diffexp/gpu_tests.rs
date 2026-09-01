@@ -1581,7 +1581,7 @@ fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
 /// available between them — which is exactly why they had to exist before this
 /// arm could be checked against anything but a sibling SCX kernel.
 ///
-/// Same table (`scx_testkit::de_reference`), same fixture, same two
+/// Same table (`super::wilcoxon_reference_values`), same fixture, same two
 /// conventions. In particular the kernel is handed all 12 rows including the
 /// two unlabelled ones while every expected value was computed on the 10
 /// labelled rows, so the unlabelled-cell contract is asserted here against

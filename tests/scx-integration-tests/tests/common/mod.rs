@@ -51,6 +51,13 @@ pub struct FixtureShape {
     /// `remap_obsp_coo_to_dim` preserves the source dtype, so two inputs that
     /// differ here produce shards that cannot be concatenated under one schema.
     pub obsp_f64_values: bool,
+    /// Omit `adata.raw`.
+    ///
+    /// Only for `append`, which refuses a file with `has_raw()` set
+    /// (`append.rs:592`, `OpsError::RawUnsupported`): append extends X's obs
+    /// axis and not raw's, so proceeding would leave `raw.n_obs < n_obs` with
+    /// `has_raw` still set. Every other op takes the fixture whole.
+    pub without_raw: bool,
     /// Store an **explicit zero** as X row 0's first value.
     ///
     /// `is_canonical_csr` treats a stored `0.0` as non-canonical, so this is
@@ -67,6 +74,23 @@ pub struct FixtureShape {
 /// idea of what a file contains — which is the thing under test.
 pub fn fixture_all_families(dir: &Path, name: &str) -> PathBuf {
     build_all_families(dir, name, FixtureShape::default())
+}
+
+/// The same file with **no `adata.raw`**, and otherwise the same shape.
+///
+/// For `append` only — see [`FixtureShape::without_raw`]. Keeping every other
+/// family means an append digest still covers layers, obsm/varm, obsp/varp,
+/// bitmaps, the group index, the predicate indexes and a deletion vector; only
+/// the one family the op refuses is absent.
+pub fn fixture_all_families_without_raw(dir: &Path, name: &str) -> PathBuf {
+    build_all_families(
+        dir,
+        name,
+        FixtureShape {
+            without_raw: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// The same file with **no `varm`**, and otherwise byte-for-byte the same shape.
@@ -205,19 +229,21 @@ fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
         .unwrap();
 
     // --- adata.raw (its own, wider var axis) -----------------------------
-    writer.set_raw_n_vars(RAW_N_VARS as u64);
-    let (r_indptr, r_indices, r_values) = csr_rows(0, N_OBS, RAW_N_VARS, 7);
-    writer
-        .write_raw_csr_shard(
-            &r_indptr,
-            &r_indices,
-            &r_values,
-            CodecId::None,
-            ValueEncoding::Uint8,
-            0,
-        )
-        .unwrap();
-    writer.write_raw_var(&var_batch(RAW_N_VARS, "raw")).unwrap();
+    if !shape.without_raw {
+        writer.set_raw_n_vars(RAW_N_VARS as u64);
+        let (r_indptr, r_indices, r_values) = csr_rows(0, N_OBS, RAW_N_VARS, 7);
+        writer
+            .write_raw_csr_shard(
+                &r_indptr,
+                &r_indices,
+                &r_values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.write_raw_var(&var_batch(RAW_N_VARS, "raw")).unwrap();
+    }
 
     // --- the grouped-sort sidecar ----------------------------------------
     writer
@@ -351,6 +377,45 @@ pub fn fixture_with_csr_obsp(dir: &Path, name: &str) -> PathBuf {
         .unwrap();
     writer.finish().unwrap();
     path
+}
+
+/// New rows to hand `scx_ops::append`, schema-compatible with the fixture's obs.
+///
+/// `append` validates the incoming obs against the target's schema, so this
+/// cannot be a generic builder — the three columns and their nullability have
+/// to match [`obs_batch`] exactly. Row identifiers continue from `N_OBS` so a
+/// digest of the appended file distinguishes "the new rows landed" from "the
+/// old rows were rewritten".
+pub fn appendable_rows(n_new: usize) -> (RecordBatch, Vec<u64>, Vec<u32>, Vec<u8>) {
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("cell_id", DataType::Utf8, false),
+            Field::new("cell_type", DataType::Utf8, true),
+            Field::new("n_counts", DataType::UInt32, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                (0..n_new)
+                    .map(|i| format!("cell_{}", N_OBS + i))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..n_new)
+                    .map(|i| if i % 2 == 0 { "T cell" } else { "B cell" })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                (0..n_new)
+                    .map(|i| (100 + N_OBS + i) as u32)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    // Salt 1 matches X's, so the appended rows continue the same value series
+    // the existing shards use rather than forming a distinguishable block.
+    let (indptr, indices, values) = csr_rows(N_OBS, n_new, N_VARS, 1);
+    (obs, indptr, indices, values)
 }
 
 fn obs_batch() -> RecordBatch {

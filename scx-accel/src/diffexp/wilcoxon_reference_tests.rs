@@ -2,7 +2,7 @@
 //!
 //! Two of SCX's three rank-sum implementations are checked here against
 //! reference values computed by scipy and scanpy, held in
-//! [`scx_testkit::de_reference`]. The third — `scx_gpu::gpu_diffexp` — checks
+//! [`super::wilcoxon_reference_values`]. The third — `scx_gpu::gpu_diffexp` — checks
 //! itself against the same table from its own crate; see
 //! `scx-gpu/src/gpu_diffexp_tests.rs`.
 //!
