@@ -292,10 +292,12 @@ pub fn write_row_distinguishable_fixture(
 
 /// The two stored counts [`write_row_distinguishable_fixture`] writes for a row.
 ///
-/// Exported so a test can assert the fixture's premise — that the *ratio*
-/// varies across rows — against the same arithmetic the writer used, rather
-/// than against a restatement of it that could drift.
-pub fn row_values(row: usize) -> (u8, u8) {
+/// Private: a test must assert the fixture's premise on what the *pipeline*
+/// decodes, not on this arithmetic. Restating the writer's formula in a test
+/// proves the formula, not that the values survive `normalize_total` — which is
+/// the property the fixture exists for, and the one the previous fixture
+/// silently lacked.
+fn row_values(row: usize) -> (u8, u8) {
     (1 + (row % 7) as u8, 1 + ((row * 3 + 1) % 11) as u8)
 }
 

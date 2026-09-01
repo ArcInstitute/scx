@@ -118,19 +118,6 @@ impl OpDigestManifest {
         Ok(())
     }
 
-    /// File an already-computed digest under `label`.
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::record`], if `label` is already present.
-    pub fn record_digest(&mut self, label: &str, digest: FileDigest) {
-        assert!(
-            self.ops.insert(label.to_string(), digest).is_none(),
-            "duplicate manifest label {label:?} — each op gets one entry, or the \
-             manifest reports coverage it does not have"
-        );
-    }
-
     pub fn labels(&self) -> impl Iterator<Item = &str> {
         self.ops.keys().map(String::as_str)
     }

@@ -216,8 +216,12 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   A cross-tree A/B is two commands and no scratch code — dump the manifest in a
   worktree at the base commit with `SCX_TESTKIT_AB_DUMP=<path>`, then assert
   against it with `SCX_TESTKIT_AB_BASE=<path>`. Cite that, not a hand-rolled
-  comparison. Note what it cannot see: `file_checksum` is outside the digest by
-  construction, so a change to its *semantics* needs a separate oracle.
+  comparison — but cite it for what it covers. Its own "What this cannot see"
+  section is the authoritative list, and it is not short: `file_checksum`
+  semantics and the root catalog are outside the digest by construction, every
+  arm runs at `Strictness::Content` so a layout-only change is invisible, and
+  `scx upgrade` / `subset` / multimodal compact/merge / the convert paths have
+  no arm at all. A refactor touching one of those owes its own oracle.
 - **Never `git add -A`.** The repo root carries untracked scratch markdown, and
   the local pre-commit hook already runs `git add -u`.
 - **Perf-touching refactors gate before merge** against

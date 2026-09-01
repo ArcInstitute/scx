@@ -1,6 +1,7 @@
 //! The committed byte-identity A/B matrix: what does each rewriting op write?
 //!
-//! Seven ops, one manifest of per-section digests, three ways to use it:
+//! Nine arms over seven ops, one manifest of per-section digests, three ways to
+//! use it:
 //!
 //! * **default** — assert against the checked-in golden. A refactor that
 //!   changes any op's output fails `cargo test`, in CI, without anybody having
@@ -20,6 +21,13 @@
 //!    cargo test -p scx-integration-tests --test op_output_identity
 //! ```
 //!
+//! ⚠️ **The base worktree must already contain this harness.** Cargo has no
+//! `op_output_identity` target at a commit that predates it, so the recipe
+//! above cannot establish a baseline against an arbitrary merge base — it works
+//! from the first commit that carries the file onward. To A/B a change against
+//! an older commit, cherry-pick this file plus `scx_testkit::ab` onto it first,
+//! and say in the PR body that you did.
+//!
 //! That is the harness the organization series' Phase 5a/5b behaviour-identity
 //! claims were measured with — as a scratch test hand-copied into two
 //! worktrees and then deleted. It is committed here so the next such claim is
@@ -31,11 +39,35 @@
 //!
 //! ## What this cannot see
 //!
-//! `FileHeader::file_checksum` is deliberately outside the digest (it covers
-//! the `Provenance` section, which is itself excluded), so a change to what
-//! `file_checksum` *means* passes here untouched and needs its own oracle. So
-//! does the 4096-byte root catalog at offset 256, which has no production
-//! readers. See `scx_testkit::ab`'s module docs for the full list.
+//! Read this before citing a green run as "the rewrite did not change bytes".
+//! It is true of these nine arms and of nothing else.
+//!
+//! **Regions of the file.** `FileHeader::file_checksum` is deliberately outside
+//! the digest (it covers the `Provenance` section, which is itself excluded),
+//! so a change to what `file_checksum` *means* passes here untouched and needs
+//! its own oracle. So does the 4096-byte root catalog at offset 256, which has
+//! no production readers. See `scx_testkit::ab`'s module docs.
+//!
+//! **Ops not in the matrix.** Every one of these is a provenance-stamping write
+//! path that a rewrite refactor can break, and none is pinned here:
+//!
+//! * **`scx upgrade`** — a full `ScxWriter` rewrite with its own
+//!   `RewriteOp::Upgrade` carry-policy row (`scx-ops/src/carry.rs`). Absent for
+//!   a structural reason, not an oversight: `run_upgrade` lives in `scx-cli`,
+//!   which is a **bin-only crate** with no `lib.rs`, so this crate cannot call
+//!   it. Adding an arm means either spawning the `scx` binary or moving the op
+//!   into a library crate; both are larger than this file.
+//! * **The multimodal branch of `compact` and `merge`.** Both ops are in the
+//!   matrix, but `compact_multimodal` / `merge_multimodal` are private arms
+//!   `compact` / `merge` dispatch into on a multimodal input, and no fixture
+//!   here is multimodal — so those arms run in neither.
+//! * **`scx subset`**, **`scx-convert`** in both directions, and
+//!   **`pyscx.from_anndata`**.
+//!
+//! **Layout.** Every arm runs at `Strictness::Content`, which ignores section
+//! offsets. A change that only moves sections — a byte-passthrough or an
+//! in-place claim — is invisible here; that is what `Strictness::Layout` is for
+//! and no arm uses it.
 //!
 //! ## Relationship to `testkit_against_real_ops.rs`
 //!
@@ -70,7 +102,9 @@ const EXPECTED_OPS: &[&str] = &[
 /// Force a predicate index on one obs column.
 ///
 /// `index_auto_threshold: 0` is the tree-wide "do nothing unless forced"
-/// sentinel; `forced_columns` is what actually makes the pass run.
+/// sentinel; the non-empty `index_obs` is what actually makes the pass run.
+/// (`forced_columns` is the corresponding field one layer down, on
+/// `PredicateIndexBuildOptions` — not this struct.)
 fn index_obs_on(column: &str) -> scx_engine::ConversionPredicateIndexOptions {
     scx_engine::ConversionPredicateIndexOptions {
         index_obs: vec![column.to_string()],
