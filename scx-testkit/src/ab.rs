@@ -56,8 +56,9 @@
 //! such target at a commit predating it, so this recipe works from the first
 //! commit that carries the harness onward, not against an arbitrary merge base.
 //! `tests/scx-integration-tests/tests/op_output_identity.rs` carries the full
-//! statement of that constraint and of what its own matrix does and does not
-//! cover; treat it, not this comment, as authoritative.
+//! statement of that constraint, the bootstrap for an older base, and what its
+//! matrix does and does not cover; treat it, not this comment, as
+//! authoritative.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -137,18 +138,15 @@ impl OpDigestManifest {
         self.ops.is_empty()
     }
 
+    /// A bare relative path (`SCX_TESTKIT_AB_DUMP=base.json`) needs no guard
+    /// here, though it looks like it does: `Path::new("base.json").parent()` is
+    /// `Some("")`, not `None`, and `std::fs::create_dir_all` documents that
+    /// "if the empty path is passed to this function, it always succeeds
+    /// without creating any directories". `digest::assert_matches_golden` has
+    /// the same shape for the same reason.
     pub fn write_json(&self, path: &Path) -> Result<()> {
-        // `Path::new("base.json").parent()` is `Some("")`, not `None`. On Linux
-        // `create_dir_all("")` happens to return `Ok(())` — measured, and
-        // independently by a reviewer — so a bare relative dump path works
-        // today. It is not documented to, and `SCX_TESTKIT_AB_DUMP` is a
-        // user-facing env var that invites exactly that spelling, so do not
-        // depend on it.
-        match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => {
-                std::fs::create_dir_all(parent)?;
-            }
-            _ => {}
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_string_pretty(self)?)?;
         Ok(())

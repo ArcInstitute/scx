@@ -220,15 +220,13 @@ fn the_fixture_can_tell_two_rows_apart() {
     // test must not re-derive that formula — re-deriving it is the mistake the
     // previous version of this test made. Scanning the epoch asks the question
     // without depending on any particular pair staying distinguishable.
-    let high_col: std::collections::HashSet<u32> = (0..N_OBS)
-        .map(|r| by_cell[r].expect("every cell decoded")[r + 1])
-        .collect();
+    let diagonal = |r: usize| by_cell[r].expect("every cell decoded")[r + 1];
+    let first = diagonal(0);
     assert!(
-        high_col.len() > 1,
+        (1..N_OBS).any(|r| diagonal(r) != first),
         "premise: the normalized values must differ across rows, or only the \
          column positions carry signal and a value-only corruption is invisible \
-         (got {} distinct value(s) at each row's second column)",
-        high_col.len()
+         (every row's second column decoded to the same {first:#010x})"
     );
 }
 

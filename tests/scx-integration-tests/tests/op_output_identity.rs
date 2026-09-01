@@ -24,9 +24,12 @@
 //! ⚠️ **The base worktree must already contain this harness.** Cargo has no
 //! `op_output_identity` target at a commit that predates it, so the recipe
 //! above cannot establish a baseline against an arbitrary merge base — it works
-//! from the first commit that carries the file onward. To A/B a change against
-//! an older commit, cherry-pick this file plus `scx_testkit::ab` onto it first,
-//! and say in the PR body that you did.
+//! from the first commit that carries the harness onward. To A/B against an
+//! older commit, cherry-pick **the whole harness commit** onto it
+//! (`git cherry-pick 8210f236`) and say in the PR body that you did. Not "this
+//! file plus `scx_testkit::ab`": that pair does not build, because this file
+//! also needs `common::{appendable_rows, fixture_all_families_without_raw}`
+//! and `scx-testkit`'s `pub mod ab;`.
 //!
 //! That is the harness the organization series' Phase 5a/5b behaviour-identity
 //! claims were measured with — as a scratch test hand-copied into two
@@ -86,7 +89,9 @@ use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest
 use scx_testkit::digest::Strictness;
 use scx_testkit::fixtures::mixed_codec_file;
 
-/// Every op PR-01 names, in the order the manifest reports them.
+/// Every arm, in the order the manifest reports them: nine labels over the
+/// seven ops PR-01 names, with `compact` and `build_csc` doubled over an
+/// index-carrying input.
 const EXPECTED_OPS: &[&str] = &[
     "append",
     "build_csc",

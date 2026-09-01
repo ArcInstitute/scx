@@ -14,7 +14,6 @@ use crate::fixtures::{
     mixed_codec_file, mixed_codec_file_with, perturb_catalog_data_generation, FixtureOpts,
 };
 
-use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn env_lock() -> MutexGuard<'static, ()> {
@@ -60,30 +59,6 @@ fn two_op_manifest(dir: &tempfile::TempDir) -> OpDigestManifest {
             ("merge", FixtureOpts::default()),
         ],
     )
-}
-
-/// A bare relative path — `base.json`, no directory — is what a reader of the
-/// `SCX_TESTKIT_AB_DUMP` docs will type, and `Path::new("base.json").parent()`
-/// is `Some("")`, not `None`.
-///
-/// On Linux `create_dir_all("")` returns `Ok(())`, so this passed before the
-/// guard too; it is here because that is an undocumented platform detail on a
-/// path the env var invites, not because a failure was observed. Runs from a
-/// temp cwd, which is why it takes the same lock as the env-reading tests.
-#[test]
-fn a_bare_relative_dump_path_works() {
-    let _env = ClearedEnv::new();
-    let dir = tempfile::tempdir().unwrap();
-    let m = two_op_manifest(&dir);
-
-    let prev = std::env::current_dir().unwrap();
-    std::env::set_current_dir(dir.path()).unwrap();
-    let wrote = m.write_json(Path::new("base.json"));
-    let read_back = OpDigestManifest::read_json(Path::new("base.json"));
-    std::env::set_current_dir(prev).unwrap();
-
-    wrote.expect("a bare relative dump path must be writable");
-    assert_eq!(read_back.expect("and readable back"), m);
 }
 
 #[test]

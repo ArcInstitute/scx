@@ -216,13 +216,11 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   that rather than a hand-rolled comparison.
 
   **Read its module docs before citing it, and do not restate them here.** They
-  own the arm list, the "What this cannot see" section — `file_checksum`
-  semantics, the root catalog, layout (every arm is `Strictness::Content`),
-  `scx upgrade`, `subset`, the multimodal branches of compact/merge, the convert
-  paths — and the constraint that the A/B's base worktree must already contain
-  the harness. A shorter list kept in a second place is how a refactor comes to
-  believe it is covered when it is not; a refactor touching anything on that
-  list owes its own oracle.
+  own the arm list, the "What this cannot see" section and the constraint that
+  the A/B's base worktree must already contain the harness. That list is not
+  short, and it is deliberately not copied into this file: a shorter second copy
+  is how a refactor comes to believe it is covered when it is not. A refactor
+  touching anything on it owes its own oracle.
 - **Never `git add -A`.** The repo root carries untracked scratch markdown, and
   the local pre-commit hook already runs `git add -u`.
 - **Perf-touching refactors gate before merge** against
