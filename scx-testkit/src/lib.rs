@@ -52,6 +52,27 @@
 //! `SCX_TESTKIT_BLESS=1` rewrites the golden instead of asserting against it.
 //! Review the diff: a blessed golden is a claim that the change was intended.
 //!
+//! ## Comparing a whole op matrix, across two trees
+//!
+//! [`digest`] answers for one file. [`ab`] is the layer above it: a labelled
+//! manifest of several files' digests that can be dumped in one worktree and
+//! asserted against in another, so a "bit-identical" claim about an op is a
+//! committed command rather than a scratch script. It also owns the
+//! run-it-twice-across-a-second helpers every op-level identity test needs.
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use scx_testkit::ab::OpDigestManifest;
+//! use scx_testkit::digest::Strictness;
+//!
+//! # let (out, golden) = (std::path::Path::new("out.scx"), std::path::Path::new("g.json"));
+//! let mut m = OpDigestManifest::new();
+//! m.record("compact", out, Strictness::Content)?;
+//! scx_testkit::ab::resolve_against_env(&m, golden)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Choosing a fixture
 //!
 //! Use [`fixtures::mixed_codec_file`] unless you need something else. An
@@ -60,5 +81,6 @@
 //! unframed, one row-group-framed integer, and one float (`Pcodec`) shard, so a
 //! single digest covers all three encoder paths.
 
+pub mod ab;
 pub mod digest;
 pub mod fixtures;

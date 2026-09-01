@@ -186,6 +186,119 @@ pub fn write_dense_scx1_fixture(
     path.to_path_buf()
 }
 
+/// Build a fixture in which **every row's dense output is distinguishable from
+/// every other row's**, both by which columns are nonzero and by the ratio
+/// between the values in them.
+///
+/// [`write_multi_shard_fixture`] is not that fixture, and the difference
+/// matters for any test comparing decoded batch *contents*. It writes one
+/// nonzero per row at column `row % n_vars`, so:
+///
+/// * with `n_vars < n_obs` the columns repeat, and rows `r` and `r + n_vars`
+///   scatter to byte-identical dense rows — a mispairing between them is
+///   invisible;
+/// * a single nonzero carries **no value signal at all** once
+///   `normalize_total` runs, because a one-nonzero row always normalizes to
+///   exactly `target_sum` whatever the stored count was.
+///
+/// Here row `r` stores two nonzeros, at columns `r` and `r + 1` (hence the
+/// `n_vars > n_obs` requirement), whose values have a row-dependent ratio that
+/// survives normalization. So a row/value pairing error changes the dense
+/// matrix whether it moves columns, values, or both.
+pub fn write_row_distinguishable_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+    n_vars: usize,
+    n_shards: usize,
+) -> std::path::PathBuf {
+    assert!(n_obs.is_multiple_of(n_shards), "n_obs must divide n_shards");
+    assert!(
+        n_vars > n_obs,
+        "columns must not wrap, or two rows share a dense footprint and a \
+         mispairing between them cannot be seen"
+    );
+    let rows_per_shard = n_obs / n_shards;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        (n_obs * 2) as u64,
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "cell_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &RecordBatch::try_new(
+                StdArc::new(Schema::new(vec![Field::new(
+                    "gene_id",
+                    DataType::Utf8,
+                    false,
+                )])),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let (mut indices, mut values) = (Vec::new(), Vec::new());
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            let (v0, v1) = row_values(row);
+            indices.push(row as u32);
+            values.push(v0);
+            indices.push(row as u32 + 1);
+            values.push(v1);
+            indptr.push(*indptr.last().unwrap() + 2);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    path.to_path_buf()
+}
+
+/// The two stored counts [`write_row_distinguishable_fixture`] writes for a row.
+///
+/// Exported so a test can assert the fixture's premise — that the *ratio*
+/// varies across rows — against the same arithmetic the writer used, rather
+/// than against a restatement of it that could drift.
+pub fn row_values(row: usize) -> (u8, u8) {
+    (1 + (row % 7) as u8, 1 + ((row * 3 + 1) % 11) as u8)
+}
+
 /// Gene count of [`write_known_multinnz_fixture`]'s output. Exported so a test
 /// can range-check its HVG panel against the same number the fixture wrote,
 /// rather than repeating the literal.

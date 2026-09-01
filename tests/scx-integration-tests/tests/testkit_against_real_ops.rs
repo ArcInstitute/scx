@@ -10,67 +10,30 @@
 //!
 //! If any of these ever fails, the harness is not usable for that op and the
 //! phase consuming it needs to know before it starts, not after.
+//!
+//! **This is the weaker of the two op-level claims.** It compares two runs of
+//! the *same* code, so it says the harness works on an op and nothing about
+//! whether that op's behaviour changed. The stronger claim — every op still
+//! writes what it wrote at some earlier commit — lives in
+//! `op_output_identity.rs`, which pins a golden manifest and can also A/B
+//! across two worktrees.
+//!
+//! The run-it-twice helpers these cases use were private to this file until
+//! PR-01; they now live in `scx_testkit::ab` so any op's tests can reach them.
 
-use scx_testkit::digest::{assert_digests_eq, digest_file, digest_file_excluding, Strictness};
+use scx_testkit::ab::{
+    assert_op_is_clock_independent, assert_provenance_actually_differs, run_twice_across_a_second,
+    wait_for_next_second,
+};
+use scx_testkit::digest::{assert_digests_eq, digest_file, Strictness};
 use scx_testkit::fixtures::mixed_codec_file;
 use std::path::Path;
-
-/// Block until the wall-clock second changes, so the second run's provenance
-/// timestamp is guaranteed to differ from the first's.
-///
-/// Without this the test passes trivially whenever both runs land in the same
-/// second — which is most of the time, and exactly when it proves nothing.
-fn wait_for_next_second() {
-    let now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    };
-    let start = now();
-    while now() == start {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
-/// Run `op` on two fresh copies of the same input, separated by a second, and
-/// return the two files.
-fn run_twice_across_a_second(
-    dir: &Path,
-    op: impl Fn(&Path),
-) -> (std::path::PathBuf, std::path::PathBuf) {
-    let src = mixed_codec_file(&dir.join("src.scx")).unwrap();
-    let (a, b) = (dir.join("a.scx"), dir.join("b.scx"));
-    std::fs::copy(&src, &a).unwrap();
-    op(&a);
-    wait_for_next_second();
-    std::fs::copy(&src, &b).unwrap();
-    op(&b);
-    (a, b)
-}
-
-/// The premise every case below depends on: the two runs really did stamp
-/// different timestamps, so "the digests agree" is a statement about the
-/// exclusion rather than about two identical files.
-fn assert_provenance_actually_differs(a: &Path, b: &Path) {
-    let inc = |p: &Path| digest_file_excluding(p, Strictness::Content, &[]).unwrap();
-    assert_ne!(
-        inc(a).sections,
-        inc(b).sections,
-        "premise: the two runs must have stamped different provenance; \
-         without that this test cannot fail"
-    );
-    assert_ne!(
-        std::fs::read(a).unwrap(),
-        std::fs::read(b).unwrap(),
-        "premise: the two files must differ on disk"
-    );
-}
 
 #[test]
 fn mark_deleted_digests_agree_across_a_second() {
     let dir = tempfile::tempdir().unwrap();
-    let (a, b) = run_twice_across_a_second(dir.path(), |p| {
+    let src = mixed_codec_file(&dir.path().join("src.scx")).unwrap();
+    let (a, b) = run_twice_across_a_second(&src, dir.path(), "mark_deleted", |p| {
         scx_ops::mark_deleted(p, &[1u64, 5, 9]).unwrap();
     });
     assert_provenance_actually_differs(&a, &b);
@@ -145,38 +108,19 @@ mod common;
 
 use common::fixture_all_families;
 
-/// Run `op` twice over **one** fixture, a second apart, and assert the digests
-/// agree while the raw bytes do not.
+/// `assert_op_is_clock_independent` over the all-families fixture.
 ///
-/// One source, not two. Building a second fixture would make the two outputs
-/// differ for a reason that has nothing to do with the clock — each fixture ends
-/// with `mark_deleted`, which stamps its own `SystemTime::now()`, so the two
-/// inputs' `file_checksum`s differ and `merge` copies those into its provenance.
-/// The premise assertion then passes with `wait_for_next_second()` deleted,
-/// which is how this helper was first written and how it was caught: removing
-/// the wait left every case green.
-fn assert_op_is_clock_independent(label: &str, op: impl Fn(&Path, &Path)) {
+/// The helper itself is `scx_testkit::ab`'s; this only supplies the fixture,
+/// which lives in this crate's `tests/common`.
+fn over_every_family(label: &str, op: impl Fn(&Path, &Path)) {
     let dir = tempfile::tempdir().unwrap();
     let src = fixture_all_families(dir.path(), "src.scx");
-
-    let a = dir.path().join(format!("{label}_a.scx"));
-    op(&src, &a);
-
-    wait_for_next_second();
-
-    let b = dir.path().join(format!("{label}_b.scx"));
-    op(&src, &b);
-
-    assert_provenance_actually_differs(&a, &b);
-    assert_digests_eq(
-        &digest_file(&a, Strictness::Content).unwrap(),
-        &digest_file(&b, Strictness::Content).unwrap(),
-    );
+    assert_op_is_clock_independent(&src, dir.path(), label, op);
 }
 
 #[test]
 fn compact_over_every_family_is_clock_independent() {
-    assert_op_is_clock_independent("compact", |src, out| {
+    over_every_family("compact", |src, out| {
         scx_ops::compact(src, out).unwrap();
     });
 }
@@ -187,21 +131,21 @@ fn sort_over_every_family_is_clock_independent() {
         by: vec!["cell_type".to_string()],
         ..Default::default()
     };
-    assert_op_is_clock_independent("sort", |src, out| {
+    over_every_family("sort", |src, out| {
         scx_ops::sort_engine::sort(src, out, &opts).unwrap();
     });
 }
 
 #[test]
 fn optimize_over_every_family_is_clock_independent() {
-    assert_op_is_clock_independent("optimize", |src, out| {
+    over_every_family("optimize", |src, out| {
         scx_ops::optimize::optimize(src, out, None, scx_format_io::ObsShardPolicy::Off).unwrap();
     });
 }
 
 #[test]
 fn build_csc_over_every_family_is_clock_independent() {
-    assert_op_is_clock_independent("build_csc", |src, out| {
+    over_every_family("build_csc", |src, out| {
         scx_ops::run_build_csc(src, out, "1G", false, 1024, None).unwrap();
     });
 }

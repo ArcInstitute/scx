@@ -207,6 +207,17 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   round-trip test is not evidence for a byte-identity contract — it proves the
   data survived, not that the bytes did. See
   [Test Organization](#test-organization) and `scx-testkit/src/digest.rs`.
+
+  For the `scx-ops` rewrite paths the harness is already built and committed:
+  `tests/scx-integration-tests/tests/op_output_identity.rs` runs `compact`,
+  `merge`, `sort`, `build-csc` (twice — once over an input carrying per-shard
+  `column_stats`), `append`, `delete` and `optimize` into one
+  `scx_testkit::ab::OpDigestManifest` and pins it against a checked-in golden.
+  A cross-tree A/B is two commands and no scratch code — dump the manifest in a
+  worktree at the base commit with `SCX_TESTKIT_AB_DUMP=<path>`, then assert
+  against it with `SCX_TESTKIT_AB_BASE=<path>`. Cite that, not a hand-rolled
+  comparison. Note what it cannot see: `file_checksum` is outside the digest by
+  construction, so a change to its *semantics* needs a separate oracle.
 - **Never `git add -A`.** The repo root carries untracked scratch markdown, and
   the local pre-commit hook already runs `git add -u`.
 - **Perf-touching refactors gate before merge** against
