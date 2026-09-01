@@ -23,8 +23,8 @@
 //! the value written at `projection.rs`'s `output_row[idx] = value` — changes
 //! *both* arms by the same amount, so the equality assertion stays green and
 //! the falsification reads as passed. A mutant here has to vary with the pool,
-//! e.g. `+ rayon::current_thread_index().unwrap_or(0) as f32`. Recorded because
-//! the first attempt at this fell into it.
+//! e.g. the `+ rayon::current_num_threads() as f32` this was falsified with.
+//! Recorded because the first attempt at this fell into it.
 //!
 //! **The fixture has to distinguish rows.** `write_multi_shard_fixture` writes
 //! one nonzero per row at column `row % n_vars`. With `n_vars < n_obs` the
@@ -32,16 +32,16 @@
 //! always scales to exactly `target_sum` whatever its stored count was — so
 //! rows `r` and `r + n_vars` decode to **byte-identical dense rows** and a
 //! pairing error that swapped them would not show. Measured, not assumed:
-//! against that fixture the `every decoded row in a batch must be distinct`
-//! premise below fails outright.
+//! against that fixture `the_fixture_can_tell_two_rows_apart`'s whole-epoch
+//! distinctness premise fails outright.
 //!
 //! It is only the *pairing* half that the old fixture hid. A value corruption
 //! was always visible, because the normalization denominator comes from
 //! `csr_data` before the scatter (`decode_stage.rs`'s `transform_depth` call),
 //! not from the output row — so a perturbed written value does not normalize
 //! back. Two different blind spots; `write_row_distinguishable_fixture` closes
-//! the one that was open, and `the_fixture_can_tell_two_rows_apart` plus the
-//! in-test distinctness premise keep it closed.
+//! the one that was open, and `the_fixture_can_tell_two_rows_apart` — which
+//! owns **both** premises, over the whole epoch — keeps it closed.
 
 mod common;
 
@@ -202,8 +202,11 @@ fn the_fixture_can_tell_two_rows_apart() {
     // still be invisible. (Measured: an earlier version asserted `rows[0] !=
     // rows[1]` and passed with both of a row's counts forced equal.)
     //
-    // So look at one column across rows. Row `r` writes its second count at
-    // column `r + 1`; after `normalize_total` that becomes
+    // So sample the diagonal — not a shared column, because this fixture has
+    // none: row `r` occupies `r`/`r + 1`, so any single column is zero in all
+    // but two rows and would compare equal across the rest whatever the values
+    // are. Row `r` writes its second count at column `r + 1`; after
+    // `normalize_total` that becomes
     // `log1p(target_sum * v1 / (v0 + v1))`, which is constant across rows
     // exactly when the ratio is. More than one distinct value there is the
     // value channel carrying information.
@@ -211,6 +214,12 @@ fn the_fixture_can_tell_two_rows_apart() {
     for (cell, row) in &rows {
         by_cell[*cell as usize] = Some(*row);
     }
+    //
+    // Over every row rather than two known ones, deliberately: which *pairs* of
+    // rows have distinguishable ratios is a property of `row_values`, and this
+    // test must not re-derive that formula — re-deriving it is the mistake the
+    // previous version of this test made. Scanning the epoch asks the question
+    // without depending on any particular pair staying distinguishable.
     let high_col: std::collections::HashSet<u32> = (0..N_OBS)
         .map(|r| by_cell[r].expect("every cell decoded")[r + 1])
         .collect();

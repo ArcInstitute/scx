@@ -234,7 +234,9 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     m
 }
 
-/// The premise: the matrix really does cover the seven ops PR-01 names.
+/// The premise: the matrix really does cover every arm it is meant to — nine of
+/// them, over the seven ops PR-01 names, with `compact` and `build_csc` doubled
+/// over an index-carrying input.
 ///
 /// Without it, dropping an op from `build_manifest` would only be caught by a
 /// golden re-bless — which is exactly the moment somebody is least likely to

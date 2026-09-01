@@ -209,19 +209,20 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   [Test Organization](#test-organization) and `scx-testkit/src/digest.rs`.
 
   For the `scx-ops` rewrite paths the harness is already built and committed:
-  `tests/scx-integration-tests/tests/op_output_identity.rs` runs `compact`,
-  `merge`, `sort`, `build-csc` (twice — once over an input carrying per-shard
-  `column_stats`), `append`, `delete` and `optimize` into one
-  `scx_testkit::ab::OpDigestManifest` and pins it against a checked-in golden.
-  A cross-tree A/B is two commands and no scratch code — dump the manifest in a
-  worktree at the base commit with `SCX_TESTKIT_AB_DUMP=<path>`, then assert
-  against it with `SCX_TESTKIT_AB_BASE=<path>`. Cite that, not a hand-rolled
-  comparison — but cite it for what it covers. Its own "What this cannot see"
-  section is the authoritative list, and it is not short: `file_checksum`
-  semantics and the root catalog are outside the digest by construction, every
-  arm runs at `Strictness::Content` so a layout-only change is invisible, and
-  `scx upgrade` / `subset` / multimodal compact/merge / the convert paths have
-  no arm at all. A refactor touching one of those owes its own oracle.
+  `tests/scx-integration-tests/tests/op_output_identity.rs` runs nine arms over
+  seven single-modality rewrite ops into one `scx_testkit::ab::OpDigestManifest`
+  and pins it against a checked-in golden, and the same target does a cross-tree
+  A/B under `SCX_TESTKIT_AB_DUMP=<path>` / `SCX_TESTKIT_AB_BASE=<path>`. Cite
+  that rather than a hand-rolled comparison.
+
+  **Read its module docs before citing it, and do not restate them here.** They
+  own the arm list, the "What this cannot see" section — `file_checksum`
+  semantics, the root catalog, layout (every arm is `Strictness::Content`),
+  `scx upgrade`, `subset`, the multimodal branches of compact/merge, the convert
+  paths — and the constraint that the A/B's base worktree must already contain
+  the harness. A shorter list kept in a second place is how a refactor comes to
+  believe it is covered when it is not; a refactor touching anything on that
+  list owes its own oracle.
 - **Never `git add -A`.** The repo root carries untracked scratch markdown, and
   the local pre-commit hook already runs `git add -u`.
 - **Perf-touching refactors gate before merge** against
