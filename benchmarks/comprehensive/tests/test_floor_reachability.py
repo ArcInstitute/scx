@@ -1671,3 +1671,96 @@ def test_scx_cli_probe_has_one_home():
         f"build (only its cloud *branch* is feature-gated), so probing it "
         f"cannot detect cloud support"
     )
+
+
+#: Every metric name PR-02c's five arms emit, keyed by the module that owns it.
+#:
+#: Pinned because `thresholds.yaml`'s Deferred entries 15-19 spell these names
+#: out in their activation recipes, and a rename would leave those recipes
+#: describing floors that resolve `None` — the "missing metric" outcome, which
+#: is loud, but only after someone has already authored the row and run a
+#: capture. Cheaper to fail here.
+#:
+#: Verified once against the gate's own reader
+#: (`compare_against_baseline._load_current_raw_metric`) on real runs of all
+#: three modules: every one of the twelve resolved a value. This test keeps the
+#: names in place; that check established they are readable at all.
+_PR02C_ARM_METRICS: dict[str, tuple[str, ...]] = {
+    "cellset_gather": (
+        "cellsets_per_sec__collate_rust",
+        "us_per_cell__collate",
+        "peak_rss_mb__collate_rust",
+    ),
+    "ml_loader": (
+        "batches_per_sec__raw_obs_highcard",
+        "batches_per_sec__raw_obs_lowcard",
+        "obs_highcard_overhead_ms_per_batch",
+        "obs_highcard_slowdown_vs_lowcard",
+    ),
+    "grouped_sort": (
+        "peak_rss_mb__convert_sort_by",
+        "wall_s__convert_sort_by",
+        "wall_s__sort_group",
+    ),
+    "fragment_ops": (
+        "wall_s__obs_import",
+        "peak_rss_mb__obs_import",
+        "wall_s__rollback",
+    ),
+    "cloud_metadata": (
+        "wall_s__scx_info_cloud",
+        "scx_info_cloud_ok",
+    ),
+}
+
+
+@pytest.mark.parametrize("module", sorted(_PR02C_ARM_METRICS))
+def test_new_arm_metric_names_are_still_emitted(module: str):
+    """The arms must keep the metric names their Deferred recipes cite.
+
+    Several are built by f-string from a scenario name
+    (`f"peak_rss_mb__{scenario}"`), so the full key never appears as a literal;
+    those are matched through the scenario name plus the prefix pattern.
+
+    **What this pins, exactly: the names, not the wiring.** Three of the five
+    modules derive the key from a different kind of constant — a local
+    (`co_arm = "collate_rust"`), a spec dict's keys
+    (`_OBS_CARDINALITY_SPEC`), an argument at the `_run_convert` call site — so
+    there is no single AST shape that means "this name is live". An attempt to
+    require the scenario name to appear *as an argument to an arm runner*
+    failed two modules that were perfectly correct, which is the signal that
+    the proxy was wrong rather than the code.
+
+    The complementary check is empirical and was run once, outside the suite:
+    each of these twelve names was resolved through the gate's own reader,
+    `compare_against_baseline._load_current_raw_metric`, against real runs of
+    `cellset_gather`, `fragment_ops` and `grouped_sort` — all twelve returned a
+    value. That established they are readable; this test keeps them from being
+    renamed out from under `thresholds.yaml`.
+    """
+    import ast
+
+    tree, path = _bench_ast(module)
+    src = path.read_text()
+
+    literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    missing = []
+    for metric in _PR02C_ARM_METRICS[module]:
+        if metric in literals:
+            continue
+        prefix, _, scenario = metric.rpartition("__")
+        if scenario in literals and f'f"{prefix}__{{' in src:
+            continue
+        missing.append(metric)
+
+    assert not missing, (
+        f"{path.name} no longer emits {missing}. These names are cited by "
+        f"thresholds.yaml's Deferred floors (items 15-19); renaming one leaves "
+        f"its activation recipe describing a floor that resolves None. Rename "
+        f"in both places, or here first."
+    )
