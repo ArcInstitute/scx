@@ -25,6 +25,53 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def probe_optional(
+    top_level: str, *members: str, install_hint: str,
+) -> tuple[bool, str]:
+    """Import an optional competitor library; distinguish absent from moved.
+
+    Returns ``(available, reason)``. ``reason`` is empty when available, and
+    otherwise says which of the two happened, because they need opposite
+    responses and a runner that conflates them costs real coverage.
+
+    Every optional runner used a single broad ``except ImportError`` around the
+    top-level import *and* its submodules, then reported "X is not installed in
+    this env. Install it with …". When the package is installed but its API has
+    moved, that message is false and it buries the real diagnosis: a tier-full
+    capture lost all 47 ``cellstream`` cells to
+    ``from cellstream import format`` and ``from cellstream.writer import
+    write_store``, both gone upstream (``CellStream`` is now ``CellStore``),
+    while the log insisted the package was missing and the fix was to install
+    it — which it already was.
+
+    This mirrors ``pyscx/src/optional_deps.rs``, which rewrites a missing-module
+    error only when the missing name *is* the requested top-level package and
+    lets a failing submodule propagate untouched, for the same reason.
+    """
+    import importlib
+
+    try:
+        importlib.import_module(top_level)
+    except ImportError as exc:
+        return False, f"{top_level} is not installed in this env. {install_hint} ({exc})"
+    for member in members:
+        # "pkg.sub" is a module; "pkg.sub:Name" is a name inside one. Not
+        # `rpartition`, which on a colon-free string puts the whole thing in
+        # the *name* half and then imports "".
+        mod, name = member.split(":", 1) if ":" in member else (member, "")
+        try:
+            obj = importlib.import_module(mod)
+            if name and not hasattr(obj, name):
+                raise ImportError(f"cannot import name {name!r} from {mod!r}")
+        except ImportError as exc:
+            return False, (
+                f"{top_level} IS installed ({importlib.import_module(top_level).__file__}) "
+                f"but its API has moved: {exc}. The runner needs porting — "
+                f"installing the package will not help."
+            )
+    return True, ""
+
+
 @dataclass
 class TimingResult:
     """Result of a single timed operation."""

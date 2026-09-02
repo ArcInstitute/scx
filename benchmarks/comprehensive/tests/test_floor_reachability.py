@@ -558,6 +558,72 @@ def test_the_hvg_projection_width_is_decided_in_one_place():
     )
 
 
+def test_no_runner_reports_a_moved_api_as_a_missing_package():
+    """"Not installed" must not be the message for an installed package.
+
+    Every optional competitor runner wrapped its top-level import *and* its
+    member imports in one broad `except ImportError`, set `_HAS_X = False`, and
+    then told the operator "X is not installed in this env. Install it with …".
+    When the package is present but its API has moved, that message is false
+    and it buries the real diagnosis.
+
+    Not hypothetical. The tier-full capture lost all 47 `cellstream` cells to
+    `from cellstream import format` and `from cellstream.writer import
+    write_store`, both gone upstream (`CellStream` is now `CellStore`) — while
+    every one of the 47 logs said the package was missing and the fix was to
+    install it, which it already was. 47 baseline rows and a misdirected
+    investigation, from an error message that was confidently wrong.
+
+    This is the class `pyscx/src/optional_deps.rs` exists to avoid: it rewrites
+    a missing-module error only when the missing name *is* the requested
+    top-level package, and lets a failing submodule propagate untouched,
+    "because 'not installed' would be false and would bury the real diagnosis."
+    `runners/base.probe_optional` is the bench-side equivalent.
+    """
+    import ast
+
+    from benchmarks.comprehensive.runners.base import probe_optional
+
+    # The three outcomes, on modules that certainly exist / certainly do not.
+    ok, why = probe_optional("json", "json.decoder", "json:loads", install_hint="n/a")
+    assert ok and why == "", (ok, why)
+
+    ok, why = probe_optional("json", "json:no_such_attribute", install_hint="n/a")
+    assert not ok and "IS installed" in why and "API has moved" in why, why
+    assert "not installed" not in why.replace("IS installed", ""), (
+        f"a moved API still reads as a missing package: {why}"
+    )
+
+    ok, why = probe_optional("scx_no_such_package_xyz", install_hint="pip install it")
+    assert not ok and "is not installed" in why and "pip install it" in why, why
+
+    # No runner may reconstruct the conflated guard.
+    runners = PROJECT_ROOT / "benchmarks" / "comprehensive" / "runners"
+    offenders: list[str] = []
+    for path in sorted(runners.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            sets_flag_false = any(
+                isinstance(st, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id.startswith("_HAS_")
+                        for t in st.targets)
+                and isinstance(st.value, ast.Constant) and st.value.value is False
+                for h in node.handlers for st in h.body
+            )
+            has_member_import = any(
+                isinstance(st, ast.ImportFrom) for st in node.body
+            )
+            if sets_flag_false and has_member_import:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        f"these guards fold a member import into the package-absent branch, so "
+        f"a moved upstream API will be reported as 'not installed': "
+        f"{offenders}. Use `runners.base.probe_optional`, which separates them."
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 

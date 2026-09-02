@@ -25,26 +25,23 @@ import numpy as np
 import scipy.sparse as sp
 
 from benchmarks.comprehensive.runners.base import (
+    probe_optional,
     ConvertResult,
     FormatRunner,
     TimingResult,
 )
 
-try:
-    import cellstream  # noqa: F401
-    from cellstream import format as _cs_fmt
-    from cellstream.writer import write_store
-
-    _HAS_CELLSTREAM = True
-except ImportError:
-    _HAS_CELLSTREAM = False
-
-
-_MISSING_MSG = (
-    "cellstream is not installed in this env. Install it into scx-bench with: "
-    "conda activate scx-bench && pip install pyfastpfor && "
-    "pip install -e ~/dev/python/cellstream"
+_HAS_CELLSTREAM, _MISSING_MSG = probe_optional(
+    "cellstream", "cellstream.format", "cellstream.writer:write_store",
+    install_hint=(
+        "Install it into scx-bench with: conda activate scx-bench && "
+        "pip install pyfastpfor && pip install -e ~/dev/python/cellstream"
+    ),
 )
+if _HAS_CELLSTREAM:
+    import cellstream  # noqa: F401
+    from cellstream import format as _cs_fmt  # noqa: F401
+    from cellstream.writer import write_store  # noqa: F401
 
 
 def _dir_size(path: str) -> int:
