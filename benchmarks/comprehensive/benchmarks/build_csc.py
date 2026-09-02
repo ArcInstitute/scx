@@ -105,32 +105,6 @@ _MEMORY_LIMIT_MB = 4 * 1024
 _CSC_COLS_PER_SHARD = 5000
 
 
-def _has_csc_sidecar(path: Path) -> bool:
-    """Did `build_csc` actually produce a sidecar?
-
-    A **premise check**, not a measurement: without one, the wall and peak
-    recorded for that run timed something other than a sidecar build, and a run
-    that silently measured a no-op is worse than a missing one.
-
-    This reads the header flag via `Experiment.has_csc`. An earlier version
-    counted `X_csc_shard_*` sections out of `Experiment.validate()` and claimed
-    that came "straight off the catalog" — it does not.
-    `ScxReader::validate` (`scx-format-io/src/reader/integrity.rs`) verifies the
-    whole-file checksum and then BLAKE3-hashes **every section payload**, so it
-    was a full-file hash after every timed run: free on pbmc3k, minutes on a
-    census fixture, and buying only a shard count nothing gates.
-    """
-    import pyscx
-
-    exp = pyscx.open(str(path))
-    try:
-        return bool(exp.has_csc)
-    finally:
-        close = getattr(exp, "close", None)
-        if close is not None:
-            close()
-
-
 def run(
     dataset: DatasetConfig,
     format_variant: FormatVariant,
@@ -198,7 +172,24 @@ def run(
             peak = sampler.peak_mb
             output_bytes = target.stat().st_size
 
-            if not _has_csc_sidecar(target):
+            # Premise check, inline: without a sidecar the wall and peak above
+            # timed something other than a sidecar build, and a run that
+            # silently measured a no-op is worse than a missing one.
+            #
+            # Reads the header flag. An earlier version counted
+            # `X_csc_shard_*` out of `Experiment.validate()` and called that a
+            # catalog read — `ScxReader::validate`
+            # (`scx-format-io/src/reader/integrity.rs`) verifies the whole-file
+            # checksum and then BLAKE3-hashes every section payload, so it was a
+            # full-file hash after every timed run.
+            built = pyscx.open(str(target))
+            try:
+                has_csc = bool(built.has_csc)
+            finally:
+                _close = getattr(built, "close", None)
+                if _close is not None:
+                    _close()
+            if not has_csc:
                 raise RuntimeError(
                     f"build_csc({target}) produced no CSC sidecar, so the "
                     f"{wall:.2f}s / {peak:.1f} MB above measured something other "

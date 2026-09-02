@@ -514,21 +514,48 @@ def test_mtx_export_is_scoped_out_of_the_census_tiers():
     )
 
 
-def _pbmc3k_mtx_args():
-    """`(dataset, format_variant, converted_path)` for a real `mtx_export.run`.
+@pytest.fixture
+def tiny_mtx_source(tmp_path):
+    """`(dataset, format_variant, converted_path)` over a synthesised SCX file.
 
-    pbmc3k is 2.3M non-zeros; a full export/ingest cycle is a few seconds.
+    Deliberately **not** the staged `pbmc3k_auto.scx`. An earlier version of
+    these tests used it and skipped when it was absent, which put the durable
+    evidence for the two MTX guards exactly where it was least useful: a
+    fixtureless checkout could delete the production `if` and keep the suite
+    green. Found by review (codex - gpt-5.6-terra, Antigravity - Gemini 3.7
+    Flash, Cursor Agent - Grok 4.6 High).
+
+    120 x 40 integer counts is enough to export, delete from, and re-ingest in
+    well under a second, and it keeps the guards under test rather than the
+    fixture.
     """
-    from benchmarks.comprehensive.config import ALL_FORMATS, DATASETS
+    anndata = pytest.importorskip("anndata")
+    pyscx = pytest.importorskip("pyscx")
+    np = pytest.importorskip("numpy")
+    sparse = pytest.importorskip("scipy.sparse")
 
-    ds = DATASETS["pbmc3k"]
+    from benchmarks.comprehensive.config import ALL_FORMATS, DatasetConfig
+
+    n_obs, n_vars = 120, 40
+    rng = np.random.default_rng(0)
+    x = sparse.csr_matrix(
+        (rng.random((n_obs, n_vars)) < 0.3) * rng.integers(1, 50, (n_obs, n_vars))
+    ).astype("float32")
+    adata = anndata.AnnData(X=x)
+    adata.obs_names = [f"cell{i}" for i in range(n_obs)]
+    adata.var_names = [f"gene{j}" for j in range(n_vars)]
+    scx = tmp_path / "tiny.scx"
+    pyscx.from_anndata(adata, str(scx))
+
+    ds = DatasetConfig(
+        id="TEST", name="tiny_mtx", n_obs=n_obs, n_vars=n_vars,
+        protocol="synthetic", source="test fixture", approx_h5ad_mb=1,
+    )
     fmt = next(f for f in ALL_FORMATS if f.key == "scx_auto")
-    if not ds.scx_auto_path.exists():
-        pytest.skip(f"fixture not staged: {ds.scx_auto_path}")
-    return ds, fmt, ds.scx_auto_path
+    return ds, fmt, scx
 
 
-def test_mtx_deletion_arm_refuses_an_export_that_ignored_the_keep_mask():
+def test_mtx_deletion_arm_refuses_an_export_that_ignored_the_keep_mask(tiny_mtx_source):
     """The row-count comparison has to be a *test*, not a one-off measurement.
 
     Round 1 found that the deletion arm recorded `mtx_rows_written` and compared
@@ -543,7 +570,7 @@ def test_mtx_deletion_arm_refuses_an_export_that_ignored_the_keep_mask():
     """
     from benchmarks.comprehensive.benchmarks import mtx_export as mx
 
-    ds, fmt, converted = _pbmc3k_mtx_args()
+    ds, fmt, converted = tiny_mtx_source
     original = mx._row_count
     try:
         mx._row_count = lambda out_dir: ds.n_obs
@@ -554,7 +581,7 @@ def test_mtx_deletion_arm_refuses_an_export_that_ignored_the_keep_mask():
         mx._row_count = original
 
 
-def test_mtx_roundtrip_refuses_an_ingest_that_lost_an_entry():
+def test_mtx_roundtrip_refuses_an_ingest_that_lost_an_entry(tiny_mtx_source):
     """Same for the round-trip shape/nnz comparison.
 
     The mutant is an ingest that silently drops one non-zero — patched at the
@@ -564,7 +591,7 @@ def test_mtx_roundtrip_refuses_an_ingest_that_lost_an_entry():
     from benchmarks.comprehensive.benchmarks import mtx_export as mx
 
     pyscx = pytest.importorskip("pyscx")
-    ds, fmt, converted = _pbmc3k_mtx_args()
+    ds, fmt, converted = tiny_mtx_source
     src = str(converted)
     real_open = pyscx.open
 
@@ -631,6 +658,126 @@ def test_csc_always_arm_refuses_a_result_with_no_sidecar():
                 ),
                 None,
                 "tabula_sapiens_100k",
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+@pytest.mark.parametrize(
+    "indexed_bytes, expect",
+    [
+        (10, "no predicate-index sections"),   # same size as the default arm
+        (5, "no predicate-index sections"),    # smaller, the measured pbmc3k shape
+        (None, "could not be verified"),       # size missing on one side
+    ],
+)
+def test_index_preset_arm_refuses_a_result_with_no_index_effect(
+    indexed_bytes, expect
+):
+    """`index_preset_cellxgene` has to fail **closed**, like the CSC arm.
+
+    `Experiment` exposes no `has_obs_index`, so the guard compares output sizes:
+    an index that took effect writes more bytes than the default arm on the same
+    input. Two ways it could be satisfied wrongly, both covered here:
+
+    * the sizes are equal or the indexed arm is *smaller* — which is the shape
+      actually measured on pbmc3k, where the preset's columns are absent
+      (4,379,713 B against the default arm's 4,379,851); and
+    * a size is missing, which an earlier version treated as "nothing to
+      compare, carry on". A comparison that could not be made is not a
+      comparison that passed.
+
+    Found by review (Antigravity - Gemini 3.7 Flash, Cursor Agent - Grok 4.6
+    High): the round-2 fix added the guard and no red test, so deleting the
+    `if` left the suite green.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        kw = extra_kwargs or {}
+        rec = {
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "has_csc": 1 if kw.get("csc") else 0,
+            },
+        }
+        if kw.get("index_preset"):
+            if indexed_bytes is not None:
+                rec["output_bytes"] = indexed_bytes
+        else:
+            rec["output_bytes"] = 10
+        return [rec]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        with pytest.raises(RuntimeError, match=expect):
+            cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset="tabula_sapiens_100k",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                "tabula_sapiens_100k",
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+def test_sweep_companion_arms_enforce_the_same_premises():
+    """The thread-sweep path must not be the unguarded way in.
+
+    `_run_extra_arms_once` was added so a sweep capture does not silently lose
+    the non-default arms — and it recorded their timings while discarding
+    `structural` / `output_bytes`, which reopened on this path the exact
+    "wrong path, right label" hole the default path had just closed. A sweep on
+    tabula could emit `csc_always_peak_rss_mb` after a worker reported no
+    sidecar. Found by all three reviewers.
+
+    The CSC premise is checkable here because it needs only this arm's own
+    record. The index premise is not: it compares against the default arm's
+    output size, which the sweep writes *after* these arms run, so the caller
+    defers it — covered by `test_index_preset_arm_refuses_a_result_with_no_index_effect`.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def no_sidecar(h5ad_path, n_runs, scenario, thread_count=None,
+                   reader_threads=None, extra_kwargs=None):
+        # A worker that ignored `csc="always"`: right label, no sidecar.
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "has_csc": 0,
+            },
+            "output_bytes": 10,
+        }]
+
+    result = BenchmarkResult(
+        benchmark="conversion_streaming",
+        format="scx_streaming_vs_materialize",
+        dataset="tabula_sapiens_100k",
+        metadata={"scenarios": []},
+    )
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = no_sidecar
+        with pytest.raises(RuntimeError, match="csc_always"):
+            cs._run_extra_arms_once(
+                pathlib.Path("/nonexistent.h5ad"), result, "tabula_sapiens_100k"
             )
     finally:
         cs._run_arm_subprocess = original

@@ -537,9 +537,76 @@ def run(
     # top of this function, so there is deliberately no second copy here.
     result.metadata["extra_arms"] = []
     _run_extra_arms_once(h5ad_path, result, dataset.name)
-    return _run_with_thread_scaling(
-        h5ad_path, n_runs, thread_counts, result, dataset.name
+    swept = _run_with_thread_scaling(h5ad_path, n_runs, thread_counts, result)
+    # Deferred to here on purpose: the extra arms ran *before* the sweep, and
+    # this check compares against `streaming_output_bytes`, which only the sweep
+    # writes. Running it inside `_run_extra_arms_once` would always see
+    # `plain is None`.
+    _assert_index_arm_changed_the_output(
+        list(swept.metadata.get("extra_arms", [])), swept
     )
+    return swept
+
+
+def _assert_csc_arm_built_a_sidecar(
+    labels: list[str] | tuple[str, ...],
+    structural: dict[str, dict | None],
+) -> None:
+    """Refuse a `csc_always` result whose output has no sidecar.
+
+    Without this the arm emits `csc_always_peak_rss_mb` after a worker that
+    dropped `csc="always"` on either subprocess hop — the default conversion
+    recorded under the CSC label. Self-contained: it needs only this arm's own
+    structural record, so it can run the moment that arm returns.
+    """
+    if "csc_always" not in labels:
+        return
+    has_csc = (structural.get("csc_always") or {}).get("has_csc")
+    if not has_csc:
+        raise RuntimeError(
+            f"the csc_always arm produced has_csc={has_csc!r}: "
+            f"`csc=\"always\"` did not reach `from_h5ad`, so the arm timed "
+            f"the default conversion under the CSC label. Refusing to record it."
+        )
+
+
+def _assert_index_arm_changed_the_output(
+    labels: list[str] | tuple[str, ...],
+    result: BenchmarkResult,
+) -> None:
+    """Refuse an `index_preset_cellxgene` result that shows no index effect.
+
+    `Experiment` exposes no `has_obs_index`, so the check is the observable one:
+    writing the preset's index sections makes the output strictly larger than the
+    default arm's, on the same input with the same codec.
+
+    **Fail-closed.** A missing size on either side means the comparison could not
+    be made, which is not evidence that it passed — an earlier version returned
+    quietly on `None` and could be satisfied by a worker that simply omitted
+    `output_bytes`. Found by review (Antigravity - Gemini 3.7 Flash, Cursor Agent
+    - Grok 4.6 High).
+
+    ⚠️ Ordering: this needs the *default* arm's size, so it must run after that
+    arm has recorded. On the thread-sweep path the extra arms run first, so the
+    caller defers this until the sweep has written `streaming_output_bytes`.
+    """
+    if "index_preset_cellxgene" not in labels:
+        return
+    indexed = result.metadata.get("index_preset_cellxgene_output_bytes")
+    plain = result.metadata.get("streaming_output_bytes")
+    if indexed is None or plain is None:
+        raise RuntimeError(
+            f"cannot check the index_preset_cellxgene premise: output sizes were "
+            f"indexed={indexed!r} default={plain!r}. Refusing to record an arm "
+            f"whose effect could not be verified."
+        )
+    if indexed <= plain:
+        raise RuntimeError(
+            f"the index_preset_cellxgene arm wrote {indexed} bytes against the "
+            f"default arm's {plain}: no predicate-index sections were emitted, "
+            f"so `index_preset=\"cellxgene\"` did not take effect and the arm "
+            f"timed the default conversion. Refusing to record it."
+        )
 
 
 def _run_isolated(
@@ -632,37 +699,8 @@ def _run_isolated(
     # subprocess hop the arm would still emit `csc_always_peak_rss_mb` and pass,
     # having timed the default conversion under the CSC label. Nothing reads
     # `metadata`, so storing `n_csc_shards` there was not a check.
-    if "csc_always" in applicable_extras:
-        has_csc = (structural.get("csc_always") or {}).get("has_csc")
-        if not has_csc:
-            raise RuntimeError(
-                f"the csc_always arm produced has_csc={has_csc!r}: "
-                f"`csc=\"always\"` did not reach `from_h5ad`, so the arm timed "
-                f"the default conversion under the CSC label. Refusing to "
-                f"record it."
-            )
-
-    # The same premise for the index arm, which had none: a conversion that
-    # accepted `index_preset` and ignored it would emit
-    # `index_preset_cellxgene_peak_rss_mb` and pass, having measured the default
-    # path. There is no `has_obs_index` on `Experiment`, so the observable effect
-    # is the one used: writing the preset's index sections makes the output
-    # strictly larger than the default arm's, same input and same codec.
-    # (Measured on pbmc3k, where the preset's columns are absent and no index is
-    # written: 4,379,713 B against the default arm's 4,379,851 B — smaller, by a
-    # provenance string. That is the shape this catches.)
-    # Found by review (codex - gpt-5.6-terra).
-    if "index_preset_cellxgene" in applicable_extras:
-        indexed = result.metadata.get("index_preset_cellxgene_output_bytes")
-        plain = result.metadata.get("streaming_output_bytes")
-        if indexed is not None and plain is not None and indexed <= plain:
-            raise RuntimeError(
-                f"the index_preset_cellxgene arm wrote {indexed} bytes against "
-                f"the default arm's {plain}: no predicate-index sections were "
-                f"emitted, so `index_preset=\"cellxgene\"` did not take effect "
-                f"and the arm timed the default conversion. Refusing to record "
-                f"it."
-            )
+    _assert_csc_arm_built_a_sidecar(applicable_extras, structural)
+    _assert_index_arm_changed_the_output(applicable_extras, result)
 
     result.metadata["gated_reader_threads"] = GATED_READER_THREADS
     result.metadata["structural"] = {
@@ -698,6 +736,7 @@ def _run_extra_arms_once(
     One run each, not `n_runs`: the sweep is already the expensive path, and
     these are here for coverage rather than for a median.
     """
+    structural: dict[str, dict | None] = {}
     for label, (kwargs, datasets) in _EXTRA_ARMS.items():
         if dataset_name not in datasets:
             continue
@@ -706,6 +745,14 @@ def _run_extra_arms_once(
             reader_threads=GATED_READER_THREADS, extra_kwargs=kwargs,
         )
         for rec in records:
+            # Kept, not discarded: the premise checks below and after the sweep
+            # read exactly these. An earlier version of this function recorded
+            # the timings and dropped both, which reopened on this path the
+            # "wrong path, right label" hole the default path had just closed.
+            if rec.get("structural") is not None and label not in structural:
+                structural[label] = rec["structural"]
+                if rec.get("output_bytes") is not None:
+                    result.metadata[f"{label}_output_bytes"] = rec["output_bytes"]
             result.add_run(
                 wall_s=rec["wall_s"],
                 peak_rss_mb=rec["peak_rss_mb"],
@@ -720,8 +767,16 @@ def _run_extra_arms_once(
                     ),
                 },
             )
+            result.metadata["scenarios"].append(label)
         result.metadata.setdefault("extra_arms", []).append(label)
         log.info("  %s (thread-sweep companion run) recorded", label)
+
+    # The CSC premise needs only this arm's own record, so it is enforced here.
+    # The index premise compares against the *default* arm's output size, which
+    # the sweep has not written yet — the caller runs that one afterwards.
+    _assert_csc_arm_built_a_sidecar(
+        list(result.metadata.get("extra_arms", [])), structural
+    )
 
 
 def _run_with_thread_scaling(
@@ -729,7 +784,6 @@ def _run_with_thread_scaling(
     n_runs: int,
     thread_counts: list[int],
     result: BenchmarkResult,
-    dataset_name: str | None = None,
 ) -> BenchmarkResult:
     """Thread-scaling path: for each thread count in `thread_counts`,
     spawn a subprocess with `RAYON_NUM_THREADS={count}` and run paired
