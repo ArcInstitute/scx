@@ -70,6 +70,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -401,6 +402,29 @@ def archive_raw_results(
     return summary
 
 
+def _resolve_since(spec: str) -> float:
+    """Parse a ``--since`` cutoff into epoch seconds.
+
+    Three spellings because three things are convenient at different moments:
+    an ISO-8601 stamp read off a job log, a bare ``@epoch`` for scripting, and
+    a path whose mtime is the cutoff — the last being what an operator
+    actually has after ``touch``ing a marker before a capture.
+    """
+    spec = spec.strip()
+    if spec.startswith("@"):
+        return float(spec[1:])
+    path = Path(spec)
+    if path.exists():
+        return path.stat().st_mtime
+    try:
+        return datetime.fromisoformat(spec).timestamp()
+    except ValueError as exc:
+        raise SystemExit(
+            f"[baseline] cannot read --since {spec!r} as an ISO-8601 "
+            f"timestamp, an @epoch, or an existing file: {exc}"
+        ) from exc
+
+
 def _snapshot_datasets(
     existing: list[str] | None, effective: list[str] | None,
 ) -> list[str]:
@@ -486,6 +510,19 @@ def main() -> int:
         "--mode",
         choices=["submit", "archive", "fingerprint-only", "dry-run"],
         default="submit",
+    )
+    parser.add_argument(
+        "--since", default=None, metavar="TS",
+        help=(
+            "Archive-mode staleness cutoff: an ISO-8601 timestamp "
+            "(2026-09-02T13:13:00), a bare @epoch (@1788400000), or the path "
+            "to a file whose mtime is the cutoff. Only results written at or "
+            "after it are archived. `--mode archive` otherwise has NO "
+            "staleness filter and would sweep in every result RAW_DIR has "
+            "ever accumulated; this is what makes a crashed capture "
+            "salvageable instead of restartable. Ignored by --mode submit, "
+            "which uses its own submission time."
+        ),
     )
     parser.add_argument(
         "--skip-convert", action="store_true",
@@ -604,6 +641,27 @@ def main() -> int:
     # entries from prior invocations. ``time.time()`` is wall-clock seconds
     # matching ``stat().st_mtime``.
     submission_start: float | None = None
+
+    if args.mode == "archive":
+        # Without a cutoff, archive mode copies every result RAW_DIR has ever
+        # accumulated — 1807 files spanning five months on this checkout at
+        # the time of writing — and the promoted baseline silently mixes runs
+        # from unrelated commits. Refuse rather than do that quietly; a
+        # deliberate sweep is still available as `--since @0`.
+        if args.since is None:
+            raise SystemExit(
+                "[baseline] --mode archive needs --since: without it every "
+                "result ever written to results/raw/ is archived, mixing runs "
+                "from unrelated commits into one snapshot. Pass the capture's "
+                "start time (--since 2026-09-02T13:13:00), a marker file "
+                "(--since path/to/stamp), or --since @0 to sweep everything "
+                "on purpose."
+            )
+        submission_start = _resolve_since(args.since)
+        print(
+            f"[baseline] archiving results at or after "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(submission_start))}"
+        )
 
     if args.mode == "submit":
         # Margin: subtract 1s so we don't lose results written within the

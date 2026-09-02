@@ -138,6 +138,30 @@ def _is_multimodal_format(format_key: str) -> bool:
     return any(format_key.startswith(p) for p in _MULTIMODAL_FORMAT_PREFIXES)
 
 
+# Submission failures that are worth retrying: slurmctld was momentarily busy
+# or unreachable, or a fast upstream convert was purged between its completion
+# and its dependents' submission. Deliberately NOT "Batch job submission
+# failed", which is also the prefix for permanent misconfiguration (an invalid
+# partition or account), where a retry only delays the real error.
+_TRANSIENT_SBATCH_ERRORS: tuple[str, ...] = (
+    "Socket timed out on send/recv operation",
+    "Unable to contact slurm controller",
+    "Zero Bytes were transmitted or received",
+    "Job dependency problem",
+)
+
+
+def _is_transient_sbatch_error(msg: str) -> bool:
+    """Whether an ``sbatch`` failure is worth retrying.
+
+    A named-substring test, not a prefix test on "Batch job submission
+    failed" — that prefix also covers permanent misconfiguration, where a
+    retry only delays the real error by 90 seconds. Extracted from the retry
+    loop so the classification can be unit-tested against both sides.
+    """
+    return any(token in msg for token in _TRANSIENT_SBATCH_ERRORS)
+
+
 def _count_active_user_jobs() -> int:
     """Return total PD+R jobs currently queued for the invoking user.
 
@@ -1560,9 +1584,24 @@ def main() -> None:
         executor.update_parameters(**update_kwargs)
 
         # --- Submit the cohort as a single SLURM Job Array ---
-        # Retry once on QOSMaxSubmitJobPerUserLimit — the squeue poll in
-        # _wait_under_pending_cap can race with SLURM's internal counter
-        # (array tasks still being registered).
+        # Retry a transient submission failure. Two distinct kinds, and both
+        # have cost a multi-hour capture its entire output:
+        #
+        #   * QOSMaxSubmitJobPerUserLimit — the squeue poll in
+        #     `_wait_under_pending_cap` can race with SLURM's internal counter
+        #     (array tasks still being registered). Drain, re-throttle, retry.
+        #   * everything in `_TRANSIENT_SBATCH_ERRORS` — slurmctld was busy or
+        #     unreachable for one call. A tier-full capture (job 2892341) died
+        #     38 minutes and 735 results in on "Socket timed out on send/recv
+        #     operation", because the predicate matched only the QOS string and
+        #     re-raised. Nothing was archived: `capture_baseline` refuses to
+        #     archive after a non-zero exit, correctly, so a flaky sbatch threw
+        #     away 38 minutes of cluster time. Plain backoff, no drain — the
+        #     queue was never the problem.
+        #
+        # Matched on a named list rather than on "Batch job submission failed",
+        # which also covers permanent misconfiguration (an invalid partition or
+        # account) where retrying just delays the real error.
         _QOS_RETRY_MAX = 3
         for _attempt in range(_QOS_RETRY_MAX):
             try:
@@ -1579,20 +1618,31 @@ def main() -> None:
                 )
                 break  # success
             except Exception as exc:
-                if "QOSMaxSubmitJobPerUserLimit" in str(exc):
-                    if _attempt < _QOS_RETRY_MAX - 1:
-                        logger.warning(
-                            "QOS limit hit submitting cohort %s/%s "
-                            "(attempt %d/%d); waiting 60s for drain...",
-                            ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
-                        )
-                        time.sleep(60)
-                        _cancel_dep_never_satisfied()
-                        _wait_under_pending_cap(
-                            effective_cap, kind="bench", headroom=tasks_in_cohort
-                        )
-                        continue
-                raise  # re-raise non-QOS errors or final attempt
+                msg = str(exc)
+                last = _attempt >= _QOS_RETRY_MAX - 1
+                if "QOSMaxSubmitJobPerUserLimit" in msg and not last:
+                    logger.warning(
+                        "QOS limit hit submitting cohort %s/%s "
+                        "(attempt %d/%d); waiting 60s for drain...",
+                        ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
+                    )
+                    time.sleep(60)
+                    _cancel_dep_never_satisfied()
+                    _wait_under_pending_cap(
+                        effective_cap, kind="bench", headroom=tasks_in_cohort
+                    )
+                    continue
+                if _is_transient_sbatch_error(msg) and not last:
+                    backoff = 30 * (_attempt + 1)
+                    logger.warning(
+                        "Transient sbatch failure submitting cohort %s/%s "
+                        "(attempt %d/%d): %s; retrying in %ds...",
+                        ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
+                        msg.strip().splitlines()[-1][:160], backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise  # permanent error, or the last attempt
 
         # Record jobs for the wait loop and manifest
         for bench_name, job in zip(group_benches, task_jobs):

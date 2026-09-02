@@ -724,6 +724,138 @@ def test_the_submission_throttle_counts_array_tasks_individually():
     )
 
 
+def test_a_transient_sbatch_failure_does_not_discard_the_whole_capture():
+    """One flaky `sbatch` call must not end a multi-hour capture.
+
+    The cohort-submit retry matched only `QOSMaxSubmitJobPerUserLimit` and
+    re-raised everything else. A tier-full capture (job 2892341) died 38
+    minutes and 735 results in on `sbatch: error: Batch job submission
+    failed: Socket timed out on send/recv operation` — slurmctld busy for one
+    call. Nothing was archived: `capture_baseline` refuses to archive after a
+    non-zero `run_parallel`, correctly, so a transient scheduler hiccup threw
+    away 38 minutes of cluster time.
+
+    The classification is the part worth pinning, in both directions. Matching
+    the "Batch job submission failed" prefix would also swallow permanent
+    misconfiguration — an invalid partition or account — where three attempts
+    with backoff only delay the real error by 90 seconds.
+    """
+    from benchmarks.comprehensive.scripts.run_parallel import (
+        _TRANSIENT_SBATCH_ERRORS,
+        _is_transient_sbatch_error,
+    )
+
+    # The one that actually happened, verbatim from the job log.
+    assert _is_transient_sbatch_error(
+        "sbatch: error: Batch job submission failed: Socket timed out on "
+        "send/recv operation"
+    )
+    # And the one the prior comment history records from a purged upstream
+    # convert racing its dependents' submission.
+    assert _is_transient_sbatch_error(
+        "sbatch: error: Batch job submission failed: Job dependency problem"
+    )
+
+    # Permanent misconfiguration must NOT retry.
+    for permanent in (
+        "sbatch: error: invalid partition specified: nonesuch",
+        "sbatch: error: Batch job submission failed: Invalid account or "
+        "account/partition combination specified",
+        "sbatch: error: Batch job submission failed: Invalid partition name "
+        "specified",
+        "sbatch: error: Batch job submission failed: Requested node "
+        "configuration is not available",
+    ):
+        assert not _is_transient_sbatch_error(permanent), permanent
+
+    # The QOS case keeps its own branch (drain + re-throttle), so it must not
+    # be folded into the plain-backoff list.
+    assert not _is_transient_sbatch_error(
+        "sbatch: error: QOSMaxSubmitJobPerUserLimit"
+    ), "the QOS limit needs the drain branch, not a blind backoff"
+
+    # `_submit_cohort` is nested inside `main()`, so slice it out by AST
+    # rather than `inspect.getsource` on an attribute that does not exist.
+    import ast
+
+    path = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+            / "run_parallel.py")
+    text = path.read_text()
+    tree = ast.parse(text)
+    body = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_submit_cohort"),
+        None,
+    )
+    assert body is not None, "run_parallel lost _submit_cohort"
+    src = ast.get_source_segment(text, body) or ""
+    assert "_is_transient_sbatch_error(msg)" in src, (
+        "the retry loop no longer consults the transient classifier"
+    )
+    # Code lines only: the comments legitimately quote the prefix while
+    # explaining why it is the wrong thing to match on.
+    code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    offending = [ln.strip() for ln in code_lines
+                 if "Batch job submission failed" in ln]
+    assert not offending, (
+        f"the retry loop matches the generic submission-failure prefix in "
+        f"code, which also covers permanent misconfiguration: {offending}"
+    )
+    assert len(_TRANSIENT_SBATCH_ERRORS) >= 4, _TRANSIENT_SBATCH_ERRORS
+
+
+def test_archive_mode_refuses_to_sweep_without_a_cutoff():
+    """`--mode archive` must not silently archive five months of results.
+
+    `--mode submit` filters `results/raw/` on its own submission time, so only
+    that run's output reaches the snapshot. `--mode archive` had no filter at
+    all — and it is the documented recovery path when a capture crashes, which
+    is exactly when someone reaches for it. On this checkout `results/raw/`
+    held 1807 files spanning five months; archiving them all would promote a
+    baseline mixing runs from unrelated commits, and nothing downstream could
+    tell.
+
+    Three attempts at one tier-full capture died mid-run (pre-submit smoke,
+    then `QOSMaxSubmitJobPerUserLimit`, then a transient `sbatch` socket
+    timeout at 38 minutes and 735 results), and each time `capture_baseline`
+    correctly refused to archive — leaving the completed work stranded with no
+    supported way to collect it. `--since` is what makes a crashed capture
+    salvageable rather than restartable.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    from benchmarks.comprehensive.scripts import capture_baseline as cb
+
+    # All three spellings resolve, and a nonsense one exits rather than
+    # defaulting to "everything".
+    assert cb._resolve_since("@1788400000") == 1788400000.0
+    assert cb._resolve_since("2026-09-02T13:13:00") > 1788000000
+    with tempfile.NamedTemporaryFile() as fh:
+        assert cb._resolve_since(fh.name) == pytest.approx(
+            __import__("os").stat(fh.name).st_mtime
+        )
+    with pytest.raises(SystemExit):
+        cb._resolve_since("not-a-time")
+
+    # And the refusal itself, through the CLI, since that is where an operator
+    # meets it.
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [sys.executable,
+             str(PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+                 / "capture_baseline.py"),
+             "--mode", "archive", "--name", "since_guard_probe",
+             "--results-dir", tmp, "--skip-fingerprints"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        )
+    assert proc.returncode != 0, proc.stdout[-2000:]
+    assert "--mode archive needs --since" in (proc.stdout + proc.stderr), (
+        proc.stdout[-2000:] + proc.stderr[-2000:]
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 
