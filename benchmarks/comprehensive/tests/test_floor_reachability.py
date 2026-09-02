@@ -516,6 +516,48 @@ def test_presubmit_smoke_is_scoped_to_the_scheduled_formats():
     assert "Refusing to report a pass over nothing" in proc.stdout, proc.stdout[-2000:]
 
 
+def test_the_hvg_projection_width_is_decided_in_one_place():
+    """Three call sites hand `hvg_indices` to `TrainingDataset`; one rule.
+
+    All three built `list(range(QUERY_N_HVGS))` unconditionally, so on a file
+    narrower than 2000 vars the loader is asked for column 2000 of 200 and
+    raises `HVG index 200 is out of range`. That took out the whole `hvg_norm`
+    scenario and with it the `samples_per_sec__hvg_norm` floors keyed to it —
+    `test_dataload_phase0.py::test_frozen_floor_keys_still_emitted` had been
+    reporting exactly that. It was also asymmetric: `ooc_loader`'s competitor
+    path guards with `X.shape[1] > QUERY_N_HVGS` and does not project, so every
+    competitor would have measured an unprojected epoch while SCX errored.
+
+    Guarded at the source because the end-to-end test only exercises one of the
+    three sites, and "which of the three clamps" is precisely what drifts.
+    """
+    import ast
+
+    src = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+           / "ml_loader.py").read_text()
+    tree = ast.parse(src)
+
+    inside: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_hvg_indices":
+            inside = {n.lineno for n in ast.walk(node) if hasattr(n, "lineno")}
+    assert inside, "ml_loader lost `_hvg_indices` — the clamp has no home"
+
+    offenders = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "range"
+        and any(isinstance(a, ast.Name) and a.id == "QUERY_N_HVGS" for a in node.args)
+        and node.lineno not in inside
+    ]
+    assert not offenders, (
+        f"ml_loader.py builds range(QUERY_N_HVGS) outside `_hvg_indices` at "
+        f"lines {offenders} — that site will crash on any file narrower than "
+        f"QUERY_N_HVGS and will disagree with the competitors' path"
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 

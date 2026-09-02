@@ -479,6 +479,35 @@ def _loader_available(loader_type: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _hvg_indices(path: str, hvg: bool) -> list[int] | None:
+    """The HVG projection to hand `TrainingDataset`, or `None` for no projection.
+
+    `None` rather than `range(QUERY_N_HVGS)` when the file is narrower than the
+    projection, for two reasons that point the same way. All three call sites
+    used an unconditional `range(2000)`, which on a narrower file asks the
+    loader for column 2000 of 200 and raises `HVG index 200 is out of range` —
+    the failure `test_frozen_floor_keys_still_emitted` has been reporting, where
+    the whole `hvg_norm` scenario is lost along with the
+    `samples_per_sec__hvg_norm` floors keyed to it. And it made this path
+    asymmetric with the competitors': `ooc_loader._apply_hvg_norm` guards with
+    `X.shape[1] > QUERY_N_HVGS` and simply does not project, so on such a file
+    every competitor would have measured an unprojected epoch while SCX errored.
+    Skipping the projection is what mirrors them; projecting to the full width
+    would still route through the HVG machinery and time something they are not.
+
+    No registered dataset is affected today — `pert_synth_*` sit at exactly 2000
+    vars (`range(2000)` is 0..1999, valid) and everything else is >= 6546 — so
+    this is a latent asymmetry plus a real crash on the narrow synthetic
+    fixtures the tests build. One function because three call sites drifting
+    apart on which of them clamps is how it would come back.
+    """
+    if not hvg:
+        return None
+    import pyscx
+
+    return list(range(QUERY_N_HVGS)) if pyscx.open(path).n_vars > QUERY_N_HVGS else None
+
+
 def _run_scx_epoch(
     path: str, batch_size: int, hvg: bool, normalize: bool, seed: int,
     obs_columns: list[str] | None = None,
@@ -492,7 +521,7 @@ def _run_scx_epoch(
     """
     import pyscx
 
-    hvg_indices = list(range(QUERY_N_HVGS)) if hvg else None
+    hvg_indices = _hvg_indices(path, hvg)
     ds = pyscx.TrainingDataset(
         path,
         batch_size=batch_size,
@@ -561,7 +590,7 @@ if _HAS_TORCH:
             worker_id = info.id if info is not None else 0
             num_workers = info.num_workers if info is not None else 1
 
-            hvg_indices = list(range(QUERY_N_HVGS)) if self.hvg else None
+            hvg_indices = _hvg_indices(self.path, self.hvg)
             ds = pyscx.TrainingDataset(
                 self.path,
                 batch_size=self.batch_size,
@@ -929,7 +958,7 @@ def _run_scdataloader_epoch(
 def _ttfb_scx(path: str, batch_size: int, hvg: bool, normalize: bool, seed: int) -> None:
     import pyscx
 
-    hvg_indices = list(range(QUERY_N_HVGS)) if hvg else None
+    hvg_indices = _hvg_indices(path, hvg)
     ds = pyscx.TrainingDataset(
         path,
         batch_size=batch_size,
