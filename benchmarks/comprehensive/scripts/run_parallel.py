@@ -1195,11 +1195,24 @@ def main() -> None:
         and len(non_accel_benchmarks) > 0
     )
     if needs_smoke:
-        logger.info("Pre-submit smoke (use --skip-smoke to bypass) …")
+        # Scope the check to the formats this run will actually schedule.
+        # Unscoped it tests every runner whose deps import, so a broken
+        # ADDITIONAL_FORMATS runner blocks a capture that does not schedule it
+        # — which is why every prior full capture passed --skip-smoke, and a
+        # check nobody runs is not a check. `smoke_test_runners` has runners
+        # only for the format keys; accel and multimodal keys match none, so
+        # the intersection can legitimately be empty and that is a skip, not a
+        # failure.
+        smoke_keys = sorted({f.key for f in formats})
+        logger.info(
+            "Pre-submit smoke over %d scheduled format keys "
+            "(use --skip-smoke to bypass) …", len(smoke_keys),
+        )
         import subprocess as _sp
         rc = _sp.call([
             sys.executable, "-m",
             "benchmarks.comprehensive.scripts.smoke_test_runners",
+            "--formats", *smoke_keys,
         ])
         if rc != 0:
             logger.error(

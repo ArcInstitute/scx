@@ -409,11 +409,24 @@ def test_bench_format_compatible_consults_supported_formats():
     assert _bench_format_compatible("cloud_push", "h5ad_gzip") is False
     assert _bench_format_compatible("cloud_push", "zarr_zstd") is False
 
-    # roundtrip accepts the 6 SCX codec variants
+    # roundtrip accepts the SCX codec variants, and only those. This used to
+    # pin the literal six from 2026-05; #323 and #324 added `scx_shufdelta` and
+    # the four per-row-group `scx_compact_trial_g*` variants, and the pin went
+    # stale rather than catching anything — it was red from then until the
+    # release-build guard above stopped masking it. A codec allow-list grows by
+    # design, so what is worth asserting is the plumbing (the orchestrator reads
+    # the module's own declaration, rather than defaulting to "everything") and
+    # the invariant that survives every future codec: roundtrip is an SCX-codec
+    # parity check, so a non-SCX format must never appear in it.
+    from benchmarks.comprehensive.benchmarks import roundtrip as _roundtrip
+
     rt = _bench_supported_formats("roundtrip")
-    assert rt == frozenset({
-        "scx_auto", "scx_none", "scx_scx1", "scx_zstd", "scx_lz4", "scx_pcodec",
-    })
+    assert rt == _roundtrip.SUPPORTED_FORMATS, (
+        "the cohort builder is not reading roundtrip.SUPPORTED_FORMATS"
+    )
+    assert len(rt) >= 6, rt
+    non_scx = sorted(k for k in rt if not k.startswith("scx_"))
+    assert not non_scx, f"roundtrip declared non-SCX formats: {non_scx}"
     assert _bench_format_compatible("roundtrip", "scx_zstd") is True
     assert _bench_format_compatible("roundtrip", "h5ad_gzip") is False
 

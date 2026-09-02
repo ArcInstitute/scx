@@ -467,6 +467,55 @@ def test_the_gpu_partition_is_not_a_hardcoded_literal():
     assert __import__("json").loads(out) == ["preemptible"] * 2, out
 
 
+def test_presubmit_smoke_is_scoped_to_the_scheduled_formats():
+    """The pre-submit runner check must test the runners the run will use.
+
+    Unscoped it tested every runner whose dependencies happened to import, so a
+    capture was blocked by breakage in a format it does not schedule. That is
+    not hypothetical: a tier-full capture (job 2891565) died in 36 s on
+    `bpcells` (`read_subset` -> a BPCells `selection_index` out-of-bounds) and
+    `parquet_zstd` (`convert` -> "Column 1 named indices expected length 2701
+    but got length 2286884"). Both live in `ADDITIONAL_FORMATS`, which a
+    capture only schedules under `--include-additional`; all 11 formats it does
+    use passed. The standing response was `--skip-smoke`, which every prior
+    full capture passed — and a check nobody runs is the same thing as no
+    check, which is the failure mode this whole file exists for.
+
+    `smoke_test_runners` has runners only for the format keys, so accel and
+    multimodal keys match none of them and the intersection can legitimately be
+    empty. An empty intersection after an explicit `--formats` is an error
+    rather than a pass, because the caller believes it asked for coverage it
+    is not getting.
+    """
+    import subprocess
+    import sys
+
+    src = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+           / "run_parallel.py").read_text()
+    assert '"--formats", *smoke_keys,' in src, (
+        "run_parallel invokes smoke_test_runners without scoping it to the "
+        "scheduled formats — a broken runner for an unscheduled format will "
+        "block the capture again"
+    )
+    assert "smoke_keys = sorted({f.key for f in formats})" in src, (
+        "the smoke scope is not derived from the formats actually scheduled"
+    )
+
+    # Behavioural: a --formats set that matches no runner must fail loudly
+    # rather than report a pass over nothing.
+    proc = subprocess.run(
+        [sys.executable, "-m",
+         "benchmarks.comprehensive.scripts.smoke_test_runners",
+         "--formats", "accel_de__pyscx_gpu"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 1, (
+        f"an unmatched --formats set exited {proc.returncode}, not 1:\n"
+        f"{proc.stdout[-2000:]}"
+    )
+    assert "Refusing to report a pass over nothing" in proc.stdout, proc.stdout[-2000:]
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 
