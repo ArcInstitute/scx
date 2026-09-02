@@ -60,6 +60,32 @@ Scenarios
     target — in which case every row short-circuits and a bare ~1.0× would read
     as "the primitive doesn't help".
 
+``collate_rust`` (data-load 1C)
+    ``pyscx.collate_cellset_gathered`` on batches gathered **beforehand** —
+    the STATE3 "3A hybrid" collation: per-cell preprocessing, the top-K encoder
+    crop, drop-to-PAD masking of withheld query genes, the target gather at
+    query positions, and ``library_size``. Timed alone because the kernel is
+    pure compute and releases the GIL, so folding it into a gather loop would
+    report scattered-read time, which every other arm here already measures.
+
+    Two premises the arm asserts rather than assumes. ``enc_mask_positions``
+    is **non-empty** and withholds a non-zero number of positions: the kernel
+    builds its withheld-gene ``HashSet`` (and pays a probe per surviving top-K
+    gene) only when the mask array is non-empty, so the empty "perturbation
+    path" — what the one pre-existing Python call site passes — would skip the
+    allocation the arm exists to price. And ``hide_readout`` is all-zero,
+    because a set bit short-circuits the whole encoder path to a single
+    GENE_MASK token. ``k_enc`` / ``k_dec`` / ``mode`` / the mask fraction are
+    pinned module constants, since the metric is a rate per cell and every one
+    of them scales it.
+
+    The mask premise is measured, not argued. On pbmc3k at the pinned shape
+    (``k_enc=2048``, ``k_dec=1024``, 25% withheld, ten S=64 batches), collating
+    the *same* batches with the mask array replaced by an empty one runs at
+    **78.7 µs/cell against 120.1 µs/cell — 1.53×**. So ~34% of this arm's wall
+    is the withheld-gene set and its per-gene probe, and an empty-mask arm
+    would have been blind to it.
+
 Per-run ``extra`` keys (sparse per-scenario):
     ``cellsets_per_sec__<sc>``  — sets/s (the STATE3-relevant throughput)
     ``cells_per_sec__gather__<sc>`` — cells/s
@@ -68,6 +94,11 @@ Per-run ``extra`` keys (sparse per-scenario):
     ``cache_policy``            — cold_fadvise / warm
     ``shard_cache_hit_rate__<sc>`` — from ``SparseCellSetDataset.cache_metrics()``
         when the counter is present, else ``None``.
+Collate arm additionally:
+    ``us_per_cell__collate``    — microseconds of collate per cell, the
+        allocation-sensitive quantity OPT-LOADER-4 moves
+    ``k_enc`` / ``k_dec`` / ``collate_mode`` / ``enc_mask_fraction`` — the
+        pinned shape, recorded so a capture is self-describing
 Rank arm additionally:
     ``cellsets_per_sec__<sc>`` — **aggregate** across ranks (what the node gets)
     ``cellsets_per_sec_per_rank__<sc>`` — median single-rank rate at N
@@ -586,6 +617,197 @@ def _downsample_supported(scx_path: str, plan: tuple) -> tuple[bool, str | None]
         return True, None
     except Exception as e:  # noqa: BLE001
         return False, f"probe failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# data-load 1C: collate (OPT-LOADER-4)
+# ---------------------------------------------------------------------------
+
+
+def _collate_supported() -> tuple[bool, str | None]:
+    """Whether the installed pyscx exposes the collate kernel at contract v2+.
+
+    Returns ``(ok, reason_if_not)`` and never raises — a raise out of ``run``
+    fails the whole cohort SLURM job, and this is one optional arm. Deliberately
+    cheaper than ``_downsample_supported``: that probe has to gather a real
+    batch to learn whether the fixture is deep enough, whereas this one only
+    needs the symbol and the contract version, so it opens no dataset (and
+    therefore cannot leak one, which the downsample probe does).
+    """
+    try:
+        import pyscx
+
+        if not hasattr(pyscx, "collate_cellset_gathered"):
+            return False, "pyscx build predates the collate kernel"
+        version = getattr(pyscx, "COLLATE_CELLSET_CONTRACT_VERSION", None)
+        if version is None:
+            return False, "pyscx exposes no COLLATE_CELLSET_CONTRACT_VERSION"
+        if int(version) < 2:
+            return False, (
+                f"collate contract v{version} predates the crop/mask semantics "
+                f"this arm measures (needs >= 2)"
+            )
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, f"probe failed: {e}"
+
+
+def _gather_batches(
+    scx_path: str, plans_factory: Callable[[], Iterator[tuple]],
+) -> list[dict]:
+    """Gather batches and hold them, so the collate arm can be timed alone.
+
+    Collate is pure compute on an already-gathered batch. Timing it inside the
+    gather loop would report a number dominated by scattered reads — the very
+    thing every other arm in this module already measures — and a 0.85x floor on
+    that would fire on page-cache weather rather than on the kernel.
+    """
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset([scx_path])
+    try:
+        return list(ds.iter_with_plans(plans_factory()))
+    finally:
+        ds.close()
+
+
+def _collate_inputs(batch: dict, rng: np.random.Generator) -> dict[str, Any]:
+    """Build the four caller-supplied arrays for one gathered batch.
+
+    The kernel is RNG-free by design — the decoder query panel and the per-cell
+    withholding mask are the caller's job — so they are built here, once per
+    batch and outside the timed region.
+
+    The query panel is drawn from **genes the set actually contains**, not
+    uniformly over the vocabulary. With ~61k genes and ~2k non-zeros per cell a
+    uniform panel would essentially never hit, so `masked.contains(gid)` would
+    always miss and no gene would ever be withheld: the arm would still pay the
+    `HashSet` build (which is most of what OPT-LOADER-4 removes) but would never
+    reach the compaction or the all-masked fallback. Drawing from the set's own
+    genes also matches what a gene panel is.
+    """
+    indptr = batch["indptr"]
+    indices = batch["indices"]
+    set_offsets = batch["set_offsets"]
+    n_rows = int(batch["shape"][0])
+    n_genes_total = int(batch["shape"][1])
+    n_sets = len(set_offsets) - 1
+    k_dec = _COLLATE_K_DEC
+
+    query = np.empty(n_sets * k_dec, dtype=np.int32)
+    for s in range(n_sets):
+        lo, hi = int(set_offsets[s]), int(set_offsets[s + 1])
+        present = indices[int(indptr[lo]) : int(indptr[hi])]
+        if present.size:
+            pool = np.unique(present)
+            picked = rng.choice(pool, size=k_dec, replace=pool.size < k_dec)
+        else:
+            # An empty set still needs a well-formed panel; the kernel's target
+            # gather then misses on every position, which is the correct answer.
+            picked = rng.integers(0, max(1, n_genes_total), size=k_dec)
+        query[s * k_dec : (s + 1) * k_dec] = picked.astype(np.int32, copy=False)
+
+    # Non-empty by construction — see _COLLATE_MASK_FRACTION.
+    enc_mask = (
+        rng.random(n_rows * k_dec) < _COLLATE_MASK_FRACTION
+    ).astype(np.uint8)
+
+    return {
+        "query_gene_ids": query,
+        "enc_mask_positions": enc_mask,
+        # All zero: a non-zero `hide_readout` short-circuits the whole encoder
+        # path to a single GENE_MASK token, skipping the sort, the mask and the
+        # crop. One set bit per cell would silently delete the arm's subject.
+        "hide_readout": np.zeros(n_rows, dtype=np.uint8),
+        "n_measured": np.full(n_sets, n_genes_total, dtype=np.uint32),
+        "n_genes_total": n_genes_total,
+        "n_sets": n_sets,
+        "n_rows": n_rows,
+    }
+
+
+def _run_collate(prepared: list[tuple[dict, dict[str, Any]]]) -> _Outcome:
+    """Collate every prepared batch, timing only the kernel calls."""
+    import pyscx
+
+    gc.collect()
+    n_sets = 0
+    n_cells = 0
+    ttfb_s = 0.0
+    with PeakRssSampler() as sampler:
+        t0 = time.perf_counter()
+        for i, (batch, aux) in enumerate(prepared):
+            pyscx.collate_cellset_gathered(
+                batch["indptr"],
+                batch["indices"],
+                batch["data"],
+                batch["set_offsets"],
+                batch["cell_indices"],
+                batch["file_ids"],
+                batch["role_tags"],
+                _COLLATE_K_DEC,
+                aux["query_gene_ids"],
+                aux["enc_mask_positions"],
+                aux["hide_readout"],
+                aux["n_measured"],
+                _COLLATE_K_ENC,
+                _COLLATE_MODE,
+                aux["n_genes_total"],
+            )
+            if i == 0:
+                ttfb_s = time.perf_counter() - t0
+            n_sets += aux["n_sets"]
+            n_cells += aux["n_rows"]
+        wall_s = time.perf_counter() - t0
+    return _Outcome(
+        n_sets=n_sets,
+        n_cells=n_cells,
+        wall_s=wall_s,
+        ttfb_s=ttfb_s,
+        peak_rss_mb=sampler.peak_mb,
+        # No dataset is open during a collate, so there is no cache to report.
+        shard_cache_hit_rate=None,
+    )
+
+
+# Every one of these is PINNED rather than derived, because the metric is a
+# rate per cell and the kernel's cost is a function of all of them: `k_enc`
+# sets the PAD-init loop and the number of mask probes, `k_dec` sets the target
+# gather and the size of the withheld-gene set, the mask fraction decides
+# whether the `HashSet` is built at all. A host-dependent value would make
+# `us_per_cell__collate` incomparable between captures, which is the one thing
+# a 0.85x floor cannot tolerate.
+#
+# The magnitudes follow STATE3's 3A hybrid: a top-K encoder crop of ~2k genes
+# and a decoder query panel of the same order.
+_COLLATE_K_ENC = 2048
+_COLLATE_K_DEC = 1024
+
+# `pass_through` on purpose. It is the only mode that needs no `pflog_alpha`,
+# and it does the least per-element work (`enc_vals[i] = tgt_vals[i] = raw`),
+# which *maximises* the share of wall attributable to the crop / mask / target
+# gather — the part OPT-LOADER-4 changes. A log-taking mode would dilute the
+# signal with transcendentals the fix does not touch.
+_COLLATE_MODE = "pass_through"
+
+# Fraction of each cell's query positions withheld from the encoder crop.
+#
+# This is NOT a tuning knob, it is the arm's premise. `collate_cell` builds its
+# `masked: Option<HashSet<i64>>` — and pays the SipHash probe per surviving
+# top-K gene — only when `enc_mask_positions` is non-empty; an empty array is
+# the perturbation path and takes `None`, skipping the allocation the arm
+# exists to measure. The one pre-existing Python call site
+# (`pyscx/tests/test_fork_safety.py`) passes empty, so copying it would have
+# produced a green arm over the wrong branch.
+_COLLATE_MASK_FRACTION = 0.25
+
+# Batches held resident and collated. At S=64 a batch is ~1024 cells, so ten
+# batches is ~10k cells; at tabula's ~1950 nnz/cell that is ~160 MB of CSR —
+# enough for a stable rate, small enough not to move the pooled peak much.
+_COLLATE_N_BATCHES = 10
+
+# Fixed so two captures collate the same panels and masks.
+_COLLATE_SEED = 20260902
 
 
 def _budget_mb_for(scx_path: str, cache_shards: int) -> int | None:
@@ -1247,6 +1469,129 @@ def run(
                 "speedup": round(speedup, 3),
             }
             logger.info("  downsample: rust vs python-per-cell = %.2f×", speedup)
+
+    # --- data-load 1C: collate throughput (OPT-LOADER-4) -----------------
+    # `pyscx.collate_cellset_gathered` ran in no benchmark and had no floor —
+    # `thresholds.yaml` matched zero lines for "collate" — which is what P0-6
+    # names. The `downsample_rust` arm above is gather+downsample, a different
+    # call.
+    #
+    # Timed on batches gathered *beforehand*: collate is pure compute and
+    # releases the GIL, so folding it into a gather loop would report I/O.
+    co_ok, co_reason = _collate_supported()
+    if not co_ok:
+        logger.info("  collate arm not applicable: %s", co_reason)
+        result.metadata["collate"] = {"applicable": False, "reason": co_reason}
+    else:
+        co_sc = _SCENARIOS[0]  # gather_random @ S=64 — the STATE3 set size
+        co_plans = _plans_for(co_sc)
+        co_arm = "collate_rust"
+        try:
+            co_batches = _gather_batches(
+                scx_path, lambda: co_plans(_COLLATE_N_BATCHES)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error("  collate arm gather failed: %s", e)
+            result.metadata["collate"] = {
+                "applicable": False, "reason": f"gather failed: {e}",
+            }
+            co_batches = []
+        if co_batches:
+            rng = np.random.default_rng(_COLLATE_SEED)
+            prepared = [(b, _collate_inputs(b, rng)) for b in co_batches]
+            masked_positions = int(
+                sum(int(aux["enc_mask_positions"].sum()) for _b, aux in prepared)
+            )
+            # Premise, asserted rather than assumed: an all-zero mask array is
+            # *non-empty* and so still takes the kernel's masking branch, but a
+            # mask that withholds nothing would leave the compaction loop with
+            # nothing to skip. Zero here means the RNG or the fraction changed.
+            if masked_positions == 0:
+                raise RuntimeError(
+                    "collate arm built an all-zero enc_mask_positions "
+                    f"({_COLLATE_MASK_FRACTION=}); the withheld-gene set would "
+                    "be empty and the arm would measure the unmasked path"
+                )
+            try:
+                _run_collate(prepared)  # warm the kernel + allocator
+            except Exception as e:  # noqa: BLE001
+                logger.error("  collate warmup failed: %s", e)
+                result.metadata["collate"] = {
+                    "applicable": False, "reason": f"warmup failed: {e}",
+                }
+                prepared = []
+            co_rates: list[float] = []
+            co_us: list[float] = []
+            for i in range(n_runs if prepared else 0):
+                try:
+                    out = _run_collate(prepared)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(
+                        "  collate run %d/%d failed: %s", i + 1, n_runs, e
+                    )
+                    continue
+                sps = out.n_sets / out.wall_s if out.wall_s > 0 else 0.0
+                us_per_cell = (
+                    out.wall_s * 1e6 / out.n_cells if out.n_cells else 0.0
+                )
+                result.add_run(
+                    wall_s=out.wall_s,
+                    peak_rss_mb=out.peak_rss_mb,
+                    scenario=co_arm,
+                    set_size=co_sc.set_size,
+                    n_sets=out.n_sets,
+                    n_cells=out.n_cells,
+                    # The kernel's cost is a function of all four, so they are
+                    # recorded beside the rate rather than only in the source.
+                    k_enc=_COLLATE_K_ENC,
+                    k_dec=_COLLATE_K_DEC,
+                    collate_mode=_COLLATE_MODE,
+                    enc_mask_fraction=_COLLATE_MASK_FRACTION,
+                    # Page cache is irrelevant here — nothing is read — so the
+                    # arm records what it is rather than borrowing the gather
+                    # arms' cold/warm label.
+                    cache_policy="in_memory",
+                    **{
+                        f"cellsets_per_sec__{co_arm}": round(sps, 1),
+                        "us_per_cell__collate": round(us_per_cell, 3),
+                        f"peak_rss_mb__{co_arm}": round(out.peak_rss_mb, 1),
+                        f"ttfb_first_set_s__{co_arm}": round(out.ttfb_s, 4),
+                    },
+                )
+                co_rates.append(sps)
+                co_us.append(us_per_cell)
+                logger.info(
+                    "    collate: sets/s=%.1f us/cell=%.2f rss=%.1fMB",
+                    sps, us_per_cell, out.peak_rss_mb,
+                )
+            if co_rates:
+                result.metadata["collate"] = {
+                    "applicable": True,
+                    "k_enc": _COLLATE_K_ENC,
+                    "k_dec": _COLLATE_K_DEC,
+                    "mode": _COLLATE_MODE,
+                    "enc_mask_fraction": _COLLATE_MASK_FRACTION,
+                    "n_batches": len(prepared),
+                    "masked_positions": masked_positions,
+                    "median_cellsets_per_sec": round(
+                        statistics.median(co_rates), 1
+                    ),
+                    "median_us_per_cell": round(statistics.median(co_us), 3),
+                }
+                result.metadata.setdefault("scenario_summary", {})[co_arm] = {
+                    "n_runs": len(co_rates),
+                    "set_size": co_sc.set_size,
+                    "median_cellsets_per_sec": round(
+                        statistics.median(co_rates), 1
+                    ),
+                    "median_us_per_cell": round(statistics.median(co_us), 3),
+                }
+        # Both names have to go: `prepared` holds references to the same batch
+        # dicts, so dropping only `co_batches` would leave ~160 MB of CSR
+        # resident through the rank arm and into this triple's pooled peak.
+        co_batches = None
+        prepared = None
+        gc.collect()
 
     # --- P-1(c): N concurrent ranks ---------------------------------------
     # Skipped at N=1: a "4 ranks vs 1 rank" ratio is undefined there, and the

@@ -64,7 +64,6 @@ import contextlib
 import gc
 import logging
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -75,7 +74,6 @@ from typing import Any
 import numpy as np
 
 from benchmarks.comprehensive.config import (
-    PROJECT_ROOT,
     DatasetConfig,
     FormatVariant,
     N_WARMUP_RUNS,
@@ -83,6 +81,7 @@ from benchmarks.comprehensive.config import (
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
 from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
 from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
+from benchmarks.comprehensive.scx_cli import OPTIMIZE_PROBE, resolve_scx_bin
 
 logger = logging.getLogger(__name__)
 
@@ -237,39 +236,6 @@ def _has_cupy() -> bool:
         return False
 
 
-def _resolve_scx_optimize_bin() -> str | None:
-    """Resolve an `scx` binary whose `optimize` supports `--codec scx1`.
-
-    Probes, in order: `$SCX_CLI_BIN`, the repo `target/release/scx`, then a
-    PATH `scx`. Returns the first whose `optimize --help` exits cleanly *and*
-    advertises `--codec` (older binaries lack the subcommand or the flag and
-    are skipped so the self-convert fallback kicks in), else `None`.
-    """
-    candidates = []
-    env_bin = os.environ.get("SCX_CLI_BIN")
-    if env_bin:
-        candidates.append(env_bin)
-    candidates.append(str(PROJECT_ROOT / "target" / "release" / "scx"))
-    which = shutil.which("scx")
-    if which:
-        candidates.append(which)
-
-    for cand in candidates:
-        if not cand or not Path(cand).exists():
-            continue
-        try:
-            proc = subprocess.run(
-                [cand, "optimize", "--help"],
-                capture_output=True,
-                timeout=30,
-            )
-        except Exception:
-            continue
-        if proc.returncode == 0 and b"--codec" in proc.stdout:
-            return cand
-    return None
-
-
 def _prepare_sidecar_scx(
     dataset: DatasetConfig, tmpdir: str, arm: _Arm
 ) -> tuple[Path, int, int]:
@@ -296,7 +262,10 @@ def _prepare_sidecar_scx(
     scx_path = Path(tmpdir) / f"{dataset.name}.scx"
 
     fixture = getattr(dataset, arm.fixture_attr)
-    opt_bin = _resolve_scx_optimize_bin()
+    # `optimize --help` exits 0 on older binaries that lack `--codec`, so the
+    # flag is what has to be probed for; absent it, the self-convert fallback
+    # kicks in.
+    opt_bin = resolve_scx_bin(OPTIMIZE_PROBE, requires=b"--codec")
     if fixture.exists() and opt_bin is not None:
         logger.info(
             "preparing sidecar fixture via `scx optimize --codec %s` (%s) from %s",

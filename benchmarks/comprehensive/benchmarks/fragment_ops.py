@@ -1,13 +1,14 @@
 """
 Fragment / Manifest Operation Throughput benchmark.
 
-Measures wall-clock and throughput for the four SCX fragment/manifest
+Measures wall-clock and throughput for the five SCX fragment/manifest
 mutations exposed by ``scx-ops`` via pyscx:
 
-  * ``append``    — ingest new shards into a base ``.scx``
-  * ``delete``    — deletion-vector construction for cell-index predicates
-  * ``compact``   — full rewrite that reclaims deleted/orphaned bytes
-  * ``rollback``  — revert the active manifest to the prior sequence
+  * ``append``     — ingest new shards into a base ``.scx``
+  * ``delete``     — deletion-vector construction for cell-index predicates
+  * ``compact``    — full rewrite that reclaims deleted/orphaned bytes
+  * ``obs_import`` — key-joined in-place add of one obs column from a CSV
+  * ``rollback``   — revert the active manifest to the prior sequence
 
 plus, when ``<dataset>_full.scx`` has been built by
 ``benchmarks/scripts/prep_full_fixtures.py``:
@@ -21,6 +22,47 @@ plus, when ``<dataset>_full.scx`` has been built by
 This is an SCX-only benchmark. For every non-SCX format variant the module
 returns ``None`` (mirrors ``correctness.py``), so the orchestrator silently
 skips those combinations.
+
+Every op's wall is also emitted as a sparse ``wall_s__<operation>`` key
+---------------------------------------------------------------------
+
+``wall_s`` is a **reserved** ``add_run`` parameter: it lands on the
+``RunRecord`` and never reaches ``runs[].extra``, which is the only place
+``compare_against_baseline`` can read a threshold from. So although this module
+has always *timed* four in-place mutations, none of those timings was gateable —
+only ``median_wall_s``, pooled across every arm, and that number is dominated
+by whichever arm is cheapest.
+
+That matters here more than elsewhere, because four of these five ops
+(``append``, ``delete``, ``obs_import``, ``rollback``) commit through
+``commit_in_place`` → ``finalize_header_with_checksum``, which streams offset
+256 → EOF to recompute ``file_checksum`` regardless of how few bytes changed.
+
+**``wall_s__rollback`` and ``wall_s__delete`` are the clean instruments for
+that**; ``wall_s__obs_import`` is not. Measured, 2 runs each:
+
+    metric              pbmc3k (4.5 MB)   census_1m (2.80 GB)
+    wall_s__rollback             0.0047                 2.247
+    wall_s__delete               0.0067                 1.727
+    wall_s__obs_import           0.0244                19.72
+    wall_s__append               0.0158                25.61
+    wall_s__compact              2.514                 (minutes, ~50 GB read)
+
+A rollback is one 4 KB pwrite, two fsyncs and the rehash, so its census figure
+is 2.80 GB at ~1.25 GB/s — essentially all checksum extent, and stable to
+2 ms across runs. ``delete`` is the same shape at ~1.6 GB/s.
+
+``obs_import`` was *expected* to be the second-cleanest ("one column added,
+whole file rehashed") and measurement says otherwise: ~2.2 s of its 19.72 s is
+the rehash, i.e. **~11%**. `attach_external_obs` **rewrites the obs section**
+and appends it at EOF — 493 MB at census_1m, against a 4 MB score column — and
+that write, plus reading 28 obs columns to join, is the other 89%. It is a
+useful arm (nothing else times a key-joined in-place import) but it is not an
+OPT-FORMAT-1 instrument; use `rollback`.
+
+Redefining the extent to header + catalogs (OPT-FORMAT-1) should collapse
+`rollback` and `delete` to near zero, take ~11% off `obs_import`, and leave
+``wall_s__compact`` — a genuine full rewrite — roughly where it is.
 """
 
 from __future__ import annotations
@@ -50,6 +92,17 @@ guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 
 # Number of random cell indices to mark deleted. Capped by n_obs at runtime.
 _DELETE_N = 10_000
+
+# Names `diagnose_obs_key` may return for the obs index itself, all of which
+# `obs_import(key=…)` accepts. Anything else it suggests is a real obs column
+# and has to be read out of the frame rather than off its index.
+_OBS_INDEX_ALIASES: frozenset[str] = frozenset(
+    {"obs_names", "index", "_index", "__index_level_0__"}
+)
+
+# The CSV's own name for the join column. Paired with `source_key=`, so it is
+# independent of whatever the target side's key turns out to be.
+_OBS_IMPORT_SOURCE_KEY = "join_key"
 
 
 def _gc() -> None:
@@ -117,6 +170,7 @@ def _run_append(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="append",
+            wall_s__append=round(wall, 6),
             rows_inserted=n_rows,
             bytes_appended=input_bytes,
             size_before_bytes=size_before,
@@ -163,6 +217,7 @@ def _run_delete(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="delete",
+            wall_s__delete=round(wall, 6),
             rows_deleted=n_delete,
             size_before_bytes=size_before,
             size_after_bytes=size_after,
@@ -216,6 +271,7 @@ def _run_compact(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="compact",
+            wall_s__compact=round(wall, 6),
             size_before_bytes=size_before,
             size_after_bytes=size_after,
             reclaimed_bytes=reclaimed,
@@ -286,7 +342,8 @@ def _run_compact_full(
             size_before_bytes=size_before,
             size_after_bytes=size_after,
             throughput_mb_s=round(throughput_mb_s, 3),
-            **{"peak_rss_mb__compact_full": round(rss, 1)},
+            peak_rss_mb__compact_full=round(rss, 1),
+            wall_s__compact_full=round(wall, 6),
         )
         input_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
@@ -294,6 +351,192 @@ def _run_compact_full(
             "  compact_full run %d/%d: wall=%.3fs peak_rss=%.1f MB",
             i + 1, n_runs, wall, rss,
         )
+
+
+def _resolve_obs_join_key(base_scx: Path) -> list[str]:
+    """Column(s) that can key an `obs_import` join on *base_scx*.
+
+    A **list**, because a unique key is not always a single column.
+    `diagnose_obs_key` reports `unique_columns` (best-candidate-first) and,
+    when none of them is unique on its own, `unique_pairs` — a two-column
+    composite, which is the normal shape on a merged atlas. Its `suggestion`
+    renders a pair as one comma-joined string, so it cannot be handed to
+    `key=` directly; the structured fields are what to read.
+
+    An earlier version required `unique_columns` to be non-empty and raised
+    otherwise, which rejected every file whose only usable key is a pair — a
+    reviewer reproduced that on a four-row fixture where
+    `unique_pairs == [("sample", "barcode"), …]`.
+    """
+    import pyscx
+
+    diag = pyscx.diagnose_obs_key(str(base_scx))
+    unique = list(diag.get("unique_columns") or [])
+    if unique:
+        return [unique[0]]
+    pairs = list(diag.get("unique_pairs") or [])
+    if pairs:
+        # Each pair is a sequence of column names. `suggestion` renders one as
+        # a comma-joined string, which is why it is not read here — that
+        # rendering cannot be handed to `key=`.
+        return [str(c) for c in pairs[0]]
+    raise RuntimeError(
+        f"{base_scx.name} has no obs column or column pair that can key a "
+        f"join ({diag.get('summary')}). The arm joins by key string, never by "
+        f"row position, so there is nothing to measure here."
+    )
+
+
+def _obs_import_csv(
+    base_scx: Path, csv_path: Path,
+) -> tuple[int, list[str], list[str]]:
+    """Write a one-column annotation CSV keyed on column(s) that can join.
+
+    Returns ``(n_rows, target_key, source_key)``, both keys as lists. Setup
+    only — outside every timed region.
+
+    **The obs index is not always unique, and census_1m is the case in point.**
+    An earlier version hard-coded ``key="obs_names"``; it worked at pbmc3k
+    (2700 distinct barcodes) and failed at census_1m with "target obs key
+    'obs_names' contains duplicates … 100000 distinct values over 1000000
+    rows". The CELLxGENE export duplicates its index 10x; the unique column is
+    ``soma_joinid``. `pyscx.diagnose_obs_key` exists for exactly this — its own
+    docstring names this fixture — so the key is resolved per file rather than
+    assumed, and the arm works on any of them, composite keys included.
+
+    Each key component is written as its own **named** column and paired with
+    an explicit ``source_key``, rather than relying on the two sides resolving
+    the same names. That is what `source_key` is for, and it keeps the CSV's
+    shape independent of whether a resolved component happens to be the obs
+    index.
+    """
+    import numpy as np
+    import pandas as pd
+    import pyscx
+
+    target_key = _resolve_obs_join_key(base_scx)
+
+    exp = pyscx.open(str(base_scx))
+    try:
+        # `read_obs([])` is the matrix-free projection `obs_open.py` uses; the
+        # projected frame keeps its barcode index by design. Measured 5.0 s at
+        # census_1m for the index alone.
+        wanted = [c for c in target_key if c not in _OBS_INDEX_ALIASES]
+        frame_in = exp.read_obs(wanted)
+        columns: dict[str, object] = {}
+        for i, component in enumerate(target_key):
+            source_name = f"{_OBS_IMPORT_SOURCE_KEY}{i}"
+            if component in _OBS_INDEX_ALIASES:
+                columns[source_name] = frame_in.index.to_numpy()
+            else:
+                columns[source_name] = frame_in[component].to_numpy()
+    finally:
+        close = getattr(exp, "close", None)
+        if close is not None:
+            close()
+
+    n_rows = len(next(iter(columns.values())))
+    rng = np.random.default_rng(RANDOM_SEED)
+    columns["synth_score"] = rng.random(n_rows).astype("float32")
+    pd.DataFrame(columns).to_csv(csv_path, index=False)
+    source_key = [f"{_OBS_IMPORT_SOURCE_KEY}{i}" for i in range(len(target_key))]
+    return n_rows, target_key, source_key
+
+
+def _run_obs_import(
+    result: BenchmarkResult,
+    base_scx: Path,
+    workdir: Path,
+    n_runs: int,
+) -> None:
+    """Measure ``pyscx.obs_import`` — a key-joined, in-place obs column add.
+
+    Nothing else in the suite times a key-joined import, which is why the arm
+    exists. It is **not** an OPT-FORMAT-1 instrument, though an earlier version
+    of this docstring said it was ("almost entirely the file checksum"). It is
+    not: `attach_external_obs` leaves X, layers, `var`, the CSC sidecar,
+    `.raw`, deletion vectors and bitmaps alone, but it **rewrites the obs
+    section** and appends it at EOF — 493 MB at census_1m against a 4 MB score
+    column — and `commit_in_place` then rehashes the file. Measured, that
+    rehash is ~2.2 s of a 19.72 s wall, i.e. **~11%**. See the module docstring
+    for the table and `wall_s__rollback` for the clean signal.
+
+    A fresh copy per run is required, not hygiene: the import is in place and
+    `overwrite=False` (the default) refuses a column that already exists, so a
+    second run against the same file would raise rather than re-measure.
+    """
+    import pyscx
+
+    csv_path = workdir / "obs_import_source.csv"
+    n_source_rows, target_key, source_key = _obs_import_csv(base_scx, csv_path)
+    csv_bytes = csv_path.stat().st_size
+
+    for i in range(n_runs):
+        target_path = workdir / f"obs_import_target_{i}.scx"
+        _copy_scx(base_scx, target_path)
+        size_before = target_path.stat().st_size
+
+        # Premise, untimed and checked before the measurement is recorded: a
+        # join that matched nothing still writes an all-null column and still
+        # pays the same whole-file rehash, so the wall would look exactly right
+        # while measuring an import of nothing. `dry_run=True` reports the join
+        # without writing.
+        preview = pyscx.obs_import(
+            str(target_path), str(csv_path),
+            key=target_key, source_key=source_key, dry_run=True,
+        )
+        n_matched = int(preview.get("n_matched", -1))
+        if n_matched != n_source_rows:
+            raise RuntimeError(
+                f"obs_import dry-run matched {n_matched} of {n_source_rows} "
+                f"source rows on {target_path.name} "
+                f"(key={target_key!r} <- {source_key!r}). The timed import "
+                f"would rehash the whole file either way, so refusing to "
+                f"record a wall for a join that did not land."
+            )
+
+        wall, rss = _time_op(
+            pyscx.obs_import, str(target_path), str(csv_path),
+            key=target_key, source_key=source_key,
+        )
+
+        size_after = target_path.stat().st_size
+        rows_per_sec = n_source_rows / wall if wall > 0 else 0.0
+
+        result.add_run(
+            wall_s=wall,
+            peak_rss_mb=rss,
+            operation="obs_import",
+            wall_s__obs_import=round(wall, 6),
+            peak_rss_mb__obs_import=round(rss, 1),
+            rows_imported=n_source_rows,
+            n_matched=n_matched,
+            obs_join_key=",".join(target_key),
+            # Whether the obs rewrite streamed shard-by-shard or assembled the
+            # whole table. Not inferable from the output file, and it decides
+            # whether this arm's peak scales with the target: a legacy
+            # single-section `ObsMetadata` target has no per-shard reader, so
+            # the whole obs table is materialised (the op warns and names
+            # `scx optimize`).
+            obs_streamed=bool(preview.get("obs_streamed", False)),
+            source_csv_bytes=csv_bytes,
+            size_before_bytes=size_before,
+            size_after_bytes=size_after,
+            # The dominant term in this arm's wall, and much larger than the
+            # one column added: `attach_external_obs` rewrites the obs section
+            # and appends it at EOF, so the delta is a whole obs table.
+            # Measured 493 MB at census_1m (28 columns, 1M rows, wide
+            # categoricals) against a 4 MB score column.
+            obs_rewrite_bytes=size_after - size_before,
+            rows_per_sec=round(rows_per_sec, 1),
+        )
+        target_path.unlink(missing_ok=True)
+        logger.info(
+            "  obs_import run %d/%d: wall=%.3fs rows/s=%.0f (+%d bytes)",
+            i + 1, n_runs, wall, rows_per_sec, size_after - size_before,
+        )
+
+    csv_path.unlink(missing_ok=True)
 
 
 def _run_rollback(
@@ -323,6 +566,11 @@ def _run_rollback(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="rollback",
+            # The sharpest OPT-FORMAT-1 signal in the suite: `rollback` is one
+            # 4 KB pwrite plus `finalize_header_with_checksum`, which streams
+            # offset 256 -> EOF. Almost all of this wall is the whole-file
+            # BLAKE3 rehash, so an O(catalog) checksum extent would collapse it.
+            wall_s__rollback=round(wall, 6),
             size_before_bytes=size_before,
             size_after_bytes=size_after,
         )
@@ -364,7 +612,9 @@ def run(
         metadata={
             "n_runs_per_op": n_runs,
             "n_delete_indices": min(_DELETE_N, max(1, n_rows // 2)),
-            "operations": ["append", "delete", "compact", "rollback"],
+            "operations": [
+                "append", "delete", "compact", "obs_import", "rollback",
+            ],
         },
     )
 
@@ -404,6 +654,9 @@ def run(
         if full_scx is not None:
             logger.info("compact_full: %s", dataset.name)
             _run_compact_full(result, full_scx, workdir, n_runs)
+
+        logger.info("obs_import: %s", dataset.name)
+        _run_obs_import(result, converted_path, workdir, n_runs)
 
         logger.info("rollback: %s", dataset.name)
         _run_rollback(result, converted_path, workdir, n_runs, n_rows)

@@ -24,6 +24,46 @@ gate. Example file::
 present and in the past relative to ``date.today()`` the justification is
 treated as inactive and its triples are NOT suppressed.
 
+**Metric scope.** By default a justification suppresses *every* metric on each
+triple it names — regressions and absolute-floor violations alike. That is the
+right default for a triple that is wholly known-bad (an OOMing suite, a
+workers2 path that collapses both throughput floor and timing), but it is the
+wrong one for the commonest case in practice: a *composition* change that moves
+only the pooled summary metrics (``peak_rss_mb_median`` / ``median_wall_s``)
+because an arm was added to an existing benchmark. Left unscoped, such a file
+silently disarms every floor on the triple, including one added in the same
+commit — two of them did exactly that.
+
+So a justification may name the metrics it explains, and then it suppresses
+only those::
+
+    ---
+    metrics: [peak_rss_mb_median, median_wall_s]
+    triples:
+      - benchmark: cellset_gather
+        format: scx_auto
+        dataset: census_1m
+      - benchmark: index_plan
+        format: scx_auto
+        dataset: tabula_sapiens_100k
+        metric: batches_per_sec__pyscx_index_plan_dataset_workers2
+    ---
+
+Two spellings, because both were already being written before either was read:
+a file-level ``metrics:`` list, and a per-entry ``metric:`` naming one metric
+for that triple alone. **Both keys are accepted at both levels** — a
+``metrics:`` inside a triple entry and a ``metric:`` at the top level work too.
+Rejecting one spelling per level would reintroduce the failure this field
+exists to end: a scope that is silently ignored falls open to whole-triple
+suppression, and that is exactly how 16 floors became unenforceable. A triple's effective scope is the union of the two, and a
+triple named *without* either keeps the whole-triple default — but a key
+written with *nothing after it* is an error rather than a synonym for omitting
+it, since a bare ``metrics:`` parsing as "every metric" would silently restore
+whole-triple suppression on a file whose author was visibly trying to scope it.
+Where two files
+name the same triple, the scopes union, and an unscoped file wins (the widest
+claim holds).
+
 Uses ``yaml.safe_load`` for the front-matter so the full YAML syntax
 (quoted values, multi-line strings, typed dates) is supported. PyYAML is
 already a hard dep of the regression gate via
@@ -50,6 +90,14 @@ logger = logging.getLogger(__name__)
 
 Triple = tuple[str, str, str]  # (benchmark, format, dataset)
 
+#: Which metrics a suppression covers on one triple. ``None`` means *every*
+#: metric — the historical, and still default, behaviour.
+MetricScope = frozenset[str] | None
+
+#: Triple -> metric scope. Returned by :func:`load_active_triples`; a caller
+#: asks :func:`suppresses` rather than reading it directly.
+SuppressionMap = dict[Triple, MetricScope]
+
 
 @dataclass
 class Justification:
@@ -59,6 +107,14 @@ class Justification:
     reason: str = ""
     expires: _dt.date | None = None
     prose: str = ""
+    #: Per-triple metric scope. A triple absent from this map (or mapped to
+    #: ``None``) suppresses every metric on that triple. Populated from the
+    #: file-level ``metrics:`` list and any per-entry ``metric:``.
+    metric_scopes: dict[Triple, MetricScope] = field(default_factory=dict)
+
+    def scope_for(self, triple: Triple) -> MetricScope:
+        """Metrics this file suppresses on *triple* (``None`` = all of them)."""
+        return self.metric_scopes.get(triple)
 
     def is_active(self, today: _dt.date | None = None) -> bool:
         """Return True if this justification is still in-date.
@@ -92,6 +148,109 @@ def _coerce_date(value: Any) -> _dt.date | None:
             return None
         return _dt.date.fromisoformat(v)
     raise ValueError(f"unsupported type for 'expires': {type(value).__name__}")
+
+
+#: Distinguishes "the key was not there" from "the key was there and null".
+#: Returning ``None`` for both is what made a bare `metrics:` parse exactly
+#: like omitting `metrics` — i.e. fall open to whole-triple suppression, the
+#: bug this whole field exists to close.
+_ABSENT = object()
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    """First of *keys* present in *mapping*, else :data:`_ABSENT`.
+
+    Lets `metric:` and `metrics:` be accepted at both the file and entry level
+    without either spelling being the one that silently does nothing — and
+    keeps a *present* key with a null value distinguishable from an absent
+    one, because those two must not mean the same thing.
+    """
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return _ABSENT
+
+
+def _coerce_metrics(path: Path, value: Any) -> MetricScope:
+    """Normalize a ``metrics:`` / ``metric:`` field into a scope or ``None``.
+
+    An **absent** key (:data:`_ABSENT`) means "every metric" — see the module
+    docstring. A key that is *present but null* is an error, not a synonym for
+    absent. A single string is accepted for the singular ``metric:`` spelling
+    that committed files already use.
+
+    An *empty* list is rejected rather than read as either extreme: it would
+    suppress nothing at all while looking exactly like a scoped suppression,
+    and that is the failure mode this whole field exists to end.
+    """
+    if value is _ABSENT:
+        return None
+    if value is None:
+        # `metrics:` with nothing after it. Rejected rather than read as
+        # either extreme: as "every metric" it silently restores whole-triple
+        # suppression on a file whose author was plainly trying to scope it,
+        # and as "no metrics" it would suppress nothing while looking scoped.
+        raise ValueError(
+            f"{path}: 'metric'/'metrics' is present but null. Omit the key "
+            f"entirely to suppress every metric on the triple, or name the "
+            f"ones this file explains."
+        )
+    if isinstance(value, str):
+        names = [value]
+    elif isinstance(value, (list, tuple)):
+        names = list(value)
+    else:
+        raise ValueError(
+            f"{path}: 'metric'/'metrics' must be a string or a list of "
+            f"strings, got {type(value).__name__}"
+        )
+    cleaned = [str(n).strip() for n in names]
+    if any(not n for n in cleaned):
+        raise ValueError(f"{path}: 'metric'/'metrics' contains a blank name")
+    if not cleaned:
+        raise ValueError(
+            f"{path}: 'metric'/'metrics' is empty — omit the key to suppress "
+            f"every metric on the triple, or name the ones this file explains"
+        )
+    return frozenset(cleaned)
+
+
+def _entry_scope(file_metrics: MetricScope, entry_metrics: MetricScope) -> MetricScope:
+    """Combine the file-level scope with one entry's own ``metric:``.
+
+    Neither given ⇒ ``None`` (whole triple). Otherwise the union, treating an
+    absent half as empty: a file-level list applies to every entry, and a
+    per-entry ``metric:`` adds to it rather than replacing it.
+    """
+    if file_metrics is None and entry_metrics is None:
+        return None
+    return (file_metrics or frozenset()) | (entry_metrics or frozenset())
+
+
+def _widen(a: MetricScope, b: MetricScope) -> MetricScope:
+    """Merge two scopes for the same triple; the *widest* claim wins.
+
+    ``None`` is the widest scope there is, so it absorbs any named set. Used
+    both for a triple listed twice in one file and for the same triple named by
+    two files.
+    """
+    if a is None or b is None:
+        return None
+    return a | b
+
+
+def suppresses(suppression: SuppressionMap, triple: Triple, metric: str) -> bool:
+    """Is *metric* on *triple* suppressed by this map?
+
+    One predicate for both gate surfaces (relative regressions and absolute
+    floors), so the exit code and the report can never disagree about what was
+    suppressed — they disagreed once, and the fix was to give them a single
+    function to ask.
+    """
+    if triple not in suppression:
+        return False
+    scope = suppression[triple]
+    return scope is None or metric in scope
 
 
 def _parse_front_matter(block: str) -> dict[str, Any]:
@@ -131,7 +290,18 @@ def parse_justification(path: Path) -> Justification | None:
     except ValueError as exc:
         raise ValueError(f"{path}: {exc}") from exc
 
+    # Both spellings, at both levels. The singular reads better on one entry and
+    # the plural on a file, but accepting only one of each is how this field
+    # came to be silently ignored in the first place: four committed files
+    # wrote a per-entry `metric:` that the parser dropped, and 16 absolute
+    # floors went unenforceable behind it. A misspelled scope must not fail
+    # open into whole-triple suppression.
+    file_metrics = _coerce_metrics(
+        path, _first_present(data, "metrics", "metric")
+    )
+
     triples: list[Triple] = []
+    scopes: dict[Triple, MetricScope] = {}
     raw_triples = data.get("triples") or []
     if not isinstance(raw_triples, list):
         raise ValueError(f"{path}: 'triples' must be a list")
@@ -145,9 +315,21 @@ def parse_justification(path: Path) -> Justification | None:
             raise ValueError(
                 f"{path}: triple entry missing keys {missing}: {entry!r}"
             )
-        triples.append(
-            (str(entry["benchmark"]), str(entry["format"]), str(entry["dataset"]))
+        triple = (
+            str(entry["benchmark"]), str(entry["format"]), str(entry["dataset"])
         )
+        triples.append(triple)
+        # A per-entry `metric:` narrows this triple alone; the file-level
+        # `metrics:` applies to every triple. Both were already being written
+        # by committed files before either was honoured, so both are read, and
+        # a triple named twice gets the union.
+        entry_metrics = _coerce_metrics(
+            path, _first_present(entry, "metric", "metrics")
+        )
+        scope = _entry_scope(file_metrics, entry_metrics)
+        if triple in scopes:
+            scope = _widen(scopes[triple], scope)
+        scopes[triple] = scope
 
     try:
         expires = _coerce_date(data.get("expires"))
@@ -164,22 +346,30 @@ def parse_justification(path: Path) -> Justification | None:
         reason=str(reason).strip(),
         expires=expires,
         prose=prose.strip(),
+        metric_scopes=scopes,
     )
 
 
 def load_active_triples(
     directory: Path, today: _dt.date | None = None,
-) -> tuple[set[Triple], list[Justification]]:
-    """Walk ``directory`` and return the union of all active suppressed triples.
+) -> tuple[SuppressionMap, list[Justification]]:
+    """Walk ``directory`` and return the merged active suppressions.
 
     Non-markdown files are ignored. Markdown files without front-matter are
-    ignored (so a README can live alongside). Returns the set of triples
-    plus the list of parsed justifications for reporting.
+    ignored (so a README can live alongside). Returns a
+    ``{triple: metric scope}`` map plus the list of parsed justifications for
+    reporting. Ask :func:`suppresses` rather than testing membership: a triple
+    present in the map may be suppressed for only some of its metrics.
+
+    Where two active files name the same triple the scopes are merged by
+    :func:`_widen`, so an unscoped file's whole-triple claim survives a scoped
+    one — the merge can only ever suppress more, never less, than either file
+    asked for on its own.
     """
     if not directory.is_dir():
-        return set(), []
+        return {}, []
 
-    active: set[Triple] = set()
+    active: SuppressionMap = {}
     all_parsed: list[Justification] = []
     for md in sorted(directory.glob("*.md")):
         try:
@@ -191,7 +381,11 @@ def load_active_triples(
             continue
         all_parsed.append(j)
         if j.is_active(today):
-            active.update(j.triples)
+            for triple in j.triples:
+                scope = j.scope_for(triple)
+                active[triple] = (
+                    _widen(active[triple], scope) if triple in active else scope
+                )
         else:
             logger.info(
                 "Justification %s expired on %s; no longer suppresses %d triple(s)",

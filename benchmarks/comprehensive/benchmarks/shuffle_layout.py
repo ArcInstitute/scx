@@ -57,8 +57,6 @@ import gc
 import json
 import logging
 import math
-import os
-import shutil
 import statistics
 import subprocess
 import tempfile
@@ -69,12 +67,12 @@ import numpy as np
 
 from benchmarks.comprehensive.cache_control import drop_file_cache
 from benchmarks.comprehensive.config import (
-    PROJECT_ROOT,
     DatasetConfig,
     FormatVariant,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.rss import PeakRssSampler, current_rss_mb
+from benchmarks.comprehensive.scx_cli import INFO_JSON_PROBE, resolve_scx_bin
 
 logger = logging.getLogger(__name__)
 
@@ -121,32 +119,6 @@ _SGS8_TRIALS = 200
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
-
-
-def _resolve_scx_bin() -> str | None:
-    """An `scx` binary whose `info --json` works, or `None`.
-
-    Probes `$SCX_CLI_BIN`, the repo `target/release/scx`, then PATH — the same
-    order `accel_to_gpu_anndata._resolve_scx_optimize_bin` uses. Only the
-    *X-section* size metric needs it; whole-file sizes come from `stat()`, so an
-    absent CLI narrows this arm rather than skipping it.
-    """
-    candidates = [os.environ.get("SCX_CLI_BIN"), str(PROJECT_ROOT / "target" / "release" / "scx")]
-    which = shutil.which("scx")
-    if which:
-        candidates.append(which)
-    for cand in candidates:
-        if not cand or not Path(cand).exists():
-            continue
-        try:
-            proc = subprocess.run(
-                [cand, "info", "--json", "--help"], capture_output=True, timeout=30
-            )
-        except Exception:
-            continue
-        if proc.returncode == 0:
-            return cand
-    return None
 
 
 def _geometry(scx_bin: str | None, path: Path) -> dict[str, int | str | None]:
@@ -686,7 +658,10 @@ def run(
     )
     result.file_size_bytes = src.stat().st_size
 
-    scx_bin = _resolve_scx_bin()
+    # `info --json` is what the X-section size metric needs; whole-file sizes
+    # come from `stat()`, so an absent CLI narrows this arm rather than
+    # skipping it.
+    scx_bin = resolve_scx_bin(INFO_JSON_PROBE)
     src_geometry = _geometry(scx_bin, src)
     result.metadata["source_geometry"] = dict(src_geometry)
     workroot = tempfile.TemporaryDirectory(prefix=f"shuffle_layout_{dataset.name}_")

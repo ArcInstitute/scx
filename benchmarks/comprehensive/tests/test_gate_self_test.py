@@ -224,14 +224,18 @@ def test_absolute_floor_suppressed_by_justification(tmp_path: Path) -> None:
     """A justification on (benchmark, format, dataset) suppresses both
     regression and absolute-floor violations on that triple.
 
-    Without this, the existing ``index_plan_workers2_v2_catalog.md``
-    justification's metric-specific entries silently fail to suppress
-    the floor violations they were intended to cover (Triple parser
-    drops the ``metric`` field; the gate filters regressions by
-    (benchmark, format, dataset) but used to leave floors alone).
-    The fix: filter both surfaces by the same suppression set; mark
-    suppressed floors in the markdown report rather than dropping them
-    silently.
+    Originally: the gate filtered regressions by (benchmark, format, dataset)
+    but left floors alone, so ``index_plan_workers2_v2_catalog.md``'s entries
+    did not suppress the floor violations they were written for. The fix was to
+    filter both surfaces by the same suppression set and mark suppressed floors
+    in the markdown report rather than dropping them silently.
+
+    That fix reached for the widest reading available at the time — the
+    per-entry ``metric:`` field those files carried was being parsed away, so
+    whole-triple was the only option. It is now the *default* rather than the
+    only behaviour (``metrics:`` / ``metric:`` narrow it), and this test pins
+    the default: silence still means every metric. The scoped half is
+    ``test_metric_scoped_justification_*`` below.
     """
     base = tmp_path / "baseline"
     cur = tmp_path / "current"
@@ -1034,3 +1038,147 @@ def test_load_summary_back_compat_missing_schema(tmp_path: Path) -> None:
     _write_summary_with_version(tmp_path, None)
     data = mod._load_summary(tmp_path)
     assert "schema_version" not in data
+
+
+# ---------------------------------------------------------------------------
+# Metric-scoped suppression
+# ---------------------------------------------------------------------------
+
+_POOLED_ONLY_JUSTIFICATION = (
+    "---\n"
+    "metrics: [peak_rss_mb_median, median_wall_s]\n"
+    "triples:\n"
+    "  - benchmark: cloud_push\n"
+    "    format: scx_auto\n"
+    "    dataset: pbmc3k\n"
+    "reason: A new arm shifted the pooled medians; not a regression.\n"
+    "---\n"
+)
+
+
+def _floor_case(tmp_path: Path, justification: str | None) -> subprocess.CompletedProcess:
+    """One triple, one failing `throughput_mbps` floor, no relative change.
+
+    Isolates the question this pair of tests asks: does a justification whose
+    subject is a *pooled* metric switch off an unrelated absolute floor on the
+    same triple?
+    """
+    base = tmp_path / "baseline"
+    cur = tmp_path / "current"
+    thresh = tmp_path / "thresholds.yaml"
+    just = tmp_path / "justifications"
+    rows = {"cloud_push__scx_auto__pbmc3k": _row(1.0)}
+    _write_summary(base, rows)
+    _write_summary(cur, rows)
+    raw_dir = cur / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "cloud_push__scx_auto__pbmc3k.json").write_text(json.dumps({
+        "benchmark": "cloud_push",
+        "format": "scx_auto",
+        "dataset": "pbmc3k",
+        "runs": [{"wall_s": 1.0, "extra": {"throughput_mbps": 12.3}}],
+    }))
+    thresh.write_text(
+        "absolute_floors:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    metric: throughput_mbps\n"
+        "    min: 50.0\n"
+    )
+    just.mkdir()
+    if justification is not None:
+        (just / "issue.md").write_text(justification)
+    return _run_gate(
+        "--thresholds", str(thresh),
+        "--justifications", str(just),
+        baseline=base, current=cur,
+    )
+
+
+def test_metric_scoped_justification_does_not_suppress_another_metric(
+    tmp_path: Path,
+) -> None:
+    """A `metrics:`-scoped justification leaves every other metric gated.
+
+    This is the half that was missing, and its absence was not theoretical:
+    two committed pooled-median justifications disarmed 16 absolute floors
+    between them, one of which was added in the same commit as its own
+    justification. The gate reported "Absolute-floor violations: 0 (1
+    justification-suppressed)" and exited 0.
+
+    Here the justification names only `peak_rss_mb_median` / `median_wall_s`;
+    the floor is on `throughput_mbps`, so it must still fail the gate.
+    """
+    result = _floor_case(tmp_path, _POOLED_ONLY_JUSTIFICATION)
+    assert result.returncode != 0, (
+        f"a justification scoped to the pooled medians must NOT suppress a "
+        f"floor on throughput_mbps; stdout={result.stdout!r}"
+    )
+    assert "Absolute-floor violations: 1" in result.stdout, (
+        f"the violation must be counted as active, not suppressed; "
+        f"stdout={result.stdout!r}"
+    )
+    # The triple is still reported as carrying a suppression, and says so is
+    # a narrow one — otherwise an operator reading the summary cannot tell
+    # this case from "no justification at all".
+    assert "metric-scoped" in result.stdout, (
+        f"summary must distinguish a scoped suppression from a whole-triple "
+        f"one; stdout={result.stdout!r}"
+    )
+
+
+def test_metric_scoped_justification_suppresses_the_metric_it_names(
+    tmp_path: Path,
+) -> None:
+    """…and the named metric really is suppressed — the accept side.
+
+    Without this, the test above could be satisfied by a scope that suppresses
+    nothing at all, which is the same bug in the other direction.
+    """
+    scoped_to_the_floor = (
+        "---\n"
+        "triples:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "    metric: throughput_mbps\n"
+        "reason: Network-variable on the shared bucket.\n"
+        "---\n"
+    )
+    result = _floor_case(tmp_path, scoped_to_the_floor)
+    assert result.returncode == 0, (
+        f"a justification naming throughput_mbps must suppress that floor; "
+        f"stdout={result.stdout!r}"
+    )
+    assert "Absolute-floor violations: 0 (1 justification-suppressed)" in result.stdout, (
+        f"stdout={result.stdout!r}"
+    )
+
+
+def test_unscoped_justification_still_suppresses_every_metric(tmp_path: Path) -> None:
+    """The default did not change: no `metrics:` still means the whole triple.
+
+    Four committed files rely on it (an OOMing correctness suite, a cuGraph
+    divergence, a borderline HVG tie-break, a contention-variable cloud push),
+    and the per-entry `metric:` fields that now work were previously being
+    dropped — so widening was the *status quo*, not an accident to reverse.
+    """
+    unscoped = (
+        "---\n"
+        "triples:\n"
+        "  - benchmark: cloud_push\n"
+        "    format: scx_auto\n"
+        "    dataset: pbmc3k\n"
+        "reason: The whole triple is known-bad.\n"
+        "---\n"
+    )
+    result = _floor_case(tmp_path, unscoped)
+    assert result.returncode == 0, (
+        f"an unscoped justification must still suppress the floor; "
+        f"stdout={result.stdout!r}"
+    )
+    assert "metric-scoped" not in result.stdout, (
+        f"an unscoped suppression must not be reported as scoped; "
+        f"stdout={result.stdout!r}"
+    )

@@ -1289,3 +1289,946 @@ def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, m
     fmt = FormatVariant("SCX (auto)", "scx_auto", "primary", "scx_runner", {})
     with pytest.raises(ValueError, match=r"thread-scaling|THREAD_COUNTS"):
         m.run(dataset=big, format_variant=fmt, n_runs=1)
+
+
+# ---------------------------------------------------------------------------
+# The second way a floor becomes unreachable: a justification over it
+# ---------------------------------------------------------------------------
+
+#: `(benchmark, format, dataset)` triples where an unscoped, whole-triple
+#: suppression is the deliberate answer, with the reason. Everything else must
+#: either scope its justification with `metrics:` or drop the floor.
+#:
+#: Kept as data with a reason per entry rather than as a bare skip list: the
+#: point of the guard is that suppressing a floor is a decision someone made
+#: on purpose, so each one is written down.
+_DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS: dict[tuple[str, str, str], str] = {
+    ("accel_leiden", "accel_leiden__pyscx_gpu", "pbmc3k"): (
+        "cuGraph Leiden diverges from leidenalg on real graphs — documented in "
+        "CLAUDE.md's Known Limitations. Both the ARI floor and the timing row "
+        "are downstream of the same divergence, so the whole triple is the unit."
+    ),
+    ("accel_hvg", "accel_hvg__pyscx_cpu", "pbmc3k"): (
+        "hvg_overlap_vs_scanpy is a deterministic 0.9891 against a 0.99 floor on "
+        "the 2700-cell fixture — a borderline tie-break miss, and the only floor "
+        "on the triple, so scoping would change nothing."
+    ),
+    ("cloud_push", "scx_auto", "tabula_sapiens_100k"): (
+        "throughput_mbps to the shared GCS bucket is network- and "
+        "contention-dependent; the floor and the timing row move together with "
+        "cluster load."
+    ),
+}
+
+
+def _active_suppressions():
+    """The committed justifications, as the gate loads them."""
+    import sys
+
+    scripts = PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import _justifications  # noqa: PLC0415
+
+    just_dir = (
+        PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "justifications"
+    )
+    suppression, parsed = _justifications.load_active_triples(just_dir)
+    return suppression, parsed, _justifications
+
+
+def test_no_floor_is_fully_suppressed_by_an_active_justification():
+    """A justification must not silently disarm a floor it says nothing about.
+
+    Suppression covers both gate surfaces — relative regressions and absolute
+    floors — on the same `(benchmark, format, dataset)`. That is right for a
+    triple that is wholly known-bad, and wrong for the commonest real case: a
+    *composition* change. `capture_baseline.archive_raw_results` writes one
+    `peak_rss_mb_median` and one `median_wall_s` per triple, pooled across
+    every run in the file, so adding an arm to an existing benchmark shifts
+    both by construction and needs a justification — which, unscoped, then
+    switches off every floor on that triple.
+
+    Both committed pooled-median justifications were in that state:
+
+      * `fragment_ops_compact_full_arm_raises_pooled_medians.md` suppressed the
+        `peak_rss_mb__compact_full max: 4096` ceiling **added in the same
+        commit**. The file's own closing note warned about the hazard without
+        noticing the condition was already true.
+      * `cellset_gather_s512_raises_pooled_rss.md` suppressed all 15
+        `cellset_gather` floors, which `thresholds.yaml`'s Deferred item 7
+        calls "NOW ACTIVE … all live".
+
+    16 floors, reading as coverage and providing none — the same shape as
+    `test_no_floor_keys_off_a_reserved_add_run_parameter` above, and just as
+    invisible: the gate prints "Absolute-floor violations: 0 (N
+    justification-suppressed)" and exits 0.
+
+    The fix is a `metrics:` (or per-entry `metric:`) scope naming what the file
+    actually explains, never deleting the floor.
+    """
+    suppression, parsed, _justifications = _active_suppressions()
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+
+    by_file: dict[tuple[str, str, str], list[str]] = {}
+    for j in parsed:
+        if not j.is_active():
+            continue
+        for triple in j.triples:
+            by_file.setdefault(triple, []).append(j.path.name)
+
+    offenders: list[str] = []
+    for f in raw.get("absolute_floors") or []:
+        triple = (f["benchmark"], f["format"], f["dataset"])
+        if triple in _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS:
+            continue
+        # A `None` scope is "every metric on this triple" — precisely the
+        # state this test rejects. A triple with a named scope is fine here
+        # even when the scope happens to cover some other metric.
+        if triple in suppression and suppression[triple] is None:
+            offenders.append(
+                f"{f['benchmark']}/{f['format']}/{f['dataset']}:{f['metric']} "
+                f"(suppressed by {', '.join(sorted(set(by_file.get(triple, ['?']))))})"
+            )
+
+    assert not offenders, (
+        f"these floors sit under a whole-triple justification and can never "
+        f"fire: {sorted(offenders)}. Add a `metrics:` list (or a per-entry "
+        f"`metric:`) to the justification naming only what it explains — a "
+        f"pooled-median justification should say "
+        f"`metrics: [peak_rss_mb_median, median_wall_s]`. If the whole triple "
+        f"really is known-bad, add it to "
+        f"_DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS with the reason."
+    )
+
+
+def test_deliberate_suppression_allowlist_has_no_stale_entries():
+    """The allowlist above is an exception list, so it must stay honest.
+
+    An entry that no longer corresponds to an active justification *and* a
+    floor is dead weight that would silently excuse a future regression on that
+    triple. Checked because the alternative — an allowlist nobody prunes — is
+    how the exception list becomes the policy.
+    """
+    suppression, _parsed, _justifications = _active_suppressions()
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+    floored = {
+        (f["benchmark"], f["format"], f["dataset"])
+        for f in (raw.get("absolute_floors") or [])
+    }
+
+    stale = [
+        f"{t} ({reason.split('.')[0][:60]}…)"
+        for t, reason in _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS.items()
+        if t not in floored or suppression.get(t, "absent") is not None
+    ]
+    assert not stale, (
+        f"these allowlist entries no longer describe a whole-triple "
+        f"suppression over a live floor: {stale}. Remove them — an exception "
+        f"nobody needs is an exception nobody rechecks."
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-02c: the five new arms, each with the premise that makes it mean something
+# ---------------------------------------------------------------------------
+
+
+def test_collate_arm_builds_a_mask_that_actually_withholds():
+    """An empty — or all-zero — `enc_mask_positions` measures the wrong branch.
+
+    `collate_cell` builds its withheld-gene `HashSet<i64>` (and pays a probe
+    per surviving top-K gene) **only** when the mask array is non-empty. An
+    empty array is the perturbation path and takes `None`, skipping the
+    allocation OPT-LOADER-4 removes — measured on pbmc3k as 78.7 µs/cell
+    against 120.1, so ~34% of the arm's subject. And an all-zero array is
+    non-empty but withholds nothing, so the compaction loop has nothing to
+    skip.
+
+    Driven on a hand-built batch rather than grepped: an earlier version
+    asserted the literals `"masked_positions == 0"` and
+    `"np.zeros(n_rows, dtype=np.uint8)"` appeared in the source, which pins the
+    spelling of the implementation instead of what it produces.
+    """
+    import pytest as _pytest
+
+    np = _pytest.importorskip("numpy")
+    from benchmarks.comprehensive.benchmarks import cellset_gather
+
+    # Two sets of three rows, five genes each — the shape `iter_with_plans`
+    # yields, with the keys `collate_cellset_gathered` consumes.
+    n_rows, n_genes, nnz_per_row = 6, 5, 5
+    batch = {
+        "indptr": np.arange(0, n_rows * nnz_per_row + 1, nnz_per_row, dtype=np.int64),
+        "indices": np.tile(np.arange(n_genes, dtype=np.int32), n_rows),
+        "data": np.ones(n_rows * nnz_per_row, dtype=np.float32),
+        "set_offsets": np.array([0, 3, 6], dtype=np.int64),
+        "cell_indices": np.arange(n_rows, dtype=np.uint64),
+        "file_ids": np.zeros(n_rows, dtype=np.uint32),
+        "role_tags": np.zeros(n_rows, dtype=np.int32),
+        "shape": (n_rows, n_genes),
+    }
+    aux = cellset_gather._collate_inputs(
+        batch, np.random.default_rng(cellset_gather._COLLATE_SEED)
+    )
+
+    k_dec = cellset_gather._COLLATE_K_DEC
+    mask = aux["enc_mask_positions"]
+    assert mask.size == n_rows * k_dec, (
+        f"the mask must be n_rows * k_dec ({n_rows * k_dec}), got {mask.size}; "
+        f"an empty array takes the kernel's None branch"
+    )
+    assert mask.dtype == np.uint8
+    assert int(mask.sum()) > 0, (
+        "the mask withholds nothing, so the withheld-gene set is empty and the "
+        "compaction loop has nothing to skip"
+    )
+
+    # `hide_readout` all-zero: a set bit short-circuits the whole encoder path
+    # to a single GENE_MASK token, deleting the sort, mask and crop.
+    assert aux["hide_readout"].shape == (n_rows,)
+    assert int(aux["hide_readout"].sum()) == 0
+
+    # The query panel is drawn from genes the set contains, so the mask can
+    # actually hit; a uniform draw over a 61k vocabulary essentially never
+    # would.
+    assert aux["query_gene_ids"].size == 2 * k_dec
+    assert set(aux["query_gene_ids"].tolist()) <= set(range(n_genes))
+    assert aux["n_measured"].shape == (2,)
+    assert aux["n_genes_total"] == n_genes
+
+
+def test_ml_loader_highcard_arm_names_a_categorical_column():
+    """The obs-cardinality arm must not be pointed at an integer column.
+
+    OPT-LOADER-6's cost is `PyList::new(py, categories.iter())` — a fresh
+    `PyUnicode` per category per batch — in `obs_to_pydict`'s `Categorical`
+    arm. An `Int64` column takes the `PyArray1::from_vec` arm and pays none of
+    it, so the arm's value rests entirely on the column being a
+    high-cardinality *dictionary* column.
+
+    The review doc prescribed `obs_columns=["soma_joinid"]`, which on census_1m
+    is `int64` with a million distinct values: high cardinality, cheap branch,
+    and the arm would have measured nothing while looking right.
+
+    Reads the spec dict directly rather than slicing the module's source text.
+    """
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _OBS_CARDINALITY_MIN_RATIO,
+        _OBS_CARDINALITY_SPEC,
+        _OBS_HIGHCARD_MIN_CATEGORIES,
+    )
+
+    assert _OBS_CARDINALITY_SPEC, "the arm has no datasets left"
+    for dataset, spec in _OBS_CARDINALITY_SPEC.items():
+        # The pair is the signal: one absolute rate cannot separate "obs
+        # projection costs something" from "cardinality costs something".
+        assert set(spec) == {"raw_obs_lowcard", "raw_obs_highcard"}, dataset
+        high_col, high_n = spec["raw_obs_highcard"]
+        low_col, low_n = spec["raw_obs_lowcard"]
+        assert high_col != "soma_joinid", (
+            f"{dataset} names soma_joinid as the high-cardinality column; it "
+            f"is int64 and takes obs_to_pydict's numpy branch, so no category "
+            f"list is rebuilt and the arm measures nothing"
+        )
+        # The declared numbers must themselves satisfy the premise the runtime
+        # preflight enforces, or the spec is asking for an arm that cannot run.
+        assert high_n >= _OBS_HIGHCARD_MIN_CATEGORIES, (dataset, high_col, high_n)
+        assert high_n >= low_n * _OBS_CARDINALITY_MIN_RATIO, (
+            dataset, high_n, low_n,
+        )
+
+
+def test_sort_by_arm_does_not_emit_the_pooled_grouped_peak_key(monkeypatch, tmp_path):
+    """`grouped_peak_rss_mb` is flat, so a new arm must not join its median.
+
+    Three `thresholds.yaml` ceilings read `grouped_peak_rss_mb`
+    (chemogenetic_rgfp 32000, replogle_k562 16000, tahoe_c38 12000), and
+    `_load_current_raw_metric` takes the median across **every** run carrying
+    the key. The key is not per-scenario: every timed run in `grouped_sort`
+    emitted it. So an arm that also emits it silently changes what those three
+    ceilings are measured against — the pooled-median trap one level down,
+    inside a single benchmark's own extras rather than in `summary.json`.
+
+    Driven, not grepped. An earlier version asserted the literal
+    `'if reorder != "sort_by":'` appeared in the source, and it broke the
+    moment that branch was legitimately restructured to add the sort
+    verification — a guard that fails on a correct refactor is measuring the
+    spelling, not the contract.
+    """
+    import pyscx as _pyscx_probe  # noqa: F401  (importorskip below is the gate)
+    import pytest as _pytest
+
+    _pytest.importorskip("pyscx")
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    # A list, not a single attribute: both arms run below, and stashing only
+    # the last call's kwargs made the sort assertion read the *grouping* arm's
+    # (which is how this test first failed).
+    calls: list[dict] = []
+
+    def fake_from_h5ad(src, out, **kwargs):
+        Path(out).write_bytes(b"x" * 1024)
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "benchmarks.comprehensive.benchmarks.grouped_sort._verify_sorted",
+        lambda out, col, n: {"sort_by_ordered_int": 1, "sort_by_rows_kept_int": 1},
+    )
+    monkeypatch.setattr("pyscx.from_h5ad", fake_from_h5ad)
+
+    def run_arm(reorder):
+        result = BenchmarkResult(
+            benchmark="grouped_sort", format="scx_auto", dataset="fake",
+        )
+        grouped_sort._run_convert(
+            result, f"convert_{reorder}", "one", tmp_path / "src.h5ad",
+            "pert", "ctrl", tmp_path, 1, reorder=reorder, expect_n_obs=10,
+        )
+        return result.runs[0].extra
+
+    sort_extra = run_arm("sort_by")
+    sort_kwargs = calls[-1]
+    group_extra = run_arm("group_by")
+    group_kwargs = calls[-1]
+
+    assert "grouped_peak_rss_mb" not in sort_extra, (
+        f"the sort arm emitted grouped_peak_rss_mb ({sort_extra}); the three "
+        f"ceilings' medians would shift to include an arm they were never "
+        f"calibrated against"
+    )
+    assert "grouped_peak_rss_mb" in group_extra, (
+        "the grouping arms must keep emitting it — that is the floored key"
+    )
+    # `wall_s` is reserved and never reaches `extra`, so the per-scenario key
+    # is the only gateable timing for this arm.
+    assert "wall_s__convert_sort_by" in sort_extra
+    assert "peak_rss_mb__convert_sort_by" in sort_extra
+    # And the sort really is requested, with a list (a bare str is a pyo3
+    # TypeError) and no group_by.
+    assert sort_kwargs.get("sort_by") == ["pert"]
+    assert "group_by" not in sort_kwargs
+    # And the grouping arms are untouched by the new parameter.
+    assert group_kwargs.get("group_by") == "pert"
+    assert "sort_by" not in group_kwargs
+
+
+def test_sort_by_arm_records_the_verification_it_ran(monkeypatch, tmp_path):
+    """The arm must carry the two verification ints, and they must be gateable.
+
+    Without them the arm records a wall and a peak for a file nothing looked
+    at: a convert that silently ignored `sort_by` would be *faster*, produce a
+    valid file, and pass any `max` ceiling authored on
+    `wall_s__convert_sort_by`.
+    """
+    import pytest as _pytest
+
+    _pytest.importorskip("pyscx")
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    seen = {}
+
+    def fake_verify(out, group_col, expect_n_obs):
+        seen["args"] = (Path(out).name, group_col, expect_n_obs)
+        return {"sort_by_ordered_int": 0, "sort_by_rows_kept_int": 1}
+
+    monkeypatch.setattr(
+        "benchmarks.comprehensive.benchmarks.grouped_sort._verify_sorted",
+        fake_verify,
+    )
+    monkeypatch.setattr(
+        "pyscx.from_h5ad",
+        lambda src, out, **kw: Path(out).write_bytes(b"x" * 1024),
+    )
+
+    result = BenchmarkResult(
+        benchmark="grouped_sort", format="scx_auto", dataset="fake",
+    )
+    grouped_sort._run_convert(
+        result, "convert_sort_by", None, tmp_path / "src.h5ad", "pert", None,
+        tmp_path, 1, reorder="sort_by", expect_n_obs=10,
+    )
+    extra = result.runs[0].extra
+    # A failed verification is recorded as 0, not raised and not omitted — a
+    # floor of `min: 1.0` on it then fails, which is the loud outcome.
+    assert extra["sort_by_ordered_int"] == 0
+    assert extra["sort_by_rows_kept_int"] == 1
+    # It ran against the arm's own output, with the real key and row count.
+    assert seen["args"][1] == "pert" and seen["args"][2] == 10
+
+
+def test_fragment_ops_emits_a_gateable_wall_key_per_operation():
+    """Every `fragment_ops` arm needs a `wall_s__<op>` in `extra`.
+
+    The module has always *timed* four in-place mutations, but `wall_s` is a
+    reserved `add_run` parameter: it lands on the `RunRecord`, never in
+    `runs[].extra`, and the gate reads `extra` only. So the only gateable
+    timing was `median_wall_s`, pooled across arms and dominated by whichever
+    is cheapest — `rollback`, which is a 4 KB pwrite.
+
+    That is the wrong way round for OPT-FORMAT-1. Four of the five ops commit
+    through `commit_in_place` -> `finalize_header_with_checksum`, which streams
+    offset 256 -> EOF regardless of how little changed, and `rollback` is the
+    purest instrument for it precisely *because* it does almost nothing else:
+    measured 2.247 s for a 2.80 GB file, stable to 2 ms.
+
+    `obs_import` is **not** the second-cleanest, though an earlier version of
+    this test said so. Only ~11% of its census wall is the rehash; the rest is
+    the obs-section rewrite. Its key still has to exist — it is the arm nothing
+    else covers — but a floor author reading this test must not be pointed at
+    it for OPT-FORMAT-1.
+    """
+    import ast
+
+    tree, path = _bench_ast("fragment_ops")
+
+    ops: set[str] = set()
+    walls: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "operation":
+            if isinstance(node.value, ast.Constant):
+                ops.add(node.value.value)
+        # Both spellings. `**{"wall_s__append": …}` puts the name in a string
+        # constant; `wall_s__append=…` puts it in the keyword's own `arg`.
+        # Collecting only the first is how this test failed on a review-driven
+        # simplification that was itself correct — the dict-unpacking round
+        # trip was noise for a valid identifier.
+        if isinstance(node, ast.keyword) and (node.arg or "").startswith("wall_s__"):
+            walls.add(node.arg[len("wall_s__"):])
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith("wall_s__"):
+                walls.add(node.value[len("wall_s__"):])
+
+    assert ops, f"found no operation= labels in {path.name}"
+    missing = sorted(ops - walls)
+    assert not missing, (
+        f"these {path.name} arms record no gateable wall: {missing}. Add "
+        f"`wall_s__<op>=round(wall, 6)` to their add_run — `wall_s=` alone is "
+        f"invisible to every threshold."
+    )
+    assert "rollback" in walls, (
+        f"wall_s__rollback is the OPT-FORMAT-1 instrument and must stay; "
+        f"found {sorted(walls)}"
+    )
+    assert "obs_import" in walls, (
+        f"wall_s__obs_import is the only timing of a key-joined import in the "
+        f"suite (not an OPT-FORMAT-1 signal — ~11% rehash); found "
+        f"{sorted(walls)}"
+    )
+
+
+def test_scx_cli_probe_has_one_home():
+    """No benchmark module re-implements the `scx` binary search.
+
+    `$SCX_CLI_BIN` -> `target/release/scx` -> PATH was written out twice, and
+    `shuffle_layout`'s own docstring noted the other copy "uses the same
+    order". A third was about to be added for the cloud `scx info` arm. The
+    shared home is `benchmarks/comprehensive/scx_cli.py`, in the shape
+    `rss.py` established for the RSS reader — and the callers keep their own
+    *probes*, because what a usable binary means differs per arm (`info
+    --json`, `optimize --codec`, a cloud-gated subcommand).
+
+    The same shape as `test_rss_helper.py`'s "no module reimplements the
+    reader".
+    """
+    import ast
+
+    bench_dir = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+    offenders: list[str] = []
+    for mod in sorted(bench_dir.glob("*.py")):
+        tree = ast.parse(mod.read_text(), filename=str(mod))
+        # Parsed, not grepped, and for the reason this file already records
+        # under `test_no_benchmark_passes_extra_as_a_dict`: all three of these
+        # modules now *explain* the shared probe in a docstring, so a text
+        # search matches the explanation and the test fails on its own prose.
+        # A re-implementation reads the env var, which only ever appears as a
+        # call argument (`os.environ.get("SCX_CLI_BIN")`) or a subscript.
+        for node in ast.walk(tree):
+            reads = []
+            if isinstance(node, ast.Call):
+                reads = [a for a in node.args if isinstance(a, ast.Constant)]
+            elif isinstance(node, ast.Subscript) and isinstance(
+                node.slice, ast.Constant
+            ):
+                reads = [node.slice]
+            if any(a.value == "SCX_CLI_BIN" for a in reads):
+                offenders.append(f"{mod.name}:{node.lineno}")
+    assert not offenders, (
+        f"these modules read $SCX_CLI_BIN directly instead of calling "
+        f"`benchmarks.comprehensive.scx_cli.resolve_scx_bin`: {offenders}"
+    )
+
+    # And the shared module must actually be what they call.
+    from benchmarks.comprehensive import scx_cli
+
+    assert callable(scx_cli.resolve_scx_bin)
+    # `info --help` exits 0 on a build with no cloud support at all, so the
+    # cloud probe has to use a clap-gated subcommand. Pinned because getting
+    # this wrong resolves a binary that then fails on the URL at run time.
+    assert scx_cli.CLOUD_PROBE[0] != "info", (
+        f"CLOUD_PROBE is {scx_cli.CLOUD_PROBE}; `info` is compiled into every "
+        f"build (only its cloud *branch* is feature-gated), so probing it "
+        f"cannot detect cloud support"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: what the arms actually record
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def composite_key_scx(tmp_path_factory):
+    """A tiny SCX whose only usable join key is a two-column composite.
+
+    Neither `sample` nor `barcode` is unique, the obs index is duplicated, and
+    the pair is unique — the normal shape on a merged atlas, and what
+    `diagnose_obs_key` reports as `unique_pairs` with an empty
+    `unique_columns`.
+    """
+    import anndata
+    import numpy as np
+    import pandas as pd
+    import pytest as _pytest
+    import scipy.sparse as sp
+
+    pyscx = _pytest.importorskip("pyscx")
+    n = 8
+    obs = pd.DataFrame(
+        {
+            "sample": ["s1"] * 4 + ["s2"] * 4,
+            "barcode": ["b1", "b2", "b3", "b4"] * 2,
+        },
+        index=["c1", "c2", "c3", "c4"] * 2,
+    )
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.arange(n * 3, dtype="float32").reshape(n, 3)),
+        obs=obs,
+        var=pd.DataFrame(index=["g1", "g2", "g3"]),
+    )
+    out = tmp_path_factory.mktemp("composite") / "composite.scx"
+    pyscx.from_anndata(adata, str(out))
+    return out
+
+
+def test_obs_import_arm_handles_a_composite_only_join_key(composite_key_scx, tmp_path):
+    """A file whose only unique key is a *pair* must not be refused.
+
+    An earlier version required `diagnose_obs_key`'s `unique_columns` to be
+    non-empty and raised otherwise, so it rejected every merged atlas whose
+    only usable key is a two-column composite. A reviewer reproduced it on a
+    four-row fixture. It also would have mishandled `suggestion`, which renders
+    a pair as one comma-joined string that `key=` cannot take.
+
+    On this fixture `diagnose_obs_key` reports `unique_columns == []` and
+    `unique_pairs == [["barcode", "sample"], ["obs_names", "sample"]]`.
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    from benchmarks.comprehensive.benchmarks import fragment_ops
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    diag = pyscx.diagnose_obs_key(str(composite_key_scx))
+    assert not diag["unique_columns"], "premise: no single column is unique here"
+    assert diag["unique_pairs"], "premise: a pair is"
+
+    resolved = fragment_ops._resolve_obs_join_key(composite_key_scx)
+    assert len(resolved) == 2, f"expected a two-column key, got {resolved}"
+
+    result = BenchmarkResult(
+        benchmark="fragment_ops", format="scx_auto", dataset="composite",
+    )
+    fragment_ops._run_obs_import(result, composite_key_scx, tmp_path, n_runs=1)
+
+    assert len(result.runs) == 1
+    extra = result.runs[0].extra
+    # The premise the arm asserts internally: every source row landed.
+    assert extra["n_matched"] == 8
+    assert extra["rows_imported"] == 8
+    assert extra["obs_join_key"] == ",".join(resolved)
+    # And the gateable keys are there, top-level in `extra`.
+    assert extra["wall_s__obs_import"] > 0
+    assert extra["peak_rss_mb__obs_import"] > 0
+    # `obs_rewrite_bytes` is the term that dominates this arm's wall at scale;
+    # it must be the obs table, not the one added column.
+    assert extra["obs_rewrite_bytes"] > 0
+
+
+def test_derived_obs_metrics_ride_existing_runs_without_moving_the_medians():
+    """The derived cardinality metrics must not arrive on a phantom run.
+
+    An earlier version appended a `wall_s=0.0, peak_rss_mb=0.0` bookkeeping
+    record and claimed it "cannot perturb the pooled medians any further than
+    the two timed arms already do". That is arithmetically false —
+    `median_wall_s` / `median_rss_mb` and `capture_baseline._median_rss` take a
+    median over *every* run, so a 0.0/0.0 sample drags both down, widens
+    `wall_s_iqr` and bumps `n_runs`. All three reviewers flagged it; one
+    measured a four-run loader median 11.5 -> 11.0 with triple the IQR.
+
+    Driven on a real `BenchmarkResult` rather than grepped for
+    `run_rec.extra.update(derived)`: what matters is that the medians do not
+    move, and that is observable.
+    """
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _attach_to_scenario_runs,
+    )
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    result = BenchmarkResult(
+        benchmark="ml_loader", format="scx_auto", dataset="census_1m",
+    )
+    for wall in (10.0, 11.0, 12.0, 13.0):
+        result.add_run(wall_s=wall, peak_rss_mb=100.0, scenario="raw_obs_lowcard")
+    for wall in (20.0, 21.0):
+        result.add_run(wall_s=wall, peak_rss_mb=200.0, scenario="raw_obs_highcard")
+
+    before = (result.median_wall_s, result.median_rss_mb, result.n_runs,
+              result.wall_s_iqr)
+
+    n = _attach_to_scenario_runs(
+        result, "raw_obs_highcard", {"obs_highcard_overhead_ms_per_batch": 109.0},
+    )
+
+    assert n == 2, f"attached to {n} runs, expected the 2 high-cardinality ones"
+    assert (result.median_wall_s, result.median_rss_mb, result.n_runs,
+            result.wall_s_iqr) == before, (
+        "attaching a derived metric moved a pooled summary; it must be an "
+        "update to existing runs, never a new one"
+    )
+    # Only the high-cardinality runs carry it, so the gate's median over the
+    # runs holding the key is that arm's value alone.
+    carriers = [
+        r for r in result.runs if "obs_highcard_overhead_ms_per_batch" in r.extra
+    ]
+    assert len(carriers) == 2
+    assert all(r.extra["scenario"] == "raw_obs_highcard" for r in carriers)
+
+
+def test_obs_cardinality_preflight_rejects_a_non_dictionary_column(tmp_path):
+    """The arm's premise is a *dictionary* column, so it must probe for one.
+
+    Checking only that the column name exists lets a fixture reconvert keep
+    the name while storing an `Int64` — which sends `obs_to_pydict` down the
+    `PyArray1::from_vec` branch, so the arm runs, emits its metrics, and
+    measures nothing. Driven on a two-column fixture: one categorical, one
+    int64, plus a name that is absent.
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    anndata = _pytest.importorskip("anndata")
+    np = _pytest.importorskip("numpy")
+    pd = _pytest.importorskip("pandas")
+    sp = _pytest.importorskip("scipy.sparse")
+
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _probe_obs_cardinality,
+    )
+
+    n = 9
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.ones((n, 2), dtype="float32")),
+        obs=pd.DataFrame(
+            {
+                "kind": pd.Categorical(["a", "b", "c"] * 3),
+                "row_id": np.arange(n, dtype="int64"),
+            },
+            index=[f"c{i}" for i in range(n)],
+        ),
+        var=pd.DataFrame(index=["g0", "g1"]),
+    )
+    path = tmp_path / "cards.scx"
+    pyscx.from_anndata(adata, str(path))
+
+    counts, problems = _probe_obs_cardinality(
+        str(path), ["kind", "row_id", "nope"]
+    )
+
+    assert counts == {"kind": 3}, (
+        f"only the categorical column has a category count; got {counts}"
+    )
+    joined = " | ".join(problems)
+    assert "row_id" in joined and "not a categorical" in joined, (
+        f"an int64 column must be refused, not counted: {problems}"
+    )
+    assert "nope" in joined and "absent" in joined, problems
+
+    # The open-failure path. It used to return "no problems", which left the
+    # caller indexing an empty dict — `KeyError: 'sex'` before the arm's own
+    # error could surface.
+    missing_counts, missing_problems = _probe_obs_cardinality(
+        str(tmp_path / "does-not-exist.scx"), ["kind"]
+    )
+    assert missing_counts == {}
+    assert missing_problems and "could not open" in missing_problems[0], (
+        f"an unopenable file must be reported as a problem: {missing_problems}"
+    )
+
+
+def test_cardinality_premise_rejects_a_collapsed_dictionary():
+    """A column that stays categorical but loses its size loses the premise.
+
+    This is the dangerous drift: the type check passes, the arm runs, and the
+    collapsed dictionary makes the high-cardinality arm *faster* — so against
+    a `min: 0.85x` floor the loss of the benchmark reads as an improvement.
+    Observing the count is what makes it visible; refusing is what stops it
+    being scored.
+    """
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _OBS_CARDINALITY_SPEC,
+        _cardinality_premise_problems,
+    )
+
+    spec = _OBS_CARDINALITY_SPEC["census_1m"]
+    high_col, high_n = spec["raw_obs_highcard"]
+    low_col, low_n = spec["raw_obs_lowcard"]
+
+    assert not _cardinality_premise_problems(
+        spec, {low_col: low_n, high_col: high_n}
+    ), "the declared pair must satisfy its own premise"
+
+    collapsed = _cardinality_premise_problems(
+        spec, {low_col: low_n, high_col: 1_000}
+    )
+    assert collapsed, "a 1,000-category high arm must be refused"
+
+    no_separation = _cardinality_premise_problems(
+        spec, {low_col: high_n - 1, high_col: high_n}
+    )
+    assert no_separation, (
+        "two columns of the same cardinality cannot support a ratio"
+    )
+
+
+def test_sort_by_convert_moves_x_with_obs(tmp_path):
+    """`from_h5ad(sort_by=…)` must permute X with obs, not just obs.
+
+    The timing arm's two verification ints cannot see this: a convert that
+    reordered the obs axis and left the matrix in source order scores 1 on
+    both. Establishing it needs per-row identity, which is cheap here and
+    expensive per capture — so it is checked once, at the level where the
+    behaviour actually lives.
+
+    Every row carries a distinct X sentinel (row *i* holds `i+1` in all four
+    genes, so its sum is `4*(i+1)`), which makes the assertion an identity
+    check rather than a shape check.
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    anndata = _pytest.importorskip("anndata")
+    np = _pytest.importorskip("numpy")
+    pd = _pytest.importorskip("pandas")
+    sp = _pytest.importorskip("scipy.sparse")
+
+    n, n_genes = 12, 4
+    X = sp.csr_matrix(
+        np.tile(np.arange(1, n + 1, dtype="float32")[:, None], (1, n_genes))
+    )
+    adata = anndata.AnnData(
+        X=X,
+        obs=pd.DataFrame(
+            {"pert": pd.Categorical(list("cbacbacbacba"))},
+            index=[f"cell{i}" for i in range(n)],
+        ),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]),
+    )
+    src = tmp_path / "s.h5ad"
+    adata.write_h5ad(src)
+    out = tmp_path / "sorted.scx"
+    pyscx.from_h5ad(str(src), str(out), sort_by=["pert"])
+
+    back = pyscx.open(str(out)).to_anndata()
+
+    # Premise: the obs axis really was reordered, or the rest proves nothing.
+    keys = list(back.obs["pert"].astype(str))
+    assert keys == sorted(keys), f"obs was not sorted: {keys}"
+    assert keys != list(adata.obs["pert"].astype(str)), (
+        "the fixture's source order was already sorted, so this test would "
+        "pass on a convert that did nothing"
+    )
+
+    # Each row's X must be the one that belongs to its label.
+    got = np.asarray(back.X.sum(axis=1)).ravel()
+    want = np.array(
+        [(int(label.removeprefix("cell")) + 1) * n_genes
+         for label in back.obs_names],
+        dtype="float32",
+    )
+    np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize(
+    "front_matter,expected",
+    [
+        # Absent: the historical whole-triple default, which four committed
+        # files rely on.
+        ("triples:\n  - {benchmark: b, format: f, dataset: d}\n", "ALL"),
+        # Present but null, both spellings and both levels. These parsed as
+        # "every metric" — i.e. fell open to whole-triple suppression on a file
+        # whose author was visibly trying to scope it.
+        ("metrics:\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n", "REJECT"),
+        ("metric:\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n", "REJECT"),
+        ("triples:\n  - {benchmark: b, format: f, dataset: d, metric: }\n", "REJECT"),
+        ("triples:\n  - {benchmark: b, format: f, dataset: d, metrics: }\n", "REJECT"),
+        # Empty list: suppresses nothing while looking scoped.
+        ("metrics: []\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n", "REJECT"),
+        # The two working spellings, at both levels.
+        ("metric: median_wall_s\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n",
+         ["median_wall_s"]),
+        ("metrics: [x, y]\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n",
+         ["x", "y"]),
+        ("triples:\n  - {benchmark: b, format: f, dataset: d, metrics: [z]}\n", ["z"]),
+    ],
+)
+def test_metric_scope_shapes(front_matter, expected, tmp_path):
+    """Every shape a `metric:`/`metrics:` field can take, and what it means.
+
+    The one that matters is **present but null**. `_first_present` originally
+    returned `None` both for an absent key and for a key with nothing after it,
+    and `_coerce_metrics` gave `None` the historical "every metric" meaning —
+    so the very plausible stub
+
+        metrics:
+        triples:
+          - benchmark: fragment_ops
+            ...
+
+    parsed exactly like omitting the key and suppressed every absolute floor on
+    the triple. That is the bug this field exists to close, reintroduced by the
+    fix for it. A reviewer reproduced the path through `suppresses`.
+
+    Absent and null must therefore be distinguishable, which is what the
+    `_ABSENT` sentinel is for. A rejected file is *skipped* by
+    `load_active_triples` (logged, not raised), so it suppresses nothing —
+    failing closed, with the floors left live.
+    """
+    import sys
+
+    scripts = PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import _justifications  # noqa: PLC0415
+
+    path = tmp_path / "j.md"
+    path.write_text(f"---\n{front_matter}---\n")
+
+    if expected == "REJECT":
+        with pytest.raises(ValueError):
+            _justifications.parse_justification(path)
+        # And the loader's fail-closed behaviour: a malformed file is skipped,
+        # so nothing is suppressed.
+        suppression, _parsed = _justifications.load_active_triples(tmp_path)
+        assert suppression == {}, (
+            f"a malformed justification suppressed {suppression}; it must be "
+            f"skipped so the floors stay live"
+        )
+        return
+
+    parsed = _justifications.parse_justification(path)
+    scope = parsed.scope_for(("b", "f", "d"))
+    if expected == "ALL":
+        assert scope is None
+    else:
+        assert scope is not None and sorted(scope) == expected
+
+
+def test_no_duplicate_keys_in_config_tables():
+    """A duplicate key in a `config.py` table is silently discarded by Python.
+
+    Not hypothetical and not cosmetic: a change intending to raise
+    `fragment_ops`' SLURM time budget added a second `"fragment_ops"` entry
+    earlier in the *same* `base_minutes` dict. Python kept the later one, so the
+    edit had no runtime effect — the arm it was budgeting for got nothing, and
+    the diff read as if it had.
+
+    AST rather than behaviour on purpose: a discarded key leaves no trace at
+    run time, so there is nothing to observe. This is the one case in this file
+    where source inspection is the *only* possible instrument, as against the
+    arm guards where it is the weaker one.
+
+    (Written once, lost to a careless slice-replace while converting other
+    guards, and then asserted by a `config.py` comment that pointed at a test
+    that did not exist. Two reviewers caught that.)
+    """
+    import ast
+    import collections
+
+    config = PROJECT_ROOT / "benchmarks" / "comprehensive" / "config.py"
+    tree = ast.parse(config.read_text(), filename=str(config))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = [
+            k.value for k in node.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        ]
+        dupes = sorted(k for k, n in collections.Counter(keys).items() if n > 1)
+        if dupes:
+            offenders.append(f"line {node.lineno}: {dupes}")
+
+    assert not offenders, (
+        f"duplicate keys in config.py dict literals: {offenders}. Python keeps "
+        f"the last one and discards the rest silently, so whichever entry you "
+        f"were editing may have had no effect."
+    )
+
+
+def test_verify_sorted_tells_a_sorted_output_from_an_unsorted_one(tmp_path):
+    """The sort verification has to discriminate, not just return 1.
+
+    Driven on real converts of one 60-row source, because the whole point is
+    that a convert which *ignored* `sort_by` produces a valid file: the
+    regression is invisible in the output's shape, size or wall — only in the
+    order. So the reject side is a plain `from_h5ad` with no `sort_by`, which
+    is exactly what that regression would look like.
+
+    (Also written once and then destroyed by a slice-replace, which left
+    `_verify_sorted` with no coverage at all — the module's other two tests
+    monkeypatch it. A reviewer caught that.)
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    anndata = _pytest.importorskip("anndata")
+    np = _pytest.importorskip("numpy")
+    pd = _pytest.importorskip("pandas")
+    sp = _pytest.importorskip("scipy.sparse")
+
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+
+    n = 60
+    rng = np.random.default_rng(0)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.random((n, 5), dtype="float32")),
+        obs=pd.DataFrame(
+            {"pert": pd.Categorical(rng.choice(["c", "a", "b"], n))},
+            index=[f"cell{i}" for i in range(n)],
+        ),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+    )
+    src = tmp_path / "s.h5ad"
+    adata.write_h5ad(src)
+
+    sorted_out = tmp_path / "sorted.scx"
+    pyscx.from_h5ad(str(src), str(sorted_out), sort_by=["pert"])
+    plain_out = tmp_path / "plain.scx"
+    pyscx.from_h5ad(str(src), str(plain_out))
+
+    good = grouped_sort._verify_sorted(sorted_out, "pert", n)
+    assert good == {"sort_by_ordered_int": 1, "sort_by_rows_kept_int": 1}
+
+    ignored = grouped_sort._verify_sorted(plain_out, "pert", n)
+    assert ignored["sort_by_ordered_int"] == 0, (
+        "a convert that ignored sort_by scored as ordered; the verification "
+        "cannot see the one regression that would read as a speedup"
+    )
+    assert ignored["sort_by_rows_kept_int"] == 1, "no rows were lost"
+
+    short = grouped_sort._verify_sorted(sorted_out, "pert", n + 1)
+    assert short["sort_by_rows_kept_int"] == 0

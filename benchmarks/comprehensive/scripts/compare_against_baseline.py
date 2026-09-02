@@ -686,7 +686,7 @@ def render_markdown(
     timing_tol: float,
     allow_fp_drift: bool,
     *,
-    suppressed_triples: set[_justifications.Triple] | None = None,
+    suppressed_triples: _justifications.SuppressionMap | None = None,
     new_benchmarks: list[tuple[str, str, str]] | None = None,
     floor_violations: list[FloorViolation] | None = None,
     flakiness_overrides_loaded: int = 0,
@@ -695,7 +695,7 @@ def render_markdown(
     timing_regs = [d for d in deltas if d.metric == "median_wall_s" and d.is_regression]
     rss_regs    = [d for d in deltas if d.metric == "peak_rss_mb_median" and d.is_regression]
     size_regs   = [d for d in deltas if d.metric == "file_size_bytes" and d.is_regression]
-    suppressed_triples = suppressed_triples or set()
+    suppressed_triples = suppressed_triples or {}
     new_benchmarks = new_benchmarks or []
     floor_violations = floor_violations or []
 
@@ -757,13 +757,19 @@ def render_markdown(
                  f" (allowed: {'yes' if allow_fp_drift else 'no'})")
     lines.append(f"- Fingerprint missing:    {len(fp_missing)}")
     if suppressed_triples:
-        lines.append(f"- Justification-suppressed triples: {len(suppressed_triples)}")
+        scoped = sum(1 for sc in suppressed_triples.values() if sc is not None)
+        detail = f" ({scoped} metric-scoped)" if scoped else ""
+        lines.append(
+            f"- Justification-suppressed triples: {len(suppressed_triples)}{detail}"
+        )
     if flakiness_overrides_loaded:
         lines.append(f"- Flakiness overrides loaded: {flakiness_overrides_loaded}")
     if floor_violations:
         suppressed_floor_count = sum(
             1 for v in floor_violations
-            if (v.benchmark, v.fmt, v.dataset) in suppressed_triples
+            if _justifications.suppresses(
+                suppressed_triples, (v.benchmark, v.fmt, v.dataset), v.metric
+            )
         )
         active_floor_count = len(floor_violations) - suppressed_floor_count
         if suppressed_floor_count:
@@ -801,7 +807,9 @@ def render_markdown(
         lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for d in sorted(timing_regs + rss_regs + size_regs,
                         key=lambda x: (x.metric, -(x.relative_change or 0))):
-            suppressed = (d.benchmark, d.fmt, d.dataset) in suppressed_triples
+            suppressed = _justifications.suppresses(
+                suppressed_triples, (d.benchmark, d.fmt, d.dataset), d.metric
+            )
             if suppressed:
                 status = "suppressed"
             elif d.current is None and d.baseline is not None:
@@ -858,7 +866,9 @@ def render_markdown(
         for v in floor_violations:
             obs = "missing" if v.observed is None else f"{v.observed:.3f}"
             op = ">=" if v.direction == "min" else "<="
-            suppressed_here = (v.benchmark, v.fmt, v.dataset) in suppressed_triples
+            suppressed_here = _justifications.suppresses(
+                suppressed_triples, (v.benchmark, v.fmt, v.dataset), v.metric
+            )
             status = "suppressed" if suppressed_here else "violated"
             lines.append(
                 f"| {v.benchmark} | {v.fmt} | {v.dataset} | {v.metric} | "
@@ -881,7 +891,7 @@ def to_json_payload(
     fp_mismatches: list[str],
     fp_missing: list[str],
     *,
-    suppressed_triples: set[_justifications.Triple] | None = None,
+    suppressed_triples: _justifications.SuppressionMap | None = None,
     new_benchmarks: list[tuple[str, str, str]] | None = None,
     floor_violations: list[FloorViolation] | None = None,
     flakiness_overrides_loaded: int = 0,
@@ -906,7 +916,14 @@ def to_json_payload(
     }
     if suppressed_triples is not None:
         payload["suppressed_triples"] = [
-            {"benchmark": b, "format": f, "dataset": d}
+            {
+                "benchmark": b, "format": f, "dataset": d,
+                # `None` = every metric on the triple; a list = only these.
+                "metrics": (
+                    None if suppressed_triples[(b, f, d)] is None
+                    else sorted(suppressed_triples[(b, f, d)])
+                ),
+            }
             for (b, f, d) in sorted(suppressed_triples)
         ]
     if new_benchmarks is not None:
@@ -1066,7 +1083,7 @@ def main() -> int:
 
     # Under --gate: load justifications, flakiness overrides, and
     # absolute-floor specs; surface new benchmarks informationally.
-    suppressed: set[_justifications.Triple] = set()
+    suppressed: _justifications.SuppressionMap = {}
     floor_violations: list[FloorViolation] = []
     new_benchmarks: list[tuple[str, str, str]] = []
     tolerance_overrides: dict[_flakiness.Quad, float] = {}
@@ -1161,21 +1178,31 @@ def main() -> int:
         ))
 
     # Drop suppressed rows from the regression tally (only matters under
-    # --gate, since suppression set is empty otherwise). The same
-    # suppression set also drops absolute-floor violations on the same
-    # (benchmark, format, dataset) — justifications cover both
-    # surfaces, since the floor metric and the regression metric on a
-    # triple share the same root cause when the triple itself is
-    # known-bad (e.g. v2 catalog workers2 path collapses both
-    # throughput floor AND timing regression).
+    # --gate, since the suppression map is empty otherwise). The same map also
+    # drops absolute-floor violations — justifications cover both surfaces,
+    # since the floor metric and the regression metric on a triple share the
+    # same root cause when the triple itself is known-bad (e.g. the v2-catalog
+    # workers2 path collapses both throughput floor AND timing regression).
+    #
+    # Both surfaces go through `_justifications.suppresses`, which respects a
+    # file's `metrics:` / `metric:` scope. Whole-triple is still the default,
+    # but it is now something a file opts into by staying silent rather than
+    # the only option: an unscoped justification for a *pooled* metric
+    # (`peak_rss_mb_median` shifting because an arm was added) used to disarm
+    # every absolute floor on the triple as a side effect, including floors
+    # added in the same commit.
     active_regressions = [
         d for d in deltas
         if d.is_regression
-        and (d.benchmark, d.fmt, d.dataset) not in suppressed
+        and not _justifications.suppresses(
+            suppressed, (d.benchmark, d.fmt, d.dataset), d.metric
+        )
     ]
     active_floor_violations = [
         v for v in floor_violations
-        if (v.benchmark, v.fmt, v.dataset) not in suppressed
+        if not _justifications.suppresses(
+            suppressed, (v.benchmark, v.fmt, v.dataset), v.metric
+        )
     ]
     if active_regressions:
         return 1

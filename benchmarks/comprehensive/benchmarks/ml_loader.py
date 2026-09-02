@@ -39,6 +39,7 @@ from typing import Any
 
 import numpy as np
 
+from benchmarks.comprehensive.cache_control import drop_file_cache
 from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
@@ -197,6 +198,170 @@ def _scx_memory_budget_mb() -> int | None:
             pass
     return None
 
+# Dataset -> {arm name: (obs column, its cardinality)} for the OPT-LOADER-6
+# cardinality arm. Only datasets listed here run it.
+#
+# The column choice is the whole arm. `obs_to_pydict`
+# (`scx-loader/src/python/convert.rs`) rebuilds a categorical column's category
+# list as fresh `PyUnicode` objects **per batch**, and hands an Int64 column
+# straight to `PyArray1::from_vec` — so the cost tracks the number of
+# *categories*, not the number of rows. census_1m's `soma_joinid` has a million
+# distinct values and is `int64`: it takes the cheap branch and would have
+# measured nothing. `observation_joinid` is the categorical, with 957,955
+# categories (verified on `census_1m_auto.scx` via
+# `Experiment.obs_categorical`); `sex` has 3 and is the control.
+#
+# Cardinalities are recorded here, and into `runs[].extra`, so a capture says
+# what it measured rather than requiring a reader to re-probe the fixture.
+# The arm's premise, as a checkable bound rather than a comment. The point is a
+# *separation* in cardinality, and only the high side needs to be large: at
+# 957,955 vs 3 the declared pair clears both of these by three orders of
+# magnitude, so a fixture that fails them has lost the premise rather than
+# merely drifted.
+#
+# Observing the counts is not enough on its own. A reconvert that keeps
+# `observation_joinid` categorical but collapses it to, say, 1,000 categories
+# would leave the arm green while destroying what it measures — the per-batch
+# `PyUnicode` rebuild is proportional to the category count — and a *faster*
+# high-cardinality arm would read as an improvement. So a collapse fails the
+# preflight instead of warning.
+_OBS_HIGHCARD_MIN_CATEGORIES = 100_000
+_OBS_CARDINALITY_MIN_RATIO = 1_000
+
+_OBS_CARDINALITY_SPEC: dict[str, dict[str, tuple[str, int]]] = {
+    "census_1m": {
+        "raw_obs_lowcard": ("sex", 3),
+        "raw_obs_highcard": ("observation_joinid", 957_955),
+    },
+}
+
+
+def _attach_to_scenario_runs(
+    result: BenchmarkResult, scenario: str, extras: dict[str, Any],
+) -> int:
+    """Merge *extras* into every run of *scenario*; return how many got them.
+
+    For a value derived *after* both arms have run and which still has to be
+    gateable. `_load_current_raw_metric` medians over the runs that carry a
+    key, so writing the same value onto each run of one scenario reads
+    identically to a dedicated record — without being one.
+
+    That distinction is the point. An earlier version appended a
+    `wall_s=0.0, peak_rss_mb=0.0` bookkeeping run, whose comment claimed it
+    could not perturb the pooled medians. `BenchmarkResult.median_wall_s` /
+    `median_rss_mb` and `capture_baseline._median_rss` take a median over
+    *every* run, so a 0.0/0.0 sample drags both down, widens `wall_s_iqr` and
+    bumps `n_runs`; a reviewer measured a four-run loader median 11.5 -> 11.0
+    with triple the IQR.
+    """
+    n = 0
+    for run_rec in result.runs:
+        if run_rec.extra.get("scenario") == scenario:
+            run_rec.extra.update(extras)
+            n += 1
+    return n
+
+
+def _probe_obs_cardinality(
+    path: str, columns: list[str],
+) -> tuple[dict[str, int], list[str]]:
+    """Observed category count per column, plus the ones that cannot be used.
+
+    Returns ``({column: n_categories}, problems)``. A column is a *problem*
+    when it is absent from obs or is not stored as a dictionary — and the
+    second half is the point. The arm's whole subject is
+    `obs_to_pydict`'s **Categorical** branch; a column that survives a fixture
+    reconvert under the same name but as an `Int64` sends the loader down the
+    `PyArray1::from_vec` branch instead, so the arm would run, emit its
+    metrics, and measure nothing.
+
+    Declared counts used to be hard-coded into `runs[].extra` (`3` and
+    `957_955`), which described the fixture as it was rather than as it is.
+    The observed count is recorded now, so a reconvert changes the number
+    instead of silently invalidating it.
+
+    A preflight rather than a try/except around the arm: `TrainingDataset`
+    validates `obs_columns` in its constructor and raises, and catching that
+    the way the `gpu_train` arm catches its own failures would turn a broken
+    fixture into a scenario with zero runs — a silent missing metric for any
+    threshold on it.
+
+    Failing to open the file is itself reported as a problem. The predecessor
+    returned "no problems" there, on the reasoning that the arm's own error
+    would surface instead — true while the caller needed only the column
+    *names*, and a `KeyError: 'sex'` the moment it started indexing the
+    observed counts. Widening a function's return domain without auditing its
+    caller is the shape a fix round most reliably regresses in; a reviewer
+    caught this one.
+    """
+    counts: dict[str, int] = {}
+    problems: list[str] = []
+    try:
+        import pyscx
+
+        exp = pyscx.open(path)
+        try:
+            available = set(exp.obs_keys())
+            for col in columns:
+                if col not in available:
+                    problems.append(f"{col}: absent from obs")
+                    continue
+                try:
+                    _codes, categories = exp.obs_categorical(col)
+                except Exception as e:  # noqa: BLE001
+                    # `obs_categorical` raises on a non-dictionary column,
+                    # which is exactly the case that must not pass silently.
+                    problems.append(f"{col}: not a categorical column ({e})")
+                    continue
+                counts[col] = len(categories)
+        finally:
+            close = getattr(exp, "close", None)
+            if close is not None:
+                close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("  obs-column preflight could not open %s: %s", path, e)
+        return {}, [f"could not open {path}: {e}"]
+    return counts, problems
+
+
+def _cardinality_premise_problems(
+    spec: dict[str, tuple[str, int]], observed: dict[str, int],
+) -> list[str]:
+    """Whether the observed counts still support a cardinality comparison.
+
+    Two bounds, both on the *observed* numbers:
+
+    * the high-cardinality column must actually be high-cardinality
+      (``>= _OBS_HIGHCARD_MIN_CATEGORIES``), since the cost this arm prices is
+      proportional to the category count;
+    * the two columns must be separated by ``>= _OBS_CARDINALITY_MIN_RATIO``,
+      since the whole design is a ratio between them.
+
+    A reconvert that keeps the column categorical but collapses its dictionary
+    passes the type check and fails these — and it is the dangerous case,
+    because the collapsed arm is *faster* and would read as an improvement
+    against a floor. Recording the observed count is what makes the drift
+    visible; refusing here is what stops it being scored.
+    """
+    high_col, _ = spec["raw_obs_highcard"]
+    low_col, _ = spec["raw_obs_lowcard"]
+    high = observed.get(high_col, 0)
+    low = max(observed.get(low_col, 0), 1)
+    problems: list[str] = []
+    if high < _OBS_HIGHCARD_MIN_CATEGORIES:
+        problems.append(
+            f"{high_col}: {high} categories is below the "
+            f"{_OBS_HIGHCARD_MIN_CATEGORIES} this arm needs — the per-batch "
+            f"category rebuild it prices scales with that count"
+        )
+    if high < low * _OBS_CARDINALITY_MIN_RATIO:
+        problems.append(
+            f"{high_col}/{low_col} = {high}/{low} is below the "
+            f"{_OBS_CARDINALITY_MIN_RATIO}x separation the comparison needs"
+        )
+    return problems
+
+
 _SCENARIOS: list[tuple[str, bool, bool]] = [
     # (name, hvg, normalize)
     ("raw", False, False),
@@ -315,8 +480,16 @@ def _loader_available(loader_type: str) -> bool:
 
 
 def _run_scx_epoch(
-    path: str, batch_size: int, hvg: bool, normalize: bool, seed: int
+    path: str, batch_size: int, hvg: bool, normalize: bool, seed: int,
+    obs_columns: list[str] | None = None,
 ) -> _EpochResult:
+    """One SCX epoch. ``obs_columns`` projects obs metadata into each batch.
+
+    ``obs_columns=None`` (every scenario but the two ``raw_obs_*`` arms) yields
+    ``batch["obs"] == {}``, so the headline ``batches_per_sec__raw`` is a
+    pure-X number and stays comparable with the competitor loaders, none of
+    which is asked for obs either.
+    """
     import pyscx
 
     hvg_indices = list(range(QUERY_N_HVGS)) if hvg else None
@@ -324,6 +497,7 @@ def _run_scx_epoch(
         path,
         batch_size=batch_size,
         hvg_indices=hvg_indices,
+        obs_columns=obs_columns,
         normalize=normalize,
         log1p=normalize,
         seed=seed,
@@ -1331,6 +1505,208 @@ def run(
 
             scenario_summary[scenario_name] = summary
             gc.collect()
+
+        # ---------------------------------------------------------------
+        # High-cardinality obs projection (SCX-only) — OPT-LOADER-6
+        #
+        # `obs_columns=` was passed nowhere in the suite, so the cost of
+        # materialising obs metadata per batch had no instrument at all. It is
+        # not a flat cost: `obs_to_pydict` (scx-loader/src/python/convert.rs)
+        # hands an Int64 column straight to numpy, but rebuilds a *categorical*
+        # column's entire category list as fresh `PyUnicode` objects on every
+        # batch. So the quantity of interest is cardinality, and the arm runs
+        # twice — a 3-category column and a ~958k-category one — because a
+        # single absolute rate cannot separate "obs projection costs
+        # something" from "cardinality costs something", which is the whole
+        # claim. The ratio is the signal a fix has to move.
+        # ---------------------------------------------------------------
+        obs_spec = _OBS_CARDINALITY_SPEC.get(dataset.name)
+        # `scx_auto` only, not every `_SCX_KEYS` variant. The cost this arm
+        # prices is Python-side and codec-independent, so running it on all
+        # seven SCX formats would pay 7x for identical information — the same
+        # reasoning `build_csc` and `fragment_ops` give for pinning a single
+        # trigger. It also keeps the composition justification to one triple:
+        # LATEST carries census_1m rows for all seven formats, and the other
+        # five would otherwise acquire two deliberately slower scenarios with
+        # nothing explaining the shift.
+        if format_variant.key == "scx_auto" and obs_spec is not None:
+            observed, problems = _probe_obs_cardinality(
+                data_path, [c for c, _n in obs_spec.values()]
+            )
+            if observed and not problems:
+                problems = _cardinality_premise_problems(obs_spec, observed)
+            if problems:
+                # Recorded, not swallowed into a per-scenario "error" key: an
+                # unusable column yields zero runs, and a threshold on a metric
+                # no run carries is a missing-metric violation rather than a
+                # skip — which is the loud outcome, but only if the reason is
+                # findable. See thresholds.yaml's Deferred entry.
+                reason = (
+                    f"obs cardinality arm cannot run on {data_path}: "
+                    f"{problems}. It needs two *categorical* columns of very "
+                    f"different cardinality; check the fixture was converted "
+                    f"from the census h5ad with obs intact."
+                )
+                logger.warning("  obs-cardinality arm skipped: %s", reason)
+                scenario_summary["raw_obs_cardinality"] = {
+                    "applicable": False, "reason": reason,
+                }
+            else:
+                obs_rates: dict[str, float] = {}
+                for arm_name, (column, declared) in obs_spec.items():
+                    n_categories = observed[column]
+                    if n_categories != declared:
+                        # Not fatal by itself: the premise that matters is the
+                        # observed separation, enforced by
+                        # `_cardinality_premise_problems` above, and a drift
+                        # that still clears it is real. What is stale is the
+                        # spec's number, which should be updated.
+                        logger.warning(
+                            "  %s: %r has %d categories, spec says %d; "
+                            "recording the observed count",
+                            arm_name, column, n_categories, declared,
+                        )
+                    logger.info(
+                        "--- Scenario: %s (obs_columns=[%r], %d categories) ---",
+                        arm_name, column, n_categories,
+                    )
+                    # Warm once, untimed. A construction failure here is NOT
+                    # caught: `TrainingDataset` validates `obs_columns` up
+                    # front and raises `obs column '…' not found in file
+                    # (available: …)`, and that is a broken fixture, not an
+                    # inapplicable arm.
+                    _run_scx_epoch(
+                        data_path, ML_BATCH_SIZE, False, False, RANDOM_SEED,
+                        obs_columns=[column],
+                    )
+                    arm_bps: list[float] = []
+                    cache_policy = "warm"
+                    for _ in range(n_runs):
+                        # The main `_SCENARIOS` loop evicts before every timed
+                        # epoch, and this arm did not — so a `cold_cache=True`
+                        # campaign would have measured a warmed file here and
+                        # labelled it cold, with the second arm additionally
+                        # riding the first arm's reads.
+                        #
+                        # `drop_file_cache` (posix_fadvise, per file, returns
+                        # its own policy label) rather than the privileged
+                        # system-wide `/proc/sys/vm/drop_caches` write the main
+                        # loop still uses: unprivileged, targeted, and the
+                        # house helper the other data-load benchmarks call. The
+                        # main loop's version is pre-existing and untouched.
+                        if cold_cache:
+                            cache_policy = drop_file_cache(data_path)
+                        gc.collect()
+                        t0 = time.perf_counter()
+                        epoch = _run_scx_epoch(
+                            # Fixed `RANDOM_SEED`, matching the `raw` scenario
+                            # rather than `gpu_train`'s `RANDOM_SEED + i`: both
+                            # obs arms and `raw` must walk the shards in the
+                            # same order, or the delta between them is partly
+                            # shard-order luck rather than the obs projection —
+                            # which is the whole claim.
+                            data_path, ML_BATCH_SIZE, False, False,
+                            RANDOM_SEED, obs_columns=[column],
+                        )
+                        wall_s = time.perf_counter() - t0
+                        bps = epoch.n_batches / wall_s if wall_s > 0 else 0.0
+                        cps = epoch.n_cells / wall_s if wall_s > 0 else 0.0
+                        rss = _current_rss_mb()
+                        result.add_run(
+                            wall_s=wall_s,
+                            peak_rss_mb=rss,
+                            scenario=arm_name,
+                            n_batches=epoch.n_batches,
+                            n_cells=epoch.n_cells,
+                            obs_column=column,
+                            obs_n_categories=n_categories,
+                            obs_n_categories_declared=declared,
+                            cache_policy=cache_policy,
+                            **{
+                                f"batches_per_sec__{arm_name}": round(bps, 1),
+                                f"cells_per_sec__{arm_name}": round(cps, 0),
+                                f"peak_rss_mb__{arm_name}": round(rss, 1),
+                            },
+                        )
+                        arm_bps.append(bps)
+                        logger.info(
+                            "    wall=%.3fs  bps=%.1f  (%d categories)",
+                            wall_s, bps, n_categories,
+                        )
+                    if arm_bps:
+                        obs_rates[arm_name] = statistics.median(arm_bps)
+                        scenario_summary[arm_name] = {
+                            "n_runs": len(arm_bps),
+                            "obs_column": column,
+                            "obs_n_categories": n_categories,
+                            "cache_policy": cache_policy,
+                            "median_batches_per_sec": round(
+                                statistics.median(arm_bps), 1
+                            ),
+                        }
+                    gc.collect()
+                lo = obs_rates.get("raw_obs_lowcard")
+                hi = obs_rates.get("raw_obs_highcard")
+                if lo and hi:
+                    # >1 means the high-cardinality column is slower, which is
+                    # the expected direction; OPT-LOADER-6 drives it toward 1.
+                    slowdown = lo / hi
+                    # The *ratio* is host-dependent in a way the per-batch
+                    # delta is not, so milliseconds per batch is the quantity
+                    # to record and to floor.
+                    #
+                    # Measured through this arm at census_1m, 2 runs of a full
+                    # 977-batch epoch: 4.2 -> 4.1 batches/s, **7.86 ms/batch**,
+                    # 1.033x. A standalone 40-batch cold probe had reported
+                    # +109 ms/batch, which agreed with the review doc's
+                    # 60-120 ms/batch estimate and is ~14x too high — 40
+                    # batches cannot separate an 8 s construction cost from a
+                    # per-batch one. The mechanism is confirmed live (the
+                    # 957,955-entry `categories` list is a fresh object every
+                    # batch), so ~8 ns per category is simply what it costs:
+                    # ~3% of a 238 ms batch, not the several-fold predicted.
+                    overhead_ms = (1.0 / hi - 1.0 / lo) * 1000.0
+                    scenario_summary["raw_obs_cardinality"] = {
+                        "applicable": True,
+                        "lowcard_batches_per_sec": round(lo, 1),
+                        "highcard_batches_per_sec": round(hi, 1),
+                        "highcard_slowdown_vs_lowcard": round(slowdown, 3),
+                        "highcard_overhead_ms_per_batch": round(overhead_ms, 2),
+                    }
+                    # Emitted into `extra` as well as metadata, because only
+                    # `extra` is gateable — but attached to the runs that
+                    # already exist, NOT to a new zero-wall bookkeeping record.
+                    #
+                    # An earlier version added such a record and claimed it
+                    # "cannot perturb the pooled medians any further than the
+                    # two timed arms already do". That is arithmetically false:
+                    # `BenchmarkResult.median_wall_s` / `median_rss_mb` and
+                    # `capture_baseline._median_rss` take a median over *every*
+                    # run, so injecting a 0.0/0.0 sample drags both down, wid-
+                    # ens `wall_s_iqr` and bumps `n_runs`. A reviewer measured
+                    # a four-run loader median 11.5 -> 11.0 with triple the IQR.
+                    #
+                    # `_load_current_raw_metric` medians over the runs that
+                    # *carry* the key, so writing the same value onto each
+                    # high-cardinality run yields the identical gate reading
+                    # with no synthetic measurement.
+                    attached = _attach_to_scenario_runs(
+                        result,
+                        "raw_obs_highcard",
+                        {
+                            "obs_highcard_slowdown_vs_lowcard": round(slowdown, 3),
+                            "obs_highcard_overhead_ms_per_batch": round(
+                                overhead_ms, 2
+                            ),
+                            "obs_lowcard_column": obs_spec["raw_obs_lowcard"][0],
+                            "obs_highcard_column": obs_spec["raw_obs_highcard"][0],
+                        },
+                    )
+                    logger.info(
+                        "  obs cardinality: %.1f -> %.1f batches/s "
+                        "(%.2fx slower, +%.1f ms/batch; on %d run(s))",
+                        lo, hi, slowdown, overhead_ms, attached,
+                    )
 
         # ---------------------------------------------------------------
         # GPU training scenario (SCX-only)

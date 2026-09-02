@@ -1,4 +1,13 @@
 ---
+# Scoped, not whole-triple: this file explains the two POOLED summary metrics
+# and nothing else. Unscoped it also suppressed all 15 `cellset_gather`
+# absolute floors — see "What this file must not suppress" below.
+metrics: [peak_rss_mb_median, median_wall_s]
+# Expires deliberately. Every "when to remove this file" recipe below waits on
+# the PR-03 recapture; without a date, a missed cleanup leaves the suppression
+# in place forever and silently. 2026-12-31 gives the recapture margin and then
+# fails loud.
+expires: 2026-12-31
 triples:
   - benchmark: cellset_gather
     format: scx_auto
@@ -47,6 +56,24 @@ single-process figure; it is reported under its own key rather than folded into
 carry the same new scenarios and will trip the same pooled-median comparison on
 the next baseline that predates them.
 
+## What this file must not suppress
+
+`cellset_gather / scx_auto` carries **15 absolute floors** across these three
+datasets (six S=64 `cellsets_per_sec__gather_*`, six S=512, three
+`rank_scaling_efficiency__gather_random_r4`). Justification suppression used to
+be whole-triple over *every* metric, so this file — whose entire subject is a
+pooled median — silently disarmed all 15 of them, while `thresholds.yaml`'s
+Deferred item 7 described them as "NOW ACTIVE … all live". The `metrics:` key in
+the front-matter is what keeps them live; do not remove it, and do not add a
+triple here without checking what floors sit on it.
+
+The suppression is also **inert today**, in the direction that matters:
+`results/baselines/LATEST` (`v0.11.2-multimodal-loader-fix`) predates the
+data-load Phase 0 benchmarks and carries **zero** `cellset_gather` rows, so
+`diff_summaries` treats every row here as *appearing* rather than regressing and
+there is no pooled comparison to suppress. This file is therefore forward-looking:
+it exists for the next baseline that predates the S=512 / rank / collate arms.
+
 **When to remove this file:** once a baseline captured *with* the S=512 and rank
 arms becomes the comparison point, the composition matches and the suppression is
 no longer needed. If the flag persists against such a baseline, it is a real
@@ -54,4 +81,6 @@ regression — investigate rather than re-justify.
 
 **Worth fixing properly at some point:** a per-scenario `peak_rss_mb` in the
 summary would make this class of false positive impossible, instead of requiring a
-justification every time a scenario is added to an existing benchmark.
+justification every time a scenario is added to an existing benchmark. (The
+per-scenario keys now exist in `runs[].extra`; what is still pooled is the
+`summary.json` row the relative gate compares.)
