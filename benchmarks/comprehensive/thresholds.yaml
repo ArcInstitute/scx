@@ -2119,6 +2119,63 @@ absolute_floors:
     metric: peak_rss_mb__compact_full
     max: 4096.0
 
+  # ─── MatrixMarket export declares `integer`, not `real` ───────────
+  #
+  # A contract, not a statistic, and the only one in this file that guards a
+  # *header field*. `scx-mtx/src/write.rs` decides the declared type from the
+  # materialised f32 values:
+  #
+  #   let all_integer = data.iter()
+  #       .all(|&v| v == v.floor() && v.is_finite() && v >= 0.0);
+  #   let type_str = if all_integer { "integer" } else { "real" };
+  #
+  # and formats the body with the same flag (`val as i64` vs the float). So a
+  # file of integral counts writes `integer` and `1`, which is what downstream
+  # readers expect.
+  #
+  # The regression this exists to catch: deriving that flag from the shard's
+  # *value encoding* instead of from the values. An h5ad-sourced file holds
+  # integral counts in a `Float32`-encoded shard — the normal case — so that
+  # change would silently flip every such file to `real`. It is the obvious
+  # thing to reach for when making the export streaming, because the values are
+  # exactly what a streaming writer no longer has all of at once.
+  #
+  # Measured on pbmc3k: header
+  # `%%MatrixMarket matrix coordinate integer general`, values float32 with
+  # min 1.0 / max 419.0 and every one integral.
+  #
+  # `mtx_values_all_integral` is the premise, floored beside it: a header check
+  # on a matrix that is *not* integral would pass for the wrong reason, so a
+  # fixture that stops being integral has to fail here rather than quietly
+  # turn the gate above vacuous.
+  #
+  # **The pair was shown to discriminate, not merely to read 1.0.** Running the
+  # same arm on `pbmc3k_lognorm` — the log-normalised sibling, same shape and
+  # same 2,286,884 non-zeros — produces
+  # `%%MatrixMarket matrix coordinate real general` and drives *both* metrics to
+  # 0.0. So an `integer` header is a claim the export re-derives per file, and a
+  # regression that hard-coded either answer would show here.
+  #
+  # That is also why these rows name `pbmc3k` and not the dataset glob:
+  # `pbmc3k_lognorm` legitimately reports 0.0 and would fail a `min: 1.0` row.
+  # It is outside every tier so no default capture reaches it, but an explicit
+  # `--datasets pbmc3k_lognorm` would.
+  #
+  # Only pbmc3k for now. tabula_sapiens_100k also runs this benchmark and emits
+  # both metrics, but nothing has confirmed its values are integral yet — add
+  # its two rows once a capture reports `mtx_values_all_integral: 1.0` there,
+  # and not before.
+  - benchmark: mtx_export
+    format: scx_auto
+    dataset: pbmc3k
+    metric: mtx_header_integer
+    min: 1.0
+  - benchmark: mtx_export
+    format: scx_auto
+    dataset: pbmc3k
+    metric: mtx_values_all_integral
+    min: 1.0
+
   # ─── Grouped sharding (sort / convert --group-by) ─────────────────
   # Correctness-only floors (perf is hardware/density sensitive — see the
   # Deferred floors note). Each grouping dataset's `grouped_sort` result carries
@@ -3037,3 +3094,72 @@ absolute_floors:
 #    and then author the census row beside the tabula one. Expect the ceiling to
 #    be dominated by the same `read_all_raw_csr_shards()` term: the plain
 #    census_1m export measures 3162 MB at rt=4, and raw adds ~8 B/nnz on top.
+#
+# 14. build_csc's declared memory budget cannot be honoured; not yet floored
+#    `pyscx.build_csc(input, memory_limit=...)` is the only operation in the
+#    suite with a *declared* memory budget, and the `build_csc` benchmark now
+#    measures what it actually takes.
+#
+#    (a) Does the budget bound anything? Measured directly on
+#    tabula_sapiens_100k (194,891,401 nnz), one run per budget:
+#
+#      memory_limit    peak (MB)   op's own delta (MB)   wall (s)
+#      512MiB             2683.6                2232.8      536.0
+#      1G                 2676.9                2189.8      374.6
+#      4G                 2973.0                2454.8      262.0
+#      64G                3272.7                2759.1      250.1
+#
+#    Across a **128x range of declared budgets** the op's own allocation moves by
+#    26% (2190 -> 2759 MB) and the wall halves. So the knob is not inert — it
+#    buys throughput for memory, which is a sane trade — but the ~2.2 GB floor
+#    sits outside its control, because `write_csc_sidecar` takes `&[ScxCsr]` by
+#    value and holds the CSR and its column-major transpose at once. **At
+#    512 MiB declared the op still uses 2233 MB, 4.4x over, and does not raise.**
+#    On a matrix this size the budget cannot be honoured at any setting.
+#
+#    (b) How it scales. Same 4 GiB budget, three datasets:
+#
+#      dataset          nnz        peak (MB)         B/nnz   peak/budget
+#      pbmc3k          2.3M    524 / 527 / 526       241.2      0.13
+#      tabula_100k   194.9M   2970 / 2970 / 2970      16.0      0.73
+#      census_500k   747.0M   8171 / 8103             11.4      1.99
+#
+#    Read B/nnz, not the ratio: pbmc3k's 241 is almost entirely the 450-520 MB
+#    interpreter baseline that `PeakRssSampler` seeds itself with, and the two
+#    real points sit at 11-16 B per non-zero.
+#
+#    Those three rows came from one process running the datasets in sequence,
+#    and `PeakRssSampler` seeds at entry RSS — so they were re-measured in fresh
+#    processes to check for inherited heap. There is none worth noting: tabula
+#    at a 4 GiB budget gives 2973 MB fresh against 2970 in the sequence, and
+#    census_500k gives **8189.8 MB fresh (entry 450.8, delta 7738.9, wall
+#    1628 s) against a sequence median of 8137** — 0.6%. Both ratios breach at
+#    census: 2.00 on the raw peak and **1.89 with the baseline removed**, so the
+#    breach does not depend on which convention the threshold picks.
+#
+#    ⚠️ It is NOT exactly 16 B/nnz. tabula's 2970 MB lands within 0.13% of
+#    `2 x nnz x 8 B` = 2973.8 MB, which is a coincidence of that shape *and* that
+#    budget: census_500k's 747M non-zeros would predict 11,399 MB and measure
+#    8137. A two-point fit over the two real scales gives
+#
+#      peak_MB ~= 9.36 * (nnz in millions) + 1146
+#
+#    crossing the 4 GiB budget at **~315M non-zeros**, about 162,000 cells at
+#    tabula's ~1,949 nnz/cell, and putting census_1m (1.40B nnz) at ~3.5x. Two
+#    points is an ordering claim, not a model.
+#
+#    Consequences for anyone authoring the threshold:
+#
+#      * The breach is scale-dependent. tabula sits *under* at 0.73x;
+#        census_500k is at 1.99x. A `peak_over_memory_limit__build_csc <= 1.25`
+#        row would pass at tabula and fail at census, so pick the dataset
+#        deliberately rather than assuming "expected to fail today" everywhere.
+#      * Two ratios are emitted and they differ by the interpreter baseline. Use
+#        `delta_over_memory_limit__build_csc` if the budget means "what this op
+#        may allocate", `peak_over_memory_limit__build_csc` if it means "what the
+#        process may reach". Below ~50M non-zeros only the first says anything.
+#
+#    Blocker: this is a bound violation, not a measurement artefact, so a live
+#    floor would fail every gate run that reaches census scale until
+#    `write_csc_sidecar` streams. Author the row in the change that fixes the
+#    writer, using the crossover above to choose the scale to gate.

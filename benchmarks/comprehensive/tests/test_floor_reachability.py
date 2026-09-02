@@ -302,8 +302,9 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
 
     calls = []
 
-    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None, reader_threads=None):
-        calls.append((scenario, reader_threads))
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        calls.append((scenario, reader_threads, extra_kwargs))
         return [{
             "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
             "peak_rss_mb": 123.0, "reader_threads": reader_threads,
@@ -328,10 +329,12 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
 
     # One process per arm, and the GATED arm must be the pinned one — a floor
     # measured at the runner's core count is a property of the runner.
+    # `dataset_name` is None here, so no `_EXTRA_ARMS` entry applies and the
+    # three base arms are all that run.
     assert calls == [
-        ("streaming", cs.GATED_READER_THREADS),
-        ("streaming", None),
-        ("materialize", None),
+        ("streaming", cs.GATED_READER_THREADS, None),
+        ("streaming", None, None),
+        ("materialize", None, None),
     ], calls
 
     gated = [r for r in result.runs if r.extra.get("scenario") == "streaming"]
@@ -358,6 +361,462 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     )
     assert result.metadata["structural"]["equal"] is True
     assert result.metadata["gated_reader_threads"] == cs.GATED_READER_THREADS
+
+
+def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
+    """`_EXTRA_ARMS` must reach the worker, and only on the right datasets.
+
+    The two extra arms (`csc_always`, `index_preset_cellxgene`) are the same
+    `from_h5ad` call with one conversion option changed, and the whole reason
+    they exist is that the default arm passes **no** conversion options — so the
+    bound `streaming_peak_rss_mb` enforces is measured in a configuration real
+    callers do not always use.
+
+    Two properties, both easy to lose in a refactor and neither visible in the
+    result JSON if lost:
+
+    1. the arm's kwargs actually reach `_timed_streaming` (a dropped
+       `extra_kwargs` would run the *default* conversion under an arm labelled
+       `csc_always`, i.e. measure the wrong thing under the right name); and
+    2. the arm is pinned to `GATED_READER_THREADS`, so its number is comparable
+       with the default arm's rather than with the runner's core count.
+
+    Scope matters for a third reason recorded in the module: `csc_always` is
+    expected to breach its ceiling and so needs a justification, and
+    justification suppression is *whole-triple* — so it must not run on a
+    dataset that carries a live floor.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def drive(dataset_name):
+        calls = []
+
+        def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                     reader_threads=None, extra_kwargs=None):
+            calls.append((scenario, reader_threads, extra_kwargs))
+            # The parent now raises when an extra arm shows no output effect,
+            # so the mock has to model a worker that honoured its kwargs — or
+            # the happy path fails for the wrong reason. Each guard's own red
+            # case is asserted separately below.
+            kw = extra_kwargs or {}
+            return [{
+                "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+                "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+                "structural": {
+                    "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                    "has_csc": 1 if kw.get("csc") else 0,
+                },
+                # An index preset that took effect writes more bytes than the
+                # default arm; that difference is the observable the parent
+                # checks, since `Experiment` exposes no `has_obs_index`.
+                "output_bytes": 20 if kw.get("index_preset") else 10,
+            }]
+
+        original = cs._run_arm_subprocess
+        try:
+            cs._run_arm_subprocess = fake_arm
+            result = cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset=dataset_name or "unit",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                dataset_name,
+            )
+        finally:
+            cs._run_arm_subprocess = original
+        return calls, result
+
+    # In scope for both extras.
+    calls, result = drive("tabula_sapiens_100k")
+    by_kwargs = {tuple(sorted((k, repr(v)) for k, v in (kw or {}).items())): rt
+                 for _, rt, kw in calls}
+    assert (("csc", "'always'"),) in by_kwargs, calls
+    assert (("index_preset", "'cellxgene'"),) in by_kwargs, calls
+    assert by_kwargs[(("csc", "'always'"),)] == cs.GATED_READER_THREADS
+    assert set(result.metadata["extra_arms"]) == {
+        "csc_always", "index_preset_cellxgene"
+    }
+    labels = {r.extra["scenario"] for r in result.runs}
+    assert "csc_always" in labels and "index_preset_cellxgene" in labels
+    for label in ("csc_always", "index_preset_cellxgene"):
+        rows = [r for r in result.runs if r.extra["scenario"] == label]
+        assert rows and all(f"{label}_peak_rss_mb" in r.extra for r in rows)
+        assert all("streaming_peak_rss_mb" not in r.extra for r in rows), (
+            f"{label} must not emit the gated key, or the census floor's median "
+            f"would mix arms"
+        )
+
+    # census_1m carries the live `streaming_peak_rss_mb` floor, so `csc_always`
+    # — which needs a whole-triple justification — must NOT run there.
+    calls, result = drive("census_1m")
+    assert all((kw or {}).get("csc") is None for _, _, kw in calls), calls
+    assert result.metadata["extra_arms"] == ["index_preset_cellxgene"]
+    assert "csc_always" in result.metadata["extra_arms_skipped"]
+
+    # A dataset in neither scope runs the three base arms only.
+    calls, result = drive("pbmc3k")
+    assert [c[0] for c in calls] == ["streaming", "streaming", "materialize"]
+    assert result.metadata["extra_arms"] == []
+
+
+def test_mtx_export_is_scoped_out_of_the_census_tiers():
+    """The size cap has to stop the *scheduler*, not just `run()`.
+
+    `mtx_export` returns `None` above `MAX_N_OBS`, but `run_parallel` only drops
+    cells at cohort-build time. With `SUPPORTED_FORMATS` alone, a `--tier full`
+    capture submitted `mtx_export x {census_500k, census_1m}` — 88 GB and 176 GB
+    of requested memory plus their Phase-A conversions — and the job returned
+    `None` on its first line. `--tier xl` added census_5m at 864 GB.
+
+    This is the trap `_bench_format_dataset_scope`'s own docstring records
+    ("they stubbed out-of-scope datasets *inside* `run()` ... eight wasted GPU
+    jobs per full accel capture"). Found by review (codex - gpt-5.6-terra and
+    Cursor Agent - Grok 4.6 High, independently).
+
+    Exercises the orchestrator's filter, not only the module constant — a
+    declaration test alone would pass with the scope never consulted.
+    """
+    import importlib
+
+    from benchmarks.comprehensive.benchmarks import mtx_export as mx
+    from benchmarks.comprehensive.config import DATASETS
+
+    rp = importlib.import_module("benchmarks.comprehensive.scripts.run_parallel")
+    scope = rp._bench_format_dataset_scope("mtx_export")
+    assert "scx_auto" in scope, (
+        "mtx_export declares no FORMAT_DATASET_SCOPE, so every unimodal "
+        "scx_auto dataset is schedulable regardless of MAX_N_OBS"
+    )
+    allowed = scope["scx_auto"]
+
+    for name in ("pbmc3k", "tabula_sapiens_100k"):
+        assert name in allowed, name
+    for name in ("census_500k", "census_1m", "census_5m", "census_10m"):
+        assert name not in allowed, (
+            f"{name} is above MAX_N_OBS={mx.MAX_N_OBS:,} yet still schedulable; "
+            f"the job would request "
+            f"{__import__('benchmarks.comprehensive.config', fromlist=['x']).estimate_memory_gb(DATASETS[name], 'scx_auto', 'mtx_export')} GB "
+            f"and then return None"
+        )
+
+    # Derived from MAX_N_OBS, not hand-listed: a literal list would stop
+    # matching the cap the first time either changed.
+    assert allowed == frozenset(
+        n for n, ds in DATASETS.items()
+        if not ds.multimodal and ds.n_obs <= mx.MAX_N_OBS
+    )
+
+
+@pytest.fixture
+def tiny_mtx_source(tmp_path):
+    """`(dataset, format_variant, converted_path)` over a synthesised SCX file.
+
+    Deliberately **not** the staged `pbmc3k_auto.scx`. An earlier version of
+    these tests used it and skipped when it was absent, which put the durable
+    evidence for the two MTX guards exactly where it was least useful: a
+    fixtureless checkout could delete the production `if` and keep the suite
+    green. Found by review (codex - gpt-5.6-terra, Antigravity - Gemini 3.7
+    Flash, Cursor Agent - Grok 4.6 High).
+
+    120 x 40 integer counts is enough to export, delete from, and re-ingest in
+    well under a second, and it keeps the guards under test rather than the
+    fixture.
+    """
+    anndata = pytest.importorskip("anndata")
+    pyscx = pytest.importorskip("pyscx")
+    np = pytest.importorskip("numpy")
+    sparse = pytest.importorskip("scipy.sparse")
+
+    from benchmarks.comprehensive.config import ALL_FORMATS, DatasetConfig
+
+    n_obs, n_vars = 120, 40
+    rng = np.random.default_rng(0)
+    x = sparse.csr_matrix(
+        (rng.random((n_obs, n_vars)) < 0.3) * rng.integers(1, 50, (n_obs, n_vars))
+    ).astype("float32")
+    adata = anndata.AnnData(X=x)
+    adata.obs_names = [f"cell{i}" for i in range(n_obs)]
+    adata.var_names = [f"gene{j}" for j in range(n_vars)]
+    scx = tmp_path / "tiny.scx"
+    pyscx.from_anndata(adata, str(scx))
+
+    ds = DatasetConfig(
+        id="TEST", name="tiny_mtx", n_obs=n_obs, n_vars=n_vars,
+        protocol="synthetic", source="test fixture", approx_h5ad_mb=1,
+    )
+    fmt = next(f for f in ALL_FORMATS if f.key == "scx_auto")
+    return ds, fmt, scx
+
+
+def test_mtx_deletion_arm_refuses_an_export_that_ignored_the_keep_mask(tiny_mtx_source):
+    """The row-count comparison has to be a *test*, not a one-off measurement.
+
+    Round 1 found that the deletion arm recorded `mtx_rows_written` and compared
+    it to nothing, so an export ignoring the deletion vector wrote a normal
+    successful result. Round 2 pointed out that the fix shipped with the raise
+    but no test — the production `if` could be deleted again and the suite would
+    stay green. Found by review (codex - gpt-5.6-terra, Cursor Agent - Grok 4.6
+    High).
+
+    The mutant is an export that drops nothing: `_row_count` reporting the full
+    obs count after cells were marked deleted.
+    """
+    from benchmarks.comprehensive.benchmarks import mtx_export as mx
+
+    ds, fmt, converted = tiny_mtx_source
+    original = mx._row_count
+    try:
+        mx._row_count = lambda out_dir: ds.n_obs
+        with pytest.raises(RuntimeError, match="keep mask was not applied"):
+            mx.run(dataset=ds, format_variant=fmt, n_runs=1,
+                   converted_path=converted)
+    finally:
+        mx._row_count = original
+
+
+def test_mtx_roundtrip_refuses_an_ingest_that_lost_an_entry(tiny_mtx_source):
+    """Same for the round-trip shape/nnz comparison.
+
+    The mutant is an ingest that silently drops one non-zero — patched at the
+    reopen rather than by corrupting a file, so the test exercises the
+    comparison itself and stays a few seconds long.
+    """
+    from benchmarks.comprehensive.benchmarks import mtx_export as mx
+
+    pyscx = pytest.importorskip("pyscx")
+    ds, fmt, converted = tiny_mtx_source
+    src = str(converted)
+    real_open = pyscx.open
+
+    class _Lossy:
+        """Reports one fewer non-zero than the file holds."""
+
+        def __init__(self, exp):
+            self._exp = exp
+
+        def __getattr__(self, name):
+            value = getattr(self._exp, name)
+            return value - 1 if name == "nnz" else value
+
+    try:
+        # Truthful for the source read; lossy for the re-imported output.
+        pyscx.open = lambda path: (
+            real_open(path) if str(path) == src else _Lossy(real_open(path))
+        )
+        with pytest.raises(RuntimeError, match="round-trip changed the matrix"):
+            mx.run(dataset=ds, format_variant=fmt, n_runs=1,
+                   converted_path=converted)
+    finally:
+        pyscx.open = real_open
+
+
+def test_csc_always_arm_refuses_a_result_with_no_sidecar():
+    """The `csc_always` premise is enforced, not merely recorded.
+
+    `_structural_summary` reports `n_csc_shards`, but nothing reads `metadata`,
+    so storing it there was not a check: if `csc="always"` were dropped on
+    either subprocess hop, the arm would still emit `csc_always_peak_rss_mb`
+    and pass — having timed the *default* conversion under the CSC label. That
+    is the failure mode the arm exists to rule out, so it has to raise.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        # A worker that ignored the kwargs: right label, no sidecar.
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "has_csc": 0,
+            },
+            "output_bytes": 10,
+        }]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        with pytest.raises(RuntimeError, match="csc_always"):
+            cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset="tabula_sapiens_100k",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                "tabula_sapiens_100k",
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+@pytest.mark.parametrize(
+    "indexed_bytes, expect",
+    [
+        (10, "no predicate-index sections"),   # same size as the default arm
+        (5, "no predicate-index sections"),    # smaller, the measured pbmc3k shape
+        (None, "could not be verified"),       # size missing on one side
+    ],
+)
+def test_index_preset_arm_refuses_a_result_with_no_index_effect(
+    indexed_bytes, expect
+):
+    """`index_preset_cellxgene` has to fail **closed**, like the CSC arm.
+
+    `Experiment` exposes no `has_obs_index`, so the guard compares output sizes:
+    an index that took effect writes more bytes than the default arm on the same
+    input. Two ways it could be satisfied wrongly, both covered here:
+
+    * the sizes are equal or the indexed arm is *smaller* — which is the shape
+      actually measured on pbmc3k, where the preset's columns are absent
+      (4,379,713 B against the default arm's 4,379,851); and
+    * a size is missing, which an earlier version treated as "nothing to
+      compare, carry on". A comparison that could not be made is not a
+      comparison that passed.
+
+    Found by review (Antigravity - Gemini 3.7 Flash, Cursor Agent - Grok 4.6
+    High): the round-2 fix added the guard and no red test, so deleting the
+    `if` left the suite green.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        kw = extra_kwargs or {}
+        rec = {
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "has_csc": 1 if kw.get("csc") else 0,
+            },
+        }
+        if kw.get("index_preset"):
+            if indexed_bytes is not None:
+                rec["output_bytes"] = indexed_bytes
+        else:
+            rec["output_bytes"] = 10
+        return [rec]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        with pytest.raises(RuntimeError, match=expect):
+            cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset="tabula_sapiens_100k",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                "tabula_sapiens_100k",
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+def test_sweep_companion_arms_enforce_the_same_premises():
+    """The thread-sweep path must not be the unguarded way in.
+
+    `_run_extra_arms_once` was added so a sweep capture does not silently lose
+    the non-default arms — and it recorded their timings while discarding
+    `structural` / `output_bytes`, which reopened on this path the exact
+    "wrong path, right label" hole the default path had just closed. A sweep on
+    tabula could emit `csc_always_peak_rss_mb` after a worker reported no
+    sidecar. Found by all three reviewers.
+
+    The CSC premise is checkable here because it needs only this arm's own
+    record. The index premise is not: it compares against the default arm's
+    output size, which the sweep writes *after* these arms run, so the caller
+    defers it — covered by `test_index_preset_arm_refuses_a_result_with_no_index_effect`.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def no_sidecar(h5ad_path, n_runs, scenario, thread_count=None,
+                   reader_threads=None, extra_kwargs=None):
+        # A worker that ignored `csc="always"`: right label, no sidecar.
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "has_csc": 0,
+            },
+            "output_bytes": 10,
+        }]
+
+    result = BenchmarkResult(
+        benchmark="conversion_streaming",
+        format="scx_streaming_vs_materialize",
+        dataset="tabula_sapiens_100k",
+        metadata={"scenarios": []},
+    )
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = no_sidecar
+        with pytest.raises(RuntimeError, match="csc_always"):
+            cs._run_extra_arms_once(
+                pathlib.Path("/nonexistent.h5ad"), result, "tabula_sapiens_100k"
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+def test_conversion_streaming_worker_threads_extra_kwargs_through():
+    """The mocked test above cannot see a broken `_WORKER_SCRIPT`.
+
+    `_run_arm_subprocess` is what the other test replaces, so a worker that
+    never parsed `sys.argv[5]` — or parsed it and never passed it to
+    `_timed_streaming` — would leave that test green while every extra arm ran
+    the default conversion. Checked on the worker source, which is a
+    `textwrap`-dedented string and therefore invisible to any import-time check.
+    Found by review (Cursor Agent - Grok 4.6 High).
+    """
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+
+    script = cs._WORKER_SCRIPT
+    assert "extra_kwargs = json.loads(sys.argv[5])" in script, (
+        "the worker does not parse the extra-arm kwargs out of argv"
+    )
+    # And it must reach the timed call, not just be parsed. Sliced to the
+    # *matching* close paren: the call is multi-line, so stopping at the first
+    # `)` lands inside `Path(h5ad_path)` and the check passes vacuously.
+    start = script.index("_timed_streaming(") + len("_timed_streaming(")
+    depth, end = 1, start
+    while depth:
+        if script[end] == "(":
+            depth += 1
+        elif script[end] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        end += 1
+    args = script[start:end]
+    assert "extra_kwargs" in args, (
+        f"the worker parses extra_kwargs but does not pass them to "
+        f"_timed_streaming: args were {args!r}"
+    )
 
 
 def test_both_streaming_modules_use_the_true_peak_sampler():

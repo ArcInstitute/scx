@@ -1124,6 +1124,29 @@ def estimate_memory_gb(
         # not a decision: `export_streaming`'s own docstring flagged the absence
         # as the reason its materialize cap had to exist at all.
         peak_mb = max(base_mb * 1.5, 8 * 1024)
+    elif benchmark == "build_csc":
+        # `write_csc_sidecar` takes the whole CSR by value and builds the
+        # column-major transpose beside it, so the working set tracks the sparse
+        # footprint and not the `memory_limit` the caller passes — the gap this
+        # benchmark exists to measure.
+        #
+        # Sized from the measurement rather than from `dense_mb`: peak was
+        # 2970 MB at tabula_sapiens_100k and 8137 MB at census_500k, against
+        # `base_mb` (2x the source h5ad) of 3200 and 11,400 MB. So 1.5x base
+        # covers both with room; `dense_mb * 0.6` would have asked for 70 GB at
+        # census_500k for an 8 GB peak.
+        peak_mb = max(base_mb * 1.5, 8 * 1024)
+    elif benchmark == "mtx_export":
+        # Both directions materialise: `to_mtx` reads the whole CSR before
+        # formatting, `from_mtx` parses the triplet into one. Bounded by the
+        # sparse footprint plus the gzip buffers, not by the dense matrix — so
+        # sized off `base_mb` (2x the source h5ad) and NOT off `dense_mb`, which
+        # an earlier version used while this comment already said not to.
+        #
+        # The module's `FORMAT_DATASET_SCOPE` caps it at n_obs <= 100,000, so the
+        # largest cell is tabula_sapiens_100k (base_mb 3200); measured peak is
+        # under 500 MB at pbmc3k and O(nnz) above that.
+        peak_mb = max(base_mb, 8 * 1024)
     elif benchmark == "fragment_ops":
         # SCX-only. pyscx.append reads the entire input CSR into memory
         # (indptr + indices + decoded values) before re-encoding into the
@@ -1556,6 +1579,22 @@ def estimate_time_minutes(
         # layer and two obsm matrices). At N_RUNS_LARGE=3 those two arms alone
         # are ~21 min, which the 15-min fall-through default does not cover.
         "fragment_ops":           45,
+        # One in-place sidecar build per run, plus a file copy per run outside
+        # the timed region. O(nnz) with a column-major transpose on top: 259 s
+        # per run at tabula_sapiens_100k (195M nnz) and 1630 s at census_500k
+        # (747M nnz), i.e. ~1.3 us per non-zero. At N_RUNS_LARGE=3 that is
+        # 13 min and 81 min respectively, so the base alone cannot cover census
+        # — see the steeper slope below.
+        "build_csc":              45,
+        # O(nnz) over a gzipped *text* triplet and neither direction streams —
+        # 3.5 us per non-zero on export, against `build_csc`'s 1.3, which makes
+        # this the slowest per-non-zero path in the suite. Measured on pbmc3k
+        # (2,286,884 nnz): to_mtx 287k nnz/s, from_mtx 450k nnz/s. At
+        # tabula_sapiens_100k (195M nnz) that is ~11 min per export and ~7 min
+        # per ingest, so N_RUNS_LARGE=3 exports + 1 deletion export + 3 ingests
+        # is ~67 min. The module caps itself at n_obs <= 100,000 for the same
+        # arithmetic — census_500k would be about an hour per export.
+        "mtx_export":            150,
     }
     base = base_minutes.get(benchmark, 15)
 
@@ -1569,6 +1608,21 @@ def estimate_time_minutes(
         # dominate. Steeper than the 8/M default so the larger OOC tiers don't
         # clip.
         slope_minutes_per_million = 15
+    elif benchmark == "build_csc":
+        # NB this slope is per million **cells** (`per_million = n_obs / 1e6`),
+        # while the op is O(nnz). The two coincide only at a fixed density, so
+        # the number below is calibrated at census density and says so.
+        #
+        # Measured: 259 s per run at tabula_sapiens_100k (100K cells, 195M nnz)
+        # and 1630 s at census_500k (500K cells, 747M nnz) — 2.2 s per million
+        # non-zeros. At N_RUNS_LARGE=3: 13 min and 81 min.
+        #
+        # census_1m carries 1.40B nnz, so 3 runs extrapolate to ~153 min, with a
+        # per-run `shutil.copy2` of a 2.8 GB file on top. 180/M gives
+        # census_500k 135 min and census_1m 225. The 8/M default would have
+        # budgeted 49 minutes for the 81-minute cell; an earlier 90/M gave
+        # census_1m 135 minutes for a ~153-minute job.
+        slope_minutes_per_million = 180
     elif benchmark == "shuffle_layout":
         # Every arm is O(nnz): each rewrite decodes and re-encodes the whole
         # matrix, and the size sweep does that once per codec variant. Steeper
