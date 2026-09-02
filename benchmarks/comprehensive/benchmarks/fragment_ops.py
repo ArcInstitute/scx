@@ -73,6 +73,17 @@ guard at the top of ``run()`` (defense-in-depth for direct invocation)."""
 # Number of random cell indices to mark deleted. Capped by n_obs at runtime.
 _DELETE_N = 10_000
 
+# Names `diagnose_obs_key` may return for the obs index itself, all of which
+# `obs_import(key=…)` accepts. Anything else it suggests is a real obs column
+# and has to be read out of the frame rather than off its index.
+_OBS_INDEX_ALIASES: frozenset[str] = frozenset(
+    {"obs_names", "index", "_index", "__index_level_0__"}
+)
+
+# The CSV's own name for the join column. Paired with `source_key=`, so it is
+# independent of whatever the target side's key turns out to be.
+_OBS_IMPORT_SOURCE_KEY = "join_key"
+
 
 def _gc() -> None:
     gc.collect()
@@ -324,40 +335,60 @@ def _run_compact_full(
         )
 
 
-def _obs_import_csv(base_scx: Path, csv_path: Path) -> tuple[int, str]:
-    """Write a one-column annotation CSV keyed on *base_scx*'s obs index.
+def _obs_import_csv(base_scx: Path, csv_path: Path) -> tuple[int, str, str]:
+    """Write a one-column annotation CSV keyed on a column that can join.
 
-    Returns ``(n_rows, key_field)``. Setup only — outside every timed region.
+    Returns ``(n_rows, target_key, source_key)``. Setup only — outside every
+    timed region.
 
-    ``read_obs([])`` is the matrix-free projection ``obs_open.py`` uses; the
-    projected frame keeps its barcode index by design, so an empty column list
-    still yields the join keys. Measured 5.0 s at census_1m (1M rows).
+    **The obs index is not always unique, and census_1m is the case in point.**
+    An earlier version hard-coded ``key="obs_names"``; it worked at pbmc3k
+    (2700 distinct barcodes) and failed at census_1m with "target obs key
+    'obs_names' contains duplicates … 100000 distinct values over 1000000
+    rows". The CELLxGENE export duplicates its index 10x; the unique column is
+    ``soma_joinid``. `pyscx.diagnose_obs_key` exists for exactly this — its own
+    docstring names this fixture — so the key is resolved per file rather than
+    assumed, and the arm works on any of them.
 
-    The CSV is written with an *unnamed* index column, which
-    ``normalize_field_names`` renames to ``_index`` — the same physical field
-    ``key="obs_names"`` resolves to on the target side. So one ``key=`` covers
-    both sides and the two cannot desync, which is the point of joining by key
-    string rather than row position.
+    The key is written as a **named** column and paired with an explicit
+    ``source_key``, rather than relying on the two sides resolving the same
+    name. That is what `source_key` is for, and it keeps the CSV's shape
+    independent of whether the resolved key happens to be the obs index.
     """
     import numpy as np
     import pandas as pd
     import pyscx
 
+    diag = pyscx.diagnose_obs_key(str(base_scx))
+    target_key = diag.get("suggestion") or "obs_names"
+    if not diag.get("unique_columns"):
+        raise RuntimeError(
+            f"{base_scx.name} has no obs column that can key a join "
+            f"({diag.get('summary')}). The arm joins by key string, never by "
+            f"row position, so there is nothing to measure here."
+        )
+
     exp = pyscx.open(str(base_scx))
     try:
-        index = exp.read_obs([]).index.to_numpy()
+        # `read_obs([])` is the matrix-free projection `obs_open.py` uses; the
+        # projected frame keeps its barcode index by design. Measured 5.0 s at
+        # census_1m for the index alone.
+        if target_key in _OBS_INDEX_ALIASES:
+            keys = exp.read_obs([]).index.to_numpy()
+        else:
+            keys = exp.read_obs([target_key])[target_key].to_numpy()
     finally:
         close = getattr(exp, "close", None)
         if close is not None:
             close()
 
     rng = np.random.default_rng(RANDOM_SEED)
-    frame = pd.DataFrame(
-        {"synth_score": rng.random(len(index)).astype("float32")},
-        index=pd.Index(index),
-    )
-    frame.to_csv(csv_path)
-    return len(index), "obs_names"
+    frame = pd.DataFrame({
+        _OBS_IMPORT_SOURCE_KEY: keys,
+        "synth_score": rng.random(len(keys)).astype("float32"),
+    })
+    frame.to_csv(csv_path, index=False)
+    return len(keys), target_key, _OBS_IMPORT_SOURCE_KEY
 
 
 def _run_obs_import(
@@ -382,7 +413,7 @@ def _run_obs_import(
     import pyscx
 
     csv_path = workdir / "obs_import_source.csv"
-    n_source_rows, key = _obs_import_csv(base_scx, csv_path)
+    n_source_rows, target_key, source_key = _obs_import_csv(base_scx, csv_path)
     csv_bytes = csv_path.stat().st_size
 
     for i in range(n_runs):
@@ -396,19 +427,22 @@ def _run_obs_import(
         # while measuring an import of nothing. `dry_run=True` reports the join
         # without writing.
         preview = pyscx.obs_import(
-            str(target_path), str(csv_path), key=key, dry_run=True,
+            str(target_path), str(csv_path),
+            key=[target_key], source_key=[source_key], dry_run=True,
         )
         n_matched = int(preview.get("n_matched", -1))
         if n_matched != n_source_rows:
             raise RuntimeError(
                 f"obs_import dry-run matched {n_matched} of {n_source_rows} "
-                f"source rows on {target_path.name} (key={key!r}). The timed "
-                f"import would rehash the whole file either way, so refusing "
-                f"to record a wall for a join that did not land."
+                f"source rows on {target_path.name} "
+                f"(key={target_key!r} <- {source_key!r}). The timed import "
+                f"would rehash the whole file either way, so refusing to "
+                f"record a wall for a join that did not land."
             )
 
         wall, rss = _time_op(
-            pyscx.obs_import, str(target_path), str(csv_path), key=key,
+            pyscx.obs_import, str(target_path), str(csv_path),
+            key=[target_key], source_key=[source_key],
         )
 
         size_after = target_path.stat().st_size
@@ -424,6 +458,7 @@ def _run_obs_import(
             },
             rows_imported=n_source_rows,
             n_matched=n_matched,
+            obs_join_key=target_key,
             source_csv_bytes=csv_bytes,
             size_before_bytes=size_before,
             size_after_bytes=size_after,

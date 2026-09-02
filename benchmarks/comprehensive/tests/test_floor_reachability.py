@@ -1764,3 +1764,58 @@ def test_new_arm_metric_names_are_still_emitted(module: str):
         f"its activation recipe describing a floor that resolves None. Rename "
         f"in both places, or here first."
     )
+
+
+def test_obs_import_arm_resolves_its_join_key_instead_of_assuming_one():
+    """The obs index is not always unique, so the arm must not assume it.
+
+    The first version of this arm hard-coded `key="obs_names"`. It passed at
+    pbmc3k, whose 2700 barcodes are distinct, and failed at census_1m with
+
+        duplicate obs join key(s): target obs key 'obs_names' contains
+        duplicates: ["0", "1", "2", "3", "4"]. key 'obs_names' has 100000
+        distinct values over 1000000 rows. Obs columns that ARE unique and can
+        key a join: ["soma_joinid"]. Try key = soma_joinid.
+
+    The CELLxGENE export duplicates its obs index 10x. `diagnose_obs_key`'s own
+    docstring names this exact fixture, and it is the API for the job — so the
+    key is resolved per file. `soma_joinid` is the *right* answer here, which is
+    the mirror image of the `ml_loader` arm above, where it is the wrong one:
+    unique enough to key a join, and an int64 that rebuilds no category list.
+
+    A pbmc3k-only smoke could not have caught this, which is the general point:
+    a fixture that satisfies an assumption cannot test it.
+    """
+    import ast
+
+    tree, path = _bench_ast("fragment_ops")
+    src = path.read_text()
+
+    assert _calls_named(tree, "diagnose_obs_key"), (
+        f"{path.name} no longer calls pyscx.diagnose_obs_key; the obs_import "
+        f"arm would be assuming a join key again"
+    )
+
+    # `key=` must come from the resolved value, never from a literal. A literal
+    # is what reintroduces the bug.
+    literal_keys = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and str(getattr(node.func, "attr", "")) == "obs_import"
+        for kw in node.keywords
+        if kw.arg == "key"
+        and isinstance(kw.value, ast.Constant)
+    ]
+    assert not literal_keys, (
+        f"{path.name} passes a literal `key=` to obs_import at lines "
+        f"{literal_keys}. Resolve it with diagnose_obs_key — the obs index is "
+        f"10x-duplicated on the census fixtures."
+    )
+
+    # And the two sides are paired explicitly rather than relying on both
+    # resolving the same name, since the CSV's column need not be the target's.
+    assert "source_key=[source_key]" in src, (
+        f"{path.name} no longer pairs the CSV's key column with the target's "
+        f"via source_key=; the two sides can then silently disagree"
+    )
