@@ -1485,11 +1485,6 @@ def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, m
 #: point of the guard is that suppressing a floor is a decision someone made
 #: on purpose, so each one is written down.
 _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS: dict[tuple[str, str, str], str] = {
-    ("accel_leiden", "accel_leiden__pyscx_gpu", "pbmc3k"): (
-        "cuGraph Leiden diverges from leidenalg on real graphs — documented in "
-        "CLAUDE.md's Known Limitations. Both the ARI floor and the timing row "
-        "are downstream of the same divergence, so the whole triple is the unit."
-    ),
     ("accel_hvg", "accel_hvg__pyscx_cpu", "pbmc3k"): (
         "hvg_overlap_vs_scanpy is a deterministic 0.9891 against a 0.99 floor on "
         "the 2700-cell fixture — a borderline tie-break miss, and the only floor "
