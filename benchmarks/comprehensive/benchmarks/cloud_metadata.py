@@ -148,7 +148,7 @@ def run(
         )
         logger.info("  wall=%.6fs", timing.wall_s)
 
-    _run_cli_info_arm(result, dataset, cloud_url, n_runs)
+    _run_cli_info_arm(result, dataset, cloud_url)
 
     logger.info(
         "cloud_metadata complete: %s / %s — median %.6fs",
@@ -163,7 +163,6 @@ def _run_cli_info_arm(
     result: BenchmarkResult,
     dataset: DatasetConfig,
     cloud_url: str,
-    n_runs: int,
 ) -> None:
     """Time `scx info <cloud-url>` as a subprocess.
 
@@ -237,6 +236,7 @@ def _run_cli_info_arm(
             "no in-process runs to attach to; the library arm recorded nothing"
         )
         return
+    verdicts: list[int] = []
     for i in range(len(targets)):
         gc.collect()
         entry_rss = current_rss_mb()
@@ -283,8 +283,10 @@ def _run_cli_info_arm(
             ) else 0
         if not ok:
             # Recorded rather than raised — one arm must not fail the cohort —
-            # but recorded *loudly*: a 0 here means the wall below timed a
-            # failure, and any threshold on `scx_info_cloud_ok` fails on it.
+            # but recorded *loudly*: the wall below timed a failure, and the
+            # aggregated `scx_info_cloud_ok` written after the loop is 0 for
+            # the whole arm, so a `min: 1.0` floor fails even if the other
+            # runs succeeded.
             logger.error(
                 "  scx info %s failed (rc=%s, n_obs=%s want %d, "
                 "n_vars=%s want %d): %s",
@@ -301,11 +303,14 @@ def _run_cli_info_arm(
         #
         # Measuring the *child's* peak would need `wait4` rusage, which is the
         # same gap `doublet_interop`'s `residual_rss_mb` documents.
+        verdicts.append(ok)
         targets[i].extra.update({
             "wall_s__scx_info_cloud": round(wall, 6),
             "harness_rss_mb__scx_info_cloud": round(current_rss_mb(), 1),
             "harness_entry_rss_mb__scx_info_cloud": round(entry_rss, 1),
-            "scx_info_cloud_ok": ok,
+            # This run's own verdict, for diagnosis. NOT the gateable key —
+            # see the aggregate below.
+            "scx_info_cloud_run_ok": ok,
             "scx_info_n_obs": n_obs_seen,
             "scx_info_n_vars": n_vars_seen,
         })
@@ -313,3 +318,22 @@ def _run_cli_info_arm(
             "  scx info (cloud) run %d/%d: wall=%.3fs ok=%d",
             i + 1, len(targets), wall, ok,
         )
+
+    # `_load_current_raw_metric` takes the **median** over the runs carrying a
+    # key, so a per-run 0/1 written straight to the gateable name hides a
+    # minority of failures: `[0, 1, 1]` medians to 1.0 and reads as success.
+    # The aggregate is `min`, written onto every carrier, so one failed
+    # invocation drives the metric to 0 and a `min: 1.0` floor fails — which is
+    # what the arm's own docstring and Deferred item 19 claim. Each run's own
+    # verdict stays under `scx_info_cloud_run_ok` for diagnosis.
+    if verdicts:
+        aggregate = min(verdicts)
+        for run_rec in targets:
+            if "scx_info_cloud_run_ok" in run_rec.extra:
+                run_rec.extra["scx_info_cloud_ok"] = aggregate
+        result.metadata["cli_info_runs_ok"] = verdicts
+        if aggregate == 0:
+            logger.error(
+                "  scx info (cloud): %d of %d runs failed; "
+                "scx_info_cloud_ok=0", verdicts.count(0), len(verdicts),
+            )

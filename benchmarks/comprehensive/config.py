@@ -1503,7 +1503,7 @@ def estimate_time_minutes(
         # 120 -> 165 for the two `raw_obs_*` cardinality arms on census_1m:
         # 2 arms x (1 untimed warm + n_runs timed) epochs. Cheap warm, but a
         # page-cache-cold census_1m epoch measured ~1.15 batches/s (~850 s),
-        # and the high-cardinality arm adds a measured ~109 ms/batch on top.
+        # and the high-cardinality arm adds a measured 7.86 ms/batch on top.
         "ml_loader":              165,
         "correctness":            60,
         "roundtrip":              10,

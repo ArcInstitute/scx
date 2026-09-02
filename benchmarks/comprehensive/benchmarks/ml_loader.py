@@ -1521,7 +1521,15 @@ def run(
         # claim. The ratio is the signal a fix has to move.
         # ---------------------------------------------------------------
         obs_spec = _OBS_CARDINALITY_SPEC.get(dataset.name)
-        if loader_type == "scx" and obs_spec is not None:
+        # `scx_auto` only, not every `_SCX_KEYS` variant. The cost this arm
+        # prices is Python-side and codec-independent, so running it on all
+        # seven SCX formats would pay 7x for identical information — the same
+        # reasoning `build_csc` and `fragment_ops` give for pinning a single
+        # trigger. It also keeps the composition justification to one triple:
+        # LATEST carries census_1m rows for all seven formats, and the other
+        # five would otherwise acquire two deliberately slower scenarios with
+        # nothing explaining the shift.
+        if format_variant.key == "scx_auto" and obs_spec is not None:
             observed, problems = _probe_obs_cardinality(
                 data_path, [c for c, _n in obs_spec.values()]
             )
@@ -1578,9 +1586,7 @@ def run(
                         # epoch, and this arm did not — so a `cold_cache=True`
                         # campaign would have measured a warmed file here and
                         # labelled it cold, with the second arm additionally
-                        # riding the first arm's reads. The documented
-                        # +109 ms/batch was taken with a separate cold probe,
-                        # which the arm could not have reproduced.
+                        # riding the first arm's reads.
                         #
                         # `drop_file_cache` (posix_fadvise, per file, returns
                         # its own policy label) rather than the privileged
@@ -1646,14 +1652,19 @@ def run(
                     # the expected direction; OPT-LOADER-6 drives it toward 1.
                     slowdown = lo / hi
                     # The *ratio* is host-dependent in a way the per-batch
-                    # delta is not, and the difference is large enough to
-                    # matter: measured on census_1m, a page-cache-cold epoch
-                    # runs at ~1.15 batches/s and the same 109 ms/batch of
-                    # category rebuilding shows up as only 1.13x, while at the
-                    # warm ~48 batches/s this benchmark normally reports it is
-                    # several-fold. Milliseconds per batch is the quantity the
-                    # fix actually changes, so it is recorded beside the ratio
-                    # and is the better thing to floor.
+                    # delta is not, so milliseconds per batch is the quantity
+                    # to record and to floor.
+                    #
+                    # Measured through this arm at census_1m, 2 runs of a full
+                    # 977-batch epoch: 4.2 -> 4.1 batches/s, **7.86 ms/batch**,
+                    # 1.033x. A standalone 40-batch cold probe had reported
+                    # +109 ms/batch, which agreed with the review doc's
+                    # 60-120 ms/batch estimate and is ~14x too high — 40
+                    # batches cannot separate an 8 s construction cost from a
+                    # per-batch one. The mechanism is confirmed live (the
+                    # 957,955-entry `categories` list is a fresh object every
+                    # batch), so ~8 ns per category is simply what it costs:
+                    # ~3% of a 238 ms batch, not the several-fold predicted.
                     overhead_ms = (1.0 / hi - 1.0 / lo) * 1000.0
                     scenario_summary["raw_obs_cardinality"] = {
                         "applicable": True,
@@ -1679,7 +1690,7 @@ def run(
                     # *carry* the key, so writing the same value onto each
                     # high-cardinality run yields the identical gate reading
                     # with no synthetic measurement.
-                    n_attached = _attach_to_scenario_runs(
+                    attached = _attach_to_scenario_runs(
                         result,
                         "raw_obs_highcard",
                         {
@@ -1693,8 +1704,8 @@ def run(
                     )
                     logger.info(
                         "  obs cardinality: %.1f -> %.1f batches/s "
-                        "(%.2fx slower, +%.1f ms/batch)",
-                        lo, hi, slowdown, overhead_ms,
+                        "(%.2fx slower, +%.1f ms/batch; on %d run(s))",
+                        lo, hi, slowdown, overhead_ms, attached,
                     )
 
         # ---------------------------------------------------------------

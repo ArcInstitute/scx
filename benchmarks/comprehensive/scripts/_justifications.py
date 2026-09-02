@@ -56,7 +56,11 @@ for that triple alone. **Both keys are accepted at both levels** — a
 Rejecting one spelling per level would reintroduce the failure this field
 exists to end: a scope that is silently ignored falls open to whole-triple
 suppression, and that is exactly how 16 floors became unenforceable. A triple's effective scope is the union of the two, and a
-triple named *without* either keeps the whole-triple default. Where two files
+triple named *without* either keeps the whole-triple default — but a key
+written with *nothing after it* is an error rather than a synonym for omitting
+it, since a bare ``metrics:`` parsing as "every metric" would silently restore
+whole-triple suppression on a file whose author was visibly trying to scope it.
+Where two files
 name the same triple, the scopes union, and an unscoped file wins (the widest
 claim holds).
 
@@ -146,31 +150,51 @@ def _coerce_date(value: Any) -> _dt.date | None:
     raise ValueError(f"unsupported type for 'expires': {type(value).__name__}")
 
 
+#: Distinguishes "the key was not there" from "the key was there and null".
+#: Returning ``None`` for both is what made a bare `metrics:` parse exactly
+#: like omitting `metrics` — i.e. fall open to whole-triple suppression, the
+#: bug this whole field exists to close.
+_ABSENT = object()
+
+
 def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
-    """First of *keys* present in *mapping*, else ``None``.
+    """First of *keys* present in *mapping*, else :data:`_ABSENT`.
 
     Lets `metric:` and `metrics:` be accepted at both the file and entry level
-    without either spelling being the one that silently does nothing.
+    without either spelling being the one that silently does nothing — and
+    keeps a *present* key with a null value distinguishable from an absent
+    one, because those two must not mean the same thing.
     """
     for key in keys:
         if key in mapping:
             return mapping[key]
-    return None
+    return _ABSENT
 
 
 def _coerce_metrics(path: Path, value: Any) -> MetricScope:
     """Normalize a ``metrics:`` / ``metric:`` field into a scope or ``None``.
 
-    ``None`` (absent) means "every metric" — see the module docstring. A single
-    string is accepted for the singular ``metric:`` spelling that committed
-    files already use.
+    An **absent** key (:data:`_ABSENT`) means "every metric" — see the module
+    docstring. A key that is *present but null* is an error, not a synonym for
+    absent. A single string is accepted for the singular ``metric:`` spelling
+    that committed files already use.
 
     An *empty* list is rejected rather than read as either extreme: it would
     suppress nothing at all while looking exactly like a scoped suppression,
     and that is the failure mode this whole field exists to end.
     """
-    if value is None:
+    if value is _ABSENT:
         return None
+    if value is None:
+        # `metrics:` with nothing after it. Rejected rather than read as
+        # either extreme: as "every metric" it silently restores whole-triple
+        # suppression on a file whose author was plainly trying to scope it,
+        # and as "no metrics" it would suppress nothing while looking scoped.
+        raise ValueError(
+            f"{path}: 'metric'/'metrics' is present but null. Omit the key "
+            f"entirely to suppress every metric on the triple, or name the "
+            f"ones this file explains."
+        )
     if isinstance(value, str):
         names = [value]
     elif isinstance(value, (list, tuple)):

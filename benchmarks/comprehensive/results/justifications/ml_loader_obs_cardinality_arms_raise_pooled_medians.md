@@ -13,10 +13,7 @@ triples:
   - benchmark: ml_loader
     format: scx_auto
     dataset: census_1m
-  - benchmark: ml_loader
-    format: scx_fast
-    dataset: census_1m
-reason: "Two new obs-cardinality arms (raw_obs_lowcard / raw_obs_highcard) add runs to a triple whose summary medians are pooled across every run; the high-cardinality arm is intentionally ~109 ms/batch slower. Not a regression."
+reason: "Two new obs-cardinality arms (raw_obs_lowcard / raw_obs_highcard) add runs to a triple whose summary medians are pooled across every run; the high-cardinality arm is intentionally slower (measured 7.86 ms/batch). Not a regression."
 ---
 
 # `ml_loader` pooled medians rose when the obs-cardinality arms landed
@@ -53,21 +50,31 @@ categorical one.
 run at similar rates; the new pair adds runs that are deliberately slower, and
 the high-cardinality one deliberately much slower.
 
-Measured 2026-09-02, page-cache-cold, 40 batches at `batch_size=1024`:
+Measured through the arm at census_1m, 2 runs of a full 977-batch epoch
+(SLURM job 2891005, warm):
 
-| `obs_columns=` | batches/s | ms/batch |
-|---|---|---|
-| `None` (the `raw` scenario) | 1.15 | 872 |
-| `["sex"]` (3 categories) | 1.14 | 879 |
-| `["observation_joinid"]` (958k) | 1.02 | 981 |
+| scenario | `obs_columns=` | categories | batches/s |
+|---|---|---|---|
+| `raw_obs_lowcard` | `["sex"]` | 3 | 4.2 |
+| `raw_obs_highcard` | `["observation_joinid"]` | 957,955 | 4.1 |
 
-**+109 ms/batch** for the high-cardinality column — squarely inside the
-60–120 ms/batch the review estimated from the code. Note it is only **1.13×**
-as a ratio, because a cold epoch is I/O-bound at ~1.15 batches/s; this
-benchmark normally reports warm, page-cache-resident rates (~48 batches/s),
-where the same 109 ms is several-fold. That is exactly why the arm records
-`obs_highcard_overhead_ms_per_batch` beside the ratio: the per-batch delta is
-what the fix changes, and the ratio is a property of the host.
+**7.86 ms/batch**, a 1.033× slowdown.
+
+> **Correction.** An earlier version of this file reported **+109 ms/batch**,
+> from a standalone 40-batch cold probe — a number that agreed with the review
+> doc's 60–120 ms/batch estimate and is ~14× too high. 40 batches cannot
+> separate an 8 s construction cost from a per-batch one. The full-epoch figure
+> is the one to use.
+>
+> The mechanism is real and confirmed live, so the small number is a *finding*:
+> a batch's `obs["observation_joinid"]` arrives as `{codes, categories}` with
+> 957,955 categories, and the list is a fresh object every batch (checked by
+> identity). ~8 ns per category on a 238 ms batch is ~3% of an epoch — so
+> OPT-LOADER-6 is worth much less than estimated, and this arm is what says so.
+
+The arm records `obs_highcard_overhead_ms_per_batch` beside the ratio because
+the per-batch delta is what a fix changes and the ratio is a property of how
+I/O-bound the host is.
 
 The per-scenario keys are where the signal is —
 `batches_per_sec__raw_obs_highcard` and friends are sparse, so a threshold on
@@ -76,9 +83,18 @@ suppresses.
 
 ## Scope
 
-Both `scx_auto` and `scx_fast` are listed: the arm is gated on
-`loader_type == "scx"`, not on a single codec key, so whichever SCX variants a
-capture schedules on census_1m will carry the new runs.
+One triple, because the arm runs on **`scx_auto` only**. It was first gated on
+`loader_type == "scx"`, which covers all seven `_SCX_KEYS` variants — and
+`results/baselines/LATEST` carries census_1m rows for all seven, so five of them
+would have acquired two deliberately slower scenarios with nothing here
+explaining the shift. A reviewer caught the mismatch between the code, this
+front matter and the prose.
+
+Pinning a single trigger is also the right answer on its own terms: the cost
+this arm prices is Python-side (`obs_to_pydict` rebuilding a category list) and
+codec-independent, so seven variants would pay seven times for one number. It
+is the same reasoning `build_csc` and `fragment_ops` give for their own
+`scx_auto` pins.
 
 Deliberately **not** listed: `ml_loader / scx_auto / tabula_sapiens_100k`,
 which carries two live `batches_per_sec__pyscx_training_dataset_workers2*`

@@ -3226,22 +3226,33 @@ absolute_floors:
 #     census_1m, so it takes `obs_to_pydict`'s numpy branch and builds no
 #     dictionary at all. High cardinality, cheap path.
 #
-#     Measured 2026-09-02 with a standalone cold probe, 40 batches,
-#     batch_size=1024:
-#         obs_columns=None                  1.15 batches/s   (872 ms/batch)
-#         obs_columns=["sex"]               1.14 batches/s   (879 ms/batch)
-#         obs_columns=["observation_joinid"] 1.02 batches/s  (981 ms/batch)
-#     i.e. +109 ms/batch for the 958k-category column, squarely inside the
-#     60-120 ms/batch the review estimated — but only 1.13x as a *ratio*,
-#     because a cold epoch is I/O-bound. This benchmark normally reports warm,
-#     page-cache-resident rates (~48 batches/s), where the same 109 ms is
-#     several-fold.
+#     MEASURED THROUGH THE ARM, census_1m, 2 runs of a full 977-batch epoch
+#     (SLURM job 2891005, warm):
+#         raw_obs_lowcard   ("sex", 3 categories)             4.2 batches/s
+#         raw_obs_highcard  ("observation_joinid", 957,955)   4.1 batches/s
+#         obs_highcard_overhead_ms_per_batch                  7.86
+#         obs_highcard_slowdown_vs_lowcard                    1.033
 #
-#     The arm now honours `cold_cache` (`drop_file_cache` before every timed
-#     epoch, policy recorded as `cache_policy`). It did not at first, so a cold
-#     campaign would have measured a warmed file and labelled it cold — and the
-#     numbers above, taken with a separate probe, were not reproducible through
-#     the arm. Read `cache_policy` before comparing a capture against them.
+#     ** That is ~14x SMALLER than this entry first claimed, and the earlier
+#     number should not be used. ** A standalone 40-batch cold probe reported
+#     +109 ms/batch (1.15 -> 1.02 batches/s), which happened to agree with the
+#     review doc's estimate of 60-120 ms/batch; neither survives a full epoch.
+#     40 batches cannot separate a one-off construction cost from a per-batch
+#     one — the constructor alone was 8.3-8.8 s in that probe.
+#
+#     The mechanism is real and confirmed live, so the small number is a
+#     finding, not a measurement error: a batch's `obs["observation_joinid"]`
+#     arrives as `{codes, categories}` with **957,955 categories**, and
+#     `categories is previous_batch_categories` is False — the list is rebuilt
+#     every batch, uncached, exactly as OPT-LOADER-6 describes. It costs ~8 ns
+#     per category, so ~7.9 ms on a 238 ms batch: **~3% of an epoch, not the
+#     several-fold the review predicted.** Price OPT-LOADER-6 accordingly.
+#
+#     The arm honours `cold_cache` (`drop_file_cache` before every timed epoch,
+#     policy recorded as `cache_policy`); it did not at first, so a cold
+#     campaign would have measured a warmed file and labelled it cold. The
+#     figures above are `cache_policy = "warm"` — read that key before
+#     comparing a capture against them.
 #
 #     Category counts are read off the file (`obs_categorical`) rather than
 #     taken from the module's spec: `obs_n_categories` is the observed count
@@ -3264,7 +3275,12 @@ absolute_floors:
 #              metric: obs_highcard_overhead_ms_per_batch -> max: 1.18 x median
 #       3. Also floor `batches_per_sec__raw_obs_highcard` at 0.85x its median,
 #          but read that median from a WARM capture — a cold one is measuring
-#          the shard reads.
+#          the shard reads. At the measured 4.1 batches/s that is min: 3.49.
+#       4. A 7.86 ms/batch signal against a 238 ms batch is ~3%, which is
+#          inside the run-to-run spread of most things in this suite. Floor
+#          `obs_highcard_overhead_ms_per_batch` (the I/O-independent quantity)
+#          rather than the ratio, and do not expect the ratio to be a useful
+#          gate at this scale.
 #
 # 17. grouped_sort / `convert_sort_by` (sort-on-convert)
 #     `pyscx.from_h5ad(sort_by=…)` had no benchmark anywhere in the suite;

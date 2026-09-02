@@ -179,7 +179,7 @@ def _cli_arm(monkeypatch, tmp_path, stdout: str, rc: int = 0, n_runs: int = 1):
     for _ in range(n_runs):
         result.add_run(wall_s=0.25, peak_rss_mb=110.0, library_open=True)
     cloud_metadata._run_cli_info_arm(
-        result, dataset, "gs://example/pbmc3k.scxd/", n_runs=n_runs,
+        result, dataset, "gs://example/pbmc3k.scxd/",
     )
     return result
 
@@ -190,6 +190,7 @@ def test_cli_info_arm_records_ok_on_a_matching_n_obs(monkeypatch, tmp_path):
     assert len(result.runs) == 1
     extra = result.runs[0].extra
     assert extra["scx_info_cloud_ok"] == 1
+    assert extra["scx_info_cloud_run_ok"] == 1
     assert extra["scx_info_n_obs"] == 2700
     assert extra["wall_s__scx_info_cloud"] > 0
     # No `scenario` of its own: the metrics ride the in-process run, which is
@@ -251,10 +252,17 @@ def test_cli_info_arm_skips_with_a_reason_when_no_cloud_build_exists(
     result = BenchmarkResult(
         benchmark="cloud_metadata", format="scx_auto", dataset="pbmc3k",
     )
+    result.add_run(wall_s=0.25, peak_rss_mb=110.0)
     cloud_metadata._run_cli_info_arm(
-        result, DATASETS["pbmc3k"], "gs://example/pbmc3k.scxd/", n_runs=2,
+        result, DATASETS["pbmc3k"], "gs://example/pbmc3k.scxd/",
     )
-    assert not result.runs, "a skipped arm must record no runs"
+    # The seeded in-process run survives untouched — the arm attaches to
+    # existing runs, so "skipped" means it added no keys, not no runs.
+    assert len(result.runs) == 1
+    assert not any(
+        k.endswith("__scx_info_cloud") or k.startswith("scx_info_")
+        for k in result.runs[0].extra
+    ), f"a skipped arm attached keys anyway: {result.runs[0].extra}"
     assert "--features cloud" in result.metadata["cli_info_skipped_reason"]
 
 
@@ -321,3 +329,63 @@ def test_cli_info_arm_adds_no_runs_and_leaves_the_pooled_medians_alone(
             "anything; naming it one is what PR-02a had to undo three times"
         )
         assert run.extra["wall_s__scx_info_cloud"] > 0.0
+
+
+def test_cli_info_arm_fails_the_gate_on_a_single_failed_run(monkeypatch, tmp_path):
+    """One failed invocation among three must drive `scx_info_cloud_ok` to 0.
+
+    `_load_current_raw_metric` takes the **median** over the runs carrying a
+    key, so a per-run 0/1 written straight to the gateable name hides a
+    minority of failures: `[0, 1, 1]` medians to 1.0 and reads as success. That
+    directly contradicted this arm's own docstring and Deferred item 19. A
+    reviewer worked it out from the reader; this pins it.
+
+    The aggregate is `min` across the arm's runs, so the per-run verdicts stay
+    available under `scx_info_cloud_run_ok` for diagnosis without being what a
+    floor reads.
+    """
+    import statistics
+
+    from benchmarks.comprehensive.benchmarks import cloud_metadata
+    from benchmarks.comprehensive.config import DATASETS
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    # A binary that answers the cloud probe, then succeeds twice and fails once
+    # — the JSON it prints depends on a counter file it bumps itself.
+    import stat
+
+    counter = tmp_path / "n"
+    counter.write_text("0")
+    path = tmp_path / "scx"
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "pull" ]; then echo cloud; exit 0; fi\n'
+        f'n=$(cat {counter}); echo $((n+1)) > {counter}\n'
+        'if [ "$n" = "1" ]; then echo \'{"n_obs": 1, "n_vars": 1}\'; exit 0; fi\n'
+        'echo \'{"n_obs": 2700, "n_vars": 32738}\'\n'
+    )
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    _pin_candidates(monkeypatch, path)
+
+    result = BenchmarkResult(
+        benchmark="cloud_metadata", format="scx_auto", dataset="pbmc3k",
+    )
+    for _ in range(3):
+        result.add_run(wall_s=0.25, peak_rss_mb=110.0)
+    cloud_metadata._run_cli_info_arm(
+        result, DATASETS["pbmc3k"], "gs://example/pbmc3k.scxd/",
+    )
+
+    per_run = [r.extra["scx_info_cloud_run_ok"] for r in result.runs]
+    assert sorted(per_run) == [0, 1, 1], f"premise: one run failed; got {per_run}"
+    # The median of the per-run verdicts is 1.0 — which is exactly why the
+    # gateable key cannot be the per-run value.
+    assert statistics.median(per_run) == 1
+
+    gated = [r.extra["scx_info_cloud_ok"] for r in result.runs]
+    assert gated == [0, 0, 0], (
+        f"the gateable key is {gated}; one failed invocation must drive it to "
+        f"0 on every carrier so a `min: 1.0` floor fails"
+    )
+    assert statistics.median(gated) == 0
+    assert result.metadata["cli_info_runs_ok"] == per_run

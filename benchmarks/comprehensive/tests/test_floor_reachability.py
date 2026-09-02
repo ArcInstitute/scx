@@ -1434,7 +1434,7 @@ def test_deliberate_suppression_allowlist_has_no_stale_entries():
 # ---------------------------------------------------------------------------
 
 
-def test_collate_arm_builds_a_mask_that_actually_withholds(tmp_path):
+def test_collate_arm_builds_a_mask_that_actually_withholds():
     """An empty — or all-zero — `enc_mask_positions` measures the wrong branch.
 
     `collate_cell` builds its withheld-gene `HashSet<i64>` (and pays a probe
@@ -1956,6 +1956,17 @@ def test_obs_cardinality_preflight_rejects_a_non_dictionary_column(tmp_path):
     )
     assert "nope" in joined and "absent" in joined, problems
 
+    # The open-failure path. It used to return "no problems", which left the
+    # caller indexing an empty dict — `KeyError: 'sex'` before the arm's own
+    # error could surface.
+    missing_counts, missing_problems = _probe_obs_cardinality(
+        str(tmp_path / "does-not-exist.scx"), ["kind"]
+    )
+    assert missing_counts == {}
+    assert missing_problems and "could not open" in missing_problems[0], (
+        f"an unopenable file must be reported as a problem: {missing_problems}"
+    )
+
 
 def test_cardinality_premise_rejects_a_collapsed_dictionary():
     """A column that stays categorical but loses its size loses the premise.
@@ -2048,3 +2059,176 @@ def test_sort_by_convert_moves_x_with_obs(tmp_path):
         dtype="float32",
     )
     np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize(
+    "front_matter,expected",
+    [
+        # Absent: the historical whole-triple default, which four committed
+        # files rely on.
+        ("triples:\n  - {benchmark: b, format: f, dataset: d}\n", "ALL"),
+        # Present but null, both spellings and both levels. These parsed as
+        # "every metric" — i.e. fell open to whole-triple suppression on a file
+        # whose author was visibly trying to scope it.
+        ("metrics:\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n", "REJECT"),
+        ("metric:\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n", "REJECT"),
+        ("triples:\n  - {benchmark: b, format: f, dataset: d, metric: }\n", "REJECT"),
+        ("triples:\n  - {benchmark: b, format: f, dataset: d, metrics: }\n", "REJECT"),
+        # Empty list: suppresses nothing while looking scoped.
+        ("metrics: []\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n", "REJECT"),
+        # The two working spellings, at both levels.
+        ("metric: median_wall_s\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n",
+         ["median_wall_s"]),
+        ("metrics: [x, y]\ntriples:\n  - {benchmark: b, format: f, dataset: d}\n",
+         ["x", "y"]),
+        ("triples:\n  - {benchmark: b, format: f, dataset: d, metrics: [z]}\n", ["z"]),
+    ],
+)
+def test_metric_scope_shapes(front_matter, expected, tmp_path):
+    """Every shape a `metric:`/`metrics:` field can take, and what it means.
+
+    The one that matters is **present but null**. `_first_present` originally
+    returned `None` both for an absent key and for a key with nothing after it,
+    and `_coerce_metrics` gave `None` the historical "every metric" meaning —
+    so the very plausible stub
+
+        metrics:
+        triples:
+          - benchmark: fragment_ops
+            ...
+
+    parsed exactly like omitting the key and suppressed every absolute floor on
+    the triple. That is the bug this field exists to close, reintroduced by the
+    fix for it. A reviewer reproduced the path through `suppresses`.
+
+    Absent and null must therefore be distinguishable, which is what the
+    `_ABSENT` sentinel is for. A rejected file is *skipped* by
+    `load_active_triples` (logged, not raised), so it suppresses nothing —
+    failing closed, with the floors left live.
+    """
+    import sys
+
+    scripts = PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import _justifications  # noqa: PLC0415
+
+    path = tmp_path / "j.md"
+    path.write_text(f"---\n{front_matter}---\n")
+
+    if expected == "REJECT":
+        with pytest.raises(ValueError):
+            _justifications.parse_justification(path)
+        # And the loader's fail-closed behaviour: a malformed file is skipped,
+        # so nothing is suppressed.
+        suppression, _parsed = _justifications.load_active_triples(tmp_path)
+        assert suppression == {}, (
+            f"a malformed justification suppressed {suppression}; it must be "
+            f"skipped so the floors stay live"
+        )
+        return
+
+    parsed = _justifications.parse_justification(path)
+    scope = parsed.scope_for(("b", "f", "d"))
+    if expected == "ALL":
+        assert scope is None
+    else:
+        assert scope is not None and sorted(scope) == expected
+
+
+def test_no_duplicate_keys_in_config_tables():
+    """A duplicate key in a `config.py` table is silently discarded by Python.
+
+    Not hypothetical and not cosmetic: a change intending to raise
+    `fragment_ops`' SLURM time budget added a second `"fragment_ops"` entry
+    earlier in the *same* `base_minutes` dict. Python kept the later one, so the
+    edit had no runtime effect — the arm it was budgeting for got nothing, and
+    the diff read as if it had.
+
+    AST rather than behaviour on purpose: a discarded key leaves no trace at
+    run time, so there is nothing to observe. This is the one case in this file
+    where source inspection is the *only* possible instrument, as against the
+    arm guards where it is the weaker one.
+
+    (Written once, lost to a careless slice-replace while converting other
+    guards, and then asserted by a `config.py` comment that pointed at a test
+    that did not exist. Two reviewers caught that.)
+    """
+    import ast
+    import collections
+
+    config = PROJECT_ROOT / "benchmarks" / "comprehensive" / "config.py"
+    tree = ast.parse(config.read_text(), filename=str(config))
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        keys = [
+            k.value for k in node.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        ]
+        dupes = sorted(k for k, n in collections.Counter(keys).items() if n > 1)
+        if dupes:
+            offenders.append(f"line {node.lineno}: {dupes}")
+
+    assert not offenders, (
+        f"duplicate keys in config.py dict literals: {offenders}. Python keeps "
+        f"the last one and discards the rest silently, so whichever entry you "
+        f"were editing may have had no effect."
+    )
+
+
+def test_verify_sorted_tells_a_sorted_output_from_an_unsorted_one(tmp_path):
+    """The sort verification has to discriminate, not just return 1.
+
+    Driven on real converts of one 60-row source, because the whole point is
+    that a convert which *ignored* `sort_by` produces a valid file: the
+    regression is invisible in the output's shape, size or wall — only in the
+    order. So the reject side is a plain `from_h5ad` with no `sort_by`, which
+    is exactly what that regression would look like.
+
+    (Also written once and then destroyed by a slice-replace, which left
+    `_verify_sorted` with no coverage at all — the module's other two tests
+    monkeypatch it. A reviewer caught that.)
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    anndata = _pytest.importorskip("anndata")
+    np = _pytest.importorskip("numpy")
+    pd = _pytest.importorskip("pandas")
+    sp = _pytest.importorskip("scipy.sparse")
+
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+
+    n = 60
+    rng = np.random.default_rng(0)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.random((n, 5), dtype="float32")),
+        obs=pd.DataFrame(
+            {"pert": pd.Categorical(rng.choice(["c", "a", "b"], n))},
+            index=[f"cell{i}" for i in range(n)],
+        ),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+    )
+    src = tmp_path / "s.h5ad"
+    adata.write_h5ad(src)
+
+    sorted_out = tmp_path / "sorted.scx"
+    pyscx.from_h5ad(str(src), str(sorted_out), sort_by=["pert"])
+    plain_out = tmp_path / "plain.scx"
+    pyscx.from_h5ad(str(src), str(plain_out))
+
+    good = grouped_sort._verify_sorted(sorted_out, "pert", n)
+    assert good == {"sort_by_ordered_int": 1, "sort_by_rows_kept_int": 1}
+
+    ignored = grouped_sort._verify_sorted(plain_out, "pert", n)
+    assert ignored["sort_by_ordered_int"] == 0, (
+        "a convert that ignored sort_by scored as ordered; the verification "
+        "cannot see the one regression that would read as a speedup"
+    )
+    assert ignored["sort_by_rows_kept_int"] == 1, "no rows were lost"
+
+    short = grouped_sort._verify_sorted(sorted_out, "pert", n + 1)
+    assert short["sort_by_rows_kept_int"] == 0
