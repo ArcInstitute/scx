@@ -1574,10 +1574,11 @@ typical.
 > ```
 >
 > Omitting both keeps the whole-triple default, which is still correct for a
-> triple that really is wholly known-bad. `test_floor_reachability.py::
-> test_no_floor_is_fully_suppressed_by_an_active_justification` fails on any
-> floor under an unscoped suppression; deliberate cases are allowlisted there
-> with their reason. Full detail in
+> triple that really is wholly known-bad.
+> `test_no_floor_is_fully_suppressed_by_an_active_justification`
+> (in `test_floor_reachability.py`) fails on any floor under an unscoped
+> suppression; deliberate cases are allowlisted there with their reason. Full
+> detail in
 > [`results/justifications/README.md`](comprehensive/results/justifications/README.md).
 
 ### Variance-aware timing tolerance (IQR widening)
