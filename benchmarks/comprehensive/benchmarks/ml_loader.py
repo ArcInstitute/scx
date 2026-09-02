@@ -26,6 +26,7 @@ GPU utilization (gpu_train only).
 from __future__ import annotations
 
 import gc
+import functools
 import logging
 import os
 import resource
@@ -503,9 +504,22 @@ def _hvg_indices(path: str, hvg: bool) -> list[int] | None:
     """
     if not hvg:
         return None
+    return list(range(QUERY_N_HVGS)) if _n_vars(path) > QUERY_N_HVGS else None
+
+
+@functools.lru_cache(maxsize=None)
+def _n_vars(path: str) -> int:
+    """`n_vars` off the catalog, once per path per process.
+
+    Cached because `_hvg_indices` is called from inside the timed epoch
+    functions, and every scenario runs a warmup epoch before the timed ones —
+    so the open lands in the warmup and the timed region adds nothing. A
+    catalog open is sub-millisecond against epochs measured in seconds, but a
+    benchmark should not put even that in the region it is reporting.
+    """
     import pyscx
 
-    return list(range(QUERY_N_HVGS)) if pyscx.open(path).n_vars > QUERY_N_HVGS else None
+    return int(pyscx.open(path).n_vars)
 
 
 def _run_scx_epoch(
