@@ -151,6 +151,43 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_auto.scx"
 
     @property
+    def scx_full_path(self) -> Path:
+        """The `auto`-codec fixture enriched with `.raw`, obsm and a layer.
+
+        Deliberately **not** a `FormatVariant`, and deliberately not routed
+        through `path_for_format`. Both of the obvious shapes would produce a
+        threshold that a default `gate_candidate.py` run never evaluates:
+
+        * as an `ADDITIONAL_FORMATS` variant — `run_parallel` defaults its format
+          pool to `PRIMARY_FORMATS` (+ accel / multimodal), so it would only be
+          scheduled under an explicit `--formats`. Adding it to `PRIMARY_FORMATS`
+          instead would pair it with every benchmark that declares no
+          `SUPPORTED_FORMATS`, which is most of them.
+        * as a new `DATASETS` entry — it would sit outside every
+          `capture_baseline.TIERS` list, and `gate_candidate.py` forwards
+          `--datasets` only when the operator passes it. `check_absolute_floors`
+          skips a triple that did not run *silently*, so the threshold would read
+          as coverage and provide none. **53 floors across 7 datasets are in
+          exactly that state today** — see `thresholds.yaml`'s Deferred floors
+          block.
+
+        Instead the two benchmarks that need it (`export_streaming`,
+        `fragment_ops`) read this path as an extra *arm* of a triple the default
+        gate already schedules.
+
+        Why it has to exist at all: no source h5ad in the suite carries a
+        `.raw`, an `obsm` key or a layer, so `census_1m_auto.scx` and
+        `tabula_sapiens_100k_auto.scx` have `obsm_keys == []` and
+        `layer_names == []`. Every export threshold measured on them is blind to
+        the raw and obsm copies in `scx-convert`'s export path — the two places
+        it still materialises a whole matrix.
+
+        Built by `benchmarks/scripts/prep_full_fixtures.py`; absent until that
+        has been run for the dataset.
+        """
+        return DATA_DIR / f"{self.name}_full.scx"
+
+    @property
     def scx_fast_path(self) -> Path:
         return DATA_DIR / f"{self.name}_fast.scx"
 
@@ -1070,6 +1107,23 @@ def estimate_memory_gb(
     elif benchmark == "compression":
         # Just measures file sizes — Python overhead only.
         peak_mb = base_mb * 0.25
+    elif benchmark in ("conversion_streaming", "export_streaming"):
+        # Both benchmarks cap their materialize arm above
+        # MATERIALIZE_MAX_N_OBS (1M cells), so the worst resident case at any
+        # tier is that arm at exactly 1M: the whole CSR triplet, measured at
+        # 13.98 GB on census_1m — about 1.2x the source h5ad, which `base_mb`
+        # (2x) already covers.
+        #
+        # The 1.5x on top is `export_streaming`'s `streaming_full` arm. It
+        # exports `<name>_full.scx`, whose `.raw` is held whole by
+        # `write_raw_to_h5ad`'s `read_all_raw_csr_shards()` — measured at
+        # +1579 MB over the plain arm on tabula_sapiens_100k, and it scales with
+        # nnz (8 B each), so roughly +1x the source's sparse content at any tier.
+        #
+        # Both fell through to `peak_mb = base_mb` before this branch, which was
+        # not a decision: `export_streaming`'s own docstring flagged the absence
+        # as the reason its materialize cap had to exist at all.
+        peak_mb = max(base_mb * 1.5, 8 * 1024)
     elif benchmark == "fragment_ops":
         # SCX-only. pyscx.append reads the entire input CSR into memory
         # (indptr + indices + decoded values) before re-encoding into the
@@ -1077,6 +1131,11 @@ def estimate_memory_gb(
         # buffers, not the dense matrix. Also needs scratch room for a few
         # on-disk copies of the base file (for per-run isolation), but those
         # are SCX-compressed and << dense_mb.
+        #
+        # The `compact_full` arm (a rewrite of `<name>_full.scx`, which carries
+        # `.raw` + obsm + a layer) rides inside this envelope: it is another
+        # rewrite of a file ~2.7x the plain one, and `dense_mb * 0.5` is already
+        # 11.7 GB at tabula_sapiens_100k against a measured single-GB peak.
         peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark in ("cloud_push", "cloud_pull"):
         # SCX-only. pyscx.push/pull stream section-by-section with a small
@@ -1476,6 +1535,27 @@ def estimate_time_minutes(
         # cache-cold TrainingDataset epochs on two files. The rewrite count is
         # what makes the base generous; see the steep slope below.
         "shuffle_layout":         60,
+        # Streaming ingest / export. Each runs 2-4 arms, each in its own
+        # subprocess, each n_runs times, and each arm rewrites or re-reads the
+        # whole matrix. `export_streaming`'s `streaming_full` arm is the slowest
+        # per run — 35-38 s against the plain arm's 13-15 s at
+        # tabula_sapiens_100k, because it writes X, raw, two obsm matrices and a
+        # layer instead of X alone.
+        #
+        # Measured end-to-end at tabula_sapiens_100k: ~4 min for all four
+        # export arms at N_RUNS_LARGE=3. The base is generous against that on
+        # purpose — these run on `cpu_preemptible`, where a job killed at the
+        # timeout costs the whole capture and an over-request costs queue
+        # position. Both previously fell through to the 15-min default, which
+        # does not cover a single census_1m materialize run.
+        "conversion_streaming":   90,
+        "export_streaming":       90,
+        # Five ops x n_runs, and two of them are whole-file rewrites. Measured
+        # at tabula_sapiens_100k: `compact` 154-169 s per run, `compact_full`
+        # 244-295 s per run (it rewrites a fixture 2.75x the size, carrying a
+        # layer and two obsm matrices). At N_RUNS_LARGE=3 those two arms alone
+        # are ~21 min, which the 15-min fall-through default does not cover.
+        "fragment_ops":           45,
     }
     base = base_minutes.get(benchmark, 15)
 

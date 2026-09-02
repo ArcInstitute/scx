@@ -9,6 +9,15 @@ mutations exposed by ``scx-ops`` via pyscx:
   * ``compact``   — full rewrite that reclaims deleted/orphaned bytes
   * ``rollback``  — revert the active manifest to the prior sequence
 
+plus, when ``<dataset>_full.scx`` has been built by
+``benchmarks/scripts/prep_full_fixtures.py``:
+
+  * ``compact_full`` — ``compact`` on a file that carries two ``obsm`` keys and
+    a layer, neither of which any ordinary fixture in the suite has. Carries
+    ``peak_rss_mb__compact_full``. The fixture also has a ``.raw``, but
+    ``compact`` drops raw (with a warning) rather than carrying it, so this arm
+    does **not** measure a raw copy — see ``_run_compact_full``.
+
 This is an SCX-only benchmark. For every non-SCX format variant the module
 returns ``None`` (mirrors ``correctness.py``), so the orchestrator silently
 skips those combinations.
@@ -27,7 +36,7 @@ import numpy as np
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant, RANDOM_SEED
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.rss import current_rss_mb as _current_rss_mb
+from benchmarks.comprehensive.rss import PeakRssSampler
 
 logger = logging.getLogger(__name__)
 
@@ -53,17 +62,26 @@ def _copy_scx(src: Path, dst: Path) -> None:
 
 
 def _time_op(fn, *args, **kwargs) -> tuple[float, float]:
-    """Run *fn* and return ``(wall_s, rss_after_mb)``.
+    """Run *fn* and return ``(wall_s, peak_rss_mb)``.
 
-    The RSS value is the *current* resident-set size sampled immediately
-    after ``fn`` returns — not a true peak. Sufficient for detecting gross
-    regressions; if/when we need true peak, bracket with ``ru_maxrss``.
+    The RSS value is the high-water mark *while fn ran*, sampled by
+    ``PeakRssSampler`` on a background thread. It was an end-of-op
+    ``current_rss_mb()`` reading until the peak-sampler change, which could not
+    see any of the ops measured here: ``append`` reads the whole input CSR
+    before re-encoding
+    and ``compact`` rewrites every section, both allocating and freeing a large
+    transient that is gone by the time ``fn`` returns.
+
+    ``PeakRssSampler`` seeds with the entry RSS, so anything this process is
+    still holding from an earlier op is attributed to this one — hence the
+    ``_gc()`` first.
     """
     _gc()
     t0 = time.perf_counter()
-    fn(*args, **kwargs)
+    with PeakRssSampler() as sampler:
+        fn(*args, **kwargs)
     wall = time.perf_counter() - t0
-    return wall, _current_rss_mb()
+    return wall, sampler.peak_mb
 
 
 def _run_append(
@@ -213,6 +231,71 @@ def _run_compact(
     dirty_path.unlink(missing_ok=True)
 
 
+def _run_compact_full(
+    result: BenchmarkResult,
+    full_scx: Path,
+    workdir: Path,
+    n_runs: int,
+) -> None:
+    """``pyscx.compact`` on a fixture that carries obsm keys and a layer.
+
+    The `compact` arm above runs on the Phase-A `.scx`, which has neither: no
+    source h5ad in the suite carries an `obsm` key or a layer, so
+    `<name>_auto.scx` reports `obsm_keys == []` and `layer_names == []`, and a
+    rewrite of one never reaches the code that copies them. This arm does.
+
+    **It does not measure a `.raw` copy, even though the fixture has one.**
+    `scx-ops`' carry table is explicit: under `compact`, `X | Layer | Obsm`
+    are `RowFiltered` — carried — while `Raw` is `Dropped` with
+    `warns: true` ("raw's obs axis is not filtered in lockstep with X (planned
+    follow-up)"). So every run of this arm logs a raw-dropped warning, and the
+    raw matrix contributes a read, not a resident copy. The export side is
+    where raw's whole-matrix copy is measured
+    (`export_streaming`'s `streaming_full` arm).
+
+    Deliberately **not** dirtied with an append + delete first, the way the
+    plain `compact` arm is. `append` refuses a file with a `.raw` outright —
+    `scx-ops/src/append.rs:591` returns `OpsError::RawUnsupported` because it
+    extends X's obs axis and not raw's — so that recipe is unavailable here.
+    This arm times the rewrite itself, which is where the memory is.
+
+    Emits `peak_rss_mb__compact_full` — sparse, so a threshold on it medians
+    this arm alone and not the four ordinary ops. (Named for the house
+    convention already used by `ooc_loader`, `ml_loader`, `cellset_gather` and
+    `shuffle_layout` — `<metric>__<scenario>`. A `streaming_`-prefixed spelling
+    would be actively misleading here: `compact` is a rewrite, not a streaming
+    export, and that prefix belongs to `export_streaming`'s arms.)
+    """
+    import pyscx
+
+    for i in range(n_runs):
+        input_path = workdir / f"compact_full_in_{i}.scx"
+        output_path = workdir / f"compact_full_out_{i}.scx"
+        _copy_scx(full_scx, input_path)
+        size_before = input_path.stat().st_size
+
+        wall, rss = _time_op(pyscx.compact, str(input_path), str(output_path))
+
+        size_after = output_path.stat().st_size
+        throughput_mb_s = (size_before / (1024 * 1024)) / wall if wall > 0 else 0.0
+
+        result.add_run(
+            wall_s=wall,
+            peak_rss_mb=rss,
+            operation="compact_full",
+            size_before_bytes=size_before,
+            size_after_bytes=size_after,
+            throughput_mb_s=round(throughput_mb_s, 3),
+            **{"peak_rss_mb__compact_full": round(rss, 1)},
+        )
+        input_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+        logger.info(
+            "  compact_full run %d/%d: wall=%.3fs peak_rss=%.1f MB",
+            i + 1, n_runs, wall, rss,
+        )
+
+
 def _run_rollback(
     result: BenchmarkResult,
     base_scx: Path,
@@ -284,6 +367,23 @@ def run(
             "operations": ["append", "delete", "compact", "rollback"],
         },
     )
+
+    # The `.raw` + obsm + layer arm, when the fixture has been built. The skip
+    # is recorded rather than silent — and it is loud at the gate too: a
+    # threshold whose metric no run carries counts as a violation, not a skip,
+    # so a missing fixture fails rather than quietly narrowing coverage.
+    full_scx: Path | None = None
+    if dataset.scx_full_path.exists():
+        full_scx = dataset.scx_full_path
+        result.metadata["operations"].append("compact_full")
+        result.metadata["full_fixture_path"] = str(full_scx)
+    else:
+        result.metadata["compact_full_skipped_reason"] = (
+            f"{dataset.scx_full_path} does not exist — build it with "
+            f"`python benchmarks/scripts/prep_full_fixtures.py --datasets "
+            f"{dataset.name}`"
+        )
+        logger.warning("%s", result.metadata["compact_full_skipped_reason"])
     result.file_size_bytes = converted_path.stat().st_size
 
     workroot = tempfile.TemporaryDirectory(
@@ -300,6 +400,10 @@ def run(
 
         logger.info("compact: %s", dataset.name)
         _run_compact(result, converted_path, workdir, n_runs, n_rows)
+
+        if full_scx is not None:
+            logger.info("compact_full: %s", dataset.name)
+            _run_compact_full(result, full_scx, workdir, n_runs)
 
         logger.info("rollback: %s", dataset.name)
         _run_rollback(result, converted_path, workdir, n_runs, n_rows)
@@ -332,8 +436,9 @@ def run(
     result.metadata["per_op_medians"] = summaries
 
     logger.info(
-        "Fragment-ops done: %s — %d runs across 4 operations",
+        "Fragment-ops done: %s — %d runs across %d operations",
         dataset.name,
         len(result.runs),
+        len(result.metadata["operations"]),
     )
     return result

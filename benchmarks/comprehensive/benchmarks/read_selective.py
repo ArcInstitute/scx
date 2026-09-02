@@ -9,6 +9,23 @@ Measures sub-matrix extraction performance across four scenarios:
 
 Each scenario is run n_runs times.  Results are returned in a single
 BenchmarkResult with per-run ``extra`` dicts tagging the scenario name.
+
+Each run also carries a **sparse per-scenario** ``wall_s__<scenario>`` key.
+``median_wall_s`` on this benchmark is an average over three fixed scenarios
+plus up to three predicates, so on census_1m the recorded IQR (11.54 s against
+a 13.85 s median) is scenario *mixing*, not noise — a number that cannot carry
+a threshold. The per-scenario medians already existed in
+``metadata["scenario_summary"]``, but thresholds read ``runs[].extra`` and
+never ``metadata``, so nothing could gate them.
+
+Scenario names, for anyone writing one of those thresholds: the three base
+scenarios are ``row_slice`` / ``col_projection`` / ``combined``; the predicate
+arms are ``filtered_query__<predicate>``, i.e.
+``filtered_query__cell_type_eq_t_cell``, ``filtered_query__n_counts_gt_1000``,
+``filtered_query__random_1pct``. ``n_counts_gt_1000`` does not run on the
+census fixtures — ``obs['n_counts']`` is injected only for pbmc3k and
+tabula_sapiens_100k by ``scripts/augment_obs_n_counts.py`` — and a threshold on
+it there would be a permanent missing-metric violation.
 """
 
 from __future__ import annotations
@@ -223,6 +240,10 @@ def run(
                 result.add_run(
                     wall_s=tr.wall_s, user_s=tr.user_s, sys_s=tr.sys_s,
                     peak_rss_mb=tr.peak_rss_mb, scenario=scenario_name,
+                    # Sparse per-scenario key: only runs of THIS scenario carry
+                    # it, so a threshold on it medians one scenario rather than
+                    # the mix. See the module docstring.
+                    **{f"wall_s__{scenario_name}": round(tr.wall_s, 6)},
                 )
 
         # -- Filtered-query scenarios (capability-gated) --
@@ -250,6 +271,7 @@ def run(
                         scenario=scen_key,
                         predicate=predicate.name,
                         native_mechanism=extra.get("native_mechanism", "unknown"),
+                        **{f"wall_s__{scen_key}": round(tr.wall_s, 6)},
                     )
         else:
             logger.info(
@@ -270,6 +292,10 @@ def run(
                 "max_s": round(max(times), 6),
                 "n_runs": len(times),
             }
+    # Kept as the human-readable view. It is NOT the gateable one: thresholds
+    # read `runs[].extra` only, never `metadata` — which is why the
+    # `wall_s__<scenario>` keys above exist. Both are derived from the same
+    # `scenario_times`, so they cannot disagree.
     result.metadata["scenario_summary"] = scenario_summary
 
     return result
