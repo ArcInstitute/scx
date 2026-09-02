@@ -397,10 +397,18 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
         def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
                      reader_threads=None, extra_kwargs=None):
             calls.append((scenario, reader_threads, extra_kwargs))
+            # A worker that honoured `csc="always"` reports a sidecar. The
+            # parent now *raises* when the csc arm reports none, so the mock has
+            # to model that faithfully or the happy path fails for the wrong
+            # reason — and the guard's own red case is asserted separately below.
+            built_csc = bool((extra_kwargs or {}).get("csc"))
             return [{
                 "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
                 "peak_rss_mb": 123.0, "reader_threads": reader_threads,
-                "structural": {"n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1},
+                "structural": {
+                    "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                    "n_csc_shards": 7 if built_csc else 0,
+                },
                 "output_bytes": 10,
             }]
 
@@ -453,6 +461,136 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
     calls, result = drive("pbmc3k")
     assert [c[0] for c in calls] == ["streaming", "streaming", "materialize"]
     assert result.metadata["extra_arms"] == []
+
+
+def test_mtx_export_is_scoped_out_of_the_census_tiers():
+    """The size cap has to stop the *scheduler*, not just `run()`.
+
+    `mtx_export` returns `None` above `MAX_N_OBS`, but `run_parallel` only drops
+    cells at cohort-build time. With `SUPPORTED_FORMATS` alone, a `--tier full`
+    capture submitted `mtx_export x {census_500k, census_1m}` — 88 GB and 176 GB
+    of requested memory plus their Phase-A conversions — and the job returned
+    `None` on its first line. `--tier xl` added census_5m at 864 GB.
+
+    This is the trap `_bench_format_dataset_scope`'s own docstring records
+    ("they stubbed out-of-scope datasets *inside* `run()` ... eight wasted GPU
+    jobs per full accel capture"). Found by review (codex - gpt-5.6-terra and
+    Cursor Agent - Grok 4.6 High, independently).
+
+    Exercises the orchestrator's filter, not only the module constant — a
+    declaration test alone would pass with the scope never consulted.
+    """
+    import importlib
+
+    from benchmarks.comprehensive.benchmarks import mtx_export as mx
+    from benchmarks.comprehensive.config import DATASETS
+
+    rp = importlib.import_module("benchmarks.comprehensive.scripts.run_parallel")
+    scope = rp._bench_format_dataset_scope("mtx_export")
+    assert "scx_auto" in scope, (
+        "mtx_export declares no FORMAT_DATASET_SCOPE, so every unimodal "
+        "scx_auto dataset is schedulable regardless of MAX_N_OBS"
+    )
+    allowed = scope["scx_auto"]
+
+    for name in ("pbmc3k", "tabula_sapiens_100k"):
+        assert name in allowed, name
+    for name in ("census_500k", "census_1m", "census_5m", "census_10m"):
+        assert name not in allowed, (
+            f"{name} is above MAX_N_OBS={mx.MAX_N_OBS:,} yet still schedulable; "
+            f"the job would request "
+            f"{__import__('benchmarks.comprehensive.config', fromlist=['x']).estimate_memory_gb(DATASETS[name], 'scx_auto', 'mtx_export')} GB "
+            f"and then return None"
+        )
+
+    # Derived from MAX_N_OBS, not hand-listed: a literal list would stop
+    # matching the cap the first time either changed.
+    assert allowed == frozenset(
+        n for n, ds in DATASETS.items()
+        if not ds.multimodal and ds.n_obs <= mx.MAX_N_OBS
+    )
+
+
+def test_csc_always_arm_refuses_a_result_with_no_sidecar():
+    """The `csc_always` premise is enforced, not merely recorded.
+
+    `_structural_summary` reports `n_csc_shards`, but nothing reads `metadata`,
+    so storing it there was not a check: if `csc="always"` were dropped on
+    either subprocess hop, the arm would still emit `csc_always_peak_rss_mb`
+    and pass — having timed the *default* conversion under the CSC label. That
+    is the failure mode the arm exists to rule out, so it has to raise.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        # A worker that ignored the kwargs: right label, no sidecar.
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+            "structural": {
+                "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
+                "n_csc_shards": 0,
+            },
+            "output_bytes": 10,
+        }]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        with pytest.raises(RuntimeError, match="csc_always"):
+            cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset="tabula_sapiens_100k",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                "tabula_sapiens_100k",
+            )
+    finally:
+        cs._run_arm_subprocess = original
+
+
+def test_conversion_streaming_worker_threads_extra_kwargs_through():
+    """The mocked test above cannot see a broken `_WORKER_SCRIPT`.
+
+    `_run_arm_subprocess` is what the other test replaces, so a worker that
+    never parsed `sys.argv[5]` — or parsed it and never passed it to
+    `_timed_streaming` — would leave that test green while every extra arm ran
+    the default conversion. Checked on the worker source, which is a
+    `textwrap`-dedented string and therefore invisible to any import-time check.
+    Found by review (Cursor Agent - Grok 4.6 High).
+    """
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+
+    script = cs._WORKER_SCRIPT
+    assert "extra_kwargs = json.loads(sys.argv[5])" in script, (
+        "the worker does not parse the extra-arm kwargs out of argv"
+    )
+    # And it must reach the timed call, not just be parsed. Sliced to the
+    # *matching* close paren: the call is multi-line, so stopping at the first
+    # `)` lands inside `Path(h5ad_path)` and the check passes vacuously.
+    start = script.index("_timed_streaming(") + len("_timed_streaming(")
+    depth, end = 1, start
+    while depth:
+        if script[end] == "(":
+            depth += 1
+        elif script[end] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        end += 1
+    args = script[start:end]
+    assert "extra_kwargs" in args, (
+        f"the worker parses extra_kwargs but does not pass them to "
+        f"_timed_streaming: args were {args!r}"
+    )
 
 
 def test_both_streaming_modules_use_the_true_peak_sampler():

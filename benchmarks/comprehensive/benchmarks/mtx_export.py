@@ -15,12 +15,12 @@ nothing to measure the change against.
 * ``to_mtx_with_deletions`` — the same export after marking 1% of cells deleted,
   so the keep-mask path is measured rather than assumed equivalent. Emits
   ``peak_rss_mb__to_mtx_with_deletions`` and ``wall_s__to_mtx_with_deletions``,
-  plus ``mtx_rows_written`` on both arms so the row count is checkable
-  (pbmc3k: 2700 -> 2673). Run once regardless of ``n_runs`` — see
-  :data:`_DELETION_ARM_RUNS`.
+  and **raises** if the row count is not ``n_obs - n_deleted`` (pbmc3k:
+  2700 -> 2673). Exported once regardless of ``n_runs``: the arm checks a row
+  count, not a timing, and at tabula scale each export is ~11 minutes.
 * ``from_mtx`` — ingest the arm-1 output back to SCX. Emits
-  ``wall_s__from_mtx`` and ``peak_rss_mb__from_mtx``, and asserts the round-trip
-  shape.
+  ``wall_s__from_mtx`` and ``peak_rss_mb__from_mtx``, and **raises** if the
+  re-imported shape or nnz differs from the source.
 
 ## The header gate
 
@@ -69,15 +69,35 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.comprehensive.config import DatasetConfig, FormatVariant, RANDOM_SEED
+from benchmarks.comprehensive.config import (
+    DATASETS,
+    DatasetConfig,
+    FormatVariant,
+    RANDOM_SEED,
+)
 from benchmarks.comprehensive.results import BenchmarkResult, require_runs
-from benchmarks.comprehensive.rss import PeakRssSampler
+from benchmarks.comprehensive.rss import PeakRssSampler, current_rss_mb
 
 logger = logging.getLogger(__name__)
 
 # MTX is an SCX-side conversion; `scx_auto` is the single trigger so the op is
 # not re-measured per codec variant.
 SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
+
+# Per-format dataset allow-list, read by `run_parallel._bench_format_dataset_scope`
+# at **cohort-build time**.
+#
+# Declaring `SUPPORTED_FORMATS` alone was not enough: the planner accepted every
+# unimodal `scx_auto` dataset and treated this benchmark as conversion-dependent,
+# so a `--tier full` run submitted `mtx_export x {census_500k, census_1m}` — 88 GB
+# and 176 GB of requested memory plus their Phase-A conversions — and `run()`
+# returned `None` on its first line. `--tier xl` added census_5m at 864 GB. Those
+# are real queue slots for work that is discarded.
+#
+# This is the trap `_bench_format_dataset_scope`'s own docstring records ("they
+# stubbed out-of-scope datasets *inside* `run()` ... eight wasted GPU jobs per
+# full accel capture"). Populated from `MAX_N_OBS` below, so the scope and the
+# runtime skip cannot drift apart.
 
 # Fraction of cells marked deleted for the keep-mask arm.
 _DELETE_FRACTION = 0.01
@@ -93,13 +113,21 @@ _DELETE_FRACTION = 0.01
 #
 # 100,000 is therefore the line: tabula runs (and is the smallest fixture where
 # the peak means anything — pbmc3k's 466 MB is mostly interpreter baseline),
-# census does not. The skip is recorded in metadata, never silent.
+# census does not. `FORMAT_DATASET_SCOPE` above stops the orchestrator
+# submitting an out-of-scope cell at all; `_skip_reason` remains as the
+# defence-in-depth path for a direct `run()` call, and logs its reason.
 MAX_N_OBS: int = 100_000
 
-# The deletion arm exists to exercise the keep-mask path and check the row count
-# it writes, not to produce a stable timing, and at tabula scale each run costs
-# ~11 minutes. One run is the whole signal.
-_DELETION_ARM_RUNS: int = 1
+# Derived, never hand-listed: every unimodal dataset at or below the cap. A
+# literal list would silently stop matching `MAX_N_OBS` the first time either
+# changed.
+FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
+    "scx_auto": frozenset(
+        name
+        for name, ds in DATASETS.items()
+        if not ds.multimodal and ds.n_obs <= MAX_N_OBS
+    ),
+}
 
 
 def _skip_reason(n_obs: int) -> str | None:
@@ -119,22 +147,26 @@ def _read_header(mtx_dir: Path) -> str:
         return fh.readline().strip()
 
 
-def _body_is_integral(mtx_dir: Path, max_lines: int = 200_000) -> bool:
-    """True when every value in the (sampled) body parses as an integer.
+def _body_is_integral(mtx_dir: Path) -> bool:
+    """True when **every** value in the body parses as an integer.
 
     Guards the header gate from going vacuous: `integer` is the correct header
     only for a matrix whose values are integral, so if the fixture ever stops
     being one, that shows up here rather than as a threshold that passes for the
-    wrong reason. Sampled — the point is to notice a fixture change, not to
-    re-verify every non-zero.
+    wrong reason.
+
+    Reads the whole body rather than the first N lines. An earlier version
+    stopped after 200,000 entries, which is worse than it sounds: this MTX is
+    column-major (`write_matrix_mtx` emits `col+1 row+1 val`), so a prefix is the
+    *first genes*, and a matrix that is integral up front and not later would
+    keep the header gate looking live. The scan is cheap beside the export it
+    follows — 2.3M text lines against an 8 s gzip write on pbmc3k.
     """
     with gzip.open(mtx_dir / "matrix.mtx.gz", "rt") as fh:
         for line in fh:  # banner + any %-comments + the dimensions line
             if not line.startswith("%"):
                 break
-        for i, line in enumerate(fh):
-            if i >= max_lines:
-                break
+        for line in fh:
             parts = line.split()
             if len(parts) != 3:
                 return False
@@ -219,6 +251,18 @@ def run(
     )
     result.file_size_bytes = converted_path.stat().st_size
 
+    # Read once, from the file rather than from `DatasetConfig`: the round-trip
+    # assertion below has to compare against what was exported, and a config
+    # figure that drifted from the fixture would make it compare two guesses.
+    src = pyscx.open(str(converted_path))
+    try:
+        source_shape = (src.n_obs, src.n_vars)
+        source_nnz = src.nnz
+    finally:
+        _close = getattr(src, "close", None)
+        if _close is not None:
+            _close()
+
     workroot = tempfile.TemporaryDirectory(prefix=f"scx_mtx_{dataset.name}_")
     workdir = Path(workroot.name)
     try:
@@ -227,6 +271,7 @@ def run(
         for i in range(n_runs):
             out_dir = workdir / f"mtx_{i}"
             out_dir.mkdir()
+            entry_rss = current_rss_mb()
             wall, peak = _timed_to_mtx(converted_path, out_dir)
             mtx_bytes = sum(p.stat().st_size for p in out_dir.iterdir())
             header = _read_header(out_dir)
@@ -242,6 +287,8 @@ def run(
                     "run_idx": i,
                     "wall_s__to_mtx": round(wall, 6),
                     "peak_rss_mb__to_mtx": round(peak, 1),
+                    "entry_rss_mb": round(entry_rss, 1),
+                    "delta_rss_mb__to_mtx": round(peak - entry_rss, 1),
                     "mtx_bytes": mtx_bytes,
                     "mtx_rows_written": rows,
                     "mtx_header": header,
@@ -267,34 +314,50 @@ def run(
         n_delete = max(1, int(dataset.n_obs * _DELETE_FRACTION))
         idx = rng.choice(dataset.n_obs, size=n_delete, replace=False)
         pyscx.mark_deleted(str(deleted_scx), [int(v) for v in idx])
-        for i in range(_DELETION_ARM_RUNS):
-            out_dir = workdir / f"mtx_del_{i}"
-            out_dir.mkdir()
-            wall, peak = _timed_to_mtx(deleted_scx, out_dir)
-            rows = _row_count(out_dir)
-            result.add_run(
-                wall_s=wall,
-                peak_rss_mb=peak,
-                **{
-                    "scenario": "to_mtx_with_deletions",
-                    "run_idx": i,
-                    "wall_s__to_mtx_with_deletions": round(wall, 6),
-                    "peak_rss_mb__to_mtx_with_deletions": round(peak, 1),
-                    "mtx_rows_written": rows,
-                    "n_deleted": n_delete,
-                },
+        # Exported once, not `n_runs` times: this arm checks the row count the
+        # keep-mask path writes, not a stable timing, and at tabula scale each
+        # export costs ~11 minutes.
+        out_dir = workdir / "mtx_del"
+        out_dir.mkdir()
+        entry_rss = current_rss_mb()
+        wall, peak = _timed_to_mtx(deleted_scx, out_dir)
+        rows = _row_count(out_dir)
+        # Compared, not merely recorded. An export that ignored the deletion
+        # vector would otherwise write a normal successful result — the exact
+        # assumption this arm was added to stop making.
+        expected_rows = dataset.n_obs - n_delete
+        if rows != expected_rows:
+            raise RuntimeError(
+                f"to_mtx wrote {rows} rows after marking {n_delete} of "
+                f"{dataset.n_obs} cells deleted; expected {expected_rows}. "
+                f"The keep mask was not applied."
             )
-            logger.info(
-                "  to_mtx_with_deletions run %d/%d: wall=%.2fs peak=%.1f MB rows=%d",
-                i + 1, _DELETION_ARM_RUNS, wall, peak, rows,
-            )
-            shutil.rmtree(out_dir)
+        result.add_run(
+            wall_s=wall,
+            peak_rss_mb=peak,
+            **{
+                "scenario": "to_mtx_with_deletions",
+                "run_idx": 0,
+                "wall_s__to_mtx_with_deletions": round(wall, 6),
+                "peak_rss_mb__to_mtx_with_deletions": round(peak, 1),
+                "entry_rss_mb": round(entry_rss, 1),
+                "delta_rss_mb__to_mtx_with_deletions": round(peak - entry_rss, 1),
+                "mtx_rows_written": rows,
+                "n_deleted": n_delete,
+            },
+        )
+        logger.info(
+            "  to_mtx_with_deletions: wall=%.2fs peak=%.1f MB (delta %.1f) rows=%d",
+            wall, peak, peak - entry_rss, rows,
+        )
+        shutil.rmtree(out_dir)
         deleted_scx.unlink(missing_ok=True)
 
         # --- arm 3: ingest ---
         assert exported is not None
         for i in range(n_runs):
             scx_out = workdir / f"from_mtx_{i}.scx"
+            entry_rss = current_rss_mb()
             wall, peak = _timed_from_mtx(exported, scx_out)
             exp = pyscx.open(str(scx_out))
             try:
@@ -304,6 +367,14 @@ def run(
                 close = getattr(exp, "close", None)
                 if close is not None:
                     close()
+            # Compared, not merely recorded. `to_mtx` -> `from_mtx` is lossless
+            # by contract; an ingest that dropped entries or transposed the
+            # matrix would otherwise write a normal-looking successful result.
+            if (shape, nnz) != (source_shape, source_nnz):
+                raise RuntimeError(
+                    f"MTX round-trip changed the matrix: got shape {shape} "
+                    f"nnz={nnz}, source is {source_shape} nnz={source_nnz}."
+                )
             result.add_run(
                 wall_s=wall,
                 peak_rss_mb=peak,
@@ -312,6 +383,8 @@ def run(
                     "run_idx": i,
                     "wall_s__from_mtx": round(wall, 6),
                     "peak_rss_mb__from_mtx": round(peak, 1),
+                    "entry_rss_mb": round(entry_rss, 1),
+                    "delta_rss_mb__from_mtx": round(peak - entry_rss, 1),
                     "roundtrip_n_obs": shape[0],
                     "roundtrip_n_vars": shape[1],
                     "roundtrip_nnz": nnz,

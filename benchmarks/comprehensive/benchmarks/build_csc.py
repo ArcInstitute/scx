@@ -52,8 +52,9 @@ Per run, into `runs[].extra`:
   peak is 0.13x the budget for a matrix of 2.3M non-zeros. Both are recorded
   rather than one being chosen, because which is right depends on whether the
   budget is read as "what this op may allocate" or "what the process may reach".
-* ``memory_limit_mb`` / ``entry_rss_mb`` / ``input_bytes`` / ``output_bytes`` /
-  ``n_csc_shards`` — context, and the premise check.
+* ``memory_limit_mb`` / ``entry_rss_mb`` / ``input_bytes`` / ``output_bytes``
+  — context. The premise (a sidecar was actually built) is enforced by raising,
+  not recorded as a metric.
 
 The ratio is deliberately **not** floored in `thresholds.yaml` yet. A
 `<= 1.25` row would pass on tabula (0.73x) and fail on census_500k (1.99x), so
@@ -74,6 +75,7 @@ from __future__ import annotations
 import gc
 import logging
 import shutil
+import statistics
 import tempfile
 import time
 from pathlib import Path
@@ -103,31 +105,26 @@ _MEMORY_LIMIT_MB = 4 * 1024
 _CSC_COLS_PER_SHARD = 5000
 
 
-def _csc_shard_count(path: Path) -> int:
-    """Number of `X_csc_shard_*` sections in the output, or 0 if none.
+def _has_csc_sidecar(path: Path) -> bool:
+    """Did `build_csc` actually produce a sidecar?
 
-    A **premise check**, not a measurement: if `build_csc` produced no sidecar
-    the wall and peak above are timing the wrong thing entirely, and a run that
-    silently measured a no-op is worse than a missing one. `Experiment.has_csc`
-    answers the yes/no; the count is what distinguishes a single-shard sidecar
-    from the multi-shard layout `csc_cols_per_shard` should produce at these
-    widths.
+    A **premise check**, not a measurement: without one, the wall and peak
+    recorded for that run timed something other than a sidecar build, and a run
+    that silently measured a no-op is worse than a missing one.
 
-    `validate()` is the only Python surface that enumerates sections — it
-    returns `[(name, checksum_ok)]` straight off the catalog. It does not carry
-    section lengths, which is why this counts shards rather than reporting
-    sidecar bytes; the file-size delta is not a substitute, because a rewrite
-    can re-encode X itself.
+    This reads the header flag via `Experiment.has_csc`. An earlier version
+    counted `X_csc_shard_*` sections out of `Experiment.validate()` and claimed
+    that came "straight off the catalog" — it does not.
+    `ScxReader::validate` (`scx-format-io/src/reader/integrity.rs`) verifies the
+    whole-file checksum and then BLAKE3-hashes **every section payload**, so it
+    was a full-file hash after every timed run: free on pbmc3k, minutes on a
+    census fixture, and buying only a shard count nothing gates.
     """
     import pyscx
 
     exp = pyscx.open(str(path))
     try:
-        if not exp.has_csc:
-            return 0
-        return sum(
-            1 for name, _ in exp.validate() if name.startswith("X_csc_shard_")
-        )
+        return bool(exp.has_csc)
     finally:
         close = getattr(exp, "close", None)
         if close is not None:
@@ -201,12 +198,11 @@ def run(
             peak = sampler.peak_mb
             output_bytes = target.stat().st_size
 
-            n_csc_shards = _csc_shard_count(target)
-            if n_csc_shards == 0:
+            if not _has_csc_sidecar(target):
                 raise RuntimeError(
-                    f"build_csc({target}) produced no X_csc_shard_* sections, so "
-                    f"the {wall:.2f}s / {peak:.1f} MB above measured something "
-                    f"other than a sidecar build. Refusing to record it."
+                    f"build_csc({target}) produced no CSC sidecar, so the "
+                    f"{wall:.2f}s / {peak:.1f} MB above measured something other "
+                    f"than a sidecar build. Refusing to record it."
                 )
 
             result.add_run(
@@ -238,24 +234,20 @@ def run(
                     "memory_limit_mb": _MEMORY_LIMIT_MB,
                     "input_bytes": input_bytes,
                     "output_bytes": output_bytes,
-                    "n_csc_shards": n_csc_shards,
                 },
             )
             logger.info(
                 "  build_csc run %d/%d: wall=%.2fs peak=%.1f MB "
-                "(%.2fx the %s budget; %.1f MB over a %.1f MB baseline = %.2fx) "
-                "csc_shards=%d",
+                "(%.2fx the %s budget; %.1f MB over a %.1f MB baseline = %.2fx)",
                 i + 1, n_runs, wall, peak, peak / _MEMORY_LIMIT_MB, _MEMORY_LIMIT,
                 peak - entry_rss, entry_rss,
-                (peak - entry_rss) / _MEMORY_LIMIT_MB, n_csc_shards,
+                (peak - entry_rss) / _MEMORY_LIMIT_MB,
             )
             target.unlink(missing_ok=True)
     finally:
         workroot.cleanup()
 
     require_runs(result, str(converted_path))
-
-    import statistics
 
     peaks = [r.peak_rss_mb for r in result.runs]
     deltas = [r.extra["delta_rss_mb__build_csc"] for r in result.runs]

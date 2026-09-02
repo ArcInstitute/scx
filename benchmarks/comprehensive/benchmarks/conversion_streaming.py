@@ -35,6 +35,13 @@ is comparable, and each gets `<label>_peak_rss_mb` / `<label>_wall_s` from the
 same f-string the base arms use — no separate emission path, and no chance of an
 extra arm polluting the floored `streaming_peak_rss_mb` key.
 
+⚠️ **The extra arms run on the default path only.** Setting
+`SCX_CONV_STREAM_THREAD_COUNTS` routes through `_run_with_thread_scaling`, which
+sweeps `streaming` and `materialize` and does not run them — the sweep exists to
+compare how those two scale with thread count, and neither extra arm varies along
+that axis. `run()` records `extra_arms_skipped_reason` in that mode so the
+absence is stated rather than inferred from a missing key.
+
 Thread scaling is opt-in via the `SCX_CONV_STREAM_THREAD_COUNTS` env
 var (comma-separated, e.g. `1,2,4,8,16,32`). When set, each thread
 count is exercised in a fresh subprocess with
@@ -508,6 +515,16 @@ def run(
         return _run_isolated(
             h5ad_path, n_runs, result, skip_materialize, dataset.name,
         )
+
+    # The sweep path below runs `streaming` and `materialize` only. Say so in the
+    # result rather than leaving a reader to infer it from absent keys — the
+    # module docstring documents the same limitation.
+    result.metadata["extra_arms"] = []
+    result.metadata["extra_arms_skipped_reason"] = (
+        f"{_THREAD_COUNTS_ENV} is set, so the thread-scaling path runs; it "
+        f"sweeps streaming vs materialize and does not run the "
+        f"{sorted(_EXTRA_ARMS)} arms, neither of which varies with thread count."
+    )
     if skip_materialize:
         # Thread scaling exists to compare how the two arms scale, so dropping
         # one silently would make its output meaningless — and running a ~136 GB
@@ -606,6 +623,21 @@ def _run_isolated(
                 "  %s (reader_threads=%s) run %d: wall=%.2fs peak_rss=%.1f MB",
                 label, reader_threads, rec["run_idx"],
                 rec["wall_s"], rec["peak_rss_mb"],
+            )
+
+    # Enforce the `csc_always` premise rather than recording it. The arm exists
+    # to measure `write_csc_sidecar`; if `csc="always"` were dropped on either
+    # subprocess hop the arm would still emit `csc_always_peak_rss_mb` and pass,
+    # having timed the default conversion under the CSC label. Nothing reads
+    # `metadata`, so storing `n_csc_shards` there was not a check.
+    if "csc_always" in applicable_extras:
+        n_csc = (structural.get("csc_always") or {}).get("n_csc_shards")
+        if not n_csc:
+            raise RuntimeError(
+                f"the csc_always arm produced n_csc_shards={n_csc!r}: "
+                f"`csc=\"always\"` did not reach `from_h5ad`, so the arm timed "
+                f"the default conversion under the CSC label. Refusing to "
+                f"record it."
             )
 
     result.metadata["gated_reader_threads"] = GATED_READER_THREADS
