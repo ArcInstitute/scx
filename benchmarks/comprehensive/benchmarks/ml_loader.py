@@ -1441,7 +1441,7 @@ def run(
                         obs_columns=[column],
                     )
                     arm_bps: list[float] = []
-                    for i in range(n_runs):
+                    for _ in range(n_runs):
                         gc.collect()
                         t0 = time.perf_counter()
                         epoch = _run_scx_epoch(

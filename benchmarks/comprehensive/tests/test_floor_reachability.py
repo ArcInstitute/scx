@@ -1367,7 +1367,7 @@ def test_no_floor_is_fully_suppressed_by_an_active_justification():
     The fix is a `metrics:` (or per-entry `metric:`) scope naming what the file
     actually explains, never deleting the floor.
     """
-    suppression, parsed, justifications = _active_suppressions()
+    suppression, parsed, _justifications = _active_suppressions()
     raw = yaml.safe_load(THRESHOLDS.read_text())
 
     by_file: dict[tuple[str, str, str], list[str]] = {}
@@ -1382,12 +1382,10 @@ def test_no_floor_is_fully_suppressed_by_an_active_justification():
         triple = (f["benchmark"], f["format"], f["dataset"])
         if triple in _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS:
             continue
-        # `metric=None` asks "is the whole triple suppressed?" — precisely the
-        # state this test rejects. A scoped justification answers False here
-        # even when it covers some other metric on the same triple.
-        if justifications.suppresses(suppression, triple, None) and (
-            suppression[triple] is None
-        ):
+        # A `None` scope is "every metric on this triple" — precisely the
+        # state this test rejects. A triple with a named scope is fine here
+        # even when the scope happens to cover some other metric.
+        if triple in suppression and suppression[triple] is None:
             offenders.append(
                 f"{f['benchmark']}/{f['format']}/{f['dataset']}:{f['metric']} "
                 f"(suppressed by {', '.join(sorted(set(by_file.get(triple, ['?']))))})"

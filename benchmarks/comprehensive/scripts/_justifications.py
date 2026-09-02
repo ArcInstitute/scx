@@ -187,7 +187,7 @@ def _entry_scope(file_metrics: MetricScope, entry_metrics: MetricScope) -> Metri
     return (file_metrics or frozenset()) | (entry_metrics or frozenset())
 
 
-def widen(a: MetricScope, b: MetricScope) -> MetricScope:
+def _widen(a: MetricScope, b: MetricScope) -> MetricScope:
     """Merge two scopes for the same triple; the *widest* claim wins.
 
     ``None`` is the widest scope there is, so it absorbs any named set. Used
@@ -199,21 +199,18 @@ def widen(a: MetricScope, b: MetricScope) -> MetricScope:
     return a | b
 
 
-def suppresses(
-    suppression: SuppressionMap, triple: Triple, metric: str | None
-) -> bool:
+def suppresses(suppression: SuppressionMap, triple: Triple, metric: str) -> bool:
     """Is *metric* on *triple* suppressed by this map?
 
     One predicate for both gate surfaces (relative regressions and absolute
     floors), so the exit code and the report can never disagree about what was
-    suppressed. ``metric=None`` asks only whether the triple appears at all.
+    suppressed — they disagreed once, and the fix was to give them a single
+    function to ask.
     """
     if triple not in suppression:
         return False
     scope = suppression[triple]
-    if scope is None or metric is None:
-        return True
-    return metric in scope
+    return scope is None or metric in scope
 
 
 def _parse_front_matter(block: str) -> dict[str, Any]:
@@ -281,7 +278,7 @@ def parse_justification(path: Path) -> Justification | None:
         entry_metrics = _coerce_metrics(path, entry.get("metric"))
         scope = _entry_scope(file_metrics, entry_metrics)
         if triple in scopes:
-            scope = widen(scopes[triple], scope)
+            scope = _widen(scopes[triple], scope)
         scopes[triple] = scope
 
     try:
@@ -315,7 +312,7 @@ def load_active_triples(
     present in the map may be suppressed for only some of its metrics.
 
     Where two active files name the same triple the scopes are merged by
-    :func:`widen`, so an unscoped file's whole-triple claim survives a scoped
+    :func:`_widen`, so an unscoped file's whole-triple claim survives a scoped
     one — the merge can only ever suppress more, never less, than either file
     asked for on its own.
     """
@@ -337,7 +334,7 @@ def load_active_triples(
             for triple in j.triples:
                 scope = j.scope_for(triple)
                 active[triple] = (
-                    widen(active[triple], scope) if triple in active else scope
+                    _widen(active[triple], scope) if triple in active else scope
                 )
         else:
             logger.info(
