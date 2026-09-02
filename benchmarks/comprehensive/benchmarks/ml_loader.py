@@ -496,11 +496,20 @@ def _hvg_indices(path: str, hvg: bool) -> list[int] | None:
     Skipping the projection is what mirrors them; projecting to the full width
     would still route through the HVG machinery and time something they are not.
 
-    No registered dataset is affected today — `pert_synth_*` sit at exactly 2000
-    vars (`range(2000)` is 0..1999, valid) and everything else is >= 6546 — so
-    this is a latent asymmetry plus a real crash on the narrow synthetic
-    fixtures the tests build. One function because three call sites drifting
-    apart on which of them clamps is how it would come back.
+    The boundary is `>`, matching the competitor guard exactly, and that is
+    where the only behaviour change on a registered dataset lives: the four
+    `pert_synth_*` fixtures are exactly 2000 vars, so the old code projected
+    all 2000 columns and the new code projects none. That is the intended
+    direction — `_apply_hvg_norm` also does nothing at exactly 2000, so the
+    two paths now agree there, where before SCX did the projection work and
+    the competitors did not. No `ml_loader` / `ooc_loader` floor sits on a
+    `pert_synth_*` dataset, so it moves no gated number; the boundary is
+    pinned by a test rather than left to this comment.
+
+    Nothing registered is below 2000 (the narrowest real fixture is 5000
+    vars), so the crash only ever reached the narrow synthetic fixtures the
+    tests build. One function because three call sites drifting apart on which
+    of them clamps is how this would come back.
     """
     if not hvg:
         return None

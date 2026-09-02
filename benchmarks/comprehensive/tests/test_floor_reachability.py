@@ -624,6 +624,54 @@ def test_no_runner_reports_a_moved_api_as_a_missing_package():
     )
 
 
+def test_the_hvg_clamp_boundary_moves_no_gated_number():
+    """Pin which datasets the `>` in `_hvg_indices` actually changes.
+
+    Backing a claim rather than asserting it. The clamp's boundary is
+    `n_vars > QUERY_N_HVGS`, so a dataset at *exactly* 2000 vars goes from
+    "project all 2000 columns" to "project nothing" — a real behaviour change,
+    not just a crash fix, and one worth knowing about before reading a
+    captured number. It is the intended direction: `ooc_loader._apply_hvg_norm`
+    guards with the same `>` and also does nothing at exactly 2000, so the two
+    paths agree there, where before SCX did the projection work and every
+    competitor it is compared against did not.
+
+    Three facts, checked against the registry rather than remembered:
+      * nothing registered is below the threshold, so the crash only ever
+        reached the narrow synthetic fixtures the tests build;
+      * exactly the `pert_synth_*` family sits on the boundary;
+      * no `ml_loader` / `ooc_loader` floor names one of them, so the change
+        cannot move a gated value.
+    """
+    from benchmarks.comprehensive.config import DATASETS, QUERY_N_HVGS
+
+    below = {n: d.n_vars for n, d in DATASETS.items()
+             if not d.multimodal and d.n_vars < QUERY_N_HVGS}
+    at = {n: d.n_vars for n, d in DATASETS.items()
+          if not d.multimodal and d.n_vars == QUERY_N_HVGS}
+
+    assert not below, (
+        f"these datasets are narrower than QUERY_N_HVGS={QUERY_N_HVGS} and the "
+        f"old unclamped `range(QUERY_N_HVGS)` would have raised on them: "
+        f"{below}. Re-read the clamp's note — the claim that only test "
+        f"fixtures were affected no longer holds."
+    )
+    assert set(at) == {"pert_synth_10k", "pert_synth_100k",
+                       "pert_synth_500k", "pert_synth_1m"}, sorted(at)
+
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+    gated = sorted(
+        f"{f['benchmark']}/{f['dataset']}:{f['metric']}"
+        for f in (raw.get("absolute_floors") or [])
+        if f["benchmark"] in ("ml_loader", "ooc_loader") and f["dataset"] in at
+    )
+    assert not gated, (
+        f"a floor now sits on a dataset the HVG clamp changes behaviour for: "
+        f"{gated}. Re-measure it before trusting the threshold — at exactly "
+        f"QUERY_N_HVGS vars the projection is skipped where it used to run."
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 
