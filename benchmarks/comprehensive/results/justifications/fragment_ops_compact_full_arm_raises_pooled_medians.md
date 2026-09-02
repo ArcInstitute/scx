@@ -105,10 +105,16 @@ about either op.
 The same change gave every arm a sparse `wall_s__<operation>` key, which is the
 gateable half — `wall_s` is a reserved `add_run` parameter and never reaches
 `runs[].extra`, so before it the only visible timing was the pooled median this
-file suppresses. `wall_s__rollback` and `wall_s__obs_import` are the two
-cleanest OPT-FORMAT-1 instruments in the suite (`thresholds.yaml` Deferred
-floors, item 18); both are sparse, so a threshold on either medians that arm
-alone and is unaffected by this suppression.
+file suppresses. `wall_s__rollback` is the cleanest OPT-FORMAT-1 instrument in
+the suite (`thresholds.yaml` Deferred floors, item 18) and `wall_s__delete` the
+next; both are sparse, so a threshold on either medians that arm alone and is
+unaffected by this suppression.
+
+An earlier version of this paragraph named `wall_s__obs_import` as the second
+cleanest. It is not: measured at census_1m, only ~2.2 s of its 19.72 s wall is
+the rehash (~11%) — `attach_external_obs` rewrites the obs section and appends
+it at EOF, 493 MB against a 4 MB score column. Do not floor it as an
+OPT-FORMAT-1 signal; item 18 says the same.
 
 ## Scope
 

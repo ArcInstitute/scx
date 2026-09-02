@@ -265,13 +265,19 @@ def _verify_sorted(out: Path, group_col: str, expect_n_obs: int) -> dict[str, in
     * ``sort_by_rows_kept_int`` — ``n_obs`` is unchanged. Catches rows lost in
       the permutation.
 
-    **Not checked here: that X followed obs.** A convert that permuted the obs
-    axis and left the matrix in source order passes both of the above, and
-    catching it needs the *source's* per-row X against the output's under the
-    same obs label — random row reads into a multi-GB h5ad, in an arm whose
-    whole point is a wall-clock number. That belongs in a correctness harness
-    with the source at hand, not in a timing arm; recorded here as the known
-    boundary of what these two ints establish.
+    **Not checked per capture: that X followed obs.** A convert that permuted
+    the obs axis and left the matrix in source order passes both of the above.
+    Catching it per run needs the *source's* per-row X against the output's
+    under the same obs label — random row reads into a multi-GB h5ad, on every
+    timed run, in an arm whose whole output is a wall-clock number.
+
+    It is checked **once, in the suite**, on a 12-row fixture whose every row
+    carries a distinct X sentinel:
+    ``test_sort_by_convert_moves_x_with_obs``. That is the right level for it —
+    the permutation is `from_h5ad`'s behaviour, identical on every dataset, so
+    re-establishing it per capture buys nothing that a converter regression
+    would not already trip in the suite. Recorded here so the boundary of what
+    these two ints establish is not mistaken for the whole claim.
     """
     import numpy as np
     import pyscx

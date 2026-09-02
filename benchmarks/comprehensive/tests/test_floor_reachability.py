@@ -1434,67 +1434,68 @@ def test_deliberate_suppression_allowlist_has_no_stale_entries():
 # ---------------------------------------------------------------------------
 
 
-def test_collate_arm_passes_a_non_empty_encoder_mask():
-    """An empty `enc_mask_positions` would measure the wrong branch.
+def test_collate_arm_builds_a_mask_that_actually_withholds(tmp_path):
+    """An empty — or all-zero — `enc_mask_positions` measures the wrong branch.
 
-    `collate_cell` builds its withheld-gene `HashSet<i64>` — and pays a probe
-    per surviving top-K gene — **only** when `enc_mask_positions` is non-empty.
-    An empty array is the perturbation path and takes `None`, skipping the
-    allocation OPT-LOADER-4 removes. It is not a small difference: collating
-    the same batches with the mask replaced by an empty array measured
-    78.7 µs/cell against 120.1, so ~34% of the arm's subject would vanish.
+    `collate_cell` builds its withheld-gene `HashSet<i64>` (and pays a probe
+    per surviving top-K gene) **only** when the mask array is non-empty. An
+    empty array is the perturbation path and takes `None`, skipping the
+    allocation OPT-LOADER-4 removes — measured on pbmc3k as 78.7 µs/cell
+    against 120.1, so ~34% of the arm's subject. And an all-zero array is
+    non-empty but withholds nothing, so the compaction loop has nothing to
+    skip.
 
-    The trap is that empty is exactly what the only pre-existing Python call
-    site (`pyscx/tests/test_fork_safety.py`) passes, so copying that template
-    produces a green arm over the wrong code.
-
-    Checked on the source: running the arm needs a real fixture, and the defect
-    is entirely in which array is handed to the kernel.
+    Driven on a hand-built batch rather than grepped: an earlier version
+    asserted the literals `"masked_positions == 0"` and
+    `"np.zeros(n_rows, dtype=np.uint8)"` appeared in the source, which pins the
+    spelling of the implementation instead of what it produces.
     """
-    import ast
+    import pytest as _pytest
 
-    tree, path = _bench_ast("cellset_gather")
-    src = path.read_text()
+    np = _pytest.importorskip("numpy")
+    from benchmarks.comprehensive.benchmarks import cellset_gather
 
-    assert "_COLLATE_MASK_FRACTION" in src, (
-        f"{path.name} no longer declares a mask fraction; the collate arm's "
-        f"premise is that the mask is non-empty"
-    )
-    fraction = next(
-        (
-            node.value.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and any(
-                getattr(t, "id", None) == "_COLLATE_MASK_FRACTION"
-                for t in node.targets
-            )
-            and isinstance(node.value, ast.Constant)
-        ),
-        None,
-    )
-    assert isinstance(fraction, (int, float)) and 0.0 < fraction < 1.0, (
-        f"_COLLATE_MASK_FRACTION is {fraction!r}; it must withhold some but "
-        f"not all query positions. 0 leaves the withheld set empty (the "
-        f"HashSet is still built but never hits); 1 masks every gene and every "
-        f"cell takes the all-masked fallback instead of the compaction loop."
+    # Two sets of three rows, five genes each — the shape `iter_with_plans`
+    # yields, with the keys `collate_cellset_gathered` consumes.
+    n_rows, n_genes, nnz_per_row = 6, 5, 5
+    batch = {
+        "indptr": np.arange(0, n_rows * nnz_per_row + 1, nnz_per_row, dtype=np.int64),
+        "indices": np.tile(np.arange(n_genes, dtype=np.int32), n_rows),
+        "data": np.ones(n_rows * nnz_per_row, dtype=np.float32),
+        "set_offsets": np.array([0, 3, 6], dtype=np.int64),
+        "cell_indices": np.arange(n_rows, dtype=np.uint64),
+        "file_ids": np.zeros(n_rows, dtype=np.uint32),
+        "role_tags": np.zeros(n_rows, dtype=np.int32),
+        "shape": (n_rows, n_genes),
+    }
+    aux = cellset_gather._collate_inputs(
+        batch, np.random.default_rng(cellset_gather._COLLATE_SEED)
     )
 
-    # The runtime half: the arm refuses to record a run whose mask withheld
-    # nothing, which catches an RNG or dtype change the constant cannot.
-    assert "masked_positions == 0" in src, (
-        f"{path.name} no longer asserts that the built mask withholds "
-        f"positions. The constant above is not sufficient: an all-zero uint8 "
-        f"array is non-empty, so the kernel takes the masking branch with an "
-        f"empty withheld set and the compaction loop has nothing to skip."
+    k_dec = cellset_gather._COLLATE_K_DEC
+    mask = aux["enc_mask_positions"]
+    assert mask.size == n_rows * k_dec, (
+        f"the mask must be n_rows * k_dec ({n_rows * k_dec}), got {mask.size}; "
+        f"an empty array takes the kernel's None branch"
+    )
+    assert mask.dtype == np.uint8
+    assert int(mask.sum()) > 0, (
+        "the mask withholds nothing, so the withheld-gene set is empty and the "
+        "compaction loop has nothing to skip"
     )
 
-    # `hide_readout` must stay all-zero: a set bit short-circuits the encoder
-    # path to a single GENE_MASK token, deleting the sort, mask and crop.
-    assert "np.zeros(n_rows, dtype=np.uint8)" in src, (
-        f"{path.name}'s collate inputs no longer build an all-zero "
-        f"hide_readout; a non-zero entry skips the whole encoder path"
-    )
+    # `hide_readout` all-zero: a set bit short-circuits the whole encoder path
+    # to a single GENE_MASK token, deleting the sort, mask and crop.
+    assert aux["hide_readout"].shape == (n_rows,)
+    assert int(aux["hide_readout"].sum()) == 0
+
+    # The query panel is drawn from genes the set contains, so the mask can
+    # actually hit; a uniform draw over a 61k vocabulary essentially never
+    # would.
+    assert aux["query_gene_ids"].size == 2 * k_dec
+    assert set(aux["query_gene_ids"].tolist()) <= set(range(n_genes))
+    assert aux["n_measured"].shape == (2,)
+    assert aux["n_genes_total"] == n_genes
 
 
 def test_ml_loader_highcard_arm_names_a_categorical_column():
@@ -1502,46 +1503,40 @@ def test_ml_loader_highcard_arm_names_a_categorical_column():
 
     OPT-LOADER-6's cost is `PyList::new(py, categories.iter())` — a fresh
     `PyUnicode` per category per batch — in `obs_to_pydict`'s `Categorical`
-    arm. An `Int64` column takes the `PyArray1::from_vec` arm instead and pays
-    none of it. So the arm's value rests entirely on the column being a
+    arm. An `Int64` column takes the `PyArray1::from_vec` arm and pays none of
+    it, so the arm's value rests entirely on the column being a
     high-cardinality *dictionary* column.
 
     The review doc prescribed `obs_columns=["soma_joinid"]`, which on census_1m
     is `int64` with a million distinct values: high cardinality, cheap branch,
-    and the arm would have measured nothing while looking exactly right.
-    `observation_joinid` is the categorical (957,955 categories, verified
-    against `census_1m_auto.scx`).
+    and the arm would have measured nothing while looking right.
+
+    Reads the spec dict directly rather than slicing the module's source text.
     """
-    import ast
-
-    _tree, path = _bench_ast("ml_loader")
-    src = path.read_text()
-    spec_src = src[src.index("_OBS_CARDINALITY_SPEC"):]
-    spec_src = spec_src[: spec_src.index("\n\n\n")]
-
-    assert "soma_joinid" not in spec_src, (
-        "the obs-cardinality arm names `soma_joinid`, which is int64 on "
-        "census_1m and takes obs_to_pydict's numpy branch — no category list "
-        "is rebuilt, so the arm would measure nothing. Use a categorical "
-        "column (`observation_joinid`)."
-    )
-    assert "observation_joinid" in spec_src, (
-        "the high-cardinality arm no longer names a known categorical column"
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _OBS_CARDINALITY_MIN_RATIO,
+        _OBS_CARDINALITY_SPEC,
+        _OBS_HIGHCARD_MIN_CATEGORIES,
     )
 
-    # Both halves are needed: the ratio is the signal, and one absolute rate
-    # cannot separate "obs projection costs something" from "cardinality costs
-    # something".
-    for arm in ("raw_obs_lowcard", "raw_obs_highcard"):
-        assert arm in spec_src, f"the {arm} arm is gone; the pair is the signal"
-
-    # The declared cardinalities are recorded into runs[].extra so a capture is
-    # self-describing rather than requiring a reader to re-probe the fixture.
-    mod = ast.parse(src)
-    assert any(
-        isinstance(node, ast.keyword) and node.arg == "obs_n_categories"
-        for node in ast.walk(mod)
-    ), "the arm no longer records obs_n_categories into runs[].extra"
+    assert _OBS_CARDINALITY_SPEC, "the arm has no datasets left"
+    for dataset, spec in _OBS_CARDINALITY_SPEC.items():
+        # The pair is the signal: one absolute rate cannot separate "obs
+        # projection costs something" from "cardinality costs something".
+        assert set(spec) == {"raw_obs_lowcard", "raw_obs_highcard"}, dataset
+        high_col, high_n = spec["raw_obs_highcard"]
+        low_col, low_n = spec["raw_obs_lowcard"]
+        assert high_col != "soma_joinid", (
+            f"{dataset} names soma_joinid as the high-cardinality column; it "
+            f"is int64 and takes obs_to_pydict's numpy branch, so no category "
+            f"list is rebuilt and the arm measures nothing"
+        )
+        # The declared numbers must themselves satisfy the premise the runtime
+        # preflight enforces, or the spec is asking for an arm that cannot run.
+        assert high_n >= _OBS_HIGHCARD_MIN_CATEGORIES, (dataset, high_col, high_n)
+        assert high_n >= low_n * _OBS_CARDINALITY_MIN_RATIO, (
+            dataset, high_n, low_n,
+        )
 
 
 def test_sort_by_arm_does_not_emit_the_pooled_grouped_peak_key(monkeypatch, tmp_path):
@@ -1862,80 +1857,64 @@ def test_obs_import_arm_handles_a_composite_only_join_key(composite_key_scx, tmp
     assert extra["obs_rewrite_bytes"] > 0
 
 
-def test_ml_loader_derived_obs_metrics_ride_existing_runs(monkeypatch):
+def test_derived_obs_metrics_ride_existing_runs_without_moving_the_medians():
     """The derived cardinality metrics must not arrive on a phantom run.
 
     An earlier version appended a `wall_s=0.0, peak_rss_mb=0.0` bookkeeping
     record and claimed it "cannot perturb the pooled medians any further than
     the two timed arms already do". That is arithmetically false —
-    `median_wall_s` / `median_rss_mb` and `capture_baseline._median_rss` take
-    a median over *every* run, so a 0.0/0.0 sample drags both down, widens
+    `median_wall_s` / `median_rss_mb` and `capture_baseline._median_rss` take a
+    median over *every* run, so a 0.0/0.0 sample drags both down, widens
     `wall_s_iqr` and bumps `n_runs`. All three reviewers flagged it; one
     measured a four-run loader median 11.5 -> 11.0 with triple the IQR.
 
-    Checked on the source rather than by running a census epoch: the defect is
-    entirely in which record the values land on.
+    Driven on a real `BenchmarkResult` rather than grepped for
+    `run_rec.extra.update(derived)`: what matters is that the medians do not
+    move, and that is observable.
     """
-    import ast
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _attach_to_scenario_runs,
+    )
+    from benchmarks.comprehensive.results import BenchmarkResult
 
-    tree, path = _bench_ast("ml_loader")
-    src = path.read_text()
+    result = BenchmarkResult(
+        benchmark="ml_loader", format="scx_auto", dataset="census_1m",
+    )
+    for wall in (10.0, 11.0, 12.0, 13.0):
+        result.add_run(wall_s=wall, peak_rss_mb=100.0, scenario="raw_obs_lowcard")
+    for wall in (20.0, 21.0):
+        result.add_run(wall_s=wall, peak_rss_mb=200.0, scenario="raw_obs_highcard")
 
-    assert "run_rec.extra.update(derived)" in src, (
-        f"{path.name} no longer attaches the derived obs metrics to existing "
-        f"runs; a separate add_run would perturb the pooled medians"
+    before = (result.median_wall_s, result.median_rss_mb, result.n_runs,
+              result.wall_s_iqr)
+
+    n = _attach_to_scenario_runs(
+        result, "raw_obs_highcard", {"obs_highcard_overhead_ms_per_batch": 109.0},
     )
 
-    # No `add_run(wall_s=0.0, ...)` anywhere in this module.
-    phantoms = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and str(getattr(node.func, "attr", "")) == "add_run"
-        for kw in node.keywords
-        if kw.arg == "wall_s"
-        and isinstance(kw.value, ast.Constant)
-        and kw.value.value == 0.0
+    assert n == 2, f"attached to {n} runs, expected the 2 high-cardinality ones"
+    assert (result.median_wall_s, result.median_rss_mb, result.n_runs,
+            result.wall_s_iqr) == before, (
+        "attaching a derived metric moved a pooled summary; it must be an "
+        "update to existing runs, never a new one"
+    )
+    # Only the high-cardinality runs carry it, so the gate's median over the
+    # runs holding the key is that arm's value alone.
+    carriers = [
+        r for r in result.runs if "obs_highcard_overhead_ms_per_batch" in r.extra
     ]
-    assert not phantoms, (
-        f"{path.name} adds a zero-wall run at lines {phantoms}; that is a "
-        f"synthetic measurement in a pooled median, not bookkeeping"
-    )
+    assert len(carriers) == 2
+    assert all(r.extra["scenario"] == "raw_obs_highcard" for r in carriers)
 
 
-def test_obs_cardinality_arm_verifies_categoricalness_against_the_file():
+def test_obs_cardinality_preflight_rejects_a_non_dictionary_column(tmp_path):
     """The arm's premise is a *dictionary* column, so it must probe for one.
 
     Checking only that the column name exists lets a fixture reconvert keep
     the name while storing an `Int64` — which sends `obs_to_pydict` down the
     `PyArray1::from_vec` branch, so the arm runs, emits its metrics, and
-    measures nothing. The declared category counts were also hard-coded into
-    `runs[].extra`, describing the fixture as it was rather than as it is.
-    """
-    tree, path = _bench_ast("ml_loader")
-    src = path.read_text()
-
-    assert _calls_named(tree, "obs_categorical"), (
-        f"{path.name} no longer probes obs_categorical; presence of the column "
-        f"name does not establish it is a dictionary column"
-    )
-    assert "obs_n_categories=n_categories" in src, (
-        f"{path.name} must record the OBSERVED category count"
-    )
-    assert "obs_n_categories_declared=declared" in src, (
-        f"{path.name} should keep the declared count beside the observed one "
-        f"so drift is visible rather than silent"
-    )
-
-
-def test_verify_sorted_tells_a_sorted_output_from_an_unsorted_one(tmp_path):
-    """The sort verification has to discriminate, not just return 1.
-
-    Driven on real converts of one 60-row source, because the whole point is
-    that a convert which *ignored* `sort_by` produces a valid file: the
-    regression is invisible in the output's shape, size or wall — it is only
-    visible in the order. So the reject side is a plain `from_h5ad` with no
-    `sort_by`, which is exactly what that regression would look like.
+    measures nothing. Driven on a two-column fixture: one categorical, one
+    int64, plus a name that is absent.
     """
     import pytest as _pytest
 
@@ -1945,38 +1924,127 @@ def test_verify_sorted_tells_a_sorted_output_from_an_unsorted_one(tmp_path):
     pd = _pytest.importorskip("pandas")
     sp = _pytest.importorskip("scipy.sparse")
 
-    from benchmarks.comprehensive.benchmarks import grouped_sort
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _probe_obs_cardinality,
+    )
 
-    n = 60
-    rng = np.random.default_rng(0)
-    obs = pd.DataFrame(
-        {"pert": pd.Categorical(rng.choice(["c", "a", "b"], n))},
-        index=[f"cell{i}" for i in range(n)],
+    n = 9
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.ones((n, 2), dtype="float32")),
+        obs=pd.DataFrame(
+            {
+                "kind": pd.Categorical(["a", "b", "c"] * 3),
+                "row_id": np.arange(n, dtype="int64"),
+            },
+            index=[f"c{i}" for i in range(n)],
+        ),
+        var=pd.DataFrame(index=["g0", "g1"]),
+    )
+    path = tmp_path / "cards.scx"
+    pyscx.from_anndata(adata, str(path))
+
+    counts, problems = _probe_obs_cardinality(
+        str(path), ["kind", "row_id", "nope"]
+    )
+
+    assert counts == {"kind": 3}, (
+        f"only the categorical column has a category count; got {counts}"
+    )
+    joined = " | ".join(problems)
+    assert "row_id" in joined and "not a categorical" in joined, (
+        f"an int64 column must be refused, not counted: {problems}"
+    )
+    assert "nope" in joined and "absent" in joined, problems
+
+
+def test_cardinality_premise_rejects_a_collapsed_dictionary():
+    """A column that stays categorical but loses its size loses the premise.
+
+    This is the dangerous drift: the type check passes, the arm runs, and the
+    collapsed dictionary makes the high-cardinality arm *faster* — so against
+    a `min: 0.85x` floor the loss of the benchmark reads as an improvement.
+    Observing the count is what makes it visible; refusing is what stops it
+    being scored.
+    """
+    from benchmarks.comprehensive.benchmarks.ml_loader import (
+        _OBS_CARDINALITY_SPEC,
+        _cardinality_premise_problems,
+    )
+
+    spec = _OBS_CARDINALITY_SPEC["census_1m"]
+    high_col, high_n = spec["raw_obs_highcard"]
+    low_col, low_n = spec["raw_obs_lowcard"]
+
+    assert not _cardinality_premise_problems(
+        spec, {low_col: low_n, high_col: high_n}
+    ), "the declared pair must satisfy its own premise"
+
+    collapsed = _cardinality_premise_problems(
+        spec, {low_col: low_n, high_col: 1_000}
+    )
+    assert collapsed, "a 1,000-category high arm must be refused"
+
+    no_separation = _cardinality_premise_problems(
+        spec, {low_col: high_n - 1, high_col: high_n}
+    )
+    assert no_separation, (
+        "two columns of the same cardinality cannot support a ratio"
+    )
+
+
+def test_sort_by_convert_moves_x_with_obs(tmp_path):
+    """`from_h5ad(sort_by=…)` must permute X with obs, not just obs.
+
+    The timing arm's two verification ints cannot see this: a convert that
+    reordered the obs axis and left the matrix in source order scores 1 on
+    both. Establishing it needs per-row identity, which is cheap here and
+    expensive per capture — so it is checked once, at the level where the
+    behaviour actually lives.
+
+    Every row carries a distinct X sentinel (row *i* holds `i+1` in all four
+    genes, so its sum is `4*(i+1)`), which makes the assertion an identity
+    check rather than a shape check.
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    anndata = _pytest.importorskip("anndata")
+    np = _pytest.importorskip("numpy")
+    pd = _pytest.importorskip("pandas")
+    sp = _pytest.importorskip("scipy.sparse")
+
+    n, n_genes = 12, 4
+    X = sp.csr_matrix(
+        np.tile(np.arange(1, n + 1, dtype="float32")[:, None], (1, n_genes))
     )
     adata = anndata.AnnData(
-        X=sp.csr_matrix(rng.random((n, 5), dtype="float32")),
-        obs=obs,
-        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+        X=X,
+        obs=pd.DataFrame(
+            {"pert": pd.Categorical(list("cbacbacbacba"))},
+            index=[f"cell{i}" for i in range(n)],
+        ),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_genes)]),
     )
     src = tmp_path / "s.h5ad"
     adata.write_h5ad(src)
+    out = tmp_path / "sorted.scx"
+    pyscx.from_h5ad(str(src), str(out), sort_by=["pert"])
 
-    sorted_out = tmp_path / "sorted.scx"
-    pyscx.from_h5ad(str(src), str(sorted_out), sort_by=["pert"])
-    plain_out = tmp_path / "plain.scx"
-    pyscx.from_h5ad(str(src), str(plain_out))
+    back = pyscx.open(str(out)).to_anndata()
 
-    good = grouped_sort._verify_sorted(sorted_out, "pert", n)
-    assert good == {"sort_by_ordered_int": 1, "sort_by_rows_kept_int": 1}
-
-    # The regression the arm exists to catch: same source, no `sort_by`.
-    ignored = grouped_sort._verify_sorted(plain_out, "pert", n)
-    assert ignored["sort_by_ordered_int"] == 0, (
-        "a convert that ignored sort_by scored as ordered; the verification "
-        "cannot see the one regression that would read as a speedup"
+    # Premise: the obs axis really was reordered, or the rest proves nothing.
+    keys = list(back.obs["pert"].astype(str))
+    assert keys == sorted(keys), f"obs was not sorted: {keys}"
+    assert keys != list(adata.obs["pert"].astype(str)), (
+        "the fixture's source order was already sorted, so this test would "
+        "pass on a convert that did nothing"
     )
-    assert ignored["sort_by_rows_kept_int"] == 1, "no rows were lost, so this half is 1"
 
-    # And the row-count half discriminates on its own.
-    short = grouped_sort._verify_sorted(sorted_out, "pert", n + 1)
-    assert short["sort_by_rows_kept_int"] == 0
+    # Each row's X must be the one that belongs to its label.
+    got = np.asarray(back.X.sum(axis=1)).ravel()
+    want = np.array(
+        [(int(label.removeprefix("cell")) + 1) * n_genes
+         for label in back.obs_names],
+        dtype="float32",
+    )
+    np.testing.assert_array_equal(got, want)

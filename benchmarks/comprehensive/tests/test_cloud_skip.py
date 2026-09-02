@@ -159,8 +159,13 @@ def _pin_candidates(monkeypatch, *paths):
     monkeypatch.setattr(scx_cli, "candidates", lambda: [str(p) for p in paths])
 
 
-def _cli_arm(monkeypatch, tmp_path, stdout: str, rc: int = 0):
-    """Drive `_run_cli_info_arm` against the fake binary; return the result."""
+def _cli_arm(monkeypatch, tmp_path, stdout: str, rc: int = 0, n_runs: int = 1):
+    """Drive `_run_cli_info_arm` against the fake binary; return the result.
+
+    Seeded with *n_runs* in-process runs, because the arm attaches its metrics
+    to those rather than appending its own — that is what keeps it from pooling
+    two incomparable operations into `median_wall_s`.
+    """
     from benchmarks.comprehensive.benchmarks import cloud_metadata
     from benchmarks.comprehensive.config import DATASETS
     from benchmarks.comprehensive.results import BenchmarkResult
@@ -171,8 +176,10 @@ def _cli_arm(monkeypatch, tmp_path, stdout: str, rc: int = 0):
     result = BenchmarkResult(
         benchmark="cloud_metadata", format="scx_auto", dataset=dataset.name,
     )
+    for _ in range(n_runs):
+        result.add_run(wall_s=0.25, peak_rss_mb=110.0, library_open=True)
     cloud_metadata._run_cli_info_arm(
-        result, dataset, "gs://example/pbmc3k.scxd/", n_runs=1,
+        result, dataset, "gs://example/pbmc3k.scxd/", n_runs=n_runs,
     )
     return result
 
@@ -185,7 +192,10 @@ def test_cli_info_arm_records_ok_on_a_matching_n_obs(monkeypatch, tmp_path):
     assert extra["scx_info_cloud_ok"] == 1
     assert extra["scx_info_n_obs"] == 2700
     assert extra["wall_s__scx_info_cloud"] > 0
-    assert extra["scenario"] == "scx_info_cloud"
+    # No `scenario` of its own: the metrics ride the in-process run, which is
+    # what keeps the arm from shifting the triple's pooled medians.
+    assert "scenario" not in extra
+    assert extra["library_open"] is True
 
 
 def test_cli_info_arm_refuses_an_exit_zero_that_answered_the_wrong_file(
@@ -270,26 +280,44 @@ def test_cli_info_arm_refuses_a_file_with_the_right_n_obs_and_wrong_n_vars(
     assert extra["scx_info_n_vars"] == 1, "the observed value is recorded"
 
 
-def test_cli_info_arm_records_a_real_parent_rss_not_add_runs_zero_default(
+def test_cli_info_arm_adds_no_runs_and_leaves_the_pooled_medians_alone(
     monkeypatch, tmp_path,
 ):
-    """Omitting `peak_rss_mb=` would poison the triple's pooled RSS median.
+    """The arm must not append runs — it pools two incomparable operations.
 
-    `add_run` defaults it to 0.0 and `capture_baseline._median_rss` medians
-    across **every** run of the triple, so three zeros beside three real
-    catalog-open samples roughly halve the pooled figure — a phantom
-    regression the moment this arm's justification is retired, and one that
-    would be baked into any baseline recaptured first.
+    `BenchmarkResult.median_wall_s` and `capture_baseline._median_rss` take a
+    median over **every** run of the triple. An `open_cloud` catalog read is
+    sub-second; `scx info` range-reads one header per CSR shard and was
+    measured at ~175 s on the largest fixture. Appending the CLI runs put the
+    pooled figure between the two, describing neither — and the first version
+    of the arm additionally omitted `peak_rss_mb=` entirely, so `add_run`
+    supplied `0.0` and the pooled RSS was an average of zeros and real
+    samples.
 
-    This arm's RSS is the *harness's* footprint while a child process does the
-    work. That is worth recording and worth labelling; it is not worth
-    recording as zero.
+    Attaching to the existing runs gives `_load_current_raw_metric` the same
+    median over the sparse key, with `n_runs`, `median_wall_s`, `wall_s_iqr`
+    and `peak_rss_mb_median` all untouched.
     """
-    result = _cli_arm(monkeypatch, tmp_path, '{"n_obs": 2700, "n_vars": 32738}')
-    run = result.runs[0]
-    assert run.peak_rss_mb > 0.0, (
-        "the CLI arm recorded add_run's 0.0 default again; see "
-        "cloud_metadata_cli_arm_raises_pooled_medians.md"
+    result = _cli_arm(
+        monkeypatch, tmp_path, '{"n_obs": 2700, "n_vars": 32738}', n_runs=3,
     )
-    assert run.extra["peak_rss_mb__scx_info_cloud"] == round(run.peak_rss_mb, 1)
-    assert run.extra["entry_rss_mb"] > 0.0
+    assert len(result.runs) == 3, (
+        f"the arm appended runs ({len(result.runs)} for 3 seeded); that pools "
+        f"a multi-second CLI call with a sub-second catalog open"
+    )
+    assert result.median_wall_s == 0.25, (
+        f"pooled median_wall_s moved to {result.median_wall_s}; the in-process "
+        f"arm recorded 0.25 s per run and this arm must not shift it"
+    )
+    for run in result.runs:
+        assert run.peak_rss_mb == 110.0, "the seeded RSS must survive untouched"
+        assert run.extra["library_open"] is True, "attached, not replaced"
+        # The harness's own footprint, labelled as such — not a peak, and not
+        # the run's reserved `peak_rss_mb`.
+        assert run.extra["harness_rss_mb__scx_info_cloud"] > 0.0
+        assert run.extra["harness_entry_rss_mb__scx_info_cloud"] > 0.0
+        assert "peak_rss_mb__scx_info_cloud" not in run.extra, (
+            "the harness's RSS while it blocks in waitpid is not a peak of "
+            "anything; naming it one is what PR-02a had to undo three times"
+        )
+        assert run.extra["wall_s__scx_info_cloud"] > 0.0

@@ -1467,11 +1467,6 @@ def estimate_time_minutes(
         # picks up the 2× format multiplier at 500K+ cells below.
         "parallel_write_scaling": 40,
         "memory":                 15,
-        # +10 for the `obs_import` arm: it materialises the obs index as
-        # Python strings once (`read_obs([])`, measured 5.0 s at census_1m),
-        # writes a 1M-row CSV, and then per run copies the whole file, runs an
-        # untimed `dry_run` join and an import that rehashes the file.
-        "fragment_ops":           25,
         # Grouped sharding runs sort + a forced one-pass + two-pass convert.
         # The dense one-pass grouped gather (random full-width row reads) is the
         # slow scenario — minutes on a real Perturb-seq file even at the
@@ -1621,7 +1616,16 @@ def estimate_time_minutes(
         # 244-295 s per run (it rewrites a fixture 2.75x the size, carrying a
         # layer and two obsm matrices). At N_RUNS_LARGE=3 those two arms alone
         # are ~21 min, which the 15-min fall-through default does not cover.
-        "fragment_ops":           45,
+        #
+        # 45 -> 55 for the `obs_import` arm: it materialises the obs index as
+        # Python strings once (`read_obs([])`, measured 5.0 s at census_1m),
+        # writes a 1M-row CSV, and then per run copies the whole file, runs an
+        # untimed `dry_run` join and an import that rehashes it (19.7 s per run
+        # at census_1m). An earlier version of this change added a SECOND
+        # `"fragment_ops"` entry earlier in this same dict, which Python
+        # silently discarded in favour of this one — so the +10 had no effect
+        # at all. `test_no_duplicate_keys_in_config_tables` now catches that.
+        "fragment_ops":           55,
         # One in-place sidecar build per run, plus a file copy per run outside
         # the timed region. O(nnz) with a column-major transpose on top: 259 s
         # per run at tabula_sapiens_100k (195M nnz) and 1630 s at census_500k

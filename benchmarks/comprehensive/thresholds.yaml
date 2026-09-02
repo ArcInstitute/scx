@@ -3254,7 +3254,12 @@ absolute_floors:
 #       1. `obs_highcard_overhead_ms_per_batch` is the metric to floor, NOT
 #          `obs_highcard_slowdown_vs_lowcard`. The ratio depends on how
 #          I/O-bound the host is; the per-batch delta is what the fix changes.
-#          It is emitted on a zero-wall bookkeeping run, so it medians alone.
+#          Both are attached to the `raw_obs_highcard` runs themselves — an
+#          earlier version put them on a zero-wall bookkeeping run, which
+#          dragged the triple's pooled `median_wall_s` / `peak_rss_mb_median`
+#          down and widened `wall_s_iqr`. `_load_current_raw_metric` medians
+#          over the runs carrying a key, so attaching gives the same reading
+#          with no synthetic sample.
 #       2. Author on census_1m at whichever scx_* format the capture ran:
 #              metric: obs_highcard_overhead_ms_per_batch -> max: 1.18 x median
 #       3. Also floor `batches_per_sec__raw_obs_highcard` at 0.85x its median,
@@ -3362,11 +3367,20 @@ absolute_floors:
 #          read that median from a capture on the SAME fixture: the metric is
 #          proportional to shard count, so it is not comparable across
 #          datasets.
-#       3. `peak_rss_mb__scx_info_cloud` is the *harness's* footprint while a
-#          child process does the work, so it is a diagnostic, not a bound on
-#          the operation. It exists because omitting `peak_rss_mb=` let
-#          `add_run` default it to 0.0, and `_median_rss` medians across every
-#          run — three zeros beside three real samples roughly halve the
-#          triple's pooled RSS, which becomes a phantom regression the moment
-#          this arm's justification expires. Do not floor it; do not let it go
-#          back to zero.
+#       3. `harness_rss_mb__scx_info_cloud` is the *harness's* footprint while
+#          a child process does the work, so it is a diagnostic, not a bound on
+#          the operation — and deliberately not called a peak: the harness
+#          blocks in `waitpid` and allocates nothing, so there is no peak to
+#          sample. The child's own would need `wait4` rusage, the same gap
+#          `doublet_interop`'s `residual_rss_mb` documents. Do not floor it.
+#
+#     The arm adds **no runs**: its keys are attached to the in-process runs
+#     that already exist, so `median_wall_s`, `wall_s_iqr`, `n_runs` and
+#     `peak_rss_mb_median` are exactly what the library arm left them and
+#     `_load_current_raw_metric` still medians the sparse key over the runs
+#     carrying it. That is why this arm has NO justification file, and why one
+#     must not be added if the arm is ever changed to append instead: an
+#     `open_cloud` catalog read is sub-second and `scx info` was ~175 s on the
+#     largest fixture, so pooling them produces a median describing neither.
+#     `test_cli_info_arm_adds_no_runs_and_leaves_the_pooled_medians_alone`
+#     enforces it.

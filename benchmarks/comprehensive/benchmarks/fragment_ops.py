@@ -376,12 +376,10 @@ def _resolve_obs_join_key(base_scx: Path) -> list[str]:
         return [unique[0]]
     pairs = list(diag.get("unique_pairs") or [])
     if pairs:
-        # Reported as a sequence of pairs; normalise both the tuple and the
-        # comma-joined-string renderings.
-        first = pairs[0]
-        if isinstance(first, str):
-            return [c.strip() for c in first.split(",") if c.strip()]
-        return [str(c) for c in first]
+        # Each pair is a sequence of column names. `suggestion` renders one as
+        # a comma-joined string, which is why it is not read here — that
+        # rendering cannot be handed to `key=`.
+        return [str(c) for c in pairs[0]]
     raise RuntimeError(
         f"{base_scx.name} has no obs column or column pair that can key a "
         f"join ({diag.get('summary')}). The arm joins by key string, never by "

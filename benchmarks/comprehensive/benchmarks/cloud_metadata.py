@@ -44,7 +44,7 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.rss import PeakRssSampler, current_rss_mb
+from benchmarks.comprehensive.rss import current_rss_mb
 from benchmarks.comprehensive.scx_cli import CLOUD_PROBE, resolve_scx_bin
 from benchmarks.comprehensive.runners import make_runner
 
@@ -175,6 +175,15 @@ def _run_cli_info_arm(
     and nothing measured it, so a 175 s → ~22 s improvement had nowhere to
     land.
 
+    Its numbers ride the in-process runs rather than adding new ones — see the
+    comment at the loop for why, and note that this is what makes the arm
+    composition-neutral and so needs no justification file.
+
+    It records no RSS *peak*: the harness blocks in `waitpid` while the child
+    works, so there is nothing to sample. Two `harness_*_rss_mb` readings
+    bracket the call as a diagnostic; the child's own peak would need `wait4`
+    rusage.
+
     Skips with a recorded reason, never raises. Two independent reasons it can
     be unavailable and they need telling apart:
 
@@ -206,7 +215,29 @@ def _run_cli_info_arm(
         return
 
     result.metadata["cli_info_bin"] = scx_bin
-    for i in range(n_runs):
+    # One CLI call per existing in-process run, and its numbers are attached to
+    # that run rather than appended as new ones.
+    #
+    # Appending was the first design and it pooled two incomparable operations:
+    # `BenchmarkResult.median_wall_s` is a median over every run, so three
+    # sub-second `open_cloud` catalog reads beside three multi-second `scx
+    # info` calls produced a figure between them that described neither. The
+    # RSS side was worse — the sampled peak is the *harness's* footprint while
+    # a child does the work, so pooling it into `peak_rss_mb_median` mixed in a
+    # number that is not about either operation.
+    #
+    # Attaching instead leaves `median_wall_s`, `wall_s_iqr`, `n_runs` and
+    # `peak_rss_mb_median` exactly as the in-process arm left them, and
+    # `_load_current_raw_metric` medians the sparse `wall_s__scx_info_cloud`
+    # over the runs that carry it — the same gate reading with no composition
+    # change at all. That is also why this arm needs no justification file.
+    targets = list(result.runs)
+    if not targets:
+        result.metadata["cli_info_skipped_reason"] = (
+            "no in-process runs to attach to; the library arm recorded nothing"
+        )
+        return
+    for i in range(len(targets)):
         gc.collect()
         entry_rss = current_rss_mb()
         t0 = time.perf_counter()
@@ -215,18 +246,10 @@ def _run_cli_info_arm(
         # arm never raises. A timed-out run is recorded as ok=0 with its (capped)
         # wall, which is the honest reading: it did take at least that long.
         try:
-            # The work happens in a child process, so this samples the
-            # *harness's* footprint while it waits. Recorded anyway, and
-            # explicitly: omitting `peak_rss_mb=` lets `add_run` default it to
-            # 0.0, and `_median_rss` medians across every run — three zeros
-            # beside three real samples halves the triple's pooled RSS, which
-            # is a phantom regression the moment this arm's justification is
-            # retired.
-            with PeakRssSampler() as sampler:
-                proc = subprocess.run(
-                    [scx_bin, "info", "--json", cloud_url],
-                    capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
-                )
+            proc = subprocess.run(
+                [scx_bin, "info", "--json", cloud_url],
+                capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
+            )
         except subprocess.TimeoutExpired:
             logger.error(
                 "  scx info %s exceeded the %ds cap", cloud_url,
@@ -270,21 +293,23 @@ def _run_cli_info_arm(
                 n_obs_seen, dataset.n_obs, n_vars_seen, dataset.n_vars,
                 "" if proc is None else (proc.stderr or "").strip()[:400],
             )
-        # `sampler` is unbound only if the `with` never entered, which cannot
-        # happen — `PeakRssSampler.__enter__` does not raise — but a spawn
-        # failure leaves the entry reading as the honest floor.
-        parent_peak = getattr(sampler, "peak_mb", entry_rss)
-        result.add_run(
-            wall_s=wall,
-            peak_rss_mb=parent_peak,
-            scenario="scx_info_cloud",
-            entry_rss_mb=round(entry_rss, 1),
-            wall_s__scx_info_cloud=round(wall, 6),
-            peak_rss_mb__scx_info_cloud=round(parent_peak, 1),
-            scx_info_cloud_ok=ok,
-            scx_info_n_obs=n_obs_seen,
-            scx_info_n_vars=n_vars_seen,
-        )
+        # NOT a peak, and not called one. The work happens in a child process
+        # while this one blocks in `waitpid`, so the harness allocates nothing
+        # and its RSS is flat for the duration — a `PeakRssSampler` here polls
+        # `/proc/self/statm` every 5 ms to rediscover a constant. Two readings
+        # bracket it instead, and the name says whose memory it is.
+        #
+        # Measuring the *child's* peak would need `wait4` rusage, which is the
+        # same gap `doublet_interop`'s `residual_rss_mb` documents.
+        targets[i].extra.update({
+            "wall_s__scx_info_cloud": round(wall, 6),
+            "harness_rss_mb__scx_info_cloud": round(current_rss_mb(), 1),
+            "harness_entry_rss_mb__scx_info_cloud": round(entry_rss, 1),
+            "scx_info_cloud_ok": ok,
+            "scx_info_n_obs": n_obs_seen,
+            "scx_info_n_vars": n_vars_seen,
+        })
         logger.info(
-            "  scx info (cloud) run %d/%d: wall=%.3fs ok=%d", i + 1, n_runs, wall, ok,
+            "  scx info (cloud) run %d/%d: wall=%.3fs ok=%d",
+            i + 1, len(targets), wall, ok,
         )

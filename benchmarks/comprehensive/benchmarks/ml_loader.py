@@ -213,12 +213,53 @@ def _scx_memory_budget_mb() -> int | None:
 #
 # Cardinalities are recorded here, and into `runs[].extra`, so a capture says
 # what it measured rather than requiring a reader to re-probe the fixture.
+# The arm's premise, as a checkable bound rather than a comment. The point is a
+# *separation* in cardinality, and only the high side needs to be large: at
+# 957,955 vs 3 the declared pair clears both of these by three orders of
+# magnitude, so a fixture that fails them has lost the premise rather than
+# merely drifted.
+#
+# Observing the counts is not enough on its own. A reconvert that keeps
+# `observation_joinid` categorical but collapses it to, say, 1,000 categories
+# would leave the arm green while destroying what it measures — the per-batch
+# `PyUnicode` rebuild is proportional to the category count — and a *faster*
+# high-cardinality arm would read as an improvement. So a collapse fails the
+# preflight instead of warning.
+_OBS_HIGHCARD_MIN_CATEGORIES = 100_000
+_OBS_CARDINALITY_MIN_RATIO = 1_000
+
 _OBS_CARDINALITY_SPEC: dict[str, dict[str, tuple[str, int]]] = {
     "census_1m": {
         "raw_obs_lowcard": ("sex", 3),
         "raw_obs_highcard": ("observation_joinid", 957_955),
     },
 }
+
+
+def _attach_to_scenario_runs(
+    result: BenchmarkResult, scenario: str, extras: dict[str, Any],
+) -> int:
+    """Merge *extras* into every run of *scenario*; return how many got them.
+
+    For a value derived *after* both arms have run and which still has to be
+    gateable. `_load_current_raw_metric` medians over the runs that carry a
+    key, so writing the same value onto each run of one scenario reads
+    identically to a dedicated record — without being one.
+
+    That distinction is the point. An earlier version appended a
+    `wall_s=0.0, peak_rss_mb=0.0` bookkeeping run, whose comment claimed it
+    could not perturb the pooled medians. `BenchmarkResult.median_wall_s` /
+    `median_rss_mb` and `capture_baseline._median_rss` take a median over
+    *every* run, so a 0.0/0.0 sample drags both down, widens `wall_s_iqr` and
+    bumps `n_runs`; a reviewer measured a four-run loader median 11.5 -> 11.0
+    with triple the IQR.
+    """
+    n = 0
+    for run_rec in result.runs:
+        if run_rec.extra.get("scenario") == scenario:
+            run_rec.extra.update(extras)
+            n += 1
+    return n
 
 
 def _probe_obs_cardinality(
@@ -243,8 +284,15 @@ def _probe_obs_cardinality(
     validates `obs_columns` in its constructor and raises, and catching that
     the way the `gpu_train` arm catches its own failures would turn a broken
     fixture into a scenario with zero runs — a silent missing metric for any
-    threshold on it. Failing to open the file at all reports no problems, so
-    the arm's own error is what surfaces rather than this probe's.
+    threshold on it.
+
+    Failing to open the file is itself reported as a problem. The predecessor
+    returned "no problems" there, on the reasoning that the arm's own error
+    would surface instead — true while the caller needed only the column
+    *names*, and a `KeyError: 'sex'` the moment it started indexing the
+    observed counts. Widening a function's return domain without auditing its
+    caller is the shape a fix round most reliably regresses in; a reviewer
+    caught this one.
     """
     counts: dict[str, int] = {}
     problems: list[str] = []
@@ -272,8 +320,46 @@ def _probe_obs_cardinality(
                 close()
     except Exception as e:  # noqa: BLE001
         logger.warning("  obs-column preflight could not open %s: %s", path, e)
-        return {}, []
+        return {}, [f"could not open {path}: {e}"]
     return counts, problems
+
+
+def _cardinality_premise_problems(
+    spec: dict[str, tuple[str, int]], observed: dict[str, int],
+) -> list[str]:
+    """Whether the observed counts still support a cardinality comparison.
+
+    Two bounds, both on the *observed* numbers:
+
+    * the high-cardinality column must actually be high-cardinality
+      (``>= _OBS_HIGHCARD_MIN_CATEGORIES``), since the cost this arm prices is
+      proportional to the category count;
+    * the two columns must be separated by ``>= _OBS_CARDINALITY_MIN_RATIO``,
+      since the whole design is a ratio between them.
+
+    A reconvert that keeps the column categorical but collapses its dictionary
+    passes the type check and fails these — and it is the dangerous case,
+    because the collapsed arm is *faster* and would read as an improvement
+    against a floor. Recording the observed count is what makes the drift
+    visible; refusing here is what stops it being scored.
+    """
+    high_col, _ = spec["raw_obs_highcard"]
+    low_col, _ = spec["raw_obs_lowcard"]
+    high = observed.get(high_col, 0)
+    low = max(observed.get(low_col, 0), 1)
+    problems: list[str] = []
+    if high < _OBS_HIGHCARD_MIN_CATEGORIES:
+        problems.append(
+            f"{high_col}: {high} categories is below the "
+            f"{_OBS_HIGHCARD_MIN_CATEGORIES} this arm needs — the per-batch "
+            f"category rebuild it prices scales with that count"
+        )
+    if high < low * _OBS_CARDINALITY_MIN_RATIO:
+        problems.append(
+            f"{high_col}/{low_col} = {high}/{low} is below the "
+            f"{_OBS_CARDINALITY_MIN_RATIO}x separation the comparison needs"
+        )
+    return problems
 
 
 _SCENARIOS: list[tuple[str, bool, bool]] = [
@@ -1439,6 +1525,8 @@ def run(
             observed, problems = _probe_obs_cardinality(
                 data_path, [c for c, _n in obs_spec.values()]
             )
+            if observed and not problems:
+                problems = _cardinality_premise_problems(obs_spec, observed)
             if problems:
                 # Recorded, not swallowed into a per-scenario "error" key: an
                 # unusable column yields zero runs, and a threshold on a metric
@@ -1460,9 +1548,11 @@ def run(
                 for arm_name, (column, declared) in obs_spec.items():
                     n_categories = observed[column]
                     if n_categories != declared:
-                        # Not fatal — a reconvert legitimately changes a
-                        # dictionary's size — but the spec's number is now
-                        # stale documentation and should be updated.
+                        # Not fatal by itself: the premise that matters is the
+                        # observed separation, enforced by
+                        # `_cardinality_premise_problems` above, and a drift
+                        # that still clears it is real. What is stale is the
+                        # spec's number, which should be updated.
                         logger.warning(
                             "  %s: %r has %d categories, spec says %d; "
                             "recording the observed count",
@@ -1589,17 +1679,18 @@ def run(
                     # *carry* the key, so writing the same value onto each
                     # high-cardinality run yields the identical gate reading
                     # with no synthetic measurement.
-                    derived = {
-                        "obs_highcard_slowdown_vs_lowcard": round(slowdown, 3),
-                        "obs_highcard_overhead_ms_per_batch": round(
-                            overhead_ms, 2
-                        ),
-                        "obs_lowcard_column": obs_spec["raw_obs_lowcard"][0],
-                        "obs_highcard_column": obs_spec["raw_obs_highcard"][0],
-                    }
-                    for run_rec in result.runs:
-                        if run_rec.extra.get("scenario") == "raw_obs_highcard":
-                            run_rec.extra.update(derived)
+                    n_attached = _attach_to_scenario_runs(
+                        result,
+                        "raw_obs_highcard",
+                        {
+                            "obs_highcard_slowdown_vs_lowcard": round(slowdown, 3),
+                            "obs_highcard_overhead_ms_per_batch": round(
+                                overhead_ms, 2
+                            ),
+                            "obs_lowcard_column": obs_spec["raw_obs_lowcard"][0],
+                            "obs_highcard_column": obs_spec["raw_obs_highcard"][0],
+                        },
+                    )
                     logger.info(
                         "  obs cardinality: %.1f -> %.1f batches/s "
                         "(%.2fx slower, +%.1f ms/batch)",
