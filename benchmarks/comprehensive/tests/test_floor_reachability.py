@@ -672,6 +672,58 @@ def test_the_hvg_clamp_boundary_moves_no_gated_number():
     )
 
 
+def test_the_submission_throttle_counts_array_tasks_individually():
+    """`squeue` must be asked for `-r`, or the throttle cannot see its subject.
+
+    `_wait_under_pending_cap` reserves room for a whole cohort before
+    submitting it, because "a `map_array` call registers N tasks that each
+    count individually against `QOSMaxSubmitJobPerUserLimit`" — its own
+    docstring. But `_count_active_user_jobs` asked `squeue` without `-r`, which
+    collapses a pending array into ONE line (`2891953_[14-19]`), so the
+    arithmetic was right and its input could not see the tasks it was
+    reserving against.
+
+    Measured on a live capture queue: 16 lines without `-r`, 39 with. The
+    tier-full capture (job 2891607) died 26 minutes in on
+    `QOSMaxSubmitJobPerUserLimit`, having exhausted all three QOS retries,
+    while the throttle believed the queue was nearly empty.
+
+    Asserted on the argv rather than the behaviour because the behaviour needs
+    a populated queue: with an empty one, `-r` and no `-r` agree, so a
+    same-answer test would pass on exactly the configuration that is broken.
+    The live-queue arm below runs only when there is something in flight.
+    """
+    import inspect
+    import os
+    import subprocess
+
+    from benchmarks.comprehensive.scripts import run_parallel
+
+    src = inspect.getsource(run_parallel._count_active_user_jobs)
+    assert '"-r"' in src or "'-r'" in src or "--array" in src, (
+        "_count_active_user_jobs asks squeue without -r, so every pending "
+        "array counts as one job instead of N and the QOS throttle "
+        "under-reports the queue depth it exists to bound"
+    )
+
+    user = os.environ.get("USER", "")
+    if not user:
+        return
+    try:
+        expanded = subprocess.check_output(
+            ["squeue", "-u", user, "-h", "-r", "-t", "PD,R", "--format=%i"],
+            text=True, timeout=15,
+        )
+    except Exception:
+        return  # no SLURM here; the argv assertion above is the contract
+    n_expanded = len([ln for ln in expanded.splitlines() if ln.strip()])
+    if n_expanded == 0:
+        return  # empty queue cannot distinguish the two spellings
+    assert run_parallel._count_active_user_jobs() == n_expanded, (
+        "the counter disagrees with the array-expanded queue depth"
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 

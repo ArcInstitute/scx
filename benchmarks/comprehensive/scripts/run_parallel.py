@@ -141,11 +141,36 @@ def _is_multimodal_format(format_key: str) -> bool:
 def _count_active_user_jobs() -> int:
     """Return total PD+R jobs currently queued for the invoking user.
 
-    Used by ``_wait_under_pending_cap`` to throttle submissions when
-    Chimera's ``QOSMaxSubmitJobPerUserLimit`` (~500 per user) is
-    approaching. Falls back to 0 when ``squeue`` is unreachable
-    (running outside SLURM, or a misconfigured PATH) — disabling the
-    throttle is safer than blocking the orchestrator.
+    Used by ``_wait_under_pending_cap`` to throttle submissions before
+    ``QOSMaxSubmitJobPerUserLimit`` rejects an ``sbatch``.
+
+    **``-r`` is load-bearing.** Without it ``squeue`` collapses a pending job
+    array into ONE line (``2891953_[14-19]``), while the QOS counts every task
+    in it. So the throttle's reservation arithmetic — which exists precisely
+    because "a ``map_array`` call registers N tasks that each count
+    individually" — was fed a number that could not see them. Measured on a
+    live capture queue: 16 lines without ``-r``, **39 with**, a 2.4x
+    undercount, and the tier-full capture (job 2891607) died 26 minutes in on
+    ``QOSMaxSubmitJobPerUserLimit`` after exhausting all three retries while
+    the throttle believed the queue was nearly empty.
+
+    The measured limits on this cluster, since the old "~500 per user" note was
+    a guess and the number that actually bites is smaller and per-QOS:
+
+        partition          QOS         MaxSubmitPU  MaxJobsPU
+        cpu_preemptible    preempt         512         100
+        cpu_batch          cpu_batch       200          20
+        cpu_high_mem       nogpu            -           -     (TRES cpu=513)
+        ctc_gpu_priority   (normal)         -           -
+
+    ``MaxJobsPU`` on ``preempt`` is what the old comment's "rejections at queue
+    depth 80-110" was actually seeing — a *running* cap, not the submit cap.
+    ``cpu_batch`` additionally pends on ``QOSGrpCpuLimit``, so it is a poor
+    choice for the bench cells however attractive its lack of preemption is.
+
+    Falls back to 0 when ``squeue`` is unreachable (running outside SLURM, or a
+    misconfigured PATH) — disabling the throttle is safer than blocking the
+    orchestrator.
     """
     import os
     import subprocess
@@ -154,7 +179,7 @@ def _count_active_user_jobs() -> int:
         return 0
     try:
         out = subprocess.check_output(
-            ["squeue", "-u", user, "-h", "-t", "PD,R", "--format=%i"],
+            ["squeue", "-u", user, "-h", "-r", "-t", "PD,R", "--format=%i"],
             text=True, timeout=15,
         )
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
