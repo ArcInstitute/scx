@@ -2860,7 +2860,23 @@ absolute_floors:
 #    `discrimination_score` op stamps only `cpu_*` routes today.
 #
 # 7. Data-load Phase 0 signals: ooc_loader / cellset_gather / obs_open
-#    NOW ACTIVE — 33 cold-cache floors, all live under `absolute_floors` above:
+#    NOW ACTIVE — 33 cold-cache floors under `absolute_floors` above.
+#
+#    CORRECTION (PR-02c): "all live" was false for 15 of them for as long as
+#    this note has existed. Every `cellset_gather / scx_auto` floor on
+#    tabula_sapiens_100k / census_500k / census_1m sat under
+#    `results/justifications/cellset_gather_s512_raises_pooled_rss.md`, which
+#    has no `expires` and — because justification suppression was whole-triple
+#    over every metric — dropped the floor violations along with the pooled
+#    `peak_rss_mb_median` regression it was actually written for. The gate
+#    printed "Absolute-floor violations: 0 (N justification-suppressed)" and
+#    exited 0. That file is now scoped
+#    (`metrics: [peak_rss_mb_median, median_wall_s]`) and the 15 floors are
+#    enforceable; a new guard,
+#    `test_no_floor_is_fully_suppressed_by_an_active_justification`, fails on
+#    any floor under an unscoped suppression.
+#
+#    The 33:
 #    24 captured 2026-07-23 (baseline v0.11.5-dataload-phase0; ooc_loader SCX +
 #    4 competitors, cellset_gather SCX, obs_open SCX + h5ad_none) plus 9 from the
 #    2026-07-30 second wave (S=512 gather x 3 datasets x 2 plan types, and the
@@ -3163,3 +3179,144 @@ absolute_floors:
 #    floor would fail every gate run that reaches census scale until
 #    `write_csc_sidecar` streams. Author the row in the change that fixes the
 #    writer, using the crossover above to choose the scale to gate.
+#
+# 15. cellset_gather / collate throughput (`collate_rust`)
+#     The arm exists as of PR-02c; the floors need PR-03's recapture because
+#     the prescribed value is 0.85x a recaptured median and no baseline carries
+#     `cellset_gather` rows at all (LATEST = v0.11.2-multimodal-loader-fix
+#     predates the whole data-load Phase 0 family).
+#
+#     Measured on pbmc3k, 2 runs, k_enc=2048 / k_dec=1024 / pass_through /
+#     25% of query positions withheld, ten S=64 batches (10,240 cells):
+#         cellsets_per_sec__collate_rust   145.1, 146.3   (median 145.7)
+#         us_per_cell__collate             107.66, 106.77 (median 107.2)
+#
+#     ACTIVATION, once a baseline carries the arm:
+#       1. Read the medians from
+#          `<candidate>/raw/cellset_gather__scx_auto__<dataset>.json`, from the
+#          runs whose `extra.scenario == "collate_rust"`.
+#       2. Author, for tabula_sapiens_100k and census_500k:
+#              metric: cellsets_per_sec__collate_rust  ->  min: 0.85 x median
+#              metric: us_per_cell__collate            ->  max: 1.18 x median
+#          (1/0.85 on the inverted quantity, so the two agree.)
+#       3. The floors only bind if the shape stays pinned. `k_enc`, `k_dec`,
+#          `collate_mode` and `enc_mask_fraction` are module constants for
+#          exactly this reason and are echoed into `runs[].extra`; changing any
+#          of them invalidates the numbers above and the floors with them.
+#       4. DO NOT floor this at census_1m before checking the wall: the arm
+#          holds ten gathered batches resident, and the gather that fills them
+#          is the pre-optimization scattered path the rest of this module
+#          already reports as slow.
+#
+#     Note the floors are only *reachable* because PR-02c narrowed
+#     `cellset_gather_s512_raises_pooled_rss.md` to
+#     `metrics: [peak_rss_mb_median, median_wall_s]`. Unscoped, that
+#     justification suppressed every metric on all three floored triples, so a
+#     collate floor authored here would have been dead on arrival — as the 15
+#     floors in item 7 already were.
+#
+# 16. ml_loader / obs cardinality (`raw_obs_lowcard` vs `raw_obs_highcard`)
+#     OPT-LOADER-6's target: `obs_to_pydict` rebuilds a categorical column's
+#     whole category list as fresh `PyUnicode` objects per batch. The arm runs
+#     on census_1m only — it is the sole fixture with a high-cardinality
+#     categorical (`observation_joinid`, 957,955 categories; `sex` is the
+#     3-category control).
+#
+#     Prescribed `soma_joinid` would have measured nothing: it is `int64` on
+#     census_1m, so it takes `obs_to_pydict`'s numpy branch and builds no
+#     dictionary at all. High cardinality, cheap path.
+#
+#     Measured 2026-09-02, page-cache-COLD, 40 batches, batch_size=1024:
+#         obs_columns=None                  1.15 batches/s   (872 ms/batch)
+#         obs_columns=["sex"]               1.14 batches/s   (879 ms/batch)
+#         obs_columns=["observation_joinid"] 1.02 batches/s  (981 ms/batch)
+#     i.e. +109 ms/batch for the 958k-category column, squarely inside the
+#     60-120 ms/batch the review estimated — but only 1.13x as a *ratio*,
+#     because a cold epoch is I/O-bound. This benchmark normally reports warm,
+#     page-cache-resident rates (~48 batches/s), where the same 109 ms is
+#     several-fold.
+#
+#     ACTIVATION:
+#       1. `obs_highcard_overhead_ms_per_batch` is the metric to floor, NOT
+#          `obs_highcard_slowdown_vs_lowcard`. The ratio depends on how
+#          I/O-bound the host is; the per-batch delta is what the fix changes.
+#          It is emitted on a zero-wall bookkeeping run, so it medians alone.
+#       2. Author on census_1m at whichever scx_* format the capture ran:
+#              metric: obs_highcard_overhead_ms_per_batch -> max: 1.18 x median
+#       3. Also floor `batches_per_sec__raw_obs_highcard` at 0.85x its median,
+#          but read that median from a WARM capture — a cold one is measuring
+#          the shard reads.
+#
+# 17. grouped_sort / `convert_sort_by` (sort-on-convert)
+#     `pyscx.from_h5ad(sort_by=…)` had no benchmark anywhere in the suite;
+#     PR-02c adds the arm on every GROUP_SPEC dataset, using the grouping
+#     column as the sort key so it is comparable with convert_one/convert_two.
+#     OPT-CONVERT-8 and OPT-OPS-5 are the targets.
+#
+#     REACHABILITY CAVEAT, stated rather than left implicit: the interesting
+#     datasets (replogle_k562, tahoe_c38, chemogenetic_rgfp) are in NO
+#     `capture_baseline.TIERS` list, so any floor authored here is evaluated
+#     only when a capture names them explicitly
+#     (`--datasets replogle_k562 tahoe_c38`). That is the same condition the
+#     three existing `grouped_peak_rss_mb` ceilings already live under, and it
+#     is item 12's gap. `pert_synth_10k` / `nb_glm_synth` are synthetic and
+#     self-materializing, and are also off-tier.
+#
+#     ACTIVATION: author `peak_rss_mb__convert_sort_by` (max, 1.18x median) and
+#     `wall_s__convert_sort_by` (max, 1.25x median) on replogle_k562 and
+#     tahoe_c38 from a capture that names them. Do NOT add
+#     `grouped_peak_rss_mb` to this arm to reuse the existing ceilings: that
+#     key is flat, not per-scenario, and the gate medians it across every run
+#     carrying it — a fourth arm would silently move what the three ceilings
+#     are measured against.
+#
+# 18. fragment_ops / in-place op walls (`wall_s__<operation>`) — OPT-FORMAT-1
+#     PR-02c adds a sparse `wall_s__<op>` to all five arms plus a new
+#     `obs_import` arm. Until then the module *timed* four in-place mutations
+#     but none of those timings was gateable: `wall_s` is a reserved `add_run`
+#     parameter and never reaches `runs[].extra`, so only the pooled
+#     `median_wall_s` was visible — and that is dominated by `rollback`, the
+#     cheapest arm.
+#
+#     `wall_s__rollback` is the sharpest OPT-FORMAT-1 instrument in the suite.
+#     `rollback` -> `apply_catalog_at` -> `finalize_header_with_checksum`
+#     streams offset 256 -> EOF, so a rollback is one 4 KB pwrite, two fsyncs
+#     and a whole-file BLAKE3 rehash: essentially all of its wall IS the
+#     checksum extent. `wall_s__obs_import` is next — one obs column added, the
+#     whole file rehashed. Redefining the extent to header + catalogs should
+#     collapse both and leave `wall_s__compact` (a real rewrite) where it is.
+#
+#     Measured on pbmc3k (4.5 MB file, so the rehash is negligible — this is a
+#     mechanism check, not a signal):
+#         wall_s__append 0.017  wall_s__delete 0.0067  wall_s__compact 2.53
+#         wall_s__compact_full 3.13  wall_s__obs_import 0.024
+#         wall_s__rollback 0.0047
+#
+#     ACTIVATION: floor on census_1m, where the rehash is ~2.8 GB and dominates.
+#     Author `wall_s__rollback` and `wall_s__obs_import` at 1.25x their
+#     recaptured medians. Expect BOTH to drop by roughly the read-bandwidth
+#     term when OPT-FORMAT-1 lands — that is the point, so re-baseline in the
+#     same change rather than treating the improvement as a failure.
+#
+# 19. cloud_metadata / `scx info <cloud-url>` — OPT-CLOUD-1
+#     A subprocess arm, added in PR-02c: `scx info --json <gs://…>`. Not a
+#     duplicate of the in-process `read_cloud_metadata` arm — `scx info` fills
+#     two columns the library open does not (the per-shard codec breakdown and
+#     the value-encoding summary) by range-reading every CSR shard's 76-byte
+#     header at `METADATA_SHARD_FETCH_CONCURRENCY = 8`. That constant is what
+#     OPT-CLOUD-1 raises, and only this arm moves when it does (~175 s -> ~22 s
+#     expected on the largest fixture).
+#
+#     ACTIVATION, and the ORDER matters:
+#       1. `scx_info_cloud_ok` -> min: 1.0 can be authored FIRST and needs no
+#          recapture: it is a 0/1 emitted on every run of the arm, and a 0
+#          means the CLI exited non-zero or printed an `n_obs` that disagreed
+#          with the dataset. It is deliberately NOT authored in PR-02c only
+#          because the arm skips (recording a reason, emitting nothing) on a
+#          build without `--features cloud`, which would read as a
+#          missing-metric violation on any host that has not built one.
+#          Author it once the capture flow builds a cloud CLI.
+#       2. `wall_s__scx_info_cloud` -> max: 1.25x the recaptured median, and
+#          read that median from a capture on the SAME fixture: the metric is
+#          proportional to shard count, so it is not comparable across
+#          datasets.

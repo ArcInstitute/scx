@@ -12,12 +12,25 @@ and touches only schema-level properties; array reads are excluded so the
 benchmark measures first-GET / catalog-parse latency, not bandwidth.
 Returns ``None`` for formats whose runner does not provide the helper
 (silent skip).
+
+A second, SCX-only arm times the **CLI**: ``scx info --json <url>`` as a
+subprocess (``scenario="scx_info_cloud"``). It is not a duplicate of the
+in-process arm. ``scx info`` fills two columns the library open does not — the
+per-shard codec breakdown and the value-encoding summary — by range-reading
+every CSR shard's 76-byte header at ``METADATA_SHARD_FETCH_CONCURRENCY = 8``,
+which is the concurrency OPT-CLOUD-1 raises. So the two arms differ by
+thousands of GETs on an atlas-scale fixture, and only this one moves when that
+lands. Requires a ``--features cloud`` build; skips with a recorded reason
+otherwise. See ``_run_cli_info_arm``.
 """
 
 from __future__ import annotations
 
 import gc
+import json
 import logging
+import subprocess
+import time
 from pathlib import Path
 
 from benchmarks.comprehensive.cloud_fixtures import (
@@ -31,6 +44,7 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.scx_cli import CLOUD_PROBE, resolve_scx_bin
 from benchmarks.comprehensive.runners import make_runner
 
 logger = logging.getLogger(__name__)
@@ -40,6 +54,11 @@ REQUIRED_CAPABILITIES: frozenset[str] = frozenset({"cloud_metadata"})
 builder so incompatible (bench, format) cells never get submitted. Mirrors
 the runtime guard at the top of ``run()`` (defense-in-depth for direct
 invocation)."""
+
+# A cloud `scx info` range-reads one header per CSR shard at concurrency 8;
+# on the largest fixture that is ~16k GETs and measured ~175 s pre-OPT-CLOUD-1.
+# The cap is a runaway guard, not a budget.
+_CLI_INFO_TIMEOUT_S = 900
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset({"scx_auto"})
 """Format-key allow-list — the only SCX layout with a cloud fixture suffix
@@ -128,6 +147,8 @@ def run(
         )
         logger.info("  wall=%.6fs", timing.wall_s)
 
+    _run_cli_info_arm(result, dataset, cloud_url, n_runs)
+
     logger.info(
         "cloud_metadata complete: %s / %s — median %.6fs",
         format_variant.key,
@@ -135,3 +156,89 @@ def run(
         result.median_wall_s or 0.0,
     )
     return result
+
+
+def _run_cli_info_arm(
+    result: BenchmarkResult,
+    dataset: DatasetConfig,
+    cloud_url: str,
+    n_runs: int,
+) -> None:
+    """Time `scx info <cloud-url>` as a subprocess.
+
+    The in-process arm above measures `pyscx.open_cloud` + touching schema
+    properties. `scx info` is a *different* code path with a different cost —
+    it fills two columns (the per-shard codec breakdown and the value-encoding
+    summary) by range-reading **every** CSR shard's 76-byte header, at
+    `METADATA_SHARD_FETCH_CONCURRENCY = 8`. That is what OPT-CLOUD-1 changes,
+    and nothing measured it, so a 175 s → ~22 s improvement had nowhere to
+    land.
+
+    Skips with a recorded reason, never raises. Two independent reasons it can
+    be unavailable and they need telling apart:
+
+    * **no cloud-capable binary.** `scx info` accepts a URL on any build, but
+      its cloud branch is `#[cfg(feature = "cloud")]` and `cloud` is not in
+      `scx-cli`'s default features, so a stock build fails the URL at run time
+      with "requires scx-cli built with --features cloud". The probe therefore
+      tests a clap-gated cloud subcommand (`pull --help`), not `info --help`,
+      which exits 0 either way.
+    * **credentials.** Already handled upstream: `run()` returns before
+      resolving the fixture when `ensure_gcp_credentials_or_skip` fails, so
+      this arm is never reached without them.
+
+    Success is asserted on the *content*, not the exit code alone: a `--json`
+    `n_obs` matching the dataset's own `n_obs`. An exit-0 that printed nothing
+    useful would otherwise be recorded as a fast open.
+    """
+    scx_bin = resolve_scx_bin(CLOUD_PROBE)
+    if scx_bin is None:
+        reason = (
+            "no `scx` binary with cloud support: probed $SCX_CLI_BIN, "
+            "target/release/scx and PATH for a build whose clap-gated `pull` "
+            "subcommand exists. Build one with "
+            "`cargo build -p scx-cli --release --features cloud`."
+        )
+        logger.warning("  scx-info-cloud arm skipped: %s", reason)
+        result.metadata["cli_info_skipped_reason"] = reason
+        return
+
+    result.metadata["cli_info_bin"] = scx_bin
+    for i in range(n_runs):
+        gc.collect()
+        t0 = time.perf_counter()
+        proc = subprocess.run(
+            [scx_bin, "info", "--json", cloud_url],
+            capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
+        )
+        wall = time.perf_counter() - t0
+
+        ok = 0
+        n_obs_seen = -1
+        if proc.returncode == 0:
+            try:
+                n_obs_seen = int(json.loads(proc.stdout).get("n_obs", -1))
+            except Exception:  # noqa: BLE001
+                n_obs_seen = -1
+            ok = 1 if n_obs_seen == dataset.n_obs else 0
+        if not ok:
+            # Recorded rather than raised — one arm must not fail the cohort —
+            # but recorded *loudly*: a 0 here means the wall below timed a
+            # failure, and any threshold on `scx_info_cloud_ok` fails on it.
+            logger.error(
+                "  scx info %s failed (rc=%d, n_obs=%s, want %d): %s",
+                cloud_url, proc.returncode, n_obs_seen, dataset.n_obs,
+                (proc.stderr or "").strip()[:400],
+            )
+        result.add_run(
+            wall_s=wall,
+            scenario="scx_info_cloud",
+            **{
+                "wall_s__scx_info_cloud": round(wall, 6),
+                "scx_info_cloud_ok": ok,
+                "scx_info_n_obs": n_obs_seen,
+            },
+        )
+        logger.info(
+            "  scx info (cloud) run %d/%d: wall=%.3fs ok=%d", i + 1, n_runs, wall, ok,
+        )

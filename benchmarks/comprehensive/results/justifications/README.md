@@ -34,6 +34,51 @@ because rolling back gcsfs would block the zarr 3.1.6 upgrade.
 triples are no longer suppressed — the gate will fail again until the
 justification is updated or removed.
 
+## Metric scope — read this before justifying a pooled median
+
+By default a justification suppresses **every metric** on each triple it names:
+relative regressions *and* `thresholds.yaml` absolute floors. That is the right
+default when the triple is wholly known-bad (a suite that OOMs, a dispatch path
+that collapses both a throughput floor and a timing row).
+
+It is the wrong default for the commonest case in practice. `summary.json`
+carries one `peak_rss_mb_median` and one `median_wall_s` per triple, pooled
+across **every** run in the file — so adding an arm to an existing benchmark
+shifts both by construction and needs a justification. Left unscoped, that
+justification also switches off every absolute floor on the triple. Two
+committed files were in exactly that state and disarmed 16 floors between them,
+one of which was added in the same commit as its own justification.
+
+So name what the file explains:
+
+```markdown
+---
+metrics: [peak_rss_mb_median, median_wall_s]
+triples:
+  - benchmark: cellset_gather
+    format: scx_auto
+    dataset: census_1m
+  - benchmark: index_plan
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: batches_per_sec__pyscx_index_plan_dataset_workers2
+---
+```
+
+- A file-level `metrics:` list applies to every triple in the file.
+- A per-entry `metric:` (singular, one name) narrows that triple alone and
+  **adds to** the file-level list rather than replacing it.
+- Omitting both keeps the whole-triple default.
+- Where two active files name the same triple, the scopes union and an unscoped
+  file wins — a merge can only ever suppress more than either file asked for.
+
+**The rule:** *a justification for a pooled summary metric must name it, or it
+silently disarms every floor on the triple.* Enforced by
+`tests/test_floor_reachability.py::test_no_floor_is_fully_suppressed_by_an_active_justification`,
+which fails on any floor sitting under an unscoped suppression; genuinely
+whole-triple cases go in that test's `_DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS`
+with the reason written down.
+
 Each justification must list at least one triple. Malformed
 front-matter fails loud (logged + skipped, gate proceeds without
 suppression).
@@ -48,6 +93,12 @@ suppression).
 4. Review expiry dates periodically — a stale suppression should
    either be renewed (new file, new expiry) or retired (delete the
    file, accept the gate will fail).
+5. Before committing, check what *floors* the triples carry:
+
+   ```bash
+   .venv/bin/python -m pytest \
+       benchmarks/comprehensive/tests/test_floor_reachability.py -k suppressed
+   ```
 
 Documented end-to-end in `benchmarks/README.md` under "Regression
 Gating".

@@ -64,7 +64,6 @@ import contextlib
 import gc
 import logging
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -75,13 +74,13 @@ from typing import Any
 import numpy as np
 
 from benchmarks.comprehensive.config import (
-    PROJECT_ROOT,
     DatasetConfig,
     FormatVariant,
     N_WARMUP_RUNS,
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
 from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
+from benchmarks.comprehensive.scx_cli import OPTIMIZE_PROBE, resolve_scx_bin
 from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
 
 logger = logging.getLogger(__name__)
@@ -240,34 +239,17 @@ def _has_cupy() -> bool:
 def _resolve_scx_optimize_bin() -> str | None:
     """Resolve an `scx` binary whose `optimize` supports `--codec scx1`.
 
-    Probes, in order: `$SCX_CLI_BIN`, the repo `target/release/scx`, then a
-    PATH `scx`. Returns the first whose `optimize --help` exits cleanly *and*
-    advertises `--codec` (older binaries lack the subcommand or the flag and
-    are skipped so the self-convert fallback kicks in), else `None`.
-    """
-    candidates = []
-    env_bin = os.environ.get("SCX_CLI_BIN")
-    if env_bin:
-        candidates.append(env_bin)
-    candidates.append(str(PROJECT_ROOT / "target" / "release" / "scx"))
-    which = shutil.which("scx")
-    if which:
-        candidates.append(which)
+    Returns the first candidate whose `optimize --help` exits cleanly *and*
+    advertises `--codec` — older binaries lack the subcommand or the flag and
+    are skipped so the self-convert fallback kicks in — else `None`.
 
-    for cand in candidates:
-        if not cand or not Path(cand).exists():
-            continue
-        try:
-            proc = subprocess.run(
-                [cand, "optimize", "--help"],
-                capture_output=True,
-                timeout=30,
-            )
-        except Exception:
-            continue
-        if proc.returncode == 0 and b"--codec" in proc.stdout:
-            return cand
-    return None
+    The `$SCX_CLI_BIN` -> `target/release/scx` -> PATH walk lives in
+    `benchmarks.comprehensive.scx_cli`; the `--codec` requirement is what makes
+    this probe specific to this arm.
+    """
+    # The candidate walk is shared (`benchmarks.comprehensive.scx_cli`); the
+    # `--codec` requirement is what makes this probe specific to this arm.
+    return resolve_scx_bin(OPTIMIZE_PROBE, requires=b"--codec")
 
 
 def _prepare_sidecar_scx(

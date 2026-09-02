@@ -57,8 +57,6 @@ import gc
 import json
 import logging
 import math
-import os
-import shutil
 import statistics
 import subprocess
 import tempfile
@@ -73,8 +71,10 @@ from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
 )
+from benchmarks.comprehensive.scx_cli import INFO_JSON_PROBE, resolve_scx_bin
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.rss import PeakRssSampler, current_rss_mb
+from benchmarks.comprehensive.scx_cli import INFO_JSON_PROBE, resolve_scx_bin
 
 logger = logging.getLogger(__name__)
 
@@ -126,27 +126,17 @@ _SGS8_TRIALS = 200
 def _resolve_scx_bin() -> str | None:
     """An `scx` binary whose `info --json` works, or `None`.
 
-    Probes `$SCX_CLI_BIN`, the repo `target/release/scx`, then PATH — the same
-    order `accel_to_gpu_anndata._resolve_scx_optimize_bin` uses. Only the
-    *X-section* size metric needs it; whole-file sizes come from `stat()`, so an
-    absent CLI narrows this arm rather than skipping it.
+    Only the *X-section* size metric needs it; whole-file sizes come from
+    `stat()`, so an absent CLI narrows this arm rather than skipping it.
+
+    The `$SCX_CLI_BIN` -> `target/release/scx` -> PATH walk lives in
+    `benchmarks.comprehensive.scx_cli`, shared with
+    `accel_to_gpu_anndata` (which needs `optimize --codec`) and
+    `cloud_metadata` (which needs a `--features cloud` build). This wrapper
+    stays because the *probe* is what differs between the three, and naming it
+    here is what keeps that visible at the call site.
     """
-    candidates = [os.environ.get("SCX_CLI_BIN"), str(PROJECT_ROOT / "target" / "release" / "scx")]
-    which = shutil.which("scx")
-    if which:
-        candidates.append(which)
-    for cand in candidates:
-        if not cand or not Path(cand).exists():
-            continue
-        try:
-            proc = subprocess.run(
-                [cand, "info", "--json", "--help"], capture_output=True, timeout=30
-            )
-        except Exception:
-            continue
-        if proc.returncode == 0:
-            return cand
-    return None
+    return resolve_scx_bin(INFO_JSON_PROBE)
 
 
 def _geometry(scx_bin: str | None, path: Path) -> dict[str, int | str | None]:

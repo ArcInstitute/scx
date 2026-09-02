@@ -109,3 +109,140 @@ def test_falls_back_to_default_key_when_env_unset(
     )
 
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# The `scx info <cloud-url>` CLI arm
+# ---------------------------------------------------------------------------
+
+
+def _fake_scx(tmp_path, stdout: str, rc: int = 0, cloud: bool = True):
+    """A stand-in `scx` that answers the cloud probe and prints *stdout*.
+
+    Two subcommands, because the arm asks the binary two different questions:
+    `pull --help` is the cloud-feature probe (a clap-gated cloud subcommand —
+    `info --help` exits 0 on a build with no cloud support at all, so probing
+    `info` would resolve a binary that then fails on the URL), and
+    `info --json <url>` is the measurement. ``cloud=False`` fails the probe,
+    standing in for a stock build.
+    """
+    import stat
+
+    path = tmp_path / "scx"
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        + ('if [ "$1" = "pull" ]; then echo "Download from cloud"; exit 0; fi\n'
+           if cloud else "")
+        + 'if [ "$1" = "info" ]; then cat <<\'JSON\'\n'
+        + f"{stdout}\n"
+        + "JSON\n"
+        + f"exit {rc}; fi\n"
+        + "exit 64\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def _pin_candidates(monkeypatch, *paths):
+    """Make the shared resolver see exactly *paths*.
+
+    Patching `candidates` rather than `$SCX_CLI_BIN` is deliberate. The env
+    var is a *preference*, not a pin: a candidate that fails the probe falls
+    through to `target/release/scx` and then to PATH, which is the right
+    behaviour and which made a first version of the skip test below resolve
+    the real cloud-capable binary and issue a live GET against a bucket that
+    does not exist. A test must not be able to reach the network by
+    misconfiguration.
+    """
+    from benchmarks.comprehensive import scx_cli
+
+    monkeypatch.setattr(scx_cli, "candidates", lambda: [str(p) for p in paths])
+
+
+def _cli_arm(monkeypatch, tmp_path, stdout: str, rc: int = 0):
+    """Drive `_run_cli_info_arm` against the fake binary; return the result."""
+    from benchmarks.comprehensive.benchmarks import cloud_metadata
+    from benchmarks.comprehensive.config import DATASETS
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    _pin_candidates(monkeypatch, _fake_scx(tmp_path, stdout, rc))
+    dataset = DATASETS["pbmc3k"]
+    assert dataset.n_obs == 2700, "premise: pbmc3k is 2700 cells"
+    result = BenchmarkResult(
+        benchmark="cloud_metadata", format="scx_auto", dataset=dataset.name,
+    )
+    cloud_metadata._run_cli_info_arm(
+        result, dataset, "gs://example/pbmc3k.scxd/", n_runs=1,
+    )
+    return result
+
+
+def test_cli_info_arm_records_ok_on_a_matching_n_obs(monkeypatch, tmp_path):
+    """The happy path: exit 0 and the right `n_obs` -> `scx_info_cloud_ok=1`."""
+    result = _cli_arm(monkeypatch, tmp_path, '{"n_obs": 2700, "n_vars": 32738}')
+    assert len(result.runs) == 1
+    extra = result.runs[0].extra
+    assert extra["scx_info_cloud_ok"] == 1
+    assert extra["scx_info_n_obs"] == 2700
+    assert extra["wall_s__scx_info_cloud"] > 0
+    assert extra["scenario"] == "scx_info_cloud"
+
+
+def test_cli_info_arm_refuses_an_exit_zero_that_answered_the_wrong_file(
+    monkeypatch, tmp_path,
+):
+    """Exit 0 is not enough — the JSON has to describe the right dataset.
+
+    A CLI that exits 0 having printed something useless (a truncated read, a
+    stale cached catalog, the wrong URL resolved) would otherwise be recorded
+    as a very fast open. The wall in that case is real but measures a failure,
+    which is worse than a missing number because it looks like an improvement.
+    """
+    result = _cli_arm(monkeypatch, tmp_path, '{"n_obs": 1, "n_vars": 1}')
+    extra = result.runs[0].extra
+    assert extra["scx_info_cloud_ok"] == 0, (
+        "an n_obs that disagrees with the dataset must not count as success"
+    )
+    assert extra["scx_info_n_obs"] == 1, "the observed value is recorded, not hidden"
+    # Still recorded, so a `scx_info_cloud_ok >= 1` floor fails on it rather
+    # than the triple going quiet.
+    assert extra["wall_s__scx_info_cloud"] > 0
+
+
+def test_cli_info_arm_refuses_unparseable_output(monkeypatch, tmp_path):
+    """Garbage on stdout is a failure, not a crash."""
+    result = _cli_arm(monkeypatch, tmp_path, "not json at all")
+    extra = result.runs[0].extra
+    assert extra["scx_info_cloud_ok"] == 0
+    assert extra["scx_info_n_obs"] == -1
+
+
+def test_cli_info_arm_skips_with_a_reason_when_no_cloud_build_exists(
+    monkeypatch, tmp_path,
+):
+    """No cloud-capable binary -> a recorded reason and zero runs.
+
+    Zero runs is the loud outcome for a threshold (missing metric), but only
+    if the reason is findable, so it goes into `metadata` rather than a log
+    line alone.
+    """
+    from benchmarks.comprehensive.benchmarks import cloud_metadata
+    from benchmarks.comprehensive.config import DATASETS
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    # A binary with no cloud support: `pull` is not compiled in, so the probe
+    # rejects it — and `info --help` would have accepted it, which is why the
+    # probe is `pull`. It is the *only* candidate, because the resolver
+    # correctly falls through to the next one otherwise.
+    _pin_candidates(
+        monkeypatch, _fake_scx(tmp_path, "{}", rc=0, cloud=False),
+    )
+
+    result = BenchmarkResult(
+        benchmark="cloud_metadata", format="scx_auto", dataset="pbmc3k",
+    )
+    cloud_metadata._run_cli_info_arm(
+        result, DATASETS["pbmc3k"], "gs://example/pbmc3k.scxd/", n_runs=2,
+    )
+    assert not result.runs, "a skipped arm must record no runs"
+    assert "--features cloud" in result.metadata["cli_info_skipped_reason"]

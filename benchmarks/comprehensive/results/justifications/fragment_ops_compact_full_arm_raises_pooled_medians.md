@@ -1,12 +1,28 @@
 ---
+# Scoped, not whole-triple. Unscoped, this file suppressed the
+# `peak_rss_mb__compact_full` ceiling that landed in the SAME commit — see
+# "What this file must not suppress".
+metrics: [peak_rss_mb_median, median_wall_s]
 triples:
   - benchmark: fragment_ops
     format: scx_auto
     dataset: pbmc3k
   - benchmark: fragment_ops
     format: scx_auto
+    dataset: pbmc10k
+  - benchmark: fragment_ops
+    format: scx_auto
+    dataset: smartseq2
+  - benchmark: fragment_ops
+    format: scx_auto
     dataset: tabula_sapiens_100k
-reason: "Two intended changes both raise the pooled medians, which are taken across every run of the triple: _time_op now reports a true in-region PeakRssSampler peak instead of a post-op instantaneous reading, and a fifth arm (compact_full) rewrites a fixture ~2.7x the plain one. Neither is a regression."
+  - benchmark: fragment_ops
+    format: scx_auto
+    dataset: census_500k
+  - benchmark: fragment_ops
+    format: scx_auto
+    dataset: census_1m
+reason: "Three intended changes all raise the pooled medians, which are taken across every run of the triple: _time_op now reports a true in-region PeakRssSampler peak instead of a post-op instantaneous reading, a compact_full arm rewrites a fixture ~2.7x the plain one, and an obs_import arm adds a key-joined in-place column add. None is a regression."
 ---
 
 # `fragment_ops` pooled medians rose when the `compact_full` arm landed
@@ -69,21 +85,60 @@ gated on its own key, `peak_rss_mb__compact_full`, which is sparse — only
 This is the same shape as `cellset_gather_s512_raises_pooled_rss.md`, for the
 same reason.
 
+## The `obs_import` arm (added in PR-02c, same file)
+
+A sixth arm, `obs_import`, times `pyscx.obs_import` — a key-joined in-place add
+of one obs column from a CSV. It runs on **every** `fragment_ops` dataset, not
+just the ones with a `_full.scx`, which is why this file's triple list now
+covers all six datasets `LATEST` carries `fragment_ops` rows for.
+
+It also moves the pooled `median_wall_s` in the *other* direction on small
+fixtures: `obs_import` is cheap (24 ms at pbmc3k), so it pulls the pooled
+median down while `compact_full` pushes it up. Neither movement says anything
+about either op.
+
+The same change gave every arm a sparse `wall_s__<operation>` key, which is the
+gateable half — `wall_s` is a reserved `add_run` parameter and never reaches
+`runs[].extra`, so before it the only visible timing was the pooled median this
+file suppresses. `wall_s__rollback` and `wall_s__obs_import` are the two
+cleanest OPT-FORMAT-1 instruments in the suite (`thresholds.yaml` Deferred
+floors, item 18); both are sparse, so a threshold on either medians that arm
+alone and is unaffected by this suppression.
+
 ## Scope
 
-`pbmc3k` and `tabula_sapiens_100k` are listed because those are the datasets
-whose `_full.scx` has been built. pbmc3k is there so the small tier — and any
-local smoke run — exercises the arm in seconds rather than only at 100k;
-tabula_sapiens_100k is where `streaming_full_peak_rss_mb` is actually floored.
+All six datasets `results/baselines/LATEST` carries `fragment_ops` rows for.
+The `compact_full` arm reaches only those with a built `_full.scx` — pbmc3k and
+tabula_sapiens_100k today, census_1m deferred to the PR-03 capture prep
+(`thresholds.yaml` Deferred item 13) — but the `obs_import` arm and the sampler
+change reach all of them, so all of them will compare.
 
-`census_1m` is deferred to the PR-03 capture prep (11 GB source, high-mem
-allocation — see `thresholds.yaml`'s Deferred floors, item 13); **add its triple
-here in the same change that builds the fixture**, or the census row will read
-as a regression the first time the arm runs there.
+## What this file must not suppress
 
-Note that `fragment_ops` carries no absolute floors, so suppressing the triple
-costs only the relative diff. If a floor is ever added to this benchmark, revisit
-— justification suppression is whole-triple and covers every metric on it.
+The paragraph that stood here was wrong on its own commit. It read: "`fragment_ops`
+carries no absolute floors, so suppressing the triple costs only the relative
+diff. If a floor is ever added to this benchmark, revisit." A floor **was** added
+to this benchmark, in the same change that added this file —
+
+```yaml
+  - benchmark: fragment_ops
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: peak_rss_mb__compact_full
+    max: 4096.0
+```
+
+— and it sits on a triple this file names. Suppression was whole-triple over
+every metric, so the ceiling could never fire: `compact_full` could have grown
+without bound and the gate would have reported "Absolute-floor violations: 0
+(1 justification-suppressed)". The hazard was even written down here; what was
+missed is that the condition was already true.
+
+The `metrics:` key in the front-matter is the fix — this file now suppresses only
+the two pooled summary metrics it actually explains, and
+`peak_rss_mb__compact_full` is gated again. A guard test,
+`test_no_floor_is_fully_suppressed_by_an_active_justification`, now fails on any
+floor sitting under an unscoped suppression, so this cannot recur silently.
 
 ## When to remove this file
 

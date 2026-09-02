@@ -1159,6 +1159,15 @@ def estimate_memory_gb(
         # `.raw` + obsm + a layer) rides inside this envelope: it is another
         # rewrite of a file ~2.7x the plain one, and `dense_mb * 0.5` is already
         # 11.7 GB at tabula_sapiens_100k against a measured single-GB peak.
+        #
+        # The `obs_import` arm's two additions are both small and both
+        # absolute, not scaled by the matrix: one obs index materialised as
+        # Python strings for the CSV (`read_obs([])`, 1M rows at census_1m,
+        # measured 5.0 s and a few hundred MB), and the pandas frame written
+        # out beside it. `attach_external_obs` itself never reads X, layers,
+        # `var`, the CSC sidecar or `.raw` — it appends obs shards and rehashes
+        # the file, so its own peak is a shard, not a matrix. Disk, not memory,
+        # is what this arm consumes most of (one more full-file copy per run).
         peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark in ("cloud_push", "cloud_pull"):
         # SCX-only. pyscx.push/pull stream section-by-section with a small
@@ -1178,6 +1187,9 @@ def estimate_memory_gb(
             peak_mb = max(base_mb, dense_mb * 1.0)
     elif benchmark == "cloud_metadata":
         # Catalog-only open — single GET + a few small parses. Trivial.
+        # The `scx_info_cloud` arm is a *subprocess*, so its footprint is the
+        # CLI's own (a catalog plus per-shard headers, tens of MB) and is not
+        # additive with this process's peak in any way the sampler here sees.
         peak_mb = max(base_mb * 0.25, 2 * 1024)  # 2 GB floor for Python baseline
     elif benchmark == "cloud_filtered":
         # Cross-format predicate pushdown — matching cells subset is loaded
@@ -1201,6 +1213,11 @@ def estimate_memory_gb(
         # materialize the entire matrix before iterating. The GPU training
         # scenario adds the model + activations on-device — host RAM stays
         # bounded by the streaming side.
+        # The `raw_obs_highcard` arm additionally holds one categorical obs
+        # column's global dictionary — ~958k Rust `String`s built once at
+        # construction, plus a fresh `PyUnicode` list of the same length per
+        # batch. At ~30 B/entry that is ~30 MB resident and ~30 MB churned per
+        # batch: real, but two orders below the CSR terms below.
         if is_dense_path:
             peak_mb = max(base_mb * 2, dense_mb * 1.3)
         else:
@@ -1216,6 +1233,14 @@ def estimate_memory_gb(
         # SCX-only S=64 gather: the shared shard cache holds a bounded working
         # set + a few decoded batches. Bounded by the sparse footprint, not the
         # dense matrix. Also subject to the OOC cap below.
+        #
+        # The `collate_rust` arm holds ten gathered batches resident at once
+        # (it times the kernel alone, so the gather has to finish first) plus
+        # one batch's stacked output at k_enc=2048 / k_dec=1024. At S=64 that
+        # is ~10k cells: ~160 MB of CSR at tabula's ~1950 nnz/cell, and ~130 MB
+        # of f32/i64 output tensors. Both are absolute, not a fraction of the
+        # file, so they sit inside the existing envelope on every real dataset
+        # and only matter on a tiny one — where `base_mb` already dominates.
         peak_mb = max(base_mb, dense_mb * 0.3)
     elif benchmark == "obs_open":
         # Matrix-free obs open (SCX read_obs) or eager-obs h5ad backed. Peak is
@@ -1442,12 +1467,19 @@ def estimate_time_minutes(
         # picks up the 2× format multiplier at 500K+ cells below.
         "parallel_write_scaling": 40,
         "memory":                 15,
-        "fragment_ops":           15,
+        # +10 for the `obs_import` arm: it materialises the obs index as
+        # Python strings once (`read_obs([])`, measured 5.0 s at census_1m),
+        # writes a 1M-row CSV, and then per run copies the whole file, runs an
+        # untimed `dry_run` join and an import that rehashes the file.
+        "fragment_ops":           25,
         # Grouped sharding runs sort + a forced one-pass + two-pass convert.
         # The dense one-pass grouped gather (random full-width row reads) is the
         # slow scenario — minutes on a real Perturb-seq file even at the
         # in-module _MAX_CONVERT_RUNS=2 cap — so the base is generous.
-        "grouped_sort":           40,
+        # 40 -> 60 for the `convert_sort_by` arm: a fourth convert scenario at
+        # the same 2-run cap, i.e. two more whole-file conversions of a
+        # multi-GB Perturb-seq h5ad.
+        "grouped_sort":           60,
         # Cross-format grouped read/write head-to-head (scx_auto + shardad).
         # Times a grouped write per format plus per-perturbation read_group
         # over a handful of labels; the shardad arm materializes full groups,
@@ -1456,7 +1488,11 @@ def estimate_time_minutes(
         "cloud_push":             20,
         "cloud_pull":             20,
         "cloud_read":             20,
-        "cloud_metadata":         5,
+        # 5 -> 25 for the `scx_info_cloud` subprocess arm. The in-process open
+        # is a single GET; `scx info` range-reads every CSR shard's header at
+        # concurrency 8, which was measured at ~175 s on the largest fixture
+        # pre-OPT-CLOUD-1, and the arm runs it n_runs times.
+        "cloud_metadata":         25,
         "cloud_filtered":         20,
         "cloud_reader_vs_pull":   25,
         "cost_model":             20,
@@ -1469,7 +1505,11 @@ def estimate_time_minutes(
         # past the old 65-min cap (base 60 + 12-min/M slope rounds to 65 for
         # ≤100k-cell sets), timing out the deferred auto_v2 + cellstream floors.
         # 120 base + 12-min/M slope + 1.5× density gives comfortable headroom.
-        "ml_loader":              120,
+        # 120 -> 165 for the two `raw_obs_*` cardinality arms on census_1m:
+        # 2 arms x (1 untimed warm + n_runs timed) epochs. Cheap warm, but a
+        # page-cache-cold census_1m epoch measured ~1.15 batches/s (~850 s),
+        # and the high-cardinality arm adds a measured ~109 ms/batch on top.
+        "ml_loader":              165,
         "correctness":            60,
         "roundtrip":              10,
         "cell_eval_parity_perf":  60,
@@ -1551,7 +1591,10 @@ def estimate_time_minutes(
         # scaled batch counts. `obs_open` is a fast open→read-one-column probe
         # (its manifest scenario scales with file count, not n_obs).
         "ooc_loader":             90,
-        "cellset_gather":         45,
+        # 45 -> 55 for the `collate_rust` arm: one untimed gather of ten
+        # batches (the kernel is timed alone, so they must be resident first)
+        # plus 1 + n_runs collate passes over them, ~1 s each.
+        "cellset_gather":         55,
         "obs_open":               20,
         # Data-load Phase 1D. Up to seven full file rewrites (two timed
         # `shuffle_write` reps + one per codec variant in the size sweep) plus

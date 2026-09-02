@@ -1,7 +1,7 @@
 """Grouped-sharding benchmark — ``scx sort --group-by`` / ``scx convert --group-by``.
 
 Measures the F1/F2 grouped-sort + Phase-7.4 convert-time grouping feature. For
-every grouping dataset (those present in :data:`GROUP_SPEC`) it times three
+every grouping dataset (those present in :data:`GROUP_SPEC`) it times four
 scenarios and runs a read-back correctness check:
 
   * ``sort_group``  — ``pyscx.sort(plain_scx, group_by=, reference=)``: re-shard an
@@ -10,6 +10,16 @@ scenarios and runs a read-back correctness check:
     grouping forced down the one-pass streaming gather.
   * ``convert_two`` — ``pyscx.from_h5ad(group_by=, group_pass="two")``: convert-time
     grouping forced down the two-pass (plain convert + sort) path.
+  * ``convert_sort_by`` — ``pyscx.from_h5ad(sort_by=[group_col])``: sort-on-convert.
+    The same permutation machinery as the grouping arms (``compute_sort_perm``
+    → ``SortKeyExtractor`` → ``stable_argsort``, then a ``PermutedCsrReader``
+    over X and a ``take`` over obs/obsm) without group-edge shard splitting or
+    the reference-first rule. Nothing in the suite called ``sort_by=`` before,
+    so OPT-CONVERT-8 and OPT-OPS-5 had no metric to register against. It
+    reuses ``GROUP_SPEC``'s column as the sort key precisely so it is
+    comparable with ``convert_one`` / ``convert_two`` on the same file — but
+    note both grouped fixtures carry ``obsm``, which the sort path permutes, so
+    the arms are not doing identical work.
 
 The ``convert_one`` vs ``convert_two`` pair is the density auto-routing story
 (CSR favours one-pass, dense favours two-pass). The read-back asserts
@@ -29,6 +39,13 @@ The three ``thresholds.yaml`` ceilings were keyed to the bare name and could
 therefore never resolve a value — and, because all three of their datasets sit
 outside every tier, the resulting missing-metric violation was never reached
 either. Two silences stacked into one that looked like coverage.
+
+``grouped_peak_rss_mb`` is **flat, not per-scenario**: every timed run in this
+module used to carry it, and the gate medians it across all of them. So an arm
+added to this module silently moves what those three ceilings are measured
+against. ``convert_sort_by`` therefore omits it and reports only its sparse
+``peak_rss_mb__convert_sort_by`` / ``wall_s__convert_sort_by`` keys; a future
+arm should do the same unless it genuinely belongs in the pooled ceiling.
 
 ``peak_rss_mb`` is a **true in-region peak**, sampled by ``PeakRssSampler`` on a
 background thread for the duration of each op. It was an end-of-op
@@ -202,7 +219,13 @@ def _run_sort_group(
             # that is not reserved — plus the house-style sparse per-scenario
             # key for diagnosis.
             grouped_peak_rss_mb=round(rss, 1),
-            **{"peak_rss_mb__sort_group": round(rss, 1)},
+            **{
+                "peak_rss_mb__sort_group": round(rss, 1),
+                # `wall_s=` above is reserved and never reaches `extra`, so
+                # without this the only gateable timing for this arm is the
+                # pooled `median_wall_s` across all four scenarios.
+                "wall_s__sort_group": round(wall, 6),
+            },
         )
         logger.info("  sort_group %d/%d: wall=%.3fs rss=%.1fMB", i + 1, n_runs, wall, rss)
         if last_out is not None:
@@ -228,35 +251,74 @@ def _run_sort_group(
 def _run_convert(
     result: BenchmarkResult,
     scenario: str,
-    group_pass: str,
+    group_pass: str | None,
     source_h5ad: Path,
     group_col: str,
     reference: str | None,
     workdir: Path,
     n_runs: int,
+    *,
+    reorder: str = "group_by",
 ) -> None:
-    """Time ``pyscx.from_h5ad(group_by=…, group_pass=…)`` convert-time grouping."""
+    """Time convert-time reordering: ``group_by=`` grouping or ``sort_by=`` sort.
+
+    ``reorder="group_by"`` (default) is the original arm:
+    ``pyscx.from_h5ad(group_by=…, group_pass=…)``, group-aligned CSR shards
+    with the reference group first.
+
+    ``reorder="sort_by"`` runs ``from_h5ad(sort_by=[group_col])`` instead —
+    the same permutation machinery (`compute_sort_perm` →
+    `SortKeyExtractor` → `stable_argsort`, then a `PermutedCsrReader` over X
+    and a `take` over obs/obsm) without the group-edge shard splitting or the
+    reference-first rule. `sort_by` is the target of OPT-CONVERT-8 and
+    OPT-OPS-5, and nothing in the suite called it. It must be a **list** (a
+    bare `str` is a pyo3 `TypeError`) and it forces the streaming route
+    regardless of `stream=`.
+
+    Metric note: this arm deliberately does **not** emit
+    ``grouped_peak_rss_mb``. That key is flat, not per-scenario — every timed
+    run in this module carries it — and it is what the three ceilings in
+    `thresholds.yaml` read, medianing across all of them. Emitting it here
+    would silently move an existing ceiling's basis, so the sort arm reports
+    only its sparse ``peak_rss_mb__convert_sort_by`` / ``wall_s__…`` keys.
+    """
     import pyscx
 
     ref_arg = [reference] if reference is not None else None
     for i in range(n_runs):
         out = workdir / f"{scenario}_{i}.scx"
-        _, wall, rss = _time_op(
-            pyscx.from_h5ad,
-            str(source_h5ad),
-            str(out),
-            group_by=group_col,
-            reference=ref_arg,
-            group_pass=group_pass,
-        )
+        if reorder == "sort_by":
+            _, wall, rss = _time_op(
+                pyscx.from_h5ad,
+                str(source_h5ad),
+                str(out),
+                sort_by=[group_col],
+            )
+        else:
+            _, wall, rss = _time_op(
+                pyscx.from_h5ad,
+                str(source_h5ad),
+                str(out),
+                group_by=group_col,
+                reference=ref_arg,
+                group_pass=group_pass,
+            )
+        extra: dict[str, object] = {
+            f"peak_rss_mb__{scenario}": round(rss, 1),
+            f"wall_s__{scenario}": round(wall, 6),
+        }
+        if reorder != "sort_by":
+            # See the docstring: `grouped_peak_rss_mb` is the floored key and
+            # is pooled across arms.
+            extra["grouped_peak_rss_mb"] = round(rss, 1)
         result.add_run(
             wall_s=wall,
             peak_rss_mb=rss,
             scenario=scenario,
             group_pass=group_pass,
+            reorder=reorder,
             output_size_bytes=out.stat().st_size,
-            grouped_peak_rss_mb=round(rss, 1),
-            **{f"peak_rss_mb__{scenario}": round(rss, 1)},
+            **extra,
         )
         logger.info("  %s %d/%d: wall=%.3fs rss=%.1fMB", scenario, i + 1, n_runs, wall, rss)
         out.unlink(missing_ok=True)
@@ -284,7 +346,9 @@ def run(
         metadata={
             "group_col": group_col,
             "reference_label": reference,
-            "scenarios": ["sort_group", "convert_one", "convert_two"],
+            "scenarios": [
+                "sort_group", "convert_one", "convert_two", "convert_sort_by",
+            ],
         },
     )
 
@@ -321,6 +385,17 @@ def run(
         logger.info("convert_two: %s", dataset.name)
         _run_convert(
             result, "convert_two", "two", source_h5ad, group_col, reference, workdir, convert_runs
+        )
+
+        # Sort-on-convert: the same permutation machinery without grouping.
+        # `from_h5ad(sort_by=…)` had no benchmark anywhere in the suite, so
+        # OPT-CONVERT-8 and OPT-OPS-5 had nothing to register against. Reuses
+        # GROUP_SPEC's column as the sort key so the arm is directly
+        # comparable with convert_one / convert_two on the same file.
+        logger.info("convert_sort_by: %s (sort_by=[%s])", dataset.name, group_col)
+        _run_convert(
+            result, "convert_sort_by", None, source_h5ad, group_col, reference,
+            workdir, convert_runs, reorder="sort_by",
         )
     finally:
         workroot.cleanup()

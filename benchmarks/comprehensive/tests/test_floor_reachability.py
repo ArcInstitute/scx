@@ -1289,3 +1289,387 @@ def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, m
     fmt = FormatVariant("SCX (auto)", "scx_auto", "primary", "scx_runner", {})
     with pytest.raises(ValueError, match=r"thread-scaling|THREAD_COUNTS"):
         m.run(dataset=big, format_variant=fmt, n_runs=1)
+
+
+# ---------------------------------------------------------------------------
+# The second way a floor becomes unreachable: a justification over it
+# ---------------------------------------------------------------------------
+
+#: `(benchmark, format, dataset)` triples where an unscoped, whole-triple
+#: suppression is the deliberate answer, with the reason. Everything else must
+#: either scope its justification with `metrics:` or drop the floor.
+#:
+#: Kept as data with a reason per entry rather than as a bare skip list: the
+#: point of the guard is that suppressing a floor is a decision someone made
+#: on purpose, so each one is written down.
+_DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS: dict[tuple[str, str, str], str] = {
+    ("accel_leiden", "accel_leiden__pyscx_gpu", "pbmc3k"): (
+        "cuGraph Leiden diverges from leidenalg on real graphs — documented in "
+        "CLAUDE.md's Known Limitations. Both the ARI floor and the timing row "
+        "are downstream of the same divergence, so the whole triple is the unit."
+    ),
+    ("accel_hvg", "accel_hvg__pyscx_cpu", "pbmc3k"): (
+        "hvg_overlap_vs_scanpy is a deterministic 0.9891 against a 0.99 floor on "
+        "the 2700-cell fixture — a borderline tie-break miss, and the only floor "
+        "on the triple, so scoping would change nothing."
+    ),
+    ("cloud_push", "scx_auto", "tabula_sapiens_100k"): (
+        "throughput_mbps to the shared GCS bucket is network- and "
+        "contention-dependent; the floor and the timing row move together with "
+        "cluster load."
+    ),
+}
+
+
+def _active_suppressions():
+    """The committed justifications, as the gate loads them."""
+    import sys
+
+    scripts = PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    import _justifications  # noqa: PLC0415
+
+    just_dir = (
+        PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "justifications"
+    )
+    suppression, parsed = _justifications.load_active_triples(just_dir)
+    return suppression, parsed, _justifications
+
+
+def test_no_floor_is_fully_suppressed_by_an_active_justification():
+    """A justification must not silently disarm a floor it says nothing about.
+
+    Suppression covers both gate surfaces — relative regressions and absolute
+    floors — on the same `(benchmark, format, dataset)`. That is right for a
+    triple that is wholly known-bad, and wrong for the commonest real case: a
+    *composition* change. `capture_baseline.archive_raw_results` writes one
+    `peak_rss_mb_median` and one `median_wall_s` per triple, pooled across
+    every run in the file, so adding an arm to an existing benchmark shifts
+    both by construction and needs a justification — which, unscoped, then
+    switches off every floor on that triple.
+
+    Both committed pooled-median justifications were in that state:
+
+      * `fragment_ops_compact_full_arm_raises_pooled_medians.md` suppressed the
+        `peak_rss_mb__compact_full max: 4096` ceiling **added in the same
+        commit**. The file's own closing note warned about the hazard without
+        noticing the condition was already true.
+      * `cellset_gather_s512_raises_pooled_rss.md` suppressed all 15
+        `cellset_gather` floors, which `thresholds.yaml`'s Deferred item 7
+        calls "NOW ACTIVE … all live".
+
+    16 floors, reading as coverage and providing none — the same shape as
+    `test_no_floor_keys_off_a_reserved_add_run_parameter` above, and just as
+    invisible: the gate prints "Absolute-floor violations: 0 (N
+    justification-suppressed)" and exits 0.
+
+    The fix is a `metrics:` (or per-entry `metric:`) scope naming what the file
+    actually explains, never deleting the floor.
+    """
+    suppression, parsed, justifications = _active_suppressions()
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+
+    by_file: dict[tuple[str, str, str], list[str]] = {}
+    for j in parsed:
+        if not j.is_active():
+            continue
+        for triple in j.triples:
+            by_file.setdefault(triple, []).append(j.path.name)
+
+    offenders: list[str] = []
+    for f in raw.get("absolute_floors") or []:
+        triple = (f["benchmark"], f["format"], f["dataset"])
+        if triple in _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS:
+            continue
+        # `metric=None` asks "is the whole triple suppressed?" — precisely the
+        # state this test rejects. A scoped justification answers False here
+        # even when it covers some other metric on the same triple.
+        if justifications.suppresses(suppression, triple, None) and (
+            suppression[triple] is None
+        ):
+            offenders.append(
+                f"{f['benchmark']}/{f['format']}/{f['dataset']}:{f['metric']} "
+                f"(suppressed by {', '.join(sorted(set(by_file.get(triple, ['?']))))})"
+            )
+
+    assert not offenders, (
+        f"these floors sit under a whole-triple justification and can never "
+        f"fire: {sorted(offenders)}. Add a `metrics:` list (or a per-entry "
+        f"`metric:`) to the justification naming only what it explains — a "
+        f"pooled-median justification should say "
+        f"`metrics: [peak_rss_mb_median, median_wall_s]`. If the whole triple "
+        f"really is known-bad, add it to "
+        f"_DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS with the reason."
+    )
+
+
+def test_deliberate_suppression_allowlist_has_no_stale_entries():
+    """The allowlist above is an exception list, so it must stay honest.
+
+    An entry that no longer corresponds to an active justification *and* a
+    floor is dead weight that would silently excuse a future regression on that
+    triple. Checked because the alternative — an allowlist nobody prunes — is
+    how the exception list becomes the policy.
+    """
+    suppression, _parsed, _justifications = _active_suppressions()
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+    floored = {
+        (f["benchmark"], f["format"], f["dataset"])
+        for f in (raw.get("absolute_floors") or [])
+    }
+
+    stale = [
+        f"{t} ({reason.split('.')[0][:60]}…)"
+        for t, reason in _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS.items()
+        if t not in floored or suppression.get(t, "absent") is not None
+    ]
+    assert not stale, (
+        f"these allowlist entries no longer describe a whole-triple "
+        f"suppression over a live floor: {stale}. Remove them — an exception "
+        f"nobody needs is an exception nobody rechecks."
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-02c: the five new arms, each with the premise that makes it mean something
+# ---------------------------------------------------------------------------
+
+
+def test_collate_arm_passes_a_non_empty_encoder_mask():
+    """An empty `enc_mask_positions` would measure the wrong branch.
+
+    `collate_cell` builds its withheld-gene `HashSet<i64>` — and pays a probe
+    per surviving top-K gene — **only** when `enc_mask_positions` is non-empty.
+    An empty array is the perturbation path and takes `None`, skipping the
+    allocation OPT-LOADER-4 removes. It is not a small difference: collating
+    the same batches with the mask replaced by an empty array measured
+    78.7 µs/cell against 120.1, so ~34% of the arm's subject would vanish.
+
+    The trap is that empty is exactly what the only pre-existing Python call
+    site (`pyscx/tests/test_fork_safety.py`) passes, so copying that template
+    produces a green arm over the wrong code.
+
+    Checked on the source: running the arm needs a real fixture, and the defect
+    is entirely in which array is handed to the kernel.
+    """
+    import ast
+
+    tree, path = _bench_ast("cellset_gather")
+    src = path.read_text()
+
+    assert "_COLLATE_MASK_FRACTION" in src, (
+        f"{path.name} no longer declares a mask fraction; the collate arm's "
+        f"premise is that the mask is non-empty"
+    )
+    fraction = next(
+        (
+            node.value.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                getattr(t, "id", None) == "_COLLATE_MASK_FRACTION"
+                for t in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+        ),
+        None,
+    )
+    assert isinstance(fraction, (int, float)) and 0.0 < fraction < 1.0, (
+        f"_COLLATE_MASK_FRACTION is {fraction!r}; it must withhold some but "
+        f"not all query positions. 0 leaves the withheld set empty (the "
+        f"HashSet is still built but never hits); 1 masks every gene and every "
+        f"cell takes the all-masked fallback instead of the compaction loop."
+    )
+
+    # The runtime half: the arm refuses to record a run whose mask withheld
+    # nothing, which catches an RNG or dtype change the constant cannot.
+    assert "masked_positions == 0" in src, (
+        f"{path.name} no longer asserts that the built mask withholds "
+        f"positions. The constant above is not sufficient: an all-zero uint8 "
+        f"array is non-empty, so the kernel takes the masking branch with an "
+        f"empty withheld set and the compaction loop has nothing to skip."
+    )
+
+    # `hide_readout` must stay all-zero: a set bit short-circuits the encoder
+    # path to a single GENE_MASK token, deleting the sort, mask and crop.
+    assert "np.zeros(n_rows, dtype=np.uint8)" in src, (
+        f"{path.name}'s collate inputs no longer build an all-zero "
+        f"hide_readout; a non-zero entry skips the whole encoder path"
+    )
+
+
+def test_ml_loader_highcard_arm_names_a_categorical_column():
+    """The obs-cardinality arm must not be pointed at an integer column.
+
+    OPT-LOADER-6's cost is `PyList::new(py, categories.iter())` — a fresh
+    `PyUnicode` per category per batch — in `obs_to_pydict`'s `Categorical`
+    arm. An `Int64` column takes the `PyArray1::from_vec` arm instead and pays
+    none of it. So the arm's value rests entirely on the column being a
+    high-cardinality *dictionary* column.
+
+    The review doc prescribed `obs_columns=["soma_joinid"]`, which on census_1m
+    is `int64` with a million distinct values: high cardinality, cheap branch,
+    and the arm would have measured nothing while looking exactly right.
+    `observation_joinid` is the categorical (957,955 categories, verified
+    against `census_1m_auto.scx`).
+    """
+    import ast
+
+    _tree, path = _bench_ast("ml_loader")
+    src = path.read_text()
+    spec_src = src[src.index("_OBS_CARDINALITY_SPEC"):]
+    spec_src = spec_src[: spec_src.index("\n\n\n")]
+
+    assert "soma_joinid" not in spec_src, (
+        "the obs-cardinality arm names `soma_joinid`, which is int64 on "
+        "census_1m and takes obs_to_pydict's numpy branch — no category list "
+        "is rebuilt, so the arm would measure nothing. Use a categorical "
+        "column (`observation_joinid`)."
+    )
+    assert "observation_joinid" in spec_src, (
+        "the high-cardinality arm no longer names a known categorical column"
+    )
+
+    # Both halves are needed: the ratio is the signal, and one absolute rate
+    # cannot separate "obs projection costs something" from "cardinality costs
+    # something".
+    for arm in ("raw_obs_lowcard", "raw_obs_highcard"):
+        assert arm in spec_src, f"the {arm} arm is gone; the pair is the signal"
+
+    # The declared cardinalities are recorded into runs[].extra so a capture is
+    # self-describing rather than requiring a reader to re-probe the fixture.
+    mod = ast.parse(src)
+    assert any(
+        isinstance(node, ast.keyword) and node.arg == "obs_n_categories"
+        for node in ast.walk(mod)
+    ), "the arm no longer records obs_n_categories into runs[].extra"
+
+
+def test_sort_by_arm_does_not_emit_the_pooled_grouped_peak_key():
+    """`grouped_peak_rss_mb` is flat, so a new arm must not join its median.
+
+    Three `thresholds.yaml` ceilings read `grouped_peak_rss_mb`
+    (chemogenetic_rgfp 32000, replogle_k562 16000, tahoe_c38 12000), and
+    `_load_current_raw_metric` takes the median across **every** run carrying
+    the key. The key is not per-scenario: every timed run in `grouped_sort`
+    emitted it. So an arm that also emits it silently changes what those three
+    ceilings are measured against — which is the pooled-median trap one level
+    down, inside a single benchmark's own extras rather than in `summary.json`.
+
+    The `convert_sort_by` arm therefore reports only its sparse
+    `peak_rss_mb__convert_sort_by` / `wall_s__convert_sort_by`.
+    """
+    _tree, path = _bench_ast("grouped_sort")
+    src = path.read_text()
+
+    assert 'reorder="sort_by"' in src or "reorder='sort_by'" in src, (
+        f"{path.name} no longer has a sort_by arm"
+    )
+    # The guard is the conditional emission, not the absence of the key: the
+    # grouping arms legitimately still emit it.
+    assert 'if reorder != "sort_by":' in src, (
+        f"{path.name} emits grouped_peak_rss_mb unconditionally again. The "
+        f"sort_by arm must omit it, or the three ceilings' medians shift to "
+        f"include an arm they were never calibrated against."
+    )
+    assert 'f"wall_s__{scenario}"' in src, (
+        f"{path.name} does not emit a per-scenario wall key; `wall_s` is a "
+        f"reserved add_run parameter and never reaches runs[].extra"
+    )
+
+
+def test_fragment_ops_emits_a_gateable_wall_key_per_operation():
+    """Every `fragment_ops` arm needs a `wall_s__<op>` in `extra`.
+
+    The module has always *timed* four in-place mutations, but `wall_s` is a
+    reserved `add_run` parameter: it lands on the `RunRecord`, never in
+    `runs[].extra`, and the gate reads `extra` only. So the only gateable
+    timing was `median_wall_s`, pooled across arms and dominated by whichever
+    is cheapest — `rollback`, which is a 4 KB pwrite.
+
+    That is the wrong way round for OPT-FORMAT-1. Four of the five ops commit
+    through `commit_in_place` -> `finalize_header_with_checksum`, which streams
+    offset 256 -> EOF regardless of how little changed, and `rollback` is the
+    purest instrument for it precisely *because* it does almost nothing else.
+    """
+    import ast
+
+    tree, path = _bench_ast("fragment_ops")
+
+    ops: set[str] = set()
+    walls: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "operation":
+            if isinstance(node.value, ast.Constant):
+                ops.add(node.value.value)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value.startswith("wall_s__"):
+                walls.add(node.value[len("wall_s__"):])
+
+    assert ops, f"found no operation= labels in {path.name}"
+    missing = sorted(ops - walls)
+    assert not missing, (
+        f"these {path.name} arms record no gateable wall: {missing}. Add "
+        f"`**{{'wall_s__<op>': round(wall, 6)}}` to their add_run — `wall_s=` "
+        f"alone is invisible to every threshold."
+    )
+    assert "rollback" in walls and "obs_import" in walls, (
+        "the two cleanest OPT-FORMAT-1 instruments (rollback, obs_import) must "
+        f"keep their wall keys; found {sorted(walls)}"
+    )
+
+
+def test_scx_cli_probe_has_one_home():
+    """No benchmark module re-implements the `scx` binary search.
+
+    `$SCX_CLI_BIN` -> `target/release/scx` -> PATH was written out twice, and
+    `shuffle_layout`'s own docstring noted the other copy "uses the same
+    order". A third was about to be added for the cloud `scx info` arm. The
+    shared home is `benchmarks/comprehensive/scx_cli.py`, in the shape
+    `rss.py` established for the RSS reader — and the callers keep their own
+    *probes*, because what a usable binary means differs per arm (`info
+    --json`, `optimize --codec`, a cloud-gated subcommand).
+
+    The same shape as `test_rss_helper.py`'s "no module reimplements the
+    reader".
+    """
+    import ast
+
+    bench_dir = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+    offenders: list[str] = []
+    for mod in sorted(bench_dir.glob("*.py")):
+        tree = ast.parse(mod.read_text(), filename=str(mod))
+        # Parsed, not grepped, and for the reason this file already records
+        # under `test_no_benchmark_passes_extra_as_a_dict`: all three of these
+        # modules now *explain* the shared probe in a docstring, so a text
+        # search matches the explanation and the test fails on its own prose.
+        # A re-implementation reads the env var, which only ever appears as a
+        # call argument (`os.environ.get("SCX_CLI_BIN")`) or a subscript.
+        for node in ast.walk(tree):
+            reads = []
+            if isinstance(node, ast.Call):
+                reads = [a for a in node.args if isinstance(a, ast.Constant)]
+            elif isinstance(node, ast.Subscript) and isinstance(
+                node.slice, ast.Constant
+            ):
+                reads = [node.slice]
+            if any(a.value == "SCX_CLI_BIN" for a in reads):
+                offenders.append(f"{mod.name}:{node.lineno}")
+    assert not offenders, (
+        f"these modules read $SCX_CLI_BIN directly instead of calling "
+        f"`benchmarks.comprehensive.scx_cli.resolve_scx_bin`: {offenders}"
+    )
+
+    # And the shared module must actually be what they call.
+    from benchmarks.comprehensive import scx_cli
+
+    assert callable(scx_cli.resolve_scx_bin)
+    # `info --help` exits 0 on a build with no cloud support at all, so the
+    # cloud probe has to use a clap-gated subcommand. Pinned because getting
+    # this wrong resolves a binary that then fails on the URL at run time.
+    assert scx_cli.CLOUD_PROBE[0] != "info", (
+        f"CLOUD_PROBE is {scx_cli.CLOUD_PROBE}; `info` is compiled into every "
+        f"build (only its cloud *branch* is feature-gated), so probing it "
+        f"cannot detect cloud support"
+    )

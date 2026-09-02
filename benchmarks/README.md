@@ -1550,6 +1550,36 @@ justification stops suppressing and the gate fails again — forces
 periodic review. Multiple triples per file are fine; one file per PR is
 typical.
 
+> **A justification for a pooled summary metric must name it, or it silently
+> disarms every floor on the triple.** Suppression covers both gate surfaces —
+> relative regressions and `thresholds.yaml` absolute floors — and by default
+> covers every metric on each triple named. `summary.json` carries one
+> `peak_rss_mb_median` and one `median_wall_s` per triple, pooled across every
+> run in the file, so **adding an arm to an existing benchmark shifts both by
+> construction** and needs a justification; unscoped, that justification also
+> switches the triple's floors off. Two committed files were in that state and
+> disarmed 16 floors between them — one of them a ceiling added in the same
+> commit as its own justification, which is why the gate then printed
+> `Absolute-floor violations: 0 (1 justification-suppressed)` and exited 0.
+>
+> Scope it with a file-level `metrics:` list, or a per-entry `metric:` that
+> narrows one triple and adds to the file-level list:
+>
+> ```yaml
+> metrics: [peak_rss_mb_median, median_wall_s]
+> triples:
+>   - benchmark: cellset_gather
+>     format: scx_auto
+>     dataset: census_1m
+> ```
+>
+> Omitting both keeps the whole-triple default, which is still correct for a
+> triple that really is wholly known-bad. `test_floor_reachability.py::
+> test_no_floor_is_fully_suppressed_by_an_active_justification` fails on any
+> floor under an unscoped suppression; deliberate cases are allowlisted there
+> with their reason. Full detail in
+> [`results/justifications/README.md`](comprehensive/results/justifications/README.md).
+
 ### Variance-aware timing tolerance (IQR widening)
 
 The gate widens the per-row `median_wall_s` tolerance automatically when
