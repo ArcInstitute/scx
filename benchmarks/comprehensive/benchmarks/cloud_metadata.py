@@ -44,6 +44,7 @@ from benchmarks.comprehensive.config import (
     N_WARMUP_RUNS,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.rss import PeakRssSampler, current_rss_mb
 from benchmarks.comprehensive.scx_cli import CLOUD_PROBE, resolve_scx_bin
 from benchmarks.comprehensive.runners import make_runner
 
@@ -187,9 +188,10 @@ def _run_cli_info_arm(
       resolving the fixture when `ensure_gcp_credentials_or_skip` fails, so
       this arm is never reached without them.
 
-    Success is asserted on the *content*, not the exit code alone: a `--json`
-    `n_obs` matching the dataset's own `n_obs`. An exit-0 that printed nothing
-    useful would otherwise be recorded as a fast open.
+    Success is asserted on the *content*, not the exit code alone: `--json`'s
+    `n_obs` **and** `n_vars` must both match the dataset's own. An exit-0 that
+    printed nothing useful would otherwise be recorded as a fast open, and
+    `n_obs` alone accepts any file with the same cell count.
     """
     scx_bin = resolve_scx_bin(CLOUD_PROBE)
     if scx_bin is None:
@@ -206,16 +208,25 @@ def _run_cli_info_arm(
     result.metadata["cli_info_bin"] = scx_bin
     for i in range(n_runs):
         gc.collect()
+        entry_rss = current_rss_mb()
         t0 = time.perf_counter()
         # `timeout=` raises rather than returning, and a cloud hang must not
         # take the whole cohort job with it — the docstring above promises this
         # arm never raises. A timed-out run is recorded as ok=0 with its (capped)
         # wall, which is the honest reading: it did take at least that long.
         try:
-            proc = subprocess.run(
-                [scx_bin, "info", "--json", cloud_url],
-                capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
-            )
+            # The work happens in a child process, so this samples the
+            # *harness's* footprint while it waits. Recorded anyway, and
+            # explicitly: omitting `peak_rss_mb=` lets `add_run` default it to
+            # 0.0, and `_median_rss` medians across every run — three zeros
+            # beside three real samples halves the triple's pooled RSS, which
+            # is a phantom regression the moment this arm's justification is
+            # retired.
+            with PeakRssSampler() as sampler:
+                proc = subprocess.run(
+                    [scx_bin, "info", "--json", cloud_url],
+                    capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
+                )
         except subprocess.TimeoutExpired:
             logger.error(
                 "  scx info %s exceeded the %ds cap", cloud_url,
@@ -229,31 +240,50 @@ def _run_cli_info_arm(
 
         ok = 0
         n_obs_seen = -1
+        n_vars_seen = -1
         if proc is not None and proc.returncode == 0:
             try:
-                n_obs_seen = int(json.loads(proc.stdout).get("n_obs", -1))
+                payload = json.loads(proc.stdout)
+                n_obs_seen = int(payload.get("n_obs", -1))
+                n_vars_seen = int(payload.get("n_vars", -1))
             except Exception:  # noqa: BLE001
                 n_obs_seen = -1
-            ok = 1 if n_obs_seen == dataset.n_obs else 0
+                n_vars_seen = -1
+            # BOTH axes. `n_obs` alone accepts any file with the same cell
+            # count — a stale catalog, the wrong URL resolved, a different
+            # fixture — and would record its (fast) wall as a successful open.
+            # Multimodal datasets sum n_vars across modalities in the config
+            # and are out of this arm's scope anyway (SUPPORTED_FORMATS is
+            # single-modality scx_auto).
+            ok = 1 if (
+                n_obs_seen == dataset.n_obs and n_vars_seen == dataset.n_vars
+            ) else 0
         if not ok:
             # Recorded rather than raised — one arm must not fail the cohort —
             # but recorded *loudly*: a 0 here means the wall below timed a
             # failure, and any threshold on `scx_info_cloud_ok` fails on it.
             logger.error(
-                "  scx info %s failed (rc=%s, n_obs=%s, want %d): %s",
+                "  scx info %s failed (rc=%s, n_obs=%s want %d, "
+                "n_vars=%s want %d): %s",
                 cloud_url,
                 "timeout/spawn" if proc is None else proc.returncode,
-                n_obs_seen, dataset.n_obs,
+                n_obs_seen, dataset.n_obs, n_vars_seen, dataset.n_vars,
                 "" if proc is None else (proc.stderr or "").strip()[:400],
             )
+        # `sampler` is unbound only if the `with` never entered, which cannot
+        # happen — `PeakRssSampler.__enter__` does not raise — but a spawn
+        # failure leaves the entry reading as the honest floor.
+        parent_peak = getattr(sampler, "peak_mb", entry_rss)
         result.add_run(
             wall_s=wall,
+            peak_rss_mb=parent_peak,
             scenario="scx_info_cloud",
-            **{
-                "wall_s__scx_info_cloud": round(wall, 6),
-                "scx_info_cloud_ok": ok,
-                "scx_info_n_obs": n_obs_seen,
-            },
+            entry_rss_mb=round(entry_rss, 1),
+            wall_s__scx_info_cloud=round(wall, 6),
+            peak_rss_mb__scx_info_cloud=round(parent_peak, 1),
+            scx_info_cloud_ok=ok,
+            scx_info_n_obs=n_obs_seen,
+            scx_info_n_vars=n_vars_seen,
         )
         logger.info(
             "  scx info (cloud) run %d/%d: wall=%.3fs ok=%d", i + 1, n_runs, wall, ok,

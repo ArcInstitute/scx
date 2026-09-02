@@ -4,6 +4,11 @@
 # adding one later does not silently land under a suppression, which is how 16
 # floors were disarmed before PR-02c.
 metrics: [peak_rss_mb_median, median_wall_s]
+# Expires deliberately. Every "when to remove this file" recipe below waits on
+# the PR-03 recapture; without a date, a missed cleanup leaves the suppression
+# in place forever and silently. 2026-12-31 gives the recapture margin and then
+# fails loud.
+expires: 2026-12-31
 triples:
   - benchmark: cloud_metadata
     format: scx_auto
@@ -59,9 +64,20 @@ runs carry it, so a threshold on it medians that arm alone. The in-process arm
 keeps reporting its own `wall_s` unchanged.
 
 `peak_rss_mb_median` also shifts, and more confusingly: the CLI arm's runs
-record the *parent* process's peak while the work happens in a subprocess, so
-their RSS rows are the harness's baseline rather than a measurement of
-anything. Another reason to read the sparse key, not the pooled one.
+record the *parent* process's peak (`PeakRssSampler` around the subprocess)
+while the work happens in a child, so their RSS rows are the harness's
+footprint rather than a measurement of the operation. Another reason to read
+the sparse `peak_rss_mb__scx_info_cloud`, not the pooled one.
+
+> **Correction.** An earlier version of this file claimed exactly that while
+> the code recorded **nothing** — `_run_cli_info_arm` omitted `peak_rss_mb=`,
+> so `add_run` supplied its `0.0` default. Three zeros beside three real
+> catalog-open samples roughly halve the triple's pooled `peak_rss_mb_median`,
+> which would have become a phantom regression the moment this file is
+> retired, and would have been baked into any baseline recaptured first. All
+> three reviewers on PR #498 caught it. The arm now samples a real parent peak,
+> and `test_cli_info_arm_records_a_real_parent_rss_not_add_runs_zero_default`
+> fails if it stops.
 
 ## Scope
 

@@ -66,10 +66,14 @@ def candidates() -> list[str]:
 
 
 def resolve_scx_bin(
-    probe: tuple[str, ...] = INFO_JSON_PROBE,
+    probe: tuple[str, ...],
     requires: bytes | None = None,
 ) -> str | None:
     """First candidate binary that passes *probe*, or ``None``.
+
+    *probe* is required rather than defaulted: all three callers need a
+    different one, so a default would favour whichever caller it named while
+    coupling this module to that subcommand.
 
     *probe* is appended to the binary path and run with output captured;
     exit 0 counts as a pass. *requires*, when given, must additionally appear

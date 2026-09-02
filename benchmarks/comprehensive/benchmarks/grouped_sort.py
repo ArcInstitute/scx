@@ -248,6 +248,49 @@ def _run_sort_group(
         last_out.unlink(missing_ok=True)
 
 
+def _verify_sorted(out: Path, group_col: str, expect_n_obs: int) -> dict[str, int]:
+    """Check the sort arm's output really is sorted, and lost nothing.
+
+    Returns gateable 0/1 ints. Without this the arm records a wall and a peak
+    for a file nothing looked at: a regression that silently **ignored**
+    ``sort_by`` would convert faster, produce a valid file, and pass any `max`
+    ceiling authored on `wall_s__convert_sort_by` — the exact "green number on
+    the wrong branch" this module's other guards exist to prevent.
+
+    Two checks:
+
+    * ``sort_by_ordered_int`` — the key column is non-decreasing. Catches
+      ``sort_by`` being dropped outright, which is the failure that would
+      otherwise read as a speedup.
+    * ``sort_by_rows_kept_int`` — ``n_obs`` is unchanged. Catches rows lost in
+      the permutation.
+
+    **Not checked here: that X followed obs.** A convert that permuted the obs
+    axis and left the matrix in source order passes both of the above, and
+    catching it needs the *source's* per-row X against the output's under the
+    same obs label — random row reads into a multi-GB h5ad, in an arm whose
+    whole point is a wall-clock number. That belongs in a correctness harness
+    with the source at hand, not in a timing arm; recorded here as the known
+    boundary of what these two ints establish.
+    """
+    import numpy as np
+    import pyscx
+
+    exp = pyscx.open(str(out))
+    try:
+        n_obs = int(exp.n_obs)
+        keys = exp.read_obs([group_col])[group_col].astype("string").to_numpy()
+        ordered = bool(np.all(keys[:-1] <= keys[1:])) if len(keys) > 1 else True
+    finally:
+        close = getattr(exp, "close", None)
+        if close is not None:
+            close()
+    return {
+        "sort_by_ordered_int": int(ordered),
+        "sort_by_rows_kept_int": int(n_obs == expect_n_obs),
+    }
+
+
 def _run_convert(
     result: BenchmarkResult,
     scenario: str,
@@ -259,6 +302,7 @@ def _run_convert(
     n_runs: int,
     *,
     reorder: str = "group_by",
+    expect_n_obs: int = 0,
 ) -> None:
     """Time convert-time reordering: ``group_by=`` grouping or ``sort_by=`` sort.
 
@@ -274,6 +318,13 @@ def _run_convert(
     OPT-OPS-5, and nothing in the suite called it. It must be a **list** (a
     bare `str` is a pyo3 `TypeError`) and it forces the streaming route
     regardless of `stream=`.
+
+    The sort arm's output is **verified before it is unlinked**
+    (``_verify_sorted``): the key column must be non-decreasing and the row
+    count preserved. Nothing else in this module looks at a `sort_by` output,
+    and a convert that silently ignored `sort_by` would be *faster* — so a
+    `max` ceiling on ``wall_s__convert_sort_by`` would read the regression as
+    an improvement.
 
     Metric note: this arm deliberately does **not** emit
     ``grouped_peak_rss_mb``. That key is flat, not per-scenario — every timed
@@ -307,7 +358,11 @@ def _run_convert(
             f"peak_rss_mb__{scenario}": round(rss, 1),
             f"wall_s__{scenario}": round(wall, 6),
         }
-        if reorder != "sort_by":
+        if reorder == "sort_by":
+            # Verified before the output is unlinked. A convert that ignored
+            # `sort_by` would be *faster* and would pass a max ceiling.
+            extra.update(_verify_sorted(out, group_col, expect_n_obs))
+        else:
             # See the docstring: `grouped_peak_rss_mb` is the floored key and
             # is pooled across arms.
             extra["grouped_peak_rss_mb"] = round(rss, 1)
@@ -396,6 +451,7 @@ def run(
         _run_convert(
             result, "convert_sort_by", None, source_h5ad, group_col, reference,
             workdir, convert_runs, reorder="sort_by",
+            expect_n_obs=dataset.n_obs,
         )
     finally:
         workroot.cleanup()

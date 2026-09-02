@@ -246,3 +246,50 @@ def test_cli_info_arm_skips_with_a_reason_when_no_cloud_build_exists(
     )
     assert not result.runs, "a skipped arm must record no runs"
     assert "--features cloud" in result.metadata["cli_info_skipped_reason"]
+
+
+def test_cli_info_arm_refuses_a_file_with_the_right_n_obs_and_wrong_n_vars(
+    monkeypatch, tmp_path,
+):
+    """`n_obs` alone accepts a different dataset with the same cell count.
+
+    Reproduced by a reviewer: `{"n_obs": 2700, "n_vars": 1}` was recorded as
+    `scx_info_cloud_ok=1` for pbmc3k. A stale catalog, the wrong URL resolved,
+    or a truncated read can all land there, and the wall would go on record as
+    a successful — very fast — open.
+
+    Both axes are compared now, which is also why the happy-path test above
+    carries pbmc3k's real `n_vars` (32738) rather than any plausible integer.
+    """
+    result = _cli_arm(monkeypatch, tmp_path, '{"n_obs": 2700, "n_vars": 1}')
+    extra = result.runs[0].extra
+    assert extra["scx_info_cloud_ok"] == 0, (
+        "an n_vars that disagrees with the dataset must not count as success"
+    )
+    assert extra["scx_info_n_obs"] == 2700
+    assert extra["scx_info_n_vars"] == 1, "the observed value is recorded"
+
+
+def test_cli_info_arm_records_a_real_parent_rss_not_add_runs_zero_default(
+    monkeypatch, tmp_path,
+):
+    """Omitting `peak_rss_mb=` would poison the triple's pooled RSS median.
+
+    `add_run` defaults it to 0.0 and `capture_baseline._median_rss` medians
+    across **every** run of the triple, so three zeros beside three real
+    catalog-open samples roughly halve the pooled figure — a phantom
+    regression the moment this arm's justification is retired, and one that
+    would be baked into any baseline recaptured first.
+
+    This arm's RSS is the *harness's* footprint while a child process does the
+    work. That is worth recording and worth labelling; it is not worth
+    recording as zero.
+    """
+    result = _cli_arm(monkeypatch, tmp_path, '{"n_obs": 2700, "n_vars": 32738}')
+    run = result.runs[0]
+    assert run.peak_rss_mb > 0.0, (
+        "the CLI arm recorded add_run's 0.0 default again; see "
+        "cloud_metadata_cli_arm_raises_pooled_medians.md"
+    )
+    assert run.extra["peak_rss_mb__scx_info_cloud"] == round(run.peak_rss_mb, 1)
+    assert run.extra["entry_rss_mb"] > 0.0

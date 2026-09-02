@@ -80,8 +80,8 @@ from benchmarks.comprehensive.config import (
 )
 from benchmarks.comprehensive.results import BenchmarkResult, write_missing_result
 from benchmarks.comprehensive.rss import current_rss_mb as _get_rss_mb
-from benchmarks.comprehensive.scx_cli import OPTIMIZE_PROBE, resolve_scx_bin
 from benchmarks.comprehensive.runners.accel_runner import AcceleratorRunner
+from benchmarks.comprehensive.scx_cli import OPTIMIZE_PROBE, resolve_scx_bin
 
 logger = logging.getLogger(__name__)
 
@@ -236,22 +236,6 @@ def _has_cupy() -> bool:
         return False
 
 
-def _resolve_scx_optimize_bin() -> str | None:
-    """Resolve an `scx` binary whose `optimize` supports `--codec scx1`.
-
-    Returns the first candidate whose `optimize --help` exits cleanly *and*
-    advertises `--codec` — older binaries lack the subcommand or the flag and
-    are skipped so the self-convert fallback kicks in — else `None`.
-
-    The `$SCX_CLI_BIN` -> `target/release/scx` -> PATH walk lives in
-    `benchmarks.comprehensive.scx_cli`; the `--codec` requirement is what makes
-    this probe specific to this arm.
-    """
-    # The candidate walk is shared (`benchmarks.comprehensive.scx_cli`); the
-    # `--codec` requirement is what makes this probe specific to this arm.
-    return resolve_scx_bin(OPTIMIZE_PROBE, requires=b"--codec")
-
-
 def _prepare_sidecar_scx(
     dataset: DatasetConfig, tmpdir: str, arm: _Arm
 ) -> tuple[Path, int, int]:
@@ -278,7 +262,10 @@ def _prepare_sidecar_scx(
     scx_path = Path(tmpdir) / f"{dataset.name}.scx"
 
     fixture = getattr(dataset, arm.fixture_attr)
-    opt_bin = _resolve_scx_optimize_bin()
+    # `optimize --help` exits 0 on older binaries that lack `--codec`, so the
+    # flag is what has to be probed for; absent it, the self-convert fallback
+    # kicks in.
+    opt_bin = resolve_scx_bin(OPTIMIZE_PROBE, requires=b"--codec")
     if fixture.exists() and opt_bin is not None:
         logger.info(
             "preparing sidecar fixture via `scx optimize --codec %s` (%s) from %s",

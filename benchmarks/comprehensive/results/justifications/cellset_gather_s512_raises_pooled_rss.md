@@ -3,6 +3,11 @@
 # and nothing else. Unscoped it also suppressed all 15 `cellset_gather`
 # absolute floors — see "What this file must not suppress" below.
 metrics: [peak_rss_mb_median, median_wall_s]
+# Expires deliberately. Every "when to remove this file" recipe below waits on
+# the PR-03 recapture; without a date, a missed cleanup leaves the suppression
+# in place forever and silently. 2026-12-31 gives the recapture margin and then
+# fails loud.
+expires: 2026-12-31
 triples:
   - benchmark: cellset_gather
     format: scx_auto

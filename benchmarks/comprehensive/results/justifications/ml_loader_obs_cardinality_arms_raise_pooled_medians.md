@@ -4,6 +4,11 @@
 # triples and this file must not become the reason a future one is unreachable.
 # See results/justifications/README.md § Metric scope.
 metrics: [peak_rss_mb_median, median_wall_s]
+# Expires deliberately. Every "when to remove this file" recipe below waits on
+# the PR-03 recapture; without a date, a missed cleanup leaves the suppression
+# in place forever and silently. 2026-12-31 gives the recapture margin and then
+# fails loud.
+expires: 2026-12-31
 triples:
   - benchmark: ml_loader
     format: scx_auto

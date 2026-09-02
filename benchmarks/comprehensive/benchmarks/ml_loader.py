@@ -39,6 +39,7 @@ from typing import Any
 
 import numpy as np
 
+from benchmarks.comprehensive.cache_control import drop_file_cache
 from benchmarks.comprehensive.config import (
     DatasetConfig,
     FormatVariant,
@@ -220,30 +221,59 @@ _OBS_CARDINALITY_SPEC: dict[str, dict[str, tuple[str, int]]] = {
 }
 
 
-def _missing_obs_columns(path: str, columns: list[str]) -> list[str]:
-    """Which of *columns* the file's obs does not have.
+def _probe_obs_cardinality(
+    path: str, columns: list[str],
+) -> tuple[dict[str, int], list[str]]:
+    """Observed category count per column, plus the ones that cannot be used.
+
+    Returns ``({column: n_categories}, problems)``. A column is a *problem*
+    when it is absent from obs or is not stored as a dictionary — and the
+    second half is the point. The arm's whole subject is
+    `obs_to_pydict`'s **Categorical** branch; a column that survives a fixture
+    reconvert under the same name but as an `Int64` sends the loader down the
+    `PyArray1::from_vec` branch instead, so the arm would run, emit its
+    metrics, and measure nothing.
+
+    Declared counts used to be hard-coded into `runs[].extra` (`3` and
+    `957_955`), which described the fixture as it was rather than as it is.
+    The observed count is recorded now, so a reconvert changes the number
+    instead of silently invalidating it.
 
     A preflight rather than a try/except around the arm: `TrainingDataset`
     validates `obs_columns` in its constructor and raises, and catching that
     the way the `gpu_train` arm catches its own failures would turn a broken
     fixture into a scenario with zero runs — a silent missing metric for any
-    threshold on it. Failing to open the file at all is treated as "columns
-    present" so the arm's own error is what surfaces, not this probe's.
+    threshold on it. Failing to open the file at all reports no problems, so
+    the arm's own error is what surfaces rather than this probe's.
     """
+    counts: dict[str, int] = {}
+    problems: list[str] = []
     try:
         import pyscx
 
         exp = pyscx.open(path)
         try:
             available = set(exp.obs_keys())
+            for col in columns:
+                if col not in available:
+                    problems.append(f"{col}: absent from obs")
+                    continue
+                try:
+                    _codes, categories = exp.obs_categorical(col)
+                except Exception as e:  # noqa: BLE001
+                    # `obs_categorical` raises on a non-dictionary column,
+                    # which is exactly the case that must not pass silently.
+                    problems.append(f"{col}: not a categorical column ({e})")
+                    continue
+                counts[col] = len(categories)
         finally:
             close = getattr(exp, "close", None)
             if close is not None:
                 close()
     except Exception as e:  # noqa: BLE001
         logger.warning("  obs-column preflight could not open %s: %s", path, e)
-        return []
-    return [c for c in columns if c not in available]
+        return {}, []
+    return counts, problems
 
 
 _SCENARIOS: list[tuple[str, bool, bool]] = [
@@ -1406,19 +1436,20 @@ def run(
         # ---------------------------------------------------------------
         obs_spec = _OBS_CARDINALITY_SPEC.get(dataset.name)
         if loader_type == "scx" and obs_spec is not None:
-            missing = _missing_obs_columns(
+            observed, problems = _probe_obs_cardinality(
                 data_path, [c for c, _n in obs_spec.values()]
             )
-            if missing:
+            if problems:
                 # Recorded, not swallowed into a per-scenario "error" key: an
-                # absent column yields zero runs, and a threshold on a metric
+                # unusable column yields zero runs, and a threshold on a metric
                 # no run carries is a missing-metric violation rather than a
                 # skip — which is the loud outcome, but only if the reason is
                 # findable. See thresholds.yaml's Deferred entry.
                 reason = (
-                    f"obs columns absent from {data_path}: {missing}. The "
-                    f"cardinality arm needs them; check the fixture was "
-                    f"converted from the census h5ad with obs intact."
+                    f"obs cardinality arm cannot run on {data_path}: "
+                    f"{problems}. It needs two *categorical* columns of very "
+                    f"different cardinality; check the fixture was converted "
+                    f"from the census h5ad with obs intact."
                 )
                 logger.warning("  obs-cardinality arm skipped: %s", reason)
                 scenario_summary["raw_obs_cardinality"] = {
@@ -1426,7 +1457,17 @@ def run(
                 }
             else:
                 obs_rates: dict[str, float] = {}
-                for arm_name, (column, n_categories) in obs_spec.items():
+                for arm_name, (column, declared) in obs_spec.items():
+                    n_categories = observed[column]
+                    if n_categories != declared:
+                        # Not fatal — a reconvert legitimately changes a
+                        # dictionary's size — but the spec's number is now
+                        # stale documentation and should be updated.
+                        logger.warning(
+                            "  %s: %r has %d categories, spec says %d; "
+                            "recording the observed count",
+                            arm_name, column, n_categories, declared,
+                        )
                     logger.info(
                         "--- Scenario: %s (obs_columns=[%r], %d categories) ---",
                         arm_name, column, n_categories,
@@ -1441,7 +1482,24 @@ def run(
                         obs_columns=[column],
                     )
                     arm_bps: list[float] = []
+                    cache_policy = "warm"
                     for _ in range(n_runs):
+                        # The main `_SCENARIOS` loop evicts before every timed
+                        # epoch, and this arm did not — so a `cold_cache=True`
+                        # campaign would have measured a warmed file here and
+                        # labelled it cold, with the second arm additionally
+                        # riding the first arm's reads. The documented
+                        # +109 ms/batch was taken with a separate cold probe,
+                        # which the arm could not have reproduced.
+                        #
+                        # `drop_file_cache` (posix_fadvise, per file, returns
+                        # its own policy label) rather than the privileged
+                        # system-wide `/proc/sys/vm/drop_caches` write the main
+                        # loop still uses: unprivileged, targeted, and the
+                        # house helper the other data-load benchmarks call. The
+                        # main loop's version is pre-existing and untouched.
+                        if cold_cache:
+                            cache_policy = drop_file_cache(data_path)
                         gc.collect()
                         t0 = time.perf_counter()
                         epoch = _run_scx_epoch(
@@ -1466,6 +1524,8 @@ def run(
                             n_cells=epoch.n_cells,
                             obs_column=column,
                             obs_n_categories=n_categories,
+                            obs_n_categories_declared=declared,
+                            cache_policy=cache_policy,
                             **{
                                 f"batches_per_sec__{arm_name}": round(bps, 1),
                                 f"cells_per_sec__{arm_name}": round(cps, 0),
@@ -1483,6 +1543,7 @@ def run(
                             "n_runs": len(arm_bps),
                             "obs_column": column,
                             "obs_n_categories": n_categories,
+                            "cache_policy": cache_policy,
                             "median_batches_per_sec": round(
                                 statistics.median(arm_bps), 1
                             ),
@@ -1511,25 +1572,34 @@ def run(
                         "highcard_slowdown_vs_lowcard": round(slowdown, 3),
                         "highcard_overhead_ms_per_batch": round(overhead_ms, 2),
                     }
-                    # Emitted into `extra` as well as metadata: only `extra` is
-                    # gateable. Recorded on a zero-wall bookkeeping run so it
-                    # cannot perturb the pooled `median_wall_s` /
-                    # `peak_rss_mb_median` any further than the two timed arms
-                    # already do — the same device `grouped_sort` uses for its
-                    # correctness record.
-                    result.add_run(
-                        wall_s=0.0,
-                        peak_rss_mb=0.0,
-                        scenario="raw_obs_cardinality",
-                        obs_lowcard_column=obs_spec["raw_obs_lowcard"][0],
-                        obs_highcard_column=obs_spec["raw_obs_highcard"][0],
-                        **{
-                            "obs_highcard_slowdown_vs_lowcard": round(slowdown, 3),
-                            "obs_highcard_overhead_ms_per_batch": round(
-                                overhead_ms, 2
-                            ),
-                        },
-                    )
+                    # Emitted into `extra` as well as metadata, because only
+                    # `extra` is gateable — but attached to the runs that
+                    # already exist, NOT to a new zero-wall bookkeeping record.
+                    #
+                    # An earlier version added such a record and claimed it
+                    # "cannot perturb the pooled medians any further than the
+                    # two timed arms already do". That is arithmetically false:
+                    # `BenchmarkResult.median_wall_s` / `median_rss_mb` and
+                    # `capture_baseline._median_rss` take a median over *every*
+                    # run, so injecting a 0.0/0.0 sample drags both down, wid-
+                    # ens `wall_s_iqr` and bumps `n_runs`. A reviewer measured
+                    # a four-run loader median 11.5 -> 11.0 with triple the IQR.
+                    #
+                    # `_load_current_raw_metric` medians over the runs that
+                    # *carry* the key, so writing the same value onto each
+                    # high-cardinality run yields the identical gate reading
+                    # with no synthetic measurement.
+                    derived = {
+                        "obs_highcard_slowdown_vs_lowcard": round(slowdown, 3),
+                        "obs_highcard_overhead_ms_per_batch": round(
+                            overhead_ms, 2
+                        ),
+                        "obs_lowcard_column": obs_spec["raw_obs_lowcard"][0],
+                        "obs_highcard_column": obs_spec["raw_obs_highcard"][0],
+                    }
+                    for run_rec in result.runs:
+                        if run_rec.extra.get("scenario") == "raw_obs_highcard":
+                            run_rec.extra.update(derived)
                     logger.info(
                         "  obs cardinality: %.1f -> %.1f batches/s "
                         "(%.2fx slower, +%.1f ms/batch)",

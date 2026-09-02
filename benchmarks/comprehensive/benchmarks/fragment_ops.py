@@ -170,7 +170,7 @@ def _run_append(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="append",
-            **{"wall_s__append": round(wall, 6)},
+            wall_s__append=round(wall, 6),
             rows_inserted=n_rows,
             bytes_appended=input_bytes,
             size_before_bytes=size_before,
@@ -217,7 +217,7 @@ def _run_delete(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="delete",
-            **{"wall_s__delete": round(wall, 6)},
+            wall_s__delete=round(wall, 6),
             rows_deleted=n_delete,
             size_before_bytes=size_before,
             size_after_bytes=size_after,
@@ -271,7 +271,7 @@ def _run_compact(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="compact",
-            **{"wall_s__compact": round(wall, 6)},
+            wall_s__compact=round(wall, 6),
             size_before_bytes=size_before,
             size_after_bytes=size_after,
             reclaimed_bytes=reclaimed,
@@ -342,10 +342,8 @@ def _run_compact_full(
             size_before_bytes=size_before,
             size_after_bytes=size_after,
             throughput_mb_s=round(throughput_mb_s, 3),
-            **{
-                "peak_rss_mb__compact_full": round(rss, 1),
-                "wall_s__compact_full": round(wall, 6),
-            },
+            peak_rss_mb__compact_full=round(rss, 1),
+            wall_s__compact_full=round(wall, 6),
         )
         input_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
@@ -355,11 +353,49 @@ def _run_compact_full(
         )
 
 
-def _obs_import_csv(base_scx: Path, csv_path: Path) -> tuple[int, str, str]:
-    """Write a one-column annotation CSV keyed on a column that can join.
+def _resolve_obs_join_key(base_scx: Path) -> list[str]:
+    """Column(s) that can key an `obs_import` join on *base_scx*.
 
-    Returns ``(n_rows, target_key, source_key)``. Setup only — outside every
-    timed region.
+    A **list**, because a unique key is not always a single column.
+    `diagnose_obs_key` reports `unique_columns` (best-candidate-first) and,
+    when none of them is unique on its own, `unique_pairs` — a two-column
+    composite, which is the normal shape on a merged atlas. Its `suggestion`
+    renders a pair as one comma-joined string, so it cannot be handed to
+    `key=` directly; the structured fields are what to read.
+
+    An earlier version required `unique_columns` to be non-empty and raised
+    otherwise, which rejected every file whose only usable key is a pair — a
+    reviewer reproduced that on a four-row fixture where
+    `unique_pairs == [("sample", "barcode"), …]`.
+    """
+    import pyscx
+
+    diag = pyscx.diagnose_obs_key(str(base_scx))
+    unique = list(diag.get("unique_columns") or [])
+    if unique:
+        return [unique[0]]
+    pairs = list(diag.get("unique_pairs") or [])
+    if pairs:
+        # Reported as a sequence of pairs; normalise both the tuple and the
+        # comma-joined-string renderings.
+        first = pairs[0]
+        if isinstance(first, str):
+            return [c.strip() for c in first.split(",") if c.strip()]
+        return [str(c) for c in first]
+    raise RuntimeError(
+        f"{base_scx.name} has no obs column or column pair that can key a "
+        f"join ({diag.get('summary')}). The arm joins by key string, never by "
+        f"row position, so there is nothing to measure here."
+    )
+
+
+def _obs_import_csv(
+    base_scx: Path, csv_path: Path,
+) -> tuple[int, list[str], list[str]]:
+    """Write a one-column annotation CSV keyed on column(s) that can join.
+
+    Returns ``(n_rows, target_key, source_key)``, both keys as lists. Setup
+    only — outside every timed region.
 
     **The obs index is not always unique, and census_1m is the case in point.**
     An earlier version hard-coded ``key="obs_names"``; it worked at pbmc3k
@@ -368,47 +404,45 @@ def _obs_import_csv(base_scx: Path, csv_path: Path) -> tuple[int, str, str]:
     rows". The CELLxGENE export duplicates its index 10x; the unique column is
     ``soma_joinid``. `pyscx.diagnose_obs_key` exists for exactly this — its own
     docstring names this fixture — so the key is resolved per file rather than
-    assumed, and the arm works on any of them.
+    assumed, and the arm works on any of them, composite keys included.
 
-    The key is written as a **named** column and paired with an explicit
-    ``source_key``, rather than relying on the two sides resolving the same
-    name. That is what `source_key` is for, and it keeps the CSV's shape
-    independent of whether the resolved key happens to be the obs index.
+    Each key component is written as its own **named** column and paired with
+    an explicit ``source_key``, rather than relying on the two sides resolving
+    the same names. That is what `source_key` is for, and it keeps the CSV's
+    shape independent of whether a resolved component happens to be the obs
+    index.
     """
     import numpy as np
     import pandas as pd
     import pyscx
 
-    diag = pyscx.diagnose_obs_key(str(base_scx))
-    target_key = diag.get("suggestion") or "obs_names"
-    if not diag.get("unique_columns"):
-        raise RuntimeError(
-            f"{base_scx.name} has no obs column that can key a join "
-            f"({diag.get('summary')}). The arm joins by key string, never by "
-            f"row position, so there is nothing to measure here."
-        )
+    target_key = _resolve_obs_join_key(base_scx)
 
     exp = pyscx.open(str(base_scx))
     try:
         # `read_obs([])` is the matrix-free projection `obs_open.py` uses; the
         # projected frame keeps its barcode index by design. Measured 5.0 s at
         # census_1m for the index alone.
-        if target_key in _OBS_INDEX_ALIASES:
-            keys = exp.read_obs([]).index.to_numpy()
-        else:
-            keys = exp.read_obs([target_key])[target_key].to_numpy()
+        wanted = [c for c in target_key if c not in _OBS_INDEX_ALIASES]
+        frame_in = exp.read_obs(wanted)
+        columns: dict[str, object] = {}
+        for i, component in enumerate(target_key):
+            source_name = f"{_OBS_IMPORT_SOURCE_KEY}{i}"
+            if component in _OBS_INDEX_ALIASES:
+                columns[source_name] = frame_in.index.to_numpy()
+            else:
+                columns[source_name] = frame_in[component].to_numpy()
     finally:
         close = getattr(exp, "close", None)
         if close is not None:
             close()
 
+    n_rows = len(next(iter(columns.values())))
     rng = np.random.default_rng(RANDOM_SEED)
-    frame = pd.DataFrame({
-        _OBS_IMPORT_SOURCE_KEY: keys,
-        "synth_score": rng.random(len(keys)).astype("float32"),
-    })
-    frame.to_csv(csv_path, index=False)
-    return len(keys), target_key, _OBS_IMPORT_SOURCE_KEY
+    columns["synth_score"] = rng.random(n_rows).astype("float32")
+    pd.DataFrame(columns).to_csv(csv_path, index=False)
+    source_key = [f"{_OBS_IMPORT_SOURCE_KEY}{i}" for i in range(len(target_key))]
+    return n_rows, target_key, source_key
 
 
 def _run_obs_import(
@@ -419,12 +453,15 @@ def _run_obs_import(
 ) -> None:
     """Measure ``pyscx.obs_import`` — a key-joined, in-place obs column add.
 
-    This is the second in-place op with a *gateable* per-op wall in this
-    module, and the one whose wall is almost entirely the file checksum:
-    `attach_external_obs` never reads or rewrites X, layers, `var`, the CSC
-    sidecar, `.raw`, deletion vectors or bitmaps, but `commit_in_place` still
-    streams offset 256 -> EOF to recompute `file_checksum`. Adding one 8 MB
-    column to census_1m therefore pays a 2.8 GB rehash.
+    Nothing else in the suite times a key-joined import, which is why the arm
+    exists. It is **not** an OPT-FORMAT-1 instrument, though an earlier version
+    of this docstring said it was ("almost entirely the file checksum"). It is
+    not: `attach_external_obs` leaves X, layers, `var`, the CSC sidecar,
+    `.raw`, deletion vectors and bitmaps alone, but it **rewrites the obs
+    section** and appends it at EOF — 493 MB at census_1m against a 4 MB score
+    column — and `commit_in_place` then rehashes the file. Measured, that
+    rehash is ~2.2 s of a 19.72 s wall, i.e. **~11%**. See the module docstring
+    for the table and `wall_s__rollback` for the clean signal.
 
     A fresh copy per run is required, not hygiene: the import is in place and
     `overwrite=False` (the default) refuses a column that already exists, so a
@@ -448,7 +485,7 @@ def _run_obs_import(
         # without writing.
         preview = pyscx.obs_import(
             str(target_path), str(csv_path),
-            key=[target_key], source_key=[source_key], dry_run=True,
+            key=target_key, source_key=source_key, dry_run=True,
         )
         n_matched = int(preview.get("n_matched", -1))
         if n_matched != n_source_rows:
@@ -462,7 +499,7 @@ def _run_obs_import(
 
         wall, rss = _time_op(
             pyscx.obs_import, str(target_path), str(csv_path),
-            key=[target_key], source_key=[source_key],
+            key=target_key, source_key=source_key,
         )
 
         size_after = target_path.stat().st_size
@@ -472,13 +509,11 @@ def _run_obs_import(
             wall_s=wall,
             peak_rss_mb=rss,
             operation="obs_import",
-            **{
-                "wall_s__obs_import": round(wall, 6),
-                "peak_rss_mb__obs_import": round(rss, 1),
-            },
+            wall_s__obs_import=round(wall, 6),
+            peak_rss_mb__obs_import=round(rss, 1),
             rows_imported=n_source_rows,
             n_matched=n_matched,
-            obs_join_key=target_key,
+            obs_join_key=",".join(target_key),
             # Whether the obs rewrite streamed shard-by-shard or assembled the
             # whole table. Not inferable from the output file, and it decides
             # whether this arm's peak scales with the target: a legacy
@@ -537,7 +572,7 @@ def _run_rollback(
             # 4 KB pwrite plus `finalize_header_with_checksum`, which streams
             # offset 256 -> EOF. Almost all of this wall is the whole-file
             # BLAKE3 rehash, so an O(catalog) checksum extent would collapse it.
-            **{"wall_s__rollback": round(wall, 6)},
+            wall_s__rollback=round(wall, 6),
             size_before_bytes=size_before,
             size_after_bytes=size_after,
         )

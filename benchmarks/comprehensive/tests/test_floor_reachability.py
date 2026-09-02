@@ -1544,7 +1544,7 @@ def test_ml_loader_highcard_arm_names_a_categorical_column():
     ), "the arm no longer records obs_n_categories into runs[].extra"
 
 
-def test_sort_by_arm_does_not_emit_the_pooled_grouped_peak_key():
+def test_sort_by_arm_does_not_emit_the_pooled_grouped_peak_key(monkeypatch, tmp_path):
     """`grouped_peak_rss_mb` is flat, so a new arm must not join its median.
 
     Three `thresholds.yaml` ceilings read `grouped_peak_rss_mb`
@@ -1552,29 +1552,116 @@ def test_sort_by_arm_does_not_emit_the_pooled_grouped_peak_key():
     `_load_current_raw_metric` takes the median across **every** run carrying
     the key. The key is not per-scenario: every timed run in `grouped_sort`
     emitted it. So an arm that also emits it silently changes what those three
-    ceilings are measured against — which is the pooled-median trap one level
-    down, inside a single benchmark's own extras rather than in `summary.json`.
+    ceilings are measured against — the pooled-median trap one level down,
+    inside a single benchmark's own extras rather than in `summary.json`.
 
-    The `convert_sort_by` arm therefore reports only its sparse
-    `peak_rss_mb__convert_sort_by` / `wall_s__convert_sort_by`.
+    Driven, not grepped. An earlier version asserted the literal
+    `'if reorder != "sort_by":'` appeared in the source, and it broke the
+    moment that branch was legitimately restructured to add the sort
+    verification — a guard that fails on a correct refactor is measuring the
+    spelling, not the contract.
     """
-    _tree, path = _bench_ast("grouped_sort")
-    src = path.read_text()
+    import pyscx as _pyscx_probe  # noqa: F401  (importorskip below is the gate)
+    import pytest as _pytest
 
-    assert 'reorder="sort_by"' in src or "reorder='sort_by'" in src, (
-        f"{path.name} no longer has a sort_by arm"
+    _pytest.importorskip("pyscx")
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    # A list, not a single attribute: both arms run below, and stashing only
+    # the last call's kwargs made the sort assertion read the *grouping* arm's
+    # (which is how this test first failed).
+    calls: list[dict] = []
+
+    def fake_from_h5ad(src, out, **kwargs):
+        Path(out).write_bytes(b"x" * 1024)
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "benchmarks.comprehensive.benchmarks.grouped_sort._verify_sorted",
+        lambda out, col, n: {"sort_by_ordered_int": 1, "sort_by_rows_kept_int": 1},
     )
-    # The guard is the conditional emission, not the absence of the key: the
-    # grouping arms legitimately still emit it.
-    assert 'if reorder != "sort_by":' in src, (
-        f"{path.name} emits grouped_peak_rss_mb unconditionally again. The "
-        f"sort_by arm must omit it, or the three ceilings' medians shift to "
-        f"include an arm they were never calibrated against."
+    monkeypatch.setattr("pyscx.from_h5ad", fake_from_h5ad)
+
+    def run_arm(reorder):
+        result = BenchmarkResult(
+            benchmark="grouped_sort", format="scx_auto", dataset="fake",
+        )
+        grouped_sort._run_convert(
+            result, f"convert_{reorder}", "one", tmp_path / "src.h5ad",
+            "pert", "ctrl", tmp_path, 1, reorder=reorder, expect_n_obs=10,
+        )
+        return result.runs[0].extra
+
+    sort_extra = run_arm("sort_by")
+    sort_kwargs = calls[-1]
+    group_extra = run_arm("group_by")
+    group_kwargs = calls[-1]
+
+    assert "grouped_peak_rss_mb" not in sort_extra, (
+        f"the sort arm emitted grouped_peak_rss_mb ({sort_extra}); the three "
+        f"ceilings' medians would shift to include an arm they were never "
+        f"calibrated against"
     )
-    assert 'f"wall_s__{scenario}"' in src, (
-        f"{path.name} does not emit a per-scenario wall key; `wall_s` is a "
-        f"reserved add_run parameter and never reaches runs[].extra"
+    assert "grouped_peak_rss_mb" in group_extra, (
+        "the grouping arms must keep emitting it — that is the floored key"
     )
+    # `wall_s` is reserved and never reaches `extra`, so the per-scenario key
+    # is the only gateable timing for this arm.
+    assert "wall_s__convert_sort_by" in sort_extra
+    assert "peak_rss_mb__convert_sort_by" in sort_extra
+    # And the sort really is requested, with a list (a bare str is a pyo3
+    # TypeError) and no group_by.
+    assert sort_kwargs.get("sort_by") == ["pert"]
+    assert "group_by" not in sort_kwargs
+    # And the grouping arms are untouched by the new parameter.
+    assert group_kwargs.get("group_by") == "pert"
+    assert "sort_by" not in group_kwargs
+
+
+def test_sort_by_arm_records_the_verification_it_ran(monkeypatch, tmp_path):
+    """The arm must carry the two verification ints, and they must be gateable.
+
+    Without them the arm records a wall and a peak for a file nothing looked
+    at: a convert that silently ignored `sort_by` would be *faster*, produce a
+    valid file, and pass any `max` ceiling authored on
+    `wall_s__convert_sort_by`.
+    """
+    import pytest as _pytest
+
+    _pytest.importorskip("pyscx")
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    seen = {}
+
+    def fake_verify(out, group_col, expect_n_obs):
+        seen["args"] = (Path(out).name, group_col, expect_n_obs)
+        return {"sort_by_ordered_int": 0, "sort_by_rows_kept_int": 1}
+
+    monkeypatch.setattr(
+        "benchmarks.comprehensive.benchmarks.grouped_sort._verify_sorted",
+        fake_verify,
+    )
+    monkeypatch.setattr(
+        "pyscx.from_h5ad",
+        lambda src, out, **kw: Path(out).write_bytes(b"x" * 1024),
+    )
+
+    result = BenchmarkResult(
+        benchmark="grouped_sort", format="scx_auto", dataset="fake",
+    )
+    grouped_sort._run_convert(
+        result, "convert_sort_by", None, tmp_path / "src.h5ad", "pert", None,
+        tmp_path, 1, reorder="sort_by", expect_n_obs=10,
+    )
+    extra = result.runs[0].extra
+    # A failed verification is recorded as 0, not raised and not omitted — a
+    # floor of `min: 1.0` on it then fails, which is the loud outcome.
+    assert extra["sort_by_ordered_int"] == 0
+    assert extra["sort_by_rows_kept_int"] == 1
+    # It ran against the arm's own output, with the real key and row count.
+    assert seen["args"][1] == "pert" and seen["args"][2] == 10
 
 
 def test_fragment_ops_emits_a_gateable_wall_key_per_operation():
@@ -1589,7 +1676,14 @@ def test_fragment_ops_emits_a_gateable_wall_key_per_operation():
     That is the wrong way round for OPT-FORMAT-1. Four of the five ops commit
     through `commit_in_place` -> `finalize_header_with_checksum`, which streams
     offset 256 -> EOF regardless of how little changed, and `rollback` is the
-    purest instrument for it precisely *because* it does almost nothing else.
+    purest instrument for it precisely *because* it does almost nothing else:
+    measured 2.247 s for a 2.80 GB file, stable to 2 ms.
+
+    `obs_import` is **not** the second-cleanest, though an earlier version of
+    this test said so. Only ~11% of its census wall is the rehash; the rest is
+    the obs-section rewrite. Its key still has to exist — it is the arm nothing
+    else covers — but a floor author reading this test must not be pointed at
+    it for OPT-FORMAT-1.
     """
     import ast
 
@@ -1601,6 +1695,13 @@ def test_fragment_ops_emits_a_gateable_wall_key_per_operation():
         if isinstance(node, ast.keyword) and node.arg == "operation":
             if isinstance(node.value, ast.Constant):
                 ops.add(node.value.value)
+        # Both spellings. `**{"wall_s__append": …}` puts the name in a string
+        # constant; `wall_s__append=…` puts it in the keyword's own `arg`.
+        # Collecting only the first is how this test failed on a review-driven
+        # simplification that was itself correct — the dict-unpacking round
+        # trip was noise for a valid identifier.
+        if isinstance(node, ast.keyword) and (node.arg or "").startswith("wall_s__"):
+            walls.add(node.arg[len("wall_s__"):])
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if node.value.startswith("wall_s__"):
                 walls.add(node.value[len("wall_s__"):])
@@ -1609,12 +1710,17 @@ def test_fragment_ops_emits_a_gateable_wall_key_per_operation():
     missing = sorted(ops - walls)
     assert not missing, (
         f"these {path.name} arms record no gateable wall: {missing}. Add "
-        f"`**{{'wall_s__<op>': round(wall, 6)}}` to their add_run — `wall_s=` "
-        f"alone is invisible to every threshold."
+        f"`wall_s__<op>=round(wall, 6)` to their add_run — `wall_s=` alone is "
+        f"invisible to every threshold."
     )
-    assert "rollback" in walls and "obs_import" in walls, (
-        "the two cleanest OPT-FORMAT-1 instruments (rollback, obs_import) must "
-        f"keep their wall keys; found {sorted(walls)}"
+    assert "rollback" in walls, (
+        f"wall_s__rollback is the OPT-FORMAT-1 instrument and must stay; "
+        f"found {sorted(walls)}"
+    )
+    assert "obs_import" in walls, (
+        f"wall_s__obs_import is the only timing of a key-joined import in the "
+        f"suite (not an OPT-FORMAT-1 signal — ~11% rehash); found "
+        f"{sorted(walls)}"
     )
 
 
@@ -1673,149 +1779,204 @@ def test_scx_cli_probe_has_one_home():
     )
 
 
-#: Every metric name PR-02c's five arms emit, keyed by the module that owns it.
-#:
-#: Pinned because `thresholds.yaml`'s Deferred entries 15-19 spell these names
-#: out in their activation recipes, and a rename would leave those recipes
-#: describing floors that resolve `None` — the "missing metric" outcome, which
-#: is loud, but only after someone has already authored the row and run a
-#: capture. Cheaper to fail here.
-#:
-#: Verified once against the gate's own reader
-#: (`compare_against_baseline._load_current_raw_metric`) on real runs of all
-#: three modules: every one of the twelve resolved a value. This test keeps the
-#: names in place; that check established they are readable at all.
-_PR02C_ARM_METRICS: dict[str, tuple[str, ...]] = {
-    "cellset_gather": (
-        "cellsets_per_sec__collate_rust",
-        "us_per_cell__collate",
-        "peak_rss_mb__collate_rust",
-    ),
-    "ml_loader": (
-        "batches_per_sec__raw_obs_highcard",
-        "batches_per_sec__raw_obs_lowcard",
-        "obs_highcard_overhead_ms_per_batch",
-        "obs_highcard_slowdown_vs_lowcard",
-    ),
-    "grouped_sort": (
-        "peak_rss_mb__convert_sort_by",
-        "wall_s__convert_sort_by",
-        "wall_s__sort_group",
-    ),
-    "fragment_ops": (
-        "wall_s__obs_import",
-        "peak_rss_mb__obs_import",
-        "wall_s__rollback",
-    ),
-    "cloud_metadata": (
-        "wall_s__scx_info_cloud",
-        "scx_info_cloud_ok",
-    ),
-}
+# ---------------------------------------------------------------------------
+# Behavioural: what the arms actually record
+# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("module", sorted(_PR02C_ARM_METRICS))
-def test_new_arm_metric_names_are_still_emitted(module: str):
-    """The arms must keep the metric names their Deferred recipes cite.
+@pytest.fixture(scope="module")
+def composite_key_scx(tmp_path_factory):
+    """A tiny SCX whose only usable join key is a two-column composite.
 
-    Several are built by f-string from a scenario name
-    (`f"peak_rss_mb__{scenario}"`), so the full key never appears as a literal;
-    those are matched through the scenario name plus the prefix pattern.
+    Neither `sample` nor `barcode` is unique, the obs index is duplicated, and
+    the pair is unique — the normal shape on a merged atlas, and what
+    `diagnose_obs_key` reports as `unique_pairs` with an empty
+    `unique_columns`.
+    """
+    import anndata
+    import numpy as np
+    import pandas as pd
+    import pytest as _pytest
+    import scipy.sparse as sp
 
-    **What this pins, exactly: the names, not the wiring.** Three of the five
-    modules derive the key from a different kind of constant — a local
-    (`co_arm = "collate_rust"`), a spec dict's keys
-    (`_OBS_CARDINALITY_SPEC`), an argument at the `_run_convert` call site — so
-    there is no single AST shape that means "this name is live". An attempt to
-    require the scenario name to appear *as an argument to an arm runner*
-    failed two modules that were perfectly correct, which is the signal that
-    the proxy was wrong rather than the code.
+    pyscx = _pytest.importorskip("pyscx")
+    n = 8
+    obs = pd.DataFrame(
+        {
+            "sample": ["s1"] * 4 + ["s2"] * 4,
+            "barcode": ["b1", "b2", "b3", "b4"] * 2,
+        },
+        index=["c1", "c2", "c3", "c4"] * 2,
+    )
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.arange(n * 3, dtype="float32").reshape(n, 3)),
+        obs=obs,
+        var=pd.DataFrame(index=["g1", "g2", "g3"]),
+    )
+    out = tmp_path_factory.mktemp("composite") / "composite.scx"
+    pyscx.from_anndata(adata, str(out))
+    return out
 
-    The complementary check is empirical and was run once, outside the suite:
-    each of these twelve names was resolved through the gate's own reader,
-    `compare_against_baseline._load_current_raw_metric`, against real runs of
-    `cellset_gather`, `fragment_ops` and `grouped_sort` — all twelve returned a
-    value. That established they are readable; this test keeps them from being
-    renamed out from under `thresholds.yaml`.
+
+def test_obs_import_arm_handles_a_composite_only_join_key(composite_key_scx, tmp_path):
+    """A file whose only unique key is a *pair* must not be refused.
+
+    An earlier version required `diagnose_obs_key`'s `unique_columns` to be
+    non-empty and raised otherwise, so it rejected every merged atlas whose
+    only usable key is a two-column composite. A reviewer reproduced it on a
+    four-row fixture. It also would have mishandled `suggestion`, which renders
+    a pair as one comma-joined string that `key=` cannot take.
+
+    On this fixture `diagnose_obs_key` reports `unique_columns == []` and
+    `unique_pairs == [["barcode", "sample"], ["obs_names", "sample"]]`.
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    from benchmarks.comprehensive.benchmarks import fragment_ops
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    diag = pyscx.diagnose_obs_key(str(composite_key_scx))
+    assert not diag["unique_columns"], "premise: no single column is unique here"
+    assert diag["unique_pairs"], "premise: a pair is"
+
+    resolved = fragment_ops._resolve_obs_join_key(composite_key_scx)
+    assert len(resolved) == 2, f"expected a two-column key, got {resolved}"
+
+    result = BenchmarkResult(
+        benchmark="fragment_ops", format="scx_auto", dataset="composite",
+    )
+    fragment_ops._run_obs_import(result, composite_key_scx, tmp_path, n_runs=1)
+
+    assert len(result.runs) == 1
+    extra = result.runs[0].extra
+    # The premise the arm asserts internally: every source row landed.
+    assert extra["n_matched"] == 8
+    assert extra["rows_imported"] == 8
+    assert extra["obs_join_key"] == ",".join(resolved)
+    # And the gateable keys are there, top-level in `extra`.
+    assert extra["wall_s__obs_import"] > 0
+    assert extra["peak_rss_mb__obs_import"] > 0
+    # `obs_rewrite_bytes` is the term that dominates this arm's wall at scale;
+    # it must be the obs table, not the one added column.
+    assert extra["obs_rewrite_bytes"] > 0
+
+
+def test_ml_loader_derived_obs_metrics_ride_existing_runs(monkeypatch):
+    """The derived cardinality metrics must not arrive on a phantom run.
+
+    An earlier version appended a `wall_s=0.0, peak_rss_mb=0.0` bookkeeping
+    record and claimed it "cannot perturb the pooled medians any further than
+    the two timed arms already do". That is arithmetically false —
+    `median_wall_s` / `median_rss_mb` and `capture_baseline._median_rss` take
+    a median over *every* run, so a 0.0/0.0 sample drags both down, widens
+    `wall_s_iqr` and bumps `n_runs`. All three reviewers flagged it; one
+    measured a four-run loader median 11.5 -> 11.0 with triple the IQR.
+
+    Checked on the source rather than by running a census epoch: the defect is
+    entirely in which record the values land on.
     """
     import ast
 
-    tree, path = _bench_ast(module)
+    tree, path = _bench_ast("ml_loader")
     src = path.read_text()
 
-    literals = {
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
-    }
-
-    missing = []
-    for metric in _PR02C_ARM_METRICS[module]:
-        if metric in literals:
-            continue
-        prefix, _, scenario = metric.rpartition("__")
-        if scenario in literals and f'f"{prefix}__{{' in src:
-            continue
-        missing.append(metric)
-
-    assert not missing, (
-        f"{path.name} no longer emits {missing}. These names are cited by "
-        f"thresholds.yaml's Deferred floors (items 15-19); renaming one leaves "
-        f"its activation recipe describing a floor that resolves None. Rename "
-        f"in both places, or here first."
+    assert "run_rec.extra.update(derived)" in src, (
+        f"{path.name} no longer attaches the derived obs metrics to existing "
+        f"runs; a separate add_run would perturb the pooled medians"
     )
 
-
-def test_obs_import_arm_resolves_its_join_key_instead_of_assuming_one():
-    """The obs index is not always unique, so the arm must not assume it.
-
-    The first version of this arm hard-coded `key="obs_names"`. It passed at
-    pbmc3k, whose 2700 barcodes are distinct, and failed at census_1m with
-
-        duplicate obs join key(s): target obs key 'obs_names' contains
-        duplicates: ["0", "1", "2", "3", "4"]. key 'obs_names' has 100000
-        distinct values over 1000000 rows. Obs columns that ARE unique and can
-        key a join: ["soma_joinid"]. Try key = soma_joinid.
-
-    The CELLxGENE export duplicates its obs index 10x. `diagnose_obs_key`'s own
-    docstring names this exact fixture, and it is the API for the job — so the
-    key is resolved per file. `soma_joinid` is the *right* answer here, which is
-    the mirror image of the `ml_loader` arm above, where it is the wrong one:
-    unique enough to key a join, and an int64 that rebuilds no category list.
-
-    A pbmc3k-only smoke could not have caught this, which is the general point:
-    a fixture that satisfies an assumption cannot test it.
-    """
-    import ast
-
-    tree, path = _bench_ast("fragment_ops")
-    src = path.read_text()
-
-    assert _calls_named(tree, "diagnose_obs_key"), (
-        f"{path.name} no longer calls pyscx.diagnose_obs_key; the obs_import "
-        f"arm would be assuming a join key again"
-    )
-
-    # `key=` must come from the resolved value, never from a literal. A literal
-    # is what reintroduces the bug.
-    literal_keys = [
+    # No `add_run(wall_s=0.0, ...)` anywhere in this module.
+    phantoms = [
         node.lineno
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
-        and str(getattr(node.func, "attr", "")) == "obs_import"
+        and str(getattr(node.func, "attr", "")) == "add_run"
         for kw in node.keywords
-        if kw.arg == "key"
+        if kw.arg == "wall_s"
         and isinstance(kw.value, ast.Constant)
+        and kw.value.value == 0.0
     ]
-    assert not literal_keys, (
-        f"{path.name} passes a literal `key=` to obs_import at lines "
-        f"{literal_keys}. Resolve it with diagnose_obs_key — the obs index is "
-        f"10x-duplicated on the census fixtures."
+    assert not phantoms, (
+        f"{path.name} adds a zero-wall run at lines {phantoms}; that is a "
+        f"synthetic measurement in a pooled median, not bookkeeping"
     )
 
-    # And the two sides are paired explicitly rather than relying on both
-    # resolving the same name, since the CSV's column need not be the target's.
-    assert "source_key=[source_key]" in src, (
-        f"{path.name} no longer pairs the CSV's key column with the target's "
-        f"via source_key=; the two sides can then silently disagree"
+
+def test_obs_cardinality_arm_verifies_categoricalness_against_the_file():
+    """The arm's premise is a *dictionary* column, so it must probe for one.
+
+    Checking only that the column name exists lets a fixture reconvert keep
+    the name while storing an `Int64` — which sends `obs_to_pydict` down the
+    `PyArray1::from_vec` branch, so the arm runs, emits its metrics, and
+    measures nothing. The declared category counts were also hard-coded into
+    `runs[].extra`, describing the fixture as it was rather than as it is.
+    """
+    tree, path = _bench_ast("ml_loader")
+    src = path.read_text()
+
+    assert _calls_named(tree, "obs_categorical"), (
+        f"{path.name} no longer probes obs_categorical; presence of the column "
+        f"name does not establish it is a dictionary column"
     )
+    assert "obs_n_categories=n_categories" in src, (
+        f"{path.name} must record the OBSERVED category count"
+    )
+    assert "obs_n_categories_declared=declared" in src, (
+        f"{path.name} should keep the declared count beside the observed one "
+        f"so drift is visible rather than silent"
+    )
+
+
+def test_verify_sorted_tells_a_sorted_output_from_an_unsorted_one(tmp_path):
+    """The sort verification has to discriminate, not just return 1.
+
+    Driven on real converts of one 60-row source, because the whole point is
+    that a convert which *ignored* `sort_by` produces a valid file: the
+    regression is invisible in the output's shape, size or wall — it is only
+    visible in the order. So the reject side is a plain `from_h5ad` with no
+    `sort_by`, which is exactly what that regression would look like.
+    """
+    import pytest as _pytest
+
+    pyscx = _pytest.importorskip("pyscx")
+    anndata = _pytest.importorskip("anndata")
+    np = _pytest.importorskip("numpy")
+    pd = _pytest.importorskip("pandas")
+    sp = _pytest.importorskip("scipy.sparse")
+
+    from benchmarks.comprehensive.benchmarks import grouped_sort
+
+    n = 60
+    rng = np.random.default_rng(0)
+    obs = pd.DataFrame(
+        {"pert": pd.Categorical(rng.choice(["c", "a", "b"], n))},
+        index=[f"cell{i}" for i in range(n)],
+    )
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.random((n, 5), dtype="float32")),
+        obs=obs,
+        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+    )
+    src = tmp_path / "s.h5ad"
+    adata.write_h5ad(src)
+
+    sorted_out = tmp_path / "sorted.scx"
+    pyscx.from_h5ad(str(src), str(sorted_out), sort_by=["pert"])
+    plain_out = tmp_path / "plain.scx"
+    pyscx.from_h5ad(str(src), str(plain_out))
+
+    good = grouped_sort._verify_sorted(sorted_out, "pert", n)
+    assert good == {"sort_by_ordered_int": 1, "sort_by_rows_kept_int": 1}
+
+    # The regression the arm exists to catch: same source, no `sort_by`.
+    ignored = grouped_sort._verify_sorted(plain_out, "pert", n)
+    assert ignored["sort_by_ordered_int"] == 0, (
+        "a convert that ignored sort_by scored as ordered; the verification "
+        "cannot see the one regression that would read as a speedup"
+    )
+    assert ignored["sort_by_rows_kept_int"] == 1, "no rows were lost, so this half is 1"
+
+    # And the row-count half discriminates on its own.
+    short = grouped_sort._verify_sorted(sorted_out, "pert", n + 1)
+    assert short["sort_by_rows_kept_int"] == 0

@@ -51,7 +51,11 @@ only those::
 
 Two spellings, because both were already being written before either was read:
 a file-level ``metrics:`` list, and a per-entry ``metric:`` naming one metric
-for that triple alone. A triple's effective scope is the union of the two, and a
+for that triple alone. **Both keys are accepted at both levels** — a
+``metrics:`` inside a triple entry and a ``metric:`` at the top level work too.
+Rejecting one spelling per level would reintroduce the failure this field
+exists to end: a scope that is silently ignored falls open to whole-triple
+suppression, and that is exactly how 16 floors became unenforceable. A triple's effective scope is the union of the two, and a
 triple named *without* either keeps the whole-triple default. Where two files
 name the same triple, the scopes union, and an unscoped file wins (the widest
 claim holds).
@@ -140,6 +144,18 @@ def _coerce_date(value: Any) -> _dt.date | None:
             return None
         return _dt.date.fromisoformat(v)
     raise ValueError(f"unsupported type for 'expires': {type(value).__name__}")
+
+
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    """First of *keys* present in *mapping*, else ``None``.
+
+    Lets `metric:` and `metrics:` be accepted at both the file and entry level
+    without either spelling being the one that silently does nothing.
+    """
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return None
 
 
 def _coerce_metrics(path: Path, value: Any) -> MetricScope:
@@ -250,7 +266,15 @@ def parse_justification(path: Path) -> Justification | None:
     except ValueError as exc:
         raise ValueError(f"{path}: {exc}") from exc
 
-    file_metrics = _coerce_metrics(path, data.get("metrics"))
+    # Both spellings, at both levels. The singular reads better on one entry and
+    # the plural on a file, but accepting only one of each is how this field
+    # came to be silently ignored in the first place: four committed files
+    # wrote a per-entry `metric:` that the parser dropped, and 16 absolute
+    # floors went unenforceable behind it. A misspelled scope must not fail
+    # open into whole-triple suppression.
+    file_metrics = _coerce_metrics(
+        path, _first_present(data, "metrics", "metric")
+    )
 
     triples: list[Triple] = []
     scopes: dict[Triple, MetricScope] = {}
@@ -275,7 +299,9 @@ def parse_justification(path: Path) -> Justification | None:
         # `metrics:` applies to every triple. Both were already being written
         # by committed files before either was honoured, so both are read, and
         # a triple named twice gets the union.
-        entry_metrics = _coerce_metrics(path, entry.get("metric"))
+        entry_metrics = _coerce_metrics(
+            path, _first_present(entry, "metric", "metrics")
+        )
         scope = _entry_scope(file_metrics, entry_metrics)
         if triple in scopes:
             scope = _widen(scopes[triple], scope)
