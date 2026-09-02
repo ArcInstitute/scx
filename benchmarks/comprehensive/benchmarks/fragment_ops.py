@@ -41,14 +41,12 @@ That matters here more than elsewhere, because four of these five ops
 **``wall_s__rollback`` and ``wall_s__delete`` are the clean instruments for
 that**; ``wall_s__obs_import`` is not. Measured, 2 runs each:
 
-===============  ==================  ====================  ==============
-metric           pbmc3k (4.5 MB)     census_1m (2.80 GB)   census/pbmc3k
-===============  ==================  ====================  ==============
-``rollback``     0.0047 s            **2.247 s**           478x
-``delete``       0.0067 s            1.727 s               258x
-``obs_import``   0.0244 s            19.72 s               808x
-``compact``      2.514 s             (minutes)             —
-===============  ==================  ====================  ==============
+    metric              pbmc3k (4.5 MB)   census_1m (2.80 GB)
+    wall_s__rollback             0.0047                 2.247
+    wall_s__delete               0.0067                 1.727
+    wall_s__obs_import           0.0244                19.72
+    wall_s__append               0.0158                25.61
+    wall_s__compact              2.514                 (minutes, ~50 GB read)
 
 A rollback is one 4 KB pwrite, two fsyncs and the rehash, so its census figure
 is 2.80 GB at ~1.25 GB/s — essentially all checksum extent, and stable to
