@@ -189,24 +189,36 @@ def _row_count(mtx_dir: Path) -> int:
     raise RuntimeError(f"{mtx_dir}/matrix.mtx.gz has no dimensions line")
 
 
-def _timed_to_mtx(scx_path: Path, out_dir: Path) -> tuple[float, float]:
+def _timed_to_mtx(scx_path: Path, out_dir: Path) -> tuple[float, float, float]:
+    """`(wall_s, peak_rss_mb, entry_rss_mb)`.
+
+    The entry reading is taken **here**, after `gc.collect()` and immediately
+    before `PeakRssSampler` seeds itself, so `peak - entry` is the op's own
+    allocation against the same baseline the sampler used. Taking it in the
+    caller instead — before this function's `gc.collect()` — compares a pre-GC
+    number against a post-GC seed and can go negative. `build_csc` gets this
+    ordering right; this module did not until review caught the asymmetry.
+    """
     import pyscx
 
     gc.collect()
+    entry = current_rss_mb()
     t0 = time.perf_counter()
     with PeakRssSampler() as sampler:
         pyscx.to_mtx(str(scx_path), str(out_dir))
-    return time.perf_counter() - t0, sampler.peak_mb
+    return time.perf_counter() - t0, sampler.peak_mb, entry
 
 
-def _timed_from_mtx(mtx_dir: Path, scx_out: Path) -> tuple[float, float]:
+def _timed_from_mtx(mtx_dir: Path, scx_out: Path) -> tuple[float, float, float]:
+    """`(wall_s, peak_rss_mb, entry_rss_mb)` — see :func:`_timed_to_mtx`."""
     import pyscx
 
     gc.collect()
+    entry = current_rss_mb()
     t0 = time.perf_counter()
     with PeakRssSampler() as sampler:
         pyscx.from_mtx(str(mtx_dir), str(scx_out))
-    return time.perf_counter() - t0, sampler.peak_mb
+    return time.perf_counter() - t0, sampler.peak_mb, entry
 
 
 def run(
@@ -271,8 +283,7 @@ def run(
         for i in range(n_runs):
             out_dir = workdir / f"mtx_{i}"
             out_dir.mkdir()
-            entry_rss = current_rss_mb()
-            wall, peak = _timed_to_mtx(converted_path, out_dir)
+            wall, peak, entry_rss = _timed_to_mtx(converted_path, out_dir)
             mtx_bytes = sum(p.stat().st_size for p in out_dir.iterdir())
             header = _read_header(out_dir)
             header_integer = 1.0 if " integer " in f" {header} " else 0.0
@@ -311,25 +322,31 @@ def run(
         deleted_scx = workdir / "deleted.scx"
         shutil.copy2(converted_path, deleted_scx)
         rng = np.random.default_rng(RANDOM_SEED)
-        n_delete = max(1, int(dataset.n_obs * _DELETE_FRACTION))
-        idx = rng.choice(dataset.n_obs, size=n_delete, replace=False)
+        # `source_shape[0]`, not `dataset.n_obs`: the round-trip check above
+        # already decided the config figure is not what to compare against, and
+        # the same reasoning applies harder here — `mark_deleted` indexes the
+        # file's obs space, so a config that drifted from the fixture would
+        # delete the wrong rows and then compare the result to the drifted
+        # number. Found by review (Cursor Agent, Antigravity).
+        source_n_obs = source_shape[0]
+        n_delete = max(1, int(source_n_obs * _DELETE_FRACTION))
+        idx = rng.choice(source_n_obs, size=n_delete, replace=False)
         pyscx.mark_deleted(str(deleted_scx), [int(v) for v in idx])
         # Exported once, not `n_runs` times: this arm checks the row count the
         # keep-mask path writes, not a stable timing, and at tabula scale each
         # export costs ~11 minutes.
         out_dir = workdir / "mtx_del"
         out_dir.mkdir()
-        entry_rss = current_rss_mb()
-        wall, peak = _timed_to_mtx(deleted_scx, out_dir)
+        wall, peak, entry_rss = _timed_to_mtx(deleted_scx, out_dir)
         rows = _row_count(out_dir)
         # Compared, not merely recorded. An export that ignored the deletion
         # vector would otherwise write a normal successful result — the exact
         # assumption this arm was added to stop making.
-        expected_rows = dataset.n_obs - n_delete
+        expected_rows = source_n_obs - n_delete
         if rows != expected_rows:
             raise RuntimeError(
                 f"to_mtx wrote {rows} rows after marking {n_delete} of "
-                f"{dataset.n_obs} cells deleted; expected {expected_rows}. "
+                f"{source_n_obs} cells deleted; expected {expected_rows}. "
                 f"The keep mask was not applied."
             )
         result.add_run(
@@ -357,8 +374,7 @@ def run(
         assert exported is not None
         for i in range(n_runs):
             scx_out = workdir / f"from_mtx_{i}.scx"
-            entry_rss = current_rss_mb()
-            wall, peak = _timed_from_mtx(exported, scx_out)
+            wall, peak, entry_rss = _timed_from_mtx(exported, scx_out)
             exp = pyscx.open(str(scx_out))
             try:
                 shape = (exp.n_obs, exp.n_vars)

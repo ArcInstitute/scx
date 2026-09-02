@@ -14,7 +14,7 @@ clock, and basic output-equality metadata for each path:
   triplet.
 
 Output equality between the two paths is measured at the "structural"
-level (n_obs / n_vars / nnz / catalog shard_count / n_csc_shards).
+level (n_obs / n_vars / nnz / catalog shard_count / has_csc).
 Bit-level equality is asserted in the Rust round-trip test
 `scx-convert/src/tests.rs::streaming_round_trip_matches_non_streaming`;
 the benchmark only needs to flag drift, not characterise it.
@@ -35,12 +35,10 @@ is comparable, and each gets `<label>_peak_rss_mb` / `<label>_wall_s` from the
 same f-string the base arms use — no separate emission path, and no chance of an
 extra arm polluting the floored `streaming_peak_rss_mb` key.
 
-⚠️ **The extra arms run on the default path only.** Setting
-`SCX_CONV_STREAM_THREAD_COUNTS` routes through `_run_with_thread_scaling`, which
-sweeps `streaming` and `materialize` and does not run them — the sweep exists to
-compare how those two scale with thread count, and neither extra arm varies along
-that axis. `run()` records `extra_arms_skipped_reason` in that mode so the
-absence is stated rather than inferred from a missing key.
+Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms are **not** swept — neither
+varies along the thread axis, since each changes a conversion option — but they
+still run **once** at `GATED_READER_THREADS` before the sweep, so a sweep capture
+does not silently lose the non-default coverage.
 
 Thread scaling is opt-in via the `SCX_CONV_STREAM_THREAD_COUNTS` env
 var (comma-separated, e.g. `1,2,4,8,16,32`). When set, each thread
@@ -173,35 +171,35 @@ _EXTRA_ARMS: dict[str, tuple[dict[str, object], frozenset[str]]] = {
 def _structural_summary(scx_path: Path) -> dict[str, int]:
     """Structural fingerprint of an output, for cross-path equality.
 
-    Returns `n_obs` / `n_vars` / `nnz` / `shard_count` / `n_csc_shards`. Bit-level
+    Returns `n_obs` / `n_vars` / `nnz` / `shard_count` / `has_csc`. Bit-level
     equality is asserted in the Rust tests — see Phase 8; this only needs to
     flag drift.
 
-    `n_csc_shards` is here for the `csc_always` arm and doubles as its premise
-    check: if that arm reports 0 it converted without building a sidecar, and its
-    wall and peak measured the default path under the wrong label. It is 0 on
+    `has_csc` is here for the `csc_always` arm and is the premise `_run_isolated`
+    enforces: if that arm reports 0 it converted without building a sidecar, and
+    its wall and peak measured the default path under the wrong label. It is 0 on
     every other arm, so adding it does not change the streaming-vs-materialize
     equality above.
 
-    (The docstring claimed `n_csr_shards` / `n_csc_shards` before this change
-    while the body returned neither name — `shard_count` and nothing.)
+    It reads the header flag. An earlier version counted `X_csc_shard_*` sections
+    out of `reader.validate()`, which verifies the whole-file checksum and then
+    BLAKE3-hashes **every section payload** — a full-file hash on every extra-arm
+    run, to answer a question consumed as a boolean. `build_csc` had the same
+    call and it was replaced there first; this was the other half of that finding.
+
+    (The docstring claimed `n_csr_shards` / `n_csc_shards` before an earlier
+    change while the body returned neither name — `shard_count` and nothing.)
     """
     import pyscx
 
     reader = pyscx.open(str(scx_path))
     try:
-        n_csc = 0
-        if reader.has_csc:
-            n_csc = sum(
-                1 for name, _ in reader.validate()
-                if name.startswith("X_csc_shard_")
-            )
         return {
             "n_obs": int(reader.n_obs),
             "n_vars": int(reader.n_vars),
             "nnz": int(reader.nnz),
             "shard_count": int(reader.shard_count),
-            "n_csc_shards": n_csc,
+            "has_csc": int(bool(reader.has_csc)),
         }
     finally:
         close = getattr(reader, "close", None)
@@ -474,12 +472,31 @@ def run(
     if format_variant is not None and format_variant.key != "scx_auto":
         return None  # type: ignore[return-value]
 
+    thread_counts = _parse_thread_counts(os.environ.get(_THREAD_COUNTS_ENV))
+
+    # Refuse a sweep above the materialize cap BEFORE resolving the input,
+    # mirroring `export_streaming.run`. The refusal does not depend on a fixture
+    # being on disk, and putting it after the existence check made the shared
+    # `test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped`
+    # parametrisation fail on this half with `FileNotFoundError` instead of the
+    # `ValueError` it asserts — a pre-existing asymmetry between the two
+    # modules, since `export_streaming` hoisted its guard and this one did not.
+    # Found by review (Antigravity - Gemini 3.7 Flash).
+    if thread_counts is not None and _skip_materialize_reason(dataset.n_obs):
+        raise ValueError(
+            f"{_THREAD_COUNTS_ENV} is set on a dataset with n_obs="
+            f"{dataset.n_obs:,}, where the materialize arm is skipped "
+            f"({_skip_materialize_reason(dataset.n_obs)}). A thread-scaling run "
+            f"compares the two arms, so it needs both: either use a dataset at "
+            f"or below n_obs={MATERIALIZE_MAX_N_OBS:,}, or unset "
+            f"{_THREAD_COUNTS_ENV}."
+        )
+
     h5ad_path = dataset.h5ad_path
     if not h5ad_path.exists():
         raise FileNotFoundError(f"Source h5ad not found: {h5ad_path}")
 
     source_bytes = h5ad_path.stat().st_size
-    thread_counts = _parse_thread_counts(os.environ.get(_THREAD_COUNTS_ENV))
 
     log.info(
         "Streaming conversion benchmark: dataset=%s source=%.1f MB n_runs=%d "
@@ -516,28 +533,13 @@ def run(
             h5ad_path, n_runs, result, skip_materialize, dataset.name,
         )
 
-    # The sweep path below runs `streaming` and `materialize` only. Say so in the
-    # result rather than leaving a reader to infer it from absent keys — the
-    # module docstring documents the same limitation.
+    # The sweep-above-the-cap refusal is hoisted above input resolution near the
+    # top of this function, so there is deliberately no second copy here.
     result.metadata["extra_arms"] = []
-    result.metadata["extra_arms_skipped_reason"] = (
-        f"{_THREAD_COUNTS_ENV} is set, so the thread-scaling path runs; it "
-        f"sweeps streaming vs materialize and does not run the "
-        f"{sorted(_EXTRA_ARMS)} arms, neither of which varies with thread count."
+    _run_extra_arms_once(h5ad_path, result, dataset.name)
+    return _run_with_thread_scaling(
+        h5ad_path, n_runs, thread_counts, result, dataset.name
     )
-    if skip_materialize:
-        # Thread scaling exists to compare how the two arms scale, so dropping
-        # one silently would make its output meaningless — and running a ~136 GB
-        # arm the operator did not know they asked for is worse. Refuse and say
-        # which knob to change.
-        raise ValueError(
-            f"{_THREAD_COUNTS_ENV} is set on a dataset with n_obs="
-            f"{dataset.n_obs:,}, where the materialize arm is skipped "
-            f"({skip_materialize}). A thread-scaling run compares the two arms, "
-            f"so it needs both: either use a dataset at or below "
-            f"n_obs={MATERIALIZE_MAX_N_OBS:,}, or unset {_THREAD_COUNTS_ENV}."
-        )
-    return _run_with_thread_scaling(h5ad_path, n_runs, thread_counts, result)
 
 
 def _run_isolated(
@@ -631,13 +633,35 @@ def _run_isolated(
     # having timed the default conversion under the CSC label. Nothing reads
     # `metadata`, so storing `n_csc_shards` there was not a check.
     if "csc_always" in applicable_extras:
-        n_csc = (structural.get("csc_always") or {}).get("n_csc_shards")
-        if not n_csc:
+        has_csc = (structural.get("csc_always") or {}).get("has_csc")
+        if not has_csc:
             raise RuntimeError(
-                f"the csc_always arm produced n_csc_shards={n_csc!r}: "
+                f"the csc_always arm produced has_csc={has_csc!r}: "
                 f"`csc=\"always\"` did not reach `from_h5ad`, so the arm timed "
                 f"the default conversion under the CSC label. Refusing to "
                 f"record it."
+            )
+
+    # The same premise for the index arm, which had none: a conversion that
+    # accepted `index_preset` and ignored it would emit
+    # `index_preset_cellxgene_peak_rss_mb` and pass, having measured the default
+    # path. There is no `has_obs_index` on `Experiment`, so the observable effect
+    # is the one used: writing the preset's index sections makes the output
+    # strictly larger than the default arm's, same input and same codec.
+    # (Measured on pbmc3k, where the preset's columns are absent and no index is
+    # written: 4,379,713 B against the default arm's 4,379,851 B — smaller, by a
+    # provenance string. That is the shape this catches.)
+    # Found by review (codex - gpt-5.6-terra).
+    if "index_preset_cellxgene" in applicable_extras:
+        indexed = result.metadata.get("index_preset_cellxgene_output_bytes")
+        plain = result.metadata.get("streaming_output_bytes")
+        if indexed is not None and plain is not None and indexed <= plain:
+            raise RuntimeError(
+                f"the index_preset_cellxgene arm wrote {indexed} bytes against "
+                f"the default arm's {plain}: no predicate-index sections were "
+                f"emitted, so `index_preset=\"cellxgene\"` did not take effect "
+                f"and the arm timed the default conversion. Refusing to record "
+                f"it."
             )
 
     result.metadata["gated_reader_threads"] = GATED_READER_THREADS
@@ -658,11 +682,54 @@ def _run_isolated(
     return result
 
 
+def _run_extra_arms_once(
+    h5ad_path: Path,
+    result: BenchmarkResult,
+    dataset_name: str | None,
+) -> None:
+    """Run each in-scope `_EXTRA_ARMS` entry once at `GATED_READER_THREADS`.
+
+    Used by the thread-scaling path, which sweeps `streaming` vs `materialize`
+    and has no reason to sweep these — neither arm varies along the thread axis;
+    each changes a *conversion option*. Documenting the omission was not enough:
+    a sweep run would silently carry none of the non-default coverage the arms
+    exist to provide. Found by review (codex - gpt-5.6-terra).
+
+    One run each, not `n_runs`: the sweep is already the expensive path, and
+    these are here for coverage rather than for a median.
+    """
+    for label, (kwargs, datasets) in _EXTRA_ARMS.items():
+        if dataset_name not in datasets:
+            continue
+        records = _run_arm_subprocess(
+            h5ad_path, 1, "streaming",
+            reader_threads=GATED_READER_THREADS, extra_kwargs=kwargs,
+        )
+        for rec in records:
+            result.add_run(
+                wall_s=rec["wall_s"],
+                peak_rss_mb=rec["peak_rss_mb"],
+                **{
+                    "scenario": label,
+                    "run_idx": rec["run_idx"],
+                    "reader_threads": GATED_READER_THREADS,
+                    f"{label}_peak_rss_mb": rec["peak_rss_mb"],
+                    f"{label}_wall_s": rec["wall_s"],
+                    "from_h5ad_kwargs": ", ".join(
+                        f"{k}={v!r}" for k, v in kwargs.items()
+                    ),
+                },
+            )
+        result.metadata.setdefault("extra_arms", []).append(label)
+        log.info("  %s (thread-sweep companion run) recorded", label)
+
+
 def _run_with_thread_scaling(
     h5ad_path: Path,
     n_runs: int,
     thread_counts: list[int],
     result: BenchmarkResult,
+    dataset_name: str | None = None,
 ) -> BenchmarkResult:
     """Thread-scaling path: for each thread count in `thread_counts`,
     spawn a subprocess with `RAYON_NUM_THREADS={count}` and run paired

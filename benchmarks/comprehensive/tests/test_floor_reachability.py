@@ -397,19 +397,22 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
         def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
                      reader_threads=None, extra_kwargs=None):
             calls.append((scenario, reader_threads, extra_kwargs))
-            # A worker that honoured `csc="always"` reports a sidecar. The
-            # parent now *raises* when the csc arm reports none, so the mock has
-            # to model that faithfully or the happy path fails for the wrong
-            # reason — and the guard's own red case is asserted separately below.
-            built_csc = bool((extra_kwargs or {}).get("csc"))
+            # The parent now raises when an extra arm shows no output effect,
+            # so the mock has to model a worker that honoured its kwargs — or
+            # the happy path fails for the wrong reason. Each guard's own red
+            # case is asserted separately below.
+            kw = extra_kwargs or {}
             return [{
                 "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
                 "peak_rss_mb": 123.0, "reader_threads": reader_threads,
                 "structural": {
                     "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
-                    "n_csc_shards": 7 if built_csc else 0,
+                    "has_csc": 1 if kw.get("csc") else 0,
                 },
-                "output_bytes": 10,
+                # An index preset that took effect writes more bytes than the
+                # default arm; that difference is the observable the parent
+                # checks, since `Experiment` exposes no `has_obs_index`.
+                "output_bytes": 20 if kw.get("index_preset") else 10,
             }]
 
         original = cs._run_arm_subprocess
@@ -511,6 +514,82 @@ def test_mtx_export_is_scoped_out_of_the_census_tiers():
     )
 
 
+def _pbmc3k_mtx_args():
+    """`(dataset, format_variant, converted_path)` for a real `mtx_export.run`.
+
+    pbmc3k is 2.3M non-zeros; a full export/ingest cycle is a few seconds.
+    """
+    from benchmarks.comprehensive.config import ALL_FORMATS, DATASETS
+
+    ds = DATASETS["pbmc3k"]
+    fmt = next(f for f in ALL_FORMATS if f.key == "scx_auto")
+    if not ds.scx_auto_path.exists():
+        pytest.skip(f"fixture not staged: {ds.scx_auto_path}")
+    return ds, fmt, ds.scx_auto_path
+
+
+def test_mtx_deletion_arm_refuses_an_export_that_ignored_the_keep_mask():
+    """The row-count comparison has to be a *test*, not a one-off measurement.
+
+    Round 1 found that the deletion arm recorded `mtx_rows_written` and compared
+    it to nothing, so an export ignoring the deletion vector wrote a normal
+    successful result. Round 2 pointed out that the fix shipped with the raise
+    but no test — the production `if` could be deleted again and the suite would
+    stay green. Found by review (codex - gpt-5.6-terra, Cursor Agent - Grok 4.6
+    High).
+
+    The mutant is an export that drops nothing: `_row_count` reporting the full
+    obs count after cells were marked deleted.
+    """
+    from benchmarks.comprehensive.benchmarks import mtx_export as mx
+
+    ds, fmt, converted = _pbmc3k_mtx_args()
+    original = mx._row_count
+    try:
+        mx._row_count = lambda out_dir: ds.n_obs
+        with pytest.raises(RuntimeError, match="keep mask was not applied"):
+            mx.run(dataset=ds, format_variant=fmt, n_runs=1,
+                   converted_path=converted)
+    finally:
+        mx._row_count = original
+
+
+def test_mtx_roundtrip_refuses_an_ingest_that_lost_an_entry():
+    """Same for the round-trip shape/nnz comparison.
+
+    The mutant is an ingest that silently drops one non-zero — patched at the
+    reopen rather than by corrupting a file, so the test exercises the
+    comparison itself and stays a few seconds long.
+    """
+    from benchmarks.comprehensive.benchmarks import mtx_export as mx
+
+    pyscx = pytest.importorskip("pyscx")
+    ds, fmt, converted = _pbmc3k_mtx_args()
+    src = str(converted)
+    real_open = pyscx.open
+
+    class _Lossy:
+        """Reports one fewer non-zero than the file holds."""
+
+        def __init__(self, exp):
+            self._exp = exp
+
+        def __getattr__(self, name):
+            value = getattr(self._exp, name)
+            return value - 1 if name == "nnz" else value
+
+    try:
+        # Truthful for the source read; lossy for the re-imported output.
+        pyscx.open = lambda path: (
+            real_open(path) if str(path) == src else _Lossy(real_open(path))
+        )
+        with pytest.raises(RuntimeError, match="round-trip changed the matrix"):
+            mx.run(dataset=ds, format_variant=fmt, n_runs=1,
+                   converted_path=converted)
+    finally:
+        pyscx.open = real_open
+
+
 def test_csc_always_arm_refuses_a_result_with_no_sidecar():
     """The `csc_always` premise is enforced, not merely recorded.
 
@@ -533,7 +612,7 @@ def test_csc_always_arm_refuses_a_result_with_no_sidecar():
             "peak_rss_mb": 123.0, "reader_threads": reader_threads,
             "structural": {
                 "n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1,
-                "n_csc_shards": 0,
+                "has_csc": 0,
             },
             "output_bytes": 10,
         }]
