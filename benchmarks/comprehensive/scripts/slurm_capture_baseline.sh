@@ -9,7 +9,7 @@
 # queue rather than from a head node.
 #
 # Usage:
-#     # Default: "full" tier on cpu_preemptible.
+#     # Default: "full" tier.
 #     sbatch benchmarks/comprehensive/scripts/slurm_capture_baseline.sh
 #
 #     # Small tier (D1-D4 only) — fast sanity check.
@@ -18,13 +18,29 @@
 #     # XL tier (includes census_5m) — routes to cpu_high_mem.
 #     sbatch benchmarks/comprehensive/scripts/slurm_capture_baseline.sh --tier xl
 #
+# The orchestrator's own sizing is the two #SBATCH lines below, and SLURM lets a
+# command-line flag override an in-file directive — `#SBATCH` itself cannot read
+# a shell variable, so that is the only way to change them per run:
+#
+#     sbatch --partition=cpu_preemptible --time=08:00:00 <this script> --tier small
+#
+# GPU *cells* are sized separately and ignore both this partition and
+# `--partition`: set `SCX_BENCH_GPU_PARTITION` (see `config.GPU_PARTITION`).
+#
+# WHY 48 h AND NOT PREEMPTIBLE. The last two tier-full captures took 12.94 h and
+# 6.40 h wall (2026-06-09 / 06-11, ~1,533 scheduled cells), and thirteen
+# benchmarks have been registered since — worth ~24,000 estimated job-minutes on
+# their own. The old `--time=12:00:00` was already under the observed wall, and
+# the orchestrator holding submitit's wait loop is exactly the process a
+# preemptible partition should not host: killing it strands the whole capture
+# with results on disk and no snapshot. `cpu_batch` allows 14 days.
 # =============================================================================
 
 #SBATCH --job-name=scx-baseline
-#SBATCH --partition=cpu_preemptible
+#SBATCH --partition=cpu_batch
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=80G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/tmp/scx-baseline-%j.out
 #SBATCH --error=/tmp/scx-baseline-%j.err
 

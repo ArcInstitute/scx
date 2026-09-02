@@ -323,6 +323,13 @@ def archive_raw_results(
     floor as a scoped-out triple, and the gate reported zero regressions and
     exited 0 — a green gate over nothing measured. Observed on job 2834602.
 
+    The returned summary describes **every** file in ``baseline_dir/raw`` after
+    the copy, not just this pass's copies, so a snapshot assembled from two
+    passes into one ``--name`` keeps both. ``raw/`` always accumulated by
+    ``copy2``; the summary did not, so the narrower pass's ``summary.json`` used
+    to replace the wider one's rows and the promoted baseline silently described
+    the narrow pass alone.
+
     Returns a per-file summary dict suitable for summary.json.
     """
     if datasets:
@@ -330,9 +337,7 @@ def archive_raw_results(
     dst = baseline_dir / "raw"
     dst.mkdir(parents=True, exist_ok=True)
 
-    summary: dict[str, Any] = {}
     copied = 0
-    skipped = 0
     stale_filtered = 0
     for src in sorted(RAW_DIR.glob("*.json")):
         if not _tier_matches(src.name, tier_cfg):
@@ -343,6 +348,17 @@ def archive_raw_results(
         shutil.copy2(src, dst / src.name)
         copied += 1
 
+    # Summarise the DESTINATION, not the files this pass copied. A snapshot can
+    # be built from more than one pass — `--tier full`, then a narrowed
+    # `--datasets` pass over the five benchmarks that are only reachable from
+    # datasets no tier schedules — and `raw/` accumulated by `copy2` while
+    # a per-pass summary did not, so the second pass's `summary.json` replaced
+    # the first's rows wholesale. Reading `dst` back makes accumulation correct
+    # by construction. The staleness filter above is untouched: it still decides
+    # what may *enter* `raw/`, and nothing lands there that a pass did not pick.
+    summary: dict[str, Any] = {}
+    skipped = 0
+    for src in sorted(dst.glob("*.json")):
         try:
             data = json.loads(src.read_text())
         except json.JSONDecodeError:
@@ -370,14 +386,38 @@ def archive_raw_results(
             "source_file": src.name,
         }
 
+    # `copied` is this pass; `len(summary)` is the snapshot. On a single-pass
+    # capture they agree, and on a two-pass one the difference is the point —
+    # an operator checking "did this measure anything" needs the first number,
+    # and one checking "does the snapshot cover what I think" needs the second.
+    tail = f"; snapshot holds {len(summary)} rows ({skipped} unparseable)"
     if stale_filtered:
         print(
-            f"[baseline] archived {copied} result files ({skipped} unparseable, "
-            f"{stale_filtered} pre-run files skipped)"
+            f"[baseline] archived {copied} result files "
+            f"({stale_filtered} pre-run files skipped){tail}"
         )
     else:
-        print(f"[baseline] archived {copied} result files ({skipped} unparseable)")
+        print(f"[baseline] archived {copied} result files{tail}")
     return summary
+
+
+def _snapshot_datasets(
+    existing: list[str] | None, effective: list[str] | None,
+) -> list[str]:
+    """Union of what a snapshot already claimed and what this pass covered.
+
+    `summary.json`'s `datasets` field describes the snapshot, not the last
+    invocation that wrote it. With two passes into one `--name` the last pass's
+    list is a strict understatement, and a snapshot that claims a coverage it
+    does not have is exactly what `archive_raw_results`' `datasets` parameter
+    exists to prevent. Order-stable so a re-run of the same passes produces a
+    byte-identical field.
+    """
+    out: list[str] = []
+    for name in list(existing or []) + list(effective or []):
+        if name not in out:
+            out.append(name)
+    return out
 
 
 def _median_rss(runs: list[dict[str, Any]]) -> float | None:
@@ -613,15 +653,26 @@ def main() -> int:
             tier_cfg, baseline_dir, since_mtime=submission_start,
             datasets=args.datasets or None,
         )
-        (baseline_dir / "summary.json").write_text(json.dumps(
+        # The effective list, not the tier's: `--datasets` can name a dataset
+        # outside the tier, and a snapshot that claims a coverage it does not
+        # have is worse than one that is narrow. Unioned with whatever a prior
+        # pass into this same `--name` already claimed, for the same reason.
+        effective_datasets = (
+            list(args.datasets) if args.datasets else list(tier_cfg["datasets"])
+        )
+        summary_path = baseline_dir / "summary.json"
+        prior_datasets: list[str] = []
+        if summary_path.is_file():
+            try:
+                prior_datasets = json.loads(summary_path.read_text()).get("datasets") or []
+            except json.JSONDecodeError:
+                prior_datasets = []
+        summary_path.write_text(json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,
                 "snapshot_name": args.name,
                 "tier": args.tier,
-                # The effective list, not the tier's: `--datasets` can name a
-                # dataset outside the tier, and a snapshot that claims a
-                # coverage it does not have is worse than one that is narrow.
-                "datasets": list(args.datasets) if args.datasets else tier_cfg["datasets"],
+                "datasets": _snapshot_datasets(prior_datasets, effective_datasets),
                 "rows": summary,
             },
             indent=2, default=str,

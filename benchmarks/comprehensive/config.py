@@ -1758,6 +1758,17 @@ def partition_for_memory(mem_gb: int, default: str = "cpu_preemptible") -> str:
 # SLURM Defaults
 # ---------------------------------------------------------------------------
 
+# The GPU partition, overridable because the default starves. Chimera's
+# `preemptible` GPU QOS can leave a job PENDING past the gate's own 600 s probe
+# timeout, which reads as a pre-flight failure rather than a queue backlog, so a
+# capture that has to finish points this at a priority partition
+# (`ctc_gpu_priority`, `gpu`). It was a bare literal in two places — here and in
+# `run_parallel._per_job_slurm_params`, where `--partition` and
+# `SCX_BENCH_PARTITION` both had no effect on GPU cells — and the standing
+# workaround was to edit that line and remember to revert it. Default unchanged,
+# so nothing moves unless an operator says so.
+GPU_PARTITION = os.environ.get("SCX_BENCH_GPU_PARTITION", "preemptible")
+
 SLURM_DEFAULTS = {
     "cpu": {
         "partition": "cpu_preemptible",
@@ -1772,7 +1783,7 @@ SLURM_DEFAULTS = {
         "time": "08:00:00",
     },
     "gpu": {
-        "partition": "preemptible",
+        "partition": GPU_PARTITION,
         "cpus_per_task": 16,
         "mem_gb": 128,
         "gpus": 1,

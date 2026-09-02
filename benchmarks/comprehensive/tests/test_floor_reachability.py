@@ -285,6 +285,188 @@ def test_archive_raw_results_signature_takes_datasets():
         )
 
 
+def test_two_capture_passes_into_one_snapshot_keep_both_passes_rows():
+    """A snapshot built from two `--datasets` passes must carry both passes' rows.
+
+A baseline recapture is two passes into one `--name`: `--tier full`, then a
+    narrowed pass over the five benchmarks that are only reachable from datasets
+    no tier schedules (`grouped_sort`, `grouped_read`, `accel_de_nb_glm`,
+    `accel_eval_metrics`, `cell_eval_parity_perf` — the 53-floor gap catalogued
+    in `thresholds.yaml`'s Deferred item 12). `<snap>/raw/`
+    already accumulated by `copy2`, but the returned summary did not: it was
+    built from the files this pass copied, so pass B's `summary.json` replaced
+    pass A's rows wholesale and the promoted baseline described five benchmarks
+    instead of forty. Every row pass A measured would have read as *appearing*
+    rather than regressing for the whole life of the baseline — the same silence
+    as an empty snapshot, but harder to see, because the file is not empty.
+
+    Building the summary from the destination directory makes accumulation
+    correct by construction. The staleness filter is unaffected: it still gates
+    what gets *copied*, and nothing reaches `raw/` that a pass did not choose.
+    """
+    import importlib
+    import json
+    import pathlib
+    import tempfile
+
+    cb = importlib.import_module("benchmarks.comprehensive.scripts.capture_baseline")
+
+    full = cb.TIERS["full"]
+    assert "replogle_k562" not in full["datasets"], (
+        "premise: replogle_k562 must be outside tier full, or pass B is not "
+        "modelling an off-tier pass. If the tiers changed, pick another."
+    )
+
+    def _result(benchmark, fmt, dataset, wall):
+        return json.dumps({
+            "schema_version": 2, "benchmark": benchmark, "format": fmt,
+            "dataset": dataset, "median_wall_s": wall,
+            "runs": [{"wall_s": wall, "peak_rss_mb": 10.0, "extra": {}}],
+        })
+
+    a_name = "read_full__scx_auto__census_1m.json"
+    b_name = "grouped_sort__scx_auto__replogle_k562.json"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        fake_raw = tmp / "raw_src"
+        fake_raw.mkdir()
+        snapshot = tmp / "snap"
+        orig = cb.RAW_DIR
+        try:
+            cb.RAW_DIR = fake_raw
+            # Pass A — the tier.
+            (fake_raw / a_name).write_text(_result(
+                "read_full", "scx_auto", "census_1m", 1.5))
+            summary_a = cb.archive_raw_results(full, snapshot, datasets=None)
+            # Pass B — off-tier, disjoint datasets, same snapshot.
+            (fake_raw / b_name).write_text(_result(
+                "grouped_sort", "scx_auto", "replogle_k562", 2.5))
+            summary_b = cb.archive_raw_results(
+                full, snapshot, datasets=["replogle_k562"])
+        finally:
+            cb.RAW_DIR = orig
+        archived = sorted(p.name for p in (snapshot / "raw").glob("*.json"))
+
+    assert archived == sorted([a_name, b_name]), archived
+    assert "read_full__scx_auto__census_1m" in summary_a
+
+    assert "grouped_sort__scx_auto__replogle_k562" in summary_b, (
+        "pass B did not archive its own off-tier row"
+    )
+    assert "read_full__scx_auto__census_1m" in summary_b, (
+        "pass B's summary dropped pass A's row — `summary.json` would claim "
+        "only the narrowed pass's coverage, and every row pass A measured "
+        "would be baseline-absent (treated as appearing, never regressing) "
+        f"for the life of the promoted baseline. Got: {sorted(summary_b)}"
+    )
+    assert summary_b["read_full__scx_auto__census_1m"]["median_wall_s"] == 1.5
+
+
+def test_capture_writes_the_union_of_both_passes_dataset_lists():
+    """`summary.json`'s `datasets` field must describe the snapshot, not the last
+    invocation.
+
+    It is the field `_tier_matches` is reconstructed from when anyone re-reads a
+    snapshot, and `check_absolute_floors` is not the only consumer — a snapshot
+    that claims a coverage it does not have is worse than one that is narrow
+    (the reason `--datasets` is honoured there at all). With two passes the last
+    one's list is not the snapshot's.
+    """
+    import importlib
+    import inspect
+
+    cb = importlib.import_module("benchmarks.comprehensive.scripts.capture_baseline")
+    assert hasattr(cb, "_snapshot_datasets"), (
+        "capture_baseline lost `_snapshot_datasets`, so a second pass's "
+        "`datasets` field would overwrite the first's instead of unioning"
+    )
+    src = inspect.getsource(cb.main)
+    assert "_snapshot_datasets(" in src, (
+        "main() writes `datasets` without unioning in what the snapshot "
+        "already claimed"
+    )
+
+    # The union itself: order-stable, deduplicated, and it must not drop either side.
+    got = cb._snapshot_datasets(["a", "b"], ["b", "c"])
+    assert got == ["a", "b", "c"], got
+    assert cb._snapshot_datasets([], ["a"]) == ["a"]
+    assert cb._snapshot_datasets(["a"], []) == ["a"]
+
+
+def test_the_gpu_partition_is_not_a_hardcoded_literal():
+    """GPU cells must take their partition from one overridable place.
+
+    `run_parallel._per_job_slurm_params` assigned `partition = "preemptible"` in
+    the `needs_gpu` branch, and `SLURM_DEFAULTS["gpu"]` repeated it. Neither
+    `--partition` nor `SCX_BENCH_PARTITION` reaches that branch — those size CPU
+    cells — so on a cluster where the preemptible GPU QOS is backlogged, the
+    ~204 GPU cells of a tier-full capture (every `accel_* x *_gpu*`, plus every
+    `ml_loader x scx_*`) sit PENDING past the gate's 600 s probe timeout and read
+    as a pre-flight failure rather than a queue. The standing workaround was to
+    edit the line for a run and remember to revert it; a forgotten revert is a
+    silent partition change, and a forgotten edit is a starved capture.
+
+    Behavioural, in a subprocess, because `GPU_PARTITION` is read at import: a
+    test that reloads the module in-process would leave `run_parallel`'s bound
+    copy stale and pass while the real thing did not move.
+    """
+    import ast
+    import os
+    import subprocess
+    import sys
+
+    src = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+           / "run_parallel.py").read_text()
+    tree = ast.parse(src)
+
+    # Find the `if needs_gpu:` body and assert nothing in it assigns a string
+    # constant to `partition`.
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if not (isinstance(node.test, ast.Name) and node.test.id == "needs_gpu"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Assign):
+                continue
+            names = [t.id for t in inner.targets if isinstance(t, ast.Name)]
+            if "partition" not in names:
+                continue
+            if isinstance(inner.value, ast.Constant):
+                offenders.append(f"line {inner.lineno}: partition = {inner.value.value!r}")
+    assert not offenders, (
+        "the needs_gpu branch hardcodes its partition again: "
+        + "; ".join(offenders)
+        + " — use config.GPU_PARTITION so SCX_BENCH_GPU_PARTITION reaches it"
+    )
+    assert "partition = GPU_PARTITION" in src, (
+        "run_parallel no longer sources the GPU partition from config"
+    )
+
+    # End to end: the env var must move both the constant and SLURM_DEFAULTS.
+    probe = (
+        "import json;"
+        "from benchmarks.comprehensive.config import GPU_PARTITION, SLURM_DEFAULTS;"
+        "print(json.dumps([GPU_PARTITION, SLURM_DEFAULTS['gpu']['partition']]))"
+    )
+    env = {**os.environ, "SCX_BENCH_GPU_PARTITION": "ctc_gpu_priority"}
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=PROJECT_ROOT, env=env,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    assert __import__("json").loads(out) == ["ctc_gpu_priority"] * 2, out
+
+    # Default unchanged: an operator who sets nothing gets today's behaviour.
+    env.pop("SCX_BENCH_GPU_PARTITION")
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=PROJECT_ROOT, env=env,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    assert __import__("json").loads(out) == ["preemptible"] * 2, out
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 

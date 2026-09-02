@@ -61,6 +61,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from benchmarks.comprehensive.config import (  # noqa: E402
     ALL_FORMATS,
     DATASETS,
+    GPU_PARTITION,
     PRIMARY_FORMATS,
     FormatVariant,
     estimate_memory_gb,
@@ -992,12 +993,19 @@ def _per_job_slurm_params(
         )
     )
     if needs_gpu:
-        partition = "preemptible"  # GPU partition on chimera
+        # `config.GPU_PARTITION` (env `SCX_BENCH_GPU_PARTITION`, default
+        # "preemptible"). GPU cells deliberately ignore `--partition` /
+        # `SCX_BENCH_PARTITION`, which size CPU cells; this is the one knob for
+        # them, and it exists because the preemptible GPU QOS starves.
+        partition = GPU_PARTITION
         extra_slurm["slurm_gres"] = "gpu:1"
         # Chimera's preemptible GPU QOS caps per-job memory at ~128 GB
         # (matching SLURM_DEFAULTS.gpu.mem_gb). Requests above that fail
         # with `QOSMaxGRESPerJob`. Clamp so census-scale preprocess cells
         # that actually use GPU compute don't get rejected at submit time.
+        # Applied on every GPU partition, not just the preemptible one: it is
+        # the tighter bound, and under-requesting is recoverable where a
+        # submit-time rejection loses the cell from the capture entirely.
         # (CPU variants have already been routed away via the `needs_gpu`
         # check and will pick up cpu_high_mem via partition_for_memory.)
         _GPU_MEM_CEILING_GB = 128
