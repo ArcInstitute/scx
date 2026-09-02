@@ -37,12 +37,34 @@ That matters here more than elsewhere, because four of these five ops
 (``append``, ``delete``, ``obs_import``, ``rollback``) commit through
 ``commit_in_place`` → ``finalize_header_with_checksum``, which streams offset
 256 → EOF to recompute ``file_checksum`` regardless of how few bytes changed.
-**``wall_s__rollback`` is the cleanest instrument for that in the suite**: a
-rollback is one 4 KB pwrite plus two fsyncs plus the whole-file BLAKE3 rehash,
-so essentially all of its wall is the checksum extent. ``wall_s__obs_import``
-is the next cleanest — it adds one column and rehashes the file. Redefining the
-extent to header + catalogs (OPT-FORMAT-1) should collapse both and leave
-``wall_s__compact``, a genuine full rewrite, roughly where it is.
+
+**``wall_s__rollback`` and ``wall_s__delete`` are the clean instruments for
+that**; ``wall_s__obs_import`` is not. Measured, 2 runs each:
+
+===============  ==================  ====================  ==============
+metric           pbmc3k (4.5 MB)     census_1m (2.80 GB)   census/pbmc3k
+===============  ==================  ====================  ==============
+``rollback``     0.0047 s            **2.247 s**           478x
+``delete``       0.0067 s            1.727 s               258x
+``obs_import``   0.0244 s            19.72 s               808x
+``compact``      2.514 s             (minutes)             —
+===============  ==================  ====================  ==============
+
+A rollback is one 4 KB pwrite, two fsyncs and the rehash, so its census figure
+is 2.80 GB at ~1.25 GB/s — essentially all checksum extent, and stable to
+2 ms across runs. ``delete`` is the same shape at ~1.6 GB/s.
+
+``obs_import`` was *expected* to be the second-cleanest ("one column added,
+whole file rehashed") and measurement says otherwise: ~2.2 s of its 19.72 s is
+the rehash, i.e. **~11%**. `attach_external_obs` **rewrites the obs section**
+and appends it at EOF — 493 MB at census_1m, against a 4 MB score column — and
+that write, plus reading 28 obs columns to join, is the other 89%. It is a
+useful arm (nothing else times a key-joined in-place import) but it is not an
+OPT-FORMAT-1 instrument; use `rollback`.
+
+Redefining the extent to header + catalogs (OPT-FORMAT-1) should collapse
+`rollback` and `delete` to near zero, take ~11% off `obs_import`, and leave
+``wall_s__compact`` — a genuine full rewrite — roughly where it is.
 """
 
 from __future__ import annotations
@@ -459,9 +481,22 @@ def _run_obs_import(
             rows_imported=n_source_rows,
             n_matched=n_matched,
             obs_join_key=target_key,
+            # Whether the obs rewrite streamed shard-by-shard or assembled the
+            # whole table. Not inferable from the output file, and it decides
+            # whether this arm's peak scales with the target: a legacy
+            # single-section `ObsMetadata` target has no per-shard reader, so
+            # the whole obs table is materialised (the op warns and names
+            # `scx optimize`).
+            obs_streamed=bool(preview.get("obs_streamed", False)),
             source_csv_bytes=csv_bytes,
             size_before_bytes=size_before,
             size_after_bytes=size_after,
+            # The dominant term in this arm's wall, and much larger than the
+            # one column added: `attach_external_obs` rewrites the obs section
+            # and appends it at EOF, so the delta is a whole obs table.
+            # Measured 493 MB at census_1m (28 columns, 1M rows, wide
+            # categoricals) against a 4 MB score column.
+            obs_rewrite_bytes=size_after - size_before,
             rows_per_sec=round(rows_per_sec, 1),
         )
         target_path.unlink(missing_ok=True)

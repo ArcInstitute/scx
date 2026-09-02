@@ -207,15 +207,29 @@ def _run_cli_info_arm(
     for i in range(n_runs):
         gc.collect()
         t0 = time.perf_counter()
-        proc = subprocess.run(
-            [scx_bin, "info", "--json", cloud_url],
-            capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
-        )
+        # `timeout=` raises rather than returning, and a cloud hang must not
+        # take the whole cohort job with it — the docstring above promises this
+        # arm never raises. A timed-out run is recorded as ok=0 with its (capped)
+        # wall, which is the honest reading: it did take at least that long.
+        try:
+            proc = subprocess.run(
+                [scx_bin, "info", "--json", cloud_url],
+                capture_output=True, text=True, timeout=_CLI_INFO_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "  scx info %s exceeded the %ds cap", cloud_url,
+                _CLI_INFO_TIMEOUT_S,
+            )
+            proc = None
+        except Exception as e:  # noqa: BLE001
+            logger.error("  scx info %s could not run: %s", cloud_url, e)
+            proc = None
         wall = time.perf_counter() - t0
 
         ok = 0
         n_obs_seen = -1
-        if proc.returncode == 0:
+        if proc is not None and proc.returncode == 0:
             try:
                 n_obs_seen = int(json.loads(proc.stdout).get("n_obs", -1))
             except Exception:  # noqa: BLE001
@@ -226,9 +240,11 @@ def _run_cli_info_arm(
             # but recorded *loudly*: a 0 here means the wall below timed a
             # failure, and any threshold on `scx_info_cloud_ok` fails on it.
             logger.error(
-                "  scx info %s failed (rc=%d, n_obs=%s, want %d): %s",
-                cloud_url, proc.returncode, n_obs_seen, dataset.n_obs,
-                (proc.stderr or "").strip()[:400],
+                "  scx info %s failed (rc=%s, n_obs=%s, want %d): %s",
+                cloud_url,
+                "timeout/spawn" if proc is None else proc.returncode,
+                n_obs_seen, dataset.n_obs,
+                "" if proc is None else (proc.stderr or "").strip()[:400],
             )
         result.add_run(
             wall_s=wall,

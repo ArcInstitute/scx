@@ -3282,21 +3282,33 @@ absolute_floors:
 #     `rollback` -> `apply_catalog_at` -> `finalize_header_with_checksum`
 #     streams offset 256 -> EOF, so a rollback is one 4 KB pwrite, two fsyncs
 #     and a whole-file BLAKE3 rehash: essentially all of its wall IS the
-#     checksum extent. `wall_s__obs_import` is next — one obs column added, the
-#     whole file rehashed. Redefining the extent to header + catalogs should
-#     collapse both and leave `wall_s__compact` (a real rewrite) where it is.
+#     checksum extent.
 #
-#     Measured on pbmc3k (4.5 MB file, so the rehash is negligible — this is a
-#     mechanism check, not a signal):
-#         wall_s__append 0.017  wall_s__delete 0.0067  wall_s__compact 2.53
-#         wall_s__compact_full 3.13  wall_s__obs_import 0.024
-#         wall_s__rollback 0.0047
+#     Measured 2026-09-02, 2 runs each:
 #
-#     ACTIVATION: floor on census_1m, where the rehash is ~2.8 GB and dominates.
-#     Author `wall_s__rollback` and `wall_s__obs_import` at 1.25x their
-#     recaptured medians. Expect BOTH to drop by roughly the read-bandwidth
-#     term when OPT-FORMAT-1 lands — that is the point, so re-baseline in the
-#     same change rather than treating the improvement as a failure.
+#         metric              pbmc3k (4.5 MB)   census_1m (2.80 GB)
+#         wall_s__rollback    0.0047            2.247   <- ~1.25 GB/s, +-2 ms
+#         wall_s__delete      0.0067            1.727   <- ~1.6 GB/s
+#         wall_s__obs_import  0.0244           19.72
+#         wall_s__compact     2.514            (minutes; ~50 GB read)
+#         wall_s__append      0.0158           25.61
+#         wall_s__compact_full 3.13            (no census _full fixture yet)
+#
+#     CORRECTED, and this is why the census numbers were worth taking:
+#     `wall_s__obs_import` was expected to be the second-cleanest instrument
+#     ("one column added, whole file rehashed"). It is not. Only ~2.2 s of its
+#     19.72 s is the rehash — **~11%**. `attach_external_obs` rewrites the obs
+#     section and appends it at EOF (493 MB at census_1m against a 4 MB score
+#     column, recorded per run as `obs_rewrite_bytes`), and that write plus
+#     reading 28 obs columns to join is the other 89%. Do not floor it as an
+#     OPT-FORMAT-1 signal.
+#
+#     ACTIVATION: floor `wall_s__rollback` on census_1m at 1.25x its median
+#     (2.247 s -> max ~2.81). `wall_s__delete` is a usable second. Expect both
+#     to drop to near zero when OPT-FORMAT-1 lands — that is the point, so
+#     re-baseline in the same change rather than treating it as a failure.
+#     `wall_s__obs_import` is still worth a (looser) ceiling, but as a guard on
+#     the obs-rewrite path, not the checksum.
 #
 # 19. cloud_metadata / `scx info <cloud-url>` — OPT-CLOUD-1
 #     A subprocess arm, added in PR-02c: `scx info --json <gs://…>`. Not a
