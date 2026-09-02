@@ -17,7 +17,14 @@ Reports per-scenario:
 * ``batches_per_sec`` — total training batches per wall-clock second.
 * ``cells_per_sec``  — sum across modalities.
 * ``time_to_first_batch_s`` — median over ``_N_TTFB_RUNS`` reps.
-* ``peak_rss_mb`` — max process RSS during the measured epoch.
+* ``peak_rss_mb`` — the high-water RSS *during* the measured epoch,
+  sampled by ``PeakRssSampler``. It was ``getrusage(RUSAGE_SELF).ru_maxrss``
+  until the peak-sampler change: a real high-water mark, but scoped to the
+  whole process lifetime, so a peak from the time-to-first-batch reps or from a
+  previous
+  epoch's eager ``read_h5mu`` was re-reported as this epoch's. (The
+  ``max(before, after)`` idiom that guarded it was a no-op — ``ru_maxrss``
+  is monotone, so ``before <= after`` always.)
 
 This is *not* a model-training benchmark; we exercise only the
 dataloader. Time-to-first-batch and steady-state throughput are the
@@ -37,6 +44,7 @@ import numpy as np
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.rss import PeakRssSampler
 from benchmarks.comprehensive.runners import make_runner
 from benchmarks.comprehensive.runners.base import FormatRunner
 
@@ -72,14 +80,6 @@ class _EpochResult:
     n_cells: int
     wall_s: float
     peak_rss_mb: float
-
-
-def _peak_rss_mb() -> float:
-    import resource
-
-    r = resource.getrusage(resource.RUSAGE_SELF)
-    # Linux: ru_maxrss is in KB.
-    return r.ru_maxrss / 1024.0
 
 
 def _disable_hdf5_locking() -> None:
@@ -119,27 +119,26 @@ def _run_scx_multimodal_epoch(
         return_dict=True,
     )
     gc.collect()
-    rss_before = _peak_rss_mb()
     t0 = time.perf_counter()
     n_batches = 0
     n_cells = 0
-    for batch in ds:
-        # `batch["X"]` is a dict {modality_name: ndarray}.
-        x_dict = batch["X"]
-        # Use the first modality's row count (rows are aligned across
-        # modalities — same global cell index).
-        any_modality = next(iter(x_dict.values()))
-        n_cells += any_modality.shape[0]
-        n_batches += 1
-        if n_batches >= n_batches_target:
-            break
+    with PeakRssSampler() as sampler:
+        for batch in ds:
+            # `batch["X"]` is a dict {modality_name: ndarray}.
+            x_dict = batch["X"]
+            # Use the first modality's row count (rows are aligned across
+            # modalities — same global cell index).
+            any_modality = next(iter(x_dict.values()))
+            n_cells += any_modality.shape[0]
+            n_batches += 1
+            if n_batches >= n_batches_target:
+                break
     wall = time.perf_counter() - t0
-    rss_after = _peak_rss_mb()
     return _EpochResult(
         n_batches=n_batches,
         n_cells=n_cells,
         wall_s=wall,
-        peak_rss_mb=max(rss_before, rss_after),
+        peak_rss_mb=sampler.peak_mb,
     )
 
 
@@ -174,27 +173,26 @@ def _run_h5mu_epoch(
             mats[name] = sp.csr_matrix(X)
 
     gc.collect()
-    rss_before = _peak_rss_mb()
     t0 = time.perf_counter()
     n_batches = 0
     n_cells = 0
-    for start in range(0, n_obs, batch_size):
-        rows = indices[start : start + batch_size]
-        for name, X in mats.items():
-            slab = X[rows].toarray()
-            # Force materialization
-            _ = slab.shape
-        n_cells += rows.size
-        n_batches += 1
-        if n_batches >= n_batches_target:
-            break
+    with PeakRssSampler() as sampler:
+        for start in range(0, n_obs, batch_size):
+            rows = indices[start : start + batch_size]
+            for name, X in mats.items():
+                slab = X[rows].toarray()
+                # Force materialization
+                _ = slab.shape
+            n_cells += rows.size
+            n_batches += 1
+            if n_batches >= n_batches_target:
+                break
     wall = time.perf_counter() - t0
-    rss_after = _peak_rss_mb()
     return _EpochResult(
         n_batches=n_batches,
         n_cells=n_cells,
         wall_s=wall,
-        peak_rss_mb=max(rss_before, rss_after),
+        peak_rss_mb=sampler.peak_mb,
     )
 
 
@@ -220,26 +218,25 @@ def _run_zarr_mudata_epoch(
             mats[name] = sp.csr_matrix(X)
 
     gc.collect()
-    rss_before = _peak_rss_mb()
     t0 = time.perf_counter()
     n_batches = 0
     n_cells = 0
-    for start in range(0, n_obs, batch_size):
-        rows = indices[start : start + batch_size]
-        for name, X in mats.items():
-            slab = X[rows].toarray()
-            _ = slab.shape
-        n_cells += rows.size
-        n_batches += 1
-        if n_batches >= n_batches_target:
-            break
+    with PeakRssSampler() as sampler:
+        for start in range(0, n_obs, batch_size):
+            rows = indices[start : start + batch_size]
+            for name, X in mats.items():
+                slab = X[rows].toarray()
+                _ = slab.shape
+            n_cells += rows.size
+            n_batches += 1
+            if n_batches >= n_batches_target:
+                break
     wall = time.perf_counter() - t0
-    rss_after = _peak_rss_mb()
     return _EpochResult(
         n_batches=n_batches,
         n_cells=n_cells,
         wall_s=wall,
-        peak_rss_mb=max(rss_before, rss_after),
+        peak_rss_mb=sampler.peak_mb,
     )
 
 
@@ -390,6 +387,8 @@ def run(
         [e.n_cells / e.wall_s if e.wall_s > 0 else 0.0 for e in epochs],
         dtype=float,
     )
+    # Each epoch now carries its own in-region peak (they are independent
+    # samples, not a monotone ru_maxrss series), so this is a real max.
     peak_rss = max(e.peak_rss_mb for e in epochs) if epochs else 0.0
 
     log.info(

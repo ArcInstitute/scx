@@ -147,7 +147,16 @@ class _ToolOutcome:
     truth: dict | None = None
     called_rate_by_batch: dict = field(default_factory=dict)
     tool_s: float = 0.0
-    peak_rss_mb: float = 0.0
+    residual_rss_mb: float = 0.0
+    """RSS this process still holds after the tool's subprocess exited.
+
+    Deliberately **not** named ``peak_rss_mb``. Every doublet caller runs in its
+    own conda environment as an external subprocess (``scripts/doublet/run_tool``),
+    and ``current_rss_mb()`` reads ``/proc/self/statm`` of the *parent*, so this
+    number never contained the tool's memory at all — it is what the parent
+    accumulated (the per-batch ``pd.read_csv`` tables) and still holds. A true
+    peak for a child would need ``wait4`` rusage; that is out of scope here.
+    """
 
 
 def run(
@@ -381,7 +390,7 @@ def _run_one_tool(pyscx, tool, spec, scx_path, export_dir, export_report,
         batch_paths = {str(b["batch"]): b.get("path")
                        for b in export_report["batches"]}
 
-    tables, records, wall, peak = [], [], 0.0, 0.0
+    tables, records, wall, residual = [], [], 0.0, 0.0
     for batch in batches:
         # The batch label is obs data: a `donor/1` would make this a path into
         # a directory that does not exist, and the runner would fail on write.
@@ -404,7 +413,7 @@ def _run_one_tool(pyscx, tool, spec, scx_path, export_dir, export_report,
         t0 = time.perf_counter()
         record = run_tool(tool, **kwargs)
         wall += time.perf_counter() - t0
-        peak = max(peak, _current_rss_mb())
+        residual = max(residual, _current_rss_mb())
 
         if not record.get("available", True):
             return _ToolOutcome(tool=tool, available=False,
@@ -445,7 +454,7 @@ def _run_one_tool(pyscx, tool, spec, scx_path, export_dir, export_report,
             "n_obs", "n_matched", "n_target_rows_absent", "n_source_rows_absent",
             "obs_key_column", "canonical_columns", "score_source_column",
             "call_source_column") if k in report},
-        roundtrip=roundtrip, tool_s=wall, peak_rss_mb=peak,
+        roundtrip=roundtrip, tool_s=wall, residual_rss_mb=residual,
     )
 
 
@@ -651,9 +660,16 @@ def _build_result(dataset, spec, n_obs, batches, dropped, envs, outcomes, ran,
         },
         metadata=metadata,
     )
+    # The same number goes into both slots on purpose. `peak_rss_mb` is the
+    # harness's fixed field and feeds `summary.json`'s `peak_rss_mb_median`, so
+    # zeroing it would erase this benchmark's memory series and publish a
+    # fabricated 0 MB. `residual_rss_mb` is the honest name, and being in
+    # `extra` it is the one a threshold can key off — see `_ToolOutcome`.
+    residual_rss = max([o.residual_rss_mb for o in ran], default=0.0)
     result.add_run(
         wall_s=total_wall,
-        peak_rss_mb=max([o.peak_rss_mb for o in ran], default=0.0),
+        peak_rss_mb=residual_rss,
+        residual_rss_mb=residual_rss,
         **extra,
     )
     logger.info(

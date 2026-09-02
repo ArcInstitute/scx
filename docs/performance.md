@@ -2954,8 +2954,8 @@ Convert-time grouping does a random-access *gather* of the source whose cost
 scales with bytes-read-per-row — `nnz` for CSR, the full `n_vars` for dense — so
 `--group-pass auto` (the default) routes **CSR → one-pass** streaming gather and
 **dense → two-pass** (plain convert + `scx sort`). Real Perturb-seq fixtures,
-`grouped_sort` benchmark (release pyscx, 16 threads; wall = median, RSS sampled
-post-op):
+`grouped_sort` benchmark (release pyscx, 16 threads; wall = median, RSS **sampled
+post-op** — see the note under the table):
 
 | source (X format, cells × genes) | one-pass wall / RSS | two-pass wall / RSS | `auto` route |
 |---|---|---|---|
@@ -2967,11 +2967,18 @@ outright; for a **dense** source it reads full-width rows per gathered cell and 
 a ~5× loss, so `auto` falls back to the two-pass path (which costs a transient
 ~2× output disk for the intermediate file). Output is byte-identical regardless of
 route. Both synthetic CSR fixtures confirm the ordering (`pert_synth_10k`:
-one-pass 1.6 s vs two-pass 3.4 s; `nb_glm_synth`: 3.6 s vs 6.5 s). The post-op RSS
-above understates true peak (the suite samples after the op, not a high-water
-mark); a `/usr/bin/time` true-peak measurement of the release `scx` CLI puts the
-dense one-pass at ~11.5 GB vs ~6.5 GB for two-pass — the memory motivation for the
-dense → two-pass route.
+one-pass 1.6 s vs two-pass 3.4 s; `nb_glm_synth`: 3.6 s vs 6.5 s).
+
+**The RSS column above understates true peak, and is kept as captured.** Those
+figures come from a run in which `grouped_sort` sampled `current_rss_mb()` after
+each op finished, so a gather buffer that was allocated and freed inside the op
+is not in them; a `/usr/bin/time` true-peak measurement of the release `scx` CLI
+puts the dense one-pass at ~11.5 GB against ~6.5 GB for two-pass — the memory
+motivation for the dense → two-pass route. The benchmark now brackets each op
+with `PeakRssSampler` and reports a genuine in-region high-water mark, so a
+re-capture will read higher than the table; the numbers here are not restated
+because they are the ones the tracked
+`results/raw/grouped_sort__scx_auto__*.json` actually contain.
 
 **Grouped sort + reference isolation.** On `replogle_k562` (415 perturbation
 groups), `sort --group-by gene --reference non-targeting` isolates all 10,691
@@ -3049,8 +3056,14 @@ path as the atlas-scale moat. The parallel gather trades peak RSS for speed — 
 ~18.7 GB vs the emitter's ~11.9 GB, still far under the historical 48–72 GB OOM;
 neutral on the other two. Bound it with `RAYON_NUM_THREADS`, or set
 `SCX_SORT_NO_INMEM_FAST=1` to force the memory-lean single-threaded emitter. A
-`grouped_sort` `peak_rss_mb` gross-regression ceiling gates each dataset in
-`thresholds.yaml` (wall time stays measured-not-gated — hardware-sensitive).
+`grouped_sort` `grouped_peak_rss_mb` gross-regression ceiling gates each dataset
+in `thresholds.yaml` (wall time stays measured-not-gated — hardware-sensitive).
+It is spelled `grouped_peak_rss_mb`, not `peak_rss_mb`, because the latter is a
+reserved `add_run` parameter that never reaches `runs[].extra` — the only place
+a threshold reads. The ceilings carried the reserved spelling until 2026-09 and
+could not resolve a value on any run; the silence went unnoticed because none of
+the three datasets is in a capture tier, so the triple never ran and the
+resulting violation was skipped rather than reported.
 
 **Beyond grouped sharding (full cross-format campaign, release build).** shardad also
 runs as a first-class format in the comprehensive suite:

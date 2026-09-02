@@ -455,6 +455,262 @@ def test_export_streaming_bounds_its_materialize_arm_too():
 
 
 # ---------------------------------------------------------------------------
+# Registration, and the rest of the "peak_rss_mb is a peak" family
+# ---------------------------------------------------------------------------
+
+
+def test_every_runnable_benchmark_module_is_registered():
+    """The converse of `test_every_floored_benchmark_is_in_all_benchmarks`.
+
+    That test catches a *threshold* whose benchmark cannot be scheduled. This
+    one catches the earlier mistake: a benchmark module added without a line in
+    `ALL_BENCHMARKS`. Nothing fails at that point — the module imports, its
+    tests pass, and `run_parallel.py --benchmarks <name>` even runs it — but
+    `capture_baseline.py` rejects the off-list name, so no tiered capture and no
+    gate can reach it. `conversion_streaming` and `export_streaming` sat in
+    exactly that state for months (see `benchmarks/__init__.py`), and the only
+    reason it surfaced was that someone tried to add a threshold.
+
+    A module is "runnable" here if it defines a top-level `run`. Private
+    helpers (`_pert_synth`) and `__init__` are excluded by name, which is the
+    same convention the package's own docstring uses.
+    """
+    import ast
+
+    from benchmarks.comprehensive.benchmarks import ALL_BENCHMARKS
+
+    bench_dir = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+    assert bench_dir.is_dir(), f"{bench_dir} moved — retarget this test"
+
+    runnable = set()
+    for path in sorted(bench_dir.glob("*.py")):
+        if path.stem.startswith("_"):
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        if any(
+            isinstance(n, ast.FunctionDef) and n.name == "run"
+            for n in tree.body
+        ):
+            runnable.add(path.stem)
+
+    assert len(runnable) > 20, (
+        f"only {len(runnable)} runnable benchmark modules found under "
+        f"{bench_dir} — the discovery above is probably broken, and the "
+        f"assertion below would be vacuous"
+    )
+
+    unregistered = sorted(runnable - set(ALL_BENCHMARKS))
+    assert not unregistered, (
+        f"benchmark modules with a top-level run() that are absent from "
+        f"ALL_BENCHMARKS: {unregistered}. capture_baseline.py rejects off-list "
+        f"--benchmarks names and both orchestrators derive their lists from it, "
+        f"so no tiered capture can schedule these and no threshold on them could "
+        f"ever fire. Add them to benchmarks/comprehensive/benchmarks/__init__.py."
+    )
+
+
+def test_no_floor_keys_off_a_reserved_add_run_parameter():
+    """A threshold on `wall_s` / `peak_rss_mb` / `user_s` / `sys_s` is unreadable.
+
+    Those four are **named parameters** of `BenchmarkResult.add_run`, so they
+    land on the `RunRecord` itself and never reach `runs[].extra` —
+    and `_load_current_raw_metric` reads `extra` only. A floor keyed to one of
+    them resolves `None` on every run, which the gate reports as a
+    missing-metric violation. It cannot be satisfied by any benchmark, however
+    correct.
+
+    Three `grouped_sort` ceilings were in exactly that state, and the reason
+    nobody noticed is the second half of the trap: their datasets
+    (chemogenetic_rgfp / replogle_k562 / tahoe_c38) are outside every tier, so a
+    default gate run never produced the triple and `check_absolute_floors`
+    skipped it *silently*. An unsatisfiable floor and an unreachable triple
+    cancel into something that reads exactly like coverage.
+
+    The fix is a non-reserved name in `extra` (`grouped_peak_rss_mb`, or the
+    house-style sparse `peak_rss_mb__<scenario>`), never a rename of the
+    parameter.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    sig = inspect.signature(BenchmarkResult.add_run)
+    reserved = {
+        name for name, prm in sig.parameters.items()
+        if prm.kind is not prm.VAR_KEYWORD and name != "self"
+    }
+    assert "peak_rss_mb" in reserved and "wall_s" in reserved, (
+        f"premise: add_run's named parameters were {sorted(reserved)} — if the "
+        f"signature changed, retarget this test rather than deleting it"
+    )
+
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+    offenders = [
+        f"{f['benchmark']}/{f['format']}/{f['dataset']}:{f['metric']}"
+        for f in (raw.get("absolute_floors") or [])
+        if f["metric"] in reserved
+    ]
+    assert not offenders, (
+        f"these floors key off a reserved add_run parameter and can never read "
+        f"a value: {offenders}. Emit the number under a different name in "
+        f"`extra` and point the floor at that."
+    )
+
+
+def _bench_ast(name: str):
+    import ast
+
+    path = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks" / f"{name}.py"
+    return ast.parse(path.read_text(), filename=str(path)), path
+
+
+def _calls_named(tree, *names: str) -> list[int]:
+    """Line numbers of calls to any of *names*.
+
+    Parsed, not grepped, and for the reason this file already records under
+    `test_no_benchmark_passes_extra_as_a_dict`: a regex cannot tell a call from
+    a sentence. Each of these modules now carries a docstring *explaining* the
+    reading it stopped taking, so a text search matches the explanation and the
+    test fails on its own prose. `ast` sees calls only.
+    """
+    import ast
+
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        got = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if got in names:
+            out.append(node.lineno)
+    return out
+
+
+def _sampler_context_lines(tree) -> list[int]:
+    """Line numbers of `with PeakRssSampler() as ...:` statements."""
+    import ast
+
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        for item in node.items:
+            call = item.context_expr
+            if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "PeakRssSampler":
+                out.append(node.lineno)
+    return out
+
+
+@pytest.mark.parametrize("name", ["grouped_sort", "fragment_ops"])
+def test_mutating_op_benchmarks_use_the_true_peak_sampler(name: str):
+    """`_time_op` has to bracket the op, not sample after it.
+
+    Both modules reported `current_rss_mb()` taken *after* `fn` returned and
+    said so in their own docstrings ("not a true peak — sufficient for detecting
+    gross regressions"). It is not sufficient for the ops these benchmarks time:
+    `append` reads the whole input CSR before re-encoding, `compact` rewrites
+    every section, and a grouped convert holds a reference-group buffer — each
+    allocates and frees a transient that is gone by the time a post-op sample
+    lands.
+
+    Checked on the source because the alternative is running a grouped convert
+    on a real Perturb-seq file, and the defect is entirely in where the sample
+    is taken.
+    """
+    tree, path = _bench_ast(name)
+
+    assert _sampler_context_lines(tree), (
+        f"{path.name} never enters a `with PeakRssSampler()` block. Importing "
+        f"the name is not using it."
+    )
+    leftover = _calls_named(tree, "current_rss_mb", "_current_rss_mb")
+    assert not leftover, (
+        f"{path.name} still calls current_rss_mb() at lines {leftover}; a "
+        f"post-op instantaneous reading cannot see a transient, which is the "
+        f"only thing these ops allocate."
+    )
+
+
+def test_multimodal_training_samples_each_epoch_not_the_process_lifetime():
+    """`ru_maxrss` is a real high-water mark — of the wrong region.
+
+    It is scoped to the whole process, so a peak from the time-to-first-batch
+    reps or from a previous epoch's eager `read_h5mu` was re-reported as this
+    epoch's. The `max(rss_before, rss_after)` that guarded it could never fire:
+    `ru_maxrss` is monotone, so `before <= after` always, and the max was a
+    no-op dressed as a safeguard.
+
+    Three epoch runners (SCX, h5mu, zarr) share the shape, so the sampler has to
+    appear in all three — asserting merely that the module mentions it would
+    pass with two of them still on `ru_maxrss`.
+    """
+    import ast
+
+    tree, path = _bench_ast("multimodal_training")
+
+    sampler_lines = _sampler_context_lines(tree)
+    assert len(sampler_lines) >= 3, (
+        f"{path.name} enters `with PeakRssSampler()` only at {sampler_lines}; "
+        f"all three epoch runners (scx / h5mu / zarr_mudata) need it"
+    )
+
+    maxrss = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "ru_maxrss"
+    ]
+    assert not maxrss, (
+        f"{path.name} still reads ru_maxrss at lines {maxrss}; that is a "
+        f"process-lifetime high-water mark, not this epoch's peak"
+    )
+
+    monotone_max = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "max"
+        and [getattr(a, "id", None) for a in node.args] == ["rss_before", "rss_after"]
+    ]
+    assert not monotone_max, (
+        f"the monotone-ru_maxrss no-op is back at lines {monotone_max}"
+    )
+
+
+def test_full_fixture_path_is_declared_once():
+    """The `.raw` + obsm + layer fixture has one home.
+
+    Both arms that read it (`export_streaming`'s `streaming_full`,
+    `fragment_ops`' `compact_full`) go through `DatasetConfig.scx_full_path`
+    rather than each rebuilding `DATA_DIR / f"{name}_full.scx"`. A second
+    spelling is how the two arms would end up measuring different files.
+    """
+    import ast
+
+    from benchmarks.comprehensive.config import DATASETS
+
+    ds = DATASETS["tabula_sapiens_100k"]
+    assert ds.scx_full_path.name == "tabula_sapiens_100k_full.scx"
+
+    bench_dir = PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+    offenders = []
+    for path in sorted(bench_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            # An f-string that builds the fixture name by hand.
+            if isinstance(node, ast.JoinedStr):
+                rendered = "".join(
+                    v.value if isinstance(v, ast.Constant) else "{}"
+                    for v in node.values
+                )
+                if rendered.endswith("_full.scx"):
+                    offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        f"these build the full-fixture path by hand instead of using "
+        f"DatasetConfig.scx_full_path: {offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Published numbers must match the results tracked to back them
 # ---------------------------------------------------------------------------
 

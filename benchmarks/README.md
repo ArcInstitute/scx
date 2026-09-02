@@ -200,7 +200,16 @@ The suite measures seven core dimensions, plus accelerator, GPU, lazy preprocess
 - **Timing**: `time.perf_counter()` for wall-clock. Median of 3 runs (large datasets) or 5 runs (small datasets).
 - **Cold start**: Fresh Python subprocess per run to avoid warm-up artifacts.
 - **Cache control**: Warm-cache = 3 warm-up reads discarded. Cold-cache = `sync; echo 3 > /proc/sys/vm/drop_caches` between runs (requires root).
-- **Memory**: Peak RSS via `/proc/self/status` or `resource.getrusage(RUSAGE_SELF).ru_maxrss`.
+- **Memory**: `rss.PeakRssSampler` — a daemon thread polling `/proc/self/statm`
+  at 5 ms for the duration of the timed region, so a transient that is allocated
+  and freed inside the op is captured. `rss.current_rss_mb()` is the same read
+  taken once, and is the right tool only where there is no transient to miss.
+  Note two things it cannot see: it samples the **calling** process, so work in
+  a spawned subprocess is invisible (`doublet_interop` reports
+  `residual_rss_mb` for that reason, not a peak), and it seeds with the entry
+  RSS, so anything the process is still holding from an earlier arm is
+  attributed to this one — which is why the streaming benchmarks run one arm per
+  subprocess.
 - **Parallel scaling**: Each thread count runs in a separate subprocess so rayon/thread pools are created fresh. SCX parallelism controlled via `RAYON_NUM_THREADS` env var.
 - **Reproducibility**: Use SLURM `--exclusive` for CPU binding. Record `uname -a`, CPU model, RAM, and storage device for every run (via `sysinfo.py`). All dependencies pinned in conda `environment.yml` files.
 - **Directory sizes**: For multi-file formats (Zarr, TileDB-SOMA, BPCells), measure with `du -sb` on the full directory.
@@ -676,6 +685,41 @@ sbatch benchmarks/scripts/slurm_build_census_5m.sh
 # D8: census_10m (1.5 TB RAM required)
 sbatch benchmarks/scripts/slurm_build_census_10m.sh
 ```
+
+### Build the `_full` fixtures (`.raw` + obsm + layer)
+
+Required by `export_streaming`'s `streaming_full` arm and `fragment_ops`'
+`compact_full` arm. Without them both arms skip, and because a threshold whose
+metric no run carries counts as a **violation** rather than a skip, the gate
+fails rather than quietly narrowing.
+
+```bash
+.venv/bin/python benchmarks/scripts/prep_full_fixtures.py \
+    --datasets pbmc3k tabula_sapiens_100k
+```
+
+Writes `$SCX_DATA_DIR/<name>_full.scx`: the source matrix plus a `.raw` copy of
+it, `obsm["X_pca"]` (50), `obsm["X_umap"]` (2) and a `counts` layer. Idempotent;
+`--force` rebuilds, `--dry-run` reports.
+
+They exist because **no source h5ad in the suite carries a `.raw`, an `obsm` key
+or a layer** — so every `.scx` fixture has `obsm_keys == []` and
+`layer_names == []`, and an export threshold measured on one is blind to the
+whole-matrix copies the export path makes. Measured at tabula_sapiens_100k
+(195M nnz), same arm, three runs each: the streaming export peaks at 1735 MB on
+`_auto.scx` and 3314 MB on `_full.scx`. The ~1.5 GB difference is
+`write_raw_to_h5ad`'s `read_all_raw_csr_shards()` holding the raw matrix whole
+— 194,891,401 nnz x 8 B = 1487 MB, which accounts for the gap to within 3%.
+
+Note the two arms cover different things. **Export** carries raw, so
+`streaming_full` measures the raw copy. **Compact** does not: `scx-ops`' carry
+table drops raw under a rewrite (with a warning) while carrying `Layer` and
+`Obsm`, so `compact_full` measures those two instead.
+
+The builder materialises the entire AnnData, so it needs roughly 3x the source
+h5ad. pbmc3k takes ~4 s, tabula_sapiens_100k (~1.5 GB source) ~90 s on a normal
+node; `census_1m` (~11 GB source) wants a high-memory allocation and is not
+built by default.
 
 ### Verify datasets
 

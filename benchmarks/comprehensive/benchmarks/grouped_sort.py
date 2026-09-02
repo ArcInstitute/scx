@@ -21,11 +21,22 @@ other format variant returns ``None`` so the orchestrator skips it (mirrors
 ``fragment_ops.py`` / ``correctness.py``). Datasets absent from ``GROUP_SPEC``
 also return ``None``.
 
-``peak_rss_mb`` is the resident-set size sampled immediately *after* each op
-(via ``current_rss_mb``), not a true peak — sufficient for gross-regression
-detection, matching ``fragment_ops``. True per-scenario peak memory (the
-dense-vs-CSR convert story) is captured in ``docs/performance.md`` from the
-``/usr/bin/time`` atlas smokes.
+The gateable memory metric is ``grouped_peak_rss_mb`` (plus sparse
+``peak_rss_mb__<scenario>`` keys). It is **not** spelled ``peak_rss_mb``,
+because that is a reserved ``add_run`` parameter: it lands on the ``RunRecord``
+and never in ``runs[].extra``, which is the only place a threshold can read.
+The three ``thresholds.yaml`` ceilings were keyed to the bare name and could
+therefore never resolve a value — and, because all three of their datasets sit
+outside every tier, the resulting missing-metric violation was never reached
+either. Two silences stacked into one that looked like coverage.
+
+``peak_rss_mb`` is a **true in-region peak**, sampled by ``PeakRssSampler`` on a
+background thread for the duration of each op. It was an end-of-op
+``current_rss_mb()`` reading until the peak-sampler change: a grouped convert
+allocates a reference-group buffer, encodes it and frees it, so an
+instantaneous sample taken after the spike has been freed cannot see it in
+either direction. Numbers recorded before that change are not comparable with
+numbers after it.
 """
 
 from __future__ import annotations
@@ -38,7 +49,7 @@ from pathlib import Path
 
 from benchmarks.comprehensive.config import DatasetConfig, FormatVariant
 from benchmarks.comprehensive.results import BenchmarkResult
-from benchmarks.comprehensive.rss import current_rss_mb as _current_rss_mb
+from benchmarks.comprehensive.rss import PeakRssSampler
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +84,22 @@ def _gc() -> None:
 
 
 def _time_op(fn, *args, **kwargs):
-    """Run *fn*, returning ``(result, wall_s, rss_after_mb)``."""
+    """Run *fn*, returning ``(result, wall_s, peak_rss_mb)``.
+
+    The RSS figure is the high-water mark *while fn ran*, not a reading taken
+    after it returned. The distinction is the whole point: a grouped convert
+    allocates a reference-group buffer, encodes it and frees it, so the
+    interesting number is gone by the time ``fn`` returns. ``PeakRssSampler``
+    seeds with the entry RSS, so a large object this process is still holding
+    from a previous scenario is attributed here too — that is why each caller
+    ``_gc()``s first.
+    """
     _gc()
     t0 = time.perf_counter()
-    out = fn(*args, **kwargs)
+    with PeakRssSampler() as sampler:
+        out = fn(*args, **kwargs)
     wall = time.perf_counter() - t0
-    return out, wall, _current_rss_mb()
+    return out, wall, sampler.peak_mb
 
 
 def _materialize_source(dataset: DatasetConfig, workdir: Path) -> Path:
@@ -174,6 +195,14 @@ def _run_sort_group(
             peak_rss_mb=rss,
             scenario="sort_group",
             output_size_bytes=out.stat().st_size,
+            # `peak_rss_mb=` above is a *reserved* `add_run` parameter: it lands
+            # on the RunRecord, never in `extra`, and thresholds read `extra`
+            # only. The three ceilings in thresholds.yaml were keyed to the bare
+            # name and so could never read a value. Emitted here under a name
+            # that is not reserved — plus the house-style sparse per-scenario
+            # key for diagnosis.
+            grouped_peak_rss_mb=round(rss, 1),
+            **{"peak_rss_mb__sort_group": round(rss, 1)},
         )
         logger.info("  sort_group %d/%d: wall=%.3fs rss=%.1fMB", i + 1, n_runs, wall, rss)
         if last_out is not None:
@@ -226,6 +255,8 @@ def _run_convert(
             scenario=scenario,
             group_pass=group_pass,
             output_size_bytes=out.stat().st_size,
+            grouped_peak_rss_mb=round(rss, 1),
+            **{f"peak_rss_mb__{scenario}": round(rss, 1)},
         )
         logger.info("  %s %d/%d: wall=%.3fs rss=%.1fMB", scenario, i + 1, n_runs, wall, rss)
         out.unlink(missing_ok=True)

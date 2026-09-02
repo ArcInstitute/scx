@@ -2018,6 +2018,107 @@ absolute_floors:
     metric: streaming_peak_rss_mb     # the reader_threads=4 arm only
     max: 5120.0
 
+  # ─── Streaming export of a file that actually HAS a .raw ──────────
+  #
+  # The ceiling above is measured on `census_1m_auto.scx`, and that file has no
+  # `.raw`, `obsm_keys == []` and `layer_names == []` — as does every other
+  # `.scx` in the suite, because no source h5ad carries any of the three. So it
+  # never reaches the code that copies them. A green ceiling there proves the
+  # file was small, not that the export streams.
+  #
+  # Of the three, raw is what this ceiling actually measures: `write_raw_to_h5ad`
+  # (`scx-convert/src/h5ad/write.rs`) calls `read_all_raw_csr_shards()` and holds
+  # the whole matrix. obsm is also materialised (`read_all_obsm()`, with an
+  # `ExportFilterSectionEager` warning under a keep mask) but is 19.8 MB at 52
+  # columns and does not move the number; layers already stream via
+  # `stream_layers_at`. Both are covered as regression nets, not measurements.
+  #
+  # `streaming_full_peak_rss_mb` comes from the `streaming_full` arm, which runs
+  # the same `to_h5ad(stream=True)` at the same pinned `reader_threads=4`
+  # against `<dataset>_full.scx` (built by
+  # `benchmarks/scripts/prep_full_fixtures.py`: `.raw` = a copy of X,
+  # `obsm["X_pca"]` 50-wide, `obsm["X_umap"]` 2-wide, a `counts` layer).
+  #
+  # Units: every RSS figure in this file is `rss.current_rss_mb`, which divides
+  # by 1024^2 — i.e. mebibytes, spelled MB throughout the suite. On-disk sizes
+  # below are also in MiB so the two are comparable.
+  #
+  # Measured on tabula_sapiens_100k (100,000 x 61,497, nnz = 194,891,401),
+  # three runs each, one subprocess per arm, same code path. Two independent
+  # captures — the first driving `_run_arm_subprocess` directly, the second
+  # through `run()` as the orchestrator calls it:
+  #
+  #                        capture 1 (peaks, MB)      capture 2 (peaks, MB)
+  #   `_auto.scx`  222.7 MiB   1701 / 1735 / 1769       1685 / 1743 / 1781
+  #   `_full.scx`  612.6 MiB   3195 / 3314 / 3347       3109 / 3118 / 3150
+  #
+  # medians 1735 / 1743 for the plain arm and 3314 / 3118 for the full one — a
+  # 6% spread between captures, which is why the ceiling is not set tight.
+  # Worst single observation across both: 3347.
+  #
+  # Derivation of the ~1.5 GB delta, which is the whole point of the arm:
+  #   raw nnz                          194,891,401
+  #   x (4 B data + 4 B indices)   = 1,559,131,208 B = 1487 MB
+  #   + indptr 100,001 x 8 B       =                     0.8 MB
+  #   predicted 1735 + 1488        =                    3223 MB
+  #   measured                                          3314 MB   (+2.8%)
+  # i.e. the delta IS `write_raw_to_h5ad`'s `read_all_raw_csr_shards()` holding
+  # the whole raw matrix. obsm is 100k x 52 f32 = 19.8 MB and does not move the
+  # needle at this shape; layers already stream.
+  #
+  # Ceiling at 4096 MB — 22% over the worst single observation (3347). If raw
+  # ever streams the
+  # way X and the layers already do, its term becomes one shard's worth
+  # (1487 / 7 = 213 MB) and this should fall to ~1.9 GB; lower the ceiling in
+  # that change rather than leaving 2 GB of slack behind.
+  #
+  # The arm is skipped when the fixture has not been built — and that is loud,
+  # not silent: `check_absolute_floors` treats a metric no run carries as a
+  # violation. Only a triple that did not run at all is skipped quietly.
+  - benchmark: export_streaming
+    format: scx_streaming_vs_materialize
+    dataset: tabula_sapiens_100k
+    metric: streaming_full_peak_rss_mb
+    max: 4096.0
+
+  # ─── compact of a file that HAS obsm and a layer ──────────────────
+  #
+  # The rewrite-side twin of the ceiling above, and it covers a different set of
+  # sections. `scx-ops`' carry table (`carry.rs::compact`) is explicit: under
+  # `compact`, `X | Layer | Obsm | ObsMetadata` are `RowFiltered` — carried —
+  # while `Raw` is `Dropped { warns: true }` ("raw's obs axis is not filtered in
+  # lockstep with X"). So this arm measures the **layer and obsm** copies, and
+  # the fixture's `.raw` contributes a read and a warning, not a resident copy.
+  #
+  # `fragment_ops`' plain `compact` arm runs on `<name>_auto.scx`, which has
+  # neither a layer nor an obsm key, so it never reaches either path.
+  #
+  # Measured on tabula_sapiens_100k, three runs each, two independent captures:
+  # the first calling `_time_op` directly on the undirtied `_auto.scx`, the
+  # second through `run()` as the orchestrator does (where the plain `compact`
+  # arm works on a base+append+delete file, hence its higher number — that one
+  # is the real arm).
+  #
+  #                        capture 1 (peaks, MB)      capture 2 (peaks, MB)
+  #   plain compact            1281 / 1285 / 1294       1537 / 1538 / 1541
+  #   `compact_full`           3054 / 3079 / 3185       3088 / 3201 / 3371
+  #
+  # Sizes: `_auto.scx` 222.7 MiB in -> 204.6 MiB out; `_full.scx` 612.6 MiB in
+  # -> 413.8 MiB out. The output is *smaller* than a 2.75x input would suggest
+  # precisely because raw is dropped.
+  #
+  # The ~1.6 GB delta is dominated by the `counts` layer — a second X-sized
+  # matrix, 194,891,401 nnz x 8 B = 1487 MB — plus obsm at 19.8 MB, with the
+  # remainder in re-encode buffers.
+  #
+  # Ceiling at 4096 MB, 21% over the worst single observation (3371), matching
+  # the export ceiling's construction.
+  - benchmark: fragment_ops
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: peak_rss_mb__compact_full
+    max: 4096.0
+
   # ─── Grouped sharding (sort / convert --group-by) ─────────────────
   # Correctness-only floors (perf is hardware/density sensitive — see the
   # Deferred floors note). Each grouping dataset's `grouped_sort` result carries
@@ -2094,31 +2195,59 @@ absolute_floors:
     metric: reference_isolated_int
     min: 1
   # Grouped-write RSS ceilings (gross-regression guards only).
-  # NOTE: `peak_rss_mb` is `current_rss_mb()` sampled *after* the op — the
-  # residual resident set, NOT the transient parallel-gather high-water mark (the
-  # A/B campaign measured true peak separately with `/usr/bin/time -v`:
-  # chemogenetic ~18.7 GB, replogle ~6.3 GB, tahoe ~5.0 GB), and it is cumulative
-  # across the benchmark's scenarios in one process. So this gate catches a
-  # sustained blowup toward the historical 48–72 GB OOM regime, but will NOT catch
-  # a spike-then-free peak; ceilings sit well above the residual to avoid flaky
-  # failures. The Phase-1 parallel fast path trades peak RSS for speed, bounded to
-  # O(concurrency × block cap) — RAYON_NUM_THREADS caps concurrency and the block
-  # cap is clamped to --memory-budget. Wall time stays measured-not-gated
-  # (grouped-sort perf floors are hardware-sensitive).
+  #
+  # Two things about these were wrong until the peak-sampler change, and they
+  # cancelled into something that read as coverage:
+  #
+  #   1. The metric was spelled `peak_rss_mb`, which is a **reserved**
+  #      `add_run` parameter. It lands on the RunRecord and never in
+  #      `runs[].extra`, and `_load_current_raw_metric` reads `extra` only —
+  #      so the ceiling could not resolve a value on any run, ever. Verified
+  #      against the tracked
+  #      `results/raw/grouped_sort__scx_auto__chemogenetic_rgfp.json`: its runs
+  #      carry `extra = {scenario, output_size_bytes}` and nothing else.
+  #   2. That would normally be a loud missing-metric violation. It never fired
+  #      because all three datasets sit outside every `capture_baseline.TIERS`
+  #      list, so a default gate run never produces the triple and
+  #      `check_absolute_floors` skips it silently.
+  #
+  # The metric is now `grouped_peak_rss_mb`, emitted in `extra` on every timed
+  # run (a sparse `peak_rss_mb__<scenario>` is emitted alongside it for
+  # diagnosis, not gated). `tests/test_floor_reachability.py` now rejects any
+  # floor keyed to a reserved parameter name.
+  #
+  # The measurement also changed: it is a true in-region `PeakRssSampler` peak,
+  # not `current_rss_mb()` sampled after the op. **The values below are
+  # unchanged and deliberately so.** The A/B campaign already measured the true
+  # peaks separately with `/usr/bin/time -v` — chemogenetic ~18.7 GB, replogle
+  # ~6.3 GB, tahoe ~5.0 GB — and each ceiling already sits 1.7-2.4x above its
+  # dataset's true peak. Raising them on the theory that "a peak reads higher
+  # than a residual" would have loosened a bound that already fits.
+  #
+  # These still catch a sustained blowup toward the historical 48-72 GB OOM
+  # regime rather than a tight contract. The Phase-1 parallel fast path trades
+  # peak RSS for speed, bounded to O(concurrency x block cap) —
+  # RAYON_NUM_THREADS caps concurrency and the block cap is clamped to
+  # --memory-budget. Wall time stays measured-not-gated (grouped-sort perf
+  # floors are hardware-sensitive).
+  #
+  # NOTE these three remain reachable only when a capture names their datasets
+  # explicitly (`--datasets chemogenetic_rgfp replogle_k562 tahoe_c38`); no
+  # tier includes them. That gap is tracked in the Deferred floors block.
   - benchmark: grouped_sort
     format: scx_auto
     dataset: chemogenetic_rgfp
-    metric: peak_rss_mb
+    metric: grouped_peak_rss_mb
     max: 32000.0
   - benchmark: grouped_sort
     format: scx_auto
     dataset: replogle_k562
-    metric: peak_rss_mb
+    metric: grouped_peak_rss_mb
     max: 16000.0
   - benchmark: grouped_sort
     format: scx_auto
     dataset: tahoe_c38
-    metric: peak_rss_mb
+    metric: grouped_peak_rss_mb
     max: 12000.0
 
   # ─── Grouped read (cross-format head-to-head: scx vs shardad) ──────
@@ -2821,3 +2950,90 @@ absolute_floors:
 #    ALREADY-sorted key costs the same 1.301x, so it is not reordering. Closing
 #    it means preserving each shard's value encoding through
 #    compact/merge/sort/subset, which is why it is not folded into the codec fix.
+#
+# 11. read_selective per-scenario wall thresholds: need a recapture
+#    Every run of `read_selective` now carries a sparse
+#    `wall_s__<scenario>` key in `extra` — the per-scenario numbers
+#    were already computed, but only into `metadata["scenario_summary"]`, which
+#    thresholds cannot read. So the plumbing is done and the numbers are not.
+#
+#    Why the aggregate cannot be gated: `median_wall_s` on this benchmark
+#    averages three fixed scenarios plus up to three predicates. On census_1m
+#    the recorded IQR is 11.54 s against a 13.85 s median — that dispersion is
+#    scenario *mixing*, not noise, and no tolerance over it means anything.
+#
+#    Blocker: the values. `results/baselines/LATEST`
+#    (v0.11.2-multimodal-loader-fix) predates the per-scenario keys entirely, so
+#    there is no median to multiply. Adding them now under `absolute_floors`
+#    would synthesise a missing-metric violation on every run against the
+#    current baseline, which is the failure this whole block exists to avoid.
+#
+#    To activate, after the PR-03 recapture:
+#      1. Read the per-scenario medians out of
+#         `<candidate>/raw/read_selective__scx_auto__census_1m.json` — filter
+#         `runs[]` by `extra.scenario` and median `extra["wall_s__<scenario>"]`.
+#         (`metadata["scenario_summary"][<scenario>]["median_s"]` is the same
+#         number and easier to read; they are computed from one list.)
+#      2. Author three rows at 1.25x each measured median:
+#           benchmark: read_selective / format: scx_auto / dataset: census_1m
+#           metric: wall_s__filtered_query__cell_type_eq_t_cell
+#           metric: wall_s__filtered_query__random_1pct
+#           metric: wall_s__col_projection
+#      3. DO NOT author `wall_s__filtered_query__n_counts_gt_1000` on any census
+#         dataset. That predicate does not run there: `_applicable_predicates`
+#         drops it when `obs['n_counts']` is absent, and the column is injected
+#         only for pbmc3k and tabula_sapiens_100k, by
+#         `benchmarks/scripts/augment_obs_n_counts.py`. Confirmed against all
+#         three tracked `read_selective__*__census_1m.json` files: their
+#         `scenario_summary` keys are col_projection / combined /
+#         filtered_query__cell_type_eq_t_cell / filtered_query__random_1pct /
+#         row_slice. A threshold on the missing one is a permanent violation.
+#      4. Leave `combined` and `row_slice` ungated for now — one capture cannot
+#         separate their cold-cache variance from a real regression, and the
+#         three above are the ones a predicate-pushdown or column-projection
+#         change would actually move.
+#
+# 12. 53 floors sit on datasets that no tier schedules
+#    Counted 2026-09-01 against `capture_baseline.TIERS` (small / full / xl),
+#    comparing on `DatasetConfig.name` — the tier lists use DATASETS *keys*
+#    (`cite_seq_pbmc`) while result filenames use `.name`
+#    (`cite_seq_pbmc_5k`), so a naive key comparison over-reports by 8:
+#
+#      grouped_read     chemogenetic_rgfp 6  replogle_k562 6  tahoe_c38 4  nb_glm_synth 4
+#      grouped_sort     chemogenetic_rgfp 4  replogle_k562 4  tahoe_c38 3  nb_glm_synth 2
+#                       pert_synth_10k 3
+#      cell_eval_parity_perf  pert_synth_10k 3   pert_synth_100k 3
+#      cloud_read       census_10m 5
+#      accel_de_nb_glm  nb_glm_synth 3
+#      accel_eval_metrics     pert_synth_10k 2
+#      shardad_fidelity nb_glm_synth 1
+#
+#    `gate_candidate.py` forwards `--datasets` only when the operator passes it,
+#    and `check_absolute_floors` skips a triple that did not run *silently* —
+#    correctly, so that narrowing a run with `--datasets` does not produce dozens
+#    of spurious rows. The consequence is that a default gate run evaluates none
+#    of the 53.
+#
+#    Recorded rather than fixed because the fix is a policy decision, not an
+#    edit. Either add the fixtures to a tier — the grouping ones are staged by
+#    `scripts/prep_grouped_fixtures.py` from a shared path rather than
+#    downloaded, so a tier including them fails on a machine without that path,
+#    and the synthetic ones are materialised in-process and would multiply the
+#    matrix — or teach `gate_candidate.py` to union in the datasets that any
+#    active floor names. The second is the better shape and belongs with whoever
+#    owns the tier definitions.
+#
+#    Until then a capture intending to exercise them must say so, e.g.
+#    `--datasets chemogenetic_rgfp replogle_k562 tahoe_c38 nb_glm_synth
+#    pert_synth_10k pert_synth_100k`.
+#
+# 13. The `_full` fixture at census scale
+#    `streaming_full_peak_rss_mb` is floored on tabula_sapiens_100k only.
+#    `census_1m_full.scx` is not built: the source is an 11 GB h5ad and the
+#    builder materialises the whole AnnData, so it wants a high-mem allocation
+#    that belongs with the PR-03 capture prep rather than with the instrument
+#    change. Build it with
+#      python benchmarks/scripts/prep_full_fixtures.py --datasets census_1m
+#    and then author the census row beside the tabula one. Expect the ceiling to
+#    be dominated by the same `read_all_raw_csr_shards()` term: the plain
+#    census_1m export measures 3162 MB at rt=4, and raw adds ~8 B/nnz on top.

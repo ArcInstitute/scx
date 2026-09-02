@@ -23,6 +23,35 @@ Rust round-trip tests at
 and friends. The benchmark only needs to flag drift, not
 characterise it.
 
+A fourth arm, **streaming_full**, runs the same streaming export against
+``<dataset>_full.scx`` — a fixture carrying a ``.raw``, ``obsm["X_pca"]``,
+``obsm["X_umap"]`` and a ``counts`` layer, built by
+``benchmarks/scripts/prep_full_fixtures.py``. It exists because no source h5ad
+in the suite has any of those, so ``census_1m_auto.scx`` and
+``tabula_sapiens_100k_auto.scx`` report ``obsm_keys == []`` and
+``layer_names == []``, and the ``streaming_peak_rss_mb`` ceiling measured on
+them never reaches the code that copies them.
+
+What the arm actually covers, checked against the export path rather than
+assumed:
+
+* **raw — materialised, and dominant.** ``write_raw_to_h5ad``
+  (``scx-convert/src/h5ad/write.rs``) calls ``read_all_raw_csr_shards()`` and
+  holds the whole matrix. Measured at tabula_sapiens_100k: 1735 MB on the plain
+  fixture against 3314 MB here, a delta that 194,891,401 nnz x 8 B = 1487 MB
+  accounts for to within 3%.
+* **obsm — materialised, but small at this shape.** ``stream_write.rs`` reads
+  ``read_all_obsm()`` whole and emits an ``ExportFilterSectionEager`` warning
+  under a keep mask. At 52 columns that is 19.8 MB and does not move the
+  ceiling; the arm covers it as a regression net, not as a measurement.
+* **layers — already streamed** via ``stream_layers_at``. Covered for the same
+  reason: so a regression to a materialising path would show up here.
+
+The arm carries ``streaming_full_peak_rss_mb``, and is skipped (with the reason
+recorded) when the fixture has not been built. That skip is loud rather than
+quiet: a threshold whose metric no run carries is a violation, not a skip, so a
+missing fixture fails the gate instead of narrowing it.
+
 Thread scaling is opt-in via the
 ``SCX_EXPORT_STREAM_THREAD_COUNTS`` env var (comma-separated, e.g.
 ``1,2,4,8,16,32``). Mirrors the ingestion benchmark's
@@ -547,9 +576,34 @@ def run(
         },
     )
 
+    # The `.raw` + obsm + layer arm. Absent unless
+    # `benchmarks/scripts/prep_full_fixtures.py` has been run for this dataset,
+    # and skipped for multimodal (that fixture is single-modality only).
+    #
+    # The skip is recorded, not silent — but note it is *also* loud at the gate:
+    # a threshold whose metric no run carries is a violation, not a skip, so a
+    # missing fixture fails the gate rather than quietly reducing coverage.
+    full_scx: Path | None = None
+    if dataset.multimodal:
+        result.metadata["full_arm_skipped_reason"] = (
+            "the .raw + obsm + layer fixture is single-modality only"
+        )
+    elif dataset.scx_full_path.exists():
+        full_scx = dataset.scx_full_path
+        log.info("Using full fixture (.raw + obsm + layer): %s", full_scx)
+    else:
+        result.metadata["full_arm_skipped_reason"] = (
+            f"{dataset.scx_full_path} does not exist — build it with "
+            f"`python benchmarks/scripts/prep_full_fixtures.py --datasets "
+            f"{dataset.name}`"
+        )
+        log.warning("%s", result.metadata["full_arm_skipped_reason"])
+
     try:
         if thread_counts is None:
-            return _run_isolated(scx_in, out_ext, n_runs, result, dataset.n_obs)
+            return _run_isolated(
+                scx_in, out_ext, n_runs, result, dataset.n_obs, full_scx,
+            )
         return _run_with_thread_scaling(
             scx_in, out_ext, n_runs, thread_counts, result
         )
@@ -564,8 +618,9 @@ def _run_isolated(
     n_runs: int,
     result: BenchmarkResult,
     n_obs: int = 0,
+    full_scx: Path | None = None,
 ) -> BenchmarkResult:
-    """Default path: three arms, each in its own subprocess.
+    """Default path: up to four arms, each in its own subprocess.
 
     * ``streaming`` at :data:`GATED_READER_THREADS` — carries
       ``streaming_peak_rss_mb``, the key ``thresholds.yaml`` floors, pinned so
@@ -573,6 +628,10 @@ def _run_isolated(
     * ``streaming_default_threads`` at the inherited parallelism — recorded, not
       gated.
     * ``materialize`` — ``stream=False``, the comparison baseline.
+    * ``streaming_full`` — the same streaming export, at the same pinned thread
+      count, of a fixture that carries a ``.raw``, two ``obsm`` keys and a
+      layer. Carries ``streaming_full_peak_rss_mb``. See the module docstring
+      for what each of the three actually costs.
 
     Replaces the previous in-process paired loop. That loop's docstring noted
     that it passed flat kwargs to ``add_run`` "so the floor at thresholds.yaml
@@ -588,18 +647,23 @@ def _run_isolated(
     if skip_materialize:
         log.info("materialize arm skipped: %s", skip_materialize)
 
-    arms: list[tuple[str, int | None]] = [
-        ("streaming", GATED_READER_THREADS),
-        ("streaming_default_threads", None),
+    # (label, reader_threads, input .scx). The path is per-arm because
+    # `streaming_full` reads a *different* file — see the module docstring.
+    arms: list[tuple[str, int | None, Path]] = [
+        ("streaming", GATED_READER_THREADS, scx_in),
+        ("streaming_default_threads", None, scx_in),
     ]
     if not skip_materialize:
-        arms.append(("materialize", None))
+        arms.append(("materialize", None, scx_in))
+    if full_scx is not None:
+        arms.append(("streaming_full", GATED_READER_THREADS, full_scx))
+        result.metadata["full_fixture_path"] = str(full_scx)
 
     structural: dict[str, dict | None] = {}
-    for label, reader_threads in arms:
+    for label, reader_threads, arm_scx in arms:
         scenario = "materialize" if label == "materialize" else "streaming"
         records = _run_arm_subprocess(
-            scx_in, out_ext, n_runs, scenario, reader_threads=reader_threads,
+            arm_scx, out_ext, n_runs, scenario, reader_threads=reader_threads,
         )
         for rec in records:
             if rec.get("structural") is not None and label not in structural:
