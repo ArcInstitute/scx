@@ -14,10 +14,26 @@ clock, and basic output-equality metadata for each path:
   triplet.
 
 Output equality between the two paths is measured at the "structural"
-level (n_obs / n_vars / nnz / catalog n_csr_shards). Bit-level
-equality is asserted in the Rust round-trip test
+level (n_obs / n_vars / nnz / catalog shard_count / n_csc_shards).
+Bit-level equality is asserted in the Rust round-trip test
 `scx-convert/src/tests.rs::streaming_round_trip_matches_non_streaming`;
 the benchmark only needs to flag drift, not characterise it.
+
+Two **extra streaming arms** run on the datasets named in `_EXTRA_ARMS`. Both
+exist because the arms above pass *no* conversion options at all — their only
+kwarg is `reader_threads` — so the bounded-memory contract this benchmark
+enforces has only ever been measured in the default configuration:
+
+- **csc_always** — `from_h5ad(..., csc="always")`. `CscPolicy::default()` is
+  `off`, so nothing in this suite has exercised `write_csc_sidecar`, which takes
+  the whole CSR by value. Expected to breach the streaming ceiling.
+- **index_preset_cellxgene** — `from_h5ad(..., index_preset="cellxgene")`,
+  materialising predicate indexes at write time.
+
+Each is pinned to the same `GATED_READER_THREADS` as the gated arm so its number
+is comparable, and each gets `<label>_peak_rss_mb` / `<label>_wall_s` from the
+same f-string the base arms use — no separate emission path, and no chance of an
+extra arm polluting the floored `streaming_peak_rss_mb` key.
 
 Thread scaling is opt-in via the `SCX_CONV_STREAM_THREAD_COUNTS` env
 var (comma-separated, e.g. `1,2,4,8,16,32`). When set, each thread
@@ -115,26 +131,82 @@ def _skip_materialize_reason(n_obs: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+# Extra streaming arms: the same `from_h5ad` call with one conversion option
+# changed. Each entry is `label -> (from_h5ad kwargs, dataset allow-list)`.
+#
+# Both exist because the default arm passes **no** conversion options at all
+# (its only kwarg is `reader_threads`), so the bound this benchmark enforces is
+# measured in a configuration real callers do not always use.
+#
+# * `csc_always` — `CscPolicy::default()` is `off`, so nothing here has ever
+#   exercised `write_csc_sidecar`, which takes the whole CSR by value. Scoped to
+#   `tabula_sapiens_100k` deliberately: this arm is expected to breach its
+#   ceiling and therefore needs a justification, and justification suppression is
+#   **whole-triple** — attaching one to census_1m would also suppress the live
+#   `streaming_peak_rss_mb <= 4096` floor on that triple.
+# * `index_preset_cellxgene` — materialises predicate indexes at write time.
+#   Scoped to the CELLxGENE-Census-derived datasets, which are the ones carrying
+#   the columns the preset names. Checked, not assumed: the preset names ten obs
+#   columns (`cell_type`, `cell_type_ontology_term_id`, `tissue`,
+#   `tissue_ontology_term_id`, `disease`, `assay`, `donor_id`,
+#   `development_stage`, `sex`, `suspension_type` —
+#   `scx-engine/src/index/diagnostics.rs`) and `tabula_sapiens_100k.h5ad` has all
+#   ten. pbmc3k has none, and measurably runs it as a no-op: the arm's output is
+#   4,379,713 B against the default arm's 4,379,851 B, a 138-byte provenance
+#   difference and no index sections at all.
+_EXTRA_ARMS: dict[str, tuple[dict[str, object], frozenset[str]]] = {
+    "csc_always": ({"csc": "always"}, frozenset({"tabula_sapiens_100k"})),
+    "index_preset_cellxgene": (
+        {"index_preset": "cellxgene"},
+        frozenset({"tabula_sapiens_100k", "census_500k", "census_1m"}),
+    ),
+}
+
+
 def _structural_summary(scx_path: Path) -> dict[str, int]:
-    """Read an SCX file and return the structural fingerprint
-    (n_obs / n_vars / nnz / n_csr_shards / n_csc_shards) used for
-    cross-path equality. Bit-level equality is asserted in the Rust
-    tests — see Phase 8."""
+    """Structural fingerprint of an output, for cross-path equality.
+
+    Returns `n_obs` / `n_vars` / `nnz` / `shard_count` / `n_csc_shards`. Bit-level
+    equality is asserted in the Rust tests — see Phase 8; this only needs to
+    flag drift.
+
+    `n_csc_shards` is here for the `csc_always` arm and doubles as its premise
+    check: if that arm reports 0 it converted without building a sidecar, and its
+    wall and peak measured the default path under the wrong label. It is 0 on
+    every other arm, so adding it does not change the streaming-vs-materialize
+    equality above.
+
+    (The docstring claimed `n_csr_shards` / `n_csc_shards` before this change
+    while the body returned neither name — `shard_count` and nothing.)
+    """
     import pyscx
 
     reader = pyscx.open(str(scx_path))
-    return {
-        "n_obs": int(reader.n_obs),
-        "n_vars": int(reader.n_vars),
-        "nnz": int(reader.nnz),
-        "shard_count": int(reader.shard_count),
-    }
+    try:
+        n_csc = 0
+        if reader.has_csc:
+            n_csc = sum(
+                1 for name, _ in reader.validate()
+                if name.startswith("X_csc_shard_")
+            )
+        return {
+            "n_obs": int(reader.n_obs),
+            "n_vars": int(reader.n_vars),
+            "nnz": int(reader.nnz),
+            "shard_count": int(reader.shard_count),
+            "n_csc_shards": n_csc,
+        }
+    finally:
+        close = getattr(reader, "close", None)
+        if close is not None:
+            close()
 
 
 def _timed_streaming(
     h5ad_path: Path,
     out_path: Path,
     reader_threads: int | None = None,
+    extra_kwargs: dict[str, object] | None = None,
 ) -> dict[str, float]:
     """Run `pyscx.from_h5ad` and capture wall + the true in-region peak RSS.
 
@@ -163,7 +235,14 @@ def _timed_streaming(
     """
     import pyscx
 
-    kwargs = {} if reader_threads is None else {"reader_threads": reader_threads}
+    kwargs: dict[str, object] = (
+        {} if reader_threads is None else {"reader_threads": reader_threads}
+    )
+    # `extra_kwargs` is the arm's conversion option (e.g. `csc="always"`). It is
+    # merged rather than replacing, so an extra arm still runs at the pinned
+    # thread count and stays comparable with the default one.
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
     t0 = time.perf_counter()
     with PeakRssSampler() as sampler:
         pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
@@ -210,6 +289,8 @@ _WORKER_SCRIPT = textwrap.dedent("""\
     scenario = sys.argv[3]          # "streaming" | "materialize"
     rt = sys.argv[4]                # reader_threads, or "" to inherit
     reader_threads = int(rt) if rt else None
+    # from_h5ad kwargs for an extra arm, JSON, or "" for the default arm.
+    extra_kwargs = json.loads(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else {}
 
     from benchmarks.comprehensive.benchmarks.conversion_streaming import (
         _timed_streaming,
@@ -226,7 +307,9 @@ _WORKER_SCRIPT = textwrap.dedent("""\
         with tempfile.TemporaryDirectory(prefix=prefix) as tmp:
             out = Path(tmp) / fname
             if scenario == "streaming":
-                t = _timed_streaming(Path(h5ad_path), out, reader_threads)
+                t = _timed_streaming(
+                    Path(h5ad_path), out, reader_threads, extra_kwargs
+                )
             else:
                 # `from_anndata` has no reader-threads knob; the arm is a
                 # whole-file materialization either way.
@@ -254,6 +337,7 @@ def _run_arm_subprocess(
     scenario: str,
     thread_count: int | None = None,
     reader_threads: int | None = None,
+    extra_kwargs: dict[str, object] | None = None,
 ) -> list[dict]:
     """Run ``n_runs`` of **one** arm in a fresh subprocess.
 
@@ -280,6 +364,7 @@ def _run_arm_subprocess(
             sys.executable, "-c", _WORKER_SCRIPT,
             str(h5ad_path), str(n_runs), scenario,
             "" if reader_threads is None else str(reader_threads),
+            json.dumps(extra_kwargs) if extra_kwargs else "",
         ],
         capture_output=True,
         text=True,
@@ -420,7 +505,9 @@ def run(
         log.info("materialize arm skipped: %s", skip_materialize)
 
     if thread_counts is None:
-        return _run_isolated(h5ad_path, n_runs, result, skip_materialize)
+        return _run_isolated(
+            h5ad_path, n_runs, result, skip_materialize, dataset.name,
+        )
     if skip_materialize:
         # Thread scaling exists to compare how the two arms scale, so dropping
         # one silently would make its output meaningless — and running a ~136 GB
@@ -441,8 +528,9 @@ def _run_isolated(
     n_runs: int,
     result: BenchmarkResult,
     skip_materialize: str | None = None,
+    dataset_name: str | None = None,
 ) -> BenchmarkResult:
-    """Default path: three arms, each in its own subprocess.
+    """Default path: three arms plus any applicable extra arms, one subprocess each.
 
     * ``streaming`` at :data:`GATED_READER_THREADS` — carries
       ``streaming_peak_rss_mb``, the key ``thresholds.yaml`` floors. Pinned so
@@ -451,6 +539,11 @@ def _run_isolated(
       ``streaming_default_threads_peak_rss_mb``, **recorded, not gated**, so the
       real-world number stays visible without making the gate machine-dependent.
     * ``materialize`` — the comparison baseline. No reader-threads knob applies.
+    * any entry of :data:`_EXTRA_ARMS` whose dataset allow-list contains
+      ``dataset_name`` — the same pinned streaming conversion with one option
+      changed (``csc="always"``, ``index_preset="cellxgene"``). Each carries
+      ``<label>_peak_rss_mb`` / ``<label>_wall_s`` for free from the f-string
+      below, so no new emission path is needed.
 
     One arm per process is load-bearing, not tidiness: the materialize arm
     allocates tens of GB, glibc does not return it, and
@@ -459,16 +552,34 @@ def _run_isolated(
     in one process, the streaming figure climbed 1722 -> 2983 -> 3472 MB across
     three identical runs.
     """
-    arms: list[tuple[str, int | None]] = [("streaming", GATED_READER_THREADS)]
-    arms.append(("streaming_default_threads", None))
+    # (label, reader_threads, from_h5ad kwargs)
+    arms: list[tuple[str, int | None, dict[str, object]]] = [
+        ("streaming", GATED_READER_THREADS, {}),
+        ("streaming_default_threads", None, {}),
+    ]
     if not skip_materialize:
-        arms.append(("materialize", None))
+        arms.append(("materialize", None, {}))
+
+    applicable_extras = []
+    for label, (kwargs, datasets) in _EXTRA_ARMS.items():
+        if dataset_name in datasets:
+            # Pinned to GATED_READER_THREADS so an extra arm's number is
+            # comparable with the default arm's rather than with the runner.
+            arms.append((label, GATED_READER_THREADS, kwargs))
+            applicable_extras.append(label)
+        else:
+            result.metadata.setdefault("extra_arms_skipped", {})[label] = (
+                f"{dataset_name} is not in this arm's dataset scope "
+                f"({sorted(datasets)})"
+            )
+    result.metadata["extra_arms"] = applicable_extras
 
     structural: dict[str, dict | None] = {}
-    for label, reader_threads in arms:
+    for label, reader_threads, extra_kwargs in arms:
         scenario = "materialize" if label == "materialize" else "streaming"
         records = _run_arm_subprocess(
             h5ad_path, n_runs, scenario, reader_threads=reader_threads,
+            extra_kwargs=extra_kwargs or None,
         )
         for rec in records:
             if rec.get("structural") is not None and label not in structural:
@@ -484,6 +595,10 @@ def _run_isolated(
                     "reader_threads": reader_threads,
                     f"{label}_peak_rss_mb": rec["peak_rss_mb"],
                     f"{label}_wall_s": rec["wall_s"],
+                    "from_h5ad_kwargs": (
+                        ", ".join(f"{k}={v!r}" for k, v in extra_kwargs.items())
+                        or "(none)"
+                    ),
                 },
             )
             result.metadata["scenarios"].append(label)

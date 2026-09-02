@@ -1124,6 +1124,23 @@ def estimate_memory_gb(
         # not a decision: `export_streaming`'s own docstring flagged the absence
         # as the reason its materialize cap had to exist at all.
         peak_mb = max(base_mb * 1.5, 8 * 1024)
+    elif benchmark == "build_csc":
+        # `write_csc_sidecar` takes the whole CSR by value and builds the
+        # column-major transpose beside it, so the working set tracks the sparse
+        # footprint and not the `memory_limit` the caller passes — the gap this
+        # benchmark exists to measure.
+        #
+        # Sized from the measurement rather than from `dense_mb`: peak was
+        # 2970 MB at tabula_sapiens_100k and 8137 MB at census_500k, against
+        # `base_mb` (2x the source h5ad) of 3200 and 11,400 MB. So 1.5x base
+        # covers both with room; `dense_mb * 0.6` would have asked for 70 GB at
+        # census_500k for an 8 GB peak.
+        peak_mb = max(base_mb * 1.5, 8 * 1024)
+    elif benchmark == "mtx_export":
+        # Both directions materialise: `to_mtx` reads the whole CSR before
+        # formatting, `from_mtx` parses the triplet into one. Bounded by the
+        # sparse footprint plus the gzip buffers, not by the dense matrix.
+        peak_mb = max(base_mb, dense_mb * 0.5)
     elif benchmark == "fragment_ops":
         # SCX-only. pyscx.append reads the entire input CSR into memory
         # (indptr + indices + decoded values) before re-encoding into the
@@ -1556,6 +1573,22 @@ def estimate_time_minutes(
         # layer and two obsm matrices). At N_RUNS_LARGE=3 those two arms alone
         # are ~21 min, which the 15-min fall-through default does not cover.
         "fragment_ops":           45,
+        # One in-place sidecar build per run, plus a file copy per run outside
+        # the timed region. O(nnz) with a column-major transpose on top: 259 s
+        # per run at tabula_sapiens_100k (195M nnz) and 1630 s at census_500k
+        # (747M nnz), i.e. ~1.3 us per non-zero. At N_RUNS_LARGE=3 that is
+        # 13 min and 81 min respectively, so the base alone cannot cover census
+        # — see the steeper slope below.
+        "build_csc":              45,
+        # O(nnz) over a gzipped *text* triplet and neither direction streams —
+        # 3.5 us per non-zero on export, against `build_csc`'s 1.3, which makes
+        # this the slowest per-non-zero path in the suite. Measured on pbmc3k
+        # (2,286,884 nnz): to_mtx 287k nnz/s, from_mtx 450k nnz/s. At
+        # tabula_sapiens_100k (195M nnz) that is ~11 min per export and ~7 min
+        # per ingest, so N_RUNS_LARGE=3 exports + 1 deletion export + 3 ingests
+        # is ~67 min. The module caps itself at n_obs <= 100,000 for the same
+        # arithmetic — census_500k would be about an hour per export.
+        "mtx_export":            150,
     }
     base = base_minutes.get(benchmark, 15)
 
@@ -1569,6 +1602,13 @@ def estimate_time_minutes(
         # dominate. Steeper than the 8/M default so the larger OOC tiers don't
         # clip.
         slope_minutes_per_million = 15
+    elif benchmark == "build_csc":
+        # Measured: 259 s per run at 195M non-zeros (tabula_sapiens_100k) and
+        # 1630 s at 747M (census_500k) — about 2.2 s per million non-zeros. At
+        # N_RUNS_LARGE=3 that is 13 min
+        # and 81 min, and the 8/M default would have budgeted 49 min for the
+        # 81-minute cell. 90/M puts census_500k at 90 min and census_1m at 135.
+        slope_minutes_per_million = 90
     elif benchmark == "shuffle_layout":
         # Every arm is O(nnz): each rewrite decodes and re-encodes the whole
         # matrix, and the size sweep does that once per codec variant. Steeper

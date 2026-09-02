@@ -65,6 +65,19 @@ ALL_BENCHMARKS: list[str] = [
     "doublet_interop",
     # SCX-only fragment / manifest operations
     "fragment_ops",
+    # SCX-only CSC sidecar build. The one operation in the suite with a
+    # *declared* memory contract — `build_csc(memory_limit=...)` — and no
+    # measurement of whether it holds. Emits
+    # `peak_over_memory_limit__build_csc`; the contract threshold is deferred
+    # (see thresholds.yaml) because the op is expected to breach any sane
+    # bound until the sidecar writer streams.
+    "build_csc",
+    # SCX-only MatrixMarket export + ingest (`pyscx.to_mtx` / `from_mtx`).
+    # Neither direction had a benchmark. Also carries the `mtx_header_integer`
+    # contract: an integral matrix must declare `integer`, not `real`, in the
+    # `%%MatrixMarket` banner — deriving that flag from a shard's value encoding
+    # rather than from the values would flip every h5ad-sourced file.
+    "mtx_export",
     # SCX-only grouped sharding: sort --group-by + convert-time grouping
     # (gated on scx_auto + a GROUP_SPEC dataset entry inside the module).
     "grouped_sort",

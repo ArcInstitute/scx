@@ -302,8 +302,9 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
 
     calls = []
 
-    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None, reader_threads=None):
-        calls.append((scenario, reader_threads))
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        calls.append((scenario, reader_threads, extra_kwargs))
         return [{
             "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
             "peak_rss_mb": 123.0, "reader_threads": reader_threads,
@@ -328,10 +329,12 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
 
     # One process per arm, and the GATED arm must be the pinned one — a floor
     # measured at the runner's core count is a property of the runner.
+    # `dataset_name` is None here, so no `_EXTRA_ARMS` entry applies and the
+    # three base arms are all that run.
     assert calls == [
-        ("streaming", cs.GATED_READER_THREADS),
-        ("streaming", None),
-        ("materialize", None),
+        ("streaming", cs.GATED_READER_THREADS, None),
+        ("streaming", None, None),
+        ("materialize", None, None),
     ], calls
 
     gated = [r for r in result.runs if r.extra.get("scenario") == "streaming"]
@@ -358,6 +361,98 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     )
     assert result.metadata["structural"]["equal"] is True
     assert result.metadata["gated_reader_threads"] == cs.GATED_READER_THREADS
+
+
+def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
+    """`_EXTRA_ARMS` must reach the worker, and only on the right datasets.
+
+    The two extra arms (`csc_always`, `index_preset_cellxgene`) are the same
+    `from_h5ad` call with one conversion option changed, and the whole reason
+    they exist is that the default arm passes **no** conversion options — so the
+    bound `streaming_peak_rss_mb` enforces is measured in a configuration real
+    callers do not always use.
+
+    Two properties, both easy to lose in a refactor and neither visible in the
+    result JSON if lost:
+
+    1. the arm's kwargs actually reach `_timed_streaming` (a dropped
+       `extra_kwargs` would run the *default* conversion under an arm labelled
+       `csc_always`, i.e. measure the wrong thing under the right name); and
+    2. the arm is pinned to `GATED_READER_THREADS`, so its number is comparable
+       with the default arm's rather than with the runner's core count.
+
+    Scope matters for a third reason recorded in the module: `csc_always` is
+    expected to breach its ceiling and so needs a justification, and
+    justification suppression is *whole-triple* — so it must not run on a
+    dataset that carries a live floor.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def drive(dataset_name):
+        calls = []
+
+        def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                     reader_threads=None, extra_kwargs=None):
+            calls.append((scenario, reader_threads, extra_kwargs))
+            return [{
+                "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+                "peak_rss_mb": 123.0, "reader_threads": reader_threads,
+                "structural": {"n_obs": 1, "n_vars": 1, "nnz": 1, "shard_count": 1},
+                "output_bytes": 10,
+            }]
+
+        original = cs._run_arm_subprocess
+        try:
+            cs._run_arm_subprocess = fake_arm
+            result = cs._run_isolated(
+                pathlib.Path("/nonexistent.h5ad"), 1,
+                BenchmarkResult(
+                    benchmark="conversion_streaming",
+                    format="scx_streaming_vs_materialize",
+                    dataset=dataset_name or "unit",
+                    metadata={"scenarios": []},
+                ),
+                None,
+                dataset_name,
+            )
+        finally:
+            cs._run_arm_subprocess = original
+        return calls, result
+
+    # In scope for both extras.
+    calls, result = drive("tabula_sapiens_100k")
+    by_kwargs = {tuple(sorted((k, repr(v)) for k, v in (kw or {}).items())): rt
+                 for _, rt, kw in calls}
+    assert (("csc", "'always'"),) in by_kwargs, calls
+    assert (("index_preset", "'cellxgene'"),) in by_kwargs, calls
+    assert by_kwargs[(("csc", "'always'"),)] == cs.GATED_READER_THREADS
+    assert set(result.metadata["extra_arms"]) == {
+        "csc_always", "index_preset_cellxgene"
+    }
+    labels = {r.extra["scenario"] for r in result.runs}
+    assert "csc_always" in labels and "index_preset_cellxgene" in labels
+    for label in ("csc_always", "index_preset_cellxgene"):
+        rows = [r for r in result.runs if r.extra["scenario"] == label]
+        assert rows and all(f"{label}_peak_rss_mb" in r.extra for r in rows)
+        assert all("streaming_peak_rss_mb" not in r.extra for r in rows), (
+            f"{label} must not emit the gated key, or the census floor's median "
+            f"would mix arms"
+        )
+
+    # census_1m carries the live `streaming_peak_rss_mb` floor, so `csc_always`
+    # — which needs a whole-triple justification — must NOT run there.
+    calls, result = drive("census_1m")
+    assert all((kw or {}).get("csc") is None for _, _, kw in calls), calls
+    assert result.metadata["extra_arms"] == ["index_preset_cellxgene"]
+    assert "csc_always" in result.metadata["extra_arms_skipped"]
+
+    # A dataset in neither scope runs the three base arms only.
+    calls, result = drive("pbmc3k")
+    assert [c[0] for c in calls] == ["streaming", "streaming", "materialize"]
+    assert result.metadata["extra_arms"] == []
 
 
 def test_both_streaming_modules_use_the_true_peak_sampler():
