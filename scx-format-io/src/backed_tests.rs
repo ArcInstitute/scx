@@ -1084,6 +1084,215 @@ fn test_read_rows_with_out_of_range_errors() {
 }
 
 // -----------------------------------------------------------------------
+// BackedCsrReader::read_row_indices — bounded gather (PR C / REC-1)
+// -----------------------------------------------------------------------
+
+/// `read_row_indices` shares `read_rows_with`'s out-of-range contract: an
+/// error, not a silently shorter result. (Before PR C it dropped the row via
+/// `shards_for_indices`, so a caller asking for 5 rows could get 4 back.)
+#[test]
+fn test_read_row_indices_out_of_range_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+    let err = backed
+        .read_row_indices(&[5, 99])
+        .expect_err("an out-of-range row must error, not be dropped");
+    assert!(
+        err.to_string().contains("99"),
+        "the error must name the offending row: {err}"
+    );
+}
+
+/// Request order is the output order; every occurrence of a duplicate is its
+/// own output row (the loader's cellset gather pins the same on `[7, 7, 31]`).
+#[test]
+fn test_read_row_indices_duplicates_and_unsorted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+    let rows = [11u64, 0, 7, 7, 4, 3];
+    let out = backed.read_row_indices(&rows).unwrap();
+    assert_eq!(out.n_rows(), rows.len());
+    assert_eq!(out.shape.1, full.shape.1);
+    for (i, &row) in rows.iter().enumerate() {
+        let expected = full.row_slice(row as usize, row as usize + 1).unwrap();
+        let actual = out.row_slice(i, i + 1).unwrap();
+        assert_eq!(actual.indices, expected.indices, "i={i} row={row} indices");
+        assert_eq!(actual.data, expected.data, "i={i} row={row} data");
+    }
+    // The indptr is exact — no over-allocation left behind.
+    assert_eq!(out.indices.len(), out.nnz());
+    assert_eq!(out.indices.capacity(), out.indices.len());
+    assert_eq!(out.data.capacity(), out.data.len());
+}
+
+/// On a framed file the gather must be byte-identical to a full decode for
+/// every codec — sparse groups go through the block index, dense ones through
+/// the full-shard path, and the two must agree with `read_all`.
+#[test]
+fn read_row_indices_matches_full_decode_on_framed_file_all_codecs() {
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    for codec in [
+        CodecId::None,
+        CodecId::ShufDeltaZstd,
+        CodecId::Zstd,
+        CodecId::Lz4Shuffle,
+        CodecId::Pcodec,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, codec);
+        for rows in [&sparse_rows[..], &dense_rows[..]] {
+            let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+            let out = backed.read_row_indices(rows).unwrap();
+            assert_eq!(out.n_rows(), rows.len(), "{codec:?}");
+            for (i, &row) in rows.iter().enumerate() {
+                let lo = full.indptr[row as usize] as usize;
+                let hi = full.indptr[row as usize + 1] as usize;
+                let olo = out.indptr[i] as usize;
+                let ohi = out.indptr[i + 1] as usize;
+                assert_eq!(
+                    &out.indices[olo..ohi],
+                    &full.indices[lo..hi],
+                    "{codec:?} indices row {row}"
+                );
+                assert_eq!(
+                    &out.data[olo..ohi],
+                    &full.data[lo..hi],
+                    "{codec:?} data row {row}"
+                );
+            }
+        }
+    }
+}
+
+/// A sparse cold gather over a framed shard takes the block-index path — the
+/// touched row groups are decoded, the shard is **not** full-decoded into the
+/// LRU. This is the caching-policy change PR C makes to `read_row_indices`
+/// (it used to full-decode and cache unconditionally).
+#[test]
+fn read_row_indices_takes_the_block_index_path() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let m = backed.enable_metrics();
+    backed.read_row_indices(&[2u64, 5, 6, 40, 41]).unwrap();
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        2,
+        "both sparse cold shard groups must be served via the block index",
+    );
+    assert_eq!(m.full_shard_groups.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        0,
+        "a block-index gather must not full-decode a shard into the LRU",
+    );
+}
+
+/// The indptr-only prescan indexes the decoded indptr with catalog-derived
+/// local rows, so a shard whose header under-reports its row count must be
+/// rejected with `InvalidCatalog` (the same guard `decode_shard` applies) —
+/// never an index-out-of-bounds panic.
+#[test]
+fn read_row_indices_rejects_a_shard_whose_header_underreports_rows() {
+    let dir = TempDir::new().unwrap();
+    let path = write_shard_shrunk_in_header(&dir, 8, 10, 4);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    let err = backed
+        .read_row_indices(&[0, 7])
+        .expect_err("a short shard must error, not panic");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+
+    // `read_rows` shares the prescan.
+    let err = backed
+        .read_rows(0, 8)
+        .expect_err("read_rows must reject the same shard");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+}
+
+/// A bulk `read_rows` — more full-path shards than the LRU holds — copies the
+/// shards that are already resident out of the cache and decodes the rest
+/// *uncached*, leaving the LRU exactly as it found it: no evictions, no new
+/// entries, and a later small read of the resident range still hits. Before
+/// PR C the single up-front warm (truncated to `cache_shards`) evicted the
+/// resident shards and the gather loop decoded them again.
+#[test]
+fn read_rows_bulk_serves_resident_shards_from_the_cache_and_leaves_it_alone() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    // 8 shards × 8 rows, a 4-slot cache.
+    let (mut backed, full) = write_test_file_and_open(&dir, 64, 10, 8, 4);
+    let m = backed.enable_metrics();
+
+    // Warm shards 2 and 3 (rows 16..32) the way an earlier `X[a:b]` would.
+    let pre = backed.read_rows(16, 32).unwrap();
+    assert_eq!(pre.n_rows(), 16);
+    assert_eq!(m.misses.load(Ordering::Relaxed), 2);
+    let hits_before = m.hits.load(Ordering::Relaxed);
+
+    let out = backed.read_rows(0, 64).unwrap();
+    assert_eq!(out.indptr, full.indptr);
+    assert_eq!(out.indices, full.indices);
+    assert_eq!(out.data, full.data);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        2,
+        "a bulk read must not push shards through the LRU",
+    );
+    assert_eq!(m.evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.hits.load(Ordering::Relaxed) - hits_before,
+        2,
+        "the two resident shards are served from the cache",
+    );
+    // Single allocation: the buffers are exactly the result, no headroom.
+    assert_eq!(out.indices.capacity(), out.indices.len());
+    assert_eq!(out.data.capacity(), out.data.len());
+
+    // The cache still holds exactly what it held before the bulk read.
+    let again = backed.read_rows(16, 32).unwrap();
+    assert_eq!(again.indices, pre.indices);
+    assert_eq!(m.misses.load(Ordering::Relaxed), 2);
+}
+
+/// A range that fits the LRU still goes through it (warm + copy), so the
+/// sequential chunk iterator's re-reads keep hitting.
+#[test]
+fn read_rows_cache_sized_range_still_populates_the_cache() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut backed, full) = write_test_file_and_open(&dir, 64, 10, 8, 4);
+    let m = backed.enable_metrics();
+
+    // 4 full shards == cache_shards ⇒ cached path.
+    let out = backed.read_rows(0, 32).unwrap();
+    assert_eq!(out.indices, full.row_slice(0, 32).unwrap().indices);
+    assert_eq!(m.misses.load(Ordering::Relaxed), 4);
+    // The warm decoded the four shards; the copy loop then took each from the
+    // cache (four hits). A second read is all hits, no decode.
+    let hits_after_first = m.hits.load(Ordering::Relaxed);
+    let again = backed.read_rows(0, 32).unwrap();
+    assert_eq!(again.indices, out.indices);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        4,
+        "second read is all hits"
+    );
+    assert_eq!(m.hits.load(Ordering::Relaxed) - hits_after_first, 4);
+}
+
+// -----------------------------------------------------------------------
 // LRU cache behavior tests
 // -----------------------------------------------------------------------
 
