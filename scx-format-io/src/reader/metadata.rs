@@ -260,7 +260,10 @@ fn intern_declared_values(
     if !RowConverter::supports_fields(std::slice::from_ref(&field)) {
         return Ok(None);
     }
-    let all = arrow::compute::concat(&inputs.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
+    let all = match inputs {
+        [one] => (*one).clone(),
+        many => arrow::compute::concat(&many.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?,
+    };
     let converter = RowConverter::new(vec![field])?;
     let rows = converter.convert_columns(std::slice::from_ref(&all))?;
 
@@ -527,7 +530,16 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
             .iter()
             .zip(maps)
             .map(|(d, map)| {
-                let keys = remap_dictionary_keys(d.keys(), &map)?;
+                // Shard 0's map is the identity by construction, and so is every
+                // shard's when they declare the same vocabulary (the
+                // `from_anndata` case) — skip the O(n_obs) walk and only swap the
+                // values `Arc`, which is the part `concat` looks at.
+                let identity = map.iter().enumerate().all(|(i, &m)| m as usize == i);
+                let keys = if identity {
+                    d.keys().clone()
+                } else {
+                    remap_dictionary_keys(d.keys(), &map)?
+                };
                 Ok(
                     Arc::new(DictionaryArray::<Int32Type>::try_new(keys, shared.clone())?)
                         as ArrayRef,
@@ -560,15 +572,23 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
 /// keeps the declared vocabulary whole (unused levels included); a
 /// `filter_obs(...).collect()` result carries only the categories present in
 /// the surviving rows (`docs/api.md` § Filtered-obs categorical semantics), the
-/// way an AnnData subset does. Before this step existed that prune was arrow's
-/// data-dependent dictionary merge in `concat` — it fired on a small result and
-/// not on a large one — so this makes the documented behaviour hold on every
-/// result size, and on the legacy single-section path, which never went
-/// through a concat at all. Field metadata (the `ordered` stamp) and the
-/// schema envelope are kept; the key type is narrowed to the surviving count.
+/// way an AnnData subset does. The engine applies this to a result whose rows
+/// the caller narrowed (an obs predicate or a limit) on both obs layouts; an
+/// unfiltered `collect()` keeps the declared list like `read_obs()`. Before
+/// this step existed the prune was arrow's data-dependent dictionary merge in
+/// `concat` — it fired on a small result and not on a large one.
+///
+/// Only a **valid** row marks its category as used: a null row's stored key is
+/// arbitrary (arrow guarantees it in range and nothing more), so reading it
+/// would keep whatever category it happens to point at. A result with no
+/// surviving rows — or only null ones — ends with no categories, as
+/// `remove_unused_categories` on an empty subset does. Linear in the row count:
+/// one key cast, one usage pass, one remap. Field metadata (the `ordered`
+/// stamp) and the schema envelope are kept; the key type is narrowed to the
+/// surviving count.
 pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch> {
     use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 
     let schema = batch.schema();
     if !schema
@@ -589,19 +609,19 @@ pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch
         };
         let dict = col.as_any_dictionary();
         let n_values = dict.values().len();
-        // A zero-row result (the engine feeds a 0-row slice of shard 0 so an
-        // empty `collect()` still carries the canonical schema) keeps its
-        // vocabulary: there are no surviving rows to prune against, and
-        // `normalized_keys` asserts a non-empty values array.
-        if dict.is_empty() || n_values == 0 {
-            new_columns.push(col.clone());
-            new_fields.push(field.as_ref().clone());
-            continue;
-        }
+        // Keys as `Int32` with their validity, whatever width the file used.
+        let keys = arrow::compute::cast(dict.keys(), &DataType::Int32)?;
+        let keys = keys.as_primitive::<Int32Type>();
         let mut used = vec![false; n_values];
-        for k in dict.normalized_keys() {
-            if let Some(slot) = used.get_mut(k) {
-                *slot = true;
+        for k in keys.iter().flatten() {
+            match usize::try_from(k).ok().and_then(|k| used.get_mut(k)) {
+                Some(slot) => *slot = true,
+                None => {
+                    return Err(ScxError::InvalidCatalog(format!(
+                    "column '{}': dictionary key {k} out of bounds (dictionary length {n_values})",
+                    field.name()
+                )))
+                }
             }
         }
         if used.iter().all(|&u| u) {
@@ -609,7 +629,8 @@ pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch
             new_fields.push(field.as_ref().clone());
             continue;
         }
-        // Declared order of the survivors; unreferenced entries get no slot.
+        // Declared order of the survivors; an unreferenced entry gets no slot,
+        // and no valid key can reach it.
         let mut old_to_new: Vec<u32> = vec![u32::MAX; n_values];
         let mut keep: Vec<u32> = Vec::new();
         for (old, &u) in used.iter().enumerate() {
@@ -618,22 +639,10 @@ pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch
                 keep.push(old as u32);
             }
         }
+        let n_kept = keep.len();
         let values = arrow::compute::take(dict.values().as_ref(), &UInt32Array::from(keep), None)?;
-        let wide_keys: arrow::array::Int32Array = (0..dict.len())
-            .map(|r| {
-                (!dict.is_null(r)).then(|| {
-                    // `normalized_keys` bounds-checked every key above; a key
-                    // that is not null indexes a used slot by construction.
-                    old_to_new[dict.normalized_keys()[r]] as i32
-                })
-            })
-            .collect();
-        let (encoded, final_dt) = finish_deduped_dictionary(
-            wide_keys,
-            values,
-            used.iter().filter(|&&u| u).count(),
-            value_type,
-        )?;
+        let new_keys = remap_dictionary_keys(keys, &old_to_new)?;
+        let (encoded, final_dt) = finish_deduped_dictionary(new_keys, values, n_kept, value_type)?;
         new_columns.push(encoded);
         new_fields.push(
             Field::new(field.name(), final_dt, field.is_nullable())
@@ -783,9 +792,9 @@ pub fn assemble_sharded_metadata(
 ///
 /// Runs the same `upcast → widen-dict → reconcile → share-dict-values →
 /// concat → unify-dict → downcast → strip-per-shard-metadata` pipeline as
-/// [`assemble_sharded_metadata`] — plus [`prune_unused_dictionary_values`]
-/// after the unify, because a filtered result carries only the categories its
-/// surviving rows use —
+/// [`assemble_sharded_metadata`], and like it keeps every declared dictionary
+/// value; the engine decides whether a result is a row subset that should
+/// carry only its surviving categories ([`prune_unused_dictionary_values`]) —
 /// but WITHOUT the contiguous-cover validation and WITHOUT requiring the
 /// per-shard `shard_idx` / `row_start` stamps — the input batches are an
 /// arbitrary subset (any order, possibly empty), already filtered to the
@@ -829,10 +838,6 @@ pub fn assemble_filtered_metadata(
     let wide_schema = wide[0].schema();
     let concatenated = arrow::compute::concat_batches(&wide_schema, wide.iter())?;
     let unified = unify_dictionary_columns(&concatenated)?;
-    // The filtered contract: only the categories the surviving rows use. See
-    // `prune_unused_dictionary_values` — this used to be arrow's row-count-
-    // dependent merge, and the shared-values step above turns that merge off.
-    let unified = prune_unused_dictionary_values(&unified)?;
     let narrowed = crate::arrow_compat::downcast_large_types(&unified)?;
 
     // Strip the per-shard metadata keys so the result schema matches a

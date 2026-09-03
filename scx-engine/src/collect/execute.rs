@@ -567,25 +567,30 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
     );
 
     let filtered_obs = if let Some(ref obs_batch) = legacy_obs {
-        // Legacy single-section obs: take directly from the full batch. `take`
-        // on a dictionary column keeps the whole parent vocabulary, so prune
-        // to the surviving categories here — the sharded path gets the same
-        // prune inside `assemble_filtered_metadata`, and the documented
-        // `collect()` contract (only the categories present in the result)
-        // must not depend on which layout the file has.
+        // Legacy single-section obs: take directly from the full batch.
         let take_indices = UInt32Array::from(matching_global_rows);
         let columns: Vec<_> = obs_batch
             .columns()
             .iter()
             .map(|col| compute::take(col.as_ref(), &take_indices, None))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        scx_format_io::prune_unused_dictionary_values(&RecordBatch::try_new(
-            obs_batch.schema(),
-            columns,
-        )?)?
+        RecordBatch::try_new(obs_batch.schema(), columns)?
     } else {
         // Row-sharded obs: read only the shards that contain matching rows.
         materialize_filtered_obs(reader, &obs_shard_ranges, &matching_global_rows)?
+    };
+    // The documented `collect()` categorical contract, decided here so it does
+    // not depend on the obs layout: a result whose rows the caller narrowed —
+    // an obs predicate or a limit — carries only the categories its surviving
+    // rows use, as an AnnData subset does (`remove_unused_categories`). Neither
+    // `take` above nor the sharded assembler prunes (both keep the parent
+    // vocabulary, deterministically), and an unfiltered `collect()` keeps the
+    // declared list like `read_obs()`. Deletion vectors alone do not make a
+    // subset: `to_anndata()` skips deleted rows and keeps the declared list too.
+    let filtered_obs = if !plan.obs_predicates.is_empty() || plan.limit.is_some() {
+        scx_format_io::prune_unused_dictionary_values(&filtered_obs)?
+    } else {
+        filtered_obs
     };
 
     // Step 11b: Filter var metadata to projected genes (in ascending order;

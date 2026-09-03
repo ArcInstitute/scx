@@ -3468,20 +3468,20 @@ fn test_assemble_keeps_unused_numeric_dictionary_values() {
     assert_eq!(flat.values().to_vec(), vec![2, 3, 1, 2]);
 }
 
-/// The *filtered* assembler has the opposite contract, and it must hold
-/// deterministically: a `filter_obs(...).collect()` result carries only the
-/// categories present in the surviving rows (`docs/api.md` § Filtered-obs
-/// categorical semantics), in declared order. Before, that prune was arrow's
-/// data-dependent dictionary merge — it fired on a small result and not on a
-/// large one — and the first version of the shared-values step turned it off
-/// entirely on this path (round-1 finding, Cursor).
+/// The *filtered* assembler keeps the declared vocabulary exactly as the full
+/// one does — the shared-values step makes `concat` deterministic here too —
+/// and leaves the "only the surviving categories" half of the `collect()`
+/// contract to the engine, which alone knows whether the caller filtered rows
+/// (`prune_unused_dictionary_values`, gated on an obs predicate or a limit).
+/// Before, arrow's row-count-dependent dictionary merge pruned *some* results
+/// on this path; the round-1 fix pruned every result here, unfiltered ones and
+/// the legacy layout's zero-predicate collects included (round-2 finding,
+/// codex).
 #[test]
-fn test_assemble_filtered_prunes_dictionary_values_to_the_surviving_rows() {
+fn test_assemble_filtered_keeps_the_declared_vocabulary_for_the_engine_to_prune() {
     use arrow::array::{Array, AsArray, DictionaryArray, Int8Array};
     use arrow::datatypes::Int8Type;
 
-    // Two already-row-filtered shard batches over a four-level vocabulary;
-    // between them the surviving rows use "S" and "G1" only.
     let values = StringArray::from(vec!["G1", "S", "G2M", "M"]);
     let shard = |keys: Vec<i8>| {
         let dict =
@@ -3500,17 +3500,14 @@ fn test_assemble_filtered_prunes_dictionary_values_to_the_surviving_rows() {
         .with_metadata(md)]));
         RecordBatch::try_new(schema, vec![Arc::new(dict) as arrow::array::ArrayRef]).unwrap()
     };
+    // 3 rows against 2 × 4 declared values: above arrow's merge threshold, so
+    // without the shared-values step arrow would have pruned "G2M" and "M".
     let a = shard(vec![1]);
     let b = shard(vec![0, 1]);
-    // 43 rows against 3 × 4 declared values: below arrow's merge threshold
-    // (`total_values >= len`), so arrow would keep every level and the prune
-    // has to come from the assembler itself, not from arrow's data-dependent
-    // merge.
-    let big = shard(vec![1; 40]);
     let template = a.schema();
 
-    let out = assemble_filtered_metadata(&template, vec![a, b, big]).unwrap();
-    assert_eq!(out.num_rows(), 43);
+    let out = assemble_filtered_metadata(&template, vec![a, b]).unwrap();
+    assert_eq!(out.num_rows(), 3);
     let col = out.column(0);
     let dict = col
         .as_any_dictionary_opt()
@@ -3520,21 +3517,100 @@ fn test_assemble_filtered_prunes_dictionary_values_to_the_surviving_rows() {
         (0..declared.len())
             .map(|i| declared.value(i))
             .collect::<Vec<_>>(),
-        ["G1", "S"],
-        "a filtered result carries only the surviving categories, in declared order"
+        ["G1", "S", "G2M", "M"],
+        "the filtered assembler keeps the declared vocabulary; pruning is the engine's call"
     );
-    let flat = arrow::compute::cast(col, &DataType::Utf8).unwrap();
-    let flat = flat.as_string::<i32>();
-    assert_eq!(flat.value(0), "S");
-    assert_eq!(flat.value(1), "G1");
-    assert_eq!(flat.value(2), "S");
     assert_eq!(
         out.schema()
             .field(0)
             .metadata()
             .get(crate::CATEGORICAL_ORDERED_KEY)
             .map(String::as_str),
-        Some("true"),
-        "the ordered stamp survives the prune"
+        Some("true")
     );
+}
+
+/// `prune_unused_dictionary_values` — pandas' `remove_unused_categories` on a
+/// subset, for the engine's `collect()` results. Three things a first version
+/// got wrong (round-2 findings, Cursor / codex / Antigravity): it consulted
+/// `normalized_keys()` once per row (quadratic, and a fresh `n_rows` allocation
+/// each time); a **null** row's arbitrary stored key marked a category as used,
+/// so `[B, null, C, B]` over `[A, B, C, D]` kept `D` (or `A`); and a zero-row
+/// result kept the whole parent vocabulary.
+#[test]
+fn test_prune_unused_dictionary_values_ignores_null_rows_and_empties_a_zero_row_result() {
+    use arrow::array::{Array, AsArray, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+
+    let values = StringArray::from(vec!["A", "B", "C", "D"]);
+    let batch = |keys: Int8Array| {
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values.clone())).unwrap();
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            crate::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "call",
+            dict.data_type().clone(),
+            true,
+        )
+        .with_metadata(md)]));
+        RecordBatch::try_new(schema, vec![Arc::new(dict) as arrow::array::ArrayRef]).unwrap()
+    };
+    let declared_of = |b: &RecordBatch| -> Vec<String> {
+        let d = b.column(0).as_any_dictionary();
+        let v = d.values().as_string::<i32>();
+        (0..v.len()).map(|i| v.value(i).to_string()).collect()
+    };
+
+    // Null rows whose stored key is 3 ("D") and 0 ("A"): neither may count.
+    let keys = Int8Array::from(vec![Some(1), None, Some(2), Some(1), None]);
+    // Make the null slots carry the keys a naive `normalized_keys` would see.
+    let (_, raw, nulls) = keys.into_parts();
+    let mut raw = raw.to_vec();
+    raw[1] = 3;
+    raw[4] = 0;
+    let keys = Int8Array::new(raw.into(), nulls);
+    let out = prune_unused_dictionary_values(&batch(keys)).unwrap();
+    assert_eq!(
+        declared_of(&out),
+        ["B", "C"],
+        "null rows must not keep a category alive"
+    );
+    let flat = arrow::compute::cast(out.column(0), &DataType::Utf8).unwrap();
+    let flat = flat.as_string::<i32>();
+    assert_eq!(
+        (0..5)
+            .map(|i| (!flat.is_null(i)).then(|| flat.value(i)))
+            .collect::<Vec<_>>(),
+        [Some("B"), None, Some("C"), Some("B"), None]
+    );
+    assert_eq!(
+        out.schema()
+            .field(0)
+            .metadata()
+            .get(crate::CATEGORICAL_ORDERED_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // Every level used: the column is handed back as is.
+    let full = batch(Int8Array::from(vec![0i8, 1, 2, 3]));
+    let out = prune_unused_dictionary_values(&full).unwrap();
+    assert_eq!(declared_of(&out), ["A", "B", "C", "D"]);
+
+    // Zero surviving rows: no categories, like `remove_unused_categories` on an
+    // empty subset — and no panic from an empty values array.
+    let out = prune_unused_dictionary_values(&batch(Int8Array::from(Vec::<i8>::new()))).unwrap();
+    assert_eq!(out.num_rows(), 0);
+    assert!(
+        declared_of(&out).is_empty(),
+        "an empty subset has no categories"
+    );
+
+    // Only null rows survive: same answer.
+    let out = prune_unused_dictionary_values(&batch(Int8Array::from(vec![None, None]))).unwrap();
+    assert_eq!(out.num_rows(), 2);
+    assert!(declared_of(&out).is_empty());
 }

@@ -359,3 +359,43 @@ def test_filtered_collect_carries_only_the_surviving_categories(target):
 
     full = pyscx.open(path).read_obs()
     assert list(full["phase"].cat.categories) == PHASE_LEVELS
+
+
+def test_unfiltered_collect_keeps_the_declared_categories(target):
+    """No obs predicate and no limit means no row subset, so `collect()` reads
+    like `read_obs()`: the declared list, unused level included. The round-1 fix
+    pruned every collect on both layouts (round-2 finding, codex)."""
+    path, _, _ = target
+    obs = pyscx.open(path).query().collect().to_anndata().obs
+    assert len(obs) == N_OBS
+    assert list(obs["phase"].cat.categories) == PHASE_LEVELS
+    assert list(obs["batch"].cat.categories) == BATCH_LEVELS
+
+
+def test_filtered_collect_with_null_rows_prunes_by_the_non_null_survivors(target):
+    """A null row is not a category. The round-1 prune read every row's stored
+    key without checking validity, so a null row could keep whatever category its
+    arbitrary key pointed at (round-2 finding, all three reviewers). Partial
+    attaches create exactly these nulls: `call` covers cells 0–5 only."""
+    path, bc, _ = target
+    call = pd.Categorical(["B", "C"] * 3, categories=["A", "B", "C", "D"], ordered=True)
+    pyscx.attach_obs_columns(path, pd.DataFrame({"call": call}, index=bc[:6]))
+
+    q = pyscx.open(path).query()
+    q.filter_obs("n_counts < 8")  # rows 0–7: six with a call, two null
+    obs = q.collect().to_anndata().obs
+    assert len(obs) == 8
+    assert obs["call"].isna().sum() == 2
+    assert list(obs["call"].cat.categories) == ["B", "C"]
+    assert obs["call"].cat.ordered is True
+
+
+def test_empty_filtered_collect_has_no_categories(target):
+    """`remove_unused_categories` on an empty subset leaves no categories."""
+    path, _, _ = target
+    q = pyscx.open(path).query()
+    q.filter_obs("phase == 'M'")  # declared, used by no cell
+    obs = q.collect().to_anndata().obs
+    assert len(obs) == 0
+    assert isinstance(obs["phase"].dtype, pd.CategoricalDtype)
+    assert list(obs["phase"].cat.categories) == []
