@@ -161,9 +161,26 @@ def _skip_materialize_reason(n_obs: int) -> str | None:
 #   difference and no index sections at all.
 _EXTRA_ARMS: dict[str, tuple[dict[str, object], frozenset[str]]] = {
     "csc_always": ({"csc": "always"}, frozenset({"tabula_sapiens_100k"})),
+    # census_500k / census_1m are EXCLUDED, and not because they lack the
+    # preset's columns — checked with h5py, both carry all ten, as does
+    # tabula. `index_preset="cellxgene"` emits no predicate-index sections at
+    # either census scale while it works at 100k: the arm's output came out
+    # 1,146,311,684 B against the default arm's 1,148,236,779 at census_500k
+    # and 2,729,215,285 vs 2,736,680,651 at census_1m — *smaller*, where an
+    # index can only make a file larger, so something beyond the missing index
+    # differs between the two arms at scale. Observed in the tier-full capture
+    # (jobs 2894727_2 / 2894798_2, 2026-09-02).
+    #
+    # The premise check is right to refuse, but it raises, which took out the
+    # whole `conversion_streaming` cell at both census scales — including
+    # `streaming_peak_rss_mb`, floored at <= 4096 on census_1m. Scoping the arm
+    # away from the datasets where the feature is broken keeps the other arms'
+    # rows; it does not make the defect less real, and the defect is not this
+    # benchmark's to fix. Restore the two datasets here in the change that
+    # fixes it — the premise check is what will confirm the fix.
     "index_preset_cellxgene": (
         {"index_preset": "cellxgene"},
-        frozenset({"tabula_sapiens_100k", "census_500k", "census_1m"}),
+        frozenset({"tabula_sapiens_100k"}),
     ),
 }
 

@@ -856,6 +856,65 @@ def test_archive_mode_refuses_to_sweep_without_a_cutoff():
     )
 
 
+def test_the_index_preset_arm_is_scoped_to_where_the_feature_works():
+    """The `index_preset_cellxgene` arm must not take out a floored triple.
+
+    Its premise check refuses an arm whose output is not larger than the
+    default's, because an index can only add bytes — and refusing is right: an
+    arm that silently timed the default conversion under an index label is
+    worse than no arm. But it raises, which fails the whole
+    `conversion_streaming` cell, and `streaming_peak_rss_mb <= 4096` is floored
+    on census_1m. One broken extra arm cost a floored triple its rows.
+
+    `index_preset="cellxgene"` does not work at census scale. Not for want of
+    columns — h5py says tabula, census_500k and census_1m all carry the ten
+    (`cell_type`, `..._ontology_term_id`, `tissue`, …, `suspension_type`). It
+    works at 100k and emits nothing at 500k and 1M, and the arm's output came
+    out *smaller* than the default's at both (1,146,311,684 vs 1,148,236,779;
+    2,729,215,285 vs 2,736,680,651), which a missing index alone does not
+    explain.
+
+    So the arm is scoped to tabula. This test states that the scope is a
+    workaround around a defect rather than a judgement about coverage, so that
+    restoring the census datasets is the natural thing to do in the change that
+    fixes it — and fails if someone restores them without one.
+    """
+    import ast
+
+    path = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+            / "conversion_streaming.py")
+    text = path.read_text()
+    mod = ast.parse(text)
+    arms = next(
+        (n for n in ast.walk(mod)
+         if isinstance(n, ast.AnnAssign)
+         and isinstance(n.target, ast.Name) and n.target.id == "_EXTRA_ARMS"),
+        None,
+    )
+    assert arms is not None, "conversion_streaming lost _EXTRA_ARMS"
+    scopes = {}
+    for key, val in zip(arms.value.keys, arms.value.values):
+        name = key.value
+        # (kwargs, frozenset({...}))
+        fs = val.elts[1]
+        scopes[name] = {
+            e.value for e in fs.args[0].elts
+        } if fs.args else set()
+
+    assert "index_preset_cellxgene" in scopes, sorted(scopes)
+    scope = scopes["index_preset_cellxgene"]
+    assert "tabula_sapiens_100k" in scope, scope
+    broken = {"census_500k", "census_1m"} & scope
+    assert not broken, (
+        f"{sorted(broken)} were restored to the index_preset_cellxgene arm. "
+        f"The feature emitted no index sections there as of 2026-09-02 and the "
+        f"arm's premise check raises, which fails the whole cell and with it "
+        f"`streaming_peak_rss_mb`, floored on census_1m. Restore them only "
+        f"alongside the fix — and delete this assertion in the same change, "
+        f"since the premise check is then the thing that guards it."
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 
