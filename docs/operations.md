@@ -16,7 +16,7 @@ intact.
 In-place does **not** imply undoable. `scx rollback` works only on the ops that
 commit through the manifest chain (`prepare_in_place` / `commit_in_place`) and so
 leave the previous catalog in the file — the import ops, `delete`,
-`modify_metadata` / `set_uns`, `append`. **`build-csc --in-place` and
+`modify_metadata` / `set_uns` / `update_uns`, `append`. **`build-csc --in-place` and
 `upgrade --in-place` are not among them**: each stages a wholly new file and
 renames it over the target, carrying no prior catalog, so a subsequent
 `scx rollback` fails with `no previous catalog available for rollback`. Copy out
@@ -35,7 +35,7 @@ first if you want a way back.
 |-----------|--------|---------------|--------------|--------------|-------------|-------------------|-------------------|
 | **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows | **Preserved** (deleted rows keep their global indices; appended rows are live) |
 | **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged | **Written** (this is the op that creates them) |
-| **modify_metadata** / **set_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
+| **modify_metadata** / **set_uns** / **update_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
 | **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
 | **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), and the per-shard column stats are **carried from the input** (rows are 1:1, so the input's stats are exactly right for the output's shards), so **Level-1** pruning survives. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
 | **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections`, and the per-shard catalog column stats are **carried from the input** (a 1:1 re-emit), so **Level-1** shard pruning survives — as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
@@ -439,9 +439,10 @@ multimodal `mark_deleted` was guarded off.)
 
 ## Modify Metadata Complexity
 
-`scx_ops::modify_metadata` / `set_uns` (CLI: `scx modify-metadata` / `scx
-set-uns`; Python: `pyscx.modify_metadata` / `pyscx.set_uns`) replace metadata
-sections (`uns` / `obs` / `var` / `obsm` / `varm`) in place. It appends only the
+`scx_ops::modify_metadata` / `set_uns` / `update_uns` (CLI: `scx modify-metadata` /
+`scx set-uns [--merge]`; Python: `pyscx.modify_metadata` / `pyscx.set_uns` /
+`pyscx.update_uns`) replace metadata sections (`uns` / `obs` / `var` / `obsm` /
+`varm`) in place. It appends only the
 replaced section bytes at EOF and repoints the catalog — **the matrix is never
 read or rewritten**, so the cost is O(size of the replaced sections), not
 O(matrix). This is the key difference from `from_anndata` / `from_h5ad`, which
@@ -470,8 +471,12 @@ count is out of scope — use `append`, `subset`, or `from_*`.
 **Commit point**: the single header `pwrite()` that repoints
 `full_catalog_offset` / `manifest_sequence` (rollback-able via the catalog
 chain). Replace semantics, not merge — a supplied section fully supersedes the
-old one. Repeated edits orphan the prior section bytes; run `scx compact` to
-reclaim them. Multimodal (`modality != 0`) is not yet supported.
+old one — with one opt-in exception: `update_uns` / `scx set-uns --merge` /
+`MetadataPatch::uns_merge` shallow-merges the patch's top-level keys into the
+existing `uns` (a patch key replaces a same-named key wholesale, every other
+key survives; the existing `uns` is read through the op's own lock and must be
+a JSON object). Repeated edits orphan the prior section bytes; run `scx compact`
+to reclaim them. Multimodal (`modality != 0`) is not yet supported.
 
 ## Compact
 
@@ -597,6 +602,20 @@ For the analyst-facing walkthrough — which caller writes which column, how to
 export per-batch h5ads, how to combine several tools — see
 [docs/scanpy.md § Landing external per-cell annotations](scanpy.md#landing-external-per-cell-annotations-doublet-detection).
 This section covers the operational invariants.
+
+### uns payloads ride in the same commit
+
+Every attach can carry `uns` entries alongside its columns, and they land in
+the **same commit**, so one `scx rollback` undoes columns and uns together.
+The payload is a map of top-level keys (`ExternalObsData::uns`; several keys
+per attach), merged shallowly into the file's `uns`: `pyscx.attach_obs_columns(uns={...})`
+merges the dict's keys, `uns_key="K"` nests the payload under `uns["K"]`
+instead; `obs_import --uns-key-from-source K` lands the selected source keys
+under their own names, or under `--uns-key K` when given; `doublet_import`
+writes `uns["<K>"]` and `cellbender_import` `uns["cellbender"]`. An empty
+payload leaves the `uns` section untouched (not even rewritten). A key the file
+already has is an error without `overwrite`; a file whose `uns` is not a JSON
+object is refused before any write.
 
 `obs_import` is the recommended way to **add or patch obs columns on an
 existing SCX file** — including from pipeline steps. A step whose only output

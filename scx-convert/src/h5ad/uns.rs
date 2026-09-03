@@ -111,6 +111,26 @@ fn write_uns_value(
                     .shape([data.len()])
                     .create(name)?
                     .write(&data)?;
+            } else if !arr.is_empty()
+                && arr
+                    .iter()
+                    .all(|v| v.is_number() || uns_float_scalar_envelope(v).is_some())
+            {
+                // A float list that carried a NaN / ±Inf: pyscx has no JSON
+                // literal for those, so under `uns_format="tagged"` each one is
+                // a float `scalar` envelope sitting between plain numbers.
+                // HDF5 holds non-finite floats natively, so the list becomes an
+                // f64 dataset. Without this arm the chain matched nothing and
+                // silently dropped the whole list.
+                let data: Vec<f64> = arr
+                    .iter()
+                    .filter_map(|v| v.as_f64().or_else(|| uns_float_scalar_envelope(v)))
+                    .collect();
+                group
+                    .new_dataset::<f64>()
+                    .shape([data.len()])
+                    .create(name)?
+                    .write(&data)?;
             } else if !arr.is_empty() && arr.iter().all(|v| v.is_boolean()) {
                 // 1-D boolean (C3): the scalar bool arm above confirms the
                 // `bool` H5Type; without this arm bool vectors are dropped.
@@ -177,6 +197,29 @@ fn write_uns_value(
 /// dataset. Handles the numeric `ndarray` (`encoding == "base64le"`) and
 /// `scalar` envelopes emitted by `read_uns_entry::uns_ndarray_envelope`
 /// (the inverse of pyscx's `encode_ndarray_tagged` / `encode_np_scalar_tagged`).
+/// A float `scalar` envelope (`{"__scx_type__":"scalar","dtype":"<f8",
+/// "data":<base64 LE bytes>}`, also `<f4` / `<f2`) as an `f64`, or `None` for
+/// anything else. This is how pyscx spells a bare `nan` / `±inf` inside a
+/// list under `uns_format="tagged"`; the 1-D list arm of `write_uns_value`
+/// uses it so such a list still lands as one f64 dataset.
+fn uns_float_scalar_envelope(v: &serde_json::Value) -> Option<f64> {
+    let map = v.as_object()?;
+    if map.get(crate::h5ad::read::SCX_UNS_TYPE_KEY)?.as_str()? != "scalar" {
+        return None;
+    }
+    let dtype = map.get("dtype")?.as_str()?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(map.get("data")?.as_str()?)
+        .ok()?;
+    match (dtype, bytes.len()) {
+        ("<f8" | "=f8", 8) => Some(f64::from_le_bytes(bytes.try_into().ok()?)),
+        ("<f4" | "=f4", 4) => Some(f64::from(f32::from_le_bytes(bytes.try_into().ok()?))),
+        ("<f2" | "=f2", 2) => Some(f64::from(half::f16::from_le_bytes([bytes[0], bytes[1]]))),
+        _ => None,
+    }
+}
+
 /// Returns `Ok(false)` for a non-envelope object or any other tag/encoding so
 /// the caller falls back to the generic subgroup recursion (no regression for
 /// pyscx-only `json` / `recarray` / `tuple` / `pandas.*` envelopes).

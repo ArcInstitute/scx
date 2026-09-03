@@ -109,9 +109,10 @@ pub(crate) fn is_numeric_kind(kind: &str) -> bool {
 /// - `None` → `null`
 /// - `bool` → `bool` (checked before `int`)
 /// - `int` → JSON number (i64 / u64; out-of-range errors)
-/// - `float` → JSON number (non-finite raw Python floats still error in
-///   tagged mode — only ndarray-backed NaN/Inf round-trips, since the base64
-///   envelope preserves raw bytes)
+/// - `float` → JSON number. A non-finite value (`nan` / `±inf`) has no JSON
+///   literal: `Tagged` wraps it in the `scalar` envelope (it reads back as
+///   `np.float64`, a `float` subclass, bit-exact); `Plain` raises, because
+///   plain mode's contract is "lossless or refuse".
 /// - `str` → string
 /// - `dict` → object; non-string keys are stringified via `str(k)`
 /// - `list` → JSON array
@@ -178,9 +179,12 @@ pub(crate) fn normalize_uns_value<'py>(
     if obj.cast::<PyFloat>().is_ok() {
         let f: f64 = obj.extract()?;
         if !f.is_finite() {
-            return Err(PyValueError::new_err(format!(
-                "uns at {key_path}: non-finite float ({f}) cannot be serialized to JSON"
-            )));
+            return match ctx.format {
+                UnsFormat::Tagged => Ok(f64_scalar_envelope(f)),
+                UnsFormat::Plain => Err(PyValueError::new_err(format!(
+                    "uns at {key_path}: non-finite float ({f}) cannot be serialized to JSON"
+                ))),
+            };
         }
         return serde_json::Number::from_f64(f)
             .map(serde_json::Value::Number)
@@ -330,16 +334,37 @@ pub(crate) fn encode_np_scalar_tagged<'py>(
     let np = crate::pyimport::import_module(ctx.np_generic.py(), "numpy")?;
     let arr = np.call_method1("asarray", (obj,))?;
     let bytes = ndarray_bytes_le(&arr, key_path)?;
+    Ok(scalar_envelope(&dtype_str, &bytes))
+}
+
+/// The `scalar` envelope: `{"__scx_type__": "scalar", "dtype": <numpy
+/// `dtype.str`>, "data": <base64 of the little-endian bytes>}`. Decoded by
+/// `decode_scalar_envelope` (and, on the SCX → h5ad export side, by
+/// `scx-convert`'s `try_write_uns_envelope`), so both builders below must
+/// keep emitting exactly this shape.
+fn scalar_envelope(dtype_str: &str, le_bytes: &[u8]) -> serde_json::Value {
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(le_bytes);
     let mut env = serde_json::Map::with_capacity(3);
     env.insert(
         SCX_TYPE_KEY.to_string(),
         serde_json::Value::String("scalar".to_string()),
     );
-    env.insert("dtype".to_string(), serde_json::Value::String(dtype_str));
+    env.insert(
+        "dtype".to_string(),
+        serde_json::Value::String(dtype_str.to_string()),
+    );
     env.insert("data".to_string(), serde_json::Value::String(b64));
-    Ok(serde_json::Value::Object(env))
+    serde_json::Value::Object(env)
+}
+
+/// A raw Python `float` that JSON cannot spell (`nan` / `±inf`), as a
+/// float64 `scalar` envelope — the same bytes an `np.float64` scalar would
+/// produce, so the reader hands back `np.float64` with the exact bit
+/// pattern (sign of the infinity included). Tagged mode only; plain mode
+/// raises before reaching here.
+fn f64_scalar_envelope(f: f64) -> serde_json::Value {
+    scalar_envelope("<f8", &f.to_le_bytes())
 }
 
 /// Encode an `np.ndarray` as a tagged JSON envelope.
@@ -574,9 +599,13 @@ pub(crate) fn pylist_to_json_leaf<'py>(
         return Ok(serde_json::Value::Number(i.into()));
     }
     if let Ok(f) = obj.extract::<f64>() {
+        // This walker is tagged-only (its sole caller is
+        // `encode_ndarray_tagged`), so a non-finite leaf takes the scalar
+        // envelope rather than a lossy `null` — which used to turn `-inf`
+        // into `nan` on the way back.
         return Ok(serde_json::Number::from_f64(f)
             .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null));
+            .unwrap_or_else(|| f64_scalar_envelope(f)));
     }
     if let Ok(by) = obj.cast::<PyBytes>() {
         let s = std::str::from_utf8(by.as_bytes()).map_err(|_| {
@@ -753,11 +782,12 @@ pub(crate) fn pyobj_to_simple_json<'py>(
     }
     if obj.cast::<PyFloat>().is_ok() {
         let f: f64 = obj.extract()?;
-        if f.is_finite() {
-            if let Some(n) = serde_json::Number::from_f64(f) {
-                return Ok(serde_json::Value::Number(n));
-            }
-        }
+        // Tagged-only (pandas envelopes exist only under `Tagged`), so a
+        // non-finite name takes the scalar envelope; the reader decodes it
+        // through `json_to_py` like any other value.
+        return Ok(serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| f64_scalar_envelope(f)));
     }
     // Fallback: stringify.
     let s: String = obj.str()?.extract()?;
@@ -1165,13 +1195,12 @@ pub(crate) fn decode_recarray_envelope<'py>(
                 // sub_dtype)` instead re-expanded subarray dims (an extra axis)
                 // and raised a broadcast error on assignment.
                 //
-                // Float note: encode maps non-finite values to JSON `null`
-                // (JSON has no NaN/Inf), which decodes to Python `None`; numpy
-                // stores `None` as `nan` in a float field, so NaN round-trips
-                // as nan, but Inf degrades to nan. Only the rare mixed
-                // object+float structured `uns` case is affected (the fast
-                // `base64le` path, used when no field is object-dtype,
-                // preserves non-finite bits exactly).
+                // Float note: a non-finite leaf arrives as a `scalar`
+                // envelope (JSON has no NaN/Inf literal), which `json_to_py`
+                // above already decoded to `np.float64`, so a float field
+                // gets the exact bit pattern back — `-inf` stays `-inf`. An
+                // *object* field holding a non-finite float therefore reads
+                // back as `np.float64` rather than a bare `float`.
                 out.set_item(name.as_str(), py_val)?;
             }
             Ok(out)

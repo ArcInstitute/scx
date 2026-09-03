@@ -428,7 +428,7 @@ fn ambient_expression_lands_in_var_not_uns() {
         .unwrap();
     assert!((amb.value(2) - 0.02).abs() < 1e-6);
 
-    let uns = out.data.uns.unwrap();
+    let uns = out.data.uns["cellbender"].clone();
     assert!(
         uns["global_latents"].get("ambient_expression").is_none(),
         "a length-G vector must not be duplicated into uns"
@@ -442,7 +442,8 @@ fn uns_enumerates_flattened_metadata_and_rank0_scalars() {
     create_cellbender_h5(&path, 4, 3, Kind::Full, Strings::VarLen, false);
 
     let out = read(&path);
-    let uns = out.data.uns.unwrap();
+    // The record lands under the reader's `uns_key` (default "cellbender").
+    let uns = out.data.uns["cellbender"].clone();
 
     // Flattened learning-curve keys are found by enumeration, not a key list.
     assert!(uns["metadata"]["learning_curve_train_elbo"].is_array());

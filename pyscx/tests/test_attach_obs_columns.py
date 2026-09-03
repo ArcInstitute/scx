@@ -158,18 +158,77 @@ def test_a_dict_is_rejected_naming_the_function(tmp_path):
         pyscx.attach_obs_columns(str(scx), {"score": [1, 2, 3, 4]})
 
 
-def test_uns_without_uns_key_is_rejected(tmp_path):
+def test_uns_key_without_uns_is_rejected(tmp_path):
     scx = _fixture(tmp_path)
     df = pd.DataFrame({"score": [0.1, 0.2, 0.3, 0.4]})
     with pytest.raises(ValueError, match="uns_key"):
-        pyscx.attach_obs_columns(str(scx), df, positional=True, uns={"m": 1})
-    with pytest.raises(ValueError, match="uns_key"):
         pyscx.attach_obs_columns(str(scx), df, positional=True, uns_key="m")
+
+
+def test_uns_without_uns_key_must_be_a_dict(tmp_path):
+    """Without `uns_key` the payload is spread at top level, so it has to have
+    top-level keys. Checked on the Python object: under the tagged format a
+    tuple normalises to a JSON *object* (an `__scx_type__` envelope), and a
+    post-hoc object check would have sprayed envelope fields into uns."""
+    scx = _fixture(tmp_path)
+    before = scx.read_bytes()
+    df = pd.DataFrame({"score": [0.1, 0.2, 0.3, 0.4]})
+    for bad in [(1, 2), [1, 2], np.array([1.0, 2.0]), "s"]:
+        with pytest.raises(ValueError, match="must be a dict"):
+            pyscx.attach_obs_columns(str(scx), df, positional=True, uns=bad)
+    assert scx.read_bytes() == before
+    assert "__scx_type__" not in (pyscx.open(str(scx)).read_uns() or {})
 
 
 # ---------------------------------------------------------------------------
 # uns merge, rollback, dry run
 # ---------------------------------------------------------------------------
+
+
+def test_uns_without_uns_key_merges_top_level_keys_and_one_rollback_undoes_all(tmp_path):
+    """Two obs columns + three uns keys, one commit, one rollback — the shape
+    that used to force a whole-obs `modify_metadata(obs=, uns=)` re-encode."""
+    scx = _fixture(tmp_path)
+    pyscx.set_uns(str(scx), {"existing": "kept", "nested": {"a": [1, 2]}})
+    before = pyscx.open(str(scx)).read_uns()
+    df = pd.DataFrame({"score": [0.1, 0.2, 0.3, 0.4], "flag": [True, False, True, False]})
+
+    pyscx.attach_obs_columns(
+        str(scx),
+        df,
+        positional=True,
+        uns={"de": {"method": "wilcoxon"}, "de_params": [1, 2.5], "note": "s"},
+    )
+    exp = pyscx.open(str(scx))
+    uns = exp.read_uns()
+    assert uns["de"] == {"method": "wilcoxon"}
+    assert list(uns["de_params"]) == [1, 2.5]
+    assert uns["note"] == "s"
+    for k, v in before.items():
+        assert uns[k] == v, f"pre-existing uns[{k!r}] changed"
+    obs = exp.read_obs()
+    assert "score" in obs.columns and "flag" in obs.columns
+
+    pyscx.rollback(str(scx))
+    exp = pyscx.open(str(scx))
+    obs = exp.read_obs()
+    assert "score" not in obs.columns and "flag" not in obs.columns
+    assert exp.read_uns() == before, "one rollback undoes columns and every uns key"
+
+
+def test_uns_collision_names_the_key(tmp_path):
+    scx = _fixture(tmp_path)
+    pyscx.set_uns(str(scx), {"existing": "kept"})
+    df = pd.DataFrame({"score": [0.1, 0.2, 0.3, 0.4]})
+    with pytest.raises(ValueError, match="'existing'"):
+        pyscx.attach_obs_columns(
+            str(scx), df, positional=True, uns={"fresh": 1, "existing": "new"}
+        )
+    pyscx.attach_obs_columns(
+        str(scx), df, positional=True, uns={"fresh": 1, "existing": "new"}, overwrite=True
+    )
+    uns = pyscx.open(str(scx)).read_uns()
+    assert uns["existing"] == "new" and uns["fresh"] == 1
 
 
 def test_uns_merges_one_key_and_one_rollback_undoes_both(tmp_path):

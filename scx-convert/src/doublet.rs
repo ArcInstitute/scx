@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanBuilder, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use scx_ops::{ExternalObsData, OpsError, Result};
 
@@ -617,7 +617,7 @@ pub fn read_doublet_table(
     )?;
     // Whatever the source reader put in `uns` is the tool's own metadata; the
     // wrapper's record is built below and must not silently replace it.
-    let source_uns = data.uns.take();
+    let source_uns = std::mem::take(&mut data.uns);
 
     let batch = &data.row_annotations;
 
@@ -754,10 +754,13 @@ pub fn read_doublet_table(
     // Nested rather than merged: the tool's own uns keys keep their source
     // names, and none of them can collide with the fields above however the
     // caller spelled `key_added`.
-    if let Some(src) = source_uns {
-        record["source_uns"] = src;
+    if !source_uns.is_empty() {
+        record["source_uns"] = Value::Object(source_uns);
     }
-    data.uns = Some(record);
+    // Keyed here, by the same `key_added` the obs columns carry, so every
+    // caller (pyscx, CLI) lands the record under one name without repeating
+    // the resolution.
+    data.uns.insert(key_added.clone(), record);
 
     let info = DoubletTableInfo {
         tool: profile.name.to_string(),

@@ -153,7 +153,7 @@ fn diagonal_data(
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: Some("test.h5".to_string()),
     }
@@ -253,7 +253,7 @@ fn permuted_source_rows_join_by_key_not_position() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -342,7 +342,7 @@ fn extra_source_rows_are_skipped_and_counted_by_whether_they_carry_counts() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -737,7 +737,7 @@ fn explicit_zero_before_a_duplicate_column_does_not_corrupt_the_row() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -841,7 +841,7 @@ fn dry_run_nnz_matches_the_real_import() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: Some(p.display().to_string()),
     };
@@ -919,17 +919,10 @@ fn var_annotations_are_written_and_uns_is_merged() {
         )
         .unwrap(),
     );
-    data.uns = Some(serde_json::json!({"version": 1}));
+    data.uns
+        .insert("cellbender".to_string(), serde_json::json!({"version": 1}));
 
-    attach_external_layer(
-        &path,
-        &data,
-        &AttachLayerOptions {
-            uns_key: Some("cellbender".to_string()),
-            ..opts("cb")
-        },
-    )
-    .unwrap();
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
 
     let reader = ScxReader::open(&path).unwrap();
     let var = reader.read_var().unwrap();
@@ -1298,7 +1291,7 @@ fn positional_probe(n: usize) -> ExternalLayerData {
         row_annotations: Some(ann),
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     }
@@ -1452,7 +1445,7 @@ fn duplicate_coordinate_data(a: f32, b: f32) -> ExternalLayerData {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     }
@@ -1655,5 +1648,33 @@ fn dry_run_reports_the_encoding_the_write_would_use() {
     assert!(
         attach_external_layer(&path, &data, &pinned_preview).is_err(),
         "a preview must surface the pinned-encoding failure, not defer it to the write"
+    );
+}
+
+#[test]
+fn several_uns_keys_merge_in_one_commit_on_the_layer_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let mut data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    data.uns
+        .insert("b".to_string(), serde_json::json!({"x": 2}));
+
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.read_uns().unwrap(),
+        serde_json::json!({"state": "v0", "a": 1, "b": {"x": 2}})
+    );
+    let prov = reader.read_provenance().unwrap();
+    assert!(
+        prov.operations
+            .last()
+            .unwrap()
+            .params_json
+            .contains("\"uns_keys_merged\":[\"a\",\"b\"]"),
+        "{}",
+        prov.operations.last().unwrap().params_json
     );
 }

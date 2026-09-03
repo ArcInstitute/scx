@@ -71,6 +71,7 @@ pub fn run_modify_metadata(
 
     let patch = MetadataPatch {
         uns: uns_json,
+        uns_merge: false,
         obs: obs_batch,
         var: var_batch,
         obsm: (!obsm_batches.is_empty()).then_some(obsm_batches),

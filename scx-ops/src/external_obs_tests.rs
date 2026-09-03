@@ -179,7 +179,7 @@ fn score_data(row_keys: Vec<String>, score: impl Fn(usize) -> f32) -> ExternalOb
         row_keys,
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: Some("calls.csv".to_string()),
     }
@@ -267,7 +267,7 @@ fn permuted_source_rows_join_by_key_not_position() {
         row_keys: reversed,
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -1125,7 +1125,7 @@ fn nothing_to_attach_is_rejected() {
         row_keys: Vec::new(),
         row_annotations: empty,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -1296,7 +1296,7 @@ fn predicate_index_is_dropped_when_an_indexed_column_is_overwritten() {
         row_keys: keys("cell_", 4),
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -1358,7 +1358,7 @@ fn overwriting_an_indexed_column_clears_its_shard_column_stats() {
         row_keys: keys("cell_", 4),
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -1437,7 +1437,7 @@ fn overwriting_clears_stats_even_when_the_index_section_is_already_gone() {
         row_keys: keys("cell_", 4),
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -1505,32 +1505,125 @@ fn obsm_embedding_is_written_and_scattered_by_the_join() {
 }
 
 #[test]
-fn uns_is_merged_only_when_a_key_is_given_and_is_otherwise_left_alone() {
+fn uns_is_left_alone_without_a_payload_and_merged_with_one() {
     let dir = tempfile::tempdir().unwrap();
 
-    // No uns_key: the existing uns section is not even rewritten.
+    // Empty payload: the existing uns section is not even rewritten.
     let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
     let data = score_data(keys("cell_", 3), |i| i as f32);
     attach_external_obs(&path, &data, &opts()).unwrap();
     let uns = ScxReader::open(&path).unwrap().read_uns().unwrap();
     assert_eq!(uns["state"], "v0");
 
-    // With a key: merged alongside the existing content.
+    // One entry: merged alongside the existing content.
     let path = write_fixture(dir.path(), "b.scx", 3, 2, 1);
     let mut data = score_data(keys("cell_", 3), |i| i as f32);
-    data.uns = Some(serde_json::json!({"tool": "scDblFinder"}));
+    data.uns.insert(
+        "doublet".to_string(),
+        serde_json::json!({"tool": "scDblFinder"}),
+    );
+    attach_external_obs(&path, &data, &opts()).unwrap();
+    let uns = ScxReader::open(&path).unwrap().read_uns().unwrap();
+    assert_eq!(uns["state"], "v0", "the pre-existing uns must survive");
+    assert_eq!(uns["doublet"]["tool"], "scDblFinder");
+}
+
+/// Several top-level keys land in the same commit as the columns, and one
+/// rollback removes every one of them — the shape `run_structured_de` needs
+/// (two obs columns + N uns records) without a whole-obs `modify_metadata`.
+#[test]
+fn several_uns_keys_merge_in_one_commit_and_one_rollback_removes_them_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    let mut data = score_data(keys("cell_", 3), |i| i as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    data.uns
+        .insert("b".to_string(), serde_json::json!({"x": [1.5, 2.5]}));
+    data.uns.insert("c".to_string(), serde_json::json!("s"));
+    attach_external_obs(&path, &data, &opts()).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(reader.header().manifest_sequence, seq0 + 1, "one commit");
+    assert_eq!(
+        reader.read_uns().unwrap(),
+        serde_json::json!({"state": "v0", "a": 1, "b": {"x": [1.5, 2.5]}, "c": "s"}),
+        "every key lands; the pre-existing key is untouched"
+    );
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert!(
+        last.params_json
+            .contains("\"uns_keys_merged\":[\"a\",\"b\",\"c\"]"),
+        "{}",
+        last.params_json
+    );
+    drop(reader);
+
+    crate::rollback(&path).unwrap();
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.read_uns().unwrap(),
+        serde_json::json!({"state": "v0"})
+    );
+    assert!(reader
+        .read_obs()
+        .unwrap()
+        .column_by_name("dbl_score")
+        .is_none());
+}
+
+#[test]
+fn uns_collision_names_the_key_and_overwrite_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    let mut data = score_data(keys("cell_", 3), |i| i as f32);
+    data.uns.insert("fresh".to_string(), serde_json::json!(1));
+    data.uns
+        .insert("state".to_string(), serde_json::json!("v1"));
+
+    let err = attach_external_obs(&path, &data, &opts()).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("'state'"), "{err}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes0,
+        "refused before any write"
+    );
+
     attach_external_obs(
         &path,
         &data,
         &AttachObsOptions {
-            uns_key: Some("doublet".into()),
+            overwrite: true,
             ..opts()
         },
     )
     .unwrap();
     let uns = ScxReader::open(&path).unwrap().read_uns().unwrap();
-    assert_eq!(uns["state"], "v0", "the pre-existing uns must survive");
-    assert_eq!(uns["doublet"]["tool"], "scDblFinder");
+    assert_eq!(uns["state"], "v1");
+    assert_eq!(uns["fresh"], 1);
+}
+
+/// Merging into a `uns` that is not a JSON object has no defined meaning;
+/// refuse before writing rather than quietly replace it with `{}` (which is
+/// what the old single-key path did).
+#[test]
+fn non_object_existing_uns_is_refused_before_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    crate::set_uns(&path, &serde_json::json!([1, 2, 3])).unwrap();
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    let mut data = score_data(keys("cell_", 3), |i| i as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    let err = attach_external_obs(&path, &data, &opts()).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("object"), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,7 +1865,7 @@ fn positional_probe(n: usize) -> ExternalObsData {
         row_keys,
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     }
@@ -2132,7 +2225,7 @@ fn positional_data(n: usize) -> ExternalObsData {
         row_keys: Vec::new(),
         row_annotations: batch,
         row_embeddings: Vec::new(),
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: Some("<DataFrame>".to_string()),
     }
@@ -2357,16 +2450,11 @@ fn positional_attach_merges_one_uns_key_and_one_rollback_undoes_both() {
     let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
 
     let mut data = positional_data(4);
-    data.uns = Some(serde_json::json!({"method": "majority"}));
-    let s = attach_external_obs(
-        &path,
-        &data,
-        &AttachObsOptions {
-            uns_key: Some("dbl_consensus".to_string()),
-            ..positional_opts()
-        },
-    )
-    .unwrap();
+    data.uns.insert(
+        "dbl_consensus".to_string(),
+        serde_json::json!({"method": "majority"}),
+    );
+    let s = attach_external_obs(&path, &data, &positional_opts()).unwrap();
     assert_eq!(s.obs_columns_added, vec!["dbl_score"]);
 
     let reader = ScxReader::open(&path).unwrap();
@@ -2443,7 +2531,7 @@ fn positional_attach_leaves_var_x_and_uns_sections_untouched() {
     assert_eq!(
         before,
         section_spans(&path),
-        "a positional obs-only attach (no uns_key) must not rewrite or move \
+        "a positional obs-only attach (no uns payload) must not rewrite or move \
          var / X / uns sections"
     );
 }

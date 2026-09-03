@@ -98,7 +98,6 @@ pub fn run_doublet_import(
         missing_row_policy: missing,
         extra_row_policy: extra,
         status_column: Some(format!("{key_added}_status")),
-        uns_key: Some(key_added.clone()),
         overwrite,
         provenance_action: "doublet_import".to_string(),
         dry_run,

@@ -242,6 +242,27 @@ pub(crate) fn read_provenance_ops(
     }
 }
 
+/// Read the file-scope `uns` blob (`modality_id == 0`) through the lock, or
+/// `None` when the file has no `uns` section. Byte-for-byte what
+/// `ScxReader::read_uns` returns, without opening an mmap — the uns-only
+/// `modify_metadata` path is the headline cheap case and must not pay for one.
+pub(crate) fn read_uns_blob(
+    lock: &mut FileLock,
+    old_catalog: &FullCatalog,
+) -> Result<Option<serde_json::Value>> {
+    let Some(e) = old_catalog
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::UnsBlob && e.modality_id == 0)
+    else {
+        return Ok(None);
+    };
+    lock.seek(SeekFrom::Start(e.offset))?;
+    let mut buf = vec![0u8; e.length as usize];
+    std::io::Read::read_exact(lock, &mut buf)?;
+    Ok(Some(scx_format::parse_uns_json(&buf)?))
+}
+
 /// Match a `{prefix}/{key}` or `{prefix}/{key}_shard_{idx}` catalog entry name
 /// against a replaced key.
 ///

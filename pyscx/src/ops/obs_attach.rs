@@ -173,7 +173,6 @@ pub fn obs_import(
         missing_row_policy: parse_obs_missing_rows(on_missing_rows)?,
         extra_row_policy: parse_obs_extra_rows(on_extra_rows)?,
         status_column: status_column.map(str::to_string),
-        uns_key: uns_key.map(str::to_string),
         overwrite,
         provenance_action: "obs_import".to_string(),
         dry_run,
@@ -186,8 +185,13 @@ pub fn obs_import(
     // Both halves return `OpsError`, so one mapping covers read-then-attach —
     // a malformed CSV surfaces as a clean `ValueError`, not a panic.
     let (summary, info, diagnosis) = py.detach(|| -> PyResult<_> {
-        let (data, info) = scx_convert::read_obs_source(&table_path, &read_opts, &uns_keys)
+        let (mut data, info) = scx_convert::read_obs_source(&table_path, &read_opts, &uns_keys)
             .map_err(ops_to_pyerr)?;
+        // Without `uns_key` the selected source keys land at top level under
+        // their own names; with it they nest under the one key.
+        if let Some(k) = uns_key {
+            data.nest_uns_under(k);
+        }
         let summary =
             scx_ops::attach_external_obs(&scx_path, &data, &attach_opts).map_err(ops_to_pyerr)?;
         // Only on a dry run: the diagnosis costs a pass per obs column, which
@@ -269,12 +273,44 @@ pub fn attach_obs_columns(
              join on",
         ));
     }
-    if uns.is_some() != uns_key.is_some() {
-        return Err(PyValueError::new_err(
-            "uns= and uns_key= go together: uns is the payload, uns_key names \
-             the single uns key it is merged under",
-        ));
-    }
+    // Decided on the Python object, BEFORE normalisation: under the tagged
+    // format a tuple / ndarray / Series normalises to a JSON *object* (an
+    // `__scx_type__` envelope), so a post-hoc "is it an object" check would
+    // spray envelope fields across the top level of uns.
+    let uns_entries: serde_json::Map<String, serde_json::Value> = match (uns, uns_key) {
+        (None, None) => serde_json::Map::new(),
+        (None, Some(_)) => {
+            return Err(PyValueError::new_err(
+                "uns_key= names where uns= lands, so it needs a uns= payload",
+            ));
+        }
+        (Some(u), Some(k)) => {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                k.to_string(),
+                convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)?,
+            );
+            m
+        }
+        (Some(u), None) => {
+            if u.cast::<PyDict>().is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "uns= without uns_key= is merged into uns at top level, so it must be \
+                     a dict whose keys become uns keys; got {}. Pass uns_key= to nest a \
+                     non-dict payload under one key.",
+                    u.get_type().name()?
+                )));
+            }
+            match convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)? {
+                serde_json::Value::Object(m) => m,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "uns= dict did not normalise to a JSON object (got {other})"
+                    )))
+                }
+            }
+        }
+    };
 
     let batch = obs_var_to_record_batch(py, df, "attach_obs_columns", "df")?;
     if batch.num_rows() == 0 {
@@ -342,16 +378,11 @@ pub fn attach_obs_columns(
     drop.push("__index_level_0__".to_string());
     let annotations = scx_ops::drop_batch_columns(&batch, &drop).map_err(ops_to_pyerr)?;
 
-    let uns_json = match uns {
-        Some(u) => Some(convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)?),
-        None => None,
-    };
-
     let data = scx_ops::ExternalObsData {
         row_keys,
         row_annotations: annotations,
         row_embeddings: Vec::new(),
-        uns: uns_json,
+        uns: uns_entries,
         source_checksum: None,
         source_name: Some("<DataFrame>".to_string()),
     };
@@ -360,7 +391,6 @@ pub fn attach_obs_columns(
         missing_row_policy: parse_obs_missing_rows(on_missing_rows)?,
         extra_row_policy: parse_obs_extra_rows(on_extra_rows)?,
         status_column: status_column.map(str::to_string),
-        uns_key: uns_key.map(str::to_string),
         overwrite,
         provenance_action: "attach_obs_columns".to_string(),
         dry_run,

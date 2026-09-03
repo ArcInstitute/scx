@@ -108,6 +108,7 @@ from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
 from .pyscx import doublet_import as _doublet_import_native  # noqa: E402
 from .pyscx import modify_metadata as _modify_metadata_native  # noqa: E402
 from .pyscx import set_uns as _set_uns_native      # noqa: E402
+from .pyscx import update_uns as _update_uns_native  # noqa: E402
 
 # N3-2026-05-21-Tier2: hdf5-gated entry points. The Rust side registers
 # these four symbols under `#[cfg(feature = "hdf5")]` (pyscx/src/lib.rs).
@@ -388,7 +389,8 @@ def modify_metadata(path, **kwargs):
     **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
     the section and `num_rows` must match the file's `n_obs` / `n_vars`
     (changing cell/gene count is out of scope — use `append` / `subset`).
-    `obsm` / `varm` replace only the named matrices.
+    `obsm` / `varm` replace only the named matrices. For a shallow `uns`
+    merge use `pyscx.update_uns`.
 
     **A replaced axis keeps the predicate index it had.** The old section
     describes values that are gone, so it is rebuilt over the same columns the
@@ -435,15 +437,34 @@ def set_uns(path, uns):
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
-        uns: dict replacing the whole `uns` block (replace, not merge).
-
-    Example:
-        # For a shallow merge, read-modify-write:
-        adata = pyscx.open(path).to_anndata()
-        adata.uns["descriptions"] = {...}
-        pyscx.set_uns(path, dict(adata.uns))
+        uns: dict replacing the whole `uns` block (replace, not merge). To
+            add or overwrite a few keys and keep the rest, use
+            `pyscx.update_uns`.
     """
     result = _set_uns_native(_coerce_path(path), uns)
+    _reload_if_experiment(path)
+    return result
+
+
+def update_uns(path, uns):
+    """Shallow-merge `uns` into the `uns` block of an existing `.scx` file in
+    place, without re-encoding `X`.
+
+    The top-level keys of `uns` are written over the file's existing keys: a
+    key that already exists is replaced wholesale (nested dicts are not
+    deep-merged; `None` sets `null`, it does not delete), and every other key
+    survives untouched. A file with no `uns` yet gets `uns` as-is. The matrix
+    (`X` / CSR / CSC shards) is never read or rewritten, so a pre-existing CSC
+    sidecar stays valid. One atomic commit, rollback-able (`pyscx.rollback`).
+    For a full replacement use `pyscx.set_uns`.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        uns: dict whose top-level keys are merged into the file's `uns`.
+            Must be a dict — a tuple / array / Series has no top-level keys
+            to merge, so it is rejected rather than spread as an envelope.
+    """
+    result = _update_uns_native(_coerce_path(path), uns)
     _reload_if_experiment(path)
     return result
 
@@ -1027,7 +1048,8 @@ def obs_import(path, table, *, key=None, source_key=None, **kwargs):
         delimiter: One-character override. None sniffs from the extension
             (`.csv` / `.tsv` / `.tab`), then from the header line.
         status_column: Obs column recording "present"/"absent" per row.
-        uns_key: `uns` key to merge the table's metadata under.
+        uns_key: Nest the `uns_keys` carried from the source under this one
+            `uns` key. Omitted, they land at top level under their own names.
         uns_keys: `/uns` keys to carry across from an h5ad source. Opt-in --
             `/uns` routinely holds large arrays and types the reader skips, so
             nothing comes across unless named. A key that is not there is an
@@ -1108,11 +1130,13 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
             Mutually exclusive with `key`.
         status_column: Obs column recording "present"/"absent" per row.
             Rejected under `positional` (every row matches by construction).
-        uns: JSON-serialisable payload merged into `uns` under `uns_key`, in
-            the same commit as the columns — one `rollback` undoes both. The
-            rest of `uns` is left byte-identical. `uns` and `uns_key` go
-            together.
-        uns_key: The single `uns` key `uns` is merged under.
+        uns: JSON-serialisable payload landed in `uns` in the same commit as
+            the columns — one `rollback` undoes both. Alone, it must be a dict
+            and its top-level keys are merged into `uns` (several keys per
+            attach; a key the file already has is an error without
+            `overwrite`). With `uns_key`, the whole payload nests under that
+            one key instead. Every other `uns` key is left untouched.
+        uns_key: The single `uns` key to nest `uns` under. Needs `uns`.
         overwrite: **Replaces, never merges** a colliding obs column or uns
             key, exactly as `obs_import`. Without it, a collision is an error.
         on_missing_rows: "null" (default) leaves uncovered target rows NULL;

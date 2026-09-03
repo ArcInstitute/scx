@@ -315,17 +315,14 @@ fn a_declared_call_column_absent_still_imports_the_score_and_records_why() {
         "barcode,doublet_score,predicted_doublet\nAAAC-1,0.12,True\n",
     );
     let (data, _) = read_doublet_table(&p, &opts("doubletdetection")).unwrap();
-    let uns = data.uns.as_ref().expect("uns record");
+    let uns = &data.uns["doubletdetection"];
     assert_eq!(uns["call_column_status"], "declared_but_absent");
     assert_eq!(uns["expected_call_columns"][0], "doublet_label");
 
     // And the other two statuses, so all three are pinned in one place.
     let p2 = write(&dir, "scds.csv", "barcode,hybrid_score\nAAAC-1,0.3\n");
     let (d2, _) = read_doublet_table(&p2, &opts("scds")).unwrap();
-    assert_eq!(
-        d2.uns.as_ref().unwrap()["call_column_status"],
-        "not_declared"
-    );
+    assert_eq!(d2.uns["scds"]["call_column_status"], "not_declared");
 
     let p3 = write(
         &dir,
@@ -333,7 +330,7 @@ fn a_declared_call_column_absent_still_imports_the_score_and_records_why() {
         "barcode,doublet_score,doublet_label\nAAAC-1,0.12,1\n",
     );
     let (d3, _) = read_doublet_table(&p3, &opts("doubletdetection")).unwrap();
-    assert_eq!(d3.uns.as_ref().unwrap()["call_column_status"], "resolved");
+    assert_eq!(d3.uns["doubletdetection"]["call_column_status"], "resolved");
 }
 
 #[test]
@@ -754,9 +751,9 @@ fn uns_records_the_tool_and_the_resolved_columns() {
         "barcode,scDblFinder.score,scDblFinder.class\nAAAC-1,0.02,doublet\n",
     );
     let (data, _) = read_doublet_table(&p, &opts("scdblfinder")).unwrap();
-    let uns = data
-        .uns
-        .expect("the wrapper always records provenance in uns");
+    // Keyed by `key_added` (the profile name by default), so callers land it
+    // without re-deriving the key.
+    let uns = &data.uns["scdblfinder"];
     assert_eq!(uns["tool"], "scdblfinder");
     assert_eq!(uns["source_score_column"], "scDblFinder.score");
     assert_eq!(uns["source_call_column"], "scDblFinder.class");

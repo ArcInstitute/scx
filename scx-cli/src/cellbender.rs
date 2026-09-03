@@ -51,6 +51,7 @@ pub fn run_cellbender_import(
     let read_opts = scx_convert::CellBenderReadOptions {
         column_prefix: prefix.to_string(),
         latent_embedding,
+        uns_key: Some(uns_key.to_string()),
         ..Default::default()
     };
     let mut sink = scx_convert::WarningSink::log();
@@ -65,7 +66,6 @@ pub fn run_cellbender_import(
         column_axis_policy: axis,
         status_column: Some(format!("{prefix}status")),
         row_sum_column: Some(format!("{prefix}total_counts")),
-        uns_key: Some(uns_key.to_string()),
         overwrite,
         provenance_action: "cellbender_import".to_string(),
         dry_run,

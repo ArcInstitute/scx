@@ -12,7 +12,9 @@
 //! `subset`, or `from_*`.
 //!
 //! Replace semantics, **not merge**: a supplied field fully replaces the
-//! existing section. For a shallow `uns` merge, read-modify-write in the caller.
+//! existing section. The one exception is opt-in: [`MetadataPatch::uns_merge`]
+//! (surfaced as [`update_uns`], `pyscx.update_uns`, `scx set-uns --merge`)
+//! shallow-merges the `uns` patch's top-level keys into the existing block.
 //!
 //! A replaced axis **keeps the predicate index it had**: the old section can
 //! never survive verbatim (its shard ranges describe values that are gone), so
@@ -44,7 +46,9 @@ use scx_format_io::writer::ScxWriter;
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_obs::indexed_column_names;
-use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
+use crate::in_place::{
+    commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops, read_uns_blob,
+};
 use crate::predicate_index::{
     user_wants_index, validate_forced_columns, ObsVarIndexPass, PredicateIndexBuildSummary,
     StatsSink,
@@ -55,8 +59,16 @@ use crate::predicate_index::{
 /// `varm` replace only the named matrices; other keys pass through.
 #[derive(Default)]
 pub struct MetadataPatch {
-    /// Replaces the whole `UnsBlob` section.
+    /// Replaces the whole `UnsBlob` section — or, with [`Self::uns_merge`],
+    /// is shallow-merged into it.
     pub uns: Option<Value>,
+    /// When true, `uns` is a **shallow patch**: its top-level keys are merged
+    /// into the file's existing `uns` — a patch key replaces a same-named key
+    /// wholesale (no deep merge), every other key survives verbatim, and
+    /// `null` sets null rather than deleting. Requires `uns` to be a JSON
+    /// object, and the existing `uns` to be one too (or absent). False
+    /// (default): `uns` replaces the whole block. See [`update_uns`].
+    pub uns_merge: bool,
     /// Replaces obs metadata; `num_rows` must equal the file's `n_obs`.
     pub obs: Option<RecordBatch>,
     /// Replaces var metadata; `num_rows` must equal the file's `n_vars`.
@@ -296,6 +308,24 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         )));
     }
 
+    if patch.uns_merge {
+        match &patch.uns {
+            None => {
+                return Err(OpsError::InvalidInput(
+                    "modify_metadata: uns_merge=true needs a uns patch to merge".to_string(),
+                ))
+            }
+            Some(v) if !v.is_object() => {
+                return Err(OpsError::InvalidInput(format!(
+                    "modify_metadata: a uns merge patch must be a JSON object (its top-level \
+                     keys are merged); got {}. To replace uns with a non-object, use set_uns.",
+                    json_kind(v)
+                )))
+            }
+            Some(_) => {}
+        }
+    }
+
     let (mut lock, mut prep) = prepare_in_place(path, patch.modality_id)?;
 
     // Per-modality metadata replace is deferred — bail before any write so the
@@ -305,6 +335,24 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             op: "modify_metadata",
         });
     }
+
+    // --- Resolve the uns payload ------------------------------------------
+    // A merge reads the existing blob through the lock (no mmap — see
+    // `read_uns_blob`) and lays the patch's top-level keys over it. Still
+    // before any write, so a non-object existing `uns` is refused with the
+    // file byte-identical.
+    let uns_to_write: Option<Value> = match &patch.uns {
+        Some(uns) if patch.uns_merge => {
+            let entries = uns
+                .as_object()
+                .expect("uns_merge patch validated as an object above");
+            let existing = read_uns_blob(&mut lock, &prep.old_catalog)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(crate::external_obs::merge_uns_entries(existing, entries)?)
+        }
+        Some(uns) => Some(uns.clone()),
+        None => None,
+    };
 
     // --- Shape validation (before any write) -------------------------------
     if let Some(obs) = &patch.obs {
@@ -455,7 +503,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     let mut writer =
         ScxWriter::adopt_in_place(cloned, prep.header.clone(), write_offset, Vec::new())?;
 
-    if let Some(uns) = &patch.uns {
+    if let Some(uns) = &uns_to_write {
         writer.write_uns(uns)?;
     }
     if let Some(var) = &patch.var {
@@ -729,7 +777,8 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
 /// Convenience wrapper: replace the whole `uns` block.
 ///
 /// A uns-only patch touches no axis, so there is no index to carry and nothing
-/// in the summary to report — hence the `()`.
+/// in the summary to report — hence the `()`. For a shallow merge see
+/// [`update_uns`].
 pub fn set_uns(path: &Path, uns: &Value) -> Result<()> {
     modify_metadata(
         path,
@@ -739,6 +788,46 @@ pub fn set_uns(path: &Path, uns: &Value) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+/// Shallow-merge `patch`'s top-level keys into the file's `uns`, in place.
+///
+/// A patch key replaces a same-named existing key wholesale (nested objects
+/// are not deep-merged); every other key survives verbatim; `null` sets null
+/// rather than deleting. A file with no `uns` section gets `patch` as-is. The
+/// existing `uns` must be a JSON object — anything else is refused before any
+/// write (replace it with [`set_uns`]). Same cost and guarantees as
+/// [`set_uns`]: O(uns bytes), the matrix is untouched, one atomic commit,
+/// undone by one `rollback`.
+pub fn update_uns(path: &Path, patch: &Value) -> Result<()> {
+    if !patch.is_object() {
+        return Err(OpsError::InvalidInput(format!(
+            "update_uns: the patch must be a JSON object whose top-level keys are merged; \
+             got {}. To replace uns wholesale, use set_uns.",
+            json_kind(patch)
+        )));
+    }
+    modify_metadata(
+        path,
+        &MetadataPatch {
+            uns: Some(patch.clone()),
+            uns_merge: true,
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
+/// JSON value kind for error messages (`null` / `bool` / `number` / …).
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a bool",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Whether an old catalog entry is superseded by `patch` and must be dropped
@@ -830,6 +919,9 @@ fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> 
         changed.push("varm");
     }
     let mut params = serde_json::json!({ "changed": changed });
+    if patch.uns_merge {
+        params["uns_merge"] = true.into();
+    }
     if patch.obs.is_some() {
         params["obs_predicate_index_dropped"] = summary.obs_predicate_index_dropped.into();
     }

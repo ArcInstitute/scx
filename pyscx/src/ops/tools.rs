@@ -92,6 +92,8 @@ pub fn cellbender_import(
     let read_opts = scx_convert::CellBenderReadOptions {
         column_prefix: prefix.to_string(),
         latent_embedding,
+        // `None` omits the diagnostics record; the reader keys it itself.
+        uns_key: uns_key.map(str::to_string),
         ..Default::default()
     };
     let attach_opts = scx_ops::AttachLayerOptions {
@@ -103,7 +105,6 @@ pub fn cellbender_import(
         column_axis_policy: parse_gene_axis(gene_axis)?,
         status_column: Some(format!("{prefix}status")),
         row_sum_column: Some(format!("{prefix}total_counts")),
-        uns_key: uns_key.map(str::to_string),
         overwrite,
         provenance_action: "cellbender_import".to_string(),
         dry_run,
@@ -256,11 +257,11 @@ pub fn doublet_import(
         join_key,
         missing_row_policy: parse_obs_missing_rows(on_missing_rows)?,
         extra_row_policy: parse_obs_extra_rows(on_extra_rows)?,
-        // Both are part of the canonical contract rather than knobs: `_status`
-        // says which cells the tool actually covered, and `uns` records what it
-        // was. `obs_import` remains the surface where they are optional.
+        // Part of the canonical contract rather than a knob: `_status` says
+        // which cells the tool actually covered. (The `uns["<K>"]` record is
+        // keyed by `read_doublet_table` itself.) `obs_import` remains the
+        // surface where the status column is optional.
         status_column: Some(format!("{resolved_key_added}_status")),
-        uns_key: Some(resolved_key_added.clone()),
         overwrite,
         provenance_action: "doublet_import".to_string(),
         dry_run,

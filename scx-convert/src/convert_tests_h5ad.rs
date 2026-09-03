@@ -2910,3 +2910,55 @@ fn an_h5ad_doublet_source_is_read_rather_than_refused_on_its_extension() {
         "the Phase-4 deferral message must be gone: {m}"
     );
 }
+
+/// A float list carrying `nan` / `±inf` is spelled, under pyscx's tagged
+/// `uns` format, as plain numbers interleaved with float `scalar` envelopes
+/// (JSON has no non-finite literal). The export writer's 1-D list arm must
+/// turn that back into one f64 dataset — before this arm existed the chain
+/// matched nothing and the whole list vanished from the h5ad without a word.
+#[test]
+fn uns_list_with_non_finite_scalar_envelopes_exports_as_f64_dataset() {
+    use base64::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = dir.path().join("env.scx");
+    let h5ad_out = dir.path().join("env_out.h5ad");
+    make_multishard_scx(&scx_path, 6, 4, 4);
+
+    let env = |f: f64| {
+        serde_json::json!({
+            "__scx_type__": "scalar",
+            "dtype": "<f8",
+            "data": base64::engine::general_purpose::STANDARD.encode(f.to_le_bytes()),
+        })
+    };
+    scx_ops::set_uns(
+        &scx_path,
+        &serde_json::json!({
+            "lst": [1.0, env(f64::NAN), env(f64::NEG_INFINITY), 2.5],
+            "top": env(f64::INFINITY),
+        }),
+    )
+    .unwrap();
+
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let uns = out.group("uns").unwrap();
+    let got: Vec<f64> = uns
+        .dataset("lst")
+        .expect("the list must not be dropped")
+        .read_1d::<f64>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert_eq!(got[0], 1.0);
+    assert!(got[1].is_nan(), "{got:?}");
+    assert!(
+        got[2].is_infinite() && got[2] < 0.0,
+        "sign of -inf lost: {got:?}"
+    );
+    assert_eq!(got[3], 2.5);
+    let top: f64 = uns.dataset("top").unwrap().read_scalar().unwrap();
+    assert!(top.is_infinite() && top > 0.0, "{top}");
+}

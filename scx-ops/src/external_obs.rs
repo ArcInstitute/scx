@@ -140,12 +140,28 @@ pub struct ExternalObsData {
     /// Per-source-row dense matrices written to `obsm`. Usually empty for
     /// doublet callers.
     pub row_embeddings: Vec<(String, RecordBatch)>,
-    /// Merged into `uns` under [`AttachObsOptions::uns_key`].
-    pub uns: Option<Value>,
+    /// Entries merged into the target's `uns` at top level, in the same commit
+    /// as the columns. Empty leaves the existing `uns` section byte-identical
+    /// (it is not even rewritten). To land everything under one key, build the
+    /// payload and call [`ExternalObsData::nest_uns_under`].
+    pub uns: serde_json::Map<String, Value>,
     /// BLAKE3 of the source file, recorded in the provenance entry.
     pub source_checksum: Option<[u8; 32]>,
     /// Display name of the source (usually a path basename).
     pub source_name: Option<String>,
+}
+
+impl ExternalObsData {
+    /// Nest every uns entry under one key: `{a, b}` becomes `{key: {a, b}}`.
+    /// What `obs_import --uns-key K` asks for. A no-op on an empty payload, so
+    /// a key with nothing to put under it never creates an empty record.
+    pub fn nest_uns_under(&mut self, key: &str) {
+        if self.uns.is_empty() {
+            return;
+        }
+        let inner = std::mem::take(&mut self.uns);
+        self.uns.insert(key.to_string(), Value::Object(inner));
+    }
 }
 
 /// How the join key is built from obs columns.
@@ -195,9 +211,6 @@ pub struct AttachObsOptions {
     pub extra_row_policy: ExtraRowPolicy,
     /// Obs column recording `"present"` / `"absent"` per row. `None` omits it.
     pub status_column: Option<String>,
-    /// `uns` key for [`ExternalObsData::uns`]. `None` omits it — and then the
-    /// existing `uns` section is left byte-identical rather than rewritten.
-    pub uns_key: Option<String>,
     /// When false (default), any pre-existing obs column / obsm key / uns key
     /// this op would replace is an error.
     ///
@@ -227,7 +240,6 @@ impl Default for AttachObsOptions {
             missing_row_policy: MissingRowPolicy::default(),
             extra_row_policy: ExtraRowPolicy::default(),
             status_column: None,
-            uns_key: None,
             overwrite: false,
             modality_id: 0,
             provenance_action: "attach_external_obs".to_string(),
@@ -1235,17 +1247,48 @@ pub(crate) fn warn_unstreamable_obs(op: &str, n_obs: u64) {
     );
 }
 
-fn build_new_uns(mut uns: Value, data: &ExternalObsData, opts: &AttachObsOptions) -> Value {
-    let (Some(key), Some(note)) = (opts.uns_key.as_ref(), data.uns.as_ref()) else {
-        return uns;
+/// Merge `entries` into the file's existing `uns` at top level (shallow: an
+/// entry replaces a same-named key wholesale). Shared by the obs and layer
+/// attach ops so the two cannot drift.
+///
+/// The existing blob must be a JSON object — callers pass `{}` for a file with
+/// no `uns` section. Anything else is refused *before any write*: "merge into
+/// an array" has no meaning, and the single-key path this replaced used to
+/// swap a non-object `uns` for `{}` in silence, which was data loss.
+pub(crate) fn merge_uns_entries(
+    mut uns: Value,
+    entries: &serde_json::Map<String, Value>,
+) -> Result<Value> {
+    if entries.is_empty() {
+        return Ok(uns);
+    }
+    let Some(map) = uns.as_object_mut() else {
+        return Err(OpsError::InvalidInput(
+            "the file's uns is not a JSON object, so there is nothing to merge \
+             into; replace it with set_uns first"
+                .to_string(),
+        ));
     };
-    if !uns.is_object() {
-        uns = serde_json::json!({});
+    for (k, v) in entries {
+        map.insert(k.clone(), v.clone());
     }
-    if let Some(map) = uns.as_object_mut() {
-        map.insert(key.clone(), note.clone());
+    Ok(uns)
+}
+
+/// The `overwrite = false` half of the uns contract: every entry must be a key
+/// the file does not have yet. Names the first collision.
+pub(crate) fn check_uns_collisions(
+    uns: &Value,
+    entries: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    for key in entries.keys() {
+        if uns.get(key).is_some() {
+            return Err(OpsError::InvalidInput(format!(
+                "uns key '{key}' already exists; pass overwrite=true to replace it"
+            )));
+        }
     }
-    uns
+    Ok(())
 }
 
 /// Scatter the source embeddings onto the full target row axis.
@@ -1351,7 +1394,6 @@ fn check_collisions(
     obs_schema: &Schema,
     uns: &Value,
     data: &ExternalObsData,
-    opts: &AttachObsOptions,
     obs_new: &[String],
 ) -> Result<()> {
     for name in obs_new {
@@ -1363,13 +1405,7 @@ fn check_collisions(
             )));
         }
     }
-    if let Some(key) = &opts.uns_key {
-        if data.uns.is_some() && uns.get(key).is_some() {
-            return Err(OpsError::InvalidInput(format!(
-                "uns key '{key}' already exists; pass overwrite=true to replace it"
-            )));
-        }
-    }
+    check_uns_collisions(uns, &data.uns)?;
     if !data.row_embeddings.is_empty() {
         // Names only — `read_all_obsm` would decode every existing embedding
         // just to look at its key, which on an atlas is the largest thing this
@@ -1440,7 +1476,7 @@ fn build_params_json(
         // both paths produce a sharded obs, so a file that cost its own obs
         // table in RAM looks exactly like one that did not.
         "obs_streamed": s.obs_streamed,
-        "uns_key": opts.uns_key,
+        "uns_keys_merged": data.uns.keys().collect::<Vec<_>>(),
         "overwrite": opts.overwrite,
     });
     if let (Some(map), Some(extra)) = (v.as_object_mut(), opts.provenance_params.as_object()) {
@@ -1547,7 +1583,7 @@ fn attach_external_obs_inner(
     }
 
     let planned_obs = planned_obs_columns(data, opts);
-    if planned_obs.is_empty() && data.row_embeddings.is_empty() && data.uns.is_none() {
+    if planned_obs.is_empty() && data.row_embeddings.is_empty() && data.uns.is_empty() {
         return Err(OpsError::InvalidInput(
             "nothing to attach: row_annotations has no columns, and no status column, \
              obsm embedding or uns payload was supplied"
@@ -1666,15 +1702,15 @@ fn attach_external_obs_inner(
 
     // --- Collision checks ---------------------------------------------------
     if !opts.overwrite {
-        check_collisions(reader, &obs_schema, &uns, data, opts, &planned_obs)?;
+        check_collisions(reader, &obs_schema, &uns, data, &planned_obs)?;
     }
 
     // --- Would this invalidate the obs predicate index? ---------------------
     let drop_obs_index = obs_index_would_go_stale(reader, &planned_obs)?;
 
     // --- Build the sections that are not the obs axis -----------------------
-    let rewrote_uns = opts.uns_key.is_some() && data.uns.is_some();
-    let new_uns = build_new_uns(uns, data, opts);
+    let rewrote_uns = !data.uns.is_empty();
+    let new_uns = merge_uns_entries(uns, &data.uns)?;
     let obsm_batches = build_obsm(data, &row_join)?;
 
     // --- Capture catalog invariants before consuming old_catalog -----------

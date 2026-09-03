@@ -625,13 +625,16 @@ enum Commands {
         #[arg(long)]
         to_seq: Option<u64>,
     },
-    /// Replace the `uns` block in place, without re-encoding X (cheapest path)
+    /// Replace (or, with --merge, shallow-merge into) the `uns` block in place, without re-encoding X (cheapest path)
     SetUns {
         /// SCX file to modify
         file: PathBuf,
-        /// JSON file whose contents become the new `uns` (replace, not merge)
+        /// JSON file whose contents become the new `uns` (replace), or whose top-level keys are merged in (--merge)
         #[arg(long)]
         uns: PathBuf,
+        /// Shallow-merge the JSON object's top-level keys into the existing `uns` instead of replacing it: a key that exists is overwritten, every other key survives
+        #[arg(long)]
+        merge: bool,
     },
     /// Replace metadata sections (uns/obs/var/obsm/varm) in place, no X re-encode
     ModifyMetadata {
@@ -1095,7 +1098,7 @@ enum Commands {
         /// obs column recording "present"/"absent" per row
         #[arg(long)]
         status_column: Option<String>,
-        /// uns key to merge the table's metadata under
+        /// Nest the --uns-key-from-source keys under this one uns key (omitted: they land at top level under their own names)
         #[arg(long)]
         uns_key: Option<String>,
         /// uns key to carry across from an h5ad source. Repeatable; ignored
@@ -1589,7 +1592,7 @@ fn main() {
             group_write_block_bytes,
         ),
         Commands::Rollback { file, to_seq } => rollback::run_rollback(&file, to_seq),
-        Commands::SetUns { file, uns } => set_uns::run_set_uns(&file, &uns),
+        Commands::SetUns { file, uns, merge } => set_uns::run_set_uns(&file, &uns, merge),
         Commands::ModifyMetadata {
             file,
             uns,

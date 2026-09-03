@@ -246,8 +246,9 @@ pub struct ExternalLayerData {
     /// Per-source-column annotations appended to var. `num_rows()` must equal
     /// `col_keys.len()`.
     pub col_annotations: Option<RecordBatch>,
-    /// Merged into `uns` under [`AttachLayerOptions::uns_key`].
-    pub uns: Option<Value>,
+    /// Entries merged into the target's `uns` at top level, in the same commit
+    /// as the layer (see `ExternalObsData::uns`).
+    pub uns: serde_json::Map<String, Value>,
     /// BLAKE3 of the source file, recorded in the provenance entry.
     pub source_checksum: Option<[u8; 32]>,
     /// Display name of the source (usually a path basename).
@@ -322,8 +323,6 @@ pub struct AttachLayerOptions {
     pub status_column: Option<String>,
     /// Obs column holding each row's emitted layer sum. `None` omits it.
     pub row_sum_column: Option<String>,
-    /// `uns` key for [`ExternalLayerData::uns`]. `None` omits it.
-    pub uns_key: Option<String>,
     /// When false (default), any pre-existing layer / obs column / var column /
     /// obsm key / uns key this op would replace is an error.
     pub overwrite: bool,
@@ -357,7 +356,6 @@ impl Default for AttachLayerOptions {
             column_axis_policy: ColumnAxisPolicy::default(),
             status_column: None,
             row_sum_column: None,
-            uns_key: None,
             overwrite: false,
             value_encoding: None,
             codec: None,
@@ -700,7 +698,7 @@ fn attach_external_layer_inner(
     // --- Build the new var / uns in memory ---------------------------------
     // The obs axis is built inside the write loop below, one shard at a time.
     let new_var = build_new_var(&var, data, &col_map, column_axis_match)?;
-    let new_uns = build_new_uns(uns, data, opts);
+    let new_uns = crate::external_obs::merge_uns_entries(uns, &data.uns)?;
     let obsm_batches = build_obsm(data, &row_join, n_obs as usize)?;
 
     // --- Capture catalog invariants before consuming old_catalog -----------
@@ -1802,19 +1800,6 @@ fn build_new_var(
         .map_err(|e| OpsError::InvalidInput(format!("failed to build new var: {e}")))
 }
 
-fn build_new_uns(mut uns: Value, data: &ExternalLayerData, opts: &AttachLayerOptions) -> Value {
-    let (Some(key), Some(note)) = (opts.uns_key.as_ref(), data.uns.as_ref()) else {
-        return uns;
-    };
-    if !uns.is_object() {
-        uns = serde_json::json!({});
-    }
-    if let Some(map) = uns.as_object_mut() {
-        map.insert(key.clone(), note.clone());
-    }
-    uns
-}
-
 /// Scatter the source embeddings onto the full target row axis.
 ///
 /// Unlike obs, this is **not** bounded: `write_obsm` emits one section, so the
@@ -1880,13 +1865,7 @@ fn check_collisions(
             )));
         }
     }
-    if let Some(key) = &opts.uns_key {
-        if data.uns.is_some() && uns.get(key).is_some() {
-            return Err(OpsError::InvalidInput(format!(
-                "uns key '{key}' already exists; pass overwrite=true to replace it"
-            )));
-        }
-    }
+    crate::external_obs::check_uns_collisions(uns, &data.uns)?;
     if !data.row_embeddings.is_empty() {
         // Names only — `read_all_obsm` would decode every existing embedding
         // just to look at its key, which on an atlas is the largest thing this
@@ -1978,7 +1957,7 @@ fn build_params_json(
         // See the obs op's twin: not recoverable from the output, because both
         // rewrite paths produce a sharded obs.
         "obs_streamed": s.obs_streamed,
-        "uns_key": opts.uns_key,
+        "uns_keys_merged": data.uns.keys().collect::<Vec<_>>(),
         "overwrite": opts.overwrite,
     });
     if let (Some(map), Some(extra)) = (v.as_object_mut(), opts.provenance_params.as_object()) {

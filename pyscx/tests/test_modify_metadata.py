@@ -598,3 +598,49 @@ def test_projected_read_obs_keeps_its_index(categorical_obs_scx):
     projected = pyscx.open(path).read_obs(["n_counts"])
     assert list(projected.index) == expected
     assert list(projected.columns) == ["n_counts"]
+
+
+# ---------------------------------------------------------------------------
+# update_uns — shallow merge
+# ---------------------------------------------------------------------------
+
+
+def test_update_uns_overwrites_only_the_named_keys(synthetic_adata, scx_from_adata):
+    path = scx_from_adata(synthetic_adata)
+    pyscx.set_uns(path, {"a": 1, "b": {"x": 1}, "keep": [1.5, "s"]})
+
+    pyscx.update_uns(path, {"b": 2, "c": [3]})
+
+    uns = pyscx.open(path).read_uns()
+    assert uns["a"] == 1, "untouched key survives"
+    assert uns["b"] == 2, "a patch key replaces the old value wholesale (no deep merge)"
+    assert list(uns["c"]) == [3]
+    assert list(uns["keep"]) == [1.5, "s"]
+    assert set(uns) == {"a", "b", "c", "keep"}
+
+
+def test_update_uns_rejects_a_non_dict_and_writes_nothing(synthetic_adata, scx_from_adata):
+    path = scx_from_adata(synthetic_adata)
+    pyscx.set_uns(path, {"a": 1})
+    before = open(path, "rb").read()
+    for bad in [(1, 2), [1, 2], np.array([1.0]), "s", 3]:
+        with pytest.raises(ValueError, match="must be a dict"):
+            pyscx.update_uns(path, bad)
+    assert open(path, "rb").read() == before
+
+
+def test_update_uns_then_rollback(synthetic_adata, scx_from_adata):
+    path = scx_from_adata(synthetic_adata)
+    pyscx.set_uns(path, {"state": "v0"})
+    pyscx.update_uns(path, {"added": True})
+    assert pyscx.open(path).read_uns() == {"state": "v0", "added": True}
+
+    pyscx.rollback(path)
+    assert pyscx.open(path).read_uns() == {"state": "v0"}
+
+
+def test_update_uns_reloads_an_open_experiment_handle(synthetic_adata, scx_from_adata):
+    path = scx_from_adata(synthetic_adata)
+    exp = pyscx.open(path)
+    pyscx.update_uns(exp, {"via_handle": 1})
+    assert exp.read_uns()["via_handle"] == 1
