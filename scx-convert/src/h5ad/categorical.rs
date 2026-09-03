@@ -171,9 +171,11 @@ where
 
 /// Build a per-shard local categorical view `(local_codes, local_values)` for
 /// the streaming categorical writer, accepting **both** a `Dictionary(_, V)`
-/// array (the existing append-grown base shards) and a **plain `V`** array
-/// (appended shards, where `append` decoded the dictionary to its value type
-/// before writing — see `scx-ops::unify_dict_columns`). For the plain case it
+/// array (what `from_anndata` and the in-place obs writers emit) and a **plain
+/// `V`** array (appended shards, where `append` decodes the dictionary to its
+/// value type before writing — see `scx-ops::unify_dict_columns` — and shards
+/// the in-place writers rewrote before they stopped doing the same). For the
+/// plain case it
 /// builds a local first-seen dedup: `local_codes[row]` is the local index of
 /// that row's value (or `-1` when the row is null, keyed on *validity* — a
 /// genuine empty-string category is distinct from a null), and `local_values`
@@ -384,8 +386,9 @@ pub(super) fn cat_class_mismatch_err(name: &str) -> ConvertError {
 /// Numeric widths are required to match **exactly** here (e.g. a plain `Int32`
 /// shard under a `Dictionary(_, Int64)` column is rejected), which is
 /// intentionally stricter than the read-side `reconcile_dictionary_representations`,
-/// where `arrow::compute::cast` would coerce integer widths. The real
-/// `append`/`from_anndata` flow never produces a width-mismatched layout —
+/// where `arrow::compute::cast` would coerce integer widths. No real writer
+/// produces a width-mismatched layout — `from_anndata` and the in-place obs
+/// writers carry the dictionary through, and `append`'s
 /// `scx-ops::unify_dict_columns` preserves the exact value type `V` — so the only
 /// way to hit the difference is a hand-crafted third-party file, where failing
 /// loudly on export is preferable to a silent width coercion.

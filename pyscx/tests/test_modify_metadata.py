@@ -446,9 +446,12 @@ def test_modify_metadata_empty_patch_raises(synthetic_adata, scx_from_adata):
 # renamed to the value of the first string column**, silently.
 #
 # It only fired when a categorical obs column was present (a batch with no
-# dictionary column takes an early return), which is why it looked intermittent:
+# dictionary column took an early return), which is why it looked intermittent:
 # a file with no categoricals was fine, and so was any *second* mutation, the
-# first having already decoded every categorical to plain strings.
+# first having already decoded every categorical to plain strings. The in-place
+# writers no longer run that cast at all — a categorical stays a dictionary
+# through every one of them — so the envelope now has to survive on its own
+# merits, on every write, with the categorical still present.
 
 
 @pytest.fixture()
@@ -540,21 +543,19 @@ def test_obs_import_then_export_keeps_obs_names(categorical_obs_scx, tmp_path):
     assert _exported_obs_names(path, tmp_path, "out.h5ad") == expected
 
 
-def test_a_second_in_place_write_self_heals_the_envelope(categorical_obs_scx, tmp_path):
-    """Two mutations in a row, which is the case that always worked.
+def test_two_in_place_writes_keep_the_index_and_the_categorical(categorical_obs_scx, tmp_path):
+    """Two mutations in a row, through two different writers.
 
-    Verified against the pre-fix build: this one **passed** even then, and the
-    reason is worth pinning. `doublet_import` drops the envelope, but it also
-    decodes the categorical to plain strings; `doublet_consensus` then reads
-    obs back through a path that re-stamps the envelope
-    (`ensure_pandas_index_metadata`) and writes it out again — and with no
-    dictionary column left there is nothing to trigger the schema rebuild, so
-    the repair persists.
-
-    That self-healing is exactly why the bug looked intermittent, and it is a
-    real behaviour worth guarding: a future change to the read path's
-    re-stamping would break this while leaving the single-mutation tests above
-    green.
+    An earlier version of this test passed even on the pre-fix build, and its
+    docstring explained why with a mechanism that depended on the bug: the
+    first write stringified the categorical, so the second write's batch had no
+    dictionary column and skipped the schema rebuild that dropped the envelope
+    — a "self-heal". That premise is gone twice over: the in-place writers no
+    longer cast categoricals at all, and `doublet_consensus`'s first run takes
+    the `attach_obs_columns` seam, not `modify_metadata`. A test whose
+    explanation encodes the bug is a spec for the bug, so this now pins what the
+    two writes must actually guarantee: the envelope survives both (obs_names
+    export intact) *and* the categorical is still a categorical afterwards.
     """
     path, expected = categorical_obs_scx
 
@@ -568,6 +569,10 @@ def test_a_second_in_place_write_self_heals_the_envelope(categorical_obs_scx, tm
     pyscx.doublet_consensus(path, keys=["scrublet"], method="any")
 
     assert _exported_obs_names(path, tmp_path, "out.h5ad") == expected
+    obs = pyscx.open(path).read_obs()
+    assert isinstance(obs["cell_type"].dtype, pd.CategoricalDtype), obs["cell_type"].dtype
+    assert list(obs["cell_type"].cat.categories) == ["B cell", "NK", "T cell"]
+    assert "doublet_consensus" in obs.columns or any(c.startswith("doublet") for c in obs.columns)
 
 
 def test_the_categorical_stays_a_column_not_the_index(categorical_obs_scx, tmp_path):
@@ -584,6 +589,10 @@ def test_the_categorical_stays_a_column_not_the_index(categorical_obs_scx, tmp_p
     obs = anndata.read_h5ad(out).obs
     assert "cell_type" in obs.columns
     assert list(obs["cell_type"].astype(str))[:4] == ["T cell"] * 4
+    # And still the categorical it was written as: the in-place rewrite carries
+    # the dictionary through rather than decoding it to plain strings.
+    assert isinstance(obs["cell_type"].dtype, pd.CategoricalDtype), obs["cell_type"].dtype
+    assert list(obs["cell_type"].cat.categories) == ["B cell", "NK", "T cell"]
     assert "__index_level_0__" not in obs.columns
 
 

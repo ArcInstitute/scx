@@ -645,8 +645,10 @@ def test_obs_import_on_a_sharded_file_joins_by_key(tmp_path):
     assert obs.index.tolist() == bc
     assert obs["score"].tolist() == [i / 100 for i in range(len(bc))]
     assert obs["dbl_status"].tolist() == ["present"] * len(bc)
-    # The pre-existing column survives untouched.
+    # The pre-existing column survives untouched — values *and* dtype. It was
+    # written as a categorical, and a per-shard rewrite must hand it back as one.
     assert obs["cell_type"].tolist() == ["A", "B"] * (len(bc) // 2)
+    assert isinstance(obs["cell_type"].dtype, pd.CategoricalDtype), obs["cell_type"].dtype
 
 
 def test_sharded_and_single_section_imports_agree(tmp_path):

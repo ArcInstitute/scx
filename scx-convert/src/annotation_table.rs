@@ -466,12 +466,13 @@ pub(crate) fn project_annotations(
             )));
         }
         // Nullable regardless of what the source looked like: the attach op
-        // scatters nulls into every target row the table does not cover.
-        fields.push(Field::new(
-            &final_name,
-            table.column(idx).data_type().clone(),
-            true,
-        ));
+        // scatters nulls into every target row the table does not cover. The
+        // field metadata is kept — the h5ad reader stamps a categorical's
+        // `ordered` bit there, and the projection is not where it gets lost.
+        fields.push(
+            Field::new(&final_name, table.column(idx).data_type().clone(), true)
+                .with_metadata(schema.field(idx).metadata().clone()),
+        );
         columns.push(Arc::clone(table.column(idx)));
     }
 

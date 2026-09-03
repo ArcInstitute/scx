@@ -635,6 +635,33 @@ lack `__import__` (see
 
 ### In place, via the same harness as append
 
+### Categoricals survive the rewrite
+
+Every in-place obs writer — `attach_obs_columns` / `scx_attach_obs`,
+`obs_import`, `doublet_import`, `cellbender_import` and `modify_metadata(obs=)`
+— writes a categorical column back as the Arrow dictionary it read (or was
+handed), field metadata included, so `read_obs()` returns it as `category` with
+its declared order, its unused levels and its `ordered` bit intact, and a
+categorical the *source* brings in lands the same way, whatever the value type
+(string, boolean, integer or float levels alike). Nothing on disk changed
+for this: `from_anndata` always wrote dictionaries and every reader accepted
+them; the writers simply stopped decoding them to plain strings on the way
+out (pyscx 0.17). The sharded-obs reader also stopped losing declared-but-unused
+levels on small files (arrow's dictionary merge pruned them once the summed
+per-shard vocabularies reached the row count); a `collect()` whose rows the
+caller narrowed (`filter_obs` or `limit`) carries only the categories its
+surviving rows use, now deterministically on both obs layouts, while an
+unfiltered `collect()` keeps the declared list like `read_obs()`. A file rewritten in place before that carries the column as a
+dictionary in some obs shards and plain strings in others; that mix still reads
+(the assembler reconciles it) and still takes an attach, which rewrites each
+shard's rows without re-encoding the columns it does not touch. `append` /
+`merge` still write the rows they add as plain strings — their dictionary
+output is a tracked follow-on. Until it lands, only an `append` onto an
+already-sharded dictionary base reads back as `category` (the assembler
+reconciles the mix); a `merge` output or an `append` onto a legacy
+single-section obs is plain strings throughout, and a filtered `collect()`
+whose surviving rows all fall in appended shards returns plain strings too.
+
 The import writes through `prepare_in_place` / `commit_in_place`: new sections
 are appended at EOF and the catalog is repointed, exactly as `append`,
 `modify_metadata` and `cellbender-import` do. `X` and its layers are never read

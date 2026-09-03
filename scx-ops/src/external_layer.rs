@@ -80,7 +80,6 @@ use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::FramingConfig;
 
-use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_obs::{
     warn_unstreamable_obs, write_obs_shards_appending, write_obs_shards_from_whole, ObsRewrite,
@@ -777,7 +776,7 @@ fn attach_external_layer_inner(
             let obs = reader.read_obs()?;
             // The n_obs check lives in `write_obs_shards_from_whole`, shared
             // with the obs op so the two cannot diverge on whether it runs.
-            let built = unify_dict_columns(&build_new_obs(&obs, data, opts, &row_join, 0)?)?;
+            let built = build_new_obs(&obs, data, opts, &row_join, 0)?;
             drop(obs);
             Some(built)
         }
@@ -1724,7 +1723,10 @@ fn build_new_obs(
         for (i, f) in ann.schema().fields().iter().enumerate() {
             let scattered = scatter_column(ann.column(i), join, row_start, row_end)?;
             // Unmatched rows become null, so the field must admit nulls.
-            fields.push(Field::new(f.name(), f.data_type().clone(), true));
+            fields.push(
+                Field::new(f.name(), f.data_type().clone(), true)
+                    .with_metadata(f.metadata().clone()),
+            );
             columns.push(scattered);
         }
     }
@@ -1796,7 +1798,9 @@ fn build_new_var(
     // The whole var axis: this is the gene axis, always read and written whole.
     let n_var_rows = join.source_of_target.len();
     for (i, f) in ann.schema().fields().iter().enumerate() {
-        fields.push(Field::new(f.name(), f.data_type().clone(), true));
+        fields.push(
+            Field::new(f.name(), f.data_type().clone(), true).with_metadata(f.metadata().clone()),
+        );
         columns.push(scatter_column(ann.column(i), &join, 0, n_var_rows)?);
     }
 

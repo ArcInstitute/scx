@@ -1,6 +1,6 @@
 //! The committed byte-identity A/B matrix: what does each rewriting op write?
 //!
-//! Nine arms over seven ops, one manifest of per-section digests, three ways to
+//! Ten arms over eight ops, one manifest of per-section digests, three ways to
 //! use it:
 //!
 //! * **default** — assert against the checked-in golden. A refactor that
@@ -43,7 +43,7 @@
 //! ## What this cannot see
 //!
 //! Read this before citing a green run as "the rewrite did not change bytes".
-//! It is true of these nine arms and of nothing else.
+//! It is true of these ten arms and of nothing else.
 //!
 //! **Regions of the file.** `FileHeader::file_checksum` is deliberately outside
 //! the digest (it covers the `Provenance` section, which is itself excluded),
@@ -66,6 +66,14 @@
 //!   here is multimodal — so those arms run in neither.
 //! * **`scx subset`**, **`scx-convert`** in both directions, and
 //!   **`pyscx.from_anndata`**.
+//! * **The other in-place obs writers, and the streamed obs path.**
+//!   `attach_external_obs` is in the matrix over a categorical-obs fixture, but
+//!   that fixture's obs is one legacy section, so the arm runs the
+//!   *materialising* rewrite (`write_obs_shards_from_whole`); the per-shard
+//!   streamed rewrite is pinned only by `scx-ops`'s own tests.
+//!   `modify_metadata`, `attach_external_layer` (cellbender) and the
+//!   `obs_import` / `doublet_import` producers share that obs writer and are
+//!   not digested at all.
 //!
 //! **Layout.** Every arm runs at `Strictness::Content`, which ignores section
 //! offsets. A change that only moves sections — a byte-passthrough or an
@@ -83,17 +91,22 @@ mod common;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use common::{appendable_rows, fixture_all_families, fixture_all_families_without_raw};
+use common::{
+    appendable_rows, fixture_all_families, fixture_all_families_with_categorical_obs,
+    fixture_all_families_without_raw,
+};
 use scx_codec::ValueEncoding;
 use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest};
 use scx_testkit::digest::Strictness;
 use scx_testkit::fixtures::mixed_codec_file;
 
-/// Every arm, in the order the manifest reports them: nine labels over the
+/// Every arm, in the order the manifest reports them: the nine labels over the
 /// seven ops PR-01 names, with `compact` and `build_csc` doubled over an
-/// index-carrying input.
+/// index-carrying input, plus `attach_obs` (the in-place obs attach, added with
+/// the categorical-fidelity change so its output is pinned from here on).
 const EXPECTED_OPS: &[&str] = &[
     "append",
+    "attach_obs",
     "build_csc",
     "build_csc_indexed",
     "compact",
@@ -236,12 +249,73 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     scx_ops::mark_deleted(&target, &[1, 6]).unwrap();
     m.record("delete", &target, Strictness::Content).unwrap();
 
+    // `attach_external_obs` over a fixture whose `cell_type` is a categorical,
+    // attaching one plain and one categorical column keyed on `cell_id`. What
+    // this digest pins: the target's dictionary column and its `ordered` stamp
+    // written through unchanged, and the attached categorical landing as a
+    // dictionary — the bytes the in-place writers used to get wrong by casting
+    // every dictionary column to plain strings.
+    let target = fixture_all_families_with_categorical_obs(dir, "attach_obs.scx");
+    scx_ops::attach_external_obs(&target, &attach_obs_payload(), &attach_obs_options()).unwrap();
+    m.record("attach_obs", &target, Strictness::Content)
+        .unwrap();
+
     m
 }
 
-/// The premise: the matrix really does cover every arm it is meant to — nine of
-/// them, over the seven ops PR-01 names, with `compact` and `build_csc` doubled
-/// over an index-carrying input.
+/// Six of the fixture's eight cells, in reverse order (a key join, not a
+/// positional one), with a float score and an ordered categorical call whose
+/// declared order is neither alphabetical nor first-appearance and whose third
+/// level no row uses.
+fn attach_obs_payload() -> scx_ops::ExternalObsData {
+    use arrow::array::{
+        Array, DictionaryArray, Float32Array, Int32Array, RecordBatch, StringArray,
+    };
+    use arrow::datatypes::{Field, Int32Type, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let row_keys: Vec<String> = (0..6).rev().map(|i| format!("cell_{i}")).collect();
+    let score = Float32Array::from((0..6).map(|i| i as f32 * 0.25).collect::<Vec<_>>());
+    let call = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![1, 0, 1, 0, 1, 0]),
+        Arc::new(StringArray::from(vec!["doublet", "singlet", "unsure"])),
+    )
+    .unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("dbl_score", score.data_type().clone(), true),
+        Field::new("dbl_call", call.data_type().clone(), true).with_metadata(md),
+    ]);
+    scx_ops::ExternalObsData {
+        row_keys,
+        row_annotations: RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(score), Arc::new(call)],
+        )
+        .unwrap(),
+        row_embeddings: Vec::new(),
+        uns: serde_json::Map::new(),
+        source_checksum: None,
+        source_name: Some("calls.csv".to_string()),
+    }
+}
+
+fn attach_obs_options() -> scx_ops::AttachObsOptions {
+    scx_ops::AttachObsOptions {
+        join_key: scx_ops::ObsJoinKey::Column("cell_id".to_string()),
+        status_column: Some("dbl_status".to_string()),
+        ..Default::default()
+    }
+}
+
+/// The premise: the matrix really does cover every arm it is meant to — the
+/// nine over the seven ops PR-01 names, with `compact` and `build_csc` doubled
+/// over an index-carrying input, plus the `attach_obs` arm.
 ///
 /// Without it, dropping an op from `build_manifest` would only be caught by a
 /// golden re-bless — which is exactly the moment somebody is least likely to

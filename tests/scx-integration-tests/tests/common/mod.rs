@@ -125,6 +125,20 @@ pub fn fixture_all_families_with_extra_obsm(dir: &Path, name: &str, key: &'stati
     )
 }
 
+/// The same file with `cell_type` stored as a categorical (`Dictionary(Int8,
+/// Utf8)` + the `scx.categorical.ordered` stamp) instead of plain `Utf8`.
+///
+/// For the `attach_obs` output-identity arm only. The in-place obs writers
+/// carry a dictionary column through as a dictionary, and a digest over a
+/// plain-string fixture cannot see whether they still do — but flipping the
+/// default fixture would move every other arm's digest for a reason that has
+/// nothing to do with those ops. The obs batch is the one thing this variant
+/// changes, so it is passed in rather than selected by a knob on
+/// [`FixtureShape`].
+pub fn fixture_all_families_with_categorical_obs(dir: &Path, name: &str) -> PathBuf {
+    build_all_families_with_obs(dir, name, FixtureShape::default(), categorical_obs_batch())
+}
+
 /// The same file with an explicit zero stored in X, so that canonicalisation
 /// has something to do and the detection bitmap written alongside is left
 /// describing a matrix that no longer exists.
@@ -140,6 +154,15 @@ pub fn fixture_with_explicit_zero_in_x(dir: &Path, name: &str) -> PathBuf {
 }
 
 fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
+    build_all_families_with_obs(dir, name, shape, obs_batch())
+}
+
+fn build_all_families_with_obs(
+    dir: &Path,
+    name: &str,
+    shape: FixtureShape,
+    obs: RecordBatch,
+) -> PathBuf {
     let path = dir.join(name);
     let mut writer = ScxWriter::new(
         &path,
@@ -148,7 +171,6 @@ fn build_all_families(dir: &Path, name: &str, shape: FixtureShape) -> PathBuf {
     .unwrap();
 
     // --- obs / var -------------------------------------------------------
-    let obs = obs_batch();
     writer.write_obs(&obs).unwrap();
     let var = var_batch(N_VARS, "gene");
     writer.write_var(&var).unwrap();
@@ -416,6 +438,52 @@ pub fn appendable_rows(n_new: usize) -> (RecordBatch, Vec<u64>, Vec<u32>, Vec<u8
     // the existing shards use rather than forming a distinguishable block.
     let (indptr, indices, values) = csr_rows(N_OBS, n_new, N_VARS, 1);
     (obs, indptr, indices, values)
+}
+
+/// [`obs_batch`] with `cell_type` as `Dictionary(Int8, Utf8)` — the shape a
+/// pandas categorical lands in — plus the `scx.categorical.ordered` stamp and a
+/// declared level no row uses, so a digest over it sees the dictionary, the
+/// stamp and the unused level (and not a vocabulary rebuilt from the data).
+fn categorical_obs_batch() -> RecordBatch {
+    use arrow::array::{Array, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+
+    let base = obs_batch();
+    let dict = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from((0..N_OBS).map(|i| (i % 2) as i8).collect::<Vec<_>>()),
+        Arc::new(StringArray::from(vec!["T cell", "B cell", "NK cell"])),
+    )
+    .unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let fields: Vec<Field> = base
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "cell_type" {
+                Field::new("cell_type", dict.data_type().clone(), true).with_metadata(md.clone())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let columns = base
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if base.schema().field(i).name() == "cell_type" {
+                Arc::new(dict.clone()) as arrow::array::ArrayRef
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
 }
 
 fn obs_batch() -> RecordBatch {

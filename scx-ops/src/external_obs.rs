@@ -89,7 +89,6 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
 
-use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_layer::{
     display_key_name, examples, first_duplicates, is_joinable_key_column, is_string_column,
@@ -479,8 +478,11 @@ pub fn drop_batch_columns(batch: &RecordBatch, drop: &[String]) -> Result<Record
             continue;
         }
         // Nullable regardless: the attach op scatters nulls into every target
-        // row the source does not cover.
-        fields.push(Field::new(f.name(), f.data_type().clone(), true));
+        // row the source does not cover. Field metadata rides along — it is
+        // where a categorical's `ordered` bit lives.
+        fields.push(
+            Field::new(f.name(), f.data_type().clone(), true).with_metadata(f.metadata().clone()),
+        );
         arrays.push(Arc::clone(batch.column(i)));
     }
     if fields.is_empty() {
@@ -1049,8 +1051,11 @@ fn build_new_obs(
     for (i, f) in data.row_annotations.schema().fields().iter().enumerate() {
         let scattered = scatter(data.row_annotations.column(i), join, row_start, row_end)?;
         // Unmatched rows become null, so the field must admit nulls regardless
-        // of how the source declared it.
-        fields.push(Field::new(f.name(), f.data_type().clone(), true));
+        // of how the source declared it. The type and the field metadata are
+        // the source's: a categorical lands as a dictionary, `ordered` intact.
+        fields.push(
+            Field::new(f.name(), f.data_type().clone(), true).with_metadata(f.metadata().clone()),
+        );
         columns.push(scattered);
     }
 
@@ -1175,13 +1180,11 @@ where
         let shard = res?;
         cover.visit("obs_metadata", &shard)?;
         let n = shard.num_rows();
+        // Written as built: a dictionary (categorical) column goes back to
+        // disk as a dictionary, with its field metadata. The materializing
+        // path slices one rebuilt table instead, and both produce the same
+        // per-shard bytes for the columns they share.
         let built = build(&shard, row_start)?;
-        // Matches the materializing path exactly: the cast to the dictionary's
-        // value type is what both paths write, so the two produce the same
-        // bytes. See the note on `unify_dict_columns` — it is not the
-        // deduplication its name suggests here, since a shard read straight off
-        // disk was never concatenated.
-        let built = unify_dict_columns(&built)?;
         writer.write_obs_shard(out_idx, row_start as u64, n as u64, n_obs, &built)?;
         row_start += n;
     }
@@ -1772,7 +1775,7 @@ fn attach_external_obs_inner(
         ObsRewrite::Materialized => {
             warn_unstreamable_obs("obs import", n_obs);
             let obs = reader.read_obs()?;
-            let built = unify_dict_columns(&build_new_obs(&obs, data, opts, &row_join, 0)?)?;
+            let built = build_new_obs(&obs, data, opts, &row_join, 0)?;
             drop(obs);
             Some(built)
         }

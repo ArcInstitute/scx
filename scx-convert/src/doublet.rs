@@ -716,7 +716,13 @@ pub fn read_doublet_table(
                      the source table, or pass keep_native_columns=false."
                 )));
             }
-            fields.push(Field::new(&final_name, f.data_type().clone(), true));
+            // Type and field metadata are the source's (a categorical native
+            // column stays a dictionary, `ordered` stamp included); only the
+            // name and nullability change.
+            fields.push(
+                Field::new(&final_name, f.data_type().clone(), true)
+                    .with_metadata(f.metadata().clone()),
+            );
             columns.push(Arc::clone(batch.column(i)));
             native_columns.push(final_name);
         }

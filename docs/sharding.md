@@ -370,9 +370,13 @@ shard skipping. This bound is **specific to the query path** — `compact`,
 `merge`, streaming export, `subset`, and `to_anndata` still assemble the
 full obs table.
 
-Filtered categorical obs columns in a `collect()` result carry only the
-categories present in the surviving rows (AnnData/pandas convention), not
-the full parent dictionary.
+Categorical obs columns in a `collect()` whose rows the caller narrowed
+(`filter_obs` or `limit`) carry only the categories present in the surviving
+rows (AnnData/pandas convention), not the full parent dictionary —
+deterministically, on both obs layouts; an unfiltered `collect()` and a full
+`read_obs()` keep the declared list, unused levels included. (Exception until
+`append` writes dictionaries: a filtered result drawn entirely from appended,
+plain-encoded shards comes back as plain strings.)
 
 ### Training loader (shard-level streaming)
 

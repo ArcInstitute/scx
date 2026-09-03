@@ -1269,10 +1269,19 @@ QueryPipeline::open("file.scx")?
   path**: other `read_obs()` callers (`compact` / `merge` / streaming
   export / CLI `subset` / `to_anndata`) still assemble the full obs table
   and remain unbounded on atlas-scale sharded files.
-- **Filtered-obs categorical semantics.** A `filter_obs(...).collect()`
-  result's categorical (`Dictionary<_, Utf8>`) obs columns carry only the
-  categories present in the surviving rows, not the full parent
-  dictionary — standard AnnData/pandas behavior. Downstream code that
+- **Filtered-obs categorical semantics.** A `collect()` whose rows the caller
+  narrowed — `filter_obs(...)` or `limit(...)` — returns categorical obs
+  columns carrying only the categories present in the surviving rows, in
+  declared order, not the full parent dictionary — standard AnnData/pandas
+  behavior (`remove_unused_categories` on a subset), on both obs layouts and
+  whatever the result size, an empty result included. An unfiltered
+  `collect()`, like `read_obs()` on the file itself, keeps the full declared
+  list. One pre-existing gap: on a file grown by `append` (which still writes
+  the rows it adds as plain strings), a filtered `collect()` whose surviving
+  rows all fall in appended shards sees no dictionary shard to reconcile
+  against and returns that column as plain strings — the values are right, the
+  `category` dtype, declared order and `ordered` bit are not; the fix is
+  dictionary output from `append` (tracked in the ROADMAP). Downstream code that
   compares `.cat.categories` against the source file (e.g. plotting that
   assumes a fixed palette) should re-derive categories from the result.
 - **Null semantics — three-valued (Kleene) logic, like a SQL `WHERE`
@@ -1681,12 +1690,20 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   dict and index behaviour as `obs_import` (`obs_key_column` is
   `"<positional>"` under positional; a pure add keeps the predicate index).
   Ungated (no libhdf5). This is `doublet_consensus`'s first-run write path
-  (its overwriting re-runs take `modify_metadata` — see below). Known
-  limitation, shared with every in-place obs edit (`modify_metadata(obs=…)`
-  included; only `from_anndata`'s writer preserves it): a pandas categorical
-  column is attached as plain strings — the category list and `ordered` bit do
-  not survive; re-derive with `.astype("category")` after reading, or land
-  categoricals through `from_anndata`.
+  (its overwriting re-runs take `modify_metadata` — see below). Categoricals
+  survive every in-place obs edit (`attach_obs_columns`, `obs_import`,
+  `doublet_import`, `cellbender_import`, `modify_metadata(obs=…)`, rscx
+  `scx_attach_obs`): a pandas `category` column — the file's existing ones and
+  the one being attached — keeps its dtype, its declared category order, its
+  unused levels and its `ordered` bit, exactly as `from_anndata` writes them,
+  for string, boolean and numeric levels alike.
+  (Before pyscx 0.17 every one of these writers demoted every categorical obs
+  column to plain strings.) `append` / `merge` still write the rows they add as
+  plain strings. Only an `append` onto an already-sharded dictionary base leaves
+  a dictionary/plain mix that a full `read_obs()` reconciles back to `category`
+  (with the union vocabulary); a `merge` output, or an `append` onto a legacy
+  single-section obs, is plain strings throughout and reads back as `object`
+  until the tracked follow-on lands.
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
   `unique_columns`, `unusable_unique_columns`, `unique_pairs` (two-column

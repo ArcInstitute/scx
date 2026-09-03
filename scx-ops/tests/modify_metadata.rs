@@ -12,7 +12,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Float32Array, StringArray};
+use arrow::array::{Array, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use scx_codec::{CodecId, ValueEncoding};
@@ -811,4 +811,92 @@ fn update_uns_preserves_generations_and_csc_sidecar() {
         "provenance must distinguish a merge from a replace: {}",
         last.params_json
     );
+}
+
+/// A categorical obs column goes through `modify_metadata(obs=)` as the
+/// dictionary it arrived as — dtype, the caller's declared order, an unused
+/// level, the `ordered` stamp — and the predicate index can still be built over
+/// it. Before, the obs batch was cast to plain strings on its way to the shards,
+/// so `read_obs()` handed the column back as `object` after every replace.
+#[test]
+fn obs_replace_keeps_categorical_columns_as_dictionaries() {
+    use arrow::array::{AsArray, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cat.scx");
+    write_base(&path, 30, 5, None);
+
+    let n = 30;
+    let cell_ids: Vec<String> = (0..n).map(|i| format!("cell_{i:07}")).collect();
+    // Declared order is neither alphabetical nor first-appearance, and the
+    // third level is used by no row.
+    let keys = Int8Array::from((0..n).map(|i| (i % 2) as i8).collect::<Vec<_>>());
+    let values = StringArray::from(vec!["donor_B", "donor_A", "donor_unused"]);
+    let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("donor", dict.data_type().clone(), true).with_metadata(md),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(StringArray::from(cell_ids)), Arc::new(dict)],
+    )
+    .unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs),
+            index: scx_engine::ConversionPredicateIndexOptions {
+                index_obs: vec!["donor".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let back = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    let col = back.column_by_name("donor").unwrap();
+    let dict = col.as_any_dictionary_opt().unwrap_or_else(|| {
+        panic!(
+            "donor must come back as a dictionary, got {:?}",
+            col.data_type()
+        )
+    });
+    let declared = arrow::compute::cast(dict.values(), &DataType::Utf8).unwrap();
+    let declared = declared.as_string::<i32>();
+    assert_eq!(
+        (0..declared.len())
+            .map(|i| declared.value(i))
+            .collect::<Vec<_>>(),
+        ["donor_B", "donor_A", "donor_unused"],
+        "declared order and the unused level survive"
+    );
+    let flat = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let flat = flat.as_string::<i32>();
+    assert_eq!(flat.value(0), "donor_B");
+    assert_eq!(flat.value(1), "donor_A");
+    assert_eq!(
+        back.schema()
+            .field_with_name("donor")
+            .unwrap()
+            .metadata()
+            .get(scx_format_io::CATEGORICAL_ORDERED_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // The index was built over the dictionary column and describes its values.
+    assert!(has_section(&path, SectionType::ObsPredicateIndex));
+    let mut indexed = indexed_donor_values(&path);
+    indexed.sort();
+    assert_eq!(indexed, ["donor_A", "donor_B"]);
 }

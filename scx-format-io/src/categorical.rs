@@ -34,11 +34,13 @@
 //!   which matches `astype("category")` retaining unused levels and matches
 //!   [`crate::distinct`]'s documented superset behaviour.
 //! - **Both on-disk representations are accepted** — `Dictionary(_, Utf8)` as
-//!   `from_anndata` writes, and plain `Utf8`/`LargeUtf8` as `append` writes
-//!   (which decodes dictionaries via `scx_ops::unify_dict_columns`). A file
-//!   grown by `append` therefore carries *both* across its shards, and this
-//!   folds them into one vocabulary without the
-//!   `reconcile_dictionary_representations` cast the assembling path needs.
+//!   `from_anndata` and the in-place obs writers write, and plain
+//!   `Utf8`/`LargeUtf8` as `append` / `merge` write (they decode dictionaries
+//!   via `scx_ops::unify_dict_columns`; the in-place writers used to as well).
+//!   A file grown by `append`, or rewritten in place before that change,
+//!   therefore carries *both* across its shards, and this folds them into one
+//!   vocabulary without the `reconcile_dictionary_representations` cast the
+//!   assembling path needs.
 //!
 //! ## Cardinality is unbounded, by necessity
 //!

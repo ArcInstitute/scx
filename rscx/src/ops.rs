@@ -727,7 +727,12 @@ fn apply_prefix(
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| Field::new(format!("{prefix}{}", f.name()), f.data_type().clone(), true))
+        .map(|f| {
+            // A rename only — type and field metadata (an ordered factor's
+            // `scx.categorical.ordered` stamp) ride along unchanged.
+            Field::new(format!("{prefix}{}", f.name()), f.data_type().clone(), true)
+                .with_metadata(f.metadata().clone())
+        })
         .collect();
     arrow::array::RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec())
         .map_err(|e| Error::Other(format!("failed to build annotation columns: {e}")))

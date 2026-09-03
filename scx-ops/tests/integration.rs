@@ -2705,9 +2705,11 @@ fn test_append_preserves_utf8_schema_via_largeutf8_round_trip() {
     assert_eq!(cell_ids.value(4), "cell_0"); // start of appended batch
     assert_eq!(cell_ids.value(6), "cell_2");
 
-    // The cluster column went through `unify_dict_columns` during
-    // append, so it lands as a flat `Utf8` column on the merged side.
-    // The key invariant for this test is that it is *not* `LargeUtf8`.
+    // `append` still runs the new rows through `unify_dict_columns`, so on
+    // the merged side the cluster column is either a flat `Utf8` (all shards
+    // plain) or a `Dictionary` (the assembler reconciled a dictionary base
+    // shard with a plain appended one). The key invariant for this test is
+    // that it is *not* `LargeUtf8`.
     let cluster_dt = obs.schema().field(1).data_type().clone();
     assert!(
         matches!(cluster_dt, DataType::Utf8 | DataType::Dictionary(_, _)),
@@ -4722,8 +4724,11 @@ fn compact_reshape_multimodal_streams_sharded_obs() {
 // ---------------------------------------------------------------------------
 
 /// Obs shaped the way a pandas round trip leaves it: a categorical column at
-/// field 0 (so `unify_dict_columns` has work to do), the index field last, and
-/// the schema-level `pandas` envelope naming it.
+/// field 0, the index field last, and the schema-level `pandas` envelope naming
+/// it. (The categorical used to be what sent the batch down the
+/// dictionary-rebuilding path in `unify_dict_columns`; the in-place ops no
+/// longer cast, but the shape is still the one the exporter's fallback gets
+/// wrong without the envelope.)
 fn obs_with_envelope_and_categorical(n: usize) -> arrow::array::RecordBatch {
     use arrow::array::Array;
     use std::collections::HashMap;
@@ -4824,23 +4829,33 @@ fn append_keeps_the_pandas_index_envelope() {
     );
 }
 
-/// `scx.categorical.ordered` lives on the very fields `unify_dict_columns`
-/// rebuilds, so an ordered categorical came back unordered from every in-place
-/// obs write. Same root cause, different casualty.
+/// An ordered categorical survives `modify_metadata(obs=)` whole: the
+/// `scx.categorical.ordered` stamp (which lived on the very fields
+/// `unify_dict_columns` used to rebuild without it, so it came back unordered
+/// from every in-place obs write), and — since the in-place ops stopped casting
+/// dictionaries to plain strings — the dictionary dtype itself, with the
+/// caller's declared order and a level no row uses. Over a sharded obs, so the
+/// per-shard slices are what is read back and reassembled.
 #[test]
 fn modify_metadata_keeps_the_ordered_categorical_flag() {
-    use arrow::array::Array;
+    use arrow::array::{Array, AsArray, Int8Array};
     use std::collections::HashMap;
 
     let dir = TempDir::new().unwrap();
-    let path = write_test_file(&dir, "t.scx", 4, 4, 1);
+    // `shard_target_rows = 2` over 4 rows: the replaced obs lands as two shards.
+    let path = write_sharded_obs_file(&dir, "t.scx", 4, 4, 2, false);
 
     let mut field_md = HashMap::new();
     field_md.insert(
         scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
         "true".to_string(),
     );
-    let dict: DictionaryArray<Int8Type> = vec!["low", "high", "low", "high"].into_iter().collect();
+    // Declared order "low" < "high" (not alphabetical); "unused" has no rows.
+    let dict = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![0i8, 1, 0, 1]),
+        Arc::new(StringArray::from(vec!["low", "high", "unused"])),
+    )
+    .unwrap();
     let schema = Schema::new(vec![
         Field::new("level", dict.data_type().clone(), true).with_metadata(field_md),
         Field::new("__index_level_0__", DataType::Utf8, false),
@@ -4861,6 +4876,10 @@ fn modify_metadata_keeps_the_ordered_categorical_flag() {
     scx_ops::modify_metadata(&path, &patch).unwrap();
 
     let reader = ScxReader::open(&path).unwrap();
+    assert!(
+        reader.obs_metadata_shard_count() > 1,
+        "premise: the replaced obs is sharded"
+    );
     let back = reader.read_obs().unwrap();
     let flag = back
         .schema()
@@ -4873,5 +4892,27 @@ fn modify_metadata_keeps_the_ordered_categorical_flag() {
         flag.as_deref(),
         Some("true"),
         "modify_metadata dropped scx.categorical.ordered",
+    );
+
+    let col = back.column_by_name("level").unwrap();
+    assert_eq!(
+        col.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        "modify_metadata cast the categorical to plain strings"
+    );
+    let declared = col.as_any_dictionary().values();
+    let declared = declared.as_string::<i32>();
+    assert_eq!(
+        (0..declared.len())
+            .map(|i| declared.value(i))
+            .collect::<Vec<_>>(),
+        ["low", "high", "unused"],
+        "declared order and the unused level must survive the per-shard round trip"
+    );
+    let flat = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let flat = flat.as_string::<i32>();
+    assert_eq!(
+        (0..4).map(|i| flat.value(i)).collect::<Vec<_>>(),
+        ["low", "high", "low", "high"]
     );
 }

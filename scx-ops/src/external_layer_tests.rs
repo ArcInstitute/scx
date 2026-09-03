@@ -65,12 +65,23 @@ fn write_fixture_with_layout(
     n_shards: usize,
     obs_layout: ObsLayout,
 ) -> PathBuf {
+    write_fixture_with_obs_layout(dir, name, obs_batch(n_obs), n_vars, n_shards, obs_layout)
+}
+
+fn write_fixture_with_obs_layout(
+    dir: &Path,
+    name: &str,
+    obs: RecordBatch,
+    n_vars: usize,
+    n_shards: usize,
+    obs_layout: ObsLayout,
+) -> PathBuf {
+    let n_obs = obs.num_rows();
     let path = dir.join(name);
     let rows_per = n_obs.div_ceil(n_shards);
     let header =
         FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, rows_per as u32, 0, 0);
     let mut writer = ScxWriter::new(&path, header).unwrap();
-    let obs = obs_batch(n_obs);
     match obs_layout {
         ObsLayout::Single => writer.write_obs(&obs).unwrap(),
         ObsLayout::Shards(rows) => {
@@ -1747,4 +1758,87 @@ fn an_unreadable_uns_section_fails_the_layer_attach_when_there_is_a_payload() {
     // Without a payload the section is never read, so the layer still lands.
     let data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
     attach_external_layer(&path, &data, &opts("cb")).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Categorical fidelity
+// ---------------------------------------------------------------------------
+
+/// The layer op rewrites obs through the same shard writer as the obs op, and
+/// used to run it through the same `unify_dict_columns` cast — so a
+/// `cellbender_import` also turned every obs categorical into plain strings.
+/// Same contract as `external_obs_tests`: dictionary dtype, declared vocabulary
+/// (unused level included), `ordered` stamp, values unchanged, both paths.
+#[test]
+fn existing_categorical_columns_survive_the_layer_import_on_both_paths() {
+    use arrow::array::{AsArray, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+    use std::collections::HashMap;
+
+    let categorical_obs = |n: usize| {
+        let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+        let keys = Int8Array::from((0..n).map(|i| (i % 2) as i8).collect::<Vec<_>>());
+        let values = StringArray::from(vec!["T cell", "B cell", "unused"]);
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let mut md = HashMap::new();
+        md.insert(
+            scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        );
+        let schema = Schema::new(vec![
+            Field::new("barcode", DataType::Utf8, false),
+            Field::new("cell_type", dict.data_type().clone(), true).with_metadata(md),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(StringArray::from(ids)), Arc::new(dict)],
+        )
+        .unwrap()
+    };
+    let values_of = |batch: &RecordBatch| -> Vec<String> {
+        let col = arrow::compute::cast(batch.column_by_name("cell_type").unwrap(), &DataType::Utf8)
+            .unwrap();
+        let col = col.as_string::<i32>();
+        (0..col.len()).map(|i| col.value(i).to_string()).collect()
+    };
+
+    for layout in [ObsLayout::Single, ObsLayout::Shards(&[4, 2])] {
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            write_fixture_with_obs_layout(dir.path(), "cat.scx", categorical_obs(6), 3, 2, layout);
+        let before = values_of(&ScxReader::open(&path).unwrap().read_obs().unwrap());
+
+        let data = diagonal_data(keys("cell_", 6), keys("g", 3), |i| i as f32 + 1.0);
+        attach_external_layer(&path, &data, &opts("cellbender")).unwrap();
+
+        let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+        let col = obs.column_by_name("cell_type").unwrap();
+        let dict = col.as_any_dictionary_opt().unwrap_or_else(|| {
+            panic!(
+                "{layout:?}: cell_type must still be a dictionary, got {:?}",
+                col.data_type()
+            )
+        });
+        let declared = arrow::compute::cast(dict.values(), &DataType::Utf8).unwrap();
+        let declared = declared.as_string::<i32>();
+        assert_eq!(
+            (0..declared.len())
+                .map(|i| declared.value(i))
+                .collect::<Vec<_>>(),
+            ["T cell", "B cell", "unused"],
+            "{layout:?}: declared vocabulary"
+        );
+        assert_eq!(values_of(&obs), before, "{layout:?}: values");
+        assert_eq!(
+            obs.schema()
+                .field_with_name("cell_type")
+                .unwrap()
+                .metadata()
+                .get(scx_format_io::CATEGORICAL_ORDERED_KEY)
+                .map(String::as_str),
+            Some("true"),
+            "{layout:?}: ordered flag"
+        );
+        assert!(obs.column_by_name("cb_status").is_some());
+    }
 }

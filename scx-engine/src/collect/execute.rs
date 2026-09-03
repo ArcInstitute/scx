@@ -579,6 +579,19 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
         // Row-sharded obs: read only the shards that contain matching rows.
         materialize_filtered_obs(reader, &obs_shard_ranges, &matching_global_rows)?
     };
+    // The documented `collect()` categorical contract, decided here so it does
+    // not depend on the obs layout: a result whose rows the caller narrowed —
+    // an obs predicate or a limit — carries only the categories its surviving
+    // rows use, as an AnnData subset does (`remove_unused_categories`). Neither
+    // `take` above nor the sharded assembler prunes (both keep the parent
+    // vocabulary, deterministically), and an unfiltered `collect()` keeps the
+    // declared list like `read_obs()`. Deletion vectors alone do not make a
+    // subset: `to_anndata()` skips deleted rows and keeps the declared list too.
+    let filtered_obs = if !plan.obs_predicates.is_empty() || plan.limit.is_some() {
+        scx_format_io::prune_unused_dictionary_values(&filtered_obs)?
+    } else {
+        filtered_obs
+    };
 
     // Step 11b: Filter var metadata to projected genes (in ascending order;
     // Step 11c restores the requested order).
