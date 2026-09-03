@@ -996,6 +996,60 @@ def test_read_scattered_needs_additional_formats_to_produce_anything():
     )
 
 
+def test_the_capture_wrapper_does_not_pin_threads():
+    """A capture must not silently change the thing it measures.
+
+    `slurm_capture_baseline.sh` exported `RAYON_NUM_THREADS=1` (and OMP / MKL),
+    justified as matching `fingerprint_accelerators.py` so a recomputed
+    fingerprint would be byte-identical. That reasoning does not hold:
+    `run_fingerprints` opens with
+    `os.environ.setdefault("RAYON_NUM_THREADS", str(PINNED_THREADS))`, so it
+    pins itself whatever the parent says. The export changed nothing for
+    fingerprints and made every benchmark cell single-threaded.
+
+    Which makes the capture incomparable with the tree it must be compared to.
+    Every promoted baseline's `environment.json` records `determinism_env` as
+    `unset` for all three variables — none was captured through this wrapper —
+    so gating a pinned capture against one reports `accel_knn` +888%,
+    `read_full` +469-616% on every SCX codec at census, and
+    `bench_csc_dispatch` +585%, purely because rayon had one thread. The median
+    ratio was 1.03x, so it hides in the tail and reads as a few catastrophic
+    regressions rather than a methodology error.
+
+    Floors authored from single-threaded medians would be worse than no floors:
+    a normal run clears them by 5-9x while the row reads as coverage.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.scripts import fingerprint_accelerators as fa
+
+    wrapper = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+               / "slurm_capture_baseline.sh").read_text()
+    offenders = [
+        ln.strip() for ln in wrapper.splitlines()
+        if not ln.lstrip().startswith("#")
+        and any(v in ln for v in ("RAYON_NUM_THREADS", "OMP_NUM_THREADS",
+                                  "MKL_NUM_THREADS"))
+        and "export" in ln
+    ]
+    assert not offenders, (
+        f"slurm_capture_baseline.sh pins thread counts again: {offenders}. "
+        f"Every promoted baseline records determinism_env unset; a pinned "
+        f"capture cannot be gated against them, and floors derived from it are "
+        f"5-9x too loose on any rayon path."
+    )
+
+    # The premise: the fingerprint script really does pin itself, so removing
+    # the export costs nothing there. If this ever stops being true, the
+    # export's original justification becomes valid and this test is wrong.
+    src = inspect.getsource(fa.run_fingerprints)
+    assert 'setdefault("RAYON_NUM_THREADS"' in src, (
+        "fingerprint_accelerators no longer self-pins, so the capture wrapper's "
+        "export was load-bearing after all — re-read this test before deleting "
+        "the assertion above"
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 

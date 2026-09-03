@@ -100,12 +100,34 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Determinism knobs.  Match fingerprint_accelerators.py's defaults so that
-# any fingerprint recomputed later on the same node produces identical bytes.
+# Thread pinning: DELIBERATELY NOT SET HERE.
+#
+# This block used to `export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"` (and
+# OMP / MKL), justified as "match fingerprint_accelerators.py's defaults so
+# that any fingerprint recomputed later on the same node produces identical
+# bytes". That reasoning does not hold: `fingerprint_accelerators.run_fingerprints`
+# opens with
+#     os.environ.setdefault("RAYON_NUM_THREADS", str(PINNED_THREADS))
+# so it pins ITSELF whatever the parent environment says. The export therefore
+# changed nothing about fingerprint determinism and everything about the ~1500
+# benchmark cells, which ran single-threaded.
+#
+# The damage is that it makes a capture incomparable with every promoted
+# baseline in the tree. `environment.json` records `determinism_env`, and every
+# promoted baseline reads `unset` for all three — so none was captured through
+# this wrapper. A pinned capture gated against an unpinned baseline reports
+# `accel_knn` +888%, `read_full` +469-616% on every SCX codec at census, and
+# `bench_csc_dispatch` +585%, purely because rayon had one thread. Overall
+# median ratio was 1.03x, so the distortion hides in the tail and reads as a
+# handful of catastrophic regressions rather than a methodology error.
+#
+# Floors authored from single-threaded medians are worse than none: a normal
+# multi-threaded run clears them by 5-9x, and the floor reads as coverage while
+# providing none.
+#
+# Set them yourself if you specifically want a single-threaded capture; they
+# are inherited, not overridden.
 # ---------------------------------------------------------------------------
-export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 
 # ---------------------------------------------------------------------------
 # Load .env if present.  Populates SCX_WORK_DIR / SCX_DATA_DIR.
