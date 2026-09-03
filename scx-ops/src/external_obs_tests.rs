@@ -2561,3 +2561,52 @@ fn a_status_column_matching_an_annotation_name_is_rejected() {
     );
     assert_eq!(before, std::fs::read(&path).unwrap());
 }
+
+/// Overwrite the file's `uns` section bytes in place so `read_uns()` fails for a
+/// reason other than "absent" (checksum / JSON), keeping the catalog intact.
+fn corrupt_uns_section(path: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let (offset, length) = {
+        let r = ScxReader::open(path).unwrap();
+        let e = r
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::UnsBlob)
+            .expect("fixture has a uns section");
+        (e.offset, e.length as usize)
+    };
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(&vec![b'{'; length]).unwrap();
+    assert!(
+        ScxReader::open(path).unwrap().read_uns().is_err(),
+        "corruption must make the read fail"
+    );
+}
+
+/// An unreadable `uns` is not an absent one. Treating every read error as `{}`
+/// would let an unrelated attach commit only its own keys and orphan the
+/// existing metadata. (Round 1: codex.)
+#[test]
+fn an_unreadable_uns_section_fails_the_attach_instead_of_being_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    corrupt_uns_section(&path);
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    // With a payload: refused before any write.
+    let mut data = score_data(keys("cell_", 3), |i| i as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    let err = attach_external_obs(&path, &data, &opts()).unwrap_err();
+    assert!(
+        !matches!(err, OpsError::InvalidInput(_)),
+        "must surface the read error itself, not an input complaint: {err}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes0, "file byte-identical");
+
+    // Without a payload the section is never read or touched, so a plain
+    // column attach on such a file still works.
+    let data = score_data(keys("cell_", 3), |i| i as f32);
+    attach_external_obs(&path, &data, &opts()).unwrap();
+}

@@ -580,7 +580,7 @@ fn attach_external_layer_inner(
     // atlas-scale cost here, and the column join needs to retry across every
     // candidate key column.
     let var = reader.read_var()?;
-    let uns = reader.read_uns().unwrap_or_else(|_| serde_json::json!({}));
+    let uns = crate::external_obs::read_uns_for_merge(reader, &data.uns)?;
 
     let obs_rewrite = if reader.obs_metadata_shard_count() > 0 {
         ObsRewrite::Streamed
@@ -698,6 +698,9 @@ fn attach_external_layer_inner(
     // --- Build the new var / uns in memory ---------------------------------
     // The obs axis is built inside the write loop below, one shard at a time.
     let new_var = build_new_var(&var, data, &col_map, column_axis_match)?;
+    // Like the obs op: no payload → the existing uns section is left exactly
+    // where it is, not rewritten byte-identically and orphaned.
+    let rewrote_uns = !data.uns.is_empty();
     let new_uns = crate::external_obs::merge_uns_entries(uns, &data.uns)?;
     let obsm_batches = build_obsm(data, &row_join, n_obs as usize)?;
 
@@ -788,7 +791,9 @@ fn attach_external_layer_inner(
     let mut writer =
         ScxWriter::adopt_in_place(cloned, prep.header.clone(), write_offset, Vec::new())?;
 
-    writer.write_uns(&new_uns)?;
+    if rewrote_uns {
+        writer.write_uns(&new_uns)?;
+    }
     writer.write_var(&new_var)?;
 
     match &materialized_obs {
@@ -887,7 +892,7 @@ fn attach_external_layer_inner(
         .old_catalog
         .entries
         .into_iter()
-        .filter(|e| !should_drop_old_entry(e, opts, drop_obs_index, &obsm_batches))
+        .filter(|e| !should_drop_old_entry(e, opts, rewrote_uns, drop_obs_index, &obsm_batches))
         .collect();
     entries.extend(new_section_entries);
     entries.push(FullCatalogEntry {
@@ -1893,6 +1898,7 @@ fn check_collisions(
 fn should_drop_old_entry(
     e: &FullCatalogEntry,
     opts: &AttachLayerOptions,
+    rewrote_uns: bool,
     drop_obs_index: bool,
     obsm: &[(String, RecordBatch)],
 ) -> bool {
@@ -1905,7 +1911,7 @@ fn should_drop_old_entry(
     if drop_obs_index && e.section_type == ObsPredicateIndex {
         return true;
     }
-    if e.section_type == UnsBlob && e.modality_id == 0 {
+    if rewrote_uns && e.section_type == UnsBlob && e.modality_id == 0 {
         return true;
     }
     if matches!(

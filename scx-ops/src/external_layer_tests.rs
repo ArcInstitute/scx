@@ -1678,3 +1678,69 @@ fn several_uns_keys_merge_in_one_commit_on_the_layer_op() {
         prov.operations.last().unwrap().params_json
     );
 }
+
+/// The layer op used to rewrite `uns` unconditionally — an identical blob
+/// appended and the old one orphaned, on every import with nothing to merge.
+/// The obs op never did; the documented contract ("an empty payload leaves the
+/// section untouched") now holds for both. (Round 1: codex + Cursor Agent.)
+#[test]
+fn an_empty_uns_payload_leaves_the_uns_section_untouched_on_the_layer_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let uns_span = |path: &Path| -> Vec<(String, u64, u64)> {
+        ScxReader::open(path)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::UnsBlob)
+            .map(|e| (e.name.clone(), e.offset, e.length))
+            .collect()
+    };
+    let before = uns_span(&path);
+    assert_eq!(before.len(), 1);
+
+    let data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    assert!(data.uns.is_empty());
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    assert_eq!(
+        uns_span(&path),
+        before,
+        "no payload → the uns section is neither rewritten nor moved"
+    );
+    assert_eq!(
+        ScxReader::open(&path).unwrap().read_uns().unwrap(),
+        serde_json::json!({"state": "v0"})
+    );
+}
+
+/// The layer twin of the obs test: an unreadable `uns` fails the attach when
+/// there is something to merge, rather than being replaced by `{}`.
+#[test]
+fn an_unreadable_uns_section_fails_the_layer_attach_when_there_is_a_payload() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let (offset, length) = {
+        let r = ScxReader::open(&path).unwrap();
+        let e = r
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::UnsBlob)
+            .unwrap();
+        (e.offset, e.length as usize)
+    };
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(&vec![b'{'; length]).unwrap();
+    drop(f);
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    let mut data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
+    assert!(!matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes0, "file byte-identical");
+}

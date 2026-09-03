@@ -1275,6 +1275,27 @@ pub(crate) fn merge_uns_entries(
     Ok(uns)
 }
 
+/// The file's existing `uns`, as the base `entries` are merged into.
+///
+/// Not read at all when there is nothing to merge, so a file whose `uns`
+/// section cannot be read still takes a plain column attach. An **absent**
+/// section is `{}`. Any other read error — checksum, JSON, nesting depth —
+/// propagates: treating it as "absent" would let an unrelated attach commit
+/// only its own keys and orphan metadata the op never saw.
+pub(crate) fn read_uns_for_merge(
+    reader: &ScxReader,
+    entries: &serde_json::Map<String, Value>,
+) -> Result<Value> {
+    if entries.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    match reader.read_uns() {
+        Ok(v) => Ok(v),
+        Err(scx_format_io::ScxError::SectionNotFound(_)) => Ok(serde_json::json!({})),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The `overwrite = false` half of the uns contract: every entry must be a key
 /// the file does not have yet. Names the first collision.
 pub(crate) fn check_uns_collisions(
@@ -1612,7 +1633,7 @@ fn attach_external_obs_inner(
             &owned_reader
         }
     };
-    let uns = reader.read_uns().unwrap_or_else(|_| serde_json::json!({}));
+    let uns = read_uns_for_merge(reader, &data.uns)?;
 
     // A single legacy `ObsMetadata` section is one Arrow IPC batch with no
     // per-shard reader, so there is nothing to stream and the whole table has

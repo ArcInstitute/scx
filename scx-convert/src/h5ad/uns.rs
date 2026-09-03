@@ -111,21 +111,13 @@ fn write_uns_value(
                     .shape([data.len()])
                     .create(name)?
                     .write(&data)?;
-            } else if !arr.is_empty()
-                && arr
-                    .iter()
-                    .all(|v| v.is_number() || uns_float_scalar_envelope(v).is_some())
-            {
+            } else if let Some(data) = uns_f64_values(arr.iter()) {
                 // A float list that carried a NaN / ±Inf: pyscx has no JSON
                 // literal for those, so under `uns_format="tagged"` each one is
                 // a float `scalar` envelope sitting between plain numbers.
                 // HDF5 holds non-finite floats natively, so the list becomes an
                 // f64 dataset. Without this arm the chain matched nothing and
                 // silently dropped the whole list.
-                let data: Vec<f64> = arr
-                    .iter()
-                    .filter_map(|v| v.as_f64().or_else(|| uns_float_scalar_envelope(v)))
-                    .collect();
                 group
                     .new_dataset::<f64>()
                     .shape([data.len()])
@@ -218,6 +210,17 @@ fn uns_float_scalar_envelope(v: &serde_json::Value) -> Option<f64> {
         ("<f2" | "=f2", 2) => Some(f64::from(half::f16::from_le_bytes([bytes[0], bytes[1]]))),
         _ => None,
     }
+}
+
+/// Every value a JSON number or a float `scalar` envelope → the f64 values, in
+/// one pass (each envelope is base64-decoded once). `None` for an empty
+/// sequence or for any other element, so the caller's `else if let` falls
+/// through to the next arm.
+fn uns_f64_values<'a>(vals: impl Iterator<Item = &'a serde_json::Value>) -> Option<Vec<f64>> {
+    let out = vals
+        .map(|v| v.as_f64().or_else(|| uns_float_scalar_envelope(v)))
+        .collect::<Option<Vec<f64>>>()?;
+    (!out.is_empty()).then_some(out)
 }
 
 /// Returns `Ok(false)` for a non-envelope object or any other tag/encoding so
@@ -411,6 +414,11 @@ fn write_uns_2d_array(
         write_2d_dataset::<u64>(group, name, n_rows, n_cols, flat)
     } else if cells().all(|v| v.is_number()) {
         let flat: Vec<f64> = cells().filter_map(|v| v.as_f64()).collect();
+        write_2d_dataset::<f64>(group, name, n_rows, n_cols, flat)
+    } else if let Some(flat) = uns_f64_values(cells()) {
+        // Same as the 1-D arm: numbers interleaved with float `scalar`
+        // envelopes (a nested Python list carrying NaN / ±Inf) is one f64
+        // dataset, not a silent skip.
         write_2d_dataset::<f64>(group, name, n_rows, n_cols, flat)
     } else if cells().all(|v| v.is_boolean()) {
         let flat: Vec<bool> = cells().filter_map(|v| v.as_bool()).collect();

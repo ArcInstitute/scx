@@ -613,9 +613,12 @@ merges the dict's keys, `uns_key="K"` nests the payload under `uns["K"]`
 instead; `obs_import --uns-key-from-source K` lands the selected source keys
 under their own names, or under `--uns-key K` when given; `doublet_import`
 writes `uns["<K>"]` and `cellbender_import` `uns["cellbender"]`. An empty
-payload leaves the `uns` section untouched (not even rewritten). A key the file
-already has is an error without `overwrite`; a file whose `uns` is not a JSON
-object is refused before any write.
+payload leaves the `uns` section untouched (not even rewritten — and not even
+read, so a file whose `uns` section cannot be read still takes a plain column
+attach). A key the file already has is an error without `overwrite`; a file
+whose `uns` is not a JSON object is refused before any write, and so is one
+whose `uns` section exists but cannot be read (checksum / JSON error) — it is
+never mistaken for an absent one and replaced.
 
 `obs_import` is the recommended way to **add or patch obs columns on an
 existing SCX file** — including from pipeline steps. A step whose only output

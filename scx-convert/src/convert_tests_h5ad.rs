@@ -2962,3 +2962,52 @@ fn uns_list_with_non_finite_scalar_envelopes_exports_as_f64_dataset() {
     let top: f64 = uns.dataset("top").unwrap().read_scalar().unwrap();
     assert!(top.is_infinite() && top > 0.0, "{top}");
 }
+
+/// The 2-D sibling of the test above: a nested Python list carrying `nan` /
+/// `±inf` is a list of lists of numbers and float `scalar` envelopes.
+/// `write_uns_2d_array` used to accept only plain numbers and return `Ok(())`
+/// otherwise — no dataset, no warning — so this PR's newly-writable tree
+/// vanished on export. (Round 1: codex + Cursor Agent, independently.)
+#[test]
+fn uns_2d_list_with_non_finite_scalar_envelopes_exports_as_f64_dataset() {
+    use base64::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scx_path = dir.path().join("env2d.scx");
+    let h5ad_out = dir.path().join("env2d_out.h5ad");
+    make_multishard_scx(&scx_path, 6, 4, 4);
+
+    let env = |f: f64| {
+        serde_json::json!({
+            "__scx_type__": "scalar",
+            "dtype": "<f8",
+            "data": base64::engine::general_purpose::STANDARD.encode(f.to_le_bytes()),
+        })
+    };
+    scx_ops::set_uns(
+        &scx_path,
+        &serde_json::json!({
+            "mat": [[1.0, env(f64::NAN)], [env(f64::NEG_INFINITY), 2.5]],
+        }),
+    )
+    .unwrap();
+
+    scx_to_h5ad(&scx_path, &h5ad_out, &mut WarningSink::log()).unwrap();
+
+    let out = hdf5::File::open(&h5ad_out).unwrap();
+    let got = out
+        .group("uns")
+        .unwrap()
+        .dataset("mat")
+        .expect("the 2-D list must not be dropped")
+        .read_2d::<f64>()
+        .unwrap();
+    assert_eq!(got.shape(), &[2, 2]);
+    assert_eq!(got[[0, 0]], 1.0);
+    assert!(got[[0, 1]].is_nan(), "{got:?}");
+    assert!(
+        got[[1, 0]].is_infinite() && got[[1, 0]] < 0.0,
+        "sign of -inf lost: {got:?}"
+    );
+    assert_eq!(got[[1, 1]], 2.5);
+}
