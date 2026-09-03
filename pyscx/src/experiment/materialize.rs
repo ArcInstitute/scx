@@ -164,7 +164,7 @@ pub(super) fn detection_counts_impl<'py>(
     // — so without this the handle would answer here while refusing
     // everywhere else. Gate on *this* handle's view first.
     exp.reader()?;
-    let backed = open_backed_csr(&exp.path, modality, 4)?;
+    let backed = open_backed_csr(&exp.path, modality, None, 4)?;
     let counts: Vec<i64> = py
         .detach(|| backed.gene_detection_counts())
         .map_err(to_pyerr)?
@@ -185,7 +185,7 @@ pub(super) fn cells_expressing_impl<'py>(
     // — so without this the handle would answer here while refusing
     // everywhere else. Gate on *this* handle's view first.
     exp.reader()?;
-    let backed = open_backed_csr(&exp.path, modality, 4)?;
+    let backed = open_backed_csr(&exp.path, modality, None, 4)?;
     // Resolve gene → gene_idx. Integer fast path; string falls
     // through to a var.index lookup.
     let gene_idx: u32 = if let Ok(idx) = gene.extract::<u32>() {
@@ -202,65 +202,52 @@ pub(super) fn cells_expressing_impl<'py>(
     Ok(PyArray1::from_vec(py, rows))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn gather_rows_sparse_impl<'py>(
     exp: &PyExperiment,
     py: Python<'py>,
-    rows: PyReadonlyArray1<'_, u64>,
+    rows: &Bound<'py, PyAny>,
     modality: Option<&str>,
     cache_shards: usize,
+    layer: Option<&str>,
+    logical: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // Snapshot the row ids while the GIL is held. A `PyReadonlyArray`
-    // borrow is not GIL-bound and does not clear numpy's WRITEABLE flag,
-    // so reading it inside the `py.detach` below would race any other
-    // Python thread that touches the caller's array — and would defeat
-    // the bounds check two statements down, which is the whole reason
-    // this method can promise an `IndexError`.
-    let rows: Vec<u64> = rows.as_slice()?.to_vec();
-    let n_rows = rows.len();
-    // Re-opens from `exp.path`, and a fresh reader is fresh by definition
-    // — so without this the handle would answer here while refusing
-    // everywhere else. Gate on *this* handle's view first.
-    exp.reader()?;
-    let backed = open_backed_csr(&exp.path, modality, cache_shards)?;
+    // Gate on *this* handle's view first: `open_backed_csr` re-opens from
+    // `exp.path`, and a fresh reader is fresh by definition — without this the
+    // handle would answer here while refusing everywhere else.
+    let reader = exp.reader()?;
+    // `logical=True` addresses the rows `read_obs()` / `Experiment.n_obs` show
+    // — deletion vectors applied, exactly as `to_anndata(backed=True).X` does
+    // (same `compute_kept_to_global`). `logical=False` is the physical file
+    // row space (`n_obs_physical`).
+    let kept: Option<Vec<u64>> = if logical {
+        crate::convert::compute_kept_to_global(reader)?
+    } else {
+        None
+    };
+    let backed = open_backed_csr(&exp.path, modality, layer, cache_shards)?;
     let n_vars = backed.n_vars();
-    let n_obs = backed.n_obs() as u64;
+    let n_visible = kept.as_ref().map_or(backed.n_obs(), |k| k.len());
 
-    // Bounds-check up front so out-of-range ids surface as a clean
-    // IndexError rather than a generic read error from the gather loop.
-    if let Some(&bad) = rows.iter().find(|&&r| r >= n_obs) {
-        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-            "row index {bad} out of range for {n_obs} cells"
-        )));
-    }
+    // Resolve the selector while the GIL is held — a bool mask or any integer
+    // array-like, negative wrap, `IndexError` past `n_visible` — and snapshot
+    // the global row ids. A `PyReadonlyArray` borrow is not GIL-bound and does
+    // not clear numpy's WRITEABLE flag, so reading the caller's array inside
+    // the `py.detach` below would race any other Python thread that touches it
+    // — and would defeat the bounds check, which is the whole reason this
+    // method can promise an `IndexError`.
+    let visible = crate::backed::resolve_row_selector(py, rows, n_visible)?;
+    let rows: Vec<u64> = match &kept {
+        Some(k) => visible.iter().map(|&v| k[v]).collect(),
+        None => visible.iter().map(|&v| v as u64).collect(),
+    };
+    let n_rows = rows.len();
 
-    // Scatter each row's CSR into its request position (GIL released).
-    let mut per_row: Vec<Option<(Vec<i32>, Vec<f32>)>> = (0..n_rows).map(|_| None).collect();
-    py.detach(|| {
-        backed.read_rows_with(&rows, |orig_pos, indices, data| {
-            per_row[orig_pos] = Some((indices.to_vec(), data.to_vec()));
-            Ok(())
-        })
-    })
-    .map_err(to_pyerr)?;
-
-    // Assemble the CSR in request order.
-    let nnz: usize = per_row
-        .iter()
-        .map(|r| r.as_ref().map_or(0, |(idx, _)| idx.len()))
-        .sum();
-    let mut indptr: Vec<i64> = Vec::with_capacity(n_rows + 1);
-    indptr.push(0);
-    let mut indices: Vec<i32> = Vec::with_capacity(nnz);
-    let mut data: Vec<f32> = Vec::with_capacity(nnz);
-    for row in &per_row {
-        if let Some((idx, val)) = row {
-            indices.extend_from_slice(idx);
-            data.extend_from_slice(val);
-        }
-        indptr.push(indices.len() as i64);
-    }
-
-    let csr = scx_sparse::ScxCsr::new_unchecked((n_rows, n_vars), indptr, indices, data);
+    // One decode per touched shard, output assembled once in request order
+    // (`read_row_indices`: indptr-only prescan, then scatter into the exact
+    // buffers). GIL released for the read.
+    let csr = py
+        .detach(|| backed.read_row_indices(&rows))
+        .map_err(to_pyerr)?;
+    debug_assert_eq!(csr.shape, (n_rows, n_vars));
     convert::csr_to_scipy(py, csr)
 }

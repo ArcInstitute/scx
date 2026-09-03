@@ -1203,14 +1203,22 @@ impl PyExperiment {
     /// Gather specific rows as a sparse `scipy.sparse.csr_matrix`, in the
     /// requested order.
     ///
-    /// A synchronous sparse gather over the backed reader's `read_rows_with`:
-    /// each touched shard is decoded once, and per-row `(indices, data)` slices
-    /// are scattered into a request-order CSR. It allocates no intermediate
-    /// `ScxCsr` (the data is zero-copy only at the final numpy handoff — each
-    /// nnz is copied into the request-order buffers). `rows` may contain
-    /// duplicates and need not be sorted; output rows follow `rows` order.
-    /// Returns raw-local gene indices (no global-vocab remap). On multimodal
-    /// files, pass `modality=`.
+    /// The bounded shard-wise gather: each touched shard is decoded once (a
+    /// sparse request on a row-group-framed shard decodes only the touched row
+    /// groups), and the result is assembled **once** into exact-size buffers in
+    /// request order — peak memory is the result plus `cache_shards` decoded
+    /// shards, never a second copy of the result. `rows` is a boolean mask or
+    /// any 1-D integer array-like (list, range, ndarray of any integer dtype);
+    /// it may contain duplicates and need not be sorted; negative indices wrap
+    /// once. Returns raw-local gene indices (no global-vocab remap). On
+    /// multimodal files, pass `modality=`.
+    ///
+    /// `logical=True` (default) indexes the rows `Experiment.n_obs` /
+    /// `read_obs()` describe — deletion vectors applied, as
+    /// `to_anndata(backed=True).X[rows]` does. `logical=False` indexes the
+    /// physical file rows (`n_obs_physical`), deleted cells included.
+    /// `layer=` gathers from that layer's shard family instead of `X`
+    /// (`ValueError` if absent; not supported together with a multimodal file).
     ///
     /// `cache_shards` bounds peak decoded-shard memory for this gather (it is
     /// not a speedup knob: within a single call each shard is decoded exactly
@@ -1219,18 +1227,21 @@ impl PyExperiment {
     /// is the eval / random-access utility, not the training hot path (use
     /// `SparseCellSetDataset` for that).
     ///
-    /// Out-of-range row ids raise `IndexError`. This is a drop-in for the
-    /// backed `adata.X[rows]` analysis path and the random-access utility an
+    /// Out-of-range row ids raise `IndexError`, as does a boolean mask whose
+    /// length is not the row count. This is a drop-in for the backed
+    /// `adata.X[rows]` analysis path and the random-access utility an
     /// `IterableDataset` cannot serve.
-    #[pyo3(signature = (rows, modality = None, cache_shards = 4))]
+    #[pyo3(signature = (rows, modality = None, cache_shards = 4, layer = None, logical = true))]
     fn gather_rows_sparse<'py>(
         &self,
         py: Python<'py>,
-        rows: PyReadonlyArray1<'_, u64>,
+        rows: &Bound<'py, PyAny>,
         modality: Option<&str>,
         cache_shards: usize,
+        layer: Option<&str>,
+        logical: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        materialize::gather_rows_sparse_impl(self, py, rows, modality, cache_shards)
+        materialize::gather_rows_sparse_impl(self, py, rows, modality, cache_shards, layer, logical)
     }
 
     /// Never raises. A repr that throws turns every later traceback into a

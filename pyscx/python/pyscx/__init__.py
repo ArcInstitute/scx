@@ -20,7 +20,11 @@ del _pkg_version, _PkgNotFound
 # Re-export everything from the native Rust extension module.
 # The compiled .so/.pyd is named "pyscx.pyscx" internally by maturin.
 from .pyscx import *  # noqa: F401, F403, E402
-from .pyscx import ScxBackedSparseDataset, ScxBackedLayerDataset  # noqa: E402
+from .pyscx import (  # noqa: E402
+    ScxBackedLayerDataset,
+    ScxBackedSparseDataset,
+    ScxLazyTransformedDataset,
+)
 
 # Register the Rust-side `accel`
 # submodule under `sys.modules` so the dotted import idiom works
@@ -1983,10 +1987,16 @@ def to_h5mu(path, out, **kwargs):
 def iter_chunks(adata, chunk_size="shard"):
     """Iterate over an AnnData in chunks, yielding fully materialized AnnData slices.
 
-    When the AnnData has a backed SCX X matrix, ``chunk_size="shard"`` aligns
-    chunks to the on-disk shard boundaries for optimal I/O.  Each yielded
-    AnnData is a fully materialized copy with the correct obs/var/obsm
-    metadata sliced to match.
+    When the AnnData has a backed SCX X matrix (plain, layer, or lazily
+    transformed), ``chunk_size="shard"`` aligns chunks to the on-disk shard
+    boundaries for optimal I/O.  Each yielded AnnData is a fully materialized
+    copy with the correct obs/var/obsm metadata sliced to match.
+
+    The alignment relies on the handle's ``shard_boundaries()`` tiling
+    contract: the ``(start, end)`` pairs are in user-visible row space and
+    tile ``[0, n_obs)`` exactly — the first starts at 0, the last ends at
+    ``n_obs``, and each starts where the previous ended (a shard whose rows
+    are all deleted is omitted, so there may be fewer pairs than shards).
 
     Args:
         adata: An ``anndata.AnnData`` object (backed or in-memory).
@@ -2009,7 +2019,10 @@ def iter_chunks(adata, chunk_size="shard"):
     if chunk_size == "shard":
         # Try to get shard boundaries from the backed X matrix
         x = adata.X
-        if isinstance(x, (ScxBackedSparseDataset, ScxBackedLayerDataset)):
+        if isinstance(
+            x,
+            (ScxBackedSparseDataset, ScxBackedLayerDataset, ScxLazyTransformedDataset),
+        ):
             boundaries = x.shard_boundaries()
         else:
             # Fallback: non-backed AnnData — use default 16384-row chunks

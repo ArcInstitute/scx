@@ -930,18 +930,35 @@ class Experiment:
         rows: Any,
         modality: str | None = None,
         cache_shards: int = 4,
+        layer: str | None = None,
+        logical: bool = True,
     ) -> Any:
         """Gather ``rows`` as a ``scipy.sparse.csr_matrix`` in request order.
 
-        Synchronous sparse gather over the backed reader: each touched shard is
-        decoded once; no intermediate ``ScxCsr`` is allocated (zero-copy only at
-        the numpy handoff). ``rows`` (numpy ``uint64``) may contain duplicates
-        and need not be sorted. Returns raw-local gene indices (no global-vocab
-        remap). ``cache_shards`` bounds peak decoded-shard memory for the gather
-        (not a speedup knob — each shard is decoded once per call). A fresh
-        reader is opened per call (fork-safe; this is the eval / random-access
-        utility, not the training hot path). Out-of-range ids raise
-        ``IndexError``. Drop-in for the backed ``adata.X[rows]`` analysis path.
+        The bounded shard-wise gather: each touched shard is decoded once (a
+        sparse request on a row-group-framed shard decodes only the touched row
+        groups) and the result is assembled once into exact-size buffers, so
+        peak memory is the result plus ``cache_shards`` decoded shards — never
+        a second copy of the result. ``rows`` is a boolean mask or any 1-D
+        integer array-like (list, ``range``, ndarray of any integer dtype); it
+        may contain duplicates and need not be sorted; negative indices wrap
+        once. Returns raw-local gene indices (no global-vocab remap).
+
+        ``logical=True`` (default) indexes the rows ``Experiment.n_obs`` /
+        ``read_obs()`` describe — deletion vectors applied, exactly as
+        ``to_anndata(backed=True).X[rows]`` does. ``logical=False`` indexes the
+        physical file rows (``n_obs_physical``), deleted cells included.
+        ``layer=`` gathers from that layer instead of ``X`` (``ValueError`` if
+        the layer does not exist; not supported on a multimodal file — index
+        the modality's layer handle from ``to_mudata()`` instead).
+
+        ``cache_shards`` bounds peak decoded-shard memory for the gather (not a
+        speedup knob — each shard is decoded once per call). A fresh reader is
+        opened per call (fork-safe; this is the eval / random-access utility,
+        not the training hot path). Out-of-range ids, and a boolean mask whose
+        length is not the row count, raise ``IndexError``. Equivalent to the
+        backed ``adata.X[rows]`` / ``adata.layers[name][rows]`` analysis path,
+        without building the AnnData.
         """
         ...
 

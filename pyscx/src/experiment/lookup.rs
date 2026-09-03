@@ -70,16 +70,35 @@ pub(crate) fn project_batch_columns(
     })
 }
 
-/// Phase 5b: open a fresh `BackedCsrReader` for the requested modality
-/// from a file path. `modality = None` → modality_id 0 (the unimodal /
-/// global X) on non-multimodal files; on multimodal files we require an
-/// explicit modality unless there is exactly one.
+/// Phase 5b: open a fresh `BackedCsrReader` for the requested modality (and,
+/// optionally, layer) from a file path. `modality = None` → modality_id 0 (the
+/// unimodal / global X) on non-multimodal files; on multimodal files we require
+/// an explicit modality unless there is exactly one. `layer = Some(name)`
+/// opens that layer's shard family instead of X (`ValueError` when the file
+/// has no such layer); layers are not modality-scoped in the backed reader, so
+/// `layer=` on a multimodal file is refused rather than guessed.
 pub(crate) fn open_backed_csr(
     path: &PathBuf,
     modality: Option<&str>,
+    layer: Option<&str>,
     cache_shards: usize,
 ) -> PyResult<BackedCsrReader> {
     let opened = crate::open_handle_reader(path).map_err(to_pyerr)?;
+    if let Some(name) = layer {
+        if opened.is_multimodal() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "layer= is not supported on a multimodal file; open the modality with \
+                 to_mudata() and index its layer handle instead",
+            ));
+        }
+        let names = opened.layer_names();
+        if !names.iter().any(|n| n == name) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "layer '{name}' not found (available: {names:?})"
+            )));
+        }
+        return Ok(BackedCsrReader::new_for_layer(opened, name, cache_shards));
+    }
     if !opened.is_multimodal() {
         return Ok(BackedCsrReader::new(opened, cache_shards));
     }
