@@ -1138,31 +1138,36 @@ every capture run picks it up automatically.
 >     print(sorted(keys))"
 > ```
 >
-> The current `LATEST` symlink points at `v0.11.2-multimodal-loader-fix`
-> (snapshot `candidate_auto_converge_20260712`, tier `full`). Measured with
-> the command above, it carries rows for **38** benchmarks: **format**
-> (`compression`, `read_full`, `read_selective`, `read_scattered`,
-> `read_streaming_vs_inmemory`, `write`, `memory`, `parallel_scaling`,
-> `parallel_write_scaling`, `roundtrip`, `ooc_rss_boundary`,
-> `shardad_fidelity`), **cloud** (`cloud_metadata`, `cloud_read`,
-> `cloud_filtered`, `cloud_pull`, `cloud_push`, `cloud_large_atlas`,
-> `cloud_reader_vs_pull`, `cost_model`), **`ml_loader`**, **multimodal**
-> (`multimodal_compression`, `multimodal_training`,
-> `multimodal_read_streaming_vs_inmemory`), `index_plan`, `fragment_ops`,
-> `correctness`, and the **`accel_*`** family (`accel_pca`, `accel_knn`,
-> `accel_umap`, `accel_leiden`, `accel_preprocess`, `accel_hvg`,
-> `accel_de`, `accel_pipeline`, `accel_format_pipeline`,
-> `accel_to_gpu_anndata`, `bench_csc_dispatch`) including per-op
-> rapids-route correctness floors (`*_route_rapids_correct`,
-> `*_fallback_no_rapids_correct`).
+> The current `LATEST` symlink points at `v0.16.0-opt-instruments`
+> (snapshot `candidate_unpinned_20260903`, tier `full` plus
+> `--include-additional`, captured 2026-09-03 at `cafeb2ce`). Measured with the
+> command above it carries **1833 rows across 52 benchmarks** — 15 families
+> more than the `v0.11.2-multimodal-loader-fix` baseline it replaced, and the
+> first baseline with rows for the SCX operations the PR-01/02 instrumentation
+> series added.
 >
-> **It predates the Data-load Phase 0/1D benchmarks entirely**, so it carries
-> no rows for `obs_open`, `cellset_gather`, `ooc_loader`, `shuffle_layout`,
-> `conversion_streaming` or `export_streaming`. A gate over any of those
-> reports them as *appearing*, not regressing (`diff_summaries` treats a
-> baseline-absent row as non-regressing by design), so only their
-> `thresholds.yaml` absolute floors carry signal. Say so when reporting such a
-> run: "no regressions against LATEST" is not what was measured.
+> **The caution this block used to carry is largely retired.** `v0.11.2`
+> predated the Data-load Phase 0/1D benchmarks entirely and had no rows for
+> `obs_open`, `cellset_gather`, `ooc_loader`, `shuffle_layout`,
+> `conversion_streaming` or `export_streaming`; all six now have them, as do
+> `build_csc`, `mtx_export`, `grouped_sort`, `grouped_read`, `accel_r_route`,
+> `accel_harmony`, `accel_de_nb_glm`, `accel_eval_metrics` and
+> `doublet_interop`.
+>
+> **What is still absent, and why** — a gate over these reports them as
+> *appearing* rather than regressing (`diff_summaries` treats a baseline-absent
+> row as non-regressing by design), so only their `thresholds.yaml` absolute
+> floors carry signal, and for the first two not even those:
+>
+> | absent | why |
+> |---|---|
+> | `cellstream` (all benchmarks) | upstream package restructured; the runner's member imports fail. 12 `ml_loader` floors are justification-suppressed as a result. `v0.11.2` had 47 rows. |
+> | `cloud_large_atlas` | its `<ds>.scxd/` fixtures are not staged in the bucket (~4.5 GB); the benchmark deliberately does not auto-upload. `v0.11.2` had 5 rows. |
+> | `cell_eval_parity_perf` | `cell_eval` / `arc_bench` / `pdex` are editable installs in `.venv` only and no conda env has them, while the orchestrator must run from `scx-bench`. `v0.11.2` had none either. |
+> | `cellset_gather` at census scale | does not fit a practical time budget — killed at 205 min on run 1/3 of one scenario. See thresholds' Deferred item 15. |
+>
+> Say so when reporting a run that touches any of them: "no regressions against
+> LATEST" is not what was measured.
 
 **Accelerator route gates.** Every GPU accelerator benchmark records the
 execution route each call actually took (read back from
@@ -1311,7 +1316,8 @@ correct on CPU.
 
 > **Baseline promoted.** `LATEST` was promoted to
 > `v0.6.5-accel-gpu-rapids-floors` after the Phase 2 routing flip merged, and
-> has since moved on to `v0.11.2-multimodal-loader-fix`. The
+> has since moved on through `v0.11.2-multimodal-loader-fix` to
+> `v0.16.0-opt-instruments`. The
 > `*_route_rapids_correct` / `*_fallback_no_rapids_correct` floors are
 > absolute (baseline-independent) and gate alongside the relative
 > regression checks.
@@ -1692,7 +1698,7 @@ Run it locally before opening a PR that touches the gate.
 
 The comprehensive baseline at
 `comprehensive/results/baselines/LATEST` (currently
-`v0.11.2-multimodal-loader-fix`) covers both format-level **and**
+`v0.16.0-opt-instruments`) covers both format-level **and**
 GPU-accelerator benchmarks (`accel_pca`, `accel_knn`, `accel_umap`,
 `accel_leiden`, `accel_preprocess`, `accel_hvg`) across pbmc3k,
 tabula_sapiens_100k, and census_1m. Per-run correctness metrics

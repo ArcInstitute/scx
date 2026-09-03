@@ -26,6 +26,7 @@ GPU utilization (gpu_train only).
 from __future__ import annotations
 
 import gc
+import functools
 import logging
 import os
 import resource
@@ -479,6 +480,57 @@ def _loader_available(loader_type: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _hvg_indices(path: str, hvg: bool) -> list[int] | None:
+    """The HVG projection to hand `TrainingDataset`, or `None` for no projection.
+
+    `None` rather than `range(QUERY_N_HVGS)` when the file is narrower than the
+    projection, for two reasons that point the same way. All three call sites
+    used an unconditional `range(2000)`, which on a narrower file asks the
+    loader for column 2000 of 200 and raises `HVG index 200 is out of range` —
+    the failure `test_frozen_floor_keys_still_emitted` has been reporting, where
+    the whole `hvg_norm` scenario is lost along with the
+    `samples_per_sec__hvg_norm` floors keyed to it. And it made this path
+    asymmetric with the competitors': `ooc_loader._apply_hvg_norm` guards with
+    `X.shape[1] > QUERY_N_HVGS` and simply does not project, so on such a file
+    every competitor would have measured an unprojected epoch while SCX errored.
+    Skipping the projection is what mirrors them; projecting to the full width
+    would still route through the HVG machinery and time something they are not.
+
+    The boundary is `>`, matching the competitor guard exactly, and that is
+    where the only behaviour change on a registered dataset lives: the four
+    `pert_synth_*` fixtures are exactly 2000 vars, so the old code projected
+    all 2000 columns and the new code projects none. That is the intended
+    direction — `_apply_hvg_norm` also does nothing at exactly 2000, so the
+    two paths now agree there, where before SCX did the projection work and
+    the competitors did not. No `ml_loader` / `ooc_loader` floor sits on a
+    `pert_synth_*` dataset, so it moves no gated number; the boundary is
+    pinned by a test rather than left to this comment.
+
+    Nothing registered is below 2000 (the narrowest real fixture is 5000
+    vars), so the crash only ever reached the narrow synthetic fixtures the
+    tests build. One function because three call sites drifting apart on which
+    of them clamps is how this would come back.
+    """
+    if not hvg:
+        return None
+    return list(range(QUERY_N_HVGS)) if _n_vars(path) > QUERY_N_HVGS else None
+
+
+@functools.lru_cache(maxsize=None)
+def _n_vars(path: str) -> int:
+    """`n_vars` off the catalog, once per path per process.
+
+    Cached because `_hvg_indices` is called from inside the timed epoch
+    functions, and every scenario runs a warmup epoch before the timed ones —
+    so the open lands in the warmup and the timed region adds nothing. A
+    catalog open is sub-millisecond against epochs measured in seconds, but a
+    benchmark should not put even that in the region it is reporting.
+    """
+    import pyscx
+
+    return int(pyscx.open(path).n_vars)
+
+
 def _run_scx_epoch(
     path: str, batch_size: int, hvg: bool, normalize: bool, seed: int,
     obs_columns: list[str] | None = None,
@@ -492,7 +544,7 @@ def _run_scx_epoch(
     """
     import pyscx
 
-    hvg_indices = list(range(QUERY_N_HVGS)) if hvg else None
+    hvg_indices = _hvg_indices(path, hvg)
     ds = pyscx.TrainingDataset(
         path,
         batch_size=batch_size,
@@ -561,7 +613,7 @@ if _HAS_TORCH:
             worker_id = info.id if info is not None else 0
             num_workers = info.num_workers if info is not None else 1
 
-            hvg_indices = list(range(QUERY_N_HVGS)) if self.hvg else None
+            hvg_indices = _hvg_indices(self.path, self.hvg)
             ds = pyscx.TrainingDataset(
                 self.path,
                 batch_size=self.batch_size,
@@ -929,7 +981,7 @@ def _run_scdataloader_epoch(
 def _ttfb_scx(path: str, batch_size: int, hvg: bool, normalize: bool, seed: int) -> None:
     import pyscx
 
-    hvg_indices = list(range(QUERY_N_HVGS)) if hvg else None
+    hvg_indices = _hvg_indices(path, hvg)
     ds = pyscx.TrainingDataset(
         path,
         batch_size=batch_size,

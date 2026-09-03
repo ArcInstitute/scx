@@ -9,6 +9,18 @@ docs/_autosummary/
 
 # Misc
 CLAUDE.local.md
+
+# Root scratch planning / review docs. AGENTS.md already forbids committing
+# these and forbids tracked files citing them, but there was no pattern here,
+# so they sat untracked — and `git status --porcelain` is what
+# `capture_baseline.capture_environment` reads for `git_dirty`, which stamps
+# every captured baseline "will not be reproducible" over three files that are
+# not part of the build. Anchored to the repo root so a legitimately tracked
+# doc deeper in the tree is unaffected.
+/2026-*_CODE-REVIEW*.md
+/2026-*_REGRESSIONS*.md
+/*_CODE-REVIEW.md
+/Phase*.md
 .nfs*
 archive/
 tasks/

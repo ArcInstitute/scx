@@ -70,6 +70,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -194,6 +195,7 @@ def submit_benchmarks(
     datasets: list[str] | None = None,
     formats: list[str] | None = None,
     skip_smoke: bool = False,
+    include_additional: bool = False,
 ) -> int:
     """Invoke run_parallel.py with the selected tier's settings.
 
@@ -259,6 +261,8 @@ def submit_benchmarks(
         cmd.append("--include-accel")
     if no_gpu:
         cmd.append("--no-gpu")
+    if include_additional:
+        cmd.append("--include-additional")
     if formats:
         cmd.extend(["--formats", *formats])
 
@@ -323,6 +327,13 @@ def archive_raw_results(
     floor as a scoped-out triple, and the gate reported zero regressions and
     exited 0 — a green gate over nothing measured. Observed on job 2834602.
 
+    The returned summary describes **every** file in ``baseline_dir/raw`` after
+    the copy, not just this pass's copies, so a snapshot assembled from two
+    passes into one ``--name`` keeps both. ``raw/`` always accumulated by
+    ``copy2``; the summary did not, so the narrower pass's ``summary.json`` used
+    to replace the wider one's rows and the promoted baseline silently described
+    the narrow pass alone.
+
     Returns a per-file summary dict suitable for summary.json.
     """
     if datasets:
@@ -330,9 +341,7 @@ def archive_raw_results(
     dst = baseline_dir / "raw"
     dst.mkdir(parents=True, exist_ok=True)
 
-    summary: dict[str, Any] = {}
     copied = 0
-    skipped = 0
     stale_filtered = 0
     for src in sorted(RAW_DIR.glob("*.json")):
         if not _tier_matches(src.name, tier_cfg):
@@ -343,6 +352,17 @@ def archive_raw_results(
         shutil.copy2(src, dst / src.name)
         copied += 1
 
+    # Summarise the DESTINATION, not the files this pass copied. A snapshot can
+    # be built from more than one pass — `--tier full`, then a narrowed
+    # `--datasets` pass over the five benchmarks that are only reachable from
+    # datasets no tier schedules — and `raw/` accumulated by `copy2` while
+    # a per-pass summary did not, so the second pass's `summary.json` replaced
+    # the first's rows wholesale. Reading `dst` back makes accumulation correct
+    # by construction. The staleness filter above is untouched: it still decides
+    # what may *enter* `raw/`, and nothing lands there that a pass did not pick.
+    summary: dict[str, Any] = {}
+    skipped = 0
+    for src in sorted(dst.glob("*.json")):
         try:
             data = json.loads(src.read_text())
         except json.JSONDecodeError:
@@ -370,14 +390,61 @@ def archive_raw_results(
             "source_file": src.name,
         }
 
+    # `copied` is this pass; `len(summary)` is the snapshot. On a single-pass
+    # capture they agree, and on a two-pass one the difference is the point —
+    # an operator checking "did this measure anything" needs the first number,
+    # and one checking "does the snapshot cover what I think" needs the second.
+    tail = f"; snapshot holds {len(summary)} rows ({skipped} unparseable)"
     if stale_filtered:
         print(
-            f"[baseline] archived {copied} result files ({skipped} unparseable, "
-            f"{stale_filtered} pre-run files skipped)"
+            f"[baseline] archived {copied} result files "
+            f"({stale_filtered} pre-run files skipped){tail}"
         )
     else:
-        print(f"[baseline] archived {copied} result files ({skipped} unparseable)")
+        print(f"[baseline] archived {copied} result files{tail}")
     return summary
+
+
+def _resolve_since(spec: str) -> float:
+    """Parse a ``--since`` cutoff into epoch seconds.
+
+    Three spellings because three things are convenient at different moments:
+    an ISO-8601 stamp read off a job log, a bare ``@epoch`` for scripting, and
+    a path whose mtime is the cutoff — the last being what an operator
+    actually has after ``touch``ing a marker before a capture.
+    """
+    spec = spec.strip()
+    if spec.startswith("@"):
+        return float(spec[1:])
+    path = Path(spec)
+    if path.exists():
+        return path.stat().st_mtime
+    try:
+        return datetime.fromisoformat(spec).timestamp()
+    except ValueError as exc:
+        raise SystemExit(
+            f"[baseline] cannot read --since {spec!r} as an ISO-8601 "
+            f"timestamp, an @epoch, or an existing file: {exc}"
+        ) from exc
+
+
+def _snapshot_datasets(
+    existing: list[str] | None, effective: list[str] | None,
+) -> list[str]:
+    """Union of what a snapshot already claimed and what this pass covered.
+
+    `summary.json`'s `datasets` field describes the snapshot, not the last
+    invocation that wrote it. With two passes into one `--name` the last pass's
+    list is a strict understatement, and a snapshot that claims a coverage it
+    does not have is exactly what `archive_raw_results`' `datasets` parameter
+    exists to prevent. Order-stable so a re-run of the same passes produces a
+    byte-identical field.
+    """
+    out: list[str] = []
+    for name in list(existing or []) + list(effective or []):
+        if name not in out:
+            out.append(name)
+    return out
 
 
 def _median_rss(runs: list[dict[str, Any]]) -> float | None:
@@ -446,6 +513,19 @@ def main() -> int:
         "--mode",
         choices=["submit", "archive", "fingerprint-only", "dry-run"],
         default="submit",
+    )
+    parser.add_argument(
+        "--since", default=None, metavar="TS",
+        help=(
+            "Archive-mode staleness cutoff: an ISO-8601 timestamp "
+            "(2026-09-02T13:13:00), a bare @epoch (@1788400000), or the path "
+            "to a file whose mtime is the cutoff. Only results written at or "
+            "after it are archived. `--mode archive` otherwise has NO "
+            "staleness filter and would sweep in every result RAW_DIR has "
+            "ever accumulated; this is what makes a crashed capture "
+            "salvageable instead of restartable. Ignored by --mode submit, "
+            "which uses its own submission time."
+        ),
     )
     parser.add_argument(
         "--skip-convert", action="store_true",
@@ -519,6 +599,18 @@ def main() -> int:
              "`bpcells` when not running from `scx-bench-r`).",
     )
     parser.add_argument(
+        "--include-additional", action="store_true",
+        help=(
+            "Schedule the ADDITIONAL_FORMATS variants too. Needed for "
+            "`read_scattered`, which is scoped to the four "
+            "`scx_compact_trial_g*` keys and therefore produces NOTHING "
+            "without this — its 14 floors then sit on a triple that did not "
+            "run, and `check_absolute_floors` skips them silently. "
+            "`results/baselines/LATEST` carries those rows, so a capture "
+            "without this flag is a coverage regression against it."
+        ),
+    )
+    parser.add_argument(
         "--skip-smoke", action="store_true",
         help="Skip the pre-submit format-runner contract check. Useful for "
              "narrow accel-only runs or when known-broken format runners "
@@ -565,6 +657,27 @@ def main() -> int:
     # matching ``stat().st_mtime``.
     submission_start: float | None = None
 
+    if args.mode == "archive":
+        # Without a cutoff, archive mode copies every result RAW_DIR has ever
+        # accumulated — 1807 files spanning five months on this checkout at
+        # the time of writing — and the promoted baseline silently mixes runs
+        # from unrelated commits. Refuse rather than do that quietly; a
+        # deliberate sweep is still available as `--since @0`.
+        if args.since is None:
+            raise SystemExit(
+                "[baseline] --mode archive needs --since: without it every "
+                "result ever written to results/raw/ is archived, mixing runs "
+                "from unrelated commits into one snapshot. Pass the capture's "
+                "start time (--since 2026-09-02T13:13:00), a marker file "
+                "(--since path/to/stamp), or --since @0 to sweep everything "
+                "on purpose."
+            )
+        submission_start = _resolve_since(args.since)
+        print(
+            f"[baseline] archiving results at or after "
+            f"{time.strftime('%Y-%m-%dT%H:%M:%S%z', time.localtime(submission_start))}"
+        )
+
     if args.mode == "submit":
         # Margin: subtract 1s so we don't lose results written within the
         # same second by a fast-running benchmark.
@@ -582,6 +695,7 @@ def main() -> int:
             datasets=args.datasets,
             formats=args.formats,
             skip_smoke=args.skip_smoke,
+            include_additional=args.include_additional,
         )
         if rc != 0:
             print(
@@ -602,6 +716,7 @@ def main() -> int:
             datasets=args.datasets,
             formats=args.formats,
             skip_smoke=args.skip_smoke,
+            include_additional=args.include_additional,
         )
         return 0
 
@@ -613,15 +728,26 @@ def main() -> int:
             tier_cfg, baseline_dir, since_mtime=submission_start,
             datasets=args.datasets or None,
         )
-        (baseline_dir / "summary.json").write_text(json.dumps(
+        # The effective list, not the tier's: `--datasets` can name a dataset
+        # outside the tier, and a snapshot that claims a coverage it does not
+        # have is worse than one that is narrow. Unioned with whatever a prior
+        # pass into this same `--name` already claimed, for the same reason.
+        effective_datasets = (
+            list(args.datasets) if args.datasets else list(tier_cfg["datasets"])
+        )
+        summary_path = baseline_dir / "summary.json"
+        prior_datasets: list[str] = []
+        if summary_path.is_file():
+            try:
+                prior_datasets = json.loads(summary_path.read_text()).get("datasets") or []
+            except json.JSONDecodeError:
+                prior_datasets = []
+        summary_path.write_text(json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,
                 "snapshot_name": args.name,
                 "tier": args.tier,
-                # The effective list, not the tier's: `--datasets` can name a
-                # dataset outside the tier, and a snapshot that claims a
-                # coverage it does not have is worse than one that is narrow.
-                "datasets": list(args.datasets) if args.datasets else tier_cfg["datasets"],
+                "datasets": _snapshot_datasets(prior_datasets, effective_datasets),
                 "rows": summary,
             },
             indent=2, default=str,

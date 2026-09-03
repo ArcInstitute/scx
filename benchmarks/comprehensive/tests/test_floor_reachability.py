@@ -285,6 +285,798 @@ def test_archive_raw_results_signature_takes_datasets():
         )
 
 
+def test_two_capture_passes_into_one_snapshot_keep_both_passes_rows():
+    """A snapshot built from two `--datasets` passes must carry both passes' rows.
+
+A baseline recapture is two passes into one `--name`: `--tier full`, then a
+    narrowed pass over the five benchmarks that are only reachable from datasets
+    no tier schedules (`grouped_sort`, `grouped_read`, `accel_de_nb_glm`,
+    `accel_eval_metrics`, `cell_eval_parity_perf` — the 53-floor gap catalogued
+    in `thresholds.yaml`'s Deferred item 12). `<snap>/raw/`
+    already accumulated by `copy2`, but the returned summary did not: it was
+    built from the files this pass copied, so pass B's `summary.json` replaced
+    pass A's rows wholesale and the promoted baseline described five benchmarks
+    instead of forty. Every row pass A measured would have read as *appearing*
+    rather than regressing for the whole life of the baseline — the same silence
+    as an empty snapshot, but harder to see, because the file is not empty.
+
+    Building the summary from the destination directory makes accumulation
+    correct by construction. The staleness filter is unaffected: it still gates
+    what gets *copied*, and nothing reaches `raw/` that a pass did not choose.
+    """
+    import importlib
+    import json
+    import pathlib
+    import tempfile
+
+    cb = importlib.import_module("benchmarks.comprehensive.scripts.capture_baseline")
+
+    full = cb.TIERS["full"]
+    assert "replogle_k562" not in full["datasets"], (
+        "premise: replogle_k562 must be outside tier full, or pass B is not "
+        "modelling an off-tier pass. If the tiers changed, pick another."
+    )
+
+    def _result(benchmark, fmt, dataset, wall):
+        return json.dumps({
+            "schema_version": 2, "benchmark": benchmark, "format": fmt,
+            "dataset": dataset, "median_wall_s": wall,
+            "runs": [{"wall_s": wall, "peak_rss_mb": 10.0, "extra": {}}],
+        })
+
+    a_name = "read_full__scx_auto__census_1m.json"
+    b_name = "grouped_sort__scx_auto__replogle_k562.json"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        fake_raw = tmp / "raw_src"
+        fake_raw.mkdir()
+        snapshot = tmp / "snap"
+        orig = cb.RAW_DIR
+        try:
+            cb.RAW_DIR = fake_raw
+            # Pass A — the tier.
+            (fake_raw / a_name).write_text(_result(
+                "read_full", "scx_auto", "census_1m", 1.5))
+            summary_a = cb.archive_raw_results(full, snapshot, datasets=None)
+            # Pass B — off-tier, disjoint datasets, same snapshot.
+            (fake_raw / b_name).write_text(_result(
+                "grouped_sort", "scx_auto", "replogle_k562", 2.5))
+            summary_b = cb.archive_raw_results(
+                full, snapshot, datasets=["replogle_k562"])
+        finally:
+            cb.RAW_DIR = orig
+        archived = sorted(p.name for p in (snapshot / "raw").glob("*.json"))
+
+    assert archived == sorted([a_name, b_name]), archived
+    assert "read_full__scx_auto__census_1m" in summary_a
+
+    assert "grouped_sort__scx_auto__replogle_k562" in summary_b, (
+        "pass B did not archive its own off-tier row"
+    )
+    assert "read_full__scx_auto__census_1m" in summary_b, (
+        "pass B's summary dropped pass A's row — `summary.json` would claim "
+        "only the narrowed pass's coverage, and every row pass A measured "
+        "would be baseline-absent (treated as appearing, never regressing) "
+        f"for the life of the promoted baseline. Got: {sorted(summary_b)}"
+    )
+    assert summary_b["read_full__scx_auto__census_1m"]["median_wall_s"] == 1.5
+
+
+def test_capture_writes_the_union_of_both_passes_dataset_lists():
+    """`summary.json`'s `datasets` field must describe the snapshot, not the last
+    invocation.
+
+    It is the field `_tier_matches` is reconstructed from when anyone re-reads a
+    snapshot, and `check_absolute_floors` is not the only consumer — a snapshot
+    that claims a coverage it does not have is worse than one that is narrow
+    (the reason `--datasets` is honoured there at all). With two passes the last
+    one's list is not the snapshot's.
+    """
+    import importlib
+    import inspect
+
+    cb = importlib.import_module("benchmarks.comprehensive.scripts.capture_baseline")
+    assert hasattr(cb, "_snapshot_datasets"), (
+        "capture_baseline lost `_snapshot_datasets`, so a second pass's "
+        "`datasets` field would overwrite the first's instead of unioning"
+    )
+    src = inspect.getsource(cb.main)
+    assert "_snapshot_datasets(" in src, (
+        "main() writes `datasets` without unioning in what the snapshot "
+        "already claimed"
+    )
+
+    # The union itself: order-stable, deduplicated, and it must not drop either side.
+    got = cb._snapshot_datasets(["a", "b"], ["b", "c"])
+    assert got == ["a", "b", "c"], got
+    assert cb._snapshot_datasets([], ["a"]) == ["a"]
+    assert cb._snapshot_datasets(["a"], []) == ["a"]
+
+
+def test_the_gpu_partition_is_not_a_hardcoded_literal():
+    """GPU cells must take their partition from one overridable place.
+
+    `run_parallel._per_job_slurm_params` assigned `partition = "preemptible"` in
+    the `needs_gpu` branch, and `SLURM_DEFAULTS["gpu"]` repeated it. Neither
+    `--partition` nor `SCX_BENCH_PARTITION` reaches that branch — those size CPU
+    cells — so on a cluster where the preemptible GPU QOS is backlogged, the
+    ~204 GPU cells of a tier-full capture (every `accel_* x *_gpu*`, plus every
+    `ml_loader x scx_*`) sit PENDING past the gate's 600 s probe timeout and read
+    as a pre-flight failure rather than a queue. The standing workaround was to
+    edit the line for a run and remember to revert it; a forgotten revert is a
+    silent partition change, and a forgotten edit is a starved capture.
+
+    Behavioural, in a subprocess, because `GPU_PARTITION` is read at import: a
+    test that reloads the module in-process would leave `run_parallel`'s bound
+    copy stale and pass while the real thing did not move.
+    """
+    import ast
+    import os
+    import subprocess
+    import sys
+
+    src = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+           / "run_parallel.py").read_text()
+    tree = ast.parse(src)
+
+    # Find the `if needs_gpu:` body and assert nothing in it assigns a string
+    # constant to `partition`.
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if not (isinstance(node.test, ast.Name) and node.test.id == "needs_gpu"):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Assign):
+                continue
+            names = [t.id for t in inner.targets if isinstance(t, ast.Name)]
+            if "partition" not in names:
+                continue
+            if isinstance(inner.value, ast.Constant):
+                offenders.append(f"line {inner.lineno}: partition = {inner.value.value!r}")
+    assert not offenders, (
+        "the needs_gpu branch hardcodes its partition again: "
+        + "; ".join(offenders)
+        + " — use config.GPU_PARTITION so SCX_BENCH_GPU_PARTITION reaches it"
+    )
+    assert "partition = GPU_PARTITION" in src, (
+        "run_parallel no longer sources the GPU partition from config"
+    )
+
+    # End to end: the env var must move both the constant and SLURM_DEFAULTS.
+    probe = (
+        "import json;"
+        "from benchmarks.comprehensive.config import GPU_PARTITION, SLURM_DEFAULTS;"
+        "print(json.dumps([GPU_PARTITION, SLURM_DEFAULTS['gpu']['partition']]))"
+    )
+    env = {**os.environ, "SCX_BENCH_GPU_PARTITION": "ctc_gpu_priority"}
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=PROJECT_ROOT, env=env,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    assert __import__("json").loads(out) == ["ctc_gpu_priority"] * 2, out
+
+    # Default unchanged: an operator who sets nothing gets today's behaviour.
+    env.pop("SCX_BENCH_GPU_PARTITION")
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=PROJECT_ROOT, env=env,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    assert __import__("json").loads(out) == ["preemptible"] * 2, out
+
+
+def test_presubmit_smoke_is_scoped_to_the_scheduled_formats():
+    """The pre-submit runner check must test the runners the run will use.
+
+    Unscoped it tested every runner whose dependencies happened to import, so a
+    capture was blocked by breakage in a format it does not schedule. That is
+    not hypothetical: a tier-full capture (job 2891565) died in 36 s on
+    `bpcells` (`read_subset` -> a BPCells `selection_index` out-of-bounds) and
+    `parquet_zstd` (`convert` -> "Column 1 named indices expected length 2701
+    but got length 2286884"). Both live in `ADDITIONAL_FORMATS`, which a
+    capture only schedules under `--include-additional`; all 11 formats it does
+    use passed. The standing response was `--skip-smoke`, which every prior
+    full capture passed — and a check nobody runs is the same thing as no
+    check, which is the failure mode this whole file exists for.
+
+    `smoke_test_runners` has runners only for the format keys, so accel and
+    multimodal keys match none of them and the intersection can legitimately be
+    empty. An empty intersection after an explicit `--formats` is an error
+    rather than a pass, because the caller believes it asked for coverage it
+    is not getting.
+    """
+    import subprocess
+    import sys
+
+    src = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+           / "run_parallel.py").read_text()
+    assert '"--formats", *smoke_keys,' in src, (
+        "run_parallel invokes smoke_test_runners without scoping it to the "
+        "scheduled formats — a broken runner for an unscheduled format will "
+        "block the capture again"
+    )
+    assert "smoke_keys = sorted({f.key for f in formats})" in src, (
+        "the smoke scope is not derived from the formats actually scheduled"
+    )
+
+    # Behavioural: a --formats set that matches no runner must fail loudly
+    # rather than report a pass over nothing.
+    proc = subprocess.run(
+        [sys.executable, "-m",
+         "benchmarks.comprehensive.scripts.smoke_test_runners",
+         "--formats", "accel_de__pyscx_gpu"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 1, (
+        f"an unmatched --formats set exited {proc.returncode}, not 1:\n"
+        f"{proc.stdout[-2000:]}"
+    )
+    assert "Refusing to report a pass over nothing" in proc.stdout, proc.stdout[-2000:]
+
+
+def test_the_hvg_projection_width_is_decided_in_one_place():
+    """Three call sites hand `hvg_indices` to `TrainingDataset`; one rule.
+
+    All three built `list(range(QUERY_N_HVGS))` unconditionally, so on a file
+    narrower than 2000 vars the loader is asked for column 2000 of 200 and
+    raises `HVG index 200 is out of range`. That took out the whole `hvg_norm`
+    scenario and with it the `samples_per_sec__hvg_norm` floors keyed to it —
+    `test_dataload_phase0.py::test_frozen_floor_keys_still_emitted` had been
+    reporting exactly that. It was also asymmetric: `ooc_loader`'s competitor
+    path guards with `X.shape[1] > QUERY_N_HVGS` and does not project, so every
+    competitor would have measured an unprojected epoch while SCX errored.
+
+    Guarded at the source because the end-to-end test only exercises one of the
+    three sites, and "which of the three clamps" is precisely what drifts.
+    """
+    import ast
+
+    src = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+           / "ml_loader.py").read_text()
+    tree = ast.parse(src)
+
+    inside: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_hvg_indices":
+            inside = {n.lineno for n in ast.walk(node) if hasattr(n, "lineno")}
+    assert inside, "ml_loader lost `_hvg_indices` — the clamp has no home"
+
+    offenders = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "range"
+        and any(isinstance(a, ast.Name) and a.id == "QUERY_N_HVGS" for a in node.args)
+        and node.lineno not in inside
+    ]
+    assert not offenders, (
+        f"ml_loader.py builds range(QUERY_N_HVGS) outside `_hvg_indices` at "
+        f"lines {offenders} — that site will crash on any file narrower than "
+        f"QUERY_N_HVGS and will disagree with the competitors' path"
+    )
+
+
+def test_no_runner_reports_a_moved_api_as_a_missing_package():
+    """"Not installed" must not be the message for an installed package.
+
+    Every optional competitor runner wrapped its top-level import *and* its
+    member imports in one broad `except ImportError`, set `_HAS_X = False`, and
+    then told the operator "X is not installed in this env. Install it with …".
+    When the package is present but its API has moved, that message is false
+    and it buries the real diagnosis.
+
+    Not hypothetical. The tier-full capture lost all 47 `cellstream` cells to
+    `from cellstream import format` and `from cellstream.writer import
+    write_store`, both gone upstream (`CellStream` is now `CellStore`) — while
+    every one of the 47 logs said the package was missing and the fix was to
+    install it, which it already was. 47 baseline rows and a misdirected
+    investigation, from an error message that was confidently wrong.
+
+    This is the class `pyscx/src/optional_deps.rs` exists to avoid: it rewrites
+    a missing-module error only when the missing name *is* the requested
+    top-level package, and lets a failing submodule propagate untouched,
+    "because 'not installed' would be false and would bury the real diagnosis."
+    `runners/base.probe_optional` is the bench-side equivalent.
+    """
+    import ast
+
+    from benchmarks.comprehensive.runners.base import probe_optional
+
+    # The three outcomes, on modules that certainly exist / certainly do not.
+    ok, why = probe_optional("json", "json.decoder", "json:loads", install_hint="n/a")
+    assert ok and why == "", (ok, why)
+
+    ok, why = probe_optional("json", "json:no_such_attribute", install_hint="n/a")
+    assert not ok and "IS installed" in why and "API has moved" in why, why
+    assert "not installed" not in why.replace("IS installed", ""), (
+        f"a moved API still reads as a missing package: {why}"
+    )
+
+    ok, why = probe_optional("scx_no_such_package_xyz", install_hint="pip install it")
+    assert not ok and "is not installed" in why and "pip install it" in why, why
+
+    # No runner may reconstruct the conflated guard.
+    runners = PROJECT_ROOT / "benchmarks" / "comprehensive" / "runners"
+    offenders: list[str] = []
+    for path in sorted(runners.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            sets_flag_false = any(
+                isinstance(st, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id.startswith("_HAS_")
+                        for t in st.targets)
+                and isinstance(st.value, ast.Constant) and st.value.value is False
+                for h in node.handlers for st in h.body
+            )
+            has_member_import = any(
+                isinstance(st, ast.ImportFrom) for st in node.body
+            )
+            if sets_flag_false and has_member_import:
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        f"these guards fold a member import into the package-absent branch, so "
+        f"a moved upstream API will be reported as 'not installed': "
+        f"{offenders}. Use `runners.base.probe_optional`, which separates them."
+    )
+
+
+def test_the_hvg_clamp_boundary_moves_no_gated_number():
+    """Pin which datasets the `>` in `_hvg_indices` actually changes.
+
+    Backing a claim rather than asserting it. The clamp's boundary is
+    `n_vars > QUERY_N_HVGS`, so a dataset at *exactly* 2000 vars goes from
+    "project all 2000 columns" to "project nothing" — a real behaviour change,
+    not just a crash fix, and one worth knowing about before reading a
+    captured number. It is the intended direction: `ooc_loader._apply_hvg_norm`
+    guards with the same `>` and also does nothing at exactly 2000, so the two
+    paths agree there, where before SCX did the projection work and every
+    competitor it is compared against did not.
+
+    Three facts, checked against the registry rather than remembered:
+      * nothing registered is below the threshold, so the crash only ever
+        reached the narrow synthetic fixtures the tests build;
+      * exactly the `pert_synth_*` family sits on the boundary;
+      * no `ml_loader` / `ooc_loader` floor names one of them, so the change
+        cannot move a gated value.
+    """
+    from benchmarks.comprehensive.config import DATASETS, QUERY_N_HVGS
+
+    below = {n: d.n_vars for n, d in DATASETS.items()
+             if not d.multimodal and d.n_vars < QUERY_N_HVGS}
+    at = {n: d.n_vars for n, d in DATASETS.items()
+          if not d.multimodal and d.n_vars == QUERY_N_HVGS}
+
+    assert not below, (
+        f"these datasets are narrower than QUERY_N_HVGS={QUERY_N_HVGS} and the "
+        f"old unclamped `range(QUERY_N_HVGS)` would have raised on them: "
+        f"{below}. Re-read the clamp's note — the claim that only test "
+        f"fixtures were affected no longer holds."
+    )
+    assert set(at) == {"pert_synth_10k", "pert_synth_100k",
+                       "pert_synth_500k", "pert_synth_1m"}, sorted(at)
+
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+    gated = sorted(
+        f"{f['benchmark']}/{f['dataset']}:{f['metric']}"
+        for f in (raw.get("absolute_floors") or [])
+        if f["benchmark"] in ("ml_loader", "ooc_loader") and f["dataset"] in at
+    )
+    assert not gated, (
+        f"a floor now sits on a dataset the HVG clamp changes behaviour for: "
+        f"{gated}. Re-measure it before trusting the threshold — at exactly "
+        f"QUERY_N_HVGS vars the projection is skipped where it used to run."
+    )
+
+
+def test_the_submission_throttle_counts_array_tasks_individually():
+    """`squeue` must be asked for `-r`, or the throttle cannot see its subject.
+
+    `_wait_under_pending_cap` reserves room for a whole cohort before
+    submitting it, because "a `map_array` call registers N tasks that each
+    count individually against `QOSMaxSubmitJobPerUserLimit`" — its own
+    docstring. But `_count_active_user_jobs` asked `squeue` without `-r`, which
+    collapses a pending array into ONE line (`2891953_[14-19]`), so the
+    arithmetic was right and its input could not see the tasks it was
+    reserving against.
+
+    Measured on a live capture queue: 16 lines without `-r`, 39 with. The
+    tier-full capture (job 2891607) died 26 minutes in on
+    `QOSMaxSubmitJobPerUserLimit`, having exhausted all three QOS retries,
+    while the throttle believed the queue was nearly empty.
+
+    Asserted on the argv rather than the behaviour because the behaviour needs
+    a populated queue: with an empty one, `-r` and no `-r` agree, so a
+    same-answer test would pass on exactly the configuration that is broken.
+    The live-queue arm below runs only when there is something in flight.
+    """
+    import inspect
+    import os
+    import subprocess
+
+    from benchmarks.comprehensive.scripts import run_parallel
+
+    src = inspect.getsource(run_parallel._count_active_user_jobs)
+    assert '"-r"' in src or "'-r'" in src or "--array" in src, (
+        "_count_active_user_jobs asks squeue without -r, so every pending "
+        "array counts as one job instead of N and the QOS throttle "
+        "under-reports the queue depth it exists to bound"
+    )
+
+    user = os.environ.get("USER", "")
+    if not user:
+        return
+    try:
+        expanded = subprocess.check_output(
+            ["squeue", "-u", user, "-h", "-r", "-t", "PD,R", "--format=%i"],
+            text=True, timeout=15,
+        )
+    except Exception:
+        return  # no SLURM here; the argv assertion above is the contract
+    n_expanded = len([ln for ln in expanded.splitlines() if ln.strip()])
+    if n_expanded == 0:
+        return  # empty queue cannot distinguish the two spellings
+    assert run_parallel._count_active_user_jobs() == n_expanded, (
+        "the counter disagrees with the array-expanded queue depth"
+    )
+
+
+def test_a_transient_sbatch_failure_does_not_discard_the_whole_capture():
+    """One flaky `sbatch` call must not end a multi-hour capture.
+
+    The cohort-submit retry matched only `QOSMaxSubmitJobPerUserLimit` and
+    re-raised everything else. A tier-full capture (job 2892341) died 38
+    minutes and 735 results in on `sbatch: error: Batch job submission
+    failed: Socket timed out on send/recv operation` — slurmctld busy for one
+    call. Nothing was archived: `capture_baseline` refuses to archive after a
+    non-zero `run_parallel`, correctly, so a transient scheduler hiccup threw
+    away 38 minutes of cluster time.
+
+    The classification is the part worth pinning, in both directions. Matching
+    the "Batch job submission failed" prefix would also swallow permanent
+    misconfiguration — an invalid partition or account — where three attempts
+    with backoff only delay the real error by 90 seconds.
+    """
+    from benchmarks.comprehensive.scripts.run_parallel import (
+        _TRANSIENT_SBATCH_ERRORS,
+        _is_transient_sbatch_error,
+    )
+
+    # The one that actually happened, verbatim from the job log.
+    assert _is_transient_sbatch_error(
+        "sbatch: error: Batch job submission failed: Socket timed out on "
+        "send/recv operation"
+    )
+    assert _is_transient_sbatch_error(
+        "sbatch: error: Batch job submission failed: Unable to contact slurm "
+        "controller (connect failure)"
+    )
+
+    # Permanent misconfiguration must NOT retry.
+    for permanent in (
+        "sbatch: error: invalid partition specified: nonesuch",
+        "sbatch: error: Batch job submission failed: Invalid account or "
+        "account/partition combination specified",
+        "sbatch: error: Batch job submission failed: Invalid partition name "
+        "specified",
+        "sbatch: error: Batch job submission failed: Requested node "
+        "configuration is not available",
+    ):
+        assert not _is_transient_sbatch_error(permanent), permanent
+
+    # The QOS case keeps its own branch (drain + re-throttle), so it must not
+    # be folded into the plain-backoff list.
+    assert not _is_transient_sbatch_error(
+        "sbatch: error: QOSMaxSubmitJobPerUserLimit"
+    ), "the QOS limit needs the drain branch, not a blind backoff"
+
+    # Nor may "Job dependency problem", which is the one that looks transient
+    # and is not. It means `afterok:<jid>` names a job SLURM no longer knows —
+    # almost always because the conversion FINISHED and was purged between
+    # being recorded and the cohort being submitted. Waiting cannot help: the
+    # id stays purged. A capture died 8 minutes in on
+    # `pbmc10k/anndata_zarr_backed` after two backoffs arrived at the same
+    # error, because this string WAS in the list.
+    from benchmarks.comprehensive.scripts.run_parallel import (
+        _DEPENDENCY_PROBLEM,
+        _dependency_already_satisfied,
+    )
+
+    assert not _is_transient_sbatch_error(
+        f"sbatch: error: Batch job submission failed: {_DEPENDENCY_PROBLEM}"
+    ), (
+        "'Job dependency problem' is back in the transient list; a backoff "
+        "spends three attempts reaching the same permanent error instead of "
+        "checking whether the dependency had already succeeded"
+    )
+    # And the recovery must fail closed: no id, or an id whose job is not
+    # COMPLETED, must not license dropping the dependency — that would race a
+    # still-running conversion and let a benchmark read a half-written fixture.
+    assert _dependency_already_satisfied(None) is False
+    assert _dependency_already_satisfied("99999999999") is False
+
+    # `_submit_cohort` is nested inside `main()`, so slice it out by AST
+    # rather than `inspect.getsource` on an attribute that does not exist.
+    import ast
+
+    path = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+            / "run_parallel.py")
+    text = path.read_text()
+    tree = ast.parse(text)
+    body = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_submit_cohort"),
+        None,
+    )
+    assert body is not None, "run_parallel lost _submit_cohort"
+    src = ast.get_source_segment(text, body) or ""
+    assert "_is_transient_sbatch_error(msg)" in src, (
+        "the retry loop no longer consults the transient classifier"
+    )
+    # Code lines only: the comments legitimately quote the prefix while
+    # explaining why it is the wrong thing to match on.
+    code_lines = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    offending = [ln.strip() for ln in code_lines
+                 if "Batch job submission failed" in ln]
+    assert not offending, (
+        f"the retry loop matches the generic submission-failure prefix in "
+        f"code, which also covers permanent misconfiguration: {offending}"
+    )
+    # A count, not a lower bound on ambition: this list should stay short.
+    # Every entry is a claim that waiting helps, and the one entry that was
+    # wrong about that cost a capture.
+    assert len(_TRANSIENT_SBATCH_ERRORS) >= 3, _TRANSIENT_SBATCH_ERRORS
+
+
+def test_archive_mode_refuses_to_sweep_without_a_cutoff():
+    """`--mode archive` must not silently archive five months of results.
+
+    `--mode submit` filters `results/raw/` on its own submission time, so only
+    that run's output reaches the snapshot. `--mode archive` had no filter at
+    all — and it is the documented recovery path when a capture crashes, which
+    is exactly when someone reaches for it. On this checkout `results/raw/`
+    held 1807 files spanning five months; archiving them all would promote a
+    baseline mixing runs from unrelated commits, and nothing downstream could
+    tell.
+
+    Three attempts at one tier-full capture died mid-run (pre-submit smoke,
+    then `QOSMaxSubmitJobPerUserLimit`, then a transient `sbatch` socket
+    timeout at 38 minutes and 735 results), and each time `capture_baseline`
+    correctly refused to archive — leaving the completed work stranded with no
+    supported way to collect it. `--since` is what makes a crashed capture
+    salvageable rather than restartable.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    from benchmarks.comprehensive.scripts import capture_baseline as cb
+
+    # All three spellings resolve, and a nonsense one exits rather than
+    # defaulting to "everything".
+    assert cb._resolve_since("@1788400000") == 1788400000.0
+    assert cb._resolve_since("2026-09-02T13:13:00") > 1788000000
+    with tempfile.NamedTemporaryFile() as fh:
+        assert cb._resolve_since(fh.name) == pytest.approx(
+            __import__("os").stat(fh.name).st_mtime
+        )
+    with pytest.raises(SystemExit):
+        cb._resolve_since("not-a-time")
+
+    # And the refusal itself, through the CLI, since that is where an operator
+    # meets it.
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run(
+            [sys.executable,
+             str(PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+                 / "capture_baseline.py"),
+             "--mode", "archive", "--name", "since_guard_probe",
+             "--results-dir", tmp, "--skip-fingerprints"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
+        )
+    assert proc.returncode != 0, proc.stdout[-2000:]
+    assert "--mode archive needs --since" in (proc.stdout + proc.stderr), (
+        proc.stdout[-2000:] + proc.stderr[-2000:]
+    )
+
+
+def test_the_index_preset_arm_is_scoped_to_where_the_feature_works():
+    """The `index_preset_cellxgene` arm must not take out a floored triple.
+
+    Its premise check refuses an arm whose output is not larger than the
+    default's, because an index can only add bytes — and refusing is right: an
+    arm that silently timed the default conversion under an index label is
+    worse than no arm. But it raises, which fails the whole
+    `conversion_streaming` cell, and `streaming_peak_rss_mb <= 4096` is floored
+    on census_1m. One broken extra arm cost a floored triple its rows.
+
+    `index_preset="cellxgene"` does not work at census scale. Not for want of
+    columns — h5py says tabula, census_500k and census_1m all carry the ten
+    (`cell_type`, `..._ontology_term_id`, `tissue`, …, `suspension_type`). It
+    works at 100k and emits nothing at 500k and 1M, and the arm's output came
+    out *smaller* than the default's at both (1,146,311,684 vs 1,148,236,779;
+    2,729,215,285 vs 2,736,680,651), which a missing index alone does not
+    explain.
+
+    So the arm is scoped to tabula. This test states that the scope is a
+    workaround around a defect rather than a judgement about coverage, so that
+    restoring the census datasets is the natural thing to do in the change that
+    fixes it — and fails if someone restores them without one.
+    """
+    import ast
+
+    path = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "benchmarks"
+            / "conversion_streaming.py")
+    text = path.read_text()
+    mod = ast.parse(text)
+    arms = next(
+        (n for n in ast.walk(mod)
+         if isinstance(n, ast.AnnAssign)
+         and isinstance(n.target, ast.Name) and n.target.id == "_EXTRA_ARMS"),
+        None,
+    )
+    assert arms is not None, "conversion_streaming lost _EXTRA_ARMS"
+    scopes = {}
+    for key, val in zip(arms.value.keys, arms.value.values):
+        name = key.value
+        # (kwargs, frozenset({...}))
+        fs = val.elts[1]
+        scopes[name] = {
+            e.value for e in fs.args[0].elts
+        } if fs.args else set()
+
+    assert "index_preset_cellxgene" in scopes, sorted(scopes)
+    scope = scopes["index_preset_cellxgene"]
+    assert "tabula_sapiens_100k" in scope, scope
+    broken = {"census_500k", "census_1m"} & scope
+    assert not broken, (
+        f"{sorted(broken)} were restored to the index_preset_cellxgene arm. "
+        f"The feature emitted no index sections there as of 2026-09-02 and the "
+        f"arm's premise check raises, which fails the whole cell and with it "
+        f"`streaming_peak_rss_mb`, floored on census_1m. Restore them only "
+        f"alongside the fix — and delete this assertion in the same change, "
+        f"since the premise check is then the thing that guards it."
+    )
+
+
+def test_cross_module_benchmark_helper_calls_match_their_signatures():
+    """A helper shared between two benchmark modules must be called correctly.
+
+    `accel_format_pipeline` imports `_prepare_sidecar_scx` from
+    `accel_to_gpu_anndata`. That function grew a third parameter (`arm`) when
+    the shufdelta arms landed, and this call site was not updated — so every
+    `accel_format_pipeline__scx_devdecode_rapids_gpu` cell raised
+    `TypeError: _prepare_sidecar_scx() missing 1 required positional argument:
+    'arm'` from then until the 2026-09-02 capture surfaced it, six cells at a
+    time. Nothing type-checks these modules and nothing imported the pair
+    together, so the break was invisible outside a real run.
+
+    Checked by binding the actual call's arguments against the actual
+    signature, which is the only form that catches a parameter added on the
+    other side of the import.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_format_pipeline as afp
+    from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import (
+        _prepare_sidecar_scx,
+    )
+    from benchmarks.comprehensive.config import DATASETS
+
+    sig = inspect.signature(_prepare_sidecar_scx)
+    arm = afp._TO_GPU_ARMS[afp._SCX1_ARM_KEY]
+    # Binding raises TypeError on an arity or name mismatch without running it.
+    bound = sig.bind(DATASETS["pbmc3k"], "/tmp", arm)
+    assert set(bound.arguments) == set(sig.parameters), (
+        f"call binds {sorted(bound.arguments)} against parameters "
+        f"{sorted(sig.parameters)}"
+    )
+    # And the arm has to be the Scx1 one: this benchmark needs the decode
+    # sidecar, which `auto` would drop on a median-nonzero > 8 fixture.
+    assert arm.codec == "scx1", arm
+    assert arm.fixture_attr == "scx_scx1_path", arm
+
+
+def test_read_scattered_needs_additional_formats_to_produce_anything():
+    """A floored benchmark that only runs on ADDITIONAL_FORMATS needs the flag.
+
+    `read_scattered` is scoped to the four `scx_compact_trial_g{128,256,512,
+    1024}` keys, and all four live in `ADDITIONAL_FORMATS` — which
+    `run_parallel` schedules only under `--include-additional`. So a capture
+    without that flag produces **no** `read_scattered` results, its 14 floors
+    sit on triples that did not run, and `check_absolute_floors` skips them
+    silently and correctly. `results/baselines/LATEST` carries those rows, so
+    the omission is a regression against the outgoing baseline, not merely a
+    thinner snapshot.
+
+    `capture_baseline` had no way to pass the flag at all, which is how the
+    2026-09-02 tier-full capture came out with the `read_scattered` family
+    missing entirely.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import read_scattered
+    from benchmarks.comprehensive.config import ADDITIONAL_FORMATS, PRIMARY_FORMATS
+    from benchmarks.comprehensive.scripts import capture_baseline as cb
+
+    scoped = set(read_scattered.SUPPORTED_FORMATS)
+    additional = {f.key for f in ADDITIONAL_FORMATS}
+    primary = {f.key for f in PRIMARY_FORMATS}
+    assert scoped, "read_scattered lost its format scope"
+    assert scoped <= additional, (
+        f"read_scattered's formats are no longer all ADDITIONAL: "
+        f"{sorted(scoped - additional)}"
+    )
+    assert not (scoped & primary), sorted(scoped & primary)
+
+    # The flag has to exist and reach run_parallel.
+    assert "include_additional" in inspect.signature(cb.submit_benchmarks).parameters
+    src = inspect.getsource(cb.submit_benchmarks)
+    assert '"--include-additional"' in src, (
+        "capture_baseline accepts include_additional but never forwards it"
+    )
+    assert "include_additional=args.include_additional" in inspect.getsource(cb.main), (
+        "main() does not forward --include-additional to submit_benchmarks"
+    )
+
+
+def test_the_capture_wrapper_does_not_pin_threads():
+    """A capture must not silently change the thing it measures.
+
+    `slurm_capture_baseline.sh` exported `RAYON_NUM_THREADS=1` (and OMP / MKL),
+    justified as matching `fingerprint_accelerators.py` so a recomputed
+    fingerprint would be byte-identical. That reasoning does not hold:
+    `run_fingerprints` opens with
+    `os.environ.setdefault("RAYON_NUM_THREADS", str(PINNED_THREADS))`, so it
+    pins itself whatever the parent says. The export changed nothing for
+    fingerprints and made every benchmark cell single-threaded.
+
+    Which makes the capture incomparable with the tree it must be compared to.
+    Every promoted baseline's `environment.json` records `determinism_env` as
+    `unset` for all three variables — none was captured through this wrapper —
+    so gating a pinned capture against one reports `accel_knn` +888%,
+    `read_full` +469-616% on every SCX codec at census, and
+    `bench_csc_dispatch` +585%, purely because rayon had one thread. The median
+    ratio was 1.03x, so it hides in the tail and reads as a few catastrophic
+    regressions rather than a methodology error.
+
+    Floors authored from single-threaded medians would be worse than no floors:
+    a normal run clears them by 5-9x while the row reads as coverage.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.scripts import fingerprint_accelerators as fa
+
+    wrapper = (PROJECT_ROOT / "benchmarks" / "comprehensive" / "scripts"
+               / "slurm_capture_baseline.sh").read_text()
+    offenders = [
+        ln.strip() for ln in wrapper.splitlines()
+        if not ln.lstrip().startswith("#")
+        and any(v in ln for v in ("RAYON_NUM_THREADS", "OMP_NUM_THREADS",
+                                  "MKL_NUM_THREADS"))
+        and "export" in ln
+    ]
+    assert not offenders, (
+        f"slurm_capture_baseline.sh pins thread counts again: {offenders}. "
+        f"Every promoted baseline records determinism_env unset; a pinned "
+        f"capture cannot be gated against them, and floors derived from it are "
+        f"5-9x too loose on any rayon path."
+    )
+
+    # The premise: the fingerprint script really does pin itself, so removing
+    # the export costs nothing there. If this ever stops being true, the
+    # export's original justification becomes valid and this test is wrong.
+    src = inspect.getsource(fa.run_fingerprints)
+    assert 'setdefault("RAYON_NUM_THREADS"' in src, (
+        "fingerprint_accelerators no longer self-pins, so the capture wrapper's "
+        "export was load-bearing after all — re-read this test before deleting "
+        "the assertion above"
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 
@@ -453,12 +1245,26 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
             f"would mix arms"
         )
 
-    # census_1m carries the live `streaming_peak_rss_mb` floor, so `csc_always`
-    # — which needs a whole-triple justification — must NOT run there.
+    # census_1m carries the live `streaming_peak_rss_mb` floor, so NEITHER extra
+    # arm runs there — and for two different reasons worth keeping apart.
+    #
+    # `csc_always` is excluded by design: it needs a whole-triple justification,
+    # which would suppress that floor along with the pooled medians it is
+    # actually about.
+    #
+    # `index_preset_cellxgene` is excluded because the feature is broken at
+    # census scale (2026-09-02): it emits no index sections, its premise check
+    # raises, and the raise failed the whole cell — taking
+    # `streaming_peak_rss_mb` with it, in the capture meant to give that floor
+    # its rows. See `test_the_index_preset_arm_is_scoped_to_where_the_feature_
+    # works`. When that is fixed, this expectation goes back to
+    # `["index_preset_cellxgene"]`.
     calls, result = drive("census_1m")
     assert all((kw or {}).get("csc") is None for _, _, kw in calls), calls
-    assert result.metadata["extra_arms"] == ["index_preset_cellxgene"]
+    assert all((kw or {}).get("index_preset") is None for _, _, kw in calls), calls
+    assert result.metadata["extra_arms"] == []
     assert "csc_always" in result.metadata["extra_arms_skipped"]
+    assert "index_preset_cellxgene" in result.metadata["extra_arms_skipped"]
 
     # A dataset in neither scope runs the three base arms only.
     calls, result = drive("pbmc3k")
@@ -1204,7 +2010,12 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
         ("streaming (`pyscx.from_h5ad`), `reader_threads=4`",
          "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
          "streaming"),
-        ("streaming, default parallelism (16 readers)",
+        # No "(16 readers)" in the label any more: the arm records
+        # `reader_threads: None` and never stores the resolved count, so that
+        # parenthetical was an inference about the 2026-08-22 capture's node,
+        # not a recorded fact. `available_parallelism()` follows the cgroup, so
+        # the real value is per-allocation and the doc cannot state it.
+        ("streaming, default parallelism",
          "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
          "streaming_default_threads"),
         ("materialise (`pyscx.from_anndata`)",
@@ -1303,11 +2114,6 @@ def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, m
 #: point of the guard is that suppressing a floor is a decision someone made
 #: on purpose, so each one is written down.
 _DELIBERATE_WHOLE_TRIPLE_SUPPRESSIONS: dict[tuple[str, str, str], str] = {
-    ("accel_leiden", "accel_leiden__pyscx_gpu", "pbmc3k"): (
-        "cuGraph Leiden diverges from leidenalg on real graphs — documented in "
-        "CLAUDE.md's Known Limitations. Both the ARI floor and the timing row "
-        "are downstream of the same divergence, so the whole triple is the unit."
-    ),
     ("accel_hvg", "accel_hvg__pyscx_cpu", "pbmc3k"): (
         "hvg_overlap_vs_scanpy is a deterministic 0.9891 against a 0.99 floor on "
         "the 2700-cell fixture — a borderline tie-break miss, and the only floor "

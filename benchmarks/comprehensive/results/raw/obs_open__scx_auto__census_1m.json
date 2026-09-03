@@ -3,15 +3,15 @@
   "benchmark": "obs_open",
   "format": "scx_auto",
   "dataset": "census_1m",
-  "timestamp": "2026-08-22T01:45:13",
+  "timestamp": "2026-09-03T02:24:46",
   "system": {
-    "hostname": "CPUDFE024",
-    "os": "Linux 5.15.0-176-generic",
+    "hostname": "GPU1142",
+    "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
-    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
     "cpu_cores_physical": 192,
-    "ram_gb": 2016,
+    "ram_gb": 2015,
     "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "library_versions": {
       "anndata": "0.12.10",
@@ -31,22 +31,23 @@
       "leidenalg": "0.11.0",
       "igraph": "1.0.0",
       "psutil": "7.2.2",
-      "pyscx": "0.14.0"
+      "pyscx": "0.16.0"
     },
     "storage": {
       "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
       "scratch_fstype": "wekafs",
-      "has_nvme": false
+      "has_nvme": true
     },
     "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M0MAAAEGSFG91GKRKB61KS7G",
-      "git_sha": "f1515c6a5ba9e4a585cffcf0289e1a96a2fb696c",
-      "git_branch": "org-phase5c-index-pass",
+      "run_id": "01M1K68BXC0K14360N964CMM0D",
+      "git_sha": "3ed7861ff3393c9a7983f6d2f56926c1c5aa6db2",
+      "git_branch": "pr03-baseline-recapture",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.14.0-25-gf1515c6a",
+      "git_describe": "pyscx-v0.16.0-20-g3ed7861f-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,248 +57,248 @@
   },
   "runs": [
     {
-      "wall_s": 0.8511135652661324,
+      "wall_s": 0.694985579000786,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1964.63671875,
+      "peak_rss_mb": 1573.76953125,
       "extra": {
         "scenario": "open_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_1file": 0.8511,
-        "obs_open_s_per_file__open_1file": 0.85111,
-        "obs_open_rss_mb__open_1file": 1964.6
+        "obs_open_s__open_1file": 0.695,
+        "obs_open_s_per_file__open_1file": 0.69499,
+        "obs_open_rss_mb__open_1file": 1573.8
       }
     },
     {
-      "wall_s": 0.7202896755188704,
+      "wall_s": 0.640043689054437,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1934.53515625,
+      "peak_rss_mb": 1566.8984375,
       "extra": {
         "scenario": "open_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_1file": 0.7203,
-        "obs_open_s_per_file__open_1file": 0.72029,
-        "obs_open_rss_mb__open_1file": 1934.5
+        "obs_open_s__open_1file": 0.64,
+        "obs_open_s_per_file__open_1file": 0.64004,
+        "obs_open_rss_mb__open_1file": 1566.9
       }
     },
     {
-      "wall_s": 0.743081109598279,
+      "wall_s": 0.6451509279431775,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1933.1328125,
+      "peak_rss_mb": 1574.98046875,
       "extra": {
         "scenario": "open_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_1file": 0.7431,
-        "obs_open_s_per_file__open_1file": 0.74308,
-        "obs_open_rss_mb__open_1file": 1933.1
+        "obs_open_s__open_1file": 0.6452,
+        "obs_open_s_per_file__open_1file": 0.64515,
+        "obs_open_rss_mb__open_1file": 1575.0
       }
     },
     {
-      "wall_s": 0.00019004568457603455,
+      "wall_s": 0.000271343975327909,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 470.6796875,
+      "peak_rss_mb": 365.87109375,
       "extra": {
         "scenario": "open_only",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only": 0.0002,
-        "obs_open_s_per_file__open_only": 0.00019,
-        "obs_open_rss_mb__open_only": 470.7
+        "obs_open_s__open_only": 0.0003,
+        "obs_open_s_per_file__open_only": 0.00027,
+        "obs_open_rss_mb__open_only": 365.9
       }
     },
     {
-      "wall_s": 0.0001731235533952713,
+      "wall_s": 0.00027287204284220934,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 470.6796875,
+      "peak_rss_mb": 365.87109375,
       "extra": {
         "scenario": "open_only",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only": 0.0002,
-        "obs_open_s_per_file__open_only": 0.00017,
-        "obs_open_rss_mb__open_only": 470.7
+        "obs_open_s__open_only": 0.0003,
+        "obs_open_s_per_file__open_only": 0.00027,
+        "obs_open_rss_mb__open_only": 365.9
       }
     },
     {
-      "wall_s": 0.00017600692808628082,
+      "wall_s": 0.00026678701397031546,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 470.6796875,
+      "peak_rss_mb": 365.87109375,
       "extra": {
         "scenario": "open_only",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only": 0.0002,
-        "obs_open_s_per_file__open_only": 0.00018,
-        "obs_open_rss_mb__open_only": 470.7
+        "obs_open_s__open_only": 0.0003,
+        "obs_open_s_per_file__open_only": 0.00027,
+        "obs_open_rss_mb__open_only": 365.9
       }
     },
     {
-      "wall_s": 0.5991206765174866,
+      "wall_s": 0.490377068053931,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1613.82421875,
+      "peak_rss_mb": 1525.59765625,
       "extra": {
         "scenario": "obs_codes_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_1file": 0.5991,
-        "obs_open_s_per_file__obs_codes_1file": 0.59912,
-        "obs_open_rss_mb__obs_codes_1file": 1613.8
+        "obs_open_s__obs_codes_1file": 0.4904,
+        "obs_open_s_per_file__obs_codes_1file": 0.49038,
+        "obs_open_rss_mb__obs_codes_1file": 1525.6
       }
     },
     {
-      "wall_s": 0.5858451426029205,
+      "wall_s": 0.5116643130313605,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1616.69921875,
+      "peak_rss_mb": 1525.91015625,
       "extra": {
         "scenario": "obs_codes_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_1file": 0.5858,
-        "obs_open_s_per_file__obs_codes_1file": 0.58585,
-        "obs_open_rss_mb__obs_codes_1file": 1616.7
+        "obs_open_s__obs_codes_1file": 0.5117,
+        "obs_open_s_per_file__obs_codes_1file": 0.51166,
+        "obs_open_rss_mb__obs_codes_1file": 1525.9
       }
     },
     {
-      "wall_s": 0.5885562561452389,
+      "wall_s": 0.4863302659941837,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1616.69921875,
+      "peak_rss_mb": 1524.17578125,
       "extra": {
         "scenario": "obs_codes_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_1file": 0.5886,
-        "obs_open_s_per_file__obs_codes_1file": 0.58856,
-        "obs_open_rss_mb__obs_codes_1file": 1616.7
+        "obs_open_s__obs_codes_1file": 0.4863,
+        "obs_open_s_per_file__obs_codes_1file": 0.48633,
+        "obs_open_rss_mb__obs_codes_1file": 1524.2
       }
     },
     {
-      "wall_s": 0.5751524865627289,
+      "wall_s": 0.484193807002157,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1632.89453125,
+      "peak_rss_mb": 1536.484375,
       "extra": {
         "scenario": "obs_codes_many_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_many_1file": 0.5752,
-        "obs_open_s_per_file__obs_codes_many_1file": 0.57515,
-        "obs_open_rss_mb__obs_codes_many_1file": 1632.9
+        "obs_open_s__obs_codes_many_1file": 0.4842,
+        "obs_open_s_per_file__obs_codes_many_1file": 0.48419,
+        "obs_open_rss_mb__obs_codes_many_1file": 1536.5
       }
     },
     {
-      "wall_s": 0.581695768982172,
+      "wall_s": 0.494025720981881,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1581.90625,
+      "peak_rss_mb": 1540.92578125,
       "extra": {
         "scenario": "obs_codes_many_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_many_1file": 0.5817,
-        "obs_open_s_per_file__obs_codes_many_1file": 0.5817,
-        "obs_open_rss_mb__obs_codes_many_1file": 1581.9
+        "obs_open_s__obs_codes_many_1file": 0.494,
+        "obs_open_s_per_file__obs_codes_many_1file": 0.49403,
+        "obs_open_rss_mb__obs_codes_many_1file": 1540.9
       }
     },
     {
-      "wall_s": 0.5803613290190697,
+      "wall_s": 0.5050794680137187,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1616.8984375,
+      "peak_rss_mb": 1544.921875,
       "extra": {
         "scenario": "obs_codes_many_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_many_1file": 0.5804,
-        "obs_open_s_per_file__obs_codes_many_1file": 0.58036,
-        "obs_open_rss_mb__obs_codes_many_1file": 1616.9
+        "obs_open_s__obs_codes_many_1file": 0.5051,
+        "obs_open_s_per_file__obs_codes_many_1file": 0.50508,
+        "obs_open_rss_mb__obs_codes_many_1file": 1544.9
       }
     },
     {
-      "wall_s": 0.0001714564859867096,
+      "wall_s": 0.00025253300555050373,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 474.2421875,
+      "peak_rss_mb": 402.078125,
       "extra": {
         "scenario": "open_only_unverified",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only_unverified": 0.0002,
-        "obs_open_s_per_file__open_only_unverified": 0.00017,
-        "obs_open_rss_mb__open_only_unverified": 474.2
+        "obs_open_s__open_only_unverified": 0.0003,
+        "obs_open_s_per_file__open_only_unverified": 0.00025,
+        "obs_open_rss_mb__open_only_unverified": 402.1
       }
     },
     {
-      "wall_s": 0.00016984716057777405,
+      "wall_s": 0.00026968889869749546,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 474.2421875,
+      "peak_rss_mb": 402.078125,
       "extra": {
         "scenario": "open_only_unverified",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only_unverified": 0.0002,
-        "obs_open_s_per_file__open_only_unverified": 0.00017,
-        "obs_open_rss_mb__open_only_unverified": 474.2
+        "obs_open_s__open_only_unverified": 0.0003,
+        "obs_open_s_per_file__open_only_unverified": 0.00027,
+        "obs_open_rss_mb__open_only_unverified": 402.1
       }
     },
     {
-      "wall_s": 0.00016143172979354858,
+      "wall_s": 0.0002636039862409234,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 474.2421875,
+      "peak_rss_mb": 402.078125,
       "extra": {
         "scenario": "open_only_unverified",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only_unverified": 0.0002,
-        "obs_open_s_per_file__open_only_unverified": 0.00016,
-        "obs_open_rss_mb__open_only_unverified": 474.2
+        "obs_open_s__open_only_unverified": 0.0003,
+        "obs_open_s_per_file__open_only_unverified": 0.00026,
+        "obs_open_rss_mb__open_only_unverified": 402.1
       }
     }
   ],
-  "median_wall_s": 0.5803613290190697,
-  "wall_s_iqr": 0.5989475529640913,
+  "median_wall_s": 0.4863302659941837,
+  "wall_s_iqr": 0.511394624132663,
   "n_runs": 15,
   "file_size_bytes": 2800057397,
   "metadata": {
@@ -306,44 +307,44 @@
     "scenario_summary": {
       "open_1file": {
         "n_runs": 3,
-        "median_obs_open_s": 0.7431,
-        "median_obs_open_s_per_file": 0.74308,
-        "median_obs_open_rss_mb": 1934.5
+        "median_obs_open_s": 0.6452,
+        "median_obs_open_s_per_file": 0.64515,
+        "median_obs_open_rss_mb": 1573.8
       },
       "open_only": {
         "n_runs": 3,
-        "median_obs_open_s": 0.0002,
-        "median_obs_open_s_per_file": 0.00018,
-        "median_obs_open_rss_mb": 470.7
+        "median_obs_open_s": 0.0003,
+        "median_obs_open_s_per_file": 0.00027,
+        "median_obs_open_rss_mb": 365.9
       },
       "obs_codes_1file": {
         "n_runs": 3,
-        "median_obs_open_s": 0.5886,
-        "median_obs_open_s_per_file": 0.58856,
-        "median_obs_open_rss_mb": 1616.7
+        "median_obs_open_s": 0.4904,
+        "median_obs_open_s_per_file": 0.49038,
+        "median_obs_open_rss_mb": 1525.6
       },
       "obs_codes_many_1file": {
         "n_runs": 3,
-        "median_obs_open_s": 0.5804,
-        "median_obs_open_s_per_file": 0.58036,
-        "median_obs_open_rss_mb": 1616.9
+        "median_obs_open_s": 0.494,
+        "median_obs_open_s_per_file": 0.49403,
+        "median_obs_open_rss_mb": 1540.9
       },
       "open_only_unverified": {
         "n_runs": 3,
-        "median_obs_open_s": 0.0002,
-        "median_obs_open_s_per_file": 0.00017,
-        "median_obs_open_rss_mb": 474.2
+        "median_obs_open_s": 0.0003,
+        "median_obs_open_s_per_file": 0.00026,
+        "median_obs_open_rss_mb": 402.1
       }
     },
     "open_cost_breakdown": {
-      "obs_read_s_per_file": 0.7429,
+      "obs_read_s_per_file": 0.64488,
       "catalog_verify_s_per_file": 1e-05,
-      "open_minus_verify_s_per_file": 0.00017
+      "open_minus_verify_s_per_file": 0.00026
     },
     "obs_codes_vs_read_obs": {
-      "read_obs_s_per_file": 0.74308,
-      "obs_categorical_s_per_file": 0.58856,
-      "speedup": 1.263
+      "read_obs_s_per_file": 0.64515,
+      "obs_categorical_s_per_file": 0.49038,
+      "speedup": 1.316
     }
   }
 }

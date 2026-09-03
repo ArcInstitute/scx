@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from benchmarks.comprehensive.runners.base import (
+    probe_optional,
     ConvertResult,
     FormatRunner,
     TimingResult,
@@ -23,19 +24,16 @@ from benchmarks.comprehensive.runners.base import (
 if TYPE_CHECKING:
     from benchmarks.comprehensive.queries import Predicate
 
-try:
-    import slaf  # noqa: F401
-    from slaf import SLAFArray
-
-    _HAS_SLAF = True
-except ImportError:
-    _HAS_SLAF = False
-
-
-_MISSING_MSG = (
-    "slafdb is not installed. Create the SLAF env with: "
-    "conda env create -f benchmarks/comprehensive/envs/scx-bench-slaf.yml"
+_HAS_SLAF, _MISSING_MSG = probe_optional(
+    "slaf", "slaf:SLAFArray",
+    install_hint=(
+        "Create the SLAF env with: conda env create -f "
+        "benchmarks/comprehensive/envs/scx-bench-slaf.yml"
+    ),
 )
+if _HAS_SLAF:
+    import slaf  # noqa: F401
+    from slaf import SLAFArray  # noqa: F401
 
 
 class SlafRunner(FormatRunner):

@@ -136,6 +136,17 @@ def smoke_test_runner(runner, h5ad_path: Path, tmp_dir: Path) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Smoke test benchmark runners")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument(
+        "--formats", nargs="+", default=None, metavar="KEY",
+        help=(
+            "Only smoke the runners with these format keys. Without it every "
+            "runner whose dependencies import is tested, which is the wrong "
+            "set for a pre-submit check: a run that schedules none of the "
+            "ADDITIONAL_FORMATS is still blocked when one of their runners "
+            "breaks. Keys that match no runner are an error, not a silent "
+            "no-op."
+        ),
+    )
     args = parser.parse_args()
 
     h5ad_path = args.data_dir / "pbmc3k.h5ad"
@@ -204,6 +215,28 @@ def main() -> None:
         runners.append(runner)
     except ImportError as exc:
         print(f"SKIP CellStream runner: {exc}")
+
+    if args.formats is not None:
+        wanted = set(args.formats)
+        available = {r.key for r in runners}
+        selected = [r for r in runners if r.key in wanted]
+        dropped = sorted(available - wanted)
+        # A key that matches nothing is a mistake worth failing on: the caller
+        # believes it asked for coverage it is not getting, and an empty smoke
+        # that exits 0 is the same "green over nothing measured" shape this
+        # suite has been bitten by elsewhere. Keys with no runner at all
+        # (accel_*, multimodal) are normal and not reported as unmatched — the
+        # caller passes the whole scheduled list and expects the intersection.
+        if not selected:
+            print(
+                f"ERROR: --formats {sorted(wanted)} matched none of the "
+                f"{len(runners)} available runners ({sorted(available)}). "
+                f"Refusing to report a pass over nothing."
+            )
+            sys.exit(1)
+        if dropped:
+            print(f"Not scheduled by this run, skipping: {dropped}")
+        runners = selected
 
     print(f"\nRunning smoke tests on {h5ad_path} ({len(runners)} runners)\n")
 

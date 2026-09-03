@@ -1295,11 +1295,32 @@ absolute_floors:
   #
   # scx_fast (decode-speed-max; the pre-flip `auto` heuristic) — carries
   # the decode-max throughput floors across all measured tiers.
+  #
+  # `batches_per_sec__raw` RE-DERIVED 2026-09-03 on pbmc3k and
+  # tabula_sapiens_100k. Both were `min: 29.0`, a single value applied to two
+  # datasets, and the Deferred block flagged the whole scx_fast group as
+  # PROVISIONAL — "transplanted from pre-flip numbers … tighten to the captured
+  # medians on the recapture, min = 0.85x the measured min run". Done, with the
+  # per-dataset spread that a shared 29.0 could not express:
+  #
+  #     dataset               runs                          min    0.85x min
+  #     pbmc3k                20.2 21.0 21.1 21.4 22.1     20.2      17.17
+  #     tabula_sapiens_100k   28.4 28.8 29.0               28.4      24.14
+  #
+  # pbmc3k was violating at 21.1 against 29.0 — a 27% shortfall that is not a
+  # regression but a floor borrowed from a different dataset. tabula was
+  # violating by 0.7% (28.8 vs 29.0), i.e. the shared value happened to sit
+  # inside tabula's own noise band, which is why one number for two datasets
+  # read as plausible for as long as it did.
+  #
+  # The other tiers are NOT re-derived here and keep their provisional values;
+  # they pass, and re-deriving a passing floor is the broader Deferred item 5
+  # work (which also wants the missing adaptive `scx_auto` rows authored).
   - benchmark: ml_loader
     format: scx_fast
     dataset: pbmc3k
     metric: batches_per_sec__raw
-    min: 29.0
+    min: 17.17
   - benchmark: ml_loader
     format: scx_fast
     dataset: pbmc3k
@@ -1314,7 +1335,7 @@ absolute_floors:
     format: scx_fast
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__raw
-    min: 29.0
+    min: 24.14
   - benchmark: ml_loader
     format: scx_fast
     dataset: tabula_sapiens_100k
@@ -1517,19 +1538,31 @@ absolute_floors:
     metric: batches_per_sec__pyscx_training_dataset_workers2_persistent
     min: 11.0
 
-  # IndexPlanDataset workers2 floor — same 0.5×-of-post-fix-median
-  # convention as the workers2 entries above.
-  # Calibrated 2026-05-01 from SLURM job 113080 (Lambda HPC, H100, 100k
-  # synthetic fixture): median workers2 throughput 144.64 bps; floor =
-  # 0.5 × 144.64 ≈ 72.3 bps. Workers2 is ~0.36× workers0 (404.4 bps) —
-  # lower than the TrainingDataset workers2 ratio (~0.50×) because each
-  # worker thrashes the shard cache on a non-locality-sorted random
-  # plan stream.
+  # IndexPlanDataset workers2 floor — RE-DERIVED 2026-09-03 from measurement.
+  #
+  # Was `min: 72.3`, "calibrated 2026-05-01 from SLURM job 113080 (Lambda HPC,
+  # H100, 100k **synthetic** fixture): median workers2 throughput 144.64 bps;
+  # floor = 0.5 × 144.64". That anchor never transferred: it was a different
+  # fixture on a different cluster, applied to the real
+  # `tabula_sapiens_100k`. Measured here: **0.66, 0.67 bps** (median 0.665,
+  # 50 batches in 75.2 / 74.7 s) — the floor was 109x above what the metric
+  # reports, so it could never pass and had been a permanent violation for as
+  # long as it has existed.
+  #
+  # This is a correction, not a concession to a regression: the metric did not
+  # get slower. The July 2026 captures have no `workers2` key at all, and the
+  # comparable `..._locality` variant is *faster* now than in July (0.52 ->
+  # 0.72 at tabula). See the locality block below for the same story with
+  # before/after numbers.
+  #
+  # New floor = 0.85 × 0.665 = 0.565. Tighter than the file's older 0.5x
+  # convention because the run-to-run spread is tiny (0.66 / 0.67), and a
+  # gross-regression guard that sits 109x away guards nothing.
   - benchmark: index_plan
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_index_plan_dataset_workers2
-    min: 72.3
+    min: 0.565
 
   # --- correctness validation suite ----------------------------------
   # Hard parity gate: any failure in scanpy-equivalence,
@@ -1843,34 +1876,66 @@ absolute_floors:
   # the sequential pipeline that would otherwise leave index_plan looking
   # healthy.
   #
-  # Smaller-dataset floors derived by scaling: pbmc3k (~3K cells) and
-  # tabula_sapiens_100k (~100K cells) shouldn't see worse cps than the
-  # 1M result × 0.5 safety margin, since smaller fixtures fit in cache
-  # better and don't exercise shard-decode misses.
+  # `..._index_plan_locality` — pbmc3k KEPT, tabula RE-DERIVED 2026-09-03.
+  #
+  # These were "derived by scaling" from a synthetic 1M anchor on the
+  # assumption that "smaller fixtures fit in cache better". The *direction* was
+  # right and the *magnitudes* were not. Measured 2026-09-03:
+  #
+  #     pbmc3k               114.08 bps   (floor 5.0    — passes, kept)
+  #     tabula_sapiens_100k    0.72 bps   (floor 12.0   — 17x above; re-derived)
+  #     census_1m              0.20 bps   (floor 4.9    — 25x above; see below)
+  #
+  # The ordering 114 > 0.72 > 0.20 is exactly "smaller fits better", so the
+  # model was sound; the anchor was not. The synthetic 1M fixture ran 9.81 bps
+  # where the real census_1m runs 0.20 — **49x apart at the same cell count** —
+  # and the census block below already warned "census_1m may use a different
+  # fixture than the synthetic 1M one … drop or re-tune if the dataset mismatch
+  # causes spurious failures". This is that re-tune.
+  #
+  # NOT a regression: `..._locality` at tabula measured 0.520 in three separate
+  # July 2026 snapshots (`baseline_2026_07_10`,
+  # `candidate_auto_converge_20260712`, `candidate_2026_07_23_dataload_phase0`)
+  # and 0.720 today — a 38% improvement. The `..._training_dataset` variant on
+  # the same fixture went 20.825 -> 24.395 and passes its floor.
+  #
+  # pbmc3k's 5.0 is left alone: it is 23x below a stable 114.08, so it is loose,
+  # but it is the one value in this group that was never wrong and re-deriving
+  # it is not this change's business.
   - benchmark: index_plan
     format: scx_auto
     dataset: pbmc3k
     metric: batches_per_sec__pyscx_index_plan_locality
     min: 5.0
+  # 0.85 × 0.720 = 0.612. Spread is 0.72 / 0.72 across both runs.
   - benchmark: index_plan
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_index_plan_locality
-    min: 12.0
+    min: 0.612
   - benchmark: index_plan
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_training_dataset
     min: 23.0
-  # 1M synthetic floors at 0.5x observed median (9.81 / 36.62 → 4.9 / 18.3).
-  # Note: census_1m may use a different fixture than the synthetic 1M one,
-  # so this floor is conservative. Drop or re-tune if the dataset
-  # mismatch causes spurious failures.
+  # Was "1M synthetic floors at 0.5x observed median (9.81 / 36.62 → 4.9 /
+  # 18.3)", with the caveat "census_1m may use a different fixture than the
+  # synthetic 1M one … drop or re-tune if the dataset mismatch causes spurious
+  # failures". It did, and this is the re-tune: measured 0.20 bps (50 batches
+  # in 244.6 s, both runs identical), so the synthetic anchor was 49x optimistic
+  # for the real fixture. New floor = 0.85 × 0.20 = 0.170.
+  #
+  # CAVEAT on precision: the metric is recorded rounded to 2 decimals, so at
+  # 0.20 one tick is 5% of the value and the 15% margin is three ticks. Fine as
+  # a gross-regression guard; do not read it as a 15%-sensitive gate.
+  #
+  # `..._training_dataset` on the same triple measured 21.775 against its 18.3
+  # floor and is left alone — that anchor did transfer.
   - benchmark: index_plan
     format: scx_auto
     dataset: census_1m
     metric: batches_per_sec__pyscx_index_plan_locality
-    min: 4.9
+    min: 0.170
   - benchmark: index_plan
     format: scx_auto
     dataset: census_1m
@@ -2729,11 +2794,13 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: cellsets_per_sec__gather_grouped_s512
     min: 1.19
-  - benchmark: cellset_gather
-    format: scx_auto
-    dataset: tabula_sapiens_100k
-    metric: rank_scaling_efficiency__gather_random_r4
-    min: 0.813
+  # DEFERRED 2026-09-03 — the metric requires an opt-in no capture sets. See
+  # the Deferred block's rank-scaling entry.
+  # - benchmark: cellset_gather
+  #   format: scx_auto
+  #   dataset: tabula_sapiens_100k
+  #   metric: rank_scaling_efficiency__gather_random_r4
+  #   min: 0.813
   - benchmark: cellset_gather
     format: scx_auto
     dataset: census_500k
@@ -2744,11 +2811,13 @@ absolute_floors:
     dataset: census_500k
     metric: cellsets_per_sec__gather_grouped_s512
     min: 7.395
-  - benchmark: cellset_gather
-    format: scx_auto
-    dataset: census_500k
-    metric: rank_scaling_efficiency__gather_random_r4
-    min: 0.852
+  # DEFERRED 2026-09-03 — the metric requires an opt-in no capture sets. See
+  # the Deferred block's rank-scaling entry.
+  # - benchmark: cellset_gather
+  #   format: scx_auto
+  #   dataset: census_500k
+  #   metric: rank_scaling_efficiency__gather_random_r4
+  #   min: 0.852
   - benchmark: cellset_gather
     format: scx_auto
     dataset: census_1m
@@ -2759,11 +2828,13 @@ absolute_floors:
     dataset: census_1m
     metric: cellsets_per_sec__gather_grouped_s512
     min: 5.185
-  - benchmark: cellset_gather
-    format: scx_auto
-    dataset: census_1m
-    metric: rank_scaling_efficiency__gather_random_r4
-    min: 0.86
+  # DEFERRED 2026-09-03 — the metric requires an opt-in no capture sets. See
+  # the Deferred block's rank-scaling entry.
+  # - benchmark: cellset_gather
+  #   format: scx_auto
+  #   dataset: census_1m
+  #   metric: rank_scaling_efficiency__gather_random_r4
+  #   min: 0.86
   - benchmark: obs_open
     format: scx_auto
     dataset: census_500k
@@ -3208,6 +3279,34 @@ absolute_floors:
 #          is the pre-optimization scattered path the rest of this module
 #          already reports as slow.
 #
+#     *** CENSUS IS NOT CAPTURABLE, SO THE PRESCRIBED census_500k ROW IS OUT. ***
+#     Measured 2026-09-03: `cellset_gather/census_500k/scx_auto` was killed at
+#     **205 minutes** (a slope raised to 300 min/M for this very reason) while
+#     still on **run 1 of 3** of the `cache_undersized` scenario, so the real
+#     requirement is some multiple of that. `census_1m/scx_fast` died the same
+#     way at 355 minutes. For scale, the whole tabula_sapiens_100k cell is
+#     **0.5 minutes of measured wall across 21 runs** — a >400x jump for 5x the
+#     data, so the base+slope model in `config.estimate_time_minutes` does not
+#     describe this benchmark at either end.
+#
+#     The collate arm is NOT the cause: `cache_undersized` runs at
+#     `cellset_gather.py:1236` and the collate arm at `:1483`, so the cell died
+#     before collate was reached. `cache_undersized` / `cache_suggested` are
+#     census-only cache-sizing arms and pre-date PR-02c — a July capture of
+#     census_500k completed with all 24 runs including them. Whether that means
+#     the path has since regressed is NOT established: a cohort's SLURM budget
+#     is the max over its benchmarks, so July's elapsed is unknown from the
+#     slope alone. Worth its own investigation; the `cache_undersized` wall at
+#     census is the thing to measure.
+#
+#     So author the collate floors on **tabula_sapiens_100k only**, from the
+#     2026-09-03 capture:
+#         cellsets_per_sec__collate_rust  median 763.70  ->  min: 649.15
+#         us_per_cell__collate            median  20.46  ->  max:  24.14
+#     and leave census deferred on wall-clock grounds rather than on the
+#     "check the wall first" caution above — the wall has now been checked and
+#     it does not fit.
+#
 #     Note the floors are only *reachable* because PR-02c narrowed
 #     `cellset_gather_s512_raises_pooled_rss.md` to
 #     `metrics: [peak_rss_mb_median, median_wall_s]`. Unscoped, that
@@ -3240,13 +3339,36 @@ absolute_floors:
 #     40 batches cannot separate a one-off construction cost from a per-batch
 #     one — the constructor alone was 8.3-8.8 s in that probe.
 #
-#     The mechanism is real and confirmed live, so the small number is a
-#     finding, not a measurement error: a batch's `obs["observation_joinid"]`
-#     arrives as `{codes, categories}` with **957,955 categories**, and
-#     `categories is previous_batch_categories` is False — the list is rebuilt
-#     every batch, uncached, exactly as OPT-LOADER-6 describes. It costs ~8 ns
-#     per category, so ~7.9 ms on a 238 ms batch: **~3% of an epoch, not the
-#     several-fold the review predicted.** Price OPT-LOADER-6 accordingly.
+#     The mechanism is real and confirmed live: a batch's
+#     `obs["observation_joinid"]` arrives as `{codes, categories}` with
+#     **957,955 categories**, and `categories is previous_batch_categories` is
+#     False — the list is rebuilt every batch, uncached, exactly as
+#     OPT-LOADER-6 describes.
+#
+#     *** CORRECTED 2026-09-02, AND THE CONCLUSION REVERSES. ***
+#     Every number above was measured against a DEBUG pyscx `.so`. The in-tree
+#     editable build was a debug artifact from 08-31 until it was rebuilt
+#     `--release` at 12:13 on 09-02; the targeted job that produced them ran at
+#     09:23, before that. `run_parallel` refuses to start on a debug build for
+#     exactly this reason, but a script that calls the benchmark functions
+#     directly bypasses the guard. Re-measured through the real capture
+#     (release, warm, census_1m, 977 batches, 3 runs):
+#
+#       scenario            batches/s     ms/batch
+#       raw (no obs)           51.70        19.34
+#       raw_obs_lowcard        47.40        21.10   ("sex", 3 categories)
+#       raw_obs_highcard       26.80        37.31   (957,955 categories)
+#
+#     The overhead is **16.2 ms/batch**, not 7.9, and the slowdown is
+#     **1.77x**, not 1.033x. On a debug build every path is 4-10x slower, so a
+#     constant per-batch cost is swamped and reads as noise; on release it
+#     dominates. So the earlier "~3% of an epoch, not the several-fold the
+#     review predicted" is wrong in the direction that matters:
+#     **OPT-LOADER-6 is worth ~1.77x on this path**, and the review's estimate
+#     was closer than the correction that replaced it. Price it accordingly.
+#
+#     Take this as a general caution about every measurement in this file that
+#     did not go through `run_parallel`.
 #
 #     The arm honours `cold_cache` (`drop_file_cache` before every timed epoch,
 #     policy recorded as `cache_policy`); it did not at first, so a cold
@@ -3350,12 +3472,66 @@ absolute_floors:
 #     reading 28 obs columns to join is the other 89%. Do not floor it as an
 #     OPT-FORMAT-1 signal.
 #
+#     *** ALL THE CENSUS NUMBERS ABOVE ARE DEBUG-BUILD NUMBERS. ***
+#     Same cause as item 16: the in-tree editable pyscx `.so` was a debug
+#     artifact from 08-31 until it was rebuilt `--release` at 12:13 on 09-02,
+#     and the targeted job that produced them ran at 09:23. Re-measured through
+#     the real capture (release, census_1m, identical work — `rows_imported`
+#     1,000,000, `n_matched` 1,000,000, `obs_rewrite_bytes` 493,330,352,
+#     `size_before_bytes` 2,800,057,397):
+#
+#         metric              debug (09:23)   release (capture)
+#         wall_s__rollback        2.247            1.674
+#         wall_s__delete          1.727            1.701
+#         wall_s__obs_import     19.72             4.33
+#
+#     `rollback` and `delete` barely move — they are dominated by a BLAKE3
+#     stream and an fsync, which a debug build does not slow down. `obs_import`
+#     is 4.5x faster, because its other 89% *is* interpreted work.
+#
+#     Which changes the split this entry reports: the rehash is now ~1.67 s of
+#     4.33 s, i.e. **~39%**, not ~11%. The ordering conclusion survives —
+#     `rollback` is still the cleanest OPT-FORMAT-1 instrument, being
+#     essentially all checksum — but `obs_import` is not the 89%-elsewhere
+#     signal this entry described.
+#
 #     ACTIVATION: floor `wall_s__rollback` on census_1m at 1.25x its median
-#     (2.247 s -> max ~2.81). `wall_s__delete` is a usable second. Expect both
-#     to drop to near zero when OPT-FORMAT-1 lands — that is the point, so
-#     re-baseline in the same change rather than treating it as a failure.
-#     `wall_s__obs_import` is still worth a (looser) ceiling, but as a guard on
-#     the obs-rewrite path, not the checksum.
+#     from the release capture (1.674 s -> max ~2.09; NOT the 2.81 derived from
+#     the debug number, which would be 68% slack). `wall_s__delete` is a usable
+#     second. Expect both to drop to near zero when OPT-FORMAT-1 lands — that
+#     is the point, so re-baseline in the same change rather than treating it
+#     as a failure. `wall_s__obs_import` is still worth a (looser) ceiling, but
+#     as a guard on the obs-rewrite path, not the checksum.
+#
+# 20. cellset_gather rank-scaling floors need an opt-in no capture sets
+#    `rank_scaling_efficiency__gather_random_r4` is emitted only when the
+#    multi-rank arm is enabled, which `multirank.resolve_n_ranks` gates on
+#    `SCX_BENCH_N_RANKS` (default 1). No capture entry point exports it, so the
+#    arm has never run in a capture and the three floors below sat on a metric
+#    no snapshot carries:
+#
+#      cellset_gather / scx_auto / tabula_sapiens_100k   >= 0.813
+#      cellset_gather / scx_auto / census_500k           >= 0.852
+#      cellset_gather / scx_auto / census_1m             >= 0.86
+#
+#    Only the tabula one ever *showed* as violated. The two census triples are
+#    hidden by a different problem — `cellset_gather` at census scale does not
+#    fit any practical time budget (item 15), so those triples produce no rows
+#    at all and `check_absolute_floors` skips them silently. Same missing
+#    opt-in, one visible symptom out of three: a floor is only as visible as
+#    the triple under it.
+#
+#    Commented out above rather than deleted, so re-enabling is a one-line
+#    change once a capture emits the metric. `slurm_capture_baseline.sh` now
+#    documents `SCX_BENCH_N_RANKS` as an opt-in and why it is not on by default
+#    (the arm runs the gather at 1 rank AND at N, so it multiplies the cost of
+#    a benchmark that is already the most expensive one at census).
+#
+#    ACTIVATION: run a capture with `SCX_BENCH_N_RANKS=4` — tabula only is
+#    enough and is cheap (its whole `cellset_gather` cell is 0.5 min of
+#    measured wall) — then re-enable the tabula row against the measured
+#    median. Leave the census two commented until item 15's wall problem is
+#    solved; they cannot be captured either way.
 #
 # 19. cloud_metadata / `scx info <cloud-url>` — OPT-CLOUD-1
 #     A subprocess arm, added in PR-02c: `scx info --json <gs://…>`. Not a
@@ -3363,8 +3539,19 @@ absolute_floors:
 #     two columns the library open does not (the per-shard codec breakdown and
 #     the value-encoding summary) by range-reading every CSR shard's 76-byte
 #     header at `METADATA_SHARD_FETCH_CONCURRENCY = 8`. That constant is what
-#     OPT-CLOUD-1 raises, and only this arm moves when it does (~175 s -> ~22 s
-#     expected on the largest fixture).
+#     OPT-CLOUD-1 raises, and only this arm moves when it does.
+#
+#     *** THE "~175 s -> ~22 s expected" FIGURE THIS ENTRY CARRIED IS WRONG. ***
+#     Measured through the capture on the tier fixtures, `wall_s__scx_info_cloud`
+#     medians are **0.21 s (pbmc3k / pbmc10k), 0.23 (smartseq2), 0.24 (tabula),
+#     0.41 (census_500k), 0.62 (census_1m)** — three orders off. Whatever the
+#     175 s described, it was not `scx info` over these fixtures. Two
+#     consequences: OPT-CLOUD-1's expected win here is a fraction of a second,
+#     not minutes, so it should not be justified on this arm; and the metric is
+#     close to the "do not floor a quantity smaller than its own noise" rule —
+#     census_1m ranges 0.587 / 0.622 / 1.506 across three runs, a 2.4x spread
+#     on a sub-second number. Floor it if you like, but expect the ceiling to
+#     be doing very little.
 #
 #     ACTIVATION, and the ORDER matters:
 #       1. `scx_info_cloud_ok` -> min: 1.0 can be authored FIRST and needs no

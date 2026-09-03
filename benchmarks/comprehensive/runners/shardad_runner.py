@@ -26,24 +26,22 @@ import numpy as np
 import scipy.sparse as sp
 
 from benchmarks.comprehensive.runners.base import (
+    probe_optional,
     ConvertResult,
     FormatRunner,
     TimingResult,
 )
 
-try:
-    import shardad  # noqa: F401
-    from shardad import ShardedArchive, write_sharded
-
-    _HAS_SHARDAD = True
-except ImportError:
-    _HAS_SHARDAD = False
-
-
-_MISSING_MSG = (
-    "shardad is not installed in this env. Install it into scx-bench with: "
-    "conda activate scx-bench && pip install ~/dev/python/shardad"
+_HAS_SHARDAD, _MISSING_MSG = probe_optional(
+    "shardad", "shardad:ShardedArchive", "shardad:write_sharded",
+    install_hint=(
+        "Install it into scx-bench with: conda activate scx-bench && "
+        "pip install ~/dev/python/shardad"
+    ),
 )
+if _HAS_SHARDAD:
+    import shardad  # noqa: F401
+    from shardad import ShardedArchive, write_sharded  # noqa: F401
 
 
 def _workers() -> int:

@@ -128,16 +128,33 @@ median of 3 paired runs on a 16-core Lambda `standard` node):
 
 | Path | Median wall | Median peak RSS |
 |---|---:|---:|
-| streaming (`pyscx.from_h5ad`), `reader_threads=4`   |  25.37 s | **2 342 MB** |
-| streaming, default parallelism (16 readers)         |  17.24 s |   5 893 MB |
-| materialise (`pyscx.from_anndata`)                  |  35.62 s |  26 919 MB |
+| streaming (`pyscx.from_h5ad`), `reader_threads=4`   |  26.31 s | **2 401 MB** |
+| streaming, default parallelism                      |  15.90 s |  10 352 MB |
+| materialise (`pyscx.from_anndata`)                  |  30.57 s |  32 120 MB |
 
-Re-measured 2026-08-22 (job **2834737**, median of 3 runs per arm, 16-core node);
+Re-measured 2026-09-03 (the `v0.16.0-opt-instruments` capture, median of 3 runs
+per arm);
 every figure is the median from the tracked JSON cited below. Streaming uses
 ~11× less peak RSS than materialising at the pinned thread count, and is *faster*
 as well — the earlier table recorded the sequential-era 98.2 s. Both paths emit
 byte-equivalent SCX (identical n_obs / n_vars / nnz / 62-shard catalog).
 
+> **The default-parallelism arm's peak RSS moved, and it is not explained.**
+> It reads 10 352 MB here against 5 893 MB in the 2026-08-22 capture, a +76%
+> change while its wall *improved* (17.24 s → 15.90 s) — the shape of a
+> parallelism change rather than a leak. Two cautions for whoever chases it.
+> The arm records `reader_threads: None` and never stores the **resolved**
+> count, so the earlier "(16 readers)" label in this table was an inference
+> about that capture's node rather than a recorded fact, and has been dropped;
+> the resolved value is `RAYON_NUM_THREADS` or `available_parallelism()`, which
+> follows the cgroup, so it is per-allocation. And do **not** compare against
+> `baselines/v0.14.0-phase5c-streaming-floors`'s `summary.json`: its 5 893 is
+> `peak_rss_mb_median` pooled over all nine runs of the three arms, and with
+> three equal-sized arms the pooled median is arithmetically the middle arm's,
+> so it coincides with the default-threads figure and invites the comparison it
+> cannot support. The floored arm (`reader_threads=4`) is stable across the two
+> captures — 2 342 → 2 401 MB — so no floor catches this.
+>
 > **RSS is quoted in MB, deliberately.** An earlier version of this table gave GB
 > figures computed as `MB / 1000` — so 5 893 MB was published as "5.79 GB" (it is
 > 5.75 GiB), 26 919 MB as "26.9 GB" (26.29 GiB), and export's 13 988 MB as
@@ -183,13 +200,13 @@ across the whole range. Materialise scales sub-linearly (1.69× peak
 at 32 threads, efficiency 5 %) because the upstream
 `anndata.read_h5ad` is single-threaded HDF5 and the rayon-parallel
 encode pool runs into Amdahl's law on top of that. Materialise peak
-RSS is thread-independent — measured 26 919 MB in 2026-08-22's re-capture; the
+RSS is thread-independent — measured 32 120 MB in the 2026-09-03 capture; the
 ~13.6 GB this line used to quote came from the pre-`PeakRssSampler` metric and
 was roughly the *residual* after the call, not the peak during it.
 
 **Crossover regime**: streaming now wins on wall *and* memory at census_1m
-(25.37 s / 2 342 MB pinned, 17.24 s / 5 893 MB at default parallelism, against
-35.62 s / 26 919 MB) — the parallel reader closed the wall gap the sequential-era
+(26.31 s / 2 401 MB pinned, 15.90 s / 10 352 MB at default parallelism, against
+30.57 s / 32 120 MB) — the parallel reader closed the wall gap the sequential-era
 table above records. Materialise remains viable only while the in-memory CSR
 triplet fits: census_1m's is ~27 GB resident at peak, and `census_5m` /
 `census_10m` push it past most workstation memory outright. Streaming also fits the
@@ -204,19 +221,25 @@ Source data (tracked, per
 `benchmarks/comprehensive/results/baselines/v0.14.0-phase5c-streaming-floors/`
 carries the aggregate `summary.json` (which medians all nine runs into one figure
 and therefore cannot back a per-arm claim), plus `environment.json`,
-`MANIFEST.sha256` and the fingerprint summary. It is **not** `LATEST` — that stays
-on `v0.11.2-multimodal-loader-fix`, the canonical full-tier baseline. SLURM job
-2834737, `git_sha f1515c6a`. The absolute
+`MANIFEST.sha256` and the fingerprint summary. `LATEST` is now
+`v0.16.0-opt-instruments` (1833 rows / 52 benchmark families, captured
+2026-09-03 at `git_sha cafeb2ce`, threads unpinned), which is where the figures
+above come from. The absolute
 floor is `streaming_peak_rss_mb max: 4096` on `census_1m`, declared in
 `benchmarks/comprehensive/thresholds.yaml`, and it is measured on the
 `reader_threads=4` arm — see the note above on why the gated arm is pinned.
 
-> `git_dirty` is `true` on that capture, which
+> `git_dirty` is `true` on the 2026-09-03 capture too, which
 > [docs/benchmark_manifest.md](benchmark_manifest.md#for-readmedocs-authors)
-> permits when the dirtiness is documented: the working tree carried only
-> untracked scratch markdown and the gate driver script
-> (`benchmarks/scripts/_run_phase6_gate.sh`), neither of which is compiled or
-> imported. Every tracked file was at `f1515c6a`.
+> permits when the dirtiness is documented — and here it is structural rather
+> than incidental. The four `results/raw/*.json` files that back the numbers
+> above are git-tracked (force-added past `.gitignore`, so that a fresh
+> checkout can audit the claims), and a capture **overwrites them**. So any
+> capture that produces these figures dirties its own tree by producing them,
+> and stamps its own baseline "will not be reproducible". Nothing else was
+> modified: the tracked tree was otherwise at `cafeb2ce`. Worth fixing in the
+> manifest design — a results file that is both an input to the audit and an
+> output of the run cannot be clean — but not by weakening the audit.
 
 ### Streaming export (SCX → h5ad / h5mu)
 
@@ -259,9 +282,12 @@ The streaming row's `streaming_peak_rss_mb` is gated on `census_1m` in
 `scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor without
 needing a wall-clock signal.
 
-Measured 2026-08-22 (job **2834737**, median of 3, census_1m → h5ad):
-**3 162 MB** peak at `reader_threads=4`, 5 622 MB at the default 16, against
-**14 037 MB** for `stream=False`. The materialise arm calls
+Measured 2026-09-03 (the `v0.16.0-opt-instruments` capture, median of 3,
+census_1m → h5ad): **3 165 MB** peak at `reader_threads=4`, against
+**15 596 MB** for `stream=False`. The `_full` fixture arm — the same export
+with a `.raw`, `obsm` and an extra layer, which is what OPT-CONVERT-1 / -4 and
+OPT-OPS-3 actually move — costs **20 198 MB**, and is the reason that fixture
+was built. The materialise arm calls
 `read_all_csr_shards_filtered()` and holds the whole CSR triplet, so the ~4.4×
 separation at the pinned thread count is the contract working. Before the harness
 was fixed that arm reported 913 MB — under-stated by 15×, which made the two arms

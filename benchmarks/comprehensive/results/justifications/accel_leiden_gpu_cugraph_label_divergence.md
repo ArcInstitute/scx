@@ -1,4 +1,16 @@
 ---
+# Scoped, because this file explains exactly one quantity. Unscoped it also
+# suppressed `leiden_route_gpu_correct min: 1.0` on pbmc3k — a route assertion
+# whose entire purpose is to turn a silent GPU->CPU dispatch fallback into a
+# hard gate failure. A label-divergence justification has nothing to say about
+# whether the GPU route was taken at all: if Leiden quietly stopped reaching
+# the GPU, ARI against leidenalg would *improve* (the CPU path holds 0.81-0.97)
+# and the route floor was the only thing that would have noticed.
+#
+# `median_wall_s` and `peak_rss_mb_median` are deliberately NOT in the scope
+# either: a partition that differs in labels does not differ in cost, so a
+# timing move on these triples is not explained by anything written below.
+metrics: [ari_vs_leidenalg]
 triples:
   - benchmark: accel_leiden
     format: accel_leiden__pyscx_gpu
@@ -38,4 +50,11 @@ reason: >
   0.85 floor stays in place. Suppressing rather than removing the
   GPU floor preserves the assertion for when cuGraph Leiden converges
   back toward leidenalg parity.
+# Dated, unlike the permanent limitation it cites, because the thing worth
+# rechecking is not the limitation but the *convergence*: this file exists so
+# the floor comes back when cuGraph Leiden approaches leidenalg again, and a
+# suppression with no date is one nobody ever rechecks. Re-measure ARI on
+# pbmc3k against whatever cuGraph the GPU env then carries; if it still reads
+# ~0.04, renew with the new version recorded.
+expires: 2027-06-30
 ---

@@ -19,24 +19,22 @@ from pathlib import Path
 import numpy as np
 
 from benchmarks.comprehensive.runners.base import (
+    probe_optional,
     ConvertResult,
     FormatRunner,
     TimingResult,
 )
 
-try:
-    import annbatch  # noqa: F401
-    from annbatch import DatasetCollection, Loader
-
-    _HAS_ANNBATCH = True
-except ImportError:
-    _HAS_ANNBATCH = False
-
-
-_MISSING_MSG = (
-    "annbatch is not installed in this env. Install it into scx-bench with: "
-    "conda activate scx-bench && pip install 'annbatch[zarrs]'"
+_HAS_ANNBATCH, _MISSING_MSG = probe_optional(
+    "annbatch", "annbatch:DatasetCollection", "annbatch:Loader",
+    install_hint=(
+        "Install it into scx-bench with: conda activate scx-bench && "
+        "pip install 'annbatch[zarrs]'"
+    ),
 )
+if _HAS_ANNBATCH:
+    import annbatch  # noqa: F401
+    from annbatch import DatasetCollection, Loader  # noqa: F401
 
 # annbatch pre-shuffle knobs (report §3 / §P1.1). `dataset_size` bounds the
 # in-memory shuffle buffer; `shuffle_chunk_size` is the contiguous-block

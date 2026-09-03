@@ -50,8 +50,18 @@ from typing import Any
 import numpy as np
 
 # Reuse the sidecar-fixture prep from the device-decode route benchmark.
+# `ARMS[_SCX1_ARM_KEY]` is imported alongside it because `_prepare_sidecar_scx`
+# takes the arm as its third argument — the parameter was added when that
+# benchmark grew its shufdelta arms, and this cross-module call site was not
+# updated, so every `scx_devdecode_rapids_gpu` cell has raised
+# `TypeError: _prepare_sidecar_scx() missing 1 required positional argument:
+# 'arm'` since. Six cells in the 2026-09-02 capture; nothing covered the call.
 from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import (
+    ARMS as _TO_GPU_ARMS,
     _prepare_sidecar_scx,
+)
+from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import (
+    _VARIANT_KEY as _SCX1_ARM_KEY,
 )
 from benchmarks.comprehensive.benchmarks.accel_umap import _trustworthiness
 from benchmarks.comprehensive.config import (
@@ -288,7 +298,12 @@ def run(
         n_shards: int | None = None
         if key == _SCX_DEVDECODE_KEY:
             try:
-                scx_path, n_obs, n_shards = _prepare_sidecar_scx(dataset, tmpdir)
+                # The Scx1 arm: this benchmark wants the decode-sidecar path,
+                # which explicit Scx1 pins (`auto` would pick Zstd on a
+                # median-nonzero > 8 fixture and silently drop the sidecar).
+                scx_path, n_obs, n_shards = _prepare_sidecar_scx(
+                    dataset, tmpdir, _TO_GPU_ARMS[_SCX1_ARM_KEY]
+                )
             except subprocess.CalledProcessError as exc:
                 stderr = (exc.stderr or b"").decode("utf-8", "replace")[-400:]
                 logger.warning("sidecar fixture prep failed for %s: %s", dataset.name, stderr)

@@ -3,15 +3,15 @@
   "benchmark": "obs_open",
   "format": "h5ad_none",
   "dataset": "census_1m",
-  "timestamp": "2026-08-22T01:45:09",
+  "timestamp": "2026-09-03T01:58:10",
   "system": {
-    "hostname": "CPUDFE024",
-    "os": "Linux 5.15.0-176-generic",
+    "hostname": "GPU71FM",
+    "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
-    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
     "cpu_cores_physical": 192,
-    "ram_gb": 2016,
+    "ram_gb": 1007,
     "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "library_versions": {
       "anndata": "0.12.10",
@@ -31,22 +31,23 @@
       "leidenalg": "0.11.0",
       "igraph": "1.0.0",
       "psutil": "7.2.2",
-      "pyscx": "0.14.0"
+      "pyscx": "0.16.0"
     },
     "storage": {
       "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
       "scratch_fstype": "wekafs",
-      "has_nvme": false
+      "has_nvme": true
     },
     "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M0MAAAEGSFG91GKRKB61KS7G",
-      "git_sha": "f1515c6a5ba9e4a585cffcf0289e1a96a2fb696c",
-      "git_branch": "org-phase5c-index-pass",
-      "git_dirty": true,
-      "git_describe": "pyscx-v0.14.0-25-gf1515c6a",
+      "run_id": "01M1K68BXC0K14360N964CMM0D",
+      "git_sha": "3ed7861ff3393c9a7983f6d2f56926c1c5aa6db2",
+      "git_branch": "pr03-baseline-recapture",
+      "git_dirty": false,
+      "git_describe": "pyscx-v0.16.0-20-g3ed7861f",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,200 +57,200 @@
   },
   "runs": [
     {
-      "wall_s": 1.0831889640539885,
+      "wall_s": 1.1727967229671776,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 706.79296875,
+      "peak_rss_mb": 709.3046875,
       "extra": {
         "scenario": "open_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_1file": 1.0832,
-        "obs_open_s_per_file__open_1file": 1.08319,
-        "obs_open_rss_mb__open_1file": 706.8
+        "obs_open_s__open_1file": 1.1728,
+        "obs_open_s_per_file__open_1file": 1.1728,
+        "obs_open_rss_mb__open_1file": 709.3
       }
     },
     {
-      "wall_s": 1.0887622125446796,
+      "wall_s": 1.0869371969019994,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 709.640625,
+      "peak_rss_mb": 714.05078125,
       "extra": {
         "scenario": "open_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_1file": 1.0888,
-        "obs_open_s_per_file__open_1file": 1.08876,
-        "obs_open_rss_mb__open_1file": 709.6
+        "obs_open_s__open_1file": 1.0869,
+        "obs_open_s_per_file__open_1file": 1.08694,
+        "obs_open_rss_mb__open_1file": 714.1
       }
     },
     {
-      "wall_s": 1.0636138189584017,
+      "wall_s": 1.0653907189844176,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 714.56640625,
+      "peak_rss_mb": 718.94140625,
       "extra": {
         "scenario": "open_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_1file": 1.0636,
-        "obs_open_s_per_file__open_1file": 1.06361,
-        "obs_open_rss_mb__open_1file": 714.6
+        "obs_open_s__open_1file": 1.0654,
+        "obs_open_s_per_file__open_1file": 1.06539,
+        "obs_open_rss_mb__open_1file": 718.9
       }
     },
     {
-      "wall_s": 1.0415715165436268,
+      "wall_s": 1.0831691580824554,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 720.38671875,
+      "peak_rss_mb": 723.98046875,
       "extra": {
         "scenario": "open_only",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only": 1.0416,
-        "obs_open_s_per_file__open_only": 1.04157,
-        "obs_open_rss_mb__open_only": 720.4
+        "obs_open_s__open_only": 1.0832,
+        "obs_open_s_per_file__open_only": 1.08317,
+        "obs_open_rss_mb__open_only": 724.0
       }
     },
     {
-      "wall_s": 1.060036888346076,
+      "wall_s": 1.0923021900234744,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 726.5390625,
+      "peak_rss_mb": 726.984375,
       "extra": {
         "scenario": "open_only",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only": 1.06,
-        "obs_open_s_per_file__open_only": 1.06004,
-        "obs_open_rss_mb__open_only": 726.5
+        "obs_open_s__open_only": 1.0923,
+        "obs_open_s_per_file__open_only": 1.0923,
+        "obs_open_rss_mb__open_only": 727.0
       }
     },
     {
-      "wall_s": 1.0149319525808096,
+      "wall_s": 1.0808476790552959,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 730.5390625,
+      "peak_rss_mb": 728.984375,
       "extra": {
         "scenario": "open_only",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__open_only": 1.0149,
-        "obs_open_s_per_file__open_only": 1.01493,
-        "obs_open_rss_mb__open_only": 730.5
+        "obs_open_s__open_only": 1.0808,
+        "obs_open_s_per_file__open_only": 1.08085,
+        "obs_open_rss_mb__open_only": 729.0
       }
     },
     {
-      "wall_s": 1.0208274498581886,
+      "wall_s": 1.095436800038442,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 735.5546875,
+      "peak_rss_mb": 735.0,
       "extra": {
         "scenario": "obs_codes_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_1file": 1.0208,
-        "obs_open_s_per_file__obs_codes_1file": 1.02083,
-        "obs_open_rss_mb__obs_codes_1file": 735.6
+        "obs_open_s__obs_codes_1file": 1.0954,
+        "obs_open_s_per_file__obs_codes_1file": 1.09544,
+        "obs_open_rss_mb__obs_codes_1file": 735.0
       }
     },
     {
-      "wall_s": 0.9891991913318634,
+      "wall_s": 1.0598170270677656,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 737.4140625,
+      "peak_rss_mb": 738.99609375,
       "extra": {
         "scenario": "obs_codes_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_1file": 0.9892,
-        "obs_open_s_per_file__obs_codes_1file": 0.9892,
-        "obs_open_rss_mb__obs_codes_1file": 737.4
+        "obs_open_s__obs_codes_1file": 1.0598,
+        "obs_open_s_per_file__obs_codes_1file": 1.05982,
+        "obs_open_rss_mb__obs_codes_1file": 739.0
       }
     },
     {
-      "wall_s": 1.022842237725854,
+      "wall_s": 1.0345033439807594,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 742.5625,
+      "peak_rss_mb": 743.95703125,
       "extra": {
         "scenario": "obs_codes_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_1file": 1.0228,
-        "obs_open_s_per_file__obs_codes_1file": 1.02284,
-        "obs_open_rss_mb__obs_codes_1file": 742.6
+        "obs_open_s__obs_codes_1file": 1.0345,
+        "obs_open_s_per_file__obs_codes_1file": 1.0345,
+        "obs_open_rss_mb__obs_codes_1file": 744.0
       }
     },
     {
-      "wall_s": 1.0095709674060345,
+      "wall_s": 1.0573663549730554,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 745.56640625,
+      "peak_rss_mb": 748.9921875,
       "extra": {
         "scenario": "obs_codes_many_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_many_1file": 1.0096,
-        "obs_open_s_per_file__obs_codes_many_1file": 1.00957,
-        "obs_open_rss_mb__obs_codes_many_1file": 745.6
+        "obs_open_s__obs_codes_many_1file": 1.0574,
+        "obs_open_s_per_file__obs_codes_many_1file": 1.05737,
+        "obs_open_rss_mb__obs_codes_many_1file": 749.0
       }
     },
     {
-      "wall_s": 0.9976577553898096,
+      "wall_s": 1.029128719936125,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 746.4453125,
+      "peak_rss_mb": 748.8046875,
       "extra": {
         "scenario": "obs_codes_many_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_many_1file": 0.9977,
-        "obs_open_s_per_file__obs_codes_many_1file": 0.99766,
-        "obs_open_rss_mb__obs_codes_many_1file": 746.4
+        "obs_open_s__obs_codes_many_1file": 1.0291,
+        "obs_open_s_per_file__obs_codes_many_1file": 1.02913,
+        "obs_open_rss_mb__obs_codes_many_1file": 748.8
       }
     },
     {
-      "wall_s": 1.0151497051119804,
+      "wall_s": 1.050781021011062,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 746.5703125,
+      "peak_rss_mb": 749.01953125,
       "extra": {
         "scenario": "obs_codes_many_1file",
         "n_files": 1,
         "n_obs_total": 1000000,
         "cache_policy": "warm",
         "n_evicted": 0,
-        "obs_open_s__obs_codes_many_1file": 1.0151,
-        "obs_open_s_per_file__obs_codes_many_1file": 1.01515,
-        "obs_open_rss_mb__obs_codes_many_1file": 746.6
+        "obs_open_s__obs_codes_many_1file": 1.0508,
+        "obs_open_s_per_file__obs_codes_many_1file": 1.05078,
+        "obs_open_rss_mb__obs_codes_many_1file": 749.0
       }
     }
   ],
-  "median_wall_s": 1.0218348437920213,
-  "wall_s_iqr": 0.05180837260559201,
+  "median_wall_s": 1.0731191990198568,
+  "wall_s_iqr": 0.03853358724154532,
   "n_runs": 12,
   "file_size_bytes": 11398091528,
   "metadata": {
@@ -258,36 +259,36 @@
     "scenario_summary": {
       "open_1file": {
         "n_runs": 3,
-        "median_obs_open_s": 1.0832,
-        "median_obs_open_s_per_file": 1.08319,
-        "median_obs_open_rss_mb": 709.6
+        "median_obs_open_s": 1.0869,
+        "median_obs_open_s_per_file": 1.08694,
+        "median_obs_open_rss_mb": 714.1
       },
       "open_only": {
         "n_runs": 3,
-        "median_obs_open_s": 1.0416,
-        "median_obs_open_s_per_file": 1.04157,
-        "median_obs_open_rss_mb": 726.5
+        "median_obs_open_s": 1.0832,
+        "median_obs_open_s_per_file": 1.08317,
+        "median_obs_open_rss_mb": 727.0
       },
       "obs_codes_1file": {
         "n_runs": 3,
-        "median_obs_open_s": 1.0208,
-        "median_obs_open_s_per_file": 1.02083,
-        "median_obs_open_rss_mb": 737.4
+        "median_obs_open_s": 1.0598,
+        "median_obs_open_s_per_file": 1.05982,
+        "median_obs_open_rss_mb": 739.0
       },
       "obs_codes_many_1file": {
         "n_runs": 3,
-        "median_obs_open_s": 1.0096,
-        "median_obs_open_s_per_file": 1.00957,
-        "median_obs_open_rss_mb": 746.4
+        "median_obs_open_s": 1.0508,
+        "median_obs_open_s_per_file": 1.05078,
+        "median_obs_open_rss_mb": 749.0
       }
     },
     "open_cost_breakdown": {
-      "obs_read_s_per_file": 0.04162
+      "obs_read_s_per_file": 0.00377
     },
     "obs_codes_vs_read_obs": {
-      "read_obs_s_per_file": 1.08319,
-      "obs_categorical_s_per_file": 1.02083,
-      "speedup": 1.061
+      "read_obs_s_per_file": 1.08694,
+      "obs_categorical_s_per_file": 1.05982,
+      "speedup": 1.026
     }
   }
 }

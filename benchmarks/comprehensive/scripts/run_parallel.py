@@ -61,6 +61,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from benchmarks.comprehensive.config import (  # noqa: E402
     ALL_FORMATS,
     DATASETS,
+    GPU_PARTITION,
     PRIMARY_FORMATS,
     FormatVariant,
     estimate_memory_gb,
@@ -137,14 +138,90 @@ def _is_multimodal_format(format_key: str) -> bool:
     return any(format_key.startswith(p) for p in _MULTIMODAL_FORMAT_PREFIXES)
 
 
+# Submission failures that are worth retrying: slurmctld was momentarily busy
+# or unreachable, or a fast upstream convert was purged between its completion
+# and its dependents' submission. Deliberately NOT "Batch job submission
+# failed", which is also the prefix for permanent misconfiguration (an invalid
+# partition or account), where a retry only delays the real error.
+_TRANSIENT_SBATCH_ERRORS: tuple[str, ...] = (
+    "Socket timed out on send/recv operation",
+    "Unable to contact slurm controller",
+    "Zero Bytes were transmitted or received",
+)
+
+# NOT in the list above, and the distinction cost a capture. "Job dependency
+# problem" means `afterok:<jid>` names a job SLURM no longer knows — almost
+# always because the conversion FINISHED and was purged (MinJobAge) between
+# being recorded and the dependent cohort being submitted. Waiting cannot help:
+# the id stays purged, so a backoff just spends three attempts arriving at the
+# same error. A tier-full capture died on it 8 minutes in, on
+# `pbmc10k/anndata_zarr_backed`, after two pointless retries.
+#
+# The right recovery is to check the dependency's real state and, if it
+# succeeded, resubmit WITHOUT the dependency — which is what
+# `_dependency_already_satisfied` is for.
+_DEPENDENCY_PROBLEM = "Job dependency problem"
+
+
+def _dependency_already_satisfied(dep_jobid: str | None) -> bool:
+    """True when a rejected `afterok` dependency had in fact already succeeded.
+
+    A purged job id is indistinguishable from a bad one at `sbatch` time, so
+    ask `sacct`, which retains the record after squeue has dropped it. An empty
+    or non-terminal answer is treated as NOT satisfied: resubmitting without a
+    dependency that might still be pending would race the conversion, and a
+    loud failure beats a benchmark reading a half-written fixture.
+    """
+    if not dep_jobid:
+        return False
+    state = _sacct_head_state(str(dep_jobid))
+    return state == "COMPLETED"
+
+
+def _is_transient_sbatch_error(msg: str) -> bool:
+    """Whether an ``sbatch`` failure is worth retrying.
+
+    A named-substring test, not a prefix test on "Batch job submission
+    failed" — that prefix also covers permanent misconfiguration, where a
+    retry only delays the real error by 90 seconds. Extracted from the retry
+    loop so the classification can be unit-tested against both sides.
+    """
+    return any(token in msg for token in _TRANSIENT_SBATCH_ERRORS)
+
+
 def _count_active_user_jobs() -> int:
     """Return total PD+R jobs currently queued for the invoking user.
 
-    Used by ``_wait_under_pending_cap`` to throttle submissions when
-    Chimera's ``QOSMaxSubmitJobPerUserLimit`` (~500 per user) is
-    approaching. Falls back to 0 when ``squeue`` is unreachable
-    (running outside SLURM, or a misconfigured PATH) — disabling the
-    throttle is safer than blocking the orchestrator.
+    Used by ``_wait_under_pending_cap`` to throttle submissions before
+    ``QOSMaxSubmitJobPerUserLimit`` rejects an ``sbatch``.
+
+    **``-r`` is load-bearing.** Without it ``squeue`` collapses a pending job
+    array into ONE line (``2891953_[14-19]``), while the QOS counts every task
+    in it. So the throttle's reservation arithmetic — which exists precisely
+    because "a ``map_array`` call registers N tasks that each count
+    individually" — was fed a number that could not see them. Measured on a
+    live capture queue: 16 lines without ``-r``, **39 with**, a 2.4x
+    undercount, and the tier-full capture (job 2891607) died 26 minutes in on
+    ``QOSMaxSubmitJobPerUserLimit`` after exhausting all three retries while
+    the throttle believed the queue was nearly empty.
+
+    The measured limits on this cluster, since the old "~500 per user" note was
+    a guess and the number that actually bites is smaller and per-QOS:
+
+        partition          QOS         MaxSubmitPU  MaxJobsPU
+        cpu_preemptible    preempt         512         100
+        cpu_batch          cpu_batch       200          20
+        cpu_high_mem       nogpu            -           -     (TRES cpu=513)
+        ctc_gpu_priority   (normal)         -           -
+
+    ``MaxJobsPU`` on ``preempt`` is what the old comment's "rejections at queue
+    depth 80-110" was actually seeing — a *running* cap, not the submit cap.
+    ``cpu_batch`` additionally pends on ``QOSGrpCpuLimit``, so it is a poor
+    choice for the bench cells however attractive its lack of preemption is.
+
+    Falls back to 0 when ``squeue`` is unreachable (running outside SLURM, or a
+    misconfigured PATH) — disabling the throttle is safer than blocking the
+    orchestrator.
     """
     import os
     import subprocess
@@ -153,7 +230,7 @@ def _count_active_user_jobs() -> int:
         return 0
     try:
         out = subprocess.check_output(
-            ["squeue", "-u", user, "-h", "-t", "PD,R", "--format=%i"],
+            ["squeue", "-u", user, "-h", "-r", "-t", "PD,R", "--format=%i"],
             text=True, timeout=15,
         )
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
@@ -992,12 +1069,19 @@ def _per_job_slurm_params(
         )
     )
     if needs_gpu:
-        partition = "preemptible"  # GPU partition on chimera
+        # `config.GPU_PARTITION` (env `SCX_BENCH_GPU_PARTITION`, default
+        # "preemptible"). GPU cells deliberately ignore `--partition` /
+        # `SCX_BENCH_PARTITION`, which size CPU cells; this is the one knob for
+        # them, and it exists because the preemptible GPU QOS starves.
+        partition = GPU_PARTITION
         extra_slurm["slurm_gres"] = "gpu:1"
         # Chimera's preemptible GPU QOS caps per-job memory at ~128 GB
         # (matching SLURM_DEFAULTS.gpu.mem_gb). Requests above that fail
         # with `QOSMaxGRESPerJob`. Clamp so census-scale preprocess cells
         # that actually use GPU compute don't get rejected at submit time.
+        # Applied on every GPU partition, not just the preemptible one: it is
+        # the tighter bound, and under-requesting is recoverable where a
+        # submit-time rejection loses the cell from the capture entirely.
         # (CPU variants have already been routed away via the `needs_gpu`
         # check and will pick up cpu_high_mem via partition_for_memory.)
         _GPU_MEM_CEILING_GB = 128
@@ -1187,11 +1271,24 @@ def main() -> None:
         and len(non_accel_benchmarks) > 0
     )
     if needs_smoke:
-        logger.info("Pre-submit smoke (use --skip-smoke to bypass) …")
+        # Scope the check to the formats this run will actually schedule.
+        # Unscoped it tests every runner whose deps import, so a broken
+        # ADDITIONAL_FORMATS runner blocks a capture that does not schedule it
+        # — which is why every prior full capture passed --skip-smoke, and a
+        # check nobody runs is not a check. `smoke_test_runners` has runners
+        # only for the format keys; accel and multimodal keys match none, so
+        # the intersection can legitimately be empty and that is a skip, not a
+        # failure.
+        smoke_keys = sorted({f.key for f in formats})
+        logger.info(
+            "Pre-submit smoke over %d scheduled format keys "
+            "(use --skip-smoke to bypass) …", len(smoke_keys),
+        )
         import subprocess as _sp
         rc = _sp.call([
             sys.executable, "-m",
             "benchmarks.comprehensive.scripts.smoke_test_runners",
+            "--formats", *smoke_keys,
         ])
         if rc != 0:
             logger.error(
@@ -1514,9 +1611,24 @@ def main() -> None:
         executor.update_parameters(**update_kwargs)
 
         # --- Submit the cohort as a single SLURM Job Array ---
-        # Retry once on QOSMaxSubmitJobPerUserLimit — the squeue poll in
-        # _wait_under_pending_cap can race with SLURM's internal counter
-        # (array tasks still being registered).
+        # Retry a transient submission failure. Two distinct kinds, and both
+        # have cost a multi-hour capture its entire output:
+        #
+        #   * QOSMaxSubmitJobPerUserLimit — the squeue poll in
+        #     `_wait_under_pending_cap` can race with SLURM's internal counter
+        #     (array tasks still being registered). Drain, re-throttle, retry.
+        #   * everything in `_TRANSIENT_SBATCH_ERRORS` — slurmctld was busy or
+        #     unreachable for one call. A tier-full capture (job 2892341) died
+        #     38 minutes and 735 results in on "Socket timed out on send/recv
+        #     operation", because the predicate matched only the QOS string and
+        #     re-raised. Nothing was archived: `capture_baseline` refuses to
+        #     archive after a non-zero exit, correctly, so a flaky sbatch threw
+        #     away 38 minutes of cluster time. Plain backoff, no drain — the
+        #     queue was never the problem.
+        #
+        # Matched on a named list rather than on "Batch job submission failed",
+        # which also covers permanent misconfiguration (an invalid partition or
+        # account) where retrying just delays the real error.
         _QOS_RETRY_MAX = 3
         for _attempt in range(_QOS_RETRY_MAX):
             try:
@@ -1533,20 +1645,52 @@ def main() -> None:
                 )
                 break  # success
             except Exception as exc:
-                if "QOSMaxSubmitJobPerUserLimit" in str(exc):
-                    if _attempt < _QOS_RETRY_MAX - 1:
+                msg = str(exc)
+                last = _attempt >= _QOS_RETRY_MAX - 1
+                if "QOSMaxSubmitJobPerUserLimit" in msg and not last:
+                    logger.warning(
+                        "QOS limit hit submitting cohort %s/%s "
+                        "(attempt %d/%d); waiting 60s for drain...",
+                        ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
+                    )
+                    time.sleep(60)
+                    _cancel_dep_never_satisfied()
+                    _wait_under_pending_cap(
+                        effective_cap, kind="bench", headroom=tasks_in_cohort
+                    )
+                    continue
+                if _DEPENDENCY_PROBLEM in msg and dep_jobid and not last:
+                    if _dependency_already_satisfied(dep_jobid):
                         logger.warning(
-                            "QOS limit hit submitting cohort %s/%s "
-                            "(attempt %d/%d); waiting 60s for drain...",
-                            ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
+                            "Cohort %s/%s was rejected with %r on "
+                            "afterok:%s, but that conversion COMPLETED and "
+                            "was purged from squeue; resubmitting without the "
+                            "dependency.",
+                            ds_name, fmt_key, _DEPENDENCY_PROBLEM, dep_jobid,
                         )
-                        time.sleep(60)
-                        _cancel_dep_never_satisfied()
-                        _wait_under_pending_cap(
-                            effective_cap, kind="bench", headroom=tasks_in_cohort
-                        )
+                        update_kwargs["slurm_additional_parameters"] = {}
+                        executor.update_parameters(**update_kwargs)
                         continue
-                raise  # re-raise non-QOS errors or final attempt
+                    logger.error(
+                        "Cohort %s/%s rejected with %r on afterok:%s, and "
+                        "that job is not COMPLETED (sacct: %r). Not "
+                        "resubmitting without the dependency — a benchmark "
+                        "would read a half-written fixture.",
+                        ds_name, fmt_key, _DEPENDENCY_PROBLEM, dep_jobid,
+                        _sacct_head_state(str(dep_jobid)),
+                    )
+                    raise
+                if _is_transient_sbatch_error(msg) and not last:
+                    backoff = 30 * (_attempt + 1)
+                    logger.warning(
+                        "Transient sbatch failure submitting cohort %s/%s "
+                        "(attempt %d/%d): %s; retrying in %ds...",
+                        ds_name, fmt_key, _attempt + 1, _QOS_RETRY_MAX,
+                        msg.strip().splitlines()[-1][:160], backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise  # permanent error, or the last attempt
 
         # Record jobs for the wait loop and manifest
         for bench_name, job in zip(group_benches, task_jobs):
