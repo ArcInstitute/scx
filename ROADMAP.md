@@ -474,9 +474,12 @@ count *matrix*; this is the obs-column half.
   just strings — and `filter_obs(...).collect()` prunes to the surviving
   categories deterministically on both obs layouts.
 - [ ] Dictionary output from `append` / `merge` / `merge_sorted` — they still
-  decode categoricals to plain strings for the rows they add (the read side
-  reconciles the mixed layout, so such files read back as `category`);
-  `scx_format_io`'s `unify_dictionary_columns` is the primitive to reuse.
+  decode categoricals to plain strings for the rows they add. Only an `append`
+  onto an already-sharded dictionary base leaves a mix the read side reconciles
+  back to `category`; a `merge` output or a legacy-layout `append` is plain
+  throughout, and a filtered `collect()` drawn entirely from appended shards
+  returns plain strings. `scx_format_io`'s `intern_declared_values` (the
+  declared-value union) is the primitive to reuse.
 - [x] `pyscx.export_batches` — one h5ad per batch without materialising the
   pool, guarding **both** identities a tool and the import rely on (`obs_names`
   and the resolved key) for uniqueness *within* each batch.
