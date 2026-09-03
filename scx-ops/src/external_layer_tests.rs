@@ -1743,4 +1743,8 @@ fn an_unreadable_uns_section_fails_the_layer_attach_when_there_is_a_payload() {
     let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
     assert!(!matches!(err, OpsError::InvalidInput(_)), "{err}");
     assert_eq!(std::fs::read(&path).unwrap(), bytes0, "file byte-identical");
+
+    // Without a payload the section is never read, so the layer still lands.
+    let data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
 }

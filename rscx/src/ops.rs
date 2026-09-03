@@ -475,7 +475,8 @@ fn scx_validate_impl(path: &str) -> Result<bool> {
 ///   `NULL` auto-resolves it.
 /// @param prefix Prepended to every imported column name.
 /// @param status_column Obs column recording "present"/"absent" per row.
-/// @param uns_key `uns` key for the run metadata.
+/// @param uns_key Reserved and currently inert: rscx sends no `uns` payload, so
+///   nothing is written under it. Kept for signature stability.
 /// @param overwrite Replace colliding columns. REPLACES, never merges.
 /// @param on_missing_rows `"null"` (default), `"zero"` (an accepted alias for
 ///   the same policy) or `"error"`.

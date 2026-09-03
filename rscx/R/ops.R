@@ -221,7 +221,9 @@ scx_merge <- function(inputs, output, index_obs = NULL, index_var = NULL,
 #' @param prefix Prepended to every attached column name.
 #' @param status_column Obs column recording \code{"present"}/\code{"absent"}
 #'   per row. \code{NULL} omits it.
-#' @param uns_key \code{uns} key for the run metadata. \code{NULL} omits it.
+#' @param uns_key Reserved and currently inert: \code{scx_attach_obs} sends no
+#'   \code{uns} payload, so nothing is written under it. Kept for signature
+#'   stability.
 #' @param overwrite Replace colliding columns. **Replaces, never merges** — so
 #'   attaching several per-batch results in turn keeps only the last. Combine
 #'   them into one \code{data.frame} and attach once.

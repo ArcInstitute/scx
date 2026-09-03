@@ -605,8 +605,11 @@ This section covers the operational invariants.
 
 ### uns payloads ride in the same commit
 
-Every attach can carry `uns` entries alongside its columns, and they land in
-the **same commit**, so one `scx rollback` undoes columns and uns together.
+Every Rust / Python / CLI attach can carry `uns` entries alongside its
+columns, and they land in the **same commit**, so one `scx rollback` undoes
+columns and uns together. (rscx's `scx_attach_obs` sends no payload today; its
+`uns_key` argument is retained but inert, and R parity for the payload is a
+ROADMAP item.)
 The payload is a map of top-level keys (`ExternalObsData::uns`; several keys
 per attach), merged shallowly into the file's `uns`: `pyscx.attach_obs_columns(uns={...})`
 merges the dict's keys, `uns_key="K"` nests the payload under `uns["K"]`
