@@ -1270,9 +1270,11 @@ QueryPipeline::open("file.scx")?
   export / CLI `subset` / `to_anndata`) still assemble the full obs table
   and remain unbounded on atlas-scale sharded files.
 - **Filtered-obs categorical semantics.** A `filter_obs(...).collect()`
-  result's categorical (`Dictionary<_, Utf8>`) obs columns carry only the
-  categories present in the surviving rows, not the full parent
-  dictionary — standard AnnData/pandas behavior. Downstream code that
+  result's categorical obs columns carry only the categories present in the
+  surviving rows, in declared order, not the full parent dictionary —
+  standard AnnData/pandas behavior (`remove_unused_categories` on a subset),
+  on both obs layouts and whatever the result size. (`read_obs()` on the file
+  itself keeps the full declared list.) Downstream code that
   compares `.cat.categories` against the source file (e.g. plotting that
   assumes a fixed palette) should re-derive categories from the result.
 - **Null semantics — three-valued (Kleene) logic, like a SQL `WHERE`
@@ -1686,7 +1688,8 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   `doublet_import`, `cellbender_import`, `modify_metadata(obs=…)`, rscx
   `scx_attach_obs`): a pandas `category` column — the file's existing ones and
   the one being attached — keeps its dtype, its declared category order, its
-  unused levels and its `ordered` bit, exactly as `from_anndata` writes them.
+  unused levels and its `ordered` bit, exactly as `from_anndata` writes them,
+  for string, boolean and numeric levels alike.
   (Before pyscx 0.17 every one of these writers demoted every categorical obs
   column to plain strings.) `append` / `merge` still write the rows they add as
   plain strings; the read side reconciles the mix, so such a column reads back

@@ -164,7 +164,9 @@ def test_obs_import_keeps_the_targets_categoricals(target, tmp_path):
 
     obs = pyscx.open(path).read_obs()
     _assert_target_factors_intact(obs)
-    assert obs["score"].tolist() == list(reversed(np.linspace(0, 1, len(bc))))
+    # approx: the scores went through CSV text, and a 1-ULP round-off there
+    # is a parser property, not what this test is about.
+    assert obs["score"].tolist() == pytest.approx(list(reversed(np.linspace(0, 1, len(bc)))))
 
 
 def test_doublet_import_keeps_the_targets_categoricals(target, tmp_path):
@@ -278,3 +280,82 @@ def test_a_file_mixing_dictionary_and_plain_shards_still_takes_an_attach(tmp_pat
     assert obs["score"].tolist() == list(range(16))
     codes, cats = exp.obs_categorical("cell_type")
     assert [cats[c] for c in codes] == before
+
+
+# ---------------------------------------------------------------------------
+# Numeric categoricals
+# ---------------------------------------------------------------------------
+#
+# `pd.Categorical([1, 2, 3])` reaches Arrow as `Dictionary(_, Int64)` — a real
+# on-disk shape for cluster labels. The first version of this PR's assembler fix
+# interned only string / boolean dictionary values, so an integer categorical
+# still lost its unused level and declared order on a small sharded file
+# (round-1 finding, codex; repro below is codex's).
+
+NUM_LEVELS = [3, 2, 1, 4]
+
+
+def _numeric_categorical(n):
+    return pd.Categorical([[2, 1, 3][i % 3] for i in range(n)], categories=NUM_LEVELS, ordered=True)
+
+
+def _assert_numeric_intact(col, n):
+    assert isinstance(col.dtype, pd.CategoricalDtype), col.dtype
+    assert col.cat.ordered is True
+    assert list(col.cat.categories) == NUM_LEVELS
+    assert list(col) == [[2, 1, 3][i % 3] for i in range(n)]
+
+
+def test_attach_obs_columns_numeric_categorical(target):
+    path, bc, _ = target
+    df = pd.DataFrame({"cluster": _numeric_categorical(len(bc))}, index=bc)
+
+    pyscx.attach_obs_columns(path, df)
+
+    obs = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(obs)
+    _assert_numeric_intact(obs["cluster"], len(bc))
+
+
+def test_modify_metadata_obs_numeric_categorical(target):
+    path, bc, _ = target
+    obs = pyscx.open(path).read_obs()
+    obs["cluster"] = _numeric_categorical(len(bc))
+
+    pyscx.modify_metadata(path, obs=obs)
+
+    back = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(back)
+    _assert_numeric_intact(back["cluster"], len(bc))
+
+
+# ---------------------------------------------------------------------------
+# filter_obs(...).collect() keeps the opposite contract
+# ---------------------------------------------------------------------------
+
+
+def test_filtered_collect_carries_only_the_surviving_categories(target):
+    """`docs/api.md` § Filtered-obs categorical semantics: a `collect()` result's
+    categoricals carry only the categories present in the surviving rows
+    (pandas' `remove_unused_categories`-on-subset rule), while `read_obs()` on
+    the same file keeps the full declared list. Before this PR the prune on
+    the sharded path was arrow's data-dependent dictionary merge — it fired on
+    a small result and not on a large one — and the first version of the
+    shared-values fix switched it off entirely (round-1 finding, Cursor). Both
+    layouts, since the legacy single-section path filters differently."""
+    path, _, _ = target
+
+    q = pyscx.open(path).query()
+    # G1 sits at i % 3 == 1 (rows 1, 4, 7, 10) and batch is "a" at odd i, so
+    # the conjunction keeps rows 1 and 7: one level of each factor survives.
+    q.filter_obs("phase == 'G1' and batch == 'a'")
+    obs = q.collect().to_anndata().obs
+    assert len(obs) == 2
+    assert isinstance(obs["phase"].dtype, pd.CategoricalDtype), obs["phase"].dtype
+    assert list(obs["phase"].cat.categories) == ["G1"]
+    assert obs["phase"].cat.ordered is True
+    # The unordered control is pruned the same way.
+    assert list(obs["batch"].cat.categories) == ["a"]
+
+    full = pyscx.open(path).read_obs()
+    assert list(full["phase"].cat.categories) == PHASE_LEVELS

@@ -77,7 +77,7 @@ pub use profile::{
 };
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
-    decode_arrow_ipc_schema, ScxReader,
+    decode_arrow_ipc_schema, prune_unused_dictionary_values, ScxReader,
 };
 pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,

@@ -372,7 +372,8 @@ full obs table.
 
 Filtered categorical obs columns in a `collect()` result carry only the
 categories present in the surviving rows (AnnData/pandas convention), not
-the full parent dictionary.
+the full parent dictionary — deterministically, on both obs layouts; a full
+`read_obs()` keeps the declared list, unused levels included.
 
 ### Training loader (shard-level streaming)
 

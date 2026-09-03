@@ -470,7 +470,9 @@ count *matrix*; this is the obs-column half.
   categorical obs column to plain strings via `unify_dict_columns`. The
   sharded-obs assembler also stopped losing declared-but-unused levels on small
   files (arrow's dictionary merge pruned them once the summed per-shard
-  vocabularies reached the row count).
+  vocabularies reached the row count) — for every categorical value type, not
+  just strings — and `filter_obs(...).collect()` prunes to the surviving
+  categories deterministically on both obs layouts.
 - [ ] Dictionary output from `append` / `merge` / `merge_sorted` — they still
   decode categoricals to plain strings for the rows they add (the read side
   reconciles the mixed layout, so such files read back as `category`);

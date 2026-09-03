@@ -129,7 +129,7 @@ pub(crate) use matrix::{check_decoded_lengths, plan_row_major_layout, X_LABELS};
 pub(crate) use metadata::DenseMappingLayout;
 pub use metadata::{
     assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
-    decode_arrow_ipc_schema, filter_batch_by_keep_mask,
+    decode_arrow_ipc_schema, filter_batch_by_keep_mask, prune_unused_dictionary_values,
 };
 
 // Reached only from `reader_tests.rs`, which is attached to this module and so

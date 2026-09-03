@@ -114,10 +114,11 @@ fn parse_shard_metadata_md(
 /// without deduplicating, so concatenating N shards that each hold the same
 /// category produces a dictionary with that category repeated N times. Such a
 /// batch round-trips through Arrow IPC fine, but `pyarrow.Table.to_pandas()`
-/// raises `ValueError: Categorical categories must be unique`. Casting each
-/// dictionary column to its value type (decode) and back to the original
-/// dictionary type (re-encode) rebuilds a deduplicated dictionary with keys
-/// remapped to the surviving values. Non-dictionary columns pass through
+/// raises `ValueError: Categorical categories must be unique`. Interning the
+/// *declared* values ([`dedup_dictionary_column`]) rebuilds a deduplicated
+/// dictionary with keys remapped onto it and every declared entry kept, used or
+/// not; a value type the interner cannot key falls back to decode→re-encode
+/// (which keeps only referenced values). Non-dictionary columns pass through
 /// untouched; the schema (and its `pandas` index metadata) is preserved.
 fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
     use arrow::datatypes::{DataType, Field, Schema};
@@ -141,7 +142,8 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
                 // whole column to a flat `n_obs`-length Utf8 array (the
                 // multi-GB-per-column transient that OOMs atlas-scale
                 // `read_obs`; see SCX-SORT-OOM-BUG Part 3). Falls back to the
-                // decode/re-encode cast for non-string value types.
+                // decode/re-encode cast only for a value type the row encoder
+                // cannot key (a nested type).
                 let (encoded, final_dt) = match dedup_dictionary_column(col, value_type)? {
                     Some(pair) => pair,
                     None => {
@@ -187,18 +189,23 @@ fn unify_dictionary_columns(batch: &RecordBatch) -> Result<RecordBatch> {
 
 /// Deduplicate a `Dictionary(Int32, value_type)` column without materializing
 /// the full `n_obs`-length value array. Returns the unified `(array, dtype)`
-/// (key narrowed via [`min_dictionary_key_type`]) for string value types, or
-/// `None` for any shape that should take the decode/re-encode fallback
-/// (non-Int32 keys — not produced by the assembler's `widen_dictionary_keys` —
-/// or a value type with neither a fast path nor a hand-packing arm).
-/// `Utf8` / `LargeUtf8` cover the common categorical, and `Boolean` has its
-/// own arm because arrow cannot pack it at all.
+/// (key narrowed via [`min_dictionary_key_type`]), or `None` for a shape that
+/// should take the decode/re-encode fallback (non-`Int32` keys — not produced
+/// by the assembler's `widen_dictionary_keys` — or a value type the row
+/// encoder cannot key, see [`intern_declared_values`]).
+///
+/// Generic over the value type through [`intern_declared_values`]: string,
+/// Boolean, every primitive (an integer or float categorical, a timestamp)
+/// all go through one interner over the *declared* values, so an entry no row
+/// references survives whatever its type. A dictionary that is already unique
+/// — the usual case now that [`share_dictionary_values`] runs before concat —
+/// skips the O(n_obs) key remap and only narrows the key type.
 fn dedup_dictionary_column(
     col: &arrow::array::ArrayRef,
     value_type: &arrow::datatypes::DataType,
 ) -> Result<Option<(arrow::array::ArrayRef, arrow::datatypes::DataType)>> {
-    use arrow::array::{Array, Int32Array, LargeStringArray, StringArray};
-    use arrow::datatypes::{DataType, Int32Type};
+    use arrow::array::Array;
+    use arrow::datatypes::Int32Type;
 
     let Some(dict) = col
         .as_any()
@@ -206,117 +213,79 @@ fn dedup_dictionary_column(
     else {
         return Ok(None);
     };
-    let keys: &Int32Array = dict.keys();
-    let values = dict.values();
-    match value_type {
-        DataType::LargeUtf8 => {
-            let v = values
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
-            Ok(Some(dedup_string_dict::<i64>(keys, v, value_type)?))
-        }
-        DataType::Utf8 => {
-            let v = values
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
-            Ok(Some(dedup_string_dict::<i32>(keys, v, value_type)?))
-        }
-        // Not an optimization like the string arms — a *requirement*. Arrow
-        // cannot pack a `Boolean` array into a dictionary, so the
-        // decode/re-encode fallback raises on this value type.
-        DataType::Boolean => {
-            let v = values
-                .as_any()
-                .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
-            Ok(Some(dedup_boolean_dict(keys, v, value_type)?))
-        }
-        _ => Ok(None),
-    }
+    let Some((unified, mut maps)) = intern_declared_values(&[dict.values()])? else {
+        return Ok(None);
+    };
+    let map = maps.pop().expect("one input, one map");
+    let n_distinct = unified.len();
+    let keys = if n_distinct == dict.values().len() {
+        // Already unique: the remap would be the identity.
+        dict.keys().clone()
+    } else {
+        remap_dictionary_keys(dict.keys(), &map)?
+    };
+    Ok(Some(finish_deduped_dictionary(
+        keys, unified, n_distinct, value_type,
+    )?))
 }
 
-/// Core of [`dedup_dictionary_column`] for a string value type: intern the
-/// dictionary's values (first-occurrence order over the values array), remap
-/// keys to the deduplicated index space, and narrow the key to the minimal fit.
-fn dedup_string_dict<O: arrow::array::OffsetSizeTrait>(
-    keys: &arrow::array::Int32Array,
-    values: &arrow::array::GenericStringArray<O>,
-    value_type: &arrow::datatypes::DataType,
-) -> Result<(arrow::array::ArrayRef, arrow::datatypes::DataType)> {
-    use arrow::array::{Array, GenericStringArray};
-
-    let mut interner: HashMap<Option<&str>, u32> = HashMap::new();
-    let mut old_to_new: Vec<u32> = Vec::with_capacity(values.len());
-    let mut unified: Vec<Option<&str>> = Vec::new();
-    for i in 0..values.len() {
-        let v = if values.is_null(i) {
-            None
-        } else {
-            Some(values.value(i))
-        };
-        // A null dictionary value interns to a single `None` slot, so all nulls
-        // in the source dictionary intentionally collapse to one unified entry
-        // (null == null in SCX categorical semantics).
-        let code = *interner.entry(v).or_insert_with(|| {
-            let c = unified.len() as u32;
-            unified.push(v);
-            c
-        });
-        old_to_new.push(code);
-    }
-    let n_distinct = unified.len();
-
-    let new_keys = remap_dictionary_keys(keys, &old_to_new)?;
-    let unified_values: arrow::array::ArrayRef = Arc::new(GenericStringArray::<O>::from(unified));
-    finish_deduped_dictionary(new_keys, unified_values, n_distinct, value_type)
-}
-
-/// Core of [`dedup_dictionary_column`] for a `Boolean` value type.
+/// Intern the union of several dictionaries' **declared** values.
 ///
-/// Booleans need their own arm because arrow's dictionary *packing* does not
-/// support them, so the generic decode→re-encode fallback below raises
-/// `Unsupported output type for dictionary packing: Boolean` — which made
-/// `read_obs()` fail outright on a row-sharded file carrying a
-/// `pd.Categorical([True, False])` column. Deduplicating here keeps the
-/// column a categorical, so a sharded file reads back with the same pandas
-/// dtype an unsharded one does.
+/// Returns the unified values array — first-occurrence order over `inputs` in
+/// order and, within one, declared order; null values collapse to one slot
+/// (null == null in SCX categorical semantics) — plus, per input, the map from
+/// its old value index to the unified index. `None` when the value type is one
+/// `arrow::row::RowConverter` cannot encode, which for a dictionary's value
+/// type means a nested type; every primitive, string, binary and Boolean value
+/// type is covered.
 ///
-/// There are at most three distinct entries (`true` / `false` / null), so
-/// the interner is a fixed three-slot lookup rather than a hash map.
-fn dedup_boolean_dict(
-    keys: &arrow::array::Int32Array,
-    values: &arrow::array::BooleanArray,
-    value_type: &arrow::datatypes::DataType,
-) -> Result<(arrow::array::ArrayRef, arrow::datatypes::DataType)> {
-    use arrow::array::{Array, BooleanArray};
+/// One interner for every value type is the point: the dedup and the
+/// shared-values step used to special-case strings and Boolean and fall back to
+/// decode→re-encode for the rest, which rebuilds the vocabulary from the *rows*
+/// and so prunes and reorders a numeric categorical's declared levels.
+/// Encoding through the row format keys on the value itself, whatever its type
+/// (a float `-0.0` and `0.0` are distinct entries, as in pandas; NaNs collapse).
+/// Cost is O(total declared values) hashing plus one `take`; no `n_obs`-length
+/// transient.
+fn intern_declared_values(
+    inputs: &[&arrow::array::ArrayRef],
+) -> Result<Option<(arrow::array::ArrayRef, Vec<Vec<u32>>)>> {
+    use arrow::array::{Array, UInt32Array};
+    use arrow::row::{RowConverter, SortField};
 
-    // Slot order is first-occurrence over the values array, matching
-    // `dedup_string_dict`. As there, all null dictionary entries collapse
-    // to a single unified slot.
-    let mut slots: [Option<u32>; 3] = [None; 3]; // [false, true, null]
-    let mut old_to_new: Vec<u32> = Vec::with_capacity(values.len());
-    let mut unified: Vec<Option<bool>> = Vec::new();
-    for i in 0..values.len() {
-        let v = (!values.is_null(i)).then(|| values.value(i));
-        let slot = match v {
-            Some(false) => 0,
-            Some(true) => 1,
-            None => 2,
-        };
-        let code = *slots[slot].get_or_insert_with(|| {
-            let c = unified.len() as u32;
-            unified.push(v);
-            c
-        });
-        old_to_new.push(code);
+    let Some(first) = inputs.first() else {
+        return Ok(None);
+    };
+    let field = SortField::new(first.data_type().clone());
+    if !RowConverter::supports_fields(std::slice::from_ref(&field)) {
+        return Ok(None);
     }
-    let n_distinct = unified.len();
+    let all = arrow::compute::concat(&inputs.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
+    let converter = RowConverter::new(vec![field])?;
+    let rows = converter.convert_columns(std::slice::from_ref(&all))?;
 
-    let new_keys = remap_dictionary_keys(keys, &old_to_new)?;
-    let unified_values: arrow::array::ArrayRef = Arc::new(BooleanArray::from(unified));
-    finish_deduped_dictionary(new_keys, unified_values, n_distinct, value_type)
+    let mut interner: HashMap<arrow::row::Row<'_>, u32> = HashMap::new();
+    let mut keep: Vec<u32> = Vec::new();
+    let mut flat: Vec<u32> = Vec::with_capacity(all.len());
+    for i in 0..rows.num_rows() {
+        let code = *interner.entry(rows.row(i)).or_insert_with(|| {
+            keep.push(i as u32);
+            (keep.len() - 1) as u32
+        });
+        flat.push(code);
+    }
+    let unified = if keep.len() == all.len() {
+        all
+    } else {
+        arrow::compute::take(all.as_ref(), &UInt32Array::from(keep), None)?
+    };
+    let mut maps = Vec::with_capacity(inputs.len());
+    let mut off = 0usize;
+    for a in inputs {
+        maps.push(flat[off..off + a.len()].to_vec());
+        off += a.len();
+    }
+    Ok(Some((unified, maps)))
 }
 
 /// Remap a dictionary's keys through `old_to_new` (an O(n_obs) integer
@@ -500,17 +469,17 @@ pub fn compact_key_shard(batch: &RecordBatch) -> Result<RecordBatch> {
 /// intermittent, and the h5ad exporter and `obs_categorical`, which fold shards
 /// themselves, never had it.
 ///
-/// This interns the union of every shard's declared values — first-occurrence
-/// order over shards in index order and, within a shard, declared order; nulls
-/// collapse to one slot as in [`unify_dictionary_columns`] — remaps each
-/// shard's keys onto it, and rebuilds each column over the **same `Arc`**, so
-/// `concat` takes its keys-only path and [`unify_dictionary_columns`] afterwards
-/// has nothing to deduplicate beyond narrowing the key. Runs after
+/// This interns the union of every shard's declared values through
+/// [`intern_declared_values`] — first-occurrence order over shards in index
+/// order and, within a shard, declared order — remaps each shard's keys onto
+/// it, and rebuilds each column over the **same `Arc`**, so `concat` takes its
+/// keys-only path and [`unify_dictionary_columns`] afterwards has nothing to
+/// deduplicate beyond narrowing the key. Runs after
 /// [`crate::arrow_compat::widen_dictionary_keys`] and
 /// [`crate::arrow_compat::reconcile_dictionary_representations`], so every
 /// batch's column for a field is already `Dictionary(Int32, V)` with one `V`.
-/// String and `Boolean` value types are covered — the same set the dedup fast
-/// path covers; any other value type passes through untouched.
+/// Every value type the row encoder can key is covered (strings, Boolean, all
+/// primitives); a nested value type passes through untouched.
 fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     use arrow::array::{Array, ArrayRef, DictionaryArray};
     use arrow::datatypes::{DataType, Int32Type};
@@ -519,22 +488,14 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
         return Ok(batches);
     }
     let schema = batches[0].schema();
-    let targets: Vec<(usize, DataType)> = schema
+    let targets: Vec<usize> = schema
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| match f.data_type() {
-            DataType::Dictionary(k, v)
-                if **k == DataType::Int32
-                    && matches!(
-                        **v,
-                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Boolean
-                    ) =>
-            {
-                Some((i, (**v).clone()))
-            }
-            _ => None,
-        })
+        .filter(
+            |(_, f)| matches!(f.data_type(), DataType::Dictionary(k, _) if **k == DataType::Int32),
+        )
+        .map(|(i, _)| i)
         .collect();
     if targets.is_empty() {
         return Ok(batches);
@@ -543,28 +504,40 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
     // Per target column: one replacement array per batch, all over one values
     // `Arc`.
     let mut replacements: Vec<(usize, Vec<ArrayRef>)> = Vec::with_capacity(targets.len());
-    for (ci, value_type) in &targets {
+    for ci in targets {
         let dicts: Vec<&DictionaryArray<Int32Type>> = batches
             .iter()
             .map(|b| {
-                b.column(*ci)
+                b.column(ci)
                     .as_any()
                     .downcast_ref::<DictionaryArray<Int32Type>>()
                     .ok_or_else(|| {
                         ScxError::InvalidCatalog(format!(
                             "column '{}' declared Dictionary(Int32, _) but failed downcast",
-                            schema.field(*ci).name()
+                            schema.field(ci).name()
                         ))
                     })
             })
             .collect::<Result<_>>()?;
-        let shared = match value_type {
-            DataType::Utf8 => share_string_values::<i32>(&dicts)?,
-            DataType::LargeUtf8 => share_string_values::<i64>(&dicts)?,
-            DataType::Boolean => share_boolean_values(&dicts)?,
-            _ => unreachable!("value types are filtered above"),
+        let values: Vec<&ArrayRef> = dicts.iter().map(|d| d.values()).collect();
+        let Some((shared, maps)) = intern_declared_values(&values)? else {
+            continue; // a value type the row encoder cannot key: leave it to arrow
         };
-        replacements.push((*ci, shared));
+        let rebuilt = dicts
+            .iter()
+            .zip(maps)
+            .map(|(d, map)| {
+                let keys = remap_dictionary_keys(d.keys(), &map)?;
+                Ok(
+                    Arc::new(DictionaryArray::<Int32Type>::try_new(keys, shared.clone())?)
+                        as ArrayRef,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        replacements.push((ci, rebuilt));
+    }
+    if replacements.is_empty() {
+        return Ok(batches);
     }
 
     batches
@@ -580,89 +553,95 @@ fn share_dictionary_values(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>
         .collect()
 }
 
-/// [`share_dictionary_values`] for a string value type: intern across every
-/// shard's declared values, remap each shard's keys, rebuild over one `Arc`.
-fn share_string_values<'a, O: arrow::array::OffsetSizeTrait>(
-    dicts: &[&'a arrow::array::DictionaryArray<arrow::datatypes::Int32Type>],
-) -> Result<Vec<arrow::array::ArrayRef>> {
-    use arrow::array::{Array, ArrayRef, DictionaryArray, GenericStringArray};
-    use arrow::datatypes::Int32Type;
+/// Drop every dictionary value no row of `batch` references, keeping the
+/// survivors in declared order — pandas' `remove_unused_categories`.
+///
+/// The filtered read's half of the categorical contract. A full `read_obs()`
+/// keeps the declared vocabulary whole (unused levels included); a
+/// `filter_obs(...).collect()` result carries only the categories present in
+/// the surviving rows (`docs/api.md` § Filtered-obs categorical semantics), the
+/// way an AnnData subset does. Before this step existed that prune was arrow's
+/// data-dependent dictionary merge in `concat` — it fired on a small result and
+/// not on a large one — so this makes the documented behaviour hold on every
+/// result size, and on the legacy single-section path, which never went
+/// through a concat at all. Field metadata (the `ordered` stamp) and the
+/// schema envelope are kept; the key type is narrowed to the surviving count.
+pub fn prune_unused_dictionary_values(batch: &RecordBatch) -> Result<RecordBatch> {
+    use arrow::array::{Array, ArrayRef, AsArray, UInt32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
 
-    let mut interner: HashMap<Option<&'a str>, u32> = HashMap::new();
-    let mut unified: Vec<Option<&'a str>> = Vec::new();
-    let mut maps: Vec<Vec<u32>> = Vec::with_capacity(dicts.len());
-    for d in dicts {
-        let values: &'a GenericStringArray<O> = d
-            .values()
-            .as_any()
-            .downcast_ref::<GenericStringArray<O>>()
-            .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
-        let mut old_to_new = Vec::with_capacity(values.len());
-        for i in 0..values.len() {
-            let v = (!values.is_null(i)).then(|| values.value(i));
-            let code = *interner.entry(v).or_insert_with(|| {
-                let c = unified.len() as u32;
-                unified.push(v);
-                c
-            });
-            old_to_new.push(code);
-        }
-        maps.push(old_to_new);
-    }
-    let shared: ArrayRef = Arc::new(GenericStringArray::<O>::from(unified));
-    dicts
+    let schema = batch.schema();
+    if !schema
+        .fields()
         .iter()
-        .zip(maps)
-        .map(|(d, map)| {
-            let keys = remap_dictionary_keys(d.keys(), &map)?;
-            Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(keys, shared.clone())?) as ArrayRef)
-        })
-        .collect()
-}
-
-/// [`share_dictionary_values`] for a `Boolean` value type — the fixed
-/// three-slot interner of [`dedup_boolean_dict`], across shards.
-fn share_boolean_values(
-    dicts: &[&arrow::array::DictionaryArray<arrow::datatypes::Int32Type>],
-) -> Result<Vec<arrow::array::ArrayRef>> {
-    use arrow::array::{Array, ArrayRef, BooleanArray, DictionaryArray};
-    use arrow::datatypes::Int32Type;
-
-    let mut slots: [Option<u32>; 3] = [None; 3]; // [false, true, null]
-    let mut unified: Vec<Option<bool>> = Vec::new();
-    let mut maps: Vec<Vec<u32>> = Vec::with_capacity(dicts.len());
-    for d in dicts {
-        let values = d
-            .values()
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| ScxError::InvalidCatalog("dictionary value type mismatch".into()))?;
-        let mut old_to_new = Vec::with_capacity(values.len());
-        for i in 0..values.len() {
-            let v = (!values.is_null(i)).then(|| values.value(i));
-            let slot = match v {
-                Some(false) => 0,
-                Some(true) => 1,
-                None => 2,
-            };
-            let code = *slots[slot].get_or_insert_with(|| {
-                let c = unified.len() as u32;
-                unified.push(v);
-                c
-            });
-            old_to_new.push(code);
-        }
-        maps.push(old_to_new);
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(_, _)))
+    {
+        return Ok(batch.clone());
     }
-    let shared: ArrayRef = Arc::new(BooleanArray::from(unified));
-    dicts
-        .iter()
-        .zip(maps)
-        .map(|(d, map)| {
-            let keys = remap_dictionary_keys(d.keys(), &map)?;
-            Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(keys, shared.clone())?) as ArrayRef)
-        })
-        .collect()
+    let mut new_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, field) in schema.fields().iter().enumerate() {
+        let col = batch.column(i);
+        let DataType::Dictionary(_, value_type) = field.data_type() else {
+            new_columns.push(col.clone());
+            new_fields.push(field.as_ref().clone());
+            continue;
+        };
+        let dict = col.as_any_dictionary();
+        let n_values = dict.values().len();
+        // A zero-row result (the engine feeds a 0-row slice of shard 0 so an
+        // empty `collect()` still carries the canonical schema) keeps its
+        // vocabulary: there are no surviving rows to prune against, and
+        // `normalized_keys` asserts a non-empty values array.
+        if dict.is_empty() || n_values == 0 {
+            new_columns.push(col.clone());
+            new_fields.push(field.as_ref().clone());
+            continue;
+        }
+        let mut used = vec![false; n_values];
+        for k in dict.normalized_keys() {
+            if let Some(slot) = used.get_mut(k) {
+                *slot = true;
+            }
+        }
+        if used.iter().all(|&u| u) {
+            new_columns.push(col.clone());
+            new_fields.push(field.as_ref().clone());
+            continue;
+        }
+        // Declared order of the survivors; unreferenced entries get no slot.
+        let mut old_to_new: Vec<u32> = vec![u32::MAX; n_values];
+        let mut keep: Vec<u32> = Vec::new();
+        for (old, &u) in used.iter().enumerate() {
+            if u {
+                old_to_new[old] = keep.len() as u32;
+                keep.push(old as u32);
+            }
+        }
+        let values = arrow::compute::take(dict.values().as_ref(), &UInt32Array::from(keep), None)?;
+        let wide_keys: arrow::array::Int32Array = (0..dict.len())
+            .map(|r| {
+                (!dict.is_null(r)).then(|| {
+                    // `normalized_keys` bounds-checked every key above; a key
+                    // that is not null indexes a used slot by construction.
+                    old_to_new[dict.normalized_keys()[r]] as i32
+                })
+            })
+            .collect();
+        let (encoded, final_dt) = finish_deduped_dictionary(
+            wide_keys,
+            values,
+            used.iter().filter(|&&u| u).count(),
+            value_type,
+        )?;
+        new_columns.push(encoded);
+        new_fields.push(
+            Field::new(field.name(), final_dt, field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        );
+    }
+    let new_schema = Schema::new(new_fields).with_metadata(schema.metadata().clone());
+    Ok(RecordBatch::try_new(Arc::new(new_schema), new_columns)?)
 }
 
 pub fn assemble_sharded_metadata(
@@ -804,7 +783,9 @@ pub fn assemble_sharded_metadata(
 ///
 /// Runs the same `upcast → widen-dict → reconcile → share-dict-values →
 /// concat → unify-dict → downcast → strip-per-shard-metadata` pipeline as
-/// [`assemble_sharded_metadata`],
+/// [`assemble_sharded_metadata`] — plus [`prune_unused_dictionary_values`]
+/// after the unify, because a filtered result carries only the categories its
+/// surviving rows use —
 /// but WITHOUT the contiguous-cover validation and WITHOUT requiring the
 /// per-shard `shard_idx` / `row_start` stamps — the input batches are an
 /// arbitrary subset (any order, possibly empty), already filtered to the
@@ -848,6 +829,10 @@ pub fn assemble_filtered_metadata(
     let wide_schema = wide[0].schema();
     let concatenated = arrow::compute::concat_batches(&wide_schema, wide.iter())?;
     let unified = unify_dictionary_columns(&concatenated)?;
+    // The filtered contract: only the categories the surviving rows use. See
+    // `prune_unused_dictionary_values` — this used to be arrow's row-count-
+    // dependent merge, and the shared-values step above turns that merge off.
+    let unified = prune_unused_dictionary_values(&unified)?;
     let narrowed = crate::arrow_compat::downcast_large_types(&unified)?;
 
     // Strip the per-shard metadata keys so the result schema matches a

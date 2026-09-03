@@ -3417,3 +3417,124 @@ fn test_assemble_keeps_unused_dictionary_values_regardless_of_row_count() {
         Some("true")
     );
 }
+
+/// The same guarantee for a *numeric* categorical (`pd.Categorical([1, 2, 3])`
+/// reaches Arrow as `Dictionary(_, Int64)`, a real on-disk shape for cluster
+/// labels): declared order and an unused level survive assembly. The first
+/// version of the shared-values step interned only string / Boolean values, so
+/// an integer categorical still went through arrow's merge (and then the
+/// decode/re-encode fallback), which pruned the unused level and reordered the
+/// rest — round-1 finding, codex.
+#[test]
+fn test_assemble_keeps_unused_numeric_dictionary_values() {
+    use arrow::array::{Array, AsArray, DictionaryArray, Int64Array, Int8Array};
+    use arrow::datatypes::{Int64Type, Int8Type};
+
+    // Declared [3, 2, 1, 4]; 4 is used by no row. Two shards of two rows:
+    // 4 + 4 declared values >= 4 rows, so arrow would merge.
+    let shard = |idx: u32, row_start: u32, keys: Vec<i8>| {
+        let values = Int64Array::from(vec![3i64, 2, 1, 4]);
+        let dict =
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from(keys), Arc::new(values)).unwrap();
+        let schema = Arc::new(
+            Schema::new(vec![Field::new("cluster", dict.data_type().clone(), true)]).with_metadata(
+                std::collections::HashMap::from([
+                    ("shard_idx".to_string(), idx.to_string()),
+                    ("row_start".to_string(), row_start.to_string()),
+                    ("n_shard_rows".to_string(), "2".to_string()),
+                    ("n_rows_total".to_string(), "4".to_string()),
+                ]),
+            ),
+        );
+        RecordBatch::try_new(schema, vec![Arc::new(dict) as arrow::array::ArrayRef]).unwrap()
+    };
+    let merged = assemble_sharded_metadata(
+        "obs",
+        vec![(0, shard(0, 0, vec![1, 0])), (1, shard(1, 2, vec![2, 1]))],
+    )
+    .unwrap();
+    let col = merged.column(0);
+    let dict = col
+        .as_any_dictionary_opt()
+        .unwrap_or_else(|| panic!("cluster must stay a dictionary, got {:?}", col.data_type()));
+    let declared = dict.values().as_primitive::<Int64Type>();
+    assert_eq!(
+        declared.values().to_vec(),
+        vec![3, 2, 1, 4],
+        "declared order and the unused level must survive for a numeric categorical"
+    );
+    let flat = arrow::compute::cast(col, &DataType::Int64).unwrap();
+    let flat = flat.as_primitive::<Int64Type>();
+    assert_eq!(flat.values().to_vec(), vec![2, 3, 1, 2]);
+}
+
+/// The *filtered* assembler has the opposite contract, and it must hold
+/// deterministically: a `filter_obs(...).collect()` result carries only the
+/// categories present in the surviving rows (`docs/api.md` § Filtered-obs
+/// categorical semantics), in declared order. Before, that prune was arrow's
+/// data-dependent dictionary merge — it fired on a small result and not on a
+/// large one — and the first version of the shared-values step turned it off
+/// entirely on this path (round-1 finding, Cursor).
+#[test]
+fn test_assemble_filtered_prunes_dictionary_values_to_the_surviving_rows() {
+    use arrow::array::{Array, AsArray, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+
+    // Two already-row-filtered shard batches over a four-level vocabulary;
+    // between them the surviving rows use "S" and "G1" only.
+    let values = StringArray::from(vec!["G1", "S", "G2M", "M"]);
+    let shard = |keys: Vec<i8>| {
+        let dict =
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from(keys), Arc::new(values.clone()))
+                .unwrap();
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            crate::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "phase",
+            dict.data_type().clone(),
+            true,
+        )
+        .with_metadata(md)]));
+        RecordBatch::try_new(schema, vec![Arc::new(dict) as arrow::array::ArrayRef]).unwrap()
+    };
+    let a = shard(vec![1]);
+    let b = shard(vec![0, 1]);
+    // 43 rows against 3 × 4 declared values: below arrow's merge threshold
+    // (`total_values >= len`), so arrow would keep every level and the prune
+    // has to come from the assembler itself, not from arrow's data-dependent
+    // merge.
+    let big = shard(vec![1; 40]);
+    let template = a.schema();
+
+    let out = assemble_filtered_metadata(&template, vec![a, b, big]).unwrap();
+    assert_eq!(out.num_rows(), 43);
+    let col = out.column(0);
+    let dict = col
+        .as_any_dictionary_opt()
+        .unwrap_or_else(|| panic!("phase must stay a dictionary, got {:?}", col.data_type()));
+    let declared = dict.values().as_string::<i32>();
+    assert_eq!(
+        (0..declared.len())
+            .map(|i| declared.value(i))
+            .collect::<Vec<_>>(),
+        ["G1", "S"],
+        "a filtered result carries only the surviving categories, in declared order"
+    );
+    let flat = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let flat = flat.as_string::<i32>();
+    assert_eq!(flat.value(0), "S");
+    assert_eq!(flat.value(1), "G1");
+    assert_eq!(flat.value(2), "S");
+    assert_eq!(
+        out.schema()
+            .field(0)
+            .metadata()
+            .get(crate::CATEGORICAL_ORDERED_KEY)
+            .map(String::as_str),
+        Some("true"),
+        "the ordered stamp survives the prune"
+    );
+}

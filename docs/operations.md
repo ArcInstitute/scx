@@ -642,10 +642,15 @@ Every in-place obs writer — `attach_obs_columns` / `scx_attach_obs`,
 — writes a categorical column back as the Arrow dictionary it read (or was
 handed), field metadata included, so `read_obs()` returns it as `category` with
 its declared order, its unused levels and its `ordered` bit intact, and a
-categorical the *source* brings in lands the same way. Nothing on disk changed
+categorical the *source* brings in lands the same way, whatever the value type
+(string, boolean, integer or float levels alike). Nothing on disk changed
 for this: `from_anndata` always wrote dictionaries and every reader accepted
 them; the writers simply stopped decoding them to plain strings on the way
-out (pyscx 0.17). A file rewritten in place before that carries the column as a
+out (pyscx 0.17). The sharded-obs reader also stopped losing declared-but-unused
+levels on small files (arrow's dictionary merge pruned them once the summed
+per-shard vocabularies reached the row count); a `filter_obs(...).collect()`
+result still carries only the categories its surviving rows use, now
+deterministically on both obs layouts. A file rewritten in place before that carries the column as a
 dictionary in some obs shards and plain strings in others; that mix still reads
 (the assembler reconciles it) and still takes an attach, which rewrites each
 shard's rows without re-encoding the columns it does not touch. `append` /
