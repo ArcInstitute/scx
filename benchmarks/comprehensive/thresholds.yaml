@@ -3208,6 +3208,34 @@ absolute_floors:
 #          is the pre-optimization scattered path the rest of this module
 #          already reports as slow.
 #
+#     *** CENSUS IS NOT CAPTURABLE, SO THE PRESCRIBED census_500k ROW IS OUT. ***
+#     Measured 2026-09-03: `cellset_gather/census_500k/scx_auto` was killed at
+#     **205 minutes** (a slope raised to 300 min/M for this very reason) while
+#     still on **run 1 of 3** of the `cache_undersized` scenario, so the real
+#     requirement is some multiple of that. `census_1m/scx_fast` died the same
+#     way at 355 minutes. For scale, the whole tabula_sapiens_100k cell is
+#     **0.5 minutes of measured wall across 21 runs** — a >400x jump for 5x the
+#     data, so the base+slope model in `config.estimate_time_minutes` does not
+#     describe this benchmark at either end.
+#
+#     The collate arm is NOT the cause: `cache_undersized` runs at
+#     `cellset_gather.py:1236` and the collate arm at `:1483`, so the cell died
+#     before collate was reached. `cache_undersized` / `cache_suggested` are
+#     census-only cache-sizing arms and pre-date PR-02c — a July capture of
+#     census_500k completed with all 24 runs including them. Whether that means
+#     the path has since regressed is NOT established: a cohort's SLURM budget
+#     is the max over its benchmarks, so July's elapsed is unknown from the
+#     slope alone. Worth its own investigation; the `cache_undersized` wall at
+#     census is the thing to measure.
+#
+#     So author the collate floors on **tabula_sapiens_100k only**, from the
+#     2026-09-03 capture:
+#         cellsets_per_sec__collate_rust  median 763.70  ->  min: 649.15
+#         us_per_cell__collate            median  20.46  ->  max:  24.14
+#     and leave census deferred on wall-clock grounds rather than on the
+#     "check the wall first" caution above — the wall has now been checked and
+#     it does not fit.
+#
 #     Note the floors are only *reachable* because PR-02c narrowed
 #     `cellset_gather_s512_raises_pooled_rss.md` to
 #     `metrics: [peak_rss_mb_median, median_wall_s]`. Unscoped, that
