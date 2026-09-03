@@ -1517,19 +1517,31 @@ absolute_floors:
     metric: batches_per_sec__pyscx_training_dataset_workers2_persistent
     min: 11.0
 
-  # IndexPlanDataset workers2 floor — same 0.5×-of-post-fix-median
-  # convention as the workers2 entries above.
-  # Calibrated 2026-05-01 from SLURM job 113080 (Lambda HPC, H100, 100k
-  # synthetic fixture): median workers2 throughput 144.64 bps; floor =
-  # 0.5 × 144.64 ≈ 72.3 bps. Workers2 is ~0.36× workers0 (404.4 bps) —
-  # lower than the TrainingDataset workers2 ratio (~0.50×) because each
-  # worker thrashes the shard cache on a non-locality-sorted random
-  # plan stream.
+  # IndexPlanDataset workers2 floor — RE-DERIVED 2026-09-03 from measurement.
+  #
+  # Was `min: 72.3`, "calibrated 2026-05-01 from SLURM job 113080 (Lambda HPC,
+  # H100, 100k **synthetic** fixture): median workers2 throughput 144.64 bps;
+  # floor = 0.5 × 144.64". That anchor never transferred: it was a different
+  # fixture on a different cluster, applied to the real
+  # `tabula_sapiens_100k`. Measured here: **0.66, 0.67 bps** (median 0.665,
+  # 50 batches in 75.2 / 74.7 s) — the floor was 109x above what the metric
+  # reports, so it could never pass and had been a permanent violation for as
+  # long as it has existed.
+  #
+  # This is a correction, not a concession to a regression: the metric did not
+  # get slower. The July 2026 captures have no `workers2` key at all, and the
+  # comparable `..._locality` variant is *faster* now than in July (0.52 ->
+  # 0.72 at tabula). See the locality block below for the same story with
+  # before/after numbers.
+  #
+  # New floor = 0.85 × 0.665 = 0.565. Tighter than the file's older 0.5x
+  # convention because the run-to-run spread is tiny (0.66 / 0.67), and a
+  # gross-regression guard that sits 109x away guards nothing.
   - benchmark: index_plan
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_index_plan_dataset_workers2
-    min: 72.3
+    min: 0.565
 
   # --- correctness validation suite ----------------------------------
   # Hard parity gate: any failure in scanpy-equivalence,
@@ -1843,34 +1855,66 @@ absolute_floors:
   # the sequential pipeline that would otherwise leave index_plan looking
   # healthy.
   #
-  # Smaller-dataset floors derived by scaling: pbmc3k (~3K cells) and
-  # tabula_sapiens_100k (~100K cells) shouldn't see worse cps than the
-  # 1M result × 0.5 safety margin, since smaller fixtures fit in cache
-  # better and don't exercise shard-decode misses.
+  # `..._index_plan_locality` — pbmc3k KEPT, tabula RE-DERIVED 2026-09-03.
+  #
+  # These were "derived by scaling" from a synthetic 1M anchor on the
+  # assumption that "smaller fixtures fit in cache better". The *direction* was
+  # right and the *magnitudes* were not. Measured 2026-09-03:
+  #
+  #     pbmc3k               114.08 bps   (floor 5.0    — passes, kept)
+  #     tabula_sapiens_100k    0.72 bps   (floor 12.0   — 17x above; re-derived)
+  #     census_1m              0.20 bps   (floor 4.9    — 25x above; see below)
+  #
+  # The ordering 114 > 0.72 > 0.20 is exactly "smaller fits better", so the
+  # model was sound; the anchor was not. The synthetic 1M fixture ran 9.81 bps
+  # where the real census_1m runs 0.20 — **49x apart at the same cell count** —
+  # and the census block below already warned "census_1m may use a different
+  # fixture than the synthetic 1M one … drop or re-tune if the dataset mismatch
+  # causes spurious failures". This is that re-tune.
+  #
+  # NOT a regression: `..._locality` at tabula measured 0.520 in three separate
+  # July 2026 snapshots (`baseline_2026_07_10`,
+  # `candidate_auto_converge_20260712`, `candidate_2026_07_23_dataload_phase0`)
+  # and 0.720 today — a 38% improvement. The `..._training_dataset` variant on
+  # the same fixture went 20.825 -> 24.395 and passes its floor.
+  #
+  # pbmc3k's 5.0 is left alone: it is 23x below a stable 114.08, so it is loose,
+  # but it is the one value in this group that was never wrong and re-deriving
+  # it is not this change's business.
   - benchmark: index_plan
     format: scx_auto
     dataset: pbmc3k
     metric: batches_per_sec__pyscx_index_plan_locality
     min: 5.0
+  # 0.85 × 0.720 = 0.612. Spread is 0.72 / 0.72 across both runs.
   - benchmark: index_plan
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_index_plan_locality
-    min: 12.0
+    min: 0.612
   - benchmark: index_plan
     format: scx_auto
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__pyscx_training_dataset
     min: 23.0
-  # 1M synthetic floors at 0.5x observed median (9.81 / 36.62 → 4.9 / 18.3).
-  # Note: census_1m may use a different fixture than the synthetic 1M one,
-  # so this floor is conservative. Drop or re-tune if the dataset
-  # mismatch causes spurious failures.
+  # Was "1M synthetic floors at 0.5x observed median (9.81 / 36.62 → 4.9 /
+  # 18.3)", with the caveat "census_1m may use a different fixture than the
+  # synthetic 1M one … drop or re-tune if the dataset mismatch causes spurious
+  # failures". It did, and this is the re-tune: measured 0.20 bps (50 batches
+  # in 244.6 s, both runs identical), so the synthetic anchor was 49x optimistic
+  # for the real fixture. New floor = 0.85 × 0.20 = 0.170.
+  #
+  # CAVEAT on precision: the metric is recorded rounded to 2 decimals, so at
+  # 0.20 one tick is 5% of the value and the 15% margin is three ticks. Fine as
+  # a gross-regression guard; do not read it as a 15%-sensitive gate.
+  #
+  # `..._training_dataset` on the same triple measured 21.775 against its 18.3
+  # floor and is left alone — that anchor did transfer.
   - benchmark: index_plan
     format: scx_auto
     dataset: census_1m
     metric: batches_per_sec__pyscx_index_plan_locality
-    min: 4.9
+    min: 0.170
   - benchmark: index_plan
     format: scx_auto
     dataset: census_1m
