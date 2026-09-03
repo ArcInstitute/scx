@@ -3240,13 +3240,36 @@ absolute_floors:
 #     40 batches cannot separate a one-off construction cost from a per-batch
 #     one — the constructor alone was 8.3-8.8 s in that probe.
 #
-#     The mechanism is real and confirmed live, so the small number is a
-#     finding, not a measurement error: a batch's `obs["observation_joinid"]`
-#     arrives as `{codes, categories}` with **957,955 categories**, and
-#     `categories is previous_batch_categories` is False — the list is rebuilt
-#     every batch, uncached, exactly as OPT-LOADER-6 describes. It costs ~8 ns
-#     per category, so ~7.9 ms on a 238 ms batch: **~3% of an epoch, not the
-#     several-fold the review predicted.** Price OPT-LOADER-6 accordingly.
+#     The mechanism is real and confirmed live: a batch's
+#     `obs["observation_joinid"]` arrives as `{codes, categories}` with
+#     **957,955 categories**, and `categories is previous_batch_categories` is
+#     False — the list is rebuilt every batch, uncached, exactly as
+#     OPT-LOADER-6 describes.
+#
+#     *** CORRECTED 2026-09-02, AND THE CONCLUSION REVERSES. ***
+#     Every number above was measured against a DEBUG pyscx `.so`. The in-tree
+#     editable build was a debug artifact from 08-31 until it was rebuilt
+#     `--release` at 12:13 on 09-02; the targeted job that produced them ran at
+#     09:23, before that. `run_parallel` refuses to start on a debug build for
+#     exactly this reason, but a script that calls the benchmark functions
+#     directly bypasses the guard. Re-measured through the real capture
+#     (release, warm, census_1m, 977 batches, 3 runs):
+#
+#       scenario            batches/s     ms/batch
+#       raw (no obs)           51.70        19.34
+#       raw_obs_lowcard        47.40        21.10   ("sex", 3 categories)
+#       raw_obs_highcard       26.80        37.31   (957,955 categories)
+#
+#     The overhead is **16.2 ms/batch**, not 7.9, and the slowdown is
+#     **1.77x**, not 1.033x. On a debug build every path is 4-10x slower, so a
+#     constant per-batch cost is swamped and reads as noise; on release it
+#     dominates. So the earlier "~3% of an epoch, not the several-fold the
+#     review predicted" is wrong in the direction that matters:
+#     **OPT-LOADER-6 is worth ~1.77x on this path**, and the review's estimate
+#     was closer than the correction that replaced it. Price it accordingly.
+#
+#     Take this as a general caution about every measurement in this file that
+#     did not go through `run_parallel`.
 #
 #     The arm honours `cold_cache` (`drop_file_cache` before every timed epoch,
 #     policy recorded as `cache_policy`); it did not at first, so a cold
@@ -3350,12 +3373,36 @@ absolute_floors:
 #     reading 28 obs columns to join is the other 89%. Do not floor it as an
 #     OPT-FORMAT-1 signal.
 #
+#     *** ALL THE CENSUS NUMBERS ABOVE ARE DEBUG-BUILD NUMBERS. ***
+#     Same cause as item 16: the in-tree editable pyscx `.so` was a debug
+#     artifact from 08-31 until it was rebuilt `--release` at 12:13 on 09-02,
+#     and the targeted job that produced them ran at 09:23. Re-measured through
+#     the real capture (release, census_1m, identical work — `rows_imported`
+#     1,000,000, `n_matched` 1,000,000, `obs_rewrite_bytes` 493,330,352,
+#     `size_before_bytes` 2,800,057,397):
+#
+#         metric              debug (09:23)   release (capture)
+#         wall_s__rollback        2.247            1.674
+#         wall_s__delete          1.727            1.701
+#         wall_s__obs_import     19.72             4.33
+#
+#     `rollback` and `delete` barely move — they are dominated by a BLAKE3
+#     stream and an fsync, which a debug build does not slow down. `obs_import`
+#     is 4.5x faster, because its other 89% *is* interpreted work.
+#
+#     Which changes the split this entry reports: the rehash is now ~1.67 s of
+#     4.33 s, i.e. **~39%**, not ~11%. The ordering conclusion survives —
+#     `rollback` is still the cleanest OPT-FORMAT-1 instrument, being
+#     essentially all checksum — but `obs_import` is not the 89%-elsewhere
+#     signal this entry described.
+#
 #     ACTIVATION: floor `wall_s__rollback` on census_1m at 1.25x its median
-#     (2.247 s -> max ~2.81). `wall_s__delete` is a usable second. Expect both
-#     to drop to near zero when OPT-FORMAT-1 lands — that is the point, so
-#     re-baseline in the same change rather than treating it as a failure.
-#     `wall_s__obs_import` is still worth a (looser) ceiling, but as a guard on
-#     the obs-rewrite path, not the checksum.
+#     from the release capture (1.674 s -> max ~2.09; NOT the 2.81 derived from
+#     the debug number, which would be 68% slack). `wall_s__delete` is a usable
+#     second. Expect both to drop to near zero when OPT-FORMAT-1 lands — that
+#     is the point, so re-baseline in the same change rather than treating it
+#     as a failure. `wall_s__obs_import` is still worth a (looser) ceiling, but
+#     as a guard on the obs-rewrite path, not the checksum.
 #
 # 19. cloud_metadata / `scx info <cloud-url>` — OPT-CLOUD-1
 #     A subprocess arm, added in PR-02c: `scx info --json <gs://…>`. Not a
@@ -3363,8 +3410,19 @@ absolute_floors:
 #     two columns the library open does not (the per-shard codec breakdown and
 #     the value-encoding summary) by range-reading every CSR shard's 76-byte
 #     header at `METADATA_SHARD_FETCH_CONCURRENCY = 8`. That constant is what
-#     OPT-CLOUD-1 raises, and only this arm moves when it does (~175 s -> ~22 s
-#     expected on the largest fixture).
+#     OPT-CLOUD-1 raises, and only this arm moves when it does.
+#
+#     *** THE "~175 s -> ~22 s expected" FIGURE THIS ENTRY CARRIED IS WRONG. ***
+#     Measured through the capture on the tier fixtures, `wall_s__scx_info_cloud`
+#     medians are **0.21 s (pbmc3k / pbmc10k), 0.23 (smartseq2), 0.24 (tabula),
+#     0.41 (census_500k), 0.62 (census_1m)** — three orders off. Whatever the
+#     175 s described, it was not `scx info` over these fixtures. Two
+#     consequences: OPT-CLOUD-1's expected win here is a fraction of a second,
+#     not minutes, so it should not be justified on this arm; and the metric is
+#     close to the "do not floor a quantity smaller than its own noise" rule —
+#     census_1m ranges 0.587 / 0.622 / 1.506 across three runs, a 2.4x spread
+#     on a sub-second number. Floor it if you like, but expect the ceiling to
+#     be doing very little.
 #
 #     ACTIVATION, and the ORDER matters:
 #       1. `scx_info_cloud_ok` -> min: 1.0 can be authored FIRST and needs no
