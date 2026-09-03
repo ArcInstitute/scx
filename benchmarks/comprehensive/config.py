@@ -1712,6 +1712,43 @@ def estimate_time_minutes(
         # the floor list and would clip if anyone extends roundtrip to
         # 1M+ datasets.
         slope_minutes_per_million = 16
+    elif benchmark == "cellset_gather":
+        # Scattered cold gather, and since the collate arm landed, ten gathered
+        # batches held resident on top. The 8/M default budgeted 60 min for
+        # census_500k; the 2026-09-02 tier-full capture ran it 134 minutes and
+        # SLURM killed it, taking a floored triple's rows with it — the collate
+        # floors in the Deferred block are prescribed on census_500k. Same for
+        # `census_1m/scx_fast`.
+        #
+        # 300/M is set from the one hard datum (>134 min at 0.5M) with margin,
+        # not from a completed run: census_500k -> 205 min, census_1m -> 355.
+        # Census-only, because `per_million` floors at 0.1: an unguarded 300/M
+        # would add 30 minutes to a 2-minute pbmc3k cell, and 652 cohorts each
+        # asking for more than they need slows the whole capture through
+        # backfill scheduling. Same guard on the three below.
+        # Replace it with a measured value once a census cell finishes. These
+        # are ceilings and SLURM bills actual usage, so over-budgeting costs
+        # scheduling priority while under-budgeting costs the row.
+        slope_minutes_per_million = 300 if n_obs >= 500_000 else 8
+    elif benchmark == "accel_knn":
+        # HNSW build is superlinear in n_obs and the census cells are the whole
+        # cost. The 8/M default gave census_500k 65 min and census_1m 70; both
+        # timed out on 2026-09-02, on `pyscx_cpu` and `pyscx_gpu_no_rapids`
+        # alike (the no-rapids variant is a CPU path by construction).
+        # 200/M -> 160 / 260 min.
+        slope_minutes_per_million = 200 if n_obs >= 500_000 else 8
+    elif benchmark == "accel_harmony":
+        # FLOOR-ONLY (`mean_per_pc_r_vs_harmonypy >= 0.99` on CPU+GPU x
+        # pbmc3k+census_1m), so a timeout here costs a floor its only evidence.
+        # The 8/M default gave census_1m 100 min and the CPU cell timed out
+        # there on 2026-09-02. 200/M -> 290 min.
+        slope_minutes_per_million = 200 if n_obs >= 500_000 else 8
+    elif benchmark == "accel_de":
+        # The `scanpy_wilcoxon_cpu` reference arm dominates at census scale — it
+        # timed out at the 55 min the 8/M default allowed on census_1m
+        # (2026-09-02). The pyscx arms are far quicker, but a cohort's budget
+        # has to cover its slowest arm. 200/M -> 245 min.
+        slope_minutes_per_million = 200 if n_obs >= 500_000 else 8
     elif benchmark == "cell_eval_parity_perf":
         # cell-eval's edistance reference is O(n_obs^2) pairwise distance
         # × n_perts × n_runs, so wall-time scales near-quadratically with

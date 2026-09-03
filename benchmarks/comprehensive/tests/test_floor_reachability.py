@@ -915,6 +915,44 @@ def test_the_index_preset_arm_is_scoped_to_where_the_feature_works():
     )
 
 
+def test_cross_module_benchmark_helper_calls_match_their_signatures():
+    """A helper shared between two benchmark modules must be called correctly.
+
+    `accel_format_pipeline` imports `_prepare_sidecar_scx` from
+    `accel_to_gpu_anndata`. That function grew a third parameter (`arm`) when
+    the shufdelta arms landed, and this call site was not updated — so every
+    `accel_format_pipeline__scx_devdecode_rapids_gpu` cell raised
+    `TypeError: _prepare_sidecar_scx() missing 1 required positional argument:
+    'arm'` from then until the 2026-09-02 capture surfaced it, six cells at a
+    time. Nothing type-checks these modules and nothing imported the pair
+    together, so the break was invisible outside a real run.
+
+    Checked by binding the actual call's arguments against the actual
+    signature, which is the only form that catches a parameter added on the
+    other side of the import.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_format_pipeline as afp
+    from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import (
+        _prepare_sidecar_scx,
+    )
+    from benchmarks.comprehensive.config import DATASETS
+
+    sig = inspect.signature(_prepare_sidecar_scx)
+    arm = afp._TO_GPU_ARMS[afp._SCX1_ARM_KEY]
+    # Binding raises TypeError on an arity or name mismatch without running it.
+    bound = sig.bind(DATASETS["pbmc3k"], "/tmp", arm)
+    assert set(bound.arguments) == set(sig.parameters), (
+        f"call binds {sorted(bound.arguments)} against parameters "
+        f"{sorted(sig.parameters)}"
+    )
+    # And the arm has to be the Scx1 one: this benchmark needs the decode
+    # sidecar, which `auto` would drop on a median-nonzero > 8 fixture.
+    assert arm.codec == "scx1", arm
+    assert arm.fixture_attr == "scx_scx1_path", arm
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 
