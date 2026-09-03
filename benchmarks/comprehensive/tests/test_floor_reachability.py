@@ -750,10 +750,9 @@ def test_a_transient_sbatch_failure_does_not_discard_the_whole_capture():
         "sbatch: error: Batch job submission failed: Socket timed out on "
         "send/recv operation"
     )
-    # And the one the prior comment history records from a purged upstream
-    # convert racing its dependents' submission.
     assert _is_transient_sbatch_error(
-        "sbatch: error: Batch job submission failed: Job dependency problem"
+        "sbatch: error: Batch job submission failed: Unable to contact slurm "
+        "controller (connect failure)"
     )
 
     # Permanent misconfiguration must NOT retry.
@@ -773,6 +772,31 @@ def test_a_transient_sbatch_failure_does_not_discard_the_whole_capture():
     assert not _is_transient_sbatch_error(
         "sbatch: error: QOSMaxSubmitJobPerUserLimit"
     ), "the QOS limit needs the drain branch, not a blind backoff"
+
+    # Nor may "Job dependency problem", which is the one that looks transient
+    # and is not. It means `afterok:<jid>` names a job SLURM no longer knows —
+    # almost always because the conversion FINISHED and was purged between
+    # being recorded and the cohort being submitted. Waiting cannot help: the
+    # id stays purged. A capture died 8 minutes in on
+    # `pbmc10k/anndata_zarr_backed` after two backoffs arrived at the same
+    # error, because this string WAS in the list.
+    from benchmarks.comprehensive.scripts.run_parallel import (
+        _DEPENDENCY_PROBLEM,
+        _dependency_already_satisfied,
+    )
+
+    assert not _is_transient_sbatch_error(
+        f"sbatch: error: Batch job submission failed: {_DEPENDENCY_PROBLEM}"
+    ), (
+        "'Job dependency problem' is back in the transient list; a backoff "
+        "spends three attempts reaching the same permanent error instead of "
+        "checking whether the dependency had already succeeded"
+    )
+    # And the recovery must fail closed: no id, or an id whose job is not
+    # COMPLETED, must not license dropping the dependency — that would race a
+    # still-running conversion and let a benchmark read a half-written fixture.
+    assert _dependency_already_satisfied(None) is False
+    assert _dependency_already_satisfied("99999999999") is False
 
     # `_submit_cohort` is nested inside `main()`, so slice it out by AST
     # rather than `inspect.getsource` on an attribute that does not exist.
@@ -801,7 +825,10 @@ def test_a_transient_sbatch_failure_does_not_discard_the_whole_capture():
         f"the retry loop matches the generic submission-failure prefix in "
         f"code, which also covers permanent misconfiguration: {offending}"
     )
-    assert len(_TRANSIENT_SBATCH_ERRORS) >= 4, _TRANSIENT_SBATCH_ERRORS
+    # A count, not a lower bound on ambition: this list should stay short.
+    # Every entry is a claim that waiting helps, and the one entry that was
+    # wrong about that cost a capture.
+    assert len(_TRANSIENT_SBATCH_ERRORS) >= 3, _TRANSIENT_SBATCH_ERRORS
 
 
 def test_archive_mode_refuses_to_sweep_without_a_cutoff():

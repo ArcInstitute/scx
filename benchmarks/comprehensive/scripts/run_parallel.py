@@ -147,8 +147,35 @@ _TRANSIENT_SBATCH_ERRORS: tuple[str, ...] = (
     "Socket timed out on send/recv operation",
     "Unable to contact slurm controller",
     "Zero Bytes were transmitted or received",
-    "Job dependency problem",
 )
+
+# NOT in the list above, and the distinction cost a capture. "Job dependency
+# problem" means `afterok:<jid>` names a job SLURM no longer knows — almost
+# always because the conversion FINISHED and was purged (MinJobAge) between
+# being recorded and the dependent cohort being submitted. Waiting cannot help:
+# the id stays purged, so a backoff just spends three attempts arriving at the
+# same error. A tier-full capture died on it 8 minutes in, on
+# `pbmc10k/anndata_zarr_backed`, after two pointless retries.
+#
+# The right recovery is to check the dependency's real state and, if it
+# succeeded, resubmit WITHOUT the dependency — which is what
+# `_dependency_already_satisfied` is for.
+_DEPENDENCY_PROBLEM = "Job dependency problem"
+
+
+def _dependency_already_satisfied(dep_jobid: str | None) -> bool:
+    """True when a rejected `afterok` dependency had in fact already succeeded.
+
+    A purged job id is indistinguishable from a bad one at `sbatch` time, so
+    ask `sacct`, which retains the record after squeue has dropped it. An empty
+    or non-terminal answer is treated as NOT satisfied: resubmitting without a
+    dependency that might still be pending would race the conversion, and a
+    loud failure beats a benchmark reading a half-written fixture.
+    """
+    if not dep_jobid:
+        return False
+    state = _sacct_head_state(str(dep_jobid))
+    return state == "COMPLETED"
 
 
 def _is_transient_sbatch_error(msg: str) -> bool:
@@ -1632,6 +1659,27 @@ def main() -> None:
                         effective_cap, kind="bench", headroom=tasks_in_cohort
                     )
                     continue
+                if _DEPENDENCY_PROBLEM in msg and dep_jobid and not last:
+                    if _dependency_already_satisfied(dep_jobid):
+                        logger.warning(
+                            "Cohort %s/%s was rejected with %r on "
+                            "afterok:%s, but that conversion COMPLETED and "
+                            "was purged from squeue; resubmitting without the "
+                            "dependency.",
+                            ds_name, fmt_key, _DEPENDENCY_PROBLEM, dep_jobid,
+                        )
+                        update_kwargs["slurm_additional_parameters"] = {}
+                        executor.update_parameters(**update_kwargs)
+                        continue
+                    logger.error(
+                        "Cohort %s/%s rejected with %r on afterok:%s, and "
+                        "that job is not COMPLETED (sacct: %r). Not "
+                        "resubmitting without the dependency — a benchmark "
+                        "would read a half-written fixture.",
+                        ds_name, fmt_key, _DEPENDENCY_PROBLEM, dep_jobid,
+                        _sacct_head_state(str(dep_jobid)),
+                    )
+                    raise
                 if _is_transient_sbatch_error(msg) and not last:
                     backoff = 30 * (_attempt + 1)
                     logger.warning(
