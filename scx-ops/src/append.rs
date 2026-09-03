@@ -1596,10 +1596,15 @@ fn effective_type(dt: &arrow::datatypes::DataType) -> &arrow::datatypes::DataTyp
 /// `ScxWriter::write_arrow_ipc` serialises whatever it is handed. So every op
 /// that runs this over an obs table permanently converts that table's
 /// categoricals to plain strings, and a `cell_type` column comes back from
-/// `read_obs()` as `object` rather than `category`. That is a real defect and
-/// it is not this function's alone — `append` writes obs categoricals as `Utf8`
-/// by a different route — so it wants one fix across that family rather than a
-/// per-caller patch. Recorded here so the next reader is not misled twice.
+/// `read_obs()` as `object` rather than `category`. The in-place obs writers
+/// (`modify_metadata`, `attach_external_obs`, `attach_external_layer`) no
+/// longer call this: they never concatenate, so a dictionary they read or are
+/// handed is already unique, and they write it through as a dictionary with
+/// its field metadata. The callers that remain — `append`, `merge`,
+/// `merge_sorted` — do concatenate, and still decode here; giving them
+/// dictionary output too is the tracked follow-on (the read side's
+/// `unify_dictionary_columns` is the primitive to reuse). Recorded here so the
+/// next reader is not misled twice.
 ///
 /// **Metadata is carried across unchanged**, at both the schema and the field
 /// level, because none of it is this function's business to edit. Two things
@@ -1652,8 +1657,7 @@ pub(crate) fn unify_dict_columns(
                 arrow::datatypes::Field::new(field.name(), value_type.clone(), field.is_nullable())
                     // Only the *type* changes here. `scx.categorical.ordered`
                     // lives on these very fields, so rebuilding without it turns
-                    // an ordered categorical unordered on every append / merge /
-                    // modify_metadata.
+                    // an ordered categorical unordered on every append / merge.
                     .with_metadata(field.metadata().clone()),
             );
             new_columns.push(cast_col);

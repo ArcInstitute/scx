@@ -679,3 +679,57 @@ fn an_h5ad_source_without_the_feature_says_what_to_do_instead() {
     assert!(m.contains("no HDF5 support"), "{m}");
     assert!(m.contains("to_csv"), "{m}");
 }
+
+// ---------------------------------------------------------------------------
+// Field metadata rides along
+// ---------------------------------------------------------------------------
+
+/// A categorical column arriving from the h5ad reader is a dictionary carrying
+/// its `scx.categorical.ordered` stamp in field metadata. Projection renames,
+/// prefixes and forces nullability — it must not rebuild the field without the
+/// metadata, or the ordered bit is gone before the attach op ever sees it.
+#[test]
+fn project_annotations_keeps_field_metadata() {
+    use arrow::array::{ArrayRef, DictionaryArray, Int32Array, RecordBatch};
+    use arrow::datatypes::{Field, Int32Type, Schema};
+    use std::sync::Arc;
+
+    let dict = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![0, 1]),
+        Arc::new(StringArray::from(vec!["singlet", "doublet"])),
+    )
+    .unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        crate::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("barcode", DataType::Utf8, false),
+        Field::new("class", dict.data_type().clone(), false).with_metadata(md),
+    ]);
+    let table = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            Arc::new(dict) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let mut o = opts();
+    o.prefix = "dbl_".to_string();
+    let out = project_annotations(&table, &["barcode".to_string()], &o).unwrap();
+
+    let field = out.schema().field_with_name("dbl_class").unwrap().clone();
+    assert!(matches!(field.data_type(), DataType::Dictionary(_, _)));
+    assert!(field.is_nullable(), "nullability is still forced");
+    assert_eq!(
+        field
+            .metadata()
+            .get(crate::CATEGORICAL_ORDERED_KEY)
+            .map(String::as_str),
+        Some("true"),
+        "projection dropped the ordered stamp"
+    );
+}

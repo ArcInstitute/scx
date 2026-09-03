@@ -52,20 +52,46 @@ test_that("scx_attach_obs joins by key, not by row position", {
 })
 
 test_that("a factor column survives as a factor", {
-  # scDblFinder's class column is a factor, and R's data.frame default used to
-  # make one out of any character vector — either way it must round-trip.
+  # scDblFinder's class column is a factor. It must come back as one — levels
+  # in the declared order, an unused level kept — not as the character vector
+  # the attach used to decode it to. (The old assertion accepted either, which
+  # is how the decode went unnoticed.)
   path <- attach_fixture()
   on.exit(unlink(path), add = TRUE)
 
   keys <- rownames(obs_of(path))[1:2]
-  df <- data.frame(dbl_class = factor(c("singlet", "doublet")))
+  df <- data.frame(dbl_class = factor(c("singlet", "doublet"),
+                                      levels = c("singlet", "doublet", "unsure")))
   rownames(df) <- keys
 
   scx_attach_obs(path, df, key = rownames(df))
   back <- obs_of(path)
-  expect_true(is.factor(back$dbl_class) || is.character(back$dbl_class))
+  expect_true(is.factor(back$dbl_class))
+  expect_false(is.ordered(back$dbl_class))
+  expect_equal(levels(back$dbl_class), c("singlet", "doublet", "unsure"))
   expect_equal(as.character(back$dbl_class[1]), "singlet")
   expect_equal(as.character(back$dbl_class[2]), "doublet")
+  # A cell the caller did not cover is NA, not a fabricated level.
+  expect_true(is.na(back$dbl_class[3]))
+})
+
+test_that("an ordered factor keeps its order through a prefixed attach", {
+  # `prefix=` renames every attached column; the rename must carry the field
+  # metadata that records `ordered`, or the factor comes back unordered.
+  path <- attach_fixture()
+  on.exit(unlink(path), add = TRUE)
+
+  keys <- rownames(obs_of(path))[1:3]
+  df <- data.frame(phase = factor(c("G2M", "G1", "S"),
+                                  levels = c("G1", "S", "G2M", "M"),
+                                  ordered = TRUE))
+  rownames(df) <- keys
+
+  scx_attach_obs(path, df, key = rownames(df), prefix = "cc_")
+  back <- obs_of(path)
+  expect_true(is.ordered(back$cc_phase))
+  expect_equal(levels(back$cc_phase), c("G1", "S", "G2M", "M"))
+  expect_equal(as.character(back$cc_phase[1:3]), c("G2M", "G1", "S"))
 })
 
 test_that("prefix is applied to the attached columns", {

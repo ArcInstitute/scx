@@ -1,0 +1,280 @@
+"""Categoricals survive every in-place obs writer.
+
+`from_anndata` writes a pandas categorical as an Arrow dictionary with the
+`scx.categorical.ordered` field stamp, and every reader rebuilds
+`pd.Categorical` from it. The in-place obs writers — `attach_obs_columns`,
+`obs_import`, `doublet_import`, `cellbender_import`, `modify_metadata(obs=)` —
+used to run the rebuilt obs table through a dictionary→string cast on its way
+back to disk, so after any of them *every* categorical obs column came back from
+`read_obs()` as `object`, its category list and `ordered` bit gone. arc-reactor
+carried a "categorical → object after any writer" caveat and dtype-tolerant
+comparers because of it.
+
+The contract pinned here, for each writer: the target's existing categoricals
+keep their dtype, declared category order, unused levels and `ordered` bit; a
+categorical the *source* brings in lands the same way; values are unchanged.
+
+Each arm runs over both obs layouts, because they are two code paths: a sharded
+obs is rewritten shard by shard (streamed), a single legacy section is read
+whole and re-sharded (materialised). Every arm asserts which layout it got.
+
+The fixture is deliberately reorder-sensitive (copied from
+`test_ordered_categorical.py`): `phase`'s declared order is neither alphabetical
+nor first-appearance order, and level `"M"` is declared and used by no cell. A
+writer that rebuilt the vocabulary from the data would pass a weaker fixture.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+import pyscx
+
+anndata = pytest.importorskip("anndata")
+sparse = pytest.importorskip("scipy.sparse")
+
+N_OBS = 12
+PHASE_LEVELS = ["G1", "S", "G2M", "M"]
+BATCH_LEVELS = ["a", "b"]
+
+
+def _phase_values(n):
+    return [["G2M", "G1", "S"][i % 3] for i in range(n)]
+
+
+def _adata(n_obs=N_OBS):
+    rng = np.random.default_rng(0)
+    x = sparse.csr_matrix(rng.integers(0, 5, size=(n_obs, 3)).astype(np.float32))
+    phase = pd.Categorical(_phase_values(n_obs), categories=PHASE_LEVELS, ordered=True)
+    batch = pd.Categorical(
+        [["b", "a"][i % 2] for i in range(n_obs)], categories=BATCH_LEVELS, ordered=False
+    )
+    obs = pd.DataFrame(
+        {"phase": phase, "batch": batch, "n_counts": np.arange(n_obs, dtype=np.float64)},
+        index=[f"cell_{i}" for i in range(n_obs)],
+    )
+    var = pd.DataFrame(
+        {"kind": pd.Categorical(["coding", "lnc", "coding"], categories=["lnc", "coding"])},
+        index=[f"gene_{i}" for i in range(3)],
+    )
+    return anndata.AnnData(X=x, obs=obs, var=var)
+
+
+SHARDED = pytest.param(4, id="sharded-obs")
+SINGLE = pytest.param(64, id="single-obs")
+
+
+@pytest.fixture(params=[SHARDED, SINGLE])
+def target(tmp_path, request):
+    """`(path, barcodes, shard_size)` — an SCX file with the reorder-sensitive obs."""
+    adata = _adata()
+    path = str(tmp_path / "t.scx")
+    pyscx.from_anndata(adata, path, shard_size=request.param)
+    _assert_layout(path, request.param)
+    return path, list(adata.obs_names), request.param
+
+
+def _assert_layout(path, shard_size):
+    count = pyscx.open(path).obs_metadata_shard_count
+    if shard_size < N_OBS:
+        assert count > 1, "fixture was meant to have a sharded obs"
+    else:
+        assert count in (0, 1), "fixture was meant to have a single obs section"
+
+
+def _assert_target_factors_intact(obs):
+    """Both of the target's factors survive whole: dtype, order, unused level, bit."""
+    assert isinstance(obs["phase"].dtype, pd.CategoricalDtype), obs["phase"].dtype
+    assert obs["phase"].cat.ordered is True
+    assert list(obs["phase"].cat.categories) == PHASE_LEVELS
+    assert list(obs["phase"].astype(str)) == _phase_values(len(obs))
+
+    assert isinstance(obs["batch"].dtype, pd.CategoricalDtype), obs["batch"].dtype
+    assert obs["batch"].cat.ordered is False
+    assert list(obs["batch"].cat.categories) == BATCH_LEVELS
+
+
+# The categorical a caller attaches: declared order is not alphabetical, "mid"
+# is declared and used by no row.
+NEW_LEVELS = ["hi", "lo", "mid"]
+
+
+def _new_categorical(n):
+    return pd.Categorical([["lo", "hi"][i % 2] for i in range(n)], categories=NEW_LEVELS, ordered=True)
+
+
+def _assert_new_column(obs, name, covered):
+    assert isinstance(obs[name].dtype, pd.CategoricalDtype), obs[name].dtype
+    assert obs[name].cat.ordered is True
+    assert list(obs[name].cat.categories) == NEW_LEVELS
+    for cell in obs.index:
+        if cell in covered:
+            assert obs.loc[cell, name] == covered[cell]
+        else:
+            assert pd.isna(obs.loc[cell, name]), "an uncovered row is null, not a level"
+
+
+# ---------------------------------------------------------------------------
+# attach_obs_columns
+# ---------------------------------------------------------------------------
+
+
+def test_attach_obs_columns_key_joined(target):
+    path, bc, _ = target
+    # Ten of twelve cells, reversed relative to the file.
+    covered_cells = list(reversed(bc[:10]))
+    new = _new_categorical(len(covered_cells))
+    df = pd.DataFrame({"call": new}, index=covered_cells)
+
+    r = pyscx.attach_obs_columns(path, df)
+    assert r["n_matched"] == 10
+
+    obs = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(obs)
+    _assert_new_column(obs, "call", dict(zip(covered_cells, new.astype(str))))
+
+
+def test_attach_obs_columns_positional(target):
+    path, bc, _ = target
+    new = _new_categorical(len(bc))
+    df = pd.DataFrame({"call": new})
+
+    pyscx.attach_obs_columns(path, df, positional=True)
+
+    obs = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(obs)
+    _assert_new_column(obs, "call", dict(zip(bc, new.astype(str))))
+
+
+# ---------------------------------------------------------------------------
+# obs_import / doublet_import / cellbender_import
+# ---------------------------------------------------------------------------
+
+
+def test_obs_import_keeps_the_targets_categoricals(target, tmp_path):
+    path, bc, _ = target
+    csv = tmp_path / "calls.csv"
+    pd.DataFrame({"barcode": list(reversed(bc)), "score": np.linspace(0, 1, len(bc))}).to_csv(
+        csv, index=False
+    )
+
+    pyscx.obs_import(path, str(csv))
+
+    obs = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(obs)
+    assert obs["score"].tolist() == list(reversed(np.linspace(0, 1, len(bc))))
+
+
+def test_doublet_import_keeps_the_targets_categoricals(target, tmp_path):
+    path, bc, _ = target
+    csv = tmp_path / "scrub.csv"
+    pd.DataFrame(
+        {
+            "barcode": bc,
+            "doublet_score": np.linspace(0, 1, len(bc)),
+            "predicted_doublet": [True, False] * (len(bc) // 2),
+        }
+    ).to_csv(csv, index=False)
+
+    pyscx.doublet_import(path, str(csv), tool="scrublet")
+
+    obs = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(obs)
+    assert "scrublet_score" in obs.columns
+
+
+@pytest.mark.skipif(not pyscx._HAS_HDF5, reason="cellbender_import needs the hdf5 feature")
+def test_cellbender_import_keeps_the_targets_categoricals(target, tmp_path):
+    pytest.importorskip("h5py")
+    from test_cellbender import _write_cellbender_h5
+
+    path, bc, _ = target
+    genes = list(pyscx.open(path).read_var().index)
+    cb = tmp_path / "cb.h5"
+    _write_cellbender_h5(cb, list(reversed(bc)), genes, lambda b: bc.index(b) + 1)
+
+    pyscx.cellbender_import(path, str(cb))
+
+    obs = pyscx.open(path).read_obs()
+    _assert_target_factors_intact(obs)
+    assert (obs["cellbender_status"] == "present").all()
+
+
+# ---------------------------------------------------------------------------
+# modify_metadata
+# ---------------------------------------------------------------------------
+
+
+def test_modify_metadata_obs_lands_the_callers_categories(target):
+    """The replace path: the *caller's* category order lands, not the file's."""
+    path, _, _ = target
+    obs = pyscx.open(path).read_obs()
+    reordered = ["M", "G2M", "S", "G1"]
+    obs["phase"] = obs["phase"].cat.reorder_categories(reordered)
+    obs["extra"] = _new_categorical(len(obs))
+
+    pyscx.modify_metadata(path, obs=obs)
+
+    back = pyscx.open(path).read_obs()
+    assert isinstance(back["phase"].dtype, pd.CategoricalDtype), back["phase"].dtype
+    assert back["phase"].cat.ordered is True
+    assert list(back["phase"].cat.categories) == reordered
+    assert list(back["phase"].astype(str)) == _phase_values(len(back))
+    assert isinstance(back["batch"].dtype, pd.CategoricalDtype)
+    assert list(back["batch"].cat.categories) == BATCH_LEVELS
+    _assert_new_column(back, "extra", dict(zip(back.index, obs["extra"].astype(str))))
+
+
+def test_modify_metadata_var_keeps_categoricals(target):
+    """Control arm: `patch.var` never went through the cast, so this held
+    before — pinned so the two axes cannot drift apart."""
+    path, _, _ = target
+    pyscx.modify_metadata(path, var=pyscx.open(path).read_var())
+
+    var = pyscx.open(path).read_var()
+    assert isinstance(var["kind"].dtype, pd.CategoricalDtype)
+    assert list(var["kind"].cat.categories) == ["lnc", "coding"]
+
+
+# ---------------------------------------------------------------------------
+# Legacy files that already mix representations
+# ---------------------------------------------------------------------------
+
+
+def test_a_file_mixing_dictionary_and_plain_shards_still_takes_an_attach(tmp_path):
+    """A file written before this fix can carry one column as a dictionary in
+    some obs shards and plain strings in others. `pyscx.append` still produces
+    exactly that layout (it decodes categoricals before writing new shards and
+    leaves the base shards alone), so it is the fixture here. Such a file must
+    still read, still take an attach, and hand the column back as a category
+    with the union vocabulary."""
+
+    def _write(name, cells, kinds):
+        n = len(cells)
+        obs = pd.DataFrame(
+            {"cell_type": pd.Categorical(kinds)}, index=cells
+        )
+        x = sparse.csr_matrix(np.ones((n, 3), dtype=np.float32))
+        var = pd.DataFrame(index=[f"gene_{i}" for i in range(3)])
+        path = str(tmp_path / name)
+        pyscx.from_anndata(anndata.AnnData(X=x, obs=obs, var=var), path, shard_size=4)
+        return path
+
+    base = _write("base.scx", [f"b{i}" for i in range(8)], ["T", "B"] * 4)
+    extra = _write("extra.scx", [f"e{i}" for i in range(8)], ["NK", "B"] * 4)
+    pyscx.append(base, extra)
+    before = pyscx.open(base).read_obs()["cell_type"].astype(str).tolist()
+
+    df = pd.DataFrame({"score": np.arange(16, dtype=np.float64)}, index=[f"b{i}" for i in range(8)] + [f"e{i}" for i in range(8)])
+    pyscx.attach_obs_columns(base, df)
+
+    exp = pyscx.open(base)
+    obs = exp.read_obs()
+    assert isinstance(obs["cell_type"].dtype, pd.CategoricalDtype), obs["cell_type"].dtype
+    assert obs["cell_type"].astype(str).tolist() == before
+    assert set(obs["cell_type"].cat.categories) == {"T", "B", "NK"}
+    assert obs["score"].tolist() == list(range(16))
+    codes, cats = exp.obs_categorical("cell_type")
+    assert [cats[c] for c in codes] == before

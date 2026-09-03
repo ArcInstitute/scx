@@ -199,7 +199,8 @@ def test_obs_categorical_after_append_mixes_encodings(tmp_dir):
 
     It decodes categoricals to plain strings before writing (`unify_dict_columns`),
     so an appended file carries dictionary-encoded base shards *and* plain string
-    appended shards on the same column. Both must fold into one vocabulary — and
+    appended shards on the same column. (The in-place obs writers used to do the
+    same and no longer do, so `append` is now the only producer of the mix.) Both must fold into one vocabulary — and
     an appended value that is new to the base must get its own code rather than
     colliding with an existing one.
 

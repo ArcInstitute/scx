@@ -244,9 +244,12 @@ pub fn widen_dictionary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
 /// Reconcile per-shard columns that disagree on `Dictionary`-vs-plain encoding
 /// so they can be concatenated.
 ///
-/// `append` writes new obs/var as plain `Utf8`/`LargeUtf8` (its
+/// `append` / `merge` write new obs/var as plain `Utf8`/`LargeUtf8` (their
 /// `unify_dict_columns` decodes categoricals before write), while `from_anndata`
-/// writes the same column as a `Dictionary`. After an append, a sharded axis can
+/// and the in-place obs writers (`modify_metadata`, `attach_external_obs`,
+/// `attach_external_layer`) write the same column as a `Dictionary` — as did
+/// every file whose obs was rewritten in place before those writers stopped
+/// casting. After an append, or on such a legacy file, a sharded axis can
 /// therefore carry the column as `Dictionary(_, V)` in some shards and plain `V`
 /// in others. `arrow::compute::concat_batches` requires every batch to share one
 /// schema, so it rejects the mix with *"It is not possible to concatenate arrays

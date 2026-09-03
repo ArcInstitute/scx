@@ -2610,3 +2610,348 @@ fn an_unreadable_uns_section_fails_the_attach_instead_of_being_replaced() {
     let data = score_data(keys("cell_", 3), |i| i as f32);
     attach_external_obs(&path, &data, &opts()).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Categorical fidelity
+//
+// A pandas categorical reaches this op as `Dictionary(_, Utf8)` with the
+// `scx.categorical.ordered` field stamp, and `from_anndata` writes it to disk
+// that way. Every in-place obs writer used to run the rebuilt table through
+// `unify_dict_columns`, which cast each dictionary column to plain strings — so
+// after any attach the column came back from `read_obs()` as `object`, with its
+// category list and `ordered` bit gone. These pin the contract that it does
+// not: values unchanged, declared order and unused levels kept, `ordered` kept,
+// on both rewrite paths and for a categorical the *source* brings in.
+// ---------------------------------------------------------------------------
+
+/// Obs with a `barcode` key and a `cell_type` categorical the way pandas lands
+/// one: `Dictionary(Int8, Utf8)`, an `ordered` stamp, and a declared level no
+/// row uses. The unused level is what tells "carried the dictionary" apart from
+/// "rebuilt one from the data".
+fn categorical_obs_batch(n: usize) -> RecordBatch {
+    use arrow::array::{DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+    use std::collections::HashMap;
+
+    let ids: Vec<String> = (0..n).map(|i| format!("cell_{i}")).collect();
+    let keys = Int8Array::from((0..n).map(|i| (i % 2) as i8).collect::<Vec<_>>());
+    let values = StringArray::from(vec!["T cell", "B cell", "unused"]);
+    let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("barcode", DataType::Utf8, false),
+        Field::new("cell_type", dict.data_type().clone(), true).with_metadata(md),
+    ]);
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(StringArray::from(ids)), Arc::new(dict)],
+    )
+    .unwrap()
+}
+
+/// The column's declared dictionary values in declared order, or `None` when
+/// it is not dictionary-encoded at all.
+fn dict_values(batch: &RecordBatch, name: &str) -> Option<Vec<String>> {
+    use arrow::array::AsArray;
+    let col = batch.column_by_name(name).unwrap();
+    let dict = col.as_any_dictionary_opt()?;
+    let values = arrow::compute::cast(dict.values(), &DataType::Utf8).unwrap();
+    let values = values.as_string::<i32>();
+    Some(
+        (0..values.len())
+            .map(|i| values.value(i).to_string())
+            .collect(),
+    )
+}
+
+fn ordered_flag(batch: &RecordBatch, name: &str) -> Option<String> {
+    batch
+        .schema()
+        .field_with_name(name)
+        .unwrap()
+        .metadata()
+        .get(scx_format_io::CATEGORICAL_ORDERED_KEY)
+        .cloned()
+}
+
+/// Per-row values with nulls kept, whatever the on-disk representation.
+fn opt_str_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+    let s = str_col(batch, name);
+    (0..s.len())
+        .map(|i| (!s.is_null(i)).then(|| s.value(i).to_string()))
+        .collect()
+}
+
+#[test]
+fn existing_categorical_columns_survive_the_rewrite_on_both_paths() {
+    for layout in [ObsLayout::Single, ObsLayout::Shards(&[4, 2])] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_fixture_with_layout(
+            dir.path(),
+            "cat.scx",
+            categorical_obs_batch(6),
+            3,
+            2,
+            layout,
+        );
+        let before = opt_str_col(
+            &ScxReader::open(&path).unwrap().read_obs().unwrap(),
+            "cell_type",
+        );
+
+        let data = score_data(keys("cell_", 6), |i| i as f32);
+        attach_external_obs(&path, &data, &opts()).unwrap();
+
+        let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+        assert_eq!(
+            dict_values(&obs, "cell_type"),
+            Some(vec![
+                "T cell".to_string(),
+                "B cell".to_string(),
+                "unused".to_string()
+            ]),
+            "{layout:?}: cell_type must still be a dictionary carrying its declared \
+             vocabulary, got {:?}",
+            obs.column_by_name("cell_type").unwrap().data_type()
+        );
+        assert_eq!(
+            opt_str_col(&obs, "cell_type"),
+            before,
+            "{layout:?}: values changed"
+        );
+        assert_eq!(
+            ordered_flag(&obs, "cell_type").as_deref(),
+            Some("true"),
+            "{layout:?}: the ordered flag was lost"
+        );
+        assert_eq!(f32_col(&obs, "dbl_score").value(5), 5.0);
+    }
+}
+
+/// A categorical the *source* brings in lands as one too: dictionary dtype, the
+/// caller's declared order (neither alphabetical nor first-appearance), its
+/// unused level, its `ordered` stamp — and null keys, not a fabricated level,
+/// on the rows the source does not cover.
+#[test]
+fn a_categorical_annotation_lands_as_a_dictionary_with_its_flag_and_null_keys() {
+    use arrow::array::{DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 6, 3, 2);
+
+    let keys = Int32Array::from(vec![1, 0, 1, 0]);
+    let values = StringArray::from(vec!["doublet", "singlet", "unsure"]);
+    let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![Field::new(
+        "dbl_class",
+        dict.data_type().clone(),
+        true,
+    )
+    .with_metadata(md)]);
+    let data = ExternalObsData {
+        row_keys: ["cell_5", "cell_0", "cell_3", "cell_1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        row_annotations: RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict)]).unwrap(),
+        row_embeddings: Vec::new(),
+        uns: serde_json::Map::new(),
+        source_checksum: None,
+        source_name: None,
+    };
+    attach_external_obs(&path, &data, &opts()).unwrap();
+
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert_eq!(
+        dict_values(&obs, "dbl_class"),
+        Some(vec![
+            "doublet".to_string(),
+            "singlet".to_string(),
+            "unsure".to_string()
+        ]),
+        "the attached column must be a dictionary carrying the caller's vocabulary, got {:?}",
+        obs.column_by_name("dbl_class").unwrap().data_type()
+    );
+    assert_eq!(ordered_flag(&obs, "dbl_class").as_deref(), Some("true"));
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        opt_str_col(&obs, "dbl_class"),
+        vec![
+            s("doublet"),
+            s("doublet"),
+            None,
+            s("singlet"),
+            None,
+            s("singlet")
+        ],
+        "rows are joined by key; uncovered rows are null"
+    );
+}
+
+/// The bindings' half of the same contract: the shared column-drop helper must
+/// hand the op the source's field metadata, or an ordered factor from pyscx /
+/// rscx arrives already unordered.
+#[test]
+fn drop_batch_columns_keeps_field_metadata() {
+    use arrow::array::{DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+    use std::collections::HashMap;
+
+    let dict = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![0, 1]),
+        Arc::new(StringArray::from(vec!["a", "b"])),
+    )
+    .unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("cat", dict.data_type().clone(), false).with_metadata(md),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec!["k0", "k1"])),
+            Arc::new(dict),
+        ],
+    )
+    .unwrap();
+
+    let out = drop_batch_columns(&batch, &["key".to_string()]).unwrap();
+    assert_eq!(out.num_columns(), 1);
+    assert!(matches!(
+        out.column(0).data_type(),
+        DataType::Dictionary(_, _)
+    ));
+    assert!(
+        out.schema().field(0).is_nullable(),
+        "nullability is still forced"
+    );
+    assert_eq!(ordered_flag(&out, "cat").as_deref(), Some("true"));
+}
+
+/// A file written before this fix can carry one column as a dictionary in some
+/// shards and as plain strings in others (an old attach stringified only the
+/// shards it rewrote; `append` still does). Such a file must still read, still
+/// take an attach, and come out with the column reconciled to a dictionary —
+/// while the shards' *existing* columns keep whatever representation they had,
+/// because the op rewrites a shard's rows, it does not repair its encoding.
+#[test]
+fn a_legacy_file_mixing_dictionary_and_plain_obs_shards_still_takes_an_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.scx");
+    let obs = categorical_obs_batch(6);
+    // Shard 1 the way an old attach wrote it: the dictionary decoded to its
+    // value type, the field rebuilt plain.
+    let plain = {
+        let ct = arrow::compute::cast(obs.column(1), &DataType::Utf8).unwrap();
+        let schema = Schema::new(vec![
+            obs.schema().field(0).as_ref().clone(),
+            Field::new("cell_type", DataType::Utf8, true),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![obs.column(0).clone(), ct]).unwrap()
+    };
+    let header = FileHeader::new_single_modality(6, 3, 0, 3, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer
+        .write_obs_shard(0, 0, 3, 6, &obs.slice(0, 3))
+        .unwrap();
+    writer
+        .write_obs_shard(1, 3, 3, 6, &plain.slice(3, 3))
+        .unwrap();
+    writer.write_var(&var_batch(3)).unwrap();
+    for start in [0u64, 3] {
+        writer
+            .write_csr_shard(
+                &[0u64; 4],
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                start,
+            )
+            .unwrap();
+    }
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1_710_000_000,
+            action: "create".to_string(),
+            tool: "test".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+
+    // Premise: the mix is real on disk.
+    let reader = ScxReader::open(&path).unwrap();
+    let pre0 = reader.read_obs_shard(0).unwrap();
+    let pre1 = reader.read_obs_shard(1).unwrap();
+    assert!(
+        matches!(
+            pre0.column_by_name("cell_type").unwrap().data_type(),
+            DataType::Dictionary(_, _)
+        ),
+        "premise: shard 0 is a dictionary"
+    );
+    assert!(
+        matches!(
+            pre1.column_by_name("cell_type").unwrap().data_type(),
+            DataType::Utf8 | DataType::LargeUtf8
+        ),
+        "premise: shard 1 is plain, got {:?}",
+        pre1.column_by_name("cell_type").unwrap().data_type()
+    );
+    let before = opt_str_col(&reader.read_obs().unwrap(), "cell_type");
+    drop(reader);
+
+    let s =
+        attach_external_obs(&path, &score_data(keys("cell_", 6), |i| i as f32), &opts()).unwrap();
+    assert!(s.obs_streamed);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let obs = reader.read_obs().unwrap();
+    assert!(
+        matches!(
+            obs.column_by_name("cell_type").unwrap().data_type(),
+            DataType::Dictionary(_, _)
+        ),
+        "the assembled column is reconciled to a dictionary, got {:?}",
+        obs.column_by_name("cell_type").unwrap().data_type()
+    );
+    assert_eq!(opt_str_col(&obs, "cell_type"), before);
+    assert_eq!(ordered_flag(&obs, "cell_type").as_deref(), Some("true"));
+
+    // Untouched columns keep their per-shard representation and values.
+    for (idx, pre) in [(0u32, &pre0), (1u32, &pre1)] {
+        let post = reader.read_obs_shard(idx).unwrap();
+        assert_eq!(
+            post.column_by_name("cell_type").unwrap().data_type(),
+            pre.column_by_name("cell_type").unwrap().data_type(),
+            "shard {idx}: the attach must not re-encode a column it did not touch"
+        );
+        assert_eq!(
+            opt_str_col(&post, "cell_type"),
+            opt_str_col(pre, "cell_type"),
+            "shard {idx}: values"
+        );
+        assert!(
+            post.column_by_name("dbl_score").is_some(),
+            "shard {idx}: new column"
+        );
+    }
+}

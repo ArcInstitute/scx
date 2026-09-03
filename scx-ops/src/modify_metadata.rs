@@ -43,7 +43,6 @@ use scx_format_io::reader::ScxReader;
 use scx_format_io::section::{write_alignment_padding, SectionType};
 use scx_format_io::writer::ScxWriter;
 
-use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
 use crate::external_obs::indexed_column_names;
 use crate::in_place::{
@@ -519,21 +518,23 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     let mut no_stats_reason = NoStatsReason::NoRebuildRequested;
 
     if let Some(obs) = &patch.obs {
-        // Unify dictionary columns to their value type, matching the obs
-        // sharding the append/merge paths perform.
-        let unified = unify_dict_columns(obs)?;
+        // Written as handed in: a dictionary (categorical) column is sliced
+        // per shard and lands as a dictionary carrying its field metadata, so
+        // `read_obs()` gives the caller's categoricals back. (This used to run
+        // `unify_dict_columns`, which cast every dictionary column to plain
+        // strings; `append` / `merge` still do, after a concat.)
         let obs_pass = if carry_obs {
             &carried_pass
         } else {
             &requested_pass
         };
         let mut builder = if rebuild_obs_index {
-            Some(obs_pass.obs_builder(unified.schema())?)
+            Some(obs_pass.obs_builder(obs.schema())?)
         } else {
             None
         };
 
-        let n = unified.num_rows();
+        let n = obs.num_rows();
         let mut obs_shard_ranges: Vec<(u64, u64)> = Vec::new();
         let mut cursor = 0usize;
         let mut idx = 0u32;
@@ -552,7 +553,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         };
         while cursor < n {
             let take = std::cmp::min(shard_target_rows, n - cursor);
-            let chunk = unified.slice(cursor, take);
+            let chunk = obs.slice(cursor, take);
             let row_start = cursor as u64;
             if let Some(b) = builder.as_mut() {
                 b.push_shard_split(&chunk, row_start, &index_ranges)

@@ -3346,3 +3346,74 @@ fn a_fresh_csc_sidecar_is_still_served_impl(framed: bool) {
     assert_eq!(plain_reader.csc_shard_count(), 0);
     assert_eq!(plain_reader.read_all_csr_shards().unwrap().shape, (6, 4));
 }
+
+/// A declared category no row uses must survive assembly. Arrow's `concat`
+/// merges per-shard dictionaries — and drops every value no key references —
+/// whenever the summed per-shard vocabularies reach the row count
+/// (`should_merge_dictionary_values`: `total_values >= len`). Every shard of a
+/// `from_anndata` file carries the full vocabulary, so on a small file that
+/// condition is met and `read_obs()` silently pruned the unused level, while a
+/// large file kept it. The assembler must give the shards one shared values
+/// array before concat so the outcome does not depend on the row count.
+#[test]
+fn test_assemble_keeps_unused_dictionary_values_regardless_of_row_count() {
+    use arrow::array::{Array, AsArray, DictionaryArray, Int8Array};
+    use arrow::datatypes::Int8Type;
+
+    // Two shards of two rows each (4 rows total) over a 4-level vocabulary:
+    // 4 + 4 declared values >= 4 rows, so arrow would merge and prune "M".
+    let shard = |idx: u32, row_start: u32, keys: Vec<i8>| {
+        let values = StringArray::from(vec!["G1", "S", "G2M", "M"]);
+        let dict =
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from(keys), Arc::new(values)).unwrap();
+        let mut md = std::collections::HashMap::new();
+        md.insert(
+            crate::CATEGORICAL_ORDERED_KEY.to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("phase", dict.data_type().clone(), true).with_metadata(md)
+            ])
+            .with_metadata(std::collections::HashMap::from([
+                ("shard_idx".to_string(), idx.to_string()),
+                ("row_start".to_string(), row_start.to_string()),
+                ("n_shard_rows".to_string(), "2".to_string()),
+                ("n_rows_total".to_string(), "4".to_string()),
+            ])),
+        );
+        RecordBatch::try_new(schema, vec![Arc::new(dict) as arrow::array::ArrayRef]).unwrap()
+    };
+    let s0 = shard(0, 0, vec![2, 0]);
+    let s1 = shard(1, 2, vec![1, 2]);
+
+    let merged = assemble_sharded_metadata("obs", vec![(0, s0), (1, s1)]).unwrap();
+    assert_eq!(merged.num_rows(), 4);
+    let col = merged.column(0);
+    let dict = col
+        .as_any_dictionary_opt()
+        .unwrap_or_else(|| panic!("phase must stay a dictionary, got {:?}", col.data_type()));
+    let declared = dict.values().as_string::<i32>();
+    assert_eq!(
+        (0..declared.len())
+            .map(|i| declared.value(i))
+            .collect::<Vec<_>>(),
+        ["G1", "S", "G2M", "M"],
+        "declared order and the unused level must survive assembly"
+    );
+    let flat = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+    let flat = flat.as_string::<i32>();
+    assert_eq!(
+        (0..4).map(|i| flat.value(i)).collect::<Vec<_>>(),
+        ["G2M", "G1", "S", "G2M"]
+    );
+    assert_eq!(
+        merged
+            .schema()
+            .field(0)
+            .metadata()
+            .get(crate::CATEGORICAL_ORDERED_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+}
