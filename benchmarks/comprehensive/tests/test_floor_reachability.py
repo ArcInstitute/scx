@@ -1083,12 +1083,26 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
             f"would mix arms"
         )
 
-    # census_1m carries the live `streaming_peak_rss_mb` floor, so `csc_always`
-    # — which needs a whole-triple justification — must NOT run there.
+    # census_1m carries the live `streaming_peak_rss_mb` floor, so NEITHER extra
+    # arm runs there — and for two different reasons worth keeping apart.
+    #
+    # `csc_always` is excluded by design: it needs a whole-triple justification,
+    # which would suppress that floor along with the pooled medians it is
+    # actually about.
+    #
+    # `index_preset_cellxgene` is excluded because the feature is broken at
+    # census scale (2026-09-02): it emits no index sections, its premise check
+    # raises, and the raise failed the whole cell — taking
+    # `streaming_peak_rss_mb` with it, in the capture meant to give that floor
+    # its rows. See `test_the_index_preset_arm_is_scoped_to_where_the_feature_
+    # works`. When that is fixed, this expectation goes back to
+    # `["index_preset_cellxgene"]`.
     calls, result = drive("census_1m")
     assert all((kw or {}).get("csc") is None for _, _, kw in calls), calls
-    assert result.metadata["extra_arms"] == ["index_preset_cellxgene"]
+    assert all((kw or {}).get("index_preset") is None for _, _, kw in calls), calls
+    assert result.metadata["extra_arms"] == []
     assert "csc_always" in result.metadata["extra_arms_skipped"]
+    assert "index_preset_cellxgene" in result.metadata["extra_arms_skipped"]
 
     # A dataset in neither scope runs the three base arms only.
     calls, result = drive("pbmc3k")
