@@ -953,6 +953,49 @@ def test_cross_module_benchmark_helper_calls_match_their_signatures():
     assert arm.fixture_attr == "scx_scx1_path", arm
 
 
+def test_read_scattered_needs_additional_formats_to_produce_anything():
+    """A floored benchmark that only runs on ADDITIONAL_FORMATS needs the flag.
+
+    `read_scattered` is scoped to the four `scx_compact_trial_g{128,256,512,
+    1024}` keys, and all four live in `ADDITIONAL_FORMATS` — which
+    `run_parallel` schedules only under `--include-additional`. So a capture
+    without that flag produces **no** `read_scattered` results, its 14 floors
+    sit on triples that did not run, and `check_absolute_floors` skips them
+    silently and correctly. `results/baselines/LATEST` carries those rows, so
+    the omission is a regression against the outgoing baseline, not merely a
+    thinner snapshot.
+
+    `capture_baseline` had no way to pass the flag at all, which is how the
+    2026-09-02 tier-full capture came out with the `read_scattered` family
+    missing entirely.
+    """
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import read_scattered
+    from benchmarks.comprehensive.config import ADDITIONAL_FORMATS, PRIMARY_FORMATS
+    from benchmarks.comprehensive.scripts import capture_baseline as cb
+
+    scoped = set(read_scattered.SUPPORTED_FORMATS)
+    additional = {f.key for f in ADDITIONAL_FORMATS}
+    primary = {f.key for f in PRIMARY_FORMATS}
+    assert scoped, "read_scattered lost its format scope"
+    assert scoped <= additional, (
+        f"read_scattered's formats are no longer all ADDITIONAL: "
+        f"{sorted(scoped - additional)}"
+    )
+    assert not (scoped & primary), sorted(scoped & primary)
+
+    # The flag has to exist and reach run_parallel.
+    assert "include_additional" in inspect.signature(cb.submit_benchmarks).parameters
+    src = inspect.getsource(cb.submit_benchmarks)
+    assert '"--include-additional"' in src, (
+        "capture_baseline accepts include_additional but never forwards it"
+    )
+    assert "include_additional=args.include_additional" in inspect.getsource(cb.main), (
+        "main() does not forward --include-additional to submit_benchmarks"
+    )
+
+
 def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     """End-to-end plumbing for the one metric `thresholds.yaml` floors.
 

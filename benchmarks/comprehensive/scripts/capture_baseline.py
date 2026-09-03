@@ -195,6 +195,7 @@ def submit_benchmarks(
     datasets: list[str] | None = None,
     formats: list[str] | None = None,
     skip_smoke: bool = False,
+    include_additional: bool = False,
 ) -> int:
     """Invoke run_parallel.py with the selected tier's settings.
 
@@ -260,6 +261,8 @@ def submit_benchmarks(
         cmd.append("--include-accel")
     if no_gpu:
         cmd.append("--no-gpu")
+    if include_additional:
+        cmd.append("--include-additional")
     if formats:
         cmd.extend(["--formats", *formats])
 
@@ -596,6 +599,18 @@ def main() -> int:
              "`bpcells` when not running from `scx-bench-r`).",
     )
     parser.add_argument(
+        "--include-additional", action="store_true",
+        help=(
+            "Schedule the ADDITIONAL_FORMATS variants too. Needed for "
+            "`read_scattered`, which is scoped to the four "
+            "`scx_compact_trial_g*` keys and therefore produces NOTHING "
+            "without this — its 14 floors then sit on a triple that did not "
+            "run, and `check_absolute_floors` skips them silently. "
+            "`results/baselines/LATEST` carries those rows, so a capture "
+            "without this flag is a coverage regression against it."
+        ),
+    )
+    parser.add_argument(
         "--skip-smoke", action="store_true",
         help="Skip the pre-submit format-runner contract check. Useful for "
              "narrow accel-only runs or when known-broken format runners "
@@ -680,6 +695,7 @@ def main() -> int:
             datasets=args.datasets,
             formats=args.formats,
             skip_smoke=args.skip_smoke,
+            include_additional=args.include_additional,
         )
         if rc != 0:
             print(
@@ -700,6 +716,7 @@ def main() -> int:
             datasets=args.datasets,
             formats=args.formats,
             skip_smoke=args.skip_smoke,
+            include_additional=args.include_additional,
         )
         return 0
 
