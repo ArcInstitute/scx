@@ -130,6 +130,26 @@ fi
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# SCX_BENCH_N_RANKS — opt-in, deliberately not set.
+#
+# `cellset_gather`'s multi-rank arm emits
+# `rank_scaling_efficiency__gather_random_r4`, which three floors name, and
+# `multirank.resolve_n_ranks` gates it on this variable (default 1). So those
+# floors have never had a capture to measure them.
+#
+# It is not on by default because the arm runs the gather at 1 rank AND at N,
+# multiplying the cost of the benchmark that is already the most expensive at
+# census scale — `cellset_gather/census_500k` does not fit a 205-minute budget
+# as it is. Enable it for a targeted capture instead:
+#
+#     sbatch --export=ALL,SCX_BENCH_N_RANKS=4 <this script> \
+#         --datasets tabula_sapiens_100k --benchmarks cellset_gather
+#
+# tabula is cheap (0.5 min of measured wall for the whole cell) and is the only
+# one of the three floored datasets that can currently be captured.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Load .env if present.  Populates SCX_WORK_DIR / SCX_DATA_DIR.
 # ---------------------------------------------------------------------------
 if [[ -f "${REPO_ROOT}/.env" ]]; then

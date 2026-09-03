@@ -53,10 +53,14 @@ python benchmarks/comprehensive/scripts/compare_against_baseline.py \
 
 ## Picking a baseline
 
-**`LATEST` points at `v0.11.2-multimodal-loader-fix`** (since 2026-07-13). It is
-a `--tier full` capture with 1551 rows and is multi-surface: format, cloud,
-accel and multimodal rows all present, so accel and format/cloud PRs can both
-gate against the default.
+**`LATEST` points at `v0.16.0-opt-instruments`** (since 2026-09-03). 1833 rows
+across 52 benchmark families and 13 datasets, multi-surface, threads unpinned.
+It is the first baseline with rows for the SCX operations instrumented in the
+PR-01/02 series — `cellset_gather`, `conversion_streaming`, `export_streaming`,
+`obs_open`, `ooc_loader`, `build_csc`, `mtx_export`, `fragment_ops`'
+`obs_import` arm, `grouped_sort`/`grouped_read`, `shuffle_layout`,
+`accel_r_route`, `accel_harmony`, `accel_de_nb_glm`, `accel_eval_metrics`,
+`doublet_interop` — 15 families its predecessor did not carry at all.
 
 Two historical cautions that still shape the tree:
 
@@ -94,6 +98,7 @@ Two historical cautions that still shape the tree:
 | `v0.10.6-default-framed` | 2026-07-05 | full + accel | 1188 rows from `candidate_final_default_framed` — framed row groups on by default. |
 | `v0.11.0-cellstream-recapture` | 2026-07-11 | full + accel | 1552 rows from `baseline_2026_07_10`; adds the `cellstream` format variant. |
 | `v0.11.0-auto-converge` | 2026-07-12 | full + accel | 1551 rows from `candidate_auto_converge_20260712` — the `auto` → cost-aware-adaptive flip. `scx_auto_v2` rows disappear here by design. |
-| `v0.11.2-multimodal-loader-fix` (`LATEST`) | 2026-07-12 | full + accel + multimodal | Same 1551-row snapshot as `v0.11.0-auto-converge`, re-promoted after the multimodal loader fix. `pyscx 0.11.0`. **Zero rows for 13 of the 35 floored benchmarks** — a gate over those tests absolute floors only and performs no regression comparison, which is what a recapture has to fix. |
+| `v0.11.2-multimodal-loader-fix` | 2026-07-12 | full + accel + multimodal | Same 1551-row snapshot as `v0.11.0-auto-converge`, re-promoted after the multimodal loader fix. `pyscx 0.11.0`. **Zero rows for 13 of the 35 floored benchmarks** — a gate over those tests absolute floors only and performs no regression comparison, which is what a recapture has to fix. |
 | `v0.11.5-dataload-phase0` | 2026-07-23 | xl + accel, no multimodal | 1603 rows; first with `cellset_gather` / `obs_open` / `ooc_loader`. Deliberately **not** promoted — see "Picking a baseline". |
 | `v0.14.0-phase5c-streaming-floors` | 2026-08-22 | `--tier small --datasets census_1m` | 4 rows (`conversion_streaming`, `export_streaming`, `obs_open` x2), promoted with `--no-latest` in `f97c8ee1` (#451). Its `summary.json` medians all nine runs of the three arms into one figure per triple, so it **cannot back a per-arm claim** — only its `raw/` can, and those four files are force-added to git for exactly that reason. `git_dirty: true`. |
+| `v0.16.0-opt-instruments` (`LATEST`) | 2026-09-03 | full + additional + accel + multimodal | 1833 rows / 52 families / 13 datasets, from `candidate_unpinned_20260903` at `cafeb2ce`. Two passes accumulating into one snapshot: `--tier full --include-additional`, then the five benchmarks reachable only from off-tier datasets (`grouped_sort`, `grouped_read`, `accel_de_nb_glm`, `accel_eval_metrics`, `cell_eval_parity_perf`). **11 of the 14 floored benchmarks that had zero rows in `v0.11.2` now have them.** Gates clean against itself: 0 timing / 0 RSS / 0 size regressions, 0 fingerprint mismatches, 0 floor violations (13 justification-suppressed). Known gaps, each recorded with its cause: no `cellstream` rows (upstream package restructured, runner needs porting — 47 rows lost vs `v0.11.2`); no `cloud_large_atlas` (its `<ds>.scxd/` fixtures are unstaged, ~4.5 GB); no `cell_eval_parity_perf` (its `cell_eval`/`arc_bench`/`pdex` deps are editable installs in `.venv` only and no conda env has them); no `cellset_gather` at census scale (does not fit a practical time budget — see thresholds' Deferred item 15). `git_dirty: true`, structurally — the capture overwrites the four git-tracked `results/raw/*.json` files that back `docs/performance.md`. |

@@ -3,10 +3,10 @@
   "benchmark": "export_streaming",
   "format": "scx_streaming_vs_materialize",
   "dataset": "census_1m",
-  "timestamp": "2026-08-22T01:45:12",
+  "timestamp": "2026-09-03T02:24:57",
   "system": {
-    "hostname": "CPUDFE024",
-    "os": "Linux 5.15.0-176-generic",
+    "hostname": "CPUDFE044",
+    "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
     "cpu": "Intel(R) Xeon(R) 6740P",
@@ -31,7 +31,7 @@
       "leidenalg": "0.11.0",
       "igraph": "1.0.0",
       "psutil": "7.2.2",
-      "pyscx": "0.14.0"
+      "pyscx": "0.16.0"
     },
     "storage": {
       "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
@@ -42,11 +42,11 @@
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M0MAAAEGSFG91GKRKB61KS7G",
-      "git_sha": "f1515c6a5ba9e4a585cffcf0289e1a96a2fb696c",
-      "git_branch": "org-phase5c-index-pass",
+      "run_id": "01M1K68BXC0K14360N964CMM0D",
+      "git_sha": "3ed7861ff3393c9a7983f6d2f56926c1c5aa6db2",
+      "git_branch": "pr03-baseline-recapture",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.14.0-25-gf1515c6a",
+      "git_describe": "pyscx-v0.16.0-20-g3ed7861f-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,126 +56,165 @@
   },
   "runs": [
     {
-      "wall_s": 22.69851752370596,
+      "wall_s": 16.942371731973253,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3124.87109375,
+      "peak_rss_mb": 3133.71875,
       "extra": {
         "scenario": "streaming",
         "run_idx": 0,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3124.87109375,
-        "streaming_wall_s": 22.69851752370596
+        "streaming_peak_rss_mb": 3133.71875,
+        "streaming_wall_s": 16.942371731973253
       }
     },
     {
-      "wall_s": 21.117531461641192,
+      "wall_s": 16.06400684104301,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3161.984375,
+      "peak_rss_mb": 3168.9296875,
       "extra": {
         "scenario": "streaming",
         "run_idx": 1,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3161.984375,
-        "streaming_wall_s": 21.117531461641192
+        "streaming_peak_rss_mb": 3168.9296875,
+        "streaming_wall_s": 16.06400684104301
       }
     },
     {
-      "wall_s": 21.378578638657928,
+      "wall_s": 15.906995650031604,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3188.90625,
+      "peak_rss_mb": 3165.0078125,
       "extra": {
         "scenario": "streaming",
         "run_idx": 2,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3188.90625,
-        "streaming_wall_s": 21.378578638657928
+        "streaming_peak_rss_mb": 3165.0078125,
+        "streaming_wall_s": 15.906995650031604
       }
     },
     {
-      "wall_s": 21.435684327036142,
+      "wall_s": 17.16436369693838,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 5422.7890625,
+      "peak_rss_mb": 10558.76171875,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 0,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 5422.7890625,
-        "streaming_default_threads_wall_s": 21.435684327036142
+        "streaming_default_threads_peak_rss_mb": 10558.76171875,
+        "streaming_default_threads_wall_s": 17.16436369693838
       }
     },
     {
-      "wall_s": 21.081870215013623,
+      "wall_s": 18.104335244977847,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 5622.015625,
+      "peak_rss_mb": 10915.171875,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 1,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 5622.015625,
-        "streaming_default_threads_wall_s": 21.081870215013623
+        "streaming_default_threads_peak_rss_mb": 10915.171875,
+        "streaming_default_threads_wall_s": 18.104335244977847
       }
     },
     {
-      "wall_s": 21.23758228495717,
+      "wall_s": 17.238665353972465,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 5679.2265625,
+      "peak_rss_mb": 11051.78125,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 2,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 5679.2265625,
-        "streaming_default_threads_wall_s": 21.23758228495717
+        "streaming_default_threads_peak_rss_mb": 11051.78125,
+        "streaming_default_threads_wall_s": 17.238665353972465
       }
     },
     {
-      "wall_s": 24.684103237465024,
+      "wall_s": 19.840570971020497,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 13987.52734375,
+      "peak_rss_mb": 15100.10546875,
       "extra": {
         "scenario": "materialize",
         "run_idx": 0,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 13987.52734375,
-        "materialize_wall_s": 24.684103237465024
+        "materialize_peak_rss_mb": 15100.10546875,
+        "materialize_wall_s": 19.840570971020497
       }
     },
     {
-      "wall_s": 23.29763225838542,
+      "wall_s": 20.19609269592911,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 14042.078125,
+      "peak_rss_mb": 15792.3203125,
       "extra": {
         "scenario": "materialize",
         "run_idx": 1,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 14042.078125,
-        "materialize_wall_s": 23.29763225838542
+        "materialize_peak_rss_mb": 15792.3203125,
+        "materialize_wall_s": 20.19609269592911
       }
     },
     {
-      "wall_s": 24.062452014535666,
+      "wall_s": 19.21479530702345,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 14036.921875,
+      "peak_rss_mb": 15595.78515625,
       "extra": {
         "scenario": "materialize",
         "run_idx": 2,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 14036.921875,
-        "materialize_wall_s": 24.062452014535666
+        "materialize_peak_rss_mb": 15595.78515625,
+        "materialize_wall_s": 19.21479530702345
+      }
+    },
+    {
+      "wall_s": 42.9219699439127,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 20198.3046875,
+      "extra": {
+        "scenario": "streaming_full",
+        "run_idx": 0,
+        "reader_threads": 4,
+        "streaming_full_peak_rss_mb": 20198.3046875,
+        "streaming_full_wall_s": 42.9219699439127
+      }
+    },
+    {
+      "wall_s": 39.58077045099344,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 20761.23828125,
+      "extra": {
+        "scenario": "streaming_full",
+        "run_idx": 1,
+        "reader_threads": 4,
+        "streaming_full_peak_rss_mb": 20761.23828125,
+        "streaming_full_wall_s": 39.58077045099344
+      }
+    },
+    {
+      "wall_s": 40.203538637957536,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 20095.078125,
+      "extra": {
+        "scenario": "streaming_full",
+        "run_idx": 2,
+        "reader_threads": 4,
+        "streaming_full_peak_rss_mb": 20095.078125,
+        "streaming_full_wall_s": 40.203538637957536
       }
     }
   ],
-  "median_wall_s": 21.435684327036142,
-  "wall_s_iqr": 2.502485263161361,
-  "n_runs": 9,
+  "median_wall_s": 18.65956527600065,
+  "wall_s_iqr": 17.736731289012823,
+  "n_runs": 12,
   "metadata": {
     "direction": "h5ad",
     "source_scx_bytes": 2800057397,
@@ -191,12 +230,18 @@
       "streaming_default_threads",
       "materialize",
       "materialize",
-      "materialize"
+      "materialize",
+      "streaming_full",
+      "streaming_full",
+      "streaming_full"
     ],
     "thread_counts": null,
+    "materialize_skipped_reason": null,
+    "full_fixture_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/census_1m_full.scx",
     "streaming_output_bytes": 11450459600,
     "streaming_default_threads_output_bytes": 11450459600,
     "materialize_output_bytes": 11450459592,
+    "streaming_full_output_bytes": 34115011056,
     "gated_reader_threads": 4,
     "structural": {
       "streaming": {
@@ -210,6 +255,11 @@
         "nnz": 1402381960
       },
       "materialize": {
+        "n_obs": 1000000,
+        "n_vars": 61497,
+        "nnz": 1402381960
+      },
+      "streaming_full": {
         "n_obs": 1000000,
         "n_vars": 61497,
         "nnz": 1402381960

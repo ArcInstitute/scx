@@ -2010,7 +2010,12 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
         ("streaming (`pyscx.from_h5ad`), `reader_threads=4`",
          "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
          "streaming"),
-        ("streaming, default parallelism (16 readers)",
+        # No "(16 readers)" in the label any more: the arm records
+        # `reader_threads: None` and never stores the resolved count, so that
+        # parenthetical was an inference about the 2026-08-22 capture's node,
+        # not a recorded fact. `available_parallelism()` follows the cgroup, so
+        # the real value is per-allocation and the doc cannot state it.
+        ("streaming, default parallelism",
          "conversion_streaming__scx_streaming_vs_materialize__census_1m.json",
          "streaming_default_threads"),
         ("materialise (`pyscx.from_anndata`)",

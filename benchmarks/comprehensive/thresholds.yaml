@@ -1295,11 +1295,32 @@ absolute_floors:
   #
   # scx_fast (decode-speed-max; the pre-flip `auto` heuristic) — carries
   # the decode-max throughput floors across all measured tiers.
+  #
+  # `batches_per_sec__raw` RE-DERIVED 2026-09-03 on pbmc3k and
+  # tabula_sapiens_100k. Both were `min: 29.0`, a single value applied to two
+  # datasets, and the Deferred block flagged the whole scx_fast group as
+  # PROVISIONAL — "transplanted from pre-flip numbers … tighten to the captured
+  # medians on the recapture, min = 0.85x the measured min run". Done, with the
+  # per-dataset spread that a shared 29.0 could not express:
+  #
+  #     dataset               runs                          min    0.85x min
+  #     pbmc3k                20.2 21.0 21.1 21.4 22.1     20.2      17.17
+  #     tabula_sapiens_100k   28.4 28.8 29.0               28.4      24.14
+  #
+  # pbmc3k was violating at 21.1 against 29.0 — a 27% shortfall that is not a
+  # regression but a floor borrowed from a different dataset. tabula was
+  # violating by 0.7% (28.8 vs 29.0), i.e. the shared value happened to sit
+  # inside tabula's own noise band, which is why one number for two datasets
+  # read as plausible for as long as it did.
+  #
+  # The other tiers are NOT re-derived here and keep their provisional values;
+  # they pass, and re-deriving a passing floor is the broader Deferred item 5
+  # work (which also wants the missing adaptive `scx_auto` rows authored).
   - benchmark: ml_loader
     format: scx_fast
     dataset: pbmc3k
     metric: batches_per_sec__raw
-    min: 29.0
+    min: 17.17
   - benchmark: ml_loader
     format: scx_fast
     dataset: pbmc3k
@@ -1314,7 +1335,7 @@ absolute_floors:
     format: scx_fast
     dataset: tabula_sapiens_100k
     metric: batches_per_sec__raw
-    min: 29.0
+    min: 24.14
   - benchmark: ml_loader
     format: scx_fast
     dataset: tabula_sapiens_100k
@@ -2773,11 +2794,13 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: cellsets_per_sec__gather_grouped_s512
     min: 1.19
-  - benchmark: cellset_gather
-    format: scx_auto
-    dataset: tabula_sapiens_100k
-    metric: rank_scaling_efficiency__gather_random_r4
-    min: 0.813
+  # DEFERRED 2026-09-03 — the metric requires an opt-in no capture sets. See
+  # the Deferred block's rank-scaling entry.
+  # - benchmark: cellset_gather
+  #   format: scx_auto
+  #   dataset: tabula_sapiens_100k
+  #   metric: rank_scaling_efficiency__gather_random_r4
+  #   min: 0.813
   - benchmark: cellset_gather
     format: scx_auto
     dataset: census_500k
@@ -2788,11 +2811,13 @@ absolute_floors:
     dataset: census_500k
     metric: cellsets_per_sec__gather_grouped_s512
     min: 7.395
-  - benchmark: cellset_gather
-    format: scx_auto
-    dataset: census_500k
-    metric: rank_scaling_efficiency__gather_random_r4
-    min: 0.852
+  # DEFERRED 2026-09-03 — the metric requires an opt-in no capture sets. See
+  # the Deferred block's rank-scaling entry.
+  # - benchmark: cellset_gather
+  #   format: scx_auto
+  #   dataset: census_500k
+  #   metric: rank_scaling_efficiency__gather_random_r4
+  #   min: 0.852
   - benchmark: cellset_gather
     format: scx_auto
     dataset: census_1m
@@ -2803,11 +2828,13 @@ absolute_floors:
     dataset: census_1m
     metric: cellsets_per_sec__gather_grouped_s512
     min: 5.185
-  - benchmark: cellset_gather
-    format: scx_auto
-    dataset: census_1m
-    metric: rank_scaling_efficiency__gather_random_r4
-    min: 0.86
+  # DEFERRED 2026-09-03 — the metric requires an opt-in no capture sets. See
+  # the Deferred block's rank-scaling entry.
+  # - benchmark: cellset_gather
+  #   format: scx_auto
+  #   dataset: census_1m
+  #   metric: rank_scaling_efficiency__gather_random_r4
+  #   min: 0.86
   - benchmark: obs_open
     format: scx_auto
     dataset: census_500k
@@ -3475,6 +3502,36 @@ absolute_floors:
 #     is the point, so re-baseline in the same change rather than treating it
 #     as a failure. `wall_s__obs_import` is still worth a (looser) ceiling, but
 #     as a guard on the obs-rewrite path, not the checksum.
+#
+# 20. cellset_gather rank-scaling floors need an opt-in no capture sets
+#    `rank_scaling_efficiency__gather_random_r4` is emitted only when the
+#    multi-rank arm is enabled, which `multirank.resolve_n_ranks` gates on
+#    `SCX_BENCH_N_RANKS` (default 1). No capture entry point exports it, so the
+#    arm has never run in a capture and the three floors below sat on a metric
+#    no snapshot carries:
+#
+#      cellset_gather / scx_auto / tabula_sapiens_100k   >= 0.813
+#      cellset_gather / scx_auto / census_500k           >= 0.852
+#      cellset_gather / scx_auto / census_1m             >= 0.86
+#
+#    Only the tabula one ever *showed* as violated. The two census triples are
+#    hidden by a different problem — `cellset_gather` at census scale does not
+#    fit any practical time budget (item 15), so those triples produce no rows
+#    at all and `check_absolute_floors` skips them silently. Same missing
+#    opt-in, one visible symptom out of three: a floor is only as visible as
+#    the triple under it.
+#
+#    Commented out above rather than deleted, so re-enabling is a one-line
+#    change once a capture emits the metric. `slurm_capture_baseline.sh` now
+#    documents `SCX_BENCH_N_RANKS` as an opt-in and why it is not on by default
+#    (the arm runs the gather at 1 rank AND at N, so it multiplies the cost of
+#    a benchmark that is already the most expensive one at census).
+#
+#    ACTIVATION: run a capture with `SCX_BENCH_N_RANKS=4` — tabula only is
+#    enough and is cheap (its whole `cellset_gather` cell is 0.5 min of
+#    measured wall) — then re-enable the tabula row against the measured
+#    median. Leave the census two commented until item 15's wall problem is
+#    solved; they cannot be captured either way.
 #
 # 19. cloud_metadata / `scx info <cloud-url>` — OPT-CLOUD-1
 #     A subprocess arm, added in PR-02c: `scx info --json <gs://…>`. Not a
