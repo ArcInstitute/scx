@@ -320,13 +320,6 @@ are not exposed in R and are tracked here rather than implemented:
   exactly the footgun the key join prevents.
 - `obsm` embeddings on `pyscx.attach_obs_columns`: deferred on the Python side
   too (`build_obsm` materializes at `n_obs` scale; no caller needs it).
-- Categorical fidelity through in-place obs edits: `attach_obs_columns`,
-  `scx_attach_obs` (R factors) and `modify_metadata(obs=…)` all demote a
-  categorical column to plain strings (category list and `ordered` bit lost);
-  only `from_anndata`'s writer preserves them. Pre-existing across the family
-  (surfaced in review of the attach seam); fixing it means carrying dictionary
-  arrays + the `scx.categorical.ordered` stamp through the in-place obs write
-  path as one work item.
 
 ### 3.4 Multimodal Support — SHIPPED
 - [x] Format v2 bump; carve `n_modalities` /
@@ -468,6 +461,20 @@ count *matrix*; this is the obs-column half.
   (review §10.5 / ORG-10.16-2).
 - [x] `rscx::scx_attach_obs` — an R `data.frame` straight onto the file, so
   scDblFinder / scds need no intermediate file in either direction.
+- [x] Categorical fidelity through in-place obs edits — `attach_obs_columns`,
+  `scx_attach_obs` (R factors), `obs_import`, `doublet_import`,
+  `cellbender_import` and `modify_metadata(obs=…)` write a categorical column
+  back as the dictionary it arrived as, `scx.categorical.ordered` stamp
+  included, so `read_obs()` returns `category` with declared order, unused
+  levels and `ordered` intact. Previously every one of them demoted every
+  categorical obs column to plain strings via `unify_dict_columns`. The
+  sharded-obs assembler also stopped losing declared-but-unused levels on small
+  files (arrow's dictionary merge pruned them once the summed per-shard
+  vocabularies reached the row count).
+- [ ] Dictionary output from `append` / `merge` / `merge_sorted` — they still
+  decode categoricals to plain strings for the rows they add (the read side
+  reconciles the mixed layout, so such files read back as `category`);
+  `scx_format_io`'s `unify_dictionary_columns` is the primitive to reuse.
 - [x] `pyscx.export_batches` — one h5ad per batch without materialising the
   pool, guarding **both** identities a tool and the import rely on (`obs_names`
   and the resolved key) for uniqueness *within* each batch.

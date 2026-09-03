@@ -1157,12 +1157,11 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
         `key_diagnosis`.
 
     Note:
-        A pandas categorical column is attached as plain strings — the
-        category list and `ordered` bit do not survive. That limitation is
-        shared by every in-place obs edit (`modify_metadata(obs=...)`
-        included); only `from_anndata`'s writer preserves categoricals.
-        Re-derive with `.astype("category")` after reading, or land
-        categorical columns through `from_anndata`.
+        Categoricals survive: a pandas `category` column — in `df` and among
+        the file's existing obs columns — keeps its dtype, declared category
+        order, unused levels and `ordered` bit, as `from_anndata` writes them.
+        The same holds for every in-place obs edit (`obs_import`,
+        `doublet_import`, `cellbender_import`, `modify_metadata(obs=...)`).
 
     Example:
         scores = pd.DataFrame({"my_score": model(exp.read_obs())})

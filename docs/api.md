@@ -1681,12 +1681,16 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   dict and index behaviour as `obs_import` (`obs_key_column` is
   `"<positional>"` under positional; a pure add keeps the predicate index).
   Ungated (no libhdf5). This is `doublet_consensus`'s first-run write path
-  (its overwriting re-runs take `modify_metadata` — see below). Known
-  limitation, shared with every in-place obs edit (`modify_metadata(obs=…)`
-  included; only `from_anndata`'s writer preserves it): a pandas categorical
-  column is attached as plain strings — the category list and `ordered` bit do
-  not survive; re-derive with `.astype("category")` after reading, or land
-  categoricals through `from_anndata`.
+  (its overwriting re-runs take `modify_metadata` — see below). Categoricals
+  survive every in-place obs edit (`attach_obs_columns`, `obs_import`,
+  `doublet_import`, `cellbender_import`, `modify_metadata(obs=…)`, rscx
+  `scx_attach_obs`): a pandas `category` column — the file's existing ones and
+  the one being attached — keeps its dtype, its declared category order, its
+  unused levels and its `ordered` bit, exactly as `from_anndata` writes them.
+  (Before pyscx 0.17 every one of these writers demoted every categorical obs
+  column to plain strings.) `append` / `merge` still write the rows they add as
+  plain strings; the read side reconciles the mix, so such a column reads back
+  as `category` with the union vocabulary either way.
 - `pyscx.diagnose_obs_key(path, key=None)` — Read-only. Report which obs columns
   could serve as a join key: `n_obs`, `resolved_key`, `resolved_cardinality`,
   `unique_columns`, `unusable_unique_columns`, `unique_pairs` (two-column
