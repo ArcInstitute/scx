@@ -391,7 +391,7 @@ pub fn read_annotation_table(
             row_keys,
             row_annotations,
             row_embeddings: Vec::new(),
-            uns: None,
+            uns: serde_json::Map::new(),
             source_checksum: blake3_of_file(path).ok(),
             source_name: path.file_name().map(|s| s.to_string_lossy().to_string()),
         },

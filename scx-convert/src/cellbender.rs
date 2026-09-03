@@ -98,6 +98,9 @@ pub struct CellBenderReadOptions {
     /// Skip `/metadata` and `/global_latents` arrays longer than this when
     /// building `uns`, so per-barcode arrays never bloat the JSON blob.
     pub uns_array_max_len: usize,
+    /// The `uns` key the run's diagnostics record lands under. `None` omits
+    /// the record altogether.
+    pub uns_key: Option<String>,
     pub feature_key: FeatureKey,
 }
 
@@ -107,6 +110,7 @@ impl Default for CellBenderReadOptions {
             column_prefix: "cellbender_".to_string(),
             latent_embedding: false,
             uns_array_max_len: 10_000,
+            uns_key: Some("cellbender".to_string()),
             feature_key: FeatureKey::Auto,
         }
     }
@@ -278,7 +282,10 @@ pub fn read_cellbender_h5(
         z_dim: latents.z_dim,
     };
 
-    let uns = build_uns(path, &file, &info, metadata, global);
+    let mut uns = serde_json::Map::new();
+    if let Some(key) = &opts.uns_key {
+        uns.insert(key.clone(), build_uns(path, &file, &info, metadata, global));
+    }
 
     Ok(CellBenderOutput {
         data: ExternalLayerData {
@@ -290,7 +297,7 @@ pub fn read_cellbender_h5(
             row_annotations,
             row_embeddings,
             col_annotations,
-            uns: Some(uns),
+            uns,
             source_checksum: blake3_of_file(path).ok(),
             source_name: path.file_name().map(|s| s.to_string_lossy().to_string()),
         },

@@ -1,4 +1,4 @@
-//! In-place metadata replacement: `set_uns`, `modify_metadata`.
+//! In-place metadata replacement: `set_uns`, `update_uns`, `modify_metadata`.
 
 use std::path::PathBuf;
 
@@ -12,7 +12,7 @@ use crate::convert;
 // ---------------------------------------------------------------------------
 
 /// Replace the whole `uns` block of an existing `.scx` file in place,
-/// without re-encoding `X`. Replace semantics, not merge.
+/// without re-encoding `X`. Replace semantics, not merge (see `update_uns`).
 ///
 /// Full user-facing documentation lives on the `pyscx.set_uns` Python
 /// wrapper, which is what `help()` shows.
@@ -21,6 +21,29 @@ pub fn set_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<(
     let json = convert::uns_py_to_json(py, uns, convert::UnsFormat::Tagged)?;
     let path_buf = PathBuf::from(path);
     py.detach(|| scx_ops::set_uns(&path_buf, &json))
+        .map_err(ops_to_pyerr)?;
+    Ok(())
+}
+
+/// Shallow-merge a dict's top-level keys into the `uns` block of an existing
+/// `.scx` file in place, without re-encoding `X`.
+///
+/// Full user-facing documentation lives on the `pyscx.update_uns` Python
+/// wrapper, which is what `help()` shows.
+#[pyfunction]
+pub fn update_uns(py: Python<'_>, path: &str, uns: &Bound<'_, PyAny>) -> PyResult<()> {
+    // Decided on the Python object, before normalisation: under the tagged
+    // format a tuple / ndarray / Series normalises to a JSON object (an
+    // `__scx_type__` envelope), which the Rust side would happily merge.
+    if uns.cast::<pyo3::types::PyDict>().is_err() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "update_uns: uns must be a dict whose top-level keys are merged; got {}",
+            uns.get_type().name()?
+        )));
+    }
+    let json = convert::uns_py_to_json(py, uns, convert::UnsFormat::Tagged)?;
+    let path_buf = PathBuf::from(path);
+    py.detach(|| scx_ops::update_uns(&path_buf, &json))
         .map_err(ops_to_pyerr)?;
     Ok(())
 }
@@ -89,6 +112,7 @@ pub fn modify_metadata(
 
     let patch = scx_ops::MetadataPatch {
         uns: uns_json,
+        uns_merge: false,
         obs: obs_batch,
         var: var_batch,
         obsm: obsm_batches,

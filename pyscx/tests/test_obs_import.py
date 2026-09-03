@@ -699,3 +699,50 @@ def test_dry_run_reports_the_obs_rewrite_path(tmp_path):
     assert r["obs_streamed"] is True, "dry run must report the path it would take"
     # And nothing was written.
     assert "score" not in pyscx.open(str(sharded)).read_obs().columns
+
+
+# ---------------------------------------------------------------------------
+# uns keys carried from an h5ad source
+# ---------------------------------------------------------------------------
+
+
+def _h5ad_with_uns(tmp_path):
+    bc = ["AAAT-1", "AAAC-1", "AAAG-1"]  # scrambled relative to the target
+    ad = anndata.AnnData(
+        X=sparse.csr_matrix(np.zeros((3, 2), dtype=np.float32)),
+        obs=pd.DataFrame({"score": [0.3, 0.1, 0.9]}, index=bc),
+        var=pd.DataFrame(index=["g0", "g1"]),
+    )
+    ad.uns["scrublet"] = {"threshold": 0.35}
+    ad.uns["other"] = 1
+    p = tmp_path / "src.h5ad"
+    ad.write_h5ad(p)
+    return p
+
+
+@pytest.mark.skipif(not pyscx._HAS_HDF5, reason="h5ad source needs the hdf5 feature")
+def test_source_uns_keys_land_at_top_level_without_uns_key(tmp_path):
+    """`uns_keys=[...]` with no `uns_key` used to be a silent drop that still
+    reported `uns_keys_imported`. The selected keys now land under their own
+    names."""
+    scx = _fixture(tmp_path)
+    pyscx.set_uns(str(scx), {"existing": "kept"})
+    h5 = _h5ad_with_uns(tmp_path)
+
+    r = pyscx.obs_import(str(scx), str(h5), uns_keys=["scrublet"])
+    assert r["uns_keys_imported"] == ["scrublet"]
+    uns = pyscx.open(str(scx)).read_uns()
+    assert uns["scrublet"] == {"threshold": 0.35}
+    assert "other" not in uns, "only what was asked for"
+    assert uns["existing"] == "kept"
+
+
+@pytest.mark.skipif(not pyscx._HAS_HDF5, reason="h5ad source needs the hdf5 feature")
+def test_uns_key_nests_the_source_uns_keys(tmp_path):
+    scx = _fixture(tmp_path)
+    h5 = _h5ad_with_uns(tmp_path)
+
+    pyscx.obs_import(str(scx), str(h5), uns_keys=["scrublet", "other"], uns_key="tool")
+    uns = pyscx.open(str(scx)).read_uns()
+    assert uns["tool"] == {"scrublet": {"threshold": 0.35}, "other": 1}
+    assert "scrublet" not in uns

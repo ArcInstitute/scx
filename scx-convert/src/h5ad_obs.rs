@@ -164,9 +164,9 @@ fn select_uns(
     uns_keys: &[String],
     path: &Path,
     sink: &mut WarningSink,
-) -> Result<(Option<Value>, Vec<String>)> {
+) -> Result<(Map<String, Value>, Vec<String>)> {
     if uns_keys.is_empty() {
-        return Ok((None, Vec::new()));
+        return Ok((Map::new(), Vec::new()));
     }
 
     let all = read_uns(file, false, sink).map_err(|e| {
@@ -202,7 +202,7 @@ fn select_uns(
         }
     }
 
-    Ok((Some(Value::Object(picked)), names))
+    Ok((picked, names))
 }
 
 #[cfg(test)]

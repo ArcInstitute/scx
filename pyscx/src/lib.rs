@@ -262,10 +262,11 @@ pub(crate) fn deep_validate_into(
 ///   containers to plain Python lists on readback. Use this only if a
 ///   downstream pipeline relies on the old list types.
 ///
-/// In both modes, non-finite raw Python `float` values and `bytes` objects
-/// still raise `ValueError` rather than being silently coerced — finite
-/// floats serialize as JSON numbers either way, and the in-array NaN/Inf
-/// case is only handled by the base64 path under `"tagged"`.
+/// `bytes` objects raise `ValueError` in both modes. Finite floats serialize
+/// as JSON numbers either way and read back bit-exact. A non-finite raw
+/// Python `float` (`nan` / `±inf`) is preserved under `"tagged"` as a float64
+/// `scalar` envelope (it reads back as `np.float64`) and raises under
+/// `"plain"`, whose contract is "lossless or refuse".
 ///
 /// By default `from_anndata()` does not mutate `adata.X`, `adata.layers`,
 /// or `adata.raw.X`.
@@ -1424,6 +1425,7 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::rollback, m)?)?;
     m.add_function(wrap_pyfunction!(ops::merge, m)?)?;
     m.add_function(wrap_pyfunction!(ops::set_uns, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::update_uns, m)?)?;
     m.add_function(wrap_pyfunction!(ops::modify_metadata, m)?)?;
     // Ungated: a delimited-table import must not require libhdf5.
     m.add_function(wrap_pyfunction!(ops::obs_import, m)?)?;

@@ -157,3 +157,39 @@ fn modify_metadata_cli_wrong_shape_fails() {
         "expected failure on wrong obs row count"
     );
 }
+
+#[test]
+fn set_uns_cli_merge_keeps_other_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let scx = write_fixture(&dir, "m.scx", 20, 5);
+    let patch = dir.path().join("patch.json");
+    std::fs::write(&patch, r#"{"method": "cli", "k": 3}"#).unwrap();
+
+    let out = scx_cli()
+        .args([
+            "set-uns",
+            scx.to_str().unwrap(),
+            "--uns",
+            patch.to_str().unwrap(),
+            "--merge",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "set-uns --merge failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let uns = ScxReader::open(&scx).unwrap().read_uns().unwrap();
+    assert_eq!(
+        uns,
+        serde_json::json!({"state": "v0", "method": "cli", "k": 3}),
+        "--merge keeps the fixture's `state` and adds the patch keys"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Merged"),
+        "the success line must say it merged: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

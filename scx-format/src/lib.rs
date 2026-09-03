@@ -338,3 +338,53 @@ mod uns_depth_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod uns_float_tests {
+    use super::*;
+
+    /// Every reader parses `uns` through [`parse_uns_json`]. `serde_json`'s
+    /// default float parser is fast but not correctly rounded: it lands a
+    /// sizeable share of 17-significant-digit doubles one ULP off, while the
+    /// writer (ryu, shortest round-trip) is exact — so a value written by
+    /// `set_uns` read back *different*. The workspace turns on
+    /// `float_roundtrip`; this pins that it stays on. A deterministic
+    /// bit-pattern sweep, not a hand-picked value: which literals drift is a
+    /// property of the parser version, so a single known case could quietly
+    /// start passing for the wrong reason.
+    #[test]
+    fn parse_uns_json_reads_back_every_double_bit_for_bit() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut xorshift64 = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut checked = 0usize;
+        let mut drifted: Vec<(f64, f64)> = Vec::new();
+        for _ in 0..100_000 {
+            let x = f64::from_bits(xorshift64());
+            if !x.is_finite() {
+                continue;
+            }
+            let bytes = serde_json::to_vec(&serde_json::json!({ "x": x })).unwrap();
+            let back = parse_uns_json(&bytes).unwrap()["x"].as_f64().unwrap();
+            checked += 1;
+            if back.to_bits() != x.to_bits() {
+                drifted.push((x, back));
+            }
+        }
+        assert!(
+            checked > 90_000,
+            "sweep degenerate: only {checked} finite values"
+        );
+        assert!(
+            drifted.is_empty(),
+            "{} of {checked} doubles changed on read; first three: {:?}",
+            drifted.len(),
+            &drifted[..drifted.len().min(3)]
+        );
+    }
+}

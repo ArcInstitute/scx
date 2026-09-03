@@ -475,7 +475,8 @@ fn scx_validate_impl(path: &str) -> Result<bool> {
 ///   `NULL` auto-resolves it.
 /// @param prefix Prepended to every imported column name.
 /// @param status_column Obs column recording "present"/"absent" per row.
-/// @param uns_key `uns` key for the run metadata.
+/// @param uns_key Reserved and currently inert: rscx sends no `uns` payload, so
+///   nothing is written under it. Kept for signature stability.
 /// @param overwrite Replace colliding columns. REPLACES, never merges.
 /// @param on_missing_rows `"null"` (default), `"zero"` (an accepted alias for
 ///   the same policy) or `"error"`.
@@ -525,7 +526,7 @@ fn scx_attach_obs_impl(
     key_column: Nullable<String>,
     prefix: &str,
     status_column: Nullable<String>,
-    uns_key: Nullable<String>,
+    _uns_key: Nullable<String>,
     overwrite: bool,
     on_missing_rows: &str,
     on_extra_rows: &str,
@@ -650,7 +651,10 @@ fn scx_attach_obs_impl(
         row_keys,
         row_annotations: annotations,
         row_embeddings: Vec::new(),
-        uns: None,
+        // rscx sends no uns payload today, so `uns_key` above is inert: it is
+        // kept on the R signature for stability (R parity for the uns payload
+        // is a ROADMAP item), and there is nothing for it to name.
+        uns: Default::default(),
         source_checksum: None,
         source_name: Some("<R data.frame>".to_string()),
     };
@@ -660,10 +664,6 @@ fn scx_attach_obs_impl(
         missing_row_policy: missing,
         extra_row_policy: extra,
         status_column: match status_column {
-            Nullable::NotNull(s) => Some(s),
-            Nullable::Null => None,
-        },
-        uns_key: match uns_key {
             Nullable::NotNull(s) => Some(s),
             Nullable::Null => None,
         },

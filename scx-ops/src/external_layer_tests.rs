@@ -153,7 +153,7 @@ fn diagonal_data(
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: Some("test.h5".to_string()),
     }
@@ -253,7 +253,7 @@ fn permuted_source_rows_join_by_key_not_position() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -342,7 +342,7 @@ fn extra_source_rows_are_skipped_and_counted_by_whether_they_carry_counts() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -737,7 +737,7 @@ fn explicit_zero_before_a_duplicate_column_does_not_corrupt_the_row() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     };
@@ -841,7 +841,7 @@ fn dry_run_nnz_matches_the_real_import() {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: Some(p.display().to_string()),
     };
@@ -919,17 +919,10 @@ fn var_annotations_are_written_and_uns_is_merged() {
         )
         .unwrap(),
     );
-    data.uns = Some(serde_json::json!({"version": 1}));
+    data.uns
+        .insert("cellbender".to_string(), serde_json::json!({"version": 1}));
 
-    attach_external_layer(
-        &path,
-        &data,
-        &AttachLayerOptions {
-            uns_key: Some("cellbender".to_string()),
-            ..opts("cb")
-        },
-    )
-    .unwrap();
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
 
     let reader = ScxReader::open(&path).unwrap();
     let var = reader.read_var().unwrap();
@@ -1298,7 +1291,7 @@ fn positional_probe(n: usize) -> ExternalLayerData {
         row_annotations: Some(ann),
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     }
@@ -1452,7 +1445,7 @@ fn duplicate_coordinate_data(a: f32, b: f32) -> ExternalLayerData {
         row_annotations: None,
         row_embeddings: Vec::new(),
         col_annotations: None,
-        uns: None,
+        uns: serde_json::Map::new(),
         source_checksum: None,
         source_name: None,
     }
@@ -1656,4 +1649,102 @@ fn dry_run_reports_the_encoding_the_write_would_use() {
         attach_external_layer(&path, &data, &pinned_preview).is_err(),
         "a preview must surface the pinned-encoding failure, not defer it to the write"
     );
+}
+
+#[test]
+fn several_uns_keys_merge_in_one_commit_on_the_layer_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let mut data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    data.uns
+        .insert("b".to_string(), serde_json::json!({"x": 2}));
+
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    let reader = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.read_uns().unwrap(),
+        serde_json::json!({"state": "v0", "a": 1, "b": {"x": 2}})
+    );
+    let prov = reader.read_provenance().unwrap();
+    assert!(
+        prov.operations
+            .last()
+            .unwrap()
+            .params_json
+            .contains("\"uns_keys_merged\":[\"a\",\"b\"]"),
+        "{}",
+        prov.operations.last().unwrap().params_json
+    );
+}
+
+/// The layer op used to rewrite `uns` unconditionally — an identical blob
+/// appended and the old one orphaned, on every import with nothing to merge.
+/// The obs op never did; the documented contract ("an empty payload leaves the
+/// section untouched") now holds for both. (Round 1: codex + Cursor Agent.)
+#[test]
+fn an_empty_uns_payload_leaves_the_uns_section_untouched_on_the_layer_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let uns_span = |path: &Path| -> Vec<(String, u64, u64)> {
+        ScxReader::open(path)
+            .unwrap()
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::UnsBlob)
+            .map(|e| (e.name.clone(), e.offset, e.length))
+            .collect()
+    };
+    let before = uns_span(&path);
+    assert_eq!(before.len(), 1);
+
+    let data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    assert!(data.uns.is_empty());
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    assert_eq!(
+        uns_span(&path),
+        before,
+        "no payload → the uns section is neither rewritten nor moved"
+    );
+    assert_eq!(
+        ScxReader::open(&path).unwrap().read_uns().unwrap(),
+        serde_json::json!({"state": "v0"})
+    );
+}
+
+/// The layer twin of the obs test: an unreadable `uns` fails the attach when
+/// there is something to merge, rather than being replaced by `{}`.
+#[test]
+fn an_unreadable_uns_section_fails_the_layer_attach_when_there_is_a_payload() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_fixture(dir.path(), "a.scx", 3, 2, 1);
+    let (offset, length) = {
+        let r = ScxReader::open(&path).unwrap();
+        let e = r
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::UnsBlob)
+            .unwrap();
+        (e.offset, e.length as usize)
+    };
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(&vec![b'{'; length]).unwrap();
+    drop(f);
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    let mut data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    data.uns.insert("a".to_string(), serde_json::json!(1));
+    let err = attach_external_layer(&path, &data, &opts("cb")).unwrap_err();
+    assert!(!matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes0, "file byte-identical");
+
+    // Without a payload the section is never read, so the layer still lands.
+    let data = diagonal_data(keys("cell_", 3), keys("g", 2), |i| (i + 1) as f32);
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
 }

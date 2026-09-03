@@ -358,7 +358,7 @@ fn no_uns_keys_requested_imports_none() {
     let (data, info) = read_h5ad_obs(&p, &opts(), &[]).unwrap();
     // Opt-in: /uns routinely holds large arrays and types the reader skips, so
     // pulling it wholesale would be a surprise in both size and content.
-    assert!(data.uns.is_none());
+    assert!(data.uns.is_empty());
     assert!(info.uns_keys_imported.is_empty());
 }
 
@@ -369,7 +369,9 @@ fn a_requested_uns_key_is_imported() {
     write_uns(&p, &[("scrublet", 0.4), ("other", 1.0)]);
 
     let (data, info) = read_h5ad_obs(&p, &opts(), &["scrublet".to_string()]).unwrap();
-    let uns = data.uns.expect("the requested key must arrive");
+    // The selected keys ARE the payload, at top level, keyed by their source
+    // names; a caller that wants them under one key nests them itself.
+    let uns = Value::Object(data.uns);
     assert!(uns.get("scrublet").is_some(), "{uns}");
     assert!(uns.get("other").is_none(), "only what was asked for: {uns}");
     assert_eq!(info.uns_keys_imported, ["scrublet"]);
@@ -423,7 +425,7 @@ fn doublet_import_reads_an_h5ad_without_a_csv_detour() {
     );
     assert!((f32_at(&data, "scrublet_score", 1) - 0.2).abs() < 1e-6);
 
-    let uns = data.uns.expect("the wrapper always records provenance");
+    let uns = &data.uns["scrublet"];
     assert_eq!(uns["source_format"], "h5ad");
 }
 
@@ -472,7 +474,14 @@ fn a_requested_uns_key_nests_under_the_wrapper_record() {
         ..Default::default()
     };
     let (data, _) = crate::doublet::read_doublet_table(&p, &o).unwrap();
-    let uns = data.uns.unwrap();
+    // The wrapper keys its record by `key_added` (here the profile default).
+    assert_eq!(
+        data.uns.len(),
+        1,
+        "{:?}",
+        data.uns.keys().collect::<Vec<_>>()
+    );
+    let uns = &data.uns["scrublet"];
 
     // Nested, so the tool's own key keeps its source name and cannot collide
     // with the wrapper's fields however `key_added` was spelled.

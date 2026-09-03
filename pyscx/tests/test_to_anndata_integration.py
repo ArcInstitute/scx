@@ -859,12 +859,11 @@ def test_from_anndata_uns_bytes_raises(tmp_dir):
         pyscx.from_anndata(adata, str(tmp_dir / "uns_bytes_plain.scx"), uns_format="plain")
 
 
-def test_from_anndata_uns_non_finite_python_float_raises(tmp_dir):
-    """Top-level Python `float('nan')` still errors loudly with a key path.
-
-    Tagged mode only preserves NaN/Inf when the value is inside an
-    `np.ndarray` (base64-LE bytes); a raw Python scalar has no dtype to
-    pin down, so we keep the explicit error for that case.
+def test_from_anndata_uns_non_finite_python_float_raises_under_plain(tmp_dir):
+    """Under `uns_format="plain"` a top-level Python `float('nan')` still
+    errors loudly with a key path — plain mode's contract is "lossless or
+    refuse", and JSON has no NaN literal. The default tagged mode preserves
+    it through the `scalar` envelope instead (`test_uns_float_fidelity.py`).
     """
     import pyscx
 
@@ -873,7 +872,7 @@ def test_from_anndata_uns_non_finite_python_float_raises(tmp_dir):
         ValueError,
         match=r"uns at uns\['top'\]: non-finite float \(NaN\) cannot be serialized",
     ):
-        pyscx.from_anndata(adata, str(tmp_dir / "nan.scx"))
+        pyscx.from_anndata(adata, str(tmp_dir / "nan.scx"), uns_format="plain")
 
 
 def test_from_anndata_uns_nan_in_array_roundtrips_under_tagged(tmp_dir):

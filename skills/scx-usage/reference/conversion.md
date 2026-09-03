@@ -263,7 +263,7 @@ Other commands:
 - `scx merge <f1> <f2> [...] --output <path> [--index-* ...] [--assume-identical-var] [--uns-policy first|require-equal|namespace|summary] [--sort-by CSV] [--sort-reverse] [--codec ...] [--memory-budget SIZE] [--rebuild-csc]`.
 - `scx sort <input> <output> --by CSV [--reverse] [--force] [--shard-size N] [--codec ...] [--index-* ...] [--memory-budget SIZE] [--temp-dir DIR] [--bitmap off|auto|always] [--rebuild-csc]` — globally reorder cells by obs columns for query locality.
 - `scx sort <input> <output> --shuffle [--seed N] [--codec ...]` — the training counterpart: reorder cells by a seeded random permutation so a loader gets i.i.d. batches at any `shard_group_size`. Mutually exclusive with `--by` / `--group-by` / `--reverse`; the seed (default 42) is recorded in provenance. Pass `--codec` to hold the input's encoding — left at `auto` the adaptive codec re-selects and the file can grow substantially. Python: `pyscx.shuffle(input, output, seed=42)`.
-- `scx set-uns <file> --uns JSON_FILE` — replace the `uns` block in place (no X re-encode).
+- `scx set-uns <file> --uns JSON_FILE [--merge]` — replace the `uns` block in place (no X re-encode); `--merge` shallow-merges the JSON object's top-level keys into the existing block instead (`pyscx.update_uns`).
 - `scx modify-metadata <file> [--uns JSON] [--obs PARQUET] [--var PARQUET] [--obsm NAME=PATH.npy ...] [--varm NAME=PATH.npy ...] [--index-* ...] [--modality NAME]` — replace metadata sections in place.
 - `scx rollback <file> [--to-seq N]`.
 - `scx build-csc <input> <output> [--memory-limit 4G] [--force] [--csc-cols-per-shard N]` — `--memory-limit` takes the same size forms as `--memory-budget`.

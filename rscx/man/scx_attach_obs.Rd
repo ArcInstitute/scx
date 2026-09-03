@@ -44,7 +44,9 @@ neither is alone. Mutually exclusive with \code{key}.}
 \item{status_column}{Obs column recording \code{"present"}/\code{"absent"}
 per row. \code{NULL} omits it.}
 
-\item{uns_key}{\code{uns} key for the run metadata. \code{NULL} omits it.}
+\item{uns_key}{Reserved and currently inert: \code{scx_attach_obs} sends no
+\code{uns} payload, so nothing is written under it. Kept for signature
+stability.}
 
 \item{overwrite}{Replace colliding columns. \strong{Replaces, never merges} — so
 attaching several per-batch results in turn keeps only the last. Combine

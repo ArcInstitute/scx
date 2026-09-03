@@ -49,6 +49,7 @@ WRAPPED = [
     "validate",
     "modify_metadata",
     "set_uns",
+    "update_uns",
     "obs_import",
     "attach_obs_columns",
     "diagnose_obs_key",

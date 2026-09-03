@@ -22,7 +22,7 @@ use scx_format_io::section::SectionType;
 use scx_format_io::writer::ScxWriter;
 use scx_format_io::ScxReader;
 
-use scx_ops::{modify_metadata, set_uns, MetadataPatch, OpsError};
+use scx_ops::{modify_metadata, set_uns, update_uns, MetadataPatch, OpsError};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -683,4 +683,132 @@ fn index_request_with_its_axis_supplied_is_honoured() {
         },
     )
     .expect("index_preset with obs supplied must be accepted");
+}
+
+// ---------------------------------------------------------------------------
+// update_uns — shallow top-level merge
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_uns_overwrites_only_the_named_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.scx");
+    write_base(
+        &path,
+        16,
+        4,
+        Some(&serde_json::json!({"a": 1, "b": {"x": 1}, "keep": [1.5, "s"]})),
+    );
+    let pre = csr_shard_snapshot(&path);
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    update_uns(&path, &serde_json::json!({"b": 2, "c": 3})).unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    assert_eq!(
+        r.read_uns().unwrap(),
+        serde_json::json!({"a": 1, "b": 2, "c": 3, "keep": [1.5, "s"]}),
+        "patch keys overwrite (shallow: `b` is replaced, not deep-merged); \
+         untouched keys survive verbatim"
+    );
+    assert_eq!(r.header().manifest_sequence, seq0 + 1, "one commit");
+    assert_eq!(csr_shard_snapshot(&path), pre, "no matrix re-encode");
+}
+
+#[test]
+fn update_uns_on_a_file_without_uns_creates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("none.scx");
+    write_base(&path, 16, 4, None);
+    assert!(
+        ScxReader::open(&path).unwrap().read_uns().is_err(),
+        "fixture has no uns section"
+    );
+
+    update_uns(&path, &serde_json::json!({"c": 3})).unwrap();
+
+    assert_eq!(
+        ScxReader::open(&path).unwrap().read_uns().unwrap(),
+        serde_json::json!({"c": 3})
+    );
+}
+
+#[test]
+fn update_uns_rejects_a_non_object_patch_and_leaves_the_file_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.scx");
+    let uns0 = serde_json::json!({"a": 1});
+    write_base(&path, 16, 4, Some(&uns0));
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    let err = update_uns(&path, &serde_json::json!([1, 2])).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("object"), "{err}");
+
+    assert_eq!(std::fs::read(&path).unwrap(), bytes0, "file byte-identical");
+    assert_eq!(ScxReader::open(&path).unwrap().read_uns().unwrap(), uns0);
+}
+
+#[test]
+fn update_uns_refuses_a_non_object_existing_uns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("arr.scx");
+    write_base(&path, 16, 4, Some(&serde_json::json!([1, 2, 3])));
+    let bytes0 = std::fs::read(&path).unwrap();
+
+    let err = update_uns(&path, &serde_json::json!({"c": 3})).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("set_uns"), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes0, "file byte-identical");
+}
+
+#[test]
+fn update_uns_then_rollback_restores_previous_uns() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rbm.scx");
+    let uns0 = serde_json::json!({"state": "v0"});
+    write_base(&path, 16, 4, Some(&uns0));
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    update_uns(&path, &serde_json::json!({"added": true})).unwrap();
+    assert_eq!(
+        ScxReader::open(&path).unwrap().read_uns().unwrap(),
+        serde_json::json!({"state": "v0", "added": true})
+    );
+
+    scx_ops::rollback(&path).unwrap();
+    let r = ScxReader::open(&path).unwrap();
+    assert_eq!(r.read_uns().unwrap(), uns0);
+    assert_eq!(r.header().manifest_sequence, seq0);
+}
+
+#[test]
+fn update_uns_preserves_generations_and_csc_sidecar() {
+    use scx_format_io::backed::BackedCscReader;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("csc_m.scx");
+    write_base_with_csc(&path, 40, 8, 4);
+    let (data_gen0, csc_gen0) = {
+        let r = ScxReader::open(&path).unwrap();
+        (
+            r.catalog().data_generation,
+            r.catalog().csc_build_generation,
+        )
+    };
+
+    update_uns(&path, &serde_json::json!({"note": "merged"})).unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    assert!(r.header().has_csc());
+    assert_eq!(r.catalog().data_generation, data_gen0);
+    assert_eq!(r.catalog().csc_build_generation, csc_gen0);
+    assert!(BackedCscReader::new(r, 0).is_ok(), "CSC reader still opens");
+    let prov = ScxReader::open(&path).unwrap().read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert!(
+        last.params_json.contains("\"uns_merge\":true"),
+        "provenance must distinguish a merge from a replace: {}",
+        last.params_json
+    );
 }

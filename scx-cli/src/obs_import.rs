@@ -159,14 +159,18 @@ pub fn run_obs_import(
         missing_row_policy: missing,
         extra_row_policy: extra,
         status_column: status_column.map(str::to_string),
-        uns_key: uns_key.map(str::to_string),
         overwrite,
         provenance_action: "obs_import".to_string(),
         dry_run,
         ..Default::default()
     };
 
-    let (data, info) = scx_convert::read_obs_source(table, &read_opts, uns_keys)?;
+    let (mut data, info) = scx_convert::read_obs_source(table, &read_opts, uns_keys)?;
+    // Without --uns-key the selected source keys land at top level under
+    // their own names; with it they nest under the one key.
+    if let Some(k) = uns_key {
+        data.nest_uns_under(k);
+    }
     println!(
         "Source: {} ({}, {} rows{}, key {:?}{})",
         table.display(),
