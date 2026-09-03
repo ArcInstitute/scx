@@ -540,7 +540,8 @@ full scverse pipeline works via AnnData from the format / codec / bridge work.
 - [x] Remaining backed mode aggregation ops (`var`, `max`, `min` per axis with deletion vectors)
 - [x] Comparison optimization (`(X > 0).sum()` → `getnnz()` short-circuit)
 - [x] Streaming preprocessing pipeline (`pyscx.preprocess`, `pyscx.save_layer`)
-- [x] Chunk iterator (`pyscx.iter_chunks`)
+- [x] Chunk iterator (`pyscx.iter_chunks`) — shard-aligned on plain, layer and lazily transformed `X`
+- [x] Bounded row gather (REC-1): `handle[rows]` / `handle[:]` / `Experiment.gather_rows_sparse(layer=, logical=)` assemble the result once (peak = result + shard cache; was 2× the result)
 - [x] Selective loading (`var_names`, `obs_filter`, `layers` parameters)
 
 ### 4b. Rust-Native Accelerators — COMPLETE

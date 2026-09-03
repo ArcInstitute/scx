@@ -54,7 +54,7 @@ and `pyscx.write(adata, path, **kwargs)` (= `from_anndata`).
 - `query() -> PyQueryPipeline`.
 - `mark_deleted(mask)`, `validate()`.
 - `detection_counts(axis="var", modality=None)` / `cells_expressing(gene, modality=None)` — bitmap fast path when sidecars exist, CSR scan otherwise.
-- `gather_rows_sparse(rows, modality=None, cache_shards=4)` — random-access sparse row gather; returns a scipy CSR submatrix.
+- `gather_rows_sparse(rows, modality=None, cache_shards=4, layer=None, logical=True)` — random-access sparse row gather (bool mask or integer array-like; request order, duplicates allowed; logical rows by default, `layer=` for a layer); returns a scipy CSR submatrix with peak memory = result + `cache_shards` shards. The same gather is `adata.X[rows]` / `adata.layers[name][rows]` on a backed handle.
 - `provenance()` — returns the file's provenance chain.
 - Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `layer_names`.
 

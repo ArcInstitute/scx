@@ -1083,6 +1083,12 @@ impl ScxBackedSparseDataset {
     /// user-visible row space (i.e., deleted rows are excluded from counts).
     /// Each tuple represents a contiguous chunk of user-visible rows that
     /// came from one on-disk shard.
+    ///
+    /// **Tiling contract** — `pyscx.iter_chunks(chunk_size="shard")` relies on
+    /// it, and `test_chunk_iterator.py` pins it: `b[0].0 == 0`,
+    /// `b.last().1 == n_obs` (visible), and `b[i].0 == b[i-1].1`, i.e. the
+    /// pairs tile `[0, n_obs)` exactly with no gaps or overlap. A shard whose
+    /// rows are all deleted is omitted, so `len(b)` may be below `n_shards`.
     pub(crate) fn shard_boundaries(&self) -> Vec<(usize, usize)> {
         let n_shards = self.n_shards;
         match &self.kept_to_global {
