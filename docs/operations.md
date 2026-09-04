@@ -504,9 +504,10 @@ the mutating ops treat it consistently:
   exempts the `RowFiltered` families (`X`, layers, `obsm`) at `n_obs == 0` —
   they are legitimately absent, not lost.
 - **merge**: a 0-row input contributes nothing, and may lack layers or `obsm`
-  keys the other inputs have — those are recorded only by shards, so a 0-row
-  input cannot carry them; the usual "key missing in input *i*" error applies
-  to populated inputs only. A merge whose inputs are all empty still writes an
+  keys the other inputs have — layers, `obsm`, per-modality `obsm`, `obsp`
+  graphs are all recorded only by shards, so a 0-row input cannot carry them;
+  the usual "key missing in input *i*" error (or, for a per-modality key, the
+  warn-and-drop) applies to populated inputs only. A merge whose inputs are all empty still writes an
   `obs` section (input 0's, with the same columns; like every merge output its
   categoricals come back as plain strings). This holds for the plain, sorted
   (`--sort-by`) and multimodal emitters alike. `varm` / `varp` still come from
@@ -516,9 +517,12 @@ the mutating ops treat it consistently:
   append") and `pyscx.append` (returns without writing). Appending onto a
   0-row target works: the target's 0-row `obs` schema — including string-typed
   empty `object` columns — is what the new block is checked against.
-- **build-csc** on an empty matrix (0 rows or 0 columns) is a no-op that still
-  produces the requested output, so `--rebuild-csc` / `rebuild_csc=True` on a
-  rewrite that yielded zero rows succeeds. `CscPolicy` never builds a sidecar
+- **build-csc** on an empty matrix (0 rows or 0 columns) writes no sidecar but
+  still produces the requested output — a verbatim copy, or, for a file that
+  carries a stale sidecar from an older writer, a rewrite without it — so
+  `--rebuild-csc` / `rebuild_csc=True` on a rewrite that yielded zero rows
+  succeeds. `input` and `output` naming the same file through different
+  spellings is refused (omit `<OUTPUT>` for the in-place form). `CscPolicy` never builds a sidecar
   on an empty matrix, whatever `csc=` says, and nothing warns about it.
 - **predicate indexes** are never built over a 0-row obs (or a 0-row var):
   `--index-obs` names are accepted, no index section is written, no warning is

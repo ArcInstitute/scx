@@ -2162,6 +2162,13 @@ fn merge_per_modality_dense_mapping_sharded(
             } else {
                 None
             };
+            if shards.is_empty() && legacy.is_none() && reader.n_obs() == 0 {
+                // A 0-row input has no shards for any key (it cannot: a key
+                // exists on disk only as its shards) and no rows to contribute,
+                // so it neither drops the key nor errors — same exemption as
+                // the global helper and the layer loops.
+                continue;
+            }
             if shards.is_empty() && legacy.is_none() {
                 // **Not** the global helper's hard error, deliberately. That
                 // helper's tolerance was an accident of a bare `continue`; this

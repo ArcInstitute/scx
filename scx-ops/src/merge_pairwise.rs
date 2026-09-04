@@ -227,6 +227,13 @@ fn merge_obsp(
             )
             .is_empty()
             {
+                // A 0-row input cannot carry a graph (it exists on disk only
+                // as its shards) and has no endpoints to offset; it contributes
+                // nothing rather than failing the merge — the same exemption
+                // the layer and dense-mapping loops grant.
+                if reader.n_obs() == 0 {
+                    continue;
+                }
                 return Err(OpsError::DenseMappingMissing {
                     axis: "obsp",
                     key,

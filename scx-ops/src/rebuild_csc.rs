@@ -58,6 +58,22 @@ pub fn rebuild_csc_inplace(
     memory_limit: &str,
     framing: Option<FramingConfig>,
 ) -> Result<BuildCscOutcome, Box<dyn std::error::Error>> {
+    // An empty matrix without a sidecar has nothing to rebuild and nothing to
+    // drop: answer without staging a copy of the file only to rename it back.
+    // (An empty matrix that still carries a stale sidecar goes through
+    // `run_build_csc`, which rewrites it without one.)
+    {
+        let reader = scx_format_io::ScxReader::open(target)?;
+        let h = reader.header();
+        if (h.n_obs == 0 || h.n_vars == 0) && !h.has_csc() {
+            log::info!(
+                "rebuild-csc: {target} is an empty matrix; no CSC sidecar to restore",
+                target = target.display()
+            );
+            return Ok(BuildCscOutcome::NoSidecar);
+        }
+    }
+
     // Stage the rebuilt file beside the target so the rename is atomic
     // on the same filesystem.
     let mut tmp_name = target.file_name().map(|s| s.to_owned()).unwrap_or_default();

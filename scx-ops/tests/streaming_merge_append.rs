@@ -1999,13 +1999,69 @@ fn write_multimodal_zero_row_input(path: &std::path::Path) {
     writer.finish().unwrap();
 }
 
-/// The multimodal emitter has its own obs and per-modality layer loops; the
-/// same two rules hold there.
+/// `write_multimodal_with_per_modality_obsm` plus a one-shard per-modality
+/// layer `rna/spliced`, so the test below can see both families survive.
+fn write_multimodal_with_obsm_and_layer(path: &std::path::Path, n_obs: u64) {
+    use scx_format_io::modality::ModalityType;
+    let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+    writer
+        .write_obs(&obs_batch(0, n_obs as usize, "donor_a"))
+        .unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &var_batch()).unwrap();
+    writer.write_var_for(adt_id, &var_batch()).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(adt_id, 4).unwrap();
+    let indptr: Vec<u64> = vec![0u64; (n_obs + 1) as usize];
+    for id in [rna_id, adt_id] {
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
+    }
+    let layer =
+        scx_format_io::ShardBuffers::new(&indptr, &[], &[], CodecId::None, ValueEncoding::Uint8);
+    writer
+        .write_layer_csr_shard_for(rna_id, "spliced", 0, 0, layer)
+        .unwrap();
+    let meta = scx_format_io::DenseShardMetadata::new(0, 0, n_obs, n_obs);
+    writer
+        .write_obsm_shard_for(rna_id, "X_umap", meta, &obsm_batch(0, n_obs as usize))
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// The multimodal emitter has its own obs, per-modality layer and
+/// per-modality obsm loops; the same two rules hold there. Round 2 of the
+/// review: the per-modality obsm loop used to *drop the key* (with a warning)
+/// when the 0-row input lacked it, and the first version of this test could
+/// not see that because it read neither the embedding nor a layer.
 #[test]
 fn multimodal_merge_tolerates_empty_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let full = dir.path().join("full_mm.scx");
-    write_multimodal_with_per_modality_obsm(&full, 6, "donor_a", 3);
+    write_multimodal_with_obsm_and_layer(&full, 6);
     let empty = dir.path().join("empty_mm.scx");
     write_multimodal_zero_row_input(&empty);
 
@@ -2019,6 +2075,21 @@ fn multimodal_merge_tolerates_empty_inputs() {
         assert_eq!(reader.header().n_obs, 6, "{label}");
         assert_eq!(reader.read_obs().unwrap().num_rows(), 6, "{label}");
         assert!(reader.is_multimodal(), "{label}");
+        let rna = reader.modality_id("rna").expect("rna modality");
+        let umap = reader
+            .read_obsm_for(rna, "X_umap")
+            .unwrap_or_else(|e| panic!("{label}: per-modality obsm must survive: {e}"));
+        assert_eq!(umap.num_rows(), 6, "{label}");
+        assert_eq!(
+            reader.layer_names_for(rna),
+            vec!["spliced".to_string()],
+            "{label}"
+        );
+        assert_eq!(
+            reader.read_layer_for(rna, "spliced").unwrap().shape,
+            (6, 4),
+            "{label}"
+        );
     }
 
     let e1 = dir.path().join("e1_mm.scx");
@@ -2031,6 +2102,68 @@ fn multimodal_merge_tolerates_empty_inputs() {
         .read_obs()
         .expect("an all-empty multimodal merge must carry an obs section");
     assert_eq!(obs.num_rows(), 0);
+}
+
+/// A COO `obsp` batch in the wire format `write_obsp` expects.
+fn coo_obsp_batch(rows: Vec<i32>, cols: Vec<i32>, data: Vec<f32>, n: usize) -> RecordBatch {
+    let schema = Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", DataType::Float32, false),
+        ],
+        std::collections::HashMap::from([
+            ("n_rows".to_string(), n.to_string()),
+            ("n_cols".to_string(), n.to_string()),
+        ]),
+    );
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(rows)),
+            Arc::new(Int32Array::from(cols)),
+            Arc::new(Float32Array::from(data)),
+        ],
+    )
+    .unwrap()
+}
+
+/// `merge_obsp` validated every input carried the graph before writing; a
+/// 0-row input cannot, so `merge([clustered, empty])` used to fail with
+/// `DenseMappingMissing` on the concat path.
+#[test]
+fn merge_tolerates_an_empty_input_lacking_obsp() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full.scx");
+    {
+        let mut writer = ScxWriter::new(&full, header(4, 4)).unwrap();
+        writer.write_obs(&obs_batch(0, 4, "donor_a")).unwrap();
+        writer.write_var(&var_batch()).unwrap();
+        write_zero_csr_shard(&mut writer, 0, 4);
+        writer
+            .write_obsp(
+                "connectivities",
+                &coo_obsp_batch(vec![0, 1, 2], vec![1, 2, 3], vec![1.0, 2.0, 3.0], 4),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let empty = dir.path().join("empty.scx");
+    write_zero_row_input(&empty, &var_batch(), false);
+
+    for (label, inputs) in [
+        ("full+empty", [full.as_path(), empty.as_path()]),
+        ("empty+full", [empty.as_path(), full.as_path()]),
+    ] {
+        let out = dir.path().join(format!("obsp_{label}.scx"));
+        scx_ops::merge(&inputs, &out).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 4, "{label}");
+        let graph = reader
+            .read_obsp("connectivities")
+            .unwrap_or_else(|e| panic!("{label}: obsp must survive: {e}"));
+        assert_eq!(graph.num_rows(), 3, "{label}: three COO entries");
+    }
 }
 
 /// Legacy single-section obsm `X_pca` (and optional legacy single-section

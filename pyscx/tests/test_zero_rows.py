@@ -211,12 +211,15 @@ def test_zero_obs_from_subsets(tmp_dir):
     out = str(tmp_dir / "sub_backed.scx")
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        pyscx.from_anndata(backed, out, csc="always")
+        pyscx.from_anndata(backed, out, csc="always", index_var=["gene_ids"])
     msgs = [str(w.message) for w in rec]
     # the rewrite route drops the source's layer with the same warning as the
-    # in-memory path, and does not advise `csc="always"` on an empty output
+    # in-memory path, does not advise `csc="always"` on an empty output, and
+    # says that `index_*` are not applied on this route (it never built an
+    # index for any row count)
     assert any('["counts"] exist on disk only as CSR shards' in m for m in msgs), msgs
     assert not any("csc" in m.lower() for m in msgs), msgs
+    assert any("index_obs / index_var / index_preset are not applied" in m for m in msgs), msgs
     e = pyscx.open(out)
     assert (e.n_obs, e.n_vars, e.shard_count) == (0, N_VARS, 0)
     assert e.to_anndata().shape == (0, N_VARS)
