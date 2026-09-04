@@ -65,7 +65,10 @@ pub fn rebuild_csc_inplace(
     {
         let reader = scx_format_io::ScxReader::open(target)?;
         let h = reader.header();
-        if (h.n_obs == 0 || h.n_vars == 0) && !h.has_csc() {
+        // Not for a header that claims rows with no CSR shards: that is
+        // malformed, and `run_build_csc` refuses it.
+        let malformed = h.n_obs > 0 && h.n_csr_shards == 0;
+        if (h.n_obs == 0 || h.n_vars == 0) && !h.has_csc() && !malformed {
             log::info!(
                 "rebuild-csc: {target} is an empty matrix; no CSC sidecar to restore",
                 target = target.display()

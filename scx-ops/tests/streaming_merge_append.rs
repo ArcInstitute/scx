@@ -2104,28 +2104,104 @@ fn multimodal_merge_tolerates_empty_inputs() {
     assert_eq!(obs.num_rows(), 0);
 }
 
-/// A COO `obsp` batch in the wire format `write_obsp` expects.
-fn coo_obsp_batch(rows: Vec<i32>, cols: Vec<i32>, data: Vec<f32>, n: usize) -> RecordBatch {
+/// A COO `obsp` batch in the wire format `write_obsp` expects; `data` is
+/// Float32, or Float64 when `f64_data` (to provoke a schema mismatch).
+fn coo_obsp_batch_typed(
+    rows: Vec<i32>,
+    cols: Vec<i32>,
+    data: Vec<f32>,
+    n: usize,
+    f64_data: bool,
+) -> RecordBatch {
+    let data_type = if f64_data {
+        DataType::Float64
+    } else {
+        DataType::Float32
+    };
     let schema = Schema::new_with_metadata(
         vec![
             Field::new("row", DataType::Int32, false),
             Field::new("col", DataType::Int32, false),
-            Field::new("data", DataType::Float32, false),
+            Field::new("data", data_type, false),
         ],
         std::collections::HashMap::from([
             ("n_rows".to_string(), n.to_string()),
             ("n_cols".to_string(), n.to_string()),
         ]),
     );
+    let data_arr: arrow::array::ArrayRef = if f64_data {
+        Arc::new(arrow::array::Float64Array::from(
+            data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+        ))
+    } else {
+        Arc::new(Float32Array::from(data))
+    };
     RecordBatch::try_new(
         Arc::new(schema),
         vec![
             Arc::new(Int32Array::from(rows)),
             Arc::new(Int32Array::from(cols)),
-            Arc::new(Float32Array::from(data)),
+            data_arr,
         ],
     )
     .unwrap()
+}
+
+fn coo_obsp_batch(rows: Vec<i32>, cols: Vec<i32>, data: Vec<f32>, n: usize) -> RecordBatch {
+    coo_obsp_batch_typed(rows, cols, data, n, false)
+}
+
+/// A 4-row input carrying `obsp/connectivities` with a Float32 or Float64
+/// `data` column.
+fn write_obsp_input(path: &std::path::Path, donor: &str, f64_data: bool) {
+    let mut writer = ScxWriter::new(path, header(4, 4)).unwrap();
+    writer.write_obs(&obs_batch(0, 4, donor)).unwrap();
+    writer.write_var(&var_batch()).unwrap();
+    write_zero_csr_shard(&mut writer, 0, 4);
+    writer
+        .write_obsp(
+            "connectivities",
+            &coo_obsp_batch_typed(
+                vec![0, 1, 2],
+                vec![1, 2, 3],
+                vec![1.0, 2.0, 3.0],
+                4,
+                f64_data,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// Round 3 of the review: exempting a 0-row input from the obsp presence walk
+/// made `validate_obsp_value_schemas` reachable with an empty input 0 — and it
+/// keyed its baseline to `readers[0]`, so `[empty, f32, f64]` skipped the
+/// comparison and wrote an unreadable graph. The baseline is now the first
+/// input that carries the graph.
+#[test]
+fn obsp_schema_mismatch_is_caught_when_the_first_input_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.scx");
+    write_zero_row_input(&empty, &var_batch(), false);
+    let f32_a = dir.path().join("f32_a.scx");
+    write_obsp_input(&f32_a, "donor_a", false);
+    let f32_b = dir.path().join("f32_b.scx");
+    write_obsp_input(&f32_b, "donor_b", false);
+    let f64_c = dir.path().join("f64_c.scx");
+    write_obsp_input(&f64_c, "donor_c", true);
+
+    let out = dir.path().join("mismatch.scx");
+    let err = scx_ops::merge(&[empty.as_path(), f32_a.as_path(), f64_c.as_path()], &out)
+        .expect_err("an empty input 0 must not hide a dtype mismatch between inputs 1 and 2");
+    let msg = err.to_string();
+    assert!(msg.contains("input 1 vs input 2"), "{msg}");
+
+    // Agreeing populated graphs behind an empty input 0 still merge.
+    let out = dir.path().join("ok.scx");
+    scx_ops::merge(&[empty.as_path(), f32_a.as_path(), f32_b.as_path()], &out).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 8);
+    assert_eq!(reader.read_obsp("connectivities").unwrap().num_rows(), 6);
 }
 
 /// `merge_obsp` validated every input carried the graph before writing; a

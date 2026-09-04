@@ -1843,7 +1843,9 @@ fn validate_dense_mapping_schemas(
             return Err(OpsError::DenseMappingMismatch {
                 axis,
                 key: key.to_string(),
-                detail: format!("input 0 vs input {}: {}", per.0, detail),
+                // `per_input[0]` is the first input that carries the key — not
+                // necessarily input 0, since a 0-row input is skipped upstream.
+                detail: format!("input {} vs input {}: {}", per_input[0].0, per.0, detail),
             });
         }
     }

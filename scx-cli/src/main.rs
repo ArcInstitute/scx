@@ -1732,14 +1732,14 @@ fn main() {
             let framing = scx_ops::framing_for_csc_rebuild(&input);
             // `run_build_csc` says whether it built anything: an empty matrix
             // (0 rows or 0 columns) gets no sidecar, and "Built" would be a lie.
-            let done = |outcome: scx_ops::BuildCscOutcome, what: &str| match outcome {
-                scx_ops::BuildCscOutcome::Built => {
-                    println!("Built CSC sidecar on {}{what}", input.display())
-                }
-                scx_ops::BuildCscOutcome::NoSidecar => println!(
+            // On `Built` the library has already printed its "Built CSC: …"
+            // summary, so the copy-out arm adds nothing and the in-place arm
+            // keeps the one line it has always printed.
+            let no_sidecar = |what: &str| {
+                println!(
                     "{} is an empty matrix (0 rows or 0 columns); no CSC sidecar to build{what}",
                     input.display()
-                ),
+                )
             };
             match output {
                 Some(output) => scx_ops::run_build_csc(
@@ -1750,7 +1750,11 @@ fn main() {
                     csc_cols_per_shard,
                     framing,
                 )
-                .map(|outcome| done(outcome, &format!(" -> {}", output.display()))),
+                .map(|outcome| {
+                    if outcome == scx_ops::BuildCscOutcome::NoSidecar {
+                        no_sidecar(&format!(" -> {}", output.display()));
+                    }
+                }),
                 // In place, so there is no output to overwrite. Refuse
                 // `--force` rather than ignore it: silently accepting it would
                 // imply a guard that does not exist.
@@ -1759,7 +1763,12 @@ fn main() {
                     .into()),
                 None => {
                     scx_ops::rebuild_csc_inplace(&input, csc_cols_per_shard, &memory_limit, framing)
-                        .map(|outcome| done(outcome, " (in place)"))
+                        .map(|outcome| match outcome {
+                            scx_ops::BuildCscOutcome::Built => {
+                                println!("Built CSC sidecar on {} (in place)", input.display())
+                            }
+                            scx_ops::BuildCscOutcome::NoSidecar => no_sidecar(" (in place)"),
+                        })
                 }
             }
         }

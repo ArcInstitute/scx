@@ -107,6 +107,13 @@ pub fn run_build_csc(
     //    normal path, which re-emits its CSR shards and writes zero CSC shards.
     //    A header that *claims* rows but has no CSR shards is malformed and
     //    stays an error (below).
+    // A header that claims rows but carries no CSR shards is malformed, and
+    // must be refused before the empty-matrix fast path can copy it through as
+    // a success. (A 0-row file legitimately has none: the format forbids framed
+    // zero-row shards, so that case is exempt.)
+    if in_header.n_obs > 0 && in_header.n_csr_shards == 0 {
+        return Err("Input file has no CSR shards".into());
+    }
     let empty_matrix = in_header.n_obs == 0 || in_header.n_vars == 0;
     let has_csc = reader
         .catalog()
@@ -146,11 +153,6 @@ pub fn run_build_csc(
         )?;
         writer.finish()?;
         return Ok(BuildCscOutcome::NoSidecar);
-    }
-
-    // 6. Validate: input has CSR shards
-    if in_header.n_csr_shards == 0 {
-        return Err("Input file has no CSR shards".into());
     }
 
     // This function is not modality-aware — it flattens every CSR shard against
@@ -789,6 +791,7 @@ mod tests {
     /// `input` and `output` naming the same file through different spellings
     /// is refused before the `--force` arm can unlink it: the source stays
     /// byte-identical.
+    #[cfg(unix)]
     #[test]
     fn test_build_csc_refuses_an_aliased_output_before_force_unlinks_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -812,6 +815,28 @@ mod tests {
             alias.symlink_metadata().is_ok(),
             "the alias itself must not be unlinked"
         );
+    }
+
+    /// The empty-matrix fast path must not launder a malformed file: a header
+    /// that claims rows with no CSR shards stays an error on the 0-column axis
+    /// too (the 2-column twin is `test_build_csc_no_csr_error`).
+    #[test]
+    fn test_build_csc_zero_columns_with_rows_but_no_shards_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(3, 0)).unwrap();
+        writer.write_obs(&sample_obs(3)).unwrap();
+        writer.write_var(&sample_var(0)).unwrap();
+        writer.finish().unwrap();
+        let output = dir.path().join("output.scx");
+        let err = run_build_csc(&path, &output, "4G", false, 5000, None).unwrap_err();
+        assert!(err.to_string().contains("no CSR shards"), "{err}");
+        assert!(
+            !output.exists(),
+            "nothing may be written for a malformed input"
+        );
+        let err = crate::rebuild_csc::rebuild_csc_inplace(&path, 5000, "4G", None).unwrap_err();
+        assert!(err.to_string().contains("no CSR shards"), "{err}");
     }
 
     /// A 0-column matrix with rows and no sidecar is copied verbatim (CSR
