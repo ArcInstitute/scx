@@ -174,21 +174,27 @@ pub enum ObsJoinKey {
     /// Ordered obs columns fused with [`COMPOSITE_KEY_SEPARATOR`]. The source
     /// must carry columns of the same names; both sides are built identically.
     Composite { columns: Vec<String> },
-    /// No join at all: source row `i` annotates physical obs row `i`.
+    /// No join at all: source row `i` annotates obs row `i`.
     ///
     /// **For frames computed in-process from this file's own obs axis** — e.g.
-    /// columns derived from `read_obs()` output, which is already in physical
-    /// row order. External tool output must never use this: a tool returns rows
-    /// in its own order, which is the whole reason the key join exists (see the
-    /// module doc). What makes positional necessary at all is the file the key
-    /// join *cannot* serve — a merged atlas whose obs index is duplicated with
-    /// no unique column, where an in-process caller still needs to land columns
-    /// it just computed.
+    /// columns derived from `read_obs()` output, which is in obs row order.
+    /// External tool output must never use this: a tool returns rows in its own
+    /// order, which is the whole reason the key join exists (see the module
+    /// doc). What makes positional necessary at all is the file the key join
+    /// *cannot* serve — a merged atlas whose obs index is duplicated with no
+    /// unique column, where an in-process caller still needs to land columns it
+    /// just computed.
     ///
     /// Requires [`ExternalObsData::row_keys`] to be empty and
-    /// `row_annotations.num_rows()` to equal the file's physical `n_obs`
-    /// (deleted rows keep their place). A `status_column` is rejected: every
-    /// row matches by construction, so the marker would be a constant.
+    /// `row_annotations.num_rows()` to equal **either** the file's physical
+    /// `n_obs` (`header.n_obs`; row `i` annotates physical row `i`, deleted rows
+    /// included — `read_obs(logical=False)`) **or** its live row count (`n_obs`
+    /// minus the deletion-vector popcount; row `i` annotates the `i`-th live
+    /// row, deleted rows get `null` — `read_obs()` since pyscx 0.17). The two
+    /// coincide when nothing is deleted. A live-length frame may carry no
+    /// `row_embeddings` (a dense mapping has no null). A `status_column` is
+    /// rejected: every row matches by construction, so the marker would be a
+    /// constant.
     Positional,
 }
 
@@ -1503,6 +1509,20 @@ fn build_params_json(
         "uns_keys_merged": data.uns.keys().collect::<Vec<_>>(),
         "overwrite": opts.overwrite,
     });
+    // A positional attach is accepted in either row space, told apart only by
+    // length — so which one landed is not recoverable from the output (both
+    // write a physical-length obs). Record it: a live-length attach nulls the
+    // deleted rows, a physical one writes them.
+    if opts.join_key == ObsJoinKey::Positional {
+        let row_space = if s.n_target_rows_absent > 0 {
+            "logical"
+        } else {
+            "physical"
+        };
+        if let Some(map) = v.as_object_mut() {
+            map.insert("row_space".to_string(), Value::from(row_space));
+        }
+    }
     if let (Some(map), Some(extra)) = (v.as_object_mut(), opts.provenance_params.as_object()) {
         for (k, val) in extra {
             map.insert(k.clone(), val.clone());
@@ -1664,16 +1684,53 @@ fn attach_external_obs_inner(
         // `read_obs_keys_validated`), and positional must not lose it. Project
         // obs column 0: obs always carries at least its index column, and one
         // column is the cheapest read that still walks every shard.
+        // Either row space is accepted, told apart by length. Physical
+        // (`header.n_obs` rows) is the identity join. Live (`n_obs` minus the
+        // deletion-vector popcount — what `read_obs()` returns since pyscx
+        // 0.17) is built straight from the keep mask: the `i`-th live row is
+        // source row `i`, a deleted row has no source and lands `null` through
+        // the same `scatter` the key join uses. Not routed through
+        // `build_obs_row_join`: its coverage WARN ("check for a sample-name
+        // prefix") and its `MissingRowPolicy::Error` arm are about keys that
+        // failed to match, and a deleted row is not a failed match.
         let n_rows = data.row_annotations.num_rows() as u64;
-        if n_rows != n_obs {
-            return Err(OpsError::ShapeMismatch {
-                detail: format!(
-                    "positional attach needs one row per physical obs row: \
-                     row_annotations has {n_rows} rows but the file has \
-                     n_obs = {n_obs}. Rows are counted in physical obs space — \
-                     deleted rows keep their place; read them with read_obs()"
-                ),
-            });
+        let keep = if n_rows == n_obs {
+            None
+        } else {
+            reader.deletion_keep_mask()?
+        };
+        let n_live = keep
+            .as_ref()
+            .map_or(n_obs, |k| k.iter().filter(|b| **b).count() as u64);
+        let live_frame = match &keep {
+            Some(_) if n_rows == n_live => true,
+            _ if n_rows == n_obs => false,
+            _ => {
+                let deletions = if n_live == n_obs {
+                    format!("n_obs = {n_obs} (no logical deletions)")
+                } else {
+                    format!(
+                        "n_obs = {n_live} live rows and n_obs_physical = {n_obs} ({} logically \
+                         deleted). Pass {n_live} rows (read_obs()) to annotate the live rows, \
+                         or {n_obs} rows (read_obs(logical=False)) to annotate every physical \
+                         row",
+                        n_obs - n_live
+                    )
+                };
+                return Err(OpsError::ShapeMismatch {
+                    detail: format!(
+                        "positional attach needs one row per obs row: row_annotations has \
+                         {n_rows} rows but the file has {deletions}"
+                    ),
+                });
+            }
+        };
+        if live_frame && !data.row_embeddings.is_empty() {
+            return Err(OpsError::InvalidInput(format!(
+                "positional attach of a live-length frame ({n_live} of {n_obs} physical rows) \
+                 cannot carry obsm embeddings: a dense mapping has no null to stand in for a \
+                 deleted row. Pass {n_obs} rows, or attach the embeddings separately"
+            )));
         }
         if n_obs > u32::MAX as u64 {
             return Err(OpsError::InvalidInput(format!(
@@ -1697,15 +1754,36 @@ fn attach_external_obs_inner(
                 ),
             });
         }
-        (
-            opts.join_key.describe(),
-            ObsRowJoin {
+        let join = match keep.filter(|_| live_frame) {
+            Some(keep) => {
+                let mut next_live = 0u32;
+                let source_of_target: Vec<Option<u32>> = keep
+                    .iter()
+                    .map(|&live| {
+                        if live {
+                            let i = next_live;
+                            next_live += 1;
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                ObsRowJoin {
+                    source_of_target,
+                    n_matched: n_live,
+                    n_target_absent: n_obs - n_live,
+                    n_source_absent: 0,
+                }
+            }
+            None => ObsRowJoin {
                 source_of_target: (0..n_obs).map(|i| Some(i as u32)).collect(),
                 n_matched: n_obs,
                 n_target_absent: 0,
                 n_source_absent: 0,
             },
-        )
+        };
+        (opts.join_key.describe(), join)
     } else {
         let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;
         let key_batch = read_obs_keys_validated(reader, &obs_schema, &key_columns, n_obs)?;

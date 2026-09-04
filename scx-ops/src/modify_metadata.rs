@@ -68,7 +68,15 @@ pub struct MetadataPatch {
     /// object, and the existing `uns` to be one too (or absent). False
     /// (default): `uns` replaces the whole block. See [`update_uns`].
     pub uns_merge: bool,
-    /// Replaces obs metadata; `num_rows` must equal the file's `n_obs`.
+    /// Replaces obs metadata. `num_rows` must equal either the file's physical
+    /// `n_obs` (`header.n_obs`, deleted rows in place — what
+    /// `read_obs(logical=False)` returns) or its **live** row count (`n_obs`
+    /// minus the deletion-vector popcount — what `read_obs()` returns since
+    /// pyscx 0.17). A live-length frame is scattered onto the physical axis
+    /// before it is written: a deleted row keeps its obs-index value (barcode)
+    /// from the existing obs and is `null` in every other column, since the
+    /// caller never saw it. The two lengths coincide on a file with no
+    /// deletions. See [`modify_metadata`].
     pub obs: Option<RecordBatch>,
     /// Replaces var metadata; `num_rows` must equal the file's `n_vars`.
     pub var: Option<RecordBatch>,
@@ -353,19 +361,38 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         None => None,
     };
 
+    // --- What does the file already index? ---------------------------------
+    // Only when an axis is actually being replaced: a `uns`-only patch is the
+    // headline cheap case and must not pay for an mmap + index parse.
+    //
+    // The reader takes no lock of its own; we only ever append, never truncate,
+    // so holding it across the transaction is safe (same reasoning as
+    // `attach_external_obs`). Opened before the shape gate because an obs
+    // replacement needs the deletion keep mask to tell a live-length frame
+    // from a wrong one.
+    let reader = if patch.obs.is_some() || patch.var.is_some() {
+        Some(ScxReader::open(path)?)
+    } else {
+        None
+    };
+
     // --- Shape validation (before any write) -------------------------------
-    if let Some(obs) = &patch.obs {
-        if obs.num_rows() as u64 != prep.old_n_obs {
-            return Err(OpsError::ShapeMismatch {
-                detail: format!(
-                    "modify_metadata: obs has {} rows but file has n_obs={} \
-                     (changing cell count is out of scope — use append/subset)",
-                    obs.num_rows(),
-                    prep.old_n_obs
-                ),
-            });
+    //
+    // `obs` is accepted in either row space. Physical (`header.n_obs` rows) is
+    // written as handed in. Live (`n_obs - n_deleted` rows, what `read_obs()`
+    // returns) is scattered onto the physical axis here — BEFORE the index
+    // builder and the shard loop below, whose row ids and CSR ranges are
+    // physical; scattering after them would index live rows against physical
+    // shards and silently shorten every `filter_obs` on the new columns.
+    let obs_to_write: Option<RecordBatch> = match &patch.obs {
+        None => None,
+        Some(obs) => {
+            let reader = reader
+                .as_ref()
+                .expect("reader is opened whenever patch.obs is Some");
+            Some(resolve_obs_row_space(reader, obs, prep.old_n_obs)?)
         }
-    }
+    };
     if let Some(var) = &patch.var {
         if var.num_rows() as u64 != prep.target_n_vars {
             return Err(OpsError::ShapeMismatch {
@@ -383,7 +410,10 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             if b.num_rows() as u64 != prep.old_n_obs {
                 return Err(OpsError::ShapeMismatch {
                     detail: format!(
-                        "modify_metadata: obsm['{k}'] has {} rows but n_obs={}",
+                        "modify_metadata: obsm['{k}'] has {} rows but n_obs_physical={}. \
+                         A dense mapping is always physical-length (it has no null to \
+                         stand in for a deleted row), so unlike `obs` a live-length \
+                         array is not accepted here; pass one row per physical obs row",
                         b.num_rows(),
                         prep.old_n_obs
                     ),
@@ -405,15 +435,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         }
     }
 
-    // --- What does the file already index? ---------------------------------
-    // Only when an axis is actually being replaced: a `uns`-only patch is the
-    // headline cheap case and must not pay for an mmap + index parse.
-    //
-    // The reader takes no lock of its own; we only ever append, never truncate,
-    // so holding it across the transaction is safe (same reasoning as
-    // `attach_external_obs`).
-    let (existing_obs_index, existing_var_index) = if patch.obs.is_some() || patch.var.is_some() {
-        let reader = ScxReader::open(path)?;
+    let (existing_obs_index, existing_var_index) = if let Some(reader) = reader.as_ref() {
         let obs = match patch.obs {
             Some(_) => indexed_column_names(reader.read_obs_predicate_index_bytes()?)?,
             None => Vec::new(),
@@ -517,8 +539,9 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     // help — sends them round in a circle.
     let mut no_stats_reason = NoStatsReason::NoRebuildRequested;
 
-    if let Some(obs) = &patch.obs {
-        // Written as handed in: a dictionary (categorical) column is sliced
+    if let Some(obs) = &obs_to_write {
+        // Written as handed in (or as scattered onto the physical axis, see
+        // `resolve_obs_row_space`): a dictionary (categorical) column is sliced
         // per shard and lands as a dictionary carrying its field metadata, so
         // `read_obs()` gives the caller's categoricals back. (This used to run
         // `unify_dict_columns`, which cast every dictionary column to plain
@@ -952,6 +975,96 @@ fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> 
         });
     }
     params
+}
+
+/// Accept an obs replacement in either row space and return it physical-length.
+///
+/// `n_obs_physical` is the header count. A frame of exactly that many rows is
+/// returned as is (deleted rows in place). A frame of exactly the **live** count
+/// — what `pyscx` `read_obs()` returns since 0.17 — is scattered onto the
+/// physical axis through the deletion keep mask: a deleted row is `null` in
+/// every column the caller supplied, except the obs index column, which keeps
+/// the barcode the file already holds for it (a null key would become `""` in
+/// every later keyed join and, twice over, a duplicate). Any other length is a
+/// [`OpsError::ShapeMismatch`] naming both counts and the read that produces
+/// each. When nothing is deleted the two counts coincide and the frame is
+/// physical by construction.
+fn resolve_obs_row_space(
+    reader: &ScxReader,
+    obs: &RecordBatch,
+    n_obs_physical: u64,
+) -> Result<RecordBatch> {
+    let n_rows = obs.num_rows() as u64;
+    if n_rows == n_obs_physical {
+        return Ok(obs.clone());
+    }
+    let keep = reader.deletion_keep_mask()?;
+    let n_live = keep
+        .as_ref()
+        .map_or(n_obs_physical, |k| k.iter().filter(|b| **b).count() as u64);
+    let keep = match keep {
+        Some(keep) if n_rows == n_live => keep,
+        _ => {
+            let deletions = if n_live == n_obs_physical {
+                format!("n_obs={n_obs_physical} (no logical deletions)")
+            } else {
+                format!(
+                    "n_obs={n_live} live rows (read_obs()) and n_obs_physical={n_obs_physical} \
+                     (read_obs(logical=False); {} logically deleted)",
+                    n_obs_physical - n_live
+                )
+            };
+            return Err(OpsError::ShapeMismatch {
+                detail: format!(
+                    "modify_metadata: obs has {n_rows} rows but file has {deletions} \
+                     (changing cell count is out of scope — use append/subset)"
+                ),
+            });
+        }
+    };
+
+    let scattered = scx_format_io::scatter_batch_to_physical(obs, &keep)?;
+
+    // Keep the deleted rows' identity. The index column is whatever the file's
+    // pandas envelope (or the literal `__index_level_0__`) names, and it must
+    // be a column of the new frame too — the barcode is a string, so a
+    // dictionary-encoded index is cast to plain Utf8 first and back to the new
+    // frame's type after.
+    let existing_schema = reader.read_obs_schema_physical()?;
+    let index_col = scx_format_io::resolve_index_columns(&existing_schema)
+        .into_iter()
+        .find(|c| existing_schema.index_of(c).is_ok() && scattered.schema().index_of(c).is_ok());
+    let Some(index_col) = index_col else {
+        return Ok(scattered);
+    };
+    let old_index = reader.read_obs_keys(std::slice::from_ref(&index_col))?;
+    if old_index.num_rows() as u64 != n_obs_physical {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "modify_metadata: the existing obs index column '{index_col}' has {} rows but the \
+                 header declares n_obs={n_obs_physical}",
+                old_index.num_rows()
+            ),
+        });
+    }
+    let pos = scattered.schema().index_of(&index_col)?;
+    let target_type = scattered.column(pos).data_type().clone();
+    let old_col = arrow::compute::cast(
+        old_index
+            .column_by_name(&index_col)
+            .expect("projected column present"),
+        &target_type,
+    )?;
+    // Where the mask is live take the caller's value, elsewhere the file's.
+    let live_mask = arrow::array::BooleanArray::from(keep.clone());
+    let merged = arrow::compute::kernels::zip::zip(&live_mask, scattered.column(pos), &old_col)?;
+    let mut columns = scattered.columns().to_vec();
+    columns[pos] = merged;
+    Ok(RecordBatch::try_new_with_options(
+        scattered.schema(),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(keep.len())),
+    )?)
 }
 
 #[cfg(test)]

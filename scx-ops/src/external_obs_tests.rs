@@ -2307,14 +2307,188 @@ fn positional_attach_rejects_row_count_mismatch() {
     assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
     let msg = err.to_string();
     assert!(
-        msg.contains("physical") && msg.contains("read_obs()"),
-        "the error must say rows are counted in physical obs space, got: {msg}"
+        msg.contains("9 rows")
+            && msg.contains("n_obs = 10")
+            && msg.contains("no logical deletions"),
+        "the error must name the frame's rows and the file's, got: {msg}"
     );
     assert_eq!(
         before,
         std::fs::read(&path).unwrap(),
         "a rejected positional attach must not write a byte"
     );
+}
+
+// On a file with deletions the positional attach accepts either row space, told
+// apart by length. `read_obs()` is logical since pyscx 0.17, so the live-length
+// frame is the one an in-process caller now holds; the physical-length frame is
+// `read_obs(logical=False)` and must keep working unchanged.
+
+/// The `i`-th live row gets source row `i`; a deleted row gets null; the
+/// deletion vector and the file's live count are untouched.
+#[test]
+fn positional_attach_accepts_a_live_length_frame_on_a_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx"); // n_obs = 10
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    let s = attach_external_obs(&path, &positional_data(8), &positional_opts()).unwrap();
+    assert_eq!(
+        s.n_obs, 10,
+        "the summary's n_obs is the physical axis the join was built over"
+    );
+    assert_eq!(s.n_matched, 8);
+    assert_eq!(
+        s.n_target_rows_absent, 2,
+        "the deleted rows are the absent ones"
+    );
+    assert_eq!(s.n_source_rows_absent, 0);
+    assert_eq!(s.obs_key_column, "<positional>");
+
+    let reader = ScxReader::open(&path).unwrap();
+    let physical = reader.read_obs().unwrap();
+    assert_eq!(physical.num_rows(), 10);
+    let scores = f32_col(&physical, "dbl_score");
+    let mut live = 0usize;
+    for row in 0..10 {
+        if row == 1 || row == 3 {
+            assert!(
+                scores.is_null(row),
+                "deleted row {row} must be null, not a value"
+            );
+        } else {
+            assert_eq!(
+                scores.value(row),
+                live as f32 * 10.0,
+                "physical row {row} must carry live row {live}'s value"
+            );
+            live += 1;
+        }
+    }
+    let logical = reader.read_obs_filtered().unwrap();
+    let scores = f32_col(&logical, "dbl_score");
+    for i in 0..8 {
+        assert_eq!(
+            scores.value(i),
+            i as f32 * 10.0,
+            "the logical read gives the frame back"
+        );
+    }
+    let keep = reader.deletion_keep_mask().unwrap().unwrap();
+    assert!(
+        !keep[1] && !keep[3] && keep[0] && keep[9],
+        "deletion vector carried"
+    );
+
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert!(
+        last.params_json.contains("\"row_space\":\"logical\""),
+        "provenance must record which row space landed: {}",
+        last.params_json
+    );
+}
+
+#[test]
+fn positional_attach_still_accepts_a_physical_length_frame_on_a_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    let s = attach_external_obs(&path, &positional_data(10), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+    assert_eq!(s.n_target_rows_absent, 0);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let scores = f32_col(&reader.read_obs().unwrap(), "dbl_score");
+    for row in 0..10 {
+        assert_eq!(
+            scores.value(row),
+            row as f32 * 10.0,
+            "a physical frame writes every row, the deleted ones included"
+        );
+    }
+    let prov = reader.read_provenance().unwrap();
+    assert!(
+        prov.operations
+            .last()
+            .unwrap()
+            .params_json
+            .contains("\"row_space\":\"physical\""),
+        "{}",
+        prov.operations.last().unwrap().params_json
+    );
+}
+
+/// Neither length: the error names both counts and the read that produces each,
+/// and the file is untouched.
+#[test]
+fn positional_attach_rejects_neither_length_naming_both_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    for n in [7usize, 9] {
+        let err = attach_external_obs(&path, &positional_data(n), &positional_opts()).unwrap_err();
+        assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
+        let msg = err.to_string();
+        for needle in [
+            &format!("{n} rows"),
+            "n_obs = 8",
+            "n_obs_physical = 10",
+            "read_obs()",
+            "read_obs(logical=False)",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+        }
+    }
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
+
+/// More than half deleted: the key join's coverage report would warn about a sample-name
+/// prefix here, which is nonsense for a positional attach. The live join is
+/// built directly and must stay quiet and correct.
+#[test]
+fn positional_live_attach_on_a_mostly_deleted_file_lands_the_survivors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[0, 1, 2, 4, 5, 6, 8]).unwrap(); // live: 3, 7, 9
+
+    let s = attach_external_obs(&path, &positional_data(3), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 3);
+    assert_eq!(s.n_target_rows_absent, 7);
+    let scores = f32_col(
+        &ScxReader::open(&path).unwrap().read_obs().unwrap(),
+        "dbl_score",
+    );
+    assert_eq!(scores.value(3), 0.0);
+    assert_eq!(scores.value(7), 10.0);
+    assert_eq!(scores.value(9), 20.0);
+    assert!(scores.is_null(0) && scores.is_null(8));
+}
+
+/// A dense mapping has no null to stand in for a deleted row, so a live-length
+/// frame may not carry obsm embeddings.
+#[test]
+fn positional_attach_rejects_row_embeddings_on_a_live_length_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut data = positional_data(8);
+    let emb = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("c0", DataType::Float32, true)])),
+        vec![Arc::new(Float32Array::from(vec![0.0f32; 8]))],
+    )
+    .unwrap();
+    data.row_embeddings = vec![("X_pca".to_string(), emb)];
+
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("obsm embeddings"), "{err}");
+    assert_eq!(before, std::fs::read(&path).unwrap());
 }
 
 #[test]

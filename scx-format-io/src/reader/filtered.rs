@@ -124,6 +124,53 @@ impl ScxReader {
         }
     }
 
+    /// Column-projected twin of [`Self::read_obs_filtered`]:
+    /// [`Self::read_obs_keys`] with the deletion keep mask applied, so a
+    /// projected read stays projected (and dictionary-compacted) in the logical
+    /// row space. Filters rows only — a dictionary's declared values are kept
+    /// whether or not a live row uses them, matching `read_obs_filtered`. No
+    /// copy when nothing is deleted.
+    pub fn read_obs_keys_filtered(&self, col_names: &[String]) -> Result<RecordBatch> {
+        let obs = self.read_obs_keys(col_names)?;
+        match self.deletion_keep_mask()? {
+            Some(mask) => filter_batch_by_keep_mask(&obs, &mask),
+            None => Ok(obs),
+        }
+    }
+
+    /// [`Self::obs_categorical_many`] in the **logical** row space: the
+    /// physical fold, then the deletion keep mask compacts each column's codes
+    /// ([`crate::filter_codes_by_keep_mask`]). Categories are unchanged — an
+    /// unreferenced level stays, exactly as in the physical result. The mask is
+    /// built once for every column.
+    pub fn obs_categorical_many_filtered(
+        &self,
+        cols: &[String],
+    ) -> Result<Vec<(Vec<i32>, Vec<String>)>> {
+        let out = self.obs_categorical_many(cols)?;
+        match self.deletion_keep_mask()? {
+            Some(mask) => out
+                .into_iter()
+                .map(|(codes, cats)| {
+                    Ok((
+                        crate::categorical::filter_codes_by_keep_mask(codes, &mask)?,
+                        cats,
+                    ))
+                })
+                .collect(),
+            None => Ok(out),
+        }
+    }
+
+    /// [`Self::obs_categorical`] in the logical row space; see
+    /// [`Self::obs_categorical_many_filtered`].
+    pub fn obs_categorical_filtered(&self, col: &str) -> Result<(Vec<i32>, Vec<String>)> {
+        Ok(self
+            .obs_categorical_many_filtered(std::slice::from_ref(&col.to_string()))?
+            .pop()
+            .expect("one column in ⇒ one column out"))
+    }
+
     /// Read all CSR shards with deletion vectors applied.
     /// Deleted rows are excluded from the returned ScxCsr.
     /// If no deletion vectors are present, returns the same result as `read_all_csr_shards()`.

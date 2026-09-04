@@ -130,6 +130,7 @@ pub(crate) use metadata::DenseMappingLayout;
 pub use metadata::{
     assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
     decode_arrow_ipc_schema, filter_batch_by_keep_mask, prune_unused_dictionary_values,
+    scatter_batch_to_physical,
 };
 
 // Reached only from `reader_tests.rs`, which is attached to this module and so

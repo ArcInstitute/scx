@@ -55,7 +55,7 @@ pub use bitmap::{
     BITMAP_SHARD_VERSION,
 };
 #[cfg(feature = "deletion-vectors")]
-pub use categorical::GlobalCategoryAccum;
+pub use categorical::{filter_codes_by_keep_mask, GlobalCategoryAccum};
 pub use csc_sidecar::{write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_BYTES};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;
@@ -77,7 +77,8 @@ pub use profile::{
 };
 pub use reader::{
     assemble_filtered_metadata, assemble_sharded_metadata, compact_key_shard,
-    decode_arrow_ipc_schema, prune_unused_dictionary_values, ScxReader,
+    decode_arrow_ipc_schema, filter_batch_by_keep_mask, prune_unused_dictionary_values,
+    scatter_batch_to_physical, ScxReader,
 };
 pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,

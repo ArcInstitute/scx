@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch, StringArray};
+use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
@@ -153,6 +153,60 @@ fn assert_flag_matches_section(path: &Path, label: &str) {
     }
 }
 
+fn score_batch(n: usize) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "score",
+            DataType::Float32,
+            true,
+        )])),
+        vec![Arc::new(Float32Array::from(
+            (0..n).map(|i| i as f32).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap()
+}
+
+/// `attach_external_obs(positional=True)` with an `n`-row frame — `LIVE` rows is
+/// the live-length arm, `N_OBS` the physical one.
+fn attach_positional_scores(path: &Path, n: usize) {
+    scx_ops::attach_external_obs(
+        path,
+        &scx_ops::ExternalObsData {
+            row_keys: Vec::new(),
+            row_annotations: score_batch(n),
+            row_embeddings: Vec::new(),
+            uns: Default::default(),
+            source_checksum: None,
+            source_name: None,
+        },
+        &scx_ops::AttachObsOptions {
+            join_key: scx_ops::ObsJoinKey::Positional,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+/// `modify_metadata(obs=)` with `obs` plus one new `score` column, in whichever
+/// row space `obs` came in.
+fn replace_obs_with_score(path: &Path, obs: RecordBatch) {
+    let n = obs.num_rows();
+    let mut fields: Vec<Arc<Field>> = obs.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new("score", DataType::Float32, true)));
+    let mut columns = obs.columns().to_vec();
+    columns.push(score_batch(n).column(0).clone());
+    let obs = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    scx_ops::modify_metadata(
+        path,
+        &scx_ops::MetadataPatch {
+            obs: Some(obs),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Policy {
     /// Rows stay; the deletion-vector section comes with them.
@@ -200,6 +254,39 @@ fn every_op_preserves_the_live_cell_count() {
                 ..Default::default()
             };
             scx_engine::streaming_save_layer(src, out, "norm", &config).unwrap();
+            out.to_path_buf()
+        }),
+        // The two in-place obs writers accept a frame in either row space
+        // (pyscx 0.17: `read_obs()` is live-length, `read_obs(logical=False)`
+        // physical). Both must carry the deletion vector and neither may
+        // resurrect a row — the live-length arm in particular writes a
+        // physical-length obs with nulls at the deleted rows.
+        ("attach_obs_positional_live", Policy::Carry, |src, out| {
+            std::fs::copy(src, out).unwrap();
+            attach_positional_scores(out, LIVE);
+            out.to_path_buf()
+        }),
+        (
+            "attach_obs_positional_physical",
+            Policy::Carry,
+            |src, out| {
+                std::fs::copy(src, out).unwrap();
+                attach_positional_scores(out, N_OBS);
+                out.to_path_buf()
+            },
+        ),
+        ("modify_metadata_obs_live", Policy::Carry, |src, out| {
+            std::fs::copy(src, out).unwrap();
+            let obs = ScxReader::open(out).unwrap().read_obs_filtered().unwrap();
+            assert_eq!(obs.num_rows(), LIVE);
+            replace_obs_with_score(out, obs);
+            out.to_path_buf()
+        }),
+        ("modify_metadata_obs_physical", Policy::Carry, |src, out| {
+            std::fs::copy(src, out).unwrap();
+            let obs = ScxReader::open(out).unwrap().read_obs().unwrap();
+            assert_eq!(obs.num_rows(), N_OBS);
+            replace_obs_with_score(out, obs);
             out.to_path_buf()
         }),
         ("compact", Policy::Apply, |src, out| {
