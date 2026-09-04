@@ -256,3 +256,199 @@ class TestEdgeCases:
         sums = np.asarray(result.sum(axis=0)).ravel()
         expected = reference_dense.sum(axis=0)
         np.testing.assert_allclose(sums, expected, rtol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# REC-7 (PR D): every column selector form projects, never the whole matrix
+# ---------------------------------------------------------------------------
+
+
+def _dense(m):
+    return m.toarray() if hasattr(m, "toarray") else np.asarray(m)
+
+
+class TestWidenedColumnSelectors:
+    """`X[:, sel]` on a backed handle: int / list / range / slice / any-order
+    ndarray all resolve without a decode. Unique selectors come back as a
+    handle (a reordered one carries a presentation permutation); a selector
+    with repeats materialises the projected unique columns and gathers — never
+    `read_rows(0, n_obs)`."""
+
+    def test_int_column_is_a_one_column_handle(self, scx_path, reference_dense):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        h = X[:, 5]
+        assert isinstance(h, pyscx.ScxBackedSparseDataset)
+        assert h.shape == (100, 1)
+        np.testing.assert_allclose(_dense(h.to_memory()), reference_dense[:, [5]])
+        last = X[:, -1]
+        assert last.shape == (100, 1)
+        np.testing.assert_allclose(_dense(last.to_memory()), reference_dense[:, [49]])
+
+    def test_slice_and_range_are_handles(self, scx_path, reference_dense):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        h = X[:, 10:20]
+        assert isinstance(h, pyscx.ScxBackedSparseDataset)
+        assert h.shape == (100, 10)
+        np.testing.assert_allclose(_dense(h.to_memory()), reference_dense[:, 10:20])
+        r = X[:, range(5, 15)]
+        assert isinstance(r, pyscx.ScxBackedSparseDataset)
+        np.testing.assert_allclose(_dense(r.to_memory()), reference_dense[:, 5:15])
+        stepped = X[:, 0:50:7]
+        assert isinstance(stepped, pyscx.ScxBackedSparseDataset)
+        np.testing.assert_allclose(_dense(stepped.to_memory()), reference_dense[:, 0:50:7])
+
+    def test_list_in_request_order_is_a_handle(self, scx_path, reference_dense):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        h = X[:, [7, 2, 11]]
+        assert isinstance(h, pyscx.ScxBackedSparseDataset)
+        assert h.shape == (100, 3)
+        np.testing.assert_allclose(_dense(h.to_memory()), reference_dense[:, [7, 2, 11]])
+        sums = np.asarray(h.sum(axis=0)).ravel()
+        np.testing.assert_allclose(sums, reference_dense[:, [7, 2, 11]].sum(axis=0), rtol=1e-6)
+
+    def test_reversed_slice_is_a_presentation_ordered_handle(self, scx_path, reference_dense):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        h = X[:, ::-1]
+        assert isinstance(h, pyscx.ScxBackedSparseDataset)
+        assert h.shape == (100, 50)
+        np.testing.assert_allclose(_dense(h.to_memory()), reference_dense[:, ::-1])
+
+    def test_composition_through_a_presentation_order(self, scx_path, reference_dense):
+        """The old fast path was gated off once a presentation order was
+        active; composing must now go *through* it."""
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        h = X[:, [7, 2, 11]][:, [2, 0]]
+        assert isinstance(h, pyscx.ScxBackedSparseDataset)
+        assert h.shape == (100, 2)
+        np.testing.assert_allclose(_dense(h.to_memory()), reference_dense[:, [11, 7]])
+
+    def test_repeated_columns_materialise_the_projected_columns(self, scx_path, reference_dense):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        m = X[:, [3, 1, 3]]
+        assert sp.issparse(m)
+        assert m.shape == (100, 3)
+        np.testing.assert_allclose(_dense(m), reference_dense[:, [3, 1, 3]])
+        # Through an existing projection too.
+        m2 = X[:, [7, 2, 11]][:, [2, 2, 0]]
+        assert sp.issparse(m2)
+        np.testing.assert_allclose(_dense(m2), reference_dense[:, [11, 11, 7]])
+
+    def test_unsigned_and_empty_selectors(self, scx_path, reference_dense):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        h = X[:, np.array([1, 3], dtype=np.uint64)]
+        assert isinstance(h, pyscx.ScxBackedSparseDataset)
+        np.testing.assert_allclose(_dense(h.to_memory()), reference_dense[:, [1, 3]])
+        empty = X[:, []]
+        assert isinstance(empty, pyscx.ScxBackedSparseDataset)
+        assert empty.shape == (100, 0)
+
+    def test_invalid_column_selectors_raise_index_error(self, scx_path):
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        with pytest.raises(IndexError, match="1000000"):
+            X[:, [0, 10**6]]
+        with pytest.raises(IndexError, match="column index -51"):
+            X[:, -51]
+        with pytest.raises(IndexError, match="boolean column mask"):
+            X[:, np.ones(3, dtype=bool)]
+        with pytest.raises(IndexError, match="integer array or a boolean mask"):
+            X[:, np.array([1.5])]
+        with pytest.raises(IndexError, match="one-dimensional"):
+            X[:, np.zeros((2, 2), dtype=np.int64)]
+
+    def test_full_column_slice_still_returns_the_matrix(self, scx_path, reference_dense):
+        """`X[:, :]` is a copy in scipy; it stays the materialised row CSR."""
+        import pyscx
+
+        X = pyscx.open(scx_path).to_anndata(backed=True).X
+        m = X[:, :]
+        assert sp.issparse(m)
+        np.testing.assert_allclose(_dense(m), reference_dense)
+
+
+class TestLazyWidenedColumnSelectors:
+    """The lazy handle has no presentation order: ascending-unique selectors
+    project, anything else materialises the projected unique columns and
+    gathers (never the whole matrix)."""
+
+    @staticmethod
+    def _lazy_and_full(scx_path):
+        import pyscx
+
+        adata = pyscx.open(scx_path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(adata)
+        pyscx.accel.log1p(adata)
+        ref = pyscx.open(scx_path).to_anndata(backed=True)
+        pyscx.accel.normalize_total(ref)
+        pyscx.accel.log1p(ref)
+        return adata.X, ref.X[:].toarray()
+
+    def test_int_slice_and_list_project(self, scx_path):
+        import pyscx
+
+        X, full = self._lazy_and_full(scx_path)
+        h = X[:, 5]
+        assert isinstance(h, pyscx.ScxLazyTransformedDataset)
+        assert h.shape == (100, 1)
+        np.testing.assert_allclose(_dense(h.to_memory()), full[:, [5]], rtol=1e-6)
+        s = X[:, 10:20]
+        assert isinstance(s, pyscx.ScxLazyTransformedDataset)
+        np.testing.assert_allclose(_dense(s.to_memory()), full[:, 10:20], rtol=1e-6)
+        lst = X[:, [1, 3]]
+        assert isinstance(lst, pyscx.ScxLazyTransformedDataset)
+        np.testing.assert_allclose(_dense(lst.to_memory()), full[:, [1, 3]], rtol=1e-6)
+
+    def test_reorder_and_repeats_materialise_projected_columns(self, scx_path):
+        X, full = self._lazy_and_full(scx_path)
+        m = X[:, [7, 2]]
+        assert sp.issparse(m)
+        np.testing.assert_allclose(_dense(m), full[:, [7, 2]], rtol=1e-6)
+        d = X[:, [3, 1, 3]]
+        assert sp.issparse(d)
+        assert d.shape == (100, 3)
+        np.testing.assert_allclose(_dense(d), full[:, [3, 1, 3]], rtol=1e-6)
+
+    def test_invalid_selectors_raise_index_error(self, scx_path):
+        X, _ = self._lazy_and_full(scx_path)
+        with pytest.raises(IndexError, match="1000000"):
+            X[:, [0, 10**6]]
+        with pytest.raises(IndexError, match="integer array or a boolean mask"):
+            X[:, np.array([1.5])]
+
+
+class TestLayerColumnSelectors:
+    """`adata.layers[k][:, cols]` keeps the layer wrapper (and its name)."""
+
+    def test_layer_projection_keeps_the_wrapper(self, scx_path, synthetic_adata):
+        import pyscx
+
+        layer = pyscx.open(scx_path).to_anndata(backed=True).layers["raw"]
+        ref = synthetic_adata.layers["raw"].toarray()
+        h = layer[:, [1, 3]]
+        assert isinstance(h, pyscx.ScxBackedLayerDataset)
+        assert h.layer_name == "raw"
+        assert h.shape == (100, 2)
+        np.testing.assert_allclose(_dense(h.to_memory()), ref[:, [1, 3]])
+        one = layer[:, 5]
+        assert isinstance(one, pyscx.ScxBackedLayerDataset)
+        np.testing.assert_allclose(_dense(one.to_memory()), ref[:, [5]])
+        mask = np.zeros(50, dtype=bool)
+        mask[[2, 4]] = True
+        assert isinstance(layer[:, mask], pyscx.ScxBackedLayerDataset)
+        # Rows still gather to scipy through the wrapper.
+        assert sp.issparse(layer[0:5])

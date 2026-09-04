@@ -422,6 +422,10 @@ _EXPERIMENT_CALLS = {
     "index_dtype": lambda e: e.index_dtype,
     "has_csc": lambda e: e.has_csc,
     "has_deletions": lambda e: e.has_deletions,
+    # shard-header / catalog folds — still through `reader()`, so they refuse too
+    "value_encoding": lambda e: e.value_encoding,
+    "is_integer": lambda e: e.is_integer,
+    "max_value": lambda e: e.max_value,
     "is_multimodal": lambda e: e.is_multimodal,
     "n_modalities": lambda e: e.n_modalities,
     "modality_names": lambda e: e.modality_names,

@@ -453,21 +453,32 @@ impl PyCloudExperiment {
     }
 
     /// Codec / shard / format-version internals as a one-line string.
-    /// Mirrors `PyExperiment.info`; the AnnData-style repr lists keys, the
-    /// on-disk encoding details live here. Header-only, no I/O.
-    fn info(&self) -> String {
+    /// Mirrors `PyExperiment.info` token for token (pinned by
+    /// `test_cloud.py`); the AnnData-style repr lists keys, the on-disk
+    /// encoding details live here. The `value_encoding` / `is_integer` tokens
+    /// cost one 76-byte range read per CSR shard (in parallel, as `scx info`
+    /// does on a cloud URL); everything else is header / catalog only.
+    fn info(&self, py: Python<'_>) -> PyResult<String> {
         let h = self.reader.header();
-        format!(
+        let (_codecs, encodings) = py
+            .detach(|| self.rt.block_on(self.reader.csr_shard_field_summaries()))
+            .map_err(cloud_to_pyerr)?;
+        let (value_encoding, is_integer) = crate::experiment::render_value_encodings(&encodings);
+        Ok(format!(
             "SCX file: format_version={}, codec_id={}, index_dtype={}, \
-             csr_shards={}, nnz={}, has_csc={}, path={}",
+             csr_shards={}, nnz={}, has_csc={}, value_encoding={}, is_integer={}, \
+             max_value={}, path={}",
             h.format_version,
             h.codec_id,
             h.index_dtype,
             h.n_csr_shards,
             self.reader.nnz(),
             h.has_csc(),
+            value_encoding,
+            is_integer,
+            self.reader.catalog().csr_max_value(None),
             self.url,
-        )
+        ))
     }
 
     /// True if this file is multimodal (v2 with `n_modalities > 0`).

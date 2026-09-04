@@ -191,7 +191,10 @@ fn scx_subset<'py>(
 /// a separate `col_presentation` permutation), but it dedups — so a repeated
 /// column would silently narrow `X` while anndata expects the repeat, and the
 /// shapes would diverge. A lazily-transformed `X` additionally cannot express a
-/// reorder at all: it stores its projection sorted.
+/// reorder at all: it stores its projection sorted. (The handle-level
+/// `X[:, cols]` serves both cases by materialising the projected unique
+/// columns and gathering; here the whole AnnData materialises instead so
+/// `var` / `varm` and `X` are sliced by one rule.)
 fn expressible_as_window(
     value: &Bound<'_, PyAny>,
     rows: Option<&[i64]>,

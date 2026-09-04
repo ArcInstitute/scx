@@ -557,21 +557,59 @@ impl PyExperiment {
     /// Codec / shard / format-version internals as a one-line string.
     ///
     /// The AnnData-style `repr` lists the obs/var/obsm/uns keys a scanpy
-    /// user expects; the on-disk encoding details live here instead.
+    /// user expects; the on-disk encoding details live here instead. The
+    /// `value_encoding` / `is_integer` / `max_value` tokens are also the
+    /// getters of the same names; rendering them reads one 76-byte header per
+    /// CSR shard (no decode), so this is O(shards), not O(1).
     fn info(&self) -> PyResult<String> {
         let reader = self.reader()?;
         let h = reader.header();
+        let (value_encoding, is_integer) = value_encoding_summary(reader)?;
         Ok(format!(
             "SCX file: format_version={}, codec_id={}, index_dtype={}, \
-             csr_shards={}, nnz={}, has_csc={}, path={}",
+             csr_shards={}, nnz={}, has_csc={}, value_encoding={}, is_integer={}, \
+             max_value={}, path={}",
             h.format_version,
             h.codec_id,
             h.index_dtype,
             h.n_csr_shards,
             reader.nnz(),
             h.has_csc(),
+            value_encoding,
+            is_integer,
+            reader.catalog().csr_max_value(None),
             self.path.display(),
         ))
+    }
+
+    /// The on-disk value encoding of the CSR shards, rendered as `scx info`
+    /// prints it: a numpy dtype name (`"uint16"`, `"float32"`, …) when every
+    /// shard agrees, `"mixed (uint8, uint16)"` when they differ, `"n/a"` with
+    /// no shards. Reads one 76-byte header per shard and decodes nothing. On a
+    /// multimodal file this folds every modality's X shards; a layer's
+    /// encoding is `adata.layers[name].stored_dtype` on a backed handle.
+    #[getter]
+    fn value_encoding(&self) -> PyResult<String> {
+        Ok(value_encoding_summary(self.reader()?)?.0)
+    }
+
+    /// `True` when every CSR shard is integer-encoded (`uint8` / `uint16` /
+    /// `uint32`), i.e. the stored values are counts. `False` when any shard is
+    /// float-encoded, and for a file with no shards. Same cost as
+    /// [`Self::value_encoding`]; no values are decoded.
+    #[getter]
+    fn is_integer(&self) -> PyResult<bool> {
+        Ok(value_encoding_summary(self.reader()?)?.1)
+    }
+
+    /// Largest stored value across the CSR shards, from the per-shard catalog
+    /// stats (no decode). Float-encoded shards record no value range, and a
+    /// shard without stats contributes nothing, so this is `0` for a float
+    /// file — read it together with [`Self::is_integer`]. Physical, like
+    /// [`Self::nnz`]: values in logically deleted rows still count.
+    #[getter]
+    fn max_value(&self) -> PyResult<u32> {
+        Ok(self.reader()?.catalog().csr_max_value(None))
     }
 
     /// `True` when the file has a CSC sidecar (gene-major shards).
@@ -1286,4 +1324,38 @@ impl PyExperiment {
             ],
         )
     }
+}
+
+/// `scx info`'s rendering of a distinct, sorted set of shard-header
+/// `value_encoding` bytes — the single name when uniform, `mixed (a, b)` when
+/// shards differ, `n/a` when there are none — plus whether every one is an
+/// integer encoding (`false` for an empty set). Shared by the local and cloud
+/// `Experiment` so `info()` stays byte-identical between them.
+pub(crate) fn render_value_encodings(distinct: &[u8]) -> (String, bool) {
+    use scx_codec::ValueEncoding;
+    let name = |b: &u8| ValueEncoding::from_u8(*b).map_or("unknown", |v| v.numpy_name());
+    let rendered = match distinct {
+        [] => "n/a".to_string(),
+        [one] => name(one).to_string(),
+        many => format!(
+            "mixed ({})",
+            many.iter().map(name).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    let is_integer = !distinct.is_empty()
+        && distinct
+            .iter()
+            .all(|b| ValueEncoding::from_u8(*b).is_some_and(|v| v.is_integer()));
+    (rendered, is_integer)
+}
+
+/// [`render_value_encodings`] over a local reader's CSR shard headers.
+fn value_encoding_summary(reader: &ScxReader) -> PyResult<(String, bool)> {
+    let shards = reader
+        .catalog()
+        .shards(scx_format_io::SectionType::CsrShard);
+    let distinct =
+        scx_format_io::distinct_sorted_shard_field(reader, &shards, |h| h.value_encoding)
+            .map_err(to_pyerr)?;
+    Ok(render_value_encodings(&distinct))
 }

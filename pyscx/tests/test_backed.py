@@ -381,12 +381,60 @@ def test_issparse_is_false_on_the_handle_but_true_on_a_slice(adata_backed):
     assert sp.issparse(x.to_memory())
 
 
-def test_asarray_on_a_handle_returns_a_0d_object_array(adata_backed):
-    """The other half of the trap: `np.asarray` does not raise on a handle, it
-    returns a 0-d object array, so the failure surfaces far away from here."""
-    arr = np.asarray(adata_backed.X)
-    assert arr.shape == ()
-    assert arr.dtype == object
+@pytest.mark.parametrize("which", ["X", "layer", "lazy"])
+def test_asarray_on_a_sparse_handle_raises(backed_scx, which):
+    """The other half of the trap, closed: `np.asarray` on a sparse handle
+    used to return a 0-d object array that failed far away ("setting an array
+    element with a sequence"). It now raises `TypeError` naming the explicit
+    paths, because the alternative — decoding n_obs × n_vars silently — is
+    the worse failure at atlas scale. Every entry point numpy uses goes
+    through `__array__`, so `np.array`, a dtype request and `copy=False` all
+    refuse the same way."""
+    import pyscx
+
+    adata = pyscx.open(backed_scx).to_anndata(backed=True)
+    if which == "X":
+        h = adata.X
+    elif which == "layer":
+        h = adata.layers["raw"]
+    else:
+        pyscx.accel.normalize_total(adata)
+        h = adata.X
+        assert isinstance(h, pyscx.ScxLazyTransformedDataset)
+
+    for call in (
+        lambda: np.asarray(h),
+        lambda: np.array(h),
+        lambda: np.asarray(h, dtype=np.float32),
+        lambda: h.__array__(copy=False),
+    ):
+        with pytest.raises(TypeError, match="to_memory"):
+            call()
+    # The explicit paths still work.
+    assert sp.issparse(h.to_memory())
+    assert isinstance(h.toarray(), np.ndarray)
+
+
+def test_cache_shards_is_readable_on_every_handle(synthetic_adata, tmp_dir):
+    """`cache_shards` is fixed per `to_anndata` call and shared by X and the
+    layers; the getter reads it back (0 is the uncached path, not clamped)."""
+    import pyscx
+
+    path = str(tmp_dir / "cache_shards_getter.scx")
+    pyscx.from_anndata(synthetic_adata, path)
+
+    adata = pyscx.open(path).to_anndata(backed=True, cache_shards=7, obsm=["X_pca"])
+    assert adata.X.cache_shards == 7
+    assert adata.layers["raw"].cache_shards == 7
+    assert type(adata.obsm["X_pca"]).__name__ == "ScxBackedObsmDataset"
+    assert adata.obsm["X_pca"].cache_shards == 7
+    pyscx.accel.normalize_total(adata)
+    assert isinstance(adata.X, pyscx.ScxLazyTransformedDataset)
+    assert adata.X.cache_shards == 7
+
+    adata0 = pyscx.open(path).to_anndata(backed=True, cache_shards=0)
+    assert adata0.X.cache_shards == 0
+    assert adata0.layers["raw"].cache_shards == 0
 
 
 # ---------------------------------------------------------------------------

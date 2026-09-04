@@ -50,8 +50,8 @@ impl ScxBackedLayerDataset {
     /// [`ScxBackedSparseDataset::subset_clone`], keeping the layer wrapper.
     ///
     /// Delegating to `inner` and returning the bare `ScxBackedSparseDataset`
-    /// (as `__getitem__` does) would silently drop the layer name that
-    /// `__repr__` and the SCX → SCX writer read.
+    /// would silently drop the layer name that `__repr__` and the SCX → SCX
+    /// writer read (`__getitem__` rewraps for the same reason).
     pub(crate) fn subset_clone(
         &self,
         rows: Option<&[i64]>,
@@ -78,6 +78,30 @@ impl ScxBackedLayerDataset {
     #[getter]
     fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.inner.dtype(py)
+    }
+
+    /// The layer's own on-disk encoding (its reader walks the layer's shard
+    /// family, not X's) — see `ScxBackedSparseDataset.stored_dtype`.
+    #[getter]
+    fn stored_dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.inner.stored_dtype(py)
+    }
+
+    #[getter]
+    fn cache_shards(&self) -> usize {
+        self.inner.cache_shards()
+    }
+
+    /// Refused, as on `ScxBackedSparseDataset`.
+    #[pyo3(signature = (dtype=None, copy=None))]
+    fn __array__<'py>(
+        &self,
+        _py: Python<'py>,
+        dtype: Option<Bound<'py, PyAny>>,
+        copy: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = (dtype, copy);
+        Err(no_implicit_array_error("ScxBackedLayerDataset"))
     }
 
     #[getter]
@@ -115,12 +139,24 @@ impl ScxBackedLayerDataset {
         )
     }
 
+    /// Rows gather to scipy exactly as on `X`. A column selector comes back
+    /// from `inner` as a bare `ScxBackedSparseDataset`; it is rewrapped here
+    /// so `layer[:, cols]` keeps the layer name that `__repr__` and the
+    /// SCX → SCX writer read (the same reason `subset_clone` exists).
     fn __getitem__<'py>(
         &self,
         py: Python<'py>,
         index: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.inner.__getitem__(py, index)
+        let out = self.inner.__getitem__(py, index)?;
+        if let Ok(projected) = out.cast::<ScxBackedSparseDataset>() {
+            let wrapped = ScxBackedLayerDataset {
+                inner: projected.borrow().clone_handle(),
+                layer_name: self.layer_name.clone(),
+            };
+            return Ok(wrapped.into_pyobject(py)?.into_any());
+        }
+        Ok(out)
     }
 
     fn to_memory<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

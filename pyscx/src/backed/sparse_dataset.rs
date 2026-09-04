@@ -48,11 +48,14 @@ pub struct ScxBackedSparseDataset {
     /// Arc-wrapped to avoid O(n) deep clones when creating lazy datasets.
     col_projection: Option<Arc<Vec<u32>>>,
     /// If the visible columns should be presented in a caller-requested
-    /// order (via `preserve_var_order`), this is the presentation
-    /// permutation over the (sorted) `col_projection`: output column `k`
-    /// is taken from sorted-projection column `col_presentation[k]`.
-    /// `None` ⇒ identity (the default sorted order). Always `None` unless
-    /// `col_projection` is also `Some`; length equals `col_projection.len()`.
+    /// order (`preserve_var_order`, `adata[:, [7, 2, 11]]`, `X[:, [7, 2, 11]]`),
+    /// this is the presentation **permutation** over the (sorted)
+    /// `col_projection`: output column `k` is taken from sorted-projection
+    /// column `col_presentation[k]`. `None` ⇒ identity (the default sorted
+    /// order). Always `None` unless `col_projection` is also `Some`; length
+    /// equals `col_projection.len()`. A permutation cannot express a
+    /// *repeated* column, so a selector with repeats never becomes a handle:
+    /// `__getitem__` materialises the projected unique columns and gathers.
     col_presentation: Option<Arc<Vec<u32>>>,
     /// Whether the data is known to be non-negative. Defaults to `true`
     /// (raw UMI counts, normalized, log1p). Set to `false` after operations
@@ -459,10 +462,49 @@ impl ScxBackedSparseDataset {
         self.modality_id
     }
 
+    /// Always `float32`: the type every read decodes to (scipy CSR interop,
+    /// anndata's `CSRDataset` expectations). The on-disk value encoding is
+    /// [`Self::stored_dtype`].
     #[getter]
     pub(crate) fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let np = crate::pyimport::import_module(py, "numpy")?;
         np.call_method1("dtype", ("float32",))
+    }
+
+    /// The on-disk value encoding of this handle's shards as a `numpy.dtype`
+    /// — `uint8` / `uint16` / `uint32` for integer counts, `float32` /
+    /// `float16` for continuous data. When shards mix it is the widest (any
+    /// float ⇒ `float32`, else the widest integer); a file with no shards
+    /// reports `float32`. Reads one 76-byte header per shard, decodes nothing;
+    /// `stored_dtype.kind in "ui"` answers "are these counts?" in O(shards).
+    #[getter]
+    pub(crate) fn stored_dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        stored_dtype_object(py, &self.backed)
+    }
+
+    /// The decoded-shard LRU size this handle was opened with
+    /// (`to_anndata(backed=True, cache_shards=…)`); `0` means every read
+    /// decodes afresh. Read-only: one reader is shared by `X` and every layer
+    /// handle, so the size is fixed per `to_anndata` call.
+    #[getter]
+    pub(crate) fn cache_shards(&self) -> usize {
+        self.cache_shards
+    }
+
+    /// The numpy array protocol — **refused**. A handle is a window onto a
+    /// file, and `np.asarray(handle)` would decode `n_obs × n_vars` at once;
+    /// at atlas scale that is the worse failure, so it raises `TypeError`
+    /// naming the explicit paths (`to_memory()`, `toarray()`, a slice).
+    /// Before this it returned a 0-d object array that failed far away.
+    #[pyo3(signature = (dtype=None, copy=None))]
+    pub(crate) fn __array__<'py>(
+        &self,
+        _py: Python<'py>,
+        dtype: Option<Bound<'py, PyAny>>,
+        copy: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = (dtype, copy);
+        Err(no_implicit_array_error("ScxBackedSparseDataset"))
     }
 
     /// Returns "csr" to match the anndata ABC format ClassVar.
@@ -505,7 +547,7 @@ impl ScxBackedSparseDataset {
         )
     }
 
-    /// Load a slice from disk.
+    /// Load a slice from disk, or project columns without loading.
     ///
     /// Supports:
     /// - Row slicing:      X[100:200]       → csr_matrix
@@ -514,6 +556,10 @@ impl ScxBackedSparseDataset {
     /// - Fancy indexing:   X[[0, 5, 10]]    → csr_matrix
     /// - Scalar indexing:  X[0, 5]          → float
     /// - Integer index:    X[5]             → csr_matrix (single row)
+    /// - Column selector:  X[:, 5] / X[:, [7, 2, 11]] / X[:, 10:20] / X[:, mask]
+    ///                     → a projected `ScxBackedSparseDataset` (no decode);
+    ///                     repeated columns (`X[:, [3, 1, 3]]`) → csr_matrix
+    ///                     built from the projected unique columns
     pub(crate) fn __getitem__<'py>(
         &self,
         py: Python<'py>,
@@ -542,11 +588,19 @@ impl ScxBackedSparseDataset {
     /// Materialize the full matrix into memory.
     /// Required by anndata.abc.CSRDataset.
     pub(crate) fn to_memory<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        // When deletion vectors are present, we need to filter the full matrix
-        // using the kept_to_global mapping rather than returning all rows.
-        // B2: decode the full matrix off the GIL; build the scipy array after.
+        // B2: decode off the GIL; build the scipy array after.
         let csr = detached(py, || {
-            if let Some(ref kept) = self.kept_to_global {
+            if self.col_projection.is_some() {
+                // A projected handle assembles shard by shard: each shard is
+                // decoded once and projected (and row-filtered) while it is
+                // still one shard wide, then the narrow pieces are concatenated
+                // — peak = 2× the *projected* result + one shard, never the
+                // whole matrix. `as_shard_source` already folds `kept_to_global`
+                // and `col_projection`; it cannot carry `col_presentation`, so
+                // the request order is restored on the (small) result.
+                materialize_projected(self).map_err(|e| e.to_string())
+            } else if let Some(ref kept) = self.kept_to_global {
+                // Deletion vectors: gather the kept rows rather than every row.
                 self.backed
                     .read_row_indices(kept)
                     .map_err(|e| e.to_string())
@@ -555,7 +609,6 @@ impl ScxBackedSparseDataset {
             }
         })
         .map_err(PyRuntimeError::new_err)?;
-        let csr = self.apply_col_projection(csr);
         csr_to_scipy(py, csr)
     }
 
@@ -1592,32 +1645,25 @@ impl ScxBackedSparseDataset {
         }
 
         // ── Non-materializing column projection ────────────────────────
-        // When row_idx selects ALL rows (`:` or `slice(None)`) and col_idx
-        // is an array or boolean mask, return a new ScxBackedSparseDataset
-        // with col_projection set instead of materializing to scipy.
-        // This keeps subsequent aggregation (sum, var, etc.) on the f64
-        // streaming path and avoids O(n_obs × n_vars) materialization.
-        // Skip this lazy fast path when a presentation reorder is active:
-        // composing a new sorted projection would silently drop the
-        // request-order semantics. Fall through to materialize-then-slice,
-        // which preserves order (the materialized CSR is already reordered).
-        if self.col_presentation.is_none() && self.is_all_rows_slice(py, row_idx)? {
-            if let Some(col_indices) = self.extract_col_indices(py, col_idx)? {
-                let composed = self.compose_col_projection(&col_indices);
-                let new_ds = ScxBackedSparseDataset {
-                    backed: Arc::clone(&self.backed),
-                    backed_csc: self.backed_csc.clone(),
-                    shape_val: (self.shape_val.0, composed.len()),
-                    n_shards: self.n_shards,
-                    cache_shards: self.cache_shards,
-                    kept_to_global: self.kept_to_global.clone(),
-                    col_projection: Some(Arc::new(composed)),
-                    col_presentation: None,
-                    non_negative: self.non_negative,
-                    modality_id: self.modality_id,
-                    source_path: self.source_path.clone(),
+        // `X[:, cols]`: every column selector form (int, list, range, slice,
+        // int / bool ndarray, any order) is resolved once and composed through
+        // the current window by `subset_clone`, so a projected handle comes
+        // back with no decode — a reordered request rides on the presentation
+        // permutation, which is also how `adata[:, [7, 2, 11]]` arrives here,
+        // so composing on top of an existing presentation is exact. A request
+        // with *repeated* columns cannot be a handle (the presentation is a
+        // permutation); it materialises the projected unique columns and
+        // gathers them with scipy — peak is the result, never the whole
+        // matrix. `X[:, :]` resolves to `None` and falls through to return the
+        // row CSR, like `X[:]`.
+        if self.is_all_rows_slice(py, row_idx)? {
+            if let Some(sel) = resolve_col_request(py, col_idx, self.shape_val.1)? {
+                let sel_i64: Vec<i64> = sel.iter().map(|&c| c as i64).collect();
+                let handle = self.subset_clone(None, Some(&sel_i64))?;
+                return match repeat_gather_first_occurrence(&sel) {
+                    None => Ok(handle.into_pyobject(py)?.into_any()),
+                    Some(remap) => scipy_column_gather(py, &handle.to_memory(py)?, &remap),
                 };
-                return Ok(new_ds.into_pyobject(py)?.into_any().unbind().into_bound(py));
             }
         }
 
@@ -1657,91 +1703,6 @@ impl ScxBackedSparseDataset {
         } else {
             Ok(false)
         }
-    }
-
-    /// Try to extract integer column indices from `col_idx`.
-    /// Returns `Some(Vec<u32>)` for ndarray (int or bool), `None` if not an array
-    /// (e.g. a slice or scalar — those fall through to the old path).
-    pub(crate) fn extract_col_indices(
-        &self,
-        py: Python<'_>,
-        col_idx: &Bound<'_, PyAny>,
-    ) -> PyResult<Option<Vec<u32>>> {
-        let numpy = crate::pyimport::import_module(py, "numpy")?;
-        let is_ndarray = col_idx.is_instance(&numpy.getattr("ndarray")?)?;
-        if !is_ndarray {
-            return Ok(None);
-        }
-
-        let dtype_str: String = col_idx.getattr("dtype")?.getattr("kind")?.extract()?;
-
-        match dtype_str.as_str() {
-            // Boolean mask → convert to integer indices
-            "b" => {
-                let mask: Vec<bool> = col_idx.extract()?;
-                if mask.len() != self.shape_val.1 {
-                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                        "boolean index length {} doesn't match axis 1 size {}",
-                        mask.len(),
-                        self.shape_val.1,
-                    )));
-                }
-                let indices: Vec<u32> = mask
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &b)| if b { Some(i as u32) } else { None })
-                    .collect();
-                Ok(Some(indices))
-            }
-            // Integer array (signed or unsigned).
-            // Only use non-materializing projection for sorted, unique indices.
-            // Unsorted or duplicate indices need materialization to preserve
-            // user-specified column order/repetition (numpy __getitem__ semantics).
-            "i" | "u" => {
-                let indices: Vec<i64> = col_idx.extract()?;
-                let n = self.shape_val.1 as i64;
-                let resolved: Vec<u32> = indices
-                    .iter()
-                    .map(|&i| {
-                        let i = if i < 0 { n + i } else { i };
-                        if i < 0 || i >= n {
-                            Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                                "column index {} out of range for axis of size {}",
-                                i, n,
-                            )))
-                        } else {
-                            Ok(i as u32)
-                        }
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
-                if !resolved.windows(2).all(|w| w[0] < w[1]) {
-                    return Ok(None); // unsorted or duplicates → materialize
-                }
-                Ok(Some(resolved))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Compose new column indices with an existing col_projection.
-    ///
-    /// `new_indices` are in the user-visible column space (`0..shape_val.1`).
-    /// Returns sorted, deduplicated indices in the original on-disk column space
-    /// (matching the convention that `col_projection` is always sorted).
-    ///
-    /// The output is always in on-disk column order regardless of input order,
-    /// and duplicate indices in `new_indices` are silently collapsed.
-    pub(crate) fn compose_col_projection(&self, new_indices: &[u32]) -> Vec<u32> {
-        let mut composed = match &self.col_projection {
-            Some(existing) => {
-                // new_indices are relative to visible columns; map through existing
-                new_indices.iter().map(|&i| existing[i as usize]).collect()
-            }
-            None => new_indices.to_vec(),
-        };
-        composed.sort_unstable();
-        composed.dedup();
-        composed
     }
 
     /// Normalize a (possibly negative) row index.
@@ -1785,4 +1746,51 @@ impl ScxBackedSparseDataset {
             }
         }
     }
+}
+
+/// `numpy.dtype` for a reader's on-disk value encoding — see
+/// `ScxBackedSparseDataset::stored_dtype`. Shared by the three sparse handles
+/// (the lazy one reports its *source*'s encoding, before transforms).
+pub(crate) fn stored_dtype_object<'py>(
+    py: Python<'py>,
+    backed: &BackedCsrReader,
+) -> PyResult<Bound<'py, PyAny>> {
+    let name = backed
+        .stored_value_encoding()
+        .map_err(crate::to_pyerr)?
+        .map_or("float32", |enc| enc.numpy_name());
+    let np = crate::pyimport::import_module(py, "numpy")?;
+    np.call_method1("dtype", (name,))
+}
+
+/// The `TypeError` every sparse handle's `__array__` raises.
+pub(crate) fn no_implicit_array_error(class_name: &str) -> PyErr {
+    pyo3::exceptions::PyTypeError::new_err(format!(
+        "{class_name} is a lazy handle onto an SCX file and does not convert to a \
+         numpy array implicitly: np.asarray(handle) would decode the whole \
+         n_obs × n_vars matrix at once. Take a window with handle[rows] / \
+         handle[:, cols], call handle.to_memory() for the whole matrix as scipy \
+         CSR or handle.toarray() for a dense array, or open the file with \
+         pyscx.open(path).to_anndata() for an in-memory AnnData."
+    ))
+}
+
+/// `to_memory()` for a handle with a column projection: one decode per
+/// shard, projected while one shard wide, concatenated, then put into
+/// presentation order. Sequential on purpose — decoding shards in parallel
+/// would hold every decoded shard at once, which is the peak this exists
+/// to avoid.
+fn materialize_projected(ds: &ScxBackedSparseDataset) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+    use scx_format_io::ShardSource;
+    let source = ds.as_shard_source();
+    let n_vars = source.n_vars();
+    let mut pieces = Vec::with_capacity(source.n_shards());
+    for shard_idx in 0..source.n_shards() {
+        pieces.push(source.read_shard(shard_idx)?);
+    }
+    let csr = scx_sparse::concatenate_csr(&pieces, n_vars)?;
+    Ok(match &ds.col_presentation {
+        Some(perm) => scx_engine::projection::reorder_csr_columns(&csr, perm),
+        None => csr,
+    })
 }
