@@ -288,3 +288,32 @@ def test_iter_chunks_fixed_size_with_deletions(tmp_dir):
     concatenated = sp.vstack([c.X for c in chunks])
     full_x = adata_backed.X.to_memory()
     np.testing.assert_array_equal(concatenated.toarray(), full_x.toarray())
+
+
+def test_iter_chunks_aligns_a_lazily_transformed_x_to_shards(tmp_dir):
+    """A normalize_total → log1p handle has `shard_boundaries()` too; `iter_chunks`
+    must use them rather than fall back to fixed 16384-row chunks (which on a
+    small file is one chunk — silently defeating the shard alignment)."""
+    import anndata
+    import pyscx
+
+    np.random.seed(7)
+    n_obs, n_vars = 100, 30
+    dense = np.random.randint(0, 200, size=(n_obs, n_vars)).astype(np.float32)
+    dense[np.random.random((n_obs, n_vars)) > 0.4] = 0
+    adata = anndata.AnnData(X=sp.csr_matrix(dense))
+    path = str(tmp_dir / "chunks_lazy.scx")
+    pyscx.from_anndata(adata, path, shard_size=25)
+
+    backed = pyscx.open(path).to_anndata(backed=True)
+    pyscx.accel.normalize_total(backed)
+    pyscx.accel.log1p(backed)
+    assert isinstance(backed.X, pyscx.ScxLazyTransformedDataset)
+    boundaries = backed.X.shard_boundaries()
+    assert boundaries == [(0, 25), (25, 50), (50, 75), (75, 100)]
+
+    chunks = list(pyscx.iter_chunks(backed, chunk_size="shard"))
+    assert [c.n_obs for c in chunks] == [25, 25, 25, 25]
+    full = backed.X.to_memory().toarray()
+    got = np.vstack([c.X.toarray() if sp.issparse(c.X) else np.asarray(c.X) for c in chunks])
+    np.testing.assert_allclose(got, full, rtol=1e-6)

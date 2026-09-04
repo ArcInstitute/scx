@@ -2184,6 +2184,50 @@ absolute_floors:
     metric: peak_rss_mb__compact_full
     max: 4096.0
 
+  # ─── Bounded row gather: `handle[mask]` peak (PR C / REC-1) ───────
+  #
+  # `read_selective`'s `row_mask_gather` arm reads every eighth cell through
+  # `to_anndata(backed=True).X[cell_indices]` — an interleaved index set that
+  # touches every shard, i.e. the gather arc-reactor's guide calling runs. It
+  # is the arm that sees `BackedCsrReader::read_row_indices`' memory shape:
+  # before PR C the gather built one CSR per requested row and concatenated
+  # them (a second copy of the result on top of the LRU); now the result is
+  # assembled once into exact-size buffers, and a sparse request on a
+  # row-group-framed shard decodes only the touched row groups.
+  #
+  # The metric is the sparse `peak_rss_mb__row_mask_gather` — a true in-region
+  # peak from `PeakRssSampler` — not the reserved `peak_rss_mb`, which is the
+  # runner's `max(before, after)` of two instantaneous readings and cannot see
+  # a transient the read frees before returning (on this arm it reads 773 MB
+  # at tabula_sapiens_100k against a sampled 1403 MB).
+  #
+  # Measured 2026-09-03 with the PR C reader, `scx_auto`, cpu_preemptible,
+  # n_runs = 3 per arm:
+  #
+  #                          true peak (MB)          cells gathered
+  #   tabula_sapiens_100k    1399 / 1399 / 1403      12,500 of 100,000
+  #   census_500k            2958 / 2958 / 2961      62,500 of 500,000
+  #
+  # Ceilings at 21% over the worst single observation, matching the export and
+  # `compact_full` ceilings' construction. A return to the per-row CSR shape
+  # adds roughly the result again: ≈ +900 MB at census_500k, which trips that
+  # ceiling by a wide margin, but only ≈ +200 MB at tabula_sapiens_100k
+  # (≈ 1600 MB), which stays under 1700 — the tabula row is a drift guard on
+  # the same construction as its siblings, not the regression detector; the
+  # census_500k row is. Lowering tabula below 1600 would leave ~10 % headroom
+  # over three observations spread 4 MB apart; do that only from a capture of
+  # the regressed shape, not from this estimate.
+  - benchmark: read_selective
+    format: scx_auto
+    dataset: tabula_sapiens_100k
+    metric: peak_rss_mb__row_mask_gather
+    max: 1700.0
+  - benchmark: read_selective
+    format: scx_auto
+    dataset: census_500k
+    metric: peak_rss_mb__row_mask_gather
+    max: 3600.0
+
   # ─── MatrixMarket export declares `integer`, not `real` ───────────
   #
   # A contract, not a statistic, and the only one in this file that guards a
@@ -3106,13 +3150,16 @@ absolute_floors:
 #    the recorded IQR is 11.54 s against a 13.85 s median — that dispersion is
 #    scenario *mixing*, not noise, and no tolerance over it means anything.
 #
-#    Blocker: the values. `results/baselines/LATEST`
-#    (v0.11.2-multimodal-loader-fix) predates the per-scenario keys entirely, so
-#    there is no median to multiply. Adding them now under `absolute_floors`
-#    would synthesise a missing-metric violation on every run against the
-#    current baseline, which is the failure this whole block exists to avoid.
+#    Blocker (updated 2026-09-03): the values are now measurable — the PR-03
+#    recapture (`LATEST` → v0.16.0-opt-instruments) carries the per-scenario
+#    `wall_s__<scenario>` keys in `results/raw/read_selective__*.json` — but no
+#    operator has yet chosen which arms to gate at what multiple, so the rows
+#    below are still unauthored. The memory side is gated independently:
+#    `peak_rss_mb__row_mask_gather` (a true in-region peak; the reserved
+#    `peak_rss_mb` cannot see a transient) has ceilings on scx_auto at
+#    tabula_sapiens_100k and census_500k under `absolute_floors`.
 #
-#    To activate, after the PR-03 recapture:
+#    To activate the wall thresholds:
 #      1. Read the per-scenario medians out of
 #         `<candidate>/raw/read_selective__scx_auto__census_1m.json` — filter
 #         `runs[]` by `extra.scenario` and median `extra["wall_s__<scenario>"]`.

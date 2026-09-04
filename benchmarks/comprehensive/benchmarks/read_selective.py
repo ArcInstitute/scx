@@ -1,8 +1,10 @@
 """
 Selective Read (Query / Subsetting) benchmark.
 
-Measures sub-matrix extraction performance across four scenarios:
+Measures sub-matrix extraction performance across five scenarios:
   - row_slice: read a random subset of cells (all genes)
+  - row_mask_gather: read every eighth cell (an interleaved mask that touches
+    every shard — the ``handle[mask]`` gather arc-reactor's guide calling does)
   - col_projection: read a random subset of genes (all cells)
   - combined: read a random subset of both cells and genes
   - filtered_query: format-specific filtered query (skipped if unsupported)
@@ -18,9 +20,18 @@ a threshold. The per-scenario medians already existed in
 ``metadata["scenario_summary"]``, but thresholds read ``runs[].extra`` and
 never ``metadata``, so nothing could gate them.
 
-Scenario names, for anyone writing one of those thresholds: the three base
-scenarios are ``row_slice`` / ``col_projection`` / ``combined``; the predicate
-arms are ``filtered_query__<predicate>``, i.e.
+``row_mask_gather`` runs also carry ``peak_rss_mb__row_mask_gather``: the **true
+in-region peak** sampled by ``PeakRssSampler`` around that read. The reserved
+``peak_rss_mb`` on every run record is the runner's ``max(before, after)`` of two
+instantaneous readings, which cannot see a transient the read allocates and frees
+before it returns — exactly the shape of the 2× copy the bounded row gather
+removed (REC-1). Floor the sparse key, never the reserved one. The sampler is
+scoped to that one arm: it is the only scenario with a memory ceiling, and a
+polling thread has no business in the other arms' wall-clock measurements.
+
+Scenario names, for anyone writing one of those thresholds: the four base
+scenarios are ``row_slice`` / ``row_mask_gather`` / ``col_projection`` /
+``combined``; the predicate arms are ``filtered_query__<predicate>``, i.e.
 ``filtered_query__cell_type_eq_t_cell``, ``filtered_query__n_counts_gt_1000``,
 ``filtered_query__random_1pct``. ``n_counts_gt_1000`` does not run on the
 census fixtures — ``obs['n_counts']`` is injected only for pbmc3k and
@@ -48,6 +59,7 @@ from benchmarks.comprehensive.config import (
 )
 from benchmarks.comprehensive.queries import default_predicates
 from benchmarks.comprehensive.results import BenchmarkResult
+from benchmarks.comprehensive.rss import PeakRssSampler
 from benchmarks.comprehensive.runners import make_runner
 from benchmarks.comprehensive.runners.base import FormatRunner
 
@@ -108,13 +120,17 @@ def _applicable_predicates(dataset: DatasetConfig):
 
 def _generate_indices(
     dataset: DatasetConfig,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Pre-generate deterministic random cell and gene indices.
 
     Returns
     -------
     cell_idx : ndarray of shape (min(QUERY_N_CELLS, n_obs),)
     gene_idx : ndarray of shape (min(QUERY_N_HVGS, n_vars),)
+    mask_idx : ndarray of shape (ceil(n_obs / 8),) — every eighth cell, the
+        sorted index form of an interleaved boolean mask. It touches every
+        shard of every format, so it measures the per-shard gather cost, not
+        which shards a random draw happened to land in.
     """
     rng = np.random.default_rng(RANDOM_SEED)
     cell_idx = rng.choice(
@@ -130,7 +146,8 @@ def _generate_indices(
     # Sort for locality-friendly access patterns
     cell_idx.sort()
     gene_idx.sort()
-    return cell_idx, gene_idx
+    mask_idx = np.arange(0, dataset.n_obs, 8, dtype=np.int64)
+    return cell_idx, gene_idx, mask_idx
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +183,7 @@ def run(
     if not h5ad_path.exists():
         raise FileNotFoundError(f"Source h5ad not found: {h5ad_path}")
 
-    cell_idx, gene_idx = _generate_indices(dataset)
+    cell_idx, gene_idx, mask_idx = _generate_indices(dataset)
 
     logger.info(
         "read_selective benchmark: dataset=%s format=%s n_runs=%d "
@@ -194,12 +211,14 @@ def run(
             "cold_cache": cold_cache,
             "query_n_cells": int(len(cell_idx)),
             "query_n_hvgs": int(len(gene_idx)),
+            "query_n_mask_cells": int(len(mask_idx)),
             "random_seed": RANDOM_SEED,
         },
     )
 
     scenarios: list[tuple[str, np.ndarray | None, np.ndarray | None]] = [
         ("row_slice", cell_idx, None),
+        ("row_mask_gather", mask_idx, None),
         ("col_projection", None, gene_idx),
         ("combined", cell_idx, gene_idx),
     ]
@@ -232,18 +251,31 @@ def run(
                     FormatRunner._drop_caches()
 
                 logger.info("  %s run %d/%d", scenario_name, i + 1, n_runs)
-                tr = runner.read_subset(
-                    output_path, cell_indices=c_idx, gene_indices=g_idx,
-                )
+                # Sparse per-scenario keys: only runs of THIS scenario carry
+                # them, so a threshold on one medians one scenario rather than
+                # the mix. See the module docstring.
+                extra: dict[str, float] = {}
+                if scenario_name == "row_mask_gather":
+                    # True in-region peak: the runner's own `peak_rss_mb` is
+                    # max(before, after) of two instantaneous readings and
+                    # misses a transient the read frees before returning. Only
+                    # this arm has a memory ceiling, so only it is sampled.
+                    with PeakRssSampler() as sampler:
+                        tr = runner.read_subset(
+                            output_path, cell_indices=c_idx, gene_indices=g_idx,
+                        )
+                    extra[f"peak_rss_mb__{scenario_name}"] = round(sampler.peak_mb, 3)
+                else:
+                    tr = runner.read_subset(
+                        output_path, cell_indices=c_idx, gene_indices=g_idx,
+                    )
+                extra[f"wall_s__{scenario_name}"] = round(tr.wall_s, 6)
 
                 scenario_times[scenario_name].append(tr.wall_s)
                 result.add_run(
                     wall_s=tr.wall_s, user_s=tr.user_s, sys_s=tr.sys_s,
                     peak_rss_mb=tr.peak_rss_mb, scenario=scenario_name,
-                    # Sparse per-scenario key: only runs of THIS scenario carry
-                    # it, so a threshold on it medians one scenario rather than
-                    # the mix. See the module docstring.
-                    **{f"wall_s__{scenario_name}": round(tr.wall_s, 6)},
+                    **extra,
                 )
 
         # -- Filtered-query scenarios (capability-gated) --

@@ -1248,11 +1248,17 @@ handle *does* yield genuine scipy sparse, so `sp.issparse(adata.X[0:10])` is
 | Access | Behavior |
 |--------|----------|
 | `X[100:200]` | Row slice → decodes 1 shard |
-| `X[[0, 5, 10]]` | Fancy index → decodes needed shards only |
-| `X[mask]` | Boolean mask → decodes matching shards |
+| `X[[0, 5, 10]]` | Fancy index → one decode per touched shard, result assembled once in request order (duplicates and negative indices allowed) |
+| `X[mask]` | Boolean mask (length must equal `n_obs`) → one decode per touched shard, result assembled once; peak memory = result + the shard cache + up to `cache_shards` shards decoding in flight while it fills (never a second copy of the result) |
+| `X[:]` | Whole matrix → exact-size result; without deletion vectors the shards decode uncached in parallel (costs what `to_memory()` costs), with deletion vectors it is the row gather over the kept rows |
 | `X[100:200, :500]` | Row slice + column filter → 1 shard + post-filter |
 | `X[:, hvg_idx]` | Column-only → must decode all shards (CSR is row-major) |
 | `X[0, 5]` | Scalar → returns `float` |
+| `X[[0, 10**9]]` | Out-of-range row → `IndexError` (never a shorter matrix) |
+
+The same rows are reachable without an AnnData through
+`Experiment.gather_rows_sparse(rows, layer=None, logical=True)` — see
+[api.md](api.md#experiment). `adata.layers[name][rows]` gathers from a layer.
 
 ### scanpy operations in backed mode
 

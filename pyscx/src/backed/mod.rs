@@ -8,6 +8,7 @@
 // - `comparison`     ScxComparisonResult + row-factor scaling helpers.
 // - `multimodal`     ScxBackedMuDataset / ScxBackedMuModality.
 // - `obsm`           ScxBackedObsmDataset — backed obsm/varm embeddings.
+// - `row_selector`   the one bool-mask / int-array row resolver every handle uses.
 //
 // Submodules reach their siblings through the glob re-exports below
 // (`use super::*`); the public class names are re-exported at `crate::backed`
@@ -18,10 +19,12 @@ pub(crate) mod comparison;
 pub(crate) mod layer;
 pub(crate) mod multimodal;
 pub(crate) mod obsm;
+pub(crate) mod row_selector;
 pub(crate) mod sparse_dataset;
 
 pub(crate) use comparison::*;
 pub(crate) use layer::*;
 pub(crate) use multimodal::*;
 pub(crate) use obsm::*;
+pub(crate) use row_selector::*;
 pub(crate) use sparse_dataset::*;

@@ -1083,6 +1083,12 @@ impl ScxBackedSparseDataset {
     /// user-visible row space (i.e., deleted rows are excluded from counts).
     /// Each tuple represents a contiguous chunk of user-visible rows that
     /// came from one on-disk shard.
+    ///
+    /// **Tiling contract** — `pyscx.iter_chunks(chunk_size="shard")` relies on
+    /// it, and `test_chunk_iterator.py` pins it: `b[0].0 == 0`,
+    /// `b.last().1 == n_obs` (visible), and `b[i].0 == b[i-1].1`, i.e. the
+    /// pairs tile `[0, n_obs)` exactly with no gaps or overlap. A shard whose
+    /// rows are all deleted is omitted, so `len(b)` may be below `n_shards`.
     pub(crate) fn shard_boundaries(&self) -> Vec<(usize, usize)> {
         let n_shards = self.n_shards;
         match &self.kept_to_global {
@@ -1497,61 +1503,15 @@ impl ScxBackedSparseDataset {
             return csr_to_scipy(py, csr);
         }
 
-        // Numpy array or list
-        let np = crate::pyimport::import_module(py, "numpy")?;
-        let arr = np.call_method1("asarray", (row_idx,))?;
-        // `dtype.kind` — never `str(dtype)`/`dtype.name`: numpy's C code imports
-        // `numpy._core._dtype` on every dtype stringification via the
-        // frame-sensitive `PyImport_Import`, which detonates when this
-        // __getitem__ is called from restricted-exec globals (no `__import__`).
-        // `kind` is a plain C descriptor char. Matches the column-index helper.
-        let dtype_kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
-
-        if dtype_kind == "b" {
-            // Boolean mask → extract True indices
-            let nonzero = arr.call_method0("nonzero")?;
-            // nonzero returns a tuple of arrays; for 1D, it's (array_of_indices,)
-            let idx_tuple = nonzero.cast::<PyTuple>()?;
-            let idx_arr = idx_tuple.get_item(0)?;
-            let flat = idx_arr.call_method1("astype", (np.getattr("int64")?,))?;
-            let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
-            let slice = readonly
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let rows: Vec<u64> = slice
-                .iter()
-                .map(|&v| self.to_global_row(v as usize).map(|g| g as u64))
-                .collect::<PyResult<Vec<u64>>>()?;
-            // Decode + project off the GIL (P1).
-            let csr = detached(py, || {
-                self.backed
-                    .read_row_indices(&rows)
-                    .map(|csr| self.apply_col_projection(csr))
-                    .map_err(|e| e.to_string())
-            })
-            .map_err(PyRuntimeError::new_err)?;
-            return csr_to_scipy(py, csr);
-        }
-
-        // Integer array / list → fancy indexing
-        let flat = arr.call_method1("astype", (np.getattr("int64")?,))?;
-        let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
-        let slice = readonly
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let n = self.shape_val.0 as i64;
-        let rows: Vec<u64> = slice
+        // Numpy array or list — a boolean mask (length-checked) or an integer
+        // array-like (negative wrap, `IndexError` on out-of-range): one shared
+        // resolver, then the bounded gather. `read_row_indices` decodes each
+        // touched shard once and assembles the result in place, in request
+        // order, duplicates included.
+        let visible = resolve_row_selector(py, row_idx, self.shape_val.0)?;
+        let rows: Vec<u64> = visible
             .iter()
-            .map(|&v| {
-                let normalized = if v < 0 { n + v } else { v };
-                if normalized < 0 || normalized >= n {
-                    return Err(PyIndexError::new_err(format!(
-                        "row index {} out of range for {} rows",
-                        v, self.shape_val.0
-                    )));
-                }
-                self.to_global_row(normalized as usize).map(|g| g as u64)
-            })
+            .map(|&v| self.to_global_row(v).map(|g| g as u64))
             .collect::<PyResult<Vec<u64>>>()?;
         // Decode + project off the GIL (P1).
         let csr = detached(py, || {

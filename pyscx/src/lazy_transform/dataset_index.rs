@@ -92,63 +92,14 @@ impl ScxLazyTransformedDataset {
             return csr_to_scipy(py, csr);
         }
 
-        // Numpy array or list
-        let np = crate::pyimport::import_module(py, "numpy")?;
-        let arr = np.call_method1("asarray", (row_idx,))?;
-        // `dtype.kind` — never `str(dtype)`/`dtype.name`: numpy's C code imports
-        // `numpy._core._dtype` on every dtype stringification via the
-        // frame-sensitive `PyImport_Import`, which detonates when this
-        // __getitem__ is called from restricted-exec globals (no `__import__`).
-        // `kind` is a plain C descriptor char. Matches the column-index helper.
-        let dtype_kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
-
-        if dtype_kind == "b" {
-            // Boolean mask → extract True indices
-            let nonzero = arr.call_method0("nonzero")?;
-            let idx_tuple = nonzero.cast::<PyTuple>()?;
-            let idx_arr = idx_tuple.get_item(0)?;
-            let flat = idx_arr.call_method1("astype", (np.getattr("int64")?,))?;
-            let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
-            let slice = readonly
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let rows: Vec<u64> = slice
-                .iter()
-                .map(|&v| self.to_global_row(v as usize).map(|g| g as u64))
-                .collect::<PyResult<Vec<u64>>>()?;
-            // Decode + per-row transform + project off the GIL; scipy on-GIL.
-            let csr = detached(py, || {
-                self.backed
-                    .read_row_indices(&rows)
-                    .map(|mut csr| {
-                        self.apply_transforms_per_row(&mut csr, &rows);
-                        self.apply_col_projection(csr)
-                    })
-                    .map_err(|e| e.to_string())
-            })
-            .map_err(PyRuntimeError::new_err)?;
-            return csr_to_scipy(py, csr);
-        }
-
-        // Integer array / list → fancy indexing
-        let flat = arr.call_method1("astype", (np.getattr("int64")?,))?;
-        let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
-        let slice = readonly
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let n = self.shape_val.0 as i64;
-        let rows: Vec<u64> = slice
+        // Numpy array or list — the shared resolver (boolean mask or integer
+        // array-like), then the bounded gather. `apply_transforms_per_row`
+        // looks each output row's parameters up by its *global* id, so it is
+        // handed the same request-order `rows` the CSR was assembled from.
+        let visible = crate::backed::resolve_row_selector(py, row_idx, self.shape_val.0)?;
+        let rows: Vec<u64> = visible
             .iter()
-            .map(|&v| {
-                let normalized = if v < 0 { n + v } else { v };
-                if normalized < 0 || normalized >= n {
-                    return Err(PyIndexError::new_err(format!(
-                        "row index {} out of range for {} rows",
-                        v, self.shape_val.0
-                    )));
-                }
-                self.to_global_row(normalized as usize).map(|g| g as u64)
-            })
+            .map(|&v| self.to_global_row(v).map(|g| g as u64))
             .collect::<PyResult<Vec<u64>>>()?;
         // Decode + per-row transform + project off the GIL; scipy on-GIL.
         let csr = detached(py, || {

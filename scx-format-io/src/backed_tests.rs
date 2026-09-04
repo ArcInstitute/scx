@@ -1084,6 +1084,417 @@ fn test_read_rows_with_out_of_range_errors() {
 }
 
 // -----------------------------------------------------------------------
+// BackedCsrReader::read_row_indices — bounded gather (PR C / REC-1)
+// -----------------------------------------------------------------------
+
+/// `read_row_indices` shares `read_rows_with`'s out-of-range contract: an
+/// error, not a silently shorter result. (Before PR C it dropped the row via
+/// `shards_for_indices`, so a caller asking for 5 rows could get 4 back.)
+#[test]
+fn test_read_row_indices_out_of_range_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+    let err = backed
+        .read_row_indices(&[5, 99])
+        .expect_err("an out-of-range row must error, not be dropped");
+    assert!(
+        err.to_string().contains("99"),
+        "the error must name the offending row: {err}"
+    );
+}
+
+/// Request order is the output order; every occurrence of a duplicate is its
+/// own output row (the loader's cellset gather pins the same on `[7, 7, 31]`).
+#[test]
+fn test_read_row_indices_duplicates_and_unsorted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+
+    let rows = [11u64, 0, 7, 7, 4, 3];
+    let out = backed.read_row_indices(&rows).unwrap();
+    assert_eq!(out.n_rows(), rows.len());
+    assert_eq!(out.shape.1, full.shape.1);
+    for (i, &row) in rows.iter().enumerate() {
+        let expected = full.row_slice(row as usize, row as usize + 1).unwrap();
+        let actual = out.row_slice(i, i + 1).unwrap();
+        assert_eq!(actual.indices, expected.indices, "i={i} row={row} indices");
+        assert_eq!(actual.data, expected.data, "i={i} row={row} data");
+    }
+    // The indptr is exact — no over-allocation left behind.
+    assert_eq!(out.indices.len(), out.nnz());
+    assert_eq!(out.indices.capacity(), out.indices.len());
+    assert_eq!(out.data.capacity(), out.data.len());
+}
+
+/// On a framed file the gather must be byte-identical to a full decode for
+/// every codec — sparse groups go through the block index, dense ones through
+/// the full-shard path, and the two must agree with `read_all`.
+#[test]
+fn read_row_indices_matches_full_decode_on_framed_file_all_codecs() {
+    let sparse_rows = [2u64, 5, 6, 40, 41, 63, 5];
+    let dense_rows: Vec<u64> = (0..10).chain(32..42).collect();
+    for codec in [
+        CodecId::None,
+        CodecId::ShufDeltaZstd,
+        CodecId::Zstd,
+        CodecId::Lz4Shuffle,
+        CodecId::Pcodec,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, codec);
+        for rows in [&sparse_rows[..], &dense_rows[..]] {
+            let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+            let out = backed.read_row_indices(rows).unwrap();
+            assert_eq!(out.n_rows(), rows.len(), "{codec:?}");
+            for (i, &row) in rows.iter().enumerate() {
+                let lo = full.indptr[row as usize] as usize;
+                let hi = full.indptr[row as usize + 1] as usize;
+                let olo = out.indptr[i] as usize;
+                let ohi = out.indptr[i + 1] as usize;
+                assert_eq!(
+                    &out.indices[olo..ohi],
+                    &full.indices[lo..hi],
+                    "{codec:?} indices row {row}"
+                );
+                assert_eq!(
+                    &out.data[olo..ohi],
+                    &full.data[lo..hi],
+                    "{codec:?} data row {row}"
+                );
+            }
+        }
+    }
+}
+
+/// A sparse cold gather over a framed shard takes the block-index path — the
+/// touched row groups are decoded, the shard is **not** full-decoded into the
+/// LRU. This is the caching-policy change PR C makes to `read_row_indices`
+/// (it used to full-decode and cache unconditionally).
+#[test]
+fn read_row_indices_takes_the_block_index_path() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+
+    let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let m = backed.enable_metrics();
+    backed.read_row_indices(&[2u64, 5, 6, 40, 41]).unwrap();
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        2,
+        "both sparse cold shard groups must be served via the block index",
+    );
+    assert_eq!(m.full_shard_groups.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        0,
+        "a block-index gather must not full-decode a shard into the LRU",
+    );
+}
+
+/// The indptr-only prescan indexes the decoded indptr with catalog-derived
+/// local rows, so a shard whose header under-reports its row count must be
+/// rejected with `InvalidCatalog` (the same guard `decode_shard` applies) —
+/// never an index-out-of-bounds panic.
+#[test]
+fn read_row_indices_rejects_a_shard_whose_header_underreports_rows() {
+    let dir = TempDir::new().unwrap();
+    let path = write_shard_shrunk_in_header(&dir, 8, 10, 4);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    let err = backed
+        .read_row_indices(&[0, 7])
+        .expect_err("a short shard must error, not panic");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+
+    // `read_rows` shares the prescan.
+    let err = backed
+        .read_rows(0, 8)
+        .expect_err("read_rows must reject the same shard");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+}
+
+/// A bulk `read_rows` — more full-path shards than the LRU holds — copies the
+/// shards that are already resident out of the cache and decodes the rest
+/// *uncached*, keeping the LRU's entries as they were: no evictions, no new
+/// entries (the copied residents are promoted, as any hit is), and a later
+/// small read of the resident range still hits. Before
+/// PR C the single up-front warm (truncated to `cache_shards`) evicted the
+/// resident shards and the gather loop decoded them again.
+#[test]
+fn read_rows_bulk_serves_resident_shards_from_the_cache_and_leaves_it_alone() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    // 8 shards × 8 rows, a 4-slot cache.
+    let (mut backed, full) = write_test_file_and_open(&dir, 64, 10, 8, 4);
+    let m = backed.enable_metrics();
+
+    // Warm shards 2 and 3 (rows 16..32) the way an earlier `X[a:b]` would.
+    let pre = backed.read_rows(16, 32).unwrap();
+    assert_eq!(pre.n_rows(), 16);
+    assert_eq!(m.misses.load(Ordering::Relaxed), 2);
+    let hits_before = m.hits.load(Ordering::Relaxed);
+
+    let out = backed.read_rows(0, 64).unwrap();
+    assert_eq!(out.indptr, full.indptr);
+    assert_eq!(out.indices, full.indices);
+    assert_eq!(out.data, full.data);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        2,
+        "a bulk read must not push shards through the LRU",
+    );
+    assert_eq!(m.evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.hits.load(Ordering::Relaxed) - hits_before,
+        2,
+        "the two resident shards are served from the cache",
+    );
+    // Single allocation: the buffers are exactly the result, no headroom.
+    assert_eq!(out.indices.capacity(), out.indices.len());
+    assert_eq!(out.data.capacity(), out.data.len());
+
+    // The cache still holds exactly what it held before the bulk read.
+    let again = backed.read_rows(16, 32).unwrap();
+    assert_eq!(again.indices, pre.indices);
+    assert_eq!(m.misses.load(Ordering::Relaxed), 2);
+}
+
+/// `read_rows` refuses a range past `n_obs` instead of sizing its output from
+/// it: the pre-sized assembly would leave the uncovered tail of `indptr` at
+/// zero — a non-monotone CSR — and `end = u64::MAX` would overflow the
+/// allocation. (The pre-PR-C concatenate path returned a shorter matrix; the
+/// Python and R bindings clamp or reject before the call, so only a direct
+/// Rust caller can reach this.)
+#[test]
+fn read_rows_rejects_a_range_past_n_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+    let n_obs = backed.n_obs() as u64;
+
+    for (start, end) in [(n_obs - 2, n_obs + 10), (n_obs, n_obs + 1), (0, u64::MAX)] {
+        let err = backed
+            .read_rows(start, end)
+            .expect_err("a range past n_obs must error, not emit a malformed CSR");
+        assert!(
+            err.to_string().contains("out of range"),
+            "{start}..{end}: {err}"
+        );
+    }
+    // The boundary itself is fine.
+    let tail = backed.read_rows(n_obs - 2, n_obs).unwrap();
+    assert_eq!(tail.indices, full.row_slice(10, 12).unwrap().indices);
+    // `start >= end` is still the empty matrix, wherever it sits.
+    assert_eq!(backed.read_rows(n_obs + 5, n_obs + 5).unwrap().n_rows(), 0);
+}
+
+/// A catalog whose CSR shards leave a gap in the row axis must make `read_rows`
+/// refuse the range, not return a shorter matrix (a range wholly inside the gap
+/// used to come back as `(0, n_vars)`) or a non-monotone `indptr` (a range
+/// straddling it).
+#[test]
+fn read_rows_rejects_a_catalog_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.scx");
+    let n_vars = 10usize;
+    // Header says 12 rows; shards cover 0..4 and 8..12 — rows 4..8 are nobody's.
+    let header = sample_header(12, n_vars as u64, 16);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(12)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    for row_start in [0u64, 8] {
+        let (indptr, indices, values) = sample_shard_data(4, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    for (start, end) in [(0u64, 12u64), (4, 8), (2, 10), (6, 9)] {
+        let err = backed
+            .read_rows(start, end)
+            .expect_err("a range touching the gap must error");
+        assert!(
+            matches!(err, ScxError::InvalidCatalog(_)),
+            "{start}..{end}: expected InvalidCatalog, got {err:?}"
+        );
+    }
+    // Ranges inside a covered shard still read.
+    assert_eq!(backed.read_rows(0, 4).unwrap().n_rows(), 4);
+    assert_eq!(backed.read_rows(9, 12).unwrap().n_rows(), 3);
+}
+
+/// A gap and an overlap of equal size sum to the requested row count, so a
+/// length-only tiling check accepts them; the positional check does not.
+/// Shards `0..4`, `6..10`, `8..12` on a 12-row file: rows 4..6 are nobody's and
+/// rows 8..10 are two shards'.
+#[test]
+fn read_rows_rejects_an_equal_gap_and_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap_overlap.scx");
+    let n_vars = 10usize;
+    let header = sample_header(12, n_vars as u64, 24);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(12)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    for row_start in [0u64, 6, 8] {
+        let (indptr, indices, values) = sample_shard_data(4, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    // Window lengths 4 + 4 + 4 == 12 requested rows — only position tells.
+    let err = backed
+        .read_rows(0, 12)
+        .expect_err("an equal gap and overlap must not pass as a tiling");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("previous shard ended at 4"),
+        "{err}"
+    );
+    // A range inside one shard, or across the overlap-free prefix, still reads.
+    assert_eq!(backed.read_rows(0, 4).unwrap().n_rows(), 4);
+    assert_eq!(backed.read_rows(1, 3).unwrap().n_rows(), 2);
+}
+
+/// `BackedCsrReader::new` on a multimodal file indexes every modality's shards
+/// (each tiles `[0, n_obs)` on its own), so a range read would copy two shards'
+/// windows into the same output rows. The positional tiling check refuses it;
+/// the scoped `for_modality` reader reads the range.
+#[test]
+fn read_rows_rejects_overlapping_modalities_on_an_unscoped_reader() {
+    use crate::modality::ModalityType;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mm.scx");
+    let n_obs: u64 = 4;
+    let header = sample_header(n_obs, 4, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let atac_id = writer
+        .add_modality(
+            "atac",
+            ModalityType::Atac,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(4)).unwrap();
+    writer.write_var_for(atac_id, &sample_var(4)).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(atac_id, 4).unwrap();
+    let indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
+    let values: Vec<u8> = vec![1, 1, 1, 1];
+    let rna_indices: Vec<u32> = vec![0, 0, 0, 0];
+    let atac_indices: Vec<u32> = vec![3, 3, 3, 3];
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &rna_indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer
+        .write_csr_shard_for(
+            atac_id,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &atac_indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let err = unscoped
+        .read_rows(0, n_obs)
+        .expect_err("two modalities' shards overlap every output row");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    assert!(err.to_string().contains("for_modality"), "{err}");
+
+    let scoped = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), atac_id, 4);
+    let out = scoped.read_rows(0, n_obs).unwrap();
+    assert_eq!(out.n_rows(), 4);
+    assert_eq!(out.indices, vec![3, 3, 3, 3]);
+}
+
+/// A range that fits the LRU still goes through it (warm + copy), so the
+/// sequential chunk iterator's re-reads keep hitting.
+#[test]
+fn read_rows_cache_sized_range_still_populates_the_cache() {
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut backed, full) = write_test_file_and_open(&dir, 64, 10, 8, 4);
+    let m = backed.enable_metrics();
+
+    // 4 full shards == cache_shards ⇒ cached path.
+    let out = backed.read_rows(0, 32).unwrap();
+    assert_eq!(out.indices, full.row_slice(0, 32).unwrap().indices);
+    assert_eq!(m.misses.load(Ordering::Relaxed), 4);
+    // The warm decoded the four shards; the copy loop then took each from the
+    // cache (four hits). A second read is all hits, no decode.
+    let hits_after_first = m.hits.load(Ordering::Relaxed);
+    let again = backed.read_rows(0, 32).unwrap();
+    assert_eq!(again.indices, out.indices);
+    assert_eq!(
+        m.misses.load(Ordering::Relaxed),
+        4,
+        "second read is all hits"
+    );
+    assert_eq!(m.hits.load(Ordering::Relaxed) - hits_after_first, 4);
+}
+
+// -----------------------------------------------------------------------
 // LRU cache behavior tests
 // -----------------------------------------------------------------------
 

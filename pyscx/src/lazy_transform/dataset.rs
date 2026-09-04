@@ -958,6 +958,11 @@ impl ScxLazyTransformedDataset {
     }
 
     /// Return shard boundaries as a list of (row_start, row_end) tuples.
+    ///
+    /// Same tiling contract as `ScxBackedSparseDataset::shard_boundaries`:
+    /// user-visible row space, first pair starts at 0, last ends at `n_obs`,
+    /// each starts where the previous ended (an all-deleted shard is omitted).
+    /// `pyscx.iter_chunks` uses it on a lazily transformed `X` too.
     fn shard_boundaries(&self) -> Vec<(usize, usize)> {
         let n_shards = self.backed.index().n_shards();
         match &self.kept_to_global {

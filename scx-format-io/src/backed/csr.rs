@@ -10,6 +10,31 @@ use super::*;
 // BackedCsrReader
 // ---------------------------------------------------------------------------
 
+/// One shard's slice of a sorted row request: `sorted[start..end]` all fall in
+/// shard `shard_idx`, whose first global row is `s_start`. `use_block_index` is
+/// [`BackedCsrReader::block_index_eligible`]'s verdict, taken at planning time.
+#[derive(Clone, Copy, Debug)]
+struct RowGroup {
+    start: usize,
+    end: usize,
+    shard_idx: usize,
+    s_start: u64,
+    use_block_index: bool,
+}
+
+/// One shard's window of a contiguous row-range read: local rows
+/// `[local_start, local_end)` land at output rows starting at `out_row`, with
+/// exactly `nnz` nonzeros (filled in by the indptr-only prescan).
+#[derive(Clone, Copy, Debug)]
+struct RangePlan {
+    shard_idx: usize,
+    local_start: usize,
+    local_end: usize,
+    out_row: usize,
+    nnz: usize,
+    use_row_range: bool,
+}
+
 /// On-demand CSR reader with optional shard caching.
 ///
 /// Wraps an [`ScxReader`] with a [`BackedCsrIndex`] for efficient row-range
@@ -61,9 +86,8 @@ pub struct BackedCsrReader {
     /// Number of shards to prefetch with `MADV_WILLNEED` after a cache miss.
     prefetch_count: usize,
     /// Configured count cap on the LRU (0 = no cache). Mirrored here so
-    /// [`Self::warm_shards`] can chunk parallel decodes without locking the
-    /// cache. Only read under `cfg(feature = "parallel")`.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    /// [`Self::warm_shards`] can chunk parallel decodes and [`Self::read_rows`]
+    /// can tell a cache-sized range from a bulk one without locking the cache.
     cache_shards: usize,
     /// Per-reader gate for the codec-agnostic **block-index** (row-group)
     /// scattered gather path (see [`Self::block_index_eligible`]). A framed (v2)
@@ -546,84 +570,299 @@ impl BackedCsrReader {
 
     /// Read rows `[start, end)` as a scipy-compatible `ScxCsr`.
     ///
-    /// Decompresses only overlapping shards.  Takes `&self` — cache
-    /// mutation is handled via interior mutability (Mutex).
+    /// Decompresses only overlapping shards and assembles the result **once**:
+    /// an indptr-only prescan of every overlapping shard sizes the output
+    /// exactly, then each shard's window is copied straight into it — no
+    /// per-shard `row_slice`, no `concatenate_csr`, so the peak is the result
+    /// plus decoded shards, not twice the result.
+    ///
+    /// A range whose full-path shards fit the LRU (`≤ cache_shards`) is warmed
+    /// once and copied out of the cache, as before. A **bulk** range — more
+    /// full shards than the LRU holds, e.g. `X[:]` — would only thrash it, so
+    /// resident shards are copied from the cache and every other shard is
+    /// decoded *uncached*, in parallel chunks of `cache_shards`, copied out and
+    /// dropped. The LRU keeps exactly the entries it had (nothing inserted,
+    /// nothing evicted — `read_all` also adds nothing), though the resident
+    /// shards this read copies are promoted to most-recently-used, as any hit
+    /// is.
+    /// Peak = result + up to `cache_shards` shards decoding in flight, **on top
+    /// of** whatever the LRU already holds (itself capped at `cache_shards`) —
+    /// so at most `2 × cache_shards` decoded shards beside the result when the
+    /// cache is full going in, `cache_shards` when it is empty. The LRU is the
+    /// caller's resident budget; this read's own transient never exceeds it.
+    ///
+    /// `end` must not exceed `n_obs`: a range past the last shard is an error
+    /// (the pre-PR-C path returned a shorter matrix; the pre-sized assembly
+    /// would otherwise emit a non-monotone `indptr`). `start >= end` is the
+    /// empty matrix. Takes `&self` — cache mutation is handled via interior
+    /// mutability (Mutex).
     pub fn read_rows(&self, start: u64, end: u64) -> Result<ScxCsr> {
         if start >= end {
-            return Ok(ScxCsr::new_unchecked(
-                (0, self.n_vars),
-                vec![0],
-                vec![],
-                vec![],
-            ));
+            return Ok(Self::empty_csr(self.n_vars));
+        }
+        if end > self.n_obs as u64 {
+            return Err(ScxError::Io(std::io::Error::other(format!(
+                "row range {start}..{end} out of range (n_obs={})",
+                self.n_obs
+            ))));
         }
 
+        // No early return on an empty `shard_indices`: `start < end <= n_obs`
+        // holds here, so a range no shard covers is a catalog gap and must
+        // fail the tiling check below, not come back as an empty matrix.
         let shard_indices = self.index.shards_for_range(start, end);
-        if shard_indices.is_empty() {
-            return Ok(ScxCsr::new_unchecked(
-                (0, self.n_vars),
-                vec![0],
-                vec![],
-                vec![],
-            ));
-        }
 
         // Plan each overlapping shard. A genuinely small window of an *uncached*
         // framed shard is decoded directly via the block-index row-range path
         // (O(window); no full-shard decode, no cache pollution). Everything else
         // — large windows, cached shards, unframed shards, repeated/sequential
-        // access like the training loader — takes the full-decode + cache path, so
-        // only those shards are pre-warmed. Tuple: (shard_idx, local_start,
-        // local_end, use_row_range).
-        const ROW_RANGE_WINDOW_DIVISOR: u64 = 4;
-        let mut plans: Vec<(usize, usize, usize, bool)> = Vec::with_capacity(shard_indices.len());
-        let mut full_shards: Vec<usize> = Vec::new();
-        // Plan each shard's read strategy. The shared cache is keyed by
-        // `(file_id, shard)`, so membership is queried per shard rather than
-        // under one held lock; the planning set (shards a row range touches)
-        // is small, and `warm_shards` re-locks anyway.
-        {
-            for &shard_idx in &shard_indices {
-                let (s_start, s_end) =
-                    self.index
-                        .shard_range(shard_idx)
-                        .ok_or(ScxError::ShardIndexOutOfBounds {
-                            index: shard_idx,
-                            count: self.index.n_shards(),
-                        })?;
-                let local_start = (start.max(s_start) - s_start) as usize;
-                let local_end = (end.min(s_end) - s_start) as usize;
-                let window = (local_end - local_start) as u64;
-                let shard_rows = s_end - s_start;
-                let cached = self.shard_cache.contains(self.file_id, shard_idx);
-                let use_row_range = !cached && window * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
-                if !use_row_range {
-                    full_shards.push(shard_idx);
-                }
-                plans.push((shard_idx, local_start, local_end, use_row_range));
-            }
+        // access like the training loader — takes the full-decode + cache path.
+        // The shared cache is keyed by `(file_id, shard)`, so membership is
+        // queried per shard rather than under one held lock; the planning set
+        // (shards a row range touches) is small, and `warm_shards` re-locks
+        // anyway.
+        let mut plans: Vec<RangePlan> = Vec::with_capacity(shard_indices.len());
+        for &shard_idx in &shard_indices {
+            let (s_start, s_end) =
+                self.index
+                    .shard_range(shard_idx)
+                    .ok_or(ScxError::ShardIndexOutOfBounds {
+                        index: shard_idx,
+                        count: self.index.n_shards(),
+                    })?;
+            let local_start = (start.max(s_start) - s_start) as usize;
+            let local_end = (end.min(s_end) - s_start) as usize;
+            let window = (local_end - local_start) as u64;
+            let shard_rows = s_end - s_start;
+            let cached = self.shard_cache.contains(self.file_id, shard_idx);
+            let use_row_range = !cached && window * ROW_RANGE_WINDOW_DIVISOR < shard_rows;
+            plans.push(RangePlan {
+                shard_idx,
+                local_start,
+                local_end,
+                out_row: (start.max(s_start) - start) as usize,
+                nnz: 0,
+                use_row_range,
+            });
         }
 
-        // Pre-decode the cold full-path shards in parallel (no-op if all cached).
-        self.warm_shards(&full_shards)?;
+        // The plans must tile `[start, end)` exactly, in order: a gap leaves
+        // output rows with no shard (a non-monotone `indptr`), an overlap writes
+        // one window twice. Checked positionally — each window must begin where
+        // the previous ended and the last must end at `end` — because a gap and
+        // an overlap of equal size sum to the right length. Either means the
+        // catalog does not tile the row axis: a corrupt file, or a reader built
+        // with `new` on a multimodal file whose modalities each tile
+        // `[0, n_obs)` (use `for_modality` there).
+        let n_rows = (end - start) as usize;
+        let mut cursor = 0usize;
+        for plan in &plans {
+            if plan.out_row != cursor {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {} covers output rows {}.. of {start}..{end} but the previous \
+                     shard ended at {cursor}: the catalog does not tile the row axis (on a \
+                     multimodal file open the reader with `for_modality`)",
+                    plan.shard_idx, plan.out_row
+                )));
+            }
+            cursor += plan.local_end - plan.local_start;
+        }
+        if cursor != n_rows {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shards cover {cursor} of the {n_rows} rows in {start}..{end}: the catalog \
+                 does not tile the row axis (on a multimodal file open the reader with \
+                 `for_modality`)"
+            )));
+        }
 
-        let mut slices = Vec::with_capacity(plans.len());
-        for (shard_idx, local_start, local_end, use_row_range) in plans {
-            if use_row_range {
-                if let Some(sliced) = self.try_row_range_slice(shard_idx, local_start, local_end)? {
-                    slices.push(sliced);
+        // Phase 1 — exact sizing. The indptr-only decode is O(rows) per shard
+        // (the indices/data streams are never touched) and is checked against
+        // the catalog's row count so a lying shard header cannot drive an
+        // out-of-bounds index below.
+        let mut indptr = vec![0i64; n_rows + 1];
+        let mut running: i64 = 0;
+        for plan in plans.iter_mut() {
+            let ip = self.shard_indptr(plan.shard_idx)?;
+            let base = ip[plan.local_start];
+            for k in 0..(plan.local_end - plan.local_start) {
+                indptr[plan.out_row + k + 1] = running + (ip[plan.local_start + k + 1] - base);
+            }
+            plan.nnz = (ip[plan.local_end] - base) as usize;
+            running += plan.nnz as i64;
+        }
+        let total_nnz = running as usize;
+        let mut indices = vec![0i32; total_nnz];
+        let mut data = vec![0f32; total_nnz];
+
+        // Phase 2 — copy each window into its pre-carved slot. Row-range plans
+        // first (they never enter the cache; a `None` means the shard is not
+        // framed and joins the full-path chunks), then full-path plans in
+        // chunks of `cache_shards`.
+        let mut full_plans: Vec<usize> = Vec::with_capacity(plans.len());
+        for (i, plan) in plans.iter().enumerate() {
+            if plan.use_row_range {
+                if let Some(run) =
+                    self.try_row_range_slice(plan.shard_idx, plan.local_start, plan.local_end)?
+                {
+                    Self::copy_window(
+                        &run,
+                        0,
+                        run.n_rows(),
+                        plan,
+                        &indptr,
+                        &mut indices,
+                        &mut data,
+                    )?;
                     continue;
                 }
-                // Unframed shard — fall through to the full-decode path.
             }
-            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
-            let sliced = shard_csr
-                .row_slice(local_start, local_end)
-                .map_err(|e| ScxError::Io(std::io::Error::other(e)))?;
-            slices.push(sliced);
+            full_plans.push(i);
         }
 
-        Ok(scx_sparse::concatenate_csr(&slices, self.n_vars)?)
+        let chunk = self.cache_shards.max(1);
+        if full_plans.len() <= chunk {
+            // Fits the LRU: warm once (parallel, no-op if cached), copy out.
+            let shards: Vec<usize> = full_plans.iter().map(|&i| plans[i].shard_idx).collect();
+            self.warm_shards(&shards)?;
+            for &i in &full_plans {
+                let plan = &plans[i];
+                let shard_csr = self.read_shard_cached_arc(plan.shard_idx)?;
+                Self::copy_window(
+                    &shard_csr,
+                    plan.local_start,
+                    plan.local_end,
+                    plan,
+                    &indptr,
+                    &mut indices,
+                    &mut data,
+                )?;
+            }
+        } else {
+            // Bulk range: the LRU cannot hold it, so do not run it through the
+            // LRU. Resident shards are copied from the cache (a hit each, no
+            // eviction); the rest are decoded uncached in parallel chunks of
+            // `cache_shards`, copied into their windows and dropped.
+            let (resident, cold): (Vec<usize>, Vec<usize>) = full_plans
+                .iter()
+                .copied()
+                .partition(|&i| self.shard_cache.contains(self.file_id, plans[i].shard_idx));
+            for &i in &resident {
+                let plan = &plans[i];
+                let shard_csr = self.read_shard_cached_arc(plan.shard_idx)?;
+                Self::copy_window(
+                    &shard_csr,
+                    plan.local_start,
+                    plan.local_end,
+                    plan,
+                    &indptr,
+                    &mut indices,
+                    &mut data,
+                )?;
+            }
+            for cold_chunk in cold.chunks(chunk) {
+                let shards: Vec<usize> = cold_chunk.iter().map(|&i| plans[i].shard_idx).collect();
+                let decoded = self.decode_shards_uncached(&shards)?;
+                for (&i, shard_csr) in cold_chunk.iter().zip(&decoded) {
+                    let plan = &plans[i];
+                    Self::copy_window(
+                        shard_csr,
+                        plan.local_start,
+                        plan.local_end,
+                        plan,
+                        &indptr,
+                        &mut indices,
+                        &mut data,
+                    )?;
+                }
+            }
+        }
+
+        Ok(ScxCsr::new_unchecked(
+            (n_rows, self.n_vars),
+            indptr,
+            indices,
+            data,
+        ))
+    }
+
+    /// Decode `shard_indices` without touching the LRU — in parallel on the
+    /// reader's pool (or rayon's global registry) when the `parallel` feature
+    /// is on and there is more than one shard, else sequentially. Peak is
+    /// `shard_indices.len()` decoded shards **in addition to** the LRU's
+    /// resident entries; callers chunk to `cache_shards` accordingly.
+    fn decode_shards_uncached(&self, shard_indices: &[usize]) -> Result<Vec<ScxCsr>> {
+        #[cfg(feature = "parallel")]
+        {
+            if shard_indices.len() > 1 {
+                let decode_all = || -> Result<Vec<ScxCsr>> {
+                    shard_indices
+                        .par_iter()
+                        .map(|&idx| self.read_shard_uncached(idx))
+                        .collect()
+                };
+                return match self.cpu_pool.as_ref() {
+                    Some(pool) => pool.install(decode_all),
+                    None => decode_all(),
+                };
+            }
+        }
+        shard_indices
+            .iter()
+            .map(|&idx| self.read_shard_uncached(idx))
+            .collect()
+    }
+
+    fn empty_csr(n_vars: usize) -> ScxCsr {
+        ScxCsr::new_unchecked((0, n_vars), vec![0], vec![], vec![])
+    }
+
+    /// Copy rows `[local_start, local_end)` of `csr` into `plan`'s window of the
+    /// output, checking that the decoded shard holds exactly the nonzeros the
+    /// indptr-only prescan counted for that window.
+    fn copy_window(
+        csr: &ScxCsr,
+        local_start: usize,
+        local_end: usize,
+        plan: &RangePlan,
+        indptr: &[i64],
+        indices: &mut [i32],
+        data: &mut [f32],
+    ) -> Result<()> {
+        let lo = csr.indptr[local_start] as usize;
+        let hi = csr.indptr[local_end] as usize;
+        if hi - lo != plan.nnz {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shard {}: the indptr-only prescan counted {} nonzeros in rows {}..{} but \
+                 the decoded shard holds {} (corrupt or inconsistent shard)",
+                plan.shard_idx,
+                plan.nnz,
+                plan.local_start,
+                plan.local_end,
+                hi - lo
+            )));
+        }
+        let dst = indptr[plan.out_row] as usize;
+        indices[dst..dst + plan.nnz].copy_from_slice(&csr.indices[lo..hi]);
+        data[dst..dst + plan.nnz].copy_from_slice(&csr.data[lo..hi]);
+        Ok(())
+    }
+
+    /// Indptr-only decode of shard `shard_idx` — every codec, framed or not —
+    /// checked against the catalog's row count. Never touches the LRU, so a
+    /// prescan between planning and warming cannot change which groups
+    /// [`Self::block_index_eligible`] admits.
+    fn shard_indptr(&self, shard_idx: usize) -> Result<Vec<i64>> {
+        let lite = self
+            .shard_entry(shard_idx)
+            .ok_or(ScxError::ShardIndexOutOfBounds {
+                index: shard_idx,
+                count: self.shard_count(),
+            })?;
+        let ip = self
+            .reader
+            .read_shard_indptr_from_entry(&lite.into_transient_full_entry())?;
+        self.check_decoded_shard_rows(shard_idx, ip.len().saturating_sub(1))?;
+        Ok(ip)
     }
 
     /// Decode just rows `[local_start, local_end)` of shard `shard_idx` directly
@@ -671,64 +910,88 @@ impl BackedCsrReader {
         }
     }
 
-    /// Read specific row indices as a scipy-compatible `ScxCsr`.
+    /// Read specific row indices as a scipy-compatible `ScxCsr`, in request
+    /// order.
     ///
-    /// Decompresses only shards containing requested rows.
-    pub fn read_row_indices(&self, indices: &[u64]) -> Result<ScxCsr> {
-        if indices.is_empty() {
-            return Ok(ScxCsr::new_unchecked(
-                (0, self.n_vars),
-                vec![0],
-                vec![],
-                vec![],
-            ));
+    /// `rows` may contain duplicates (each occurrence is its own output row)
+    /// and need not be sorted. Every row must be in range: an out-of-range row
+    /// is an error, the same contract as [`Self::read_rows_with`] (it used to
+    /// be dropped silently, so a caller could get fewer rows than it asked for).
+    ///
+    /// Two passes, one allocation of the result: an indptr-only prescan of each
+    /// touched shard gives the exact per-row lengths — hence an exact
+    /// request-order `indptr` — and the [`Self::read_rows_with`] scatter then
+    /// copies every row straight into its window. Each touched shard is
+    /// decoded once; a sparse request group on a cold row-group-framed shard is
+    /// decoded by row group through the block index and is **not** inserted
+    /// into the LRU (see [`Self::block_index_eligible`]), so repeated small
+    /// gathers over one region re-decode row groups rather than paying a
+    /// full-shard decode each. Peak memory is the result plus the shard cache,
+    /// plus up to `cache_shards` shards decoding in flight while
+    /// [`Self::warm_shards`] fills that cache (a full LRU is evicted only as
+    /// each new shard lands, so at most `2 × cache_shards` decoded shards sit
+    /// beside the result) and one shard's block-index transient — not a
+    /// per-row `ScxCsr` per requested row and a second copy of the result, as
+    /// before.
+    pub fn read_row_indices(&self, rows: &[u64]) -> Result<ScxCsr> {
+        if rows.is_empty() {
+            return Ok(Self::empty_csr(self.n_vars));
         }
 
-        // Sort the indices but keep track of the original ordering
-        // so we output rows in the requested order.
-        let mut sorted_pairs: Vec<(u64, usize)> =
-            indices.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-        sorted_pairs.sort_by_key(|&(r, _)| r);
+        let sorted = Self::sort_rows(rows);
+        let groups = self.plan_row_groups(&sorted)?;
 
-        // Group by shard
-        let shard_indices = self
-            .index
-            .shards_for_indices(&sorted_pairs.iter().map(|&(r, _)| r).collect::<Vec<_>>());
-
-        // Pre-decode cold shards in parallel before the per-shard gather.
-        // No-op when every shard is already cached.
-        self.warm_shards(&shard_indices)?;
-
-        // For each shard, extract the needed rows
-        let mut row_csrs: Vec<(usize, ScxCsr)> = Vec::new();
-
-        for &shard_idx in &shard_indices {
-            let shard_csr = self.read_shard_cached_arc(shard_idx)?;
-            let (s_start, s_end) =
-                self.index
-                    .shard_range(shard_idx)
-                    .ok_or(ScxError::ShardIndexOutOfBounds {
-                        index: shard_idx,
-                        count: self.index.n_shards(),
-                    })?;
-
-            // Extract individual rows from this shard
-            for &(row, orig_idx) in &sorted_pairs {
-                if row >= s_start && row < s_end {
-                    let local_row = (row - s_start) as usize;
-                    let sliced = shard_csr
-                        .row_slice(local_row, local_row + 1)
-                        .map_err(|e| ScxError::Io(std::io::Error::other(e)))?;
-                    row_csrs.push((orig_idx, sliced));
-                }
+        // Phase 1 — exact per-row lengths in request order, then prefix-sum.
+        let mut indptr = vec![0i64; rows.len() + 1];
+        for g in &groups {
+            let ip = self.shard_indptr(g.shard_idx)?;
+            for &(row, pos) in &sorted[g.start..g.end] {
+                let local = (row - g.s_start) as usize;
+                indptr[pos + 1] = ip[local + 1] - ip[local];
             }
         }
+        for i in 1..indptr.len() {
+            indptr[i] += indptr[i - 1];
+        }
+        let nnz = indptr[rows.len()] as usize;
 
-        // Sort by original index to preserve requested ordering
-        row_csrs.sort_by_key(|&(idx, _)| idx);
+        // Phase 2 — scatter each row into its pre-carved window.
+        let mut indices = vec![0i32; nnz];
+        let mut data = vec![0f32; nnz];
+        let mut fired = 0usize;
+        let mut copied = 0usize;
+        self.scatter_groups(&sorted, &groups, |pos, idx, val| {
+            let lo = indptr[pos] as usize;
+            let hi = indptr[pos + 1] as usize;
+            if idx.len() != hi - lo || val.len() != hi - lo {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "row {} (request position {pos}): the indptr-only prescan counted {} \
+                     nonzeros but the decoded shard holds {} indices / {} values",
+                    rows[pos],
+                    hi - lo,
+                    idx.len(),
+                    val.len()
+                )));
+            }
+            indices[lo..hi].copy_from_slice(idx);
+            data[lo..hi].copy_from_slice(val);
+            fired += 1;
+            copied += idx.len();
+            Ok(())
+        })?;
+        if fired != rows.len() || copied != nnz {
+            return Err(ScxError::InvalidCatalog(format!(
+                "row gather scattered {fired} of {} rows and {copied} of {nnz} nonzeros",
+                rows.len()
+            )));
+        }
 
-        let ordered: Vec<ScxCsr> = row_csrs.into_iter().map(|(_, csr)| csr).collect();
-        Ok(scx_sparse::concatenate_csr(&ordered, self.n_vars)?)
+        Ok(ScxCsr::new_unchecked(
+            (rows.len(), self.n_vars),
+            indptr,
+            indices,
+            data,
+        ))
     }
 
     /// Read specific row indices, invoking `scatter` once per row with
@@ -743,49 +1006,53 @@ impl BackedCsrReader {
     ///
     /// Allocates no intermediate `ScxCsr` and does no per-row `row_slice`
     /// — the per-shard request sub-slice is found via binary search on the
-    /// shard ranges (O(R log S) total grouping cost), avoiding the
-    /// `read_row_indices` inner-scan pattern. Use this for dense-gather
+    /// shard ranges (O(R log S) total grouping cost). Use this for dense-gather
     /// hot paths (ML training, paired-batch readers) where the consumer
     /// owns the dense output. Callers that need a `ScxCsr` (scipy interop)
-    /// should keep using [`Self::read_row_indices`].
+    /// should use [`Self::read_row_indices`], which is built on the same
+    /// planner and scatter.
     ///
     /// `rows` may contain duplicates; each occurrence triggers one
-    /// `scatter` call. Empty `rows` is a no-op.
-    ///
-    /// **Out-of-range semantics differ from [`Self::read_row_indices`]**:
-    /// `read_row_indices` filters via `shards_for_indices` and silently
-    /// drops rows that fall outside every shard, whereas `read_rows_with`
-    /// walks shards directly and returns an error on the first row outside
-    /// any shard range. Callers that need silent-skip semantics must
-    /// pre-filter `rows`.
-    pub fn read_rows_with<F>(&self, rows: &[u64], mut scatter: F) -> Result<()>
+    /// `scatter` call. Empty `rows` is a no-op. A row outside every shard
+    /// range is an error (shared with `read_row_indices`).
+    pub fn read_rows_with<F>(&self, rows: &[u64], scatter: F) -> Result<()>
     where
         F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
     {
         if rows.is_empty() {
             return Ok(());
         }
+        let sorted = Self::sort_rows(rows);
+        let groups = self.plan_row_groups(&sorted)?;
+        self.scatter_groups(&sorted, &groups, scatter)
+    }
 
-        // (row, orig_pos) sorted by row so duplicates / requests for the
-        // same shard are contiguous and the shard decode happens once.
+    /// `(row, orig_pos)` sorted by row so duplicates / requests for the same
+    /// shard are contiguous and each shard decode happens once. Stable, so
+    /// duplicates keep request order among themselves.
+    fn sort_rows(rows: &[u64]) -> Vec<(u64, usize)> {
         let mut sorted_pairs: Vec<(u64, usize)> =
             rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
         sorted_pairs.sort_by_key(|&(r, _)| r);
+        sorted_pairs
+    }
 
-        // Plan each shard's request group: sidecar (row-range) vs full-shard
-        // decode — same policy as the contiguous `read_rows` planner. Use the
-        // sidecar only when the shard isn't already decoded AND the requested
-        // rows are a small fraction of the shard (so O(rows) block-index decode
-        // beats one full 16k-row shard decode). Scattered cell-set gather hits
-        // the block-index path; sequential / cached reads keep the full-shard path.
-        //
-        // `shard_for_row` (not `shards_for_indices`) preserves the out-of-range
-        // error semantics. Planning before warming is what lets the `!cached`
-        // test mean something — we then warm ONLY the full-path shards, so
-        // block-index-group shards stay undecoded and the row-range path is taken.
-        // (start, end, shard_idx, s_start, use_block_index)
-        let mut groups: Vec<(usize, usize, usize, u64, bool)> = Vec::new();
-        let mut full_shards: Vec<usize> = Vec::new();
+    /// Group a sorted request by shard and decide each group's decode
+    /// strategy: block-index row groups vs full-shard decode — same policy as
+    /// the contiguous `read_rows` planner. The block-index path is used only
+    /// when the shard isn't already decoded AND the requested rows are a small
+    /// fraction of the shard (so O(rows) block-index decode beats one full
+    /// 16k-row shard decode). Scattered cell-set gather hits the block-index
+    /// path; sequential / cached reads keep the full-shard path.
+    ///
+    /// `shard_for_row` (not `shards_for_indices`) is what makes an
+    /// out-of-range row an error rather than a dropped row. Planning happens
+    /// **before** any warming — that is what lets the `!cached` test in
+    /// [`Self::block_index_eligible`] mean something: [`Self::scatter_groups`]
+    /// then warms ONLY the full-path shards, so block-index-group shards stay
+    /// undecoded and the row-group path is taken.
+    fn plan_row_groups(&self, sorted_pairs: &[(u64, usize)]) -> Result<Vec<RowGroup>> {
+        let mut groups: Vec<RowGroup> = Vec::new();
         let mut start = 0;
         while start < sorted_pairs.len() {
             let row = sorted_pairs[start].0;
@@ -813,27 +1080,54 @@ impl BackedCsrReader {
             // eligible predicate returns true here and the O(rows) path is taken;
             // dense/cached/unframed groups still go full-shard.
             let use_block_index = self.block_index_eligible(shard_idx, group_len);
-            if !use_block_index {
-                full_shards.push(shard_idx);
-            }
-            groups.push((start, end, shard_idx, s_start, use_block_index));
+            groups.push(RowGroup {
+                start,
+                end,
+                shard_idx,
+                s_start,
+                use_block_index,
+            });
             start = end;
         }
+        Ok(groups)
+    }
 
+    /// Warm the full-path shards of `groups` (in parallel, capped at
+    /// `cache_shards`), then scatter every group: eligible groups through the
+    /// block index, the rest from the cached full-shard decode. Metrics count
+    /// one `block_index_groups` / `full_shard_groups` per group.
+    fn scatter_groups<F>(
+        &self,
+        sorted_pairs: &[(u64, usize)],
+        groups: &[RowGroup],
+        mut scatter: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
         // Pre-decode the cold full-path shards in parallel (no-op if all cached
         // or if every group took the block-index path).
+        let full_shards: Vec<usize> = groups
+            .iter()
+            .filter(|g| !g.use_block_index)
+            .map(|g| g.shard_idx)
+            .collect();
         self.warm_shards(&full_shards)?;
 
-        for (start, end, shard_idx, s_start, use_block_index) in groups {
-            let group = &sorted_pairs[start..end];
+        for g in groups {
+            let group = &sorted_pairs[g.start..g.end];
 
             // Strategy: on an eligible (sparse, cache-cold, framed) group, decode
             // only the touched row-groups via the codec-agnostic block index;
             // otherwise fall back to a full-shard decode.
             let mut handled = false;
-            if use_block_index {
-                handled =
-                    self.scatter_group_via_block_index(shard_idx, s_start, group, &mut scatter)?;
+            if g.use_block_index {
+                handled = self.scatter_group_via_block_index(
+                    g.shard_idx,
+                    g.s_start,
+                    group,
+                    &mut scatter,
+                )?;
             }
 
             if let Some(m) = self.metrics() {
@@ -846,9 +1140,9 @@ impl BackedCsrReader {
 
             if !handled {
                 // Full-shard fallback: decode once (cached), slice each row.
-                let shard_csr = self.read_shard_cached_arc(shard_idx)?;
+                let shard_csr = self.read_shard_cached_arc(g.shard_idx)?;
                 for &(row, orig_pos) in group {
-                    let local = (row - s_start) as usize;
+                    let local = (row - g.s_start) as usize;
                     let lo = shard_csr.indptr[local] as usize;
                     let hi = shard_csr.indptr[local + 1] as usize;
                     scatter(
@@ -1291,7 +1585,9 @@ impl BackedCsrReader {
     /// singleflight table. Any tail beyond `cache_shards` is left for the
     /// per-shard gather loop to decode sequentially — warming further would
     /// just thrash the LRU (also capped at `cache_shards`) and force the
-    /// gather loop to re-decode the evicted prefix.
+    /// gather loop to re-decode the evicted prefix. (`read_rows` warms only a
+    /// range that fits the LRU; a bulk range bypasses the cache — see
+    /// [`Self::decode_shards_uncached`].)
     ///
     /// No-op for shards already cached or in flight via the singleflight
     /// table — the up-front filter avoids paying the singleflight Condvar

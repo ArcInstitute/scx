@@ -980,8 +980,8 @@ will still raise); the guarantee covers pyscx's own entry points.
 ## BackedCsrReader (`scx-format-io/src/backed/csr.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
-- `read_rows(start, end)` → `ScxCsr` — Decode and concatenate rows from relevant shards
-- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing)
+- `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards`, keeping the LRU's entries as they were (the residents it copies are promoted, as any hit is) — peak = result + up to `cache_shards` shards in flight, on top of whatever the LRU already holds (itself capped at `cache_shards`). `end > n_obs` is an error, and so is a catalog whose shards do not tile the range exactly (a gap, or the overlapping modalities of an unscoped reader on a multimodal file).
+- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + the shard cache + up to `cache_shards` shards decoding in flight while `warm_shards` fills it (at most `2 × cache_shards` decoded shards beside the result on a full cache) + one shard's block-index transient. A sparse request on a cold row-group-framed shard decodes only the touched row groups (block index) and is not inserted into the LRU. An out-of-range row is an error (it used to be dropped silently).
 - `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
 - `read_shard_uncached(idx)` → `ScxCsr` — Read shard bypassing cache (preferred for streaming)
 - `row_sums()` / `col_sums()` — Streaming per-row/column sums
@@ -2030,6 +2030,29 @@ the repr onto `Experiment.info() -> str`.
   Indices of cells with non-zero expression for `gene` (name or
   integer). Bitmap fast path when sidecars exist; CSR fallback
   otherwise.
+- `gather_rows_sparse(rows, modality=None, cache_shards=4, layer=None, logical=True) -> scipy.sparse.csr_matrix`
+  — The bounded shard-wise row gather, without building an AnnData. `rows` is a
+  boolean mask or any 1-D integer array-like (list, `range`, ndarray of any
+  integer dtype); duplicates allowed, order preserved, negative indices wrap
+  once. Each touched shard is decoded once (a sparse request on a
+  row-group-framed shard decodes only the touched row groups) and the result is
+  assembled once into exact-size buffers, so peak memory is the result plus the
+  shard cache, plus up to `cache_shards` shards decoding in flight while that
+  cache fills (at most `2 × cache_shards` decoded shards beside the result) —
+  never a second copy of the result.
+  `logical=True` (default) indexes the rows `n_obs` / `read_obs()` describe
+  (deletion vectors applied, exactly as `to_anndata(backed=True).X[rows]`);
+  `logical=False` indexes physical file rows (`n_obs_physical`). **Changed in
+  0.17**: before, this method addressed physical rows only, so on a file with
+  deletion vectors the same ids now select different cells — pass
+  `logical=False` for the old behaviour. `layer=`
+  gathers from that layer instead of `X` (`ValueError` if absent; not supported
+  on a multimodal file — index the modality's layer handle from `to_mudata()`).
+  Out-of-range ids and a boolean mask whose length is not the row count raise
+  `IndexError`. Gene indices are raw-local (no global-vocab remap). A fresh
+  reader is opened per call (fork-safe; `cache_shards` bounds its memory, it is
+  not a speedup knob). Equivalent to `adata.X[rows]` / `adata.layers[name][rows]`
+  on a backed handle.
 - `to_gpu_anndata()` — Minimal-copy on-device handoff: decodes shards, transfers to the GPU, and returns a GPU-resident AnnData whose `X` is a `cupyx.scipy.sparse.csr_matrix`. The returned object is suitable for direct use with rapids-singlecell (`rsc.pp.*`, `rsc.tl.*`) without additional host↔device copies. Requires `cupy` and a CUDA-capable GPU. Records its `transfer_mode` and real `bytes_uploaded` on `uns["scx_accel"]["to_gpu_anndata"]` — `scx_device_decode_gpu` (Scx1 sidecar shards decoded fully in VRAM, including dense ≥128-nnz rows via the BitPacker4x kernel; only indptr uploaded), `scx_device_handoff_streamed` (some shard host-bounced because it is not an Scx1 sidecar shard — a non-Scx1 codec or a sidecar-less Scx1 shard), or `scx_device_handoff` (host-assembled filtered/projected/multimodal input). If the in-VRAM decode *fails* on a request that qualified for the fast path, the call does not raise: it falls through to the host-assemble path, which reaches the same `cupyx` `X` by a different road, and records `transfer_mode="scx_device_handoff"` with `fallback_reason="gpu_runtime_error"` plus a `UserWarning` naming the device error. An out-of-memory failure is excluded — both paths end with the same CSR resident on the device, so host-assemble cannot fix a VRAM shortfall and the `>VRAM` error is raised directly instead. See **Accelerator route metadata** below.
 
   **Memory semantics.** The result is the **complete** sparse matrix in VRAM — this is not a streaming/partial representation. Sparse CSR format is preserved throughout (VRAM scales with NNZ, not N×M). Shards are decoded one at a time into pre-allocated combined device buffers; peak device memory during transfer is the combined buffer plus one shard. A **VRAM pre-flight check** (1.2× headroom factor) compares the required bytes against free device memory and raises `ValueError` if insufficient, with an actionable message pointing to `backed=True` streaming workflows. See [gpu-setup.md § GPU memory model](gpu-setup.md#gpu-memory-model) for sizing formulas.
@@ -2613,6 +2636,26 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 - `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, return scipy CSR.
 - `__getitem__(row_slice, col_slice)` — Row decode + column post-filter.
 - Supports integer, slice, boolean mask, and fancy indexing.
+- **`handle[rows]` is the bounded row gather.** A boolean mask or any 1-D
+  integer array-like (unsorted, duplicates, negative indices wrapping once) is
+  resolved in user-visible row space and gathered in request order by
+  `BackedCsrReader::read_row_indices`: each touched shard is decoded once — a
+  sparse request on a row-group-framed shard decodes only the touched row groups
+  — and the result is assembled once into exact-size buffers, so peak memory is
+  the result plus the shard cache, plus up to `cache_shards` shards decoding in
+  flight while that cache fills (at most `2 × cache_shards` decoded shards
+  beside the result), never a second copy of the result. `X[:]` and other
+  contiguous slices on a handle **without** deletion vectors go through
+  `read_rows`, which sizes the result exactly and, for a range larger than the
+  shard cache, decodes uncached in parallel chunks of `cache_shards` on top of
+  whatever the LRU already holds — `X[:]` costs what `to_memory()` costs. With
+  deletion vectors, `X[:]` is the row gather over the kept rows (still one
+  decode per shard and one assembly, but through the LRU rather than the
+  uncached bulk path). An out-of-range row, and a boolean mask whose length is
+  not the row count, raise `IndexError` (numpy's rule) rather than returning a
+  shorter matrix. Deletion vectors and column projection compose with all of
+  this. The same gather is available without an AnnData as
+  `Experiment.gather_rows_sparse`.
 
 **Aggregation (streaming, no materialization):**
 - `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums via native Rust streaming.
@@ -2645,14 +2688,15 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 - `power(n)` — Element-wise power (materializes).
 
 **Introspection:**
-- `shard_boundaries()` `→ list[(int, int)]` — List of `(row_start, row_end)` tuples per shard.
+- `shard_boundaries()` `→ list[(int, int)]` — `(row_start, row_end)` pairs in user-visible row space, one per on-disk shard that still has visible rows. **Tiling contract** (relied on by `pyscx.iter_chunks(chunk_size="shard")`): `b[0][0] == 0`, `b[-1][1] == n_obs`, and `b[i][0] == b[i-1][1]` — the pairs tile `[0, n_obs)` exactly, with no gaps or overlap. With deletion vectors the counts exclude deleted rows, and a shard whose rows are all deleted is omitted, so `len(b)` may be less than `n_shards`.
 
 ### ScxBackedLayerDataset
 
 PyO3 class for backed-mode layer access (e.g., `adata.layers["raw_counts"]`). Wraps a `ScxBackedSparseDataset` for a named layer. Registered with `anndata.abc.CSRDataset`.
 
-- Same interface as `ScxBackedSparseDataset` (`shape`, `dtype`, `format`, `backend`, `ndim`, `__getitem__`, `to_memory`, `toarray`, `tocsr`, `tocsc`, `copy`, `sum`, `mean`, `var`, `getnnz`, `max`, `min`)
+- Same interface as `ScxBackedSparseDataset` (`shape`, `dtype`, `format`, `backend`, `ndim`, `__getitem__`, `to_memory`, `toarray`, `tocsr`, `tocsc`, `copy`, `sum`, `mean`, `var`, `getnnz`, `max`, `min`, `shard_boundaries`)
 - `layer_name` `→ str` — Name of the backing layer
+- `adata.layers[name][rows]` is the same bounded row gather as on `X` (one decode per touched shard, result assembled once, `IndexError` semantics as above) — the layer's own shard family is read, so gathering counts from a layer needs no round trip through the `Experiment`.
 
 ### ScxComparisonResult
 
@@ -2680,8 +2724,9 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 - `non_negative` `→ bool` — Whether the transformed data is non-negative
 
 **Slicing:**
-- `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, apply all transforms in order, return scipy CSR. Peak memory = 1 shard.
+- `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, apply all transforms in order, return scipy CSR.
 - `__getitem__(row_slice, col_slice)` — Row decode + transform + column projection.
+- A boolean mask or integer array-like is the same bounded row gather as on `ScxBackedSparseDataset` (one decode per touched shard, result assembled once in request order, `IndexError` for out-of-range rows or a wrong-length mask), with each output row's transform parameters looked up by its global row id — duplicates and unsorted requests included.
 
 **Aggregation (streaming through transforms):**
 - `sum(axis=0|1)` `→ numpy.ndarray` — Column or row sums of transformed data.
@@ -2716,7 +2761,7 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 **Introspection:**
 - `nnz` `→ int` — Total non-zero count in backing file.
 - `n_shards` `→ int` — Number of CSR shards in backing file.
-- `shard_boundaries()` `→ list[(int, int)]` — List of `(row_start, row_end)` tuples per shard.
+- `shard_boundaries()` `→ list[(int, int)]` — Same tiling contract as `ScxBackedSparseDataset.shard_boundaries()` (user-visible row space; `b[0][0] == 0`, `b[-1][1] == n_obs`, contiguous). `pyscx.iter_chunks` uses it on a lazily transformed `X` too.
 
 **Transform chain:**
 - Backed data → `NormalizeTotal` → `Log1p` is fused into `ln(x × target_sum / row_sum + 1)` in a single pass.

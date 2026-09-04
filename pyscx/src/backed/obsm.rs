@@ -162,60 +162,13 @@ impl ScxBackedObsmDataset {
             return Ok((rows, false));
         }
 
-        // numpy array or list
-        let np = crate::pyimport::import_module(py, "numpy")?;
-        let arr = np.call_method1("asarray", (row_idx,))?;
-        // Detect boolean masks via the dtype `kind` ('b'), which is stable
-        // across numpy versions/platforms (unlike the `str(dtype)` text,
-        // which can be "bool" / "bool_" / "bool8").
-        let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
-
-        if kind == "b" {
-            // A boolean mask must be 1-D and exactly `shape[0]` long — match
-            // numpy's semantics rather than silently mis-selecting rows
-            // (a short mask would otherwise gather only its leading rows, and
-            // a 2-D mask would collapse to its first nonzero coordinate).
-            let ndim: usize = arr.getattr("ndim")?.extract()?;
-            let len: usize = arr.len()?;
-            if ndim != 1 || len != self.shape_val.0 {
-                return Err(PyIndexError::new_err(format!(
-                    "boolean index did not match indexed array along axis 0; \
-                     size of axis is {} but size of corresponding boolean axis is {}",
-                    self.shape_val.0, len
-                )));
-            }
-            let nonzero = arr.call_method0("nonzero")?;
-            let idx_tuple = nonzero.cast::<PyTuple>()?;
-            let idx_arr = idx_tuple.get_item(0)?;
-            let flat = idx_arr.call_method1("astype", (np.getattr("int64")?,))?;
-            let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
-            let slice = readonly
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            let rows = slice
-                .iter()
-                .map(|&v| self.to_global_row(v as usize))
-                .collect::<PyResult<Vec<u64>>>()?;
-            return Ok((rows, false));
-        }
-
-        let flat = arr.call_method1("astype", (np.getattr("int64")?,))?;
-        let readonly: numpy::PyReadonlyArray1<'_, i64> = flat.extract()?;
-        let slice = readonly
-            .as_slice()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let rows = slice
+        // numpy array or list — the one bool-mask / int-array resolver every
+        // handle uses (numpy's mask-length rule, negative wrap for signed
+        // arrays, unsigned bounds-checked as `uint64`), then the deletion map.
+        let visible = super::resolve_row_selector(py, row_idx, self.shape_val.0)?;
+        let rows = visible
             .iter()
-            .map(|&v| {
-                let norm = if v < 0 { n + v } else { v };
-                if norm < 0 || norm >= n {
-                    return Err(PyIndexError::new_err(format!(
-                        "row index {} out of range for {} rows",
-                        v, self.shape_val.0
-                    )));
-                }
-                self.to_global_row(norm as usize)
-            })
+            .map(|&v| self.to_global_row(v))
             .collect::<PyResult<Vec<u64>>>()?;
         Ok((rows, false))
     }
