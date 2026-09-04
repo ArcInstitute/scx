@@ -15,7 +15,7 @@ use scx_sparse::ScxCsr;
 
 use crate::backed::detached;
 use crate::backed::ScxComparisonResult;
-use crate::backed::{is_all_rows_slice, resolve_col_request, scipy_column_gather};
+use crate::backed::{is_full_slice, resolve_col_request, scipy_column_gather};
 use crate::convert::csr_to_scipy;
 
 use super::*;
@@ -177,7 +177,7 @@ impl ScxLazyTransformedDataset {
         // repeated request materialises the projected *unique* columns and
         // gathers them with scipy — peak is the result, never the whole
         // matrix. `X[:, :]` resolves to `None` and falls through.
-        if is_all_rows_slice(row_idx, self.shape_val.0)? {
+        if is_full_slice(row_idx, self.shape_val.0)? {
             if let Some(sel) = resolve_col_request(py, col_idx, self.shape_val.1)? {
                 let sel_i64: Vec<i64> = sel.iter().map(|&c| c as i64).collect();
                 let composed = crate::axis_align::compose_cols_positional(
@@ -213,12 +213,8 @@ impl ScxLazyTransformedDataset {
         let row_csr = self.getitem_rows(py, row_idx)?;
 
         // Check if col_idx is a full slice (`:`)
-        if let Ok(slice) = col_idx.cast::<PySlice>() {
-            let indices = slice.indices(self.shape_val.1 as isize)?;
-            if indices.start == 0 && indices.stop == self.shape_val.1 as isize && indices.step == 1
-            {
-                return Ok(row_csr);
-            }
+        if is_full_slice(col_idx, self.shape_val.1)? {
+            return Ok(row_csr);
         }
 
         // Apply column selection

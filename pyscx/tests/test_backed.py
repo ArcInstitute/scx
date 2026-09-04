@@ -416,8 +416,9 @@ def test_asarray_on_a_sparse_handle_raises(backed_scx, which):
 
 
 def test_cache_shards_is_readable_on_every_handle(synthetic_adata, tmp_dir):
-    """`cache_shards` is fixed per `to_anndata` call and shared by X and the
-    layers; the getter reads it back (0 is the uncached path, not clamped)."""
+    """`cache_shards` is fixed per `to_anndata` call — X and each layer get
+    their own reader, built with the same count; the getter reads it back from
+    the reader (0 is the uncached path, not clamped)."""
     import pyscx
 
     path = str(tmp_dir / "cache_shards_getter.scx")

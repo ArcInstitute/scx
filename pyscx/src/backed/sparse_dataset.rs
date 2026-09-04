@@ -593,9 +593,11 @@ impl ScxBackedSparseDataset {
                 // decoded once and projected (and row-filtered) while it is
                 // still one shard wide, then the narrow pieces are concatenated
                 // — peak = 2× the *projected* result + one shard, never the
-                // whole matrix. `as_shard_source` already folds `kept_to_global`
-                // and `col_projection`; it cannot carry `col_presentation`, so
-                // the request order is restored on the (small) result.
+                // whole matrix. `as_shard_source` folds `kept_to_global` and
+                // `col_projection`; it cannot carry `col_presentation`, so
+                // `materialize_projected` applies the permutation to each piece
+                // before concatenating (never to the concatenated result — that
+                // would hold a third result-sized buffer).
                 materialize_projected(self).map_err(|e| e.to_string())
             } else if let Some(ref kept) = self.kept_to_global {
                 // Deletion vectors: gather the kept rows rather than every row.
@@ -1654,7 +1656,7 @@ impl ScxBackedSparseDataset {
         // gathers them with scipy — peak is the result, never the whole
         // matrix. `X[:, :]` resolves to `None` and falls through to return the
         // row CSR, like `X[:]`.
-        if is_all_rows_slice(row_idx, self.shape_val.0)? {
+        if is_full_slice(row_idx, self.shape_val.0)? {
             if let Some(sel) = resolve_col_request(py, col_idx, self.shape_val.1)? {
                 let sel_i64: Vec<i64> = sel.iter().map(|&c| c as i64).collect();
                 let handle = self.subset_clone(None, Some(&sel_i64))?;
@@ -1685,12 +1687,8 @@ impl ScxBackedSparseDataset {
         let row_csr = self.getitem_rows(py, row_idx)?;
 
         // Check if col_idx is a full slice (`:`) — if so, return as-is
-        if let Ok(slice) = col_idx.cast::<PySlice>() {
-            let indices = slice.indices(self.shape_val.1 as isize)?;
-            if indices.start == 0 && indices.stop == self.shape_val.1 as isize && indices.step == 1
-            {
-                return Ok(row_csr);
-            }
+        if is_full_slice(col_idx, self.shape_val.1)? {
+            return Ok(row_csr);
         }
 
         // Apply column selection: row_csr[:, col_idx]

@@ -104,13 +104,23 @@ def test_a_warm_stored_dtype_is_stale_too(tmp_path):
     touches no section, so without its own freshness check a handle that had
     answered `uint8` kept answering it after an `append` mixed in wider shards
     — while `shape` on the same handle refused. Every sparse wrapper."""
-    scx = _fixture(tmp_path)
-    other = _fixture(tmp_path, name="other.scx")
+    # A layered copy of the fixture, so the layer wrapper is covered too.
+    X = sparse.csr_matrix(np.arange(4 * 3, dtype=np.float32).reshape(4, 3))
+    layered = anndata.AnnData(
+        X=X,
+        obs=pd.DataFrame({"grp": ["a", "b", "a", "b"]}, index=["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(3)]),
+        layers={"raw": X.copy()},
+    )
+    scx = tmp_path / "layered.scx"
+    pyscx.from_anndata(layered, str(scx))
+    other = tmp_path / "other.scx"
+    pyscx.from_anndata(layered, str(other))
     adata = pyscx.open(str(scx)).to_anndata(backed=True)
     pyscx.accel.normalize_total(adata)
     lazy = adata.X
     fresh = pyscx.open(str(scx)).to_anndata(backed=True)
-    handles = [fresh.X, fresh.X[:, [1, 0]], lazy]
+    handles = [fresh.X, fresh.X[:, [1, 0]], fresh.layers["raw"], lazy]
     for h in handles:
         assert h.stored_dtype == np.dtype("uint8")  # warm the memo
 

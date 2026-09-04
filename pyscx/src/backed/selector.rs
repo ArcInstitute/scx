@@ -227,13 +227,15 @@ pub(crate) fn scipy_column_gather<'py>(
     mat.get_item(key)
 }
 
-/// Whether `row_idx` is the full `:` over `n_obs` rows (`slice(None)`, or any
-/// slice that resolves to `0..n_obs` with step 1). The gate for `handle[:, cols]`
-/// projecting instead of reading, shared by the backed and lazy handles.
-pub(crate) fn is_all_rows_slice(row_idx: &Bound<'_, PyAny>, n_obs: usize) -> PyResult<bool> {
-    if let Ok(slice) = row_idx.cast::<PySlice>() {
-        let ind = slice.indices(n_obs as isize)?;
-        Ok(ind.start == 0 && ind.stop == n_obs as isize && ind.step == 1)
+/// Whether `idx` is the full `:` over an axis of `len` (`slice(None)`, or any
+/// slice that resolves to `0..len` with step 1). On the row axis it is the gate
+/// for `handle[:, cols]` projecting instead of reading; on the column axis it
+/// is what lets `handle[rows, :]` return the row read unchanged. Shared by the
+/// backed and lazy handles.
+pub(crate) fn is_full_slice(idx: &Bound<'_, PyAny>, len: usize) -> PyResult<bool> {
+    if let Ok(slice) = idx.cast::<PySlice>() {
+        let ind = slice.indices(len as isize)?;
+        Ok(ind.start == 0 && ind.stop == len as isize && ind.step == 1)
     } else {
         Ok(false)
     }

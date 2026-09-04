@@ -1235,7 +1235,7 @@ guard therefore takes the wrong arm, silently:
 
 ```python
 sp.issparse(adata.X)          # False  -> the usual guard takes the DENSE arm
-np.asarray(adata.X)           # TypeError: use to_memory() / toarray() / a slice
+np.asarray(adata.X)           # TypeError: use to_memory() / toarray() / a row window
 ```
 
 The dense arm is the wrong arm; the `np.asarray` it typically leads to is now
