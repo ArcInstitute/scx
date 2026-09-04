@@ -1234,9 +1234,21 @@ pub fn from_anndata_impl(
 
     // Write layers
     let layers = adata.getattr("layers")?;
-    let layer_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
+    let mut layer_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (layers.call_method0("keys")?,))?
         .extract()?;
+    if n_obs == 0 && !layer_keys.is_empty() {
+        // A layer exists on disk only as its CSR shards, and a 0-row file has
+        // none (the format forbids framed zero-row shards: "emit no shard at
+        // all instead"), so the layer's very name cannot be recorded. Say so
+        // rather than drop it silently; X's shape, obs / var, obsm / varm and
+        // uns all survive. See docs/api.md § `pyscx.from_anndata`.
+        let msg = format!(
+            "from_anndata: the AnnData has no rows; layers {layer_keys:?} exist on disk              only as CSR shards and a 0-row file has none, so they were not written.              X's shape, obs / var, obsm / varm and uns are kept."
+        );
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
+        layer_keys.clear();
+    }
     for layer_name in &layer_keys {
         let layer_x = layers.call_method1("__getitem__", (layer_name,))?;
         let (layer_csr, l_csr_validated) = ensure_csr(py, &layer_x, in_place)?;
@@ -1449,6 +1461,17 @@ fn write_raw_from_anndata(
     let Some(raw) = adata.getattr("raw").ok().filter(|r| !r.is_none()) else {
         return Ok(());
     };
+    if n_obs == 0 {
+        // Same reason as the layers: raw is recorded by its `RawCsrShard`
+        // sections (`has_raw` is derived from their presence), and a 0-row
+        // file has none. Writing `raw/var` alone would leave an orphan
+        // section behind a `has_raw() == false` header, so raw is dropped
+        // whole, with a warning.
+        let msg = "from_anndata: the AnnData has no rows; adata.raw exists on disk only                    as CSR shards and a 0-row file has none, so it was not written."
+            .to_string();
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
+        return Ok(());
+    }
 
     let raw_x = raw.getattr("X")?;
     // Read the shape off `raw.X`, NEVER off `raw`: anndata's `Raw.shape`
