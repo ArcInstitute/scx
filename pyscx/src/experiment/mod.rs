@@ -372,9 +372,27 @@ impl PyExperiment {
     }
 
     /// Read the `obs` (cell metadata) table as a pandas DataFrame **without
-    /// touching X**. Routes through `ScxReader::read_obs` (full obs) or
-    /// `read_obs_keys` (when `columns` is given), so the cost is
+    /// touching X**. Routes through `ScxReader::read_obs_filtered` (full obs)
+    /// or `read_obs_keys_filtered` (when `columns` is given), so the cost is
     /// `O(obs_metadata_bytes)`, not `O(X_bytes)`.
+    ///
+    /// **Row space.** `logical=True` (default) returns the **live** rows:
+    /// deletion vectors applied, so `len(read_obs()) == n_obs ==
+    /// len(to_anndata(backed=True).obs)`, row for row and index for index —
+    /// the same frame `query().collect()`, `gather_rows_sparse` and rscx's
+    /// `$obs()` describe. `logical=False` returns the **physical** table:
+    /// `n_obs_physical` rows with every logically deleted row still in place,
+    /// which is the row space `to_h5ad(obs_mask=)` and `mark_deleted(mask)`
+    /// take. On a file with no deletions the two are identical (and the
+    /// logical read costs no copy); `has_deletions` says whether they differ.
+    ///
+    /// **Changed in 0.17**: `read_obs()` used to return the physical table on
+    /// every file, so on a `mark_deleted` file it was longer than
+    /// `to_anndata(backed=True).obs` with no warning — pre-1.0 clean break, no
+    /// `FutureWarning` cycle. A frame computed from `read_obs()` can still be
+    /// landed positionally: `attach_obs_columns(positional=True)` and
+    /// `modify_metadata(obs=)` accept either row space (a live-length frame
+    /// leaves the deleted rows null).
     ///
     /// `columns` selects a subset by **physical** column name (matching
     /// `obs_keys()`); projecting avoids materialising unselected columns. The
@@ -391,11 +409,12 @@ impl PyExperiment {
     /// path may return pandas `category` dtype (the projection dictionary-
     /// encodes key columns), whereas the cloud `CloudExperiment.read_obs` and
     /// the unprojected `read_obs()` return `object`. Compare values, not dtype.
-    #[pyo3(signature = (columns=None))]
+    #[pyo3(signature = (columns=None, *, logical=true))]
     fn read_obs<'py>(
         &self,
         py: Python<'py>,
         columns: Option<Vec<String>>,
+        logical: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Decode off the GIL; only the pyarrow/pandas conversion needs Python.
         let reader = self.reader()?;
@@ -416,8 +435,13 @@ impl PyExperiment {
                         }
                     }
                     proj.extend(cols);
-                    reader.read_obs_keys(&proj)
+                    if logical {
+                        reader.read_obs_keys_filtered(&proj)
+                    } else {
+                        reader.read_obs_keys(&proj)
+                    }
                 }
+                None if logical => reader.read_obs_filtered(),
                 None => reader.read_obs(),
             })
             .map_err(to_pyerr)?;
@@ -524,19 +548,34 @@ impl PyExperiment {
     ///   (`from_anndata` writes dictionary-encoded shards, `append` writes plain
     ///   string shards).
     ///
-    /// **Physical row space.** `len(codes) == n_obs_physical`, *not* `n_obs`. On
-    /// a file with deletion vectors those differ, and indexing `codes` by a
-    /// logical row id addresses the wrong cell — a correctly shaped array of
-    /// wrong rows. Check `exp.n_obs == exp.n_obs_physical` before treating the
-    /// codes as logical, or filter them yourself. (`read_obs` has the same
-    /// contract, for the same reason.)
+    /// **Row space.** `logical=True` (default): one code per **live** row,
+    /// `len(codes) == n_obs`, aligned with `read_obs()` and
+    /// `to_anndata(backed=True).obs`. `logical=False`: one code per physical
+    /// row, `len(codes) == n_obs_physical`, deleted rows in place. Indexing a
+    /// physical array by a logical row id (or the reverse) addresses the wrong
+    /// cell — a correctly shaped array of wrong rows — so pick the space the
+    /// consumer indexes in; `categories` is the same either way (the filter
+    /// drops rows, never levels). Changed in 0.17: the default used to be
+    /// physical, like `read_obs()`.
     ///
     /// Raises `ValueError` for non-string columns and a corrupt-file-class error
     /// for an unknown column name.
-    fn obs_categorical<'py>(&self, py: Python<'py>, col: &str) -> PyResult<PyCategorical<'py>> {
+    #[pyo3(signature = (col, *, logical=true))]
+    fn obs_categorical<'py>(
+        &self,
+        py: Python<'py>,
+        col: &str,
+        logical: bool,
+    ) -> PyResult<PyCategorical<'py>> {
         let reader = self.reader()?;
         let (codes, categories) = py
-            .detach(|| reader.obs_categorical(col))
+            .detach(|| {
+                if logical {
+                    reader.obs_categorical_filtered(col)
+                } else {
+                    reader.obs_categorical(col)
+                }
+            })
             .map_err(to_pyerr)?;
         Ok((PyArray1::from_vec(py, codes), categories))
     }
@@ -546,15 +585,23 @@ impl PyExperiment {
     /// Returns a list of `(codes, categories)` in `cols` order. N columns cost
     /// one projected read per obs shard instead of N — the difference that
     /// matters when a catalog build resolves several covariate columns over a
-    /// many-file manifest.
+    /// many-file manifest. `logical=` as on `obs_categorical`.
+    #[pyo3(signature = (cols, *, logical=true))]
     fn obs_categorical_many<'py>(
         &self,
         py: Python<'py>,
         cols: Vec<String>,
+        logical: bool,
     ) -> PyResult<Vec<PyCategorical<'py>>> {
         let reader = self.reader()?;
         let out = py
-            .detach(|| reader.obs_categorical_many(&cols))
+            .detach(|| {
+                if logical {
+                    reader.obs_categorical_many_filtered(&cols)
+                } else {
+                    reader.obs_categorical_many(&cols)
+                }
+            })
             .map_err(to_pyerr)?;
         Ok(out
             .into_iter()

@@ -391,10 +391,15 @@ def modify_metadata(path, **kwargs):
     commit; rollback-able via `pyscx.rollback`.
 
     **Replace semantics, not merge.** A supplied `obs`/`var` fully replaces
-    the section and `num_rows` must match the file's `n_obs` / `n_vars`
-    (changing cell/gene count is out of scope — use `append` / `subset`).
-    `obsm` / `varm` replace only the named matrices. For a shallow `uns`
-    merge use `pyscx.update_uns`.
+    the section; `var` must have `n_vars` rows and `obs` either `n_obs` rows
+    (what `read_obs()` returns — the live rows; on a file with deletions the
+    frame is scattered onto the physical axis, and a deleted row keeps its
+    barcode but is `null` in every other column) or `n_obs_physical` rows
+    (what `read_obs(logical=False)` returns — every physical row, written as
+    handed in). Changing the cell/gene count is out of scope — use `append` /
+    `subset`. `obsm` / `varm` replace only the named matrices and are always
+    physical-length (a dense mapping has no `null` for a deleted row). For a
+    shallow `uns` merge use `pyscx.update_uns`.
 
     **A replaced axis keeps the predicate index it had.** The old section
     describes values that are gone, so it is rebuilt over the same columns the
@@ -412,8 +417,9 @@ def modify_metadata(path, **kwargs):
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
         uns: dict replacing the whole `uns` block.
-        obs / var: pandas `DataFrame` (or pyarrow `Table`); `num_rows` must
-            equal `n_obs` / `n_vars`.
+        obs / var: pandas `DataFrame` (or pyarrow `Table`); `var` must have
+            `n_vars` rows, `obs` either `n_obs` or `n_obs_physical` rows (see
+            above).
         obsm / varm: `dict[str, np.ndarray]` of named dense matrices.
         index_obs / index_var: obs / var column lists for the rebuilt
             predicate index (only consulted when obs/var change). Omitted,
@@ -863,11 +869,13 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
             no_unique_candidate = " " + diag["summary"]
 
     exp = _open_native(src)
-    obs = exp.read_obs()
-    # `read_obs()` returns PHYSICAL rows, which is exactly the row space
-    # `to_h5ad(obs_mask=)` wants. It also *includes* logically deleted rows, so
-    # the per-batch counts below can overcount; `to_h5ad` ANDs with the
-    # deletion keep mask, so the exports themselves stay right.
+    # PHYSICAL rows, deliberately: `to_h5ad(obs_mask=)` takes a mask in the
+    # physical row space (`n_obs_physical` long), and this frame is where each
+    # batch's mask comes from. `read_obs()` itself returns live rows since 0.17.
+    # The physical frame *includes* logically deleted rows, so the per-batch
+    # counts below can overcount; `to_h5ad` ANDs with the deletion keep mask,
+    # so the exports themselves stay right.
+    obs = exp.read_obs(logical=False)
     if batch_key not in obs.columns:
         raise ValueError(
             f"batch_key {batch_key!r} is not an obs column; columns are "
@@ -1109,15 +1117,18 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
     Joins **by key** by default, exactly as `obs_import` does: target rows the
     frame does not cover get `null`, never a fabricated `0`.
 
-    `positional=True` skips the join: row `i` of `df` annotates physical obs
-    row `i`. That is for frames computed in-process from THIS file's own
-    `read_obs()` output, which is already in physical row order (deleted rows
-    keep their place) — the shape a key join structurally cannot serve when
-    the obs index is duplicated with no unique column. External tool output
-    must never use it: a tool returns rows in its own order, and a positional
-    attach would put every value on the wrong cell while still producing a
-    correctly-shaped column. `df` must then have exactly `n_obs_physical`
-    rows, and its pandas index is ignored.
+    `positional=True` skips the join: row `i` of `df` annotates obs row `i`.
+    That is for frames computed in-process from THIS file's own `read_obs()`
+    output, which is already in obs row order — the shape a key join
+    structurally cannot serve when the obs index is duplicated with no unique
+    column. External tool output must never use it: a tool returns rows in its
+    own order, and a positional attach would put every value on the wrong cell
+    while still producing a correctly-shaped column. `df` must then have
+    either `n_obs` rows (what `read_obs()` returns: the live rows, deleted
+    rows excluded — those are left `null`) or `n_obs_physical` rows (what
+    `read_obs(logical=False)` returns: every physical row, deleted rows
+    included and written); the two coincide on a file with no deletions. Its
+    pandas index is ignored either way.
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).
@@ -1130,8 +1141,9 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
             (`"obs_names"` names the index on both sides); a list builds a
             composite key. Key columns (and the pandas index) are consumed by
             the join, not re-imported.
-        positional: Attach by physical row position instead of a key.
-            Mutually exclusive with `key`.
+        positional: Attach by row position instead of a key, in whichever
+            row space `df`'s length names (see above). Mutually exclusive
+            with `key`.
         status_column: Obs column recording "present"/"absent" per row.
             Rejected under `positional` (every row matches by construction).
         uns: JSON-serialisable payload landed in `uns` in the same commit as
@@ -1154,11 +1166,13 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
             without writing. A key-mode dry run also attaches `key_diagnosis`.
 
     Returns:
-        dict with `n_obs`, `n_matched`, `n_target_rows_absent`,
-        `n_source_rows_absent`, `obs_key_column` (`"<positional>"` under
-        `positional`), `obs_columns_added`, `obs_index_dropped`,
-        `obs_streamed`, `dry_run`, and (on a key-mode dry run)
-        `key_diagnosis`.
+        dict with `n_obs` (the physical obs axis the attach was built over),
+        `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,
+        `obs_key_column` (`"<positional>"` under `positional`),
+        `obs_columns_added`, `obs_index_dropped`, `obs_streamed`, `dry_run`,
+        and (on a key-mode dry run) `key_diagnosis`. Under a live-length
+        positional attach `n_matched` is the live row count and
+        `n_target_rows_absent` the deleted rows.
 
     Note:
         Categoricals survive: a pandas `category` column — in `df` and among
@@ -1734,9 +1748,13 @@ def doublet_consensus(target, *, keys=None, method="majority",
         # the file is not mutated between here and `modify_metadata` below.
         uns = exp.read_uns()
         uns = dict(uns) if uns else {}
-        # PHYSICAL rows — the row space `modify_metadata` validates against,
-        # and the one logically-deleted rows still occupy.
-        obs = exp.read_obs()
+        # PHYSICAL rows, deliberately: a consensus is written back positionally
+        # (`attach_obs_columns(positional=True)` / `modify_metadata(obs=)`),
+        # and both accept either row space — but only the physical frame keeps
+        # a logically-deleted row's existing votes in place; a live-length
+        # frame would null them. Reading physical keeps the output identical to
+        # what 0.16 wrote. (`read_obs()` itself returns live rows since 0.17.)
+        obs = exp.read_obs(logical=False)
 
     keys, keys_excluded, keys_are_consensus = _resolve_consensus_keys(
         obs, uns, keys, method, key_added
@@ -1880,12 +1898,13 @@ def doublet_consensus(target, *, keys=None, method="majority",
         return record
 
     # Default (first-run) path: a consensus is a pure column ADD computed from
-    # this file's own physical-row obs, so it takes the attach seam — the
+    # this file's own physical-row obs (`read_obs(logical=False)` above), so it
+    # takes the attach seam — the
     # predicate index survives untouched (nothing it covers is written), the
     # rest of uns stays byte-identical, and obs is rewritten one shard at a
     # time instead of round-tripping the whole frame through Python.
     # Positional is safe here and only here: `columns` was computed
-    # row-for-row from `read_obs()`. `existing` is empty on this branch, so
+    # row-for-row from the physical obs. `existing` is empty on this branch, so
     # every column is new and `overwrite` has nothing left to widen; True is
     # passed only so the uns re-merge of `<K>_consensus` cannot trip the
     # collision check on a rollback-then-rerun file.

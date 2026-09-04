@@ -301,11 +301,13 @@ def test_mark_deleted_through_the_handle_does_not_strand_it(tmp_path):
     scx = _fixture(tmp_path)
     exp = pyscx.open(str(scx))
     exp.mark_deleted(np.array([True, False, False, False]))
-    # `n_obs` is the live count; `read_obs` is the physical table, which a
-    # logical deletion does not rewrite. Both must simply still *work*.
+    # `n_obs` and `read_obs()` are the live count / rows; the physical table,
+    # which a logical deletion does not rewrite, is `read_obs(logical=False)`.
+    # All must simply still *work* through the re-opened handle.
     assert exp.n_obs == 3
     assert exp.n_obs_physical == 4
-    assert len(exp.read_obs()) == 4
+    assert len(exp.read_obs()) == 3
+    assert len(exp.read_obs(logical=False)) == 4
 
 
 @pytest.mark.parametrize(

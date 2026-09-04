@@ -358,8 +358,95 @@ def test_modify_metadata_obs_wrong_shape_raises(synthetic_adata, scx_from_adata)
     n = synthetic_adata.n_obs
 
     bad_obs = pd.DataFrame({"x": list(range(n - 1))})  # one row short
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="n_obs"):
         pyscx.modify_metadata(path, obs=bad_obs)
+
+
+# On a file with deletions `obs=` is accepted in either row space — the live
+# frame `read_obs()` returns (since 0.17) or the physical one
+# `read_obs(logical=False)` returns — told apart by length.
+
+
+def _deleted(synthetic_adata, scx_from_adata, name):
+    path = scx_from_adata(synthetic_adata, name)
+    pyscx.mark_deleted(path, [3, 7, 50])
+    exp = pyscx.open(path)
+    assert exp.n_obs == 97 and exp.n_obs_physical == 100, "premise"
+    return path, exp
+
+
+def test_modify_metadata_obs_accepts_the_live_frame_from_read_obs(
+    synthetic_adata, scx_from_adata
+):
+    path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_live.scx")
+    obs = exp.read_obs()
+    obs["score"] = np.arange(len(obs), dtype=np.float64)
+    physical_index_before = exp.read_obs(logical=False).index
+
+    pyscx.modify_metadata(path, obs=obs)
+
+    exp = pyscx.open(path)
+    assert exp.has_deletions and exp.n_obs == 97, "the deletion vector survives"
+    live = exp.read_obs()
+    assert live["score"].tolist() == list(range(97))
+    pd.testing.assert_index_equal(live.index, obs.index)
+    backed = exp.to_anndata(backed=True).obs
+    assert backed["score"].tolist() == list(range(97)), "aligned with the backed obs"
+
+    physical = exp.read_obs(logical=False)
+    assert len(physical) == 100
+    # Deleted rows: barcode kept, every other column null.
+    pd.testing.assert_index_equal(physical.index, physical_index_before)
+    for row in (3, 7, 50):
+        assert pd.isna(physical["score"].iloc[row])
+        assert pd.isna(physical["batch"].iloc[row])
+    assert physical["score"].iloc[4] == 3.0, "the live row after a deleted one shifts by one"
+
+    # …so the file stays joinable by its index afterwards.
+    calls = pd.DataFrame({"flag": [True] * 97}, index=live.index)
+    r = pyscx.attach_obs_columns(path, calls)
+    assert r["n_matched"] == 97 and r["n_target_rows_absent"] == 3
+
+    # And compact drops them for good.
+    out = path.replace("mm_live.scx", "mm_live_compact.scx")
+    pyscx.compact(path, out)
+    assert len(pyscx.open(out).read_obs(logical=False)) == 97
+
+
+def test_modify_metadata_obs_still_accepts_the_physical_frame(synthetic_adata, scx_from_adata):
+    path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_phys.scx")
+    obs = exp.read_obs(logical=False)
+    obs["score"] = np.arange(100, dtype=np.float64)
+
+    pyscx.modify_metadata(path, obs=obs)
+
+    exp = pyscx.open(path)
+    physical = exp.read_obs(logical=False)
+    assert physical["score"].tolist() == list(range(100)), "deleted rows written as handed in"
+    assert exp.read_obs()["score"].tolist() == [i for i in range(100) if i not in (3, 7, 50)]
+
+
+def test_modify_metadata_obs_wrong_length_on_a_deleted_file_names_both_counts(
+    synthetic_adata, scx_from_adata
+):
+    path, _ = _deleted(synthetic_adata, scx_from_adata, "mm_bad.scx")
+    for n in (96, 98):
+        with pytest.raises(ValueError) as e:
+            pyscx.modify_metadata(path, obs=pd.DataFrame({"x": list(range(n))}))
+        msg = str(e.value)
+        for needle in (f"{n} rows", "n_obs=97", "n_obs_physical=100", "read_obs()",
+                       "read_obs(logical=False)"):
+            assert needle in msg, f"{needle!r} missing from: {msg}"
+
+
+def test_modify_metadata_obsm_stays_physical_length_on_a_deleted_file(
+    synthetic_adata, scx_from_adata
+):
+    path, _ = _deleted(synthetic_adata, scx_from_adata, "mm_obsm.scx")
+    with pytest.raises(ValueError, match=r"97 rows.*n_obs_physical=100.*dense mapping"):
+        pyscx.modify_metadata(path, obsm={"X_new": np.zeros((97, 2), dtype=np.float32)})
+    pyscx.modify_metadata(path, obsm={"X_new": np.zeros((100, 2), dtype=np.float32)})
+    assert pyscx.open(path).to_anndata(backed=True).obsm["X_new"].shape == (97, 2)
 
 
 def test_modify_metadata_obs_dict_raises_typeerror(synthetic_adata, scx_from_adata):

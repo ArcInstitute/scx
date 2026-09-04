@@ -269,8 +269,7 @@ pub fn attach_obs_columns(
     if positional && key.is_some() {
         return Err(PyValueError::new_err(
             "key= and positional=True are mutually exclusive: positional means \
-             row i of df annotates physical obs row i, so there is no key to \
-             join on",
+             row i of df annotates obs row i, so there is no key to join on",
         ));
     }
     // Decided on the Python object, BEFORE normalisation: under the tagged

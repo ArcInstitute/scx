@@ -57,8 +57,8 @@ def _scx(tmp_path, adata, name="atlas.scx"):
     return str(path)
 
 
-def _obs(path):
-    return pyscx.open(path).read_obs()
+def _obs(path, *, logical=True):
+    return pyscx.open(path).read_obs(logical=logical)
 
 
 def _calls(series):
@@ -576,15 +576,20 @@ def test_a_duplicated_obs_index_survives_the_round_trip(tmp_path):
 
 
 def test_deleted_rows_keep_their_place_in_the_physical_obs(tmp_path):
-    # `read_obs` is the PHYSICAL row space and `modify_metadata` validates
-    # against it, so a file with logical deletions must round trip without a
-    # row-count error — and the surviving rows must keep their own values.
+    # The consensus reads the PHYSICAL obs (`read_obs(logical=False)`) and
+    # writes it back positionally, so a file with logical deletions round
+    # trips without a row-count error, the deleted row keeps its own vote in
+    # place, and the surviving rows keep theirs. Pinned across the 0.17 flip
+    # of `read_obs()` to live rows: the output is byte-for-byte what 0.16 wrote.
     path = _scx(tmp_path, _adata({"one": [T, F, T, F]}))
     pyscx.mark_deleted(path, [1])
 
     pyscx.doublet_consensus(path, keys=["one"], method="any")
 
-    assert len(_obs(path)) == 4
+    physical = _obs(path, logical=False)
+    assert len(physical) == 4
+    assert list(physical["doublet_predicted"]) == [T, F, T, F], "the deleted row is written too"
+    assert len(_obs(path)) == 3, "read_obs() itself is the live frame"
     adata = pyscx.open(path).to_anndata()
     assert adata.n_obs == 3
     assert list(adata.obs["doublet_predicted"]) == [T, T, F]

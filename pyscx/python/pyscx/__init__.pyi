@@ -854,9 +854,21 @@ class Experiment:
         """
         ...
 
-    def read_obs(self, columns: list[str] | None = ...) -> Any:
+    def read_obs(
+        self, columns: list[str] | None = ..., *, logical: bool = ...
+    ) -> Any:
         """Read obs (optionally a column projection) as a pandas DataFrame,
-        without materializing X. `columns=None` reads the full obs table."""
+        without materializing X. `columns=None` reads the full obs table.
+
+        `logical=True` (default) returns the **live** rows — deletion vectors
+        applied, so `len(read_obs()) == n_obs == len(to_anndata(backed=True).obs)`
+        row for row. `logical=False` returns the physical table:
+        `n_obs_physical` rows, deleted rows in place (the row space
+        `to_h5ad(obs_mask=)` and `mark_deleted(mask)` take). Identical on a
+        file without deletions. Changed in 0.17: the default used to be the
+        physical table on every file. A frame computed from `read_obs()` can
+        still be landed with `attach_obs_columns(positional=True)` or
+        `modify_metadata(obs=)`, which accept either row space."""
         ...
 
     def read_var(
@@ -883,7 +895,9 @@ class Experiment:
         `(values, has_more)`. Never decodes X."""
         ...
 
-    def obs_categorical(self, col: str) -> tuple[np.ndarray, list[str]]:
+    def obs_categorical(
+        self, col: str, *, logical: bool = ...
+    ) -> tuple[np.ndarray, list[str]]:
         """`(codes, categories)` for a string/categorical obs column.
 
         `codes` is `int32`, one entry per obs row, `-1` for missing
@@ -895,19 +909,23 @@ class Experiment:
         dictionary levels are retained (as pandas retains unused levels).
         Raises `ValueError` for non-string columns.
 
-        Physical row space: `len(codes) == n_obs_physical`, not `n_obs`. On a
-        file with deletion vectors those differ and indexing by a logical row id
-        addresses the wrong cell (`read_obs` has the same contract).
+        Row space: `logical=True` (default) gives one code per live row
+        (`len(codes) == n_obs`, aligned with `read_obs()`); `logical=False`
+        one per physical row (`n_obs_physical`, deleted rows in place).
+        Indexing one space by the other's row ids addresses the wrong cell.
+        `categories` is the same either way. Changed in 0.17: the default
+        used to be physical, like `read_obs()`.
         """
         ...
 
     def obs_categorical_many(
-        self, cols: list[str]
+        self, cols: list[str], *, logical: bool = ...
     ) -> list[tuple[np.ndarray, list[str]]]:
         """`obs_categorical` for several columns in one shard pass.
 
         Returns `(codes, categories)` per column in `cols` order. N columns
-        cost one projected read per obs shard instead of N."""
+        cost one projected read per obs shard instead of N. `logical=` as on
+        `obs_categorical`."""
         ...
 
     def info(self) -> str:
@@ -1296,7 +1314,11 @@ class CloudExperiment:
     """Cloud-hosted SCX handle. Returned by `pyscx.open_cloud(url)`."""
 
     @property
-    def n_obs(self) -> int: ...
+    def n_obs(self) -> int:
+        """Live row count (header `n_obs` minus deleted rows), like the local
+        `Experiment.n_obs`; one small section read on a file with deletions.
+        Changed in 0.17: was the physical header count."""
+        ...
     @property
     def n_vars(self) -> int: ...
     @property
@@ -1322,9 +1344,14 @@ class CloudExperiment:
     def obs_keys(self) -> list[str]: ...
     def var_keys(self) -> list[str]: ...
 
-    def read_obs(self, columns: list[str] | None = ...) -> Any:
+    def read_obs(
+        self, columns: list[str] | None = ..., *, logical: bool = ...
+    ) -> Any:
         """Read obs as a pandas DataFrame over the cloud path.
 
+        `logical=True` (default) returns the live rows (deletion vectors
+        applied, `len == n_obs`); `logical=False` the physical table — the
+        same contract as `Experiment.read_obs`, changed in 0.17 alongside it.
         `columns` is a genuine pushdown: each obs shard is fetched as a
         projected range read, so the network cost is the requested columns'
         bytes rather than the whole obs body. The pandas index column is always
@@ -1353,14 +1380,17 @@ class CloudExperiment:
         `(values, has_more)`. Mirrors `Experiment.distinct_values`."""
         ...
 
-    def obs_categorical(self, col: str) -> tuple[np.ndarray, list[str]]:
+    def obs_categorical(
+        self, col: str, *, logical: bool = ...
+    ) -> tuple[np.ndarray, list[str]]:
         """`(codes, categories)` over the cloud path. Mirrors
         `Experiment.obs_categorical` — same `-1`-for-null, first-seen-order and
-        unreferenced-level semantics. Never fetches the full obs body."""
+        unreferenced-level semantics, same `logical=` row space. Never fetches
+        the full obs body."""
         ...
 
     def obs_categorical_many(
-        self, cols: list[str]
+        self, cols: list[str], *, logical: bool = ...
     ) -> list[tuple[np.ndarray, list[str]]]:
         """`obs_categorical` for several columns in one pass over the obs
         shards. Mirrors `Experiment.obs_categorical_many`."""
