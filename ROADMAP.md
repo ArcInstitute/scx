@@ -542,6 +542,7 @@ full scverse pipeline works via AnnData from the format / codec / bridge work.
 - [x] Streaming preprocessing pipeline (`pyscx.preprocess`, `pyscx.save_layer`)
 - [x] Chunk iterator (`pyscx.iter_chunks`) — shard-aligned on plain, layer and lazily transformed `X`
 - [x] Bounded row gather (REC-1): `handle[rows]` / `handle[:]` / `Experiment.gather_rows_sparse(layer=, logical=)` assemble the result once — peak = result + the shard cache + up to `cache_shards` shards decoding in flight (a warm gather or a bulk `handle[:]` on a full cache holds at most 2 × `cache_shards` decoded shards beside the result; it was a second copy of the result). `gather_rows_sparse` defaults to logical rows since 0.17
+- [x] Handle selectors and introspection (REC-7): every column selector form (`int`, `list`, `range`, `slice`, any-order ndarray, mask) on `X` / a layer / a lazy `X` returns a projected handle with no decode (repeats materialise the projected unique columns, never the whole matrix; a layer keeps its wrapper); `np.asarray(handle)` raises `TypeError` instead of returning a 0-d object array; `stored_dtype` / `cache_shards` on the handles and `Experiment.value_encoding` / `is_integer` / `max_value` (+ `info()` tokens) report what is on disk without decoding. Not done: a gather-capable presentation (which would let `X[:, [3, 1, 3]]` be a handle); cloud `Experiment` getters for the three
 - [x] Selective loading (`var_names`, `obs_filter`, `layers` parameters)
 
 ### 4b. Rust-Native Accelerators — COMPLETE

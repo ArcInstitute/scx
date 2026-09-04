@@ -185,6 +185,13 @@ normalized values in a layer.
 Zstd (codec_id = 2) or Pcodec (codec_id = 4) because float values do not
 follow the geometric distribution.
 
+The `Encoding` column is the numpy dtype name (`ValueEncoding::numpy_name`),
+which is how the encoding is reported everywhere: `scx info` (`Value encoding:
+uint16` / `mixed (uint8, uint16)`), `pyscx.open(path).value_encoding` /
+`.is_integer`, and a backed handle's `stored_dtype` (`numpy.dtype("uint16")`;
+the widest when shards mix). None of these decode values — the encoding is
+read from each shard header.
+
 ## 7. LZ4+Shuffle (codec_id = 3)
 
 Applies a byte-shuffle pre-filter before LZ4 frame compression. Effective on

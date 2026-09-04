@@ -1230,18 +1230,22 @@ True for all four handle classes — `ScxBackedSparseDataset`,
 
 **Do not reach for `scipy.sparse.issparse` here.** It returns `False` for a
 handle and cannot be made to return `True`: scipy's `sparray` / `spmatrix` are
-concrete classes rather than ABCs, so there is no `register()` seam. Two
-consequences, neither of which raises:
+concrete classes rather than ABCs, so there is no `register()` seam. The usual
+guard therefore takes the wrong arm, silently:
 
 ```python
 sp.issparse(adata.X)          # False  -> the usual guard takes the DENSE arm
-np.asarray(adata.X).shape     # ()     -> a 0-d object array, not an error
+np.asarray(adata.X)           # TypeError: use to_memory() / toarray() / a slice
 ```
 
-The dense arm is the wrong arm, and the 0-d array surfaces as an unrelated
-failure much later ("setting an array element with a sequence"). Slicing a
-handle *does* yield genuine scipy sparse, so `sp.issparse(adata.X[0:10])` is
-`True` — test the slice, or use this predicate on the matrix.
+The dense arm is the wrong arm; the `np.asarray` it typically leads to is now
+a loud `TypeError` on the three sparse handles rather than the 0-d object array
+it used to return (which surfaced much later as "setting an array element with
+a sequence") — decoding an atlas because a guard misrouted is the worse
+failure. The dense `ScxBackedObsmDataset` still materialises under
+`np.asarray`. Slicing a handle *does* yield genuine scipy sparse, so
+`sp.issparse(adata.X[0:10])` is `True` — test the slice, or use this predicate
+on the matrix.
 
 ### Indexing patterns
 
@@ -1252,8 +1256,11 @@ handle *does* yield genuine scipy sparse, so `sp.issparse(adata.X[0:10])` is
 | `X[mask]` | Boolean mask (length must equal `n_obs`) → one decode per touched shard, result assembled once; peak memory = result + the shard cache + up to `cache_shards` shards decoding in flight while it fills (never a second copy of the result) |
 | `X[:]` | Whole matrix → exact-size result; without deletion vectors the shards decode uncached in parallel (costs what `to_memory()` costs), with deletion vectors it is the row gather over the kept rows |
 | `X[100:200, :500]` | Row slice + column filter → 1 shard + post-filter |
-| `X[:, hvg_idx]` | Column-only → must decode all shards (CSR is row-major) |
+| `X[:, hvg_idx]` / `X[:, mask]` | Column projection → a new **handle**, no decode; the projection is applied shard by shard on later reads / aggregations |
+| `X[:, 5]` / `X[:, [7, 2, 11]]` / `X[:, 10:20]` | Same — `int`, `list`, `range`, `slice` and any-order ndarray all project; a reordered request keeps its order (`sum(axis=0)` too). Before 0.17 these decoded the whole matrix |
+| `X[:, [3, 1, 3]]` | Repeated columns → scipy built from the 2 projected columns, never the whole matrix (a lazily transformed `X` does the same for any reorder) |
 | `X[0, 5]` | Scalar → returns `float` |
+| `X[:, [0, 10**9]]` / `X[:, np.array([1.5])]` | Out-of-range or float column selector → `IndexError` (float used to slip through and decode everything) |
 | `X[[0, 10**9]]` | Out-of-range row → `IndexError` (never a shorter matrix) |
 
 The same rows are reachable without an AnnData through
@@ -1371,7 +1378,22 @@ adata = pyscx.open("atlas.scx").to_anndata(backed=True, cache_shards=16)
 
 # No cache (minimum memory footprint)
 adata = pyscx.open("atlas.scx").to_anndata(backed=True, cache_shards=0)
+
+# Read the setting back — it is fixed per to_anndata() call (there is no
+# cache_shards on pyscx.open) and shared by X and every layer handle
+adata.X.cache_shards            # 0
+adata.layers["counts"].cache_shards
 ```
+
+`cache_shards=0` is a true uncached read: every access decodes afresh and
+retains nothing, so the streaming footprint is one shard plus the result.
+`IndexPlanDataset(cache_shards=0)` is different — it raises on purpose, because
+the training loader's prefetcher needs a cache to prefetch into.
+
+While you are inspecting a handle: `adata.X.stored_dtype` is the on-disk value
+encoding (`uint16` for counts, `float32` after normalisation was saved), and
+`pyscx.open(path).is_integer` / `.max_value` answer "are these counts, and how
+large?" from the shard headers and catalog stats without decoding a value.
 
 ### Comparison with h5ad backed mode
 
