@@ -581,7 +581,10 @@ impl BackedCsrReader {
     /// full shards than the LRU holds, e.g. `X[:]` — would only thrash it, so
     /// resident shards are copied from the cache and every other shard is
     /// decoded *uncached*, in parallel chunks of `cache_shards`, copied out and
-    /// dropped, and the LRU is left as it was (the same contract as `read_all`).
+    /// dropped. The LRU keeps exactly the entries it had (nothing inserted,
+    /// nothing evicted — `read_all` also adds nothing), though the resident
+    /// shards this read copies are promoted to most-recently-used, as any hit
+    /// is.
     /// Peak = result + up to `cache_shards` shards decoding in flight, **on top
     /// of** whatever the LRU already holds (itself capped at `cache_shards`) —
     /// so at most `2 × cache_shards` decoded shards beside the result when the

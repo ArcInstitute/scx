@@ -1223,8 +1223,9 @@ fn read_row_indices_rejects_a_shard_whose_header_underreports_rows() {
 
 /// A bulk `read_rows` — more full-path shards than the LRU holds — copies the
 /// shards that are already resident out of the cache and decodes the rest
-/// *uncached*, leaving the LRU exactly as it found it: no evictions, no new
-/// entries, and a later small read of the resident range still hits. Before
+/// *uncached*, keeping the LRU's entries as they were: no evictions, no new
+/// entries (the copied residents are promoted, as any hit is), and a later
+/// small read of the resident range still hits. Before
 /// PR C the single up-front warm (truncated to `cache_shards`) evicted the
 /// resident shards and the gather loop decoded them again.
 #[test]
@@ -1336,6 +1337,52 @@ fn read_rows_rejects_a_catalog_gap() {
     // Ranges inside a covered shard still read.
     assert_eq!(backed.read_rows(0, 4).unwrap().n_rows(), 4);
     assert_eq!(backed.read_rows(9, 12).unwrap().n_rows(), 3);
+}
+
+/// A gap and an overlap of equal size sum to the requested row count, so a
+/// length-only tiling check accepts them; the positional check does not.
+/// Shards `0..4`, `6..10`, `8..12` on a 12-row file: rows 4..6 are nobody's and
+/// rows 8..10 are two shards'.
+#[test]
+fn read_rows_rejects_an_equal_gap_and_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap_overlap.scx");
+    let n_vars = 10usize;
+    let header = sample_header(12, n_vars as u64, 24);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(12)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    for row_start in [0u64, 6, 8] {
+        let (indptr, indices, values) = sample_shard_data(4, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    // Window lengths 4 + 4 + 4 == 12 requested rows — only position tells.
+    let err = backed
+        .read_rows(0, 12)
+        .expect_err("an equal gap and overlap must not pass as a tiling");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("previous shard ended at 4"),
+        "{err}"
+    );
+    // A range inside one shard, or across the overlap-free prefix, still reads.
+    assert_eq!(backed.read_rows(0, 4).unwrap().n_rows(), 4);
+    assert_eq!(backed.read_rows(1, 3).unwrap().n_rows(), 2);
 }
 
 /// `BackedCsrReader::new` on a multimodal file indexes every modality's shards
