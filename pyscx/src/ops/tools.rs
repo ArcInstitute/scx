@@ -157,10 +157,7 @@ pub fn cellbender_import(
             format!("{:?}", s.column_axis_match).to_lowercase(),
         )?;
         d.set_item("layer_nnz", s.layer_nnz)?;
-        d.set_item(
-            "value_encoding",
-            format!("{:?}", s.value_encoding).to_lowercase(),
-        )?;
+        d.set_item("value_encoding", s.value_encoding.numpy_name())?;
         d.set_item("obs_columns_added", s.obs_columns_added)?;
         d.set_item("var_columns_added", s.var_columns_added)?;
         d.set_item("obsm_keys_added", s.obsm_keys_added)?;

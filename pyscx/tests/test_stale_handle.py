@@ -99,6 +99,40 @@ def test_a_scalar_read_is_stale_too(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_a_warm_stored_dtype_is_stale_too(tmp_path):
+    """`stored_dtype` folds every shard header once and memoises. The memo hit
+    touches no section, so without its own freshness check a handle that had
+    answered `uint8` kept answering it after an `append` mixed in wider shards
+    — while `shape` on the same handle refused. Every sparse wrapper."""
+    # A layered copy of the fixture, so the layer wrapper is covered too.
+    X = sparse.csr_matrix(np.arange(4 * 3, dtype=np.float32).reshape(4, 3))
+    layered = anndata.AnnData(
+        X=X,
+        obs=pd.DataFrame({"grp": ["a", "b", "a", "b"]}, index=["AAAC-1", "AAAG-1", "AAAT-1", "AAAA-1"]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(3)]),
+        layers={"raw": X.copy()},
+    )
+    scx = tmp_path / "layered.scx"
+    pyscx.from_anndata(layered, str(scx))
+    other = tmp_path / "other.scx"
+    pyscx.from_anndata(layered, str(other))
+    adata = pyscx.open(str(scx)).to_anndata(backed=True)
+    pyscx.accel.normalize_total(adata)
+    lazy = adata.X
+    fresh = pyscx.open(str(scx)).to_anndata(backed=True)
+    handles = [fresh.X, fresh.X[:, [1, 0]], fresh.layers["raw"], lazy]
+    for h in handles:
+        assert h.stored_dtype == np.dtype("uint8")  # warm the memo
+
+    pyscx.append(str(scx), str(other))
+
+    for h in handles:
+        with pytest.raises(RuntimeError, match=STALE):
+            h.stored_dtype
+        # The setting is a handle property, not a file answer: still readable.
+        assert isinstance(h.cache_shards, int)
+
+
 def test_compact_in_place_replaces_the_inode_under_an_open_handle(tmp_path):
     """`compact` writes a temp file and renames it over the target.
 
@@ -422,6 +456,10 @@ _EXPERIMENT_CALLS = {
     "index_dtype": lambda e: e.index_dtype,
     "has_csc": lambda e: e.has_csc,
     "has_deletions": lambda e: e.has_deletions,
+    # shard-header / catalog folds — still through `reader()`, so they refuse too
+    "value_encoding": lambda e: e.value_encoding,
+    "is_integer": lambda e: e.is_integer,
+    "max_value": lambda e: e.max_value,
     "is_multimodal": lambda e: e.is_multimodal,
     "n_modalities": lambda e: e.n_modalities,
     "modality_names": lambda e: e.modality_names,

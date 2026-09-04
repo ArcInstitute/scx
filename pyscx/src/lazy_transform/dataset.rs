@@ -957,6 +957,36 @@ impl ScxLazyTransformedDataset {
         self.backed.index().n_shards()
     }
 
+    /// The on-disk encoding of the *source* matrix, before the transforms
+    /// (`normalize_total` / `log1p` produce floats on read regardless) — see
+    /// `ScxBackedSparseDataset.stored_dtype`.
+    #[getter]
+    fn stored_dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::backed::stored_dtype_object(py, &self.backed)
+    }
+
+    /// The decoded-shard LRU size of the reader this handle shares with the
+    /// `ScxBackedSparseDataset` it was derived from; `0` = no cache.
+    #[getter]
+    fn cache_shards(&self) -> usize {
+        self.backed.cache_shards()
+    }
+
+    /// Refused, as on `ScxBackedSparseDataset`: the transforms would have to
+    /// run over the whole matrix to answer.
+    #[pyo3(signature = (dtype=None, copy=None))]
+    fn __array__<'py>(
+        &self,
+        _py: Python<'py>,
+        dtype: Option<Bound<'py, PyAny>>,
+        copy: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let _ = (dtype, copy);
+        Err(crate::backed::no_implicit_array_error(
+            "ScxLazyTransformedDataset",
+        ))
+    }
+
     /// Return shard boundaries as a list of (row_start, row_end) tuples.
     ///
     /// Same tiling contract as `ScxBackedSparseDataset::shard_boundaries`:

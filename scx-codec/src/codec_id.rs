@@ -124,6 +124,43 @@ impl ValueEncoding {
         matches!(self, Self::Uint8 | Self::Uint16 | Self::Uint32)
     }
 
+    /// The numpy dtype name of this encoding — `"uint8"`, `"uint16"`,
+    /// `"uint32"`, `"float32"` or `"float16"`. Every variant is a valid
+    /// `numpy.dtype(...)` argument, so this is the one rendering shared by
+    /// `scx info`, pyscx's `stored_dtype` / `Experiment.value_encoding` and the
+    /// ops summaries (`value_encoding_name` in `scx-cli` and a
+    /// `format!("{:?}").to_lowercase()` in pyscx used to carry their own copies).
+    pub fn numpy_name(&self) -> &'static str {
+        match self {
+            Self::Uint8 => "uint8",
+            Self::Uint16 => "uint16",
+            Self::Uint32 => "uint32",
+            Self::Float32 => "float32",
+            Self::Float16 => "float16",
+        }
+    }
+
+    /// The one encoding that describes a whole shard family, for **reporting**.
+    ///
+    /// `None` when there are no shards. A uniform family reports its own
+    /// encoding (`Float16` stays `Float16`); a mixed one reports the widest:
+    /// any float present ⇒ `Float32`, otherwise the widest integer.
+    ///
+    /// This is deliberately not `scx_ops`' `widest_value_encoding`, which picks
+    /// an encoding to *write* into and therefore widens every float source to
+    /// `Float32` even when all inputs are `Float16` — the conservative answer
+    /// for a writer, and the wrong one for a reader describing what is on disk.
+    pub fn widest(encs: &[ValueEncoding]) -> Option<ValueEncoding> {
+        let first = *encs.first()?;
+        if encs.iter().all(|&e| e == first) {
+            return Some(first);
+        }
+        if encs.iter().any(|e| !e.is_integer()) {
+            return Some(Self::Float32);
+        }
+        encs.iter().copied().max_by_key(|e| e.byte_width())
+    }
+
     /// Encode a single f32 value to raw LE bytes, with range checking.
     ///
     /// This is the inverse of `values_raw_to_f32` for one element.
@@ -325,3 +362,60 @@ pub enum ShardValuesNative {
 /// A shard decoded to native types: `i64` indptr, `u32` indices, and
 /// [`ShardValuesNative`] values.
 pub type NativeShard = (Vec<i64>, Vec<u32>, ShardValuesNative);
+
+#[cfg(test)]
+mod value_encoding_tests {
+    use super::ValueEncoding;
+
+    #[test]
+    fn numpy_name_is_a_valid_numpy_dtype_for_every_variant() {
+        let all = [
+            ValueEncoding::Uint8,
+            ValueEncoding::Uint16,
+            ValueEncoding::Uint32,
+            ValueEncoding::Float32,
+            ValueEncoding::Float16,
+        ];
+        let names: Vec<&str> = all.iter().map(|e| e.numpy_name()).collect();
+        assert_eq!(names, ["uint8", "uint16", "uint32", "float32", "float16"]);
+        // Round-trips through the byte code, so the two tables cannot drift.
+        for e in all {
+            assert_eq!(ValueEncoding::from_u8(e as u8), Some(e));
+        }
+    }
+
+    #[test]
+    fn widest_reports_uniform_families_as_themselves() {
+        assert_eq!(ValueEncoding::widest(&[]), None);
+        assert_eq!(
+            ValueEncoding::widest(&[ValueEncoding::Uint16, ValueEncoding::Uint16]),
+            Some(ValueEncoding::Uint16)
+        );
+        // A uniform half-precision family is reported as such — the write-side
+        // fold would say Float32 here, which is the distinction this test pins.
+        assert_eq!(
+            ValueEncoding::widest(&[ValueEncoding::Float16, ValueEncoding::Float16]),
+            Some(ValueEncoding::Float16)
+        );
+    }
+
+    #[test]
+    fn widest_mixed_family_is_the_widest_integer_or_float32() {
+        assert_eq!(
+            ValueEncoding::widest(&[
+                ValueEncoding::Uint8,
+                ValueEncoding::Uint32,
+                ValueEncoding::Uint16
+            ]),
+            Some(ValueEncoding::Uint32)
+        );
+        assert_eq!(
+            ValueEncoding::widest(&[ValueEncoding::Uint8, ValueEncoding::Float16]),
+            Some(ValueEncoding::Float32)
+        );
+        assert_eq!(
+            ValueEncoding::widest(&[ValueEncoding::Float32, ValueEncoding::Float16]),
+            Some(ValueEncoding::Float32)
+        );
+    }
+}

@@ -521,6 +521,24 @@ impl ScxLazyTransformedDataset {
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
     pub(crate) fn materialize_csr(&self) -> Result<ScxCsr, String> {
+        if self.col_projection.is_some() {
+            // A projected handle assembles shard by shard: `LazyShardSource`
+            // decodes one shard, applies the transforms, projects the columns
+            // and drops deleted rows while it is still one shard wide, and the
+            // narrow pieces are concatenated — peak = 2× the *projected* result
+            // + one shard, never the whole matrix (the unprojected path below
+            // holds every transformed shard before filtering). Sequential on
+            // purpose: decoding in parallel would hold every shard at once.
+            use scx_format_io::ShardSource;
+            let source = self.as_shard_source();
+            let n_vars = source.n_vars();
+            let mut pieces = Vec::with_capacity(source.n_shards());
+            for shard_idx in 0..source.n_shards() {
+                pieces.push(source.read_shard(shard_idx).map_err(|e| e.to_string())?);
+            }
+            return Ok(concatenate_csr_vec(&pieces, n_vars));
+        }
+
         let mut global_row = 0usize;
         let mut all_slices = Vec::new();
 

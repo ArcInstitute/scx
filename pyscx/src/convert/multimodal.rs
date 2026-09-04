@@ -61,7 +61,7 @@ pub fn build_backed_anndata_for_modality<'py>(
         None
     };
 
-    let mut x_dataset = ScxBackedSparseDataset::from_reader(Arc::clone(&backed_csr), cache_shards);
+    let mut x_dataset = ScxBackedSparseDataset::from_reader(Arc::clone(&backed_csr));
     x_dataset.with_csc_reader(backed_csc);
     x_dataset.with_modality_id(modality_id);
     x_dataset.with_source_path(path);

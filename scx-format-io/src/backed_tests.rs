@@ -3893,3 +3893,262 @@ fn a_reader_without_a_pool_keeps_using_the_global_one() {
         assert_eq!(out[i].1, expected.data, "row {row} data");
     }
 }
+
+// ---------------------------------------------------------------------------
+// stored_value_encoding / cache_shards (REC-7, PR D)
+// ---------------------------------------------------------------------------
+
+/// Write a `CodecId::None` file whose X shards carry the given value encodings
+/// one shard each (4 rows per shard), plus an optional layer with its own
+/// per-shard encodings. Values are the u8 sample data re-encoded to the
+/// requested width, so every encoding holds them exactly.
+fn write_encoded_file(
+    dir: &TempDir,
+    name: &str,
+    x_encodings: &[ValueEncoding],
+    layer: Option<(&str, &[ValueEncoding])>,
+) -> std::path::PathBuf {
+    let n_vars = 8usize;
+    let rows_per_shard = 4usize;
+    let n_obs = rows_per_shard * x_encodings.len().max(1);
+    let path = dir.path().join(name);
+    let header = sample_header(n_obs as u64, n_vars as u64, (n_obs * 2) as u64);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    for (s, &enc) in x_encodings.iter().enumerate() {
+        let (indptr, indices, values_u8) = sample_shard_data(rows_per_shard, n_vars);
+        let values_f32: Vec<f32> = values_u8.iter().map(|&v| v as f32).collect();
+        let bytes = enc.encode_f32_batch(&values_f32).unwrap();
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &bytes,
+                CodecId::None,
+                enc,
+                (s * rows_per_shard) as u64,
+            )
+            .unwrap();
+    }
+    if let Some((layer_name, encs)) = layer {
+        for (s, &enc) in encs.iter().enumerate() {
+            let (indptr, indices, values_u8) = sample_shard_data(rows_per_shard, n_vars);
+            let values_f32: Vec<f32> = values_u8.iter().map(|&v| v as f32).collect();
+            let bytes = enc.encode_f32_batch(&values_f32).unwrap();
+            let shard = ShardBuffers::new(&indptr, &indices, &bytes, CodecId::None, enc);
+            writer
+                .write_layer_csr_shard(layer_name, s as u32, (s * rows_per_shard) as u64, shard)
+                .unwrap();
+        }
+    }
+    writer.finish().unwrap();
+    path
+}
+
+#[test]
+fn stored_value_encoding_uniform_family_reports_itself() {
+    let dir = TempDir::new().unwrap();
+    let path = write_encoded_file(
+        &dir,
+        "u16.scx",
+        &[ValueEncoding::Uint16, ValueEncoding::Uint16],
+        None,
+    );
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint16)
+    );
+    // Second call is served from the memo and agrees.
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint16)
+    );
+    // A uniform float16 family is float16, not the write-side "any float ⇒ f32".
+    let path = write_encoded_file(&dir, "f16.scx", &[ValueEncoding::Float16], None);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Float16)
+    );
+}
+
+#[test]
+fn stored_value_encoding_mixed_family_reports_the_widest() {
+    let dir = TempDir::new().unwrap();
+    let path = write_encoded_file(
+        &dir,
+        "mixed_int.scx",
+        &[
+            ValueEncoding::Uint8,
+            ValueEncoding::Uint16,
+            ValueEncoding::Uint8,
+        ],
+        None,
+    );
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint16)
+    );
+
+    let path = write_encoded_file(
+        &dir,
+        "mixed_float.scx",
+        &[ValueEncoding::Uint8, ValueEncoding::Float16],
+        None,
+    );
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Float32)
+    );
+}
+
+#[test]
+fn stored_value_encoding_layer_reader_reports_the_layers_family() {
+    let dir = TempDir::new().unwrap();
+    let path = write_encoded_file(
+        &dir,
+        "layer.scx",
+        &[ValueEncoding::Uint8, ValueEncoding::Uint8],
+        Some(("norm", &[ValueEncoding::Float32, ValueEncoding::Float32])),
+    );
+    let x = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        x.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint8)
+    );
+    let layer = BackedCsrReader::new_for_layer(ScxReader::open(&path).unwrap(), "norm", 4);
+    assert_eq!(
+        layer.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Float32),
+        "a layer reader must fold the layer's shards, not X's"
+    );
+}
+
+#[test]
+fn stored_value_encoding_for_modality_reader_is_scoped() {
+    use crate::modality::ModalityType;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mm_enc.scx");
+    let n_obs: u64 = 4;
+    let header = sample_header(n_obs, 4, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let atac_id = writer
+        .add_modality(
+            "atac",
+            ModalityType::Atac,
+            CodecId::None,
+            ValueEncoding::Uint32,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(4)).unwrap();
+    writer.write_var_for(atac_id, &sample_var(4)).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(atac_id, 4).unwrap();
+    let indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
+    let indices: Vec<u32> = vec![0, 1, 2, 3];
+    let values_u8: Vec<u8> = vec![1, 2, 3, 4];
+    let values_u32 = ValueEncoding::Uint32
+        .encode_f32_batch(&[1.0, 2.0, 3.0, 4.0])
+        .unwrap();
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values_u8,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer
+        .write_csr_shard_for(
+            atac_id,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values_u32,
+                CodecId::None,
+                ValueEncoding::Uint32,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let rna = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), rna_id, 4);
+    let atac = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), atac_id, 4);
+    let all = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        rna.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint8)
+    );
+    assert_eq!(
+        atac.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint32)
+    );
+    // The unscoped reader folds every modality's shards.
+    assert_eq!(
+        all.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint32)
+    );
+}
+
+#[test]
+fn cache_shards_reports_the_requested_count_including_zero() {
+    let dir = TempDir::new().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 20, 8, 4, 0);
+    assert_eq!(
+        backed.cache_shards(),
+        0,
+        "0 is 'no cache', not clamped to 1"
+    );
+    let dir2 = TempDir::new().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir2, 20, 8, 4, 4);
+    assert_eq!(backed.cache_shards(), 4);
+}
+
+#[test]
+fn stored_value_encoding_refuses_on_a_watched_reader_once_the_file_changed() {
+    let dir = TempDir::new().unwrap();
+    let path = write_encoded_file(&dir, "watched.scx", &[ValueEncoding::Uint8], None);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap().watching().unwrap(), 4);
+    // Warm the memo.
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint8)
+    );
+    // Replace the file (new inode, as a copy-out op does) with a wider family.
+    let newer = write_encoded_file(&dir, "newer.scx", &[ValueEncoding::Uint16], None);
+    std::fs::rename(&newer, &path).unwrap();
+    let err = backed
+        .stored_value_encoding()
+        .expect_err("a warm memo must not answer for a file that changed underneath");
+    assert!(
+        matches!(err, ScxError::FileChangedOnDisk { .. }),
+        "expected FileChangedOnDisk, got {err:?}"
+    );
+    // A fresh reader sees the new family.
+    let fresh = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        fresh.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint16)
+    );
+}

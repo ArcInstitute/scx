@@ -980,6 +980,8 @@ will still raise); the guarantee covers pyscx's own entry points.
 ## BackedCsrReader (`scx-format-io/src/backed/csr.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
+- `cache_shards()` → `usize` — The requested LRU count cap this reader was built with (`0` = no cache; the cache clamps its own capacity to ≥ 1 internally). Read back by the pyscx handles' `cache_shards` getter.
+- `stored_value_encoding()` → `Result<Option<ValueEncoding>>` — The on-disk value encoding of this reader's shard family (X, the layer, or the modality it is scoped to — it walks the same `shard_entry` table every read does): one 76-byte header read per shard, no payload decode, memoised. A uniform family reports its own encoding; a mixed one the widest via `ValueEncoding::widest` (any float ⇒ `Float32`, else the widest integer); `None` for no shards. The encoding lives only in the shard header — `ShardStats` has no encoding field, and a `value_max` of 0 cannot tell a float shard from an all-zero one — so this is the one place a caller learns whether the stored values are integer counts without decoding.
 - `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards`, keeping the LRU's entries as they were (the residents it copies are promoted, as any hit is) — peak = result + up to `cache_shards` shards in flight, on top of whatever the LRU already holds (itself capped at `cache_shards`). `end > n_obs` is an error, and so is a catalog whose shards do not tile the range exactly (a gap, or the overlapping modalities of an unscoped reader on a multimodal file).
 - `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + the shard cache + up to `cache_shards` shards decoding in flight while `warm_shards` fills it (at most `2 × cache_shards` decoded shards beside the result on a full cache) + one shard's block-index transient. A sparse request on a cold row-group-framed shard decodes only the touched row groups (block index) and is not inserted into the LRU. An out-of-range row is an error (it used to be dropped silently).
 - `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
@@ -1883,7 +1885,11 @@ The Python-visible class is `Experiment` (the Rust type is `PyExperiment`).
 `repr(exp)` is AnnData-style — a `Experiment object with n_obs × n_vars = …`
 header followed by indented `obs:` / `var:` / `uns:` / `obsm:` / `varm:` /
 `layers:` key lists. On-disk codec / shard / format-version internals moved off
-the repr onto `Experiment.info() -> str`.
+the repr onto `Experiment.info() -> str`, whose tokens now include
+`value_encoding=`, `is_integer=` and `max_value=` (rendering them reads one
+76-byte header per CSR shard, so `info()` is O(shards), not O(1)).
+
+- `value_encoding` `→ str` / `is_integer` `→ bool` / `max_value` `→ int` — What the file stores, without decoding it. `value_encoding` is the on-disk value encoding of the CSR shards as `scx info` prints it: a numpy dtype name (`"uint16"`, `"float32"`, …) when every shard agrees, `"mixed (uint8, uint16)"` when they differ (append keeps each shard's own encoding), `"n/a"` with no shards; on a multimodal file it folds every modality's X shards, and a layer's encoding is `adata.layers[name].stored_dtype` on a backed handle. `is_integer` is `True` when every shard is integer-encoded (`uint8` / `uint16` / `uint32`), i.e. the values are counts — `False` for any float shard or a shard-less file. `max_value` is the largest stored value from the per-shard catalog stats: float-encoded shards record no value range and a shard without stats contributes nothing, so it is `0` for a float file — read it together with `is_integer`; it is physical, like `nnz` (values in logically deleted rows still count). Each costs one shard-header read per CSR shard on first access (`max_value` is catalog-only); the fold is memoised per `Experiment` — shared by `value_encoding`, `is_integer` and `info()`, reset by `reload()` / `close()`, and a stale handle refuses before it can answer from the memo — so later reads are free. None decodes a value.
 
 - `read_obs(columns=None)` / `read_var(columns=None, *, modality=None)` — Read the cell / gene metadata table as a pandas DataFrame **without touching `X`**. Reach for these instead of `to_anndata().obs` / `.var` when you only want the metadata: on a 500k × 61k Census file `read_var()` is ~0.05 s against ~1.4 s and ~10 GB peak for the full materialisation. Both always retain the pandas index column (barcodes / gene names), so a projected frame indexes the same as an unprojected one, and an unknown column name raises `KeyError` listing what is available. Boolean columns come back as the pandas nullable `boolean` dtype whether or not they contain nulls, so the dtype follows the schema rather than the data and agrees with what a `to_h5ad` round trip returns. On a column with nulls that means `.astype(bool)` raises — deliberately, since coercing "not covered" to `False` is the mistake nullability exists to prevent — and `.fillna(False)` is the explicit form.
   - `read_obs`'s `columns` is a genuine **pushdown** — unselected columns are never materialised, which matters because `obs` scales with `n_obs`.
@@ -1893,7 +1899,7 @@ the repr onto `Experiment.info() -> str`.
   - `CloudExperiment` mirrors both. There, `read_obs(columns=…)` *is* a genuine network pushdown (per-column projected range reads); `read_var(columns=…)` is still post-fetch, for the same reason as locally.
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None, preserve_var_order=False, strict_var_names=True, container="csr", data_dtype=None, index_dtype=None, allow_lossy=False)` — Convert to AnnData
   - `var_names`: list of gene names to project (column subset). A set selector by default (sorted original-column order, duplicates collapsed)
-  - `preserve_var_order`: when True, return the gene axis in the order `var_names` was listed (first-occurrence-wins dedup) instead of sorted order. Works on eager / backed / GPU / query-engine paths. The streaming accelerators decode columns in sorted on-disk order and so cannot express a request-ordered gene axis; on a *backed* `X` they refuse rather than misalign the result against `adata.var` — `highly_variable_genes`, `normalize_total`, `log1p`, `calculate_qc_metrics`, `score_genes`, `pflog`, `pca`, `pca_neighbors`, `pca_neighbors_umap`, `rank_genes_groups`, `pdex_ref`, `pseudobulk_means`, `pseudobulk_dex` and `pdex_nb_glm` raise `RuntimeError`. Run them before projecting by name, or re-open without `preserve_var_order`
+  - `preserve_var_order`: when True, return the gene axis in the order `var_names` was listed (first-occurrence-wins dedup) instead of sorted order. Works on eager / backed / GPU / query-engine paths. The streaming accelerators decode columns in sorted on-disk order and so cannot express a request-ordered gene axis; on a *backed* `X` they refuse rather than misalign the result against `adata.var` — `highly_variable_genes`, `normalize_total`, `log1p`, `calculate_qc_metrics`, `score_genes`, `pflog`, `pca`, `pca_neighbors`, `pca_neighbors_umap`, `rank_genes_groups`, `pdex_ref`, `pseudobulk_means`, `pseudobulk_dex` and `pdex_nb_glm` raise `RuntimeError`. The same refusal applies to a backed `X` reordered at the handle level — `adata[:, idx]` with a non-ascending `idx`, or `adata.X = adata.X[:, [7, 2, 11]]` / `X[:, ::-1]` — which installs the same presentation permutation. Run them before reordering, select with a sorted index or a boolean mask, or materialise first (`adata.X = adata.X.to_memory()`)
   - `strict_var_names`: when True (default), any name absent from the var metadata raises `KeyError`. Pass False to silently drop unknown names (pre-0.8.6 behaviour)
   - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
   - `layers`: list of layer names to load (default: all)
@@ -2213,7 +2219,10 @@ the large-count shard:
   is decoded only on later `adata.layers[...]` access.
 
 For those ungated paths, a `> 2²⁴` count still rounds silently on access; pass
-`allow_lossy` where available, or read eagerly to get the guard.
+`allow_lossy` where available, or read eagerly to get the guard. To *know*
+before reading: `Experiment.is_integer` / `Experiment.max_value` (catalog
+stats, no decode) say whether a file holds counts and how large they get, and a
+backed handle's `stored_dtype` names its on-disk encoding.
 
 The R bindings (`rscx`) wire the same guard behind the same `allow_lossy`
 opt-out: eager reads — `$x_matrix()`, `$layer()`, `$to_seurat()` / `$to_mae()`
@@ -2618,13 +2627,16 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 
 **Properties:**
 - `shape` `→ (int, int)` — `(n_obs, n_vars)`, adjusted for deletion vectors and column projection
-- `dtype` `→ numpy.dtype` — Always `float32`
+- `dtype` `→ numpy.dtype` — Always `float32`: the type every read decodes to (scipy CSR interop, anndata's `CSRDataset` expectations). The on-disk encoding is `stored_dtype`.
+- `stored_dtype` `→ numpy.dtype` — The on-disk value encoding of this handle's shards: `uint8` / `uint16` / `uint32` for integer counts, `float32` / `float16` for continuous data. When shards mix (an `append` keeps each shard's own encoding) it is the widest — any float ⇒ `float32`, else the widest integer; a file with no shards reports `float32`. One 76-byte header read per shard, no decode, memoised on the reader, so `stored_dtype.kind in "ui"` answers "are these counts?" in O(shards). A layer handle reports the layer's own family; a lazy handle reports its *source*'s encoding (the transforms produce floats on read regardless).
+- `cache_shards` `→ int` — The decoded-shard LRU size this handle was opened with (`to_anndata(backed=True, cache_shards=…)`, default 4). `0` is the **uncached** path — every read decodes afresh and retains nothing — and is the right setting when the streaming footprint must be one shard. Read-only: the count is fixed when a handle's reader is built, and one `to_anndata` call builds `X` and each layer's reader with the same count (there is no `cache_shards` on `pyscx.open`). Note the split: `to_anndata(cache_shards=0)` is legal and meaningful, while `IndexPlanDataset(cache_shards=0)` raises `RuntimeError` on purpose (the loader's prefetcher needs a cache to prefetch into).
 - `format` `→ str` — Always `"csr"`
 - `backend` `→ str` — Always `"scx"`
 - `ndim` `→ int` — Always `2`
 - `non_negative` `→ bool` — Whether the data is known to be non-negative (enables `(X > 0).sum() → getnnz()` short-circuit)
 - `nnz` `→ int` — Total non-zero count
 - `n_shards` `→ int` — Number of CSR shards in the backing file
+- `__array__(dtype=None, copy=None)` — **Raises `TypeError`.** numpy's array protocol is implemented only to refuse: `np.asarray(adata.X)` on a handle would decode the whole `n_obs × n_vars` matrix at once, and before this it returned a 0-d object array that failed far away ("setting an array element with a sequence"). Call `to_memory()` (scipy CSR) or `toarray()` (dense) — both work on a column-projected handle such as `X[:, genes]`, which is itself a handle and refuses `np.asarray` the same way — take a row window with `handle[rows]` (a scipy CSR), or open the file with `pyscx.open(path).to_anndata()` for an in-memory AnnData. The dense `ScxBackedObsmDataset` keeps a materialising `__array__` — an embedding is small.
 
 **Column projection:**
 - `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` and streaming QC with gene subsets (`qc_vars`).
@@ -2634,8 +2646,29 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 
 **Slicing:**
 - `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, return scipy CSR.
-- `__getitem__(row_slice, col_slice)` — Row decode + column post-filter.
-- Supports integer, slice, boolean mask, and fancy indexing.
+- `__getitem__(rows, cols)` — With a non-`:` row selector: the row gather below, then a scipy column slice on the result (materialises the selected rows only). With `:` rows: the column projection below.
+- **`handle[:, cols]` is a column projection, not a read.** Every column
+  selector form — an `int` (`X[:, 5]` is an `(n_obs, 1)` handle, as scipy's is
+  `(n, 1)`), a `list` / `range` / `tuple`, an integer ndarray of **any order**
+  (signed negatives wrap once; unsigned is bounds-checked as `uint64`), a
+  boolean mask of length `n_vars`, or a non-full `slice` (`X[:, 10:20]`,
+  `X[:, ::-1]`) — is resolved once and composed through the handle's current
+  window, and a new `ScxBackedSparseDataset` comes back with **no decode**: one
+  decode per touched shard happens later, when that handle is read or
+  aggregated. Ascending-unique selectors install a sorted projection; a
+  reordered-but-unique selector rides on the presentation permutation
+  (`sum(axis=0)`, `to_memory()` and every read honour the request order), and
+  composing on top of an existing presentation (`X[:, [7, 2, 11]][:, [2, 0]]`
+  → columns `[11, 7]`) is exact. Two forms are not handles: a selector with
+  **repeated** columns (`X[:, [3, 1, 3]]`) — a permutation cannot express a
+  repeat, so it materialises the *projected unique columns* (one `to_memory()`
+  over 2 columns here, never the whole matrix) and gathers them with scipy —
+  and the full `X[:, :]`, which returns the row CSR like `X[:]` (scipy's
+  `X[:, :]` is a copy too). An out-of-range column, a wrong-length mask, a
+  float or 2-D selector raise `IndexError` (numpy's rule; a float selector
+  used to slip through and decode everything). Before 0.17 only an ascending
+  int / bool ndarray projected; every other form decoded the whole matrix and
+  sliced it.
 - **`handle[rows]` is the bounded row gather.** A boolean mask or any 1-D
   integer array-like (unsorted, duplicates, negative indices wrapping once) is
   resolved in user-visible row space and gathered in request order by
@@ -2666,7 +2699,7 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 - `min(axis=0|1)` `→ numpy.ndarray` — Column or row min.
 
 **Materialization:**
-- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards → full CSR.
+- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards → full CSR (one exact-size assembly, `read_all`). On a handle with a **column projection** it assembles shard by shard instead: each shard is decoded once, projected (and row-filtered) while still one shard wide, and the narrow pieces are concatenated — peak is 2× the *projected* result plus one shard, never the whole matrix (it used to decode everything and project afterwards, so `X[:, [1, 3]].to_memory()` peaked at the full matrix). Sequential by design; parallel decode would hold every shard at once.
 - `copy()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()`.
 - `toarray()` `→ numpy.ndarray` — Dense array.
 - `tocsr()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()` (scipy compat).
@@ -2696,7 +2729,9 @@ PyO3 class for backed-mode layer access (e.g., `adata.layers["raw_counts"]`). Wr
 
 - Same interface as `ScxBackedSparseDataset` (`shape`, `dtype`, `format`, `backend`, `ndim`, `__getitem__`, `to_memory`, `toarray`, `tocsr`, `tocsc`, `copy`, `sum`, `mean`, `var`, `getnnz`, `max`, `min`, `shard_boundaries`)
 - `layer_name` `→ str` — Name of the backing layer
+- `stored_dtype` `→ numpy.dtype` — The **layer's** on-disk encoding (its reader walks the layer's shard family, not X's), so `adata.layers["counts"].stored_dtype` can be `uint16` while a float `X` reports `float32`. `cache_shards` is this layer reader's setting — one `to_anndata` call builds `X` and each layer's own reader with the same count. `__array__` raises `TypeError`, as on `X`.
 - `adata.layers[name][rows]` is the same bounded row gather as on `X` (one decode per touched shard, result assembled once, `IndexError` semantics as above) — the layer's own shard family is read, so gathering counts from a layer needs no round trip through the `Experiment`.
+- `adata.layers[name][:, cols]` is the same column projection as on `X` and comes back as a `ScxBackedLayerDataset` (the wrapper, and with it `layer_name`, is kept — it used to return the bare inner class).
 
 ### ScxComparisonResult
 
@@ -2718,14 +2753,18 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 **Properties:**
 - `shape` `→ (int, int)` — `(n_obs, n_vars)`
 - `dtype` `→ numpy.dtype` — Always `float32`
+- `stored_dtype` `→ numpy.dtype` — The on-disk encoding of the **source** matrix, before the transforms (`normalize_total` / `log1p` produce floats on read regardless); `uint16` on a counts file.
+- `cache_shards` `→ int` — The LRU size of the reader this handle shares with the `ScxBackedSparseDataset` it was derived from.
 - `format` `→ str` — Always `"csr"`
 - `ndim` `→ int` — Always `2`
 - `backend` `→ str` — Always `"scx-lazy"` (distinguishes from `ScxBackedSparseDataset.backend` which is `"scx"`)
 - `non_negative` `→ bool` — Whether the transformed data is non-negative
+- `__array__(dtype=None, copy=None)` — Raises `TypeError`, as on `ScxBackedSparseDataset` (the transforms would have to run over the whole matrix to answer).
 
 **Slicing:**
 - `__getitem__(row_slice)` `→ scipy.sparse.csr_matrix` — Decode requested shards, apply all transforms in order, return scipy CSR.
-- `__getitem__(row_slice, col_slice)` — Row decode + transform + column projection.
+- `__getitem__(:, cols)` — The same column selector forms as on `ScxBackedSparseDataset` (`int`, `list`, `range`, `slice`, any-order ndarray, bool mask; same `IndexError` rules). An **ascending-unique** selection (after composing through the current projection) is a projected `ScxLazyTransformedDataset` with no decode. This class stores its projection sorted and has no presentation permutation, so a **reordered or repeated** request (`X[:, [7, 2]]`, `X[:, [3, 1, 3]]`) materialises the projected *unique* columns — transforms applied, `to_memory()` over just those columns — and gathers them with scipy; it never decodes the whole matrix. (Reorder through `adata[:, idx]` on a lazy `X` still raises, because `var` and `X` must be sliced by one rule there.)
+- `__getitem__(rows, cols)` — Row gather + transform, then a scipy column slice.
 - A boolean mask or integer array-like is the same bounded row gather as on `ScxBackedSparseDataset` (one decode per touched shard, result assembled once in request order, `IndexError` for out-of-range rows or a wrong-length mask), with each output row's transform parameters looked up by its global row id — duplicates and unsorted requests included.
 
 **Aggregation (streaming through transforms):**
@@ -2737,7 +2776,7 @@ PyO3 class wrapping `ScxBackedSparseDataset` with chained per-row transforms. Cr
 - `min(axis=0|1)` `→ numpy.ndarray` — Column or row min of transformed data.
 
 **Materialization:**
-- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards + apply transforms → full CSR.
+- `to_memory()` `→ scipy.sparse.csr_matrix` — Decode all shards + apply transforms → full CSR. With a column projection it assembles shard by shard (decode → transforms → project → drop deleted rows, one shard at a time, then concatenate), so it peaks at 2× the projected result plus one shard rather than the whole transformed matrix.
 - `copy()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()`.
 - `toarray()` `→ numpy.ndarray` — Dense array (via `to_memory().toarray()`).
 - `tocsr()` `→ scipy.sparse.csr_matrix` — Same as `to_memory()` (scipy compat).

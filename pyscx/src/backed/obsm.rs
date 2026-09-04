@@ -207,6 +207,12 @@ impl ScxBackedObsmDataset {
         "scx"
     }
 
+    /// The decoded-shard LRU size this handle was opened with; `0` = no cache.
+    #[getter]
+    fn cache_shards(&self) -> usize {
+        self.cache_shards
+    }
+
     #[getter]
     fn dtype<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         use arrow::datatypes::DataType;

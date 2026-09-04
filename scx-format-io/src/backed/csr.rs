@@ -104,6 +104,11 @@ pub struct BackedCsrReader {
     /// on the training hot path; caching the 76-byte header parse avoids
     /// re-reading it every batch for shards whose framing never changes.
     framed_cache: OnceLock<Vec<AtomicU8>>,
+    /// Memo for [`Self::stored_value_encoding`]: the widest value encoding
+    /// across this reader's shard family, folded from every shard header on
+    /// first request. Immutable for the reader's lifetime, like `framed_cache`;
+    /// only a successful fold is stored, so an I/O error is retried next time.
+    stored_encoding: OnceLock<Option<scx_codec::ValueEncoding>>,
     /// Optional pool for this reader's own parallel decode
     /// ([`Self::warm_shards`]). `None` — the default for every constructor —
     /// keeps dispatch on rayon's global registry, so `scx-accel`, `scx-ops`,
@@ -199,6 +204,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
             #[cfg(feature = "test-hooks")]
@@ -240,6 +246,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
             #[cfg(feature = "test-hooks")]
@@ -283,6 +290,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
             #[cfg(feature = "test-hooks")]
@@ -342,6 +350,7 @@ impl BackedCsrReader {
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
             framed_cache: OnceLock::new(),
+            stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
             #[cfg(feature = "test-hooks")]
@@ -1252,6 +1261,53 @@ impl BackedCsrReader {
         } else {
             self.reader.read_all_csr_shards_for(modality_id)
         }
+    }
+
+    /// The `cache_shards` this reader was constructed with — the *requested*
+    /// count cap on the decoded-shard LRU, so `0` means "no cache" (the cache
+    /// itself clamps its capacity to ≥ 1 internally). Read back by the pyscx
+    /// handles' `cache_shards` getter. There is no setter: the count is fixed
+    /// when the reader is built, and a `to_anndata(backed=True)` builds its `X`
+    /// reader and each layer's reader with the same count.
+    pub fn cache_shards(&self) -> usize {
+        self.cache_shards
+    }
+
+    /// The value encoding that describes this reader's shard family — `X`, the
+    /// layer, or the modality it was scoped to, since it walks the same
+    /// [`Self::shard_entry`] table every read does.
+    ///
+    /// Reads each shard's 76-byte header (no payload decode), folds with
+    /// [`scx_codec::ValueEncoding::widest`] — a uniform family reports its own
+    /// encoding, a mixed one the widest (any float ⇒ `Float32`, else the
+    /// widest integer) — and memoises the answer. `Ok(None)` when the family
+    /// has no shards. The encoding lives only in the shard header, not in the
+    /// catalog stats (`ShardEntryLite` drops the `value_*` fields, and a
+    /// `value_max` of 0 cannot tell a float shard from an all-zero one), so
+    /// this is the one place a caller can learn whether the stored values are
+    /// integer counts without decoding anything.
+    pub fn stored_value_encoding(&self) -> Result<Option<scx_codec::ValueEncoding>> {
+        // Before the memo, not after: the first fold reaches `section_bytes`,
+        // which checks freshness itself, but a memo hit touches no section —
+        // and an `append` can mix a wider encoding into a file whose warm memo
+        // would otherwise keep answering the old one while `shape` refuses.
+        self.check_fresh()?;
+        if let Some(memo) = self.stored_encoding.get() {
+            return Ok(*memo);
+        }
+        let mut encs = Vec::with_capacity(self.shard_count());
+        for shard_idx in 0..self.shard_count() {
+            let Some(&lite) = self.shard_entry(shard_idx) else {
+                continue;
+            };
+            let entry = lite.into_transient_full_entry();
+            let header = self.reader.read_shard_header(&entry)?;
+            let enc = scx_codec::ValueEncoding::from_u8(header.value_encoding)
+                .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
+            encs.push(enc);
+        }
+        let widest = scx_codec::ValueEncoding::widest(&encs);
+        Ok(*self.stored_encoding.get_or_init(|| widest))
     }
 
     /// Phase 5b: which modality this backed reader is scoped to. Used

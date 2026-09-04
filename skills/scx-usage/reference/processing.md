@@ -56,7 +56,8 @@ and `pyscx.write(adata, path, **kwargs)` (= `from_anndata`).
 - `detection_counts(axis="var", modality=None)` / `cells_expressing(gene, modality=None)` — bitmap fast path when sidecars exist, CSR scan otherwise.
 - `gather_rows_sparse(rows, modality=None, cache_shards=4, layer=None, logical=True)` — random-access sparse row gather (bool mask or integer array-like; request order, duplicates allowed; logical rows by default, `layer=` for a layer); returns a scipy CSR submatrix with peak memory = result + the shard cache + up to `cache_shards` shards decoding in flight while it fills (never a second copy of the result). The same gather is `adata.X[rows]` / `adata.layers[name][rows]` on a backed handle.
 - `provenance()` — returns the file's provenance chain.
-- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `layer_names`.
+- Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `layer_names`; `value_encoding` (`"uint16"` / `"mixed (uint8, uint16)"`), `is_integer` (every CSR shard integer-encoded — "are these counts?" without decoding), `max_value` (largest stored value from catalog stats; 0 for a float file). `info()` prints the same three as tokens.
+- Backed handle column selectors: `adata.X[:, 5]`, `X[:, [7, 2, 11]]`, `X[:, 10:20]`, `X[:, mask]`, any-order int ndarray → a projected **handle**, no decode (request order kept). Repeated columns (`X[:, [3, 1, 3]]`) → scipy from the projected unique columns. `np.asarray(handle)` raises `TypeError` — use `to_memory()` / `toarray()`. `handle.stored_dtype` is the on-disk encoding (`dtype` stays `float32`); `handle.cache_shards` reads the LRU size back.
 
 ## Query pipeline (`PyQueryPipeline`)
 - `filter_obs(expr)` / `filter_var(expr)` — predicate strings (e.g. `"tissue == 'lung'"`).
@@ -145,6 +146,7 @@ this envelope, including `harmony_integrate` (`gpu_dense` / `cpu_dense`).
 
 **Streaming column stats** (on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`; honor `col_projection` / deletion vector):
 - `col_sums(dataset, prefer_format="csr") -> f64[]`, `col_nnz -> i64[]`, `col_min`, `col_max`, `col_var`.
+- Restrict to a gene subset first with `dataset[:, cols]` (a projected handle, no decode) rather than materialising.
 
 **GPU helpers:**
 - `gpu_info() -> dict | None` — `{device, total_vram_gb, free_vram_gb}` or `None` if unavailable.
