@@ -489,6 +489,42 @@ The output is a clean single-manifest file (`manifest_sequence=0`).
 Complexity is O(live data) — proportional to the surviving cells, not the
 historical file size.
 
+## Empty inputs and outputs
+
+A file with `n_obs == 0` is a legitimate state, not a corruption: it has zero
+CSR shards (the format forbids framed zero-row shards — "emit no shard at all
+instead"), a single 0-row `obs` section carrying the full schema, `var`,
+`obsm` / `varm` / `uns`, and no layers or `raw` (both exist on disk only as
+their shards). `pyscx.from_anndata` writes one from an empty AnnData — see
+[api.md § Zero rows and zero columns](api.md#zero-rows-and-zero-columns) — and
+the mutating ops treat it consistently:
+
+- **compact** after deleting every row (or of an already-empty file) writes
+  a 0-row file: one empty legacy `obs` section, no shards. The carry audit
+  exempts the `RowFiltered` families (`X`, layers, `obsm`) at `n_obs == 0` —
+  they are legitimately absent, not lost.
+- **merge**: a 0-row input contributes nothing, and may lack layers or `obsm`
+  keys the other inputs have — those are recorded only by shards, so a 0-row
+  input cannot carry them; the usual "key missing in input *i*" error applies
+  to populated inputs only. A merge whose inputs are all empty still writes an
+  `obs` section (input 0's, so declared categories survive). `varm` / `varp`
+  still come from input 0, whatever its row count. A 0-**var** input is an
+  `IncompatibleVars` error as before.
+- **append** of a 0-row source is a no-op on both `scx append` ("nothing to
+  append") and `pyscx.append` (returns without writing). Appending onto a
+  0-row target works: the target's 0-row `obs` schema — including string-typed
+  empty `object` columns — is what the new block is checked against.
+- **build-csc** on an empty matrix (0 rows or 0 columns) is a no-op that still
+  produces the requested output, so `--rebuild-csc` / `rebuild_csc=True` on a
+  rewrite that yielded zero rows succeeds. `CscPolicy` never builds a sidecar
+  on an empty matrix, whatever `csc=` says, and nothing warns about it.
+- **predicate indexes** are never built over a 0-row obs (or a 0-row var):
+  `--index-obs` names are accepted, no index section is written, no warning is
+  raised, and `filter_obs` scans the (empty) obs. Metadata-carrying axes
+  keep their indexes — `--index-var` on a 0-row file still indexes `var`.
+- **subset** with a predicate matching no rows writes a 0-row file (it always
+  has; the test is `scx-cli/src/subset.rs::test_subset_zero_rows_ok`).
+
 ## Optimize
 
 `scx optimize <input> <output>` upgrades an existing **single-modality**

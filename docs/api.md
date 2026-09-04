@@ -939,6 +939,59 @@ The full transform list is also surfaced on the wrapper itself via
 `ScxLazyTransformedDataset.transforms_repr() → list[{"name","params"}]`,
 which the writer uses to build the `lazy_transforms` payload.
 
+### Zero rows and zero columns
+
+`pyscx.from_anndata` accepts an AnnData with `n_obs == 0` (an empty QC or
+guide filter, `adata[mask]` with an all-`False` mask, `pyscx.accel.subset_obs`
+keeping nothing) or `n_vars == 0`, on every `X` shape above. Before 0.17 both
+raised `RuntimeError: Arrow IPC contains no batches` — pyarrow's `write_table`
+emits zero IPC batches for a 0-row frame; the format, the Rust writer and every
+reader already handled zero shards (`scx subset` with a predicate matching
+nothing has always written a valid 0-row file). What a 0-row file holds:
+
+- **`X`'s shape and the full schema.** The header carries `n_obs = 0` and
+  `n_vars`; there are **no** CSR shards (the format forbids framed zero-row
+  shards — "emit no shard at all instead", [format.md § Block index](format.md#block-index)).
+  `obs` and `var` are single 0-row sections with every column, dtype and
+  declared category — `pd.Categorical([], categories=["A", "B"], ordered=True)`
+  reads back with both categories and `ordered=True`, because the 0-row frame
+  crosses the pandas → Arrow boundary as a real 0-row batch
+  (`pyarrow.RecordBatch.from_pandas`), not as an empty batch rebuilt from the
+  schema. `obsm` / `varm` (as `(0, k)` / `(n_vars, k)`), `obsp` / `varp` and
+  `uns` survive.
+- **Empty `object` columns, and the obs index, are stored as string.** With no
+  values to look at pyarrow types them Arrow `null`, and a categorical that an
+  anndata subset pruned to zero categories as `dictionary<null>` — types no
+  populated frame produces. They are stored as `string` / `dictionary<string>`
+  so the 0-row file's schema is the one its populated sibling has: `append`'s
+  obs-schema check, `merge`'s column unification and a forced `index_obs=`
+  all compare against it. Only 0-row frames are touched; a populated all-`None`
+  column still round-trips as `null` → `object`.
+- **`layers` and `adata.raw` are dropped, with a `UserWarning`** naming them.
+  Both exist on disk only as their CSR shards (`has_raw` is derived from shard
+  presence), and a 0-row file has none, so not even the layer's name can be
+  recorded. `to_anndata()` of a 0-row file has `layers == {}` and `raw is None`.
+- **No CSC sidecar and no obs predicate index**, whatever `csc=` / `index_obs=`
+  say, and no warning about either: a sidecar over an empty matrix indexes
+  nothing, and a 0-row obs has nothing to index (`filter_obs` scans the empty
+  obs). `index_var=` on a 0-row file still indexes `var`, which has rows. The
+  same rule holds for `n_vars == 0` (`csc` skipped; `index_var` builds nothing)
+  and for every op that rebuilds them (`compact`, `merge`, `sort`, `build-csc`
+  — see [operations.md § Empty inputs and outputs](operations.md#empty-inputs-and-outputs)).
+
+Reading one back: `to_anndata()` is `(0, n_vars)` with the obs / var frames
+above; `to_anndata(backed=True).X` is a handle with `n_shards == 0` whose
+`to_memory()` / `sum(axis=0)` / column selectors all work (`stored_dtype`
+reports `float32`, the decode dtype, since there is no shard to read an
+encoding from, while `Experiment.value_encoding` reports `"n/a"` — both
+documented above); `read_obs()` / `read_var()`, `query().collect()`,
+`to_h5ad` (streaming and eager) and `scx info` all answer for the empty
+file. A `(n_obs, 0)` file reads back the same way with the axes swapped.
+
+Not covered: `pyscx.from_mudata` still rejects `n_obs == 0` (it derives the
+global cell count from the outer obs), and `adata.X is None` is not accepted
+on any row count.
+
 ## Restricted-exec (sandbox) safety
 
 pyscx entry points work when called from code `exec`'d under **restricted
