@@ -1206,8 +1206,9 @@ impl PyExperiment {
     /// The bounded shard-wise gather: each touched shard is decoded once (a
     /// sparse request on a row-group-framed shard decodes only the touched row
     /// groups), and the result is assembled **once** into exact-size buffers in
-    /// request order — peak memory is the result plus the shard cache
-    /// (`cache_shards` decoded shards) plus one shard's transient, never a
+    /// request order — peak memory is the result plus the shard cache, plus up
+    /// to `cache_shards` shards decoding in flight while that cache fills (at
+    /// most `2 × cache_shards` decoded shards beside the result), never a
     /// second copy of the result. `rows` is a boolean mask or
     /// any 1-D integer array-like (list, range, ndarray of any integer dtype);
     /// it may contain duplicates and need not be sorted; negative indices wrap

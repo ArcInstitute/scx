@@ -1294,6 +1294,133 @@ fn read_rows_rejects_a_range_past_n_obs() {
     assert_eq!(backed.read_rows(n_obs + 5, n_obs + 5).unwrap().n_rows(), 0);
 }
 
+/// A catalog whose CSR shards leave a gap in the row axis must make `read_rows`
+/// refuse the range, not return a shorter matrix (a range wholly inside the gap
+/// used to come back as `(0, n_vars)`) or a non-monotone `indptr` (a range
+/// straddling it).
+#[test]
+fn read_rows_rejects_a_catalog_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.scx");
+    let n_vars = 10usize;
+    // Header says 12 rows; shards cover 0..4 and 8..12 — rows 4..8 are nobody's.
+    let header = sample_header(12, n_vars as u64, 16);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(12)).unwrap();
+    writer.write_var(&sample_var(n_vars)).unwrap();
+    for row_start in [0u64, 8] {
+        let (indptr, indices, values) = sample_shard_data(4, n_vars);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+
+    for (start, end) in [(0u64, 12u64), (4, 8), (2, 10), (6, 9)] {
+        let err = backed
+            .read_rows(start, end)
+            .expect_err("a range touching the gap must error");
+        assert!(
+            matches!(err, ScxError::InvalidCatalog(_)),
+            "{start}..{end}: expected InvalidCatalog, got {err:?}"
+        );
+    }
+    // Ranges inside a covered shard still read.
+    assert_eq!(backed.read_rows(0, 4).unwrap().n_rows(), 4);
+    assert_eq!(backed.read_rows(9, 12).unwrap().n_rows(), 3);
+}
+
+/// `BackedCsrReader::new` on a multimodal file indexes every modality's shards
+/// (each tiles `[0, n_obs)` on its own), so a range read would copy two shards'
+/// windows into the same output rows. The positional tiling check refuses it;
+/// the scoped `for_modality` reader reads the range.
+#[test]
+fn read_rows_rejects_overlapping_modalities_on_an_unscoped_reader() {
+    use crate::modality::ModalityType;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("mm.scx");
+    let n_obs: u64 = 4;
+    let header = sample_header(n_obs, 4, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&sample_obs(n_obs as usize)).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let atac_id = writer
+        .add_modality(
+            "atac",
+            ModalityType::Atac,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &sample_var(4)).unwrap();
+    writer.write_var_for(atac_id, &sample_var(4)).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(atac_id, 4).unwrap();
+    let indptr: Vec<u64> = vec![0, 1, 2, 3, 4];
+    let values: Vec<u8> = vec![1, 1, 1, 1];
+    let rna_indices: Vec<u32> = vec![0, 0, 0, 0];
+    let atac_indices: Vec<u32> = vec![3, 3, 3, 3];
+    writer
+        .write_csr_shard_for(
+            rna_id,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &rna_indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer
+        .write_csr_shard_for(
+            atac_id,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &atac_indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let unscoped = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    let err = unscoped
+        .read_rows(0, n_obs)
+        .expect_err("two modalities' shards overlap every output row");
+    assert!(
+        matches!(err, ScxError::InvalidCatalog(_)),
+        "expected InvalidCatalog, got {err:?}"
+    );
+    assert!(err.to_string().contains("for_modality"), "{err}");
+
+    let scoped = BackedCsrReader::for_modality(ScxReader::open(&path).unwrap(), atac_id, 4);
+    let out = scoped.read_rows(0, n_obs).unwrap();
+    assert_eq!(out.n_rows(), 4);
+    assert_eq!(out.indices, vec![3, 3, 3, 3]);
+}
+
 /// A range that fits the LRU still goes through it (warm + copy), so the
 /// sequential chunk iterator's re-reads keep hitting.
 #[test]

@@ -453,11 +453,12 @@ pattern arc-reactor's guide calling runs, and the one PR C (REC-1) rewrote in
 `BackedCsrReader::read_row_indices` to assemble its output once instead of
 building a per-row CSR and concatenating (2× the result on top of the LRU).
 
-The same change wraps every `read_selective` read in `PeakRssSampler` and
-records `peak_rss_mb__<scenario>` per run — a true in-region peak. The reserved
-`peak_rss_mb` on the run record is still the runner's `max(before, after)` of
-two instantaneous readings and is unchanged; it cannot see the transient the
-gather used to allocate and free, which is why the new key exists.
+The same change wraps the `row_mask_gather` read — and only that read — in
+`PeakRssSampler` and records `peak_rss_mb__row_mask_gather` per run, a true
+in-region peak. The reserved `peak_rss_mb` on every run record is still the
+runner's `max(before, after)` of two instantaneous readings and is unchanged; it
+cannot see the transient the gather used to allocate and free, which is why the
+new key exists.
 
 ## Why the medians move, and why that is not a regression
 
@@ -472,10 +473,10 @@ pooled numbers by construction: its wall is above `row_slice`'s (more cells) and
 its RSS carries a result an eighth the size of the matrix.
 
 The per-scenario numbers are where the signal is: `wall_s__<scenario>` and the
-new `peak_rss_mb__<scenario>` are sparse keys — only that scenario's runs carry
-them, so a threshold on one medians that arm alone. The new arm's memory is
-gated on its own key, `peak_rss_mb__row_mask_gather`, on `scx_auto` at
-`tabula_sapiens_100k` and `census_500k`.
+new `peak_rss_mb__row_mask_gather` are sparse keys — only that scenario's runs
+carry them, so a threshold on one medians that arm alone. The new arm's memory
+is gated on its own key on `scx_auto` at `tabula_sapiens_100k` and
+`census_500k`.
 
 This is the same shape as `fragment_ops_compact_full_arm_raises_pooled_medians.md`
 and `cellset_gather_s512_raises_pooled_rss.md`, for the same reason.

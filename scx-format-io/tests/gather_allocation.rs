@@ -1,5 +1,8 @@
 //! The backed row gather must assemble its output **once**, into pre-sized
-//! buffers, with a live-memory peak bounded by the result plus the shard cache.
+//! buffers, with a live-memory peak bounded by the result plus the shard cache
+//! plus the shards a warm or bulk decode holds in flight — at most
+//! `2 × cache_shards` decoded shards beside the result on a full cache, never a
+//! second copy of the result.
 //!
 //! `BackedCsrReader::read_row_indices` used to build one `ScxCsr` (three `Vec`s)
 //! per requested row and then `concatenate_csr` them — a second full copy of the
@@ -295,6 +298,35 @@ fn gather_paths_assemble_once_within_the_cache_bound() {
             peak <= budget,
             "framed={framed}: read_row_indices peaked at {peak} live bytes for a {result}-byte \
              result (budget {budget}) — the gather is not assembling once"
+        );
+        drop(out);
+        drop(backed);
+
+        // --- read_row_indices with a FULL LRU going in ---
+        // `scatter_groups` warms up to `cache_shards` cold full-path shards in
+        // parallel; a full LRU is evicted only as each new shard lands, so up
+        // to `2 × cache_shards` decoded shards can sit beside the result. Armed
+        // before the warming read so the resident shards count.
+        let backed = open(&path);
+        let (out, peak) = measure_live_peak(|| {
+            let warm = backed
+                .read_rows(0, (CACHE_SHARDS * ROWS_PER_SHARD) as u64)
+                .unwrap();
+            drop(warm);
+            backed.read_row_indices(&eighth).unwrap()
+        });
+        assert_rows_match(&out, &full, &eighth);
+        let result = csr_bytes(out.n_rows(), out.nnz());
+        let budget = result + 2 * CACHE_SHARDS * shard + shard + shard / 4 + eighth.len() * 3 * 32;
+        let budget = budget + budget / 10;
+        eprintln!(
+            "framed={framed} read_row_indices(eighth) warm LRU: result={result} peak={peak} budget={budget} ({:.2}× result)",
+            peak as f64 / result as f64
+        );
+        assert!(
+            peak <= budget,
+            "framed={framed}: read_row_indices on a full LRU peaked at {peak} live bytes for a \
+             {result}-byte result (budget {budget}: result + 2 × cache_shards shards + transient)"
         );
         drop(out);
         drop(backed);

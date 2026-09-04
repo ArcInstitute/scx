@@ -138,6 +138,20 @@ def test_gather_accepts_a_boolean_mask_and_checks_its_length(scx_path, adata_bac
         exp.gather_rows_sparse(np.ones(exp.n_obs + 1, dtype=bool))
 
 
+def test_gather_empty_plain_sequences_select_no_rows(scx_path):
+    """`[]` and `range(0)` coerce to an empty *float64* array under
+    `np.asarray`; numpy still treats them as an empty integer index."""
+    import pyscx
+
+    exp = pyscx.open(scx_path)
+    for sel in ([], range(0), (), np.asarray([], dtype=np.int64), np.asarray([], dtype=np.uint64)):
+        got = exp.gather_rows_sparse(sel)
+        assert got.shape == (0, exp.n_vars), sel
+    # An ndarray the caller typed float is still refused, empty or not.
+    with pytest.raises(IndexError, match="integer array or a boolean mask"):
+        exp.gather_rows_sparse(np.asarray([], dtype=np.float64))
+
+
 def test_gather_rejects_a_float_selector_and_a_2d_selector(scx_path):
     import pyscx
 

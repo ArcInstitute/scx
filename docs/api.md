@@ -980,8 +980,8 @@ will still raise); the guarantee covers pyscx's own entry points.
 ## BackedCsrReader (`scx-format-io/src/backed/csr.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
-- `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards` and leaves the LRU untouched — peak = result + up to `cache_shards` shards in flight, on top of whatever the LRU already holds (itself capped at `cache_shards`). `end > n_obs` is an error.
-- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + `cache_shards` shards. A sparse request on a cold row-group-framed shard decodes only the touched row groups (block index) and is not inserted into the LRU. An out-of-range row is an error (it used to be dropped silently).
+- `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards` and leaves the LRU untouched — peak = result + up to `cache_shards` shards in flight, on top of whatever the LRU already holds (itself capped at `cache_shards`). `end > n_obs` is an error, and so is a catalog whose shards do not tile the range exactly (a gap, or the overlapping modalities of an unscoped reader on a multimodal file).
+- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + the shard cache + up to `cache_shards` shards decoding in flight while `warm_shards` fills it (at most `2 × cache_shards` decoded shards beside the result on a full cache) + one shard's block-index transient. A sparse request on a cold row-group-framed shard decodes only the touched row groups (block index) and is not inserted into the LRU. An out-of-range row is an error (it used to be dropped silently).
 - `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
 - `read_shard_uncached(idx)` → `ScxCsr` — Read shard bypassing cache (preferred for streaming)
 - `row_sums()` / `col_sums()` — Streaming per-row/column sums
@@ -2037,8 +2037,9 @@ the repr onto `Experiment.info() -> str`.
   once. Each touched shard is decoded once (a sparse request on a
   row-group-framed shard decodes only the touched row groups) and the result is
   assembled once into exact-size buffers, so peak memory is the result plus the
-  shard cache (`cache_shards` decoded shards) plus one shard's transient — never
-  a second copy of the result.
+  shard cache, plus up to `cache_shards` shards decoding in flight while that
+  cache fills (at most `2 × cache_shards` decoded shards beside the result) —
+  never a second copy of the result.
   `logical=True` (default) indexes the rows `n_obs` / `read_obs()` describe
   (deletion vectors applied, exactly as `to_anndata(backed=True).X[rows]`);
   `logical=False` indexes physical file rows (`n_obs_physical`). **Changed in
@@ -2641,8 +2642,9 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
   `BackedCsrReader::read_row_indices`: each touched shard is decoded once — a
   sparse request on a row-group-framed shard decodes only the touched row groups
   — and the result is assembled once into exact-size buffers, so peak memory is
-  the result plus the shard cache (`cache_shards` decoded shards) plus one
-  shard's transient, never a second copy of the result. `X[:]` and other
+  the result plus the shard cache, plus up to `cache_shards` shards decoding in
+  flight while that cache fills (at most `2 × cache_shards` decoded shards
+  beside the result), never a second copy of the result. `X[:]` and other
   contiguous slices on a handle **without** deletion vectors go through
   `read_rows`, which sizes the result exactly and, for a range larger than the
   shard cache, decodes uncached in parallel chunks of `cache_shards` on top of

@@ -110,6 +110,34 @@ def test_boolean_mask_matches_and_a_wrong_length_mask_is_an_index_error(scx_path
         assert empty.shape == (0, ref.shape[1]), name
 
 
+def test_empty_plain_sequences_select_no_rows(scx_path):
+    for name, h, ref in _handles(scx_path):
+        for sel in ([], range(0), np.asarray([], dtype=np.int64)):
+            got = h[sel]
+            assert got.shape == (0, ref.shape[1]), (name, sel)
+        with pytest.raises(IndexError, match="integer array or a boolean mask"):
+            h[np.asarray([], dtype=np.float64)]
+
+
+def test_backed_obsm_uses_the_same_selector_rules(scx_path):
+    """The dense obsm handle shares the resolver: unsigned values near the top
+    are out of range, wrong-length masks and empty lists behave as on `X`."""
+    import pyscx
+
+    exp = pyscx.open(scx_path)
+    adata = exp.to_anndata(backed=True, obsm=["X_pca"], eager=False)
+    m = adata.obsm["X_pca"]
+    assert isinstance(m, pyscx.ScxBackedObsmDataset)
+    ref = np.asarray(m[:])
+    with pytest.raises(IndexError, match=f"{2**64 - 1}"):
+        m[np.asarray([2**64 - 1], dtype=np.uint64)]
+    with pytest.raises(IndexError, match="boolean row mask"):
+        m[np.ones(m.shape[0] - 1, dtype=bool)]
+    assert np.asarray(m[[]]).shape == (0, ref.shape[1])
+    np.testing.assert_allclose(np.asarray(m[[3, 1, 3]]), ref[[3, 1, 3]])
+    np.testing.assert_allclose(np.asarray(m[np.asarray([-1])]), ref[[-1]])
+
+
 def test_float_selector_is_an_index_error(scx_path):
     for name, h, _ in _handles(scx_path):
         with pytest.raises(IndexError, match="integer array or a boolean mask"):

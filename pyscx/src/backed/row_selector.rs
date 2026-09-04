@@ -23,8 +23,11 @@ use pyo3::types::PyTuple;
 ///   naming the value. An unsigned array is bounds-checked as `uint64` — it is
 ///   never converted to a signed type, so `2**64 - 1` is out of range, not
 ///   the last row.
-/// - Anything else — a float array, a 2-D array — is an `IndexError`, as in
-///   numpy ("arrays used as indices must be of integer (or boolean) type").
+/// - An empty plain sequence (`[]`, `range(0)`, `()`) selects no rows, as in
+///   numpy, even though `np.asarray` types it `float64`.
+/// - Anything else — a float ndarray (empty or not), a 2-D array — is an
+///   `IndexError`, as in numpy ("arrays used as indices must be of integer
+///   (or boolean) type").
 ///
 /// Reads `dtype.kind`, never `str(dtype)`: numpy's C code imports
 /// `numpy._core._dtype` on every dtype stringification via the frame-sensitive
@@ -44,6 +47,13 @@ pub(crate) fn resolve_row_selector(
         return Err(PyIndexError::new_err(format!(
             "row selector must be one-dimensional, got a {ndim}-D array"
         )));
+    }
+    // `np.asarray([])` / `np.asarray(range(0))` is an empty *float64* array,
+    // so a plain empty sequence would fall into the dtype rejection below.
+    // numpy treats `x[[]]` as an empty integer index; only an ndarray the
+    // caller explicitly typed float is refused.
+    if arr.len()? == 0 && !selector.is_instance(&np.getattr("ndarray")?)? {
+        return Ok(Vec::new());
     }
 
     if dtype_kind == "b" {

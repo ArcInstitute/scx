@@ -604,10 +604,10 @@ impl BackedCsrReader {
             ))));
         }
 
+        // No early return on an empty `shard_indices`: `start < end <= n_obs`
+        // holds here, so a range no shard covers is a catalog gap and must
+        // fail the tiling check below, not come back as an empty matrix.
         let shard_indices = self.index.shards_for_range(start, end);
-        if shard_indices.is_empty() {
-            return Ok(Self::empty_csr(self.n_vars));
-        }
 
         // Plan each overlapping shard. A genuinely small window of an *uncached*
         // framed shard is decoded directly via the block-index row-range path
@@ -643,16 +643,30 @@ impl BackedCsrReader {
             });
         }
 
-        // The plans must tile `[start, end)` exactly: a gap leaves output rows
-        // with no shard (a non-monotone `indptr`), an overlap writes one window
-        // twice. Both mean the catalog does not tile the row axis — a corrupt
-        // file, or a reader built with `new` on a multimodal file whose
-        // modalities each tile `[0, n_obs)` (use `for_modality` there).
+        // The plans must tile `[start, end)` exactly, in order: a gap leaves
+        // output rows with no shard (a non-monotone `indptr`), an overlap writes
+        // one window twice. Checked positionally — each window must begin where
+        // the previous ended and the last must end at `end` — because a gap and
+        // an overlap of equal size sum to the right length. Either means the
+        // catalog does not tile the row axis: a corrupt file, or a reader built
+        // with `new` on a multimodal file whose modalities each tile
+        // `[0, n_obs)` (use `for_modality` there).
         let n_rows = (end - start) as usize;
-        let covered: usize = plans.iter().map(|p| p.local_end - p.local_start).sum();
-        if covered != n_rows {
+        let mut cursor = 0usize;
+        for plan in &plans {
+            if plan.out_row != cursor {
+                return Err(ScxError::InvalidCatalog(format!(
+                    "CSR shard {} covers output rows {}.. of {start}..{end} but the previous \
+                     shard ended at {cursor}: the catalog does not tile the row axis (on a \
+                     multimodal file open the reader with `for_modality`)",
+                    plan.shard_idx, plan.out_row
+                )));
+            }
+            cursor += plan.local_end - plan.local_start;
+        }
+        if cursor != n_rows {
             return Err(ScxError::InvalidCatalog(format!(
-                "CSR shards cover {covered} of the {n_rows} rows in {start}..{end}: the catalog \
+                "CSR shards cover {cursor} of the {n_rows} rows in {start}..{end}: the catalog \
                  does not tile the row axis (on a multimodal file open the reader with \
                  `for_modality`)"
             )));
@@ -909,9 +923,13 @@ impl BackedCsrReader {
     /// decoded by row group through the block index and is **not** inserted
     /// into the LRU (see [`Self::block_index_eligible`]), so repeated small
     /// gathers over one region re-decode row groups rather than paying a
-    /// full-shard decode each. Peak memory is the result plus the shard cache
-    /// plus one shard's transient — not a per-row `ScxCsr` per requested row
-    /// and a second copy of the result, as before.
+    /// full-shard decode each. Peak memory is the result plus the shard cache,
+    /// plus up to `cache_shards` shards decoding in flight while
+    /// [`Self::warm_shards`] fills that cache (a full LRU is evicted only as
+    /// each new shard lands, so at most `2 × cache_shards` decoded shards sit
+    /// beside the result) and one shard's block-index transient — not a
+    /// per-row `ScxCsr` per requested row and a second copy of the result, as
+    /// before.
     pub fn read_row_indices(&self, rows: &[u64]) -> Result<ScxCsr> {
         if rows.is_empty() {
             return Ok(Self::empty_csr(self.n_vars));

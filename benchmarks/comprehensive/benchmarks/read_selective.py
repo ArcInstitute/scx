@@ -20,12 +20,14 @@ a threshold. The per-scenario medians already existed in
 ``metadata["scenario_summary"]``, but thresholds read ``runs[].extra`` and
 never ``metadata``, so nothing could gate them.
 
-Every run also carries ``peak_rss_mb__<scenario>``: the **true in-region peak**
-sampled by ``PeakRssSampler`` around the read. The reserved ``peak_rss_mb`` on
-the run record is the runner's ``max(before, after)`` of two instantaneous
-readings, which cannot see a transient the read allocates and frees before it
-returns — exactly the shape of the 2× copy the bounded row gather removed
-(REC-1). Floor the sparse key, never the reserved one.
+``row_mask_gather`` runs also carry ``peak_rss_mb__row_mask_gather``: the **true
+in-region peak** sampled by ``PeakRssSampler`` around that read. The reserved
+``peak_rss_mb`` on every run record is the runner's ``max(before, after)`` of two
+instantaneous readings, which cannot see a transient the read allocates and frees
+before it returns — exactly the shape of the 2× copy the bounded row gather
+removed (REC-1). Floor the sparse key, never the reserved one. The sampler is
+scoped to that one arm: it is the only scenario with a memory ceiling, and a
+polling thread has no business in the other arms' wall-clock measurements.
 
 Scenario names, for anyone writing one of those thresholds: the four base
 scenarios are ``row_slice`` / ``row_mask_gather`` / ``col_projection`` /
@@ -249,25 +251,31 @@ def run(
                     FormatRunner._drop_caches()
 
                 logger.info("  %s run %d/%d", scenario_name, i + 1, n_runs)
-                # True in-region peak: the runner's own `peak_rss_mb` is
-                # max(before, after) of two instantaneous readings and misses
-                # a transient the read frees before returning.
-                with PeakRssSampler() as sampler:
+                # Sparse per-scenario keys: only runs of THIS scenario carry
+                # them, so a threshold on one medians one scenario rather than
+                # the mix. See the module docstring.
+                extra: dict[str, float] = {}
+                if scenario_name == "row_mask_gather":
+                    # True in-region peak: the runner's own `peak_rss_mb` is
+                    # max(before, after) of two instantaneous readings and
+                    # misses a transient the read frees before returning. Only
+                    # this arm has a memory ceiling, so only it is sampled.
+                    with PeakRssSampler() as sampler:
+                        tr = runner.read_subset(
+                            output_path, cell_indices=c_idx, gene_indices=g_idx,
+                        )
+                    extra[f"peak_rss_mb__{scenario_name}"] = round(sampler.peak_mb, 3)
+                else:
                     tr = runner.read_subset(
                         output_path, cell_indices=c_idx, gene_indices=g_idx,
                     )
+                extra[f"wall_s__{scenario_name}"] = round(tr.wall_s, 6)
 
                 scenario_times[scenario_name].append(tr.wall_s)
                 result.add_run(
                     wall_s=tr.wall_s, user_s=tr.user_s, sys_s=tr.sys_s,
                     peak_rss_mb=tr.peak_rss_mb, scenario=scenario_name,
-                    # Sparse per-scenario keys: only runs of THIS scenario carry
-                    # them, so a threshold on one medians one scenario rather
-                    # than the mix. See the module docstring.
-                    **{
-                        f"wall_s__{scenario_name}": round(tr.wall_s, 6),
-                        f"peak_rss_mb__{scenario_name}": round(sampler.peak_mb, 3),
-                    },
+                    **extra,
                 )
 
         # -- Filtered-query scenarios (capability-gated) --
@@ -286,8 +294,7 @@ def run(
                     )
                     # Capability is declared, so a failure here is a contract
                     # violation — let it propagate.
-                    with PeakRssSampler() as sampler:
-                        tr = runner.read_filtered_query(output_path, predicate)
+                    tr = runner.read_filtered_query(output_path, predicate)
                     scenario_times[scen_key].append(tr.wall_s)
                     extra = tr.extra or {}
                     result.add_run(
@@ -296,10 +303,7 @@ def run(
                         scenario=scen_key,
                         predicate=predicate.name,
                         native_mechanism=extra.get("native_mechanism", "unknown"),
-                        **{
-                            f"wall_s__{scen_key}": round(tr.wall_s, 6),
-                            f"peak_rss_mb__{scen_key}": round(sampler.peak_mb, 3),
-                        },
+                        **{f"wall_s__{scen_key}": round(tr.wall_s, 6)},
                     )
         else:
             logger.info(
