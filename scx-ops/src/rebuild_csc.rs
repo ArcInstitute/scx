@@ -10,6 +10,8 @@ use std::path::Path;
 
 use scx_format_io::FramingConfig;
 
+use crate::build_csc::BuildCscOutcome;
+
 use crate::build_csc;
 
 /// Framing for a CSC-sidecar rebuild on `path`: keep the file's existing layout
@@ -55,7 +57,26 @@ pub fn rebuild_csc_inplace(
     csc_cols_per_shard: usize,
     memory_limit: &str,
     framing: Option<FramingConfig>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<BuildCscOutcome, Box<dyn std::error::Error>> {
+    // An empty matrix without a sidecar has nothing to rebuild and nothing to
+    // drop: answer without staging a copy of the file only to rename it back.
+    // (An empty matrix that still carries a stale sidecar goes through
+    // `run_build_csc`, which rewrites it without one.)
+    {
+        let reader = scx_format_io::ScxReader::open(target)?;
+        let h = reader.header();
+        // Not for a header that claims rows with no CSR shards: that is
+        // malformed, and `run_build_csc` refuses it.
+        let malformed = h.n_obs > 0 && h.n_csr_shards == 0;
+        if (h.n_obs == 0 || h.n_vars == 0) && !h.has_csc() && !malformed {
+            log::info!(
+                "rebuild-csc: {target} is an empty matrix; no CSC sidecar to restore",
+                target = target.display()
+            );
+            return Ok(BuildCscOutcome::NoSidecar);
+        }
+    }
+
     // Stage the rebuilt file beside the target so the rename is atomic
     // on the same filesystem.
     let mut tmp_name = target.file_name().map(|s| s.to_owned()).unwrap_or_default();
@@ -67,8 +88,8 @@ pub fn rebuild_csc_inplace(
     // then we swap into place. OE7: a cleanup guard removes the partial temp on
     // any failure so a failed rebuild never leaks a stray `*.rebuild_csc.tmp`;
     // this also drops the previous `exists()`-then-`remove_file` TOCTOU.
-    let build_and_swap = || -> Result<(), Box<dyn std::error::Error>> {
-        build_csc::run_build_csc(
+    let build_and_swap = || -> Result<BuildCscOutcome, Box<dyn std::error::Error>> {
+        let outcome = build_csc::run_build_csc(
             target,
             &tmp_path,
             memory_limit,
@@ -77,16 +98,25 @@ pub fn rebuild_csc_inplace(
             framing,
         )?;
         std::fs::rename(&tmp_path, target)?;
-        Ok(())
+        Ok(outcome)
     };
-    if let Err(e) = build_and_swap() {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
+    let outcome = match build_and_swap() {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
 
-    log::info!(
-        "rebuild-csc: restored CSC sidecar on {target}",
-        target = target.display()
-    );
-    Ok(())
+    match outcome {
+        BuildCscOutcome::Built => log::info!(
+            "rebuild-csc: restored CSC sidecar on {target}",
+            target = target.display()
+        ),
+        BuildCscOutcome::NoSidecar => log::info!(
+            "rebuild-csc: {target} is an empty matrix; no CSC sidecar to restore",
+            target = target.display()
+        ),
+    }
+    Ok(outcome)
 }

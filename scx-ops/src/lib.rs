@@ -38,7 +38,7 @@ pub use append::{
     append, append_from_reader, append_from_reader_with_index_options, append_with_index_options,
     AppendOptions,
 };
-pub use build_csc::run_build_csc;
+pub use build_csc::{run_build_csc, BuildCscOutcome};
 pub use codec_intent::{framing_for_rewrite, intent_from_codec_selection, seed_codec};
 pub use compact::{compact, compact_with_index_options, compact_with_options, CompactOptions};
 // Re-exported from `scx-format-io`, which is where the obs shard-boundary loop

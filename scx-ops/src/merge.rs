@@ -519,6 +519,20 @@ pub fn merge_with_options(
             cumulative_obs_rows += n_shard_rows;
         }
     }
+    if out_shard_idx == 0 {
+        // Every input was empty, so the loop wrote nothing — but a file
+        // without an obs section is unreadable (`read_obs` →
+        // `SectionNotFound`), and `carry` cannot catch it because merge's
+        // obs family is `Rebuilt`. Write input 0's own 0-row obs as one
+        // legacy section, through the same `unify_dict_columns` every chunk
+        // goes through, so the empty output has exactly the schema a
+        // populated merge of these inputs would have (plain strings for the
+        // categoricals, the `pandas` index envelope intact) — not a
+        // `RecordBatch::new_empty(schema)`, which is a third shape.
+        debug_assert_eq!(total_n_obs, 0);
+        let empty_obs = readers[0].read_obs()?;
+        writer.write_obs(&unify_dict_columns(&empty_obs)?)?;
+    }
 
     writer.write_var(&var)?;
 
@@ -714,6 +728,14 @@ pub fn merge_with_options(
                 })
                 .collect();
             if input_shards.is_empty() {
+                // A 0-row input has no layer shards for *any* layer (a layer
+                // exists on disk only as its shards, and a 0-row file has
+                // none), so it contributes nothing here rather than failing
+                // the merge. A populated input that lacks the layer is still
+                // the hard error it always was.
+                if reader.n_obs() == 0 {
+                    continue;
+                }
                 return Err(OpsError::LayerMissing {
                     name: layer_name.clone(),
                     file_index: file_idx,
@@ -1154,6 +1176,14 @@ fn merge_multimodal(
             cumulative_obs_rows += n_shard_rows;
         }
     }
+    if out_shard_idx == 0 {
+        // Every input was empty — same fallback as the single-modality
+        // emitter: one legacy obs section from input 0, or the output has no
+        // obs section at all.
+        debug_assert_eq!(total_n_obs, 0);
+        let empty_obs = readers[0].read_obs()?;
+        writer.write_obs(&unify_dict_columns(&empty_obs)?)?;
+    }
 
     // Phase 3b: stream global obsm shard-by-shard (multimodal). Same
     // pattern as single-modality: every input's shards (or legacy
@@ -1375,6 +1405,12 @@ fn merge_multimodal(
                     .catalog()
                     .layer_csr_shards_for_modality(modality_id, layer_name);
                 if shards.is_empty() {
+                    // A 0-row input has no layer shards in any modality and
+                    // contributes nothing (same exemption as the
+                    // single-modality emitter).
+                    if reader.n_obs() == 0 {
+                        continue;
+                    }
                     return Err(OpsError::LayerMissing {
                         name: format!("{}/{}", info.name, layer_name),
                         file_index: file_idx,
@@ -1807,7 +1843,9 @@ fn validate_dense_mapping_schemas(
             return Err(OpsError::DenseMappingMismatch {
                 axis,
                 key: key.to_string(),
-                detail: format!("input 0 vs input {}: {}", per.0, detail),
+                // `per_input[0]` is the first input that carries the key — not
+                // necessarily input 0, since a 0-row input is skipped upstream.
+                detail: format!("input {} vs input {}: {}", per_input[0].0, per.0, detail),
             });
         }
     }
@@ -1947,6 +1985,14 @@ fn merge_global_dense_mapping_sharded(
             } else {
                 None
             };
+            if shards.is_empty() && legacy.is_none() && reader.n_obs() == 0 {
+                // A 0-row input may lack the key entirely (a 0-row
+                // `from_anndata` output keeps obsm it was given, but an empty
+                // file produced by `subset` / `compact` carries none). It has
+                // no rows to contribute, so skip it rather than fail — the
+                // same exemption the layer loop grants.
+                continue;
+            }
             if shards.is_empty() && legacy.is_none() {
                 // §6.4: this was a bare `continue 'next_key` — the key was
                 // dropped from the output with no diagnostic, while a *layer*
@@ -2118,6 +2164,13 @@ fn merge_per_modality_dense_mapping_sharded(
             } else {
                 None
             };
+            if shards.is_empty() && legacy.is_none() && reader.n_obs() == 0 {
+                // A 0-row input has no shards for any key (it cannot: a key
+                // exists on disk only as its shards) and no rows to contribute,
+                // so it neither drops the key nor errors — same exemption as
+                // the global helper and the layer loops.
+                continue;
+            }
             if shards.is_empty() && legacy.is_none() {
                 // **Not** the global helper's hard error, deliberately. That
                 // helper's tolerance was an accident of a bare `continue`; this

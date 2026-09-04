@@ -85,6 +85,15 @@ pub fn append(
     }
     drop(target_reader);
 
+    // A 0-row input has nothing to append (and no CSR shard to read an
+    // encoding from). The CLI has always treated this as "nothing to append"
+    // and returned; match it rather than raising — an empty batch file in a
+    // pipeline of appends is a legitimate input, not an error. A *populated*
+    // input that lacks the requested modality's shards still errors below.
+    if input_reader.n_obs() == 0 {
+        return Ok(());
+    }
+
     // Detect value encoding from the first source CSR shard header (for the
     // source modality) so we can resolve Scx1+float fallback before crossing
     // into Rust.

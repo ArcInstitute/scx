@@ -703,6 +703,21 @@ pub fn from_anndata_impl(
     // to the existing in-memory path for scipy / numpy input. The
     // `extract::<PyRef<…>>()` calls are no-ops on non-matching
     // types (fail-fast, no Python call overhead).
+    let is_rewrite_route = x
+        .extract::<PyRef<crate::backed::ScxBackedSparseDataset>>()
+        .is_ok()
+        || x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>()
+            .is_ok();
+    if is_rewrite_route
+        && (!index_obs.is_empty() || !index_var.is_empty() || index_preset.is_some())
+    {
+        // The SCX → SCX rewrite routes below write no predicate index and do
+        // not take the `index_*` kwargs; silently accepting them documented a
+        // contract the path never had. Build the index afterwards instead.
+        let msg = "from_anndata: index_obs / index_var / index_preset are not applied when adata.X is an SCX-backed or lazily transformed handle (the SCX -> SCX rewrite writes no predicate index); build one afterwards with pyscx.compact(out, out2, index_obs=[...]) or `scx compact --index-obs`."
+            .to_string();
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
+    }
     if let Ok(backed) = x.extract::<PyRef<crate::backed::ScxBackedSparseDataset>>() {
         return route_scx_backed_to_scx(
             py,
@@ -1234,9 +1249,13 @@ pub fn from_anndata_impl(
 
     // Write layers
     let layers = adata.getattr("layers")?;
-    let layer_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
+    let mut layer_keys: Vec<String> = crate::pyimport::import_module(py, "builtins")?
         .call_method1("list", (layers.call_method0("keys")?,))?
         .extract()?;
+    if n_obs == 0 && !layer_keys.is_empty() {
+        super::scx_to_scx::warn_layers_dropped_at_zero_rows(py, &layer_keys)?;
+        layer_keys.clear();
+    }
     for layer_name in &layer_keys {
         let layer_x = layers.call_method1("__getitem__", (layer_name,))?;
         let (layer_csr, l_csr_validated) = ensure_csr(py, &layer_x, in_place)?;
@@ -1449,6 +1468,17 @@ fn write_raw_from_anndata(
     let Some(raw) = adata.getattr("raw").ok().filter(|r| !r.is_none()) else {
         return Ok(());
     };
+    if n_obs == 0 {
+        // Same reason as the layers: raw is recorded by its `RawCsrShard`
+        // sections (`has_raw` is derived from their presence), and a 0-row
+        // file has none. Writing `raw/var` alone would leave an orphan
+        // section behind a `has_raw() == false` header, so raw is dropped
+        // whole, with a warning.
+        let msg = "from_anndata: the AnnData has no rows; adata.raw exists on disk only as CSR shards and a 0-row file has none, so it was not written."
+            .to_string();
+        crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
+        return Ok(());
+    }
 
     let raw_x = raw.getattr("X")?;
     // Read the shape off `raw.X`, NEVER off `raw`: anndata's `Raw.shape`

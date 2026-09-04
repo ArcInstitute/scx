@@ -179,6 +179,13 @@ fn build_predicate_index_bytes_inner(
 ) -> Result<Option<Vec<u8>>> {
     use std::collections::BTreeSet;
 
+    // Zero rows: nothing to index, and a forced column is not an error —
+    // same contract as `ObsPredicateIndexBuilder::finish`. Without this a
+    // 0-row obs / var with a numeric column wrote a degenerate index.
+    if metadata.num_rows() == 0 {
+        return Ok(None);
+    }
+
     let schema = metadata.schema();
 
     // Auto-detect path: when both forced and preset are empty, use the

@@ -1794,6 +1794,454 @@ fn write_sharded_input(
     writer.finish().unwrap();
 }
 
+/// A 0-row input as `pyscx.from_anndata` writes one: a 0-row legacy obs
+/// section, the shared var (and, with `with_varm`, its var-axis `varm`,
+/// which needs no rows), **zero** CSR shards, no layers, no obsm. The
+/// format forbids framed zero-row shards ("emit no shard at all instead"),
+/// so this is the only shape an empty file takes.
+fn write_zero_row_input(path: &std::path::Path, var: &RecordBatch, with_varm: bool) {
+    let mut writer = ScxWriter::new(path, header(0, 4)).unwrap();
+    writer.write_obs(&obs_batch(0, 0, "none")).unwrap();
+    writer.write_var(var).unwrap();
+    if with_varm {
+        let n_vars = var.num_rows() as u64;
+        writer
+            .write_varm_shard(
+                "feature_emb",
+                0,
+                0,
+                n_vars,
+                n_vars,
+                &varm_batch(n_vars as usize),
+            )
+            .unwrap();
+    }
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "from_anndata".to_string(),
+            tool: "streaming_merge_append zero-row fixture".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// A merge whose inputs are all empty must still write an obs section: obs
+/// used to be written only inside the per-chunk loop, so two 0-row inputs
+/// produced a file whose `read_obs()` failed with `SectionNotFound("obs")`.
+#[test]
+fn merge_of_only_empty_inputs_writes_an_obs_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let e0 = dir.path().join("e0.scx");
+    let e1 = dir.path().join("e1.scx");
+    write_zero_row_input(&e0, &var_batch(), false);
+    write_zero_row_input(&e1, &var_batch(), false);
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[e0.as_path(), e1.as_path()], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 0);
+    assert_eq!(reader.header().n_vars, 4);
+    assert_eq!(reader.catalog().csr_shards_sorted().len(), 0);
+    let obs = reader
+        .read_obs()
+        .expect("a 0-row merge output must carry an obs section");
+    assert_eq!(obs.num_rows(), 0);
+    assert_eq!(
+        obs.schema().fields().len(),
+        2,
+        "obs schema survives: {:?}",
+        obs.schema()
+    );
+    assert_eq!(reader.read_var().unwrap().num_rows(), 4);
+    let x = reader.read_all_csr_shards().unwrap();
+    assert_eq!(x.shape, (0, 4));
+}
+
+/// A 0-row input contributes nothing — including to layers and obsm keys it
+/// has no shards for. Layer / obsm names are the union across inputs, and a
+/// 0-row input has no layer shards and no obsm section, so `LayerMissing` /
+/// `DenseMappingMissing` used to fire on it in either position.
+#[test]
+fn merge_tolerates_an_empty_input_lacking_layers_and_obsm() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full.scx");
+    // 6 rows, sharded obsm X_pca, a varm, and a 2-shard layer `spliced`.
+    write_sharded_input(&full, 6, "donor_a", &var_batch(), 3, true, 2);
+    let empty = dir.path().join("empty.scx");
+    // varm is var-axis data and survives 0 rows, so a real 0-row input
+    // carries it — and merge takes varm from input 0 only, so the
+    // `empty+full` order below reads it off the empty input.
+    write_zero_row_input(&empty, &var_batch(), true);
+
+    for (label, inputs) in [
+        ("full+empty", [full.as_path(), empty.as_path()]),
+        ("empty+full", [empty.as_path(), full.as_path()]),
+    ] {
+        let out = dir.path().join(format!("{label}.scx"));
+        scx_ops::merge(&inputs, &out).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 6, "{label}");
+        assert_eq!(reader.read_obs().unwrap().num_rows(), 6, "{label}");
+        assert_eq!(reader.layer_names(), vec!["spliced".to_string()], "{label}");
+        let layer = reader.read_layer("spliced").unwrap();
+        assert_eq!(layer.shape, (6, 4), "{label}");
+        let obsm = reader.read_obsm("X_pca").unwrap();
+        assert_eq!(obsm.num_rows(), 6, "{label}");
+        let varm = reader.read_varm("feature_emb").unwrap();
+        assert_eq!(varm.num_rows(), 4, "{label}");
+    }
+}
+
+/// A populated input with a 2-shard layer `spliced` and no obsm — the sorted
+/// emitter refuses obsm by design, so `write_sharded_input` cannot be used.
+fn write_layer_only_input(path: &std::path::Path, n_obs: u64, donor: &str) {
+    let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+    writer
+        .write_obs(&obs_batch(0, n_obs as usize, donor))
+        .unwrap();
+    writer.write_var(&var_batch()).unwrap();
+    write_zero_csr_shard(&mut writer, 0, n_obs);
+    let rows_per_shard = n_obs.div_ceil(2);
+    let mut row_start: u64 = 0;
+    for shard_idx in 0..2u32 {
+        let n_rows = rows_per_shard.min(n_obs - row_start);
+        let indptr: Vec<u64> = vec![0u64; (n_rows + 1) as usize];
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer
+            .write_layer_csr_shard("spliced", shard_idx, row_start, shard)
+            .unwrap();
+        row_start += n_rows;
+    }
+    writer.finish().unwrap();
+}
+
+/// The sorted emitter (`--sort-by`) has its own obs / layer loops, so the
+/// two empty-input rules are pinned there too: a 0-row input contributes
+/// nothing (and may lack layers), and an all-empty merge still writes obs.
+#[test]
+fn sorted_merge_tolerates_empty_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full.scx");
+    write_layer_only_input(&full, 6, "donor_a");
+    let empty = dir.path().join("empty.scx");
+    write_zero_row_input(&empty, &var_batch(), true);
+    let opts = sorted_merge_opts(&["donor"], false, false);
+
+    for (label, inputs) in [
+        ("full+empty", [full.as_path(), empty.as_path()]),
+        ("empty+full", [empty.as_path(), full.as_path()]),
+    ] {
+        let out = dir.path().join(format!("sorted_{label}.scx"));
+        scx_ops::merge_with_options(&inputs, &out, &opts)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 6, "{label}");
+        assert_eq!(reader.read_obs().unwrap().num_rows(), 6, "{label}");
+        assert_eq!(reader.layer_names(), vec!["spliced".to_string()], "{label}");
+        assert_eq!(
+            reader.read_layer("spliced").unwrap().shape,
+            (6, 4),
+            "{label}"
+        );
+    }
+
+    let e1 = dir.path().join("e1.scx");
+    write_zero_row_input(&e1, &var_batch(), false);
+    let out = dir.path().join("sorted_all_empty.scx");
+    scx_ops::merge_with_options(&[empty.as_path(), e1.as_path()], &out, &opts).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 0);
+    let obs = reader
+        .read_obs()
+        .expect("an all-empty sorted merge must carry an obs section");
+    assert_eq!(obs.num_rows(), 0);
+    assert_eq!(obs.schema().fields().len(), 2);
+}
+
+/// A 0-row multimodal input: global 0-row obs, both modalities' var, and no
+/// CSR shards in either modality (the shape `scx subset` / a compact after
+/// deleting every row produce).
+fn write_multimodal_zero_row_input(path: &std::path::Path) {
+    use scx_format_io::modality::ModalityType;
+    let mut writer = ScxWriter::new(path, header(0, 4)).unwrap();
+    writer.write_obs(&obs_batch(0, 0, "none")).unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &var_batch()).unwrap();
+    writer.write_var_for(adt_id, &var_batch()).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(adt_id, 4).unwrap();
+    writer.finish().unwrap();
+}
+
+/// `write_multimodal_with_per_modality_obsm` plus a one-shard per-modality
+/// layer `rna/spliced`, so the test below can see both families survive.
+fn write_multimodal_with_obsm_and_layer(path: &std::path::Path, n_obs: u64) {
+    use scx_format_io::modality::ModalityType;
+    let mut writer = ScxWriter::new(path, header(n_obs, 4)).unwrap();
+    writer
+        .write_obs(&obs_batch(0, n_obs as usize, "donor_a"))
+        .unwrap();
+    let rna_id = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt_id = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.write_var_for(rna_id, &var_batch()).unwrap();
+    writer.write_var_for(adt_id, &var_batch()).unwrap();
+    writer.set_modality_n_vars(rna_id, 4).unwrap();
+    writer.set_modality_n_vars(adt_id, 4).unwrap();
+    let indptr: Vec<u64> = vec![0u64; (n_obs + 1) as usize];
+    for id in [rna_id, adt_id] {
+        let shard = scx_format_io::ShardBuffers::new(
+            &indptr,
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+        );
+        writer.write_csr_shard_for(id, 0, shard).unwrap();
+    }
+    let layer =
+        scx_format_io::ShardBuffers::new(&indptr, &[], &[], CodecId::None, ValueEncoding::Uint8);
+    writer
+        .write_layer_csr_shard_for(rna_id, "spliced", 0, 0, layer)
+        .unwrap();
+    let meta = scx_format_io::DenseShardMetadata::new(0, 0, n_obs, n_obs);
+    writer
+        .write_obsm_shard_for(rna_id, "X_umap", meta, &obsm_batch(0, n_obs as usize))
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// The multimodal emitter has its own obs, per-modality layer and
+/// per-modality obsm loops; the same two rules hold there. Round 2 of the
+/// review: the per-modality obsm loop used to *drop the key* (with a warning)
+/// when the 0-row input lacked it, and the first version of this test could
+/// not see that because it read neither the embedding nor a layer.
+#[test]
+fn multimodal_merge_tolerates_empty_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full_mm.scx");
+    write_multimodal_with_obsm_and_layer(&full, 6);
+    let empty = dir.path().join("empty_mm.scx");
+    write_multimodal_zero_row_input(&empty);
+
+    for (label, inputs) in [
+        ("full+empty", [full.as_path(), empty.as_path()]),
+        ("empty+full", [empty.as_path(), full.as_path()]),
+    ] {
+        let out = dir.path().join(format!("mm_{label}.scx"));
+        scx_ops::merge(&inputs, &out).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 6, "{label}");
+        assert_eq!(reader.read_obs().unwrap().num_rows(), 6, "{label}");
+        assert!(reader.is_multimodal(), "{label}");
+        let rna = reader.modality_id("rna").expect("rna modality");
+        let umap = reader
+            .read_obsm_for(rna, "X_umap")
+            .unwrap_or_else(|e| panic!("{label}: per-modality obsm must survive: {e}"));
+        assert_eq!(umap.num_rows(), 6, "{label}");
+        assert_eq!(
+            reader.layer_names_for(rna),
+            vec!["spliced".to_string()],
+            "{label}"
+        );
+        assert_eq!(
+            reader.read_layer_for(rna, "spliced").unwrap().shape,
+            (6, 4),
+            "{label}"
+        );
+    }
+
+    let e1 = dir.path().join("e1_mm.scx");
+    write_multimodal_zero_row_input(&e1);
+    let out = dir.path().join("mm_all_empty.scx");
+    scx_ops::merge(&[empty.as_path(), e1.as_path()], &out).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 0);
+    let obs = reader
+        .read_obs()
+        .expect("an all-empty multimodal merge must carry an obs section");
+    assert_eq!(obs.num_rows(), 0);
+}
+
+/// A COO `obsp` batch in the wire format `write_obsp` expects; `data` is
+/// Float32, or Float64 when `f64_data` (to provoke a schema mismatch).
+fn coo_obsp_batch_typed(
+    rows: Vec<i32>,
+    cols: Vec<i32>,
+    data: Vec<f32>,
+    n: usize,
+    f64_data: bool,
+) -> RecordBatch {
+    let data_type = if f64_data {
+        DataType::Float64
+    } else {
+        DataType::Float32
+    };
+    let schema = Schema::new_with_metadata(
+        vec![
+            Field::new("row", DataType::Int32, false),
+            Field::new("col", DataType::Int32, false),
+            Field::new("data", data_type, false),
+        ],
+        std::collections::HashMap::from([
+            ("n_rows".to_string(), n.to_string()),
+            ("n_cols".to_string(), n.to_string()),
+        ]),
+    );
+    let data_arr: arrow::array::ArrayRef = if f64_data {
+        Arc::new(arrow::array::Float64Array::from(
+            data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+        ))
+    } else {
+        Arc::new(Float32Array::from(data))
+    };
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(rows)),
+            Arc::new(Int32Array::from(cols)),
+            data_arr,
+        ],
+    )
+    .unwrap()
+}
+
+fn coo_obsp_batch(rows: Vec<i32>, cols: Vec<i32>, data: Vec<f32>, n: usize) -> RecordBatch {
+    coo_obsp_batch_typed(rows, cols, data, n, false)
+}
+
+/// A 4-row input carrying `obsp/connectivities` with a Float32 or Float64
+/// `data` column.
+fn write_obsp_input(path: &std::path::Path, donor: &str, f64_data: bool) {
+    let mut writer = ScxWriter::new(path, header(4, 4)).unwrap();
+    writer.write_obs(&obs_batch(0, 4, donor)).unwrap();
+    writer.write_var(&var_batch()).unwrap();
+    write_zero_csr_shard(&mut writer, 0, 4);
+    writer
+        .write_obsp(
+            "connectivities",
+            &coo_obsp_batch_typed(
+                vec![0, 1, 2],
+                vec![1, 2, 3],
+                vec![1.0, 2.0, 3.0],
+                4,
+                f64_data,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// Round 3 of the review: exempting a 0-row input from the obsp presence walk
+/// made `validate_obsp_value_schemas` reachable with an empty input 0 — and it
+/// keyed its baseline to `readers[0]`, so `[empty, f32, f64]` skipped the
+/// comparison and wrote an unreadable graph. The baseline is now the first
+/// input that carries the graph.
+#[test]
+fn obsp_schema_mismatch_is_caught_when_the_first_input_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty.scx");
+    write_zero_row_input(&empty, &var_batch(), false);
+    let f32_a = dir.path().join("f32_a.scx");
+    write_obsp_input(&f32_a, "donor_a", false);
+    let f32_b = dir.path().join("f32_b.scx");
+    write_obsp_input(&f32_b, "donor_b", false);
+    let f64_c = dir.path().join("f64_c.scx");
+    write_obsp_input(&f64_c, "donor_c", true);
+
+    let out = dir.path().join("mismatch.scx");
+    let err = scx_ops::merge(&[empty.as_path(), f32_a.as_path(), f64_c.as_path()], &out)
+        .expect_err("an empty input 0 must not hide a dtype mismatch between inputs 1 and 2");
+    let msg = err.to_string();
+    assert!(msg.contains("input 1 vs input 2"), "{msg}");
+
+    // Agreeing populated graphs behind an empty input 0 still merge.
+    let out = dir.path().join("ok.scx");
+    scx_ops::merge(&[empty.as_path(), f32_a.as_path(), f32_b.as_path()], &out).unwrap();
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 8);
+    assert_eq!(reader.read_obsp("connectivities").unwrap().num_rows(), 6);
+}
+
+/// `merge_obsp` validated every input carried the graph before writing; a
+/// 0-row input cannot, so `merge([clustered, empty])` used to fail with
+/// `DenseMappingMissing` on the concat path.
+#[test]
+fn merge_tolerates_an_empty_input_lacking_obsp() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full.scx");
+    {
+        let mut writer = ScxWriter::new(&full, header(4, 4)).unwrap();
+        writer.write_obs(&obs_batch(0, 4, "donor_a")).unwrap();
+        writer.write_var(&var_batch()).unwrap();
+        write_zero_csr_shard(&mut writer, 0, 4);
+        writer
+            .write_obsp(
+                "connectivities",
+                &coo_obsp_batch(vec![0, 1, 2], vec![1, 2, 3], vec![1.0, 2.0, 3.0], 4),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let empty = dir.path().join("empty.scx");
+    write_zero_row_input(&empty, &var_batch(), false);
+
+    for (label, inputs) in [
+        ("full+empty", [full.as_path(), empty.as_path()]),
+        ("empty+full", [empty.as_path(), full.as_path()]),
+    ] {
+        let out = dir.path().join(format!("obsp_{label}.scx"));
+        scx_ops::merge(&inputs, &out).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 4, "{label}");
+        let graph = reader
+            .read_obsp("connectivities")
+            .unwrap_or_else(|e| panic!("{label}: obsp must survive: {e}"));
+        assert_eq!(graph.num_rows(), 3, "{label}: three COO entries");
+    }
+}
+
 /// Legacy single-section obsm `X_pca` (and optional legacy single-section
 /// varm `feature_emb`). Used by the mixed-layout merge test.
 fn write_legacy_obsm_input(

@@ -590,6 +590,52 @@ fn streaming_builder_matches_batch_auto_detect() {
     assert!(stream_outcomes.is_empty());
 }
 
+/// Zero rows: neither the streaming nor the batch builder writes an index,
+/// even for a forced column — a 0-row file (`from_anndata` on an empty
+/// AnnData, `compact` after deleting every row) would otherwise carry a
+/// degenerate index describing nothing, and a forced column would have
+/// reached the dtype gate with pyarrow's `null` inference.
+#[test]
+fn zero_rows_build_no_index_even_when_forced() {
+    let batch = make_obs_batch().slice(0, 0);
+    assert_eq!(batch.num_rows(), 0);
+    let options = PredicateIndexBuildOptions {
+        forced_columns: vec!["cell_type".to_string(), "n_genes".to_string()],
+        ..Default::default()
+    };
+
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let mut builder = ObsPredicateIndexBuilder::new(batch.schema(), &options).unwrap();
+    builder.push_shard_split(&batch, 0, &[]).unwrap();
+    let bytes = builder.finish(&[], &mut outcomes, &mut names).unwrap();
+    assert!(
+        bytes.is_none(),
+        "streaming builder must write no index at 0 rows"
+    );
+    assert!(
+        outcomes.is_empty(),
+        "a forced column at 0 rows is not an error: {outcomes:?}"
+    );
+    assert!(names.is_empty());
+
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes =
+        build_obs_predicate_index_bytes(&batch, &[], &options, &mut outcomes, &mut names).unwrap();
+    assert!(
+        bytes.is_none(),
+        "batch builder must write no index at 0 rows"
+    );
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+    let mut outcomes = Vec::new();
+    let mut names = Vec::new();
+    let bytes =
+        build_var_predicate_index_bytes(&batch, &[], &options, &mut outcomes, &mut names).unwrap();
+    assert!(bytes.is_none());
+    assert!(outcomes.is_empty(), "{outcomes:?}");
+}
+
 #[test]
 fn streaming_builder_named_forced_column() {
     // Force the `cell_type` column under named mode and verify the

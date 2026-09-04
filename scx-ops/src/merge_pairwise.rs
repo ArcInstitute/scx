@@ -227,6 +227,13 @@ fn merge_obsp(
             )
             .is_empty()
             {
+                // A 0-row input cannot carry a graph (it exists on disk only
+                // as its shards) and has no endpoints to offset; it contributes
+                // nothing rather than failing the merge — the same exemption
+                // the layer and dense-mapping loops grant.
+                if reader.n_obs() == 0 {
+                    continue;
+                }
                 return Err(OpsError::DenseMappingMissing {
                     axis: "obsp",
                     key,
@@ -322,23 +329,29 @@ fn validate_obsp_value_schemas(readers: &[ScxReader], key: &str) -> Result<()> {
             .map(|(_, f)| (f.data_type().clone(), f.is_nullable())))
     };
 
-    let Some(first) = value_field(&readers[0])? else {
-        return Ok(());
-    };
-    for (idx, reader) in readers.iter().enumerate().skip(1) {
+    // The baseline is the first input that *carries* the graph, not input 0:
+    // a 0-row input has no shards (the presence walk exempts it), and keying
+    // the baseline to `readers[0]` made an empty-first merge skip the
+    // comparison of its populated siblings altogether.
+    let mut first: Option<(usize, (arrow::datatypes::DataType, bool))> = None;
+    for (idx, reader) in readers.iter().enumerate() {
         let Some(other) = value_field(reader)? else {
             continue;
         };
-        if other != first {
+        let Some((first_idx, first_field)) = first.as_ref() else {
+            first = Some((idx, other));
+            continue;
+        };
+        if other != *first_field {
             return Err(OpsError::DenseMappingMismatch {
                 axis: "obsp",
                 key: key.to_string(),
                 detail: format!(
-                    "input 0 vs input {idx}: 'data' column is {:?} (nullable={}) vs {:?} \
+                    "input {first_idx} vs input {idx}: 'data' column is {:?} (nullable={}) vs {:?} \
                      (nullable={}). The merged shards would be written under one key and \
                      `read_all_obsp` concatenates them under a single schema, so the graph \
                      would be unreadable. Cast them to one dtype before merging.",
-                    first.0, first.1, other.0, other.1,
+                    first_field.0, first_field.1, other.0, other.1,
                 ),
             });
         }

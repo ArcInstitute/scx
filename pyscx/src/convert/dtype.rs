@@ -3,7 +3,8 @@
 // Extracted from the former pyscx/src/anndata.rs (T5.7).
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatchOptions;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::collections::HashSet;
@@ -65,22 +66,42 @@ pub(crate) fn codec_selection_params_json(profile: &str) -> String {
 }
 
 /// Convert a pandas DataFrame to an Arrow RecordBatch via pyarrow IPC.
+///
+/// A **0-row** frame takes a different route through pyarrow: `write_table`
+/// emits zero IPC batches for a 0-row table (there is no batch to write), and
+/// rebuilding an empty batch from the schema alone on the Rust side would
+/// lose every categorical's declared dictionary — dictionary values live in
+/// the array, not the schema. `RecordBatch.from_pandas` + `write_batch` emits
+/// one real 0-row batch that carries the dictionaries and the `ordered` flag,
+/// so a 0-row obs keeps `pd.Categorical([], categories=[...])`'s categories
+/// exactly as a populated one does. The result is then run through
+/// [`coerce_null_fields_for_empty_batch`]. Frames with rows are untouched.
 pub(crate) fn pandas_to_record_batch(
     py: Python<'_>,
     df: &Bound<'_, PyAny>,
 ) -> PyResult<RecordBatch> {
     let pa = crate::pyimport::import_module(py, "pyarrow")?;
-    let table_cls = pa.getattr("Table")?;
-    let table = table_cls.call_method1("from_pandas", (df,))?;
+    let n_rows = df.len()?;
 
     // Serialize to IPC bytes
     let sink_cls = pa.getattr("BufferOutputStream")?;
     let sink = sink_cls.call0()?;
     let ipc = pa.getattr("ipc")?;
-    let schema = table.getattr("schema")?;
-    let writer = ipc.call_method1("new_file", (&sink, &schema))?;
-    writer.call_method1("write_table", (&table,))?;
-    writer.call_method0("close")?;
+    if n_rows == 0 {
+        let rb = pa
+            .getattr("RecordBatch")?
+            .call_method1("from_pandas", (df,))?;
+        let schema = rb.getattr("schema")?;
+        let writer = ipc.call_method1("new_file", (&sink, &schema))?;
+        writer.call_method1("write_batch", (&rb,))?;
+        writer.call_method0("close")?;
+    } else {
+        let table = pa.getattr("Table")?.call_method1("from_pandas", (df,))?;
+        let schema = table.getattr("schema")?;
+        let writer = ipc.call_method1("new_file", (&sink, &schema))?;
+        writer.call_method1("write_table", (&table,))?;
+        writer.call_method0("close")?;
+    }
     let buf = sink.call_method0("getvalue")?;
     let py_bytes = buf.call_method0("to_pybytes")?;
     let bytes: &[u8] = py_bytes.extract()?;
@@ -98,6 +119,11 @@ pub(crate) fn pandas_to_record_batch(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let batch = scx_format_io::downcast_large_types(&batch)
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let batch = if batch.num_rows() == 0 {
+        coerce_null_fields_for_empty_batch(&batch)?
+    } else {
+        batch
+    };
 
     // `pyarrow.Table.from_pandas` drops the pandas `ordered` flag of categorical
     // columns. Re-stamp the `scx.categorical.ordered` field metadata the read
@@ -108,6 +134,64 @@ pub(crate) fn pandas_to_record_batch(
         return Ok(batch);
     }
     stamp_ordered_categorical_metadata(&batch, &ordered)
+}
+
+/// Store the columns pyarrow could not type in a 0-row frame as string.
+///
+/// With no values to look at, pyarrow infers Arrow `Null` for an empty
+/// `object` column **and for the index** (`__index_level_0__`) of an empty
+/// frame, and `Dictionary(_, Null)` for a categorical that anndata's row
+/// subset pruned to zero categories. No populated frame ever produces those
+/// types (an `object` string column is `string`), so leaving them would give
+/// a 0-row file a schema its populated sibling never matches — `append`'s
+/// obs-schema check, `merge`'s column unification and a forced `index_obs=`
+/// (whose dtype gate rejects `Null`) all compare against it. String is what
+/// pyarrow would have inferred from one row, and it is what `read_obs()`
+/// returns for the column either way (`object`).
+///
+/// Zero rows only: a populated all-null column is genuinely typeless and
+/// keeps round-tripping as `Null`. Field metadata (the `scx.categorical.*`
+/// stamps) and the schema's `pandas` envelope are preserved.
+fn coerce_null_fields_for_empty_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
+    debug_assert_eq!(batch.num_rows(), 0);
+    fn coerced(dt: &DataType) -> Option<DataType> {
+        match dt {
+            DataType::Null => Some(DataType::Utf8),
+            DataType::Dictionary(key, value) if **value == DataType::Null => {
+                Some(DataType::Dictionary(key.clone(), Box::new(DataType::Utf8)))
+            }
+            _ => None,
+        }
+    }
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| coerced(f.data_type()).is_some())
+    {
+        return Ok(batch.clone());
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        match coerced(field.data_type()) {
+            Some(dt) => {
+                columns.push(arrow::array::new_empty_array(&dt));
+                fields.push(Arc::new(field.as_ref().clone().with_data_type(dt)));
+            }
+            None => {
+                columns.push(column.clone());
+                fields.push(field.clone());
+            }
+        }
+    }
+    let new_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new_with_options(
+        new_schema,
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(0)),
+    )
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
 /// Names of columns in a pandas DataFrame that are ordered categoricals
