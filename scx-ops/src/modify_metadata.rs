@@ -551,6 +551,14 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
         } else {
             Vec::new()
         };
+        // A 0-row obs cannot be sharded: the loop would emit no shard and the
+        // file would lose its obs section (`read_obs` → `SectionNotFound`).
+        // Same rule as `scx_format_io::write_obs_section` — an empty batch is
+        // written as the single legacy section. The index builder (if any)
+        // finishes over zero rows and writes nothing.
+        if n == 0 {
+            writer.write_obs(obs)?;
+        }
         while cursor < n {
             let take = std::cmp::min(shard_target_rows, n - cursor);
             let chunk = obs.slice(cursor, take);

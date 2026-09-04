@@ -519,6 +519,20 @@ pub fn merge_with_options(
             cumulative_obs_rows += n_shard_rows;
         }
     }
+    if out_shard_idx == 0 {
+        // Every input was empty, so the loop wrote nothing — but a file
+        // without an obs section is unreadable (`read_obs` →
+        // `SectionNotFound`), and `carry` cannot catch it because merge's
+        // obs family is `Rebuilt`. Write input 0's own 0-row obs as one
+        // legacy section, through the same `unify_dict_columns` every chunk
+        // goes through, so the empty output has exactly the schema a
+        // populated merge of these inputs would have (plain strings for the
+        // categoricals, the `pandas` index envelope intact) — not a
+        // `RecordBatch::new_empty(schema)`, which is a third shape.
+        debug_assert_eq!(total_n_obs, 0);
+        let empty_obs = readers[0].read_obs()?;
+        writer.write_obs(&unify_dict_columns(&empty_obs)?)?;
+    }
 
     writer.write_var(&var)?;
 
@@ -714,6 +728,14 @@ pub fn merge_with_options(
                 })
                 .collect();
             if input_shards.is_empty() {
+                // A 0-row input has no layer shards for *any* layer (a layer
+                // exists on disk only as its shards, and a 0-row file has
+                // none), so it contributes nothing here rather than failing
+                // the merge. A populated input that lacks the layer is still
+                // the hard error it always was.
+                if reader.n_obs() == 0 {
+                    continue;
+                }
                 return Err(OpsError::LayerMissing {
                     name: layer_name.clone(),
                     file_index: file_idx,
@@ -1947,6 +1969,14 @@ fn merge_global_dense_mapping_sharded(
             } else {
                 None
             };
+            if shards.is_empty() && legacy.is_none() && reader.n_obs() == 0 {
+                // A 0-row input may lack the key entirely (a 0-row
+                // `from_anndata` output keeps obsm it was given, but an empty
+                // file produced by `subset` / `compact` carries none). It has
+                // no rows to contribute, so skip it rather than fail — the
+                // same exemption the layer loop grants.
+                continue;
+            }
             if shards.is_empty() && legacy.is_none() {
                 // §6.4: this was a bare `continue 'next_key` — the key was
                 // dropped from the output with no diagnostic, while a *layer*

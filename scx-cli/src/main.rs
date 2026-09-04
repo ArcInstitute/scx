@@ -1730,6 +1730,21 @@ fn main() {
             // re-authorise per-shard codec re-selection, the opposite of what a
             // sidecar rebuild needs.
             let framing = scx_ops::framing_for_csc_rebuild(&input);
+            // An empty matrix gets no sidecar (`run_build_csc` is a no-op
+            // that still produces <OUTPUT>); say so instead of "Built".
+            let empty_matrix = scx_format_io::ScxReader::open(&input)
+                .map(|r| r.header().n_obs == 0 || r.header().n_vars == 0)
+                .unwrap_or(false);
+            let done = |what: &str| {
+                if empty_matrix {
+                    println!(
+                        "{} is an empty matrix (0 rows or 0 columns); no CSC sidecar to build{what}",
+                        input.display()
+                    );
+                } else {
+                    println!("Built CSC sidecar on {}{what}", input.display());
+                }
+            };
             match output {
                 Some(output) => scx_ops::run_build_csc(
                     &input,
@@ -1738,7 +1753,8 @@ fn main() {
                     force,
                     csc_cols_per_shard,
                     framing,
-                ),
+                )
+                .map(|()| done(&format!(" -> {}", output.display()))),
                 // In place, so there is no output to overwrite. Refuse
                 // `--force` rather than ignore it: silently accepting it would
                 // imply a guard that does not exist.
@@ -1747,9 +1763,7 @@ fn main() {
                     .into()),
                 None => {
                     scx_ops::rebuild_csc_inplace(&input, csc_cols_per_shard, &memory_limit, framing)
-                        .map(|()| {
-                            println!("Built CSC sidecar on {} (in place)", input.display());
-                        })
+                        .map(|()| done(" (in place)"))
                 }
             }
         }

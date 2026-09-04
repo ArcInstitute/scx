@@ -55,7 +55,17 @@ impl CscPolicy {
     /// Resolve the policy to a build/no-build decision once the matrix
     /// shape is known. `Auto` compares `(n_obs, n_vars)` against the
     /// (env-tunable) thresholds; both must be met.
+    ///
+    /// An **empty matrix** — either axis zero — never gets a sidecar, whatever
+    /// the policy: a 0-row file has no CSR shards to transpose and a 0-column
+    /// file has no CSC columns to emit, so `Always` would only add a section
+    /// that indexes nothing (and every `--rebuild-csc` caller would then
+    /// have to special-case it). Silent by design; there is nothing to warn
+    /// about.
     pub fn should_build_csc(self, n_obs: u64, n_vars: u64) -> bool {
+        if n_obs == 0 || n_vars == 0 {
+            return false;
+        }
         match self {
             Self::Off => false,
             Self::Always => true,
@@ -111,6 +121,20 @@ mod tests {
     #[test]
     fn off_and_always_ignore_shape() {
         assert!(!CscPolicy::Off.should_build_csc(10_000_000, 100_000));
+        assert!(CscPolicy::Always.should_build_csc(1, 1));
+    }
+
+    /// An empty matrix has nothing for a sidecar to index: no policy builds
+    /// one when either axis is zero (`n_obs == 0` → zero CSR shards to
+    /// transpose; `n_vars == 0` → zero CSC columns to emit).
+    #[test]
+    fn empty_matrix_never_builds() {
+        for policy in [CscPolicy::Always, CscPolicy::Auto, CscPolicy::Off] {
+            assert!(!policy.should_build_csc(0, 5), "{policy:?} at (0, 5)");
+            assert!(!policy.should_build_csc(10, 0), "{policy:?} at (10, 0)");
+            assert!(!policy.should_build_csc(0, 0), "{policy:?} at (0, 0)");
+        }
+        // The rows > 0 && cols > 0 answer is unchanged.
         assert!(CscPolicy::Always.should_build_csc(1, 1));
     }
 

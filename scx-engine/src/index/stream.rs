@@ -466,6 +466,15 @@ impl ObsPredicateIndexBuilder {
         outcomes: &mut Vec<BuildOutcome>,
         indexed_column_names: &mut Vec<String>,
     ) -> Result<Option<Vec<u8>>> {
+        // Zero rows: there is nothing to index. Return before the per-column
+        // walk so a *forced* column is not reported as an error and no
+        // degenerate index (a numeric column with no leaf pages, a categorical
+        // with no entries) is written. A 0-row file — `from_anndata` on an
+        // empty AnnData, `compact` after deleting every row, `merge` of empty
+        // inputs — reads its obs by a full scan, which is a scan of nothing.
+        if self.rows_pushed == 0 {
+            return Ok(None);
+        }
         let push_outcome = |outcomes: &mut Vec<BuildOutcome>,
                             col_name: &str,
                             is_forced: bool,

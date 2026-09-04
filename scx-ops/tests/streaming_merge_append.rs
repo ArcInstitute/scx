@@ -1794,6 +1794,107 @@ fn write_sharded_input(
     writer.finish().unwrap();
 }
 
+/// A 0-row input as `pyscx.from_anndata` writes one: a 0-row legacy obs
+/// section, the shared var (and, with `with_varm`, its var-axis `varm`,
+/// which needs no rows), **zero** CSR shards, no layers, no obsm. The
+/// format forbids framed zero-row shards ("emit no shard at all instead"),
+/// so this is the only shape an empty file takes.
+fn write_zero_row_input(path: &std::path::Path, var: &RecordBatch, with_varm: bool) {
+    let mut writer = ScxWriter::new(path, header(0, 4)).unwrap();
+    writer.write_obs(&obs_batch(0, 0, "none")).unwrap();
+    writer.write_var(var).unwrap();
+    if with_varm {
+        let n_vars = var.num_rows() as u64;
+        writer
+            .write_varm_shard(
+                "feature_emb",
+                0,
+                0,
+                n_vars,
+                n_vars,
+                &varm_batch(n_vars as usize),
+            )
+            .unwrap();
+    }
+    writer
+        .write_provenance(vec![ProvenanceEntry {
+            timestamp: 1710000000,
+            action: "from_anndata".to_string(),
+            tool: "streaming_merge_append zero-row fixture".to_string(),
+            params_json: "{}".to_string(),
+            input_checksums: vec![],
+        }])
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// A merge whose inputs are all empty must still write an obs section: obs
+/// used to be written only inside the per-chunk loop, so two 0-row inputs
+/// produced a file whose `read_obs()` failed with `SectionNotFound("obs")`.
+#[test]
+fn merge_of_only_empty_inputs_writes_an_obs_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let e0 = dir.path().join("e0.scx");
+    let e1 = dir.path().join("e1.scx");
+    write_zero_row_input(&e0, &var_batch(), false);
+    write_zero_row_input(&e1, &var_batch(), false);
+    let out = dir.path().join("merged.scx");
+    scx_ops::merge(&[e0.as_path(), e1.as_path()], &out).unwrap();
+
+    let reader = ScxReader::open(&out).unwrap();
+    assert_eq!(reader.header().n_obs, 0);
+    assert_eq!(reader.header().n_vars, 4);
+    assert_eq!(reader.catalog().csr_shards_sorted().len(), 0);
+    let obs = reader
+        .read_obs()
+        .expect("a 0-row merge output must carry an obs section");
+    assert_eq!(obs.num_rows(), 0);
+    assert_eq!(
+        obs.schema().fields().len(),
+        2,
+        "obs schema survives: {:?}",
+        obs.schema()
+    );
+    assert_eq!(reader.read_var().unwrap().num_rows(), 4);
+    let x = reader.read_all_csr_shards().unwrap();
+    assert_eq!(x.shape, (0, 4));
+}
+
+/// A 0-row input contributes nothing — including to layers and obsm keys it
+/// has no shards for. Layer / obsm names are the union across inputs, and a
+/// 0-row input has no layer shards and no obsm section, so `LayerMissing` /
+/// `DenseMappingMissing` used to fire on it in either position.
+#[test]
+fn merge_tolerates_an_empty_input_lacking_layers_and_obsm() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = dir.path().join("full.scx");
+    // 6 rows, sharded obsm X_pca, a varm, and a 2-shard layer `spliced`.
+    write_sharded_input(&full, 6, "donor_a", &var_batch(), 3, true, 2);
+    let empty = dir.path().join("empty.scx");
+    // varm is var-axis data and survives 0 rows, so a real 0-row input
+    // carries it — and merge takes varm from input 0 only, so the
+    // `empty+full` order below reads it off the empty input.
+    write_zero_row_input(&empty, &var_batch(), true);
+
+    for (label, inputs) in [
+        ("full+empty", [full.as_path(), empty.as_path()]),
+        ("empty+full", [empty.as_path(), full.as_path()]),
+    ] {
+        let out = dir.path().join(format!("{label}.scx"));
+        scx_ops::merge(&inputs, &out).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 6, "{label}");
+        assert_eq!(reader.read_obs().unwrap().num_rows(), 6, "{label}");
+        assert_eq!(reader.layer_names(), vec!["spliced".to_string()], "{label}");
+        let layer = reader.read_layer("spliced").unwrap();
+        assert_eq!(layer.shape, (6, 4), "{label}");
+        let obsm = reader.read_obsm("X_pca").unwrap();
+        assert_eq!(obsm.num_rows(), 6, "{label}");
+        let varm = reader.read_varm("feature_emb").unwrap();
+        assert_eq!(varm.num_rows(), 4, "{label}");
+    }
+}
+
 /// Legacy single-section obsm `X_pca` (and optional legacy single-section
 /// varm `feature_emb`). Used by the mixed-layout merge test.
 fn write_legacy_obsm_input(

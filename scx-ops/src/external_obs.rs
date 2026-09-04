@@ -1224,6 +1224,17 @@ pub(crate) fn write_obs_shards_from_whole(
             "shard_target_rows must be non-zero to write obs shards".into(),
         ));
     }
+    // A 0-row obs cannot be sharded: the loop below would emit no shard and
+    // the file would lose its obs section altogether (`read_obs` →
+    // `SectionNotFound`). Same rule as `scx_format_io::write_obs_section` —
+    // an empty batch is written as the single legacy section. Not reachable
+    // through the two imports today (the join guard refuses a zero-match
+    // attach, so `n > 0` here); kept so the shared writer cannot lose an axis
+    // if a caller ever hands it one.
+    if n == 0 {
+        writer.write_obs(obs)?;
+        return Ok(());
+    }
     let mut cursor = 0usize;
     let mut idx = 0u32;
     while cursor < n {

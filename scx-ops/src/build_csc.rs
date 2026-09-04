@@ -56,7 +56,26 @@ pub fn run_build_csc(
     let reader = ScxReader::open(input)?;
     let in_header = reader.header();
 
-    // 5. Validate: input has CSR shards
+    // 5. An empty matrix (0 rows or 0 columns) has nothing to transpose:
+    //    the op is a no-op, but the requested output must still exist —
+    //    `rebuild_csc_inplace` and the convert / sort / subset `--rebuild-csc`
+    //    callers rename it into place, and a rewrite that yielded zero rows
+    //    must not fail after the fact. A file whose header *claims* rows but
+    //    carries no CSR shards is malformed and stays an error (below).
+    if in_header.n_obs == 0 || in_header.n_vars == 0 {
+        log::info!(
+            "build-csc: {} is an empty matrix ({} x {}); no CSC sidecar to build",
+            input.display(),
+            in_header.n_obs,
+            in_header.n_vars
+        );
+        if output != input {
+            std::fs::copy(input, output)?;
+        }
+        return Ok(());
+    }
+
+    // 6. Validate: input has CSR shards
     if in_header.n_csr_shards == 0 {
         return Err("Input file has no CSR shards".into());
     }
@@ -630,6 +649,31 @@ mod tests {
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("no CSR shards"));
+    }
+
+    /// An empty matrix (`n_obs == 0` here) has nothing to transpose, so
+    /// `build-csc` is a no-op that still produces the requested output — the
+    /// `--rebuild-csc` / `rebuild_csc=True` callers rename that output into
+    /// place and must not fail on a rewrite that yielded zero rows. Distinct
+    /// from `test_build_csc_no_csr_error`, whose header *claims* rows.
+    #[test]
+    fn test_build_csc_empty_matrix_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(0, 2)).unwrap();
+        writer.write_obs(&sample_obs(0)).unwrap();
+        writer.write_var(&sample_var(2)).unwrap();
+        writer.finish().unwrap();
+
+        let output = dir.path().join("output.scx");
+        run_build_csc(&path, &output, "4G", false, 5000, None)
+            .expect("build-csc on an empty matrix must succeed");
+        let reader = ScxReader::open(&output).unwrap();
+        assert!(!reader.header().has_csc());
+        assert_eq!(reader.header().n_obs, 0);
+        assert_eq!(reader.header().n_vars, 2);
+        assert_eq!(reader.read_obs().unwrap().num_rows(), 0);
+        assert_eq!(reader.read_var().unwrap().num_rows(), 2);
     }
 
     /// write a small CSR-only file, run build-csc with
