@@ -513,16 +513,11 @@ fn render_text(model: &InfoModel) -> CliResult<()> {
     Ok(())
 }
 
-/// Human-readable name for a raw `value_encoding` header byte.
+/// Human-readable name for a raw `value_encoding` header byte — the numpy
+/// dtype name (`ValueEncoding::numpy_name`), or `"unknown"` for a byte the
+/// enum does not know.
 fn value_encoding_name(byte: u8) -> &'static str {
-    match ValueEncoding::from_u8(byte) {
-        Some(ValueEncoding::Uint8) => "uint8",
-        Some(ValueEncoding::Uint16) => "uint16",
-        Some(ValueEncoding::Uint32) => "uint32",
-        Some(ValueEncoding::Float32) => "float32",
-        Some(ValueEncoding::Float16) => "float16",
-        None => "unknown",
-    }
+    ValueEncoding::from_u8(byte).map_or("unknown", |v| v.numpy_name())
 }
 
 /// Render all info as JSON.
