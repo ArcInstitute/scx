@@ -486,6 +486,16 @@ pub(crate) fn emit_sorted(
                 &mut cumulative,
             )?;
         }
+        if out_shard_idx == 0 {
+            // Every input was empty: `order` had nothing to drain, so no obs
+            // shard was written — and a file without an obs section is
+            // unreadable. Write input 0's own 0-row obs as one legacy section
+            // through the same `unify_dict_columns` every chunk goes through
+            // (mirrors the plain merge emitter).
+            debug_assert_eq!(total_n_obs, 0);
+            let empty_obs = readers[0].read_obs()?;
+            writer.write_obs(&crate::append::unify_dict_columns(&empty_obs)?)?;
+        }
     }
 
     // ---- X ----
@@ -526,9 +536,14 @@ pub(crate) fn emit_sorted(
         names
     };
     for layer_name in &layer_names {
-        // Every input must carry the layer (matches plain-merge semantics).
+        // Every input must carry the layer (matches plain-merge semantics) —
+        // except a 0-row input, which has no layer shards for any layer and
+        // contributes nothing.
         for (idx, r) in readers.iter().enumerate() {
             if layer_entries(r, layer_name).is_empty() {
+                if r.n_obs() == 0 {
+                    continue;
+                }
                 return Err(OpsError::LayerMissing {
                     name: layer_name.clone(),
                     file_index: idx,

@@ -21,6 +21,28 @@ use crate::rewrite_helpers;
 /// framing from a source that was already framed**; the framing-preserving entry
 /// point for arbitrary files is `scx optimize`, so mutating-op callers that don't
 /// thread framing pass `None` deliberately.
+/// What `build-csc` did, so callers print the truth rather than "Built".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildCscOutcome {
+    /// At least one CSC shard was written.
+    Built,
+    /// The matrix is empty (0 rows or 0 columns): there is nothing to
+    /// transpose, the output carries no CSC sidecar — and if the input had a
+    /// stale one, it is gone.
+    NoSidecar,
+}
+
+/// `input` and `output` name the same file — by canonical path when both
+/// resolve, else lexically. `std::fs::copy` opens the destination with
+/// `O_TRUNC`, so copying a file onto itself through a different spelling
+/// (`./a.scx` vs `a.scx`) would truncate the source before reading it.
+fn same_file(input: &Path, output: &Path) -> bool {
+    match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => input == output,
+    }
+}
+
 pub fn run_build_csc(
     input: &Path,
     output: &Path,
@@ -28,7 +50,7 @@ pub fn run_build_csc(
     force: bool,
     csc_cols_per_shard: usize,
     framing: Option<FramingConfig>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<BuildCscOutcome, Box<dyn std::error::Error>> {
     // 1. Parse memory limit string ("4G" → 4 * 1024^3 bytes). Shares the
     //    workspace parser so --memory-limit accepts the same forms as
     //    `scx convert --memory-budget` (K/M/G/T, KiB/MiB/GiB/TiB; decimals
@@ -56,23 +78,58 @@ pub fn run_build_csc(
     let reader = ScxReader::open(input)?;
     let in_header = reader.header();
 
-    // 5. An empty matrix (0 rows or 0 columns) has nothing to transpose:
-    //    the op is a no-op, but the requested output must still exist —
-    //    `rebuild_csc_inplace` and the convert / sort / subset `--rebuild-csc`
-    //    callers rename it into place, and a rewrite that yielded zero rows
-    //    must not fail after the fact. A file whose header *claims* rows but
-    //    carries no CSR shards is malformed and stays an error (below).
-    if in_header.n_obs == 0 || in_header.n_vars == 0 {
+    // 5. A 0-row matrix has no CSR shards to transpose (the format forbids
+    //    framed zero-row shards, so an empty file carries none), but the
+    //    requested output must still exist — `rebuild_csc_inplace` and the
+    //    convert / sort / subset `--rebuild-csc` callers rename it into place,
+    //    and a rewrite that yielded zero rows must not fail after the fact.
+    //    Two shapes: an input without a sidecar is copied verbatim; an input
+    //    that still carries one (written under the pre-0.17 `CscPolicy::Always`,
+    //    which emitted a CSC shard of empty columns) is rewritten without it,
+    //    so "an empty matrix has no sidecar" does not depend on how the file
+    //    was made. A header that *claims* rows but has no CSR shards is
+    //    malformed and stays an error (below). A 0-**column** matrix with rows
+    //    takes the normal path: its CSR shards are re-emitted and the column
+    //    loop writes zero CSC shards.
+    if in_header.n_obs == 0 {
+        let has_csc = reader
+            .catalog()
+            .entries
+            .iter()
+            .any(|e| e.section_type == scx_format_io::section::SectionType::CscShard);
         log::info!(
-            "build-csc: {} is an empty matrix ({} x {}); no CSC sidecar to build",
+            "build-csc: {} has no rows; no CSC sidecar to build{}",
             input.display(),
-            in_header.n_obs,
-            in_header.n_vars
+            if has_csc {
+                " (dropping the stale one)"
+            } else {
+                ""
+            }
         );
-        if output != input {
-            std::fs::copy(input, output)?;
+        if !has_csc {
+            if !same_file(input, output) {
+                std::fs::copy(input, output)?;
+            }
+            return Ok(BuildCscOutcome::NoSidecar);
         }
-        return Ok(());
+        let out_header = FileHeader {
+            manifest_sequence: in_header.manifest_sequence + 1,
+            ..in_header.clone()
+        };
+        let mut writer = ScxWriter::new(output, out_header)?
+            .with_data_generation(reader.catalog().data_generation);
+        rewrite_helpers::copy_obs_var_preserving_layout(&reader, &mut writer)?;
+        let params_json = format!(
+            "{{\"memory_limit\":\"{memory_limit}\",\"csc_cols_per_shard\":{csc_cols_per_shard}}}"
+        );
+        rewrite_helpers::copy_auxiliary_sections(&reader, &mut writer, "build-csc", &params_json)?;
+        crate::carry::audit_staged(
+            crate::carry::RewriteOp::BuildCsc,
+            &[reader.catalog()],
+            &writer,
+        )?;
+        writer.finish()?;
+        return Ok(BuildCscOutcome::NoSidecar);
     }
 
     // 6. Validate: input has CSR shards
@@ -370,7 +427,13 @@ pub fn run_build_csc(
         n_csc_shards_written,
         if n_csc_shards_written == 1 { "" } else { "s" },
     );
-    Ok(())
+
+    Ok(if n_csc_shards_written == 0 {
+        // A 0-column matrix: the column loop above had nothing to emit.
+        BuildCscOutcome::NoSidecar
+    } else {
+        BuildCscOutcome::Built
+    })
 }
 
 #[cfg(test)]
@@ -666,14 +729,75 @@ mod tests {
         writer.finish().unwrap();
 
         let output = dir.path().join("output.scx");
-        run_build_csc(&path, &output, "4G", false, 5000, None)
+        let outcome = run_build_csc(&path, &output, "4G", false, 5000, None)
             .expect("build-csc on an empty matrix must succeed");
+        assert_eq!(outcome, BuildCscOutcome::NoSidecar);
         let reader = ScxReader::open(&output).unwrap();
         assert!(!reader.header().has_csc());
         assert_eq!(reader.header().n_obs, 0);
         assert_eq!(reader.header().n_vars, 2);
         assert_eq!(reader.read_obs().unwrap().num_rows(), 0);
         assert_eq!(reader.read_var().unwrap().num_rows(), 2);
+    }
+
+    /// A 0-row file written under the pre-0.17 `CscPolicy::Always` carries a
+    /// CSC shard of empty columns. `build-csc` must not preserve it through the
+    /// copy shortcut — the output has no sidecar whatever the input had.
+    #[test]
+    fn test_build_csc_empty_matrix_drops_a_stale_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_with_csc.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(0, 2)).unwrap();
+        writer.write_obs(&sample_obs(0)).unwrap();
+        writer.write_var(&sample_var(2)).unwrap();
+        writer.write_uns(&serde_json::json!({"k": "v"})).unwrap();
+        // Two empty columns, zero rows: what the old policy emitted.
+        writer
+            .write_csc_shard(&[0, 0, 0], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+            .unwrap();
+        writer.finish().unwrap();
+        assert!(ScxReader::open(&path).unwrap().header().has_csc());
+
+        let output = dir.path().join("output.scx");
+        let outcome = run_build_csc(&path, &output, "4G", false, 5000, None).unwrap();
+        assert_eq!(outcome, BuildCscOutcome::NoSidecar);
+        let reader = ScxReader::open(&output).unwrap();
+        assert!(!reader.header().has_csc(), "the stale sidecar must be gone");
+        assert_eq!(reader.header().n_obs, 0);
+        assert_eq!(reader.read_obs().unwrap().num_rows(), 0);
+        assert_eq!(reader.read_var().unwrap().num_rows(), 2);
+        assert_eq!(reader.read_uns().unwrap()["k"], "v", "uns is carried");
+    }
+
+    /// A 0-column matrix with rows has CSR shards (0 nnz each) and takes the
+    /// normal path, which emits zero CSC shards.
+    #[test]
+    fn test_build_csc_zero_columns_writes_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_cols.scx");
+        let mut writer = ScxWriter::new(&path, sample_header(3, 0)).unwrap();
+        writer.write_obs(&sample_obs(3)).unwrap();
+        writer.write_var(&sample_var(0)).unwrap();
+        writer
+            .write_csr_shard(
+                &[0, 0, 0, 0],
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let output = dir.path().join("output.scx");
+        let outcome = run_build_csc(&path, &output, "4G", false, 5000, None).unwrap();
+        assert_eq!(outcome, BuildCscOutcome::NoSidecar);
+        let reader = ScxReader::open(&output).unwrap();
+        assert!(!reader.header().has_csc());
+        assert_eq!(reader.header().n_obs, 3);
+        assert_eq!(reader.header().n_vars, 0);
+        assert_eq!(reader.read_all_csr_shards().unwrap().shape, (3, 0));
     }
 
     /// write a small CSR-only file, run build-csc with

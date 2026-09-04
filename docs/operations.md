@@ -507,9 +507,11 @@ the mutating ops treat it consistently:
   keys the other inputs have — those are recorded only by shards, so a 0-row
   input cannot carry them; the usual "key missing in input *i*" error applies
   to populated inputs only. A merge whose inputs are all empty still writes an
-  `obs` section (input 0's, so declared categories survive). `varm` / `varp`
-  still come from input 0, whatever its row count. A 0-**var** input is an
-  `IncompatibleVars` error as before.
+  `obs` section (input 0's, with the same columns; like every merge output its
+  categoricals come back as plain strings). This holds for the plain, sorted
+  (`--sort-by`) and multimodal emitters alike. `varm` / `varp` still come from
+  input 0, whatever its row count. A 0-**var** input is an `IncompatibleVars`
+  error as before.
 - **append** of a 0-row source is a no-op on both `scx append` ("nothing to
   append") and `pyscx.append` (returns without writing). Appending onto a
   0-row target works: the target's 0-row `obs` schema — including string-typed

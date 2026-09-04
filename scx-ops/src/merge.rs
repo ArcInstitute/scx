@@ -1176,6 +1176,14 @@ fn merge_multimodal(
             cumulative_obs_rows += n_shard_rows;
         }
     }
+    if out_shard_idx == 0 {
+        // Every input was empty — same fallback as the single-modality
+        // emitter: one legacy obs section from input 0, or the output has no
+        // obs section at all.
+        debug_assert_eq!(total_n_obs, 0);
+        let empty_obs = readers[0].read_obs()?;
+        writer.write_obs(&unify_dict_columns(&empty_obs)?)?;
+    }
 
     // Phase 3b: stream global obsm shard-by-shard (multimodal). Same
     // pattern as single-modality: every input's shards (or legacy
@@ -1397,6 +1405,12 @@ fn merge_multimodal(
                     .catalog()
                     .layer_csr_shards_for_modality(modality_id, layer_name);
                 if shards.is_empty() {
+                    // A 0-row input has no layer shards in any modality and
+                    // contributes nothing (same exemption as the
+                    // single-modality emitter).
+                    if reader.n_obs() == 0 {
+                        continue;
+                    }
                     return Err(OpsError::LayerMissing {
                         name: format!("{}/{}", info.name, layer_name),
                         file_index: file_idx,

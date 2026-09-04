@@ -978,6 +978,11 @@ nothing has always written a valid 0-row file). What a 0-row file holds:
   same rule holds for `n_vars == 0` (`csc` skipped; `index_var` builds nothing)
   and for every op that rebuilds them (`compact`, `merge`, `sort`, `build-csc`
   — see [operations.md § Empty inputs and outputs](operations.md#empty-inputs-and-outputs)).
+  The SCX-backed / lazy `X` rewrite (shapes 2 and 3) applies the same
+  layers / `raw` / CSC policy, but it has never built a predicate index for any
+  row count: passing `index_obs=` / `index_var=` / `index_preset=` there raises
+  a `UserWarning` and writes none — build it afterwards with
+  `pyscx.compact(out, out2, index_obs=[...])`.
 
 Reading one back: `to_anndata()` is `(0, n_vars)` with the obs / var frames
 above; `to_anndata(backed=True).X` is a handle with `n_shards == 0` whose

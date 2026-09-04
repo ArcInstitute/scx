@@ -339,7 +339,10 @@ pub(crate) fn route_scx_backed_to_scx(
     // CSC sidecar is (re)built only when the rewritten dataset is large
     // enough to benefit.
     let csc_build = csc_policy.should_build_csc(out_n_obs, out_n_vars);
-    let csc_dropped = src_has_csc && !csc_build;
+    // An empty output has no sidecar to rebuild under any policy, so telling
+    // the caller to pass `csc="always"` would be wrong; the source's sidecar
+    // is simply gone with its rows.
+    let csc_dropped = src_has_csc && !csc_build && out_n_obs > 0 && out_n_vars > 0;
     if csc_dropped {
         warn_csc_dropped(py);
     }
@@ -598,7 +601,8 @@ pub(crate) fn route_scx_lazy_to_scx(
     // Source CSC sidecar (if any) is always invalidated by the
     // transform chain. Warn unless the user opted into a rebuild.
     let src_has_csc = lazy.backed_csc.is_some();
-    let csc_dropped = src_has_csc && !csc_build;
+    // Same as the backed route: no rebuild advice on an empty output.
+    let csc_dropped = src_has_csc && !csc_build && n_obs > 0 && n_vars > 0;
     if csc_dropped {
         warn_csc_dropped(py);
     }
@@ -812,6 +816,23 @@ pub(crate) fn chunk_boundaries(n_obs: usize, target_rows: usize) -> Vec<(usize, 
 /// support `__getitem__(slice)` and report `(n_obs, n_vars)` via
 /// `.shape`. The shape must match the output X dims; otherwise we
 /// raise a `ValueError` matching the in-memory path's contract.
+/// The `UserWarning` every `from_anndata` door raises when a 0-row write has
+/// layers to drop. A layer exists on disk only as its CSR shards, and a 0-row
+/// file has none (the format forbids framed zero-row shards: "emit no shard
+/// at all instead"), so the layer's very name cannot be recorded. Say so
+/// rather than drop it silently; X's shape, obs / var, obsm / varm and uns all
+/// survive. See docs/api.md § `pyscx.from_anndata`.
+pub(crate) fn warn_layers_dropped_at_zero_rows(
+    py: Python<'_>,
+    layer_keys: &[String],
+) -> PyResult<()> {
+    let msg = format!(
+        "from_anndata: the AnnData has no rows; layers {layer_keys:?} exist on disk only as CSR shards and a 0-row file has none, so they were not written. X's shape, obs / var, obsm / varm and uns are kept."
+    );
+    crate::pyimport::import_module(py, "warnings")?.call_method1("warn", (msg,))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_write_layers(
     py: Python<'_>,
@@ -833,6 +854,13 @@ pub(crate) fn stream_write_layers(
         .extract()?;
     if keys.is_empty() {
         return Ok(());
+    }
+    if out_n_obs == 0 {
+        // Same policy as the in-memory path: a layer exists on disk only as its
+        // CSR shards, a 0-row file has none, so the layer is dropped and the
+        // caller is told. `chunk_boundaries` would otherwise return no bounds
+        // and the loop below would drop every layer silently.
+        return warn_layers_dropped_at_zero_rows(py, &keys);
     }
 
     let n_vars_u32 = u32::try_from(out_n_vars)

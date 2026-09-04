@@ -81,9 +81,7 @@ pub(crate) fn pandas_to_record_batch(
     df: &Bound<'_, PyAny>,
 ) -> PyResult<RecordBatch> {
     let pa = crate::pyimport::import_module(py, "pyarrow")?;
-    let table_cls = pa.getattr("Table")?;
-    let table = table_cls.call_method1("from_pandas", (df,))?;
-    let n_rows: usize = table.getattr("num_rows")?.extract()?;
+    let n_rows = df.len()?;
 
     // Serialize to IPC bytes
     let sink_cls = pa.getattr("BufferOutputStream")?;
@@ -98,6 +96,7 @@ pub(crate) fn pandas_to_record_batch(
         writer.call_method1("write_batch", (&rb,))?;
         writer.call_method0("close")?;
     } else {
+        let table = pa.getattr("Table")?.call_method1("from_pandas", (df,))?;
         let schema = table.getattr("schema")?;
         let writer = ipc.call_method1("new_file", (&sink, &schema))?;
         writer.call_method1("write_table", (&table,))?;

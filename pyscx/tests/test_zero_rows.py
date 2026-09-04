@@ -175,8 +175,8 @@ def test_zero_obs_layers_and_raw_are_dropped_with_a_warning(tmp_dir):
     with pytest.warns(UserWarning) as rec:
         pyscx.from_anndata(a, str(tmp_dir / "z.scx"))
     msgs = [str(w.message) for w in rec]
-    assert any("counts" in m and "layer" in m for m in msgs), msgs
-    assert any("raw" in m for m in msgs), msgs
+    assert any('layers ["counts"] exist on disk only as CSR shards and a 0-row file has none' in m for m in msgs), msgs
+    assert any("adata.raw exists on disk only as CSR shards and a 0-row file has none" in m for m in msgs), msgs
     back = pyscx.open(str(tmp_dir / "z.scx")).to_anndata()
     assert len(back.layers) == 0 and back.raw is None
     assert back.shape == (0, N_VARS)
@@ -208,7 +208,15 @@ def test_zero_obs_from_subsets(tmp_dir):
     backed = pyscx.open(src).to_anndata(backed=True)
     pyscx.accel.subset_obs(backed, np.zeros(backed.n_obs, dtype=bool))
     assert isinstance(backed.X, pyscx.ScxBackedSparseDataset) and backed.shape == (0, N_VARS)
-    out = _write_quiet(backed, tmp_dir / "sub_backed.scx")
+    out = str(tmp_dir / "sub_backed.scx")
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        pyscx.from_anndata(backed, out, csc="always")
+    msgs = [str(w.message) for w in rec]
+    # the rewrite route drops the source's layer with the same warning as the
+    # in-memory path, and does not advise `csc="always"` on an empty output
+    assert any('["counts"] exist on disk only as CSR shards' in m for m in msgs), msgs
+    assert not any("csc" in m.lower() for m in msgs), msgs
     e = pyscx.open(out)
     assert (e.n_obs, e.n_vars, e.shard_count) == (0, N_VARS, 0)
     assert e.to_anndata().shape == (0, N_VARS)
