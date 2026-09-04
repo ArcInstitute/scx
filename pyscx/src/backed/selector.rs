@@ -213,25 +213,6 @@ pub(crate) fn resolve_col_request(
     Ok(Some(resolve_col_selector(py, col_idx, n_visible)?))
 }
 
-/// `None` when `sel` has no repeated entries. Otherwise the scipy column
-/// gather that rebuilds `sel` from its distinct values in order of **first
-/// appearance** — the visible order `set_col_projection_ordered` gives the
-/// deduped request — so `mat[:, remap]` on the projected handle's
-/// `to_memory()` is exactly `X[:, sel]`.
-pub(crate) fn repeat_gather_first_occurrence(sel: &[usize]) -> Option<Vec<usize>> {
-    let mut first_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let mut remap = Vec::with_capacity(sel.len());
-    for &c in sel {
-        let next = first_pos.len();
-        remap.push(*first_pos.entry(c).or_insert(next));
-    }
-    if first_pos.len() == sel.len() {
-        None
-    } else {
-        Some(remap)
-    }
-}
-
 /// `mat[:, remap]` for a scipy sparse matrix.
 pub(crate) fn scipy_column_gather<'py>(
     py: Python<'py>,
@@ -244,4 +225,16 @@ pub(crate) fn scipy_column_gather<'py>(
     let cols = numpy::PyArray1::from_vec(py, cols);
     let key = PyTuple::new(py, [slice_none, cols.into_any()])?;
     mat.get_item(key)
+}
+
+/// Whether `row_idx` is the full `:` over `n_obs` rows (`slice(None)`, or any
+/// slice that resolves to `0..n_obs` with step 1). The gate for `handle[:, cols]`
+/// projecting instead of reading, shared by the backed and lazy handles.
+pub(crate) fn is_all_rows_slice(row_idx: &Bound<'_, PyAny>, n_obs: usize) -> PyResult<bool> {
+    if let Ok(slice) = row_idx.cast::<PySlice>() {
+        let ind = slice.indices(n_obs as isize)?;
+        Ok(ind.start == 0 && ind.stop == n_obs as isize && ind.step == 1)
+    } else {
+        Ok(false)
+    }
 }

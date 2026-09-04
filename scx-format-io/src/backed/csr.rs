@@ -1266,8 +1266,9 @@ impl BackedCsrReader {
     /// The `cache_shards` this reader was constructed with — the *requested*
     /// count cap on the decoded-shard LRU, so `0` means "no cache" (the cache
     /// itself clamps its capacity to ≥ 1 internally). Read back by the pyscx
-    /// handles' `cache_shards` getter; there is no setter because one reader
-    /// is shared by `X` and every layer handle of a `to_anndata(backed=True)`.
+    /// handles' `cache_shards` getter. There is no setter: the count is fixed
+    /// when the reader is built, and a `to_anndata(backed=True)` builds its `X`
+    /// reader and each layer's reader with the same count.
     pub fn cache_shards(&self) -> usize {
         self.cache_shards
     }
@@ -1286,6 +1287,11 @@ impl BackedCsrReader {
     /// this is the one place a caller can learn whether the stored values are
     /// integer counts without decoding anything.
     pub fn stored_value_encoding(&self) -> Result<Option<scx_codec::ValueEncoding>> {
+        // Before the memo, not after: the first fold reaches `section_bytes`,
+        // which checks freshness itself, but a memo hit touches no section —
+        // and an `append` can mix a wider encoding into a file whose warm memo
+        // would otherwise keep answering the old one while `shape` refuses.
+        self.check_fresh()?;
         if let Some(memo) = self.stored_encoding.get() {
             return Ok(*memo);
         }

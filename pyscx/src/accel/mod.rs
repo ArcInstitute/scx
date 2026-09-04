@@ -47,13 +47,16 @@ use pyo3::prelude::*;
 
 /// Reject accel ops on a backed `X` opened with `preserve_var_order=True`.
 ///
-/// `preserve_var_order` lives only on `ScxBackedSparseDataset` (as
-/// `col_presentation`). Accel ops that build a `ScxLazyTransformedDataset`
-/// or a `ShardSource` from the dataset's *sorted* `col_projection` would
-/// decode columns in sorted order while `adata.var` stays in request order —
-/// a silent X/var misalignment (or, for name-resolving ops like
-/// `score_genes`, the wrong physical columns). Until the permutation is
-/// propagated into those paths, refuse loudly rather than return wrong data.
+/// A request-ordered gene axis lives only on `ScxBackedSparseDataset` (as
+/// `col_presentation`), installed by `to_anndata(preserve_var_order=True)`,
+/// by `adata[:, idx]` with a non-ascending `idx`, and — since 0.17 — by a
+/// handle-level reorder such as `adata.X = adata.X[:, [7, 2, 11]]` or
+/// `X[:, ::-1]`. Accel ops that build a `ScxLazyTransformedDataset` or a
+/// `ShardSource` from the dataset's *sorted* `col_projection` would decode
+/// columns in sorted order while `adata.var` stays in request order — a silent
+/// X/var misalignment (or, for name-resolving ops like `score_genes`, the wrong
+/// physical columns). Until the permutation is propagated into those paths,
+/// refuse loudly rather than return wrong data.
 ///
 /// No-op when `X` is not a presentation-ordered backed dataset.
 ///
@@ -72,10 +75,13 @@ pub(crate) fn reject_preserve_var_order(adata: &Bound<'_, PyAny>, op: &str) -> P
     if let Ok(backed) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
         if backed.borrow().col_presentation_arc().is_some() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "{op} is not supported on a dataset opened with \
-                 preserve_var_order=True (the gene axis is in request order, which \
-                 would misalign the result against adata.var). Run {op} before \
-                 projecting by name, or re-open without preserve_var_order."
+                "{op} is not supported on a backed X whose gene axis is in a \
+                 caller-requested order — opened with preserve_var_order=True, or \
+                 reordered through adata[:, idx] / X[:, [7, 2, 11]] / X[:, ::-1] \
+                 (the streaming kernels decode columns in sorted on-disk order, \
+                 which would misalign the result against adata.var). Run {op} \
+                 before reordering, select with a sorted index or a boolean mask, \
+                 or materialise first with `adata.X = adata.X.to_memory()`."
             )));
         }
     }

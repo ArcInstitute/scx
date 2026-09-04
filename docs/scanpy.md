@@ -1243,9 +1243,11 @@ a loud `TypeError` on the three sparse handles rather than the 0-d object array
 it used to return (which surfaced much later as "setting an array element with
 a sequence") — decoding an atlas because a guard misrouted is the worse
 failure. The dense `ScxBackedObsmDataset` still materialises under
-`np.asarray`. Slicing a handle *does* yield genuine scipy sparse, so
-`sp.issparse(adata.X[0:10])` is `True` — test the slice, or use this predicate
-on the matrix.
+`np.asarray`. A **row** slice of a handle *does* yield genuine scipy sparse, so
+`sp.issparse(adata.X[0:10])` is `True`; a **column** selector (`X[:, 5]`,
+`X[:, genes]`, `X[:, 10:20]`) returns another handle, for which `issparse` is
+again `False` and `np.asarray` again raises — test a row slice, or use this
+predicate on the matrix.
 
 ### Indexing patterns
 
@@ -1380,7 +1382,8 @@ adata = pyscx.open("atlas.scx").to_anndata(backed=True, cache_shards=16)
 adata = pyscx.open("atlas.scx").to_anndata(backed=True, cache_shards=0)
 
 # Read the setting back — it is fixed per to_anndata() call (there is no
-# cache_shards on pyscx.open) and shared by X and every layer handle
+# cache_shards on pyscx.open); X and each layer get their own reader, built
+# with the same count
 adata.X.cache_shards            # 0
 adata.layers["counts"].cache_shards
 ```

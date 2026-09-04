@@ -84,6 +84,8 @@ _PROBE = textwrap.dedent(
         result["peak"] = measure(lambda: X[:, [7, 2, 11]].to_memory())
     elif mode == "repeats":
         result["peak"] = measure(lambda: X[:, [3, 1, 3]])
+    elif mode == "wide_reorder":
+        result["peak"] = measure(lambda: X[:, ::-1].to_memory())
     elif mode == "lazy_reorder":
         pyscx.accel.normalize_total(adata)
         pyscx.accel.log1p(adata)
@@ -138,12 +140,14 @@ def test_column_selector_paths_never_decode_the_whole_matrix(tmp_dir):
     projected_read = _probe(path, "projected_read")["peak"]
     repeats = _probe(path, "repeats")["peak"]
     lazy_reorder = _probe(path, "lazy_reorder")["peak"]
+    wide_reorder = _probe(path, "wide_reorder")["peak"]
 
     shard_bytes = exp.nnz // n_shards * 8 + (shard_size + 1) * 8
     report = (
         f"full={full / 1e6:.1f} MB handle={handle / 1e6:.2f} MB "
         f"projected_read={projected_read / 1e6:.1f} MB repeats={repeats / 1e6:.1f} MB "
-        f"lazy_reorder={lazy_reorder / 1e6:.1f} MB (shard {shard_bytes / 1e6:.2f} MB)"
+        f"lazy_reorder={lazy_reorder / 1e6:.1f} MB wide_reorder={wide_reorder / 1e6:.1f} MB "
+        f"(shard {shard_bytes / 1e6:.2f} MB)"
     )
     # A handle is bookkeeping only.
     assert handle <= 1_000_000, report
@@ -153,3 +157,8 @@ def test_column_selector_paths_never_decode_the_whole_matrix(tmp_dir):
     for peak in (projected_read, repeats, lazy_reorder):
         assert peak <= 0.35 * full, report
         assert peak <= 4 * shard_bytes + 4_000_000, report
+    # A presentation-ordered projection as wide as the matrix (`X[:, ::-1]`)
+    # is the case where the reorder used to add a third result-sized buffer on
+    # top of the pieces and the concatenation (~2.9× a plain `to_memory()`,
+    # found by codex). Reordering per piece keeps it at the two.
+    assert wide_reorder <= 2.25 * full + 2 * shard_bytes + 4_000_000, report

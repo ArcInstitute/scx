@@ -4124,3 +4124,31 @@ fn cache_shards_reports_the_requested_count_including_zero() {
     let (backed, _) = write_test_file_and_open(&dir2, 20, 8, 4, 4);
     assert_eq!(backed.cache_shards(), 4);
 }
+
+#[test]
+fn stored_value_encoding_refuses_on_a_watched_reader_once_the_file_changed() {
+    let dir = TempDir::new().unwrap();
+    let path = write_encoded_file(&dir, "watched.scx", &[ValueEncoding::Uint8], None);
+    let backed = BackedCsrReader::new(ScxReader::open(&path).unwrap().watching().unwrap(), 4);
+    // Warm the memo.
+    assert_eq!(
+        backed.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint8)
+    );
+    // Replace the file (new inode, as a copy-out op does) with a wider family.
+    let newer = write_encoded_file(&dir, "newer.scx", &[ValueEncoding::Uint16], None);
+    std::fs::rename(&newer, &path).unwrap();
+    let err = backed
+        .stored_value_encoding()
+        .expect_err("a warm memo must not answer for a file that changed underneath");
+    assert!(
+        matches!(err, ScxError::FileChangedOnDisk { .. }),
+        "expected FileChangedOnDisk, got {err:?}"
+    );
+    // A fresh reader sees the new family.
+    let fresh = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 4);
+    assert_eq!(
+        fresh.stored_value_encoding().unwrap(),
+        Some(ValueEncoding::Uint16)
+    );
+}

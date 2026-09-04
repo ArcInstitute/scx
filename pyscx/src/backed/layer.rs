@@ -23,27 +23,18 @@ pub struct ScxBackedLayerDataset {
 
 impl ScxBackedLayerDataset {
     /// Create a new layer dataset wrapping a BackedCsrReader for a specific layer.
-    pub fn from_reader(
-        backed: Arc<BackedCsrReader>,
-        cache_shards: usize,
-        layer_name: String,
-    ) -> Self {
-        let inner = ScxBackedSparseDataset::from_reader(backed, cache_shards);
+    pub fn from_reader(backed: Arc<BackedCsrReader>, layer_name: String) -> Self {
+        let inner = ScxBackedSparseDataset::from_reader(backed);
         ScxBackedLayerDataset { inner, layer_name }
     }
 
     /// Create a new layer dataset with deletion vector remapping.
     pub fn from_reader_with_deletions(
         backed: Arc<BackedCsrReader>,
-        cache_shards: usize,
         layer_name: String,
         kept_to_global: Vec<u64>,
     ) -> Self {
-        let inner = ScxBackedSparseDataset::from_reader_with_deletions(
-            backed,
-            cache_shards,
-            kept_to_global,
-        );
+        let inner = ScxBackedSparseDataset::from_reader_with_deletions(backed, kept_to_global);
         ScxBackedLayerDataset { inner, layer_name }
     }
 
@@ -135,7 +126,7 @@ impl ScxBackedLayerDataset {
             self.inner.shape_val.0,
             self.inner.shape_val.1,
             self.inner.n_shards,
-            self.inner.cache_shards
+            self.inner.cache_shards()
         )
     }
 

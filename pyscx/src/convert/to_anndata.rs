@@ -955,10 +955,9 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     let mut x_dataset = match &kept_to_global {
         Some(mapping) => ScxBackedSparseDataset::from_reader_with_deletions(
             Arc::clone(&x_backed),
-            cache_shards,
             mapping.clone(),
         ),
-        None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed), cache_shards),
+        None => ScxBackedSparseDataset::from_reader(Arc::clone(&x_backed)),
     };
     x_dataset.with_csc_reader(x_backed_csc);
     x_dataset.with_source_path(path);
@@ -1107,11 +1106,10 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         let mut l_dataset = match &kept_to_global {
             Some(mapping) => ScxBackedLayerDataset::from_reader_with_deletions(
                 l_backed,
-                cache_shards,
                 name.clone(),
                 mapping.clone(),
             ),
-            None => ScxBackedLayerDataset::from_reader(l_backed, cache_shards, name.clone()),
+            None => ScxBackedLayerDataset::from_reader(l_backed, name.clone()),
         };
         if let Some(ref indices) = col_indices {
             // Mirror X's setter: under `preserve_var_order` the visible axis is

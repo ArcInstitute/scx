@@ -15,7 +15,7 @@ use scx_sparse::ScxCsr;
 
 use crate::backed::detached;
 use crate::backed::ScxComparisonResult;
-use crate::backed::{resolve_col_request, scipy_column_gather};
+use crate::backed::{is_all_rows_slice, resolve_col_request, scipy_column_gather};
 use crate::convert::csr_to_scipy;
 
 use super::*;
@@ -177,7 +177,7 @@ impl ScxLazyTransformedDataset {
         // repeated request materialises the projected *unique* columns and
         // gathers them with scipy — peak is the result, never the whole
         // matrix. `X[:, :]` resolves to `None` and falls through.
-        if self.is_all_rows_slice(py, row_idx)? {
+        if is_all_rows_slice(row_idx, self.shape_val.0)? {
             if let Some(sel) = resolve_col_request(py, col_idx, self.shape_val.1)? {
                 let sel_i64: Vec<i64> = sel.iter().map(|&c| c as i64).collect();
                 let composed = crate::axis_align::compose_cols_positional(
@@ -226,24 +226,6 @@ impl ScxLazyTransformedDataset {
         let slice_none = builtins.call_method1("slice", (py.None(),))?;
         let col_tuple = PyTuple::new(py, &[slice_none.unbind(), col_idx.clone().unbind()])?;
         row_csr.get_item(col_tuple)
-    }
-
-    /// Check whether `row_idx` selects all rows (is `slice(None)` / `:`).
-    pub(crate) fn is_all_rows_slice(
-        &self,
-        _py: Python<'_>,
-        row_idx: &Bound<'_, PyAny>,
-    ) -> PyResult<bool> {
-        if let Ok(slice) = row_idx.cast::<PySlice>() {
-            let indices = slice.indices(self.shape_val.0 as isize)?;
-            Ok(
-                indices.start == 0
-                    && indices.stop == self.shape_val.0 as isize
-                    && indices.step == 1,
-            )
-        } else {
-            Ok(false)
-        }
     }
 
     /// Apply transforms row-by-row for non-contiguous access.

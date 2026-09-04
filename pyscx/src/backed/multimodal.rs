@@ -245,7 +245,7 @@ impl ScxBackedMuModality {
             None
         };
 
-        let mut ds = ScxBackedSparseDataset::from_reader(backed_csr, self.cache_shards);
+        let mut ds = ScxBackedSparseDataset::from_reader(backed_csr);
         ds.with_csc_reader(backed_csc).with_modality_id(modality_id);
         ds.with_source_path(&self.path);
         Py::new(py, ds)

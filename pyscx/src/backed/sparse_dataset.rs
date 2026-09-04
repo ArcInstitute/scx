@@ -38,7 +38,6 @@ pub struct ScxBackedSparseDataset {
     pub(crate) backed_csc: Option<Arc<BackedCscReader>>,
     pub(crate) shape_val: (usize, usize),
     pub(crate) n_shards: usize,
-    pub(crate) cache_shards: usize,
     /// If deletions are present, maps user-visible row i → global row index.
     /// When None, no remapping is needed (no deletions).
     /// Arc-wrapped to avoid O(n) deep clones when creating lazy datasets.
@@ -84,7 +83,7 @@ pub struct ScxBackedSparseDataset {
 
 impl ScxBackedSparseDataset {
     /// Create a new ScxBackedSparseDataset from a BackedCsrReader.
-    pub fn from_reader(backed: Arc<BackedCsrReader>, cache_shards: usize) -> Self {
+    pub fn from_reader(backed: Arc<BackedCsrReader>) -> Self {
         let shape_val = backed.shape();
         let n_shards = backed.index().n_shards();
         ScxBackedSparseDataset {
@@ -92,7 +91,6 @@ impl ScxBackedSparseDataset {
             backed_csc: None,
             shape_val,
             n_shards,
-            cache_shards,
             kept_to_global: None,
             col_projection: None,
             col_presentation: None,
@@ -108,7 +106,6 @@ impl ScxBackedSparseDataset {
     /// excluding deleted rows. The shape is adjusted to `(kept.len(), n_vars)`.
     pub fn from_reader_with_deletions(
         backed: Arc<BackedCsrReader>,
-        cache_shards: usize,
         kept_to_global: Vec<u64>,
     ) -> Self {
         let (_, n_vars) = backed.shape();
@@ -119,7 +116,6 @@ impl ScxBackedSparseDataset {
             backed_csc: None,
             shape_val: (n_kept, n_vars),
             n_shards,
-            cache_shards,
             kept_to_global: Some(Arc::new(kept_to_global)),
             col_projection: None,
             col_presentation: None,
@@ -370,7 +366,6 @@ impl ScxBackedSparseDataset {
             backed_csc: self.backed_csc.clone(),
             shape_val: self.shape_val,
             n_shards: self.n_shards,
-            cache_shards: self.cache_shards,
             kept_to_global: self.kept_to_global.clone(),
             col_projection: self.col_projection.clone(),
             col_presentation: self.col_presentation.clone(),
@@ -482,13 +477,13 @@ impl ScxBackedSparseDataset {
         stored_dtype_object(py, &self.backed)
     }
 
-    /// The decoded-shard LRU size this handle was opened with
+    /// The decoded-shard LRU size this handle's reader was built with
     /// (`to_anndata(backed=True, cache_shards=…)`); `0` means every read
-    /// decodes afresh. Read-only: one reader is shared by `X` and every layer
-    /// handle, so the size is fixed per `to_anndata` call.
+    /// decodes afresh. Read-only: the count is fixed when the reader is built,
+    /// and one `to_anndata` call builds `X` and each layer with the same count.
     #[getter]
     pub(crate) fn cache_shards(&self) -> usize {
-        self.cache_shards
+        self.backed.cache_shards()
     }
 
     /// The numpy array protocol — **refused**. A handle is a window onto a
@@ -543,7 +538,10 @@ impl ScxBackedSparseDataset {
     pub(crate) fn __repr__(&self) -> String {
         format!(
             "ScxBackedSparseDataset(shape=({}, {}), n_shards={}, cache_shards={})",
-            self.shape_val.0, self.shape_val.1, self.n_shards, self.cache_shards
+            self.shape_val.0,
+            self.shape_val.1,
+            self.n_shards,
+            self.backed.cache_shards()
         )
     }
 
@@ -1656,14 +1654,30 @@ impl ScxBackedSparseDataset {
         // gathers them with scipy — peak is the result, never the whole
         // matrix. `X[:, :]` resolves to `None` and falls through to return the
         // row CSR, like `X[:]`.
-        if self.is_all_rows_slice(py, row_idx)? {
+        if is_all_rows_slice(row_idx, self.shape_val.0)? {
             if let Some(sel) = resolve_col_request(py, col_idx, self.shape_val.1)? {
                 let sel_i64: Vec<i64> = sel.iter().map(|&c| c as i64).collect();
                 let handle = self.subset_clone(None, Some(&sel_i64))?;
-                return match repeat_gather_first_occurrence(&sel) {
-                    None => Ok(handle.into_pyobject(py)?.into_any()),
-                    Some(remap) => scipy_column_gather(py, &handle.to_memory(py)?, &remap),
-                };
+                // `set_col_projection_ordered` dedups, so the visible width is the
+                // number of distinct columns: equal to the request length ⇔ no
+                // repeats, and the handle is the answer with nothing else built.
+                if handle.shape_val.1 == sel.len() {
+                    return Ok(handle.into_pyobject(py)?.into_any());
+                }
+                // Repeats: the handle's visible order is the request's distinct
+                // columns in order of first appearance, so `remap[k]` is the
+                // position of `sel[k]` among those — `mat[:, remap]` rebuilds
+                // the request from the projected read.
+                let mut first_pos: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::with_capacity(handle.shape_val.1);
+                let remap: Vec<usize> = sel
+                    .iter()
+                    .map(|&c| {
+                        let next = first_pos.len();
+                        *first_pos.entry(c).or_insert(next)
+                    })
+                    .collect();
+                return scipy_column_gather(py, &handle.to_memory(py)?, &remap);
             }
         }
 
@@ -1685,24 +1699,6 @@ impl ScxBackedSparseDataset {
         let slice_none = builtins.call_method1("slice", (py.None(),))?;
         let col_tuple = PyTuple::new(py, &[slice_none.unbind(), col_idx.clone().unbind()])?;
         row_csr.get_item(col_tuple)
-    }
-
-    /// Check whether `row_idx` selects all rows (is `slice(None)` / `:`).
-    pub(crate) fn is_all_rows_slice(
-        &self,
-        _py: Python<'_>,
-        row_idx: &Bound<'_, PyAny>,
-    ) -> PyResult<bool> {
-        if let Ok(slice) = row_idx.cast::<PySlice>() {
-            let indices = slice.indices(self.shape_val.0 as isize)?;
-            Ok(
-                indices.start == 0
-                    && indices.stop == self.shape_val.0 as isize
-                    && indices.step == 1,
-            )
-        } else {
-            Ok(false)
-        }
     }
 
     /// Normalize a (possibly negative) row index.
@@ -1755,8 +1751,9 @@ pub(crate) fn stored_dtype_object<'py>(
     py: Python<'py>,
     backed: &BackedCsrReader,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let name = backed
-        .stored_value_encoding()
+    // The first call folds every shard header; run it with the GIL released
+    // (a memo hit is an atomic load and costs nothing either way).
+    let name = detached(py, || backed.stored_value_encoding())
         .map_err(crate::to_pyerr)?
         .map_or("float32", |enc| enc.numpy_name());
     let np = crate::pyimport::import_module(py, "numpy")?;
@@ -1768,29 +1765,35 @@ pub(crate) fn no_implicit_array_error(class_name: &str) -> PyErr {
     pyo3::exceptions::PyTypeError::new_err(format!(
         "{class_name} is a lazy handle onto an SCX file and does not convert to a \
          numpy array implicitly: np.asarray(handle) would decode the whole \
-         n_obs × n_vars matrix at once. Take a window with handle[rows] / \
-         handle[:, cols], call handle.to_memory() for the whole matrix as scipy \
-         CSR or handle.toarray() for a dense array, or open the file with \
-         pyscx.open(path).to_anndata() for an in-memory AnnData."
+         n_obs × n_vars matrix at once. Call handle.to_memory() for scipy CSR or \
+         handle.toarray() for a dense array (both work on a column-projected \
+         handle such as X[:, genes] too), take a row window with handle[rows] \
+         (a scipy CSR), or open the file with pyscx.open(path).to_anndata() for \
+         an in-memory AnnData."
     ))
 }
 
 /// `to_memory()` for a handle with a column projection: one decode per
-/// shard, projected while one shard wide, concatenated, then put into
-/// presentation order. Sequential on purpose — decoding shards in parallel
-/// would hold every decoded shard at once, which is the peak this exists
-/// to avoid.
+/// shard, projected — and, under a presentation order, reordered — while one
+/// shard wide, then concatenated. Peak = the projected pieces + the
+/// concatenated result (2× the projected result) + one shard's transient.
+/// The reorder happens per piece, not on the concatenated result: a column
+/// permutation commutes with row concatenation, and reordering afterwards
+/// would hold a third result-sized buffer while the other two are still live
+/// (measured at ~2.9× a plain `to_memory()` for `X[:, ::-1]`). Sequential on
+/// purpose — decoding shards in parallel would hold every decoded shard at
+/// once, which is the peak this exists to avoid.
 fn materialize_projected(ds: &ScxBackedSparseDataset) -> scx_format_io::Result<scx_sparse::ScxCsr> {
     use scx_format_io::ShardSource;
     let source = ds.as_shard_source();
     let n_vars = source.n_vars();
     let mut pieces = Vec::with_capacity(source.n_shards());
     for shard_idx in 0..source.n_shards() {
-        pieces.push(source.read_shard(shard_idx)?);
+        let piece = source.read_shard(shard_idx)?;
+        pieces.push(match &ds.col_presentation {
+            Some(perm) => scx_engine::projection::reorder_csr_columns(&piece, perm),
+            None => piece,
+        });
     }
-    let csr = scx_sparse::concatenate_csr(&pieces, n_vars)?;
-    Ok(match &ds.col_presentation {
-        Some(perm) => scx_engine::projection::reorder_csr_columns(&csr, perm),
-        None => csr,
-    })
+    Ok(scx_sparse::concatenate_csr(&pieces, n_vars)?)
 }

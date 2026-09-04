@@ -1309,6 +1309,11 @@ class CloudExperiment:
     def format_version(self) -> int: ...
     @property
     def codec_id(self) -> int: ...
+    def info(self) -> str:
+        """One-line codec / shard / format-version internals, token for token the
+        same as `Experiment.info()` (the `value_encoding=` / `is_integer=` tokens
+        cost one 76-byte range read per CSR shard)."""
+        ...
 
     # Schema discovery — list obs/var column names (the `filter_obs`
     # vocabulary). Unlike the local `Experiment.*_keys()` footer read, the

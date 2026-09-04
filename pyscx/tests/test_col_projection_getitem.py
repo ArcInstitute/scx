@@ -371,6 +371,29 @@ class TestWidenedColumnSelectors:
         with pytest.raises(IndexError, match="one-dimensional"):
             X[:, np.zeros((2, 2), dtype=np.int64)]
 
+    def test_accel_refusal_names_the_handle_level_reorder(self, scx_path):
+        """A reordered `X[:, cols]` assigned back to `adata.X` installs the same
+        presentation permutation `preserve_var_order=True` does; the accel
+        prologue refuses either way, and its message must name this route and
+        the `to_memory()` escape rather than blaming a flag that was never set."""
+        import anndata
+        import pyscx
+
+        adata = pyscx.open(scx_path).to_anndata(backed=True)
+        order = [7, 2, 11]
+        # anndata accepts the handle as X (it is registered as a CSRDataset);
+        # the var frame is sliced by hand so the two axes agree.
+        sub = anndata.AnnData(X=adata.X[:, order], obs=adata.obs, var=adata.var.iloc[order])
+        assert isinstance(sub.X, pyscx.ScxBackedSparseDataset)
+        assert sub.X.shape == (100, 3)
+        with pytest.raises(RuntimeError, match="reordered through"):
+            pyscx.accel.normalize_total(sub)
+        with pytest.raises(RuntimeError, match="to_memory"):
+            pyscx.accel.normalize_total(sub)
+        # The escape the message names works.
+        sub.X = sub.X.to_memory()
+        pyscx.accel.normalize_total(sub)
+
     def test_full_column_slice_still_returns_the_matrix(self, scx_path, reference_dense):
         """`X[:, :]` is a copy in scipy; it stays the materialised row CSR."""
         import pyscx
