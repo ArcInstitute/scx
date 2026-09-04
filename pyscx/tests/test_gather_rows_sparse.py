@@ -100,6 +100,20 @@ def test_gather_accepts_a_plain_list_and_any_integer_dtype(scx_path, adata_backe
     )
 
 
+def test_gather_unsigned_indices_near_the_top_are_out_of_range(scx_path):
+    """`uint64` values that would wrap to a small negative `int64` (`2**64 - 1`
+    → `-1`) must not alias the last rows; unsigned is bounds-checked unsigned."""
+    import pyscx
+
+    exp = pyscx.open(scx_path)
+    for v in (2**64 - 1, 2**64 - 2, 2**63, 100):
+        with pytest.raises(IndexError, match=f"{v}"):
+            exp.gather_rows_sparse(np.asarray([v], dtype=np.uint64))
+    # The unsigned path still resolves in-range values.
+    got = exp.gather_rows_sparse(np.asarray([99, 0], dtype=np.uint64))
+    assert got.shape[0] == 2
+
+
 def test_gather_negative_indices_wrap_once(scx_path, adata_backed):
     import pyscx
 

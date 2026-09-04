@@ -18,8 +18,11 @@ use pyo3::types::PyTuple;
 /// - A boolean array must have exactly `n_visible` entries (`IndexError`
 ///   otherwise, numpy's rule); its `True` positions are returned in order.
 /// - An integer array-like (ndarray, list, range) may be unsorted and may
-///   repeat rows; negative entries wrap once (`-1` is the last row); anything
-///   still outside `[0, n_visible)` is an `IndexError` naming the value.
+///   repeat rows; negative entries of a *signed* array wrap once (`-1` is the
+///   last row); anything still outside `[0, n_visible)` is an `IndexError`
+///   naming the value. An unsigned array is bounds-checked as `uint64` — it is
+///   never converted to a signed type, so `2**64 - 1` is out of range, not
+///   the last row.
 /// - Anything else — a float array, a 2-D array — is an `IndexError`, as in
 ///   numpy ("arrays used as indices must be of integer (or boolean) type").
 ///
@@ -61,7 +64,28 @@ pub(crate) fn resolve_row_selector(
         return Ok(slice.iter().map(|&v| v as usize).collect());
     }
 
-    if dtype_kind != "i" && dtype_kind != "u" {
+    if dtype_kind == "u" {
+        // Unsigned stays unsigned: casting `uint64` to `int64` wraps
+        // `2**64 - 1` to `-1`, which the negative-wrap rule below would then
+        // turn into "the last row" instead of an `IndexError`.
+        let flat = arr.call_method1("astype", (np.getattr("uint64")?,))?;
+        let readonly: numpy::PyReadonlyArray1<'_, u64> = flat.extract()?;
+        let slice = readonly
+            .as_slice()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        return slice
+            .iter()
+            .map(|&v| {
+                if v >= n_visible as u64 {
+                    return Err(PyIndexError::new_err(format!(
+                        "row index {v} out of range for {n_visible} rows"
+                    )));
+                }
+                Ok(v as usize)
+            })
+            .collect();
+    }
+    if dtype_kind != "i" {
         return Err(PyIndexError::new_err(format!(
             "row selector must be an integer array or a boolean mask, got dtype kind '{dtype_kind}'"
         )));

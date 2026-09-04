@@ -581,12 +581,27 @@ impl BackedCsrReader {
     /// full shards than the LRU holds, e.g. `X[:]` — would only thrash it, so
     /// resident shards are copied from the cache and every other shard is
     /// decoded *uncached*, in parallel chunks of `cache_shards`, copied out and
-    /// dropped: peak = result + `cache_shards` shards, and the LRU is left as it
-    /// was (the same contract as `read_all`). Takes `&self` — cache mutation is
-    /// handled via interior mutability (Mutex).
+    /// dropped, and the LRU is left as it was (the same contract as `read_all`).
+    /// Peak = result + up to `cache_shards` shards decoding in flight, **on top
+    /// of** whatever the LRU already holds (itself capped at `cache_shards`) —
+    /// so at most `2 × cache_shards` decoded shards beside the result when the
+    /// cache is full going in, `cache_shards` when it is empty. The LRU is the
+    /// caller's resident budget; this read's own transient never exceeds it.
+    ///
+    /// `end` must not exceed `n_obs`: a range past the last shard is an error
+    /// (the pre-PR-C path returned a shorter matrix; the pre-sized assembly
+    /// would otherwise emit a non-monotone `indptr`). `start >= end` is the
+    /// empty matrix. Takes `&self` — cache mutation is handled via interior
+    /// mutability (Mutex).
     pub fn read_rows(&self, start: u64, end: u64) -> Result<ScxCsr> {
         if start >= end {
             return Ok(Self::empty_csr(self.n_vars));
+        }
+        if end > self.n_obs as u64 {
+            return Err(ScxError::Io(std::io::Error::other(format!(
+                "row range {start}..{end} out of range (n_obs={})",
+                self.n_obs
+            ))));
         }
 
         let shard_indices = self.index.shards_for_range(start, end);
@@ -628,11 +643,25 @@ impl BackedCsrReader {
             });
         }
 
+        // The plans must tile `[start, end)` exactly: a gap leaves output rows
+        // with no shard (a non-monotone `indptr`), an overlap writes one window
+        // twice. Both mean the catalog does not tile the row axis — a corrupt
+        // file, or a reader built with `new` on a multimodal file whose
+        // modalities each tile `[0, n_obs)` (use `for_modality` there).
+        let n_rows = (end - start) as usize;
+        let covered: usize = plans.iter().map(|p| p.local_end - p.local_start).sum();
+        if covered != n_rows {
+            return Err(ScxError::InvalidCatalog(format!(
+                "CSR shards cover {covered} of the {n_rows} rows in {start}..{end}: the catalog \
+                 does not tile the row axis (on a multimodal file open the reader with \
+                 `for_modality`)"
+            )));
+        }
+
         // Phase 1 — exact sizing. The indptr-only decode is O(rows) per shard
         // (the indices/data streams are never touched) and is checked against
         // the catalog's row count so a lying shard header cannot drive an
         // out-of-bounds index below.
-        let n_rows = (end - start) as usize;
         let mut indptr = vec![0i64; n_rows + 1];
         let mut running: i64 = 0;
         for plan in plans.iter_mut() {
@@ -742,7 +771,8 @@ impl BackedCsrReader {
     /// Decode `shard_indices` without touching the LRU — in parallel on the
     /// reader's pool (or rayon's global registry) when the `parallel` feature
     /// is on and there is more than one shard, else sequentially. Peak is
-    /// `shard_indices.len()` decoded shards; callers chunk accordingly.
+    /// `shard_indices.len()` decoded shards **in addition to** the LRU's
+    /// resident entries; callers chunk to `cache_shards` accordingly.
     fn decode_shards_uncached(&self, shard_indices: &[usize]) -> Result<Vec<ScxCsr>> {
         #[cfg(feature = "parallel")]
         {

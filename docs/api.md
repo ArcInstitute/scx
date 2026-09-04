@@ -980,7 +980,7 @@ will still raise); the guarantee covers pyscx's own entry points.
 ## BackedCsrReader (`scx-format-io/src/backed/csr.rs`)
 
 - `new(reader, cache_shards)` — Create backed reader from `ScxReader` with LRU shard cache
-- `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards` and leaves the LRU untouched — peak = result + `cache_shards` shards.
+- `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards` and leaves the LRU untouched — peak = result + up to `cache_shards` shards in flight, on top of whatever the LRU already holds (itself capped at `cache_shards`). `end > n_obs` is an error.
 - `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + `cache_shards` shards. A sparse request on a cold row-group-framed shard decodes only the touched row groups (block index) and is not inserted into the LRU. An out-of-range row is an error (it used to be dropped silently).
 - `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
 - `read_shard_uncached(idx)` → `ScxCsr` — Read shard bypassing cache (preferred for streaming)
@@ -2036,11 +2036,15 @@ the repr onto `Experiment.info() -> str`.
   integer dtype); duplicates allowed, order preserved, negative indices wrap
   once. Each touched shard is decoded once (a sparse request on a
   row-group-framed shard decodes only the touched row groups) and the result is
-  assembled once into exact-size buffers, so peak memory is the result plus
-  `cache_shards` decoded shards — never a second copy of the result.
+  assembled once into exact-size buffers, so peak memory is the result plus the
+  shard cache (`cache_shards` decoded shards) plus one shard's transient — never
+  a second copy of the result.
   `logical=True` (default) indexes the rows `n_obs` / `read_obs()` describe
   (deletion vectors applied, exactly as `to_anndata(backed=True).X[rows]`);
-  `logical=False` indexes physical file rows (`n_obs_physical`). `layer=`
+  `logical=False` indexes physical file rows (`n_obs_physical`). **Changed in
+  0.17**: before, this method addressed physical rows only, so on a file with
+  deletion vectors the same ids now select different cells — pass
+  `logical=False` for the old behaviour. `layer=`
   gathers from that layer instead of `X` (`ValueError` if absent; not supported
   on a multimodal file — index the modality's layer handle from `to_mudata()`).
   Out-of-range ids and a boolean mask whose length is not the row count raise
@@ -2637,11 +2641,15 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
   `BackedCsrReader::read_row_indices`: each touched shard is decoded once — a
   sparse request on a row-group-framed shard decodes only the touched row groups
   — and the result is assembled once into exact-size buffers, so peak memory is
-  the result plus `cache_shards` decoded shards, never a second copy of the
-  result. `X[:]` and other contiguous slices go through `read_rows`, which sizes
-  the result exactly and, for a range larger than the shard cache, decodes
-  uncached in parallel chunks of `cache_shards` — `X[:]` costs what
-  `to_memory()` costs. An out-of-range row, and a boolean mask whose length is
+  the result plus the shard cache (`cache_shards` decoded shards) plus one
+  shard's transient, never a second copy of the result. `X[:]` and other
+  contiguous slices on a handle **without** deletion vectors go through
+  `read_rows`, which sizes the result exactly and, for a range larger than the
+  shard cache, decodes uncached in parallel chunks of `cache_shards` on top of
+  whatever the LRU already holds — `X[:]` costs what `to_memory()` costs. With
+  deletion vectors, `X[:]` is the row gather over the kept rows (still one
+  decode per shard and one assembly, but through the LRU rather than the
+  uncached bulk path). An out-of-range row, and a boolean mask whose length is
   not the row count, raise `IndexError` (numpy's rule) rather than returning a
   shorter matrix. Deletion vectors and column projection compose with all of
   this. The same gather is available without an AnnData as

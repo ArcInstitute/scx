@@ -2210,7 +2210,13 @@ absolute_floors:
   #
   # Ceilings at 21% over the worst single observation, matching the export and
   # `compact_full` ceilings' construction. A return to the per-row CSR shape
-  # adds roughly the result again (≈ +200 MB / +900 MB here) and trips both.
+  # adds roughly the result again: ≈ +900 MB at census_500k, which trips that
+  # ceiling by a wide margin, but only ≈ +200 MB at tabula_sapiens_100k
+  # (≈ 1600 MB), which stays under 1700 — the tabula row is a drift guard on
+  # the same construction as its siblings, not the regression detector; the
+  # census_500k row is. Lowering tabula below 1600 would leave ~10 % headroom
+  # over three observations spread 4 MB apart; do that only from a capture of
+  # the regressed shape, not from this estimate.
   - benchmark: read_selective
     format: scx_auto
     dataset: tabula_sapiens_100k

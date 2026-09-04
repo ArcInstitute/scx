@@ -320,5 +320,37 @@ fn gather_paths_assemble_once_within_the_cache_bound() {
             "framed={framed}: read_rows(0, n) peaked at {peak} live bytes for a {result}-byte \
              result (budget {budget}) — the range read is not assembling once"
         );
+        drop(out);
+        drop(backed);
+
+        // --- read_rows(0, n) with a FULL LRU going in ---
+        // The resident shards are the caller's budget and stay resident; the
+        // bulk read adds at most one chunk of `cache_shards` uncached decodes
+        // on top, so the documented bound is result + 2 × cache_shards shards.
+        // Arm *before* the warming read so the four resident shards count
+        // toward the peak — the entry baseline of a later arm would already
+        // contain them and hide exactly the term this arm exists to bound.
+        let backed = open(&path);
+        let (out, peak) = measure_live_peak(|| {
+            let warm = backed
+                .read_rows(0, (CACHE_SHARDS * ROWS_PER_SHARD) as u64)
+                .unwrap();
+            assert_eq!(warm.n_rows(), CACHE_SHARDS * ROWS_PER_SHARD);
+            drop(warm);
+            backed.read_rows(0, n_obs as u64).unwrap()
+        });
+        assert_eq!(out.indices, full.indices);
+        let result = csr_bytes(out.n_rows(), out.nnz());
+        let budget = result + 2 * CACHE_SHARDS * shard + shard;
+        let budget = budget + budget / 10;
+        eprintln!(
+            "framed={framed} read_rows(0, n) warm LRU: result={result} peak={peak} budget={budget} ({:.2}× result)",
+            peak as f64 / result as f64
+        );
+        assert!(
+            peak <= budget,
+            "framed={framed}: read_rows(0, n) on a full LRU peaked at {peak} live bytes for a \
+             {result}-byte result (budget {budget}: result + 2 × cache_shards shards)"
+        );
     }
 }

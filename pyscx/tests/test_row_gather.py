@@ -77,6 +77,16 @@ def test_negative_indices_wrap_once(scx_path):
             h[np.asarray([-101])]
 
 
+def test_unsigned_indices_near_the_top_do_not_alias_the_last_rows(scx_path):
+    for name, h, ref in _handles(scx_path):
+        for v in (2**64 - 1, 2**64 - 2, 2**63):
+            with pytest.raises(IndexError, match=f"{v}"):
+                h[np.asarray([v], dtype=np.uint64)]
+        np.testing.assert_allclose(
+            h[np.asarray([99, 0], dtype=np.uint64)].toarray(), ref[[99, 0]], rtol=1e-6, err_msg=name
+        )
+
+
 def test_out_of_range_row_is_an_index_error_not_a_shorter_result(scx_path):
     for name, h, _ in _handles(scx_path):
         with pytest.raises(IndexError, match="10000"):

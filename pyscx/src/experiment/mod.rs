@@ -1206,8 +1206,9 @@ impl PyExperiment {
     /// The bounded shard-wise gather: each touched shard is decoded once (a
     /// sparse request on a row-group-framed shard decodes only the touched row
     /// groups), and the result is assembled **once** into exact-size buffers in
-    /// request order — peak memory is the result plus `cache_shards` decoded
-    /// shards, never a second copy of the result. `rows` is a boolean mask or
+    /// request order — peak memory is the result plus the shard cache
+    /// (`cache_shards` decoded shards) plus one shard's transient, never a
+    /// second copy of the result. `rows` is a boolean mask or
     /// any 1-D integer array-like (list, range, ndarray of any integer dtype);
     /// it may contain duplicates and need not be sorted; negative indices wrap
     /// once. Returns raw-local gene indices (no global-vocab remap). On
@@ -1216,7 +1217,9 @@ impl PyExperiment {
     /// `logical=True` (default) indexes the rows `Experiment.n_obs` /
     /// `read_obs()` describe — deletion vectors applied, as
     /// `to_anndata(backed=True).X[rows]` does. `logical=False` indexes the
-    /// physical file rows (`n_obs_physical`), deleted cells included.
+    /// physical file rows (`n_obs_physical`), deleted cells included. Changed in
+    /// 0.17: the method used to address physical rows only, so on a file with
+    /// deletion vectors the same ids now select different cells.
     /// `layer=` gathers from that layer's shard family instead of `X`
     /// (`ValueError` if absent; not supported together with a multimodal file).
     ///

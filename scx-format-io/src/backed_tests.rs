@@ -1266,6 +1266,34 @@ fn read_rows_bulk_serves_resident_shards_from_the_cache_and_leaves_it_alone() {
     assert_eq!(m.misses.load(Ordering::Relaxed), 2);
 }
 
+/// `read_rows` refuses a range past `n_obs` instead of sizing its output from
+/// it: the pre-sized assembly would leave the uncovered tail of `indptr` at
+/// zero — a non-monotone CSR — and `end = u64::MAX` would overflow the
+/// allocation. (The pre-PR-C concatenate path returned a shorter matrix; the
+/// Python and R bindings clamp or reject before the call, so only a direct
+/// Rust caller can reach this.)
+#[test]
+fn read_rows_rejects_a_range_past_n_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, full) = write_test_file_and_open(&dir, 12, 10, 4, 4);
+    let n_obs = backed.n_obs() as u64;
+
+    for (start, end) in [(n_obs - 2, n_obs + 10), (n_obs, n_obs + 1), (0, u64::MAX)] {
+        let err = backed
+            .read_rows(start, end)
+            .expect_err("a range past n_obs must error, not emit a malformed CSR");
+        assert!(
+            err.to_string().contains("out of range"),
+            "{start}..{end}: {err}"
+        );
+    }
+    // The boundary itself is fine.
+    let tail = backed.read_rows(n_obs - 2, n_obs).unwrap();
+    assert_eq!(tail.indices, full.row_slice(10, 12).unwrap().indices);
+    // `start >= end` is still the empty matrix, wherever it sits.
+    assert_eq!(backed.read_rows(n_obs + 5, n_obs + 5).unwrap().n_rows(), 0);
+}
+
 /// A range that fits the LRU still goes through it (warm + copy), so the
 /// sequential chunk iterator's re-reads keep hitting.
 #[test]
