@@ -67,8 +67,9 @@ from _rust_literals import f64_literal, rust_matrix
 # lossless and a reference computed here in f64 is comparable at abs=0.
 #
 # Rows 10 and 11 carry the unlabelled sentinel. Their values are deliberately
-# extreme: if a kernel ever let an unlabelled cell into the rank pool or the
-# rest denominator, no tolerance would hide it.
+# extreme: an unlabelled cell is in no group but IS in the rank pool and in
+# every group's "rest" (scanpy's rule, pyscx's since 0.17 / X9), so a kernel
+# that drops them from either could not hide behind a tolerance.
 #
 # The six genes, each chosen for a path some arm treats differently:
 #   g0  distinct separating values      — the clean signal
@@ -78,8 +79,11 @@ from _rust_literals import f64_literal, rust_matrix
 #                                         stored zeros that must join the
 #                                         *implicit*-zero block, not `pos`
 #   g4  small counts                    — partial ties, the realistic shape
-#   g5  nonzero ONLY in unlabelled rows — the leak canary: to the labelled
-#                                         pool this gene is identical to g2
+#   g5  nonzero ONLY in unlabelled rows — the inclusion canary: it is all-zero
+#                                         over the labelled cells, so it is
+#                                         distinguishable from the all-zero g2
+#                                         only if unlabelled cells are in the
+#                                         pool. Before X9 the two were identical.
 GROUPS = [0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 2, 2]  # 2 == unlabelled sentinel
 N_GROUPS = 2
 
@@ -103,15 +107,16 @@ X = np.array(
 )
 
 N_OBS, N_VARS = X.shape
-LABELLED = [i for i, g in enumerate(GROUPS) if g < N_GROUPS]
 
 
 def scipy_reference() -> np.ndarray:
     """Per-(gene, group) 1-vs-rest two-sided p from **scipy's own p-value**.
 
-    Over LABELLED cells only: scipy has no notion of a cell outside the
-    comparison pool, so the reference is `mannwhitneyu(group, rest)` on the
-    physically subsetted matrix.
+    Over EVERY cell: "rest" is every row outside the group, unlabelled rows
+    included, so the reference is `mannwhitneyu(group, everything-else)` on the
+    unfiltered matrix. scipy needs no notion of an unlabelled cell for that —
+    such a cell is simply on the `g != grp` side of every split, which is
+    exactly what scanpy's `X[~mask_g]` means.
 
     `res.pvalue` is taken verbatim. scipy applies its own tie correction
     internally, which is what makes this an independent check on SCX's
@@ -120,8 +125,8 @@ def scipy_reference() -> np.ndarray:
     from scipy.stats import mannwhitneyu
 
     p = np.zeros((N_VARS, N_GROUPS))
-    d = X[LABELLED].astype(np.float64)
-    g = np.asarray([GROUPS[i] for i in LABELLED])
+    d = X.astype(np.float64)
+    g = np.asarray(GROUPS)
     for j in range(N_VARS):
         col = d[:, j]
         for grp in range(N_GROUPS):
@@ -143,21 +148,26 @@ def scipy_reference() -> np.ndarray:
 def scanpy_reference(tie_correct: bool) -> tuple[np.ndarray, np.ndarray]:
     """scanpy `rank_genes_groups(method="wilcoxon")`, either convention.
 
-    Run on the LABELLED subset, because scanpy has no notion of a cell outside
-    the comparison pool: its "rest" is every other row. Feeding it the full
-    matrix would make it answer a different question, which is precisely the
-    §7.1 class of bug this fixture exists to pin.
+    Run on the FULL matrix with the two sentinel rows carrying a NaN label —
+    the input the kernels are handed, not a pre-filtered stand-in. scanpy ranks
+    the whole matrix and keeps a NaN-labelled cell in every group's "rest", and
+    since 0.17 (X9) so does SCX; running scanpy on a filtered matrix would pin
+    the old, divergent rule instead of the one being claimed.
+
+    The categories are declared explicitly so a NaN row stays NaN rather than
+    becoming a third level.
     """
     import anndata
     import pandas as pd
     import scanpy as sc
     import scipy.sparse as sp
 
-    labels = [f"grp{GROUPS[i]}" for i in LABELLED]
+    cats = [f"grp{g}" for g in range(N_GROUPS)]
+    labels = [f"grp{g}" if g < N_GROUPS else None for g in GROUPS]
     ad = anndata.AnnData(
-        X=sp.csr_matrix(X[LABELLED].copy()),
-        obs=pd.DataFrame({"g": pd.Categorical(labels)},
-                         index=[f"c{i}" for i in LABELLED]),
+        X=sp.csr_matrix(X.copy()),
+        obs=pd.DataFrame({"g": pd.Categorical(labels, categories=cats)},
+                         index=[f"c{i}" for i in range(N_OBS)]),
         var=pd.DataFrame(index=[f"g{j}" for j in range(N_VARS)]),
     )
     sc.tl.rank_genes_groups(ad, "g", method="wilcoxon", tie_correct=tie_correct)

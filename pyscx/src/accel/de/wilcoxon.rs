@@ -34,11 +34,12 @@ pub(crate) struct RankGenesRun {
 ///
 /// `requested_groups` restricts which groups are *reported*, never which cells
 /// take part: every group's statistic is computed against the same pool
-/// (1-vs-rest keeps every other labelled cell in "rest"; pairwise compares
-/// against the named reference; BH is per group), so a group's numbers are
-/// identical with or without the restriction — and identical to scanpy's,
-/// whose `groups=` works the same way. Relabelling the unselected groups as
-/// unlabelled before the kernel would have changed what "rest" means.
+/// (1-vs-rest keeps every other cell in "rest", unlabelled ones included;
+/// pairwise compares against the named reference; BH is per group), so a
+/// group's numbers are identical with or without the restriction — and
+/// identical to scanpy's, whose `groups=` works the same way. Relabelling the
+/// unselected groups as unlabelled before the kernel would have changed what
+/// "rest" means.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_rank_genes_groups_inner(
     py: Python<'_>,
@@ -71,7 +72,18 @@ pub(crate) fn run_rank_genes_groups_inner(
             .call_method0("tolist")?
             .extract()?
     } else {
-        let mut unique: Vec<String> = group_labels.to_vec();
+        // scanpy reaches this column through `sanitize_anndata`, i.e. through
+        // `astype("category")`, where a NaN is *not* a category. Mirror that:
+        // `encode_group_labels` sends `"nan"` / `""` to the unlabelled sentinel,
+        // so keeping them here would mint levels that no cell can ever be in —
+        // a phantom `pts` column, and, since the singlet guard below counts
+        // cells per level, a spurious "only contain one sample" error on any
+        // plain string column with a missing value.
+        let mut unique: Vec<String> = group_labels
+            .iter()
+            .filter(|label| !label.is_empty() && label.as_str() != "nan")
+            .cloned()
+            .collect();
         unique.sort();
         unique.dedup();
         unique
@@ -85,10 +97,17 @@ pub(crate) fn run_rank_genes_groups_inner(
         .collect();
 
     // Unknown groups (NaN / empty after astype("str") → "nan" / "") map to a
-    // sentinel >= n_groups so the Wilcoxon kernels drop them, instead of
-    // contaminating group 0. Mirrors resolve_groups_and_reference.
+    // sentinel >= n_groups so the Wilcoxon kernels give them no group of their
+    // own, instead of contaminating group 0. They still rank, and still count
+    // as "rest", in the 1-vs-rest arm. Mirrors resolve_groups_and_reference.
     let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
-    warn_unlabelled_cells(py, &groups, unique_groups.len(), groupby);
+    warn_unlabelled_cells(
+        py,
+        &groups,
+        unique_groups.len(),
+        groupby,
+        reference == "rest",
+    );
 
     // Resolve reference.
     let ref_idx: Option<usize> = if reference == "rest" {
@@ -106,8 +125,65 @@ pub(crate) fn run_rank_genes_groups_inner(
     // above). The reference is never a tested group — scanpy drops it from the
     // request silently and keeps it as a `pts` column, so do the same.
     let named_reference = (reference != "rest").then_some(reference);
+
+    // scanpy refuses any *participating* group with fewer than two cells
+    // ("… since they only contain one sample"), and a participating group is
+    // every level when `groups=` is omitted — `select_groups(adata, "all", …)`
+    // returns `cat.categories`, and `value_counts()` reports an unused level as
+    // 0, which is also `< 2`. So the check cannot live inside the `groups=`
+    // branch: doing so made the default call — the one nobody is watching —
+    // return finite, plausible scores computed from one cell (X8).
+    //
+    // Sizes are counted over the encoded labels, so an off-category value is a
+    // sentinel here and not a member of any level, exactly as it is downstream.
+    let group_sizes = {
+        let mut sizes = vec![0usize; unique_groups.len()];
+        for &code in &groups {
+            if code < unique_groups.len() {
+                sizes[code] += 1;
+            }
+        }
+        sizes
+    };
+    let refuse_singletons = |participating: &[&str]| -> PyResult<()> {
+        let too_small: Vec<&str> = participating
+            .iter()
+            .copied()
+            .filter(|name| group_sizes[group_name_to_idx[*name]] < 2)
+            .collect();
+        if too_small.is_empty() {
+            return Ok(());
+        }
+        // Naming the remedy matters for the zero-cell case, which is almost
+        // always a subset that kept its parent's categories rather than a
+        // genuinely tiny group.
+        let empties: Vec<&str> = too_small
+            .iter()
+            .copied()
+            .filter(|name| group_sizes[group_name_to_idx[*name]] == 0)
+            .collect();
+        let remedy = if empties.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({} has no cells at all; if that is a level left over from a subset, run \
+                 adata.obs[{groupby:?}] = adata.obs[{groupby:?}].cat.remove_unused_categories())",
+                empties.join(", ")
+            )
+        };
+        Err(PyValueError::new_err(format!(
+            "Could not calculate statistics for groups {} since they only contain one \
+             sample.{remedy}",
+            too_small.join(", ")
+        )))
+    };
+
     let tested_groups: Option<Vec<String>> = match requested_groups {
-        None => None,
+        None => {
+            let all: Vec<&str> = unique_groups.iter().map(String::as_str).collect();
+            refuse_singletons(&all)?;
+            None
+        }
         Some(req) => {
             // Shape (non-empty, no repeats) was checked at the entry point, so
             // the stratified path fails once, up front, not once per stratum.
@@ -130,31 +206,16 @@ pub(crate) fn run_rank_genes_groups_inner(
                      group {reference:?}"
                 )));
             }
-            // scanpy refuses any participating group with fewer than two cells
-            // ("… since they only contain one sample"). Applied to the groups the
-            // caller named — the tested ones and a named reference — so the new
-            // surface matches scanpy; an omitted `groups=` keeps today's NaN rows
-            // for empty / singlet levels (a pre-existing difference, tracked
-            // separately).
-            let mut sizes = vec![0usize; unique_groups.len()];
-            for &code in &groups {
-                if code < unique_groups.len() {
-                    sizes[code] += 1;
-                }
-            }
-            let too_small: Vec<&str> = tested
+            // The requested set, not the whole universe: `groups=` is an output
+            // filter, so a singleton level the caller did not ask about is not
+            // a group this run reports on. Same rule as scanpy's, whose
+            // `groups_order` is the request when one is given.
+            let participating: Vec<&str> = tested
                 .iter()
                 .map(String::as_str)
                 .chain(named_reference)
-                .filter(|name| sizes[group_name_to_idx[*name]] < 2)
                 .collect();
-            if !too_small.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "Could not calculate statistics for groups {} since they only contain one \
-                     sample.",
-                    too_small.join(", ")
-                )));
-            }
+            refuse_singletons(&participating)?;
             Some(tested)
         }
     };
@@ -852,10 +913,22 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// pool each group is compared against is unchanged, so its numbers equal the
 /// unrestricted run's and scanpy's ``groups=``. Unknown names, repeats and an
 /// empty list raise; the reference group is silently not tested (it stays a
-/// ``pts`` column); a named group (or the named reference) with fewer than two
-/// cells raises scanpy's "only contain one sample" error — under
-/// ``stratify_by`` that, like any per-stratum failure, warns and drops the
-/// stratum. ``pts=True`` refuses duplicate var names (its table is joined by
+/// ``pts`` column).
+///
+/// Any **participating** group with fewer than two cells raises scanpy's "only
+/// contain one sample" error: every level when ``groups`` is omitted, the named
+/// ones (plus a named reference) when it is given. An unused category counts as
+/// zero cells and so raises too, as it does in scanpy — the message names
+/// ``remove_unused_categories()``. Under ``stratify_by`` that, like any
+/// per-stratum failure, warns and drops the stratum.
+///
+/// Cells with no ``groupby`` label (NaN, empty, or off-category) get no group,
+/// no result row and no ``pts`` column, but for ``reference="rest"`` they are in
+/// the rank pool and in every group's "rest" — scanpy 1.12's rule. A pairwise
+/// run against a named reference compares ``group ∪ reference``, so they take
+/// no part in it.
+///
+/// ``pts=True`` refuses duplicate var names (its table is joined by
 /// name). ``corr_method`` accepts only ``"benjamini-hochberg"`` and is
 /// recorded in ``params``; any other value raises instead of silently
 /// applying BH.

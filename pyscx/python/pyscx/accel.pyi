@@ -58,9 +58,13 @@ def rank_genes_groups(
     round-trip through ``from_anndata`` / ``to_anndata`` and h5ad on the uns
     ``pandas.DataFrame`` envelope. ``groups=`` restricts
     which groups are *reported*, in the given order; "rest" is unchanged, so
-    each group's statistics equal the unrestricted run's (and scanpy's); a
-    named group (or named reference) with fewer than two cells raises, as in
-    scanpy. ``pts=True`` refuses duplicate ``var_names`` (its table is joined
+    each group's statistics equal the unrestricted run's (and scanpy's). Any
+    *participating* group with fewer than two cells raises, as in scanpy —
+    every level when ``groups`` is omitted, the named ones (plus a named
+    reference) when it is given; an unused category counts as zero cells.
+    Cells with no ``groupby`` label get no group of their own, but for
+    ``reference="rest"`` they are in the rank pool and in every group's
+    "rest", as scanpy does. ``pts=True`` refuses duplicate ``var_names`` (its table is joined
     by name). ``corr_method`` accepts only ``"benjamini-hochberg"`` (recorded
     in ``params``); any other value raises rather than silently applying BH.
     """

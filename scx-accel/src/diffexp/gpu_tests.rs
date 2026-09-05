@@ -1374,17 +1374,21 @@ fn test_gpu_lazy_entry_points_match_dense_reference() {
 // ---------------------------------------------------------------------------
 
 /// **The oracle for unlabelled-cell semantics on the GPU**, mirroring
-/// `diffexp::cpu_tests::test_one_vs_rest_unlabelled_cells_equal_physical_subset`.
+/// `diffexp::cpu_tests::test_one_vs_rest_unlabelled_cells_equal_an_extra_group`.
 ///
 /// GPU 1-vs-rest over a matrix containing unlabelled cells (group label
-/// `>= n_groups`) must equal GPU 1-vs-rest over the same matrix with those rows
-/// physically removed. The v3 driver used to build its rank pool from
-/// `0..n_obs` and derive `rest_n = n_obs - n_g` while the pseudobulk sums it
-/// subtracted covered labelled groups only — the same numerator/denominator
-/// mismatch the CPU kernels had, replicated deliberately for parity.
+/// `>= n_groups`) must equal GPU 1-vs-rest over the same matrix with those cells
+/// collected into one *extra* group: both rank all `n_obs` values and both give
+/// group `g` the same "rest".
+///
+/// The GPU arrives at this differently from the CPU and that is the point of a
+/// separate arm: slot 0 of the main table — empty in 1-vs-rest until X9 —
+/// carries the unlabelled cells, purely so the per-slot pseudobulk sums that
+/// `total_gene_sum` adds up cover every cell. Get that wrong and the rank pool
+/// is right while the logFC numerator is short, which no CPU test can see.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
+fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_an_extra_group() {
     require_gpu_or_skip!();
 
     let n_groups = 3usize;
@@ -1408,16 +1412,13 @@ fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
     let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
     let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
 
-    let mut sub_data = Vec::new();
-    let mut sub_groups = Vec::new();
-    for (cell, &g) in groups.iter().enumerate() {
-        if g < n_groups {
-            sub_data.extend_from_slice(&data[cell * n_vars..(cell + 1) * n_vars]);
-            sub_groups.push(g);
-        }
-    }
-    let sub_n_obs = sub_groups.len();
-    assert!(sub_n_obs < n_obs, "fixture must contain unlabelled cells");
+    assert!(
+        groups.iter().any(|&g| g >= n_groups),
+        "fixture must contain unlabelled cells"
+    );
+    let mut extra_group_names = group_names.clone();
+    extra_group_names.push("unlabelled".to_string());
+    let extra_groups: Vec<usize> = groups.iter().map(|&g| g.min(n_groups)).collect();
 
     let with_sentinel = wilcoxon_rank_sum_gpu_dense(
         0,
@@ -1436,18 +1437,18 @@ fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
 
     let physically_subset = wilcoxon_rank_sum_gpu_dense(
         0,
-        &sub_data,
-        sub_n_obs,
+        &data,
+        n_obs,
         n_vars,
         &gene_names,
-        &sub_groups,
-        &group_names,
+        &extra_groups,
+        &extra_group_names,
         None,
         false,
         false,
         true,
     )
-    .expect("GPU wilcoxon (physical subset) failed");
+    .expect("GPU wilcoxon (unlabelled as an extra group) failed");
 
     use std::collections::HashMap;
     let to_map = |res: &DiffExpResult, g: usize| -> HashMap<String, (f64, f64, f64)> {
@@ -1471,17 +1472,17 @@ fn test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset() {
             let (sb, pb, lb) = b[gene];
             assert!(
                 (sa - sb).abs() < 1e-6,
-                "score mismatch group={} gene={gene}: sentinel={sa}, subset={sb}",
+                "score mismatch group={} gene={gene}: sentinel={sa}, extra-group={sb}",
                 group_name
             );
             assert!(
                 (pa - pb).abs() < 1e-9 || (pa - pb).abs() / pa.abs().max(1e-12) < 1e-6,
-                "pval mismatch group={} gene={gene}: sentinel={pa}, subset={pb}",
+                "pval mismatch group={} gene={gene}: sentinel={pa}, extra-group={pb}",
                 group_name
             );
             assert!(
                 (la - lb).abs() < 1e-6,
-                "logFC mismatch group={} gene={gene}: sentinel={la}, subset={lb}",
+                "logFC mismatch group={} gene={gene}: sentinel={la}, extra-group={lb}",
                 group_name
             );
         }
@@ -1640,7 +1641,7 @@ fn test_wilcoxon_gpu_matches_the_external_reference_values() {
                 // The p bar is deliberately looser than the host's
                 // `P_CORRECTED_ATOL`: the kernel accumulates rank sums in a
                 // different order, so this is a reduction-order bound. It is
-                // still seven orders tighter than the 7.6e-02 gap between the
+                // still seven orders tighter than the 4.4e-01 gap between the
                 // two tie conventions, so it cannot launder one into the other.
                 let (atol_z, atol_p) = (r::Z_ATOL, 1e-9);
                 assert!(

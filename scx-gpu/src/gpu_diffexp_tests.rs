@@ -46,12 +46,12 @@ fn test_gpu_de_aux_elems_covers_the_largest_sort_not_the_pool() {
         .next_power_of_two();
     assert!(from_max >= needed, "aux {from_max} < required {needed}");
 
-    // 1-vs-rest: the pool is every labelled cell, so it already dominates every
-    // group and the same expression must not inflate the allocation.
-    let labelled = 20_000usize;
+    // 1-vs-rest: the pool is every cell, so it already dominates every group
+    // and the same expression must not inflate the allocation.
+    let pool = 20_000usize;
     assert_eq!(
-        gpu_de_aux_elems(chunk, labelled.max(n_g_max)).unwrap(),
-        chunk * labelled
+        gpu_de_aux_elems(chunk, pool.max(n_g_max)).unwrap(),
+        chunk * pool
     );
 
     // Overflow is rejected here rather than wrapping into a small allocation

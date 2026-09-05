@@ -291,8 +291,10 @@ def _make_unlabelled_fixture(n_unlabelled: int = 30):
     """The 3-group fixture with `n_unlabelled` extra cells carrying a NaN label.
 
     Returns `(with_nan, filtered)` — the same expression matrix twice, once with
-    the unlabelled rows present and once with them physically removed. Any
-    correct definition of "rest" makes those two runs identical.
+    the unlabelled rows present and once with them physically removed. Since
+    X9 those are two *different* computations: an unlabelled cell is in every
+    group's "rest", so removing it changes every group's answer. The tests below
+    pin both halves of that.
     """
     cats = ["non-targeting", "ko_a", "ko_b"]
     base = _make_adata()
@@ -319,65 +321,73 @@ def _make_unlabelled_fixture(n_unlabelled: int = 30):
     return with_nan, filtered
 
 
-def test_rank_genes_groups_rest_excludes_unlabelled_cells():
-    """1-vs-rest DE must not count unlabelled cells in "rest".
+def test_rank_genes_groups_rest_counts_unlabelled_cells_in_rest():
+    """1-vs-rest DE counts unlabelled cells in "rest", so deleting them moves it.
 
-    `reference="rest"` is the arm the existing unknown-label test above does not
-    reach — it runs pairwise against a named reference, which gathers only
-    `group ∪ ref` and was always correct.
+    `reference="rest"` is the arm the unknown-label test above does not reach —
+    it runs pairwise against a named reference, which gathers only `group ∪ ref`
+    and is unaffected either way.
 
-    In 1-vs-rest the rest *numerator* summed only labelled cells while the rest
-    *denominator* was `n_obs`, so every logFC in every group came out inflated
-    by `log2(n_obs − n1) − log2(n_labelled − n1)`; the rank pool kept the
-    unlabelled cells as competitors, so the z-scores were off too. The oracle is
-    the same matrix with those rows physically deleted.
+    Until X9 pyscx dropped unlabelled cells from the pool and this asserted the
+    opposite: that the two runs agreed. They do not, and the difference is the
+    behaviour change. Asserted as "materially different", not against a fixed
+    number — the numbers themselves are pinned against scanpy in the test below,
+    and a tolerance-sized difference would not carry the claim.
     """
     with_nan, filtered = _make_unlabelled_fixture()
     assert with_nan.n_obs > filtered.n_obs
 
-    pyscx.accel.rank_genes_groups(with_nan, "target", reference="rest", device="cpu")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        pyscx.accel.rank_genes_groups(
+            with_nan, "target", reference="rest", device="cpu"
+        )
     pyscx.accel.rank_genes_groups(filtered, "target", reference="rest", device="cpu")
 
     got = _scores_and_pvals_by_gene(with_nan)
     want = _scores_and_pvals_by_gene(filtered)
     assert got.keys() == want.keys()
-    for key in want:
-        np.testing.assert_allclose(
-            got[key],
-            want[key],
-            rtol=1e-9,
-            atol=1e-12,
-            err_msg=(
-                f"1-vs-rest DE for {key} differs from the physically-filtered "
-                f"run — unlabelled cells are leaking into 'rest' or the rank pool"
-            ),
-        )
+    max_delta = max(
+        float(np.max(np.abs(np.asarray(got[key]) - np.asarray(want[key]))))
+        for key in want
+    )
+    assert max_delta > 1e-6, (
+        "1-vs-rest DE is indistinguishable from the physically-filtered run "
+        f"(max |Δ| = {max_delta}) — unlabelled cells are still being dropped "
+        "from 'rest' and the rank pool"
+    )
 
 
 def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy_on_log1p():
-    """End-to-end oracle: scanpy on the filtered matrix.
+    """End-to-end oracle: scanpy on the **same, unfiltered** matrix.
 
     Runs on log1p data deliberately. scanpy's `rank_genes_groups` applies
     `expm1` to the group means unconditionally (the `uns["log1p"]["base"]` entry
     only rescales it), so its logFC is only comparable to ours on log-space
     input — on raw counts scanpy warns and the two formulas legitimately differ.
-    scanpy is run on the *filtered* matrix on purpose: pyscx's rule is that
-    unlabelled cells take no part, and this pins that rule against scanpy's
-    numbers for the labelled cells alone. scanpy 1.12 itself keeps NaN-labelled
-    cells in its 1-vs-rest pool, so scanpy-on-NaN is a different computation —
-    a pre-existing divergence, tracked separately.
+
+    scanpy is run on the NaN-bearing matrix, which is the whole point: this is
+    the claim the parity table makes and the one X9 fixed. The previous version
+    of this test ran scanpy on the *filtered* matrix, so both sides excluded the
+    same cells and it could not see the divergence at all — it stayed green
+    through the entire lifetime of the bug.
     """
     sc = pytest.importorskip("scanpy")
 
-    with_nan, filtered = _make_unlabelled_fixture()
+    with_nan, _ = _make_unlabelled_fixture()
+    scanpy_side = with_nan.copy()
     sc.pp.log1p(with_nan)
-    sc.pp.log1p(filtered)
+    sc.pp.log1p(scanpy_side)
 
-    pyscx.accel.rank_genes_groups(with_nan, "target", reference="rest", device="cpu")
-    sc.tl.rank_genes_groups(filtered, "target", method="wilcoxon")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        pyscx.accel.rank_genes_groups(
+            with_nan, "target", reference="rest", device="cpu"
+        )
+    sc.tl.rank_genes_groups(scanpy_side, "target", method="wilcoxon")
 
     got = _scores_and_pvals_by_gene(with_nan)
-    want = _scores_and_pvals_by_gene(filtered)
+    want = _scores_and_pvals_by_gene(scanpy_side)
     assert got.keys() == want.keys()
     # Looser than the self-parity test above (1e-9/1e-12), which compares two
     # runs of the same kernel. Here the two sides are different implementations:
@@ -391,11 +401,26 @@ def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy_on_log1p():
 
 
 def test_rank_genes_groups_warns_about_unlabelled_cells():
-    """Dropping rows silently is the part that made this invisible."""
+    """Saying nothing is the part that made this invisible.
+
+    The two arms say different things, because they do different things: in
+    1-vs-rest the cells are in every group's "rest"; pairwise against a named
+    reference they take no part at all.
+    """
     with_nan, _ = _make_unlabelled_fixture(n_unlabelled=12)
     with pytest.warns(UserWarning, match=r"12 of \d+ cells have no group label"):
         pyscx.accel.rank_genes_groups(
-            with_nan, "target", reference="rest", device="cpu"
+            with_nan.copy(), "target", reference="rest", device="cpu"
+        )
+
+    with pytest.warns(UserWarning, match=r"in every group's 'rest'"):
+        pyscx.accel.rank_genes_groups(
+            with_nan.copy(), "target", reference="rest", device="cpu"
+        )
+
+    with pytest.warns(UserWarning, match=r"takes no part in it at all"):
+        pyscx.accel.rank_genes_groups(
+            with_nan.copy(), "target", reference="non-targeting", device="cpu"
         )
 
 

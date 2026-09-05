@@ -489,7 +489,9 @@ fn resolve_groups_and_reference(
     // "") get mapped to a sentinel that exceeds n_groups, so pdex_ref drops
     // them. Use `unique_groups.len()` as the out-of-range marker.
     let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
-    warn_unlabelled_cells(adata.py(), &groups, unique_groups.len(), groupby);
+    // `resolve_groups_and_reference` serves `pdex_ref` only, which is always
+    // pairwise against a named reference.
+    warn_unlabelled_cells(adata.py(), &groups, unique_groups.len(), groupby, false);
 
     let Some(req) = requested else {
         return Ok((groups, unique_groups, ref_idx));
@@ -570,36 +572,58 @@ fn encode_group_labels(
         .collect()
 }
 
-/// Tell the caller when cells were dropped for having no group label.
+/// Tell the caller that some cells carry no group label, and what that means
+/// for the comparison they asked for.
 ///
-/// Silently excluding rows changes what "rest" means, and an `obs` column with
-/// a handful of unannotated cells looks exactly like one without. The exclusion
-/// is pyscx's rule (scanpy 1.12 keeps such cells in its 1-vs-rest pool — see
-/// `scx_accel::diffexp::groups`), and nothing anywhere reported it.
-fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, groupby: &str) {
+/// An `obs` column with a handful of unannotated cells looks exactly like one
+/// without, and the two arms treat them differently, so neither silence would
+/// be safe:
+///
+/// * `one_vs_rest` — the cells rank alongside everyone else and count in every
+///   group's "rest" (scanpy's rule, and SCX's since 0.17 / X9). Nothing is
+///   dropped; what they do not get is a group, a row of results or a `pts`
+///   column of their own.
+/// * pairwise (`reference = <name>`, and every `pdex_ref` call) — the
+///   comparison is `group ∪ reference`, so a cell in neither takes no part at
+///   all.
+fn warn_unlabelled_cells(
+    py: Python<'_>,
+    groups: &[usize],
+    n_groups: usize,
+    groupby: &str,
+    one_vs_rest: bool,
+) {
     let n_unlabelled = groups.iter().filter(|&&g| g >= n_groups).count();
     if n_unlabelled == 0 {
         return;
     }
+    let short = if one_vs_rest {
+        "are in every group's 'rest' but in no group of their own"
+    } else {
+        "take no part in the test"
+    };
     // Also on the Rust log, so a batch pipeline running under
-    // `-W ignore` / `warnings.simplefilter("ignore")` still leaves a record
-    // that rows were dropped.
+    // `-W ignore` / `warnings.simplefilter("ignore")` still leaves a record.
     log::warn!(
-        "DE on obs['{groupby}']: {n_unlabelled} of {} cells have no group label and are \
-         excluded from the test",
+        "DE on obs['{groupby}']: {n_unlabelled} of {} cells have no group label and {short}",
         groups.len()
     );
+    let detail = if one_vs_rest {
+        "They are in no group of their own — no result row, no `pts` column — but they \
+         are in the rank pool and in every group's 'rest', numerator and denominator \
+         alike, as scanpy 1.12 does. Label them to give them a group of their own, or \
+         drop them to leave them out of 'rest' as well."
+    } else {
+        "This test compares each group with the named reference group, so a cell in \
+         neither takes no part in it at all. Drop or label them to silence this."
+    };
     if let Ok(warnings) = crate::pyimport::import_module(py, "warnings") {
         let _ = warnings.call_method1(
             "warn",
             (
                 format!(
                     "{n_unlabelled} of {} cells have no group label in obs['{groupby}'] \
-                     (NaN, empty, or a value outside the column's categories). They are \
-                     excluded from the test entirely — not part of 'rest' and not part of \
-                     the rank pool. That is pyscx's rule; scanpy 1.12 keeps such cells in its \
-                     1-vs-rest pool, so results differ from scanpy's on this input (pts_rest \
-                     follows scanpy). Drop or label them to silence this.",
+                     (NaN, empty, or a value outside the column's categories). {detail}",
                     groups.len()
                 ),
                 py.get_type::<pyo3::exceptions::PyUserWarning>(),

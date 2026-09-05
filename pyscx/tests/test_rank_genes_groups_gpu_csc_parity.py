@@ -93,9 +93,68 @@ def _run_parity(tmp_path, reference) -> None:
     assert route == "gpu_csc_v3", f"expected CSC-direct route, got {route!r}"
 
 
+def _partially_labelled_adata():
+    """The shared fixture with a tenth of its cells carrying a NaN label.
+
+    Also plants a gene that is nonzero *only* in those cells: to any route that
+    leaves them out of the pool it is identical to an all-zero gene, so the
+    fixture separates the two pools rather than merely containing both.
+    """
+    import pandas as pd
+    import scipy.sparse as sp
+
+    adata = _make_adata()
+    cats = list(pd.unique(adata.obs["target"]))
+    labels = adata.obs["target"].astype(object).to_numpy()
+    unlabelled = list(range(0, adata.n_obs, 10))
+    for i in unlabelled:
+        labels[i] = None
+    adata.obs["target"] = pd.Categorical(labels, categories=cats)
+
+    X = (adata.X.tolil() if sp.issparse(adata.X) else sp.lil_matrix(adata.X))
+    X[:, 0] = 0
+    for i in unlabelled:
+        X[i, 0] = 5.0
+    adata.X = X.tocsr()
+    return adata
+
+
 def test_rank_genes_groups_gpu_csc_parity_one_vs_rest(tmp_path) -> None:
     _run_parity(tmp_path, "rest")
 
 
 def test_rank_genes_groups_gpu_csc_parity_vs_reference(tmp_path) -> None:
     _run_parity(tmp_path, REFERENCE)
+
+
+def test_rank_genes_groups_gpu_csc_parity_partially_labelled(tmp_path) -> None:
+    """The CSC-direct v3 route on the same partially-labelled input (X9).
+
+    Same prep as the CSR route, but a different scatter kernel reads the
+    `cell_to_group` tables, so agreeing with the CPU on fully-labelled input
+    does not imply agreeing here.
+    """
+    import warnings
+
+    base = _partially_labelled_adata()
+    cpu = _open_with_csc(tmp_path / "cpu.scx", base)
+    gpu = _open_with_csc(tmp_path / "gpu.scx", base)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        pyscx.accel.rank_genes_groups(
+            cpu, "target", reference="rest", tie_correct=True, device="cpu"
+        )
+        pyscx.accel.rank_genes_groups(
+            gpu, "target", reference="rest", tie_correct=True, device="gpu"
+        )
+
+    _compare(_result_to_gene_dict(cpu), _result_to_gene_dict(gpu))
+    assert _route(gpu) == "gpu_csc_v3", f"expected CSC-direct route, got {_route(gpu)!r}"
+
+    planted = str(base.var_names[0])
+    for g, per_gene in _result_to_gene_dict(cpu).items():
+        assert per_gene[planted][0] != 0.0, (
+            f"group {g}: the gene nonzero only in unlabelled cells scored 0 — "
+            f"those cells never reached the pool"
+        )

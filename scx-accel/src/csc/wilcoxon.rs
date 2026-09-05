@@ -161,9 +161,10 @@ pub fn wilcoxon_rank_sum_streaming_csc<S: ColumnShardSource + ?Sized>(
 /// the two agreeing was an assertion in a doc comment rather than a fact about
 /// the code; all this function supplies now is *where a run's rank goes*.
 ///
-/// Every entry here belongs to a real group: the caller drops unlabelled cells
-/// before building the blocks, because they are not in the comparison pool at
-/// all (see `crate::diffexp::groups`).
+/// An entry's second field is its **pool bucket**
+/// (`crate::diffexp::groups::pool_bucket`), not its group: an unlabelled cell is
+/// in the pool — it occupies a rank and shifts everyone else's — but its rank
+/// mass lands in the sentinel slot, which no group ever reads back.
 fn assign_block_ranks(
     block: &[(f64, usize)],
     offset: usize,
@@ -186,15 +187,15 @@ fn assign_block_ranks(
 /// from a single gene's nonzeros (`rows`/`vals`) plus the implicit-zero block —
 /// the exact sparse analogue of the dense kernel's per-gene arm.
 ///
-/// The comparison pool is the **labelled** cells (`n_labelled`), never `n_obs`:
-/// an unlabelled cell contributes to no group sum, to no rest denominator, and
-/// to no rank — its nonzeros never enter the sorted blocks and it is not part
-/// of the implicit-zero block. Same rule as `wilcoxon_rank_sum`'s 1-vs-rest
-/// arm; see `crate::diffexp::groups`.
+/// The comparison pool is every cell (`n_obs`). An unlabelled cell joins no
+/// group's sum or count, but its nonzeros do enter the sorted blocks and it does
+/// belong to the implicit-zero block, because it is in every group's "rest" —
+/// scanpy's `X[~mask_g]`. Same rule as `wilcoxon_rank_sum`'s 1-vs-rest arm; see
+/// `crate::diffexp::groups`.
 ///
-/// `n_obs` survives as the **data-dimension** bound only — CSC row indices are
-/// global, so it is what an out-of-range row is checked against. It is not a
-/// statistical parameter here; `n_labelled` is.
+/// `group_cell_counts` is `n_groups + 1` long: the last entry is the unlabelled
+/// count, needed so the sentinel's share of the implicit-zero block is accounted
+/// for rather than silently folded into some group's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gene_stats_nnz(
     rows: &[i32],
@@ -202,13 +203,14 @@ pub(crate) fn gene_stats_nnz(
     groups: &[usize],
     group_cell_counts: &[usize],
     n_obs: usize,
-    n_labelled: usize,
     n_groups: usize,
     tie_correct: bool,
     log_transformed: bool,
 ) -> Result<Vec<(f64, f64, f64)>> {
-    let mut group_sum = vec![0.0f64; n_groups];
-    let mut nonzero_in_g = vec![0usize; n_groups];
+    debug_assert_eq!(group_cell_counts.len(), n_groups + 1);
+    // `n_groups + 1` wide throughout: the last slot is the unlabelled bucket.
+    let mut group_sum = vec![0.0f64; n_groups + 1];
+    let mut nonzero_in_g = vec![0usize; n_groups + 1];
     let mut neg: Vec<(f64, usize)> = Vec::new();
     let mut pos: Vec<(f64, usize)> = Vec::new();
     let mut total_sum = 0.0f64;
@@ -218,11 +220,9 @@ pub(crate) fn gene_stats_nnz(
         if row >= n_obs {
             continue;
         }
-        let g = groups[row];
-        if g >= n_groups {
-            // Unlabelled: outside the comparison pool entirely.
-            continue;
-        }
+        // Pool bucket, not group: an unlabelled cell is in the pool (it ranks,
+        // and it is in every group's rest) but in no group.
+        let g = crate::diffexp::groups::pool_bucket(groups[row], n_groups);
         let v = v32 as f64;
         total_sum += v;
         group_sum[g] += v;
@@ -240,8 +240,8 @@ pub(crate) fn gene_stats_nnz(
     let n_neg = neg.len();
     let n_pos = pos.len();
     // Each stored entry is one distinct cell (one entry per (cell,gene) in CSC),
-    // and out-of-range rows plus unlabelled cells are dropped above, so the
-    // pooled nonzeros never exceed n_labelled. A corrupt sidecar with duplicate
+    // and out-of-range rows are dropped above, so the pooled nonzeros never
+    // exceed n_obs. A corrupt sidecar with duplicate
     // rows in a column breaks that, and this used to be a `debug_assert!` —
     // compiled out in exactly the release builds where the subtraction below
     // then wrapped to ~1.8e19 and became a rank-block width. `ScxCsc::new`
@@ -251,23 +251,22 @@ pub(crate) fn gene_stats_nnz(
     // `scx-sparse`'s release `overflow-checks` override does not reach this
     // crate, so the guard has to be explicit.
     //
-    // Note precisely what it proves: `n_neg + n_pos` counts labelled **nonzero**
-    // cells, since explicit stored zeros join the implicit-zero block above. So
+    // Note precisely what it proves: `n_neg + n_pos` counts **nonzero** cells,
+    // since explicit stored zeros join the implicit-zero block above. So
     // a column overfull purely with duplicated explicit zeros passes this — the
     // arithmetic is safe either way, but this is not a canonicality verdict.
-    let n_zero_total =
-        scx_sparse::implicit_zero_count(n_labelled, n_neg + n_pos).map_err(|_| {
-            AccelError::InvalidInput(format!(
-                "non-canonical CSC sidecar: a gene column holds {} labelled nonzero cells \
-             against {n_labelled} labelled cells, so at least one cell is stored twice; \
+    let n_zero_total = scx_sparse::implicit_zero_count(n_obs, n_neg + n_pos).map_err(|_| {
+        AccelError::InvalidInput(format!(
+            "non-canonical CSC sidecar: a gene column holds {} nonzero cells \
+             against {n_obs} cells, so at least one cell is stored twice; \
              run `scx validate --deep`",
-                n_neg + n_pos
-            ))
-        })?;
+            n_neg + n_pos
+        ))
+    })?;
     // Mid-rank of the zero tie-block spanning 1-based ranks [n_neg+1 .. n_neg+n_zero].
     let zero_mid = n_neg as f64 + (n_zero_total as f64 + 1.0) / 2.0;
 
-    let mut rank_sum = vec![0.0f64; n_groups];
+    let mut rank_sum = vec![0.0f64; n_groups + 1];
     let mut tie_correction = 0.0f64;
 
     neg.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
@@ -286,17 +285,25 @@ pub(crate) fn gene_stats_nnz(
         &mut tie_correction,
     );
 
-    // Zero cells (implicit + explicit) per group all carry the zero mid-rank.
+    // Zero cells (implicit + explicit) per bucket all carry the zero mid-rank.
+    // The unlabelled bucket is walked too — not because anything reads its rank
+    // sum, but because its own count has to be checked against the same
+    // canonicality rule as a group's.
     //
-    // Checked per group, not just pooled: the two subtractions have different
+    // Checked per bucket, not just pooled: the two subtractions have different
     // operands, so a duplicate concentrated in one small group can invert this
-    // one while the pooled count above still fits under `n_labelled`.
-    for g in 0..n_groups {
+    // one while the pooled count above still fits under `n_obs`.
+    for g in 0..=n_groups {
         let n_zero_cells_g = scx_sparse::implicit_zero_count(group_cell_counts[g], nonzero_in_g[g])
             .map_err(|_| {
+                let what = if g == n_groups {
+                    "the unlabelled cells hold".to_string()
+                } else {
+                    format!("group {g} holds")
+                };
                 AccelError::InvalidInput(format!(
-                    "non-canonical CSC sidecar: group {g} holds {} nonzero cells against \
-                     {} cells in the group, so at least one cell is stored twice; \
+                    "non-canonical CSC sidecar: {what} {} nonzero cells against \
+                     {} cells, so at least one cell is stored twice; \
                      run `scx validate --deep`",
                     nonzero_in_g[g], group_cell_counts[g]
                 ))
@@ -307,14 +314,14 @@ pub(crate) fn gene_stats_nnz(
     let mut out = Vec::with_capacity(n_groups);
     for g in 0..n_groups {
         let n1 = group_cell_counts[g];
-        if n1 == 0 || n1 == n_labelled {
+        if n1 == 0 || n1 == n_obs {
             out.push((f64::NAN, 1.0, f64::NAN));
             continue;
         }
         let tc = if tie_correct { tie_correction } else { 0.0 };
-        let (score, pval) = wilcoxon_stats_from_rank_sum(rank_sum[g], n1, n_labelled, tc);
+        let (score, pval) = wilcoxon_stats_from_rank_sum(rank_sum[g], n1, n_obs, tc);
         let mean_group = group_sum[g] / n1 as f64;
-        let mean_ref = (total_sum - group_sum[g]) / (n_labelled - n1) as f64;
+        let mean_ref = (total_sum - group_sum[g]) / (n_obs - n1) as f64;
         let logfc = compute_logfc(mean_group, mean_ref, log_transformed);
         out.push((score, pval, logfc));
     }
@@ -341,15 +348,16 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
     let n_vars = gene_names.len();
     let n_groups = group_names.len();
 
-    // Per-group cell counts and the labelled-pool size, from the one shared
-    // partition the dense and GPU kernels also use.
+    // Per-bucket cell counts, from the one shared partition the dense and GPU
+    // kernels also use. The trailing entry is the unlabelled count — those cells
+    // are in the pool (and so in every group's rest) but in no group.
     let partition = crate::diffexp::partition_by_group(groups, n_groups);
-    let n_labelled = partition.n_labelled();
-    let group_cell_counts: Vec<usize> = partition
+    let mut group_cell_counts: Vec<usize> = partition
         .group_indices
         .iter()
         .map(|cells| cells.len())
         .collect();
+    group_cell_counts.push(partition.n_unlabelled(n_obs));
 
     // per_gene[gene][group] = (score, pval, logfc).
     let mut per_gene: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); n_vars];
@@ -378,7 +386,6 @@ fn wilcoxon_rank_sum_nnz_csc<S: ColumnShardSource + ?Sized>(
                     groups,
                     &group_cell_counts,
                     n_obs,
-                    n_labelled,
                     n_groups,
                     tie_correct,
                     log_transformed,
@@ -447,24 +454,23 @@ mod tests {
     ///
     /// Two arms, because the two subtractions have different operands and the
     /// second can invert while the first still fits:
-    ///   * pooled  — `n_labelled - (n_neg + n_pos)`
-    ///   * per-group — `group_cell_counts[g] - nonzero_in_g[g]`
+    ///   * pooled  — `n_obs - (n_neg + n_pos)`
+    ///   * per-bucket — `group_cell_counts[g] - nonzero_in_g[g]`
     ///
     /// `gene_stats_nnz` is called directly: the corruption cannot be written to
     /// a file (writers canonicalize, and the encoder `debug_assert`s it), so a
     /// unit call on the kernel is the only way to exercise it at all.
     #[test]
     fn gene_stats_nnz_rejects_a_cell_stored_twice() {
-        // 2 labelled cells in one group. The column stores cell 0 twice, so
-        // both the pooled count (2 > ... ) and the group count invert.
+        // 2 cells in one group, none unlabelled. The column stores cell 0
+        // twice, so both the pooled count (2 > ... ) and the group count invert.
         let groups = vec![0usize, 0usize];
-        let group_cell_counts = vec![2usize];
+        let group_cell_counts = vec![2usize, 0usize];
         let err = gene_stats_nnz(
             &[0, 0, 1],
             &[1.0, 2.0, 3.0],
             &groups,
             &group_cell_counts,
-            2,
             2,
             1,
             true,
@@ -475,7 +481,7 @@ mod tests {
         // "non-canonical CSC sidecar" error, so matching only that prefix let
         // this arm pass with the pooled guard sabotaged — the per-group guard
         // was catching it downstream. Whenever the pooled count inverts some
-        // group's must too (the group counts sum to n_labelled), so only the
+        // bucket's must too (the bucket counts sum to n_obs), so only the
         // message distinguishes which guard fired, and the pooled one still has
         // to exist: its subtraction runs first and would wrap before the
         // per-group loop is ever reached.
@@ -484,17 +490,16 @@ mod tests {
             "expected the pooled guard to fire first, got: {err:?}"
         );
 
-        // Per-group arm: pooled count fits (2 <= 3 labelled) but group 0 holds
+        // Per-bucket arm: pooled count fits (2 <= 3 cells) but group 0 holds
         // 2 stored entries against its 1 cell. This is the case the pooled
         // check alone would wave through.
         let groups = vec![0usize, 1usize, 1usize];
-        let group_cell_counts = vec![1usize, 2usize];
+        let group_cell_counts = vec![1usize, 2usize, 0usize];
         let err = gene_stats_nnz(
             &[0, 0],
             &[1.0, 2.0],
             &groups,
             &group_cell_counts,
-            3,
             3,
             2,
             true,
@@ -508,19 +513,40 @@ mod tests {
 
         // Canonical input on the same shape still works.
         let groups = vec![0usize, 0usize];
-        let group_cell_counts = vec![2usize];
+        let group_cell_counts = vec![2usize, 0usize];
         assert!(gene_stats_nnz(
             &[0, 1],
             &[1.0, 2.0],
             &groups,
             &group_cell_counts,
             2,
-            2,
             1,
             true,
             false,
         )
         .is_ok());
+
+        // The unlabelled bucket is guarded on the same rule: one unlabelled
+        // cell whose column stores that row twice. The pooled count fits
+        // (2 <= 3), so only the per-bucket arm can catch it — and it must name
+        // the unlabelled cells rather than a group that is fine.
+        let groups = vec![0usize, 0usize, 2usize];
+        let group_cell_counts = vec![2usize, 0usize, 1usize];
+        let err = gene_stats_nnz(
+            &[2, 2],
+            &[1.0, 2.0],
+            &groups,
+            &group_cell_counts,
+            3,
+            2,
+            true,
+            false,
+        )
+        .expect_err("an overfull unlabelled bucket must be rejected too");
+        assert!(
+            matches!(err, AccelError::InvalidInput(ref m) if m.contains("the unlabelled cells hold")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -1213,11 +1239,16 @@ mod tests {
         /// cells, and both tie-correction settings — the §5.3 exactness contract.
         ///
         /// Both arms are also checked against a **third, independent** result:
-        /// the dense kernel run on the matrix with the unlabelled rows physically
-        /// removed. Agreement between two implementations only proves they agree
-        /// — and they did, on the wrong answer, for as long as both counted
-        /// unlabelled cells in the rest denominator. The physical subset is the
-        /// oracle; nnz-vs-dense is the parity check.
+        /// the dense kernel run with the unlabelled cells collected into one
+        /// *extra* group. Agreement between two implementations only proves they
+        /// agree — and they did, on the wrong answer, for as long as both left
+        /// unlabelled cells out of the pool. The extra-group run is the oracle;
+        /// nnz-vs-dense is the parity check.
+        ///
+        /// `pvals_adj` is deliberately **not** compared against the oracle: BH
+        /// runs over every (group, gene) pair, and the oracle has one group more,
+        /// so its denominator legitimately differs. The nnz-vs-dense arm still
+        /// pins it.
         #[test]
         fn nnz_matches_dense_wilcoxon(
             seed in any::<u64>(),
@@ -1230,8 +1261,8 @@ mod tests {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
             // Group per cell in 0..=n_groups; `n_groups` is the unlabelled
-            // sentinel — such a cell belongs to no group and is outside the
-            // comparison pool entirely.
+            // sentinel — such a cell belongs to no group but is in the pool, so
+            // it ranks and it counts in every group's "rest".
             let groups: Vec<usize> = (0..n_obs).map(|_| rng.gen_range(0..=n_groups)).collect();
 
             // Dense buffer + verbatim CSC columns. ~55% density; values are small
@@ -1262,46 +1293,33 @@ mod tests {
                 &src, &gene_names, &groups, &group_names, 3, log_transformed, tie_correct,
             ).unwrap();
 
-            // Oracle: the same matrix with the unlabelled rows physically gone.
-            let mut sub_dense = Vec::new();
-            let mut sub_groups = Vec::new();
-            for (row, &g) in groups.iter().enumerate() {
-                if g < n_groups {
-                    sub_dense.extend_from_slice(&dense[row * n_vars..(row + 1) * n_vars]);
-                    sub_groups.push(g);
-                }
-            }
-            let sub_n_obs = sub_groups.len();
-            // A group with no cells yields NaN scores in both arms; that is
-            // already covered by the parity assertions, and the oracle run needs
-            // at least one labelled cell to be meaningful.
-            let oracle_res = if sub_n_obs > 0 {
-                Some(wilcoxon_rank_sum(
-                    &sub_dense, sub_n_obs, n_vars, &gene_names, &sub_groups, &group_names,
-                    None, log_transformed, false, tie_correct, 0,
-                ).unwrap())
-            } else {
-                None
-            };
+            // Oracle: the same matrix, the unlabelled cells promoted to a group
+            // of their own. Same pool, same ranks, same rest for every real
+            // group — but arrived at without any sentinel handling.
+            let mut oracle_group_names = group_names.clone();
+            oracle_group_names.push("unlabelled".to_string());
+            let oracle_groups: Vec<usize> =
+                groups.iter().map(|&g| g.min(n_groups)).collect();
+            let oracle_res = wilcoxon_rank_sum(
+                &dense, n_obs, n_vars, &gene_names, &oracle_groups, &oracle_group_names,
+                None, log_transformed, false, tie_correct, 0,
+            ).unwrap();
 
             prop_assert_eq!(&dense_res.group_names, &nnz_res.group_names);
             for gi in 0..group_names.len() {
                 let dmap = group_map(&dense_res, gi);
                 let nmap = group_map(&nnz_res, gi);
-                let omap = oracle_res.as_ref().map(|r| group_map(r, gi));
+                let omap = group_map(&oracle_res, gi);
                 for (name, &(ds, dp, dpa, dl)) in &dmap {
                     let &(ns, np, npa, nl) = nmap.get(name).unwrap();
                     prop_assert!(close(ds, ns), "score g{} {}: {} vs {}", gi, name, ds, ns);
                     prop_assert!(close(dp, np), "pval g{} {}: {} vs {}", gi, name, dp, np);
                     prop_assert!(close(dpa, npa), "padj g{} {}: {} vs {}", gi, name, dpa, npa);
                     prop_assert!(close(dl, nl), "logfc g{} {}: {} vs {}", gi, name, dl, nl);
-                    if let Some(omap) = &omap {
-                        let &(os, op, opa, ol) = omap.get(name).unwrap();
-                        prop_assert!(close(ds, os), "score vs subset g{} {}: {} vs {}", gi, name, ds, os);
-                        prop_assert!(close(dp, op), "pval vs subset g{} {}: {} vs {}", gi, name, dp, op);
-                        prop_assert!(close(dpa, opa), "padj vs subset g{} {}: {} vs {}", gi, name, dpa, opa);
-                        prop_assert!(close(dl, ol), "logfc vs subset g{} {}: {} vs {}", gi, name, dl, ol);
-                    }
+                    let &(os, op, _opa, ol) = omap.get(name).unwrap();
+                    prop_assert!(close(ds, os), "score vs extra-group g{} {}: {} vs {}", gi, name, ds, os);
+                    prop_assert!(close(dp, op), "pval vs extra-group g{} {}: {} vs {}", gi, name, dp, op);
+                    prop_assert!(close(dl, ol), "logfc vs extra-group g{} {}: {} vs {}", gi, name, dl, ol);
                 }
             }
         }

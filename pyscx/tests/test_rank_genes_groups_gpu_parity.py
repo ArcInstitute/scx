@@ -74,6 +74,32 @@ def _compare_results(cpu, gpu) -> None:
                 )
 
 
+def _partially_labelled_adata():
+    """The shared fixture with a tenth of its cells carrying a NaN label.
+
+    Also plants a gene that is nonzero *only* in those cells: to any route that
+    leaves them out of the pool it is identical to an all-zero gene, so the
+    fixture separates the two pools rather than merely containing both.
+    """
+    import pandas as pd
+    import scipy.sparse as sp
+
+    adata = _make_adata()
+    cats = list(pd.unique(adata.obs["target"]))
+    labels = adata.obs["target"].astype(object).to_numpy()
+    unlabelled = list(range(0, adata.n_obs, 10))
+    for i in unlabelled:
+        labels[i] = None
+    adata.obs["target"] = pd.Categorical(labels, categories=cats)
+
+    X = (adata.X.tolil() if sp.issparse(adata.X) else sp.lil_matrix(adata.X))
+    X[:, 0] = 0
+    for i in unlabelled:
+        X[i, 0] = 5.0
+    adata.X = X.tocsr()
+    return adata
+
+
 @pytest.mark.parametrize("tie_correct", [True, False])
 def test_rank_genes_groups_gpu_parity_one_vs_rest(tie_correct: bool) -> None:
     adata_cpu = _make_adata()
@@ -108,4 +134,42 @@ def test_rank_genes_groups_gpu_rejects_csc() -> None:
     with pytest.raises(RuntimeError, match="csc"):
         pyscx.accel.rank_genes_groups(
             adata, "target", reference=REFERENCE, prefer_format="csc", device="gpu"
+        )
+
+
+@pytest.mark.parametrize("tie_correct", [True, False])
+def test_rank_genes_groups_gpu_parity_one_vs_rest_partially_labelled(
+    tie_correct: bool,
+) -> None:
+    """X9 on the GPU: unlabelled cells are in the pool and in every "rest".
+
+    The GPU reaches that differently from the CPU — slot 0 of the v3 main
+    table, empty in 1-vs-rest until X9, carries the unlabelled cells purely so
+    the per-slot pseudobulk sums cover every cell. Get that wrong and the ranks
+    are right while the logFC numerator is short, which the fully-labelled arms
+    above cannot see.
+    """
+    import warnings
+
+    adata_cpu = _partially_labelled_adata()
+    adata_gpu = adata_cpu.copy()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        pyscx.accel.rank_genes_groups(
+            adata_cpu, "target", reference="rest", tie_correct=tie_correct, device="cpu"
+        )
+        pyscx.accel.rank_genes_groups(
+            adata_gpu, "target", reference="rest", tie_correct=tie_correct, device="gpu"
+        )
+    cpu, gpu = _result_to_gene_dict(adata_cpu), _result_to_gene_dict(adata_gpu)
+    _compare_results(cpu, gpu)
+
+    # The fixture has to be able to tell the two pools apart, or the parity
+    # above would hold with both sides dropping the cells.
+    planted = str(adata_cpu.var_names[0])
+    for g, per_gene in cpu.items():
+        assert np.isfinite(per_gene[planted][0]) and per_gene[planted][0] != 0.0, (
+            f"group {g}: the gene nonzero only in unlabelled cells scored 0 — "
+            f"those cells never reached the pool"
         )
