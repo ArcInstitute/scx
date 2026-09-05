@@ -2606,6 +2606,59 @@ fn positional_live_attach_checks_keys_against_the_live_barcodes() {
     assert!(err.to_string().contains("different order"), "{err}");
 }
 
+/// A two-level obs index compares as the composite key the key join builds, on
+/// both sides — so a reordered MultiIndex frame is refused like a single-level one.
+#[test]
+fn positional_attach_checks_a_multi_level_index_as_a_composite_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(
+        "pandas".to_string(),
+        "{\"index_columns\":[\"lvl_a\",\"lvl_b\"]}".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("lvl_a", DataType::Utf8, false),
+        Field::new("lvl_b", DataType::Utf8, false),
+    ])
+    .with_metadata(meta);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(keys("a", 10))),
+            Arc::new(StringArray::from(keys("b", 10))),
+        ],
+    )
+    .unwrap();
+    let path = write_fixture_with_obs(dir.path(), "multi.scx", obs, 2, 2);
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    let composite = |i: usize| format!("a{i}{}b{i}", COMPOSITE_KEY_SEPARATOR);
+    let live: Vec<String> = (0..10)
+        .filter(|i| *i != 1 && *i != 3)
+        .map(composite)
+        .collect();
+
+    // Reversed live composite keys: refused, naming the levels.
+    let mut data = positional_data(8);
+    data.row_keys = live.iter().rev().cloned().collect();
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different order") && msg.contains("lvl_a+lvl_b"),
+        "{msg}"
+    );
+
+    // In order: lands.
+    let mut data = positional_data(8);
+    data.row_keys = live;
+    assert_eq!(
+        attach_external_obs(&path, &data, &positional_opts())
+            .unwrap()
+            .n_matched,
+        8
+    );
+}
+
 /// A file with no obs index column cannot be checked against, so keys are
 /// refused by name rather than compared against a guessed column.
 #[test]

@@ -210,6 +210,27 @@ def test_positional_refuses_a_reordered_read_obs_frame(tmp_path):
     assert pyscx.open(str(scx)).read_obs()["score"].tolist() == [1.0, 2.0, 3.0]
 
 
+def test_positional_refuses_a_reordered_multiindex_frame(tmp_path):
+    # A two-level obs index compares as a composite key on both sides, so a
+    # reordered MultiIndex `read_obs()` frame is refused like a flat one.
+    scx = _fixture(tmp_path)
+    obs = pyscx.open(str(scx)).read_obs(logical=False)
+    obs["sample"] = ["s0", "s0", "s1", "s1"]
+    obs["barcode"] = list(obs.index)
+    pyscx.modify_metadata(str(scx), obs=obs.set_index(["sample", "barcode"]))
+    pyscx.mark_deleted(str(scx), [1])
+    exp = pyscx.open(str(scx))
+    live = exp.read_obs()
+    assert isinstance(live.index, pd.MultiIndex) and len(live) == 3
+    live["score"] = [1.0, 2.0, 3.0]
+
+    with pytest.raises(ValueError, match=r"different order.*sample\+barcode"):
+        pyscx.attach_obs_columns(str(scx), live.iloc[[2, 0, 1]][["score"]], positional=True)
+    r = pyscx.attach_obs_columns(str(scx), live[["score"]], positional=True)
+    assert r["n_matched"] == 3
+    assert pyscx.open(str(scx)).read_obs()["score"].tolist() == [1.0, 2.0, 3.0]
+
+
 def test_positional_accepts_the_empty_live_frame_when_every_row_is_deleted(tmp_path):
     scx = _fixture(tmp_path)
     pyscx.mark_deleted(str(scx), [0, 1, 2, 3])

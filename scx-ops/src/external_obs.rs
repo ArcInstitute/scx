@@ -185,8 +185,7 @@ pub enum ObsJoinKey {
     /// unique column, where an in-process caller still needs to land columns it
     /// just computed.
     ///
-    /// Requires [`ExternalObsData::row_keys`] to be empty and
-    /// `row_annotations.num_rows()` to equal **either** the file's physical
+    /// Requires `row_annotations.num_rows()` to equal **either** the file's physical
     /// `n_obs` (`header.n_obs`; row `i` annotates physical row `i`, deleted rows
     /// included — `read_obs(logical=False)`) **or** its live row count (`n_obs`
     /// minus the deletion-vector popcount; row `i` annotates the `i`-th live
@@ -1368,13 +1367,13 @@ fn build_obsm(data: &ExternalObsData, join: &ObsRowJoin) -> Result<Vec<(String, 
 /// when the file has deletions — with none the two coincide and the frame is
 /// `Physical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ObsFrameRowSpace {
+pub enum ObsFrameRowSpace {
     Physical,
     Live,
 }
 
 impl ObsFrameRowSpace {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ObsFrameRowSpace::Physical => "physical",
             ObsFrameRowSpace::Live => "logical",
@@ -1387,7 +1386,7 @@ impl ObsFrameRowSpace {
 /// Any other length is a [`OpsError::ShapeMismatch`] naming both counts and
 /// the read that yields each. `what` names the frame in the message
 /// (`"positional attach: row_annotations"`, `"modify_metadata: obs"`).
-pub(crate) fn classify_obs_frame_length(
+pub fn classify_obs_frame_length(
     what: &str,
     n_rows: u64,
     n_physical: u64,
@@ -1401,7 +1400,7 @@ pub(crate) fn classify_obs_frame_length(
         return Ok(ObsFrameRowSpace::Live);
     }
     let file = if n_live == n_physical {
-        format!("n_obs = {n_physical} (no logical deletions)")
+        format!("n_obs = {n_physical} = n_obs_physical (no logical deletions)")
     } else {
         format!(
             "n_obs = {n_live} live rows and n_obs_physical = {n_physical} ({} logically \
@@ -1851,14 +1850,15 @@ fn attach_external_obs_inner(
         // **order check**: positional dispatch is by length alone, so a frame
         // that was sorted or reindexed after `read_obs()` has the right length
         // and every value on the wrong cell. Keys are never joined on.
-        let index_col = if data.row_keys.is_empty() {
-            None
+        let index_cols: Vec<String> = if data.row_keys.is_empty() {
+            Vec::new()
         } else {
             scx_format_io::resolve_index_columns(&obs_schema)
                 .into_iter()
-                .find(|c| obs_schema.index_of(c).is_ok())
+                .filter(|c| obs_schema.index_of(c).is_ok())
+                .collect()
         };
-        if !data.row_keys.is_empty() && index_col.is_none() {
+        if !data.row_keys.is_empty() && index_cols.is_empty() {
             return Err(OpsError::InvalidInput(
                 "positional attach: the frame carries an index to check the row order against, \
                  but the file's obs has no index column (pandas envelope or `__index_level_0__`); \
@@ -1866,9 +1866,11 @@ fn attach_external_obs_inner(
                     .into(),
             ));
         }
-        let probe_columns = vec![index_col
-            .clone()
-            .unwrap_or_else(|| obs_schema.field(0).name().clone())];
+        let probe_columns = if index_cols.is_empty() {
+            vec![obs_schema.field(0).name().clone()]
+        } else {
+            index_cols.clone()
+        };
         let probe = read_obs_keys_validated(reader, &obs_schema, &probe_columns, n_obs)?;
         if probe.num_rows() as u64 != n_obs {
             return Err(OpsError::ShapeMismatch {
@@ -1878,14 +1880,17 @@ fn attach_external_obs_inner(
                 ),
             });
         }
-        if let Some(index_col) = index_col {
+        if !index_cols.is_empty() {
             // The check fires only when the frame's labels ARE the file's
             // barcodes (of the rows it lands on) in a different order — a
             // `sort_values` / `reindex` after `read_obs()`. Labels that are
             // not the file's barcodes at all are ignored, as positional has
             // always ignored the index: a frame built from another source
-            // with its own row labels is still "row i annotates row i".
-            let target = crate::external_layer::string_column(&probe, &index_col)?;
+            // with its own row labels is still "row i annotates row i". A
+            // multi-level index compares as the same composite string the
+            // key join builds, on both sides.
+            let target = materialize_target_keys(&probe, &index_cols)?;
+            let index_name = index_cols.join("+");
             let landed: Vec<(usize, u32)> = join
                 .source_of_target
                 .iter()
@@ -1907,10 +1912,11 @@ fn attach_external_obs_inner(
                         .expect("not in order ⇒ a mismatch exists");
                     return Err(OpsError::InvalidInput(format!(
                         "positional attach: the frame holds the file's own barcodes in a different \
-                         order — frame row {src} is '{}' but obs row {phys} ('{index_col}') is \
+                         order — frame row {src} is '{}' but obs row {phys} ('{index_name}') is \
                          '{}'. A frame sorted or reindexed after read_obs() cannot be landed \
                          positionally; restore the original order (or join by key instead)",
-                        data.row_keys[*src as usize], target[*phys]
+                        data.row_keys[*src as usize].replace(COMPOSITE_KEY_SEPARATOR, " / "),
+                        target[*phys].replace(COMPOSITE_KEY_SEPARATOR, " / ")
                     )));
                 }
             }

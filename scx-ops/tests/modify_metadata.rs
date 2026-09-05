@@ -1540,3 +1540,73 @@ fn obs_replace_refuses_a_reordered_live_frame() {
         "renamed_0"
     );
 }
+
+/// A live-length frame cannot change the number of index levels: levels are
+/// paired by position, so a mismatch would pair the wrong columns or leave a
+/// new level null on the deleted rows. Restructuring the index is a
+/// physical-length replace.
+#[test]
+fn obs_replace_live_frame_refuses_an_index_arity_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("arity.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["lvl_a", "lvl_b"],
+            vec![
+                (0..n).map(|i| format!("a_{i}")).collect(),
+                (0..n).map(|i| format!("b_{i}")).collect(),
+            ],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["barcode"],
+                vec![(0..17).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("index level count") && msg.contains("2 level(s)") && msg.contains("has 1"),
+        "{msg}"
+    );
+    assert_eq!(
+        ScxReader::open(&path).unwrap().header().manifest_sequence,
+        seq0
+    );
+
+    // The physical-length frame restructures freely.
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["barcode"],
+                vec![(0..n).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ScxReader::open(&path)
+            .unwrap()
+            .read_obs_filtered()
+            .unwrap()
+            .num_rows(),
+        17
+    );
+}

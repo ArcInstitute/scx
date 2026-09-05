@@ -1068,13 +1068,14 @@ class Experiment:
         dtype/container narrowing kwargs at runtime."""
         ...
 
-    def mark_deleted(self, mask: np.ndarray) -> int:
-        """Mark cells for deletion via a boolean mask in either row space:
-        ``n_obs`` entries (the live rows ``read_obs()`` describes) or
-        ``n_obs_physical`` entries (every physical row, as
-        ``read_obs(logical=False)`` describes); any other length raises naming
-        both counts. Returns the total number of deleted rows. Writes a
-        deletion vector."""
+    def mark_deleted(self, mask: Any) -> int:
+        """Mark cells for deletion via a boolean mask (numpy array or pandas
+        Series) in either row space: ``n_obs`` entries (the live rows
+        ``read_obs()`` describes) or ``n_obs_physical`` entries (every physical
+        row, as ``read_obs(logical=False)`` describes); any other length raises
+        naming both counts. A Series with a labelled index is checked for order
+        (the file's barcodes in a different order raise). Returns the total
+        number of deleted rows. Writes a deletion vector."""
         ...
 
     def validate(self, deep: bool = ...) -> list[tuple[str, bool]]:

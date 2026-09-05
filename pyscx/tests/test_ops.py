@@ -220,6 +220,27 @@ def test_mark_deleted_accepts_a_live_length_mask(query_adata, scx_from_adata):
     assert f"n_obs = {n - 6}" in str(e.value) and f"n_obs_physical = {n}" in str(e.value)
 
 
+def test_mark_deleted_refuses_a_reordered_series_mask(query_adata, scx_from_adata):
+    """A Series from a sorted `read_obs()` frame has the right length and every
+    entry on the wrong cell; its index says so. A Series in the file's order
+    (and a plain array) is accepted; a non-bool Series is refused."""
+    import pandas as pd
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_series.scx")
+    exp = pyscx.open(path)
+    exp.mark_deleted(np.arange(exp.n_obs_physical) < 2)
+    obs = exp.read_obs()
+    flag = pd.Series(np.arange(len(obs)) == 0, index=obs.index)
+
+    with pytest.raises(ValueError, match="different order"):
+        exp.mark_deleted(flag.iloc[::-1])
+    with pytest.raises(TypeError, match="boolean"):
+        exp.mark_deleted(pd.Series(np.arange(len(obs)), index=obs.index))
+    assert exp.mark_deleted(flag) == 3
+    assert list(exp.read_obs().index) == list(obs.index[1:])
+
+
 def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
     """mark_deleted() rejects masks longer than n_obs."""
     import pyscx

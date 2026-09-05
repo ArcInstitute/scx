@@ -699,13 +699,19 @@ def to_h5ad(path, out, **kwargs):
         obs_mask: Boolean array selecting the observations to keep, in
             either obs row space, told apart by length: `n_obs` entries (the
             live rows — what `read_obs()` describes, so
-            `obs_mask=exp.read_obs()["keep"].to_numpy()` works) or
-            `n_obs_physical` entries (every physical row, as
-            `read_obs(logical=False)` describes). The two coincide on a file
-            with no deletions; any other length raises naming both counts.
-            Rows already logically deleted stay dropped regardless of their
-            entry here: the mask is ANDed with the deletion-vector mask,
-            never substituted for it.
+            `obs_mask=exp.read_obs()["keep"]` works) or `n_obs_physical`
+            entries (every physical row, as `read_obs(logical=False)`
+            describes). The two coincide on a file with no deletions; any
+            other length raises naming both counts. A pandas Series with a
+            labelled index is also checked for order: the file's own barcodes
+            in a different order (a `sort_values` after `read_obs()`) raise
+            rather than export the wrong cells; a RangeIndex Series or a bare
+            array is not checked. Rows already logically deleted stay dropped
+            regardless of their entry here: the mask is ANDed with the
+            deletion-vector mask, never substituted for it.
+        obs_mask_index: The row labels behind `obs_mask`, one per entry, for
+            that order check. Filled in automatically from a pandas Series'
+            index; pass it yourself only to supply labels for a bare array.
             Accepts a numpy bool array, a pandas boolean Series, or a list of
             bool; a non-bool dtype raises rather than being coerced. Requires
             stream=True.
@@ -724,7 +730,20 @@ def to_h5ad(path, out, **kwargs):
     """
     _require_hdf5("to_h5ad")
     if kwargs.get("obs_mask") is not None:
-        kwargs["obs_mask"] = _coerce_obs_mask(kwargs["obs_mask"])
+        mask = kwargs["obs_mask"]
+        # A pandas Series with a labelled index hands its labels along: the
+        # file's own barcodes in a different order (a `sort_values` after
+        # `read_obs()`) are refused, since a length check cannot see that. A
+        # RangeIndex Series or a bare array carries no labels.
+        import pandas as _pd
+
+        if (
+            isinstance(mask, _pd.Series)
+            and type(mask.index).__name__ != "RangeIndex"
+            and "obs_mask_index" not in kwargs
+        ):
+            kwargs["obs_mask_index"] = [str(x) for x in mask.index]
+        kwargs["obs_mask"] = _coerce_obs_mask(mask)
     src = _coerce_path(path)
     _warn_if_deletions(src, "h5ad")
     return _to_h5ad_native(src, _coerce_path(out), **kwargs)
@@ -878,9 +897,9 @@ def export_batches(path, out_dir, *, batch_key, key=None, batches=None,
             no_unique_candidate = " " + diag["summary"]
 
     exp = _open_native(src)
-    # PHYSICAL rows, deliberately: `to_h5ad(obs_mask=)` takes a mask in the
-    # physical row space (`n_obs_physical` long), and this frame is where each
-    # batch's mask comes from. `read_obs()` itself returns live rows since 0.17.
+    # PHYSICAL rows, deliberately: this keeps the per-batch masks, counts and
+    # exports byte-identical to what 0.16 produced (`read_obs()` itself returns
+    # live rows since 0.17, and `to_h5ad(obs_mask=)` accepts either length).
     # The physical frame *includes* logically deleted rows, so the per-batch
     # counts below can overcount; `to_h5ad` ANDs with the deletion keep mask,
     # so the exports themselves stay right.

@@ -184,7 +184,7 @@ fn resolve_codec_selection(
 /// User-input validation errors → ValueError; missing files → FileNotFoundError;
 /// permission errors → PermissionError; wrapped ScxError → delegates to
 /// `crate::to_pyerr`; everything else → RuntimeError.
-fn ops_to_pyerr(e: OpsError) -> PyErr {
+pub(crate) fn ops_to_pyerr(e: OpsError) -> PyErr {
     use pyo3::exceptions::{PyFileNotFoundError, PyPermissionError};
     let msg = e.to_string();
     match e {

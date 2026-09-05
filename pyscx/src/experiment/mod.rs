@@ -174,11 +174,13 @@ impl PyExperiment {
         if let Some(deleted) = self.n_deleted.get() {
             return Ok(physical.saturating_sub(*deleted));
         }
+        // Counted from the same keep mask every logical read applies — not from
+        // the bitmap's cardinality, which also counts ids beyond the physical
+        // axis that the mask (and so `read_obs()`) ignores.
         let deleted = reader
-            .read_deletion_vectors()
+            .deletion_keep_mask()
             .map_err(to_pyerr)?
-            .map(|dv| dv.total_deleted())
-            .unwrap_or(0);
+            .map_or(0, |k| k.iter().filter(|b| !**b).count() as u64);
         let _ = self.n_deleted.set(deleted);
         Ok(physical.saturating_sub(deleted))
     }
@@ -823,24 +825,63 @@ impl PyExperiment {
 
     /// Mark cells as logically deleted using a boolean mask.
     ///
-    /// `mask` is a boolean numpy array in **either row space**, told apart by
-    /// length: `n_obs` entries (the live rows — what `read_obs()` and
-    /// `to_anndata(backed=True).obs` describe; a `True` marks that live cell)
-    /// or `n_obs_physical` entries (every physical row, already-deleted rows in
-    /// place — what `read_obs(logical=False)` describes). The two coincide on a
-    /// file with no deletions. Any other length raises naming both counts.
-    /// Returns the total number of deleted cells (including previously deleted).
+    /// `mask` is a boolean array (numpy, or a pandas Series) in **either row
+    /// space**, told apart by length: `n_obs` entries (the live rows — what
+    /// `read_obs()` and `to_anndata(backed=True).obs` describe; a `True` marks
+    /// that live cell) or `n_obs_physical` entries (every physical row,
+    /// already-deleted rows in place — what `read_obs(logical=False)`
+    /// describes). The two coincide on a file with no deletions. Any other
+    /// length raises naming both counts. A pandas Series with a labelled index
+    /// is also checked for order: the file's own barcodes in a different order
+    /// (a `sort_values` after `read_obs()`) raise instead of deleting the wrong
+    /// cells; a RangeIndex Series or a bare array is not checked. Non-bool
+    /// dtypes are rejected rather than coerced. Returns the total number of
+    /// deleted cells (including previously deleted).
     ///
     /// Example:
     ///     exp = pyscx.open("experiment.scx")
     ///     obs = exp.read_obs()
-    ///     total = exp.mark_deleted((obs["doublet_score"] > 0.5).to_numpy())
-    fn mark_deleted(&mut self, mask: PyReadonlyArray1<'_, bool>) -> PyResult<u64> {
-        let mask_slice = mask
+    ///     total = exp.mark_deleted(obs["doublet_score"] > 0.5)
+    fn mark_deleted(&mut self, py: Python<'_>, mask: &Bound<'_, PyAny>) -> PyResult<u64> {
+        // A pandas Series carries its index; a RangeIndex names no rows. Only a
+        // Series is inspected — a list has an `index` *method*.
+        let series_type = crate::pyimport::import_module(py, "pandas")?.getattr("Series")?;
+        let labels: Option<Vec<String>> = if mask.is_instance(&series_type)? {
+            let index = mask.getattr("index")?;
+            if index.get_type().name()? != "RangeIndex" {
+                Some(
+                    index
+                        .call_method1("astype", ("str",))?
+                        .call_method0("tolist")?
+                        .extract()?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let np = crate::pyimport::import_module(py, "numpy")?;
+        let arr = np.call_method1("ascontiguousarray", (mask,))?;
+        let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
+        if kind != "b" {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "mask must be a boolean array; got dtype {}. Pass a predicate result, not a \
+                 score",
+                arr.getattr("dtype")?.str()?
+            )));
+        }
+        let arr: PyReadonlyArray1<'_, bool> = arr.extract()?;
+        let mask_slice = arr
             .as_slice()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let reader = self.reader()?;
+        if let Some(labels) = &labels {
+            if labels.len() == mask_slice.len() {
+                crate::convert::check_row_mask_order(reader, labels, "mark_deleted: mask")?;
+            }
+        }
         let physical = crate::convert::physical_row_mask(reader, mask_slice, "mark_deleted: mask")?;
 
         // Collect indices where mask is True

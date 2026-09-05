@@ -138,10 +138,10 @@ def test_round_trips_through_doublet_import(tmp_path):
 def test_exports_only_the_live_cells_of_a_deleted_file(tmp_path):
     """Pinned before `read_obs()` flipped to logical rows (pyscx 0.17).
 
-    `export_batches` builds each batch's mask in the physical row space that
-    `to_h5ad(obs_mask=)` requires, so it reads obs with `logical=False`. What a
-    tool receives must not change across that flip: exactly the batch's live
-    cells, never a deleted one. (The per-batch `n_cells` counts physical rows
+    `export_batches` reads obs with `logical=False` so its per-batch masks,
+    counts and exports stay byte-identical to 0.16 (`to_h5ad(obs_mask=)` itself
+    accepts either row space). What a tool receives must not change across that
+    flip: exactly the batch's live cells, never a deleted one. (The per-batch `n_cells` counts physical rows
     and is documented as an overcount on a file with deletions; it is not
     pinned here.)
     """

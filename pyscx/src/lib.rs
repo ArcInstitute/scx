@@ -771,7 +771,7 @@ fn from_h5mu(
 /// wrapper, which is what `help()` shows.
 #[cfg(feature = "hdf5")]
 #[pyfunction]
-#[pyo3(signature = (path, out, stream=true, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None, obs_mask=None, min_counts=None))]
+#[pyo3(signature = (path, out, stream=true, modality=None, reader_threads=None, writer_queue_depth=4, memory_budget=None, obs_mask=None, min_counts=None, obs_mask_index=None))]
 #[allow(clippy::too_many_arguments)]
 fn to_h5ad(
     py: Python<'_>,
@@ -784,6 +784,7 @@ fn to_h5ad(
     memory_budget: Option<Bound<'_, PyAny>>,
     obs_mask: Option<numpy::PyReadonlyArray1<'_, bool>>,
     min_counts: Option<f64>,
+    obs_mask_index: Option<Vec<String>>,
 ) -> PyResult<()> {
     use std::path::Path;
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
@@ -828,9 +829,18 @@ fn to_h5ad(
     // since 0.17 — is expanded through the deletion keep mask here, and any
     // other length is a ValueError naming both counts rather than the
     // RuntimeError a ConvertError maps to.
+    // A mask handed as a pandas Series with a labelled index also carries the
+    // labels (the wrapper passes them as `obs_mask_index`): the file's own
+    // barcodes in a different order are refused, since a length check cannot
+    // see a `sort_values` after `read_obs()`.
     let obs_mask_owned: Option<std::sync::Arc<[bool]>> = match obs_mask_owned {
         Some(mask) => {
             let reader = scx_format_io::ScxReader::open(Path::new(path)).map_err(to_pyerr)?;
+            if let Some(labels) = &obs_mask_index {
+                if labels.len() == mask.len() {
+                    convert::check_row_mask_order(&reader, labels, "obs_mask")?;
+                }
+            }
             Some(convert::physical_row_mask(&reader, &mask, "obs_mask")?.into())
         }
         None => None,

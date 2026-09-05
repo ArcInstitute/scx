@@ -14,6 +14,7 @@ subtly wrong, and both are pinned here:
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pyscx
@@ -161,6 +162,27 @@ def test_obs_mask_in_live_coordinates_is_expanded_through_the_keep_mask(
         pyscx.to_h5ad(path, tmp_dir / "out2.h5ad", obs_mask=np.ones(n_obs - 5, dtype=bool))
     msg = str(e.value)
     assert f"n_obs = {n_obs - 3}" in msg and f"n_obs_physical = {n_obs}" in msg
+
+
+def test_obs_mask_series_in_a_different_order_is_refused(
+    synthetic_adata, scx_from_adata, tmp_dir
+):
+    """A Series built from a sorted `read_obs()` frame has the right length and
+    every entry on the wrong cell; its index says so, and the export refuses
+    rather than writing the wrong cells. A plain array carries no labels."""
+    path = scx_from_adata(synthetic_adata, "deleted3.scx")
+    n_obs = synthetic_adata.n_obs
+    pyscx.open(path).mark_deleted(np.arange(n_obs) < 3)
+    obs = pyscx.open(path).read_obs()
+    keep = pd.Series(np.arange(len(obs)) % 2 == 0, index=obs.index)
+
+    shuffled = keep.iloc[::-1]
+    with pytest.raises(ValueError, match="different order"):
+        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=shuffled)
+
+    pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=keep)
+    got = anndata.read_h5ad(tmp_dir / "out.h5ad")
+    np.testing.assert_array_equal(got.obs_names.to_numpy(), obs.index.to_numpy()[::2])
 
 
 # ---------------------------------------------------------------------------

@@ -30,9 +30,8 @@
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Schema};
 use serde_json::Value;
 
@@ -1050,6 +1049,22 @@ fn resolve_obs_row_space(
     if old_levels.is_empty() || new_levels.is_empty() {
         return Ok((scattered, ObsFrameRowSpace::Live));
     }
+    // Levels are paired by position, so a different level count would pair
+    // the wrong columns (an old `donor` level onto a new `barcode` level) or
+    // leave a new level null on the deleted rows. Restructuring the index is a
+    // physical-length replace.
+    if old_levels.len() != new_levels.len() {
+        return Err(OpsError::InvalidInput(format!(
+            "modify_metadata: a live-length obs cannot change the index level count — the file's \
+             obs index has {} level(s) ({:?}) and the frame's has {} ({:?}). Deleted rows keep \
+             their index from the file, level by level, so the two must agree; to restructure \
+             the index pass the physical-length frame (read_obs(logical=False))",
+            old_levels.len(),
+            old_levels,
+            new_levels.len(),
+            new_levels
+        )));
+    }
     let old_index = reader.read_obs_keys(&old_levels)?;
     if old_index.num_rows() as u64 != n_obs_physical {
         return Err(OpsError::ShapeMismatch {
@@ -1074,29 +1089,19 @@ fn resolve_obs_row_space(
 
         // Reorder guard on this level: the caller's live values against the
         // file's live values. Same multiset, different order → refuse by row.
-        let old_live = scx_format_io::filter_batch_by_keep_mask(
-            &RecordBatch::try_new(
-                Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-                    "k",
-                    DataType::Utf8,
-                    true,
-                )])),
-                vec![arrow::compute::cast(&old, &DataType::Utf8)?],
-            )?,
-            &keep,
-        )?;
-        let old_live = crate::external_layer::string_column(&old_live, "k")?;
-        let new_live = crate::external_layer::string_column(
-            &RecordBatch::try_new(
-                Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-                    "k",
-                    DataType::Utf8,
-                    true,
-                )])),
-                vec![arrow::compute::cast(obs.column(pos), &DataType::Utf8)?],
-            )?,
-            "k",
-        )?;
+        // Compared as strings (the barcode is one); a null on either side
+        // compares as absent.
+        let old_utf8 = arrow::compute::cast(&old, &DataType::Utf8)?;
+        let new_utf8 = arrow::compute::cast(obs.column(pos), &DataType::Utf8)?;
+        let old_arr = old_utf8.as_string::<i32>();
+        let new_arr = new_utf8.as_string::<i32>();
+        let old_live: Vec<Option<&str>> = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k)
+            .map(|(i, _)| old_arr.is_valid(i).then(|| old_arr.value(i)))
+            .collect();
+        let new_live: Vec<Option<&str>> = new_arr.iter().collect();
         if old_live != new_live {
             let mut a = old_live.clone();
             let mut b = new_live.clone();
@@ -1114,7 +1119,8 @@ fn resolve_obs_row_space(
                      '{}'. A frame sorted or reindexed after read_obs() would land every value \
                      on the wrong cell; restore the original order (or pass the physical-length \
                      frame, read_obs(logical=False), in its own order)",
-                    new_live[row], old_live[row]
+                    new_live[row].unwrap_or("<null>"),
+                    old_live[row].unwrap_or("<null>")
                 )));
             }
         }

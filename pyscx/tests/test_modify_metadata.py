@@ -444,6 +444,21 @@ def test_modify_metadata_live_frame_with_a_renamed_index_keeps_deleted_barcodes(
     assert physical["score"].isna().sum() == 3
 
 
+def test_modify_metadata_live_frame_refuses_an_index_arity_change(
+    synthetic_adata, scx_from_adata
+):
+    # Index levels are paired by position, so a live frame cannot change how
+    # many there are; the physical-length frame can.
+    path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_arity.scx")
+    obs = exp.read_obs()
+    two = obs.set_index([obs["batch"].astype(str), obs.index])
+    with pytest.raises(ValueError, match="index level count"):
+        pyscx.modify_metadata(path, obs=two)
+    physical = exp.read_obs(logical=False)
+    pyscx.modify_metadata(path, obs=physical.set_index([physical["batch"].astype(str), physical.index]))
+    assert isinstance(pyscx.open(path).read_obs().index, pd.MultiIndex)
+
+
 def test_modify_metadata_obs_still_accepts_the_physical_frame(synthetic_adata, scx_from_adata):
     path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_phys.scx")
     obs = exp.read_obs(logical=False)

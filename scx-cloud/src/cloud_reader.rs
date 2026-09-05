@@ -801,7 +801,11 @@ impl CloudReader {
         }
     }
 
-    /// Deletion vectors, if present in the file.
+    /// Deletion vectors, if present in the file. `Ok(None)` when the header
+    /// flags none; a header that flags them while the catalog has no
+    /// `DeletionVectors` section is a corrupt or incompatible file and is an
+    /// error, exactly as on `ScxReader` — answering "no deletions" there would
+    /// resurrect every deleted cell with no warning.
     pub async fn read_deletion_vectors(&self) -> Result<Option<scx_format_io::DeletionVectors>> {
         if !self.header.has_deletion_vectors() {
             return Ok(None);
@@ -811,11 +815,12 @@ impl CloudReader {
             .entries
             .iter()
             .find(|e| e.section_type == SectionType::DeletionVectors)
-            .cloned();
-        let entry = match entry {
-            Some(e) => e,
-            None => return Ok(None),
-        };
+            .cloned()
+            .ok_or_else(|| {
+                CloudError::Format(scx_format_io::ScxError::SectionNotFound(
+                    "deletion_vectors".to_string(),
+                ))
+            })?;
         let bytes = self.read_section_for_entry(&entry).await?;
         let mut dv =
             scx_format_io::DeletionVectors::read_from(&mut Cursor::new(&bytes), bytes.len())
@@ -1558,6 +1563,33 @@ mod tests {
         let reader = open_cloud(&plain.to_string_lossy()).await.unwrap();
         assert!(reader.deletion_keep_mask().await.unwrap().is_none());
         assert_eq!(reader.read_obs_filtered().await.unwrap().num_rows(), 30);
+    }
+
+    /// A header that flags deletion vectors while the catalog carries no
+    /// section is corrupt or incompatible: an error, as on `ScxReader` — never
+    /// "no deletions", which would resurrect every deleted cell.
+    #[tokio::test]
+    async fn flagged_file_without_a_deletion_section_is_an_error_not_no_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 30, 10);
+        // Patch the header flag in place; the header carries no checksum.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut header = FileHeader::read_from(&mut Cursor::new(&bytes[..HEADER_SIZE])).unwrap();
+        assert!(!header.has_deletion_vectors());
+        header.set_deletion_vectors();
+        let mut patched = Vec::new();
+        header.write_to(&mut patched).unwrap();
+        bytes[..patched.len()].copy_from_slice(&patched);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let reader = open_cloud(&path.to_string_lossy()).await.unwrap();
+        assert!(reader.header().has_deletion_vectors());
+        let err = reader.deletion_keep_mask().await.unwrap_err();
+        assert!(err.to_string().contains("deletion_vectors"), "{err}");
+        assert!(reader.read_obs_filtered().await.is_err());
+        assert!(reader.read_deletion_vectors().await.is_err());
+        // The physical read is unaffected.
+        assert_eq!(reader.read_obs().await.unwrap().num_rows(), 30);
     }
 
     #[tokio::test]

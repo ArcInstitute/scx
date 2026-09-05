@@ -348,8 +348,13 @@ pub fn attach_obs_columns(
                 Some(col) if index_cols.len() <= 1 => {
                     scx_ops::obs_key_values(&batch, &col).map_err(ops_to_pyerr)?
                 }
-                // A MultiIndex frame: no single label per row to check with.
-                _ => Vec::new(),
+                // A MultiIndex frame compares as the composite key the key
+                // join builds — the ops layer builds the same from the file's
+                // index levels.
+                Some(_) => {
+                    scx_ops::build_composite_key(&batch, &index_cols).map_err(ops_to_pyerr)?
+                }
+                None => Vec::new(),
             };
             (keys, scx_ops::ObsJoinKey::Positional, Vec::new())
         } else {

@@ -823,7 +823,12 @@ pandas index, that refuses a `sort_values` / `reindex` while leaving a frame
 with unrelated labels positional as ever (a `RangeIndex` frame is not checked;
 provenance records `positional_index_checked`). For a live-length
 `modify_metadata(obs=)`, different barcodes are a rename, which a replace is
-for, and pass.
+for, and pass. The same check guards the two mask sinks that accept either
+length — `to_h5ad(obs_mask=)` and `Experiment.mark_deleted(mask)` — when the
+mask is a pandas Series with a labelled index; a bare array carries no labels
+and is dispatched by length alone. A live-length `modify_metadata(obs=)` also
+cannot change the number of index levels (they are paired by position); use the
+physical-length frame to restructure the index.
 
 ### Uncovered rows get `null`, never `0.0`
 
