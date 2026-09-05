@@ -501,27 +501,122 @@ def test_default_path_refuses_an_unused_category_and_names_the_remedy(synthetic_
     assert "remove_unused_categories()" in str(excinfo.value)
 
 
-def test_a_plain_string_column_with_nan_is_not_a_singleton_group(synthetic_adata):
-    """The guard must not fire on a non-categorical column carrying NaN.
+@pytest.mark.parametrize(
+    "na", [np.nan, None, pd.NA], ids=["np.nan", "None", "pd.NA"]
+)
+def test_a_plain_string_column_with_a_missing_value_is_not_a_singleton_group(
+    synthetic_adata, na
+):
+    """The guard must not fire on a non-categorical column carrying a missing value.
 
-    pyscx derives the level universe from `astype(str)` when the column is not
-    categorical, so `"nan"` used to become a level of its own — one with zero
-    cells, since the encoder maps that spelling to the unlabelled sentinel.
-    Universalising the guard would then reject any object column with a missing
-    value. scanpy never sees such a level: it runs `sanitize_anndata`, and
-    `astype("category")` does not make NaN a category.
+    Whether a cell is missing is asked of `pandas.isna`, never inferred from how
+    the value prints — `astype("str")` renders `np.nan` as `"nan"`, `None` as
+    `"None"` and `pd.NA` as `"<NA>"`. A spelling test caught only the first, so
+    a single `None` failed the *whole* default call with "…groups None since
+    they only contain one sample", and two of them minted a result row and a
+    `pts` column scanpy never emits. scanpy never sees such a level: it runs
+    `sanitize_anndata`, and `astype("category")` makes no missing value a
+    category.
+
+    Parametrised over all three spellings because one of them passing is
+    exactly what hid this: the original test planted `np.nan` only.
     """
     adata = synthetic_adata.copy()
     labels = adata.obs["batch"].astype(object).to_numpy()
-    labels[0] = np.nan
+    labels[0] = na
+    labels[1] = na  # two, so a phantom level would be a group rather than an error
     adata.obs["batch"] = labels  # plain object column, not a Categorical
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         rgg = _rgg(adata, pts=True)
     assert set(rgg["names"].dtype.names) == {"A", "B", "C"}
     assert list(rgg["pts"].columns) == ["A", "B", "C"], (
-        "a phantom 'nan' level reached the pts frame"
+        "a phantom missing-value level reached the pts frame"
     )
+
+
+@pytest.mark.parametrize("na", [np.nan, None, pd.NA], ids=["np.nan", "None", "pd.NA"])
+def test_a_single_missing_value_does_not_trip_the_singlet_guard(synthetic_adata, na):
+    """One missing cell must not fail the run — the sharpest form of the above.
+
+    With missingness read off the printed form, exactly one `None` produced
+    `Could not calculate statistics for groups None since they only contain one
+    sample.` while scanpy 1.12 succeeded on the same input. Asserted on the
+    default path, under `groups=`, and with a named reference, because the
+    guard's participating set differs in each.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[0] = na
+    adata.obs["batch"] = labels
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        assert set(_rgg(adata.copy())["names"].dtype.names) == {"A", "B", "C"}
+        assert _rgg(adata.copy(), groups=["B"])["names"].dtype.names == ("B",)
+        assert set(_rgg(adata.copy(), reference="A")["names"].dtype.names) == {"B", "C"}
+
+
+@pytest.mark.parametrize("name", ["nan", "None", "<NA>", ""], ids=lambda s: repr(s))
+def test_a_group_whose_name_looks_like_a_missing_value_is_still_a_group(
+    synthetic_adata, name
+):
+    """The other direction: a real cluster named `"nan"` is not a missing value.
+
+    A spelling denylist steals these. `pandas.isna` does not — the strings are
+    present, so no cell is missing and every level survives, including under
+    `pts` where a stolen level would silently vanish from the frame.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[labels == "C"] = name
+    adata.obs["batch"] = labels
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)  # nothing is missing here
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", name}
+    assert set(rgg["pts"].columns) == {"A", "B", name}
+
+
+def test_a_nullable_string_column_with_pd_na_is_handled(synthetic_adata):
+    """pandas' nullable `string` dtype, not an object array holding `pd.NA`.
+
+    It has no `.cat`, so it takes the same branch as an object column, and its
+    missing value also prints as `"<NA>"`. Called out separately because the
+    dtype is what a `pyarrow`-backed or `convert_dtypes()`-ed obs frame gives
+    you, and the object-array arm above does not exercise it.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[0] = pd.NA
+    adata.obs["batch"] = pd.array(labels, dtype="string")
+    assert str(adata.obs["batch"].dtype) == "string"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", "C"}
+    assert list(rgg["pts"].columns) == ["A", "B", "C"]
+
+
+def test_a_categorical_level_named_nan_is_told_apart_from_a_real_nan(synthetic_adata):
+    """Both print as `"nan"` after `astype("str")`; only `isna` separates them.
+
+    A categorical carrying a level literally called `"nan"` *and* genuine NaN
+    cells is the case a spelling test cannot get right at all: it must either
+    drop the real level or keep the missing cells. The level keeps its cells and
+    the NaN rows are the ones the warning counts.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[labels == "C"] = "nan"
+    labels[0] = np.nan  # a genuine missing value, printing the same way
+    labels[1] = np.nan
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "nan"])
+
+    with pytest.warns(UserWarning, match=r"2 of \d+ cells have no group label"):
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", "nan"}
+    # The level is real, so it has cells; the two NaN rows are in nobody's pts.
+    assert (rgg["pts"]["nan"] > 0).any()
 
 
 def test_groups_errors(synthetic_adata):

@@ -28,7 +28,7 @@ The one convention that matters
 scanpy's default — `scanpy.tl.rank_genes_groups` takes a `tie_correct`
 parameter whose default is `False`, so scanpy *can* produce the corrected
 convention and simply does not by default. Measured on the fixture below the
-two conventions differ by 7.6e-02 in z, so they are different answers rather
+two conventions differ by 4.4e-01 in z, so they are different answers rather
 than different precisions, and each arm needs its own reference.
 
 Every reference here is a value some other implementation PRODUCED, never one

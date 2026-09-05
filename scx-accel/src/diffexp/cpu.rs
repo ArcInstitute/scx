@@ -50,7 +50,7 @@ impl DiffExpResult {
     ///
     /// Every tested group's statistics are computed against the same pool
     /// whether or not the caller asked for it (1-vs-rest keeps every other
-    /// labelled cell in "rest", pairwise compares against the named reference,
+    /// cell in "rest", pairwise compares against the named reference,
     /// BH is per group), so selecting afterwards is numerically identical to
     /// selecting before, and identical to scanpy — which is the point: a
     /// kernel-level pre-filter would have changed what "rest" means.
@@ -213,7 +213,7 @@ pub fn wilcoxon_rank_sum(
     let n_test_groups = test_groups.len();
 
     // --- Pre-rank approach: rank once per gene, then derive per-group statistics ---
-    // For 1-vs-rest: rank the labelled pool once per gene (10× fewer sorts).
+    // For 1-vs-rest: rank the whole matrix once per gene (10× fewer sorts).
     // For pairwise: rank (group + ref) cells per test group per gene.
     let gene_group_results: Vec<Vec<(f64, f64, f64)>> = (0..n_vars)
         .into_par_iter()

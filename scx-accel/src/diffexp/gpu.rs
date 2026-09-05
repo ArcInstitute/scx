@@ -654,9 +654,8 @@ fn wilcoxon_chunk_gpu_sequence_v3(
     is_ref_mode: bool,
 ) -> Result<()> {
     // Pool slab is pre-populated by the shard pass; sort + tie on it. The pool
-    // is the reference group in ref-mode or the labelled cells in 1-vs-rest;
-    // either way `scratch.ref_slab` holds it and `scratch.tie_term` holds its
-    // tie term.
+    // is the reference group in ref-mode or every cell in 1-vs-rest; either way
+    // `scratch.ref_slab` holds it and `scratch.tie_term` holds its tie term.
     gpu_de_block_sort(
         dev,
         &mut scratch.ref_slab,
@@ -1770,8 +1769,8 @@ fn pdex_ref_gpu_chunked_v3_csc(
 /// Two distinct cell→group/pos table sets are needed because the Wilcoxon
 /// comparison pool differs from `pdex_ref` (§C.5):
 /// - **Main tables** (`cell_to_group_dev` / `cell_to_pos_dev`): slot 0 is the
-///   reference group (ref-mode) or empty (1-vs-rest); slots `1..=n_test` are
-///   the test groups. Used for the per-test-group scatters (`group_id =
+///   reference group (ref-mode) or the unlabelled cells (1-vs-rest); slots
+///   `1..=n_test` are the test groups. Used for the per-test-group scatters (`group_id =
 ///   tg_idx + 1`) and for the pseudobulk (which spans all `n_slots` slots,
 ///   covering every cell). `slot_to_group[slot]` maps a slot back to its
 ///   original group id (for reading per-group sums back).
@@ -1785,8 +1784,9 @@ struct WilcoxonV3Prep {
     cell_to_pos_dev: CudaSlice<i32>,
     pool_group_dev: CudaSlice<i32>,
     pool_pos_dev: CudaSlice<i32>,
-    /// `slot_to_group[slot] = Some(original_group)` for populated slots; slot 0
-    /// is `None` in 1-vs-rest (empty), `Some(reference)` in ref-mode.
+    /// `slot_to_group[slot] = Some(original_group)` for slots that are a group;
+    /// slot 0 is `None` in 1-vs-rest (it holds the unlabelled cells, which are
+    /// in no group) and `Some(reference)` in ref-mode.
     slot_to_group: Vec<Option<usize>>,
     n_slots: usize,
     pool_len: usize,
@@ -1987,7 +1987,7 @@ where
     // will see. Not `pool_len`: ref-mode also sorts each test group's slab
     // (`wilcoxon_chunk_gpu_sequence_v3`), and the reference is routinely the
     // smaller side — `reference="B cell"` against a much larger T-cell group.
-    // 1-vs-rest is unaffected, its pool being every labelled cell.
+    // 1-vs-rest is unaffected, its pool being every cell.
     let n_sorted_max = pool_len.max(n_g_max).max(1);
 
     // Clamp the gene chunk so the per-target-group pool slabs (the dominant
@@ -2281,8 +2281,9 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
             source
                 .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
                     shards += 1;
-                    // group_id = 0 is the pool (ref cells / labelled cells); 1..=n_test
-                    // are the per-test-group slabs.
+                    // group_id = 0 is the pool (the reference group in ref-mode,
+                    // every cell in 1-vs-rest); 1..=n_test are the per-test-group
+                    // slabs.
                     gpu_de_scatter_csc_to_gene_major(
                         dev,
                         csc_view,

@@ -78,16 +78,34 @@ def test_excluded_targets_do_not_trip_the_unlabelled_cell_warning():
     _run(_make_adata(), groups=["ko_a"])
 
 
-def test_a_genuinely_unlabelled_cell_still_warns_under_groups():
+@pytest.mark.parametrize("na", [np.nan, None, pd.NA], ids=["np.nan", "None", "pd.NA"])
+def test_a_genuinely_unlabelled_cell_still_warns_under_groups(na):
+    """Every pandas missing value counts, not just the one that prints "nan".
+
+    `astype("str")` renders `np.nan` as `"nan"`, `None` as `"None"` and `pd.NA`
+    as `"<NA>"`. While missingness was read off that string, only the first was
+    unlabelled here: the other two became levels of their own on a plain
+    (non-categorical) column, i.e. phantom `pdex_ref` targets with no cells and
+    no warning. `pandas.isna` decides it now.
+    """
     adata = _make_adata()
     labels = adata.obs["target"].astype(object).to_numpy()
-    # NaN, not None: `astype("str")` renders NaN as "nan", which the encoder
-    # treats as unlabelled; a `None` would become the string "None" and, on a
-    # plain (non-categorical) column, a level of its own — pre-existing rule.
-    labels[0] = np.nan
+    labels[0] = na
     adata.obs["target"] = labels
     with pytest.warns(UserWarning, match="1 of 90 cells have no group label"):
         _run(adata, groups=["ko_a"])
+
+
+def test_a_target_named_like_a_missing_value_is_a_real_target():
+    """The other direction: `pdex_ref` must not steal a perturbation called
+    `"nan"`. It is a legitimate label, and only `pandas.isna` can tell it from a
+    genuine NaN."""
+    adata = _make_adata()
+    labels = adata.obs["target"].astype(object).to_numpy()
+    labels[labels == "ko_b"] = "nan"
+    adata.obs["target"] = labels
+    df = _run(adata, groups=["nan"])
+    assert set(df["target"]) == {"nan"}
 
 
 def test_groups_errors():

@@ -1583,12 +1583,13 @@ fn test_wilcoxon_gpu_unlabelled_matches_cpu() {
 /// arm could be checked against anything but a sibling SCX kernel.
 ///
 /// Same table (`super::wilcoxon_reference_values`), same fixture, same two
-/// conventions. In particular the kernel is handed all 12 rows including the
-/// two unlabelled ones while every expected value was computed on the 10
-/// labelled rows, so the unlabelled-cell contract is asserted here against
-/// scipy rather than against `wilcoxon_rank_sum_gpu_dense`'s own physical-subset
-/// run (which `test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_physical_subset`
-/// above still covers, and which cannot see a bug both arms share).
+/// conventions. Every expected value was computed over all 12 rows, the two
+/// unlabelled ones included — they are in no group but in the rank pool and in
+/// every group's "rest" — so the unlabelled-cell contract is asserted here
+/// against scipy rather than against `wilcoxon_rank_sum_gpu_dense`'s own
+/// extra-group run (which
+/// `test_wilcoxon_gpu_one_vs_rest_unlabelled_equals_an_extra_group` above still
+/// covers, and which cannot see a bug both arms share).
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn test_wilcoxon_gpu_matches_the_external_reference_values() {

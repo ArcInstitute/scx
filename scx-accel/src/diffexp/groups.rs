@@ -29,6 +29,13 @@
 ///
 /// There is no separate "pool" view: the 1-vs-rest pool is every row, so a
 /// group's positions *within* the pool are its global cell indices.
+///
+/// It stays a named struct rather than collapsing to a bare `Vec<Vec<usize>>`
+/// now that it carries one field. It is the public return type of
+/// [`partition_by_group`], re-exported from `diffexp`, and 0.17 already removes
+/// `labelled` / `pool_pos` / `is_total` from it; deleting the type as well would
+/// deepen that break for callers who only ever wanted the group lists, and buy
+/// a `Vec` in exchange.
 #[derive(Debug, Clone)]
 pub struct GroupPartition {
     /// `group_indices[g]` — ascending **global** cell indices in group `g`.
@@ -37,10 +44,15 @@ pub struct GroupPartition {
 }
 
 impl GroupPartition {
-    /// Cells carrying a real group label. Private: outside this module the
-    /// interesting figure is always the complement, and exporting both invites
-    /// a caller to use `n_labelled` as a pool size, which it no longer is.
-    fn n_labelled(&self) -> usize {
+    /// Cells carrying a real group label.
+    ///
+    /// **No longer the 1-vs-rest pool size** — that is `n_obs`. It was, before
+    /// 0.17 (X9), and the two coinciding is what the removal of
+    /// `GroupPartition::{labelled, pool_pos}` and `is_total` is about: a caller
+    /// that reached for one of those wanted a pool, and would now silently get
+    /// every cell. A compile error is the right signal for that; this method
+    /// survives because the count itself still means what it always did.
+    pub fn n_labelled(&self) -> usize {
         self.group_indices.iter().map(Vec::len).sum()
     }
 

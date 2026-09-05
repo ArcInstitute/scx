@@ -461,17 +461,8 @@ fn resolve_groups_and_reference(
         .call_method0("tolist")?
         .extract()?;
 
-    let cat_attr = group_col.getattr("cat");
-    let unique_groups: Vec<String> = if let Ok(cat) = cat_attr {
-        cat.getattr("categories")?
-            .call_method0("tolist")?
-            .extract()?
-    } else {
-        let mut unique: Vec<String> = group_labels.to_vec();
-        unique.sort();
-        unique.dedup();
-        unique
-    };
+    let missing = missing_label_mask(adata.py(), &group_col, group_labels.len())?;
+    let unique_groups = group_level_universe(&group_col, &group_labels, &missing)?;
 
     let group_name_to_idx: std::collections::HashMap<&str, usize> = unique_groups
         .iter()
@@ -485,10 +476,15 @@ fn resolve_groups_and_reference(
         ))
     })?;
 
-    // Unknown groups (NaN / empty strings after astype("str") become "nan" /
-    // "") get mapped to a sentinel that exceeds n_groups, so pdex_ref drops
-    // them. Use `unique_groups.len()` as the out-of-range marker.
-    let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
+    // Missing values, and any label outside the universe, get a sentinel that
+    // exceeds n_groups, so pdex_ref drops them. `unique_groups.len()` is the
+    // out-of-range marker.
+    let groups = encode_group_labels(
+        &group_labels,
+        &group_name_to_idx,
+        unique_groups.len(),
+        &missing,
+    );
     // `resolve_groups_and_reference` serves `pdex_ref` only, which is always
     // pairwise against a named reference.
     warn_unlabelled_cells(adata.py(), &groups, unique_groups.len(), groupby, false);
@@ -547,23 +543,92 @@ pub(crate) fn validate_groups_request(groups: &[String]) -> PyResult<()> {
     Ok(())
 }
 
-/// Map string labels onto group indices, sending anything unrecognised to the
-/// out-of-range sentinel `oor = n_groups`.
+/// Per-cell "this value is missing", asked of pandas rather than inferred from
+/// how a value happens to print.
 ///
-/// `pandas` renders a missing categorical value as `"nan"` and an empty string
-/// as `""` once `astype("str")` has run; both mean "this cell was never
-/// annotated". The kernels treat any index `>= n_groups` as unlabelled and
-/// leave those cells out of the comparison entirely (see
-/// `scx_accel::diffexp::groups`).
+/// `astype("str")` renders `np.nan` as `"nan"`, `None` as `"None"` and `pd.NA`
+/// (including a nullable `string` dtype's) as `"<NA>"`, so a spelling denylist
+/// fails in **both** directions: it misses every NA kind but one, and it steals
+/// real group names — a cluster genuinely called `"None"` is not a missing
+/// value. `pandas.isna` answers the question that was actually being asked, and
+/// it is the same call [`extract_strata`] already makes on its own columns.
+///
+/// Costs one more `tolist()` over the column, alongside the `astype("str")` one
+/// every caller here already pays.
+///
+/// `n_obs` is the label count the mask has to line up with. Both consumers
+/// `zip` the two, and `zip` truncates to the shorter — so a mask that came back
+/// short (a duplicated `obs` column name makes `obs[groupby]` a *frame*, whose
+/// `isna().tolist()` is a list of rows) would silently shrink the label universe
+/// rather than fail.
+fn missing_label_mask(
+    py: Python<'_>,
+    group_col: &Bound<'_, PyAny>,
+    n_obs: usize,
+) -> PyResult<Vec<bool>> {
+    let pd = crate::pyimport::import_module(py, "pandas")?;
+    let mask: Vec<bool> = pd
+        .call_method1("isna", (group_col,))?
+        .call_method0("tolist")?
+        .extract()?;
+    if mask.len() != n_obs {
+        return Err(PyValueError::new_err(format!(
+            "pandas.isna(obs[groupby]) returned {} values for {n_obs} cells; \
+             is the column name duplicated in adata.obs?",
+            mask.len()
+        )));
+    }
+    Ok(mask)
+}
+
+/// The level universe for a `groupby` column: its declared categories when it
+/// is categorical, else the sorted distinct labels of the **non-missing** rows.
+///
+/// The non-categorical arm is what scanpy reaches through `sanitize_anndata` →
+/// `astype("category")`, where a missing value is never a category. Deriving it
+/// from every row instead would mint a level no cell can be in (`"nan"`,
+/// `"None"`, `"<NA>"`, `""`) — a phantom `pts` column, a phantom `pdex_ref`
+/// target, and, since the singlet guard counts cells per level, a spurious
+/// "only contain one sample" error on any object column with a missing value.
+fn group_level_universe(
+    group_col: &Bound<'_, PyAny>,
+    group_labels: &[String],
+    missing: &[bool],
+) -> PyResult<Vec<String>> {
+    if let Ok(cat) = group_col.getattr("cat") {
+        return cat.getattr("categories")?.call_method0("tolist")?.extract();
+    }
+    let mut unique: Vec<String> = group_labels
+        .iter()
+        .zip(missing)
+        .filter(|(_, &is_na)| !is_na)
+        .map(|(label, _)| label.clone())
+        .collect();
+    unique.sort();
+    unique.dedup();
+    Ok(unique)
+}
+
+/// Map string labels onto group indices, sending every missing value — and
+/// anything unrecognised — to the out-of-range sentinel `oor = n_groups`.
+///
+/// `missing` comes from [`missing_label_mask`], never from the printed form: by
+/// the time a label reaches here a `None` is already the string `"None"`, and a
+/// category genuinely named `"nan"` is indistinguishable from `np.nan`. The
+/// kernels give any index `>= n_groups` no group of its own; whether such a cell
+/// still takes part in the comparison depends on the arm, and
+/// [`warn_unlabelled_cells`] says which (see `scx_accel::diffexp::groups`).
 fn encode_group_labels(
     group_labels: &[String],
     group_name_to_idx: &std::collections::HashMap<&str, usize>,
     oor: usize,
+    missing: &[bool],
 ) -> Vec<usize> {
     group_labels
         .iter()
-        .map(|label| {
-            if label.is_empty() || label == "nan" {
+        .zip(missing)
+        .map(|(label, &is_na)| {
+            if is_na {
                 oor
             } else {
                 *group_name_to_idx.get(label.as_str()).unwrap_or(&oor)
@@ -623,7 +688,8 @@ fn warn_unlabelled_cells(
             (
                 format!(
                     "{n_unlabelled} of {} cells have no group label in obs['{groupby}'] \
-                     (NaN, empty, or a value outside the column's categories). {detail}",
+                     (a pandas missing value, or a value outside the column's \
+                     categories). {detail}",
                     groups.len()
                 ),
                 py.get_type::<pyo3::exceptions::PyUserWarning>(),

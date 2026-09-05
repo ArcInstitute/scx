@@ -62,9 +62,11 @@ def rank_genes_groups(
     *participating* group with fewer than two cells raises, as in scanpy —
     every level when ``groups`` is omitted, the named ones (plus a named
     reference) when it is given; an unused category counts as zero cells.
-    Cells with no ``groupby`` label get no group of their own, but for
-    ``reference="rest"`` they are in the rank pool and in every group's
-    "rest", as scanpy does. ``pts=True`` refuses duplicate ``var_names`` (its table is joined
+    Cells with no ``groupby`` label — ``pandas.isna``, so ``NaN`` / ``None`` /
+    ``pd.NA`` alike, never a test on how the value prints — get no group of
+    their own, but for ``reference="rest"`` they are in the rank pool and in
+    every group's "rest", as scanpy does. A group *named* ``"nan"`` or ``""``
+    is a real group. ``pts=True`` refuses duplicate ``var_names`` (its table is joined
     by name). ``corr_method`` accepts only ``"benjamini-hochberg"`` (recorded
     in ``params``); any other value raises rather than silently applying BH.
     """

@@ -65,29 +65,14 @@ pub(crate) fn run_rank_genes_groups_inner(
         .call_method0("tolist")?
         .extract()?;
 
-    // Determine unique group names (sorted, matching scanpy's default).
-    let cat_attr = group_col.getattr("cat");
-    let unique_groups: Vec<String> = if let Ok(cat) = cat_attr {
-        cat.getattr("categories")?
-            .call_method0("tolist")?
-            .extract()?
-    } else {
-        // scanpy reaches this column through `sanitize_anndata`, i.e. through
-        // `astype("category")`, where a NaN is *not* a category. Mirror that:
-        // `encode_group_labels` sends `"nan"` / `""` to the unlabelled sentinel,
-        // so keeping them here would mint levels that no cell can ever be in —
-        // a phantom `pts` column, and, since the singlet guard below counts
-        // cells per level, a spurious "only contain one sample" error on any
-        // plain string column with a missing value.
-        let mut unique: Vec<String> = group_labels
-            .iter()
-            .filter(|label| !label.is_empty() && label.as_str() != "nan")
-            .cloned()
-            .collect();
-        unique.sort();
-        unique.dedup();
-        unique
-    };
+    // Which cells have no label, and what the levels are. Both come from
+    // `pandas` rather than from how a value prints — see `missing_label_mask`:
+    // `astype("str")` turns `None` into `"None"` and `pd.NA` into `"<NA>"`, so
+    // a spelling test would both miss those and steal a real group named
+    // `"None"`. That matters more since X8, because the singlet guard counts
+    // cells per level and a phantom level has none.
+    let missing = missing_label_mask(py, &group_col, group_labels.len())?;
+    let unique_groups = group_level_universe(&group_col, &group_labels, &missing)?;
 
     // Map labels → indices.
     let group_name_to_idx: std::collections::HashMap<&str, usize> = unique_groups
@@ -96,11 +81,16 @@ pub(crate) fn run_rank_genes_groups_inner(
         .map(|(i, name)| (name.as_str(), i))
         .collect();
 
-    // Unknown groups (NaN / empty after astype("str") → "nan" / "") map to a
-    // sentinel >= n_groups so the Wilcoxon kernels give them no group of their
-    // own, instead of contaminating group 0. They still rank, and still count
-    // as "rest", in the 1-vs-rest arm. Mirrors resolve_groups_and_reference.
-    let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
+    // Missing values, and any label outside the universe, map to a sentinel
+    // >= n_groups so the Wilcoxon kernels give them no group of their own,
+    // instead of contaminating group 0. They still rank, and still count as
+    // "rest", in the 1-vs-rest arm. Mirrors resolve_groups_and_reference.
+    let groups = encode_group_labels(
+        &group_labels,
+        &group_name_to_idx,
+        unique_groups.len(),
+        &missing,
+    );
     warn_unlabelled_cells(
         py,
         &groups,
@@ -1235,6 +1225,30 @@ fn write_de_to_adata(
     params.set_item("layer", layer)?;
     params.set_item("corr_method", corr_method)?;
 
+    // scanpy's recarray dtype, built through the **dict** spelling
+    // (`{"names": [...], "formats": [...]}`) rather than a list of
+    // `(name, format)` tuples.
+    //
+    // The two are equivalent for every ordinary group name and differ on
+    // exactly one: numpy silently renames an empty field name to a positional
+    // `"f0"` in the tuple-list form, so a group legitimately labelled `""`
+    // produced an array whose field could not be read back —
+    // `ValueError: no field of name`, raised from inside the writer. The dict
+    // form keeps the name. Reachable only since missing values stopped being
+    // inferred from their printed form, which is what made `""` a real level.
+    let build_dtype = |groups: &[String], format: &str| -> PyResult<Bound<'_, PyAny>> {
+        let names = pyo3::types::PyList::empty(py);
+        let formats = pyo3::types::PyList::empty(py);
+        for gn in groups {
+            names.append(gn.as_str())?;
+            formats.append(format)?;
+        }
+        let spec = pyo3::types::PyDict::new(py);
+        spec.set_item("names", names)?;
+        spec.set_item("formats", formats)?;
+        numpy.call_method1("dtype", (spec,))
+    };
+
     // Helper to build structured array (like scanpy's recarray format).
     // Scanpy stores e.g. names as a structured array with dtype like:
     //   [('group_A', 'O'), ('group_B', 'O')]
@@ -1247,12 +1261,7 @@ fn write_de_to_adata(
             // silently produced NaN past 200 characters) and no single long
             // name widens every cell of every group (a fitted `U{max}` would
             // have cost `4 × max_len × n_groups × n_genes` bytes).
-            let dt_list = pyo3::types::PyList::empty(py);
-            for gn in groups {
-                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "O"])?;
-                dt_list.append(tup)?;
-            }
-            let dtype = numpy.call_method1("dtype", (dt_list,))?;
+            let dtype = build_dtype(groups, "O")?;
 
             // Build empty structured array, then fill fields.
             let arr = numpy.call_method1("empty", (n_genes,))?;
@@ -1276,12 +1285,7 @@ fn write_de_to_adata(
     let build_structured_f64 =
         |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
             let t_marshal = scx_accel::cpu_profile::start();
-            let dt_list = pyo3::types::PyList::empty(py);
-            for gn in groups {
-                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "f8"])?;
-                dt_list.append(tup)?;
-            }
-            let dtype = numpy.call_method1("dtype", (dt_list,))?;
+            let dtype = build_dtype(groups, "f8")?;
 
             let arr = numpy.call_method1("empty", (n_genes,))?;
             let arr = arr.call_method1("astype", (&dtype,))?;

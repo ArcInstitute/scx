@@ -207,7 +207,18 @@ pub(crate) fn gene_stats_nnz(
     tie_correct: bool,
     log_transformed: bool,
 ) -> Result<Vec<(f64, f64, f64)>> {
-    debug_assert_eq!(group_cell_counts.len(), n_groups + 1);
+    // A runtime check, not a `debug_assert`: the per-bucket loop below indexes
+    // `group_cell_counts[n_groups]`, so a short slice is an out-of-bounds panic
+    // in exactly the release builds where the assert is compiled out. Same
+    // shape as this file's other guards — a named `InvalidInput`, not a crash.
+    if group_cell_counts.len() != n_groups + 1 {
+        return Err(AccelError::InvalidInput(format!(
+            "gene_stats_nnz: group_cell_counts has {} entries, expected {} \
+             (one per group plus the unlabelled bucket)",
+            group_cell_counts.len(),
+            n_groups + 1
+        )));
+    }
     // `n_groups + 1` wide throughout: the last slot is the unlabelled bucket.
     let mut group_sum = vec![0.0f64; n_groups + 1];
     let mut nonzero_in_g = vec![0usize; n_groups + 1];
