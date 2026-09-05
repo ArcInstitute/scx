@@ -370,10 +370,25 @@ fn decode_categorical(
     let categories = decode_column(categories).map_err(|e| format!("categories: {e}"))?;
 
     let codes = match decode_column(codes)? {
-        UnsColumn::Numeric { dtype, bytes } => codes_to_i32(&dtype, &bytes)
-            .ok_or_else(|| format!("codes dtype {dtype} is not an integer width"))?,
+        UnsColumn::Numeric { dtype, bytes } => codes_to_i32(&dtype, &bytes).ok_or_else(|| {
+            format!("codes dtype {dtype} is not an integer width, or a code is out of i32 range")
+        })?,
         _ => return Err("categorical `codes` is not a numeric array".into()),
     };
+    // A code must address a declared category, or be pandas' `-1` null. An
+    // out-of-range code would index past the `categories` dataset on read, and
+    // the preflight's whole job is to answer "faithfully writable".
+    let n_categories = categories
+        .len()
+        .ok_or_else(|| "categories length is not determinable".to_string())?;
+    if let Some(bad) = codes
+        .iter()
+        .find(|&&c| c < -1 || c as usize >= n_categories)
+    {
+        return Err(format!(
+            "categorical code {bad} does not address one of the {n_categories} declared categories"
+        ));
+    }
     let ordered = map
         .get("ordered")
         .and_then(|v| v.as_bool())
@@ -387,25 +402,28 @@ fn decode_categorical(
 }
 
 /// Categorical codes, whatever signed width pandas used, as `i32`.
+///
+/// `i32::try_from`, not `as i32`, which *wraps*: an envelope carrying i64 codes
+/// `[2**32, 2**32 + 1]` narrowed to `[0, 1]` and exported silently as the first
+/// two categories. A raw envelope can be handed to `set_uns` as an ordinary
+/// dict, so this is reachable with pyscx's encoder nowhere in the path.
 fn codes_to_i32(dtype: &str, bytes: &[u8]) -> Option<Vec<i32>> {
-    macro_rules! widen {
+    macro_rules! narrow {
         ($ty:ty, $w:expr) => {{
             if bytes.len() % $w != 0 {
                 return None;
             }
-            Some(
-                bytes
-                    .chunks_exact($w)
-                    .map(|c| <$ty>::from_le_bytes(c.try_into().unwrap()) as i32)
-                    .collect(),
-            )
+            bytes
+                .chunks_exact($w)
+                .map(|c| i32::try_from(<$ty>::from_le_bytes(c.try_into().unwrap())).ok())
+                .collect::<Option<Vec<i32>>>()
         }};
     }
     match (dtype.chars().nth(1), dtype_width(dtype)?) {
         (Some('i'), 1) => Some(bytes.iter().map(|&b| b as i8 as i32).collect()),
-        (Some('i'), 2) => widen!(i16, 2),
-        (Some('i'), 4) => widen!(i32, 4),
-        (Some('i'), 8) => widen!(i64, 8),
+        (Some('i'), 2) => narrow!(i16, 2),
+        (Some('i'), 4) => narrow!(i32, 4),
+        (Some('i'), 8) => narrow!(i64, 8),
         _ => None,
     }
 }

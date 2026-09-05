@@ -501,7 +501,8 @@ Headlines:
   `UnsupportedUnsDataframeColumn` warning (an error under `strict_uns=true`).
   Going the other way, a frame h5ad cannot spell is written whole as a raw
   envelope subgroup with an `UnsExportedAsRawEnvelope` warning: anndata reads
-  it as a dict, but no value is lost.
+  it as a dict, and every value whose key HDF5 can carry is preserved (a key it
+  cannot — empty, or containing `/` — is dropped with `SkippedUnsKey`).
 - **Dropped (warns):** CSC/unsupported `obsp`/`varp`, pickled `uns` objects,
   obs/var columns with an unsupported dtype, and
   **compound/structured `uns` arrays** — notably scanpy's `rank_genes_groups`

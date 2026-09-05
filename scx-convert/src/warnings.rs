@@ -45,9 +45,13 @@ pub enum ConvertWarning {
 
     /// A `uns` pandas DataFrame could not be exported to h5ad as an anndata
     /// dataframe group and was written as a raw `__scx_type__` envelope
-    /// subgroup instead. **No data is lost** — anndata reads that subgroup back
-    /// as a nested dict — but DataFrame consumers (`sc.tl.filter_rank_genes_groups`,
+    /// subgroup instead — anndata reads that subgroup back as a nested dict, so
+    /// DataFrame consumers (`sc.tl.filter_rank_genes_groups`,
     /// `sc.get.rank_genes_groups_df`) will not recognise it.
+    ///
+    /// The fallback keeps every value **whose key HDF5 can carry**. A column
+    /// named `"/evil"` or `""` has no HDF5 member spelling anywhere, so the
+    /// fallback drops it too, with its own [`Self::SkippedUnsKey`].
     ///
     /// Declining the whole frame rather than dropping the offending column is
     /// deliberate: on export the fallback preserves everything, so dropping a
@@ -307,9 +311,10 @@ impl fmt::Display for ConvertWarning {
             Self::UnsExportedAsRawEnvelope { key, reason } => write!(
                 f,
                 "uns['{key}'] could not be written as an h5ad DataFrame ({reason}); \
-                 it was exported as a raw envelope subgroup instead. No data is \
-                 lost, but anndata will read it back as a nested dict rather than \
-                 a DataFrame."
+                 it was exported as a raw envelope subgroup instead, which anndata \
+                 reads back as a nested dict. Every value whose key HDF5 can carry \
+                 is preserved; a key it cannot is dropped with its own \
+                 skipped_uns_key warning."
             ),
             Self::FlattenedUnsSparse { key, format } => write!(
                 f,

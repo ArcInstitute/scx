@@ -2128,10 +2128,19 @@ fn read_uns_dataframe_group(
         }
         Err(_) => None,
     };
+    // HDF5 resolves a member string as a *path*, and `_index` / `column-order`
+    // are attributes any producer can write. An `_index` of `"/obs/_index"`
+    // silently rebuilt the frame with obs's barcodes as its index — wrong data,
+    // no warning, under `strict_uns` too. Every name must be a single member of
+    // *this* group before it is dereferenced. The export side got this guard in
+    // round 2; this is its missing counterpart.
+    let members = group.member_names()?;
+    let resolvable =
+        |n: &str| super::uns::is_safe_hdf5_member_name(n) && members.iter().any(|m| m == n);
+
     // Without `column-order` there is no column order to recover; member order
     // is HDF5's, which is alphabetical. Say so by falling back to it rather
     // than refusing a frame anndata itself considers well-formed.
-    let members = group.member_names()?;
     let names: Vec<String> = match declared {
         Some(cols) => cols,
         None => members
@@ -2145,6 +2154,22 @@ fn read_uns_dataframe_group(
     // so the caller takes the generic subgroup recurse, which still recovers
     // every sibling column as a dict — before X6 that was the only behaviour,
     // and losing the whole `uns` key would be a strict regression on it.
+    if !resolvable(&index_name) {
+        if strict_uns {
+            return Err(ConvertError::Other(format!(
+                "uns['{key}']: index name {index_name:?} is not a member of the dataframe \
+                 group (strict_uns=true)"
+            )));
+        }
+        sink.emit(ConvertWarning::UnsupportedUnsDataframeColumn {
+            key: key.to_string(),
+            column: index_name.clone(),
+            reason: "index name does not name a member of this group; the group was read \
+                     as a plain dict instead of a DataFrame"
+                .to_string(),
+        });
+        return Ok(None);
+    }
     let Ok(index_ds) = group.dataset(&index_name) else {
         if strict_uns {
             return Err(ConvertError::Other(format!(
@@ -2187,6 +2212,22 @@ fn read_uns_dataframe_group(
     let mut data = serde_json::Map::with_capacity(names.len());
     let mut kept: Vec<serde_json::Value> = Vec::with_capacity(names.len());
     for name in &names {
+        if !resolvable(name) {
+            let e = ConvertError::Other(format!(
+                "{name:?} does not name a member of this dataframe group"
+            ));
+            if strict_uns {
+                return Err(ConvertError::Other(format!(
+                    "uns['{key}'] column '{name}': {e} (strict_uns=true)"
+                )));
+            }
+            sink.emit(ConvertWarning::UnsupportedUnsDataframeColumn {
+                key: key.to_string(),
+                column: name.to_string(),
+                reason: e.to_string(),
+            });
+            continue;
+        }
         let encoded = if let Ok(sub) = group.group(name) {
             let enc = sub
                 .attr("encoding-type")

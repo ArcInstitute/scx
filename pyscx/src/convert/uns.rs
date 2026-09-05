@@ -724,19 +724,21 @@ pub(crate) fn ndarray_bytes_le<'py>(arr: &Bound<'py, PyAny>, key_path: &str) -> 
 /// back as an object array of `pd.NA`, which then fails deep inside the string
 /// walker with a message about `NAType` rather than about the dtype. Refusing
 /// here keeps the lossless contract and names the thing the user has to cast.
-/// `category` is handled before this is reached; it has a real envelope.
+/// `category` is handled before this is reached on a *column*; a
+/// `CategoricalIndex` is refused, since the envelope carries an index's values
+/// but not a categorical dtype for them.
+///
+/// Takes the resolved `pd.api.types.is_extension_array_dtype` callable rather
+/// than the pandas module: it is called once per column plus once for the
+/// index, and re-walking that attribute chain each time is three dict lookups
+/// a frame-wide resolve does once.
 fn reject_extension_dtype(
-    pd: &Bound<'_, PyModule>,
+    is_ext: &Bound<'_, PyAny>,
     dtype: &Bound<'_, PyAny>,
     key_path: &str,
     what: &str,
 ) -> PyResult<()> {
-    if pd
-        .getattr("api")?
-        .getattr("types")?
-        .call_method1("is_extension_array_dtype", (dtype,))?
-        .extract::<bool>()?
-    {
+    if is_ext.call1((dtype,))?.extract::<bool>()? {
         let dtype_str: String = dtype.str()?.extract()?;
         return Err(PyValueError::new_err(format!(
             "uns at {key_path}: DataFrame {what} dtype {dtype_str} is a pandas extension \
@@ -922,8 +924,15 @@ fn dataframe_envelope<'py>(
         names.push(name);
     }
 
+    // Resolved once per frame: `is_extension_array_dtype` is called for the
+    // index and every column, and re-walking `pd.api.types` each time is three
+    // dict lookups a single resolve does once.
+    let is_ext = pd
+        .getattr("api")?
+        .getattr("types")?
+        .getattr("is_extension_array_dtype")?;
     reject_extension_dtype(
-        &pd,
+        &is_ext,
         &index.getattr("dtype")?,
         &format!("{key_path}.index"),
         "index",
@@ -938,7 +947,7 @@ fn dataframe_envelope<'py>(
             // `Series.array` of a categorical Series *is* the `pd.Categorical`.
             categorical_envelope(&series.getattr("array")?, &col_path, ctx)?
         } else {
-            reject_extension_dtype(&pd, &dtype, &col_path, "column")?;
+            reject_extension_dtype(&is_ext, &dtype, &col_path, "column")?;
             let values = series.call_method1("to_numpy", ())?;
             reject_bytes_elements(&values, &col_path)?;
             encode_ndarray_tagged(&values, &col_path, ctx)?

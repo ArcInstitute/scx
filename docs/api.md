@@ -522,7 +522,7 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | Variant | Emitted by | Meaning |
 | --- | --- | --- |
 | `InferredEncoding { path, inferred }` | h5ad layout detection (`detect_matrix_format_at`, `open_x_streaming`) | h5ad `encoding-type` was missing or ambiguous; layout was inferred from group children or dataset shape. |
-| `SkippedUnsKey { key, reason }` | `read_uns` / `read_uns_entry` | `uns` entry was unrepresentable; skipped under default `strict_uns=false`. `strict_uns=true` turns this into an error on the first occurrence. |
+| `SkippedUnsKey { key, reason }` | `read_uns` / `read_uns_entry` (ingest); `write_uns_value` (export) | **Ingest:** a `uns` entry was unrepresentable; skipped under default `strict_uns=false`, an error on the first occurrence under `strict_uns=true`. **Export:** the key is not usable as an HDF5 member name (empty, `.`, `..`, or containing `/`, which HDF5 would resolve as a *path*), so the entry is dropped. `strict_uns` is an ingest option and does not govern the export case. |
 | `UnsupportedUnsDataframeColumn { key, column, reason }` | `read_uns_dataframe_group` | **Ingest.** One column of a `uns` pandas DataFrame had no lossless `uns` encoding (anndata's `nullable-integer` / `nullable-boolean` / `nullable-string-array`, or an unrecognised column encoding) and was left out of the reconstructed frame. The index, the column order and every other column are intact. Under `strict_uns=true` this is an error instead. |
 | `UnsExportedAsRawEnvelope { key, reason }` | `try_write_uns_dataframe` | **Export.** A `uns` pandas DataFrame had no faithful h5ad dataframe spelling and was written as a raw `__scx_type__` envelope subgroup. No data is lost; anndata reads it back as a nested dict rather than a DataFrame. |
 | `FlattenedUnsSparse { key, format }` | `read_uns_entry` | A `uns` scipy-sparse matrix (`encoding-type` = `"csr_matrix"` / `"csc_matrix"` / `"coo_matrix"`) was preserved as a nested dict of `data` / `indices` / `indptr` arrays rather than reconstructed as a sparse matrix — the sparse type tag is not restored on read. Data is not dropped. |
@@ -2377,10 +2377,12 @@ collide in the group; a name HDF5 cannot carry as a single member — empty,
 `.`, `..`, or containing `/`; a non-string index name, which h5ad has nowhere
 to put), the
 whole frame is written as a raw `__scx_type__` envelope subgroup instead, with
-an `uns_exported_as_raw_envelope` warning. **No data is lost** in that case —
-anndata reads the subgroup as a nested dict — but DataFrame consumers will not
-recognise it. Declining beats dropping the column, because the fallback keeps
-what dropping would discard.
+an `uns_exported_as_raw_envelope` warning. anndata reads the subgroup as a
+nested dict, so DataFrame consumers will not recognise it. Declining beats
+dropping the column, because the fallback keeps what dropping would discard —
+every value **whose key HDF5 can carry**. A column named `"/evil"` or `""` has
+no HDF5 member spelling anywhere, so the fallback drops it too, with its own
+`skipped_uns_key` warning.
 Non-finite raw Python `float` scalars (`nan` / `±inf`) are preserved under
 `"tagged"` via the `scalar` envelope (they read back as `np.float64`, a
 `float` subclass, bit-exact) and raise under `"plain"`, whose contract is

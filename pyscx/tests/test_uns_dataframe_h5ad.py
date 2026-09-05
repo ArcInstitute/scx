@@ -538,3 +538,129 @@ def test_exported_dataframe_children_carry_anndata_encoding_metadata(tmp_dir):
         str(w.message) for w in caught if "OldFormat" in type(w.message).__name__
     ]
     assert not [m for m in offenders if "/uns/t" in m], offenders
+
+
+def test_uns_dataframe_ingest_refuses_path_bearing_attributes(tmp_dir):
+    """`_index` / `column-order` are attributes; HDF5 reads them as *paths*.
+
+    Setting a frame's `_index` to `"/obs/_index"` made the reader rebuild the
+    frame with obs's barcodes as its index — wrong data, no warning, under
+    `strict_uns=True` too. A crafted `column-order` could pull in any dataset in
+    the file the same way. The export side got a member-name guard in round 2;
+    this is its missing counterpart. Found by codex.
+    """
+    import anndata
+    import h5py
+    import scipy.sparse as sp
+
+    import pyscx
+
+    def write_frame(name):
+        adata = anndata.AnnData(
+            X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32)),
+            obs=pd.DataFrame(index=["c0", "c1"]),
+            var=pd.DataFrame(index=["g0", "g1"]),
+            uns={"t": pd.DataFrame({"a": [1.0, 2.0]}, index=["r0", "r1"])},
+        )
+        path = str(tmp_dir / f"{name}.h5ad")
+        adata.write_h5ad(path)
+        return path
+
+    # A path-bearing index name.
+    idx = write_frame("pathidx")
+    with h5py.File(idx, "a") as f:
+        del f["uns/t"].attrs["_index"]
+        f["uns/t"].attrs["_index"] = "/obs/_index"
+
+    with pytest.raises(Exception, match=r"not a member of the dataframe group"):
+        pyscx.from_h5ad(idx, str(tmp_dir / "pathidx_strict.scx"), strict_uns=True)
+
+    with pytest.warns(UserWarning, match="unsupported_uns_dataframe_column"):
+        pyscx.from_h5ad(idx, str(tmp_dir / "pathidx.scx"))
+    got = pyscx.open(str(tmp_dir / "pathidx.scx")).read_uns()["t"]
+    # Falls back to the dict recurse; obs's barcodes never reach the frame.
+    assert isinstance(got, dict)
+    assert list(got["a"]) == [1.0, 2.0]
+    assert "c0" not in str(got)
+
+    # A path-bearing column entry.
+    cols = write_frame("pathcol")
+    with h5py.File(cols, "a") as f:
+        del f["uns/t"].attrs["column-order"]
+        f["uns/t"].attrs["column-order"] = np.array(
+            ["a", "/obs/_index"], dtype=h5py.special_dtype(vlen=str)
+        )
+    with pytest.warns(UserWarning, match="unsupported_uns_dataframe_column"):
+        pyscx.from_h5ad(cols, str(tmp_dir / "pathcol.scx"))
+    frame = pyscx.open(str(tmp_dir / "pathcol.scx")).to_anndata().uns["t"]
+    assert list(frame.columns) == ["a"], "the path-bearing column must be dropped"
+
+
+def test_uns_dataframe_export_declines_out_of_range_categorical_codes(tmp_dir):
+    """Codes were narrowed with `as i32`, which wraps rather than failing.
+
+    An envelope carrying i64 codes `[2**32, 2**32 + 1]` exported silently as the
+    first two categories. A raw envelope reaches `set_uns` as an ordinary dict,
+    so this needs pyscx's encoder nowhere in the path. Found by codex.
+    """
+    import base64
+
+    import anndata
+    import scipy.sparse as sp
+
+    import pyscx
+
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32)),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1"]),
+        uns={"k": 1.0},
+    )
+    scx_path = str(tmp_dir / "codes.scx")
+    pyscx.from_anndata(adata, scx_path)
+
+    def env(codes):
+        return {
+            "__scx_type__": "pandas.DataFrame",
+            "index": {
+                "__scx_type__": "pandas.Index",
+                "name": None,
+                "data": {
+                    "__scx_type__": "ndarray", "dtype": "object", "shape": [2],
+                    "encoding": "json", "data": ["r0", "r1"],
+                },
+            },
+            "columns": ["c"],
+            "data": {
+                "c": {
+                    "__scx_type__": "categorical", "ordered": False,
+                    "codes": {
+                        "__scx_type__": "ndarray", "dtype": "<i8", "shape": [2],
+                        "encoding": "base64le",
+                        "data": base64.b64encode(
+                            np.array(codes, dtype="<i8").tobytes()
+                        ).decode(),
+                    },
+                    "categories": {
+                        "__scx_type__": "ndarray", "dtype": "object", "shape": [2],
+                        "encoding": "json", "data": ["a", "b"],
+                    },
+                }
+            },
+        }
+
+    for name, codes in [("wrapping", [2**32, 2**32 + 1]), ("out_of_range", [0, 5])]:
+        pyscx.set_uns(scx_path, {"t": env(codes)})
+        out = str(tmp_dir / f"codes_{name}.h5ad")
+        with pytest.warns(UserWarning, match="uns_exported_as_raw_envelope"):
+            pyscx.to_h5ad(scx_path, out)
+        got = anndata.read_h5ad(out).uns["t"]
+        assert isinstance(got, dict), f"{name}: must decline, not write wrong codes"
+
+    # A valid code set still exports as a real frame — the guard is not blanket.
+    pyscx.set_uns(scx_path, {"t": env([1, 0])})
+    ok = str(tmp_dir / "codes_ok.h5ad")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pyscx.to_h5ad(scx_path, ok)
+    assert list(anndata.read_h5ad(ok).uns["t"]["c"]) == ["b", "a"]
