@@ -131,9 +131,9 @@ def test_rank_genes_groups_structured_field_dtypes(adata_mem):
             assert finite.size > 0
             assert ((finite >= 0) & (finite <= 1)).all(), f"{field} out of [0,1]"
 
-    # The names field keeps its Python-string path (fixed-width `U`, sized to
-    # the longest name so nothing is truncated) deliberately.
-    assert rgg["names"].dtype[groups[0]].kind == "U"
+    # The names field is object dtype — scanpy's own — so no name is truncated
+    # and no single long name widens every cell; Python strings by design.
+    assert rgg["names"].dtype[groups[0]].kind == "O"
 
 
 # ---------------------------------------------------------------------------

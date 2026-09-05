@@ -254,15 +254,12 @@ def test_pts_rest_with_unlabelled_cells_matches_scanpy(synthetic_adata):
     _assert_frames_equal_to(rgg["pts_rest"], want_rest, 0.0)
 
 
-def test_pct_nz_survives_duplicate_var_names():
-    """AnnData permits duplicate `var_names`; `Series.reindex` on such an index
-    raises, so the lookup is a name map — first occurrence wins, one row per
-    DE row."""
+def _dup_adata():
     import anndata
 
     rng = np.random.default_rng(11)
     X = sp.csr_matrix(rng.poisson(1.0, size=(30, 4)).astype(np.float32))
-    adata = anndata.AnnData(
+    return anndata.AnnData(
         X=X,
         obs=pd.DataFrame(
             {"batch": pd.Categorical(["A", "B", "C"] * 10)},
@@ -270,21 +267,34 @@ def test_pct_nz_survives_duplicate_var_names():
         ),
         var=pd.DataFrame(index=["dup", "dup", "g2", "g3"]),
     )
+
+
+def test_pts_refuses_duplicate_var_names_on_write_and_on_extract():
+    """AnnData permits duplicate `var_names`, but a `pts` table indexed by them
+    cannot be joined by gene name without handing one gene's fraction to the
+    other (scanpy's merge multiplies the rows instead). Both ends refuse:
+    `rank_genes_groups(pts=True)` before writing, and the extractor when a
+    table with a duplicated index is already in `uns` (scanpy-written, say).
+    Without `pts` the duplicate names are as fine as they ever were."""
+    adata = _dup_adata()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # anndata's non-unique var_names warning
-        _rgg(adata, pts=True)
-        df = pyscx.accel.rank_genes_groups_df(adata, group="A")
-    assert len(df) == 4  # one row per DE row, not scanpy's multiplied merge
-    pts = adata.uns[KEY]["pts"]
-    first_dup = pts["A"].iloc[0]
-    for _, row in df.iterrows():
-        want = first_dup if row["names"] == "dup" else pts.loc[row["names"], "A"]
-        assert row["pct_nz_group"] == want
+        with pytest.raises(ValueError, match=r'unique var names.*"dup".*var_names_make_unique'):
+            _rgg(adata, pts=True)
+        _rgg(adata)  # pts=False: unaffected
+        assert len(pyscx.accel.rank_genes_groups_df(adata, group="A")) == 4
+        adata.uns[KEY]["pts"] = pd.DataFrame(
+            {g: np.zeros(4) for g in ("A", "B", "C")}, index=list(adata.var_names)
+        )
+        with pytest.raises(ValueError, match=r'\["pts"\] has a duplicated var name.*"dup"'):
+            pyscx.accel.rank_genes_groups_df(adata, group="A")
 
 
 def test_pct_nz_survives_gene_names_longer_than_200_characters(synthetic_adata):
     """`names` used to be a fixed `U200`, so a longer var name was truncated in
-    the structured array and missed the full-name `pts` index — a silent NaN."""
+    the structured array and missed the full-name `pts` index — a silent NaN.
+    It is object dtype now (scanpy's), which also means one long name does not
+    widen every cell of every group the way a fitted `U{max}` would."""
     adata = synthetic_adata.copy()
     long_name = "G" * 250
     names = list(adata.var_names)
@@ -292,11 +302,19 @@ def test_pct_nz_survives_gene_names_longer_than_200_characters(synthetic_adata):
     adata.var_names = names
     _rgg(adata, pts=True)
     rgg = adata.uns[KEY]
-    assert rgg["names"].dtype["A"].itemsize // 4 >= 250
+    assert rgg["names"].dtype["A"].kind == "O"
     assert long_name in list(rgg["names"]["A"])
     df = pyscx.accel.rank_genes_groups_df(adata, group="A").set_index("names")
     assert not np.isnan(df.loc[long_name, "pct_nz_group"])
     assert df.loc[long_name, "pct_nz_group"] == rgg["pts"].loc[long_name, "A"]
+
+
+def test_pct_nz_refuses_a_pts_rest_indexed_unlike_pts(synthetic_adata):
+    adata = synthetic_adata.copy()
+    _rgg(adata, pts=True)
+    adata.uns[KEY]["pts_rest"] = adata.uns[KEY]["pts_rest"].iloc[::-1]
+    with pytest.raises(ValueError, match="not indexed like"):
+        pyscx.accel.rank_genes_groups_df(adata, group="A")
 
 
 def test_pts_is_refused_with_stratify_by(synthetic_adata):
@@ -358,6 +376,29 @@ def test_groups_subset_matches_scanpy_groups(synthetic_adata):
         assert abs(p - sc_p[gene]) <= SCANPY_PVAL_ATOL
     _assert_frames_equal_to(rgg["pts"], rgg_sc["pts"], PTS_ATOL)
     _assert_frames_equal_to(rgg["pts_rest"], rgg_sc["pts_rest"], PTS_ATOL)
+
+
+def test_groups_refuses_a_named_group_with_fewer_than_two_cells(synthetic_adata):
+    """scanpy's rule for every participating group, applied here to the groups
+    the caller named (and a named reference). An omitted `groups=` keeps
+    today's NaN rows for empty / singlet levels — a pre-existing difference,
+    tracked separately, deliberately not pinned here."""
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[labels == "A"] = "B"
+    labels[0] = "A"  # exactly one A cell
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    with pytest.raises(ValueError, match="groups A since they only contain one sample"):
+        _rgg(adata, groups=["A"])
+    with pytest.raises(ValueError, match="groups A since they only contain one sample"):
+        _rgg(adata, groups=["B"], reference="A")
+    # A named group with two or more cells is fine.
+    rgg = _rgg(adata, groups=["B"])
+    assert rgg["names"].dtype.names == ("B",)
+    # An empty category named in `groups` is refused the same way.
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C", "D"])
+    with pytest.raises(ValueError, match="groups D since they only contain one sample"):
+        _rgg(adata, groups=["D", "B"])
 
 
 def test_groups_errors(synthetic_adata):

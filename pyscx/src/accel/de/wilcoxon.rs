@@ -130,6 +130,31 @@ pub(crate) fn run_rank_genes_groups_inner(
                      group {reference:?}"
                 )));
             }
+            // scanpy refuses any participating group with fewer than two cells
+            // ("… since they only contain one sample"). Applied to the groups the
+            // caller named — the tested ones and a named reference — so the new
+            // surface matches scanpy; an omitted `groups=` keeps today's NaN rows
+            // for empty / singlet levels (a pre-existing difference, tracked
+            // separately).
+            let mut sizes = vec![0usize; unique_groups.len()];
+            for &code in &groups {
+                if code < unique_groups.len() {
+                    sizes[code] += 1;
+                }
+            }
+            let too_small: Vec<&str> = tested
+                .iter()
+                .map(String::as_str)
+                .chain(named_reference)
+                .filter(|name| sizes[group_name_to_idx[*name]] < 2)
+                .collect();
+            if !too_small.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "Could not calculate statistics for groups {} since they only contain one \
+                     sample.",
+                    too_small.join(", ")
+                )));
+            }
             Some(tested)
         }
     };
@@ -187,6 +212,17 @@ pub(crate) fn run_rank_genes_groups_inner(
     // enters a kernel, so CSC-direct and the GPU drivers report the same
     // number as the dense CPU path.
     let pts_tables = if pts {
+        // The `pts` frame is indexed by var name and `rank_genes_groups_df`
+        // joins on it, so the names must be unique: with a duplicate, any
+        // by-name lookup would hand one gene's fraction to the other (and
+        // scanpy's own merge multiplies the rows). Refuse up front.
+        let mut seen = std::collections::HashSet::with_capacity(gene_names.len());
+        if let Some(dup) = gene_names.iter().find(|name| !seen.insert(name.as_str())) {
+            return Err(PyValueError::new_err(format!(
+                "pts=True needs unique var names but {dup:?} occurs more than once; run \
+                 adata.var_names_make_unique() first"
+            )));
+        }
         let counts =
             compute_group_nonzero_counts(py, &x, &groups, unique_groups.len(), gene_names.len())?;
         let fractions = counts.fractions(ref_idx);
@@ -222,8 +258,9 @@ pub(crate) fn run_rank_genes_groups_inner(
 /// from `x` in the same order the dispatcher recognises it: backed handle,
 /// lazy handle, scipy sparse, dense. The in-memory arms take an owned copy
 /// (the sanctioned way to read a buffer with the GIL released — see
-/// `crate::convert::owned_csr`); the streamed arms re-read the shards through
-/// the handle's LRU, which the DE pass just warmed.
+/// `crate::convert::owned_csr`); the streamed arms decode every shard again —
+/// the default four-shard LRU does not keep a full sequential scan resident, so
+/// this is a second read of `X`, not a cache hit.
 fn compute_group_nonzero_counts(
     py: Python<'_>,
     x: &Bound<'_, PyAny>,
@@ -1119,22 +1156,15 @@ fn write_de_to_adata(
     // Each row is one gene rank position.
     let build_structured =
         |field_data: &[Vec<String>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
-            // Fixed-width unicode sized to the longest emitted name, so no
-            // name is ever truncated: the `pts` frame is indexed by the full
-            // var names and `rank_genes_groups_df` joins the two by name — a
-            // fixed `U200` silently produced NaN for any gene named with more
-            // than 200 characters.
-            let width = field_data
-                .iter()
-                .flat_map(|col| col.iter().take(n_genes))
-                .map(|s| s.chars().count())
-                .max()
-                .unwrap_or(0)
-                .max(1);
-            let fmt = format!("U{width}");
+            // Object dtype, as scanpy writes it: no name is ever truncated (the
+            // `pts` frame is indexed by the full var names and
+            // `rank_genes_groups_df` joins the two by name — a fixed `U200`
+            // silently produced NaN past 200 characters) and no single long
+            // name widens every cell of every group (a fitted `U{max}` would
+            // have cost `4 × max_len × n_groups × n_genes` bytes).
             let dt_list = pyo3::types::PyList::empty(py);
             for gn in groups {
-                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), fmt.as_str()])?;
+                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "O"])?;
                 dt_list.append(tup)?;
             }
             let dtype = numpy.call_method1("dtype", (dt_list,))?;
@@ -1156,8 +1186,8 @@ fn write_de_to_adata(
     // that back — n_groups × n_genes objects per field, so a 30-group ×
     // 60k-gene run materialised millions of them purely in transit.
     //
-    // The `names` builder above keeps its `PyList`: its fixed-width `U` field
-    // genuinely needs Python strings.
+    // The `names` builder above keeps its `PyList`: its object field genuinely
+    // needs Python strings.
     let build_structured_f64 =
         |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
             let t_marshal = scx_accel::cpu_profile::start();

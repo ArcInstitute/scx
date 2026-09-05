@@ -246,32 +246,55 @@ fn extract_rank_genes_groups_df<'py>(
     let mut pct_nz_reference: Vec<f64> = Vec::new();
     // The `pts` frame is `genes × groups` in var order, not rank order and not
     // truncated by `n_genes`, so the per-row value is looked up by gene name —
-    // the join scanpy's `melt` + `merge` performs. Done through a Rust map
-    // rather than `Series.reindex`, which raises on a duplicated var index
-    // (AnnData permits duplicate `var_names`): with duplicates the first
-    // occurrence wins and each DE row stays one row, where scanpy's merge
-    // multiplies them. A name absent from the table gives NaN, as scanpy's
-    // extractor would leave no row at all.
-    let pct_by_name =
-        |table: &Bound<'py, PyAny>, g: &str| -> PyResult<std::collections::HashMap<String, f64>> {
-            let series = table.get_item(g)?;
-            let names: Vec<String> = series
-                .getattr("index")?
+    // the join scanpy's `melt` + `merge` performs. The index is read once (it is
+    // shared by every column and by `pts_rest`) and must be unique: on
+    // duplicated var names scanpy's merge multiplies rows, and any single-valued
+    // lookup would hand one gene's fraction to the other, so refuse rather than
+    // guess — `rank_genes_groups(pts=True)` refuses to write such a table too.
+    let pts_row_of: std::collections::HashMap<String, usize> = match &pts_table {
+        Some(table) => {
+            let index = table.getattr("index")?;
+            let names: Vec<String> = index
                 .call_method1("astype", ("str",))?
                 .call_method0("tolist")?
                 .extract()?;
-            let values: Vec<f64> = series.call_method0("tolist")?.extract()?;
             let mut map = std::collections::HashMap::with_capacity(names.len());
-            for (name, value) in names.into_iter().zip(values) {
-                map.entry(name).or_insert(value);
+            for (row, name) in names.into_iter().enumerate() {
+                if map.insert(name.clone(), row).is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "adata.uns[{key:?}][\"pts\"] has a duplicated var name {name:?}, so \
+                         pct_nz_group / pct_nz_reference cannot be joined by gene name; make \
+                         var_names unique (adata.var_names_make_unique()) before \
+                         rank_genes_groups(pts=True)"
+                    )));
+                }
             }
-            Ok(map)
-        };
+            if let Some(rest) = &pts_rest_table {
+                let same: bool = rest
+                    .getattr("index")?
+                    .call_method1("equals", (&index,))?
+                    .extract()?;
+                if !same {
+                    return Err(PyValueError::new_err(format!(
+                        "adata.uns[{key:?}][\"pts_rest\"] is not indexed like [\"pts\"]; the two \
+                         tables must share one var-name index"
+                    )));
+                }
+            }
+            map
+        }
+        None => std::collections::HashMap::new(),
+    };
     let gather_pct = |table: &Bound<'py, PyAny>, g: &str, kept: &[String]| -> PyResult<Vec<f64>> {
-        let map = pct_by_name(table, g)?;
+        let values: Vec<f64> = table.get_item(g)?.call_method0("tolist")?.extract()?;
         Ok(kept
             .iter()
-            .map(|name| map.get(name).copied().unwrap_or(f64::NAN))
+            .map(|name| {
+                pts_row_of
+                    .get(name)
+                    .and_then(|&row| values.get(row).copied())
+                    .unwrap_or(f64::NAN)
+            })
             .collect())
     };
 

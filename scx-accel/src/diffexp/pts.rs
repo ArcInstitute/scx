@@ -115,8 +115,12 @@ impl GroupNonzeroCounts {
                 groups.len()
             )));
         }
+        let Self { counts, total, .. } = self;
         for row in 0..n_rows {
             let g = groups[row_offset + row];
+            // Every row is in the total (scanpy's `~mask_g` rest); only a
+            // labelled row is in a group — decided once per row, not per value.
+            let mut group_row = (g < n_groups).then(|| &mut counts[g]);
             let start = csr.indptr[row] as usize;
             let end = csr.indptr[row + 1] as usize;
             for j in start..end {
@@ -130,11 +134,9 @@ impl GroupNonzeroCounts {
                         row_offset + row
                     )));
                 }
-                // Every row is in the total (scanpy's `~mask_g` rest); only a
-                // labelled row is in a group.
-                self.total[col] += 1;
-                if g < n_groups {
-                    self.counts[g][col] += 1;
+                total[col] += 1;
+                if let Some(row) = group_row.as_deref_mut() {
+                    row[col] += 1;
                 }
             }
         }
@@ -172,13 +174,15 @@ impl GroupNonzeroCounts {
             )));
         }
         let n_groups = self.n_groups();
+        let Self { counts, total, .. } = self;
         for (row, &g) in groups.iter().enumerate() {
+            let mut group_row = (g < n_groups).then(|| &mut counts[g]);
             let values = &data[row * n_vars..(row + 1) * n_vars];
             for (col, &v) in values.iter().enumerate() {
                 if v != 0.0 {
-                    self.total[col] += 1;
-                    if g < n_groups {
-                        self.counts[g][col] += 1;
+                    total[col] += 1;
+                    if let Some(row) = group_row.as_deref_mut() {
+                        row[col] += 1;
                     }
                 }
             }
@@ -224,10 +228,12 @@ impl GroupNonzeroCounts {
 
 /// Counts over a streamed shard source — the backed or lazy `X` the DE ran on.
 ///
-/// Walks every shard once through [`ShardSource::read_shard_arc`], so a
-/// caching source that the DE pass just warmed serves the second read from
-/// its LRU. `groups.len()` must be the source's `n_obs` (one label per
-/// *visible* row — a subset handle streams its view).
+/// Walks every shard once through [`ShardSource::read_shard_arc`]. This is a
+/// second decode of the matrix, not a cache hit: the default four-shard LRU
+/// holds the *last* shards the DE pass touched, so a fresh sequential scan
+/// starting at shard 0 evicts them before it gets there. `groups.len()` must be
+/// the source's `n_obs` (one label per *visible* row — a subset handle streams
+/// its view).
 pub fn group_nonzero_counts_streaming<S: ShardSource + ?Sized>(
     source: &S,
     groups: &[usize],

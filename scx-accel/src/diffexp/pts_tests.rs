@@ -22,7 +22,7 @@ fn dense_fixture() -> (Vec<f32>, Vec<usize>) {
         -1.0, 5.0, 0.0, 0.0,  // g1  (negative counts as expressing)
         0.0, 0.0, 0.0, 0.0,   // g1
         4.0, 4.0, 4.0, 0.0,   // g2
-        9.0, 9.0, 9.0, 9.0,   // unlabelled: must not count anywhere
+        9.0, 9.0, 9.0, 9.0,   // unlabelled: in no group, in every group's rest
     ];
     (data, vec![0, 0, 1, 1, 2, OOR])
 }
@@ -141,9 +141,10 @@ fn an_empty_group_is_nan_not_a_panic() {
     let f = got.fractions(None);
     assert!(f.pts[1].iter().all(|v| v.is_nan()));
     let rest = f.pts_rest.as_ref().unwrap();
-    // Its rest is every labelled cell: gene 0 nonzero in 2 of 2, gene 1 in 1 of 2.
+    // Its rest is every other row, here both: gene 0 nonzero in 2 of 2, gene 1
+    // in 1 of 2.
     assert_eq!(rest[1], vec![1.0, 0.5]);
-    // A group that IS every labelled cell has an empty rest: NaN as well.
+    // A group that IS every row has an empty rest: NaN as well.
     assert!(rest[0].iter().all(|v| v.is_nan()));
 }
 

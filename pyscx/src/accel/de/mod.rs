@@ -595,9 +595,10 @@ fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, grou
                 format!(
                     "{n_unlabelled} of {} cells have no group label in obs['{groupby}'] \
                      (NaN, empty, or a value outside the column's categories). They are \
-                     excluded from the test entirely — they are not part of 'rest' and not \
-                     part of the rank pool — matching scanpy, which subsets them out before \
-                     ranking. Drop or label them to silence this.",
+                     excluded from the test entirely — not part of 'rest' and not part of \
+                     the rank pool. That is pyscx's rule; scanpy 1.12 keeps such cells in its \
+                     1-vs-rest pool, so results differ from scanpy's on this input (pts_rest \
+                     follows scanpy). Drop or label them to silence this.",
                     groups.len()
                 ),
                 py.get_type::<pyo3::exceptions::PyUserWarning>(),

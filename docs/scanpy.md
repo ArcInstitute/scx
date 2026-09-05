@@ -2875,9 +2875,9 @@ df = pyscx.accel.rank_genes_groups_df(adata, group="0")  # + pct_nz_group, pct_n
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — NaN, empty, or a value outside the column's categories — are **excluded from the test entirely**: they are not part of a group, not part of `"rest"`, and not in the rank pool, matching scanpy, which subsets them out before ranking. A `UserWarning` reports how many were dropped. |
+| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — NaN, empty, or a value outside the column's categories — are **excluded from the test entirely**: they are not part of a group, not part of `"rest"`, and not in the rank pool. This is pyscx's rule — scanpy 1.12 keeps such cells in its 1-vs-rest pool, so on partially labelled `obs` the two differ (a pre-existing difference, tracked as a follow-up; `pts_rest` follows scanpy, see below). A `UserWarning` reports how many were dropped. |
 | `reference` | `"rest"` | Compare against a specific group or `"rest"` (1-vs-rest) |
-| `groups` | `None` (all) | Report only these groups, in this order. An **output** filter: the pool each group is compared against does not change, so a group's statistics are identical with or without it — and identical to scanpy's `groups=`. Unknown names, repeats and an empty list raise; the reference group is silently not tested (scanpy's rule) but stays a `pts` column. Compute is not reduced. |
+| `groups` | `None` (all) | Report only these groups, in this order. An **output** filter: the pool each group is compared against does not change, so a group's statistics are identical with or without it — and identical to scanpy's `groups=`. Unknown names, repeats and an empty list raise; the reference group is silently not tested (scanpy's rule) but stays a `pts` column; a named group (or the named reference) with fewer than two cells raises scanpy's "only contain one sample" error. Compute is not reduced. |
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
 | `pts` | `False` | Also write `uns[key]["pts"]` — and `["pts_rest"]` when `reference="rest"` — the fraction of cells in each group with a nonzero value, as scanpy does: `genes × groups` float64 DataFrames indexed by the analysed var names, over **every** gene whatever `n_genes` says. See below. |
@@ -2896,8 +2896,9 @@ Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
 per (group, gene) is made in a separate streaming pass over the analysed matrix
 — the same backed / lazy / scipy / dense source the test ran on — so every
 route reports the same number from the same code, CSC-direct and the GPU
-drivers included; `pts=True` costs one more read of `X` (LRU-warm on a backed
-handle) and nothing when off. "Expressing" is scanpy's `!= 0`: an explicit zero
+drivers included; `pts=True` costs one more read of `X` (a second decode pass
+on a backed handle — the default four-shard LRU does not keep a full
+sequential scan resident) and nothing when off. "Expressing" is scanpy's `!= 0`: an explicit zero
 stored in a scipy CSR is not counted, a negative value is. `pts_rest[g]` is
 scanpy's `X[~mask_g]` fraction — over **every other cell of the matrix**, cells
 with no `groupby` label included — so the table equals scanpy's on partially
@@ -2906,9 +2907,10 @@ out of its pool; that is a pre-existing pyscx difference from scanpy 1.12,
 tracked as a follow-up, and `pts` follows scanpy's tables rather than that
 pool.) `rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
 `reference="rest"`) `pct_nz_reference`, looked up by gene name, as
-`sc.get.rank_genes_groups_df` does; with duplicate `var_names` the first
-occurrence wins and each DE row stays one row (scanpy's merge would multiply
-them). **Limitation:** pyscx's `uns` writer has
+`sc.get.rank_genes_groups_df` does. Both refuse duplicate `var_names` (run
+`adata.var_names_make_unique()` first): a by-name join cannot tell two genes
+with one name apart, and scanpy's merge silently multiplies the rows instead.
+**Limitation:** pyscx's `uns` writer has
 no `pandas.DataFrame` encoding yet, so `pyscx.from_anndata` refuses an
 `AnnData` carrying `uns["rank_genes_groups"]["pts"]` (scanpy's own `pts=True`
 output included) — `del adata.uns["rank_genes_groups"]["pts"]` (and
