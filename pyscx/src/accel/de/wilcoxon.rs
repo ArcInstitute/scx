@@ -8,6 +8,37 @@ use super::*;
 use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
+/// scanpy's `pts` / `pts_rest` tables and the column order they are written in.
+pub(crate) struct PtsTables {
+    /// `pts` frame columns: every group of the label universe (reference
+    /// included, in category order), or the requested `groups` in request order
+    /// with the reference appended when one is named — scanpy's `groups_order`.
+    pub(crate) group_names: Vec<String>,
+    /// `[group][gene]`, parallel to `group_names`, over every analysed gene.
+    pub(crate) pts: Vec<Vec<f64>>,
+    /// `[group][gene]`; `None` when a reference group was named (scanpy emits
+    /// `pts_rest` only for `reference="rest"`).
+    pub(crate) pts_rest: Option<Vec<Vec<f64>>>,
+}
+
+/// One `rank_genes_groups` run: the result (already restricted to `groups=`
+/// when given), the analysed gene names, and the `pts` tables when asked for.
+pub(crate) struct RankGenesRun {
+    pub(crate) result: scx_accel::DiffExpResult,
+    pub(crate) gene_names: Vec<String>,
+    pub(crate) pts: Option<PtsTables>,
+}
+
+/// Resolve labels, reference and `groups=`, run the kernels, then apply the
+/// `groups=` output filter and the `pts` pass.
+///
+/// `requested_groups` restricts which groups are *reported*, never which cells
+/// take part: every group's statistic is computed against the same pool
+/// (1-vs-rest keeps every other labelled cell in "rest"; pairwise compares
+/// against the named reference; BH is per group), so a group's numbers are
+/// identical with or without the restriction — and identical to scanpy's,
+/// whose `groups=` works the same way. Relabelling the unselected groups as
+/// unlabelled before the kernel would have changed what "rest" means.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_rank_genes_groups_inner(
     py: Python<'_>,
@@ -22,10 +53,9 @@ pub(crate) fn run_rank_genes_groups_inner(
     gpu_device_id: Option<usize>,
     use_raw: bool,
     layer: Option<&str>,
-) -> PyResult<(scx_accel::DiffExpResult, Vec<String>)> {
-    let numpy = crate::pyimport::import_module(py, "numpy")?;
-    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
-
+    pts: bool,
+    requested_groups: Option<&[String]>,
+) -> PyResult<RankGenesRun> {
     // Extract group labels from adata.obs[groupby].
     let obs = adata.getattr("obs")?;
     let group_col = obs.get_item(groupby)?;
@@ -71,15 +101,56 @@ pub(crate) fn run_rank_genes_groups_inner(
         })?)
     };
 
+    // `groups=`: which groups are *reported*. Validated against the label
+    // universe now; applied to the result after the dispatch (see the doc
+    // above). The reference is never a tested group — scanpy drops it from the
+    // request silently and keeps it as a `pts` column, so do the same.
+    let named_reference = (reference != "rest").then_some(reference);
+    let tested_groups: Option<Vec<String>> = match requested_groups {
+        None => None,
+        Some(req) => {
+            validate_groups_request(req)?;
+            let mut tested = Vec::with_capacity(req.len());
+            for name in req {
+                if !unique_groups.iter().any(|g| g == name) {
+                    return Err(PyValueError::new_err(format!(
+                        "groups: {name:?} is not a level of adata.obs[{groupby:?}]; \
+                         available: {unique_groups:?}"
+                    )));
+                }
+                if named_reference == Some(name.as_str()) {
+                    continue;
+                }
+                tested.push(name.clone());
+            }
+            if tested.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "groups={req:?} leaves no group to test: it names only the reference \
+                     group {reference:?}"
+                )));
+            }
+            Some(tested)
+        }
+    };
+    // scanpy's `groups_order` for the `pts` frame: every level (reference in
+    // place) when nothing was requested, else the request plus the reference.
+    let pts_groups: Vec<String> = match requested_groups {
+        None => unique_groups.clone(),
+        Some(req) => {
+            let mut cols = req.to_vec();
+            if let Some(r) = named_reference {
+                if !cols.iter().any(|g| g == r) {
+                    cols.push(r.to_string());
+                }
+            }
+            cols
+        }
+    };
+
     // Select the input matrix + gene names per the use_raw/layer contract
     // (adata.X by default; adata.raw.X with raw var names for use_raw; a named
     // layer otherwise). The selected matrix flows through the same dispatch.
     let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
-
-    // Resolve the `"auto"` policy (§5.2) against the *selected* matrix: CSC-direct
-    // on CPU when a valid sidecar is present, else CSR; CSR on GPU (the planner
-    // routes gpu_csc_v3 from there). Explicit "csr"/"csc" pass through.
-    let prefer_format = resolve_de_format(prefer_format, gpu_device_id, &x);
 
     // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
     // adata.uns["log1p"], and so does pyscx.accel.log1p). When true, logFC uses
@@ -87,6 +158,141 @@ pub(crate) fn run_rank_genes_groups_inner(
     // annotation alone, with no value heuristic: scanpy keys off `uns` too, so
     // adding one here would create a divergence rather than close one.
     let log_transformed = crate::accel::util::uns_log1p_present(adata);
+
+    let mut result = dispatch_rank_genes_kernels(
+        py,
+        &x,
+        &gene_names,
+        &groups,
+        &unique_groups,
+        ref_idx,
+        log_transformed,
+        gene_chunk_size,
+        rankby_abs,
+        tie_correct,
+        prefer_format,
+        device,
+        gpu_device_id,
+    )?;
+
+    if let Some(tested) = &tested_groups {
+        result = result
+            .restrict_to_groups(tested)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    }
+
+    // `pts`: one more pass over the same matrix, counting nonzeros per
+    // (group, gene). Route-independent by construction — the count never
+    // enters a kernel, so CSC-direct and the GPU drivers report the same
+    // number as the dense CPU path.
+    let pts_tables = if pts {
+        let counts =
+            compute_group_nonzero_counts(py, &x, &groups, unique_groups.len(), gene_names.len())?;
+        let fractions = counts.fractions(ref_idx);
+        let column_of = |name: &String| -> usize {
+            unique_groups
+                .iter()
+                .position(|g| g == name)
+                .expect("pts column validated against the label universe above")
+        };
+        let pick = |table: &Vec<Vec<f64>>| -> Vec<Vec<f64>> {
+            pts_groups
+                .iter()
+                .map(|g| table[column_of(g)].clone())
+                .collect()
+        };
+        Some(PtsTables {
+            pts: pick(&fractions.pts),
+            pts_rest: fractions.pts_rest.as_ref().map(pick),
+            group_names: pts_groups,
+        })
+    } else {
+        None
+    };
+
+    Ok(RankGenesRun {
+        result,
+        gene_names,
+        pts: pts_tables,
+    })
+}
+
+/// Nonzero counts per (group, gene) over the matrix the DE ran on, derived
+/// from `x` in the same order the dispatcher recognises it: backed handle,
+/// lazy handle, scipy sparse, dense. The in-memory arms take an owned copy
+/// (the sanctioned way to read a buffer with the GIL released — see
+/// `crate::convert::owned_csr`); the streamed arms re-read the shards through
+/// the handle's LRU, which the DE pass just warmed.
+fn compute_group_nonzero_counts(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    group_codes: &[usize],
+    n_groups: usize,
+    n_vars: usize,
+) -> PyResult<scx_accel::GroupNonzeroCounts> {
+    let to_err = |e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string());
+    let counts = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        let source = backed.as_shard_source().with_cached_reads();
+        drop(backed);
+        py.detach(|| scx_accel::group_nonzero_counts_streaming(&source, group_codes, n_groups))
+            .map_err(to_err)?
+    } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
+        let source = lazy.as_shard_source().with_cached_reads();
+        drop(lazy);
+        py.detach(|| scx_accel::group_nonzero_counts_streaming(&source, group_codes, n_groups))
+            .map_err(to_err)?
+    } else {
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
+        let is_sparse = scipy_sparse
+            .call_method1("issparse", (x,))?
+            .extract::<bool>()?;
+        if is_sparse {
+            let csr = crate::convert::owned_csr(py, x, Some("rank_genes_groups(pts=True)"))?;
+            py.detach(|| scx_accel::group_nonzero_counts_csr(&csr, group_codes, n_groups))
+                .map_err(to_err)?
+        } else {
+            let (data, (n_obs, n_cols)) =
+                crate::convert::owned_dense2_f32(py, x, Some("rank_genes_groups(pts=True)"))?;
+            py.detach(|| {
+                scx_accel::group_nonzero_counts_dense(&data, n_obs, n_cols, group_codes, n_groups)
+            })
+            .map_err(to_err)?
+        }
+    };
+    if counts.n_vars() != n_vars {
+        return Err(PyRuntimeError::new_err(format!(
+            "pts: the analysed matrix has {} columns but {n_vars} gene names",
+            counts.n_vars()
+        )));
+    }
+    Ok(counts)
+}
+
+/// The kernel dispatch: pick the CPU / GPU, CSC-direct / CSR / in-memory arm
+/// for `x` and run it. Knows nothing about `groups=` or `pts`.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_rank_genes_kernels(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    gene_names: &[String],
+    groups: &[usize],
+    unique_groups: &[String],
+    ref_idx: Option<usize>,
+    log_transformed: bool,
+    gene_chunk_size: Option<usize>,
+    rankby_abs: bool,
+    tie_correct: bool,
+    prefer_format: &str,
+    device: &str,
+    gpu_device_id: Option<usize>,
+) -> PyResult<scx_accel::DiffExpResult> {
+    let numpy = crate::pyimport::import_module(py, "numpy")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
+
+    // Resolve the `"auto"` policy (§5.2) against the *selected* matrix: CSC-direct
+    // on CPU when a valid sidecar is present, else CSR; CSR on GPU (the planner
+    // routes gpu_csc_v3 from there). Explicit "csr"/"csc" pass through.
+    let prefer_format = resolve_de_format(prefer_format, gpu_device_id, x);
 
     if prefer_format == "csc" {
         if gpu_device_id.is_some() {
@@ -125,9 +331,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming_csc(
                         csc_reader.as_ref(),
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
+                        gene_names,
+                        groups,
+                        unique_groups,
                         ref_idx,
                         chunk_size,
                         log_transformed,
@@ -146,7 +352,7 @@ pub(crate) fn run_rank_genes_groups_inner(
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            return Ok((result, unique_groups));
+            return Ok(result);
         }
         if let Ok(lazy) = x.extract::<PyRef<crate::lazy_transform::ScxLazyTransformedDataset>>() {
             let lazy_src = lazy.as_column_source().ok_or_else(|| {
@@ -161,9 +367,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming_csc(
                         &lazy_src,
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
+                        gene_names,
+                        groups,
+                        unique_groups,
                         ref_idx,
                         chunk_size,
                         log_transformed,
@@ -182,7 +388,7 @@ pub(crate) fn run_rank_genes_groups_inner(
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            return Ok((result, unique_groups));
+            return Ok(result);
         }
         return Err(PyRuntimeError::new_err(
             "prefer_format='csc' requires adata.X to be a backed or lazy SCX \
@@ -243,9 +449,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                     scx_accel::wilcoxon_rank_sum_gpu(
                         device_id,
                         input,
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
+                        gene_names,
+                        groups,
+                        unique_groups,
                         ref_idx,
                         Some(chunk_size),
                         log_transformed,
@@ -260,9 +466,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming(
                         &source,
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
+                        gene_names,
+                        groups,
+                        unique_groups,
                         ref_idx,
                         chunk_size,
                         log_transformed,
@@ -301,9 +507,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                             scx_accel::wilcoxon_rank_sum_gpu(
                                 device_id,
                                 scx_accel::GpuDeShardInput::Lazy(&lazy_src),
-                                &gene_names,
-                                &groups,
-                                &unique_groups,
+                                gene_names,
+                                groups,
+                                unique_groups,
                                 ref_idx,
                                 Some(chunk_size),
                                 log_transformed,
@@ -314,7 +520,7 @@ pub(crate) fn run_rank_genes_groups_inner(
                         .map_err(|e: scx_accel::AccelError| {
                             PyRuntimeError::new_err(e.to_string())
                         })?;
-                    return Ok((result, unique_groups));
+                    return Ok(result);
                 }
             }
         }
@@ -334,9 +540,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                 .detach(|| {
                     scx_accel::wilcoxon_rank_sum_streaming(
                         &lazy_src,
-                        &gene_names,
-                        &groups,
-                        &unique_groups,
+                        gene_names,
+                        groups,
+                        unique_groups,
                         ref_idx,
                         chunk_size,
                         log_transformed,
@@ -355,11 +561,11 @@ pub(crate) fn run_rank_genes_groups_inner(
                     r
                 })
                 .map_err(|e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string()))?;
-            return Ok((result, unique_groups));
+            return Ok(result);
         }
 
         let is_sparse = scipy_sparse
-            .call_method1("issparse", (&x,))?
+            .call_method1("issparse", (x,))?
             .extract::<bool>()?;
 
         if is_sparse {
@@ -373,7 +579,7 @@ pub(crate) fn run_rank_genes_groups_inner(
             // `scx_engine::project_csr_row`; without this step the CPU
             // sparse path silently returns U = n_g·n_ref/2 for every gene
             // on inputs with unsorted CSRs (e.g. pbmc10k.h5ad).
-            let (csr_obj, _) = crate::convert::ensure_csr(py, &x, /* in_place */ false)?;
+            let (csr_obj, _) = crate::convert::ensure_csr(py, x, /* in_place */ false)?;
             let shape: (usize, usize) = csr_obj.getattr("shape")?.extract()?;
             let np = crate::pyimport::import_module(py, "numpy")?;
             let indptr: Vec<i64> = np
@@ -398,9 +604,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                         scx_accel::wilcoxon_rank_sum_gpu(
                             device_id,
                             scx_accel::GpuDeShardInput::Csr(&csr),
-                            &gene_names,
-                            &groups,
-                            &unique_groups,
+                            gene_names,
+                            groups,
+                            unique_groups,
                             ref_idx,
                             Some(chunk_size),
                             log_transformed,
@@ -415,9 +621,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                     .detach(|| {
                         scx_accel::wilcoxon_rank_sum_sparse(
                             &csr,
-                            &gene_names,
-                            &groups,
-                            &unique_groups,
+                            gene_names,
+                            groups,
+                            unique_groups,
                             ref_idx,
                             chunk_size,
                             log_transformed,
@@ -440,7 +646,7 @@ pub(crate) fn run_rank_genes_groups_inner(
         } else {
             // Dense numpy array: flatten and use direct wilcoxon_rank_sum
             let dense = numpy
-                .call_method1("asarray", (&x,))?
+                .call_method1("asarray", (x,))?
                 .call_method1("astype", ("float32",))?;
             let shape: (usize, usize) = dense.getattr("shape")?.extract()?;
             let (n_obs, n_vars) = shape;
@@ -457,9 +663,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                             &data,
                             n_obs,
                             n_vars,
-                            &gene_names,
-                            &groups,
-                            &unique_groups,
+                            gene_names,
+                            groups,
+                            unique_groups,
                             ref_idx,
                             log_transformed,
                             rankby_abs,
@@ -475,9 +681,9 @@ pub(crate) fn run_rank_genes_groups_inner(
                             &data,
                             n_obs,
                             n_vars,
-                            &gene_names,
-                            &groups,
-                            &unique_groups,
+                            gene_names,
+                            groups,
+                            unique_groups,
                             ref_idx,
                             log_transformed,
                             rankby_abs,
@@ -500,7 +706,7 @@ pub(crate) fn run_rank_genes_groups_inner(
         }
     };
 
-    Ok((result, unique_groups))
+    Ok(result)
 }
 
 /// Convert a DiffExpResult into a pandas DataFrame.
@@ -585,6 +791,25 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// ``layer`` is None, else ``False``. The resolved ``use_raw`` and ``layer`` are
 /// written to ``adata.uns["rank_genes_groups"]["params"]``.
 ///
+/// ``pts=True`` adds scanpy's ``uns[key]["pts"]`` — and ``["pts_rest"]`` when
+/// ``reference="rest"`` — as ``genes × groups`` DataFrames (float64, indexed by
+/// the analysed var names, every gene whatever ``n_genes`` says) of the fraction
+/// of cells in the group with a nonzero value; ``rank_genes_groups_df`` then
+/// appends ``pct_nz_group`` / ``pct_nz_reference``. It is one extra streaming
+/// pass over the matrix and is route-independent (CSC-direct and GPU included).
+/// ``pts_rest`` is over the *labelled* rest — the pool the statistic itself uses
+/// — which equals scanpy's whenever every cell carries a label. pyscx's uns
+/// writer has no DataFrame encoding yet, so drop the two keys before
+/// ``from_anndata``.
+///
+/// ``groups`` restricts which groups are *reported*, in the given order; the
+/// pool each group is compared against is unchanged, so its numbers equal the
+/// unrestricted run's and scanpy's ``groups=``. Unknown names, repeats and an
+/// empty list raise; the reference group is silently not tested (it stays a
+/// ``pts`` column). ``corr_method`` accepts only ``"benjamini-hochberg"`` and
+/// is recorded in ``params``; any other value raises instead of silently
+/// applying BH.
+///
 /// NOTE: the log-fold-change back-transform uses the ``adata.uns["log1p"]``
 /// flag, which describes ``X``. For the conventional case (``.raw`` /
 /// ``layer`` hold log-normalized data, like ``X``) this is correct; if ``.raw``
@@ -593,7 +818,7 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// ``is_log1p`` override) when analyzing a matrix whose transform state differs
 /// from ``X``.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="auto", device="auto", use_raw=None, layer=None))]
+#[pyo3(signature = (adata, groupby, reference="rest", n_genes=None, method="wilcoxon", gene_chunk_size=None, stratify_by=None, min_cells_per_stratum=50, rankby_abs=false, tie_correct=false, prefer_format="auto", device="auto", use_raw=None, layer=None, *, pts=false, groups=None, corr_method="benjamini-hochberg"))]
 #[allow(clippy::too_many_arguments)]
 pub fn rank_genes_groups(
     py: Python<'_>,
@@ -611,11 +836,35 @@ pub fn rank_genes_groups(
     device: &str,
     use_raw: Option<bool>,
     layer: Option<&str>,
+    pts: bool,
+    groups: Option<Vec<String>>,
+    corr_method: &str,
 ) -> PyResult<Py<PyAny>> {
     if method != "wilcoxon" {
         return Err(PyRuntimeError::new_err(format!(
             "unsupported method '{method}': only 'wilcoxon' is currently supported"
         )));
+    }
+    // Fail loud rather than silently fall back to BH: a caller who asked for
+    // Bonferroni and got BH-adjusted values would never find out from the
+    // output. scanpy's Bonferroni is `np.minimum(pvals * n_genes, 1.0)`.
+    if corr_method != "benjamini-hochberg" {
+        return Err(PyValueError::new_err(format!(
+            "corr_method={corr_method:?} is not supported: pyscx applies Benjamini-Hochberg \
+             only (scanpy's default), so pass corr_method=\"benjamini-hochberg\" or omit it. \
+             For Bonferroni compute np.minimum(uns[\"rank_genes_groups\"][\"pvals\"][group] * \
+             n_genes, 1.0) from the raw p-values."
+        )));
+    }
+    if pts && stratify_by.is_some() {
+        return Err(PyValueError::new_err(
+            "pts=True cannot be combined with stratify_by: the stratified path returns a \
+             DataFrame and writes no adata.uns[\"rank_genes_groups\"], which is where the pts / \
+             pts_rest tables live. Run per stratum without stratify_by, or drop pts.",
+        ));
+    }
+    if let Some(req) = &groups {
+        validate_groups_request(req)?;
     }
     if !matches!(prefer_format, "csr" | "csc" | "auto") {
         return Err(PyValueError::new_err(format!(
@@ -703,9 +952,11 @@ pub fn rank_genes_groups(
                 gpu_device_id,
                 resolved_use_raw,
                 layer,
+                false,
+                groups.as_deref(),
             ) {
-                Ok((result, _unique)) => {
-                    let df = de_result_to_dataframe(py, &result, n_genes)?;
+                Ok(run) => {
+                    let df = de_result_to_dataframe(py, &run.result, n_genes)?;
                     // Add stratum columns.
                     for (j, col_name) in strat_cols.iter().enumerate() {
                         df.set_item(col_name.as_str(), stratum.key[j].as_str())?;
@@ -741,7 +992,7 @@ pub fn rank_genes_groups(
     }
 
     // --- Non-stratified path (original behavior) ---
-    let (result, _unique_groups) = run_rank_genes_groups_inner(
+    let run = run_rank_genes_groups_inner(
         py,
         adata,
         groupby,
@@ -754,18 +1005,24 @@ pub fn rank_genes_groups(
         gpu_device_id,
         resolved_use_raw,
         layer,
+        pts,
+        groups.as_deref(),
     )?;
+    let result = &run.result;
 
     // Write results to adata.uns["rank_genes_groups"] in scanpy format.
     write_de_to_adata(
         py,
         adata,
-        &result,
+        result,
         groupby,
         reference,
         n_genes,
         resolved_use_raw,
         layer,
+        corr_method,
+        &run.gene_names,
+        run.pts.as_ref(),
     )?;
 
     // Record the accelerator execution route: both inside the scanpy-style
@@ -804,6 +1061,9 @@ fn write_de_to_adata(
     n_genes: Option<usize>,
     use_raw: bool,
     layer: Option<&str>,
+    corr_method: &str,
+    gene_names: &[String],
+    pts: Option<&PtsTables>,
 ) -> PyResult<()> {
     let numpy = crate::pyimport::import_module(py, "numpy")?;
     // The builder closures below iterate `result.group_names` (length n_groups)
@@ -850,6 +1110,7 @@ fn write_de_to_adata(
     params.set_item("method", "wilcoxon")?;
     params.set_item("use_raw", use_raw)?;
     params.set_item("layer", layer)?;
+    params.set_item("corr_method", corr_method)?;
 
     // Helper to build structured array (like scanpy's recarray format).
     // Scanpy stores e.g. names as a structured array with dtype like:
@@ -919,6 +1180,37 @@ fn write_de_to_adata(
     rgg.set_item("pvals", pvals)?;
     rgg.set_item("pvals_adj", pvals_adj)?;
     rgg.set_item("logfoldchanges", logfoldchanges)?;
+
+    // `pts` / `pts_rest`: scanpy's shape exactly — a `genes × groups` DataFrame
+    // indexed by the analysed var names (so `filter_rank_genes_groups`' `.loc`
+    // lookups work), float64, every gene regardless of `n_genes`. NOTE: pyscx's
+    // uns writer has no DataFrame encoding yet, so `from_anndata` refuses an
+    // adata carrying these two keys (scanpy's own `pts=True` output included);
+    // drop them before writing the file.
+    if let Some(tables) = pts {
+        let pd = crate::pyimport::import_module(py, "pandas")?;
+        let index = pyo3::types::PyList::new(py, gene_names)?;
+        let frame = |values: &[Vec<f64>]| -> PyResult<Bound<'_, PyAny>> {
+            let cols = PyDict::new(py);
+            for (name, col) in tables.group_names.iter().zip(values) {
+                if col.len() != gene_names.len() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "pts table for group {name:?} has {} entries but there are {} genes",
+                        col.len(),
+                        gene_names.len()
+                    )));
+                }
+                cols.set_item(name.as_str(), numpy::PyArray1::from_slice(py, col))?;
+            }
+            let kw = PyDict::new(py);
+            kw.set_item("index", &index)?;
+            pd.call_method("DataFrame", (cols,), Some(&kw))
+        };
+        rgg.set_item("pts", frame(&tables.pts)?)?;
+        if let Some(rest) = &tables.pts_rest {
+            rgg.set_item("pts_rest", frame(rest)?)?;
+        }
+    }
 
     let uns = adata.getattr("uns")?;
     uns.set_item("rank_genes_groups", rgg)?;

@@ -227,6 +227,25 @@ fn extract_rank_genes_groups_df<'py>(
     let mut logfoldchanges: Vec<f64> = Vec::new();
     let mut pvals: Vec<f64> = Vec::new();
     let mut pvals_adj: Vec<f64> = Vec::new();
+    // scanpy adds `pct_nz_group` / `pct_nz_reference` only when the matching
+    // `pts` / `pts_rest` table was written (`rank_genes_groups(pts=True)`), and
+    // there is no fallback for a missing `pts_rest` — a pairwise run has a
+    // `pct_nz_group` column and no `pct_nz_reference`.
+    let has_pts = rgg.contains("pts")?;
+    let has_pts_rest = has_pts && rgg.contains("pts_rest")?;
+    let mut pct_nz_group: Vec<f64> = Vec::new();
+    let mut pct_nz_reference: Vec<f64> = Vec::new();
+    // The `pts` frame is `genes × groups` in var order, not rank order and not
+    // truncated by `n_genes`, so the per-row value is looked up by gene name —
+    // the same join scanpy's `melt` + `merge` performs.
+    let gather_pct = |table: &str, g: &str, kept: &[String]| -> PyResult<Vec<f64>> {
+        let kept_list = pyo3::types::PyList::new(py, kept)?;
+        rgg.get_item(table)?
+            .get_item(g)?
+            .call_method1("reindex", (kept_list,))?
+            .call_method0("tolist")?
+            .extract()
+    };
 
     for g in &groups {
         let g_names = read_str("names", g)?;
@@ -279,6 +298,13 @@ fn extract_rank_genes_groups_df<'py>(
         if multi {
             col_group.extend(std::iter::repeat_n(g.clone(), names.len() - rows_before));
         }
+        if has_pts {
+            let kept = &names[rows_before..];
+            pct_nz_group.extend(gather_pct("pts", g, kept)?);
+            if has_pts_rest {
+                pct_nz_reference.extend(gather_pct("pts_rest", g, kept)?);
+            }
+        }
     }
 
     let dict = PyDict::new(py);
@@ -291,19 +317,20 @@ fn extract_rank_genes_groups_df<'py>(
     dict.set_item("pvals", pvals)?;
     dict.set_item("pvals_adj", pvals_adj)?;
 
-    let column_order: &[&str] = if multi {
-        &[
-            "group",
-            "names",
-            "scores",
-            "logfoldchanges",
-            "pvals",
-            "pvals_adj",
-        ]
-    } else {
-        &["names", "scores", "logfoldchanges", "pvals", "pvals_adj"]
-    };
-    build_de_dataframe(py, &dict, column_order, output)
+    let mut column_order: Vec<&str> = Vec::with_capacity(8);
+    if multi {
+        column_order.push("group");
+    }
+    column_order.extend(["names", "scores", "logfoldchanges", "pvals", "pvals_adj"]);
+    if has_pts {
+        dict.set_item("pct_nz_group", pct_nz_group)?;
+        column_order.push("pct_nz_group");
+        if has_pts_rest {
+            dict.set_item("pct_nz_reference", pct_nz_reference)?;
+            column_order.push("pct_nz_reference");
+        }
+    }
+    build_de_dataframe(py, &dict, &column_order, output)
 }
 
 /// Differential-expression DataFrame — **two modes**, selected by which kwarg
@@ -457,7 +484,7 @@ pub fn rank_genes_groups_df(
     };
     // `rank_genes_groups_df` is the cell-eval-style entry; CSC dispatch
     // is reserved for the scanpy-style `rank_genes_groups`. Pin to CSR.
-    let (result, _unique_groups) = run_rank_genes_groups_inner(
+    let run = run_rank_genes_groups_inner(
         py,
         adata,
         groupby,
@@ -470,7 +497,10 @@ pub fn rank_genes_groups_df(
         gpu_device_id,
         false, // use_raw: this cell-eval bridge is X-only
         None,  // layer
+        false, // pts: cell-eval's DEResults schema has no fraction-expressing column
+        None,  // groups: every group, as the schema consumers expect
     )?;
+    let result = run.result;
 
     // Record the accelerator execution route on adata.uns; the returned
     // polars DataFrame carries no metadata of its own. `result.exec_info` is

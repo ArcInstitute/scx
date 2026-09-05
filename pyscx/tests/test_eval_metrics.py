@@ -58,6 +58,37 @@ class TestPseudobulkMeans:
                 err_msg=f"Means mismatch for group {group}"
             )
 
+    def test_groupby_accepts_a_list_and_a_multi_column_key(self):
+        """S15: `groupby` takes `str | list[str]` like `pseudobulk_dex`. One
+        column in a list is the str form exactly; several columns key by the
+        per-cell tuple and name each group as a tuple of str."""
+        import pandas as pd
+
+        import pyscx
+
+        adata = self._make_adata()
+        adata.obs["donor"] = ["d1", "d2"] * (adata.n_obs // 2)
+
+        means_str, groups_str = pyscx.accel.pseudobulk_means(adata, "perturbation")
+        means_list, groups_list = pyscx.accel.pseudobulk_means(adata, ["perturbation"])
+        assert groups_list == groups_str
+        np.testing.assert_array_equal(means_list, means_str)
+
+        means, groups = pyscx.accel.pseudobulk_means(adata, ["perturbation", "donor"])
+        assert len(groups) == 10 and means.shape == (10, adata.n_vars)
+        assert all(isinstance(g, tuple) and len(g) == 2 for g in groups)
+        assert groups == sorted(groups)
+        X_dense = adata.X.toarray()
+        key = pd.Series(list(zip(adata.obs["perturbation"], adata.obs["donor"])))
+        for i, g in enumerate(groups):
+            mask = (key == g).to_numpy()
+            np.testing.assert_allclose(means[i], X_dense[mask].mean(axis=0), atol=1e-6)
+
+        with pytest.raises(ValueError, match="groupby must be an obs column name"):
+            pyscx.accel.pseudobulk_means(adata, ["perturbation", 1])
+        with pytest.raises(ValueError, match="groupby column 'nope' not found"):
+            pyscx.accel.pseudobulk_means(adata, ["perturbation", "nope"])
+
     def test_min_cells_filter(self):
         """Groups with too few cells should be excluded."""
         import pyscx

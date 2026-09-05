@@ -181,27 +181,34 @@ fn agg_dense(
 ///
 /// Args:
 ///     adata: AnnData object with X and obs columns for groupby
-///     groupby: Column name in adata.obs to group by (e.g., "perturbation")
+///     groupby: obs column name (e.g. "perturbation") or a list of column names
+///         whose per-cell tuple defines a group (e.g. ["perturbation", "donor"]),
+///         the same `str | list[str]` `pseudobulk_dex` takes.
 ///     min_cells_per_group: Skip groups with fewer cells (default: 1)
 ///
 /// Returns:
 ///     Tuple of (means, group_names):
 ///     - means: numpy array of shape [P, G] (float64) — per-group mean expression
-///     - group_names: list of str — group names in order
+///     - group_names: group labels in row order, sorted lexicographically — a
+///       list of str for one groupby column, a list of str tuples (one entry
+///       per column) for several.
 ///
 /// Example:
 ///     means, groups = pyscx.accel.pseudobulk_means(adata, "perturbation")
 ///     # means.shape == (n_perturbations, n_genes)
 ///     # groups == ["control", "drug_A", "drug_B", ...]
+///     means, groups = pyscx.accel.pseudobulk_means(adata, ["perturbation", "donor"])
+///     # groups == [("control", "d1"), ("control", "d2"), ("drug_A", "d1"), ...]
 #[pyfunction]
 #[pyo3(signature = (adata, groupby, min_cells_per_group=1, device="auto"))]
 pub fn pseudobulk_means<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    groupby: &str,
+    groupby: &Bound<'py, PyAny>,
     min_cells_per_group: usize,
     device: &str,
 ) -> PyResult<Py<PyAny>> {
+    let groupby = crate::accel::pseudobulk::coerce_column_list("groupby", groupby)?;
     // Phase 2: GPU-accelerate the aggregation. Sparse X → gpu_csr, dense/obsm →
     // gpu_dense (route stamped GpuCsr either way — the op ran on GPU); CPU/auto-
     // on-CPU-host / non-gpu-build fall through to the CPU path.
@@ -228,7 +235,7 @@ pub fn pseudobulk_means<'py>(
     route.settle(pseudobulk_means_impl(
         py,
         adata,
-        groupby,
+        &groupby,
         min_cells_per_group,
         &gpu_dev,
     ))
@@ -241,7 +248,7 @@ pub fn pseudobulk_means<'py>(
 fn pseudobulk_means_impl<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
-    groupby: &str,
+    groupby: &[String],
     min_cells_per_group: usize,
     gpu_dev: &EvalGpuDev,
 ) -> PyResult<Py<PyAny>> {
@@ -253,20 +260,10 @@ fn pseudobulk_means_impl<'py>(
     // error. Refuse, as the other streaming accel ops do.
     crate::accel::reject_preserve_var_order(adata, "pseudobulk_means")?;
 
-    // Extract groupby column from adata.obs as Vec<String>.
-    let obs = adata.getattr("obs")?;
-    let col = obs.get_item(groupby).map_err(|_| {
-        PyValueError::new_err(format!(
-            "groupby column '{}' not found in adata.obs",
-            groupby
-        ))
-    })?;
-    let labels: Vec<String> = col
-        .call_method1("astype", ("str",))?
-        .call_method0("tolist")?
-        .extract()?;
-    let obs_groups = vec![labels];
-    let groupby_columns = vec![groupby.to_string()];
+    // One label vector per groupby column; the composite key over several
+    // columns is `scx_accel::build_group_mapping`'s, shared with pseudobulk_dex.
+    let obs_groups = crate::accel::pseudobulk::extract_obs_group_columns(adata, groupby)?;
+    let groupby_columns: Vec<String> = groupby.to_vec();
 
     // Get gene names.
     let var = adata.getattr("var")?;
@@ -389,18 +386,23 @@ fn pseudobulk_means_impl<'py>(
     let counts_array = numpy::PyArray::from_vec(py, result.counts).into_any();
     let means_2d = counts_array.call_method1("reshape", ((result.n_groups, result.n_vars),))?;
 
-    // Extract group names (first column of group_labels, since we only have
-    // one groupby column).
-    let group_names: Vec<String> = result.group_labels.iter().map(|l| l[0].clone()).collect();
+    // Group names: a plain str per group for one groupby column (the
+    // long-standing shape), a tuple of str per group for several — lossless,
+    // where a joined string could collide on a value containing the separator.
+    let group_names = if groupby_columns.len() == 1 {
+        let names: Vec<String> = result.group_labels.iter().map(|l| l[0].clone()).collect();
+        pyo3::types::PyList::new(py, &names)?.into_any()
+    } else {
+        let tuples = result
+            .group_labels
+            .iter()
+            .map(|labels| pyo3::types::PyTuple::new(py, labels))
+            .collect::<PyResult<Vec<_>>>()?;
+        pyo3::types::PyList::new(py, &tuples)?.into_any()
+    };
 
     // Return (means, group_names) tuple.
-    let tuple = pyo3::types::PyTuple::new(
-        py,
-        &[
-            means_2d.into_any(),
-            pyo3::types::PyList::new(py, &group_names)?.into_any(),
-        ],
-    )?;
+    let tuple = pyo3::types::PyTuple::new(py, &[means_2d.into_any(), group_names])?;
 
     Ok(tuple.into())
 }
@@ -474,10 +476,20 @@ pub(crate) fn compute_aligned_pseudobulk_means<'py>(
             (means_r, groups_r, means_p, groups_p, empty_genes)
         } else {
             // Use standard X-based pseudobulk means
-            let means_real_obj =
-                pseudobulk_means_impl(py, adata_real, pert_col, min_cells_per_group, gpu_dev)?;
-            let means_pred_obj =
-                pseudobulk_means_impl(py, adata_pred, pert_col, min_cells_per_group, gpu_dev)?;
+            let means_real_obj = pseudobulk_means_impl(
+                py,
+                adata_real,
+                &[pert_col.to_string()],
+                min_cells_per_group,
+                gpu_dev,
+            )?;
+            let means_pred_obj = pseudobulk_means_impl(
+                py,
+                adata_pred,
+                &[pert_col.to_string()],
+                min_cells_per_group,
+                gpu_dev,
+            )?;
 
             let real_tuple = means_real_obj.bind(py);
             let pred_tuple = means_pred_obj.bind(py);

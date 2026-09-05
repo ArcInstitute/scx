@@ -44,6 +44,56 @@ pub struct DiffExpResult {
     pub exec_info: crate::route::AccelExecutionInfo,
 }
 
+impl DiffExpResult {
+    /// Keep only the named groups, in the given order — scanpy's
+    /// `rank_genes_groups(groups=[...])` as an *output* filter.
+    ///
+    /// Every tested group's statistics are computed against the same pool
+    /// whether or not the caller asked for it (1-vs-rest keeps every other
+    /// labelled cell in "rest", pairwise compares against the named reference,
+    /// BH is per group), so selecting afterwards is numerically identical to
+    /// selecting before, and identical to scanpy — which is the point: a
+    /// kernel-level pre-filter would have changed what "rest" means.
+    ///
+    /// A name that is not in the result (a typo, or the reference group, which
+    /// is never a tested group) is an error; the caller decides which of those
+    /// to report and which to drop silently.
+    pub fn restrict_to_groups(self, order: &[String]) -> Result<DiffExpResult> {
+        let mut picks: Vec<usize> = Vec::with_capacity(order.len());
+        for name in order {
+            let idx = self
+                .group_names
+                .iter()
+                .position(|g| g == name)
+                .ok_or_else(|| {
+                    crate::AccelError::InvalidInput(format!(
+                        "restrict_to_groups: group {name:?} is not among the tested groups {:?}",
+                        self.group_names
+                    ))
+                })?;
+            if picks.contains(&idx) {
+                return Err(crate::AccelError::InvalidInput(format!(
+                    "restrict_to_groups: group {name:?} requested twice"
+                )));
+            }
+            picks.push(idx);
+        }
+        fn take<T: Clone>(rows: &[Vec<T>], picks: &[usize]) -> Vec<Vec<T>> {
+            picks.iter().map(|&i| rows[i].clone()).collect()
+        }
+        Ok(DiffExpResult {
+            group_names: picks.iter().map(|&i| self.group_names[i].clone()).collect(),
+            names: take(&self.names, &picks),
+            gene_indices: take(&self.gene_indices, &picks),
+            scores: take(&self.scores, &picks),
+            pvals: take(&self.pvals, &picks),
+            pvals_adj: take(&self.pvals_adj, &picks),
+            logfoldchanges: take(&self.logfoldchanges, &picks),
+            exec_info: self.exec_info,
+        })
+    }
+}
+
 /// Per-gene test result (before sorting/grouping).
 #[derive(Debug, Clone)]
 struct GeneTestResult {

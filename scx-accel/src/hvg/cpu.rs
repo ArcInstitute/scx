@@ -560,14 +560,14 @@ pub fn streaming_clip_square_sum_batched<S: ShardSource + Sync>(
 /// A simple in-memory `ShardSource` for testing.
 ///
 /// Lives at module scope rather than inside `mod tests` so the sibling
-/// `moments_golden` module can reuse it — the crate already carries five
+/// `moments_golden` module (and `diffexp::pts_tests`) can reuse it — the crate already carries five
 /// in-memory `ShardSource` doubles (`gene_score_tests`, `pflog_tests`,
 /// `fused::gpu`, and two in `pca::cpu`) and a sixth is not an improvement.
 #[cfg(test)]
-struct InMemorySource {
-    shards: Vec<scx_sparse::ScxCsr>,
-    n_obs: usize,
-    n_vars: usize,
+pub(crate) struct InMemorySource {
+    pub(crate) shards: Vec<scx_sparse::ScxCsr>,
+    pub(crate) n_obs: usize,
+    pub(crate) n_vars: usize,
 }
 
 #[cfg(test)]
