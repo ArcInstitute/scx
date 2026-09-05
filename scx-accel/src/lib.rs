@@ -91,9 +91,10 @@ pub use csc::{
 #[cfg(feature = "gpu")]
 pub use csc::{streaming_clip_square_sum_csc_with_device, streaming_mean_var_csc_with_device};
 pub use diffexp::{
-    finalize_pdex, merge_diff_exp_results, pdex_ref, pdex_ref_core, pdex_ref_sparse,
-    pdex_ref_streaming, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse, wilcoxon_rank_sum_streaming,
-    DiffExpResult, PdexRefResult,
+    finalize_pdex, group_nonzero_counts_csr, group_nonzero_counts_dense,
+    group_nonzero_counts_streaming, merge_diff_exp_results, pdex_ref, pdex_ref_core,
+    pdex_ref_sparse, pdex_ref_streaming, wilcoxon_rank_sum, wilcoxon_rank_sum_sparse,
+    wilcoxon_rank_sum_streaming, DiffExpResult, GroupNonzeroCounts, PdexRefResult,
 };
 pub use error::{AccelError, InvalidArgument, Result};
 #[cfg(feature = "gpu")]

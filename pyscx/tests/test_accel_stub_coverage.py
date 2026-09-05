@@ -15,6 +15,8 @@ Pure import + text check; no GPU required.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import pathlib
 import re
 
@@ -69,6 +71,8 @@ def test_user_facing_accelerators_have_stubs():
         # rank_genes_groups role contrast in its docstring — the stub is where a
         # user's editor surfaces both, so it must not be dropped.
         "pseudobulk_dex",
+        # S15 (PR G): gained the `str | list[str]` groupby and had no stub at all.
+        "pseudobulk_means",
     }
     missing = sorted(required - _stub_names())
     assert not missing, f"user-facing accelerators missing type stubs in accel.pyi: {missing}"
@@ -76,3 +80,54 @@ def test_user_facing_accelerators_have_stubs():
     runtime = _runtime_functions()
     absent = sorted(required - runtime)
     assert not absent, f"declared accelerators absent from pyscx.accel at runtime: {absent}"
+
+
+def _stub_parameters() -> dict[str, list[tuple[str, str]]]:
+    """`(name, kind)` per parameter of every explicit stub, in order.
+
+    `kind` is `inspect.Parameter`'s kind name so a stub that types a kwarg as
+    positional (or the reverse) is caught along with a missing / extra name.
+    """
+    pyi = pathlib.Path(pyscx.__file__).parent / "accel.pyi"
+    tree = ast.parse(pyi.read_text())
+    out: dict[str, list[tuple[str, str]]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+            continue
+        a = node.args
+        params: list[tuple[str, str]] = []
+        params += [(p.arg, "POSITIONAL_ONLY") for p in a.posonlyargs]
+        params += [(p.arg, "POSITIONAL_OR_KEYWORD") for p in a.args]
+        if a.vararg:
+            params.append((a.vararg.arg, "VAR_POSITIONAL"))
+        params += [(p.arg, "KEYWORD_ONLY") for p in a.kwonlyargs]
+        if a.kwarg:
+            params.append((a.kwarg.arg, "VAR_KEYWORD"))
+        out[node.name] = params
+    return out
+
+
+def test_accel_stub_signatures_match_runtime():
+    """Every explicit stub's parameter list is the runtime one.
+
+    The two tests above check *names* only, so a kwarg added on the Rust side
+    (PR G's `pts=` / `groups=` / `corr_method=`) could be missing from its
+    stub — invisible to a user's editor — without anything going red. This
+    compares names, order and keyword-only-ness against `inspect.signature`
+    of the pyo3 function (pure-Python helpers attached to the module are
+    checked the same way).
+    """
+    drift: list[str] = []
+    for name, stub_params in _stub_parameters().items():
+        fn = getattr(accel, name, None)
+        if fn is None:
+            continue  # test_no_dead_stubs_in_accel_pyi reports it
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            drift.append(f"{name}: runtime signature unavailable")
+            continue
+        runtime = [(p.name, p.kind.name) for p in sig.parameters.values()]
+        if runtime != stub_params:
+            drift.append(f"{name}:\n    stub    {stub_params}\n    runtime {runtime}")
+    assert not drift, "accel.pyi stubs drift from the runtime signatures:\n" + "\n".join(drift)

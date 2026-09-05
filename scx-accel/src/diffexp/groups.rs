@@ -7,15 +7,20 @@
 //!
 //! # Why unlabelled cells leave the comparison entirely
 //!
-//! scanpy's `rank_genes_groups` subsets the matrix to
-//! `adata.obs[groupby].isin(groups_order)` before it ranks anything, so an
-//! unlabelled cell is in no group, is **not** part of "rest", and is **not** in
-//! the rank pool. Reproducing that means one number — `labelled.len()` — has to
-//! be the rest denominator *and* the rank-pool size everywhere. Deriving them
+//! pyscx's rule: an unlabelled cell is in no group, is **not** part of "rest",
+//! and is **not** in the rank pool. One number — `labelled.len()` — has to be
+//! the rest denominator *and* the rank-pool size everywhere. Deriving them
 //! separately is what made the 1-vs-rest logFC wrong: the rest *numerator*
 //! excluded unlabelled cells while the rest *denominator* counted them, so
 //! every logFC in every group was inflated by
 //! `log2(n_obs − n1) − log2(n_labelled − n1)`.
+//!
+//! This is **not** what scanpy 1.12 does: it ranks the whole matrix and keeps
+//! NaN-labelled cells in every group's "rest" (verified on a probe whose scores
+//! change when the unlabelled row is removed). The parity pins compare against
+//! scanpy run on the *filtered* matrix, i.e. against pyscx's rule; the
+//! difference on partially labelled `obs` is a known, tracked divergence. Only
+//! `pts` / `pts_rest` (`super::pts`) follow scanpy's own tables.
 //!
 //! When no cell is unlabelled — the overwhelmingly common case — `labelled` is
 //! `0..n_obs`, `pool_pos == group_indices`, and every kernel is bit-identical

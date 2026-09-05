@@ -44,7 +44,25 @@ def rank_genes_groups(
     device: str = "auto",
     use_raw: bool | None = None,
     layer: str | None = None,
-) -> Any: ...
+    *,
+    pts: bool = False,
+    groups: list[str] | None = None,
+    corr_method: str = "benjamini-hochberg",
+) -> Any:
+    """scanpy-compatible Wilcoxon rank-sum DE, written to ``adata.uns["rank_genes_groups"]``.
+
+    ``pts=True`` adds scanpy's ``uns[key]["pts"]`` (and ``["pts_rest"]`` when
+    ``reference="rest"``): ``genes × groups`` DataFrames of the fraction of
+    cells with a nonzero value, indexed by var name, over every gene. It is
+    one extra streaming pass over ``X`` on every route. ``groups=`` restricts
+    which groups are *reported*, in the given order; "rest" is unchanged, so
+    each group's statistics equal the unrestricted run's (and scanpy's); a
+    named group (or named reference) with fewer than two cells raises, as in
+    scanpy. ``pts=True`` refuses duplicate ``var_names`` (its table is joined
+    by name). ``corr_method`` accepts only ``"benjamini-hochberg"`` (recorded
+    in ``params``); any other value raises rather than silently applying BH.
+    """
+    ...
 
 
 def rank_genes_groups_df(
@@ -70,7 +88,9 @@ def rank_genes_groups_df(
     ``group=`` is the scanpy ``sc.get.rank_genes_groups_df`` alias: extracts the
     precomputed ``adata.uns[key]`` (no recompute) and returns scanpy's columns
     (``names, scores, logfoldchanges, pvals, pvals_adj``; a leading ``group``
-    column when ``group`` is a list). ``pval_cutoff``/``log2fc_min``/
+    column when ``group`` is a list; ``pct_nz_group`` / ``pct_nz_reference``
+    appended when ``uns[key]`` carries ``pts`` / ``pts_rest`` — i.e. after
+    ``rank_genes_groups(pts=True)``). ``pval_cutoff``/``log2fc_min``/
     ``log2fc_max`` are scanpy-style row filters for the extraction path.
     ``n_genes`` is a pyscx extension (scanpy's extractor has none): top-N per
     group, before the filters. ``device`` is ignored in extract mode.
@@ -100,7 +120,7 @@ def highly_variable_genes(
 
 def pseudobulk_dex(
     adata: Any,
-    groupby: list[str] | None = None,
+    groupby: str | list[str] | None = None,
     test_col: str | None = None,
     reference: str | None = None,
     design: str | None = None,
@@ -124,8 +144,8 @@ def pseudobulk_dex(
     here it names the columns that together define one pseudobulk *sample* —
     condition **plus** replicate, e.g. ``["disease", "donor_id"]`` — and the
     compared column is ``test_col``. ``sample_cols=`` and ``sample_key=`` are
-    aliases named for that role; both accept a bare string as well as a list.
-    Pass exactly one of the three.
+    aliases named for that role; all three accept a bare string as well as a
+    list. Pass exactly one of the three.
 
     ``groupby`` / ``test_col`` / ``reference`` are all semantically required —
     they are typed optional only because the aliases make ``groupby`` optional
@@ -155,7 +175,33 @@ def pdex_ref(
     output: str = "pandas",
     use_raw: bool | None = None,
     layer: str | None = None,
-) -> Any: ...
+    groups: list[str] | None = None,
+) -> Any:
+    """pdex ``mode="ref"`` DE: every ``groupby`` level vs ``reference``.
+
+    ``groups=`` restricts the tested targets to those levels, reported in that
+    order; each target's rows equal the unrestricted run's (a target is only
+    ever compared with the reference) while the work scales with the number
+    of targets asked for. Unknown names, repeats, an empty list and the
+    reference itself are errors. A pyscx extension over upstream pdex.
+    """
+    ...
+
+
+def pseudobulk_means(
+    adata: Any,
+    groupby: str | list[str],
+    min_cells_per_group: int = 1,
+    device: str = "auto",
+) -> tuple[Any, list[str] | list[tuple[str, ...]]]:
+    """Per-group mean expression: ``(means[P, G] float64, group_names)``.
+
+    ``groupby`` is one obs column or a list of columns whose per-cell tuple
+    defines a group (the same ``str | list[str]`` ``pseudobulk_dex`` takes).
+    ``group_names`` is sorted lexicographically: a list of ``str`` for one
+    column, a list of ``str`` tuples (one entry per column) for several.
+    """
+    ...
 
 
 def pdex_nb_glm(

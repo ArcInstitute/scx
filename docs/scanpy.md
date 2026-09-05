@@ -1848,12 +1848,12 @@ visible-gene totals — the same numbers `adata.obs["total_counts"]` and
 | `leiden`                 | ✓   | ✓¹  | `resolution`, `key_added`, `random_state`, `n_iterations`             | `device`, `parallel`, `theta`                  |
 | `harmony_integrate`      | ✓   | —   | `key`, `basis`, `theta`, `sigma`, `lamb`, `max_iter`                  | `adjusted_basis`, `block_size`, `n_clusters`, `alpha`, `max_iter_kmeans`, `random_state`, `device` |
 | `compute_lisi`           | ✓   | —   | `key`, `basis`, `perplexity`, `n_neighbors`, `approximate_knn`        | —                                              |
-| `rank_genes_groups`      | ✓   | ✓   | `groupby`, `reference`, `n_genes`, `method`                           | `gene_chunk_size`, `stratify_by`, `prefer_format`, `tie_correct`, `rankby_abs`, `device` |
-| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `is_log1p`, `geometric_mean`, `epsilon`, `cpm_filter`, `gene_chunk_size`, `prefer_format`, `device`, `output` |
-| `pseudobulk_dex`         | ✓   | —   | `design`, `reference` (**`groupby` is spelled the same but means the opposite** — sample-defining columns, not the compared one) | `test_col`, `sample_cols`/`sample_key` (aliases for `groupby`), `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
+| `rank_genes_groups`      | ✓   | ✓   | `groupby`, `groups`, `reference`, `n_genes`, `method`, `pts`, `corr_method` (BH only), `rankby_abs`, `tie_correct`, `use_raw`, `layer` | `gene_chunk_size`, `stratify_by`, `prefer_format`, `device` |
+| `pdex_ref`               | ✓   | ✓   | `groupby`, `reference`                                                | `groups`, `is_log1p`, `geometric_mean`, `epsilon`, `cpm_filter`, `gene_chunk_size`, `prefer_format`, `device`, `output`, `use_raw`, `layer` |
+| `pseudobulk_dex`         | ✓   | —   | `design`, `reference` (**`groupby` is spelled the same but means the opposite** — sample-defining columns, not the compared one; `str \| list[str]`) | `test_col`, `sample_cols`/`sample_key` (aliases for `groupby`), `aggr_method`, `stratify_by`, `prefer_format`, `backend`, `nbglm_options`, `gene_indices`, `n_cpus` |
 | `nb_glm`                 | ✓   | —   | — (no scanpy equivalent)                                             | `counts`, `design`, `contrast`                 |
 | `pdex_nb_glm`            | ✓   | —   | — (no scanpy equivalent)                                             | `groupby`, `reference`, `stratify_by`          |
-| `pseudobulk_means`       | ✓   | ✓   | — (no scanpy equivalent)                                             | `groupby`, `min_cells_per_group`, `device`     |
+| `pseudobulk_means`       | ✓   | ✓   | — (no scanpy equivalent)                                             | `groupby` (`str \| list[str]`), `min_cells_per_group`, `device` |
 | `perturbation_metrics`   | ✓   | ✓   | — (cell-eval metric)                                                 | `pert_col`, `control`, `metrics`, `min_cells_per_group`, `device` |
 | `energy_distance`        | ✓   | ✓²  | — (cell-eval metric)                                                 | `pert_col`, `control`, `metric`, `embed_key`, `backend`, `dtype`, `device` |
 | `discrimination_score`   | ✓   | —   | — (cell-eval metric)                                                 | `pert_col`, `control`, `metric`, `exclude_target_gene`, `embed_key` |
@@ -2861,18 +2861,29 @@ pyscx.accel.rank_genes_groups(adata, "leiden")
 #   adata.uns["rank_genes_groups"]["pvals"]             — raw p-values
 #   adata.uns["rank_genes_groups"]["pvals_adj"]         — BH-adjusted
 #   adata.uns["rank_genes_groups"]["logfoldchanges"]    — log2 FC
+#   adata.uns["rank_genes_groups"]["pts"]               — with pts=True: genes × groups
+#   adata.uns["rank_genes_groups"]["pts_rest"]          — with pts=True and reference="rest"
 
 # Downstream scanpy works identically:
 sc.pl.rank_genes_groups(adata, n_genes=20)
 df = sc.get.rank_genes_groups_df(adata, group="0")
+
+# Restrict the reported groups; fraction-expressing tables as scanpy writes them.
+pyscx.accel.rank_genes_groups(adata, "leiden", groups=["0", "3"], pts=True)
+df = pyscx.accel.rank_genes_groups_df(adata, group="0")  # + pct_nz_group, pct_nz_reference
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — NaN, empty, or a value outside the column's categories — are **excluded from the test entirely**: they are not part of a group, not part of `"rest"`, and not in the rank pool, matching scanpy, which subsets them out before ranking. A `UserWarning` reports how many were dropped. |
+| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — NaN, empty, or a value outside the column's categories — are **excluded from the test entirely**: they are not part of a group, not part of `"rest"`, and not in the rank pool. This is pyscx's rule — scanpy 1.12 keeps such cells in its 1-vs-rest pool, so on partially labelled `obs` the two differ (a pre-existing difference, tracked as a follow-up; `pts_rest` follows scanpy, see below). A `UserWarning` reports how many were dropped. |
 | `reference` | `"rest"` | Compare against a specific group or `"rest"` (1-vs-rest) |
+| `groups` | `None` (all) | Report only these groups, in this order. An **output** filter: the pool each group is compared against does not change, so a group's statistics are identical with or without it — and identical to scanpy's `groups=`. Unknown names, repeats and an empty list raise; the reference group is silently not tested (scanpy's rule) but stays a `pts` column; a named group (or the named reference) with fewer than two cells raises scanpy's "only contain one sample" error. Compute is not reduced. |
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
+| `pts` | `False` | Also write `uns[key]["pts"]` — and `["pts_rest"]` when `reference="rest"` — the fraction of cells in each group with a nonzero value, as scanpy does: `genes × groups` float64 DataFrames indexed by the analysed var names, over **every** gene whatever `n_genes` says. See below. |
+| `corr_method` | `"benjamini-hochberg"` | Recorded in `params`. Only BH is implemented; any other value (e.g. `"bonferroni"`) **raises** rather than silently applying BH. |
+| `use_raw` | `None` | Analyse `adata.raw.X` (with `adata.raw.var` names). `None` → `True` iff `adata.raw` exists and `layer` is `None` (scanpy's rule). Mutually exclusive with `layer`. |
+| `layer` | `None` | Analyse `adata.layers[layer]` instead of `X`. |
 | `rankby_abs` | `False` | Sort genes by absolute z-score instead of signed score. `False` (default) matches scanpy's default: highest positive z-score first. `True` ranks by significance regardless of direction. |
 | `tie_correct` | `False` | Apply the `Σ(t³−t)` tie correction to the Wilcoxon rank-sum variance estimate. The default `False` matches **scanpy's default** (`scanpy.tl.rank_genes_groups` takes the same parameter, also defaulting to `False`); `True` matches **scipy**, which always corrects. These are two different answers, not two precisions — see [Numerical parity](#numerical-parity-against-scanpy-and-scipy) below. |
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
@@ -2880,6 +2891,30 @@ df = sc.get.rank_genes_groups_df(adata, group="0")
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
 
 Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
+
+**`pts` is one extra pass, not a kernel change.** The count of nonzero values
+per (group, gene) is made in a separate streaming pass over the analysed matrix
+— the same backed / lazy / scipy / dense source the test ran on — so every
+route reports the same number from the same code, CSC-direct and the GPU
+drivers included; `pts=True` costs one more read of `X` (a second decode pass
+on a backed handle — the default four-shard LRU does not keep a full
+sequential scan resident) and nothing when off. "Expressing" is scanpy's `!= 0`: an explicit zero
+stored in a scipy CSR is not counted, a negative value is. `pts_rest[g]` is
+scanpy's `X[~mask_g]` fraction — over **every other cell of the matrix**, cells
+with no `groupby` label included — so the table equals scanpy's on partially
+labelled input as well. (The rank-sum statistic itself leaves unlabelled cells
+out of its pool; that is a pre-existing pyscx difference from scanpy 1.12,
+tracked as a follow-up, and `pts` follows scanpy's tables rather than that
+pool.) `rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
+`reference="rest"`) `pct_nz_reference`, looked up by gene name, as
+`sc.get.rank_genes_groups_df` does. Both refuse duplicate `var_names` (run
+`adata.var_names_make_unique()` first): a by-name join cannot tell two genes
+with one name apart, and scanpy's merge silently multiplies the rows instead.
+**Limitation:** pyscx's `uns` writer has
+no `pandas.DataFrame` encoding yet, so `pyscx.from_anndata` refuses an
+`AnnData` carrying `uns["rank_genes_groups"]["pts"]` (scanpy's own `pts=True`
+output included) — `del adata.uns["rank_genes_groups"]["pts"]` (and
+`"pts_rest"`) before writing the file. Tracked as a follow-up.
 
 ##### Numerical parity against scanpy and scipy
 
@@ -2928,6 +2963,11 @@ keyed by gene name:
 | `pvals` | 1.1e-16 | `1e-12` |
 | `pvals_adj` | 3.3e-16 | `1e-12` |
 | `logfoldchanges` (log1p'd input) | 2.3e-07 | `1e-6` |
+| `pts` / `pts_rest` (`pts=True`) | 0.0 | `1e-12` |
+
+`pts` is an exact integer count divided once, so the two implementations agree
+bit-for-bit (`pyscx/tests/test_rank_genes_groups_pts.py`); its bar is the
+division's, not a tolerance for a differing formula.
 
 The observed column is the pytest fixture's; the generator re-measures on a
 second, independent fixture and **fails** if any field there exceeds the same
@@ -2965,14 +3005,22 @@ the polars frame `cell_eval` (and upstream `pdex`) use.
 
 ```python
 df = pyscx.accel.pdex_ref(adata, "perturbation", reference="non-targeting")
-# Columns: target, feature, fold_change, p_value, fdr,
-#          log2_fold_change, abs_log2_fold_change
+# Columns (upstream pdex v0.2.x schema): target, feature, target_mean, ref_mean,
+#          target_membership, ref_membership, fold_change (= log2_fold_change,
+#          deprecated alias), log2_fold_change, percent_change, p_value,
+#          statistic, fdr
+
+# Test only these targets (rows equal the full run's, in this order):
+df = pyscx.accel.pdex_ref(adata, "perturbation", groups=["KO_1", "KO_7"])
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `groupby` | (required) | Column in `adata.obs` containing perturbation labels |
 | `reference` | `"non-targeting"` | Control group label |
+| `groups` | `None` (all) | Restrict the tested targets to these `groupby` levels, reported in this order. A target is only ever compared with the reference (MWU, pseudobulk fold change, per-target `cpm_filter`, per-target BH), so each selected target's rows equal the unrestricted run's, while the work — and GPU memory — scales with the number of targets asked for (the other levels' cells are dropped before the kernel). Unknown names, repeats, an empty list and the reference itself raise. A pyscx extension: upstream pdex has no such knob. |
+| `use_raw` | `None` | Analyse `adata.raw.X` (with `adata.raw.var` names); `None` → `True` iff `adata.raw` exists and `layer` is `None`. Recorded on `uns["scx_accel"]["pdex_ref"]`. |
+| `layer` | `None` | Analyse `adata.layers[layer]` instead of `X`. Mutually exclusive with `use_raw=True`. |
 | `is_log1p` | `None` | Whether input X is log1p-transformed. `None` auto-detects, layout-independently — a backed handle and an in-memory `AnnData` over the same data resolve the same mode. Order: `adata.uns["log1p"]` → a lazy `X`'s `Log1p` transform → a backed `X`'s catalog `value_max` against a `< 30` heuristic (catalog-only, no decode) → in-memory `max(X) < 30`. **Two cases raise `ValueError` instead of guessing**: a backed file whose catalog cannot bound its value range — shards that are float-encoded (the format records no range for those), carry no statistics, or hold no values — and a lazy `X` carrying a rescaling-only chain such as `normalize_total` (which detaches the values from the recorded range). Pass `True`/`False` to resolve either — or run `pyscx.accel.log1p`, which stamps `uns["log1p"]` and settles it. |
 | `geometric_mean` | `True` | Use geometric mean for fold-change computation |
 | `epsilon` | `1e-9` | Finite-guard pseudocount on count-space means before fold-/percent-change (not CPM/MWU). Default keeps outputs finite; `0/0 → 0.0`. Pass `0.0` for legacy `±inf` on reference-undetected genes. |
@@ -3207,6 +3255,11 @@ Group-by mean on sparse `X`. Foundation for the pairwise metrics below.
 means, groups = pyscx.accel.pseudobulk_means(adata, "perturbation")
 # means.shape == (n_perturbations, n_genes), dtype float64
 # groups == ["control", "drug_A", "drug_B", ...]  (sorted)
+
+# Several columns key by the per-cell tuple (the `str | list[str]` groupby
+# `pseudobulk_dex` takes); group names are then tuples, one entry per column:
+means, groups = pyscx.accel.pseudobulk_means(adata, ["perturbation", "donor"])
+# groups == [("control", "d1"), ("control", "d2"), ("drug_A", "d1"), ...]
 ```
 
 Streams directly from CSR shards with no full-matrix materialization. On
@@ -3561,7 +3614,9 @@ downstream (overlap@N, precision@N, pr_auc, etc.).
 > frame `cell_eval` consumes (it needs the `eval` extra). Calling it the scanpy way —
 > `pyscx.accel.rank_genes_groups_df(adata, group="0")` — does **not** recompute;
 > it extracts the precomputed `adata.uns["rank_genes_groups"]` and returns
-> scanpy's columns (`names, scores, logfoldchanges, pvals, pvals_adj`), a
+> scanpy's columns (`names, scores, logfoldchanges, pvals, pvals_adj`, plus
+> `pct_nz_group` / `pct_nz_reference` when `uns` carries `pts` / `pts_rest` —
+> i.e. after `rank_genes_groups(pts=True)`), a
 > drop-in for `sc.get.rank_genes_groups_df`. Use `groupby=` to recompute (cell-eval
 > columns), `group=` to extract (scanpy columns); pass one, not both. The scanpy
 > filters `pval_cutoff` / `log2fc_min` / `log2fc_max` apply to the `group=` path.

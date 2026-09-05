@@ -526,3 +526,17 @@ def test_pdex_ref_defaults_to_pandas():
     # Unknown output value is rejected.
     with pytest.raises(ValueError):
         pyscx.accel.pdex_ref(adata, "target", reference=REFERENCE, output="bogus")
+
+
+def test_pdex_ref_groups_matches_upstream_filtered_by_target():
+    """`groups=` is a pyscx extension (upstream has no knob), so the parity
+    oracle is upstream's full frame filtered to the requested targets — the
+    restricted call must reproduce those rows exactly, and nothing else."""
+    adata = _make_adata()
+    pdx_df = pdex_fn(adata, groupby="target", mode="ref", reference=REFERENCE, is_log1p=False)
+    pdx_sub = as_polars(pdx_df).filter(pl.col("target") == "ko_b")
+    scx_sub = pyscx.accel.pdex_ref(
+        adata, "target", reference=REFERENCE, is_log1p=False, groups=["ko_b"]
+    )
+    assert set(scx_sub["target"]) == {"ko_b"}
+    _assert_frames_close(scx_sub, pdx_sub)

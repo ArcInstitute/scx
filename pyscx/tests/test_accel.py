@@ -414,6 +414,8 @@ class TestRankGenesGroups:
         assert rgg["params"]["groupby"] == "batch"
         assert rgg["params"]["method"] == "wilcoxon"
         assert rgg["params"]["reference"] == "rest"
+        # scanpy's sixth params key; only BH is implemented, so it is always this.
+        assert rgg["params"]["corr_method"] == "benjamini-hochberg"
 
         # Names should be a structured array with group fields
         names = rgg["names"]
@@ -1459,6 +1461,26 @@ class TestPseudobulkDexSampleColumnAliases:
         )
         assert len(via_groupby) > 0, "fixture must produce fittable contrasts"
         pd.testing.assert_frame_equal(via_groupby, via_sample_cols)
+
+    def test_groupby_accepts_a_bare_string_like_its_aliases(self, replicate_adata):
+        """S15: `pseudobulk_means(groupby=str)` vs `pseudobulk_dex(groupby=list)`
+        was a both-ways asymmetry. `groupby` now takes `str | list[str]` through
+        the same coercion as the aliases, and a wrong element type names the
+        parameter instead of pyo3's `Can't extract 'str' to 'Vec'`.
+        """
+        import pyscx
+
+        # A one-column sample definition has no replication, so the NB-GLM
+        # refuses it downstream — a RuntimeError from the *model* proves the
+        # bare string resolved; a TypeError would mean it did not.
+        with pytest.raises(RuntimeError, match="replicate|contrast"):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), groupby="perturbation", **self._common()
+            )
+        with pytest.raises(ValueError, match="groupby must be an obs column name"):
+            pyscx.accel.pseudobulk_dex(
+                replicate_adata.copy(), groupby=["perturbation", 7], **self._common()
+            )
 
     def test_sample_key_accepts_a_bare_string(self, replicate_adata):
         """`sample_key="perturbation"` must resolve, not raise on the type.

@@ -224,17 +224,7 @@ pub(super) fn aggregate_pseudobulk(
     method: scx_accel::AggregationMethod,
     min_cells_per_group: usize,
 ) -> PyResult<scx_accel::PseudobulkResult> {
-    // Extract groupby columns from adata.obs.
-    let obs = adata.getattr("obs")?;
-    let mut obs_groups: Vec<Vec<String>> = Vec::with_capacity(groupby.len());
-    for col_name in groupby {
-        let col = obs.get_item(col_name.as_str())?;
-        let labels: Vec<String> = col
-            .call_method1("astype", ("str",))?
-            .call_method0("tolist")?
-            .extract()?;
-        obs_groups.push(labels);
-    }
+    let obs_groups = extract_obs_group_columns(adata, groupby)?;
 
     // Get gene names.
     let var = adata.getattr("var")?;
@@ -414,15 +404,41 @@ pub(super) fn aggregate_pseudobulk(
     Ok(result)
 }
 
-/// Coerce one alias value to a column list, accepting a bare string.
+/// Read the obs columns that define a pseudobulk group, one `Vec<String>` of
+/// per-cell labels per column (`astype("str")`, so categoricals and integers
+/// come out as their string form). The composite key over several columns is
+/// built downstream by `scx_accel::build_group_mapping`; this is the one
+/// extraction both `pseudobulk_dex` and `pseudobulk_means` go through.
+pub(crate) fn extract_obs_group_columns(
+    adata: &Bound<'_, PyAny>,
+    groupby: &[String],
+) -> PyResult<Vec<Vec<String>>> {
+    let obs = adata.getattr("obs")?;
+    let mut obs_groups: Vec<Vec<String>> = Vec::with_capacity(groupby.len());
+    for col_name in groupby {
+        let col = obs.get_item(col_name.as_str()).map_err(|_| {
+            PyValueError::new_err(format!(
+                "groupby column '{col_name}' not found in adata.obs"
+            ))
+        })?;
+        let labels: Vec<String> = col
+            .call_method1("astype", ("str",))?
+            .call_method0("tolist")?
+            .extract()?;
+        obs_groups.push(labels);
+    }
+    Ok(obs_groups)
+}
+
+/// Coerce a `str | list[str]` column argument to a column list.
 ///
-/// Both new spellings take `str`-or-list. pyo3 refuses `str` → `Vec<String>`
-/// (correctly — it would otherwise char-split), but the resulting
-/// `TypeError: argument 'sample_cols': Can't extract 'str' to 'Vec'` names
-/// neither the fix nor the sibling kwarg, which is precisely the unhelpful
-/// landing F8 exists to remove. So both aliases go through here instead of
-/// being typed `Vec<String>`.
-fn coerce_column_list(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+/// pyo3 refuses `str` → `Vec<String>` (correctly — it would otherwise
+/// char-split), but the resulting `TypeError: argument 'sample_cols': Can't
+/// extract 'str' to 'Vec'` names neither the fix nor the sibling kwarg, which
+/// is precisely the unhelpful landing F8 exists to remove. So `groupby`, the
+/// two aliases, and `pseudobulk_means`' `groupby` all go through here instead
+/// of being typed `Vec<String>`.
+pub(crate) fn coerce_column_list(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
     if let Ok(one) = value.extract::<String>() {
         return Ok(vec![one]);
     }
@@ -443,12 +459,12 @@ fn coerce_column_list(name: &str, value: &Bound<'_, PyAny>) -> PyResult<Vec<Stri
 /// columns that defines a pseudobulk sample (dogfood F8).
 ///
 /// These are three spellings of one parameter, so supplying more than one is a
-/// user error rather than something to merge. The two aliases accept a bare
-/// string as well as a list — `sample_key="donor_id"` is the exact spelling a
-/// user reaching for the replicate role types, so neither may raise on it.
-/// `groupby` keeps its pre-existing list-only typing.
+/// user error rather than something to merge. All three accept a bare string
+/// as well as a list — `sample_key="donor_id"` is the exact spelling a user
+/// reaching for the replicate role types, and `groupby="donor_id"` is what
+/// `pseudobulk_means(groupby="…")` had always taken, so none may raise on it.
 fn resolve_sample_columns(
-    groupby: Option<Vec<String>>,
+    groupby: Option<&Bound<'_, PyAny>>,
     sample_cols: Option<&Bound<'_, PyAny>>,
     sample_key: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Vec<String>> {
@@ -471,8 +487,8 @@ fn resolve_sample_columns(
         )));
     }
 
-    if let Some(cols) = groupby {
-        return Ok(cols);
+    if let Some(v) = groupby {
+        return coerce_column_list("groupby", v);
     }
     if let Some(v) = sample_cols {
         return coerce_column_list("sample_cols", v);
@@ -553,7 +569,7 @@ pub fn pseudobulk_dex(
     // the `sample_cols` / `sample_key` aliases makes `groupby` optional. So the
     // requirement is re-imposed below with messages that carry more than the
     // stock `TypeError: missing required argument` did.
-    groupby: Option<Vec<String>>,
+    groupby: Option<&Bound<'_, PyAny>>,
     test_col: Option<&str>,
     reference: Option<&str>,
     design: Option<&str>,
@@ -693,10 +709,11 @@ pub fn pseudobulk_dex(
             // Pass the *resolved* column list, never the raw aliases — the
             // recursion must not re-run alias resolution (and `sample_cols` /
             // `sample_key` are already folded into `groupby` at this point).
+            let groupby_list = pyo3::types::PyList::new(py, &groupby)?;
             match pseudobulk_dex(
                 py,
                 &sub_adata,
-                Some(groupby.clone()),
+                Some(groupby_list.as_any()),
                 Some(test_col),
                 Some(reference),
                 design,

@@ -26,11 +26,13 @@ fn run_pdex_ref_inner(
     gpu_device_id: Option<usize>,
     use_raw: bool,
     layer: Option<&str>,
+    requested_groups: Option<&[String]>,
 ) -> PyResult<scx_accel::PdexRefResult> {
     let numpy = crate::pyimport::import_module(py, "numpy")?;
     let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
 
-    let (groups, unique_groups, ref_idx) = resolve_groups_and_reference(adata, groupby, reference)?;
+    let (groups, unique_groups, ref_idx) =
+        resolve_groups_and_reference(adata, groupby, reference, requested_groups)?;
 
     // Select the input matrix + gene names per the use_raw/layer contract.
     let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
@@ -602,6 +604,13 @@ fn pdex_ref_result_to_dataframe<'py>(
 ///         with `layer`. Recorded on `adata.uns["scx_accel"]["pdex_ref"]`.
 ///     layer: Analyze `adata.layers[layer]` instead of `adata.X`. Mutually
 ///         exclusive with `use_raw=True`.
+///     groups: Restrict the tested targets to these `groupby` levels, reported
+///         in this order (default: every level except `reference`, in category
+///         order). Each selected target's row is identical to the unrestricted
+///         run's — a target is only ever compared with the reference — while the
+///         work (and GPU memory) scales with the number of targets asked for.
+///         Unknown names, repeats, an empty list, and the reference itself are
+///         errors. A pyscx extension: upstream pdex has no such knob.
 ///
 /// The accelerator execution route is recorded on
 /// ``adata.uns["scx_accel"]["pdex_ref"]`` (keys: ``route``,
@@ -611,7 +620,7 @@ fn pdex_ref_result_to_dataframe<'py>(
 /// fall back to ``"gpu_csr_v3"`` with ``fallback_reason == "no_csc_sidecar"``. Check
 /// ``route`` when comparing performance.
 #[pyfunction]
-#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="auto", device="auto", output="pandas", use_raw=None, layer=None))]
+#[pyo3(signature = (adata, groupby, *, reference="non-targeting", is_log1p=None, geometric_mean=true, epsilon=1e-9, cpm_filter=None, gene_chunk_size=None, prefer_format="auto", device="auto", output="pandas", use_raw=None, layer=None, groups=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pdex_ref(
     py: Python<'_>,
@@ -628,6 +637,7 @@ pub fn pdex_ref(
     output: &str,
     use_raw: Option<bool>,
     layer: Option<&str>,
+    groups: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
@@ -730,6 +740,7 @@ pub fn pdex_ref(
         gpu_device_id,
         resolved_use_raw,
         layer,
+        groups.as_deref(),
     )?;
     // Record the accelerator execution route on adata.uns["scx_accel"]["pdex_ref"].
     // `result.exec_info` is already complete (route + reason) from the single

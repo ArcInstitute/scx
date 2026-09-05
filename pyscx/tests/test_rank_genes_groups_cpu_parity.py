@@ -361,9 +361,11 @@ def test_rank_genes_groups_rest_with_unlabelled_matches_scanpy_on_log1p():
     `expm1` to the group means unconditionally (the `uns["log1p"]["base"]` entry
     only rescales it), so its logFC is only comparable to ours on log-space
     input — on raw counts scanpy warns and the two formulas legitimately differ.
-    `sc.tl.rank_genes_groups` drops NaN-label cells itself via
-    `obs[groupby].isin(groups_order)`, so scanpy-on-filtered is the same
-    computation scanpy-on-NaN would do.
+    scanpy is run on the *filtered* matrix on purpose: pyscx's rule is that
+    unlabelled cells take no part, and this pins that rule against scanpy's
+    numbers for the labelled cells alone. scanpy 1.12 itself keeps NaN-labelled
+    cells in its 1-vs-rest pool, so scanpy-on-NaN is a different computation —
+    a pre-existing divergence, tracked separately.
     """
     sc = pytest.importorskip("scanpy")
 

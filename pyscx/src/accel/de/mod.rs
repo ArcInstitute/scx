@@ -437,10 +437,22 @@ fn detect_is_log1p(
 
 /// Resolve group encoding and reference index, mirroring
 /// `run_rank_genes_groups_inner`.
+///
+/// `requested` (pdex_ref's `groups=`) restricts the *tested targets* before
+/// the kernel: the returned universe is `requested ++ [reference]` in request
+/// order and every other level's cells carry the unlabelled sentinel. That is
+/// exact, not an approximation — each target is compared with the reference
+/// alone (Mann-Whitney U, pseudobulk fold change, per-target CPM filter,
+/// per-target BH), so cells of an unselected target never entered a selected
+/// target's row in the first place. The kernels' `test_groups` become exactly
+/// the request, which is what shrinks the CPU work and the GPU footprint.
+/// The unlabelled-cell warning is computed against the *full* universe so it
+/// still counts only cells with no label at all.
 fn resolve_groups_and_reference(
     adata: &Bound<'_, PyAny>,
     groupby: &str,
     reference: &str,
+    requested: Option<&[String]>,
 ) -> PyResult<(Vec<usize>, Vec<String>, usize)> {
     let obs = adata.getattr("obs")?;
     let group_col = obs.get_item(groupby)?;
@@ -479,7 +491,58 @@ fn resolve_groups_and_reference(
     let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
     warn_unlabelled_cells(adata.py(), &groups, unique_groups.len(), groupby);
 
-    Ok((groups, unique_groups, ref_idx))
+    let Some(req) = requested else {
+        return Ok((groups, unique_groups, ref_idx));
+    };
+    validate_groups_request(req)?;
+    let mut restricted: Vec<String> = Vec::with_capacity(req.len() + 1);
+    for name in req {
+        if !group_name_to_idx.contains_key(name.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "groups: {name:?} is not a level of adata.obs[{groupby:?}]; available: \
+                 {unique_groups:?}"
+            )));
+        }
+        if name == reference {
+            return Err(PyValueError::new_err(format!(
+                "groups: {name:?} is the reference group and cannot also be a tested target"
+            )));
+        }
+        restricted.push(name.clone());
+    }
+    restricted.push(reference.to_string());
+    let restricted_ref = restricted.len() - 1;
+    // Full-universe code → restricted code; everything else (unselected levels
+    // and the already-unlabelled) → the new sentinel `restricted.len()`.
+    let oor = restricted.len();
+    let mut remap = vec![oor; unique_groups.len() + 1];
+    for (new_idx, name) in restricted.iter().enumerate() {
+        remap[group_name_to_idx[name.as_str()]] = new_idx;
+    }
+    let groups: Vec<usize> = groups.iter().map(|&c| remap[c]).collect();
+    Ok((groups, restricted, restricted_ref))
+}
+
+/// The shape checks a `groups=` request needs before any label is looked at:
+/// non-empty and free of repeats. Membership is checked where the label
+/// universe is known (`rank_genes_groups`' inner driver,
+/// [`resolve_groups_and_reference`] for `pdex_ref`).
+pub(crate) fn validate_groups_request(groups: &[String]) -> PyResult<()> {
+    if groups.is_empty() {
+        return Err(PyValueError::new_err(
+            "groups must name at least one group (got an empty list); omit it to test \
+             every group",
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(groups.len());
+    for name in groups {
+        if !seen.insert(name.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "groups lists {name:?} more than once"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Map string labels onto group indices, sending anything unrecognised to the
@@ -510,8 +573,9 @@ fn encode_group_labels(
 /// Tell the caller when cells were dropped for having no group label.
 ///
 /// Silently excluding rows changes what "rest" means, and an `obs` column with
-/// a handful of unannotated cells looks exactly like one without. scanpy makes
-/// the same exclusion; nothing anywhere reported it.
+/// a handful of unannotated cells looks exactly like one without. The exclusion
+/// is pyscx's rule (scanpy 1.12 keeps such cells in its 1-vs-rest pool — see
+/// `scx_accel::diffexp::groups`), and nothing anywhere reported it.
 fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, groupby: &str) {
     let n_unlabelled = groups.iter().filter(|&&g| g >= n_groups).count();
     if n_unlabelled == 0 {
@@ -532,9 +596,10 @@ fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, grou
                 format!(
                     "{n_unlabelled} of {} cells have no group label in obs['{groupby}'] \
                      (NaN, empty, or a value outside the column's categories). They are \
-                     excluded from the test entirely — they are not part of 'rest' and not \
-                     part of the rank pool — matching scanpy, which subsets them out before \
-                     ranking. Drop or label them to silence this.",
+                     excluded from the test entirely — not part of 'rest' and not part of \
+                     the rank pool. That is pyscx's rule; scanpy 1.12 keeps such cells in its \
+                     1-vs-rest pool, so results differ from scanpy's on this input (pts_rest \
+                     follows scanpy). Drop or label them to silence this.",
                     groups.len()
                 ),
                 py.get_type::<pyo3::exceptions::PyUserWarning>(),

@@ -227,6 +227,76 @@ fn extract_rank_genes_groups_df<'py>(
     let mut logfoldchanges: Vec<f64> = Vec::new();
     let mut pvals: Vec<f64> = Vec::new();
     let mut pvals_adj: Vec<f64> = Vec::new();
+    // scanpy adds `pct_nz_group` / `pct_nz_reference` only when the matching
+    // `pts` / `pts_rest` table was written (`rank_genes_groups(pts=True)`), and
+    // there is no fallback for a missing `pts_rest` — a pairwise run has a
+    // `pct_nz_group` column and no `pct_nz_reference`.
+    let pts_table = if rgg.contains("pts")? {
+        Some(rgg.get_item("pts")?)
+    } else {
+        None
+    };
+    let pts_rest_table = match &pts_table {
+        Some(_) if rgg.contains("pts_rest")? => Some(rgg.get_item("pts_rest")?),
+        _ => None,
+    };
+    let has_pts = pts_table.is_some();
+    let has_pts_rest = pts_rest_table.is_some();
+    let mut pct_nz_group: Vec<f64> = Vec::new();
+    let mut pct_nz_reference: Vec<f64> = Vec::new();
+    // The `pts` frame is `genes × groups` in var order, not rank order and not
+    // truncated by `n_genes`, so the per-row value is looked up by gene name —
+    // the join scanpy's `melt` + `merge` performs. The index is read once (it is
+    // shared by every column and by `pts_rest`) and must be unique: on
+    // duplicated var names scanpy's merge multiplies rows, and any single-valued
+    // lookup would hand one gene's fraction to the other, so refuse rather than
+    // guess — `rank_genes_groups(pts=True)` refuses to write such a table too.
+    let pts_row_of: std::collections::HashMap<String, usize> = match &pts_table {
+        Some(table) => {
+            let index = table.getattr("index")?;
+            let names: Vec<String> = index
+                .call_method1("astype", ("str",))?
+                .call_method0("tolist")?
+                .extract()?;
+            let mut map = std::collections::HashMap::with_capacity(names.len());
+            for (row, name) in names.into_iter().enumerate() {
+                if map.insert(name.clone(), row).is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "adata.uns[{key:?}][\"pts\"] has a duplicated var name {name:?}, so \
+                         pct_nz_group / pct_nz_reference cannot be joined by gene name; make \
+                         var_names unique (adata.var_names_make_unique()) before \
+                         rank_genes_groups(pts=True)"
+                    )));
+                }
+            }
+            if let Some(rest) = &pts_rest_table {
+                let same: bool = rest
+                    .getattr("index")?
+                    .call_method1("equals", (&index,))?
+                    .extract()?;
+                if !same {
+                    return Err(PyValueError::new_err(format!(
+                        "adata.uns[{key:?}][\"pts_rest\"] is not indexed like [\"pts\"]; the two \
+                         tables must share one var-name index"
+                    )));
+                }
+            }
+            map
+        }
+        None => std::collections::HashMap::new(),
+    };
+    let gather_pct = |table: &Bound<'py, PyAny>, g: &str, kept: &[String]| -> PyResult<Vec<f64>> {
+        let values: Vec<f64> = table.get_item(g)?.call_method0("tolist")?.extract()?;
+        Ok(kept
+            .iter()
+            .map(|name| {
+                pts_row_of
+                    .get(name)
+                    .and_then(|&row| values.get(row).copied())
+                    .unwrap_or(f64::NAN)
+            })
+            .collect())
+    };
 
     for g in &groups {
         let g_names = read_str("names", g)?;
@@ -279,6 +349,13 @@ fn extract_rank_genes_groups_df<'py>(
         if multi {
             col_group.extend(std::iter::repeat_n(g.clone(), names.len() - rows_before));
         }
+        if let Some(table) = &pts_table {
+            let kept = &names[rows_before..];
+            pct_nz_group.extend(gather_pct(table, g, kept)?);
+            if let Some(rest) = &pts_rest_table {
+                pct_nz_reference.extend(gather_pct(rest, g, kept)?);
+            }
+        }
     }
 
     let dict = PyDict::new(py);
@@ -291,19 +368,20 @@ fn extract_rank_genes_groups_df<'py>(
     dict.set_item("pvals", pvals)?;
     dict.set_item("pvals_adj", pvals_adj)?;
 
-    let column_order: &[&str] = if multi {
-        &[
-            "group",
-            "names",
-            "scores",
-            "logfoldchanges",
-            "pvals",
-            "pvals_adj",
-        ]
-    } else {
-        &["names", "scores", "logfoldchanges", "pvals", "pvals_adj"]
-    };
-    build_de_dataframe(py, &dict, column_order, output)
+    let mut column_order: Vec<&str> = Vec::with_capacity(8);
+    if multi {
+        column_order.push("group");
+    }
+    column_order.extend(["names", "scores", "logfoldchanges", "pvals", "pvals_adj"]);
+    if has_pts {
+        dict.set_item("pct_nz_group", pct_nz_group)?;
+        column_order.push("pct_nz_group");
+        if has_pts_rest {
+            dict.set_item("pct_nz_reference", pct_nz_reference)?;
+            column_order.push("pct_nz_reference");
+        }
+    }
+    build_de_dataframe(py, &dict, &column_order, output)
 }
 
 /// Differential-expression DataFrame — **two modes**, selected by which kwarg
@@ -457,7 +535,7 @@ pub fn rank_genes_groups_df(
     };
     // `rank_genes_groups_df` is the cell-eval-style entry; CSC dispatch
     // is reserved for the scanpy-style `rank_genes_groups`. Pin to CSR.
-    let (result, _unique_groups) = run_rank_genes_groups_inner(
+    let run = run_rank_genes_groups_inner(
         py,
         adata,
         groupby,
@@ -470,7 +548,10 @@ pub fn rank_genes_groups_df(
         gpu_device_id,
         false, // use_raw: this cell-eval bridge is X-only
         None,  // layer
+        false, // pts: cell-eval's DEResults schema has no fraction-expressing column
+        None,  // groups: every group, as the schema consumers expect
     )?;
+    let result = run.result;
 
     // Record the accelerator execution route on adata.uns; the returned
     // polars DataFrame carries no metadata of its own. `result.exec_info` is

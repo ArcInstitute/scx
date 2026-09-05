@@ -943,8 +943,8 @@ one worth reaching for on performance grounds. Both halves are **output-neutral*
   `PyArray1::from_vec` / `from_slice`; `write_neighbors_to_adata` takes its `KnnResult` by
   value so the buffers are *moved*, not copied. Smaller instances converted alongside in
   `pca.rs`, `harmony.rs`, `pseudobulk.rs`, `nb_glm.rs`, `de.rs` and `eval_metrics.rs`. The
-  `rank_genes_groups` `names` field keeps its `PyList` path — its `U200` dtype genuinely
-  needs Python strings.
+  `rank_genes_groups` `names` field keeps its `PyList` path — its object dtype (scanpy's,
+  so no name is truncated and no long name widens every cell) genuinely needs Python strings.
 
   **Dtype was the risk, not values.** `np.array(list[int])` is int64 whatever the Rust
   width, so the kNN `Vec<i32>` indices used to arrive as int64 and now arrive as int32 —

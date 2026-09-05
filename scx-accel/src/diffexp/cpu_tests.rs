@@ -2051,3 +2051,75 @@ fn rank_with_ties_pinned_degenerate_lengths() {
     assert!(ranks.is_empty());
     assert_eq!(tc, 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// DiffExpResult::restrict_to_groups — the `groups=` output filter
+// ---------------------------------------------------------------------------
+
+/// Three groups × three genes with distinct per-group profiles, so a
+/// mis-picked group would change every field.
+fn three_group_result() -> DiffExpResult {
+    let n_obs = 30;
+    let n_vars = 3;
+    let groups: Vec<usize> = (0..n_obs).map(|i| i / 10).collect();
+    let mut data = vec![0.0f32; n_obs * n_vars];
+    for i in 0..n_obs {
+        let g = groups[i];
+        data[i * n_vars + g] = 10.0 + (i % 10) as f32;
+        data[i * n_vars + (g + 1) % 3] = 1.0 + (i % 3) as f32;
+    }
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        false,
+        0,
+    )
+    .unwrap()
+}
+
+#[test]
+fn restrict_to_groups_reorders_and_drops_without_touching_values() {
+    let full = three_group_result();
+    let picked = full
+        .clone()
+        .restrict_to_groups(&["C".to_string(), "A".to_string()])
+        .unwrap();
+    assert_eq!(picked.group_names, vec!["C", "A"]);
+    for (out_idx, src_idx) in [(0usize, 2usize), (1, 0)] {
+        assert_eq!(picked.names[out_idx], full.names[src_idx]);
+        assert_eq!(picked.gene_indices[out_idx], full.gene_indices[src_idx]);
+        assert_eq!(picked.scores[out_idx], full.scores[src_idx]);
+        assert_eq!(picked.pvals[out_idx], full.pvals[src_idx]);
+        assert_eq!(picked.pvals_adj[out_idx], full.pvals_adj[src_idx]);
+        assert_eq!(picked.logfoldchanges[out_idx], full.logfoldchanges[src_idx]);
+    }
+    assert_eq!(picked.exec_info.route, full.exec_info.route);
+}
+
+#[test]
+fn restrict_to_groups_rejects_unknown_and_duplicate_names() {
+    let full = three_group_result();
+    let err = full
+        .clone()
+        .restrict_to_groups(&["A".to_string(), "Z".to_string()])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("\"Z\"") && err.contains("A") && err.contains("C"),
+        "{err}"
+    );
+    let err = full
+        .restrict_to_groups(&["A".to_string(), "A".to_string()])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("twice"), "{err}");
+}
