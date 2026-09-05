@@ -78,7 +78,7 @@ pub fn write_scx_to_h5ad(
     match reader.read_uns() {
         Ok(uns) => {
             let uns_group = file.create_group("uns")?;
-            write_uns_entries(&uns_group, &uns, 1)?;
+            write_uns_entries(&uns_group, &uns, 1, "", sink)?;
         }
         Err(scx_format_io::error::ScxError::SectionNotFound(_)) => {}
         Err(e) => return Err(e.into()),

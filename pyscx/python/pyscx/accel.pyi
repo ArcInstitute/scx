@@ -54,7 +54,9 @@ def rank_genes_groups(
     ``pts=True`` adds scanpy's ``uns[key]["pts"]`` (and ``["pts_rest"]`` when
     ``reference="rest"``): ``genes × groups`` DataFrames of the fraction of
     cells with a nonzero value, indexed by var name, over every gene. It is
-    one extra streaming pass over ``X`` on every route. ``groups=`` restricts
+    one extra streaming pass over ``X`` on every route, and both frames
+    round-trip through ``from_anndata`` / ``to_anndata`` and h5ad on the uns
+    ``pandas.DataFrame`` envelope. ``groups=`` restricts
     which groups are *reported*, in the given order; "rest" is unchanged, so
     each group's statistics equal the unrestricted run's (and scanpy's); a
     named group (or named reference) with fewer than two cells raises, as in

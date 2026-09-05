@@ -846,6 +846,268 @@ def test_from_anndata_uns_pandas_categorical_roundtrip(tmp_dir):
     assert s.name == "s"
 
 
+def _mixed_dtype_frame():
+    """A frame that exercises every column encoding the envelope supports.
+
+    Column order is deliberately not alphabetical, the index is named, and the
+    categorical is ordered — the three things the h5ad flatten path used to
+    lose.
+    """
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "zscore": np.array([1.5, np.nan, -2.0], dtype=np.float64),
+            "count": np.array([3, 0, 7], dtype=np.int64),
+            "flag": np.array([True, False, True]),
+            "label": np.array(["x", "y", "z"], dtype=object),
+            "grade": pd.Categorical(
+                ["hi", "lo", "hi"], categories=["lo", "hi"], ordered=True
+            ),
+        },
+        index=pd.Index(["g0", "g1", "g2"], name="gene"),
+    )
+
+
+def test_from_anndata_uns_dataframe_roundtrip(tmp_dir):
+    """A mixed-dtype DataFrame survives `from_anndata` -> `to_anndata`.
+
+    `assert_frame_equal`, not `==`: `==` on two frames returns a *frame*, which
+    is truthy-ambiguous rather than False, so an `assert a == b` here would
+    raise instead of comparing and a subtly wrong frame could never fail it.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = _mixed_dtype_frame()
+    adata = _adata_with_uns({"scores": df})
+
+    path = str(tmp_dir / "uns_frame.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    got = out.uns["scores"]
+    assert isinstance(got, pd.DataFrame)
+    pd.testing.assert_frame_equal(got, df, check_dtype=True)
+    # Column order is carried explicitly, not by JSON object order.
+    assert list(got.columns) == ["zscore", "count", "flag", "label", "grade"]
+    assert got.index.name == "gene"
+    assert got["grade"].cat.ordered is True
+
+
+def test_from_anndata_uns_dataframe_keeps_narrow_dtypes_exactly(tmp_dir):
+    """Narrow numeric columns keep their exact width on the SCX side.
+
+    Worth pinning separately from the mixed-dtype round trip because the h5ad
+    *export* deliberately widens these (int8/uint16 -> int32) to fit the nine
+    on-disk column encodings, exactly as obs and var already do. The SCX file
+    and every pyscx read are the lossless half of that pair, and this is the
+    test that says so.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame(
+        {
+            "i8": np.array([1, -2], dtype=np.int8),
+            "u2": np.array([7, 8], dtype=np.uint16),
+            "f4": np.array([1.5, 2.5], dtype=np.float32),
+        },
+        index=pd.Index(["r0", "r1"], name="i"),
+    )
+    path = str(tmp_dir / "narrow.scx")
+    pyscx.from_anndata(_adata_with_uns({"t": df}), path)
+    got = pyscx.open(path).to_anndata().uns["t"]
+
+    pd.testing.assert_frame_equal(got, df, check_dtype=True)
+    assert [str(d) for d in got.dtypes] == ["int8", "uint16", "float32"]
+
+
+def test_from_anndata_uns_dataframe_nulls_round_trip(tmp_dir):
+    """A missing categorical level and a missing object string both survive.
+
+    pandas spells "no value" three different ways across these dtypes — code
+    `-1`, `None`, `NaN` — and each takes a different branch of the encoder, so
+    a frame that only carried complete columns would leave all three untested.
+    An unlabelled cell in a `groupby` column is the everyday source.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame(
+        {
+            "cat": pd.Categorical(["a", None], categories=["a", "b"], ordered=True),
+            "obj": np.array(["x", None], dtype=object),
+            "num": np.array([1.0, np.nan], dtype=np.float64),
+        },
+        index=pd.Index(["r0", "r1"], name="i"),
+    )
+    path = str(tmp_dir / "nulls.scx")
+    pyscx.from_anndata(_adata_with_uns({"t": df}), path)
+    got = pyscx.open(path).to_anndata().uns["t"]
+
+    pd.testing.assert_frame_equal(got, df, check_dtype=True)
+    assert pd.isna(got["cat"].iloc[1])
+    assert got["obj"].iloc[1] is None
+    assert np.isnan(got["num"].iloc[1])
+    assert list(got["cat"].cat.categories) == ["a", "b"]
+    assert got["cat"].cat.ordered is True
+
+
+def test_from_anndata_uns_dataframe_preserves_columns_name(tmp_dir):
+    """`df.columns.name` has no home in the column list, so it rides its own key."""
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"a": [1, 2]}, index=["r0", "r1"])
+    df.columns.name = "group"
+    adata = _adata_with_uns({"t": df})
+
+    path = str(tmp_dir / "uns_frame_colname.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    assert out.uns["t"].columns.name == "group"
+
+
+def test_from_anndata_uns_empty_dataframe_roundtrips(tmp_dir):
+    """Zero columns and zero rows are both legal frames, not edge cases to refuse."""
+    import pandas as pd
+    import pyscx
+
+    no_cols = pd.DataFrame(index=pd.Index(["r0", "r1"], name="i"))
+    no_rows = pd.DataFrame({"a": np.array([], dtype=np.float64)}, index=pd.Index([], dtype=object))
+    adata = _adata_with_uns({"no_cols": no_cols, "no_rows": no_rows})
+
+    path = str(tmp_dir / "uns_frame_empty.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    pd.testing.assert_frame_equal(out.uns["no_cols"], no_cols, check_dtype=True)
+    pd.testing.assert_frame_equal(out.uns["no_rows"], no_rows, check_dtype=True)
+
+
+def test_from_anndata_uns_dataframe_nested_in_a_dict(tmp_dir):
+    """The shape that motivated the envelope: `uns[key]["pts"]`, scanpy's own."""
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"A": [0.25, 0.5]}, index=pd.Index(["g0", "g1"]))
+    adata = _adata_with_uns({"rank_genes_groups": {"pts": df, "params": {"method": "wilcoxon"}}})
+
+    path = str(tmp_dir / "uns_frame_nested.scx")
+    pyscx.from_anndata(adata, path)
+    out = pyscx.open(path).to_anndata()
+
+    pd.testing.assert_frame_equal(out.uns["rank_genes_groups"]["pts"], df, check_dtype=True)
+    assert out.uns["rank_genes_groups"]["params"]["method"] == "wilcoxon"
+
+
+def test_from_anndata_uns_dataframe_multiindex_raises(tmp_dir):
+    """A lossless MultiIndex envelope is a second design; refuse rather than flatten."""
+    import pandas as pd
+    import pyscx
+
+    mi = pd.MultiIndex.from_tuples([("a", 1), ("b", 2)], names=["l", "n"])
+    adata = _adata_with_uns({"t": pd.DataFrame({"x": [1, 2]}, index=mi)})
+
+    with pytest.raises(ValueError, match=r"MultiIndex"):
+        pyscx.from_anndata(adata, str(tmp_dir / "mi.scx"))
+
+
+def test_from_anndata_uns_dataframe_multiindex_columns_raises(tmp_dir):
+    """Both axes, not just the index."""
+    import pandas as pd
+    import pyscx
+
+    cols = pd.MultiIndex.from_tuples([("a", 1), ("b", 2)])
+    adata = _adata_with_uns({"t": pd.DataFrame([[1, 2], [3, 4]], columns=cols)})
+
+    with pytest.raises(ValueError, match=r"MultiIndex"):
+        pyscx.from_anndata(adata, str(tmp_dir / "mic.scx"))
+
+
+def test_from_anndata_uns_dataframe_extension_dtype_raises(tmp_dir):
+    """Nullable/extension dtypes have no lossless numpy spelling — name the column."""
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"ok": [1, 2], "nullable": pd.array([1, None], dtype="Int64")})
+    adata = _adata_with_uns({"t": df})
+
+    with pytest.raises(ValueError, match=r"nullable.*Int64|Int64.*nullable"):
+        pyscx.from_anndata(adata, str(tmp_dir / "ext.scx"))
+
+
+def test_from_anndata_uns_dataframe_duplicate_columns_raises(tmp_dir):
+    """`data` is a JSON object, so duplicate names would silently collapse."""
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame([[1, 2]], columns=["a", "a"])
+    adata = _adata_with_uns({"t": df})
+
+    with pytest.raises(ValueError, match=r"duplicate column name"):
+        pyscx.from_anndata(adata, str(tmp_dir / "dup.scx"))
+
+
+def test_from_anndata_uns_dataframe_non_string_columns_raises(tmp_dir):
+    """Column names key a JSON object, so they have to be strings."""
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({0: [1, 2], 1: [3, 4]})
+    adata = _adata_with_uns({"t": df})
+
+    with pytest.raises(ValueError, match=r"column name"):
+        pyscx.from_anndata(adata, str(tmp_dir / "nonstr.scx"))
+
+
+def test_from_anndata_uns_dataframe_extension_index_raises(tmp_dir):
+    """The index gets the same dtype check the columns get.
+
+    `Index.to_numpy()` on a nullable `Int64` does not fail — it coerces to
+    float64-with-NaN — so without an explicit check the index was the one part
+    of a frame that could be silently downgraded while the columns beside it
+    were refused. Found by Antigravity.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"a": [1, 2]}, index=pd.Index(pd.array([1, None], dtype="Int64")))
+    with pytest.raises(ValueError, match=r"index dtype Int64"):
+        pyscx.from_anndata(_adata_with_uns({"t": df}), str(tmp_dir / "extidx.scx"))
+
+
+def test_from_anndata_uns_dataframe_bytes_column_raises(tmp_dir):
+    """Bytes in an object column would come back as `str`.
+
+    pandas normalises a byte-string Series to `object`, so the column reached
+    the string walker, whose `PyBytes` arm UTF-8-decodes each element —
+    `[b"a", b"b"]` read back as `["a", "b"]`. A silent type change under a
+    mode whose contract is losslessness, and one the docs already said was
+    unsupported. Found by codex.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"b": np.array([b"a", b"b"], dtype=object)}, index=["r0", "r1"])
+    with pytest.raises(ValueError, match=r"bytes are not JSON-serializable"):
+        pyscx.from_anndata(_adata_with_uns({"t": df}), str(tmp_dir / "bytes.scx"))
+
+
+def test_from_anndata_uns_dataframe_error_names_the_column(tmp_dir):
+    """A refusal deep in a frame must say which column, not just which key."""
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"fine": [1, 2], "when": pd.to_datetime(["2020-01-01", "2020-01-02"])})
+    adata = _adata_with_uns({"tbl": df})
+
+    with pytest.raises(ValueError, match=r"uns\['tbl'\]\['when'\]"):
+        pyscx.from_anndata(adata, str(tmp_dir / "dt.scx"))
+
+
 def test_from_anndata_uns_bytes_raises(tmp_dir):
     """`bytes` are not JSON-serializable and should error explicitly in both modes."""
     import pyscx
@@ -1067,6 +1329,101 @@ def test_uns_at_max_depth_round_trips_but_one_deeper_raises(tmp_dir):
         pyscx.from_anndata(too_deep, str(tmp_dir / "over_cap.scx"), uns_format="tagged")
 
 
+def test_dataframe_at_max_depth_round_trips_but_one_deeper_raises(tmp_dir):
+    """A frame envelope costs *one* container level, like a tuple.
+
+    Its JSON is deeper than one level — frame -> "data" -> column envelope is
+    already three — so if the writer charged JSON depth instead, the frame
+    would be refused short of the cap. Numeric columns and a numeric index on
+    purpose: those encode to base64 and never enter the list walkers, which
+    have a budget of their own (see the next test).
+    """
+    import pandas as pd
+    import pyscx
+
+    cap = _probe_max_uns_depth(tmp_dir)
+
+    frame = pd.DataFrame(
+        {"z": np.array([1.5, 2.5], dtype=np.float64)},
+        index=pd.Index([10, 20], name="i"),
+    )
+
+    def wrap(n):
+        cur = frame
+        for _ in range(n):
+            cur = (cur,)
+        return cur
+
+    # uns dict (1) + `cap - 2` tuples + the frame (1) == cap containers.
+    ok = _adata_with_uns({"deep": wrap(cap - 2)})
+    path = str(tmp_dir / "frame_at_cap.scx")
+    pyscx.from_anndata(ok, path, uns_format="tagged")
+    back = pyscx.open(path).to_anndata()
+
+    cur = back.uns["deep"]
+    for _ in range(cap - 2):
+        cur = cur[0]
+    pd.testing.assert_frame_equal(cur, frame, check_dtype=True)
+
+    too_deep = _adata_with_uns({"deep": wrap(cap - 1)})
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(
+            too_deep, str(tmp_dir / "frame_over_cap.scx"), uns_format="tagged"
+        )
+
+
+def test_dataframe_with_object_leaf_draws_on_the_same_depth_budget(tmp_dir):
+    """An object/string leaf inside a frame costs a level, as it does anywhere.
+
+    `encode_ndarray_tagged` hands object and string arrays to
+    `pylist_to_string_json_array`, whose budget is *seeded* from the container
+    depth already spent — deliberately, so containers and array nesting cannot
+    sum past the cap between them. A frame is not an exemption from that: an
+    object-categorical column reaches one level deeper than a numeric one, so
+    such a frame's deepest legal position is one container higher.
+
+    Pinned because it is the difference between the frame envelope's JSON
+    depth (which the `scx-format` derivation bounds) and its *budget* cost
+    (which this bounds) — and reading either one for the other gives a wrong
+    answer about which trees write.
+    """
+    import pandas as pd
+    import pyscx
+
+    cap = _probe_max_uns_depth(tmp_dir)
+
+    frame = pd.DataFrame(
+        {"g": pd.Categorical(["a", "b"], categories=["a", "b"], ordered=True)},
+        index=pd.Index(["r0", "r1"], name="i"),
+    )
+
+    def wrap(n):
+        cur = frame
+        for _ in range(n):
+            cur = (cur,)
+        return cur
+
+    # One container shallower than the numeric frame above: uns dict (1) +
+    # `cap - 3` tuples + the frame (1) == cap - 1 containers, leaving the last
+    # level for the categories' string list.
+    ok = _adata_with_uns({"deep": wrap(cap - 3)})
+    path = str(tmp_dir / "cat_frame_at_cap.scx")
+    pyscx.from_anndata(ok, path, uns_format="tagged")
+    back = pyscx.open(path).to_anndata()
+
+    cur = back.uns["deep"]
+    for _ in range(cap - 3):
+        cur = cur[0]
+    pd.testing.assert_frame_equal(cur, frame, check_dtype=True)
+    assert cur["g"].cat.ordered is True
+
+    over = _adata_with_uns({"deep": wrap(cap - 2)})
+    with pytest.raises(ValueError, match=r"deeper than the maximum"):
+        pyscx.from_anndata(
+            over, str(tmp_dir / "cat_frame_over_cap.scx"), uns_format="tagged"
+        )
+
+
 def test_from_anndata_uns_object_array_of_deep_list_raises(tmp_dir):
     """An object-dtype ndarray reaches a *different* walker, also capped.
 
@@ -1273,6 +1630,23 @@ def test_from_anndata_uns_plain_mode_pandas_collapses(tmp_dir):
     assert out.uns["series"] == [10, 20, 30]
 
 
+def test_from_anndata_uns_plain_mode_dataframe_still_raises(tmp_dir):
+    """Plain mode's contract is "lossless or refuse".
+
+    `to_dict(orient="list")` would spell a frame in plain JSON, but it drops the
+    index and every dtype — so plain mode keeps refusing, exactly as it refuses
+    a non-finite float.
+    """
+    import pandas as pd
+    import pyscx
+
+    adata = _adata_with_uns({"t": pd.DataFrame({"a": [1, 2]})})
+    with pytest.raises(ValueError, match=r"uns_format='plain'"):
+        pyscx.from_anndata(
+            adata, str(tmp_dir / "frame_plain.scx"), uns_format="plain"
+        )
+
+
 def test_from_anndata_uns_plain_mode_nan_in_array_still_raises(tmp_dir):
     """Under `plain`, NaN inside an array still raises because the path
     goes through `.tolist()` → Python float → JSON."""
@@ -1378,6 +1752,7 @@ def test_from_anndata_uns_known_tag_with_missing_keys_treated_as_plain_dict(tmp_
         "fake_scalar": {"__scx_type__": "scalar"},
         "fake_categorical": {"__scx_type__": "categorical", "codes": [0, 1]},
         "fake_index": {"__scx_type__": "pandas.Index", "data": [1, 2]},
+        "fake_dataframe": {"__scx_type__": "pandas.DataFrame", "columns": ["a"]},
     }
     adata = _adata_with_uns(payloads)
     path = str(tmp_dir / "uns_collision.scx")

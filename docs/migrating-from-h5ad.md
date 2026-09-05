@@ -494,10 +494,17 @@ Headlines:
   including `None` scalars (round-trip as Python `None`, e.g.
   `uns['log1p']['base']`).
 - **Lossy / transformed (warns):** `X` and `obsp`/`varp` float64 → float32;
-  a dense `obsp`/`varp` is re-emitted as sparse (values identical).
+  a dense `obsp`/`varp` is re-emitted as sparse (values identical). A `uns`
+  pandas DataFrame is preserved as a real `pd.DataFrame` — index name, column
+  order and per-column dtypes intact — except for a column in one of anndata's
+  nullable encodings, which is left out with an
+  `UnsupportedUnsDataframeColumn` warning (an error under `strict_uns=true`).
+  Going the other way, a frame h5ad cannot spell is written whole as a raw
+  envelope subgroup with an `UnsExportedAsRawEnvelope` warning: anndata reads
+  it as a dict, and every value whose key HDF5 can carry is preserved (a key it
+  cannot — empty, or containing `/` — is dropped with `SkippedUnsKey`).
 - **Dropped (warns):** CSC/unsupported `obsp`/`varp`, pickled `uns` objects,
-  obs/var columns with an unsupported dtype, `uns` pandas DataFrames (kept as a
-  nested dict + a `FlattenedUnsDataframe` warning, not silently flattened), and
+  obs/var columns with an unsupported dtype, and
   **compound/structured `uns` arrays** — notably scanpy's `rank_genes_groups`
   (stored as a per-cluster recarray). Export DE results separately before
   converting (`sc.get.rank_genes_groups_df(...)` → CSV/Parquet); the skip emits a

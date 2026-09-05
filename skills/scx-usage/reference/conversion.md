@@ -41,9 +41,10 @@ from_h5ad(path, out, codec=None, shard_size=None, shard_obs="auto", csc=None,
   `SkippedColumn` (unreadable obs/var column), `SkippedObsm` (unreadable
   obsm/varm), `LayerSkipped` (unreadable / shape-mismatched layer),
   `DroppedObsp` (CSC or unsupported pairwise `obsp`/`varp` dropped — CSR and
-  dense are preserved as COO), `FlattenedUnsDataframe` (a `uns` pandas
-  DataFrame is kept as a nested dict, not reconstructed as a DataFrame). All
-  formerly-silent skips now warn. For the full preserved/lossy/dropped matrix
+  dense are preserved as COO), `UnsupportedUnsDataframeColumn` (one column of a
+  `uns` pandas DataFrame is in a nullable encoding with no lossless `uns` form
+  and is left out; the index, the column order and every other column are
+  intact). All formerly-silent skips now warn. For the full preserved/lossy/dropped matrix
   see [docs/api.md § Round-trip fidelity](../../../docs/api.md#round-trip-fidelity).
 - `reader_threads`: parallel streaming reader. `None` → `RAYON_NUM_THREADS` or
   `os.cpu_count()`; `1` forces sequential; `>1` requests rayon workers

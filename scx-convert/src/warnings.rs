@@ -24,12 +24,41 @@ pub enum ConvertWarning {
     InferredEncoding { path: String, inferred: String },
     /// An `uns` entry could not be represented and was skipped.
     SkippedUnsKey { key: String, reason: String },
-    /// A `uns` entry stored as a pandas DataFrame (`encoding-type ==
-    /// "dataframe"`) was preserved as a nested dict (per-column values +
-    /// `_index`) rather than reconstructed as a DataFrame. The column data
-    /// survives, but column order and per-column categorical dtypes are not
-    /// restored on read. Surfaces the structure loss so it is never silent.
-    FlattenedUnsDataframe { key: String },
+    /// One column of a `uns` pandas DataFrame had no lossless representation
+    /// and was left out of the reconstructed frame. The rest of the frame —
+    /// index, column order, every other column — is intact.
+    ///
+    /// Reached for anndata's nullable encodings (`nullable-integer`,
+    /// `nullable-boolean`, `nullable-string-array`) and for any column dtype
+    /// the `uns` envelope cannot spell. Ingest drops per column because there
+    /// is no fallback that keeps the column *and* the frame — unlike export,
+    /// which declines the whole frame precisely because its raw-envelope
+    /// fallback keeps everything (see [`Self::UnsExportedAsRawEnvelope`]).
+    ///
+    /// Under `strict_uns=true` the column's error is returned instead, so a
+    /// strict conversion cannot succeed with a truncated frame.
+    UnsupportedUnsDataframeColumn {
+        key: String,
+        column: String,
+        reason: String,
+    },
+
+    /// A `uns` pandas DataFrame could not be exported to h5ad as an anndata
+    /// dataframe group and was written as a raw `__scx_type__` envelope
+    /// subgroup instead — anndata reads that subgroup back as a nested dict, so
+    /// DataFrame consumers (`sc.tl.filter_rank_genes_groups`,
+    /// `sc.get.rank_genes_groups_df`) will not recognise it.
+    ///
+    /// The fallback keeps every value **whose key HDF5 can carry**. A column
+    /// named `"/evil"` or `""` has no HDF5 member spelling anywhere, so the
+    /// fallback drops it too, with its own [`Self::SkippedUnsKey`].
+    ///
+    /// Declining the whole frame rather than dropping the offending column is
+    /// deliberate: on export the fallback preserves everything, so dropping a
+    /// column would lose data the fallback would have kept. (Ingest has no such
+    /// fallback, which is why it drops per column instead — see
+    /// [`Self::UnsupportedUnsDataframeColumn`].)
+    UnsExportedAsRawEnvelope { key: String, reason: String },
     /// A `uns` entry stored as a scipy-sparse matrix (`encoding-type` ==
     /// `"csr_matrix"` / `"csc_matrix"` / `"coo_matrix"`) was preserved as a
     /// nested dict of `data` / `indices` / `indptr` arrays rather than
@@ -211,7 +240,8 @@ impl ConvertWarning {
         match self {
             Self::InferredEncoding { .. } => "inferred_encoding",
             Self::SkippedUnsKey { .. } => "skipped_uns_key",
-            Self::FlattenedUnsDataframe { .. } => "flattened_uns_dataframe",
+            Self::UnsupportedUnsDataframeColumn { .. } => "unsupported_uns_dataframe_column",
+            Self::UnsExportedAsRawEnvelope { .. } => "uns_exported_as_raw_envelope",
             Self::FlattenedUnsSparse { .. } => "flattened_uns_sparse",
             Self::MissingPresetIndexColumn { .. } => "missing_preset_index_column",
             Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
@@ -268,12 +298,23 @@ impl fmt::Display for ConvertWarning {
                     n = missing.len(),
                 )
             }
-            Self::FlattenedUnsDataframe { key } => write!(
+            Self::UnsupportedUnsDataframeColumn {
+                key,
+                column,
+                reason,
+            } => write!(
                 f,
-                "uns['{key}'] is a pandas DataFrame; it was preserved as a nested \
-                 dict (per-column values + `_index`) but not reconstructed as a \
-                 DataFrame — column order and per-column categorical dtypes are not \
-                 restored on read."
+                "uns['{key}'] column '{column}' has no lossless uns encoding \
+                 ({reason}); it was left out of the reconstructed DataFrame. The \
+                 index, the column order and every other column are intact."
+            ),
+            Self::UnsExportedAsRawEnvelope { key, reason } => write!(
+                f,
+                "uns['{key}'] could not be written as an h5ad DataFrame ({reason}); \
+                 it was exported as a raw envelope subgroup instead, which anndata \
+                 reads back as a nested dict. Every value whose key HDF5 can carry \
+                 is preserved; a key it cannot is dropped with its own \
+                 skipped_uns_key warning."
             ),
             Self::FlattenedUnsSparse { key, format } => write!(
                 f,

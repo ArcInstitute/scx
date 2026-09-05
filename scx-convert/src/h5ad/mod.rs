@@ -26,4 +26,5 @@ pub(crate) mod read;
 pub(crate) mod stream;
 pub(crate) mod stream_write;
 pub(crate) mod uns;
+pub(crate) mod uns_dataframe;
 pub(crate) mod write;

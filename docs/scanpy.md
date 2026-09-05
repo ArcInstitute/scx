@@ -2910,11 +2910,10 @@ pool.) `rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
 `sc.get.rank_genes_groups_df` does. Both refuse duplicate `var_names` (run
 `adata.var_names_make_unique()` first): a by-name join cannot tell two genes
 with one name apart, and scanpy's merge silently multiplies the rows instead.
-**Limitation:** pyscx's `uns` writer has
-no `pandas.DataFrame` encoding yet, so `pyscx.from_anndata` refuses an
-`AnnData` carrying `uns["rank_genes_groups"]["pts"]` (scanpy's own `pts=True`
-output included) — `del adata.uns["rank_genes_groups"]["pts"]` (and
-`"pts_rest"`) before writing the file. Tracked as a follow-up.
+Both frames survive `pyscx.from_anndata` → `to_anndata` and both h5ad
+directions: `uns` carries a `pandas.DataFrame` envelope preserving the index,
+the column order and per-column dtypes (see
+[docs/api.md § `uns` serialization](api.md#uns-serialization)).
 
 ##### Numerical parity against scanpy and scipy
 

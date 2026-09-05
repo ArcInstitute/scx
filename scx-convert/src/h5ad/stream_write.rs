@@ -256,7 +256,7 @@ pub fn write_scx_to_h5ad_streaming(
         Ok(mut uns) => {
             merge_export_provenance(&mut uns, export_note, sink);
             let uns_group = root.create_group("uns")?;
-            write_uns_entries_at(&uns_group, &uns)?;
+            write_uns_entries_at(&uns_group, &uns, sink)?;
         }
         // No uns section. Only materialise one when we actually have a filter
         // note to record, so unfiltered exports stay byte-identical.
@@ -264,7 +264,7 @@ pub fn write_scx_to_h5ad_streaming(
             if let Some(note) = export_note {
                 let uns = serde_json::json!({ EXPORT_PROVENANCE_KEY: note });
                 let uns_group = root.create_group("uns")?;
-                write_uns_entries_at(&uns_group, &uns)?;
+                write_uns_entries_at(&uns_group, &uns, sink)?;
             }
         }
         Err(e) => return Err(e.into()),
