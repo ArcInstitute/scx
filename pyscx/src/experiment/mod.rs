@@ -848,15 +848,30 @@ impl PyExperiment {
         let series_type = crate::pyimport::import_module(py, "pandas")?.getattr("Series")?;
         let labels: Option<Vec<String>> = if mask.is_instance(&series_type)? {
             let index = mask.getattr("index")?;
-            if index.get_type().name()? != "RangeIndex" {
+            let nlevels: usize = index.getattr("nlevels")?.extract()?;
+            if index.get_type().name()? == "RangeIndex" {
+                None
+            } else if nlevels > 1 {
+                // A MultiIndex compares as the composite key the key join
+                // builds: the levels' string forms joined by the separator.
+                let sep = scx_ops::COMPOSITE_KEY_SEPARATOR.to_string();
+                let rows: Vec<Vec<Bound<'_, PyAny>>> = index.call_method0("tolist")?.extract()?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let parts: Vec<String> = row
+                        .iter()
+                        .map(|x| x.str().map(|s| s.to_string()))
+                        .collect::<PyResult<_>>()?;
+                    out.push(parts.join(&sep));
+                }
+                Some(out)
+            } else {
                 Some(
                     index
                         .call_method1("astype", ("str",))?
                         .call_method0("tolist")?
                         .extract()?,
                 )
-            } else {
-                None
             }
         } else {
             None

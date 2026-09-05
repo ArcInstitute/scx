@@ -161,6 +161,21 @@ def _warn_if_deletions(src_path, out_fmt):
         pass
 
 
+def _mask_index_labels(index):
+    """The row labels a mask's pandas index names, for the order check, or None.
+
+    A RangeIndex names no rows. A MultiIndex compares as the composite key the
+    key join builds: the levels' string forms joined by ``"\\x1f"`` (the
+    ``COMPOSITE_KEY_SEPARATOR`` of the ops crate) — the same form the native
+    side materialises from the file's index levels.
+    """
+    if type(index).__name__ == "RangeIndex":
+        return None
+    if getattr(index, "nlevels", 1) > 1:
+        return ["\x1f".join(str(x) for x in row) for row in index]
+    return [str(x) for x in index]
+
+
 def _coerce_obs_mask(mask):
     """Normalise a user obs_mask to a C-contiguous 1-D numpy bool array.
 
@@ -737,12 +752,10 @@ def to_h5ad(path, out, **kwargs):
         # RangeIndex Series or a bare array carries no labels.
         import pandas as _pd
 
-        if (
-            isinstance(mask, _pd.Series)
-            and type(mask.index).__name__ != "RangeIndex"
-            and "obs_mask_index" not in kwargs
-        ):
-            kwargs["obs_mask_index"] = [str(x) for x in mask.index]
+        if isinstance(mask, _pd.Series) and "obs_mask_index" not in kwargs:
+            labels = _mask_index_labels(mask.index)
+            if labels is not None:
+                kwargs["obs_mask_index"] = labels
         kwargs["obs_mask"] = _coerce_obs_mask(mask)
     src = _coerce_path(path)
     _warn_if_deletions(src, "h5ad")

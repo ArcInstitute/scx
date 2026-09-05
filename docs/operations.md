@@ -466,7 +466,7 @@ existing values, drop or retype columns, or respec the index.
 | **Predicate indexes** | O(n_obs)/O(n_vars) when the axis is replaced and indexed | The old section describes values that are gone, so it is rebuilt over the columns the file already indexed — the replaced axis keeps its pushdown rather than silently losing it. `--index-obs` / `--index-var` / `--index-preset` name a different set instead. Untouched (O(1)) when only `uns`/`obsm`/`varm` change, or when the axis had no index. |
 
 **Invariants (validated, never changed)**: `n_obs`, `n_vars`, `nnz`,
-`n_csr_shards`, `HAS_CSC`. A shape mismatch (`obs.num_rows() != n_obs`, etc.) is
+`n_csr_shards`, `HAS_CSC`. A shape mismatch (`obs` in neither row space, `var.num_rows() != n_vars`, etc.) is
 rejected *before* any write, leaving the file byte-identical. Changing cell/gene
 count is out of scope — use `append`, `subset`, or `from_*`.
 

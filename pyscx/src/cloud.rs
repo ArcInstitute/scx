@@ -284,20 +284,23 @@ impl PyCloudExperiment {
     /// and shares with every logical read, so `n_obs` and `read_obs()` cannot
     /// disagree: a fetch failure is raised here exactly as it would be there.
     /// `__repr__`, which must not raise, uses the best-effort twin.
-    fn logical_n_obs(&self) -> PyResult<u64> {
+    fn logical_n_obs(&self, py: Python<'_>) -> PyResult<u64> {
         let physical = self.reader.n_obs();
         if !self.reader.header().has_deletion_vectors() {
             return Ok(physical);
         }
-        let keep = self
-            .rt
-            .block_on(self.reader.deletion_keep_mask())
+        // A section fetch on first access: release the GIL around it like
+        // every other cloud read, so a slow range request cannot stall
+        // unrelated Python threads.
+        let keep = py
+            .detach(|| self.rt.block_on(self.reader.deletion_keep_mask()))
             .map_err(cloud_to_pyerr)?;
         Ok(keep.map_or(physical, |k| k.iter().filter(|b| **b).count() as u64))
     }
 
-    fn logical_n_obs_best_effort(&self) -> u64 {
-        self.logical_n_obs().unwrap_or_else(|_| self.reader.n_obs())
+    fn logical_n_obs_best_effort(&self, py: Python<'_>) -> u64 {
+        self.logical_n_obs(py)
+            .unwrap_or_else(|_| self.reader.n_obs())
     }
 
     /// Resolve the optional `modality` kwarg shared by `uns_keys` and
@@ -327,8 +330,8 @@ impl PyCloudExperiment {
     /// `Experiment.n_obs`, and what `query().count()` / `read_obs()` on this
     /// handle agree with. See `n_obs_physical` for the header count.
     #[getter]
-    fn n_obs(&self) -> PyResult<u64> {
-        self.logical_n_obs()
+    fn n_obs(&self, py: Python<'_>) -> PyResult<u64> {
+        self.logical_n_obs(py)
     }
 
     #[getter]
@@ -339,8 +342,8 @@ impl PyCloudExperiment {
     /// `(n_obs, n_vars)` — mirrors `anndata.AnnData.shape` and the local
     /// `Experiment.shape`; `n_obs` is the live count (see `n_obs`).
     #[getter]
-    fn shape(&self) -> PyResult<(u64, u64)> {
-        Ok((self.logical_n_obs()?, self.reader.n_vars()))
+    fn shape(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        Ok((self.logical_n_obs(py)?, self.reader.n_vars()))
     }
 
     /// Column names in `obs` (cell metadata), excluding the pandas index —
@@ -786,13 +789,13 @@ impl PyCloudExperiment {
         ))
     }
 
-    fn __repr__(&self) -> String {
+    fn __repr__(&self, py: Python<'_>) -> String {
         // No key lines: listing obs/var/obsm/uns keys would require
         // network range reads, so the cloud repr stays to the cheap
         // header line. Use `.query()` / `read_cloud()` to materialise.
         let mut repr = crate::experiment::format_anndata_repr(
             "CloudExperiment",
-            self.logical_n_obs_best_effort(),
+            self.logical_n_obs_best_effort(py),
             self.reader.n_vars(),
             &[],
         );

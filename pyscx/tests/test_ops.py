@@ -241,6 +241,35 @@ def test_mark_deleted_refuses_a_reordered_series_mask(query_adata, scx_from_adat
     assert list(exp.read_obs().index) == list(obs.index[1:])
 
 
+def test_mark_deleted_multiindex_series_is_order_checked_as_a_composite(
+    query_adata, scx_from_adata
+):
+    """A MultiIndex Series neither crashes nor bypasses the order check: its
+    levels compare as the composite key the key join builds."""
+    import pandas as pd
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_mi.scx")
+    obs = pyscx.open(path).read_obs()
+    obs["sample"] = ["s%d" % (i % 3) for i in range(len(obs))]
+    obs["barcode"] = list(obs.index)
+    pyscx.modify_metadata(path, obs=obs.set_index(["sample", "barcode"]))
+    exp = pyscx.open(path)
+    exp.mark_deleted(np.arange(exp.n_obs_physical) < 2)
+    live = exp.read_obs()
+    assert isinstance(live.index, pd.MultiIndex)
+    flag = pd.Series(np.arange(len(live)) == 0, index=live.index)
+
+    with pytest.raises(ValueError, match="different order"):
+        exp.mark_deleted(flag.iloc[::-1])
+    assert exp.mark_deleted(flag) == 3
+    assert exp.n_obs == exp.n_obs_physical - 3
+
+    with pytest.raises(ValueError) as e:
+        exp.mark_deleted(np.ones(5, dtype=bool))
+    assert str(e.value).startswith("mark_deleted: mask has 5 rows"), str(e.value)
+
+
 def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
     """mark_deleted() rejects masks longer than n_obs."""
     import pyscx

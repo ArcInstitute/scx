@@ -1610,3 +1610,64 @@ fn obs_replace_live_frame_refuses_an_index_arity_change() {
         17
     );
 }
+
+/// The arity guard covers a side with no declared index too: dropping the index
+/// (1→0) would erase the deleted rows' identity, adding one (0→1) would leave it
+/// null on every deleted row.
+#[test]
+fn obs_replace_live_frame_refuses_adding_or_dropping_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1 → 0: the file has an index, the live frame has none.
+    let path = dir.path().join("drop_index.scx");
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["__index_level_0__"],
+            vec![(0..20).map(|i| format!("bc_{i}")).collect()],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(17, "donor_Z")), // `cell_id` + `donor`, no index column
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("index level count"), "{err}");
+
+    // 0 → 1: the file has no index, the live frame declares one.
+    let path = dir.path().join("add_index.scx");
+    write_base(&path, 20, 4, None); // `cell_id` + `donor`, no index column
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![(0..17).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("index level count"), "{err}");
+    // Physical-length: both restructurings are fine.
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![(0..20).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}

@@ -1241,7 +1241,14 @@ pub(crate) fn physical_row_mask(
     };
     let space =
         scx_ops::classify_obs_frame_length(what, mask.len() as u64, n_physical, keep.as_deref())
-            .map_err(crate::ops::ops_to_pyerr)?;
+            .map_err(|e| match e {
+                // The ops error's Display prefixes "CSR shape mismatch on append:",
+                // which is about matrices; a mask wants the bare sentence.
+                scx_ops::OpsError::ShapeMismatch { detail } => {
+                    pyo3::exceptions::PyValueError::new_err(detail)
+                }
+                other => crate::ops::ops_to_pyerr(other),
+            })?;
     match (space, keep) {
         (scx_ops::ObsFrameRowSpace::Live, Some(keep)) => {
             let mut live = mask.iter();

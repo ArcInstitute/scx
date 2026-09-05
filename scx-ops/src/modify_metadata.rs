@@ -1002,7 +1002,8 @@ fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> 
 /// duplicate). The index columns are resolved on each side independently (the
 /// pandas envelope, else the literal `__index_level_0__`) and paired **level by
 /// level**, so a renamed index (`rename_axis`) or a multi-level one is
-/// preserved too; a level the new frame does not have stays null.
+/// preserved too; a frame that changes the number of levels (including to or
+/// from none) is refused — restructuring the index is a physical-length replace.
 ///
 /// Because dispatch is by length alone, a live frame that was **reordered**
 /// after `read_obs()` has the right length and every row on the wrong cell.
@@ -1046,7 +1047,7 @@ fn resolve_obs_row_space(
         .into_iter()
         .filter(|c| scattered.schema().index_of(c).is_ok())
         .collect();
-    if old_levels.is_empty() || new_levels.is_empty() {
+    if old_levels.is_empty() && new_levels.is_empty() {
         return Ok((scattered, ObsFrameRowSpace::Live));
     }
     // Levels are paired by position, so a different level count would pair
