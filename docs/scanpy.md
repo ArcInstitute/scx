@@ -395,9 +395,10 @@ the writer emits the modern `categorical` group form so
 `to_h5ad` also takes an optional obs-axis row filter, so a large file can be
 exported as a subset without materialising it: `obs_mask=` (a boolean array) and
 `min_counts=` (a per-cell total-UMI floor, computed with one streaming pass over
-the CSR shards). Both are indexed in the **global / physical** obs row space —
-length must equal `pyscx.open(path).n_obs_physical`, not `.n_obs`, which is the
-post-deletion live count — and both are ANDed with the deletion-vector mask
+the CSR shards). `obs_mask=` is accepted in either obs row space, told apart by
+length — `n_obs` entries (the live rows `read_obs()` describes; a pandas Series
+with a labelled index is also checked for order) or `n_obs_physical` entries
+(every physical row) — and both filters are ANDed with the deletion-vector mask
 rather than replacing it, so a logically deleted row stays dropped. A filtered
 export records what it dropped in `uns["scx_export"]`. Both require
 `stream=True`.

@@ -877,6 +877,77 @@ pub fn filter_batch_by_keep_mask(batch: &RecordBatch, keep: &[bool]) -> Result<R
     Ok(arrow::compute::filter_record_batch(batch, &mask)?)
 }
 
+/// Expand a **live-row** (logical) obs-axis batch back onto the physical row
+/// axis a deletion keep mask describes (`true` = live) — the forward
+/// counterpart of [`filter_batch_by_keep_mask`]: `filter(scatter(b, keep),
+/// keep)` is `b` again, up to nullability. Rows the mask marks deleted come
+/// back **null in every column**: the caller never saw them, so it supplied
+/// nothing for them, and a fabricated value would be a claim nobody made.
+///
+/// Every output field is forced nullable — a `take` through a null index
+/// produces nulls whatever the source declared, and `RecordBatch::try_new`
+/// rejects a null in a non-nullable field — while field metadata and the
+/// schema metadata (the pandas envelope) are carried verbatim. A dictionary
+/// column keeps its dictionary values (`take` moves keys, not values), so
+/// declared categories and the `scx.categorical.ordered` stamp survive.
+///
+/// Errors when `batch.num_rows()` is not the mask's live count: scattering a
+/// physical-length batch, or a live batch against another file's mask, would
+/// land every row on the wrong cell. Also refuses a mask longer than
+/// `u32::MAX` rows (the take index is `u32`).
+pub fn scatter_batch_to_physical(batch: &RecordBatch, keep: &[bool]) -> Result<RecordBatch> {
+    use arrow::datatypes::{Field, Schema};
+
+    let n_live = keep.iter().filter(|k| **k).count();
+    if n_live != batch.num_rows() {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+            "deletion keep mask has {n_live} live rows (of {} physical) but the batch has {} rows",
+            keep.len(),
+            batch.num_rows()
+        ))
+        .into());
+    }
+    if keep.len() > u32::MAX as usize {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+            "cannot scatter onto {} physical rows: the take index is u32",
+            keep.len()
+        ))
+        .into());
+    }
+    let mut next_live = 0u32;
+    let take_idx: arrow::array::UInt32Array = keep
+        .iter()
+        .map(|&k| {
+            if k {
+                let i = next_live;
+                next_live += 1;
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &take_idx, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            Field::new(f.name(), f.data_type().clone(), true).with_metadata(f.metadata().clone())
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(fields).with_metadata(batch.schema().metadata().clone()));
+    Ok(RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(keep.len())),
+    )?)
+}
+
 impl ScxReader {
     /// Read the Arrow IPC schema from a catalog entry.
     ///

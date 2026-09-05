@@ -35,7 +35,7 @@ first if you want a way back.
 |-----------|--------|---------------|--------------|--------------|-------------|-------------------|-------------------|
 | **append** | In place (`<TARGET> <SOURCE>`) | Existing CSR preserved; new CSR appended at EOF | Rewritten as merged Arrow IPC (all cells) | Unchanged | **Dropped** (warning emitted) | Stale entries preserved unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild covering all rows | **Preserved** (deleted rows keep their global indices; appended rows are live) |
 | **delete** (`mark_deleted`) | In place (`<FILE>`) | Unchanged (logical deletion vector) | Unchanged | Unchanged | Preserved | Unchanged | **Written** (this is the op that creates them) |
-| **modify_metadata** / **set_uns** / **update_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied (same `n_obs`); a supplied `obsm` sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
+| **modify_metadata** / **set_uns** / **update_uns** | In place (`<FILE>`) | **Unchanged** (never read or rewritten) | Replaced if supplied — `n_obs_physical` rows as handed in, or the live `n_obs` rows scattered onto the physical axis (deleted rows `null`, barcode kept); a supplied `obsm` (always physical-length) sets `has_obsm`, so a first-ever in-place embedding survives the next `compact` | Replaced if supplied (same `n_vars`) | **Preserved** | **Carried forward** for the replaced axis — rebuilt over the columns the file already indexed, which also re-derives the per-shard column stats. `--index-obs` / `--index-var` override that axis's column set (`--index-preset` / `--index-auto-threshold` override both); a previously indexed column the new set omits is *reported*, not silently dropped. Untouched when only `uns` / `obsm` / `varm` change — see the note below | **Preserved** (X and its row space are untouched) |
 | **compact** | New file (`<OUTPUT>` required) | Rewrites live data (drops orphaned sections, merges small shards) | Rewrites live metadata | Rewrites | **Dropped** unless `--rebuild-csc` | **Dropped** unless `--index-obs` / `--index-var` / `--index-preset` requests a rebuild | **Applied** — deleted rows are dropped and no vector is emitted. This is the op that materializes deletions |
 | **optimize** | New file, or in place when `<OUTPUT>` == `<INPUT>` (`<OUTPUT>` is required either way) | Re-encodes + canonicalizes every CSR shard (X / layer / obsp-CSR); shard boundaries preserved; row-group-frames shards; stamps `format_version=4` when framed (default) or `format_version=3` when unframed | **Preserved** (rows 1:1) | **Preserved** | **Dropped** (rerun `scx build-csc`) | Sections **preserved** (rows + shard boundaries unchanged), and the per-shard column stats are **carried from the input** (rows are 1:1, so the input's stats are exactly right for the output's shards), so **Level-1** pruning survives. See the note below | **Carried** verbatim (rows are 1:1, so the global row indices stay valid) |
 | **upgrade** | New file, or in place (`--in-place`, temp + rename) — **not** rollback-able; **refuses multimodal input** | Decoded, **canonicalized** and re-emitted **unframed** (per-shard codec preserved; canonicalizing can change `nnz`); a file already newer than the target (v4) is **declined**. `varm`, `obsp`, `varp`, `.raw` and the group index are **carried**; detection bitmaps are carried too unless canonicalizing actually rewrote X, in which case they are dropped with a warning — see below | **Preserved** (rows 1:1; a sharded layout stays sharded) | **Preserved** | **Preserved** when canonicalizing left the matrix unchanged (every file a current writer produces) — the one op that carries the sidecar through rather than dropping it. **Dropped with a warning** when canonicalizing actually rewrote X, since the sidecar is then a view of a different matrix | Sections **copied verbatim** by `copy_auxiliary_sections`, and the per-shard catalog column stats are **carried from the input** (a 1:1 re-emit), so **Level-1** shard pruning survives — as for `build-csc`. See the note below | **Carried** verbatim (a 1:1 re-emit, so the global row indices stay valid) |
@@ -125,8 +125,9 @@ correct answers, and the column above records which each op has:
 
 Exports to formats with no deletion concept — `scx convert --to h5ad / h5mu /
 mtx` — necessarily apply. So do the materialising reads (`pyscx` `to_anndata`,
-`rscx` `$x_matrix()` / `$obs()` / `to_seurat()`), which is why they agree with
-`query()` on the same file.
+`read_obs()` and `obs_categorical()` since 0.17, `rscx` `$x_matrix()` /
+`$obs()` / `to_seurat()`), which is why they agree with `query()` on the same
+file.
 
 Two consequences worth knowing:
 
@@ -134,8 +135,9 @@ Two consequences worth knowing:
   *physical* row count. `scx info` reports the vector separately ("Deletion
   vectors: … N cells deleted"). Both bindings expose the logical count as the
   default and the physical one under an explicit name: `Experiment.n_obs` /
-  `Experiment.n_obs_physical` in `pyscx`, `$n_obs()` / `$n_obs_physical()` in
-  `rscx`. `nnz` is **physical** on both — it comes from catalog stats, and
+  `Experiment.n_obs_physical` and `read_obs()` / `read_obs(logical=False)` in
+  `pyscx` (the `CloudExperiment` twins alike), `$n_obs()` / `$n_obs_physical()`
+  in `rscx`. `nnz` is **physical** on both — it comes from catalog stats, and
   excluding deleted rows would mean decoding the matrix — so on a file with
   deletions it exceeds the nnz of what a read returns.
 - Because `build-csc --in-place` writes a wholly new file with no prior catalog,
@@ -384,7 +386,7 @@ which is reported as a warning naming each one.
 unrelated `cell_type` index pruning, but they get there differently.
 `obs_import` (a table on disk) and `pyscx.attach_obs_columns` (an in-memory
 DataFrame) join by key — or, for a frame computed from this file's own
-`read_obs()`, land rows positionally — know exactly which columns they write,
+`read_obs()` (in either row space), land rows positionally — know exactly which columns they write,
 and clear nothing else — O(new columns). `modify_metadata(obs=…)` replaces the
 whole frame and cannot tell an add from a rewrite, so it re-earns the index by
 rebuilding it, which is O(n_obs) over the indexed columns on top of the obs
@@ -456,7 +458,7 @@ existing values, drop or retype columns, or respec the index.
 |-----------|-----------|-------|
 | **Matrix shards (CSR/CSC)** | O(1) | Never read or rewritten — original catalog entries pass through verbatim. |
 | **`uns`** | O(uns bytes) | One fresh `UnsBlob` section. The headline cheap case. |
-| **`obs`** | O(n_obs) | Re-sharded `ObsMetadataShard` sections. Must match the file's `n_obs`. |
+| **`obs`** | O(n_obs) | Re-sharded `ObsMetadataShard` sections. Either `n_obs_physical` rows (written as handed in) or the live `n_obs` rows (scattered onto the physical axis: deleted rows `null`, barcode kept) — see [the positional row-space rule](#the-join-is-by-key-string-never-by-row-position). |
 | **`var`** | O(n_vars) | Single `VarMetadata` section. Must match `n_vars`. |
 | **`obsm` / `varm`** | O(replaced matrices) | Only the named matrices are rewritten; other keys pass through. |
 | **`obsp` / `varp`** | O(1) | Not replaceable here — existing sections (`ObspEmbedding` / `VarpEmbedding` and their shards) pass through unchanged. |
@@ -464,7 +466,7 @@ existing values, drop or retype columns, or respec the index.
 | **Predicate indexes** | O(n_obs)/O(n_vars) when the axis is replaced and indexed | The old section describes values that are gone, so it is rebuilt over the columns the file already indexed — the replaced axis keeps its pushdown rather than silently losing it. `--index-obs` / `--index-var` / `--index-preset` name a different set instead. Untouched (O(1)) when only `uns`/`obsm`/`varm` change, or when the axis had no index. |
 
 **Invariants (validated, never changed)**: `n_obs`, `n_vars`, `nnz`,
-`n_csr_shards`, `HAS_CSC`. A shape mismatch (`obs.num_rows() != n_obs`, etc.) is
+`n_csr_shards`, `HAS_CSC`. A shape mismatch (`obs` in neither row space, `var.num_rows() != n_vars`, etc.) is
 rejected *before* any write, leaving the file byte-identical. Changing cell/gene
 count is out of scope — use `append`, `subset`, or `from_*`.
 
@@ -785,15 +787,48 @@ producing a perfectly well-shaped column. So:
 `--dry-run` runs the join and the diagnosis and writes nothing.
 
 The one qualified exception is `pyscx.attach_obs_columns(path, df,
-positional=True)`: no join at all — row `i` of `df` annotates **physical** obs
-row `i` (deleted rows keep their place), and `df` must have exactly
-`n_obs_physical` rows. That mode exists for frames computed **in-process from
-this file's own `read_obs()` output**, which is already in physical row order —
-the shape a key join structurally cannot serve when the obs index is duplicated
-with no unique column (`doublet_consensus`'s default write path). External tool
-output must never use it, for exactly the row-order reason above. A
-`status_column` is rejected under positional (every row matches by
-construction), and the row-order rationale for keyed joins is unchanged.
+positional=True)`: no join at all — row `i` of `df` annotates obs row `i`. That
+mode exists for frames computed **in-process from this file's own `read_obs()`
+output**, which is already in obs row order — the shape a key join structurally
+cannot serve when the obs index is duplicated with no unique column
+(`doublet_consensus`'s default write path). External tool output must never use
+it, for exactly the row-order reason above. A `status_column` is rejected under
+positional (every row matches by construction), and the row-order rationale for
+keyed joins is unchanged.
+
+**Two row spaces, told apart by length.** Since pyscx 0.17 `read_obs()` returns
+the live rows, so a positional frame may have either `n_obs` rows (the live
+rows: the `i`-th row annotates the `i`-th live cell and every logically deleted
+row is left `null`) or `n_obs_physical` rows (`read_obs(logical=False)`: every
+physical row, deleted rows included and written). The two coincide on a file
+with no deletions. Any other length is refused naming both counts and the read
+that yields each. `modify_metadata(obs=)` accepts the same two lengths; on a
+live-length replacement a deleted row keeps the barcode the file already holds
+(a `null` key would become `""` in every later keyed join and, twice over, a
+duplicate that blocks `obs_import` until `compact`) and is `null` in every other
+column — every other column, including ones it had before: `modify_metadata`
+is a replace, and the add-a-column path that keeps deleted rows' existing values
+is the positional attach. `obsm` — and a positional frame's embeddings — stay
+physical-length: a dense mapping has no `null` to stand in for a deleted row.
+Both ops record `row_space` in provenance, because a physical-length obs on disk
+does not say which frame produced it.
+
+**Length is not order.** Dispatch by length cannot see a frame that was sorted
+or reindexed after `read_obs()` — right length, every value on the wrong cell —
+nor a physically built frame short by exactly the number of deleted rows. So
+both ops check the one thing a `read_obs()` frame does carry: its barcodes,
+with one rule — the file's own barcodes in a different order are refused by
+row; other labels pass. For a positional attach of a frame with a labelled
+pandas index, that refuses a `sort_values` / `reindex` while leaving a frame
+with unrelated labels positional as ever (a `RangeIndex` frame is not checked;
+provenance records `positional_index_checked`). For a live-length
+`modify_metadata(obs=)`, different barcodes are a rename, which a replace is
+for, and pass. The same check guards the two mask sinks that accept either
+length — `to_h5ad(obs_mask=)` and `Experiment.mark_deleted(mask)` — when the
+mask is a pandas Series with a labelled index; a bare array carries no labels
+and is dispatched by length alone. A live-length `modify_metadata(obs=)` also
+cannot change the number of index levels (they are paired by position); use the
+physical-length frame to restructure the index.
 
 ### Uncovered rows get `null`, never `0.0`
 

@@ -900,3 +900,774 @@ fn obs_replace_keeps_categorical_columns_as_dictionaries() {
     indexed.sort();
     assert_eq!(indexed, ["donor_A", "donor_B"]);
 }
+
+// ---------------------------------------------------------------------------
+// Either row space for `obs=` on a file with deletions (pyscx 0.17: `read_obs()`
+// returns live rows, `read_obs(logical=False)` the physical ones)
+// ---------------------------------------------------------------------------
+
+const DELETED_ROWS: [u64; 3] = [2, 7, 11];
+
+fn str_col<'a>(batch: &'a RecordBatch, name: &str) -> &'a StringArray {
+    batch
+        .column_by_name(name)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+}
+
+/// A live-length obs lands on the live rows in order and leaves every deleted
+/// row null; the deletion vector, the live count and the matrix are untouched.
+#[test]
+fn obs_replace_accepts_a_live_length_frame_on_a_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let pre = csr_shard_snapshot(&path);
+    assert_eq!(
+        ScxReader::open(&path)
+            .unwrap()
+            .read_obs_filtered()
+            .unwrap()
+            .num_rows(),
+        17,
+        "premise: 17 live rows"
+    );
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(17, "donor_Z")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    let physical = r.read_obs().unwrap();
+    assert_eq!(
+        physical.num_rows(),
+        20,
+        "the obs axis stays physical on disk"
+    );
+    let donor = str_col(&physical, "donor");
+    let cell_id = str_col(&physical, "cell_id");
+    let mut live = 0usize;
+    for row in 0..20 {
+        if DELETED_ROWS.contains(&(row as u64)) {
+            assert!(donor.is_null(row), "deleted row {row}: donor must be null");
+            // No pandas index column in this fixture → nothing to preserve.
+            assert!(
+                cell_id.is_null(row),
+                "deleted row {row}: cell_id must be null"
+            );
+        } else {
+            assert_eq!(donor.value(row), "donor_Z");
+            assert_eq!(cell_id.value(row), format!("cell_{live:07}"));
+            live += 1;
+        }
+    }
+    let logical = r.read_obs_filtered().unwrap();
+    assert_eq!(logical.num_rows(), 17);
+    assert!(str_col(&logical, "donor")
+        .iter()
+        .all(|v| v == Some("donor_Z")));
+
+    assert!(r.header().has_deletion_vectors(), "deletion vector carried");
+    let keep = r.deletion_keep_mask().unwrap().unwrap();
+    for row in DELETED_ROWS {
+        assert!(!keep[row as usize]);
+    }
+    assert_eq!(csr_shard_snapshot(&path), pre, "matrix untouched");
+}
+
+/// A physical-length frame still writes every row, deleted ones included.
+#[test]
+fn obs_replace_still_accepts_a_physical_length_frame_on_a_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("phys.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(20, "donor_Z")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    let physical = r.read_obs().unwrap();
+    assert_eq!(physical.num_rows(), 20);
+    let donor = str_col(&physical, "donor");
+    assert!((0..20).all(|row| donor.value(row) == "donor_Z"));
+    assert_eq!(r.read_obs_filtered().unwrap().num_rows(), 17);
+}
+
+/// Neither length names both counts and the read that yields each; the file is
+/// untouched.
+#[test]
+fn obs_replace_wrong_length_on_a_deleted_file_names_both_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    for n in [16usize, 18] {
+        let err = modify_metadata(
+            &path,
+            &MetadataPatch {
+                obs: Some(obs_batch(n, "x")),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, OpsError::ShapeMismatch { .. }), "got {err:?}");
+        let msg = err.to_string();
+        for needle in [
+            &format!("{n} rows"),
+            "n_obs = 17",
+            "n_obs_physical = 20",
+            "read_obs()",
+            "read_obs(logical=False)",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+        }
+    }
+    assert_eq!(
+        ScxReader::open(&path).unwrap().header().manifest_sequence,
+        seq0,
+        "manifest unchanged on reject"
+    );
+}
+
+/// `obsm=` stays physical-length: a dense mapping has no null for a deleted row.
+#[test]
+fn obsm_replace_on_a_deleted_file_stays_physical_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("obsm.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    let emb = |n: usize| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "c0",
+                DataType::Float32,
+                false,
+            )])),
+            vec![Arc::new(Float32Array::from(
+                (0..n).map(|i| i as f32).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap()
+    };
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obsm: Some(vec![("X_pca".to_string(), emb(17))]),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, OpsError::ShapeMismatch { .. }), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("17 rows")
+            && msg.contains("n_obs_physical = 20")
+            && msg.contains("dense mapping"),
+        "{msg}"
+    );
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obsm: Some(vec![("X_pca".to_string(), emb(20))]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ScxReader::open(&path)
+            .unwrap()
+            .read_obsm_for(0, "X_pca")
+            .unwrap()
+            .num_rows(),
+        20
+    );
+}
+
+/// The predicate index requested alongside a live-length frame is built over the
+/// scattered, physical-length obs — the same row space as the CSR shards.
+#[test]
+fn obs_replace_live_frame_rebuilds_the_index_in_physical_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live_idx.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(17, "donor_Z")),
+            index: scx_engine::ConversionPredicateIndexOptions {
+                index_obs: vec!["donor".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(has_section(&path, SectionType::ObsPredicateIndex));
+    assert_eq!(indexed_donor_values(&path), vec!["donor_Z".to_string()]);
+
+    // The index must describe the physical axis: a query through it returns
+    // exactly the live rows (the deleted rows are null in `donor`, so they
+    // match neither the predicate nor the keep mask).
+    let pipeline = scx_engine::QueryPipeline::open(&path).unwrap();
+    let result = pipeline
+        .filter_obs("donor == 'donor_Z'")
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(result.x.shape.0, 17);
+    assert_eq!(result.obs.num_rows(), 17);
+}
+
+/// A live-length frame keeps the deleted rows' barcodes when the file declares
+/// an obs index column: a null key would become `""` in every later keyed join
+/// and, twice over, a duplicate — which would block `obs_import` on the file
+/// until `compact`. Everything else about a deleted row is null.
+#[test]
+fn obs_replace_live_frame_keeps_the_deleted_rows_barcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("barcodes.scx");
+    let n = 20usize;
+    let indexed_obs = |ids: Vec<String>, donor: &str| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("__index_level_0__", DataType::Utf8, false),
+                Field::new("donor", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(
+                    std::iter::repeat_n(donor.to_string(), 0)
+                        .chain((0..0).map(|_| String::new()))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+    };
+    let _ = indexed_obs; // (shape helper kept simple below)
+    let build = |ids: Vec<String>, donor: &str| {
+        let k = ids.len();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("__index_level_0__", DataType::Utf8, false),
+                Field::new("donor", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(StringArray::from(vec![donor.to_string(); k])),
+            ],
+        )
+        .unwrap()
+    };
+    {
+        let mut writer = ScxWriter::new(&path, header(n as u64, 4)).unwrap();
+        writer
+            .write_obs(&build(
+                (0..n).map(|i| format!("bc_{i}")).collect(),
+                "donor_A",
+            ))
+            .unwrap();
+        writer.write_var(&var_batch(4)).unwrap();
+        let (indptr, indices, values) = dense_to_csr(&dense(n, 4), n, 4);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    // The caller renames the live barcodes too — the deleted rows never saw it.
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(build(
+                (0..17).map(|i| format!("new_{i}")).collect(),
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let r = ScxReader::open(&path).unwrap();
+    let physical = r.read_obs().unwrap();
+    let idx = str_col(&physical, "__index_level_0__");
+    let donor = str_col(&physical, "donor");
+    let mut live = 0usize;
+    for row in 0..n {
+        if DELETED_ROWS.contains(&(row as u64)) {
+            assert_eq!(
+                idx.value(row),
+                format!("bc_{row}"),
+                "deleted row {row} keeps its barcode"
+            );
+            assert!(donor.is_null(row), "…but every other column is null");
+        } else {
+            assert_eq!(idx.value(row), format!("new_{live}"));
+            assert_eq!(donor.value(row), "donor_Z");
+            live += 1;
+        }
+    }
+
+    // And the file stays joinable by its index: a keyed attach over the live
+    // barcodes matches every live row and trips no duplicate-key check.
+    let scores = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("s", DataType::Float32, true)])),
+        vec![Arc::new(Float32Array::from(
+            (0..17).map(|i| i as f32).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    let summary = scx_ops::attach_external_obs(
+        &path,
+        &scx_ops::ExternalObsData {
+            row_keys: (0..17).map(|i| format!("new_{i}")).collect(),
+            row_annotations: scores,
+            row_embeddings: Vec::new(),
+            uns: Default::default(),
+            source_checksum: None,
+            source_name: None,
+        },
+        &scx_ops::AttachObsOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(summary.n_matched, 17);
+    assert_eq!(
+        summary.n_target_rows_absent, 3,
+        "the deleted rows, whose barcodes no source row names"
+    );
+}
+
+/// The row space the frame arrived in is recorded in provenance: the obs on
+/// disk is physical-length either way and does not say which frame produced it.
+#[test]
+fn obs_replace_records_the_row_space_in_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prov.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    let last_params = |path: &Path| {
+        ScxReader::open(path)
+            .unwrap()
+            .read_provenance()
+            .unwrap()
+            .operations
+            .last()
+            .unwrap()
+            .params_json
+            .clone()
+    };
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(17, "live")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        last_params(&path).contains("\"row_space\":\"logical\""),
+        "{}",
+        last_params(&path)
+    );
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(20, "phys")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        last_params(&path).contains("\"row_space\":\"physical\""),
+        "{}",
+        last_params(&path)
+    );
+}
+
+/// Obs with a pandas envelope declaring `levels` as its index columns.
+fn envelope_obs(levels: &[&str], values: Vec<Vec<String>>, donor: &str) -> RecordBatch {
+    let n = values[0].len();
+    let mut fields: Vec<Field> = levels
+        .iter()
+        .map(|l| Field::new(*l, DataType::Utf8, false))
+        .collect();
+    fields.push(Field::new("donor", DataType::Utf8, false));
+    let mut columns: Vec<Arc<dyn Array>> = values
+        .into_iter()
+        .map(|v| Arc::new(StringArray::from(v)) as Arc<dyn Array>)
+        .collect();
+    columns.push(Arc::new(StringArray::from(vec![donor.to_string(); n])));
+    let quoted: Vec<String> = levels.iter().map(|l| format!("\"{l}\"")).collect();
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(
+        "pandas".to_string(),
+        format!("{{\"index_columns\":[{}]}}", quoted.join(",")),
+    );
+    RecordBatch::try_new(Arc::new(Schema::new(fields).with_metadata(meta)), columns).unwrap()
+}
+
+fn write_base_with_obs(path: &Path, obs: RecordBatch, n_vars: usize) {
+    let n = obs.num_rows();
+    let mut writer = ScxWriter::new(path, header(n as u64, n_vars as u64)).unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var_batch(n_vars)).unwrap();
+    let (indptr, indices, values) = dense_to_csr(&dense(n, n_vars), n, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// A live frame whose index was renamed (`rename_axis`) still keeps the deleted
+/// rows' barcodes: the two sides' index columns are resolved independently and
+/// paired by position, not by name.
+#[test]
+fn obs_replace_live_frame_with_a_renamed_index_keeps_the_deleted_rows_barcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("renamed.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["__index_level_0__"],
+            vec![(0..n).map(|i| format!("bc_{i}")).collect()],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["cell_id"],
+                vec![(0..17).map(|i| format!("new_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let physical = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert!(
+        physical.column_by_name("cell_id").is_some(),
+        "the frame's index name wins"
+    );
+    let idx = str_col(&physical, "cell_id");
+    let mut live = 0usize;
+    for row in 0..n {
+        if DELETED_ROWS.contains(&(row as u64)) {
+            assert_eq!(
+                idx.value(row),
+                format!("bc_{row}"),
+                "deleted row {row} keeps its barcode"
+            );
+        } else {
+            assert_eq!(idx.value(row), format!("new_{live}"));
+            live += 1;
+        }
+    }
+}
+
+/// Every index level is paired and preserved, not only the first.
+#[test]
+fn obs_replace_live_frame_pairs_every_index_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["lvl_a", "lvl_b"],
+            vec![
+                (0..n).map(|i| format!("a_{i}")).collect(),
+                (0..n).map(|i| format!("b_{i}")).collect(),
+            ],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["lvl_a", "lvl_b"],
+                vec![
+                    (0..17).map(|i| format!("na_{i}")).collect(),
+                    (0..17).map(|i| format!("nb_{i}")).collect(),
+                ],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let physical = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    let a = str_col(&physical, "lvl_a");
+    let b = str_col(&physical, "lvl_b");
+    for row in DELETED_ROWS {
+        let row = row as usize;
+        assert_eq!(
+            a.value(row),
+            format!("a_{row}"),
+            "level a kept on deleted row {row}"
+        );
+        assert_eq!(
+            b.value(row),
+            format!("b_{row}"),
+            "level b kept on deleted row {row}"
+        );
+    }
+    assert_eq!(a.value(0), "na_0");
+    assert_eq!(b.value(0), "nb_0");
+}
+
+/// A live frame holding the file's own live barcodes in a different order is a
+/// `sort_values` / `reindex` accident, not a rename: refused by row. Different
+/// values (a rename) pass — that is what a replace is for.
+#[test]
+fn obs_replace_refuses_a_reordered_live_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reorder.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["__index_level_0__"],
+            vec![(0..n).map(|i| format!("bc_{i}")).collect()],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    let live: Vec<String> = (0..n)
+        .filter(|i| !DELETED_ROWS.contains(&(*i as u64)))
+        .map(|i| format!("bc_{i}"))
+        .collect();
+    let mut reversed = live.clone();
+    reversed.reverse();
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![reversed],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different order") && msg.contains("row 0 of the frame is 'bc_19'"),
+        "{msg}"
+    );
+    assert_eq!(
+        ScxReader::open(&path).unwrap().header().manifest_sequence,
+        seq0,
+        "refused → nothing written"
+    );
+
+    // Same order: accepted. Renamed barcodes: accepted (a replace may rename).
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(&["__index_level_0__"], vec![live], "donor_Z")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![(0..17).map(|i| format!("renamed_{i}")).collect()],
+                "donor_Y",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let live_now = ScxReader::open(&path).unwrap().read_obs_filtered().unwrap();
+    assert_eq!(
+        str_col(&live_now, "__index_level_0__").value(0),
+        "renamed_0"
+    );
+}
+
+/// A live-length frame cannot change the number of index levels: levels are
+/// paired by position, so a mismatch would pair the wrong columns or leave a
+/// new level null on the deleted rows. Restructuring the index is a
+/// physical-length replace.
+#[test]
+fn obs_replace_live_frame_refuses_an_index_arity_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("arity.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["lvl_a", "lvl_b"],
+            vec![
+                (0..n).map(|i| format!("a_{i}")).collect(),
+                (0..n).map(|i| format!("b_{i}")).collect(),
+            ],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["barcode"],
+                vec![(0..17).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("index level count") && msg.contains("2 level(s)") && msg.contains("has 1"),
+        "{msg}"
+    );
+    assert_eq!(
+        ScxReader::open(&path).unwrap().header().manifest_sequence,
+        seq0
+    );
+
+    // The physical-length frame restructures freely.
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["barcode"],
+                vec![(0..n).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        ScxReader::open(&path)
+            .unwrap()
+            .read_obs_filtered()
+            .unwrap()
+            .num_rows(),
+        17
+    );
+}
+
+/// The arity guard covers a side with no declared index too: dropping the index
+/// (1→0) would erase the deleted rows' identity, adding one (0→1) would leave it
+/// null on every deleted row.
+#[test]
+fn obs_replace_live_frame_refuses_adding_or_dropping_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1 → 0: the file has an index, the live frame has none.
+    let path = dir.path().join("drop_index.scx");
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["__index_level_0__"],
+            vec![(0..20).map(|i| format!("bc_{i}")).collect()],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(17, "donor_Z")), // `cell_id` + `donor`, no index column
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("index level count"), "{err}");
+
+    // 0 → 1: the file has no index, the live frame declares one.
+    let path = dir.path().join("add_index.scx");
+    write_base(&path, 20, 4, None); // `cell_id` + `donor`, no index column
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![(0..17).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("index level count"), "{err}");
+    // Physical-length: both restructurings are fine.
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![(0..20).map(|i| format!("bc_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}

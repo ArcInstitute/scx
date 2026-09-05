@@ -1218,6 +1218,124 @@ pub(crate) fn compute_kept_to_global(reader: &ScxReader) -> PyResult<Option<Vec<
     Ok(Some(kept))
 }
 
+/// Accept a boolean row mask in either obs row space and return it
+/// physical-length.
+///
+/// The length rule is the one the in-place obs writers use for a positional
+/// frame (`scx_ops::classify_obs_frame_length`): `n_obs_physical` entries
+/// (`header.n_obs`; what `read_obs(logical=False)` describes) are returned as
+/// they are; the live count (what `read_obs()` describes since 0.17) is
+/// expanded through the keep mask — a live entry lands on its physical row, an
+/// already-deleted row gets `false`. Any other length is a `ValueError` naming
+/// both counts and the read that yields each. `what` names the argument.
+pub(crate) fn physical_row_mask(
+    reader: &ScxReader,
+    mask: &[bool],
+    what: &str,
+) -> PyResult<Vec<bool>> {
+    let n_physical = reader.n_obs();
+    let keep = if mask.len() as u64 == n_physical {
+        None
+    } else {
+        reader.deletion_keep_mask().map_err(to_pyerr)?
+    };
+    let space =
+        scx_ops::classify_obs_frame_length(what, mask.len() as u64, n_physical, keep.as_deref())
+            .map_err(|e| match e {
+                // The ops error's Display prefixes "CSR shape mismatch on append:",
+                // which is about matrices; a mask wants the bare sentence.
+                scx_ops::OpsError::ShapeMismatch { detail } => {
+                    pyo3::exceptions::PyValueError::new_err(detail)
+                }
+                other => crate::ops::ops_to_pyerr(other),
+            })?;
+    match (space, keep) {
+        (scx_ops::ObsFrameRowSpace::Live, Some(keep)) => {
+            let mut live = mask.iter();
+            Ok(keep
+                .iter()
+                .map(|&k| {
+                    if k {
+                        *live.next().expect("n_live entries")
+                    } else {
+                        false
+                    }
+                })
+                .collect())
+        }
+        _ => Ok(mask.to_vec()),
+    }
+}
+
+/// Refuse a row mask whose pandas index says its rows were reordered.
+///
+/// Dispatch by length cannot see a mask built from a frame that was sorted or
+/// reindexed after `read_obs()` — right length, every entry on the wrong cell,
+/// and the sink here is a deletion or an export. So when the caller hands a
+/// pandas Series with a labelled index, `labels` (one per mask entry) are
+/// compared with the file's obs-index barcodes in the row space the mask's
+/// length names: the same barcodes in a different order are refused naming the
+/// first misplaced row; labels that are not the file's barcodes are ignored
+/// (the mask may have been built from another source), and a RangeIndex Series
+/// or a bare array hands no labels and is not checked. A multi-level index
+/// compares as the composite key the key join builds.
+pub(crate) fn check_row_mask_order(
+    reader: &ScxReader,
+    labels: &[String],
+    what: &str,
+) -> PyResult<()> {
+    let n_physical = reader.n_obs() as usize;
+    let schema = reader.read_obs_schema_physical().map_err(to_pyerr)?;
+    let index_cols: Vec<String> = scx_format_io::resolve_index_columns(&schema)
+        .into_iter()
+        .filter(|c| schema.index_of(c).is_ok())
+        .collect();
+    if index_cols.is_empty() {
+        return Ok(());
+    }
+    let batch = if labels.len() == n_physical {
+        reader.read_obs_keys(&index_cols)
+    } else {
+        reader.read_obs_keys_filtered(&index_cols)
+    }
+    .map_err(to_pyerr)?;
+    if batch.num_rows() != labels.len() {
+        // Neither row space — `physical_row_mask` reports that with both counts.
+        return Ok(());
+    }
+    let file_keys = if index_cols.len() == 1 {
+        scx_ops::obs_key_values(&batch, &index_cols[0])
+    } else {
+        scx_ops::build_composite_key(&batch, &index_cols)
+    }
+    .map_err(crate::ops::ops_to_pyerr)?;
+    if file_keys == labels {
+        return Ok(());
+    }
+    let mut a: Vec<&str> = file_keys.iter().map(String::as_str).collect();
+    let mut b: Vec<&str> = labels.iter().map(String::as_str).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    if a != b {
+        return Ok(());
+    }
+    let row = file_keys
+        .iter()
+        .zip(labels.iter())
+        .position(|(f, l)| f != l)
+        .expect("vectors differ");
+    let sep = scx_ops::COMPOSITE_KEY_SEPARATOR;
+    Err(pyo3::exceptions::PyValueError::new_err(format!(
+        "{what}: the mask's index holds the file's own barcodes in a different order — entry \
+         {row} is '{}' but obs row {row} ('{}') is '{}'. A mask built from a frame sorted or \
+         reindexed after read_obs() would address the wrong cells; restore the original order \
+         (or pass a plain array in the file's row order)",
+        labels[row].replace(sep, " / "),
+        index_cols.join("+"),
+        file_keys[row].replace(sep, " / ")
+    )))
+}
+
 /// Filter an obs RecordBatch to exclude deleted rows.
 ///
 /// Builds a boolean keep-mask from the deletion vectors (same logic

@@ -3614,3 +3614,195 @@ fn test_prune_unused_dictionary_values_ignores_null_rows_and_empties_a_zero_row_
     assert_eq!(out.num_rows(), 2);
     assert!(declared_of(&out).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Logical-row-space twins: `scatter_batch_to_physical`, `read_obs_keys_filtered`,
+// `obs_categorical_*_filtered`
+// ---------------------------------------------------------------------------
+
+/// A live-length batch scattered onto the physical axis comes back with the
+/// live rows in place, null at every deleted row, every field nullable, and the
+/// dictionary values + field/schema metadata intact — and filtering it again
+/// gives the input back.
+#[test]
+fn scatter_then_filter_is_identity_and_nulls_deleted_rows() {
+    use std::collections::HashMap;
+
+    use arrow::array::{
+        Array, ArrayRef, AsArray, DictionaryArray, Float32Array, Int8Array, StringArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+
+    use crate::reader::{filter_batch_by_keep_mask, scatter_batch_to_physical};
+
+    // Declared vocabulary ["a", "b", "unused"]: the third level is referenced by
+    // no row, and must survive the round trip (PR B fidelity).
+    let dict_values: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "unused"]));
+    let dict = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(0), Some(1), None]),
+        dict_values,
+    )
+    .unwrap();
+    let mut ordered = HashMap::new();
+    ordered.insert("scx.categorical.ordered".to_string(), "true".to_string());
+    let mut envelope = HashMap::new();
+    envelope.insert(
+        "pandas".to_string(),
+        "{\"index_columns\":[\"cell_id\"]}".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("cell_id", DataType::Utf8, false),
+        Field::new("score", DataType::Float32, true),
+        Field::new(
+            "ct",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        )
+        .with_metadata(ordered.clone()),
+    ])
+    .with_metadata(envelope.clone());
+    let live = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(vec!["c0", "c2", "c3"])),
+            Arc::new(Float32Array::from(vec![0.0, 2.0, 3.0])),
+            Arc::new(dict),
+        ],
+    )
+    .unwrap();
+
+    let keep = [true, false, true, true, false];
+    let phys = scatter_batch_to_physical(&live, &keep).unwrap();
+    assert_eq!(phys.num_rows(), 5);
+    assert!(
+        phys.schema().fields().iter().all(|f| f.is_nullable()),
+        "every scattered field must admit the nulls it now carries"
+    );
+    assert_eq!(
+        phys.schema().metadata(),
+        &envelope,
+        "schema metadata carried"
+    );
+    assert_eq!(
+        phys.schema().field(2).metadata(),
+        &ordered,
+        "field metadata (the ordered stamp) carried"
+    );
+    let ids = phys.column(0).as_string::<i32>();
+    assert_eq!(ids.value(0), "c0");
+    assert!(ids.is_null(1));
+    assert_eq!(ids.value(2), "c2");
+    assert_eq!(ids.value(3), "c3");
+    assert!(ids.is_null(4));
+    let scores = phys
+        .column(1)
+        .as_primitive::<arrow::datatypes::Float32Type>();
+    assert!(scores.is_null(1) && scores.is_null(4));
+    assert_eq!(scores.value(3), 3.0);
+    let ct = phys.column(2).as_dictionary::<Int8Type>();
+    assert_eq!(
+        ct.values().as_string::<i32>().value(2),
+        "unused",
+        "an unreferenced dictionary level survives the scatter"
+    );
+    assert!(ct.is_null(1) && ct.is_null(4));
+    // The live row whose key was null stays null (row 3 of the input).
+    assert!(ct.is_null(3));
+
+    let back = filter_batch_by_keep_mask(&phys, &keep).unwrap();
+    assert_eq!(back.num_rows(), 3);
+    for c in 0..3 {
+        assert_eq!(
+            back.column(c).as_ref(),
+            live.column(c).as_ref(),
+            "column {c} must round-trip"
+        );
+    }
+}
+
+#[test]
+fn scatter_rejects_length_mismatch() {
+    use arrow::array::Float32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::reader::scatter_batch_to_physical;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("s", DataType::Float32, true)])),
+        vec![Arc::new(Float32Array::from(vec![1.0, 2.0]))],
+    )
+    .unwrap();
+    // Three live rows in the mask, two in the batch: a physical-length batch
+    // handed to the scatter, or a live one against the wrong file.
+    let err = scatter_batch_to_physical(&batch, &[true, true, false, true]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("3 live rows") && msg.contains("2 rows"),
+        "the error must name both counts: {msg}"
+    );
+}
+
+/// The projected logical read agrees with the unprojected one column for
+/// column, and with the physical projected read on the live rows.
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn read_obs_keys_filtered_matches_filtered_read_obs_projection() {
+    use arrow::array::AsArray;
+    use arrow::datatypes::DataType;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Row 0 deleted (see the fixture); 10 obs rows, 10 CSR rows.
+    let path = write_mask_csr_mismatch_file(&dir, "keys_filtered.scx", 10, 10);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let cols = vec!["cell_id".to_string()];
+    let projected = reader.read_obs_keys_filtered(&cols).unwrap();
+    let full = reader.read_obs_filtered().unwrap();
+    let physical = reader.read_obs_keys(&cols).unwrap();
+    assert_eq!(projected.num_rows(), 9);
+    assert_eq!(full.num_rows(), 9);
+    assert_eq!(physical.num_rows(), 10);
+
+    // `read_obs_keys` dictionary-compacts strings; compare values, not dtype.
+    let as_strings = |b: &RecordBatch| -> Vec<String> {
+        let c =
+            arrow::compute::cast(b.column_by_name("cell_id").unwrap(), &DataType::Utf8).unwrap();
+        c.as_string::<i32>()
+            .iter()
+            .map(|v| v.unwrap().to_string())
+            .collect()
+    };
+    let expect: Vec<String> = (1..10).map(|i| format!("cell_{i}")).collect();
+    assert_eq!(as_strings(&projected), expect);
+    assert_eq!(as_strings(&full), expect);
+    assert_eq!(
+        as_strings(&physical)[0],
+        "cell_0",
+        "the physical read keeps the deleted row"
+    );
+}
+
+#[cfg(feature = "deletion-vectors")]
+#[test]
+fn obs_categorical_filtered_agrees_with_read_obs_filtered_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_mask_csr_mismatch_file(&dir, "codes_filtered.scx", 10, 10);
+    let reader = ScxReader::open(&path).unwrap();
+
+    let (codes, cats) = reader.obs_categorical_filtered("cell_id").unwrap();
+    assert_eq!(codes.len(), 9, "one code per live row");
+    let decoded: Vec<&str> = codes.iter().map(|&c| cats[c as usize].as_str()).collect();
+    let expect: Vec<String> = (1..10).map(|i| format!("cell_{i}")).collect();
+    assert_eq!(
+        decoded,
+        expect.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        cats.len(),
+        10,
+        "categories are untouched by the row filter — the deleted row's level stays"
+    );
+
+    let (physical, _) = reader.obs_categorical("cell_id").unwrap();
+    assert_eq!(physical.len(), 10, "the physical fold keeps every row");
+}

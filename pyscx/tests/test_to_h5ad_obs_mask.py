@@ -4,16 +4,19 @@ The row filter exists so a raw all-droplet SCX file can be trimmed on its way
 to CellBender without materializing the matrix. Two things make it easy to get
 subtly wrong, and both are pinned here:
 
-1. **Coordinate system.** The mask is indexed in the *global / physical* obs
-   row space (header ``n_obs``), not the post-deletion live space. A mask built
-   from a backed ``X.sum(1)`` on a file with deletions is in the wrong space,
-   and silently so if we only checked ``len(mask) <= n_obs``.
+1. **Coordinate system.** The mask is accepted in either obs row space, told
+   apart by length: ``n_obs_physical`` entries (header ``n_obs``) or the live
+   ``n_obs`` entries ``read_obs()`` describes (since 0.17), expanded through
+   the keep mask. Any other length raises naming both counts — a mask that is
+   merely ``<= n_obs`` long would silently filter the wrong rows. A pandas
+   Series' labelled index is checked for order too.
 2. **Composition with deletion vectors.** The mask is ANDed with the deletion
    mask, never substituted for it — a ``True`` entry must not resurrect a
    logically deleted row.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pyscx
@@ -130,21 +133,89 @@ def test_obs_mask_uses_physical_coordinates_and_never_resurrects_deleted_rows(
     np.testing.assert_array_equal(got.obs_names.to_numpy(), kept)
 
 
-def test_obs_mask_in_live_coordinates_is_rejected(
+def test_obs_mask_in_live_coordinates_is_expanded_through_the_keep_mask(
     synthetic_adata, scx_from_adata, tmp_dir
 ):
-    """A mask sized to the *live* row count is the natural mistake; it must
-    raise rather than silently filtering the wrong rows."""
+    """Since 0.17 `read_obs()` is the live frame, so a live-length mask is what
+    a caller naturally derives from it. It is expanded onto the physical axis
+    (an already-deleted row is `False` either way) — the same either-length
+    rule as `attach_obs_columns(positional=True)`; any other length raises."""
     path = scx_from_adata(synthetic_adata, "deleted2.scx")
     n_obs = synthetic_adata.n_obs
 
     delete = np.zeros(n_obs, dtype=bool)
     delete[:3] = True
     pyscx.open(path).mark_deleted(delete)
+    exp = pyscx.open(path)
+    obs = exp.read_obs()
+    assert len(obs) == n_obs - 3
 
-    live_sized = np.ones(n_obs - 3, dtype=bool)
-    with pytest.raises(ValueError, match="physical n_obs"):
-        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=live_sized)
+    # Drop the first live cell (physical row 3) through a live-length mask.
+    live_mask = np.ones(len(obs), dtype=bool)
+    live_mask[0] = False
+    with pytest.warns(UserWarning, match="logically-deleted"):
+        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=live_mask)
+    got = anndata.read_h5ad(tmp_dir / "out.h5ad")
+    assert got.n_obs == n_obs - 4
+    np.testing.assert_array_equal(got.obs_names.to_numpy(), obs.index.to_numpy()[1:])
+
+    # Neither length: both counts named.
+    with pytest.raises(ValueError) as e:
+        pyscx.to_h5ad(path, tmp_dir / "out2.h5ad", obs_mask=np.ones(n_obs - 5, dtype=bool))
+    msg = str(e.value)
+    assert f"n_obs = {n_obs - 3}" in msg and f"n_obs_physical = {n_obs}" in msg
+
+
+def test_obs_mask_series_in_a_different_order_is_refused(
+    synthetic_adata, scx_from_adata, tmp_dir
+):
+    """A Series built from a sorted `read_obs()` frame has the right length and
+    every entry on the wrong cell; its index says so, and the export refuses
+    rather than writing the wrong cells. A plain array carries no labels."""
+    path = scx_from_adata(synthetic_adata, "deleted3.scx")
+    n_obs = synthetic_adata.n_obs
+    pyscx.open(path).mark_deleted(np.arange(n_obs) < 3)
+    obs = pyscx.open(path).read_obs()
+    keep = pd.Series(np.arange(len(obs)) % 2 == 0, index=obs.index)
+
+    shuffled = keep.iloc[::-1]
+    with pytest.raises(ValueError, match="different order"):
+        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=shuffled)
+
+    pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=keep)
+    got = anndata.read_h5ad(tmp_dir / "out.h5ad")
+    np.testing.assert_array_equal(got.obs_names.to_numpy(), obs.index.to_numpy()[::2])
+
+
+def test_obs_mask_multiindex_series_is_order_checked_as_a_composite(
+    synthetic_adata, scx_from_adata, tmp_dir
+):
+    """A two-level obs index compares as the composite the key join builds, so
+    a reordered MultiIndex Series is refused like a flat one and an in-order one
+    is accepted."""
+    path = scx_from_adata(synthetic_adata, "deleted_mi.scx")
+    exp = pyscx.open(path)
+    obs = exp.read_obs(logical=False)
+    obs["sample"] = ["s%d" % (i % 2) for i in range(len(obs))]
+    obs["barcode"] = list(obs.index)
+    pyscx.modify_metadata(path, obs=obs.set_index(["sample", "barcode"]))
+    pyscx.mark_deleted(path, [0, 1, 2])
+    live = pyscx.open(path).read_obs()
+    assert isinstance(live.index, pd.MultiIndex)
+    keep = pd.Series(np.arange(len(live)) % 2 == 0, index=live.index)
+
+    with pytest.raises(ValueError, match="different order"):
+        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=keep.iloc[::-1])
+    pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=keep)
+    assert anndata.read_h5ad(tmp_dir / "out.h5ad").n_obs == int(keep.sum())
+
+
+def test_obs_mask_length_error_is_a_bare_sentence(synthetic_adata, scx_path, tmp_dir):
+    with pytest.raises(ValueError) as e:
+        pyscx.to_h5ad(scx_path, tmp_dir / "out.h5ad", obs_mask=np.ones(3, dtype=bool))
+    msg = str(e.value)
+    assert msg.startswith("obs_mask has 3 rows"), msg
+    assert "CSR shape mismatch" not in msg
 
 
 # ---------------------------------------------------------------------------

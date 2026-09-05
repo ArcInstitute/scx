@@ -160,25 +160,36 @@ impl PyExperiment {
 
 impl PyExperiment {
     /// Live (non-deleted) row count: physical `n_obs` minus the deletion-vector
-    /// popcount. Best-effort — falls back to the physical count when the file
-    /// has no deletion vectors or the deletion section can't be read, so it
-    /// never panics (the `n_obs` getter and repr must always render).
-    fn logical_n_obs_of(&self, reader: &ScxReader) -> u64 {
+    /// popcount. Header-only when the file flags no deletions; otherwise the
+    /// deletion section is decoded at most once per `Experiment`, **memoised
+    /// on success only** — a read failure is returned (so `n_obs` and
+    /// `read_obs()` cannot disagree: the latter raises on the same failure)
+    /// and retried on the next call rather than pinned. `__repr__`, which must
+    /// always render, uses [`Self::logical_n_obs_best_effort`].
+    fn logical_n_obs_of(&self, reader: &ScxReader) -> PyResult<u64> {
         let physical = reader.n_obs();
         if !reader.header().has_deletion_vectors() {
-            return physical;
+            return Ok(physical);
         }
-        // Decode the deletion section at most once per Experiment (best-effort:
-        // a failed read memoizes 0, matching the pre-cache physical fallback).
-        let deleted = *self.n_deleted.get_or_init(|| {
-            reader
-                .read_deletion_vectors()
-                .ok()
-                .flatten()
-                .map(|dv| dv.total_deleted())
-                .unwrap_or(0)
-        });
-        physical.saturating_sub(deleted)
+        if let Some(deleted) = self.n_deleted.get() {
+            return Ok(physical.saturating_sub(*deleted));
+        }
+        // Counted from the same keep mask every logical read applies — not from
+        // the bitmap's cardinality, which also counts ids beyond the physical
+        // axis that the mask (and so `read_obs()`) ignores.
+        let deleted = reader
+            .deletion_keep_mask()
+            .map_err(to_pyerr)?
+            .map_or(0, |k| k.iter().filter(|b| !**b).count() as u64);
+        let _ = self.n_deleted.set(deleted);
+        Ok(physical.saturating_sub(deleted))
+    }
+
+    /// [`Self::logical_n_obs_of`] for surfaces that must not raise (`repr`):
+    /// the physical count when the deletion section cannot be read.
+    fn logical_n_obs_best_effort(&self, reader: &ScxReader) -> u64 {
+        self.logical_n_obs_of(reader)
+            .unwrap_or_else(|_| reader.n_obs())
     }
 }
 
@@ -190,7 +201,7 @@ impl PyExperiment {
     /// [`Self::n_obs_physical`] for the raw, pre-deletion header count.
     #[getter]
     fn n_obs(&self) -> PyResult<u64> {
-        Ok(self.logical_n_obs_of(self.reader()?))
+        self.logical_n_obs_of(self.reader()?)
     }
 
     /// Physical (pre-deletion) row count straight from the file header. Equals
@@ -212,7 +223,7 @@ impl PyExperiment {
     #[getter]
     fn shape(&self) -> PyResult<(u64, u64)> {
         let reader = self.reader()?;
-        Ok((self.logical_n_obs_of(reader), reader.n_vars()))
+        Ok((self.logical_n_obs_of(reader)?, reader.n_vars()))
     }
 
     /// Total number of non-zero entries — **physical**, unlike [`Self::n_obs`].
@@ -372,9 +383,28 @@ impl PyExperiment {
     }
 
     /// Read the `obs` (cell metadata) table as a pandas DataFrame **without
-    /// touching X**. Routes through `ScxReader::read_obs` (full obs) or
-    /// `read_obs_keys` (when `columns` is given), so the cost is
+    /// touching X**. Routes through `ScxReader::read_obs_filtered` (full obs)
+    /// or `read_obs_keys_filtered` (when `columns` is given), so the cost is
     /// `O(obs_metadata_bytes)`, not `O(X_bytes)`.
+    ///
+    /// **Row space.** `logical=True` (default) returns the **live** rows:
+    /// deletion vectors applied, so `len(read_obs()) == n_obs ==
+    /// len(to_anndata(backed=True).obs)`, row for row and index for index —
+    /// the same frame `query().collect()`, `gather_rows_sparse` and rscx's
+    /// `$obs()` describe. `logical=False` returns the **physical** table:
+    /// `n_obs_physical` rows with every logically deleted row still in place.
+    /// (`to_h5ad(obs_mask=)` and `mark_deleted(mask)` take a mask in either row
+    /// space, so a mask derived from `read_obs()` works.) On a file with no
+    /// deletions the two are identical (and the logical read costs no copy);
+    /// `has_deletions` says whether they differ.
+    ///
+    /// **Changed in 0.17**: `read_obs()` used to return the physical table on
+    /// every file, so on a `mark_deleted` file it was longer than
+    /// `to_anndata(backed=True).obs` with no warning — pre-1.0 clean break, no
+    /// `FutureWarning` cycle. A frame computed from `read_obs()` can still be
+    /// landed positionally: `attach_obs_columns(positional=True)` and
+    /// `modify_metadata(obs=)` accept either row space (a live-length frame
+    /// leaves the deleted rows null).
     ///
     /// `columns` selects a subset by **physical** column name (matching
     /// `obs_keys()`); projecting avoids materialising unselected columns. The
@@ -391,11 +421,12 @@ impl PyExperiment {
     /// path may return pandas `category` dtype (the projection dictionary-
     /// encodes key columns), whereas the cloud `CloudExperiment.read_obs` and
     /// the unprojected `read_obs()` return `object`. Compare values, not dtype.
-    #[pyo3(signature = (columns=None))]
+    #[pyo3(signature = (columns=None, *, logical=true))]
     fn read_obs<'py>(
         &self,
         py: Python<'py>,
         columns: Option<Vec<String>>,
+        logical: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Decode off the GIL; only the pyarrow/pandas conversion needs Python.
         let reader = self.reader()?;
@@ -416,8 +447,13 @@ impl PyExperiment {
                         }
                     }
                     proj.extend(cols);
-                    reader.read_obs_keys(&proj)
+                    if logical {
+                        reader.read_obs_keys_filtered(&proj)
+                    } else {
+                        reader.read_obs_keys(&proj)
+                    }
                 }
+                None if logical => reader.read_obs_filtered(),
                 None => reader.read_obs(),
             })
             .map_err(to_pyerr)?;
@@ -524,19 +560,34 @@ impl PyExperiment {
     ///   (`from_anndata` writes dictionary-encoded shards, `append` writes plain
     ///   string shards).
     ///
-    /// **Physical row space.** `len(codes) == n_obs_physical`, *not* `n_obs`. On
-    /// a file with deletion vectors those differ, and indexing `codes` by a
-    /// logical row id addresses the wrong cell — a correctly shaped array of
-    /// wrong rows. Check `exp.n_obs == exp.n_obs_physical` before treating the
-    /// codes as logical, or filter them yourself. (`read_obs` has the same
-    /// contract, for the same reason.)
+    /// **Row space.** `logical=True` (default): one code per **live** row,
+    /// `len(codes) == n_obs`, aligned with `read_obs()` and
+    /// `to_anndata(backed=True).obs`. `logical=False`: one code per physical
+    /// row, `len(codes) == n_obs_physical`, deleted rows in place. Indexing a
+    /// physical array by a logical row id (or the reverse) addresses the wrong
+    /// cell — a correctly shaped array of wrong rows — so pick the space the
+    /// consumer indexes in; `categories` is the same either way (the filter
+    /// drops rows, never levels). Changed in 0.17: the default used to be
+    /// physical, like `read_obs()`.
     ///
     /// Raises `ValueError` for non-string columns and a corrupt-file-class error
     /// for an unknown column name.
-    fn obs_categorical<'py>(&self, py: Python<'py>, col: &str) -> PyResult<PyCategorical<'py>> {
+    #[pyo3(signature = (col, *, logical=true))]
+    fn obs_categorical<'py>(
+        &self,
+        py: Python<'py>,
+        col: &str,
+        logical: bool,
+    ) -> PyResult<PyCategorical<'py>> {
         let reader = self.reader()?;
         let (codes, categories) = py
-            .detach(|| reader.obs_categorical(col))
+            .detach(|| {
+                if logical {
+                    reader.obs_categorical_filtered(col)
+                } else {
+                    reader.obs_categorical(col)
+                }
+            })
             .map_err(to_pyerr)?;
         Ok((PyArray1::from_vec(py, codes), categories))
     }
@@ -546,15 +597,23 @@ impl PyExperiment {
     /// Returns a list of `(codes, categories)` in `cols` order. N columns cost
     /// one projected read per obs shard instead of N — the difference that
     /// matters when a catalog build resolves several covariate columns over a
-    /// many-file manifest.
+    /// many-file manifest. `logical=` as on `obs_categorical`.
+    #[pyo3(signature = (cols, *, logical=true))]
     fn obs_categorical_many<'py>(
         &self,
         py: Python<'py>,
         cols: Vec<String>,
+        logical: bool,
     ) -> PyResult<Vec<PyCategorical<'py>>> {
         let reader = self.reader()?;
         let out = py
-            .detach(|| reader.obs_categorical_many(&cols))
+            .detach(|| {
+                if logical {
+                    reader.obs_categorical_many_filtered(&cols)
+                } else {
+                    reader.obs_categorical_many(&cols)
+                }
+            })
             .map_err(to_pyerr)?;
         Ok(out
             .into_iter()
@@ -766,30 +825,82 @@ impl PyExperiment {
 
     /// Mark cells as logically deleted using a boolean mask.
     ///
-    /// The mask should be a boolean numpy array whose length matches n_obs.
-    /// Cells where the mask is True are marked as deleted.
-    /// Returns the total number of deleted cells (including previously deleted).
+    /// `mask` is a boolean array (numpy, or a pandas Series) in **either row
+    /// space**, told apart by length: `n_obs` entries (the live rows — what
+    /// `read_obs()` and `to_anndata(backed=True).obs` describe; a `True` marks
+    /// that live cell) or `n_obs_physical` entries (every physical row,
+    /// already-deleted rows in place — what `read_obs(logical=False)`
+    /// describes). The two coincide on a file with no deletions. Any other
+    /// length raises naming both counts. A pandas Series with a labelled index
+    /// is also checked for order: the file's own barcodes in a different order
+    /// (a `sort_values` after `read_obs()`) raise instead of deleting the wrong
+    /// cells; a RangeIndex Series or a bare array is not checked. Non-bool
+    /// dtypes are rejected rather than coerced. Returns the total number of
+    /// deleted cells (including previously deleted).
     ///
     /// Example:
     ///     exp = pyscx.open("experiment.scx")
-    ///     adata = exp.to_anndata()
-    ///     total = exp.mark_deleted(adata.obs["is_doublet"] == True)
-    fn mark_deleted(&mut self, mask: PyReadonlyArray1<'_, bool>) -> PyResult<u64> {
-        let mask_slice = mask
+    ///     obs = exp.read_obs()
+    ///     total = exp.mark_deleted(obs["doublet_score"] > 0.5)
+    fn mark_deleted(&mut self, py: Python<'_>, mask: &Bound<'_, PyAny>) -> PyResult<u64> {
+        // A pandas Series carries its index; a RangeIndex names no rows. Only a
+        // Series is inspected — a list has an `index` *method*.
+        let series_type = crate::pyimport::import_module(py, "pandas")?.getattr("Series")?;
+        let labels: Option<Vec<String>> = if mask.is_instance(&series_type)? {
+            let index = mask.getattr("index")?;
+            let nlevels: usize = index.getattr("nlevels")?.extract()?;
+            if index.get_type().name()? == "RangeIndex" {
+                None
+            } else if nlevels > 1 {
+                // A MultiIndex compares as the composite key the key join
+                // builds: the levels' string forms joined by the separator.
+                let sep = scx_ops::COMPOSITE_KEY_SEPARATOR.to_string();
+                let rows: Vec<Vec<Bound<'_, PyAny>>> = index.call_method0("tolist")?.extract()?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let parts: Vec<String> = row
+                        .iter()
+                        .map(|x| x.str().map(|s| s.to_string()))
+                        .collect::<PyResult<_>>()?;
+                    out.push(parts.join(&sep));
+                }
+                Some(out)
+            } else {
+                Some(
+                    index
+                        .call_method1("astype", ("str",))?
+                        .call_method0("tolist")?
+                        .extract()?,
+                )
+            }
+        } else {
+            None
+        };
+        let np = crate::pyimport::import_module(py, "numpy")?;
+        let arr = np.call_method1("ascontiguousarray", (mask,))?;
+        let kind: String = arr.getattr("dtype")?.getattr("kind")?.extract()?;
+        if kind != "b" {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "mask must be a boolean array; got dtype {}. Pass a predicate result, not a \
+                 score",
+                arr.getattr("dtype")?.str()?
+            )));
+        }
+        let arr: PyReadonlyArray1<'_, bool> = arr.extract()?;
+        let mask_slice = arr
             .as_slice()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        let expected = self.reader()?.n_obs() as usize;
-        if mask_slice.len() != expected {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "mask length {} does not match n_obs {}",
-                mask_slice.len(),
-                expected
-            )));
+        let reader = self.reader()?;
+        if let Some(labels) = &labels {
+            if labels.len() == mask_slice.len() {
+                crate::convert::check_row_mask_order(reader, labels, "mark_deleted: mask")?;
+            }
         }
+        let physical = crate::convert::physical_row_mask(reader, mask_slice, "mark_deleted: mask")?;
 
         // Collect indices where mask is True
-        let indices: Vec<u64> = mask_slice
+        let indices: Vec<u64> = physical
             .iter()
             .enumerate()
             .filter(|(_, &v)| v)
@@ -1315,7 +1426,7 @@ impl PyExperiment {
         // `var_keys` getters surface the error loudly instead).
         format_anndata_repr(
             "Experiment",
-            self.logical_n_obs_of(reader),
+            self.logical_n_obs_best_effort(reader),
             reader.n_vars(),
             &[
                 (

@@ -135,6 +135,32 @@ def test_round_trips_through_doublet_import(tmp_path):
     assert obs["scrublet_status"].tolist() == ["present"] * 4
 
 
+def test_exports_only_the_live_cells_of_a_deleted_file(tmp_path):
+    """Pinned before `read_obs()` flipped to logical rows (pyscx 0.17).
+
+    `export_batches` reads obs with `logical=False` so its per-batch masks,
+    counts and exports stay byte-identical to 0.16 (`to_h5ad(obs_mask=)` itself
+    accepts either row space). What a tool receives must not change across that
+    flip: exactly the batch's live cells, never a deleted one. (The per-batch `n_cells` counts physical rows
+    and is documented as an overcount on a file with deletions; it is not
+    pinned here.)
+    """
+    scx = _fixture(tmp_path, _clean_obs())
+    pyscx.mark_deleted(str(scx), [1])  # AAAG-1, a d1 cell
+    exp = pyscx.open(str(scx))
+    assert exp.n_obs == 3 and exp.n_obs_physical == 4, "premise"
+
+    r = pyscx.export_batches(str(scx), str(tmp_path / "b"), batch_key="donor_id")
+
+    assert r["n_batches"] == 2
+    by_batch = {b["batch"]: b for b in r["batches"]}
+    d1 = anndata.read_h5ad(by_batch["d1"]["path"])
+    d2 = anndata.read_h5ad(by_batch["d2"]["path"])
+    assert list(d1.obs_names) == ["AAAC-1"], "the deleted d1 cell is not exported"
+    assert list(d2.obs_names) == ["AAAT-2", "AAAA-2"]
+    assert set(d1.obs["donor_id"]) == {"d1"} and set(d2.obs["donor_id"]) == {"d2"}
+
+
 # ---------------------------------------------------------------------------
 # The key guard
 # ---------------------------------------------------------------------------
