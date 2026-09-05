@@ -305,9 +305,35 @@ pub(crate) fn normalize_container<'py>(
     }
 
     let type_name: String = obj.get_type().getattr("__name__")?.extract()?;
+    // A `pandas.DataFrame` is representable, but only under `tagged` — it needs
+    // an envelope to carry the index, the column order and the per-column
+    // dtypes, and plain mode's contract is "lossless or refuse". Saying so
+    // beats the generic message, which would send the user looking for a
+    // `.tolist()` that would not help them.
+    if type_name == "DataFrame" && is_pandas_type(obj)? {
+        return Err(PyValueError::new_err(format!(
+            "uns at {key_path}: a pandas DataFrame cannot be written under \
+             uns_format='plain' without losing its index, column order and dtypes; \
+             use the default uns_format='tagged'"
+        )));
+    }
     Err(PyValueError::new_err(format!(
-        "uns at {key_path}: cannot serialize {type_name} to JSON; supported types are None, bool, int, float, str, dict, list, tuple, NumPy arrays/scalars, and any object exposing a callable .tolist() (pandas Series/Index/Categorical)"
+        "uns at {key_path}: cannot serialize {type_name} to JSON; supported types are None, bool, int, float, str, dict, list, tuple, NumPy arrays/scalars, pandas DataFrames (tagged mode), and any object exposing a callable .tolist() (pandas Series/Index/Categorical)"
     )))
+}
+
+/// True if `obj`'s type is defined in pandas.
+///
+/// Read off `type(obj).__module__` rather than by `isinstance`, because the
+/// sole caller is the terminal error arm — reached in plain mode, where the
+/// writer has deliberately never imported pandas. Importing it just to phrase
+/// an error would pay the import on every unsupported value.
+fn is_pandas_type(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let module: String = match obj.get_type().getattr("__module__") {
+        Ok(m) => m.extract().unwrap_or_default(),
+        Err(_) => return Ok(false),
+    };
+    Ok(module == "pandas" || module.starts_with("pandas."))
 }
 
 /// Wrap a NumPy scalar (`np.generic` instance) in a `scalar` envelope under
@@ -690,9 +716,201 @@ pub(crate) fn ndarray_bytes_le<'py>(arr: &Bound<'py, PyAny>, key_path: &str) -> 
     Ok(pybytes.as_bytes().to_vec())
 }
 
-/// In tagged mode, recognize a pandas `Index` / `Series` / `Categorical`
-/// and emit the corresponding envelope. Returns `Ok(None)` if `obj` is not
-/// a pandas object (caller falls back to the generic `.tolist()` path).
+/// The `categorical` envelope: `{"__scx_type__": "categorical", "categories":
+/// <ndarray envelope>, "codes": <ndarray envelope>, "ordered": <bool>}`.
+///
+/// Shared by the standalone `pd.Categorical` arm of [`encode_pandas_tagged`]
+/// and by a categorical *column* of a `pandas.DataFrame`, so the two cannot
+/// drift into emitting different shapes for the same Python object.
+fn categorical_envelope<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let categories = obj.getattr("categories")?;
+    let codes = obj.getattr("codes")?;
+    let ordered: bool = obj.getattr("ordered")?.extract()?;
+    let cats_inner = encode_ndarray_tagged(
+        &categories.call_method1("to_numpy", ())?,
+        &format!("{key_path}.categories"),
+        ctx,
+    )?;
+    let codes_inner = encode_ndarray_tagged(&codes, &format!("{key_path}.codes"), ctx)?;
+    let mut env = serde_json::Map::new();
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("categorical".to_string()),
+    );
+    env.insert("categories".to_string(), cats_inner);
+    env.insert("codes".to_string(), codes_inner);
+    env.insert("ordered".to_string(), serde_json::Value::Bool(ordered));
+    Ok(serde_json::Value::Object(env))
+}
+
+/// The `pandas.Index` envelope: `{"__scx_type__": "pandas.Index", "name":
+/// <scalar>, "data": <ndarray envelope>}`.
+///
+/// Shared by the standalone `pd.Index` arm of [`encode_pandas_tagged`] and by
+/// the `index` slot of a `pandas.DataFrame` envelope, which is why a frame
+/// needs no separate spelling for its index name.
+fn index_envelope<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let name = obj.getattr("name")?;
+    let values = obj.call_method1("to_numpy", ())?;
+    let inner = encode_ndarray_tagged(&values, key_path, ctx)?;
+    let mut env = serde_json::Map::new();
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("pandas.Index".to_string()),
+    );
+    env.insert("name".to_string(), pyobj_to_simple_json(&name, key_path)?);
+    env.insert("data".to_string(), inner);
+    Ok(serde_json::Value::Object(env))
+}
+
+/// Encode a `pandas.DataFrame` as a tagged envelope:
+///
+/// ```json
+/// {"__scx_type__": "pandas.DataFrame",
+///  "index": <pandas.Index envelope>,
+///  "columns": ["b", "a"],
+///  "columns_name": <scalar, omitted when null>,
+///  "data": {"a": <ndarray | categorical envelope>, "b": ...}}
+/// ```
+///
+/// `columns` is an explicit ordered list because JSON object member order is
+/// not a contract — `data` alone could not restore the frame's column order.
+/// Nothing new exists at the leaf: every column is one of the two envelopes
+/// that already round-trip.
+///
+/// One documented gap: a frame with **zero columns** reads back with pandas'
+/// default empty `RangeIndex` for `columns`, whatever the original empty index
+/// type was. The envelope carries column names, and with no names there is
+/// nothing for a dtype to travel on.
+///
+/// Refusals, all `ValueError` naming the offending column:
+/// - a `MultiIndex` on either axis (a lossless MultiIndex envelope is a
+///   separate design; scanpy's uns tables are flat);
+/// - a non-string column name (names key the `data` JSON object);
+/// - a duplicate column name — `data` is an object, so duplicates would
+///   silently collapse and hand one column's values to another;
+/// - any remaining extension dtype (`Int64`, `boolean`, `string[python]`,
+///   `datetime64`, ...), which has no lossless NumPy spelling. `to_numpy()`
+///   would quietly produce `object` full of `pd.NA`, or a float column with
+///   the integer-ness gone.
+///
+/// **Depth.** Reached from `normalize_container` *after* the single
+/// `ctx.visiting` insert, and it calls the leaf encoders directly rather than
+/// re-entering [`normalize_uns_value`] — so a frame costs exactly one
+/// container level, the way a `tuple` does, even though its JSON is deeper.
+/// See `scx_format::UNS_DATAFRAME_ENVELOPE_JSON_LEVELS`.
+fn dataframe_envelope<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let py = obj.py();
+    let pd = ctx.pandas(py)?.clone();
+    let multi_cls = pd.getattr("MultiIndex")?;
+    let cat_dtype_cls = pd.getattr("CategoricalDtype")?;
+
+    let index = obj.getattr("index")?;
+    let columns = obj.getattr("columns")?;
+    for (axis, axis_obj) in [("index", &index), ("columns", &columns)] {
+        if axis_obj.is_instance(&multi_cls)? {
+            return Err(PyValueError::new_err(format!(
+                "uns at {key_path}: DataFrame {axis} is a MultiIndex, which has no lossless \
+                 uns encoding; flatten it first (e.g. `df.reset_index()` or \
+                 `df.columns = ['_'.join(c) for c in df.columns]`)"
+            )));
+        }
+    }
+
+    // Column names first: they key `data`, so every later step depends on them
+    // being unique strings.
+    let mut names: Vec<String> = Vec::with_capacity(columns.len()?);
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, col) in columns.try_iter()?.enumerate() {
+        let col = col?;
+        let name: String = match col.cast::<PyString>() {
+            Ok(s) => s.extract()?,
+            Err(_) => {
+                let type_name: String = col.get_type().getattr("__name__")?.extract()?;
+                return Err(PyValueError::new_err(format!(
+                    "uns at {key_path}: DataFrame column name at position {i} is a \
+                     {type_name}, but uns column names must be str (they key the \
+                     envelope's `data` object); use `df.columns = df.columns.astype(str)`"
+                )));
+            }
+        };
+        if !seen.insert(name.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "uns at {key_path}: duplicate column name {name:?}; the envelope stores \
+                 columns in a JSON object, so duplicates would silently collapse into one"
+            )));
+        }
+        names.push(name);
+    }
+
+    let mut data = serde_json::Map::with_capacity(names.len());
+    for name in &names {
+        let col_path = format!("{key_path}['{name}']");
+        let series = obj.get_item(name.as_str())?;
+        let dtype = series.getattr("dtype")?;
+        let encoded = if dtype.is_instance(&cat_dtype_cls)? {
+            // `Series.array` of a categorical Series *is* the `pd.Categorical`.
+            categorical_envelope(&series.getattr("array")?, &col_path, ctx)?
+        } else {
+            if pd
+                .getattr("api")?
+                .getattr("types")?
+                .call_method1("is_extension_array_dtype", (&dtype,))?
+                .extract::<bool>()?
+            {
+                let dtype_str: String = dtype.str()?.extract()?;
+                return Err(PyValueError::new_err(format!(
+                    "uns at {col_path}: column dtype {dtype_str} is a pandas extension \
+                     dtype with no lossless NumPy form; cast it first (e.g. \
+                     `.astype('float64')` for a nullable integer, `.astype(object)` for \
+                     a nullable string)"
+                )));
+            }
+            encode_ndarray_tagged(&series.call_method1("to_numpy", ())?, &col_path, ctx)?
+        };
+        data.insert(name.clone(), encoded);
+    }
+
+    let mut env = serde_json::Map::new();
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("pandas.DataFrame".to_string()),
+    );
+    env.insert(
+        "index".to_string(),
+        index_envelope(&index, &format!("{key_path}.index"), ctx)?,
+    );
+    env.insert(
+        "columns".to_string(),
+        serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+    );
+    let columns_name = columns.getattr("name")?;
+    if !columns_name.is_none() {
+        env.insert(
+            "columns_name".to_string(),
+            pyobj_to_simple_json(&columns_name, &format!("{key_path}.columns.name"))?,
+        );
+    }
+    env.insert("data".to_string(), serde_json::Value::Object(data));
+    Ok(serde_json::Value::Object(env))
+}
+
+/// In tagged mode, recognize a pandas `DataFrame` / `Index` / `Series` /
+/// `Categorical` and emit the corresponding envelope. Returns `Ok(None)` if
+/// `obj` is not a pandas object (caller falls back to the generic `.tolist()`
+/// path).
 pub(crate) fn encode_pandas_tagged<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
@@ -700,43 +918,21 @@ pub(crate) fn encode_pandas_tagged<'py>(
 ) -> PyResult<Option<serde_json::Value>> {
     let py = obj.py();
     let pd = ctx.pandas(py)?.clone();
+    let frame_cls = pd.getattr("DataFrame")?;
     let cat_cls = pd.getattr("Categorical")?;
     let idx_cls = pd.getattr("Index")?;
     let series_cls = pd.getattr("Series")?;
 
+    if obj.is_instance(&frame_cls)? {
+        return Ok(Some(dataframe_envelope(obj, key_path, ctx)?));
+    }
+
     if obj.is_instance(&cat_cls)? {
-        let categories = obj.getattr("categories")?;
-        let codes = obj.getattr("codes")?;
-        let ordered: bool = obj.getattr("ordered")?.extract()?;
-        let cats_inner = encode_ndarray_tagged(
-            &categories.call_method1("to_numpy", ())?,
-            &format!("{key_path}.categories"),
-            ctx,
-        )?;
-        let codes_inner = encode_ndarray_tagged(&codes, &format!("{key_path}.codes"), ctx)?;
-        let mut env = serde_json::Map::new();
-        env.insert(
-            SCX_TYPE_KEY.to_string(),
-            serde_json::Value::String("categorical".to_string()),
-        );
-        env.insert("categories".to_string(), cats_inner);
-        env.insert("codes".to_string(), codes_inner);
-        env.insert("ordered".to_string(), serde_json::Value::Bool(ordered));
-        return Ok(Some(serde_json::Value::Object(env)));
+        return Ok(Some(categorical_envelope(obj, key_path, ctx)?));
     }
 
     if obj.is_instance(&idx_cls)? {
-        let name = obj.getattr("name")?;
-        let values = obj.call_method1("to_numpy", ())?;
-        let inner = encode_ndarray_tagged(&values, key_path, ctx)?;
-        let mut env = serde_json::Map::new();
-        env.insert(
-            SCX_TYPE_KEY.to_string(),
-            serde_json::Value::String("pandas.Index".to_string()),
-        );
-        env.insert("name".to_string(), pyobj_to_simple_json(&name, key_path)?);
-        env.insert("data".to_string(), inner);
-        return Ok(Some(serde_json::Value::Object(env)));
+        return Ok(Some(index_envelope(obj, key_path, ctx)?));
     }
 
     if obj.is_instance(&series_cls)? {
@@ -973,6 +1169,9 @@ pub(crate) fn envelope_required_keys(tag: &str) -> Option<&'static [&'static str
         "categorical" => Some(&["categories", "codes", "ordered"]),
         "pandas.Index" => Some(&["data", "name"]),
         "pandas.Series" => Some(&["data", "name"]),
+        // `columns_name` is optional (omitted when `df.columns.name` is None),
+        // so it is not a structural key.
+        "pandas.DataFrame" => Some(&["index", "columns", "data"]),
         _ => None,
     }
 }
@@ -1000,6 +1199,7 @@ pub(crate) fn decode_tagged_envelope<'py>(
         "categorical" => decode_categorical_envelope(map, ctx),
         "pandas.Index" => decode_pandas_index_envelope(map, ctx),
         "pandas.Series" => decode_pandas_series_envelope(map, ctx),
+        "pandas.DataFrame" => decode_dataframe_envelope(map, ctx),
         other => Err(PyValueError::new_err(format!(
             "uns: envelope tag '{other}' has required keys registered but no decoder"
         ))),
@@ -1319,6 +1519,85 @@ pub(crate) fn decode_pandas_index_envelope<'py>(
     let kwargs = PyDict::new(ctx.py);
     kwargs.set_item("name", name)?;
     idx_cls.call((data,), Some(&kwargs))
+}
+
+/// Rebuild a `pandas.DataFrame` from the `pandas.DataFrame` envelope.
+///
+/// Every leaf goes back through [`json_to_py`], so the index, the numeric /
+/// object columns and the categorical columns are reconstructed by the very
+/// decoders that already round-trip them standalone — this function only
+/// assembles them.
+///
+/// `columns` drives both the order and the membership: a name listed there but
+/// absent from `data` is a malformed envelope, not a column to skip silently.
+/// Passing `columns=` to the constructor pins the order rather than trusting
+/// the insertion order of the dict we build.
+pub(crate) fn decode_dataframe_envelope<'py>(
+    map: &serde_json::Map<String, serde_json::Value>,
+    ctx: &mut UnsReadCtx<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let names = match require_value_json(map, "columns")? {
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_owned).ok_or_else(|| {
+                    PyValueError::new_err(
+                        "uns DataFrame envelope: 'columns' element is not a string",
+                    )
+                })
+            })
+            .collect::<PyResult<Vec<String>>>()?,
+        _ => {
+            return Err(PyValueError::new_err(
+                "uns DataFrame envelope: 'columns' is not a list",
+            ))
+        }
+    };
+    let data_map = match require_value_json(map, "data")? {
+        serde_json::Value::Object(m) => m,
+        _ => {
+            return Err(PyValueError::new_err(
+                "uns DataFrame envelope: 'data' is not an object",
+            ))
+        }
+    };
+
+    let index = json_to_py(require_value_json(map, "index")?, ctx)?;
+    let columns_name = match map.get("columns_name") {
+        Some(v) => Some(json_to_py(v, ctx)?),
+        None => None,
+    };
+
+    let py = ctx.py;
+    let data = PyDict::new(py);
+    for name in &names {
+        let col_v = data_map.get(name.as_str()).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "uns DataFrame envelope: column {name:?} is listed in 'columns' but missing from 'data'"
+            ))
+        })?;
+        let decoded = json_to_py(col_v, ctx)?;
+        data.set_item(name.as_str(), decoded)?;
+    }
+
+    let pd = ctx.pandas()?.clone();
+    let frame_cls = pd.getattr("DataFrame")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("index", index)?;
+    // Passing `columns=[]` for a zero-column frame would build an empty
+    // *object* columns Index, where pandas' own no-columns constructor yields
+    // an empty `RangeIndex`. With no names there is nothing for a dtype to
+    // hang on, so we reproduce the constructor default instead of inventing a
+    // different empty. Documented on the envelope: a zero-column frame is the
+    // one case whose columns index type is not carried.
+    if !names.is_empty() {
+        kwargs.set_item("columns", PyList::new(py, &names)?)?;
+    }
+    let frame = frame_cls.call((data,), Some(&kwargs))?;
+    if let Some(cn) = columns_name {
+        frame.getattr("columns")?.setattr("name", cn)?;
+    }
+    Ok(frame)
 }
 
 pub(crate) fn decode_pandas_series_envelope<'py>(

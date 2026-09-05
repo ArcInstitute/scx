@@ -9,15 +9,17 @@
 
 use crate::h5_write_util::vlu;
 use crate::pipeline::ConvertError;
+use crate::warnings::WarningSink;
 use hdf5::types::VarLenUnicode;
 use scx_format_io::SERDE_JSON_MAX_NESTING;
 
 pub(crate) fn write_uns_entries_at(
     group: &hdf5::Group,
     value: &serde_json::Value,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     // `group` is the `/uns` group: container level 1.
-    write_uns_entries(group, value, 1)
+    write_uns_entries(group, value, 1, sink)
 }
 
 /// `depth` counts container levels already committed to, `group` included, so
@@ -33,10 +35,11 @@ pub(super) fn write_uns_entries(
     group: &hdf5::Group,
     value: &serde_json::Value,
     depth: usize,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if let serde_json::Value::Object(map) = value {
         for (key, val) in map {
-            write_uns_value(group, key, val, depth)?;
+            write_uns_value(group, key, val, depth, sink)?;
         }
     }
     Ok(())
@@ -47,6 +50,7 @@ fn write_uns_value(
     name: &str,
     value: &serde_json::Value,
     depth: usize,
+    sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     match value {
         serde_json::Value::Number(n) => {
@@ -148,18 +152,20 @@ fn write_uns_value(
             // arrays) decodes back to a native HDF5 dataset. Anything else —
             // a plain dict, or a pyscx-only envelope (recarray / tuple /
             // pandas.*) — falls through to the generic subgroup recursion.
-            if !try_write_uns_envelope(group, name, map)? {
-                // Refuse before descending: the subgroup would be level
-                // `depth + 1`, and this walk is recursive, so an unbounded
-                // tree overflows the stack and aborts the process.
-                if depth >= SERDE_JSON_MAX_NESTING {
-                    return Err(ConvertError::UnsTooDeep {
-                        path: name.to_string(),
-                        max_depth: SERDE_JSON_MAX_NESTING,
-                    });
-                }
+            // A `pandas.DataFrame` envelope becomes a real anndata dataframe
+            // group; the frame group is one level, exactly like the fallback
+            // subgroup below, so it takes the same guard.
+            if depth >= SERDE_JSON_MAX_NESTING {
+                return Err(ConvertError::UnsTooDeep {
+                    path: name.to_string(),
+                    max_depth: SERDE_JSON_MAX_NESTING,
+                });
+            }
+            if !super::uns_dataframe::try_write_uns_dataframe(group, name, map, sink)?
+                && !try_write_uns_envelope(group, name, map)?
+            {
                 let subgroup = group.create_group(name)?;
-                write_uns_entries(&subgroup, value, depth + 1)?;
+                write_uns_entries(&subgroup, value, depth + 1, sink)?;
             }
         }
         serde_json::Value::Null => {
@@ -462,6 +468,7 @@ mod uns_envelope_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = hdf5::File::create(dir.path().join("t.h5")).unwrap();
         let uns = file.create_group("uns").unwrap();
+        let mut sink = WarningSink::log();
 
         let env = |extra: &[(&str, serde_json::Value)]| {
             let mut m = serde_json::Map::new();
@@ -479,7 +486,7 @@ mod uns_envelope_tests {
         // (1) missing `data` → fallback.
         let mut no_data = env(&[]);
         no_data.as_object_mut().unwrap().remove("data");
-        write_uns_value(&uns, "no_data", &no_data, 1).unwrap();
+        write_uns_value(&uns, "no_data", &no_data, 1, &mut sink).unwrap();
 
         // (2) non-integer shape dim → fallback (no wrong-rank dataset).
         write_uns_value(
@@ -487,11 +494,19 @@ mod uns_envelope_tests {
             "bad_shape",
             &env(&[("shape", serde_json::json!([2, null]))]),
             1,
+            &mut sink,
         )
         .unwrap();
 
         // (3) big-endian byte order → fallback (no abort, no byte-swap misread).
-        write_uns_value(&uns, "big_endian", &env(&[("dtype", ">f8".into())]), 1).unwrap();
+        write_uns_value(
+            &uns,
+            "big_endian",
+            &env(&[("dtype", ">f8".into())]),
+            1,
+            &mut sink,
+        )
+        .unwrap();
 
         // Each fell back to a subgroup that preserved the raw envelope fields.
         for key in ["no_data", "bad_shape", "big_endian"] {
@@ -506,7 +521,7 @@ mod uns_envelope_tests {
 
         // A well-formed little-endian envelope still writes a real dataset
         // (not a subgroup), confirming the fallback is scoped to the bad cases.
-        write_uns_value(&uns, "good", &env(&[]), 1).unwrap();
+        write_uns_value(&uns, "good", &env(&[]), 1, &mut sink).unwrap();
         assert!(
             uns.dataset("good").is_ok(),
             "valid envelope should write a dataset"

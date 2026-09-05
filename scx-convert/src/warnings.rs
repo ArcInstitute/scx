@@ -24,12 +24,20 @@ pub enum ConvertWarning {
     InferredEncoding { path: String, inferred: String },
     /// An `uns` entry could not be represented and was skipped.
     SkippedUnsKey { key: String, reason: String },
-    /// A `uns` entry stored as a pandas DataFrame (`encoding-type ==
-    /// "dataframe"`) was preserved as a nested dict (per-column values +
-    /// `_index`) rather than reconstructed as a DataFrame. The column data
-    /// survives, but column order and per-column categorical dtypes are not
-    /// restored on read. Surfaces the structure loss so it is never silent.
-    FlattenedUnsDataframe { key: String },
+    /// One column of a `uns` pandas DataFrame had no lossless representation
+    /// and was left out of the reconstructed frame. The rest of the frame —
+    /// index, column order, every other column — is intact.
+    ///
+    /// Reached for anndata's nullable encodings (`nullable-integer`,
+    /// `nullable-boolean`, `nullable-string-array`) and for any column dtype
+    /// the `uns` envelope cannot spell. Dropping the one column mirrors what
+    /// the export side does with a column it cannot write, and is preferred to
+    /// flattening the whole frame back to a dict over a single bad column.
+    UnsupportedUnsDataframeColumn {
+        key: String,
+        column: String,
+        reason: String,
+    },
     /// A `uns` entry stored as a scipy-sparse matrix (`encoding-type` ==
     /// `"csr_matrix"` / `"csc_matrix"` / `"coo_matrix"`) was preserved as a
     /// nested dict of `data` / `indices` / `indptr` arrays rather than
@@ -211,7 +219,7 @@ impl ConvertWarning {
         match self {
             Self::InferredEncoding { .. } => "inferred_encoding",
             Self::SkippedUnsKey { .. } => "skipped_uns_key",
-            Self::FlattenedUnsDataframe { .. } => "flattened_uns_dataframe",
+            Self::UnsupportedUnsDataframeColumn { .. } => "unsupported_uns_dataframe_column",
             Self::FlattenedUnsSparse { .. } => "flattened_uns_sparse",
             Self::MissingPresetIndexColumn { .. } => "missing_preset_index_column",
             Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
@@ -268,12 +276,15 @@ impl fmt::Display for ConvertWarning {
                     n = missing.len(),
                 )
             }
-            Self::FlattenedUnsDataframe { key } => write!(
+            Self::UnsupportedUnsDataframeColumn {
+                key,
+                column,
+                reason,
+            } => write!(
                 f,
-                "uns['{key}'] is a pandas DataFrame; it was preserved as a nested \
-                 dict (per-column values + `_index`) but not reconstructed as a \
-                 DataFrame — column order and per-column categorical dtypes are not \
-                 restored on read."
+                "uns['{key}'] column '{column}' has no lossless uns encoding \
+                 ({reason}); it was left out of the reconstructed DataFrame. The \
+                 index, the column order and every other column are intact."
             ),
             Self::FlattenedUnsSparse { key, format } => write!(
                 f,

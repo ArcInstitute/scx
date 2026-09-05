@@ -89,6 +89,32 @@ def test_read_uns_parity_with_to_anndata(synthetic_adata, tmp_dir):
         assert direct[k] == via_anndata[k], f"uns[{k!r}] mismatch"
 
 
+def test_read_uns_parity_with_to_anndata_for_a_dataframe(synthetic_adata, tmp_dir):
+    """The same parity claim, on a value that `==` cannot check.
+
+    The parity test above compares each key with `==`. That is fine for the
+    scalars its fixture carries, but `==` on two DataFrames returns a *frame* —
+    truthy-ambiguous, so it would raise instead of comparing and could never
+    catch a decoder wired into only one of the two read paths. This arm makes
+    the same claim with the comparison that actually holds.
+    """
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {"v": [1.0, 2.0], "c": pd.Categorical(["a", "b"], ordered=True)},
+        index=pd.Index(["r0", "r1"], name="row"),
+    )
+    adata = synthetic_adata.copy()
+    adata.uns["frame"] = df
+
+    path = str(tmp_dir / "frame_parity.scx")
+    pyscx.write(adata, path)
+    exp = pyscx.open(path)
+
+    pd.testing.assert_frame_equal(exp.read_uns()["frame"], df, check_dtype=True)
+    pd.testing.assert_frame_equal(exp.to_anndata().uns["frame"], df, check_dtype=True)
+
+
 def test_read_uns_none_when_absent(tmp_dir):
     """`read_uns()` returns None on a file written without any uns."""
     import anndata

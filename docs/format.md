@@ -260,15 +260,19 @@ The `uns_blob` section is a UTF-8 JSON document. Container nesting inside it is
 bounded, and a conforming writer MUST NOT exceed **60 levels** — counting
 dicts, lists and tuples from the `uns` root, where a tagged envelope
 (`{"__scx_type__": "tuple", "data": [...]}`) is one level even though it
-occupies two in the JSON.
+occupies two in the JSON. The same rule covers the deeper envelopes: a
+`pandas.DataFrame` is one level though its deepest path (frame → `data` → a
+categorical column → that column's `categories` array → its JSON element list)
+occupies five.
 
 The bound is not decorative. Every producer and consumer of this section walks
 it recursively, so an unbounded tree exhausts the stack and aborts the process
 instead of raising. Independently, the reference JSON parser stops at **127**
 nesting levels while its serializer has no limit at all — so an uncapped writer
 can emit a section that no reader can take back. 60 containers is the deepest
-tree that still fits under 127 in the worst case, where every container is a
-two-level tagged tuple.
+tree that still fits under 127 in the worst case: 59 two-level tagged tuples
+under the `uns` root, with the innermost one replaced by a five-level
+`pandas.DataFrame` envelope (1 + 2×58 + 5 = 122).
 
 Readers SHOULD accept up to 127 levels rather than 60, so that a file written
 before this bound existed still opens if it is parseable at all.

@@ -143,6 +143,8 @@ def test_obs_import_under_restricted_exec(sandbox_env, synthetic_adata, tmp_path
 def test_set_uns_and_modify_metadata_under_restricted_exec(
     sandbox_env, synthetic_adata
 ):
+    import pandas as pd
+
     path = sandbox_env["outputs"]["result"]
     pyscx.write(synthetic_adata, path)
     run_sandboxed(
@@ -152,6 +154,24 @@ def test_set_uns_and_modify_metadata_under_restricted_exec(
     )
     exp = pyscx.open(path)
     assert exp.read_uns()["sandboxed"] is True
+
+    # A DataFrame value too: writing one calls `.dtype` / `.to_numpy()` on each
+    # column and reading one constructs `pd.DataFrame`, both of which can drive
+    # C-level lazy imports that resolve from the innermost Python frame's
+    # builtins — the failure mode `_frame_safe` exists for.
+    frame = pd.DataFrame(
+        {"v": [1.0, 2.0], "c": pd.Categorical(["a", "b"], ordered=True)},
+        index=pd.Index(["r0", "r1"], name="row"),
+    )
+    run_sandboxed(
+        "pyscx.set_uns(path, {'table': frame})",
+        pyscx=pyscx,
+        path=path,
+        frame=frame,
+    )
+    pd.testing.assert_frame_equal(
+        pyscx.open(path).read_uns()["table"], frame, check_dtype=True
+    )
 
     # modify_metadata too — with an actual obs replacement, so the
     # pandas/pyarrow interop path runs inside the sandbox (an earlier

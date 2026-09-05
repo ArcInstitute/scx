@@ -765,10 +765,45 @@ def test_update_uns_rejects_a_non_dict_and_writes_nothing(synthetic_adata, scx_f
     path = scx_from_adata(synthetic_adata)
     pyscx.set_uns(path, {"a": 1})
     before = open(path, "rb").read()
-    for bad in [(1, 2), [1, 2], np.array([1.0]), "s", 3]:
+    import pandas as pd
+
+    # A DataFrame joins the list for the reason the guard exists: under the
+    # tagged format it normalises to a JSON *object* (its envelope), which the
+    # Rust side would otherwise merge key-by-key — splattering `__scx_type__`,
+    # `index`, `columns` and `data` across the top level of uns.
+    for bad in [(1, 2), [1, 2], np.array([1.0]), "s", 3, pd.DataFrame({"a": [1]})]:
         with pytest.raises(ValueError, match="must be a dict"):
             pyscx.update_uns(path, bad)
     assert open(path, "rb").read() == before
+
+
+def test_set_uns_and_update_uns_accept_a_dataframe_value(
+    synthetic_adata, scx_from_adata
+):
+    """A frame as a *value* inside the dict — the shape `uns[key]["pts"]` has.
+
+    Both writers go through the same `normalize_uns_value`, so this is really
+    one assertion made twice; it is worth making twice because they are
+    separate public entry points and only `from_anndata` had coverage.
+    """
+    import pandas as pd
+
+    path = scx_from_adata(synthetic_adata)
+    df = pd.DataFrame(
+        {"score": [0.5, 1.5], "tag": pd.Categorical(["x", "y"], ordered=True)},
+        index=pd.Index(["r0", "r1"], name="row"),
+    )
+
+    pyscx.set_uns(path, {"table": df, "n": 2})
+    got = pyscx.open(path).read_uns()
+    pd.testing.assert_frame_equal(got["table"], df, check_dtype=True)
+    assert got["n"] == 2
+
+    other = pd.DataFrame({"z": [9.0]}, index=["only"])
+    pyscx.update_uns(path, {"table2": other})
+    got = pyscx.open(path).read_uns()
+    pd.testing.assert_frame_equal(got["table"], df, check_dtype=True)
+    pd.testing.assert_frame_equal(got["table2"], other, check_dtype=True)
 
 
 def test_update_uns_then_rollback(synthetic_adata, scx_from_adata):

@@ -232,7 +232,7 @@ fn write_h5mu_root_attrs_and_global_blocks(
     // Global uns.
     if let Ok(uns) = reader.read_uns() {
         let uns_group = root.create_group("uns")?;
-        write_uns_entries_at(&uns_group, &uns)?;
+        write_uns_entries_at(&uns_group, &uns, sink)?;
     }
 
     Ok(())
@@ -427,7 +427,7 @@ pub fn scx_modality_to_h5ad_streaming(
             crate::h5ad::stream_write::EXPORT_PROVENANCE_KEY: note,
         });
         let uns_group = root.create_group("uns")?;
-        write_uns_entries_at(&uns_group, &uns)?;
+        write_uns_entries_at(&uns_group, &uns, sink)?;
     }
 
     Ok(())

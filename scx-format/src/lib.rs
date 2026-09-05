@@ -69,6 +69,17 @@ pub const MAX_UNS_DEPTH: usize = 60;
 /// deserializer guarantees rather than to what a particular call site enables.
 pub const SERDE_JSON_MAX_NESTING: usize = 127;
 
+/// JSON levels a `pandas.DataFrame` envelope occupies for the *one* container
+/// level it costs a writer's depth counter.
+///
+/// The deepest path through the envelope is
+/// frame → `"data"` → a `categorical` column envelope → its `"categories"`
+/// `ndarray` envelope → that envelope's `"data"` JSON array. A frame cannot
+/// contain another frame (its columns are Series), so this expansion applies
+/// at most once in any root-to-leaf path — which is what keeps it out of the
+/// multiplier below and in the additive term instead.
+pub const UNS_DATAFRAME_ENVELOPE_JSON_LEVELS: usize = 5;
+
 // `MAX_UNS_DEPTH` is *derived* from `SERDE_JSON_MAX_NESTING`, not chosen, and
 // the derivation is enforced here so that raising the cap past what the reader
 // can parse is a compile error rather than a class of silently unreadable
@@ -77,18 +88,43 @@ pub const SERDE_JSON_MAX_NESTING: usize = 127;
 // The conversion factor is the tagged-envelope encoding: a Python tuple is
 // written as `{"__scx_type__": "tuple", "data": [...]}`, which is *two* JSON
 // levels for one container, while a dict or list is one. The `uns` root is
-// always a dict, so the worst case is one object plus `MAX_UNS_DEPTH - 1`
-// tuples:
+// always a dict, so the all-tuples worst case is one object plus
+// `MAX_UNS_DEPTH - 1` tuples:
 //
 //     1 + 2 * (MAX_UNS_DEPTH - 1)  <=  SERDE_JSON_MAX_NESTING
 //
 // Confirmed by measurement at the boundary: 63 nested tuples under the `uns`
 // dict is 64 containers and 127 JSON levels and reads back; 64 tuples is 129
-// levels and does not. `MAX_UNS_DEPTH` sits below that ceiling deliberately —
-// real `uns` is 3–6 deep (scanpy's deepest standard structure,
-// `rank_genes_groups`, is 3), so the headroom costs nothing and absorbs any
-// future envelope that expands by more than 2x.
+// levels and does not.
 const _: () = assert!(2 * MAX_UNS_DEPTH - 1 <= SERDE_JSON_MAX_NESTING);
+
+// The all-tuples case is no longer the deepest encoding. A `pandas.DataFrame`
+// envelope expands by [`UNS_DATAFRAME_ENVELOPE_JSON_LEVELS`] rather than 2,
+// and since a frame can hold no frame it appears at most once per path — so
+// the bound swaps the innermost tuple for a frame:
+//
+//     1 + 2 * (MAX_UNS_DEPTH - 2) + UNS_DATAFRAME_ENVELOPE_JSON_LEVELS
+//         <=  SERDE_JSON_MAX_NESTING
+//
+// At today's constants that is 1 + 116 + 5 = 122 against a ceiling of 127.
+//
+// This is an *upper* bound, not a tree pyscx emits. Reaching all five levels
+// needs an object-dtype categorical column, and pyscx's object/string walker
+// draws on the same 60-level budget as the containers — so its writer refuses
+// such a frame one container short of the cap, landing at 120. The bound is
+// deliberately the looser of the two, because `validate_uns_depth` also gates
+// trees built directly in Rust (e.g. `scx-ops` merge under
+// `UnsPolicy::Namespace`, which wraps each input in another level) where that
+// walker never runs.
+//
+// The remaining headroom is not large enough to absorb an arbitrary future
+// envelope, which is exactly why this assert names the expansion instead of
+// leaving it to a comment. Real `uns` is nowhere near: scanpy's deepest
+// standard structure, `rank_genes_groups`, is 3 containers, and its `pts`
+// frame makes it 4.
+const _: () = assert!(
+    1 + 2 * (MAX_UNS_DEPTH - 2) + UNS_DATAFRAME_ENVELOPE_JSON_LEVELS <= SERDE_JSON_MAX_NESTING
+);
 
 /// Reject an `uns` tree that could not be read back, before it is serialized.
 ///
@@ -336,6 +372,75 @@ mod uns_depth_tests {
             parse_uns_json(json.as_bytes()).is_ok(),
             "a tree at the write cap must be readable, or the cap is wrong"
         );
+    }
+
+    /// The `pandas.DataFrame` half of the derivation, at the bound the assert
+    /// above claims: a frame at container level `MAX_UNS_DEPTH`, spelled the
+    /// way pyscx's encoder spells one — ordered categorical column with object
+    /// categories, the branch that reaches
+    /// [`UNS_DATAFRAME_ENVELOPE_JSON_LEVELS`] levels.
+    ///
+    /// pyscx's own writer stops one container short of this (its object-array
+    /// walker shares the 60-level budget), so this is the looser bound that
+    /// also covers hand-built Rust trees. Checking the loose one is the point:
+    /// if the frame's expansion were larger than the constant claims, the
+    /// storage gate would admit a tree the parser refuses — silently
+    /// unreadable files, the whole failure this derivation exists to prevent.
+    /// Measuring against the parser rather than asserting the arithmetic is
+    /// what makes that impossible to get wrong on paper.
+    #[test]
+    fn worst_case_dataframe_encoding_at_max_depth_still_parses() {
+        // The deepest path a frame envelope can take, verbatim.
+        let frame = concat!(
+            r#"{"__scx_type__":"pandas.DataFrame","#,
+            r#""index":{"__scx_type__":"pandas.Index","name":null,"#,
+            r#""data":{"__scx_type__":"ndarray","dtype":"object","shape":[1],"#,
+            r#""encoding":"json","data":["r0"]}},"#,
+            r#""columns":["g"],"#,
+            r#""data":{"g":{"__scx_type__":"categorical","ordered":true,"#,
+            r#""codes":{"__scx_type__":"ndarray","dtype":"|i1","shape":[1],"#,
+            r#""encoding":"base64le","data":"AA=="},"#,
+            r#""categories":{"__scx_type__":"ndarray","dtype":"object","shape":[1],"#,
+            r#""encoding":"json","data":["a"]}}}}"#,
+        );
+
+        // Pin the constant to the literal above rather than trusting it: this
+        // is the one place the two can be compared.
+        assert_eq!(
+            json_max_depth(&serde_json::from_str(frame).unwrap()),
+            UNS_DATAFRAME_ENVELOPE_JSON_LEVELS,
+            "the frame envelope's JSON depth must be what the derivation claims"
+        );
+
+        // `uns` root object (1 container) + MAX_UNS_DEPTH - 2 tuples + the
+        // frame (1 container) == MAX_UNS_DEPTH containers, the write cap.
+        let mut json = String::from(frame);
+        for _ in 0..MAX_UNS_DEPTH - 2 {
+            json = format!(r#"{{"__scx_type__":"tuple","data":[{json}]}}"#);
+        }
+        json = format!(r#"{{"deep":{json}}}"#);
+
+        assert!(
+            validate_uns_depth(&serde_json::from_str::<serde_json::Value>(&json).unwrap()).is_ok(),
+            "the storage gate must accept a tree at the write cap"
+        );
+        assert!(
+            parse_uns_json(json.as_bytes()).is_ok(),
+            "a frame at the write cap must be readable, or the cap is wrong"
+        );
+    }
+
+    /// Longest root-to-leaf container path, counting the root as 1.
+    fn json_max_depth(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Array(items) => {
+                1 + items.iter().map(json_max_depth).max().unwrap_or(0)
+            }
+            serde_json::Value::Object(map) => {
+                1 + map.values().map(json_max_depth).max().unwrap_or(0)
+            }
+            _ => 0,
+        }
     }
 }
 

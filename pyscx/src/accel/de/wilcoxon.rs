@@ -845,8 +845,8 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// pass over the matrix and is route-independent (CSC-direct and GPU included).
 /// ``pts_rest`` is scanpy's ``X[~mask_g]`` fraction — every other cell of the
 /// matrix, cells with no ``groupby`` label included — so the table equals
-/// scanpy's on partially labelled input too. pyscx's uns writer has no
-/// DataFrame encoding yet, so drop the two keys before ``from_anndata``.
+/// scanpy's on partially labelled input too. Both frames round-trip through
+/// ``from_anndata`` / ``to_anndata`` and h5ad via the uns DataFrame envelope.
 ///
 /// ``groups`` restricts which groups are *reported*, in the given order; the
 /// pool each group is compared against is unchanged, so its numbers equal the
@@ -1238,10 +1238,9 @@ fn write_de_to_adata(
 
     // `pts` / `pts_rest`: scanpy's shape exactly — a `genes × groups` DataFrame
     // indexed by the analysed var names (so `filter_rank_genes_groups`' `.loc`
-    // lookups work), float64, every gene regardless of `n_genes`. NOTE: pyscx's
-    // uns writer has no DataFrame encoding yet, so `from_anndata` refuses an
-    // adata carrying these two keys (scanpy's own `pts=True` output included);
-    // drop them before writing the file.
+    // lookups work), float64, every gene regardless of `n_genes`. The uns writer
+    // has a `pandas.DataFrame` envelope, so these two keys survive
+    // `from_anndata` and both h5ad directions unchanged.
     if let Some(tables) = pts {
         let pd = crate::pyimport::import_module(py, "pandas")?;
         let index = pyo3::types::PyList::new(py, gene_names)?;

@@ -637,6 +637,36 @@ class TestCloudReadUns:
             assert cloud.read_uns()["species"] == "human"
             assert int(cloud.read_uns()["version"]) == 2
 
+    def test_read_uns_dataframe_parity_with_local(self):
+        """A `pandas.DataFrame` value decodes identically on the cloud path.
+
+        The local and cloud readers share one decoder
+        (`convert::uns::json_value_to_pyobject`), so this is really a check that
+        the sharing still holds — but it is the arm that would catch a decoder
+        wired into only one of them, and the parity test above cannot: `==` on
+        two frames returns a *frame*, not a bool.
+        """
+        import pandas as pd
+
+        import pyscx
+
+        df = pd.DataFrame(
+            {"v": [1.0, 2.0], "c": pd.Categorical(["a", "b"], ordered=True)},
+            index=pd.Index(["r0", "r1"], name="row"),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "uns_frame.scx")
+            _create_test_scx_with_uns(scx_path, {"frame": df})
+            exploded_dir = os.path.join(tmpdir, "uns_frame.scxd")
+            pyscx.explode(scx_path, exploded_dir)
+
+            local = pyscx.open(scx_path).read_uns()["frame"]
+            cloud = pyscx.open_cloud(exploded_dir).read_uns()["frame"]
+
+            assert isinstance(cloud, pd.DataFrame)
+            pd.testing.assert_frame_equal(cloud, df, check_dtype=True)
+            pd.testing.assert_frame_equal(cloud, local, check_dtype=True)
+
     def test_read_uns_none_when_absent(self):
         import pyscx
 

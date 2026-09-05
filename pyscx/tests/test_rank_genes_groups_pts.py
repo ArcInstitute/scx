@@ -443,3 +443,66 @@ def test_corr_method_accepts_only_benjamini_hochberg(synthetic_adata):
         _rgg(synthetic_adata.copy(), corr_method="bonferroni")
     with pytest.raises(ValueError, match="benjamini-hochberg"):
         _rgg(synthetic_adata.copy(), corr_method="fdr_bh")
+
+
+# ---------------------------------------------------------------------------
+# X6: the `pts` frames survive an SCX round trip.
+# ---------------------------------------------------------------------------
+
+
+def test_pts_frames_survive_a_from_anndata_round_trip(synthetic_adata, tmp_path):
+    """`from_anndata` used to *refuse* the object it had just told pyscx to make.
+
+    PR G made `rank_genes_groups(pts=True)` write two `pandas.DataFrame`s into
+    `uns`, which every pyscx uns writer then rejected — scanpy's own `pts=True`
+    output included. The documented workaround was to delete the two keys
+    before writing. This is that workaround becoming unnecessary.
+
+    `assert_frame_equal`, not `==`: comparing two frames with `==` yields a
+    *frame*, so an `assert` on it raises rather than comparing.
+    """
+    adata = synthetic_adata.copy()
+    _rgg(adata, pts=True)
+
+    path = str(tmp_path / "pts.scx")
+    pyscx.from_anndata(adata, path)
+    back = pyscx.open(path).to_anndata()
+
+    for key in ("pts", "pts_rest"):
+        got = back.uns[KEY][key]
+        assert isinstance(got, pd.DataFrame), f"{key} came back as {type(got).__name__}"
+        pd.testing.assert_frame_equal(got, adata.uns[KEY][key], check_dtype=True)
+
+    # Column order is the group order, carried explicitly rather than by JSON
+    # object order, and the index is the var names `.loc` lookups need.
+    assert list(back.uns[KEY]["pts"].columns) == list(adata.uns[KEY]["pts"].columns)
+    assert list(back.uns[KEY]["pts"].index) == list(adata.var_names)
+
+
+def test_round_tripped_pts_still_drives_the_scanpy_consumers(synthetic_adata, tmp_path):
+    """The two scanpy functions that are the *reason* `pts` is a frame.
+
+    `sc.tl.filter_rank_genes_groups` does `uns[key]["pts"][group].loc[var_names]`
+    and `sc.get.rank_genes_groups_df` melts and merges the tables — both break
+    on a dict. Running them after the round trip is what proves the envelope
+    restored a frame rather than something frame-shaped.
+    """
+    sc = pytest.importorskip("scanpy")
+
+    adata = synthetic_adata.copy()
+    _rgg(adata, pts=True)
+    path = str(tmp_path / "pts_consumers.scx")
+    pyscx.from_anndata(adata, path)
+    back = pyscx.open(path).to_anndata()
+
+    group = str(back.uns[KEY]["pts"].columns[0])
+
+    sc_df = sc.get.rank_genes_groups_df(back, group=group)
+    assert {"pct_nz_group", "pct_nz_reference"} <= set(sc_df.columns)
+
+    sc.tl.filter_rank_genes_groups(back, key=KEY, min_in_group_fraction=0.1)
+    assert f"{KEY}_filtered" in back.uns
+
+    # pyscx's own extractor reads the same two frames back out.
+    px_df = pyscx.accel.rank_genes_groups_df(back, group=group)
+    assert {"pct_nz_group", "pct_nz_reference"} <= set(px_df.columns)
