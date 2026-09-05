@@ -56,9 +56,11 @@ def rank_genes_groups(
     cells with a nonzero value, indexed by var name, over every gene. It is
     one extra streaming pass over ``X`` on every route. ``groups=`` restricts
     which groups are *reported*, in the given order; "rest" is unchanged, so
-    each group's statistics equal the unrestricted run's (and scanpy's).
-    ``corr_method`` accepts only ``"benjamini-hochberg"`` (recorded in
-    ``params``); any other value raises rather than silently applying BH.
+    each group's statistics equal the unrestricted run's (and scanpy's); a
+    named group (or named reference) with fewer than two cells raises, as in
+    scanpy. ``pts=True`` refuses duplicate ``var_names`` (its table is joined
+    by name). ``corr_method`` accepts only ``"benjamini-hochberg"`` (recorded
+    in ``params``); any other value raises rather than silently applying BH.
     """
     ...
 

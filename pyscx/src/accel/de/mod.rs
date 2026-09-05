@@ -573,8 +573,9 @@ fn encode_group_labels(
 /// Tell the caller when cells were dropped for having no group label.
 ///
 /// Silently excluding rows changes what "rest" means, and an `obs` column with
-/// a handful of unannotated cells looks exactly like one without. scanpy makes
-/// the same exclusion; nothing anywhere reported it.
+/// a handful of unannotated cells looks exactly like one without. The exclusion
+/// is pyscx's rule (scanpy 1.12 keeps such cells in its 1-vs-rest pool — see
+/// `scx_accel::diffexp::groups`), and nothing anywhere reported it.
 fn warn_unlabelled_cells(py: Python<'_>, groups: &[usize], n_groups: usize, groupby: &str) {
     let n_unlabelled = groups.iter().filter(|&&g| g >= n_groups).count();
     if n_unlabelled == 0 {

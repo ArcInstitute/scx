@@ -281,6 +281,12 @@ def test_pts_refuses_duplicate_var_names_on_write_and_on_extract():
         warnings.simplefilter("ignore")  # anndata's non-unique var_names warning
         with pytest.raises(ValueError, match=r'unique var names.*"dup".*var_names_make_unique'):
             _rgg(adata, pts=True)
+        # With the names coming from `adata.raw`, `var_names_make_unique()` would
+        # not help — the message says so and names the way out.
+        with_raw = adata.copy()
+        with_raw.raw = with_raw
+        with pytest.raises(ValueError, match=r"adata\.raw\.var_names.*use_raw=False"):
+            _rgg(with_raw, pts=True)
         _rgg(adata)  # pts=False: unaffected
         assert len(pyscx.accel.rank_genes_groups_df(adata, group="A")) == 4
         adata.uns[KEY]["pts"] = pd.DataFrame(

@@ -178,6 +178,29 @@ pub(crate) fn run_rank_genes_groups_inner(
     // layer otherwise). The selected matrix flows through the same dispatch.
     let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
 
+    // `pts` is indexed by var name and `rank_genes_groups_df` joins on it, so
+    // the names must be unique: with a duplicate, any by-name lookup would hand
+    // one gene's fraction to the other (and scanpy's own merge multiplies the
+    // rows). Checked here, before the kernels run, so a bad index does not pay
+    // for a full rank-sum first — and named for the matrix that was actually
+    // selected: `adata.var_names_make_unique()` fixes `X` / a layer, but leaves
+    // `adata.raw.var_names` alone.
+    if pts {
+        let mut seen = std::collections::HashSet::with_capacity(gene_names.len());
+        if let Some(dup) = gene_names.iter().find(|name| !seen.insert(name.as_str())) {
+            let remedy = if use_raw {
+                "the names come from adata.raw.var_names, which \
+                 adata.var_names_make_unique() does not touch — pass use_raw=False, or rebuild \
+                 raw from an AnnData whose var_names are unique"
+            } else {
+                "run adata.var_names_make_unique() first"
+            };
+            return Err(PyValueError::new_err(format!(
+                "pts=True needs unique var names but {dup:?} occurs more than once; {remedy}"
+            )));
+        }
+    }
+
     // Auto-detect whether data has been log-transformed (sc.pp.log1p sets
     // adata.uns["log1p"], and so does pyscx.accel.log1p). When true, logFC uses
     // the expm1 back-transform to match scanpy's formula. Deliberately the
@@ -212,30 +235,15 @@ pub(crate) fn run_rank_genes_groups_inner(
     // enters a kernel, so CSC-direct and the GPU drivers report the same
     // number as the dense CPU path.
     let pts_tables = if pts {
-        // The `pts` frame is indexed by var name and `rank_genes_groups_df`
-        // joins on it, so the names must be unique: with a duplicate, any
-        // by-name lookup would hand one gene's fraction to the other (and
-        // scanpy's own merge multiplies the rows). Refuse up front.
-        let mut seen = std::collections::HashSet::with_capacity(gene_names.len());
-        if let Some(dup) = gene_names.iter().find(|name| !seen.insert(name.as_str())) {
-            return Err(PyValueError::new_err(format!(
-                "pts=True needs unique var names but {dup:?} occurs more than once; run \
-                 adata.var_names_make_unique() first"
-            )));
-        }
         let counts =
             compute_group_nonzero_counts(py, &x, &groups, unique_groups.len(), gene_names.len())?;
         let fractions = counts.fractions(ref_idx);
-        let column_of = |name: &String| -> usize {
-            unique_groups
-                .iter()
-                .position(|g| g == name)
-                .expect("pts column validated against the label universe above")
-        };
+        // `pts_groups` was validated against the label universe above, so the
+        // lookup cannot miss.
         let pick = |table: &Vec<Vec<f64>>| -> Vec<Vec<f64>> {
             pts_groups
                 .iter()
-                .map(|g| table[column_of(g)].clone())
+                .map(|g| table[group_name_to_idx[g.as_str()]].clone())
                 .collect()
         };
         Some(PtsTables {
@@ -844,8 +852,12 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// pool each group is compared against is unchanged, so its numbers equal the
 /// unrestricted run's and scanpy's ``groups=``. Unknown names, repeats and an
 /// empty list raise; the reference group is silently not tested (it stays a
-/// ``pts`` column). ``corr_method`` accepts only ``"benjamini-hochberg"`` and
-/// is recorded in ``params``; any other value raises instead of silently
+/// ``pts`` column); a named group (or the named reference) with fewer than two
+/// cells raises scanpy's "only contain one sample" error — under
+/// ``stratify_by`` that, like any per-stratum failure, warns and drops the
+/// stratum. ``pts=True`` refuses duplicate var names (its table is joined by
+/// name). ``corr_method`` accepts only ``"benjamini-hochberg"`` and is
+/// recorded in ``params``; any other value raises instead of silently
 /// applying BH.
 ///
 /// NOTE: the log-fold-change back-transform uses the ``adata.uns["log1p"]``

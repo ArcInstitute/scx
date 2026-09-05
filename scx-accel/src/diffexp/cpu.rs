@@ -149,8 +149,8 @@ pub(crate) fn de_rank_cmp(
 /// * `groups` — Group label per cell, length `n_obs`, encoded as indices `0..n_groups`.
 ///   A label `>= n_groups` marks an **unlabelled** cell (NaN / empty / off-category
 ///   upstream); such cells take part in nothing — not the group sums, not "rest",
-///   not the rank pool — matching scanpy, which subsets them out of the matrix
-///   before ranking. See [`super::groups`].
+///   not the rank pool. That is pyscx's rule; scanpy 1.12 keeps them in its
+///   1-vs-rest pool. See [`super::groups`].
 /// * `group_names` — Unique group names, length `n_groups`.
 /// * `reference` — If `Some(idx)`, compare every other group against group `idx`.
 ///   If `None`, 1-vs-rest.
