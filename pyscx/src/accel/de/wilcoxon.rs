@@ -109,7 +109,8 @@ pub(crate) fn run_rank_genes_groups_inner(
     let tested_groups: Option<Vec<String>> = match requested_groups {
         None => None,
         Some(req) => {
-            validate_groups_request(req)?;
+            // Shape (non-empty, no repeats) was checked at the entry point, so
+            // the stratified path fails once, up front, not once per stratum.
             let mut tested = Vec::with_capacity(req.len());
             for name in req {
                 if !unique_groups.iter().any(|g| g == name) {
@@ -797,10 +798,10 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// of cells in the group with a nonzero value; ``rank_genes_groups_df`` then
 /// appends ``pct_nz_group`` / ``pct_nz_reference``. It is one extra streaming
 /// pass over the matrix and is route-independent (CSC-direct and GPU included).
-/// ``pts_rest`` is over the *labelled* rest — the pool the statistic itself uses
-/// — which equals scanpy's whenever every cell carries a label. pyscx's uns
-/// writer has no DataFrame encoding yet, so drop the two keys before
-/// ``from_anndata``.
+/// ``pts_rest`` is scanpy's ``X[~mask_g]`` fraction — every other cell of the
+/// matrix, cells with no ``groupby`` label included — so the table equals
+/// scanpy's on partially labelled input too. pyscx's uns writer has no
+/// DataFrame encoding yet, so drop the two keys before ``from_anndata``.
 ///
 /// ``groups`` restricts which groups are *reported*, in the given order; the
 /// pool each group is compared against is unchanged, so its numbers equal the
@@ -1118,10 +1119,22 @@ fn write_de_to_adata(
     // Each row is one gene rank position.
     let build_structured =
         |field_data: &[Vec<String>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
-            // Build dtype: list of (group_name, 'U200') tuples.
+            // Fixed-width unicode sized to the longest emitted name, so no
+            // name is ever truncated: the `pts` frame is indexed by the full
+            // var names and `rank_genes_groups_df` joins the two by name — a
+            // fixed `U200` silently produced NaN for any gene named with more
+            // than 200 characters.
+            let width = field_data
+                .iter()
+                .flat_map(|col| col.iter().take(n_genes))
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            let fmt = format!("U{width}");
             let dt_list = pyo3::types::PyList::empty(py);
             for gn in groups {
-                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "U200"])?;
+                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), fmt.as_str()])?;
                 dt_list.append(tup)?;
             }
             let dtype = numpy.call_method1("dtype", (dt_list,))?;
@@ -1143,8 +1156,8 @@ fn write_de_to_adata(
     // that back — n_groups × n_genes objects per field, so a 30-group ×
     // 60k-gene run materialised millions of them purely in transit.
     //
-    // The `names` builder above keeps its `PyList`: its field dtype is `U200`,
-    // which genuinely needs Python strings.
+    // The `names` builder above keeps its `PyList`: its fixed-width `U` field
+    // genuinely needs Python strings.
     let build_structured_f64 =
         |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
             let t_marshal = scx_accel::cpu_profile::start();

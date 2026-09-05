@@ -1,6 +1,7 @@
 //! `GroupNonzeroCounts` — dense, CSR and streamed inputs agree; the counting
-//! rule is scanpy's (`!= 0`, explicit zeros ignored, negatives counted,
-//! unlabelled cells in nothing); the fractions divide by the right pools.
+//! rule is scanpy's (`!= 0`, explicit zeros ignored, negatives counted; an
+//! unlabelled cell is in no group but in every group's rest); the fractions
+//! divide by the right pools.
 
 use super::*;
 use crate::hvg::cpu::InMemorySource;
@@ -9,9 +10,10 @@ const OOR: usize = 3;
 
 /// 6 cells × 4 genes; labels `[0, 0, 1, 1, 2, unlabelled]`.
 ///
-/// Row 5 (unlabelled) is dense with nonzeros so any leak into a count shows.
-/// Gene 3 is zero in every labelled cell so its `pts` is 0 everywhere and its
-/// `pts_rest` denominator still counts the cells.
+/// Row 5 (unlabelled) is dense with nonzeros so a leak into a group count
+/// shows — and so its presence in every `pts_rest` is visible. Gene 3 is zero
+/// in every labelled cell, so its `pts` is 0 everywhere while its `pts_rest`
+/// is the unlabelled row alone.
 fn dense_fixture() -> (Vec<f32>, Vec<usize>) {
     #[rustfmt::skip]
     let data: Vec<f32> = vec![
@@ -55,9 +57,10 @@ fn expected_counts() -> GroupNonzeroCounts {
             vec![1, 1, 0, 0], // g1: rows 2, 3
             vec![1, 1, 1, 0], // g2: row 4
         ],
-        labelled_total: vec![3, 2, 3, 0],
+        // Every row, the unlabelled one included (scanpy's `~mask_g`).
+        total: vec![4, 3, 4, 1],
         group_sizes: vec![2, 2, 1],
-        n_labelled: 5,
+        n_obs: 6,
     }
 }
 
@@ -99,24 +102,24 @@ fn an_explicitly_stored_zero_is_not_expressing() {
     let csr = ScxCsr::new((2, 2), vec![0, 2, 3], vec![0, 1, 0], vec![0.0, 7.0, 0.0]).unwrap();
     let got = group_nonzero_counts_csr(&csr, &[0, 0], 1).unwrap();
     assert_eq!(got.counts, vec![vec![0, 1]]);
-    assert_eq!(got.labelled_total, vec![0, 1]);
+    assert_eq!(got.total, vec![0, 1]);
 }
 
 #[test]
-fn fractions_divide_by_group_size_and_labelled_rest() {
+fn fractions_divide_by_group_size_and_every_other_cell() {
     let counts = expected_counts();
     let f = counts.fractions(None);
     // g0 has 2 cells: gene 0 in 1 of 2, gene 2 in 2 of 2.
     assert_eq!(f.pts[0], vec![0.5, 0.0, 1.0, 0.0]);
     // g2 has 1 cell.
     assert_eq!(f.pts[2], vec![1.0, 1.0, 1.0, 0.0]);
-    // rest of g0 = 3 labelled cells (rows 2, 3, 4): gene 0 in 2 of them,
-    // gene 1 in 2, gene 2 in 1, gene 3 in 0. The unlabelled row 5 (all
-    // nonzero) is in neither numerator nor denominator.
+    // rest of g0 = the other 4 rows (2, 3, 4 and the unlabelled 5): gene 0 in
+    // 3 of them, gene 1 in 3, gene 2 in 2, gene 3 in 1 (row 5 only) — scanpy's
+    // `X[~mask_g]`, so the unlabelled row is in numerator and denominator.
     let rest = f.pts_rest.as_ref().unwrap();
-    assert_eq!(rest[0], vec![2.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 0.0]);
-    // rest of g2 = 4 labelled cells.
-    assert_eq!(rest[2], vec![2.0 / 4.0, 1.0 / 4.0, 2.0 / 4.0, 0.0]);
+    assert_eq!(rest[0], vec![3.0 / 4.0, 3.0 / 4.0, 2.0 / 4.0, 1.0 / 4.0]);
+    // rest of g2 = the other 5 rows.
+    assert_eq!(rest[2], vec![3.0 / 5.0, 2.0 / 5.0, 3.0 / 5.0, 1.0 / 5.0]);
 }
 
 #[test]

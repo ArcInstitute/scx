@@ -2899,12 +2899,16 @@ route reports the same number from the same code, CSC-direct and the GPU
 drivers included; `pts=True` costs one more read of `X` (LRU-warm on a backed
 handle) and nothing when off. "Expressing" is scanpy's `!= 0`: an explicit zero
 stored in a scipy CSR is not counted, a negative value is. `pts_rest[g]` is
-taken over the **labelled** rest — the same pool the statistic compares against
-(a cell with no `groupby` label is in nobody's rest). scanpy divides by every
-other cell of the matrix, so the two agree exactly whenever every cell carries
-a label. `rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
-`reference="rest"`) `pct_nz_reference`, looked up by gene name, exactly as
-`sc.get.rank_genes_groups_df` does. **Limitation:** pyscx's `uns` writer has
+scanpy's `X[~mask_g]` fraction — over **every other cell of the matrix**, cells
+with no `groupby` label included — so the table equals scanpy's on partially
+labelled input as well. (The rank-sum statistic itself leaves unlabelled cells
+out of its pool; that is a pre-existing pyscx difference from scanpy 1.12,
+tracked as a follow-up, and `pts` follows scanpy's tables rather than that
+pool.) `rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
+`reference="rest"`) `pct_nz_reference`, looked up by gene name, as
+`sc.get.rank_genes_groups_df` does; with duplicate `var_names` the first
+occurrence wins and each DE row stays one row (scanpy's merge would multiply
+them). **Limitation:** pyscx's `uns` writer has
 no `pandas.DataFrame` encoding yet, so `pyscx.from_anndata` refuses an
 `AnnData` carrying `uns["rank_genes_groups"]["pts"]` (scanpy's own `pts=True`
 output included) — `del adata.uns["rank_genes_groups"]["pts"]` (and

@@ -15,29 +15,38 @@
 //! A value `!= 0.0` on the `f32` the DE saw. That is scanpy's rule
 //! (`getnnz(axis=0)` after `eliminate_zeros()` for sparse input,
 //! `np.count_nonzero` for dense): an explicit zero stored in a scipy CSR is
-//! not counted, a negative value is. Cells whose label is the unlabelled
-//! sentinel (`>= n_groups`, see [`super::groups`]) take part in nothing — not
-//! in their non-group, not in the labelled total — which is exactly the pool
-//! the rank-sum statistic uses.
+//! not counted, a negative value is.
+//!
+//! # Which cells are "rest"
+//!
+//! scanpy's `pts_rest[g]` is the nonzero fraction over `X[~mask_g]` — **every
+//! other row of the matrix**, cells with no `groupby` label included — and this
+//! module reproduces that table exactly. A cell whose label is the unlabelled
+//! sentinel (`>= n_groups`, see [`super::groups`]) is therefore in no group's
+//! `pts` but in every group's `pts_rest`. (The rank-sum kernels leave such
+//! cells out of their pool; that is a pre-existing difference from scanpy 1.12
+//! tracked separately, and `pts` follows scanpy's tables, not that pool.)
 
 use scx_format_io::ShardSource;
 use scx_sparse::ScxCsr;
 
 use crate::{AccelError, Result};
 
-/// Nonzero counts per group and per gene, plus the labelled total the
+/// Nonzero counts per group and per gene, plus the whole-matrix total the
 /// 1-vs-rest fraction is derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupNonzeroCounts {
     /// `counts[g][j]` — cells with label `g` whose value at gene `j` is nonzero.
     pub counts: Vec<Vec<u64>>,
-    /// `labelled_total[j]` — nonzero cells at gene `j` over every labelled cell.
-    pub labelled_total: Vec<u64>,
+    /// `total[j]` — nonzero cells at gene `j` over **every** row, unlabelled
+    /// ones included. Not derivable from `counts` (which see only labelled
+    /// rows); it is what makes `pts_rest` scanpy's `X[~mask_g]` fraction.
+    pub total: Vec<u64>,
     /// `group_sizes[g]` — cells carrying label `g` (the `pts` denominator).
     pub group_sizes: Vec<usize>,
-    /// Cells carrying any real label (`Σ group_sizes`); with `group_sizes[g]`
-    /// it gives the `pts_rest` denominator `n_labelled - n_g`.
-    pub n_labelled: usize,
+    /// Rows in the matrix; with `group_sizes[g]` it gives the `pts_rest`
+    /// denominator `n_obs - n_g`.
+    pub n_obs: usize,
 }
 
 /// The two tables scanpy stores: `pts[g][j]` for every group, and
@@ -46,30 +55,29 @@ pub struct GroupNonzeroCounts {
 pub struct PtsFractions {
     /// `[n_groups][n_vars]`; `NaN` for a group with no cells (0 / 0, as scanpy).
     pub pts: Vec<Vec<f64>>,
-    /// `[n_groups][n_vars]` over the *labelled* rest, `None` when a reference
-    /// group was named (scanpy emits `pts_rest` only for `reference="rest"`).
+    /// `[n_groups][n_vars]` over every other cell of the matrix, `None` when a
+    /// reference group was named (scanpy emits `pts_rest` only for
+    /// `reference="rest"`).
     pub pts_rest: Option<Vec<Vec<f64>>>,
 }
 
 impl GroupNonzeroCounts {
     /// Zeroed accumulators sized from the label vector: `group_sizes` and
-    /// `n_labelled` are fixed here (they depend only on `groups`), the
-    /// per-gene counts fill in through [`add_csr`](Self::add_csr) /
+    /// `n_obs` are fixed here (they depend only on `groups`), the per-gene
+    /// counts fill in through [`add_csr`](Self::add_csr) /
     /// [`add_dense`](Self::add_dense).
     pub fn new(groups: &[usize], n_groups: usize, n_vars: usize) -> Self {
         let mut group_sizes = vec![0usize; n_groups];
-        let mut n_labelled = 0usize;
         for &g in groups {
             if g < n_groups {
                 group_sizes[g] += 1;
-                n_labelled += 1;
             }
         }
         Self {
             counts: vec![vec![0u64; n_vars]; n_groups],
-            labelled_total: vec![0u64; n_vars],
+            total: vec![0u64; n_vars],
             group_sizes,
-            n_labelled,
+            n_obs: groups.len(),
         }
     }
 
@@ -80,7 +88,7 @@ impl GroupNonzeroCounts {
 
     /// Number of genes.
     pub fn n_vars(&self) -> usize {
-        self.labelled_total.len()
+        self.total.len()
     }
 
     /// Fold in a CSR block whose first row is global row `row_offset`.
@@ -109,12 +117,8 @@ impl GroupNonzeroCounts {
         }
         for row in 0..n_rows {
             let g = groups[row_offset + row];
-            if g >= n_groups {
-                continue;
-            }
             let start = csr.indptr[row] as usize;
             let end = csr.indptr[row + 1] as usize;
-            let group_row = &mut self.counts[g];
             for j in start..end {
                 if csr.data[j] == 0.0 {
                     continue;
@@ -126,8 +130,12 @@ impl GroupNonzeroCounts {
                         row_offset + row
                     )));
                 }
-                group_row[col] += 1;
-                self.labelled_total[col] += 1;
+                // Every row is in the total (scanpy's `~mask_g` rest); only a
+                // labelled row is in a group.
+                self.total[col] += 1;
+                if g < n_groups {
+                    self.counts[g][col] += 1;
+                }
             }
         }
         Ok(())
@@ -165,15 +173,13 @@ impl GroupNonzeroCounts {
         }
         let n_groups = self.n_groups();
         for (row, &g) in groups.iter().enumerate() {
-            if g >= n_groups {
-                continue;
-            }
             let values = &data[row * n_vars..(row + 1) * n_vars];
-            let group_row = &mut self.counts[g];
             for (col, &v) in values.iter().enumerate() {
                 if v != 0.0 {
-                    group_row[col] += 1;
-                    self.labelled_total[col] += 1;
+                    self.total[col] += 1;
+                    if g < n_groups {
+                        self.counts[g][col] += 1;
+                    }
                 }
             }
         }
@@ -182,12 +188,9 @@ impl GroupNonzeroCounts {
 
     /// scanpy's two tables from the counts. Plain IEEE division of two exact
     /// integers, so the result is bit-identical to
-    /// `getnnz(axis=0) / x_mask.shape[0]` on the same cells.
-    ///
-    /// `pts_rest` is over the **labelled** rest — the same pool the rank-sum
-    /// statistic compares against. scanpy divides by every other cell of the
-    /// matrix, unlabelled ones included; the two agree exactly whenever every
-    /// cell carries a label, which is the case the parity pins cover.
+    /// `getnnz(axis=0) / x_mask.shape[0]` on the same cells: `pts[g]` over the
+    /// group's cells, `pts_rest[g]` over `n_obs - n_g` — every other row of the
+    /// matrix, as scanpy's `X[~mask_g]`.
     pub fn fractions(&self, reference: Option<usize>) -> PtsFractions {
         let pts: Vec<Vec<f64>> = self
             .counts
@@ -204,9 +207,9 @@ impl GroupNonzeroCounts {
                     .iter()
                     .zip(&self.group_sizes)
                     .map(|(row, &n_g)| {
-                        let denom = (self.n_labelled - n_g) as f64;
+                        let denom = (self.n_obs - n_g) as f64;
                         row.iter()
-                            .zip(&self.labelled_total)
+                            .zip(&self.total)
                             .map(|(&c, &total)| (total - c) as f64 / denom)
                             .collect()
                     })

@@ -231,20 +231,48 @@ fn extract_rank_genes_groups_df<'py>(
     // `pts` / `pts_rest` table was written (`rank_genes_groups(pts=True)`), and
     // there is no fallback for a missing `pts_rest` — a pairwise run has a
     // `pct_nz_group` column and no `pct_nz_reference`.
-    let has_pts = rgg.contains("pts")?;
-    let has_pts_rest = has_pts && rgg.contains("pts_rest")?;
+    let pts_table = if rgg.contains("pts")? {
+        Some(rgg.get_item("pts")?)
+    } else {
+        None
+    };
+    let pts_rest_table = match &pts_table {
+        Some(_) if rgg.contains("pts_rest")? => Some(rgg.get_item("pts_rest")?),
+        _ => None,
+    };
+    let has_pts = pts_table.is_some();
+    let has_pts_rest = pts_rest_table.is_some();
     let mut pct_nz_group: Vec<f64> = Vec::new();
     let mut pct_nz_reference: Vec<f64> = Vec::new();
     // The `pts` frame is `genes × groups` in var order, not rank order and not
     // truncated by `n_genes`, so the per-row value is looked up by gene name —
-    // the same join scanpy's `melt` + `merge` performs.
-    let gather_pct = |table: &str, g: &str, kept: &[String]| -> PyResult<Vec<f64>> {
-        let kept_list = pyo3::types::PyList::new(py, kept)?;
-        rgg.get_item(table)?
-            .get_item(g)?
-            .call_method1("reindex", (kept_list,))?
-            .call_method0("tolist")?
-            .extract()
+    // the join scanpy's `melt` + `merge` performs. Done through a Rust map
+    // rather than `Series.reindex`, which raises on a duplicated var index
+    // (AnnData permits duplicate `var_names`): with duplicates the first
+    // occurrence wins and each DE row stays one row, where scanpy's merge
+    // multiplies them. A name absent from the table gives NaN, as scanpy's
+    // extractor would leave no row at all.
+    let pct_by_name =
+        |table: &Bound<'py, PyAny>, g: &str| -> PyResult<std::collections::HashMap<String, f64>> {
+            let series = table.get_item(g)?;
+            let names: Vec<String> = series
+                .getattr("index")?
+                .call_method1("astype", ("str",))?
+                .call_method0("tolist")?
+                .extract()?;
+            let values: Vec<f64> = series.call_method0("tolist")?.extract()?;
+            let mut map = std::collections::HashMap::with_capacity(names.len());
+            for (name, value) in names.into_iter().zip(values) {
+                map.entry(name).or_insert(value);
+            }
+            Ok(map)
+        };
+    let gather_pct = |table: &Bound<'py, PyAny>, g: &str, kept: &[String]| -> PyResult<Vec<f64>> {
+        let map = pct_by_name(table, g)?;
+        Ok(kept
+            .iter()
+            .map(|name| map.get(name).copied().unwrap_or(f64::NAN))
+            .collect())
     };
 
     for g in &groups {
@@ -298,11 +326,11 @@ fn extract_rank_genes_groups_df<'py>(
         if multi {
             col_group.extend(std::iter::repeat_n(g.clone(), names.len() - rows_before));
         }
-        if has_pts {
+        if let Some(table) = &pts_table {
             let kept = &names[rows_before..];
-            pct_nz_group.extend(gather_pct("pts", g, kept)?);
-            if has_pts_rest {
-                pct_nz_reference.extend(gather_pct("pts_rest", g, kept)?);
+            pct_nz_group.extend(gather_pct(table, g, kept)?);
+            if let Some(rest) = &pts_rest_table {
+                pct_nz_reference.extend(gather_pct(rest, g, kept)?);
             }
         }
     }

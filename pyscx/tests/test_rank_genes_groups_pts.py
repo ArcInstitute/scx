@@ -35,18 +35,17 @@ def _rgg(adata, **kw):
 
 def _manual_pts(adata, group_labels, groups, reference="rest"):
     """scanpy's definition, computed by hand: nonzero fraction per group, and
-    the nonzero fraction over the *labelled* rest (pyscx's rest pool)."""
+    the nonzero fraction over `X[~mask_g]` — every other cell, an unlabelled
+    one included."""
     X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
     nz = X != 0
     labels = np.asarray(group_labels, dtype=object)
-    labelled = np.array([lab in groups for lab in labels])
     pts = {}
     pts_rest = {}
     for g in groups:
         in_g = labels == g
         pts[g] = nz[in_g].mean(axis=0)
-        rest = labelled & ~in_g
-        pts_rest[g] = nz[rest].mean(axis=0)
+        pts_rest[g] = nz[~in_g].mean(axis=0)
     pts = pd.DataFrame(pts, index=adata.var_names)
     pts_rest = pd.DataFrame(pts_rest, index=adata.var_names) if reference == "rest" else None
     return pts, pts_rest
@@ -222,21 +221,82 @@ def test_pts_counts_nonzero_not_positive_and_ignores_stored_zeros():
     assert (rgg["pts"]["g0"].to_numpy() > pos_only).any()
 
 
-def test_pts_rest_denominator_is_the_labelled_rest(synthetic_adata):
-    """An unlabelled cell is in no group, so it is in nobody's rest either —
-    the same pool the rank-sum statistic uses. (scanpy divides by every other
-    cell of the matrix; the two agree whenever every cell is labelled, which
-    the parity tests above cover.)"""
+def test_pts_rest_with_unlabelled_cells_matches_scanpy(synthetic_adata):
+    """scanpy's `pts_rest[g]` is over `X[~mask_g]`: every other cell, the
+    NaN-labelled ones included — even though scanpy and pyscx handle those
+    cells differently in the statistic. The table is scanpy's, exactly."""
+    sc = pytest.importorskip("scanpy")
     adata = synthetic_adata.copy()
     labels = adata.obs["batch"].astype(object).to_numpy()
     labels[:7] = None
     adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    # Plant a gene nonzero only in unlabelled cells: its pts is 0 for every
+    # group while its pts_rest is not — the arm that tells the two pools apart.
+    X = adata.X.tolil()
+    X[:, 0] = 0
+    X[:7, 0] = 3.0
+    adata.X = X.tocsr()
+
+    adata_sc = adata.copy()
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)  # the unlabelled-cell warning
+        warnings.simplefilter("ignore")
+        sc.tl.rank_genes_groups(adata_sc, "batch", method="wilcoxon", pts=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # pyscx's unlabelled-cell warning
         rgg = _rgg(adata, pts=True)
+    rgg_sc = adata_sc.uns[KEY]
+    _assert_frames_equal_to(rgg["pts"], rgg_sc["pts"], PTS_ATOL)
+    _assert_frames_equal_to(rgg["pts_rest"], rgg_sc["pts_rest"], PTS_ATOL)
+    assert (rgg["pts"].iloc[0] == 0).all()
+    assert (rgg["pts_rest"].iloc[0] > 0).all()
     want, want_rest = _manual_pts(adata, labels, ["A", "B", "C"])
     _assert_frames_equal_to(rgg["pts"], want, 0.0)
     _assert_frames_equal_to(rgg["pts_rest"], want_rest, 0.0)
+
+
+def test_pct_nz_survives_duplicate_var_names():
+    """AnnData permits duplicate `var_names`; `Series.reindex` on such an index
+    raises, so the lookup is a name map — first occurrence wins, one row per
+    DE row."""
+    import anndata
+
+    rng = np.random.default_rng(11)
+    X = sp.csr_matrix(rng.poisson(1.0, size=(30, 4)).astype(np.float32))
+    adata = anndata.AnnData(
+        X=X,
+        obs=pd.DataFrame(
+            {"batch": pd.Categorical(["A", "B", "C"] * 10)},
+            index=[f"c{i}" for i in range(30)],
+        ),
+        var=pd.DataFrame(index=["dup", "dup", "g2", "g3"]),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # anndata's non-unique var_names warning
+        _rgg(adata, pts=True)
+        df = pyscx.accel.rank_genes_groups_df(adata, group="A")
+    assert len(df) == 4  # one row per DE row, not scanpy's multiplied merge
+    pts = adata.uns[KEY]["pts"]
+    first_dup = pts["A"].iloc[0]
+    for _, row in df.iterrows():
+        want = first_dup if row["names"] == "dup" else pts.loc[row["names"], "A"]
+        assert row["pct_nz_group"] == want
+
+
+def test_pct_nz_survives_gene_names_longer_than_200_characters(synthetic_adata):
+    """`names` used to be a fixed `U200`, so a longer var name was truncated in
+    the structured array and missed the full-name `pts` index — a silent NaN."""
+    adata = synthetic_adata.copy()
+    long_name = "G" * 250
+    names = list(adata.var_names)
+    names[3] = long_name
+    adata.var_names = names
+    _rgg(adata, pts=True)
+    rgg = adata.uns[KEY]
+    assert rgg["names"].dtype["A"].itemsize // 4 >= 250
+    assert long_name in list(rgg["names"]["A"])
+    df = pyscx.accel.rank_genes_groups_df(adata, group="A").set_index("names")
+    assert not np.isnan(df.loc[long_name, "pct_nz_group"])
+    assert df.loc[long_name, "pct_nz_group"] == rgg["pts"].loc[long_name, "A"]
 
 
 def test_pts_is_refused_with_stratify_by(synthetic_adata):

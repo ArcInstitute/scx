@@ -639,9 +639,6 @@ pub fn pdex_ref(
     layer: Option<&str>,
     groups: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
-    if let Some(req) = &groups {
-        validate_groups_request(req)?;
-    }
     if epsilon < 0.0 || !epsilon.is_finite() {
         return Err(PyValueError::new_err(format!(
             "epsilon must be non-negative and finite (got {epsilon})"
