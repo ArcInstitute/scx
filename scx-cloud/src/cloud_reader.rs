@@ -146,6 +146,11 @@ pub struct CloudReader {
     /// and lets the schema derive from it without a redundant GET.
     obs_assembled: tokio::sync::OnceCell<RecordBatch>,
     var_assembled: tokio::sync::OnceCell<RecordBatch>,
+    /// The whole-cell deletion keep mask, decoded once per reader and shared by
+    /// every logical read (`read_obs_filtered`, the projected and codes twins)
+    /// and by `pyscx`'s live `n_obs`. `get_or_try_init` memoises on success
+    /// only, so a transient fetch failure is retried rather than pinned.
+    deletion_keep_mask: tokio::sync::OnceCell<Option<Arc<Vec<bool>>>>,
 }
 
 impl CloudReader {
@@ -824,14 +829,22 @@ impl CloudReader {
     /// vectors, or `None` when the file has none or nothing is deleted. Mirrors
     /// `ScxReader::deletion_keep_mask` (the global modality key), so the cloud
     /// logical reads apply exactly the mask the local ones and the cloud
-    /// `QueryPipeline` do. One section read; callers that need it more than
-    /// once should hold the result.
-    pub async fn deletion_keep_mask(&self) -> Result<Option<Vec<bool>>> {
-        let dv = match self.read_deletion_vectors().await? {
-            Some(dv) if dv.total_deleted() > 0 => dv,
-            _ => return Ok(None),
-        };
-        Ok(Some(dv.build_keep_mask_global(self.header.n_obs as usize)))
+    /// `QueryPipeline` do. Decoded once per reader (one section read, only on
+    /// a file whose header flags deletions) and shared through an `Arc`;
+    /// memoised on success only.
+    pub async fn deletion_keep_mask(&self) -> Result<Option<Arc<Vec<bool>>>> {
+        self.deletion_keep_mask
+            .get_or_try_init(|| async {
+                let dv = match self.read_deletion_vectors().await? {
+                    Some(dv) if dv.total_deleted() > 0 => dv,
+                    _ => return Ok(None),
+                };
+                Ok(Some(Arc::new(
+                    dv.build_keep_mask_global(self.header.n_obs as usize),
+                )))
+            })
+            .await
+            .cloned()
     }
 
     /// [`Self::read_obs`] in the **logical** row space — deletion vectors
@@ -854,6 +867,17 @@ impl CloudReader {
             Some(mask) => Ok(scx_format_io::filter_batch_by_keep_mask(&obs, &mask)?),
             None => Ok(obs),
         }
+    }
+
+    /// [`Self::obs_categorical`] in the logical row space; see
+    /// [`Self::obs_categorical_many_filtered`]. Parity with
+    /// `ScxReader::obs_categorical_filtered`.
+    pub async fn obs_categorical_filtered(&self, col: &str) -> Result<(Vec<i32>, Vec<String>)> {
+        Ok(self
+            .obs_categorical_many_filtered(std::slice::from_ref(&col.to_string()))
+            .await?
+            .pop()
+            .expect("one column in ⇒ one column out"))
     }
 
     /// [`Self::obs_categorical_many`] in the logical row space: each column's
@@ -1241,6 +1265,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 var_bytes_cache: tokio::sync::OnceCell::new(),
                 obs_assembled: tokio::sync::OnceCell::new(),
                 var_assembled: tokio::sync::OnceCell::new(),
+                deletion_keep_mask: tokio::sync::OnceCell::new(),
             })
         }
         Err(e) => {
@@ -1328,6 +1353,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     var_bytes_cache: tokio::sync::OnceCell::new(),
                     obs_assembled: tokio::sync::OnceCell::new(),
                     var_assembled: tokio::sync::OnceCell::new(),
+                    deletion_keep_mask: tokio::sync::OnceCell::new(),
                 })
             } else {
                 // Not cloud-ready: read full catalog at EOF
@@ -1357,6 +1383,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     var_bytes_cache: tokio::sync::OnceCell::new(),
                     obs_assembled: tokio::sync::OnceCell::new(),
                     var_assembled: tokio::sync::OnceCell::new(),
+                    deletion_keep_mask: tokio::sync::OnceCell::new(),
                 })
             }
         }

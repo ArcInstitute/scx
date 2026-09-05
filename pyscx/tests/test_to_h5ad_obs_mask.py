@@ -130,21 +130,37 @@ def test_obs_mask_uses_physical_coordinates_and_never_resurrects_deleted_rows(
     np.testing.assert_array_equal(got.obs_names.to_numpy(), kept)
 
 
-def test_obs_mask_in_live_coordinates_is_rejected(
+def test_obs_mask_in_live_coordinates_is_expanded_through_the_keep_mask(
     synthetic_adata, scx_from_adata, tmp_dir
 ):
-    """A mask sized to the *live* row count is the natural mistake; it must
-    raise rather than silently filtering the wrong rows."""
+    """Since 0.17 `read_obs()` is the live frame, so a live-length mask is what
+    a caller naturally derives from it. It is expanded onto the physical axis
+    (an already-deleted row is `False` either way) — the same either-length
+    rule as `attach_obs_columns(positional=True)`; any other length raises."""
     path = scx_from_adata(synthetic_adata, "deleted2.scx")
     n_obs = synthetic_adata.n_obs
 
     delete = np.zeros(n_obs, dtype=bool)
     delete[:3] = True
     pyscx.open(path).mark_deleted(delete)
+    exp = pyscx.open(path)
+    obs = exp.read_obs()
+    assert len(obs) == n_obs - 3
 
-    live_sized = np.ones(n_obs - 3, dtype=bool)
-    with pytest.raises(ValueError, match="physical n_obs"):
-        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=live_sized)
+    # Drop the first live cell (physical row 3) through a live-length mask.
+    live_mask = np.ones(len(obs), dtype=bool)
+    live_mask[0] = False
+    with pytest.warns(UserWarning, match="logically-deleted"):
+        pyscx.to_h5ad(path, tmp_dir / "out.h5ad", obs_mask=live_mask)
+    got = anndata.read_h5ad(tmp_dir / "out.h5ad")
+    assert got.n_obs == n_obs - 4
+    np.testing.assert_array_equal(got.obs_names.to_numpy(), obs.index.to_numpy()[1:])
+
+    # Neither length: both counts named.
+    with pytest.raises(ValueError) as e:
+        pyscx.to_h5ad(path, tmp_dir / "out2.h5ad", obs_mask=np.ones(n_obs - 5, dtype=bool))
+    msg = str(e.value)
+    assert f"n_obs = {n_obs - 3}" in msg and f"n_obs_physical = {n_obs}" in msg
 
 
 # ---------------------------------------------------------------------------

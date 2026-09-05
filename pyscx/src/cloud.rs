@@ -269,12 +269,6 @@ pub struct PyCloudExperiment {
     // `group_index` over the network (combines with the engine-side
     // `GroupIndex` cache).
     grouped_pipeline: std::sync::OnceLock<Arc<QueryPipeline>>,
-    /// Deletion-vector popcount, fetched at most once per handle (one small
-    /// section read, only on a file whose header flags deletions) so `n_obs`
-    /// / `shape` / `repr` report the live count like the local `Experiment`.
-    /// Memoized on success only: a transient network failure must not pin the
-    /// physical count for the handle's lifetime.
-    n_deleted: std::sync::OnceLock<u64>,
     /// The `gs://` / `s3://` / local URL this handle was opened from.
     /// `CloudReader` does not retain it (it keeps a parsed `ReaderLayout`),
     /// so we keep it here to back `path` / `info`. Mirrors
@@ -283,28 +277,27 @@ pub struct PyCloudExperiment {
 }
 
 impl PyCloudExperiment {
-    /// Live (non-deleted) row count: the header `n_obs` minus the
-    /// deletion-vector popcount — the cloud twin of
+    /// Live (non-deleted) row count: the header `n_obs` minus the deleted
+    /// rows of the reader's keep mask — the cloud twin of
     /// `PyExperiment::logical_n_obs_of`. Header-only when the file flags no
-    /// deletions; otherwise one section read, memoized on success. A failed
-    /// read falls back to the physical count for this call and is retried on
-    /// the next, so the getter never raises.
-    fn logical_n_obs(&self) -> u64 {
+    /// deletions; otherwise the mask `CloudReader` decodes once (success-only)
+    /// and shares with every logical read, so `n_obs` and `read_obs()` cannot
+    /// disagree: a fetch failure is raised here exactly as it would be there.
+    /// `__repr__`, which must not raise, uses the best-effort twin.
+    fn logical_n_obs(&self) -> PyResult<u64> {
         let physical = self.reader.n_obs();
         if !self.reader.header().has_deletion_vectors() {
-            return physical;
+            return Ok(physical);
         }
-        if let Some(deleted) = self.n_deleted.get() {
-            return physical.saturating_sub(*deleted);
-        }
-        match self.rt.block_on(self.reader.read_deletion_vectors()) {
-            Ok(dv) => {
-                let deleted = dv.map(|dv| dv.total_deleted()).unwrap_or(0);
-                let _ = self.n_deleted.set(deleted);
-                physical.saturating_sub(deleted)
-            }
-            Err(_) => physical,
-        }
+        let keep = self
+            .rt
+            .block_on(self.reader.deletion_keep_mask())
+            .map_err(cloud_to_pyerr)?;
+        Ok(keep.map_or(physical, |k| k.iter().filter(|b| **b).count() as u64))
+    }
+
+    fn logical_n_obs_best_effort(&self) -> u64 {
+        self.logical_n_obs().unwrap_or_else(|_| self.reader.n_obs())
     }
 
     /// Resolve the optional `modality` kwarg shared by `uns_keys` and
@@ -334,7 +327,7 @@ impl PyCloudExperiment {
     /// `Experiment.n_obs`, and what `query().count()` / `read_obs()` on this
     /// handle agree with. See `n_obs_physical` for the header count.
     #[getter]
-    fn n_obs(&self) -> u64 {
+    fn n_obs(&self) -> PyResult<u64> {
         self.logical_n_obs()
     }
 
@@ -346,8 +339,8 @@ impl PyCloudExperiment {
     /// `(n_obs, n_vars)` — mirrors `anndata.AnnData.shape` and the local
     /// `Experiment.shape`; `n_obs` is the live count (see `n_obs`).
     #[getter]
-    fn shape(&self) -> (u64, u64) {
-        (self.logical_n_obs(), self.reader.n_vars())
+    fn shape(&self) -> PyResult<(u64, u64)> {
+        Ok((self.logical_n_obs()?, self.reader.n_vars()))
     }
 
     /// Column names in `obs` (cell metadata), excluding the pandas index —
@@ -738,19 +731,17 @@ impl PyCloudExperiment {
         col: &str,
         logical: bool,
     ) -> PyResult<crate::experiment::PyCategorical<'py>> {
-        let cols = vec![col.to_string()];
-        let mut out = py
+        let (codes, categories) = py
             .detach(|| {
                 self.rt.block_on(async {
                     if logical {
-                        self.reader.obs_categorical_many_filtered(&cols).await
+                        self.reader.obs_categorical_filtered(col).await
                     } else {
-                        self.reader.obs_categorical_many(&cols).await
+                        self.reader.obs_categorical(col).await
                     }
                 })
             })
             .map_err(cloud_to_pyerr)?;
-        let (codes, categories) = out.pop().expect("one column in ⇒ one column out");
         Ok((PyArray1::from_vec(py, codes), categories))
     }
 
@@ -801,7 +792,7 @@ impl PyCloudExperiment {
         // header line. Use `.query()` / `read_cloud()` to materialise.
         let mut repr = crate::experiment::format_anndata_repr(
             "CloudExperiment",
-            self.logical_n_obs(),
+            self.logical_n_obs_best_effort(),
             self.reader.n_vars(),
             &[],
         );
@@ -975,7 +966,6 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
         rt: Arc::new(rt),
         modalities,
         grouped_pipeline: std::sync::OnceLock::new(),
-        n_deleted: std::sync::OnceLock::new(),
         url,
     })
 }

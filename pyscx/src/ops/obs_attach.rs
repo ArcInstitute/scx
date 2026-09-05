@@ -312,7 +312,11 @@ pub fn attach_obs_columns(
     };
 
     let batch = obs_var_to_record_batch(py, df, "attach_obs_columns", "df")?;
-    if batch.num_rows() == 0 {
+    // A keyed attach of zero rows can match nothing. A positional one may be
+    // legitimate: on a file whose every row is deleted, `read_obs()` is the
+    // 0-row live frame, and the ops layer decides by length (it refuses a file
+    // with no obs rows itself).
+    if batch.num_rows() == 0 && !positional {
         return Err(PyValueError::new_err(
             "df has no rows; there is nothing to attach",
         ));
@@ -326,7 +330,28 @@ pub fn attach_obs_columns(
     let key = key.unwrap_or_default();
     let (row_keys, join_key, mut drop): (Vec<String>, scx_ops::ObsJoinKey, Vec<String>) =
         if positional {
-            (Vec::new(), scx_ops::ObsJoinKey::Positional, Vec::new())
+            // Positional joins on nothing — but a frame that carries a
+            // labelled pandas index (every `read_obs()` frame does; a
+            // RangeIndex frame carries none) hands its labels to the ops layer
+            // as an ALIGNMENT CHECK: each must equal the barcode of the row it
+            // lands on, so a frame sorted or reindexed after `read_obs()` is
+            // refused by row instead of landing every value on the wrong cell.
+            let index_cols = scx_format_io::pandas_index_columns(&batch.schema());
+            let index_col = index_cols.first().cloned().or_else(|| {
+                batch
+                    .schema()
+                    .index_of("__index_level_0__")
+                    .ok()
+                    .map(|_| "__index_level_0__".to_string())
+            });
+            let keys = match index_col {
+                Some(col) if index_cols.len() <= 1 => {
+                    scx_ops::obs_key_values(&batch, &col).map_err(ops_to_pyerr)?
+                }
+                // A MultiIndex frame: no single label per row to check with.
+                _ => Vec::new(),
+            };
+            (keys, scx_ops::ObsJoinKey::Positional, Vec::new())
         } else {
             match key.len() {
                 0 => {

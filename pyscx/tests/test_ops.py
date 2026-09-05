@@ -191,8 +191,33 @@ def test_mark_deleted_mask_too_short(query_adata, scx_from_adata):
     path = scx_from_adata(query_adata, "mask_short.scx")
     exp = pyscx.open(path)
     short_mask = np.zeros(exp.n_obs - 10, dtype=bool)
-    with pytest.raises(ValueError, match="does not match n_obs"):
+    with pytest.raises(ValueError, match="n_obs_physical"):
         exp.mark_deleted(short_mask)
+
+
+def test_mark_deleted_accepts_a_live_length_mask(query_adata, scx_from_adata):
+    """After a first deletion `read_obs()` is the live frame (0.17), so a mask
+    derived from it has `n_obs` entries; it is expanded onto the physical axis.
+    A physical-length mask keeps working; any other length names both counts."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_live.scx")
+    exp = pyscx.open(path)
+    n = exp.n_obs_physical
+    exp.mark_deleted(np.arange(n) < 5)  # physical rows 0..4
+    assert exp.n_obs == n - 5
+
+    obs = exp.read_obs()
+    live_mask = np.zeros(len(obs), dtype=bool)
+    live_mask[0] = True  # the first LIVE cell = physical row 5
+    total = exp.mark_deleted(live_mask)
+    assert total == 6
+    assert exp.n_obs == n - 6
+    assert list(exp.read_obs().index) == list(obs.index[1:])
+
+    with pytest.raises(ValueError) as e:
+        exp.mark_deleted(np.zeros(n - 7, dtype=bool))
+    assert f"n_obs = {n - 6}" in str(e.value) and f"n_obs_physical = {n}" in str(e.value)
 
 
 def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
@@ -202,7 +227,7 @@ def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
     path = scx_from_adata(query_adata, "mask_long.scx")
     exp = pyscx.open(path)
     long_mask = np.zeros(exp.n_obs + 10, dtype=bool)
-    with pytest.raises(ValueError, match="does not match n_obs"):
+    with pytest.raises(ValueError, match="n_obs_physical"):
         exp.mark_deleted(long_mask)
 
 

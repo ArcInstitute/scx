@@ -1218,6 +1218,66 @@ pub(crate) fn compute_kept_to_global(reader: &ScxReader) -> PyResult<Option<Vec<
     Ok(Some(kept))
 }
 
+/// Accept a boolean row mask in either obs row space and return it
+/// physical-length.
+///
+/// `n_obs_physical` entries (`header.n_obs`; what `read_obs(logical=False)`
+/// describes) are returned as they are. The live count (`n_obs_physical` minus
+/// the deletion-vector popcount; what `read_obs()` describes since 0.17) is
+/// expanded through the keep mask — a live entry lands on its physical row, an
+/// already-deleted row gets `false`. The two lengths coincide on a file with no
+/// deletions. Any other length is a `ValueError` naming both counts and the
+/// read that yields each. `what` names the argument in the message.
+///
+/// The mask-side twin of the length rule the in-place obs writers use for a
+/// positional frame (`scx_ops::classify_obs_frame_length`), so `to_h5ad(obs_mask=)`
+/// and `Experiment.mark_deleted(mask)` take what `read_obs()` hands out.
+pub(crate) fn physical_row_mask(
+    reader: &ScxReader,
+    mask: &[bool],
+    what: &str,
+) -> PyResult<Vec<bool>> {
+    let n_physical = reader.n_obs() as usize;
+    if mask.len() == n_physical {
+        return Ok(mask.to_vec());
+    }
+    let keep = reader.deletion_keep_mask().map_err(to_pyerr)?;
+    let n_live = keep
+        .as_ref()
+        .map_or(n_physical, |k| k.iter().filter(|b| **b).count());
+    match keep {
+        Some(keep) if mask.len() == n_live => {
+            let mut live = mask.iter();
+            Ok(keep
+                .iter()
+                .map(|&k| {
+                    if k {
+                        *live.next().expect("n_live entries")
+                    } else {
+                        false
+                    }
+                })
+                .collect())
+        }
+        _ => {
+            let file = if n_live == n_physical {
+                format!("n_obs_physical = {n_physical} (no logical deletions)")
+            } else {
+                format!(
+                    "n_obs = {n_live} live rows (read_obs()) and n_obs_physical = {n_physical} \
+                     (read_obs(logical=False); {} logically deleted)",
+                    n_physical - n_live
+                )
+            };
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{what} has {} entries but the file has {file}; pass one entry per live row or \
+                 one per physical row",
+                mask.len()
+            )))
+        }
+    }
+}
+
 /// Filter an obs RecordBatch to exclude deleted rows.
 ///
 /// Builds a boolean keep-mask from the deletion vectors (same logic

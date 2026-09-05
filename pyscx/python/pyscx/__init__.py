@@ -394,12 +394,17 @@ def modify_metadata(path, **kwargs):
     the section; `var` must have `n_vars` rows and `obs` either `n_obs` rows
     (what `read_obs()` returns — the live rows; on a file with deletions the
     frame is scattered onto the physical axis, and a deleted row keeps its
-    barcode but is `null` in every other column) or `n_obs_physical` rows
-    (what `read_obs(logical=False)` returns — every physical row, written as
-    handed in). Changing the cell/gene count is out of scope — use `append` /
-    `subset`. `obsm` / `varm` replace only the named matrices and are always
-    physical-length (a dense mapping has no `null` for a deleted row). For a
-    shallow `uns` merge use `pyscx.update_uns`.
+    barcode but is `null` in every other column — **including columns it had
+    before**: this is a replace, so to add a column while keeping deleted
+    rows' existing values use `attach_obs_columns(positional=True)`) or
+    `n_obs_physical` rows (what `read_obs(logical=False)` returns — every
+    physical row, written as handed in). A live-length frame holding the
+    file's own live barcodes in a **different order** is refused by row (a
+    `sort_values` / `reindex` after `read_obs()`, not a rename — renamed
+    barcodes pass). Changing the cell/gene count is out of scope — use
+    `append` / `subset`. `obsm` / `varm` replace only the named matrices and
+    are always physical-length (a dense mapping has no `null` for a deleted
+    row). For a shallow `uns` merge use `pyscx.update_uns`.
 
     **A replaced axis keeps the predicate index it had.** The old section
     describes values that are gone, so it is rebuilt over the same columns the
@@ -691,12 +696,16 @@ def to_h5ad(path, out, **kwargs):
             (powers of 1024); decimal KB/MB/GB/TB is rejected. E.g. "4G" /
             "512M" / "2GiB". A single shard exceeding the budget raises;
             smaller mismatches emit ReaderThreadsDerated.
-        obs_mask: Boolean array selecting the observations to keep. Indexed
-            in the GLOBAL / physical obs row space — its length must equal
-            `pyscx.open(path).n_obs_physical` (the file header count), NOT
-            `.n_obs` (the live, post-deletion count). Rows already logically
-            deleted stay dropped regardless of their entry here: the mask is
-            ANDed with the deletion-vector mask, never substituted for it.
+        obs_mask: Boolean array selecting the observations to keep, in
+            either obs row space, told apart by length: `n_obs` entries (the
+            live rows — what `read_obs()` describes, so
+            `obs_mask=exp.read_obs()["keep"].to_numpy()` works) or
+            `n_obs_physical` entries (every physical row, as
+            `read_obs(logical=False)` describes). The two coincide on a file
+            with no deletions; any other length raises naming both counts.
+            Rows already logically deleted stay dropped regardless of their
+            entry here: the mask is ANDed with the deletion-vector mask,
+            never substituted for it.
             Accepts a numpy bool array, a pandas boolean Series, or a list of
             bool; a non-bool dtype raises rather than being coerced. Requires
             stream=True.
@@ -1127,8 +1136,15 @@ def attach_obs_columns(path, df, *, key=None, **kwargs):
     either `n_obs` rows (what `read_obs()` returns: the live rows, deleted
     rows excluded — those are left `null`) or `n_obs_physical` rows (what
     `read_obs(logical=False)` returns: every physical row, deleted rows
-    included and written); the two coincide on a file with no deletions. Its
-    pandas index is ignored either way.
+    included and written); the two coincide on a file with no deletions.
+    Positional dispatch is by length, so a frame **sorted or reindexed** after
+    `read_obs()` has the right length and every value on the wrong cell. A
+    frame that carries a labelled pandas index (every `read_obs()` frame does)
+    is therefore checked: when its labels are the file's own barcodes in a
+    different order, the attach raises naming the first misplaced row. Labels
+    that are not the file's barcodes are ignored, as the index always was
+    under positional; a `RangeIndex` frame checks nothing. The index is never
+    attached as data.
 
     Args:
         path: Target SCX file (str, os.PathLike, or an open Experiment).

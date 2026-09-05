@@ -863,8 +863,8 @@ class Experiment:
         `logical=True` (default) returns the **live** rows — deletion vectors
         applied, so `len(read_obs()) == n_obs == len(to_anndata(backed=True).obs)`
         row for row. `logical=False` returns the physical table:
-        `n_obs_physical` rows, deleted rows in place (the row space
-        `to_h5ad(obs_mask=)` and `mark_deleted(mask)` take). Identical on a
+        `n_obs_physical` rows, deleted rows in place. (`to_h5ad(obs_mask=)` and
+        `mark_deleted(mask)` accept a mask in either row space.) Identical on a
         file without deletions. Changed in 0.17: the default used to be the
         physical table on every file. A frame computed from `read_obs()` can
         still be landed with `attach_obs_columns(positional=True)` or
@@ -1069,8 +1069,12 @@ class Experiment:
         ...
 
     def mark_deleted(self, mask: np.ndarray) -> int:
-        """Mark cells for deletion via a boolean mask (length ``n_obs``);
-        returns the number of rows newly marked. Writes a deletion vector."""
+        """Mark cells for deletion via a boolean mask in either row space:
+        ``n_obs`` entries (the live rows ``read_obs()`` describes) or
+        ``n_obs_physical`` entries (every physical row, as
+        ``read_obs(logical=False)`` describes); any other length raises naming
+        both counts. Returns the total number of deleted rows. Writes a
+        deletion vector."""
         ...
 
     def validate(self, deep: bool = ...) -> list[tuple[str, bool]]:
@@ -1316,8 +1320,18 @@ class CloudExperiment:
     @property
     def n_obs(self) -> int:
         """Live row count (header `n_obs` minus deleted rows), like the local
-        `Experiment.n_obs`; one small section read on a file with deletions.
+        `Experiment.n_obs`; one small section read on a file with deletions
+        (raises if that read fails, so it cannot disagree with `read_obs()`).
         Changed in 0.17: was the physical header count."""
+        ...
+    @property
+    def n_obs_physical(self) -> int:
+        """Physical row count straight from the header — every row, deleted
+        ones included. Equals `n_obs` on a file with no deletions."""
+        ...
+    @property
+    def has_deletions(self) -> bool:
+        """`True` when the file carries a deletion vector. Header-only."""
         ...
     @property
     def n_vars(self) -> int: ...

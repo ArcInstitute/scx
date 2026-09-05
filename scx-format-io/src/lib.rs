@@ -54,8 +54,9 @@ pub use bitmap::{
     BitmapPolicy, BitmapShard, BITMAP_ORIENTATION_GENE_TO_ROWS, BITMAP_SHARD_MAGIC,
     BITMAP_SHARD_VERSION,
 };
+pub use categorical::filter_codes_by_keep_mask;
 #[cfg(feature = "deletion-vectors")]
-pub use categorical::{filter_codes_by_keep_mask, GlobalCategoryAccum};
+pub use categorical::GlobalCategoryAccum;
 pub use csc_sidecar::{write_csc_sidecar, CscSidecarOptions, DEFAULT_CSC_MEMORY_BYTES};
 #[cfg(feature = "deletion-vectors")]
 pub use deletion_vectors::DeletionVectors;

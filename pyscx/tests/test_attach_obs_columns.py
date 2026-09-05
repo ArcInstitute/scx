@@ -192,6 +192,41 @@ def test_positional_still_accepts_a_physical_length_frame_on_a_deleted_file(tmp_
     assert pyscx.open(str(scx)).read_obs()["my_score"].tolist() == [1.0, 3.0, 4.0]
 
 
+def test_positional_refuses_a_reordered_read_obs_frame(tmp_path):
+    # `read_obs().sort_values(...)` keeps the length and permutes the rows: the
+    # frame's index labels no longer match the file's barcodes row for row, and
+    # the attach must refuse by row instead of landing every value on the
+    # wrong cell. A RangeIndex frame carries no labels and is not checked.
+    scx, exp = _deleted_fixture(tmp_path)
+    obs = exp.read_obs()  # AAAC-1, AAAT-1, AAAA-1
+    obs["score"] = [1.0, 2.0, 3.0]
+    shuffled = obs.iloc[[2, 0, 1]]
+    with pytest.raises(ValueError, match=r"different order.*AAAA-1"):
+        pyscx.attach_obs_columns(str(scx), shuffled[["score"]], positional=True)
+    assert "score" not in pyscx.open(str(scx)).read_obs().columns, "refused → nothing written"
+
+    r = pyscx.attach_obs_columns(str(scx), obs[["score"]], positional=True)
+    assert r["n_matched"] == 3
+    assert pyscx.open(str(scx)).read_obs()["score"].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_positional_accepts_the_empty_live_frame_when_every_row_is_deleted(tmp_path):
+    scx = _fixture(tmp_path)
+    pyscx.mark_deleted(str(scx), [0, 1, 2, 3])
+    exp = pyscx.open(str(scx))
+    obs = exp.read_obs()
+    assert len(obs) == 0 and exp.n_obs_physical == 4
+    obs["score"] = pd.Series(dtype="float64")
+
+    r = pyscx.attach_obs_columns(str(scx), obs[["score"]], positional=True)
+    assert r["n_matched"] == 0 and r["n_target_rows_absent"] == 4
+    physical = pyscx.open(str(scx)).read_obs(logical=False)
+    assert physical["score"].isna().all()
+    # The keyed path keeps refusing an empty frame.
+    with pytest.raises(ValueError, match="no rows"):
+        pyscx.attach_obs_columns(str(scx), obs[["score"]])
+
+
 def test_positional_neither_length_names_both_counts_on_a_deleted_file(tmp_path):
     scx, _ = _deleted_fixture(tmp_path)
     for n in (2, 5):

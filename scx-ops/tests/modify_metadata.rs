@@ -1031,8 +1031,8 @@ fn obs_replace_wrong_length_on_a_deleted_file_names_both_counts() {
         let msg = err.to_string();
         for needle in [
             &format!("{n} rows"),
-            "n_obs=17",
-            "n_obs_physical=20",
+            "n_obs = 17",
+            "n_obs_physical = 20",
             "read_obs()",
             "read_obs(logical=False)",
         ] {
@@ -1079,7 +1079,7 @@ fn obsm_replace_on_a_deleted_file_stays_physical_length() {
     let msg = err.to_string();
     assert!(
         msg.contains("17 rows")
-            && msg.contains("n_obs_physical=20")
+            && msg.contains("n_obs_physical = 20")
             && msg.contains("dense mapping"),
         "{msg}"
     );
@@ -1262,5 +1262,281 @@ fn obs_replace_live_frame_keeps_the_deleted_rows_barcodes() {
     assert_eq!(
         summary.n_target_rows_absent, 3,
         "the deleted rows, whose barcodes no source row names"
+    );
+}
+
+/// The row space the frame arrived in is recorded in provenance: the obs on
+/// disk is physical-length either way and does not say which frame produced it.
+#[test]
+fn obs_replace_records_the_row_space_in_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prov.scx");
+    write_base(&path, 20, 4, None);
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    let last_params = |path: &Path| {
+        ScxReader::open(path)
+            .unwrap()
+            .read_provenance()
+            .unwrap()
+            .operations
+            .last()
+            .unwrap()
+            .params_json
+            .clone()
+    };
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(17, "live")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        last_params(&path).contains("\"row_space\":\"logical\""),
+        "{}",
+        last_params(&path)
+    );
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(obs_batch(20, "phys")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        last_params(&path).contains("\"row_space\":\"physical\""),
+        "{}",
+        last_params(&path)
+    );
+}
+
+/// Obs with a pandas envelope declaring `levels` as its index columns.
+fn envelope_obs(levels: &[&str], values: Vec<Vec<String>>, donor: &str) -> RecordBatch {
+    let n = values[0].len();
+    let mut fields: Vec<Field> = levels
+        .iter()
+        .map(|l| Field::new(*l, DataType::Utf8, false))
+        .collect();
+    fields.push(Field::new("donor", DataType::Utf8, false));
+    let mut columns: Vec<Arc<dyn Array>> = values
+        .into_iter()
+        .map(|v| Arc::new(StringArray::from(v)) as Arc<dyn Array>)
+        .collect();
+    columns.push(Arc::new(StringArray::from(vec![donor.to_string(); n])));
+    let quoted: Vec<String> = levels.iter().map(|l| format!("\"{l}\"")).collect();
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(
+        "pandas".to_string(),
+        format!("{{\"index_columns\":[{}]}}", quoted.join(",")),
+    );
+    RecordBatch::try_new(Arc::new(Schema::new(fields).with_metadata(meta)), columns).unwrap()
+}
+
+fn write_base_with_obs(path: &Path, obs: RecordBatch, n_vars: usize) {
+    let n = obs.num_rows();
+    let mut writer = ScxWriter::new(path, header(n as u64, n_vars as u64)).unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var_batch(n_vars)).unwrap();
+    let (indptr, indices, values) = dense_to_csr(&dense(n, n_vars), n, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+/// A live frame whose index was renamed (`rename_axis`) still keeps the deleted
+/// rows' barcodes: the two sides' index columns are resolved independently and
+/// paired by position, not by name.
+#[test]
+fn obs_replace_live_frame_with_a_renamed_index_keeps_the_deleted_rows_barcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("renamed.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["__index_level_0__"],
+            vec![(0..n).map(|i| format!("bc_{i}")).collect()],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["cell_id"],
+                vec![(0..17).map(|i| format!("new_{i}")).collect()],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let physical = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert!(
+        physical.column_by_name("cell_id").is_some(),
+        "the frame's index name wins"
+    );
+    let idx = str_col(&physical, "cell_id");
+    let mut live = 0usize;
+    for row in 0..n {
+        if DELETED_ROWS.contains(&(row as u64)) {
+            assert_eq!(
+                idx.value(row),
+                format!("bc_{row}"),
+                "deleted row {row} keeps its barcode"
+            );
+        } else {
+            assert_eq!(idx.value(row), format!("new_{live}"));
+            live += 1;
+        }
+    }
+}
+
+/// Every index level is paired and preserved, not only the first.
+#[test]
+fn obs_replace_live_frame_pairs_every_index_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multi.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["lvl_a", "lvl_b"],
+            vec![
+                (0..n).map(|i| format!("a_{i}")).collect(),
+                (0..n).map(|i| format!("b_{i}")).collect(),
+            ],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["lvl_a", "lvl_b"],
+                vec![
+                    (0..17).map(|i| format!("na_{i}")).collect(),
+                    (0..17).map(|i| format!("nb_{i}")).collect(),
+                ],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let physical = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    let a = str_col(&physical, "lvl_a");
+    let b = str_col(&physical, "lvl_b");
+    for row in DELETED_ROWS {
+        let row = row as usize;
+        assert_eq!(
+            a.value(row),
+            format!("a_{row}"),
+            "level a kept on deleted row {row}"
+        );
+        assert_eq!(
+            b.value(row),
+            format!("b_{row}"),
+            "level b kept on deleted row {row}"
+        );
+    }
+    assert_eq!(a.value(0), "na_0");
+    assert_eq!(b.value(0), "nb_0");
+}
+
+/// A live frame holding the file's own live barcodes in a different order is a
+/// `sort_values` / `reindex` accident, not a rename: refused by row. Different
+/// values (a rename) pass — that is what a replace is for.
+#[test]
+fn obs_replace_refuses_a_reordered_live_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reorder.scx");
+    let n = 20usize;
+    write_base_with_obs(
+        &path,
+        envelope_obs(
+            &["__index_level_0__"],
+            vec![(0..n).map(|i| format!("bc_{i}")).collect()],
+            "donor_A",
+        ),
+        4,
+    );
+    scx_ops::mark_deleted(&path, &DELETED_ROWS).unwrap();
+    let seq0 = ScxReader::open(&path).unwrap().header().manifest_sequence;
+
+    let live: Vec<String> = (0..n)
+        .filter(|i| !DELETED_ROWS.contains(&(*i as u64)))
+        .map(|i| format!("bc_{i}"))
+        .collect();
+    let mut reversed = live.clone();
+    reversed.reverse();
+    let err = modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![reversed],
+                "donor_Z",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "got {err:?}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different order") && msg.contains("row 0 of the frame is 'bc_19'"),
+        "{msg}"
+    );
+    assert_eq!(
+        ScxReader::open(&path).unwrap().header().manifest_sequence,
+        seq0,
+        "refused → nothing written"
+    );
+
+    // Same order: accepted. Renamed barcodes: accepted (a replace may rename).
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(&["__index_level_0__"], vec![live], "donor_Z")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    modify_metadata(
+        &path,
+        &MetadataPatch {
+            obs: Some(envelope_obs(
+                &["__index_level_0__"],
+                vec![(0..17).map(|i| format!("renamed_{i}")).collect()],
+                "donor_Y",
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let live_now = ScxReader::open(&path).unwrap().read_obs_filtered().unwrap();
+    assert_eq!(
+        str_col(&live_now, "__index_level_0__").value(0),
+        "renamed_0"
     );
 }

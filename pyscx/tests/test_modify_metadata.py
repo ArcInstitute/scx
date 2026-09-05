@@ -413,6 +413,37 @@ def test_modify_metadata_obs_accepts_the_live_frame_from_read_obs(
     assert len(pyscx.open(out).read_obs(logical=False)) == 97
 
 
+def test_modify_metadata_refuses_a_reordered_live_frame(synthetic_adata, scx_from_adata):
+    # Same live barcodes, different order: a `sort_values` accident, refused by
+    # row. Renamed barcodes are a legitimate replace and pass.
+    path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_reorder.scx")
+    obs = exp.read_obs()
+    with pytest.raises(ValueError, match="different order"):
+        pyscx.modify_metadata(path, obs=obs.sort_values("batch", kind="stable").iloc[::-1])
+    assert pyscx.open(path).read_obs().equals(obs), "refused → nothing written"
+
+    renamed = obs.copy()
+    renamed.index = [f"new_{i}" for i in range(len(obs))]
+    pyscx.modify_metadata(path, obs=renamed)
+    assert list(pyscx.open(path).read_obs().index) == list(renamed.index)
+
+
+def test_modify_metadata_live_frame_with_a_renamed_index_keeps_deleted_barcodes(
+    synthetic_adata, scx_from_adata
+):
+    # `rename_axis` changes the index column's name; the deleted rows must still
+    # get their barcodes back (levels are paired by position, not by name).
+    path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_axis.scx")
+    before = exp.read_obs(logical=False).index
+    obs = exp.read_obs().rename_axis("cell")
+    obs["score"] = 1.0
+    pyscx.modify_metadata(path, obs=obs)
+    physical = pyscx.open(path).read_obs(logical=False)
+    assert physical.index.name == "cell"
+    assert list(physical.index) == list(before)
+    assert physical["score"].isna().sum() == 3
+
+
 def test_modify_metadata_obs_still_accepts_the_physical_frame(synthetic_adata, scx_from_adata):
     path, exp = _deleted(synthetic_adata, scx_from_adata, "mm_phys.scx")
     obs = exp.read_obs(logical=False)
@@ -434,7 +465,7 @@ def test_modify_metadata_obs_wrong_length_on_a_deleted_file_names_both_counts(
         with pytest.raises(ValueError) as e:
             pyscx.modify_metadata(path, obs=pd.DataFrame({"x": list(range(n))}))
         msg = str(e.value)
-        for needle in (f"{n} rows", "n_obs=97", "n_obs_physical=100", "read_obs()",
+        for needle in (f"{n} rows", "n_obs = 97", "n_obs_physical = 100", "read_obs()",
                        "read_obs(logical=False)"):
             assert needle in msg, f"{needle!r} missing from: {msg}"
 
@@ -443,7 +474,7 @@ def test_modify_metadata_obsm_stays_physical_length_on_a_deleted_file(
     synthetic_adata, scx_from_adata
 ):
     path, _ = _deleted(synthetic_adata, scx_from_adata, "mm_obsm.scx")
-    with pytest.raises(ValueError, match=r"97 rows.*n_obs_physical=100.*dense mapping"):
+    with pytest.raises(ValueError, match=r"97 rows.*n_obs_physical = 100.*dense mapping"):
         pyscx.modify_metadata(path, obsm={"X_new": np.zeros((97, 2), dtype=np.float32)})
     pyscx.modify_metadata(path, obsm={"X_new": np.zeros((100, 2), dtype=np.float32)})
     assert pyscx.open(path).to_anndata(backed=True).obsm["X_new"].shape == (97, 2)

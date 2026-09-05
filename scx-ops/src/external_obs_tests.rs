@@ -2491,17 +2491,152 @@ fn positional_attach_rejects_row_embeddings_on_a_live_length_frame() {
     assert_eq!(before, std::fs::read(&path).unwrap());
 }
 
-#[test]
-fn positional_attach_requires_empty_row_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+/// A 10-row file whose obs carries a pandas-style index column
+/// (`__index_level_0__` = cell_0..cell_9), as every `from_anndata` file does —
+/// the alignment check below resolves the file's barcodes through it.
+fn indexed_fixture(dir: &Path, name: &str) -> PathBuf {
+    let ids: Vec<String> = keys("cell_", 10);
+    let schema = Schema::new(vec![
+        Field::new("__index_level_0__", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, true),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(
+                (0..10)
+                    .map(|i| if i % 2 == 0 { "T" } else { "B" })
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    write_fixture_with_obs(dir, name, obs, 2, 2)
+}
 
-    let mut data = positional_data(4);
-    data.row_keys = keys("cell_", 4); // a caller who built keys meant a key join
+/// Under positional, supplied keys are never joined on — they are an alignment
+/// check: the frame's labels must equal the file's barcodes row for row, so a
+/// frame sorted or reindexed after `read_obs()` (right length, wrong order) is
+/// refused by row instead of landing every value on the wrong cell.
+#[test]
+fn positional_attach_keys_are_an_alignment_check_not_a_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = indexed_fixture(dir.path(), "a.scx");
+    let before = std::fs::read(&path).unwrap();
+
+    // Right length, permuted: refused, naming the first offending row.
+    let mut data = positional_data(10);
+    let mut permuted = keys("cell_", 10);
+    permuted.swap(2, 7);
+    data.row_keys = permuted;
     let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("row_keys"),
-        "positional with keys present must be refused by name, got: {err}"
+        msg.contains("different order") && msg.contains("frame row 2") && msg.contains("cell_7"),
+        "the refusal must name the row and both labels: {msg}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read(&path).unwrap(),
+        "refused → not a byte written"
+    );
+
+    // Wrong key count: refused as a shape error.
+    let mut data = positional_data(10);
+    data.row_keys = keys("cell_", 9);
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
+    assert!(err.to_string().contains("row_keys has 9"), "{err}");
+
+    // Matching keys: the check passes and the attach is positional as ever.
+    let mut data = positional_data(10);
+    data.row_keys = keys("cell_", 10);
+    let s = attach_external_obs(&path, &data, &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+    let reader = ScxReader::open(&path).unwrap();
+    let scores = f32_col(&reader.read_obs().unwrap(), "dbl_score");
+    for i in 0..10 {
+        assert_eq!(scores.value(i), i as f32 * 10.0);
+    }
+    let prov = reader.read_provenance().unwrap();
+    assert!(
+        prov.operations
+            .last()
+            .unwrap()
+            .params_json
+            .contains("\"positional_index_checked\":true"),
+        "{}",
+        prov.operations.last().unwrap().params_json
+    );
+
+    // Labels that are not the file's barcodes at all: ignored, as the index
+    // always was under positional (a frame from another source with its own
+    // row labels is still "row i annotates row i").
+    let path2 = indexed_fixture(dir.path(), "b.scx");
+    let mut data = positional_data(10);
+    data.row_keys = keys("other_", 10);
+    let s = attach_external_obs(&path2, &data, &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+}
+
+/// The alignment check follows the frame's row space: live keys against the
+/// live barcodes on a deleted file.
+#[test]
+fn positional_live_attach_checks_keys_against_the_live_barcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = indexed_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    // The live barcodes in order: cell_0, cell_2, cell_4..cell_9.
+    let live: Vec<String> = (0..10)
+        .filter(|i| *i != 1 && *i != 3)
+        .map(|i| format!("cell_{i}"))
+        .collect();
+    let mut data = positional_data(8);
+    data.row_keys = live.clone();
+    let s = attach_external_obs(&path, &data, &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 8);
+
+    // The same labels reversed: a `read_obs().sort_values(...)` accident.
+    let mut data = positional_data(8);
+    data.row_keys = live.into_iter().rev().collect();
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(err.to_string().contains("different order"), "{err}");
+}
+
+/// A file with no obs index column cannot be checked against, so keys are
+/// refused by name rather than compared against a guessed column.
+#[test]
+fn positional_attach_keys_need_an_obs_index_column_to_check_against() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx"); // `cell_id` only, no index column
+    let mut data = positional_data(10);
+    data.row_keys = keys("cell_", 10);
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(err.to_string().contains("no index column"), "{err}");
+    // Without keys the same file attaches positionally as before.
+    attach_external_obs(&path, &positional_data(10), &positional_opts()).unwrap();
+}
+
+/// Every row deleted: `read_obs()` is a 0-row frame and is exactly the live
+/// frame — the attach must accept it (all-null column) rather than refuse it.
+#[test]
+fn positional_attach_accepts_an_empty_live_frame_when_every_row_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &(0..10u64).collect::<Vec<_>>()).unwrap();
+
+    let s = attach_external_obs(&path, &positional_data(0), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 0);
+    assert_eq!(s.n_target_rows_absent, 10);
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let scores = f32_col(&obs, "dbl_score");
+    assert!(
+        (0..10).all(|i| scores.is_null(i)),
+        "every deleted row is null"
     );
 }
 

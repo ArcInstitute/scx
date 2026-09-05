@@ -30,9 +30,10 @@
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use serde_json::Value;
 
 use scx_engine::{BuildOutcome, ConversionPredicateIndexOptions, ConversionPredicateIndexResult};
@@ -194,6 +195,12 @@ pub struct ModifyMetadataSummary {
     pub obs_predicate_index_dropped: bool,
     /// True when the file had a var predicate index and the output has none.
     pub var_predicate_index_dropped: bool,
+    /// Which row space the supplied `obs` was in — `Some("physical")` when it
+    /// had `n_obs_physical` rows, `Some("logical")` when it was the live-length
+    /// frame scattered onto the physical axis; `None` when no `obs` was
+    /// supplied. Recorded in provenance as `row_space` because the obs on disk
+    /// is physical-length either way and does not say which frame produced it.
+    pub obs_row_space: Option<&'static str>,
 }
 
 impl ModifyMetadataSummary {
@@ -384,7 +391,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
     // builder and the shard loop below, whose row ids and CSR ranges are
     // physical; scattering after them would index live rows against physical
     // shards and silently shorten every `filter_obs` on the new columns.
-    let obs_to_write: Option<RecordBatch> = match &patch.obs {
+    let obs_to_write = match &patch.obs {
         None => None,
         Some(obs) => {
             let reader = reader
@@ -393,6 +400,8 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             Some(resolve_obs_row_space(reader, obs, prep.old_n_obs)?)
         }
     };
+    let obs_row_space = obs_to_write.as_ref().map(|(_, space)| space.as_str());
+    let obs_to_write: Option<RecordBatch> = obs_to_write.map(|(batch, _)| batch);
     if let Some(var) = &patch.var {
         if var.num_rows() as u64 != prep.target_n_vars {
             return Err(OpsError::ShapeMismatch {
@@ -410,7 +419,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             if b.num_rows() as u64 != prep.old_n_obs {
                 return Err(OpsError::ShapeMismatch {
                     detail: format!(
-                        "modify_metadata: obsm['{k}'] has {} rows but n_obs_physical={}. \
+                        "modify_metadata: obsm['{k}'] has {} rows but n_obs_physical = {}. \
                          A dense mapping is always physical-length (it has no null to \
                          stand in for a deleted row), so unlike `obs` a live-length \
                          array is not accepted here; pass one row per physical obs row",
@@ -692,6 +701,7 @@ pub fn modify_metadata(path: &Path, patch: &MetadataPatch) -> Result<ModifyMetad
             result: Some(index_result),
             multimodal_skip: None,
         },
+        obs_row_space,
     };
 
     // --- Append provenance (manual, mirrors finalize_append) ---------------
@@ -956,6 +966,9 @@ fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> 
     }
     if patch.obs.is_some() {
         params["obs_predicate_index_dropped"] = summary.obs_predicate_index_dropped.into();
+        if let Some(space) = summary.obs_row_space {
+            params["row_space"] = space.into();
+        }
     }
     if patch.var.is_some() {
         params["var_predicate_index_dropped"] = summary.var_predicate_index_dropped.into();
@@ -977,94 +990,146 @@ fn build_params_json(patch: &MetadataPatch, summary: &ModifyMetadataSummary) -> 
     params
 }
 
-/// Accept an obs replacement in either row space and return it physical-length.
+/// Accept an obs replacement in either row space and return it physical-length,
+/// with the row space it arrived in.
 ///
-/// `n_obs_physical` is the header count. A frame of exactly that many rows is
-/// returned as is (deleted rows in place). A frame of exactly the **live** count
-/// — what `pyscx` `read_obs()` returns since 0.17 — is scattered onto the
-/// physical axis through the deletion keep mask: a deleted row is `null` in
-/// every column the caller supplied, except the obs index column, which keeps
-/// the barcode the file already holds for it (a null key would become `""` in
-/// every later keyed join and, twice over, a duplicate). Any other length is a
-/// [`OpsError::ShapeMismatch`] naming both counts and the read that produces
-/// each. When nothing is deleted the two counts coincide and the frame is
-/// physical by construction.
+/// The length rule is the shared [`crate::external_obs::classify_obs_frame_length`]
+/// (the same one the positional attach uses). A physical frame is returned as is
+/// (deleted rows in place). A live frame — what `pyscx` `read_obs()` returns
+/// since 0.17 — is scattered onto the physical axis through the deletion keep
+/// mask: a deleted row is `null` in every column the caller supplied, except
+/// the obs **index** columns, which keep the barcodes the file already holds (a
+/// null key would become `""` in every later keyed join and, twice over, a
+/// duplicate). The index columns are resolved on each side independently (the
+/// pandas envelope, else the literal `__index_level_0__`) and paired **level by
+/// level**, so a renamed index (`rename_axis`) or a multi-level one is
+/// preserved too; a level the new frame does not have stays null.
+///
+/// Because dispatch is by length alone, a live frame that was **reordered**
+/// after `read_obs()` has the right length and every row on the wrong cell.
+/// When a paired index level holds exactly the file's live barcodes in a
+/// different order, the frame is refused by row — that is a sort or a
+/// reindex, not a rename, and a rename (different values) is what a replace is
+/// for and passes.
 fn resolve_obs_row_space(
     reader: &ScxReader,
     obs: &RecordBatch,
     n_obs_physical: u64,
-) -> Result<RecordBatch> {
+) -> Result<(RecordBatch, crate::external_obs::ObsFrameRowSpace)> {
+    use crate::external_obs::{classify_obs_frame_length, ObsFrameRowSpace};
+
     let n_rows = obs.num_rows() as u64;
-    if n_rows == n_obs_physical {
-        return Ok(obs.clone());
-    }
-    let keep = reader.deletion_keep_mask()?;
-    let n_live = keep
-        .as_ref()
-        .map_or(n_obs_physical, |k| k.iter().filter(|b| **b).count() as u64);
-    let keep = match keep {
-        Some(keep) if n_rows == n_live => keep,
-        _ => {
-            let deletions = if n_live == n_obs_physical {
-                format!("n_obs={n_obs_physical} (no logical deletions)")
-            } else {
-                format!(
-                    "n_obs={n_live} live rows (read_obs()) and n_obs_physical={n_obs_physical} \
-                     (read_obs(logical=False); {} logically deleted)",
-                    n_obs_physical - n_live
-                )
-            };
-            return Err(OpsError::ShapeMismatch {
-                detail: format!(
-                    "modify_metadata: obs has {n_rows} rows but file has {deletions} \
-                     (changing cell count is out of scope — use append/subset)"
-                ),
-            });
-        }
+    let keep = if n_rows == n_obs_physical {
+        None
+    } else {
+        reader.deletion_keep_mask()?
+    };
+    let space = classify_obs_frame_length(
+        "modify_metadata: obs",
+        n_rows,
+        n_obs_physical,
+        keep.as_deref(),
+    )?;
+    let Some(keep) = keep.filter(|_| space == ObsFrameRowSpace::Live) else {
+        return Ok((obs.clone(), ObsFrameRowSpace::Physical));
     };
 
     let scattered = scx_format_io::scatter_batch_to_physical(obs, &keep)?;
 
-    // Keep the deleted rows' identity. The index column is whatever the file's
-    // pandas envelope (or the literal `__index_level_0__`) names, and it must
-    // be a column of the new frame too — the barcode is a string, so a
-    // dictionary-encoded index is cast to plain Utf8 first and back to the new
-    // frame's type after.
+    // Pair the two sides' index levels positionally; nothing to do when either
+    // side declares none.
     let existing_schema = reader.read_obs_schema_physical()?;
-    let index_col = scx_format_io::resolve_index_columns(&existing_schema)
+    let old_levels: Vec<String> = scx_format_io::resolve_index_columns(&existing_schema)
         .into_iter()
-        .find(|c| existing_schema.index_of(c).is_ok() && scattered.schema().index_of(c).is_ok());
-    let Some(index_col) = index_col else {
-        return Ok(scattered);
-    };
-    let old_index = reader.read_obs_keys(std::slice::from_ref(&index_col))?;
+        .filter(|c| existing_schema.index_of(c).is_ok())
+        .collect();
+    let new_levels: Vec<String> = scx_format_io::resolve_index_columns(&scattered.schema())
+        .into_iter()
+        .filter(|c| scattered.schema().index_of(c).is_ok())
+        .collect();
+    if old_levels.is_empty() || new_levels.is_empty() {
+        return Ok((scattered, ObsFrameRowSpace::Live));
+    }
+    let old_index = reader.read_obs_keys(&old_levels)?;
     if old_index.num_rows() as u64 != n_obs_physical {
         return Err(OpsError::ShapeMismatch {
             detail: format!(
-                "modify_metadata: the existing obs index column '{index_col}' has {} rows but the \
-                 header declares n_obs={n_obs_physical}",
+                "modify_metadata: the existing obs index has {} rows but the header declares \
+                 n_obs = {n_obs_physical}",
                 old_index.num_rows()
             ),
         });
     }
-    let pos = scattered.schema().index_of(&index_col)?;
-    let target_type = scattered.column(pos).data_type().clone();
-    let old_col = arrow::compute::cast(
-        old_index
-            .column_by_name(&index_col)
-            .expect("projected column present"),
-        &target_type,
-    )?;
-    // Where the mask is live take the caller's value, elsewhere the file's.
     let live_mask = arrow::array::BooleanArray::from(keep.clone());
-    let merged = arrow::compute::kernels::zip::zip(&live_mask, scattered.column(pos), &old_col)?;
     let mut columns = scattered.columns().to_vec();
-    columns[pos] = merged;
-    Ok(RecordBatch::try_new_with_options(
-        scattered.schema(),
-        columns,
-        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(keep.len())),
-    )?)
+    for (old_col, new_col) in old_levels.iter().zip(new_levels.iter()) {
+        let pos = scattered.schema().index_of(new_col)?;
+        let target_type = scattered.column(pos).data_type().clone();
+        let old = arrow::compute::cast(
+            old_index
+                .column_by_name(old_col)
+                .expect("projected column present"),
+            &target_type,
+        )?;
+
+        // Reorder guard on this level: the caller's live values against the
+        // file's live values. Same multiset, different order → refuse by row.
+        let old_live = scx_format_io::filter_batch_by_keep_mask(
+            &RecordBatch::try_new(
+                Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                    "k",
+                    DataType::Utf8,
+                    true,
+                )])),
+                vec![arrow::compute::cast(&old, &DataType::Utf8)?],
+            )?,
+            &keep,
+        )?;
+        let old_live = crate::external_layer::string_column(&old_live, "k")?;
+        let new_live = crate::external_layer::string_column(
+            &RecordBatch::try_new(
+                Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                    "k",
+                    DataType::Utf8,
+                    true,
+                )])),
+                vec![arrow::compute::cast(obs.column(pos), &DataType::Utf8)?],
+            )?,
+            "k",
+        )?;
+        if old_live != new_live {
+            let mut a = old_live.clone();
+            let mut b = new_live.clone();
+            a.sort_unstable();
+            b.sort_unstable();
+            if a == b {
+                let row = old_live
+                    .iter()
+                    .zip(new_live.iter())
+                    .position(|(o, n)| o != n)
+                    .expect("vectors differ");
+                return Err(OpsError::InvalidInput(format!(
+                    "modify_metadata: obs is the file's live rows in a different order — row \
+                     {row} of the frame is '{}' but the file's live row {row} ('{old_col}') is \
+                     '{}'. A frame sorted or reindexed after read_obs() would land every value \
+                     on the wrong cell; restore the original order (or pass the physical-length \
+                     frame, read_obs(logical=False), in its own order)",
+                    new_live[row], old_live[row]
+                )));
+            }
+        }
+
+        // Where the mask is live take the caller's value, elsewhere the file's.
+        columns[pos] = arrow::compute::kernels::zip::zip(&live_mask, scattered.column(pos), &old)?;
+    }
+    Ok((
+        RecordBatch::try_new_with_options(
+            scattered.schema(),
+            columns,
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(keep.len())),
+        )?,
+        ObsFrameRowSpace::Live,
+    ))
 }
 
 #[cfg(test)]

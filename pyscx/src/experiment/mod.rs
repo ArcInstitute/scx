@@ -160,25 +160,34 @@ impl PyExperiment {
 
 impl PyExperiment {
     /// Live (non-deleted) row count: physical `n_obs` minus the deletion-vector
-    /// popcount. Best-effort — falls back to the physical count when the file
-    /// has no deletion vectors or the deletion section can't be read, so it
-    /// never panics (the `n_obs` getter and repr must always render).
-    fn logical_n_obs_of(&self, reader: &ScxReader) -> u64 {
+    /// popcount. Header-only when the file flags no deletions; otherwise the
+    /// deletion section is decoded at most once per `Experiment`, **memoised
+    /// on success only** — a read failure is returned (so `n_obs` and
+    /// `read_obs()` cannot disagree: the latter raises on the same failure)
+    /// and retried on the next call rather than pinned. `__repr__`, which must
+    /// always render, uses [`Self::logical_n_obs_best_effort`].
+    fn logical_n_obs_of(&self, reader: &ScxReader) -> PyResult<u64> {
         let physical = reader.n_obs();
         if !reader.header().has_deletion_vectors() {
-            return physical;
+            return Ok(physical);
         }
-        // Decode the deletion section at most once per Experiment (best-effort:
-        // a failed read memoizes 0, matching the pre-cache physical fallback).
-        let deleted = *self.n_deleted.get_or_init(|| {
-            reader
-                .read_deletion_vectors()
-                .ok()
-                .flatten()
-                .map(|dv| dv.total_deleted())
-                .unwrap_or(0)
-        });
-        physical.saturating_sub(deleted)
+        if let Some(deleted) = self.n_deleted.get() {
+            return Ok(physical.saturating_sub(*deleted));
+        }
+        let deleted = reader
+            .read_deletion_vectors()
+            .map_err(to_pyerr)?
+            .map(|dv| dv.total_deleted())
+            .unwrap_or(0);
+        let _ = self.n_deleted.set(deleted);
+        Ok(physical.saturating_sub(deleted))
+    }
+
+    /// [`Self::logical_n_obs_of`] for surfaces that must not raise (`repr`):
+    /// the physical count when the deletion section cannot be read.
+    fn logical_n_obs_best_effort(&self, reader: &ScxReader) -> u64 {
+        self.logical_n_obs_of(reader)
+            .unwrap_or_else(|_| reader.n_obs())
     }
 }
 
@@ -190,7 +199,7 @@ impl PyExperiment {
     /// [`Self::n_obs_physical`] for the raw, pre-deletion header count.
     #[getter]
     fn n_obs(&self) -> PyResult<u64> {
-        Ok(self.logical_n_obs_of(self.reader()?))
+        self.logical_n_obs_of(self.reader()?)
     }
 
     /// Physical (pre-deletion) row count straight from the file header. Equals
@@ -212,7 +221,7 @@ impl PyExperiment {
     #[getter]
     fn shape(&self) -> PyResult<(u64, u64)> {
         let reader = self.reader()?;
-        Ok((self.logical_n_obs_of(reader), reader.n_vars()))
+        Ok((self.logical_n_obs_of(reader)?, reader.n_vars()))
     }
 
     /// Total number of non-zero entries — **physical**, unlike [`Self::n_obs`].
@@ -381,10 +390,11 @@ impl PyExperiment {
     /// len(to_anndata(backed=True).obs)`, row for row and index for index —
     /// the same frame `query().collect()`, `gather_rows_sparse` and rscx's
     /// `$obs()` describe. `logical=False` returns the **physical** table:
-    /// `n_obs_physical` rows with every logically deleted row still in place,
-    /// which is the row space `to_h5ad(obs_mask=)` and `mark_deleted(mask)`
-    /// take. On a file with no deletions the two are identical (and the
-    /// logical read costs no copy); `has_deletions` says whether they differ.
+    /// `n_obs_physical` rows with every logically deleted row still in place.
+    /// (`to_h5ad(obs_mask=)` and `mark_deleted(mask)` take a mask in either row
+    /// space, so a mask derived from `read_obs()` works.) On a file with no
+    /// deletions the two are identical (and the logical read costs no copy);
+    /// `has_deletions` says whether they differ.
     ///
     /// **Changed in 0.17**: `read_obs()` used to return the physical table on
     /// every file, so on a `mark_deleted` file it was longer than
@@ -813,30 +823,28 @@ impl PyExperiment {
 
     /// Mark cells as logically deleted using a boolean mask.
     ///
-    /// The mask should be a boolean numpy array whose length matches n_obs.
-    /// Cells where the mask is True are marked as deleted.
+    /// `mask` is a boolean numpy array in **either row space**, told apart by
+    /// length: `n_obs` entries (the live rows — what `read_obs()` and
+    /// `to_anndata(backed=True).obs` describe; a `True` marks that live cell)
+    /// or `n_obs_physical` entries (every physical row, already-deleted rows in
+    /// place — what `read_obs(logical=False)` describes). The two coincide on a
+    /// file with no deletions. Any other length raises naming both counts.
     /// Returns the total number of deleted cells (including previously deleted).
     ///
     /// Example:
     ///     exp = pyscx.open("experiment.scx")
-    ///     adata = exp.to_anndata()
-    ///     total = exp.mark_deleted(adata.obs["is_doublet"] == True)
+    ///     obs = exp.read_obs()
+    ///     total = exp.mark_deleted((obs["doublet_score"] > 0.5).to_numpy())
     fn mark_deleted(&mut self, mask: PyReadonlyArray1<'_, bool>) -> PyResult<u64> {
         let mask_slice = mask
             .as_slice()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-        let expected = self.reader()?.n_obs() as usize;
-        if mask_slice.len() != expected {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "mask length {} does not match n_obs {}",
-                mask_slice.len(),
-                expected
-            )));
-        }
+        let reader = self.reader()?;
+        let physical = crate::convert::physical_row_mask(reader, mask_slice, "mark_deleted: mask")?;
 
         // Collect indices where mask is True
-        let indices: Vec<u64> = mask_slice
+        let indices: Vec<u64> = physical
             .iter()
             .enumerate()
             .filter(|(_, &v)| v)
@@ -1362,7 +1370,7 @@ impl PyExperiment {
         // `var_keys` getters surface the error loudly instead).
         format_anndata_repr(
             "Experiment",
-            self.logical_n_obs_of(reader),
+            self.logical_n_obs_best_effort(reader),
             reader.n_vars(),
             &[
                 (

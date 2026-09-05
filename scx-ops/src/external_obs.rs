@@ -195,6 +195,15 @@ pub enum ObsJoinKey {
     /// `row_embeddings` (a dense mapping has no null). A `status_column` is
     /// rejected: every row matches by construction, so the marker would be a
     /// constant.
+    ///
+    /// [`ExternalObsData::row_keys`] may be **empty or one per row**. Supplied,
+    /// they are never joined on; they are an **order check**: when they are
+    /// the file's own obs-index barcodes (of the rows the frame lands on) in a
+    /// different order — a frame sorted or reindexed after `read_obs()`, right
+    /// length, every value on the wrong cell — the attach is refused by row.
+    /// Labels that are not the file's barcodes are ignored, as the index
+    /// always was under positional. pyscx passes the frame's labelled pandas
+    /// index; a RangeIndex frame checks nothing.
     Positional,
 }
 
@@ -1349,13 +1358,76 @@ fn build_obsm(data: &ExternalObsData, join: &ObsRowJoin) -> Result<Vec<(String, 
 // Validation and catalog bookkeeping
 // ---------------------------------------------------------------------------
 
+/// Which obs row space a positional frame is in, decided by its length alone.
+///
+/// Shared by the positional `attach_external_obs` and `modify_metadata(obs=)`
+/// so the two ops cannot drift on the rule or on the words. `Physical` is
+/// `n_obs_physical` rows (`header.n_obs`; what `read_obs(logical=False)`
+/// returns); `Live` is the live count (`n_obs_physical` minus the keep mask's
+/// deleted rows; what `read_obs()` returns since pyscx 0.17) and only exists
+/// when the file has deletions — with none the two coincide and the frame is
+/// `Physical`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObsFrameRowSpace {
+    Physical,
+    Live,
+}
+
+impl ObsFrameRowSpace {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ObsFrameRowSpace::Physical => "physical",
+            ObsFrameRowSpace::Live => "logical",
+        }
+    }
+}
+
+/// Classify an `n_rows`-row positional frame against a file with
+/// `n_physical` obs rows and keep mask `keep` (`None` = nothing deleted).
+/// Any other length is a [`OpsError::ShapeMismatch`] naming both counts and
+/// the read that yields each. `what` names the frame in the message
+/// (`"positional attach: row_annotations"`, `"modify_metadata: obs"`).
+pub(crate) fn classify_obs_frame_length(
+    what: &str,
+    n_rows: u64,
+    n_physical: u64,
+    keep: Option<&[bool]>,
+) -> Result<ObsFrameRowSpace> {
+    let n_live = keep.map_or(n_physical, |k| k.iter().filter(|b| **b).count() as u64);
+    if n_rows == n_physical {
+        return Ok(ObsFrameRowSpace::Physical);
+    }
+    if keep.is_some() && n_rows == n_live {
+        return Ok(ObsFrameRowSpace::Live);
+    }
+    let file = if n_live == n_physical {
+        format!("n_obs = {n_physical} (no logical deletions)")
+    } else {
+        format!(
+            "n_obs = {n_live} live rows and n_obs_physical = {n_physical} ({} logically \
+             deleted). Pass {n_live} rows (read_obs()) to address the live rows, or \
+             {n_physical} rows (read_obs(logical=False)) to address every physical row",
+            n_physical - n_live
+        )
+    };
+    Err(OpsError::ShapeMismatch {
+        detail: format!("{what} has {n_rows} rows but the file has {file}"),
+    })
+}
+
 fn validate_shape(data: &ExternalObsData, positional: bool) -> Result<()> {
-    if positional && !data.row_keys.is_empty() {
-        return Err(OpsError::InvalidInput(format!(
-            "positional attach takes no row_keys ({} supplied) — a caller that \
-             built keys almost certainly meant a key join",
-            data.row_keys.len()
-        )));
+    if positional
+        && !data.row_keys.is_empty()
+        && data.row_keys.len() != data.row_annotations.num_rows()
+    {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "positional attach: row_keys has {} entries but row_annotations has {} rows — \
+                 under positional the keys are an alignment check on the frame, one per row",
+                data.row_keys.len(),
+                data.row_annotations.num_rows()
+            ),
+        });
     }
     // Under positional the annotations ARE the row count; keyed mode measures
     // everything against the keys.
@@ -1521,6 +1593,10 @@ fn build_params_json(
         };
         if let Some(map) = v.as_object_mut() {
             map.insert("row_space".to_string(), Value::from(row_space));
+            map.insert(
+                "positional_index_checked".to_string(),
+                Value::from(!data.row_keys.is_empty()),
+            );
         }
     }
     if let (Some(map), Some(extra)) = (v.as_object_mut(), opts.provenance_params.as_object()) {
@@ -1684,48 +1760,39 @@ fn attach_external_obs_inner(
         // `read_obs_keys_validated`), and positional must not lose it. Project
         // obs column 0: obs always carries at least its index column, and one
         // column is the cheapest read that still walks every shard.
-        // Either row space is accepted, told apart by length. Physical
-        // (`header.n_obs` rows) is the identity join. Live (`n_obs` minus the
-        // deletion-vector popcount — what `read_obs()` returns since pyscx
-        // 0.17) is built straight from the keep mask: the `i`-th live row is
-        // source row `i`, a deleted row has no source and lands `null` through
-        // the same `scatter` the key join uses. Not routed through
-        // `build_obs_row_join`: its coverage WARN ("check for a sample-name
-        // prefix") and its `MissingRowPolicy::Error` arm are about keys that
-        // failed to match, and a deleted row is not a failed match.
+        // Either row space is accepted, told apart by length (the shared
+        // `classify_obs_frame_length`). Physical (`header.n_obs` rows) is the
+        // identity join. Live (`n_obs` minus the deletion-vector popcount —
+        // what `read_obs()` returns since pyscx 0.17) is built straight from
+        // the keep mask: the `i`-th live row is source row `i`, a deleted row
+        // has no source and lands `null` through the same `scatter` the key
+        // join uses. Not routed through `build_obs_row_join`: its coverage
+        // WARN ("check for a sample-name prefix") and its
+        // `MissingRowPolicy::Error` arm are about keys that failed to match,
+        // and a deleted row is not a failed match.
+        if n_obs == 0 {
+            return Err(OpsError::InvalidInput(
+                "positional attach: the file has no obs rows, so there is nothing to \
+                 annotate"
+                    .into(),
+            ));
+        }
         let n_rows = data.row_annotations.num_rows() as u64;
         let keep = if n_rows == n_obs {
             None
         } else {
             reader.deletion_keep_mask()?
         };
+        let row_space = classify_obs_frame_length(
+            "positional attach: row_annotations",
+            n_rows,
+            n_obs,
+            keep.as_deref(),
+        )?;
         let n_live = keep
             .as_ref()
             .map_or(n_obs, |k| k.iter().filter(|b| **b).count() as u64);
-        let live_frame = match &keep {
-            Some(_) if n_rows == n_live => true,
-            _ if n_rows == n_obs => false,
-            _ => {
-                let deletions = if n_live == n_obs {
-                    format!("n_obs = {n_obs} (no logical deletions)")
-                } else {
-                    format!(
-                        "n_obs = {n_live} live rows and n_obs_physical = {n_obs} ({} logically \
-                         deleted). Pass {n_live} rows (read_obs()) to annotate the live rows, \
-                         or {n_obs} rows (read_obs(logical=False)) to annotate every physical \
-                         row",
-                        n_obs - n_live
-                    )
-                };
-                return Err(OpsError::ShapeMismatch {
-                    detail: format!(
-                        "positional attach needs one row per obs row: row_annotations has \
-                         {n_rows} rows but the file has {deletions}"
-                    ),
-                });
-            }
-        };
-        if live_frame && !data.row_embeddings.is_empty() {
+        if row_space == ObsFrameRowSpace::Live && !data.row_embeddings.is_empty() {
             return Err(OpsError::InvalidInput(format!(
                 "positional attach of a live-length frame ({n_live} of {n_obs} physical rows) \
                  cannot carry obsm embeddings: a dense mapping has no null to stand in for a \
@@ -1744,18 +1811,8 @@ fn attach_external_obs_inner(
                 "obs has no columns to validate the shard cover against".into(),
             ));
         }
-        let probe_columns = vec![obs_schema.field(0).name().clone()];
-        let probe = read_obs_keys_validated(reader, &obs_schema, &probe_columns, n_obs)?;
-        if probe.num_rows() as u64 != n_obs {
-            return Err(OpsError::ShapeMismatch {
-                detail: format!(
-                    "obs has {} rows but the header declares n_obs = {n_obs}",
-                    probe.num_rows()
-                ),
-            });
-        }
-        let join = match keep.filter(|_| live_frame) {
-            Some(keep) => {
+        let join = match (row_space, keep) {
+            (ObsFrameRowSpace::Live, Some(keep)) => {
                 let mut next_live = 0u32;
                 let source_of_target: Vec<Option<u32>> = keep
                     .iter()
@@ -1776,13 +1833,88 @@ fn attach_external_obs_inner(
                     n_source_absent: 0,
                 }
             }
-            None => ObsRowJoin {
+            _ => ObsRowJoin {
                 source_of_target: (0..n_obs).map(|i| Some(i as u32)).collect(),
                 n_matched: n_obs,
                 n_target_absent: 0,
                 n_source_absent: 0,
             },
         };
+
+        // The keyed path's projected read doubles as the payload-vs-stamp
+        // preflight that keeps `dry_run` honest (see `read_obs_keys_validated`),
+        // and positional must not lose it. With no keys supplied, project obs
+        // column 0 — obs always carries at least its index column, and one
+        // column is the cheapest read that still walks every shard. With keys
+        // supplied (pyscx passes the frame's labelled pandas index), project
+        // the file's obs index column instead and use the same read as an
+        // **order check**: positional dispatch is by length alone, so a frame
+        // that was sorted or reindexed after `read_obs()` has the right length
+        // and every value on the wrong cell. Keys are never joined on.
+        let index_col = if data.row_keys.is_empty() {
+            None
+        } else {
+            scx_format_io::resolve_index_columns(&obs_schema)
+                .into_iter()
+                .find(|c| obs_schema.index_of(c).is_ok())
+        };
+        if !data.row_keys.is_empty() && index_col.is_none() {
+            return Err(OpsError::InvalidInput(
+                "positional attach: the frame carries an index to check the row order against, \
+                 but the file's obs has no index column (pandas envelope or `__index_level_0__`); \
+                 pass a frame with a RangeIndex to attach by position without the check"
+                    .into(),
+            ));
+        }
+        let probe_columns = vec![index_col
+            .clone()
+            .unwrap_or_else(|| obs_schema.field(0).name().clone())];
+        let probe = read_obs_keys_validated(reader, &obs_schema, &probe_columns, n_obs)?;
+        if probe.num_rows() as u64 != n_obs {
+            return Err(OpsError::ShapeMismatch {
+                detail: format!(
+                    "obs has {} rows but the header declares n_obs = {n_obs}",
+                    probe.num_rows()
+                ),
+            });
+        }
+        if let Some(index_col) = index_col {
+            // The check fires only when the frame's labels ARE the file's
+            // barcodes (of the rows it lands on) in a different order — a
+            // `sort_values` / `reindex` after `read_obs()`. Labels that are
+            // not the file's barcodes at all are ignored, as positional has
+            // always ignored the index: a frame built from another source
+            // with its own row labels is still "row i annotates row i".
+            let target = crate::external_layer::string_column(&probe, &index_col)?;
+            let landed: Vec<(usize, u32)> = join
+                .source_of_target
+                .iter()
+                .enumerate()
+                .filter_map(|(phys, src)| src.map(|s| (phys, s)))
+                .collect();
+            let in_order = landed
+                .iter()
+                .all(|(phys, src)| data.row_keys[*src as usize] == target[*phys]);
+            if !in_order {
+                let mut a: Vec<&str> = landed.iter().map(|(p, _)| target[*p].as_str()).collect();
+                let mut b: Vec<&str> = data.row_keys.iter().map(String::as_str).collect();
+                a.sort_unstable();
+                b.sort_unstable();
+                if a == b {
+                    let (phys, src) = landed
+                        .iter()
+                        .find(|(p, s)| data.row_keys[*s as usize] != target[*p])
+                        .expect("not in order ⇒ a mismatch exists");
+                    return Err(OpsError::InvalidInput(format!(
+                        "positional attach: the frame holds the file's own barcodes in a different \
+                         order — frame row {src} is '{}' but obs row {phys} ('{index_col}') is \
+                         '{}'. A frame sorted or reindexed after read_obs() cannot be landed \
+                         positionally; restore the original order (or join by key instead)",
+                        data.row_keys[*src as usize], target[*phys]
+                    )));
+                }
+            }
+        }
         (opts.join_key.describe(), join)
     } else {
         let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;

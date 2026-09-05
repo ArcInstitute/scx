@@ -806,12 +806,24 @@ that yields each. `modify_metadata(obs=)` accepts the same two lengths; on a
 live-length replacement a deleted row keeps the barcode the file already holds
 (a `null` key would become `""` in every later keyed join and, twice over, a
 duplicate that blocks `obs_import` until `compact`) and is `null` in every other
-column. `obsm` — and a positional frame's embeddings — stay physical-length: a
-dense mapping has no `null` to stand in for a deleted row. Provenance records
-`row_space` for a positional attach, because a physical-length obs on disk does
-not say which frame produced it; a physically built frame short by exactly the
-number of deleted rows is indistinguishable from a live one (no length check
-ever caught that).
+column — every other column, including ones it had before: `modify_metadata`
+is a replace, and the add-a-column path that keeps deleted rows' existing values
+is the positional attach. `obsm` — and a positional frame's embeddings — stay
+physical-length: a dense mapping has no `null` to stand in for a deleted row.
+Both ops record `row_space` in provenance, because a physical-length obs on disk
+does not say which frame produced it.
+
+**Length is not order.** Dispatch by length cannot see a frame that was sorted
+or reindexed after `read_obs()` — right length, every value on the wrong cell —
+nor a physically built frame short by exactly the number of deleted rows. So
+both ops check the one thing a `read_obs()` frame does carry: its barcodes,
+with one rule — the file's own barcodes in a different order are refused by
+row; other labels pass. For a positional attach of a frame with a labelled
+pandas index, that refuses a `sort_values` / `reindex` while leaving a frame
+with unrelated labels positional as ever (a `RangeIndex` frame is not checked;
+provenance records `positional_index_checked`). For a live-length
+`modify_metadata(obs=)`, different barcodes are a rename, which a replace is
+for, and pass.
 
 ### Uncovered rows get `null`, never `0.0`
 

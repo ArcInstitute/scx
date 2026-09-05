@@ -823,23 +823,18 @@ fn to_h5ad(
         ));
     }
 
-    // Validate length here so the user gets ValueError rather than the
-    // RuntimeError that a ConvertError maps to, and with a message that names
-    // the coordinate system.
-    if let Some(mask) = &obs_mask_owned {
-        let n_obs = scx_format_io::ScxReader::open(Path::new(path))
-            .map_err(to_pyerr)?
-            .n_obs() as usize;
-        if mask.len() != n_obs {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "obs_mask length {} does not match the SCX file's physical n_obs {n_obs}. \
-                 obs_mask is indexed in the GLOBAL (pre-deletion) obs row space — use \
-                 `pyscx.open(path).n_obs_physical`, not `.n_obs` (the post-deletion \
-                 live count).",
-                mask.len()
-            )));
+    // Accept the mask in either obs row space (the streaming exporter wants
+    // it physical-length): a live-length mask — what `read_obs()` describes
+    // since 0.17 — is expanded through the deletion keep mask here, and any
+    // other length is a ValueError naming both counts rather than the
+    // RuntimeError a ConvertError maps to.
+    let obs_mask_owned: Option<std::sync::Arc<[bool]>> = match obs_mask_owned {
+        Some(mask) => {
+            let reader = scx_format_io::ScxReader::open(Path::new(path)).map_err(to_pyerr)?;
+            Some(convert::physical_row_mask(&reader, &mask, "obs_mask")?.into())
         }
-    }
+        None => None,
+    };
 
     // Exhaustive, and now visibly so: this literal names every field of
     // `ExportOptions`, which is the measurement behind the claim that
