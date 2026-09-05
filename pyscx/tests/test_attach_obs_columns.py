@@ -140,11 +140,124 @@ def test_positional_and_key_are_mutually_exclusive(tmp_path):
         pyscx.attach_obs_columns(str(scx), df, key=["bc"], positional=True)
 
 
-def test_positional_row_count_mismatch_names_physical_space(tmp_path):
-    scx = _fixture(tmp_path)  # n_obs = 4
+def test_positional_row_count_mismatch_names_the_file_count(tmp_path):
+    scx = _fixture(tmp_path)  # n_obs = 4, no deletions
     df = pd.DataFrame({"score": [0.1, 0.2, 0.3]})
-    with pytest.raises(ValueError, match="physical"):
+    with pytest.raises(ValueError, match=r"3 rows.*n_obs = 4.*no logical deletions"):
         pyscx.attach_obs_columns(str(scx), df, positional=True)
+
+
+# On a file with deletions a positional frame is accepted in either row space,
+# told apart by length: `read_obs()` (live rows, since 0.17) or
+# `read_obs(logical=False)` (every physical row).
+
+
+def _deleted_fixture(tmp_path):
+    scx = _fixture(tmp_path)  # AAAC-1, AAAG-1, AAAT-1, AAAA-1
+    pyscx.mark_deleted(str(scx), [1])
+    exp = pyscx.open(str(scx))
+    assert exp.n_obs == 3 and exp.n_obs_physical == 4, "premise"
+    return scx, exp
+
+
+def test_positional_accepts_a_frame_computed_from_read_obs_on_a_deleted_file(tmp_path):
+    # The docstring's own example: a column computed row-for-row from
+    # `read_obs()` — which is the live frame now — lands on the live rows.
+    scx, exp = _deleted_fixture(tmp_path)
+    obs = exp.read_obs()
+    scores = pd.DataFrame({"my_score": [10.0 * (i + 1) for i in range(len(obs))]})
+
+    r = pyscx.attach_obs_columns(str(scx), scores, positional=True)
+    assert r["n_obs"] == 4, "the physical axis the attach was built over"
+    assert r["n_matched"] == 3
+    assert r["n_target_rows_absent"] == 1, "the deleted row"
+
+    backed = pyscx.open(str(scx)).to_anndata(backed=True).obs
+    assert backed["my_score"].tolist() == [10.0, 20.0, 30.0]
+    assert list(backed.index) == ["AAAC-1", "AAAT-1", "AAAA-1"]
+    physical = pyscx.open(str(scx)).read_obs(logical=False)
+    assert physical["my_score"].tolist()[0] == 10.0
+    assert pd.isna(physical["my_score"].iloc[1]), "the deleted row is null, not a value"
+    assert physical["my_score"].tolist()[2:] == [20.0, 30.0]
+
+
+def test_positional_still_accepts_a_physical_length_frame_on_a_deleted_file(tmp_path):
+    scx, exp = _deleted_fixture(tmp_path)
+    scores = pd.DataFrame({"my_score": [1.0, 2.0, 3.0, 4.0]})
+
+    r = pyscx.attach_obs_columns(str(scx), scores, positional=True)
+    assert r["n_matched"] == 4 and r["n_target_rows_absent"] == 0
+    physical = pyscx.open(str(scx)).read_obs(logical=False)
+    assert physical["my_score"].tolist() == [1.0, 2.0, 3.0, 4.0], "the deleted row is written"
+    assert pyscx.open(str(scx)).read_obs()["my_score"].tolist() == [1.0, 3.0, 4.0]
+
+
+def test_positional_refuses_a_reordered_read_obs_frame(tmp_path):
+    # `read_obs().sort_values(...)` keeps the length and permutes the rows: the
+    # frame's index labels no longer match the file's barcodes row for row, and
+    # the attach must refuse by row instead of landing every value on the
+    # wrong cell. A RangeIndex frame carries no labels and is not checked.
+    scx, exp = _deleted_fixture(tmp_path)
+    obs = exp.read_obs()  # AAAC-1, AAAT-1, AAAA-1
+    obs["score"] = [1.0, 2.0, 3.0]
+    shuffled = obs.iloc[[2, 0, 1]]
+    with pytest.raises(ValueError, match=r"different order.*AAAA-1"):
+        pyscx.attach_obs_columns(str(scx), shuffled[["score"]], positional=True)
+    assert "score" not in pyscx.open(str(scx)).read_obs().columns, "refused → nothing written"
+
+    r = pyscx.attach_obs_columns(str(scx), obs[["score"]], positional=True)
+    assert r["n_matched"] == 3
+    assert pyscx.open(str(scx)).read_obs()["score"].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_positional_refuses_a_reordered_multiindex_frame(tmp_path):
+    # A two-level obs index compares as a composite key on both sides, so a
+    # reordered MultiIndex `read_obs()` frame is refused like a flat one.
+    scx = _fixture(tmp_path)
+    obs = pyscx.open(str(scx)).read_obs(logical=False)
+    obs["sample"] = ["s0", "s0", "s1", "s1"]
+    obs["barcode"] = list(obs.index)
+    pyscx.modify_metadata(str(scx), obs=obs.set_index(["sample", "barcode"]))
+    pyscx.mark_deleted(str(scx), [1])
+    exp = pyscx.open(str(scx))
+    live = exp.read_obs()
+    assert isinstance(live.index, pd.MultiIndex) and len(live) == 3
+    live["score"] = [1.0, 2.0, 3.0]
+
+    with pytest.raises(ValueError, match=r"different order.*sample\+barcode"):
+        pyscx.attach_obs_columns(str(scx), live.iloc[[2, 0, 1]][["score"]], positional=True)
+    r = pyscx.attach_obs_columns(str(scx), live[["score"]], positional=True)
+    assert r["n_matched"] == 3
+    assert pyscx.open(str(scx)).read_obs()["score"].tolist() == [1.0, 2.0, 3.0]
+
+
+def test_positional_accepts_the_empty_live_frame_when_every_row_is_deleted(tmp_path):
+    scx = _fixture(tmp_path)
+    pyscx.mark_deleted(str(scx), [0, 1, 2, 3])
+    exp = pyscx.open(str(scx))
+    obs = exp.read_obs()
+    assert len(obs) == 0 and exp.n_obs_physical == 4
+    obs["score"] = pd.Series(dtype="float64")
+
+    r = pyscx.attach_obs_columns(str(scx), obs[["score"]], positional=True)
+    assert r["n_matched"] == 0 and r["n_target_rows_absent"] == 4
+    physical = pyscx.open(str(scx)).read_obs(logical=False)
+    assert physical["score"].isna().all()
+    # The keyed path keeps refusing an empty frame.
+    with pytest.raises(ValueError, match="no rows"):
+        pyscx.attach_obs_columns(str(scx), obs[["score"]])
+
+
+def test_positional_neither_length_names_both_counts_on_a_deleted_file(tmp_path):
+    scx, _ = _deleted_fixture(tmp_path)
+    for n in (2, 5):
+        df = pd.DataFrame({"score": [0.1] * n})
+        with pytest.raises(ValueError) as e:
+            pyscx.attach_obs_columns(str(scx), df, positional=True)
+        msg = str(e.value)
+        for needle in (f"{n} rows", "n_obs = 3", "n_obs_physical = 4", "read_obs()",
+                       "read_obs(logical=False)"):
+            assert needle in msg, f"{needle!r} missing from: {msg}"
 
 
 # ---------------------------------------------------------------------------

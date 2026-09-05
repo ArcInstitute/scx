@@ -191,8 +191,83 @@ def test_mark_deleted_mask_too_short(query_adata, scx_from_adata):
     path = scx_from_adata(query_adata, "mask_short.scx")
     exp = pyscx.open(path)
     short_mask = np.zeros(exp.n_obs - 10, dtype=bool)
-    with pytest.raises(ValueError, match="does not match n_obs"):
+    with pytest.raises(ValueError, match="n_obs_physical"):
         exp.mark_deleted(short_mask)
+
+
+def test_mark_deleted_accepts_a_live_length_mask(query_adata, scx_from_adata):
+    """After a first deletion `read_obs()` is the live frame (0.17), so a mask
+    derived from it has `n_obs` entries; it is expanded onto the physical axis.
+    A physical-length mask keeps working; any other length names both counts."""
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_live.scx")
+    exp = pyscx.open(path)
+    n = exp.n_obs_physical
+    exp.mark_deleted(np.arange(n) < 5)  # physical rows 0..4
+    assert exp.n_obs == n - 5
+
+    obs = exp.read_obs()
+    live_mask = np.zeros(len(obs), dtype=bool)
+    live_mask[0] = True  # the first LIVE cell = physical row 5
+    total = exp.mark_deleted(live_mask)
+    assert total == 6
+    assert exp.n_obs == n - 6
+    assert list(exp.read_obs().index) == list(obs.index[1:])
+
+    with pytest.raises(ValueError) as e:
+        exp.mark_deleted(np.zeros(n - 7, dtype=bool))
+    assert f"n_obs = {n - 6}" in str(e.value) and f"n_obs_physical = {n}" in str(e.value)
+
+
+def test_mark_deleted_refuses_a_reordered_series_mask(query_adata, scx_from_adata):
+    """A Series from a sorted `read_obs()` frame has the right length and every
+    entry on the wrong cell; its index says so. A Series in the file's order
+    (and a plain array) is accepted; a non-bool Series is refused."""
+    import pandas as pd
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_series.scx")
+    exp = pyscx.open(path)
+    exp.mark_deleted(np.arange(exp.n_obs_physical) < 2)
+    obs = exp.read_obs()
+    flag = pd.Series(np.arange(len(obs)) == 0, index=obs.index)
+
+    with pytest.raises(ValueError, match="different order"):
+        exp.mark_deleted(flag.iloc[::-1])
+    with pytest.raises(TypeError, match="boolean"):
+        exp.mark_deleted(pd.Series(np.arange(len(obs)), index=obs.index))
+    assert exp.mark_deleted(flag) == 3
+    assert list(exp.read_obs().index) == list(obs.index[1:])
+
+
+def test_mark_deleted_multiindex_series_is_order_checked_as_a_composite(
+    query_adata, scx_from_adata
+):
+    """A MultiIndex Series neither crashes nor bypasses the order check: its
+    levels compare as the composite key the key join builds."""
+    import pandas as pd
+    import pyscx
+
+    path = scx_from_adata(query_adata, "mask_mi.scx")
+    obs = pyscx.open(path).read_obs()
+    obs["sample"] = ["s%d" % (i % 3) for i in range(len(obs))]
+    obs["barcode"] = list(obs.index)
+    pyscx.modify_metadata(path, obs=obs.set_index(["sample", "barcode"]))
+    exp = pyscx.open(path)
+    exp.mark_deleted(np.arange(exp.n_obs_physical) < 2)
+    live = exp.read_obs()
+    assert isinstance(live.index, pd.MultiIndex)
+    flag = pd.Series(np.arange(len(live)) == 0, index=live.index)
+
+    with pytest.raises(ValueError, match="different order"):
+        exp.mark_deleted(flag.iloc[::-1])
+    assert exp.mark_deleted(flag) == 3
+    assert exp.n_obs == exp.n_obs_physical - 3
+
+    with pytest.raises(ValueError) as e:
+        exp.mark_deleted(np.ones(5, dtype=bool))
+    assert str(e.value).startswith("mark_deleted: mask has 5 rows"), str(e.value)
 
 
 def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
@@ -202,7 +277,7 @@ def test_mark_deleted_mask_too_long(query_adata, scx_from_adata):
     path = scx_from_adata(query_adata, "mask_long.scx")
     exp = pyscx.open(path)
     long_mask = np.zeros(exp.n_obs + 10, dtype=bool)
-    with pytest.raises(ValueError, match="does not match n_obs"):
+    with pytest.raises(ValueError, match="n_obs_physical"):
         exp.mark_deleted(long_mask)
 
 

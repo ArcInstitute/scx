@@ -232,20 +232,16 @@ def test_obs_categorical_after_append_mixes_encodings(tmp_dir):
     assert _decode(codes, categories) == _decode(exp_codes, exp_cats)
 
 
-def test_obs_categorical_is_physical_row_space(tmp_dir):
-    """`codes` is indexed in PHYSICAL obs row space, not logical.
+def test_obs_categorical_row_space(tmp_dir):
+    """`codes` follows `read_obs()`: live rows by default, physical under
+    `logical=False` — and each agrees with the same-space `read_obs`.
 
-    On a file with deletion vectors `n_obs` (logical) < `n_obs_physical`, and
-    `obs_categorical` returns one code per *physical* row — matching `read_obs`.
-    A consumer that indexes codes by a logical row id gets a correctly shaped
-    array of wrong rows, which is the worst failure mode available, so the
-    contract is pinned here rather than only documented.
-
-    Why it matters concretely: state3's `_ScxBackend` refuses files with deletion
-    vectors for exactly this reason — its catalog addresses cells by
-    `(file_idx, cell_idx)`, so physical-space columns against a logical `n_cells`
-    would make every index point at the wrong cell. Anything building a global
-    vocabulary from these codes needs the same guard.
+    On a file with deletion vectors `n_obs` (logical) < `n_obs_physical`.
+    Indexing one space's codes by the other space's row ids gets a correctly
+    shaped array of wrong rows — the worst failure mode available — so both
+    contracts are pinned here rather than only documented. (Before 0.17 the
+    only space was physical, and state3's `_ScxBackend` refused deleted files
+    for exactly this reason; it can now read the live codes directly.)
     """
     cell_types = ["A", "B", "C", "D"]
     path = _write_sharded(tmp_dir / "del.scx", cell_types, shard_size=2)
@@ -259,12 +255,15 @@ def test_obs_categorical_is_physical_row_space(tmp_dir):
     assert exp2.n_obs == 3, "premise: one row must be logically deleted"
     assert exp2.n_obs_physical == 4, "premise: physical count is unchanged"
 
+    # Default: the live rows, aligned with read_obs().
     codes, categories = exp2.obs_categorical("cell_type")
-    assert len(codes) == exp2.n_obs_physical == 4, (
-        f"codes must cover the physical axis, got {len(codes)}"
-    )
-    # The deleted row is still present, in its physical position.
-    assert _decode(codes, categories) == cell_types
+    assert len(codes) == exp2.n_obs == 3, f"codes must cover the live axis, got {len(codes)}"
+    assert _decode(codes, categories) == ["A", "C", "D"]
+    assert len(exp2.read_obs()) == 3
+    assert categories == cell_types, "the deleted row's level is a level still"
 
-    # And it agrees with read_obs, which is physical for the same reason.
-    assert len(pyscx.open(path).read_obs()) == 4
+    # logical=False: the physical axis, the deleted row in its place.
+    codes, categories = exp2.obs_categorical("cell_type", logical=False)
+    assert len(codes) == exp2.n_obs_physical == 4
+    assert _decode(codes, categories) == cell_types
+    assert len(exp2.read_obs(logical=False)) == 4

@@ -2652,11 +2652,13 @@ memory argument is structural rather than demonstrated here: the fold never hold
 shard's projected column plus the running vocabulary, so it does not scale with `n_obs × width`
 the way `concat_batches` does.
 
-One contract worth stating loudly: `codes` is indexed in the **physical** obs row space, so
-`len(codes) == n_obs_physical`, not `n_obs`. On a file with deletion vectors those differ and
-indexing by a logical row id addresses the wrong cell — a correctly *shaped* array of wrong
-rows. `read_obs` has the same contract for the same reason; it is pinned by a test rather than
-left to the docstring.
+One contract worth stating loudly: `codes` follows `read_obs()`'s row space. By default
+(`logical=True`, since 0.17) it is indexed in the **live** obs row space, `len(codes) == n_obs`,
+aligned with `read_obs()` and `to_anndata(backed=True).obs`; `logical=False` gives the
+**physical** space, `len(codes) == n_obs_physical`, deleted rows in place. On a file with
+deletion vectors those differ, and indexing one space's codes by the other's row ids addresses
+the wrong cell — a correctly *shaped* array of wrong rows — so both are pinned by a test
+(`test_obs_categorical_row_space`) rather than left to the docstring.
 
 Semantics are pandas-compatible by choice: null → code `-1`, so a literal `"NaN"` *string*
 stays a real category. This deliberately differs from `scx_loader`'s training-internal

@@ -63,6 +63,89 @@ def test_read_obs_matches_to_anndata(query_adata, tmp_dir):
 
 
 # ---------------------------------------------------------------------------
+# Row space: logical by default since 0.17, physical under logical=False
+# ---------------------------------------------------------------------------
+
+
+def _deleted_file(synthetic_adata, scx_from_adata, name, deleted=(3, 7, 50)):
+    """A 100-cell file with three rows logically deleted."""
+    path = scx_from_adata(synthetic_adata, name)
+    pyscx.mark_deleted(path, list(deleted))
+    exp = pyscx.open(path)
+    assert exp.has_deletions and exp.n_obs == 97 and exp.n_obs_physical == 100, "premise"
+    return path, exp
+
+
+def test_read_obs_default_is_logical_and_matches_the_backed_obs(
+    synthetic_adata, scx_from_adata
+):
+    path, exp = _deleted_file(synthetic_adata, scx_from_adata, "ro_logical.scx")
+
+    obs = exp.read_obs()
+    assert len(obs) == exp.n_obs == 97
+    backed = exp.to_anndata(backed=True).obs
+    pd.testing.assert_frame_equal(obs, backed)
+    # The deleted barcodes are gone, the survivors keep their order.
+    full_index = pyscx.open(path).read_obs(logical=False).index
+    assert list(obs.index) == [b for i, b in enumerate(full_index) if i not in (3, 7, 50)]
+
+
+def test_read_obs_logical_false_is_the_physical_table(synthetic_adata, scx_from_adata):
+    _, exp = _deleted_file(synthetic_adata, scx_from_adata, "ro_physical.scx")
+
+    physical = exp.read_obs(logical=False)
+    assert len(physical) == exp.n_obs_physical == 100
+    # The deleted rows are still there, in their physical positions.
+    assert list(physical.index[:4]) == list(synthetic_adata.obs_names[:4])
+
+
+def test_read_obs_columns_projection_is_logical_too(synthetic_adata, scx_from_adata):
+    _, exp = _deleted_file(synthetic_adata, scx_from_adata, "ro_proj_logical.scx")
+
+    proj = exp.read_obs(columns=["batch"])
+    full = exp.read_obs()
+    assert len(proj) == 97
+    assert list(proj.index) == list(full.index)
+    # Values agree (the projected path may dictionary-encode; compare values).
+    assert proj["batch"].astype(str).tolist() == full["batch"].astype(str).tolist()
+
+    phys_proj = exp.read_obs(columns=["batch"], logical=False)
+    assert len(phys_proj) == 100
+
+
+def test_read_obs_without_deletions_is_unchanged_by_logical(synthetic_adata, scx_from_adata):
+    # Byte-identical contract on a file with nothing deleted: both spaces are
+    # the same frame, and the logical read costs no copy.
+    path = scx_from_adata(synthetic_adata, "ro_nodel.scx")
+    exp = pyscx.open(path)
+    assert not exp.has_deletions
+    pd.testing.assert_frame_equal(exp.read_obs(), exp.read_obs(logical=False))
+    pd.testing.assert_frame_equal(
+        exp.read_obs(columns=["batch"]), exp.read_obs(columns=["batch"], logical=False)
+    )
+
+
+def test_obs_categorical_row_space_follows_read_obs(synthetic_adata, scx_from_adata):
+    _, exp = _deleted_file(synthetic_adata, scx_from_adata, "ro_codes.scx")
+
+    codes, cats = exp.obs_categorical("batch")
+    assert len(codes) == exp.n_obs == 97
+    decoded = [None if c < 0 else cats[c] for c in codes]
+    assert decoded == exp.read_obs()["batch"].astype(str).tolist()
+
+    codes_p, cats_p = exp.obs_categorical("batch", logical=False)
+    assert len(codes_p) == 100
+    assert cats_p == cats, "the row filter never drops a level"
+    decoded_p = [None if c < 0 else cats_p[c] for c in codes_p]
+    assert decoded_p == exp.read_obs(logical=False)["batch"].astype(str).tolist()
+
+    many = exp.obs_categorical_many(["batch", "cell_id"])
+    assert [len(c) for c, _ in many] == [97, 97]
+    many_p = exp.obs_categorical_many(["batch"], logical=False)
+    assert len(many_p[0][0]) == 100
+
+
+# ---------------------------------------------------------------------------
 # distinct_values
 # ---------------------------------------------------------------------------
 
@@ -183,3 +266,29 @@ def test_cloud_read_obs_and_distinct(query_adata, tmp_dir):
 
     vals, has_more = exp.distinct_values("cell_type", limit=2)
     assert len(vals) == 2 and has_more
+
+
+@needs_cloud
+def test_cloud_read_obs_is_logical_like_the_local_handle(synthetic_adata, scx_from_adata):
+    path, local = _deleted_file(synthetic_adata, scx_from_adata, "cloud_logical.scx")
+    cloud = pyscx.open_cloud("file://" + path)
+
+    assert cloud.n_obs == local.n_obs == 97
+    assert cloud.n_obs_physical == 100
+    assert cloud.shape == (97, 50)
+    assert "97" in repr(cloud)
+
+    obs = cloud.read_obs()
+    assert len(obs) == 97
+    assert list(obs.index) == list(local.read_obs().index)
+    assert len(cloud.read_obs(logical=False)) == 100
+    proj = cloud.read_obs(columns=["batch"])
+    assert len(proj) == 97 and list(proj.columns) == ["batch"]
+    assert len(cloud.read_obs(columns=["batch"], logical=False)) == 100
+
+    codes, cats = cloud.obs_categorical("batch")
+    assert len(codes) == 97
+    local_codes, local_cats = local.obs_categorical("batch")
+    assert [cats[c] for c in codes] == [local_cats[c] for c in local_codes]
+    assert len(cloud.obs_categorical("batch", logical=False)[0]) == 100
+    assert len(cloud.obs_categorical_many(["batch"])[0][0]) == 97

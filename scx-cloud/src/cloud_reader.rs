@@ -146,6 +146,11 @@ pub struct CloudReader {
     /// and lets the schema derive from it without a redundant GET.
     obs_assembled: tokio::sync::OnceCell<RecordBatch>,
     var_assembled: tokio::sync::OnceCell<RecordBatch>,
+    /// The whole-cell deletion keep mask, decoded once per reader and shared by
+    /// every logical read (`read_obs_filtered`, the projected and codes twins)
+    /// and by `pyscx`'s live `n_obs`. `get_or_try_init` memoises on success
+    /// only, so a transient fetch failure is retried rather than pinned.
+    deletion_keep_mask: tokio::sync::OnceCell<Option<Arc<Vec<bool>>>>,
 }
 
 impl CloudReader {
@@ -796,7 +801,11 @@ impl CloudReader {
         }
     }
 
-    /// Deletion vectors, if present in the file.
+    /// Deletion vectors, if present in the file. `Ok(None)` when the header
+    /// flags none; a header that flags them while the catalog has no
+    /// `DeletionVectors` section is a corrupt or incompatible file and is an
+    /// error, exactly as on `ScxReader` — answering "no deletions" there would
+    /// resurrect every deleted cell with no warning.
     pub async fn read_deletion_vectors(&self) -> Result<Option<scx_format_io::DeletionVectors>> {
         if !self.header.has_deletion_vectors() {
             return Ok(None);
@@ -806,11 +815,12 @@ impl CloudReader {
             .entries
             .iter()
             .find(|e| e.section_type == SectionType::DeletionVectors)
-            .cloned();
-        let entry = match entry {
-            Some(e) => e,
-            None => return Ok(None),
-        };
+            .cloned()
+            .ok_or_else(|| {
+                CloudError::Format(scx_format_io::ScxError::SectionNotFound(
+                    "deletion_vectors".to_string(),
+                ))
+            })?;
         let bytes = self.read_section_for_entry(&entry).await?;
         let mut dv =
             scx_format_io::DeletionVectors::read_from(&mut Cursor::new(&bytes), bytes.len())
@@ -818,6 +828,83 @@ impl CloudReader {
         // Fold a legacy v1 (per-shard) section to the v2 global representation.
         dv.fold_v1_to_global(&self.catalog);
         Ok(Some(dv))
+    }
+
+    /// Whole-cell keep mask (`true` = retained) implied by the file's deletion
+    /// vectors, or `None` when the file has none or nothing is deleted. Mirrors
+    /// `ScxReader::deletion_keep_mask` (the global modality key), so the cloud
+    /// logical reads apply exactly the mask the local ones and the cloud
+    /// `QueryPipeline` do. Decoded once per reader (one section read, only on
+    /// a file whose header flags deletions) and shared through an `Arc`;
+    /// memoised on success only.
+    pub async fn deletion_keep_mask(&self) -> Result<Option<Arc<Vec<bool>>>> {
+        self.deletion_keep_mask
+            .get_or_try_init(|| async {
+                let dv = match self.read_deletion_vectors().await? {
+                    Some(dv) if dv.total_deleted() > 0 => dv,
+                    _ => return Ok(None),
+                };
+                Ok(Some(Arc::new(
+                    dv.build_keep_mask_global(self.header.n_obs as usize),
+                )))
+            })
+            .await
+            .cloned()
+    }
+
+    /// [`Self::read_obs`] in the **logical** row space — deletion vectors
+    /// applied. Parity with `ScxReader::read_obs_filtered`. Filtering yields a
+    /// new batch, so the assembled-obs cache is never mutated; when nothing is
+    /// deleted this is the cached batch itself.
+    pub async fn read_obs_filtered(&self) -> Result<RecordBatch> {
+        let obs = self.read_obs().await?;
+        match self.deletion_keep_mask().await? {
+            Some(mask) => Ok(scx_format_io::filter_batch_by_keep_mask(&obs, &mask)?),
+            None => Ok(obs),
+        }
+    }
+
+    /// [`Self::read_obs_keys`] in the logical row space. Parity with
+    /// `ScxReader::read_obs_keys_filtered`.
+    pub async fn read_obs_keys_filtered(&self, cols: &[String]) -> Result<RecordBatch> {
+        let obs = self.read_obs_keys(cols).await?;
+        match self.deletion_keep_mask().await? {
+            Some(mask) => Ok(scx_format_io::filter_batch_by_keep_mask(&obs, &mask)?),
+            None => Ok(obs),
+        }
+    }
+
+    /// [`Self::obs_categorical`] in the logical row space; see
+    /// [`Self::obs_categorical_many_filtered`]. Parity with
+    /// `ScxReader::obs_categorical_filtered`.
+    pub async fn obs_categorical_filtered(&self, col: &str) -> Result<(Vec<i32>, Vec<String>)> {
+        Ok(self
+            .obs_categorical_many_filtered(std::slice::from_ref(&col.to_string()))
+            .await?
+            .pop()
+            .expect("one column in ⇒ one column out"))
+    }
+
+    /// [`Self::obs_categorical_many`] in the logical row space: each column's
+    /// codes compacted by the keep mask, categories untouched. Parity with
+    /// `ScxReader::obs_categorical_many_filtered`.
+    pub async fn obs_categorical_many_filtered(
+        &self,
+        cols: &[String],
+    ) -> Result<Vec<(Vec<i32>, Vec<String>)>> {
+        let out = self.obs_categorical_many(cols).await?;
+        match self.deletion_keep_mask().await? {
+            Some(mask) => out
+                .into_iter()
+                .map(|(codes, cats)| {
+                    Ok((
+                        scx_format_io::filter_codes_by_keep_mask(codes, &mask)?,
+                        cats,
+                    ))
+                })
+                .collect(),
+            None => Ok(out),
+        }
     }
 
     /// Whether the source is an exploded `.scxd/` directory (each section a
@@ -1183,6 +1270,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                 var_bytes_cache: tokio::sync::OnceCell::new(),
                 obs_assembled: tokio::sync::OnceCell::new(),
                 var_assembled: tokio::sync::OnceCell::new(),
+                deletion_keep_mask: tokio::sync::OnceCell::new(),
             })
         }
         Err(e) => {
@@ -1270,6 +1358,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     var_bytes_cache: tokio::sync::OnceCell::new(),
                     obs_assembled: tokio::sync::OnceCell::new(),
                     var_assembled: tokio::sync::OnceCell::new(),
+                    deletion_keep_mask: tokio::sync::OnceCell::new(),
                 })
             } else {
                 // Not cloud-ready: read full catalog at EOF
@@ -1299,6 +1388,7 @@ pub async fn open_cloud(url: &str) -> Result<CloudReader> {
                     var_bytes_cache: tokio::sync::OnceCell::new(),
                     obs_assembled: tokio::sync::OnceCell::new(),
                     var_assembled: tokio::sync::OnceCell::new(),
+                    deletion_keep_mask: tokio::sync::OnceCell::new(),
                 })
             }
         }
@@ -1400,6 +1490,106 @@ mod tests {
         }
         writer.finish().unwrap();
         path
+    }
+
+    /// The cloud logical reads apply the same whole-cell keep mask the local
+    /// `ScxReader` and the cloud `QueryPipeline` do; without deletions they are
+    /// the physical reads themselves.
+    #[tokio::test]
+    async fn deletion_keep_mask_and_filtered_reads_drop_deleted_rows() {
+        use scx_format_io::deletion_vectors::DeletionVectors;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted.scx");
+        let n_obs = 100usize;
+        let mut writer = ScxWriter::new(&path, sample_header(n_obs as u64, 20)).unwrap();
+        writer.write_obs(&sample_obs(n_obs)).unwrap();
+        writer.write_var(&sample_var(20)).unwrap();
+        let (indptr, indices, values) = sample_shard_data(n_obs, 20);
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+        let mut dv = DeletionVectors::new();
+        dv.insert_global([5u32, 10]);
+        writer.write_deletion_vectors(&dv).unwrap();
+        writer.finish().unwrap();
+
+        let reader = open_cloud(&path.to_string_lossy()).await.unwrap();
+        let keep = reader.deletion_keep_mask().await.unwrap().unwrap();
+        assert_eq!(keep.len(), n_obs);
+        assert!(!keep[5] && !keep[10] && keep[6]);
+
+        let obs = reader.read_obs_filtered().await.unwrap();
+        assert_eq!(obs.num_rows(), n_obs - 2);
+        let ids = obs
+            .column_by_name("cell_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(ids.value(4), "cell_4");
+        assert_eq!(
+            ids.value(5),
+            "cell_6",
+            "row 5 is gone; the next live row moves up"
+        );
+        assert_eq!(ids.value(9), "cell_11");
+        assert_eq!(
+            reader.read_obs().await.unwrap().num_rows(),
+            n_obs,
+            "physical read untouched"
+        );
+
+        let cols = vec!["cell_type".to_string()];
+        let projected = reader.read_obs_keys_filtered(&cols).await.unwrap();
+        assert_eq!(projected.num_rows(), n_obs - 2);
+        assert_eq!(projected.num_columns(), 1);
+
+        let folded = reader.obs_categorical_many_filtered(&cols).await.unwrap();
+        assert_eq!(folded[0].0.len(), n_obs - 2);
+        // Row 5 was a Monocyte (5 % 3 == 2); the live row that takes its slot is
+        // row 6, a T_cell.
+        assert_eq!(folded[0].1[folded[0].0[5] as usize], "T_cell");
+
+        // No deletions: the mask is None and the logical reads are the physical ones.
+        let plain = write_test_file(&dir, 30, 10);
+        let reader = open_cloud(&plain.to_string_lossy()).await.unwrap();
+        assert!(reader.deletion_keep_mask().await.unwrap().is_none());
+        assert_eq!(reader.read_obs_filtered().await.unwrap().num_rows(), 30);
+    }
+
+    /// A header that flags deletion vectors while the catalog carries no
+    /// section is corrupt or incompatible: an error, as on `ScxReader` — never
+    /// "no deletions", which would resurrect every deleted cell.
+    #[tokio::test]
+    async fn flagged_file_without_a_deletion_section_is_an_error_not_no_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_test_file(&dir, 30, 10);
+        // Patch the header flag in place; the header carries no checksum.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut header = FileHeader::read_from(&mut Cursor::new(&bytes[..HEADER_SIZE])).unwrap();
+        assert!(!header.has_deletion_vectors());
+        header.set_deletion_vectors();
+        let mut patched = Vec::new();
+        header.write_to(&mut patched).unwrap();
+        bytes[..patched.len()].copy_from_slice(&patched);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let reader = open_cloud(&path.to_string_lossy()).await.unwrap();
+        assert!(reader.header().has_deletion_vectors());
+        let err = reader.deletion_keep_mask().await.unwrap_err();
+        assert!(err.to_string().contains("deletion_vectors"), "{err}");
+        assert!(reader.read_obs_filtered().await.is_err());
+        assert!(reader.read_deletion_vectors().await.is_err());
+        // The physical read is unaffected.
+        assert_eq!(reader.read_obs().await.unwrap().num_rows(), 30);
     }
 
     #[tokio::test]

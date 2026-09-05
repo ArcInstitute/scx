@@ -187,3 +187,27 @@ fn empty_shard_contributes_nothing() {
     assert_eq!(cats, vec!["a"]);
     assert_eq!(codes, vec![0]);
 }
+
+#[test]
+fn filter_codes_by_keep_mask_compacts_and_rejects_mismatch() {
+    let codes = vec![0, 1, -1, 2, 1];
+    let keep = [true, false, true, true, false];
+    assert_eq!(
+        filter_codes_by_keep_mask(codes.clone(), &keep).unwrap(),
+        vec![0, -1, 2],
+        "live rows keep their codes (a null code included), in order"
+    );
+    assert_eq!(
+        filter_codes_by_keep_mask(codes.clone(), &[true; 5]).unwrap(),
+        codes,
+        "an all-live mask is the identity"
+    );
+    assert!(filter_codes_by_keep_mask(codes.clone(), &[false; 5])
+        .unwrap()
+        .is_empty());
+    let err = filter_codes_by_keep_mask(codes, &[true; 4]).unwrap_err();
+    assert!(
+        err.to_string().contains("4 entries") && err.to_string().contains("5 rows"),
+        "{err}"
+    );
+}

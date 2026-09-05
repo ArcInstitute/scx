@@ -67,6 +67,34 @@ use arrow::datatypes::DataType;
 
 use crate::error::{Result, ScxError};
 
+/// Drop the codes of rows a deletion keep mask marks deleted (`true` = live),
+/// preserving order — the codes-side counterpart of
+/// [`crate::filter_batch_by_keep_mask`]. Categories are untouched: an
+/// unreferenced level stays a level, exactly as the physical fold keeps it.
+///
+/// Errors rather than truncating when the mask and `codes` disagree on length:
+/// a mask sized against `header.n_obs` applied to one shard's codes would keep
+/// the wrong cells.
+pub fn filter_codes_by_keep_mask(mut codes: Vec<i32>, keep: &[bool]) -> Result<Vec<i32>> {
+    if keep.len() != codes.len() {
+        return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+            "deletion keep mask has {} entries but the codes have {} rows",
+            keep.len(),
+            codes.len()
+        ))
+        .into());
+    }
+    let mut write = 0usize;
+    for (read, &live) in keep.iter().enumerate() {
+        if live {
+            codes[write] = codes[read];
+            write += 1;
+        }
+    }
+    codes.truncate(write);
+    Ok(codes)
+}
+
 /// Folds per-shard obs column arrays into one global `(codes, categories)` pair.
 ///
 /// See the [module docs](self) for null / ordering / representation semantics.

@@ -2307,8 +2307,10 @@ fn positional_attach_rejects_row_count_mismatch() {
     assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
     let msg = err.to_string();
     assert!(
-        msg.contains("physical") && msg.contains("read_obs()"),
-        "the error must say rows are counted in physical obs space, got: {msg}"
+        msg.contains("9 rows")
+            && msg.contains("n_obs = 10")
+            && msg.contains("no logical deletions"),
+        "the error must name the frame's rows and the file's, got: {msg}"
     );
     assert_eq!(
         before,
@@ -2317,17 +2319,377 @@ fn positional_attach_rejects_row_count_mismatch() {
     );
 }
 
-#[test]
-fn positional_attach_requires_empty_row_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_fixture(dir.path(), "a.scx", 4, 2, 1);
+// On a file with deletions the positional attach accepts either row space, told
+// apart by length. `read_obs()` is logical since pyscx 0.17, so the live-length
+// frame is the one an in-process caller now holds; the physical-length frame is
+// `read_obs(logical=False)` and must keep working unchanged.
 
-    let mut data = positional_data(4);
-    data.row_keys = keys("cell_", 4); // a caller who built keys meant a key join
-    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+/// The `i`-th live row gets source row `i`; a deleted row gets null; the
+/// deletion vector and the file's live count are untouched.
+#[test]
+fn positional_attach_accepts_a_live_length_frame_on_a_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx"); // n_obs = 10
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    let s = attach_external_obs(&path, &positional_data(8), &positional_opts()).unwrap();
+    assert_eq!(
+        s.n_obs, 10,
+        "the summary's n_obs is the physical axis the join was built over"
+    );
+    assert_eq!(s.n_matched, 8);
+    assert_eq!(
+        s.n_target_rows_absent, 2,
+        "the deleted rows are the absent ones"
+    );
+    assert_eq!(s.n_source_rows_absent, 0);
+    assert_eq!(s.obs_key_column, "<positional>");
+
+    let reader = ScxReader::open(&path).unwrap();
+    let physical = reader.read_obs().unwrap();
+    assert_eq!(physical.num_rows(), 10);
+    let scores = f32_col(&physical, "dbl_score");
+    let mut live = 0usize;
+    for row in 0..10 {
+        if row == 1 || row == 3 {
+            assert!(
+                scores.is_null(row),
+                "deleted row {row} must be null, not a value"
+            );
+        } else {
+            assert_eq!(
+                scores.value(row),
+                live as f32 * 10.0,
+                "physical row {row} must carry live row {live}'s value"
+            );
+            live += 1;
+        }
+    }
+    let logical = reader.read_obs_filtered().unwrap();
+    let scores = f32_col(&logical, "dbl_score");
+    for i in 0..8 {
+        assert_eq!(
+            scores.value(i),
+            i as f32 * 10.0,
+            "the logical read gives the frame back"
+        );
+    }
+    let keep = reader.deletion_keep_mask().unwrap().unwrap();
     assert!(
-        err.to_string().contains("row_keys"),
-        "positional with keys present must be refused by name, got: {err}"
+        !keep[1] && !keep[3] && keep[0] && keep[9],
+        "deletion vector carried"
+    );
+
+    let prov = reader.read_provenance().unwrap();
+    let last = prov.operations.last().unwrap();
+    assert!(
+        last.params_json.contains("\"row_space\":\"logical\""),
+        "provenance must record which row space landed: {}",
+        last.params_json
+    );
+}
+
+#[test]
+fn positional_attach_still_accepts_a_physical_length_frame_on_a_deleted_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    let s = attach_external_obs(&path, &positional_data(10), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+    assert_eq!(s.n_target_rows_absent, 0);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let scores = f32_col(&reader.read_obs().unwrap(), "dbl_score");
+    for row in 0..10 {
+        assert_eq!(
+            scores.value(row),
+            row as f32 * 10.0,
+            "a physical frame writes every row, the deleted ones included"
+        );
+    }
+    let prov = reader.read_provenance().unwrap();
+    assert!(
+        prov.operations
+            .last()
+            .unwrap()
+            .params_json
+            .contains("\"row_space\":\"physical\""),
+        "{}",
+        prov.operations.last().unwrap().params_json
+    );
+}
+
+/// Neither length: the error names both counts and the read that produces each,
+/// and the file is untouched.
+#[test]
+fn positional_attach_rejects_neither_length_naming_both_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    for n in [7usize, 9] {
+        let err = attach_external_obs(&path, &positional_data(n), &positional_opts()).unwrap_err();
+        assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
+        let msg = err.to_string();
+        for needle in [
+            &format!("{n} rows"),
+            "n_obs = 8",
+            "n_obs_physical = 10",
+            "read_obs()",
+            "read_obs(logical=False)",
+        ] {
+            assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
+        }
+    }
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
+
+/// More than half deleted: the key join's coverage report would warn about a sample-name
+/// prefix here, which is nonsense for a positional attach. The live join is
+/// built directly and must stay quiet and correct.
+#[test]
+fn positional_live_attach_on_a_mostly_deleted_file_lands_the_survivors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[0, 1, 2, 4, 5, 6, 8]).unwrap(); // live: 3, 7, 9
+
+    let s = attach_external_obs(&path, &positional_data(3), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 3);
+    assert_eq!(s.n_target_rows_absent, 7);
+    let scores = f32_col(
+        &ScxReader::open(&path).unwrap().read_obs().unwrap(),
+        "dbl_score",
+    );
+    assert_eq!(scores.value(3), 0.0);
+    assert_eq!(scores.value(7), 10.0);
+    assert_eq!(scores.value(9), 20.0);
+    assert!(scores.is_null(0) && scores.is_null(8));
+}
+
+/// A dense mapping has no null to stand in for a deleted row, so a live-length
+/// frame may not carry obsm embeddings.
+#[test]
+fn positional_attach_rejects_row_embeddings_on_a_live_length_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut data = positional_data(8);
+    let emb = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("c0", DataType::Float32, true)])),
+        vec![Arc::new(Float32Array::from(vec![0.0f32; 8]))],
+    )
+    .unwrap();
+    data.row_embeddings = vec![("X_pca".to_string(), emb)];
+
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("obsm embeddings"), "{err}");
+    assert_eq!(before, std::fs::read(&path).unwrap());
+}
+
+/// A 10-row file whose obs carries a pandas-style index column
+/// (`__index_level_0__` = cell_0..cell_9), as every `from_anndata` file does —
+/// the alignment check below resolves the file's barcodes through it.
+fn indexed_fixture(dir: &Path, name: &str) -> PathBuf {
+    let ids: Vec<String> = keys("cell_", 10);
+    let schema = Schema::new(vec![
+        Field::new("__index_level_0__", DataType::Utf8, false),
+        Field::new("cell_type", DataType::Utf8, true),
+    ]);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(StringArray::from(
+                (0..10)
+                    .map(|i| if i % 2 == 0 { "T" } else { "B" })
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    write_fixture_with_obs(dir, name, obs, 2, 2)
+}
+
+/// Under positional, supplied keys are never joined on — they are an alignment
+/// check: the frame's labels must equal the file's barcodes row for row, so a
+/// frame sorted or reindexed after `read_obs()` (right length, wrong order) is
+/// refused by row instead of landing every value on the wrong cell.
+#[test]
+fn positional_attach_keys_are_an_alignment_check_not_a_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = indexed_fixture(dir.path(), "a.scx");
+    let before = std::fs::read(&path).unwrap();
+
+    // Right length, permuted: refused, naming the first offending row.
+    let mut data = positional_data(10);
+    let mut permuted = keys("cell_", 10);
+    permuted.swap(2, 7);
+    data.row_keys = permuted;
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::InvalidInput(_)), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different order") && msg.contains("frame row 2") && msg.contains("cell_7"),
+        "the refusal must name the row and both labels: {msg}"
+    );
+    assert_eq!(
+        before,
+        std::fs::read(&path).unwrap(),
+        "refused → not a byte written"
+    );
+
+    // Wrong key count: refused as a shape error.
+    let mut data = positional_data(10);
+    data.row_keys = keys("cell_", 9);
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(matches!(err, OpsError::ShapeMismatch { .. }), "{err}");
+    assert!(err.to_string().contains("row_keys has 9"), "{err}");
+
+    // Matching keys: the check passes and the attach is positional as ever.
+    let mut data = positional_data(10);
+    data.row_keys = keys("cell_", 10);
+    let s = attach_external_obs(&path, &data, &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+    let reader = ScxReader::open(&path).unwrap();
+    let scores = f32_col(&reader.read_obs().unwrap(), "dbl_score");
+    for i in 0..10 {
+        assert_eq!(scores.value(i), i as f32 * 10.0);
+    }
+    let prov = reader.read_provenance().unwrap();
+    assert!(
+        prov.operations
+            .last()
+            .unwrap()
+            .params_json
+            .contains("\"positional_index_checked\":true"),
+        "{}",
+        prov.operations.last().unwrap().params_json
+    );
+
+    // Labels that are not the file's barcodes at all: ignored, as the index
+    // always was under positional (a frame from another source with its own
+    // row labels is still "row i annotates row i").
+    let path2 = indexed_fixture(dir.path(), "b.scx");
+    let mut data = positional_data(10);
+    data.row_keys = keys("other_", 10);
+    let s = attach_external_obs(&path2, &data, &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 10);
+}
+
+/// The alignment check follows the frame's row space: live keys against the
+/// live barcodes on a deleted file.
+#[test]
+fn positional_live_attach_checks_keys_against_the_live_barcodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = indexed_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    // The live barcodes in order: cell_0, cell_2, cell_4..cell_9.
+    let live: Vec<String> = (0..10)
+        .filter(|i| *i != 1 && *i != 3)
+        .map(|i| format!("cell_{i}"))
+        .collect();
+    let mut data = positional_data(8);
+    data.row_keys = live.clone();
+    let s = attach_external_obs(&path, &data, &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 8);
+
+    // The same labels reversed: a `read_obs().sort_values(...)` accident.
+    let mut data = positional_data(8);
+    data.row_keys = live.into_iter().rev().collect();
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(err.to_string().contains("different order"), "{err}");
+}
+
+/// A two-level obs index compares as the composite key the key join builds, on
+/// both sides — so a reordered MultiIndex frame is refused like a single-level one.
+#[test]
+fn positional_attach_checks_a_multi_level_index_as_a_composite_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(
+        "pandas".to_string(),
+        "{\"index_columns\":[\"lvl_a\",\"lvl_b\"]}".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("lvl_a", DataType::Utf8, false),
+        Field::new("lvl_b", DataType::Utf8, false),
+    ])
+    .with_metadata(meta);
+    let obs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(StringArray::from(keys("a", 10))),
+            Arc::new(StringArray::from(keys("b", 10))),
+        ],
+    )
+    .unwrap();
+    let path = write_fixture_with_obs(dir.path(), "multi.scx", obs, 2, 2);
+    crate::mark_deleted(&path, &[1, 3]).unwrap();
+
+    let composite = |i: usize| format!("a{i}{}b{i}", COMPOSITE_KEY_SEPARATOR);
+    let live: Vec<String> = (0..10)
+        .filter(|i| *i != 1 && *i != 3)
+        .map(composite)
+        .collect();
+
+    // Reversed live composite keys: refused, naming the levels.
+    let mut data = positional_data(8);
+    data.row_keys = live.iter().rev().cloned().collect();
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("different order") && msg.contains("lvl_a+lvl_b"),
+        "{msg}"
+    );
+
+    // In order: lands.
+    let mut data = positional_data(8);
+    data.row_keys = live;
+    assert_eq!(
+        attach_external_obs(&path, &data, &positional_opts())
+            .unwrap()
+            .n_matched,
+        8
+    );
+}
+
+/// A file with no obs index column cannot be checked against, so keys are
+/// refused by name rather than compared against a guessed column.
+#[test]
+fn positional_attach_keys_need_an_obs_index_column_to_check_against() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx"); // `cell_id` only, no index column
+    let mut data = positional_data(10);
+    data.row_keys = keys("cell_", 10);
+    let err = attach_external_obs(&path, &data, &positional_opts()).unwrap_err();
+    assert!(err.to_string().contains("no index column"), "{err}");
+    // Without keys the same file attaches positionally as before.
+    attach_external_obs(&path, &positional_data(10), &positional_opts()).unwrap();
+}
+
+/// Every row deleted: `read_obs()` is a 0-row frame and is exactly the live
+/// frame — the attach must accept it (all-null column) rather than refuse it.
+#[test]
+fn positional_attach_accepts_an_empty_live_frame_when_every_row_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = sharded_fixture(dir.path(), "a.scx");
+    crate::mark_deleted(&path, &(0..10u64).collect::<Vec<_>>()).unwrap();
+
+    let s = attach_external_obs(&path, &positional_data(0), &positional_opts()).unwrap();
+    assert_eq!(s.n_matched, 0);
+    assert_eq!(s.n_target_rows_absent, 10);
+    let obs = ScxReader::open(&path).unwrap().read_obs().unwrap();
+    assert_eq!(obs.num_rows(), 10);
+    let scores = f32_col(&obs, "dbl_score");
+    assert!(
+        (0..10).all(|i| scores.is_null(i)),
+        "every deleted row is null"
     );
 }
 
