@@ -305,7 +305,7 @@ fn try_write_uns_envelope(
 /// falls back to writing the raw envelope as a subgroup — never aborting the
 /// export and never reinterpreting bytes at the wrong width. `Err` is reserved
 /// for a genuine HDF5 write failure.
-fn write_uns_envelope_dataset(
+pub(super) fn write_uns_envelope_dataset(
     group: &hdf5::Group,
     name: &str,
     dtype: &str,

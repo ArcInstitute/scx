@@ -1063,6 +1063,39 @@ def test_from_anndata_uns_dataframe_non_string_columns_raises(tmp_dir):
         pyscx.from_anndata(adata, str(tmp_dir / "nonstr.scx"))
 
 
+def test_from_anndata_uns_dataframe_extension_index_raises(tmp_dir):
+    """The index gets the same dtype check the columns get.
+
+    `Index.to_numpy()` on a nullable `Int64` does not fail — it coerces to
+    float64-with-NaN — so without an explicit check the index was the one part
+    of a frame that could be silently downgraded while the columns beside it
+    were refused. Found by Antigravity.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"a": [1, 2]}, index=pd.Index(pd.array([1, None], dtype="Int64")))
+    with pytest.raises(ValueError, match=r"index dtype Int64"):
+        pyscx.from_anndata(_adata_with_uns({"t": df}), str(tmp_dir / "extidx.scx"))
+
+
+def test_from_anndata_uns_dataframe_bytes_column_raises(tmp_dir):
+    """Bytes in an object column would come back as `str`.
+
+    pandas normalises a byte-string Series to `object`, so the column reached
+    the string walker, whose `PyBytes` arm UTF-8-decodes each element —
+    `[b"a", b"b"]` read back as `["a", "b"]`. A silent type change under a
+    mode whose contract is losslessness, and one the docs already said was
+    unsupported. Found by codex.
+    """
+    import pandas as pd
+    import pyscx
+
+    df = pd.DataFrame({"b": np.array([b"a", b"b"], dtype=object)}, index=["r0", "r1"])
+    with pytest.raises(ValueError, match=r"bytes are not JSON-serializable"):
+        pyscx.from_anndata(_adata_with_uns({"t": df}), str(tmp_dir / "bytes.scx"))
+
+
 def test_from_anndata_uns_dataframe_error_names_the_column(tmp_dir):
     """A refusal deep in a frame must say which column, not just which key."""
     import pandas as pd

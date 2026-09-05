@@ -771,6 +771,64 @@ fn index_envelope<'py>(
     Ok(serde_json::Value::Object(env))
 }
 
+/// Refuse a pandas extension dtype (`Int64`, `boolean`, `string[python]`,
+/// `datetime64[ns, tz]`, …) on a frame's index or one of its columns.
+///
+/// `to_numpy()` does not fail on these — it *coerces*: a nullable `Int64` with
+/// a missing value comes back as float64-with-NaN, and a nullable string comes
+/// back as an object array of `pd.NA`, which then fails deep inside the string
+/// walker with a message about `NAType` rather than about the dtype. Refusing
+/// here keeps the lossless contract and names the thing the user has to cast.
+/// `category` is handled before this is reached; it has a real envelope.
+fn reject_extension_dtype(
+    pd: &Bound<'_, PyModule>,
+    dtype: &Bound<'_, PyAny>,
+    key_path: &str,
+    what: &str,
+) -> PyResult<()> {
+    if pd
+        .getattr("api")?
+        .getattr("types")?
+        .call_method1("is_extension_array_dtype", (dtype,))?
+        .extract::<bool>()?
+    {
+        let dtype_str: String = dtype.str()?.extract()?;
+        return Err(PyValueError::new_err(format!(
+            "uns at {key_path}: DataFrame {what} dtype {dtype_str} is a pandas extension \
+             dtype with no lossless NumPy form; cast it first (e.g. `.astype('float64')` \
+             for a nullable integer, `.astype(object)` for a nullable string)"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse `bytes` elements inside an object-dtype column.
+///
+/// `pylist_to_string_json_array` UTF-8-*decodes* a `bytes` element, so a
+/// `[b"a", b"b"]` column would read back as `["a", "b"]` — a silent type
+/// change, in a mode whose contract is losslessness, and one the docs already
+/// said was unsupported. Bytes are refused at the top level of `uns` for the
+/// same reason; this closes the door a DataFrame column opened.
+fn reject_bytes_elements(values: &Bound<'_, PyAny>, key_path: &str) -> PyResult<()> {
+    let kind: String = values.getattr("dtype")?.getattr("kind")?.extract()?;
+    if kind != "O" && kind != "S" {
+        return Ok(());
+    }
+    let lst = values.call_method0("tolist")?;
+    if let Ok(lst) = lst.cast::<PyList>() {
+        for (i, item) in lst.iter().enumerate() {
+            if item.cast::<PyBytes>().is_ok() {
+                return Err(PyValueError::new_err(format!(
+                    "uns at {key_path}[{i}]: bytes are not JSON-serializable; a bytes \
+                     element would read back as a str. Decode the column first \
+                     (e.g. `.str.decode('utf-8')`)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Encode a `pandas.DataFrame` as a tagged envelope:
 ///
 /// ```json
@@ -806,7 +864,7 @@ fn index_envelope<'py>(
 /// `ctx.visiting` insert, and it calls the leaf encoders directly rather than
 /// re-entering [`normalize_uns_value`] — so a frame costs exactly one
 /// container level, the way a `tuple` does, even though its JSON is deeper.
-/// See `scx_format::UNS_DATAFRAME_ENVELOPE_JSON_LEVELS`.
+/// See `scx-format`'s `MAX_UNS_DEPTH` derivation, which bounds the JSON side.
 fn dataframe_envelope<'py>(
     obj: &Bound<'py, PyAny>,
     key_path: &str,
@@ -819,6 +877,9 @@ fn dataframe_envelope<'py>(
 
     let index = obj.getattr("index")?;
     let columns = obj.getattr("columns")?;
+    // Both axes, and then the index's own dtype: `Index.to_numpy()` on a
+    // nullable `Int64` quietly yields float64-with-NaN, so without this check
+    // the index is the one part of the frame that could be silently coerced.
     for (axis, axis_obj) in [("index", &index), ("columns", &columns)] {
         if axis_obj.is_instance(&multi_cls)? {
             return Err(PyValueError::new_err(format!(
@@ -855,6 +916,13 @@ fn dataframe_envelope<'py>(
         names.push(name);
     }
 
+    reject_extension_dtype(
+        &pd,
+        &index.getattr("dtype")?,
+        &format!("{key_path}.index"),
+        "index",
+    )?;
+
     let mut data = serde_json::Map::with_capacity(names.len());
     for name in &names {
         let col_path = format!("{key_path}['{name}']");
@@ -864,21 +932,10 @@ fn dataframe_envelope<'py>(
             // `Series.array` of a categorical Series *is* the `pd.Categorical`.
             categorical_envelope(&series.getattr("array")?, &col_path, ctx)?
         } else {
-            if pd
-                .getattr("api")?
-                .getattr("types")?
-                .call_method1("is_extension_array_dtype", (&dtype,))?
-                .extract::<bool>()?
-            {
-                let dtype_str: String = dtype.str()?.extract()?;
-                return Err(PyValueError::new_err(format!(
-                    "uns at {col_path}: column dtype {dtype_str} is a pandas extension \
-                     dtype with no lossless NumPy form; cast it first (e.g. \
-                     `.astype('float64')` for a nullable integer, `.astype(object)` for \
-                     a nullable string)"
-                )));
-            }
-            encode_ndarray_tagged(&series.call_method1("to_numpy", ())?, &col_path, ctx)?
+            reject_extension_dtype(&pd, &dtype, &col_path, "column")?;
+            let values = series.call_method1("to_numpy", ())?;
+            reject_bytes_elements(&values, &col_path)?;
+            encode_ndarray_tagged(&values, &col_path, ctx)?
         };
         data.insert(name.clone(), encoded);
     }

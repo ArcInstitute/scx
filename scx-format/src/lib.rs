@@ -72,13 +72,16 @@ pub const SERDE_JSON_MAX_NESTING: usize = 127;
 /// JSON levels a `pandas.DataFrame` envelope occupies for the *one* container
 /// level it costs a writer's depth counter.
 ///
+/// Private: it is an input to the derivation below, not a compatibility
+/// surface. The wire fact it encodes belongs to `docs/format.md`.
+///
 /// The deepest path through the envelope is
 /// frame → `"data"` → a `categorical` column envelope → its `"categories"`
 /// `ndarray` envelope → that envelope's `"data"` JSON array. A frame cannot
 /// contain another frame (its columns are Series), so this expansion applies
 /// at most once in any root-to-leaf path — which is what keeps it out of the
 /// multiplier below and in the additive term instead.
-pub const UNS_DATAFRAME_ENVELOPE_JSON_LEVELS: usize = 5;
+const UNS_DATAFRAME_ENVELOPE_JSON_LEVELS: usize = 5;
 
 // `MAX_UNS_DEPTH` is *derived* from `SERDE_JSON_MAX_NESTING`, not chosen, and
 // the derivation is enforced here so that raising the cap past what the reader

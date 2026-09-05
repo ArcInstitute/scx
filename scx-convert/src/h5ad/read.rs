@@ -2021,11 +2021,14 @@ fn uns_dataframe_column_envelope(ds: &hdf5::Dataset) -> Result<serde_json::Value
         | TypeDescriptor::VarLenAscii
         | TypeDescriptor::FixedUnicode(_)
         | TypeDescriptor::FixedAscii(_) => {
-            let raw: Vec<hdf5::types::VarLenUnicode> = ds.read_1d()?.to_vec();
-            let data: Vec<serde_json::Value> = raw
-                .iter()
-                .map(|s| serde_json::Value::String(s.to_string()))
-                .collect();
+            // `read_string_dataset`, not `read_1d::<VarLenUnicode>()`: the
+            // fixed-width families need a const-generic type, and reading them
+            // as variable-length fails with an opaque "no conversion paths
+            // found" (see that function's own doc comment). PyTables writers —
+            // CellRanger, CellBender — emit fixed ASCII.
+            let raw = read_string_dataset(ds)?;
+            let data: Vec<serde_json::Value> =
+                raw.into_iter().map(serde_json::Value::String).collect();
             let shape_json: Vec<serde_json::Value> = shape
                 .iter()
                 .map(|s| serde_json::Value::Number((*s as u64).into()))
@@ -2099,8 +2102,9 @@ fn uns_categorical_envelope(group: &hdf5::Group) -> Result<serde_json::Value, Co
 fn read_uns_dataframe_group(
     group: &hdf5::Group,
     key: &str,
+    strict_uns: bool,
     sink: &mut WarningSink,
-) -> Result<serde_json::Value, ConvertError> {
+) -> Result<Option<serde_json::Value>, ConvertError> {
     let index_name: String = group
         .attr("_index")
         .ok()
@@ -2135,7 +2139,13 @@ fn read_uns_dataframe_group(
             .collect(),
     };
 
-    let index_ds = group.dataset(&index_name)?;
+    // No index dataset: this is not a frame we can reconstruct. Return `None`
+    // so the caller takes the generic subgroup recurse, which still recovers
+    // every sibling column as a dict — before X6 that was the only behaviour,
+    // and losing the whole `uns` key would be a strict regression on it.
+    let Ok(index_ds) = group.dataset(&index_name) else {
+        return Ok(None);
+    };
     let mut index_env = serde_json::Map::new();
     index_env.insert(
         SCX_UNS_TYPE_KEY.to_string(),
@@ -2168,7 +2178,13 @@ fn read_uns_dataframe_group(
             if enc == "categorical" {
                 uns_categorical_envelope(&sub)
             } else {
-                Err(ConvertError::Other(enc))
+                // Reason only. Both consumers — the lenient warning and the
+                // strict error — supply the `uns['key'] column 'name'` prefix,
+                // so repeating it here reads as a doubled location.
+                Err(ConvertError::Other(format!(
+                    "encoding-type '{}' has no lossless uns representation",
+                    if enc.is_empty() { "<none>" } else { &enc }
+                )))
             }
         } else {
             group
@@ -2180,6 +2196,14 @@ fn read_uns_dataframe_group(
             Ok(v) => {
                 data.insert(name.clone(), v);
                 kept.push(serde_json::Value::String(name.clone()));
+            }
+            // `strict_uns` means "abort on the first unrepresentable entry".
+            // Warning-and-omitting here regardless would have made a strict
+            // conversion silently return a truncated frame.
+            Err(e) if strict_uns => {
+                return Err(ConvertError::Other(format!(
+                    "uns['{key}'] column '{name}': {e} (strict_uns=true)"
+                )))
             }
             Err(e) => sink.emit(ConvertWarning::UnsupportedUnsDataframeColumn {
                 key: key.to_string(),
@@ -2197,7 +2221,7 @@ fn read_uns_dataframe_group(
     env.insert("index".to_string(), serde_json::Value::Object(index_env));
     env.insert("columns".to_string(), serde_json::Value::Array(kept));
     env.insert("data".to_string(), serde_json::Value::Object(data));
-    Ok(serde_json::Value::Object(env))
+    Ok(Some(serde_json::Value::Object(env)))
 }
 
 fn read_uns_entry(
@@ -2407,7 +2431,14 @@ fn read_uns_entry(
             // envelope, index / column order / categorical dtypes intact. It
             // used to take the generic recurse below, arriving as a dict of
             // columns + `_index` under a `flattened_uns_dataframe` warning.
-            return read_uns_dataframe_group(&subgroup, name, sink);
+            // `key_path`, not `name`: a nested frame's warnings must name where
+            // it actually sits (`rank_genes_groups/pts`), like every other
+            // warning on this walk.
+            if let Some(frame) = read_uns_dataframe_group(&subgroup, key_path, strict_uns, sink)? {
+                return Ok(frame);
+            }
+            // Not reconstructable as a frame — fall through to the generic
+            // recurse below, which preserves the columns as a dict.
         } else if matches!(enc.as_str(), "csr_matrix" | "csc_matrix" | "coo_matrix") {
             // B8: a scipy-sparse matrix in uns. The generic recurse below
             // preserves its data/indices/indptr arrays as a nested dict, but

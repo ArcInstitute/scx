@@ -30,14 +30,31 @@ pub enum ConvertWarning {
     ///
     /// Reached for anndata's nullable encodings (`nullable-integer`,
     /// `nullable-boolean`, `nullable-string-array`) and for any column dtype
-    /// the `uns` envelope cannot spell. Dropping the one column mirrors what
-    /// the export side does with a column it cannot write, and is preferred to
-    /// flattening the whole frame back to a dict over a single bad column.
+    /// the `uns` envelope cannot spell. Ingest drops per column because there
+    /// is no fallback that keeps the column *and* the frame — unlike export,
+    /// which declines the whole frame precisely because its raw-envelope
+    /// fallback keeps everything (see [`Self::UnsExportedAsRawEnvelope`]).
+    ///
+    /// Under `strict_uns=true` the column's error is returned instead, so a
+    /// strict conversion cannot succeed with a truncated frame.
     UnsupportedUnsDataframeColumn {
         key: String,
         column: String,
         reason: String,
     },
+
+    /// A `uns` pandas DataFrame could not be exported to h5ad as an anndata
+    /// dataframe group and was written as a raw `__scx_type__` envelope
+    /// subgroup instead. **No data is lost** — anndata reads that subgroup back
+    /// as a nested dict — but DataFrame consumers (`sc.tl.filter_rank_genes_groups`,
+    /// `sc.get.rank_genes_groups_df`) will not recognise it.
+    ///
+    /// Declining the whole frame rather than dropping the offending column is
+    /// deliberate: on export the fallback preserves everything, so dropping a
+    /// column would lose data the fallback would have kept. (Ingest has no such
+    /// fallback, which is why it drops per column instead — see
+    /// [`Self::UnsupportedUnsDataframeColumn`].)
+    UnsExportedAsRawEnvelope { key: String, reason: String },
     /// A `uns` entry stored as a scipy-sparse matrix (`encoding-type` ==
     /// `"csr_matrix"` / `"csc_matrix"` / `"coo_matrix"`) was preserved as a
     /// nested dict of `data` / `indices` / `indptr` arrays rather than
@@ -220,6 +237,7 @@ impl ConvertWarning {
             Self::InferredEncoding { .. } => "inferred_encoding",
             Self::SkippedUnsKey { .. } => "skipped_uns_key",
             Self::UnsupportedUnsDataframeColumn { .. } => "unsupported_uns_dataframe_column",
+            Self::UnsExportedAsRawEnvelope { .. } => "uns_exported_as_raw_envelope",
             Self::FlattenedUnsSparse { .. } => "flattened_uns_sparse",
             Self::MissingPresetIndexColumn { .. } => "missing_preset_index_column",
             Self::PresetNoColumnsMatched { .. } => "preset_no_columns_matched",
@@ -285,6 +303,13 @@ impl fmt::Display for ConvertWarning {
                 "uns['{key}'] column '{column}' has no lossless uns encoding \
                  ({reason}); it was left out of the reconstructed DataFrame. The \
                  index, the column order and every other column are intact."
+            ),
+            Self::UnsExportedAsRawEnvelope { key, reason } => write!(
+                f,
+                "uns['{key}'] could not be written as an h5ad DataFrame ({reason}); \
+                 it was exported as a raw envelope subgroup instead. No data is \
+                 lost, but anndata will read it back as a nested dict rather than \
+                 a DataFrame."
             ),
             Self::FlattenedUnsSparse { key, format } => write!(
                 f,

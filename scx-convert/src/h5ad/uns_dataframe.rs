@@ -8,583 +8,443 @@
 //! `uns[key]["pts"][group].loc[var_names]` and breaks on a dict, which is the
 //! whole reason the envelope exists.
 //!
-//! The group layout — `encoding-type`, `_index`, `column-order`, per-column
-//! datasets, categoricals as a `categories`/`codes` sub-group with an
-//! `ordered` attribute — is **not** re-implemented here. This module turns the
-//! envelope into an Arrow [`RecordBatch`] and hands it to
-//! [`crate::h5ad::column_stream::write_dataframe_group_at`], the crate's one
-//! dataframe-column writer, so the nine column encodings keep existing exactly
-//! once (see `h5ad/mod.rs`).
+//! ## Why this writes the group itself rather than reusing the obs/var writer
 //!
-//! **Dtype widening.** Those nine encodings are i32 / i64 / f32 / f64 / Utf8 /
-//! Boolean / Categorical / nullable / unsupported, so an `int8`, `uint16` or
-//! `float16` column lands in h5ad as `int32` / `int32` / `float32`, and a
-//! `bool` or `object` column lands in one of anndata's nullable encodings
-//! (read back as pandas `boolean` / `string`-like rather than numpy `bool` /
-//! `object`). That is what obs and var already do; the SCX file and every
-//! pyscx round trip keep the exact dtype, and only this export widens.
+//! The first version of this module built an Arrow `RecordBatch` and handed it
+//! to [`crate::h5ad::column_stream::write_dataframe_group_at`], on the argument
+//! that the crate should own the h5ad dataframe layout exactly once. Review
+//! found three separate defects, all one root cause — that writer models an
+//! **obs/var** column, and a `uns` column is a different thing:
+//!
+//! - It writes *every* `bool` as `encoding-type: "nullable-boolean"` and any
+//!   `object` column carrying a null as `nullable-string-array`, because an
+//!   obs column is nullable by nature. This module's own ingest arm has no
+//!   lossless reading for those, so a frame SCX had just written could not be
+//!   read back: `to_h5ad` → `from_h5ad` silently lost every `bool` and
+//!   null-bearing string column.
+//! - It classifies a `Dictionary(Int32, Boolean)` field `Unsupported`, drops
+//!   it, and keeps going — so a boolean categorical exported as an *empty*
+//!   DataFrame while this arm still reported success.
+//! - It resolves the index by field *name*, so a frame whose index name equals
+//!   one of its column names — legal pandas — collided on `create_dataset` and
+//!   aborted the entire `to_h5ad` with an opaque HDF5 error.
+//!
+//! A `uns` frame is one in-memory rectangular table of 1-D columns. Writing
+//! that layout directly is *less* code than the batch construction it replaces
+//! (no dtype-widening table, no `DictionaryArray`, no field metadata), and it
+//! keeps every column's **exact** dtype: an `int8` column lands as `int8`,
+//! where the obs/var encodings would have widened it to `int32`.
+//!
+//! ## Contract: write the whole frame, or decline the whole frame
+//!
+//! Every column is decoded and checked *before* the group is created. If any
+//! one of them has no faithful anndata spelling, this arm declines
+//! (`Ok(false)`) and emits [`ConvertWarning::UnsExportedAsRawEnvelope`] — the
+//! caller then writes the raw envelope subgroup, which **preserves all the
+//! data** (as a dict) rather than dropping a column from an
+//! otherwise-successful frame. Nothing is written before that decision, so a
+//! decline can never leave a half-built group behind, and no Arrow or HDF5
+//! error escapes past this arm to abort an unrelated export.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use hdf5::types::VarLenUnicode;
 
-use arrow::array::{
-    ArrayRef, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
-};
-use arrow::datatypes::{DataType, Field, Int32Type, Schema};
-
+use crate::h5_write_util::vlu;
 use crate::pipeline::ConvertError;
-use crate::warnings::WarningSink;
-use crate::CATEGORICAL_ORDERED_KEY;
+use crate::warnings::{ConvertWarning, WarningSink};
 
-/// The on-disk name anndata gives an unnamed dataframe index.
+use super::read::SCX_UNS_TYPE_KEY;
+
+/// One decoded column, in the shapes anndata actually spells inside a `uns`
+/// dataframe group.
+enum UnsColumn {
+    /// A numeric or boolean 1-D array: numpy `dtype.str` plus its raw
+    /// little-endian bytes, handed to the shared typed-dataset emitter so the
+    /// exact width survives.
+    Numeric { dtype: String, bytes: Vec<u8> },
+    /// A variable-length UTF-8 string array. Nulls are not representable here —
+    /// a plain h5ad string dataset has no null — so a column carrying one
+    /// declines the frame rather than inventing an empty string for it.
+    Strings(Vec<String>),
+    /// `categories` + `codes` + the `ordered` attribute. A negative code is
+    /// pandas' null and is written through unchanged, exactly as anndata does.
+    Categorical {
+        categories: Box<UnsColumn>,
+        codes: Vec<i32>,
+        ordered: bool,
+    },
+}
+
+impl UnsColumn {
+    /// Element count, used to reject a frame whose columns disagree with its
+    /// index before anything is written.
+    fn len(&self) -> Option<usize> {
+        match self {
+            UnsColumn::Numeric { dtype, bytes } => {
+                let width = dtype_width(dtype)?;
+                (bytes.len() % width == 0).then(|| bytes.len() / width)
+            }
+            UnsColumn::Strings(v) => Some(v.len()),
+            UnsColumn::Categorical { codes, .. } => Some(codes.len()),
+        }
+    }
+
+    fn write(&self, group: &hdf5::Group, name: &str) -> Result<(), ConvertError> {
+        match self {
+            UnsColumn::Numeric { dtype, bytes } => {
+                let n = self.len().unwrap_or(0);
+                // Shares the dtype dispatch with the plain-`ndarray` envelope
+                // arm, so a column and a standalone array of the same dtype
+                // land as the same HDF5 type. `Ok(false)` is unreachable here:
+                // `decode_column` accepted this dtype through the same helper.
+                if !super::uns::write_uns_envelope_dataset(group, name, dtype, &[n], bytes)? {
+                    return Err(ConvertError::Other(format!(
+                        "uns DataFrame column '{name}': dtype {dtype} passed preflight but could not be written"
+                    )));
+                }
+                Ok(())
+            }
+            UnsColumn::Strings(values) => {
+                let data: Vec<VarLenUnicode> = values.iter().map(|s| vlu(s)).collect();
+                group
+                    .new_dataset::<VarLenUnicode>()
+                    .shape([data.len()])
+                    .create(name)?
+                    .write(&data)?;
+                Ok(())
+            }
+            UnsColumn::Categorical {
+                categories,
+                codes,
+                ordered,
+            } => {
+                let cat = group.create_group(name)?;
+                categories.write(&cat, "categories")?;
+                cat.new_dataset::<i32>()
+                    .shape([codes.len()])
+                    .create("codes")?
+                    .write(codes)?;
+                cat.new_attr::<VarLenUnicode>()
+                    .create("encoding-type")?
+                    .write_scalar(&vlu("categorical"))?;
+                cat.new_attr::<VarLenUnicode>()
+                    .create("encoding-version")?
+                    .write_scalar(&vlu("0.2.0"))?;
+                cat.new_attr::<bool>()
+                    .create("ordered")?
+                    .write_scalar(ordered)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Byte width from a numpy `dtype.str` label (`"<f8"` -> 8, `"|b1"` -> 1).
 ///
-/// `write_dataframe_header` resolves the index from pandas `index_columns`
-/// schema metadata, else from a field literally called `__index_level_0__` or
-/// `_index`, else field 0 — so naming an unnamed index this way is what makes
-/// it land as `_index` rather than as a column.
-const UNNAMED_INDEX_FIELD: &str = "__index_level_0__";
+/// The label is byte-order char, kind char, then itemsize — the same three-part
+/// shape `write_uns_envelope_dataset` parses, kept in step with it.
+fn dtype_width(dtype: &str) -> Option<usize> {
+    let mut chars = dtype.chars();
+    let _order = chars.next()?;
+    let _kind = chars.next()?;
+    chars.as_str().parse::<usize>().ok()
+}
 
 /// Decode a `pandas.DataFrame` envelope and write it as an anndata dataframe
 /// group under `parent/name`.
 ///
-/// `Ok(false)` — never an error — for anything this cannot faithfully decode,
-/// so the caller falls back to the raw-subgroup write. Refusing to export the
-/// whole file over one odd column would be a worse trade than the pre-X6
-/// behaviour it replaces.
+/// `Ok(false)` — never an error — for anything this cannot faithfully write,
+/// so the caller falls back to the raw-subgroup write with all the data
+/// intact. See the module docs for why that is the whole-frame decision rather
+/// than a per-column one.
 pub(super) fn try_write_uns_dataframe(
     parent: &hdf5::Group,
     name: &str,
     map: &serde_json::Map<String, serde_json::Value>,
     sink: &mut WarningSink,
 ) -> Result<bool, ConvertError> {
-    if map
-        .get(super::read::SCX_UNS_TYPE_KEY)
-        .and_then(|v| v.as_str())
-        != Some("pandas.DataFrame")
-    {
+    if map.get(SCX_UNS_TYPE_KEY).and_then(|v| v.as_str()) != Some("pandas.DataFrame") {
         return Ok(false);
     }
-    let Some(batch) = envelope_to_record_batch(map)? else {
-        return Ok(false);
+    let frame = match decode_frame(map) {
+        Ok(f) => f,
+        Err(reason) => {
+            sink.emit(ConvertWarning::UnsExportedAsRawEnvelope {
+                key: name.to_string(),
+                reason,
+            });
+            return Ok(false);
+        }
     };
-    super::column_stream::write_dataframe_group_at(parent, name, &batch, sink)?;
+    frame.write(parent, name)?;
     Ok(true)
 }
 
-/// Envelope → `RecordBatch` with the index as field 0.
-///
-/// `None` when a leaf cannot be decoded. Column order comes from the
-/// envelope's `columns` list, never from `data`'s member order, because JSON
-/// object order is not a contract — and `column-order` on the written group
-/// follows Arrow field order, so getting this wrong would reorder the frame
-/// anndata reads back.
-fn envelope_to_record_batch(
-    map: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<RecordBatch>, ConvertError> {
+/// A frame that passed preflight: nothing here can fail to write.
+struct DecodedFrame {
+    /// On-disk name of the index dataset, and the value of the group's
+    /// `_index` attribute.
+    index_name: String,
+    index: UnsColumn,
+    columns: Vec<(String, UnsColumn)>,
+}
+
+impl DecodedFrame {
+    fn write(&self, parent: &hdf5::Group, name: &str) -> Result<(), ConvertError> {
+        let group = parent.create_group(name)?;
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("encoding-type")?
+            .write_scalar(&vlu("dataframe"))?;
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("encoding-version")?
+            .write_scalar(&vlu("0.2.0"))?;
+        group
+            .new_attr::<VarLenUnicode>()
+            .create("_index")?
+            .write_scalar(&vlu(&self.index_name))?;
+
+        // `column-order` carries the frame's column order; anndata falls back
+        // to HDF5 member order (alphabetical) without it. Written with an
+        // explicit shape so the column-less case is a length-0 array rather
+        // than a scalar, which anndata rejects.
+        let order: Vec<VarLenUnicode> = self.columns.iter().map(|(n, _)| vlu(n)).collect();
+        group
+            .new_attr::<VarLenUnicode>()
+            .shape([order.len()])
+            .create("column-order")?
+            .write_raw(&order)?;
+
+        self.index.write(&group, &self.index_name)?;
+        for (col_name, col) in &self.columns {
+            col.write(&group, col_name)?;
+        }
+        Ok(())
+    }
+}
+
+/// Envelope → a frame every part of which is known writable, or `Err(reason)`
+/// naming what could not be spelled. The reason travels into the warning, so
+/// it has to read as a sentence fragment.
+fn decode_frame(map: &serde_json::Map<String, serde_json::Value>) -> Result<DecodedFrame, String> {
     let Some(serde_json::Value::Array(col_names)) = map.get("columns") else {
-        return Ok(None);
+        return Err("envelope has no `columns` list".into());
     };
     let Some(serde_json::Value::Object(data)) = map.get("data") else {
-        return Ok(None);
+        return Err("envelope has no `data` object".into());
     };
     let Some(serde_json::Value::Object(index_env)) = map.get("index") else {
-        return Ok(None);
+        return Err("envelope has no `index` object".into());
     };
 
     // The index rides in a `pandas.Index` envelope, whose `data` is the array
     // envelope proper.
-    let Some(index_data) = index_env.get("data") else {
-        return Ok(None);
-    };
-    let Some((index_array, _)) = decode_column(index_data)? else {
-        return Ok(None);
-    };
+    let index = index_env
+        .get("data")
+        .ok_or_else(|| "index envelope has no `data`".to_string())
+        .and_then(|v| decode_column(v).map_err(|e| format!("index: {e}")))?;
     let index_name = match index_env.get("name") {
         Some(serde_json::Value::String(s)) => s.clone(),
-        _ => UNNAMED_INDEX_FIELD.to_string(),
+        _ => "_index".to_string(),
     };
 
-    let n_rows = index_array.len();
-    let mut fields: Vec<Field> = vec![Field::new(
-        index_name,
-        index_array.data_type().clone(),
-        false,
-    )];
-    let mut arrays: Vec<ArrayRef> = vec![index_array];
+    let n_rows = index
+        .len()
+        .ok_or_else(|| "index length is not determinable".to_string())?;
 
+    let mut columns: Vec<(String, UnsColumn)> = Vec::with_capacity(col_names.len());
     for col in col_names {
         let serde_json::Value::String(col) = col else {
-            return Ok(None);
+            return Err("a `columns` entry is not a string".into());
         };
-        let Some(value) = data.get(col.as_str()) else {
-            return Ok(None);
-        };
-        let Some((array, ordered)) = decode_column(value)? else {
-            return Ok(None);
-        };
-        // A column shorter or longer than the index would build an invalid
-        // batch; a malformed envelope must degrade to the raw-subgroup write,
-        // not abort the export.
-        if array.len() != n_rows {
-            return Ok(None);
+        // A column named like the index would collide on `create_dataset` and
+        // abort the export. Legal in pandas (`df.index.name == "gene"` with a
+        // "gene" column), so decline rather than fail.
+        if *col == index_name {
+            return Err(format!(
+                "column '{col}' has the same name as the index, which anndata stores in the same group"
+            ));
         }
-        let mut field = Field::new(col.clone(), array.data_type().clone(), true);
-        if let Some(ordered) = ordered {
-            // The only supplier of the `ordered` bit `finalize_column_writer`
-            // writes back out as the group's attribute.
-            field = field.with_metadata(HashMap::from([(
-                CATEGORICAL_ORDERED_KEY.to_string(),
-                ordered.to_string(),
-            )]));
+        let value = data.get(col.as_str()).ok_or_else(|| {
+            format!("column '{col}' is listed in `columns` but missing from `data`")
+        })?;
+        let decoded = decode_column(value).map_err(|e| format!("column '{col}': {e}"))?;
+        if decoded.len() != Some(n_rows) {
+            return Err(format!(
+                "column '{col}' has {:?} values but the index has {n_rows}",
+                decoded.len()
+            ));
         }
-        fields.push(field);
-        arrays.push(array);
+        columns.push((col.clone(), decoded));
     }
 
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| ConvertError::Other(format!("uns DataFrame export: {e}")))?;
-    Ok(Some(batch))
+    Ok(DecodedFrame {
+        index_name,
+        index,
+        columns,
+    })
 }
 
-/// One envelope → an Arrow array, plus the categorical `ordered` bit when the
-/// column is one. `None` for a leaf with no faithful Arrow spelling.
-fn decode_column(
-    value: &serde_json::Value,
-) -> Result<Option<(ArrayRef, Option<bool>)>, ConvertError> {
+/// One envelope → a writable column, or `Err(reason)`.
+fn decode_column(value: &serde_json::Value) -> Result<UnsColumn, String> {
     let serde_json::Value::Object(map) = value else {
-        return Ok(None);
+        return Err("not an envelope object".into());
     };
-    match map
-        .get(super::read::SCX_UNS_TYPE_KEY)
-        .and_then(|v| v.as_str())
-    {
-        Some("ndarray") => Ok(decode_ndarray(map)?.map(|a| (a, None))),
+    match map.get(SCX_UNS_TYPE_KEY).and_then(|v| v.as_str()) {
+        Some("ndarray") => decode_ndarray(map),
         Some("categorical") => decode_categorical(map),
-        _ => Ok(None),
+        Some(other) => Err(format!("unsupported `{SCX_UNS_TYPE_KEY}` '{other}'")),
+        None => Err("not a tagged envelope".into()),
     }
 }
 
-/// A `categorical` envelope → an Arrow `DictionaryArray<Int32Type>`.
+/// A `categorical` envelope → `categories` + `codes` + `ordered`.
 ///
-/// Codes arrive as whatever integer width pandas used (`int8` for a few
-/// levels); Arrow dictionaries are `Int32`, and `create_column_writer` builds
-/// its `codes` dataset as `i32`, so the widening here is the on-disk form
-/// either way. A negative code is pandas' null and becomes an Arrow null.
+/// Codes widen to `i32`, which is the width anndata's `codes` dataset uses and
+/// the one this crate's reader expects; a negative code is pandas' null and is
+/// preserved. Boolean categories are refused: `read_categorical_values` cannot
+/// read them back, so writing them would produce a file this workspace could
+/// not ingest.
 fn decode_categorical(
     map: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<(ArrayRef, Option<bool>)>, ConvertError> {
+) -> Result<UnsColumn, String> {
     let (Some(categories), Some(codes)) = (map.get("categories"), map.get("codes")) else {
-        return Ok(None);
+        return Err("categorical envelope is missing `categories` or `codes`".into());
     };
-    let Some(values) = decode_ndarray_map(categories)? else {
-        return Ok(None);
-    };
-    let Some(codes) = decode_ndarray_map(codes)? else {
-        return Ok(None);
+    let categories = decode_column(categories).map_err(|e| format!("categories: {e}"))?;
+    if let UnsColumn::Numeric { dtype, .. } = &categories {
+        if dtype.chars().nth(1) == Some('b') {
+            return Err("boolean categories have no readable anndata categorical form".into());
+        }
+    }
+
+    let codes = match decode_column(codes)? {
+        UnsColumn::Numeric { dtype, bytes } => codes_to_i32(&dtype, &bytes)
+            .ok_or_else(|| format!("codes dtype {dtype} is not an integer width"))?,
+        _ => return Err("categorical `codes` is not a numeric array".into()),
     };
     let ordered = map
         .get("ordered")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let keys: Int32Array = match codes.data_type() {
-        DataType::Int32 => codes
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("checked")
-            .iter()
-            .map(|c| c.filter(|&c| c >= 0))
-            .collect(),
-        DataType::Int64 => codes
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("checked")
-            .iter()
-            .map(|c| c.filter(|&c| c >= 0).map(|c| c as i32))
-            .collect(),
-        _ => return Ok(None),
-    };
-
-    let dict = DictionaryArray::<Int32Type>::try_new(keys, values)
-        .map_err(|e| ConvertError::Other(format!("uns DataFrame categorical export: {e}")))?;
-    Ok(Some((Arc::new(dict), Some(ordered))))
+    Ok(UnsColumn::Categorical {
+        categories: Box::new(categories),
+        codes,
+        ordered,
+    })
 }
 
-fn decode_ndarray_map(value: &serde_json::Value) -> Result<Option<ArrayRef>, ConvertError> {
-    let serde_json::Value::Object(map) = value else {
-        return Ok(None);
-    };
-    if map
-        .get(super::read::SCX_UNS_TYPE_KEY)
-        .and_then(|v| v.as_str())
-        != Some("ndarray")
-    {
-        return Ok(None);
+/// Categorical codes, whatever signed width pandas used, as `i32`.
+fn codes_to_i32(dtype: &str, bytes: &[u8]) -> Option<Vec<i32>> {
+    macro_rules! widen {
+        ($ty:ty, $w:expr) => {{
+            if bytes.len() % $w != 0 {
+                return None;
+            }
+            Some(
+                bytes
+                    .chunks_exact($w)
+                    .map(|c| <$ty>::from_le_bytes(c.try_into().unwrap()) as i32)
+                    .collect(),
+            )
+        }};
     }
-    decode_ndarray(map)
+    match (dtype.chars().nth(1), dtype_width(dtype)?) {
+        (Some('i'), 1) => Some(bytes.iter().map(|&b| b as i8 as i32).collect()),
+        (Some('i'), 2) => widen!(i16, 2),
+        (Some('i'), 4) => widen!(i32, 4),
+        (Some('i'), 8) => widen!(i64, 8),
+        _ => None,
+    }
 }
 
-/// An `ndarray` envelope → an Arrow array.
+/// An `ndarray` envelope → a writable column.
 ///
-/// `encoding: "json"` carries object/string arrays as a JSON list; everything
-/// else is base64 little-endian raw bytes, reinterpreted per the numpy
-/// `dtype.str` label. Only 1-D arrays make sense as dataframe columns, so a
-/// higher-rank envelope declines rather than flattening silently.
-fn decode_ndarray(
-    map: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<ArrayRef>, ConvertError> {
+/// Only 1-D arrays are dataframe columns, so a higher-rank envelope declines
+/// rather than flattening silently. Numeric payloads pass their bytes through
+/// untouched, dtype and all — no widening.
+fn decode_ndarray(map: &serde_json::Map<String, serde_json::Value>) -> Result<UnsColumn, String> {
     let Some(dtype) = map.get("dtype").and_then(|v| v.as_str()) else {
-        return Ok(None);
+        return Err("ndarray envelope has no `dtype`".into());
     };
     let Some(serde_json::Value::Array(shape)) = map.get("shape") else {
-        return Ok(None);
+        return Err("ndarray envelope has no `shape`".into());
     };
     if shape.len() != 1 {
-        return Ok(None);
+        return Err(format!("{}-dimensional, not a column", shape.len()));
     }
     let Some(n) = shape[0].as_u64().map(|n| n as usize) else {
-        return Ok(None);
+        return Err("`shape` entry is not a non-negative integer".into());
     };
 
     match map.get("encoding").and_then(|v| v.as_str()) {
         Some("json") => {
             let Some(serde_json::Value::Array(items)) = map.get("data") else {
-                return Ok(None);
+                return Err("json-encoded ndarray has no `data` list".into());
             };
-            let mut out: Vec<Option<String>> = Vec::with_capacity(items.len());
+            let mut out: Vec<String> = Vec::with_capacity(items.len());
             for item in items {
                 match item {
-                    serde_json::Value::String(s) => out.push(Some(s.clone())),
-                    serde_json::Value::Null => out.push(None),
-                    // A nested list means a >1-D object array; not a column.
-                    _ => return Ok(None),
+                    serde_json::Value::String(s) => out.push(s.clone()),
+                    // A plain h5ad string dataset has no null. Rather than
+                    // write `""` and read back the wrong value, decline the
+                    // frame so the raw envelope keeps the null.
+                    serde_json::Value::Null => {
+                        return Err(
+                            "contains a null, which a plain h5ad string dataset cannot hold".into(),
+                        )
+                    }
+                    _ => return Err("a string-array element is not a string".into()),
                 }
             }
-            Ok(Some(Arc::new(StringArray::from(out)) as ArrayRef))
+            if out.len() != n {
+                return Err(format!("declares {n} elements but carries {}", out.len()));
+            }
+            Ok(UnsColumn::Strings(out))
         }
         Some("base64le") => {
             use base64::Engine;
             let Some(b64) = map.get("data").and_then(|v| v.as_str()) else {
-                return Ok(None);
+                return Err("base64 ndarray has no `data` string".into());
             };
-            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-                return Ok(None);
-            };
-            Ok(numeric_array(dtype, &bytes, n))
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|_| "`data` is not valid base64".to_string())?;
+            // Byte order is explicit in the label; reinterpreting a big-endian
+            // payload as little-endian would silently corrupt every value.
+            let order = dtype.chars().next();
+            if !matches!(order, Some('<') | Some('|') | Some('=')) {
+                return Err(format!("dtype {dtype} is not little-endian"));
+            }
+            let width = dtype_width(dtype).ok_or_else(|| format!("unparseable dtype {dtype}"))?;
+            if width == 0 || bytes.len() != n * width {
+                return Err(format!(
+                    "dtype {dtype} and {n} elements do not match {} payload bytes",
+                    bytes.len()
+                ));
+            }
+            // Reject here rather than at write time: `write_uns_envelope_dataset`
+            // answers `Ok(false)` for a kind it cannot emit, and by then the
+            // group would already exist.
+            if !matches!(
+                (dtype.chars().nth(1), width),
+                (Some('f'), 2 | 4 | 8)
+                    | (Some('i'), 1 | 2 | 4 | 8)
+                    | (Some('u'), 1 | 2 | 4 | 8)
+                    | (Some('b'), 1)
+            ) {
+                return Err(format!("dtype {dtype} has no HDF5 form"));
+            }
+            Ok(UnsColumn::Numeric {
+                dtype: dtype.to_string(),
+                bytes,
+            })
         }
-        _ => Ok(None),
+        other => Err(format!("unsupported ndarray encoding {other:?}")),
     }
-}
-
-/// Little-endian `bytes` reinterpreted as `dtype`, widened into whichever of
-/// the four numeric column encodings can hold it losslessly.
-///
-/// `uint64` has no lossless target — `i64` cannot hold its upper half — so it
-/// declines rather than wrapping a large count into a negative one.
-fn numeric_array(dtype: &str, bytes: &[u8], n: usize) -> Option<ArrayRef> {
-    /// Reinterpret `bytes` as `n` little-endian values of a fixed width.
-    macro_rules! read_le {
-        ($ty:ty, $w:expr) => {{
-            if bytes.len() != n * $w {
-                return None;
-            }
-            bytes
-                .chunks_exact($w)
-                .map(|c| <$ty>::from_le_bytes(c.try_into().unwrap()))
-                .collect::<Vec<$ty>>()
-        }};
-    }
-
-    // Byte order is explicit in the label; a big-endian payload is not
-    // something this workspace writes, and reinterpreting it as LE would
-    // silently corrupt every value.
-    let arr: ArrayRef = match dtype {
-        "|b1" | "<b1" | "=b1" => {
-            if bytes.len() != n {
-                return None;
-            }
-            Arc::new(BooleanArray::from(
-                bytes.iter().map(|&b| b != 0).collect::<Vec<bool>>(),
-            ))
-        }
-        "|i1" | "<i1" | "=i1" => Arc::new(Int32Array::from(
-            read_le!(i8, 1)
-                .into_iter()
-                .map(i32::from)
-                .collect::<Vec<i32>>(),
-        )),
-        "<i2" | "=i2" => Arc::new(Int32Array::from(
-            read_le!(i16, 2)
-                .into_iter()
-                .map(i32::from)
-                .collect::<Vec<i32>>(),
-        )),
-        "<i4" | "=i4" => Arc::new(Int32Array::from(read_le!(i32, 4))),
-        "<i8" | "=i8" => Arc::new(Int64Array::from(read_le!(i64, 8))),
-        "|u1" | "<u1" | "=u1" => Arc::new(Int32Array::from(
-            read_le!(u8, 1)
-                .into_iter()
-                .map(i32::from)
-                .collect::<Vec<i32>>(),
-        )),
-        "<u2" | "=u2" => Arc::new(Int32Array::from(
-            read_le!(u16, 2)
-                .into_iter()
-                .map(i32::from)
-                .collect::<Vec<i32>>(),
-        )),
-        "<u4" | "=u4" => Arc::new(Int64Array::from(
-            read_le!(u32, 4)
-                .into_iter()
-                .map(i64::from)
-                .collect::<Vec<i64>>(),
-        )),
-        "<f4" | "=f4" => Arc::new(Float32Array::from(read_le!(f32, 4))),
-        "<f8" | "=f8" => Arc::new(Float64Array::from(read_le!(f64, 8))),
-        "<f2" | "=f2" => {
-            if bytes.len() != n * 2 {
-                return None;
-            }
-            Arc::new(Float32Array::from(
-                bytes
-                    .chunks_exact(2)
-                    .map(|c| f32::from(half::f16::from_le_bytes([c[0], c[1]])))
-                    .collect::<Vec<f32>>(),
-            ))
-        }
-        _ => return None,
-    };
-    Some(arr)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The envelope a pyscx-written frame actually looks like, so the test
-    /// exercises the shape the decoder meets in the wild rather than one
-    /// invented to suit it.
-    fn frame_envelope() -> serde_json::Value {
-        serde_json::json!({
-            "__scx_type__": "pandas.DataFrame",
-            "index": {
-                "__scx_type__": "pandas.Index",
-                "name": "row",
-                "data": {
-                    "__scx_type__": "ndarray", "dtype": "object", "shape": [2],
-                    "encoding": "json", "data": ["r0", "r1"],
-                },
-            },
-            // Deliberately not alphabetical: `column-order` on the written
-            // group follows Arrow field order, so a decoder that iterated
-            // `data`'s members instead would reorder the frame silently.
-            "columns": ["zed", "abe", "grade"],
-            "data": {
-                // [1.0, 2.0] as little-endian f64.
-                "zed": {
-                    "__scx_type__": "ndarray", "dtype": "<f8", "shape": [2],
-                    "encoding": "base64le", "data": "AAAAAAAA8D8AAAAAAAAAQA==",
-                },
-                // [3, 4] as little-endian i64.
-                "abe": {
-                    "__scx_type__": "ndarray", "dtype": "<i8", "shape": [2],
-                    "encoding": "base64le", "data": "AwAAAAAAAAAEAAAAAAAAAA==",
-                },
-                "grade": {
-                    "__scx_type__": "categorical",
-                    "ordered": true,
-                    // codes [1, 0] as int8.
-                    "codes": {
-                        "__scx_type__": "ndarray", "dtype": "|i1", "shape": [2],
-                        "encoding": "base64le", "data": "AQA=",
-                    },
-                    "categories": {
-                        "__scx_type__": "ndarray", "dtype": "object", "shape": [3],
-                        "encoding": "json", "data": ["lo", "mid", "hi"],
-                    },
-                },
-            },
-        })
-    }
-
-    /// The frame arm writes the anndata dataframe layout, not a raw subgroup.
-    ///
-    /// Asserting the on-disk attributes rather than a Python round trip is the
-    /// point: `encoding-type`, `_index` and `column-order` are exactly what
-    /// anndata dispatches on, and they are what the pre-X6 generic path never
-    /// wrote.
-    #[test]
-    fn frame_envelope_writes_an_anndata_dataframe_group() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = hdf5::File::create(dir.path().join("t.h5")).unwrap();
-        let uns = file.create_group("uns").unwrap();
-        let mut sink = crate::warnings::WarningSink::log();
-
-        let env = frame_envelope();
-        assert!(
-            try_write_uns_dataframe(&uns, "tbl", env.as_object().unwrap(), &mut sink).unwrap(),
-            "a well-formed frame envelope must be claimed by this arm"
-        );
-
-        let g = uns.group("tbl").unwrap();
-        let read_attr = |name: &str| -> String {
-            g.attr(name)
-                .unwrap()
-                .read_scalar::<hdf5::types::VarLenUnicode>()
-                .unwrap()
-                .to_string()
-        };
-        assert_eq!(read_attr("encoding-type"), "dataframe");
-        assert_eq!(read_attr("_index"), "row");
-
-        let order: Vec<String> = g
-            .attr("column-order")
-            .unwrap()
-            .read_1d::<hdf5::types::VarLenUnicode>()
-            .unwrap()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(
-            order,
-            ["zed", "abe", "grade"],
-            "column-order must follow the envelope's `columns`, not `data`'s member order"
-        );
-
-        assert_eq!(g.dataset("row").unwrap().shape(), [2]);
-        assert_eq!(g.dataset("zed").unwrap().shape(), [2]);
-
-        // The categorical becomes a real categorical group, `ordered` included
-        // — the bit the flatten path used to drop.
-        let cat = g.group("grade").unwrap();
-        assert_eq!(
-            cat.attr("encoding-type")
-                .unwrap()
-                .read_scalar::<hdf5::types::VarLenUnicode>()
-                .unwrap()
-                .to_string(),
-            "categorical"
-        );
-        assert!(cat.attr("ordered").unwrap().read_scalar::<bool>().unwrap());
-        assert_eq!(
-            cat.dataset("codes").unwrap().read_raw::<i32>().unwrap(),
-            [1, 0]
-        );
-        // Declared categories survive whole: no row uses "mid", and ingest
-        // applies no row filter, so pruning it would be wrong.
-        let cats: Vec<String> = cat
-            .dataset("categories")
-            .unwrap()
-            .read_1d::<hdf5::types::VarLenUnicode>()
-            .unwrap()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(cats, ["lo", "mid", "hi"]);
-    }
-
-    /// An unnamed index must land as `_index`, anndata's own spelling.
-    #[test]
-    fn unnamed_index_lands_as_underscore_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = hdf5::File::create(dir.path().join("t.h5")).unwrap();
-        let uns = file.create_group("uns").unwrap();
-        let mut sink = crate::warnings::WarningSink::log();
-
-        let mut env = frame_envelope();
-        env["index"]["name"] = serde_json::Value::Null;
-        assert!(try_write_uns_dataframe(&uns, "tbl", env.as_object().unwrap(), &mut sink).unwrap());
-
-        let g = uns.group("tbl").unwrap();
-        assert_eq!(
-            g.attr("_index")
-                .unwrap()
-                .read_scalar::<hdf5::types::VarLenUnicode>()
-                .unwrap()
-                .to_string(),
-            "_index"
-        );
-        assert!(g.dataset("_index").is_ok());
-    }
-
-    /// Every malformed shape declines rather than erroring, so the caller falls
-    /// back to the raw-subgroup write.
-    ///
-    /// Declining, not failing, is the contract: refusing to export a whole file
-    /// over one odd `uns` value would be worse than the pre-X6 behaviour this
-    /// replaces.
-    #[test]
-    fn malformed_frame_envelopes_decline_rather_than_erroring() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = hdf5::File::create(dir.path().join("t.h5")).unwrap();
-        let uns = file.create_group("uns").unwrap();
-        let mut sink = crate::warnings::WarningSink::log();
-
-        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
-            (
-                "wrong_tag",
-                Box::new(|e: &mut serde_json::Value| {
-                    e["__scx_type__"] = "something.else".into();
-                }),
-            ),
-            (
-                "no_columns",
-                Box::new(|e: &mut serde_json::Value| {
-                    e.as_object_mut().unwrap().remove("columns");
-                }),
-            ),
-            (
-                "column_not_in_data",
-                Box::new(|e: &mut serde_json::Value| {
-                    e["columns"] = serde_json::json!(["zed", "ghost"]);
-                }),
-            ),
-            (
-                "length_mismatch",
-                Box::new(|e: &mut serde_json::Value| {
-                    // One value where the index has two: an invalid RecordBatch.
-                    e["data"]["zed"]["shape"] = serde_json::json!([1]);
-                    e["data"]["zed"]["data"] = "AAAAAAAA8D8=".into();
-                    e["columns"] = serde_json::json!(["zed"]);
-                }),
-            ),
-            (
-                "big_endian_column",
-                Box::new(|e: &mut serde_json::Value| {
-                    e["data"]["zed"]["dtype"] = ">f8".into();
-                    e["columns"] = serde_json::json!(["zed"]);
-                }),
-            ),
-            (
-                "uint64_column",
-                Box::new(|e: &mut serde_json::Value| {
-                    // No lossless Arrow/h5ad target; wrapping into i64 would turn a
-                    // large count negative.
-                    e["data"]["zed"]["dtype"] = "<u8".into();
-                    e["columns"] = serde_json::json!(["zed"]);
-                }),
-            ),
-            (
-                "two_dimensional_column",
-                Box::new(|e: &mut serde_json::Value| {
-                    e["data"]["zed"]["shape"] = serde_json::json!([1, 2]);
-                    e["columns"] = serde_json::json!(["zed"]);
-                }),
-            ),
-        ];
-
-        for (name, mutate) in cases {
-            let mut env = frame_envelope();
-            mutate(&mut env);
-            assert!(
-                !try_write_uns_dataframe(&uns, name, env.as_object().unwrap(), &mut sink).unwrap(),
-                "'{name}' must decline, not claim the value"
-            );
-            assert!(
-                uns.group(name).is_err() && uns.dataset(name).is_err(),
-                "'{name}' must not have written anything before declining"
-            );
-        }
-    }
-}
+#[path = "uns_dataframe_tests.rs"]
+mod tests;

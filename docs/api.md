@@ -523,7 +523,8 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | --- | --- | --- |
 | `InferredEncoding { path, inferred }` | h5ad layout detection (`detect_matrix_format_at`, `open_x_streaming`) | h5ad `encoding-type` was missing or ambiguous; layout was inferred from group children or dataset shape. |
 | `SkippedUnsKey { key, reason }` | `read_uns` / `read_uns_entry` | `uns` entry was unrepresentable; skipped under default `strict_uns=false`. `strict_uns=true` turns this into an error on the first occurrence. |
-| `UnsupportedUnsDataframeColumn { key, column, reason }` | `read_uns_dataframe_group` | One column of a `uns` pandas DataFrame had no lossless `uns` encoding (anndata's `nullable-integer` / `nullable-boolean` / `nullable-string-array`, or an unrecognised column encoding) and was left out of the reconstructed frame. The index, the column order and every other column are intact. |
+| `UnsupportedUnsDataframeColumn { key, column, reason }` | `read_uns_dataframe_group` | **Ingest.** One column of a `uns` pandas DataFrame had no lossless `uns` encoding (anndata's `nullable-integer` / `nullable-boolean` / `nullable-string-array`, or an unrecognised column encoding) and was left out of the reconstructed frame. The index, the column order and every other column are intact. Under `strict_uns=true` this is an error instead. |
+| `UnsExportedAsRawEnvelope { key, reason }` | `try_write_uns_dataframe` | **Export.** A `uns` pandas DataFrame had no faithful h5ad dataframe spelling and was written as a raw `__scx_type__` envelope subgroup. No data is lost; anndata reads it back as a nested dict rather than a DataFrame. |
 | `FlattenedUnsSparse { key, format }` | `read_uns_entry` | A `uns` scipy-sparse matrix (`encoding-type` = `"csr_matrix"` / `"csc_matrix"` / `"coo_matrix"`) was preserved as a nested dict of `data` / `indices` / `indptr` arrays rather than reconstructed as a sparse matrix — the sparse type tag is not restored on read. Data is not dropped. |
 | `SkippedColumn { group, name, reason }` | `read_dataframe_group` | An obs/var column could not be read (unsupported encoding-type or read error); skipped. The column is absent from output. |
 | `SkippedObsm { name, reason }` | `read_obsm_at` | An obsm/varm embedding could not be read; skipped. |
@@ -571,7 +572,7 @@ is lost *silently*.
 | `adata.raw` | preserved² | `DroppedRaw` / `DroppedRawOnWrite` (some modes) | Round-trips raw counts bit-exact with the wider var axis through **both** write doors — `h5ad → scx → h5ad` and in-memory `pyscx.from_anndata` / `pyscx.write`. ² Dropped, with a warning, under obs-filtered `to_anndata`, backed mode, and deletion-vector-active files, on the SCX-backed / lazy-`X` rewrite, and under reorder-on-convert (`--sort-by` / `--group-by`). See [`adata.raw`](#adataraw). |
 | `adata.raw.varm` | dropped | `DroppedRawVarm` | Raw's own var-axis mappings have no section in the raw family (`raw/X` + `raw/var` only). `raw.X` and `raw.var` are unaffected. |
 | `uns` scalars / 1-D & 2-D numeric arrays / nested dicts | preserved | — | Round-trip through the `uns` JSON representation. |
-| `uns` pandas **DataFrame** | preserved | `UnsupportedUnsDataframeColumn` (per column) | Round-trips as a `pd.DataFrame` through both write doors, index name, column order and per-column dtypes (ordered categoricals included) intact — see [`uns` serialization](#uns-serialization). A column in one of anndata's nullable encodings is the one exception: it is left out and warned about. |
+| `uns` pandas **DataFrame** | preserved | `UnsupportedUnsDataframeColumn` / `UnsExportedAsRawEnvelope` | Round-trips as a `pd.DataFrame` through both write doors, index name, column order and per-column dtypes (ordered categoricals included) intact — see [`uns` serialization](#uns-serialization). Two exceptions, each warned: on **ingest** a column in one of anndata's nullable encodings is left out (an error under `strict_uns=true`); on **export** a frame h5ad cannot spell is demoted whole to a raw envelope subgroup, losing no data but arriving at anndata as a dict. |
 | `uns` scipy-sparse matrix | lossy | `FlattenedUnsSparse` | Preserved as a nested dict of `data` / `indices` / `indptr` arrays; **not** reconstructed as a sparse matrix (the sparse type tag is not restored). Data survives. |
 | `uns` pickled / unrepresentable entry | dropped | `SkippedUnsKey` | Skipped under default `strict_uns=false`; `strict_uns=true` errors on the first occurrence. |
 | `uns` nested more than 60 levels deep | rejected / truncated | `SkippedUnsKey` (h5ad ingest) | See [`uns` nesting depth](#uns-nesting-depth). Writing raises `ValueError` naming the key path; an over-deep h5ad `/uns` group chain is truncated at the limit with the warning (or errors under `strict_uns=true`). |
@@ -2367,12 +2368,17 @@ column. One documented gap: a frame with **zero columns** reads back with
 pandas' default empty `RangeIndex` for `columns`, since with no names there is
 nothing for a columns dtype to travel on.
 
-The **h5ad export** of a frame goes through the same nine column encodings obs
-and var use, so its dtypes are the h5ad ones, not the SCX ones: `int8` /
-`uint16` widen to `int32` and `float16` to `float32`, and `bool` / `object`
-columns land in anndata's nullable encodings (read back as pandas `boolean` /
-`string`-like). The SCX file and every pyscx read keep the exact original
-dtype; only the h5ad copy widens.
+The **h5ad export** writes the anndata dataframe group directly and keeps every
+column's exact dtype — an `int8` column lands as `int8`, a `bool` as a plain
+`bool` dataset. It is all-or-nothing per frame: if any column has no faithful
+anndata spelling (a `null` inside an object column, which a plain h5ad string
+dataset cannot hold; boolean categories, which no reader here takes back; a
+column whose name equals the index's, which would collide in the group), the
+whole frame is written as a raw `__scx_type__` envelope subgroup instead, with
+an `uns_exported_as_raw_envelope` warning. **No data is lost** in that case —
+anndata reads the subgroup as a nested dict — but DataFrame consumers will not
+recognise it. Declining beats dropping the column, because the fallback keeps
+what dropping would discard.
 Non-finite raw Python `float` scalars (`nan` / `±inf`) are preserved under
 `"tagged"` via the `scalar` envelope (they read back as `np.float64`, a
 `float` subclass, bit-exact) and raise under `"plain"`, whose contract is

@@ -860,8 +860,13 @@ fn to_h5ad(
         export_obs_keep_mask: obs_mask_owned,
         export_min_counts: min_counts,
     };
+    // The sink is built out here, not inside `py.detach`, so its warnings can
+    // be bridged to Python afterwards. Export warnings used to reach only the
+    // Rust `log` backend — invisible in a default Python session — so an
+    // `UnsupportedExportColumn` or a demoted `uns` DataFrame was silent to the
+    // caller. Matches what `from_h5ad` has always done.
+    let mut sink = scx_convert::WarningSink::log();
     py.detach(|| -> Result<(), scx_convert::ConvertError> {
-        let mut sink = scx_convert::WarningSink::log();
         match (modality, stream) {
             (Some(name), true) => scx_convert::scx_modality_to_h5ad_streaming(
                 Path::new(path),
@@ -882,7 +887,8 @@ fn to_h5ad(
             (None, false) => scx_convert::scx_to_h5ad(Path::new(path), Path::new(out), &mut sink),
         }
     })
-    .map_err(convert_to_pyerr)
+    .map_err(convert_to_pyerr)?;
+    convert::emit_python_warnings(py, &sink)
 }
 
 /// Convert a multimodal SCX file to h5mu, streaming by default.
@@ -911,15 +917,17 @@ fn to_h5mu(
         memory_budget: memory_budget_bytes,
         ..Default::default()
     };
+    // Sink outside `py.detach` so its warnings reach Python — see `to_h5ad`.
+    let mut sink = scx_convert::WarningSink::log();
     py.detach(|| -> Result<(), scx_convert::ConvertError> {
-        let mut sink = scx_convert::WarningSink::log();
         if stream {
             scx_convert::scx_to_h5mu_streaming(Path::new(path), Path::new(out), &opts, &mut sink)
         } else {
             scx_convert::scx_to_h5mu(Path::new(path), Path::new(out), &mut sink)
         }
     })
-    .map_err(convert_to_pyerr)
+    .map_err(convert_to_pyerr)?;
+    convert::emit_python_warnings(py, &sink)
 }
 
 /// Convert a `mudata.MuData` object to a multimodal SCX v2 file.
