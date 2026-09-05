@@ -2372,8 +2372,10 @@ The **h5ad export** writes the anndata dataframe group directly and keeps every
 column's exact dtype — an `int8` column lands as `int8`, a `bool` as a plain
 `bool` dataset. It is all-or-nothing per frame: if any column has no faithful
 anndata spelling (a `null` inside an object column, which a plain h5ad string
-dataset cannot hold; boolean categories, which no reader here takes back; a
-column whose name equals the index's, which would collide in the group), the
+dataset cannot hold; a column whose name equals the index's, which would
+collide in the group; a name HDF5 cannot carry as a single member — empty,
+`.`, `..`, or containing `/`; a non-string index name, which h5ad has nowhere
+to put), the
 whole frame is written as a raw `__scx_type__` envelope subgroup instead, with
 an `uns_exported_as_raw_envelope` warning. **No data is lost** in that case —
 anndata reads the subgroup as a nested dict — but DataFrame consumers will not

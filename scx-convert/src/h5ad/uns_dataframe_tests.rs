@@ -82,7 +82,7 @@ fn frame_envelope_writes_an_anndata_dataframe_group() {
 
     let env = frame_envelope();
     assert!(
-        try_write_uns_dataframe(&uns, "tbl", env.as_object().unwrap(), &mut sink).unwrap(),
+        try_write_uns_dataframe(&uns, "tbl", "tbl", env.as_object().unwrap(), &mut sink).unwrap(),
         "a well-formed frame envelope must be claimed by this arm"
     );
 
@@ -153,7 +153,9 @@ fn narrow_and_boolean_columns_keep_their_plain_dtypes() {
         "flag": {"__scx_type__": "ndarray", "dtype": "|b1", "shape": [2],
                  "encoding": "base64le", "data": "AQA="},          // [true, false]
     });
-    assert!(try_write_uns_dataframe(&uns, "tbl", env.as_object().unwrap(), &mut sink).unwrap());
+    assert!(
+        try_write_uns_dataframe(&uns, "tbl", "tbl", env.as_object().unwrap(), &mut sink).unwrap()
+    );
 
     let g = uns.group("tbl").unwrap();
     assert_eq!(g.dataset("i8").unwrap().read_raw::<i8>().unwrap(), [1, -2]);
@@ -178,7 +180,9 @@ fn unnamed_index_lands_as_underscore_index() {
 
     let mut env = frame_envelope();
     env["index"]["name"] = serde_json::Value::Null;
-    assert!(try_write_uns_dataframe(&uns, "tbl", env.as_object().unwrap(), &mut sink).unwrap());
+    assert!(
+        try_write_uns_dataframe(&uns, "tbl", "tbl", env.as_object().unwrap(), &mut sink).unwrap()
+    );
 
     let g = uns.group("tbl").unwrap();
     assert_eq!(read_str_attr(&g, "_index"), "_index");
@@ -199,7 +203,9 @@ fn column_less_frame_writes_an_empty_column_order() {
     let mut env = frame_envelope();
     env["columns"] = serde_json::json!([]);
     env["data"] = serde_json::json!({});
-    assert!(try_write_uns_dataframe(&uns, "tbl", env.as_object().unwrap(), &mut sink).unwrap());
+    assert!(
+        try_write_uns_dataframe(&uns, "tbl", "tbl", env.as_object().unwrap(), &mut sink).unwrap()
+    );
 
     let g = uns.group("tbl").unwrap();
     assert_eq!(g.attr("column-order").unwrap().shape(), [0]);
@@ -250,14 +256,40 @@ fn unwritable_frames_decline_write_nothing_and_warn() {
                       "encoding": "json", "data": ["x", null]},
             });
         }),
-        // `read_categorical_values` cannot read boolean categories back, so
-        // writing them would produce a file this workspace cannot ingest.
-        ("boolean_categorical", |e| {
-            e["columns"] = serde_json::json!(["grade"]);
-            e["data"]["grade"]["categories"] = serde_json::json!({
-                "__scx_type__": "ndarray", "dtype": "|b1", "shape": [2],
-                "encoding": "base64le", "data": "AAE=",
-            });
+        // Names HDF5 cannot carry as a single member. `/` would resolve as a
+        // *path* and escape the group; the rest are rejected identifiers that
+        // aborted the export from inside `create_dataset`. All legal pandas.
+        ("slash_in_column", |e| {
+            e["columns"] = serde_json::json!(["/evil"]);
+            e["data"] = serde_json::json!({"/evil": {
+                "__scx_type__": "ndarray", "dtype": "<f8", "shape": [2],
+                "encoding": "base64le", "data": "AAAAAAAA8D8AAAAAAAAAQA==",
+            }});
+        }),
+        ("empty_column_name", |e| {
+            e["columns"] = serde_json::json!([""]);
+            e["data"] = serde_json::json!({"": {
+                "__scx_type__": "ndarray", "dtype": "<f8", "shape": [2],
+                "encoding": "base64le", "data": "AAAAAAAA8D8AAAAAAAAAQA==",
+            }});
+        }),
+        ("dot_column_name", |e| {
+            e["columns"] = serde_json::json!(["."]);
+            e["data"] = serde_json::json!({".": {
+                "__scx_type__": "ndarray", "dtype": "<f8", "shape": [2],
+                "encoding": "base64le", "data": "AAAAAAAA8D8AAAAAAAAAQA==",
+            }});
+        }),
+        // `data` is a JSON object, so it holds one payload for a repeated name;
+        // the second write would collide on a dataset that already exists.
+        // pyscx refuses duplicates, but an envelope from elsewhere can carry them.
+        ("duplicate_columns", |e| {
+            e["columns"] = serde_json::json!(["zed", "zed"]);
+        }),
+        // `df.index.name = 7` is legal pandas; h5ad stores the index name as an
+        // HDF5 member name, so it used to be silently erased to `_index`.
+        ("non_string_index_name", |e| {
+            e["index"]["name"] = serde_json::json!(7);
         }),
         // Legal pandas (`df.index.name == "zed"` with a "zed" column); both
         // land in one HDF5 group, so the names would collide.
@@ -271,7 +303,8 @@ fn unwritable_frames_decline_write_nothing_and_warn() {
         mutate(&mut env);
         let mut sink = WarningSink::log();
         assert!(
-            !try_write_uns_dataframe(&uns, name, env.as_object().unwrap(), &mut sink).unwrap(),
+            !try_write_uns_dataframe(&uns, name, name, env.as_object().unwrap(), &mut sink)
+                .unwrap(),
             "'{name}' must decline, not claim the value"
         );
         assert!(
@@ -287,4 +320,115 @@ fn unwritable_frames_decline_write_nothing_and_warn() {
             assert_eq!(warned, Some(1), "'{name}' must warn that it was demoted");
         }
     }
+}
+
+/// Every child dataset carries anndata's element encoding.
+///
+/// The obs/var writer this module replaced stamped these; the first direct
+/// revision did not, and anndata read the result under eight
+/// `OldFormatWarning`s. Found by codex.
+#[test]
+fn every_child_dataset_is_stamped_with_its_anndata_encoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_f, uns) = fresh_uns(&dir, "stamped");
+    let mut sink = WarningSink::log();
+
+    let env = frame_envelope();
+    assert!(
+        try_write_uns_dataframe(&uns, "tbl", "tbl", env.as_object().unwrap(), &mut sink).unwrap()
+    );
+    let g = uns.group("tbl").unwrap();
+
+    let enc = |ds: &hdf5::Dataset| -> String {
+        ds.attr("encoding-type")
+            .unwrap()
+            .read_scalar::<hdf5::types::VarLenUnicode>()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(enc(&g.dataset("row").unwrap()), "string-array");
+    assert_eq!(enc(&g.dataset("zed").unwrap()), "array");
+    assert_eq!(enc(&g.dataset("abe").unwrap()), "array");
+    let cat = g.group("grade").unwrap();
+    assert_eq!(enc(&cat.dataset("codes").unwrap()), "array");
+    assert_eq!(enc(&cat.dataset("categories").unwrap()), "string-array");
+}
+
+/// Boolean categories are written, not declined.
+///
+/// An earlier revision refused them, on the premise that no reader here takes
+/// them back. That premise was false — `uns_dataframe_column_envelope` has a
+/// `TypeDescriptor::Boolean` arm — so the guard was a false refusal that
+/// demoted a valid frame to a dict. Found by codex.
+#[test]
+fn boolean_categories_are_written_rather_than_declined() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_f, uns) = fresh_uns(&dir, "boolcat");
+    let mut sink = WarningSink::log();
+
+    let mut env = frame_envelope();
+    env["columns"] = serde_json::json!(["grade"]);
+    env["data"]["grade"]["categories"] = serde_json::json!({
+        "__scx_type__": "ndarray", "dtype": "|b1", "shape": [2],
+        "encoding": "base64le", "data": "AAE=",   // [false, true]
+    });
+    assert!(
+        try_write_uns_dataframe(&uns, "tbl", "tbl", env.as_object().unwrap(), &mut sink).unwrap(),
+        "a boolean categorical is representable and must not be declined"
+    );
+
+    let cat = uns.group("tbl").unwrap().group("grade").unwrap();
+    assert_eq!(
+        cat.dataset("categories")
+            .unwrap()
+            .read_raw::<bool>()
+            .unwrap(),
+        [false, true]
+    );
+    assert!(cat.attr("ordered").unwrap().read_scalar::<bool>().unwrap());
+}
+
+/// A demoted nested frame names the path it actually sits at.
+///
+/// The warning carried the local group name, so a demoted
+/// `uns['rank_genes_groups']['pts']` reported as `uns['pts']` — a key the user
+/// cannot find. Ingest was fixed for this in round 1; export was not. Found by
+/// codex.
+#[test]
+fn the_demotion_warning_names_the_full_key_path() {
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_f, uns) = fresh_uns(&dir, "nested");
+    // Captured through the handler, because `WarningSink` counts categories and
+    // does not retain messages.
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    let mut sink = WarningSink::with_handler(move |w| {
+        sink_seen.lock().unwrap().push(format!("{w}"));
+    });
+
+    let mut env = frame_envelope();
+    env["columns"] = serde_json::json!(["zed", "zed"]); // any decline reason
+    assert!(!try_write_uns_dataframe(
+        &uns,
+        "pts",
+        "rank_genes_groups/pts",
+        env.as_object().unwrap(),
+        &mut sink
+    )
+    .unwrap());
+
+    let messages = seen.lock().unwrap();
+    assert_eq!(messages.len(), 1, "expected exactly one warning");
+    assert!(
+        messages[0].contains("uns['rank_genes_groups/pts']"),
+        "warning must name the full path, got: {}",
+        messages[0]
+    );
+    assert!(
+        !messages[0].contains("uns['pts']"),
+        "warning must not name only the leaf: {}",
+        messages[0]
+    );
 }

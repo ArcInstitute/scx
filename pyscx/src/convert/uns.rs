@@ -716,61 +716,6 @@ pub(crate) fn ndarray_bytes_le<'py>(arr: &Bound<'py, PyAny>, key_path: &str) -> 
     Ok(pybytes.as_bytes().to_vec())
 }
 
-/// The `categorical` envelope: `{"__scx_type__": "categorical", "categories":
-/// <ndarray envelope>, "codes": <ndarray envelope>, "ordered": <bool>}`.
-///
-/// Shared by the standalone `pd.Categorical` arm of [`encode_pandas_tagged`]
-/// and by a categorical *column* of a `pandas.DataFrame`, so the two cannot
-/// drift into emitting different shapes for the same Python object.
-fn categorical_envelope<'py>(
-    obj: &Bound<'py, PyAny>,
-    key_path: &str,
-    ctx: &mut UnsWriteCtx<'_, 'py>,
-) -> PyResult<serde_json::Value> {
-    let categories = obj.getattr("categories")?;
-    let codes = obj.getattr("codes")?;
-    let ordered: bool = obj.getattr("ordered")?.extract()?;
-    let cats_inner = encode_ndarray_tagged(
-        &categories.call_method1("to_numpy", ())?,
-        &format!("{key_path}.categories"),
-        ctx,
-    )?;
-    let codes_inner = encode_ndarray_tagged(&codes, &format!("{key_path}.codes"), ctx)?;
-    let mut env = serde_json::Map::new();
-    env.insert(
-        SCX_TYPE_KEY.to_string(),
-        serde_json::Value::String("categorical".to_string()),
-    );
-    env.insert("categories".to_string(), cats_inner);
-    env.insert("codes".to_string(), codes_inner);
-    env.insert("ordered".to_string(), serde_json::Value::Bool(ordered));
-    Ok(serde_json::Value::Object(env))
-}
-
-/// The `pandas.Index` envelope: `{"__scx_type__": "pandas.Index", "name":
-/// <scalar>, "data": <ndarray envelope>}`.
-///
-/// Shared by the standalone `pd.Index` arm of [`encode_pandas_tagged`] and by
-/// the `index` slot of a `pandas.DataFrame` envelope, which is why a frame
-/// needs no separate spelling for its index name.
-fn index_envelope<'py>(
-    obj: &Bound<'py, PyAny>,
-    key_path: &str,
-    ctx: &mut UnsWriteCtx<'_, 'py>,
-) -> PyResult<serde_json::Value> {
-    let name = obj.getattr("name")?;
-    let values = obj.call_method1("to_numpy", ())?;
-    let inner = encode_ndarray_tagged(&values, key_path, ctx)?;
-    let mut env = serde_json::Map::new();
-    env.insert(
-        SCX_TYPE_KEY.to_string(),
-        serde_json::Value::String("pandas.Index".to_string()),
-    );
-    env.insert("name".to_string(), pyobj_to_simple_json(&name, key_path)?);
-    env.insert("data".to_string(), inner);
-    Ok(serde_json::Value::Object(env))
-}
-
 /// Refuse a pandas extension dtype (`Int64`, `boolean`, `string[python]`,
 /// `datetime64[ns, tz]`, …) on a frame's index or one of its columns.
 ///
@@ -827,6 +772,67 @@ fn reject_bytes_elements(values: &Bound<'_, PyAny>, key_path: &str) -> PyResult<
         }
     }
     Ok(())
+}
+
+/// The `categorical` envelope: `{"__scx_type__": "categorical", "categories":
+/// <ndarray envelope>, "codes": <ndarray envelope>, "ordered": <bool>}`.
+///
+/// Shared by the standalone `pd.Categorical` arm of [`encode_pandas_tagged`]
+/// and by a categorical *column* of a `pandas.DataFrame`, so the two cannot
+/// drift into emitting different shapes for the same Python object.
+fn categorical_envelope<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let categories = obj.getattr("categories")?;
+    let codes = obj.getattr("codes")?;
+    let ordered: bool = obj.getattr("ordered")?.extract()?;
+    let cat_values = categories.call_method1("to_numpy", ())?;
+    let cats_path = format!("{key_path}.categories");
+    // Categories take the same object-array walker as any other string array,
+    // so bytes categories would silently become str here too.
+    reject_bytes_elements(&cat_values, &cats_path)?;
+    let cats_inner = encode_ndarray_tagged(&cat_values, &cats_path, ctx)?;
+    let codes_inner = encode_ndarray_tagged(&codes, &format!("{key_path}.codes"), ctx)?;
+    let mut env = serde_json::Map::new();
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("categorical".to_string()),
+    );
+    env.insert("categories".to_string(), cats_inner);
+    env.insert("codes".to_string(), codes_inner);
+    env.insert("ordered".to_string(), serde_json::Value::Bool(ordered));
+    Ok(serde_json::Value::Object(env))
+}
+
+/// The `pandas.Index` envelope: `{"__scx_type__": "pandas.Index", "name":
+/// <scalar>, "data": <ndarray envelope>}`.
+///
+/// Shared by the standalone `pd.Index` arm of [`encode_pandas_tagged`] and by
+/// the `index` slot of a `pandas.DataFrame` envelope, which is why a frame
+/// needs no separate spelling for its index name.
+fn index_envelope<'py>(
+    obj: &Bound<'py, PyAny>,
+    key_path: &str,
+    ctx: &mut UnsWriteCtx<'_, 'py>,
+) -> PyResult<serde_json::Value> {
+    let name = obj.getattr("name")?;
+    let values = obj.call_method1("to_numpy", ())?;
+    // Same refusal the frame's columns get. An object index of `bytes` is not
+    // an extension dtype, so the dtype check above does not see it, and the
+    // string walker below would UTF-8-*decode* it: `[b"r0", b"r1"]` read back
+    // as `["r0", "r1"]`.
+    reject_bytes_elements(&values, key_path)?;
+    let inner = encode_ndarray_tagged(&values, key_path, ctx)?;
+    let mut env = serde_json::Map::new();
+    env.insert(
+        SCX_TYPE_KEY.to_string(),
+        serde_json::Value::String("pandas.Index".to_string()),
+    );
+    env.insert("name".to_string(), pyobj_to_simple_json(&name, key_path)?);
+    env.insert("data".to_string(), inner);
+    Ok(serde_json::Value::Object(env))
 }
 
 /// Encode a `pandas.DataFrame` as a tagged envelope:

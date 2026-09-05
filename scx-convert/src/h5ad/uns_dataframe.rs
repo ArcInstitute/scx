@@ -101,16 +101,16 @@ impl UnsColumn {
                         "uns DataFrame column '{name}': dtype {dtype} passed preflight but could not be written"
                     )));
                 }
-                Ok(())
+                stamp_encoding(&group.dataset(name)?, "array")
             }
             UnsColumn::Strings(values) => {
                 let data: Vec<VarLenUnicode> = values.iter().map(|s| vlu(s)).collect();
-                group
+                let ds = group
                     .new_dataset::<VarLenUnicode>()
                     .shape([data.len()])
-                    .create(name)?
-                    .write(&data)?;
-                Ok(())
+                    .create(name)?;
+                ds.write(&data)?;
+                stamp_encoding(&ds, "string-array")
             }
             UnsColumn::Categorical {
                 categories,
@@ -119,10 +119,12 @@ impl UnsColumn {
             } => {
                 let cat = group.create_group(name)?;
                 categories.write(&cat, "categories")?;
-                cat.new_dataset::<i32>()
+                let codes_ds = cat
+                    .new_dataset::<i32>()
                     .shape([codes.len()])
-                    .create("codes")?
-                    .write(codes)?;
+                    .create("codes")?;
+                codes_ds.write(codes)?;
+                stamp_encoding(&codes_ds, "array")?;
                 cat.new_attr::<VarLenUnicode>()
                     .create("encoding-type")?
                     .write_scalar(&vlu("categorical"))?;
@@ -136,6 +138,23 @@ impl UnsColumn {
             }
         }
     }
+}
+
+/// Stamp anndata's element encoding on a child dataset.
+///
+/// anndata's own writer marks every dataframe child (`array` for numeric, bool
+/// and categorical codes; `string-array` for strings and string categories),
+/// and reads an unmarked one only under an `OldFormatWarning`. The first
+/// direct-writer revision omitted these and produced eight such warnings per
+/// file — the obs/var writer this module replaced had been stamping them.
+fn stamp_encoding(ds: &hdf5::Dataset, encoding: &str) -> Result<(), ConvertError> {
+    ds.new_attr::<VarLenUnicode>()
+        .create("encoding-type")?
+        .write_scalar(&vlu(encoding))?;
+    ds.new_attr::<VarLenUnicode>()
+        .create("encoding-version")?
+        .write_scalar(&vlu("0.2.0"))?;
+    Ok(())
 }
 
 /// Byte width from a numpy `dtype.str` label (`"<f8"` -> 8, `"|b1"` -> 1).
@@ -159,6 +178,7 @@ fn dtype_width(dtype: &str) -> Option<usize> {
 pub(super) fn try_write_uns_dataframe(
     parent: &hdf5::Group,
     name: &str,
+    key_path: &str,
     map: &serde_json::Map<String, serde_json::Value>,
     sink: &mut WarningSink,
 ) -> Result<bool, ConvertError> {
@@ -169,7 +189,10 @@ pub(super) fn try_write_uns_dataframe(
         Ok(f) => f,
         Err(reason) => {
             sink.emit(ConvertWarning::UnsExportedAsRawEnvelope {
-                key: name.to_string(),
+                // The accumulated path, not the local group name: a demoted
+                // `uns['rank_genes_groups']['pts']` reported as `uns['pts']`
+                // names a key the user cannot find.
+                key: key_path.to_string(),
                 reason,
             });
             return Ok(false);
@@ -243,20 +266,48 @@ fn decode_frame(map: &serde_json::Map<String, serde_json::Value>) -> Result<Deco
         .get("data")
         .ok_or_else(|| "index envelope has no `data`".to_string())
         .and_then(|v| decode_column(v).map_err(|e| format!("index: {e}")))?;
+    // `null` (and a missing key) is genuinely unnamed and becomes anndata's
+    // `_index`. A *non-string* scalar name — `df.index.name = 7`, legal pandas —
+    // used to fall into that same arm and be silently erased; anndata itself
+    // refuses such a name, so declining says so instead of quietly dropping it.
     let index_name = match index_env.get("name") {
         Some(serde_json::Value::String(s)) => s.clone(),
-        _ => "_index".to_string(),
+        None | Some(serde_json::Value::Null) => "_index".to_string(),
+        Some(other) => {
+            return Err(format!(
+                "index name {other} is not a string, and h5ad stores the index name as an \
+                 HDF5 member name"
+            ))
+        }
     };
+    if !super::uns::is_safe_hdf5_member_name(&index_name) {
+        return Err(format!(
+            "index name {index_name:?} is not usable as an HDF5 member name"
+        ));
+    }
 
     let n_rows = index
         .len()
         .ok_or_else(|| "index length is not determinable".to_string())?;
 
     let mut columns: Vec<(String, UnsColumn)> = Vec::with_capacity(col_names.len());
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for col in col_names {
         let serde_json::Value::String(col) = col else {
             return Err("a `columns` entry is not a string".into());
         };
+        if !super::uns::is_safe_hdf5_member_name(col) {
+            return Err(format!(
+                "column name {col:?} is not usable as an HDF5 member name"
+            ));
+        }
+        // pyscx's encoder refuses duplicates, so a frame it wrote cannot get
+        // here — but an envelope from anywhere else can, and `data` is a JSON
+        // object, so the second copy would `create_dataset` a name that already
+        // exists and abort the export from inside the write.
+        if !seen.insert(col.as_str()) {
+            return Err(format!("duplicate column name {col:?} in `columns`"));
+        }
         // A column named like the index would collide on `create_dataset` and
         // abort the export. Legal in pandas (`df.index.name == "gene"` with a
         // "gene" column), so decline rather than fail.
@@ -302,9 +353,14 @@ fn decode_column(value: &serde_json::Value) -> Result<UnsColumn, String> {
 ///
 /// Codes widen to `i32`, which is the width anndata's `codes` dataset uses and
 /// the one this crate's reader expects; a negative code is pandas' null and is
-/// preserved. Boolean categories are refused: `read_categorical_values` cannot
-/// read them back, so writing them would produce a file this workspace could
-/// not ingest.
+/// preserved.
+///
+/// Boolean categories are **not** refused. An earlier revision did, on the
+/// premise that no reader here takes them back — measured false: this crate's
+/// `uns_dataframe_column_envelope` has a `TypeDescriptor::Boolean` arm, and an
+/// anndata-written ordered boolean categorical ingests with its values,
+/// categories and `ordered` bit intact. The guard was a false refusal that
+/// demoted a valid frame.
 fn decode_categorical(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<UnsColumn, String> {
@@ -312,11 +368,6 @@ fn decode_categorical(
         return Err("categorical envelope is missing `categories` or `codes`".into());
     };
     let categories = decode_column(categories).map_err(|e| format!("categories: {e}"))?;
-    if let UnsColumn::Numeric { dtype, .. } = &categories {
-        if dtype.chars().nth(1) == Some('b') {
-            return Err("boolean categories have no readable anndata categorical form".into());
-        }
-    }
 
     let codes = match decode_column(codes)? {
         UnsColumn::Numeric { dtype, bytes } => codes_to_i32(&dtype, &bytes)

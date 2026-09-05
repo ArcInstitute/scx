@@ -2097,8 +2097,10 @@ fn uns_categorical_envelope(group: &hdf5::Group) -> Result<serde_json::Value, Co
 /// A column whose encoding has no lossless pyscx spelling (`nullable-integer`,
 /// `nullable-boolean`, `nullable-string-array`, or anything unrecognised) is
 /// omitted and reported through
-/// [`ConvertWarning::UnsupportedUnsDataframeColumn`], mirroring what the export
-/// side already does with a column it cannot write.
+/// [`ConvertWarning::UnsupportedUnsDataframeColumn`] — or, under `strict_uns`,
+/// returned as an error. Dropping per column is an *ingest* rule: unlike the
+/// export side, there is no fallback here that keeps both the column and the
+/// frame.
 fn read_uns_dataframe_group(
     group: &hdf5::Group,
     key: &str,
@@ -2144,6 +2146,19 @@ fn read_uns_dataframe_group(
     // every sibling column as a dict — before X6 that was the only behaviour,
     // and losing the whole `uns` key would be a strict regression on it.
     let Ok(index_ds) = group.dataset(&index_name) else {
+        if strict_uns {
+            return Err(ConvertError::Other(format!(
+                "uns['{key}'] is an encoding-type=\"dataframe\" group with no '{index_name}' \
+                 index dataset (strict_uns=true)"
+            )));
+        }
+        sink.emit(ConvertWarning::UnsupportedUnsDataframeColumn {
+            key: key.to_string(),
+            column: index_name.clone(),
+            reason: "index dataset is missing; the group was read as a plain dict instead \
+                     of a DataFrame"
+                .to_string(),
+        });
         return Ok(None);
     };
     let mut index_env = serde_json::Map::new();
@@ -2151,10 +2166,14 @@ fn read_uns_dataframe_group(
         SCX_UNS_TYPE_KEY.to_string(),
         serde_json::Value::String("pandas.Index".to_string()),
     );
-    // pandas' own placeholder names for an unnamed index are not names.
+    // `_index` is anndata's on-disk spelling for an *unnamed* index, and what
+    // the export side writes for one, so it decodes back to `None`. Anything
+    // else is a real name — `__index_level_0__` included: it is a pandas/Arrow
+    // sentinel, not an anndata one, and a file that carries it explicitly means
+    // it.
     index_env.insert(
         "name".to_string(),
-        if index_name == "_index" || index_name == "__index_level_0__" {
+        if index_name == "_index" {
             serde_json::Value::Null
         } else {
             serde_json::Value::String(index_name.clone())

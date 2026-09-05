@@ -337,15 +337,19 @@ def test_uns_dataframe_export_declines_loudly_and_keeps_the_data(tmp_dir):
         return path
 
     cases = {
-        "boolcat": pd.DataFrame(
-            {"bc": pd.Categorical([True, False], categories=[False, True], ordered=True)},
-            index=["r0", "r1"],
-        ),
-        # Legal pandas: index.name equals a column name.
+        # Legal pandas: index.name equals a column name. Both land in one HDF5
+        # group, so the names would collide.
         "collide": pd.DataFrame({"gene": [1.0, 2.0]}, index=pd.Index(["r0", "r1"], name="gene")),
         # A null in an object column: a plain h5ad string dataset has no null.
         "nullstr": pd.DataFrame({"s": np.array(["x", None], dtype=object)}, index=["r0", "r1"]),
+        # `df.index.name = 7` is legal pandas, but h5ad stores the index name as
+        # an HDF5 member name — it used to be silently erased to `_index`.
+        "intname": pd.DataFrame({"a": [1.0, 2.0]}, index=pd.Index(["r0", "r1"], name=7)),
     }
+
+    # NB: a *boolean categorical* is deliberately not here. Round 1 declined it
+    # on a false premise; it round-trips, and
+    # `test_boolean_categorical_round_trips_through_h5ad` pins that.
 
     for name, df in cases.items():
         scx_path = frame_file(df, name)
@@ -357,3 +361,180 @@ def test_uns_dataframe_export_declines_loudly_and_keeps_the_data(tmp_dir):
         # The fallback is what makes declining better than dropping a column:
         # every part of the envelope is still on disk.
         assert {"__scx_type__", "index", "columns", "data"} <= set(got), name
+
+
+def test_hdf5_unsafe_uns_keys_are_skipped_not_escaped_or_aborted(tmp_dir):
+    """A `uns` key HDF5 cannot carry must not corrupt the file or kill the export.
+
+    HDF5 resolves a name containing `/` as a **path**: `uns["/evil"]` wrote a
+    dataset at the file *root*, outside `/uns` entirely, and `to_h5ad` reported
+    success — `anndata.read_h5ad` then could not open the file at all. `""`,
+    `"."` and `".."` are rejected identifiers and aborted the whole export from
+    inside `create_dataset`. All four are legal Python dict keys.
+
+    Pre-existing and general: reproducible with no DataFrame anywhere, which is
+    why the guard lives on the generic `uns` walk. Found by codex via a
+    DataFrame column.
+    """
+    import anndata
+    import h5py
+    import scipy.sparse as sp
+
+    import pyscx
+
+    def make(uns):
+        a = anndata.AnnData(
+            X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32)),
+            obs=pd.DataFrame(index=["c0", "c1"]),
+            var=pd.DataFrame(index=["g0", "g1"]),
+        )
+        a.uns.update(uns)
+        return a
+
+    col = lambda name: pd.DataFrame({name: [1.0, 2.0]}, index=["r0", "r1"])  # noqa: E731
+    cases = {
+        "plain_slash": {"/evil": 1.0},
+        "nested_slash": {"grp": {"/evil": 1.0}},
+        "plain_empty": {"": 1.0},
+        "plain_dot": {".": 1.0},
+        "df_slash": {"t": col("/evil")},
+        "df_empty": {"t": col("")},
+        "df_dot": {"t": col(".")},
+    }
+
+    for name, uns in cases.items():
+        scx_path = str(tmp_dir / f"{name}.scx")
+        pyscx.from_anndata(make(uns), scx_path)
+        out = str(tmp_dir / f"{name}.h5ad")
+        with pytest.warns(UserWarning, match="skipped_uns_key"):
+            pyscx.to_h5ad(scx_path, out)
+        with h5py.File(out) as f:
+            assert sorted(f.keys()) == ["X", "obs", "uns", "var"], (
+                f"{name}: an unsafe key escaped to the file root"
+            )
+        # The point of the guard: the file is still a readable h5ad.
+        anndata.read_h5ad(out)
+
+
+def test_uns_dataframe_bytes_index_and_categories_are_refused(tmp_dir):
+    """The bytes refusal has to cover every object-array path in a frame.
+
+    Round 1 wired it into the column loop only, so an index or a categorical's
+    categories still reached the string walker and were UTF-8-*decoded* —
+    `[b"r0", b"r1"]` read back as `["r0", "r1"]`. Found by codex and Cursor
+    Agent (index) and Antigravity (categories).
+    """
+    import anndata
+    import scipy.sparse as sp
+
+    import pyscx
+
+    def make(df):
+        return anndata.AnnData(
+            X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32)),
+            obs=pd.DataFrame(index=["c0", "c1"]),
+            var=pd.DataFrame(index=["g0", "g1"]),
+            uns={"t": df},
+        )
+
+    with pytest.raises(ValueError, match=r"bytes are not JSON-serializable"):
+        pyscx.from_anndata(
+            make(pd.DataFrame({"a": [1, 2]}, index=pd.Index([b"r0", b"r1"]))),
+            str(tmp_dir / "bidx.scx"),
+        )
+    with pytest.raises(ValueError, match=r"bytes are not JSON-serializable"):
+        pyscx.from_anndata(
+            make(pd.DataFrame({"c": pd.Categorical([b"a", b"b"])}, index=["r0", "r1"])),
+            str(tmp_dir / "bcat.scx"),
+        )
+
+
+def test_boolean_categorical_round_trips_through_h5ad(tmp_dir):
+    """Boolean categories are representable, so they must not be declined.
+
+    Round 1 refused them on the premise that no reader here takes them back.
+    Measured false: an anndata-written ordered boolean categorical ingests with
+    values, categories and `ordered` intact, so the guard was a false refusal
+    that demoted a valid frame to a dict. Found by codex.
+    """
+    import anndata
+    import scipy.sparse as sp
+
+    import pyscx
+
+    df = pd.DataFrame(
+        {"bc": pd.Categorical([True, False], categories=[False, True], ordered=True)},
+        index=pd.Index(["r0", "r1"], name="row"),
+    )
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32)),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1"]),
+        uns={"t": df},
+    )
+
+    # scx -> h5ad: a real DataFrame, not a demoted dict.
+    scx_path = str(tmp_dir / "boolcat.scx")
+    pyscx.from_anndata(adata, scx_path)
+    out = str(tmp_dir / "boolcat.h5ad")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no demotion warning
+        pyscx.to_h5ad(scx_path, out)
+    got = anndata.read_h5ad(out).uns["t"]
+    assert isinstance(got, pd.DataFrame)
+    assert list(got["bc"]) == [True, False]
+    assert list(got["bc"].cat.categories) == [False, True]
+    assert got["bc"].cat.ordered is True
+
+    # h5ad -> scx, from anndata's own writer: the direction the false premise
+    # claimed was impossible.
+    native = str(tmp_dir / "boolcat_native.h5ad")
+    adata.write_h5ad(native)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pyscx.from_h5ad(native, str(tmp_dir / "boolcat_native.scx"))
+    back = pyscx.open(str(tmp_dir / "boolcat_native.scx")).to_anndata().uns["t"]
+    pd.testing.assert_frame_equal(back, df, check_dtype=True)
+
+
+def test_exported_dataframe_children_carry_anndata_encoding_metadata(tmp_dir):
+    """anndata reads an unmarked element only under an `OldFormatWarning`.
+
+    The obs/var writer this arm replaced stamped every child; the direct writer
+    initially did not, producing eight such warnings per file. Found by codex.
+    The three that remain on any exported file (`/obs/_index`, `/uns`,
+    `/var/_index`) are pre-existing and unrelated to frames — this asserts the
+    frame's own children, not the file total.
+    """
+    import anndata
+    import h5py
+    import scipy.sparse as sp
+
+    import pyscx
+
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(np.zeros((2, 2), dtype=np.float32)),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1"]),
+        uns={"t": _uns_frame()},
+    )
+    scx_path = str(tmp_dir / "stamped.scx")
+    pyscx.from_anndata(adata, scx_path)
+    out = str(tmp_dir / "stamped.h5ad")
+    pyscx.to_h5ad(scx_path, out)
+
+    with h5py.File(out) as f:
+        group = f["uns/t"]
+        assert group.attrs["encoding-type"] == "dataframe"
+        for key in group:
+            assert "encoding-type" in group[key].attrs, f"uns/t/{key} is unmarked"
+        for key in group["grade"]:
+            assert "encoding-type" in group["grade"][key].attrs, f"grade/{key} unmarked"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        anndata.read_h5ad(out)
+    offenders = [
+        str(w.message) for w in caught if "OldFormat" in type(w.message).__name__
+    ]
+    assert not [m for m in offenders if "/uns/t" in m], offenders

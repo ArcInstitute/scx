@@ -9,7 +9,7 @@
 
 use crate::h5_write_util::vlu;
 use crate::pipeline::ConvertError;
-use crate::warnings::WarningSink;
+use crate::warnings::{ConvertWarning, WarningSink};
 use hdf5::types::VarLenUnicode;
 use scx_format_io::SERDE_JSON_MAX_NESTING;
 
@@ -19,7 +19,7 @@ pub(crate) fn write_uns_entries_at(
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     // `group` is the `/uns` group: container level 1.
-    write_uns_entries(group, value, 1, sink)
+    write_uns_entries(group, value, 1, "", sink)
 }
 
 /// `depth` counts container levels already committed to, `group` included, so
@@ -31,18 +31,40 @@ pub(crate) fn write_uns_entries_at(
 /// consumer to the producer cap instead would make an SCX file written before
 /// that cap existed — legal, readable, up to 127 levels — suddenly
 /// unexportable.
+/// `key_path` is the accumulated `uns` path of `group` ("" at the root), so a
+/// warning about a nested value can name where it actually sits — the ingest
+/// walk carries the same thing for the same reason.
 pub(super) fn write_uns_entries(
     group: &hdf5::Group,
     value: &serde_json::Value,
     depth: usize,
+    key_path: &str,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
     if let serde_json::Value::Object(map) = value {
         for (key, val) in map {
-            write_uns_value(group, key, val, depth, sink)?;
+            let child = if key_path.is_empty() {
+                key.clone()
+            } else {
+                format!("{key_path}/{key}")
+            };
+            write_uns_value(group, key, val, depth, &child, sink)?;
         }
     }
     Ok(())
+}
+
+/// True if `name` is usable as a single HDF5 member name.
+///
+/// Load-bearing, not defensive. HDF5 resolves a name containing `/` as a
+/// *path*: a column called `"/evil"` wrote a dataset at the file **root**,
+/// leaving `uns/t` holding only its index, and the export reported success —
+/// anndata then failed to open the file at all. `""`, `"."` and `".."` are
+/// rejected identifiers and aborted the whole export from inside
+/// `create_dataset`, after the group existed. Every one of those is a legal
+/// pandas column name, so they are declined at preflight instead.
+pub(super) fn is_safe_hdf5_member_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
 }
 
 fn write_uns_value(
@@ -50,8 +72,29 @@ fn write_uns_value(
     name: &str,
     value: &serde_json::Value,
     depth: usize,
+    key_path: &str,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
+    // Before anything is created. HDF5 resolves a name containing `/` as a
+    // *path*, so a `uns` key like `"/evil"` wrote a dataset at the file root —
+    // outside `/uns` entirely — and the export reported success while anndata
+    // could no longer open the file. `""` / `"."` / `".."` are rejected
+    // identifiers and aborted the whole export from inside `create_dataset`.
+    // All of them are legal Python dict keys, so they are skipped with a
+    // warning rather than allowed to corrupt or abort. Pre-existing: reachable
+    // with no DataFrame involved (`uns = {"/evil": 1.0}`), which is why the
+    // guard lives on the generic walk rather than only on the frame arm.
+    if !is_safe_hdf5_member_name(name) {
+        sink.emit(ConvertWarning::SkippedUnsKey {
+            key: if key_path.is_empty() {
+                name.to_string()
+            } else {
+                key_path.to_string()
+            },
+            reason: format!("{name:?} is not usable as an HDF5 member name"),
+        });
+        return Ok(());
+    }
     match value {
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -161,11 +204,11 @@ fn write_uns_value(
                     max_depth: SERDE_JSON_MAX_NESTING,
                 });
             }
-            if !super::uns_dataframe::try_write_uns_dataframe(group, name, map, sink)?
+            if !super::uns_dataframe::try_write_uns_dataframe(group, name, key_path, map, sink)?
                 && !try_write_uns_envelope(group, name, map)?
             {
                 let subgroup = group.create_group(name)?;
-                write_uns_entries(&subgroup, value, depth + 1, sink)?;
+                write_uns_entries(&subgroup, value, depth + 1, key_path, sink)?;
             }
         }
         serde_json::Value::Null => {
@@ -486,7 +529,7 @@ mod uns_envelope_tests {
         // (1) missing `data` → fallback.
         let mut no_data = env(&[]);
         no_data.as_object_mut().unwrap().remove("data");
-        write_uns_value(&uns, "no_data", &no_data, 1, &mut sink).unwrap();
+        write_uns_value(&uns, "no_data", &no_data, 1, "no_data", &mut sink).unwrap();
 
         // (2) non-integer shape dim → fallback (no wrong-rank dataset).
         write_uns_value(
@@ -494,6 +537,7 @@ mod uns_envelope_tests {
             "bad_shape",
             &env(&[("shape", serde_json::json!([2, null]))]),
             1,
+            "bad_shape",
             &mut sink,
         )
         .unwrap();
@@ -504,6 +548,7 @@ mod uns_envelope_tests {
             "big_endian",
             &env(&[("dtype", ">f8".into())]),
             1,
+            "big_endian",
             &mut sink,
         )
         .unwrap();
@@ -521,7 +566,7 @@ mod uns_envelope_tests {
 
         // A well-formed little-endian envelope still writes a real dataset
         // (not a subgroup), confirming the fallback is scoped to the bad cases.
-        write_uns_value(&uns, "good", &env(&[]), 1, &mut sink).unwrap();
+        write_uns_value(&uns, "good", &env(&[]), 1, "good", &mut sink).unwrap();
         assert!(
             uns.dataset("good").is_ok(),
             "valid envelope should write a dataset"

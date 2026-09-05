@@ -498,7 +498,10 @@ Headlines:
   pandas DataFrame is preserved as a real `pd.DataFrame` — index name, column
   order and per-column dtypes intact — except for a column in one of anndata's
   nullable encodings, which is left out with an
-  `UnsupportedUnsDataframeColumn` warning.
+  `UnsupportedUnsDataframeColumn` warning (an error under `strict_uns=true`).
+  Going the other way, a frame h5ad cannot spell is written whole as a raw
+  envelope subgroup with an `UnsExportedAsRawEnvelope` warning: anndata reads
+  it as a dict, but no value is lost.
 - **Dropped (warns):** CSC/unsupported `obsp`/`varp`, pickled `uns` objects,
   obs/var columns with an unsupported dtype, and
   **compound/structured `uns` arrays** — notably scanpy's `rank_genes_groups`
