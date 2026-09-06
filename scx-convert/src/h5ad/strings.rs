@@ -41,25 +41,29 @@ use crate::pipeline::ConvertError;
 /// `TypeDescriptor::VarLenAscii` datasets are read as `VarLenUnicode`, which
 /// is what the pre-existing reader did and what HDF5's own conversion path
 /// supports.
-pub(crate) trait H5Str {
+trait H5Str {
     fn as_str(&self) -> &str;
 }
 
 impl H5Str for hdf5::types::VarLenUnicode {
     fn as_str(&self) -> &str {
-        self.as_str()
+        // Fully qualified deliberately. The inherent method wins resolution
+        // over the trait one, so the short form is not a recursion -- but it
+        // reads like one, and it would become one if hdf5 ever moved `as_str`
+        // onto a trait.
+        hdf5::types::VarLenUnicode::as_str(self)
     }
 }
 
 impl<const N: usize> H5Str for hdf5::types::FixedAscii<N> {
     fn as_str(&self) -> &str {
-        self.as_str()
+        hdf5::types::FixedAscii::<N>::as_str(self)
     }
 }
 
 impl<const N: usize> H5Str for hdf5::types::FixedUnicode<N> {
     fn as_str(&self) -> &str {
-        self.as_str()
+        hdf5::types::FixedUnicode::<N>::as_str(self)
     }
 }
 
@@ -68,7 +72,7 @@ impl<const N: usize> H5Str for hdf5::types::FixedUnicode<N> {
 /// `Config` is whatever the sink needs that the traversal cannot know — the
 /// validity mask, for [`MaskedUtf8Sink`]. It is `Copy` so the width ladder can
 /// hand it to whichever arm fires without an `Option` dance.
-pub(crate) trait StringSink: Sized {
+trait StringSink: Sized {
     type Config: Copy;
 
     /// Called exactly once, with the exact element count and the exact total
@@ -80,10 +84,10 @@ pub(crate) trait StringSink: Sized {
 
 /// Collects owned `String`s — the shape the five non-Arrow consumers need
 /// (barcode-join hashmap keys, `serde_json::Value::String`).
-pub(crate) struct OwnedSink(Vec<String>);
+struct OwnedSink(Vec<String>);
 
 impl OwnedSink {
-    pub(crate) fn into_vec(self) -> Vec<String> {
+    fn into_vec(self) -> Vec<String> {
         self.0
     }
 }
@@ -108,10 +112,10 @@ impl StringSink for OwnedSink {
 /// yields `nulls: None` exactly as `from_iter_values` does. **Never call
 /// `append_null` / `append_option(None)` here** — an all-valid null buffer is
 /// not the same array.
-pub(crate) struct Utf8Sink(GenericStringBuilder<i32>);
+struct Utf8Sink(GenericStringBuilder<i32>);
 
 impl Utf8Sink {
-    pub(crate) fn finish(mut self) -> StringArray {
+    fn finish(mut self) -> StringArray {
         self.0.finish()
     }
 }
@@ -131,14 +135,14 @@ impl StringSink for Utf8Sink {
 /// Builds an Arrow `Utf8` array carrying validity bits from an external mask,
 /// for anndata's `nullable-string-array` group form (`mask[i] == true` ⇔
 /// null, null positions filled with `""` on disk).
-pub(crate) struct MaskedUtf8Sink<'a> {
+struct MaskedUtf8Sink<'a> {
     builder: GenericStringBuilder<i32>,
     mask: &'a [bool],
     next: usize,
 }
 
 impl MaskedUtf8Sink<'_> {
-    pub(crate) fn finish(mut self) -> StringArray {
+    fn finish(mut self) -> StringArray {
         self.builder.finish()
     }
 }
@@ -192,6 +196,10 @@ where
 /// The ladder is keyed on **bytes**, which is why a multi-byte UTF-8 fixture
 /// belongs in its tests: a `FixedUnicode(24)` column holding eight
 /// three-byte characters is a 24-byte dataset, not an 8-byte one.
+/// Expanded only inside [`read_string_dataset_as`], and it reads that
+/// function's `S` and `ConvertError` from the expansion site rather than
+/// taking them as macro arguments -- which is why it is defined here and not
+/// exported.
 macro_rules! fixed_width_ladder {
     ($ds:expr, $config:expr, $ty:ident, $size:expr, $($cap:literal),+) => {{
         let size = $size;
@@ -215,7 +223,7 @@ macro_rules! fixed_width_ladder {
 ///
 /// This is the single funnel: all four string flavours, one width ladder, one
 /// pass over the data. Consumers pick their shape by picking a sink.
-pub(crate) fn read_string_dataset_as<S: StringSink>(
+fn read_string_dataset_as<S: StringSink>(
     ds: &hdf5::Dataset,
     config: S::Config,
 ) -> Result<S, ConvertError> {
