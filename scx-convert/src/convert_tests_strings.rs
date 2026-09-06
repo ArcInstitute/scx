@@ -116,17 +116,27 @@ fn obs_group(file: &hdf5::File, n_rows: usize, columns: &[&str]) -> hdf5::Group 
     obs
 }
 
-/// The construction this change replaces, kept as the oracle:
-/// `Vec<String>` → `Vec<&str>` → `StringArray::from_iter_values`.
-fn legacy_plain(ds: &hdf5::Dataset) -> StringArray {
-    let strings = read_string_dataset(ds).unwrap();
+/// The pre-change read, transcribed. **Deliberately does not call anything in
+/// `h5ad/strings.rs`** — an oracle routed through the new traversal would agree
+/// with a shared extraction bug in it. This is `read_1d::<VarLenUnicode>()` +
+/// `to_vec()` + `Vec<String>` + `Vec<&str>` + `from_iter_values`, exactly as
+/// `read_string_dataset` and `read_column_to_arrow` did before this change.
+///
+/// Var-length only, which is all the pre-change code supported on the two
+/// group readers; the fixed-width arms are pinned by literal expectations
+/// instead (see `fixed_width_categories_and_nullable_values_read_at_all`).
+fn legacy_plain_varlen(ds: &hdf5::Dataset) -> StringArray {
+    let data: Vec<VarLenUnicode> = ds.read_1d().unwrap().to_vec();
+    let strings: Vec<String> = data.iter().map(|s| s.to_string()).collect();
     StringArray::from(strings.iter().map(|s| s.as_str()).collect::<Vec<_>>())
 }
 
-/// The nullable-group construction this change replaces:
-/// `Vec<String>` → `Vec<Option<&str>>` → `FromIterator<Option<_>>`.
-fn legacy_masked(ds: &hdf5::Dataset, mask: &[bool]) -> StringArray {
-    let strings = read_string_dataset(ds).unwrap();
+/// The pre-change nullable-group read, transcribed, on the same terms:
+/// `read_1d` + `to_vec()` + `Vec<String>` + `Vec<Option<&str>>` +
+/// `FromIterator<Option<_>>`, touching nothing in `h5ad/strings.rs`.
+fn legacy_masked_varlen(ds: &hdf5::Dataset, mask: &[bool]) -> StringArray {
+    let data: Vec<VarLenUnicode> = ds.read_1d().unwrap().to_vec();
+    let strings: Vec<String> = data.iter().map(|s| s.to_string()).collect();
     StringArray::from(
         strings
             .iter()
@@ -134,6 +144,60 @@ fn legacy_masked(ds: &hdf5::Dataset, mask: &[bool]) -> StringArray {
             .map(|(v, m)| if *m { None } else { Some(v.as_str()) })
             .collect::<Vec<Option<&str>>>(),
     )
+}
+
+/// How much slack a "was this buffer pre-sized?" assertion must allow.
+///
+/// `MutableBuffer::with_capacity` rounds up to 64-byte alignment, and
+/// `Buffer::capacity()` reports the allocation, not the request — neither is a
+/// promised Arrow contract. So these assertions bound the capacity rather than
+/// equating it: exact equality holds on arrow 58 today but would break on an
+/// allocator or `finish()` change with no production defect. **If Arrow's
+/// rounding changes, widen this constant — do not delete the assertion**: it is
+/// the only observable trace that the value buffer was allocated once instead
+/// of grown by doubling, and it is what the two route pins rest on.
+const CAPACITY_SLACK: usize = 64;
+
+/// The value buffer holds exactly the payload (a real Arrow contract) and was
+/// allocated once rather than grown (bounded, see [`CAPACITY_SLACK`]).
+///
+/// **Carries its own premise check**, and that is not decoration. When this
+/// assertion was first loosened from an exact equality to a bounded one, both
+/// route pins silently stopped discriminating: their fixtures were small
+/// enough (39 B and ~50 B of payload) that a buffer grown by doubling landed
+/// at 64 B, *inside* the slack. The tests still passed with the call sites
+/// routed back to the old construction. So the helper now builds a
+/// deliberately grown buffer over the same payload and refuses to run unless
+/// that one actually violates the bound.
+///
+/// For null-free arrays only — it reconstructs the payload via `value(i)`.
+fn assert_value_buffer_was_pre_sized(got: &StringArray, payload: usize, what: &str) {
+    assert_eq!(
+        got.value_data().len(),
+        payload,
+        "{what}: value buffer length must equal the payload"
+    );
+
+    let mut grown = arrow::array::GenericStringBuilder::<i32>::with_capacity(got.len(), 0);
+    for i in 0..got.len() {
+        grown.append_value(got.value(i));
+    }
+    let grown_capacity = grown.finish().to_data().buffers()[1].capacity();
+    assert!(
+        grown_capacity > payload + CAPACITY_SLACK,
+        "{what}: PREMISE FAILED — a buffer grown from zero over this payload \
+         reaches only {grown_capacity} against payload {payload} \
+         (+{CAPACITY_SLACK} slack), so the assertion below cannot tell a \
+         pre-sized buffer from a grown one. Enlarge the fixture."
+    );
+
+    let capacity = got.to_data().buffers()[1].capacity();
+    assert!(
+        capacity >= payload && capacity <= payload + CAPACITY_SLACK,
+        "{what}: value buffer capacity {capacity} is not one allocation of \
+         payload {payload} (+{CAPACITY_SLACK} slack) — it was grown, so this \
+         array did not come through the pre-sized builder"
+    );
 }
 
 fn assert_arrays_identical(got: &StringArray, want: &StringArray, what: &str) {
@@ -164,7 +228,7 @@ fn a_plain_string_column_is_byte_identical_to_the_vec_str_construction() {
     let ds = file.dataset("note").unwrap();
 
     let got = read_string_array(&ds).unwrap();
-    let want = legacy_plain(&ds);
+    let want = legacy_plain_varlen(&ds);
 
     assert_arrays_identical(&got, &want, "plain string column");
     // Not implied by the comparison: `from_iter_values` emits no validity
@@ -201,7 +265,7 @@ fn a_nullable_string_group_is_byte_identical_and_a_null_does_not_advance_the_off
     let ds = file.dataset("values").unwrap();
 
     let got = read_masked_string_array(&ds, &mask, "note").unwrap();
-    let want = legacy_masked(&ds, &mask);
+    let want = legacy_masked_varlen(&ds, &mask);
 
     assert_arrays_identical(&got, &want, "nullable-string group");
     assert!(got.is_null(0) && got.is_null(3) && got.is_null(5));
@@ -223,7 +287,7 @@ fn a_nullable_string_group_is_byte_identical_and_a_null_does_not_advance_the_off
 }
 
 #[test]
-fn the_utf8_value_buffer_is_pre_sized_to_the_exact_payload() {
+fn the_utf8_value_buffer_is_allocated_once_not_grown() {
     // The only observable trace of the allocation win. `with_capacity(items,
     // bytes)` lands the value buffer at exactly the payload size; the
     // construction this replaces starts at `MutableBuffer::new(0)` and grows
@@ -254,19 +318,17 @@ fn the_utf8_value_buffer_is_pre_sized_to_the_exact_payload() {
 
     let payload: usize = refs.iter().map(|s| s.len()).sum();
     let got = read_string_array(&ds).unwrap();
-    let capacity = got.to_data().buffers()[1].capacity();
+    assert_value_buffer_was_pre_sized(&got, payload, "pre-sized value buffer");
 
-    assert_eq!(
-        capacity, payload,
-        "the value buffer must be allocated once, at exactly the payload size"
-    );
-    // Premise: the construction being replaced really does overshoot, so the
-    // assertion above is discriminating rather than trivially true.
-    let legacy_capacity = legacy_plain(&ds).to_data().buffers()[1].capacity();
+    // Premise: the construction being replaced really does overshoot the
+    // bound, so the assertion above is discriminating rather than trivially
+    // true.
+    let legacy_capacity = legacy_plain_varlen(&ds).to_data().buffers()[1].capacity();
     assert!(
-        legacy_capacity > payload,
+        legacy_capacity > payload + CAPACITY_SLACK,
         "premise failed: the `Vec<&str>` construction no longer overshoots \
-         ({legacy_capacity} vs {payload}), so this test proves nothing"
+         ({legacy_capacity} vs {payload}+{CAPACITY_SLACK}), so this test \
+         proves nothing"
     );
 }
 
@@ -452,9 +514,13 @@ fn tenx_obs_and_var_strings_survive_the_builder_route() {
     // `test_tenx_to_scx` asserts the shape and that nnz > 0; nothing asserted
     // that the barcodes and feature columns arrive intact, which is what the
     // two routed sites in `tenx_read.rs` produce.
+    // Sized, not arbitrary: the route pins need a payload a doubling-grown
+    // buffer overshoots (see `assert_value_buffer_was_pre_sized`). 5 x 3 left
+    // both pins vacuous.
+    let (n_cells, n_genes) = (3000usize, 800usize);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.h5");
-    create_test_tenx_h5(&path, 5, 3);
+    create_test_tenx_h5(&path, n_cells, n_genes);
     let file = hdf5::File::open(&path).unwrap();
     let data = crate::tenx_read::read_tenx_h5(&file).unwrap();
 
@@ -465,18 +531,14 @@ fn tenx_obs_and_var_strings_survive_the_builder_route() {
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(bc.len(), 5);
+    assert_eq!(bc.len(), n_cells);
     assert!(bc.nulls().is_none(), "10x barcodes are non-nullable");
     let first = bc.value(0).to_string();
     assert!(!first.is_empty(), "barcode 0 must not be empty: {first:?}");
-    // ROUTE PIN, as in the obs test above: values cannot distinguish the two
-    // constructions, buffer capacity can.
+    // ROUTE PIN, as in the obs test below: values cannot distinguish the two
+    // constructions, the value buffer's allocation can.
     let payload: usize = (0..bc.len()).map(|i| bc.value(i).len()).sum();
-    assert_eq!(
-        bc.to_data().buffers()[1].capacity(),
-        payload,
-        "10x barcodes did not come through the pre-sized builder"
-    );
+    assert_value_buffer_was_pre_sized(bc, payload, "10x barcodes");
 
     for col in ["id", "name", "feature_type"] {
         let arr = data
@@ -486,18 +548,14 @@ fn tenx_obs_and_var_strings_survive_the_builder_route() {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap_or_else(|| panic!("var column {col} is not Utf8"));
-        assert_eq!(arr.len(), 3, "{col} length");
+        assert_eq!(arr.len(), n_genes, "{col} length");
         assert!(arr.nulls().is_none(), "{col} must carry no validity buffer");
         assert!(
             (0..arr.len()).all(|i| !arr.value(i).is_empty()),
             "{col} has an empty value"
         );
         let payload: usize = (0..arr.len()).map(|i| arr.value(i).len()).sum();
-        assert_eq!(
-            arr.to_data().buffers()[1].capacity(),
-            payload,
-            "var column {col} did not come through the pre-sized builder"
-        );
+        assert_value_buffer_was_pre_sized(arr, payload, &format!("10x var column {col}"));
     }
 }
 
@@ -505,10 +563,15 @@ fn tenx_obs_and_var_strings_survive_the_builder_route() {
 fn a_multi_byte_obs_column_round_trips_through_read_dataframe_group() {
     // End-to-end through the public reader, on the payload no fixture in this
     // crate carried before this test.
+    // TRICKY repeated: the values are what matters, but the route pin below
+    // needs a payload large enough that a doubling-grown buffer overshoots the
+    // slack. At `TRICKY.len()` rows it does not, and the pin was silently
+    // vacuous until the helper's premise check caught it.
+    let rows: Vec<&str> = TRICKY.iter().copied().cycle().take(3000).collect();
     let dir = tempfile::tempdir().unwrap();
     let file = hdf5::File::create(dir.path().join("obs.h5")).unwrap();
-    let obs = obs_group(&file, TRICKY.len(), &["note"]);
-    varlen_ds(&obs, "note", TRICKY);
+    let obs = obs_group(&file, rows.len(), &["note"]);
+    varlen_ds(&obs, "note", &rows);
 
     let batch = read_dataframe_group(&file, "obs", &mut WarningSink::log()).unwrap();
     let note = batch
@@ -519,20 +582,16 @@ fn a_multi_byte_obs_column_round_trips_through_read_dataframe_group() {
         .unwrap();
     assert_eq!(
         (0..note.len()).map(|i| note.value(i)).collect::<Vec<_>>(),
-        TRICKY
+        rows
     );
     assert!(note.nulls().is_none());
 
     // ROUTE PIN. Every value assertion above passes against the four-copy
-    // construction too -- byte-identical output is the point of the change,
-    // so nothing about the *values* can tell which path ran. The value
-    // buffer's capacity can: the builder allocates it once at the exact
-    // payload size, the `Vec<&str>` construction grows it by doubling. This
-    // is the only assertion that fails if the site is routed back.
-    let payload: usize = TRICKY.iter().map(|s| s.len()).sum();
-    assert_eq!(
-        note.to_data().buffers()[1].capacity(),
-        payload,
-        "the obs string column did not come through the pre-sized builder"
-    );
+    // construction too -- byte-identical output is the point of the change, so
+    // nothing about the *values* can tell which path ran. The value buffer's
+    // allocation can: the builder sizes it once, the `Vec<&str>` construction
+    // grows it by doubling. This is the only assertion that fails if the site
+    // is routed back.
+    let payload: usize = rows.iter().map(|s| s.len()).sum();
+    assert_value_buffer_was_pre_sized(note, payload, "obs string column");
 }

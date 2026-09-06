@@ -1,4 +1,4 @@
-//! One traversal for every HDF5 string dataset on the ingest side.
+//! One traversal for every **1-D** HDF5 string *dataset* on the ingest side.
 //!
 //! HDF5 has four string flavours and producers pick freely: h5py/anndata emit
 //! variable-length UTF-8, while PyTables `create_carray` (CellRanger and
@@ -15,20 +15,46 @@
 //! var-length, so a PyTables-written `categories` or nullable `values` dataset
 //! failed with exactly the error the ladder exists to prevent. Routing every
 //! consumer through one traversal is what makes that class of drift
-//! unrepresentable.
+//! unrepresentable *on this shape*.
 //!
-//! The traversal reads each element **by reference** and pushes it into a
+//! # What is NOT on this traversal
+//!
+//! Only 1-D dataset reads are. Three ingest paths still read strings directly
+//! and are unchanged by this module:
+//!
+//! * **rank-0 (scalar) dataset reads** — `read.rs`'s `uns` scalar arm and
+//!   `cellbender.rs`'s metadata scalars both do `read_scalar::<VarLenUnicode>()`.
+//!   They cannot share this code: the const-generic dispatch here is over
+//!   `read_1d`, and a scalar needs `read_scalar`. **The same fixed-width drift
+//!   lives there** — `uns`'s `FixedUnicode(_) | FixedAscii(_)` scalar arm reads
+//!   the body as `VarLenUnicode`, exactly as the two dataset readers did before
+//!   this change. A scalar companion to this dispatcher would close it.
+//! * **1-D `uns` string arrays**, which route their var-length arm through
+//!   [`read_string_dataset`] but have no fixed-width arm at all, so a
+//!   fixed-width `uns` array is still rejected rather than read.
+//! * **attribute** reads — `encoding-type`, `column-order`, the legacy
+//!   `categories` attribute form. Attributes are not datasets and anndata only
+//!   ever writes var-length there.
+//!
+//! # How it works
+//!
+//! The traversal reads each element **by reference** and appends it to a
 //! [`StringSink`]. Nothing clones the HDF5 element type: `VarLenUnicode` is a
 //! bare `{ ptr }` with a deep-copying `Clone`, so the `read_1d()?.to_vec()`
 //! this replaces paid a `malloc` + `memcpy` per row before `to_string()` paid
 //! a second one. A sink that appends into an Arrow buffer copies the payload
 //! **once**.
 //!
-//! Sinks are constructed by the traversal, not by the caller, because the
-//! exact item count *and* the exact payload byte count are only known after
-//! the read — and passing both is what lets [`Utf8Sink`] pre-size its value
-//! buffer instead of growing it by doubling the way
-//! `StringArray::from_iter_values` does.
+//! There is **one HDF5 read and one copy of the payload** into the
+//! destination — not one traversal of the resident elements. A sink that wants
+//! its buffer pre-sized needs the exact byte total, and that is its own walk
+//! over the (already decoded) array; [`StringSink::WANTS_BYTE_COUNT`] is how a
+//! sink that cannot use it declines to pay for it.
+//!
+//! Sinks are constructed by the traversal, not by the caller, because the item
+//! count and the byte total are only known after the read — and passing both
+//! is what lets the Arrow builders pre-size their value buffer instead of
+//! growing it by doubling the way `StringArray::from_iter_values` does.
 //!
 //! # What this does and does not buy, measured
 //!
@@ -49,106 +75,73 @@ use hdf5::types::TypeDescriptor;
 
 use crate::pipeline::ConvertError;
 
-/// An HDF5 string element that can be borrowed as `&str`.
-///
-/// Implemented for the three read types the ladder below uses.
-/// `TypeDescriptor::VarLenAscii` datasets are read as `VarLenUnicode`, which
-/// is what the pre-existing reader did and what HDF5's own conversion path
-/// supports.
-trait H5Str {
-    fn as_str(&self) -> &str;
-}
-
-impl H5Str for hdf5::types::VarLenUnicode {
-    fn as_str(&self) -> &str {
-        // Fully qualified deliberately. The inherent method wins resolution
-        // over the trait one, so the short form is not a recursion -- but it
-        // reads like one, and it would become one if hdf5 ever moved `as_str`
-        // onto a trait.
-        hdf5::types::VarLenUnicode::as_str(self)
-    }
-}
-
-impl<const N: usize> H5Str for hdf5::types::FixedAscii<N> {
-    fn as_str(&self) -> &str {
-        hdf5::types::FixedAscii::<N>::as_str(self)
-    }
-}
-
-impl<const N: usize> H5Str for hdf5::types::FixedUnicode<N> {
-    fn as_str(&self) -> &str {
-        hdf5::types::FixedUnicode::<N>::as_str(self)
-    }
-}
-
 /// Where a string traversal puts what it reads.
 ///
 /// `Config` is whatever the sink needs that the traversal cannot know — the
 /// validity mask, for [`MaskedUtf8Sink`]. It is `Copy` so the width ladder can
-/// hand it to whichever arm fires without an `Option` dance.
+/// hand it to whichever arm fires without an `Option` dance. The alternative,
+/// dropping the associated type and passing `Option<&[bool]>` to every sink,
+/// puts a parameter two of the three impls must accept and ignore;
+/// `Config = ()` says "needs nothing" once, in the impl where it is true.
+///
+/// The method names deliberately avoid `Vec`'s and `GenericByteBuilder`'s
+/// inherent ones: both of those *are* sinks here, and a name collision would
+/// be resolved silently in favour of the inherent method.
 trait StringSink: Sized {
     type Config: Copy;
 
-    /// Called exactly once, with the exact element count and the exact total
-    /// payload size in bytes, before any [`StringSink::push`].
-    fn with_capacity(config: Self::Config, items: usize, bytes: usize) -> Self;
+    /// Whether this sink uses the payload byte count. Summing it costs a walk
+    /// over the resident elements, and the owned path has nothing to spend it
+    /// on — a `Vec<String>` allocates per element regardless.
+    const WANTS_BYTE_COUNT: bool = true;
 
-    fn push(&mut self, s: &str);
+    /// Called exactly once, with the exact element count and — when
+    /// [`StringSink::WANTS_BYTE_COUNT`] — the exact payload size in bytes,
+    /// before any [`StringSink::append`].
+    fn with_reservation(config: Self::Config, items: usize, bytes: usize) -> Self;
+
+    fn append(&mut self, s: &str);
 }
 
-/// Collects owned `String`s — the shape the five non-Arrow consumers need
-/// (barcode-join hashmap keys, `serde_json::Value::String`).
-struct OwnedSink(Vec<String>);
-
-impl OwnedSink {
-    fn into_vec(self) -> Vec<String> {
-        self.0
-    }
-}
-
-impl StringSink for OwnedSink {
+/// Owned `String`s — the shape the five non-Arrow consumers need (barcode-join
+/// hashmap keys, `serde_json::Value::String`).
+impl StringSink for Vec<String> {
     type Config = ();
+    const WANTS_BYTE_COUNT: bool = false;
 
-    fn with_capacity(_config: (), items: usize, _bytes: usize) -> Self {
-        Self(Vec::with_capacity(items))
+    fn with_reservation(_config: (), items: usize, _bytes: usize) -> Self {
+        Vec::with_capacity(items)
     }
 
-    fn push(&mut self, s: &str) {
-        self.0.push(s.to_owned());
+    fn append(&mut self, s: &str) {
+        self.push(s.to_owned());
     }
 }
 
-/// Builds an Arrow `Utf8` array with **no validity buffer**.
+/// An Arrow `Utf8` array with **no validity buffer**.
 ///
 /// Byte-identity with the `StringArray::from(Vec<&str>)` this replaces rests
 /// on `NullBufferBuilder` allocating lazily: `append_value` records a `true`
 /// bit but the buffer materialises only once a `false` arrives, so `finish()`
-/// yields `nulls: None` exactly as `from_iter_values` does. **Never call
-/// `append_null` / `append_option(None)` here** — an all-valid null buffer is
-/// not the same array.
-struct Utf8Sink(GenericStringBuilder<i32>);
-
-impl Utf8Sink {
-    fn finish(mut self) -> StringArray {
-        self.0.finish()
-    }
-}
-
-impl StringSink for Utf8Sink {
+/// yields `nulls: None` exactly as `from_iter_values` does. **Nothing on this
+/// path may call `append_null` / `append_option(None)`** — an all-valid null
+/// buffer is not the same array. That is why the masked form below is a
+/// separate sink rather than a flag on this one.
+impl StringSink for GenericStringBuilder<i32> {
     type Config = ();
 
-    fn with_capacity(_config: (), items: usize, bytes: usize) -> Self {
-        Self(GenericStringBuilder::with_capacity(items, bytes))
+    fn with_reservation(_config: (), items: usize, bytes: usize) -> Self {
+        GenericStringBuilder::with_capacity(items, bytes)
     }
 
-    fn push(&mut self, s: &str) {
-        self.0.append_value(s);
+    fn append(&mut self, s: &str) {
+        self.append_value(s);
     }
 }
 
-/// Builds an Arrow `Utf8` array carrying validity bits from an external mask,
-/// for anndata's `nullable-string-array` group form (`mask[i] == true` ⇔
-/// null, null positions filled with `""` on disk).
+/// An Arrow `Utf8` array carrying validity bits from an external mask, for
+/// anndata's `nullable-string-array` group form (`mask[i] == true` ⇔ null,
+/// null positions filled with `""` on disk).
 struct MaskedUtf8Sink<'a> {
     builder: GenericStringBuilder<i32>,
     mask: &'a [bool],
@@ -164,7 +157,7 @@ impl MaskedUtf8Sink<'_> {
 impl<'a> StringSink for MaskedUtf8Sink<'a> {
     type Config = &'a [bool];
 
-    fn with_capacity(mask: &'a [bool], items: usize, bytes: usize) -> Self {
+    fn with_reservation(mask: &'a [bool], items: usize, bytes: usize) -> Self {
         Self {
             builder: GenericStringBuilder::with_capacity(items, bytes),
             mask,
@@ -172,7 +165,7 @@ impl<'a> StringSink for MaskedUtf8Sink<'a> {
         }
     }
 
-    fn push(&mut self, s: &str) {
+    fn append(&mut self, s: &str) {
         // `mask` length is checked against the dataset shape before the read,
         // so an out-of-range index here is unreachable; treat a short mask as
         // "not null" rather than panicking in a reader.
@@ -188,16 +181,23 @@ impl<'a> StringSink for MaskedUtf8Sink<'a> {
 
 /// Read the whole dataset as `T`, size the sink from what came back, then
 /// append every element by reference.
+///
+/// `AsRef<str>` is implemented for all four `hdf5::types` string types, so no
+/// local adapter trait is needed.
 fn read_and_drain<T, S>(ds: &hdf5::Dataset, config: S::Config) -> Result<S, ConvertError>
 where
-    T: hdf5::H5Type + H5Str,
+    T: hdf5::H5Type + AsRef<str>,
     S: StringSink,
 {
     let array = ds.read_1d::<T>()?;
-    let bytes: usize = array.iter().map(|s| s.as_str().len()).sum();
-    let mut sink = S::with_capacity(config, array.len(), bytes);
+    let bytes: usize = if S::WANTS_BYTE_COUNT {
+        array.iter().map(|s| s.as_ref().len()).sum()
+    } else {
+        0
+    };
+    let mut sink = S::with_reservation(config, array.len(), bytes);
     for s in array.iter() {
-        sink.push(s.as_str());
+        sink.append(s.as_ref());
     }
     Ok(sink)
 }
@@ -208,11 +208,12 @@ where
 /// reading an `N`-byte dataset as `M >= N` is lossless.
 ///
 /// The ladder is keyed on **bytes**, which is why a multi-byte UTF-8 fixture
-/// belongs in its tests: a `FixedUnicode(24)` column holding eight
-/// three-byte characters is a 24-byte dataset, not an 8-byte one.
+/// belongs in its tests: a `FixedUnicode(24)` column holding eight three-byte
+/// characters is a 24-byte dataset, not an 8-byte one.
+///
 /// Expanded only inside [`read_string_dataset_as`], and it reads that
 /// function's `S` and `ConvertError` from the expansion site rather than
-/// taking them as macro arguments -- which is why it is defined here and not
+/// taking them as macro arguments — which is why it is defined here and not
 /// exported.
 macro_rules! fixed_width_ladder {
     ($ds:expr, $config:expr, $ty:ident, $size:expr, $($cap:literal),+) => {{
@@ -235,8 +236,9 @@ macro_rules! fixed_width_ladder {
 
 /// Read any 1-D HDF5 string dataset into `S`.
 ///
-/// This is the single funnel: all four string flavours, one width ladder, one
-/// pass over the data. Consumers pick their shape by picking a sink.
+/// The one funnel for that shape: all four string flavours, one width ladder,
+/// one HDF5 read. Consumers pick their output by picking a sink. See the
+/// module docs for the reads this does **not** cover.
 fn read_string_dataset_as<S: StringSink>(
     ds: &hdf5::Dataset,
     config: S::Config,
@@ -276,7 +278,7 @@ fn read_string_dataset_as<S: StringSink>(
 /// `StringArray::from(read_string_dataset(ds)?.iter().map(…).collect::<Vec<_>>())`
 /// — same bytes, same i32 offsets, no `Vec<String>` and no `Vec<&str>`.
 pub(crate) fn read_string_array(ds: &hdf5::Dataset) -> Result<StringArray, ConvertError> {
-    Ok(read_string_dataset_as::<Utf8Sink>(ds, ())?.finish())
+    Ok(read_string_dataset_as::<GenericStringBuilder<i32>>(ds, ())?.finish())
 }
 
 /// Read a 1-D HDF5 string dataset as an Arrow `Utf8` array carrying validity
@@ -310,5 +312,5 @@ pub(crate) fn read_masked_string_array(
 /// [`read_string_array`] or [`read_masked_string_array`] instead; going
 /// through here and re-collecting is the four-copy chain this module removes.
 pub(crate) fn read_string_dataset(ds: &hdf5::Dataset) -> Result<Vec<String>, ConvertError> {
-    Ok(read_string_dataset_as::<OwnedSink>(ds, ())?.into_vec())
+    read_string_dataset_as::<Vec<String>>(ds, ())
 }
