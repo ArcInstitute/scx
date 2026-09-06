@@ -29,6 +29,20 @@
 //! the read — and passing both is what lets [`Utf8Sink`] pre-size its value
 //! buffer instead of growing it by doubling the way
 //! `StringArray::from_iter_values` does.
+//!
+//! # What this does and does not buy, measured
+//!
+//! It buys read-phase wall and a lower read-phase transient. It does **not**
+//! lower the peak RSS of a full `from_h5ad`, and the reason is worth writing
+//! down so nobody re-derives it: on a 10M-row obs-heavy conversion the process
+//! high-water mark lands at ~0.85 of total wall — in the *writer* — and is
+//! identical either way. Sampling RSS at 5 ms through the conversion, the read
+//! phase plateaus ~400 MB lower here than it did through the four-copy chain,
+//! and then both curves climb past it to the same peak while obs is
+//! serialised. A read-only workload (`read_h5ad_metadata`, no writer
+//! downstream) does show it: ~1.06x lower peak and ~1.24x faster.
+//!
+//! So the remaining obs term is on the **write** side, not this one.
 
 use arrow::array::{GenericStringBuilder, StringArray};
 use hdf5::types::TypeDescriptor;
