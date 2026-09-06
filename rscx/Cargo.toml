@@ -1,6 +1,6 @@
 [package]
 name = "rscx"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 description = "R bindings for SCX via extendr"
 license.workspace = true
