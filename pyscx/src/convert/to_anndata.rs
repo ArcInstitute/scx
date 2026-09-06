@@ -245,10 +245,10 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // (`to_anndata(obsm=[...])`).
     let lazy_obsm_requested = !eager && obsm_filter.is_some();
     let obsm_dict = pyo3::types::PyDict::new(py);
-    if lazy_obsm_requested {
-        // Keys were validated by `to_anndata_filtered` before it chose a
-        // branch; the bridge just reads each on first access.
-    } else {
+    // Lazy mode reads nothing here: keys were validated by `to_anndata_filtered`
+    // before it chose a branch, and the bridge built below reads each on first
+    // access.
+    if !lazy_obsm_requested {
         let obsm_map = read_obsm_selected(reader, obsm_filter)?;
         for (name, batch) in &obsm_map {
             let filtered = filter_obs_by_deletion_vectors(reader, batch.clone())?;
@@ -1088,11 +1088,10 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // gather is deferred), and `obsm=None` keeps the historical
     // eager-all behaviour.
     let use_backed_obsm = obsm_filter.is_some() && !eager && obs_filter.is_none();
-    // `obsm_filter` restricts the loaded keys; under backed mode we only
-    // need to validate them (the bridge reads each lazily).
+    // Under backed mode nothing is read here — the `ScxBackedObsmDataset` bridge
+    // built below gathers each key on demand.
     let obsm_dict = pyo3::types::PyDict::new(py);
-    if use_backed_obsm {
-    } else {
+    if !use_backed_obsm {
         build_eager_obsm_dict(
             py,
             &reader,
