@@ -75,15 +75,22 @@ pub struct ScxLazyPairwiseMapping {
 }
 
 impl ScxLazyPairwiseMapping {
+    /// `key_filter` restricts the bridge to the listed keys
+    /// (`to_anndata(obsp=[...])` / `varp=[...]`); `None` keeps every key on
+    /// disk. Same shape as [`ScxLazyObsmMapping::new`]'s `obsm_filter`.
     pub(crate) fn new(
         reader: Arc<ScxReader>,
         axis: PairwiseAxis,
         kept_to_global: Option<Arc<Vec<u64>>>,
+        key_filter: Option<&[String]>,
     ) -> Self {
-        let keys = match axis {
+        let mut keys = match axis {
             PairwiseAxis::Obsp => reader.list_obsp(),
             PairwiseAxis::Varp => reader.list_varp(),
         };
+        if let Some(filter) = key_filter {
+            keys.retain(|n| filter.iter().any(|f| f == n));
+        }
         let state: HashMap<String, Option<Py<PyAny>>> =
             keys.into_iter().map(|k| (k, None)).collect();
         Self {
@@ -318,9 +325,15 @@ impl ScxLazyVarmMapping {
         self
     }
 
-    pub(crate) fn new(reader: Arc<ScxReader>) -> Self {
+    /// `key_filter` restricts the bridge to the listed keys
+    /// (`to_anndata(varm=[...])`); `None` keeps every key on disk.
+    pub(crate) fn new(reader: Arc<ScxReader>, key_filter: Option<&[String]>) -> Self {
+        let mut keys = reader.list_varm();
+        if let Some(filter) = key_filter {
+            keys.retain(|n| filter.iter().any(|f| f == n));
+        }
         let state: HashMap<String, Option<Py<PyAny>>> =
-            reader.list_varm().into_iter().map(|k| (k, None)).collect();
+            keys.into_iter().map(|k| (k, None)).collect();
         Self {
             reader,
             state: Mutex::new(state),

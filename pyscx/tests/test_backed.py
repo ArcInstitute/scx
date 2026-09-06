@@ -478,19 +478,8 @@ _HANDLE_CLASSES_FOR_STUBS = (
 )
 
 
-def _stub_class_body(cls_name):
-    """The lines of one `class <cls_name>:` block in `__init__.pyi`."""
-    import pathlib
-
-    import pyscx
-
-    pyi = pathlib.Path(pyscx.__file__).with_name("__init__.pyi")
-    text = pyi.read_text()
-    start = text.index(f"class {cls_name}:")
-    rest = text[start + 1 :]
-    # Ends at the next top-level `class `/`def ` declaration.
-    ends = [i for i in (rest.find("\nclass "), rest.find("\ndef ")) if i != -1]
-    return rest[: min(ends)] if ends else rest
+# Shared with `test_experiment_stub_coverage.py` -- one parse of the stub, not two.
+from _stub_ast import stub_class_methods  # noqa: E402
 
 
 @pytest.mark.parametrize("cls_name", _HANDLE_CLASSES_FOR_STUBS)
@@ -505,7 +494,7 @@ def test_handle_stubs_declare_every_runtime_special(cls_name):
     import pyscx
 
     cls = getattr(pyscx, cls_name)
-    body = _stub_class_body(cls_name)
+    declared = set(stub_class_methods(cls_name))
 
     # `hasattr` is the wrong probe and was the bug in this test's first
     # version: `object` supplies `__eq__`, `__ne__` and all four ordering
@@ -521,7 +510,7 @@ def test_handle_stubs_declare_every_runtime_special(cls_name):
         if getattr(cls, name, None) is not None
         and getattr(cls, name, None) is not getattr(object, name, None)
     }
-    stubbed = {name for name in _MATRIX_SPECIALS if f"def {name}(" in body}
+    stubbed = _MATRIX_SPECIALS & declared
 
     assert runtime - stubbed == set(), (
         f"{cls_name} implements {sorted(runtime - stubbed)} but __init__.pyi "

@@ -128,6 +128,9 @@ pub fn to_mudata_backed<'py>(
             None,
             None,
             None,
+            // `to_mudata` exposes no slot filters and no `raw=`, so the inner
+            // AnnData keeps every slot and today's raw behaviour.
+            crate::convert::SlotFilters::default(),
             false,
             false,
             // var_names is None here, so preserve_var_order / strict_var_names

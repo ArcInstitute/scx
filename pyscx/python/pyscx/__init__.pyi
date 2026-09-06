@@ -953,6 +953,10 @@ class Experiment:
         data_dtype: str | None = ...,
         index_dtype: str | None = ...,
         allow_lossy: bool = ...,
+        obsp: list[str] | None = ...,
+        varp: list[str] | None = ...,
+        varm: list[str] | None = ...,
+        raw: bool = ...,
     ) -> Any: ...
 
     def to_mudata(
@@ -1062,6 +1066,10 @@ class Experiment:
         data_dtype: str | None = ...,
         index_dtype: str | None = ...,
         allow_lossy: bool = ...,
+        obsp: list[str] | None = ...,
+        varp: list[str] | None = ...,
+        varm: list[str] | None = ...,
+        raw: bool = ...,
     ) -> Any:
         """Materialise on-device as an AnnData backed by a
         ``cupyx.scipy.sparse.csr_matrix`` (f32-native). Rejects the

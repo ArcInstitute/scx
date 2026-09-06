@@ -20,6 +20,46 @@ use super::*;
 /// is advisory.
 const DEFAULT_EAGER_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Per-slot key filters for `obsp` / `varp` / `varm`, plus the `raw` opt-out.
+///
+/// `layers=` and `obsm=` have carried their own filter parameters since they
+/// were added; these three had none, so the only way to avoid decoding an
+/// `n_obs × n_obs` kNN graph was not to touch `adata.obsp` at all — and
+/// anndata touches it for you, since `AlignedMappingProperty.__get__` builds
+/// an `AlignedActual` that validates (and therefore decodes) every entry of
+/// the slot on first property access.
+///
+/// Each field follows `obsm=`'s contract exactly: `None` = every key on disk,
+/// `Some([])` = none, `Some(keys)` = that subset, unknown key → `KeyError`.
+/// `raw` gates the three `has_raw()` sites; `false` skips both the rebuild and
+/// the `DroppedRaw` notice.
+///
+/// Grouped rather than threaded as four more positional parameters: the four
+/// functions this passes through already carry 11–16 of them under
+/// `#[allow(clippy::too_many_arguments)]`.
+#[derive(Clone, Copy)]
+pub(crate) struct SlotFilters<'a> {
+    pub obsp: Option<&'a [String]>,
+    pub varp: Option<&'a [String]>,
+    pub varm: Option<&'a [String]>,
+    pub raw: bool,
+}
+
+impl Default for SlotFilters<'_> {
+    /// Today's behaviour: every key of every slot, and raw reconstructed (or
+    /// dropped with its notice) as before. Hand-written rather than derived
+    /// because `raw` must default to `true` — a derived `false` would silently
+    /// disable raw at every call site that has not opted in.
+    fn default() -> Self {
+        Self {
+            obsp: None,
+            varp: None,
+            varm: None,
+            raw: true,
+        }
+    }
+}
+
 /// Map a typed-read error to a Python exception. The in-assembly narrow reader
 /// surfaces the fail-loud cast gate (lossy narrow / decode-loss) as
 /// `ScxError::Codec(..)`; that is a bad-request condition — map it to
@@ -98,6 +138,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     reader: &ScxReader,
     layer_filter: Option<&[String]>,
     obsm_filter: Option<&[String]>,
+    filters: SlotFilters<'_>,
     eager: bool,
     memory_budget: Option<u64>,
     skip_x: bool,
@@ -204,13 +245,10 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // (`to_anndata(obsm=[...])`).
     let lazy_obsm_requested = !eager && obsm_filter.is_some();
     let obsm_dict = pyo3::types::PyDict::new(py);
-    if lazy_obsm_requested {
-        // Lazy path: validate the requested keys exist now via a
-        // catalog-only scan (no shard bytes read — preserves the
-        // deferral guarantee), then let the bridge read each on first
-        // access.
-        validate_obsm_keys(reader, obsm_filter)?;
-    } else {
+    // Lazy mode reads nothing here: keys were validated by `to_anndata_filtered`
+    // before it chose a branch, and the bridge built below reads each on first
+    // access.
+    if !lazy_obsm_requested {
         let obsm_map = read_obsm_selected(reader, obsm_filter)?;
         for (name, batch) in &obsm_map {
             let filtered = filter_obs_by_deletion_vectors(reader, batch.clone())?;
@@ -228,9 +266,15 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // `_layers`). Independent mmap so the returned AnnData stays valid
     // after the caller's `ScxReader` drops. Skipped when no lazy slot
     // is needed.
-    let has_obsp = !reader.list_obsp().is_empty();
-    let has_varp = !reader.list_varp().is_empty();
-    let has_varm = !reader.list_varm().is_empty();
+    //
+    // `obsp` / `varp` / `varm` narrow the same way `layers` always has: the
+    // filter decides whether the slot exists for this call at all, so an empty
+    // list builds no bridge rather than an empty one. Keys were validated by
+    // the entry point (`to_anndata_filtered`), which reaches the query branch
+    // this function does not.
+    let has_obsp = slot_has_selected(&reader.list_obsp(), filters.obsp);
+    let has_varp = slot_has_selected(&reader.list_varp(), filters.varp);
+    let has_varm = slot_has_selected(&reader.list_varm(), filters.varm);
     let layer_names = reader.layer_names();
     let has_layers = if let Some(filter) = layer_filter {
         layer_names.iter().any(|n| filter.iter().any(|f| f == n))
@@ -252,18 +296,21 @@ pub(crate) fn to_anndata_with_layers<'py>(
     } else {
         None
     };
-    let lazy_obsp = lazy_reader
-        .as_ref()
-        .filter(|_| has_obsp)
-        .map(|r| ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Obsp, obsp_kept.clone()));
-    let lazy_varp = lazy_reader
-        .as_ref()
-        .filter(|_| has_varp)
-        .map(|r| ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None));
+    let lazy_obsp = lazy_reader.as_ref().filter(|_| has_obsp).map(|r| {
+        ScxLazyPairwiseMapping::new(
+            Arc::clone(r),
+            PairwiseAxis::Obsp,
+            obsp_kept.clone(),
+            filters.obsp,
+        )
+    });
+    let lazy_varp = lazy_reader.as_ref().filter(|_| has_varp).map(|r| {
+        ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None, filters.varp)
+    });
     let lazy_varm = lazy_reader
         .as_ref()
         .filter(|_| has_varm)
-        .map(|r| ScxLazyVarmMapping::new(Arc::clone(r)));
+        .map(|r| ScxLazyVarmMapping::new(Arc::clone(r), filters.varm));
     let lazy_layers = lazy_reader
         .as_ref()
         .filter(|_| has_layers)
@@ -327,7 +374,10 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // Raw shares X's obs axis; when deletion vectors are active the raw
     // rows would need the same filtering as X, which this path does not
     // yet apply — warn and drop rather than emit a misaligned raw.
-    if reader.has_raw() {
+    //
+    // `raw=False` opts out of both branches: no rebuild, and no notice about
+    // a matrix the caller has said they do not want.
+    if filters.raw && reader.has_raw() {
         if reader.header().has_deletion_vectors() {
             warn_python_convert(
                 py,
@@ -424,6 +474,7 @@ pub fn to_anndata_filtered<'py>(
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
     obsm_filter: Option<&[String]>,
+    filters: SlotFilters<'_>,
     preserve_slots: bool,
     eager: bool,
     memory_budget: Option<u64>,
@@ -440,6 +491,28 @@ pub fn to_anndata_filtered<'py>(
         "skip_x requires no var_names / obs_filter / layer_filter"
     );
 
+    // Validate the slot filters here rather than in `to_anndata_with_layers`:
+    // this function has four branches and one of them (the obs-filtered query
+    // path) never calls it, so validating downstream would let a typo through
+    // on exactly the path that already discards those slots. Catalog-only
+    // listings — no shard bytes, so the lazy bridges' deferral is intact.
+    //
+    // All FIVE slots, not just the three new ones. The query branch decides its
+    // "does not load {slots}" warning with `slot_has_selected`, which cannot
+    // tell "the caller excluded this slot" from "the caller misspelled a key" —
+    // both select nothing. So an unvalidated slot with a typo would produce no
+    // `KeyError` *and* no warning naming it: on a file whose only aligned slot
+    // is that one, `to_anndata(obs_filter=…, obsm=["typo"])` returned in silence.
+    // `obsm=` already documents `KeyError`; the check simply lived in
+    // `to_anndata_with_layers`, which this branch never reaches. `layers=` had
+    // no such contract at all and silently yielded an empty slot on any path —
+    // it gets one here, so every slot filter fails the same way.
+    validate_slot_keys(&reader.layer_names(), layer_filter, "layers")?;
+    validate_slot_keys(&reader.list_obsm(), obsm_filter, "obsm")?;
+    validate_slot_keys(&reader.list_obsp(), filters.obsp, "obsp")?;
+    validate_slot_keys(&reader.list_varp(), filters.varp, "varp")?;
+    validate_slot_keys(&reader.list_varm(), filters.varm, "varm")?;
+
     // Fast path: no filtering → use existing implementation. The decode-loss
     // guard (X / raw / eager layers) runs inside `to_anndata_with_layers`, so
     // every caller of it — this branch, preserve_slots, and the var_names-only
@@ -451,6 +524,7 @@ pub fn to_anndata_filtered<'py>(
             reader,
             None,
             obsm_filter,
+            filters,
             eager,
             memory_budget,
             skip_x,
@@ -472,6 +546,7 @@ pub fn to_anndata_filtered<'py>(
             reader,
             layer_filter,
             obsm_filter,
+            filters,
             true,
             memory_budget,
             false,
@@ -579,24 +654,16 @@ pub fn to_anndata_filtered<'py>(
             kwargs.set_item("uns", uns)?;
         }
         // obsm, varm, obsp, varp, and layers are not available via QueryResult.
-        // Warn if the source file contains them so users know they're being dropped.
-        let has_obsm = reader
-            .read_all_obsm()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
-        let has_varm = reader
-            .read_all_varm()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
-        let has_obsp = reader
-            .read_all_obsp()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
-        let has_varp = reader
-            .read_all_varp()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false);
-        let has_layers = !reader.layer_names().is_empty();
+        // Warn if the source file contains them so users know they're being
+        // dropped — but only for slots the caller has not already excluded. A
+        // caller who passed `obsp=[]` has said they do not want obsp; naming it
+        // in a "you are losing these" notice would be telling them about a loss
+        // they asked for.
+        let has_obsm = slot_has_selected(&reader.list_obsm(), obsm_filter);
+        let has_varm = slot_has_selected(&reader.list_varm(), filters.varm);
+        let has_obsp = slot_has_selected(&reader.list_obsp(), filters.obsp);
+        let has_varp = slot_has_selected(&reader.list_varp(), filters.varp);
+        let has_layers = slot_has_selected(&reader.layer_names(), layer_filter);
         if has_obsm || has_varm || has_obsp || has_varp || has_layers {
             let warnings = crate::pyimport::import_module(py, "warnings")?;
             let mut parts = Vec::new();
@@ -627,8 +694,9 @@ pub fn to_anndata_filtered<'py>(
         }
 
         // The obs-filtered query path does not subset the raw matrix's
-        // obs axis — warn + drop rather than emit a misaligned raw.
-        if reader.has_raw() {
+        // obs axis — warn + drop rather than emit a misaligned raw. `raw=False`
+        // opts out of the notice.
+        if filters.raw && reader.has_raw() {
             warn_python_convert(
                 py,
                 &scx_convert::ConvertWarning::DroppedRaw {
@@ -653,6 +721,7 @@ pub fn to_anndata_filtered<'py>(
         reader,
         layer_filter,
         obsm_filter,
+        filters,
         true,
         memory_budget,
         false,
@@ -781,6 +850,7 @@ pub fn to_anndata_backed<'py>(
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
     obsm_filter: Option<&[String]>,
+    filters: SlotFilters<'_>,
     eager: bool,
     preserve_var_order: bool,
     strict_var_names: bool,
@@ -793,6 +863,7 @@ pub fn to_anndata_backed<'py>(
         obs_filter,
         layer_filter,
         obsm_filter,
+        filters,
         true,
         eager,
         preserve_var_order,
@@ -817,6 +888,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     obs_filter: Option<&str>,
     layer_filter: Option<&[String]>,
     obsm_filter: Option<&[String]>,
+    filters: SlotFilters<'_>,
     apply_deletion_vectors: bool,
     eager: bool,
     preserve_var_order: bool,
@@ -841,6 +913,21 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // catalog is reused. See docs/multithreading.md for the
     // fork-safety contract.
     let shared_catalog = reader.catalog_arc();
+
+    // --- Validate the slot filters FIRST ---
+    //
+    // Before obs / var are read, before the backed X and CSC readers open, and
+    // before `build_eager_obsm_dict` decodes every obsm entry. A typo is a
+    // bad request, and answering it should not first cost a full obsm decode on
+    // an atlas-scale file. All five listings are catalog-only scans.
+    let obsp_names = reader.list_obsp();
+    let varp_names = reader.list_varp();
+    let varm_names = reader.list_varm();
+    validate_slot_keys(&reader.layer_names(), layer_filter, "layers")?;
+    validate_slot_keys(&reader.list_obsm(), obsm_filter, "obsm")?;
+    validate_slot_keys(&obsp_names, filters.obsp, "obsp")?;
+    validate_slot_keys(&varp_names, filters.varp, "varp")?;
+    validate_slot_keys(&varm_names, filters.varm, "varm")?;
 
     // --- Compute kept_to_global from deletion vectors (if present) ---
     // Cache the deletion-vector-only mapping; obs_filter may mutate kept_to_global
@@ -1001,12 +1088,10 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // gather is deferred), and `obsm=None` keeps the historical
     // eager-all behaviour.
     let use_backed_obsm = obsm_filter.is_some() && !eager && obs_filter.is_none();
-    // `obsm_filter` restricts the loaded keys; under backed mode we only
-    // need to validate them (the bridge reads each lazily).
+    // Under backed mode nothing is read here — the `ScxBackedObsmDataset` bridge
+    // built below gathers each key on demand.
     let obsm_dict = pyo3::types::PyDict::new(py);
-    if use_backed_obsm {
-        validate_obsm_keys(&reader, obsm_filter)?;
-    } else {
+    if !use_backed_obsm {
         build_eager_obsm_dict(
             py,
             &reader,
@@ -1052,9 +1137,12 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // See `to_anndata_with_layers` for the contract between
     // `eager=true/false` and AnnData's private `_obsp` / `_varp` /
     // `_varm` storage.
-    let has_obsp = !reader.list_obsp().is_empty();
-    let has_varp = !reader.list_varp().is_empty();
-    let has_varm = !reader.list_varm().is_empty();
+    // Filter-aware, exactly as on the eager path: an empty list builds no
+    // bridge. Keys were validated at the top of this function, before any
+    // payload read.
+    let has_obsp = slot_has_selected(&obsp_names, filters.obsp);
+    let has_varp = slot_has_selected(&varp_names, filters.varp);
+    let has_varm = slot_has_selected(&varm_names, filters.varm);
     let need_lazy_aligned = has_obsp || has_varp || has_varm;
     let lazy_reader: Option<Arc<ScxReader>> = if need_lazy_aligned {
         Some(Arc::new(
@@ -1073,6 +1161,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             Arc::clone(r),
             PairwiseAxis::Obsp,
             kept_to_global_arc.clone(),
+            filters.obsp,
         )
     });
     // varp / varm decode at physical var width, so an open-time `var_names=`
@@ -1080,11 +1169,12 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // `filter_genes` replays visible-space indices against a physical-width
     // value and silently returns the wrong genes' rows.
     let lazy_varp = lazy_reader.as_ref().filter(|_| has_varp).map(|r| {
-        ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None)
+        ScxLazyPairwiseMapping::new(Arc::clone(r), PairwiseAxis::Varp, None, filters.varp)
             .with_var_projection(col_indices.as_deref())
     });
     let lazy_varm = lazy_reader.as_ref().filter(|_| has_varm).map(|r| {
-        ScxLazyVarmMapping::new(Arc::clone(r)).with_var_projection(col_indices.as_deref())
+        ScxLazyVarmMapping::new(Arc::clone(r), filters.varm)
+            .with_var_projection(col_indices.as_deref())
     });
 
     // --- uns (eager; tagged envelopes reconstructed) ---
@@ -1162,7 +1252,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
 
     // Backed mode does not reconstruct the raw matrix — warn + drop.
-    if reader.has_raw() {
+    // `raw=False` opts out of the notice.
+    if filters.raw && reader.has_raw() {
         warn_python_convert(
             py,
             &scx_convert::ConvertWarning::DroppedRaw {

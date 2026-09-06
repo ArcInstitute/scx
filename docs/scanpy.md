@@ -367,6 +367,8 @@ reorder-on-convert (`--sort-by` / `--group-by`), where raw streams unpermuted an
 end up attached to the wrong cells. That warning's remedy is per call site — convert
 from the h5ad for the first, convert without the reorder for the second.
 `adata.raw.varm` has no section and is dropped with `DroppedRawVarm`.
+`to_anndata(raw=False)` opts out of raw entirely — no rebuild on the paths that would
+rebuild it, and no `DroppedRaw` notice on the three that would drop it.
 See [docs/api.md § `adata.raw`](api.md#adataraw).
 
 ### Exporting back to MTX
@@ -765,27 +767,52 @@ where decode correctness matters.
 
 ```python
 exp.to_anndata(
+    # Declaration order, matching `#[pyo3(signature = ...)]` and `__init__.pyi`.
+    # Every parameter is positional-or-keyword, so this order is the calling
+    # contract, not presentation -- `test_experiment_stub_coverage.py` pins it.
     backed=False,         # True for lazy loading (X stays on disk)
     cache_shards=4,       # LRU cache size for backed mode
     var_names=None,       # List of gene names to project (column subset)
     obs_filter=None,      # Predicate string to filter cells (e.g. "cell_type == 'T cell'")
     layers=None,          # None = load all layers; pass a list to select specific layers
                           # (e.g. ["raw_counts"]), or [] to skip loading layers entirely
-    obsm=None,            # None = load all obsm keys (default); pass a list to load only
-                          # those embeddings (e.g. ["X_pca"]), or [] to skip obsm. Selecting
-                          # keys also switches obsm to a lazy / backed row-gather bridge
-                          # (see "Selective + lazy obsm" below).
+    preserve_slots=False, # With obs_filter in non-backed mode: materialise the aligned
+                          # slots after filtering (pandas.eval grammar) instead of taking
+                          # the query-engine path, which drops them
+    modality=None,        # One modality of a multimodal file (requires backed=True).
+                          # Rejects every selection kwarg rather than ignoring it
     eager=False,          # False (default): obsp/varp/varm and non-backed layers are
                           # wrapped in lazy bridges that decode each entry on first
                           # access. True: materialise everything up front so the
-                          # AnnData is fully detached from the SCX file handle.
+                          # AnnData is fully detached from the SCX file handle
     memory_budget=None,   # None (default: 8 GiB), int (bytes), or a binary-prefixed
                           # size str: K/M/G/T or KiB/MiB/GiB/TiB ("4G" / "512MiB"); decimal KB/MB rejected.
                           # When the estimated eager assembly footprint exceeds this
                           # budget, a UserWarning is emitted recommending backed mode.
-                          # Advisory only — assembly still proceeds.
+                          # Advisory only -- assembly still proceeds
+    obsm=None,            # None = load all obsm keys (default); pass a list to load only
+                          # those embeddings (e.g. ["X_pca"]), or [] to skip obsm. Selecting
+                          # keys also switches obsm to a lazy / backed row-gather bridge
+                          # (see "Selective + lazy obsm" below)
+    preserve_var_order=False,  # Return genes in var_names order rather than sorted
+    strict_var_names=True,     # KeyError on a var_name absent from var (False drops it)
+    container="csr",      # "csr" (default) or "dense" -- read-side materialisation
+    data_dtype=None,      # Narrow X / raw in-decode (e.g. "uint16"); None = float32
+    index_dtype=None,     # Index width (e.g. "int64"); None = int32
+    allow_lossy=False,    # Permit a narrowing cast that cannot round-trip
+    obsp=None,            # None = all obsp keys; a list = that subset; [] = none
+    varp=None,            # Same contract as obsp
+    varm=None,            # Same contract as obsp. An empty / fully-excluding list builds
+                          # no lazy bridge at all, which is what actually bounds the cost:
+                          # anndata validates every entry of a slot on the first
+                          # `adata.obsp` access, so one touch decodes the whole slot
+    raw=True,             # True: reconstruct adata.raw where the mode allows, and emit
+                          # the dropped_raw notice where it cannot. False: neither
 )
 ```
+
+An unknown key in any of `layers` / `obsm` / `obsp` / `varp` / `varm` raises
+`KeyError` naming the slot and listing what the file has, on every path.
 
 ### Default behavior (no extra params)
 
@@ -837,26 +864,41 @@ The returned `anndata.AnnData` is fully populated:
 > the four slots above are `MutableMapping`-compatible bridges
 > (`ScxLazyPairwiseMapping`, `ScxLazyVarmMapping`,
 > `ScxLazyLayersMapping`) that decode each entry from the SCX file
-> only on first access — `ad.obsp["distances"]`,
-> `for k, v in ad.varm.items():`, `dict(ad.layers)`, etc. — and cache
-> the materialised value. Lookups via `__contains__` and key iteration
-> stay catalog-only (no I/O). Mutations are in-memory and never write
-> back to disk. The bridges keep a sibling `Arc<ScxReader>` alive so
-> the returned AnnData stays usable after the source `Experiment`
-> drops. Pass `eager=True` to substitute a plain `dict` and fully
-> detach the AnnData from the SCX file handle — required when you
-> intend to close the experiment, hand the AnnData to a subprocess,
-> or otherwise outlive the underlying mmap. See
-> [`docs/api.md` § `Experiment`](api.md#experiment) for the kwarg
-> table.
+> only on first access, and cache the materialised value. Lookups via
+> `__contains__` and key iteration stay catalog-only (no I/O).
+> Mutations are in-memory and never write back to disk. The bridges
+> keep a sibling `Arc<ScxReader>` alive so the returned AnnData stays
+> usable after the source `Experiment` drops. Pass `eager=True` to
+> substitute a plain `dict` and fully detach the AnnData from the SCX
+> file handle — required when you intend to close the experiment, hand
+> the AnnData to a subprocess, or otherwise outlive the underlying
+> mmap. See [`docs/api.md` § `Experiment`](api.md#experiment) for the
+> kwarg table.
 >
-> The lazy default bounds the peak RSS of `to_anndata()` itself for
-> files that carry large kNN graphs (`obsp["distances"]` /
-> `obsp["connectivities"]`) or embeddings (`varm["PCs"]`): the
-> sections are not decoded until consumer code touches the slot. User
-> code that does access them pays the same one-time decode cost it
-> would have paid at construction time. Repeat accesses of the same
-> key return the cached object.
+> **Per-key laziness is not per-key access through `adata`.** Reading
+> the *slot* — `ad.obsp[...]`, `for k, v in ad.varm.items():`,
+> `dict(ad.layers)` — goes through anndata's
+> `AlignedMappingProperty.__get__`, which constructs an `AlignedActual`
+> whose `__init__` runs `_validate_value` over **every** entry. So the
+> first touch of `ad.obsp` decodes every obsp key once, not just the
+> one you indexed; a subsequent `ad.obsp["distances"]` is then a cache
+> hit. This is anndata's design, not a version regression — 0.11.4 and
+> 0.12.x behave identically — and it is why an in-place axis subset
+> detaches the bridges first rather than letting anndata walk them
+> (`pyscx/src/axis_align.rs`). Only direct bridge access
+> (`ad._obsp["distances"]`) is decode-per-key.
+>
+> The lazy default therefore bounds the peak RSS of `to_anndata()`
+> *itself* for files that carry large kNN graphs
+> (`obsp["distances"]` / `obsp["connectivities"]`) or embeddings
+> (`varm["PCs"]`), but it does not bound what the first slot access
+> costs. To bound that, name the keys you want — or none of them:
+> `to_anndata(obsp=["connectivities"])`, `to_anndata(obsp=[])`. Each of
+> `obsp=` / `varp=` / `varm=` takes the same `None` = all / `[]` = none /
+> list = subset shape as `obsm=` and `layers=`; an empty or
+> fully-excluding list builds no bridge at all, so nothing remains that
+> could decode. `to_anndata(layers=[], obsm=[], obsp=[], varp=[],
+> varm=[], raw=False)` is the X / obs / var / uns-only read.
 
 #### Selective + lazy `obsm` (`obsm=[...]`)
 

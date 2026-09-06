@@ -86,6 +86,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
     preserve_var_order: bool,
     strict_var_names: bool,
     plan: &scx_sparse::MaterializePlan,
+    filters: crate::convert::SlotFilters<'_>,
 ) -> PyResult<Bound<'py, PyAny>> {
     use pyo3::exceptions::{PyRuntimeError, PyValueError};
 
@@ -155,6 +156,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
                 None,
                 None,
                 obsm.as_deref(),
+                filters,
                 false, // preserve_slots
                 true,  // eager
                 memory_budget_bytes,
@@ -358,6 +360,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
                 obs_filter,
                 layers.as_deref(),
                 obsm.as_deref(),
+                filters,
                 false, // preserve_slots
                 true,  // eager
                 memory_budget_bytes,

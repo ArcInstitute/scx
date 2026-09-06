@@ -160,3 +160,68 @@ def test_to_gpu_anndata_values_match_cpu(scx1_scx):
     np.testing.assert_array_equal(gpu_x.indptr, cpu_x.indptr)
     np.testing.assert_array_equal(gpu_x.indices, cpu_x.indices)
     np.testing.assert_allclose(gpu_x.data, cpu_x.data, rtol=1e-5, atol=1e-5)
+
+
+@pytest.fixture
+def scx1_with_slots(tmp_path):
+    """The same framed Scx1 X, plus two keys in each aligned slot and a raw.
+
+    Separate from ``scx1_scx`` so the transfer-mode assertions above keep
+    running against the minimal file they were written for.
+    """
+    import anndata
+    import pandas as pd
+
+    rng = np.random.default_rng(1)
+    n_obs, n_vars, raw_n_vars = 120, 40, 60
+    dense = rng.poisson(2.0, size=(n_obs, n_vars)).astype(np.float32)
+    dense[rng.random(dense.shape) > 0.3] = 0.0
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"cell_{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"gene_{j}" for j in range(n_vars)]),
+        varm={
+            "PCs": rng.random((n_vars, 4)).astype(np.float32),
+            "loadings": rng.random((n_vars, 3)).astype(np.float32),
+        },
+        obsp={
+            "connectivities": sp.csr_matrix(
+                rng.random((n_obs, n_obs)).astype(np.float32)
+            ),
+            "distances": sp.csr_matrix(rng.random((n_obs, n_obs)).astype(np.float32)),
+        },
+    )
+    raw_dense = rng.poisson(2.0, size=(n_obs, raw_n_vars)).astype(np.float32)
+    adata.raw = anndata.AnnData(
+        X=sp.csr_matrix(raw_dense),
+        var=pd.DataFrame(index=[f"raw_gene_{j}" for j in range(raw_n_vars)]),
+    )
+
+    path = str(tmp_path / "slots.scx")
+    pyscx.from_anndata(adata, path, codec="scx1")
+    return path
+
+
+def test_to_gpu_anndata_honours_slot_filters(scx1_with_slots):
+    """`to_gpu_anndata` shares the eager host assembler, so the slot filters
+    reach it — but it takes its own branch into that assembler, so nothing on
+    the CPU side proves it."""
+    gpu_adata = pyscx.open(scx1_with_slots).to_gpu_anndata(varm=["PCs"], obsp=[])
+
+    assert set(gpu_adata.varm) == {"PCs"}
+    assert len(gpu_adata.obsp) == 0
+
+
+def test_to_gpu_anndata_raw_false_skips_the_rebuild(scx1_with_slots):
+    import warnings
+
+    # Control: the default still reconstructs raw on this path, so the
+    # assertion below is about the kwarg and not about raw being broken here.
+    assert pyscx.open(scx1_with_slots).to_gpu_anndata().raw is not None
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        gpu_adata = pyscx.open(scx1_with_slots).to_gpu_anndata(raw=False)
+
+    assert gpu_adata.raw is None
+    assert [w for w in rec if str(w.message).startswith("dropped_raw:")] == []
