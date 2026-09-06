@@ -15,10 +15,15 @@
 // * Deletion vectors: when present, the pre-scan decodes each shard
 //   once to count kept nnz, then the write loop decodes again. The
 //   second decode is acceptable for export — deterministic on-disk
-//   layout is worth one extra pass over the CSR shards.
-// * Metadata writes (`obs`, `var`, `obsm`, `varm`, `obsp`, `varp`,
-//   `uns`) reuse the non-streaming helpers in `write.rs`. Only
-//   `/X` and `/layers/{name}` change.
+//   layout is worth one extra pass over the CSR shards. This applies
+//   to `/raw` as well, which the eager path decoded once; the trade is
+//   the same one `/X` already makes.
+// * Streamed: `/X`, `/layers/{name}` and `/raw/X`, all through
+//   `stream_csr_to_group_at`; `obs` and `var` through
+//   `column_stream.rs` when the source carries metadata shards.
+// * Still materialised, via the non-streaming helpers in `write.rs`:
+//   `obsm`, `varm`, `obsp`, `varp`, `uns`, and `raw/var` (var is never
+//   sharded, so there is nothing to stream).
 
 use std::path::Path;
 
@@ -156,6 +161,7 @@ pub(crate) fn filter_record_batch_by_mask(
     mask: &[bool],
 ) -> Result<arrow::array::RecordBatch, ConvertError> {
     use arrow::array::BooleanArray;
+    use arrow::buffer::BooleanBuffer;
     let n = batch.num_rows();
     if mask.len() < n {
         return Err(ConvertError::Other(format!(
@@ -163,7 +169,14 @@ pub(crate) fn filter_record_batch_by_mask(
             mask.len()
         )));
     }
-    let bool_arr = BooleanArray::from(mask[..n].to_vec());
+    // Pack straight into the bitmap. `BooleanArray::from(Vec<bool>)` first
+    // allocates an n-BYTE `Vec<bool>`, then sets one bit per element from it;
+    // `BooleanBuffer::from(&[bool])` goes through `BooleanBufferBuilder::
+    // append_slice` and skips the copy. Identical output: both produce a
+    // bit-packed buffer, and `BooleanArray: From<BooleanBuffer>` sets
+    // `nulls: None`, which is exactly what `From<Vec<bool>>`'s hand-rolled
+    // `ArrayData` (no null buffer added) also produces.
+    let bool_arr = BooleanArray::from(BooleanBuffer::from(&mask[..n]));
     arrow::compute::filter_record_batch(batch, &bool_arr).map_err(ConvertError::Arrow)
 }
 
@@ -273,12 +286,12 @@ pub fn write_scx_to_h5ad_streaming(
     // /layers/{name}.
     stream_layers_at(&root, &reader, 0, keep_mask.as_deref(), opts, sink)?;
 
-    // /raw (DV-filtered on the obs axis like /X). Read eagerly; shared
-    // with the eager exporter.
-    if caller_filtered && reader.has_raw() {
-        sink.emit(ConvertWarning::ExportFilterSectionEager { section: "raw" });
-    }
-    super::write::write_raw_to_h5ad(&root, &reader, keep_mask.as_deref(), sink)?;
+    // /raw (DV-filtered on the obs axis like /X). Streams shard-by-shard,
+    // so — unlike obsm / obsp below — it emits no
+    // `ExportFilterSectionEager`: the warning exists to tell the caller a
+    // section was materialised whole despite their filter, and raw no
+    // longer is.
+    stream_raw_at(&root, &reader, keep_mask.as_deref(), opts, sink)?;
 
     // obsp / varp pairwise matrices (COO → csr_matrix groups). Read eagerly,
     // mirroring obsm/varm above. obsp filters both axes by the obs keep mask;
@@ -300,6 +313,16 @@ pub fn write_scx_to_h5ad_streaming(
 /// triplet using catalog stats (or a per-shard decode if deletion
 /// vectors are active), then walks shards in row order writing
 /// hyperslab slices.
+///
+/// Shards are read by **catalog entry**, not by `(section_type, layer_name,
+/// shard_idx)`. The index-based dispatch this replaced re-derived the shard
+/// list inside the reader — a second, hand-rolled ordering that had to agree
+/// with `collect_shards`' — so an index meant one shard here and possibly
+/// another there. `read_csr_shard_for`, `read_layer_csr_shard{,_for}` and
+/// their indptr siblings are all bounds-check + `read_shard_from_entry`, so
+/// passing the entry the caller already holds is the same decode with the
+/// ambiguity removed. It is also what let a new section family (`/raw`) join
+/// without a fourth match arm in each of three places.
 ///
 /// Phase 8d dispatcher: when `opts.reader_threads` resolves to > 1
 /// (and the memory-budget derate allows), routes to
@@ -340,7 +363,7 @@ pub(crate) fn stream_csr_to_group_at(
         }
         None => n_obs_total,
     };
-    let total_nnz = precompute_total_nnz(reader, &shards, keep_mask_opt, layer_name, modality_id)?;
+    let total_nnz = precompute_total_nnz(reader, &shards, keep_mask_opt)?;
 
     let group = parent.create_group(name)?;
     create_csr_triplet(&group, n_obs_kept as usize, n_vars, total_nnz as usize)?;
@@ -387,24 +410,14 @@ pub(crate) fn stream_csr_to_group_at(
     };
 
     if granted_threads <= 1 {
-        stream_csr_into_prealloc_sequential(
-            datasets,
-            reader,
-            &shards,
-            modality_id,
-            section_type,
-            layer_name,
-            keep_mask_opt,
-        )?;
+        stream_csr_into_prealloc_sequential(datasets, reader, &shards, keep_mask_opt)?;
     } else {
         stream_csr_into_prealloc_parallel(
             datasets,
             reader,
             &shards,
-            modality_id,
-            section_type,
-            layer_name,
             keep_mask_opt,
+            source_label_for(modality_id, section_type, layer_name, reader),
             granted_threads,
             granted_depth,
         )?;
@@ -430,20 +443,17 @@ fn stream_csr_into_prealloc_sequential(
     datasets: TripletDatasets<'_>,
     reader: &ScxReader,
     shards: &[&FullCatalogEntry],
-    modality_id: u8,
-    section_type: SectionType,
-    layer_name: Option<&str>,
     keep_mask_opt: Option<&[bool]>,
 ) -> Result<(), ConvertError> {
     let mut nnz_offset: u64 = 0;
     let mut row_offset_kept: u64 = 0;
 
-    for (shard_idx, entry) in shards.iter().enumerate() {
+    for entry in shards.iter() {
         let stats = require_stats(entry)?;
         let shard_row_start = stats.row_start as usize;
 
         let (indptr_local_i64, indices_local_i32, data_local_f32) =
-            read_shard_payload(reader, modality_id, section_type, layer_name, shard_idx)?;
+            reader.read_shard_from_entry(entry)?;
 
         write_one_shard_to_prealloc(
             &datasets,
@@ -476,10 +486,8 @@ fn stream_csr_into_prealloc_parallel(
     datasets: TripletDatasets<'_>,
     reader: &ScxReader,
     shards: &[&FullCatalogEntry],
-    modality_id: u8,
-    section_type: SectionType,
-    layer_name: Option<&str>,
     keep_mask_opt: Option<&[bool]>,
+    source_label: String,
     reader_threads: usize,
     writer_queue_depth: usize,
 ) -> Result<(), ConvertError> {
@@ -492,7 +500,6 @@ fn stream_csr_into_prealloc_parallel(
         .iter()
         .map(|e| e.stats.as_ref().map(|s| s.row_start).unwrap_or(0))
         .collect();
-    let source_label = source_label_for(modality_id, section_type, layer_name, reader);
 
     // Panic-injection switch for the deadlock regression test. Copied on the
     // calling thread and read inside the worker closure; `#[cfg(test)]`-gated,
@@ -518,7 +525,10 @@ fn stream_csr_into_prealloc_parallel(
                 panic!("test_hooks: injected panic at shard {idx}");
             }
             let row_start = shard_row_starts[idx];
-            match read_shard_payload(reader, modality_id, section_type, layer_name, idx) {
+            match reader
+                .read_shard_from_entry(shards[idx])
+                .map_err(ConvertError::from)
+            {
                 Ok((indptr, indices, data)) => {
                     let n_rows = indptr.len().saturating_sub(1) as u32;
                     Ok(DecodedShard {
@@ -590,6 +600,7 @@ fn source_label_for(
     };
     match (section_type, layer_name) {
         (SectionType::CsrShard, _) => format!("{mod_part}X"),
+        (SectionType::RawCsrShard, _) => format!("{mod_part}raw/X"),
         (SectionType::LayerCsrShard, Some(name)) => format!("{mod_part}layers/{name}"),
         _ => format!("{mod_part}?"),
     }
@@ -740,6 +751,88 @@ pub(crate) fn stream_layers_at(
     Ok(())
 }
 
+/// Stream `adata.raw` (`raw/X` + `raw/var`) into `parent/raw`.
+///
+/// Raw shares X's obs axis, so it carries the same deletion-vector /
+/// caller keep mask — but it has its OWN, usually wider, gene axis
+/// (`.raw` is captured before HVG subsetting), which is why `n_vars`
+/// comes from [`ScxReader::raw_n_vars`] and never from `reader.n_vars()`.
+///
+/// `raw/var` is a single section ([`SectionType::RawVarMetadata`], name
+/// `raw/var`) — var is never sharded — so it keeps the same whole-batch
+/// writer the eager path uses.
+pub(crate) fn stream_raw_at(
+    parent: &hdf5::Group,
+    reader: &ScxReader,
+    keep_mask_opt: Option<&[bool]>,
+    opts: &crate::ExportOptions,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    if !reader.has_raw() {
+        return Ok(());
+    }
+    // `has_raw` is derived from the catalog (`FileHeader::sync_from_catalog`
+    // sets it from any `RawCsrShard`), so a set flag with no resolvable
+    // gene axis means the file is inconsistent — not that raw is absent.
+    // Defensive: no writer in the workspace can produce it.
+    let raw_n_vars = reader.raw_n_vars().ok_or_else(|| {
+        ConvertError::Other(
+            "file declares adata.raw but carries no readable raw CSR shard \
+             (truncated or corrupt file)"
+                .to_string(),
+        )
+    })?;
+
+    let shards = collect_shards(reader, 0, SectionType::RawCsrShard, None);
+    // Diagnose a stats-less shard here, before the row-count guard below:
+    // `total_rows_in_shards` silently skips entries without stats, so the
+    // guard would otherwise report a misleading row-count mismatch.
+    for entry in &shards {
+        require_stats(entry)?;
+    }
+    // Raw shares X's obs axis. The eager path enforces this
+    // (`filter_csr_rows` errors on `mask.len() != rows`), but only when a
+    // mask is present; the streaming driver's own check is `mask.len() <
+    // n_obs_total`, which a SHORT raw slips past — producing an h5ad whose
+    // `/raw/X` has fewer rows than `/obs`, which anndata refuses to open.
+    // Check unconditionally, on both directions.
+    let raw_rows = total_rows_in_shards(&shards);
+    ensure_raw_covers_obs(raw_rows, reader.n_obs())?;
+
+    let raw_group = parent.create_group("raw")?;
+    stream_csr_to_group_at(
+        &raw_group,
+        "X",
+        reader,
+        0,
+        SectionType::RawCsrShard,
+        None,
+        raw_n_vars,
+        keep_mask_opt,
+        opts,
+        sink,
+    )?;
+    let raw_var = reader.read_raw_var()?;
+    write_dataframe_group_at(&raw_group, "var", &raw_var, sink)
+}
+
+/// `adata.raw` shares X's obs axis, so its row count must equal `n_obs`
+/// exactly — in both directions.
+///
+/// A pure fn, and tested as one: every writer in the workspace already
+/// upholds this (both ingest paths assert it, `append` refuses a file with
+/// raw, and `merge` / `compact` / `sort` / `optimize` drop raw), so reaching
+/// it through a real file would mean hand-forging a corrupt SCX.
+fn ensure_raw_covers_obs(raw_rows: u64, n_obs: u64) -> Result<(), ConvertError> {
+    if raw_rows != n_obs {
+        return Err(ConvertError::Other(format!(
+            "adata.raw covers {raw_rows} rows but obs has {n_obs} \
+             (truncated or corrupt file)"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -752,6 +845,11 @@ fn collect_shards<'a>(
 ) -> Vec<&'a FullCatalogEntry> {
     match (section_type, layer_name) {
         (SectionType::CsrShard, None) => reader.catalog().csr_shards_for_modality(modality_id),
+        // `adata.raw` is a file-global section family, so `modality_id` does
+        // not narrow it. Without this arm the match falls through to
+        // `Vec::new()` and the caller writes an EMPTY `/raw/X` rather than
+        // erroring — silent data loss, which is why it gets its own test.
+        (SectionType::RawCsrShard, None) => reader.catalog().raw_csr_shards_sorted(),
         (SectionType::LayerCsrShard, Some(name)) if modality_id == 0 => {
             // Legacy single-modality naming: `{layer}_shard_{idx}`.
             let prefix = format!("{name}_shard_");
@@ -775,58 +873,6 @@ fn collect_shards<'a>(
             .layer_csr_shards_for_modality(modality_id, name),
         _ => Vec::new(),
     }
-}
-
-#[allow(clippy::type_complexity)] // (indptr, indices, data) matches every read_csr_shard_* return type.
-fn read_shard_payload(
-    reader: &ScxReader,
-    modality_id: u8,
-    section_type: SectionType,
-    layer_name: Option<&str>,
-    shard_idx: usize,
-) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>), ConvertError> {
-    let (ip, ix, dv) = match (section_type, layer_name) {
-        (SectionType::CsrShard, _) => reader.read_csr_shard_for(modality_id, shard_idx)?,
-        (SectionType::LayerCsrShard, Some(name)) if modality_id == 0 => {
-            reader.read_layer_csr_shard(name, shard_idx)?
-        }
-        (SectionType::LayerCsrShard, Some(name)) => {
-            reader.read_layer_csr_shard_for(modality_id, name, shard_idx)?
-        }
-        _ => {
-            return Err(ConvertError::Other(format!(
-                "unsupported shard read: section_type={section_type:?}, layer_name={layer_name:?}"
-            )));
-        }
-    };
-    Ok((ip, ix, dv))
-}
-
-/// Indptr-only counterpart of [`read_shard_payload`]. Decodes just the
-/// row-pointer array, skipping indices/data — used by precompute paths
-/// that only need per-row nnz counts.
-fn read_shard_indptr(
-    reader: &ScxReader,
-    modality_id: u8,
-    section_type: SectionType,
-    layer_name: Option<&str>,
-    shard_idx: usize,
-) -> Result<Vec<i64>, ConvertError> {
-    let ip = match (section_type, layer_name) {
-        (SectionType::CsrShard, _) => reader.read_csr_shard_indptr_for(modality_id, shard_idx)?,
-        (SectionType::LayerCsrShard, Some(name)) if modality_id == 0 => {
-            reader.read_layer_csr_shard_indptr(name, shard_idx)?
-        }
-        (SectionType::LayerCsrShard, Some(name)) => {
-            reader.read_layer_csr_shard_indptr_for(modality_id, name, shard_idx)?
-        }
-        _ => {
-            return Err(ConvertError::Other(format!(
-                "unsupported shard read: section_type={section_type:?}, layer_name={layer_name:?}"
-            )));
-        }
-    };
-    Ok(ip)
 }
 
 /// `entry.stats` must be present on every shard in v2 catalogs (the
@@ -862,12 +908,19 @@ fn count_kept_rows_in_shards(shards: &[&FullCatalogEntry], keep_mask: &[bool]) -
     kept
 }
 
+/// Total kept nnz across `shards`, for pre-allocating the HDF5 triplet.
+///
+/// This used to re-derive which section family it was looking at —
+/// `if layer_name.is_some() { LayerCsrShard } else { CsrShard }` — and then
+/// decode by `(type, idx)`. That inference was correct only for as long as
+/// exactly two families existed: a raw pre-scan under a keep mask would have
+/// decoded **`/X`'s** indptrs and sized `/raw/X` from X's kept nnz. Reading
+/// each `entry` directly removes the guess rather than correcting it, which
+/// is why the parameter is gone instead of being threaded through.
 fn precompute_total_nnz(
     reader: &ScxReader,
     shards: &[&FullCatalogEntry],
     keep_mask_opt: Option<&[bool]>,
-    layer_name: Option<&str>,
-    modality_id: u8,
 ) -> Result<u64, ConvertError> {
     match keep_mask_opt {
         None => {
@@ -883,17 +936,11 @@ fn precompute_total_nnz(
             // DV active: decode each shard's indptr once to count
             // kept nnz. Indices/data stay encoded — they're not
             // touched until the main write loop's full-shard read.
-            let section_type = if layer_name.is_some() {
-                SectionType::LayerCsrShard
-            } else {
-                SectionType::CsrShard
-            };
             let mut nnz = 0u64;
-            for (shard_idx, entry) in shards.iter().enumerate() {
+            for entry in shards.iter() {
                 let stats = require_stats(entry)?;
                 let row_start = stats.row_start as usize;
-                let indptr_local =
-                    read_shard_indptr(reader, modality_id, section_type, layer_name, shard_idx)?;
+                let indptr_local = reader.read_shard_indptr_from_entry(entry)?;
                 let n_rows = indptr_local.len().saturating_sub(1);
                 for r in 0..n_rows {
                     let global = row_start + r;
@@ -1163,5 +1210,40 @@ fn filter_shard(
             }
             (kept_indptr_tail, kept_indices, kept_data)
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_axis_tests {
+    use super::ensure_raw_covers_obs;
+
+    /// `adata.raw` shares X's obs axis, so a raw that covers a different
+    /// number of rows is a corrupt file, not a shape to accommodate.
+    ///
+    /// Unit-tested rather than driven through a fixture because no writer in
+    /// the workspace can produce the state: both h5ad ingest paths assert
+    /// `raw_n_obs == n_obs`, `append` refuses a file that has raw, and
+    /// `merge` / `compact` / `sort` / `optimize` drop raw outright. Reaching
+    /// it end-to-end would mean hand-forging a corrupt SCX, which tests the
+    /// forgery as much as the guard.
+    #[test]
+    fn raw_row_count_must_equal_n_obs_in_both_directions() {
+        assert!(ensure_raw_covers_obs(10, 10).is_ok());
+        assert!(ensure_raw_covers_obs(0, 0).is_ok());
+
+        // Short raw: the case the streaming driver's own `mask.len() <
+        // n_obs_total` check lets through, producing an h5ad whose /raw/X has
+        // fewer rows than /obs.
+        let short = ensure_raw_covers_obs(9, 10).unwrap_err().to_string();
+        assert!(
+            short.contains('9') && short.contains("10"),
+            "error must name both counts, got: {short}"
+        );
+
+        // Long raw. A `<`-only check would accept this one.
+        assert!(
+            ensure_raw_covers_obs(11, 10).is_err(),
+            "a raw with MORE rows than obs is equally corrupt"
+        );
     }
 }

@@ -71,6 +71,13 @@ pub struct ReaderDebugCounts {
     pub read_varm: AtomicU64,
     pub read_all_varm: AtomicU64,
     pub read_varm_for: AtomicU64,
+    /// Whole-`adata.raw` materialising reads (`read_all_raw_csr_shards`).
+    ///
+    /// Paired with `read_shard_from_entry` this is what lets a test tell the
+    /// streaming h5ad export of `/raw` from the eager one. Both produce
+    /// identical values, so no assertion on the OUTPUT can distinguish them —
+    /// only the absence of this call plus the presence of the per-shard ones.
+    pub read_all_raw_csr_shards: AtomicU64,
 }
 
 pub struct ScxReader {

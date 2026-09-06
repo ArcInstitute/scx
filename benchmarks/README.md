@@ -707,9 +707,12 @@ or a layer** — so every `.scx` fixture has `obsm_keys == []` and
 `layer_names == []`, and an export threshold measured on one is blind to the
 whole-matrix copies the export path makes. Measured at tabula_sapiens_100k
 (195M nnz), same arm, three runs each: the streaming export peaks at 1735 MB on
-`_auto.scx` and 3314 MB on `_full.scx`. The ~1.5 GB difference is
+`_auto.scx` and 3314 MB on `_full.scx`. The ~1.5 GB difference was
 `write_raw_to_h5ad`'s `read_all_raw_csr_shards()` holding the raw matrix whole
 — 194,891,401 nnz x 8 B = 1487 MB, which accounts for the gap to within 3%.
+PR-04 (OPT-CONVERT-1) made raw stream, which is what closed that gap; the arm
+stays because a regression back to a materialising raw is invisible in the
+exported values and shows up only as peak RSS here.
 
 Note the two arms cover different things. **Export** carries raw, so
 `streaming_full` measures the raw copy. **Compact** does not: `scx-ops`' carry
@@ -718,8 +721,9 @@ table drops raw under a rewrite (with a warning) while carrying `Layer` and
 
 The builder materialises the entire AnnData, so it needs roughly 3x the source
 h5ad. pbmc3k takes ~4 s, tabula_sapiens_100k (~1.5 GB source) ~90 s on a normal
-node; `census_1m` (~11 GB source) wants a high-memory allocation and is not
-built by default.
+node; `census_1m` (~11 GB source) wants a high-memory allocation. All three are
+built (`census_1m_full.scx` was produced during the v0.16.0-opt-instruments
+capture); rebuild one with `--datasets <name>`.
 
 ### Verify datasets
 

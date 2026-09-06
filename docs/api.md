@@ -1874,7 +1874,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   without materialising `X` in memory. Mirror of `pyscx.from_h5ad` in the
   opposite direction. Bounded peak memory: one shard's worth of CSR
   plus encode buffers per matrix written, plus the always-resident
-  `indptr` (`(n_obs + 1) × 8` bytes). When deletion vectors are
+  `indptr` (`(n_obs + 1) × 8` bytes). "Per matrix" covers `X`, every
+  `layers` entry, and `adata.raw` — raw goes through the same shard
+  walk on its own (usually wider) gene axis. `obsm` / `varm` / `obsp` /
+  `varp` are still read whole and are the remaining unbounded term. When deletion vectors are
   present, only kept rows appear in the output (`shape[0] = n_obs -
   n_deleted`); a single pre-scan pass computes the filtered nnz before
   pre-allocating the HDF5 triplet so the on-disk layout is

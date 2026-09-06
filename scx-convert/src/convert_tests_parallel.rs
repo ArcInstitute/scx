@@ -1442,3 +1442,77 @@ fn dense_dtype_writers() -> Vec<(&'static str, DenseFixtureWriter)> {
         ("f64", write_dense::<f64>),
     ]
 }
+
+/// `/raw` survives the parallel export drain unchanged, with and without a
+/// deletion vector.
+///
+/// The four `parallel_export_*` tests above all use raw-free fixtures, so
+/// none of them put a `RawCsrShard` through the rayon pool. The DV arm is the
+/// one that matters: the writer thread's `nnz_offset` / `row_offset_kept`
+/// accumulators advance as shards come back through the reorder buffer, and
+/// raw is the second matrix to drive them within one export.
+#[test]
+fn parallel_export_with_raw_byte_identical() {
+    use super::pipeline::scx_to_h5ad_streaming;
+
+    fn raw_triplet(path: &std::path::Path) -> (Vec<i64>, Vec<i32>, Vec<f32>, Vec<i64>) {
+        let f = hdf5::File::open(path).unwrap();
+        let g = f.group("raw/X").unwrap();
+        (
+            g.dataset("indptr").unwrap().read_1d().unwrap().to_vec(),
+            g.dataset("indices").unwrap().read_1d().unwrap().to_vec(),
+            g.dataset("data").unwrap().read_1d().unwrap().to_vec(),
+            g.attr("shape").unwrap().read_1d().unwrap().to_vec(),
+        )
+    }
+
+    for deleted in [Vec::<u64>::new(), vec![1, 9, 12, 25, 41, 67]] {
+        let tag = if deleted.is_empty() { "clean" } else { "dv" };
+        let dir = tempfile::tempdir().unwrap();
+        let scx = dir.path().join("src.scx");
+        // 80 rows at shard_size 10 → 8 raw shards, more than the 4 worker
+        // threads below, so the reorder buffer actually has to reorder.
+        make_multishard_scx_with_raw(&scx, 80, 11, 19, 10);
+        if !deleted.is_empty() {
+            scx_ops::mark_deleted(&scx, &deleted).unwrap();
+        }
+
+        let seq = dir.path().join("seq.h5ad");
+        scx_to_h5ad_streaming(
+            &scx,
+            &seq,
+            &ExportOptions {
+                reader_threads: Some(1),
+                ..ExportOptions::default()
+            },
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+
+        let par = dir.path().join("par.h5ad");
+        scx_to_h5ad_streaming(
+            &scx,
+            &par,
+            &ExportOptions {
+                reader_threads: Some(4),
+                writer_queue_depth: 4,
+                ..ExportOptions::default()
+            },
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+
+        let a = raw_triplet(&seq);
+        let b = raw_triplet(&par);
+        assert_eq!(a.3, b.3, "{tag}: raw shape attr");
+        assert_eq!(a.0, b.0, "{tag}: raw indptr diverges under parallel export");
+        assert_eq!(a.1, b.1, "{tag}: raw indices diverges");
+        assert_eq!(a.2, b.2, "{tag}: raw data diverges");
+        assert_eq!(
+            a.3[0],
+            (80 - deleted.len()) as i64,
+            "{tag}: kept-row count in raw shape attr"
+        );
+        assert!(!a.1.is_empty(), "{tag}: fixture must have nonzeros");
+    }
+}

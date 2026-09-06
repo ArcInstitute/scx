@@ -154,8 +154,12 @@ pub enum ConvertWarning {
     /// `export_min_counts`) is active, but this section is read eagerly and
     /// filtered afterwards rather than streamed. The output is correct; the
     /// filter simply does not bound peak RSS for this section the way it does
-    /// for `/X`, `obs`, and `/layers`. Matters most on raw-droplet files,
-    /// which are exactly the ones a row filter targets.
+    /// for `/X`, `obs`, `/layers` and `/raw`.
+    ///
+    /// The remaining eager sections are `obsm` and `obsp`. `/raw` used to be
+    /// the third and by far the largest — the reason this variant said it
+    /// "matters most on raw-droplet files" — but it streams now, so a filtered
+    /// export of one no longer emits this for raw.
     ExportFilterSectionEager { section: &'static str },
     /// In-memory `from_anndata` ingest detected an obsm / varm / obsp /
     /// varp key whose estimated peak footprint exceeds `memory_budget`.

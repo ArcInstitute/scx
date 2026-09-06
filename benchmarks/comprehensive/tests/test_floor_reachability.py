@@ -2057,6 +2057,63 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
     assert checked == 3, checked
 
 
+def test_performance_doc_export_prose_matches_the_tracked_json():
+    """`docs/performance.md`'s export_streaming paragraph must equal the medians
+    in the tracked raw JSON.
+
+    The table pin above covers only the *conversion* rows. The export prose
+    quotes three numbers from
+    `export_streaming__scx_streaming_vs_materialize__census_1m.json` — which is
+    tracked for exactly that reason — and nothing checked them. PR-04
+    (OPT-CONVERT-1) moved one of the three (`streaming_full`, the arm that
+    carries `.raw`), which is precisely the situation where an unpinned
+    published number goes stale silently. That is the same shape as the 5.79-GB
+    error the table pin was written to prevent, so the prose gets the same
+    treatment.
+
+    Prose, not a table, so the numbers are matched by scenario keyword rather
+    than by row label.
+    """
+    import json
+    import re
+    import statistics
+
+    raw = PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "raw"
+    doc = (PROJECT_ROOT / "docs" / "performance.md").read_text()
+    fname = "export_streaming__scx_streaming_vs_materialize__census_1m.json"
+    assert (raw / fname).is_file(), (
+        f"{fname} is not tracked, so the export numbers citing it cannot be "
+        f"audited from a fresh checkout — force-add it "
+        f"(see docs/benchmark_manifest.md)"
+    )
+    d = json.loads((raw / fname).read_text())
+
+    # The paragraph is bounded so a number elsewhere in the doc cannot satisfy
+    # the search by accident.
+    start = doc.index("Measured 2026-09-03")
+    para = doc[start : doc.index("## Column Projection", start)]
+
+    checked = 0
+    for scenario in ("streaming", "materialize", "streaming_full"):
+        key = f"{scenario}_peak_rss_mb"
+        vals = [r["extra"][key] for r in d["runs"] if key in r.get("extra", {})]
+        assert vals, f"{fname} carries no {key}"
+        want = statistics.median(vals)
+        # `**3 165 MB**` / `**20 198 MB**` — thin or ordinary spaces as digit
+        # separators, bold optional.
+        found = [
+            float(m.replace("\u202f", "").replace(" ", "").replace(",", ""))
+            for m in re.findall(r"\*{0,2}([\d][\d\s,\u202f]*)\s*MB", para)
+        ]
+        assert any(abs(f - want) < 1.0 for f in found), (
+            f"{scenario}: docs/performance.md's export paragraph quotes "
+            f"{sorted(found)} MB, tracked median for {key} is {want:.0f} MB "
+            f"(min {min(vals):.0f}, max {max(vals):.0f})"
+        )
+        checked += 1
+    assert checked == 3, checked
+
+
 @pytest.mark.parametrize("mod", ["conversion_streaming", "export_streaming"])
 def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, monkeypatch):
     """Drive `run()` — do not just assert the constants exist.

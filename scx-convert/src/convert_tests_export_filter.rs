@@ -553,3 +553,194 @@ fn existing_scx_export_uns_key_is_preserved() {
         .unwrap();
     assert_eq!(value.as_str(), "user-owned");
 }
+
+// ---------------------------------------------------------------------------
+// `/raw` under a row filter (OPT-CONVERT-1)
+//
+// Invariant 2 of this file's header — "every obs-axis section agrees on the
+// kept row count" — covers `/raw` too: raw shares the obs axis. It was
+// untested here because raw was exported eagerly, by a different function,
+// with its own row-filter implementation (`write.rs::filter_csr_rows`).
+// ---------------------------------------------------------------------------
+
+/// `build_scx` with an `adata.raw` on a WIDER gene axis, spanning several
+/// raw shards.
+///
+/// `add_raw_group`'s canonical CSR is deliberately not returned: every
+/// assertion below compares against an unfiltered export of the same file, so
+/// that the expectation is not a second derivation of the fixture generator.
+fn build_scx_with_raw(
+    dir: &Path,
+    n_obs: usize,
+    n_vars: usize,
+    raw_n_vars: usize,
+) -> std::path::PathBuf {
+    let h5ad = dir.join("raw_in.h5ad");
+    let scx = dir.join("raw_in.scx");
+    // `extras = true` also writes a LAYER named "raw". Deliberate: it proves
+    // the `RawCsrShard` and `LayerCsrShard` families do not cross-contaminate
+    // now that both reach the same streaming driver.
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", true);
+    add_raw_group(&h5ad, n_obs, raw_n_vars);
+    let opts = IngestOptions {
+        shard_target_rows: 4,
+        ..IngestOptions::default()
+    };
+    h5ad_to_scx(&h5ad, &scx, &opts, &mut WarningSink::log()).unwrap();
+    scx
+}
+
+fn raw_values(file: &hdf5::File) -> Vec<f32> {
+    file.dataset("raw/X/data")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec()
+}
+
+fn raw_indptr(file: &hdf5::File) -> Vec<i64> {
+    file.dataset("raw/X/indptr")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec()
+}
+
+/// A caller mask filters `/raw/X` to the same rows as `/X` and `obs`, and
+/// the surviving VALUES are the masked rows of the unfiltered export.
+///
+/// Values, not just counts, on purpose. The pre-allocation that sizes
+/// `/raw/X/{indices,data}` comes from a pre-scan over the raw shards' own
+/// indptrs; a pre-scan that read `/X`'s instead would still produce the right
+/// row count. On this fixture raw is SPARSER than X (1–2 nnz/row against
+/// 2–3), so the mis-sized datasets would be over-allocated and the failure
+/// would be a garbage tail — silent unless the values are checked.
+#[test]
+fn mask_filters_raw_consistently_with_x_and_obs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (20usize, 15usize, 23usize);
+    let scx = build_scx_with_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    // Unfiltered baseline from the same file, so the expectation is not a
+    // re-derivation of the fixture generator.
+    let all_out = dir.path().join("all.h5ad");
+    export(&scx, &all_out, &ExportOptions::default()).unwrap();
+    let all = hdf5::File::open(&all_out).unwrap();
+    let all_ip = raw_indptr(&all);
+    let all_data = raw_values(&all);
+
+    // ODD rows, not even. `create_test_h5ad` gives row r `2 + (r % 2)`
+    // nonzeros and `add_raw_group` gives it 2 (1 where its two columns
+    // collide), so an EVEN-row mask makes X's kept nnz and raw's coincide
+    // exactly — and a pre-scan that sized `/raw/X` from `/X` would allocate
+    // the right length by accident. The premise is asserted below rather
+    // than left to the fixture generators to keep agreeing.
+    let mask: Vec<bool> = (0..n_obs).map(|r| r % 2 == 1).collect();
+    let kept = mask.iter().filter(|&&b| b).count();
+
+    let out = dir.path().join("out.h5ad");
+    export(&scx, &out, &mask_opts(mask.clone())).unwrap();
+    let f = hdf5::File::open(&out).unwrap();
+
+    assert_eq!(x_rows(&f), kept, "/X row count");
+    assert_eq!(raw_indptr(&f).len() - 1, kept, "/raw/X row count");
+    assert_eq!(dataset_len(&f, "obs/_index"), kept, "obs row count");
+
+    let raw_shape: Vec<i64> = f
+        .group("raw/X")
+        .unwrap()
+        .attr("shape")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(raw_shape, vec![kept as i64, raw_n_vars as i64]);
+
+    let mut expected = Vec::new();
+    for (row, &keep) in mask.iter().enumerate() {
+        if keep {
+            let (s, e) = (all_ip[row] as usize, all_ip[row + 1] as usize);
+            expected.extend_from_slice(&all_data[s..e]);
+        }
+    }
+    assert_eq!(raw_values(&f), expected, "/raw/X kept values");
+    assert_eq!(
+        dataset_len(&f, "raw/X/indices"),
+        expected.len(),
+        "indices must be allocated to the kept nnz, not over-allocated"
+    );
+    assert_eq!(dataset_len(&f, "raw/X/data"), expected.len());
+
+    // The premise that makes the two assertions above discriminating: if
+    // `/X` and `/raw/X` keep the same number of nonzeros, a pre-scan that
+    // read the wrong section family would still allocate the right length,
+    // and this test would pass against that bug. Watched red with the
+    // pre-scan pointed at `/X` — it fails only because these differ.
+    assert_ne!(
+        dataset_len(&f, "X/data"),
+        dataset_len(&f, "raw/X/data"),
+        "fixture must keep a DIFFERENT nnz for X and raw, else the \
+         allocation assertions above are vacuous"
+    );
+}
+
+/// A deletion vector filters `/raw` identically on the streaming and eager
+/// exporters. The eager path applies it through `write.rs::filter_csr_rows`,
+/// an independent implementation — which is what makes this a differential
+/// rather than a restatement of the streaming code.
+#[test]
+fn deletion_vector_filters_raw_like_the_eager_exporter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (20usize, 15usize, 23usize);
+    let scx = build_scx_with_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    scx_ops::mark_deleted(&scx, &[0, 1, 7]).unwrap();
+
+    let streamed_out = dir.path().join("streamed.h5ad");
+    export(&scx, &streamed_out, &ExportOptions::default()).unwrap();
+    let eager_out = dir.path().join("eager.h5ad");
+    crate::pipeline::scx_to_h5ad(&scx, &eager_out, &mut WarningSink::log()).unwrap();
+
+    let s = hdf5::File::open(&streamed_out).unwrap();
+    let e = hdf5::File::open(&eager_out).unwrap();
+    assert_eq!(raw_indptr(&s), raw_indptr(&e), "raw indptr");
+    assert_eq!(raw_values(&s), raw_values(&e), "raw data");
+    assert_eq!(
+        dataset_len(&s, "raw/X/indices"),
+        dataset_len(&e, "raw/X/indices"),
+        "raw indices length"
+    );
+    assert_eq!(raw_indptr(&s).len() - 1, n_obs - 3, "deleted rows dropped");
+    assert_eq!(x_rows(&s), n_obs - 3, "/X agrees with /raw");
+}
+
+/// Deleting every row leaves an empty-but-well-formed `/raw/X`: a
+/// single-element indptr and zero-length indices/data, matching what the
+/// eager writer produces. Sibling of
+/// `all_deleted_without_a_caller_filter_still_exports` for the raw section.
+#[test]
+fn all_deleted_export_writes_an_empty_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (8usize, 10usize, 17usize);
+    let scx = build_scx_with_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    let all: Vec<u64> = (0..n_obs as u64).collect();
+    scx_ops::mark_deleted(&scx, &all).unwrap();
+
+    let out = dir.path().join("empty.h5ad");
+    export(&scx, &out, &ExportOptions::default()).unwrap();
+    let f = hdf5::File::open(&out).unwrap();
+
+    assert_eq!(raw_indptr(&f), vec![0i64], "empty raw indptr");
+    assert_eq!(dataset_len(&f, "raw/X/indices"), 0);
+    assert_eq!(dataset_len(&f, "raw/X/data"), 0);
+    let shape: Vec<i64> = f
+        .group("raw/X")
+        .unwrap()
+        .attr("shape")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
+    assert_eq!(shape, vec![0, raw_n_vars as i64]);
+}

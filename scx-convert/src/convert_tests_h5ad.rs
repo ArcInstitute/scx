@@ -1,6 +1,7 @@
 //! scx-convert integration tests — h5ad (T5.6 split).
 
 use super::convert_tests_common::*;
+use super::pipeline::scx_to_h5ad_streaming;
 
 #[test]
 fn test_h5ad_csr_to_scx_to_h5ad_round_trip() {
@@ -3010,4 +3011,307 @@ fn uns_2d_list_with_non_finite_scalar_envelopes_exports_as_f64_dataset() {
         "sign of -inf lost: {got:?}"
     );
     assert_eq!(got[[1, 1]], 2.5);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming `/raw` export (OPT-CONVERT-1)
+//
+// Until this section existed, `scx_to_h5ad_streaming` had NO test that put a
+// real `.raw` in front of it: `test_h5ad_raw_round_trip` above varies the
+// *ingest* path but always exports through the eager `scx_to_h5ad`. The
+// streaming exporter reached raw only through the benchmark suite.
+// ---------------------------------------------------------------------------
+
+/// The canonical raw CSR `add_raw_group` writes and we compare against.
+type RawCsr = (Vec<i64>, Vec<i32>, Vec<f32>);
+
+/// `/raw/X`'s three datasets plus its `shape` attribute.
+fn raw_x_triplet(path: &Path) -> (Vec<i64>, Vec<i32>, Vec<f32>, Vec<i64>) {
+    let f = hdf5::File::open(path).unwrap();
+    let g = f.group("raw/X").unwrap();
+    (
+        g.dataset("indptr").unwrap().read_1d().unwrap().to_vec(),
+        g.dataset("indices").unwrap().read_1d().unwrap().to_vec(),
+        g.dataset("data").unwrap().read_1d().unwrap().to_vec(),
+        g.attr("shape").unwrap().read_1d().unwrap().to_vec(),
+    )
+}
+
+/// An SCX file whose `.raw` is WIDER than `X` and spans several raw shards.
+/// Returns the path and `add_raw_group`'s canonical `(indptr, indices, data)`.
+fn scx_with_multishard_raw(
+    dir: &Path,
+    n_obs: usize,
+    n_vars: usize,
+    raw_n_vars: usize,
+) -> (std::path::PathBuf, RawCsr) {
+    let h5ad = dir.join("raw_in.h5ad");
+    let scx = dir.join("raw_in.scx");
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", false);
+    let canonical = add_raw_group(&h5ad, n_obs, raw_n_vars);
+    let opts = IngestOptions {
+        shard_target_rows: 4,
+        ..IngestOptions::default()
+    };
+    h5ad_to_scx(&h5ad, &scx, &opts, &mut WarningSink::log()).unwrap();
+
+    // Premise, not decoration: a single-shard raw would let a broken shard
+    // walk pass. Assert the fixture actually spans several.
+    let reader = ScxReader::open(&scx).unwrap();
+    let n_raw_shards = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::RawCsrShard)
+        .count();
+    assert!(
+        n_raw_shards > 1,
+        "fixture must span multiple raw shards, got {n_raw_shards}"
+    );
+    (scx, canonical)
+}
+
+/// The streaming exporter writes `/raw/X` on RAW's own gene axis, not X's.
+///
+/// `raw_n_vars > n_vars` is the whole point of the fixture: `.raw` is
+/// captured before HVG subsetting, so passing `reader.n_vars()` into the
+/// streaming driver would produce a `shape` attr anndata reads as a
+/// differently-shaped matrix while every value still matched.
+#[test]
+fn streaming_export_writes_raw_on_raws_own_gene_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (12, 15, 23);
+    let (scx, (raw_ip, raw_ix, raw_dt)) =
+        scx_with_multishard_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    let out = dir.path().join("stream_out.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let (ip, ix, dt, shape) = raw_x_triplet(&out);
+    assert_eq!(ip, raw_ip, "streamed raw indptr");
+    assert_eq!(ix, raw_ix, "streamed raw indices");
+    assert_eq!(dt, raw_dt, "streamed raw data");
+    assert_eq!(
+        shape,
+        vec![n_obs as i64, raw_n_vars as i64],
+        "raw shape must use raw's own (wider) gene axis, not X's {n_vars}"
+    );
+
+    // `raw/var` is a single section (var is never sharded) and keeps the
+    // whole-batch writer on both paths.
+    let f = hdf5::File::open(&out).unwrap();
+    assert_eq!(
+        f.dataset("raw/var/_index").unwrap().shape()[0],
+        raw_n_vars,
+        "raw/var rows"
+    );
+    // `create_csr_triplet` never sets a chunk layout. A change that did
+    // would alter the on-disk shape without moving a single value.
+    assert!(
+        !f.dataset("raw/X/data").unwrap().is_chunked(),
+        "streamed raw datasets must stay contiguous"
+    );
+}
+
+/// Streaming and eager export produce the same raw VALUES.
+///
+/// Not the same file bytes: the eager writer creates-and-writes each
+/// dataset before adding attrs while `create_csr_triplet` creates all three
+/// then hyperslabs, so the HDF5 layouts already differ for `/X` today.
+///
+/// This is the test that catches the silent-corruption failure mode. With
+/// no `RawCsrShard` arm in `collect_shards` the driver sees zero shards,
+/// pre-allocates a zero-length triplet and writes an EMPTY `/raw/X` —
+/// no error, no warning, and a peak-RSS benchmark that reads as a triumph.
+#[test]
+fn streaming_and_eager_raw_export_agree_on_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (12, 15, 23);
+    let (scx, _) = scx_with_multishard_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    let eager_out = dir.path().join("eager.h5ad");
+    scx_to_h5ad(&scx, &eager_out, &mut WarningSink::log()).unwrap();
+    let streamed_out = dir.path().join("streamed.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &streamed_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let eager = raw_x_triplet(&eager_out);
+    let streamed = raw_x_triplet(&streamed_out);
+    assert_eq!(streamed.0, eager.0, "indptr");
+    assert_eq!(streamed.1, eager.1, "indices");
+    assert_eq!(streamed.2, eager.2, "data");
+    assert_eq!(streamed.3, eager.3, "shape attr");
+    assert!(
+        !streamed.1.is_empty(),
+        "a non-empty raw must stay non-empty"
+    );
+}
+
+/// An all-zero `.raw` has no nonzeros to encode but still has rows, and it
+/// must survive the streaming path with the shape the eager path writes.
+/// `create_csr_triplet` pre-allocates from `stats.nnz`, so a zero total is
+/// the boundary where a length-0 `indices`/`data` meets an (n_obs + 1)
+/// `indptr`.
+#[test]
+fn streaming_raw_export_handles_an_all_zero_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (10, 6, 9);
+    let h5ad = dir.path().join("zero_raw.h5ad");
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", false);
+    {
+        // `add_raw_group` always emits nonzeros; write the empty CSR by hand.
+        let file = hdf5::File::open_rw(&h5ad).unwrap();
+        let raw = file.create_group("raw").unwrap();
+        let rx = raw.create_group("X").unwrap();
+        rx.new_dataset::<i64>()
+            .shape([n_obs + 1])
+            .create("indptr")
+            .unwrap()
+            .write(&vec![0i64; n_obs + 1])
+            .unwrap();
+        rx.new_dataset::<i32>()
+            .shape([0])
+            .create("indices")
+            .unwrap()
+            .write(&Vec::<i32>::new())
+            .unwrap();
+        rx.new_dataset::<f32>()
+            .shape([0])
+            .create("data")
+            .unwrap()
+            .write(&Vec::<f32>::new())
+            .unwrap();
+        rx.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        rx.new_attr::<VarLenUnicode>()
+            .create("encoding-version")
+            .unwrap()
+            .write_scalar(&vlu("0.1.0"))
+            .unwrap();
+        rx.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, raw_n_vars as i64])
+            .unwrap();
+        let rv = raw.create_group("var").unwrap();
+        let idx: Vec<VarLenUnicode> = (0..raw_n_vars).map(|i| vlu(&format!("r{i}"))).collect();
+        rv.new_dataset::<VarLenUnicode>()
+            .shape([raw_n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&idx)
+            .unwrap();
+        rv.new_attr::<VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+        rv.new_attr::<VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("dataframe"))
+            .unwrap();
+    }
+
+    let scx = dir.path().join("zero_raw.scx");
+    h5ad_to_scx(
+        &h5ad,
+        &scx,
+        &IngestOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let eager_out = dir.path().join("zero_eager.h5ad");
+    scx_to_h5ad(&scx, &eager_out, &mut WarningSink::log()).unwrap();
+    let streamed_out = dir.path().join("zero_streamed.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &streamed_out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let eager = raw_x_triplet(&eager_out);
+    let streamed = raw_x_triplet(&streamed_out);
+    assert_eq!(streamed.0, eager.0, "empty-raw indptr");
+    assert!(
+        streamed.1.is_empty() && streamed.2.is_empty(),
+        "no nonzeros"
+    );
+    assert_eq!(streamed.3, eager.3, "empty-raw shape attr");
+}
+
+/// `/raw` is written shard-by-shard, not materialised.
+///
+/// Every other test in this section asserts VALUES, and values cannot see
+/// this: the eager `write_raw_to_h5ad` produces byte-identical `/raw/X`
+/// content. They all pass against the pre-change code. The only in-process
+/// evidence that raw streams is which reader methods were called — so this
+/// asserts both halves, per the discipline `ReaderDebugCounts` documents:
+///
+/// * `read_all_raw_csr_shards == 0` — the materialising path was not taken;
+/// * `read_shard_from_entry >= n_raw_shards` — the per-shard path *was*.
+///
+/// The first alone is satisfied by a `/raw` that was skipped entirely.
+///
+/// Counters are per-`ScxReader` and `cfg(debug_assertions)`-gated, so this
+/// drives `stream_raw_at` directly against a reader it owns rather than going
+/// through `scx_to_h5ad_streaming`, which opens its own.
+#[test]
+fn streaming_raw_export_never_materialises_the_whole_raw_matrix() {
+    use super::h5ad::stream_write::stream_raw_at;
+    use std::sync::atomic::Ordering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (12, 15, 23);
+    let (scx, _) = scx_with_multishard_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    let reader = ScxReader::open(&scx).unwrap();
+    let n_raw_shards = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::RawCsrShard)
+        .count() as u64;
+
+    let out = dir.path().join("counted.h5ad");
+    let file = hdf5::File::create(&out).unwrap();
+    let root = file.as_group().unwrap();
+    stream_raw_at(
+        &root,
+        &reader,
+        None,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let counts = reader.debug_counts();
+    assert_eq!(
+        counts.read_all_raw_csr_shards.load(Ordering::Relaxed),
+        0,
+        "streaming export must not call read_all_raw_csr_shards"
+    );
+    assert!(
+        counts.read_shard_from_entry.load(Ordering::Relaxed) >= n_raw_shards,
+        "expected at least {n_raw_shards} per-shard decodes, got {}",
+        counts.read_shard_from_entry.load(Ordering::Relaxed)
+    );
 }

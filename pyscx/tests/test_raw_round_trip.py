@@ -514,6 +514,18 @@ def test_empty_raw_matrix_round_trips(tmp_dir):
     assert out.raw.X.nnz == 0
     assert list(out.raw.var_names) == [f"r{i}" for i in range(raw_n_vars)]
 
+    # ...and through the streaming h5ad exporter, read back by anndata itself.
+    # zero nnz is the boundary where the streaming writer pre-allocates a
+    # length-0 indices/data against an (n_obs + 1) indptr; only anndata/scipy
+    # can say whether the result is a matrix they will actually accept.
+    h5ad_out = str(tmp_dir / "emptyraw.h5ad")
+    pyscx.to_h5ad(scx_path, h5ad_out)
+    rt = anndata.read_h5ad(h5ad_out)
+    assert rt.raw is not None, "an all-zero raw must survive scx -> h5ad"
+    assert rt.raw.shape == (n_obs, raw_n_vars)
+    assert rt.raw.X.nnz == 0
+    assert list(rt.raw.var_names) == [f"r{i}" for i in range(raw_n_vars)]
+
 
 def test_in_place_contract_extends_to_raw(tmp_dir):
     """`in_place` now governs `adata.raw.X` too, not just X and layers.
