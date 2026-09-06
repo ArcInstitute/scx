@@ -67,8 +67,16 @@ pub struct ExportOptions {
     /// Provenance tool name recorded in the exported `uns["scx_export"]`.
     /// Shared with [`crate::IngestOptions::tool`].
     pub tool: String,
-    /// Byte budget for the export reader pool. Shared with
-    /// [`crate::IngestOptions::memory_budget`].
+    /// Byte budget for the export reader pool. Same parsing and units as
+    /// [`crate::IngestOptions::memory_budget`], but a narrower job on this
+    /// side: it bounds how many decoded shards are in flight, evaluated
+    /// **per matrix written** — `/X`, each layer, and `/raw/X`.
+    ///
+    /// Applies **only** when `reader_threads` resolves to > 1. At one thread
+    /// there is nothing left to derate, so the sequential route runs whatever
+    /// the file needs — which is why the refusal offers `--reader-threads 1`
+    /// as the alternative to raising the budget. Pinned by
+    /// `export_memory_budget_applies_to_raw_and_names_it`.
     pub memory_budget: Option<u64>,
     /// Export-side shard-decode worker count; `None` resolves to
     /// `RAYON_NUM_THREADS` or `available_parallelism`. Shared with

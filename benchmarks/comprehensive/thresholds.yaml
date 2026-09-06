@@ -2125,9 +2125,11 @@ absolute_floors:
   # makes the first one's numbers safe to discard rather than argue about.
   #
   # i.e. 1.65x at tabula and 2.68x at census — 12.7 GB freed on the census
-  # export. The plain (`_auto.scx`) arm is unchanged at 1.00x on all three,
-  # which is the control: those fixtures have no raw, so a change scoped to raw
-  # must not move them.
+  # export. The plain (`_auto.scx`) arm is the control — those fixtures have no
+  # raw, so a change scoped to raw must not move them — and it does not: 1.015x
+  # / 1.010x / 1.011x, which is cross-capture variance (this capture ran on
+  # GPU71BA, the v0.16.0 baseline on a different node), not a shift. Quoting it
+  # as a flat "1.00x" would be tidier and false.
   #
   # The residual over the plain arm is NOT one shard's worth. It is the
   # remaining eager `obsm` read plus the fact that peak RSS over a multi-matrix
@@ -2136,7 +2138,8 @@ absolute_floors:
   # the rest needs OPT-CONVERT-4 and an allocator-level look; it is not claimed
   # here.
   #
-  # CEILING AT 1.30x THE MEDIAN, not the 1.18x used elsewhere, and the looseness
+  # CEILINGS AT ~1.30x THE MEDIAN, rounded to a round number (3000 = 1.300x of
+  # 2308.1; 9800 = 1.298x of 7547.2), not the 1.18x used elsewhere, and the looseness
   # is deliberate. The ceiling this replaces was set at 4096 from a capture whose
   # worst observation was 3347, and by the v0.16.0 capture the median had moved
   # to 3799.4 with a worst of 3846.6 — 6.5% of headroom left, i.e. it was about
@@ -3241,7 +3244,7 @@ absolute_floors:
 #
 #    The expectation recorded here was that the ceiling would stay dominated by
 #    `read_all_raw_csr_shards()`. PR-04 removed that term instead: raw streams,
-#    census_1m went 20198 -> 7604 MB. The residual over the plain arm is larger
+#    census_1m went 20198 -> 7547 MB. The residual over the plain arm is larger
 #    than one shard's worth and is not yet attributed — `obsm` is still read
 #    whole (OPT-CONVERT-4) and peak RSS over a multi-matrix export is not the
 #    max of independent peaks.

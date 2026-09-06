@@ -1882,7 +1882,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   largest one rather than for `X`: raw is captured before HVG subsetting and
   its shards are usually the binding constraint on a `.raw`-bearing file. Raw
   is written last, so a budget that admits `X` but not raw raises only after
-  `/X` and the layers are on disk, leaving a partial output. When deletion vectors are
+  `/X` and the layers are on disk, leaving a partial output. The check runs
+  **only on the parallel route** (`reader_threads` > 1) — the budget bounds
+  how many shards are in flight, and at one thread there is nothing to
+  derate, which is why the refusal offers `--reader-threads 1` as the
+  alternative to raising the budget. When deletion vectors are
   present, only kept rows appear in the output (`shape[0] = n_obs -
   n_deleted`); a single pre-scan pass computes the filtered nnz before
   pre-allocating the HDF5 triplet so the on-disk layout is

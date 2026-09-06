@@ -145,8 +145,20 @@ Every number that appears in a user-visible document must satisfy:
 1. A corresponding raw JSON result exists in `benchmarks/comprehensive/results/raw/`
    **or** the number appears in `baselines/LATEST/summary.json`.
 2. The result's `system.provenance.git_sha` is an ancestor of `main`.
+
+   A capture taken on a PR branch to justify numbers that PR is publishing
+   satisfies this **on merge**, not before — the SHA is an ancestor of the PR
+   head, and becomes an ancestor of `main` when the branch lands. That is the
+   expected state for a PR that changes a published number, and is fine. What
+   is *not* fine, and is the failure this clause exists to catch, is a SHA
+   that is an ancestor of nothing: a capture from a commit that was later
+   amended, rebased away, or never pushed cannot be resolved by anyone
+   reading the result afterwards.
 3. The result's `system.provenance.git_dirty` is `false` (or the dirtiness
-   is documented as acceptable — e.g., benchmark-only changes).
+   is documented as acceptable — e.g., benchmark-only changes). "Documented"
+   means the specific files are named somewhere a reader will find them
+   (the threshold comment that cites the number is the usual place), not
+   merely asserted to be harmless.
 
 ### Automated verification
 

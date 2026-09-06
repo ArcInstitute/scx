@@ -1676,4 +1676,35 @@ fn export_memory_budget_applies_to_raw_and_names_it() {
         &mut WarningSink::log(),
     )
     .expect("a budget above raw's working set must succeed");
+
+    // SEQUENTIAL ROUTE: the same below-raw budget does NOT refuse.
+    //
+    // The budget bounds how many shards are in flight; at one thread there is
+    // nothing left to derate, so refusing would leave the caller no remedy —
+    // which is why the refusal's own text offers `--reader-threads 1` as the
+    // alternative to raising the budget. Pinned here because it is the
+    // difference between a documented escape hatch and a hole: the docs on
+    // `pyscx.to_h5ad` and in `docs/api.md` say the check is parallel-only, and
+    // this is what would fail if that stopped being true in either direction.
+    let seq_out = dir.path().join("budget_seq.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &seq_out,
+        &ExportOptions {
+            reader_threads: Some(1),
+            memory_budget: Some(budget),
+            ..ExportOptions::default()
+        },
+        &mut WarningSink::log(),
+    )
+    .expect("reader_threads=1 is the documented escape from the budget");
+
+    // ...and it must produce the same raw as the unbudgeted parallel run,
+    // so "escape" means "skips the derate", not "skips the data".
+    let a = hdf5::File::open(&ok_out).unwrap();
+    let b = hdf5::File::open(&seq_out).unwrap();
+    let data = |f: &hdf5::File| -> Vec<f32> {
+        f.dataset("raw/X/data").unwrap().read_1d().unwrap().to_vec()
+    };
+    assert_eq!(data(&a), data(&b), "sequential raw must match parallel raw");
 }
