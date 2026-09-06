@@ -115,7 +115,7 @@ pub(super) fn to_anndata_impl<'py>(
             preserve_slots,
             eager,
             memory_budget_bytes,
-            false,
+            convert::MatrixMode::Eager,
             preserve_var_order,
             strict_var_names,
             &plan,

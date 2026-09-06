@@ -467,3 +467,96 @@ def test_non_default_plans_compose_with_a_projection(rich, kwargs):
     np.testing.assert_allclose(
         np.asarray(_dense(out.X), dtype=np.float64), source["x"][:, SORTED_IDX]
     )
+
+
+# --------------------------------------------------------------------------
+# preserve_slots=True + obs_filter + var_names — the branch that shares the
+# projected route and filters rows as well as columns
+# --------------------------------------------------------------------------
+
+
+def test_preserve_slots_with_var_names_keeps_raw_aligned(rich):
+    """`.raw` must follow the obs filter, and it is not enough to check its shape.
+
+    anndata does not var-slice `.raw` but it does obs-slice it, so a projected
+    read that attaches raw *after* a row-filtering slice hands a filtered
+    AnnData a full-height raw — and `Raw` takes the parent's row count and the
+    assignee's matrix without checking they agree. The result reports
+    `raw.shape == (K, raw_n_vars)` while `raw.X.shape` is `(N, raw_n_vars)`,
+    which is the same "right shape, wrong rows" class this path already guards
+    against for X and layers. Assert on `raw.X`, not on `raw.shape`.
+    """
+    import warnings
+
+    import pyscx
+
+    path, source = rich
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = pyscx.open(path).to_anndata(
+            var_names=NAMES, obs_filter="group == 'a'", preserve_slots=True
+        )
+    keep = np.arange(N_OBS) % 2 == 0
+    assert out.shape == (int(keep.sum()), 3)
+    assert out.raw is not None
+    assert out.raw.X.shape == (int(keep.sum()), RAW_N_VARS), (
+        "raw.X must be row-filtered, not merely reported as filtered"
+    )
+    np.testing.assert_allclose(_dense(out.raw.X), source["raw"][keep])
+
+
+def test_preserve_slots_with_var_names_equals_full_then_sliced(rich):
+    """The same differential the var-only path gets, with a row mask as well."""
+    import warnings
+
+    from anndata.tests.helpers import assert_equal
+
+    import pyscx
+
+    path, _ = rich
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        projected = pyscx.open(path).to_anndata(
+            var_names=NAMES, obs_filter="group == 'a'", preserve_slots=True
+        )
+    full = pyscx.open(path).to_anndata()
+    mask = full.obs["group"].to_numpy() == "a"
+    sliced = full[mask, np.array(SORTED_IDX)].copy()
+
+    assert list(projected.var_names) == list(sliced.var_names)
+    assert list(projected.obs_names) == list(sliced.obs_names)
+    assert_equal(projected, sliced)
+
+
+def test_preserve_slots_with_var_names_and_deletions(tmp_dir):
+    """Row filter composed on top of a deletion vector, with the gene projection.
+
+    Raw is dropped on a deletion-vector file, so this arm is about X, layers and
+    the obs-axis members landing on the right cells.
+    """
+    import warnings
+
+    import pyscx
+
+    source = _source(seed=11)
+    path = str(tmp_dir / "ps_deleted.scx")
+    pyscx.from_anndata(_rich_adata(source), path, shard_size=8)
+    deleted = np.zeros(N_OBS, dtype=bool)
+    deleted[[0, 9, 20]] = True
+    pyscx.open(path).mark_deleted(deleted)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = pyscx.open(path).to_anndata(
+            var_names=NAMES, obs_filter="group == 'a'", preserve_slots=True
+        )
+
+    live = ~deleted
+    wanted = live & (np.arange(N_OBS) % 2 == 0)
+    assert out.shape == (int(wanted.sum()), 3)
+    np.testing.assert_allclose(_dense(out.X), source["x"][np.ix_(wanted, SORTED_IDX)])
+    np.testing.assert_allclose(
+        _dense(out.layers["counts"]), source["counts"][np.ix_(wanted, SORTED_IDX)]
+    )
+    np.testing.assert_allclose(out.obsm["X_emb"], source["emb"][wanted])
+    assert list(out.obs_names) == [f"c{i}" for i in np.flatnonzero(wanted)]

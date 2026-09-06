@@ -72,7 +72,11 @@ pub(crate) enum MatrixMode {
     /// Everything inline: `X`, eager `layers`, and `.raw`.
     Eager,
     /// No `X`; `layers` and `.raw` unchanged. `to_gpu_anndata` decodes X
-    /// straight onto the device and assigns it afterwards.
+    /// straight onto the device and assigns it afterwards. Its only
+    /// constructor is behind `feature = "gpu"`, so a default build sees it as
+    /// dead — allowed there rather than everywhere, so the variant still has to
+    /// earn its place in a GPU build.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     SkipX,
     /// No `X` and no `layers`, an explicit `shape=`, and `.raw` deferred to the
     /// caller. The gene-projection path builds the metadata half here, lets
@@ -570,7 +574,7 @@ fn mask_true_positions(py: Python<'_>, mask: &Bound<'_, PyAny>) -> PyResult<Vec<
 /// `None` means no deletion vectors, so a visible row *is* a global row and the
 /// positions are already the answer. Shared by the backed `obs_filter` path and
 /// the projected `preserve_slots` one, which compose the same two things.
-fn compose_kept_to_global(kept_to_global: Option<&Vec<u64>>, positions: &[usize]) -> Vec<u64> {
+fn compose_kept_to_global(kept_to_global: Option<&[u64]>, positions: &[usize]) -> Vec<u64> {
     match kept_to_global {
         Some(existing) => positions.iter().map(|&i| existing[i]).collect(),
         None => positions.iter().map(|&i| i as u64).collect(),
@@ -601,7 +605,7 @@ fn projected_eager_anndata<'py>(
     filters: SlotFilters<'_>,
     memory_budget: Option<u64>,
     plan: &scx_sparse::MaterializePlan,
-    col_indices: &Vec<u32>,
+    col_indices: &[u32],
     preserve_var_order: bool,
     obs_filter_expr: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -629,26 +633,46 @@ fn projected_eager_anndata<'py>(
         Some(expr) => {
             let mask = eval_preserve_slots_mask(py, &skeleton, expr)?;
             let positions = mask_true_positions(py, &mask)?;
-            kept_to_global = Some(compose_kept_to_global(kept_to_global.as_ref(), &positions));
+            kept_to_global = Some(compose_kept_to_global(
+                kept_to_global.as_deref(),
+                &positions,
+            ));
             mask
         }
     };
+
+    // `.raw` is attached *before* the slice whenever the slice filters rows, and
+    // after it otherwise.
+    //
+    // anndata does not var-slice raw but it does obs-slice it, so on the
+    // `preserve_slots` route the post-slice attachment would hand a filtered
+    // AnnData a full-height raw. That does not raise: `Raw` takes the parent's
+    // row count and the assignee's matrix without checking they agree, so
+    // `adata.raw.shape` follows the filtered cells while `adata.raw.X` holds
+    // every row — the same "right shape, wrong rows" class this path already
+    // guards against for X and layers via `kept_to_global`. Attaching first
+    // costs the extra full-width raw copy that the var-only path avoids, on a
+    // route that already copies everything; being right is worth more than
+    // that copy.
+    let filters_rows = obs_filter_expr.is_some();
+    if filters_rows {
+        attach_raw(py, &skeleton, reader, filters, plan)?;
+    }
 
     let np_indices = PyArray1::from_slice(py, col_indices);
     let idx = pyo3::types::PyTuple::new(py, &[row_idx.unbind(), np_indices.into_any().unbind()])?;
     let adata = skeleton.get_item(idx)?.call_method0("copy")?;
 
     let catalog = reader.catalog_arc();
-    let window = decode_window(reader);
     let x = projected_matrix(
         py,
         path,
         std::sync::Arc::clone(&catalog),
         None,
-        kept_to_global.as_ref(),
+        kept_to_global.as_deref(),
         col_indices,
         preserve_var_order,
-        window,
+        decode_window(reader, None),
         plan,
     )?;
     adata.setattr("X", x)?;
@@ -679,17 +703,19 @@ fn projected_eager_anndata<'py>(
                 path,
                 std::sync::Arc::clone(&catalog),
                 Some(name),
-                kept_to_global.as_ref(),
+                kept_to_global.as_deref(),
                 col_indices,
                 preserve_var_order,
-                window,
+                decode_window(reader, Some(name)),
                 &layer_plan,
             )?;
             layers_attr.set_item(name, mat)?;
         }
     }
 
-    attach_raw(py, &adata, reader, filters, plan)?;
+    if !filters_rows {
+        attach_raw(py, &adata, reader, filters, plan)?;
+    }
     Ok(adata)
 }
 
@@ -701,30 +727,56 @@ fn projected_eager_anndata<'py>(
 /// A window restores the parallelism while keeping the memory claim honest:
 /// peak holds `window` full-width shards, not the whole matrix.
 ///
-/// Sized from the catalog's average X shard nnz against a fixed budget, so a
-/// file with very large shards narrows the window rather than the in-flight
-/// bytes growing with core count. The same window serves each layer, whose
-/// shards are assumed to be of comparable density — an approximation, and the
-/// reason the budget is set well below anything a caller would notice.
+/// Full-width decoded shards may occupy this much at once during a projected
+/// assembly. Well under the 8 GiB default eager budget, and far above any real
+/// shard.
+const IN_FLIGHT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Sized against the **largest** shard of the matrix being read, so the budget
+/// holds whichever shards the window actually lands on. An average would not:
+/// a skewed file can carry one shard many times the mean, and a layer can be
+/// far denser than X, so averaging X's shards and reusing the answer for every
+/// layer would let the in-flight bytes exceed the budget by an arbitrary
+/// factor. Computed per matrix for the same reason.
 ///
 /// Deliberately independent of the `memory_budget` kwarg: that one is advisory
 /// (it warns, it does not block), and making it govern decode concurrency would
 /// quietly change what it means.
-fn decode_window(reader: &ScxReader) -> usize {
-    /// Full-width decoded shards may occupy this much at once. Well under the
-    /// 8 GiB default eager budget, and far above any real shard.
-    const IN_FLIGHT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-
+fn decode_window(reader: &ScxReader, layer: Option<&str>) -> usize {
     let threads = rayon::current_num_threads().max(1);
-    let n_shards = reader.header().n_csr_shards as u64;
-    if n_shards == 0 {
+    let entries: Vec<&scx_format_io::FullCatalogEntry> = match layer {
+        Some(name) => reader.catalog().layer_csr_shards_for_modality(0, name),
+        None => reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+            .collect(),
+    };
+    // A decoded shard is roughly `nnz * 8` (i32 index + f32 value per nonzero)
+    // plus its indptr; the indptr term is noise beside the values. An entry
+    // without stats cannot be sized, so fall back to one shard at a time rather
+    // than guessing — the conservative direction.
+    let mut max_nnz = 0u64;
+    let mut sized_every_shard = !entries.is_empty();
+    for entry in entries {
+        match &entry.stats {
+            Some(stats) => max_nnz = max_nnz.max(stats.nnz),
+            None => sized_every_shard = false,
+        }
+    }
+    if !sized_every_shard {
         return 1;
     }
-    // A decoded shard is roughly `nnz * 8` (i32 index + f32 value per nonzero)
-    // plus its indptr; the indptr term is noise beside the values.
-    let shard_bytes = (reader.nnz() / n_shards).saturating_mul(8).max(1);
-    let by_bytes = (IN_FLIGHT_BUDGET_BYTES / shard_bytes).max(1) as usize;
-    threads.min(by_bytes)
+    window_for(threads, max_nnz.saturating_mul(8))
+}
+
+/// The budget arithmetic behind [`decode_window`], split out so it can be
+/// tested without a file: how many shards of `shard_bytes` fit in the in-flight
+/// budget, capped at `threads` and never below 1.
+fn window_for(threads: usize, shard_bytes: u64) -> usize {
+    let by_bytes = (IN_FLIGHT_BUDGET_BYTES / shard_bytes.max(1)).max(1) as usize;
+    threads.max(1).min(by_bytes)
 }
 
 /// Open a `BackedCsrReader` over X (`layer = None`) or one named layer, reusing
@@ -756,14 +808,14 @@ pub(crate) fn open_backed_matrix_reader(
 /// `adata.var`. Shared so X and every layer cannot pick different setters.
 pub(crate) fn install_projection(
     ds: &mut crate::backed::ScxBackedSparseDataset,
-    col_indices: Option<&Vec<u32>>,
+    col_indices: Option<&[u32]>,
     preserve_var_order: bool,
 ) {
     if let Some(indices) = col_indices {
         if preserve_var_order {
-            ds.set_col_projection_ordered(indices.clone());
+            ds.set_col_projection_ordered(indices.to_vec());
         } else {
-            ds.set_col_projection(indices.clone());
+            ds.set_col_projection(indices.to_vec());
         }
     }
 }
@@ -779,8 +831,8 @@ fn projected_matrix<'py>(
     path: &std::path::Path,
     catalog: std::sync::Arc<scx_format_io::FullCatalog>,
     layer: Option<&str>,
-    kept_to_global: Option<&Vec<u64>>,
-    col_indices: &Vec<u32>,
+    kept_to_global: Option<&[u64]>,
+    col_indices: &[u32],
     preserve_var_order: bool,
     window: usize,
     plan: &scx_sparse::MaterializePlan,
@@ -790,7 +842,7 @@ fn projected_matrix<'py>(
     let backed = open_backed_matrix_reader(path, catalog, layer, 0)?;
     let mut ds = match kept_to_global {
         Some(mapping) => {
-            ScxBackedSparseDataset::from_reader_with_deletions(backed, mapping.clone())
+            ScxBackedSparseDataset::from_reader_with_deletions(backed, mapping.to_vec())
         }
         None => ScxBackedSparseDataset::from_reader(backed),
     };
@@ -799,16 +851,12 @@ fn projected_matrix<'py>(
         crate::backed::materialize_projected(&ds, window).map_err(|e| e.to_string())
     })
     .map_err(PyRuntimeError::new_err)?;
-    let csr = csr_to_scipy(py, csr)?;
     // The projected assembler is f32; a non-default plan narrows the (already
-    // small) projected result afterwards. Reaching here at all means
+    // small) projected result on the way out. Reaching here at all means
     // `f32_roundtrip_is_exact` said the detour cannot round a value, and the
-    // narrow itself is still gated per element by `retype_matrix`.
-    if plan.is_default_csr_f32() {
-        Ok(csr)
-    } else {
-        retype_matrix(py, csr, plan)
-    }
+    // narrow is still gated per element by `csr_to_scipy_typed`, which also
+    // short-circuits to `csr_to_scipy` for the default plan.
+    csr_to_scipy_typed(py, csr, plan)
 }
 
 /// Reconstruct `adata.raw` from the file's raw sections, or say why not.
@@ -900,24 +948,25 @@ pub fn to_anndata_filtered<'py>(
     preserve_slots: bool,
     eager: bool,
     memory_budget: Option<u64>,
-    skip_x: bool,
+    base_mode: MatrixMode,
     preserve_var_order: bool,
     strict_var_names: bool,
     plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // `skip_x` (the X-less object `to_gpu_anndata` fills in) is only meaningful
+    // `SkipX` (the X-less object `to_gpu_anndata` fills in) is only meaningful
     // on the no-filter fast path — the caller guarantees no var_names /
-    // obs_filter / layer projection when it sets it (those paths reshape X and
-    // must build it).
+    // obs_filter / layer projection when it passes it (those paths reshape X
+    // and must build it). `Skeleton` is chosen inside this function, never by a
+    // caller: it is a step of the projected route, not a mode to request.
     debug_assert!(
-        !skip_x || (var_names.is_none() && obs_filter.is_none() && layer_filter.is_none()),
-        "skip_x requires no var_names / obs_filter / layer_filter"
+        !matches!(base_mode, MatrixMode::SkipX)
+            || (var_names.is_none() && obs_filter.is_none() && layer_filter.is_none()),
+        "MatrixMode::SkipX requires no var_names / obs_filter / layer_filter"
     );
-    let base_mode = if skip_x {
-        MatrixMode::SkipX
-    } else {
-        MatrixMode::Eager
-    };
+    debug_assert!(
+        !matches!(base_mode, MatrixMode::Skeleton { .. }),
+        "MatrixMode::Skeleton is internal to the projected route"
+    );
 
     // Validate the slot filters here rather than in `to_anndata_with_layers`:
     // this function has four branches and one of them (the obs-filtered query
@@ -973,9 +1022,18 @@ pub fn to_anndata_filtered<'py>(
         // This branch is the highest-peak path in the API — it exists to keep
         // every slot — so leaving it on assemble-then-slice would be an
         // incoherent contract.
-        if let Some(names) = var_names {
-            let indices =
-                resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
+        // Resolved once: the fallback below reuses these rather than re-scanning
+        // every string column of `var` a second time.
+        let resolved = match var_names {
+            Some(names) => Some(resolve_var_names_to_indices(
+                reader,
+                names,
+                preserve_var_order,
+                strict_var_names,
+            )?),
+            None => None,
+        };
+        if let Some(indices) = &resolved {
             if projection_is_safe(reader, plan) {
                 return projected_eager_anndata(
                     py,
@@ -986,7 +1044,7 @@ pub fn to_anndata_filtered<'py>(
                     filters,
                     memory_budget,
                     plan,
-                    &indices,
+                    indices,
                     preserve_var_order,
                     Some(expr),
                 );
@@ -1010,14 +1068,11 @@ pub fn to_anndata_filtered<'py>(
         let mask = eval_preserve_slots_mask(py, &full, expr)?;
         let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
-        let col_idx = if let Some(names) = var_names {
+        let col_idx = match &resolved {
             // Fancy column indexing honours order, so request order is preserved
             // automatically when preserve_var_order is set.
-            let indices =
-                resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
-            PyArray1::from_vec(py, indices).into_any().unbind()
-        } else {
-            slice_all.unbind()
+            Some(indices) => PyArray1::from_slice(py, indices).into_any().unbind(),
+            None => slice_all.unbind(),
         };
         let idx = pyo3::types::PyTuple::new(py, &[mask.unbind(), col_idx])?;
         return full.get_item(idx)?.call_method0("copy");
@@ -1415,7 +1470,10 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             // deletion-filtered) obs, composed onto the visible → global map.
             let isin_mask = original_idx.call_method1("isin", (&filtered_idx,))?;
             let positions = mask_true_positions(py, &isin_mask)?;
-            kept_to_global = Some(compose_kept_to_global(kept_to_global.as_ref(), &positions));
+            kept_to_global = Some(compose_kept_to_global(
+                kept_to_global.as_deref(),
+                &positions,
+            ));
 
             Some(filtered)
         } else {
@@ -1467,7 +1525,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     };
     x_dataset.with_csc_reader(x_backed_csc);
     x_dataset.with_source_path(path);
-    install_projection(&mut x_dataset, col_indices.as_ref(), preserve_var_order);
+    install_projection(&mut x_dataset, col_indices.as_deref(), preserve_var_order);
 
     // --- var (eager, optionally filtered by var_names) ---
     let var = match reader.read_var() {
@@ -1615,7 +1673,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
         };
         install_projection(
             &mut l_dataset.inner,
-            col_indices.as_ref(),
+            col_indices.as_deref(),
             preserve_var_order,
         );
         let l_py = l_dataset.into_pyobject(py)?;
@@ -1865,6 +1923,33 @@ mod tests {
     /// pyscx write door routes X through f32, so an *odd* count above 2²⁴
     /// cannot be put in a file from that side and the Python suite can only
     /// pin the accept half. Pin both halves here instead.
+    /// The in-flight budget is the only thing bounding a projected assembly's
+    /// peak once the shard loop runs more than one decode at a time, and the
+    /// memory harness cannot falsify it: its fixtures are uniformly sparse, so
+    /// every shard is far under the budget and the window is always the thread
+    /// count. Pin the arithmetic directly.
+    ///
+    /// Not pinned by a test: that `decode_window` folds `max` rather than a
+    /// mean over the shards, and computes per matrix rather than reusing X's
+    /// answer for every layer. Both would need a deliberately skewed
+    /// multi-hundred-megabyte fixture to observe.
+    #[test]
+    fn the_decode_window_honours_the_in_flight_budget() {
+        // One shard bigger than the whole budget: decode them one at a time.
+        assert_eq!(window_for(12, IN_FLIGHT_BUDGET_BYTES + 1), 1);
+        assert_eq!(window_for(12, 4 * IN_FLIGHT_BUDGET_BYTES), 1);
+        // Exactly the budget still fits one.
+        assert_eq!(window_for(12, IN_FLIGHT_BUDGET_BYTES), 1);
+        // A shard worth an eighth of the budget: bytes allow 8, threads cap it.
+        assert_eq!(window_for(12, IN_FLIGHT_BUDGET_BYTES / 8), 8);
+        assert_eq!(window_for(4, IN_FLIGHT_BUDGET_BYTES / 8), 4);
+        // Tiny shards are bounded by the thread count alone.
+        assert_eq!(window_for(12, 1024), 12);
+        // Degenerate inputs never yield a zero window.
+        assert_eq!(window_for(0, 1024), 1);
+        assert_eq!(window_for(12, 0), 12);
+    }
+
     #[test]
     fn f32_roundtrip_exactness_matches_the_decode_loss_guard() {
         // Float-encoded shards record no integer maximum.

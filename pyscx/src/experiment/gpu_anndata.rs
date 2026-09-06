@@ -160,7 +160,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
                 false, // preserve_slots
                 true,  // eager
                 memory_budget_bytes,
-                true,  // skip_x
+                convert::MatrixMode::SkipX,
                 false, // preserve_var_order (fast path: var_names is None)
                 false, // strict_var_names (no names to check)
                 plan,  // default plan (non-default rejected above); GPU X is f32-native
@@ -364,7 +364,7 @@ pub(super) fn to_gpu_anndata_impl<'py>(
                 false, // preserve_slots
                 true,  // eager
                 memory_budget_bytes,
-                false, // skip_x
+                convert::MatrixMode::Eager,
                 preserve_var_order,
                 strict_var_names,
                 plan, // default plan (non-default rejected above); GPU X is f32-native
