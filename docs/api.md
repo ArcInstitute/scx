@@ -635,6 +635,13 @@ it, and the `DroppedRaw` notice is not emitted on the three that would drop it. 
 when raw is irrelevant to the workload — otherwise the notice fires on every backed
 open of a raw-bearing file. `raw=True` is the default and is unchanged.
 
+A **gene projection does not narrow raw**: anndata hands `.raw` only the obs index when
+slicing, so `to_anndata(var_names=[...])` returns raw on its full gene axis, exactly as
+a plain read does. That makes raw the dominant cost of a projected read of a
+raw-bearing file (the projected `X` is small and raw is not), which is what `raw=False`
+is for — measured on a 20-shard fixture, a three-gene read peaked at 61.6 MB with raw,
+20.5 MB once raw stopped being copied along the way, and 3.1 MB with `raw=False`.
+
 Three write paths still cannot carry raw and say so rather than dropping it in silence.
 The first two warn with `DroppedRawOnWrite`, whose `reason` is supplied per call site —
 they lose raw for different causes, so a single baked-in remedy would misdirect one of
@@ -1990,7 +1997,7 @@ the repr onto `Experiment.info() -> str`, whose tokens now include
   - For enumerating one categorical obs column, prefer `distinct_values()` / `obs_categorical()`, which scan per-shard dictionaries instead of assembling the table.
   - `CloudExperiment` mirrors both, `logical=` included (its `n_obs` / `shape` / `repr` are the live count too since 0.17 — one small section read on a file with deletions, memoised per handle; `n_obs_physical` stays the header count). There, `read_obs(columns=…)` *is* a genuine network pushdown (per-column projected range reads); `read_var(columns=…)` is still post-fetch, for the same reason as locally.
 - `to_anndata(backed=False, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=False, modality=None, eager=False, memory_budget=None, obsm=None, preserve_var_order=False, strict_var_names=True, container="csr", data_dtype=None, index_dtype=None, allow_lossy=False, obsp=None, varp=None, varm=None, raw=True)` — Convert to AnnData
-  - `var_names`: list of gene names to project (column subset). A set selector by default (sorted original-column order, duplicates collapsed)
+  - `var_names`: list of gene names to project (column subset). A set selector by default (sorted original-column order, duplicates collapsed). `X` and each selected layer are assembled **already projected**, shard by shard, so a few genes out of tens of thousands cost roughly the projected result rather than the whole matrix twice (measured on a 40-shard 20 480 × 2 000 fixture carrying one layer: 74.0 MB → 8.9 MB peak; `container="dense"` 48.8 MB → 8.8 MB). The bound is on the **var axis only** — `obs`, `obsm` and `obsp` are on the other axis, so they are in the result at full size and anndata's copy transiently doubles them. On a file carrying an `n_obs × n_obs` kNN graph that term dominates whatever `var_names` says; pair it with the slot filters (`to_anndata(var_names=[...], obsp=[], varp=[], varm=[])`) for the tight bound. `.raw` is not projected either — anndata never var-slices it, so it stays on its own (usually wider) gene axis; pass `raw=False` if you do not want to pay for it
   - `preserve_var_order`: when True, return the gene axis in the order `var_names` was listed (first-occurrence-wins dedup) instead of sorted order. Works on eager / backed / GPU / query-engine paths. The streaming accelerators decode columns in sorted on-disk order and so cannot express a request-ordered gene axis; on a *backed* `X` they refuse rather than misalign the result against `adata.var` — `highly_variable_genes`, `normalize_total`, `log1p`, `calculate_qc_metrics`, `score_genes`, `pflog`, `pca`, `pca_neighbors`, `pca_neighbors_umap`, `rank_genes_groups`, `pdex_ref`, `pseudobulk_means`, `pseudobulk_dex` and `pdex_nb_glm` raise `RuntimeError`. The same refusal applies to a backed `X` reordered at the handle level — `adata[:, idx]` with a non-ascending `idx`, or `adata.X = adata.X[:, [7, 2, 11]]` / `X[:, ::-1]` — which installs the same presentation permutation. Run them before reordering, select with a sorted index or a boolean mask, or materialise first (`adata.X = adata.X.to_memory()`)
   - `strict_var_names`: when True (default), any name absent from the var metadata raises `KeyError`. Pass False to silently drop unknown names (pre-0.8.6 behaviour)
   - `obs_filter`: predicate string for cell filtering. Non-backed mode uses the scx-engine query parser with shard pushdown; `backed=True` evaluates it with pandas `.query()` (different grammar — see [Filter Expression Compatibility](scanpy.md#filter-expression-compatibility) in docs/scanpy.md)
@@ -1998,7 +2005,7 @@ the repr onto `Experiment.info() -> str`, whose tokens now include
   - `obsm`: list of obsm keys to load (default `None` = all keys, byte-identical to prior behaviour). When set, only the listed embeddings are read — dropping the per-process RAM of unused keys on the random-access dataloader path. An unknown key raises `KeyError`; `obsm=[]` loads no embeddings. Selecting keys also changes *how* obsm is materialised (see `obsm` loading modes under `eager`, below).
   - `obsp` / `varp` / `varm`: lists of keys to load from those slots (default `None` = all keys, byte-identical to prior behaviour). Same contract as `obsm=`: `[]` loads none, a list loads that subset, an unknown key raises `KeyError`. Unlike `obsm=`, an empty or fully-excluding list builds **no lazy bridge at all** for that slot — `adata.obsp` is then anndata's own empty mapping, so there is nothing left that could decode. This is the knob that bounds the cost described under the lazy-mapping note in [docs/scanpy.md](scanpy.md#understanding-to_anndata): anndata's `AlignedMappingProperty` builds an `AlignedActual` on the first `adata.obsp` access, and that validates — and therefore decodes — **every** key of the slot, so a census-scale kNN graph comes off disk whether or not the caller wanted it. Honoured on the eager, backed and `preserve_slots` paths, and on `to_gpu_anndata`; on the obs-filtered query path these slots are dropped anyway, so excluding one simply removes it from the "not loaded" warning. Key validation is at the entry point, so an unknown key raises on every path including that one.
   - `raw`: when `True` (default), `adata.raw` is reconstructed on the paths that can (see [`adata.raw`](#adataraw)) and the `DroppedRaw` notice is emitted on the three that cannot — backed mode, an obs-filtered query, and a deletion-vector-active file. When `False`, neither happens: no rebuild, no notice. The explicit opt-out for callers who never wanted raw and do not want the warning on every open.
-  - `layers=` and `var_names=` force eager assembly. Passing either takes a branch that materialises `obsp` / `varp` / `varm` / `layers` up front regardless of `eager=False`, because anndata's `AlignedMapping` validation would drag every bridge through the subsequent `adata[:, idx].copy()` anyway. Combine them with the slot filters above to keep that assembly small.
+  - `layers=` and `var_names=` force eager assembly of `obsp` / `varp` / `varm` regardless of `eager=False`: those are sliced by anndata, whose `AlignedMapping` validation would drag every bridge through the slice anyway, so fragmenting the cost across implicit slicing helps nobody. Combine them with the slot filters above to keep that assembly small. Under `var_names=` the **matrices** are the exception — `X` and each selected layer are projected while assembling and never exist at full width.
   - `backed`: when True, X and layers are lazy `ScxBackedSparseDataset` instances
   - `modality`: select one modality of a multimodal file and
     return a backed AnnData scoped to that modality (per-modality X /
@@ -2053,7 +2060,10 @@ the repr onto `Experiment.info() -> str`, whose tokens now include
   - `memory_budget` (default `None`, treated as 8 GiB): emits
     `EagerAssemblyMemoryHigh` `UserWarning` when the estimated eager
     footprint exceeds the budget. Warn-only — does not block
-    assembly.
+    assembly. Under `var_names=` the estimate is scaled by the fraction
+    of genes selected, so taking the warning's own advice actually
+    silences it; the catalog carries no per-column `nnz`, so that
+    scaling assumes an even spread of nonzeros across genes.
   - **Container / dtype materialization** (`container`, `data_dtype`,
     `index_dtype`, `allow_lossy`) — control the output container and numeric
     dtype of `X` (and layers). Eager (`backed=False`) only; a non-default
@@ -2302,6 +2312,17 @@ only to 2²⁴), and `float16` (exact only to 2¹¹). Notes:
   `> 2²⁴` integer request there still fails loud (or rounds under `allow_lossy`) —
   the lossless-wide read lands on the eager path. Extending it to the query path is
   a planned follow-up.
+- A **`var_names=` projection** assembles f32 too (it streams shard by shard through
+  the same projecting reader the backed handles use, which has no typed variant), so
+  a narrow `data_dtype=` takes that route only when the file's values survive an f32
+  round trip — `value_max ≤ 2²⁴`, which includes every float-encoded file, since
+  those record `value_max = 0`. Above that the projection stands down and the read
+  falls back to today's full-width assemble-then-slice: same values, same peak as
+  before the projection existed. Nothing is silently rounded either way. In practice
+  the fallback is unreachable through pyscx's own write doors — both `from_anndata`
+  and h5ad ingest route `X` through f32, so a count above 2²⁴ that is *not*
+  f32-exact cannot be written from Python; it exists for files other scx tooling
+  produces.
 
 **Which matrices are guarded.** The guard covers every eagerly-decoded count
 matrix: `X` (all `to_anndata` paths — default, `var_names`, `obs_filter`,
@@ -2771,7 +2792,7 @@ PyO3 class for backed-mode lazy access to the main expression matrix (`adata.X`)
 - `__array__(dtype=None, copy=None)` — **Raises `TypeError`.** numpy's array protocol is implemented only to refuse: `np.asarray(adata.X)` on a handle would decode the whole `n_obs × n_vars` matrix at once, and before this it returned a 0-d object array that failed far away ("setting an array element with a sequence"). Call `to_memory()` (scipy CSR) or `toarray()` (dense) — both work on a column-projected handle such as `X[:, genes]`, which is itself a handle and refuses `np.asarray` the same way — take a row window with `handle[rows]` (a scipy CSR), or open the file with `pyscx.open(path).to_anndata()` for an in-memory AnnData. The dense `ScxBackedObsmDataset` keeps a materialising `__array__` — an embedding is small.
 
 **Column projection:**
-- `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` and streaming QC with gene subsets (`qc_vars`).
+- `set_col_projection(col_indices)` — Restrict all access and aggregation to a subset of columns. Used internally by `to_anndata(var_names=...)` — on the backed path to project the handle, and on the eager path to assemble `X` and each layer already projected — and by streaming QC with gene subsets (`qc_vars`).
 
   > [!WARNING]
   > **This is a handle-level knob, not an axis subset.** It moves `X` only — `var`, `layers`, `varm` and `varp` are left at the old width, so the AnnData is inconsistent until you slice them yourself. Use `pyscx.accel.subset_var(adata, mask)` (or `adata[:, mask]`) for a real gene subset — see [Axis subsetting and aligned members](#axis-subsetting-and-aligned-members). Reach for this only when you want to reproject a bare handle.
