@@ -3315,3 +3315,49 @@ fn streaming_raw_export_never_materialises_the_whole_raw_matrix() {
         counts.read_shard_from_entry.load(Ordering::Relaxed)
     );
 }
+
+/// The streaming entry point must call `stream_raw_at`, not the eager
+/// `write_raw_to_h5ad`.
+///
+/// `streaming_raw_export_never_materialises_the_whole_raw_matrix` drives
+/// `stream_raw_at` directly — it has to, because the reader counters it reads
+/// are per-instance and `write_scx_to_h5ad_streaming` opens its own. That
+/// leaves a gap: reverting the CALL SITE to the eager helper would keep every
+/// test in this file green, since both paths emit identical bytes.
+///
+/// So this pins the call site itself. A source check, which is weak in
+/// general — but the property is "which function does this one call", and
+/// there is no runtime seam that exposes it. Scoped to the function body and
+/// with comment lines stripped, because a bare grep cannot tell a call from a
+/// sentence about a call (the body has both: the comment above the call names
+/// `ExportFilterSectionEager`, and an earlier one names `write_raw_to_h5ad`'s
+/// role as the fallback).
+#[test]
+fn the_streaming_entry_point_calls_stream_raw_at_not_the_eager_writer() {
+    let src = include_str!("h5ad/stream_write.rs");
+    let start = src
+        .find("pub fn write_scx_to_h5ad_streaming(")
+        .expect("write_scx_to_h5ad_streaming not found — did it get renamed?");
+    // The next item at column 0 ends the function.
+    let rest = &src[start..];
+    let end = rest[1..]
+        .find("\n/// ")
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let body: String = rest[..end]
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        body.contains("stream_raw_at("),
+        "write_scx_to_h5ad_streaming must call stream_raw_at"
+    );
+    assert!(
+        !body.contains("write_raw_to_h5ad("),
+        "write_scx_to_h5ad_streaming calls the EAGER write_raw_to_h5ad — /raw \
+         would be materialised whole again, and no value assertion in this \
+         file can see it"
+    );
+}
