@@ -28,8 +28,18 @@ pub(super) fn to_anndata_impl<'py>(
     data_dtype: Option<&str>,
     index_dtype: Option<&str>,
     allow_lossy: bool,
+    obsp: Option<Vec<String>>,
+    varp: Option<Vec<String>>,
+    varm: Option<Vec<String>>,
+    raw: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let memory_budget_bytes = convert::parse_memory_budget(memory_budget.as_ref())?;
+    let filters = convert::SlotFilters {
+        obsp: obsp.as_deref(),
+        varp: varp.as_deref(),
+        varm: varm.as_deref(),
+        raw,
+    };
     // F3: resolve the container/dtype materialization plan. The default
     // (csr / f32 / i32) keeps the exact zero-copy path; any non-default plan
     // triggers a post-assembly retype of X (and layers).
@@ -51,12 +61,24 @@ pub(super) fn to_anndata_impl<'py>(
                  use to_mudata() for eager multimodal extraction",
             ));
         }
-        if var_names.is_some() || obs_filter.is_some() || layers.is_some() || obsm.is_some() {
+        // `to_anndata_backed_for_modality` accepts no selection at all, so a
+        // filter passed here would be silently dropped — refuse instead. `raw`
+        // is in the list for the same reason: `raw=False` would look honoured
+        // and do nothing.
+        if var_names.is_some()
+            || obs_filter.is_some()
+            || layers.is_some()
+            || obsm.is_some()
+            || obsp.is_some()
+            || varp.is_some()
+            || varm.is_some()
+            || !raw
+        {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "to_anndata(modality=..., backed=True) does not support \
-                 var_names / obs_filter / layers / obsm; use \
-                 `scx subset --modality NAME --filter ...` to materialise \
-                 a filtered single-modality file first",
+                 var_names / obs_filter / layers / obsm / obsp / varp / varm / \
+                 raw=False; use `scx subset --modality NAME --filter ...` to \
+                 materialise a filtered single-modality file first",
             ));
         }
         return convert::to_anndata_backed_for_modality(py, &exp.path, name, cache_shards);
@@ -75,6 +97,7 @@ pub(super) fn to_anndata_impl<'py>(
             obs_filter,
             layers.as_deref(),
             obsm.as_deref(),
+            filters,
             eager,
             preserve_var_order,
             strict_var_names,
@@ -88,6 +111,7 @@ pub(super) fn to_anndata_impl<'py>(
             obs_filter,
             layers.as_deref(),
             obsm.as_deref(),
+            filters,
             preserve_slots,
             eager,
             memory_budget_bytes,

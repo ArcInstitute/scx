@@ -1006,6 +1006,17 @@ impl PyExperiment {
     ///           When set, only the listed keys are read — dropping the
     ///           per-process RAM of unused embeddings on the random-access
     ///           dataloader path. An unknown key raises KeyError.
+    ///     obsp: Optional list of obsp keys to load, same contract as obsm:
+    ///           None (default) = every key, [] = none, a list = that subset,
+    ///           unknown key raises KeyError. Worth setting because anndata
+    ///           decodes a whole slot on the first `adata.obsp` access — an
+    ///           n_obs x n_obs graph comes off disk whether or not you wanted it.
+    ///     varp: Optional list of varp keys to load. Same contract as obsp.
+    ///     varm: Optional list of varm keys to load. Same contract as obsp.
+    ///     raw: When True (default), reconstruct `adata.raw` where the mode
+    ///          allows and emit the `dropped_raw` notice where it does not
+    ///          (backed mode, an obs-filtered query, a deletion-vector-active
+    ///          file). When False, do neither: no rebuild, no notice.
     ///     preserve_slots: When True together with obs_filter in non-backed mode,
     ///                     materialize obsm and layers after filtering instead of
     ///                     dropping them. Skips query-engine predicate pushdown for X
@@ -1046,7 +1057,11 @@ impl PyExperiment {
     ///
     /// Returns an anndata.AnnData with X, obs, var, and optionally
     /// obsm, uns, and layers populated from the file.
-    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false))]
+    // New kwargs are appended, never inserted: every parameter here is
+    // positional-or-keyword, so a mid-signature insert silently rebinds
+    // positional callers (pinned by
+    // `test_obsm_loading.py::test_to_anndata_positional_preserve_slots_still_binds`).
+    #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false, obsp=None, varp=None, varm=None, raw=true))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
         &self,
@@ -1067,6 +1082,10 @@ impl PyExperiment {
         data_dtype: Option<&str>,
         index_dtype: Option<&str>,
         allow_lossy: bool,
+        obsp: Option<Vec<String>>,
+        varp: Option<Vec<String>>,
+        varm: Option<Vec<String>>,
+        raw: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         materialize::to_anndata_impl(
             self,
@@ -1087,6 +1106,10 @@ impl PyExperiment {
             data_dtype,
             index_dtype,
             allow_lossy,
+            obsp,
+            varp,
+            varm,
+            raw,
         )
     }
 
@@ -1115,7 +1138,8 @@ impl PyExperiment {
     ///     adata = pyscx.open("atlas.scx").to_gpu_anndata()
     ///     import rapids_singlecell as rsc
     ///     rsc.pp.pca(adata)            # runs in-VRAM; no host bounce
-    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false))]
+    // Appended, not inserted — see the note on `to_anndata`'s signature.
+    #[pyo3(signature = (var_names=None, obs_filter=None, layers=None, obsm=None, device="gpu", memory_budget=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false, obsp=None, varp=None, varm=None, raw=true))]
     #[allow(clippy::too_many_arguments)]
     fn to_gpu_anndata<'py>(
         &self,
@@ -1132,6 +1156,10 @@ impl PyExperiment {
         data_dtype: Option<&str>,
         index_dtype: Option<&str>,
         allow_lossy: bool,
+        obsp: Option<Vec<String>>,
+        varp: Option<Vec<String>>,
+        varm: Option<Vec<String>>,
+        raw: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         // Before the feature gate: a stale handle is stale regardless of how
         // this build was compiled.
@@ -1161,6 +1189,12 @@ impl PyExperiment {
                 preserve_var_order,
                 strict_var_names,
                 &plan,
+                convert::SlotFilters {
+                    obsp: obsp.as_deref(),
+                    varp: varp.as_deref(),
+                    varm: varm.as_deref(),
+                    raw,
+                },
             )
         }
         #[cfg(not(feature = "gpu"))]
@@ -1175,6 +1209,10 @@ impl PyExperiment {
                 memory_budget,
                 preserve_var_order,
                 strict_var_names,
+                obsp,
+                varp,
+                varm,
+                raw,
             );
             Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "to_gpu_anndata requires pyscx built with the 'gpu' feature",

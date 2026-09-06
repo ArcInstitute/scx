@@ -367,6 +367,8 @@ reorder-on-convert (`--sort-by` / `--group-by`), where raw streams unpermuted an
 end up attached to the wrong cells. That warning's remedy is per call site — convert
 from the h5ad for the first, convert without the reorder for the second.
 `adata.raw.varm` has no section and is dropped with `DroppedRawVarm`.
+`to_anndata(raw=False)` opts out of raw entirely — no rebuild on the paths that would
+rebuild it, and no `DroppedRaw` notice on the three that would drop it.
 See [docs/api.md § `adata.raw`](api.md#adataraw).
 
 ### Exporting back to MTX
@@ -837,26 +839,41 @@ The returned `anndata.AnnData` is fully populated:
 > the four slots above are `MutableMapping`-compatible bridges
 > (`ScxLazyPairwiseMapping`, `ScxLazyVarmMapping`,
 > `ScxLazyLayersMapping`) that decode each entry from the SCX file
-> only on first access — `ad.obsp["distances"]`,
-> `for k, v in ad.varm.items():`, `dict(ad.layers)`, etc. — and cache
-> the materialised value. Lookups via `__contains__` and key iteration
-> stay catalog-only (no I/O). Mutations are in-memory and never write
-> back to disk. The bridges keep a sibling `Arc<ScxReader>` alive so
-> the returned AnnData stays usable after the source `Experiment`
-> drops. Pass `eager=True` to substitute a plain `dict` and fully
-> detach the AnnData from the SCX file handle — required when you
-> intend to close the experiment, hand the AnnData to a subprocess,
-> or otherwise outlive the underlying mmap. See
-> [`docs/api.md` § `Experiment`](api.md#experiment) for the kwarg
-> table.
+> only on first access, and cache the materialised value. Lookups via
+> `__contains__` and key iteration stay catalog-only (no I/O).
+> Mutations are in-memory and never write back to disk. The bridges
+> keep a sibling `Arc<ScxReader>` alive so the returned AnnData stays
+> usable after the source `Experiment` drops. Pass `eager=True` to
+> substitute a plain `dict` and fully detach the AnnData from the SCX
+> file handle — required when you intend to close the experiment, hand
+> the AnnData to a subprocess, or otherwise outlive the underlying
+> mmap. See [`docs/api.md` § `Experiment`](api.md#experiment) for the
+> kwarg table.
 >
-> The lazy default bounds the peak RSS of `to_anndata()` itself for
-> files that carry large kNN graphs (`obsp["distances"]` /
-> `obsp["connectivities"]`) or embeddings (`varm["PCs"]`): the
-> sections are not decoded until consumer code touches the slot. User
-> code that does access them pays the same one-time decode cost it
-> would have paid at construction time. Repeat accesses of the same
-> key return the cached object.
+> **Per-key laziness is not per-key access through `adata`.** Reading
+> the *slot* — `ad.obsp[...]`, `for k, v in ad.varm.items():`,
+> `dict(ad.layers)` — goes through anndata's
+> `AlignedMappingProperty.__get__`, which constructs an `AlignedActual`
+> whose `__init__` runs `_validate_value` over **every** entry. So the
+> first touch of `ad.obsp` decodes every obsp key once, not just the
+> one you indexed; a subsequent `ad.obsp["distances"]` is then a cache
+> hit. This is anndata's design, not a version regression — 0.11.4 and
+> 0.12.x behave identically — and it is why an in-place axis subset
+> detaches the bridges first rather than letting anndata walk them
+> (`pyscx/src/axis_align.rs`). Only direct bridge access
+> (`ad._obsp["distances"]`) is decode-per-key.
+>
+> The lazy default therefore bounds the peak RSS of `to_anndata()`
+> *itself* for files that carry large kNN graphs
+> (`obsp["distances"]` / `obsp["connectivities"]`) or embeddings
+> (`varm["PCs"]`), but it does not bound what the first slot access
+> costs. To bound that, name the keys you want — or none of them:
+> `to_anndata(obsp=["connectivities"])`, `to_anndata(obsp=[])`. Each of
+> `obsp=` / `varp=` / `varm=` takes the same `None` = all / `[]` = none /
+> list = subset shape as `obsm=` and `layers=`; an empty or
+> fully-excluding list builds no bridge at all, so nothing remains that
+> could decode. `to_anndata(layers=[], obsm=[], obsp=[], varp=[],
+> varm=[], raw=False)` is the X / obs / var / uns-only read.
 
 #### Selective + lazy `obsm` (`obsm=[...]`)
 

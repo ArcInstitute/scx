@@ -909,23 +909,44 @@ pub(crate) fn read_obsm_selected(
     }
 }
 
-/// Validate that every key in `filter` exists in the file's obsm catalog
-/// (a catalog-only scan via [`ScxReader::list_obsm`] — reads no shard
-/// bytes). `None` validates nothing. An unknown key raises `KeyError`.
-/// Used by the lazy obsm path to fail fast on a bad key without
-/// defeating the per-key deferral.
-pub(crate) fn validate_obsm_keys(reader: &ScxReader, filter: Option<&[String]>) -> PyResult<()> {
+/// Validate that every key in `filter` exists in `available`, the catalog
+/// listing for one aligned slot (`obsm` / `obsp` / `varp` / `varm`). `None`
+/// validates nothing. An unknown key raises `KeyError` naming the slot.
+///
+/// The listings this is called with (`ScxReader::list_obsm` and siblings) are
+/// pure catalog scans that read no shard bytes, so validating here fails fast
+/// on a bad key without defeating the lazy bridges' per-key deferral.
+pub(crate) fn validate_slot_keys(
+    available: &[String],
+    filter: Option<&[String]>,
+    slot: &str,
+) -> PyResult<()> {
     if let Some(keys) = filter {
-        let available = reader.list_obsm();
         for key in keys {
             if !available.iter().any(|a| a == key) {
                 return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "obsm key {key:?} not found; available obsm keys: {available:?}"
+                    "{slot} key {key:?} not found; available {slot} keys: {available:?}"
                 )));
             }
         }
     }
     Ok(())
+}
+
+/// Whether a slot should be materialised at all under `filter`: `None` keeps
+/// today's "any key on disk" rule, `Some(keys)` requires at least one of them
+/// to be present. Mirrors the `has_layers` gate that `layer_filter` has always
+/// used, so an empty list builds no bridge rather than an empty one.
+pub(crate) fn slot_has_selected(available: &[String], filter: Option<&[String]>) -> bool {
+    match filter {
+        None => !available.is_empty(),
+        Some(keys) => available.iter().any(|a| keys.iter().any(|k| k == a)),
+    }
+}
+
+/// [`validate_slot_keys`] against the file's obsm catalog.
+pub(crate) fn validate_obsm_keys(reader: &ScxReader, filter: Option<&[String]>) -> PyResult<()> {
+    validate_slot_keys(&reader.list_obsm(), filter, "obsm")
 }
 
 /// Populate `obsm_dict` with eager dense numpy arrays for the selected

@@ -583,3 +583,137 @@ def test_from_anndata_warns_on_raw_varm(tmp_dir):
 
     with pytest.warns(UserWarning, match="dropped_raw_varm"):
         pyscx.from_anndata(src, str(tmp_dir / "rawvarm.scx"))
+
+
+# ---------------------------------------------------------------------------
+# `raw=False` — the explicit opt-out (REC-8 / S7).
+#
+# Three modes drop raw with a `dropped_raw` warning today: backed, the
+# obs-filtered query path, and a deletion-vector-active file. The warning is
+# correct but unavoidable, so it fires on every backed open of a raw-bearing
+# file whether or not the caller wanted raw. `raw=False` says "I don't want
+# it": no rebuild on the path that would have rebuilt, and no notice on the
+# three that would have dropped.
+#
+# `raw=True` stays the default, so every test above is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _dropped_raw_warnings(recorded):
+    """Only the read-side notice — not `dropped_raw_on_write` / `_varm`.
+
+    `match="dropped_raw"` elsewhere in this file is a substring test and so
+    also matches its two siblings; here the whole point is which one fired,
+    so anchor on the category prefix `warn_python_convert` emits.
+    """
+    return [w for w in recorded if str(w.message).startswith("dropped_raw:")]
+
+
+def test_raw_false_suppresses_the_backed_drop_notice(tmp_dir):
+    import pyscx
+
+    src, _ = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    import warnings
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        out = pyscx.open(scx_path).to_anndata(backed=True, raw=False)
+
+    assert out.raw is None
+    # Not "no warnings at all" — other advisory notices may legitimately fire.
+    assert _dropped_raw_warnings(rec) == []
+
+
+def test_raw_false_skips_the_eager_rebuild(tmp_dir):
+    """The eager path is the one that would otherwise *build* raw. Opting out
+    must leave `.raw` unset and say nothing about it."""
+    import warnings
+
+    import pyscx
+
+    src, _ = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        out = pyscx.open(scx_path).to_anndata(raw=False)
+
+    assert out.raw is None
+    assert _dropped_raw_warnings(rec) == []
+    # X is untouched by the opt-out.
+    assert out.shape == (20, 12)
+
+
+def test_raw_true_still_rebuilds_and_is_the_default(tmp_dir):
+    """The accept side of the switch: `raw=True` and the default agree, and
+    both still produce raw. Without this, `raw=False` could be passing by
+    breaking raw everywhere."""
+    import pyscx
+
+    src, raw_dense = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    default = pyscx.open(scx_path).to_anndata()
+    explicit = pyscx.open(scx_path).to_anndata(raw=True)
+
+    assert default.raw is not None
+    assert explicit.raw is not None
+    np.testing.assert_array_equal(_dense(default.raw.X), raw_dense)
+    np.testing.assert_array_equal(_dense(explicit.raw.X), raw_dense)
+
+
+def test_raw_false_on_the_obs_filtered_query_path(tmp_dir):
+    import warnings
+
+    import pyscx
+
+    src, _ = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        out = pyscx.open(scx_path).to_anndata(obs_filter="n_counts < 10", raw=False)
+
+    assert out.raw is None
+    assert _dropped_raw_warnings(rec) == []
+    assert out.n_obs == 10
+
+    # And with the default the notice is still there — the suppression is the
+    # kwarg's doing, not a regression that lost the warning outright.
+    with pytest.warns(UserWarning, match="dropped_raw"):
+        pyscx.open(scx_path).to_anndata(obs_filter="n_counts < 10")
+
+
+def test_raw_false_is_harmless_on_a_file_without_raw(tmp_dir):
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.default_rng(3)
+    dense = rng.integers(0, 10, size=(8, 5)).astype(np.float32)
+    src = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(8)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(5)]),
+    )
+    scx_path = str(tmp_dir / "noraw.scx")
+    pyscx.from_anndata(src, scx_path)
+
+    assert pyscx.open(scx_path).to_anndata(raw=False).raw is None
+    assert pyscx.open(scx_path).to_anndata(backed=True, raw=False).raw is None
