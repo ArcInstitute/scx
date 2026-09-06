@@ -1,111 +1,112 @@
 //! Group-label partitioning shared by every Wilcoxon / pdex kernel.
 //!
 //! Callers encode a per-cell group label as an index into `group_names`. Any
-//! label `>= n_groups` is the **unlabelled** sentinel: `pyscx` maps a NaN /
-//! empty / off-category `obs[groupby]` value to `unique_groups.len()` so that a
-//! cell nobody annotated does not silently join group 0.
+//! label `>= n_groups` is the **unlabelled** sentinel: `pyscx` maps a missing
+//! `obs[groupby]` value — `pandas.isna`, so `NaN` / `None` / `pd.NA` alike — or
+//! one outside the column's categories to `unique_groups.len()`, so that a cell
+//! nobody annotated does not silently join group 0. A label that merely *looks*
+//! like a missing value, `""` included, is an ordinary group.
 //!
-//! # Why unlabelled cells leave the comparison entirely
+//! # Where an unlabelled cell does and does not appear
 //!
-//! pyscx's rule: an unlabelled cell is in no group, is **not** part of "rest",
-//! and is **not** in the rank pool. One number — `labelled.len()` — has to be
-//! the rest denominator *and* the rank-pool size everywhere. Deriving them
-//! separately is what made the 1-vs-rest logFC wrong: the rest *numerator*
-//! excluded unlabelled cells while the rest *denominator* counted them, so
-//! every logFC in every group was inflated by
-//! `log2(n_obs − n1) − log2(n_labelled − n1)`.
+//! It is in **no group of its own** — it contributes to no group's sum, count
+//! or `pts` column. It **is** in the 1-vs-rest comparison pool: it ranks
+//! alongside everyone else and it counts in every group's "rest", numerator and
+//! denominator alike. That is scanpy 1.12's rule, which ranks the whole matrix
+//! and leaves NaN-labelled cells in `X[~mask_g]`, and since 0.17 it is pyscx's
+//! too (X9). `pts` / `pts_rest` (`super::pts`) always followed it.
 //!
-//! This is **not** what scanpy 1.12 does: it ranks the whole matrix and keeps
-//! NaN-labelled cells in every group's "rest" (verified on a probe whose scores
-//! change when the unlabelled row is removed). The parity pins compare against
-//! scanpy run on the *filtered* matrix, i.e. against pyscx's rule; the
-//! difference on partially labelled `obs` is a known, tracked divergence. Only
-//! `pts` / `pts_rest` (`super::pts`) follow scanpy's own tables.
+//! One number — `n_obs` — is therefore the rank-pool size *and* the base of the
+//! rest denominator everywhere. Deriving the two separately is what made the
+//! 1-vs-rest logFC wrong once before: the rest *numerator* excluded unlabelled
+//! cells while the rest *denominator* counted them, so every logFC in every
+//! group was off by `log2(n_obs − n1) − log2(n_labelled − n1)`.
 //!
-//! When no cell is unlabelled — the overwhelmingly common case — `labelled` is
-//! `0..n_obs`, `pool_pos == group_indices`, and every kernel is bit-identical
-//! to a version that never knew about this module.
+//! The pairwise arm (`reference = Some(_)`) is a different comparison and is
+//! unaffected: it gathers `group ∪ ref` out of [`GroupPartition::group_indices`]
+//! and never had a pool.
 
-/// The three views of a group-label array that the DE kernels need.
+/// Per-group cell lists, built once per DE call by [`partition_by_group`] so
+/// the per-gene loops do not re-scan `groups`.
 ///
-/// Built once per DE call by [`partition_by_group`]; the per-gene loops read
-/// it without re-scanning `groups`.
+/// There is no separate "pool" view: the 1-vs-rest pool is every row, so a
+/// group's positions *within* the pool are its global cell indices.
+///
+/// It stays a named struct rather than collapsing to a bare `Vec<Vec<usize>>`
+/// now that it carries one field. It is the public return type of
+/// [`partition_by_group`], re-exported from `diffexp`, and 0.17 already removes
+/// `labelled` / `pool_pos` / `is_total` from it; deleting the type as well would
+/// deepen that break for callers who only ever wanted the group lists, and buy
+/// a `Vec` in exchange.
 #[derive(Debug, Clone)]
 pub struct GroupPartition {
-    /// Ascending global cell indices whose label is a real group. The
-    /// comparison pool for 1-vs-rest — its length is both the rest denominator
-    /// base and the rank-pool size.
-    pub labelled: Vec<usize>,
     /// `group_indices[g]` — ascending **global** cell indices in group `g`.
-    /// Used by the pairwise (`reference = Some(_)`) arm, which gathers
-    /// `group ∪ ref` straight out of the caller's matrix.
+    /// Unlabelled cells appear in none of them.
     pub group_indices: Vec<Vec<usize>>,
-    /// `pool_pos[g]` — ascending positions of group `g`'s cells **within
-    /// `labelled`**. Used by the 1-vs-rest arm, whose value/rank buffers are
-    /// compacted to the labelled cells.
-    pub pool_pos: Vec<Vec<usize>>,
 }
 
 impl GroupPartition {
-    /// Number of cells carrying a real group label. The rank-pool size and the
-    /// base of the rest denominator (`n_labelled - n1`) in 1-vs-rest.
+    /// Cells carrying a real group label.
+    ///
+    /// **No longer the 1-vs-rest pool size** — that is `n_obs`. It was, before
+    /// 0.17 (X9), and the two coinciding is what the removal of
+    /// `GroupPartition::{labelled, pool_pos}` and `is_total` is about: a caller
+    /// that reached for one of those wanted a pool, and would now silently get
+    /// every cell. A compile error is the right signal for that; this method
+    /// survives because the count itself still means what it always did.
     pub fn n_labelled(&self) -> usize {
-        self.labelled.len()
+        self.group_indices.iter().map(Vec::len).sum()
     }
 
     /// Cells whose label was out of range. Non-zero means the caller handed us
     /// unannotated cells; surfacing the count is the caller's job.
     pub fn n_unlabelled(&self, n_obs: usize) -> usize {
-        n_obs - self.labelled.len()
-    }
-
-    /// `true` when every cell carries a real label, i.e. the pool is the whole
-    /// matrix and `pool_pos[g] == group_indices[g]`.
-    pub fn is_total(&self, n_obs: usize) -> bool {
-        self.labelled.len() == n_obs
+        n_obs - self.n_labelled()
     }
 }
 
-/// Partition `groups` (one label per cell) into the labelled pool, the
-/// per-group global cell lists, and the per-group pool positions.
+/// Partition `groups` (one label per cell) into the per-group global cell lists.
 ///
-/// A label `>= n_groups` is unlabelled and appears in none of the three.
-/// The filling pass walks `groups` in ascending order, so both index lists come
-/// out ascending and the f64 accumulation order of any sum driven by them is
-/// deterministic.
+/// A label `>= n_groups` is unlabelled and appears in none of them. The filling
+/// pass walks `groups` in ascending order, so each list comes out ascending and
+/// the f64 accumulation order of any sum driven by them is deterministic.
 ///
 /// A counting pass runs first so every vector is allocated at its exact size.
 /// At atlas scale the growth-doubling alternative transiently holds roughly
-/// twice the final footprint across `2·n_groups + 1` vectors, and the extra
-/// read over `groups` is far cheaper than that.
+/// twice the final footprint across `n_groups` vectors, and the extra read over
+/// `groups` is far cheaper than that.
 pub fn partition_by_group(groups: &[usize], n_groups: usize) -> GroupPartition {
     let mut group_sizes = vec![0usize; n_groups];
-    let mut n_labelled = 0usize;
     for &g in groups {
         if g < n_groups {
             group_sizes[g] += 1;
-            n_labelled += 1;
         }
     }
 
-    let mut labelled = Vec::with_capacity(n_labelled);
     let mut group_indices: Vec<Vec<usize>> =
-        group_sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
-    let mut pool_pos: Vec<Vec<usize>> =
         group_sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
 
     for (i, &g) in groups.iter().enumerate() {
         if g < n_groups {
             group_indices[g].push(i);
-            pool_pos[g].push(labelled.len());
-            labelled.push(i);
         }
     }
-    GroupPartition {
-        labelled,
-        group_indices,
-        pool_pos,
-    }
+    GroupPartition { group_indices }
+}
+
+/// Bucket index for a cell's label, folding every unlabelled spelling onto one
+/// slot at `n_groups`.
+///
+/// Buffers indexed by this must therefore be `n_groups + 1` long. The sentinel
+/// slot is written but never read back as a group: what it exists for is to
+/// keep an unlabelled cell's value inside the pooled `total`, which is what
+/// makes `rest = total − group` describe every other cell.
+///
+/// `partition_by_group`'s contract admits **any** label `>= n_groups`, not just
+/// `n_groups` itself, so this clamps rather than trusting the caller.
+#[inline]
+pub fn pool_bucket(label: usize, n_groups: usize) -> usize {
+    label.min(n_groups)
 }
 
 #[cfg(test)]
@@ -116,25 +117,20 @@ mod tests {
     fn total_partition_is_identity() {
         let groups = vec![0, 1, 0, 1, 2];
         let p = partition_by_group(&groups, 3);
-        assert_eq!(p.labelled, vec![0, 1, 2, 3, 4]);
-        assert_eq!(p.group_indices, p.pool_pos);
-        assert!(p.is_total(5));
+        assert_eq!(p.group_indices, vec![vec![0, 2], vec![1, 3], vec![4]]);
+        assert_eq!(p.n_labelled(), 5);
         assert_eq!(p.n_unlabelled(5), 0);
     }
 
     #[test]
-    fn unlabelled_cells_are_dropped_and_positions_compact() {
+    fn unlabelled_cells_are_in_no_group() {
         // n_groups = 2, so labels 2 and 7 are both the unlabelled sentinel.
         let groups = vec![0, 2, 1, 7, 0, 1];
         let p = partition_by_group(&groups, 2);
-        assert_eq!(p.labelled, vec![0, 2, 4, 5]);
         assert_eq!(p.n_labelled(), 4);
         assert_eq!(p.n_unlabelled(6), 2);
-        assert!(!p.is_total(6));
-        // Global cell ids.
+        // Global cell ids; cells 1 and 3 appear nowhere.
         assert_eq!(p.group_indices, vec![vec![0, 4], vec![2, 5]]);
-        // Positions inside `labelled` = [0, 2, 4, 5].
-        assert_eq!(p.pool_pos, vec![vec![0, 2], vec![1, 3]]);
     }
 
     #[test]
@@ -144,5 +140,15 @@ mod tests {
         assert_eq!(p.group_indices.len(), 3);
         assert!(p.group_indices[1].is_empty());
         assert!(p.group_indices[2].is_empty());
+    }
+
+    #[test]
+    fn pool_bucket_folds_every_sentinel_spelling_onto_one_slot() {
+        assert_eq!(pool_bucket(0, 3), 0);
+        assert_eq!(pool_bucket(2, 3), 2);
+        // Both the canonical sentinel and a larger stray land in the same slot,
+        // which is the only reason an `n_groups + 1` buffer is enough.
+        assert_eq!(pool_bucket(3, 3), 3);
+        assert_eq!(pool_bucket(99, 3), 3);
     }
 }

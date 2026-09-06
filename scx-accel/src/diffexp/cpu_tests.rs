@@ -1771,18 +1771,20 @@ fn drop_unlabelled(
     (sub_data, sub_groups, n_obs)
 }
 
-/// **The oracle for unlabelled-cell semantics.** 1-vs-rest DE over a matrix
-/// containing unlabelled cells must equal 1-vs-rest DE over the same matrix
-/// with those rows physically removed — scores, p-values and logFC alike. That
-/// is exactly what scanpy computes: `rank_genes_groups` subsets to
-/// `obs[groupby].isin(groups_order)` before it ranks anything.
+/// **The oracle for unlabelled-cell semantics.** An unlabelled cell is in no
+/// group of its own but is in every group's "rest" and in the rank pool — so
+/// 1-vs-rest DE over a matrix containing unlabelled cells must equal 1-vs-rest
+/// DE over the same matrix with those cells collected into one *extra* group,
+/// read back for the real groups only. Both runs then rank the same `n_obs`
+/// values against the same competitors, and group `g`'s rest is everything
+/// outside `g` in both.
 ///
-/// Regression for the review's §7.1: `total` excluded unlabelled cells while
-/// `n2 = n_obs - n1` counted them, inflating every logFC in every group by
-/// `log2(n_obs − n1) − log2(n_labelled − n1)`, and the rank pool kept them as
-/// competitors so the z-score diverged too.
+/// That equality is exact, not approximate, and it is scanpy's rule: scanpy
+/// ranks the whole matrix and leaves a NaN-labelled cell in every group's
+/// "rest" (X9 / PR N). The oracle is deliberately *not* the physically-subset
+/// matrix — see the sibling test below, which pins that the two now differ.
 #[test]
-fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
+fn test_one_vs_rest_unlabelled_cells_equal_an_extra_group() {
     let n_groups = 4usize;
     let n_vars = 6usize;
     let per_group = 15usize;
@@ -1793,8 +1795,14 @@ fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
     let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
     let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
 
-    let (sub_data, sub_groups, sub_n_obs) = drop_unlabelled(&data, &groups, n_vars, n_groups);
-    assert_eq!(sub_n_obs, n_obs - n_unlabelled);
+    // The oracle run: the sentinel cells become a real group of their own, so
+    // the pool is the whole matrix in both runs.
+    let mut extra_group_names = group_names.clone();
+    extra_group_names.push("unlabelled".to_string());
+    let extra_groups: Vec<usize> = groups
+        .iter()
+        .map(|&g| if g >= n_groups { n_groups } else { g })
+        .collect();
 
     for &tie_correct in &[false, true] {
         let with_sentinel = wilcoxon_rank_sum(
@@ -1811,13 +1819,13 @@ fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
             0,
         )
         .unwrap();
-        let physically_subset = wilcoxon_rank_sum(
-            &sub_data,
-            sub_n_obs,
+        let as_extra_group = wilcoxon_rank_sum(
+            &data,
+            n_obs,
             n_vars,
             &gene_names,
-            &sub_groups,
-            &group_names,
+            &extra_groups,
+            &extra_group_names,
             None,
             false,
             false,
@@ -1825,18 +1833,22 @@ fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
             0,
         )
         .unwrap();
-
-        assert_eq!(with_sentinel.group_names, physically_subset.group_names);
+        // The oracle reports one row more; the real groups must line up.
+        assert_eq!(as_extra_group.group_names.len(), n_groups + 1);
+        assert_eq!(
+            with_sentinel.group_names,
+            as_extra_group.group_names[..n_groups]
+        );
         for row in 0..with_sentinel.group_names.len() {
             assert_eq!(
-                with_sentinel.names[row], physically_subset.names[row],
+                with_sentinel.names[row], as_extra_group.names[row],
                 "gene order diverged for group {}",
                 with_sentinel.group_names[row]
             );
             for col in 0..n_vars {
                 let (a, b) = (
                     with_sentinel.scores[row][col],
-                    physically_subset.scores[row][col],
+                    as_extra_group.scores[row][col],
                 );
                 assert!(
                     (a - b).abs() < 1e-12,
@@ -1846,7 +1858,7 @@ fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
                 );
                 let (a, b) = (
                     with_sentinel.pvals[row][col],
-                    physically_subset.pvals[row][col],
+                    as_extra_group.pvals[row][col],
                 );
                 assert!(
                     (a - b).abs() < 1e-12,
@@ -1856,7 +1868,7 @@ fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
                 );
                 let (a, b) = (
                     with_sentinel.logfoldchanges[row][col],
-                    physically_subset.logfoldchanges[row][col],
+                    as_extra_group.logfoldchanges[row][col],
                 );
                 assert!(
                     (a - b).abs() < 1e-12,
@@ -1869,12 +1881,78 @@ fn test_one_vs_rest_unlabelled_cells_equal_physical_subset() {
     }
 }
 
-/// The brute-force rest-sum oracle, but with unlabelled cells present: the rest
-/// denominator is `n_labelled − n1`, never `n_obs − n1`. Sibling of
+/// The inverse of the oracle above, and the reason PR N is a behaviour change:
+/// dropping the unlabelled rows from the matrix is **not** the same computation
+/// any more. Until X9 it was — pyscx left those cells out of the pool — and
+/// that is precisely what diverged from scanpy 1.12.
+///
+/// Asserted as "some field moves by more than float noise", not as a specific
+/// number: the claim is that the two pools are genuinely different, and a
+/// tolerance-sized difference would not carry it.
+#[test]
+fn test_one_vs_rest_unlabelled_cells_differ_from_physical_subset() {
+    let n_groups = 4usize;
+    let n_vars = 6usize;
+    let per_group = 15usize;
+    let (data, groups, n_obs) = unlabelled_fixture(n_groups, n_vars, per_group, 7);
+    let gene_names: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    let group_names: Vec<String> = (0..n_groups).map(|g| format!("grp_{g}")).collect();
+    let (sub_data, sub_groups, sub_n_obs) = drop_unlabelled(&data, &groups, n_vars, n_groups);
+    assert!(sub_n_obs < n_obs, "fixture must contain unlabelled cells");
+
+    let full = wilcoxon_rank_sum(
+        &data,
+        n_obs,
+        n_vars,
+        &gene_names,
+        &groups,
+        &group_names,
+        None,
+        false,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+    let subset = wilcoxon_rank_sum(
+        &sub_data,
+        sub_n_obs,
+        n_vars,
+        &gene_names,
+        &sub_groups,
+        &group_names,
+        None,
+        false,
+        false,
+        false,
+        0,
+    )
+    .unwrap();
+
+    let mut max_delta = 0.0f64;
+    for row in 0..full.group_names.len() {
+        for col in 0..n_vars {
+            // Same gene order is not guaranteed across runs; compare by name.
+            let name = &full.names[row][col];
+            let other = subset.names[row].iter().position(|n| n == name).unwrap();
+            max_delta = max_delta.max((full.scores[row][col] - subset.scores[row][other]).abs());
+        }
+    }
+    assert!(
+        max_delta > 1e-6,
+        "1-vs-rest on the full matrix is indistinguishable from the physically \
+         subset one (max |Δz| = {max_delta}) — unlabelled cells are still being \
+         dropped from the pool"
+    );
+}
+
+/// The brute-force rest-sum oracle with unlabelled cells present: the rest
+/// numerator is the sum over **every** other cell and the denominator is
+/// `n_obs − n1`, matching scanpy's `X[~mask_g]`. Sibling of
 /// `test_one_vs_rest_logfc_matches_bruteforce_restsum`, whose `i / per_group`
 /// fixture leaves no cell unassigned and so pins nothing here.
 #[test]
-fn test_one_vs_rest_rest_denominator_excludes_unlabelled() {
+fn test_one_vs_rest_rest_denominator_includes_unlabelled() {
     let n_groups = 5usize;
     let n_vars = 3usize;
     let per_group = 9usize;
@@ -1902,7 +1980,13 @@ fn test_one_vs_rest_rest_denominator_excludes_unlabelled() {
 
     let mut group_gene_sums = vec![vec![0.0f64; n_vars]; n_groups];
     let mut group_sizes = vec![0usize; n_groups];
+    // Summed over every row, unlabelled included — that is what makes the rest
+    // numerator and the `n_obs − n1` denominator describe the same population.
+    let mut total_gene_sums = vec![0.0f64; n_vars];
     for (cell, &g) in groups.iter().enumerate() {
+        for var in 0..n_vars {
+            total_gene_sums[var] += data[cell * n_vars + var] as f64;
+        }
         if g >= n_groups {
             continue;
         }
@@ -1915,13 +1999,10 @@ fn test_one_vs_rest_rest_denominator_excludes_unlabelled() {
     for (g, gname) in group_names.iter().enumerate() {
         let row = result.group_names.iter().position(|n| n == gname).unwrap();
         let n1 = group_sizes[g] as f64;
-        let n2 = (n_labelled - group_sizes[g]) as f64;
+        let n2 = (n_obs - group_sizes[g]) as f64;
         for (var, vname) in gene_names.iter().enumerate() {
             let mean_group = group_gene_sums[g][var] / n1;
-            let rest_sum: f64 = (0..n_groups)
-                .filter(|&gg| gg != g)
-                .map(|gg| group_gene_sums[gg][var])
-                .sum();
+            let rest_sum: f64 = total_gene_sums[var] - group_gene_sums[g][var];
             let expected = compute_logfc(mean_group, rest_sum / n2, false);
             let col = result.names[row].iter().position(|n| n == vname).unwrap();
             let got = result.logfoldchanges[row][col];

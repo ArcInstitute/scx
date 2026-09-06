@@ -42,7 +42,7 @@
 //! `tie_correct` parameter that **defaults to `False`**, and SCX's default
 //! matches scanpy's — so scanpy *can* produce the corrected convention and
 //! simply does not by default. On this fixture the two conventions differ by
-//! **7.647e-02** in `z`, both measured from scanpy: a difference in definition,
+//! **4.364e-01** in `z`, both measured from scanpy: a difference in definition,
 //! not in precision, so each arm needs its own reference.
 //!
 //! [`SCIPY_P_TIE_CORRECTED`] and [`SCANPY_P_TIE_CORRECTED`] agree at
@@ -75,11 +75,9 @@ pub const N_OBS: usize = 12;
 pub const N_VARS: usize = 6;
 /// Real groups. `FIXTURE_GROUPS[i] == N_GROUPS` is the unlabelled sentinel.
 pub const N_GROUPS: usize = 2;
-/// Cells that take part in the comparison — `N_OBS` minus the unlabelled ones.
-pub const N_LABELLED: usize = 10;
 
 /// Tolerance for every `z` table: scanpy's f32 storage, one decimal order over
-/// the observed 4.3e-08.
+/// the observed 1.07e-07.
 pub const Z_ATOL: f64 = 1e-6;
 /// Tolerance for [`SCIPY_P_TIE_CORRECTED`] — f64 on both sides.
 pub const P_CORRECTED_ATOL: f64 = 1e-15;
@@ -91,9 +89,10 @@ pub const P_UNCORRECTED_ATOL: f64 = 1e-12;
 /// Every value is exactly representable in `f32`, so the `f32 → f64` promotion
 /// inside the kernels is lossless.
 ///
-/// Rows 10 and 11 are unlabelled and carry deliberately extreme values: if any
-/// kernel ever let an unlabelled cell into the rank pool or the rest
-/// denominator, no tolerance would hide it.
+/// Rows 10 and 11 are unlabelled and carry deliberately extreme values. An
+/// unlabelled cell is in no group but **is** in the rank pool and in every
+/// group's "rest" (scanpy's rule, SCX's since 0.17 / X9), so a kernel that
+/// dropped them from either could not hide behind a tolerance.
 ///
 /// The six genes each pin a path some arm treats differently:
 ///
@@ -104,7 +103,7 @@ pub const P_UNCORRECTED_ATOL: f64 = 1e-12;
 /// | `g2` | all zeros | degenerate, and no stored nonzeros for the nnz arm |
 /// | `g3` | negatives + stored zeros | the nnz arm's `neg` block, and stored zeros that must join the *implicit*-zero block rather than `pos` |
 /// | `g4` | small counts | partial ties — the realistic single-cell shape |
-/// | `g5` | nonzero **only** in unlabelled rows | the leak canary: to the labelled pool this gene is identical to `g2`, so any answer that differs from `g2`'s means unlabelled cells reached the pool |
+/// | `g5` | nonzero **only** in unlabelled rows | the inclusion canary: over the labelled cells alone it is identical to the all-zero `g2`, so an answer that *matches* `g2`'s means unlabelled cells never reached the pool |
 pub const FIXTURE_X: [[f32; N_VARS]; N_OBS] = [
     [1.0, 3.0, 0.0, -2.0, 0.0, 0.0],
     [2.0, 3.0, 0.0, -1.0, 1.0, 0.0],
@@ -129,23 +128,26 @@ pub const FIXTURE_GROUPS: [usize; N_OBS] = [0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 2, 2];
 /// internally, which is what makes this an independent check on SCX's
 /// `Σ(t³−t)/(n(n−1))` term rather than a restatement of it.
 ///
-/// Computed over the **labelled subset only**, because scipy has no notion of a
-/// cell outside the pool. A kernel handed the full `N_OBS` matrix plus the
-/// sentinel must reproduce it; that equality *is* the unlabelled-cell contract,
-/// referenced to scipy rather than to a sibling implementation of the same idea.
+/// Computed over **every** cell: each group is compared with every row outside
+/// it, unlabelled rows included, which is what scanpy's `X[~mask_g]` means and
+/// what scipy expresses natively as the `g != grp` side of the split. So the
+/// unlabelled-cell contract is referenced to scipy rather than to a sibling
+/// implementation of the same idea. (Before X9 these were computed on the
+/// labelled subset, which pinned the divergent rule.)
 ///
-/// `g1`, `g2` and `g5` are fully tied over the labelled pool, so
+/// `g1` and `g2` are fully tied over the pool, so
 /// `σ² = (n₁n₂/12)·((n+1) − Σ(t³−t)/(n(n−1)))` is exactly 0. scipy warns and
 /// yields `nan` there; every SCX kernel returns the documented `(0.0, 1.0)`.
-/// Those three cells pin SCX's contract, not scipy's — the generator says so at
-/// the point it writes them.
+/// Those cells pin SCX's contract, not scipy's — the generator says so at the
+/// point it writes them. `g5` is **not** among them any more: its two nonzeros
+/// sit in the unlabelled rows, which are now in the pool.
 pub const SCIPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
-    [0.009023438818080326, 0.009023438818080326],
+    [0.004483250402085382, 0.22322514530675575],
     [1.0, 1.0],
     [1.0, 1.0],
-    [0.13756389390990328, 0.13756389390990328],
-    [0.10034824646229074, 0.10034824646229074],
-    [1.0, 1.0],
+    [0.25143684995587434, 0.25143684995587434],
+    [0.03668277440246522, 0.6760528085643454],
+    [0.21189355203127813, 0.21189355203127813],
 ];
 
 /// scanpy `scores` per `[gene][group]` with `tie_correct=True`.
@@ -155,12 +157,12 @@ pub const SCIPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
 /// this module self-referential — so the z oracle is scanpy, which implements
 /// the tie term independently. **float32** in the recarray, hence [`Z_ATOL`].
 pub const SCANPY_Z_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
-    [-2.6111648082733154, 2.6111648082733154],
+    [-2.8419928550720215, 1.2179969549179077],
     [0.0, 0.0],
     [0.0, 0.0],
-    [-1.4849241971969604, 1.4849241971969604],
-    [-1.6431676149368286, 1.6431676149368286],
-    [0.0, 0.0],
+    [-1.1468663215637207, 1.1468663215637207],
+    [-2.0892772674560547, 0.417855441570282],
+    [-1.2483755350112915, -1.2483755350112915],
 ];
 
 /// scanpy `pvals` per `[gene][group]` with `tie_correct=True`.
@@ -170,12 +172,12 @@ pub const SCANPY_Z_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
 /// because it is what makes either of them an oracle for SCX rather than a
 /// second opinion on the same arithmetic.
 pub const SCANPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
-    [0.009023438818080326, 0.009023438818080326],
+    [0.004483250402085382, 0.22322514530675575],
     [1.0, 1.0],
     [1.0, 1.0],
-    [0.13756389390990328, 0.13756389390990328],
-    [0.10034824646229074, 0.10034824646229074],
-    [1.0, 1.0],
+    [0.25143684995587434, 0.25143684995587434],
+    [0.03668277440246522, 0.6760528085643454],
+    [0.21189355203127813, 0.21189355203127813],
 ];
 
 /// scanpy `scores` per `[gene][group]` with `tie_correct=False` — the default.
@@ -184,12 +186,12 @@ pub const SCANPY_P_TIE_CORRECTED: [[f64; N_GROUPS]; N_VARS] = [
 /// no ties at all, so both conventions must agree exactly on it, and the two
 /// scanpy tables do.
 pub const SCANPY_Z_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
-    [-2.6111648082733154, 2.6111648082733154],
+    [-2.8419928550720215, 1.2179969549179077],
     [0.0, 0.0],
     [0.0, 0.0],
-    [-1.4622522592544556, 1.4622522592544556],
-    [-1.5666989088058472, 1.5666989088058472],
-    [0.0, 0.0],
+    [-1.1367970705032349, 1.1367970705032349],
+    [-2.0299949645996094, 0.40599897503852844],
+    [-0.8119979500770569, -0.8119979500770569],
 ];
 
 /// scanpy `pvals` per `[gene][group]` with `tie_correct=False`.
@@ -197,12 +199,12 @@ pub const SCANPY_Z_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
 /// float64 in the recarray — computed from an f64 z, not from the f32 `scores`
 /// above — so this one is pinned tightly.
 pub const SCANPY_P_UNCORRECTED: [[f64; N_GROUPS]; N_VARS] = [
-    [0.009023438818080326, 0.009023438818080326],
+    [0.004483250402085382, 0.22322514530675575],
     [1.0, 1.0],
     [1.0, 1.0],
-    [0.14367208180696023, 0.14367208180696023],
-    [0.11718508719813801, 0.11718508719813801],
-    [1.0, 1.0],
+    [0.2556231075464126, 0.2556231075464126],
+    [0.042357062026854894, 0.6847433561373875],
+    [0.41679281184762706, 0.41679281184762706],
 ];
 
 /// The fixture flattened row-major, for kernels that take a dense `&[f32]`.
@@ -234,13 +236,12 @@ pub fn csc_column(gene: usize) -> (Vec<i32>, Vec<f32>) {
     (rows, vals)
 }
 
-/// Cells per real group, indexed by group. Excludes the unlabelled cells.
+/// Cells per pool bucket: `N_GROUPS` real groups followed by the unlabelled
+/// count, the shape `gene_stats_nnz` takes.
 pub fn group_cell_counts() -> Vec<usize> {
-    let mut counts = vec![0usize; N_GROUPS];
+    let mut counts = vec![0usize; N_GROUPS + 1];
     for &g in FIXTURE_GROUPS.iter() {
-        if g < N_GROUPS {
-            counts[g] += 1;
-        }
+        counts[g.min(N_GROUPS)] += 1;
     }
     counts
 }

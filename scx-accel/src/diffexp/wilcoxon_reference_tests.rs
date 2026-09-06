@@ -17,18 +17,20 @@
 //!
 //! # The unlabelled-cell contract, referenced rather than asserted
 //!
-//! Every expected value was computed on the **labelled subset** of the fixture
-//! (10 of 12 rows), because scipy has no notion of a cell outside the
-//! comparison pool. The kernels here are handed the **full 12 rows** plus the
-//! unlabelled sentinel. So "adding two unlabelled cells changes nothing" is not
-//! a separate assertion bolted on afterwards — it is the only way these
+//! Every expected value was computed over **all 12 rows**, the two unlabelled
+//! ones included: an unlabelled cell is in no group but is in the rank pool and
+//! in every group's "rest", which is scanpy's rule and — since 0.17 (X9) — SCX's
+//! (`super::groups`). scipy expresses it natively, as the `g != grp` side of
+//! each split. So "an unlabelled cell ranks and counts as rest" is not a
+//! separate assertion bolted on afterwards — it is the only way these
 //! assertions can pass at all, and it is stated against scipy instead of
 //! against another SCX kernel. That closes ORG-7.21-5's `unknown-group cells`
 //! item, which until now was three SCX arms agreeing with each other.
 //!
 //! Gene `g5` is the sharpest form of it: nonzero *only* in the two unlabelled
-//! rows. Over the labelled pool it is identical to the all-zero gene `g2`, so
-//! any answer that differs between the two proves a leak.
+//! rows, and so indistinguishable from the all-zero gene `g2` to anything that
+//! leaves those rows out. An answer that makes the two *equal* proves the
+//! omission.
 
 use super::wilcoxon_reference_values as r;
 
@@ -171,7 +173,7 @@ fn the_two_libraries_agree_on_the_tie_corrected_p_value() {
 ///
 /// A separate reference on purpose. scipy always applies the `Σ(t³−t)`
 /// correction, so it is not an oracle for this arm at all: on this fixture the
-/// two conventions differ by 7.6e-02 in `z`, which is a different answer rather
+/// two conventions differ by 4.4e-01 in `z`, which is a different answer rather
 /// than a looser one. scanpy is the implementation of *this* convention, and its
 /// `scores` are float32 in the recarray, which is where
 /// [`Z_ATOL`](r::Z_ATOL) comes from.
@@ -236,7 +238,6 @@ fn nnz_wilcoxon_matches_the_same_reference_values() {
                 &r::FIXTURE_GROUPS,
                 &counts,
                 r::N_OBS,
-                r::N_LABELLED,
                 r::N_GROUPS,
                 tie_correct,
                 false, // log_transformed
@@ -271,23 +272,36 @@ fn nnz_wilcoxon_matches_the_same_reference_values() {
     }
 }
 
-/// The leak canary, stated as its own assertion so a failure names the cause.
+/// The inclusion canary, stated as its own assertion so a failure names the cause.
 ///
-/// `g5` is nonzero only in the two unlabelled rows; `g2` is all zeros. Over the
-/// labelled pool they are the same column, so every kernel must return the same
-/// answer for both. If an unlabelled cell reaches the rank pool or the rest
-/// denominator, `g5` diverges from `g2` and this fires — where the two tests
-/// above would only report "gene g5 does not match its reference", which is the
-/// same failure without the diagnosis.
+/// `g5` is nonzero only in the two unlabelled rows; `g2` is all zeros. To
+/// anything that leaves unlabelled cells out of the pool they are the same
+/// column and every kernel returns the same answer for both — which is exactly
+/// what SCX did before X9. Now those rows rank, so `g5` must differ from `g2`,
+/// and this fires when it does not — where the two tests above would only
+/// report "gene g5 does not match its reference", the same failure without the
+/// diagnosis.
+///
+/// `g2` stays the reference point rather than a hard-coded number: it is the
+/// degenerate column on the *same* fixture, so the assertion says "these two
+/// are distinguishable" without restating either table.
 #[test]
-fn a_gene_nonzero_only_in_unlabelled_cells_is_indistinguishable_from_an_empty_one() {
+fn a_gene_nonzero_only_in_unlabelled_cells_differs_from_an_empty_one() {
     for tie_correct in [true, false] {
         let got = dense_result(tie_correct);
         for (grp, per_gene) in got.iter().enumerate() {
+            let (empty, unlabelled_only) = (per_gene[2], per_gene[5]);
             assert_eq!(
-                per_gene[2], per_gene[5],
+                empty,
+                (0.0, 1.0),
+                "group {grp} tie_correct={tie_correct}: g2 is all zeros, so σ² collapses \
+                 and the documented answer is (0.0, 1.0); got {empty:?}"
+            );
+            assert_ne!(
+                unlabelled_only, empty,
                 "group {grp} tie_correct={tie_correct}: g5 (nonzero only in unlabelled rows) \
-                 differs from g2 (all zeros) — an unlabelled cell reached the comparison pool"
+                 is indistinguishable from g2 (all zeros) — the unlabelled cells never \
+                 reached the comparison pool"
             );
         }
     }

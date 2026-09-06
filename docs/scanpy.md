@@ -2875,9 +2875,9 @@ df = pyscx.accel.rank_genes_groups_df(adata, group="0")  # + pct_nz_group, pct_n
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — NaN, empty, or a value outside the column's categories — are **excluded from the test entirely**: they are not part of a group, not part of `"rest"`, and not in the rank pool. This is pyscx's rule — scanpy 1.12 keeps such cells in its 1-vs-rest pool, so on partially labelled `obs` the two differ (a pre-existing difference, tracked as a follow-up; `pts_rest` follows scanpy, see below). A `UserWarning` reports how many were dropped. |
+| `groupby` | (required) | Column in `adata.obs` to group cells by. Cells with no label — a pandas missing value (`NaN` / `None` / `pd.NA`, decided by `pandas.isna` and not by how it prints), or a value outside the column's categories — get **no group of their own**: no result row, no `pts` column. For `reference="rest"` they are still in the rank pool and in every group's `"rest"`, numerator and denominator alike, exactly as scanpy 1.12 does (**changed in 0.17**; before that pyscx left them out, and results on partially labelled `obs` differed from scanpy's). A pairwise run against a named reference compares `group ∪ reference`, so such a cell takes no part in it. A `UserWarning` reports how many there were and which of the two applies. A group whose *name* merely looks like a missing value — `"nan"`, `"None"`, `""` — is a real group and is kept. |
 | `reference` | `"rest"` | Compare against a specific group or `"rest"` (1-vs-rest) |
-| `groups` | `None` (all) | Report only these groups, in this order. An **output** filter: the pool each group is compared against does not change, so a group's statistics are identical with or without it — and identical to scanpy's `groups=`. Unknown names, repeats and an empty list raise; the reference group is silently not tested (scanpy's rule) but stays a `pts` column; a named group (or the named reference) with fewer than two cells raises scanpy's "only contain one sample" error. Compute is not reduced. |
+| `groups` | `None` (all) | Report only these groups, in this order. An **output** filter: the pool each group is compared against does not change, so a group's statistics are identical with or without it — and identical to scanpy's `groups=`. Unknown names, repeats and an empty list raise; the reference group is silently not tested (scanpy's rule) but stays a `pts` column. Compute is not reduced. |
 | `n_genes` | all | Number of top genes to report per group |
 | `method` | `"wilcoxon"` | Statistical method (currently only `"wilcoxon"`) |
 | `pts` | `False` | Also write `uns[key]["pts"]` — and `["pts_rest"]` when `reference="rest"` — the fraction of cells in each group with a nonzero value, as scanpy does: `genes × groups` float64 DataFrames indexed by the analysed var names, over **every** gene whatever `n_genes` says. See below. |
@@ -2889,6 +2889,18 @@ df = pyscx.accel.rank_genes_groups_df(adata, group="0")  # + pct_nz_group, pct_n
 | `gene_chunk_size` | `None` | Process genes in chunks of this size to limit memory. `None` processes all genes at once. |
 | `prefer_format` | `"auto"` | `"auto"` (default; CPU routes CSC-direct when a valid sidecar is present, else CSR), `"csr"`, or `"csc"`. |
 | `device` | `"auto"` | Device selection: `"auto"`, `"cpu"`, `"gpu"`, `"gpu:N"`. GPU routes to CSC-direct (`gpu_csc_v3`) when a sidecar is present, or CSR-direct (`gpu_csr_v3`) otherwise. |
+
+**A group with fewer than two cells is refused, whichever way you ask.** Any
+**participating** group raises scanpy's `Could not calculate statistics for
+groups <g> since they only contain one sample.` — every level when `groups` is
+omitted, the named ones (plus a named reference) when it is given. Before 0.17
+only the named path checked, so the default call returned finite, plausible
+z-scores computed from a single cell. An unused category counts as zero cells
+and raises too, exactly as in scanpy (its `value_counts()` reports every
+category, and `groups="all"` selects every category); since the usual cause is
+a subset that kept its parent's levels, the message names
+`remove_unused_categories()`. Under `stratify_by` this is a per-stratum failure
+like any other: it warns and drops that stratum.
 
 Benchmarked at 5.4s on 1M cells (3.2× faster than scanpy's 17.2s).
 
@@ -2902,10 +2914,9 @@ sequential scan resident) and nothing when off. "Expressing" is scanpy's `!= 0`:
 stored in a scipy CSR is not counted, a negative value is. `pts_rest[g]` is
 scanpy's `X[~mask_g]` fraction — over **every other cell of the matrix**, cells
 with no `groupby` label included — so the table equals scanpy's on partially
-labelled input as well. (The rank-sum statistic itself leaves unlabelled cells
-out of its pool; that is a pre-existing pyscx difference from scanpy 1.12,
-tracked as a follow-up, and `pts` follows scanpy's tables rather than that
-pool.) `rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
+labelled input as well. Since 0.17 the rank-sum statistic uses that same pool,
+so `pts_rest` and `pvals` describe one reference population rather than two.
+`rank_genes_groups_df(group=…)` then appends `pct_nz_group` and (for
 `reference="rest"`) `pct_nz_reference`, looked up by gene name, as
 `sc.get.rank_genes_groups_df` does. Both refuse duplicate `var_names` (run
 `adata.var_names_make_unique()` first): a by-name join cannot tell two genes
@@ -2930,7 +2941,7 @@ in definition rather than in precision. scipy *always* applies the tie
 correction. scanpy takes the same `tie_correct` parameter and **defaults it to
 `False`**, so it can produce either convention and simply does not correct
 unless asked — SCX's default matches scanpy's. On a fixture with ties the two
-conventions differ by **7.6e-02** in `z`, so pinning one arm against the other's
+conventions differ by **4.4e-01** in `z`, so pinning one arm against the other's
 reference would be wrong, not merely loose.
 
 Rust-side pins (`scx-accel`, CPU dense and analytic-nnz kernels):

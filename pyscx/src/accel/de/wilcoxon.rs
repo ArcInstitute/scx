@@ -34,11 +34,12 @@ pub(crate) struct RankGenesRun {
 ///
 /// `requested_groups` restricts which groups are *reported*, never which cells
 /// take part: every group's statistic is computed against the same pool
-/// (1-vs-rest keeps every other labelled cell in "rest"; pairwise compares
-/// against the named reference; BH is per group), so a group's numbers are
-/// identical with or without the restriction — and identical to scanpy's,
-/// whose `groups=` works the same way. Relabelling the unselected groups as
-/// unlabelled before the kernel would have changed what "rest" means.
+/// (1-vs-rest keeps every other cell in "rest", unlabelled ones included;
+/// pairwise compares against the named reference; BH is per group), so a
+/// group's numbers are identical with or without the restriction — and
+/// identical to scanpy's, whose `groups=` works the same way. Relabelling the
+/// unselected groups as unlabelled before the kernel would have changed what
+/// "rest" means.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_rank_genes_groups_inner(
     py: Python<'_>,
@@ -58,24 +59,20 @@ pub(crate) fn run_rank_genes_groups_inner(
 ) -> PyResult<RankGenesRun> {
     // Extract group labels from adata.obs[groupby].
     let obs = adata.getattr("obs")?;
-    let group_col = obs.get_item(groupby)?;
+    let group_col = single_obs_column(obs.get_item(groupby)?, groupby)?;
     let group_labels: Vec<String> = group_col
         .call_method1("astype", ("str",))?
         .call_method0("tolist")?
         .extract()?;
 
-    // Determine unique group names (sorted, matching scanpy's default).
-    let cat_attr = group_col.getattr("cat");
-    let unique_groups: Vec<String> = if let Ok(cat) = cat_attr {
-        cat.getattr("categories")?
-            .call_method0("tolist")?
-            .extract()?
-    } else {
-        let mut unique: Vec<String> = group_labels.to_vec();
-        unique.sort();
-        unique.dedup();
-        unique
-    };
+    // Which cells have no label, and what the levels are. Both come from
+    // `pandas` rather than from how a value prints — see `missing_label_mask`:
+    // `astype("str")` turns `None` into `"None"` and `pd.NA` into `"<NA>"`, so
+    // a spelling test would both miss those and steal a real group named
+    // `"None"`. That matters more since X8, because the singlet guard counts
+    // cells per level and a phantom level has none.
+    let missing = missing_label_mask(py, &group_col, group_labels.len())?;
+    let unique_groups = group_level_universe(&group_col, &group_labels, &missing)?;
 
     // Map labels → indices.
     let group_name_to_idx: std::collections::HashMap<&str, usize> = unique_groups
@@ -84,11 +81,23 @@ pub(crate) fn run_rank_genes_groups_inner(
         .map(|(i, name)| (name.as_str(), i))
         .collect();
 
-    // Unknown groups (NaN / empty after astype("str") → "nan" / "") map to a
-    // sentinel >= n_groups so the Wilcoxon kernels drop them, instead of
-    // contaminating group 0. Mirrors resolve_groups_and_reference.
-    let groups = encode_group_labels(&group_labels, &group_name_to_idx, unique_groups.len());
-    warn_unlabelled_cells(py, &groups, unique_groups.len(), groupby);
+    // Missing values, and any label outside the universe, map to a sentinel
+    // >= n_groups so the Wilcoxon kernels give them no group of their own,
+    // instead of contaminating group 0. They still rank, and still count as
+    // "rest", in the 1-vs-rest arm. Mirrors resolve_groups_and_reference.
+    let groups = encode_group_labels(
+        &group_labels,
+        &group_name_to_idx,
+        unique_groups.len(),
+        &missing,
+    );
+    warn_unlabelled_cells(
+        py,
+        &groups,
+        unique_groups.len(),
+        groupby,
+        reference == "rest",
+    );
 
     // Resolve reference.
     let ref_idx: Option<usize> = if reference == "rest" {
@@ -106,8 +115,65 @@ pub(crate) fn run_rank_genes_groups_inner(
     // above). The reference is never a tested group — scanpy drops it from the
     // request silently and keeps it as a `pts` column, so do the same.
     let named_reference = (reference != "rest").then_some(reference);
+
+    // scanpy refuses any *participating* group with fewer than two cells
+    // ("… since they only contain one sample"), and a participating group is
+    // every level when `groups=` is omitted — `select_groups(adata, "all", …)`
+    // returns `cat.categories`, and `value_counts()` reports an unused level as
+    // 0, which is also `< 2`. So the check cannot live inside the `groups=`
+    // branch: doing so made the default call — the one nobody is watching —
+    // return finite, plausible scores computed from one cell (X8).
+    //
+    // Sizes are counted over the encoded labels, so an off-category value is a
+    // sentinel here and not a member of any level, exactly as it is downstream.
+    let group_sizes = {
+        let mut sizes = vec![0usize; unique_groups.len()];
+        for &code in &groups {
+            if code < unique_groups.len() {
+                sizes[code] += 1;
+            }
+        }
+        sizes
+    };
+    let refuse_singletons = |participating: &[&str]| -> PyResult<()> {
+        let too_small: Vec<&str> = participating
+            .iter()
+            .copied()
+            .filter(|name| group_sizes[group_name_to_idx[*name]] < 2)
+            .collect();
+        if too_small.is_empty() {
+            return Ok(());
+        }
+        // Naming the remedy matters for the zero-cell case, which is almost
+        // always a subset that kept its parent's categories rather than a
+        // genuinely tiny group.
+        let empties: Vec<&str> = too_small
+            .iter()
+            .copied()
+            .filter(|name| group_sizes[group_name_to_idx[*name]] == 0)
+            .collect();
+        let remedy = if empties.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({} has no cells at all; if that is a level left over from a subset, run \
+                 adata.obs[{groupby:?}] = adata.obs[{groupby:?}].cat.remove_unused_categories())",
+                empties.join(", ")
+            )
+        };
+        Err(PyValueError::new_err(format!(
+            "Could not calculate statistics for groups {} since they only contain one \
+             sample.{remedy}",
+            too_small.join(", ")
+        )))
+    };
+
     let tested_groups: Option<Vec<String>> = match requested_groups {
-        None => None,
+        None => {
+            let all: Vec<&str> = unique_groups.iter().map(String::as_str).collect();
+            refuse_singletons(&all)?;
+            None
+        }
         Some(req) => {
             // Shape (non-empty, no repeats) was checked at the entry point, so
             // the stratified path fails once, up front, not once per stratum.
@@ -130,31 +196,16 @@ pub(crate) fn run_rank_genes_groups_inner(
                      group {reference:?}"
                 )));
             }
-            // scanpy refuses any participating group with fewer than two cells
-            // ("… since they only contain one sample"). Applied to the groups the
-            // caller named — the tested ones and a named reference — so the new
-            // surface matches scanpy; an omitted `groups=` keeps today's NaN rows
-            // for empty / singlet levels (a pre-existing difference, tracked
-            // separately).
-            let mut sizes = vec![0usize; unique_groups.len()];
-            for &code in &groups {
-                if code < unique_groups.len() {
-                    sizes[code] += 1;
-                }
-            }
-            let too_small: Vec<&str> = tested
+            // The requested set, not the whole universe: `groups=` is an output
+            // filter, so a singleton level the caller did not ask about is not
+            // a group this run reports on. Same rule as scanpy's, whose
+            // `groups_order` is the request when one is given.
+            let participating: Vec<&str> = tested
                 .iter()
                 .map(String::as_str)
                 .chain(named_reference)
-                .filter(|name| sizes[group_name_to_idx[*name]] < 2)
                 .collect();
-            if !too_small.is_empty() {
-                return Err(PyValueError::new_err(format!(
-                    "Could not calculate statistics for groups {} since they only contain one \
-                     sample.",
-                    too_small.join(", ")
-                )));
-            }
+            refuse_singletons(&participating)?;
             Some(tested)
         }
     };
@@ -852,10 +903,25 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// pool each group is compared against is unchanged, so its numbers equal the
 /// unrestricted run's and scanpy's ``groups=``. Unknown names, repeats and an
 /// empty list raise; the reference group is silently not tested (it stays a
-/// ``pts`` column); a named group (or the named reference) with fewer than two
-/// cells raises scanpy's "only contain one sample" error — under
-/// ``stratify_by`` that, like any per-stratum failure, warns and drops the
-/// stratum. ``pts=True`` refuses duplicate var names (its table is joined by
+/// ``pts`` column).
+///
+/// Any **participating** group with fewer than two cells raises scanpy's "only
+/// contain one sample" error: every level when ``groups`` is omitted, the named
+/// ones (plus a named reference) when it is given. An unused category counts as
+/// zero cells and so raises too, as it does in scanpy — the message names
+/// ``remove_unused_categories()``. Under ``stratify_by`` that, like any
+/// per-stratum failure, warns and drops the stratum.
+///
+/// Cells with no ``groupby`` label — a pandas missing value (``NaN`` / ``None``
+/// / ``pd.NA``, decided by ``pandas.isna`` and never by how the value prints)
+/// or a value outside the column's categories — get no group, no result row and
+/// no ``pts`` column, but for ``reference="rest"`` they are in the rank pool and
+/// in every group's "rest", scanpy 1.12's rule. A pairwise run against a named
+/// reference compares ``group ∪ reference``, so they take no part in it. A group
+/// whose *name* merely looks like a missing value (``"nan"``, ``"None"``,
+/// ``""``) is a real group and is kept.
+///
+/// ``pts=True`` refuses duplicate var names (its table is joined by
 /// name). ``corr_method`` accepts only ``"benjamini-hochberg"`` and is
 /// recorded in ``params``; any other value raises instead of silently
 /// applying BH.
@@ -1162,6 +1228,30 @@ fn write_de_to_adata(
     params.set_item("layer", layer)?;
     params.set_item("corr_method", corr_method)?;
 
+    // scanpy's recarray dtype, built through the **dict** spelling
+    // (`{"names": [...], "formats": [...]}`) rather than a list of
+    // `(name, format)` tuples.
+    //
+    // The two are equivalent for every ordinary group name and differ on
+    // exactly one: numpy silently renames an empty field name to a positional
+    // `"f0"` in the tuple-list form, so a group legitimately labelled `""`
+    // produced an array whose field could not be read back —
+    // `ValueError: no field of name`, raised from inside the writer. The dict
+    // form keeps the name. Reachable only since missing values stopped being
+    // inferred from their printed form, which is what made `""` a real level.
+    let build_dtype = |groups: &[String], format: &str| -> PyResult<Bound<'_, PyAny>> {
+        let names = pyo3::types::PyList::empty(py);
+        let formats = pyo3::types::PyList::empty(py);
+        for gn in groups {
+            names.append(gn.as_str())?;
+            formats.append(format)?;
+        }
+        let spec = pyo3::types::PyDict::new(py);
+        spec.set_item("names", names)?;
+        spec.set_item("formats", formats)?;
+        numpy.call_method1("dtype", (spec,))
+    };
+
     // Helper to build structured array (like scanpy's recarray format).
     // Scanpy stores e.g. names as a structured array with dtype like:
     //   [('group_A', 'O'), ('group_B', 'O')]
@@ -1174,12 +1264,7 @@ fn write_de_to_adata(
             // silently produced NaN past 200 characters) and no single long
             // name widens every cell of every group (a fitted `U{max}` would
             // have cost `4 × max_len × n_groups × n_genes` bytes).
-            let dt_list = pyo3::types::PyList::empty(py);
-            for gn in groups {
-                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "O"])?;
-                dt_list.append(tup)?;
-            }
-            let dtype = numpy.call_method1("dtype", (dt_list,))?;
+            let dtype = build_dtype(groups, "O")?;
 
             // Build empty structured array, then fill fields.
             let arr = numpy.call_method1("empty", (n_genes,))?;
@@ -1203,12 +1288,7 @@ fn write_de_to_adata(
     let build_structured_f64 =
         |field_data: &[Vec<f64>], groups: &[String]| -> PyResult<Bound<'_, PyAny>> {
             let t_marshal = scx_accel::cpu_profile::start();
-            let dt_list = pyo3::types::PyList::empty(py);
-            for gn in groups {
-                let tup = pyo3::types::PyTuple::new(py, [gn.as_str(), "f8"])?;
-                dt_list.append(tup)?;
-            }
-            let dtype = numpy.call_method1("dtype", (dt_list,))?;
+            let dtype = build_dtype(groups, "f8")?;
 
             let arr = numpy.call_method1("empty", (n_genes,))?;
             let arr = arr.call_method1("astype", (&dtype,))?;

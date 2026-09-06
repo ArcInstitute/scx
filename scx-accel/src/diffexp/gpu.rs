@@ -654,9 +654,8 @@ fn wilcoxon_chunk_gpu_sequence_v3(
     is_ref_mode: bool,
 ) -> Result<()> {
     // Pool slab is pre-populated by the shard pass; sort + tie on it. The pool
-    // is the reference group in ref-mode or the labelled cells in 1-vs-rest;
-    // either way `scratch.ref_slab` holds it and `scratch.tie_term` holds its
-    // tie term.
+    // is the reference group in ref-mode or every cell in 1-vs-rest; either way
+    // `scratch.ref_slab` holds it and `scratch.tie_term` holds its tie term.
     gpu_de_block_sort(
         dev,
         &mut scratch.ref_slab,
@@ -1770,23 +1769,24 @@ fn pdex_ref_gpu_chunked_v3_csc(
 /// Two distinct cell→group/pos table sets are needed because the Wilcoxon
 /// comparison pool differs from `pdex_ref` (§C.5):
 /// - **Main tables** (`cell_to_group_dev` / `cell_to_pos_dev`): slot 0 is the
-///   reference group (ref-mode) or empty (1-vs-rest); slots `1..=n_test` are
-///   the test groups. Used for the per-test-group scatters (`group_id =
+///   reference group (ref-mode) or the unlabelled cells (1-vs-rest); slots
+///   `1..=n_test` are the test groups. Used for the per-test-group scatters (`group_id =
 ///   tg_idx + 1`) and for the pseudobulk (which spans all `n_slots` slots,
 ///   covering every cell). `slot_to_group[slot]` maps a slot back to its
 ///   original group id (for reading per-group sums back).
 /// - **Pool tables** (`pool_group_dev` / `pool_pos_dev`): map every pool cell
 ///   to `group_id = 0`. In ref-mode the pool is the reference group; in
-///   1-vs-rest the pool is every *labelled* cell, which overlaps the test
-///   groups and so cannot share the main table. Used only for the
-///   `group_id = 0` pool scatter into `ref_slab`.
+///   1-vs-rest the pool is every cell, which overlaps the test groups and so
+///   cannot share the main table. Used only for the `group_id = 0` pool scatter
+///   into `ref_slab`.
 struct WilcoxonV3Prep {
     cell_to_group_dev: CudaSlice<i32>,
     cell_to_pos_dev: CudaSlice<i32>,
     pool_group_dev: CudaSlice<i32>,
     pool_pos_dev: CudaSlice<i32>,
-    /// `slot_to_group[slot] = Some(original_group)` for populated slots; slot 0
-    /// is `None` in 1-vs-rest (empty), `Some(reference)` in ref-mode.
+    /// `slot_to_group[slot] = Some(original_group)` for slots that are a group;
+    /// slot 0 is `None` in 1-vs-rest (it holds the unlabelled cells, which are
+    /// in no group) and `Some(reference)` in ref-mode.
     slot_to_group: Vec<Option<usize>>,
     n_slots: usize,
     pool_len: usize,
@@ -1807,24 +1807,21 @@ fn prepare_wilcoxon_v3(
     // Destructured rather than cloned: `group_indices` is moved into the
     // returned prep, and at atlas scale the clone was a second copy of one
     // index per labelled cell for no reason.
-    let super::groups::GroupPartition {
-        labelled,
-        group_indices,
-        ..
-    } = super::groups::partition_by_group(groups, n_groups);
+    let super::groups::GroupPartition { group_indices } =
+        super::groups::partition_by_group(groups, n_groups);
     let is_ref_mode = reference.is_some();
     let test_groups: Vec<usize> = match reference {
         Some(r) => (0..n_groups).filter(|&g| g != r).collect(),
         None => (0..n_groups).collect(),
     };
 
-    // Pool permutation: reference cells (ref-mode) or every *labelled* cell
-    // (1-vs-rest). An unlabelled cell is in no group, so it is neither "rest"
-    // nor a rank competitor — see `super::groups`. `pool_len` is therefore the
+    // Pool permutation: reference cells (ref-mode) or every cell (1-vs-rest).
+    // An unlabelled cell is in no group but it ranks alongside everyone and it
+    // counts in every group's "rest" — see `super::groups`. `pool_len` is the
     // rank-pool size and the base of the rest denominator below.
     let pool_host: Vec<i32> = match reference {
         Some(r) => group_indices[r].iter().map(|&c| c as i32).collect(),
-        None => labelled.iter().map(|&c| c as i32).collect(),
+        None => (0..n_obs as i32).collect(),
     };
     let pool_len = pool_host.len();
     if pool_len == 0 {
@@ -1832,7 +1829,7 @@ fn prepare_wilcoxon_v3(
             if is_ref_mode {
                 "Wilcoxon GPU v3: empty comparison pool (reference group has zero cells)"
             } else {
-                "Wilcoxon GPU v3: empty comparison pool (no cell carries a group label)"
+                "Wilcoxon GPU v3: empty comparison pool (the matrix has no cells)"
             }
             .to_string(),
         ));
@@ -1843,13 +1840,26 @@ fn prepare_wilcoxon_v3(
     let pool_pos_dev = build_cell_to_pos_dev(dev, &pool_host, &pool_offsets, n_obs)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE Wilcoxon v3 alloc pool pos: {e}")))?;
 
-    // Main table: slot 0 = reference (ref-mode) or empty (1-vs-rest); slots
-    // 1..=n_test = test groups, in `test_groups` order.
+    // Main table: slot 0 = reference (ref-mode) or the **unlabelled** cells
+    // (1-vs-rest); slots 1..=n_test = test groups, in `test_groups` order.
+    //
+    // Slot 0 carries the unlabelled cells rather than being empty because the
+    // pseudobulk kernels sum per slot and skip a cell whose `cell_to_group` is
+    // negative (`scx-gpu/kernels/diffexp.cu`). Those values have to reach the
+    // chunk total — an unlabelled cell is in every group's "rest" — while
+    // reaching no group's own sum, and `slot_to_group[0] = None` is exactly
+    // that. The per-test-group scatters use `group_id = tg_idx + 1`, so nothing
+    // else ever reads slot 0.
     let mut all_cells_host: Vec<i32> = Vec::new();
     let mut offsets_host: Vec<i32> = Vec::with_capacity(test_groups.len() + 2);
     offsets_host.push(0);
-    if let Some(r) = reference {
-        all_cells_host.extend(group_indices[r].iter().map(|&c| c as i32));
+    match reference {
+        Some(r) => all_cells_host.extend(group_indices[r].iter().map(|&c| c as i32)),
+        None => all_cells_host.extend(
+            (0..n_obs)
+                .filter(|&c| groups[c] >= n_groups)
+                .map(|c| c as i32),
+        ),
     }
     offsets_host.push(checked_offset_i32(
         all_cells_host.len(),
@@ -1977,7 +1987,7 @@ where
     // will see. Not `pool_len`: ref-mode also sorts each test group's slab
     // (`wilcoxon_chunk_gpu_sequence_v3`), and the reference is routinely the
     // smaller side — `reference="B cell"` against a much larger T-cell group.
-    // 1-vs-rest is unaffected, its pool being every labelled cell.
+    // 1-vs-rest is unaffected, its pool being every cell.
     let n_sorted_max = pool_len.max(n_g_max).max(1);
 
     // Clamp the gene chunk so the per-target-group pool slabs (the dominant
@@ -2049,14 +2059,19 @@ where
         }
 
         // 1-vs-rest reference sum in O(1): precompute the chunk-local total gene
-        // sum across all groups once, then derive each group's rest_sum via
+        // sum across all slots once, then derive each group's rest_sum via
         // subtraction (mirrors `diffexp.rs::wilcoxon_rank_sum`). Avoids the
         // O(n_groups) re-scan per (gene, group) — i.e. O(sz·n_groups²) per chunk.
         // Only needed for the 1-vs-rest arm.
+        //
+        // Summed over the raw slot sums, **not** over `group_gene_sums`: slot 0
+        // holds the unlabelled cells and `slot_to_group[0]` is `None`, so those
+        // values never reach `group_gene_sums`. They must reach the total, since
+        // an unlabelled cell is in every group's "rest".
         let total_gene_sum: Vec<f64> = if reference.is_none() {
             let mut totals = vec![0.0f64; sz];
-            for sums in &group_gene_sums {
-                for (total, &s) in totals.iter_mut().zip(sums.iter()) {
+            for slot in 0..n_slots {
+                for (total, &s) in totals.iter_mut().zip(&sums_host[slot * sz..slot * sz + sz]) {
                     *total += s;
                 }
             }
@@ -2146,8 +2161,8 @@ where
                     .iter()
                     .map(|&r| r - n1d * (n1d + 1.0) / 2.0)
                     .collect();
-                // `pool_len` is the labelled-cell count in 1-vs-rest, not
-                // `n_obs`: unlabelled cells are outside the pool.
+                // `pool_len` is every cell in 1-vs-rest: unlabelled cells are
+                // in the pool, and in every group's "rest".
                 (u_host, pool_tie_host.clone(), n_g, pool_len - n_g)
             };
 
@@ -2167,10 +2182,10 @@ where
                         }
                     }
                     None => {
-                        // `total_gene_sum` sums the labelled groups only, so the
-                        // denominator must be the labelled pool (`pool_len`) minus
-                        // this group — not `n_obs`, which counts unlabelled cells
-                        // the numerator never saw.
+                        // `total_gene_sum` sums every slot, unlabelled included,
+                        // so the denominator is the whole pool (`pool_len`) minus
+                        // this group — numerator and denominator describing the
+                        // same population.
                         let rest_sum = total_gene_sum[var] - group_gene_sums[g][var];
                         let rest_n = pool_len - n_g;
                         if rest_n == 0 {
@@ -2266,8 +2281,9 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csc(
             source
                 .for_each_gpu_csc_shard_in_range(c0 as u32..c1 as u32, &mut |_idx, csc_view| {
                     shards += 1;
-                    // group_id = 0 is the pool (ref cells / labelled cells); 1..=n_test
-                    // are the per-test-group slabs.
+                    // group_id = 0 is the pool (the reference group in ref-mode,
+                    // every cell in 1-vs-rest); 1..=n_test are the per-test-group
+                    // slabs.
                     gpu_de_scatter_csc_to_gene_major(
                         dev,
                         csc_view,

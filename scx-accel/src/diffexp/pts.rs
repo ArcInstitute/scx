@@ -23,9 +23,10 @@
 //! other row of the matrix**, cells with no `groupby` label included — and this
 //! module reproduces that table exactly. A cell whose label is the unlabelled
 //! sentinel (`>= n_groups`, see [`super::groups`]) is therefore in no group's
-//! `pts` but in every group's `pts_rest`. (The rank-sum kernels leave such
-//! cells out of their pool; that is a pre-existing difference from scanpy 1.12
-//! tracked separately, and `pts` follows scanpy's tables, not that pool.)
+//! `pts` but in every group's `pts_rest`. Since 0.17 (X9) the rank-sum kernels
+//! use that same pool, so `pts_rest` and `pvals` in one result describe one
+//! reference population; before then they did not, and this module was the half
+//! that already matched scanpy.
 
 use scx_format_io::ShardSource;
 use scx_sparse::ScxCsr;

@@ -7,8 +7,8 @@ as `genes × groups` DataFrames indexed by var name, over every gene whatever
 `n_genes` says. The count is exact, so the bar against scanpy is 1e-12 — only
 the division can differ, and it does not.
 
-`groups=` is an *output* filter: "rest" keeps every other labelled cell, so a
-group's statistics are identical with or without it, and identical to scanpy's
+`groups=` is an *output* filter: "rest" keeps every other cell, so a group's
+statistics are identical with or without it, and identical to scanpy's
 `groups=`. Every test pins `device="cpu"`.
 """
 
@@ -223,8 +223,9 @@ def test_pts_counts_nonzero_not_positive_and_ignores_stored_zeros():
 
 def test_pts_rest_with_unlabelled_cells_matches_scanpy(synthetic_adata):
     """scanpy's `pts_rest[g]` is over `X[~mask_g]`: every other cell, the
-    NaN-labelled ones included — even though scanpy and pyscx handle those
-    cells differently in the statistic. The table is scanpy's, exactly."""
+    NaN-labelled ones included. Since X9 the statistic uses that same pool, so
+    the two agree with each other as well as with scanpy — see
+    `test_pts_rest_and_the_statistic_share_one_pool` below."""
     sc = pytest.importorskip("scanpy")
     adata = synthetic_adata.copy()
     labels = adata.obs["batch"].astype(object).to_numpy()
@@ -252,6 +253,49 @@ def test_pts_rest_with_unlabelled_cells_matches_scanpy(synthetic_adata):
     want, want_rest = _manual_pts(adata, labels, ["A", "B", "C"])
     _assert_frames_equal_to(rgg["pts"], want, 0.0)
     _assert_frames_equal_to(rgg["pts_rest"], want_rest, 0.0)
+
+
+def test_pts_rest_and_the_statistic_share_one_pool(synthetic_adata):
+    """One dict, one reference population (X9).
+
+    0.17 shipped `pts_rest` over `X[~mask_g]` (unlabelled included) while
+    `scores` / `pvals` still used the labelled-only pool, so a single
+    `uns["rank_genes_groups"]` described two different "rest"s with nothing
+    saying so. The gene planted below is the sharpest statement of it: nonzero
+    *only* in the unlabelled cells, so it is indistinguishable from an all-zero
+    gene to anything that leaves them out.
+
+    Asserted against a gene that really is all-zero on the same run, rather than
+    against a number: the claim is that the two are distinguishable, and that is
+    exactly what a shared pool buys.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[:7] = None
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    X = adata.X.tolil()
+    X[:, 0] = 0
+    X[:7, 0] = 3.0  # gene 0: nonzero only in the unlabelled cells
+    X[:, 1] = 0  # gene 1: all zeros everywhere
+    adata.X = X.tocsr()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        rgg = _rgg(adata, pts=True)
+
+    unlabelled_only, all_zero = adata.var_names[0], adata.var_names[1]
+    # pts_rest already saw those cells before X9 …
+    assert (rgg["pts_rest"].loc[unlabelled_only] > 0).all()
+    assert (rgg["pts_rest"].loc[all_zero] == 0).all()
+    # … and now the statistic does too, so the two genes are not the same
+    # column any more.
+    for group in rgg["names"].dtype.names:
+        scores = dict(zip(rgg["names"][group], rgg["scores"][group]))
+        assert scores[unlabelled_only] != scores[all_zero], (
+            f"group {group}: a gene nonzero only in unlabelled cells scores the "
+            f"same as an all-zero gene — `pts_rest` and `scores` are still "
+            f"describing different reference populations"
+        )
 
 
 def _dup_adata():
@@ -384,27 +428,234 @@ def test_groups_subset_matches_scanpy_groups(synthetic_adata):
     _assert_frames_equal_to(rgg["pts_rest"], rgg_sc["pts_rest"], PTS_ATOL)
 
 
-def test_groups_refuses_a_named_group_with_fewer_than_two_cells(synthetic_adata):
-    """scanpy's rule for every participating group, applied here to the groups
-    the caller named (and a named reference). An omitted `groups=` keeps
-    today's NaN rows for empty / singlet levels — a pre-existing difference,
-    tracked separately, deliberately not pinned here."""
-    adata = synthetic_adata.copy()
+def _one_cell_in_group_a(adata, categories=("A", "B", "C")):
+    """Move every A cell but one into B, so `A` has exactly one cell."""
     labels = adata.obs["batch"].astype(object).to_numpy()
     labels[labels == "A"] = "B"
-    labels[0] = "A"  # exactly one A cell
-    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    labels[0] = "A"
+    adata.obs["batch"] = pd.Categorical(labels, categories=list(categories))
+    return adata, labels
+
+
+def test_groups_refuses_a_named_group_with_fewer_than_two_cells(synthetic_adata):
+    """scanpy's rule, applied to the groups the caller named (and a named
+    reference). The `groups=None` half is pinned by the sibling test below."""
+    adata, labels = _one_cell_in_group_a(synthetic_adata.copy())
     with pytest.raises(ValueError, match="groups A since they only contain one sample"):
         _rgg(adata, groups=["A"])
     with pytest.raises(ValueError, match="groups A since they only contain one sample"):
         _rgg(adata, groups=["B"], reference="A")
-    # A named group with two or more cells is fine.
+    # A named group with two or more cells is fine — the guard is a floor, not
+    # a filter, and naming only healthy groups must not trip it even though a
+    # singleton level exists in the column.
     rgg = _rgg(adata, groups=["B"])
     assert rgg["names"].dtype.names == ("B",)
     # An empty category named in `groups` is refused the same way.
     adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C", "D"])
     with pytest.raises(ValueError, match="groups D since they only contain one sample"):
         _rgg(adata, groups=["D", "B"])
+
+
+def test_default_path_refuses_a_singleton_group_too(synthetic_adata):
+    """X8: the guard must not depend on how the caller spelled the request.
+
+    `groups=None` is what every ordinary call does, and until this it was the
+    *unguarded* branch: a one-cell group came back with finite, plausible
+    z-scores and no warning, while `groups=["A"]` on the same input raised.
+    NaN announces itself; `0.99` does not.
+    """
+    adata, _ = _one_cell_in_group_a(synthetic_adata.copy())
+    with pytest.raises(ValueError, match="groups A since they only contain one sample"):
+        _rgg(adata)
+    # Same input, same op, named request — this arm already raised, and must
+    # keep raising with the identical message.
+    with pytest.raises(ValueError, match="groups A since they only contain one sample"):
+        _rgg(adata.copy(), groups=["A"])
+
+
+def test_default_path_accepts_a_two_cell_group(synthetic_adata):
+    """The floor is two, not three: a two-cell group is a legal Wilcoxon."""
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[labels == "A"] = "B"
+    labels[0] = "A"
+    labels[1] = "A"  # exactly two A cells
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    rgg = _rgg(adata)
+    assert set(rgg["names"].dtype.names) == {"A", "B", "C"}
+    assert np.isfinite(np.asarray(rgg["scores"]["A"], dtype=float)).all()
+
+
+def test_default_path_refuses_an_unused_category_and_names_the_remedy(synthetic_adata):
+    """An unused level has zero cells, and `0 < 2`, so scanpy raises on it too:
+    its `value_counts()` reports every category and `groups="all"` selects
+    every category. The overwhelmingly common source is a subset that kept its
+    parent's categories, so the message says how to drop them."""
+    adata = synthetic_adata.copy()
+    adata.obs["batch"] = pd.Categorical(
+        adata.obs["batch"].astype(object).to_numpy(), categories=["A", "B", "C", "D"]
+    )
+    with pytest.raises(ValueError) as excinfo:
+        _rgg(adata)
+    assert "groups D since they only contain one sample" in str(excinfo.value)
+    assert "remove_unused_categories()" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "na", [np.nan, None, pd.NA], ids=["np.nan", "None", "pd.NA"]
+)
+def test_a_plain_string_column_with_a_missing_value_is_not_a_singleton_group(
+    synthetic_adata, na
+):
+    """The guard must not fire on a non-categorical column carrying a missing value.
+
+    Whether a cell is missing is asked of `pandas.isna`, never inferred from how
+    the value prints — `astype("str")` renders `np.nan` as `"nan"`, `None` as
+    `"None"` and `pd.NA` as `"<NA>"`. A spelling test caught only the first, so
+    a single `None` failed the *whole* default call with "…groups None since
+    they only contain one sample", and two of them minted a result row and a
+    `pts` column scanpy never emits. scanpy never sees such a level: it runs
+    `sanitize_anndata`, and `astype("category")` makes no missing value a
+    category.
+
+    Parametrised over all three spellings because one of them passing is
+    exactly what hid this: the original test planted `np.nan` only.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[0] = na
+    labels[1] = na  # two, so a phantom level would be a group rather than an error
+    adata.obs["batch"] = labels  # plain object column, not a Categorical
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", "C"}
+    assert list(rgg["pts"].columns) == ["A", "B", "C"], (
+        "a phantom missing-value level reached the pts frame"
+    )
+
+
+@pytest.mark.parametrize("na", [np.nan, None, pd.NA], ids=["np.nan", "None", "pd.NA"])
+def test_a_single_missing_value_does_not_trip_the_singlet_guard(synthetic_adata, na):
+    """One missing cell must not fail the run — the sharpest form of the above.
+
+    With missingness read off the printed form, exactly one `None` produced
+    `Could not calculate statistics for groups None since they only contain one
+    sample.` while scanpy 1.12 succeeded on the same input. Asserted on the
+    default path, under `groups=`, and with a named reference, because the
+    guard's participating set differs in each.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[0] = na
+    adata.obs["batch"] = labels
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        assert set(_rgg(adata.copy())["names"].dtype.names) == {"A", "B", "C"}
+        assert _rgg(adata.copy(), groups=["B"])["names"].dtype.names == ("B",)
+        assert set(_rgg(adata.copy(), reference="A")["names"].dtype.names) == {"B", "C"}
+
+
+@pytest.mark.parametrize("name", ["nan", "None", "<NA>", ""], ids=lambda s: repr(s))
+def test_a_group_whose_name_looks_like_a_missing_value_is_still_a_group(
+    synthetic_adata, name
+):
+    """The other direction: a real cluster named `"nan"` is not a missing value.
+
+    A spelling denylist steals these. `pandas.isna` does not — the strings are
+    present, so no cell is missing and every level survives, including under
+    `pts` where a stolen level would silently vanish from the frame.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[labels == "C"] = name
+    adata.obs["batch"] = labels
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)  # nothing is missing here
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", name}
+    assert set(rgg["pts"].columns) == {"A", "B", name}
+
+
+def test_a_nullable_string_column_with_pd_na_is_handled(synthetic_adata):
+    """pandas' nullable `string` dtype, not an object array holding `pd.NA`.
+
+    It has no `.cat`, so it takes the same branch as an object column, and its
+    missing value also prints as `"<NA>"`. Called out separately because the
+    dtype is what a `pyarrow`-backed or `convert_dtypes()`-ed obs frame gives
+    you, and the object-array arm above does not exercise it.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[0] = pd.NA
+    adata.obs["batch"] = pd.array(labels, dtype="string")
+    assert str(adata.obs["batch"].dtype) == "string"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", "C"}
+    assert list(rgg["pts"].columns) == ["A", "B", "C"]
+
+
+def test_an_integer_categorical_groupby_works(synthetic_adata):
+    """`pd.Categorical([0, 1, 0])` is an ordinary way to spell cluster ids.
+
+    The level universe comes from `cat.categories`, which for such a column is
+    an integer index — extracting it as strings raised
+    `TypeError: 'int' object is not an instance of 'str'` while scanpy simply
+    stringifies. Pre-existing, and the fix belongs where the universe is built,
+    so the categories and the column's own `astype("str")` labels line up.
+    """
+    sc = pytest.importorskip("scanpy")
+    adata = synthetic_adata.copy()
+    codes = {"A": 0, "B": 1, "C": 2}
+    ints = [codes[v] for v in adata.obs["batch"].astype(str)]
+    adata.obs["batch"] = pd.Categorical(ints)
+
+    scanpy_side = adata.copy()
+    rgg = _rgg(adata)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sc.tl.rank_genes_groups(scanpy_side, "batch", method="wilcoxon")
+    assert set(rgg["names"].dtype.names) == {"0", "1", "2"}
+    assert set(rgg["names"].dtype.names) == set(
+        scanpy_side.uns["rank_genes_groups"]["names"].dtype.names
+    )
+
+
+def test_a_duplicated_obs_column_name_is_named_in_the_error(synthetic_adata):
+    """`obs[groupby]` is then a frame, and every conversion downstream fails
+    with `AttributeError: 'DataFrame' object has no attribute 'tolist'` — which
+    names neither the column nor the duplication. Checked before the first
+    conversion so the message can."""
+    adata = synthetic_adata.copy()
+    adata.obs["dup"] = adata.obs["batch"].to_numpy()
+    adata.obs.columns = ["dup" if c == "batch" else c for c in adata.obs.columns]
+    assert list(adata.obs.columns).count("dup") == 2
+    with pytest.raises(ValueError, match=r"is 2-dimensional.*duplicated in adata\.obs"):
+        pyscx.accel.rank_genes_groups(adata, "dup", device="cpu")
+
+
+def test_a_categorical_level_named_nan_is_told_apart_from_a_real_nan(synthetic_adata):
+    """Both print as `"nan"` after `astype("str")`; only `isna` separates them.
+
+    A categorical carrying a level literally called `"nan"` *and* genuine NaN
+    cells is the case a spelling test cannot get right at all: it must either
+    drop the real level or keep the missing cells. The level keeps its cells and
+    the NaN rows are the ones the warning counts.
+    """
+    adata = synthetic_adata.copy()
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    labels[labels == "C"] = "nan"
+    labels[0] = np.nan  # a genuine missing value, printing the same way
+    labels[1] = np.nan
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "nan"])
+
+    with pytest.warns(UserWarning, match=r"2 of \d+ cells have no group label"):
+        rgg = _rgg(adata, pts=True)
+    assert set(rgg["names"].dtype.names) == {"A", "B", "nan"}
+    # The level is real, so it has cells; the two NaN rows are in nobody's pts.
+    assert (rgg["pts"]["nan"] > 0).any()
 
 
 def test_groups_errors(synthetic_adata):
@@ -429,6 +680,41 @@ def test_groups_applies_to_the_stratified_frame(synthetic_adata):
     assert set(sub["group"]) == {"C"}
     want = full[full["group"] == "C"].reset_index(drop=True)
     pd.testing.assert_frame_equal(sub.reset_index(drop=True), want)
+
+
+def test_a_stratum_with_a_singleton_group_is_dropped_not_silently_scored(
+    synthetic_adata,
+):
+    """Under `stratify_by` the guard rides the existing per-stratum policy.
+
+    A per-stratum failure already warns and drops that stratum, and the singlet
+    guard is now one such failure. Unused categories are not a problem here:
+    anndata prunes them when it builds the subset view, so only a stratum that
+    genuinely contains one cell of a group is affected — and the surviving
+    strata must still come back, which is the half a bare `pytest.warns` would
+    not check.
+    """
+    adata = synthetic_adata.copy()
+    strata = np.array(["s0", "s1"] * (adata.n_obs // 2), dtype=object)
+    labels = adata.obs["batch"].astype(object).to_numpy()
+    # Make group "A" a singleton inside s0 only: every other s0 A-cell becomes
+    # a B, so s1 keeps a healthy A.
+    s0_a = [i for i in range(adata.n_obs) if strata[i] == "s0" and labels[i] == "A"]
+    assert len(s0_a) >= 2, "fixture must give s0 more than one A cell"
+    for i in s0_a[1:]:
+        labels[i] = "B"
+    adata.obs["batch"] = pd.Categorical(labels, categories=["A", "B", "C"])
+    adata.obs["stratum"] = pd.Categorical(strata)
+
+    with pytest.warns(UserWarning, match=r"DE failed for stratum \[s0\].*one sample"):
+        out = pyscx.accel.rank_genes_groups(
+            adata,
+            "batch",
+            stratify_by=["stratum"],
+            min_cells_per_stratum=1,
+            device="cpu",
+        )
+    assert set(out["stratum"]) == {"s1"}, "the healthy stratum was dropped too"
 
 
 # ---------------------------------------------------------------------------
