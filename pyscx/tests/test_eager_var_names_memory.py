@@ -1,16 +1,17 @@
 """Peak memory of the eager `to_anndata(var_names=...)` path, each mode in a
 fresh process.
 
-Today the eager gene projection assembles the whole matrix and then hands it to
-anndata to slice: `to_anndata_with_layers(..., eager=true)` builds full-width X
-**and** every selected layer, and `adata[:, idx].copy()` then makes a second copy
-of all of it. So asking for three genes of two thousand costs *more* than reading
-the whole file — the default `to_anndata()` at least leaves layers as a lazy
-bridge, which `var_names=` forces eager.
+These are the bars that keep the projection a projection. Before it, the eager
+gene path assembled the whole matrix and handed it to anndata to slice:
+`to_anndata_with_layers(..., eager=true)` built full-width X **and** every
+selected layer, and `adata[:, idx].copy()` then made a second copy of all of it.
+Asking for three genes of two thousand cost *more* than reading the whole file —
+the default `to_anndata()` at least leaves layers as a lazy bridge, which
+`var_names=` forces eager.
 
-`.raw` is the same story once removed: it is attached to the full AnnData, so the
-view copies it and `_mutated_copy` copies it again — three full-width buffers for
-a matrix a gene projection does not touch at all (anndata never var-slices
+`.raw` was the same story once removed: attached to the full AnnData, so the view
+copied it and `_mutated_copy` copied it again — three full-width buffers for a
+matrix a gene projection does not touch at all (anndata never var-slices
 `.raw`).
 
 Sampler, env pinning and fixture geometry are copied from

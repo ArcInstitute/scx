@@ -108,6 +108,20 @@ impl ScxBackedSparseDataset {
         backed: Arc<BackedCsrReader>,
         kept_to_global: Vec<u64>,
     ) -> Self {
+        Self::from_reader_with_shared_deletions(backed, Arc::new(kept_to_global))
+    }
+
+    /// [`Self::from_reader_with_deletions`] over a mapping the caller already
+    /// owns as an `Arc`.
+    ///
+    /// The eager projected read builds one dataset per matrix — X and every
+    /// selected layer — off the same row set, and the mapping is one `u64` per
+    /// live cell. Cloning it per layer is an 8 MB allocation each at a million
+    /// cells, for a value none of them mutates.
+    pub fn from_reader_with_shared_deletions(
+        backed: Arc<BackedCsrReader>,
+        kept_to_global: Arc<Vec<u64>>,
+    ) -> Self {
         let (_, n_vars) = backed.shape();
         let n_kept = kept_to_global.len();
         let n_shards = backed.index().n_shards();
@@ -116,7 +130,7 @@ impl ScxBackedSparseDataset {
             backed_csc: None,
             shape_val: (n_kept, n_vars),
             n_shards,
-            kept_to_global: Some(Arc::new(kept_to_global)),
+            kept_to_global: Some(kept_to_global),
             col_projection: None,
             col_presentation: None,
             non_negative: true,

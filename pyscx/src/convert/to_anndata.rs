@@ -454,10 +454,11 @@ pub(crate) fn to_anndata_with_layers<'py>(
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
 
-    // `Skeleton` defers raw to the caller, which attaches it *after* anndata's
-    // slice + copy. Attaching it here would put it through both — a var slice
-    // does not touch raw, so the view and `_mutated_copy` would each take a
-    // full-width copy of a matrix nothing narrowed.
+    // `Skeleton` defers raw to the caller, which decides where to attach it:
+    // after the slice when only columns are selected (a var slice does not
+    // touch raw, so attaching first would cost the view and `_mutated_copy` a
+    // full-width copy each), before it when the slice also filters rows.
+    // Attaching here would take that decision away.
     if !matches!(mode, MatrixMode::Skeleton { .. }) {
         attach_raw(py, &adata, reader, filters, plan)?;
     }
@@ -588,9 +589,14 @@ fn compose_kept_to_global(kept_to_global: Option<&[u64]>, positions: &[usize]) -
 /// reindexes or deletes `uns["<col>_colors"]` (`AnnData._init_as_view`).
 /// Reproducing that by hand is how a rewrite silently changes output, so the
 /// slice stays and only the matrices are taken away from it — X and each
-/// selected layer are assembled already projected, and `.raw` (which anndata
-/// never var-slices) is attached afterwards so the view and the copy do not each
-/// take a full-width copy of it.
+/// selected layer are assembled already projected.
+///
+/// `.raw` is attached **before** the slice when the slice filters rows, and
+/// after it otherwise. anndata does not var-slice raw but it does obs-slice it,
+/// so the var-only path can attach afterwards and spare the view and the copy a
+/// full-width copy each of a matrix nothing narrowed — while the
+/// `preserve_slots` path must attach first, or hand a filtered AnnData a
+/// full-height raw that `Raw` will not reject.
 ///
 /// `obs_filter_expr` is the `preserve_slots=True` case: the mask is evaluated on
 /// the skeleton's obs, folded into the row set the projected matrices are built
@@ -663,13 +669,15 @@ fn projected_eager_anndata<'py>(
     let idx = pyo3::types::PyTuple::new(py, &[row_idx.unbind(), np_indices.into_any().unbind()])?;
     let adata = skeleton.get_item(idx)?.call_method0("copy")?;
 
+    // One shared row mapping for X and every layer (see `projected_matrix`).
+    let kept_to_global = kept_to_global.map(std::sync::Arc::new);
     let catalog = reader.catalog_arc();
     let x = projected_matrix(
         py,
         path,
         std::sync::Arc::clone(&catalog),
         None,
-        kept_to_global.as_deref(),
+        kept_to_global.as_ref(),
         col_indices,
         preserve_var_order,
         decode_window(reader, None),
@@ -703,7 +711,7 @@ fn projected_eager_anndata<'py>(
                 path,
                 std::sync::Arc::clone(&catalog),
                 Some(name),
-                kept_to_global.as_deref(),
+                kept_to_global.as_ref(),
                 col_indices,
                 preserve_var_order,
                 decode_window(reader, Some(name)),
@@ -727,9 +735,13 @@ fn projected_eager_anndata<'py>(
 /// A window restores the parallelism while keeping the memory claim honest:
 /// peak holds `window` full-width shards, not the whole matrix.
 ///
-/// Full-width decoded shards may occupy this much at once during a projected
-/// assembly. Well under the 8 GiB default eager budget, and far above any real
-/// shard.
+/// The concurrency cap for a projected assembly: how many full-width decoded
+/// shards it will hold at once, expressed as bytes. Well under the 8 GiB
+/// default eager budget, and far above any real shard.
+///
+/// A cap on concurrency, **not** a ceiling on the read: a single shard larger
+/// than this still decodes, one at a time. The budget decides how many such
+/// decodes overlap, never whether one happens.
 const IN_FLIGHT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Sized against the **largest** shard of the matrix being read, so the budget
@@ -753,22 +765,45 @@ fn decode_window(reader: &ScxReader, layer: Option<&str>) -> usize {
             .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
             .collect(),
     };
-    // A decoded shard is roughly `nnz * 8` (i32 index + f32 value per nonzero)
-    // plus its indptr; the indptr term is noise beside the values. An entry
-    // without stats cannot be sized, so fall back to one shard at a time rather
-    // than guessing — the conservative direction.
-    let mut max_nnz = 0u64;
-    let mut sized_every_shard = !entries.is_empty();
-    for entry in entries {
-        match &entry.stats {
-            Some(stats) => max_nnz = max_nnz.max(stats.nnz),
-            None => sized_every_shard = false,
+    let section = match layer {
+        Some(_) => SectionType::LayerCsrShard,
+        None => SectionType::CsrShard,
+    };
+    match max_decoded_shard_bytes(entries.iter().map(|e| {
+        e.stats.as_ref().map(|s| {
+            let start = s.major_start(section);
+            let end = s.major_end(section);
+            (s.nnz, end.saturating_sub(start))
+        })
+    })) {
+        Some(bytes) => window_for(threads, bytes),
+        None => 1,
+    }
+}
+
+/// Largest decoded size among a matrix's shards, or `None` when the answer
+/// cannot be derived — an empty shard list, or an entry the catalog has no
+/// stats for. `None` means "decode one at a time": guessing a size for a shard
+/// nobody measured is the wrong direction to be wrong in.
+///
+/// Each item is `Some((nnz, rows))` for a shard that has stats.
+fn max_decoded_shard_bytes(shards: impl Iterator<Item = Option<(u64, u64)>>) -> Option<u64> {
+    let mut max = None;
+    for shard in shards {
+        let (nnz, rows) = shard?;
+        // The same formula `ShardSizeHint::decoded_bytes` uses: an `ScxCsr` is
+        // an i64 indptr of `rows + 1` plus an i32 index and an f32 value per
+        // nonzero. The row term is not noise — a tall, near-empty shard is
+        // almost all indptr, and sizing it by `nnz` alone would put an
+        // arbitrary number of those in flight at once.
+        let bytes = scx_format_io::ShardSizeHint {
+            max_rows: rows as usize,
+            max_nnz: nnz as usize,
         }
+        .decoded_bytes();
+        max = Some(max.map_or(bytes, |m: u64| m.max(bytes)));
     }
-    if !sized_every_shard {
-        return 1;
-    }
-    window_for(threads, max_nnz.saturating_mul(8))
+    max
 }
 
 /// The budget arithmetic behind [`decode_window`], split out so it can be
@@ -831,7 +866,7 @@ fn projected_matrix<'py>(
     path: &std::path::Path,
     catalog: std::sync::Arc<scx_format_io::FullCatalog>,
     layer: Option<&str>,
-    kept_to_global: Option<&[u64]>,
+    kept_to_global: Option<&std::sync::Arc<Vec<u64>>>,
     col_indices: &[u32],
     preserve_var_order: bool,
     window: usize,
@@ -840,10 +875,13 @@ fn projected_matrix<'py>(
     use crate::backed::ScxBackedSparseDataset;
 
     let backed = open_backed_matrix_reader(path, catalog, layer, 0)?;
+    // The row set is shared, not copied per matrix: X and every selected layer
+    // are built off the same mapping, which is one `u64` per live cell.
     let mut ds = match kept_to_global {
-        Some(mapping) => {
-            ScxBackedSparseDataset::from_reader_with_deletions(backed, mapping.to_vec())
-        }
+        Some(mapping) => ScxBackedSparseDataset::from_reader_with_shared_deletions(
+            backed,
+            std::sync::Arc::clone(mapping),
+        ),
         None => ScxBackedSparseDataset::from_reader(backed),
     };
     install_projection(&mut ds, Some(col_indices), preserve_var_order);
@@ -1933,6 +1971,36 @@ mod tests {
     /// mean over the shards, and computes per matrix rather than reusing X's
     /// answer for every layer. Both would need a deliberately skewed
     /// multi-hundred-megabyte fixture to observe.
+    /// The catalog → bytes half of the window, which the budget arithmetic
+    /// below cannot reach. A tall, near-empty shard is the case an `nnz`-only
+    /// size gets wrong: it is almost all indptr.
+    #[test]
+    fn shard_sizing_counts_rows_as_well_as_nonzeros() {
+        // Largest, not first and not a mean. One row, 1 000 nonzeros:
+        // (1 + 1) * 8 bytes of indptr + 1 000 * 8 bytes of index+value.
+        assert_eq!(
+            max_decoded_shard_bytes([Some((10, 1)), Some((1_000, 1)), Some((10, 1))].into_iter()),
+            Some(2 * 8 + 1_000 * 8)
+        );
+        // A shard with no nonzeros at all still occupies its indptr.
+        assert_eq!(
+            max_decoded_shard_bytes([Some((0, 1_000_000))].into_iter()),
+            Some(1_000_001 * 8)
+        );
+        // And that row term can dominate: 1M empty rows outweigh 1k nonzeros.
+        let tall = max_decoded_shard_bytes([Some((0, 1_000_000))].into_iter()).unwrap();
+        let dense = max_decoded_shard_bytes([Some((1_000, 10))].into_iter()).unwrap();
+        assert!(tall > dense);
+        assert!(window_for(64, tall) < window_for(64, dense));
+        // One unmeasured shard makes the whole answer unknown.
+        assert_eq!(
+            max_decoded_shard_bytes([Some((10, 10)), None, Some((10, 10))].into_iter()),
+            None
+        );
+        // So does an empty matrix — there is nothing to size against.
+        assert_eq!(max_decoded_shard_bytes(std::iter::empty()), None);
+    }
+
     #[test]
     fn the_decode_window_honours_the_in_flight_budget() {
         // One shard bigger than the whole budget: decode them one at a time.
