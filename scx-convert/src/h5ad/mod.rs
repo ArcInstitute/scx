@@ -15,6 +15,11 @@
 // | `column_stream` | the nine column encodings and their two drivers          |
 // | `categorical`   | Arrow dictionary -> h5ad categorical, shared by both     |
 // | `uns`           | `/uns`: JSON -> HDF5                                     |
+//
+// On the ingest side `strings` owns the one traversal every HDF5 string
+// dataset goes through: four flavours, one const-generic width ladder, one
+// pass, and a sink that decides the output shape. Two readers had already
+// hand-rolled that ladder and lost the fixed-width half of it.
 
 pub(crate) mod categorical;
 pub(crate) mod column_stream;
@@ -25,6 +30,7 @@ pub(crate) mod dense_stream;
 pub(crate) mod read;
 pub(crate) mod stream;
 pub(crate) mod stream_write;
+pub(crate) mod strings;
 pub(crate) mod uns;
 pub(crate) mod uns_dataframe;
 pub(crate) mod write;

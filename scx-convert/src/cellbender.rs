@@ -39,7 +39,8 @@ use std::sync::Arc;
 use scx_ops::ExternalLayerData;
 
 use crate::file_checksum::blake3_of_file;
-use crate::h5ad::read::{read_f32_dataset, read_i64_dataset, read_string_dataset};
+use crate::h5ad::read::{read_f32_dataset, read_i64_dataset};
+use crate::h5ad::strings::read_string_dataset;
 use crate::pipeline::ConvertError;
 use crate::warnings::{ConvertWarning, WarningSink};
 

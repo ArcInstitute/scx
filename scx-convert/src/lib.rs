@@ -214,6 +214,8 @@ mod convert_tests_parallel;
 mod convert_tests_sort;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_streaming;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_strings;
 
 #[cfg(test)]
 mod mtx_tests;

@@ -12,6 +12,7 @@ use scx_format_io::MAX_UNS_DEPTH;
 use std::sync::Arc;
 
 use super::csc_transpose::csc_to_csr;
+use super::strings::{read_masked_string_array, read_string_array, read_string_dataset};
 use crate::detect::{detect_matrix_format, detect_matrix_format_at, MatrixFormat};
 use crate::pipeline::ConvertError;
 use crate::warnings::{ConvertWarning, WarningSink};
@@ -369,64 +370,6 @@ fn read_dense_matrix(file: &hdf5::File, dataset_name: &str) -> Result<CsrArrays,
 /// width; `u64` values exceeding `i64::MAX` fail with
 /// [`ConvertError::IndexOverflow`] (silent truncation would corrupt the
 /// CSR layout). Float source dtypes are rejected.
-/// Fixed-length HDF5 strings are read through a const-generic type, so the
-/// width must be known at compile time. Dispatch the runtime width up to the
-/// next size in this ladder: HDF5 performs the string-size conversion, so
-/// reading an `N`-byte dataset as `M >= N` is lossless.
-macro_rules! read_fixed_string {
-    ($ds:expr, $ty:ident, $size:expr, $($cap:literal),+) => {{
-        let size = $size;
-        let mut out: Option<Result<Vec<String>, ConvertError>> = None;
-        $(
-            if out.is_none() && size <= $cap {
-                out = Some(
-                    $ds.read_1d::<hdf5::types::$ty<$cap>>()
-                        .map(|a| a.iter().map(|s| s.to_string()).collect())
-                        .map_err(ConvertError::from),
-                );
-            }
-        )+
-        out.unwrap_or_else(|| {
-            Err(ConvertError::UnsupportedDtype(format!(
-                "dataset '{}' has fixed-length strings of {size} bytes, beyond \
-                 the largest supported width",
-                $ds.name()
-            )))
-        })
-    }};
-}
-
-/// Read any 1-D HDF5 string dataset as owned `String`s.
-///
-/// HDF5 has four string flavours and producers pick freely: h5py/anndata emit
-/// variable-length UTF-8, while PyTables `create_carray` (CellRanger and
-/// CellBender outputs) emits **fixed-length ASCII**.
-///
-/// The two families need different read types. `read_1d::<VarLenUnicode>()` on
-/// a fixed-length dataset fails with an opaque "no conversion paths found", so
-/// a single four-arm match over the descriptor is not enough — the fixed
-/// widths have to go through a const-generic type.
-pub(crate) fn read_string_dataset(ds: &hdf5::Dataset) -> Result<Vec<String>, ConvertError> {
-    use hdf5::types::TypeDescriptor;
-    let desc = ds.dtype()?.to_descriptor()?;
-    match &desc {
-        TypeDescriptor::VarLenUnicode | TypeDescriptor::VarLenAscii => {
-            let data: Vec<hdf5::types::VarLenUnicode> = ds.read_1d()?.to_vec();
-            Ok(data.iter().map(|s| s.to_string()).collect())
-        }
-        TypeDescriptor::FixedAscii(size) => {
-            read_fixed_string!(ds, FixedAscii, *size, 16, 32, 64, 128, 256, 1024, 4096)
-        }
-        TypeDescriptor::FixedUnicode(size) => {
-            read_fixed_string!(ds, FixedUnicode, *size, 16, 32, 64, 128, 256, 1024, 4096)
-        }
-        other => Err(ConvertError::UnsupportedDtype(format!(
-            "dataset '{}' is not a string dataset: {other:?}",
-            ds.name()
-        ))),
-    }
-}
-
 pub(crate) fn read_i64_dataset(ds: &hdf5::Dataset) -> Result<Vec<i64>, ConvertError> {
     use crate::hdf_dtype::HdfNumericDtype;
     let path = ds.name();
@@ -624,15 +567,17 @@ fn read_categorical_values(cats_ds: &hdf5::Dataset) -> Result<(ArrayRef, DataTyp
             Ok((Arc::new(Float64Array::from(cats)), DataType::Float64))
         }
         // String (var/fixed, unicode/ascii) categories — the common case.
-        // Reading as `VarLenUnicode` matches the var-length unicode categories
-        // anndata emits.
+        //
+        // Through the shared traversal, which is what makes the fixed-width
+        // arms below true: this used to read the body as `VarLenUnicode`
+        // whatever the arm matched, so a PyTables-written `categories` dataset
+        // (CellRanger, CellBender) failed here with HDF5's opaque "no
+        // conversion paths found" despite the arm accepting it.
         TypeDescriptor::VarLenUnicode
         | TypeDescriptor::VarLenAscii
         | TypeDescriptor::FixedUnicode(_)
         | TypeDescriptor::FixedAscii(_) => {
-            let cats_raw: Vec<hdf5::types::VarLenUnicode> = cats_ds.read_1d()?.to_vec();
-            let cats: Vec<String> = cats_raw.into_iter().map(|s| s.to_string()).collect();
-            let values = StringArray::from(cats);
+            let values = read_string_array(cats_ds)?;
             Ok((Arc::new(values), DataType::Utf8))
         }
         // Anything else (Boolean, Enum, Compound, …) is not a categorical
@@ -956,12 +901,12 @@ fn read_column_to_arrow(
         | TypeDescriptor::VarLenAscii
         | TypeDescriptor::FixedUnicode(_)
         | TypeDescriptor::FixedAscii(_) => {
-            // Via the shared reader: fixed-length strings need a const-generic
-            // read type, which a plain `read_1d::<VarLenUnicode>()` cannot do.
-            let strings = read_string_dataset(ds)?;
-            let array: ArrayRef = Arc::new(StringArray::from(
-                strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            ));
+            // Via the shared traversal: fixed-length strings need a
+            // const-generic read type, which a plain
+            // `read_1d::<VarLenUnicode>()` cannot do — and it appends into the
+            // Arrow value buffer directly, so the payload is copied once
+            // rather than through a `Vec<String>` and a `Vec<&str>`.
+            let array: ArrayRef = Arc::new(read_string_array(ds)?);
             return Ok((Field::new(name, DataType::Utf8, true), array));
         }
         _ => {}
@@ -1365,22 +1310,12 @@ fn read_nullable_string_group(
 ) -> Result<(Field, ArrayRef), ConvertError> {
     let values_ds = str_group.dataset("values")?;
     let mask = read_bool_or_u8(&str_group.dataset("mask")?)?;
-    let values: Vec<hdf5::types::VarLenUnicode> = values_ds.read_1d()?.to_vec();
-    if values.len() != mask.len() {
-        return Err(ConvertError::Other(format!(
-            "nullable-string-array '{name}': values len {} != mask len {}",
-            values.len(),
-            mask.len()
-        )));
-    }
-    let strings: Vec<String> = values.iter().map(|s| s.to_string()).collect();
-    let arr = StringArray::from(
-        strings
-            .iter()
-            .zip(mask.iter())
-            .map(|(v, m)| if *m { None } else { Some(v.as_str()) })
-            .collect::<Vec<Option<&str>>>(),
-    );
+    // Through the shared traversal, which also gives this form the
+    // fixed-width families it never handled: the direct
+    // `read_1d::<VarLenUnicode>()` it replaces failed on a PyTables-written
+    // `values` dataset. The length check now runs against the dataset shape,
+    // before the decode rather than after it.
+    let arr = read_masked_string_array(&values_ds, &mask, name)?;
     Ok((Field::new(name, DataType::Utf8, true), Arc::new(arr)))
 }
 
@@ -2400,9 +2335,10 @@ fn read_uns_entry(
                     Ok(serde_json::json!(data))
                 }
                 TypeDescriptor::VarLenUnicode | TypeDescriptor::VarLenAscii => {
-                    let data: Vec<hdf5::types::VarLenUnicode> = ds.read_1d()?.to_vec();
-                    let strings: Vec<String> = data.iter().map(|s| s.to_string()).collect();
-                    Ok(serde_json::json!(strings))
+                    // `read_string_dataset` rather than a direct read: same
+                    // accepted input (only the var-len arms reach here), one
+                    // fewer copy of every string.
+                    Ok(serde_json::json!(read_string_dataset(&ds)?))
                 }
                 _ => Err(ConvertError::Other(format!(
                     "unsupported uns array type: {desc:?}"
