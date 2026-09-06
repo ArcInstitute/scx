@@ -5,9 +5,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
 use super::pipeline::ConvertError;
-use crate::h5ad::read::{
-    read_f32_dataset, read_i32_dataset, read_i64_dataset, read_string_dataset,
-};
+use crate::h5ad::read::{read_f32_dataset, read_i32_dataset, read_i64_dataset};
+use crate::h5ad::strings::read_string_array;
 
 pub struct TenXData {
     pub indptr: Vec<i64>,
@@ -62,16 +61,10 @@ pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
 
     // Build obs from barcodes
     let barcodes_ds = matrix.dataset("barcodes")?;
-    let barcode_strings = read_string_dataset(&barcodes_ds)?;
     let obs_schema = Schema::new(vec![Field::new("barcode", DataType::Utf8, false)]);
     let obs = RecordBatch::try_new(
         Arc::new(obs_schema),
-        vec![Arc::new(StringArray::from(
-            barcode_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>(),
-        )) as ArrayRef],
+        vec![Arc::new(read_string_array(&barcodes_ds)?) as ArrayRef],
     )?;
 
     // Build var from features
@@ -81,11 +74,8 @@ pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
 
     for col_name in &["id", "name", "feature_type"] {
         if let Ok(ds) = features.dataset(col_name) {
-            let strings = read_string_dataset(&ds)?;
             var_fields.push(Field::new(*col_name, DataType::Utf8, false));
-            var_arrays.push(Arc::new(StringArray::from(
-                strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            )));
+            var_arrays.push(Arc::new(read_string_array(&ds)?));
         }
     }
 
@@ -98,9 +88,7 @@ pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
                 DataType::Utf8,
                 false,
             )])),
-            vec![Arc::new(StringArray::from(
-                ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            )) as ArrayRef],
+            vec![Arc::new(StringArray::from(ids)) as ArrayRef],
         )?
     } else {
         RecordBatch::try_new(Arc::new(Schema::new(var_fields)), var_arrays)?
