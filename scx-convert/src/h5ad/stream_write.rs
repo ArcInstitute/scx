@@ -783,6 +783,10 @@ pub(crate) fn stream_raw_at(
         )
     })?;
 
+    // Walked here as well as inside `stream_csr_to_group_at` on purpose: both
+    // guards below must run BEFORE `create_group("raw")`, or an inconsistent
+    // file leaves a half-written `/raw` behind. A catalog scan is O(entries),
+    // once per export, against a decode of every nonzero.
     let shards = collect_shards(reader, 0, SectionType::RawCsrShard, None);
     // Diagnose a stats-less shard here, before the row-count guard below:
     // `total_rows_in_shards` silently skips entries without stats, so the

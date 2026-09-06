@@ -2057,22 +2057,21 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
     assert checked == 3, checked
 
 
-def test_performance_doc_export_prose_matches_the_tracked_json():
-    """`docs/performance.md`'s export_streaming paragraph must equal the medians
-    in the tracked raw JSON.
+def test_performance_doc_export_table_matches_the_tracked_json():
+    """`docs/performance.md`'s export_streaming table must equal the medians in
+    the tracked raw JSON.
 
-    The table pin above covers only the *conversion* rows. The export prose
-    quotes three numbers from
-    `export_streaming__scx_streaming_vs_materialize__census_1m.json` — which is
-    tracked for exactly that reason — and nothing checked them. PR-04
-    (OPT-CONVERT-1) moved one of the three (`streaming_full`, the arm that
-    carries `.raw`), which is precisely the situation where an unpinned
-    published number goes stale silently. That is the same shape as the 5.79-GB
-    error the table pin was written to prevent, so the prose gets the same
-    treatment.
+    The table pin above covers only the *conversion* rows. The export numbers
+    come from the same tracked file — which is tracked for exactly that reason —
+    and nothing checked them. OPT-CONVERT-1 moved one of the three
+    (`streaming_full`, the arm that reaches `.raw`), which is precisely when an
+    unpinned published number goes stale silently. Same shape as the 5.79-GB
+    error the conversion pin was written to prevent.
 
-    Prose, not a table, so the numbers are matched by scenario keyword rather
-    than by row label.
+    Anchored per row label, not by scanning the section for any number that
+    happens to match: a paragraph-wide search cannot tell which arm a figure
+    belongs to, so swapping two arms' numbers would pass it. That was the first
+    version of this test, and it is why the prose became a table.
     """
     import json
     import re
@@ -2088,27 +2087,32 @@ def test_performance_doc_export_prose_matches_the_tracked_json():
     )
     d = json.loads((raw / fname).read_text())
 
-    # The paragraph is bounded so a number elsewhere in the doc cannot satisfy
-    # the search by accident.
-    start = doc.index("Measured 2026-09-03")
-    para = doc[start : doc.index("## Column Projection", start)]
+    # (doc row label, scenario key prefix)
+    rows = [
+        ("streaming (`pyscx.to_h5ad`), `reader_threads=4`", "streaming"),
+        ("materialise (`stream=False`)", "materialize"),
+        ("streaming, `_full` fixture (`.raw` + `obsm` + a layer)", "streaming_full"),
+    ]
 
     checked = 0
-    for scenario in ("streaming", "materialize", "streaming_full"):
+    for label, scenario in rows:
         key = f"{scenario}_peak_rss_mb"
         vals = [r["extra"][key] for r in d["runs"] if key in r.get("extra", {})]
         assert vals, f"{fname} carries no {key}"
         want = statistics.median(vals)
-        # `**3 165 MB**` / `**20 198 MB**` — thin or ordinary spaces as digit
-        # separators, bold optional.
-        found = [
-            float(m.replace("\u202f", "").replace(" ", "").replace(",", ""))
-            for m in re.findall(r"\*{0,2}([\d][\d\s,\u202f]*)\s*MB", para)
-        ]
-        assert any(abs(f - want) < 1.0 for f in found), (
-            f"{scenario}: docs/performance.md's export paragraph quotes "
-            f"{sorted(found)} MB, tracked median for {key} is {want:.0f} MB "
-            f"(min {min(vals):.0f}, max {max(vals):.0f})"
+
+        # `| <label> | **7 604 MB** |` — bold optional, thin or ordinary space
+        # as the digit separator.
+        pat = re.escape(label) + r"\s*\|\s*\*{0,2}([\d][\d\s,\u202f]*)\s*MB"
+        m = re.search(pat, doc)
+        assert m, f"no MB row labelled {label!r} in docs/performance.md"
+        got = float(
+            m.group(1).replace("\u202f", "").replace(" ", "").replace(",", "")
+        )
+        assert abs(got - want) < 1.0, (
+            f"{label}: doc says {got:.0f} MB, tracked median for {key} is "
+            f"{want:.0f} MB (min {min(vals):.0f}, max {max(vals):.0f}) — "
+            f"publishing the min instead of the median is how this drifted before"
         )
         checked += 1
     assert checked == 3, checked

@@ -282,16 +282,35 @@ The streaming row's `streaming_peak_rss_mb` is gated on `census_1m` in
 `scx_to_h5ad_streaming` / `scx_to_h5mu_streaming` trips the floor without
 needing a wall-clock signal.
 
-Measured 2026-09-03 (the `v0.16.0-opt-instruments` capture, median of 3,
-census_1m → h5ad): **3 165 MB** peak at `reader_threads=4`, against
-**15 596 MB** for `stream=False`. The `_full` fixture arm — the same export
-with a `.raw`, `obsm` and an extra layer, which is what OPT-CONVERT-1 / -4 and
-OPT-OPS-3 actually move — costs **20 198 MB**, and is the reason that fixture
-was built. The materialise arm calls
-`read_all_csr_shards_filtered()` and holds the whole CSR triplet, so the ~4.4×
-separation at the pinned thread count is the contract working. Before the harness
-was fixed that arm reported 913 MB — under-stated by 15×, which made the two arms
-look indistinguishable and the comparison this benchmark exists for vacuous.
+Measured 2026-09-05 (median of 3, census_1m → h5ad, `reader_threads=4`):
+
+| Arm | Peak RSS |
+| --- | --- |
+| streaming (`pyscx.to_h5ad`), `reader_threads=4` | **3 214 MB** |
+| materialise (`stream=False`) | **14 035 MB** |
+| streaming, `_full` fixture (`.raw` + `obsm` + a layer) | **7 604 MB** |
+
+The materialise arm calls `read_all_csr_shards_filtered()` and holds the whole
+CSR triplet, so the ~4.4× separation at the pinned thread count is the contract
+working. Before the harness was fixed that arm reported 913 MB — under-stated
+by 15×, which made the two arms look indistinguishable and the comparison this
+benchmark exists for vacuous.
+
+The `_full` row is the one that reaches `.raw`, `obsm` and layers, since no
+source h5ad in the suite carries any of the three. It was **20 198 MB** in the
+`v0.16.0-opt-instruments` capture, when `/raw` was read whole by
+`write_raw_to_h5ad`; OPT-CONVERT-1 made raw stream through the same shard walk
+as `/X`, taking it to 7 604 MB — 2.66×, 12.6 GB freed. The same change moved
+tabula_sapiens_100k from 3 799 MB to 2 269 MB (1.67×), and left the plain arm
+unchanged on all three datasets (1.00×), which is the control: those fixtures
+have no raw.
+
+The residual over the plain arm (4 390 MB at census, 480 MB at tabula) is not
+one shard's worth, and is not fully attributed: `obsm` is still read whole
+(OPT-CONVERT-4, ~208 MB at census scale), and peak RSS over a multi-matrix
+export is not the max of independent peaks — buffers freed after `/X` are not
+returned to the OS before the layer and raw are written.
+
 Backed by the tracked
 `results/raw/export_streaming__scx_streaming_vs_materialize__census_1m.json`.
 

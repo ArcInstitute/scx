@@ -3,15 +3,15 @@
   "benchmark": "export_streaming",
   "format": "scx_streaming_vs_materialize",
   "dataset": "census_1m",
-  "timestamp": "2026-09-03T02:24:57",
+  "timestamp": "2026-09-05T19:54:25",
   "system": {
-    "hostname": "CPUDFE044",
+    "hostname": "GPU71BA",
     "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
-    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
     "cpu_cores_physical": 192,
-    "ram_gb": 2016,
+    "ram_gb": 1007,
     "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "library_versions": {
       "anndata": "0.12.10",
@@ -31,193 +31,194 @@
       "leidenalg": "0.11.0",
       "igraph": "1.0.0",
       "psutil": "7.2.2",
-      "pyscx": "0.16.0"
+      "pyscx": "0.17.0"
     },
     "storage": {
       "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
       "scratch_fstype": "wekafs",
-      "has_nvme": false
+      "has_nvme": true
     },
     "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M1K68BXC0K14360N964CMM0D",
-      "git_sha": "3ed7861ff3393c9a7983f6d2f56926c1c5aa6db2",
-      "git_branch": "pr03-baseline-recapture",
+      "run_id": "01M1TA6YCVN8GFNVJ4ZG95176D",
+      "git_sha": "aaee6ecfac19c4f3319ef6418af2940cf44d3dbb",
+      "git_branch": "pr04-stream-raw-export",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.16.0-20-g3ed7861f-dirty",
+      "git_describe": "pyscx-v0.17.0-3-gaaee6ecf-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
-      "conda_env": "scx-bench",
+      "conda_env": "",
       "pyscx_features": ""
     }
   },
   "runs": [
     {
-      "wall_s": 16.942371731973253,
+      "wall_s": 19.104001585044898,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3133.71875,
+      "peak_rss_mb": 3181.22265625,
       "extra": {
         "scenario": "streaming",
         "run_idx": 0,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3133.71875,
-        "streaming_wall_s": 16.942371731973253
+        "streaming_peak_rss_mb": 3181.22265625,
+        "streaming_wall_s": 19.104001585044898
       }
     },
     {
-      "wall_s": 16.06400684104301,
+      "wall_s": 19.070104854064994,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3168.9296875,
+      "peak_rss_mb": 3213.90625,
       "extra": {
         "scenario": "streaming",
         "run_idx": 1,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3168.9296875,
-        "streaming_wall_s": 16.06400684104301
+        "streaming_peak_rss_mb": 3213.90625,
+        "streaming_wall_s": 19.070104854064994
       }
     },
     {
-      "wall_s": 15.906995650031604,
+      "wall_s": 18.3704973210115,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3165.0078125,
+      "peak_rss_mb": 3233.40234375,
       "extra": {
         "scenario": "streaming",
         "run_idx": 2,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3165.0078125,
-        "streaming_wall_s": 15.906995650031604
+        "streaming_peak_rss_mb": 3233.40234375,
+        "streaming_wall_s": 18.3704973210115
       }
     },
     {
-      "wall_s": 17.16436369693838,
+      "wall_s": 19.448007112019695,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 10558.76171875,
+      "peak_rss_mb": 5362.8046875,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 0,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 10558.76171875,
-        "streaming_default_threads_wall_s": 17.16436369693838
+        "streaming_default_threads_peak_rss_mb": 5362.8046875,
+        "streaming_default_threads_wall_s": 19.448007112019695
       }
     },
     {
-      "wall_s": 18.104335244977847,
+      "wall_s": 19.388153398991562,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 10915.171875,
+      "peak_rss_mb": 5555.3671875,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 1,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 10915.171875,
-        "streaming_default_threads_wall_s": 18.104335244977847
+        "streaming_default_threads_peak_rss_mb": 5555.3671875,
+        "streaming_default_threads_wall_s": 19.388153398991562
       }
     },
     {
-      "wall_s": 17.238665353972465,
+      "wall_s": 19.31382995902095,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 11051.78125,
+      "peak_rss_mb": 5621.80078125,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 2,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 11051.78125,
-        "streaming_default_threads_wall_s": 17.238665353972465
+        "streaming_default_threads_peak_rss_mb": 5621.80078125,
+        "streaming_default_threads_wall_s": 19.31382995902095
       }
     },
     {
-      "wall_s": 19.840570971020497,
+      "wall_s": 21.48147038195748,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 15100.10546875,
+      "peak_rss_mb": 13994.4921875,
       "extra": {
         "scenario": "materialize",
         "run_idx": 0,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 15100.10546875,
-        "materialize_wall_s": 19.840570971020497
+        "materialize_peak_rss_mb": 13994.4921875,
+        "materialize_wall_s": 21.48147038195748
       }
     },
     {
-      "wall_s": 20.19609269592911,
+      "wall_s": 21.058789620990865,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 15792.3203125,
+      "peak_rss_mb": 14050.79296875,
       "extra": {
         "scenario": "materialize",
         "run_idx": 1,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 15792.3203125,
-        "materialize_wall_s": 20.19609269592911
+        "materialize_peak_rss_mb": 14050.79296875,
+        "materialize_wall_s": 21.058789620990865
       }
     },
     {
-      "wall_s": 19.21479530702345,
+      "wall_s": 21.54952199908439,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 15595.78515625,
+      "peak_rss_mb": 14034.80859375,
       "extra": {
         "scenario": "materialize",
         "run_idx": 2,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 15595.78515625,
-        "materialize_wall_s": 19.21479530702345
+        "materialize_peak_rss_mb": 14034.80859375,
+        "materialize_wall_s": 21.54952199908439
       }
     },
     {
-      "wall_s": 42.9219699439127,
+      "wall_s": 36.700724545051344,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 20198.3046875,
+      "peak_rss_mb": 7438.1328125,
       "extra": {
         "scenario": "streaming_full",
         "run_idx": 0,
         "reader_threads": 4,
-        "streaming_full_peak_rss_mb": 20198.3046875,
-        "streaming_full_wall_s": 42.9219699439127
+        "streaming_full_peak_rss_mb": 7438.1328125,
+        "streaming_full_wall_s": 36.700724545051344
       }
     },
     {
-      "wall_s": 39.58077045099344,
+      "wall_s": 38.29509308608249,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 20761.23828125,
+      "peak_rss_mb": 7616.9296875,
       "extra": {
         "scenario": "streaming_full",
         "run_idx": 1,
         "reader_threads": 4,
-        "streaming_full_peak_rss_mb": 20761.23828125,
-        "streaming_full_wall_s": 39.58077045099344
+        "streaming_full_peak_rss_mb": 7616.9296875,
+        "streaming_full_wall_s": 38.29509308608249
       }
     },
     {
-      "wall_s": 40.203538637957536,
+      "wall_s": 36.409300168044865,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 20095.078125,
+      "peak_rss_mb": 7603.8515625,
       "extra": {
         "scenario": "streaming_full",
         "run_idx": 2,
         "reader_threads": 4,
-        "streaming_full_peak_rss_mb": 20095.078125,
-        "streaming_full_wall_s": 40.203538637957536
+        "streaming_full_peak_rss_mb": 7603.8515625,
+        "streaming_full_wall_s": 36.409300168044865
       }
     }
   ],
-  "median_wall_s": 18.65956527600065,
-  "wall_s_iqr": 17.736731289012823,
+  "median_wall_s": 20.25339836650528,
+  "wall_s_iqr": 13.537896947265835,
   "n_runs": 12,
   "metadata": {
     "direction": "h5ad",
-    "source_scx_bytes": 2800057397,
+    "source_scx_bytes": 2736680651,
     "n_obs": 1000000,
     "n_vars": 61497,
     "multimodal": false,

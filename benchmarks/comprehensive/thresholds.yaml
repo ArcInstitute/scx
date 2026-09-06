@@ -2091,60 +2091,62 @@ absolute_floors:
   # never reaches the code that copies them. A green ceiling there proves the
   # file was small, not that the export streams.
   #
-  # Of the three, raw is what this ceiling actually measures: `write_raw_to_h5ad`
-  # (`scx-convert/src/h5ad/write.rs`) calls `read_all_raw_csr_shards()` and holds
-  # the whole matrix. obsm is also materialised (`read_all_obsm()`, with an
-  # `ExportFilterSectionEager` warning under a keep mask) but is 19.8 MB at 52
-  # columns and does not move the number; layers already stream via
-  # `stream_layers_at`. Both are covered as regression nets, not measurements.
+  # `_full.scx` (built by `benchmarks/scripts/prep_full_fixtures.py`) adds a
+  # `.raw`, `obsm["X_pca"]` / `obsm["X_umap"]` and a `counts` layer.
   #
-  # `streaming_full_peak_rss_mb` comes from the `streaming_full` arm, which runs
-  # the same `to_h5ad(stream=True)` at the same pinned `reader_threads=4`
-  # against `<dataset>_full.scx` (built by
-  # `benchmarks/scripts/prep_full_fixtures.py`: `.raw` = a copy of X,
-  # `obsm["X_pca"]` 50-wide, `obsm["X_umap"]` 2-wide, a `counts` layer).
+  # What each term costs, after PR-04 (OPT-CONVERT-1) made `/raw` stream:
+  #   raw    — streamed, via `stream_raw_at` (`h5ad/stream_write.rs`), the same
+  #            `stream_csr_to_group_at` driver as `/X` and the layers. It used
+  #            to call `read_all_raw_csr_shards()` and hold the whole matrix,
+  #            and it dominated this ceiling.
+  #   obsm   — still materialised (`read_all_obsm()`, with an
+  #            `ExportFilterSectionEager` warning under a keep mask). 19.8 MB
+  #            at 52 columns on tabula, ~208 MB at census scale. OPT-CONVERT-4.
+  #   layers — already streamed via `stream_layers_at`.
   #
-  # Units: every RSS figure in this file is `rss.current_rss_mb`, which divides
-  # by 1024^2 — i.e. mebibytes, spelled MB throughout the suite. On-disk sizes
-  # below are also in MiB so the two are comparable.
+  # MEASURED, PR-04 capture (job 2907694, median of 3, `reader_threads=4`),
+  # against the `v0.16.0-opt-instruments` baseline on the same fixtures:
   #
-  # Measured on tabula_sapiens_100k (100,000 x 61,497, nnz = 194,891,401),
-  # three runs each, one subprocess per arm, same code path. Two independent
-  # captures — the first driving `_run_arm_subprocess` directly, the second
-  # through `run()` as the orchestrator calls it:
+  #                          before      after     plain arm   full-minus-plain
+  #   tabula_sapiens_100k    3799.4     2268.5        1788.3        480 MB
+  #   census_1m             20198.3     7603.9        3213.9       4390 MB
+  #   pbmc3k                  363.7      352.3         343.2          9 MB
   #
-  #                        capture 1 (peaks, MB)      capture 2 (peaks, MB)
-  #   `_auto.scx`  222.7 MiB   1701 / 1735 / 1769       1685 / 1743 / 1781
-  #   `_full.scx`  612.6 MiB   3195 / 3314 / 3347       3109 / 3118 / 3150
+  # i.e. 1.67x at tabula and 2.66x at census — 12.6 GB freed on the census
+  # export. The plain (`_auto.scx`) arm is unchanged at 1.00x on all three,
+  # which is the control: those fixtures have no raw, so a change scoped to raw
+  # must not move them.
   #
-  # medians 1735 / 1743 for the plain arm and 3314 / 3118 for the full one — a
-  # 6% spread between captures, which is why the ceiling is not set tight.
-  # Worst single observation across both: 3347.
+  # The residual over the plain arm is NOT one shard's worth. It is the
+  # remaining eager `obsm` read plus the fact that peak RSS over a multi-matrix
+  # export is not the max of independent peaks — shard buffers freed after `/X`
+  # are not returned to the OS before the layer and raw are written. Attributing
+  # the rest needs OPT-CONVERT-4 and an allocator-level look; it is not claimed
+  # here.
   #
-  # Derivation of the ~1.5 GB delta, which is the whole point of the arm:
-  #   raw nnz                          194,891,401
-  #   x (4 B data + 4 B indices)   = 1,559,131,208 B = 1487 MB
-  #   + indptr 100,001 x 8 B       =                     0.8 MB
-  #   predicted 1735 + 1488        =                    3223 MB
-  #   measured                                          3314 MB   (+2.8%)
-  # i.e. the delta IS `write_raw_to_h5ad`'s `read_all_raw_csr_shards()` holding
-  # the whole raw matrix. obsm is 100k x 52 f32 = 19.8 MB and does not move the
-  # needle at this shape; layers already stream.
-  #
-  # Ceiling at 4096 MB — 22% over the worst single observation (3347). If raw
-  # ever streams the
-  # way X and the layers already do, its term becomes one shard's worth
-  # (1487 / 7 = 213 MB) and this should fall to ~1.9 GB; lower the ceiling in
-  # that change rather than leaving 2 GB of slack behind.
-  #
-  # The arm is skipped when the fixture has not been built — and that is loud,
-  # not silent: `check_absolute_floors` treats a metric no run carries as a
-  # violation. Only a triple that did not run at all is skipped quietly.
+  # CEILING AT 1.30x THE MEDIAN, not the 1.18x used elsewhere, and the looseness
+  # is deliberate. The ceiling this replaces was set at 4096 from a capture whose
+  # worst observation was 3347, and by the v0.16.0 capture the median had moved
+  # to 3799.4 with a worst of 3846.6 — 6.5% of headroom left, i.e. it was about
+  # to fail for no reason but cross-capture drift. That drift has been measured
+  # at 15-22% on this metric across three captures. A tight ceiling here buys
+  # nothing: what it guards against is a regression to a materialising raw,
+  # which is +68% at tabula and +166% at census and clears any of these numbers
+  # by a wide margin.
   - benchmark: export_streaming
     format: scx_streaming_vs_materialize
     dataset: tabula_sapiens_100k
     metric: streaming_full_peak_rss_mb
-    max: 4096.0
+    max: 2950.0
+
+  # census_1m, same arm. Deferred item 13 asked for this row once
+  # `census_1m_full.scx` existed; it was built during the v0.16.0 capture and
+  # the arm has produced rows since, unfloored. 7603.9 x 1.30 = 9885.
+  - benchmark: export_streaming
+    format: scx_streaming_vs_materialize
+    dataset: census_1m
+    metric: streaming_full_peak_rss_mb
+    max: 9900.0
 
   # ─── compact of a file that HAS obsm and a layer ──────────────────
   #
@@ -3218,16 +3220,19 @@ absolute_floors:
 #    `--datasets chemogenetic_rgfp replogle_k562 tahoe_c38 nb_glm_synth
 #    pert_synth_10k pert_synth_100k`.
 #
-# 13. The `_full` fixture at census scale
-#    `streaming_full_peak_rss_mb` is floored on tabula_sapiens_100k only.
-#    `census_1m_full.scx` is not built: the source is an 11 GB h5ad and the
-#    builder materialises the whole AnnData, so it wants a high-mem allocation
-#    that belongs with the PR-03 capture prep rather than with the instrument
-#    change. Build it with
-#      python benchmarks/scripts/prep_full_fixtures.py --datasets census_1m
-#    and then author the census row beside the tabula one. Expect the ceiling to
-#    be dominated by the same `read_all_raw_csr_shards()` term: the plain
-#    census_1m export measures 3162 MB at rt=4, and raw adds ~8 B/nnz on top.
+# 13. The `_full` fixture at census scale — CLOSED (PR-04, OPT-CONVERT-1)
+#    `census_1m_full.scx` was built during the v0.16.0-opt-instruments capture
+#    and the `streaming_full` arm has produced rows since. Both
+#    `streaming_full_peak_rss_mb` rows are now floored — see the
+#    "Streaming export of a file that actually HAS a .raw" block above for the
+#    measured before/after and why the ceiling is 1.30x rather than 1.18x.
+#
+#    The expectation recorded here was that the ceiling would stay dominated by
+#    `read_all_raw_csr_shards()`. PR-04 removed that term instead: raw streams,
+#    census_1m went 20198 -> 7604 MB. The residual over the plain arm is larger
+#    than one shard's worth and is not yet attributed — `obsm` is still read
+#    whole (OPT-CONVERT-4) and peak RSS over a multi-matrix export is not the
+#    max of independent peaks.
 #
 # 14. build_csc's declared memory budget cannot be honoured; not yet floored
 #    `pyscx.build_csc(input, memory_limit=...)` is the only operation in the
