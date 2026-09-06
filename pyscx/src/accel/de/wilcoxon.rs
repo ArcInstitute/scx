@@ -59,7 +59,7 @@ pub(crate) fn run_rank_genes_groups_inner(
 ) -> PyResult<RankGenesRun> {
     // Extract group labels from adata.obs[groupby].
     let obs = adata.getattr("obs")?;
-    let group_col = obs.get_item(groupby)?;
+    let group_col = single_obs_column(obs.get_item(groupby)?, groupby)?;
     let group_labels: Vec<String> = group_col
         .call_method1("astype", ("str",))?
         .call_method0("tolist")?
@@ -912,11 +912,14 @@ pub(crate) fn de_result_to_dataframe<'py>(
 /// ``remove_unused_categories()``. Under ``stratify_by`` that, like any
 /// per-stratum failure, warns and drops the stratum.
 ///
-/// Cells with no ``groupby`` label (NaN, empty, or off-category) get no group,
-/// no result row and no ``pts`` column, but for ``reference="rest"`` they are in
-/// the rank pool and in every group's "rest" — scanpy 1.12's rule. A pairwise
-/// run against a named reference compares ``group ∪ reference``, so they take
-/// no part in it.
+/// Cells with no ``groupby`` label — a pandas missing value (``NaN`` / ``None``
+/// / ``pd.NA``, decided by ``pandas.isna`` and never by how the value prints)
+/// or a value outside the column's categories — get no group, no result row and
+/// no ``pts`` column, but for ``reference="rest"`` they are in the rank pool and
+/// in every group's "rest", scanpy 1.12's rule. A pairwise run against a named
+/// reference compares ``group ∪ reference``, so they take no part in it. A group
+/// whose *name* merely looks like a missing value (``"nan"``, ``"None"``,
+/// ``""``) is a real group and is kept.
 ///
 /// ``pts=True`` refuses duplicate var names (its table is joined by
 /// name). ``corr_method`` accepts only ``"benjamini-hochberg"`` and is

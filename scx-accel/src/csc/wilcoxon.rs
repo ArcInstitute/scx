@@ -1256,10 +1256,12 @@ mod tests {
         /// unlabelled cells out of the pool. The extra-group run is the oracle;
         /// nnz-vs-dense is the parity check.
         ///
-        /// `pvals_adj` is deliberately **not** compared against the oracle: BH
-        /// runs over every (group, gene) pair, and the oracle has one group more,
-        /// so its denominator legitimately differs. The nnz-vs-dense arm still
-        /// pins it.
+        /// `pvals_adj` is compared against the oracle too. An earlier version of
+        /// this test skipped it, claiming BH's denominator changes when the
+        /// oracle adds a group — it does not: BH is applied **per group**
+        /// (`benjamini_hochberg(&pvals)` inside the per-group assembly loop, in
+        /// both this file and `diffexp::cpu`), so an extra group cannot move an
+        /// existing group's adjusted p-values.
         #[test]
         fn nnz_matches_dense_wilcoxon(
             seed in any::<u64>(),
@@ -1327,9 +1329,10 @@ mod tests {
                     prop_assert!(close(dp, np), "pval g{} {}: {} vs {}", gi, name, dp, np);
                     prop_assert!(close(dpa, npa), "padj g{} {}: {} vs {}", gi, name, dpa, npa);
                     prop_assert!(close(dl, nl), "logfc g{} {}: {} vs {}", gi, name, dl, nl);
-                    let &(os, op, _opa, ol) = omap.get(name).unwrap();
+                    let &(os, op, opa, ol) = omap.get(name).unwrap();
                     prop_assert!(close(ds, os), "score vs extra-group g{} {}: {} vs {}", gi, name, ds, os);
                     prop_assert!(close(dp, op), "pval vs extra-group g{} {}: {} vs {}", gi, name, dp, op);
+                    prop_assert!(close(dpa, opa), "padj vs extra-group g{} {}: {} vs {}", gi, name, dpa, opa);
                     prop_assert!(close(dl, ol), "logfc vs extra-group g{} {}: {} vs {}", gi, name, dl, ol);
                 }
             }

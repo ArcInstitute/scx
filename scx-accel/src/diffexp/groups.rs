@@ -1,9 +1,11 @@
 //! Group-label partitioning shared by every Wilcoxon / pdex kernel.
 //!
 //! Callers encode a per-cell group label as an index into `group_names`. Any
-//! label `>= n_groups` is the **unlabelled** sentinel: `pyscx` maps a NaN /
-//! empty / off-category `obs[groupby]` value to `unique_groups.len()` so that a
-//! cell nobody annotated does not silently join group 0.
+//! label `>= n_groups` is the **unlabelled** sentinel: `pyscx` maps a missing
+//! `obs[groupby]` value — `pandas.isna`, so `NaN` / `None` / `pd.NA` alike — or
+//! one outside the column's categories to `unique_groups.len()`, so that a cell
+//! nobody annotated does not silently join group 0. A label that merely *looks*
+//! like a missing value, `""` included, is an ordinary group.
 //!
 //! # Where an unlabelled cell does and does not appear
 //!

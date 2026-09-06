@@ -597,6 +597,45 @@ def test_a_nullable_string_column_with_pd_na_is_handled(synthetic_adata):
     assert list(rgg["pts"].columns) == ["A", "B", "C"]
 
 
+def test_an_integer_categorical_groupby_works(synthetic_adata):
+    """`pd.Categorical([0, 1, 0])` is an ordinary way to spell cluster ids.
+
+    The level universe comes from `cat.categories`, which for such a column is
+    an integer index — extracting it as strings raised
+    `TypeError: 'int' object is not an instance of 'str'` while scanpy simply
+    stringifies. Pre-existing, and the fix belongs where the universe is built,
+    so the categories and the column's own `astype("str")` labels line up.
+    """
+    sc = pytest.importorskip("scanpy")
+    adata = synthetic_adata.copy()
+    codes = {"A": 0, "B": 1, "C": 2}
+    ints = [codes[v] for v in adata.obs["batch"].astype(str)]
+    adata.obs["batch"] = pd.Categorical(ints)
+
+    scanpy_side = adata.copy()
+    rgg = _rgg(adata)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sc.tl.rank_genes_groups(scanpy_side, "batch", method="wilcoxon")
+    assert set(rgg["names"].dtype.names) == {"0", "1", "2"}
+    assert set(rgg["names"].dtype.names) == set(
+        scanpy_side.uns["rank_genes_groups"]["names"].dtype.names
+    )
+
+
+def test_a_duplicated_obs_column_name_is_named_in_the_error(synthetic_adata):
+    """`obs[groupby]` is then a frame, and every conversion downstream fails
+    with `AttributeError: 'DataFrame' object has no attribute 'tolist'` — which
+    names neither the column nor the duplication. Checked before the first
+    conversion so the message can."""
+    adata = synthetic_adata.copy()
+    adata.obs["dup"] = adata.obs["batch"].to_numpy()
+    adata.obs.columns = ["dup" if c == "batch" else c for c in adata.obs.columns]
+    assert list(adata.obs.columns).count("dup") == 2
+    with pytest.raises(ValueError, match=r"is 2-dimensional.*duplicated in adata\.obs"):
+        pyscx.accel.rank_genes_groups(adata, "dup", device="cpu")
+
+
 def test_a_categorical_level_named_nan_is_told_apart_from_a_real_nan(synthetic_adata):
     """Both print as `"nan"` after `astype("str")`; only `isna` separates them.
 

@@ -455,7 +455,7 @@ fn resolve_groups_and_reference(
     requested: Option<&[String]>,
 ) -> PyResult<(Vec<usize>, Vec<String>, usize)> {
     let obs = adata.getattr("obs")?;
-    let group_col = obs.get_item(groupby)?;
+    let group_col = single_obs_column(obs.get_item(groupby)?, groupby)?;
     let group_labels: Vec<String> = group_col
         .call_method1("astype", ("str",))?
         .call_method0("tolist")?
@@ -543,6 +543,33 @@ pub(crate) fn validate_groups_request(groups: &[String]) -> PyResult<()> {
     Ok(())
 }
 
+/// Reject an `obs[groupby]` lookup that came back as a frame rather than a
+/// column.
+///
+/// A duplicated column name in `adata.obs` makes `obs[groupby]` a `DataFrame`,
+/// and the very next call — `astype("str").tolist()` — then fails with
+/// `AttributeError: 'DataFrame' object has no attribute 'tolist'`, which names
+/// neither the column nor the duplication. Checked before either conversion so
+/// the message can.
+fn single_obs_column<'py>(
+    group_col: Bound<'py, PyAny>,
+    groupby: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ndim: usize = match group_col.getattr("ndim") {
+        Ok(n) => n.extract()?,
+        // Not a pandas/numpy object at all; let the existing conversion produce
+        // whatever error it would have.
+        Err(_) => return Ok(group_col),
+    };
+    if ndim != 1 {
+        return Err(PyValueError::new_err(format!(
+            "adata.obs[{groupby:?}] is {ndim}-dimensional, not a single column — \
+             the name is duplicated in adata.obs"
+        )));
+    }
+    Ok(group_col)
+}
+
 /// Per-cell "this value is missing", asked of pandas rather than inferred from
 /// how a value happens to print.
 ///
@@ -557,10 +584,10 @@ pub(crate) fn validate_groups_request(groups: &[String]) -> PyResult<()> {
 /// every caller here already pays.
 ///
 /// `n_obs` is the label count the mask has to line up with. Both consumers
-/// `zip` the two, and `zip` truncates to the shorter — so a mask that came back
-/// short (a duplicated `obs` column name makes `obs[groupby]` a *frame*, whose
-/// `isna().tolist()` is a list of rows) would silently shrink the label universe
-/// rather than fail.
+/// `zip` the two, and `zip` truncates to the shorter, so a short mask would
+/// silently shrink the label universe rather than fail. The multi-column case
+/// is caught earlier and more precisely by [`single_obs_column`]; this is the
+/// backstop for anything else that returns the wrong length.
 fn missing_label_mask(
     py: Python<'_>,
     group_col: &Bound<'_, PyAny>,
@@ -587,16 +614,28 @@ fn missing_label_mask(
 /// The non-categorical arm is what scanpy reaches through `sanitize_anndata` →
 /// `astype("category")`, where a missing value is never a category. Deriving it
 /// from every row instead would mint a level no cell can be in (`"nan"`,
-/// `"None"`, `"<NA>"`, `""`) — a phantom `pts` column, a phantom `pdex_ref`
-/// target, and, since the singlet guard counts cells per level, a spurious
-/// "only contain one sample" error on any object column with a missing value.
+/// `"None"`, `"<NA>"`) — a phantom `pts` column, a phantom `pdex_ref` target,
+/// and, since the singlet guard counts cells per level, a spurious "only
+/// contain one sample" error on any object column with a missing value. Note
+/// that `""` is **not** among them: `pandas.isna("")` is false, so an
+/// empty-string label is an ordinary group.
 fn group_level_universe(
     group_col: &Bound<'_, PyAny>,
     group_labels: &[String],
     missing: &[bool],
 ) -> PyResult<Vec<String>> {
     if let Ok(cat) = group_col.getattr("cat") {
-        return cat.getattr("categories")?.call_method0("tolist")?.extract();
+        // `astype("str")` before `tolist`, because a categorical's categories
+        // need not be strings — `pd.Categorical([0, 1, 0])` is an ordinary way
+        // to spell cluster ids, and extracting `Vec<String>` from `[0, 1]`
+        // raised `TypeError: 'int' object is not an instance of 'str'` where
+        // scanpy simply stringifies. The column's own labels already come
+        // through `astype("str")`, so this is what makes the two line up.
+        return cat
+            .getattr("categories")?
+            .call_method1("astype", ("str",))?
+            .call_method0("tolist")?
+            .extract();
     }
     let mut unique: Vec<String> = group_labels
         .iter()

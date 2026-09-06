@@ -147,8 +147,9 @@ pub(crate) fn de_rank_cmp(
 /// * `n_vars` — Number of variables (genes).
 /// * `gene_names` — Gene names, length `n_vars`.
 /// * `groups` — Group label per cell, length `n_obs`, encoded as indices `0..n_groups`.
-///   A label `>= n_groups` marks an **unlabelled** cell (NaN / empty / off-category
-///   upstream). Such a cell joins no group's sum or count, but it *is* in the
+///   A label `>= n_groups` marks an **unlabelled** cell (upstream: a pandas
+///   missing value, or one outside the column's categories). Such a cell joins
+///   no group's sum or count, but it *is* in the
 ///   1-vs-rest rank pool and in every group's "rest" — scanpy 1.12's rule, and
 ///   pyscx's since 0.17. See [`super::groups`].
 /// * `group_names` — Unique group names, length `n_groups`.
@@ -1316,8 +1317,9 @@ pub fn pdex_ref_core(
     ensure_finite_de_input(data)?;
 
     // Bucket cell indices by group. Cells with `group >= n_groups` are
-    // silently dropped (matches pdex's NaN/empty-string handling, which the
-    // caller is expected to encode upstream as out-of-range group ids).
+    // silently dropped — pdex is pairwise against a named reference, so a cell
+    // in neither side takes no part. The caller encodes a missing label as an
+    // out-of-range group id upstream (`pandas.isna`, not a spelling test).
     let mut group_indices: Vec<Vec<usize>> = vec![vec![]; n_groups];
     for (i, &g) in groups.iter().enumerate() {
         if g < n_groups {
