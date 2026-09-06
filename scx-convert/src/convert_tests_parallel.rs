@@ -1699,12 +1699,25 @@ fn export_memory_budget_applies_to_raw_and_names_it() {
     )
     .expect("reader_threads=1 is the documented escape from the budget");
 
-    // ...and it must produce the same raw as the unbudgeted parallel run,
-    // so "escape" means "skips the derate", not "skips the data".
-    let a = hdf5::File::open(&ok_out).unwrap();
-    let b = hdf5::File::open(&seq_out).unwrap();
-    let data = |f: &hdf5::File| -> Vec<f32> {
-        f.dataset("raw/X/data").unwrap().read_1d().unwrap().to_vec()
+    // ...and it must produce the same raw as the unbudgeted parallel run, so
+    // "escape" means "skips the derate", not "skips the data". The whole CSR
+    // triplet plus the shape attr, not just `data`: an earlier version compared
+    // values alone while the surrounding prose claimed byte identity, which is
+    // the kind of gap between assertion and claim this PR keeps finding.
+    let triplet = |p: &std::path::Path| -> (Vec<i64>, Vec<i32>, Vec<f32>, Vec<i64>) {
+        let f = hdf5::File::open(p).unwrap();
+        let g = f.group("raw/X").unwrap();
+        (
+            g.dataset("indptr").unwrap().read_1d().unwrap().to_vec(),
+            g.dataset("indices").unwrap().read_1d().unwrap().to_vec(),
+            g.dataset("data").unwrap().read_1d().unwrap().to_vec(),
+            g.attr("shape").unwrap().read_1d().unwrap().to_vec(),
+        )
     };
-    assert_eq!(data(&a), data(&b), "sequential raw must match parallel raw");
+    let par = triplet(&ok_out);
+    let seq = triplet(&seq_out);
+    assert_eq!(seq.0, par.0, "sequential raw indptr must match parallel");
+    assert_eq!(seq.1, par.1, "sequential raw indices must match parallel");
+    assert_eq!(seq.2, par.2, "sequential raw data must match parallel");
+    assert_eq!(seq.3, par.3, "sequential raw shape must match parallel");
 }

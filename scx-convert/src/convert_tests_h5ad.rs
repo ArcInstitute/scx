@@ -3329,9 +3329,10 @@ fn streaming_raw_export_never_materialises_the_whole_raw_matrix() {
 /// test `include_str!`d `stream_write.rs` and parsed the function body for the
 /// call — all three reviewers flagged it as a source parser that any harmless
 /// reorganisation would break. Only the streaming path is instrumented, so
-/// `write.rs` stays byte-for-byte untouched and keeps its role as the
-/// independent oracle; a revert to the eager writer simply leaves the counter
-/// at 0.
+/// `write_raw_to_h5ad`'s implementation body is untouched and keeps its role as
+/// the independent oracle — "body", not "file": its rustdoc was corrected in
+/// review, so the file is not byte-identical. A revert to the eager writer
+/// simply leaves the counter at 0.
 #[test]
 fn the_streaming_entry_point_routes_raw_through_stream_raw_at() {
     use super::pipeline::test_hooks::take_raw_export_streamed;

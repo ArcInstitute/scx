@@ -1917,7 +1917,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     writer_queue_depth` so a slow shard 0 can't let the buffer
     accumulate the rest of the file.
   - `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes — same
-    parser as `from_h5ad`. Derates the granted `reader_threads`
+    parser as `from_h5ad`. **Parallel route only** (`reader_threads` > 1);
+    at one thread there is nothing to derate, which is why the refusal
+    offers `--reader-threads 1`. Evaluated per matrix written (`/X`, each
+    layer, `/raw/X`) — size it for the largest, usually raw.
+    Derates the granted `reader_threads`
     against `max_shard_bytes` (computed exactly from
     `FullCatalogEntry::stats.nnz` and row count, no density
     heuristic). A single shard exceeding the budget raises with an

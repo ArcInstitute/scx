@@ -8,7 +8,7 @@
 //! never instrumented at all. What is left is per-coordinator, because each
 //! switch is read inside that coordinator's own worker closure — the ingest
 //! ones before it calls `encode_one_shard_worker`, the export one before
-//! `read_shard_payload`.
+//! `read_shard_from_entry`.
 //!
 //! Every switch here is a thread-local rather than a global atomic, so a
 //! concurrently scheduled test on another thread never observes another test's
@@ -71,9 +71,10 @@ thread_local! {
     /// per-`ScxReader` and `write_scx_to_h5ad_streaming` opens its own.
     ///
     /// Deliberately one-sided: only the streaming path is instrumented, so
-    /// `h5ad/write.rs` stays byte-for-byte untouched and remains an
-    /// independent oracle to diff the streamed output against. A call site
-    /// that reverts to the eager writer leaves this at 0.
+    /// `write_raw_to_h5ad`'s IMPLEMENTATION BODY is untouched and remains an
+    /// independent oracle to diff the streamed output against. (The file is
+    /// not byte-identical — its rustdoc was corrected — so say "body", not
+    /// "file".) A call site that reverts to the eager writer leaves this at 0.
     pub static RAW_EXPORT_STREAMED: Cell<u32> = const { Cell::new(0) };
 }
 

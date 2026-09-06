@@ -302,8 +302,20 @@ source h5ad in the suite carries any of the three. It was **20 198 MB** in the
 `write_raw_to_h5ad`; OPT-CONVERT-1 made raw stream through the same shard walk
 as `/X`, taking it to 7 547 MB — 2.68×, 12.7 GB freed. The same change moved
 tabula_sapiens_100k from 3 799 MB to 2 308 MB (1.65×), and left the plain arm
-unchanged on all three datasets (1.00×), which is the control: those fixtures
-have no raw.
+essentially unchanged — 1.015× / 1.010× / 1.011× across the three datasets,
+which is cross-capture variance (this capture ran on a different node from the
+`v0.16.0-opt-instruments` baseline), not a shift. That arm is the control:
+those fixtures have no raw, so a change scoped to raw must not move them.
+
+Both sides are backed by tracked results: the after values by
+`results/raw/export_streaming__*.json` (three datasets), the before values by
+`results/candidate_unpinned_20260903/raw/export_streaming__*.json`. Run counts
+differ by dataset — three for census_1m and tabula_sapiens_100k, five for
+pbmc3k. One caveat on the before side: that capture's recorded `git_sha`
+(`3ed7861f`) was on a development branch that has since been squash-merged
+away, so the *values* are auditable from the tracked JSON but the exact commit
+is no longer fetchable. The after capture (`868cf6d6`) is reachable from this
+PR's head.
 
 The residual over the plain arm (4 335 MB at census, 508 MB at tabula) is not
 one shard's worth, and is not fully attributed: `obsm` is still read whole
