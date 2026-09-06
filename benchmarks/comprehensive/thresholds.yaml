@@ -2104,15 +2104,27 @@ absolute_floors:
   #            at 52 columns on tabula, ~208 MB at census scale. OPT-CONVERT-4.
   #   layers — already streamed via `stream_layers_at`.
   #
-  # MEASURED, PR-04 capture (job 2907694, median of 3, `reader_threads=4`),
-  # against the `v0.16.0-opt-instruments` baseline on the same fixtures:
+  # MEASURED, PR-04 capture (SLURM job 2907891, median of 3,
+  # `reader_threads=4`), against the `v0.16.0-opt-instruments` baseline on the
+  # same fixtures:
   #
   #                          before      after     plain arm   full-minus-plain
-  #   tabula_sapiens_100k    3799.4     2268.5        1788.3        480 MB
-  #   census_1m             20198.3     7603.9        3213.9       4390 MB
-  #   pbmc3k                  363.7      352.3         343.2          9 MB
+  #   tabula_sapiens_100k    3799.4     2308.1        1800.0        508 MB
+  #   census_1m             20198.3     7547.2        3212.2       4335 MB
+  #   pbmc3k                  363.7      352.7         342.2         11 MB
   #
-  # i.e. 1.67x at tabula and 2.66x at census — 12.6 GB freed on the census
+  # PROVENANCE. An earlier capture of these same numbers (job 2907694) recorded
+  # `git_sha aaee6ecf` with `git_dirty: true`, and that commit was later rebased
+  # away — so it is an ancestor of nothing and GitHub cannot resolve it, failing
+  # `docs/benchmark_manifest.md` rules 2 and 3. Job 2907891 re-ran from the
+  # committed PR head (`868cf6d6`). It still records `git_dirty: true`, and the
+  # dirtiness is exactly two files: a `.gitignore` line adding `manuscript/` to
+  # the ignore list, and this benchmark's own tracked result JSON, which the run
+  # rewrites as it goes. Both are benchmark-irrelevant — the documented-dirtiness
+  # case rule 3 allows. The two captures agree to within 1.7%, which is what
+  # makes the first one's numbers safe to discard rather than argue about.
+  #
+  # i.e. 1.65x at tabula and 2.68x at census — 12.7 GB freed on the census
   # export. The plain (`_auto.scx`) arm is unchanged at 1.00x on all three,
   # which is the control: those fixtures have no raw, so a change scoped to raw
   # must not move them.
@@ -2137,16 +2149,16 @@ absolute_floors:
     format: scx_streaming_vs_materialize
     dataset: tabula_sapiens_100k
     metric: streaming_full_peak_rss_mb
-    max: 2950.0
+    max: 3000.0
 
   # census_1m, same arm. Deferred item 13 asked for this row once
   # `census_1m_full.scx` existed; it was built during the v0.16.0 capture and
-  # the arm has produced rows since, unfloored. 7603.9 x 1.30 = 9885.
+  # the arm has produced rows since, unfloored. 7547.2 x 1.30 = 9811.
   - benchmark: export_streaming
     format: scx_streaming_vs_materialize
     dataset: census_1m
     metric: streaming_full_peak_rss_mb
-    max: 9900.0
+    max: 9800.0
 
   # ─── compact of a file that HAS obsm and a layer ──────────────────
   #

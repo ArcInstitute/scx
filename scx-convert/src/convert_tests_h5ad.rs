@@ -3316,48 +3316,88 @@ fn streaming_raw_export_never_materialises_the_whole_raw_matrix() {
     );
 }
 
-/// The streaming entry point must call `stream_raw_at`, not the eager
-/// `write_raw_to_h5ad`.
+/// The streaming entry point routes `/raw` through `stream_raw_at`, not the
+/// eager `write_raw_to_h5ad` — asserted through the REAL entry point.
 ///
 /// `streaming_raw_export_never_materialises_the_whole_raw_matrix` drives
-/// `stream_raw_at` directly — it has to, because the reader counters it reads
-/// are per-instance and `write_scx_to_h5ad_streaming` opens its own. That
-/// leaves a gap: reverting the CALL SITE to the eager helper would keep every
-/// test in this file green, since both paths emit identical bytes.
+/// `stream_raw_at` directly, because `ReaderDebugCounts` are per-`ScxReader`
+/// and `write_scx_to_h5ad_streaming` opens its own. That leaves the call site
+/// itself unpinned: reverting just that line would keep every other test in
+/// this file green, since both writers emit byte-identical `/raw/X`.
 ///
-/// So this pins the call site itself. A source check, which is weak in
-/// general — but the property is "which function does this one call", and
-/// there is no runtime seam that exposes it. Scoped to the function body and
-/// with comment lines stripped, because a bare grep cannot tell a call from a
-/// sentence about a call (the body has both: the comment above the call names
-/// `ExportFilterSectionEager`, and an earlier one names `write_raw_to_h5ad`'s
-/// role as the fallback).
+/// A thread-local counter closes it semantically. An earlier version of this
+/// test `include_str!`d `stream_write.rs` and parsed the function body for the
+/// call — all three reviewers flagged it as a source parser that any harmless
+/// reorganisation would break. Only the streaming path is instrumented, so
+/// `write.rs` stays byte-for-byte untouched and keeps its role as the
+/// independent oracle; a revert to the eager writer simply leaves the counter
+/// at 0.
 #[test]
-fn the_streaming_entry_point_calls_stream_raw_at_not_the_eager_writer() {
-    let src = include_str!("h5ad/stream_write.rs");
-    let start = src
-        .find("pub fn write_scx_to_h5ad_streaming(")
-        .expect("write_scx_to_h5ad_streaming not found — did it get renamed?");
-    // The next item at column 0 ends the function.
-    let rest = &src[start..];
-    let end = rest[1..]
-        .find("\n/// ")
-        .map(|i| i + 1)
-        .unwrap_or(rest.len());
-    let body: String = rest[..end]
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+fn the_streaming_entry_point_routes_raw_through_stream_raw_at() {
+    use super::pipeline::test_hooks::take_raw_export_streamed;
 
-    assert!(
-        body.contains("stream_raw_at("),
-        "write_scx_to_h5ad_streaming must call stream_raw_at"
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, raw_n_vars) = (12, 15, 23);
+    let (scx, _) = scx_with_multishard_raw(dir.path(), n_obs, n_vars, raw_n_vars);
+
+    // Reset-on-read: clear anything a sibling on this thread left behind.
+    let _ = take_raw_export_streamed();
+
+    let out = dir.path().join("routed.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        take_raw_export_streamed(),
+        1,
+        "write_scx_to_h5ad_streaming must route /raw through stream_raw_at; \
+         0 means it reverted to the eager write_raw_to_h5ad, which produces \
+         identical bytes and so is invisible to every other test here"
     );
+
+    // The export still has to be correct, not merely routed.
+    let (_, ix, _, shape) = raw_x_triplet(&out);
+    assert!(!ix.is_empty(), "routed raw must still carry its nonzeros");
+    assert_eq!(shape, vec![n_obs as i64, raw_n_vars as i64]);
+}
+
+/// A file with no `.raw` must not increment the counter — otherwise the
+/// assertion above would pass on a `stream_raw_at` that had been reduced to a
+/// no-op, and "routed" would mean nothing.
+#[test]
+fn a_file_without_raw_does_not_route_through_stream_raw_at() {
+    use super::pipeline::test_hooks::take_raw_export_streamed;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("noraw.h5ad");
+    let scx = dir.path().join("noraw.scx");
+    create_test_h5ad(&h5ad, 8, 10, "csr", false);
+    h5ad_to_scx(
+        &h5ad,
+        &scx,
+        &IngestOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    let _ = take_raw_export_streamed();
+    let out = dir.path().join("noraw_out.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &out,
+        &ExportOptions::default(),
+        &mut WarningSink::log(),
+    )
+    .unwrap();
+
+    assert_eq!(take_raw_export_streamed(), 0, "no raw, no raw stream");
     assert!(
-        !body.contains("write_raw_to_h5ad("),
-        "write_scx_to_h5ad_streaming calls the EAGER write_raw_to_h5ad — /raw \
-         would be materialised whole again, and no value assertion in this \
-         file can see it"
+        hdf5::File::open(&out).unwrap().group("raw").is_err(),
+        "a file without raw must not gain a /raw group"
     );
 }

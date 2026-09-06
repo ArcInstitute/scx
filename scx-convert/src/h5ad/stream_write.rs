@@ -181,10 +181,12 @@ pub(crate) fn filter_record_batch_by_mask(
 }
 
 /// Streaming SCX → h5ad entry point. Mirrors `write_scx_to_h5ad`
-/// (`write.rs`) but writes `/X` and `/layers/{name}` shard-
-/// by-shard via pre-allocated hyperslab datasets. Single-modality
-/// SCX files only; multimodal files must use `scx_to_h5mu_streaming`
-/// or `scx_modality_to_h5ad_streaming`.
+/// (`write.rs`) but writes `/X`, `/layers/{name}` and `/raw/X` shard-
+/// by-shard via pre-allocated hyperslab datasets (`/raw/X` through
+/// [`stream_raw_at`], on raw's own gene axis). `obsm` / `varm` / `obsp` /
+/// `varp` / `uns` and `raw/var` still go through the materialising helpers
+/// in `write.rs`. Single-modality SCX files only; multimodal files must use
+/// `scx_to_h5mu_streaming` or `scx_modality_to_h5ad_streaming`.
 pub fn write_scx_to_h5ad_streaming(
     scx_path: &Path,
     h5ad_path: &Path,
@@ -382,6 +384,13 @@ pub(crate) fn stream_csr_to_group_at(
         data: &data_ds,
     };
 
+    // Names which matrix this is — "X", "layers/{name}", "raw/X". Used both
+    // for the budget refusal below and for shard-read errors in the parallel
+    // drain. The budget noun used to be a bare "export shard" for all of
+    // them, so a refusal could not say which matrix blew the budget — and
+    // since the budget is evaluated per matrix and raw is written last, that
+    // is exactly the question the caller has.
+    let source_label = source_label_for(modality_id, section_type, layer_name, reader);
     let requested_threads = crate::pipeline::resolve_reader_threads(opts.reader_threads);
     let queue_depth = opts.writer_queue_depth.max(1);
 
@@ -403,7 +412,7 @@ pub(crate) fn stream_csr_to_group_at(
             max_shard_bytes,
             requested_threads,
             queue_depth,
-            "export shard",
+            &format!("{source_label} export shard"),
             "raise --memory-budget or pass --reader-threads 1",
             sink,
         )?
@@ -417,7 +426,7 @@ pub(crate) fn stream_csr_to_group_at(
             reader,
             &shards,
             keep_mask_opt,
-            source_label_for(modality_id, section_type, layer_name, reader),
+            source_label,
             granted_threads,
             granted_depth,
         )?;
@@ -771,6 +780,11 @@ pub(crate) fn stream_raw_at(
     if !reader.has_raw() {
         return Ok(());
     }
+    // Records that the STREAMING raw writer ran, for the call-site test. The
+    // eager writer is deliberately not instrumented, so `h5ad/write.rs` stays
+    // untouched and keeps working as an independent oracle.
+    #[cfg(test)]
+    crate::pipeline::test_hooks::note_raw_export_streamed();
     // `has_raw` is derived from the catalog (`FileHeader::sync_from_catalog`
     // sets it from any `RawCsrShard`), so a set flag with no resolvable
     // gene axis means the file is inconsistent — not that raw is absent.

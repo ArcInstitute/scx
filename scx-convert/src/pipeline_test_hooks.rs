@@ -60,6 +60,37 @@ thread_local! {
     pub static PANIC_EXPORT_SHARD_AT: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
+thread_local! {
+    /// Per-thread count of `stream_raw_at` entries on a file that has a
+    /// `.raw`.
+    ///
+    /// Exists because the *only* runtime difference between the streaming and
+    /// eager `/raw` writers is which one ran: they emit byte-identical
+    /// `/raw/X`, so no assertion on the OUTPUT can tell them apart, and
+    /// `ReaderDebugCounts` cannot either from outside — those are
+    /// per-`ScxReader` and `write_scx_to_h5ad_streaming` opens its own.
+    ///
+    /// Deliberately one-sided: only the streaming path is instrumented, so
+    /// `h5ad/write.rs` stays byte-for-byte untouched and remains an
+    /// independent oracle to diff the streamed output against. A call site
+    /// that reverts to the eager writer leaves this at 0.
+    pub static RAW_EXPORT_STREAMED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Record that the streaming `/raw` writer ran on this thread.
+/// `stream_raw_at` calls this under `#[cfg(test)]`; no production cost.
+pub fn note_raw_export_streamed() {
+    RAW_EXPORT_STREAMED.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Read and reset this thread's streamed-raw counter. Reset-on-read so a
+/// test needs no setup call and cannot inherit a sibling's count.
+/// `stream_raw_at` runs on the calling thread (only shard decode fans out),
+/// so the count lands on the thread that drove the export.
+pub fn take_raw_export_streamed() -> u32 {
+    RAW_EXPORT_STREAMED.with(|c| c.replace(0))
+}
+
 /// Read the current thread's ingest panic-injection setting.
 pub fn current_ingest_panic_shard() -> Option<usize> {
     PANIC_INGEST_SHARD_AT.with(|c| c.get())

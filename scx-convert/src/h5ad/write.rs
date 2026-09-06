@@ -122,8 +122,16 @@ pub fn write_scx_to_h5ad(
 
 /// Write the `adata.raw` group (`raw/X` + `raw/var`) into an output
 /// h5ad if the SCX file carries a raw matrix. Raw shares X's obs axis,
-/// so the same deletion-vector keep mask is applied to its rows. Shared
-/// by the eager and streaming SCX→h5ad export paths.
+/// so the same deletion-vector keep mask is applied to its rows.
+///
+/// The **eager** (`--stream=false` / `stream=False`) export path only. The
+/// streaming exporter used to share this and now uses
+/// `h5ad::stream_write::stream_raw_at`, which walks raw shard-by-shard
+/// instead of holding the whole matrix. Keeping this one materialising is
+/// deliberate: it is a second, independent implementation of `/raw/X`, and
+/// it is what the streaming output is diffed against
+/// (`streaming_and_eager_raw_export_agree_on_values`,
+/// `deletion_vector_filters_raw_like_the_eager_exporter`).
 pub(crate) fn write_raw_to_h5ad(
     root: &hdf5::Group,
     reader: &ScxReader,

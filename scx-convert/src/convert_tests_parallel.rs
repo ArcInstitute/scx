@@ -1516,3 +1516,164 @@ fn parallel_export_with_raw_byte_identical() {
         assert!(!a.1.is_empty(), "{tag}: fixture must have nonzeros");
     }
 }
+
+/// `memory_budget` is evaluated per matrix, and `/raw` participates.
+///
+/// This is a behaviour change: `write_raw_to_h5ad` never consulted the budget,
+/// so a budget sized off `/X` used to succeed on a `.raw`-bearing file. Raw is
+/// captured before HVG subsetting, so its shards are often the widest — and it
+/// is written last, so the refusal lands after `/X` and the layers are already
+/// on disk.
+///
+/// The fixture makes raw deliberately DENSER than X (~20 nnz/row against 2–3)
+/// so a budget can be placed strictly between the two per-shard working sets;
+/// `add_raw_group` emits at most 2 nnz/row, which would leave raw smaller than
+/// X and make the in-between budget unconstructible.
+#[test]
+fn export_memory_budget_applies_to_raw_and_names_it() {
+    use super::pipeline::scx_to_h5ad_streaming;
+    use scx_format_io::section::SectionType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense_raw.h5ad");
+    let scx = dir.path().join("dense_raw.scx");
+    let (n_obs, n_vars, raw_n_vars) = (40usize, 8usize, 60usize);
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", false);
+    {
+        let f = hdf5::File::open_rw(&h5ad).unwrap();
+        let raw = f.create_group("raw").unwrap();
+        let rx = raw.create_group("X").unwrap();
+        let per_row = 20usize;
+        let mut indptr = vec![0i64];
+        let (mut indices, mut data) = (Vec::new(), Vec::new());
+        for row in 0..n_obs {
+            for j in 0..per_row {
+                indices.push(((row * 7 + j * 3) % raw_n_vars) as i32);
+                data.push((j + 1) as f32);
+            }
+            // CSR wants sorted, deduplicated columns within a row.
+            let s = indptr[row] as usize;
+            let seg = &mut indices[s..];
+            seg.sort_unstable();
+            indptr.push(indices.len() as i64);
+        }
+        rx.new_dataset::<i64>()
+            .shape([indptr.len()])
+            .create("indptr")
+            .unwrap()
+            .write(&indptr)
+            .unwrap();
+        rx.new_dataset::<i32>()
+            .shape([indices.len()])
+            .create("indices")
+            .unwrap()
+            .write(&indices)
+            .unwrap();
+        rx.new_dataset::<f32>()
+            .shape([data.len()])
+            .create("data")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+        rx.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("csr_matrix"))
+            .unwrap();
+        rx.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("encoding-version")
+            .unwrap()
+            .write_scalar(&vlu("0.1.0"))
+            .unwrap();
+        rx.new_attr::<i64>()
+            .shape([2])
+            .create("shape")
+            .unwrap()
+            .write(&[n_obs as i64, raw_n_vars as i64])
+            .unwrap();
+        let rv = raw.create_group("var").unwrap();
+        let idx: Vec<hdf5::types::VarLenUnicode> =
+            (0..raw_n_vars).map(|i| vlu(&format!("r{i}"))).collect();
+        rv.new_dataset::<hdf5::types::VarLenUnicode>()
+            .shape([raw_n_vars])
+            .create("_index")
+            .unwrap()
+            .write(&idx)
+            .unwrap();
+        rv.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("_index")
+            .unwrap()
+            .write_scalar(&vlu("_index"))
+            .unwrap();
+        rv.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("encoding-type")
+            .unwrap()
+            .write_scalar(&vlu("dataframe"))
+            .unwrap();
+    }
+    let opts = IngestOptions {
+        shard_target_rows: 10,
+        ..IngestOptions::default()
+    };
+    h5ad_to_scx(&h5ad, &scx, &opts, &mut WarningSink::log()).unwrap();
+
+    // Per-shard working sets straight from catalog stats — the same numbers
+    // the derate uses, so the budget below is placed by measurement, not guess.
+    let reader = ScxReader::open(&scx).unwrap();
+    let biggest = |st: SectionType| -> u64 {
+        reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == st)
+            .filter_map(|e| e.stats.as_ref())
+            .map(crate::h5ad::stream_write::per_shard_export_bytes_for_test)
+            .max()
+            .unwrap_or(0)
+    };
+    let x_bytes = biggest(SectionType::CsrShard);
+    let raw_bytes = biggest(SectionType::RawCsrShard);
+    drop(reader);
+    assert!(
+        raw_bytes > x_bytes,
+        "premise: raw ({raw_bytes} B/shard) must exceed X ({x_bytes} B/shard), \
+         else no budget sits between them and this test proves nothing"
+    );
+
+    // Strictly between: X fits, raw does not.
+    let budget = (x_bytes + raw_bytes) / 2;
+    let out = dir.path().join("budget.h5ad");
+    let err = scx_to_h5ad_streaming(
+        &scx,
+        &out,
+        &ExportOptions {
+            reader_threads: Some(4),
+            memory_budget: Some(budget),
+            ..ExportOptions::default()
+        },
+        &mut WarningSink::log(),
+    )
+    .expect_err("a budget below raw's per-shard working set must refuse");
+    let msg = err.to_string();
+    assert!(msg.contains("memory_budget"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("raw/X"),
+        "the refusal must name WHICH matrix blew the budget — the budget is \
+         per matrix and raw is written last, so 'export shard' alone leaves \
+         the caller guessing: {msg}"
+    );
+
+    // Same file, same threads, a budget above raw: succeeds.
+    let ok_out = dir.path().join("budget_ok.h5ad");
+    scx_to_h5ad_streaming(
+        &scx,
+        &ok_out,
+        &ExportOptions {
+            reader_threads: Some(4),
+            memory_budget: Some(raw_bytes * 4),
+            ..ExportOptions::default()
+        },
+        &mut WarningSink::log(),
+    )
+    .expect("a budget above raw's working set must succeed");
+}

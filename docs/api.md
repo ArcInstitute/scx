@@ -1877,7 +1877,12 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   `indptr` (`(n_obs + 1) × 8` bytes). "Per matrix" covers `X`, every
   `layers` entry, and `adata.raw` — raw goes through the same shard
   walk on its own (usually wider) gene axis. `obsm` / `varm` / `obsp` /
-  `varp` are still read whole and are the remaining unbounded term. When deletion vectors are
+  `varp` are still read whole and are the remaining unbounded term.
+  `memory_budget=` is likewise evaluated **per matrix**, so size it for the
+  largest one rather than for `X`: raw is captured before HVG subsetting and
+  its shards are usually the binding constraint on a `.raw`-bearing file. Raw
+  is written last, so a budget that admits `X` but not raw raises only after
+  `/X` and the layers are on disk, leaving a partial output. When deletion vectors are
   present, only kept rows appear in the output (`shape[0] = n_obs -
   n_deleted`); a single pre-scan pass computes the filtered nnz before
   pre-allocating the HDF5 triplet so the on-disk layout is
