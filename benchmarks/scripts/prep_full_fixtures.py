@@ -10,9 +10,13 @@ has no `.raw`, `obsm_keys == []` and `layer_names == []` — as does every other
 `.scx` in the suite, because no source h5ad carries any of the three. So the
 ceiling never reaches the parts of the export path that handle them:
 
-  * `/raw`  — `scx-convert/src/h5ad/write.rs`'s `write_raw_to_h5ad` calls
-              `read_all_raw_csr_shards()`, i.e. the whole raw matrix resident.
-              This is the dominant term: 1487 MB at tabula_sapiens_100k.
+  * `/raw`  — streamed since PR-04 (OPT-CONVERT-1) by `stream_write.rs`'s
+              `stream_raw_at`. Before that, `write_raw_to_h5ad` called
+              `read_all_raw_csr_shards()` and held the whole raw matrix
+              resident — the dominant term, 1487 MB at tabula_sapiens_100k.
+              Still the reason this fixture exists: a raw that regressed to a
+              materialising read produces byte-identical output, so peak RSS
+              on this fixture is the only signal.
   * `obsm`  — `stream_write.rs` reads `read_all_obsm()` whole (and emits an
               `ExportFilterSectionEager` warning under a keep mask). Small at
               ordinary embedding widths: 19.8 MB for 52 columns at 100k cells.

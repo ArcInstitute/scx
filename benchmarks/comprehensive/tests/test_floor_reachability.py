@@ -2057,6 +2057,100 @@ def test_performance_doc_streaming_table_matches_the_tracked_json():
     assert checked == 3, checked
 
 
+def test_performance_doc_export_table_matches_the_tracked_json():
+    """`docs/performance.md`'s export_streaming table must equal the medians in
+    the tracked raw JSON.
+
+    The table pin above covers only the *conversion* rows. The export numbers
+    come from the same tracked file — which is tracked for exactly that reason —
+    and nothing checked them. OPT-CONVERT-1 moved one of the three
+    (`streaming_full`, the arm that reaches `.raw`), which is precisely when an
+    unpinned published number goes stale silently. Same shape as the 5.79-GB
+    error the conversion pin was written to prevent.
+
+    Anchored per row label, not by scanning the section for any number that
+    happens to match: a paragraph-wide search cannot tell which arm a figure
+    belongs to, so swapping two arms' numbers would pass it. That was the first
+    version of this test, and it is why the prose became a table.
+    """
+    import json
+    import re
+    import statistics
+
+    raw = PROJECT_ROOT / "benchmarks" / "comprehensive" / "results" / "raw"
+    doc = (PROJECT_ROOT / "docs" / "performance.md").read_text()
+    fname = "export_streaming__scx_streaming_vs_materialize__census_1m.json"
+    assert (raw / fname).is_file(), (
+        f"{fname} is not tracked, so the export numbers citing it cannot be "
+        f"audited from a fresh checkout — force-add it "
+        f"(see docs/benchmark_manifest.md)"
+    )
+    d = json.loads((raw / fname).read_text())
+
+    # (doc row label, scenario key prefix)
+    rows = [
+        ("streaming (`pyscx.to_h5ad`), `reader_threads=4`", "streaming"),
+        ("materialise (`stream=False`)", "materialize"),
+        ("streaming, `_full` fixture (`.raw` + `obsm` + a layer)", "streaming_full"),
+    ]
+
+    checked = 0
+    for label, scenario in rows:
+        key = f"{scenario}_peak_rss_mb"
+        vals = [r["extra"][key] for r in d["runs"] if key in r.get("extra", {})]
+        assert vals, f"{fname} carries no {key}"
+        want = statistics.median(vals)
+
+        # `| <label> | **7 604 MB** |` — bold optional, thin or ordinary space
+        # as the digit separator.
+        pat = re.escape(label) + r"\s*\|\s*\*{0,2}([\d][\d\s,\u202f]*)\s*MB"
+        m = re.search(pat, doc)
+        assert m, f"no MB row labelled {label!r} in docs/performance.md"
+        got = float(
+            m.group(1).replace("\u202f", "").replace(" ", "").replace(",", "")
+        )
+        assert abs(got - want) < 1.0, (
+            f"{label}: doc says {got:.0f} MB, tracked median for {key} is "
+            f"{want:.0f} MB (min {min(vals):.0f}, max {max(vals):.0f}) — "
+            f"publishing the min instead of the median is how this drifted before"
+        )
+        checked += 1
+    assert checked == 3, checked
+
+    # The prose also publishes tabula and pbmc3k figures. Round 2 (codex,
+    # Cursor) caught that those were unbacked: only census_1m.json was tracked,
+    # so a fresh checkout could not audit them. Both are force-added now, and
+    # this is what keeps them honest — a table pin that covered only census
+    # would have let the other two drift exactly as the export prose did.
+    # tabula only: `docs/performance.md` quotes its streaming_full figure in the
+    # export prose. pbmc3k's JSON is tracked too — the PR description and the
+    # thresholds comment cite it — but the doc does not publish it, and pinning a
+    # number the doc never states would fail on the doc's silence rather than on
+    # any drift. (This assertion caught exactly that when it was first written
+    # too broadly: pbmc3k's 352.7 median rounds to 353, and the only "352 MB" in
+    # the doc was part of "10 352 MB" for an unrelated metric.)
+    for ds in ("tabula_sapiens_100k",):
+        f = raw / f"export_streaming__scx_streaming_vs_materialize__{ds}.json"
+        assert f.is_file(), (
+            f"{f.name} is not tracked, but docs/performance.md publishes its "
+            f"streaming_full figure — force-add it (docs/benchmark_manifest.md)"
+        )
+        dd = json.loads(f.read_text())
+        vals = [
+            r["extra"]["streaming_full_peak_rss_mb"]
+            for r in dd["runs"]
+            if "streaming_full_peak_rss_mb" in r.get("extra", {})
+        ]
+        assert vals, f"{f.name} carries no streaming_full_peak_rss_mb"
+        med = statistics.median(vals)
+        # Doc quotes these to the nearest MB, with a thin/ordinary space.
+        rendered = f"{round(med):,}".replace(",", " ")
+        assert rendered in doc or f"{round(med)}" in doc, (
+            f"{ds}: docs/performance.md does not quote the tracked median "
+            f"{med:.0f} MB for streaming_full_peak_rss_mb"
+        )
+
+
 @pytest.mark.parametrize("mod", ["conversion_streaming", "export_streaming"])
 def test_thread_sweep_above_the_cap_is_refused_not_silently_uncapped(mod: str, monkeypatch):
     """Drive `run()` — do not just assert the constants exist.

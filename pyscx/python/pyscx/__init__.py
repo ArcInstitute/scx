@@ -711,6 +711,21 @@ def to_h5ad(path, out, **kwargs):
             (powers of 1024); decimal KB/MB/GB/TB is rejected. E.g. "4G" /
             "512M" / "2GiB". A single shard exceeding the budget raises;
             smaller mismatches emit ReaderThreadsDerated.
+
+            Applies only when reader_threads resolves to > 1: the budget
+            bounds how many shards are in flight, and at one thread there is
+            nothing left to derate, so the sequential route runs whatever the
+            file needs. That is why the refusal's own remedy offers
+            reader_threads=1 as the alternative to raising the budget.
+
+            On the parallel route it is evaluated per matrix written — X,
+            each layer, and (since /raw began streaming) adata.raw. Size it
+            for the LARGEST of those, not for X: raw is captured before HVG
+            subsetting, so its shards are often the widest and are usually
+            the binding constraint on a .raw-bearing file. Because raw is
+            written last, a budget that admits X but not raw raises only
+            after /X and the layers are already on disk, leaving a partial
+            output file.
         obs_mask: Boolean array selecting the observations to keep, in
             either obs row space, told apart by length: `n_obs` entries (the
             live rows — what `read_obs()` describes, so

@@ -477,9 +477,10 @@ dispatcher but with a simpler precondition set:
   `reader_threads + writer_queue_depth` against `max_shard_bytes` so
   the rolling-window cap matches the budget directly.
 - **No `max_slab_rows` clamp.** SCX shards are random-access via
-  `ScxReader::read_csr_shard_for(modality_id, shard_idx)`; the
-  source isn't gated by a slab budget the way an HDF5 dense reader
-  is on the ingest side.
+  `ScxReader::read_shard_from_entry(entry)` — the export walk passes the
+  catalog entry it already holds rather than an index the reader re-resolves,
+  so `X`, layers and `raw` share one read path; the source isn't gated by a
+  slab budget the way an HDF5 dense reader is on the ingest side.
 - **Rolling-window spawn carries over** — literally: export and
   ingest share `ordered_parallel_drain`, so the reorder buffer on the
   writer thread is bounded by the same

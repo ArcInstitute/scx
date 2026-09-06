@@ -35,11 +35,17 @@ them never reaches the code that copies them.
 What the arm actually covers, checked against the export path rather than
 assumed:
 
-* **raw — materialised, and dominant.** ``write_raw_to_h5ad``
-  (``scx-convert/src/h5ad/write.rs``) calls ``read_all_raw_csr_shards()`` and
-  holds the whole matrix. Measured at tabula_sapiens_100k: 1735 MB on the plain
-  fixture against 3314 MB here, a delta that 194,891,401 nnz x 8 B = 1487 MB
-  accounts for to within 3%.
+* **raw — streamed since PR-04 (OPT-CONVERT-1), and this arm is what measured
+  it.** It used to be materialised and dominant: ``write_raw_to_h5ad``
+  (``scx-convert/src/h5ad/write.rs``) called ``read_all_raw_csr_shards()`` and
+  held the whole matrix, which at tabula_sapiens_100k was 1735 MB on the plain
+  fixture against 3314 MB here — a delta that 194,891,401 nnz x 8 B = 1487 MB
+  accounted for to within 3%. ``stream_raw_at``
+  (``scx-convert/src/h5ad/stream_write.rs``) now walks ``RawCsrShard`` entries
+  through the same ``stream_csr_to_group_at`` driver as ``/X`` and the layers,
+  so the term is one shard's worth. This arm remains the only instrument that
+  can see a regression back to a materialising raw — the values are identical
+  either way, so nothing about the OUTPUT distinguishes them.
 * **obsm — materialised, but small at this shape.** ``stream_write.rs`` reads
   ``read_all_obsm()`` whole and emits an ``ExportFilterSectionEager`` warning
   under a keep mask. At 52 columns that is 19.8 MB and does not move the

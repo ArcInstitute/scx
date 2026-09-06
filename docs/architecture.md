@@ -1067,8 +1067,10 @@ post-`finish()` `scx_ops::rebuild_csc_inplace` pass (transient disk
 `pyscx.to_h5mu`): the inverse path. `scx_convert::
 scx_to_h5ad_streaming` (and `scx_to_h5mu_streaming` / `scx_modality_to_h5ad_streaming`)
 iterate SCX CSR shards in row order
-via `ScxReader::read_csr_shard_for` / `read_layer_csr_shard*` and
-write hyperslab slices into pre-allocated `/X/{indptr,indices,data}`
+via `ScxReader::read_shard_from_entry` (keyed by the catalog entry the
+shard walk already holds, so `X`, layers and raw share one read path
+rather than three index-based dispatches that each re-derive the shard
+ordering) and write hyperslab slices into pre-allocated `/X/{indptr,indices,data}`
 HDF5 datasets. The total `nnz` is computed up front from catalog
 `ShardStats` (single pre-scan decode when deletion vectors are
 active) so the on-disk layout is deterministic — no extendable HDF5
@@ -1089,8 +1091,12 @@ finalize would need every already-written code renumbered.
 A legacy single-section obs/var source is not a second writer: it goes
 through `write_dataframe_group_at`, the whole-batch **driver** over the
 same function (one shard, and the deletion-vector mask passed through
-rather than applied first). Obsm / varm / uns / mappings still
-reuse the materialising helpers. Peak memory is bounded by one
+rather than applied first). `adata.raw` streams too, via `stream_raw_at`
+— the same `stream_csr_to_group_at` driver on raw's own (usually wider)
+gene axis, resolved from `ScxReader::raw_n_vars()`; only `raw/var` stays
+whole-batch, because var is never sharded. Obsm / varm / obsp / varp /
+uns still reuse the materialising helpers and are the remaining
+unbounded term. Peak memory is bounded by one
 shard's worth of CSR per matrix written, plus one shard's worth of
 obs/var per column when sharded. `--stream=false` falls back to the
 legacy materialising `scx_to_h5ad` / `scx_to_h5mu` /

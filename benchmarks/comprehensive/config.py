@@ -179,8 +179,13 @@ class DatasetConfig:
         `.raw`, an `obsm` key or a layer, so `census_1m_auto.scx` and
         `tabula_sapiens_100k_auto.scx` have `obsm_keys == []` and
         `layer_names == []`. Every export threshold measured on them is blind to
-        the raw and obsm copies in `scx-convert`'s export path — the two places
-        it still materialises a whole matrix.
+        the `.raw` / `obsm` / layer handling in `scx-convert`'s export path.
+
+        Since OPT-CONVERT-1, `/raw` streams like `/X` and the layers, so `obsm`
+        (with `varm` / `obsp` / `varp`) is the only whole-matrix copy left —
+        OPT-CONVERT-4. The arm still matters more than that shrinkage suggests:
+        streamed and materialised raw produce byte-identical output, so peak RSS
+        here is the only signal that would catch a regression back.
 
         Built by `benchmarks/scripts/prep_full_fixtures.py`; absent until that
         has been run for the dataset.
@@ -1114,11 +1119,20 @@ def estimate_memory_gb(
         # 13.98 GB on census_1m — about 1.2x the source h5ad, which `base_mb`
         # (2x) already covers.
         #
-        # The 1.5x on top is `export_streaming`'s `streaming_full` arm. It
-        # exports `<name>_full.scx`, whose `.raw` is held whole by
-        # `write_raw_to_h5ad`'s `read_all_raw_csr_shards()` — measured at
-        # +1579 MB over the plain arm on tabula_sapiens_100k, and it scales with
-        # nnz (8 B each), so roughly +1x the source's sparse content at any tier.
+        # The 1.5x on top is `export_streaming`'s `streaming_full` arm. It used
+        # to be justified by `.raw` being held whole by `write_raw_to_h5ad`'s
+        # `read_all_raw_csr_shards()` — +1579 MB over the plain arm on
+        # tabula_sapiens_100k, scaling with nnz at 8 B each. OPT-CONVERT-1 made
+        # raw stream, which removed that term: the measured `streaming_full`
+        # residual over the plain arm is now ~508 MB on tabula and ~4335 MB on
+        # census_1m, from the still-eager `obsm` plus the fact that peak RSS over
+        # a multi-matrix export is not the max of independent peaks.
+        #
+        # The multiplier is DELIBERATELY not retuned here. It sizes a scheduler
+        # request, where over-asking costs queue time and under-asking costs an
+        # OOM mid-capture; census_1m's `streaming_full` still peaks at ~7.5 GB,
+        # which `base_mb` alone does not cover at every tier. Retuning it wants
+        # its own measurement across tiers, not a division on one capture.
         #
         # Both fell through to `peak_mb = base_mb` before this branch, which was
         # not a decision: `export_streaming`'s own docstring flagged the absence

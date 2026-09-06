@@ -513,6 +513,10 @@ impl ScxReader {
     /// the main matrix `n_vars`. Mirrors [`Self::read_all_csr_shards`]
     /// but over the raw section family.
     pub fn read_all_raw_csr_shards(&self) -> Result<ScxCsr> {
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_all_raw_csr_shards
+            .fetch_add(1, Ordering::Relaxed);
         let shards = self.full_catalog.raw_csr_shards_sorted();
         if shards.is_empty() {
             return Ok(ScxCsr::new_unchecked(

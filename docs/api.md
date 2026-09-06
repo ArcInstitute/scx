@@ -1874,7 +1874,19 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   without materialising `X` in memory. Mirror of `pyscx.from_h5ad` in the
   opposite direction. Bounded peak memory: one shard's worth of CSR
   plus encode buffers per matrix written, plus the always-resident
-  `indptr` (`(n_obs + 1) × 8` bytes). When deletion vectors are
+  `indptr` (`(n_obs + 1) × 8` bytes). "Per matrix" covers `X`, every
+  `layers` entry, and `adata.raw` — raw goes through the same shard
+  walk on its own (usually wider) gene axis. `obsm` / `varm` / `obsp` /
+  `varp` are still read whole and are the remaining unbounded term.
+  `memory_budget=` is likewise evaluated **per matrix**, so size it for the
+  largest one rather than for `X`: raw is captured before HVG subsetting and
+  its shards are usually the binding constraint on a `.raw`-bearing file. Raw
+  is written last, so a budget that admits `X` but not raw raises only after
+  `/X` and the layers are on disk, leaving a partial output. The check runs
+  **only on the parallel route** (`reader_threads` > 1) — the budget bounds
+  how many shards are in flight, and at one thread there is nothing to
+  derate, which is why the refusal offers `--reader-threads 1` as the
+  alternative to raising the budget. When deletion vectors are
   present, only kept rows appear in the output (`shape[0] = n_obs -
   n_deleted`); a single pre-scan pass computes the filtered nnz before
   pre-allocating the HDF5 triplet so the on-disk layout is
@@ -1905,7 +1917,11 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     writer_queue_depth` so a slow shard 0 can't let the buffer
     accumulate the rest of the file.
   - `memory_budget`: `"4G"`, `"512M"`, `"2GiB"`, or bytes — same
-    parser as `from_h5ad`. Derates the granted `reader_threads`
+    parser as `from_h5ad`. **Parallel route only** (`reader_threads` > 1);
+    at one thread there is nothing to derate, which is why the refusal
+    offers `--reader-threads 1`. Evaluated per matrix written (`/X`, each
+    layer, `/raw/X`) — size it for the largest, usually raw.
+    Derates the granted `reader_threads`
     against `max_shard_bytes` (computed exactly from
     `FullCatalogEntry::stats.nnz` and row count, no density
     heuristic). A single shard exceeding the budget raises with an

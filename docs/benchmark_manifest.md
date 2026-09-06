@@ -145,8 +145,31 @@ Every number that appears in a user-visible document must satisfy:
 1. A corresponding raw JSON result exists in `benchmarks/comprehensive/results/raw/`
    **or** the number appears in `baselines/LATEST/summary.json`.
 2. The result's `system.provenance.git_sha` is an ancestor of `main`.
+
+   ⚠️ **This repository squash-merges, so a capture SHA taken on a PR branch
+   never becomes an ancestor of `main`.** Squash creates a new single-parent
+   commit; the branch head is not in its history. (Check it: PR #509's head
+   `df8da2d1` is not an ancestor of its `main` commit `830c33eb`.) Read
+   literally, rule 2 is unsatisfiable for any capture that justifies a number
+   the same PR introduces — the capture must run on the PR's code, and that
+   code is only on the PR branch.
+
+   What the rule is actually protecting is **resolvability**: anyone reading
+   the result later must be able to fetch the commit it names and see the code
+   that produced the number. So the property to check is that the SHA is
+   **pushed and reachable** — an ancestor of the reviewed PR head, with the PR
+   number recorded — or, once the work has landed by a non-squash route, an
+   ancestor of `main`.
+
+   The failure this clause exists to catch is a SHA that is an ancestor of
+   **nothing**: a capture from a commit later amended, rebased away, or never
+   pushed. That one cannot be resolved by anybody, and it is what PR #510
+   shipped in its first round.
 3. The result's `system.provenance.git_dirty` is `false` (or the dirtiness
-   is documented as acceptable — e.g., benchmark-only changes).
+   is documented as acceptable — e.g., benchmark-only changes). "Documented"
+   means the specific files are named somewhere a reader will find them
+   (the threshold comment that cites the number is the usual place), not
+   merely asserted to be harmless.
 
 ### Automated verification
 

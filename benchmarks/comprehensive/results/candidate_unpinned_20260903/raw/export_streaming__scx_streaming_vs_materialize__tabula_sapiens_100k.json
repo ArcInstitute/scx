@@ -2,16 +2,16 @@
   "schema_version": 2,
   "benchmark": "export_streaming",
   "format": "scx_streaming_vs_materialize",
-  "dataset": "census_1m",
-  "timestamp": "2026-09-05T21:06:15",
+  "dataset": "tabula_sapiens_100k",
+  "timestamp": "2026-09-03T01:50:28",
   "system": {
-    "hostname": "GPU71BA",
+    "hostname": "CPUDFE044",
     "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
-    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu": "Intel(R) Xeon(R) 6740P",
     "cpu_cores_physical": 192,
-    "ram_gb": 1007,
+    "ram_gb": 2016,
     "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "library_versions": {
       "anndata": "0.12.10",
@@ -31,195 +31,194 @@
       "leidenalg": "0.11.0",
       "igraph": "1.0.0",
       "psutil": "7.2.2",
-      "pyscx": "0.17.0"
+      "pyscx": "0.16.0"
     },
     "storage": {
       "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
       "scratch_fstype": "wekafs",
-      "has_nvme": true
+      "has_nvme": false
     },
     "gpu": {
-      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M1TEAFEQA44ZB4710EHQR6CB",
-      "git_sha": "868cf6d62a6953ea1e93f8f3d391b224c8adf10e",
-      "git_branch": "pr04-stream-raw-export",
-      "git_dirty": true,
-      "git_describe": "pyscx-v0.17.0-3-g868cf6d6-dirty",
+      "run_id": "01M1K68BXC0K14360N964CMM0D",
+      "git_sha": "3ed7861ff3393c9a7983f6d2f56926c1c5aa6db2",
+      "git_branch": "pr03-baseline-recapture",
+      "git_dirty": false,
+      "git_describe": "pyscx-v0.16.0-20-g3ed7861f",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
-      "conda_env": "",
+      "conda_env": "scx-bench",
       "pyscx_features": ""
     }
   },
   "runs": [
     {
-      "wall_s": 18.999699442996643,
+      "wall_s": 1.4561614079866558,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3183.71875,
+      "peak_rss_mb": 1762.734375,
       "extra": {
         "scenario": "streaming",
         "run_idx": 0,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3183.71875,
-        "streaming_wall_s": 18.999699442996643
+        "streaming_peak_rss_mb": 1762.734375,
+        "streaming_wall_s": 1.4561614079866558
       }
     },
     {
-      "wall_s": 18.340167546994053,
+      "wall_s": 1.3510632460238412,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3212.234375,
+      "peak_rss_mb": 1781.4921875,
       "extra": {
         "scenario": "streaming",
         "run_idx": 1,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3212.234375,
-        "streaming_wall_s": 18.340167546994053
+        "streaming_peak_rss_mb": 1781.4921875,
+        "streaming_wall_s": 1.3510632460238412
       }
     },
     {
-      "wall_s": 18.306103453040123,
+      "wall_s": 1.355882226023823,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 3239.97265625,
+      "peak_rss_mb": 1781.765625,
       "extra": {
         "scenario": "streaming",
         "run_idx": 2,
         "reader_threads": 4,
-        "streaming_peak_rss_mb": 3239.97265625,
-        "streaming_wall_s": 18.306103453040123
+        "streaming_peak_rss_mb": 1781.765625,
+        "streaming_wall_s": 1.355882226023823
       }
     },
     {
-      "wall_s": 19.811528204008937,
+      "wall_s": 1.439677852904424,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 5353.76953125,
+      "peak_rss_mb": 2016.9140625,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 0,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 5353.76953125,
-        "streaming_default_threads_wall_s": 19.811528204008937
+        "streaming_default_threads_peak_rss_mb": 2016.9140625,
+        "streaming_default_threads_wall_s": 1.439677852904424
       }
     },
     {
-      "wall_s": 20.5766040320741,
+      "wall_s": 1.341058133984916,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 5635.65625,
+      "peak_rss_mb": 2118.28125,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 1,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 5635.65625,
-        "streaming_default_threads_wall_s": 20.5766040320741
+        "streaming_default_threads_peak_rss_mb": 2118.28125,
+        "streaming_default_threads_wall_s": 1.341058133984916
       }
     },
     {
-      "wall_s": 21.709963876986876,
+      "wall_s": 1.2951905101072043,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 5726.44921875,
+      "peak_rss_mb": 2178.34375,
       "extra": {
         "scenario": "streaming_default_threads",
         "run_idx": 2,
         "reader_threads": null,
-        "streaming_default_threads_peak_rss_mb": 5726.44921875,
-        "streaming_default_threads_wall_s": 21.709963876986876
+        "streaming_default_threads_peak_rss_mb": 2178.34375,
+        "streaming_default_threads_wall_s": 1.2951905101072043
       }
     },
     {
-      "wall_s": 21.553806054987945,
+      "wall_s": 1.7015666330698878,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 14031.578125,
+      "peak_rss_mb": 2975.08984375,
       "extra": {
         "scenario": "materialize",
         "run_idx": 0,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 14031.578125,
-        "materialize_wall_s": 21.553806054987945
+        "materialize_peak_rss_mb": 2975.08984375,
+        "materialize_wall_s": 1.7015666330698878
       }
     },
     {
-      "wall_s": 21.746907018008642,
+      "wall_s": 1.6044245479861274,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 14047.46484375,
+      "peak_rss_mb": 3246.67578125,
       "extra": {
         "scenario": "materialize",
         "run_idx": 1,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 14047.46484375,
-        "materialize_wall_s": 21.746907018008642
+        "materialize_peak_rss_mb": 3246.67578125,
+        "materialize_wall_s": 1.6044245479861274
       }
     },
     {
-      "wall_s": 21.334306868957356,
+      "wall_s": 1.5881274400744587,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 14077.859375,
+      "peak_rss_mb": 3213.70703125,
       "extra": {
         "scenario": "materialize",
         "run_idx": 2,
         "reader_threads": null,
-        "materialize_peak_rss_mb": 14077.859375,
-        "materialize_wall_s": 21.334306868957356
+        "materialize_peak_rss_mb": 3213.70703125,
+        "materialize_wall_s": 1.5881274400744587
       }
     },
     {
-      "wall_s": 38.48639334808104,
+      "wall_s": 4.350216644932516,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 7547.15625,
+      "peak_rss_mb": 3714.0859375,
       "extra": {
         "scenario": "streaming_full",
         "run_idx": 0,
         "reader_threads": 4,
-        "streaming_full_peak_rss_mb": 7547.15625,
-        "streaming_full_wall_s": 38.48639334808104
+        "streaming_full_peak_rss_mb": 3714.0859375,
+        "streaming_full_wall_s": 4.350216644932516
       }
     },
     {
-      "wall_s": 39.90483597794082,
+      "wall_s": 4.079560393001884,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 7525.6328125,
+      "peak_rss_mb": 3799.41796875,
       "extra": {
         "scenario": "streaming_full",
         "run_idx": 1,
         "reader_threads": 4,
-        "streaming_full_peak_rss_mb": 7525.6328125,
-        "streaming_full_wall_s": 39.90483597794082
+        "streaming_full_peak_rss_mb": 3799.41796875,
+        "streaming_full_wall_s": 4.079560393001884
       }
     },
     {
-      "wall_s": 35.34831567900255,
+      "wall_s": 4.08034541097004,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 7576.44921875,
+      "peak_rss_mb": 3846.6171875,
       "extra": {
         "scenario": "streaming_full",
         "run_idx": 2,
         "reader_threads": 4,
-        "streaming_full_peak_rss_mb": 7576.44921875,
-        "streaming_full_wall_s": 35.34831567900255
+        "streaming_full_peak_rss_mb": 3846.6171875,
+        "streaming_full_wall_s": 4.08034541097004
       }
     }
   ],
-  "median_wall_s": 21.44405646197265,
-  "wall_s_iqr": 12.745306880504359,
+  "median_wall_s": 1.5221444240305573,
+  "wall_s_iqr": 2.1327939619950484,
   "n_runs": 12,
   "metadata": {
     "direction": "h5ad",
-    "source_scx_bytes": 2736680651,
-    "n_obs": 1000000,
+    "source_scx_bytes": 233530210,
+    "n_obs": 100000,
     "n_vars": 61497,
     "multimodal": false,
     "scenarios": [
@@ -238,32 +237,32 @@
     ],
     "thread_counts": null,
     "materialize_skipped_reason": null,
-    "full_fixture_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/census_1m_full.scx",
-    "streaming_output_bytes": 11450459600,
-    "streaming_default_threads_output_bytes": 11450459600,
-    "materialize_output_bytes": 11450459592,
-    "streaming_full_output_bytes": 34115011056,
+    "full_fixture_path": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/tabula_sapiens_100k_full.scx",
+    "streaming_output_bytes": 1592709200,
+    "streaming_default_threads_output_bytes": 1592709200,
+    "materialize_output_bytes": 1592709192,
+    "streaming_full_output_bytes": 4743887168,
     "gated_reader_threads": 4,
     "structural": {
       "streaming": {
-        "n_obs": 1000000,
+        "n_obs": 100000,
         "n_vars": 61497,
-        "nnz": 1402381960
+        "nnz": 194891401
       },
       "streaming_default_threads": {
-        "n_obs": 1000000,
+        "n_obs": 100000,
         "n_vars": 61497,
-        "nnz": 1402381960
+        "nnz": 194891401
       },
       "materialize": {
-        "n_obs": 1000000,
+        "n_obs": 100000,
         "n_vars": 61497,
-        "nnz": 1402381960
+        "nnz": 194891401
       },
       "streaming_full": {
-        "n_obs": 1000000,
+        "n_obs": 100000,
         "n_vars": 61497,
-        "nnz": 1402381960
+        "nnz": 194891401
       },
       "equal": true
     }

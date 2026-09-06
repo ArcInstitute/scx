@@ -1072,6 +1072,28 @@ pub(crate) fn read_h5ad_x_triplet(path: &Path) -> (Vec<i64>, Vec<i32>, Vec<f32>,
 /// Convert h5ad → SCX with a small shard_size so the SCX file has
 /// many shards (the export-parallel path needs ≥ a handful of shards
 /// to exercise the rolling-window).
+/// [`make_multishard_scx`] with an `adata.raw` on a WIDER gene axis, sharded
+/// the same way. Raw shares the obs axis, so it gets the same shard count —
+/// which is what puts several raw shards through the parallel export drain's
+/// reorder buffer.
+pub(crate) fn make_multishard_scx_with_raw(
+    scx_path: &Path,
+    n_obs: usize,
+    n_vars: usize,
+    raw_n_vars: usize,
+    shard_size: u32,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("src.h5ad");
+    create_test_h5ad(&h5ad, n_obs, n_vars, "csr", false);
+    add_raw_group(&h5ad, n_obs, raw_n_vars);
+    let opts = IngestOptions {
+        shard_target_rows: shard_size,
+        ..IngestOptions::default()
+    };
+    h5ad_to_scx(&h5ad, scx_path, &opts, &mut WarningSink::log()).unwrap();
+}
+
 pub(crate) fn make_multishard_scx(scx_path: &Path, n_obs: usize, n_vars: usize, shard_size: u32) {
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("src.h5ad");

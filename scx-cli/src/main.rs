@@ -177,6 +177,11 @@ enum Commands {
         /// of 1024). Decimal suffixes (`KB`/`MB`/`GB`/`TB`) are
         /// rejected to avoid 1000-vs-1024 ambiguity. None = each
         /// phase's default.
+        ///
+        /// On `--to h5ad`/`h5mu` it bounds decoded shards in flight, per
+        /// matrix written (`/X`, each layer, `/raw/X`) — size it for the
+        /// largest, usually raw. Only applies with `--reader-threads` > 1;
+        /// at one thread there is nothing to derate.
         #[arg(long, value_name = "SIZE")]
         memory_budget: Option<String>,
         /// Fail conversion on the first unsupported `uns` key
