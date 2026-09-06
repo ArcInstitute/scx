@@ -1059,8 +1059,13 @@ impl PyExperiment {
     /// obsm, uns, and layers populated from the file.
     // New kwargs are appended, never inserted: every parameter here is
     // positional-or-keyword, so a mid-signature insert silently rebinds
-    // positional callers (pinned by
-    // `test_obsm_loading.py::test_to_anndata_positional_preserve_slots_still_binds`).
+    // positional callers. Only partly pinned by a test —
+    // `test_obsm_loading.py::test_to_anndata_positional_preserve_slots_still_binds`
+    // binds the first six positionally, so it catches an insert before
+    // `preserve_slots` and nothing after it. The stub-order check in
+    // `test_experiment_stub_coverage.py` does not help here either: it compares
+    // the stub against the runtime, and an insert made in both moves them
+    // together. Appending is the discipline, not something a test enforces.
     #[pyo3(signature = (backed=false, cache_shards=4, var_names=None, obs_filter=None, layers=None, preserve_slots=false, modality=None, eager=false, memory_budget=None, obsm=None, preserve_var_order=false, strict_var_names=true, container="csr", data_dtype=None, index_dtype=None, allow_lossy=false, obsp=None, varp=None, varm=None, raw=true))]
     #[allow(clippy::too_many_arguments)]
     fn to_anndata<'py>(
