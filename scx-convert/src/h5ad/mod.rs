@@ -16,13 +16,13 @@
 // | `categorical`   | Arrow dictionary -> h5ad categorical, shared by both     |
 // | `uns`           | `/uns`: JSON -> HDF5                                     |
 //
-// On the ingest side `strings` owns the one traversal every **1-D** HDF5
-// string *dataset* goes through: four flavours, one const-generic width ladder,
-// one HDF5 read, and a sink that decides the output shape. Two readers had
-// already hand-rolled that ladder and lost the fixed-width half of it. Rank-0
-// (scalar) reads, `uns`'s fixed-width 1-D arrays and attribute reads are NOT
-// on it -- that module's docs list them, including the same fixed-width drift
-// still present on the scalar path.
+// On the ingest side `strings` is the one decoder for 1-D HDF5 string
+// *datasets*: every flavour, one const-generic width ladder, one HDF5 read, and
+// a sink that decides the output shape. Two readers had already hand-rolled
+// that ladder and lost the fixed-width half of it. Not every string read routes
+// through it -- rank-0 (scalar) reads, `uns`'s fixed-width 1-D arm and
+// attribute reads decode themselves; that module's docs list all three,
+// including the same fixed-width drift still live on the scalar path.
 
 pub(crate) mod categorical;
 pub(crate) mod column_stream;

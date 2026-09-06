@@ -146,29 +146,23 @@ fn legacy_masked_varlen(ds: &hdf5::Dataset, mask: &[bool]) -> StringArray {
     )
 }
 
-/// How much slack a "was this buffer pre-sized?" assertion must allow.
-///
-/// `MutableBuffer::with_capacity` rounds up to 64-byte alignment, and
-/// `Buffer::capacity()` reports the allocation, not the request — neither is a
-/// promised Arrow contract. So these assertions bound the capacity rather than
-/// equating it: exact equality holds on arrow 58 today but would break on an
-/// allocator or `finish()` change with no production defect. **If Arrow's
-/// rounding changes, widen this constant — do not delete the assertion**: it is
-/// the only observable trace that the value buffer was allocated once instead
-/// of grown by doubling, and it is what the two route pins rest on.
-const CAPACITY_SLACK: usize = 64;
-
 /// The value buffer holds exactly the payload (a real Arrow contract) and was
-/// allocated once rather than grown (bounded, see [`CAPACITY_SLACK`]).
+/// allocated once rather than grown.
+///
+/// The "not grown" half has no Arrow contract to lean on — `Buffer::capacity()`
+/// reports the allocation, not the request, and `MutableBuffer::with_capacity`
+/// rounds to 64-byte alignment. So it is asserted **relatively**: this array's
+/// capacity is compared against a buffer built here, from the same payload,
+/// under the same Arrow version, with no reservation at all. No hard-coded
+/// rounding allowance to go stale.
 ///
 /// **Carries its own premise check**, and that is not decoration. When this
-/// assertion was first loosened from an exact equality to a bounded one, both
-/// route pins silently stopped discriminating: their fixtures were small
-/// enough (39 B and ~50 B of payload) that a buffer grown by doubling landed
-/// at 64 B, *inside* the slack. The tests still passed with the call sites
-/// routed back to the old construction. So the helper now builds a
-/// deliberately grown buffer over the same payload and refuses to run unless
-/// that one actually violates the bound.
+/// assertion was first loosened from an exact equality to a fixed +64 B slack,
+/// both route pins silently stopped discriminating: their fixtures were small
+/// enough (39 B and ~50 B of payload) that a grown buffer landed at 64 B,
+/// *inside* the slack, and the tests passed with the call sites routed back to
+/// the old construction. The premise below refuses to run unless the grown
+/// comparator really does overshoot.
 ///
 /// For null-free arrays only — it reconstructs the payload via `value(i)`.
 fn assert_value_buffer_was_pre_sized(got: &StringArray, payload: usize, what: &str) {
@@ -178,25 +172,28 @@ fn assert_value_buffer_was_pre_sized(got: &StringArray, payload: usize, what: &s
         "{what}: value buffer length must equal the payload"
     );
 
+    // The comparator: the same payload, appended with no reservation, so it
+    // grows by doubling exactly as the construction this change replaced did.
     let mut grown = arrow::array::GenericStringBuilder::<i32>::with_capacity(got.len(), 0);
     for i in 0..got.len() {
         grown.append_value(got.value(i));
     }
     let grown_capacity = grown.finish().to_data().buffers()[1].capacity();
     assert!(
-        grown_capacity > payload + CAPACITY_SLACK,
+        grown_capacity > payload,
         "{what}: PREMISE FAILED — a buffer grown from zero over this payload \
-         reaches only {grown_capacity} against payload {payload} \
-         (+{CAPACITY_SLACK} slack), so the assertion below cannot tell a \
-         pre-sized buffer from a grown one. Enlarge the fixture."
+         reaches only {grown_capacity} against payload {payload}, so the \
+         assertion below cannot tell a pre-sized buffer from a grown one. \
+         Enlarge the fixture."
     );
 
     let capacity = got.to_data().buffers()[1].capacity();
     assert!(
-        capacity >= payload && capacity <= payload + CAPACITY_SLACK,
+        capacity >= payload && capacity < grown_capacity,
         "{what}: value buffer capacity {capacity} is not one allocation of \
-         payload {payload} (+{CAPACITY_SLACK} slack) — it was grown, so this \
-         array did not come through the pre-sized builder"
+         payload {payload} — a grown buffer over the same payload reaches \
+         {grown_capacity}, so this array did not come through the pre-sized \
+         builder"
     );
 }
 
@@ -320,15 +317,13 @@ fn the_utf8_value_buffer_is_allocated_once_not_grown() {
     let got = read_string_array(&ds).unwrap();
     assert_value_buffer_was_pre_sized(&got, payload, "pre-sized value buffer");
 
-    // Premise: the construction being replaced really does overshoot the
-    // bound, so the assertion above is discriminating rather than trivially
-    // true.
+    // And specifically against the construction being replaced, not just
+    // against a synthetic grown comparator.
     let legacy_capacity = legacy_plain_varlen(&ds).to_data().buffers()[1].capacity();
     assert!(
-        legacy_capacity > payload + CAPACITY_SLACK,
+        legacy_capacity > payload,
         "premise failed: the `Vec<&str>` construction no longer overshoots \
-         ({legacy_capacity} vs {payload}+{CAPACITY_SLACK}), so this test \
-         proves nothing"
+         ({legacy_capacity} vs {payload}), so this test proves nothing"
     );
 }
 

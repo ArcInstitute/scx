@@ -15,8 +15,9 @@
 //!    layout depending on which entry point read it.
 //!
 //! What this does **not** fix, measured rather than assumed: the >2 GB obs
-//! string column. That panic is on the *read* side (`h5ad/strings.rs`'s
-//! `Utf8Sink`, where `GenericByteBuilder::next_offset` fails its
+//! string column. That panic is on the *read* side (`h5ad/strings.rs` appends
+//! into a `GenericStringBuilder<i32>`, whose `append_value` ->
+//! `GenericByteBuilder::next_offset` fails its
 //! `expect("byte array offset overflow")` at the same i32 ceiling the
 //! `StringArray::from` it replaced hit), strictly before any of this, and
 //! slicing an already-materialized batch is zero-copy so peak RSS is

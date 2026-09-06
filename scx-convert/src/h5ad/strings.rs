@@ -1,4 +1,9 @@
-//! One traversal for every **1-D** HDF5 string *dataset* on the ingest side.
+//! The one decoder for 1-D HDF5 string *datasets* on the ingest side.
+//!
+//! It covers every flavour and every 1-D shape. It is **not** reached by
+//! every string read on the ingest side, and the claim is about the decoder,
+//! not about coverage: three callers still decode strings themselves, listed
+//! below.
 //!
 //! HDF5 has four string flavours and producers pick freely: h5py/anndata emit
 //! variable-length UTF-8, while PyTables `create_carray` (CellRanger and
@@ -17,10 +22,10 @@
 //! consumer through one traversal is what makes that class of drift
 //! unrepresentable *on this shape*.
 //!
-//! # What is NOT on this traversal
+//! # Callers that do NOT route through it
 //!
-//! Only 1-D dataset reads are. Three ingest paths still read strings directly
-//! and are unchanged by this module:
+//! Three ingest paths still decode strings themselves and are unchanged by
+//! this module:
 //!
 //! * **rank-0 (scalar) dataset reads** — `read.rs`'s `uns` scalar arm and
 //!   `cellbender.rs`'s metadata scalars both do `read_scalar::<VarLenUnicode>()`.
@@ -29,9 +34,13 @@
 //!   lives there** — `uns`'s `FixedUnicode(_) | FixedAscii(_)` scalar arm reads
 //!   the body as `VarLenUnicode`, exactly as the two dataset readers did before
 //!   this change. A scalar companion to this dispatcher would close it.
-//! * **1-D `uns` string arrays**, which route their var-length arm through
-//!   [`read_string_dataset`] but have no fixed-width arm at all, so a
-//!   fixed-width `uns` array is still rejected rather than read.
+//! * **1-D `uns` string arrays** — a 1-D shape this decoder handles, but the
+//!   `uns` reader only *calls* it on its var-length arm. It has no fixed-width
+//!   arm at all, so a fixed-width `uns` array is still rejected with
+//!   "unsupported uns array type" rather than read. Adding that arm is a
+//!   one-line call away and would widen `uns` behaviour, which is a separate
+//!   decision from this change (`uns` has its own `strict_uns` policy and
+//!   warning channel); it is deliberately not taken here.
 //! * **attribute** reads — `encoding-type`, `column-order`, the legacy
 //!   `categories` attribute form. Attributes are not datasets and anndata only
 //!   ever writes var-length there.
@@ -211,12 +220,19 @@ where
 /// belongs in its tests: a `FixedUnicode(24)` column holding eight three-byte
 /// characters is a 24-byte dataset, not an 8-byte one.
 ///
+/// The rungs are baked in rather than passed: both call sites want the same
+/// ladder, and a variadic that is only ever given one sequence is a parameter
+/// with no decision behind it.
+///
 /// Expanded only inside [`read_string_dataset_as`], and it reads that
 /// function's `S` and `ConvertError` from the expansion site rather than
 /// taking them as macro arguments — which is why it is defined here and not
 /// exported.
 macro_rules! fixed_width_ladder {
-    ($ds:expr, $config:expr, $ty:ident, $size:expr, $($cap:literal),+) => {{
+    ($ds:expr, $config:expr, $ty:ident, $size:expr) => {
+        fixed_width_ladder!(@rungs $ds, $config, $ty, $size, 16, 32, 64, 128, 256, 1024, 4096)
+    };
+    (@rungs $ds:expr, $config:expr, $ty:ident, $size:expr, $($cap:literal),+) => {{
         let size = $size;
         let mut out: Option<Result<S, ConvertError>> = None;
         $(
@@ -249,22 +265,10 @@ fn read_string_dataset_as<S: StringSink>(
             read_and_drain::<hdf5::types::VarLenUnicode, S>(ds, config)
         }
         TypeDescriptor::FixedAscii(size) => {
-            fixed_width_ladder!(ds, config, FixedAscii, *size, 16, 32, 64, 128, 256, 1024, 4096)
+            fixed_width_ladder!(ds, config, FixedAscii, *size)
         }
         TypeDescriptor::FixedUnicode(size) => {
-            fixed_width_ladder!(
-                ds,
-                config,
-                FixedUnicode,
-                *size,
-                16,
-                32,
-                64,
-                128,
-                256,
-                1024,
-                4096
-            )
+            fixed_width_ladder!(ds, config, FixedUnicode, *size)
         }
         other => Err(ConvertError::UnsupportedDtype(format!(
             "dataset '{}' is not a string dataset: {other:?}",
