@@ -206,6 +206,28 @@ def test_partial_filter_values_match_the_unfiltered_read(multi_key_path):
     )
 
 
+def test_partial_filter_under_preserve_slots_narrows_the_sliced_result(
+    multi_key_path,
+):
+    """`preserve_slots=True` takes its own branch: eager assembly, then a
+    pandas-mask slice. Unknown keys were covered there; that the filter actually
+    narrows the surviving slots was not."""
+    import pyscx
+
+    adata = pyscx.open(multi_key_path).to_anndata(
+        obs_filter="group == 'a'",
+        preserve_slots=True,
+        varm=["PCs"],
+        obsp=[],
+    )
+
+    assert set(adata.varm) == {"PCs"}
+    assert len(adata.obsp) == 0
+    assert set(adata.varp) == {"corr", "cov"}
+    # The row filter still applied, so this is not passing by returning nothing.
+    assert adata.n_obs == N_OBS // 2
+
+
 def test_partial_filter_under_backed(multi_key_path):
     import pyscx
 
@@ -238,6 +260,79 @@ def test_unknown_key_raises_under_backed_too(multi_key_path, slot):
 
     with pytest.raises(KeyError):
         pyscx.open(multi_key_path).to_anndata(backed=True, **{slot: ["not_a_key"]})
+
+
+@pytest.mark.parametrize("slot", ["obsm", "layers"])
+def test_unknown_key_raises_for_the_older_slot_kwargs_too(multi_key_path, slot):
+    """`obsm=` documented `KeyError` but only enforced it inside the eager
+    assembler; `layers=` never enforced one at all and silently returned an
+    empty slot. Both matter now that the query path's "does not load {slots}"
+    warning is decided by the same filter: `slot_has_selected` cannot tell "the
+    caller excluded this slot" from "the caller misspelled a key", so an
+    unvalidated typo produced neither an error nor a warning naming the slot."""
+    import pyscx
+
+    with pytest.raises(KeyError) as exc:
+        pyscx.open(multi_key_path).to_anndata(**{slot: ["not_a_key"]})
+
+    assert "not_a_key" in str(exc.value)
+
+
+@pytest.mark.parametrize("slot", ["obsm", "layers"])
+def test_older_slot_kwargs_are_validated_on_the_query_path(multi_key_path, slot):
+    import pyscx
+
+    with pytest.raises(KeyError):
+        pyscx.open(multi_key_path).to_anndata(
+            obs_filter="group == 'a'", **{slot: ["not_a_key"]}
+        )
+
+
+@pytest.mark.parametrize("slot", ["obsm", "layers"])
+def test_older_slot_kwargs_are_validated_under_backed(multi_key_path, slot):
+    import pyscx
+
+    with pytest.raises(KeyError):
+        pyscx.open(multi_key_path).to_anndata(backed=True, **{slot: ["not_a_key"]})
+
+
+def test_a_typo_never_masquerades_as_an_excluded_slot(tmp_dir):
+    """The regression this guards, on the file shape that exposes it.
+
+    On a file whose *only* aligned slot is obsm, a typo made `slot_has_selected`
+    false, which removed obsm from the query path's drop warning — so the call
+    returned with no `KeyError` and no warning at all. The single-slot fixture
+    is load-bearing: on a file with five slots the other four keep the warning
+    alive and the omission hides."""
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.RandomState(3)
+    x = rng.random_sample((N_OBS, N_VARS)).astype(np.float32)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(x),
+        obs=pd.DataFrame(
+            {"group": ["a" if i % 2 else "b" for i in range(N_OBS)]},
+            index=[f"cell_{i}" for i in range(N_OBS)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{j}" for j in range(N_VARS)]),
+        obsm={"X_pca": rng.random_sample((N_OBS, 3)).astype(np.float32)},
+    )
+    path = str(tmp_dir / "obsm_only.scx")
+    pyscx.from_anndata(adata, path)
+
+    # A correct key still warns that the query path drops obsm.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        pyscx.open(path).to_anndata(obs_filter="group == 'a'", obsm=["X_pca"])
+    assert [w for w in rec if "does not load" in str(w.message)]
+
+    # A typo raises rather than returning in silence.
+    with pytest.raises(KeyError):
+        pyscx.open(path).to_anndata(obs_filter="group == 'a'", obsm=["X_pca_typo"])
 
 
 @pytest.mark.parametrize("slot", ["obsp", "varp", "varm"])

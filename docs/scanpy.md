@@ -786,8 +786,30 @@ exp.to_anndata(
                           # When the estimated eager assembly footprint exceeds this
                           # budget, a UserWarning is emitted recommending backed mode.
                           # Advisory only — assembly still proceeds.
+    preserve_slots=False, # With obs_filter in non-backed mode: materialise the aligned
+                          # slots after filtering (pandas.eval grammar) instead of taking
+                          # the query-engine path, which drops them.
+    modality=None,        # One modality of a multimodal file (requires backed=True).
+                          # Rejects every selection kwarg rather than ignoring it.
+    obsp=None,            # None = all obsp keys; a list = that subset; [] = none.
+    varp=None,            # Same contract as obsp.
+    varm=None,            # Same contract as obsp. An empty / fully-excluding list builds
+                          # no lazy bridge at all, which is what actually bounds the cost:
+                          # anndata validates every entry of a slot on the first
+                          # `adata.obsp` access, so one touch decodes the whole slot.
+    raw=True,             # True: reconstruct adata.raw where the mode allows, and emit
+                          # the dropped_raw notice where it cannot. False: neither.
+    preserve_var_order=False,  # Return genes in var_names order rather than sorted.
+    strict_var_names=True,     # KeyError on a var_name absent from var (False drops it).
+    container="csr",      # "csr" (default) or "dense" -- read-side materialisation.
+    data_dtype=None,      # Narrow X / raw in-decode (e.g. "uint16"); None = float32.
+    index_dtype=None,     # Index width (e.g. "int64"); None = int32.
+    allow_lossy=False,    # Permit a narrowing cast that cannot round-trip.
 )
 ```
+
+An unknown key in any of `layers` / `obsm` / `obsp` / `varp` / `varm` raises
+`KeyError` naming the slot and listing what the file has, on every path.
 
 ### Default behavior (no extra params)
 

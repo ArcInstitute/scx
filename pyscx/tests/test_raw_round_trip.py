@@ -717,3 +717,41 @@ def test_raw_false_is_harmless_on_a_file_without_raw(tmp_dir):
 
     assert pyscx.open(scx_path).to_anndata(raw=False).raw is None
     assert pyscx.open(scx_path).to_anndata(backed=True, raw=False).raw is None
+
+
+def test_raw_false_on_a_deletion_vector_file(tmp_dir):
+    """The third `DroppedRaw` site.
+
+    Backed mode and the obs-filtered query are covered above; the
+    deletion-vectors-active branch is a separate `if` inside the eager
+    assembler, and nothing would have failed if only that conjunction were
+    reverted. Both halves are asserted, so the test cannot pass by raw being
+    broken everywhere.
+    """
+    import warnings
+
+    import pyscx
+
+    src, _ = _adata_with_raw(20, 12, 30)
+    h5ad_in = str(tmp_dir / "in.h5ad")
+    src.write_h5ad(h5ad_in)
+    scx_path = str(tmp_dir / "raw_dv.scx")
+    pyscx.from_h5ad(h5ad_in, scx_path)
+
+    mask = np.zeros(20, dtype=bool)
+    mask[:5] = True
+    assert pyscx.open(scx_path).mark_deleted(mask) == 5
+
+    # raw=True: the DV branch still warns and drops.
+    with pytest.warns(UserWarning, match="dropped_raw"):
+        kept = pyscx.open(scx_path).to_anndata()
+    assert kept.raw is None
+    assert kept.n_obs == 15
+
+    # raw=False: neither.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        out = pyscx.open(scx_path).to_anndata(raw=False)
+    assert out.raw is None
+    assert out.n_obs == 15
+    assert _dropped_raw_warnings(rec) == []

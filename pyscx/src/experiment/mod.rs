@@ -1027,9 +1027,12 @@ impl PyExperiment {
     ///     modality: Select a single modality of a multimodal file
     ///                     and return a backed AnnData scoped to that modality
     ///                     (per-modality X, var, and obsm; the global obs is
-    ///                     shared). Currently requires `backed=True`. The
-    ///                     filter kwargs (`var_names`, `obs_filter`, `layers`)
-    ///                     are not supported in this mode — use
+    ///                     shared). Currently requires `backed=True`. No
+    ///                     selection kwarg is supported in this mode —
+    ///                     `var_names`, `obs_filter`, `layers`, `obsm`, `obsp`,
+    ///                     `varp`, `varm` and `raw=False` are all **rejected**
+    ///                     rather than ignored, because the per-modality
+    ///                     builder accepts none of them. Use
     ///                     `scx subset --modality NAME --filter ...` to
     ///                     materialise a filtered single-modality file first.
     ///     eager: When False (default), `obsp`, `varp`, `varm`, and (in the
@@ -1130,7 +1133,8 @@ impl PyExperiment {
     /// for the >VRAM regime.
     ///
     /// Accepts the same shaping options as `to_anndata` (`var_names`,
-    /// `obs_filter`, `layers`, `obsm`, `preserve_var_order`, `strict_var_names`);
+    /// `obs_filter`, `layers`, `obsm`, `obsp`, `varp`, `varm`, `raw`,
+    /// `preserve_var_order`, `strict_var_names`);
     /// obs/var/obsm/uns/layers are host-resident and `X` is the GPU-resident
     /// matrix. Requires cuPy.
     ///

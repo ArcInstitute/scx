@@ -499,6 +499,19 @@ pub fn to_anndata_filtered<'py>(
     // path) never calls it, so validating downstream would let a typo through
     // on exactly the path that already discards those slots. Catalog-only
     // listings — no shard bytes, so the lazy bridges' deferral is intact.
+    //
+    // All FIVE slots, not just the three new ones. The query branch decides its
+    // "does not load {slots}" warning with `slot_has_selected`, which cannot
+    // tell "the caller excluded this slot" from "the caller misspelled a key" —
+    // both select nothing. So an unvalidated slot with a typo would produce no
+    // `KeyError` *and* no warning naming it: on a file whose only aligned slot
+    // is that one, `to_anndata(obs_filter=…, obsm=["typo"])` returned in silence.
+    // `obsm=` already documents `KeyError`; the check simply lived in
+    // `to_anndata_with_layers`, which this branch never reaches. `layers=` had
+    // no such contract at all and silently yielded an empty slot on any path —
+    // it gets one here, so every slot filter fails the same way.
+    validate_slot_keys(&reader.layer_names(), layer_filter, "layer")?;
+    validate_obsm_keys(reader, obsm_filter)?;
     validate_slot_keys(&reader.list_obsp(), filters.obsp, "obsp")?;
     validate_slot_keys(&reader.list_varp(), filters.varp, "varp")?;
     validate_slot_keys(&reader.list_varm(), filters.varm, "varm")?;
@@ -904,6 +917,21 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // fork-safety contract.
     let shared_catalog = reader.catalog_arc();
 
+    // --- Validate the slot filters FIRST ---
+    //
+    // Before obs / var are read, before the backed X and CSC readers open, and
+    // before `build_eager_obsm_dict` decodes every obsm entry. A typo is a
+    // bad request, and answering it should not first cost a full obsm decode on
+    // an atlas-scale file. All five listings are catalog-only scans.
+    let obsp_names = reader.list_obsp();
+    let varp_names = reader.list_varp();
+    let varm_names = reader.list_varm();
+    validate_slot_keys(&reader.layer_names(), layer_filter, "layer")?;
+    validate_obsm_keys(&reader, obsm_filter)?;
+    validate_slot_keys(&obsp_names, filters.obsp, "obsp")?;
+    validate_slot_keys(&varp_names, filters.varp, "varp")?;
+    validate_slot_keys(&varm_names, filters.varm, "varm")?;
+
     // --- Compute kept_to_global from deletion vectors (if present) ---
     // Cache the deletion-vector-only mapping; obs_filter may mutate kept_to_global
     // further, but obsm filtering needs the original DV-only version.
@@ -1115,14 +1143,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // `eager=true/false` and AnnData's private `_obsp` / `_varp` /
     // `_varm` storage.
     // Filter-aware, exactly as on the eager path: an empty list builds no
-    // bridge, and an unknown key raises before anything is constructed. This
-    // is the backed entry point, so it validates for itself.
-    let obsp_names = reader.list_obsp();
-    let varp_names = reader.list_varp();
-    let varm_names = reader.list_varm();
-    validate_slot_keys(&obsp_names, filters.obsp, "obsp")?;
-    validate_slot_keys(&varp_names, filters.varp, "varp")?;
-    validate_slot_keys(&varm_names, filters.varm, "varm")?;
+    // bridge. Keys were validated at the top of this function, before any
+    // payload read.
     let has_obsp = slot_has_selected(&obsp_names, filters.obsp);
     let has_varp = slot_has_selected(&varp_names, filters.varp);
     let has_varm = slot_has_selected(&varm_names, filters.varm);
