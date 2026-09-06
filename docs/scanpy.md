@@ -767,44 +767,47 @@ where decode correctness matters.
 
 ```python
 exp.to_anndata(
+    # Declaration order, matching `#[pyo3(signature = ...)]` and `__init__.pyi`.
+    # Every parameter is positional-or-keyword, so this order is the calling
+    # contract, not presentation -- `test_experiment_stub_coverage.py` pins it.
     backed=False,         # True for lazy loading (X stays on disk)
     cache_shards=4,       # LRU cache size for backed mode
     var_names=None,       # List of gene names to project (column subset)
     obs_filter=None,      # Predicate string to filter cells (e.g. "cell_type == 'T cell'")
     layers=None,          # None = load all layers; pass a list to select specific layers
                           # (e.g. ["raw_counts"]), or [] to skip loading layers entirely
-    obsm=None,            # None = load all obsm keys (default); pass a list to load only
-                          # those embeddings (e.g. ["X_pca"]), or [] to skip obsm. Selecting
-                          # keys also switches obsm to a lazy / backed row-gather bridge
-                          # (see "Selective + lazy obsm" below).
+    preserve_slots=False, # With obs_filter in non-backed mode: materialise the aligned
+                          # slots after filtering (pandas.eval grammar) instead of taking
+                          # the query-engine path, which drops them
+    modality=None,        # One modality of a multimodal file (requires backed=True).
+                          # Rejects every selection kwarg rather than ignoring it
     eager=False,          # False (default): obsp/varp/varm and non-backed layers are
                           # wrapped in lazy bridges that decode each entry on first
                           # access. True: materialise everything up front so the
-                          # AnnData is fully detached from the SCX file handle.
+                          # AnnData is fully detached from the SCX file handle
     memory_budget=None,   # None (default: 8 GiB), int (bytes), or a binary-prefixed
                           # size str: K/M/G/T or KiB/MiB/GiB/TiB ("4G" / "512MiB"); decimal KB/MB rejected.
                           # When the estimated eager assembly footprint exceeds this
                           # budget, a UserWarning is emitted recommending backed mode.
-                          # Advisory only — assembly still proceeds.
-    preserve_slots=False, # With obs_filter in non-backed mode: materialise the aligned
-                          # slots after filtering (pandas.eval grammar) instead of taking
-                          # the query-engine path, which drops them.
-    modality=None,        # One modality of a multimodal file (requires backed=True).
-                          # Rejects every selection kwarg rather than ignoring it.
-    obsp=None,            # None = all obsp keys; a list = that subset; [] = none.
-    varp=None,            # Same contract as obsp.
+                          # Advisory only -- assembly still proceeds
+    obsm=None,            # None = load all obsm keys (default); pass a list to load only
+                          # those embeddings (e.g. ["X_pca"]), or [] to skip obsm. Selecting
+                          # keys also switches obsm to a lazy / backed row-gather bridge
+                          # (see "Selective + lazy obsm" below)
+    preserve_var_order=False,  # Return genes in var_names order rather than sorted
+    strict_var_names=True,     # KeyError on a var_name absent from var (False drops it)
+    container="csr",      # "csr" (default) or "dense" -- read-side materialisation
+    data_dtype=None,      # Narrow X / raw in-decode (e.g. "uint16"); None = float32
+    index_dtype=None,     # Index width (e.g. "int64"); None = int32
+    allow_lossy=False,    # Permit a narrowing cast that cannot round-trip
+    obsp=None,            # None = all obsp keys; a list = that subset; [] = none
+    varp=None,            # Same contract as obsp
     varm=None,            # Same contract as obsp. An empty / fully-excluding list builds
                           # no lazy bridge at all, which is what actually bounds the cost:
                           # anndata validates every entry of a slot on the first
-                          # `adata.obsp` access, so one touch decodes the whole slot.
+                          # `adata.obsp` access, so one touch decodes the whole slot
     raw=True,             # True: reconstruct adata.raw where the mode allows, and emit
-                          # the dropped_raw notice where it cannot. False: neither.
-    preserve_var_order=False,  # Return genes in var_names order rather than sorted.
-    strict_var_names=True,     # KeyError on a var_name absent from var (False drops it).
-    container="csr",      # "csr" (default) or "dense" -- read-side materialisation.
-    data_dtype=None,      # Narrow X / raw in-decode (e.g. "uint16"); None = float32.
-    index_dtype=None,     # Index width (e.g. "int64"); None = int32.
-    allow_lossy=False,    # Permit a narrowing cast that cannot round-trip.
+                          # the dropped_raw notice where it cannot. False: neither
 )
 ```
 

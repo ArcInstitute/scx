@@ -21,6 +21,7 @@ The `[]`-means-no-bridge choice is why the laziness assertions below run on a
 bridge narrowed **and** stayed unmaterialised, which an empty bridge could not.
 """
 
+import pathlib
 import warnings
 
 import numpy as np
@@ -357,6 +358,72 @@ def test_unknown_key_raises_under_preserve_slots_too(multi_key_path, slot):
         pyscx.open(multi_key_path).to_anndata(
             obs_filter="group == 'a'", preserve_slots=True, **{slot: ["not_a_key"]}
         )
+
+
+@pytest.mark.parametrize(
+    "slot, kwarg",
+    [("layers", "layers"), ("obsm", "obsm"), ("obsp", "obsp"), ("varp", "varp"), ("varm", "varm")],
+)
+def test_the_error_names_the_kwarg_the_caller_passed(multi_key_path, slot, kwarg):
+    """`docs/scanpy.md` promises the message names the slot, so the label has to
+    be the kwarg the caller typed. `layers=` briefly said `layer key ... not
+    found`, which sends the reader looking for a kwarg that does not exist."""
+    import pyscx
+
+    with pytest.raises(KeyError) as exc:
+        pyscx.open(multi_key_path).to_anndata(**{kwarg: ["not_a_key"]})
+
+    assert f"{slot} key" in str(exc.value)
+    assert f"available {slot} keys" in str(exc.value)
+
+
+def test_a_bad_key_is_rejected_before_any_payload_is_read(tmp_dir):
+    """Validation must precede the reads, not merely precede the return.
+
+    The backed builder used to validate only after reading obs and var, opening
+    the X and CSC readers, and decoding every obsm entry — so answering "that key
+    does not exist" first cost a full obsm decode on an atlas-scale file. Moving
+    the check is invisible to a test that only asserts `KeyError` eventually
+    arrives, so this one makes the payload unreadable: if any of it were touched
+    before the check, the call would fail with a decode error instead.
+    """
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.default_rng(0)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(rng.poisson(2.0, (N_OBS, N_VARS)).astype(np.float32)),
+        obs=pd.DataFrame(index=[f"cell_{i}" for i in range(N_OBS)]),
+        var=pd.DataFrame(index=[f"gene_{j}" for j in range(N_VARS)]),
+        obsm={"X_pca": rng.random((N_OBS, 6)).astype(np.float32)},
+        obsp={
+            "conn": sp.csr_matrix(rng.random((N_OBS, N_OBS)).astype(np.float32))
+        },
+    )
+    path = str(tmp_dir / "corrupt.scx")
+    pyscx.from_anndata(adata, path)
+
+    # Garble the section region, leaving the header, root catalog and the
+    # catalog at EOF intact so the file still opens and lists its keys.
+    blob = bytearray(pathlib.Path(path).read_bytes())
+    lo, hi = 4352, len(blob) - 4096
+    assert hi > lo, "fixture too small to corrupt a section region"
+    for i in range(lo, min(lo + 4096, hi)):
+        blob[i] ^= 0xFF
+    pathlib.Path(path).write_bytes(bytes(blob))
+
+    # Control: without a filter the payload really is unreadable, so the
+    # assertion below cannot pass by the corruption having missed.
+    with pytest.raises(Exception) as ctrl:
+        pyscx.open(path, verify=False).to_anndata(backed=True)
+    assert not isinstance(ctrl.value, KeyError)
+
+    # An unknown key is answered from the catalog, before any of that is touched.
+    with pytest.raises(KeyError):
+        pyscx.open(path, verify=False).to_anndata(backed=True, obsp=["missing"])
 
 
 # --------------------------------------------------------------------------

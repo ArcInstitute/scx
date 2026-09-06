@@ -246,11 +246,8 @@ pub(crate) fn to_anndata_with_layers<'py>(
     let lazy_obsm_requested = !eager && obsm_filter.is_some();
     let obsm_dict = pyo3::types::PyDict::new(py);
     if lazy_obsm_requested {
-        // Lazy path: validate the requested keys exist now via a
-        // catalog-only scan (no shard bytes read — preserves the
-        // deferral guarantee), then let the bridge read each on first
-        // access.
-        validate_obsm_keys(reader, obsm_filter)?;
+        // Keys were validated by `to_anndata_filtered` before it chose a
+        // branch; the bridge just reads each on first access.
     } else {
         let obsm_map = read_obsm_selected(reader, obsm_filter)?;
         for (name, batch) in &obsm_map {
@@ -510,8 +507,8 @@ pub fn to_anndata_filtered<'py>(
     // `to_anndata_with_layers`, which this branch never reaches. `layers=` had
     // no such contract at all and silently yielded an empty slot on any path —
     // it gets one here, so every slot filter fails the same way.
-    validate_slot_keys(&reader.layer_names(), layer_filter, "layer")?;
-    validate_obsm_keys(reader, obsm_filter)?;
+    validate_slot_keys(&reader.layer_names(), layer_filter, "layers")?;
+    validate_slot_keys(&reader.list_obsm(), obsm_filter, "obsm")?;
     validate_slot_keys(&reader.list_obsp(), filters.obsp, "obsp")?;
     validate_slot_keys(&reader.list_varp(), filters.varp, "varp")?;
     validate_slot_keys(&reader.list_varm(), filters.varm, "varm")?;
@@ -926,8 +923,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     let obsp_names = reader.list_obsp();
     let varp_names = reader.list_varp();
     let varm_names = reader.list_varm();
-    validate_slot_keys(&reader.layer_names(), layer_filter, "layer")?;
-    validate_obsm_keys(&reader, obsm_filter)?;
+    validate_slot_keys(&reader.layer_names(), layer_filter, "layers")?;
+    validate_slot_keys(&reader.list_obsm(), obsm_filter, "obsm")?;
     validate_slot_keys(&obsp_names, filters.obsp, "obsp")?;
     validate_slot_keys(&varp_names, filters.varp, "varp")?;
     validate_slot_keys(&varm_names, filters.varm, "varm")?;
@@ -1095,7 +1092,6 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     // need to validate them (the bridge reads each lazily).
     let obsm_dict = pyo3::types::PyDict::new(py);
     if use_backed_obsm {
-        validate_obsm_keys(&reader, obsm_filter)?;
     } else {
         build_eager_obsm_dict(
             py,

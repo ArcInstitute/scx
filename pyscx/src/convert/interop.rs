@@ -898,7 +898,7 @@ pub(crate) fn read_obsm_selected(
             Err(e) => Err(to_pyerr(e)),
         },
         Some(keys) => {
-            validate_obsm_keys(reader, filter)?;
+            validate_slot_keys(&reader.list_obsm(), filter, "obsm")?;
             let mut map = std::collections::HashMap::with_capacity(keys.len());
             for key in keys {
                 let batch = reader.read_obsm(key).map_err(to_pyerr)?;
@@ -942,11 +942,6 @@ pub(crate) fn slot_has_selected(available: &[String], filter: Option<&[String]>)
         None => !available.is_empty(),
         Some(keys) => available.iter().any(|a| keys.iter().any(|k| k == a)),
     }
-}
-
-/// [`validate_slot_keys`] against the file's obsm catalog.
-pub(crate) fn validate_obsm_keys(reader: &ScxReader, filter: Option<&[String]>) -> PyResult<()> {
-    validate_slot_keys(&reader.list_obsm(), filter, "obsm")
 }
 
 /// Populate `obsm_dict` with eager dense numpy arrays for the selected

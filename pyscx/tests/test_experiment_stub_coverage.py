@@ -17,10 +17,13 @@ Two checks, for two different silent failures:
 * **stub vs runtime** — names *and order*. Order matters because every
   parameter here is positional-or-keyword (there is no `*` separator on either
   side), so a kwarg inserted mid-signature rebinds every positional call.
-* **docs vs runtime** — a name-presence check over the block that carries the
-  signature. Deliberately not a parse: the doc copies are prose- and
-  comment-laden and a strict parser would be brittle, while "every parameter is
-  mentioned" is exactly the property that went stale.
+* **docs vs runtime** — names *and order*, extracted from the block that carries
+  the signature. A presence check was not enough and said so out loud: `raw`
+  counted as present because the word appears inside `dropped_raw` in a
+  neighbouring comment, so the block could lose the real `raw=True` line and
+  stay green. Comments are stripped and only `name=` tokens are read, which also
+  lets the check catch a block that lists every parameter in the wrong order —
+  the failure that matters here, since these are positional-or-keyword.
 """
 
 from __future__ import annotations
@@ -60,6 +63,19 @@ def _repo_root() -> pathlib.Path:
     raise AssertionError("could not locate the repo root from the test file")
 
 
+def _doc_params(signature: str) -> list[str]:
+    """`name=` tokens from a doc signature block, in order.
+
+    Comments go first: `# None = load all layers` would otherwise contribute a
+    `None` parameter, and `# ... dropped_raw ...` would satisfy a bare search
+    for `raw`. Handles both shapes the docs use — a one-line markdown bullet and
+    a multi-line fenced call — since a name is preceded either by the start of a
+    line or by a comma.
+    """
+    stripped = re.sub(r"#.*", "", signature)
+    return re.findall(r"(?:^|,)\s*([A-Za-z_]\w*)\s*=", stripped, re.MULTILINE)
+
+
 def _runtime_params(method_name: str) -> list[str]:
     """Parameter names, in order, from the pyo3 `__text_signature__`."""
     import pyscx
@@ -90,9 +106,14 @@ def test_doc_signature_copies_name_every_kwarg(doc_path, method_name, pattern):
     assert match, f"{doc_path} carries no `{method_name}(...)` signature block"
     signature = match.group(1)
 
-    missing = [p for p in _runtime_params(method_name) if p not in signature]
-    assert not missing, (
-        f"{doc_path}'s `{method_name}(...)` signature omits {missing}. "
-        "It is a hand-maintained copy of the pyo3 signature; update it in the "
-        "same commit as the Rust change."
+    documented = _doc_params(signature)
+    runtime = _runtime_params(method_name)
+
+    assert documented == runtime, (
+        f"{doc_path}'s `{method_name}(...)` signature has drifted from the pyo3 "
+        f"one.\n  doc:     {documented}\n  runtime: {runtime}\n"
+        "It is a hand-maintained copy; update it in the same commit as the Rust "
+        "change. Order counts: every parameter is positional-or-keyword, so a "
+        "block that lists them in a different order documents a different "
+        "calling contract."
     )
