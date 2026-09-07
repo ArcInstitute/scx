@@ -211,6 +211,65 @@ def test_single_chunk_declines_residency(scx_path):
     assert info["resident_csr"] is False
 
 
+def test_a_row_window_stages_only_the_shards_it_keeps(scx_path):
+    """The GPU staging plan honours a row-filtering source's shard plan (X10).
+
+    `RawGpuShardSource::run` built `StagingPlan::all(n_shards)`, so a
+    row-windowed handle decoded and uploaded every shard and `drive_shards`
+    skipped the empty ones only at the far end, after the cost was paid — the
+    same gap the CPU streaming kernels had, in a second place. It now builds
+    the plan with `StagingPlan::for_source`.
+
+    Asserted as a *ratio* rather than an absolute count, so it holds whether or
+    not residency engages: residency drains the source once
+    (`shards_decoded == visited`), streaming drains it once per gene chunk
+    (`n_chunks x visited`). Either way a one-of-six-shard window must cost a
+    sixth.
+    """
+    n_shards = N_OBS // SHARD_SIZE
+    assert n_shards > 1, "premise: a single-shard file cannot show a skip"
+
+    full = pyscx.open(str(scx_path)).to_anndata(backed=True)
+    pyscx.accel.rank_genes_groups(
+        full, "grp", device="gpu", gene_chunk_size=GENE_CHUNK
+    )
+    full_info = full.uns["scx_accel"]["rank_genes_groups"]
+
+    windowed = pyscx.open(str(scx_path)).to_anndata(backed=True)[:SHARD_SIZE]
+    pyscx.accel.rank_genes_groups(
+        windowed, "grp", device="gpu", gene_chunk_size=GENE_CHUNK
+    )
+    win_info = windowed.uns["scx_accel"]["rank_genes_groups"]
+
+    # --- premises ---
+    assert full_info["route"] == "gpu_csr_v3", (
+        f"premise: the fixture must take the CSR staging route, got "
+        f"{full_info['route']!r} — the CSC route prefilters by column range and "
+        "never consults the row plan."
+    )
+    assert win_info["route"] == "gpu_csr_v3", (
+        f"premise: a row-windowed handle must stay on the CSR route, got "
+        f"{win_info['route']!r}"
+    )
+    full_decoded = full_info["shards_decoded"]
+    win_decoded = win_info["shards_decoded"]
+    assert full_decoded is not None and win_decoded is not None, (
+        "premise: the CSR staging route reports `shards_decoded`; without it "
+        "there is nothing to compare"
+    )
+    assert full_decoded >= n_shards, (
+        f"premise: the unwindowed run must stage every shard, got {full_decoded}"
+    )
+
+    # --- the claim ---
+    assert win_decoded == full_decoded // n_shards, (
+        f"a one-of-{n_shards}-shard row window staged {win_decoded} shards "
+        f"against {full_decoded} unwindowed; the projection empties the other "
+        f"{n_shards - 1}, so it should have staged {full_decoded // n_shards}"
+    )
+    assert win_decoded >= 1, "the window keeps rows, so it must stage something"
+
+
 def test_cpu_route_records_no_residency_decision(scx_path):
     """`resident_csr` is `None`, not `False`, where there is no decision to
     make — a CPU route never re-decodes per chunk in the first place."""
