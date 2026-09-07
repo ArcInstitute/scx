@@ -75,11 +75,12 @@ cloud = [
     "scanpy>=1.10",
 ]
 # The accel ops that delegate to scanpy when `adata.X` is an in-memory
-# scipy/dense matrix: `normalize_total`, `log1p`, `calculate_qc_metrics`,
-# `filter_cells`, `filter_genes`, plus `highly_variable_genes` for the flavors
-# scx has no native kernel for (`cell_ranger`, and batched `seurat`). None of
-# these need scanpy on a backed or lazy X, where the scx-native streaming
-# kernels run instead.
+# scipy/dense matrix: `normalize_total`, `log1p`, `filter_cells`,
+# `filter_genes`, plus `highly_variable_genes` for the flavors scx has no native
+# kernel for (`cell_ranger`, and batched `seurat`). None of these need scanpy on
+# a backed or lazy X, where the scx-native streaming kernels run instead.
+# `calculate_qc_metrics` was on this list until it was unified onto one native
+# kernel for every kind of X; it now needs scanpy nowhere.
 scanpy = [
     "scanpy>=1.10",
 ]

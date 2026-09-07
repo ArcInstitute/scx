@@ -34,6 +34,37 @@ use super::hvg::build_shard_source;
 /// `gene_list` / `gene_pool` are gene symbols resolved against `adata.var.index`;
 /// genes absent from `var_names` are dropped with a warning. `gene_pool` defaults
 /// to all genes and is only used by `method="control"`.
+/// Resolve gene symbols to var-index positions, de-duplicated, first-seen order.
+///
+/// Returns `(resolved, missing)`. Duplicate *inputs* collapse to one index (a
+/// repeat would inflate the `1/k` normalization); duplicate *var_names* resolve
+/// to their first occurrence, matching pandas `.loc`.
+///
+/// The error policy is the caller's: `gene_list` and `ctrl_genes` warn on drops
+/// and refuse an empty result, while `gene_pool` warns only when most of it
+/// failed. Sharing the resolution but not the policy is deliberate — an
+/// under-resolved pool still samples, an under-resolved control set silently
+/// answers a different question.
+fn resolve_var_indices(
+    name_to_idx: &HashMap<&str, u32>,
+    names: &[String],
+) -> (Vec<u32>, Vec<String>) {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut resolved: Vec<u32> = Vec::with_capacity(names.len());
+    let mut missing: Vec<String> = Vec::new();
+    for g in names {
+        match name_to_idx.get(g.as_str()) {
+            Some(&idx) => {
+                if seen.insert(idx) {
+                    resolved.push(idx);
+                }
+            }
+            None => missing.push(g.clone()),
+        }
+    }
+    (resolved, missing)
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     adata,
@@ -46,6 +77,8 @@ use super::hvg::build_shard_source;
     method="control",
     layer=None,
     device="auto",
+    *,
+    ctrl_genes=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn score_genes<'py>(
@@ -60,6 +93,7 @@ pub fn score_genes<'py>(
     method: &str,
     layer: Option<&str>,
     device: &str,
+    ctrl_genes: Option<Vec<String>>,
 ) -> PyResult<()> {
     // gene_list is resolved against var_names (presentation order) but the
     // ShardSource gathers in sorted-projection order — a presentation-ordered
@@ -75,6 +109,27 @@ pub fn score_genes<'py>(
     let method_enum = ScoreMethod::parse(method, ctrl_size, n_bins, random_state)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
+    // `ctrl_genes` replaces the control *selection*, so it is meaningful only
+    // for the one method that has controls, and it makes `gene_pool` — which
+    // exists solely to be binned and sampled from — dead. Silently ignoring
+    // either is how a published number ends up computed from something other
+    // than what the call says.
+    if ctrl_genes.is_some() {
+        if !matches!(method_enum, ScoreMethod::Control { .. }) {
+            return Err(PyValueError::new_err(format!(
+                "score_genes: ctrl_genes= is only meaningful for method=\"control\" \
+                 (got method={method:?}); \"mean\" and \"zscore\" use no control set"
+            )));
+        }
+        if gene_pool.is_some() {
+            return Err(PyValueError::new_err(
+                "score_genes: ctrl_genes= and gene_pool= are mutually exclusive — \
+                 gene_pool only supplies the universe the control set is sampled \
+                 from, and ctrl_genes= replaces that sampling entirely",
+            ));
+        }
+    }
+
     // ── Resolve gene symbols → var-index positions ──────────────────────
     let var = adata.getattr("var")?;
     let var_index = var.getattr("index")?;
@@ -87,19 +142,7 @@ pub fn score_genes<'py>(
         name_to_idx.entry(name.as_str()).or_insert(i as u32);
     }
 
-    let mut seen: HashSet<u32> = HashSet::new();
-    let mut gene_list_idx: Vec<u32> = Vec::with_capacity(gene_list.len());
-    let mut missing: Vec<String> = Vec::new();
-    for g in &gene_list {
-        match name_to_idx.get(g.as_str()) {
-            Some(&idx) => {
-                if seen.insert(idx) {
-                    gene_list_idx.push(idx);
-                }
-            }
-            None => missing.push(g.clone()),
-        }
-    }
+    let (gene_list_idx, missing) = resolve_var_indices(&name_to_idx, &gene_list);
     if !missing.is_empty() {
         let shown: Vec<&String> = missing.iter().take(10).collect();
         let suffix = if missing.len() > 10 { ", …" } else { "" };
@@ -148,6 +191,42 @@ pub fn score_genes<'py>(
             resolved
         }
         None => (0..var_names.len() as u32).collect(),
+    };
+
+    // ── Resolve an explicit control set, if one was given ───────────────
+    //
+    // Deliberately the `gene_list` policy (warn on drops, error if nothing
+    // survives), not `gene_pool`'s lenient one: a control set that quietly
+    // loses half its members still returns a number, and that number is no
+    // longer the one the caller's controls define — which is the entire
+    // reason to pass them.
+    let method_enum = match &ctrl_genes {
+        None => method_enum,
+        Some(names) => {
+            let (ctrl, missing) = resolve_var_indices(&name_to_idx, names);
+            if !missing.is_empty() {
+                let shown: Vec<&String> = missing.iter().take(10).collect();
+                let suffix = if missing.len() > 10 { ", …" } else { "" };
+                let warnings = crate::pyimport::import_module(py, "warnings")?;
+                warnings.call_method1(
+                    "warn",
+                    (format!(
+                        "score_genes: {} of {} genes in ctrl_genes are not in var_names \
+                         and were dropped: {:?}{}",
+                        missing.len(),
+                        names.len(),
+                        shown,
+                        suffix
+                    ),),
+                )?;
+            }
+            if ctrl.is_empty() {
+                return Err(PyValueError::new_err(
+                    "score_genes: no genes from ctrl_genes were found in adata.var_names",
+                ));
+            }
+            ScoreMethod::ControlSet { ctrl }
+        }
     };
 
     // ── Select the source matrix (layer or X) ───────────────────────────

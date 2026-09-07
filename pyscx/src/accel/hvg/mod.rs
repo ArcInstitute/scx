@@ -13,7 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::backed::ScxBackedSparseDataset;
+use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::optional_deps::{import_optional_with_hint, EXTRA_SCANPY};
 
@@ -329,12 +329,11 @@ pub fn highly_variable_genes<'py>(
     };
 
     // F3: read the source matrix from `adata.layers[layer]` when a
-    // layer is named (scanpy parity); otherwise from `adata.X`. The
-    // downstream dispatch on `ScxBackedSparseDataset` /
-    // `ScxLazyTransformedDataset` works identically — if the layer is
-    // itself an SCX-backed dataset (e.g. set via
-    // `adata.layers["counts"] = adata.X.copy()`), the streaming path
-    // applies; otherwise we fall through to scanpy with `layer=`.
+    // layer is named (scanpy parity); otherwise from `adata.X`. A backed
+    // file's layer arrives as `ScxBackedLayerDataset`, which has its own
+    // dispatch arm below (it is not an `ScxBackedSparseDataset`); a scipy
+    // layer falls through to the in-memory path, and a flavor scx has no
+    // native kernel for falls through to scanpy with `layer=`.
     let x = match layer {
         Some(name) => adata.getattr("layers")?.get_item(name)?,
         None => adata.getattr("X")?,
@@ -404,6 +403,42 @@ pub fn highly_variable_genes<'py>(
         let kept = backed_ref.kept_to_global.clone();
         let col_proj = backed_ref.col_projection_arc();
         drop(backed_ref);
+
+        let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
+        return route.settle(hvg_on_source(
+            py,
+            adata,
+            &source,
+            n_obs,
+            n_vars,
+            n_top_genes,
+            flavor,
+            batch_key,
+            span,
+            subset,
+            n_bins,
+            effective_gpu_id,
+        ));
+    }
+
+    // ── Try a backed *layer* handle ─────────────────────────────────────
+    //
+    // `adata.layers[name]` on a backed file is `ScxBackedLayerDataset`, not
+    // `ScxBackedSparseDataset`, so the cast above does not match it and the
+    // handle used to fall all the way through to `owned_csr`, where
+    // `scipy.sparse.csr_matrix(<handle>)` raises "unrecognized csr_matrix
+    // constructor input". `layer=` on a backed AnnData — the case the kwarg
+    // exists for — therefore never worked; every test for it used an in-memory
+    // scipy AnnData whose layers are plain scipy matrices.
+    if let Ok(layer_ds) = x.cast::<ScxBackedLayerDataset>() {
+        let layer_ref = layer_ds.borrow();
+        let inner = &layer_ref.inner;
+        let reader = Arc::clone(&inner.backed);
+        let n_vars = inner.shape_val.1;
+        let n_obs = inner.shape_val.0;
+        let kept = inner.kept_to_global.clone();
+        let col_proj = inner.col_projection_arc();
+        drop(layer_ref);
 
         let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
         return route.settle(hvg_on_source(

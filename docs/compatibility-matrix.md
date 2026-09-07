@@ -29,7 +29,7 @@ Optional extras follow the same convention:
 |---|---|---|---|
 | `mudata` | `mudata` | `>=0.2,<1.0` | `pyscx.from_mudata` / `to_mudata` |
 | `10x` | `scanpy` | `>=1.10` | `pyscx.from_10x` |
-| `scanpy` | `scanpy` | `>=1.10` | `accel.normalize_total` / `log1p` / `calculate_qc_metrics` / `filter_cells` / `filter_genes` **on an in-memory scipy/dense `X`**, and `accel.highly_variable_genes` for the flavors scx has no native kernel for (`cell_ranger`, and `seurat` with a `batch_key`). Not needed on a backed or lazy `X`, where the scx-native streaming kernels run |
+| `scanpy` | `scanpy` | `>=1.10` | `accel.normalize_total` / `log1p` / `filter_cells` / `filter_genes` **on an in-memory scipy/dense `X`**, and `accel.highly_variable_genes` for the flavors scx has no native kernel for (`cell_ranger`, and `seurat` with a `batch_key`). Not needed on a backed or lazy `X`, where the scx-native streaming kernels run. **`calculate_qc_metrics` no longer appears here** — it runs one native kernel on every kind of `X` |
 | `hvg` | `scikit-misc` | `>=0.5` | `accel.highly_variable_genes(flavor="seurat_v3")` — the **default** flavor. Its loess lives in the shared native kernel, so this is required on every `X` kind, backed included |
 | `pydeseq2` | `pydeseq2` | `>=0.5` | `accel.pseudobulk_dex(backend="pydeseq2")`, and the `stratify_by=` / `aggr_method="mean"` paths. Not needed for the default `backend="nb_glm"` |
 | `dev` | `scanpy` | `>=1.10` | Local test suite |

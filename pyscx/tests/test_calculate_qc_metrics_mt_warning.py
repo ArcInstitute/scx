@@ -14,10 +14,14 @@ import scipy.sparse as sp
 
 def _adata_with_mt_genes(n_mt=8, n_extra=600):
     """Build an AnnData where the first `n_mt` var_names start with
-    `MT-` (human convention). `n_extra` defaults large enough that
-    scanpy's downstream `percent_top=[50, 100, 200, 500]` check does
-    not trip on the small-fixture path (`pct_counts_mt` is what we're
-    here for, not the `percent_top` machinery)."""
+    `MT-` (human convention).
+
+    `n_extra` used to be large enough to clear scanpy's default
+    `percent_top=[50, 100, 200, 500]`, which the scipy route inherited and which
+    raised `IndexError` below 500 genes. QC runs one native kernel now and
+    `percent_top` defaults to `None`, so the width is free; it stays at 600 only
+    because these tests are about `pct_counts_mt` and the advisories, and
+    changing the fixture would change what they measure."""
     n_vars = n_mt + n_extra
     n_obs = 6
     x = sp.csr_matrix(

@@ -237,8 +237,19 @@ def test_overlapping_qc_vars_double_count(multishard_path):
         )
 
 
-def test_empty_qc_var_keeps_historical_columns(multishard_path):
-    """An all-false mask zero-fills and emits no log1p column (unchanged)."""
+def test_empty_qc_var_zero_fills_without_changing_the_column_set(multishard_path):
+    """An all-false mask zero-fills, and publishes the same three columns.
+
+    This used to assert `"log1p_total_counts_none" not in adata.obs.columns` —
+    an empty mask "kept its historical shape" and skipped that one column. That
+    made the output schema a function of the *data* (did any gene match?) rather
+    than of the call, and it disagreed with scanpy, which writes
+    `log1p(0) == 0.0` like any other value. A dataset with no annotated
+    mitochondrial genes then produced a frame missing a column its siblings had.
+
+    The advisory `emit_qc_advisories` raises for an empty mask is still the
+    signal that something is wrong with the mask; a missing column is not.
+    """
     import pyscx
 
     adata = _open(multishard_path)
@@ -250,7 +261,7 @@ def test_empty_qc_var_keeps_historical_columns(multishard_path):
 
     assert np.all(adata.obs["total_counts_none"].to_numpy() == 0.0)
     assert np.all(adata.obs["pct_counts_none"].to_numpy() == 0.0)
-    assert "log1p_total_counts_none" not in adata.obs.columns
+    assert np.all(adata.obs["log1p_total_counts_none"].to_numpy() == 0.0)
     assert "log1p_total_counts_some" in adata.obs.columns
 
 

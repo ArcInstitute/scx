@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::backed::{detached, ScxBackedSparseDataset};
+use crate::backed::{detached, ScxBackedLayerDataset, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::optional_deps::{import_optional_with_hint, BACKED_ESCAPE_HATCH, EXTRA_SCANPY};
 use crate::projected_agg;
@@ -467,11 +467,36 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 /// Calculate QC metrics natively using streaming aggregation.
 ///
 /// Replacement for `sc.pp.calculate_qc_metrics()` that works on backed and
-/// lazy-transformed SCX data without materialization.  Falls back to scanpy
-/// for regular scipy/dense matrices.
+/// lazy-transformed SCX data without materialization.
 ///
 /// Computes per-cell (obs) and per-gene (var) metrics and writes them to
-/// `adata.obs` / `adata.var` columns, matching scanpy's naming convention.
+/// `adata.obs` / `adata.var`, matching scanpy's column names, column order and
+/// values.
+///
+/// **One kernel, every matrix.** A scipy/dense `X` is copied into an owned CSR
+/// and run through the same streaming accumulator as a backed or lazy `X`,
+/// rather than delegated to `sc.pp.calculate_qc_metrics`. Two implementations
+/// behind one name is how the op came to return different column sets depending
+/// on what `X` was — the streaming route never wrote
+/// `log1p_n_genes_by_counts`, `mean_counts`, `log1p_mean_counts` or
+/// `pct_dropout_by_counts`, and only the scanpy route could produce
+/// `pct_counts_in_top_<n>_genes`.
+///
+/// Consequences of that, for a caller who was on the scipy route:
+///
+/// * `scanpy` is no longer needed for this op on any kind of `X`.
+/// * The in-memory matrix is copied (`nnz × 8` bytes; the shared >2 GB warning
+///   applies), where handing it to scanpy copied nothing. HVG and `score_genes`
+///   already worked this way.
+/// * Values are accumulated in f64 rather than scanpy's f32, so they differ in
+///   the last digits — and a float64 `X` is narrowed to f32 on the way in, as
+///   everywhere else in pyscx.
+/// * `pct_counts_<v>` for a cell with no counts is `0.0`, this module's
+///   convention, where scanpy gives `NaN`.
+/// * Explicitly-stored zeros are dropped from the copy before counting, so
+///   `n_genes_by_counts` / `n_cells_by_counts` count real nonzeros as scanpy
+///   does (it calls `eliminate_zeros()` on the caller's matrix; we do it on
+///   ours, which reaches the same numbers without the side effect).
 ///
 /// Args:
 ///     adata: AnnData object
@@ -480,6 +505,16 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 ///     log1p: if True, also add log1p-transformed versions of count metrics
 ///     inplace: if True (default), write metrics to adata.obs/var;
 ///              if False, return (obs_df, var_df)
+///     layer: read `adata.layers[name]` instead of `adata.X`. Accepts a backed
+///            layer handle, a lazy handle, or a scipy/dense matrix. Rejected
+///            with `prefer_format="csc"` — the CSC sidecar belongs to `X`.
+///     percent_top: 1-indexed positions for `pct_counts_in_top_<n>_genes`,
+///            computed in the same shard pass as everything else. Defaults to
+///            `None`, deliberately **not** scanpy's `(50, 100, 200, 500)`:
+///            that default raises `IndexError` on any file with fewer than 500
+///            genes, which is how the old scipy route inherited a crash on
+///            narrow data. Positions outside `1..=n_visible` raise a
+///            `ValueError` naming the visible width.
 ///     prefer_format: "csr" (default) or "csc". When "csc", the gene-axis
 ///         (`total_counts`, `n_cells_by_counts`) accumulators read the CSC
 ///         sidecar instead of streaming CSR shards. The cell-axis stays
@@ -520,7 +555,8 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 /// `pct_counts_mt` after a lazy `normalize_total` will keep and drop different
 /// cells than before.
 ///
-/// Results are unchanged for unprojected, untransformed input.
+/// Results are unchanged for unprojected, untransformed input on the backed and
+/// lazy routes; see the one-kernel note above for what moved on a scipy `X`.
 ///
 /// SUPPORTED CONTRACT: `adata.var` row *i* must describe visible column *i*.
 /// `set_col_projection` sorts and dedups its input, so passing an unsorted
@@ -528,7 +564,17 @@ pub fn log1p(py: Python<'_>, adata: &Bound<'_, PyAny>, device: &str) -> PyResult
 /// disagreeing — the gene axis is then labelled wrongly with no error, since
 /// the lengths still match. Slice `var` in ascending column order.
 #[pyfunction]
-#[pyo3(signature = (adata, qc_vars=None, log1p=true, inplace=true, prefer_format="csr"))]
+#[pyo3(signature = (
+    adata,
+    qc_vars=None,
+    log1p=true,
+    inplace=true,
+    prefer_format="csr",
+    *,
+    layer=None,
+    percent_top=None,
+))]
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_qc_metrics<'py>(
     py: Python<'py>,
     adata: &Bound<'py, PyAny>,
@@ -536,6 +582,8 @@ pub fn calculate_qc_metrics<'py>(
     log1p: bool,
     inplace: bool,
     prefer_format: &str,
+    layer: Option<&str>,
+    percent_top: Option<Vec<i64>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if !matches!(prefer_format, "csr" | "csc") {
         return Err(PyValueError::new_err(format!(
@@ -546,6 +594,21 @@ pub fn calculate_qc_metrics<'py>(
     // Per-gene QC metrics are computed over the sorted projection and written to
     // adata.var; a presentation-ordered backed X would misalign them.
     super::prepare_target(py, adata, "calculate_qc_metrics")?;
+
+    // Read the source matrix: `adata.layers[name]` when a layer is named,
+    // `adata.X` otherwise. Modelled on `select_de_matrix` rather than HVG's
+    // resolution, so a typo raises a `ValueError` naming the layer instead of
+    // leaking a bare `KeyError` from the mapping.
+    let x = match layer {
+        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?,
+        None => adata.getattr("X")?,
+    };
+
+    // Normalize `percent_top` before anything is stamped or computed, so a bad
+    // value leaves `uns` exactly as it found it.
+    let percent_top = normalize_percent_top(percent_top.as_deref(), source_n_vars(&x)?)?;
 
     // Record the planned route. QC metrics have no GPU kernel; the only route
     // choice is the gene-axis layout — cpu_csc when prefer_format="csc" (reads
@@ -565,50 +628,56 @@ pub fn calculate_qc_metrics<'py>(
         &scx_accel::AccelExecutionInfo::new(qc_route, scx_accel::FallbackReason::None),
     )?;
 
-    let x = adata.getattr("X")?;
     let qc_vars = qc_vars.unwrap_or_default();
 
-    // emit qc-vars
-    // advisories upfront so they cover BOTH the SCX-backed/lazy streaming
-    // path and the scipy/dense → scanpy fallback path.
+    // Advisories are route-independent (they read `adata.var` only), and run
+    // before any rejection below so a user who asked for the impossible still
+    // learns their `qc_vars` mask is empty.
     emit_qc_advisories(py, adata, &qc_vars)?;
 
-    // Detect backed or lazy-transformed SCX dataset
-    let is_backed = x.cast::<ScxBackedSparseDataset>().is_ok();
-    let is_lazy = x.cast::<ScxLazyTransformedDataset>().is_ok();
+    // Which kind of matrix are we reading? A backed *layer* is its own pyclass
+    // and does not answer to `cast::<ScxBackedSparseDataset>()`, so it needs its
+    // own arm — miss it and the handle falls through to the in-memory arm and
+    // dies inside `scipy.sparse.csr_matrix(<handle>)`.
+    let kind = QcSourceKind::of(&x);
 
-    if !is_backed && !is_lazy {
-        // Delegate to scanpy for regular scipy/dense. CSC on a non-SCX
-        // matrix has no meaningful interpretation — reject explicitly so
-        // the user doesn't think it had any effect.
-        if prefer_format == "csc" {
+    if prefer_format == "csc" {
+        // CSC on a non-SCX matrix has no meaningful interpretation — reject
+        // explicitly so the user doesn't think it had any effect.
+        if matches!(kind, QcSourceKind::InMemory) {
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' requires adata.X to be ScxBackedSparseDataset \
                  or ScxLazyTransformedDataset (got scipy/dense)",
             ));
         }
-        let sc = import_optional_with_hint(
-            py,
-            "scanpy",
-            EXTRA_SCANPY,
-            "pyscx.accel.calculate_qc_metrics()",
-            "scanpy",
-            Some(BACKED_ESCAPE_HATCH),
-        )?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("inplace", inplace)?;
-        kwargs.set_item("log1p", log1p)?;
-        if !qc_vars.is_empty() {
-            kwargs.set_item("qc_vars", &qc_vars)?;
+        // The CSC sidecar belongs to `X`, not to an arbitrary layer, and a
+        // layer handle is built with no column source at all — so this would
+        // otherwise fail deeper down with a message about a missing sidecar,
+        // blaming the file for the caller's kwarg combination.
+        if layer.is_some() {
+            return Err(PyRuntimeError::new_err(
+                "calculate_qc_metrics: prefer_format='csc' does not support layer= \
+                 (the CSC sidecar lives on adata.X, not on layers); pass layer=None \
+                 or use prefer_format='csr'",
+            ));
         }
-        return route.settle(sc.getattr("pp")?.call_method(
-            "calculate_qc_metrics",
-            (adata,),
-            Some(&kwargs),
-        ));
     }
 
-    // --- Streaming path for SCX-backed / lazy data ---
+    // --- One streaming kernel, whatever the matrix is ---
+    //
+    // An in-memory scipy/dense `X` is copied into an owned Rust CSR and fed to
+    // the same accumulator the backed and lazy routes use, rather than handed
+    // to `sc.pp.calculate_qc_metrics`. Two implementations behind one name is
+    // how this op came to return different column sets depending on what `X`
+    // was; there is now one.
+    let in_memory_csr = match kind {
+        QcSourceKind::InMemory => Some(canonicalize_for_qc(crate::convert::owned_csr(
+            py,
+            &x,
+            Some("calculate_qc_metrics"),
+        )?)),
+        _ => None,
+    };
 
     let pd = crate::pyimport::import_module(py, "pandas")?;
 
@@ -629,55 +698,119 @@ pub fn calculate_qc_metrics<'py>(
     //
     // Heavy row-axis scans run off the GIL (`detached`); rebind to a plain
     // `&Self` (Send) so the closure captures the ref, not the `!Send` PyRef.
-    let row_stats: RowQcOutputs = if is_backed {
-        let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
-        let b: &ScxBackedSparseDataset = &backed;
-        detached(py, || {
-            RowQcOutputs::accumulate(
-                &qc_masks,
-                b.kept_to_global.as_ref().map(|k| k.as_slice()),
-                |bits, n| b.qc_row_pass_raw(bits, n),
-            )
-        })
-        .map_err(PyRuntimeError::new_err)?
-    } else {
-        let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-        let l: &ScxLazyTransformedDataset = &lazy;
-        detached(py, || {
-            RowQcOutputs::accumulate(
-                &qc_masks,
-                l.kept_to_global.as_ref().map(|k| k.as_slice()),
-                |bits, n| l.streaming_qc_row_pass(bits, n),
-            )
-        })
-        .map_err(PyRuntimeError::new_err)?
+    let ns = percent_top.as_slice();
+    let row_stats: RowQcOutputs = match kind {
+        QcSourceKind::Backed => {
+            let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
+            let b: &ScxBackedSparseDataset = &backed;
+            detached(py, || {
+                RowQcOutputs::accumulate(
+                    &qc_masks,
+                    b.kept_to_global.as_ref().map(|k| k.as_slice()),
+                    |bits, n| b.qc_row_pass_raw(bits, n, ns),
+                )
+            })
+            .map_err(PyRuntimeError::new_err)?
+        }
+        QcSourceKind::BackedLayer => {
+            let layer_ds = x.extract::<PyRef<ScxBackedLayerDataset>>()?;
+            let b: &ScxBackedSparseDataset = &layer_ds.inner;
+            detached(py, || {
+                RowQcOutputs::accumulate(
+                    &qc_masks,
+                    b.kept_to_global.as_ref().map(|k| k.as_slice()),
+                    |bits, n| b.qc_row_pass_raw(bits, n, ns),
+                )
+            })
+            .map_err(PyRuntimeError::new_err)?
+        }
+        QcSourceKind::Lazy => {
+            let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+            let l: &ScxLazyTransformedDataset = &lazy;
+            detached(py, || {
+                RowQcOutputs::accumulate(
+                    &qc_masks,
+                    l.kept_to_global.as_ref().map(|k| k.as_slice()),
+                    |bits, n| l.streaming_qc_row_pass(bits, n, ns),
+                )
+            })
+            .map_err(PyRuntimeError::new_err)?
+        }
+        QcSourceKind::InMemory => {
+            // One "shard": the whole matrix, through the same accumulator. No
+            // deletion vector — an in-memory `X` is already the visible rows.
+            let csr = in_memory_csr.as_ref().expect("in-memory arm builds a CSR");
+            detached(py, || {
+                RowQcOutputs::accumulate(&qc_masks, None, |bits, n| {
+                    let mut out =
+                        projected_agg::QcRowStats::zeroed(csr.n_rows(), n, percent_top.len());
+                    projected_agg::accumulate_qc_rows_into(csr, 0, bits, ns, &mut out);
+                    Ok(out)
+                })
+            })
+            .map_err(PyRuntimeError::new_err)?
+        }
     };
     let RowQcOutputs {
         total_counts,
         n_genes,
         qc_subset_sums,
+        top_fractions,
     } = row_stats;
 
     // Compute per-gene total_counts and n_cells_by_counts.
     let (gene_total_counts, n_cells): (Vec<f64>, Vec<u32>) = if prefer_format == "csc" {
         // CSC dispatch: capability gate + projected_agg twins.
         compute_gene_axis_csc(&x)?
-    } else if is_backed {
-        // The fused kernel resolves projection + keep-mask and returns vectors
-        // whose length matches the visible var axis (`shape_val.1`) — in one
-        // shard scan rather than one per statistic.
-        let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
-        let b: &ScxBackedSparseDataset = &backed;
-        detached(py, || b.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?
     } else {
-        let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
-        let l: &ScxLazyTransformedDataset = &lazy;
-        detached(py, || l.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?
+        match kind {
+            // The fused kernel resolves projection + keep-mask and returns
+            // vectors whose length matches the visible var axis
+            // (`shape_val.1`) — in one shard scan rather than one per statistic.
+            QcSourceKind::Backed => {
+                let backed = x.extract::<PyRef<ScxBackedSparseDataset>>()?;
+                let b: &ScxBackedSparseDataset = &backed;
+                detached(py, || b.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?
+            }
+            QcSourceKind::BackedLayer => {
+                let layer_ds = x.extract::<PyRef<ScxBackedLayerDataset>>()?;
+                let b: &ScxBackedSparseDataset = &layer_ds.inner;
+                detached(py, || b.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?
+            }
+            QcSourceKind::Lazy => {
+                let lazy = x.extract::<PyRef<ScxLazyTransformedDataset>>()?;
+                let l: &ScxLazyTransformedDataset = &lazy;
+                detached(py, || l.col_sums_and_nnz_raw()).map_err(PyRuntimeError::new_err)?
+            }
+            QcSourceKind::InMemory => {
+                let csr = in_memory_csr.as_ref().expect("in-memory arm builds a CSR");
+                // Same visit order and same left-to-right f64 accumulation as
+                // `col_sums_and_nnz_projected`'s inner loop.
+                csr.col_sums_and_nnz()
+            }
+        }
     };
 
-    // Build obs DataFrame
+    // The divisor for `mean_counts` / `pct_dropout_by_counts` is the number of
+    // rows the gene axis was actually accumulated over — the *visible* count,
+    // after any deletion vector — matching scanpy's `x.shape[0]` on the object
+    // it was handed. Reading it off the file would be silently wrong on every
+    // filtered dataset, and no assertion about the gene axis would notice.
+    let n_obs_visible = total_counts.len();
+
+    // Build obs DataFrame. Column order follows scanpy's `describe_obs`, so a
+    // frame from `inplace=False` lines up with one from `sc.pp` without a sort.
     let obs_dict = PyDict::new(py);
-    obs_dict.set_item("n_genes_by_counts", numpy::PyArray::from_vec(py, n_genes))?;
+    if log1p {
+        let log_n_genes: Vec<f64> = n_genes.iter().map(|&v| (v as f64 + 1.0).ln()).collect();
+        obs_dict.set_item("n_genes_by_counts", numpy::PyArray::from_vec(py, n_genes))?;
+        obs_dict.set_item(
+            "log1p_n_genes_by_counts",
+            numpy::PyArray::from_vec(py, log_n_genes),
+        )?;
+    } else {
+        obs_dict.set_item("n_genes_by_counts", numpy::PyArray::from_vec(py, n_genes))?;
+    }
     obs_dict.set_item(
         "total_counts",
         numpy::PyArray::from_vec(py, total_counts.clone()),
@@ -689,10 +822,58 @@ pub fn calculate_qc_metrics<'py>(
             numpy::PyArray::from_vec(py, log_total),
         )?;
     }
+    // `percent_top` is normalized ascending, so these emit in scanpy's order.
+    for (&n, fractions) in percent_top.iter().zip(top_fractions) {
+        let pct: Vec<f64> = fractions.into_iter().map(|f| f * 100.0).collect();
+        obs_dict.set_item(
+            format!("pct_counts_in_top_{n}_genes"),
+            numpy::PyArray::from_vec(py, pct),
+        )?;
+    }
 
-    // Build var DataFrame
+    // Build var DataFrame, in scanpy's `describe_var` column order.
+    //
+    // `mean_counts` and `pct_dropout_by_counts` cost nothing here — they are
+    // the gene totals and cell counts the pass already produced, divided by the
+    // visible row count — but they were absent for as long as this route
+    // existed, which is most of what made the two schemas differ.
     let var_dict = PyDict::new(py);
-    var_dict.set_item("n_cells_by_counts", numpy::PyArray::from_vec(py, n_cells))?;
+    let n_obs_f = n_obs_visible as f64;
+    let mean_counts: Vec<f64> = gene_total_counts
+        .iter()
+        .map(|&v| if n_obs_visible == 0 { 0.0 } else { v / n_obs_f })
+        .collect();
+    // Widened from the kernel's u32: scanpy publishes a signed integer, and an
+    // unsigned column turns the natural `n_cells_by_counts - k` into a wrap to
+    // ~4e9 rather than a negative number.
+    let n_cells_i64: Vec<i64> = n_cells.iter().map(|&c| c as i64).collect();
+    let pct_dropout: Vec<f64> = n_cells
+        .iter()
+        .map(|&c| {
+            if n_obs_visible == 0 {
+                0.0
+            } else {
+                (1.0 - c as f64 / n_obs_f) * 100.0
+            }
+        })
+        .collect();
+
+    var_dict.set_item(
+        "n_cells_by_counts",
+        numpy::PyArray::from_vec(py, n_cells_i64),
+    )?;
+    var_dict.set_item(
+        "mean_counts",
+        numpy::PyArray::from_vec(py, mean_counts.clone()),
+    )?;
+    if log1p {
+        let log_mean: Vec<f64> = mean_counts.iter().map(|&v| (v + 1.0).ln()).collect();
+        var_dict.set_item("log1p_mean_counts", numpy::PyArray::from_vec(py, log_mean))?;
+    }
+    var_dict.set_item(
+        "pct_dropout_by_counts",
+        numpy::PyArray::from_vec(py, pct_dropout),
+    )?;
     var_dict.set_item(
         "total_counts",
         numpy::PyArray::from_vec(py, gene_total_counts.clone()),
@@ -707,10 +888,14 @@ pub fn calculate_qc_metrics<'py>(
 
     // Publish the qc_var metrics. The subset sums were accumulated by the row
     // pass above — no further shard scans here. An empty mask contributes an
-    // all-zero row (its advisory was emitted upfront by `emit_qc_advisories`),
-    // so it needs no special case beyond skipping the log1p column, matching
-    // the previous zero-fill behavior.
-    for (i, (qc_var, subset_sums)) in qc_vars.iter().zip(qc_subset_sums).enumerate() {
+    // all-zero row (its advisory was emitted upfront by `emit_qc_advisories`)
+    // and needs no special case: it publishes the same three columns as any
+    // other mask, all zero.
+    //
+    // It used to omit `log1p_total_counts_<v>` for an empty mask, so the column
+    // set depended on whether any gene happened to match rather than on the
+    // call. Column order is scanpy's: total, log1p_total, pct.
+    for (qc_var, subset_sums) in qc_vars.iter().zip(qc_subset_sums) {
         // pct_counts = subset_sum / total * 100
         let pct_counts: Vec<f64> = subset_sums
             .iter()
@@ -718,10 +903,8 @@ pub fn calculate_qc_metrics<'py>(
             .map(|(&s, &t)| if t > 0.0 { s / t * 100.0 } else { 0.0 })
             .collect();
 
-        // Compute log1p before moving subset_sums. An empty mask keeps its
-        // historical shape: total_counts_/pct_counts_ zero-filled, and NO
-        // log1p_total_counts_ column.
-        let log1p_subset_sums: Option<Vec<f64>> = if log1p && !qc_masks.empty[i] {
+        // Compute log1p before moving subset_sums.
+        let log1p_subset_sums: Option<Vec<f64>> = if log1p {
             Some(subset_sums.iter().map(|&v| (v + 1.0).ln()).collect())
         } else {
             None
@@ -731,16 +914,16 @@ pub fn calculate_qc_metrics<'py>(
             format!("total_counts_{qc_var}"),
             numpy::PyArray::from_vec(py, subset_sums),
         )?;
-        obs_dict.set_item(
-            format!("pct_counts_{qc_var}"),
-            numpy::PyArray::from_vec(py, pct_counts),
-        )?;
         if let Some(log1p_sums) = log1p_subset_sums {
             obs_dict.set_item(
                 format!("log1p_total_counts_{qc_var}"),
                 numpy::PyArray::from_vec(py, log1p_sums),
             )?;
         }
+        obs_dict.set_item(
+            format!("pct_counts_{qc_var}"),
+            numpy::PyArray::from_vec(py, pct_counts),
+        )?;
     }
 
     // Create DataFrames
@@ -1365,7 +1548,7 @@ fn resolve_qc_masks(
         });
     }
 
-    let n_visible = visible_n_vars(x)?;
+    let n_visible = source_n_vars(x)?;
     let np = crate::pyimport::import_module(py, "numpy")?;
     let var_df = adata.getattr("var")?;
     let mut empty = Vec::with_capacity(qc_vars.len());
@@ -1400,10 +1583,42 @@ fn resolve_qc_masks(
     Ok(QcMasks { chunks, empty })
 }
 
+/// Which kind of matrix `calculate_qc_metrics` was pointed at.
+///
+/// `BackedLayer` exists because `adata.layers[name]` on a backed file is
+/// `ScxBackedLayerDataset` — a distinct `#[pyclass]` wrapping an
+/// `ScxBackedSparseDataset` — so a plain `cast::<ScxBackedSparseDataset>()`
+/// silently misses it and the handle ends up in the in-memory arm, where
+/// `scipy.sparse.csr_matrix(<handle>)` raises.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QcSourceKind {
+    Backed,
+    BackedLayer,
+    Lazy,
+    InMemory,
+}
+
+impl QcSourceKind {
+    fn of(x: &Bound<'_, PyAny>) -> Self {
+        if x.cast::<ScxBackedSparseDataset>().is_ok() {
+            Self::Backed
+        } else if x.cast::<ScxBackedLayerDataset>().is_ok() {
+            Self::BackedLayer
+        } else if x.cast::<ScxLazyTransformedDataset>().is_ok() {
+            Self::Lazy
+        } else {
+            Self::InMemory
+        }
+    }
+}
+
 /// Number of user-visible columns on a backed / lazy SCX `X`.
 fn visible_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         return Ok(backed.shape_val.1);
+    }
+    if let Ok(layer) = x.extract::<PyRef<ScxBackedLayerDataset>>() {
+        return Ok(layer.inner.shape_val.1);
     }
     if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         return Ok(lazy.shape_val.1);
@@ -1413,11 +1628,95 @@ fn visible_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
     ))
 }
 
+/// Visible column count for any matrix `calculate_qc_metrics` accepts.
+///
+/// Unlike [`visible_n_vars`] this also answers for a scipy/dense `X`, because
+/// `percent_top` has to be range-checked before the route is chosen.
+fn source_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if matches!(QcSourceKind::of(x), QcSourceKind::InMemory) {
+        let shape: (usize, usize) = x.getattr("shape")?.extract()?;
+        return Ok(shape.1);
+    }
+    visible_n_vars(x)
+}
+
+/// Validate and canonicalize `percent_top` into ascending, de-duplicated,
+/// 1-indexed positions.
+///
+/// scanpy raises `IndexError("Positions outside range of features.")` here; we
+/// raise `ValueError` naming the offending value and the width it has to fit,
+/// because this is a bad argument rather than a bad subscript, and because the
+/// width that matters is the *visible* one — under a column projection it is
+/// not the file's `n_vars`, and a message quoting the file would send the
+/// reader looking in the wrong place.
+///
+/// An empty collection means "not requested", matching scanpy's `if
+/// percent_top:` — it is skipped, not rejected.
+fn normalize_percent_top(percent_top: Option<&[i64]>, n_visible: usize) -> PyResult<Vec<usize>> {
+    let Some(requested) = percent_top else {
+        return Ok(Vec::new());
+    };
+    let mut ns: Vec<usize> = Vec::with_capacity(requested.len());
+    for &n in requested {
+        if n <= 0 {
+            return Err(PyValueError::new_err(format!(
+                "percent_top entries are 1-indexed gene positions and must be >= 1, got {n}"
+            )));
+        }
+        let n = n as usize;
+        if n > n_visible {
+            return Err(PyValueError::new_err(format!(
+                "percent_top entry {n} exceeds the {n_visible} visible genes; \
+                 percent_top positions must fall in 1..={n_visible}"
+            )));
+        }
+        ns.push(n);
+    }
+    ns.sort_unstable();
+    ns.dedup();
+    Ok(ns)
+}
+
+/// Drop explicitly-stored zeros from an in-memory CSR.
+///
+/// The QC kernel takes each row's nnz from `indptr`, which is right for SCX
+/// shards — they never store a zero. A user's scipy matrix can (`X[mask] = 0`
+/// leaves the entries in place), and counting those would report more expressed
+/// genes and fewer dropouts than there are. scanpy avoids it by calling
+/// `x.eliminate_zeros()` on the caller's matrix; doing it on our own copy
+/// reaches the same numbers without mutating the caller's data.
+///
+/// Returns the input untouched when there is nothing to drop, which is the
+/// common case and costs one scan.
+fn canonicalize_for_qc(csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {
+    if !csr.data.contains(&0.0) {
+        return csr;
+    }
+    let n_rows = csr.n_rows();
+    let mut indptr = Vec::with_capacity(n_rows + 1);
+    let mut indices = Vec::with_capacity(csr.data.len());
+    let mut data = Vec::with_capacity(csr.data.len());
+    indptr.push(0i64);
+    for row in 0..n_rows {
+        let s = csr.indptr[row] as usize;
+        let e = csr.indptr[row + 1] as usize;
+        for j in s..e {
+            if csr.data[j] != 0.0 {
+                indices.push(csr.indices[j]);
+                data.push(csr.data[j]);
+            }
+        }
+        indptr.push(data.len() as i64);
+    }
+    scx_sparse::ScxCsr::new_unchecked(csr.shape, indptr, indices, data)
+}
+
 /// Deletion-filtered outputs of the fused row pass, in publish order.
 struct RowQcOutputs {
     total_counts: Vec<f64>,
     n_genes: Vec<i64>,
     qc_subset_sums: Vec<Vec<f64>>,
+    top_fractions: Vec<Vec<f64>>,
 }
 
 impl RowQcOutputs {
@@ -1445,6 +1744,7 @@ impl RowQcOutputs {
 
         let mut total_counts: Option<Vec<f64>> = None;
         let mut n_genes: Option<Vec<i64>> = None;
+        let mut top_fractions: Vec<Vec<f64>> = Vec::new();
         let mut qc_subset_sums: Vec<Vec<f64>> = Vec::with_capacity(masks.empty.len());
 
         // `chunks` is empty only when no qc_var was requested — still run one
@@ -1464,6 +1764,14 @@ impl RowQcOutputs {
             if total_counts.is_none() {
                 total_counts = Some(take(stats.sums, kept));
                 n_genes = Some(take(stats.nnz, kept));
+                // Like `sums`/`nnz`, these do not depend on the qc_var chunk;
+                // taking them from every chunk would recompute an identical
+                // answer once per additional 64 subsets.
+                top_fractions = stats
+                    .top_fractions
+                    .into_iter()
+                    .map(|v| take(v, kept))
+                    .collect();
             }
             qc_subset_sums.extend(stats.qc_sums.into_iter().map(|v| take(v, kept)));
         }
@@ -1472,6 +1780,7 @@ impl RowQcOutputs {
             total_counts: total_counts.unwrap_or_default(),
             n_genes: n_genes.unwrap_or_default(),
             qc_subset_sums,
+            top_fractions,
         })
     }
 }

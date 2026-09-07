@@ -73,6 +73,12 @@ def test_user_facing_accelerators_have_stubs():
         "pseudobulk_dex",
         # S15 (PR G): gained the `str | list[str]` groupby and had no stub at all.
         "pseudobulk_means",
+        # PR J: gained `ctrl_genes=`, the exact-scanpy-parity mode, and had no
+        # stub at all — it resolved through `__getattr__`, so neither an editor
+        # nor `test_accel_stub_signatures_match_runtime` could see its kwargs.
+        "score_genes",
+        # PR J: gained `layer=` and `percent_top=`.
+        "calculate_qc_metrics",
     }
     missing = sorted(required - _stub_names())
     assert not missing, f"user-facing accelerators missing type stubs in accel.pyi: {missing}"

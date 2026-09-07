@@ -225,11 +225,12 @@ def test_failing_op_does_not_create_the_container():
 def test_failing_op_restores_the_previous_stamp():
     """Restore, don't delete: a bad re-run must not erase a good stamp.
 
-    600 genes because the *successful* call delegates to scanpy on a scipy X,
-    and scanpy's default `percent_top=[50, 100, 200, 500]` requires at least
-    500 columns.
+    25 genes: QC no longer delegates to scanpy on a scipy X, so the fixture no
+    longer has to be wide enough for scanpy's default
+    `percent_top=[50, 100, 200, 500]`. Kept deliberately narrow — a width that
+    used to raise `IndexError` before the call could reach the route stamp.
     """
-    adata = _random_count_adata(n_obs=60, n_vars=600, density=0.1, seed=12)
+    adata = _random_count_adata(n_obs=60, n_vars=25, density=0.4, seed=12)
     pyscx.accel.calculate_qc_metrics(adata)
     good = dict(_route(adata, "calculate_qc_metrics"))
 

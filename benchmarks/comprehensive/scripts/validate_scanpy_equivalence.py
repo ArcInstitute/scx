@@ -712,11 +712,27 @@ def check_filter_genes(adata_raw) -> ValidationCheck:
 
 
 def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
-    """Compare pyscx.accel.calculate_qc_metrics() vs sc.pp.calculate_qc_metrics()."""
+    """Compare pyscx.accel.calculate_qc_metrics() vs sc.pp.calculate_qc_metrics().
+
+    Runs pyscx against an SCX file opened backed, as check_normalize_total and
+    check_log1p do. It previously ran pyscx on the same in-memory AnnData it
+    gave scanpy — and on an in-memory matrix pyscx used to delegate straight to
+    scanpy, so the check compared scanpy with itself and its recorded 0.0 error
+    measured nothing. The streaming kernel was never covered.
+
+    The comparison is now genuinely cross-implementation, so the tolerance is
+    relative rather than absolute: scanpy accumulates a float32 matrix in
+    float32, and a per-gene total above 2**24 loses integer resolution there
+    (~1e2 absolute on a census-scale gene), while the streaming kernel
+    accumulates in f64. That is scanpy's rounding, not a pyscx regression, and
+    an absolute 1e-5 gate would fail on any large dataset.
+    """
     import pyscx
     import scanpy as sc
 
     ensure_metadata_columns(adata_raw)
+    base_obs = set(adata_raw.obs.columns)
+    base_var = set(adata_raw.var.columns)
 
     # Scanpy path
     adata_sc = adata_raw.copy()
@@ -724,59 +740,45 @@ def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
         adata_sc, qc_vars=["mt"], percent_top=None, log1p=True, inplace=True
     )
 
-    # pyscx path
-    adata_pyscx = adata_raw.copy()
-    pyscx.accel.calculate_qc_metrics(adata_pyscx, qc_vars=["mt"], log1p=True)
+    # pyscx path — through the streaming kernel, on a real SCX file
+    with tempfile.TemporaryDirectory() as tmp:
+        scx_path = prepare_scx_file(adata_raw, Path(tmp))
+        adata_pyscx = pyscx.open(scx_path).to_anndata(backed=True)
+        adata_pyscx.var["mt"] = np.asarray(adata_raw.var["mt"], dtype=bool)
+        pyscx.accel.calculate_qc_metrics(adata_pyscx, qc_vars=["mt"], log1p=True)
+        obs_pyscx = adata_pyscx.obs.copy()
+        var_pyscx = adata_pyscx.var.copy()
 
-    # Compare obs float columns
-    float_cols = ["total_counts", "pct_counts_mt"]
-    int_cols = ["n_genes_by_counts"]
+    # Every column both sides write, not a hand-picked four: the point of the
+    # unified kernel is that the two column sets are equal.
+    added_sc_obs = set(adata_sc.obs.columns) - base_obs
+    added_sc_var = set(adata_sc.var.columns) - base_var
+    obs_cols = sorted(added_sc_obs & (set(obs_pyscx.columns) - base_obs))
+    var_cols = sorted(added_sc_var & (set(var_pyscx.columns) - base_var))
+    schema_match = added_sc_obs <= set(obs_pyscx.columns) and added_sc_var <= set(
+        var_pyscx.columns
+    )
 
-    max_float_err = 0.0
-    int_match = True
+    max_rel_err = 0.0
+    for cols, ref_frame, got_frame in (
+        (obs_cols, adata_sc.obs, obs_pyscx),
+        (var_cols, adata_sc.var, var_pyscx),
+    ):
+        for col in cols:
+            ref = np.asarray(ref_frame[col].values, dtype=np.float64)
+            got = np.asarray(got_frame[col].values, dtype=np.float64)
+            if ref.shape != got.shape:
+                schema_match = False
+                continue
+            scale = np.maximum(np.abs(ref), 1.0)
+            max_rel_err = max(max_rel_err, float(np.max(np.abs(ref - got) / scale)))
 
-    for col in float_cols:
-        if col in adata_sc.obs.columns and col in adata_pyscx.obs.columns:
-            err = max_abs_error(
-                adata_sc.obs[col].values.astype(np.float64),
-                adata_pyscx.obs[col].values.astype(np.float64),
-            )
-            max_float_err = max(max_float_err, err)
-
-    for col in int_cols:
-        if col in adata_sc.obs.columns and col in adata_pyscx.obs.columns:
-            if not np.array_equal(
-                adata_sc.obs[col].values.astype(np.int64),
-                adata_pyscx.obs[col].values.astype(np.int64),
-            ):
-                int_match = False
-
-    # Compare var columns
-    var_float_cols = ["total_counts"]
-    var_int_cols = ["n_cells_by_counts"]
-
-    for col in var_float_cols:
-        if col in adata_sc.var.columns and col in adata_pyscx.var.columns:
-            err = max_abs_error(
-                adata_sc.var[col].values.astype(np.float64),
-                adata_pyscx.var[col].values.astype(np.float64),
-            )
-            max_float_err = max(max_float_err, err)
-
-    for col in var_int_cols:
-        if col in adata_sc.var.columns and col in adata_pyscx.var.columns:
-            if not np.array_equal(
-                adata_sc.var[col].values.astype(np.int64),
-                adata_pyscx.var[col].values.astype(np.int64),
-            ):
-                int_match = False
-
-    float_threshold = 1e-5
+    rel_threshold = 1e-5
     return ValidationCheck(
         name="calculate_qc_metrics",
-        passed=max_float_err < float_threshold and int_match,
-        metrics={"max_float_error": max_float_err, "int_exact_match": int_match},
-        thresholds={"max_float_error": float_threshold, "int_exact_match": True},
+        passed=max_rel_err < rel_threshold and schema_match,
+        metrics={"max_rel_error": max_rel_err, "schema_match": schema_match},
+        thresholds={"max_rel_error": rel_threshold, "schema_match": True},
     )
 
 
