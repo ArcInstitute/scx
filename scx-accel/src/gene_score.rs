@@ -44,6 +44,17 @@ pub enum ScoreMethod {
         /// Seed for the deterministic (non-numpy) control sampler.
         random_state: u64,
     },
+    /// scanpy `score_genes` with the control set supplied by the caller:
+    /// `mean(gene_list) − mean(ctrl)`, no binning and no sampling.
+    ///
+    /// This is the exact-parity mode. `Control`'s sampler is deterministic but
+    /// is not numpy's, so it draws different control genes from scanpy and the
+    /// absolute scores differ; handing in the controls removes the only step
+    /// the two implementations disagree on.
+    ControlSet {
+        /// 0-based column indices, de-duplicated by the caller.
+        ctrl: Vec<u32>,
+    },
     /// Per-cell mean over `gene_list`.
     Mean,
     /// Per-cell decoupler `mt.zscore`: `Σ_{g} (x_g − mean_g)/std_g / sqrt(k)`.
@@ -338,33 +349,54 @@ pub fn score_genes<S: ShardSource + Sync>(
                 *random_state,
             );
 
-            // Fuse the two weight vectors into one: +1/k_list on list genes,
-            // −1/|control| on control genes. This halves the per-nonzero inner
-            // work in `streaming_weighted_row_sums` (one weight vector, not two).
-            // Use `+=`/`-=` so the fused weight is `w_list[g] − w_ctrl[g]` even
-            // if a gene were in both sets (today they are disjoint — scanpy's
-            // `ctrl_as_ref=True` removes scored genes from the control set).
-            // Numerics: the score is `Σ(w_list − w_ctrl)·v` accumulated in one
-            // f64 pass, which matches the previous `(Σ w_list·v) − (Σ w_ctrl·v)`
-            // up to f64 re-association (single accumulator vs two subtracted
-            // once) — within the tolerance of the scanpy parity test.
-            let mut w = vec![0.0f64; n_vars];
-            let inv_list = 1.0 / k_list;
-            for &g in gene_list {
-                w[g as usize] += inv_list;
-            }
-            if !control.is_empty() {
-                let inv_ctrl = 1.0 / control.len() as f64;
-                for &g in &control {
-                    w[g as usize] -= inv_ctrl;
+            let w = control_weights(gene_list, &control, n_vars);
+            let out = streaming_weighted_row_sums(source, std::slice::from_ref(&w))?;
+            Ok(out.into_iter().next().unwrap())
+        }
+        ScoreMethod::ControlSet { ctrl } => {
+            for &g in ctrl {
+                if g as usize >= n_vars {
+                    return Err(AccelError::InvalidInput(format!(
+                        "score_genes: ctrl_genes index {g} out of range (n_vars={n_vars})"
+                    )));
                 }
             }
-
-            // Empty control set → no negative entries, so score = mean(list).
+            let w = control_weights(gene_list, ctrl, n_vars);
             let out = streaming_weighted_row_sums(source, std::slice::from_ref(&w))?;
             Ok(out.into_iter().next().unwrap())
         }
     }
+}
+
+/// The fused `mean(gene_list) − mean(control)` weight vector.
+///
+/// Fusing the two weight vectors into one halves the per-nonzero inner work in
+/// [`streaming_weighted_row_sums`] (one weight vector, not two). `+=` / `-=`
+/// rather than `=` so the fused weight is `w_list[g] − w_ctrl[g]` when a gene
+/// is in both sets: [`ScoreMethod::Control`] never produces that (scanpy's
+/// `ctrl_as_ref=True` removes scored genes from the control set), but
+/// [`ScoreMethod::ControlSet`] takes whatever the caller passes, and scanpy
+/// subtracts the raw control mean without removing the overlap either.
+///
+/// An empty control set leaves no negative entries, so the score degenerates to
+/// `mean(gene_list)`.
+///
+/// Numerics: the score becomes `Σ(w_list − w_ctrl)·v` in one f64 accumulator,
+/// which matches `(Σ w_list·v) − (Σ w_ctrl·v)` up to f64 re-association —
+/// pinned to 1e-12 by `fused_weight_matches_two_accumulator_within_tolerance`.
+fn control_weights(gene_list: &[u32], control: &[u32], n_vars: usize) -> Vec<f64> {
+    let mut w = vec![0.0f64; n_vars];
+    let inv_list = 1.0 / gene_list.len() as f64;
+    for &g in gene_list {
+        w[g as usize] += inv_list;
+    }
+    if !control.is_empty() {
+        let inv_ctrl = 1.0 / control.len() as f64;
+        for &g in control {
+            w[g as usize] -= inv_ctrl;
+        }
+    }
+    w
 }
 
 #[cfg(test)]

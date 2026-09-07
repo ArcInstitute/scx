@@ -181,13 +181,6 @@ _OPTIONAL_PATHS = [
     ),
     ("log1p", "scanpy", "scanpy", "log1p", lambda a: pyscx.accel.log1p(a)),
     (
-        "calculate_qc_metrics",
-        "scanpy",
-        "scanpy",
-        "calculate_qc_metrics",
-        lambda a: pyscx.accel.calculate_qc_metrics(a),
-    ),
-    (
         "filter_cells",
         "scanpy",
         "scanpy",
@@ -436,6 +429,27 @@ def test_base_install_runs_the_de_and_pca_surface(adata):
         pyscx.accel.pdex_ref(adata, groupby="cond", reference="ctrl")
         pyscx.accel.pca(adata, n_comps=5)
     assert adata.obsm["X_pca"].shape == (adata.n_obs, 5)
+
+
+def test_base_install_computes_qc_metrics_on_any_x(adata, scx_path):
+    """`calculate_qc_metrics` no longer needs scanpy on *any* matrix.
+
+    It used to be in `_OPTIONAL_PATHS`: a scipy/dense `X` was handed to
+    `sc.pp.calculate_qc_metrics`, so the op raised on a base install unless the
+    caller kept `X` backed. It now runs one native kernel whatever `X` is, which
+    is why the `scanpy` extra no longer lists it.
+    """
+    import scipy.sparse as sp
+
+    with blocked(*BASE):
+        assert sp.issparse(adata.X), "premise: the in-memory arm, not the backed one"
+        pyscx.accel.calculate_qc_metrics(adata)
+        assert "total_counts" in adata.obs
+        assert "mean_counts" in adata.var
+
+        backed = pyscx.open(scx_path).to_anndata(backed=True)
+        pyscx.accel.calculate_qc_metrics(backed)
+        assert set(backed.obs.columns) >= set(adata.obs.columns)
 
 
 def test_base_install_preprocesses_a_backed_x(scx_path):

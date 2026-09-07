@@ -1367,12 +1367,14 @@ impl ScxBackedSparseDataset {
         &self,
         qc_bits: &[u64],
         n_qc: usize,
+        percent_top: &[usize],
     ) -> Result<projected_agg::QcRowStats, String> {
         projected_agg::qc_row_pass(
             &self.backed,
             self.col_projection.as_ref().map(|c| c.as_slice()),
             qc_bits,
             n_qc,
+            percent_top,
         )
         .map_err(|e| e.to_string())
     }

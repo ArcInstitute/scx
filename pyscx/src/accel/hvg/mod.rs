@@ -13,7 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::backed::ScxBackedSparseDataset;
+use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::optional_deps::{import_optional_with_hint, EXTRA_SCANPY};
 
@@ -168,6 +168,21 @@ pub fn highly_variable_genes<'py>(
     // would misalign those stats against the request-ordered var — reject.
     super::prepare_target(py, adata, "highly_variable_genes")?;
 
+    // Resolve the source matrix and guard it *before* the route stamp: a guard
+    // has to refuse before `adata` is touched (see `accel::prepare_target`'s
+    // ordering invariant), and `prepare_target` itself only inspected
+    // `adata.X`, which says nothing about a named layer.
+    let x = match layer {
+        // Typed error naming the layer, as `calculate_qc_metrics` /
+        // `score_genes` / `select_de_matrix` do, rather than the mapping's
+        // bare `KeyError`.
+        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?,
+        None => adata.getattr("X")?,
+    };
+    super::reject_presentation_ordered_source(&x, "highly_variable_genes")?;
+
     if prefer_format == "csc" {
         // Explicit CSC: single-batch seurat_v3 only. Reject mismatched
         // configurations with a clear message rather than silently falling
@@ -192,6 +207,17 @@ pub fn highly_variable_genes<'py>(
             return Err(PyRuntimeError::new_err(
                 "prefer_format='csc' for HVG reads adata.X only and does not support \
                  layer=; pass layer=None or use prefer_format='csr'",
+            ));
+        }
+        // Reached via `adata.X = adata.layers["counts"]`, where `layer` is
+        // already None, so the advice above would name a kwarg the caller is
+        // not using. A layer handle carries no CSC sidecar of its own.
+        if x.cast::<ScxBackedLayerDataset>().is_ok() {
+            return Err(PyRuntimeError::new_err(
+                "prefer_format='csc' for HVG does not support a layer source \
+                 (adata.X is a layer handle; the CSC sidecar belongs to the file's \
+                 X). Restore adata.X to the base backed dataset, or use \
+                 prefer_format='csr'",
             ));
         }
         // GPU CSC reduce when a GPU is requested and available, else CPU CSC.
@@ -329,17 +355,11 @@ pub fn highly_variable_genes<'py>(
     };
 
     // F3: read the source matrix from `adata.layers[layer]` when a
-    // layer is named (scanpy parity); otherwise from `adata.X`. The
-    // downstream dispatch on `ScxBackedSparseDataset` /
-    // `ScxLazyTransformedDataset` works identically — if the layer is
-    // itself an SCX-backed dataset (e.g. set via
-    // `adata.layers["counts"] = adata.X.copy()`), the streaming path
-    // applies; otherwise we fall through to scanpy with `layer=`.
-    let x = match layer {
-        Some(name) => adata.getattr("layers")?.get_item(name)?,
-        None => adata.getattr("X")?,
-    };
-
+    // layer is named (scanpy parity); otherwise from `adata.X`. A backed
+    // file's layer arrives as `ScxBackedLayerDataset`, which has its own
+    // dispatch arm below (it is not an `ScxBackedSparseDataset`); a scipy
+    // layer falls through to the in-memory path, and a flavor scx has no
+    // native kernel for falls through to scanpy with `layer=`.
     // Auto-detect CSC, mirroring DE's gpu_csc_v3 default: a single-batch
     // seurat_v3 GPU run on a backed dataset that exposes a CSC sidecar uses
     // the column-major reduce (route gpu_csc_v3) even under the default
@@ -395,23 +415,21 @@ pub fn highly_variable_genes<'py>(
     // batch, a missing `batch_key`, …) — see RouteStamp.
     let route = super::route::RouteStamp::write(py, adata, "highly_variable_genes", &info)?;
 
-    // ── Try SCX backed dataset ──────────────────────────────────────────
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let backed_ref = backed.borrow();
-        let reader = Arc::clone(&backed_ref.backed);
-        let n_vars = backed_ref.shape_val.1;
-        let n_obs = backed_ref.shape_val.0;
-        let kept = backed_ref.kept_to_global.clone();
-        let col_proj = backed_ref.col_projection_arc();
-        drop(backed_ref);
-
-        let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
+    // ── Try a backed SCX dataset: `adata.X` or a backed layer handle ────
+    if let Some(parts) = super::backed_shard_parts(&x) {
+        let source = build_shard_source(
+            &parts.reader,
+            &[],
+            &parts.kept,
+            &parts.col_proj,
+            parts.n_vars,
+        );
         return route.settle(hvg_on_source(
             py,
             adata,
             &source,
-            n_obs,
-            n_vars,
+            parts.n_obs,
+            parts.n_vars,
             n_top_genes,
             flavor,
             batch_key,

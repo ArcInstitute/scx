@@ -1895,9 +1895,9 @@ visible-gene totals — the same numbers `adata.obs["total_counts"]` and
 | `filter_genes`           | ✓   | —   | `min_cells`, `max_cells`, `min_counts`, `max_counts`                  | —                                              |
 | `subset_obs`             | ✓   | —   | — (`adata[mask].copy()`, without materializing)                       | `mask_or_indices`                              |
 | `subset_var`             | ✓   | —   | — (`adata[:, mask].copy()`, without materializing)                    | `mask_or_indices`                              |
-| `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`                                         | `prefer_format`                                |
+| `calculate_qc_metrics`   | ✓   | —   | `qc_vars`, `log1p`, `inplace`, `layer`, `percent_top`                 | `prefer_format`                                |
 | `highly_variable_genes`  | ✓   | ✓   | `n_top_genes`, `flavor`, `batch_key`, `span`, `subset`, `n_bins`, `layer` | `device`, `prefer_format`                  |
-| `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`           |
+| `score_genes`            | ✓   | —   | `gene_list`, `ctrl_size`, `gene_pool`, `n_bins`, `score_name`, `random_state` | `method`, `layer`, `device`, `ctrl_genes` |
 | `pflog`                 | ✓   | —   | — (no scanpy equivalent)                                             | `alpha`, `store`, `n_components`, `store_repr`, `out`, `shard_size`, `layer`, `device` |
 | `pca`                    | ✓   | ✓   | `n_comps`, `zero_center`, `random_state`                              | `device`, `method`, `qr_method`, `prefer_format`, `allow_tf32`, `n_oversamples`, `n_power_iterations`, `spmm_policy`, `memory_budget` |
 | `neighbors`              | ✓   | ✓   | `n_neighbors`, `use_rep`, `random_state`                              | `device`, `ef_construction`, `ef_search`       |
@@ -1939,7 +1939,7 @@ Entries that accept it:
 | `pyscx.accel.highly_variable_genes` | Single-batch seurat_v3 only — single-pass per-column accumulators with no `O(n_vars)` row-wise scratch. Multi-batch and non-seurat_v3 raise. |
 | `pyscx.accel.rank_genes_groups` | Per gene chunk: read CSC slab + scatter into row-major dense buffer (vs decode every row + project for CSR). Clearest CSC win. |
 | `pyscx.accel.pseudobulk_dex` | Filtered-gene subsets only (`gene_indices=...` or column projection on `adata.X`). Full-gene pseudobulk has no CSC win and raises. |
-| `pyscx.accel.calculate_qc_metrics` | Gene-axis aggregations only (`total_counts`, `n_cells_by_counts`); cell-axis stays CSR. Both axes take one shard pass each, whatever the `qc_vars` count. |
+| `pyscx.accel.calculate_qc_metrics` | Gene-axis aggregations only (`total_counts`, `n_cells_by_counts`, and the `mean_counts` / `pct_dropout_by_counts` derived from them); cell-axis stays CSR. Both axes take one shard pass each for up to 64 `qc_vars`, with one extra row pass per additional 64, and `percent_top` adds none. `prefer_format="csc"` rejects a scipy/dense `X` and a layer source (`layer=`, or a layer handle assigned to `X`); `layer=` works on the default CSR route. |
 | `pyscx.accel.col_sums` / `col_nnz` / `col_min` / `col_max` / `col_var` | Per-column aggregations on `ScxBackedSparseDataset` / `ScxLazyTransformedDataset`. |
 | `pyscx.accel.pca` | **Rejects `prefer_format="csc"`** with `ValueError`. Covariance build and randomized SpMM are row-major; CSC offers no measurable speed-up. |
 
@@ -2749,7 +2749,7 @@ Three methods via `method=`:
 
 | `method`    | Score per cell                                                   | Notes |
 |-------------|------------------------------------------------------------------|-------|
-| `"control"` | `mean(gene_list) − mean(control)` (default; scanpy `score_genes`)| Control genes sampled from expression-matched bins. |
+| `"control"` | `mean(gene_list) − mean(control)` (default; scanpy `score_genes`)| Control genes sampled from expression-matched bins. Pass `ctrl_genes=` to supply them instead and get exact scanpy parity. |
 | `"mean"`    | `mean(gene_list)`                                                | Fastest; no control set, ignores `gene_pool`/`ctrl_size`/`n_bins`. |
 | `"zscore"`  | `Σ (xᵍ − meanᵍ)/stdᵍ / √k` over the set                          | decoupler [`mt.zscore`](https://decoupler.readthedocs.io/en/latest/api/generated/decoupler.mt.zscore.html); per-gene std uses ddof=1. |
 
@@ -2771,18 +2771,50 @@ adata.obs["t_cell_score"]   # per-cell signature score
 # lightweight alternatives when score_genes' control sampling is too slow
 pyscx.accel.score_genes(adata, marker_genes, method="mean",   score_name="sig_mean")
 pyscx.accel.score_genes(adata, marker_genes, method="zscore", score_name="sig_z")
+
+# exact parity: score against a control set you chose (or scanpy chose)
+pyscx.accel.score_genes(
+    adata,
+    ["CD3D", "CD3E", "CD8A", "GZMB"],
+    ctrl_genes=my_control_genes,       # no binning, no sampling
+    score_name="t_cell_score",
+)
 ```
 
-> **Divergence from scanpy.** The `control` method replicates scanpy's
-> rank-binning + control-gene sampling algorithm, but the sampler is
-> Rust-native (a fixed `ChaCha8` stream seeded by `random_state`, reproducible
-> across `rand` upgrades) and seeded independently of numpy, so the *specific*
-> control genes (and therefore the absolute scores) differ from
-> `sc.tl.score_genes`. The score is deterministic for a fixed `random_state` and
-> rank-correlates near-perfectly with scanpy in practice. Genes in `gene_list`
-> (or an explicit `gene_pool`) not present in `adata.var_names` are dropped with
-> a `UserWarning`. Use `layer=` to score a named layer instead of `X`. CPU-only —
-> `device` is accepted for API symmetry but there is no GPU kernel.
+> **Divergence from scanpy, and how to avoid it.** The `control` method
+> replicates scanpy's rank-binning + control-gene sampling algorithm, but the
+> sampler is Rust-native (a fixed `ChaCha8` stream seeded by `random_state`,
+> reproducible across `rand` upgrades) and seeded independently of numpy. It
+> therefore draws *different* control genes, and the scores differ by more than
+> rounding.
+>
+> Measured against scanpy 1.12 on a synthetic 400 × 2000 matrix with
+> log-normally distributed gene means, at **all defaults** (`ctrl_size=50`,
+> `n_bins=25`): Spearman **0.958**, maximum absolute difference **0.124** against
+> a score range of 1.095 — about **11 %** of the range. At 5000 genes, 0.971 and
+> 0.232 of 1.824. Forcing more sampling widens it: `ctrl_size=25` gives 0.891,
+> `ctrl_size=10` gives 0.721.
+>
+> The divergence disappears only when scanpy does not sample at all — when
+> `ctrl_size` is at least the bin size (`round(n_genes / (n_bins − 1))`), whole
+> bins are taken and both implementations pick the same set, agreeing to ~1e-7.
+> That is worth knowing before writing a parity check: at ~1200 genes with the
+> defaults the bin size *is* 50, so a test written there passes without
+> exercising anything.
+>
+> **`ctrl_genes=` is the exact-parity route.** It takes the control set as an
+> argument and skips the selection entirely, so the score matches
+> `sc.tl.score_genes` given the controls scanpy used — and it works on a backed
+> `X`, which `sc.tl.score_genes` refuses outright (`NotImplementedError`). It
+> requires `method="control"` and rejects an explicit `gene_pool=`, which exists
+> only as the universe to sample from; `ctrl_size` / `n_bins` / `random_state`
+> are ignored, there being no sampling left to steer.
+>
+> Genes in `gene_list`, `ctrl_genes` (or an explicit `gene_pool`) not present in
+> `adata.var_names` are dropped with a `UserWarning`; an empty `gene_list` or
+> `ctrl_genes` after resolution raises. Use `layer=` to score a named layer
+> instead of `X`. CPU-only — `device` is accepted for API symmetry but there is
+> no GPU kernel.
 
 ### PFlog normalization (`pyscx.accel.pflog`)
 

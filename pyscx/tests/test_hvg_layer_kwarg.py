@@ -101,3 +101,57 @@ def test_prefer_csc_with_layer_raises():
             prefer_format="csc",
             layer="counts",
         )
+
+
+def test_layer_on_a_backed_adata_reads_the_layer(tmp_dir):
+    """`layer=` must work when the layer is an SCX handle, not just scipy.
+
+    Every other test in this file uses an in-memory scipy AnnData, so nothing
+    covered the case the kwarg exists for: a file opened backed, whose
+    `adata.layers[name]` is an `ScxBackedLayerDataset` rather than a
+    `ScxBackedSparseDataset`. The dispatch cast missed that type and fell
+    through to `scipy.sparse.csr_matrix(handle)`, which raises
+    `ValueError: unrecognized csr_matrix constructor input`.
+    """
+    import pyscx
+    from pyscx import ScxBackedLayerDataset, accel
+
+    adata = _make_counts_adata(n_obs=200, n_vars=120, seed=5)
+    adata.var_names = [f"g{i}" for i in range(adata.n_vars)]
+    adata.obs_names = [f"c{i}" for i in range(adata.n_obs)]
+    adata.layers["counts"] = adata.X.copy()
+
+    path = str(tmp_dir / "hvg_backed_layer.scx")
+    pyscx.from_anndata(adata, path)
+    backed = pyscx.open(path).to_anndata(backed=True)
+    assert isinstance(backed.layers["counts"], ScxBackedLayerDataset), (
+        "premise: the layer must be an SCX handle, or this is the scipy case again"
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        accel.highly_variable_genes(
+            backed, n_top_genes=10, flavor="seurat_v3", layer="counts", device="cpu"
+        )
+
+    # The layer is a byte copy of X, so the selection must match layer=None.
+    reference = pyscx.open(path).to_anndata(backed=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        accel.highly_variable_genes(
+            reference, n_top_genes=10, flavor="seurat_v3", device="cpu"
+        )
+    assert list(backed.var["highly_variable"]) == list(reference.var["highly_variable"])
+
+
+def test_unknown_layer_names_itself():
+    """Typed error naming the layer, matching QC / score_genes / DE.
+
+    This leaked the mapping's bare `KeyError` while its siblings raised a
+    `ValueError` naming the layer.
+    """
+    from pyscx import accel
+
+    adata = _make_counts_adata()
+    with pytest.raises(ValueError, match=r"nope"):
+        accel.highly_variable_genes(adata, n_top_genes=10, layer="nope")

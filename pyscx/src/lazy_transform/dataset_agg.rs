@@ -83,7 +83,7 @@ impl ScxLazyTransformedDataset {
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
     pub(crate) fn streaming_row_nnz_and_sums(&self) -> Result<(Vec<i64>, Vec<f64>), String> {
-        let stats = self.streaming_qc_row_pass(&[], 0)?;
+        let stats = self.streaming_qc_row_pass(&[], 0, &[])?;
         Ok((stats.nnz, stats.sums))
     }
 
@@ -350,11 +350,16 @@ impl ScxLazyTransformedDataset {
         &self,
         qc_bits: &[u64],
         n_qc: usize,
+        percent_top: &[usize],
     ) -> Result<crate::projected_agg::QcRowStats, String> {
         let cols = self.col_projection.clone();
         let n_visible = cols.as_deref().map_or(self.backed.shape().1, |c| c.len());
-        crate::projected_agg::ensure_qc_pass_args(n_qc, qc_bits, n_visible);
-        let mut out = crate::projected_agg::QcRowStats::zeroed(self.backed.shape().0, n_qc);
+        crate::projected_agg::ensure_qc_pass_args(n_qc, qc_bits, n_visible, percent_top);
+        let mut out = crate::projected_agg::QcRowStats::zeroed(
+            self.backed.shape().0,
+            n_qc,
+            percent_top.len(),
+        );
         let mut global_row = 0usize;
         prefetch::for_each_shard_ordered_uncached(
             &*self.backed,
@@ -370,10 +375,15 @@ impl ScxLazyTransformedDataset {
                         &scx_engine::projection::project_csr(&csr, c),
                         global_row,
                         qc_bits,
+                        percent_top,
                         &mut out,
                     ),
                     None => crate::projected_agg::accumulate_qc_rows_into(
-                        &csr, global_row, qc_bits, &mut out,
+                        &csr,
+                        global_row,
+                        qc_bits,
+                        percent_top,
+                        &mut out,
                     ),
                 }
                 global_row += n_rows;

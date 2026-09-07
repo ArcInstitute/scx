@@ -15,6 +15,7 @@ non-DE ops still reject `"auto"`).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Literal
 
 # Non-DE ops: explicit CSR/CSC opt-in, default CSR.
@@ -247,7 +248,53 @@ def calculate_qc_metrics(
     log1p: bool = True,
     inplace: bool = True,
     prefer_format: PreferFormat = "csr",
-) -> Any: ...
+    *,
+    layer: str | None = None,
+    percent_top: Sequence[int] | None = None,
+) -> Any:
+    """Per-cell and per-gene QC metrics, matching `sc.pp.calculate_qc_metrics`.
+
+    One native kernel for every kind of `X` — backed, lazy, a backed layer
+    handle, or an in-memory scipy/dense matrix — so the obs/var column set does
+    not depend on what the matrix happens to be.
+
+    `layer` reads `adata.layers[name]` instead of `adata.X`.
+
+    `percent_top` requests `pct_counts_in_top_<n>_genes` for each 1-indexed
+    position, computed in the same shard pass as everything else. It defaults to
+    `None` rather than scanpy's `(50, 100, 200, 500)`: that default raises on any
+    file with fewer than 500 genes. Positions outside `1..=n_visible_genes`
+    raise `ValueError`.
+    """
+
+
+def score_genes(
+    adata: Any,
+    gene_list: Sequence[str],
+    ctrl_size: int = 50,
+    gene_pool: Sequence[str] | None = None,
+    n_bins: int = 25,
+    score_name: str = "score",
+    random_state: int = 0,
+    method: Literal["control", "mean", "zscore"] = "control",
+    layer: str | None = None,
+    device: str = "auto",
+    *,
+    ctrl_genes: Sequence[str] | None = None,
+) -> None:
+    """Per-cell gene-set score, written to `adata.obs[score_name]`.
+
+    `method="control"` is `sc.tl.score_genes`: `mean(gene_list) - mean(control)`
+    with controls sampled from expression-matched bins. The sampler is
+    Rust-native rather than numpy's, so it draws *different* control genes from
+    scanpy and the absolute scores differ.
+
+    `ctrl_genes` supplies the control set directly and skips the sampling, which
+    is the exact-parity route: given the same controls scanpy used, the score
+    matches. It also works on a backed `X`, where `sc.tl.score_genes` raises.
+    It requires `method="control"` and rejects an explicit `gene_pool`, which
+    only exists to be sampled from.
+    """
 
 
 # ---------------------------------------------------------------------------

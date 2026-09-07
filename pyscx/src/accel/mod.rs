@@ -72,20 +72,97 @@ pub(crate) fn reject_preserve_var_order(adata: &Bound<'_, PyAny>, op: &str) -> P
     let Ok(x) = adata.getattr("X") else {
         return Ok(());
     };
-    if let Ok(backed) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
-        if backed.borrow().col_presentation_arc().is_some() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "{op} is not supported on a backed X whose gene axis is in a \
-                 caller-requested order — opened with preserve_var_order=True, or \
-                 reordered through adata[:, idx] / X[:, [7, 2, 11]] / X[:, ::-1] \
-                 (the streaming kernels decode columns in sorted on-disk order, \
-                 which would misalign the result against adata.var). Run {op} \
-                 before reordering, select with a sorted index or a boolean mask, \
-                 or materialise first with `adata.X = adata.X.to_memory()`."
-            )));
-        }
+    reject_presentation_ordered_source(&x, op)
+}
+
+/// Refuse a presentation-ordered gene axis on **the matrix an op will actually
+/// read**, which is not always `adata.X`.
+///
+/// Two ways the `adata.X`-only check misses it, both of which returned silently
+/// mislabelled genes rather than an error:
+///
+/// * a backed *layer* handle carries its own permutation, and
+///   `cast::<ScxBackedSparseDataset>()` does not match `ScxBackedLayerDataset`;
+/// * an op resolving `layer=` reads a matrix `adata.X` says nothing about — so
+///   materialising `X` (`adata.X = adata.X.to_memory()`) disarmed the guard
+///   while the layer stayed presentation-ordered.
+///
+/// The streaming kernels emit the *sorted* projection, so a request-ordered
+/// `adata.var` would be labelled with the wrong genes: asking for the second
+/// gene of `var_names=["g2", "g0"]` returned `g0`'s values under `g2`'s name.
+/// Every op that resolves a source calls this on the resolved matrix.
+pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str) -> PyResult<()> {
+    let ordered = if let Ok(backed) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
+        backed.borrow().col_presentation_arc().is_some()
+    } else if let Ok(layer) = x.cast::<crate::backed::ScxBackedLayerDataset>() {
+        layer.borrow().inner.col_presentation_arc().is_some()
+    } else {
+        false
+    };
+    if ordered {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op} is not supported on a backed matrix whose gene axis is in a \
+             caller-requested order — opened with preserve_var_order=True, or \
+             reordered through adata[:, idx] / X[:, [7, 2, 11]] / X[:, ::-1] \
+             (the streaming kernels decode columns in sorted on-disk order, \
+             which would misalign the result against adata.var). This covers a \
+             named `layer=` and a layer handle assigned to X, not just X \
+             itself — and materialising `adata.X` does not help when the \
+             permutation is on the layer. Run {op} before reordering, select \
+             with a sorted index or a boolean mask, or materialise the matrix \
+             the op reads: `adata.X = adata.X.to_memory()`, or \
+             `adata.layers[name] = adata.layers[name].to_memory()` for a \
+             named layer."
+        )));
     }
     Ok(())
+}
+
+/// The shard-source inputs of a backed dataset, however it reached us.
+///
+/// `adata.X` on a backed file is `crate::backed::ScxBackedSparseDataset`; `adata.layers[name]`
+/// is `crate::backed::ScxBackedLayerDataset`, a distinct `#[pyclass]` wrapping one. Every
+/// accelerator that dispatched with a bare `cast::<crate::backed::ScxBackedSparseDataset>()`
+/// therefore missed a layer handle and fell through to `owned_csr`, where
+/// `scipy.sparse.csr_matrix(<handle>)` raises "unrecognized csr_matrix
+/// constructor input" — so `layer=` was broken on exactly the files it exists
+/// for, and every test for it used an in-memory scipy AnnData.
+///
+/// Returning the parts rather than a borrow keeps the `PyRef` guard local: the
+/// layer's `inner` lives behind a `Ref`, so callers cannot hold a reference to
+/// it across `build_shard_source`.
+pub(crate) struct BackedShardParts {
+    pub(crate) reader: std::sync::Arc<scx_format_io::BackedCsrReader>,
+    pub(crate) n_obs: usize,
+    pub(crate) n_vars: usize,
+    pub(crate) kept: Option<std::sync::Arc<Vec<u64>>>,
+    pub(crate) col_proj: Option<std::sync::Arc<Vec<u32>>>,
+}
+
+impl BackedShardParts {
+    fn of_dataset(ds: &crate::backed::ScxBackedSparseDataset) -> Self {
+        Self {
+            reader: std::sync::Arc::clone(&ds.backed),
+            n_obs: ds.shape_val.0,
+            n_vars: ds.shape_val.1,
+            kept: ds.kept_to_global.clone(),
+            col_proj: ds.col_projection_arc(),
+        }
+    }
+}
+
+/// Extract [`BackedShardParts`] from `adata.X` **or** a backed layer handle.
+///
+/// `None` means "not a backed SCX matrix" — the caller falls on to its lazy
+/// and in-memory arms as before.
+pub(crate) fn backed_shard_parts(x: &Bound<'_, PyAny>) -> Option<BackedShardParts> {
+    if let Ok(ds) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
+        return Some(BackedShardParts::of_dataset(&ds.borrow()));
+    }
+    if let Ok(layer) = x.cast::<crate::backed::ScxBackedLayerDataset>() {
+        return Some(BackedShardParts::of_dataset(&layer.borrow().inner));
+    }
+    None
 }
 
 /// The prologue every `pyscx.accel.*` op that writes back to `adata` runs first.

@@ -712,71 +712,131 @@ def check_filter_genes(adata_raw) -> ValidationCheck:
 
 
 def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
-    """Compare pyscx.accel.calculate_qc_metrics() vs sc.pp.calculate_qc_metrics()."""
+    """Compare pyscx.accel.calculate_qc_metrics() vs sc.pp.calculate_qc_metrics().
+
+    Runs pyscx against an SCX file opened backed, as check_normalize_total and
+    check_log1p do. It previously ran pyscx on the same in-memory AnnData it
+    gave scanpy — and on an in-memory matrix pyscx used to delegate straight to
+    scanpy, so the check compared scanpy with itself and its recorded 0.0 error
+    measured nothing. The streaming kernel was never covered.
+
+    The comparison is now genuinely cross-implementation, so the tolerance is
+    relative rather than absolute: scanpy accumulates a float32 matrix in
+    float32, and a per-gene total above 2**24 loses integer resolution there
+    (~1e2 absolute on a census-scale gene), while the streaming kernel
+    accumulates in f64. That is scanpy's rounding, not a pyscx regression, and
+    an absolute 1e-5 gate would fail on any large dataset.
+    """
     import pyscx
     import scanpy as sc
 
     ensure_metadata_columns(adata_raw)
 
-    # Scanpy path
-    adata_sc = adata_raw.copy()
-    sc.pp.calculate_qc_metrics(
-        adata_sc, qc_vars=["mt"], percent_top=None, log1p=True, inplace=True
+    # `inplace=False` on both sides so the produced column sets are compared
+    # directly. Subtracting the input schema instead would drop any QC-named
+    # column the input already carried, which on a pre-annotated dataset makes
+    # the comparison partially or wholly vacuous — the failure mode this check
+    # is being fixed for.
+    obs_sc, var_sc = sc.pp.calculate_qc_metrics(
+        adata_raw, qc_vars=["mt"], percent_top=None, log1p=True, inplace=False
     )
 
-    # pyscx path
-    adata_pyscx = adata_raw.copy()
-    pyscx.accel.calculate_qc_metrics(adata_pyscx, qc_vars=["mt"], log1p=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        scx_path = prepare_scx_file(adata_raw, Path(tmp))
+        adata_pyscx = pyscx.open(scx_path).to_anndata(backed=True)
+        adata_pyscx.var["mt"] = np.asarray(adata_raw.var["mt"], dtype=bool)
+        obs_pyscx, var_pyscx = pyscx.accel.calculate_qc_metrics(
+            adata_pyscx, qc_vars=["mt"], log1p=True, inplace=False
+        )
+        obs_pyscx, var_pyscx = obs_pyscx.copy(), var_pyscx.copy()
 
-    # Compare obs float columns
-    float_cols = ["total_counts", "pct_counts_mt"]
-    int_cols = ["n_genes_by_counts"]
+    # Set EQUALITY, not inclusion: an extra pyscx-only column is a schema
+    # divergence too, and the whole point of the unified kernel is that the two
+    # sets are the same.
+    schema_match = set(obs_sc.columns) == set(obs_pyscx.columns) and set(
+        var_sc.columns
+    ) == set(var_pyscx.columns)
 
-    max_float_err = 0.0
+    # Integer counts must match exactly; a relative tolerance would let a
+    # one-cell error pass on any gene expressed in more than 100k cells.
+    int_cols = {"obs": ["n_genes_by_counts"], "var": ["n_cells_by_counts"]}
     int_match = True
-
-    for col in float_cols:
-        if col in adata_sc.obs.columns and col in adata_pyscx.obs.columns:
-            err = max_abs_error(
-                adata_sc.obs[col].values.astype(np.float64),
-                adata_pyscx.obs[col].values.astype(np.float64),
+    nan_match = True
+    max_rel_err = 0.0
+    for frame, ref_frame, got_frame in (
+        ("obs", obs_sc, obs_pyscx),
+        ("var", var_sc, var_pyscx),
+    ):
+        shared = sorted(set(ref_frame.columns) & set(got_frame.columns))
+        for col in shared:
+            ref = np.asarray(ref_frame[col].values)
+            got = np.asarray(got_frame[col].values)
+            if ref.shape != got.shape:
+                schema_match = False
+                continue
+            if col in int_cols[frame]:
+                if not np.array_equal(ref.astype(np.int64), got.astype(np.int64)):
+                    int_match = False
+                continue
+            ref = ref.astype(np.float64)
+            got = got.astype(np.float64)
+            # NaN is compared as a *pattern*, not a value. `np.max` over a NaN
+            # yields NaN, and Python's `max(0.0, nan)` returns 0.0 — so a single
+            # NaN would have zeroed the recorded error and passed the gate over
+            # every finite mismatch in that column. This op has a documented
+            # NaN divergence (scanpy gives NaN for `pct_counts_<v>` on a
+            # zero-total cell where pyscx gives 0.0), which is exactly the input
+            # that would have triggered it.
+            ref_nan, got_nan = np.isnan(ref), np.isnan(got)
+            # One divergence is documented and intended: scanpy divides a
+            # subset sum by a zero row total and gets NaN, where the streaming
+            # kernel publishes 0.0 (its convention for a cell with nothing in
+            # it). Accept exactly that shape — scanpy NaN against our 0.0 — and
+            # treat every other NaN disagreement as a failure. A strict pattern
+            # match would have failed the gate on a dataset containing an empty
+            # cell, which is not a regression.
+            expected_divergence = (
+                col.startswith("pct_counts_")
+                and not col.startswith("pct_counts_in_top_")
+                and bool(np.all(got[ref_nan & ~got_nan] == 0.0))
             )
-            max_float_err = max(max_float_err, err)
+            mismatch = ref_nan != got_nan
+            if expected_divergence:
+                mismatch &= ~(ref_nan & ~got_nan)
+            if np.any(mismatch):
+                nan_match = False
+                continue
+            finite = ~(ref_nan | got_nan)
+            if not np.any(finite):
+                continue
+            # Relative, because scanpy accumulates a float32 matrix in float32:
+            # above 2**24 a per-gene total loses integer resolution there (~1e2
+            # absolute on a census-scale gene) while the streaming kernel
+            # accumulates in f64. That is scanpy's rounding, not a regression,
+            # and an absolute 1e-5 gate would fail on any large dataset.
+            scale = np.maximum(np.abs(ref[finite]), 1.0)
+            err = float(np.max(np.abs(ref[finite] - got[finite]) / scale))
+            max_rel_err = max(max_rel_err, err)
 
-    for col in int_cols:
-        if col in adata_sc.obs.columns and col in adata_pyscx.obs.columns:
-            if not np.array_equal(
-                adata_sc.obs[col].values.astype(np.int64),
-                adata_pyscx.obs[col].values.astype(np.int64),
-            ):
-                int_match = False
-
-    # Compare var columns
-    var_float_cols = ["total_counts"]
-    var_int_cols = ["n_cells_by_counts"]
-
-    for col in var_float_cols:
-        if col in adata_sc.var.columns and col in adata_pyscx.var.columns:
-            err = max_abs_error(
-                adata_sc.var[col].values.astype(np.float64),
-                adata_pyscx.var[col].values.astype(np.float64),
-            )
-            max_float_err = max(max_float_err, err)
-
-    for col in var_int_cols:
-        if col in adata_sc.var.columns and col in adata_pyscx.var.columns:
-            if not np.array_equal(
-                adata_sc.var[col].values.astype(np.int64),
-                adata_pyscx.var[col].values.astype(np.int64),
-            ):
-                int_match = False
-
-    float_threshold = 1e-5
+    rel_threshold = 1e-5
     return ValidationCheck(
         name="calculate_qc_metrics",
-        passed=max_float_err < float_threshold and int_match,
-        metrics={"max_float_error": max_float_err, "int_exact_match": int_match},
-        thresholds={"max_float_error": float_threshold, "int_exact_match": True},
+        passed=max_rel_err < rel_threshold
+        and schema_match
+        and int_match
+        and nan_match,
+        metrics={
+            "max_rel_error": max_rel_err,
+            "schema_match": schema_match,
+            "int_exact_match": int_match,
+            "nan_pattern_match": nan_match,
+        },
+        thresholds={
+            "max_rel_error": rel_threshold,
+            "schema_match": True,
+            "int_exact_match": True,
+            "nan_pattern_match": True,
+        },
     )
 
 

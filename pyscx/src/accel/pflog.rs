@@ -46,7 +46,6 @@ use scx_format_io::shard_source::SingleShardSource;
 use scx_format_io::{ProvenanceEntry, ScxWriter, ShardSource};
 use scx_sparse::ScxCsr;
 
-use crate::backed::ScxBackedSparseDataset;
 use crate::convert::dtype::UnsFormat;
 use crate::convert::from_anndata::build_output_header;
 use crate::convert::h5ad::extract_scx_overrides;
@@ -54,6 +53,7 @@ use crate::convert::scx_to_scx::{for_each_coo_shard, for_each_dense_shard};
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::to_pyerr;
 
+use super::backed_shard_parts;
 use super::hvg::build_shard_source;
 
 /// Default guard for the in-memory dense layer (`n_obs · n_vars` elements).
@@ -156,22 +156,30 @@ pub fn pflog(
 
     // Select the source matrix (layer or X).
     let x = match layer {
-        Some(name) => adata.getattr("layers")?.get_item(name)?,
+        // Typed error naming the layer, as `calculate_qc_metrics` /
+        // `score_genes` / `select_de_matrix` do, rather than the mapping's
+        // bare `KeyError`.
+        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?,
         None => adata.getattr("X")?,
     };
+
+    // `prepare_target` only inspected `adata.X`; guard the matrix actually read.
+    super::reject_presentation_ordered_source(&x, "pflog")?;
 
     // ── Build the delta source (Scale{4α} → Log1p) ─────────────────────────
     // v4 acts on raw counts: the matrix-wide Anscombe pseudocount 1/(4α) — no
     // per-cell depth. `α` is estimated once from the raw matrix (`alpha=None`)
     // or pinned. Three X kinds: backed (out-of-core), lazy (raw-count guard),
     // in-memory.
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let backed_ref = backed.borrow();
-        let reader = Arc::clone(&backed_ref.backed);
-        let n_vars = backed_ref.shape_val.1;
-        let kept = backed_ref.kept_to_global.clone();
-        let col_proj = backed_ref.col_projection_arc();
-        drop(backed_ref);
+    // `backed_shard_parts` matches `adata.X` *and* a backed layer handle: a
+    // layer is `ScxBackedLayerDataset`, which a bare
+    // `cast::<ScxBackedSparseDataset>()` misses, sending `pflog(layer=...)` on
+    // a backed file into `owned_csr` and a `csr_matrix` constructor error.
+    if let Some(parts) = backed_shard_parts(&x) {
+        let (reader, n_vars, kept, col_proj) =
+            (parts.reader, parts.n_vars, parts.kept, parts.col_proj);
         // α from the raw-count source (empty transform chain = raw).
         let raw_source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
         let meta = resolve_alpha(alpha, &raw_source)?;

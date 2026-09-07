@@ -408,6 +408,15 @@ pub struct QcRowStats {
     /// Per-cell sum over each `qc_var` gene subset, in the order the masks were
     /// supplied (`total_counts_<v>`). Empty when no `qc_var` was requested.
     pub qc_sums: Vec<Vec<f64>>,
+    /// Per-cell fraction of `total_counts` carried by the cell's `ns[k]`
+    /// largest values (`pct_counts_in_top_<n>_genes`, before the ×100), one
+    /// vector per requested `n`. Empty when `percent_top` was not requested.
+    ///
+    /// Indexed `[k][row]`, matching `qc_sums`, so the deletion gather in
+    /// `RowQcOutputs::accumulate` treats both the same way — and so a file with
+    /// many cells allocates a handful of long vectors rather than one short
+    /// vector per cell.
+    pub top_fractions: Vec<Vec<f64>>,
 }
 
 impl QcRowStats {
@@ -416,11 +425,12 @@ impl QcRowStats {
     /// Exposed so the lazy-transform twin
     /// (`ScxLazyTransformedDataset::streaming_qc_row_pass`) can drive the same
     /// accumulator with its own shard loop.
-    pub(crate) fn zeroed(n_obs: usize, n_qc: usize) -> Self {
+    pub(crate) fn zeroed(n_obs: usize, n_qc: usize, n_top: usize) -> Self {
         Self {
             nnz: vec![0i64; n_obs],
             sums: vec![0.0f64; n_obs],
             qc_sums: vec![vec![0.0f64; n_obs]; n_qc],
+            top_fractions: vec![vec![0.0f64; n_obs]; n_top],
         }
     }
 }
@@ -437,11 +447,15 @@ pub(crate) fn accumulate_qc_rows_into(
     csr: &scx_sparse::ScxCsr,
     global_row: usize,
     qc_bits: &[u64],
+    percent_top: &[usize],
     out: &mut QcRowStats,
 ) {
     // No subsets requested (or none representable) → skip the mask lookup
     // entirely; the sum loop is then identical to `row_sums_projected`'s.
     let plain = qc_bits.is_empty() || out.qc_sums.is_empty();
+    // Scratch for the per-row top-N selection, allocated once per *shard*.
+    let max_n = percent_top.last().copied().unwrap_or(0);
+    let mut top_buf: Vec<f32> = Vec::with_capacity(max_n);
     for row in 0..csr.n_rows() {
         let s = csr.indptr[row] as usize;
         let e = csr.indptr[row + 1] as usize;
@@ -466,6 +480,69 @@ pub(crate) fn accumulate_qc_rows_into(
             }
         }
         out.sums[g] = total;
+
+        if !percent_top.is_empty() {
+            accumulate_top_fractions(
+                &csr.data[s..e],
+                total,
+                percent_top,
+                g,
+                &mut top_buf,
+                &mut out.top_fractions,
+            );
+        }
+    }
+}
+
+/// One row's `percent_top` fractions, matching scanpy's
+/// `top_segment_proportions_sparse_csr`.
+///
+/// `percent_top` is **1-indexed**, sorted ascending and de-duplicated by the
+/// caller, so the cumulative sums here are monotone and each `n` extends the
+/// previous prefix rather than re-summing it.
+///
+/// A row with `nnz <= n` puts its whole mass in the top `n`, so the fraction is
+/// exactly 1: scanpy reaches that by zero-padding a fixed-width partition
+/// buffer, we reach it by clamping the prefix to what the row actually has.
+/// The denominator is the row's full total either way, never the buffer's sum.
+///
+/// A zero-total row takes this module's `0.0` convention rather than scanpy's
+/// `NaN` — the same choice `pct_counts_<v>` already makes for a cell with
+/// nothing in it.
+///
+/// Ordering uses `f32::total_cmp`, so a NaN in the data cannot panic the sort;
+/// such a row's total is already NaN and its fraction is meaningless either way.
+fn accumulate_top_fractions(
+    values: &[f32],
+    total: f64,
+    percent_top: &[usize],
+    row: usize,
+    buf: &mut Vec<f32>,
+    out: &mut [Vec<f64>],
+) {
+    let max_n = match percent_top.last() {
+        Some(&n) => n,
+        None => return,
+    };
+    buf.clear();
+    buf.extend_from_slice(values);
+    if buf.len() > max_n && max_n > 0 {
+        // Partial selection: we only ever need the `max_n` largest, not a full
+        // sort of a row that may carry tens of thousands of nonzeros.
+        buf.select_nth_unstable_by(max_n - 1, |a, b| b.total_cmp(a));
+        buf.truncate(max_n);
+    }
+    buf.sort_unstable_by(|a, b| b.total_cmp(a));
+
+    let mut acc = 0.0f64;
+    let mut taken = 0usize;
+    for (k, &n) in percent_top.iter().enumerate() {
+        let upto = n.min(buf.len());
+        for &v in &buf[taken..upto] {
+            acc += v as f64;
+        }
+        taken = upto;
+        out[k][row] = if total > 0.0 { acc / total } else { 0.0 };
     }
 }
 
@@ -490,11 +567,13 @@ pub fn qc_row_pass(
     col_indices: Option<&[u32]>,
     qc_bits: &[u64],
     n_qc: usize,
+    percent_top: &[usize],
 ) -> Result<QcRowStats> {
     let (n_obs, n_vars) = reader.shape();
-    ensure_qc_pass_args(n_qc, qc_bits, col_indices.map_or(n_vars, |c| c.len()));
+    let n_visible = col_indices.map_or(n_vars, |c| c.len());
+    ensure_qc_pass_args(n_qc, qc_bits, n_visible, percent_top);
 
-    let mut out = QcRowStats::zeroed(n_obs, n_qc);
+    let mut out = QcRowStats::zeroed(n_obs, n_qc, percent_top.len());
     let mut global_row = 0usize;
     prefetch::for_each_shard_ordered_uncached(
         reader,
@@ -502,10 +581,14 @@ pub fn qc_row_pass(
         |_shard_idx, csr| -> Result<()> {
             let n_rows = csr.n_rows();
             match col_indices {
-                Some(cols) => {
-                    accumulate_qc_rows_into(&project_csr(&csr, cols), global_row, qc_bits, &mut out)
-                }
-                None => accumulate_qc_rows_into(&csr, global_row, qc_bits, &mut out),
+                Some(cols) => accumulate_qc_rows_into(
+                    &project_csr(&csr, cols),
+                    global_row,
+                    qc_bits,
+                    percent_top,
+                    &mut out,
+                ),
+                None => accumulate_qc_rows_into(&csr, global_row, qc_bits, percent_top, &mut out),
             }
             global_row += n_rows;
             Ok(())
@@ -576,7 +659,21 @@ pub(crate) fn total_nnz_for(
 /// active `assert!`s rather than `debug_assert!`s because an oversized `n_qc`
 /// would shift past the mask width and *silently drop subsets* in the shipped
 /// `.so`, which is precisely the failure mode this module exists to prevent.
-pub(crate) fn ensure_qc_pass_args(n_qc: usize, qc_bits: &[u64], n_visible: usize) {
+pub(crate) fn ensure_qc_pass_args(
+    n_qc: usize,
+    qc_bits: &[u64],
+    n_visible: usize,
+    percent_top: &[usize],
+) {
+    assert!(
+        percent_top.windows(2).all(|w| w[0] < w[1]),
+        "percent_top must arrive sorted ascending and de-duplicated, got {percent_top:?}"
+    );
+    assert!(
+        percent_top.first().is_none_or(|&n| n > 0)
+            && percent_top.last().is_none_or(|&n| n <= n_visible),
+        "percent_top {percent_top:?} outside 1..={n_visible} (the visible gene axis)"
+    );
     assert!(
         n_qc <= 64,
         "qc_row_pass accepts at most 64 subsets per pass, got {n_qc}; \
