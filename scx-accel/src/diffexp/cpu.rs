@@ -715,6 +715,133 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
     adjusted
 }
 
+/// Warn when a multi-pass streaming DE call cannot hold the shards it will
+/// re-read in the source's decoded-shard LRU.
+///
+/// The kernel walks every visited shard once per gene chunk; if the LRU cannot
+/// hold them all simultaneously, ascending iteration order evicts the shard the
+/// next chunk re-requests *first*, so the cached path is strictly slower than an
+/// uncached one (LRU bookkeeping plus a re-decode). Warn once per call so the
+/// caller sees it without spamming per shard.
+///
+/// Measured against the shards this call will actually **visit**, not the
+/// file's: under a row projection the source hands the drivers a plan, and
+/// comparing against `n_shards` made a one-shard window on a hundred-shard file
+/// advise sizing a hundred-shard cache for a read that touches one.
+///
+/// `None` from `shard_cache_capacity` means a non-caching source (every
+/// `read_shard_arc` re-decodes by design) — no cache to size, nothing to warn
+/// about.
+fn warn_if_de_cache_undersized<S: ShardSource + ?Sized>(
+    source: &S,
+    n_chunks: usize,
+    context: &str,
+) {
+    let Some(cache_cap) = source.shard_cache_capacity() else {
+        return;
+    };
+    let visited = source
+        .visible_shard_indices()
+        .map_or_else(|| source.n_shards(), |plan| plan.len());
+    if n_chunks > 1 && cache_cap < visited {
+        log::warn!(
+            "{context}: cache_shards={cache_cap} < the {visited} shards this call visits, with \
+             {n_chunks} gene chunks — the cached read path will evict and re-decode every shard \
+             on each chunk. Size the shard cache to >= the visited shard count for the \
+             documented speedup."
+        );
+    }
+}
+
+/// Decode-prefetch depth for one streaming DE call.
+///
+/// `pinned` short-circuits the budget for tests (see the `*_with_depth`
+/// entries); otherwise the depth is whatever the memory budget has left after
+/// the dense `n_obs x chunk x 4` workspace this call is about to allocate.
+fn resolve_de_prefetch_depth<S: ShardSource + ?Sized>(
+    source: &S,
+    pinned: Option<usize>,
+    n_obs: usize,
+    gene_chunk_size: usize,
+) -> usize {
+    if let Some(depth) = pinned {
+        return depth.max(1);
+    }
+    let dense_bytes = (n_obs as u64)
+        .saturating_mul(gene_chunk_size as u64)
+        .saturating_mul(4);
+    crate::mem_budget::de_prefetch_depth(source.shard_size_hint(), dense_bytes)
+}
+
+/// Scatter one gene chunk of `source` into a row-major dense `n_obs x
+/// chunk_size` `f32` buffer, through the shared bounded decode-prefetch driver.
+///
+/// One copy of what were two byte-identical loops — Wilcoxon's and pdex's — each
+/// running its own `for shard_idx in 0..n_shards`. Going through
+/// [`crate::prefetch::for_each_shard_ordered`] buys two things a hand-rolled
+/// loop cannot have, both at `n_gene_chunks x n_shards` scale because the shard
+/// walk is *inner* to the gene-chunk walk:
+///
+/// * the row-projection shard skip — the driver consults
+///   [`ShardSource::visible_shard_indices`], so a shard the projection empties
+///   is never read, where before it was decoded, transformed, projected and
+///   found to hold nothing;
+/// * bounded decode-prefetch, where the loop decoded one shard, used it, and
+///   only then started the next.
+///
+/// Bit-identical to that loop, not merely close: `consume` runs on the calling
+/// thread in strict ascending plan order and the scatter is row-disjoint.
+///
+/// `global_row` stays a running count of *visible* rows, which is both the right
+/// cursor under skipping and the only one available — a skipped shard would have
+/// contributed zero rows, and the buffer is indexed in visible space, never in
+/// file row space (the physical offset a transform chain needs is applied inside
+/// the source, before this ever sees the shard). The two row-count checks are
+/// what make that assumption falsifiable: without them a source whose plan omits
+/// a shard that *does* hold visible rows would misplace every row after it, and
+/// still return a fully formed result.
+fn fill_gene_chunk_dense<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    col_indices: &[u32],
+    n_obs: usize,
+    chunk_size: usize,
+    depth: usize,
+    dense: &mut [f32],
+    context: &str,
+) -> Result<()> {
+    let dense = &mut dense[..n_obs * chunk_size];
+    dense.fill(0.0);
+    let mut global_row = 0usize;
+    crate::prefetch::for_each_shard_ordered(source, depth, |shard_idx, shard_csr| {
+        let _r = scx_format_io::reduction_guard();
+        let projected = scx_engine::project_csr(&shard_csr, col_indices);
+        let rows = projected.n_rows();
+        if global_row + rows > n_obs {
+            return Err(crate::AccelError::ShapeError(format!(
+                "{context}: shard {shard_idx} has {rows} rows, exceeding n_obs = {n_obs} at row \
+                 {global_row}"
+            )));
+        }
+        for row in 0..rows {
+            let start = projected.indptr[row] as usize;
+            let end = projected.indptr[row + 1] as usize;
+            for j in start..end {
+                let col = projected.indices[j] as usize;
+                dense[(global_row + row) * chunk_size + col] = projected.data[j];
+            }
+        }
+        global_row += rows;
+        Ok(())
+    })?;
+    if global_row != n_obs {
+        return Err(crate::AccelError::ShapeError(format!(
+            "{context}: the shards visited cover {global_row} rows but the source reports \
+             n_obs = {n_obs}"
+        )));
+    }
+    Ok(())
+}
+
 /// Gene-chunked streaming Wilcoxon rank-sum over a CSR [`ShardSource`].
 ///
 /// Generic over the source rather than taking a `BackedCsrReader`: `groups` is
@@ -724,22 +851,33 @@ pub fn benjamini_hochberg(pvals: &[f64]) -> Vec<f64> {
 /// Multi-pass, so a caching source should opt in (`with_cached_reads()`).
 ///
 /// Instead of materializing the full matrix, processes genes in chunks:
-/// 1. For each gene chunk, iterate all shards via `read_shard_arc()`,
-///    apply `project_csr()` per shard, scatter into a dense buffer. The
-///    cache is populated on the first chunk and reused by every subsequent
-///    chunk; sizing `cache_shards >= n_shards` on the `BackedCsrReader`
-///    makes the inner loop fully cache-resident after the first pass.
-///    A too-small cache evicts the shard the next chunk needs first (the
-///    iteration order is linear `0..n_shards`), which defeats the win.
+/// 1. For each gene chunk, [`fill_gene_chunk_dense`] streams the source's
+///    shards through the shared decode-prefetch driver, projects each to the
+///    chunk's columns and scatters it into one reused dense buffer. A row
+///    projection skips the shards it empties; decode overlaps the calling
+///    thread's scatter up to the resolved depth.
 /// 2. Run `wilcoxon_rank_sum()` on the dense buffer for that chunk.
 /// 3. Merge all chunk results with global BH correction.
 ///
+/// Every visited shard is read once per gene chunk, so a caching source
+/// (`with_cached_reads()`) wants `cache_shards >= ` the number of shards the
+/// call visits; below that, ascending order evicts the shard the next chunk
+/// needs first and the cached path is slower than an uncached one. That is
+/// warned about, once per call, by [`warn_if_de_cache_undersized`].
+///
 /// Peak memory:
-///   * O(n_obs × gene_chunk_size) for the dense buffer per chunk
-///   * + O(min(cache_shards, n_shards) × decoded-shard-bytes) for the LRU
+///   * O(n_obs × gene_chunk_size) for the dense buffer — one per call, not one
+///     per chunk
+///   * + O(min(cache_shards, visited shards) × decoded-shard-bytes) for the LRU
 ///       shard cache (≈ 640 MB / shard on Replogle-scale inputs)
+///   * + up to `depth` decoded shards in flight in the prefetch pipeline, which
+///       on a plain backed handle are the *same* `Arc`s the LRU holds (no copy)
+///       and only cost extra where the source rebuilds each shard — a view or a
+///       transform chain. [`crate::mem_budget::de_prefetch_depth`] bounds it
+///       against what the dense buffer left of the DE budget, so a budget-bound
+///       file falls back to depth 1 rather than growing.
 #[allow(clippy::too_many_arguments)]
-pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
+pub fn wilcoxon_rank_sum_streaming<S: ShardSource + Sync + ?Sized>(
     source: &S,
     gene_names: &[String],
     groups: &[usize],
@@ -749,6 +887,40 @@ pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
     log_transformed: bool,
     rankby_abs: bool,
     tie_correct: bool,
+) -> Result<DiffExpResult> {
+    wilcoxon_rank_sum_streaming_with_depth(
+        source,
+        gene_names,
+        groups,
+        group_names,
+        reference,
+        gene_chunk_size,
+        log_transformed,
+        rankby_abs,
+        tie_correct,
+        None,
+    )
+}
+
+/// [`wilcoxon_rank_sum_streaming`] with the decode-prefetch depth pinned.
+///
+/// `None` resolves it from the memory budget, which is what the public entry
+/// does. `Some(d)` exists for tests: the pipeline's sequential fallback is
+/// silent and indistinguishable from a prefetching run in every result, so
+/// observing that prefetch engaged at all needs a call that can pin `d = 1`
+/// against `d > 1`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wilcoxon_rank_sum_streaming_with_depth<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: Option<usize>,
+    gene_chunk_size: usize,
+    log_transformed: bool,
+    rankby_abs: bool,
+    tie_correct: bool,
+    depth: Option<usize>,
 ) -> Result<DiffExpResult> {
     let n_obs = source.n_obs();
     let n_vars = gene_names.len();
@@ -788,31 +960,15 @@ pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
         "wilcoxon_rank_sum_streaming",
     )?;
 
-    let n_shards = source.n_shards();
-
-    // Cache-sizing footgun guard. The kernel walks every shard once per
-    // gene chunk; if the LRU can't hold all `n_shards` decoded shards
-    // simultaneously, the iteration order `0..n_shards` evicts the
-    // shard the next chunk re-requests *first*, so the cached path is
-    // strictly slower than `read_shard_uncached` (LRU bookkeeping +
-    // re-decode). Warn once per call so the caller sees it without
-    // spamming per-shard.
-    // `None` = a non-caching source (every `read_shard_arc` re-decodes by
-    // design); there is no cache to size, so there is nothing to warn about.
     let n_chunks = n_vars.div_ceil(gene_chunk_size);
-    if let Some(cache_cap) = source.shard_cache_capacity() {
-        if n_chunks > 1 && cache_cap < n_shards {
-            log::warn!(
-                "wilcoxon_rank_sum_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
-                 the cached read path will evict and re-decode every shard on each chunk. \
-                 Size the shard cache to >= n_shards for the documented speedup.",
-                cache_cap,
-                n_shards,
-                n_chunks,
-            );
-        }
-    }
+    warn_if_de_cache_undersized(source, n_chunks, "wilcoxon_rank_sum_streaming");
+    let depth = resolve_de_prefetch_depth(source, depth, n_obs, gene_chunk_size);
 
+    // One dense workspace for the whole call, re-zeroed per chunk (the trailing
+    // chunk is narrower, so `fill_gene_chunk_dense` slices the active sub-range
+    // down). The CSC kernels have always done this; the CSR ones allocated a
+    // fresh buffer per chunk.
+    let mut dense = vec![0.0f32; n_obs.saturating_mul(gene_chunk_size.min(n_vars))];
     let mut all_chunk_results = Vec::new();
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
@@ -820,35 +976,15 @@ pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
         let chunk_size = chunk_end - chunk_start;
         let col_indices: Vec<u32> = (chunk_start as u32..chunk_end as u32).collect();
 
-        // Build dense buffer (n_obs × chunk_size), zero-initialized.
-        let mut dense = vec![0.0f32; n_obs * chunk_size];
-
-        // Stream all shards, project each, scatter into dense buffer.
-        //
-        // Use the cached API: this kernel makes one pass per gene chunk,
-        // so every shard is read O(n_chunks) times. With `cache_shards`
-        // sized to hold all shards (the typical Python-side default for
-        // full-matrix DE), the second chunk onward is fully cache-resident
-        // and the inner loop pays no decompression cost. `&Arc<ScxCsr>`
-        // auto-derefs to `&ScxCsr` for `project_csr` — no extra clone.
-        let mut global_row = 0usize;
-        for shard_idx in 0..n_shards {
-            let shard_csr = source
-                .read_shard_arc(shard_idx)
-                .map_err(crate::AccelError::Scx)?;
-            let _r = scx_format_io::reduction_guard();
-            let projected = scx_engine::project_csr(&shard_csr, &col_indices);
-
-            for row in 0..projected.n_rows() {
-                let start = projected.indptr[row] as usize;
-                let end = projected.indptr[row + 1] as usize;
-                for j in start..end {
-                    let col = projected.indices[j] as usize;
-                    dense[(global_row + row) * chunk_size + col] = projected.data[j];
-                }
-            }
-            global_row += projected.n_rows();
-        }
+        fill_gene_chunk_dense(
+            source,
+            &col_indices,
+            n_obs,
+            chunk_size,
+            depth,
+            &mut dense,
+            "wilcoxon_rank_sum_streaming",
+        )?;
 
         // Run existing wilcoxon_rank_sum on this chunk's dense buffer. The
         // per-gene ranking is the dominant DE compute (O(n_obs·log n_obs)/gene)
@@ -857,7 +993,7 @@ pub fn wilcoxon_rank_sum_streaming<S: ShardSource>(
         let _rank = scx_format_io::reduction_guard();
         let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
         let chunk_result = wilcoxon_rank_sum(
-            &dense,
+            &dense[..n_obs * chunk_size],
             n_obs,
             chunk_size,
             &chunk_genes,
@@ -1582,11 +1718,11 @@ pub fn pdex_ref_sparse(
 /// Mirrors [`wilcoxon_rank_sum_streaming`], including the reason it is generic:
 /// `groups` / `gene_names` are indexed by *visible* cell and gene, so a caller
 /// holding a subset SCX handle must pass that handle's view
-/// (`as_shard_source()`), not the reader underneath it. Walks every shard once
-/// per gene chunk, so a caching source should opt in (`with_cached_reads()`)
-/// and be sized to `>= n_shards`.
+/// (`as_shard_source()`), not the reader underneath it. Walks every visited
+/// shard once per gene chunk, so a caching source should opt in
+/// (`with_cached_reads()`) and be sized to `>=` the visited shard count.
 #[allow(clippy::too_many_arguments)]
-pub fn pdex_ref_streaming<S: ShardSource>(
+pub fn pdex_ref_streaming<S: ShardSource + Sync + ?Sized>(
     source: &S,
     gene_names: &[String],
     groups: &[usize],
@@ -1596,6 +1732,35 @@ pub fn pdex_ref_streaming<S: ShardSource>(
     mode: crate::pseudobulk::GeomMeanMode,
     epsilon: f64,
     cpm_filter: Option<f64>,
+) -> Result<PdexRefResult> {
+    pdex_ref_streaming_with_depth(
+        source,
+        gene_names,
+        groups,
+        group_names,
+        reference,
+        gene_chunk_size,
+        mode,
+        epsilon,
+        cpm_filter,
+        None,
+    )
+}
+
+/// [`pdex_ref_streaming`] with the decode-prefetch depth pinned; see
+/// [`wilcoxon_rank_sum_streaming_with_depth`] for why the knob exists.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pdex_ref_streaming_with_depth<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    gene_names: &[String],
+    groups: &[usize],
+    group_names: &[String],
+    reference: usize,
+    gene_chunk_size: usize,
+    mode: crate::pseudobulk::GeomMeanMode,
+    epsilon: f64,
+    cpm_filter: Option<f64>,
+    depth: Option<usize>,
 ) -> Result<PdexRefResult> {
     let n_obs = source.n_obs();
     let n_vars = gene_names.len();
@@ -1632,23 +1797,13 @@ pub fn pdex_ref_streaming<S: ShardSource>(
     let gene_chunk_size =
         crate::mem_budget::de_gene_chunk_or_err(gene_chunk_size, n_obs, "pdex_ref_streaming")?;
 
-    let n_shards = source.n_shards();
-    // `None` = a non-caching source (every `read_shard_arc` re-decodes by
-    // design); there is no cache to size, so there is nothing to warn about.
     let n_chunks = n_vars.div_ceil(gene_chunk_size);
-    if let Some(cache_cap) = source.shard_cache_capacity() {
-        if n_chunks > 1 && cache_cap < n_shards {
-            log::warn!(
-                "pdex_ref_streaming: cache_shards={} < n_shards={} with {} gene chunks — \
-                 the cached read path will evict and re-decode every shard on each chunk. \
-                 Size the shard cache to >= n_shards for the documented speedup.",
-                cache_cap,
-                n_shards,
-                n_chunks,
-            );
-        }
-    }
+    warn_if_de_cache_undersized(source, n_chunks, "pdex_ref_streaming");
+    let depth = resolve_de_prefetch_depth(source, depth, n_obs, gene_chunk_size);
 
+    // One dense workspace for the whole call — see the note in
+    // `wilcoxon_rank_sum_streaming_with_depth`.
+    let mut dense = vec![0.0f32; n_obs.saturating_mul(gene_chunk_size.min(n_vars))];
     let mut combined: Option<PdexRefResult> = None;
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
@@ -1656,30 +1811,21 @@ pub fn pdex_ref_streaming<S: ShardSource>(
         let chunk_size = chunk_end - chunk_start;
         let col_indices: Vec<u32> = (chunk_start as u32..chunk_end as u32).collect();
 
-        let mut dense = vec![0.0f32; n_obs * chunk_size];
-        let mut global_row = 0usize;
-        for shard_idx in 0..n_shards {
-            let shard_csr = source
-                .read_shard_arc(shard_idx)
-                .map_err(crate::AccelError::Scx)?;
-            let _r = scx_format_io::reduction_guard();
-            let projected = scx_engine::project_csr(&shard_csr, &col_indices);
-            for row in 0..projected.n_rows() {
-                let s = projected.indptr[row] as usize;
-                let e = projected.indptr[row + 1] as usize;
-                for j in s..e {
-                    let col = projected.indices[j] as usize;
-                    dense[(global_row + row) * chunk_size + col] = projected.data[j];
-                }
-            }
-            global_row += projected.n_rows();
-        }
+        fill_gene_chunk_dense(
+            source,
+            &col_indices,
+            n_obs,
+            chunk_size,
+            depth,
+            &mut dense,
+            "pdex_ref_streaming",
+        )?;
 
         // MWU compute dominates and runs post-decode → `reduction`, disjoint.
         let _rank = scx_format_io::reduction_guard();
         let chunk_genes: Vec<String> = gene_names[chunk_start..chunk_end].to_vec();
         let chunk_result = pdex_ref_core(
-            &dense,
+            &dense[..n_obs * chunk_size],
             n_obs,
             chunk_size,
             &chunk_genes,

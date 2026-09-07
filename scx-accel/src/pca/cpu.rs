@@ -2843,109 +2843,7 @@ mod tests {
     // Decode-prefetch: engagement, and equivalence at depth 1 vs depth 4
     // -----------------------------------------------------------------------
 
-    use std::collections::HashSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-    use std::thread::ThreadId;
-
-    /// A `ShardSource` that records **which thread** decoded each shard.
-    ///
-    /// This is the anti-trap instrument, and the reason it exists is specific:
-    /// `for_each_ordered` **silently** falls back to a sequential loop when the
-    /// caller is a rayon worker, when the pool has one thread, or when the depth
-    /// is 1. PCA owns two inner rayon pools, so a mis-nested wiring here would
-    /// produce no speedup and no error — the whole task could land, pass every
-    /// correctness test below, and do nothing at all.
-    ///
-    /// **Thread identity, not observed overlap.** An earlier version asserted a
-    /// maximum-in-flight count of >= 2, which is a *timing* property: it held on
-    /// a 24-core box 20 runs out of 20 and failed on a 2-core CI runner, where
-    /// libtest's own parallelism saturates the pool and the spawned decodes run
-    /// one at a time. "Did the pipeline engage" is structural — when it does,
-    /// `read_shard` runs on a rayon worker; when it declines, on the calling
-    /// thread — so that is what these tests assert. `max_live` is still
-    /// recorded, but only to make a failure message informative.
-    struct GaugedSource {
-        shards: Vec<ScxCsr>,
-        n_obs: usize,
-        n_vars: usize,
-        live: AtomicUsize,
-        max_live: AtomicUsize,
-        decode_threads: Mutex<HashSet<ThreadId>>,
-    }
-
-    impl GaugedSource {
-        fn new(shards: Vec<ScxCsr>, n_obs: usize, n_vars: usize) -> Self {
-            Self {
-                shards,
-                n_obs,
-                n_vars,
-                live: AtomicUsize::new(0),
-                max_live: AtomicUsize::new(0),
-                decode_threads: Mutex::new(HashSet::new()),
-            }
-        }
-
-        /// True when at least one shard decoded somewhere other than `caller`.
-        fn decoded_off_thread(&self, caller: ThreadId) -> bool {
-            self.decode_threads
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|t| *t != caller)
-        }
-
-        fn decode_thread_count(&self) -> usize {
-            self.decode_threads.lock().unwrap().len()
-        }
-
-        fn max_concurrent_decodes(&self) -> usize {
-            self.max_live.load(Ordering::SeqCst)
-        }
-
-        fn reset(&self) {
-            self.max_live.store(0, Ordering::SeqCst);
-            self.decode_threads.lock().unwrap().clear();
-        }
-    }
-
-    /// Assert the pipeline engaged: some shard decoded off the calling thread.
-    fn assert_prefetch_engaged(src: &GaugedSource, what: &str) {
-        let me = std::thread::current().id();
-        assert!(
-            src.decoded_off_thread(me),
-            "{what}: every shard decoded on the calling thread — the prefetch \
-             pipeline declined to engage (threads seen: {}, max in flight: {})",
-            src.decode_thread_count(),
-            src.max_concurrent_decodes()
-        );
-    }
-
-    impl ShardSource for GaugedSource {
-        fn n_shards(&self) -> usize {
-            self.shards.len()
-        }
-        fn n_obs(&self) -> usize {
-            self.n_obs
-        }
-        fn n_vars(&self) -> usize {
-            self.n_vars
-        }
-        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
-            self.decode_threads
-                .lock()
-                .unwrap()
-                .insert(std::thread::current().id());
-            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_live.fetch_max(now, Ordering::SeqCst);
-            // Kept short: nothing asserts on overlap now, so this only widens the
-            // window in which `max_live` can observe some.
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            let out = self.shards[shard_idx].clone();
-            self.live.fetch_sub(1, Ordering::SeqCst);
-            Ok(out)
-        }
-    }
+    use crate::test_support::{assert_prefetch_engaged, pool_can_prefetch, GaugedSource};
 
     /// A multi-shard fixture. `rows_per_shard × k` stays under
     /// `spmm_*`'s 10 000-element parallel threshold, so every reduction takes
@@ -2972,12 +2870,6 @@ mod tests {
             })
             .collect();
         GaugedSource::new(shards, n_shards * rows_per_shard, n_vars)
-    }
-
-    /// Skip rather than fail where the pipeline is *designed* not to engage: a
-    /// single-thread pool takes the sequential fallback by construction.
-    fn pool_can_prefetch() -> bool {
-        rayon::current_num_threads() > 1
     }
 
     #[test]

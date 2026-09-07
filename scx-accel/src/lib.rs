@@ -82,6 +82,8 @@ pub mod prefetch;
 pub mod projected_source;
 pub mod pseudobulk;
 pub mod route;
+#[cfg(test)]
+mod test_support;
 pub mod umap;
 
 pub use csc::{
