@@ -665,7 +665,41 @@ def _ordered_fixture(tmp_dir):
     return path
 
 
-def test_a_named_layer_cannot_smuggle_a_presentation_order_past_the_guard(tmp_dir):
+def _layer_ops():
+    """Every op that resolves `layer=` and streams the result.
+
+    Parametrized because the guard has four call sites and one shared helper:
+    pinning only the helper leaves a removed or misplaced call site green, which
+    is exactly how the hole reached review in the first place.
+    """
+    import pyscx
+
+    return [
+        pytest.param(
+            lambda a: pyscx.accel.calculate_qc_metrics(a, layer="counts"),
+            id="calculate_qc_metrics",
+        ),
+        pytest.param(
+            lambda a: pyscx.accel.score_genes(
+                a, ["g2"], method="mean", layer="counts", device="cpu"
+            ),
+            id="score_genes",
+        ),
+        pytest.param(
+            lambda a: pyscx.accel.highly_variable_genes(
+                a, n_top_genes=1, flavor="seurat_v3", layer="counts", device="cpu"
+            ),
+            id="highly_variable_genes",
+        ),
+        pytest.param(
+            lambda a: pyscx.accel.pflog(a, layer="counts", store="baseline"),
+            id="pflog",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("op", _layer_ops())
+def test_a_named_layer_cannot_smuggle_a_presentation_order_past_the_guard(tmp_dir, op):
     """The guard reads `adata.X`; a named layer is a different matrix.
 
     Materialising `X` disarms the `adata.X`-only check while the layer stays
@@ -673,6 +707,9 @@ def test_a_named_layer_cannot_smuggle_a_presentation_order_past_the_guard(tmp_di
     projection with a request-ordered `adata.var`: asking for `g2` returned
     `g0`'s values under `g2`'s name. Silently wrong genes, where the same
     request on `X` had always raised.
+
+    `score_genes` is the original reproduction; the other three share the call
+    site, and each is asserted separately so removing any one of them is red.
     """
     import pyscx
 
@@ -684,7 +721,7 @@ def test_a_named_layer_cannot_smuggle_a_presentation_order_past_the_guard(tmp_di
     adata.X = adata.X.to_memory()  # disarms the adata.X-only guard
 
     with pytest.raises(RuntimeError, match=r"caller-requested order"):
-        pyscx.accel.calculate_qc_metrics(adata, layer="counts")
+        op(adata)
 
 
 def test_a_layer_handle_assigned_to_x_is_caught_too(tmp_dir):
@@ -738,3 +775,48 @@ def test_csc_rejects_a_layer_handle_assigned_to_x(qc_path):
     assert "layer=None" not in str(excinfo.value), (
         "the advice must not name a kwarg the caller is already passing"
     )
+
+
+def test_a_dask_x_is_refused_rather_than_silently_computed():
+    """`owned_csr` would `compute()` the whole thing before any QC number.
+
+    The removed scanpy delegation covered "neither of our two SCX handles", so a
+    dask array used to reach scanpy's own dask arm and stay bounded. Unifying
+    the kernel took that away: measured, pyscx computed the entire array where
+    scanpy had done per-axis reductions, and the `nnz x 8` large-copy warning
+    cannot help because it is sized from the CSR that materialization produces.
+    Refusing is the honest contract.
+    """
+    import anndata
+    import pandas as pd
+
+    import pyscx
+
+    da = pytest.importorskip("dask.array")
+
+    dense = np.array([[1.0, 5.0, 10.0], [2.0, 6.0, 20.0]], dtype=np.float32)
+    adata = anndata.AnnData(
+        X=da.from_array(dense, chunks=(1, 3)),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    with pytest.raises(RuntimeError, match=r"(?i)materialize"):
+        pyscx.accel.calculate_qc_metrics(adata)
+
+    # The accept side, so the guard cannot pass by refusing everything.
+    import scipy.sparse as sp
+
+    ok = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    pyscx.accel.calculate_qc_metrics(ok)
+    assert "total_counts" in ok.obs
+    dense_ok = anndata.AnnData(
+        X=dense.copy(),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    pyscx.accel.calculate_qc_metrics(dense_ok)
+    assert "total_counts" in dense_ok.obs

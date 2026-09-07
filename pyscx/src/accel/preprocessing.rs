@@ -688,11 +688,14 @@ pub fn calculate_qc_metrics<'py>(
     // how this op came to return different column sets depending on what `X`
     // was; there is now one.
     let in_memory_csr = match kind {
-        QcSourceKind::InMemory => Some(canonicalize_for_qc(crate::convert::owned_csr(
-            py,
-            &x,
-            Some("calculate_qc_metrics"),
-        )?)),
+        QcSourceKind::InMemory => {
+            reject_unmaterialized_matrix(py, &x)?;
+            Some(canonicalize_for_qc(crate::convert::owned_csr(
+                py,
+                &x,
+                Some("calculate_qc_metrics"),
+            )?))
+        }
         _ => None,
     };
 
@@ -1591,6 +1594,47 @@ fn resolve_qc_masks(
     }
 
     Ok(QcMasks { chunks })
+}
+
+/// Refuse a matrix `owned_csr` would silently materialize in full.
+///
+/// The in-memory arm accepts what it can copy cheaply and predictably: a scipy
+/// sparse matrix or a numpy array. Anything else reaches
+/// `scipy.sparse.csr_matrix(x)`, which asks for the array protocol — and for a
+/// `dask.array.Array` that is `compute()`, i.e. the **whole** matrix densified
+/// before a single QC number is produced. Measured: pyscx computed the entire
+/// array where `sc.pp.calculate_qc_metrics` had done bounded per-axis
+/// reductions. The `nnz × 8` large-copy warning cannot help, since it is sized
+/// from the CSR that materialization produces — after the peak.
+///
+/// This used to be scanpy's problem: the delegation covered "neither of our two
+/// SCX handles", so dask went to scanpy's own dask arm. Unifying the kernel took
+/// that away, so the honest contract is to refuse rather than to quietly spend
+/// the memory. An h5ad-backed `CSRDataset` lands here too, where it previously
+/// failed deeper down with `scipy.sparse does not support dtype object`.
+fn reject_unmaterialized_matrix(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<()> {
+    let np = crate::pyimport::import_module(py, "numpy")?;
+    let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
+    let is_sparse: bool = scipy_sparse
+        .call_method1("issparse", (x,))?
+        .extract()
+        .unwrap_or(false);
+    if is_sparse || x.is_instance(&np.getattr("ndarray")?)? {
+        return Ok(());
+    }
+    let name = x
+        .get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    Err(PyRuntimeError::new_err(format!(
+        "calculate_qc_metrics does not accept a {name} matrix: it would have to \
+         materialize the whole thing before computing anything (for a dask array \
+         that is a full `compute()`), which is neither bounded nor announced. \
+         Pass a scipy sparse or numpy `X`, an SCX handle from \
+         `pyscx.open(...).to_anndata(backed=True)`, or materialize deliberately \
+         first (e.g. `adata.X = adata.X.compute()`)."
+    )))
 }
 
 /// Which kind of matrix `calculate_qc_metrics` was pointed at.

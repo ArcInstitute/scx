@@ -788,10 +788,25 @@ def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
             # zero-total cell where pyscx gives 0.0), which is exactly the input
             # that would have triggered it.
             ref_nan, got_nan = np.isnan(ref), np.isnan(got)
-            if not np.array_equal(ref_nan, got_nan):
+            # One divergence is documented and intended: scanpy divides a
+            # subset sum by a zero row total and gets NaN, where the streaming
+            # kernel publishes 0.0 (its convention for a cell with nothing in
+            # it). Accept exactly that shape — scanpy NaN against our 0.0 — and
+            # treat every other NaN disagreement as a failure. A strict pattern
+            # match would have failed the gate on a dataset containing an empty
+            # cell, which is not a regression.
+            expected_divergence = (
+                col.startswith("pct_counts_")
+                and not col.startswith("pct_counts_in_top_")
+                and bool(np.all(got[ref_nan & ~got_nan] == 0.0))
+            )
+            mismatch = ref_nan != got_nan
+            if expected_divergence:
+                mismatch &= ~(ref_nan & ~got_nan)
+            if np.any(mismatch):
                 nan_match = False
                 continue
-            finite = ~ref_nan
+            finite = ~(ref_nan | got_nan)
             if not np.any(finite):
                 continue
             # Relative, because scanpy accumulates a float32 matrix in float32:

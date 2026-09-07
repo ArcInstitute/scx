@@ -107,9 +107,12 @@ pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str)
              (the streaming kernels decode columns in sorted on-disk order, \
              which would misalign the result against adata.var). This covers a \
              named `layer=` and a layer handle assigned to X, not just X \
-             itself. Run {op} before reordering, select with a sorted index or \
-             a boolean mask, or materialise first with \
-             `adata.X = adata.X.to_memory()`."
+             itself — and materialising `adata.X` does not help when the \
+             permutation is on the layer. Run {op} before reordering, select \
+             with a sorted index or a boolean mask, or materialise the matrix \
+             the op reads: `adata.X = adata.X.to_memory()`, or \
+             `adata.layers[name] = adata.layers[name].to_memory()` for a \
+             named layer."
         )));
     }
     Ok(())
