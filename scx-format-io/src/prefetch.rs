@@ -255,7 +255,12 @@ where
             .read_shard_arc(idx)
             .map_err(|e| E::from_shard_read(idx, e))
     };
-    for_each_ordered(n_shards, depth, &read, consume)
+    // A source that filters rows inside `read_shard` can say which shards
+    // still hold one; the rest would decode only to come back empty.
+    match source.visible_shard_indices() {
+        Some(indices) => for_each_ordered_selected(&indices, depth, &read, consume),
+        None => for_each_ordered(n_shards, depth, &read, consume),
+    }
 }
 
 /// Like [`for_each_shard_ordered`] but decodes via [`ShardSource::read_shard`]
@@ -281,7 +286,12 @@ where
             .map(Arc::new)
             .map_err(|e| E::from_shard_read(idx, e))
     };
-    for_each_ordered(n_shards, depth, &read, consume)
+    // A source that filters rows inside `read_shard` can say which shards
+    // still hold one; the rest would decode only to come back empty.
+    match source.visible_shard_indices() {
+        Some(indices) => for_each_ordered_selected(&indices, depth, &read, consume),
+        None => for_each_ordered(n_shards, depth, &read, consume),
+    }
 }
 
 /// [`for_each_shard_ordered_uncached`] restricted to an explicit ascending list
@@ -294,6 +304,15 @@ where
 /// real and is not.
 ///
 /// `indices` must be strictly ascending (see [`for_each_ordered_selected`]).
+///
+/// Unlike the two drivers above, this does **not** consult
+/// [`ShardSource::visible_shard_indices`]: the caller has already decided which
+/// shards to visit, and second-guessing an explicit plan is how a staging path
+/// ends up skipping a shard it meant to stage. No in-tree caller both passes a
+/// list and overrides that method — the masked aggregation kernels derive their
+/// list from the same row set over a source that does not override it, and the
+/// GPU staging plans run over sources that do not either. A future source that
+/// wants both would have to intersect them itself.
 pub fn for_each_shard_ordered_uncached_selected<S, F, E>(
     source: &S,
     indices: &[usize],

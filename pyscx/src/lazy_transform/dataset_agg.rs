@@ -294,16 +294,26 @@ impl ScxLazyTransformedDataset {
             None => return self.streaming_col_sums(),
         };
 
-        prefetch::for_each_shard_ordered_uncached(
+        // Skip shards no kept row falls in. The walk below already discovers
+        // that (`lo == hi`), but only after the decode and the transform pass.
+        prefetch::for_each_shard_ordered_uncached_selected(
             &*self.backed,
+            &self.backed.index().shards_with_kept_rows(kept),
             prefetch::prefetch_depth(),
             |shard_idx, csr| -> scx_format_io::Result<()> {
                 // The uncached read hands back a fresh refcount-1 Arc, so this
                 // unwraps for free; the transforms below need owned buffers.
                 let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
-                self.apply_transforms(&mut csr, global_row);
+                let range = self.backed.index().shard_range(shard_idx);
+                // The shard's own first physical row, not a running total.
+                // Identical while every shard is visited — they tile
+                // `[0, n_obs)` in order — and *correct* now that skipped shards
+                // never reach this closure, where a cursor would under-count
+                // and apply a later shard's transforms at the wrong row.
+                let row0 = range.map_or(global_row, |(s, _)| s as usize);
+                self.apply_transforms(&mut csr, row0);
 
-                let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
+                let (s_start, s_end) = match range {
                     Some(r) => r,
                     None => {
                         global_row += csr.n_rows();
@@ -470,50 +480,71 @@ impl ScxLazyTransformedDataset {
         let mut counts = vec![0u32; n_vars];
         let mut global_row = 0usize;
 
-        prefetch::for_each_shard_ordered_uncached(
-            &*self.backed,
-            prefetch::prefetch_depth(),
-            |shard_idx, csr| -> scx_format_io::Result<()> {
-                // The uncached read hands back a fresh refcount-1 Arc, so this
-                // unwraps for free; the transforms below need owned buffers.
-                let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
-                let n_rows = csr.n_rows();
-                self.apply_transforms(&mut csr, global_row);
+        // With a kept-row filter, skip the shards it empties; without one
+        // every shard contributes, so the plain driver stays. `consume` is
+        // moved into whichever arm runs.
+        let visible = self
+            .kept_to_global
+            .as_ref()
+            .map(|kept| self.backed.index().shards_with_kept_rows(kept));
+        let consume = |shard_idx: usize, csr: Arc<ScxCsr>| -> scx_format_io::Result<()> {
+            // The uncached read hands back a fresh refcount-1 Arc, so this
+            // unwraps for free; the transforms below need owned buffers.
+            let mut csr = Arc::try_unwrap(csr).unwrap_or_else(|s| (*s).clone());
+            let n_rows = csr.n_rows();
+            let range = self.backed.index().shard_range(shard_idx);
+            // See `streaming_col_sums_masked`: the shard's own first
+            // physical row, so a driver-skipped shard cannot shift the
+            // transform offset of the ones that follow.
+            let row0 = range.map_or(global_row, |(s, _)| s as usize);
+            self.apply_transforms(&mut csr, row0);
 
-                match &self.kept_to_global {
-                    None => {
-                        for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
-                            let c = col as usize;
-                            sums[c] += val as f64;
+            match &self.kept_to_global {
+                None => {
+                    for (&col, &val) in csr.indices.iter().zip(csr.data.iter()) {
+                        let c = col as usize;
+                        sums[c] += val as f64;
+                        counts[c] += 1;
+                    }
+                }
+                Some(kept) => {
+                    let (s_start, s_end) = match range {
+                        Some(r) => r,
+                        None => {
+                            global_row += n_rows;
+                            return Ok(());
+                        }
+                    };
+                    let lo = kept.partition_point(|&r| r < s_start);
+                    let hi = kept.partition_point(|&r| r < s_end);
+                    for &g_row in &kept[lo..hi] {
+                        let local = (g_row - s_start) as usize;
+                        let s = csr.indptr[local] as usize;
+                        let e = csr.indptr[local + 1] as usize;
+                        for j in s..e {
+                            let c = csr.indices[j] as usize;
+                            sums[c] += csr.data[j] as f64;
                             counts[c] += 1;
                         }
                     }
-                    Some(kept) => {
-                        let (s_start, s_end) = match self.backed.index().shard_range(shard_idx) {
-                            Some(r) => r,
-                            None => {
-                                global_row += n_rows;
-                                return Ok(());
-                            }
-                        };
-                        let lo = kept.partition_point(|&r| r < s_start);
-                        let hi = kept.partition_point(|&r| r < s_end);
-                        for &g_row in &kept[lo..hi] {
-                            let local = (g_row - s_start) as usize;
-                            let s = csr.indptr[local] as usize;
-                            let e = csr.indptr[local + 1] as usize;
-                            for j in s..e {
-                                let c = csr.indices[j] as usize;
-                                sums[c] += csr.data[j] as f64;
-                                counts[c] += 1;
-                            }
-                        }
-                    }
                 }
-                global_row += n_rows;
-                Ok(())
-            },
-        )
+            }
+            global_row += n_rows;
+            Ok(())
+        };
+        match &visible {
+            Some(indices) => prefetch::for_each_shard_ordered_uncached_selected(
+                &*self.backed,
+                indices,
+                prefetch::prefetch_depth(),
+                consume,
+            ),
+            None => prefetch::for_each_shard_ordered_uncached(
+                &*self.backed,
+                prefetch::prefetch_depth(),
+                consume,
+            ),
+        }
         .map_err(|e| e.to_string())?;
 
         let sums = self.apply_col_projection_to_vec(sums);

@@ -138,6 +138,35 @@ pub trait ShardSource {
         Ok(Arc::new(self.read_shard(shard_idx)?))
     }
 
+    /// Shards this source can contribute visible rows from, ascending.
+    ///
+    /// `None` — the default — means "unknown, visit every shard", so a source
+    /// that does not override this behaves exactly as before.
+    ///
+    /// Overridden by sources that apply a **row** filter inside `read_shard`.
+    /// Such a source decodes a shard, discovers none of its rows survive, and
+    /// returns an empty one; the drivers in [`crate::prefetch`] consult this
+    /// first and never ask for that shard at all. A caller with the row set in
+    /// hand does not
+    /// need this — it can pass the shard list to
+    /// `for_each_shard_ordered_uncached_selected` directly (the masked
+    /// aggregation kernels do) — but a caller that only holds a `&dyn
+    /// ShardSource` cannot know the filter exists.
+    ///
+    /// Deliberately **not** overridden by `BackedCsrReader`, which knows the
+    /// file's deletion keep-mask: it applies no row filter in `read_shard`, and
+    /// the row-axis kernels that iterate it (`qc_row_pass` and its lazy twin)
+    /// finish with a check that the shards they saw tile `[0, n_obs)`, which an
+    /// override would break. The row projection they honour is applied by their
+    /// caller, after the pass.
+    ///
+    /// The returned list must be strictly ascending — the contract of
+    /// [`crate::prefetch::for_each_shard_ordered_uncached_selected`], since
+    /// "shard order" there is defined by position in the list.
+    fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+        None
+    }
+
     /// Capacity (in shards) of this source's decode cache, if it has one.
     ///
     /// `None` means the source does not cache (every `read_shard_arc` call

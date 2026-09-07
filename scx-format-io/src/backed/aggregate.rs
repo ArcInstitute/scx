@@ -444,8 +444,11 @@ impl BackedCsrReader {
         let mut sums = vec![0.0f64; self.n_vars];
         let mut counts = vec![0u32; self.n_vars];
 
-        prefetch::for_each_shard_ordered_uncached(
+        // Skip shards no kept row falls in: the closure below already
+        // computes that (`lo == hi`), but only after paying for the decode.
+        prefetch::for_each_shard_ordered_uncached_selected(
             self,
+            &self.index.shards_with_kept_rows(kept_rows),
             prefetch::prefetch_depth(),
             |shard_idx, csr| -> Result<()> {
                 let (s_start, s_end) = match self.index.shard_range(shard_idx) {
@@ -497,8 +500,10 @@ impl BackedCsrReader {
         let mut sq_devs = vec![0.0f64; self.n_vars];
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        prefetch::for_each_shard_ordered_uncached(
+        // See `col_sums_and_nnz_masked`: skip the shards this kept set empties.
+        prefetch::for_each_shard_ordered_uncached_selected(
             self,
+            &self.index.shards_with_kept_rows(kept_rows),
             prefetch::prefetch_depth(),
             |shard_idx, csr| -> Result<()> {
                 let (s_start, s_end) = match self.index.shard_range(shard_idx) {
@@ -541,8 +546,10 @@ impl BackedCsrReader {
         };
         let mut col_nnz = vec![0usize; self.n_vars];
 
-        prefetch::for_each_shard_ordered_uncached(
+        // See `col_sums_and_nnz_masked`: skip the shards this kept set empties.
+        prefetch::for_each_shard_ordered_uncached_selected(
             self,
+            &self.index.shards_with_kept_rows(kept_rows),
             prefetch::prefetch_depth(),
             |shard_idx, csr| -> Result<()> {
                 let (s_start, s_end) = match self.index.shard_range(shard_idx) {

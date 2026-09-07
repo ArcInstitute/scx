@@ -799,6 +799,85 @@ fn test_shards_for_range_empty() {
     assert!(shards.is_empty());
 }
 
+// -----------------------------------------------------------------------
+// shards_with_kept_rows — the predicate the masked kernels skip on
+// -----------------------------------------------------------------------
+//
+// Pure index arithmetic, so it is pinned exhaustively here rather than
+// inferred from the kernels' output: a kernel that visits a shard it did not
+// need still produces the right numbers, so bit-identity alone cannot say
+// whether the skip list is correct.
+
+#[test]
+fn kept_rows_confined_to_one_shard_select_only_that_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+    // 4 shards of 3 rows each: [0,3), [3,6), [6,9), [9,12).
+    assert_eq!(backed.index().shards_with_kept_rows(&[6, 7, 8]), vec![2]);
+    assert_eq!(backed.index().shards_with_kept_rows(&[0]), vec![0]);
+    assert_eq!(backed.index().shards_with_kept_rows(&[11]), vec![3]);
+}
+
+#[test]
+fn kept_rows_straddling_a_boundary_select_both_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+    // Half-open ranges: row 3 belongs to shard 1, not shard 0.
+    assert_eq!(backed.index().shards_with_kept_rows(&[2, 3]), vec![0, 1]);
+    assert_eq!(backed.index().shards_with_kept_rows(&[3]), vec![1]);
+}
+
+#[test]
+fn a_gap_in_kept_rows_skips_the_shards_it_spans() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+    // Shards 1 and 2 contribute nothing — the case the change exists for.
+    assert_eq!(backed.index().shards_with_kept_rows(&[1, 10]), vec![0, 3]);
+}
+
+#[test]
+fn every_row_kept_selects_every_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+    let all: Vec<u64> = (0..12).collect();
+    assert_eq!(
+        backed.index().shards_with_kept_rows(&all),
+        vec![0, 1, 2, 3],
+        "the unsubset case must not skip anything"
+    );
+}
+
+#[test]
+fn no_kept_rows_selects_no_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+    assert!(backed.index().shards_with_kept_rows(&[]).is_empty());
+    // Out of range on both sides, not just empty.
+    assert!(backed.index().shards_with_kept_rows(&[99]).is_empty());
+}
+
+#[test]
+fn shards_with_kept_rows_agrees_with_shards_for_indices_when_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backed, _) = write_test_file_and_open(&dir, 12, 10, 4, 0);
+    // The pre-existing sort-then-scan helper is the oracle for the ascending
+    // input both are contracted for. They may not diverge: the kernels walk
+    // `kept_rows` with the same `partition_point` pair this uses.
+    for kept in [
+        vec![0u64],
+        vec![1, 10],
+        vec![2, 3],
+        vec![4, 5, 6, 7],
+        (0..12).collect::<Vec<u64>>(),
+    ] {
+        assert_eq!(
+            backed.index().shards_with_kept_rows(&kept),
+            backed.index().shards_for_indices(&kept),
+            "kept={kept:?}"
+        );
+    }
+}
+
 #[test]
 fn test_shards_for_range_at_boundary() {
     let dir = tempfile::tempdir().unwrap();
@@ -3178,17 +3257,22 @@ fn prefetched_aggregations_are_bit_identical_to_a_sequential_loop() {
     assert_bits_eq("col_var", &backed.col_var().unwrap(), &ref_col_var);
 }
 
+/// The oracle for one kept set: every masked kernel against a sequential
+/// re-derivation from the raw shards.
+///
+/// Parametrized on `kept` because the two call sites exercise different code.
+/// A set spanning every shard checks the arithmetic; a set that leaves whole
+/// shards empty additionally checks that skipping those shards changes
+/// nothing — which is only a real check while a *spanning* set is asserted
+/// too, since a kernel that wrongly skipped a shard holding kept rows would
+/// pass the second case on its own.
 #[cfg(feature = "parallel")]
-#[test]
-fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
-    let dir = tempfile::tempdir().unwrap();
-    let (n_obs, n_vars, n_shards) = (120usize, 11usize, 5usize);
-    let backed = write_float_file_and_open(&dir, n_obs, n_vars, n_shards);
-    assert_prefetch_engages(&backed);
-
-    // Strictly ascending kept set spanning every shard — the masked kernels
-    // `partition_point` it per shard, so it must stay sorted.
-    let kept: Vec<u64> = (0..n_obs as u64).filter(|r| r % 3 != 1).collect();
+fn assert_masked_aggregations_bit_identical(
+    backed: &BackedCsrReader,
+    n_vars: usize,
+    n_shards: usize,
+    kept: &[u64],
+) {
     let n_kept = kept.len();
 
     let mut ref_sums = vec![0.0f64; n_vars];
@@ -3231,27 +3315,27 @@ fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
 
     assert_bits_eq(
         "col_sums_masked",
-        &backed.col_sums_masked(&kept).unwrap(),
+        &backed.col_sums_masked(kept).unwrap(),
         &ref_sums,
     );
     assert_bits_eq(
         "col_max_masked",
-        &backed.col_max_masked(&kept).unwrap(),
+        &backed.col_max_masked(kept).unwrap(),
         &ref_max,
     );
     assert_bits_eq(
         "col_min_masked",
-        &backed.col_min_masked(&kept).unwrap(),
+        &backed.col_min_masked(kept).unwrap(),
         &ref_min,
     );
     let nnz_as_f64: Vec<f64> = ref_counts.iter().map(|&c| c as f64).collect();
     assert_bits_eq(
         "col_nnz_masked",
-        &backed.col_nnz_masked(&kept).unwrap(),
+        &backed.col_nnz_masked(kept).unwrap(),
         &nnz_as_f64,
     );
 
-    let (fs, fc) = backed.col_sums_and_nnz_masked(&kept).unwrap();
+    let (fs, fc) = backed.col_sums_and_nnz_masked(kept).unwrap();
     assert_bits_eq("col_sums_and_nnz_masked: sums", &fs, &ref_sums);
     assert_eq!(fc, ref_counts, "col_sums_and_nnz_masked: nnz");
 
@@ -3280,9 +3364,39 @@ fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
         .collect();
     assert_bits_eq(
         "col_var_masked",
-        &backed.col_var_masked(&kept).unwrap(),
+        &backed.col_var_masked(kept).unwrap(),
         &ref_var,
     );
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn prefetched_masked_aggregations_are_bit_identical_to_a_sequential_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (n_obs, n_vars, n_shards) = (120usize, 11usize, 5usize);
+    let backed = write_float_file_and_open(&dir, n_obs, n_vars, n_shards);
+    assert_prefetch_engages(&backed);
+
+    // Strictly ascending kept set spanning every shard — the masked kernels
+    // `partition_point` it per shard, so it must stay sorted.
+    let spanning: Vec<u64> = (0..n_obs as u64).filter(|r| r % 3 != 1).collect();
+    assert_eq!(
+        backed.index().shards_with_kept_rows(&spanning).len(),
+        n_shards,
+        "premise: this set reaches every shard, so nothing is skipped"
+    );
+    assert_masked_aggregations_bit_identical(&backed, n_vars, n_shards, &spanning);
+
+    // 5 shards of 24 rows: keep only the first and the last, so shards 1, 2
+    // and 3 hold no visible row and are never decoded. The set above cannot
+    // exercise that — it was written to span every shard on purpose.
+    let sparse_shards: Vec<u64> = (0..24u64).chain(96..120u64).collect();
+    assert_eq!(
+        backed.index().shards_with_kept_rows(&sparse_shards),
+        vec![0, 4],
+        "premise: three of five shards contribute nothing"
+    );
+    assert_masked_aggregations_bit_identical(&backed, n_vars, n_shards, &sparse_shards);
 }
 
 /// `shard_size_hint` reads catalog statistics — no decode — and reports upper
