@@ -394,59 +394,21 @@ pub fn highly_variable_genes<'py>(
     // batch, a missing `batch_key`, …) — see RouteStamp.
     let route = super::route::RouteStamp::write(py, adata, "highly_variable_genes", &info)?;
 
-    // ── Try SCX backed dataset ──────────────────────────────────────────
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let backed_ref = backed.borrow();
-        let reader = Arc::clone(&backed_ref.backed);
-        let n_vars = backed_ref.shape_val.1;
-        let n_obs = backed_ref.shape_val.0;
-        let kept = backed_ref.kept_to_global.clone();
-        let col_proj = backed_ref.col_projection_arc();
-        drop(backed_ref);
-
-        let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
+    // ── Try a backed SCX dataset: `adata.X` or a backed layer handle ────
+    if let Some(parts) = backed_shard_parts(&x) {
+        let source = build_shard_source(
+            &parts.reader,
+            &[],
+            &parts.kept,
+            &parts.col_proj,
+            parts.n_vars,
+        );
         return route.settle(hvg_on_source(
             py,
             adata,
             &source,
-            n_obs,
-            n_vars,
-            n_top_genes,
-            flavor,
-            batch_key,
-            span,
-            subset,
-            n_bins,
-            effective_gpu_id,
-        ));
-    }
-
-    // ── Try a backed *layer* handle ─────────────────────────────────────
-    //
-    // `adata.layers[name]` on a backed file is `ScxBackedLayerDataset`, not
-    // `ScxBackedSparseDataset`, so the cast above does not match it and the
-    // handle used to fall all the way through to `owned_csr`, where
-    // `scipy.sparse.csr_matrix(<handle>)` raises "unrecognized csr_matrix
-    // constructor input". `layer=` on a backed AnnData — the case the kwarg
-    // exists for — therefore never worked; every test for it used an in-memory
-    // scipy AnnData whose layers are plain scipy matrices.
-    if let Ok(layer_ds) = x.cast::<ScxBackedLayerDataset>() {
-        let layer_ref = layer_ds.borrow();
-        let inner = &layer_ref.inner;
-        let reader = Arc::clone(&inner.backed);
-        let n_vars = inner.shape_val.1;
-        let n_obs = inner.shape_val.0;
-        let kept = inner.kept_to_global.clone();
-        let col_proj = inner.col_projection_arc();
-        drop(layer_ref);
-
-        let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
-        return route.settle(hvg_on_source(
-            py,
-            adata,
-            &source,
-            n_obs,
-            n_vars,
+            parts.n_obs,
+            parts.n_vars,
             n_top_genes,
             flavor,
             batch_key,
@@ -624,6 +586,53 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
             "Unsupported HVG flavor '{flavor}'. Use 'seurat_v3' or 'seurat'."
         ))),
     }
+}
+
+/// The shard-source inputs of a backed dataset, however it reached us.
+///
+/// `adata.X` on a backed file is `ScxBackedSparseDataset`; `adata.layers[name]`
+/// is `ScxBackedLayerDataset`, a distinct `#[pyclass]` wrapping one. Every
+/// accelerator that dispatched with a bare `cast::<ScxBackedSparseDataset>()`
+/// therefore missed a layer handle and fell through to `owned_csr`, where
+/// `scipy.sparse.csr_matrix(<handle>)` raises "unrecognized csr_matrix
+/// constructor input" — so `layer=` was broken on exactly the files it exists
+/// for, and every test for it used an in-memory scipy AnnData.
+///
+/// Returning the parts rather than a borrow keeps the `PyRef` guard local: the
+/// layer's `inner` lives behind a `Ref`, so callers cannot hold a reference to
+/// it across `build_shard_source`.
+pub(super) struct BackedShardParts {
+    pub(super) reader: std::sync::Arc<scx_format_io::BackedCsrReader>,
+    pub(super) n_obs: usize,
+    pub(super) n_vars: usize,
+    pub(super) kept: Option<std::sync::Arc<Vec<u64>>>,
+    pub(super) col_proj: Option<std::sync::Arc<Vec<u32>>>,
+}
+
+impl BackedShardParts {
+    fn of_dataset(ds: &ScxBackedSparseDataset) -> Self {
+        Self {
+            reader: Arc::clone(&ds.backed),
+            n_obs: ds.shape_val.0,
+            n_vars: ds.shape_val.1,
+            kept: ds.kept_to_global.clone(),
+            col_proj: ds.col_projection_arc(),
+        }
+    }
+}
+
+/// Extract [`BackedShardParts`] from `adata.X` **or** a backed layer handle.
+///
+/// `None` means "not a backed SCX matrix" — the caller falls on to its lazy
+/// and in-memory arms as before.
+pub(super) fn backed_shard_parts(x: &Bound<'_, PyAny>) -> Option<BackedShardParts> {
+    if let Ok(ds) = x.cast::<ScxBackedSparseDataset>() {
+        return Some(BackedShardParts::of_dataset(&ds.borrow()));
+    }
+    if let Ok(layer) = x.cast::<ScxBackedLayerDataset>() {
+        return Some(BackedShardParts::of_dataset(&layer.borrow().inner));
+    }
+    None
 }
 
 /// Build a full-dataset `LazyShardSource` for the backed / lazy dispatch.

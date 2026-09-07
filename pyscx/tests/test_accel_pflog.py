@@ -437,3 +437,41 @@ class TestDeviceValidation:
         with pytest.raises(ValueError, match="unknown device"):
             pyscx.accel.pflog(ad, alpha=ALPHA, store="baseline", device="tpu")
         assert "pflog_baseline" not in ad.obs
+
+
+def test_pflog_layer_on_a_backed_adata(tmp_dir):
+    """`pflog(layer=)` on a backed file — the `ScxBackedLayerDataset` arm.
+
+    Same hole as `score_genes` / `highly_variable_genes` / `calculate_qc_metrics`
+    had: a backed layer is a distinct pyclass that a bare
+    `cast::<ScxBackedSparseDataset>()` misses, so the handle reached
+    `scipy.sparse.csr_matrix(...)` and raised.
+    """
+    import anndata as ad
+    import numpy as np
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+    from pyscx import ScxBackedLayerDataset
+
+    rng = np.random.default_rng(4)
+    n_obs, n_vars = 120, 60
+    x = sp.csr_matrix(
+        (rng.random((n_obs, n_vars)) < 0.3) * rng.integers(1, 40, (n_obs, n_vars)).astype(np.float32)
+    )
+    adata = ad.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{j}" for j in range(n_vars)]),
+    )
+    adata.layers["counts"] = x.copy()
+
+    path = str(tmp_dir / "pflog_backed_layer.scx")
+    pyscx.from_anndata(adata, path)
+    backed = pyscx.open(path).to_anndata(backed=True)
+    assert isinstance(backed.layers["counts"], ScxBackedLayerDataset), "premise"
+
+    pyscx.accel.pflog(backed, layer="counts", store="baseline")
+    assert "pflog_baseline" in backed.obs
+    assert np.all(np.isfinite(backed.obs["pflog_baseline"].to_numpy()))

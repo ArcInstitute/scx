@@ -731,54 +731,76 @@ def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
     import scanpy as sc
 
     ensure_metadata_columns(adata_raw)
-    base_obs = set(adata_raw.obs.columns)
-    base_var = set(adata_raw.var.columns)
 
-    # Scanpy path
-    adata_sc = adata_raw.copy()
-    sc.pp.calculate_qc_metrics(
-        adata_sc, qc_vars=["mt"], percent_top=None, log1p=True, inplace=True
+    # `inplace=False` on both sides so the produced column sets are compared
+    # directly. Subtracting the input schema instead would drop any QC-named
+    # column the input already carried, which on a pre-annotated dataset makes
+    # the comparison partially or wholly vacuous — the failure mode this check
+    # is being fixed for.
+    obs_sc, var_sc = sc.pp.calculate_qc_metrics(
+        adata_raw, qc_vars=["mt"], percent_top=None, log1p=True, inplace=False
     )
 
-    # pyscx path — through the streaming kernel, on a real SCX file
     with tempfile.TemporaryDirectory() as tmp:
         scx_path = prepare_scx_file(adata_raw, Path(tmp))
         adata_pyscx = pyscx.open(scx_path).to_anndata(backed=True)
         adata_pyscx.var["mt"] = np.asarray(adata_raw.var["mt"], dtype=bool)
-        pyscx.accel.calculate_qc_metrics(adata_pyscx, qc_vars=["mt"], log1p=True)
-        obs_pyscx = adata_pyscx.obs.copy()
-        var_pyscx = adata_pyscx.var.copy()
+        obs_pyscx, var_pyscx = pyscx.accel.calculate_qc_metrics(
+            adata_pyscx, qc_vars=["mt"], log1p=True, inplace=False
+        )
+        obs_pyscx, var_pyscx = obs_pyscx.copy(), var_pyscx.copy()
 
-    # Every column both sides write, not a hand-picked four: the point of the
-    # unified kernel is that the two column sets are equal.
-    added_sc_obs = set(adata_sc.obs.columns) - base_obs
-    added_sc_var = set(adata_sc.var.columns) - base_var
-    obs_cols = sorted(added_sc_obs & (set(obs_pyscx.columns) - base_obs))
-    var_cols = sorted(added_sc_var & (set(var_pyscx.columns) - base_var))
-    schema_match = added_sc_obs <= set(obs_pyscx.columns) and added_sc_var <= set(
-        var_pyscx.columns
-    )
+    # Set EQUALITY, not inclusion: an extra pyscx-only column is a schema
+    # divergence too, and the whole point of the unified kernel is that the two
+    # sets are the same.
+    schema_match = set(obs_sc.columns) == set(obs_pyscx.columns) and set(
+        var_sc.columns
+    ) == set(var_pyscx.columns)
 
+    # Integer counts must match exactly; a relative tolerance would let a
+    # one-cell error pass on any gene expressed in more than 100k cells.
+    int_cols = {"obs": ["n_genes_by_counts"], "var": ["n_cells_by_counts"]}
+    int_match = True
     max_rel_err = 0.0
-    for cols, ref_frame, got_frame in (
-        (obs_cols, adata_sc.obs, obs_pyscx),
-        (var_cols, adata_sc.var, var_pyscx),
+    for frame, ref_frame, got_frame in (
+        ("obs", obs_sc, obs_pyscx),
+        ("var", var_sc, var_pyscx),
     ):
-        for col in cols:
-            ref = np.asarray(ref_frame[col].values, dtype=np.float64)
-            got = np.asarray(got_frame[col].values, dtype=np.float64)
+        shared = sorted(set(ref_frame.columns) & set(got_frame.columns))
+        for col in shared:
+            ref = np.asarray(ref_frame[col].values)
+            got = np.asarray(got_frame[col].values)
             if ref.shape != got.shape:
                 schema_match = False
                 continue
+            if col in int_cols[frame]:
+                if not np.array_equal(ref.astype(np.int64), got.astype(np.int64)):
+                    int_match = False
+                continue
+            ref = ref.astype(np.float64)
+            got = got.astype(np.float64)
+            # Relative, because scanpy accumulates a float32 matrix in float32:
+            # above 2**24 a per-gene total loses integer resolution there (~1e2
+            # absolute on a census-scale gene) while the streaming kernel
+            # accumulates in f64. That is scanpy's rounding, not a regression,
+            # and an absolute 1e-5 gate would fail on any large dataset.
             scale = np.maximum(np.abs(ref), 1.0)
             max_rel_err = max(max_rel_err, float(np.max(np.abs(ref - got) / scale)))
 
     rel_threshold = 1e-5
     return ValidationCheck(
         name="calculate_qc_metrics",
-        passed=max_rel_err < rel_threshold and schema_match,
-        metrics={"max_rel_error": max_rel_err, "schema_match": schema_match},
-        thresholds={"max_rel_error": rel_threshold, "schema_match": True},
+        passed=max_rel_err < rel_threshold and schema_match and int_match,
+        metrics={
+            "max_rel_error": max_rel_err,
+            "schema_match": schema_match,
+            "int_exact_match": int_match,
+        },
+        thresholds={
+            "max_rel_error": rel_threshold,
+            "schema_match": True,
+            "int_exact_match": True,
+        },
     )
 
 

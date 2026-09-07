@@ -24,16 +24,10 @@ use scx_accel::{score_genes as accel_score_genes, ScoreMethod};
 use scx_format_io::shard_source::SingleShardSource;
 use scx_format_io::ShardSource;
 
-use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
-use super::hvg::build_shard_source;
+use super::hvg::{backed_shard_parts, build_shard_source};
 
-/// Score a set of genes per cell, writing the result to `adata.obs[score_name]`.
-///
-/// `gene_list` / `gene_pool` are gene symbols resolved against `adata.var.index`;
-/// genes absent from `var_names` are dropped with a warning. `gene_pool` defaults
-/// to all genes and is only used by `method="control"`.
 /// Resolve gene symbols to var-index positions, de-duplicated, first-seen order.
 ///
 /// Returns `(resolved, missing)`. Duplicate *inputs* collapse to one index (a
@@ -65,6 +59,21 @@ fn resolve_var_indices(
     (resolved, missing)
 }
 
+/// Score a set of genes per cell, writing the result to `adata.obs[score_name]`.
+///
+/// `gene_list` / `gene_pool` / `ctrl_genes` are gene symbols resolved against
+/// `adata.var.index`; genes absent from `var_names` are dropped with a warning.
+/// `gene_pool` defaults to all genes and is only used by `method="control"`.
+///
+/// `ctrl_genes` supplies the control set directly and skips the
+/// expression-matched sampling, which is the exact-parity route: given the
+/// controls scanpy used, the score matches `sc.tl.score_genes`. The sampler
+/// behind `method="control"` is deterministic but is not numpy's, so it draws
+/// different control genes and the absolute scores differ. `ctrl_genes` also
+/// works on a backed `X`, which `sc.tl.score_genes` refuses outright. It
+/// requires `method="control"` and rejects an explicit `gene_pool`, whose only
+/// role is to be sampled from; `ctrl_size` / `n_bins` / `random_state` are
+/// ignored, there being no sampling left to steer.
 #[pyfunction]
 #[pyo3(signature = (
     adata,
@@ -231,19 +240,23 @@ pub fn score_genes<'py>(
 
     // ── Select the source matrix (layer or X) ───────────────────────────
     let x = match layer {
-        Some(name) => adata.getattr("layers")?.get_item(name)?,
+        // Same typed error as `select_de_matrix` / `calculate_qc_metrics`
+        // rather than the mapping's bare `KeyError`.
+        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?,
         None => adata.getattr("X")?,
     };
 
     // ── Dispatch: backed → lazy → in-memory, all via ShardSource ─────────
-    if let Ok(backed) = x.cast::<ScxBackedSparseDataset>() {
-        let backed_ref = backed.borrow();
-        let reader = Arc::clone(&backed_ref.backed);
-        let n_vars = backed_ref.shape_val.1;
-        let kept = backed_ref.kept_to_global.clone();
-        let col_proj = backed_ref.col_projection_arc();
-        drop(backed_ref);
-        let source = build_shard_source(&reader, &[], &kept, &col_proj, n_vars);
+    if let Some(parts) = backed_shard_parts(&x) {
+        let source = build_shard_source(
+            &parts.reader,
+            &[],
+            &parts.kept,
+            &parts.col_proj,
+            parts.n_vars,
+        );
         return score_on_source(
             py,
             adata,

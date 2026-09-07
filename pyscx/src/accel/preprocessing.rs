@@ -653,8 +653,10 @@ pub fn calculate_qc_metrics<'py>(
         // The CSC sidecar belongs to `X`, not to an arbitrary layer, and a
         // layer handle is built with no column source at all — so this would
         // otherwise fail deeper down with a message about a missing sidecar,
-        // blaming the file for the caller's kwarg combination.
-        if layer.is_some() {
+        // blaming the file for the caller's kwarg combination. The
+        // `BackedLayer` arm catches the same handle reached without the kwarg,
+        // via `adata.X = adata.layers["counts"]`.
+        if layer.is_some() || matches!(kind, QcSourceKind::BackedLayer) {
             return Err(PyRuntimeError::new_err(
                 "calculate_qc_metrics: prefer_format='csc' does not support layer= \
                  (the CSC sidecar lives on adata.X, not on layers); pass layer=None \
@@ -707,7 +709,7 @@ pub fn calculate_qc_metrics<'py>(
                 RowQcOutputs::accumulate(
                     &qc_masks,
                     b.kept_to_global.as_ref().map(|k| k.as_slice()),
-                    |bits, n| b.qc_row_pass_raw(bits, n, ns),
+                    |bits, n, top| b.qc_row_pass_raw(bits, n, if top { ns } else { &[] }),
                 )
             })
             .map_err(PyRuntimeError::new_err)?
@@ -719,7 +721,7 @@ pub fn calculate_qc_metrics<'py>(
                 RowQcOutputs::accumulate(
                     &qc_masks,
                     b.kept_to_global.as_ref().map(|k| k.as_slice()),
-                    |bits, n| b.qc_row_pass_raw(bits, n, ns),
+                    |bits, n, top| b.qc_row_pass_raw(bits, n, if top { ns } else { &[] }),
                 )
             })
             .map_err(PyRuntimeError::new_err)?
@@ -731,7 +733,7 @@ pub fn calculate_qc_metrics<'py>(
                 RowQcOutputs::accumulate(
                     &qc_masks,
                     l.kept_to_global.as_ref().map(|k| k.as_slice()),
-                    |bits, n| l.streaming_qc_row_pass(bits, n, ns),
+                    |bits, n, top| l.streaming_qc_row_pass(bits, n, if top { ns } else { &[] }),
                 )
             })
             .map_err(PyRuntimeError::new_err)?
@@ -741,9 +743,9 @@ pub fn calculate_qc_metrics<'py>(
             // deletion vector — an in-memory `X` is already the visible rows.
             let csr = in_memory_csr.as_ref().expect("in-memory arm builds a CSR");
             detached(py, || {
-                RowQcOutputs::accumulate(&qc_masks, None, |bits, n| {
-                    let mut out =
-                        projected_agg::QcRowStats::zeroed(csr.n_rows(), n, percent_top.len());
+                RowQcOutputs::accumulate(&qc_masks, None, |bits, n, top| {
+                    let ns = if top { ns } else { &[][..] };
+                    let mut out = projected_agg::QcRowStats::zeroed(csr.n_rows(), n, ns.len());
                     projected_agg::accumulate_qc_rows_into(csr, 0, bits, ns, &mut out);
                     Ok(out)
                 })
@@ -802,7 +804,7 @@ pub fn calculate_qc_metrics<'py>(
     // frame from `inplace=False` lines up with one from `sc.pp` without a sort.
     let obs_dict = PyDict::new(py);
     if log1p {
-        let log_n_genes: Vec<f64> = n_genes.iter().map(|&v| (v as f64 + 1.0).ln()).collect();
+        let log_n_genes: Vec<f64> = n_genes.iter().map(|&v| (v as f64).ln_1p()).collect();
         obs_dict.set_item("n_genes_by_counts", numpy::PyArray::from_vec(py, n_genes))?;
         obs_dict.set_item(
             "log1p_n_genes_by_counts",
@@ -816,7 +818,7 @@ pub fn calculate_qc_metrics<'py>(
         numpy::PyArray::from_vec(py, total_counts.clone()),
     )?;
     if log1p {
-        let log_total: Vec<f64> = total_counts.iter().map(|&v| (v + 1.0).ln()).collect();
+        let log_total: Vec<f64> = total_counts.iter().map(|&v| v.ln_1p()).collect();
         obs_dict.set_item(
             "log1p_total_counts",
             numpy::PyArray::from_vec(py, log_total),
@@ -867,7 +869,7 @@ pub fn calculate_qc_metrics<'py>(
         numpy::PyArray::from_vec(py, mean_counts.clone()),
     )?;
     if log1p {
-        let log_mean: Vec<f64> = mean_counts.iter().map(|&v| (v + 1.0).ln()).collect();
+        let log_mean: Vec<f64> = mean_counts.iter().map(|&v| v.ln_1p()).collect();
         var_dict.set_item("log1p_mean_counts", numpy::PyArray::from_vec(py, log_mean))?;
     }
     var_dict.set_item(
@@ -879,7 +881,7 @@ pub fn calculate_qc_metrics<'py>(
         numpy::PyArray::from_vec(py, gene_total_counts.clone()),
     )?;
     if log1p {
-        let log_gene_total: Vec<f64> = gene_total_counts.iter().map(|&v| (v + 1.0).ln()).collect();
+        let log_gene_total: Vec<f64> = gene_total_counts.iter().map(|&v| v.ln_1p()).collect();
         var_dict.set_item(
             "log1p_total_counts",
             numpy::PyArray::from_vec(py, log_gene_total),
@@ -905,7 +907,7 @@ pub fn calculate_qc_metrics<'py>(
 
         // Compute log1p before moving subset_sums.
         let log1p_subset_sums: Option<Vec<f64>> = if log1p {
-            Some(subset_sums.iter().map(|&v| (v + 1.0).ln()).collect())
+            Some(subset_sums.iter().map(|&v| v.ln_1p()).collect())
         } else {
             None
         };
@@ -1514,10 +1516,6 @@ struct QcMasks {
     /// Subsets split into ≤64-wide chunks, in `qc_vars` order. Empty when no
     /// `qc_var` was requested (the row pass then runs once with no subsets).
     chunks: Vec<QcMaskChunk>,
-    /// Per-subset "mask selected no genes", flattened across chunks in
-    /// `qc_vars` order, to reproduce the historical zero-fill shape (no
-    /// `log1p_total_counts_<v>` column).
-    empty: Vec<bool>,
 }
 
 /// Read each `qc_var` boolean column off `adata.var` and pack the subsets into
@@ -1542,16 +1540,12 @@ fn resolve_qc_masks(
     qc_vars: &[String],
 ) -> PyResult<QcMasks> {
     if qc_vars.is_empty() {
-        return Ok(QcMasks {
-            chunks: Vec::new(),
-            empty: Vec::new(),
-        });
+        return Ok(QcMasks { chunks: Vec::new() });
     }
 
     let n_visible = source_n_vars(x)?;
     let np = crate::pyimport::import_module(py, "numpy")?;
     let var_df = adata.getattr("var")?;
-    let mut empty = Vec::with_capacity(qc_vars.len());
     let mut chunks: Vec<QcMaskChunk> = Vec::new();
 
     for group in qc_vars.chunks(QC_MASK_BITS) {
@@ -1563,7 +1557,6 @@ fn resolve_qc_masks(
                 .get_item(0)?
                 .call_method1("astype", ("uint32",))?
                 .extract()?;
-            empty.push(idx.is_empty());
             for &i in &idx {
                 let slot = bits.get_mut(i as usize).ok_or_else(|| {
                     PyRuntimeError::new_err(format!(
@@ -1580,7 +1573,7 @@ fn resolve_qc_masks(
         });
     }
 
-    Ok(QcMasks { chunks, empty })
+    Ok(QcMasks { chunks })
 }
 
 /// Which kind of matrix `calculate_qc_metrics` was pointed at.
@@ -1612,8 +1605,13 @@ impl QcSourceKind {
     }
 }
 
-/// Number of user-visible columns on a backed / lazy SCX `X`.
-fn visible_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
+/// Visible column count for any matrix `calculate_qc_metrics` accepts.
+///
+/// One pass over the four kinds, rather than a classify-then-re-extract pair:
+/// `percent_top` has to be range-checked against the **visible** width before a
+/// route is chosen, and under a column projection that is not the file's
+/// `n_vars`.
+fn source_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
     if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
         return Ok(backed.shape_val.1);
     }
@@ -1623,21 +1621,8 @@ fn visible_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
     if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
         return Ok(lazy.shape_val.1);
     }
-    Err(PyRuntimeError::new_err(
-        "expected an ScxBackedSparseDataset or ScxLazyTransformedDataset",
-    ))
-}
-
-/// Visible column count for any matrix `calculate_qc_metrics` accepts.
-///
-/// Unlike [`visible_n_vars`] this also answers for a scipy/dense `X`, because
-/// `percent_top` has to be range-checked before the route is chosen.
-fn source_n_vars(x: &Bound<'_, PyAny>) -> PyResult<usize> {
-    if matches!(QcSourceKind::of(x), QcSourceKind::InMemory) {
-        let shape: (usize, usize) = x.getattr("shape")?.extract()?;
-        return Ok(shape.1);
-    }
-    visible_n_vars(x)
+    let shape: (usize, usize) = x.getattr("shape")?.extract()?;
+    Ok(shape.1)
 }
 
 /// Validate and canonicalize `percent_top` into ascending, de-duplicated,
@@ -1688,27 +1673,34 @@ fn normalize_percent_top(percent_top: Option<&[i64]>, n_visible: usize) -> PyRes
 ///
 /// Returns the input untouched when there is nothing to drop, which is the
 /// common case and costs one scan.
-fn canonicalize_for_qc(csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {
+fn canonicalize_for_qc(mut csr: scx_sparse::ScxCsr) -> scx_sparse::ScxCsr {
     if !csr.data.contains(&0.0) {
         return csr;
     }
+    // Single forward pass, compacting in place: read `indptr[row + 1]` into
+    // `next_start` before the write that overwrites it. Mirrors
+    // `scx_sparse::drop_explicit_zeros_inplace`, which cannot be called here —
+    // it takes the writer-side `u64`/`u32` shard widths, while `ScxCsr` is
+    // scipy-compatible `i64`/`i32`.
     let n_rows = csr.n_rows();
-    let mut indptr = Vec::with_capacity(n_rows + 1);
-    let mut indices = Vec::with_capacity(csr.data.len());
-    let mut data = Vec::with_capacity(csr.data.len());
-    indptr.push(0i64);
+    let mut write = 0usize;
+    let mut next_start = csr.indptr[0] as usize;
     for row in 0..n_rows {
-        let s = csr.indptr[row] as usize;
-        let e = csr.indptr[row + 1] as usize;
-        for j in s..e {
-            if csr.data[j] != 0.0 {
-                indices.push(csr.indices[j]);
-                data.push(csr.data[j]);
+        let start = next_start;
+        let end = csr.indptr[row + 1] as usize;
+        next_start = end;
+        for k in start..end {
+            if csr.data[k] != 0.0 {
+                csr.indices[write] = csr.indices[k];
+                csr.data[write] = csr.data[k];
+                write += 1;
             }
         }
-        indptr.push(data.len() as i64);
+        csr.indptr[row + 1] = write as i64;
     }
-    scx_sparse::ScxCsr::new_unchecked(csr.shape, indptr, indices, data)
+    csr.indices.truncate(write);
+    csr.data.truncate(write);
+    csr
 }
 
 /// Deletion-filtered outputs of the fused row pass, in publish order.
@@ -1731,7 +1723,7 @@ impl RowQcOutputs {
     /// `filter_row_results` on both dataset types.
     fn accumulate<F>(masks: &QcMasks, kept: Option<&[u64]>, mut pass: F) -> Result<Self, String>
     where
-        F: FnMut(&[u64], usize) -> Result<projected_agg::QcRowStats, String>,
+        F: FnMut(&[u64], usize, bool) -> Result<projected_agg::QcRowStats, String>,
     {
         // Consumes `all`: with no deletion vector the global-length vector is
         // already the answer, so the common path moves instead of copying.
@@ -1745,7 +1737,8 @@ impl RowQcOutputs {
         let mut total_counts: Option<Vec<f64>> = None;
         let mut n_genes: Option<Vec<i64>> = None;
         let mut top_fractions: Vec<Vec<f64>> = Vec::new();
-        let mut qc_subset_sums: Vec<Vec<f64>> = Vec::with_capacity(masks.empty.len());
+        let mut qc_subset_sums: Vec<Vec<f64>> =
+            Vec::with_capacity(masks.chunks.iter().map(|c| c.n_qc).sum());
 
         // `chunks` is empty only when no qc_var was requested — still run one
         // pass, for total_counts / n_genes_by_counts.
@@ -1759,8 +1752,12 @@ impl RowQcOutputs {
             &masks.chunks[..]
         };
 
-        for chunk in chunks {
-            let stats = pass(&chunk.bits, chunk.n_qc)?;
+        for (i, chunk) in chunks.iter().enumerate() {
+            // Only the first chunk's row-axis outputs are kept (below), so the
+            // later chunks must not pay for a per-row top-N selection whose
+            // result is discarded.
+            let first = i == 0;
+            let stats = pass(&chunk.bits, chunk.n_qc, first)?;
             if total_counts.is_none() {
                 total_counts = Some(take(stats.sums, kept));
                 n_genes = Some(take(stats.nnz, kept));

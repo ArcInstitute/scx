@@ -455,3 +455,69 @@ class TestCtrlGenes:
                 gene_pool=["gene_1", "gene_2"],
                 device="cpu",
             )
+
+
+class TestBackedLayer:
+    """`layer=` on a *backed* AnnData, which is where the handle is an SCX type.
+
+    `adata.layers[name]` on a backed file is `ScxBackedLayerDataset`, not
+    `ScxBackedSparseDataset`, so a bare cast misses it and the handle falls
+    through to `scipy.sparse.csr_matrix(<handle>)`, which raises
+    `ValueError: unrecognized csr_matrix constructor input`. `TestLayer` above
+    only ever used an in-memory scipy layer, so nothing covered the case the
+    kwarg exists for.
+    """
+
+    def _backed(self, synthetic_adata, tmp_dir):
+        path = str(tmp_dir / "score_backed_layer.scx")
+        pyscx.from_anndata(synthetic_adata, path)
+        backed = pyscx.open(path).to_anndata(backed=True)
+        from pyscx import ScxBackedLayerDataset
+
+        assert isinstance(backed.layers["raw"], ScxBackedLayerDataset), (
+            "premise: the layer must be an SCX handle, or this is the scipy case"
+        )
+        return backed
+
+    @pytest.mark.parametrize("method", ["control", "mean", "zscore"])
+    def test_layer_on_a_backed_adata(self, synthetic_adata, tmp_dir, method):
+        backed = self._backed(synthetic_adata, tmp_dir)
+        pyscx.accel.score_genes(
+            backed, GENES, method=method, layer="raw", score_name="s", device="cpu"
+        )
+
+        reference = synthetic_adata.copy()
+        reference.X = reference.layers["raw"]
+        pyscx.accel.score_genes(
+            reference, GENES, method=method, score_name="s", device="cpu"
+        )
+        np.testing.assert_allclose(
+            backed.obs["s"].to_numpy(),
+            reference.obs["s"].to_numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_ctrl_genes_on_a_backed_layer(self, synthetic_adata, tmp_dir):
+        """The combination this PR advertises: explicit controls, backed, layer."""
+        backed = self._backed(synthetic_adata, tmp_dir)
+        ctrl = ["gene_1", "gene_2", "gene_3"]
+        pyscx.accel.score_genes(
+            backed, GENES, ctrl_genes=ctrl, layer="raw", score_name="s", device="cpu"
+        )
+
+        raw = synthetic_adata.layers["raw"]
+        x = raw.toarray() if hasattr(raw, "toarray") else np.asarray(raw)
+        x = x.astype(np.float64)
+        loc = synthetic_adata.var_names.get_loc
+        expected = x[:, [loc(g) for g in GENES]].mean(axis=1) - x[
+            :, [loc(g) for g in ctrl]
+        ].mean(axis=1)
+        np.testing.assert_allclose(
+            backed.obs["s"].to_numpy(), expected, rtol=1e-5, atol=1e-6
+        )
+
+    def test_unknown_layer_names_itself(self, synthetic_adata, tmp_dir):
+        backed = self._backed(synthetic_adata, tmp_dir)
+        with pytest.raises(ValueError, match=r"nope"):
+            pyscx.accel.score_genes(backed, GENES, layer="nope", device="cpu")
