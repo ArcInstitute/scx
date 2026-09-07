@@ -20,12 +20,15 @@ What is compared: parameter **names, order, and keyword-only-ness**, against
 signatures do carry `*` separators, unlike `to_anndata` — a kwarg drifting
 across the `*` changes the calling contract without changing the name list.
 
-What is **not** compared: default *values*. `epsilon=1e-9` against a repr of
-`1e-09`, and `"csr"` against `'csr'`, would make the guard brittle without
-reaching a new class of bug — a bullet with a stale default almost always has a
-stale name list too (`normalize_total(target_sum=10000.0)` was also missing
-`device`). If that assumption ever stops holding, add the comparison rather than
-loosening this one.
+Defaults **are** compared, after review pushed back on skipping them. The
+original reasoning — that `1e-9` against a repr of `1e-09`, or `"csr"` against
+`'csr'`, would be brittle — was an artifact of comparing the *text*; parsing
+with `ast` removes it, since both sides become the same Python object. And the
+assumption behind the skip ("a stale default almost always has a stale name list
+too") was false: `docs/api.md` documented `pca_neighbors(prefer_format="auto")`
+against a runtime `"csr"` with an otherwise-perfect name list, and a names-only
+guard passed it. A documented default that is not a literal, and a pyo3 sentinel
+default (`...`), are exempt — see `_same_default`.
 
 The docs also state kwargs in a *second*, non-signature shape: the accel
 compatibility matrix in `docs/scanpy.md`. That table is deliberately incomplete
@@ -57,6 +60,13 @@ _DOC_FILES = {
     "docs/api.md": "qualified",
     "skills/scx-usage/reference/processing.md": "bare-ok",
 }
+
+# In a `bare-ok` file, the section whose bullets are accel functions — so an
+# unresolved bare name *inside* it is a stale bullet and fails, while the
+# `Experiment` / query-pipeline sections above it are left alone. Without this
+# split the disappearing-callable check only covered `docs/api.md`, and the
+# reference documented `shifted_clr(...)`, which exists nowhere in the repo.
+_ACCEL_SECTION = "## pyscx.accel.* — Rust-native accelerators"
 
 # A markdown bullet, and then every ``name(`` inside it. Names are matched
 # loosely and filtered against the runtime module afterwards, so a
@@ -291,7 +301,15 @@ def _leading_signatures(line: str) -> list[tuple[bool, str, int]]:
         # backtick, then `, ` / ` / ` to continue the run.
         after = line.index(")", m.end() - 1 + len(body))
         rest = line[after + 1 :]
-        cont = re.match(r"(?:\s*(?:->|→)[^`]*)?`\s*(?:,|/)\s*", rest)
+        # `,` / `/` / `;` all separate signatures in these files, and a
+        # parenthesised note can sit between one signature and the next
+        # (`…, \`knockdown_efficiency(…)\` (input must be normalized…),
+        # \`clustering_agreement(…)\``). Without both, the run stopped early and
+        # the tail signatures were invisible — which is the blind spot this
+        # helper exists to remove.
+        cont = re.match(
+            r"(?:\s*(?:->|→)[^`]*)?`(?:\s*\([^)]*\))?\s*[,;/]\s*", rest
+        )
         if not cont:
             return out
         pos = after + 1 + cont.end()
@@ -317,14 +335,17 @@ def _collect() -> tuple[list[tuple[str, int, str, str]], list[str]]:
     unresolved: list[str] = []
     for rel, mode in _DOC_FILES.items():
         text = (root / rel).read_text()
+        in_accel_section = False
         for lineno, line in enumerate(text.splitlines(), 1):
+            if line.startswith("## "):
+                in_accel_section = line.strip() == _ACCEL_SECTION
             for qualified, name, paren in _leading_signatures(line):
                 if mode == "qualified" and not qualified:
                     continue
                 fn = getattr(accel, name, None)
                 if fn is None or not callable(fn):
-                    if qualified:
-                        unresolved.append(f"{rel}:{lineno} `pyscx.accel.{name}`")
+                    if qualified or in_accel_section:
+                        unresolved.append(f"{rel}:{lineno} `{name}`")
                     continue
                 found.append((rel, lineno, name, _balanced_group(line, paren) or ""))
     return found, unresolved

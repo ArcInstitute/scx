@@ -117,10 +117,17 @@ _PROBE = textwrap.dedent(
         pyscx.accel.log1p(adata)
         assert type(adata.X).__name__ == "ScxLazyTransformedDataset", type(adata.X)
 
+    # `mask_var` is passed as an **argument**, never written to `adata.var`:
+    # on a subset view that write is copy-on-write, which materialises `X` and
+    # takes the streaming path out of the picture entirely. An earlier version
+    # of this probe did exactly that and measured 0 decodes either way, which
+    # is how the `ProjectedShardSource` finding came to be wrongly rejected.
+    mask_var = None
     if op == "mask_var":
-        # PCA under a gene mask wraps the source in `ProjectedShardSource`,
-        # which is a different seam from the bare source.
-        adata.var["highly_variable"] = np.arange(adata.n_vars) % 3 == 0
+        mask_var = np.arange(adata.n_vars) % 3 == 0
+        op = "pca"
+    elif op == "mask_var_all":
+        mask_var = np.ones(adata.n_vars, dtype=bool)
         op = "pca"
     pyscx.accel.cpu_profile_reset()
     if op == "sum":
@@ -134,7 +141,12 @@ _PROBE = textwrap.dedent(
             adata, ["g0", "g1", "g2"], method="mean", device="cpu"
         )
     elif op == "pca":
-        pyscx.accel.pca(adata, n_comps=3, device="cpu")
+        kw = {} if mask_var is None else {"mask_var": mask_var}
+        pyscx.accel.pca(adata, n_comps=3, device="cpu", **kw)
+    elif op == "hvg_seurat":
+        pyscx.accel.highly_variable_genes(
+            adata, n_top_genes=10, flavor="seurat", device="cpu"
+        )
     elif op == "pflog":
         pyscx.accel.pflog(adata, store="baseline")
     elif op == "hvg":
@@ -153,8 +165,8 @@ _PROBE = textwrap.dedent(
 )
 
 
-def _probe(path, case):
-    env = dict(os.environ, SCX_CPU_PROFILE="1")
+def _probe(path, case, **extra_env):
+    env = dict(os.environ, SCX_CPU_PROFILE="1", **extra_env)
     out = subprocess.run(
         [sys.executable, "-c", _PROBE, path, case],
         capture_output=True,
@@ -186,38 +198,53 @@ _OPS = {
 }
 
 
-def test_a_gene_mask_does_not_undo_the_row_skip(path):
+@pytest.mark.parametrize("op", ["mask_var", "mask_var_all"])
+def test_pca_under_a_gene_mask_still_skips(path, op):
     """`mask_var=` wraps the source in `ProjectedShardSource`.
 
-    That wrapper answered the trait default (`None` = visit every shard) and so
-    discarded the inner source's plan; it now forwards it. Review predicted the
-    CPU HVG → PCA pipeline "still decodes every shard" as a result — **measured,
-    it does not**: with a row subset the masked path decodes 0 counted shard
-    sections either way, because it materialises through the bounded row gather
-    rather than the prefetch driver. The only in-tree caller that wraps a
-    row-filtering source in `ProjectedShardSource` is the GPU dispatch arm
-    (`#[cfg(feature = "gpu")]`), which a CPU build cannot reach, so the forward
-    is pinned directly in
-    `scx-accel/src/projected_source.rs::forwards_the_visible_shard_plan_of_the_inner_source`.
-
-    What is observable here, and worth holding, is the weaker invariant: a gene
-    mask must not make a row-projected read cost *more* than the unprojected
-    one. Asserting the 1 that review asked for would pin a number this code
-    does not produce.
+    That wrapper forwards `n_shards`, `n_obs`, `max_shard_rows`,
+    `shard_cache_capacity` and `shard_size_hint` to its inner source but not,
+    at first, the shard plan — so it answered the trait default ("visit every
+    shard") and discarded it. `mask_var=None` auto-consumes
+    `adata.var["highly_variable"]`, so the HVG → PCA pipeline on a row subset is
+    the composition that lost the skip. Measured on this fixture: 5 decodes
+    without the forward, 1 with it, for a partial mask and for an all-true one
+    alike.
     """
-    masked_window = _probe(path, "window:mask_var")["decodes"]
-    masked_all = _probe(path, "all:mask_var")["decodes"]
-    plain_window = _probe(path, "window:pca")["decodes"]
+    res = _probe(path, f"window:{op}")
+    assert res["decodes"] == 1, (
+        f"PCA with mask_var= decoded {res['decodes']} shards on a "
+        "1-of-5-shard row window; ProjectedShardSource must forward "
+        "visible_shard_indices"
+    )
+    assert _probe(path, f"all:{op}")["decodes"] == N_SHARDS
 
-    assert masked_all == N_SHARDS, (
-        "premise: without a row projection the masked PCA sweeps every shard "
-        f"(saw {masked_all})"
+
+def test_the_tolerant_reduction_mode_skips_too(path):
+    """`SCX_ACCEL_REDUCTION_MODE=parallel_tolerant` is a supported mode.
+
+    HVG `flavor="seurat"` reduces through `accumulate_shards`, whose tolerant
+    arm is `reduce_shards_budgeted` — which swept `0..n_shards` and never
+    consulted the plan. So the skip held on the default `StableOrder` and was
+    silently lost in the other mode: 1 decode by default, 5 in tolerant mode.
+    `seurat_v3` is not affected (it drives the ordered driver directly), which
+    is why testing only that flavour missed this.
+    """
+    default = _probe(path, "window:hvg_seurat")
+    tolerant = _probe(
+        path, "window:hvg_seurat", SCX_ACCEL_REDUCTION_MODE="parallel_tolerant"
     )
-    assert masked_window <= plain_window, (
-        f"a gene mask raised the decode count on a row window from "
-        f"{plain_window} to {masked_window}"
+    assert default["decodes"] == 1, default["decodes"]
+    assert tolerant["decodes"] == default["decodes"], (
+        f"tolerant mode decoded {tolerant['decodes']} shards where the default "
+        f"mode decoded {default['decodes']}"
     )
-    assert masked_window < masked_all
+    assert (
+        _probe(path, "all:hvg_seurat", SCX_ACCEL_REDUCTION_MODE="parallel_tolerant")[
+            "decodes"
+        ]
+        == N_SHARDS
+    )
 
 
 @pytest.mark.parametrize("op", sorted(_OPS))
@@ -377,12 +404,9 @@ def test_an_all_excluded_projection_still_refuses_a_changed_file(tmp_path):
         ("getnnz(axis=0)", lambda: x.getnnz(axis=0)),
         ("shape", lambda: x.shape),
     ]:
-        if label == "shape":
-            with pytest.raises(RuntimeError, match="changed on disk"):
-                call()
-            continue
         with pytest.raises(RuntimeError, match="changed on disk"):
             call()
+            pytest.fail(f"{label} answered from a stale handle")
 
 
 def test_an_all_excluded_projection_still_answers_on_an_unchanged_file(tmp_path):
@@ -401,3 +425,66 @@ def test_an_all_excluded_projection_still_answers_on_an_unchanged_file(tmp_path)
     x = pyscx.open(p).to_anndata(backed=True)[:0].X
     np.testing.assert_array_equal(np.asarray(x.sum(axis=0)).ravel(), [0.0, 0.0, 0.0])
     np.testing.assert_array_equal(np.asarray(x.getnnz(axis=0)).ravel(), [0, 0, 0])
+
+
+def test_an_all_excluded_projection_on_a_lazy_x_also_refuses(tmp_path):
+    """The same hole, on the handle a post-QC pipeline actually holds.
+
+    The first fix put the check in the backed masked kernels and had
+    `LazyShardSource` report "no plan" on a stale file. `ScxLazyTransformedDataset`'s
+    own column aggregations go through neither: they build a selected shard plan
+    from `self.backed.index()` and drive the raw reader. So
+    `normalize_total → log1p` over `adata[:0]` still answered
+    `sum(axis=0) -> [[0, 0, 0]]`, `var(axis=0) -> [[0, 0, 0]]` and
+    `mean(axis=0) -> [[nan, nan, nan]]` while `shape` raised. All three
+    reviewers reproduced it independently.
+    """
+    import pyscx
+
+    dense = np.arange(12, dtype=np.float32).reshape(4, 3) + 1
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(4)]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    p = str(tmp_path / "lazy_fresh.scx")
+    pyscx.from_anndata(adata, p, shard_size=2)
+
+    empty = pyscx.open(p).to_anndata(backed=True)[:0]
+    pyscx.accel.normalize_total(empty, target_sum=1e4)
+    pyscx.accel.log1p(empty)
+    x = empty.X
+    assert type(x).__name__ == "ScxLazyTransformedDataset", type(x)
+
+    drop = np.zeros(4, dtype=bool)
+    drop[1:] = True
+    pyscx.open(p).mark_deleted(drop)
+
+    for call in (
+        lambda: x.sum(axis=0),
+        lambda: x.var(axis=0),
+        lambda: x.mean(axis=0),
+        lambda: x.shape,
+    ):
+        with pytest.raises(RuntimeError, match="changed on disk"):
+            call()
+
+
+def test_a_lazy_x_over_an_empty_projection_answers_on_an_unchanged_file(tmp_path):
+    """Accept side for the arm above."""
+    import pyscx
+
+    dense = np.arange(12, dtype=np.float32).reshape(4, 3) + 1
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(4)]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    p = str(tmp_path / "lazy_ok.scx")
+    pyscx.from_anndata(adata, p, shard_size=2)
+
+    empty = pyscx.open(p).to_anndata(backed=True)[:0]
+    pyscx.accel.normalize_total(empty, target_sum=1e4)
+    np.testing.assert_array_equal(
+        np.asarray(empty.X.sum(axis=0)).ravel(), [0.0, 0.0, 0.0]
+    )

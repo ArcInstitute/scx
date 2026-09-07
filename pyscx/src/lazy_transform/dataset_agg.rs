@@ -205,6 +205,14 @@ impl ScxLazyTransformedDataset {
     /// computing var for filtered-out columns is wasted work but doesn't affect
     /// the values for kept columns.
     pub(crate) fn streaming_col_var(&self) -> Result<Vec<f64>, String> {
+        // A stale file must raise. These kernels build their own selected
+        // shard plan, so they never consult `LazyShardSource`, and an empty
+        // plan — every shard emptied by the row filter, as `adata[:0]` gives —
+        // performs no `read_shard` at all. The per-shard read is where a
+        // watching reader checks that the file has not changed, so without this
+        // the same handle answers `sum(axis=0)` from an obsolete mapping and
+        // raises on `shape`.
+        self.backed.check_fresh().map_err(|e| e.to_string())?;
         let n_vars = self.backed.shape().1; // physical width, intentionally
         let n_obs = self.shape_val.0;
         if n_obs == 0 {
@@ -299,6 +307,14 @@ impl ScxLazyTransformedDataset {
     /// Pure-Rust (returns `Result<_, String>`, no `PyErr`) so callers can run
     /// it through `detached` with the GIL released.
     pub(crate) fn streaming_col_sums_masked(&self) -> Result<Vec<f64>, String> {
+        // A stale file must raise. These kernels build their own selected
+        // shard plan, so they never consult `LazyShardSource`, and an empty
+        // plan — every shard emptied by the row filter, as `adata[:0]` gives —
+        // performs no `read_shard` at all. The per-shard read is where a
+        // watching reader checks that the file has not changed, so without this
+        // the same handle answers `sum(axis=0)` from an obsolete mapping and
+        // raises on `shape`.
+        self.backed.check_fresh().map_err(|e| e.to_string())?;
         let n_vars = self.backed.shape().1; // physical width, intentionally
         let mut sums = vec![0.0f64; n_vars];
 
@@ -480,6 +496,14 @@ impl ScxLazyTransformedDataset {
     /// transform chain has to run on each decoded shard *before* the values are
     /// accumulated — the backed kernel reads the untransformed shard.
     pub(crate) fn col_sums_and_nnz_raw(&self) -> Result<(Vec<f64>, Vec<u32>), String> {
+        // A stale file must raise. These kernels build their own selected
+        // shard plan, so they never consult `LazyShardSource`, and an empty
+        // plan — every shard emptied by the row filter, as `adata[:0]` gives —
+        // performs no `read_shard` at all. The per-shard read is where a
+        // watching reader checks that the file has not changed, so without this
+        // the same handle answers `sum(axis=0)` from an obsolete mapping and
+        // raises on `shape`.
+        self.backed.check_fresh().map_err(|e| e.to_string())?;
         let n_vars = self.backed.shape().1; // physical width, projected below
         let mut sums = vec![0.0f64; n_vars];
         let mut counts = vec![0u32; n_vars];

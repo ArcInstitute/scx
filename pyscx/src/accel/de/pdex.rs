@@ -676,7 +676,13 @@ pub fn pdex_ref(
     // that this op streams the handle's *view*, the two widths match, so the
     // mismatch would be a silent gene/column permutation instead of a shape
     // error. Refuse, as the other streaming accel ops do.
-    crate::accel::prepare_target(py, adata, "pdex_ref")?;
+    // Deliberately the no-var-guard prologue: `select_de_matrix` guards the
+    // matrix this op will actually read, which is `adata.raw.X` or
+    // `adata.layers[layer]` when either was asked for. Keeping the X-only
+    // check here made the documented remedy impossible — materialise the
+    // layer, and `pdex_ref(layer=…)` still refused because `adata.X` was
+    // presentation-ordered, while the matrix it was about to read was fine.
+    crate::accel::prepare_target_no_var_guard(py, adata, "pdex_ref")?;
 
     if !matches!(output, "polars" | "pandas") {
         return Err(PyValueError::new_err(format!(

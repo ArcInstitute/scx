@@ -340,3 +340,51 @@ def test_a_sorted_request_labels_the_right_gene(ordered):
     )
     top = out.iloc[out["abs_log2_fold_change"].to_numpy().argmax()]
     assert top["feature"] == "g2"
+
+
+def test_the_documented_remedy_works_on_an_ordered_x(ordered):
+    """Materialising the matrix the op reads must actually let it run.
+
+    The refusal tells the caller to materialise "the matrix the op reads", and
+    `docs/api.md` says the guard covers that matrix rather than `adata.X`. Both
+    were false while the entry prologue ran the X-only check *before*
+    `select_de_matrix` chose the layer: with a presentation-ordered `X`, the
+    caller could materialise `counts`, ask for `layer="counts"`, and still be
+    refused for a matrix the op was not going to read. The prologue is now the
+    no-var-guard variant and `select_de_matrix` is the single guard.
+
+    The accept side is the half the first version of this file missed: it pinned
+    only the opposite arrangement (materialised `X` plus an *ordered* layer,
+    which must still refuse).
+    """
+    import pyscx
+
+    def ordered_handle():
+        return pyscx.open(ordered).to_anndata(
+            backed=True, var_names=["g2", "g0"], preserve_var_order=True
+        )
+
+    a = ordered_handle()
+    a.layers["counts"] = a.layers["counts"].to_memory()
+    pyscx.accel.rank_genes_groups(a, "grp", layer="counts", device="cpu")
+    assert a.uns["rank_genes_groups"]["names"]["b"][0] == "g2", (
+        "the materialised layer must also be labelled correctly, not merely "
+        "accepted — its var order is the request order"
+    )
+
+    b = ordered_handle()
+    b.layers["counts"] = b.layers["counts"].to_memory()
+    got = pyscx.accel.pdex_ref(b, "grp", reference="a", layer="counts", device="cpu")
+    best = got.iloc[got["log2_fold_change"].abs().to_numpy().argmax()]
+    assert best["feature"] == "g2"
+
+    # And the guard has not simply been deleted: reading the ordered `X`
+    # itself, or an ordered layer, still refuses.
+    with pytest.raises(RuntimeError, match=r"caller-requested order"):
+        pyscx.accel.rank_genes_groups(ordered_handle(), "grp", device="cpu")
+    still_ordered = ordered_handle()
+    still_ordered.X = still_ordered.X.to_memory()
+    with pytest.raises(RuntimeError, match=r"caller-requested order"):
+        pyscx.accel.rank_genes_groups(
+            still_ordered, "grp", layer="counts", device="cpu"
+        )

@@ -523,7 +523,11 @@ Two mechanisms, because the row set arrives two ways:
   `None` — "visit every shard" — so a source without a row filter is unaffected.
   An adapter that wraps such a source must forward the hook or it discards the
   plan; `ProjectedShardSource` (a column projection, which changes a shard's
-  width and never which shards hold a visible row) does.
+  width and never which shards hold a visible row) does — without it,
+  `pca(mask_var=…)`, and so the HVG → PCA pipeline, decoded all five shards of
+  the fixture below instead of one. The tolerant reduction arm
+  (`SCX_ACCEL_REDUCTION_MODE=parallel_tolerant`, which HVG `flavor="seurat"`
+  uses) consults the plan too, so the saving does not depend on the mode.
 
 Measured on a 120 x 200 file in 5 shards of 24 rows, counting shard decodes:
 
@@ -534,6 +538,7 @@ Measured on a 120 x 200 file in 5 shards of 24 rows, counting shard decodes:
 | the same, over a mask covering shards 0 and 4 | 2 |
 | `col_var` (two passes), one-shard window | 2 of 10 |
 | `score_genes` / `pca`, one-shard window | 1 |
+| `pca(mask_var=…)`, one-shard window (5 without the adapter forward) | 1 |
 | `highly_variable_genes(flavor="seurat_v3")` (two passes), one-shard window | 2 of 10 |
 | `normalize_total` + `log1p` chain, two-shard mask | 2 |
 
@@ -541,9 +546,12 @@ A plan can also be **empty** — a projection that keeps no row in any shard, as
 `adata[:0]` does. That is where skipping needed care rather than just wiring: the
 per-shard read is what checks that the file has not changed since the handle was
 opened, so an empty plan would have answered zeros from a possibly-obsolete
-mapping while `shape` on the same handle raised. The masked kernels therefore
-check freshness up front, unconditionally, and the lazy source reports "no plan"
-on a stale file so the driver falls back to reading and raises.
+mapping while `shape` on the same handle raised. Every kernel that builds a plan
+therefore checks freshness up front, unconditionally — the six masked column
+kernels, their six column-projected twins, and the three transform-aware ones —
+and the lazy source reports "no plan" on a stale file so a driver consumer falls
+back to reading and raises. (Two of those checks also close a hole that predated
+the skip: the variance kernels' `n_kept == 0` early return never read either.)
 
 The saving scales with how much of the file the projection excludes, so it is
 largest exactly where it matters: a per-batch or per-condition view of an atlas.

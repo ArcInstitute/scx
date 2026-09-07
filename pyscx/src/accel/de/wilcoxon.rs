@@ -1000,7 +1000,13 @@ pub fn rank_genes_groups(
     // that this op streams the handle's *view*, the two widths match, so the
     // mismatch would be a silent gene/column permutation instead of a shape
     // error. Refuse, as the other streaming accel ops do.
-    crate::accel::prepare_target(py, adata, "rank_genes_groups")?;
+    // Deliberately the no-var-guard prologue: `select_de_matrix` guards the
+    // matrix this op will actually read, which is `adata.raw.X` or
+    // `adata.layers[layer]` when either was asked for. Keeping the X-only
+    // check here made the documented remedy impossible — materialise the
+    // layer, and `rank_genes_groups(layer=…)` still refused because `adata.X` was
+    // presentation-ordered, while the matrix it was about to read was fine.
+    crate::accel::prepare_target_no_var_guard(py, adata, "rank_genes_groups")?;
 
     // Resolve scanpy's use_raw/layer contract once (mutual-exclusion + default).
     let resolved_use_raw = resolve_use_raw(adata, use_raw, layer)?;

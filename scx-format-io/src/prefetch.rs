@@ -676,12 +676,24 @@ where
     if n_shards == 0 {
         return Ok(init());
     }
+    // Honour a row-filtering source's shard plan, like the ordered drivers do.
+    // Without this the skip held on the default `StableOrder` mode and was lost
+    // under `SCX_ACCEL_REDUCTION_MODE=parallel_tolerant` — measured on HVG
+    // `flavor="seurat"`, which reduces through here: 1 decode on a
+    // one-of-five-shard row window by default, 5 in tolerant mode.
+    let plan: Vec<usize> = match source.visible_shard_indices() {
+        Some(indices) => indices,
+        None => (0..n_shards).collect(),
+    };
+    if plan.is_empty() {
+        return Ok(init());
+    }
 
     #[cfg(not(feature = "parallel"))]
     {
         let _ = (max_workers, merge);
         let mut acc = init();
-        for idx in 0..n_shards {
+        for idx in plan {
             let csr = source
                 .read_shard_arc(idx)
                 .map_err(|e| E::from_shard_read(idx, e))?;
@@ -697,10 +709,9 @@ where
         let workers = max_workers.max(1).min(rayon::current_num_threads().max(1));
         // Segment shards across at most `workers` chunks so at most `workers`
         // accumulators exist concurrently (bounds peak = workers × sizeof(T)).
-        let chunk = n_shards.div_ceil(workers).max(1);
+        let chunk = plan.len().div_ceil(workers).max(1);
 
-        (0..n_shards)
-            .into_par_iter()
+        plan.into_par_iter()
             .with_min_len(chunk)
             .try_fold(&init, |mut acc: T, idx| -> Result<T, E> {
                 let csr = source
