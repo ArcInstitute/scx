@@ -475,3 +475,24 @@ def test_pflog_layer_on_a_backed_adata(tmp_dir):
     pyscx.accel.pflog(backed, layer="counts", store="baseline")
     assert "pflog_baseline" in backed.obs
     assert np.all(np.isfinite(backed.obs["pflog_baseline"].to_numpy()))
+
+
+def test_pflog_unknown_layer_names_itself():
+    """Typed error naming the layer, matching QC / score_genes / HVG."""
+    import anndata as ad
+    import numpy as np
+    import pandas as pd
+    import pytest
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.default_rng(9)
+    x = sp.csr_matrix(rng.integers(0, 20, size=(40, 20)).astype(np.float32))
+    adata = ad.AnnData(
+        X=x,
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(40)]),
+        var=pd.DataFrame(index=[f"g{j}" for j in range(20)]),
+    )
+    with pytest.raises(ValueError, match=r"nope"):
+        pyscx.accel.pflog(adata, layer="nope", store="baseline")

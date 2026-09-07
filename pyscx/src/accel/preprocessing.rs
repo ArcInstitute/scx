@@ -606,6 +606,10 @@ pub fn calculate_qc_metrics<'py>(
         None => adata.getattr("X")?,
     };
 
+    // The `prepare_target` guard above only saw `adata.X`; a named layer is a
+    // different matrix and can carry its own presentation permutation.
+    super::reject_presentation_ordered_source(&x, "calculate_qc_metrics")?;
+
     // Normalize `percent_top` before anything is stamped or computed, so a bad
     // value leaves `uns` exactly as it found it.
     let percent_top = normalize_percent_top(percent_top.as_deref(), source_n_vars(&x)?)?;
@@ -656,11 +660,22 @@ pub fn calculate_qc_metrics<'py>(
         // blaming the file for the caller's kwarg combination. The
         // `BackedLayer` arm catches the same handle reached without the kwarg,
         // via `adata.X = adata.layers["counts"]`.
-        if layer.is_some() || matches!(kind, QcSourceKind::BackedLayer) {
+        if layer.is_some() {
             return Err(PyRuntimeError::new_err(
                 "calculate_qc_metrics: prefer_format='csc' does not support layer= \
                  (the CSC sidecar lives on adata.X, not on layers); pass layer=None \
                  or use prefer_format='csr'",
+            ));
+        }
+        // Reached via `adata.X = adata.layers["counts"]`, where `layer` is
+        // already None — so the message above would advise passing the value
+        // the caller is already using.
+        if matches!(kind, QcSourceKind::BackedLayer) {
+            return Err(PyRuntimeError::new_err(
+                "calculate_qc_metrics: prefer_format='csc' does not support a layer \
+                 source (adata.X is a layer handle; the CSC sidecar belongs to the \
+                 file's X). Restore adata.X to the base backed dataset, or use \
+                 prefer_format='csr'",
             ));
         }
     }
@@ -709,7 +724,8 @@ pub fn calculate_qc_metrics<'py>(
                 RowQcOutputs::accumulate(
                     &qc_masks,
                     b.kept_to_global.as_ref().map(|k| k.as_slice()),
-                    |bits, n, top| b.qc_row_pass_raw(bits, n, if top { ns } else { &[] }),
+                    ns,
+                    |bits, n, top| b.qc_row_pass_raw(bits, n, top),
                 )
             })
             .map_err(PyRuntimeError::new_err)?
@@ -721,7 +737,8 @@ pub fn calculate_qc_metrics<'py>(
                 RowQcOutputs::accumulate(
                     &qc_masks,
                     b.kept_to_global.as_ref().map(|k| k.as_slice()),
-                    |bits, n, top| b.qc_row_pass_raw(bits, n, if top { ns } else { &[] }),
+                    ns,
+                    |bits, n, top| b.qc_row_pass_raw(bits, n, top),
                 )
             })
             .map_err(PyRuntimeError::new_err)?
@@ -733,7 +750,8 @@ pub fn calculate_qc_metrics<'py>(
                 RowQcOutputs::accumulate(
                     &qc_masks,
                     l.kept_to_global.as_ref().map(|k| k.as_slice()),
-                    |bits, n, top| l.streaming_qc_row_pass(bits, n, if top { ns } else { &[] }),
+                    ns,
+                    |bits, n, top| l.streaming_qc_row_pass(bits, n, top),
                 )
             })
             .map_err(PyRuntimeError::new_err)?
@@ -743,10 +761,9 @@ pub fn calculate_qc_metrics<'py>(
             // deletion vector — an in-memory `X` is already the visible rows.
             let csr = in_memory_csr.as_ref().expect("in-memory arm builds a CSR");
             detached(py, || {
-                RowQcOutputs::accumulate(&qc_masks, None, |bits, n, top| {
-                    let ns = if top { ns } else { &[][..] };
-                    let mut out = projected_agg::QcRowStats::zeroed(csr.n_rows(), n, ns.len());
-                    projected_agg::accumulate_qc_rows_into(csr, 0, bits, ns, &mut out);
+                RowQcOutputs::accumulate(&qc_masks, None, ns, |bits, n, top| {
+                    let mut out = projected_agg::QcRowStats::zeroed(csr.n_rows(), n, top.len());
+                    projected_agg::accumulate_qc_rows_into(csr, 0, bits, top, &mut out);
                     Ok(out)
                 })
             })
@@ -1721,9 +1738,14 @@ impl RowQcOutputs {
     ///
     /// `kept` is the visible→global row map (`None` = no deletions), matching
     /// `filter_row_results` on both dataset types.
-    fn accumulate<F>(masks: &QcMasks, kept: Option<&[u64]>, mut pass: F) -> Result<Self, String>
+    fn accumulate<F>(
+        masks: &QcMasks,
+        kept: Option<&[u64]>,
+        percent_top: &[usize],
+        mut pass: F,
+    ) -> Result<Self, String>
     where
-        F: FnMut(&[u64], usize, bool) -> Result<projected_agg::QcRowStats, String>,
+        F: FnMut(&[u64], usize, &[usize]) -> Result<projected_agg::QcRowStats, String>,
     {
         // Consumes `all`: with no deletion vector the global-length vector is
         // already the answer, so the common path moves instead of copying.
@@ -1755,9 +1777,10 @@ impl RowQcOutputs {
         for (i, chunk) in chunks.iter().enumerate() {
             // Only the first chunk's row-axis outputs are kept (below), so the
             // later chunks must not pay for a per-row top-N selection whose
-            // result is discarded.
-            let first = i == 0;
-            let stats = pass(&chunk.bits, chunk.n_qc, first)?;
+            // result is discarded. The "first chunk only" decision lives here,
+            // not in each caller's closure.
+            let ns = if i == 0 { percent_top } else { &[] };
+            let stats = pass(&chunk.bits, chunk.n_qc, ns)?;
             if total_counts.is_none() {
                 total_counts = Some(take(stats.sums, kept));
                 n_genes = Some(take(stats.nnz, kept));

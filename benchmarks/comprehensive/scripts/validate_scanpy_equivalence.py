@@ -761,6 +761,7 @@ def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
     # one-cell error pass on any gene expressed in more than 100k cells.
     int_cols = {"obs": ["n_genes_by_counts"], "var": ["n_cells_by_counts"]}
     int_match = True
+    nan_match = True
     max_rel_err = 0.0
     for frame, ref_frame, got_frame in (
         ("obs", obs_sc, obs_pyscx),
@@ -779,27 +780,47 @@ def check_calculate_qc_metrics(adata_raw) -> ValidationCheck:
                 continue
             ref = ref.astype(np.float64)
             got = got.astype(np.float64)
+            # NaN is compared as a *pattern*, not a value. `np.max` over a NaN
+            # yields NaN, and Python's `max(0.0, nan)` returns 0.0 — so a single
+            # NaN would have zeroed the recorded error and passed the gate over
+            # every finite mismatch in that column. This op has a documented
+            # NaN divergence (scanpy gives NaN for `pct_counts_<v>` on a
+            # zero-total cell where pyscx gives 0.0), which is exactly the input
+            # that would have triggered it.
+            ref_nan, got_nan = np.isnan(ref), np.isnan(got)
+            if not np.array_equal(ref_nan, got_nan):
+                nan_match = False
+                continue
+            finite = ~ref_nan
+            if not np.any(finite):
+                continue
             # Relative, because scanpy accumulates a float32 matrix in float32:
             # above 2**24 a per-gene total loses integer resolution there (~1e2
             # absolute on a census-scale gene) while the streaming kernel
             # accumulates in f64. That is scanpy's rounding, not a regression,
             # and an absolute 1e-5 gate would fail on any large dataset.
-            scale = np.maximum(np.abs(ref), 1.0)
-            max_rel_err = max(max_rel_err, float(np.max(np.abs(ref - got) / scale)))
+            scale = np.maximum(np.abs(ref[finite]), 1.0)
+            err = float(np.max(np.abs(ref[finite] - got[finite]) / scale))
+            max_rel_err = max(max_rel_err, err)
 
     rel_threshold = 1e-5
     return ValidationCheck(
         name="calculate_qc_metrics",
-        passed=max_rel_err < rel_threshold and schema_match and int_match,
+        passed=max_rel_err < rel_threshold
+        and schema_match
+        and int_match
+        and nan_match,
         metrics={
             "max_rel_error": max_rel_err,
             "schema_match": schema_match,
             "int_exact_match": int_match,
+            "nan_pattern_match": nan_match,
         },
         thresholds={
             "max_rel_error": rel_threshold,
             "schema_match": True,
             "int_exact_match": True,
+            "nan_pattern_match": True,
         },
     )
 

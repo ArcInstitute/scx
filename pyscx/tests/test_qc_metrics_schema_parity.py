@@ -15,8 +15,10 @@ equality**, which is the only shape of assertion that can see a missing column.
 The narrow-file test is the user-visible half: because the delegation never set
 `percent_top`, scanpy's default `(50, 100, 200, 500)` applied, and scanpy's
 `check_ns` raises `IndexError: Positions outside range of features.` for any
-file with fewer than 500 genes. Three fixtures elsewhere in this suite are sized
->= 500 genes *because of that*, and say so in their comments.
+file with fewer than 500 genes. Three fixtures elsewhere in this suite were sized
+>= 500 genes *because of that*; two of them said so in their comments, and this
+change narrows one of those two (`test_accel_route_metadata.py`) to 25 genes to
+show the constraint is gone.
 """
 
 import numpy as np
@@ -630,3 +632,109 @@ def test_inplace_false_returns_exactly_what_inplace_true_writes(qc_adata):
         )
     added_var = [c for c in written.var.columns if c not in qc_adata.var.columns]
     assert set(var_df.columns) == set(added_var)
+
+
+# ---------------------------------------------------------------------------
+# Presentation-ordered gene axis, on the matrix the op actually reads
+# ---------------------------------------------------------------------------
+
+
+def _ordered_fixture(tmp_dir):
+    """Three genes with distinguishable values, so a mislabel is visible.
+
+    g0 = [1, 2], g1 = [5, 6], g2 = [10, 20]. Requesting `["g2", "g0"]` with
+    `preserve_var_order=True` makes `adata.var` request-ordered while the
+    streaming kernels emit the sorted projection, so reading position 0 as `g2`
+    is only correct if the op refuses or honours the permutation.
+    """
+    import anndata
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+
+    dense = np.array([[1.0, 5.0, 10.0], [2.0, 6.0, 20.0]], dtype=np.float32)
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=["c0", "c1"]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    adata.layers["counts"] = sp.csr_matrix(dense)
+    path = str(tmp_dir / "presentation_order.scx")
+    pyscx.from_anndata(adata, path)
+    return path
+
+
+def test_a_named_layer_cannot_smuggle_a_presentation_order_past_the_guard(tmp_dir):
+    """The guard reads `adata.X`; a named layer is a different matrix.
+
+    Materialising `X` disarms the `adata.X`-only check while the layer stays
+    presentation-ordered, and the streaming kernel then labels the sorted
+    projection with a request-ordered `adata.var`: asking for `g2` returned
+    `g0`'s values under `g2`'s name. Silently wrong genes, where the same
+    request on `X` had always raised.
+    """
+    import pyscx
+
+    path = _ordered_fixture(tmp_dir)
+    adata = pyscx.open(path).to_anndata(
+        backed=True, var_names=["g2", "g0"], preserve_var_order=True
+    )
+    assert list(adata.var_names) == ["g2", "g0"], "premise: request order kept"
+    adata.X = adata.X.to_memory()  # disarms the adata.X-only guard
+
+    with pytest.raises(RuntimeError, match=r"caller-requested order"):
+        pyscx.accel.calculate_qc_metrics(adata, layer="counts")
+
+
+def test_a_layer_handle_assigned_to_x_is_caught_too(tmp_dir):
+    """`adata.X = adata.layers["counts"]` — a backed layer handle *as* `X`.
+
+    `cast::<ScxBackedSparseDataset>()` does not match `ScxBackedLayerDataset`,
+    so the presentation permutation on the layer's inner dataset was invisible
+    to the guard.
+    """
+    import pyscx
+
+    path = _ordered_fixture(tmp_dir)
+    adata = pyscx.open(path).to_anndata(
+        backed=True, var_names=["g2", "g0"], preserve_var_order=True
+    )
+    adata.X = adata.layers["counts"]
+
+    with pytest.raises(RuntimeError, match=r"caller-requested order"):
+        pyscx.accel.calculate_qc_metrics(adata)
+
+
+def test_a_sorted_layer_request_is_still_allowed(tmp_dir):
+    """The accept side: a sorted projection is not a presentation order.
+
+    Without this the guard could reject everything and both tests above would
+    still pass.
+    """
+    import pyscx
+
+    path = _ordered_fixture(tmp_dir)
+    adata = pyscx.open(path).to_anndata(backed=True, var_names=["g0", "g2"])
+    assert list(adata.var_names) == ["g0", "g2"], "premise: sorted request"
+    pyscx.accel.calculate_qc_metrics(adata, layer="counts")
+    np.testing.assert_allclose(
+        adata.obs["total_counts"].to_numpy(), [1.0 + 10.0, 2.0 + 20.0]
+    )
+
+
+def test_csc_rejects_a_layer_handle_assigned_to_x(qc_path):
+    """The `BackedLayer` half of the CSC reject, which `layer=` does not cover.
+
+    Reached with no `layer=` kwarg at all, so the message must not advise
+    passing `layer=None` — the caller already is.
+    """
+    import pyscx
+
+    backed = _backed(qc_path)
+    backed.X = backed.layers["counts"]
+    with pytest.raises(RuntimeError, match=r"(?i)layer source") as excinfo:
+        pyscx.accel.calculate_qc_metrics(backed, prefer_format="csc")
+    assert "layer=None" not in str(excinfo.value), (
+        "the advice must not name a kwarg the caller is already passing"
+    )

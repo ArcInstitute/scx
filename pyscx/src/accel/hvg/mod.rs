@@ -13,7 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::backed::{ScxBackedLayerDataset, ScxBackedSparseDataset};
+use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::{ScxLazyTransformedDataset, Transform};
 use crate::optional_deps::{import_optional_with_hint, EXTRA_SCANPY};
 
@@ -335,7 +335,12 @@ pub fn highly_variable_genes<'py>(
     // layer falls through to the in-memory path, and a flavor scx has no
     // native kernel for falls through to scanpy with `layer=`.
     let x = match layer {
-        Some(name) => adata.getattr("layers")?.get_item(name)?,
+        // Typed error naming the layer, as `calculate_qc_metrics` /
+        // `score_genes` / `select_de_matrix` do, rather than the mapping's
+        // bare `KeyError`.
+        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?,
         None => adata.getattr("X")?,
     };
 
@@ -394,8 +399,11 @@ pub fn highly_variable_genes<'py>(
     // batch, a missing `batch_key`, …) — see RouteStamp.
     let route = super::route::RouteStamp::write(py, adata, "highly_variable_genes", &info)?;
 
+    // `prepare_target` only inspected `adata.X`; guard the matrix actually read.
+    super::reject_presentation_ordered_source(&x, "highly_variable_genes")?;
+
     // ── Try a backed SCX dataset: `adata.X` or a backed layer handle ────
-    if let Some(parts) = backed_shard_parts(&x) {
+    if let Some(parts) = super::backed_shard_parts(&x) {
         let source = build_shard_source(
             &parts.reader,
             &[],
@@ -586,53 +594,6 @@ fn hvg_on_source<'py, S: scx_format_io::ShardSource + Sync>(
             "Unsupported HVG flavor '{flavor}'. Use 'seurat_v3' or 'seurat'."
         ))),
     }
-}
-
-/// The shard-source inputs of a backed dataset, however it reached us.
-///
-/// `adata.X` on a backed file is `ScxBackedSparseDataset`; `adata.layers[name]`
-/// is `ScxBackedLayerDataset`, a distinct `#[pyclass]` wrapping one. Every
-/// accelerator that dispatched with a bare `cast::<ScxBackedSparseDataset>()`
-/// therefore missed a layer handle and fell through to `owned_csr`, where
-/// `scipy.sparse.csr_matrix(<handle>)` raises "unrecognized csr_matrix
-/// constructor input" — so `layer=` was broken on exactly the files it exists
-/// for, and every test for it used an in-memory scipy AnnData.
-///
-/// Returning the parts rather than a borrow keeps the `PyRef` guard local: the
-/// layer's `inner` lives behind a `Ref`, so callers cannot hold a reference to
-/// it across `build_shard_source`.
-pub(super) struct BackedShardParts {
-    pub(super) reader: std::sync::Arc<scx_format_io::BackedCsrReader>,
-    pub(super) n_obs: usize,
-    pub(super) n_vars: usize,
-    pub(super) kept: Option<std::sync::Arc<Vec<u64>>>,
-    pub(super) col_proj: Option<std::sync::Arc<Vec<u32>>>,
-}
-
-impl BackedShardParts {
-    fn of_dataset(ds: &ScxBackedSparseDataset) -> Self {
-        Self {
-            reader: Arc::clone(&ds.backed),
-            n_obs: ds.shape_val.0,
-            n_vars: ds.shape_val.1,
-            kept: ds.kept_to_global.clone(),
-            col_proj: ds.col_projection_arc(),
-        }
-    }
-}
-
-/// Extract [`BackedShardParts`] from `adata.X` **or** a backed layer handle.
-///
-/// `None` means "not a backed SCX matrix" — the caller falls on to its lazy
-/// and in-memory arms as before.
-pub(super) fn backed_shard_parts(x: &Bound<'_, PyAny>) -> Option<BackedShardParts> {
-    if let Ok(ds) = x.cast::<ScxBackedSparseDataset>() {
-        return Some(BackedShardParts::of_dataset(&ds.borrow()));
-    }
-    if let Ok(layer) = x.cast::<ScxBackedLayerDataset>() {
-        return Some(BackedShardParts::of_dataset(&layer.borrow().inner));
-    }
-    None
 }
 
 /// Build a full-dataset `LazyShardSource` for the backed / lazy dispatch.

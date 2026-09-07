@@ -26,7 +26,8 @@ use scx_format_io::ShardSource;
 
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
-use super::hvg::{backed_shard_parts, build_shard_source};
+use super::backed_shard_parts;
+use super::hvg::build_shard_source;
 
 /// Resolve gene symbols to var-index positions, de-duplicated, first-seen order.
 ///
@@ -247,6 +248,9 @@ pub fn score_genes<'py>(
         })?,
         None => adata.getattr("X")?,
     };
+
+    // `prepare_target` only inspected `adata.X`; guard the matrix actually read.
+    super::reject_presentation_ordered_source(&x, "score_genes")?;
 
     // ── Dispatch: backed → lazy → in-memory, all via ShardSource ─────────
     if let Some(parts) = backed_shard_parts(&x) {

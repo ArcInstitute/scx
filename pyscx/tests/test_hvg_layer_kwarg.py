@@ -142,3 +142,16 @@ def test_layer_on_a_backed_adata_reads_the_layer(tmp_dir):
             reference, n_top_genes=10, flavor="seurat_v3", device="cpu"
         )
     assert list(backed.var["highly_variable"]) == list(reference.var["highly_variable"])
+
+
+def test_unknown_layer_names_itself():
+    """Typed error naming the layer, matching QC / score_genes / DE.
+
+    This leaked the mapping's bare `KeyError` while its siblings raised a
+    `ValueError` naming the layer.
+    """
+    from pyscx import accel
+
+    adata = _make_counts_adata()
+    with pytest.raises(ValueError, match=r"nope"):
+        accel.highly_variable_genes(adata, n_top_genes=10, layer="nope")
