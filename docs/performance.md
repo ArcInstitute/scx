@@ -765,7 +765,7 @@ a rayon worker — the GPU staging path is now fully sequential, where the old d
 "no ambient parallelism" configuration, and the worker-thread guard is what keeps a
 nested call from deadlocking.
 
-### Decode-prefetch reaches the DE kernels (X10)
+### Decode-prefetch reaches the DE kernels
 
 Task 4.2 wired every loop that could reach the pipeline. The three streaming DE
 kernels could not: `wilcoxon_rank_sum_streaming`, `pdex_ref_streaming` and the

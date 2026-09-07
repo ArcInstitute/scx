@@ -2328,7 +2328,7 @@ fn assert_diffexp_identical(a: &DiffExpResult, b: &DiffExpResult, what: &str) {
     assert_eq!(a.logfoldchanges, b.logfoldchanges, "{what}: logfoldchanges");
 }
 
-/// The X10 headline: a shard the row projection empties is never read.
+/// The headline: a shard the row projection empties is never read.
 ///
 /// Before the kernels used the drivers this decoded all five shards, once per
 /// gene chunk, and the excluded ones contributed nothing after a full decode,

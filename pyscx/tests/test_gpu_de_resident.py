@@ -212,7 +212,7 @@ def test_single_chunk_declines_residency(scx_path):
 
 
 def test_a_row_window_stages_only_the_shards_it_keeps(scx_path):
-    """The GPU staging plan honours a row-filtering source's shard plan (X10).
+    """The GPU staging plan honours a row-filtering source's shard plan.
 
     `RawGpuShardSource::run` built `StagingPlan::all(n_shards)`, so a
     row-windowed handle decoded and uploaded every shard and `drive_shards`
