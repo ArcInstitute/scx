@@ -60,6 +60,47 @@ impl Default for SlotFilters<'_> {
     }
 }
 
+/// Which matrices [`to_anndata_with_layers`] builds into the `AnnData` it
+/// returns, and which it leaves to its caller.
+///
+/// Three named states rather than a pair of booleans, because each one changes
+/// four things at once (whether `X` is decoded, whether eager `layers` are, and
+/// therefore whether a `shape=` has to be supplied and where `.raw` is
+/// attached) and a boolean pair cannot say which combinations are meaningful.
+#[derive(Clone, Copy)]
+pub(crate) enum MatrixMode {
+    /// Everything inline: `X`, eager `layers`, and `.raw`.
+    Eager,
+    /// No `X`; `layers` and `.raw` unchanged. `to_gpu_anndata` decodes X
+    /// straight onto the device and assigns it afterwards. Its only
+    /// constructor is behind `feature = "gpu"`, so a default build sees it as
+    /// dead — allowed there rather than everywhere, so the variant still has to
+    /// earn its place in a GPU build.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    SkipX,
+    /// No `X` and no `layers`, an explicit `shape=`, and `.raw` deferred to the
+    /// caller. The gene-projection path builds the metadata half here, lets
+    /// anndata slice it, and then assigns matrices that were assembled already
+    /// projected. Carries the projected gene count so the memory-budget
+    /// estimate describes the assembly that will actually happen.
+    Skeleton { n_selected_vars: usize },
+}
+
+/// Whether a `u32 → f32 → target` round trip can lose a value in this file.
+///
+/// The projected assembler is f32 (it reuses the backed handle's shard-by-shard
+/// materialisation), while `read_all_csr_shards_typed` narrows from the native
+/// `u32` stream and is therefore exact for an integer target of any width. The
+/// two only differ above 2²⁴, so a non-default plan may take the projected path
+/// exactly when the file's values fit f32 without rounding.
+///
+/// Float-encoded shards record `value_max == 0`, so they qualify: their values
+/// were f32 on the way in, and a lossy *narrow* of one is still rejected
+/// per element by `checked_cast_values`, the same gate the typed path uses.
+pub(crate) fn f32_roundtrip_is_exact(csr_max_value: u32) -> bool {
+    csr_max_value <= scx_codec::F32_MAX_EXACT_INT
+}
+
 /// Map a typed-read error to a Python exception. The in-assembly narrow reader
 /// surfaces the fail-loud cast gate (lossy narrow / decode-loss) as
 /// `ScxError::Codec(..)`; that is a bad-request condition — map it to
@@ -81,7 +122,10 @@ pub(crate) fn typed_read_to_pyerr(e: scx_format_io::ScxError) -> PyErr {
 /// for the assembled CSR indptr (i64), and the on-disk size of every
 /// obs / var section (sharded or single). Walks `reader.catalog()`
 /// only — no payload reads.
-pub(crate) fn estimate_eager_assembly_bytes(reader: &ScxReader) -> u64 {
+pub(crate) fn estimate_eager_assembly_bytes(
+    reader: &ScxReader,
+    selected_vars: Option<usize>,
+) -> u64 {
     let entries = &reader.catalog().entries;
     let mut nnz: u64 = 0;
     let mut x_rows: u64 = 0;
@@ -104,6 +148,19 @@ pub(crate) fn estimate_eager_assembly_bytes(reader: &ScxReader) -> u64 {
                 meta_bytes = meta_bytes.saturating_add(entry.length);
             }
             _ => {}
+        }
+    }
+    // A gene projection assembles only the selected columns, so the whole-file
+    // nnz describes a matrix that is never built. The catalog has no per-column
+    // nnz, so scale proportionally and say so: this assumes an even spread of
+    // nonzeros across genes, which is an approximation on a warning that was
+    // always advisory. Without it, `to_anndata(var_names=…)` on a large file
+    // would keep recommending a smaller `var_names` — advice the caller has
+    // already taken.
+    let n_vars = reader.n_vars();
+    if let Some(selected) = selected_vars {
+        if n_vars > 0 && (selected as u64) < n_vars {
+            nnz = (nnz as u128 * selected as u128 / n_vars as u128) as u64;
         }
     }
     nnz.saturating_mul(16)
@@ -141,7 +198,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     filters: SlotFilters<'_>,
     eager: bool,
     memory_budget: Option<u64>,
-    skip_x: bool,
+    mode: MatrixMode,
     plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
     use crate::lazy_mapping::{
@@ -158,7 +215,13 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // `UserWarning` recommending the backed / query alternatives.
     // Assembly proceeds regardless — the warning is advisory.
     let budget = memory_budget.unwrap_or(DEFAULT_EAGER_MEMORY_BUDGET_BYTES);
-    let est_bytes = estimate_eager_assembly_bytes(reader);
+    let est_bytes = estimate_eager_assembly_bytes(
+        reader,
+        match mode {
+            MatrixMode::Skeleton { n_selected_vars } => Some(n_selected_vars),
+            _ => None,
+        },
+    );
     if est_bytes > budget {
         warn_python_convert(
             py,
@@ -173,7 +236,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // (this function is the eager assembler shared by the no-filter, var_names,
     // preserve_slots, and gpu-skeleton paths), so all of them are guarded here
     // rather than at each call site. The check is catalog-only, so it applies
-    // even when `skip_x` defers the host X decode to `to_gpu_anndata`'s
+    // even when the caller defers the host X decode to `to_gpu_anndata`'s
     // f32-native device path.
     guard_decode_loss_dtype(
         reader.catalog().csr_max_value(None),
@@ -183,18 +246,19 @@ pub(crate) fn to_anndata_with_layers<'py>(
 
     // X — assemble all CSR shards (with deletion vector filtering).
     //
-    // `skip_x` builds an X-less skeleton: obs/var define the shape and the
-    // caller assigns `adata.X` afterwards. Used by `to_gpu_anndata`'s
-    // device-resident streamed path, which decodes X straight onto the GPU
-    // instead of materialising a host scipy CSR here. obs/var/obsm/uns/layers
-    // are assembled identically either way.
+    // `SkipX` and `Skeleton` both build an X-less object and let the caller
+    // assign `adata.X`: `to_gpu_anndata`'s device-resident streamed path
+    // decodes X straight onto the GPU, and the gene-projection path assembles
+    // it already projected. obs/var/obsm/uns are assembled identically in every
+    // mode; `Skeleton` additionally omits eager layers, since those are
+    // projected too.
     //
     // Non-default plans narrow **in-decode**: the typed reader assembles X
     // directly at the target dtype (never building the full-matrix f32 CSR), so
     // a narrow read lowers peak RSS and integer→integer narrows are exact for
     // any value (including > 2²⁴). The default (csr/f32/i32) plan stays on the
     // untouched zero-copy path.
-    let x = if skip_x {
+    let x = if !matches!(mode, MatrixMode::Eager) {
         None
     } else if plan.is_default_csr_f32() {
         let csr = reader.read_all_csr_shards_filtered().map_err(to_pyerr)?;
@@ -276,11 +340,16 @@ pub(crate) fn to_anndata_with_layers<'py>(
     let has_varp = slot_has_selected(&reader.list_varp(), filters.varp);
     let has_varm = slot_has_selected(&reader.list_varm(), filters.varm);
     let layer_names = reader.layer_names();
-    let has_layers = if let Some(filter) = layer_filter {
-        layer_names.iter().any(|n| filter.iter().any(|f| f == n))
-    } else {
-        !layer_names.is_empty()
-    };
+    // `Skeleton` never builds a layer bridge — the caller assembles each
+    // selected layer projected and assigns it after the slice. Leaving
+    // `has_layers` true here would open a sibling `ScxReader` mmap for a bridge
+    // nothing reads.
+    let has_layers = !matches!(mode, MatrixMode::Skeleton { .. })
+        && if let Some(filter) = layer_filter {
+            layer_names.iter().any(|n| filter.iter().any(|f| f == n))
+        } else {
+            !layer_names.is_empty()
+        };
     let need_lazy = has_obsp || has_varp || has_varm || has_layers || lazy_obsm_requested;
 
     let obsp_kept = if has_obsp {
@@ -325,7 +394,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     if let Some(x) = x {
         kwargs.set_item("X", x)?;
     }
-    if let Some(obs) = obs {
+    if let Some(obs) = &obs {
         kwargs.set_item("obs", obs)?;
     }
     if let Some(var) = var {
@@ -336,6 +405,21 @@ pub(crate) fn to_anndata_with_layers<'py>(
     }
     if let Some(uns) = uns_dict {
         kwargs.set_item("uns", uns)?;
+    }
+    if matches!(mode, MatrixMode::Skeleton { .. }) {
+        // Without X *and* without layers, AnnData infers `n_obs` from obs /
+        // obsm / obsp — and a file with no obs section has none of them, so the
+        // skeleton would silently come out `(0, n_vars)` and the caller's
+        // `adata.X = …` would die on a shape mismatch. Stating the shape also
+        // gets a free cross-check against `obs` when obs *is* present.
+        let n_obs_visible = match &obs {
+            Some(df) => df.getattr("shape")?.get_item(0)?.extract::<usize>()?,
+            None => match compute_kept_to_global(reader)? {
+                Some(kept) => kept.len(),
+                None => reader.n_obs() as usize,
+            },
+        };
+        kwargs.set_item("shape", (n_obs_visible, reader.n_vars() as usize))?;
     }
     if eager {
         // Materialize each lazy bridge up front; AnnData's __init__
@@ -370,53 +454,13 @@ pub(crate) fn to_anndata_with_layers<'py>(
 
     let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
 
-    // Reconstruct `adata.raw` if the file carries a raw count matrix.
-    // Raw shares X's obs axis; when deletion vectors are active the raw
-    // rows would need the same filtering as X, which this path does not
-    // yet apply — warn and drop rather than emit a misaligned raw.
-    //
-    // `raw=False` opts out of both branches: no rebuild, and no notice about
-    // a matrix the caller has said they do not want.
-    if filters.raw && reader.has_raw() {
-        if reader.header().has_deletion_vectors() {
-            warn_python_convert(
-                py,
-                &scx_convert::ConvertWarning::DroppedRaw {
-                    raw_n_vars: reader.raw_n_vars().unwrap_or(0),
-                },
-            )?;
-        } else {
-            // adata.raw holds pre-normalization counts — the most likely place
-            // a > 2²⁴ integer lives. Guard before decode (dtype-aware).
-            guard_decode_loss_dtype(
-                reader.catalog().raw_csr_max_value(),
-                plan.data_dtype,
-                plan.allow_lossy,
-            )?;
-            // Non-default plans narrow raw in-decode too (raw stays CSR even for
-            // `container="dense"` — the conventional raw representation). This
-            // also fixes the pre-existing gap where raw stayed f32 under a
-            // non-default plan (the old post-assembly retype only touched X/layers).
-            let raw_x = if plan.is_default_csr_f32() {
-                let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
-                csr_to_scipy(py, raw_csr)?
-            } else {
-                let raw_csr = reader
-                    .read_all_raw_csr_shards_typed(plan)
-                    .map_err(typed_read_to_pyerr)?;
-                typed_csr_to_scipy(py, raw_csr)?
-            };
-            let raw_var_batch = reader.read_raw_var().map_err(to_pyerr)?;
-            let raw_var_table = record_batch_to_pyarrow(py, &raw_var_batch)?;
-            let raw_var = pyarrow_table_to_pandas(&raw_var_table)?;
-            let raw_kwargs = pyo3::types::PyDict::new(py);
-            raw_kwargs.set_item("X", raw_x)?;
-            raw_kwargs.set_item("var", raw_var)?;
-            let raw_adata = anndata_mod.call_method("AnnData", (), Some(&raw_kwargs))?;
-            // `adata.raw = AnnData(X=..., var=...)` stores it as a Raw —
-            // the canonical scanpy idiom.
-            adata.setattr("raw", raw_adata)?;
-        }
+    // `Skeleton` defers raw to the caller, which decides where to attach it:
+    // after the slice when only columns are selected (a var slice does not
+    // touch raw, so attaching first would cost the view and `_mutated_copy` a
+    // full-width copy each), before it when the slice also filters rows.
+    // Attaching here would take that decision away.
+    if !matches!(mode, MatrixMode::Skeleton { .. }) {
+        attach_raw(py, &adata, reader, filters, plan)?;
     }
 
     if !eager {
@@ -452,6 +496,470 @@ pub(crate) fn to_anndata_with_layers<'py>(
     Ok(adata)
 }
 
+/// Whether the projected assembler may serve this read.
+///
+/// It is f32 (it reuses the backed handle's shard-by-shard materialisation),
+/// while `read_all_csr_shards_typed` narrows from the native `u32` stream and is
+/// exact for an integer target of any width. The two can only differ above 2²⁴,
+/// so a non-default plan takes the projected path exactly when the file's values
+/// survive an f32 round trip — otherwise a `data_dtype="uint32"` read of a
+/// `> 2²⁴` count would round with no guard firing, since
+/// `guard_decode_loss_for::<u32>` permits that target by design.
+fn projection_is_safe(reader: &ScxReader, plan: &scx_sparse::MaterializePlan) -> bool {
+    plan.is_default_csr_f32() || f32_roundtrip_is_exact(reader.catalog().csr_max_value(None))
+}
+
+/// Evaluate a `preserve_slots=True` `obs_filter` against an assembled AnnData's
+/// obs frame, rejecting a non-boolean result and warning about the grammar shift.
+///
+/// Split out so the projected and unprojected `preserve_slots` paths cannot
+/// drift on the validation or on the warning text.
+fn eval_preserve_slots_mask<'py>(
+    py: Python<'py>,
+    adata: &Bound<'py, PyAny>,
+    expr: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let obs_attr = adata.getattr("obs")?;
+    let mask = obs_attr.call_method1("eval", (expr,)).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "preserve_slots=True parses obs_filter via pandas.eval; \
+             failed to evaluate {expr:?}: {e}"
+        ))
+    })?;
+
+    // Reject non-boolean results: AnnData treats numeric arrays as positional
+    // indices, which would silently reorder rows instead of failing on a
+    // malformed predicate.
+    let dtype_kind: String = mask.getattr("dtype")?.getattr("kind")?.extract()?;
+    if dtype_kind != "b" {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "preserve_slots=True requires obs_filter to evaluate to a \
+             boolean mask (e.g. \"cell_type == 'T cell'\"); expression \
+             {expr:?} produced dtype kind {dtype_kind:?}"
+        )));
+    }
+
+    // Surface the grammar shift: this path evaluates obs_filter via pandas.eval,
+    // which does not match the SCX predicate engine (e.g. pandas accepts `&` /
+    // `|` / `~`; SCX accepts only `and` / `or` / `not`). Users opted into
+    // preserve_slots=True, so one warning per call is appropriate.
+    crate::pyimport::import_module(py, "warnings")?.call_method1(
+        "warn",
+        (format!(
+            "preserve_slots=True evaluated obs_filter {expr:?} via pandas.eval; \
+             grammar differs from the SCX predicate engine used by \
+             preserve_slots=False (see docs/scanpy.md \"Filter Expression Compatibility\")."
+        ),),
+    )?;
+    Ok(mask)
+}
+
+/// Positional indices of the `True` entries of a boolean mask, in order.
+fn mask_true_positions(py: Python<'_>, mask: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
+    let np = crate::pyimport::import_module(py, "numpy")?;
+    let where_result = np.call_method1("where", (mask,))?;
+    let arr: numpy::PyReadonlyArray1<'_, i64> = where_result
+        .get_item(0)?
+        .call_method1("astype", (np.getattr("int64")?,))?
+        .extract()?;
+    Ok(arr
+        .as_slice()
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        .iter()
+        .map(|&i| i as usize)
+        .collect())
+}
+
+/// Narrow a visible-row → global-row map by a set of visible positions.
+///
+/// `None` means no deletion vectors, so a visible row *is* a global row and the
+/// positions are already the answer. Shared by the backed `obs_filter` path and
+/// the projected `preserve_slots` one, which compose the same two things.
+fn compose_kept_to_global(kept_to_global: Option<&[u64]>, positions: &[usize]) -> Vec<u64> {
+    match kept_to_global {
+        Some(existing) => positions.iter().map(|&i| existing[i]).collect(),
+        None => positions.iter().map(|&i| i as u64).collect(),
+    }
+}
+
+/// Build the eager AnnData for a gene-projected read.
+///
+/// The metadata half is built full width and handed to anndata to slice, which
+/// is not laziness: `adata[:, idx]` prunes unused **var** categories and
+/// reindexes or deletes `uns["<col>_colors"]` (`AnnData._init_as_view`).
+/// Reproducing that by hand is how a rewrite silently changes output, so the
+/// slice stays and only the matrices are taken away from it — X and each
+/// selected layer are assembled already projected.
+///
+/// `.raw` is attached **before** the slice when the slice filters rows, and
+/// after it otherwise. anndata does not var-slice raw but it does obs-slice it,
+/// so the var-only path can attach afterwards and spare the view and the copy a
+/// full-width copy each of a matrix nothing narrowed — while the
+/// `preserve_slots` path must attach first, or hand a filtered AnnData a
+/// full-height raw that `Raw` will not reject.
+///
+/// `obs_filter_expr` is the `preserve_slots=True` case: the mask is evaluated on
+/// the skeleton's obs, folded into the row set the projected matrices are built
+/// with, and passed to the same slice.
+#[allow(clippy::too_many_arguments)]
+fn projected_eager_anndata<'py>(
+    py: Python<'py>,
+    path: &std::path::Path,
+    reader: &ScxReader,
+    layer_filter: Option<&[String]>,
+    obsm_filter: Option<&[String]>,
+    filters: SlotFilters<'_>,
+    memory_budget: Option<u64>,
+    plan: &scx_sparse::MaterializePlan,
+    col_indices: &[u32],
+    preserve_var_order: bool,
+    obs_filter_expr: Option<&str>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let skeleton = to_anndata_with_layers(
+        py,
+        path,
+        reader,
+        layer_filter,
+        obsm_filter,
+        filters,
+        true,
+        memory_budget,
+        MatrixMode::Skeleton {
+            n_selected_vars: col_indices.len(),
+        },
+        plan,
+    )?;
+
+    // Row set the projected matrices must be built over: the file's deletion
+    // vectors, further narrowed by `preserve_slots`' pandas mask.
+    let mut kept_to_global = compute_kept_to_global(reader)?;
+    let builtins = crate::pyimport::import_module(py, "builtins")?;
+    let row_idx = match obs_filter_expr {
+        None => builtins.call_method1("slice", (py.None(),))?,
+        Some(expr) => {
+            let mask = eval_preserve_slots_mask(py, &skeleton, expr)?;
+            let positions = mask_true_positions(py, &mask)?;
+            kept_to_global = Some(compose_kept_to_global(
+                kept_to_global.as_deref(),
+                &positions,
+            ));
+            mask
+        }
+    };
+
+    // `.raw` is attached *before* the slice whenever the slice filters rows, and
+    // after it otherwise.
+    //
+    // anndata does not var-slice raw but it does obs-slice it, so on the
+    // `preserve_slots` route the post-slice attachment would hand a filtered
+    // AnnData a full-height raw. That does not raise: `Raw` takes the parent's
+    // row count and the assignee's matrix without checking they agree, so
+    // `adata.raw.shape` follows the filtered cells while `adata.raw.X` holds
+    // every row — the same "right shape, wrong rows" class this path already
+    // guards against for X and layers via `kept_to_global`. Attaching first
+    // costs the extra full-width raw copy that the var-only path avoids, on a
+    // route that already copies everything; being right is worth more than
+    // that copy.
+    let filters_rows = obs_filter_expr.is_some();
+    if filters_rows {
+        attach_raw(py, &skeleton, reader, filters, plan)?;
+    }
+
+    let np_indices = PyArray1::from_slice(py, col_indices);
+    let idx = pyo3::types::PyTuple::new(py, &[row_idx.unbind(), np_indices.into_any().unbind()])?;
+    let adata = skeleton.get_item(idx)?.call_method0("copy")?;
+
+    // One shared row mapping for X and every layer (see `projected_matrix`).
+    let kept_to_global = kept_to_global.map(std::sync::Arc::new);
+    let catalog = reader.catalog_arc();
+    let x = projected_matrix(
+        py,
+        path,
+        std::sync::Arc::clone(&catalog),
+        None,
+        kept_to_global.as_ref(),
+        col_indices,
+        preserve_var_order,
+        decode_window(reader, None),
+        plan,
+    )?;
+    adata.setattr("X", x)?;
+
+    // Layers, in catalog order (the pre-projection path materialised them from
+    // a `HashMap`, so `list(adata.layers)` used to vary between runs).
+    let selected: Vec<String> = reader
+        .layer_names()
+        .into_iter()
+        .filter(|n| layer_filter.is_none_or(|f| f.iter().any(|x| x == n)))
+        .collect();
+    if !selected.is_empty() {
+        // The eager-layers decode-loss guard lived inside the bridge branch this
+        // path replaces. Layers materialise as f32 on every path and are
+        // narrowed post-assembly, so a `> 2²⁴` layer count cannot be delivered
+        // losslessly by any route — fail loud rather than round silently.
+        guard_decode_loss(
+            reader.catalog().layer_csr_max_value(0, None),
+            plan.allow_lossy,
+        )?;
+        let layers_attr = adata.getattr("layers")?;
+        // f32, like every other layer path: `experiment::to_anndata_impl`
+        // applies a non-default plan to layers after this returns.
+        let layer_plan = scx_sparse::MaterializePlan::default_csr_f32();
+        for name in &selected {
+            let mat = projected_matrix(
+                py,
+                path,
+                std::sync::Arc::clone(&catalog),
+                Some(name),
+                kept_to_global.as_ref(),
+                col_indices,
+                preserve_var_order,
+                decode_window(reader, Some(name)),
+                &layer_plan,
+            )?;
+            layers_attr.set_item(name, mat)?;
+        }
+    }
+
+    if !filters_rows {
+        attach_raw(py, &adata, reader, filters, plan)?;
+    }
+    Ok(adata)
+}
+
+/// How many shards the projected assembly may decode at once.
+///
+/// The path this replaces ran its shard loop through rayon, so a purely
+/// sequential projected assembly is a several-fold wall-clock regression on the
+/// call it is supposed to make cheaper — measured at ~6x on a 12-core box.
+/// A window restores the parallelism while keeping the memory claim honest:
+/// peak holds `window` full-width shards, not the whole matrix.
+///
+/// The concurrency cap for a projected assembly: how many full-width decoded
+/// shards it will hold at once, expressed as bytes. Well under the 8 GiB
+/// default eager budget, and far above any real shard.
+///
+/// A cap on concurrency, **not** a ceiling on the read: a single shard larger
+/// than this still decodes, one at a time. The budget decides how many such
+/// decodes overlap, never whether one happens.
+const IN_FLIGHT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Sized against the **largest** shard of the matrix being read, so the budget
+/// holds whichever shards the window actually lands on. An average would not:
+/// a skewed file can carry one shard many times the mean, and a layer can be
+/// far denser than X, so averaging X's shards and reusing the answer for every
+/// layer would let the in-flight bytes exceed the budget by an arbitrary
+/// factor. Computed per matrix for the same reason.
+///
+/// Deliberately independent of the `memory_budget` kwarg: that one is advisory
+/// (it warns, it does not block), and making it govern decode concurrency would
+/// quietly change what it means.
+fn decode_window(reader: &ScxReader, layer: Option<&str>) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    let entries: Vec<&scx_format_io::FullCatalogEntry> = match layer {
+        Some(name) => reader.catalog().layer_csr_shards_for_modality(0, name),
+        None => reader
+            .catalog()
+            .entries
+            .iter()
+            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
+            .collect(),
+    };
+    let section = match layer {
+        Some(_) => SectionType::LayerCsrShard,
+        None => SectionType::CsrShard,
+    };
+    match max_decoded_shard_bytes(entries.iter().map(|e| {
+        e.stats.as_ref().map(|s| {
+            let start = s.major_start(section);
+            let end = s.major_end(section);
+            (s.nnz, end.saturating_sub(start))
+        })
+    })) {
+        Some(bytes) => window_for(threads, bytes),
+        None => 1,
+    }
+}
+
+/// Largest decoded size among a matrix's shards, or `None` when the answer
+/// cannot be derived — an empty shard list, or an entry the catalog has no
+/// stats for. `None` means "decode one at a time": guessing a size for a shard
+/// nobody measured is the wrong direction to be wrong in.
+///
+/// Each item is `Some((nnz, rows))` for a shard that has stats.
+fn max_decoded_shard_bytes(shards: impl Iterator<Item = Option<(u64, u64)>>) -> Option<u64> {
+    let mut max = None;
+    for shard in shards {
+        let (nnz, rows) = shard?;
+        // The same formula `ShardSizeHint::decoded_bytes` uses: an `ScxCsr` is
+        // an i64 indptr of `rows + 1` plus an i32 index and an f32 value per
+        // nonzero. The row term is not noise — a tall, near-empty shard is
+        // almost all indptr, and sizing it by `nnz` alone would put an
+        // arbitrary number of those in flight at once.
+        let bytes = scx_format_io::ShardSizeHint {
+            max_rows: rows as usize,
+            max_nnz: nnz as usize,
+        }
+        .decoded_bytes();
+        max = Some(max.map_or(bytes, |m: u64| m.max(bytes)));
+    }
+    max
+}
+
+/// The budget arithmetic behind [`decode_window`], split out so it can be
+/// tested without a file: how many shards of `shard_bytes` fit in the in-flight
+/// budget, capped at `threads` and never below 1.
+fn window_for(threads: usize, shard_bytes: u64) -> usize {
+    let by_bytes = (IN_FLIGHT_BUDGET_BYTES / shard_bytes.max(1)).max(1) as usize;
+    threads.max(1).min(by_bytes)
+}
+
+/// Open a `BackedCsrReader` over X (`layer = None`) or one named layer, reusing
+/// an already-parsed catalog.
+///
+/// `cache_shards = 0` is the right value for a one-shot projected assembly, and
+/// not merely a small one: `ScxBackedSparseDataset::as_shard_source` does not
+/// opt into cached reads, so every shard is decoded through
+/// `read_shard_uncached` and the LRU is never consulted. Any other value would
+/// allocate a cache with a guaranteed zero hit rate.
+pub(crate) fn open_backed_matrix_reader(
+    path: &std::path::Path,
+    catalog: std::sync::Arc<scx_format_io::FullCatalog>,
+    layer: Option<&str>,
+    cache_shards: usize,
+) -> PyResult<std::sync::Arc<scx_format_io::BackedCsrReader>> {
+    let reader = crate::open_handle_reader_shared(path, catalog).map_err(to_pyerr)?;
+    Ok(std::sync::Arc::new(match layer {
+        Some(name) => scx_format_io::BackedCsrReader::new_for_layer(reader, name, cache_shards),
+        None => scx_format_io::BackedCsrReader::new(reader, cache_shards),
+    }))
+}
+
+/// Install a resolved gene projection on a backed handle.
+///
+/// Under `preserve_var_order` the visible axis is in request order, which the
+/// handle expresses as a sorted projection plus a presentation permutation;
+/// using the sorted setter there leaves the handle transposed relative to
+/// `adata.var`. Shared so X and every layer cannot pick different setters.
+pub(crate) fn install_projection(
+    ds: &mut crate::backed::ScxBackedSparseDataset,
+    col_indices: Option<&[u32]>,
+    preserve_var_order: bool,
+) {
+    if let Some(indices) = col_indices {
+        if preserve_var_order {
+            ds.set_col_projection_ordered(indices.to_vec());
+        } else {
+            ds.set_col_projection(indices.to_vec());
+        }
+    }
+}
+
+/// Assemble X (or one layer), projected to `col_indices`, as a scipy matrix.
+///
+/// Streams shard by shard, so peak is twice the projected result plus `window`
+/// full-width shards in flight rather than the whole matrix twice. Deletion
+/// vectors ride along through `kept_to_global`.
+#[allow(clippy::too_many_arguments)]
+fn projected_matrix<'py>(
+    py: Python<'py>,
+    path: &std::path::Path,
+    catalog: std::sync::Arc<scx_format_io::FullCatalog>,
+    layer: Option<&str>,
+    kept_to_global: Option<&std::sync::Arc<Vec<u64>>>,
+    col_indices: &[u32],
+    preserve_var_order: bool,
+    window: usize,
+    plan: &scx_sparse::MaterializePlan,
+) -> PyResult<Bound<'py, PyAny>> {
+    use crate::backed::ScxBackedSparseDataset;
+
+    let backed = open_backed_matrix_reader(path, catalog, layer, 0)?;
+    // The row set is shared, not copied per matrix: X and every selected layer
+    // are built off the same mapping, which is one `u64` per live cell.
+    let mut ds = match kept_to_global {
+        Some(mapping) => ScxBackedSparseDataset::from_reader_with_shared_deletions(
+            backed,
+            std::sync::Arc::clone(mapping),
+        ),
+        None => ScxBackedSparseDataset::from_reader(backed),
+    };
+    install_projection(&mut ds, Some(col_indices), preserve_var_order);
+    let csr = crate::backed::detached(py, || {
+        crate::backed::materialize_projected(&ds, window).map_err(|e| e.to_string())
+    })
+    .map_err(PyRuntimeError::new_err)?;
+    // The projected assembler is f32; a non-default plan narrows the (already
+    // small) projected result on the way out. Reaching here at all means
+    // `f32_roundtrip_is_exact` said the detour cannot round a value, and the
+    // narrow is still gated per element by `csr_to_scipy_typed`, which also
+    // short-circuits to `csr_to_scipy` for the default plan.
+    csr_to_scipy_typed(py, csr, plan)
+}
+
+/// Reconstruct `adata.raw` from the file's raw sections, or say why not.
+///
+/// Raw shares X's obs axis; when deletion vectors are active the raw rows would
+/// need the same filtering as X, which this path does not apply — warn and drop
+/// rather than emit a misaligned raw. `raw=False` opts out of both branches: no
+/// rebuild, and no notice about a matrix the caller has said they do not want.
+///
+/// A **gene** projection is deliberately not passed here: anndata does not
+/// var-slice `.raw` (`AnnData._init_as_view` hands it only the obs index), so
+/// raw stays on its own — usually wider — gene axis on every path.
+pub(crate) fn attach_raw(
+    py: Python<'_>,
+    adata: &Bound<'_, PyAny>,
+    reader: &ScxReader,
+    filters: SlotFilters<'_>,
+    plan: &scx_sparse::MaterializePlan,
+) -> PyResult<()> {
+    if !(filters.raw && reader.has_raw()) {
+        return Ok(());
+    }
+    if reader.header().has_deletion_vectors() {
+        warn_python_convert(
+            py,
+            &scx_convert::ConvertWarning::DroppedRaw {
+                raw_n_vars: reader.raw_n_vars().unwrap_or(0),
+            },
+        )?;
+        return Ok(());
+    }
+    // adata.raw holds pre-normalization counts — the most likely place a > 2²⁴
+    // integer lives. Guard before decode (dtype-aware).
+    guard_decode_loss_dtype(
+        reader.catalog().raw_csr_max_value(),
+        plan.data_dtype,
+        plan.allow_lossy,
+    )?;
+    // Non-default plans narrow raw in-decode too (raw stays CSR even for
+    // `container="dense"` — the conventional raw representation). This also
+    // fixes the pre-existing gap where raw stayed f32 under a non-default plan
+    // (the old post-assembly retype only touched X/layers).
+    let raw_x = if plan.is_default_csr_f32() {
+        let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
+        csr_to_scipy(py, raw_csr)?
+    } else {
+        let raw_csr = reader
+            .read_all_raw_csr_shards_typed(plan)
+            .map_err(typed_read_to_pyerr)?;
+        typed_csr_to_scipy(py, raw_csr)?
+    };
+    let raw_var_batch = reader.read_raw_var().map_err(to_pyerr)?;
+    let raw_var_table = record_batch_to_pyarrow(py, &raw_var_batch)?;
+    let raw_var = pyarrow_table_to_pandas(&raw_var_table)?;
+    let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
+    let raw_kwargs = pyo3::types::PyDict::new(py);
+    raw_kwargs.set_item("X", raw_x)?;
+    raw_kwargs.set_item("var", raw_var)?;
+    let raw_adata = anndata_mod.call_method("AnnData", (), Some(&raw_kwargs))?;
+    // `adata.raw = AnnData(X=..., var=...)` stores it as a Raw — the canonical
+    // scanpy idiom.
+    adata.setattr("raw", raw_adata)?;
+    Ok(())
+}
+
 /// Build an AnnData with optional var_names projection, obs_filter, and layers selection.
 ///
 /// For obs_filter: delegates to the QueryPipeline for predicate pushdown.
@@ -478,17 +986,24 @@ pub fn to_anndata_filtered<'py>(
     preserve_slots: bool,
     eager: bool,
     memory_budget: Option<u64>,
-    skip_x: bool,
+    base_mode: MatrixMode,
     preserve_var_order: bool,
     strict_var_names: bool,
     plan: &scx_sparse::MaterializePlan,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // `skip_x` (the X-less skeleton for `to_gpu_anndata`) is only meaningful on
-    // the no-filter fast path — the caller guarantees no var_names / obs_filter /
-    // layer projection when it sets it (those paths reshape X and must build it).
+    // `SkipX` (the X-less object `to_gpu_anndata` fills in) is only meaningful
+    // on the no-filter fast path — the caller guarantees no var_names /
+    // obs_filter / layer projection when it passes it (those paths reshape X
+    // and must build it). `Skeleton` is chosen inside this function, never by a
+    // caller: it is a step of the projected route, not a mode to request.
     debug_assert!(
-        !skip_x || (var_names.is_none() && obs_filter.is_none() && layer_filter.is_none()),
-        "skip_x requires no var_names / obs_filter / layer_filter"
+        !matches!(base_mode, MatrixMode::SkipX)
+            || (var_names.is_none() && obs_filter.is_none() && layer_filter.is_none()),
+        "MatrixMode::SkipX requires no var_names / obs_filter / layer_filter"
+    );
+    debug_assert!(
+        !matches!(base_mode, MatrixMode::Skeleton { .. }),
+        "MatrixMode::Skeleton is internal to the projected route"
     );
 
     // Validate the slot filters here rather than in `to_anndata_with_layers`:
@@ -527,7 +1042,7 @@ pub fn to_anndata_filtered<'py>(
             filters,
             eager,
             memory_budget,
-            skip_x,
+            base_mode,
             plan,
         );
     }
@@ -539,6 +1054,41 @@ pub fn to_anndata_filtered<'py>(
     // than lazy bridges (which AnnData iterates / validates during
     // `.copy()` anyway).
     if let (Some(expr), true) = (obs_filter, preserve_slots) {
+        // A gene projection takes the same route as the unfiltered one: the
+        // metadata half is sliced by anndata (rows *and* columns at once), and
+        // X / layers are assembled already projected over the surviving rows.
+        // This branch is the highest-peak path in the API — it exists to keep
+        // every slot — so leaving it on assemble-then-slice would be an
+        // incoherent contract.
+        // Resolved once: the fallback below reuses these rather than re-scanning
+        // every string column of `var` a second time.
+        let resolved = match var_names {
+            Some(names) => Some(resolve_var_names_to_indices(
+                reader,
+                names,
+                preserve_var_order,
+                strict_var_names,
+            )?),
+            None => None,
+        };
+        if let Some(indices) = &resolved {
+            if projection_is_safe(reader, plan) {
+                return projected_eager_anndata(
+                    py,
+                    path,
+                    reader,
+                    layer_filter,
+                    obsm_filter,
+                    filters,
+                    memory_budget,
+                    plan,
+                    indices,
+                    preserve_var_order,
+                    Some(expr),
+                );
+            }
+        }
+
         // Decode-loss guard runs inside to_anndata_with_layers.
         let full = to_anndata_with_layers(
             py,
@@ -549,54 +1099,18 @@ pub fn to_anndata_filtered<'py>(
             filters,
             true,
             memory_budget,
-            false,
+            MatrixMode::Eager,
             plan,
         )?;
 
-        let obs_attr = full.getattr("obs")?;
-        let mask = obs_attr.call_method1("eval", (expr,)).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "preserve_slots=True parses obs_filter via pandas.eval; \
-                 failed to evaluate {expr:?}: {e}"
-            ))
-        })?;
-
-        // Reject non-boolean results: AnnData treats numeric arrays as
-        // positional indices, which would silently reorder rows instead
-        // of failing on a malformed predicate.
-        let dtype_kind: String = mask.getattr("dtype")?.getattr("kind")?.extract()?;
-        if dtype_kind != "b" {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "preserve_slots=True requires obs_filter to evaluate to a \
-                 boolean mask (e.g. \"cell_type == 'T cell'\"); expression \
-                 {expr:?} produced dtype kind {dtype_kind:?}"
-            )));
-        }
-
-        // Surface the grammar shift: this path evaluates obs_filter via
-        // pandas.eval, which does not match the SCX predicate engine
-        // (e.g. pandas accepts `&` / `|` / `~`; SCX accepts only
-        // `and` / `or` / `not`). Users opted into preserve_slots=True, so
-        // one warning per call is appropriate.
-        crate::pyimport::import_module(py, "warnings")?.call_method1(
-            "warn",
-            (format!(
-                "preserve_slots=True evaluated obs_filter {expr:?} via pandas.eval; \
-                 grammar differs from the SCX predicate engine used by \
-                 preserve_slots=False (see docs/scanpy.md \"Filter Expression Compatibility\")."
-            ),),
-        )?;
-
+        let mask = eval_preserve_slots_mask(py, &full, expr)?;
         let builtins = crate::pyimport::import_module(py, "builtins")?;
         let slice_all = builtins.call_method1("slice", (py.None(),))?;
-        let col_idx = if let Some(names) = var_names {
+        let col_idx = match &resolved {
             // Fancy column indexing honours order, so request order is preserved
             // automatically when preserve_var_order is set.
-            let indices =
-                resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
-            PyArray1::from_vec(py, indices).into_any().unbind()
-        } else {
-            slice_all.unbind()
+            Some(indices) => PyArray1::from_slice(py, indices).into_any().unbind(),
+            None => slice_all.unbind(),
         };
         let idx = pyo3::types::PyTuple::new(py, &[mask.unbind(), col_idx])?;
         return full.get_item(idx)?.call_method0("copy");
@@ -709,13 +1223,57 @@ pub fn to_anndata_filtered<'py>(
         return Ok(adata);
     }
 
-    // No obs_filter but var_names and/or layers specified
-    // Load normally, then apply var_names column projection. Force eager
-    // because slicing the AnnData by var_names triggers AlignedMapping
-    // validation across all aligned slots (obsp / varp / varm), which
-    // would materialize through the lazy bridges anyway — doing it up
-    // front avoids fragmenting the cost across implicit slicing.
-    let adata = to_anndata_with_layers(
+    // No obs_filter, but var_names and/or layers. `var_names` projects while
+    // assembling; `layers=` alone still forces eager assembly, because slicing
+    // the AnnData drags every aligned bridge through anndata's validation
+    // anyway and fragmenting that cost across implicit slicing helps nobody.
+    if let Some(names) = var_names {
+        // Resolve via the same path as backed / query-engine: scans all string
+        // columns (so gene symbols in non-index columns work). Returns sorted
+        // positional indices by default, or request-order (deduped first-wins)
+        // when preserve_var_order is set.
+        let indices =
+            resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
+        if projection_is_safe(reader, plan) {
+            return projected_eager_anndata(
+                py,
+                path,
+                reader,
+                layer_filter,
+                obsm_filter,
+                filters,
+                memory_budget,
+                plan,
+                &indices,
+                preserve_var_order,
+                None,
+            );
+        }
+        // Fallback: assemble full width and let anndata slice. Reached only for
+        // a narrow-dtype request on a file whose values exceed 2²⁴, where the
+        // projected assembler's f32 stage could round a count the typed reader
+        // delivers exactly. Same output, same peak, as before this path existed.
+        let adata = to_anndata_with_layers(
+            py,
+            path,
+            reader,
+            layer_filter,
+            obsm_filter,
+            filters,
+            true,
+            memory_budget,
+            MatrixMode::Eager,
+            plan,
+        )?;
+        let np_indices = PyArray1::from_vec(py, indices);
+        let builtins = crate::pyimport::import_module(py, "builtins")?;
+        let slice_all = builtins.call_method1("slice", (py.None(),))?;
+        let idx =
+            pyo3::types::PyTuple::new(py, &[slice_all.unbind(), np_indices.into_any().unbind()])?;
+        return adata.get_item(idx)?.call_method0("copy");
+    }
+
+    to_anndata_with_layers(
         py,
         path,
         reader,
@@ -724,31 +1282,9 @@ pub fn to_anndata_filtered<'py>(
         filters,
         true,
         memory_budget,
-        false,
+        MatrixMode::Eager,
         plan,
-    )?;
-
-    if let Some(names) = var_names {
-        // Resolve via the same path as backed / query-engine: scans all string
-        // columns (so gene symbols in non-index columns work). Returns sorted
-        // positional indices by default, or request-order (deduped first-wins)
-        // when preserve_var_order is set. Slicing adata[:, np_indices] projects
-        // X, layers, var, varm, and varp consistently and honours the index
-        // order, so request order is preserved automatically.
-        let indices =
-            resolve_var_names_to_indices(reader, names, preserve_var_order, strict_var_names)?;
-        let np_indices = PyArray1::from_vec(py, indices);
-
-        let builtins = crate::pyimport::import_module(py, "builtins")?;
-        let slice_all = builtins.call_method1("slice", (py.None(),))?;
-        let idx =
-            pyo3::types::PyTuple::new(py, &[slice_all.unbind(), np_indices.into_any().unbind()])?;
-        let sliced = adata.get_item(idx)?;
-        let copied = sliced.call_method0("copy")?;
-        return Ok(copied);
-    }
-
-    Ok(adata)
+    )
 }
 
 /// Resolve gene names to column indices using the var metadata.
@@ -898,7 +1434,6 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     use crate::lazy_mapping::{
         PairwiseAxis, ScxLazyObsmMapping, ScxLazyPairwiseMapping, ScxLazyVarmMapping,
     };
-    use scx_format_io::BackedCsrReader;
     use std::sync::Arc;
 
     let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
@@ -969,33 +1504,14 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             let original_idx = obs_df.getattr("index")?;
             let filtered_idx = filtered.getattr("index")?;
 
-            // Get positional indices of kept rows in the (already deletion-filtered) obs
-            let np = crate::pyimport::import_module(py, "numpy")?;
+            // Positional indices of the kept rows in the (already
+            // deletion-filtered) obs, composed onto the visible → global map.
             let isin_mask = original_idx.call_method1("isin", (&filtered_idx,))?;
-            let where_result = np.call_method1("where", (&isin_mask,))?;
-            // np.where returns a tuple; first element is array of indices
-            let pos_indices = where_result.get_item(0)?;
-            let pos_arr: numpy::PyReadonlyArray1<'_, i64> = pos_indices
-                .call_method1("astype", (np.getattr("int64")?,))?
-                .extract()?;
-            let pos_slice = pos_arr
-                .as_slice()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            // Update kept_to_global to reflect the obs_filter
-            match &kept_to_global {
-                Some(existing) => {
-                    // existing maps user-visible → global. Now further filter.
-                    let new_kept: Vec<u64> =
-                        pos_slice.iter().map(|&i| existing[i as usize]).collect();
-                    kept_to_global = Some(new_kept);
-                }
-                None => {
-                    // No prior deletions. pos_slice maps directly to global.
-                    let new_kept: Vec<u64> = pos_slice.iter().map(|&i| i as u64).collect();
-                    kept_to_global = Some(new_kept);
-                }
-            }
+            let positions = mask_true_positions(py, &isin_mask)?;
+            kept_to_global = Some(compose_kept_to_global(
+                kept_to_global.as_deref(),
+                &positions,
+            ));
 
             Some(filtered)
         } else {
@@ -1021,10 +1537,9 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     };
 
     // --- X: backed ---
-    let x_reader =
-        crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog)).map_err(to_pyerr)?;
-    let has_csc = x_reader.header().has_csc();
-    let x_backed = Arc::new(BackedCsrReader::new(x_reader, cache_shards));
+    let has_csc = reader.header().has_csc();
+    let x_backed =
+        open_backed_matrix_reader(path, Arc::clone(&shared_catalog), None, cache_shards)?;
     let x_backed_csc: Option<Arc<scx_format_io::BackedCscReader>> = if has_csc {
         // Open a separate ScxReader for the CSC sidecar (BackedCscReader
         // takes ownership). Header check is cheap; the reader holds a
@@ -1048,13 +1563,7 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
     };
     x_dataset.with_csc_reader(x_backed_csc);
     x_dataset.with_source_path(path);
-    if let Some(ref indices) = col_indices {
-        if preserve_var_order {
-            x_dataset.set_col_projection_ordered(indices.clone());
-        } else {
-            x_dataset.set_col_projection(indices.clone());
-        }
-    }
+    install_projection(&mut x_dataset, col_indices.as_deref(), preserve_var_order);
 
     // --- var (eager, optionally filtered by var_names) ---
     let var = match reader.read_var() {
@@ -1190,9 +1699,8 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
                 continue;
             }
         }
-        let l_reader = crate::open_handle_reader_shared(path, Arc::clone(&shared_catalog))
-            .map_err(to_pyerr)?;
-        let l_backed = Arc::new(BackedCsrReader::new_for_layer(l_reader, name, cache_shards));
+        let l_backed =
+            open_backed_matrix_reader(path, Arc::clone(&shared_catalog), Some(name), cache_shards)?;
         let mut l_dataset = match &kept_to_global {
             Some(mapping) => ScxBackedLayerDataset::from_reader_with_deletions(
                 l_backed,
@@ -1201,16 +1709,11 @@ pub(crate) fn to_anndata_backed_with_options<'py>(
             ),
             None => ScxBackedLayerDataset::from_reader(l_backed, name.clone()),
         };
-        if let Some(ref indices) = col_indices {
-            // Mirror X's setter: under `preserve_var_order` the visible axis is
-            // in request order, and using the sorted setter here left layers
-            // transposed relative to X from the moment the file was opened.
-            if preserve_var_order {
-                l_dataset.inner.set_col_projection_ordered(indices.clone());
-            } else {
-                l_dataset.inner.set_col_projection(indices.clone());
-            }
-        }
+        install_projection(
+            &mut l_dataset.inner,
+            col_indices.as_deref(),
+            preserve_var_order,
+        );
         let l_py = l_dataset.into_pyobject(py)?;
         layers_dict.set_item(name, l_py)?;
     }
@@ -1447,4 +1950,86 @@ pub(crate) fn filter_obs_by_deletion_vectors(
     let bool_array = arrow::array::BooleanArray::from(keep);
     arrow::compute::filter_record_batch(&obs, &bool_array)
         .map_err(|e| PyRuntimeError::new_err(format!("failed to filter obs: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The gate that decides whether a narrow-dtype read may take the projected
+    /// (f32) assembler. Its falsifying case is unreachable from Python — every
+    /// pyscx write door routes X through f32, so an *odd* count above 2²⁴
+    /// cannot be put in a file from that side and the Python suite can only
+    /// pin the accept half. Pin both halves here instead.
+    /// The in-flight budget is the only thing bounding a projected assembly's
+    /// peak once the shard loop runs more than one decode at a time, and the
+    /// memory harness cannot falsify it: its fixtures are uniformly sparse, so
+    /// every shard is far under the budget and the window is always the thread
+    /// count. Pin the arithmetic directly.
+    ///
+    /// Not pinned by a test: that `decode_window` folds `max` rather than a
+    /// mean over the shards, and computes per matrix rather than reusing X's
+    /// answer for every layer. Both would need a deliberately skewed
+    /// multi-hundred-megabyte fixture to observe.
+    /// The catalog → bytes half of the window, which the budget arithmetic
+    /// below cannot reach. A tall, near-empty shard is the case an `nnz`-only
+    /// size gets wrong: it is almost all indptr.
+    #[test]
+    fn shard_sizing_counts_rows_as_well_as_nonzeros() {
+        // Largest, not first and not a mean. One row, 1 000 nonzeros:
+        // (1 + 1) * 8 bytes of indptr + 1 000 * 8 bytes of index+value.
+        assert_eq!(
+            max_decoded_shard_bytes([Some((10, 1)), Some((1_000, 1)), Some((10, 1))].into_iter()),
+            Some(2 * 8 + 1_000 * 8)
+        );
+        // A shard with no nonzeros at all still occupies its indptr.
+        assert_eq!(
+            max_decoded_shard_bytes([Some((0, 1_000_000))].into_iter()),
+            Some(1_000_001 * 8)
+        );
+        // And that row term can dominate: 1M empty rows outweigh 1k nonzeros.
+        let tall = max_decoded_shard_bytes([Some((0, 1_000_000))].into_iter()).unwrap();
+        let dense = max_decoded_shard_bytes([Some((1_000, 10))].into_iter()).unwrap();
+        assert!(tall > dense);
+        assert!(window_for(64, tall) < window_for(64, dense));
+        // One unmeasured shard makes the whole answer unknown.
+        assert_eq!(
+            max_decoded_shard_bytes([Some((10, 10)), None, Some((10, 10))].into_iter()),
+            None
+        );
+        // So does an empty matrix — there is nothing to size against.
+        assert_eq!(max_decoded_shard_bytes(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn the_decode_window_honours_the_in_flight_budget() {
+        // One shard bigger than the whole budget: decode them one at a time.
+        assert_eq!(window_for(12, IN_FLIGHT_BUDGET_BYTES + 1), 1);
+        assert_eq!(window_for(12, 4 * IN_FLIGHT_BUDGET_BYTES), 1);
+        // Exactly the budget still fits one.
+        assert_eq!(window_for(12, IN_FLIGHT_BUDGET_BYTES), 1);
+        // A shard worth an eighth of the budget: bytes allow 8, threads cap it.
+        assert_eq!(window_for(12, IN_FLIGHT_BUDGET_BYTES / 8), 8);
+        assert_eq!(window_for(4, IN_FLIGHT_BUDGET_BYTES / 8), 4);
+        // Tiny shards are bounded by the thread count alone.
+        assert_eq!(window_for(12, 1024), 12);
+        // Degenerate inputs never yield a zero window.
+        assert_eq!(window_for(0, 1024), 1);
+        assert_eq!(window_for(12, 0), 12);
+    }
+
+    #[test]
+    fn f32_roundtrip_exactness_matches_the_decode_loss_guard() {
+        // Float-encoded shards record no integer maximum.
+        assert!(f32_roundtrip_is_exact(0));
+        assert!(f32_roundtrip_is_exact(1));
+        // 2²⁴ itself is representable; the guard uses the same inclusive bound,
+        // so the two cannot disagree about which files are exact.
+        assert!(f32_roundtrip_is_exact(scx_codec::F32_MAX_EXACT_INT));
+        assert!(scx_codec::guard_f32_decode_loss(scx_codec::F32_MAX_EXACT_INT, false).is_ok());
+        // One above, and the projection must stand down.
+        assert!(!f32_roundtrip_is_exact(scx_codec::F32_MAX_EXACT_INT + 1));
+        assert!(scx_codec::guard_f32_decode_loss(scx_codec::F32_MAX_EXACT_INT + 1, false).is_err());
+        assert!(!f32_roundtrip_is_exact(u32::MAX));
+    }
 }

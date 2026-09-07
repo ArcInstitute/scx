@@ -108,6 +108,20 @@ impl ScxBackedSparseDataset {
         backed: Arc<BackedCsrReader>,
         kept_to_global: Vec<u64>,
     ) -> Self {
+        Self::from_reader_with_shared_deletions(backed, Arc::new(kept_to_global))
+    }
+
+    /// [`Self::from_reader_with_deletions`] over a mapping the caller already
+    /// owns as an `Arc`.
+    ///
+    /// The eager projected read builds one dataset per matrix — X and every
+    /// selected layer — off the same row set, and the mapping is one `u64` per
+    /// live cell. Cloning it per layer is an 8 MB allocation each at a million
+    /// cells, for a value none of them mutates.
+    pub fn from_reader_with_shared_deletions(
+        backed: Arc<BackedCsrReader>,
+        kept_to_global: Arc<Vec<u64>>,
+    ) -> Self {
         let (_, n_vars) = backed.shape();
         let n_kept = kept_to_global.len();
         let n_shards = backed.index().n_shards();
@@ -116,7 +130,7 @@ impl ScxBackedSparseDataset {
             backed_csc: None,
             shape_val: (n_kept, n_vars),
             n_shards,
-            kept_to_global: Some(Arc::new(kept_to_global)),
+            kept_to_global: Some(kept_to_global),
             col_projection: None,
             col_presentation: None,
             non_negative: true,
@@ -598,7 +612,7 @@ impl ScxBackedSparseDataset {
                 // `materialize_projected` applies the permutation to each piece
                 // before concatenating (never to the concatenated result — that
                 // would hold a third result-sized buffer).
-                materialize_projected(self).map_err(|e| e.to_string())
+                materialize_projected(self, 1).map_err(|e| e.to_string())
             } else if let Some(ref kept) = self.kept_to_global {
                 // Deletion vectors: gather the kept rows rather than every row.
                 self.backed
@@ -1781,17 +1795,48 @@ pub(crate) fn no_implicit_array_error(class_name: &str) -> PyErr {
 /// (measured at ~2.9× a plain `to_memory()` for `X[:, ::-1]`). Sequential on
 /// purpose — decoding shards in parallel would hold every decoded shard at
 /// once, which is the peak this exists to avoid.
-fn materialize_projected(ds: &ScxBackedSparseDataset) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+pub(crate) fn materialize_projected(
+    ds: &ScxBackedSparseDataset,
+    window: usize,
+) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+    use rayon::prelude::*;
     use scx_format_io::ShardSource;
+
     let source = ds.as_shard_source();
     let n_vars = source.n_vars();
-    let mut pieces = Vec::with_capacity(source.n_shards());
-    for shard_idx in 0..source.n_shards() {
-        let piece = source.read_shard(shard_idx)?;
-        pieces.push(match &ds.col_presentation {
-            Some(perm) => scx_engine::projection::reorder_csr_columns(&piece, perm),
-            None => piece,
-        });
+    let n_shards = source.n_shards();
+    let window = window.max(1);
+    let reorder = |piece: scx_sparse::ScxCsr| match &ds.col_presentation {
+        Some(perm) => scx_engine::projection::reorder_csr_columns(&piece, perm),
+        None => piece,
+    };
+
+    let mut pieces: Vec<scx_sparse::ScxCsr> = Vec::with_capacity(n_shards);
+    if window == 1 {
+        // The handle path's documented bound: one full-width shard in flight.
+        for shard_idx in 0..n_shards {
+            pieces.push(reorder(source.read_shard(shard_idx)?));
+        }
+    } else {
+        // A bounded window, for a one-shot read that would otherwise pay a
+        // whole-file sequential decode where the path it replaced ran the
+        // shard loop through rayon. `window` shards are decoded at once, so
+        // peak rises from one full-width shard to `window` of them — the
+        // caller sizes it against a byte budget. Rayon's ordered `collect`
+        // keeps the row order `concatenate_csr` depends on.
+        for start in (0..n_shards).step_by(window) {
+            let end = (start + window).min(n_shards);
+            let batch = (start..end)
+                .into_par_iter()
+                .map(|shard_idx| source.read_shard(shard_idx).map(&reorder))
+                .collect::<scx_format_io::Result<Vec<_>>>()?;
+            pieces.extend(batch);
+        }
+    }
+    if pieces.len() == 1 {
+        // `concatenate_csr` clones its single input; a one-shard file would
+        // otherwise pay a second copy of the projected result for nothing.
+        return Ok(pieces.pop().expect("checked non-empty"));
     }
     Ok(scx_sparse::concatenate_csr(&pieces, n_vars)?)
 }

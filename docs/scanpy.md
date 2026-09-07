@@ -1059,9 +1059,26 @@ adata = pyscx.open("atlas.scx").to_anndata(
 print(adata.n_vars)  # 5
 ```
 
-In non-backed mode, this applies column projection to the materialized CSR.
+In non-backed mode, `X` and each selected layer are assembled **already
+projected**: each shard is decoded once and narrowed to the requested genes
+while it is still one shard wide, so the full-width matrix is never built.
 In backed mode, projection is applied lazily — full rows are decoded from
 disk, but only the requested columns are retained in the returned CSR.
+
+The bound is on the gene axis only. `obs`, `obsm` and `obsp` are cell-axis
+members: they come back at full size whatever `var_names` says, and anndata's
+copy transiently doubles them. On a file carrying an `n_obs × n_obs` kNN graph
+that is the term that matters, so pair the projection with the slot filters:
+
+```python
+adata = pyscx.open("atlas.scx").to_anndata(
+    var_names=markers, obsp=[], varp=[], varm=[]
+)
+```
+
+`.raw` is not narrowed either — anndata never slices it on the gene axis — so a
+projected read of a raw-bearing file still pays for raw in full. Pass
+`raw=False` when the workload does not need it.
 
 By default `var_names` is a **set selector**: the returned gene axis is in
 sorted original-column order, and duplicate names collapse. Pass
