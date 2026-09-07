@@ -357,6 +357,7 @@ _DECODE_PROBE = textwrap.dedent(
     n_qc = int(sys.argv[2])
     case = sys.argv[3]
     op = sys.argv[4]
+    percent_top = [int(n) for n in sys.argv[5].split(",")] if len(sys.argv) > 5 and sys.argv[5] else None
 
     adata = pyscx.open(path).to_anndata(backed=True)
     n_shards = adata.X.n_shards if hasattr(adata.X, "n_shards") else None
@@ -382,7 +383,9 @@ _DECODE_PROBE = textwrap.dedent(
 
     pyscx.accel.cpu_profile_reset()
     if op == "qc":
-        pyscx.accel.calculate_qc_metrics(adata, qc_vars=qc_vars or None)
+        pyscx.accel.calculate_qc_metrics(
+            adata, qc_vars=qc_vars or None, percent_top=percent_top
+        )
     else:
         pyscx.accel.filter_genes(adata, min_cells=1, min_counts=1.0)
     snap = pyscx.accel.cpu_profile_snapshot()
@@ -393,12 +396,13 @@ _DECODE_PROBE = textwrap.dedent(
 )
 
 
-def _probe_decodes(path, n_qc, case="plain", op="qc"):
+def _probe_decodes(path, n_qc, case="plain", op="qc", percent_top=None):
     import json
 
     env = dict(os.environ, SCX_CPU_PROFILE="1")
+    ns = ",".join(str(n) for n in percent_top) if percent_top else ""
     out = subprocess.run(
-        [sys.executable, "-c", _DECODE_PROBE, path, str(n_qc), case, op],
+        [sys.executable, "-c", _DECODE_PROBE, path, str(n_qc), case, op, ns],
         capture_output=True,
         text=True,
         env=env,
@@ -425,6 +429,26 @@ def test_filter_genes_decode_count_is_one_pass(multishard_path, case):
     n_shards = res["n_shards"]
     assert res["decodes"] == n_shards, (
         f"{case}: expected 1 pass over {n_shards} shards, saw {res['decodes']}"
+    )
+
+
+@pytest.mark.parametrize(
+    "case", ["plain", "projected", "deleted", "lazy", "lazy+projected"]
+)
+def test_percent_top_adds_no_shard_pass(multishard_path, case):
+    """`percent_top` rides in the existing row pass.
+
+    The per-row top-N is selected from the values that pass already holds, so
+    the count stays at two. The docs claim it costs no extra scan; this is what
+    makes that a claim rather than an intention. `percent_top=(5,)` because the
+    projected cases narrow the visible axis to 9 genes.
+    """
+    res = _probe_decodes(multishard_path, 1, case=case, percent_top=(5,))
+    assert res["enabled"]
+    n_shards = res["n_shards"]
+    assert res["decodes"] == 2 * n_shards, (
+        f"{case}: percent_top added a pass — expected {2 * n_shards} decodes "
+        f"over {n_shards} shards, saw {res['decodes']}"
     )
 
 
