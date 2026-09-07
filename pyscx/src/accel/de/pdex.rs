@@ -5,7 +5,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::PyDict;
 
 use super::*;
-use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
 /// Run pdex `mode="ref"` against an AnnData, dispatching to the SCX-backed
@@ -35,7 +34,7 @@ fn run_pdex_ref_inner(
         resolve_groups_and_reference(adata, groupby, reference, requested_groups)?;
 
     // Select the input matrix + gene names per the use_raw/layer contract.
-    let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer, "pdex_ref")?;
 
     // Resolve the `"auto"` policy (§5.2): CSC-direct on CPU when a valid sidecar
     // is present, else CSR; CSR on GPU (planner routes gpu_csc_v3 from there).
@@ -60,8 +59,9 @@ fn run_pdex_ref_inner(
         }
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
-        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
-            reject_csc_on_subset(&backed)?;
+        if let Some(handle) = crate::accel::backed_dataset_ref(&x) {
+            let backed = handle.get();
+            reject_csc_on_subset(backed)?;
             let csc_reader = backed
                 .backed_csc
                 .as_ref()
@@ -71,7 +71,7 @@ fn run_pdex_ref_inner(
                     )
                 })?
                 .clone();
-            drop(backed);
+            drop(handle);
             return py
                 .detach(|| {
                     scx_accel::pdex_ref_streaming_csc(
@@ -139,7 +139,8 @@ fn run_pdex_ref_inner(
         ));
     }
 
-    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+    if let Some(handle) = crate::accel::backed_dataset_ref(&x) {
+        let backed = handle.get();
         let chunk_size = gene_chunk_size.unwrap_or(500);
         // The handle's *view* — see the matching branch in
         // `run_rank_genes_groups_inner` for why the raw reader is wrong here.
@@ -156,7 +157,7 @@ fn run_pdex_ref_inner(
         // take a CSC reader.
         #[cfg(feature = "gpu")]
         let csc_reader = backed.backed_csc.as_ref().map(std::sync::Arc::clone);
-        drop(backed);
+        drop(handle);
         return match gpu_device_id {
             #[cfg(feature = "gpu")]
             Some(device_id) => py

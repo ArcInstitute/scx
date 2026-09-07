@@ -180,10 +180,19 @@ fn resolve_use_raw(
 /// `layer` → `adata.layers[layer]` with `adata.var.index`; otherwise `adata.X`
 /// with `adata.var.index`. The returned matrix flows through the same
 /// backed/lazy/scipy/dense dispatch as before — only the source object changes.
+///
+/// The gene axis of the *selected* matrix is checked here, not by the caller's
+/// `prepare_target` prologue: that one reads `adata.X`, so a presentation
+/// order living on a named layer went unseen. `gene_names` comes from
+/// `adata.var` in request order while the streaming kernels emit the sorted
+/// on-disk projection, which is a silent gene permutation rather than an
+/// error. Guarding at the point of selection keeps the check on whichever
+/// matrix the op will actually read, for all three arms.
 fn select_de_matrix<'py>(
     adata: &Bound<'py, PyAny>,
     use_raw: bool,
     layer: Option<&str>,
+    op: &str,
 ) -> PyResult<(Bound<'py, PyAny>, Vec<String>)> {
     let var_names_of = |frame: &Bound<'py, PyAny>| -> PyResult<Vec<String>> {
         frame
@@ -198,16 +207,19 @@ fn select_de_matrix<'py>(
         }
         let x = raw.getattr("X")?;
         let gene_names = var_names_of(&raw.getattr("var")?)?;
+        crate::accel::reject_presentation_ordered_source(&x, op)?;
         Ok((x, gene_names))
     } else if let Some(name) = layer {
         let x = adata.getattr("layers")?.get_item(name).map_err(|_| {
             PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
         })?;
         let gene_names = var_names_of(&adata.getattr("var")?)?;
+        crate::accel::reject_presentation_ordered_source(&x, op)?;
         Ok((x, gene_names))
     } else {
         let x = adata.getattr("X")?;
         let gene_names = var_names_of(&adata.getattr("var")?)?;
+        crate::accel::reject_presentation_ordered_source(&x, op)?;
         Ok((x, gene_names))
     }
 }
@@ -254,7 +266,8 @@ fn reject_csc_on_subset(backed: &ScxBackedSparseDataset) -> PyResult<()> {
 /// just routes `auto` to the CSR streamer. A materialized matrix (numpy/scipy,
 /// e.g. `use_raw`/`layer`) is not a backed/lazy SCX dataset → `false`.
 fn csc_route_available(x: &Bound<'_, PyAny>) -> bool {
-    if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+    if let Some(handle) = crate::accel::backed_dataset_ref(x) {
+        let backed = handle.get();
         // `as_column_source` exposes the *full-axis* CSC reader and ignores an
         // active column projection (a gene subset, e.g. `adata[:, highly_variable]`
         // on a backed file that keeps its sidecar). Routing such a projected
@@ -380,9 +393,7 @@ fn detect_is_log1p(
         }
         Some(std::sync::Arc::clone(&lazy.backed))
     } else {
-        x.extract::<PyRef<ScxBackedSparseDataset>>()
-            .ok()
-            .map(|b| std::sync::Arc::clone(&b.backed))
+        crate::accel::backed_dataset_ref(x).map(|h| std::sync::Arc::clone(&h.get().backed))
     };
 
     if let Some(backed) = backed_arc {

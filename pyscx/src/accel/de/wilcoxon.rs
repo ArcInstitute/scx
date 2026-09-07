@@ -5,7 +5,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::PyDict;
 
 use super::*;
-use crate::backed::ScxBackedSparseDataset;
 use crate::lazy_transform::ScxLazyTransformedDataset;
 
 /// scanpy's `pts` / `pts_rest` tables and the column order they are written in.
@@ -227,7 +226,7 @@ pub(crate) fn run_rank_genes_groups_inner(
     // Select the input matrix + gene names per the use_raw/layer contract
     // (adata.X by default; adata.raw.X with raw var names for use_raw; a named
     // layer otherwise). The selected matrix flows through the same dispatch.
-    let (x, gene_names) = select_de_matrix(adata, use_raw, layer)?;
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer, "rank_genes_groups")?;
 
     // `pts` is indexed by var name and `rank_genes_groups_df` joins on it, so
     // the names must be unique: with a duplicate, any by-name lookup would hand
@@ -328,9 +327,10 @@ fn compute_group_nonzero_counts(
     n_vars: usize,
 ) -> PyResult<scx_accel::GroupNonzeroCounts> {
     let to_err = |e: scx_accel::AccelError| PyRuntimeError::new_err(e.to_string());
-    let counts = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+    let counts = if let Some(handle) = crate::accel::backed_dataset_ref(x) {
+        let backed = handle.get();
         let source = backed.as_shard_source().with_cached_reads();
-        drop(backed);
+        drop(handle);
         py.detach(|| scx_accel::group_nonzero_counts_streaming(&source, group_codes, n_groups))
             .map_err(to_err)?
     } else if let Ok(lazy) = x.extract::<PyRef<ScxLazyTransformedDataset>>() {
@@ -408,10 +408,11 @@ fn dispatch_rank_genes_kernels(
         // hands it to the existing `wilcoxon_rank_sum` kernel.
         let chunk_size = gene_chunk_size.unwrap_or(500);
 
-        if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+        if let Some(handle) = crate::accel::backed_dataset_ref(x) {
+            let backed = handle.get();
             // Validate CSC availability under the GIL, then clone the Arc so
             // the Rust kernel can run without holding the GIL.
-            reject_csc_on_subset(&backed)?;
+            reject_csc_on_subset(backed)?;
             let csc_reader = backed
                 .backed_csc
                 .as_ref()
@@ -421,7 +422,7 @@ fn dispatch_rank_genes_kernels(
                     )
                 })?
                 .clone();
-            drop(backed);
+            drop(handle);
             // Pass the concrete `BackedCscReader` (not `&dyn`) so the
             // closure is `Send` — `dyn ColumnShardSource` is not `Send`.
             let result = py
@@ -493,7 +494,8 @@ fn dispatch_rank_genes_kernels(
         ));
     }
 
-    let result = if let Ok(backed) = x.extract::<PyRef<ScxBackedSparseDataset>>() {
+    let result = if let Some(handle) = crate::accel::backed_dataset_ref(x) {
+        let backed = handle.get();
         // Backed mode: stream shards with gene-chunked DE. Clone the Arc
         // so the kernel runs without holding the GIL.
         let chunk_size = gene_chunk_size.unwrap_or(500);
@@ -516,7 +518,7 @@ fn dispatch_rank_genes_kernels(
         // feature — the CPU branch takes no CSC.
         #[cfg(feature = "gpu")]
         let csc_reader = backed.backed_csc.as_ref().map(std::sync::Arc::clone);
-        drop(backed);
+        drop(handle);
         match gpu_device_id {
             #[cfg(feature = "gpu")]
             Some(device_id) => py
