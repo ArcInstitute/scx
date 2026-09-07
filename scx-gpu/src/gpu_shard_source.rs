@@ -374,7 +374,7 @@ impl<'a> RawGpuShardSource<'a> {
         F: FnMut(usize, &mut GpuCsrSlot) -> Result<(), GpuError>,
         T: FnMut(&GpuDevice, &mut GpuCsrSlot) -> Result<(), GpuError>,
     {
-        let plan = StagingPlan::all(self.source.n_shards(), self.prefetch_depth);
+        let plan = StagingPlan::for_source(self.source, self.prefetch_depth);
         // `ProfiledDecode` still wraps the source, because the prefetch
         // pipeline owns the decode call and inline timing would silently stop
         // reporting host-decode time on the multi-shard path.

@@ -31,6 +31,8 @@
 //! invalidated when pointers move, and that staged data is numerically
 //! identical.
 
+use scx_format_io::ShardSource;
+
 use crate::error::GpuError;
 
 /// Pinned staging slots in the ring. Two is enough to overlap one shard's DMA
@@ -71,6 +73,26 @@ impl StagingPlan {
     /// Plan covering an explicit ascending subset.
     pub(crate) fn selected(indices: Vec<usize>, depth: usize) -> Self {
         Self { indices, depth }
+    }
+
+    /// Plan for a row-major source, honouring a row filter.
+    ///
+    /// A source that filters rows inside `read_shard` answers
+    /// [`ShardSource::visible_shard_indices`] with the shards that still hold
+    /// one; the rest would be decoded, uploaded and found empty. `StagingPlan`
+    /// has to ask, because the driver cannot: it feeds through
+    /// `for_each_shard_ordered_uncached_selected`, which deliberately does not
+    /// consult the hook — second-guessing an explicit plan is how a staging
+    /// path skips a shard it meant to stage. Asking here is what keeps the GPU
+    /// DE routes in step with the CPU ones, which get the skip from the driver.
+    ///
+    /// `drive_shards` already skips an empty shard *after* decoding it; this
+    /// removes the decode.
+    pub(crate) fn for_source<S: ShardSource + ?Sized>(source: &S, depth: usize) -> Self {
+        match source.visible_shard_indices() {
+            Some(indices) => Self::selected(indices, depth),
+            None => Self::all(source.n_shards(), depth),
+        }
     }
 }
 

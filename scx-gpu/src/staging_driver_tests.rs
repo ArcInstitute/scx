@@ -640,3 +640,76 @@ fn drain_error_surfaces_alone_but_never_displaces_a_feed_error() {
         "drain must run even when the feed failed"
     );
 }
+
+// ── StagingPlan::for_source ─────────────────────────────────────────────
+//
+// The GPU DE routes reach the same `prefetch` pipeline the CPU ones do, but
+// through `for_each_shard_ordered_uncached_selected`, which deliberately does
+// not consult `visible_shard_indices`. So the row-projection skip has to be
+// asked for when the plan is built, and this is where. Testable on a CPU host:
+// the plan is arithmetic over the source's answer, with no device in it.
+
+/// A source that answers a plan, as a row-filtering one does.
+struct PlannedSource {
+    n_shards: usize,
+    plan: Option<Vec<usize>>,
+}
+
+impl ShardSource for PlannedSource {
+    fn n_shards(&self) -> usize {
+        self.n_shards
+    }
+    fn n_obs(&self) -> usize {
+        self.n_shards
+    }
+    fn n_vars(&self) -> usize {
+        1
+    }
+    fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+        self.plan.clone()
+    }
+    fn read_shard(&self, _shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+        Ok(scx_sparse::ScxCsr::new_unchecked(
+            (1, 1),
+            vec![0, 0],
+            vec![],
+            vec![],
+        ))
+    }
+}
+
+/// Without this the GPU CSR staging path stages every shard of a row-windowed
+/// handle, decoding and uploading the ones the window empties only for
+/// `drive_shards` to skip them at the far end.
+#[test]
+fn for_source_honours_a_row_filtering_sources_plan() {
+    let src = PlannedSource {
+        n_shards: 5,
+        plan: Some(vec![0, 4]),
+    };
+    let plan = StagingPlan::for_source(&src, 4);
+    assert_eq!(plan.indices, vec![0, 4]);
+    assert_eq!(plan.depth, 4, "the depth is the caller's, not the source's");
+}
+
+/// "No filter" must stay "every shard", not become an empty plan — the arm
+/// every unsubset GPU DE call takes.
+#[test]
+fn for_source_stages_every_shard_when_there_is_no_filter() {
+    let src = PlannedSource {
+        n_shards: 3,
+        plan: None,
+    };
+    assert_eq!(StagingPlan::for_source(&src, 2).indices, vec![0, 1, 2]);
+}
+
+/// A plan that keeps nothing stays empty rather than falling back to the
+/// whole file: `adata[:0]` stages nothing, and `drive_shards` handles it.
+#[test]
+fn for_source_keeps_an_empty_plan_empty() {
+    let src = PlannedSource {
+        n_shards: 3,
+        plan: Some(vec![]),
+    };
+    assert!(StagingPlan::for_source(&src, 2).indices.is_empty());
+}
