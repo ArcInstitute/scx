@@ -229,16 +229,37 @@ impl GroupNonzeroCounts {
 
 /// Counts over a streamed shard source — the backed or lazy `X` the DE ran on.
 ///
-/// Walks every shard once through [`ShardSource::read_shard_arc`]. This is a
+/// Walks the source's shards once through the shared decode-prefetch driver
+/// ([`crate::prefetch::for_each_shard_ordered`]), which means a row projection
+/// skips the shards it empties and the decode overlaps the counting. This is a
 /// second decode of the matrix, not a cache hit: the default four-shard LRU
 /// holds the *last* shards the DE pass touched, so a fresh sequential scan
-/// starting at shard 0 evicts them before it gets there. `groups.len()` must be
-/// the source's `n_obs` (one label per *visible* row — a subset handle streams
-/// its view).
-pub fn group_nonzero_counts_streaming<S: ShardSource + ?Sized>(
+/// starting at shard 0 evicts them before it gets there.
+///
+/// The cached driver, matching the `read_shard_arc` this used to call. On a
+/// `LazyShardSource` — the only type pyscx ever passes — the choice is moot
+/// either way: its `read_shard` delegates to `read_shard_arc`, and the source's
+/// own `cached_reads` flag decides whether the reader's LRU is involved.
+///
+/// `groups.len()` must be the source's `n_obs` (one label per *visible* row — a
+/// subset handle streams its view). `row_offset` is a running count of visible
+/// rows, which stays correct under skipping because a skipped shard would have
+/// contributed none; the trailing coverage check is what makes that falsifiable.
+pub fn group_nonzero_counts_streaming<S: ShardSource + Sync + ?Sized>(
     source: &S,
     groups: &[usize],
     n_groups: usize,
+) -> Result<GroupNonzeroCounts> {
+    group_nonzero_counts_streaming_with_depth(source, groups, n_groups, None)
+}
+
+/// [`group_nonzero_counts_streaming`] with the decode-prefetch depth pinned;
+/// see `wilcoxon_rank_sum_streaming_with_depth` for why the knob exists.
+pub(crate) fn group_nonzero_counts_streaming_with_depth<S: ShardSource + Sync + ?Sized>(
+    source: &S,
+    groups: &[usize],
+    n_groups: usize,
+    depth: Option<usize>,
 ) -> Result<GroupNonzeroCounts> {
     let n_obs = source.n_obs();
     if groups.len() != n_obs {
@@ -248,13 +269,19 @@ pub fn group_nonzero_counts_streaming<S: ShardSource + ?Sized>(
             n_obs
         )));
     }
+    // The accumulator is `n_groups x n_vars` u64s and is not the dense DE
+    // workspace, so the prefetch has the whole budget to fit shards into.
+    let depth = depth.map_or_else(
+        || crate::mem_budget::de_prefetch_depth(source.shard_size_hint(), 0),
+        |d| d.max(1),
+    );
     let mut acc = GroupNonzeroCounts::new(groups, n_groups, source.n_vars());
     let mut row_offset = 0usize;
-    for shard_idx in 0..source.n_shards() {
-        let shard = source.read_shard_arc(shard_idx).map_err(AccelError::Scx)?;
+    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, shard| {
         acc.add_csr(&shard, row_offset, groups)?;
         row_offset += shard.n_rows();
-    }
+        Ok(())
+    })?;
     if row_offset != n_obs {
         return Err(AccelError::ShapeError(format!(
             "group nonzero counts: shards cover {row_offset} rows but the source reports n_obs = {n_obs}"
