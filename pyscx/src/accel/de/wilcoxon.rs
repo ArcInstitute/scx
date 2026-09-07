@@ -55,6 +55,11 @@ pub(crate) fn run_rank_genes_groups_inner(
     layer: Option<&str>,
     pts: bool,
     requested_groups: Option<&[String]>,
+    // The public entry point that called this, for error messages only. Two
+    // ops share this kernel — `rank_genes_groups` and `rank_genes_groups_df`'s
+    // compute mode — and a refusal naming the other one sends the caller
+    // looking at a function they did not call.
+    op: &str,
 ) -> PyResult<RankGenesRun> {
     // Extract group labels from adata.obs[groupby].
     let obs = adata.getattr("obs")?;
@@ -226,7 +231,7 @@ pub(crate) fn run_rank_genes_groups_inner(
     // Select the input matrix + gene names per the use_raw/layer contract
     // (adata.X by default; adata.raw.X with raw var names for use_raw; a named
     // layer otherwise). The selected matrix flows through the same dispatch.
-    let (x, gene_names) = select_de_matrix(adata, use_raw, layer, "rank_genes_groups")?;
+    let (x, gene_names) = select_de_matrix(adata, use_raw, layer, op)?;
 
     // `pts` is indexed by var name and `rank_genes_groups_df` joins on it, so
     // the names must be unique: with a duplicate, any by-name lookup would hand
@@ -1072,6 +1077,7 @@ pub fn rank_genes_groups(
                 layer,
                 false,
                 groups.as_deref(),
+                "rank_genes_groups",
             ) {
                 Ok(run) => {
                     let df = de_result_to_dataframe(py, &run.result, n_genes)?;
@@ -1125,6 +1131,7 @@ pub fn rank_genes_groups(
         layer,
         pts,
         groups.as_deref(),
+        "rank_genes_groups",
     )?;
     let result = &run.result;
 

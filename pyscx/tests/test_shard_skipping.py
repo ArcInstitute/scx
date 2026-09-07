@@ -89,24 +89,39 @@ _PROBE = textwrap.dedent(
     import numpy as np
     import pyscx
 
+    # `<selector>[+lazy]:<op>` — parsed by segment, never by prefix/suffix on
+    # the whole string. An earlier version tested `case.endswith("lazy")`,
+    # which is never true once the op is appended, so both lazy arms silently
+    # ran the non-lazy path and asserted the non-lazy count.
     path, case = sys.argv[1], sys.argv[2]
+    selector, _, op = case.partition(":")
+    parts = selector.split("+")
+    sel, lazy = parts[0], "lazy" in parts[1:]
+    assert sel in ("window", "mask", "all"), sel
+    assert op, case
+
     adata = pyscx.open(path).to_anndata(backed=True)
     n_shards = adata.X.n_shards
 
-    if case.startswith("window"):
+    if sel == "window":
         adata = adata[:24]
-    elif case.startswith("mask"):
+    elif sel == "mask":
         m = np.zeros(adata.n_obs, dtype=bool)
         m[:24] = True
         m[96:] = True
         adata = adata[m]
     assert adata.n_obs > 0
 
-    if case.endswith("lazy"):
+    if lazy:
         pyscx.accel.normalize_total(adata, target_sum=1e4)
         pyscx.accel.log1p(adata)
+        assert type(adata.X).__name__ == "ScxLazyTransformedDataset", type(adata.X)
 
-    op = case.split(":")[1]
+    if op == "mask_var":
+        # PCA under a gene mask wraps the source in `ProjectedShardSource`,
+        # which is a different seam from the bare source.
+        adata.var["highly_variable"] = np.arange(adata.n_vars) % 3 == 0
+        op = "pca"
     pyscx.accel.cpu_profile_reset()
     if op == "sum":
         adata.X.sum(axis=0)
@@ -171,6 +186,40 @@ _OPS = {
 }
 
 
+def test_a_gene_mask_does_not_undo_the_row_skip(path):
+    """`mask_var=` wraps the source in `ProjectedShardSource`.
+
+    That wrapper answered the trait default (`None` = visit every shard) and so
+    discarded the inner source's plan; it now forwards it. Review predicted the
+    CPU HVG → PCA pipeline "still decodes every shard" as a result — **measured,
+    it does not**: with a row subset the masked path decodes 0 counted shard
+    sections either way, because it materialises through the bounded row gather
+    rather than the prefetch driver. The only in-tree caller that wraps a
+    row-filtering source in `ProjectedShardSource` is the GPU dispatch arm
+    (`#[cfg(feature = "gpu")]`), which a CPU build cannot reach, so the forward
+    is pinned directly in
+    `scx-accel/src/projected_source.rs::forwards_the_visible_shard_plan_of_the_inner_source`.
+
+    What is observable here, and worth holding, is the weaker invariant: a gene
+    mask must not make a row-projected read cost *more* than the unprojected
+    one. Asserting the 1 that review asked for would pin a number this code
+    does not produce.
+    """
+    masked_window = _probe(path, "window:mask_var")["decodes"]
+    masked_all = _probe(path, "all:mask_var")["decodes"]
+    plain_window = _probe(path, "window:pca")["decodes"]
+
+    assert masked_all == N_SHARDS, (
+        "premise: without a row projection the masked PCA sweeps every shard "
+        f"(saw {masked_all})"
+    )
+    assert masked_window <= plain_window, (
+        f"a gene mask raised the decode count on a row window from "
+        f"{plain_window} to {masked_window}"
+    )
+    assert masked_window < masked_all
+
+
 @pytest.mark.parametrize("op", sorted(_OPS))
 def test_a_one_shard_window_decodes_one_shard(path, op):
     windowed, whole = _OPS[op]
@@ -209,12 +258,12 @@ def test_a_lazy_transform_chain_also_skips(path):
     raw reader and apply the chain per shard. A skipped shard saves the
     transform pass as well as the decode.
     """
-    lazy = _probe(path, "masklazy:sum")
+    lazy = _probe(path, "mask+lazy:sum")
     assert lazy["decodes"] == 2, (
         f"the lazy chain decoded {lazy['decodes']} shards; shards 1-3 hold no "
         "visible row"
     )
-    assert _probe(path, "alllazy:sum")["decodes"] == N_SHARDS
+    assert _probe(path, "all+lazy:sum")["decodes"] == N_SHARDS
 
 
 # ---------------------------------------------------------------------------
@@ -281,3 +330,74 @@ def test_a_transform_chain_over_a_gapped_subset_uses_the_right_row_offsets(path)
     np.testing.assert_allclose(
         np.asarray(adata.X.sum(axis=0)).ravel(), ref.sum(axis=0), rtol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------
+# A skipped read is still a read, as far as handle freshness is concerned.
+# ---------------------------------------------------------------------------
+
+
+def test_an_all_excluded_projection_still_refuses_a_changed_file(tmp_path):
+    """The regression the skip introduced, and the reason for the up-front check.
+
+    A `pyscx` handle that is asked to read a file which changed since it was
+    opened must raise rather than answer from its obsolete mapping. That check
+    lives in the reader's shard read — so a shard plan with *nothing* in it used
+    to answer without performing any read at all, and the same handle would
+    return zeros for `X.sum(axis=0)` while raising on `X.shape`:
+
+        x = pyscx.open(p).to_anndata(backed=True)[:0].X
+        <mutate the file>
+        x.sum(axis=0)  ->  [[0.0, 0.0, 0.0]]   # before
+        x.shape        ->  RuntimeError: ... changed on disk since it was opened
+
+    A zero vector is not harmless either: a copy-out rewrite can change the gene
+    axis, so the width can be obsolete too. Found by review.
+    """
+    import pyscx
+
+    dense = np.arange(12, dtype=np.float32).reshape(4, 3) + 1
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(4)]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    p = str(tmp_path / "fresh.scx")
+    pyscx.from_anndata(adata, p, shard_size=2)
+
+    x = pyscx.open(p).to_anndata(backed=True)[:0].X
+    assert x.shape[0] == 0, "premise: the projection keeps no row at all"
+
+    drop = np.zeros(4, dtype=bool)
+    drop[1:] = True
+    pyscx.open(p).mark_deleted(drop)
+
+    for label, call in [
+        ("sum(axis=0)", lambda: x.sum(axis=0)),
+        ("getnnz(axis=0)", lambda: x.getnnz(axis=0)),
+        ("shape", lambda: x.shape),
+    ]:
+        if label == "shape":
+            with pytest.raises(RuntimeError, match="changed on disk"):
+                call()
+            continue
+        with pytest.raises(RuntimeError, match="changed on disk"):
+            call()
+
+
+def test_an_all_excluded_projection_still_answers_on_an_unchanged_file(tmp_path):
+    """The accept side: the freshness check must not reject a valid empty read."""
+    import pyscx
+
+    dense = np.arange(12, dtype=np.float32).reshape(4, 3) + 1
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(4)]),
+        var=pd.DataFrame(index=["g0", "g1", "g2"]),
+    )
+    p = str(tmp_path / "unchanged.scx")
+    pyscx.from_anndata(adata, p, shard_size=2)
+
+    x = pyscx.open(p).to_anndata(backed=True)[:0].X
+    np.testing.assert_array_equal(np.asarray(x.sum(axis=0)).ravel(), [0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(np.asarray(x.getnnz(axis=0)).ravel(), [0, 0, 0])

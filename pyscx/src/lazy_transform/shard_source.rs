@@ -184,6 +184,15 @@ impl scx_format_io::ShardSource for LazyShardSource {
     /// untouched.
     fn visible_shard_indices(&self) -> Option<Vec<usize>> {
         let kept = self.kept_to_global.as_ref()?;
+        // A plan can be empty (nothing kept in any shard), and an empty plan
+        // performs no `read_shard` — which is where a watching reader checks
+        // that the file has not changed underneath it. Rather than teach this
+        // hook to fail, answer `None` when the file is stale: the driver then
+        // visits every shard and the first read raises, exactly as it did
+        // before there was a plan at all.
+        if self.backed.check_fresh().is_err() {
+            return None;
+        }
         Some(self.backed.index().shards_with_kept_rows(kept))
     }
 

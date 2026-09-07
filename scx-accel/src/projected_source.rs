@@ -68,6 +68,16 @@ impl<S: ShardSource + ?Sized> ShardSource for ProjectedShardSource<'_, S> {
         Ok(Arc::new(scx_engine::project_csr(&full, &self.cols)))
     }
 
+    /// Forwarded: a column projection changes the width of a shard, never
+    /// which shards hold a visible row. Without this the wrapper answers the
+    /// trait default (`None` = visit every shard) and swallows the inner
+    /// source's row-projection skip — which is the composition PCA takes
+    /// whenever `mask_var=` is set (`adata.var["highly_variable"]` is
+    /// auto-consumed), i.e. the HVG → PCA pipeline on a row subset.
+    fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+        self.inner.visible_shard_indices()
+    }
+
     fn shard_cache_capacity(&self) -> Option<usize> {
         self.inner.shard_cache_capacity()
     }
@@ -104,6 +114,60 @@ mod tests {
             data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             shape: (3, 4),
         }
+    }
+
+    /// A source that filters rows tells the prefetch drivers which shards can
+    /// still contribute one; a wrapper that does not forward that answers the
+    /// trait default (`None` = visit every shard) and silently discards the
+    /// plan. A column projection changes a shard's *width*, never which shards
+    /// hold a visible row, so forwarding is unconditionally right.
+    ///
+    /// Pinned here rather than through a decode count: the only in-tree caller
+    /// that wraps a row-filtering source is the **GPU** PCA dispatch arm
+    /// (`#[cfg(feature = "gpu")]`), so a CPU build cannot observe it end to end.
+    #[test]
+    fn forwards_the_visible_shard_plan_of_the_inner_source() {
+        struct Planned<'a> {
+            csr: &'a ScxCsr,
+            plan: Option<Vec<usize>>,
+        }
+        impl ShardSource for Planned<'_> {
+            fn n_shards(&self) -> usize {
+                3
+            }
+            fn n_obs(&self) -> usize {
+                self.csr.shape.0
+            }
+            fn n_vars(&self) -> usize {
+                self.csr.shape.1
+            }
+            fn read_shard(&self, _idx: usize) -> scx_format_io::Result<ScxCsr> {
+                Ok(self.csr.clone())
+            }
+            fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+                self.plan.clone()
+            }
+        }
+
+        let csr = csr_3x4();
+        let planned = Planned {
+            csr: &csr,
+            plan: Some(vec![0, 2]),
+        };
+        let proj = ProjectedShardSource::new(&planned, vec![0, 3]);
+        assert_eq!(
+            proj.visible_shard_indices(),
+            Some(vec![0, 2]),
+            "the projection must not swallow the inner source's shard plan"
+        );
+
+        // And "no filter" stays "no filter", rather than becoming an empty plan.
+        let unfiltered = Planned {
+            csr: &csr,
+            plan: None,
+        };
+        let proj = ProjectedShardSource::new(&unfiltered, vec![0, 3]);
+        assert_eq!(proj.visible_shard_indices(), None);
     }
 
     #[test]

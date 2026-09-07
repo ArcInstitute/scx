@@ -441,6 +441,15 @@ impl BackedCsrReader {
     /// `col_sums_masked()` + `col_nnz_masked()`, which walk the same rows in
     /// the same order — this just decodes each shard once instead of twice.
     pub fn col_sums_and_nnz_masked(&self, kept_rows: &[u64]) -> Result<(Vec<f64>, Vec<u32>)> {
+        // A stale file must raise, and the plan below can be empty: with no
+        // kept row in any shard there is no `read_shard` left to perform the
+        // freshness check a watching reader relies on, so the call would answer
+        // zeros from an obsolete mapping while `shape` on the same handle
+        // raises. Check up front, where it is unconditional. (This also closes
+        // the pre-existing `n_kept == 0` early return below, which never read
+        // either.)
+        self.check_fresh()?;
+
         let mut sums = vec![0.0f64; self.n_vars];
         let mut counts = vec![0u32; self.n_vars];
 
@@ -487,6 +496,15 @@ impl BackedCsrReader {
 
     /// Column variance considering only the kept rows.
     pub fn col_var_masked(&self, kept_rows: &[u64]) -> Result<Vec<f64>> {
+        // A stale file must raise, and the plan below can be empty: with no
+        // kept row in any shard there is no `read_shard` left to perform the
+        // freshness check a watching reader relies on, so the call would answer
+        // zeros from an obsolete mapping while `shape` on the same handle
+        // raises. Check up front, where it is unconditional. (This also closes
+        // the pre-existing `n_kept == 0` early return below, which never read
+        // either.)
+        self.check_fresh()?;
+
         let n_kept = kept_rows.len();
         if n_kept == 0 {
             return Ok(vec![0.0f64; self.n_vars]);
@@ -538,6 +556,15 @@ impl BackedCsrReader {
 
     /// Internal: masked column aggregation over kept rows.
     fn col_aggregate_masked(&self, kept_rows: &[u64], op: AggOp) -> Result<Vec<f64>> {
+        // A stale file must raise, and the plan below can be empty: with no
+        // kept row in any shard there is no `read_shard` left to perform the
+        // freshness check a watching reader relies on, so the call would answer
+        // zeros from an obsolete mapping while `shape` on the same handle
+        // raises. Check up front, where it is unconditional. (This also closes
+        // the pre-existing `n_kept == 0` early return below, which never read
+        // either.)
+        self.check_fresh()?;
+
         let n_kept = kept_rows.len();
         let mut result = match op {
             AggOp::Sum | AggOp::Nnz => vec![0.0f64; self.n_vars],

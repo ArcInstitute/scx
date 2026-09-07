@@ -561,6 +561,7 @@ pub fn rank_genes_groups_df(
         None,  // layer
         false, // pts: cell-eval's DEResults schema has no fraction-expressing column
         None,  // groups: every group, as the schema consumers expect
+        "rank_genes_groups_df",
     )?;
     let result = run.result;
 

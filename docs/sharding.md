@@ -521,6 +521,9 @@ Two mechanisms, because the row set arrives two ways:
   `ShardSource::visible_shard_indices`, which the lazy source overrides and the
   decode-prefetch drivers consult before scheduling a read. The default is
   `None` — "visit every shard" — so a source without a row filter is unaffected.
+  An adapter that wraps such a source must forward the hook or it discards the
+  plan; `ProjectedShardSource` (a column projection, which changes a shard's
+  width and never which shards hold a visible row) does.
 
 Measured on a 120 x 200 file in 5 shards of 24 rows, counting shard decodes:
 
@@ -533,6 +536,14 @@ Measured on a 120 x 200 file in 5 shards of 24 rows, counting shard decodes:
 | `score_genes` / `pca`, one-shard window | 1 |
 | `highly_variable_genes(flavor="seurat_v3")` (two passes), one-shard window | 2 of 10 |
 | `normalize_total` + `log1p` chain, two-shard mask | 2 |
+
+A plan can also be **empty** — a projection that keeps no row in any shard, as
+`adata[:0]` does. That is where skipping needed care rather than just wiring: the
+per-shard read is what checks that the file has not changed since the handle was
+opened, so an empty plan would have answered zeros from a possibly-obsolete
+mapping while `shape` on the same handle raised. The masked kernels therefore
+check freshness up front, unconditionally, and the lazy source reports "no plan"
+on a stale file so the driver falls back to reading and raises.
 
 The saving scales with how much of the file the projection excludes, so it is
 largest exactly where it matters: a per-batch or per-condition view of an atlas.
