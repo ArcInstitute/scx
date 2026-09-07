@@ -765,6 +765,60 @@ a rayon worker — the GPU staging path is now fully sequential, where the old d
 "no ambient parallelism" configuration, and the worker-thread guard is what keeps a
 nested call from deadlocking.
 
+### Decode-prefetch reaches the DE kernels (X10)
+
+Task 4.2 wired every loop that could reach the pipeline. The three streaming DE
+kernels could not: `wilcoxon_rank_sum_streaming`, `pdex_ref_streaming` and the
+`pts` counting pass each ran their own `for shard_idx in 0..n_shards`, so neither
+knob above governed them and neither did the row-projection shard skip the
+`ShardSource::visible_shard_indices` hook gives every driver consumer. They now
+share one `fill_gene_chunk_dense` over `for_each_shard_ordered`.
+
+DE is where this matters most because its shard walk is **inner** to its
+gene-chunk walk: every visited shard is read once per gene chunk, so the cost is
+`n_gene_chunks × visited shards`. Two separable effects, measured separately.
+
+**The row-projection skip**, counted in shard decodes (`SCX_CPU_PROFILE=1`, a
+120 × 200 file in 5 shards of 24, `cache_shards=0` so every read is a decode):
+
+| request | before | after |
+|---|--:|--:|
+| `rank_genes_groups` / `pdex_ref`, one-shard row window | 5 | **1** |
+| `rank_genes_groups(pts=True)` (two passes), one-shard window | 10 | **2** |
+| `rank_genes_groups(gene_chunk_size=64)` → 4 chunks, one-shard window | 20 | **4** |
+| `rank_genes_groups`, 4 chunks, two-shard mask | 20 | **8** |
+| any of them, no row projection | 5 / 10 / 20 | unchanged |
+
+**The decode-prefetch**, wall-clock, on a full-file DE where no rows are skipped
+(20 000 cells × 1 000 genes, density 0.2, 10 shards, `gene_chunk_size=125` → 8
+chunks; `SCX_ACCEL_PREFETCH_DEPTH=1` against the default 4, best of 3):
+
+| shard cache | depth 1 | depth 4 | Speedup |
+|---|--:|--:|--:|
+| `cache_shards=0` (every read decodes) | 6.24 s | 2.52 s | **2.48×** |
+| `cache_shards=16` (holds the file) | 2.27 s | 1.83 s | 1.24× |
+| one-shard row window, either cache | 0.65 / 0.24 s | 0.65 / 0.24 s | ~1.0× |
+
+The cache row is the honest ceiling: with the LRU sized to the file only the
+first gene chunk misses, so there is one pass of decode to overlap rather than
+eight. The row-window row is flat by construction — a one-shard plan has nothing
+to prefetch ahead of, and the pipeline's `n_shards <= 1` guard takes the
+sequential path.
+
+This is a **local** measurement on a synthetic fixture, not a gated capture:
+`accel_de`'s CPU arms run on the in-memory `AnnData` and so exercise
+`wilcoxon_rank_sum_sparse`, not the streaming kernel. The scenario that does
+reach it is `bench_csc_dispatch`'s `bench_csc__de_csr` / `bench_csc__pdex_ref_csr`
+on `tabula_sapiens_100k`, and neither carries a floor in `thresholds.yaml`.
+
+Peak memory is bounded rather than assumed: the pipeline holds `depth` decoded
+shards where the loop held one, and `scx_accel::mem_budget::de_prefetch_depth`
+grants only what the dense `n_obs × chunk` workspace left of
+`SCX_ACCEL_DE_MEMORY_BUDGET`. A budget-bound file therefore resolves to depth 1
+and keeps its pre-change footprint; on a plain backed handle the in-flight
+`Arc`s are the same ones the LRU already holds, so there is no second copy at
+all. The GPU CSR staging plan learned the same skip (`StagingPlan::for_source`).
+
 ### GPU DE device residency + gene-chunk windowing (Phase-4 task 4.5)
 
 4.2 widened GPU staging's decode; it did not reduce how much decoding there was.

@@ -172,10 +172,13 @@ impl scx_format_io::ShardSource for LazyShardSource {
     /// decode, the transform pass and the column projection all paid for
     /// nothing. Answering here lets the `prefetch` drivers skip the read
     /// entirely, which every consumer of `as_shard_source()` gets for free:
-    /// PCA (six to seven passes), HVG, `score_genes`, `pflog`. Not the streaming
-    /// Wilcoxon / pdex kernels: those run their own `0..n_shards` loop per gene
-    /// chunk instead of the drivers, so nothing consults this — measured, they
-    /// still decode every shard under a row window.
+    /// PCA (six to seven passes), HVG, `score_genes`, `pflog`, and the DE
+    /// kernels — Wilcoxon, pdex and the `pts` counting pass. The DE ones ran
+    /// their own `0..n_shards` loop per gene chunk until they adopted the
+    /// drivers, so nothing consulted this and they decoded every shard under a
+    /// row window; they are also where it pays most, because their shard walk
+    /// is inner to the gene-chunk walk (5 decodes to 1 on a one-shard window,
+    /// 20 to 4 at four gene chunks).
     ///
     /// Behaviourally identical to today, not merely close: a consumer that
     /// received the empty shard added nothing to its accumulators, and the

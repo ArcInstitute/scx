@@ -70,7 +70,8 @@ two of its three consumers and both sit below `scx-accel` in the crate graph.
 and the `SCX_ACCEL_PREFETCH_DEPTH` / `SCX_ACCEL_REDUCTION_MODE` knobs are
 unchanged — those knobs now also govern the backed aggregation kernels
 (`row_sums`, `col_sums`, `col_var`, the QC/filter passes, …), pyscx's
-column-projected and lazy/transformed twins, and GPU staging.
+column-projected and lazy/transformed twins, the streaming DE kernels, and
+GPU staging.
 
 Two constraints on callers:
 
@@ -454,7 +455,7 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 | Accelerator | Threading model |
 |-------------|----------------|
 | **PCA** (covariance / randomized) | Bounded ordered decode-prefetch on the global pool; covariance and transpose SpMM partition their **output** columns across workers into one shared accumulator (no merge); row-disjoint `par_chunks_mut` for the forward SpMM |
-| **Differential expression** (Wilcoxon rank-sum) | `par_iter` over genes |
+| **Differential expression** (Wilcoxon rank-sum, pdex ref-mode, the `pts` counting pass) | `par_iter` over genes for the ranking; on a backed or lazy `X` the per-gene-chunk shard walk goes through the bounded ordered decode-prefetch, so a row projection skips the shards it empties and decode overlaps the ranking. Depth is granted from whatever the dense `n_obs x chunk` workspace left of `SCX_ACCEL_DE_MEMORY_BUDGET` |
 | **NB-GLM** (DESeq2-style DE) | `par_iter` over genes for IRLS, shrinkage refit, and Wald inference |
 | **Harmony** batch integration | Per-op `rayon::ThreadPool`; tiled cell updates via `par_chunks` |
 | **Leiden** clustering | Conflict-free parallel batching via `par_iter` |

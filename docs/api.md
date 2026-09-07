@@ -2602,6 +2602,35 @@ backed SCX file that has a CSC sidecar — see
 [scanpy.md § GPU-supported vs GPU-fast](scanpy.md#gpu-supported-vs-gpu-fast).
 Confirm which path actually ran via the [route metadata](#accelerator-route-metadata).
 
+#### `gene_chunk_size` and DE memory
+
+`rank_genes_groups`, `rank_genes_groups_df`, `pdex_ref` and `pdex_nb_glm` process
+genes in chunks, densifying `n_obs × gene_chunk_size` `f32` per chunk (default
+`None` → 500 genes) and ranking that. The chunk is clamped to
+`SCX_ACCEL_DE_MEMORY_BUDGET` (default 4 GiB) — an atlas-scale `n_obs` with a
+large chunk would otherwise request hundreds of GB — and a request that cannot
+fit even 32 genes raises rather than letting the allocation fail.
+
+On a **backed or lazy** `X` the shard walk is *inner* to the chunk walk: every
+shard the call visits is read once per gene chunk. Three things follow.
+
+- **Size the decoded-shard LRU to the shards the call visits**
+  (`to_anndata(backed=True, cache_shards=…)`), or each chunk re-decodes what the
+  last one evicted. Below that, pyscx warns once per call — against the *visited*
+  shard count, so a row-windowed read is not told to size a cache for the whole
+  file.
+- **A row projection skips the shards it empties** — a deletion vector,
+  `adata[mask]`, `adata[:n]` — so the cost is `n_gene_chunks × visited shards`,
+  not `× n_shards`. See
+  [docs/sharding.md § Row-projected reads](sharding.md#row-projected-reads-skip-whole-shards).
+- **Decode is prefetched** up to `SCX_ACCEL_PREFETCH_DEPTH` (default 4) shards
+  ahead, bounded by whatever the dense workspace left of the DE budget. The
+  pipeline holds `depth` decoded shards where a sequential loop held one; on a
+  plain backed handle those are the same objects the LRU already holds, so the
+  extra cost appears only where the handle rebuilds each shard (a view, or a
+  lazy transform chain), and a budget-bound file resolves to depth 1 and keeps
+  its sequential footprint.
+
 - `pyscx.accel.pca(adata, n_comps=50, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", prefer_format="csr", allow_tf32=False, spmm_policy="default", memory_budget=None, mask_var=None)` — Randomized/covariance SVD PCA with streaming SpMM. Writes `obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]` (incl. `uns["pca"]["params"]`). On GPU: cuSPARSE SpMM + cuSOLVER QR (f32). **`mask_var`** (scanpy semantics): a var-column name, a boolean array of length `n_vars`, or `None`. `None` auto-consumes `adata.var["highly_variable"]` when present, else uses all genes. PCA runs on the selected columns only (backed/lazy/in-memory alike, no materialization — via a column-projecting shard source), while `varm["PCs"]` stays aligned to the **full** `var` axis (excluded vars filled with 0). An all-false mask or a length mismatch raises `ValueError`. **`memory_budget`** (`"8G"`, `"512M"`, bytes, or `None` → 8 GiB) is the RAM ceiling for out-of-core PCA on a backed `X`. Out-of-core PCA re-reads every shard once per pass — ~6–7 passes for randomized, 3 for covariance — so the budget sizes a decoded-shard LRU that lets each shard decode once per pass instead of once per *read*; a budget too small to hold the working set logs a warning and the passes re-decode. It also bounds decode-prefetch, on every input shape: up to `depth` shards decode concurrently ahead of the reduction, and the depth is resolved against this ceiling rather than taken from the process-wide default. On a backed `X` the reserve comes out of the shard LRU, so worst-case live bytes are `budget + one shard` — the same high-water the pre-prefetch loop had. A lazy/transformed `X` has no LRU, so the ceiling bounds the pipeline directly; a shard larger than the budget falls back to depth 1 and prefetches nothing. Prefetch depth is `SCX_ACCEL_PREFETCH_DEPTH` (default 4, capped by the rayon pool and by `SCX_ACCEL_NUM_THREADS`); setting it to `1` disables the pipeline and restores the strictly sequential decode.
 - `pyscx.accel.neighbors(adata, n_neighbors=15, use_rep="X_pca", random_state=0, ef_construction=200, ef_search=200, device="auto")` — kNN graph + UMAP-style connectivities. CPU: HNSW. In-VRAM `device="gpu"` routes to rapids-singlecell (`rsc.pp.neighbors`); the native standalone CAGRA dispatch was removed, so with rapids absent / `SCX_FORCE_NATIVE_GPU=1` the standalone op falls back to CPU HNSW (device-resident CAGRA survives only inside the fused `pca_neighbors` path). Writes `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`.
 - `pyscx.accel.pca_neighbors(adata, n_comps=50, n_neighbors=15, zero_center=True, random_state=0, n_oversamples=10, n_power_iterations=2, device="auto", method="auto", qr_method="householder", use_rep="X_pca", prefer_format="csr")` — Fused PCA → kNN in one call. For an in-memory `X`, in-VRAM `device="gpu"` routes to the rapids-singlecell pipeline (`rsc.pp.pca` → `rsc.pp.neighbors`, route `rapids_singlecell_gpu`). For backed/lazy `X` (or under `SCX_FORCE_NATIVE_GPU=1`) the native device-resident path runs: the PCA embedding stays GPU-resident and feeds straight into CAGRA (no `X_pca` host round-trip), recording route `gpu_device_resident`. With neither GPU path available it falls back to sequential `pca` + `neighbors`. Writes the union of both ops' slots (`obsm["X_pca"]`, `varm["PCs"]`, `uns["pca"]`, `obsp["distances"]`, `obsp["connectivities"]`, `uns["neighbors"]`). **Note:** the fused entry points do not expose `mask_var`; the CPU/rapids routes delegate to `pca()` and so auto-consume `adata.var["highly_variable"]` when present, but the native device-resident GPU route analyzes all genes — so the PCA gene set is route-dependent when HVGs are flagged. For a deterministic HVG-masked pipeline, run `pca(mask_var=...)` then `neighbors()`/`umap()` separately. See [docs/scanpy.md § Fused PCA → kNN](scanpy.md#fused-pca--knn-pyscxaccelpca_neighbors).
