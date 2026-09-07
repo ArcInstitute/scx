@@ -108,7 +108,30 @@ pub fn score_genes<'py>(
     // gene_list is resolved against var_names (presentation order) but the
     // ShardSource gathers in sorted-projection order — a presentation-ordered
     // backed X would score the wrong physical columns. Reject loudly.
-    super::prepare_target(py, adata, "score_genes")?;
+    // Deliberately the no-var-guard prologue: the
+    // `reject_presentation_ordered_source` call below guards the matrix this
+    // op will actually read, which is `adata.layers[layer]` when `layer=` was
+    // given. Keeping the X-only check here made the documented remedy
+    // impossible — materialise the layer, and the op still refused because
+    // `adata.X` was presentation-ordered, while the matrix it was about to
+    // read was fine.
+    super::prepare_target_no_var_guard(py, adata, "score_genes")?;
+
+    // Resolve the matrix and guard it **here**, before `adata.var` is read: a
+    // caller whose gene axis is in a requested order should be told about the
+    // axis, not handed a downstream symptom. This fixture makes the difference
+    // concrete — `var.index` holds ENSG ids while `var_names=` selected through
+    // a symbol column, so resolving the gene list first reports "no genes from
+    // gene_list were found", which is true and useless.
+    let x = match layer {
+        // Same typed error as `select_de_matrix` / `calculate_qc_metrics`
+        // rather than the mapping's bare `KeyError`.
+        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
+            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
+        })?,
+        None => adata.getattr("X")?,
+    };
+    super::reject_presentation_ordered_source(&x, "score_genes")?;
 
     // Validate `device=` like every other accel op (round-2 review: this op
     // previously skipped `resolve_device`, so `device="tpu"` was silently
@@ -240,18 +263,6 @@ pub fn score_genes<'py>(
     };
 
     // ── Select the source matrix (layer or X) ───────────────────────────
-    let x = match layer {
-        // Same typed error as `select_de_matrix` / `calculate_qc_metrics`
-        // rather than the mapping's bare `KeyError`.
-        Some(name) => adata.getattr("layers")?.get_item(name).map_err(|_| {
-            PyValueError::new_err(format!("layer '{name}' not found in adata.layers"))
-        })?,
-        None => adata.getattr("X")?,
-    };
-
-    // `prepare_target` only inspected `adata.X`; guard the matrix actually read.
-    super::reject_presentation_ordered_source(&x, "score_genes")?;
-
     // ── Dispatch: backed → lazy → in-memory, all via ShardSource ─────────
     if let Some(parts) = backed_shard_parts(&x) {
         let source = build_shard_source(

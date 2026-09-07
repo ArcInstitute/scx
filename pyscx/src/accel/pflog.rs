@@ -121,7 +121,14 @@ pub fn pflog(
     }
     // Builds a ShardSource over the sorted projection; a presentation-ordered
     // backed X (preserve_var_order=True) would misalign the result against var.
-    super::prepare_target(py, adata, "pflog")?;
+    // Deliberately the no-var-guard prologue: the
+    // `reject_presentation_ordered_source` call below guards the matrix this
+    // op will actually read, which is `adata.layers[layer]` when `layer=` was
+    // given. Keeping the X-only check here made the documented remedy
+    // impossible — materialise the layer, and the op still refused because
+    // `adata.X` was presentation-ordered, while the matrix it was about to
+    // read was fine.
+    super::prepare_target_no_var_guard(py, adata, "pflog")?;
     // Validate `device=` like every other accel op (round-2 review: this op
     // previously skipped `resolve_device`, so an invalid string was silently
     // treated as GPU intent in the route stamp instead of raising).

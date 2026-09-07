@@ -273,8 +273,8 @@ def _matches(
     return len(runtime) in reachable
 
 
-def _leading_signatures(line: str) -> list[tuple[bool, str, int]]:
-    """The bullet's leading run of signatures: `(qualified, name, paren_idx)`.
+def _leading_signatures(line: str) -> list[tuple[bool, str, str]]:
+    """The bullet's leading run of signatures: `(qualified, name, arg_text)`.
 
     Bullets in these files are `` - `sig`[, `sig`…] — prose ``, and a signature
     may carry a return annotation (`` `f(x) -> T` ``). Only that leading run is
@@ -288,7 +288,7 @@ def _leading_signatures(line: str) -> list[tuple[bool, str, int]]:
     if not m:
         return []
     pos = m.end()
-    out: list[tuple[bool, str, int]] = []
+    out: list[tuple[bool, str, str]] = []
     while True:
         m = re.compile(r"`(pyscx\.accel\.)?([A-Za-z_]\w*)\(").match(line, pos)
         if not m:
@@ -296,7 +296,7 @@ def _leading_signatures(line: str) -> list[tuple[bool, str, int]]:
         body = _balanced_group(line, m.end() - 1)
         if body is None:
             return out
-        out.append((m.group(1) is not None, m.group(2), m.end() - 1))
+        out.append((m.group(1) is not None, m.group(2), body))
         # Past the closing paren: an optional return annotation, the closing
         # backtick, then `, ` / ` / ` to continue the run.
         after = line.index(")", m.end() - 1 + len(body))
@@ -339,7 +339,7 @@ def _collect() -> tuple[list[tuple[str, int, str, str]], list[str]]:
         for lineno, line in enumerate(text.splitlines(), 1):
             if line.startswith("## "):
                 in_accel_section = line.strip() == _ACCEL_SECTION
-            for qualified, name, paren in _leading_signatures(line):
+            for qualified, name, body in _leading_signatures(line):
                 if mode == "qualified" and not qualified:
                     continue
                 fn = getattr(accel, name, None)
@@ -347,7 +347,7 @@ def _collect() -> tuple[list[tuple[str, int, str, str]], list[str]]:
                     if qualified or in_accel_section:
                         unresolved.append(f"{rel}:{lineno} `{name}`")
                     continue
-                found.append((rel, lineno, name, _balanced_group(line, paren) or ""))
+                found.append((rel, lineno, name, body))
     return found, unresolved
 
 

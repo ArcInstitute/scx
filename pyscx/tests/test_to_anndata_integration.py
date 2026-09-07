@@ -579,7 +579,14 @@ def test_accel_ops_reject_preserve_var_order(tmp_dir, op):
         elif op == "log1p":
             accel.log1p(ad)
         elif op == "score_genes":
-            accel.score_genes(ad, ["SYM_5", "SYM_1"])
+            # Resolvable gene names on purpose. `_gene_symbol_adata`'s
+            # `var.index` holds ENSG ids while `var_names=` above selected
+            # through the disjoint `gene_symbol` column, so `["SYM_5", "SYM_1"]`
+            # is not in `adata.var_names` at all — this arm used to pass only
+            # because the prologue raised before the gene list was resolved.
+            # With the axis guard now on the resolved matrix, an unresolvable
+            # list would report "no genes from gene_list were found" instead.
+            accel.score_genes(ad, list(ad.var_names[:2]))
         else:
             # This guard is what lets calculate_qc_metrics index its per-column
             # qc_var bitmask by `adata.var` position: it holds only while the

@@ -135,7 +135,13 @@ _PROBE = textwrap.dedent(
     elif op == "getnnz":
         adata.X.getnnz(axis=0)
     elif op == "var":
-        pyscx.accel.col_var(adata.X)
+        # `col_var` takes the handle; on a lazy `X` the equivalent is the
+        # handle's own reduction, so this op works for `+lazy` cases too rather
+        # than raising on a type `col_var` does not accept.
+        if type(adata.X).__name__ == "ScxLazyTransformedDataset":
+            adata.X.var(axis=0)
+        else:
+            pyscx.accel.col_var(adata.X)
     elif op == "score_genes":
         pyscx.accel.score_genes(
             adata, ["g0", "g1", "g2"], method="mean", device="cpu"
