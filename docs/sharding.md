@@ -501,6 +501,82 @@ enabling per-shard adaptive codec selection and mixed integer/float layers.
 
 For the full binary specification, see [format.md §CSR Shard Internal Layout](format.md#4-csr-shard-internal-layout).
 
+## Row-projected reads skip whole shards
+
+A row projection — a deletion vector, `adata[mask]`, an `adata[:n]` window — is
+carried as `kept_to_global`, a strictly ascending list of the physical rows still
+visible. The streaming aggregation kernels intersect it with each shard's row
+range and visit only the rows inside; a shard the projection empties therefore
+contributes nothing, and is not read at all.
+
+Two mechanisms, because the row set arrives two ways:
+
+- **Kernels that take the row set as an argument** (`col_sums_masked`,
+  `col_nnz_masked`, `col_max_masked`, `col_min_masked`, `col_var_masked`,
+  `col_sums_and_nnz_masked`, and their column-projected twins) ask
+  `BackedCsrIndex::shards_with_kept_rows` for the shard list up front. That is
+  catalog arithmetic — two `partition_point`s per shard, no I/O.
+- **Kernels that stream a `ShardSource`** (PCA, HVG, `score_genes`, `pflog`)
+  cannot see the row set: it belongs to the source. Those go through
+  `ShardSource::visible_shard_indices`, which the lazy source overrides and the
+  decode-prefetch drivers consult before scheduling a read. The default is
+  `None` — "visit every shard" — so a source without a row filter is unaffected.
+  An adapter that wraps such a source must forward the hook or it discards the
+  plan; `ProjectedShardSource` (a column projection, which changes a shard's
+  width and never which shards hold a visible row) does — without it,
+  `pca(mask_var=…)`, and so the HVG → PCA pipeline, decoded all five shards of
+  the fixture below instead of one. The tolerant reduction arm
+  (`SCX_ACCEL_REDUCTION_MODE=parallel_tolerant`, which HVG `flavor="seurat"`
+  uses) consults the plan too, so the saving does not depend on the mode.
+
+Measured on a 120 x 200 file in 5 shards of 24 rows, counting shard decodes:
+
+| request | shards decoded |
+|---|---|
+| `X.sum(axis=0)` / `X.getnnz(axis=0)`, no projection | 5 |
+| the same, over a one-shard window | 1 |
+| the same, over a mask covering shards 0 and 4 | 2 |
+| `col_var` (two passes), one-shard window | 2 of 10 |
+| `score_genes` / `pca`, one-shard window | 1 |
+| `pca(mask_var=…)`, one-shard window (5 without the adapter forward) | 1 |
+| `highly_variable_genes(flavor="seurat_v3")` (two passes), one-shard window | 2 of 10 |
+| `normalize_total` + `log1p` chain, two-shard mask | 2 |
+
+A plan can also be **empty** — a projection that keeps no row in any shard, as
+`adata[:0]` does. That is where skipping needed care rather than just wiring: the
+per-shard read is what checks that the file has not changed since the handle was
+opened, so an empty plan would have answered zeros from a possibly-obsolete
+mapping while `shape` on the same handle raised. Every kernel that builds a plan
+therefore checks freshness up front, unconditionally — the six masked column
+kernels, their six column-projected twins, and the three transform-aware ones —
+and the lazy source reports "no plan" on a stale file so a driver consumer falls
+back to reading and raises. (Two of those checks also close a hole that predated
+the skip: the variance kernels' `n_kept == 0` early return never read either.)
+
+The saving scales with how much of the file the projection excludes, so it is
+largest exactly where it matters: a per-batch or per-condition view of an atlas.
+Results are unchanged — a skipped shard's rows were already contributing nothing
+— with one subtlety that is *not* free: a transform chain is applied per shard at
+a global row offset, which now comes from the shard's own `row_start` rather
+than a running count of rows seen, since a running count under-counts once a
+shard is skipped.
+
+Two families are **not** covered — the first by design, the second measured
+rather than assumed:
+
+- Row-*axis* kernels, deliberately. `calculate_qc_metrics`' fused row pass writes
+  into `n_obs`-length vectors and ends by checking that the shards it saw tile
+  `[0, n_obs)`; it applies its row projection after the pass, so its shard count
+  is unchanged by design.
+- **The streaming Wilcoxon / pdex kernels, not yet.** They do not use the
+  decode-prefetch drivers at all — each gene chunk runs its own
+  `for shard_idx in 0..n_shards` loop — so consulting the source never happens.
+  Measured: `rank_genes_groups` and `pdex_ref` on a one-of-five-shard row window
+  still decode 5 shards. Routing them through the drivers would pick up the skip
+  *and* the decode-prefetch they currently lack, at `n_gene_chunks x n_shards`
+  scale; it is a separate change to that kernel, with its own row-offset cursor
+  to rebase.
+
 ## Row-group framing & scattered reads
 
 A shard's `Block Index` is what lets a scattered read decode only the row-groups it

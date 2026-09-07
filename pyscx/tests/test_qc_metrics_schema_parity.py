@@ -820,3 +820,28 @@ def test_a_dask_x_is_refused_rather_than_silently_computed():
     )
     pyscx.accel.calculate_qc_metrics(dense_ok)
     assert "total_counts" in dense_ok.obs
+
+
+@pytest.mark.parametrize("op", _layer_ops())
+def test_a_materialised_layer_is_enough_even_when_x_stays_ordered(tmp_dir, op):
+    """The accept side of the guard, for every op that resolves `layer=`.
+
+    The refusal tells the caller to materialise "the matrix the op reads", and
+    `docs/api.md` says each op is guarded on the matrix it selects rather than
+    on `X`. Both were false while these prologues ran the X-only check *before*
+    resolving `layer=`: materialising `counts` and asking for `layer="counts"`
+    was still refused, over a matrix the op was not going to read. The prologue
+    is now the no-var-guard variant; the per-op
+    `reject_presentation_ordered_source` call on the resolved matrix is the
+    single guard, and the sibling test above still pins the opposite
+    arrangement — a materialised `X` with an *ordered* layer must refuse.
+    """
+    import pyscx
+
+    path = _ordered_fixture(tmp_dir)
+    adata = pyscx.open(path).to_anndata(
+        backed=True, var_names=["g2", "g0"], preserve_var_order=True
+    )
+    assert list(adata.var_names) == ["g2", "g0"], "premise: request order kept"
+    adata.layers["counts"] = adata.layers["counts"].to_memory()
+    op(adata)

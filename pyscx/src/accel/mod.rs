@@ -92,13 +92,8 @@ pub(crate) fn reject_preserve_var_order(adata: &Bound<'_, PyAny>, op: &str) -> P
 /// gene of `var_names=["g2", "g0"]` returned `g0`'s values under `g2`'s name.
 /// Every op that resolves a source calls this on the resolved matrix.
 pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str) -> PyResult<()> {
-    let ordered = if let Ok(backed) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
-        backed.borrow().col_presentation_arc().is_some()
-    } else if let Ok(layer) = x.cast::<crate::backed::ScxBackedLayerDataset>() {
-        layer.borrow().inner.col_presentation_arc().is_some()
-    } else {
-        false
-    };
+    let ordered =
+        backed_dataset_ref(x).is_some_and(|handle| handle.get().col_presentation_arc().is_some());
     if ordered {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{op} is not supported on a backed matrix whose gene axis is in a \
@@ -116,6 +111,53 @@ pub(crate) fn reject_presentation_ordered_source(x: &Bound<'_, PyAny>, op: &str)
         )));
     }
     Ok(())
+}
+
+/// A borrow of the backed dataset behind `adata.X` **or** a backed layer handle.
+///
+/// `adata.X` on a backed file is [`crate::backed::ScxBackedSparseDataset`];
+/// `adata.layers[name]` is [`crate::backed::ScxBackedLayerDataset`], a distinct
+/// `#[pyclass]` wrapping one. An op that dispatches with a bare
+/// `extract::<PyRef<ScxBackedSparseDataset>>()` therefore misses a layer, and
+/// falls through to whatever its last arm is — for DE, `np.asarray(handle)`,
+/// which raises rather than answering.
+///
+/// This exists **beside** [`BackedShardParts`] rather than replacing it because
+/// the two answer different questions. `BackedShardParts` copies out the four
+/// values `build_shard_source` needs and drops the borrow, which is what a
+/// CSR-streaming op wants. DE needs the dataset itself: the CSC sidecar
+/// (`as_column_source`), `as_shard_source().with_cached_reads()`, and
+/// `has_axis_view()` for the GPU arms' `Backed { csr, csc }` switch. None of
+/// those are expressible from the parts, so DE holds the borrow instead.
+///
+/// One function knows the two handle types exist. Three did, and DE was the one
+/// that did not.
+pub(crate) enum BackedDatasetRef<'py> {
+    Direct(PyRef<'py, crate::backed::ScxBackedSparseDataset>),
+    Layer(PyRef<'py, crate::backed::ScxBackedLayerDataset>),
+}
+
+impl BackedDatasetRef<'_> {
+    pub(crate) fn get(&self) -> &crate::backed::ScxBackedSparseDataset {
+        match self {
+            Self::Direct(ds) => ds,
+            Self::Layer(layer) => &layer.inner,
+        }
+    }
+}
+
+/// Borrow the backed dataset behind `adata.X` or a backed layer handle.
+///
+/// `None` means "not a backed SCX matrix" — the caller falls on to its lazy and
+/// in-memory arms as before.
+pub(crate) fn backed_dataset_ref<'py>(x: &Bound<'py, PyAny>) -> Option<BackedDatasetRef<'py>> {
+    if let Ok(ds) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
+        return Some(BackedDatasetRef::Direct(ds.borrow()));
+    }
+    if let Ok(layer) = x.cast::<crate::backed::ScxBackedLayerDataset>() {
+        return Some(BackedDatasetRef::Layer(layer.borrow()));
+    }
+    None
 }
 
 /// The shard-source inputs of a backed dataset, however it reached us.
@@ -156,13 +198,7 @@ impl BackedShardParts {
 /// `None` means "not a backed SCX matrix" — the caller falls on to its lazy
 /// and in-memory arms as before.
 pub(crate) fn backed_shard_parts(x: &Bound<'_, PyAny>) -> Option<BackedShardParts> {
-    if let Ok(ds) = x.cast::<crate::backed::ScxBackedSparseDataset>() {
-        return Some(BackedShardParts::of_dataset(&ds.borrow()));
-    }
-    if let Ok(layer) = x.cast::<crate::backed::ScxBackedLayerDataset>() {
-        return Some(BackedShardParts::of_dataset(&layer.borrow().inner));
-    }
-    None
+    backed_dataset_ref(x).map(|handle| BackedShardParts::of_dataset(handle.get()))
 }
 
 /// The prologue every `pyscx.accel.*` op that writes back to `adata` runs first.

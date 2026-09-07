@@ -593,7 +593,14 @@ pub fn calculate_qc_metrics<'py>(
 
     // Per-gene QC metrics are computed over the sorted projection and written to
     // adata.var; a presentation-ordered backed X would misalign them.
-    super::prepare_target(py, adata, "calculate_qc_metrics")?;
+    // Deliberately the no-var-guard prologue: the
+    // `reject_presentation_ordered_source` call below guards the matrix this
+    // op will actually read, which is `adata.layers[layer]` when `layer=` was
+    // given. Keeping the X-only check here made the documented remedy
+    // impossible — materialise the layer, and the op still refused because
+    // `adata.X` was presentation-ordered, while the matrix it was about to
+    // read was fine.
+    super::prepare_target_no_var_guard(py, adata, "calculate_qc_metrics")?;
 
     // Read the source matrix: `adata.layers[name]` when a layer is named,
     // `adata.X` otherwise. Modelled on `select_de_matrix` rather than HVG's

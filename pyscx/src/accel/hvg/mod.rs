@@ -166,7 +166,14 @@ pub fn highly_variable_genes<'py>(
     // column projection (via build_shard_source), then writes them to
     // adata.var. A presentation-ordered backed X (preserve_var_order=True)
     // would misalign those stats against the request-ordered var — reject.
-    super::prepare_target(py, adata, "highly_variable_genes")?;
+    // Deliberately the no-var-guard prologue: the
+    // `reject_presentation_ordered_source` call below guards the matrix this
+    // op will actually read, which is `adata.layers[layer]` when `layer=` was
+    // given. Keeping the X-only check here made the documented remedy
+    // impossible — materialise the layer, and the op still refused because
+    // `adata.X` was presentation-ordered, while the matrix it was about to
+    // read was fine.
+    super::prepare_target_no_var_guard(py, adata, "highly_variable_genes")?;
 
     // Resolve the source matrix and guard it *before* the route stamp: a guard
     // has to refuse before `adata` is touched (see `accel::prepare_target`'s

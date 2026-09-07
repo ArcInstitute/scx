@@ -165,6 +165,37 @@ impl scx_format_io::ShardSource for LazyShardSource {
         scx_format_io::ShardSource::shard_size_hint(&*self.backed)
     }
 
+    /// The shards a kept-row filter leaves anything in.
+    ///
+    /// `read_shard_arc` below applies `kept_to_global` *after* decoding, and a
+    /// shard none of the kept rows falls in comes back as a 0-row CSR — the
+    /// decode, the transform pass and the column projection all paid for
+    /// nothing. Answering here lets the `prefetch` drivers skip the read
+    /// entirely, which every consumer of `as_shard_source()` gets for free:
+    /// PCA (six to seven passes), HVG, `score_genes`, `pflog`. Not the streaming
+    /// Wilcoxon / pdex kernels: those run their own `0..n_shards` loop per gene
+    /// chunk instead of the drivers, so nothing consults this — measured, they
+    /// still decode every shard under a row window.
+    ///
+    /// Behaviourally identical to today, not merely close: a consumer that
+    /// received the empty shard added nothing to its accumulators, and the
+    /// ones that track a row cursor advance it by `projected.n_rows()`, which
+    /// was zero. `None` when there is no row filter, so the unsubset path is
+    /// untouched.
+    fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+        let kept = self.kept_to_global.as_ref()?;
+        // A plan can be empty (nothing kept in any shard), and an empty plan
+        // performs no `read_shard` — which is where a watching reader checks
+        // that the file has not changed underneath it. Rather than teach this
+        // hook to fail, answer `None` when the file is stale: the driver then
+        // visits every shard and the first read raises, exactly as it did
+        // before there was a plan at all.
+        if self.backed.check_fresh().is_err() {
+            return None;
+        }
+        Some(self.backed.index().shards_with_kept_rows(kept))
+    }
+
     fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
         // `read_shard_arc` owns the pipeline. When nothing else holds the Arc
         // (the uncached path, or any path that derived a fresh CSR) this

@@ -471,6 +471,17 @@ pub fn rank_genes_groups_df(
     // After the cheap arg check, before the first write to `adata` (the
     // compute mode below stamps `uns["scx_accel"]`): rebuild a view as actual
     // so a backed X is not gathered by anndata's copy-on-write.
+    //
+    // Deliberately the no-var-guard variant, and not because this op is
+    // order-indifferent — its compute mode returns gene-labelled DE rows, and
+    // on a presentation-ordered backed `X` it used to label the sorted on-disk
+    // projection with request-ordered `adata.var` names (measured: `g2`'s
+    // effect reported under `g0`). That is now refused, but by
+    // `select_de_matrix`, which guards the matrix the kernel actually reads.
+    // Guarding here instead would also reject the **extraction** mode below,
+    // which reads `adata.uns[key]` and never touches the matrix — a
+    // presentation-ordered handle is no obstacle to pulling out results
+    // computed before the reorder.
     crate::accel::prepare_target_no_var_guard(py, adata, "rank_genes_groups_df")?;
 
     // Extraction mode (scanpy `sc.get.rank_genes_groups_df` alias): read
@@ -550,6 +561,7 @@ pub fn rank_genes_groups_df(
         None,  // layer
         false, // pts: cell-eval's DEResults schema has no fraction-expressing column
         None,  // groups: every group, as the schema consumers expect
+        "rank_genes_groups_df",
     )?;
     let result = run.result;
 

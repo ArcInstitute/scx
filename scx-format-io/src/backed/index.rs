@@ -300,6 +300,39 @@ impl BackedCsrIndex {
             .map(|r| (r.row_start, r.row_end))
     }
 
+    /// Shards holding at least one row of an **ascending** `kept_rows`, in
+    /// ascending shard order.
+    ///
+    /// The row set a deletion vector or an obs-row window leaves visible is
+    /// `kept_to_global`, which is strictly ascending by construction — the
+    /// masked aggregation kernels already rely on that, `partition_point`ing it
+    /// per shard to find the rows they must visit. This computes the same two
+    /// bounds *before* the decode, so a shard no kept row falls in is never
+    /// read at all. Deliberately the same predicate (`hi > lo` over the same
+    /// `partition_point` pair) rather than a second formulation of "overlaps",
+    /// so the skip decision and the walk cannot disagree.
+    ///
+    /// Not [`Self::shards_for_indices`], which defends against an unordered
+    /// input by cloning and sorting it — an `n_obs`-sized allocation and an
+    /// `O(n log n)` sort per call, where this is `O(n_shards · log n_kept)` and
+    /// allocates only the result. An unsorted `kept_rows` gives a wrong answer
+    /// here, exactly as it already does in the kernels' own walk; the two stay
+    /// consistent, which is what matters.
+    ///
+    /// The result satisfies the strictly-ascending contract of
+    /// `prefetch::for_each_shard_ordered_uncached_selected`.
+    pub fn shards_with_kept_rows(&self, kept_rows: &[u64]) -> Vec<usize> {
+        self.shard_ranges
+            .iter()
+            .filter(|r| {
+                let lo = kept_rows.partition_point(|&row| row < r.row_start);
+                let hi = kept_rows.partition_point(|&row| row < r.row_end);
+                hi > lo
+            })
+            .map(|r| r.sorted_shard_idx)
+            .collect()
+    }
+
     /// Find the shard index containing a single row, or `None` if the row
     /// falls outside every shard's range.
     ///

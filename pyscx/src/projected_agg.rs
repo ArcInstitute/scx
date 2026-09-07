@@ -714,11 +714,23 @@ pub fn col_sums_masked_projected(
     kept_rows: &[u64],
     col_indices: &[u32],
 ) -> Result<Vec<f64>> {
+    // A stale file must raise, and the plan below can be empty: with no kept
+    // row in any shard there is no `read_shard` left to perform the freshness
+    // check a watching reader relies on, so the call would answer zeros from an
+    // obsolete mapping while `shape` on the same handle raises. Check up front,
+    // where it is unconditional. (This also covers the `n_kept == 0` early
+    // return in the variance kernel, which never read either.)
+    reader.check_fresh()?;
+
     let n_proj = col_indices.len();
     let mut sums = vec![0.0f64; n_proj];
 
-    prefetch::for_each_shard_ordered_uncached(
+    // Skip shards no kept row falls in: the closure below already computes
+    // that (`lo == hi`), but only after paying for the decode *and* the column
+    // projection.
+    prefetch::for_each_shard_ordered_uncached_selected(
         reader,
+        &reader.index().shards_with_kept_rows(kept_rows),
         prefetch::prefetch_depth(),
         |shard_idx, csr| -> Result<()> {
             let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
@@ -751,11 +763,17 @@ pub fn col_nnz_masked_projected(
     kept_rows: &[u64],
     col_indices: &[u32],
 ) -> Result<Vec<u32>> {
+    // See `col_sums_masked_projected`: an empty shard plan performs no read, so
+    // the freshness check has to happen here.
+    reader.check_fresh()?;
+
     let n_proj = col_indices.len();
     let mut counts = vec![0u32; n_proj];
 
-    prefetch::for_each_shard_ordered_uncached(
+    // See `col_sums_masked_projected`: skip the shards this kept set empties.
+    prefetch::for_each_shard_ordered_uncached_selected(
         reader,
+        &reader.index().shards_with_kept_rows(kept_rows),
         prefetch::prefetch_depth(),
         |shard_idx, csr| -> Result<()> {
             let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
@@ -790,12 +808,18 @@ pub fn col_sums_and_nnz_masked_projected(
     kept_rows: &[u64],
     col_indices: &[u32],
 ) -> Result<(Vec<f64>, Vec<u32>)> {
+    // See `col_sums_masked_projected`: an empty shard plan performs no read, so
+    // the freshness check has to happen here.
+    reader.check_fresh()?;
+
     let n_proj = col_indices.len();
     let mut sums = vec![0.0f64; n_proj];
     let mut counts = vec![0u32; n_proj];
 
-    prefetch::for_each_shard_ordered_uncached(
+    // See `col_sums_masked_projected`: skip the shards this kept set empties.
+    prefetch::for_each_shard_ordered_uncached_selected(
         reader,
+        &reader.index().shards_with_kept_rows(kept_rows),
         prefetch::prefetch_depth(),
         |shard_idx, csr| -> Result<()> {
             let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
@@ -830,12 +854,18 @@ pub fn col_max_masked_projected(
     col_indices: &[u32],
     n_kept: usize,
 ) -> Result<Vec<f64>> {
+    // See `col_sums_masked_projected`: an empty shard plan performs no read, so
+    // the freshness check has to happen here.
+    reader.check_fresh()?;
+
     let n_proj = col_indices.len();
     let mut maxes = vec![f64::NEG_INFINITY; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    prefetch::for_each_shard_ordered_uncached(
+    // See `col_sums_masked_projected`: skip the shards this kept set empties.
+    prefetch::for_each_shard_ordered_uncached_selected(
         reader,
+        &reader.index().shards_with_kept_rows(kept_rows),
         prefetch::prefetch_depth(),
         |shard_idx, csr| -> Result<()> {
             let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
@@ -881,12 +911,18 @@ pub fn col_min_masked_projected(
     col_indices: &[u32],
     n_kept: usize,
 ) -> Result<Vec<f64>> {
+    // See `col_sums_masked_projected`: an empty shard plan performs no read, so
+    // the freshness check has to happen here.
+    reader.check_fresh()?;
+
     let n_proj = col_indices.len();
     let mut mins = vec![f64::INFINITY; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    prefetch::for_each_shard_ordered_uncached(
+    // See `col_sums_masked_projected`: skip the shards this kept set empties.
+    prefetch::for_each_shard_ordered_uncached_selected(
         reader,
+        &reader.index().shards_with_kept_rows(kept_rows),
         prefetch::prefetch_depth(),
         |shard_idx, csr| -> Result<()> {
             let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
@@ -931,6 +967,10 @@ pub fn col_var_masked_projected(
     kept_rows: &[u64],
     col_indices: &[u32],
 ) -> Result<Vec<f64>> {
+    // See `col_sums_masked_projected`: an empty shard plan performs no read, so
+    // the freshness check has to happen here.
+    reader.check_fresh()?;
+
     let n_proj = col_indices.len();
     let n_kept = kept_rows.len();
     if n_kept == 0 {
@@ -945,8 +985,10 @@ pub fn col_var_masked_projected(
     let mut sq_devs = vec![0.0f64; n_proj];
     let mut col_nnz = vec![0usize; n_proj];
 
-    prefetch::for_each_shard_ordered_uncached(
+    // See `col_sums_masked_projected`: skip the shards this kept set empties.
+    prefetch::for_each_shard_ordered_uncached_selected(
         reader,
+        &reader.index().shards_with_kept_rows(kept_rows),
         prefetch::prefetch_depth(),
         |shard_idx, csr| -> Result<()> {
             let (s_start, s_end) = match reader.index().shard_range(shard_idx) {
