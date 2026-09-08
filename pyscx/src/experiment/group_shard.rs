@@ -23,6 +23,14 @@ pub(crate) fn stale_repr_detail(e: &scx_format_io::ScxError) -> String {
 /// Map an `scx_engine::EngineError` to the right Python exception for the
 /// grouped-read API: unknown label → `KeyError` (with close matches in the
 /// message), not-grouped → `ValueError`, everything else → `RuntimeError`.
+///
+/// **A second mapper, deliberately not merged with `query::engine_to_pyerr`.**
+/// The two own disjoint variants — this one the grouped-read errors, that one
+/// the predicate / modality / cast-refusal ones — and they have always disagreed
+/// about the variants neither names (a `SchemaError` is a `ValueError` through a
+/// query and a `RuntimeError` through a grouped read). Unifying them would flip
+/// exception types on grouped reads, which no caller of this API has asked for;
+/// worth doing on its own, not as a side effect.
 pub(crate) fn engine_to_pyerr(e: scx_engine::EngineError) -> PyErr {
     use scx_engine::EngineError as E;
     match e {

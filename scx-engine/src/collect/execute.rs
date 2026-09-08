@@ -15,8 +15,7 @@ use arrow::compute;
 
 use scx_sparse::{IndexBuffer, MaterializePlan, ScxCsr, ValueBuffer};
 
-use crate::error::EngineError;
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::fused_ops::apply_fused_ops;
 use crate::pipeline::{QueryPipeline, QueryResult, TypedQueryResult};
 use crate::predicate::evaluate;
@@ -357,13 +356,17 @@ pub(crate) fn materialize_typed(
     } = pm;
 
     if plan.normalize.is_some() || plan.log1p {
-        return Err(EngineError::Generic(
-            "a dtype-selected collect cannot be combined with with_normalize() / \
-             with_log1p(): those produce floating-point values from the counts, so no \
-             requested dtype can represent the stored data exactly. Collect without a \
-             dtype (the values are transformed anyway) or drop the transform."
+        // Not `Generic`: that variant is classified retryable, and this is a
+        // usage error the caller must act on, not a transient one.
+        return Err(EngineError::UnsupportedRewrite {
+            op: "a dtype-selected collect".to_string(),
+            feature: "with_normalize() / with_log1p()".to_string(),
+            remedy: "those transforms replace the stored counts with floating-point values, \
+                     so no requested dtype can reproduce the stored data exactly. Collect \
+                     without a dtype (the values are transformed anyway), or drop the \
+                     transform."
                 .to_string(),
-        ));
+        });
     }
 
     let reader = pipeline.reader();

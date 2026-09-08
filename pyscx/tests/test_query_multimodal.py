@@ -137,3 +137,34 @@ def test_query_matches_to_mudata(citeseq_scx):
     np.testing.assert_allclose(
         rna_q.X.toarray(), rna_ref.X.toarray(), rtol=0, atol=0
     )
+
+
+def test_modality_scoped_typed_collect(citeseq_scx):
+    """`collect(data_dtype=)` is modality-scoped like the default collect.
+
+    The typed decode reuses the same shard scan and the same output width, so a
+    per-modality query narrows to that modality's genes rather than the global
+    var axis — the failure a separate assembly path would have introduced.
+    """
+    import numpy as np
+
+    import pyscx
+
+    for modality, n_vars in [("rna", 8), ("adt", 4)]:
+        default = (
+            pyscx.open(citeseq_scx)
+            .query(modality=modality)
+            .filter_obs("cell_type == 'T cell'")
+            .collect()
+        )
+        typed = (
+            pyscx.open(citeseq_scx)
+            .query(modality=modality)
+            .filter_obs("cell_type == 'T cell'")
+            .collect(data_dtype="float64")
+        )
+        assert typed.n_vars == n_vars == default.n_vars
+        assert typed.n_obs == default.n_obs == 10
+        a, b = default.to_csr(), typed.to_csr()
+        assert b.data.dtype == np.float64
+        np.testing.assert_array_equal(b.toarray(), a.toarray().astype(np.float64))

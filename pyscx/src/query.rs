@@ -5,8 +5,9 @@
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use scx_engine::pipeline::{QueryPipeline, QueryResult};
+use scx_engine::pipeline::{QueryPipeline, QueryResult, TypedQueryResult};
 use scx_engine::EngineError;
+use scx_sparse::ValueDtype;
 
 use crate::convert;
 
@@ -61,6 +62,17 @@ pub(crate) fn engine_to_pyerr(e: EngineError) -> PyErr {
         EngineError::UnknownModality { .. } => PyKeyError::new_err(e.to_string()),
         // Multimodal file queried without a modality → a value/usage error.
         EngineError::ModalityRequired { .. } => PyValueError::new_err(e.to_string()),
+        // An operation refusing an input it cannot serve faithfully (e.g. a
+        // dtype-selected collect over a fused transform) is a usage error.
+        EngineError::UnsupportedRewrite { .. } => PyValueError::new_err(e.to_string()),
+        // The fail-loud cast gate surfaces through the engine as
+        // `ScxError::Codec`. Same reasoning as `typed_read_to_pyerr` on the
+        // eager path: a refused narrow is a bad request, not a runtime fault,
+        // and the two paths must agree — a `uint16` request that raises
+        // `ValueError` eagerly cannot raise `RuntimeError` through a query.
+        EngineError::FormatError(scx_format_io::ScxError::Codec(ce)) => {
+            PyValueError::new_err(ce.to_string())
+        }
         _ => PyRuntimeError::new_err(e.to_string()),
     }
 }
@@ -72,31 +84,36 @@ pub(crate) fn query_result_to_anndata<'py>(
     py: Python<'py>,
     result: QueryResult,
 ) -> PyResult<Bound<'py, PyAny>> {
-    query_result_to_anndata_with_plan(py, result, &scx_sparse::MaterializePlan::default_csr_f32())
+    // f32 by construction — this door has no dtype kwarg (`read_group`,
+    // `read_reference`, the group-shard readers, `read_cloud`), so the only
+    // possible loss is the decode that already happened.
+    convert::materialize_guard(
+        result.max_value,
+        scx_sparse::ValueDtype::F32,
+        scx_sparse::ValueDtype::F32,
+        false,
+    )
+    .map_err(convert::guard_failure_to_pyerr)?;
+    let x = convert::csr_to_scipy(py, result.x)?;
+    anndata_from_parts(py, x, &result.obs, &result.var)
 }
 
-/// Like [`query_result_to_anndata`] but materializes X into the container/dtype
-/// selected by `plan` (F3). The default plan preserves the exact zero-copy path.
-pub(crate) fn query_result_to_anndata_with_plan<'py>(
+/// Assemble an `anndata.AnnData` from an already-materialized `X` plus the
+/// result's obs / var batches.
+///
+/// Split out so both matrix representations share it, and so the obs/var half
+/// stops being duplicated per dtype arm.
+pub(crate) fn anndata_from_parts<'py>(
     py: Python<'py>,
-    result: QueryResult,
-    plan: &scx_sparse::MaterializePlan,
+    x: Bound<'py, PyAny>,
+    obs: &arrow::array::RecordBatch,
+    var: &arrow::array::RecordBatch,
 ) -> PyResult<Bound<'py, PyAny>> {
     let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
 
-    // Fail loud on the silent u32→f32 decode loss over the shards that survived
-    // pushdown, before consuming `result.x`.
-    convert::guard_decode_loss(result.max_value, plan.allow_lossy)?;
-
-    // X — CSR → scipy/dense in the requested dtype (zero-copy for the default).
-    let x = convert::csr_to_scipy_typed(py, result.x, plan)?;
-
-    // obs → pandas DataFrame
-    let obs_table = convert::record_batch_to_pyarrow(py, &result.obs)?;
+    let obs_table = convert::record_batch_to_pyarrow(py, obs)?;
     let obs_df = convert::pyarrow_table_to_pandas(&obs_table)?;
-
-    // var → pandas DataFrame
-    let var_table = convert::record_batch_to_pyarrow(py, &result.var)?;
+    let var_table = convert::record_batch_to_pyarrow(py, var)?;
     let var_df = convert::pyarrow_table_to_pandas(&var_table)?;
 
     let kwargs = pyo3::types::PyDict::new(py);
@@ -104,8 +121,7 @@ pub(crate) fn query_result_to_anndata_with_plan<'py>(
     kwargs.set_item("obs", obs_df)?;
     kwargs.set_item("var", var_df)?;
 
-    let adata = anndata_mod.call_method("AnnData", (), Some(&kwargs))?;
-    Ok(adata)
+    anndata_mod.call_method("AnnData", (), Some(&kwargs))
 }
 
 // ---------------------------------------------------------------------------
@@ -303,19 +319,72 @@ impl PyQueryPipeline {
     /// This is where all I/O and computation occurs. A *successful* collect
     /// consumes the pipeline — further method calls then raise RuntimeError.
     /// A failed one does not: the pipeline stays usable so the caller can fix
-    /// the offending step (e.g. an out-of-range gene index) and re-collect.
-    /// The GIL is released during execution.
-    fn collect(&mut self, py: Python<'_>) -> PyResult<PyQueryResult> {
-        // Run on a borrow (`collect_ref`) rather than moving the pipeline into
-        // the engine, so an error leaves it recoverable. Consuming on success
-        // is a deliberate binding-layer policy, not a Rust-ownership artifact.
-        let result = {
-            let pipeline = self.pipeline_ref()?;
-            py.detach(|| pipeline.collect_ref())
-                .map_err(engine_to_pyerr)?
+    /// the offending step (e.g. an out-of-range gene index, or a `data_dtype`
+    /// too narrow for the file) and re-collect. The GIL is released during
+    /// execution.
+    ///
+    /// Args:
+    ///     data_dtype: dtype to **decode** `X` at, rather than the default
+    ///         `float32`. Because this call is the decode, it is the only place
+    ///         a dtype can make the read lossless: a count above 2²⁴ read into
+    ///         `"uint32"` / `"int64"` / `"float64"` comes back exactly, where
+    ///         naming the dtype on the following `to_anndata()` / `to_csr()`
+    ///         only casts values that already rounded (and fails loud). A
+    ///         narrower dtype than the file's values still refuses. Refused
+    ///         with `with_normalize()` / `with_log1p()`, which replace the
+    ///         counts with floating-point values.
+    ///     index_dtype: dtype for the CSR column indices (`"int16"` /
+    ///         `"int32"` / `"int64"`). Only meaningful alongside `data_dtype`;
+    ///         scipy upcasts `int16` back to `int32` on construction.
+    ///     allow_lossy: accept a narrowing decode that loses data. The gate
+    ///         paired with `data_dtype` — without it here, an intentional lossy
+    ///         narrow would be unreachable at decode time.
+    ///
+    /// Keyword-only. `container=` is deliberately absent: it cannot lose
+    /// anything, so it stays on `to_anndata()` / `to_csr()` where the
+    /// presentation choice belongs.
+    #[pyo3(signature = (*, data_dtype=None, index_dtype=None, allow_lossy=false))]
+    fn collect(
+        &mut self,
+        py: Python<'_>,
+        data_dtype: Option<&str>,
+        index_dtype: Option<&str>,
+        allow_lossy: bool,
+    ) -> PyResult<PyQueryResult> {
+        // Run on a borrow (`collect_ref` / `collect_typed`) rather than moving
+        // the pipeline into the engine, so an error leaves it recoverable —
+        // including a refused cast, which now makes `collect` itself able to
+        // fail. Consuming on success is a deliberate binding-layer policy, not a
+        // Rust-ownership artifact.
+        let requested = convert::parse_value_dtype_opt(data_dtype)?;
+        let result = match requested {
+            // No dtype named, or the default one: today's f32 decode, unchanged
+            // and byte-identical. `float32` deliberately takes this door too —
+            // the typed assembly would produce the same values at more cost, and
+            // routing it here keeps the fused transforms working.
+            None | Some(scx_sparse::ValueDtype::F32) => {
+                let pipeline = self.pipeline_ref()?;
+                let r = py
+                    .detach(|| pipeline.collect_ref())
+                    .map_err(engine_to_pyerr)?;
+                PyQueryResult::from_result(r)
+            }
+            Some(dtype) => {
+                let plan = scx_sparse::MaterializePlan {
+                    container: scx_sparse::Container::Csr,
+                    data_dtype: dtype,
+                    index_dtype: convert::parse_index_dtype(index_dtype)?,
+                    allow_lossy,
+                };
+                let pipeline = self.pipeline_ref()?;
+                let r = py
+                    .detach(|| pipeline.collect_typed(&plan))
+                    .map_err(engine_to_pyerr)?;
+                PyQueryResult::from_typed_result(r)
+            }
         };
         self.pipeline = None;
-        Ok(PyQueryResult::from_result(result))
+        Ok(result)
     }
 
     /// Number of matching cells, **without decoding X** and ignoring `limit`.
@@ -356,38 +425,114 @@ impl PyQueryPipeline {
 ///
 /// Provides `.to_anndata()` and `.to_csr()` for conversion, plus
 /// metadata getters that remain accessible after conversion.
+/// What `collect()` produced — exactly one arm, taken once.
+///
+/// One `Option<Collected>` rather than an `Option` per arm: the bug class this
+/// field has already had is "more than one thing can empty it", and
+/// `take_collected`'s single "already consumed" message is only truthful while
+/// exactly one field can be emptied.
+enum Collected {
+    /// Default `collect()` — the untouched f32 result. Byte-identical path.
+    F32(QueryResult),
+    /// `collect(data_dtype=…)` — decoded at the caller's dtype by the engine.
+    Typed(TypedQueryResult),
+}
+
+impl Collected {
+    fn shape(&self) -> (usize, usize) {
+        match self {
+            Collected::F32(r) => (r.x.n_rows(), r.x.n_cols()),
+            Collected::Typed(r) => (r.x.n_rows(), r.x.n_cols()),
+        }
+    }
+
+    fn nnz(&self) -> usize {
+        match self {
+            Collected::F32(r) => r.x.nnz(),
+            Collected::Typed(r) => r.x.nnz(),
+        }
+    }
+
+    fn skipped_shards(&self) -> usize {
+        match self {
+            Collected::F32(r) => r.skipped_shards,
+            Collected::Typed(r) => r.skipped_shards,
+        }
+    }
+
+    fn total_shards(&self) -> usize {
+        match self {
+            Collected::F32(r) => r.total_shards,
+            Collected::Typed(r) => r.total_shards,
+        }
+    }
+
+    fn max_value(&self) -> u32 {
+        match self {
+            Collected::F32(r) => r.max_value,
+            Collected::Typed(r) => r.max_value,
+        }
+    }
+
+    /// The dtype the values are **already** stored at — step 1 of the
+    /// decode-loss rule, and the meaning of a later `data_dtype=None`.
+    fn dtype(&self) -> ValueDtype {
+        match self {
+            Collected::F32(_) => ValueDtype::F32,
+            Collected::Typed(r) => r.x.values.dtype(),
+        }
+    }
+
+    /// The index dtype the column indices are already stored at.
+    fn index_dtype(&self) -> scx_sparse::IndexDtype {
+        match self {
+            Collected::F32(_) => scx_sparse::IndexDtype::I32,
+            Collected::Typed(r) => r.x.indices.dtype(),
+        }
+    }
+}
+
 #[pyclass]
 pub struct PyQueryResult {
-    result: Option<QueryResult>,
+    /// `None` iff a **successful** to_anndata()/to_csr() took it.
+    collected: Option<Collected>,
     // Cached values so getters work after to_anndata()/to_csr() consumes data
     cached_n_obs: usize,
     cached_n_vars: usize,
     cached_nnz: usize,
     cached_skipped_shards: usize,
     cached_total_shards: usize,
+    /// The dtype X was decoded at, kept for `__repr__` after consumption.
+    cached_dtype: ValueDtype,
 }
 
 impl PyQueryResult {
-    /// Construct from a QueryResult, caching dimension values.
+    /// Construct from a default (f32) QueryResult, caching dimension values.
     pub fn from_result(r: QueryResult) -> Self {
-        let n_obs = r.x.n_rows();
-        let n_vars = r.x.n_cols();
-        let nnz = r.x.nnz();
-        let skipped = r.skipped_shards;
-        let total = r.total_shards;
+        Self::from_collected(Collected::F32(r))
+    }
+
+    /// Construct from a dtype-selected result.
+    pub fn from_typed_result(r: TypedQueryResult) -> Self {
+        Self::from_collected(Collected::Typed(r))
+    }
+
+    fn from_collected(c: Collected) -> Self {
+        let (n_obs, n_vars) = c.shape();
         Self {
-            result: Some(r),
             cached_n_obs: n_obs,
             cached_n_vars: n_vars,
-            cached_nnz: nnz,
-            cached_skipped_shards: skipped,
-            cached_total_shards: total,
+            cached_nnz: c.nnz(),
+            cached_skipped_shards: c.skipped_shards(),
+            cached_total_shards: c.total_shards(),
+            cached_dtype: c.dtype(),
+            collected: Some(c),
         }
     }
 
     /// Take the inner result, returning an error if already consumed.
-    fn take_result(&mut self) -> PyResult<QueryResult> {
-        self.result.take().ok_or_else(|| {
+    fn take_collected(&mut self) -> PyResult<Collected> {
+        self.collected.take().ok_or_else(|| {
             PyRuntimeError::new_err("QueryResult already consumed by to_anndata() or to_csr()")
         })
     }
@@ -400,7 +545,108 @@ impl PyQueryResult {
     /// consumed (the guard then passes and `take_result()` surfaces the
     /// "already consumed" error).
     fn peek_max_value(&self) -> u32 {
-        self.result.as_ref().map(|r| r.max_value).unwrap_or(0)
+        self.collected
+            .as_ref()
+            .map(Collected::max_value)
+            .unwrap_or(0)
+    }
+
+    /// Guard the request against **both** loss steps, then take the result.
+    ///
+    /// Guarding before the take is what keeps a tripped guard non-destructive,
+    /// so the `allow_lossy=True` retry the message recommends works on the same
+    /// object. Both `to_anndata` and `to_csr` route through here: the defect
+    /// being fixed was four hand-copied guard sites, and two of them were these.
+    fn guarded_take(
+        &mut self,
+        requested: Option<ValueDtype>,
+        requested_index: Option<scx_sparse::IndexDtype>,
+        allow_lossy: bool,
+    ) -> PyResult<Collected> {
+        let Some(collected) = self.collected.as_ref() else {
+            // Already consumed: let the take below say so rather than guarding
+            // a result that is not there (peek_max_value returns 0).
+            return self.take_collected();
+        };
+        let assembled = collected.dtype();
+        let requested = requested.unwrap_or(assembled);
+
+        // A typed result's buffers are handed to numpy as they are, so an
+        // `index_dtype=` here would be accepted and ignored. Refuse instead —
+        // and refuse before the value-dtype check only in the sense that both
+        // are reported the same way.
+        if assembled != ValueDtype::F32 {
+            if let Some(idx) = requested_index {
+                if idx != collected.index_dtype() {
+                    return Err(PyValueError::new_err(format!(
+                        "this result was collected with `index_dtype=\"{have}\"`; \
+                         `index_dtype=\"{want}\"` here would be ignored, because a \
+                         dtype-selected result's indices are already narrowed. Pass it to \
+                         `.collect(index_dtype=...)` instead.",
+                        have = collected.index_dtype().numpy_name(),
+                        want = idx.numpy_name(),
+                    )));
+                }
+            }
+        }
+        if assembled != ValueDtype::F32 && requested != assembled {
+            // A typed result would need an assembled→requested cast across the
+            // full dtype matrix, which nothing else here needs and which is not
+            // what the caller means: they want a different *decode*, or a numpy
+            // cast of what they have. `allow_lossy` does not unlock it — it is a
+            // wrong-knob error, not a loss question.
+            return Err(PyValueError::new_err(format!(
+                "this result was collected as {assembled}; `data_dtype=\"{requested}\"` here \
+                 would re-cast it. Pass the dtype to `.collect(data_dtype=...)`, or cast the \
+                 returned matrix yourself (`X.astype(np.{requested})`).",
+                assembled = assembled.numpy_name(),
+                requested = requested.numpy_name(),
+            )));
+        }
+
+        // Step 1 is skipped on the typed arm: it ran pre-decode inside
+        // `collect_typed`, and re-raising it here would report a decode that
+        // already happened and cannot be undone.
+        if assembled == ValueDtype::F32 {
+            convert::materialize_guard(self.peek_max_value(), assembled, requested, allow_lossy)
+                .map_err(convert::guard_failure_to_pyerr)?;
+        }
+        self.take_collected()
+    }
+
+    /// Materialize X from whichever arm the result carries, plus its obs / var.
+    ///
+    /// The f32 arm takes the untouched `csr_to_scipy_typed` path (zero-copy for
+    /// the default plan, post-assembly cast otherwise). The typed arm's values
+    /// are already at the requested dtype, so they move straight into numpy —
+    /// `container` is the only thing left to honour.
+    fn materialize_x<'py>(
+        &self,
+        py: Python<'py>,
+        collected: Collected,
+        plan: &scx_sparse::MaterializePlan,
+    ) -> PyResult<(
+        Bound<'py, PyAny>,
+        arrow::array::RecordBatch,
+        arrow::array::RecordBatch,
+    )> {
+        match collected {
+            Collected::F32(r) => {
+                let x = convert::csr_to_scipy_typed(py, r.x, plan)?;
+                Ok((x, r.obs, r.var))
+            }
+            Collected::Typed(r) => {
+                let x = match plan.container {
+                    scx_sparse::Container::Csr => convert::typed_csr_to_scipy(py, r.x)?,
+                    scx_sparse::Container::Dense => {
+                        let dense = scx_format_io::scatter_typed_csr_to_dense(&r.x)
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                        convert::typed_dense_to_numpy(py, dense)?
+                    }
+                };
+                Ok((x, r.obs, r.var))
+            }
+        }
     }
 }
 
@@ -421,14 +667,21 @@ impl PyQueryResult {
         index_dtype: Option<&str>,
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
-        // Guard before taking: a tripped decode-loss guard must leave the
-        // result intact so the retry it recommends (`allow_lossy=True`) works
-        // on the same object. `query_result_to_anndata_with_plan` re-checks for
-        // the callers that reach it directly (`pyscx.read_cloud`).
-        convert::guard_decode_loss(self.peek_max_value(), plan.allow_lossy)?;
-        let result = self.take_result()?;
-        query_result_to_anndata_with_plan(py, result, &plan)
+        let requested = convert::parse_value_dtype_opt(data_dtype)?;
+        let requested_index = index_dtype
+            .map(|_| convert::parse_index_dtype(index_dtype))
+            .transpose()?;
+        let plan = convert::build_plan_with_default(
+            py,
+            container,
+            data_dtype,
+            index_dtype,
+            allow_lossy,
+            self.cached_dtype,
+        )?;
+        let collected = self.guarded_take(requested, requested_index, allow_lossy)?;
+        let (x, obs, var) = self.materialize_x(py, collected, &plan)?;
+        anndata_from_parts(py, x, &obs, &var)
     }
 
     /// Return just the scipy CSR matrix (or dense array) without building full
@@ -443,11 +696,21 @@ impl PyQueryResult {
         index_dtype: Option<&str>,
         allow_lossy: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let plan = convert::build_plan(py, container, data_dtype, index_dtype, allow_lossy)?;
-        // Guard before taking — see `to_anndata`.
-        convert::guard_decode_loss(self.peek_max_value(), plan.allow_lossy)?;
-        let result = self.take_result()?;
-        convert::csr_to_scipy_typed(py, result.x, &plan)
+        let requested = convert::parse_value_dtype_opt(data_dtype)?;
+        let requested_index = index_dtype
+            .map(|_| convert::parse_index_dtype(index_dtype))
+            .transpose()?;
+        let plan = convert::build_plan_with_default(
+            py,
+            container,
+            data_dtype,
+            index_dtype,
+            allow_lossy,
+            self.cached_dtype,
+        )?;
+        let collected = self.guarded_take(requested, requested_index, allow_lossy)?;
+        let (x, _obs, _var) = self.materialize_x(py, collected, &plan)?;
+        Ok(x)
     }
 
     /// Number of observations (cells) in the result.
@@ -482,13 +745,14 @@ impl PyQueryResult {
 
     fn __repr__(&self) -> String {
         format!(
-            "PyQueryResult(n_obs={}, n_vars={}, nnz={}, skipped={}/{}{})",
+            "PyQueryResult(n_obs={}, n_vars={}, nnz={}, dtype={}, skipped={}/{}{})",
             self.cached_n_obs,
             self.cached_n_vars,
             self.cached_nnz,
+            self.cached_dtype.numpy_name(),
             self.cached_skipped_shards,
             self.cached_total_shards,
-            if self.result.is_none() {
+            if self.collected.is_none() {
                 ", consumed"
             } else {
                 ""

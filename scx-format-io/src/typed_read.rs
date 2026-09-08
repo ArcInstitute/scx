@@ -430,7 +430,12 @@ fn compact_value_buffer(src: &ValueBuffer, indptr: &[i64], keep: &[bool]) -> Val
 
 /// Scatter a [`TypedCsr`] (with `i32` indices) into a row-major dense
 /// [`TypedDense`] at the same value dtype. Mirrors `ScxCsr::to_dense_dtype`.
-fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
+/// Scatter a typed CSR into a row-major typed dense buffer.
+///
+/// Public so the bindings can honour `container="dense"` on a result that was
+/// already decoded at a chosen dtype — the values are in a `ValueBuffer` by
+/// then, not an `ScxCsr`, so `ScxCsr::to_dense_dtype` cannot serve it.
+pub fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
     let (n_rows, n_cols) = csr.shape;
     let total = n_rows
         .checked_mul(n_cols)

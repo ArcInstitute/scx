@@ -444,7 +444,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
             // non-eager narrow path is guarded symmetrically in `experiment.rs`
             // before the retype loop; X/raw, by contrast, narrow in-decode and are
             // exact for `>2²⁴` integer targets.
-            guard_decode_loss(
+            guard_decode_loss_layers(
                 reader.catalog().layer_csr_max_value(0, None),
                 plan.allow_lossy,
             )?;
@@ -697,7 +697,12 @@ fn projected_eager_anndata<'py>(
         // path replaces. Layers materialise as f32 on every path and are
         // narrowed post-assembly, so a `> 2²⁴` layer count cannot be delivered
         // losslessly by any route — fail loud rather than round silently.
-        guard_decode_loss(
+        //
+        // Which of the two shapes this is: **assemble f32, then cast**, so the
+        // f32 limit is the real limit. Contrast `X`, which decodes *at* the
+        // requested dtype — on the eager path, and on the query path when the
+        // dtype is declared at `collect()` — and so guards on that dtype.
+        guard_decode_loss_layers(
             reader.catalog().layer_csr_max_value(0, None),
             plan.allow_lossy,
         )?;
@@ -1137,23 +1142,47 @@ pub fn to_anndata_filtered<'py>(
             pipeline = pipeline.select_genes(gene_indices);
         }
 
-        let result = pipeline
-            .collect()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // This route knows the plan *before* the decode, so a non-default dtype
+        // can be decoded at rather than cast to — unlike `collect().to_anndata()`,
+        // where the decode has already happened. `typed_collect_supported` is
+        // false for a dense container and for the fused transforms (which this
+        // entry point never sets), and those keep the f32 route and its f32
+        // guard, correctly, because f32 is what they produce.
+        let use_typed = !plan.is_default_csr_f32() && pipeline.typed_collect_supported(plan);
 
-        // Guard against the silent u32→f32 decode loss over exactly the shards
-        // that survived predicate pushdown (`result.max_value`). The query path
-        // assembles X as f32 first (Option A: post-assembly cast), so a `>2²⁴`
-        // integer request is still gated here rather than decoded losslessly —
-        // the in-decode narrow (G2) lands on the eager path only.
-        guard_decode_loss(result.max_value, plan.allow_lossy)?;
+        let (x, result_obs, result_var) = if use_typed {
+            let result = pipeline
+                .collect_typed(plan)
+                .map_err(crate::query::engine_to_pyerr)?;
+            // The pre-decode guard already ran inside `collect_typed`, keyed on
+            // the requested dtype.
+            let x = typed_csr_to_scipy(py, result.x)?;
+            (x, result.obs, result.var)
+        } else {
+            // Mapped through the shared engine converter, not straight to
+            // `RuntimeError`: a refused narrowing cast must be the same
+            // `ValueError` here as it is on the eager path and on
+            // `collect().to_csr()`. It was not, and the disagreement was
+            // invisible because nothing asked this route for a narrow dtype on
+            // a file the dtype could not hold.
+            let result = pipeline.collect().map_err(crate::query::engine_to_pyerr)?;
+            // Assembled as f32, so the honest gate is the f32 one — this is the
+            // "decode already happened" step of the two-step rule.
+            crate::convert::materialize_guard(
+                result.max_value,
+                scx_sparse::ValueDtype::F32,
+                plan.data_dtype,
+                plan.allow_lossy,
+            )
+            .map_err(crate::convert::guard_failure_to_pyerr)?;
+            let x = csr_to_scipy_typed(py, result.x, plan)?;
+            (x, result.obs, result.var)
+        };
 
         let anndata_mod = crate::pyimport::import_module(py, "anndata")?;
-        // Narrow to the requested container/dtype (no-op for the default plan).
-        let x = csr_to_scipy_typed(py, result.x, plan)?;
-        let obs_table = record_batch_to_pyarrow(py, &result.obs)?;
+        let obs_table = record_batch_to_pyarrow(py, &result_obs)?;
         let obs_df = pyarrow_table_to_pandas(&obs_table)?;
-        let var_table = record_batch_to_pyarrow(py, &result.var)?;
+        let var_table = record_batch_to_pyarrow(py, &result_var)?;
         let var_df = pyarrow_table_to_pandas(&var_table)?;
 
         // uns (still loaded from reader; see read_uns_as_pyobject for the

@@ -189,7 +189,9 @@ Rscript -e 'install.packages(c("Matrix", "testthat"), repos="https://cloud.r-pro
 cd rscx && R CMD INSTALL . && cd ..
 
 # Run R tests
-cd rscx && Rscript -e 'testthat::test_dir("tests/testthat")' && cd ..
+# `package=` / `load_package=` are required — a bare `test_dir` does not attach
+# the package and every test then fails with `could not find function "scx_…"`.
+cd rscx && Rscript -e 'testthat::test_dir("tests/testthat", package="rscx", load_package="installed")' && cd ..
 ```
 
 > **Conda R:** if R came from conda, build from an **activated** env

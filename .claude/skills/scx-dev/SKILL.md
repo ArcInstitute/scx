@@ -66,7 +66,10 @@ Run on the edited working tree, *before* committing (Phase 2 of the pipeline bel
 
 **R bindings** (when rscx changed):
 
-- [ ] `cd rscx && R CMD INSTALL . && Rscript -e 'testthat::test_dir("tests/testthat")'`
+- [ ] `cd rscx && R CMD INSTALL . && Rscript -e 'testthat::test_dir("tests/testthat", package="rscx", load_package="installed")'`
+      (`package=` / `load_package=` are required: a bare `test_dir` does not attach the
+      package, so every test fails with `could not find function "scx_…"` — 47 phantom
+      failures that look like a real regression.)
 
 **Benchmarks** (when format / codec / hot paths changed):
 
