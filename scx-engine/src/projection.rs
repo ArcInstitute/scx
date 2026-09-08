@@ -71,6 +71,27 @@ pub fn project_csr_row<I: CsrIndex, V: Copy>(
     data: &[V],
     gene_set: &[u32],
 ) -> (Vec<I>, Vec<V>) {
+    let mut out_indices = Vec::new();
+    let mut out_data = Vec::new();
+    project_csr_row_into(&mut out_indices, &mut out_data, indices, data, gene_set);
+    (out_indices, out_data)
+}
+
+/// [`project_csr_row`] appending into caller-owned buffers.
+///
+/// The merge scan itself — the part with the monotonic-pointer precondition —
+/// lives here and nowhere else; [`project_csr_row`] is a thin wrapper that
+/// allocates. Shard-level callers project row after row, so returning a fresh
+/// pair of `Vec`s per row cost two allocations and two frees per kept row, on
+/// both the f32 and the native decode paths. Appending into one pair of buffers
+/// per shard removes all of it.
+pub fn project_csr_row_into<I: CsrIndex, V: Copy>(
+    out_indices: &mut Vec<I>,
+    out_data: &mut Vec<V>,
+    indices: &[I],
+    data: &[V],
+    gene_set: &[u32],
+) {
     // Compared as `u32`, which is how the merge scan below reads them too — so
     // the assertion checks the order the scan actually depends on rather than the
     // element type's own order.
@@ -87,12 +108,9 @@ pub fn project_csr_row<I: CsrIndex, V: Copy>(
          requires it. `project_csr` sorts internally; direct callers must too."
     );
 
-    let mut out_indices = Vec::new();
-    let mut out_data = Vec::new();
-
     let mut gi = 0; // pointer into gene_set
 
-    for (pos, (&col_idx, &val)) in indices.iter().zip(data.iter()).enumerate() {
+    for (&col_idx, &val) in indices.iter().zip(data.iter()) {
         let col = col_idx.to_u32();
         // Advance gene_set pointer past values smaller than current column
         while gi < gene_set.len() && gene_set[gi] < col {
@@ -107,10 +125,7 @@ pub fn project_csr_row<I: CsrIndex, V: Copy>(
             out_data.push(val);
         }
         // If gene_set[gi] > col, this column is not in the gene set — skip it
-        let _ = pos; // suppress unused variable warning
     }
-
-    (out_indices, out_data)
 }
 
 /// Project an entire `ScxCsr` matrix to keep only the specified gene columns.
@@ -257,13 +272,15 @@ pub fn decode_shard_projected(
         let start = indptr[row] as usize;
         let end = indptr[row + 1] as usize;
 
-        let (row_indices, row_data) =
-            project_csr_row(&indices[start..end], &data[start..end], &sorted_genes);
-
-        new_indices.extend_from_slice(&row_indices);
-        new_data.extend_from_slice(&row_data);
-        let prev = *new_indptr.last().unwrap();
-        new_indptr.push(prev + row_indices.len() as i64);
+        // Appends rather than returning a pair of `Vec`s per row.
+        project_csr_row_into(
+            &mut new_indices,
+            &mut new_data,
+            &indices[start..end],
+            &data[start..end],
+            &sorted_genes,
+        );
+        new_indptr.push(new_indices.len() as i64);
     }
 
     Ok((new_indptr, new_indices, new_data))

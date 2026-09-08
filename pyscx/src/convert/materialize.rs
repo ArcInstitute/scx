@@ -74,6 +74,21 @@ pub(crate) fn parse_index_dtype(dt: Option<&str>) -> PyResult<IndexDtype> {
     }
 }
 
+/// The decode-loss guard for a read surface that has **no dtype kwargs at all**
+/// — `read_group`, `read_reference`, the group-shard readers, `read_cloud`.
+///
+/// Separate from [`materialize_guard`] because that message offers a wider
+/// `data_dtype` and `allow_lossy=True`, and these signatures carry neither.
+/// Naming a remedy the caller cannot reach is worse than stating the bare fact.
+pub(crate) fn guard_decode_loss_f32_only(max_value: u32) -> PyResult<()> {
+    scx_codec::guard_f32_decode_loss(max_value, false).map_err(|e| {
+        PyValueError::new_err(format!(
+            "{e} This read path is float32-only and takes no `data_dtype` — use \
+             `query().collect(data_dtype=...)` for a lossless wide read."
+        ))
+    })
+}
+
 /// The decode-loss guard for a **layer** read: `f32`-bound, because layers are
 /// decoded as `f32` on every path.
 ///

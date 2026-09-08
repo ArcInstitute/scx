@@ -22,7 +22,7 @@ use scx_format_io::catalog::FullCatalogEntry;
 
 use super::rows::check_keep_mask_len;
 use crate::error::Result;
-use crate::projection::project_csr_row;
+use crate::projection::project_csr_row_into;
 use crate::reader::SectionReader;
 
 /// One shard's kept rows, decoded to native types.
@@ -138,8 +138,12 @@ fn filter_project_rows<V: Copy>(
 
     let mut new_indptr = Vec::with_capacity(kept + 1);
     new_indptr.push(0i64);
-    let mut new_indices = Vec::new();
-    let mut new_values = Vec::new();
+    // An unprojected keep is a lower bound on the projected one, and the exact
+    // count when there is no gene set, so this is the right reservation either
+    // way — it just may be generous under a narrow projection.
+    let hint = if kept == n_rows { values.len() } else { 0 };
+    let mut new_indices = Vec::with_capacity(hint);
+    let mut new_values = Vec::with_capacity(hint);
 
     for row in 0..n_rows {
         if !keep_mask[row] {
@@ -150,10 +154,15 @@ fn filter_project_rows<V: Copy>(
 
         match gene_set {
             Some(gs) => {
-                let (row_ix, row_v) =
-                    project_csr_row(&indices[start..end], &values[start..end], gs);
-                new_indices.extend_from_slice(&row_ix);
-                new_values.extend_from_slice(&row_v);
+                // Appends into the shard's buffers: the returning form allocated
+                // and freed two `Vec`s per kept row.
+                project_csr_row_into(
+                    &mut new_indices,
+                    &mut new_values,
+                    &indices[start..end],
+                    &values[start..end],
+                    gs,
+                );
             }
             None => {
                 new_indices.extend_from_slice(&indices[start..end]);

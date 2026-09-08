@@ -2017,7 +2017,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.open_cloud(url) -> CloudExperiment` — Direct cloud reads.
   `CloudExperiment.query(modality=…)` scopes to one modality of a multimodal
   file (same semantics as the local `Experiment.query`).
-- `pyscx.read_cloud(url, *, obs_filter=None, var_names=None, modality=None) -> AnnData` — One-call cloud read (= `open_cloud(url).query(modality=…)…collect().to_anndata()`); see [docs/cloud.md § `pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read).
+- `pyscx.read_cloud(url, *, obs_filter=None, var_names=None, modality=None, data_dtype=None, index_dtype=None, allow_lossy=False) -> AnnData` — One-call cloud read (= `open_cloud(url).query(modality=…)…collect().to_anndata()`); see [docs/cloud.md § `pyscx.read_cloud(...)`](cloud.md#pyscxread_cloud--one-liner-cloud-read).
 
 ### Experiment
 
@@ -2419,11 +2419,13 @@ Backed reads (`backed=True`) are lazy and f32-native, so a non-default plan with
   requested `data_dtype` (same typed reader as `X`) and gated by the same
   decode-loss check; it stays CSR even under `container="dense"` (the
   conventional raw representation).
-- **Scope.** The kwargs are surfaced on the three read entry points above. Other
-  read surfaces (the grouped-shard read helpers, the flat `pyscx.read_cloud(...)`
-  cloud helper) are f32-native for now; the cloud *query* path
-  (`open_cloud(...).query()...collect()`) returns a `PyQueryResult` and so does
-  honor them.
+- **Scope.** The kwargs are surfaced on the three read entry points above, on
+  `QueryPipeline.collect` (`data_dtype` / `index_dtype` / `allow_lossy` — see
+  [Declaring the dtype at `collect()`](#declaring-the-dtype-at-collect)), and on
+  the flat `pyscx.read_cloud(...)` cloud helper, which is a one-call query and so
+  takes them for the same reason `collect()` does. The grouped-shard read helpers
+  (`read_group` / `read_reference` / `iter_group_shards`) are f32-native, and say
+  so in their refusal rather than recommending a `data_dtype` they do not accept.
 
 ### `uns` serialization
 
@@ -2546,9 +2548,11 @@ q.collect(data_dtype="float64").to_csr()            # exact, float64
 exp.query().filter_obs(...).collect().to_csr(data_dtype="float64")   # ValueError
 ```
 
-The second call raises because the values are f32 by then: returning them as
-`float64` would report f32-rounded numbers at the wider dtype. The error names
-the dtype and points at `collect()`. `uint32` and `int64` behave like `float64`
+The second call raises **on this file** because the values are f32 by then:
+returning them as `float64` would report f32-rounded numbers at the wider dtype.
+The error names the dtype and points at `collect()`. It is the guard firing, not
+a blanket rule — the same call on a file whose selected shards hold no count
+above 2²⁴ succeeds and casts post-assembly, because there was nothing to lose. `uint32` and `int64` behave like `float64`
 (each holds every `u32` exactly); `float16`, `uint16` and the plain `float32`
 default still fail loud on a `> 2²⁴` count, because no decode order helps a
 target that cannot hold the value; `allow_lossy=True` accepts the rounding
@@ -2561,15 +2565,25 @@ Three details worth knowing:
   a *different* one raises: the caller wants either another decode (re-collect)
   or a numpy `.astype()` of what they hold, and `allow_lossy` does not unlock it.
 - `container=` stays on the materialize call, since it is applied after the
-  decode. `container="dense"` works on either kind of result.
+  decode. `container="dense"` works on either kind of result, and on the
+  one-shot `to_anndata(obs_filter=…, data_dtype=…, container="dense")` route,
+  which decodes natively and scatters afterwards.
+- `index_dtype` at `collect()` narrows the index buffer, but scipy normalises a
+  `csr_matrix`'s index width on construction, so the returned matrix does not
+  report it (the same caveat as `index_dtype="int16"` above). Passing a
+  *different* `index_dtype` to `to_anndata()` / `to_csr()` on a dtype-selected
+  result raises rather than being ignored; for `container="dense"` it is
+  accepted and irrelevant, since dense output has no indices.
 - `with_normalize()` / `with_log1p()` with a non-`float32` `data_dtype` is
   **refused**: those replace the stored counts with floating-point values, so no
   dtype reproduces the stored data exactly, and serving it from the f32 route
   would silently change which guard ran. Collect without a dtype (the values are
   transformed anyway) or drop the transform.
 
-The same applies over cloud: `open_cloud(url).query()` returns the same pipeline,
-so `collect(data_dtype=…)` decodes losslessly there too.
+The same applies over cloud, on both spellings: `open_cloud(url).query()` returns
+the same pipeline, so `collect(data_dtype=…)` decodes losslessly there — and
+`pyscx.read_cloud(url, …)` takes `data_dtype` / `index_dtype` / `allow_lossy`
+directly, for the same reason `collect()` does (that call *is* the decode).
 
 ### CloudExperiment
 

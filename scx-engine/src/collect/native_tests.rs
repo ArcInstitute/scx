@@ -452,14 +452,24 @@ fn fused_transforms_are_refused_rather_than_served_from_the_f32_route() {
         );
     }
 
-    // A dense request is likewise not a typed assembly — it is presentation on
-    // top of one.
+    // A dense request, by contrast, does **not** disqualify the typed decode:
+    // the container is presentation applied after it, and gating the decode on
+    // it sent `to_anndata(obs_filter=…, container="dense", data_dtype=…)` back
+    // to the f32 route and refused the read this exists to serve.
     let mut dense = plan(ValueDtype::F64);
     dense.container = Container::Dense;
-    assert!(!QueryPipeline::open(&path)
+    assert!(QueryPipeline::open(&path)
         .unwrap()
         .typed_collect_supported(&dense));
     assert!(QueryPipeline::open(&path)
         .unwrap()
         .typed_collect_supported(&mplan));
+    // And it assembles a CSR regardless, which is what makes the scatter the
+    // caller's step.
+    let typed = QueryPipeline::open(&path)
+        .unwrap()
+        .collect_typed(&dense)
+        .unwrap();
+    assert_eq!(typed.x.values.dtype(), ValueDtype::F64);
+    assert_eq!(typed.x.n_cols(), 2);
 }

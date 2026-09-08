@@ -87,13 +87,11 @@ pub(crate) fn query_result_to_anndata<'py>(
     // f32 by construction — this door has no dtype kwarg (`read_group`,
     // `read_reference`, the group-shard readers, `read_cloud`), so the only
     // possible loss is the decode that already happened.
-    convert::materialize_guard(
-        result.max_value,
-        scx_sparse::ValueDtype::F32,
-        scx_sparse::ValueDtype::F32,
-        false,
-    )
-    .map_err(convert::guard_failure_to_pyerr)?;
+    // Not `guard_failure_to_pyerr`: that message offers a wider `data_dtype`
+    // and `allow_lossy=True`, and this door (`read_group`, `read_reference`, the
+    // group-shard readers, `read_cloud`) has neither kwarg. Advertising a remedy
+    // the signature does not carry is worse than the bare fact.
+    convert::guard_decode_loss_f32_only(result.max_value)?;
     let x = convert::csr_to_scipy(py, result.x)?;
     anndata_from_parts(py, x, &result.obs, &result.var)
 }
@@ -356,26 +354,39 @@ impl PyQueryPipeline {
         // including a refused cast, which now makes `collect` itself able to
         // fail. Consuming on success is a deliberate binding-layer policy, not a
         // Rust-ownership artifact.
+        // Parse **every** supplied kwarg before dispatching. Parsing inside one
+        // arm meant `collect(index_dtype="not_a_dtype")` was silently accepted
+        // on the other — the same silent-argument-loss class this PR refuses at
+        // materialize time, on the very door that refusal points at.
         let requested = convert::parse_value_dtype_opt(data_dtype)?;
-        let result = match requested {
-            // No dtype named, or the default one: today's f32 decode, unchanged
-            // and byte-identical. `float32` deliberately takes this door too —
-            // the typed assembly would produce the same values at more cost, and
-            // routing it here keeps the fused transforms working.
-            None | Some(scx_sparse::ValueDtype::F32) => {
+        let requested_index = index_dtype
+            .map(|_| convert::parse_index_dtype(index_dtype))
+            .transpose()?;
+
+        // An explicit `index_dtype` needs the typed assembly too — it is what
+        // narrows the index buffer — so it routes there even at `float32`, where
+        // the values are identical either way.
+        let typed = match (requested, requested_index) {
+            (None | Some(scx_sparse::ValueDtype::F32), None) => None,
+            (dtype, index) => Some(scx_sparse::MaterializePlan {
+                container: scx_sparse::Container::Csr,
+                data_dtype: dtype.unwrap_or(scx_sparse::ValueDtype::F32),
+                index_dtype: index.unwrap_or(scx_sparse::IndexDtype::I32),
+                allow_lossy,
+            }),
+        };
+
+        let mut result = match typed {
+            // Nothing to narrow: today's f32 decode, unchanged and
+            // byte-identical, and the door the fused transforms need.
+            None => {
                 let pipeline = self.pipeline_ref()?;
                 let r = py
                     .detach(|| pipeline.collect_ref())
                     .map_err(engine_to_pyerr)?;
                 PyQueryResult::from_result(r)
             }
-            Some(dtype) => {
-                let plan = scx_sparse::MaterializePlan {
-                    container: scx_sparse::Container::Csr,
-                    data_dtype: dtype,
-                    index_dtype: convert::parse_index_dtype(index_dtype)?,
-                    allow_lossy,
-                };
+            Some(plan) => {
                 let pipeline = self.pipeline_ref()?;
                 let r = py
                     .detach(|| pipeline.collect_typed(&plan))
@@ -383,6 +394,11 @@ impl PyQueryPipeline {
                 PyQueryResult::from_typed_result(r)
             }
         };
+        // `allow_lossy` is a property of the read the caller asked for, so it
+        // travels with the result. Dropping it meant `collect(allow_lossy=True)`
+        // then `to_csr()` was refused with a message telling the caller to pass
+        // the flag they had just passed.
+        result.collected_allow_lossy = allow_lossy;
         self.pipeline = None;
         Ok(result)
     }
@@ -484,6 +500,15 @@ impl Collected {
     }
 
     /// The index dtype the column indices are already stored at.
+    /// Whether the values were decoded by the typed assembler.
+    ///
+    /// **Not** `dtype() != F32`: `collect(index_dtype=…)` alone takes the typed
+    /// route at `F32` values, so the value dtype stopped being a proxy for the
+    /// arm the moment that became reachable.
+    fn is_typed(&self) -> bool {
+        matches!(self, Collected::Typed(_))
+    }
+
     fn index_dtype(&self) -> scx_sparse::IndexDtype {
         match self {
             Collected::F32(_) => scx_sparse::IndexDtype::I32,
@@ -504,6 +529,9 @@ pub struct PyQueryResult {
     cached_total_shards: usize,
     /// The dtype X was decoded at, kept for `__repr__` after consumption.
     cached_dtype: ValueDtype,
+    /// Whether `collect()` was given `allow_lossy=True`. Carried so a later
+    /// materialize does not re-demand an opt-in the caller already made.
+    collected_allow_lossy: bool,
 }
 
 impl PyQueryResult {
@@ -526,6 +554,7 @@ impl PyQueryResult {
             cached_skipped_shards: c.skipped_shards(),
             cached_total_shards: c.total_shards(),
             cached_dtype: c.dtype(),
+            collected_allow_lossy: false,
             collected: Some(c),
         }
     }
@@ -561,6 +590,7 @@ impl PyQueryResult {
         &mut self,
         requested: Option<ValueDtype>,
         requested_index: Option<scx_sparse::IndexDtype>,
+        container: scx_sparse::Container,
         allow_lossy: bool,
     ) -> PyResult<Collected> {
         let Some(collected) = self.collected.as_ref() else {
@@ -575,7 +605,9 @@ impl PyQueryResult {
         // `index_dtype=` here would be accepted and ignored. Refuse instead —
         // and refuse before the value-dtype check only in the sense that both
         // are reported the same way.
-        if assembled != ValueDtype::F32 {
+        // Skipped for dense output, which carries no column indices at all — a
+        // width the caller cannot observe is not worth refusing over.
+        if collected.is_typed() && container == scx_sparse::Container::Csr {
             if let Some(idx) = requested_index {
                 if idx != collected.index_dtype() {
                     return Err(PyValueError::new_err(format!(
@@ -589,7 +621,7 @@ impl PyQueryResult {
                 }
             }
         }
-        if assembled != ValueDtype::F32 && requested != assembled {
+        if collected.is_typed() && requested != assembled {
             // A typed result would need an assembled→requested cast across the
             // full dtype matrix, which nothing else here needs and which is not
             // what the caller means: they want a different *decode*, or a numpy
@@ -607,9 +639,14 @@ impl PyQueryResult {
         // Step 1 is skipped on the typed arm: it ran pre-decode inside
         // `collect_typed`, and re-raising it here would report a decode that
         // already happened and cannot be undone.
-        if assembled == ValueDtype::F32 {
-            convert::materialize_guard(self.peek_max_value(), assembled, requested, allow_lossy)
-                .map_err(convert::guard_failure_to_pyerr)?;
+        if !collected.is_typed() {
+            convert::materialize_guard(
+                self.peek_max_value(),
+                assembled,
+                requested,
+                allow_lossy || self.collected_allow_lossy,
+            )
+            .map_err(convert::guard_failure_to_pyerr)?;
         }
         self.take_collected()
     }
@@ -639,7 +676,10 @@ impl PyQueryResult {
                 let x = match plan.container {
                     scx_sparse::Container::Csr => convert::typed_csr_to_scipy(py, r.x)?,
                     scx_sparse::Container::Dense => {
-                        let dense = scx_format_io::scatter_typed_csr_to_dense(&r.x)
+                        // `n_rows × n_cols` allocation plus a full scatter — no
+                        // Python touched, so it does not need the GIL.
+                        let dense = py
+                            .detach(|| scx_format_io::scatter_typed_csr_to_dense(&r.x))
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
                         convert::typed_dense_to_numpy(py, dense)?
                     }
@@ -679,7 +719,8 @@ impl PyQueryResult {
             allow_lossy,
             self.cached_dtype,
         )?;
-        let collected = self.guarded_take(requested, requested_index, allow_lossy)?;
+        let collected =
+            self.guarded_take(requested, requested_index, plan.container, allow_lossy)?;
         let (x, obs, var) = self.materialize_x(py, collected, &plan)?;
         anndata_from_parts(py, x, &obs, &var)
     }
@@ -708,7 +749,8 @@ impl PyQueryResult {
             allow_lossy,
             self.cached_dtype,
         )?;
-        let collected = self.guarded_take(requested, requested_index, allow_lossy)?;
+        let collected =
+            self.guarded_take(requested, requested_index, plan.container, allow_lossy)?;
         let (x, _obs, _var) = self.materialize_x(py, collected, &plan)?;
         Ok(x)
     }

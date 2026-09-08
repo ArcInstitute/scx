@@ -338,6 +338,12 @@ def test_index_dtype_after_a_typed_collect_is_refused_not_ignored(tmp_dir):
         result.to_csr(index_dtype="int64")
 
     # Declared at collect, it is honoured; repeating the same value is a no-op.
+    #
+    # `indices.dtype` is deliberately *not* the assertion: scipy normalises a
+    # `csr_matrix`'s index width on construction (docs/api.md says so for
+    # int16), so the buffer's dtype is not observable through the returned
+    # matrix. What is observable is that a *conflicting* request is refused —
+    # which can only happen if the collected buffer really is int64.
     x = (
         pyscx.open(path)
         .query()
@@ -346,8 +352,137 @@ def test_index_dtype_after_a_typed_collect_is_refused_not_ignored(tmp_dir):
     )
     assert x.data.dtype == np.float64
 
+    result = pyscx.open(path).query().collect(data_dtype="float64", index_dtype="int64")
+    with pytest.raises(ValueError, match="int64"):
+        result.to_csr(index_dtype="int32")
+
     # The f32 arm still applies it post-assembly, as it always has.
     assert (
         pyscx.open(path).query().collect().to_csr(index_dtype="int64").data.dtype
         == np.float32
     )
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: kwargs that were parsed on one branch and dropped on the other
+# ---------------------------------------------------------------------------
+
+
+def test_collect_index_dtype_is_honoured_without_a_value_dtype(tmp_dir):
+    """`index_dtype` alone must narrow the indices, not be silently dropped.
+
+    It was parsed only inside the non-float32 branch, so `collect(index_dtype=)`
+    on the default value dtype went to the f32 decode and the request vanished —
+    the same silent-argument-loss this PR refuses at materialize time, on the
+    door that refusal points at.
+    """
+    path = _write(tmp_dir, _small_count_adata())
+
+    # The request landing is observable through the conflict refusal, not
+    # through `indices.dtype` — scipy normalises the index width on
+    # construction, so the returned matrix cannot report it.
+    for kwargs in [{"index_dtype": "int64"}, {"data_dtype": "float32", "index_dtype": "int64"}]:
+        result = pyscx.open(path).query().collect(**kwargs)
+        with pytest.raises(ValueError, match="int64"):
+            result.to_csr(index_dtype="int16")
+
+        # Values are untouched by an index-only request.
+        x = pyscx.open(path).query().collect(**kwargs).to_csr()
+        assert x.data.dtype == np.float32, kwargs
+        np.testing.assert_array_equal(
+            x.toarray(), np.array([[7, 0], [1, 2], [3, 0], [4, 5]], dtype=np.float32)
+        )
+
+
+def test_collect_validates_index_dtype_on_every_branch(tmp_dir):
+    """A bogus `index_dtype` was silently *accepted* on the default branch."""
+    path = _write(tmp_dir, _small_count_adata())
+    for data_dtype in [None, "float32", "float64"]:
+        with pytest.raises(ValueError, match="index_dtype"):
+            pyscx.open(path).query().collect(
+                data_dtype=data_dtype, index_dtype="not_a_dtype"
+            )
+
+
+def test_collect_allow_lossy_carries_to_the_materialize(tmp_dir):
+    """`collect(allow_lossy=True)` must not be forgotten by `to_csr()`.
+
+    It was dropped on the f32 branch, so the caller got a refusal telling them to
+    pass the flag they had just passed.
+    """
+    path = _write(tmp_dir, _big_count_adata())
+    x = pyscx.open(path).query().collect(allow_lossy=True).to_csr()
+    assert x.data.dtype == np.float32
+    rt = pyscx.open(path).query().collect(allow_lossy=True).to_anndata()
+    assert rt.X.data.dtype == np.float32
+
+    # Without it, the refusal still stands.
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).query().collect().to_csr()
+
+
+def test_dense_container_on_the_obs_filter_route_reads_wide_exactly(tmp_dir):
+    """The one-shot route must decode natively for `container="dense"` too.
+
+    `typed_collect_supported` gated the *decode* on the container, so asking for
+    an exact dense array of the matching cells — a natural spelling, and the one
+    `pyscx.read` forwards — fell back to f32 and was refused.
+    """
+    path = _write(tmp_dir, _big_count_adata())
+    for reader in (
+        lambda p, **kw: pyscx.open(p).to_anndata(**kw),
+        lambda p, **kw: pyscx.read(p, **kw),
+    ):
+        rt = reader(
+            path, obs_filter="batch == 'a'", data_dtype="float64", container="dense"
+        )
+        assert isinstance(rt.X, np.ndarray)
+        assert rt.X.dtype == np.float64
+        assert int(rt.X.max()) == BIG
+        assert rt.n_obs == 2
+
+    # A narrower dense request is still refused.
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(
+            obs_filter="batch == 'a'", data_dtype="uint16", container="dense"
+        )
+
+
+def test_dense_on_a_typed_result_with_narrow_indices(tmp_dir):
+    """Dense output carries no indices, so a narrowed index dtype cannot block it.
+
+    The scatter accepted only `int32` buffers, so this legal sequence failed with
+    an `InvalidCatalog` error *after* consuming the result.
+    """
+    path = _write(tmp_dir, _big_count_adata())
+    for index_dtype in ["int16", "int32", "int64"]:
+        rt = (
+            pyscx.open(path)
+            .query()
+            .collect(data_dtype="float64", index_dtype=index_dtype)
+            .to_anndata(container="dense")
+        )
+        assert isinstance(rt.X, np.ndarray)
+        assert rt.X.dtype == np.float64
+        assert int(rt.X.max()) == BIG, index_dtype
+
+
+def test_obs_filter_predicate_errors_are_value_errors(tmp_dir):
+    """A bad predicate is a `ValueError` through `query()`; it was a
+    `RuntimeError` through `to_anndata(obs_filter=)`."""
+    path = _write(tmp_dir, _small_count_adata())
+    with pytest.raises(ValueError):
+        pyscx.open(path).to_anndata(obs_filter="batch == ")
+    with pytest.raises(ValueError):
+        pyscx.open(path).query().filter_obs("batch == ")
+
+
+def test_the_f32_only_doors_do_not_advertise_absent_kwargs(tmp_dir):
+    """`read_group` and friends take no `data_dtype`, so their refusal must not
+    recommend one."""
+    path = _write(tmp_dir, _big_count_adata())
+    exp = pyscx.open(path)
+    with pytest.raises(ValueError) as exc:
+        exp.query().collect().to_csr()
+    # The query result *does* have the kwarg, so it may recommend it.
+    assert "data_dtype" in str(exc.value)

@@ -28,9 +28,7 @@ pub use index::{
     IndexPreset, ObsPredicateIndexBuilder, PredicateIndex, PredicateIndexBuildOptions,
     ResolvedIndexBuildOptions, ShardRange, SkipReason, HIGH_CARDINALITY_THRESHOLD,
 };
-pub use pipeline::{
-    CountResult, NormalizeConfig, QueryMatrix, QueryPipeline, QueryResult, TypedQueryResult,
-};
+pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult, TypedQueryResult};
 pub use predicate::{eval_rowset, evaluate, parse_predicate, Predicate, RowSetCtx, ScalarValue};
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var, CsrIndex};
 pub use pushdown::{

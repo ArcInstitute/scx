@@ -502,7 +502,23 @@ adata = pyscx.read_cloud(
 names resolved to indices against the file's `var`. Normalization / log1p
 transforms are not exposed on `read_cloud` — build the explicit
 `open_cloud(url).query()` chain (`.with_normalize()` / `.with_log1p()`) when
-you need them. Returns a regular `anndata.AnnData`. `file://` URLs and local
+you need them.
+
+`data_dtype` / `index_dtype` / `allow_lossy` are accepted too, and mean here what
+they mean on `QueryPipeline.collect`: this call **is** the decode, so it is where
+a count above 2²⁴ can be read exactly rather than rounded through `float32`.
+
+```python
+# Exact, on an atlas whose counts exceed 2**24:
+adata = pyscx.read_cloud(
+    "gs://bucket/atlas.scxd/",
+    obs_filter="perturbation == 'Belinostat'",
+    data_dtype="float64",
+)
+```
+
+See [docs/api.md § Declaring the dtype at `collect()`](api.md#declaring-the-dtype-at-collect)
+for the decode-vs-cast rule. Returns a regular `anndata.AnnData`. `file://` URLs and local
 paths work too, so the same call serves local exploded directories.
 
 > **Caveat — stale index after append.** Unless `scx append` is given

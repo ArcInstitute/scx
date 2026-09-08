@@ -988,17 +988,29 @@ pub fn open_cloud(py: Python<'_>, url: &str) -> PyResult<PyCloudExperiment> {
 ///                against the file's `var` index; an unknown name raises
 ///                KeyError.
 ///
+///     data_dtype: dtype to decode `X` at, as on
+///               `QueryPipeline.collect` — this call *is* the decode, so it is
+///               where a `> 2²⁴` count can be read exactly (`"uint32"` /
+///               `"int64"` / `"float64"`). Defaults to `float32`.
+///     index_dtype: CSR column-index dtype.
+///     allow_lossy: accept a narrowing decode that loses data.
+///
 /// Returns an `anndata.AnnData`. Normalization / log1p transforms are
 /// not exposed here — build the explicit `open_cloud(url).query()` chain
 /// when you need them.
 #[pyfunction]
-#[pyo3(signature = (url, *, obs_filter=None, var_names=None, modality=None))]
+#[pyo3(signature = (url, *, obs_filter=None, var_names=None, modality=None,
+                    data_dtype=None, index_dtype=None, allow_lossy=false))]
+#[allow(clippy::too_many_arguments)]
 pub fn read_cloud<'py>(
     py: Python<'py>,
     url: &str,
     obs_filter: Option<&str>,
     var_names: Option<Vec<String>>,
     modality: Option<&str>,
+    data_dtype: Option<&str>,
+    index_dtype: Option<&str>,
+    allow_lossy: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let rt = build_cloud_runtime()
         .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
@@ -1090,8 +1102,36 @@ pub fn read_cloud<'py>(
         pipeline = pipeline.select_genes(indices);
     }
 
-    let result = py
-        .detach(|| pipeline.collect())
-        .map_err(crate::query::engine_to_pyerr)?;
-    crate::query::query_result_to_anndata(py, result)
+    // Same dispatch as `PyQueryPipeline::collect`: without it this one-liner —
+    // the call the cloud docs lead with — was the last door still f32-only, so
+    // the production failure it exists to serve survived on it.
+    let requested = crate::convert::parse_value_dtype_opt(data_dtype)?;
+    let requested_index = index_dtype
+        .map(|_| crate::convert::parse_index_dtype(index_dtype))
+        .transpose()?;
+    let typed = match (requested, requested_index) {
+        (None | Some(scx_sparse::ValueDtype::F32), None) => None,
+        (dtype, index) => Some(scx_sparse::MaterializePlan {
+            container: scx_sparse::Container::Csr,
+            data_dtype: dtype.unwrap_or(scx_sparse::ValueDtype::F32),
+            index_dtype: index.unwrap_or(scx_sparse::IndexDtype::I32),
+            allow_lossy,
+        }),
+    };
+
+    match typed {
+        None => {
+            let result = py
+                .detach(|| pipeline.collect())
+                .map_err(crate::query::engine_to_pyerr)?;
+            crate::query::query_result_to_anndata(py, result)
+        }
+        Some(plan) => {
+            let result = py
+                .detach(|| pipeline.collect_typed(&plan))
+                .map_err(crate::query::engine_to_pyerr)?;
+            let x = crate::convert::typed_csr_to_scipy(py, result.x)?;
+            crate::query::anndata_from_parts(py, x, &result.obs, &result.var)
+        }
+    }
 }

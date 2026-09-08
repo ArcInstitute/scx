@@ -1125,11 +1125,13 @@ pub fn to_anndata_filtered<'py>(
     if let Some(expr) = obs_filter {
         use scx_engine::QueryPipeline;
 
-        let mut pipeline =
-            QueryPipeline::open(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        // Through the shared engine converter, like the collects below: a bad
+        // predicate is a `ValueError` on `query()` and was a `RuntimeError`
+        // here.
+        let mut pipeline = QueryPipeline::open(path).map_err(crate::query::engine_to_pyerr)?;
         pipeline = pipeline
             .filter_obs(expr)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(crate::query::engine_to_pyerr)?;
 
         // If var_names is also specified, resolve to gene indices. The query
         // engine (scx-engine collect's F4 ColumnReorder) already presents the
@@ -1156,7 +1158,18 @@ pub fn to_anndata_filtered<'py>(
                 .map_err(crate::query::engine_to_pyerr)?;
             // The pre-decode guard already ran inside `collect_typed`, keyed on
             // the requested dtype.
-            let x = typed_csr_to_scipy(py, result.x)?;
+            // `container` is presentation applied after the decode, so it is
+            // honoured here rather than gating the decode — gating it is what
+            // sent `container="dense"` back to the f32 route and refused it.
+            let x = match plan.container {
+                scx_sparse::Container::Csr => typed_csr_to_scipy(py, result.x)?,
+                scx_sparse::Container::Dense => {
+                    let dense = py
+                        .detach(|| scx_format_io::scatter_typed_csr_to_dense(&result.x))
+                        .map_err(typed_read_to_pyerr)?;
+                    crate::convert::typed_dense_to_numpy(py, dense)?
+                }
+            };
             (x, result.obs, result.var)
         } else {
             // Mapped through the shared engine converter, not straight to

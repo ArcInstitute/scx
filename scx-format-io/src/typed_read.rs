@@ -440,15 +440,44 @@ pub fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
     let total = n_rows
         .checked_mul(n_cols)
         .ok_or_else(|| ScxError::InvalidCatalog(format!("dense dim overflow {n_rows}×{n_cols}")))?;
-    let cols: &[i32] = match &csr.indices {
-        IndexBuffer::I32(v) => v,
-        _ => {
-            return Err(ScxError::InvalidCatalog(
-                "dense scatter expects i32 CSR indices".to_string(),
-            ))
-        }
+    // Every index arm, not just `I32`. Dense output carries no column indices at
+    // all, so the *width* the caller narrowed them to cannot make a dense read
+    // impossible — rejecting `I16` / `I64` here turned the legal sequence
+    // `collect(data_dtype=…, index_dtype="int64").to_anndata(container="dense")`
+    // into an `InvalidCatalog` error that had consumed the result on the way.
+    let cols: Vec<i64> = match &csr.indices {
+        IndexBuffer::I16(v) => v.iter().map(|&c| i64::from(c)).collect(),
+        IndexBuffer::I32(v) => v.iter().map(|&c| i64::from(c)).collect(),
+        IndexBuffer::I64(v) => v.clone(),
     };
     let indptr = &csr.indptr;
+
+    // Bounds the caller's buffers against each other before any indexing below.
+    // Cheap, and this function is `pub` now: the bindings hand it a `TypedCsr`
+    // whose invariants are only `debug_assert!`ed at construction, so in a
+    // release build a malformed one would panic out of the slice writes rather
+    // than return an error.
+    if indptr.len() != n_rows + 1 {
+        return Err(ScxError::InvalidCatalog(format!(
+            "dense scatter: indptr has {} entries for {n_rows} rows (expected {})",
+            indptr.len(),
+            n_rows + 1
+        )));
+    }
+    if cols.len() != csr.values.len() {
+        return Err(ScxError::InvalidCatalog(format!(
+            "dense scatter: {} indices against {} values",
+            cols.len(),
+            csr.values.len()
+        )));
+    }
+    if indptr.last().copied().unwrap_or(0) as usize != cols.len() {
+        return Err(ScxError::InvalidCatalog(format!(
+            "dense scatter: indptr ends at {} but there are {} indices",
+            indptr.last().copied().unwrap_or(0),
+            cols.len()
+        )));
+    }
 
     // The decode seam already bounded every index against its **shard's**
     // `n_minor`; this bounds against the **assembled matrix's** `n_cols`, which
