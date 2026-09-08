@@ -1090,13 +1090,35 @@ impl FullCatalog {
     /// dead decode-loss guard was indistinguishable from a passing one.
     pub fn layer_csr_max_value(&self, modality_id: u8, layer_name: Option<&str>) -> u32 {
         match layer_name {
-            Some(name) => {
-                Self::fold_value_max(self.layer_csr_shards_named(modality_id, name).into_iter())
-            }
+            Some(name) => self.layer_csr_max_value_over(modality_id, &[name]),
             None => Self::fold_value_max(self.entries.iter().filter(|e| {
                 e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id
             })),
         }
+    }
+
+    /// Maximum `value_max` over the Layer-CSR shards of `modality_id` belonging
+    /// to **any** of `layer_names` — the fold a read that selects a subset of
+    /// layers needs. An empty `layer_names` yields 0: nothing is decoded, so
+    /// nothing can round.
+    ///
+    /// One pass over the catalog with each name's two match patterns built once,
+    /// rather than one pass per name: a caller selecting every layer of a
+    /// many-shard file (which `to_anndata(eager=True)` does) would otherwise pay
+    /// `layers x entries` comparisons and an allocation per layer where the
+    /// whole-file fold paid a single non-allocating scan.
+    pub fn layer_csr_max_value_over(&self, modality_id: u8, layer_names: &[&str]) -> u32 {
+        let patterns: Vec<(String, String)> = layer_names
+            .iter()
+            .map(|name| (format!("/{name}/"), format!("{name}_shard_")))
+            .collect();
+        Self::fold_value_max(self.entries.iter().filter(|e| {
+            e.section_type == SectionType::LayerCsrShard
+                && e.modality_id == modality_id
+                && patterns.iter().any(|(component, legacy)| {
+                    Self::layer_entry_is_named(&e.name, component, legacy)
+                })
+        }))
     }
 
     /// One named layer's CSR shards under **either** section naming: the
@@ -1126,9 +1148,17 @@ impl FullCatalog {
             .filter(|e| {
                 e.section_type == SectionType::LayerCsrShard
                     && e.modality_id == modality_id
-                    && (e.name.contains(&component) || e.name.starts_with(&legacy_prefix))
+                    && Self::layer_entry_is_named(&e.name, &component, &legacy_prefix)
             })
             .collect()
+    }
+
+    /// The two-naming predicate behind [`Self::layer_csr_shards_named`] and
+    /// [`Self::layer_csr_max_value_over`], so a guard's fold and the shard list
+    /// a read is sized against cannot drift apart. Takes pre-built patterns
+    /// because both callers hoist them out of their entry loop.
+    fn layer_entry_is_named(entry_name: &str, component: &str, legacy_prefix: &str) -> bool {
+        entry_name.contains(component) || entry_name.starts_with(legacy_prefix)
     }
 
     /// Shared fold behind the `*_max_value` helpers: max `value_max` over the

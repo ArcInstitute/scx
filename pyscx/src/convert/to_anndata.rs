@@ -445,12 +445,11 @@ pub(crate) fn to_anndata_with_layers<'py>(
             // `ScxLazyLayersMapping` carries the same filter), not to every
             // layer in the file — a `> 2²⁴` count in an unselected layer must
             // not refuse a read that never touches it.
+            let selected_names: Vec<&str> = selected_layers.iter().map(String::as_str).collect();
             guard_decode_loss_layers(
-                selected_layers_max_value(
-                    reader.catalog(),
-                    0,
-                    selected_layers.iter().map(String::as_str),
-                ),
+                reader
+                    .catalog()
+                    .layer_csr_max_value_over(0, &selected_names),
                 plan.allow_lossy,
             )?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
@@ -685,7 +684,7 @@ fn projected_eager_anndata<'py>(
         kept_to_global.as_ref(),
         col_indices,
         preserve_var_order,
-        decode_window(reader, None),
+        decode_window(reader.catalog(), None),
         plan,
     )?;
     adata.setattr("X", x)?;
@@ -707,8 +706,11 @@ fn projected_eager_anndata<'py>(
         // Scoped to `selected` — the layers this loop decodes — rather than to
         // every layer in the file, so an unselected `> 2²⁴` layer cannot refuse
         // a read that never touches it.
+        let selected_names: Vec<&str> = selected.iter().map(String::as_str).collect();
         guard_decode_loss_layers(
-            selected_layers_max_value(reader.catalog(), 0, selected.iter().map(String::as_str)),
+            reader
+                .catalog()
+                .layer_csr_max_value_over(0, &selected_names),
             plan.allow_lossy,
         )?;
         let layers_attr = adata.getattr("layers")?;
@@ -724,7 +726,7 @@ fn projected_eager_anndata<'py>(
                 kept_to_global.as_ref(),
                 col_indices,
                 preserve_var_order,
-                decode_window(reader, Some(name)),
+                decode_window(reader.catalog(), Some(name)),
                 &layer_plan,
             )?;
             layers_attr.set_item(name, mat)?;
@@ -764,12 +766,21 @@ const IN_FLIGHT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Deliberately independent of the `memory_budget` kwarg: that one is advisory
 /// (it warns, it does not block), and making it govern decode concurrency would
 /// quietly change what it means.
-fn decode_window(reader: &ScxReader, layer: Option<&str>) -> usize {
+///
+/// `layer_csr_shards_named`, not `layer_csr_shards_for_modality`: the latter
+/// matches only the per-modality `layer/{modality}/{layer}/shard_{idx}` naming,
+/// so on a single-modality file — which is every file pyscx's own write doors
+/// produce — the layer branch listed no shards, `max_decoded_shard_bytes`
+/// answered `None`, and the window collapsed to 1. That silently serialized the
+/// bounded parallel layer decode this function exists to size.
+///
+/// Takes the catalog rather than the reader because that is all it reads, which
+/// is also what makes it unit-testable against a synthetic catalog.
+fn decode_window(catalog: &scx_format_io::FullCatalog, layer: Option<&str>) -> usize {
     let threads = rayon::current_num_threads().max(1);
     let entries: Vec<&scx_format_io::FullCatalogEntry> = match layer {
-        Some(name) => reader.catalog().layer_csr_shards_for_modality(0, name),
-        None => reader
-            .catalog()
+        Some(name) => catalog.layer_csr_shards_named(0, name),
+        None => catalog
             .entries
             .iter()
             .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == 0)
@@ -2057,6 +2068,66 @@ mod tests {
         );
         // So does an empty matrix — there is nothing to size against.
         assert_eq!(max_decoded_shard_bytes(std::iter::empty()), None);
+    }
+
+    /// A minimal catalog carrying `n` Layer-CSR shards for one layer, named
+    /// with the **legacy single-modality** pattern every non-multimodal writer
+    /// emits. Enough for `decode_window` and nothing else.
+    fn legacy_layer_catalog(layer: &str, n: usize) -> scx_format_io::FullCatalog {
+        let entries = (0..n)
+            .map(|i| scx_format_io::FullCatalogEntry {
+                name: format!("{layer}_shard_{i}"),
+                offset: 0,
+                length: 0,
+                section_type: SectionType::LayerCsrShard,
+                checksum: [0u8; 32],
+                modality_id: 0,
+                stats: Some(scx_format_io::ShardStats {
+                    row_start: (i * 10) as u64,
+                    row_end: ((i + 1) * 10) as u64,
+                    col_start: 0,
+                    col_end: 0,
+                    nnz: 100,
+                    value_min: 0,
+                    value_max: 5,
+                    value_sum: 0,
+                    n_indexed_columns: 0,
+                    column_stats: Vec::new(),
+                }),
+            })
+            .collect();
+        scx_format_io::FullCatalog {
+            catalog_version: 4,
+            manifest_sequence: 0,
+            prev_catalog_offset: 0,
+            n_obs: (n * 10) as u64,
+            entries,
+            data_generation: 1,
+            csc_build_generation: 0,
+        }
+    }
+
+    /// `decode_window` sized a layer's shards through a resolver that matches
+    /// only the per-modality naming, so on a single-modality file it saw no
+    /// shards, could not size them, and returned a window of 1 — serializing
+    /// the parallel decode it exists to size. Small shards must be bounded by
+    /// the thread count, exactly as X's branch already was.
+    #[test]
+    fn the_decode_window_sizes_a_legacy_named_layer() {
+        let cat = legacy_layer_catalog("counts", 8);
+        // Premise: the resolver this used to call still cannot see these.
+        assert!(cat.layer_csr_shards_for_modality(0, "counts").is_empty());
+        assert_eq!(cat.layer_csr_shards_named(0, "counts").len(), 8);
+
+        let threads = rayon::current_num_threads().max(1);
+        let window = decode_window(&cat, Some("counts"));
+        assert_eq!(window, threads.min(window_for(threads, 100 * 8 + 11 * 8)));
+        // The whole point: more than one when the machine has more than one.
+        if threads > 1 {
+            assert!(window > 1, "expected a parallel window, got {window}");
+        }
+        // A name the file does not carry still cannot be sized.
+        assert_eq!(decode_window(&cat, Some("missing")), 1);
     }
 
     #[test]

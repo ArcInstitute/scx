@@ -1470,6 +1470,67 @@ fn layer_csr_shards_named_accepts_either_naming() {
     assert!(cat.layer_csr_shards_named(0, "nope").is_empty());
 }
 
+/// The subset fold a filtered layer read needs: max over the named layers and
+/// nothing else, in one pass, under either naming. `layer_csr_max_value(_,
+/// Some(name))` is the one-name case of exactly this, so the two cannot
+/// disagree.
+#[test]
+fn layer_csr_max_value_over_folds_only_the_named_layers() {
+    let cat = catalog_with(vec![
+        max_value_entry("narrow_shard_0", SectionType::LayerCsrShard, 0, Some(50)),
+        max_value_entry(
+            "wide_shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(20_000_000),
+        ),
+        max_value_entry(
+            "layer/rna/mid/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(700),
+        ),
+        max_value_entry(
+            "wide_shard_0",
+            SectionType::LayerCsrShard,
+            1,
+            Some(u32::MAX),
+        ),
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(999)),
+    ]);
+    // The whole point: the wide layer does not contribute unless it is named.
+    assert_eq!(cat.layer_csr_max_value_over(0, &["narrow"]), 50);
+    assert_eq!(cat.layer_csr_max_value_over(0, &["wide"]), 20_000_000);
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, &["narrow", "wide"]),
+        20_000_000
+    );
+    // Both namings resolve through the one call.
+    assert_eq!(cat.layer_csr_max_value_over(0, &["narrow", "mid"]), 700);
+    // Nothing selected decodes nothing, so nothing can round.
+    assert_eq!(cat.layer_csr_max_value_over(0, &[]), 0);
+    // A name the modality does not carry contributes nothing, and another
+    // modality's same-named layer is never in scope.
+    assert_eq!(cat.layer_csr_max_value_over(0, &["missing"]), 0);
+    assert_eq!(cat.layer_csr_max_value_over(2, &["wide"]), 0);
+    assert_eq!(cat.layer_csr_max_value_over(1, &["wide"]), u32::MAX);
+    // X shards never contribute, whatever is named.
+    assert_eq!(cat.layer_csr_max_value_over(0, &["X"]), 0);
+    // Equal to the single-name accessor by construction.
+    for name in ["narrow", "wide", "mid", "missing"] {
+        assert_eq!(
+            cat.layer_csr_max_value(0, Some(name)),
+            cat.layer_csr_max_value_over(0, &[name]),
+            "single-name accessor disagreed for {name}"
+        );
+    }
+    // And naming every layer equals the unfiltered whole-modality fold.
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, &["narrow", "wide", "mid"]),
+        cat.layer_csr_max_value(0, None)
+    );
+}
+
 /// An entry without `ShardStats` contributes 0 to the fold (it is skipped) —
 /// the guard is only as strong as the catalog it reads. Deliberate pre-1.0
 /// semantics; every current writer path emits stats.

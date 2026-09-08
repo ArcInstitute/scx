@@ -115,29 +115,6 @@ pub(crate) fn guard_decode_loss_layers(max_value: u32, allow_lossy: bool) -> PyR
     })
 }
 
-/// Max `ShardStats::value_max` over exactly the layers a read will decode.
-///
-/// The three eager-layer guard sites used to fold `layer_csr_max_value(0, None)`
-/// — every layer in the file — so a `> 2²⁴` count in a layer the caller did not
-/// ask for refused a read that never touches it. `layers=` has been a filter
-/// since before 0.17, so the fold was over-broad on every filtered read.
-/// Passing the selected names keeps the guard's own contract ("the layers in
-/// scope") true at each site, and all three sites scope the same way, so none of
-/// them disagrees about when a read raises.
-///
-/// An empty `names` yields 0 — nothing is decoded, so nothing can round.
-pub(crate) fn selected_layers_max_value<'a>(
-    catalog: &scx_format_io::FullCatalog,
-    modality_id: u8,
-    names: impl IntoIterator<Item = &'a str>,
-) -> u32 {
-    names
-        .into_iter()
-        .map(|name| catalog.layer_csr_max_value(modality_id, Some(name)))
-        .max()
-        .unwrap_or(0)
-}
-
 /// Dtype-aware decode-loss guard for the in-decode narrow path: fails loud iff
 /// the shards' `max_value` cannot be represented exactly in the *target*
 /// `dtype`. Error-mapping wrapper over the shared

@@ -2391,7 +2391,9 @@ one in a layer the call does not read. (`layers=` forces eager assembly, so a
 filtered read is always a guarded read.) That holds at all three eager-layer
 sites — the bridge branch, the `var_names=` projected assemble, and the
 post-assembly narrow a non-default `data_dtype=` triggers — so none of them
-disagrees about when a read raises.
+disagrees about when a read raises. The retype site reads the layer keys off the
+assembled object rather than re-deriving the filter, which is what keeps it in
+step with the f32 decode guard that already ran.
 
 For those ungated paths, a `> 2²⁴` count still rounds silently on access; pass
 `allow_lossy` where available, or read eagerly to get the guard. To *know*
