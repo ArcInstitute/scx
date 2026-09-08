@@ -84,6 +84,18 @@ pub(crate) fn query_result_to_anndata<'py>(
     py: Python<'py>,
     result: QueryResult,
 ) -> PyResult<Bound<'py, PyAny>> {
+    query_result_to_anndata_lossy(py, result, false)
+}
+
+/// [`query_result_to_anndata`] with the caller's `allow_lossy` opt-in.
+///
+/// Only `read_cloud` passes `true`: it is the one f32-arm caller that takes the
+/// flag, and routing it through the no-argument form discarded it.
+pub(crate) fn query_result_to_anndata_lossy<'py>(
+    py: Python<'py>,
+    result: QueryResult,
+    allow_lossy: bool,
+) -> PyResult<Bound<'py, PyAny>> {
     // f32 by construction — this door has no dtype kwarg (`read_group`,
     // `read_reference`, the group-shard readers, `read_cloud`), so the only
     // possible loss is the decode that already happened.
@@ -91,7 +103,7 @@ pub(crate) fn query_result_to_anndata<'py>(
     // and `allow_lossy=True`, and this door (`read_group`, `read_reference`, the
     // group-shard readers, `read_cloud`) has neither kwarg. Advertising a remedy
     // the signature does not carry is worse than the bare fact.
-    convert::guard_decode_loss_f32_only(result.max_value)?;
+    convert::guard_decode_loss_f32_only(result.max_value, allow_lossy)?;
     let x = convert::csr_to_scipy(py, result.x)?;
     anndata_from_parts(py, x, &result.obs, &result.var)
 }
@@ -332,8 +344,12 @@ impl PyQueryPipeline {
     ///         with `with_normalize()` / `with_log1p()`, which replace the
     ///         counts with floating-point values.
     ///     index_dtype: dtype for the CSR column indices (`"int16"` /
-    ///         `"int32"` / `"int64"`). Only meaningful alongside `data_dtype`;
-    ///         scipy upcasts `int16` back to `int32` on construction.
+    ///         `"int32"` / `"int64"`). Honoured on its own as well as alongside
+    ///         `data_dtype` — it is the index buffer's width, so it needs the
+    ///         typed assembly either way. Naming the default (`"int32"`) is a
+    ///         no-op and keeps the plain f32 decode, fused transforms included.
+    ///         Note scipy normalises a `csr_matrix`'s index width on
+    ///         construction, so the returned matrix may not report it.
     ///     allow_lossy: accept a narrowing decode that loses data. The gate
     ///         paired with `data_dtype` — without it here, an intentional lossy
     ///         narrow would be unreachable at decode time.
@@ -364,17 +380,20 @@ impl PyQueryPipeline {
             .transpose()?;
 
         // An explicit `index_dtype` needs the typed assembly too — it is what
-        // narrows the index buffer — so it routes there even at `float32`, where
-        // the values are identical either way.
-        let typed = match (requested, requested_index) {
-            (None | Some(scx_sparse::ValueDtype::F32), None) => None,
-            (dtype, index) => Some(scx_sparse::MaterializePlan {
-                container: scx_sparse::Container::Csr,
-                data_dtype: dtype.unwrap_or(scx_sparse::ValueDtype::F32),
-                index_dtype: index.unwrap_or(scx_sparse::IndexDtype::I32),
-                allow_lossy,
-            }),
+        // narrows the index buffer — so it routes there even at `float32`.
+        //
+        // The test is whether the resolved plan *is* the default, not whether the
+        // caller named anything: routing on "named" alone meant
+        // `collect(index_dtype="int32")` took the typed path and was refused for
+        // a fused transform, while the identical call without that no-op
+        // spelling succeeded.
+        let candidate = scx_sparse::MaterializePlan {
+            container: scx_sparse::Container::Csr,
+            data_dtype: requested.unwrap_or(scx_sparse::ValueDtype::F32),
+            index_dtype: requested_index.unwrap_or(scx_sparse::IndexDtype::I32),
+            allow_lossy,
         };
+        let typed = (!candidate.is_default_csr_f32()).then_some(candidate);
 
         let mut result = match typed {
             // Nothing to narrow: today's f32 decode, unchanged and

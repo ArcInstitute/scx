@@ -74,17 +74,22 @@ pub(crate) fn parse_index_dtype(dt: Option<&str>) -> PyResult<IndexDtype> {
     }
 }
 
-/// The decode-loss guard for a read surface that has **no dtype kwargs at all**
-/// — `read_group`, `read_reference`, the group-shard readers, `read_cloud`.
+/// The decode-loss guard for the f32-only read surfaces: `read_group`,
+/// `read_reference`, the group-shard readers, and `read_cloud`'s default arm.
 ///
 /// Separate from [`materialize_guard`] because that message offers a wider
-/// `data_dtype` and `allow_lossy=True`, and these signatures carry neither.
-/// Naming a remedy the caller cannot reach is worse than stating the bare fact.
-pub(crate) fn guard_decode_loss_f32_only(max_value: u32) -> PyResult<()> {
-    scx_codec::guard_f32_decode_loss(max_value, false).map_err(|e| {
+/// `data_dtype`, and the grouped readers carry no such kwarg — naming a remedy
+/// the caller cannot reach is worse than stating the bare fact.
+///
+/// `allow_lossy` is a parameter rather than a hardcoded `false`: `read_cloud`
+/// *does* take the flag, and hardcoding it meant `read_cloud(allow_lossy=True)`
+/// was refused with a message denying the kwarg it had just been given.
+pub(crate) fn guard_decode_loss_f32_only(max_value: u32, allow_lossy: bool) -> PyResult<()> {
+    scx_codec::guard_f32_decode_loss(max_value, allow_lossy).map_err(|e| {
         PyValueError::new_err(format!(
-            "{e} This read path is float32-only and takes no `data_dtype` — use \
-             `query().collect(data_dtype=...)` for a lossless wide read."
+            "{e} This read decodes as float32 — pass `data_dtype=` where the read \
+             accepts it (`query().collect(data_dtype=...)`, `read_cloud(data_dtype=...)`) \
+             for a lossless wide read."
         ))
     })
 }

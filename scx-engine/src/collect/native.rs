@@ -138,12 +138,17 @@ fn filter_project_rows<V: Copy>(
 
     let mut new_indptr = Vec::with_capacity(kept + 1);
     new_indptr.push(0i64);
-    // An unprojected keep is a lower bound on the projected one, and the exact
-    // count when there is no gene set, so this is the right reservation either
-    // way — it just may be generous under a narrow projection.
-    let hint = if kept == n_rows { values.len() } else { 0 };
-    let mut new_indices = Vec::with_capacity(hint);
-    let mut new_values = Vec::with_capacity(hint);
+    // Exact when there is no projection: sum the kept rows' lengths, which the
+    // indptr already gives without touching the values. Under a projection it is
+    // an **upper** bound (the merge scan can only drop entries), so it is still
+    // a safe reservation — the first version reserved zero for every filtered
+    // query and mis-described the unprojected count as a lower bound.
+    let kept_nnz: usize = (0..n_rows)
+        .filter(|&row| keep_mask[row])
+        .map(|row| (indptr[row + 1] - indptr[row]) as usize)
+        .sum();
+    let mut new_indices = Vec::with_capacity(kept_nnz);
+    let mut new_values = Vec::with_capacity(kept_nnz);
 
     for row in 0..n_rows {
         if !keep_mask[row] {

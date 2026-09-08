@@ -1147,10 +1147,21 @@ pub fn to_anndata_filtered<'py>(
         // This route knows the plan *before* the decode, so a non-default dtype
         // can be decoded at rather than cast to — unlike `collect().to_anndata()`,
         // where the decode has already happened. `typed_collect_supported` is
-        // false for a dense container and for the fused transforms (which this
-        // entry point never sets), and those keep the f32 route and its f32
-        // guard, correctly, because f32 is what they produce.
-        let use_typed = !plan.is_default_csr_f32() && pipeline.typed_collect_supported(plan);
+        // false only for the fused transforms, which this entry point never
+        // sets; those keep the f32 route and its f32 guard, correctly, because
+        // f32 is what they produce.
+        //
+        // The decode plan pins `index_dtype` to `i32` for a dense request: dense
+        // output has no column indices (`build_plan` warns as much), so
+        // honouring a narrow width there is unobservable and can only fail — a
+        // column above 32 767 would trip the checked cast on a read the caller
+        // was told ignores the kwarg.
+        let mut decode_plan = *plan;
+        if decode_plan.container == scx_sparse::Container::Dense {
+            decode_plan.index_dtype = scx_sparse::IndexDtype::I32;
+        }
+        let plan = &decode_plan;
+        let use_typed = !plan.is_default_csr_f32() && pipeline.typed_collect_supported();
 
         let (x, result_obs, result_var) = if use_typed {
             let result = pipeline

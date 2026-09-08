@@ -974,6 +974,54 @@ class TestCloudModalityQuery:
             assert adata.n_vars == 12
             assert adata.n_obs > 0
 
+    def test_read_cloud_dtype_kwargs(self):
+        """`read_cloud` is a one-call query, so it takes the decode kwargs.
+
+        Both arms are exercised: a wide `data_dtype` (the typed decode) and an
+        omitted one with `allow_lossy=True` (the f32 decode). The second is the
+        one that regressed — the flag was accepted by the signature and dropped
+        by the dispatcher, so the call was refused with a message denying the
+        kwarg it had just been given.
+        """
+        import anndata
+        import numpy as np
+        import scipy.sparse as sp
+
+        import pyscx
+
+        big = 20_000_000
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scx_path = os.path.join(tmpdir, "big.scx")
+            x = np.array([[big, 0], [1, 2], [3, 0], [4, 5]], dtype=np.int32)
+            pyscx.from_anndata(
+                anndata.AnnData(
+                    X=sp.csr_matrix(x),
+                    obs={"batch": ["a", "b", "a", "b"]},
+                    var={"gene": ["g0", "g1"]},
+                ),
+                scx_path,
+            )
+            exploded = os.path.join(tmpdir, "big.scxd")
+            pyscx.explode(scx_path, exploded)
+
+            # Typed arm: exact at the requested width.
+            adata = pyscx.read_cloud(exploded, data_dtype="float64")
+            assert adata.X.data.dtype == np.float64
+            assert int(adata.X.max()) == big
+
+            # Default arm: refused without the opt-in, accepted with it.
+            with pytest.raises(ValueError, match="allow_lossy"):
+                pyscx.read_cloud(exploded)
+            adata = pyscx.read_cloud(exploded, allow_lossy=True)
+            assert adata.X.data.dtype == np.float32
+            # Explicit float32 takes the same arm, and must honour it too.
+            adata = pyscx.read_cloud(exploded, data_dtype="float32", allow_lossy=True)
+            assert adata.X.data.dtype == np.float32
+
+            # A dtype too narrow for the value is still refused.
+            with pytest.raises(ValueError, match="allow_lossy"):
+                pyscx.read_cloud(exploded, data_dtype="uint16")
+
 
 class TestCloudReadVar:
     """`CloudExperiment.read_var` — parity with the local `Experiment`.

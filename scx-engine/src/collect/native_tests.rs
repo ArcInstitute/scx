@@ -444,7 +444,7 @@ fn fused_transforms_are_refused_rather_than_served_from_the_f32_route() {
         QueryPipeline::open(&path).unwrap().with_normalize(1e4),
         QueryPipeline::open(&path).unwrap().with_log1p(),
     ] {
-        assert!(!pipeline.typed_collect_supported(&mplan));
+        assert!(!pipeline.typed_collect_supported());
         let err = pipeline.collect_typed(&mplan).unwrap_err().to_string();
         assert!(
             err.contains("with_normalize") && err.contains("with_log1p"),
@@ -452,18 +452,16 @@ fn fused_transforms_are_refused_rather_than_served_from_the_f32_route() {
         );
     }
 
-    // A dense request, by contrast, does **not** disqualify the typed decode:
-    // the container is presentation applied after it, and gating the decode on
-    // it sent `to_anndata(obs_filter=…, container="dense", data_dtype=…)` back
-    // to the f32 route and refused the read this exists to serve.
+    // A dense request, by contrast, does **not** disqualify the typed decode —
+    // the predicate does not even take a plan any more. The container is
+    // presentation applied after the decode, and gating the decode on it sent
+    // `to_anndata(obs_filter=…, container="dense", data_dtype=…)` back to the
+    // f32 route and refused the read this exists to serve.
     let mut dense = plan(ValueDtype::F64);
     dense.container = Container::Dense;
     assert!(QueryPipeline::open(&path)
         .unwrap()
-        .typed_collect_supported(&dense));
-    assert!(QueryPipeline::open(&path)
-        .unwrap()
-        .typed_collect_supported(&mplan));
+        .typed_collect_supported());
     // And it assembles a CSR regardless, which is what makes the scatter the
     // caller's step.
     let typed = QueryPipeline::open(&path)

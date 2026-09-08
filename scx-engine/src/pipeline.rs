@@ -76,32 +76,24 @@ pub struct CountResult {
     pub candidate_shard_rows: usize,
 }
 
-/// Just enough of a matrix for the shared `Debug` below — deliberately private
-/// and one method wide.
-///
-/// This replaced a `pub trait QueryMatrix { shape, nnz }`, which had two
-/// implementations but exactly one consumer (this `Debug` impl) and never called
-/// `nnz` at all.
-trait QueryMatrixShape {
-    fn shape(&self) -> (usize, usize);
-}
-
-impl QueryMatrixShape for ScxCsr {
-    fn shape(&self) -> (usize, usize) {
-        self.shape
-    }
-}
-
-impl QueryMatrixShape for scx_sparse::TypedCsr {
-    fn shape(&self) -> (usize, usize) {
-        self.shape
-    }
-}
-
-impl<X: QueryMatrixShape> std::fmt::Debug for QueryResult<X> {
+impl std::fmt::Debug for QueryResult<ScxCsr> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryResult")
-            .field("x_shape", &self.x.shape())
+            .field("x_shape", &self.x.shape)
+            .field("obs_rows", &self.obs.num_rows())
+            .field("var_rows", &self.var.num_rows())
+            .field("skipped_shards", &self.skipped_shards)
+            .field("total_shards", &self.total_shards)
+            .field("candidate_shard_rows", &self.candidate_shard_rows)
+            .field("matched_rows", &self.matched_rows)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for QueryResult<scx_sparse::TypedCsr> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResult")
+            .field("x_shape", &self.x.shape)
             .field("obs_rows", &self.obs.num_rows())
             .field("var_rows", &self.var.num_rows())
             .field("skipped_shards", &self.skipped_shards)
@@ -442,14 +434,15 @@ impl QueryPipeline {
     /// read exact, and that belongs on the `f32` route, which guards on `f32` —
     /// correctly, because that is what it produced.
     ///
-    /// **`mplan.container` is deliberately not consulted.** A dense request is a
+    /// Takes no plan: nothing in a [`MaterializePlan`] can make the typed decode
+    /// unavailable. **`container` in particular is not consulted** — a dense
+    /// request is a
     /// presentation step applied *after* the decode, so gating the decode on it
     /// is what made `to_anndata(obs_filter=…, container="dense",
     /// data_dtype="float64")` fall back to f32 and refuse the very read this
     /// exists to serve. [`collect_typed`](Self::collect_typed) always assembles a
     /// CSR; the caller scatters.
-    pub fn typed_collect_supported(&self, mplan: &MaterializePlan) -> bool {
-        let _ = mplan;
+    pub fn typed_collect_supported(&self) -> bool {
         self.normalize.is_none() && !self.log1p
     }
 

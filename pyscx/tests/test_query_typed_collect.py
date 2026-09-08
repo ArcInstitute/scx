@@ -477,12 +477,57 @@ def test_obs_filter_predicate_errors_are_value_errors(tmp_dir):
         pyscx.open(path).query().filter_obs("batch == ")
 
 
-def test_the_f32_only_doors_do_not_advertise_absent_kwargs(tmp_dir):
-    """`read_group` and friends take no `data_dtype`, so their refusal must not
-    recommend one."""
+def test_a_query_results_refusal_recommends_the_kwarg_it_accepts(tmp_dir):
+    """The query result *does* take `data_dtype`, so its refusal should say so.
+
+    This test was previously named for the f32-only doors (`read_group` and
+    friends) while asserting the opposite — the query result's message. The
+    f32-only doors need a grouped file and are covered in the grouped-read
+    tests; naming a test after a surface it does not touch is how a gap hides.
+    """
     path = _write(tmp_dir, _big_count_adata())
-    exp = pyscx.open(path)
     with pytest.raises(ValueError) as exc:
-        exp.query().collect().to_csr()
-    # The query result *does* have the kwarg, so it may recommend it.
+        pyscx.open(path).query().collect().to_csr()
     assert "data_dtype" in str(exc.value)
+
+
+def test_naming_the_default_index_dtype_keeps_the_fused_transforms(tmp_dir):
+    """`index_dtype="int32"` is a no-op, so it must not disqualify a transform.
+
+    Routing on "did the caller name it" rather than "is the resolved plan the
+    default" made `collect(index_dtype="int32")` take the typed path, which
+    refuses `with_log1p()` — while the identical call without that no-op
+    spelling succeeded.
+    """
+    path = _write(tmp_dir, _small_count_adata())
+    x = (
+        pyscx.open(path)
+        .query()
+        .with_log1p()
+        .collect(index_dtype="int32", data_dtype="float32")
+        .to_csr()
+    )
+    assert x.data.dtype == np.float32
+    assert float(x.max()) == pytest.approx(np.log1p(np.float32(7.0)))
+
+    # A genuinely non-default width still refuses, and says why.
+    with pytest.raises(ValueError, match="with_normalize"):
+        pyscx.open(path).query().with_log1p().collect(index_dtype="int64")
+
+
+def test_dense_one_shot_ignores_index_dtype_rather_than_failing_on_it(tmp_dir):
+    """`build_plan` warns that `index_dtype` is ignored for dense output.
+
+    Once the dense route started decoding natively, honouring that width could
+    fail a checked cast on a read the caller had been told ignores the kwarg.
+    """
+    path = _write(tmp_dir, _big_count_adata())
+    with pytest.warns(RuntimeWarning, match="index_dtype is ignored"):
+        rt = pyscx.open(path).to_anndata(
+            obs_filter="batch == 'a'",
+            data_dtype="float64",
+            container="dense",
+            index_dtype="int16",
+        )
+    assert isinstance(rt.X, np.ndarray)
+    assert int(rt.X.max()) == BIG

@@ -445,12 +445,14 @@ pub fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
     // impossible — rejecting `I16` / `I64` here turned the legal sequence
     // `collect(data_dtype=…, index_dtype="int64").to_anndata(container="dense")`
     // into an `InvalidCatalog` error that had consumed the result on the way.
-    let cols: Vec<i64> = match &csr.indices {
-        IndexBuffer::I16(v) => v.iter().map(|&c| i64::from(c)).collect(),
-        IndexBuffer::I32(v) => v.iter().map(|&c| i64::from(c)).collect(),
-        IndexBuffer::I64(v) => v.clone(),
-    };
+    //
+    // Each arm is *borrowed* and cast per element. Normalising them into one
+    // `Vec<i64>` first was simpler to write and cost 8 bytes per nonzero at
+    // peak, immediately before allocating the `n_rows × n_cols` output — a
+    // regression on exactly the large matrices where a dense conversion is
+    // already the risky choice.
     let indptr = &csr.indptr;
+    let n_indices = csr.indices.len();
 
     // Bounds the caller's buffers against each other before any indexing below.
     // Cheap, and this function is `pub` now: the bindings hand it a `TypedCsr`
@@ -464,18 +466,16 @@ pub fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
             n_rows + 1
         )));
     }
-    if cols.len() != csr.values.len() {
+    if n_indices != csr.values.len() {
         return Err(ScxError::InvalidCatalog(format!(
-            "dense scatter: {} indices against {} values",
-            cols.len(),
+            "dense scatter: {n_indices} indices against {} values",
             csr.values.len()
         )));
     }
-    if indptr.last().copied().unwrap_or(0) as usize != cols.len() {
+    if indptr.last().copied().unwrap_or(0) as usize != n_indices {
         return Err(ScxError::InvalidCatalog(format!(
-            "dense scatter: indptr ends at {} but there are {} indices",
-            indptr.last().copied().unwrap_or(0),
-            cols.len()
+            "dense scatter: indptr ends at {} but there are {n_indices} indices",
+            indptr.last().copied().unwrap_or(0)
         )));
     }
 
@@ -491,30 +491,46 @@ pub fn scatter_typed_csr_to_dense(csr: &TypedCsr) -> Result<TypedDense> {
     // out-of-range `col` runs off the end of one row into the next and returns a
     // plausible, wrong matrix — no panic, no error. Every other consumer indexes
     // a `Vec` sized by the same axis it validates against, so it panics instead.
-    // Cost is negligible against the `n_rows × n_cols` allocation this function
-    // already makes.
-    if let Some((position, &bad)) = cols
-        .iter()
-        .enumerate()
-        .find(|&(_, &c)| c < 0 || c as usize >= n_cols)
-    {
-        return Err(ScxError::ShardIndexOutOfRange {
-            index: bad as u32,
-            position,
-            n_minor: n_cols as u32,
-        });
+    macro_rules! check_bounds {
+        ($cols:expr) => {
+            if let Some((position, &bad)) = $cols
+                .iter()
+                .enumerate()
+                .find(|&(_, &c)| c < 0 || c as usize >= n_cols)
+            {
+                return Err(ScxError::ShardIndexOutOfRange {
+                    index: bad as u32,
+                    position,
+                    n_minor: n_cols as u32,
+                });
+            }
+        };
+    }
+    match &csr.indices {
+        IndexBuffer::I16(v) => check_bounds!(v),
+        IndexBuffer::I32(v) => check_bounds!(v),
+        IndexBuffer::I64(v) => check_bounds!(v),
     }
 
     macro_rules! scatter {
         ($arm:ident, $vals:expr, $ty:ty) => {{
             let mut dense = vec![<$ty>::default(); total];
-            for row in 0..n_rows {
-                let s = indptr[row] as usize;
-                let e = indptr[row + 1] as usize;
-                let base = row * n_cols;
-                for k in s..e {
-                    dense[base + cols[k] as usize] = $vals[k];
-                }
+            macro_rules! fill {
+                ($cols:expr) => {
+                    for row in 0..n_rows {
+                        let s = indptr[row] as usize;
+                        let e = indptr[row + 1] as usize;
+                        let base = row * n_cols;
+                        for k in s..e {
+                            dense[base + $cols[k] as usize] = $vals[k];
+                        }
+                    }
+                };
+            }
+            match &csr.indices {
+                IndexBuffer::I16(c) => fill!(c),
+                IndexBuffer::I32(c) => fill!(c),
+                IndexBuffer::I64(c) => fill!(c),
             }
             ValueBuffer::$arm(dense)
         }};

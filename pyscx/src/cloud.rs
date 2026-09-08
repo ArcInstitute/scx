@@ -1124,7 +1124,9 @@ pub fn read_cloud<'py>(
             let result = py
                 .detach(|| pipeline.collect())
                 .map_err(crate::query::engine_to_pyerr)?;
-            crate::query::query_result_to_anndata(py, result)
+            // `allow_lossy` threaded, not dropped: this arm serves an omitted or
+            // `float32` `data_dtype`, and it is exactly where the flag was lost.
+            crate::query::query_result_to_anndata_lossy(py, result, allow_lossy)
         }
         Some(plan) => {
             let result = py
