@@ -1037,6 +1037,243 @@ fn fixture_with_obs_index(dir: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// A fixture whose **var** carries a predicate index over `feature_type`, and
+/// whose var is written as `VarMetadataShard` sections with the given per-shard
+/// row counts. Both halves exist to pin behaviour this op had never been asked
+/// about: it writes var columns on every import.
+fn fixture_with_var_index_and_shards(
+    dir: &Path,
+    name: &str,
+    var_shard_rows: Option<&[usize]>,
+) -> PathBuf {
+    let n_obs = 4usize;
+    let n_vars = 6usize;
+    let types: Vec<&str> = (0..n_vars)
+        .map(|i| {
+            if i % 2 == 0 {
+                "Gene Expression"
+            } else {
+                "Peaks"
+            }
+        })
+        .collect();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("feature_type", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                (0..n_vars).map(|i| format!("g{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(types)),
+        ],
+    )
+    .unwrap();
+
+    let path = dir.join(name);
+    // 2 is not a divisor of the 3-shard split below, so a rewrite that
+    // re-derives var boundaries from the header cannot match by coincidence.
+    let header = FileHeader::new_single_modality(n_obs as u64, n_vars as u64, 0, 2, 0, 0);
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&obs_batch(n_obs)).unwrap();
+    match var_shard_rows {
+        None => writer.write_var(&var).unwrap(),
+        Some(rows) => {
+            assert_eq!(rows.iter().sum::<usize>(), n_vars);
+            let mut start = 0usize;
+            for (idx, take) in rows.iter().enumerate() {
+                writer
+                    .write_var_shard(
+                        idx as u32,
+                        start as u64,
+                        *take as u64,
+                        n_vars as u64,
+                        &var.slice(start, *take),
+                    )
+                    .unwrap();
+                start += take;
+            }
+        }
+    }
+    for start in [0u64, 2] {
+        writer
+            .write_csr_shard(
+                &[0u64; 3],
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                start,
+            )
+            .unwrap();
+    }
+    let build_opts = scx_engine::PredicateIndexBuildOptions {
+        forced_columns: vec!["feature_type".to_string()],
+        preset_columns: Vec::new(),
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let mut outcomes = Vec::new();
+    let mut named = Vec::new();
+    let bytes = scx_engine::build_var_predicate_index_bytes(
+        &var,
+        &[(0, n_vars as u64)],
+        &build_opts,
+        &mut outcomes,
+        &mut named,
+    )
+    .unwrap()
+    .expect("feature_type must be indexable");
+    assert_eq!(named, vec!["feature_type".to_string()]);
+    writer.write_var_predicate_index(&bytes).unwrap();
+    writer
+        .write_uns(&serde_json::json!({"state": "v0"}))
+        .unwrap();
+    writer.finish().unwrap();
+    path
+}
+
+fn var_shard_ranges(path: &Path) -> Vec<(String, u64, u64)> {
+    let reader = ScxReader::open(path).unwrap();
+    let mut v: Vec<(String, u64, u64)> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::VarMetadataShard)
+        .map(|e| {
+            let s = e.stats.as_ref().expect("a var shard stamps its row range");
+            (e.name.clone(), s.row_start, s.row_end)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn var_index_bytes(path: &Path) -> Option<Vec<u8>> {
+    ScxReader::open(path)
+        .unwrap()
+        .read_var_predicate_index_bytes()
+        .unwrap()
+        .map(|b| b.to_vec())
+}
+
+/// A layer attach writes var columns, so it must not quietly re-lay-out var.
+///
+/// It did: the adopted writer was seeded with no entries, so `var_layout`
+/// reconstructed as `Pending`, the writer's single-vs-sharded guard never
+/// fired, one `write_var` replaced the lot, and `should_drop_old_entry` removed
+/// every `VarMetadataShard`. Any file whose var was sharded — a `from_anndata`
+/// output above `shard_target_rows`, or an `optimize`d one — silently lost that
+/// layout on a `cellbender_import`.
+#[test]
+fn a_sharded_var_survives_a_layer_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_var_index_and_shards(dir.path(), "vs.scx", Some(&[2, 3, 1]));
+    let before = var_shard_ranges(&path);
+    assert_eq!(before.len(), 3, "fixture premise: three var shards");
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 6), |i| (i + 1) as f32);
+    data.col_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cb_ambient",
+                DataType::Float32,
+                true,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![0.25f32; 6]))],
+        )
+        .unwrap(),
+    );
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    assert_eq!(
+        var_shard_ranges(&path),
+        before,
+        "a layer attach must not collapse a sharded var into one section"
+    );
+    let var = ScxReader::open(&path).unwrap().read_var().unwrap();
+    assert_eq!(var.num_rows(), 6);
+    assert!(
+        var.column_by_name("cb_ambient").is_some(),
+        "and the new var column must still land"
+    );
+}
+
+/// The var-axis half of the staleness question this op only ever asked about
+/// obs: it computed `obs_index_would_go_stale` and had no `VarPredicateIndex`
+/// arm at all, so overwriting an indexed var column carried a stale index
+/// forward and `filter_var` would have been answered from values that are gone.
+#[test]
+fn overwriting_an_indexed_var_column_does_not_carry_a_stale_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_var_index_and_shards(dir.path(), "vi.scx", None);
+    let before = var_index_bytes(&path).expect("fixture premise: a var index exists");
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 6), |i| (i + 1) as f32);
+    // Overwrite the indexed column with a value it has never held.
+    data.col_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "feature_type",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["Antibody Capture"; 6]))],
+        )
+        .unwrap(),
+    );
+    let o = AttachLayerOptions {
+        overwrite: true,
+        ..opts("cb")
+    };
+    let summary = attach_external_layer(&path, &data, &o).unwrap();
+    assert!(
+        summary.var_index_rebuilt,
+        "the summary must report what happened to the index"
+    );
+
+    let after = var_index_bytes(&path).expect("the index must be rebuilt, not dropped");
+    assert_ne!(
+        after, before,
+        "carrying the old bytes is the bug: they describe values that are gone"
+    );
+    let idx =
+        scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(after.as_slice())).unwrap();
+    match &idx.columns[0] {
+        scx_engine::index::IndexedColumn::Categorical(cat) => {
+            let values: Vec<&str> = cat.entries.iter().map(|e| e.value.as_str()).collect();
+            assert_eq!(values, vec!["Antibody Capture"]);
+        }
+        other => panic!("expected a categorical index, got {other:?}"),
+    }
+}
+
+/// The other direction: a layer attach that adds a *new* var column must leave
+/// the var index alone, exactly as it does for obs.
+#[test]
+fn a_pure_var_column_add_keeps_the_var_index_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_var_index_and_shards(dir.path(), "vk.scx", None);
+    let before = var_index_bytes(&path).unwrap();
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 6), |i| (i + 1) as f32);
+    data.col_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cb_ambient",
+                DataType::Float32,
+                true,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![0.25f32; 6]))],
+        )
+        .unwrap(),
+    );
+    let summary = attach_external_layer(&path, &data, &opts("cb")).unwrap();
+    assert!(!summary.var_index_rebuilt);
+    assert_eq!(var_index_bytes(&path).as_deref(), Some(before.as_slice()));
+}
+
 fn has_obs_index(path: &Path) -> bool {
     ScxReader::open(path)
         .unwrap()

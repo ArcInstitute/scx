@@ -408,6 +408,13 @@ pub struct AttachLayerSummary {
     /// single-section `ObsMetadata` forces. See
     /// [`crate::external_obs::ObsRewrite`].
     pub obs_streamed: bool,
+    /// Whether the **var** predicate index had to be rebuilt because this
+    /// import overwrote a column it covered.
+    ///
+    /// Reported for the same reason the obs half is: an import that silently
+    /// left a stale index would have query pushdown answering `filter_var`
+    /// from values that no longer exist.
+    pub var_index_rebuilt: bool,
 }
 
 /// The value encoding one canonicalized shard is written under.
@@ -685,6 +692,16 @@ fn attach_external_layer_inner(
     // indexed column does not: the index would describe values that no longer
     // exist and pushdown would silently return wrong rows.
     let drop_obs_index = crate::external_obs::obs_index_would_go_stale(reader, &obs_new_columns)?;
+    // The same question on the var axis, which this op writes columns onto and
+    // had never asked. A pure add keeps the index verbatim; an overwrite of an
+    // indexed column is rebuilt from the new table (see the write below).
+    let var_index_bytes = reader.read_var_predicate_index_bytes()?;
+    let existing_var_index = crate::external_obs::indexed_column_names(var_index_bytes)?;
+    let rebuild_var_index =
+        crate::external_obs::index_would_go_stale(var_index_bytes, &var_new_columns)?;
+    // A sharded var must be rewritten shard by shard to keep its boundaries.
+    let var_streamed = reader.var_metadata_shard_count() > 0;
+    let n_vars_total = var.num_rows() as u64;
     if !opts.overwrite {
         check_collisions(
             reader,
@@ -733,6 +750,7 @@ fn attach_external_layer_inner(
     let framing = framing_for(&prep);
 
     let mut summary = AttachLayerSummary {
+        var_index_rebuilt: rebuild_var_index,
         n_obs,
         n_matched: row_join.n_matched,
         n_target_rows_absent: row_join.n_target_absent,
@@ -810,7 +828,34 @@ fn attach_external_layer_inner(
     if rewrote_uns {
         writer.write_uns(&new_uns)?;
     }
-    writer.write_var(&new_var)?;
+    // Whatever layout var arrived in, it leaves in. The adopted writer is
+    // seeded with no entries (`into_in_place_parts` hands back everything it
+    // holds, so seeding it with the old catalog would duplicate every entry),
+    // which means its own single-vs-sharded guard cannot help here — a plain
+    // `write_var` therefore replaced a sharded var with one section and
+    // `should_drop_old_entry` removed the shards, so any file whose var was
+    // sharded lost that layout on every layer import.
+    if var_streamed {
+        crate::external_var::write_var_shards_appending(
+            reader,
+            &mut writer,
+            n_vars_total,
+            |shard, row_start| Ok(new_var.slice(row_start, shard.num_rows())),
+        )?;
+    } else {
+        writer.write_var(&new_var)?;
+    }
+
+    // The var-axis half of the staleness question, which this op only ever
+    // asked about obs. var's index is one batch-mode build over
+    // `[(0, n_vars)]` and the new table is already in memory, so an overwrite
+    // rebuilds rather than dropping — matching `modify_metadata` and the var
+    // attach.
+    if rebuild_var_index {
+        let pass = crate::predicate_index::ObsVarIndexPass::carried(&[], &existing_var_index);
+        let mut result = scx_engine::ConversionPredicateIndexResult::default();
+        pass.write_var(&new_var, n_vars_total, &mut writer, &mut result)?;
+    }
 
     match &materialized_obs {
         None => write_obs_shards_appending(reader, &mut writer, n_obs, |shard, row_start| {
@@ -908,7 +953,16 @@ fn attach_external_layer_inner(
         .old_catalog
         .entries
         .into_iter()
-        .filter(|e| !should_drop_old_entry(e, opts, rewrote_uns, drop_obs_index, &obsm_batches))
+        .filter(|e| {
+            !should_drop_old_entry(
+                e,
+                opts,
+                rewrote_uns,
+                drop_obs_index,
+                rebuild_var_index,
+                &obsm_batches,
+            )
+        })
         .collect();
     entries.extend(new_section_entries);
     entries.push(FullCatalogEntry {
@@ -1912,6 +1966,7 @@ fn should_drop_old_entry(
     opts: &AttachLayerOptions,
     rewrote_uns: bool,
     drop_obs_index: bool,
+    rebuilt_var_index: bool,
     obsm: &[(String, RecordBatch)],
 ) -> bool {
     use SectionType::*;
@@ -1921,6 +1976,11 @@ fn should_drop_old_entry(
     // The one case where the index is NOT safe to keep: this import overwrites
     // an obs column the index covers, so its entries now describe stale values.
     if drop_obs_index && e.section_type == ObsPredicateIndex {
+        return true;
+    }
+    // Same for var: the old bytes are superseded by the rebuild written above,
+    // and keeping them would leave two `VarPredicateIndex` entries.
+    if rebuilt_var_index && e.section_type == VarPredicateIndex {
         return true;
     }
     if rewrote_uns && e.section_type == UnsBlob && e.modality_id == 0 {
@@ -1975,6 +2035,7 @@ fn build_params_json(
         // See the obs op's twin: not recoverable from the output, because both
         // rewrite paths produce a sharded obs.
         "obs_streamed": s.obs_streamed,
+        "var_predicate_index_rebuilt": s.var_index_rebuilt,
         "uns_keys_merged": data.uns.keys().collect::<Vec<_>>(),
         "overwrite": opts.overwrite,
     });
