@@ -1333,6 +1333,12 @@ fn max_value_entry(
     }
 }
 
+/// Owned layer names for the subset fold, whose public arm is concrete in
+/// `String` so its `None` (all-layers) case is callable without a turbofish.
+fn names(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
 fn catalog_with(entries: Vec<FullCatalogEntry>) -> FullCatalog {
     FullCatalog {
         entries,
@@ -1484,11 +1490,14 @@ fn layer_csr_max_value_over_folds_only_the_named_layers() {
             0,
             Some(20_000_000),
         ),
+        // The unique maximum lives on the *per-modality*-named shard on purpose:
+        // otherwise `wide` dominates and the `None` == "every layer" equality
+        // below holds even with `mid` omitted, pinning nothing.
         max_value_entry(
             "layer/rna/mid/shard_0",
             SectionType::LayerCsrShard,
             0,
-            Some(700),
+            Some(30_000_000),
         ),
         max_value_entry(
             "wide_shard_0",
@@ -1499,52 +1508,73 @@ fn layer_csr_max_value_over_folds_only_the_named_layers() {
         max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(999)),
     ]);
     // The whole point: the wide layer does not contribute unless it is named.
-    assert_eq!(cat.layer_csr_max_value_over(0, Some(&["narrow"])), 50);
-    assert_eq!(cat.layer_csr_max_value_over(0, Some(&["wide"])), 20_000_000);
     assert_eq!(
-        cat.layer_csr_max_value_over(0, Some(&["narrow", "wide"])),
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow"]))),
+        50
+    );
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["wide"]))),
+        20_000_000
+    );
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide"]))),
         20_000_000
     );
     // Both namings resolve through the one call.
     assert_eq!(
-        cat.layer_csr_max_value_over(0, Some(&["narrow", "mid"])),
-        700
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "mid"]))),
+        30_000_000
     );
     // Nothing selected decodes nothing, so nothing can round — and that is a
     // different answer from `None`, which means "every layer".
-    assert_eq!(cat.layer_csr_max_value_over(0, Some(&[] as &[&str])), 0);
+    assert_eq!(cat.layer_csr_max_value_over(0, Some(&[])), 0);
+    // Reachable: `to_anndata(layers=[], data_dtype=…)` reaches the retype guard
+    // with no keys, and an empty selection answers without touching the catalog.
+    assert_eq!(cat.fold_value_max_over_names(0, &[] as &[&str]), 0);
     assert_eq!(
-        cat.layer_csr_max_value_over(0, None::<&[&str]>),
+        cat.layer_csr_max_value_over(0, None),
         cat.layer_csr_max_value(0, None)
     );
     // And `None` really is the cheap whole-modality fold, not a rebuild of it:
     // it agrees with naming every layer, which is what the callers rely on when
     // they pass `None` for an unfiltered read.
     assert_eq!(
-        cat.layer_csr_max_value_over(0, None::<&[&str]>),
-        cat.layer_csr_max_value_over(0, Some(&["narrow", "wide", "mid"]))
+        cat.layer_csr_max_value_over(0, None),
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide", "mid"])))
+    );
+    // …and that equality only pins anything if dropping a layer breaks it. With
+    // the maximum on `mid`, omitting `mid` does.
+    assert_ne!(
+        cat.layer_csr_max_value_over(0, None),
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide"])))
     );
     // Owned strings pass without an intermediate `Vec<&str>` at the call site.
     let owned = vec![String::from("narrow")];
     assert_eq!(cat.layer_csr_max_value_over(0, Some(&owned)), 50);
     // A name the modality does not carry contributes nothing, and another
     // modality's same-named layer is never in scope.
-    assert_eq!(cat.layer_csr_max_value_over(0, Some(&["missing"])), 0);
-    assert_eq!(cat.layer_csr_max_value_over(2, Some(&["wide"])), 0);
-    assert_eq!(cat.layer_csr_max_value_over(1, Some(&["wide"])), u32::MAX);
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["missing"]))),
+        0
+    );
+    assert_eq!(cat.layer_csr_max_value_over(2, Some(&names(&["wide"]))), 0);
+    assert_eq!(
+        cat.layer_csr_max_value_over(1, Some(&names(&["wide"]))),
+        u32::MAX
+    );
     // X shards never contribute, whatever is named.
-    assert_eq!(cat.layer_csr_max_value_over(0, Some(&["X"])), 0);
+    assert_eq!(cat.layer_csr_max_value_over(0, Some(&names(&["X"]))), 0);
     // Equal to the single-name accessor by construction.
     for name in ["narrow", "wide", "mid", "missing"] {
         assert_eq!(
             cat.layer_csr_max_value(0, Some(name)),
-            cat.layer_csr_max_value_over(0, Some(&[name])),
+            cat.layer_csr_max_value_over(0, Some(&names(&[name]))),
             "single-name accessor disagreed for {name}"
         );
     }
     // And naming every layer equals the unfiltered whole-modality fold.
     assert_eq!(
-        cat.layer_csr_max_value_over(0, Some(&["narrow", "wide", "mid"])),
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide", "mid"]))),
         cat.layer_csr_max_value(0, None)
     );
 }

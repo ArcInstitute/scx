@@ -1090,7 +1090,7 @@ impl FullCatalog {
     /// dead decode-loss guard was indistinguishable from a passing one.
     pub fn layer_csr_max_value(&self, modality_id: u8, layer_name: Option<&str>) -> u32 {
         match layer_name {
-            Some(name) => self.layer_csr_max_value_over(modality_id, Some(&[name])),
+            Some(name) => self.fold_value_max_over_names(modality_id, &[name]),
             None => Self::fold_value_max(self.entries.iter().filter(|e| {
                 e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id
             })),
@@ -1112,14 +1112,30 @@ impl FullCatalog {
     /// 100.8 us with all five named, a 78x difference. A *filtered* read has no
     /// such baseline to regress against: before the guard was scoped, it did
     /// not complete at all.
-    pub fn layer_csr_max_value_over<S: AsRef<str>>(
-        &self,
-        modality_id: u8,
-        layer_names: Option<&[S]>,
-    ) -> u32 {
-        let Some(layer_names) = layer_names else {
-            return self.layer_csr_max_value(modality_id, None);
-        };
+    /// Concrete in `String` rather than generic over `AsRef<str>`: a generic
+    /// element type is uninferable at the documented `None`, so
+    /// `layer_csr_max_value_over(0, None)` would not compile and every caller of
+    /// the all-layers arm would need a turbofish naming a type it does not use.
+    /// Every caller holds a `Vec<String>` anyway, so nothing allocates to call
+    /// this; the one-name delegate goes through the private helper instead.
+    pub fn layer_csr_max_value_over(&self, modality_id: u8, layer_names: Option<&[String]>) -> u32 {
+        match layer_names {
+            None => self.layer_csr_max_value(modality_id, None),
+            Some(names) => self.fold_value_max_over_names(modality_id, names),
+        }
+    }
+
+    /// The subset fold itself, generic only so the one-name delegate can pass a
+    /// `&[&str]` without allocating a `String`. Private, so the inference
+    /// problem the public wrapper documents cannot reach a caller.
+    fn fold_value_max_over_names<S: AsRef<str>>(&self, modality_id: u8, layer_names: &[S]) -> u32 {
+        // An explicit empty selection decodes nothing, so nothing can round —
+        // and answering it without walking the catalog matters because it is
+        // reachable: `to_anndata(layers=[], data_dtype=…)` reaches the retype
+        // guard with no keys at all.
+        if layer_names.is_empty() {
+            return 0;
+        }
         let patterns: Vec<(String, String)> = layer_names
             .iter()
             .map(|name| {
@@ -1151,7 +1167,10 @@ impl FullCatalog {
     ///
     /// Unsorted, and its consumer is `pyscx`'s `decode_window`, which folds the
     /// largest decoded shard size to bound a parallel decode — order-independent,
-    /// and it wants the entries and their count, not a maximum `value_max`. Read
+    /// and it wants the entries' shard statistics, not a maximum `value_max`.
+    /// (It reads no length: the `Vec` stays because that function's other arm
+    /// collects too, and two differently-typed iterators would need a box or a
+    /// second copy of the fold.) Read
     /// paths that need shards in **row order** must keep using the
     /// naming-specific, sorting accessors.
     pub fn layer_csr_shards_named(
