@@ -93,7 +93,7 @@ use crate::error::{OpsError, Result};
 use crate::external_layer::{
     display_key_name, examples, first_duplicates, is_joinable_key_column, is_string_column,
     resolve_key_alias, resolve_key_column, string_column, unmatched_examples, ExtraRowPolicy,
-    MissingRowPolicy, OBS_KEY_FALLBACKS,
+    MissingRowPolicy,
 };
 use crate::in_place::{commit_in_place, entry_matches_key, prepare_in_place, read_provenance_ops};
 
@@ -163,9 +163,13 @@ impl ExternalObsData {
     }
 }
 
-/// How the join key is built from obs columns.
+/// How the join key is built from an axis's columns.
+///
+/// Axis-neutral: the obs and var attach ops resolve the same four modes against
+/// their own axis, and a second enum with identical variants would only be a
+/// second place to forget a case. `ObsJoinKey` is retained as an alias.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ObsJoinKey {
+pub enum AxisJoinKey {
     /// Resolve automatically: the pandas index column, then `OBS_KEY_FALLBACKS`.
     #[default]
     Auto,
@@ -206,7 +210,11 @@ pub enum ObsJoinKey {
     Positional,
 }
 
-impl ObsJoinKey {
+/// The obs axis's spelling of [`AxisJoinKey`], kept so existing callers and
+/// the `scx_ops::ObsJoinKey` re-export continue to compile.
+pub type ObsJoinKey = AxisJoinKey;
+
+impl AxisJoinKey {
     /// Human-readable spec, as it would be typed on a command line.
     pub fn describe(&self) -> String {
         match self {
@@ -289,22 +297,29 @@ pub struct AttachObsSummary {
 
 /// What a key looks like on this file, and what would actually work.
 ///
-/// Produced by [`diagnose_obs_key`] and folded into every key-related error, so
-/// a failed import names the fix instead of leaving the caller to guess.
+/// Produced by [`diagnose_obs_key`] / [`crate::diagnose_var_key`] and folded
+/// into every key-related error, so a failed import names the fix instead of
+/// leaving the caller to guess.
 #[derive(Debug, Clone)]
 pub struct KeyDiagnosis {
-    pub n_obs: usize,
+    /// Which axis was analysed: `"obs"` or `"var"`. Carried so the rendered
+    /// text and the binding's row-count key name the caller's own axis instead
+    /// of always saying "obs".
+    pub axis: &'static str,
+    /// Rows on [`Self::axis`] — `n_obs` for obs, `n_vars` for var.
+    pub n_rows: usize,
     /// The key that was resolved (or requested), if one could be resolved.
     pub resolved_key: Option<String>,
-    /// Distinct values of `resolved_key`. Less than `n_obs` means it cannot join.
+    /// Distinct values of `resolved_key`. Less than `n_rows` means it cannot join.
     pub resolved_cardinality: Option<usize>,
-    /// Obs columns whose values are unique across all rows **and can serve as a
+    /// Columns whose values are unique across all rows **and can serve as a
     /// join key** — the actionable list, best candidate first.
     ///
-    /// Ordered: the obs index, then the [`OBS_KEY_FALLBACKS`] barcode spellings,
-    /// then other string columns, then integers. Schema order is only the
-    /// tiebreak — it used to be the whole ranking, which on a file carrying
-    /// imported float score columns put a `*_score` first and the obs index last.
+    /// Ordered: the axis index, then that axis's barcode / gene-id fallback
+    /// spellings, then other string columns, then integers. Schema order is
+    /// only the tiebreak — it used to be the whole ranking, which on a file
+    /// carrying imported float score columns put a `*_score` first and the obs
+    /// index last.
     pub unique_columns: Vec<String>,
     /// Unique 2-column composites, searched only when no single column is unique.
     pub unique_pairs: Vec<(String, String)>,
@@ -327,11 +342,12 @@ pub struct KeyDiagnosis {
 impl KeyDiagnosis {
     /// One-paragraph rendering appended to error messages.
     pub fn describe(&self) -> String {
+        let axis = self.axis;
         let mut s = String::new();
         if let (Some(k), Some(c)) = (&self.resolved_key, self.resolved_cardinality) {
             s.push_str(&format!(
                 "key '{k}' has {c} distinct values over {} rows. ",
-                self.n_obs
+                self.n_rows
             ));
         }
         if !self.unique_columns.is_empty() {
@@ -339,7 +355,7 @@ impl KeyDiagnosis {
             // is now filtered to keys the join accepts — a float column is
             // often unique per row and is deliberately absent from it.
             s.push_str(&format!(
-                "Obs columns that ARE unique and can key a join: {:?}. ",
+                "{axis} columns that ARE unique and can key a join: {:?}. ",
                 self.unique_columns
             ));
         } else if !self.unique_pairs.is_empty() {
@@ -349,11 +365,11 @@ impl KeyDiagnosis {
                 .map(|(a, b)| format!("{a}+{b}"))
                 .collect();
             s.push_str(&format!(
-                "No single obs column is unique; unique 2-column composites: {pairs:?}. "
+                "No single {axis} column is unique; unique 2-column composites: {pairs:?}. "
             ));
         } else {
             s.push_str(&format!(
-                "No unique obs column{} was found — this file may have no usable join key. ",
+                "No unique {axis} column{} was found — this file may have no usable join key. ",
                 if self.pair_search_capped {
                     " (and the 2-column search was capped)"
                 } else {
@@ -390,6 +406,16 @@ impl KeyDiagnosis {
 /// same code the op uses for the target side; the separator is then an
 /// implementation detail neither side can disagree about.
 pub fn build_composite_key(batch: &RecordBatch, columns: &[String]) -> Result<Vec<String>> {
+    build_composite_key_for("obs", batch, columns)
+}
+
+/// [`build_composite_key`] on a named axis, so a var-side composite resolves
+/// `var_names` rather than `obs_names` and its errors say `var`.
+pub fn build_composite_key_for(
+    axis: &'static str,
+    batch: &RecordBatch,
+    columns: &[String],
+) -> Result<Vec<String>> {
     if columns.is_empty() {
         return Err(OpsError::InvalidInput(
             "composite join key needs at least one column".into(),
@@ -397,21 +423,21 @@ pub fn build_composite_key(batch: &RecordBatch, columns: &[String]) -> Result<Ve
     }
     // Every component goes through the same alias resolution a single key does,
     // so `["sample_id", "obs_names"]` works and a composite can never disagree
-    // with `ObsJoinKey::Column` about what a name means.
+    // with `AxisJoinKey::Column` about what a name means.
     let schema = batch.schema();
     let resolved: Vec<String> = columns
         .iter()
-        .map(|c| resolve_key_alias("obs", &schema, c))
+        .map(|c| resolve_key_alias(axis, &schema, c))
         .collect();
     for (name, requested) in resolved.iter().zip(columns) {
         if batch.column_by_name(name).is_none() {
             let present: Vec<String> = schema
                 .fields()
                 .iter()
-                .map(|f| display_key_name("obs", f.name()))
+                .map(|f| display_key_name(axis, f.name()))
                 .collect();
             return Err(OpsError::KeyColumnUnresolved {
-                axis: "obs",
+                axis,
                 detail: format!(
                     "composite key column '{requested}' not found; columns present are {present:?}"
                 ),
@@ -519,20 +545,21 @@ pub fn drop_batch_columns(batch: &RecordBatch, drop: &[String]) -> Result<Record
 /// The reported spec is the physical name, not what the caller typed, so
 /// `AttachObsSummary::obs_key_column` and the provenance entry stay in the
 /// on-disk vocabulary even when the caller used `obs_names`.
-fn resolve_target_key_spec(
+pub(crate) fn resolve_target_key_spec(
+    axis: &'static str,
     schema: &Schema,
-    join_key: &ObsJoinKey,
+    join_key: &AxisJoinKey,
 ) -> Result<(String, Vec<String>)> {
     match join_key {
-        ObsJoinKey::Auto => {
-            let col = resolve_key_column("obs", schema, None)?;
+        AxisJoinKey::Auto => {
+            let col = resolve_key_column(axis, schema, None)?;
             Ok((col.clone(), vec![col]))
         }
-        ObsJoinKey::Column(c) => {
-            let col = resolve_key_column("obs", schema, Some(c))?;
+        AxisJoinKey::Column(c) => {
+            let col = resolve_key_column(axis, schema, Some(c))?;
             Ok((col.clone(), vec![col]))
         }
-        ObsJoinKey::Composite { columns } => {
+        AxisJoinKey::Composite { columns } => {
             if columns.is_empty() {
                 return Err(OpsError::InvalidInput(
                     "composite join key needs at least one column".into(),
@@ -544,7 +571,7 @@ fn resolve_target_key_spec(
             // handed and must not be able to disagree with it.
             let physical: Vec<String> = columns
                 .iter()
-                .map(|c| resolve_key_alias("obs", schema, c))
+                .map(|c| resolve_key_alias(axis, schema, c))
                 .collect();
             // Existence is checked here, against the caller's own spelling.
             // `build_composite_key` also checks, but by the time it runs the
@@ -558,10 +585,10 @@ fn resolve_target_key_spec(
                     let present: Vec<String> = schema
                         .fields()
                         .iter()
-                        .map(|f| display_key_name("obs", f.name()))
+                        .map(|f| display_key_name(axis, f.name()))
                         .collect();
                     return Err(OpsError::KeyColumnUnresolved {
-                        axis: "obs",
+                        axis,
                         detail: format!(
                             "composite key column '{requested}' not found; \
                              columns present are {present:?}"
@@ -571,10 +598,10 @@ fn resolve_target_key_spec(
             }
             Ok((physical.join(","), physical))
         }
-        // Handled by the positional branch in `attach_external_obs_inner`
-        // before this is ever called; an error beats an unreachable!() panic if
-        // a future caller reaches it anyway.
-        ObsJoinKey::Positional => Err(OpsError::InvalidInput(
+        // Handled by the positional branch in each op's `_inner` before this
+        // is ever called; an error beats an unreachable!() panic if a future
+        // caller reaches it anyway.
+        AxisJoinKey::Positional => Err(OpsError::InvalidInput(
             "positional join has no key columns to resolve".into(),
         )),
     }
@@ -583,20 +610,28 @@ fn resolve_target_key_spec(
 /// Build the target-side key strings from a batch already projected to
 /// `physical` (or from the full obs table — either works, the columns are
 /// addressed by name).
-fn materialize_target_keys(batch: &RecordBatch, physical: &[String]) -> Result<Vec<String>> {
+pub(crate) fn materialize_target_keys(
+    axis: &'static str,
+    batch: &RecordBatch,
+    physical: &[String],
+) -> Result<Vec<String>> {
     if physical.len() == 1 {
         string_column(batch, &physical[0])
     } else {
-        build_composite_key(batch, physical)
+        build_composite_key_for(axis, batch, physical)
     }
 }
 
 /// Resolve the target-side keys for `join_key` from a materialized obs table,
 /// returning `(spec, keys)`. Used by [`diagnose_obs_key`], which needs the whole
 /// table anyway.
-fn resolve_target_keys(obs: &RecordBatch, join_key: &ObsJoinKey) -> Result<(String, Vec<String>)> {
-    let (spec, physical) = resolve_target_key_spec(&obs.schema(), join_key)?;
-    let keys = materialize_target_keys(obs, &physical)?;
+pub(crate) fn resolve_target_keys(
+    axis: &'static str,
+    obs: &RecordBatch,
+    join_key: &AxisJoinKey,
+) -> Result<(String, Vec<String>)> {
+    let (spec, physical) = resolve_target_key_spec(axis, &obs.schema(), join_key)?;
+    let keys = materialize_target_keys(axis, obs, &physical)?;
     Ok((spec, keys))
 }
 
@@ -625,11 +660,16 @@ fn distinct_count(columns: &[ArrayRef]) -> Option<usize> {
     Some(seen.len())
 }
 
-/// Build a [`KeyDiagnosis`] from an already-read obs batch.
+/// Build a [`KeyDiagnosis`] from an already-read axis batch.
 ///
-/// Only ever called on an error path (or from the public [`diagnose_obs_key`]),
-/// so the per-column passes never cost anything on a successful import.
-fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> KeyDiagnosis {
+/// Only ever called on an error path (or from the public [`diagnose_obs_key`] /
+/// [`crate::diagnose_var_key`]), so the per-column passes never cost anything
+/// on a successful import.
+pub(crate) fn diagnose_from_axis(
+    axis: &'static str,
+    obs: &RecordBatch,
+    resolved: Option<(&str, &[String])>,
+) -> KeyDiagnosis {
     let n_obs = obs.num_rows();
     let schema = obs.schema();
 
@@ -670,7 +710,10 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
         if index_col.as_deref() == Some(name) {
             return (0, 0);
         }
-        if let Some(pos) = OBS_KEY_FALLBACKS.iter().position(|c| *c == name) {
+        if let Some(pos) = crate::external_layer::key_fallbacks(axis)
+            .iter()
+            .position(|c| *c == name)
+        {
             return (1, pos);
         }
         let is_str = schema
@@ -728,7 +771,7 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
     // Python dict, the CLI print and every error `describe()` feeds at once.
     // `resolve_key_column` accepts `obs_names` back, so each name reported is a
     // name that can be pasted into `key=`.
-    let disp = |n: &String| display_key_name("obs", n);
+    let disp = |n: &String| display_key_name(axis, n);
     let unique_columns: Vec<String> = unique_columns.iter().map(disp).collect();
     let unique_pairs: Vec<(String, String)> = unique_pairs
         .iter()
@@ -742,7 +785,8 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
         .or_else(|| unique_pairs.first().map(|(a, b)| format!("{a},{b}")));
 
     KeyDiagnosis {
-        n_obs,
+        axis,
+        n_rows: n_obs,
         resolved_key: resolved_key.as_ref().map(disp),
         resolved_cardinality,
         unique_columns,
@@ -758,28 +802,44 @@ fn diagnose_from_obs(obs: &RecordBatch, resolved: Option<(&str, &[String])>) -> 
 /// Read-only. Pass the key you intended to use as `requested` to have its
 /// cardinality reported alongside the alternatives; pass `None` to just
 /// enumerate what is available.
-pub fn diagnose_obs_key(path: &Path, requested: Option<&ObsJoinKey>) -> Result<KeyDiagnosis> {
+pub fn diagnose_obs_key(path: &Path, requested: Option<&AxisJoinKey>) -> Result<KeyDiagnosis> {
     let reader = ScxReader::open(path)?;
     let obs = reader.read_obs()?;
-    // A bad requested key must not abort the diagnosis — reporting the
-    // alternatives is the whole point.
-    let resolved = requested.and_then(|k| resolve_target_keys(&obs, k).ok());
-    Ok(match &resolved {
-        Some((spec, keys)) => diagnose_from_obs(&obs, Some((spec.as_str(), keys))),
-        None => diagnose_from_obs(&obs, None),
-    })
+    Ok(diagnose_axis_key("obs", &obs, requested))
+}
+
+/// [`diagnose_obs_key`]'s axis-neutral body, for a batch the caller already has.
+///
+/// A bad requested key must not abort the diagnosis — reporting the
+/// alternatives is the whole point — so an unresolvable request degrades to
+/// "just enumerate what is available".
+pub(crate) fn diagnose_axis_key(
+    axis: &'static str,
+    batch: &RecordBatch,
+    requested: Option<&AxisJoinKey>,
+) -> KeyDiagnosis {
+    let resolved = requested.and_then(|k| resolve_target_keys(axis, batch, k).ok());
+    match &resolved {
+        Some((spec, keys)) => diagnose_from_axis(axis, batch, Some((spec.as_str(), keys))),
+        None => diagnose_from_axis(axis, batch, None),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Join
 // ---------------------------------------------------------------------------
 
-struct ObsRowJoin {
+/// The resolved join: for each target row on the axis, which source row (if
+/// any) supplies its values, plus the three counts every summary reports.
+///
+/// Axis-neutral — the obs and var attach ops build the same thing against their
+/// own axis, and [`scatter`] windows it per shard either way.
+pub(crate) struct AxisRowJoin {
     /// For each target row, the source row that supplies it.
-    source_of_target: Vec<Option<u32>>,
-    n_matched: u64,
-    n_target_absent: u64,
-    n_source_absent: u64,
+    pub(crate) source_of_target: Vec<Option<u32>>,
+    pub(crate) n_matched: u64,
+    pub(crate) n_target_absent: u64,
+    pub(crate) n_source_absent: u64,
 }
 
 /// The failure-path [`KeyDiagnosis`] text, read from `reader` on demand.
@@ -795,35 +855,46 @@ struct ObsRowJoin {
 /// Returns an empty string when obs cannot be read: a failed read must not
 /// replace the join error the user actually needs with an I/O error raised by
 /// the code trying to explain it.
-fn describe_key_diagnosis(reader: &ScxReader, resolved: Option<(&str, &[String])>) -> String {
-    match reader.read_obs() {
-        Ok(obs) => diagnose_from_obs(&obs, resolved).describe(),
+pub(crate) fn describe_key_diagnosis(
+    axis: &'static str,
+    reader: &ScxReader,
+    resolved: Option<(&str, &[String])>,
+) -> String {
+    let read = if axis == "var" {
+        reader.read_var()
+    } else {
+        reader.read_obs()
+    };
+    match read {
+        Ok(batch) => diagnose_from_axis(axis, &batch, resolved).describe(),
         Err(_) => String::new(),
     }
 }
 
-fn build_obs_row_join(
+pub(crate) fn build_axis_row_join(
+    axis: &'static str,
     reader: &ScxReader,
     key_spec: &str,
     target_keys: &[String],
     source_keys: &[String],
-    opts: &AttachObsOptions,
-) -> Result<ObsRowJoin> {
+    missing_row_policy: MissingRowPolicy,
+    extra_row_policy: ExtraRowPolicy,
+) -> Result<AxisRowJoin> {
     let dups = first_duplicates(target_keys);
     if !dups.is_empty() {
-        let diag = describe_key_diagnosis(reader, Some((key_spec, target_keys)));
+        let diag = describe_key_diagnosis(axis, reader, Some((key_spec, target_keys)));
         return Err(OpsError::DuplicateJoinKey {
-            axis: "obs",
+            axis,
             detail: format!(
-                "target obs key '{}' contains duplicates: {dups:?}. {diag}",
-                display_key_name("obs", key_spec),
+                "target {axis} key '{}' contains duplicates: {dups:?}. {diag}",
+                display_key_name(axis, key_spec),
             ),
         });
     }
     let dups = first_duplicates(source_keys);
     if !dups.is_empty() {
         return Err(OpsError::DuplicateJoinKey {
-            axis: "obs",
+            axis,
             detail: format!("source row keys contain duplicates: {dups:?}"),
         });
     }
@@ -853,14 +924,14 @@ fn build_obs_row_join(
     }
 
     if n_matched == 0 {
-        let diag = describe_key_diagnosis(reader, Some((key_spec, target_keys)));
+        let diag = describe_key_diagnosis(axis, reader, Some((key_spec, target_keys)));
         return Err(OpsError::AxisMismatch {
-            axis: "obs",
+            axis,
             detail: format!(
                 "no target row key matched any source row key on '{}'. Target \
                  examples: {:?}; source examples: {:?}. Check for a sample-name prefix \
                  or a '-1' suffix difference. {diag}",
-                display_key_name("obs", key_spec),
+                display_key_name(axis, key_spec),
                 examples(target_keys),
                 examples(source_keys),
             ),
@@ -868,30 +939,31 @@ fn build_obs_row_join(
     }
 
     let n_source_absent = used.iter().filter(|u| !**u).count() as u64;
-    if n_source_absent > 0 && opts.extra_row_policy == ExtraRowPolicy::Error {
+    if n_source_absent > 0 && extra_row_policy == ExtraRowPolicy::Error {
         return Err(OpsError::AxisMismatch {
-            axis: "obs",
+            axis,
             detail: format!(
                 "{n_source_absent} source rows have no matching target row \
                  (extra_row_policy = Error)"
             ),
         });
     }
-    if n_target_absent > 0 && opts.missing_row_policy == MissingRowPolicy::Error {
+    if n_target_absent > 0 && missing_row_policy == MissingRowPolicy::Error {
         return Err(OpsError::AxisMismatch {
-            axis: "obs",
+            axis,
             detail: format!(
                 "{n_target_absent} target rows have no matching source row \
                  (missing_row_policy = Error)"
             ),
         });
     }
-    if let Some((level, msg)) = obs_join_coverage_report(
+    if let Some((level, msg)) = axis_join_coverage_report(
+        axis,
         n_matched,
         target_keys.len() as u64,
         n_target_absent,
         n_source_absent,
-        &display_key_name("obs", key_spec),
+        &display_key_name(axis, key_spec),
         || {
             // Examples from the keys that did NOT match — a target "100000"
             // beside a source "100000-1" names the suffix instantly, where head
@@ -907,7 +979,7 @@ fn build_obs_row_join(
         log::log!(level, "{msg}");
     }
 
-    Ok(ObsRowJoin {
+    Ok(AxisRowJoin {
         source_of_target,
         n_matched,
         n_target_absent,
@@ -935,7 +1007,8 @@ fn build_obs_row_join(
 ///
 /// `examples` is a closure so the (allocating) example extraction is skipped
 /// entirely on the coverage branch and on the no-report path.
-fn obs_join_coverage_report(
+fn axis_join_coverage_report(
+    axis: &'static str,
     n_matched: u64,
     n_target_total: u64,
     n_target_absent: u64,
@@ -950,7 +1023,7 @@ fn obs_join_coverage_report(
         return Some((
             log::Level::Info,
             format!(
-                "external obs join coverage: {n_matched} of {n_target_total} target rows \
+                "external {axis} join coverage: {n_matched} of {n_target_total} target rows \
                  matched on '{key_name}'; {n_target_absent} rows left null. Every source \
                  row matched, so this is a partial-coverage import, not a key mismatch."
             ),
@@ -960,7 +1033,7 @@ fn obs_join_coverage_report(
     Some((
         log::Level::Warn,
         format!(
-            "external obs join matched only {n_matched} of {n_target_total} target rows \
+            "external {axis} join matched only {n_matched} of {n_target_total} target rows \
              on '{key_name}', and {n_source_absent} source rows matched no target row — \
              check for a sample-name prefix or a '-1' suffix difference; target examples \
              {target_examples:?}, source examples {source_examples:?}"
@@ -974,9 +1047,9 @@ fn obs_join_coverage_report(
 ///
 /// The row window is what lets the whole build run one obs shard at a time: the
 /// output is shard-length, not `n_obs`-length.
-fn scatter(
+pub(crate) fn scatter(
     col: &ArrayRef,
-    join: &ObsRowJoin,
+    join: &AxisRowJoin,
     row_start: usize,
     row_end: usize,
 ) -> Result<ArrayRef> {
@@ -993,12 +1066,25 @@ fn scatter(
 // ---------------------------------------------------------------------------
 
 fn planned_obs_columns(data: &ExternalObsData, opts: &AttachObsOptions) -> Vec<String> {
+    planned_columns(&data.row_annotations, opts.status_column.as_deref())
+}
+
+/// The names an attach is about to write: the status marker (if any), then the
+/// annotation columns in source order.
+///
+/// The order matters — it is the order `build_new_axis_batch` appends them in,
+/// and the collision checks, the predicate-index staleness test and the summary
+/// all read this one list.
+pub(crate) fn planned_columns(
+    annotations: &RecordBatch,
+    status_column: Option<&str>,
+) -> Vec<String> {
     let mut cols = Vec::new();
-    if let Some(name) = &opts.status_column {
-        cols.push(name.clone());
+    if let Some(name) = status_column {
+        cols.push(name.to_string());
     }
     cols.extend(
-        data.row_annotations
+        annotations
             .schema()
             .fields()
             .iter()
@@ -1018,15 +1104,43 @@ fn build_new_obs(
     obs: &RecordBatch,
     data: &ExternalObsData,
     opts: &AttachObsOptions,
-    join: &ObsRowJoin,
+    join: &AxisRowJoin,
+    row_start: usize,
+) -> Result<RecordBatch> {
+    build_new_axis_batch(
+        "obs",
+        obs,
+        &data.row_annotations,
+        &planned_obs_columns(data, opts),
+        opts.status_column.as_deref(),
+        join,
+        row_start,
+    )
+}
+
+/// [`build_new_obs`]'s axis-neutral body: drop the columns being written, append
+/// the status marker, then scatter each annotation column onto rows
+/// `[row_start, row_start + batch.num_rows())`.
+///
+/// `axis` appears only in the two error messages and the overrun bound's
+/// wording; everything else is type- and axis-agnostic, which is why the var
+/// attach calls this rather than owning a second copy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_new_axis_batch(
+    axis: &str,
+    obs: &RecordBatch,
+    annotations: &RecordBatch,
+    planned: &[String],
+    status_column: Option<&str>,
+    join: &AxisRowJoin,
     row_start: usize,
 ) -> Result<RecordBatch> {
     let row_end = row_start + obs.num_rows();
     if row_end > join.source_of_target.len() {
         return Err(OpsError::ShapeMismatch {
             detail: format!(
-                "obs rows [{row_start}, {row_end}) overrun the {}-row join built \
-                 from the header's n_obs",
+                "{axis} rows [{row_start}, {row_end}) overrun the {}-row join built \
+                 from the header's axis length",
                 join.source_of_target.len()
             ),
         });
@@ -1040,7 +1154,6 @@ fn build_new_obs(
     let mut columns: Vec<ArrayRef> = obs.columns().to_vec();
 
     // Drop any column we are about to add (the overwrite path).
-    let planned = planned_obs_columns(data, opts);
     let keep: Vec<bool> = fields.iter().map(|f| !planned.contains(f.name())).collect();
     fields = fields
         .into_iter()
@@ -1053,7 +1166,7 @@ fn build_new_obs(
         .filter_map(|(c, k)| k.then_some(c))
         .collect();
 
-    if let Some(name) = &opts.status_column {
+    if let Some(name) = status_column {
         let arr: StringArray = join.source_of_target[row_start..row_end]
             .iter()
             .map(|o| Some(if o.is_some() { "present" } else { "absent" }))
@@ -1062,8 +1175,8 @@ fn build_new_obs(
         columns.push(Arc::new(arr) as ArrayRef);
     }
 
-    for (i, f) in data.row_annotations.schema().fields().iter().enumerate() {
-        let scattered = scatter(data.row_annotations.column(i), join, row_start, row_end)?;
+    for (i, f) in annotations.schema().fields().iter().enumerate() {
+        let scattered = scatter(annotations.column(i), join, row_start, row_end)?;
         // Unmatched rows become null, so the field must admit nulls regardless
         // of how the source declared it. The type and the field metadata are
         // the source's: a categorical lands as a dictionary, `ordered` intact.
@@ -1075,7 +1188,7 @@ fn build_new_obs(
 
     let schema = Arc::new(Schema::new(fields).with_metadata(obs.schema().metadata().clone()));
     RecordBatch::try_new(schema, columns)
-        .map_err(|e| OpsError::InvalidInput(format!("failed to build new obs: {e}")))
+        .map_err(|e| OpsError::InvalidInput(format!("failed to build new {axis}: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,7 +1448,7 @@ pub(crate) fn check_uns_collisions(
 /// batch has to be `n_obs` rows. Only reached when the caller supplies
 /// embeddings — no doublet caller does — and bounding it needs sharded
 /// `ObsmEmbeddingShard` writes.
-fn build_obsm(data: &ExternalObsData, join: &ObsRowJoin) -> Result<Vec<(String, RecordBatch)>> {
+fn build_obsm(data: &ExternalObsData, join: &AxisRowJoin) -> Result<Vec<(String, RecordBatch)>> {
     let n_obs = join.source_of_target.len();
     let mut out = Vec::new();
     for (name, batch) in &data.row_embeddings {
@@ -1463,7 +1576,19 @@ fn validate_shape(data: &ExternalObsData, positional: bool) -> Result<()> {
 /// import would silently kill query pushdown for callers who only ever *add*
 /// columns, which is the overwhelmingly common case.
 pub(crate) fn obs_index_would_go_stale(reader: &ScxReader, planned: &[String]) -> Result<bool> {
-    let existing = indexed_column_names(reader.read_obs_predicate_index_bytes()?)?;
+    index_would_go_stale(reader.read_obs_predicate_index_bytes()?, planned)
+}
+
+/// [`obs_index_would_go_stale`] on already-read index bytes, so the var attach
+/// and the layer op ask the same question of their own axis.
+///
+/// One test rather than a `contains` open-coded per op: the whole point of the
+/// check is that a *pure add* keeps the index, and an op that gets the
+/// intersection wrong in the conservative direction silently kills pushdown
+/// while an op that gets it wrong in the other direction silently answers
+/// queries from stale values.
+pub(crate) fn index_would_go_stale(bytes: Option<&[u8]>, planned: &[String]) -> Result<bool> {
+    let existing = indexed_column_names(bytes)?;
     Ok(existing.iter().any(|name| planned.contains(name)))
 }
 
@@ -1825,14 +1950,14 @@ fn attach_external_obs_inner(
                         }
                     })
                     .collect();
-                ObsRowJoin {
+                AxisRowJoin {
                     source_of_target,
                     n_matched: n_live,
                     n_target_absent: n_obs - n_live,
                     n_source_absent: 0,
                 }
             }
-            _ => ObsRowJoin {
+            _ => AxisRowJoin {
                 source_of_target: (0..n_obs).map(|i| Some(i as u32)).collect(),
                 n_matched: n_obs,
                 n_target_absent: 0,
@@ -1889,7 +2014,7 @@ fn attach_external_obs_inner(
             // with its own row labels is still "row i annotates row i". A
             // multi-level index compares as the same composite string the
             // key join builds, on both sides.
-            let target = materialize_target_keys(&probe, &index_cols)?;
+            let target = materialize_target_keys("obs", &probe, &index_cols)?;
             let index_name = index_cols.join("+");
             let landed: Vec<(usize, u32)> = join
                 .source_of_target
@@ -1923,7 +2048,7 @@ fn attach_external_obs_inner(
         }
         (opts.join_key.describe(), join)
     } else {
-        let (key_spec, key_columns) = resolve_target_key_spec(&obs_schema, &opts.join_key)?;
+        let (key_spec, key_columns) = resolve_target_key_spec("obs", &obs_schema, &opts.join_key)?;
         let key_batch = read_obs_keys_validated(reader, &obs_schema, &key_columns, n_obs)?;
         if key_batch.num_rows() as u64 != n_obs {
             return Err(OpsError::ShapeMismatch {
@@ -1933,10 +2058,18 @@ fn attach_external_obs_inner(
                 ),
             });
         }
-        let target_keys = materialize_target_keys(&key_batch, &key_columns)?;
+        let target_keys = materialize_target_keys("obs", &key_batch, &key_columns)?;
         // The key diagnosis costs the whole obs table, so `build_obs_row_join`
         // takes the reader and pays for it only on the arms that print it.
-        let row_join = build_obs_row_join(reader, &key_spec, &target_keys, &data.row_keys, opts)?;
+        let row_join = build_axis_row_join(
+            "obs",
+            reader,
+            &key_spec,
+            &target_keys,
+            &data.row_keys,
+            opts.missing_row_policy,
+            opts.extra_row_policy,
+        )?;
         (key_spec, row_join)
     };
 

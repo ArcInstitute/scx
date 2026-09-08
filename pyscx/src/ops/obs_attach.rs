@@ -94,7 +94,11 @@ pub(crate) fn key_diagnosis_dict<'py>(
     d: &scx_ops::KeyDiagnosis,
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
-    out.set_item("n_obs", d.n_obs)?;
+    // The row-count key names the caller's own axis: `diagnose_obs_key` returns
+    // `n_obs`, `diagnose_var_key` `n_vars`. One dict builder, because every
+    // other field is identical and a second copy would drift on the next one
+    // added.
+    out.set_item(if d.axis == "var" { "n_vars" } else { "n_obs" }, d.n_rows)?;
     out.set_item("resolved_key", d.resolved_key.clone())?;
     out.set_item("resolved_cardinality", d.resolved_cardinality)?;
     out.set_item("unique_columns", d.unique_columns.clone())?;

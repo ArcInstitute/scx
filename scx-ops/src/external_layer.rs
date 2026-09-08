@@ -110,7 +110,7 @@ pub(crate) const OBS_KEY_FALLBACKS: &[&str] = &[
     "index",
 ];
 
-const VAR_KEY_FALLBACKS: &[&str] = &[
+pub(crate) const VAR_KEY_FALLBACKS: &[&str] = &[
     "gene_id",
     "gene_ids",
     "id",
@@ -126,6 +126,23 @@ const VAR_KEY_FALLBACKS: &[&str] = &[
 /// Physical arrow field names that carry a frame's index. Kept in step with
 /// the literal probe in [`scx_format_io::resolve_index_columns`].
 const INDEX_FIELD_NAMES: &[&str] = &["__index_level_0__", "_index"];
+
+/// The fallback key spellings for an axis, in preference order.
+///
+/// One dispatcher rather than a `match` at each site: `resolve_key_column`, the
+/// key diagnosis and the "candidates tried" error text must agree on what a
+/// bare `key=None` would have picked, and they live in two different modules.
+pub(crate) fn key_fallbacks(axis: &str) -> &'static [&'static str] {
+    debug_assert!(
+        axis == "obs" || axis == "var",
+        "unknown axis {axis:?}: expected \"obs\" or \"var\""
+    );
+    if axis == "var" {
+        VAR_KEY_FALLBACKS
+    } else {
+        OBS_KEY_FALLBACKS
+    }
+}
 
 /// The user-facing spelling of an axis's index, and the alias a caller may pass
 /// to name it.
@@ -1158,11 +1175,7 @@ pub(crate) fn resolve_key_column(
         }
     }
 
-    let fallbacks = if axis == "obs" {
-        OBS_KEY_FALLBACKS
-    } else {
-        VAR_KEY_FALLBACKS
-    };
+    let fallbacks = key_fallbacks(axis);
     let present: Vec<&str> = fallbacks
         .iter()
         .copied()
@@ -1197,12 +1210,7 @@ pub(crate) fn resolve_key_column(
 /// the external tool may have keyed on the other one.
 pub(crate) fn candidate_key_columns(axis: &'static str, batch: &RecordBatch) -> Vec<String> {
     let schema = batch.schema();
-    let fallbacks = if axis == "obs" {
-        OBS_KEY_FALLBACKS
-    } else {
-        VAR_KEY_FALLBACKS
-    };
-    fallbacks
+    key_fallbacks(axis)
         .iter()
         .filter(|c| {
             schema

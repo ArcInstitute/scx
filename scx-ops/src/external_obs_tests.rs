@@ -609,7 +609,7 @@ fn diagnose_obs_key_reports_unique_columns_and_a_suggestion() {
     let path = write_fixture_with_obs(dir.path(), "a.scx", obs_census_shaped(), 2, 1);
 
     let d = diagnose_obs_key(&path, Some(&ObsJoinKey::Column("index".into()))).unwrap();
-    assert_eq!(d.n_obs, 4);
+    assert_eq!(d.n_rows, 4);
     assert_eq!(d.resolved_key.as_deref(), Some("index"));
     assert_eq!(d.resolved_cardinality, Some(2));
     assert_eq!(d.unique_columns, vec!["soma_joinid".to_string()]);
@@ -1700,7 +1700,7 @@ fn diagnoses_a_real_atlas_whose_index_is_not_a_key() {
     let path = PathBuf::from(path);
 
     let d = diagnose_obs_key(&path, Some(&ObsJoinKey::Auto)).unwrap();
-    eprintln!("n_obs                 = {}", d.n_obs);
+    eprintln!("n_obs                 = {}", d.n_rows);
     eprintln!("resolved_key          = {:?}", d.resolved_key);
     eprintln!("resolved_cardinality  = {:?}", d.resolved_cardinality);
     eprintln!("unique_columns        = {:?}", d.unique_columns);
@@ -1708,7 +1708,7 @@ fn diagnoses_a_real_atlas_whose_index_is_not_a_key() {
     eprintln!("suggestion            = {:?}", d.suggestion);
     eprintln!("describe()            = {}", d.describe());
 
-    assert!(d.n_obs > 0);
+    assert!(d.n_rows > 0);
     assert!(
         !d.unique_columns.is_empty() || !d.unique_pairs.is_empty(),
         "no usable join key found on {} — the importer would be a dead end here",
@@ -1741,7 +1741,8 @@ fn some_examples() -> (Vec<String>, Vec<String>) {
 /// shape of a key-format-mismatch diagnostic.
 #[test]
 fn partial_coverage_reports_coverage_at_info_without_examples() {
-    let (level, msg) = obs_join_coverage_report(
+    let (level, msg) = axis_join_coverage_report(
+        "obs",
         186_649,
         500_000,
         313_351,
@@ -1779,7 +1780,7 @@ fn partial_coverage_reports_coverage_at_info_without_examples() {
 /// example pair, and the hard-won prefix / `-1`-suffix hint.
 #[test]
 fn unmatched_source_rows_still_warn_with_examples() {
-    let (level, msg) = obs_join_coverage_report(10, 100, 90, 40, "barcode", some_examples)
+    let (level, msg) = axis_join_coverage_report("obs", 10, 100, 90, 40, "barcode", some_examples)
         .expect("below half, so something must be reported");
 
     assert_eq!(level, log::Level::Warn);
@@ -1801,13 +1802,29 @@ fn unmatched_source_rows_still_warn_with_examples() {
 #[test]
 fn high_coverage_reports_nothing() {
     assert!(
-        obs_join_coverage_report(50, 100, 50, 0, "obs_names", examples_must_not_be_needed)
-            .is_none(),
+        axis_join_coverage_report(
+            "obs",
+            50,
+            100,
+            50,
+            0,
+            "obs_names",
+            examples_must_not_be_needed
+        )
+        .is_none(),
         "exactly half is not below half"
     );
     assert!(
-        obs_join_coverage_report(99, 100, 1, 20, "obs_names", examples_must_not_be_needed)
-            .is_none(),
+        axis_join_coverage_report(
+            "obs",
+            99,
+            100,
+            1,
+            20,
+            "obs_names",
+            examples_must_not_be_needed
+        )
+        .is_none(),
         "high coverage stays silent even with unmatched source rows"
     );
 }
@@ -1818,8 +1835,8 @@ fn high_coverage_reports_nothing() {
 #[test]
 fn identical_coverage_splits_on_unmatched_source_rows_alone() {
     let coverage =
-        obs_join_coverage_report(10, 100, 90, 0, "k", examples_must_not_be_needed).unwrap();
-    let mismatch = obs_join_coverage_report(10, 100, 90, 5, "k", some_examples).unwrap();
+        axis_join_coverage_report("obs", 10, 100, 90, 0, "k", examples_must_not_be_needed).unwrap();
+    let mismatch = axis_join_coverage_report("obs", 10, 100, 90, 5, "k", some_examples).unwrap();
     assert_eq!(coverage.0, log::Level::Info);
     assert_eq!(mismatch.0, log::Level::Warn);
     assert_ne!(

@@ -51,10 +51,10 @@ pub use external_layer::{
     ExtraRowPolicy, MissingRowPolicy, ShardRangeSource,
 };
 pub use external_obs::{
-    attach_external_obs, build_composite_key, classify_obs_frame_length, diagnose_obs_key,
-    drop_batch_columns, obs_key_values, resolve_obs_key_column, AttachObsOptions, AttachObsSummary,
-    ExternalObsData, KeyDiagnosis, ObsFrameRowSpace, ObsJoinKey, ObsRewrite,
-    COMPOSITE_KEY_SEPARATOR,
+    attach_external_obs, build_composite_key, build_composite_key_for, classify_obs_frame_length,
+    diagnose_obs_key, drop_batch_columns, obs_key_values, resolve_obs_key_column, AttachObsOptions,
+    AttachObsSummary, AxisJoinKey, ExternalObsData, KeyDiagnosis, ObsFrameRowSpace, ObsJoinKey,
+    ObsRewrite, COMPOSITE_KEY_SEPARATOR,
 };
 pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};
