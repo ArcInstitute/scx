@@ -217,7 +217,9 @@ scx_merge <- function(inputs, output, index_obs = NULL, index_var = NULL,
 #'   a multi-library merge where \code{sample_id} + \code{barcode} is unique but
 #'   neither is alone. Mutually exclusive with \code{key}.
 #' @param key_column Target obs column to join \code{key} against.
-#'   \code{NULL} auto-resolves it.
+#'   \code{NULL} auto-resolves it. It names the target side of a \code{key}
+#'   join, so supplying it without \code{key} is an error rather than being
+#'   silently ignored.
 #' @param prefix Prepended to every attached column name.
 #' @param status_column Obs column recording \code{"present"}/\code{"absent"}
 #'   per row. \code{NULL} omits it.
@@ -270,6 +272,16 @@ scx_attach_obs <- function(path, df, key, key_columns = NULL,
   if (missing(key)) key <- character(0)
   if (!is.null(key_columns) && length(key) > 0L) {
     stop("pass either `key` or `key_columns`, not both.", call. = FALSE)
+  }
+
+  # Same reasoning as `scx_attach_var`: `key_column` names the TARGET obs
+  # column that `key`'s values are matched against, and the Rust side reads it
+  # only on the `key` branch — so beside `key_columns`, or alone, it was
+  # silently ignored while the join ran against the source column's own name.
+  if (!is.null(key_column) && length(key) == 0L) {
+    stop("`key_column` names the target obs column that `key`'s values join ",
+         "against, so it needs `key=`. To join on columns of `df`, use ",
+         "`key_columns=` alone.", call. = FALSE)
   }
 
   .Call(

@@ -1564,3 +1564,75 @@ fn a_zero_overlap_var_join_does_not_mention_barcode_suffixes() {
         "the obs wording must not reach a var caller: {msg}"
     );
 }
+
+/// The middle case: a two-column index where one column survives the overwrite
+/// and one does not.
+///
+/// The two existing arms cover all-survive (`rebuilt`, empty not-carried) and
+/// none-survive (`dropped`, one name). Neither pins the branch where the
+/// replacement section exists *and* something was lost — which is the outcome
+/// that most needs reporting, since a caller sees a live index and would not
+/// think to check what it still covers.
+#[test]
+fn a_partial_index_loss_is_rebuilt_and_still_names_what_it_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = write_fixture(
+        dir.path(),
+        "partial.scx",
+        4,
+        var_batch(4),
+        VarLayout::Single,
+        &["feature_type", "gene_id"],
+    );
+
+    // Overwrite only `feature_type`, with booleans. `gene_id` is untouched and
+    // still indexable, so a replacement section exists — but `feature_type` is
+    // gone from it.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "feature_type",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![true, false, true, false]))],
+    )
+    .unwrap();
+    let data = ExternalVarData {
+        row_keys: gene_names(f.n_vars),
+        row_annotations: batch,
+        uns: serde_json::Map::new(),
+        source_checksum: None,
+        source_name: None,
+    };
+    let o = AttachVarOptions {
+        overwrite: true,
+        status_column: None,
+        ..opts()
+    };
+    let s = attach_external_var(&f.path, &data, &o).unwrap();
+
+    assert!(s.var_index_rebuilt, "gene_id is still indexable");
+    assert!(!s.var_index_dropped, "so the section is not retired");
+    assert_eq!(
+        s.var_columns_not_carried,
+        vec!["feature_type".to_string()],
+        "and the column that fell out must still be named"
+    );
+
+    let bytes = var_index_bytes(&f.path).expect("a replacement section exists");
+    let idx =
+        scx_engine::PredicateIndex::read_from(&mut std::io::Cursor::new(bytes.as_slice())).unwrap();
+    let covered: Vec<String> = idx
+        .columns
+        .iter()
+        .map(|c| match c {
+            scx_engine::index::IndexedColumn::Categorical(cat) => cat.column_name.clone(),
+            scx_engine::index::IndexedColumn::Numeric(num) => num.column_name.clone(),
+        })
+        .collect();
+    assert_eq!(
+        covered,
+        vec!["gene_id".to_string()],
+        "the rebuilt index covers exactly what survived"
+    );
+}

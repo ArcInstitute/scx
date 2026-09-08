@@ -599,8 +599,14 @@ flags; any other value raises `ValueError`. There is no `force` analogue — pas
 `pyscx.cellbender_import`) attaches a CellBender `remove-background` output to
 an existing file as a layer, **in place**. It appends new sections at EOF and
 repoints the catalog — the same harness `append` and `modify_metadata` use — so
-`X`, the CSC sidecar, `.raw`, deletion vectors, detection bitmaps and predicate
-indexes all survive, and `scx rollback` undoes the whole import.
+`X`, the CSC sidecar, `.raw`, deletion vectors and detection bitmaps all
+survive, and `scx rollback` undoes the whole import. Predicate indexes survive a
+pure column *add* on either axis; an `--overwrite` of an indexed column does not
+— the obs index is dropped, and the **var** index is rebuilt over the new values
+or, when none of the columns it covered can still be indexed, retired. The CLI
+and the Python result report which happened (`var_index_rebuilt` /
+`var_index_dropped` / `var_columns_not_carried`), on `--dry-run` as well as a
+real import.
 
 The join is by **barcode string, never by row position**. CellBender's
 `<name>_filtered.h5` stores rows in descending-UMI order rather than the input's
@@ -611,8 +617,9 @@ absent from the CellBender output become empty layer rows marked
 
 Because the join is the whole risk surface, `--dry-run` runs the join and every
 validation that does not require decoding a non-key obs column (see the memory
-section below for that one gap), prints the match counts and the obs rewrite
-path, and writes nothing. Use it before importing onto a large file.
+section below for that one gap), prints the match counts, the obs rewrite path
+and the var predicate-index outcome, and writes nothing. Use it before importing
+onto a large file.
 
 Emitted alongside the layer: `obs` gets `cellbender_status`,
 `cellbender_cell_probability`, `cellbender_cell_size`,
@@ -934,7 +941,8 @@ three are decided before any write, so `--dry-run` reports the same outcome the
 real import produces — which column survives depends on the *new* values, so
 the planning decision alone cannot say.
 
-Both are also reported by `cellbender-import`, the other op that writes var.
+All three are reported by `cellbender-import` too, the other op that writes
+var — on its `--dry-run` as well.
 
 Note that no query path reads the var predicate index today: `filter_var`
 evaluates its predicates directly against the assembled `var` batch. Keeping

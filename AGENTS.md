@@ -49,14 +49,14 @@ cargo test -p scx-convert --features hdf5
 cargo test -p scx-cli --features hdf5 -- --test-threads=1
 # CI's `Test (hdf5 features)` job runs only the hdf5-GATED subset instead — a
 # --skip list of the 7 ungated scx-convert module prefixes plus `--test`
-# selection of the 4 hdf5-gated scx-cli test binaries (see ci.yml; a dedup-guard
+# selection of the 5 hdf5-gated scx-cli test binaries (see ci.yml; a dedup-guard
 # step pins both lists to the crates' layout and enforces that hdf5-gated tests
 # live in hdf5-gated homes).
 # `--test-threads=1` is required, not tuning: the scx-cli hdf5 tests spawn the
 # `scx` binary to open an h5ad the test process just created, and in parallel
 # libhdf5 refuses the child's H5Fopen with `unable to lock file, errno = 11`.
 # Measured on ext4 — it is cargo's parallel harness, not a network-filesystem
-# quirk. The lock needs it only for the three binaries that link the hdf5 crate
+# quirk. The lock needs it only for the four binaries that link the hdf5 crate
 # (CI serializes those plus doublet_import_hdf5, which rides along); every
 # other scx-cli target never touches libhdf5.
 # `HDF5_USE_FILE_LOCKING=FALSE` also works and is the convenient local escape on

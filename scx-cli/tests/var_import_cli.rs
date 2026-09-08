@@ -537,14 +537,19 @@ ENSG1,false
     );
     let out = String::from_utf8_lossy(&preview.stdout);
     assert!(
-        out.contains("DROPPED"),
-        "a dry run must report the drop it is previewing: {out}"
+        out.contains("would be DROPPED"),
+        "a dry run must report the drop it is previewing, in the conditional: {out}"
+    );
+    assert!(
+        !out.contains("was DROPPED"),
+        "and must not claim it already happened, one line above \
+         'nothing written': {out}"
     );
 
     let real = run(&[]);
     assert!(real.status.success());
     let out = String::from_utf8_lossy(&real.stdout);
-    assert!(out.contains("DROPPED"), "{out}");
+    assert!(out.contains("was DROPPED"), "{out}");
     assert!(out.contains("no longer covers"), "{out}");
     assert!(
         ScxReader::open(&path)

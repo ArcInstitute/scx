@@ -241,9 +241,9 @@ cargo test -p scx-cli --features hdf5 -- --test-threads=1
 
 CI runs only the hdf5-**gated** subset instead — `--features hdf5` is additive,
 so the bare commands re-run ~296 tests the default `test` job already covered.
-The job skips scx-convert's 7 ungated module prefixes and selects scx-cli's 4
+The job skips scx-convert's 7 ungated module prefixes and selects scx-cli's 5
 hdf5-gated test binaries (`convert_stream`, `cellbender_cli`, `convert_subset`,
-`doublet_import_hdf5`); a dedup-guard step pins both selection lists against
+`doublet_import_hdf5`, `var_import_hdf5`); a dedup-guard step pins both selection lists against
 the crates' layout — and enforces the layout rule that hdf5-gated tests live in
 hdf5-gated homes — so a new hdf5-gated test cannot silently fall out of both
 lanes.
@@ -260,7 +260,7 @@ make libhdf5 refuse the child's `H5Fopen` with
 `unable to lock file, errno = 11`. Measured on ext4: most of the tests in
 `convert_stream.rs` fail that way in parallel, and all pass serialised — so
 this is cargo's parallel harness, **not** a network-filesystem quirk. The lock
-serialization exists for the three binaries that reference the `hdf5` crate
+serialization exists for the four binaries that reference the `hdf5` crate
 (`convert_stream`, `cellbender_cli`, `convert_subset`); `doublet_import_hdf5`
 never links it and merely rides in the same serialized invocation.
 `scx-convert`'s suite is unaffected (its tests spawn no child processes) and

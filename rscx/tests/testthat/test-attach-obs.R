@@ -209,6 +209,23 @@ test_that("key and key_columns are mutually exclusive", {
   )
 })
 
+test_that("key_column without key is an error, not a silent no-op", {
+  # `key_column` names the TARGET obs column that `key`'s values are matched
+  # against, and the Rust side reads it only on the `key` branch — so alone, or
+  # beside `key_columns`, it used to be accepted and ignored while the join ran
+  # against something else. Same guard as scx_attach_var.
+  path <- attach_fixture()
+  on.exit(unlink(path), add = TRUE)
+
+  keys <- rownames(obs_of(path))
+  df <- data.frame(score = seq_along(keys) * 1.0, alt = keys,
+                   stringsAsFactors = FALSE)
+
+  expect_error(scx_attach_obs(path, df, key_columns = "alt",
+                              key_column = "barcode"),
+               "needs `key=")
+})
+
 test_that("key_columns joins on a column of the data.frame", {
   path <- attach_fixture()
   on.exit(unlink(path), add = TRUE)

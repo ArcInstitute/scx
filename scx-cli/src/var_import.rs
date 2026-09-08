@@ -182,23 +182,35 @@ pub fn run_var_import(
     // new values before anything is written, so a preview can and must report
     // it. A caller who indexed a var column deliberately needs to know it is
     // about to lose pushdown, not to discover it afterwards.
+    // Past tense only once something has happened: on a preview these are
+    // still predictions, and "was DROPPED" one line above "nothing written"
+    // reads as an accomplished fact.
+    let (verb_rebuilt, verb_dropped, verb_covers) = if dry_run {
+        (
+            "would be rebuilt",
+            "would be DROPPED",
+            "would no longer cover",
+        )
+    } else {
+        ("was rebuilt", "was DROPPED", "no longer covers")
+    };
     if s.var_index_rebuilt {
         println!(
-            "Note: the var predicate index was rebuilt — this import overwrote a \
-             column it covered, so its entries now describe the new values."
+            "Note: the var predicate index {verb_rebuilt} — this import overwrites \
+             a column it covered, so its entries describe the new values."
         );
     }
     if s.var_index_dropped {
         println!(
-            "Note: the var predicate index was DROPPED — this import overwrote \
+            "Note: the var predicate index {verb_dropped} — this import overwrites \
              every column it covered with values that cannot be indexed, so no \
-             replacement was written."
+             replacement is written."
         );
     }
     if !s.var_columns_not_carried.is_empty() {
         println!(
-            "Note: the var index no longer covers {:?} — the new values cannot \
-             be indexed.",
+            "Note: the var index {verb_covers} {:?} — the new values cannot be \
+             indexed.",
             s.var_columns_not_carried
         );
     }

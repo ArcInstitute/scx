@@ -742,7 +742,16 @@ fn attach_external_layer_inner(
     // --- Build the new var / uns in memory ---------------------------------
     // The obs axis is built inside the write loop below, one shard at a time.
     let var_join = var_column_join(var.num_rows(), &col_map);
-    let new_var = build_new_var_window(&var, data, &var_join, 0)?;
+    // Needed on two paths and skipped otherwise, the same gate the var attach
+    // uses: the single-section write emits it directly and an index rebuild
+    // indexes it, while a *streamed* write rebuilds per shard (to keep each
+    // shard's own encodings) and never looks at it.
+    let need_whole = !var_streamed || retire_var_index;
+    let new_var = if need_whole {
+        Some(build_new_var_window(&var, data, &var_join, 0)?)
+    } else {
+        None
+    };
 
     // The replacement var index, decided from the new *values* rather than
     // from the planning boolean: which covered columns survive is only knowable
@@ -750,8 +759,11 @@ fn attach_external_layer_inner(
     // indexed), so this is also what makes the `dry_run` preview agree with the
     // write. The bytes are written below rather than rebuilt.
     let (new_var_index_bytes, var_columns_not_carried) = if retire_var_index {
+        let whole = new_var
+            .as_ref()
+            .expect("retire_var_index implies need_whole");
         let pass = crate::predicate_index::ObsVarIndexPass::carried(&[], &existing_var_index);
-        let (bytes, covered) = pass.build_var_bytes(&new_var, n_vars_total)?;
+        let (bytes, covered) = pass.build_var_bytes(whole, n_vars_total)?;
         let missing: Vec<String> = existing_var_index
             .iter()
             .filter(|c| !covered.contains(c))
@@ -883,7 +895,7 @@ fn attach_external_layer_inner(
             |shard, row_start| build_new_var_window(shard, data, &var_join, row_start),
         )?;
     } else {
-        writer.write_var(&new_var)?;
+        writer.write_var(new_var.as_ref().expect("!var_streamed implies need_whole"))?;
     }
 
     // The var-axis half of the staleness question, which this op only ever
