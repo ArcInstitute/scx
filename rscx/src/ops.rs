@@ -919,6 +919,7 @@ fn scx_attach_var_impl(
         var_key_column = scx_ops::display_key_name("var", &s.var_key_column),
         var_columns_added = s.var_columns_added,
         var_index_rebuilt = s.var_index_rebuilt,
+        var_index_dropped = s.var_index_dropped,
         var_columns_not_carried = s.var_columns_not_carried,
         var_streamed = s.var_streamed,
         dry_run = dry_run

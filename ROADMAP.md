@@ -504,7 +504,14 @@ count *matrix*; this is the obs-column half.
   `AxisJoinKey`, with `pub type ObsJoinKey = AxisJoinKey` kept so existing
   callers compile; `KeyDiagnosis` gains `axis` and renames `n_obs` to `n_rows`
   (the pyscx dict still keys `n_obs` on the obs surface and `n_vars` on the
-  var one). Not done: `varm` payloads on the attach — `varm` has no header
+  var one); and `AttachLayerSummary` gains `var_index_rebuilt`,
+  `var_index_dropped` and `var_columns_not_carried`, since
+  `cellbender_import` writes var columns and had been reporting nothing about
+  what that did to the var index. A stale var index is *retired* either way —
+  "rebuilt" now means a replacement section was written and "dropped" that
+  every column it covered became unindexable, which the planning decision
+  alone cannot predict; both are decided before any write, so `--dry-run`
+  previews the real outcome. Not done: `varm` payloads on the attach — `varm` has no header
   flag, so a first-ever in-place `varm` has a lifecycle question to settle
   first. See [docs/operations.md § External var import](docs/operations.md#external-var-import).
 - [ ] Dictionary output from `append` / `merge` / `merge_sorted` — they still

@@ -110,6 +110,31 @@ pub fn run_cellbender_import(
             "the entire obs table \u{2014} run `scx optimize` to shard it"
         },
     );
+    // Also before the dry-run return: an `--overwrite` of an indexed var column
+    // rebuilds that index from the new values, and when none of them can be
+    // indexed the section is retired instead. Both outcomes are decided before
+    // any write, so a preview can and must report them — a caller who indexed a
+    // column deliberately needs to know it is about to lose pushdown.
+    if s.var_index_rebuilt {
+        println!(
+            "Var predicate index: rebuilt over the new values (this import \
+             overwrote a column it covered)."
+        );
+    }
+    if s.var_index_dropped {
+        println!(
+            "Var predicate index: DROPPED — every column it covered was \
+             overwritten with values that cannot be indexed, so no replacement \
+             was written."
+        );
+    }
+    if !s.var_columns_not_carried.is_empty() {
+        println!(
+            "Var predicate index no longer covers {:?} — the new values cannot \
+             be indexed.",
+            s.var_columns_not_carried
+        );
+    }
     if dry_run {
         println!("Dry run: nothing written.");
         return Ok(());

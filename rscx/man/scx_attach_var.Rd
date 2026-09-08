@@ -34,7 +34,9 @@ exclusive with \code{key}.}
 
 \item{key_column}{Target var column to join on when \code{key} is given.
 \code{NULL} auto-resolves it (the var index, then \code{gene_id},
-\code{gene_ids}, \code{feature_id}, \code{gene_name}, ...).}
+\code{gene_ids}, \code{feature_id}, \code{gene_name}, ...). It names the
+target side of a \code{key} join, so supplying it without \code{key} is
+an error rather than being silently ignored.}
 
 \item{prefix}{Prepended to every imported column name.}
 
@@ -59,8 +61,8 @@ A named list summarising the join: \code{n_vars},
 \code{n_matched}, \code{n_target_rows_absent},
 \code{n_source_rows_absent}, \code{var_key_column},
 \code{var_columns_added}, \code{var_index_rebuilt},
-\code{var_columns_not_carried}, \code{var_streamed} and
-\code{dry_run}.
+\code{var_index_dropped}, \code{var_columns_not_carried},
+\code{var_streamed} and \code{dry_run}.
 }
 \description{
 The var-axis twin of \code{\link{scx_attach_obs}}: a gene-level

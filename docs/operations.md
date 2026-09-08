@@ -925,9 +925,16 @@ A pure column *add* leaves it valid, so it is carried verbatim. An
 gone — so it is rebuilt from the new table, which `modify_metadata` already
 does for both axes. Unlike obs there is nothing streaming about it: var's index
 is one batch-mode build over the single range `[(0, n_vars)]` and the new table
-is already in memory. `var_index_rebuilt` says whether it happened, and
-`var_columns_not_carried` names any column the rebuild could not cover (one
-whose new dtype cannot be indexed) rather than dropping it silently.
+is already in memory. `var_index_rebuilt` says a replacement section was written;
+`var_index_dropped` says the stale one was retired with **nothing** to replace
+it, which is what happens when every column it covered became unindexable; and
+`var_columns_not_carried` names the columns the rebuild could not cover (one
+whose new dtype cannot be indexed) rather than dropping them silently. All
+three are decided before any write, so `--dry-run` reports the same outcome the
+real import produces — which column survives depends on the *new* values, so
+the planning decision alone cannot say.
+
+Both are also reported by `cellbender-import`, the other op that writes var.
 
 Note that no query path reads the var predicate index today: `filter_var`
 evaluates its predicates directly against the assembled `var` batch. Keeping

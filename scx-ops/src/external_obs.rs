@@ -886,6 +886,26 @@ pub(crate) fn describe_key_diagnosis(
     }
 }
 
+/// The "why might these keys not line up" hint, per axis.
+///
+/// The obs wording is about cell barcodes — a sample-name prefix, CellRanger's
+/// `-1` suffix — and was the whole message before the join became
+/// axis-neutral. On the var axis it sends a caller hunting the wrong bug: a
+/// gene join that misses is almost never a `-1` suffix, it is Ensembl versus
+/// symbol, a versioned accession, or each side auto-resolving onto a different
+/// identifier. The `KeyDiagnosis` that follows lists the columns that *would*
+/// key, but the first sentence is what a reader acts on.
+fn key_mismatch_hint(axis: &str) -> &'static str {
+    if axis == "var" {
+        "Check whether the two sides name genes differently — Ensembl accession \
+         versus symbol, or a versioned accession (ENSG00000141510.17) against an \
+         unversioned one; with no explicit key each side resolves its own, which \
+         can pick different identifiers."
+    } else {
+        "Check for a sample-name prefix or a '-1' suffix difference."
+    }
+}
+
 pub(crate) fn build_axis_row_join(
     axis: &'static str,
     reader: &ScxReader,
@@ -944,11 +964,11 @@ pub(crate) fn build_axis_row_join(
             axis,
             detail: format!(
                 "no target row key matched any source row key on '{}'. Target \
-                 examples: {:?}; source examples: {:?}. Check for a sample-name prefix \
-                 or a '-1' suffix difference. {diag}",
+                 examples: {:?}; source examples: {:?}. {} {diag}",
                 display_key_name(axis, key_spec),
                 examples(target_keys),
                 examples(source_keys),
+                key_mismatch_hint(axis),
             ),
         });
     }
@@ -1045,13 +1065,14 @@ fn axis_join_coverage_report(
         ));
     }
     let (target_examples, source_examples) = examples();
+    let hint = key_mismatch_hint(axis);
     Some((
         log::Level::Warn,
         format!(
             "external {axis} join matched only {n_matched} of {n_target_total} target rows \
-             on '{key_name}', and {n_source_absent} source rows matched no target row — \
-             check for a sample-name prefix or a '-1' suffix difference; target examples \
-             {target_examples:?}, source examples {source_examples:?}"
+             on '{key_name}', and {n_source_absent} source rows matched no target row. \
+             {hint} Target examples {target_examples:?}, source examples \
+             {source_examples:?}"
         ),
     ))
 }

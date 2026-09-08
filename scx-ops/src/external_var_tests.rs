@@ -20,9 +20,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, DictionaryArray, Float32Array, Int8Array, RecordBatch, StringArray,
+    Array, BooleanArray, DictionaryArray, Float32Array, Int32Array, Int8Array, RecordBatch,
+    StringArray,
 };
-use arrow::datatypes::{DataType, Field, Int8Type, Schema};
+use arrow::datatypes::{DataType, Field, Int32Type, Int8Type, Schema};
 use scx_codec::{CodecId, ValueEncoding};
 use scx_format_io::header::FileHeader;
 use scx_format_io::provenance::ProvenanceEntry;
@@ -1349,4 +1350,217 @@ fn provenance_records_the_key_and_the_counts() {
     assert_eq!(params["var_key_column"], "__index_level_0__");
     assert_eq!(params["var_streamed"], false);
     assert_eq!(params["source_file"], "peaks.csv");
+}
+
+// ---------------------------------------------------------------------------
+// Round-1 review follow-ups
+// ---------------------------------------------------------------------------
+
+/// A streamed var write must rebuild from each shard **as read**, not slice an
+/// assembled table.
+///
+/// `read_var()` reconciles a var whose shards disagree on a column's encoding —
+/// one dictionary-encoded, one plain `Utf8`, which is what an in-place rewrite
+/// by an older writer leaves behind — so a slice of the assembled batch writes
+/// the *unified* encoding to every shard. Measured: slicing turns
+/// `[Dictionary(Int32, Utf8), Utf8]` into
+/// `[Dictionary(Int8, Utf8), Dictionary(Int8, Utf8)]`, rewriting bytes for a
+/// column the attach was not asked to touch. Every other test in this file
+/// passes under either strategy, so without this one the choice is unpinned.
+#[test]
+fn a_var_whose_shards_disagree_on_encoding_keeps_each_shards_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.scx");
+
+    let dict: DictionaryArray<Int32Type> = DictionaryArray::try_new(
+        Int32Array::from(vec![0, 1]),
+        Arc::new(StringArray::from(vec!["a", "b"])),
+    )
+    .unwrap();
+    let dict_type = dict.data_type().clone();
+    let shard0 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("kind", dict_type, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["ENSG0", "ENSG1"])),
+            Arc::new(dict),
+        ],
+    )
+    .unwrap();
+    let shard1 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["ENSG2", "ENSG3"])),
+            Arc::new(StringArray::from(vec!["a", "c"])),
+        ],
+    )
+    .unwrap();
+
+    let mut w = ScxWriter::new(&path, FileHeader::new_single_modality(2, 4, 0, 2, 0, 0)).unwrap();
+    w.write_obs(&obs_batch(2)).unwrap();
+    w.write_var_shard(0, 0, 2, 4, &shard0).unwrap();
+    w.write_var_shard(1, 2, 2, 4, &shard1).unwrap();
+    w.write_csr_shard(&[0u64; 3], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    w.finish().unwrap();
+
+    let per_shard_kinds = |p: &Path| -> Vec<String> {
+        let r = ScxReader::open(p).unwrap();
+        (0..2)
+            .map(|i| {
+                format!(
+                    "{:?}",
+                    r.read_var_shard(i)
+                        .unwrap()
+                        .schema()
+                        .field_with_name("kind")
+                        .unwrap()
+                        .data_type()
+                )
+            })
+            .collect()
+    };
+    let before = per_shard_kinds(&path);
+    assert_eq!(
+        before,
+        vec!["Dictionary(Int32, Utf8)".to_string(), "Utf8".to_string()],
+        "fixture premise: the two shards must actually disagree"
+    );
+
+    let data = annot(gene_names_ensg(4), |i| i as f32);
+    let o = AttachVarOptions {
+        join_key: AxisJoinKey::Column("gene_id".into()),
+        status_column: None,
+        ..opts()
+    };
+    attach_external_var(&path, &data, &o).unwrap();
+
+    assert_eq!(
+        per_shard_kinds(&path),
+        before,
+        "each shard must keep its own encoding for a column the attach did not touch"
+    );
+    // And the values still landed.
+    let var = ScxReader::open(&path).unwrap().read_var().unwrap();
+    assert_eq!(
+        (0..4)
+            .map(|i| f32_col(&var, "peak_score").value(i))
+            .collect::<Vec<_>>(),
+        vec![0.0, 1.0, 2.0, 3.0]
+    );
+}
+
+fn gene_names_ensg(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("ENSG{i}")).collect()
+}
+
+/// A `dry_run` must report the index outcome the real import would produce.
+///
+/// `var_index_rebuilt` can be decided from the planning boolean, but
+/// `var_columns_not_carried` cannot: whether a covered column survives depends
+/// on the *new* values. Overwriting an indexed string column with a boolean is
+/// the case — the preview used to say `[]` and the write then named the drop.
+#[test]
+fn dry_run_previews_the_index_outcome_the_write_would_produce() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = write_fixture(
+        dir.path(),
+        "prev.scx",
+        4,
+        var_batch(4),
+        VarLayout::Single,
+        &["feature_type"],
+    );
+    let before = std::fs::read(&f.path).unwrap();
+
+    // A boolean replacement for the indexed string column: nothing left to
+    // index, so the stale section is retired with no replacement.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "feature_type",
+            DataType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![true, false, true, false]))],
+    )
+    .unwrap();
+    let data = ExternalVarData {
+        row_keys: gene_names(f.n_vars),
+        row_annotations: batch,
+        uns: serde_json::Map::new(),
+        source_checksum: None,
+        source_name: None,
+    };
+    let base = AttachVarOptions {
+        overwrite: true,
+        status_column: None,
+        ..opts()
+    };
+
+    let preview = attach_external_var(
+        &f.path,
+        &data,
+        &AttachVarOptions {
+            dry_run: true,
+            overwrite: true,
+            status_column: None,
+            ..opts()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&f.path).unwrap(),
+        before,
+        "a dry run must still write nothing"
+    );
+
+    let real = attach_external_var(&f.path, &data, &base).unwrap();
+    assert_eq!(
+        (
+            preview.var_index_rebuilt,
+            preview.var_index_dropped,
+            preview.var_columns_not_carried.clone()
+        ),
+        (
+            real.var_index_rebuilt,
+            real.var_index_dropped,
+            real.var_columns_not_carried.clone()
+        ),
+        "the preview must agree with the write it previews"
+    );
+    // And the outcome is the honest one: retired, not "rebuilt".
+    assert!(!real.var_index_rebuilt, "no replacement could be built");
+    assert!(real.var_index_dropped);
+    assert_eq!(
+        real.var_columns_not_carried,
+        vec!["feature_type".to_string()]
+    );
+    assert!(
+        var_index_bytes(&f.path).is_none(),
+        "and no VarPredicateIndex section is left behind"
+    );
+}
+
+/// The failure hint names the identifiers a *gene* join actually mismatches on.
+#[test]
+fn a_zero_overlap_var_join_does_not_mention_barcode_suffixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = plain(dir.path(), 3);
+    let data = annot(keys("nothing_", 3), |i| i as f32);
+    let msg = attach_external_var(&f.path, &data, &opts())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        msg.contains("Ensembl accession") && msg.contains("versioned"),
+        "a gene join that misses is not a barcode-suffix problem: {msg}"
+    );
+    assert!(
+        !msg.contains("sample-name prefix") && !msg.contains("'-1' suffix"),
+        "the obs wording must not reach a var caller: {msg}"
+    );
 }

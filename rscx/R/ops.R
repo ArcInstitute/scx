@@ -316,7 +316,9 @@ scx_attach_obs <- function(path, df, key, key_columns = NULL,
 #'   exclusive with \code{key}.
 #' @param key_column Target var column to join on when \code{key} is given.
 #'   \code{NULL} auto-resolves it (the var index, then \code{gene_id},
-#'   \code{gene_ids}, \code{feature_id}, \code{gene_name}, ...).
+#'   \code{gene_ids}, \code{feature_id}, \code{gene_name}, ...). It names the
+#'   target side of a \code{key} join, so supplying it without \code{key} is
+#'   an error rather than being silently ignored.
 #' @param prefix Prepended to every imported column name.
 #' @param status_column Var column recording \code{"present"}/\code{"absent"}
 #'   per gene. \code{NULL} omits it.
@@ -332,8 +334,8 @@ scx_attach_obs <- function(path, df, key, key_columns = NULL,
 #'   \code{n_matched}, \code{n_target_rows_absent},
 #'   \code{n_source_rows_absent}, \code{var_key_column},
 #'   \code{var_columns_added}, \code{var_index_rebuilt},
-#'   \code{var_columns_not_carried}, \code{var_streamed} and
-#'   \code{dry_run}.
+#'   \code{var_index_dropped}, \code{var_columns_not_carried},
+#'   \code{var_streamed} and \code{dry_run}.
 #' @export
 #' @examples
 #' \dontrun{
@@ -357,6 +359,16 @@ scx_attach_var <- function(path, df, key, key_columns = NULL,
   if (missing(key)) key <- character(0)
   if (!is.null(key_columns) && length(key) > 0L) {
     stop("pass either `key` or `key_columns`, not both.", call. = FALSE)
+  }
+
+  # `key_column` names the TARGET column that `key`'s values are matched
+  # against, so it means nothing without `key` — the Rust side reads it only on
+  # that branch, and passing it beside `key_columns` used to be silently
+  # ignored while the join ran against the source column's own name.
+  if (!is.null(key_column) && length(key) == 0L) {
+    stop("`key_column` names the target var column that `key`'s values join ",
+         "against, so it needs `key=`. To join on columns of `df`, use ",
+         "`key_columns=` alone.", call. = FALSE)
   }
 
   .Call(

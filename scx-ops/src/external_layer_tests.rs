@@ -1274,6 +1274,161 @@ fn a_pure_var_column_add_keeps_the_var_index_verbatim() {
     assert_eq!(var_index_bytes(&path).as_deref(), Some(before.as_slice()));
 }
 
+/// The layer op must report an unindexable replacement, not drop it silently.
+///
+/// The first fix made it *rebuild* a stale var index instead of carrying it —
+/// but a rebuild that can cover nothing is a drop, and the summary said
+/// "rebuilt" with an empty not-carried list while no replacement section was
+/// written at all. That is the silent loss the var attach was written not to
+/// have, on the op this PR set out to make honest.
+#[test]
+fn an_unindexable_var_replacement_is_reported_not_silently_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fixture_with_var_index_and_shards(dir.path(), "vd.scx", None);
+    assert!(var_index_bytes(&path).is_some(), "fixture premise");
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 6), |i| (i + 1) as f32);
+    // A boolean replacement for the indexed string column: nothing left to index.
+    data.col_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "feature_type",
+                DataType::Boolean,
+                true,
+            )])),
+            vec![Arc::new(arrow::array::BooleanArray::from(vec![
+                true, false, true, false, true, false,
+            ]))],
+        )
+        .unwrap(),
+    );
+    let o = AttachLayerOptions {
+        overwrite: true,
+        ..opts("cb")
+    };
+    let summary = attach_external_layer(&path, &data, &o).unwrap();
+
+    assert!(
+        !summary.var_index_rebuilt,
+        "no replacement section exists, so this is not a rebuild"
+    );
+    assert!(summary.var_index_dropped);
+    assert_eq!(
+        summary.var_columns_not_carried,
+        vec!["feature_type".to_string()],
+        "the covered column the rebuild could not carry must be named"
+    );
+    assert!(
+        var_index_bytes(&path).is_none(),
+        "and the stale section is gone rather than left describing dead values"
+    );
+}
+
+/// A streamed layer-attach var write must keep each shard's own encoding.
+///
+/// The first fix stopped `attach_external_layer` collapsing a sharded var — but
+/// by slicing the assembled table, which rewrites every shard under the
+/// encoding `read_var()` unified them into. Measured: slicing turns
+/// `[Dictionary(Int32, Utf8), Utf8]` into two `Dictionary(Int8, Utf8)` shards.
+#[test]
+fn a_layer_attach_keeps_each_var_shards_own_encoding() {
+    use arrow::array::{Array, DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.scx");
+    let dict: DictionaryArray<Int32Type> = DictionaryArray::try_new(
+        Int32Array::from(vec![0, 1]),
+        Arc::new(StringArray::from(vec!["x", "y"])),
+    )
+    .unwrap();
+    let dict_type = dict.data_type().clone();
+    let s0 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("kind", dict_type, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["g0", "g1"])),
+            Arc::new(dict),
+        ],
+    )
+    .unwrap();
+    let s1 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["g2", "g3"])),
+            Arc::new(StringArray::from(vec!["x", "z"])),
+        ],
+    )
+    .unwrap();
+
+    let mut w = ScxWriter::new(&path, FileHeader::new_single_modality(4, 4, 0, 2, 0, 0)).unwrap();
+    w.write_obs(&obs_batch(4)).unwrap();
+    w.write_var_shard(0, 0, 2, 4, &s0).unwrap();
+    w.write_var_shard(1, 2, 2, 4, &s1).unwrap();
+    for start in [0u64, 2] {
+        w.write_csr_shard(
+            &[0u64; 3],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            start,
+        )
+        .unwrap();
+    }
+    w.finish().unwrap();
+
+    let kinds = |p: &Path| -> Vec<String> {
+        let r = ScxReader::open(p).unwrap();
+        (0..2)
+            .map(|i| {
+                format!(
+                    "{:?}",
+                    r.read_var_shard(i)
+                        .unwrap()
+                        .schema()
+                        .field_with_name("kind")
+                        .unwrap()
+                        .data_type()
+                )
+            })
+            .collect()
+    };
+    let before = kinds(&path);
+    assert_eq!(
+        before,
+        vec!["Dictionary(Int32, Utf8)".to_string(), "Utf8".to_string()],
+        "fixture premise: the shards must disagree"
+    );
+
+    let mut data = diagonal_data(keys("cell_", 4), keys("g", 4), |i| (i + 1) as f32);
+    data.col_annotations = Some(
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cb_ambient",
+                DataType::Float32,
+                true,
+            )])),
+            vec![Arc::new(Float32Array::from(vec![0.25f32; 4]))],
+        )
+        .unwrap(),
+    );
+    attach_external_layer(&path, &data, &opts("cb")).unwrap();
+
+    assert_eq!(
+        kinds(&path),
+        before,
+        "each var shard must keep its own encoding for a column the attach did not touch"
+    );
+    let var = ScxReader::open(&path).unwrap().read_var().unwrap();
+    assert!(var.column_by_name("cb_ambient").is_some());
+}
+
 fn has_obs_index(path: &Path) -> bool {
     ScxReader::open(path)
         .unwrap()

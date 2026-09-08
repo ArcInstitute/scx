@@ -169,12 +169,22 @@ pub struct AttachVarSummary {
     /// [`crate::display_key_name`] first.
     pub var_key_column: String,
     pub var_columns_added: Vec<String>,
-    /// Whether the var predicate index was rebuilt because this import
-    /// overwrote a column it covered. `false` on a pure add (the section is
-    /// carried verbatim) and on a file with no index.
+    /// Whether a **replacement** `VarPredicateIndex` section was written
+    /// because this import overwrote a column the old one covered. `false` on
+    /// a pure add (the section is carried verbatim), on a file with no index,
+    /// and when the rebuild could cover nothing — see
+    /// [`Self::var_index_dropped`].
     pub var_index_rebuilt: bool,
+    /// Whether the stale index section was removed with **no** replacement,
+    /// because every column it covered became unindexable.
+    ///
+    /// Reported separately from [`Self::var_index_rebuilt`] because "rebuilt"
+    /// and "gone" are different outcomes for a caller, and the planning
+    /// boolean alone cannot tell them apart: whether a replacement can be
+    /// built is only known once the new values are in hand.
+    pub var_index_dropped: bool,
     /// Columns the old index covered that the rebuild could not — reported
-    /// rather than silently dropped.
+    /// rather than silently dropped. Honest on a `dry_run` too.
     pub var_columns_not_carried: Vec<String>,
     /// `true` when var was rewritten shard by shard, preserving the input's
     /// boundaries; `false` when it was a single `VarMetadata` section, which
@@ -245,7 +255,7 @@ where
 /// Deliberately narrow. `obs`, CSR shards, layers, the CSC sidecar, `.raw`,
 /// deletion vectors, detection bitmaps, `varm` / `varp` and the obs predicate
 /// index are all untouched by a var-only attach and must survive verbatim.
-fn should_drop_old_entry(e: &FullCatalogEntry, rewrote_uns: bool, rebuilt_var_index: bool) -> bool {
+fn should_drop_old_entry(e: &FullCatalogEntry, rewrote_uns: bool, retire_var_index: bool) -> bool {
     use SectionType::*;
     if e.section_type == Provenance {
         return true;
@@ -256,7 +266,9 @@ fn should_drop_old_entry(e: &FullCatalogEntry, rewrote_uns: bool, rebuilt_var_in
     if matches!(e.section_type, VarMetadata | VarMetadataShard) {
         return true;
     }
-    if rebuilt_var_index && e.section_type == VarPredicateIndex {
+    // `retire_var_index` covers both outcomes: the stale section goes whether a
+    // replacement was built from the new values or nothing could be.
+    if retire_var_index && e.section_type == VarPredicateIndex {
         return true;
     }
     false
@@ -276,6 +288,7 @@ fn build_params_json(
         "n_source_rows_absent": s.n_source_rows_absent,
         "var_columns": s.var_columns_added,
         "var_predicate_index_rebuilt": s.var_index_rebuilt,
+        "var_predicate_index_dropped": s.var_index_dropped,
         "var_columns_not_carried": s.var_columns_not_carried,
         // Which layout the file had, and therefore kept. Not recoverable from
         // the output on its own: a single-section var and a one-shard sharded
@@ -477,12 +490,12 @@ pub fn attach_external_var(
     }
 
     // --- Would this stale the var predicate index? --------------------------
-    // A pure add keeps it verbatim; an overwrite of an indexed column is
+    // A pure add keeps it verbatim; an overwrite of a column it covers is
     // rebuilt from the new table rather than dropped, because var's index is
     // one batch-mode build over `[(0, n_vars)]` and the table is in memory.
     let index_bytes = reader.read_var_predicate_index_bytes()?;
     let existing_var_index = indexed_column_names(index_bytes)?;
-    let rebuild_var_index = index_would_go_stale(index_bytes, &planned_var)?;
+    let retire_var_index = index_would_go_stale(index_bytes, &planned_var)?;
 
     let rewrote_uns = !data.uns.is_empty();
     let new_uns = merge_uns_entries(uns, &data.uns)?;
@@ -493,24 +506,6 @@ pub fn attach_external_var(
     let manifest = prep.header.manifest_sequence;
     let mt_off = prep.header.modality_table_offset;
     let mt_len = prep.header.modality_table_length;
-
-    let mut summary = AttachVarSummary {
-        n_vars,
-        n_matched: row_join.n_matched,
-        n_target_rows_absent: row_join.n_target_absent,
-        n_source_rows_absent: row_join.n_source_absent,
-        var_key_column: key_spec,
-        var_columns_added: planned_var.clone(),
-        var_index_rebuilt: rebuild_var_index,
-        var_columns_not_carried: Vec::new(),
-        var_streamed,
-    };
-
-    if opts.dry_run {
-        // Everything above is validation and the join itself, so the caller
-        // gets a real `n_matched` while the file stays untouched.
-        return Ok(summary);
-    }
 
     let build = |batch: &RecordBatch, row_start: usize| {
         build_new_axis_batch(
@@ -523,10 +518,66 @@ pub fn attach_external_var(
             row_start,
         )
     };
-    // Built before the writer exists, so a failure still leaves the file
-    // untouched. The whole table either way — the sharded path re-slices it via
-    // the per-shard closure below, which is what keeps the boundaries.
-    let new_var = build(&var, 0)?;
+
+    // The whole new table, built before the writer exists so a failure still
+    // leaves the file untouched.
+    //
+    // Needed on two paths and skipped otherwise: the single-section write
+    // emits it directly, and an index rebuild indexes it. A *streamed* write
+    // does **not** use it — see the write below for why it rebuilds per shard
+    // instead of slicing this — so on a sharded var with no index to rebuild
+    // it is never built.
+    let need_whole = !var_streamed || retire_var_index;
+    let new_var = if need_whole {
+        Some(build(&var, 0)?)
+    } else {
+        None
+    };
+
+    // The replacement index, built here rather than inside the write, so a
+    // `dry_run` reports what the real import would do. Which covered columns
+    // survive is only knowable from the new *values* — a covered string column
+    // overwritten by a float cannot be indexed — so the planning boolean alone
+    // cannot fill `var_columns_not_carried`, and a preview that guessed `[]`
+    // would disagree with the write it is previewing. The bytes are reused
+    // below rather than rebuilt.
+    let (new_index_bytes, var_columns_not_carried) = if retire_var_index {
+        let whole = new_var
+            .as_ref()
+            .expect("retire_var_index implies need_whole");
+        let pass = ObsVarIndexPass::carried(&[], &existing_var_index);
+        let (bytes, covered) = pass.build_var_bytes(whole, n_vars)?;
+        let missing: Vec<String> = existing_var_index
+            .iter()
+            .filter(|c| !covered.contains(c))
+            .cloned()
+            .collect();
+        (bytes, missing)
+    } else {
+        (None, Vec::new())
+    };
+
+    let summary = AttachVarSummary {
+        n_vars,
+        n_matched: row_join.n_matched,
+        n_target_rows_absent: row_join.n_target_absent,
+        n_source_rows_absent: row_join.n_source_absent,
+        var_key_column: key_spec,
+        var_columns_added: planned_var.clone(),
+        // "Rebuilt" means a replacement section exists; when the rebuild could
+        // cover nothing, the stale section is retired and that is a *drop*.
+        var_index_rebuilt: retire_var_index && new_index_bytes.is_some(),
+        var_index_dropped: retire_var_index && new_index_bytes.is_none(),
+        var_columns_not_carried,
+        var_streamed,
+    };
+
+    if opts.dry_run {
+        // Everything above is validation, the join, and the index decision, so
+        // the caller gets a real `n_matched` and a real index outcome while the
+        // file stays untouched.
+        return Ok(summary);
+    }
 
     let mut prov_ops = read_provenance_ops(&mut lock, &prep.old_catalog)?;
 
@@ -545,22 +596,26 @@ pub fn attach_external_var(
     }
 
     if var_streamed {
+        // Rebuilt **from each shard as read**, not sliced out of `new_var`.
+        // That is the difference between preserving a shard's own encoding and
+        // re-encoding it: `read_var()` reconciles a var whose shards disagree
+        // (one dictionary-encoded column, one plain `Utf8` — what an in-place
+        // rewrite by an older writer leaves behind), so a slice of the
+        // assembled table writes the *unified* encoding to every shard.
+        // Measured on a two-shard mixed fixture: slicing turns
+        // `[Dictionary(Int32, Utf8), Utf8]` into
+        // `[Dictionary(Int8, Utf8), Dictionary(Int8, Utf8)]`, rewriting bytes
+        // for a column this op was not asked to touch. Pinned by
+        // `a_var_whose_shards_disagree_on_encoding_keeps_each_shards_own`.
         write_var_shards_appending(&reader, &mut writer, n_vars, |shard, row_start| {
             build(shard, row_start)
         })?;
     } else {
-        writer.write_var(&new_var)?;
+        writer.write_var(new_var.as_ref().expect("!var_streamed implies need_whole"))?;
     }
 
-    if rebuild_var_index {
-        let pass = ObsVarIndexPass::carried(&[], &existing_var_index);
-        let mut result = scx_engine::ConversionPredicateIndexResult::default();
-        pass.write_var(&new_var, n_vars, &mut writer, &mut result)?;
-        summary.var_columns_not_carried = existing_var_index
-            .iter()
-            .filter(|c| !result.var_indexed_columns.contains(c))
-            .cloned()
-            .collect();
+    if let Some(bytes) = &new_index_bytes {
+        writer.write_var_predicate_index(bytes)?;
     }
 
     let (file, new_offset, new_section_entries) = writer.into_in_place_parts()?;
@@ -598,7 +653,7 @@ pub fn attach_external_var(
         .old_catalog
         .entries
         .into_iter()
-        .filter(|e| !should_drop_old_entry(e, rewrote_uns, rebuild_var_index))
+        .filter(|e| !should_drop_old_entry(e, rewrote_uns, retire_var_index))
         .collect();
     entries.extend(new_section_entries);
     entries.push(FullCatalogEntry {

@@ -721,9 +721,12 @@ v["is_hvg"] = v.index.isin(hvg_ids)
 pyscx.attach_var_columns(exp, v[["is_hvg"]], key="var_names")
 ```
 
-Same rules as the obs side: key-joined never positional, `null` for genes the
+Same rules as the obs side: key-joined **by default**, `null` for genes the
 source does not cover, `overwrite` replaces rather than merges, `dry_run=True`
-previews the join, and one `pyscx.rollback` undoes it. `pyscx.diagnose_var_key`
+previews the join, and one `pyscx.rollback` undoes it. `positional=True` is
+there for a frame computed in-process from this file's own `read_var()` —
+exactly `n_vars` rows, checked against the file's gene names when the frame
+carries them — and never for external tool output, whose row order is its own. `pyscx.diagnose_var_key`
 names a usable key when `var_names` is duplicated — which happens on
 concatenated files, where symbols repeat and only (symbol, id) is unique.
 

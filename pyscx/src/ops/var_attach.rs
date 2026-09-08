@@ -35,9 +35,12 @@ fn var_summary_dict<'py>(
         scx_ops::display_key_name("var", &summary.var_key_column),
     )?;
     d.set_item("var_columns_added", summary.var_columns_added.clone())?;
-    // Whether the var predicate index had to be rebuilt (an overwrite of a
-    // column it covered) rather than carried verbatim (a pure add).
+    // Whether a replacement var predicate index was written (an overwrite of a
+    // column it covered) rather than the section carried verbatim (a pure add)
+    // — and, separately, whether the stale section was retired with nothing to
+    // replace it, which "rebuilt" alone cannot say.
     d.set_item("var_index_rebuilt", summary.var_index_rebuilt)?;
+    d.set_item("var_index_dropped", summary.var_index_dropped)?;
     d.set_item(
         "var_columns_not_carried",
         summary.var_columns_not_carried.clone(),

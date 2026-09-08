@@ -1709,7 +1709,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.cellbender_import(path, cellbender_h5, *, layer="cellbender", obs_key=None, var_key=None, prefix="cellbender_", uns_key="cellbender", overwrite=False, on_missing_rows="zero", on_extra_rows="warn", gene_axis="identical", latent_embedding=False, dry_run=False)` —
   Attach a CellBender `remove-background` output to an existing SCX file as a
   layer, **in place**, joined by barcode. Returns a summary dict; inspect
-  `n_matched` (or run with `dry_run=True`) before trusting the result. See
+  `n_matched` (or run with `dry_run=True`) before trusting the result. Since it
+  writes `var` columns too, the dict also carries the var predicate index
+  outcome — `var_index_rebuilt` / `var_index_dropped` /
+  `var_columns_not_carried` — on the same terms as `var_import`. See
   [docs/operations.md § CellBender import](operations.md#cellbender-import).
 - `pyscx.is_cellbender_h5(path)` — True when a `.h5` looks like a CellBender
   `remove-background` output rather than a plain 10x CellRanger matrix.
@@ -1820,7 +1823,7 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   boundaries and a single-section var stays one section. Returns a summary dict
   (`n_vars`, `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,
   `var_key_column`, `var_columns_added`, `var_index_rebuilt`,
-  `var_columns_not_carried`, `var_streamed`, the source's `format` /
+  `var_index_dropped`, `var_columns_not_carried`, `var_streamed`, the source's `format` /
   `delimiter` / `n_rows_in_source` / `uns_keys_imported`, and a `key_diagnosis`
   on a dry run). A **multimodal** file is refused — each modality owns its own
   var table. Undone by `pyscx.rollback`. See

@@ -310,6 +310,35 @@ def test_a_multimodal_target_is_refused(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_an_unindexable_overwrite_drops_the_index_and_the_dry_run_says_so(tmp_path):
+    """The index outcome is two outcomes, and a preview must get both right.
+
+    Overwriting the only indexed column with a boolean leaves nothing to index,
+    so the stale section is retired with no replacement — which `rebuilt` alone
+    cannot express. And which covered column survives depends on the *new*
+    values, so a preview that guessed `[]` would disagree with its own write.
+    """
+    var = pd.DataFrame(
+        {"feature_type": ["Gene Expression", "Peaks", "Gene Expression", "Peaks"]},
+        index=[f"ENSG{i}" for i in range(4)],
+    )
+    scx = _fixture(tmp_path, var=var, index_var=["feature_type"])
+    over = pd.DataFrame(
+        {"feature_type": [True, False, True, False]}, index=list(var.index)
+    )
+
+    before = scx.read_bytes()
+    preview = pyscx.attach_var_columns(str(scx), over, overwrite=True, dry_run=True)
+    assert scx.read_bytes() == before
+
+    real = pyscx.attach_var_columns(str(scx), over, overwrite=True)
+    for k in ("var_index_rebuilt", "var_index_dropped", "var_columns_not_carried"):
+        assert preview[k] == real[k], f"dry run disagreed with the write on {k}"
+    assert real["var_index_rebuilt"] is False, "no replacement could be built"
+    assert real["var_index_dropped"] is True
+    assert real["var_columns_not_carried"] == ["feature_type"]
+
+
 def test_a_pure_add_keeps_the_var_index_and_an_overwrite_rebuilds_it(tmp_path):
     var = pd.DataFrame(
         {"feature_type": ["Gene Expression", "Peaks", "Gene Expression", "Peaks"]},
@@ -320,12 +349,14 @@ def test_a_pure_add_keeps_the_var_index_and_an_overwrite_rebuilds_it(tmp_path):
     add = pd.DataFrame({"score": [1.0, 2.0, 3.0, 4.0]}, index=list(var.index))
     r = pyscx.attach_var_columns(str(scx), add)
     assert r["var_index_rebuilt"] is False, "a pure add keeps the index valid"
+    assert r["var_index_dropped"] is False
 
     over = pd.DataFrame(
         {"feature_type": ["Antibody Capture"] * 4}, index=list(var.index)
     )
     r = pyscx.attach_var_columns(str(scx), over, overwrite=True)
     assert r["var_index_rebuilt"] is True
+    assert r["var_index_dropped"] is False
     assert r["var_columns_not_carried"] == []
     # And the values really changed on the file.
     assert set(_var(scx)["feature_type"]) == {"Antibody Capture"}

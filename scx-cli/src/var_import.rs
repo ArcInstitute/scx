@@ -178,6 +178,30 @@ pub fn run_var_import(
             "single section rewritten whole"
         },
     );
+    // Printed before the dry-run return: the index outcome is decided from the
+    // new values before anything is written, so a preview can and must report
+    // it. A caller who indexed a var column deliberately needs to know it is
+    // about to lose pushdown, not to discover it afterwards.
+    if s.var_index_rebuilt {
+        println!(
+            "Note: the var predicate index was rebuilt — this import overwrote a \
+             column it covered, so its entries now describe the new values."
+        );
+    }
+    if s.var_index_dropped {
+        println!(
+            "Note: the var predicate index was DROPPED — this import overwrote \
+             every column it covered with values that cannot be indexed, so no \
+             replacement was written."
+        );
+    }
+    if !s.var_columns_not_carried.is_empty() {
+        println!(
+            "Note: the var index no longer covers {:?} — the new values cannot \
+             be indexed.",
+            s.var_columns_not_carried
+        );
+    }
     if dry_run {
         // The join succeeded, but "succeeded" is not the same as "is the key
         // you wanted" — report the alternatives while nothing is committed.
@@ -189,19 +213,6 @@ pub fn run_var_import(
     }
 
     println!("Wrote var columns {:?}", s.var_columns_added);
-    if s.var_index_rebuilt {
-        println!(
-            "Note: the var predicate index was rebuilt — this import overwrote a \
-             column it covered, so its entries now describe the new values."
-        );
-    }
-    if !s.var_columns_not_carried.is_empty() {
-        println!(
-            "Note: the rebuilt var index no longer covers {:?} — the new column \
-             cannot be indexed.",
-            s.var_columns_not_carried
-        );
-    }
     println!("Undo with: scx rollback {}", input.display());
     Ok(())
 }

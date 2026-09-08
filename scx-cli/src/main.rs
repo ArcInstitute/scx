@@ -1107,8 +1107,9 @@ enum Commands {
         /// Nest the --uns-key-from-source keys under this one uns key (omitted: they land at top level under their own names)
         #[arg(long)]
         uns_key: Option<String>,
-        /// uns key to carry across from an h5ad source. Repeatable; ignored
-        /// for a delimited table, which carries no uns.
+        /// uns key to carry across from an h5ad source. Repeatable. A
+        /// delimited table carries no uns, so passing this with one is an
+        /// error rather than a silent no-op.
         #[arg(long = "uns-key-from-source")]
         uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several
@@ -1174,8 +1175,9 @@ enum Commands {
         /// Nest the --uns-key-from-source keys under this one uns key (omitted: they land at top level under their own names)
         #[arg(long)]
         uns_key: Option<String>,
-        /// uns key to carry across from an h5ad source. Repeatable; ignored
-        /// for a delimited table, which carries no uns.
+        /// uns key to carry across from an h5ad source. Repeatable. A
+        /// delimited table carries no uns, so passing this with one is an
+        /// error rather than a silent no-op.
         #[arg(long = "uns-key-from-source")]
         uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several
@@ -1248,8 +1250,9 @@ enum Commands {
         /// One-byte delimiter override (default: sniff by extension, then header)
         #[arg(long)]
         delimiter: Option<String>,
-        /// uns key to carry across from an h5ad source. Repeatable; ignored
-        /// for a delimited table, which carries no uns.
+        /// uns key to carry across from an h5ad source. Repeatable. A
+        /// delimited table carries no uns, so passing this with one is an
+        /// error rather than a silent no-op.
         #[arg(long = "uns-key-from-source")]
         uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several

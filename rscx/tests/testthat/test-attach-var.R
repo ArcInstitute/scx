@@ -144,6 +144,12 @@ test_that("bad arguments raise clean R errors, not Rust panics", {
     scx_attach_var(path, df, key = rownames(df), key_columns = "score"),
     "not both"
   )
+  # `key_column` names the TARGET side of a `key` join, so it means nothing
+  # without one. It used to be accepted and silently ignored.
+  expect_error(
+    scx_attach_var(path, df, key_columns = "score", key_column = "gene_id"),
+    "needs `key="
+  )
   expect_error(scx_attach_var(path, df, key = genes[1:2]),
                "`key` has 2 values")
   expect_error(

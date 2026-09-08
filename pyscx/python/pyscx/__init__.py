@@ -1359,9 +1359,14 @@ def var_import(path, table, *, key=None, source_key=None, **kwargs):
     Returns:
         dict with `n_vars`, `n_matched`, `n_target_rows_absent`,
         `n_source_rows_absent`, `var_key_column`, `var_columns_added`,
-        `var_index_rebuilt`, `var_columns_not_carried`, `var_streamed`, the
+        `var_index_rebuilt` (a replacement var predicate index was written),
+        `var_index_dropped` (the stale one was retired with nothing to replace
+        it, every covered column having become unindexable),
+        `var_columns_not_carried`, `var_streamed`, the
         source's `format` / `delimiter` (None for h5ad) / `n_rows_in_source` /
-        `uns_keys_imported`, and (on a dry run) `key_diagnosis`.
+        `uns_keys_imported`, and (on a dry run) `key_diagnosis`. The index
+        fields are decided before any write, so a `dry_run` reports the same
+        outcome the real import produces.
 
     Example:
         r = pyscx.var_import("atlas.scx", "symbols.csv", dry_run=True)

@@ -465,6 +465,97 @@ fn a_sharded_var_keeps_its_shard_layout() {
     assert_eq!(got.value(2), 3.0);
 }
 
+/// The CLI must say which of the two index outcomes happened, on a dry run as
+/// well as a real import — a caller who indexed a var column deliberately needs
+/// to know before losing pushdown, not after.
+#[test]
+fn an_unindexable_overwrite_reports_the_dropped_index_on_both_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idx.scx");
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("feature_type", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["ENSG0", "ENSG1"])),
+            Arc::new(StringArray::from(vec!["Gene Expression", "Peaks"])),
+        ],
+    )
+    .unwrap();
+    let mut w =
+        ScxWriter::new(&path, FileHeader::new_single_modality(4, 2, 0, 16384, 0, 0)).unwrap();
+    w.write_obs(&obs_batch(4)).unwrap();
+    w.write_var(&var).unwrap();
+    w.write_csr_shard(&[0u64; 5], &[], &[], CodecId::None, ValueEncoding::Uint8, 0)
+        .unwrap();
+    let opts = scx_engine::PredicateIndexBuildOptions {
+        forced_columns: vec!["feature_type".to_string()],
+        preset_columns: Vec::new(),
+        auto_threshold: 1000,
+        high_cardinality_threshold: 100_000,
+    };
+    let (mut outcomes, mut named) = (Vec::new(), Vec::new());
+    let bytes = scx_engine::build_var_predicate_index_bytes(
+        &var,
+        &[(0, 2)],
+        &opts,
+        &mut outcomes,
+        &mut named,
+    )
+    .unwrap()
+    .expect("fixture premise: feature_type must be indexable");
+    w.write_var_predicate_index(&bytes).unwrap();
+    w.finish().unwrap();
+
+    // Overwrite the indexed string column with booleans: nothing left to index.
+    let csv = write_text(
+        dir.path(),
+        "p.csv",
+        "gene_id,feature_type
+ENSG0,true
+ENSG1,false
+",
+    );
+    let run = |extra: &[&str]| {
+        let mut c = scx();
+        c.args([
+            "var-import",
+            path.to_str().unwrap(),
+            csv.to_str().unwrap(),
+            "--overwrite",
+        ]);
+        c.args(extra);
+        c.output().unwrap()
+    };
+
+    let preview = run(&["--dry-run"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let out = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        out.contains("DROPPED"),
+        "a dry run must report the drop it is previewing: {out}"
+    );
+
+    let real = run(&[]);
+    assert!(real.status.success());
+    let out = String::from_utf8_lossy(&real.stdout);
+    assert!(out.contains("DROPPED"), "{out}");
+    assert!(out.contains("no longer covers"), "{out}");
+    assert!(
+        ScxReader::open(&path)
+            .unwrap()
+            .read_var_predicate_index_bytes()
+            .unwrap()
+            .is_none(),
+        "the stale section must be gone rather than left describing dead values"
+    );
+}
+
 #[test]
 fn a_status_column_marks_present_and_absent_genes() {
     let dir = tempfile::tempdir().unwrap();

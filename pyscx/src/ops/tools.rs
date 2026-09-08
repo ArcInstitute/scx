@@ -165,6 +165,13 @@ pub fn cellbender_import(
         // the whole table (which a legacy single-section obs forces). Not
         // inferable from the output file: both paths write a sharded obs.
         d.set_item("obs_streamed", s.obs_streamed)?;
+        // The var predicate index outcome. An `overwrite` of an indexed var
+        // column rebuilds the index from the new values; when none of the
+        // covered columns can still be indexed the stale section is retired
+        // instead, and `var_columns_not_carried` names what pushdown lost.
+        d.set_item("var_index_rebuilt", s.var_index_rebuilt)?;
+        d.set_item("var_index_dropped", s.var_index_dropped)?;
+        d.set_item("var_columns_not_carried", s.var_columns_not_carried.clone())?;
     }
     Ok(d.into())
 }
