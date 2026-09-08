@@ -1,6 +1,6 @@
 [package]
 name = "scx-cli"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "CLI tool for SCX: convert, info, validate"
 license.workspace = true
