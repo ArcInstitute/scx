@@ -147,25 +147,34 @@ pub(super) fn to_anndata_impl<'py>(
         if !plan.is_default_csr_f32() {
             // Layers go through f32 before this cast, so a layer count > 2²⁴
             // cannot be delivered losslessly regardless of the requested
-            // dtype — fail loud here rather than silently round (the eager
-            // path guards the same value_max inside `to_anndata_with_layers`;
-            // this covers the non-eager narrow path, which materializes layers
-            // lazily via the retype loop below). Matches the X/raw fail-loud
-            // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
-            // layer reader.
+            // dtype — fail loud here rather than silently round. Matches the
+            // X/raw fail-loud contract; the exact `>2²⁴` layer read awaits the
+            // Phase-5 typed layer reader.
             //
             // Which of the two shapes this is: **assemble f32, then cast**. `X`
             // decodes at the requested dtype instead — eagerly, and on the query
             // path when the dtype is declared at `collect()` — and guards on it.
-            convert::guard_decode_loss_layers(
-                exp.reader()?.catalog().layer_csr_max_value(0, None),
-                plan.allow_lossy,
-            )?;
+            //
+            // Scoped to the layers actually on the object, so an unselected
+            // `> 2²⁴` layer cannot refuse a narrow cast of a narrow one. This
+            // is the second guard a filtered read passes, not the only one:
+            // `layers=` forces eager assembly, so `to_anndata_filtered` has
+            // already folded the same names for the f32 decode itself. Reading
+            // the keys off the object rather than re-deriving the filter is
+            // what keeps the two in step — including on an unfiltered read,
+            // where the keys are every layer and the fold is the old one.
             let layers_obj = adata.getattr("layers")?;
             let mut keys: Vec<String> = Vec::new();
             for k in layers_obj.call_method0("keys")?.try_iter()? {
                 keys.push(k?.extract()?);
             }
+            // As at the decode guards: an unfiltered read's keys *are* every
+            // layer, so hand the catalog `None` and let it take its cheap fold.
+            let scope = layers.as_ref().map(|_| keys.as_slice());
+            convert::guard_decode_loss_layers(
+                exp.reader()?.catalog().layer_csr_max_value_over(0, scope),
+                plan.allow_lossy,
+            )?;
             for key in keys {
                 let layer = layers_obj.get_item(&key)?;
                 let new_layer = convert::retype_matrix(py, layer, &plan)?;

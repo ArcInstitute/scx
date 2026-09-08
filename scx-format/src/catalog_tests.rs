@@ -1333,6 +1333,12 @@ fn max_value_entry(
     }
 }
 
+/// Owned layer names for the subset fold, whose public arm is concrete in
+/// `String` so its `None` (all-layers) case is callable without a turbofish.
+fn names(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
 fn catalog_with(entries: Vec<FullCatalogEntry>) -> FullCatalog {
     FullCatalog {
         entries,
@@ -1409,6 +1415,168 @@ fn layer_csr_max_value_scopes_by_modality_and_name() {
     assert_eq!(cat.layer_csr_max_value(0, Some("counts_sq")), 80);
     assert_eq!(cat.layer_csr_max_value(0, Some("missing")), 0);
     assert_eq!(cat.layer_csr_max_value(1, Some("counts")), 200);
+}
+
+/// The single-modality legacy naming (`{layer}_shard_{idx}`, what
+/// `layer_names()` parses and every non-multimodal writer emits) must resolve
+/// too. It did not: the named fold delegated to
+/// `layer_csr_shards_for_modality`, whose `/{layer}/` needle no legacy name
+/// contains, so `layer_csr_max_value(0, Some(name))` answered 0 for every
+/// single-modality file — indistinguishable from "no large values here", which
+/// is what a decode-loss guard reads it as.
+#[test]
+fn layer_csr_max_value_resolves_the_legacy_single_modality_naming() {
+    let cat = catalog_with(vec![
+        max_value_entry("counts_shard_0", SectionType::LayerCsrShard, 0, Some(50)),
+        max_value_entry("counts_shard_1", SectionType::LayerCsrShard, 0, Some(70)),
+        // Trap: shares the `counts` prefix but is a different layer, and
+        // `starts_with("counts_shard_")` must not match it.
+        max_value_entry("counts_sq_shard_0", SectionType::LayerCsrShard, 0, Some(90)),
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(999)),
+    ]);
+    // The delegate the fold used to call still cannot see these entries — this
+    // is the whole defect, kept visible so a later "simplify back to one
+    // predicate" cannot quietly restore it.
+    assert!(cat.layer_csr_shards_for_modality(0, "counts").is_empty());
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 70);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts_sq")), 90);
+    assert_eq!(cat.layer_csr_max_value(0, Some("missing")), 0);
+    // The unnamed fold already covered this naming and still does.
+    assert_eq!(cat.layer_csr_max_value(0, None), 90);
+    // And the names the fold accepts are exactly the ones `layer_names()`
+    // reports, so a caller cannot hand it a name it will silently miss.
+    assert_eq!(cat.layer_names(), vec!["counts", "counts_sq"]);
+}
+
+/// Both namings resolve through one call, and a mixed catalog does not
+/// double-count or cross-contaminate: no writer emits both spellings for one
+/// layer, but the fold must be right if it ever sees them side by side.
+#[test]
+fn layer_csr_shards_named_accepts_either_naming() {
+    let cat = catalog_with(vec![
+        max_value_entry("counts_shard_0", SectionType::LayerCsrShard, 0, Some(50)),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(60),
+        ),
+        // Same layer name under a different modality: never in scope.
+        max_value_entry(
+            "layer/atac/counts/shard_0",
+            SectionType::LayerCsrShard,
+            1,
+            Some(400),
+        ),
+    ]);
+    assert_eq!(cat.layer_csr_shards_named(0, "counts").len(), 2);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 60);
+    assert_eq!(cat.layer_csr_shards_named(1, "counts").len(), 1);
+    assert_eq!(cat.layer_csr_max_value(1, Some("counts")), 400);
+    assert!(cat.layer_csr_shards_named(0, "nope").is_empty());
+}
+
+/// The subset fold a filtered layer read needs: max over the named layers and
+/// nothing else, in one pass, under either naming. `layer_csr_max_value(_,
+/// Some(name))` is the one-name case of exactly this, so the two cannot
+/// disagree.
+#[test]
+fn layer_csr_max_value_over_folds_only_the_named_layers() {
+    let cat = catalog_with(vec![
+        max_value_entry("narrow_shard_0", SectionType::LayerCsrShard, 0, Some(50)),
+        max_value_entry(
+            "wide_shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(20_000_000),
+        ),
+        // The unique maximum lives on the *per-modality*-named shard on purpose:
+        // otherwise `wide` dominates and the `None` == "every layer" equality
+        // below holds even with `mid` omitted, pinning nothing.
+        max_value_entry(
+            "layer/rna/mid/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(30_000_000),
+        ),
+        max_value_entry(
+            "wide_shard_0",
+            SectionType::LayerCsrShard,
+            1,
+            Some(u32::MAX),
+        ),
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(999)),
+    ]);
+    // The whole point: the wide layer does not contribute unless it is named.
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow"]))),
+        50
+    );
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["wide"]))),
+        20_000_000
+    );
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide"]))),
+        20_000_000
+    );
+    // Both namings resolve through the one call.
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "mid"]))),
+        30_000_000
+    );
+    // Nothing selected decodes nothing, so nothing can round — and that is a
+    // different answer from `None`, which means "every layer".
+    assert_eq!(cat.layer_csr_max_value_over(0, Some(&[])), 0);
+    // Reachable: `to_anndata(layers=[], data_dtype=…)` reaches the retype guard
+    // with no keys, and an empty selection answers without touching the catalog.
+    assert_eq!(cat.fold_value_max_over_names(0, &[] as &[&str]), 0);
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, None),
+        cat.layer_csr_max_value(0, None)
+    );
+    // And `None` really is the cheap whole-modality fold, not a rebuild of it:
+    // it agrees with naming every layer, which is what the callers rely on when
+    // they pass `None` for an unfiltered read.
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, None),
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide", "mid"])))
+    );
+    // …and that equality only pins anything if dropping a layer breaks it. With
+    // the maximum on `mid`, omitting `mid` does.
+    assert_ne!(
+        cat.layer_csr_max_value_over(0, None),
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide"])))
+    );
+    // Owned strings pass without an intermediate `Vec<&str>` at the call site.
+    let owned = vec![String::from("narrow")];
+    assert_eq!(cat.layer_csr_max_value_over(0, Some(&owned)), 50);
+    // A name the modality does not carry contributes nothing, and another
+    // modality's same-named layer is never in scope.
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["missing"]))),
+        0
+    );
+    assert_eq!(cat.layer_csr_max_value_over(2, Some(&names(&["wide"]))), 0);
+    assert_eq!(
+        cat.layer_csr_max_value_over(1, Some(&names(&["wide"]))),
+        u32::MAX
+    );
+    // X shards never contribute, whatever is named.
+    assert_eq!(cat.layer_csr_max_value_over(0, Some(&names(&["X"]))), 0);
+    // Equal to the single-name accessor by construction.
+    for name in ["narrow", "wide", "mid", "missing"] {
+        assert_eq!(
+            cat.layer_csr_max_value(0, Some(name)),
+            cat.layer_csr_max_value_over(0, Some(&names(&[name]))),
+            "single-name accessor disagreed for {name}"
+        );
+    }
+    // And naming every layer equals the unfiltered whole-modality fold.
+    assert_eq!(
+        cat.layer_csr_max_value_over(0, Some(&names(&["narrow", "wide", "mid"]))),
+        cat.layer_csr_max_value(0, None)
+    );
 }
 
 /// An entry without `ShardStats` contributes 0 to the fold (it is skipped) —

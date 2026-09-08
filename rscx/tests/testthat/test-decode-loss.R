@@ -58,3 +58,29 @@ test_that("small-count archive reads without spurious error", {
   exp <- scx_open(path)
   expect_no_error(exp$x_matrix())
 })
+
+# `$layer()` is the surface the catalog's name-scoped `value_max` fold reaches,
+# and it had no coverage: the fold resolved only the per-modality
+# `layer/{modality}/{layer}/shard_{idx}` section naming, so on a
+# single-modality file it answered 0 — indistinguishable from "no large values
+# here" — and this guard never fired. rscx cannot write a layer (`from_seurat`
+# reads only the Seurat `counts` layer), so the fixture is written by pyscx and
+# committed: 6 cells x 4 genes, a `narrow` layer and a `wide` one holding
+# 20,000,000.
+test_that("layer() guards per layer: narrow reads, wide fails loud, allow_lossy escapes", {
+  path <- skip_if_no_fixture("tiny_big_layer.scx")
+  exp <- scx_open(path)
+  expect_setequal(exp$layer_names(), c("narrow", "wide"))
+
+  # The scoping that matters: a narrow layer reads even though a wide one
+  # exists in the same file.
+  narrow <- exp$layer("narrow")
+  expect_s4_class(narrow, "dgCMatrix")
+  expect_equal(max(narrow), 14)
+
+  # And the wide one still refuses, rather than silently rounding.
+  expect_error(exp$layer("wide"), "allow_lossy")
+  wide <- exp$layer("wide", allow_lossy = TRUE)
+  expect_s4_class(wide, "dgCMatrix")
+  expect_equal(max(wide), 20000000)
+})
