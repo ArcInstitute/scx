@@ -223,6 +223,77 @@ def test_default_lazy_layers_not_gated(tmp_dir):
 
 
 # --------------------------------------------------------------------------
+# The eager-layers guard is scoped to the SELECTED layers (I8)
+#
+# `layers=` has been a filter since before 0.17, but all three eager-layer
+# guard sites folded `value_max` over *every* layer in the file, so a `> 2**24`
+# count in a layer the caller never asked for refused a read that does not
+# touch it. Same class as the query-path false refusal that reached production
+# (a caller reads a narrow layer, gets a ValueError, and downstream code reads
+# it as "no data"). These pin the scoping at each of the three sites.
+# --------------------------------------------------------------------------
+
+
+def _narrow_and_wide_layers_adata(n_obs=4, n_vars=3):
+    """Small X + a narrow layer a read can serve exactly + a wide one it cannot."""
+    small = np.array([[3, 0, 5], [0, 7, 0], [1, 0, 0], [0, 0, 2]], dtype=np.float32)
+    wide = np.zeros((n_obs, n_vars), dtype=np.float32)
+    wide[0, 0] = float(BIG)
+    ad = anndata.AnnData(
+        X=sp.csr_matrix(small),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n_obs)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+    )
+    ad.layers["narrow"] = sp.csr_matrix(small * 2.0)
+    ad.layers["wide"] = sp.csr_matrix(wide)
+    return ad
+
+
+def test_eager_layers_guard_scopes_to_the_selected_layer(tmp_dir):
+    path = _write(tmp_dir, _narrow_and_wide_layers_adata(), name="f4_sel.scx")
+    # `layers=` forces eager assembly, so this is the bridge-branch guard.
+    rt = pyscx.open(path).to_anndata(layers=["narrow"])
+    assert set(rt.layers.keys()) == {"narrow"}
+    np.testing.assert_array_equal(
+        rt.layers["narrow"].toarray(),
+        np.array([[6, 0, 10], [0, 14, 0], [2, 0, 0], [0, 0, 4]], dtype=np.float32),
+    )
+    # Premise: the unselected layer really is wide, so selecting it still refuses.
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(layers=["wide"])
+    # And scoping is not "never guard": naming both refuses, as does no filter.
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(layers=["narrow", "wide"])
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(eager=True)
+
+
+def test_projected_layers_guard_scopes_to_the_selected_layer(tmp_dir):
+    """`var_names=` takes the projected assemble path, which guards separately."""
+    path = _write(tmp_dir, _narrow_and_wide_layers_adata(), name="f4_sel_proj.scx")
+    rt = pyscx.open(path).to_anndata(layers=["narrow"], var_names=["g0", "g2"])
+    assert list(rt.var_names) == ["g0", "g2"]
+    np.testing.assert_array_equal(
+        rt.layers["narrow"].toarray(),
+        np.array([[6, 10], [0, 0], [2, 0], [0, 4]], dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(layers=["wide"], var_names=["g0", "g2"])
+
+
+def test_layer_retype_guard_scopes_to_the_selected_layer(tmp_dir):
+    """A non-default `data_dtype=` narrows layers post-assembly (a third site)."""
+    path = _write(tmp_dir, _narrow_and_wide_layers_adata(), name="f4_sel_retype.scx")
+    rt = pyscx.open(path).to_anndata(layers=["narrow"], data_dtype="uint16")
+    assert rt.layers["narrow"].data.dtype == np.uint16
+    assert rt.layers["narrow"].toarray()[0, 2] == 10
+    # A wide layer cannot be delivered exactly at any dtype — layers assemble as
+    # f32 before the cast — so selecting it still refuses.
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(layers=["wide"], data_dtype="uint32")
+
+
+# --------------------------------------------------------------------------
 # Eager to_mudata (per-modality X)
 # --------------------------------------------------------------------------
 

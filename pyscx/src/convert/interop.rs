@@ -944,6 +944,19 @@ pub(crate) fn slot_has_selected(available: &[String], filter: Option<&[String]>)
     }
 }
 
+/// The layers a `layers=` filter selects, in the file's order (`None` selects
+/// every layer). Same predicate as [`slot_has_selected`], which answers the
+/// `is_empty()` question without the allocation; this one is for the callers
+/// that need the names — the eager layer loop, and the decode-loss guard, which
+/// must fold `value_max` over exactly these and no others.
+pub(crate) fn selected_layer_names(available: &[String], filter: Option<&[String]>) -> Vec<String> {
+    available
+        .iter()
+        .filter(|a| filter.is_none_or(|keys| keys.iter().any(|k| k == *a)))
+        .cloned()
+        .collect()
+}
+
 /// Populate `obsm_dict` with eager dense numpy arrays for the selected
 /// obsm keys, applying deletion vectors and (when `obs_filter` is set)
 /// the obs_filter row slice. Extracted from the backed `to_anndata`

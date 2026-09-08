@@ -2385,6 +2385,14 @@ the large-count shard:
 - **Lazy `layers`** on the default (`eager=False`) `to_anndata()` — the layer
   is decoded only on later `adata.layers[...]` access.
 
+The layers guard folds `value_max` over **the selected layers only**, so
+`to_anndata(layers=["cpm"])` is refused by a `> 2²⁴` count in `cpm` and never by
+one in a layer the call does not read. (`layers=` forces eager assembly, so a
+filtered read is always a guarded read.) That holds at all three eager-layer
+sites — the bridge branch, the `var_names=` projected assemble, and the
+post-assembly narrow a non-default `data_dtype=` triggers — so none of them
+disagrees about when a read raises.
+
 For those ungated paths, a `> 2²⁴` count still rounds silently on access; pass
 `allow_lossy` where available, or read eagerly to get the guard. To *know*
 before reading: `Experiment.is_integer` / `Experiment.max_value` (catalog

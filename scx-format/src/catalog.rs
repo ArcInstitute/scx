@@ -1079,21 +1079,56 @@ impl FullCatalog {
     }
 
     /// Maximum `value_max` over the Layer-CSR shards of `modality_id` — every
-    /// layer when `layer_name` is `None`, else just the named layer (matched
-    /// as a whole `/{layer_name}/` path component of the
-    /// `layer/{modality}/{layer}/shard_{idx}` section name, mirroring
-    /// [`Self::layer_csr_shards_for_modality`]). Same semantics as
-    /// [`Self::csr_max_value`].
+    /// layer when `layer_name` is `None`, else just the named layer. Same
+    /// semantics as [`Self::csr_max_value`].
+    ///
+    /// The named form resolves **both** section namings (see
+    /// [`Self::layer_csr_shards_named`]). It used to delegate to
+    /// [`Self::layer_csr_shards_for_modality`], which knows only the
+    /// per-modality one, so on a single-modality file it returned 0 — and 0 is
+    /// also what "this layer stores floats, nothing to guard" looks like, so a
+    /// dead decode-loss guard was indistinguishable from a passing one.
     pub fn layer_csr_max_value(&self, modality_id: u8, layer_name: Option<&str>) -> u32 {
         match layer_name {
-            Some(name) => Self::fold_value_max(
-                self.layer_csr_shards_for_modality(modality_id, name)
-                    .into_iter(),
-            ),
+            Some(name) => {
+                Self::fold_value_max(self.layer_csr_shards_named(modality_id, name).into_iter())
+            }
             None => Self::fold_value_max(self.entries.iter().filter(|e| {
                 e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id
             })),
         }
+    }
+
+    /// One named layer's CSR shards under **either** section naming: the
+    /// per-modality `layer/{modality}/{layer}/shard_{idx}` that
+    /// [`Self::layer_csr_shards_for_modality`] matches on a `/{layer}/` path
+    /// component, and the single-modality legacy `{layer}_shard_{idx}` that
+    /// `ScxReader::legacy_layer_shards` and [`Self::layer_names`] use. Every
+    /// writer emits one or the other, never both for the same layer, so the
+    /// two predicates cannot double-count.
+    ///
+    /// Each half is deliberately the *same* predicate as the reader that
+    /// decodes that naming, so a guard folded over this and the read it guards
+    /// see the same shards — including on a pathological name like a layer `a`
+    /// beside a layer `a_shard`, where the legacy prefix over-matches in both.
+    ///
+    /// Unsorted: the only caller folds a max. Read paths that need shards in
+    /// row order should keep using the naming-specific, sorting accessors.
+    pub fn layer_csr_shards_named(
+        &self,
+        modality_id: u8,
+        layer_name: &str,
+    ) -> Vec<&FullCatalogEntry> {
+        let component = format!("/{layer_name}/");
+        let legacy_prefix = format!("{layer_name}_shard_");
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.section_type == SectionType::LayerCsrShard
+                    && e.modality_id == modality_id
+                    && (e.name.contains(&component) || e.name.starts_with(&legacy_prefix))
+            })
+            .collect()
     }
 
     /// Shared fold behind the `*_max_value` helpers: max `value_max` over the

@@ -339,17 +339,12 @@ pub(crate) fn to_anndata_with_layers<'py>(
     let has_obsp = slot_has_selected(&reader.list_obsp(), filters.obsp);
     let has_varp = slot_has_selected(&reader.list_varp(), filters.varp);
     let has_varm = slot_has_selected(&reader.list_varm(), filters.varm);
-    let layer_names = reader.layer_names();
+    let selected_layers = selected_layer_names(&reader.layer_names(), layer_filter);
     // `Skeleton` never builds a layer bridge — the caller assembles each
     // selected layer projected and assigns it after the slice. Leaving
     // `has_layers` true here would open a sibling `ScxReader` mmap for a bridge
     // nothing reads.
-    let has_layers = !matches!(mode, MatrixMode::Skeleton { .. })
-        && if let Some(filter) = layer_filter {
-            layer_names.iter().any(|n| filter.iter().any(|f| f == n))
-        } else {
-            !layer_names.is_empty()
-        };
+    let has_layers = !matches!(mode, MatrixMode::Skeleton { .. }) && !selected_layers.is_empty();
     let need_lazy = has_obsp || has_varp || has_varm || has_layers || lazy_obsm_requested;
 
     let obsp_kept = if has_obsp {
@@ -444,8 +439,18 @@ pub(crate) fn to_anndata_with_layers<'py>(
             // non-eager narrow path is guarded symmetrically in `experiment.rs`
             // before the retype loop; X/raw, by contrast, narrow in-decode and are
             // exact for `>2²⁴` integer targets.
+            //
+            // Scoped to the layers this bridge will actually decode
+            // (`layer_filter` already narrowed `selected_layers`, and
+            // `ScxLazyLayersMapping` carries the same filter), not to every
+            // layer in the file — a `> 2²⁴` count in an unselected layer must
+            // not refuse a read that never touches it.
             guard_decode_loss_layers(
-                reader.catalog().layer_csr_max_value(0, None),
+                selected_layers_max_value(
+                    reader.catalog(),
+                    0,
+                    selected_layers.iter().map(String::as_str),
+                ),
                 plan.allow_lossy,
             )?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
@@ -687,11 +692,7 @@ fn projected_eager_anndata<'py>(
 
     // Layers, in catalog order (the pre-projection path materialised them from
     // a `HashMap`, so `list(adata.layers)` used to vary between runs).
-    let selected: Vec<String> = reader
-        .layer_names()
-        .into_iter()
-        .filter(|n| layer_filter.is_none_or(|f| f.iter().any(|x| x == n)))
-        .collect();
+    let selected = selected_layer_names(&reader.layer_names(), layer_filter);
     if !selected.is_empty() {
         // The eager-layers decode-loss guard lived inside the bridge branch this
         // path replaces. Layers materialise as f32 on every path and are
@@ -702,8 +703,12 @@ fn projected_eager_anndata<'py>(
         // f32 limit is the real limit. Contrast `X`, which decodes *at* the
         // requested dtype — on the eager path, and on the query path when the
         // dtype is declared at `collect()` — and so guards on that dtype.
+        //
+        // Scoped to `selected` — the layers this loop decodes — rather than to
+        // every layer in the file, so an unselected `> 2²⁴` layer cannot refuse
+        // a read that never touches it.
         guard_decode_loss_layers(
-            reader.catalog().layer_csr_max_value(0, None),
+            selected_layers_max_value(reader.catalog(), 0, selected.iter().map(String::as_str)),
             plan.allow_lossy,
         )?;
         let layers_attr = adata.getattr("layers")?;

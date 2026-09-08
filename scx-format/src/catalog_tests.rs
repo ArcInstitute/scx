@@ -1411,6 +1411,65 @@ fn layer_csr_max_value_scopes_by_modality_and_name() {
     assert_eq!(cat.layer_csr_max_value(1, Some("counts")), 200);
 }
 
+/// The single-modality legacy naming (`{layer}_shard_{idx}`, what
+/// `layer_names()` parses and every non-multimodal writer emits) must resolve
+/// too. It did not: the named fold delegated to
+/// `layer_csr_shards_for_modality`, whose `/{layer}/` needle no legacy name
+/// contains, so `layer_csr_max_value(0, Some(name))` answered 0 for every
+/// single-modality file — indistinguishable from "no large values here", which
+/// is what a decode-loss guard reads it as.
+#[test]
+fn layer_csr_max_value_resolves_the_legacy_single_modality_naming() {
+    let cat = catalog_with(vec![
+        max_value_entry("counts_shard_0", SectionType::LayerCsrShard, 0, Some(50)),
+        max_value_entry("counts_shard_1", SectionType::LayerCsrShard, 0, Some(70)),
+        // Trap: shares the `counts` prefix but is a different layer, and
+        // `starts_with("counts_shard_")` must not match it.
+        max_value_entry("counts_sq_shard_0", SectionType::LayerCsrShard, 0, Some(90)),
+        max_value_entry("X_shard_0", SectionType::CsrShard, 0, Some(999)),
+    ]);
+    // The delegate the fold used to call still cannot see these entries — this
+    // is the whole defect, kept visible so a later "simplify back to one
+    // predicate" cannot quietly restore it.
+    assert!(cat.layer_csr_shards_for_modality(0, "counts").is_empty());
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 70);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts_sq")), 90);
+    assert_eq!(cat.layer_csr_max_value(0, Some("missing")), 0);
+    // The unnamed fold already covered this naming and still does.
+    assert_eq!(cat.layer_csr_max_value(0, None), 90);
+    // And the names the fold accepts are exactly the ones `layer_names()`
+    // reports, so a caller cannot hand it a name it will silently miss.
+    assert_eq!(cat.layer_names(), vec!["counts", "counts_sq"]);
+}
+
+/// Both namings resolve through one call, and a mixed catalog does not
+/// double-count or cross-contaminate: no writer emits both spellings for one
+/// layer, but the fold must be right if it ever sees them side by side.
+#[test]
+fn layer_csr_shards_named_accepts_either_naming() {
+    let cat = catalog_with(vec![
+        max_value_entry("counts_shard_0", SectionType::LayerCsrShard, 0, Some(50)),
+        max_value_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(60),
+        ),
+        // Same layer name under a different modality: never in scope.
+        max_value_entry(
+            "layer/atac/counts/shard_0",
+            SectionType::LayerCsrShard,
+            1,
+            Some(400),
+        ),
+    ]);
+    assert_eq!(cat.layer_csr_shards_named(0, "counts").len(), 2);
+    assert_eq!(cat.layer_csr_max_value(0, Some("counts")), 60);
+    assert_eq!(cat.layer_csr_shards_named(1, "counts").len(), 1);
+    assert_eq!(cat.layer_csr_max_value(1, Some("counts")), 400);
+    assert!(cat.layer_csr_shards_named(0, "nope").is_empty());
+}
+
 /// An entry without `ShardStats` contributes 0 to the fold (it is skipped) —
 /// the guard is only as strong as the catalog it reads. Deliberate pre-1.0
 /// semantics; every current writer path emits stats.

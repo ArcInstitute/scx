@@ -157,15 +157,24 @@ pub(super) fn to_anndata_impl<'py>(
             // Which of the two shapes this is: **assemble f32, then cast**. `X`
             // decodes at the requested dtype instead — eagerly, and on the query
             // path when the dtype is declared at `collect()` — and guards on it.
-            convert::guard_decode_loss_layers(
-                exp.reader()?.catalog().layer_csr_max_value(0, None),
-                plan.allow_lossy,
-            )?;
+            //
+            // Scoped to the layers actually on the object — a `layers=` filter
+            // already applied upstream, so folding over every layer in the file
+            // would refuse a narrow cast of a narrow layer because some
+            // unselected layer holds a `> 2²⁴` count.
             let layers_obj = adata.getattr("layers")?;
             let mut keys: Vec<String> = Vec::new();
             for k in layers_obj.call_method0("keys")?.try_iter()? {
                 keys.push(k?.extract()?);
             }
+            convert::guard_decode_loss_layers(
+                convert::selected_layers_max_value(
+                    exp.reader()?.catalog(),
+                    0,
+                    keys.iter().map(String::as_str),
+                ),
+                plan.allow_lossy,
+            )?;
             for key in keys {
                 let layer = layers_obj.get_item(&key)?;
                 let new_layer = convert::retype_matrix(py, layer, &plan)?;
