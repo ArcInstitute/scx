@@ -789,27 +789,21 @@ gene-chunk walk: every visited shard is read once per gene chunk, so the cost is
 | `rank_genes_groups`, 4 chunks, two-shard mask | 20 | **8** |
 | any of them, no row projection | 5 / 10 / 20 | unchanged |
 
-**The decode-prefetch**, wall-clock, on a full-file DE where no rows are skipped
-(20 000 cells × 1 000 genes, density 0.2, 10 shards, `gene_chunk_size=125` → 8
-chunks; `SCX_ACCEL_PREFETCH_DEPTH=1` against the default 4, best of 3):
+**The decode-prefetch** is a wall-clock claim, and it is deliberately **not
+published here**. It could be expressed as a `benchmark × format × dataset`
+triple — `bench_csc_dispatch`'s `bench_csc__de_csr` / `bench_csc__pdex_ref_csr`
+on `tabula_sapiens_100k` run CPU DE on a backed file, which *is* the streaming
+kernel — and [docs/benchmark_manifest.md](benchmark_manifest.md) is explicit
+that a claim of that shape must be manifested, with the inline-disclosure tier
+reserved for kernel measurements that genuinely cannot take it. The local
+depth-1-vs-4 numbers are in the pull request that made the change; the durable
+figure waits on a capture of those two arms, neither of which carries a floor in
+`thresholds.yaml` today.
 
-| shard cache | depth 1 | depth 4 | Speedup |
-|---|--:|--:|--:|
-| `cache_shards=0` (every read decodes) | 6.24 s | 2.52 s | **2.48×** |
-| `cache_shards=16` (holds the file) | 2.27 s | 1.83 s | 1.24× |
-| one-shard row window, either cache | 0.65 / 0.24 s | 0.65 / 0.24 s | ~1.0× |
-
-The cache row is the honest ceiling: with the LRU sized to the file only the
-first gene chunk misses, so there is one pass of decode to overlap rather than
-eight. The row-window row is flat by construction — a one-shard plan has nothing
-to prefetch ahead of, and the pipeline's `n_shards <= 1` guard takes the
-sequential path.
-
-This is a **local** measurement on a synthetic fixture, not a gated capture:
-`accel_de`'s CPU arms run on the in-memory `AnnData` and so exercise
-`wilcoxon_rank_sum_sparse`, not the streaming kernel. The scenario that does
-reach it is `bench_csc_dispatch`'s `bench_csc__de_csr` / `bench_csc__pdex_ref_csr`
-on `tabula_sapiens_100k`, and neither carries a floor in `thresholds.yaml`.
+(For the record on the *shape* of the win, which the counts above already
+establish: overlap only helps where decode is repeated, so it is largest with no
+shard cache and smallest once the LRU holds the file — and flat on a one-shard
+row window, which has nothing to prefetch ahead of.)
 
 Peak memory is bounded rather than assumed: the pipeline holds `depth` decoded
 shards where the loop held one, and `scx_accel::mem_budget::de_prefetch_depth`

@@ -584,11 +584,11 @@ undersized-cache warning measures the cache against the shards a call visits
 rather than against the file.
 
 Going through the drivers also gave the DE kernels the bounded decode-prefetch
-they never had, which is a separate effect from the skip and was measured
-separately — a full-file `rank_genes_groups` over 20 000 cells x 1 000 genes in
-10 shards at 8 gene chunks: **6.24 s to 2.52 s** with no shard cache
-(`SCX_ACCEL_PREFETCH_DEPTH=1` against the default 4), and 2.27 s to 1.83 s with
-the cache sized to the file, where only the first pass misses. Depth is clamped
+they never had — a separate effect from the skip, measured separately, and not
+quoted here: it is a wall-clock claim of a shape
+[docs/benchmark_manifest.md](benchmark_manifest.md) requires a manifest entry
+for. Overlap helps where decode is repeated, so it is largest with no shard
+cache and vanishes on a one-shard window. Depth is clamped
 by `scx_accel::mem_budget::de_prefetch_depth` against whatever the dense
 `n_obs x chunk` workspace left of `SCX_ACCEL_DE_MEMORY_BUDGET`, so a
 budget-bound file falls back to depth 1 rather than growing: the pipeline holds

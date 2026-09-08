@@ -70,10 +70,24 @@ pub fn gpu_pseudobulk_means_csr(
         ValidationChecks::SORTED,
         "pseudobulk",
     ));
-    let mut global_row = 0usize;
-    src.for_each_gpu_csr_shard(&mut |_idx, slot| {
+    // `RawGpuShardSource::run` follows the source's `StagingPlan`, which since
+    // `StagingPlan::for_source` may be a row-filtered subset rather than every
+    // shard — so the row cursor is only correct if the plan agrees with the rows
+    // handed over. It is the same `csr_shard_pseudobulk_kernel` the GPU DE
+    // passes use, indexing `cell_to_group[global_row + r]` into a device buffer
+    // of length `n_obs`: an over-covering plan is an out-of-bounds *device*
+    // read, an under-covering one a silently shifted result. Hence the shared
+    // cursor, the same one the DE passes use.
+    // Bounded by `cell_to_group.len()` rather than `source.n_obs()`: that slice
+    // is the device buffer the kernel actually indexes, so it is the length a
+    // guard against an out-of-bounds read has to respect.
+    let mut cursor = scx_format_io::VisibleRowCursor::new(cell_to_group.len());
+    src.for_each_gpu_csr_shard(&mut |idx, slot| {
         let view = slot.view();
         let n_rows = view.shape.0;
+        let global_row = cursor
+            .advance(n_rows, idx, "GPU pseudobulk CSR shard pass")
+            .map_err(GpuError::InvalidShard)?;
         gpu_de_pseudobulk_csr_direct(
             dev,
             &view,
@@ -85,9 +99,11 @@ pub fn gpu_pseudobulk_means_csr(
             n_cols,
             0, // mode_id = identity (plain sum)
         )?;
-        global_row += n_rows;
         Ok(())
     })?;
+    cursor
+        .finish("GPU pseudobulk CSR shard pass")
+        .map_err(GpuError::InvalidShard)?;
     dev.synchronize()?;
 
     let mut host = dev.dtoh_copy(&sums)?;

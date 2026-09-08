@@ -216,7 +216,10 @@ pub use scx_format_io::prefetch::clamp_prefetch_depth;
 /// Deliberately **not** done: shrinking the gene chunk to make room for
 /// prefetch. That would change chunk counts on exactly the files where the
 /// clamp binds, trading a measured win for an unmeasured one.
-pub fn de_prefetch_depth(hint: Option<scx_format_io::ShardSizeHint>, dense_bytes: u64) -> usize {
+pub(crate) fn de_prefetch_depth(
+    hint: Option<scx_format_io::ShardSizeHint>,
+    dense_bytes: u64,
+) -> usize {
     de_prefetch_depth_for(
         scx_format_io::prefetch::prefetch_depth(),
         hint,

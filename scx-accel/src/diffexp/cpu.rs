@@ -823,12 +823,14 @@ fn fill_gene_chunk_dense<S: ShardSource + Sync + ?Sized>(
     let chunk_size = col_indices.len();
     let dense = &mut dense[..n_obs * chunk_size];
     dense.fill(0.0);
-    let mut cursor = super::VisibleRowCursor::new(n_obs);
+    let mut cursor = scx_format_io::VisibleRowCursor::new(n_obs);
     crate::prefetch::for_each_shard_ordered(source, depth, |shard_idx, shard_csr| {
         let _r = scx_format_io::reduction_guard();
         let projected = scx_engine::project_csr(&shard_csr, col_indices);
         let rows = projected.n_rows();
-        let base = cursor.advance(rows, shard_idx, context)?;
+        let base = cursor
+            .advance(rows, shard_idx, context)
+            .map_err(crate::AccelError::ShapeError)?;
         for row in 0..rows {
             // A per-row slice: the row's base offset is computed once per row
             // rather than once per nonzero, the bounds check is one per row
@@ -843,7 +845,9 @@ fn fill_gene_chunk_dense<S: ShardSource + Sync + ?Sized>(
         }
         Ok(())
     })?;
-    cursor.finish(context)
+    cursor
+        .finish(context)
+        .map_err(crate::AccelError::ShapeError)
 }
 
 /// Gene-chunked streaming Wilcoxon rank-sum over a CSR [`ShardSource`].

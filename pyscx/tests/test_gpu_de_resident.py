@@ -365,14 +365,22 @@ def test_a_row_window_gives_the_same_answer_as_those_rows_alone(
         want = ref[key]
         if key in ("names", "feature"):
             assert got == want, f"{op}: {key} differs between the window and its own file"
-        else:
-            np.testing.assert_allclose(
-                np.asarray(got, dtype=np.float64),
-                np.asarray(want, dtype=np.float64),
-                rtol=1e-9,
-                atol=1e-12,
-                err_msg=f"{op}: {key} differs between the window and its own file",
-            )
+            continue
+        # The same split the residency test uses, and for the same reason: the
+        # pseudobulk fold is an f64 `atomicAdd` whose ordering is run-to-run
+        # nondeterministic, so means and fold changes are a tolerance question.
+        # Statistics and p-values come from the single-writer scatter slabs and
+        # are exact. These are two separate GPU processes, so `target_mean` is
+        # squarely in the nondeterministic bucket.
+        exact = key in ("scores", "p_value")
+        rtol, atol = (1e-9, 1e-12) if exact else (1e-5, 1e-7)
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float64),
+            np.asarray(want, dtype=np.float64),
+            rtol=rtol,
+            atol=atol,
+            err_msg=f"{op}: {key} differs between the window and its own file",
+        )
 
 
 def test_cpu_route_records_no_residency_decision(scx_path):

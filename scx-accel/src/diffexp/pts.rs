@@ -283,13 +283,17 @@ pub(crate) fn group_nonzero_counts_streaming_with_depth<S: ShardSource + Sync + 
         |d| d.max(1),
     );
     let mut acc = GroupNonzeroCounts::new(groups, n_groups, n_vars);
-    let mut cursor = super::VisibleRowCursor::new(n_obs);
+    let mut cursor = scx_format_io::VisibleRowCursor::new(n_obs);
     crate::prefetch::for_each_shard_ordered(source, depth, |shard_idx, shard| {
-        let base = cursor.advance(shard.n_rows(), shard_idx, "group nonzero counts")?;
+        let base = cursor
+            .advance(shard.n_rows(), shard_idx, "group nonzero counts")
+            .map_err(AccelError::ShapeError)?;
         acc.add_csr(&shard, base, groups)?;
         Ok(())
     })?;
-    cursor.finish("group nonzero counts")?;
+    cursor
+        .finish("group nonzero counts")
+        .map_err(AccelError::ShapeError)?;
     Ok(acc)
 }
 

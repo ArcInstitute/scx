@@ -34,6 +34,7 @@ pub mod mem;
 pub mod prefetch;
 pub mod profile;
 pub mod reader;
+pub mod row_cursor;
 pub mod shard_decode;
 pub mod shard_report;
 pub mod shard_source;
@@ -81,6 +82,7 @@ pub use reader::{
     decode_arrow_ipc_schema, filter_batch_by_keep_mask, prune_unused_dictionary_values,
     scatter_batch_to_physical, ScxReader,
 };
+pub use row_cursor::VisibleRowCursor;
 pub use shard_decode::{
     decode_shard_bytes, decode_shard_bytes_native, decode_shard_indptr_bytes,
     decode_shard_regions_native, decode_shard_regions_scipy,
