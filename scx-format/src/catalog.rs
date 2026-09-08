@@ -1090,7 +1090,7 @@ impl FullCatalog {
     /// dead decode-loss guard was indistinguishable from a passing one.
     pub fn layer_csr_max_value(&self, modality_id: u8, layer_name: Option<&str>) -> u32 {
         match layer_name {
-            Some(name) => self.layer_csr_max_value_over(modality_id, &[name]),
+            Some(name) => self.layer_csr_max_value_over(modality_id, Some(&[name])),
             None => Self::fold_value_max(self.entries.iter().filter(|e| {
                 e.section_type == SectionType::LayerCsrShard && e.modality_id == modality_id
             })),
@@ -1102,15 +1102,30 @@ impl FullCatalog {
     /// layers needs. An empty `layer_names` yields 0: nothing is decoded, so
     /// nothing can round.
     ///
-    /// One pass over the catalog with each name's two match patterns built once,
-    /// rather than one pass per name: a caller selecting every layer of a
-    /// many-shard file (which `to_anndata(eager=True)` does) would otherwise pay
-    /// `layers x entries` comparisons and an allocation per layer where the
-    /// whole-file fold paid a single non-allocating scan.
-    pub fn layer_csr_max_value_over(&self, modality_id: u8, layer_names: &[&str]) -> u32 {
+    /// `None` means "every layer of this modality" and takes the plain
+    /// [`Self::layer_csr_max_value`] fold, which is a single type check per
+    /// entry. That branch lives here rather than at the call sites so a caller
+    /// cannot forget it: naming every layer explicitly is **not** free. Each
+    /// name contributes a `contains` (a substring search, not a comparison) per
+    /// candidate entry, and measured on an atlas-shaped catalog — 1240 entries,
+    /// 5 layers x 200 shards — that is 1.3 us for the unfiltered fold against
+    /// 100.8 us with all five named, a 78x difference. A *filtered* read has no
+    /// such baseline to regress against: before the guard was scoped, it did
+    /// not complete at all.
+    pub fn layer_csr_max_value_over<S: AsRef<str>>(
+        &self,
+        modality_id: u8,
+        layer_names: Option<&[S]>,
+    ) -> u32 {
+        let Some(layer_names) = layer_names else {
+            return self.layer_csr_max_value(modality_id, None);
+        };
         let patterns: Vec<(String, String)> = layer_names
             .iter()
-            .map(|name| (format!("/{name}/"), format!("{name}_shard_")))
+            .map(|name| {
+                let name = name.as_ref();
+                (format!("/{name}/"), format!("{name}_shard_"))
+            })
             .collect();
         Self::fold_value_max(self.entries.iter().filter(|e| {
             e.section_type == SectionType::LayerCsrShard
@@ -1134,8 +1149,11 @@ impl FullCatalog {
     /// see the same shards — including on a pathological name like a layer `a`
     /// beside a layer `a_shard`, where the legacy prefix over-matches in both.
     ///
-    /// Unsorted: the only caller folds a max. Read paths that need shards in
-    /// row order should keep using the naming-specific, sorting accessors.
+    /// Unsorted, and its consumer is `pyscx`'s `decode_window`, which folds the
+    /// largest decoded shard size to bound a parallel decode — order-independent,
+    /// and it wants the entries and their count, not a maximum `value_max`. Read
+    /// paths that need shards in **row order** must keep using the
+    /// naming-specific, sorting accessors.
     pub fn layer_csr_shards_named(
         &self,
         modality_id: u8,

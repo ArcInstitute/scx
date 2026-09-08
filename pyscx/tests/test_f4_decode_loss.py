@@ -293,6 +293,26 @@ def test_layer_retype_guard_scopes_to_the_selected_layer(tmp_dir):
         pyscx.open(path).to_anndata(layers=["wide"], data_dtype="uint32")
 
 
+def test_unfiltered_narrow_dtype_still_refuses_on_the_lazy_retype_path(tmp_dir):
+    """The retype guard, reached with no `layers=` at all — the only test that
+    isolates it.
+
+    Naming a layer forces eager assembly, so the tests above pass the *decode*
+    guard first and would stay green if the retype guard were deleted outright.
+    With no filter the read stays lazy, never reaches that decode guard, and the
+    retype loop is the only thing standing between a `> 2**24` layer and a
+    silently rounded cast. `uint32` holds 20,000,000 exactly, so nothing but this
+    guard can produce the refusal.
+    """
+    path = _write(tmp_dir, _narrow_and_wide_layers_adata(), name="f4_sel_lazy.scx")
+    with pytest.raises(ValueError, match="allow_lossy"):
+        pyscx.open(path).to_anndata(data_dtype="uint32")
+    # And it is the guard, not the cast: allow_lossy delivers the same read.
+    rt = pyscx.open(path).to_anndata(data_dtype="uint32", allow_lossy=True)
+    assert rt.layers["wide"].data.dtype == np.uint32
+    assert rt.layers["wide"].toarray()[0, 0] == BIG
+
+
 # --------------------------------------------------------------------------
 # Eager to_mudata (per-modality X)
 # --------------------------------------------------------------------------

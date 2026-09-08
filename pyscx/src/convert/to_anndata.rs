@@ -445,11 +445,12 @@ pub(crate) fn to_anndata_with_layers<'py>(
             // `ScxLazyLayersMapping` carries the same filter), not to every
             // layer in the file — a `> 2²⁴` count in an unselected layer must
             // not refuse a read that never touches it.
-            let selected_names: Vec<&str> = selected_layers.iter().map(String::as_str).collect();
+            // `None` when the caller named no layers: that is every layer, and
+            // the catalog's plain fold answers it far more cheaply than naming
+            // them all does.
+            let scope = layer_filter.map(|_| selected_layers.as_slice());
             guard_decode_loss_layers(
-                reader
-                    .catalog()
-                    .layer_csr_max_value_over(0, &selected_names),
+                reader.catalog().layer_csr_max_value_over(0, scope),
                 plan.allow_lossy,
             )?;
             kwargs.set_item("layers", m.materialize_all(py)?)?;
@@ -706,11 +707,9 @@ fn projected_eager_anndata<'py>(
         // Scoped to `selected` — the layers this loop decodes — rather than to
         // every layer in the file, so an unselected `> 2²⁴` layer cannot refuse
         // a read that never touches it.
-        let selected_names: Vec<&str> = selected.iter().map(String::as_str).collect();
+        let scope = layer_filter.map(|_| selected.as_slice());
         guard_decode_loss_layers(
-            reader
-                .catalog()
-                .layer_csr_max_value_over(0, &selected_names),
+            reader.catalog().layer_csr_max_value_over(0, scope),
             plan.allow_lossy,
         )?;
         let layers_attr = adata.getattr("layers")?;

@@ -168,11 +168,11 @@ pub(super) fn to_anndata_impl<'py>(
             for k in layers_obj.call_method0("keys")?.try_iter()? {
                 keys.push(k?.extract()?);
             }
-            let key_names: Vec<&str> = keys.iter().map(String::as_str).collect();
+            // As at the decode guards: an unfiltered read's keys *are* every
+            // layer, so hand the catalog `None` and let it take its cheap fold.
+            let scope = layers.as_ref().map(|_| keys.as_slice());
             convert::guard_decode_loss_layers(
-                exp.reader()?
-                    .catalog()
-                    .layer_csr_max_value_over(0, &key_names),
+                exp.reader()?.catalog().layer_csr_max_value_over(0, scope),
                 plan.allow_lossy,
             )?;
             for key in keys {
