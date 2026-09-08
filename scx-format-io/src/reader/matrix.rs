@@ -1214,8 +1214,10 @@ impl ScxReader {
     /// indices, [`scx_codec::ShardValuesNative`] values) — the in-assembly narrow
     /// twin of [`read_shard_from_entry`](Self::read_shard_from_entry). Integer
     /// values stay `u32` (never rounded through `f32`); float values are `f32`.
-    /// Used by the typed whole-matrix reader in `typed_read.rs`.
-    pub(crate) fn read_shard_from_entry_native(
+    /// Used by the typed whole-matrix reader in `typed_read.rs` and by the query
+    /// engine's typed collect (via `SectionReader::read_shard_from_entry_native`),
+    /// which is why this is `pub` rather than `pub(crate)`.
+    pub fn read_shard_from_entry_native(
         &self,
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
