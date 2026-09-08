@@ -13,17 +13,20 @@
 use arrow::array::{Array, RecordBatch, UInt32Array};
 use arrow::compute;
 
-use scx_sparse::ScxCsr;
+use scx_sparse::{IndexBuffer, MaterializePlan, ScxCsr, ValueBuffer};
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::fused_ops::apply_fused_ops;
-use crate::pipeline::{QueryPipeline, QueryResult};
+use crate::pipeline::{QueryPipeline, QueryResult, TypedQueryResult};
 use crate::predicate::evaluate;
 use crate::projection::{decode_shard_projected, project_var};
+use crate::reader::SectionReader;
 
 use scx_format_io::assemble_filtered_metadata;
+use scx_format_io::catalog::FullCatalogEntry;
 
 use super::mask::{compute_mask, MaskResult, ShardInfo};
+use super::native::{decode_shard_native_filtered, truncate_to_limit, NativeShardRows};
 use super::plan::{build_plan, scan_shards, ExecutionPlan};
 use super::retry::par_map_with_shard_retry;
 use super::rows::filter_csr_rows;
@@ -308,6 +311,172 @@ pub fn execute(pipeline: &QueryPipeline) -> Result<QueryResult> {
     materialize(pipeline, pm)
 }
 
+/// Execute a query, decoding `X` **at `mplan`'s dtype** rather than `f32`.
+///
+/// The default [`execute`] decodes every shard to scipy types, so a caller who
+/// names a wider dtype afterwards receives values that already rounded through
+/// `f32`. This path decodes each shard to its native stream instead and narrows
+/// once, into the requested buffer — which is what makes an integer count above
+/// 2²⁴ readable exactly.
+///
+/// Refuses a pipeline carrying `with_normalize` / `with_log1p`: those transform
+/// counts into floats, so there is no stored value left to reproduce exactly,
+/// and the honest route is the `f32` one with its own guard. Callers should ask
+/// [`QueryPipeline::typed_collect_supported`] first rather than handle the
+/// error.
+pub fn execute_typed(
+    pipeline: &QueryPipeline,
+    mplan: &MaterializePlan,
+) -> Result<TypedQueryResult> {
+    let pm = plan_and_mask(pipeline)?;
+    materialize_typed(pipeline, pm, mplan)
+}
+
+/// The typed twin of [`materialize`]. Shares the prefix choice, the `max_value`
+/// fold and the whole metadata half with it; differs only in how `X` is decoded
+/// and assembled.
+pub(crate) fn materialize_typed(
+    pipeline: &QueryPipeline,
+    pm: PlanAndMask,
+    mplan: &MaterializePlan,
+) -> Result<TypedQueryResult> {
+    let PlanAndMask {
+        plan,
+        legacy_obs,
+        obs_shard_ranges,
+        var_batch,
+        shard_infos,
+        effective_gene_indices,
+        n_output_cols,
+        reorder,
+        skipped_shards,
+        total_shards,
+        candidate_shard_rows,
+        matched_rows,
+    } = pm;
+
+    if plan.normalize.is_some() || plan.log1p {
+        // Not `Generic`: that variant is classified retryable, and this is a
+        // usage error the caller must act on, not a transient one.
+        return Err(EngineError::UnsupportedRewrite {
+            op: "a dtype-selected collect".to_string(),
+            feature: "with_normalize() / with_log1p()".to_string(),
+            remedy: "those transforms replace the stored counts with floating-point values, \
+                     so no requested dtype can reproduce the stored data exactly. Collect \
+                     without a dtype (the values are transformed anyway), or drop the \
+                     transform."
+                .to_string(),
+        });
+    }
+
+    let reader = pipeline.reader();
+    let sorted_shards = scan_shards(reader.catalog(), pipeline.modality_id());
+
+    let decode_count = decode_prefix_len(&shard_infos, plan.limit);
+    let max_value = max_value_over_prefix(&sorted_shards, &shard_infos[..decode_count]);
+
+    // O(1) pre-decode guard, as the whole-matrix typed reader does: fail loud
+    // before the decode and the big allocation when the target dtype cannot hold
+    // `max_value`. Routed through `ScxError` rather than `EngineError::Generic`
+    // so a refused cast is not classified as a retryable shard fault and
+    // re-decoded before failing.
+    scx_format_io::guard_decode_loss_dtype(max_value, mplan.data_dtype, mplan.allow_lossy)
+        .map_err(scx_format_io::ScxError::from)?;
+
+    // Decode natively, keeping only matching rows and projected columns in one
+    // pass, then relabel to the caller's requested gene order while the indices
+    // are still plain `u32` — before they narrow into the target index buffer,
+    // whose own range gate then covers them.
+    let mut shard_results: Vec<NativeShardRows> =
+        par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
+            let entry = sorted_shards[si.shard_idx];
+            let mut rows = decode_shard_native_filtered(
+                reader,
+                entry,
+                &si.local_keep_mask,
+                effective_gene_indices.as_deref(),
+            )?;
+            if let Some(ref reorder) = reorder {
+                for idx in rows.indices.iter_mut() {
+                    *idx = reorder.sorted_to_output[*idx as usize];
+                }
+            }
+            Ok(rows)
+        })?;
+
+    if let Some(limit) = plan.limit {
+        truncate_to_limit(&mut shard_results, limit);
+    }
+
+    // Assemble at the target width. The exact totals are known here — the query
+    // path materialises per-shard results before merging — so the buffers are
+    // sized once and filled, with no growable typed buffer needed.
+    let total_rows: usize = shard_results.iter().map(NativeShardRows::n_rows).sum();
+    let total_nnz: usize = shard_results.iter().map(NativeShardRows::nnz).sum();
+
+    let mut indptr = vec![0i64; total_rows + 1];
+    let mut indices = IndexBuffer::zeroed(mplan.index_dtype, total_nnz);
+    let mut values = ValueBuffer::zeroed(mplan.data_dtype, total_nnz);
+
+    let mut cum_rows = 0usize;
+    let mut cum_nnz = 0usize;
+    for rows in &shard_results {
+        let (n, nnz) = (rows.n_rows(), rows.nnz());
+        let range = cum_nnz..cum_nnz + nnz;
+        scx_format_io::cast_native_indices_into(
+            &mut indices,
+            range.clone(),
+            &rows.indices,
+            mplan.allow_lossy,
+        )?;
+        scx_format_io::cast_native_values_into(
+            &mut values,
+            range,
+            &rows.values,
+            mplan.allow_lossy,
+        )?;
+        let nnz_off = cum_nnz as i64;
+        for j in 0..n {
+            indptr[cum_rows + 1 + j] = rows.indptr[j + 1] + nnz_off;
+        }
+        cum_rows += n;
+        cum_nnz += nnz;
+    }
+
+    let csr =
+        scx_sparse::TypedCsr::new_unchecked((total_rows, n_output_cols), indptr, indices, values);
+
+    let (filtered_obs, filtered_var) = materialize_metadata(
+        reader,
+        &plan,
+        legacy_obs.as_ref(),
+        &obs_shard_ranges,
+        var_batch,
+        &shard_infos[..decode_count],
+        effective_gene_indices.as_deref(),
+        reorder.as_ref(),
+    )?;
+
+    // Same invariant the f32 path asserts: with no limit every candidate shard
+    // is decoded, so the mask-only count and the assembled row count must agree.
+    debug_assert!(
+        plan.limit.is_some() || matched_rows == csr.n_rows(),
+        "unlimited typed query: matched_rows ({matched_rows}) must equal assembled rows ({})",
+        csr.n_rows(),
+    );
+
+    Ok(QueryResult {
+        x: csr,
+        obs: filtered_obs,
+        var: filtered_var,
+        skipped_shards,
+        total_shards,
+        candidate_shard_rows,
+        matched_rows,
+        max_value,
+    })
+}
+
 /// Count matching rows without decoding `X` (CLI2). Ignores `limit` entirely,
 /// so `--count --limit` cannot misreport (CLI6).
 pub fn count(pipeline: &QueryPipeline) -> Result<crate::pipeline::CountResult> {
@@ -424,30 +593,13 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
     let reader = pipeline.reader();
     let sorted_shards = scan_shards(reader.catalog(), pipeline.modality_id());
 
-    // Step 7: Parallel shard decode with optional projection.
-    //
-    // Push `limit` into shard selection. `shard_infos` are ascending by
-    // `row_start` and each carries its keep mask, so the per-shard matched-row
-    // count is known without decoding X. We therefore only decode the first K
-    // shards whose cumulative matches reach the limit. This bounds peak decode +
-    // CSR memory to those K shards even when a low-selectivity predicate matches
-    // rows in every candidate shard — otherwise the entire matched X would be
-    // materialised here before Step 10 truncates it to `limit`.
-    let decode_count = match plan.limit {
-        Some(limit) => {
-            let mut cum = 0usize;
-            let mut k = 0usize;
-            for si in &shard_infos {
-                if cum >= limit {
-                    break;
-                }
-                cum += si.local_keep_mask.iter().filter(|&&keep| keep).count();
-                k += 1;
-            }
-            k
-        }
-        None => shard_infos.len(),
-    };
+    // Step 7: Parallel shard decode with optional projection, over the prefix of
+    // candidate shards `limit` can reach (see `decode_prefix_len`).
+    let decode_count = decode_prefix_len(&shard_infos, plan.limit);
+
+    // Folded before the decode, not after: it comes from catalog stats and
+    // `decode_count` alone, so a caller whose guard trips pays no decode.
+    let max_value = max_value_over_prefix(&sorted_shards, &shard_infos[..decode_count]);
 
     // Each shard produces (indptr, indices, data) filtered to matching rows
     let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> =
@@ -467,17 +619,6 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
 
             Ok((filtered_indptr, filtered_indices, filtered_data))
         })?;
-
-    // Max `value_max` over the shards actually decoded into `csr`. Integer
-    // encodings record the true max; float encodings record 0. A reader
-    // compares this against `scx_codec::F32_MAX_EXACT_INT` to fail loud on the
-    // silent u32→f32 decode loss before returning X.
-    let max_value = shard_infos[..decode_count]
-        .iter()
-        .filter_map(|si| sorted_shards[si.shard_idx].stats.as_ref())
-        .map(|s| s.value_max)
-        .max()
-        .unwrap_or(0);
 
     // Step 8: Assemble CSR from per-shard results
     let mut merged_indptr: Vec<i64> = Vec::new();
@@ -547,8 +688,109 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
     // over it (then truncating below) yields the same first-`limit` rows while
     // avoiding an all-shards alloc on the low-selectivity full-scan path. With
     // no limit `decode_count == shard_infos.len()`, so this is unchanged.
+    // Steps 11–11c: obs rows for the same shard prefix, var rows for the
+    // projection, both restored to the caller's requested gene order.
+    let (filtered_obs, filtered_var) = materialize_metadata(
+        reader,
+        &plan,
+        legacy_obs.as_ref(),
+        &obs_shard_ranges,
+        var_batch,
+        &shard_infos[..decode_count],
+        effective_gene_indices.as_deref(),
+        reorder.as_ref(),
+    )?;
+
+    // The column relabel that goes with that reorder is container-specific, so
+    // it stays out here — `materialize_metadata` moves the var rows, the caller
+    // moves the matching CSR column indices.
+    if let Some(ref reorder) = reorder {
+        for idx in csr.indices.iter_mut() {
+            *idx = reorder.sorted_to_output[*idx as usize] as i32;
+        }
+    }
+
+    // Step 12: Return QueryResult
+    Ok(QueryResult {
+        x: csr,
+        obs: filtered_obs,
+        var: filtered_var,
+        skipped_shards,
+        total_shards,
+        candidate_shard_rows,
+        matched_rows,
+        max_value,
+    })
+}
+
+/// How many of the (ascending, mask-carrying) candidate shards a `limit` can
+/// reach.
+///
+/// `shard_infos` are ascending by `row_start` and each carries its keep mask, so
+/// the per-shard matched-row count is known without decoding X. Decoding only
+/// the first K shards whose cumulative matches reach the limit bounds peak
+/// decode + assembled memory to those K, even when a low-selectivity predicate
+/// matches rows in every candidate shard — otherwise the entire matched X would
+/// be materialised before the limit truncated it.
+///
+/// Shared by both collect paths: a divergence here would silently misalign the
+/// obs half (built over the same prefix) against the assembled matrix.
+fn decode_prefix_len(shard_infos: &[ShardInfo], limit: Option<usize>) -> usize {
+    match limit {
+        Some(limit) => {
+            let mut cum = 0usize;
+            let mut k = 0usize;
+            for si in shard_infos {
+                if cum >= limit {
+                    break;
+                }
+                cum += si.local_keep_mask.iter().filter(|&&keep| keep).count();
+                k += 1;
+            }
+            k
+        }
+        None => shard_infos.len(),
+    }
+}
+
+/// Max `ShardStats::value_max` over the shards that will actually be decoded.
+///
+/// Integer encodings record the true max; float encodings record 0. A reader
+/// compares this against the largest integer its target dtype represents exactly
+/// to fail loud on a silent decode loss before returning X. Deliberately
+/// **narrower than a catalog-wide fold**: a large count in a shard the predicate
+/// skipped, or one past the `limit` cutoff, is never decoded and so must not
+/// refuse the read.
+fn max_value_over_prefix(sorted_shards: &[&FullCatalogEntry], prefix: &[ShardInfo]) -> u32 {
+    prefix
+        .iter()
+        .filter_map(|si| sorted_shards[si.shard_idx].stats.as_ref())
+        .map(|s| s.value_max)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Build the obs and var halves of a query result: the obs rows for the decoded
+/// shard prefix (limit-truncated, categories pruned per the documented
+/// `collect()` contract), and the var rows for the gene projection, restored to
+/// the caller's requested order.
+///
+/// Container-independent, so both collect paths share it. What it deliberately
+/// does **not** do is relabel the matrix's column indices — that half of the
+/// reorder depends on how the values are stored, and lives with each caller.
+#[allow(clippy::too_many_arguments)]
+fn materialize_metadata(
+    reader: &dyn SectionReader,
+    plan: &ExecutionPlan,
+    legacy_obs: Option<&RecordBatch>,
+    obs_shard_ranges: &[(u32, u64, u64)],
+    var_batch: RecordBatch,
+    prefix: &[ShardInfo],
+    effective_gene_indices: Option<&[u32]>,
+    reorder: Option<&ColumnReorder>,
+) -> Result<(RecordBatch, RecordBatch)> {
     let mut matching_global_rows: Vec<u32> = Vec::new();
-    for si in &shard_infos[..decode_count] {
+    for si in prefix {
         for (local_row, &keep) in si.local_keep_mask.iter().enumerate() {
             if keep {
                 matching_global_rows.push((si.row_start as usize + local_row) as u32);
@@ -566,7 +808,7 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
         "matching_global_rows must be ascending to align with the assembled CSR"
     );
 
-    let filtered_obs = if let Some(ref obs_batch) = legacy_obs {
+    let filtered_obs = if let Some(obs_batch) = legacy_obs {
         // Legacy single-section obs: take directly from the full batch.
         let take_indices = UInt32Array::from(matching_global_rows);
         let columns: Vec<_> = obs_batch
@@ -577,7 +819,7 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
         RecordBatch::try_new(obs_batch.schema(), columns)?
     } else {
         // Row-sharded obs: read only the shards that contain matching rows.
-        materialize_filtered_obs(reader, &obs_shard_ranges, &matching_global_rows)?
+        materialize_filtered_obs(reader, obs_shard_ranges, &matching_global_rows)?
     };
     // The documented `collect()` categorical contract, decided here so it does
     // not depend on the obs layout: a result whose rows the caller narrowed —
@@ -595,7 +837,7 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
 
     // Step 11b: Filter var metadata to projected genes (in ascending order;
     // Step 11c restores the requested order).
-    let filtered_var = if let Some(ref gi) = effective_gene_indices {
+    let filtered_var = if let Some(gi) = effective_gene_indices {
         project_var(&var_batch, gi)?
     } else {
         var_batch
@@ -608,10 +850,7 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
     // so the common path is unchanged. Per-row CSR indices may become
     // non-ascending here — correct for terminal output and matches anndata's
     // `adata[:, names]`; scipy tolerates unsorted indices.
-    let filtered_var = if let Some(ref reorder) = reorder {
-        for idx in csr.indices.iter_mut() {
-            *idx = reorder.sorted_to_output[*idx as usize] as i32;
-        }
+    let filtered_var = if let Some(reorder) = reorder {
         let take_idx = UInt32Array::from(reorder.output_to_sorted.clone());
         let columns: Vec<_> = filtered_var
             .columns()
@@ -623,15 +862,5 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
         filtered_var
     };
 
-    // Step 12: Return QueryResult
-    Ok(QueryResult {
-        x: csr,
-        obs: filtered_obs,
-        var: filtered_var,
-        skipped_shards,
-        total_shards,
-        candidate_shard_rows,
-        matched_rows,
-        max_value,
-    })
+    Ok((filtered_obs, filtered_var))
 }

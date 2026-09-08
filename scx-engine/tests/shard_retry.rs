@@ -261,6 +261,18 @@ impl SectionReader for FaultInjectingReader {
         }
         SectionReader::read_shard_from_entry(&self.inner, entry)
     }
+    /// Draws on the **same** failure credit as the f32 twin, so a scenario
+    /// written for one decode shape exercises the retry path of whichever one
+    /// the pipeline actually took.
+    fn read_shard_from_entry_native(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> scx_engine::Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
+        if Self::take_failure(&self.x_fails_remaining) {
+            return Err(self.make_err());
+        }
+        SectionReader::read_shard_from_entry_native(&self.inner, entry)
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -401,6 +413,48 @@ fn query_survives_transient_csr_shard_failure() {
         reference.len(),
         "all matched rows materialized"
     );
+}
+
+/// The **native** shard decode retries too.
+///
+/// `read_shard_from_entry_native` draws on the same failure credit as its f32
+/// twin, but nothing exercised that: the dtype-selected collect is the only
+/// caller, and no test here used it, so the retry path on the new decode was
+/// implemented and unverified.
+#[test]
+fn typed_query_survives_a_transient_native_shard_failure() {
+    let dir = TempDir::new().unwrap();
+    let path = build_sharded_indexed_file(&dir);
+
+    let reference = n_counts(
+        &QueryPipeline::open(&path)
+            .unwrap()
+            .filter_obs("cell_type == 'B'")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .obs,
+    );
+
+    let mplan = scx_sparse::MaterializePlan {
+        container: scx_sparse::Container::Csr,
+        data_dtype: scx_sparse::ValueDtype::F64,
+        index_dtype: scx_sparse::IndexDtype::I32,
+        allow_lossy: false,
+    };
+
+    let inner = ScxReader::open(&path).unwrap();
+    let faulty = FaultInjectingReader::new(inner, 0, 0, Fault::Transient).with_x_fails(1);
+    let result = QueryPipeline::from_reader(Box::new(faulty))
+        .unwrap()
+        .filter_obs("cell_type == 'B'")
+        .unwrap()
+        .collect_typed(&mplan)
+        .expect("a transient native shard decode failure must be recovered");
+
+    assert_eq!(n_counts(&result.obs), reference);
+    assert_eq!(result.x.n_rows(), reference.len());
+    assert_eq!(result.x.values.dtype(), scx_sparse::ValueDtype::F64);
 }
 
 /// Every shard pruned at Level-1 means **no shard is read at all** — asserted

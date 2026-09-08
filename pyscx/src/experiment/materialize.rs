@@ -153,7 +153,11 @@ pub(super) fn to_anndata_impl<'py>(
             // lazily via the retype loop below). Matches the X/raw fail-loud
             // contract; the exact `>2²⁴` layer read awaits the Phase-5 typed
             // layer reader.
-            convert::guard_decode_loss(
+            //
+            // Which of the two shapes this is: **assemble f32, then cast**. `X`
+            // decodes at the requested dtype instead — eagerly, and on the query
+            // path when the dtype is declared at `collect()` — and guards on it.
+            convert::guard_decode_loss_layers(
                 exp.reader()?.catalog().layer_csr_max_value(0, None),
                 plan.allow_lossy,
             )?;

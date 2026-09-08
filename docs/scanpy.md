@@ -1065,8 +1065,10 @@ X = exp.to_anndata(container="dense", data_dtype="float32").X   # numpy.ndarray
 ```
 
 The **default** (`container="csr"`, no dtype kwargs) is unchanged and stays
-zero-copy — the `i64/i32/f32` Vecs are moved into numpy with no cast. Any
-non-default request is a read-then-convert (an extra cast/copy of `X`).
+zero-copy — the `i64/i32/f32` Vecs are moved into numpy with no cast. A
+non-default request on `X` / `raw` narrows **in-decode** (assembled directly at
+the target width, no f32 intermediate), so it lowers peak RSS rather than costing
+an extra copy; eager `layers` are the remaining read-then-convert.
 
 Narrowing is **fail-loud** by default: a value that cannot be represented in the
 requested dtype (out of range, fractional into an integer, negative into an
@@ -1075,7 +1077,12 @@ the offending value. Pass `allow_lossy=True` to narrow anyway. This also fixes a
 prior silent `u32 → f32` rounding above 2²⁴ (e.g. pseudobulk / aggregated
 counts). See [`docs/api.md` § Container and dtype materialization](api.md#container-and-dtype-materialization)
 for the full reference. (Note: these kwargs apply to the eager and query paths;
-`to_gpu_anndata` is f32-native and rejects them — narrow on the host first.)
+`to_gpu_anndata` is f32-native and rejects them — narrow on the host first.) On a
+query the dtype belongs on `collect()`, which is where the decode happens:
+`exp.query().filter_obs(...).collect(data_dtype="float64")` reads a `> 2²⁴` count
+exactly, while naming the dtype on the `to_anndata()` / `to_csr()` that follows
+only casts values already decoded as f32 and fails loud — see
+[`docs/api.md` § Declaring the dtype at `collect()`](api.md#declaring-the-dtype-at-collect).
 
 ### Selective loading
 

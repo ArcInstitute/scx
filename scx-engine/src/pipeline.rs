@@ -8,7 +8,7 @@ use std::path::Path;
 
 use arrow::datatypes::Schema;
 use scx_format_io::ScxReader;
-use scx_sparse::ScxCsr;
+use scx_sparse::{MaterializePlan, ScxCsr};
 
 use scx_format_io::DeletionVectors;
 
@@ -22,10 +22,18 @@ pub struct NormalizeConfig {
     pub target_sum: f64,
 }
 
+/// A [`QueryResult`] whose `X` was decoded at a caller-chosen dtype rather than
+/// `f32` — what [`QueryPipeline::collect_typed`] returns.
+pub type TypedQueryResult = QueryResult<scx_sparse::TypedCsr>;
+
 /// Result of a query pipeline execution.
-pub struct QueryResult {
+///
+/// Generic in the matrix so the dtype-selected collect reuses every metadata
+/// field, with [`ScxCsr`] defaulted so existing callers keep spelling it
+/// `QueryResult`.
+pub struct QueryResult<X = ScxCsr> {
     /// The expression matrix (filtered + projected).
-    pub x: ScxCsr,
+    pub x: X,
     /// Observation metadata for matching cells.
     pub obs: arrow::array::RecordBatch,
     /// Variable/gene metadata for projected genes.
@@ -68,7 +76,21 @@ pub struct CountResult {
     pub candidate_shard_rows: usize,
 }
 
-impl std::fmt::Debug for QueryResult {
+impl std::fmt::Debug for QueryResult<ScxCsr> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResult")
+            .field("x_shape", &self.x.shape)
+            .field("obs_rows", &self.obs.num_rows())
+            .field("var_rows", &self.var.num_rows())
+            .field("skipped_shards", &self.skipped_shards)
+            .field("total_shards", &self.total_shards)
+            .field("candidate_shard_rows", &self.candidate_shard_rows)
+            .field("matched_rows", &self.matched_rows)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for QueryResult<scx_sparse::TypedCsr> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryResult")
             .field("x_shape", &self.x.shape)
@@ -382,6 +404,46 @@ impl QueryPipeline {
     /// pipeline: pushdown → decode → projection → filter → fused ops.
     pub fn collect(self) -> Result<QueryResult> {
         self.collect_ref()
+    }
+
+    /// Execute the pipeline, decoding `X` **at `mplan`'s dtype** instead of
+    /// `f32`.
+    ///
+    /// The reason this exists rather than being a kwarg on the materialization
+    /// step: [`collect_ref`](Self::collect_ref) *is* the decode, so a dtype
+    /// named after it can only cast values that already rounded. A count above
+    /// 2²⁴ is exact through this door and unreachable through the other.
+    ///
+    /// Borrows, like `collect_ref`, so a refused cast leaves the pipeline usable.
+    /// Ask [`typed_collect_supported`](Self::typed_collect_supported) first — a
+    /// fused transform is refused here rather than silently served from the f32
+    /// route, because *which guard ran* is the thing a caller is relying on.
+    ///
+    /// Consumes `mplan`'s `data_dtype`, `index_dtype` and `allow_lossy`, and
+    /// **ignores its `container`**: this always assembles a CSR, and a dense
+    /// request is a scatter the caller applies afterwards (see
+    /// `scx_format_io::scatter_typed_csr_to_dense`).
+    pub fn collect_typed(&self, mplan: &MaterializePlan) -> Result<TypedQueryResult> {
+        crate::collect::execute_typed(self, mplan)
+    }
+
+    /// Whether [`collect_typed`](Self::collect_typed) can serve `mplan`.
+    ///
+    /// `false` for a pipeline carrying `with_normalize` / `with_log1p`: the
+    /// transform replaces the stored counts with floats, so no dtype makes the
+    /// read exact, and that belongs on the `f32` route, which guards on `f32` —
+    /// correctly, because that is what it produced.
+    ///
+    /// Takes no plan: nothing in a [`MaterializePlan`] can make the typed decode
+    /// unavailable. **`container` in particular is not consulted** — a dense
+    /// request is a
+    /// presentation step applied *after* the decode, so gating the decode on it
+    /// is what made `to_anndata(obs_filter=…, container="dense",
+    /// data_dtype="float64")` fall back to f32 and refuse the very read this
+    /// exists to serve. [`collect_typed`](Self::collect_typed) always assembles a
+    /// CSR; the caller scatters.
+    pub fn typed_collect_supported(&self) -> bool {
+        self.normalize.is_none() && !self.log1p
     }
 
     /// Count matching rows without decoding the X matrix (CLI2).

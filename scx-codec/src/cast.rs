@@ -43,9 +43,9 @@ pub fn guard_f32_decode_loss(max_value: u32, allow_lossy: bool) -> Result<(), Co
     }
     Err(CodecError::MalformedInput(format!(
         "integer value {max_value} exceeds 2²⁴ ({F32_MAX_EXACT_INT}), the largest integer \
-         representable exactly in float32; scx decodes counts to f32 before materialization, \
-         so this read would silently round large counts. Pass `allow_lossy=True` to accept \
-         the f32 rounding (lossless typed decode is not yet available)."
+         representable exactly in float32; this read decodes counts to f32 before \
+         materialization, so it would silently round large counts. Pass `allow_lossy=True` \
+         to accept the f32 rounding."
     )))
 }
 

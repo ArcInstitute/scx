@@ -7,7 +7,10 @@ file adds coverage specific to the Phase-3 rewiring, where X and raw now narrow
 
 - raw (`adata.raw.X`) now respects `data_dtype` (previously left f32);
 - the integer-narrow path works end-to-end for values above the uint16 range;
-- the query (`obs_filter`) branch still narrows correctly (Option A cast).
+- the query (`obs_filter`) branch narrows correctly. It used to do so by casting
+  the assembled f32 matrix; it now decodes at the requested dtype, because that
+  route knows the plan before it collects. See `test_query_typed_collect.py` for
+  the `>2**24` half, which only the typed decode can serve.
 """
 
 import anndata
@@ -111,7 +114,7 @@ def test_integer_narrow_above_u16(tmp_dir):
 
 
 # --------------------------------------------------------------------------
-# query (obs_filter) branch still narrows (Option A post-assembly cast)
+# query (obs_filter) branch still narrows — now by decoding at the dtype
 # --------------------------------------------------------------------------
 
 

@@ -203,6 +203,23 @@ impl SectionReader for CloudSectionReader {
         )?)
     }
 
+    fn read_shard_from_entry_native(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> scx_engine::Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
+        let bytes = self
+            .rt
+            .block_on(self.inner.read_section_for_entry(entry))
+            .map_err(cloud_to_engine)?;
+        let catalog_version = self.inner.catalog().catalog_version;
+        Ok(scx_format_io::decode_shard_bytes_native(
+            &bytes,
+            entry,
+            catalog_version,
+            false,
+        )?)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -3858,7 +3858,7 @@ Features with no meaningful two-sided benchmark, reported as capability presence
 | Multimodal (CITE-seq / Multiome) | ✅ | ❌ |
 | R bindings (Seurat / SCE) | ✅ | ❌ (Python only) |
 | In-place mutation (append/delete/compact/merge) | ✅ | metadata-tail only (`update_obs`) |
-| In-decode dtype/density materialization | ✅ true in-decode narrow on the eager path (`data_dtype=`/`container=`/`index_dtype=`): `X`/`raw` assemble directly at target dtype, no f32 intermediate → lowers peak RSS (matches/beats shardad on 3/5 datasets); `>2²⁴` integer reads exact. (query path + layers still post-assembly) | ✅ (true in-decode narrow, direct to target dtype; also narrows indices) |
+| In-decode dtype/density materialization | ✅ true in-decode narrow on the eager path (`data_dtype=`/`container=`/`index_dtype=`): `X`/`raw` assemble directly at target dtype, no f32 intermediate → lowers peak RSS (matches/beats shardad on 3/5 datasets); `>2²⁴` integer reads exact. (layers still post-assembly) | ✅ (true in-decode narrow, direct to target dtype; also narrows indices) |
 | Physical group-aligned (condition) sharding | approximated (sort + query pruning) | ✅ (native) |
 
 ### Takeaways
