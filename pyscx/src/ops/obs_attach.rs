@@ -43,6 +43,52 @@ pub fn parse_obs_extra_rows(s: &str) -> PyResult<scx_ops::ExtraRowPolicy> {
     }
 }
 
+/// Normalise a `uns=` / `uns_key=` pair into the top-level entries the attach
+/// ops merge.
+///
+/// Shared by the obs and var attaches because the rule is about `uns`, not
+/// about an axis. The dict check is made on the **Python object, before
+/// normalisation**: under the tagged format a tuple / ndarray / Series
+/// normalises to a JSON *object* (an `__scx_type__` envelope), so a post-hoc
+/// "is it an object" test would spray envelope fields across the top level of
+/// uns.
+pub(crate) fn parse_uns_payload(
+    py: Python<'_>,
+    uns: Option<&Bound<'_, PyAny>>,
+    uns_key: Option<&str>,
+) -> PyResult<serde_json::Map<String, serde_json::Value>> {
+    match (uns, uns_key) {
+        (None, None) => Ok(serde_json::Map::new()),
+        (None, Some(_)) => Err(PyValueError::new_err(
+            "uns_key= names where uns= lands, so it needs a uns= payload",
+        )),
+        (Some(u), Some(k)) => {
+            let mut m = serde_json::Map::new();
+            m.insert(
+                k.to_string(),
+                convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)?,
+            );
+            Ok(m)
+        }
+        (Some(u), None) => {
+            if u.cast::<PyDict>().is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "uns= without uns_key= is merged into uns at top level, so it must be \
+                     a dict whose keys become uns keys; got {}. Pass uns_key= to nest a \
+                     non-dict payload under one key.",
+                    u.get_type().name()?
+                )));
+            }
+            match convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)? {
+                serde_json::Value::Object(m) => Ok(m),
+                other => Err(PyValueError::new_err(format!(
+                    "uns= dict did not normalise to a JSON object (got {other})"
+                ))),
+            }
+        }
+    }
+}
+
 /// Turn the caller's `key` / `source_key` into the reader's column list and the
 /// op's join-key spec.
 ///
@@ -58,15 +104,26 @@ pub fn parse_obs_extra_rows(s: &str) -> PyResult<scx_ops::ExtraRowPolicy> {
 pub(crate) fn resolve_join_key(
     key: Option<Vec<String>>,
     source_key: Option<Vec<String>>,
-) -> PyResult<(Vec<String>, scx_ops::ObsJoinKey)> {
+) -> PyResult<(Vec<String>, scx_ops::AxisJoinKey)> {
+    resolve_join_key_for("obs", key, source_key)
+}
+
+/// [`resolve_join_key`] on a named axis, so the remedy in the error names the
+/// caller's own index alias (`obs_names` / `var_names`) rather than always obs.
+pub(crate) fn resolve_join_key_for(
+    axis: &str,
+    key: Option<Vec<String>>,
+    source_key: Option<Vec<String>>,
+) -> PyResult<(Vec<String>, scx_ops::AxisJoinKey)> {
+    let alias = scx_ops::axis_index_alias(axis);
     let target = key.unwrap_or_default();
     let source = source_key.unwrap_or_default();
     if !source.is_empty() && target.is_empty() {
-        return Err(PyValueError::new_err(
+        return Err(PyValueError::new_err(format!(
             "source_key= needs key=: it names the source-side column for each \
-             target-side key component, positionally. To key on the target's obs \
-             index, pass key=\"obs_names\".",
-        ));
+             target-side key component, positionally. To key on the target's {axis} \
+             index, pass key=\"{alias}\"."
+        )));
     }
     if !source.is_empty() && source.len() != target.len() {
         return Err(PyValueError::new_err(format!(
@@ -276,44 +333,7 @@ pub fn attach_obs_columns(
              row i of df annotates obs row i, so there is no key to join on",
         ));
     }
-    // Decided on the Python object, BEFORE normalisation: under the tagged
-    // format a tuple / ndarray / Series normalises to a JSON *object* (an
-    // `__scx_type__` envelope), so a post-hoc "is it an object" check would
-    // spray envelope fields across the top level of uns.
-    let uns_entries: serde_json::Map<String, serde_json::Value> = match (uns, uns_key) {
-        (None, None) => serde_json::Map::new(),
-        (None, Some(_)) => {
-            return Err(PyValueError::new_err(
-                "uns_key= names where uns= lands, so it needs a uns= payload",
-            ));
-        }
-        (Some(u), Some(k)) => {
-            let mut m = serde_json::Map::new();
-            m.insert(
-                k.to_string(),
-                convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)?,
-            );
-            m
-        }
-        (Some(u), None) => {
-            if u.cast::<PyDict>().is_err() {
-                return Err(PyValueError::new_err(format!(
-                    "uns= without uns_key= is merged into uns at top level, so it must be \
-                     a dict whose keys become uns keys; got {}. Pass uns_key= to nest a \
-                     non-dict payload under one key.",
-                    u.get_type().name()?
-                )));
-            }
-            match convert::uns_py_to_json(py, u, convert::UnsFormat::Tagged)? {
-                serde_json::Value::Object(m) => m,
-                other => {
-                    return Err(PyValueError::new_err(format!(
-                        "uns= dict did not normalise to a JSON object (got {other})"
-                    )))
-                }
-            }
-        }
-    };
+    let uns_entries = parse_uns_payload(py, uns, uns_key)?;
 
     let batch = obs_var_to_record_batch(py, df, "attach_obs_columns", "df")?;
     // A keyed attach of zero rows can match nothing. A positional one may be

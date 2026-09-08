@@ -30,12 +30,14 @@ pub(crate) mod metadata;
 pub(crate) mod obs_attach;
 pub(crate) mod rewrite;
 pub(crate) mod tools;
+pub(crate) mod var_attach;
 
 pub(crate) use append_delete::*;
 pub(crate) use metadata::*;
 pub(crate) use obs_attach::*;
 pub(crate) use rewrite::*;
 pub(crate) use tools::*;
+pub(crate) use var_attach::*;
 
 // ---------------------------------------------------------------------------
 // Predicate-index kwarg helpers

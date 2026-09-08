@@ -407,6 +407,9 @@ pub(crate) fn project_annotations(
     opts: &AnnotationTableOptions,
 ) -> Result<RecordBatch> {
     let schema = table.schema();
+    // Hoisted: this walks the schema (and parses the `pandas` envelope), so it
+    // must not run once per candidate column.
+    let index_fields = scx_format_io::resolve_index_columns(&schema);
 
     // Which source columns to take, in table order so the output is stable.
     let selected: Vec<String> = match &opts.columns {
@@ -433,6 +436,18 @@ pub(crate) fn project_annotations(
             .iter()
             .map(|f| f.name().clone())
             .filter(|n| opts.keep_key_columns || !key_columns.contains(n))
+            // A source frame's index field is not data to attach unless it is
+            // the key. When it IS the key the line above decides — excluded, or
+            // imported when `keep_key_columns` asks for it. When it is *not* —
+            // an h5ad keyed on `gene_id` whose index holds symbols — importing
+            // it lands a column literally called `__index_level_0__`, which
+            // collides with the target's own index field and fails the
+            // collision check with a message about a column the user never
+            // mentioned. The DataFrame path in pyscx has always dropped the
+            // index for this reason; the readers now follow the same rule. An
+            // explicit `columns=[…]` still wins, so naming it remains the way
+            // to import an index as an ordinary column.
+            .filter(|n| key_columns.contains(n) || !index_fields.contains(n))
             .collect(),
     };
 

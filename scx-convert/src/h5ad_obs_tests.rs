@@ -269,6 +269,63 @@ fn keep_key_columns_imports_the_index_too() {
     assert!(names(&data).contains(&"__index_level_0__".to_string()));
 }
 
+/// The index is data only when it is the key.
+///
+/// Keying on a named column left the frame's own index field in the import set,
+/// so the attach tried to write a column literally called
+/// `__index_level_0__` — which collides with the target's own index field and
+/// fails with a message about a column the caller never mentioned. Reachable
+/// on obs (an h5ad keyed on a sample column) and unavoidable on var, where the
+/// index is symbols and the key is usually `gene_id`.
+#[test]
+fn a_non_key_index_field_is_not_imported_as_a_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("named_key.h5ad");
+    let file = hdf5::File::create(&path).unwrap();
+    let obs = file.create_group("obs").unwrap();
+    attr(&obs, "encoding-type", "dataframe");
+    attr(&obs, "encoding-version", "0.2.0");
+    attr(&obs, "_index", "_index");
+    let order: Vec<VarLenUnicode> = ["alt_id", "score"].iter().map(|s| vlu(s)).collect();
+    obs.new_attr::<VarLenUnicode>()
+        .shape([order.len()])
+        .create("column-order")
+        .unwrap()
+        .write(&order)
+        .unwrap();
+    str_ds(&obs, "_index", &["A", "B"]);
+    str_ds(&obs, "alt_id", &["x", "y"]);
+    obs.new_dataset::<f64>()
+        .shape([2])
+        .create("score")
+        .unwrap()
+        .write(&[1.0f64, 2.0])
+        .unwrap();
+    file.close().unwrap();
+
+    let o = AnnotationTableOptions {
+        key_columns: vec!["alt_id".to_string()],
+        ..opts()
+    };
+    let (data, info) = read_h5ad_obs(&path, &o, &[]).unwrap();
+    assert_eq!(info.key_columns, vec!["alt_id".to_string()]);
+    assert_eq!(
+        names(&data),
+        vec!["score".to_string()],
+        "the index must not be imported as `__index_level_0__` alongside the data"
+    );
+
+    // An explicit request still wins: naming it is how you import an index as
+    // an ordinary column.
+    let o = AnnotationTableOptions {
+        key_columns: vec!["alt_id".to_string()],
+        columns: Some(vec!["__index_level_0__".to_string(), "score".to_string()]),
+        ..opts()
+    };
+    let (data, _) = read_h5ad_obs(&path, &o, &[]).unwrap();
+    assert!(names(&data).contains(&"__index_level_0__".to_string()));
+}
+
 #[test]
 fn a_composite_key_fuses_from_obs_columns() {
     let dir = tempfile::tempdir().unwrap();

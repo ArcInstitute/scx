@@ -207,6 +207,44 @@ def test_attach_obs_columns_under_restricted_exec(sandbox_env, synthetic_adata):
     assert "attached_flag" in pyscx.open(path).read_obs().columns
 
 
+def test_attach_var_columns_under_restricted_exec(sandbox_env, synthetic_adata):
+    """The var-axis attach seam. Same pure-Python wrapper shape as its obs
+    twin, so it must be sandbox-safe for the same reason: the pipeline steps
+    that land per-gene annotations run under restricted `exec`."""
+    import pandas as pd
+
+    path = sandbox_env["outputs"]["result"]
+    pyscx.write(synthetic_adata, path)
+    df = pd.DataFrame(
+        {"attached_gene_flag": np.arange(synthetic_adata.n_vars, dtype=np.int32)}
+    )
+    run_sandboxed(
+        "pyscx.attach_var_columns(path, df, positional=True)",
+        pyscx=pyscx,
+        path=path,
+        df=df,
+    )
+    assert "attached_gene_flag" in pyscx.open(path).read_var().columns
+
+
+def test_var_import_under_restricted_exec(sandbox_env, synthetic_adata, tmp_path):
+    """The delimited var import, from inside the sandbox."""
+    path = sandbox_env["outputs"]["result"]
+    pyscx.write(synthetic_adata, path)
+    var_names = list(pyscx.open(path).read_var().index)
+    table = tmp_path / "genes.csv"
+    lines = ["var_names,gene_flag"]
+    lines += [f"{g},{i}" for i, g in enumerate(var_names)]
+    table.write_text("\n".join(lines) + "\n")
+    run_sandboxed(
+        "pyscx.var_import(path, table, key='var_names')",
+        pyscx=pyscx,
+        path=path,
+        table=str(table),
+    )
+    assert "gene_flag" in pyscx.open(path).read_var().columns
+
+
 def test_backed_and_lazy_fancy_indexing_under_restricted_exec(
     sandbox_env, synthetic_adata
 ):

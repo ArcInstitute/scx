@@ -109,6 +109,9 @@ from .pyscx import from_anndata as _from_anndata_native  # noqa: E402
 from .pyscx import obs_import as _obs_import_native  # noqa: E402
 from .pyscx import attach_obs_columns as _attach_obs_columns_native  # noqa: E402
 from .pyscx import diagnose_obs_key as _diagnose_obs_key_native  # noqa: E402
+from .pyscx import var_import as _var_import_native  # noqa: E402
+from .pyscx import attach_var_columns as _attach_var_columns_native  # noqa: E402
+from .pyscx import diagnose_var_key as _diagnose_var_key_native  # noqa: E402
 from .pyscx import doublet_import as _doublet_import_native  # noqa: E402
 from .pyscx import modify_metadata as _modify_metadata_native  # noqa: E402
 from .pyscx import set_uns as _set_uns_native      # noqa: E402
@@ -1281,6 +1284,196 @@ def diagnose_obs_key(path, key=None):
         printable `summary`.
     """
     return _diagnose_obs_key_native(_coerce_path(path), _coerce_key(key))
+
+
+def var_import(path, table, *, key=None, source_key=None, **kwargs):
+    """Import a delimited annotation table (CSV/TSV) as `var` columns, in place.
+
+    The var-axis twin of `obs_import`: land per-**gene** annotations computed
+    outside SCX — a normalised gene symbol from a reference release, an ATAC
+    peak annotation, a curated gene set flag — onto an existing file without
+    rewriting it. The alternative is `modify_metadata(var=<whole frame>)`,
+    which means reading var, joining in pandas, and handing back every column.
+
+    Joins **by key string, never by row position**: an annotation table has its
+    own row order, and a positional import would put every value on the wrong
+    gene while still producing a correctly-shaped column. Genes the table does
+    not cover get `null`, never a fabricated `0`.
+
+    In place via the same harness `append` uses: `X`, layers, `obs`, the CSC
+    sidecar, `.raw`, deletion vectors and the *obs* predicate index are
+    preserved, and `pyscx.rollback(path)` undoes the whole import. A sharded
+    var keeps its shard boundaries; a single-section var stays one section.
+
+    A multimodal file is refused — each modality owns its own var table, so
+    "the var axis" is ambiguous. Extract one modality with
+    `scx subset --modality NAME`, import, then `scx merge` back.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        table: Source .csv / .tsv / .txt, or an .h5ad whose `/var` holds the
+            columns (str or os.PathLike). The h5ad route needs a build with
+            HDF5 support; without it the error says to write a CSV instead.
+        key: Target-side join key. None auto-resolves with the same preference
+            order the target side uses (the var index, then
+            `gene_id`/`gene_ids`/`feature_id`/`gene_name`/…). A str names one
+            column; `"var_names"` names the var index. A list of str builds a
+            composite key — the right answer when gene symbols repeat and only
+            (symbol, id) is unique. The fusing separator is internal and not
+            configurable.
+        source_key: Source-side column(s) for the same key, when the table
+            spells it differently. Pairs **positionally** with `key`, mirroring
+            pandas `left_on` / `right_on`, so the two must have equal length::
+
+                var_import(t, "peaks.csv", key=["var_names"],
+                           source_key=["peak_id"])
+
+            None means the source uses the `key` names.
+        columns: Import only these source columns. None imports every non-key
+            column.
+        rename: `{source_name: new_name}`, applied before `prefix`.
+        prefix: Prepended to every imported column name.
+        keep_key_columns: Also import the key column(s) as ordinary
+            annotations. Off by default — the key is usually already in var.
+        delimiter: One-character override. None sniffs from the extension
+            (`.csv` / `.tsv` / `.tab`), then from the header line.
+        status_column: Var column recording "present"/"absent" per gene.
+        uns_key: Nest the `uns_keys` carried from the source under this one
+            `uns` key. Omitted, they land at top level under their own names.
+        uns_keys: `/uns` keys to carry across from an h5ad source. Opt-in, and
+            meaningless for a delimited table — requesting one there is an
+            error rather than a silent no-op.
+        overwrite: **Replaces, never merges.** A colliding column is dropped
+            and rebuilt from this table alone, so importing several partial
+            tables one after another keeps only the last. Concatenate them and
+            import once. Without this, a collision is an error.
+        on_missing_rows: "null" (default) leaves uncovered target rows NULL;
+            "error" refuses. "zero" is an accepted legacy alias for "null" —
+            the shared policy's zero is literal only where the missing thing
+            is a matrix row (cellbender_import), which really is zeros.
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses.
+        dry_run: Run the join and every validation, then return the summary
+            without writing. Also attaches a `key_diagnosis` to the result.
+
+    Returns:
+        dict with `n_vars`, `n_matched`, `n_target_rows_absent`,
+        `n_source_rows_absent`, `var_key_column`, `var_columns_added`,
+        `var_index_rebuilt`, `var_columns_not_carried`, `var_streamed`, the
+        source's `format` / `delimiter` (None for h5ad) / `n_rows_in_source` /
+        `uns_keys_imported`, and (on a dry run) `key_diagnosis`.
+
+    Example:
+        r = pyscx.var_import("atlas.scx", "symbols.csv", dry_run=True)
+        print(r["n_matched"], "of", r["n_vars"], "genes matched")
+        pyscx.var_import("atlas.scx", "symbols.csv", key="var_names")
+    """
+    key = _coerce_key(key)
+    source_key = _coerce_key(source_key)
+    result = _var_import_native(_coerce_path(path), _coerce_path(table, allow_experiment=False),
+                                key=key, source_key=source_key, **kwargs)
+    _reload_if_experiment(path)
+    return result
+
+
+def attach_var_columns(path, df, *, key=None, **kwargs):
+    """Land an in-memory DataFrame as `var` columns on an existing file, in place.
+
+    The DataFrame twin of `var_import`, on the same seam: land a pandas
+    `DataFrame` (or pyarrow `Table`) of per-gene annotations without writing a
+    temp CSV or replacing the whole frame through `modify_metadata`.
+
+    Key-joined by default. `key=None` resolves each side independently, exactly
+    as `var_import` with no `key=`: the source uses `df`'s index (named or not)
+    then the gene-id fallbacks, the target its own var index then its own
+    fallbacks. A str names one column, matched to the **same name** on the
+    target; a list builds a composite. Key columns and the pandas index are
+    consumed by the join, not re-imported.
+
+    `positional=True` (mutually exclusive with `key`) skips the join: row `i`
+    annotates var row `i`. It requires exactly `n_vars` rows — var has no
+    deletion vector and so no second row space, and any other length is
+    refused rather than reinterpreted. Because dispatch is by position, a frame
+    **sorted or reindexed** after `read_var()` would land every value on the
+    wrong gene, so a frame carrying a labelled pandas index (every `read_var()`
+    frame does) is checked: labels that are the file's own gene names in a
+    different order raise, naming the first misplaced row. Labels that are not
+    the file's gene names are ignored, and a `RangeIndex` frame is not checked.
+
+    Categoricals survive: a pandas `category` column keeps its dtype, declared
+    category order, unused levels and `ordered` bit, exactly as `from_anndata`
+    writes them.
+
+    Args:
+        path: Target SCX file (str, os.PathLike, or an open Experiment).
+        df: pandas DataFrame or pyarrow Table of per-gene annotations.
+        key: Join key, in any form `var_import(key=...)` accepts — None to
+            auto-resolve, a str (or `"var_names"`) for one column, a list for a
+            composite. Mutually exclusive with `positional`.
+        positional: Skip the join and land row `i` on var row `i`. For frames
+            computed in-process from this file's own `read_var()`, never for
+            external tool output.
+        status_column: Var column recording "present"/"absent" per gene.
+            Rejected under `positional`, where every gene matches by
+            construction and the marker would be a constant.
+        uns: `uns` entries landing in the **same commit** as the columns, so one
+            `pyscx.rollback` undoes both. Alone it must be a dict, whose
+            top-level keys are merged into `uns`; with `uns_key` the whole
+            payload nests under that one key instead. Untouched `uns` keys are
+            left as they were.
+        uns_key: Nest the `uns` payload under this one key. An error without
+            `uns`.
+        overwrite: **Replaces, never merges** — see `var_import`. Also required
+            to replace a colliding `uns` key.
+        on_missing_rows: "null" (default) leaves uncovered target rows NULL;
+            "error" refuses. "zero" is an accepted legacy alias for "null" —
+            the shared policy's zero is literal only where the missing thing
+            is a matrix row (cellbender_import), which really is zeros.
+        on_extra_rows: "warn" (default) skips source rows the target lacks;
+            "error" refuses.
+        dry_run: Validate and report without writing; adds `key_diagnosis`
+            under a key join.
+
+    Returns:
+        dict, as `var_import` minus the source-file fields.
+
+    Example:
+        v = exp.read_var()
+        v["is_hvg"] = v["gene_id"].isin(hvg_ids)
+        pyscx.attach_var_columns("atlas.scx", v[["is_hvg"]], key="var_names")
+    """
+    key = _coerce_key(key)
+    result = _attach_var_columns_native(_coerce_path(path), df, key=key, **kwargs)
+    _reload_if_experiment(path)
+    return result
+
+
+def diagnose_var_key(path, key=None):
+    """Report which var columns could serve as a `var_import` join key.
+
+    Read-only. The var-axis twin of `diagnose_obs_key`, and worth reaching for
+    on a concatenated or merged file, where `var_names` is not always unique
+    and the column that is may not be one a fallback list would guess.
+
+    Every name reported -- `resolved_key`, `unique_columns`, `suggestion` -- is
+    one `var_import(key=...)` accepts, including `"var_names"` for the var
+    index. `unique_columns` is ordered best-candidate-first and holds only
+    columns that can actually serve as a key; a unique column the join would
+    refuse (a float, whose text form is not guaranteed to agree across two
+    independently written sides) is listed separately under
+    `unusable_unique_columns`.
+
+    Args:
+        path: SCX file to inspect (str, os.PathLike, or an open Experiment).
+        key: Optional key to diagnose specifically, in any form
+            `var_import(key=...)` accepts. None diagnoses the auto-resolved key.
+
+    Returns:
+        dict with `n_vars`, `resolved_key`, `resolved_cardinality`,
+        `unique_columns`, `unusable_unique_columns`, `unique_pairs`,
+        `suggestion` and a printable `summary`.
+    """
+    return _diagnose_var_key_native(_coerce_path(path), _coerce_key(key))
 
 
 def doublet_import(path, table, *, tool, key=None, source_key=None, **kwargs):
