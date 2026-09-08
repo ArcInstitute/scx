@@ -155,3 +155,81 @@ pub fn gpu_pseudobulk_means_dense(
     divide_by_counts(&mut host, n_groups, n_cols, counts);
     Ok(host)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scx_sparse::ScxCsr;
+
+    /// A source whose `visible_shard_indices` plan disagrees with the rows it
+    /// hands over — the failure `VisibleRowCursor` exists to catch here.
+    struct LyingPlanSource {
+        shards: Vec<ScxCsr>,
+        n_obs: usize,
+        plan: Vec<usize>,
+    }
+
+    impl ShardSource for LyingPlanSource {
+        fn n_shards(&self) -> usize {
+            self.shards.len()
+        }
+        fn n_obs(&self) -> usize {
+            self.n_obs
+        }
+        fn n_vars(&self) -> usize {
+            2
+        }
+        fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+            Some(self.plan.clone())
+        }
+        fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<ScxCsr> {
+            Ok(self.shards[shard_idx].clone())
+        }
+    }
+
+    fn two_row_shard() -> ScxCsr {
+        ScxCsr::new_unchecked((2, 2), vec![0, 1, 2], vec![0, 1], vec![1.0, 2.0])
+    }
+
+    /// Locks the cursor wiring in [`gpu_pseudobulk_means_csr`].
+    ///
+    /// Without it, reverting this pass to a bare `global_row += n_rows` loop
+    /// leaves every suite green — which is exactly how the pass was missed when
+    /// the three DE passes were guarded. Device-gated because the function needs
+    /// a `GpuDevice`; the cursor's own arithmetic is covered on a CPU host by
+    /// `scx_format_io::row_cursor`.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn a_plan_that_disagrees_with_the_rows_is_rejected_before_the_kernel() {
+        let dev = require_gpu!();
+        // Claims six rows, plans two shards of two.
+        let src = LyingPlanSource {
+            shards: vec![two_row_shard(), two_row_shard(), two_row_shard()],
+            n_obs: 6,
+            plan: vec![0, 1],
+        };
+        let cell_to_group = vec![0i32; 6];
+        let err = gpu_pseudobulk_means_csr(&dev, &src, &cell_to_group, 1, 2, &[6])
+            .expect_err("an under-covering plan must not return means");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cover 4 rows") && msg.contains("n_obs = 6"),
+            "{msg}"
+        );
+
+        // Over-coverage is the one that would read out of bounds on device.
+        let over = LyingPlanSource {
+            shards: vec![two_row_shard(), two_row_shard(), two_row_shard()],
+            n_obs: 2,
+            plan: vec![0, 1, 2],
+        };
+        let cell_to_group = vec![0i32; 2];
+        let err = gpu_pseudobulk_means_csr(&dev, &over, &cell_to_group, 1, 2, &[2])
+            .expect_err("an over-covering plan must not reach the kernel");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shard 1") && msg.contains("exceeding n_obs = 2"),
+            "{msg}"
+        );
+    }
+}

@@ -8,8 +8,10 @@
 //! agree with the rows actually handed over.
 //!
 //! This lives here, below both `scx-accel` and `scx-gpu`, because the check was
-//! written once per pass and a review found the fourth pass unguarded. One
-//! definition, four callers, and a fifth cannot be added without it.
+//! written once per pass and a review found the fourth pass unguarded. Four
+//! construction sites today — `scx-accel`'s CPU gene-chunk fill, its `pts`
+//! counting pass, its `GpuRowCursor` (which the three GPU DE CSR passes share),
+//! and `scx-gpu`'s pseudobulk pass — covering six shard walks between them.
 
 /// A cursor over the visible rows a shard walk delivers, carrying the two
 /// checks that make a source's shard plan falsifiable.
@@ -42,7 +44,11 @@ impl VisibleRowCursor {
         shard_idx: usize,
         context: &str,
     ) -> Result<usize, String> {
-        if self.pos + n_rows > self.n_obs {
+        // `n_obs - pos`, not `pos + n_rows`: the cursor invariant keeps
+        // `pos <= n_obs`, so the subtraction is safe, while the addition could
+        // itself overflow on a large `n_rows` — panicking in debug and wrapping
+        // in release, inside the check whose job is to prevent exactly that.
+        if n_rows > self.n_obs - self.pos {
             return Err(format!(
                 "{context}: shard {shard_idx} has {n_rows} rows, exceeding n_obs = {} at row {}",
                 self.n_obs, self.pos
@@ -97,6 +103,20 @@ mod tests {
             err.contains("shard 1") && err.contains("exceeding n_obs = 8"),
             "{err}"
         );
+    }
+
+    /// The check must not be the thing that overflows. `pos + n_rows` panics in
+    /// debug and wraps in release at this input; `n_obs - pos` cannot, because
+    /// the cursor never lets `pos` pass `n_obs`.
+    #[test]
+    fn an_absurd_row_count_errors_rather_than_overflowing_the_check() {
+        let mut c = VisibleRowCursor::new(8);
+        assert_eq!(c.advance(4, 0, "op").unwrap(), 0);
+        let err = c.advance(usize::MAX, 1, "op").unwrap_err();
+        assert!(err.contains("exceeding n_obs = 8"), "{err}");
+        // And the cursor is unchanged by the rejected claim.
+        assert_eq!(c.advance(4, 2, "op").unwrap(), 4);
+        c.finish("op").unwrap();
     }
 
     #[test]

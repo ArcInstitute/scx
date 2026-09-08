@@ -455,7 +455,7 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 | Accelerator | Threading model |
 |-------------|----------------|
 | **PCA** (covariance / randomized) | Bounded ordered decode-prefetch on the global pool; covariance and transpose SpMM partition their **output** columns across workers into one shared accumulator (no merge); row-disjoint `par_chunks_mut` for the forward SpMM |
-| **Differential expression** (Wilcoxon rank-sum, pdex ref-mode, the `pts` counting pass) | `par_iter` over genes for the ranking; on a backed or lazy `X` the per-gene-chunk shard walk goes through the bounded ordered decode-prefetch, so a row projection skips the shards it empties and decode overlaps the ranking. Depth is granted from whatever the dense `n_obs x chunk` workspace left of `SCX_ACCEL_DE_MEMORY_BUDGET` |
+| **Differential expression** (Wilcoxon rank-sum, pdex ref-mode, the `pts` counting pass) | `par_iter` over genes for the ranking; on a backed or lazy `X` the shard walk goes through the bounded ordered decode-prefetch — per gene chunk for Wilcoxon and pdex, once over the matrix for `pts`, so a row projection skips the shards it empties and decode overlaps the ranking. Depth is granted from whatever the dense `n_obs x chunk` workspace left of `SCX_ACCEL_DE_MEMORY_BUDGET` |
 | **NB-GLM** (DESeq2-style DE) | `par_iter` over genes for IRLS, shrinkage refit, and Wald inference |
 | **Harmony** batch integration | Per-op `rayon::ThreadPool`; tiled cell updates via `par_chunks` |
 | **Leiden** clustering | Conflict-free parallel batching via `par_iter` |

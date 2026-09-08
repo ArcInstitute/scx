@@ -34,7 +34,10 @@ pub mod mem;
 pub mod prefetch;
 pub mod profile;
 pub mod reader;
-pub mod row_cursor;
+// Workspace infrastructure, not a user-facing API: the type is re-exported
+// below because `scx-accel` and `scx-gpu` both need to name it, but the module
+// path is not part of the published surface.
+mod row_cursor;
 pub mod shard_decode;
 pub mod shard_report;
 pub mod shard_source;

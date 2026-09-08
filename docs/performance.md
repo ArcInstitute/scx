@@ -767,16 +767,20 @@ nested call from deadlocking.
 
 ### Decode-prefetch reaches the DE kernels
 
-Task 4.2 wired every loop that could reach the pipeline. The three streaming DE
+Task 4.2 wired every loop that could reach the pipeline. Three streaming DE
 kernels could not: `wilcoxon_rank_sum_streaming`, `pdex_ref_streaming` and the
 `pts` counting pass each ran their own `for shard_idx in 0..n_shards`, so neither
 knob above governed them and neither did the row-projection shard skip the
-`ShardSource::visible_shard_indices` hook gives every driver consumer. They now
-share one `fill_gene_chunk_dense` over `for_each_shard_ordered`.
+`ShardSource::visible_shard_indices` hook gives every driver consumer.
 
-DE is where this matters most because its shard walk is **inner** to its
-gene-chunk walk: every visited shard is read once per gene chunk, so the cost is
-`n_gene_chunks × visited shards`. Two separable effects, measured separately.
+They are two different shapes, and only the first is a per-gene-chunk walk.
+Wilcoxon and pdex now share one `fill_gene_chunk_dense` over
+`for_each_shard_ordered`; `pts` makes a single whole-matrix counting pass and
+moved that one pass onto the same ordered driver. DE is where this matters most
+because *its* shard walk is **inner** to its gene-chunk walk — every visited
+shard is read once per gene chunk, so the cost is
+`n_gene_chunks × visited shards`, where `pts` pays `visited shards` once. Two
+separable effects, measured separately.
 
 **The row-projection skip**, counted in shard decodes (`SCX_CPU_PROFILE=1`, a
 120 × 200 file in 5 shards of 24, `cache_shards=0` so every read is a decode):
@@ -806,7 +810,7 @@ shard cache and smallest once the LRU holds the file — and flat on a one-shard
 row window, which has nothing to prefetch ahead of.)
 
 Peak memory is bounded rather than assumed: the pipeline holds `depth` decoded
-shards where the loop held one, and `scx_accel::mem_budget::de_prefetch_depth`
+shards where the loop held one, and the DE prefetch clamp (`scx-accel`, crate-internal)
 grants only what the dense `n_obs × chunk` workspace left of
 `SCX_ACCEL_DE_MEMORY_BUDGET`. A budget-bound file therefore resolves to depth 1
 and keeps its pre-change footprint; on a plain backed handle the in-flight

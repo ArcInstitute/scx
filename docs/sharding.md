@@ -589,7 +589,7 @@ quoted here: it is a wall-clock claim of a shape
 [docs/benchmark_manifest.md](benchmark_manifest.md) requires a manifest entry
 for. Overlap helps where decode is repeated, so it is largest with no shard
 cache and vanishes on a one-shard window. Depth is clamped
-by `scx_accel::mem_budget::de_prefetch_depth` against whatever the dense
+by the DE prefetch clamp (`scx-accel`, crate-internal) against whatever the dense
 `n_obs x chunk` workspace left of `SCX_ACCEL_DE_MEMORY_BUDGET`, so a
 budget-bound file falls back to depth 1 rather than growing: the pipeline holds
 `depth` decoded shards where the loop held one, and on a plain backed handle

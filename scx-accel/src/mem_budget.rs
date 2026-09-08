@@ -209,9 +209,22 @@ pub use scx_format_io::prefetch::clamp_prefetch_depth;
 ///   genes is 200 MB of a 4 GiB budget.
 ///
 /// A source with no [`shard_size_hint`](scx_format_io::ShardSource::shard_size_hint)
-/// keeps the unclamped depth: there is no per-shard byte estimate to divide by.
-/// That is the same rule the GPU staging path applies
-/// (`scx_gpu::gpu_shard_source::resolve_staging_prefetch_depth_for`).
+/// falls to **depth 1**, not to the unclamped request. There is no per-shard
+/// byte estimate to divide by, and this is reachable on real files rather than
+/// only on a hypothetical third-party source: `BackedCsrReader::shard_size_hint`
+/// answers `None` whenever the catalog carries no per-shard `nnz`, and
+/// `LazyShardSource` forwards that. Granting the full depth there would stack
+/// `depth` decoded shards on top of a full dense workspace on exactly the files
+/// that cannot be measured — an unbounded term under a function whose contract
+/// is a bound.
+///
+/// This deliberately diverges from
+/// `scx_gpu::gpu_shard_source::resolve_staging_prefetch_depth_for`, which does
+/// return the unclamped request without a hint. That is consistent there: its
+/// budget (`SCX_GPU_STAGING_MEMORY_BUDGET`) is unset by default, so "no budget"
+/// and "no hint" both mean "no clamp was asked for". Here the budget always
+/// exists (4 GiB by default), so a missing hint is a measurement failure, not an
+/// opt-out.
 ///
 /// Deliberately **not** done: shrinking the gene chunk to make room for
 /// prefetch. That would change chunk counts on exactly the files where the
@@ -240,7 +253,8 @@ pub(crate) fn de_prefetch_depth_for(
     budget: u64,
 ) -> usize {
     let Some(hint) = hint else {
-        return requested;
+        // Unmeasurable, so unbounded — take the floor rather than the request.
+        return 1;
     };
     let remaining = budget.saturating_sub(dense_bytes);
     clamp_prefetch_depth(requested, hint.decoded_bytes(), remaining)
@@ -420,14 +434,20 @@ mod tests {
         })
     }
 
-    /// No per-shard estimate means nothing to divide by, so the request stands
-    /// — the same rule the GPU staging path applies.
+    /// No per-shard estimate means the budget cannot be honoured, so the depth
+    /// takes the floor rather than the request.
+    ///
+    /// Reachable on real files, not just a third-party source:
+    /// `BackedCsrReader::shard_size_hint` answers `None` whenever the catalog
+    /// carries no per-shard `nnz`. Returning the request there would put an
+    /// unbounded term under a function whose contract is a bound.
     #[test]
-    fn de_prefetch_depth_without_a_hint_keeps_the_request() {
-        assert_eq!(de_prefetch_depth_for(4, None, 0, 1024), 4);
-        // Even when the dense workspace has visibly eaten the whole budget:
-        // with no hint there is no basis to clamp on.
-        assert_eq!(de_prefetch_depth_for(4, None, 1024, 1024), 4);
+    fn de_prefetch_depth_without_a_hint_falls_to_the_floor() {
+        assert_eq!(de_prefetch_depth_for(4, None, 0, 1024), 1);
+        assert_eq!(de_prefetch_depth_for(4, None, 1024, 1024), 1);
+        // And a roomy budget does not buy back the depth: the shard size, not
+        // the budget, is what is unknown.
+        assert_eq!(de_prefetch_depth_for(4, None, 0, u64::MAX), 1);
     }
 
     /// A budget-bound file: the dense gene-chunk workspace already claimed the

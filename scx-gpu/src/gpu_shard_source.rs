@@ -628,9 +628,16 @@ impl<'a> GpuShardSource for GpuPreprocessedShardSource<'a> {
         // different fields, so binding it before `self.inner.run` is allowed.
         let row_scale = self.row_scale.as_ref();
         // Cumulative first-global-row of the current shard, advanced per shard.
-        // `run` invokes the transform only for non-empty shards in 0..n_shards
-        // order, and empty shards contribute 0 rows — so this matches the
-        // global row layout the factor vector is indexed against.
+        // `run` invokes the transform only for non-empty shards, in the
+        // ascending order of its `StagingPlan` — every shard when the source
+        // reports no row filter, otherwise only the shards its
+        // `visible_shard_indices` names. Empty shards contribute 0 rows either
+        // way, so this matches the *visible* row layout the factor vector is
+        // indexed against. (It said `0..n_shards` before `StagingPlan::for_source`
+        // made a filtered plan possible; the row_scale factors are host-side and
+        // sized to the visible axis, so a disagreeing plan mis-scales rather
+        // than reading out of bounds — the DE and pseudobulk passes index a
+        // device `cell_to_group` and so carry `VisibleRowCursor` instead.)
         let mut global_row_offset = 0usize;
         self.inner.run(f, move |dev, slot| {
             let n_rows = slot.shape().0;
