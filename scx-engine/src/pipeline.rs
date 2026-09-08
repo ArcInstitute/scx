@@ -8,7 +8,7 @@ use std::path::Path;
 
 use arrow::datatypes::Schema;
 use scx_format_io::ScxReader;
-use scx_sparse::ScxCsr;
+use scx_sparse::{MaterializePlan, ScxCsr};
 
 use scx_format_io::DeletionVectors;
 
@@ -22,10 +22,49 @@ pub struct NormalizeConfig {
     pub target_sum: f64,
 }
 
+/// The matrix shapes a [`QueryResult`] can carry.
+///
+/// Two implementations — [`ScxCsr`] (the default `f32` collect) and
+/// [`scx_sparse::TypedCsr`] (the dtype-selected collect) — consumed by this
+/// module's shared `Debug` and by the bindings, which cache a result's
+/// dimensions before handing the matrix out.
+pub trait QueryMatrix {
+    /// `(n_rows, n_cols)`.
+    fn shape(&self) -> (usize, usize);
+    /// Number of stored non-zeros.
+    fn nnz(&self) -> usize;
+}
+
+impl QueryMatrix for ScxCsr {
+    fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+    fn nnz(&self) -> usize {
+        ScxCsr::nnz(self)
+    }
+}
+
+impl QueryMatrix for scx_sparse::TypedCsr {
+    fn shape(&self) -> (usize, usize) {
+        self.shape
+    }
+    fn nnz(&self) -> usize {
+        scx_sparse::TypedCsr::nnz(self)
+    }
+}
+
+/// A [`QueryResult`] whose `X` was decoded at a caller-chosen dtype rather than
+/// `f32` — what [`QueryPipeline::collect_typed`] returns.
+pub type TypedQueryResult = QueryResult<scx_sparse::TypedCsr>;
+
 /// Result of a query pipeline execution.
-pub struct QueryResult {
+///
+/// Generic in the matrix so the dtype-selected collect reuses every metadata
+/// field, with [`ScxCsr`] defaulted so existing callers keep spelling it
+/// `QueryResult`.
+pub struct QueryResult<X = ScxCsr> {
     /// The expression matrix (filtered + projected).
-    pub x: ScxCsr,
+    pub x: X,
     /// Observation metadata for matching cells.
     pub obs: arrow::array::RecordBatch,
     /// Variable/gene metadata for projected genes.
@@ -68,10 +107,10 @@ pub struct CountResult {
     pub candidate_shard_rows: usize,
 }
 
-impl std::fmt::Debug for QueryResult {
+impl<X: QueryMatrix> std::fmt::Debug for QueryResult<X> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueryResult")
-            .field("x_shape", &self.x.shape)
+            .field("x_shape", &self.x.shape())
             .field("obs_rows", &self.obs.num_rows())
             .field("var_rows", &self.var.num_rows())
             .field("skipped_shards", &self.skipped_shards)
@@ -382,6 +421,34 @@ impl QueryPipeline {
     /// pipeline: pushdown → decode → projection → filter → fused ops.
     pub fn collect(self) -> Result<QueryResult> {
         self.collect_ref()
+    }
+
+    /// Execute the pipeline, decoding `X` **at `mplan`'s dtype** instead of
+    /// `f32`.
+    ///
+    /// The reason this exists rather than being a kwarg on the materialization
+    /// step: [`collect_ref`](Self::collect_ref) *is* the decode, so a dtype
+    /// named after it can only cast values that already rounded. A count above
+    /// 2²⁴ is exact through this door and unreachable through the other.
+    ///
+    /// Borrows, like `collect_ref`, so a refused cast leaves the pipeline usable.
+    /// Ask [`typed_collect_supported`](Self::typed_collect_supported) first — a
+    /// fused transform is refused here rather than silently served from the f32
+    /// route, because *which guard ran* is the thing a caller is relying on.
+    pub fn collect_typed(&self, mplan: &MaterializePlan) -> Result<TypedQueryResult> {
+        crate::collect::execute_typed(self, mplan)
+    }
+
+    /// Whether [`collect_typed`](Self::collect_typed) can serve `mplan`.
+    ///
+    /// `false` for a pipeline carrying `with_normalize` / `with_log1p` (the
+    /// transform replaces the stored counts with floats, so no dtype makes the
+    /// read exact) and for a non-CSR container (the typed assembly produces a
+    /// CSR; a dense request is a presentation step on top). Both cases belong on
+    /// the `f32` route, which guards on `f32` — correctly, because that is what
+    /// it produced.
+    pub fn typed_collect_supported(&self, mplan: &MaterializePlan) -> bool {
+        mplan.container == scx_sparse::Container::Csr && self.normalize.is_none() && !self.log1p
     }
 
     /// Count matching rows without decoding the X matrix (CLI2).

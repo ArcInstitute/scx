@@ -271,6 +271,67 @@ pub struct TypedCsr {
     pub values: ValueBuffer,
 }
 
+impl TypedCsr {
+    /// Construct without validation, mirroring [`crate::ScxCsr::new_unchecked`]
+    /// — same five invariants, checked in debug builds only.
+    ///
+    /// Worth having even though it is only ever called with data this crate just
+    /// built: every `TypedCsr` in the tree was a bare struct literal before, so
+    /// the typed path had **none** of the invariant checks its `f32` twin has had
+    /// since it was written, on either the whole-matrix or the query assembly.
+    pub fn new_unchecked(
+        shape: (usize, usize),
+        indptr: Vec<i64>,
+        indices: IndexBuffer,
+        values: ValueBuffer,
+    ) -> Self {
+        debug_assert_eq!(
+            indptr.len(),
+            shape.0 + 1,
+            "TypedCsr::new_unchecked: indptr.len() must equal shape.0 + 1"
+        );
+        debug_assert!(
+            indptr.first().copied() == Some(0),
+            "TypedCsr::new_unchecked: indptr[0] must be 0"
+        );
+        debug_assert!(
+            indptr.windows(2).all(|w| w[0] <= w[1]),
+            "TypedCsr::new_unchecked: indptr must be monotone non-decreasing"
+        );
+        debug_assert_eq!(
+            indices.len(),
+            values.len(),
+            "TypedCsr::new_unchecked: indices.len() must equal values.len()"
+        );
+        debug_assert_eq!(
+            values.len() as i64,
+            *indptr.last().unwrap_or(&0),
+            "TypedCsr::new_unchecked: values.len() must equal indptr.last()"
+        );
+        Self {
+            shape,
+            indptr,
+            indices,
+            values,
+        }
+    }
+
+    /// Number of rows.
+    pub fn n_rows(&self) -> usize {
+        self.shape.0
+    }
+
+    /// Number of columns.
+    pub fn n_cols(&self) -> usize {
+        self.shape.1
+    }
+
+    /// Number of non-zero entries.
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
+}
+
 /// A row-major dense buffer materialized directly at the target value dtype.
 #[derive(Debug, Clone)]
 pub struct TypedDense {

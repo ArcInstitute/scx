@@ -261,6 +261,18 @@ impl SectionReader for FaultInjectingReader {
         }
         SectionReader::read_shard_from_entry(&self.inner, entry)
     }
+    /// Draws on the **same** failure credit as the f32 twin, so a scenario
+    /// written for one decode shape exercises the retry path of whichever one
+    /// the pipeline actually took.
+    fn read_shard_from_entry_native(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> scx_engine::Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
+        if Self::take_failure(&self.x_fails_remaining) {
+            return Err(self.make_err());
+        }
+        SectionReader::read_shard_from_entry_native(&self.inner, entry)
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -133,12 +133,12 @@ impl ScxReader {
         plan: &MaterializePlan,
     ) -> Result<TypedCsr> {
         if shards.is_empty() {
-            return Ok(TypedCsr {
-                shape: (0, n_cols),
-                indptr: vec![0i64],
-                indices: IndexBuffer::zeroed(plan.index_dtype, 0),
-                values: ValueBuffer::zeroed(plan.data_dtype, 0),
-            });
+            return Ok(TypedCsr::new_unchecked(
+                (0, n_cols),
+                vec![0i64],
+                IndexBuffer::zeroed(plan.index_dtype, 0),
+                ValueBuffer::zeroed(plan.data_dtype, 0),
+            ));
         }
 
         // Per-shard (n_rows, nnz) from catalog stats, and the max integer value
@@ -204,12 +204,12 @@ impl ScxReader {
         }
 
         let n_rows = indptr.len().saturating_sub(1);
-        Ok(TypedCsr {
-            shape: (n_rows, n_cols),
+        Ok(TypedCsr::new_unchecked(
+            (n_rows, n_cols),
             indptr,
             indices,
             values,
-        })
+        ))
     }
 
     /// Deletion-vector row compaction over a [`TypedCsr`] (typed twin of
@@ -243,12 +243,12 @@ impl ScxReader {
         let new_n_rows = new_indptr.len() - 1;
         let indices = compact_index_buffer(&csr.indices, &csr.indptr, &keep);
         let values = compact_value_buffer(&csr.values, &csr.indptr, &keep);
-        Ok(TypedCsr {
-            shape: (new_n_rows, csr.shape.1),
-            indptr: new_indptr,
+        Ok(TypedCsr::new_unchecked(
+            (new_n_rows, csr.shape.1),
+            new_indptr,
             indices,
             values,
-        })
+        ))
     }
 }
 

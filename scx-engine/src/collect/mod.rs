@@ -9,6 +9,7 @@
 //! |---|---|
 //! | `retry` | `par_map_with_shard_retry` — generic resilient parallel map, nothing query-specific |
 //! | `rows` | `filter_csr_rows` — row selection inside one decoded shard |
+//! | `native` | the fused native decode+filter+project for the dtype-selected collect |
 //! | `plan` | the `ExecutionPlan`: catalog-level (Level-1) shard pruning and the category dictionaries |
 //! | `mask` | the row-set fast path, the legacy full-decode fallback, and the fork between them |
 //! | `execute` | the public entry points and the X-shard decode they drive |
@@ -23,11 +24,12 @@
 
 mod execute;
 mod mask;
+mod native;
 mod plan;
 mod retry;
 mod rows;
 
-pub use execute::{count, execute, exists};
+pub use execute::{count, execute, execute_typed, exists};
 pub use rows::filter_csr_rows;
 
 pub(crate) use execute::materialize_filtered_obs;

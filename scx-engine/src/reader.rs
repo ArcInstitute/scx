@@ -159,6 +159,21 @@ pub trait SectionReader: Send + Sync {
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)>;
 
+    /// Decode a single CSR shard to **native** types (`i64` indptr, `u32`
+    /// indices, [`scx_codec::ShardValuesNative`] values): integer-encoded
+    /// shards keep their `u32` stream instead of rounding through `f32`.
+    ///
+    /// Backs the typed (dtype-selected) collect. Deliberately **not**
+    /// defaulted: a default would have to either round through `f32` — the
+    /// exact loss the typed path exists to avoid — or fail at run time, and
+    /// every implementor is in this workspace (the local reader, the cloud
+    /// reader, and one fault-injecting test reader), so requiring it costs
+    /// nothing and keeps a future backend from landing without it.
+    fn read_shard_from_entry_native(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)>;
+
     /// Downcast escape hatch for callers that need backend-specific
     /// methods not on the trait (e.g. `scx subset` reading uns / layer
     /// names from a local `ScxReader`). Cloud-only callers do not use
@@ -263,6 +278,13 @@ impl SectionReader for ScxReader {
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
         Ok(ScxReader::read_shard_from_entry(self, entry)?)
+    }
+
+    fn read_shard_from_entry_native(
+        &self,
+        entry: &FullCatalogEntry,
+    ) -> Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
+        Ok(ScxReader::read_shard_from_entry_native(self, entry)?)
     }
 
     fn as_any(&self) -> &dyn Any {

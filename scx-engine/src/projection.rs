@@ -11,6 +11,40 @@ use scx_sparse::{ScxCsc, ScxCsr};
 use crate::error::Result;
 use crate::reader::SectionReader;
 
+/// A CSR column-index element the projection can compare and remap.
+///
+/// Exists so [`project_csr_row`] serves both shapes a decoded shard comes in:
+/// the scipy-facing `i32` of [`SectionReader::read_shard_from_entry`] and the
+/// `u32` of its native twin, which the typed (dtype-selected) collect decodes to
+/// because integer values must not round through `f32`. Two implementations, two
+/// instantiations — the alternative was a second copy of the merge scan, and a
+/// projection bug that lands in one copy is exactly the failure this avoids.
+pub trait CsrIndex: Copy {
+    /// The index as a `u32`, for comparison against the gene set.
+    fn to_u32(self) -> u32;
+    /// A position within the gene set (`< gene_set.len()`, so always in range
+    /// for both implementations) as an index element.
+    fn from_gene_position(pos: usize) -> Self;
+}
+
+impl CsrIndex for i32 {
+    fn to_u32(self) -> u32 {
+        self as u32
+    }
+    fn from_gene_position(pos: usize) -> Self {
+        pos as i32
+    }
+}
+
+impl CsrIndex for u32 {
+    fn to_u32(self) -> u32 {
+        self
+    }
+    fn from_gene_position(pos: usize) -> Self {
+        pos as u32
+    }
+}
+
 /// Project a single CSR row, keeping only entries whose column index
 /// appears in `gene_set`.
 ///
@@ -32,9 +66,16 @@ use crate::reader::SectionReader;
 ///
 /// Returns `(projected_indices, projected_data)` where indices are
 /// remapped to `0..gene_set.len()` (position in gene_set).
-pub fn project_csr_row(indices: &[i32], data: &[f32], gene_set: &[u32]) -> (Vec<i32>, Vec<f32>) {
+pub fn project_csr_row<I: CsrIndex, V: Copy>(
+    indices: &[I],
+    data: &[V],
+    gene_set: &[u32],
+) -> (Vec<I>, Vec<V>) {
+    // Compared as `u32`, which is how the merge scan below reads them too — so
+    // the assertion checks the order the scan actually depends on rather than the
+    // element type's own order.
     debug_assert!(
-        indices.windows(2).all(|w| w[0] <= w[1]),
+        indices.windows(2).all(|w| w[0].to_u32() <= w[1].to_u32()),
         "project_csr_row: row indices are not sorted ascending — unsorted input \
          silently produces wrong results because the merge scan uses a monotonic \
          pointer. Sort indices at the caller (e.g. via scipy `sort_indices()` or \
@@ -52,7 +93,7 @@ pub fn project_csr_row(indices: &[i32], data: &[f32], gene_set: &[u32]) -> (Vec<
     let mut gi = 0; // pointer into gene_set
 
     for (pos, (&col_idx, &val)) in indices.iter().zip(data.iter()).enumerate() {
-        let col = col_idx as u32;
+        let col = col_idx.to_u32();
         // Advance gene_set pointer past values smaller than current column
         while gi < gene_set.len() && gene_set[gi] < col {
             gi += 1;
@@ -62,7 +103,7 @@ pub fn project_csr_row(indices: &[i32], data: &[f32], gene_set: &[u32]) -> (Vec<
         }
         if gene_set[gi] == col {
             // Remap to position within gene_set
-            out_indices.push(gi as i32);
+            out_indices.push(I::from_gene_position(gi));
             out_data.push(val);
         }
         // If gene_set[gi] > col, this column is not in the gene set — skip it
@@ -316,8 +357,8 @@ mod tests {
     #[test]
     fn project_row_basic() {
         // Row with columns [0, 3, 5, 7], select genes {3, 5}
-        let indices = vec![0, 3, 5, 7];
-        let data = vec![1.0, 2.0, 3.0, 4.0];
+        let indices: Vec<i32> = vec![0, 3, 5, 7];
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let gene_set = vec![3, 5];
 
         let (out_idx, out_data) = project_csr_row(&indices, &data, &gene_set);
@@ -328,8 +369,8 @@ mod tests {
     #[test]
     fn project_row_no_match() {
         // Row has columns [0, 1, 2], gene_set is {5, 6}
-        let indices = vec![0, 1, 2];
-        let data = vec![1.0, 2.0, 3.0];
+        let indices: Vec<i32> = vec![0, 1, 2];
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let gene_set = vec![5, 6];
 
         let (out_idx, out_data) = project_csr_row(&indices, &data, &gene_set);
@@ -339,8 +380,8 @@ mod tests {
 
     #[test]
     fn project_row_all_match() {
-        let indices = vec![2, 4, 6];
-        let data = vec![10.0, 20.0, 30.0];
+        let indices: Vec<i32> = vec![2, 4, 6];
+        let data: Vec<f32> = vec![10.0, 20.0, 30.0];
         let gene_set = vec![2, 4, 6];
 
         let (out_idx, out_data) = project_csr_row(&indices, &data, &gene_set);
@@ -350,13 +391,31 @@ mod tests {
 
     #[test]
     fn project_row_empty_gene_set() {
-        let indices = vec![0, 1, 2];
-        let data = vec![1.0, 2.0, 3.0];
+        let indices: Vec<i32> = vec![0, 1, 2];
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0];
         let gene_set: Vec<u32> = vec![];
 
         let (out_idx, out_data) = project_csr_row(&indices, &data, &gene_set);
         assert!(out_idx.is_empty());
         assert!(out_data.is_empty());
+    }
+
+    /// The native instantiation the typed (dtype-selected) collect runs on:
+    /// `u32` indices and `u32` values. The f32 tests above cannot reach it, and
+    /// an integer value domain is the whole point of the typed path — a count
+    /// above 2²⁴ must survive the projection without touching `f32`.
+    #[test]
+    fn project_row_native_u32_domain() {
+        let indices: Vec<u32> = vec![0, 3, 5, 7];
+        let big = (1u32 << 24) + 7; // odd, and not representable exactly in f32
+        let data: Vec<u32> = vec![1, big, 3, 4];
+        let gene_set = vec![3, 5];
+
+        let (out_idx, out_data) = project_csr_row(&indices, &data, &gene_set);
+        assert_eq!(out_idx, vec![0u32, 1]); // remapped: 3→0, 5→1
+        assert_eq!(out_data, vec![big, 3]);
+        // The value that motivates the typed path did not round on the way.
+        assert_ne!(out_data[0] as f32 as u32, out_data[0]);
     }
 
     #[test]

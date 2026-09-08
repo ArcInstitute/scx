@@ -1222,13 +1222,37 @@ impl ScxReader {
         entry: &FullCatalogEntry,
     ) -> Result<(Vec<i64>, Vec<u32>, scx_codec::ShardValuesNative)> {
         self.guard_csc_sidecar_fresh(entry)?;
+        // Instrumented identically to the f32 twin above. It was not, and the
+        // omission made a typed read report zero shard decodes and zero I/O —
+        // a diagnostic that lies rather than one that is merely absent, since
+        // `debug_counts` is what "did we read the whole table" assertions read.
+        #[cfg(debug_assertions)]
+        self.debug_counts
+            .read_shard_from_entry
+            .fetch_add(1, Ordering::Relaxed);
+        let io_start = crate::profile::start();
         let section = self.section_bytes(entry)?;
-        crate::shard_decode::decode_shard_bytes_native(
+        crate::profile::record_io_since(io_start, section.len());
+        let class = if crate::profile::profile_enabled() {
+            crate::validated_section::ValidatedSection::new(section)
+                .header()
+                .ok()
+                .and_then(|h| ShardHeader::read_from(&mut Cursor::new(h)).ok())
+                .and_then(|h| CodecId::from_u8(h.codec_id))
+                .map(crate::profile::CodecClass::from_codec)
+                .unwrap_or(crate::profile::CodecClass::Generic)
+        } else {
+            crate::profile::CodecClass::Generic
+        };
+        let decode_start = crate::profile::start();
+        let decoded = crate::shard_decode::decode_shard_bytes_native(
             section,
             entry,
             self.full_catalog.catalog_version,
             false,
-        )
+        );
+        crate::profile::record_decode_since(class, decode_start, section.len());
+        decoded
     }
 
     /// Read only the indptr (row-pointer) array of a shard, skipping
