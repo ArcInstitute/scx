@@ -288,3 +288,90 @@ scx_attach_obs <- function(path, df, key, key_columns = NULL,
     as.logical(dry_run)
   )
 }
+
+#' Attach per-gene annotations to an SCX file, in place
+#'
+#' The var-axis twin of \code{\link{scx_attach_obs}}: a gene-level
+#' \code{data.frame} computed in R — a normalised symbol, a peak annotation, a
+#' curated flag — landed on an existing file without rewriting it.
+#'
+#' Joins \strong{by key string, never by row position}: an annotation table has
+#' its own row order, and a positional import would put every value on the wrong
+#' gene while still producing a correctly-shaped column. Genes the table does not
+#' cover get \code{NA}, never a fabricated \code{0}.
+#'
+#' In place, so \code{X}, layers, \code{obs}, the CSC sidecar, \code{.raw},
+#' deletion vectors and the obs predicate index all survive, and
+#' \code{\link{scx_rollback}} undoes the whole attach. A sharded var keeps its
+#' shard boundaries; a single-section var stays one section. A multimodal file is
+#' refused — each modality owns its own var table.
+#'
+#' @param path Path to the SCX file (modified in place).
+#' @param df The annotations, as a \code{data.frame}. An R factor arrives as a
+#'   dictionary and is preserved as one, with its levels and order.
+#' @param key Character vector of one key per row of \code{df} — usually
+#'   \code{rownames(df)}. Omit to resolve a key column from \code{df} instead.
+#' @param key_columns Columns \strong{of \code{df}} to fuse into a composite
+#'   key, joined against target var columns of the same names. Mutually
+#'   exclusive with \code{key}.
+#' @param key_column Target var column to join on when \code{key} is given.
+#'   \code{NULL} auto-resolves it (the var index, then \code{gene_id},
+#'   \code{gene_ids}, \code{feature_id}, \code{gene_name}, ...).
+#' @param prefix Prepended to every imported column name.
+#' @param status_column Var column recording \code{"present"}/\code{"absent"}
+#'   per gene. \code{NULL} omits it.
+#' @param uns_key Reserved and currently inert: rscx sends no \code{uns}
+#'   payload, so nothing is written under it.
+#' @param overwrite Replace colliding columns. \strong{Replaces, never merges} —
+#'   landing several partial tables in turn keeps only the last.
+#' @param on_missing_rows \code{"null"} (default), \code{"zero"} (an accepted
+#'   alias for the same policy) or \code{"error"}.
+#' @param on_extra_rows \code{"warn"} (default) or \code{"error"}.
+#' @param dry_run Validate and join without writing.
+#' @return A named list summarising the join: \code{n_vars},
+#'   \code{n_matched}, \code{n_target_rows_absent},
+#'   \code{n_source_rows_absent}, \code{var_key_column},
+#'   \code{var_columns_added}, \code{var_index_rebuilt},
+#'   \code{var_columns_not_carried}, \code{var_streamed} and
+#'   \code{dry_run}.
+#' @export
+#' @examples
+#' \dontrun{
+#' ann <- data.frame(symbol_norm = c("TP53", "MYC"))
+#' rownames(ann) <- c("ENSG00000141510", "ENSG00000136997")
+#' scx_attach_var("atlas.scx", ann, key = rownames(ann))
+#' }
+scx_attach_var <- function(path, df, key, key_columns = NULL,
+                           key_column = NULL, prefix = "",
+                           status_column = NULL, uns_key = NULL,
+                           overwrite = FALSE, on_missing_rows = "null",
+                           on_extra_rows = "warn", dry_run = FALSE) {
+  # As on obs: `key` supplied but empty is the rownames(df) == NULL trap, and
+  # joining on nothing would match nothing while looking like the annotation
+  # covered no genes.
+  if (!missing(key) && (is.null(key) || length(key) == 0L)) {
+    stop("`key` was supplied but is NULL/empty — rownames(df) is NULL when the ",
+         "object has no feature names. Give the keys explicitly, or use ",
+         "`key_columns=` to join on columns of `df`.", call. = FALSE)
+  }
+  if (missing(key)) key <- character(0)
+  if (!is.null(key_columns) && length(key) > 0L) {
+    stop("pass either `key` or `key_columns`, not both.", call. = FALSE)
+  }
+
+  .Call(
+    wrap__scx_attach_var,
+    path,
+    df,
+    as.character(key),
+    .scx_chr_or_empty(key_columns),
+    if (is.null(key_column)) NULL else as.character(key_column),
+    as.character(prefix),
+    if (is.null(status_column)) NULL else as.character(status_column),
+    if (is.null(uns_key)) NULL else as.character(uns_key),
+    as.logical(overwrite),
+    as.character(on_missing_rows),
+    as.character(on_extra_rows),
+    as.logical(dry_run)
+  )
+}

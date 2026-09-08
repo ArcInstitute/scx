@@ -30,6 +30,16 @@
 
 ### New features
 
+- **`scx_attach_var()`** — the var-axis twin of `scx_attach_obs()`: attach a
+  `data.frame` of per-**gene** annotations (a normalised symbol, a peak
+  annotation, a curated flag) to an existing SCX file as var columns, in place.
+  Same contract — joins **by key string, never by row position**, genes the
+  `data.frame` does not cover become `NA`, `scx_rollback()` undoes the attach —
+  and the same arguments (`key` / `key_columns` / `key_column`, `prefix`,
+  `status_column`, `overwrite`, `on_missing_rows`, `on_extra_rows`,
+  `dry_run`). A sharded var keeps its shard boundaries; a single-section var
+  stays one section. A multimodal file is refused, because each modality owns
+  its own var table. As on obs, `uns_key` is accepted but inert.
 - **`scx_attach_obs()`** — attach a `data.frame` of per-cell annotations to an
   existing SCX file as obs columns, in place. The R end of the doublet-caller
   interop: scDblFinder / DoubletFinder / scds run directly on an rscx-loaded

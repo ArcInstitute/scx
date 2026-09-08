@@ -131,6 +131,21 @@ var, the CSC sidecar, `.raw`, deletion vectors and predicate indexes are
 preserved, and `scx_rollback(path)` undoes the whole attach. Pass
 `dry_run = TRUE` to run every validation and the join without writing.
 
+`scx_attach_var()` is the var-axis twin, for a gene-level `data.frame` — a
+normalised symbol from a reference release, a peak annotation, a curated flag:
+
+```r
+ann <- data.frame(symbol_norm = normalise(rownames(var_df)))
+rownames(ann) <- rownames(var_df)
+scx_attach_var("atlas.scx", ann, key = rownames(ann))
+```
+
+Same contract, same options: key-joined, `NA` for genes the table does not
+cover, in place, `scx_rollback()`-able. A sharded var keeps its shard
+boundaries and a single-section var stays one section; a multimodal file is
+refused, because each modality owns its own var table (extract one with
+`scx subset --modality NAME`, attach, then re-merge).
+
 `scx_merge` / `scx_compact` / `scx_append` accept the same option set as pyscx
 (predicate-index columns via `index_obs`/`index_var`/`index_preset`, `uns_policy`
 and `assume_identical_var`/`sort_by` on merge, `codec`/`shard_size`/`modality` on
