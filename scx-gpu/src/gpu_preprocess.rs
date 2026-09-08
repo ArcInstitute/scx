@@ -408,9 +408,13 @@ pub fn gpu_preprocess_to_csr(
 
     // `for_each_gpu_shard` invokes the callback strictly sequentially on
     // the calling thread (worker thread only decodes), and
-    // `RawGpuShardSource::run` iterates `0..n_shards` in order — so a plain
-    // `Vec::push` here yields the shards in the correct order without
-    // needing a Mutex or post-hoc sort.
+    // `RawGpuShardSource::run` iterates its `StagingPlan` in ascending order —
+    // every shard when the source reports no row filter, otherwise only the
+    // shards its `visible_shard_indices` names. Either way the order is
+    // ascending, so a plain `Vec::push` here yields the shards in the correct
+    // order without needing a Mutex or post-hoc sort. It does *not* iterate
+    // `0..n_shards` unconditionally, which is what this said before
+    // `StagingPlan::for_source`.
     let mut shard_csrs = Vec::<ScxCsr>::with_capacity(n_shards);
 
     // `PreprocessedGpuMatrixSource` rather than `GpuPreprocessedShardSource`

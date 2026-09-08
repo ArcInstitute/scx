@@ -447,6 +447,41 @@ mod tests {
         assert_eq!(de_prefetch_depth_for(4, hint(8), 0, 4 * 1024 * 1024), 4);
     }
 
+    /// Charging the *requested* gene chunk rather than the one actually
+    /// allocated collapses the depth on a narrow gene view — the regression
+    /// this arm records, with the numbers that make it matter.
+    ///
+    /// 10 M cells projected to 10 genes: the caller asks for 500-gene chunks,
+    /// `clamp_de_gene_chunk` leaves the request alone because it fits, and the
+    /// buffer is `n_obs x min(500, 10)` — about 400 MB. Billing the request
+    /// instead charges ~20 GB against a 4 GiB budget, leaves nothing, and pins
+    /// the depth at 1 while depth 4 fits many times over.
+    #[test]
+    fn charging_the_request_instead_of_the_active_chunk_collapses_the_depth() {
+        let n_obs = 10_000_000u64;
+        let budget = 4 * 1024 * 1024 * 1024u64;
+        let shard = Some(scx_format_io::ShardSizeHint {
+            max_rows: 16_384,
+            max_nnz: 16_384 * 10,
+        });
+
+        let allocated = n_obs * 10 * 4; // active chunk = min(500, 10)
+        let as_requested = n_obs * 500 * 4; // what charging the request bills
+
+        assert_eq!(
+            de_prefetch_depth_for(4, shard, as_requested, budget),
+            1,
+            "charging the request must be what collapses the depth — \
+             otherwise this arm proves nothing"
+        );
+        assert_eq!(
+            de_prefetch_depth_for(4, shard, allocated, budget),
+            4,
+            "charging only the allocated workspace must leave room for the \
+             full depth"
+        );
+    }
+
     /// The interesting middle, and the arm that would catch a clamp applied to
     /// the wrong quantity: exactly two shards fit the remainder, so the depth is
     /// two even though four were requested.

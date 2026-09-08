@@ -269,24 +269,27 @@ pub(crate) fn group_nonzero_counts_streaming_with_depth<S: ShardSource + Sync + 
             n_obs
         )));
     }
-    // The accumulator is `n_groups x n_vars` u64s and is not the dense DE
-    // workspace, so the prefetch has the whole budget to fit shards into.
+    // This pass is not the dense DE workspace, but it is not free either: the
+    // accumulator is `(n_groups + 1) x n_vars` u64s, which on a 5 000-target
+    // screen across 30 000 genes is ~1.2 GB. Charge it, so the prefetch cannot
+    // be granted depth on top of memory already committed.
+    let n_vars = source.n_vars();
+    let acc_bytes = (n_groups as u64)
+        .saturating_add(1)
+        .saturating_mul(n_vars as u64)
+        .saturating_mul(8);
     let depth = depth.map_or_else(
-        || crate::mem_budget::de_prefetch_depth(source.shard_size_hint(), 0),
+        || crate::mem_budget::de_prefetch_depth(source.shard_size_hint(), acc_bytes),
         |d| d.max(1),
     );
-    let mut acc = GroupNonzeroCounts::new(groups, n_groups, source.n_vars());
-    let mut row_offset = 0usize;
-    crate::prefetch::for_each_shard_ordered(source, depth, |_shard_idx, shard| {
-        acc.add_csr(&shard, row_offset, groups)?;
-        row_offset += shard.n_rows();
+    let mut acc = GroupNonzeroCounts::new(groups, n_groups, n_vars);
+    let mut cursor = super::VisibleRowCursor::new(n_obs);
+    crate::prefetch::for_each_shard_ordered(source, depth, |shard_idx, shard| {
+        let base = cursor.advance(shard.n_rows(), shard_idx, "group nonzero counts")?;
+        acc.add_csr(&shard, base, groups)?;
         Ok(())
     })?;
-    if row_offset != n_obs {
-        return Err(AccelError::ShapeError(format!(
-            "group nonzero counts: shards cover {row_offset} rows but the source reports n_obs = {n_obs}"
-        )));
-    }
+    cursor.finish("group nonzero counts")?;
     Ok(acc)
 }
 

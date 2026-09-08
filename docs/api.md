@@ -2604,9 +2604,12 @@ Confirm which path actually ran via the [route metadata](#accelerator-route-meta
 
 #### `gene_chunk_size` and DE memory
 
-`rank_genes_groups`, `rank_genes_groups_df`, `pdex_ref` and `pdex_nb_glm` process
-genes in chunks, densifying `n_obs × gene_chunk_size` `f32` per chunk (default
-`None` → 500 genes) and ranking that. The chunk is clamped to
+`rank_genes_groups`, `pdex_ref`, and `rank_genes_groups_df` **in compute mode**
+(`groupby=`) process genes in chunks, densifying `n_obs × gene_chunk_size` `f32`
+per chunk (default `None` → 500 genes) and ranking that. Extraction mode
+(`group=`) reads `uns[key]` and densifies nothing. `pdex_nb_glm` accepts the
+kwarg but does **not** chunk — it holds all genes in memory and warns that
+`gene_chunk_size` is not implemented — so none of this section applies to it. The chunk is clamped to
 `SCX_ACCEL_DE_MEMORY_BUDGET` (default 4 GiB) — an atlas-scale `n_obs` with a
 large chunk would otherwise request hundreds of GB — and a request that cannot
 fit even 32 genes raises rather than letting the allocation fail.

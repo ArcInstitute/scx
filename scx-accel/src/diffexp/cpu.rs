@@ -737,7 +737,11 @@ fn warn_if_de_cache_undersized<S: ShardSource + ?Sized>(
     n_chunks: usize,
     context: &str,
 ) {
-    let Some(cache_cap) = source.shard_cache_capacity() else {
+    // `None` is a non-caching source and `Some(0)` an explicitly disabled cache
+    // — in both, every `read_shard_arc` re-decodes by design, so there is no
+    // cache to size and nothing to advise. Warning on `0` told a caller who had
+    // just asked for no cache to make their cache bigger.
+    let Some(cache_cap) = source.shard_cache_capacity().filter(|&c| c > 0) else {
         return;
     };
     let visited = source
@@ -762,13 +766,18 @@ fn resolve_de_prefetch_depth<S: ShardSource + ?Sized>(
     source: &S,
     pinned: Option<usize>,
     n_obs: usize,
-    gene_chunk_size: usize,
+    active_chunk: usize,
 ) -> usize {
     if let Some(depth) = pinned {
         return depth.max(1);
     }
+    // `active_chunk` is the chunk actually allocated — `min(gene_chunk_size,
+    // n_vars)`, not the request. Charging the request instead would bill memory
+    // that is never committed and could force depth 1 on a narrow gene view:
+    // 10 M cells projected to 10 genes clamps to ~107 genes, a ~400 MB buffer,
+    // while the request would have charged ~4 GiB.
     let dense_bytes = (n_obs as u64)
-        .saturating_mul(gene_chunk_size as u64)
+        .saturating_mul(active_chunk as u64)
         .saturating_mul(4);
     crate::mem_budget::de_prefetch_depth(source.shard_size_hint(), dense_bytes)
 }
@@ -804,42 +813,37 @@ fn fill_gene_chunk_dense<S: ShardSource + Sync + ?Sized>(
     source: &S,
     col_indices: &[u32],
     n_obs: usize,
-    chunk_size: usize,
     depth: usize,
     dense: &mut [f32],
     context: &str,
 ) -> Result<()> {
+    // Derived, not a parameter: it must equal `col_indices.len()`, and nothing
+    // could check that a caller's separate `chunk_size` agreed. A smaller one
+    // would let a projected column index spill into the next cell's row.
+    let chunk_size = col_indices.len();
     let dense = &mut dense[..n_obs * chunk_size];
     dense.fill(0.0);
-    let mut global_row = 0usize;
+    let mut cursor = super::VisibleRowCursor::new(n_obs);
     crate::prefetch::for_each_shard_ordered(source, depth, |shard_idx, shard_csr| {
         let _r = scx_format_io::reduction_guard();
         let projected = scx_engine::project_csr(&shard_csr, col_indices);
         let rows = projected.n_rows();
-        if global_row + rows > n_obs {
-            return Err(crate::AccelError::ShapeError(format!(
-                "{context}: shard {shard_idx} has {rows} rows, exceeding n_obs = {n_obs} at row \
-                 {global_row}"
-            )));
-        }
+        let base = cursor.advance(rows, shard_idx, context)?;
         for row in 0..rows {
+            // A per-row slice: the row's base offset is computed once per row
+            // rather than once per nonzero, the bounds check is one per row
+            // rather than one per value, and a column index outside the chunk
+            // cannot reach the next cell's row.
+            let out = &mut dense[(base + row) * chunk_size..(base + row + 1) * chunk_size];
             let start = projected.indptr[row] as usize;
             let end = projected.indptr[row + 1] as usize;
             for j in start..end {
-                let col = projected.indices[j] as usize;
-                dense[(global_row + row) * chunk_size + col] = projected.data[j];
+                out[projected.indices[j] as usize] = projected.data[j];
             }
         }
-        global_row += rows;
         Ok(())
     })?;
-    if global_row != n_obs {
-        return Err(crate::AccelError::ShapeError(format!(
-            "{context}: the shards visited cover {global_row} rows but the source reports \
-             n_obs = {n_obs}"
-        )));
-    }
-    Ok(())
+    cursor.finish(context)
 }
 
 /// Gene-chunked streaming Wilcoxon rank-sum over a CSR [`ShardSource`].
@@ -962,13 +966,14 @@ pub(crate) fn wilcoxon_rank_sum_streaming_with_depth<S: ShardSource + Sync + ?Si
 
     let n_chunks = n_vars.div_ceil(gene_chunk_size);
     warn_if_de_cache_undersized(source, n_chunks, "wilcoxon_rank_sum_streaming");
-    let depth = resolve_de_prefetch_depth(source, depth, n_obs, gene_chunk_size);
+    let active_chunk = gene_chunk_size.min(n_vars);
+    let depth = resolve_de_prefetch_depth(source, depth, n_obs, active_chunk);
 
     // One dense workspace for the whole call, re-zeroed per chunk (the trailing
     // chunk is narrower, so `fill_gene_chunk_dense` slices the active sub-range
     // down). The CSC kernels have always done this; the CSR ones allocated a
     // fresh buffer per chunk.
-    let mut dense = vec![0.0f32; n_obs.saturating_mul(gene_chunk_size.min(n_vars))];
+    let mut dense = vec![0.0f32; n_obs.saturating_mul(active_chunk)];
     let mut all_chunk_results = Vec::new();
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
@@ -980,7 +985,6 @@ pub(crate) fn wilcoxon_rank_sum_streaming_with_depth<S: ShardSource + Sync + ?Si
             source,
             &col_indices,
             n_obs,
-            chunk_size,
             depth,
             &mut dense,
             "wilcoxon_rank_sum_streaming",
@@ -1799,11 +1803,12 @@ pub(crate) fn pdex_ref_streaming_with_depth<S: ShardSource + Sync + ?Sized>(
 
     let n_chunks = n_vars.div_ceil(gene_chunk_size);
     warn_if_de_cache_undersized(source, n_chunks, "pdex_ref_streaming");
-    let depth = resolve_de_prefetch_depth(source, depth, n_obs, gene_chunk_size);
+    let active_chunk = gene_chunk_size.min(n_vars);
+    let depth = resolve_de_prefetch_depth(source, depth, n_obs, active_chunk);
 
     // One dense workspace for the whole call — see the note in
     // `wilcoxon_rank_sum_streaming_with_depth`.
-    let mut dense = vec![0.0f32; n_obs.saturating_mul(gene_chunk_size.min(n_vars))];
+    let mut dense = vec![0.0f32; n_obs.saturating_mul(active_chunk)];
     let mut combined: Option<PdexRefResult> = None;
 
     for chunk_start in (0..n_vars).step_by(gene_chunk_size) {
@@ -1815,7 +1820,6 @@ pub(crate) fn pdex_ref_streaming_with_depth<S: ShardSource + Sync + ?Sized>(
             source,
             &col_indices,
             n_obs,
-            chunk_size,
             depth,
             &mut dense,
             "pdex_ref_streaming",

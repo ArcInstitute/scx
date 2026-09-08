@@ -224,6 +224,36 @@ fn the_pts_pass_skips_the_shards_a_row_projection_empties() {
     assert_eq!(streamed, oracle);
 }
 
+/// The depth knob is not decoration: the prefetch pipeline's sequential
+/// fallback is silent and produces identical counts, so "did it engage" is only
+/// observable by pinning `d = 1` against `d > 1` and looking at which thread
+/// decoded. Wilcoxon and pdex carry the same pair.
+#[test]
+fn the_pts_pass_decodes_shards_concurrently() {
+    use crate::test_support::{assert_prefetch_engaged, pool_can_prefetch, GaugedSource};
+
+    if !pool_can_prefetch() {
+        return;
+    }
+    let src = GaugedSource::new(gauged_pts_shards(), 12, 4);
+    let groups: Vec<usize> = (0..12).map(|i| i % 2).collect();
+    group_nonzero_counts_streaming_with_depth(&src, &groups, 2, Some(4)).unwrap();
+    assert_prefetch_engaged(&src, "group_nonzero_counts_streaming");
+}
+
+#[test]
+fn depth_one_decodes_pts_shards_on_the_calling_thread() {
+    use crate::test_support::GaugedSource;
+
+    let src = GaugedSource::new(gauged_pts_shards(), 12, 4);
+    let groups: Vec<usize> = (0..12).map(|i| i % 2).collect();
+    group_nonzero_counts_streaming_with_depth(&src, &groups, 2, Some(1)).unwrap();
+    assert!(
+        !src.decoded_off_thread(std::thread::current().id()),
+        "depth 1 must decode inline on the calling thread"
+    );
+}
+
 #[test]
 fn without_a_projection_the_pts_pass_reads_every_shard() {
     use crate::test_support::GaugedSource;
