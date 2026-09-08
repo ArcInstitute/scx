@@ -13,6 +13,7 @@ pub mod delete;
 pub mod error;
 pub mod external_layer;
 pub mod external_obs;
+pub mod external_var;
 pub mod flock;
 pub mod group_plan;
 pub mod helpers;
@@ -55,6 +56,10 @@ pub use external_obs::{
     diagnose_obs_key, drop_batch_columns, obs_key_values, resolve_obs_key_column, AttachObsOptions,
     AttachObsSummary, AxisJoinKey, ExternalObsData, KeyDiagnosis, ObsFrameRowSpace, ObsJoinKey,
     ObsRewrite, COMPOSITE_KEY_SEPARATOR,
+};
+pub use external_var::{
+    attach_external_var, diagnose_var_key, resolve_var_key_column, AttachVarOptions,
+    AttachVarSummary, ExternalVarData,
 };
 pub use group_plan::{plan_group_shards, GroupPlan, GroupRecord, Role};
 pub use merge::{merge, merge_with_index_options, merge_with_options};
