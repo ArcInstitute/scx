@@ -45,7 +45,8 @@ first if you want a way back.
 | **sort `--shuffle`** | New file (`<OUTPUT>` required) | Same rewrite, but rows are reordered by a **seeded random permutation** instead of a key (seed recorded in provenance) | Rewritten in shuffled order | Unchanged | **Dropped** unless `--rebuild-csc` | Rebuilt as for `sort`, but a shuffle **maximally scatters** each value's shard ranges — the opposite of what a sort does to them | **Applied** — as for `sort` |
 | **build-csc** | In place, or a new file with `<OUTPUT>` | **Re-emitted** (not re-encoded or canonicalized); row-group framing is preserved from the input | **Preserved** | **Preserved** | **Built** (this is the op that creates it) | Sections **copied verbatim** (shard boundaries are unchanged, so their `ShardRange`s stay valid), and the per-shard catalog column stats are **carried from the input**, so **Level-1** shard pruning survives. See the note below | **Carried** verbatim (a 1:1 re-emit; the CSC sidecar is built over the physical rows, which the vector still indexes correctly) |
 | **obs-import** / **doublet-import** / **attach_obs_columns** | In place (`<FILE> <SOURCE>` / `pyscx.attach_obs_columns(path, df)`) | **Unchanged** (never read or rewritten) | Replaced (same `n_obs`, plus the new columns) | **Preserved** | **Preserved** (X untouched) | **Preserved** on a pure column *add*; dropped only when `--overwrite` rewrites an indexed column (`obs_index_would_go_stale` decides). The per-shard catalog column stats are cleared **per rewritten column** — see the note below | **Preserved** (X untouched) |
-| **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns) | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | Same as **obs-import**: preserved on a pure column *add*, dropped when `overwrite` rewrites an indexed obs column, and the column stats cleared per rewritten column | **Preserved** (X untouched) |
+| **var-import** / **attach_var_columns** | In place (`<FILE> <SOURCE>` / `pyscx.attach_var_columns(path, df)`) | **Unchanged** (never read or rewritten) | **Preserved** (never read or rewritten) | Replaced (same `n_vars`, plus the new columns); a sharded var keeps its shard boundaries, a single section stays one section | **Preserved** (X untouched) | The **obs** index and the per-shard obs column stats are untouched — this op writes no obs column. The **var** index survives a pure column *add* and is **rebuilt** (not dropped) when `overwrite` rewrites a column it covers; there are no per-shard var column stats to clear | **Preserved** (X untouched) |
+| **cellbender-import** (`attach_external_layer`) | In place (`<FILE> <CELLBENDER_H5>`) | **Unchanged** (never read or rewritten); a new layer's shards are appended | Replaced (same `n_obs`, plus the new columns) | Replaced (same `n_vars`, plus the new columns); a sharded var keeps its boundaries | **Preserved** (X untouched, so `data_generation` / `csc_build_generation` are unchanged) | **obs**: as **obs-import** — preserved on a pure add, dropped when `overwrite` rewrites an indexed obs column, column stats cleared per rewritten column. **var**: preserved on a pure add, **rebuilt** when `overwrite` rewrites a column it covers | **Preserved** (X untouched) |
 | **rollback** | In place (`<FILE>`) | Unchanged (header repoints to previous catalog) | Unchanged | Unchanged | Restored (if previous catalog referenced it) | Restored | Restored (as of the previous catalog) |
 
 ### Everything the matrix above does not have a column for
@@ -342,6 +343,7 @@ The three in-place ops therefore clear what they invalidate:
 | `modify_metadata` with `obs=` | **all** columns — obs is replaced wholesale and the op cannot tell an added column from a rewritten one. Re-derived instead of cleared whenever an index is built — which now includes the carry-forward, so an indexed file keeps its pruning — **and** that build can be mapped onto the CSR shards (see below). |
 | `obs-import` / `doublet-import` / `attach_obs_columns` | only the columns the import writes. It joins by key (or lands rows positionally) and never reorders rows, so an untouched column's stats stay true. |
 | `cellbender-import` | the same, over `status_column` / row annotations / `row_sum_column`. |
+| `var-import` / `attach_var_columns` | **nothing.** These stats are keyed by *obs* column name and a var attach writes no obs column. There is no var equivalent — var's predicate index is one batch-mode build over `[(0, n_vars)]`, and Level-1 pruning has nothing per-shard to read on that axis — so a var attach clears none and rebuilds the var index instead. |
 
 The scoped clears are **not** conditional on whether an `ObsPredicateIndex` is
 still present: a file can carry stats with no index — a `modify_metadata` obs
@@ -667,6 +669,9 @@ whose `uns` is not a JSON object is refused before any write, and so is one
 whose `uns` section exists but cannot be read (checksum / JSON error) — it is
 never mistaken for an absent one and replaced.
 
+For the per-gene twin of everything in this section, see
+[§ External var import](#external-var-import).
+
 `obs_import` is the recommended way to **add or patch obs columns on an
 existing SCX file** — including from pipeline steps. A step whose only output
 is a new per-cell column (a batch key, a score, a QC flag) should
@@ -876,6 +881,66 @@ recent one and leaves earlier imports standing. Three successive imports then on
 rollback leaves the first two sets of columns in place, with queries and pushdown
 still working against them. There is no way to undo an import from the middle of
 that chain.
+
+## External var import
+
+`scx var-import <target.scx> <genes.csv>` / `pyscx.var_import` land per-**gene**
+annotations computed outside SCX — a normalised symbol from a reference
+release, an ATAC peak annotation, a curated gene-set flag — onto an existing
+file as `var` columns. `pyscx.attach_var_columns` takes an in-memory pandas
+`DataFrame` (or pyarrow `Table`) directly, and `rscx::scx_attach_var` an R
+`data.frame`. The delimited-table reader is **ungated** (no libhdf5); an
+`.h5ad`'s `/var` needs `--features hdf5`.
+
+Everything in [§ External obs import](#external-obs-import) about the join
+applies unchanged, on the var axis: by key string never by row position, genes
+the source does not cover get `null` rather than a fabricated `0.0`,
+`overwrite` **replaces and never merges**, and `pyscx.diagnose_var_key` /
+`--dry-run` name a usable key when the obvious one is duplicated. `key=None`
+resolves the var index first, then `gene_id` / `gene_ids` / `id` /
+`feature_id` / `gene_name` / `gene_symbol` / `name`; `var_names` names the var
+index on either side of the join.
+
+The alternative it replaces is `modify_metadata(var=<whole new frame>)`, which
+requires reading var, joining in pandas, and handing back every column — so
+adding one column means being trusted with all of them.
+
+### The var layout survives
+
+Whatever layout var arrived in, it leaves in: a sharded var (`VarMetadataShard`
+sections — what `from_anndata` writes once `n_vars > shard_target_rows`, and
+what `optimize` preserves) is rewritten one shard at a time with the **same
+boundaries**, and a single `VarMetadata` section stays a single section. The
+summary's `var_streamed` reports which path ran.
+
+This deliberately differs from the obs importers, which upgrade a legacy
+single-section obs to shards. Nothing in the ingest tree creates var shards,
+and `merge` / `compact` / `modify_metadata` all collapse var back to one
+section — so an attach is the wrong place to change a file's layout.
+
+### The var predicate index is rebuilt, not dropped
+
+A pure column *add* leaves it valid, so it is carried verbatim. An
+**overwrite** of a column it covers would leave it describing values that are
+gone — so it is rebuilt from the new table, which `modify_metadata` already
+does for both axes. Unlike obs there is nothing streaming about it: var's index
+is one batch-mode build over the single range `[(0, n_vars)]` and the new table
+is already in memory. `var_index_rebuilt` says whether it happened, and
+`var_columns_not_carried` names any column the rebuild could not cover (one
+whose new dtype cannot be indexed) rather than dropping it silently.
+
+Note that no query path reads the var predicate index today: `filter_var`
+evaluates its predicates directly against the assembled `var` batch. Keeping
+the section honest is still right — it is what every rewrite op's carry logic
+reads, and what a later pushdown implementation would — but this is not the
+pushdown-performance property the obs half is.
+
+### A multimodal file is refused
+
+Each modality owns its own `var/<name>` section, so "the var axis" is ambiguous
+on a multimodal file and the op refuses it (`MultimodalUnsupported`), as
+`attach_external_layer` and `modify_metadata` do. Extract one modality with
+`scx subset --modality NAME`, attach, then `scx merge` back.
 
 ## Rollback
 

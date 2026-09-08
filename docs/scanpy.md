@@ -700,6 +700,37 @@ predicate index over the rewritten values rather than dropping it. Full
 behaviour and the predicate-index interaction:
 [docs/operations.md § External obs import](operations.md#external-obs-import).
 
+### Landing external per-gene annotations
+
+The same seam on the other axis. A step whose output is one value per *gene* —
+a normalised symbol resolved against a reference release, an ATAC peak
+annotation, a curated gene-set flag — lands with `pyscx.var_import` (a table on
+disk, or an `.h5ad`'s `/var`), `pyscx.attach_var_columns` (an in-memory
+DataFrame) or `rscx::scx_attach_var`:
+
+```python
+import pyscx
+
+# A table a gene-label normaliser wrote, keyed on Ensembl ids.
+pyscx.var_import("atlas.scx", "symbols.csv", key="var_names")
+
+# Or a frame computed here, from the file's own var.
+exp = pyscx.open("atlas.scx")
+v = exp.read_var()
+v["is_hvg"] = v.index.isin(hvg_ids)
+pyscx.attach_var_columns(exp, v[["is_hvg"]], key="var_names")
+```
+
+Same rules as the obs side: key-joined never positional, `null` for genes the
+source does not cover, `overwrite` replaces rather than merges, `dry_run=True`
+previews the join, and one `pyscx.rollback` undoes it. `pyscx.diagnose_var_key`
+names a usable key when `var_names` is duplicated — which happens on
+concatenated files, where symbols repeat and only (symbol, id) is unique.
+
+The alternative — `modify_metadata(var=<whole new frame>)` — still exists and
+is the right call when you genuinely mean to replace the table. Full behaviour:
+[docs/operations.md § External var import](operations.md#external-var-import).
+
 ## Validating files after write or transfer
 
 `pyscx.open(path)` and `pyscx.open(path, verify=True)` authenticate the file
