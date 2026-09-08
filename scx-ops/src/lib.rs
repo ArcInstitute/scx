@@ -53,9 +53,9 @@ pub use external_layer::{
 };
 pub use external_obs::{
     attach_external_obs, build_composite_key, build_composite_key_for, classify_obs_frame_length,
-    diagnose_obs_key, drop_batch_columns, obs_key_values, resolve_obs_key_column, AttachObsOptions,
-    AttachObsSummary, AxisJoinKey, ExternalObsData, KeyDiagnosis, ObsFrameRowSpace, ObsJoinKey,
-    ObsRewrite, COMPOSITE_KEY_SEPARATOR,
+    diagnose_obs_key, drop_batch_columns, obs_key_values, resolve_axis_key_column,
+    resolve_obs_key_column, AttachObsOptions, AttachObsSummary, AxisJoinKey, ExternalObsData,
+    KeyDiagnosis, ObsFrameRowSpace, ObsJoinKey, ObsRewrite, COMPOSITE_KEY_SEPARATOR,
 };
 pub use external_var::{
     attach_external_var, diagnose_var_key, resolve_var_key_column, AttachVarOptions,

@@ -59,9 +59,7 @@ use arrow::csv::reader::Format;
 use arrow::csv::ReaderBuilder;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use scx_ops::{
-    build_composite_key, obs_key_values, resolve_obs_key_column, ExternalObsData, OpsError, Result,
-};
+use scx_ops::{obs_key_values, ExternalObsData, OpsError, Result};
 
 use crate::file_checksum::blake3_of_file;
 
@@ -266,6 +264,21 @@ pub fn read_annotation_table(
     path: &Path,
     opts: &AnnotationTableOptions,
 ) -> Result<(ExternalObsData, AnnotationTableInfo)> {
+    let (src, info) = read_annotation_table_for("obs", path, opts)?;
+    Ok((src.into_obs_data(), info))
+}
+
+/// [`read_annotation_table`] on a named axis.
+///
+/// `axis` picks the key-resolution vocabulary — the fallback spellings
+/// (`barcode`/`cell_id` vs `gene_id`/`feature_id`), the index alias
+/// (`obs_names` vs `var_names`) and the axis named in every error. Everything
+/// else about reading a delimited table is the same on both axes.
+pub fn read_annotation_table_for(
+    axis: &'static str,
+    path: &Path,
+    opts: &AnnotationTableOptions,
+) -> Result<(AnnotationSource, AnnotationTableInfo)> {
     let delimiter = resolve_delimiter(path, opts.delimiter)?;
     let format = base_format(delimiter)?;
 
@@ -308,33 +321,18 @@ pub fn read_annotation_table(
     );
     let header_batch = RecordBatch::new_empty(Arc::new(as_text));
     let key_columns: Vec<String> = if opts.key_columns.is_empty() {
-        vec![resolve_obs_key_column(&header_batch, None)?]
+        vec![scx_ops::resolve_axis_key_column(axis, &header_batch, None)?]
     } else {
-        // `obs_names` resolves here too, not just on the target side: an
-        // unnamed CSV index column is renamed to `_index` above, and the
-        // diagnosis tells users every name it reports is paste-able into
-        // `key=`. Resolving per component keeps that promise for a source table
-        // whose key IS its index. The error still quotes what the user typed.
-        let mut resolved = Vec::with_capacity(opts.key_columns.len());
-        for k in &opts.key_columns {
-            let physical = scx_ops::resolve_key_alias("obs", &schema, k);
-            if schema.field_with_name(&physical).is_err() {
-                let present: Vec<String> = schema
-                    .fields()
-                    .iter()
-                    .map(|f| scx_ops::display_key_name("obs", f.name()))
-                    .collect();
-                return Err(OpsError::KeyColumnUnresolved {
-                    axis: "obs",
-                    detail: format!(
-                        "key column '{k}' not found in '{}'; columns present are {present:?}",
-                        path.display()
-                    ),
-                });
-            }
-            resolved.push(physical);
-        }
-        resolved
+        // `obs_names` / `var_names` resolve here too, not just on the target
+        // side: an unnamed CSV index column is renamed to `_index` above, and
+        // the diagnosis tells users every name it reports is paste-able into
+        // `key=`. The error still quotes what the user typed.
+        resolve_source_key_columns(
+            axis,
+            &schema,
+            &opts.key_columns,
+            &format!("'{}'", path.display()),
+        )?
     };
 
     // --- Real read ----------------------------------------------------------
@@ -364,7 +362,7 @@ pub fn read_annotation_table(
     let row_keys = if key_columns.len() == 1 {
         obs_key_values(&table, &key_columns[0])?
     } else {
-        build_composite_key(&table, &key_columns)?
+        scx_ops::build_composite_key_for(axis, &table, &key_columns)?
     };
 
     // --- Project the annotations -------------------------------------------
@@ -387,10 +385,9 @@ pub fn read_annotation_table(
     };
 
     Ok((
-        ExternalObsData {
+        AnnotationSource {
             row_keys,
             row_annotations,
-            row_embeddings: Vec::new(),
             uns: serde_json::Map::new(),
             source_checksum: blake3_of_file(path).ok(),
             source_name: path.file_name().map(|s| s.to_string_lossy().to_string()),
@@ -488,6 +485,79 @@ pub(crate) fn project_annotations(
         .map_err(|e| OpsError::InvalidInput(format!("failed to build annotation columns: {e}")))
 }
 
+/// Resolve the source-side key column(s) for `axis` against `schema`.
+///
+/// Shared by the delimited and h5ad readers, on both axes: four copies of this
+/// loop is four places for the source side to disagree with the target side
+/// about what a key name means, and a disagreement there produces a join with
+/// zero overlap and no obvious cause.
+///
+/// `where_` names the location in the error (`'file.csv'`, `/var of 'f.h5ad'`).
+pub(crate) fn resolve_source_key_columns(
+    axis: &'static str,
+    schema: &Schema,
+    key_columns: &[String],
+    where_: &str,
+) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(key_columns.len());
+    for k in key_columns {
+        // The axis-index alias resolves on the source side too, so
+        // `key="var_names"` works against a table whose key IS its index.
+        let physical = scx_ops::resolve_key_alias(axis, schema, k);
+        if schema.field_with_name(&physical).is_err() {
+            let present: Vec<String> = schema
+                .fields()
+                .iter()
+                .map(|f| scx_ops::display_key_name(axis, f.name()))
+                .collect();
+            return Err(OpsError::KeyColumnUnresolved {
+                axis,
+                detail: format!(
+                    "key column '{k}' not found in {where_}; columns present are {present:?}"
+                ),
+            });
+        }
+        resolved.push(physical);
+    }
+    Ok(resolved)
+}
+
+/// What a reader produces, before it is wrapped for one axis or the other.
+///
+/// The two readers are axis-neutral apart from key resolution and the struct
+/// they return, so they build this and each entry point converts it.
+#[derive(Debug)]
+pub struct AnnotationSource {
+    pub row_keys: Vec<String>,
+    pub row_annotations: RecordBatch,
+    pub uns: serde_json::Map<String, serde_json::Value>,
+    pub source_checksum: Option<[u8; 32]>,
+    pub source_name: Option<String>,
+}
+
+impl AnnotationSource {
+    pub fn into_obs_data(self) -> ExternalObsData {
+        ExternalObsData {
+            row_keys: self.row_keys,
+            row_annotations: self.row_annotations,
+            row_embeddings: Vec::new(),
+            uns: self.uns,
+            source_checksum: self.source_checksum,
+            source_name: self.source_name,
+        }
+    }
+
+    pub fn into_var_data(self) -> scx_ops::ExternalVarData {
+        scx_ops::ExternalVarData {
+            row_keys: self.row_keys,
+            row_annotations: self.row_annotations,
+            uns: self.uns,
+            source_checksum: self.source_checksum,
+            source_name: self.source_name,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Source dispatch
 // ---------------------------------------------------------------------------
@@ -551,6 +621,74 @@ pub fn read_obs_source(
         }
         ObsSourceFormat::H5ad => read_h5ad_obs_dispatch(path, opts, uns_keys),
     }
+}
+
+/// Read per-gene annotations from a delimited table **or** an h5ad's `/var`.
+///
+/// The var-axis twin of [`read_obs_source`], and the single entry point
+/// `var_import` goes through. `uns_keys` is honoured only by the h5ad reader; a
+/// delimited table carries no `uns`.
+pub fn read_var_source(
+    path: &Path,
+    opts: &AnnotationTableOptions,
+    uns_keys: &[String],
+) -> Result<(scx_ops::ExternalVarData, AnnotationTableInfo)> {
+    // An h5mu keeps var per modality at `/mod/<name>/var`, so there is no one
+    // `/var` to read — the same reasoning as obs, and the same route out.
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("h5mu"))
+    {
+        return Err(OpsError::InvalidInput(format!(
+            "'{}' is multimodal: its var lives at /mod/<modality>/var, so there is no \
+             single var table to import. Extract one modality first — \
+             `scx subset --modality rna` — or read the modality in Python and write \
+             its var to a CSV.",
+            path.display()
+        )));
+    }
+
+    match sniff_obs_source(path) {
+        ObsSourceFormat::Table => {
+            if !uns_keys.is_empty() {
+                return Err(OpsError::InvalidInput(format!(
+                    "uns keys {uns_keys:?} were requested, but '{}' is a delimited table \
+                     and carries no uns. Drop the request, or import from an h5ad.",
+                    path.display()
+                )));
+            }
+            let (src, info) = read_annotation_table_for("var", path, opts)?;
+            Ok((src.into_var_data(), info))
+        }
+        ObsSourceFormat::H5ad => read_h5ad_var_dispatch(path, opts, uns_keys),
+    }
+}
+
+#[cfg(feature = "hdf5")]
+fn read_h5ad_var_dispatch(
+    path: &Path,
+    opts: &AnnotationTableOptions,
+    uns_keys: &[String],
+) -> Result<(scx_ops::ExternalVarData, AnnotationTableInfo)> {
+    let (src, info) = crate::h5ad_obs::read_h5ad_axis("var", path, opts, uns_keys)?;
+    Ok((src.into_var_data(), info))
+}
+
+/// Without `hdf5` there is no reader, but the failure must still name the way
+/// through — the CSV path works in this build and produces the same result.
+#[cfg(not(feature = "hdf5"))]
+fn read_h5ad_var_dispatch(
+    path: &Path,
+    _opts: &AnnotationTableOptions,
+    _uns_keys: &[String],
+) -> Result<(scx_ops::ExternalVarData, AnnotationTableInfo)> {
+    Err(OpsError::InvalidInput(format!(
+        "'{}' is an HDF5 file, but this build has no HDF5 support (the 'hdf5' feature \
+         is off). Write the columns to a table first, e.g. \
+         `adata.var[[\"gene_symbol\"]].to_csv(\"genes.csv\")`, and import that.",
+        path.display()
+    )))
 }
 
 #[cfg(feature = "hdf5")]

@@ -733,3 +733,126 @@ fn project_annotations_keeps_field_metadata() {
         "projection dropped the ordered stamp"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The var axis
+//
+// Same reader, different key vocabulary. The two things worth pinning are that
+// `key=None` resolves through the *gene* fallbacks rather than the barcode ones
+// (they are disjoint, so a shared list would be visible immediately), and that
+// the h5mu / uns refusals name var rather than obs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_var_table_resolves_its_key_through_the_gene_fallbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    // Carries a `barcode` column too: if the var axis were resolving through
+    // the obs fallback list, it would key on that and every gene would miss.
+    let p = write_file(
+        dir.path(),
+        "genes.csv",
+        "barcode,gene_id,gene_symbol\nnot_a_key,ENSG1,TP53\nalso_not,ENSG2,MYC\n",
+    );
+    let (data, info) = read_var_source(&p, &opts(), &[]).unwrap();
+    assert_eq!(info.key_columns, vec!["gene_id".to_string()]);
+    assert_eq!(
+        data.row_keys,
+        vec!["ENSG1".to_string(), "ENSG2".to_string()]
+    );
+    let cols: Vec<String> = data
+        .row_annotations
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        cols,
+        vec!["barcode".to_string(), "gene_symbol".to_string()],
+        "only the key column is consumed by the join"
+    );
+}
+
+#[test]
+fn var_names_keys_a_var_table_on_its_unnamed_index() {
+    let dir = tempfile::tempdir().unwrap();
+    // pandas `to_csv` on a var frame: unnamed leading index column.
+    let p = write_file(dir.path(), "v.csv", ",gene_symbol\nENSG1,TP53\nENSG2,MYC\n");
+    let o = AnnotationTableOptions {
+        key_columns: vec!["var_names".to_string()],
+        ..opts()
+    };
+    let (data, info) = read_var_source(&p, &o, &[]).unwrap();
+    assert_eq!(info.key_columns, vec!["_index".to_string()]);
+    assert!(info.renamed_index_column);
+    assert_eq!(
+        data.row_keys,
+        vec!["ENSG1".to_string(), "ENSG2".to_string()]
+    );
+}
+
+#[test]
+fn a_var_composite_key_is_fused_by_the_shared_builder() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(
+        dir.path(),
+        "v.csv",
+        "gene_symbol,gene_id,score\nDUP,e1,0.5\nDUP,e2,0.75\n",
+    );
+    let o = AnnotationTableOptions {
+        key_columns: vec!["gene_symbol".to_string(), "gene_id".to_string()],
+        ..opts()
+    };
+    let (data, info) = read_var_source(&p, &o, &[]).unwrap();
+    assert_eq!(info.key_columns, vec!["gene_symbol", "gene_id"]);
+    let sep = scx_ops::COMPOSITE_KEY_SEPARATOR;
+    assert_eq!(
+        data.row_keys,
+        vec![format!("DUP{sep}e1"), format!("DUP{sep}e2")]
+    );
+}
+
+#[test]
+fn an_unknown_var_key_column_errors_naming_the_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "v.csv", "gene_id,score\nENSG1,0.5\n");
+    let o = AnnotationTableOptions {
+        key_columns: vec!["nope".to_string()],
+        ..opts()
+    };
+    let err = read_var_source(&p, &o, &[]).unwrap_err();
+    assert!(
+        matches!(&err, OpsError::KeyColumnUnresolved { axis, .. } if *axis == "var"),
+        "got {err}"
+    );
+    assert!(err.to_string().contains("gene_id"));
+}
+
+#[test]
+fn uns_keys_are_refused_for_a_delimited_var_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "v.csv", "gene_id,score\nENSG1,0.5\n");
+    let err = read_var_source(&p, &opts(), &["peaks".to_string()]).unwrap_err();
+    assert!(err.to_string().contains("carries no uns"), "{err}");
+}
+
+#[test]
+fn an_h5mu_var_source_is_refused_with_the_extraction_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "x.h5mu", "not really hdf5");
+    let err = read_var_source(&p, &opts(), &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("/mod/<modality>/var"), "{msg}");
+    assert!(msg.contains("subset --modality"), "{msg}");
+}
+
+#[cfg(not(feature = "hdf5"))]
+#[test]
+fn without_hdf5_an_h5ad_var_source_names_the_csv_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_file(dir.path(), "x.h5ad", "not really hdf5");
+    let err = read_var_source(&p, &opts(), &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("no HDF5 support"), "{msg}");
+    assert!(msg.contains("adata.var"), "{msg}");
+}

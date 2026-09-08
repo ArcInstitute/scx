@@ -489,7 +489,22 @@ pub fn build_composite_key_for(
 /// file that should have joined would fail with zero overlap and no obvious
 /// cause.
 pub fn resolve_obs_key_column(batch: &RecordBatch, requested: Option<&str>) -> Result<String> {
-    resolve_key_column("obs", &batch.schema(), requested)
+    resolve_axis_key_column("obs", batch, requested)
+}
+
+/// [`resolve_obs_key_column`] on a named axis, for readers that serve both.
+///
+/// `axis` selects the fallback spellings (`barcode` / `cell_id` versus
+/// `gene_id` / `feature_id`), the index alias (`obs_names` / `var_names`) and
+/// the axis named in the error. One entry point rather than a `match` at each
+/// reader: the source and target sides of a join must resolve a key by the same
+/// rules, and there are now four readers.
+pub fn resolve_axis_key_column(
+    axis: &'static str,
+    batch: &RecordBatch,
+    requested: Option<&str>,
+) -> Result<String> {
+    resolve_key_column(axis, &batch.schema(), requested)
 }
 
 /// Materialize a column as owned `String`s, resolving dictionaries. Exported

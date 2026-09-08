@@ -33,12 +33,11 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use scx_ops::{
-    build_composite_key, obs_key_values, resolve_obs_key_column, ExternalObsData, OpsError, Result,
-};
+use scx_ops::{obs_key_values, ExternalObsData, OpsError, Result};
 
 use crate::annotation_table::{
-    project_annotations, AnnotationTableInfo, AnnotationTableOptions, ObsSourceFormat,
+    project_annotations, resolve_source_key_columns, AnnotationSource, AnnotationTableInfo,
+    AnnotationTableOptions, ObsSourceFormat,
 };
 use crate::file_checksum::blake3_of_file;
 use crate::h5ad::read::{read_dataframe_group, read_uns};
@@ -53,21 +52,38 @@ pub fn read_h5ad_obs(
     opts: &AnnotationTableOptions,
     uns_keys: &[String],
 ) -> Result<(ExternalObsData, AnnotationTableInfo)> {
+    let (src, info) = read_h5ad_axis("obs", path, opts, uns_keys)?;
+    Ok((src.into_obs_data(), info))
+}
+
+/// [`read_h5ad_obs`] on a named axis: `"obs"` reads `/obs`, `"var"` reads
+/// `/var`.
+///
+/// The group name and the key vocabulary are the only differences — an h5ad's
+/// `/var` is a dataframe group of exactly the same shape, written by the same
+/// anndata code, and `read_dataframe_group` already resolves its `_index`
+/// attribute to the canonical `__index_level_0__`.
+pub fn read_h5ad_axis(
+    axis: &'static str,
+    path: &Path,
+    opts: &AnnotationTableOptions,
+    uns_keys: &[String],
+) -> Result<(AnnotationSource, AnnotationTableInfo)> {
     let file = hdf5::File::open(path).map_err(|e| {
         OpsError::InvalidInput(format!("could not open '{}' as HDF5: {e}", path.display()))
     })?;
 
     let mut sink = WarningSink::log();
-    let obs = read_dataframe_group(&file, "obs", &mut sink).map_err(|e| {
+    let obs = read_dataframe_group(&file, axis, &mut sink).map_err(|e| {
         OpsError::InvalidInput(format!(
-            "could not read /obs from '{}': {e}",
+            "could not read /{axis} from '{}': {e}",
             path.display()
         ))
     })?;
 
     if obs.num_rows() == 0 {
         return Err(OpsError::InvalidInput(format!(
-            "'{}' has an empty /obs; there is nothing to import",
+            "'{}' has an empty /{axis}; there is nothing to import",
             path.display()
         )));
     }
@@ -81,38 +97,23 @@ pub fn read_h5ad_obs(
     // borrowing field names straight out of it does not outlive the statement.
     let schema = obs.schema();
     let key_columns: Vec<String> = if opts.key_columns.is_empty() {
-        vec![resolve_obs_key_column(&obs, None)?]
+        vec![scx_ops::resolve_axis_key_column(axis, &obs, None)?]
     } else {
         // See `annotation_table.rs`: the axis-index alias resolves on the
         // source side too, so `key="obs_names"` works against an h5ad's own
         // obs index without a `source_key=`.
-        let mut resolved = Vec::with_capacity(opts.key_columns.len());
-        for k in &opts.key_columns {
-            let physical = scx_ops::resolve_key_alias("obs", &schema, k);
-            if schema.field_with_name(&physical).is_err() {
-                let present: Vec<String> = schema
-                    .fields()
-                    .iter()
-                    .map(|f| scx_ops::display_key_name("obs", f.name()))
-                    .collect();
-                return Err(OpsError::KeyColumnUnresolved {
-                    axis: "obs",
-                    detail: format!(
-                        "key column '{k}' not found in /obs of '{}'; columns present are \
-                         {present:?}",
-                        path.display()
-                    ),
-                });
-            }
-            resolved.push(physical);
-        }
-        resolved
+        resolve_source_key_columns(
+            axis,
+            &schema,
+            &opts.key_columns,
+            &format!("/{axis} of '{}'", path.display()),
+        )?
     };
 
     let row_keys = if key_columns.len() == 1 {
         obs_key_values(&obs, &key_columns[0])?
     } else {
-        build_composite_key(&obs, &key_columns)?
+        scx_ops::build_composite_key_for(axis, &obs, &key_columns)?
     };
 
     let row_annotations = project_annotations(&obs, &key_columns, opts)?;
@@ -139,10 +140,9 @@ pub fn read_h5ad_obs(
     };
 
     Ok((
-        ExternalObsData {
+        AnnotationSource {
             row_keys,
             row_annotations,
-            row_embeddings: Vec::new(),
             uns,
             source_checksum: blake3_of_file(path).ok(),
             source_name: path.file_name().map(|s| s.to_string_lossy().to_string()),
