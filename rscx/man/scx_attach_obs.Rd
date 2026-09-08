@@ -37,7 +37,9 @@ a multi-library merge where \code{sample_id} + \code{barcode} is unique but
 neither is alone. Mutually exclusive with \code{key}.}
 
 \item{key_column}{Target obs column to join \code{key} against.
-\code{NULL} auto-resolves it.}
+\code{NULL} auto-resolves it. It names the target side of a \code{key}
+join, so supplying it without \code{key} is an error rather than being
+silently ignored.}
 
 \item{prefix}{Prepended to every attached column name.}
 

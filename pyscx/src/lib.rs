@@ -1444,6 +1444,10 @@ fn register_ops(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ops::obs_import, m)?)?;
     m.add_function(wrap_pyfunction!(ops::attach_obs_columns, m)?)?;
     m.add_function(wrap_pyfunction!(ops::diagnose_obs_key, m)?)?;
+    // The var-axis twins, ungated for the same reason.
+    m.add_function(wrap_pyfunction!(ops::var_import, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::attach_var_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(ops::diagnose_var_key, m)?)?;
     m.add_function(wrap_pyfunction!(ops::doublet_import, m)?)?;
     m.add_function(wrap_pyfunction!(ops::doublet_tools, m)?)?;
     m.add_function(wrap_pyfunction!(ops::doublet_profiles, m)?)?;

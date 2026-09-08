@@ -97,6 +97,28 @@ def test_round_trip_joins_by_barcode_despite_reversed_source_order(target, tmp_d
         )
 
 
+def test_the_summary_reports_the_var_index_outcome(target, tmp_dir):
+    """cellbender_import writes var columns, so it reports what that did to the
+    var predicate index.
+
+    It used to report nothing: an `overwrite=True` of an indexed var column
+    removed it from the index with no key in the dict and no CLI line. The keys
+    are present on every import (a pure add is False/False/[]), so the shape of
+    the result does not depend on the data.
+    """
+    path, barcodes, genes = target
+    cb = tmp_dir / "cb.h5"
+    _write_cellbender_h5(cb, barcodes, genes, lambda bc: 1)
+
+    summary = pyscx.cellbender_import(str(path), str(cb))
+    for k in ("var_index_rebuilt", "var_index_dropped", "var_columns_not_carried"):
+        assert k in summary, f"the summary must always carry {k}"
+    # This fixture carries no var predicate index, so nothing was staled.
+    assert summary["var_index_rebuilt"] is False
+    assert summary["var_index_dropped"] is False
+    assert summary["var_columns_not_carried"] == []
+
+
 def test_emits_obs_var_and_uns_diagnostics(target, tmp_dir):
     path, barcodes, genes = target
     cb = tmp_dir / "cb.h5"

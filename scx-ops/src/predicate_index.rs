@@ -359,4 +359,35 @@ impl ObsVarIndexPass {
         }
         Ok(())
     }
+
+    /// [`Self::write_var`] without a writer: the serialised index and the
+    /// columns it actually covers.
+    ///
+    /// The in-place attaches need the *decision* before they open a writer,
+    /// because a `dry_run` has to report the same index outcome the real
+    /// import would produce — and which covered columns survive is only
+    /// knowable from the new values (a covered string column overwritten by a
+    /// float cannot be indexed). They then write these bytes rather than
+    /// building a second time.
+    ///
+    /// `None` bytes mean nothing could be indexed, so the caller's stale
+    /// section is *retired* rather than replaced — a different outcome from a
+    /// rebuild, and one the planning boolean cannot predict.
+    pub fn build_var_bytes(
+        &self,
+        var: &arrow::array::RecordBatch,
+        n_vars: u64,
+    ) -> Result<(Option<Vec<u8>>, Vec<String>)> {
+        let var_row_ranges: [(u64, u64); 1] = [(0, n_vars)];
+        let mut outcomes = Vec::new();
+        let mut covered = Vec::new();
+        let bytes = scx_engine::build_var_predicate_index_bytes(
+            var,
+            &var_row_ranges,
+            &self.resolved.var,
+            &mut outcomes,
+            &mut covered,
+        )?;
+        Ok((bytes, covered))
+    }
 }

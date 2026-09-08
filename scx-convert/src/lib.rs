@@ -31,16 +31,18 @@ mod tenx_read;
 // obs-import` would be unavailable in a no-hdf5 build.
 mod annotation_table;
 pub use annotation_table::{
-    read_annotation_table, read_obs_source, sniff_obs_source, AnnotationTableInfo,
-    AnnotationTableOptions, ObsSourceFormat,
+    read_annotation_table, read_annotation_table_for, read_obs_source, read_var_source,
+    sniff_obs_source, AnnotationSource, AnnotationTableInfo, AnnotationTableOptions,
+    ObsSourceFormat,
 };
 
-// The h5ad `/obs` reader behind `read_obs_source`'s H5ad arm. Gated like every
-// other h5ad path; the dispatcher keeps a clear error without it.
+// The h5ad dataframe-group reader behind `read_obs_source` / `read_var_source`'s
+// H5ad arms. Gated like every other h5ad path; the dispatchers keep a clear
+// error without it.
 #[cfg(feature = "hdf5")]
 mod h5ad_obs;
 #[cfg(feature = "hdf5")]
-pub use h5ad_obs::read_h5ad_obs;
+pub use h5ad_obs::{read_h5ad_axis, read_h5ad_obs};
 
 mod doublet;
 pub use doublet::{

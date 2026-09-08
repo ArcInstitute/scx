@@ -407,6 +407,18 @@ scx compact cite_merged.scx cite_compacted.scx                   # multimodal co
 > `pyscx.append` / `append_from_anndata` still work normally on single-modality
 > files (omit `modality=`).
 
+> **The var attach is refused too, for a different reason.**
+> `pyscx.var_import` / `attach_var_columns` / `rscx::scx_attach_var` and
+> `scx var-import` reject a multimodal target: each modality owns its own
+> `var/<name>` section, so "the var axis" names nothing on such a file. Unlike
+> append this is a scope decision rather than a correctness one — the in-place
+> harness is already modality-parameterised and per-modality var is a single
+> unsharded section — but the op does not model it and the obs twin has no
+> equivalent, so it refuses rather than guessing. Same workaround:
+> `scx subset --modality NAME`, attach, `scx merge` back. `attach_external_layer`
+> (`cellbender-import`), the other op that writes var, refuses multimodal on the
+> same grounds.
+
 Python equivalent for the export direction:
 
 ```python

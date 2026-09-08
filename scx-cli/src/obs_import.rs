@@ -22,7 +22,10 @@ use scx_ops::{AttachObsOptions, ExtraRowPolicy, MissingRowPolicy, ObsJoinKey};
 type CmdResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Split `--key a,b` into components. Empty (or absent) means auto-resolve.
-fn parse_key(key: Option<&str>) -> Vec<String> {
+///
+/// Shared with `var-import`: both commands accept the same spelling, and two
+/// copies would be two places for the trimming rules to drift.
+pub(crate) fn parse_key_components(key: Option<&str>) -> Vec<String> {
     key.map(|k| {
         k.split(',')
             .map(str::trim)
@@ -43,8 +46,8 @@ pub(crate) fn resolve_key_pair(
     key: Option<&str>,
     source_key: Option<&str>,
 ) -> Result<(Vec<String>, ObsJoinKey), Box<dyn std::error::Error>> {
-    let target = parse_key(key);
-    let source = parse_key(source_key);
+    let target = parse_key_components(key);
+    let source = parse_key_components(source_key);
     if !source.is_empty() && target.is_empty() {
         return Err(
             "--source-key needs --key: it names the source-side column for each \
@@ -73,7 +76,8 @@ pub(crate) fn resolve_key_pair(
     Ok((source_columns, join_key))
 }
 
-fn parse_rename(
+/// Parse `--rename SRC=DST` pairs. Shared with `var-import`.
+pub(crate) fn parse_rename_pairs(
     pairs: &[String],
 ) -> Result<std::collections::HashMap<String, String>, Box<dyn std::error::Error>> {
     let mut out = std::collections::HashMap::new();
@@ -148,7 +152,7 @@ pub fn run_obs_import(
                 .map(str::to_string)
                 .collect()
         }),
-        rename: parse_rename(rename)?,
+        rename: parse_rename_pairs(rename)?,
         prefix: prefix.to_string(),
         keep_key_columns,
         infer_max_records: None,

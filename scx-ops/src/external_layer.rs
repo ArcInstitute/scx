@@ -110,7 +110,7 @@ pub(crate) const OBS_KEY_FALLBACKS: &[&str] = &[
     "index",
 ];
 
-const VAR_KEY_FALLBACKS: &[&str] = &[
+pub(crate) const VAR_KEY_FALLBACKS: &[&str] = &[
     "gene_id",
     "gene_ids",
     "id",
@@ -126,6 +126,23 @@ const VAR_KEY_FALLBACKS: &[&str] = &[
 /// Physical arrow field names that carry a frame's index. Kept in step with
 /// the literal probe in [`scx_format_io::resolve_index_columns`].
 const INDEX_FIELD_NAMES: &[&str] = &["__index_level_0__", "_index"];
+
+/// The fallback key spellings for an axis, in preference order.
+///
+/// One dispatcher rather than a `match` at each site: `resolve_key_column`, the
+/// key diagnosis and the "candidates tried" error text must agree on what a
+/// bare `key=None` would have picked, and they live in two different modules.
+pub(crate) fn key_fallbacks(axis: &str) -> &'static [&'static str] {
+    debug_assert!(
+        axis == "obs" || axis == "var",
+        "unknown axis {axis:?}: expected \"obs\" or \"var\""
+    );
+    if axis == "var" {
+        VAR_KEY_FALLBACKS
+    } else {
+        OBS_KEY_FALLBACKS
+    }
+}
 
 /// The user-facing spelling of an axis's index, and the alias a caller may pass
 /// to name it.
@@ -391,6 +408,24 @@ pub struct AttachLayerSummary {
     /// single-section `ObsMetadata` forces. See
     /// [`crate::external_obs::ObsRewrite`].
     pub obs_streamed: bool,
+    /// Whether a **replacement** var predicate index was written because this
+    /// import overwrote a column the old one covered.
+    ///
+    /// Reported for the same reason the obs half is: an import that silently
+    /// left a stale index would leave the section describing values that no
+    /// longer exist. `false` when the rebuild could cover nothing — see
+    /// [`Self::var_index_dropped`].
+    pub var_index_rebuilt: bool,
+    /// Whether the stale var index was retired with **no** replacement, every
+    /// column it covered having become unindexable.
+    pub var_index_dropped: bool,
+    /// Columns the old var index covered that the rebuild could not.
+    ///
+    /// Named rather than counted, and reported rather than left silent: an
+    /// `overwrite` that replaces an indexed string column with a float removes
+    /// it from the index, and a caller who indexed it deliberately needs to
+    /// know.
+    pub var_columns_not_carried: Vec<String>,
 }
 
 /// The value encoding one canonicalized shard is written under.
@@ -668,6 +703,16 @@ fn attach_external_layer_inner(
     // indexed column does not: the index would describe values that no longer
     // exist and pushdown would silently return wrong rows.
     let drop_obs_index = crate::external_obs::obs_index_would_go_stale(reader, &obs_new_columns)?;
+    // The same question on the var axis, which this op writes columns onto and
+    // had never asked. A pure add keeps the index verbatim; an overwrite of an
+    // indexed column is rebuilt from the new table (see the write below).
+    let var_index_bytes = reader.read_var_predicate_index_bytes()?;
+    let existing_var_index = crate::external_obs::indexed_column_names(var_index_bytes)?;
+    let retire_var_index =
+        crate::external_obs::index_would_go_stale(var_index_bytes, &var_new_columns)?;
+    // A sharded var must be rewritten shard by shard to keep its boundaries.
+    let var_streamed = reader.var_metadata_shard_count() > 0;
+    let n_vars_total = var.num_rows() as u64;
     if !opts.overwrite {
         check_collisions(
             reader,
@@ -696,7 +741,38 @@ fn attach_external_layer_inner(
 
     // --- Build the new var / uns in memory ---------------------------------
     // The obs axis is built inside the write loop below, one shard at a time.
-    let new_var = build_new_var(&var, data, &col_map, column_axis_match)?;
+    let var_join = var_column_join(var.num_rows(), &col_map);
+    // Needed on two paths and skipped otherwise, the same gate the var attach
+    // uses: the single-section write emits it directly and an index rebuild
+    // indexes it, while a *streamed* write rebuilds per shard (to keep each
+    // shard's own encodings) and never looks at it.
+    let need_whole = !var_streamed || retire_var_index;
+    let new_var = if need_whole {
+        Some(build_new_var_window(&var, data, &var_join, 0)?)
+    } else {
+        None
+    };
+
+    // The replacement var index, decided from the new *values* rather than
+    // from the planning boolean: which covered columns survive is only knowable
+    // once they exist (a covered string column overwritten by a float cannot be
+    // indexed), so this is also what makes the `dry_run` preview agree with the
+    // write. The bytes are written below rather than rebuilt.
+    let (new_var_index_bytes, var_columns_not_carried) = if retire_var_index {
+        let whole = new_var
+            .as_ref()
+            .expect("retire_var_index implies need_whole");
+        let pass = crate::predicate_index::ObsVarIndexPass::carried(&[], &existing_var_index);
+        let (bytes, covered) = pass.build_var_bytes(whole, n_vars_total)?;
+        let missing: Vec<String> = existing_var_index
+            .iter()
+            .filter(|c| !covered.contains(c))
+            .cloned()
+            .collect();
+        (bytes, missing)
+    } else {
+        (None, Vec::new())
+    };
     // Like the obs op: no payload → the existing uns section is left exactly
     // where it is, not rewritten byte-identically and orphaned.
     let rewrote_uns = !data.uns.is_empty();
@@ -716,6 +792,11 @@ fn attach_external_layer_inner(
     let framing = framing_for(&prep);
 
     let mut summary = AttachLayerSummary {
+        // "Rebuilt" means a replacement section exists; when the rebuild could
+        // cover nothing, the stale section is retired and that is a *drop*.
+        var_index_rebuilt: retire_var_index && new_var_index_bytes.is_some(),
+        var_index_dropped: retire_var_index && new_var_index_bytes.is_none(),
+        var_columns_not_carried: var_columns_not_carried.clone(),
         n_obs,
         n_matched: row_join.n_matched,
         n_target_rows_absent: row_join.n_target_absent,
@@ -793,7 +874,38 @@ fn attach_external_layer_inner(
     if rewrote_uns {
         writer.write_uns(&new_uns)?;
     }
-    writer.write_var(&new_var)?;
+    // Whatever layout var arrived in, it leaves in. The adopted writer is
+    // seeded with no entries (`into_in_place_parts` hands back everything it
+    // holds, so seeding it with the old catalog would duplicate every entry),
+    // which means its own single-vs-sharded guard cannot help here — a plain
+    // `write_var` therefore replaced a sharded var with one section and
+    // `should_drop_old_entry` removed the shards, so any file whose var was
+    // sharded lost that layout on every layer import.
+    if var_streamed {
+        // Rebuilt **from each shard as read**, not sliced out of `new_var`:
+        // `read_var()` reconciles a var whose shards disagree on a column's
+        // encoding, so a slice of the assembled table would rewrite every
+        // shard under the unified encoding — bytes this op was not asked to
+        // touch. Measured: slicing turns `[Dictionary(Int32, Utf8), Utf8]`
+        // into `[Dictionary(Int8, Utf8), Dictionary(Int8, Utf8)]`.
+        crate::external_var::write_var_shards_appending(
+            reader,
+            &mut writer,
+            n_vars_total,
+            |shard, row_start| build_new_var_window(shard, data, &var_join, row_start),
+        )?;
+    } else {
+        writer.write_var(new_var.as_ref().expect("!var_streamed implies need_whole"))?;
+    }
+
+    // The var-axis half of the staleness question, which this op only ever
+    // asked about obs. var's index is one batch-mode build over
+    // `[(0, n_vars)]` and the new table is already in memory, so an overwrite
+    // rebuilds rather than dropping — matching `modify_metadata` and the var
+    // attach. Decided above, so these bytes are not rebuilt here.
+    if let Some(bytes) = &new_var_index_bytes {
+        writer.write_var_predicate_index(bytes)?;
+    }
 
     match &materialized_obs {
         None => write_obs_shards_appending(reader, &mut writer, n_obs, |shard, row_start| {
@@ -891,7 +1003,16 @@ fn attach_external_layer_inner(
         .old_catalog
         .entries
         .into_iter()
-        .filter(|e| !should_drop_old_entry(e, opts, rewrote_uns, drop_obs_index, &obsm_batches))
+        .filter(|e| {
+            !should_drop_old_entry(
+                e,
+                opts,
+                rewrote_uns,
+                drop_obs_index,
+                retire_var_index,
+                &obsm_batches,
+            )
+        })
         .collect();
     entries.extend(new_section_entries);
     entries.push(FullCatalogEntry {
@@ -1158,11 +1279,7 @@ pub(crate) fn resolve_key_column(
         }
     }
 
-    let fallbacks = if axis == "obs" {
-        OBS_KEY_FALLBACKS
-    } else {
-        VAR_KEY_FALLBACKS
-    };
+    let fallbacks = key_fallbacks(axis);
     let present: Vec<&str> = fallbacks
         .iter()
         .copied()
@@ -1197,12 +1314,7 @@ pub(crate) fn resolve_key_column(
 /// the external tool may have keyed on the other one.
 pub(crate) fn candidate_key_columns(axis: &'static str, batch: &RecordBatch) -> Vec<String> {
     let schema = batch.schema();
-    let fallbacks = if axis == "obs" {
-        OBS_KEY_FALLBACKS
-    } else {
-        VAR_KEY_FALLBACKS
-    };
-    fallbacks
+    key_fallbacks(axis)
         .iter()
         .filter(|c| {
             schema
@@ -1756,18 +1868,10 @@ fn build_new_obs(
         .map_err(|e| OpsError::InvalidInput(format!("failed to build new obs: {e}")))
 }
 
-fn build_new_var(
-    var: &RecordBatch,
-    data: &ExternalLayerData,
-    col_map: &Option<Vec<u32>>,
-    _matched: ColumnAxisMatch,
-) -> Result<RecordBatch> {
-    let Some(ann) = &data.col_annotations else {
-        return Ok(var.clone());
-    };
-    let n_vars = var.num_rows();
-
-    // Invert the source→target column map so annotations land on the right gene.
+/// Invert the source→target column map into the whole-axis join the var
+/// annotations scatter through. Built once from `n_vars`, then windowed per
+/// shard by [`build_new_var_window`].
+fn var_column_join(n_vars: usize, col_map: &Option<Vec<u32>>) -> RowJoin {
     let source_of_target: Vec<Option<u32>> = match col_map {
         None => (0..n_vars).map(|i| Some(i as u32)).collect(),
         Some(map) => {
@@ -1778,33 +1882,59 @@ fn build_new_var(
             inv
         }
     };
-    let join = RowJoin {
+    RowJoin {
         source_of_target,
         n_matched: 0,
         n_target_absent: 0,
         n_source_absent: 0,
         n_source_absent_nonzero: 0,
+    }
+}
+
+/// Append the import's var columns to `var_chunk`, which covers global var rows
+/// `[row_start, row_start + var_chunk.num_rows())`.
+///
+/// `row_start` is the only thing separating the whole-table call from a
+/// per-shard one, and the per-shard one matters: it keeps each shard's own
+/// column encodings, where slicing an assembled table would write the unified
+/// encoding `read_var()` produced. Same shape and same reason as
+/// `build_new_axis_batch` on the obs side.
+fn build_new_var_window(
+    var_chunk: &RecordBatch,
+    data: &ExternalLayerData,
+    join: &RowJoin,
+    row_start: usize,
+) -> Result<RecordBatch> {
+    let Some(ann) = &data.col_annotations else {
+        return Ok(var_chunk.clone());
     };
+    let row_end = row_start + var_chunk.num_rows();
+    if row_end > join.source_of_target.len() {
+        return Err(OpsError::ShapeMismatch {
+            detail: format!(
+                "var rows [{row_start}, {row_end}) overrun the {}-row column join",
+                join.source_of_target.len()
+            ),
+        });
+    }
 
     let planned = planned_var_columns(data);
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
-    for (i, f) in var.schema().fields().iter().enumerate() {
+    for (i, f) in var_chunk.schema().fields().iter().enumerate() {
         if !planned.contains(f.name()) {
             fields.push(f.as_ref().clone());
-            columns.push(var.column(i).clone());
+            columns.push(var_chunk.column(i).clone());
         }
     }
-    // The whole var axis: this is the gene axis, always read and written whole.
-    let n_var_rows = join.source_of_target.len();
     for (i, f) in ann.schema().fields().iter().enumerate() {
         fields.push(
             Field::new(f.name(), f.data_type().clone(), true).with_metadata(f.metadata().clone()),
         );
-        columns.push(scatter_column(ann.column(i), &join, 0, n_var_rows)?);
+        columns.push(scatter_column(ann.column(i), join, row_start, row_end)?);
     }
 
-    let schema = Arc::new(Schema::new(fields).with_metadata(var.schema().metadata().clone()));
+    let schema = Arc::new(Schema::new(fields).with_metadata(var_chunk.schema().metadata().clone()));
     RecordBatch::try_new(schema, columns)
         .map_err(|e| OpsError::InvalidInput(format!("failed to build new var: {e}")))
 }
@@ -1904,6 +2034,7 @@ fn should_drop_old_entry(
     opts: &AttachLayerOptions,
     rewrote_uns: bool,
     drop_obs_index: bool,
+    retire_var_index: bool,
     obsm: &[(String, RecordBatch)],
 ) -> bool {
     use SectionType::*;
@@ -1913,6 +2044,11 @@ fn should_drop_old_entry(
     // The one case where the index is NOT safe to keep: this import overwrites
     // an obs column the index covers, so its entries now describe stale values.
     if drop_obs_index && e.section_type == ObsPredicateIndex {
+        return true;
+    }
+    // Same for var: the old bytes are superseded by the rebuild written above,
+    // and keeping them would leave two `VarPredicateIndex` entries.
+    if retire_var_index && e.section_type == VarPredicateIndex {
         return true;
     }
     if rewrote_uns && e.section_type == UnsBlob && e.modality_id == 0 {
@@ -1967,6 +2103,9 @@ fn build_params_json(
         // See the obs op's twin: not recoverable from the output, because both
         // rewrite paths produce a sharded obs.
         "obs_streamed": s.obs_streamed,
+        "var_predicate_index_rebuilt": s.var_index_rebuilt,
+        "var_predicate_index_dropped": s.var_index_dropped,
+        "var_columns_not_carried": s.var_columns_not_carried,
         "uns_keys_merged": data.uns.keys().collect::<Vec<_>>(),
         "overwrite": opts.overwrite,
     });

@@ -1709,7 +1709,10 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
 - `pyscx.cellbender_import(path, cellbender_h5, *, layer="cellbender", obs_key=None, var_key=None, prefix="cellbender_", uns_key="cellbender", overwrite=False, on_missing_rows="zero", on_extra_rows="warn", gene_axis="identical", latent_embedding=False, dry_run=False)` —
   Attach a CellBender `remove-background` output to an existing SCX file as a
   layer, **in place**, joined by barcode. Returns a summary dict; inspect
-  `n_matched` (or run with `dry_run=True`) before trusting the result. See
+  `n_matched` (or run with `dry_run=True`) before trusting the result. Since it
+  writes `var` columns too, the dict also carries the var predicate index
+  outcome — `var_index_rebuilt` / `var_index_dropped` /
+  `var_columns_not_carried` — on the same terms as `var_import`. See
   [docs/operations.md § CellBender import](operations.md#cellbender-import).
 - `pyscx.is_cellbender_h5(path)` — True when a `.h5` looks like a CellBender
   `remove-background` output rather than a plain 10x CellRanger matrix.
@@ -1803,6 +1806,45 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
   join; a unique column the join would refuse — a float, whose text form is not
   guaranteed to agree across two independently written sides — is listed
   separately under `unusable_unique_columns` rather than offered.
+- `pyscx.var_import(path, table, *, key=None, source_key=None, columns=None, rename=None, prefix="", keep_key_columns=False, delimiter=None, status_column=None, uns_key=None, uns_keys=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` —
+  The var-axis twin of `obs_import`: land per-**gene** annotations computed
+  elsewhere — a normalised symbol from a reference release, an ATAC peak
+  annotation, a curated flag — as `var` columns, **in place**, joined by key
+  string and never by row position. Genes the table does not cover get `null`,
+  never a fabricated `0.0`. `key=None` auto-resolves each side independently:
+  the var index, then `gene_id` / `gene_ids` / `id` / `feature_id` /
+  `gene_name` / `gene_symbol` / `name`; `"var_names"` names the var index on
+  either side, and a list builds a composite. Same `source_key` / `columns` /
+  `rename` / `prefix` / `keep_key_columns` / `delimiter` / `status_column` /
+  `uns_key` / `uns_keys` / `overwrite` / `on_missing_rows` / `on_extra_rows` /
+  `dry_run` semantics as `obs_import`, including **overwrite replaces, never
+  merges**. `X`, layers, `obs`, the CSC sidecar, `.raw`, deletion vectors and
+  the *obs* predicate index are all untouched; a sharded var keeps its shard
+  boundaries and a single-section var stays one section. Returns a summary dict
+  (`n_vars`, `n_matched`, `n_target_rows_absent`, `n_source_rows_absent`,
+  `var_key_column`, `var_columns_added`, `var_index_rebuilt`,
+  `var_index_dropped`, `var_columns_not_carried`, `var_streamed`, the source's `format` /
+  `delimiter` / `n_rows_in_source` / `uns_keys_imported`, and a `key_diagnosis`
+  on a dry run). A **multimodal** file is refused — each modality owns its own
+  var table. Undone by `pyscx.rollback`. See
+  [docs/operations.md § External var import](operations.md#external-var-import).
+- `pyscx.attach_var_columns(path, df, *, key=None, positional=False, status_column=None, uns=None, uns_key=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` —
+  The DataFrame twin of `var_import`, on the same `attach_external_var` seam.
+  Key-joined by default; `positional=True` (mutually exclusive with `key`)
+  lands row `i` on var row `i` and requires exactly `n_vars` rows — var has no
+  deletion vector and therefore no second row space, so unlike
+  `attach_obs_columns` there is no length-based dispatch and any other length
+  raises. A frame carrying a labelled pandas index (every `read_var()` frame
+  does) is checked under `positional`: labels that are the file's own gene
+  names in a different order raise, naming the first misplaced row, because a
+  frame sorted after `read_var()` would otherwise land every value on the wrong
+  gene. Categoricals survive with their declared order, unused levels and
+  `ordered` bit. `uns=` lands in the same commit as the columns. Ungated (no
+  libhdf5).
+- `pyscx.diagnose_var_key(path, key=None)` — The var-axis twin of
+  `diagnose_obs_key`, returning the same dict with `n_vars` in place of
+  `n_obs`. Worth running on a concatenated or merged file, where `var_names` is
+  not always unique.
 - `pyscx.doublet_import(path, table, *, tool, key=None, source_key=None, key_added=None, score_column=None, call_column=None, call_true=None, call_false=None, keep_native_columns=True, delimiter=None, uns_keys=None, overwrite=False, on_missing_rows="null", on_extra_rows="warn", dry_run=False)` —
   The doublet-caller wrapper over `obs_import`: each tool names its score and
   call differently, and this maps them onto canonical columns so downstream code
@@ -3479,6 +3521,7 @@ The CLI binary is named `scx` (built from the `scx-cli` crate via `cargo build -
 ### External annotation import
 - `scx cellbender-import <target.scx> <cellbender_out.h5> [--layer NAME] [--obs-key NAME] [--var-key NAME] [--prefix P] [--uns-key K] [--overwrite] [--on-missing-rows zero|error] [--on-extra-rows warn|error] [--gene-axis identical|reorder|subset] [--latent-embedding] [--dry-run]` — Attach a CellBender `remove-background` output as a layer, in place, joined by barcode. `--gene-axis` defaults to `identical`: a silent gene permutation is biologically wrong, so reordering must be opted into. Needs `--features hdf5`. See [docs/operations.md § CellBender import](operations.md#cellbender-import).
 - `scx obs-import <target.scx> <table.csv> [--key CSV] [--source-key CSV] [--columns CSV] [--rename SRC=DST]... [--prefix P] [--keep-key-columns] [--delimiter C] [--status-column NAME] [--uns-key K] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — Import a delimited annotation table (CSV/TSV) as obs columns, in place. Joins by key string, never by row position; uncovered target rows get `null`, not `0`. `--key a,b` is a composite key, and `--key obs_names` keys on the obs index. `--source-key` names the source side per component when the table spells the key differently (`--key sample_id,obs_names --source-key sample_id,barcode`), pairing positionally. Ungated — a delimited-table reader needs no libhdf5; an `.h5ad` source does (`--features hdf5`). `--dry-run` runs the join and a key diagnosis and writes nothing. Undo with `scx rollback`. See [docs/operations.md § External obs import](operations.md#external-obs-import).
+- `scx var-import <target.scx> <genes.csv> [--key CSV] [--source-key CSV] [--columns CSV] [--rename SRC=DST]... [--prefix P] [--keep-key-columns] [--delimiter C] [--status-column NAME] [--uns-key K] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — The var-axis twin of `obs-import`: import a delimited annotation table as var columns, in place. Joins by key string, never by row position; genes the table does not cover get `null`, not `0`. `--key var_names` keys on the var index; omitted, it auto-resolves through the var index then the gene-id spellings. A sharded var keeps its shard boundaries. Ungated; an `.h5ad` source needs `--features hdf5`. Refuses a multimodal file. `--dry-run` runs the join and a key diagnosis and writes nothing. Undo with `scx rollback`. See [docs/operations.md § External var import](operations.md#external-var-import).
 - `scx doublet-import <target.scx> <table.csv> --tool {scdblfinder|scrublet|doubletfinder|doubletdetection|solo|scds|generic} [--key CSV] [--source-key CSV] [--key-added K] [--score-column NAME] [--call-column NAME] [--call-true TOK] [--call-false TOK] [--drop-native-columns] [--delimiter C] [--uns-key-from-source K]... [--overwrite] [--on-missing-rows null|zero|error] [--on-extra-rows warn|error] [--dry-run]` — The doublet wrapper over `obs-import`, normalising each tool's spellings onto `<K>_score` / `<K>_predicted` / `<K>_status` (+ `uns["<K>"]`). `--tool scds` emits no call column, so no `<K>_predicted` unless `--call-column` opts in; `--tool generic` requires `--score-column`. Use `--drop-native-columns` when the source is an h5ad exported from the target file.
 
 ### Cloud operations (`--features cloud`)

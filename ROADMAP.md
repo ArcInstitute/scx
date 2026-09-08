@@ -1,6 +1,6 @@
 # SCX Implementation Roadmap
 
-**Last updated**: 2026-09-06
+**Last updated**: 2026-09-07
 
 ## Strategy: AnnData-First, Not Scanpy-Replacement
 
@@ -315,9 +315,11 @@ are not exposed in R and are tracked here rather than implemented:
 - Framing granularity: `from_*` expose `row_group_rows` but hardcode
   `target_nnz = None` (no `row_group_target_nnz` byte/nnz-aware sizing knob that
   pyscx/CLI carry).
-- `positional=` on `scx_attach_obs` (`ObsJoinKey::Positional`): no in-process
-  positional consumer exists in R yet, and for external tables positional is
-  exactly the footgun the key join prevents.
+- `positional=` on `scx_attach_obs` / `scx_attach_var` (`AxisJoinKey::Positional`):
+  no in-process positional consumer exists in R yet, and for external tables
+  positional is exactly the footgun the key join prevents.
+- `uns=` payloads on `scx_attach_obs` / `scx_attach_var`: both accept `uns_key`
+  and neither sends a payload, so the argument is inert on the R side.
 - `obsm` embeddings on `pyscx.attach_obs_columns`: deferred on the Python side
   too (`build_obsm` materializes at `n_obs` scale; no caller needs it).
 
@@ -473,6 +475,45 @@ count *matrix*; this is the obs-column half.
   vocabularies reached the row count) — for every categorical value type, not
   just strings — and `filter_obs(...).collect()` prunes to the surviving
   categories deterministically on both obs layouts.
+- [x] `attach_var_columns` — the var-axis twin of the obs attach family
+  (REC-13, pyscx 0.18): `pyscx.var_import` (a delimited table, **ungated**, or
+  an `.h5ad`'s `/var` on an `hdf5` build), `pyscx.attach_var_columns` (an
+  in-memory DataFrame), `pyscx.diagnose_var_key`, `scx var-import` and
+  `rscx::scx_attach_var`, all over one `scx_ops::attach_external_var` seam.
+  Key-joined by `var_names` by default with `positional=True` opt-in, in place
+  through the same harness `append` uses, `scx rollback`-able. It replaces
+  `modify_metadata(var=<whole frame>)` for the add-one-column case, which
+  required reading var, joining in pandas, and being trusted with every column.
+  Three properties differ from the obs twin **by decision**: whatever layout
+  var arrived in it leaves in (a sharded var keeps its shard boundaries, a
+  single section stays one — nothing on the ingest path creates var shards, and
+  the rewrite ops collapse them, so an attach is the wrong place to change a
+  layout); a stale var predicate index is **rebuilt** rather than dropped
+  (var's index is one batch-mode build over `[(0, n_vars)]` and the new table
+  is already in memory, so there is no reason to lose it — and there are no
+  per-shard var column stats, so nothing is cleared); and there is no
+  live/physical row-space dispatch, because deletion vectors are obs-only.
+  A **multimodal** target is refused, as on `attach_external_layer`. Two
+  defects on `attach_external_layer` — the other op that writes var — were
+  fixed with it: it silently collapsed a sharded var into one section, and it
+  never asked whether the *var* predicate index had gone stale. A third, on the
+  source readers and reachable on obs too: a source frame's index field was
+  imported as an ordinary annotation whenever the key was some other column,
+  landing a column literally named `__index_level_0__`. **Rust API break in the
+  same release** (`scx-ops`, no pyscx or CLI surface): `ObsJoinKey` is renamed
+  `AxisJoinKey`, with `pub type ObsJoinKey = AxisJoinKey` kept so existing
+  callers compile; `KeyDiagnosis` gains `axis` and renames `n_obs` to `n_rows`
+  (the pyscx dict still keys `n_obs` on the obs surface and `n_vars` on the
+  var one); and `AttachLayerSummary` gains `var_index_rebuilt`,
+  `var_index_dropped` and `var_columns_not_carried`, since
+  `cellbender_import` writes var columns and had been reporting nothing about
+  what that did to the var index. A stale var index is *retired* either way —
+  "rebuilt" now means a replacement section was written and "dropped" that
+  every column it covered became unindexable, which the planning decision
+  alone cannot predict; both are decided before any write, so `--dry-run`
+  previews the real outcome. Not done: `varm` payloads on the attach — `varm` has no header
+  flag, so a first-ever in-place `varm` has a lifecycle question to settle
+  first. See [docs/operations.md § External var import](docs/operations.md#external-var-import).
 - [ ] Dictionary output from `append` / `merge` / `merge_sorted` — they still
   decode categoricals to plain strings for the rows they add. Only an `append`
   onto an already-sharded dictionary base leaves a mix the read side reconciles

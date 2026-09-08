@@ -12,6 +12,7 @@ mod compact;
 mod doublet_import;
 mod index_warnings;
 mod obs_import;
+mod var_import;
 use scx_convert as convert;
 mod delete;
 mod format;
@@ -1106,8 +1107,9 @@ enum Commands {
         /// Nest the --uns-key-from-source keys under this one uns key (omitted: they land at top level under their own names)
         #[arg(long)]
         uns_key: Option<String>,
-        /// uns key to carry across from an h5ad source. Repeatable; ignored
-        /// for a delimited table, which carries no uns.
+        /// uns key to carry across from an h5ad source. Repeatable. A
+        /// delimited table carries no uns, so passing this with one is an
+        /// error rather than a silent no-op.
         #[arg(long = "uns-key-from-source")]
         uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several
@@ -1118,6 +1120,72 @@ enum Commands {
         /// NULL; `error` refuses. `zero` is an accepted legacy alias for `null` —
         /// the shared policy's zero is literal only where the missing thing is a
         /// matrix row (`scx cellbender-import`), which really is zeros.
+        #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
+        on_missing_rows: String,
+        /// Source rows absent from the target: warn and skip, or fail
+        #[arg(long, default_value = "warn", value_parser = ["warn", "error"])]
+        on_extra_rows: String,
+        /// Validate and report the join (plus a key diagnosis) without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Import a delimited annotation table (CSV/TSV) as var columns on an
+    /// existing SCX file, in place.
+    ///
+    /// The var-axis twin of `obs-import`: per-gene annotations computed
+    /// elsewhere — a normalised symbol, a peak annotation, a curated flag —
+    /// landed without rewriting the file. Joins by key string, never by row
+    /// position. X, layers, obs, the CSC sidecar, .raw, deletion vectors and
+    /// the obs predicate index are preserved; a sharded var keeps its shard
+    /// boundaries; undo with `scx rollback`. A multimodal file is refused —
+    /// each modality owns its own var table.
+    VarImport {
+        /// Target SCX file (mutated in place).
+        input: PathBuf,
+        /// Source .csv / .tsv / .txt
+        table: PathBuf,
+        /// Target-side join key column(s), comma-separated for a composite
+        /// key. `var_names` keys on the var index. Omitted auto-resolves
+        /// (var index, then gene_id/gene_ids/feature_id/gene_name/...).
+        #[arg(long)]
+        key: Option<String>,
+        /// Source-side column(s) for the same key, when the table spells it
+        /// differently: `--key var_names --source-key peak_id`. Pairs
+        /// positionally with --key, so the counts must match.
+        #[arg(long)]
+        source_key: Option<String>,
+        /// Import only these source columns (comma-separated)
+        #[arg(long)]
+        columns: Option<String>,
+        /// Rename a source column: SRC=DST. Repeatable.
+        #[arg(long)]
+        rename: Vec<String>,
+        /// Prefix for the emitted var columns
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Also import the key column(s) as ordinary annotations
+        #[arg(long)]
+        keep_key_columns: bool,
+        /// One-byte delimiter override (default: sniff by extension, then header)
+        #[arg(long)]
+        delimiter: Option<String>,
+        /// var column recording "present"/"absent" per gene
+        #[arg(long)]
+        status_column: Option<String>,
+        /// Nest the --uns-key-from-source keys under this one uns key (omitted: they land at top level under their own names)
+        #[arg(long)]
+        uns_key: Option<String>,
+        /// uns key to carry across from an h5ad source. Repeatable. A
+        /// delimited table carries no uns, so passing this with one is an
+        /// error rather than a silent no-op.
+        #[arg(long = "uns-key-from-source")]
+        uns_keys: Vec<String>,
+        /// Replace existing columns. REPLACES, never merges: importing several
+        /// partial tables in turn keeps only the last. Concatenate first.
+        #[arg(long)]
+        overwrite: bool,
+        /// Genes with no matching source row: `null` (default) leaves them
+        /// NULL; `error` refuses. `zero` is an accepted alias for `null`.
         #[arg(long, default_value = "null", value_parser = ["null", "zero", "error"])]
         on_missing_rows: String,
         /// Source rows absent from the target: warn and skip, or fail
@@ -1182,8 +1250,9 @@ enum Commands {
         /// One-byte delimiter override (default: sniff by extension, then header)
         #[arg(long)]
         delimiter: Option<String>,
-        /// uns key to carry across from an h5ad source. Repeatable; ignored
-        /// for a delimited table, which carries no uns.
+        /// uns key to carry across from an h5ad source. Repeatable. A
+        /// delimited table carries no uns, so passing this with one is an
+        /// error rather than a silent no-op.
         #[arg(long = "uns-key-from-source")]
         uns_keys: Vec<String>,
         /// Replace existing columns. REPLACES, never merges: importing several
@@ -1393,6 +1462,41 @@ fn main() {
             on_extra_rows,
             dry_run,
         } => obs_import::run_obs_import(
+            &input,
+            &table,
+            key.as_deref(),
+            source_key.as_deref(),
+            columns.as_deref(),
+            &rename,
+            &prefix,
+            keep_key_columns,
+            delimiter.as_deref(),
+            status_column.as_deref(),
+            uns_key.as_deref(),
+            &uns_keys,
+            overwrite,
+            &on_missing_rows,
+            &on_extra_rows,
+            dry_run,
+        ),
+        Commands::VarImport {
+            input,
+            table,
+            key,
+            source_key,
+            columns,
+            rename,
+            prefix,
+            keep_key_columns,
+            delimiter,
+            status_column,
+            uns_key,
+            uns_keys,
+            overwrite,
+            on_missing_rows,
+            on_extra_rows,
+            dry_run,
+        } => var_import::run_var_import(
             &input,
             &table,
             key.as_deref(),

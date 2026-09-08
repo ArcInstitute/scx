@@ -269,6 +269,63 @@ fn keep_key_columns_imports_the_index_too() {
     assert!(names(&data).contains(&"__index_level_0__".to_string()));
 }
 
+/// The index is data only when it is the key.
+///
+/// Keying on a named column left the frame's own index field in the import set,
+/// so the attach tried to write a column literally called
+/// `__index_level_0__` — which collides with the target's own index field and
+/// fails with a message about a column the caller never mentioned. Reachable
+/// on obs (an h5ad keyed on a sample column) and unavoidable on var, where the
+/// index is symbols and the key is usually `gene_id`.
+#[test]
+fn a_non_key_index_field_is_not_imported_as_a_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("named_key.h5ad");
+    let file = hdf5::File::create(&path).unwrap();
+    let obs = file.create_group("obs").unwrap();
+    attr(&obs, "encoding-type", "dataframe");
+    attr(&obs, "encoding-version", "0.2.0");
+    attr(&obs, "_index", "_index");
+    let order: Vec<VarLenUnicode> = ["alt_id", "score"].iter().map(|s| vlu(s)).collect();
+    obs.new_attr::<VarLenUnicode>()
+        .shape([order.len()])
+        .create("column-order")
+        .unwrap()
+        .write(&order)
+        .unwrap();
+    str_ds(&obs, "_index", &["A", "B"]);
+    str_ds(&obs, "alt_id", &["x", "y"]);
+    obs.new_dataset::<f64>()
+        .shape([2])
+        .create("score")
+        .unwrap()
+        .write(&[1.0f64, 2.0])
+        .unwrap();
+    file.close().unwrap();
+
+    let o = AnnotationTableOptions {
+        key_columns: vec!["alt_id".to_string()],
+        ..opts()
+    };
+    let (data, info) = read_h5ad_obs(&path, &o, &[]).unwrap();
+    assert_eq!(info.key_columns, vec!["alt_id".to_string()]);
+    assert_eq!(
+        names(&data),
+        vec!["score".to_string()],
+        "the index must not be imported as `__index_level_0__` alongside the data"
+    );
+
+    // An explicit request still wins: naming it is how you import an index as
+    // an ordinary column.
+    let o = AnnotationTableOptions {
+        key_columns: vec!["alt_id".to_string()],
+        columns: Some(vec!["__index_level_0__".to_string(), "score".to_string()]),
+        ..opts()
+    };
+    let (data, _) = read_h5ad_obs(&path, &o, &[]).unwrap();
+    assert!(names(&data).contains(&"__index_level_0__".to_string()));
+}
+
 #[test]
 fn a_composite_key_fuses_from_obs_columns() {
     let dir = tempfile::tempdir().unwrap();
@@ -488,4 +545,143 @@ fn a_requested_uns_key_nests_under_the_wrapper_record() {
     assert!(uns["source_uns"]["scrublet"].is_array() || uns["source_uns"]["scrublet"].is_number());
     assert_eq!(uns["tool"], "scrublet");
     assert_eq!(uns["key_added"], "scrublet");
+}
+
+// ---------------------------------------------------------------------------
+// The var axis
+//
+// `read_h5ad_axis("var", ..)` reads `/var` through the same code. Worth its own
+// fixture rather than trusting the obs arm: the group name is a parameter, and
+// nothing else in the tree would notice if it stopped being used.
+// ---------------------------------------------------------------------------
+
+/// A `/var` group in anndata's own layout: an unnamed index of gene ids, a
+/// symbol column and a categorical `feature_type`.
+fn write_var_fixture(dir: &Path, name: &str, gene_ids: &[&str]) -> PathBuf {
+    let path = dir.join(name);
+    let file = hdf5::File::create(&path).unwrap();
+    let var = file.create_group("var").unwrap();
+
+    attr(&var, "encoding-type", "dataframe");
+    attr(&var, "encoding-version", "0.2.0");
+    attr(&var, "_index", "_index");
+
+    let cols = ["gene_symbol", "feature_type"];
+    let order: Vec<VarLenUnicode> = cols.iter().map(|s| vlu(s)).collect();
+    var.new_attr::<VarLenUnicode>()
+        .shape([order.len()])
+        .create("column-order")
+        .unwrap()
+        .write(&order)
+        .unwrap();
+
+    str_ds(&var, "_index", gene_ids);
+    let symbols: Vec<String> = gene_ids.iter().map(|g| format!("sym_{g}")).collect();
+    str_ds(
+        &var,
+        "gene_symbol",
+        &symbols.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+
+    let codes: Vec<i8> = (0..gene_ids.len()).map(|i| (i % 2) as i8).collect();
+    let cds = var
+        .new_dataset::<i8>()
+        .shape([codes.len()])
+        .create("feature_type")
+        .unwrap();
+    cds.write(&codes).unwrap();
+    cds.new_attr::<VarLenUnicode>()
+        .create("encoding-type")
+        .unwrap()
+        .write_scalar(&vlu("categorical"))
+        .unwrap();
+    let cats = vec![vlu("Gene Expression"), vlu("Peaks")];
+    cds.new_attr::<VarLenUnicode>()
+        .shape([2])
+        .create("categories")
+        .unwrap()
+        .write(&cats)
+        .unwrap();
+
+    file.close().unwrap();
+    path
+}
+
+#[test]
+fn reads_var_from_an_h5ad_with_the_index_as_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_var_fixture(dir.path(), "v.h5ad", &["ENSG1", "ENSG2", "ENSG3"]);
+
+    let (src, info) = crate::h5ad_obs::read_h5ad_axis("var", &path, &opts(), &[]).unwrap();
+    // The `_index` sentinel must surface as the canonical name, which is what
+    // makes automatic key resolution work without special casing.
+    assert_eq!(info.key_columns, vec!["__index_level_0__".to_string()]);
+    assert_eq!(
+        src.row_keys,
+        vec![
+            "ENSG1".to_string(),
+            "ENSG2".to_string(),
+            "ENSG3".to_string()
+        ]
+    );
+    assert_eq!(info.n_rows, 3);
+    assert_eq!(info.format, ObsSourceFormat::H5ad);
+    assert!(info.delimiter.is_none());
+
+    let cols: Vec<String> = src
+        .row_annotations
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        cols,
+        vec!["gene_symbol".to_string(), "feature_type".to_string()]
+    );
+    // A pandas Categorical must arrive as a dictionary, so it lands on the file
+    // as a dictionary too.
+    assert!(matches!(
+        src.row_annotations
+            .schema()
+            .field_with_name("feature_type")
+            .unwrap()
+            .data_type(),
+        DataType::Dictionary(_, _)
+    ));
+}
+
+#[test]
+fn an_h5ad_with_no_var_group_errors_naming_var() {
+    let dir = tempfile::tempdir().unwrap();
+    // An obs-only file: the reader must not silently fall back to /obs.
+    let path = write_obs_fixture(dir.path(), "obs_only.h5ad", "_index", &["c1", "c2"]);
+    let err = crate::h5ad_obs::read_h5ad_axis("var", &path, &opts(), &[]).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("/var"), "{msg}");
+}
+
+#[test]
+fn a_named_var_key_resolves_against_var_and_reports_the_axis_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_var_fixture(dir.path(), "v2.h5ad", &["ENSG1", "ENSG2"]);
+
+    let o = AnnotationTableOptions {
+        key_columns: vec!["gene_symbol".to_string()],
+        ..opts()
+    };
+    let (src, info) = crate::h5ad_obs::read_h5ad_axis("var", &path, &o, &[]).unwrap();
+    assert_eq!(info.key_columns, vec!["gene_symbol".to_string()]);
+    assert_eq!(src.row_keys, vec!["sym_ENSG1", "sym_ENSG2"]);
+
+    let bad = AnnotationTableOptions {
+        key_columns: vec!["nope".to_string()],
+        ..opts()
+    };
+    let err = crate::h5ad_obs::read_h5ad_axis("var", &path, &bad, &[]).unwrap_err();
+    assert!(
+        matches!(&err, scx_ops::OpsError::KeyColumnUnresolved { axis, .. } if *axis == "var"),
+        "got {err}"
+    );
+    assert!(err.to_string().contains("/var of"), "{err}");
 }

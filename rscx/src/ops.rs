@@ -695,6 +695,238 @@ fn scx_attach_obs_impl(
     .into())
 }
 
+// ---------------------------------------------------------------------------
+// Attach external var
+// ---------------------------------------------------------------------------
+
+/// Attach an R `data.frame` of per-gene annotations to an SCX file, in place.
+///
+/// The var-axis twin of [`scx_attach_obs`]: a gene-level table computed in R —
+/// a normalised symbol, a peak annotation, a curated flag — landed on the file
+/// without rewriting it. Joins by key string, never by row position.
+///
+/// A sharded var keeps its shard boundaries and a single-section var stays one
+/// section; a multimodal file is refused, because each modality owns its own
+/// var table.
+///
+/// @param path Path to the SCX file (modified in place).
+/// @param df The annotations. Columns become var columns; an R factor arrives
+///   as a dictionary and is preserved as one.
+/// @param key Character vector of one key per row of `df` — usually
+///   `rownames(df)`. Empty means "resolve a key column from `df` instead".
+/// @param key_columns Columns **of `df`** to fuse into a composite key,
+///   joined against target var columns of the same names. Mutually exclusive
+///   with `key`.
+/// @param key_column Target var column to join on when `key` is given.
+///   `NULL` auto-resolves it (the var index, then `gene_id` / `gene_ids` /
+///   `feature_id` / `gene_name` / ...).
+/// @param prefix Prepended to every imported column name.
+/// @param status_column Var column recording "present"/"absent" per gene.
+/// @param uns_key Reserved and currently inert: rscx sends no `uns` payload, so
+///   nothing is written under it. Kept for signature stability.
+/// @param overwrite Replace colliding columns. REPLACES, never merges.
+/// @param on_missing_rows `"null"` (default), `"zero"` (an accepted alias for
+///   the same policy) or `"error"`.
+/// @param on_extra_rows `"warn"` or `"error"`.
+/// @param dry_run Validate and join without writing.
+/// @return Named list summarising the join.
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn scx_attach_var(
+    path: &str,
+    df: Robj,
+    key: Strings,
+    key_columns: Strings,
+    key_column: Nullable<String>,
+    prefix: &str,
+    status_column: Nullable<String>,
+    uns_key: Nullable<String>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> Robj {
+    crate::util::throw_on_err(scx_attach_var_impl(
+        path,
+        df,
+        key,
+        key_columns,
+        key_column,
+        prefix,
+        status_column,
+        uns_key,
+        overwrite,
+        on_missing_rows,
+        on_extra_rows,
+        dry_run,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scx_attach_var_impl(
+    path: &str,
+    df: Robj,
+    key: Strings,
+    key_columns: Strings,
+    key_column: Nullable<String>,
+    prefix: &str,
+    status_column: Nullable<String>,
+    _uns_key: Nullable<String>,
+    overwrite: bool,
+    on_missing_rows: &str,
+    on_extra_rows: &str,
+    dry_run: bool,
+) -> Result<Robj> {
+    use scx_ops::{
+        attach_external_var, build_composite_key_for, obs_key_values, resolve_var_key_column,
+        AttachVarOptions, AxisJoinKey, ExternalVarData, ExtraRowPolicy, MissingRowPolicy,
+    };
+
+    let missing = match on_missing_rows {
+        // "null" is what actually happens here (Arrow nulls, so NA in R), and
+        // is the default; "zero" names the shared enum variant, whose zero is
+        // literal only on the layer / CellBender path.
+        "null" | "zero" => MissingRowPolicy::ZeroFill,
+        "error" => MissingRowPolicy::Error,
+        other => {
+            return Err(Error::Other(format!(
+                "on_missing_rows must be \"null\", \"zero\" or \"error\"; got \"{other}\""
+            )))
+        }
+    };
+    let extra = match on_extra_rows {
+        "warn" => ExtraRowPolicy::WarnSkip,
+        "error" => ExtraRowPolicy::Error,
+        other => {
+            return Err(Error::Other(format!(
+                "on_extra_rows must be \"warn\" or \"error\"; got \"{other}\""
+            )))
+        }
+    };
+
+    let batch = crate::interop::dataframe_to_record_batch(&df)?;
+    let n_rows = batch.num_rows();
+    if n_rows == 0 {
+        return Err(Error::Other(
+            "the data.frame has no rows; there is nothing to attach".into(),
+        ));
+    }
+
+    let explicit_keys: Vec<String> = key.iter().map(|s| s.to_string()).collect();
+    let key_cols: Vec<String> = key_columns.iter().map(|s| s.to_string()).collect();
+    if !explicit_keys.is_empty() && !key_cols.is_empty() {
+        return Err(Error::Other(
+            "pass either `key` (one value per row) or `key_columns` (columns of \
+             `df` to fuse), not both"
+                .into(),
+        ));
+    }
+
+    // Both sides of the join are built by the same ops-crate helpers the CSV
+    // reader uses, so an R-attached table and an imported CSV cannot disagree
+    // about what a key is.
+    let (row_keys, join_key, drop): (Vec<String>, AxisJoinKey, Vec<String>) =
+        if !explicit_keys.is_empty() {
+            if explicit_keys.len() != n_rows {
+                return Err(Error::Other(format!(
+                    "`key` has {} values but `df` has {n_rows} rows",
+                    explicit_keys.len()
+                )));
+            }
+            let target = match key_column {
+                Nullable::NotNull(c) => AxisJoinKey::Column(c),
+                Nullable::Null => AxisJoinKey::Auto,
+            };
+            // The keys came from outside `df`, so every column is an annotation.
+            (explicit_keys, target, Vec::new())
+        } else if key_cols.len() > 1 {
+            for c in &key_cols {
+                if batch.schema().field_with_name(c).is_err() {
+                    return Err(Error::Other(format!(
+                        "key column \"{c}\" is not in `df`; columns are {:?}",
+                        column_names(&batch)
+                    )));
+                }
+            }
+            let fused = build_composite_key_for("var", &batch, &key_cols).map_err(to_r_err)?;
+            (
+                fused,
+                AxisJoinKey::Composite {
+                    columns: key_cols.clone(),
+                },
+                key_cols.clone(),
+            )
+        } else {
+            let col = if key_cols.len() == 1 {
+                if batch.schema().field_with_name(&key_cols[0]).is_err() {
+                    return Err(Error::Other(format!(
+                        "key column \"{}\" is not in `df`; columns are {:?}",
+                        key_cols[0],
+                        column_names(&batch)
+                    )));
+                }
+                key_cols[0].clone()
+            } else {
+                resolve_var_key_column(&batch, None).map_err(to_r_err)?
+            };
+            let values = obs_key_values(&batch, &col).map_err(to_r_err)?;
+            let drop = vec![col.clone()];
+            (values, AxisJoinKey::Column(col), drop)
+        };
+
+    // As on obs: the key columns are already on the target's axis, and
+    // `__index_level_0__` — synthesised from `rownames(df)`, which in the
+    // flagship recipe *is* the key — would collide with the target's own index
+    // column on every attach.
+    let mut drop = drop;
+    drop.push("__index_level_0__".to_string());
+    let annotations = scx_ops::drop_batch_columns(&batch, &drop).map_err(to_r_err)?;
+    let annotations = apply_prefix(&annotations, prefix)?;
+
+    let data = ExternalVarData {
+        row_keys,
+        row_annotations: annotations,
+        // rscx sends no uns payload today, so `uns_key` above is inert; R
+        // parity for the payload is a ROADMAP item.
+        uns: Default::default(),
+        source_checksum: None,
+        source_name: Some("<R data.frame>".to_string()),
+    };
+
+    let opts = AttachVarOptions {
+        join_key,
+        missing_row_policy: missing,
+        extra_row_policy: extra,
+        status_column: match status_column {
+            Nullable::NotNull(s) => Some(s),
+            Nullable::Null => None,
+        },
+        overwrite,
+        provenance_action: "scx_attach_var".to_string(),
+        dry_run,
+        ..Default::default()
+    };
+
+    let s = attach_external_var(Path::new(path), &data, &opts).map_err(to_r_err)?;
+
+    Ok(list!(
+        n_vars = s.n_vars as f64,
+        n_matched = s.n_matched as f64,
+        n_target_rows_absent = s.n_target_rows_absent as f64,
+        n_source_rows_absent = s.n_source_rows_absent as f64,
+        // Display spelling, matching pyscx and the CLI: the physical
+        // `__index_level_0__` is not a column an R user can address either.
+        var_key_column = scx_ops::display_key_name("var", &s.var_key_column),
+        var_columns_added = s.var_columns_added,
+        var_index_rebuilt = s.var_index_rebuilt,
+        var_index_dropped = s.var_index_dropped,
+        var_columns_not_carried = s.var_columns_not_carried,
+        var_streamed = s.var_streamed,
+        dry_run = dry_run
+    )
+    .into())
+}
+
 fn column_names(batch: &arrow::array::RecordBatch) -> Vec<String> {
     batch
         .schema()
@@ -752,4 +984,5 @@ extendr_module! {
     fn scx_info;
     fn scx_validate;
     fn scx_attach_obs;
+    fn scx_attach_var;
 }

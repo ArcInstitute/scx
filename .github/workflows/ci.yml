@@ -250,11 +250,13 @@ jobs:
       # `--test <bin>` selection + `--test-threads=1`, and NOT
       # `HDF5_USE_FILE_LOCKING=FALSE`.
       #
-      # convert_stream, cellbender_cli and convert_subset are the only scx-cli
-      # targets that reference the `hdf5` crate (they are what the lock
-      # serialization below exists for); doublet_import_hdf5 never links it —
-      # it is feature-gated *behavior* — and merely rides in the same
-      # serialized invocation. Every other target runs (in parallel) in the
+      # convert_stream, cellbender_cli, convert_subset and var_import_hdf5 are
+      # the scx-cli targets that reference the `hdf5` crate — they build an
+      # h5ad in-process and are what the lock serialization below exists for.
+      # doublet_import_hdf5 never links it: its gating is feature-gated
+      # *behavior* (the h5ad source arm), and it merely rides in the same
+      # serialized invocation. So: five binaries selected, four of them
+      # touching libhdf5. Every other target runs (in parallel) in the
       # `test` job. They build an h5ad with `hdf5::File::create` in the test
       # process and then spawn the `scx` binary to open it. Run in parallel,
       # sibling tests' open files make libhdf5 refuse the child's `H5Fopen`
@@ -272,7 +274,7 @@ jobs:
         run: |
           cargo test -p scx-cli --features hdf5 \
             --test convert_stream --test cellbender_cli --test convert_subset \
-            --test doublet_import_hdf5 \
+            --test doublet_import_hdf5 --test var_import_hdf5 \
             -- --test-threads=1
       # Authoritative coverage backstop, compiler-derived: the dedup-guard's
       # grep layout rule cannot see a gated test inline in a skipped module's
@@ -306,7 +308,7 @@ jobs:
           comm -23 /tmp/cli_hdf5.list /tmp/cli_default.list > /tmp/cli_only.list
           list -p scx-cli --features hdf5 \
             --test convert_stream --test cellbender_cli --test convert_subset \
-            --test doublet_import_hdf5 > /tmp/cli_selected.list
+            --test doublet_import_hdf5 --test var_import_hdf5 > /tmp/cli_selected.list
           if bad=$(comm -23 /tmp/cli_only.list /tmp/cli_selected.list | grep .); then
             echo "::error::hdf5-only scx-cli tests not listed by any selected --test binary — they run in NEITHER CI lane:"
             echo "$bad"

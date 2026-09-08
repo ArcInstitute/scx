@@ -53,8 +53,15 @@ fn parse_gene_axis(s: &str) -> PyResult<scx_ops::ColumnAxisPolicy> {
 ///
 /// Reads the corrected count matrix and lands it as a new layer on `path`,
 /// **in place**, joined to the target's own obs axis by barcode. X, the CSC
-/// sidecar, `.raw`, deletion vectors and predicate indexes are preserved; the
-/// whole import is undoable with `scx rollback`.
+/// sidecar, `.raw` and deletion vectors are preserved; the whole import is
+/// undoable with `scx rollback`.
+///
+/// Predicate indexes survive a pure column *add* on either axis. An
+/// `overwrite=True` of an indexed column does not: the obs index is dropped,
+/// and the **var** index is rebuilt over the new values — or retired, when none
+/// of the columns it covered can still be indexed. The returned dict says which
+/// happened, on a `dry_run` too: `var_index_rebuilt`, `var_index_dropped` and
+/// `var_columns_not_carried`.
 ///
 /// The join is always by barcode string, never by position: CellBender's
 /// `_filtered.h5` is in descending-UMI order, so a positional import would
@@ -165,6 +172,13 @@ pub fn cellbender_import(
         // the whole table (which a legacy single-section obs forces). Not
         // inferable from the output file: both paths write a sharded obs.
         d.set_item("obs_streamed", s.obs_streamed)?;
+        // The var predicate index outcome. An `overwrite` of an indexed var
+        // column rebuilds the index from the new values; when none of the
+        // covered columns can still be indexed the stale section is retired
+        // instead, and `var_columns_not_carried` names what pushdown lost.
+        d.set_item("var_index_rebuilt", s.var_index_rebuilt)?;
+        d.set_item("var_index_dropped", s.var_index_dropped)?;
+        d.set_item("var_columns_not_carried", s.var_columns_not_carried.clone())?;
     }
     Ok(d.into())
 }

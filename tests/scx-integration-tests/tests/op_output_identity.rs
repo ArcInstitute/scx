@@ -103,10 +103,12 @@ use scx_testkit::fixtures::mixed_codec_file;
 /// Every arm, in the order the manifest reports them: the nine labels over the
 /// seven ops PR-01 names, with `compact` and `build_csc` doubled over an
 /// index-carrying input, plus `attach_obs` (the in-place obs attach, added with
-/// the categorical-fidelity change so its output is pinned from here on).
+/// the categorical-fidelity change) and `attach_var` (its var-axis twin, added
+/// with the var attach) so both in-place attaches are pinned from here on.
 const EXPECTED_OPS: &[&str] = &[
     "append",
     "attach_obs",
+    "attach_var",
     "build_csc",
     "build_csc_indexed",
     "compact",
@@ -260,7 +262,70 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     m.record("attach_obs", &target, Strictness::Content)
         .unwrap();
 
+    // `attach_external_var` over the same fixture, attaching one plain and one
+    // categorical column keyed on `gene_id`. What this digest pins beyond the
+    // op's own tests: that a var attach leaves every *other* section's bytes
+    // alone — obs (categorical stamp included), X, the layer, the CSC sidecar,
+    // `.raw`, `obsm`/`varm`/`obsp`/`varp`, the bitmap and the deletion vector.
+    // The manifest is the only place that is checked across all of them at once.
+    let target = fixture_all_families_with_categorical_obs(dir, "attach_var.scx");
+    scx_ops::attach_external_var(&target, &attach_var_payload(), &attach_var_options()).unwrap();
+    m.record("attach_var", &target, Strictness::Content)
+        .unwrap();
+
     m
+}
+
+/// Four of the fixture's genes, in reverse order (a key join, not a positional
+/// one), with a float score and an ordered categorical whose declared order is
+/// neither alphabetical nor first-appearance and whose third level no row uses.
+fn attach_var_payload() -> scx_ops::ExternalVarData {
+    use arrow::array::{
+        Array, DictionaryArray, Float32Array, Int32Array, RecordBatch, StringArray,
+    };
+    use arrow::datatypes::{Field, Int32Type, Schema};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let row_keys: Vec<String> = (0..4).rev().map(|i| format!("gene_{i}")).collect();
+    let score = Float32Array::from((0..4).map(|i| i as f32 * 0.5).collect::<Vec<_>>());
+    let class = DictionaryArray::<Int32Type>::try_new(
+        Int32Array::from(vec![1, 0, 1, 0]),
+        Arc::new(StringArray::from(vec![
+            "promoter",
+            "enhancer",
+            "intergenic",
+        ])),
+    )
+    .unwrap();
+    let mut md = HashMap::new();
+    md.insert(
+        scx_format_io::CATEGORICAL_ORDERED_KEY.to_string(),
+        "true".to_string(),
+    );
+    let schema = Schema::new(vec![
+        Field::new("peak_score", score.data_type().clone(), true),
+        Field::new("peak_class", class.data_type().clone(), true).with_metadata(md),
+    ]);
+    scx_ops::ExternalVarData {
+        row_keys,
+        row_annotations: RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(score), Arc::new(class)],
+        )
+        .unwrap(),
+        uns: serde_json::Map::new(),
+        source_checksum: None,
+        source_name: Some("peaks.csv".to_string()),
+    }
+}
+
+fn attach_var_options() -> scx_ops::AttachVarOptions {
+    scx_ops::AttachVarOptions {
+        join_key: scx_ops::AxisJoinKey::Column("gene_id".to_string()),
+        status_column: Some("peak_status".to_string()),
+        ..Default::default()
+    }
 }
 
 /// Six of the fixture's eight cells, in reverse order (a key join, not a
@@ -315,7 +380,7 @@ fn attach_obs_options() -> scx_ops::AttachObsOptions {
 
 /// The premise: the matrix really does cover every arm it is meant to — the
 /// nine over the seven ops PR-01 names, with `compact` and `build_csc` doubled
-/// over an index-carrying input, plus the `attach_obs` arm.
+/// over an index-carrying input, plus the `attach_obs` and `attach_var` arms.
 ///
 /// Without it, dropping an op from `build_manifest` would only be caught by a
 /// golden re-bless — which is exactly the moment somebody is least likely to

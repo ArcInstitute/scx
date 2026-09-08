@@ -53,6 +53,9 @@ WRAPPED = [
     "obs_import",
     "attach_obs_columns",
     "diagnose_obs_key",
+    "var_import",
+    "attach_var_columns",
+    "diagnose_var_key",
     "doublet_import",
     "from_h5ad",
     "to_h5ad",
@@ -186,7 +189,13 @@ def test_wrapper_docstring_is_substantial(name):
 
 def test_on_missing_rows_wording_is_single_sourced():
     canonical = _norm(ON_MISSING_ROWS_CANONICAL)
-    for name in ("obs_import", "attach_obs_columns", "doublet_import"):
+    for name in (
+        "obs_import",
+        "attach_obs_columns",
+        "doublet_import",
+        "var_import",
+        "attach_var_columns",
+    ):
         doc = _norm(getattr(pyscx, name).__doc__)
         assert canonical in doc, (
             f"pyscx.{name} documents on_missing_rows in its own words. Use the "

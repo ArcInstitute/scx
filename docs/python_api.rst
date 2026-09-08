@@ -62,7 +62,7 @@ External annotation import
 
 In-place, key-joined landing of externally computed per-cell annotations
 (doublet callers, CellBender, any CSV/DataFrame). See :doc:`operations`
-§ External obs import for the prose guide.
+§ External obs import / § External var import for the prose guides.
 
 .. autosummary::
    :toctree: _autosummary
@@ -71,6 +71,9 @@ In-place, key-joined landing of externally computed per-cell annotations
    obs_import
    attach_obs_columns
    diagnose_obs_key
+   var_import
+   attach_var_columns
+   diagnose_var_key
    doublet_import
    doublet_consensus
    doublet_tools
