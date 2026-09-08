@@ -62,7 +62,12 @@ def path(tmp_path_factory):
     dense = _dense()
     adata = anndata.AnnData(
         X=sp.csr_matrix(dense),
-        obs=pd.DataFrame(index=[f"c{i}" for i in range(N_OBS)]),
+        # `grp` is in the *file* because the DE probes need a groupby and
+        # writing one onto a subset view is copy-on-write.
+        obs=pd.DataFrame(
+            {"grp": ["A" if i % 2 == 0 else "B" for i in range(N_OBS)]},
+            index=[f"c{i}" for i in range(N_OBS)],
+        ),
         var=pd.DataFrame(index=[f"g{i}" for i in range(N_VARS)]),
     )
     p = str(tmp_path_factory.mktemp("skip") / "skip.scx")
@@ -100,7 +105,16 @@ _PROBE = textwrap.dedent(
     assert sel in ("window", "mask", "all"), sel
     assert op, case
 
-    adata = pyscx.open(path).to_anndata(backed=True)
+    # The decode counter counts *misses*, so a multi-pass op's count depends on
+    # the LRU. `nocache` makes it one decode per read, which is what turns a
+    # per-pass expectation into an exact number; `bigcache` is the opposite
+    # arm, where the cache is meant to absorb the re-reads.
+    cache = {"nocache": 0, "bigcache": 8}
+    open_kw = {}
+    for seg in parts[1:]:
+        if seg in cache:
+            open_kw["cache_shards"] = cache[seg]
+    adata = pyscx.open(path).to_anndata(backed=True, **open_kw)
     n_shards = adata.X.n_shards
 
     if sel == "window":
@@ -159,6 +173,16 @@ _PROBE = textwrap.dedent(
         pyscx.accel.highly_variable_genes(
             adata, n_top_genes=10, flavor="seurat_v3", device="cpu"
         )
+    elif op == "rank_genes_groups":
+        pyscx.accel.rank_genes_groups(adata, "grp", device="cpu")
+    elif op == "rank_genes_groups_pts":
+        pyscx.accel.rank_genes_groups(adata, "grp", device="cpu", pts=True)
+    elif op == "rank_genes_groups_chunked":
+        pyscx.accel.rank_genes_groups(
+            adata, "grp", device="cpu", gene_chunk_size=64
+        )
+    elif op == "pdex_ref":
+        pyscx.accel.pdex_ref(adata, "grp", reference="A", device="cpu")
     else:
         raise SystemExit(f"unknown op {op}")
     snap = pyscx.accel.cpu_profile_snapshot()
@@ -201,6 +225,27 @@ _OPS = {
     "pca": (1, 5),
     "pflog": (2, 10),
     "hvg": (2, 10),  # seurat_v3: mean/var, then the clipped square sum
+}
+
+# The DE family, kept apart from `_OPS` for two reasons: it reaches the row
+# filter the same way the `as_shard_source()` consumers do but through kernels
+# that used to bypass the drivers entirely (their own `for shard_idx in
+# 0..n_shards` per gene chunk, so nothing consulted the plan — measured, they
+# decoded all five shards over a one-shard window), and its counts are only
+# exact with the LRU out of the way, since a multi-pass op's misses depend on it.
+#
+# `op -> (decodes over a 1-of-5-shard window, decodes with no projection)`,
+# every case opened with `cache_shards=0`.
+_DE_OPS = {
+    # 200 genes against the default 500-gene chunk: one pass over the shards.
+    "rank_genes_groups": (1, 5),
+    "pdex_ref": (1, 5),
+    # `pts=True` adds the nonzero-counting pass — a second walk of the matrix.
+    "rank_genes_groups_pts": (2, 10),
+    # `gene_chunk_size=64` -> 4 chunks, and the shard walk is *inner* to the
+    # chunk walk. This is the row that shows what the change is actually worth:
+    # the cost is `n_chunks x visited shards`, so 20 becomes 4, not 5 becomes 1.
+    "rank_genes_groups_chunked": (4, 20),
 }
 
 
@@ -284,6 +329,62 @@ def test_a_mask_over_two_shards_decodes_two(path, op):
     )
 
 
+@pytest.mark.parametrize("op", sorted(_DE_OPS))
+def test_de_over_a_one_shard_window_decodes_one_shard_per_pass(path, op):
+    """The kernels that used to run their own shard loop per gene chunk.
+
+    Before they took the shared drivers, every one of these decoded all five
+    shards (and `rank_genes_groups_chunked` decoded all five *four times*),
+    then threw four fifths of the work away because the projection had emptied
+    those shards.
+    """
+    expected = _DE_OPS[op][0]
+    res = _probe(path, f"window+nocache:{op}")
+    assert res["decodes"] == expected, (
+        f"{op} over a one-shard window decoded {res['decodes']} shards, "
+        f"expected {expected} — the row projection empties the other four"
+    )
+
+
+@pytest.mark.parametrize("op", sorted(_DE_OPS))
+def test_de_without_a_projection_reads_every_shard(path, op):
+    """Accept side: with no projection nothing is skipped, so the assertion
+    above cannot be satisfied by a skip that fires unconditionally."""
+    expected = _DE_OPS[op][1]
+    res = _probe(path, f"all+nocache:{op}")
+    assert res["decodes"] == expected, (
+        f"{op} with no projection decoded {res['decodes']}, expected {expected}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"), [("rank_genes_groups", 2), ("rank_genes_groups_chunked", 8)]
+)
+def test_de_over_a_two_shard_mask_decodes_two_per_pass(path, op, expected):
+    """A gapped projection, not just a prefix window: shards 1-3 are empty."""
+    res = _probe(path, f"mask+nocache:{op}")
+    assert res["decodes"] == expected, f"{op}: {res['decodes']} != {expected}"
+
+
+def test_a_cache_sized_to_the_visited_shards_absorbs_the_per_chunk_rereads(path):
+    """The other half of the DE cost model, and the advice the undersized-cache
+    warning gives.
+
+    Each gene chunk re-reads every visited shard, so the per-chunk factor is
+    paid in *decodes* only when the LRU cannot hold them. Sized to the file, the
+    four-chunk run costs the same five decodes as the one-chunk run — which is
+    also why the warning now measures the cache against the shards a call
+    visits rather than against the file.
+    """
+    small = _probe(path, "all+nocache:rank_genes_groups_chunked")
+    big = _probe(path, "all+bigcache:rank_genes_groups_chunked")
+    assert small["decodes"] == 20
+    assert big["decodes"] == N_SHARDS, (
+        f"a cache holding all {N_SHARDS} shards still decoded {big['decodes']}; "
+        "the per-chunk re-reads should be hits"
+    )
+
+
 def test_a_lazy_transform_chain_also_skips(path):
     """`normalize_total` + `log1p` over a row subset, the third mechanism.
 
@@ -331,6 +432,43 @@ def test_masked_aggregates_match_an_in_memory_oracle(path, sel, label):
     )
     np.testing.assert_allclose(
         pyscx.accel.col_var(adata.X), ref.astype(np.float64).var(axis=0), rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    "sel, label", [(slice(0, SHARD), "window"), (_mask(), "mask")]
+)
+def test_de_over_a_projection_matches_the_in_memory_answer(path, sel, label):
+    """The skip must not move a row.
+
+    The dense buffer the DE kernels rank is filled at a running count of
+    *visible* rows, so a shard skipped in error, or a plan that disagrees with
+    the rows handed over, would place every later row too early and still return
+    a fully formed result. Compare against the same rows as a plain scipy
+    AnnData, which takes the in-memory kernel — a different code path, not the
+    same one twice.
+    """
+    import pyscx
+
+    dense = _dense()[sel]
+    groups = np.array(["A" if i % 2 == 0 else "B" for i in range(N_OBS)])[sel]
+    ref = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame({"grp": groups}, index=[f"c{i}" for i in range(len(groups))]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(N_VARS)]),
+    )
+    pyscx.accel.rank_genes_groups(ref, "grp", device="cpu")
+    ref_df = pyscx.accel.rank_genes_groups_df(ref, group="A")
+
+    backed = pyscx.open(path).to_anndata(backed=True)[sel]
+    pyscx.accel.rank_genes_groups(backed, "grp", device="cpu")
+    got_df = pyscx.accel.rank_genes_groups_df(backed, group="A")
+
+    assert list(got_df["names"]) == list(ref_df["names"]), label
+    np.testing.assert_allclose(
+        got_df["scores"].to_numpy().astype(np.float64),
+        ref_df["scores"].to_numpy().astype(np.float64),
+        atol=1e-6,
     )
 
 

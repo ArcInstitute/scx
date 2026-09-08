@@ -31,6 +31,8 @@
 //! invalidated when pointers move, and that staged data is numerically
 //! identical.
 
+use scx_format_io::ShardSource;
+
 use crate::error::GpuError;
 
 /// Pinned staging slots in the ring. Two is enough to overlap one shard's DMA
@@ -40,12 +42,15 @@ pub(crate) const RING: usize = 2;
 
 /// A drive's shard list plus the decode-prefetch depth to run it at.
 ///
-/// `indices` is always an explicit list, even on the CSR path where it is
-/// exactly `0..n_shards`. An earlier revision had an `All(n)` / `Selected(v)`
-/// enum so the dense sweep could skip the allocation; it was collapsed because
-/// only one layout could ever produce each arm, which is coverage that reads as
-/// real and is not. The cost is one `Vec<usize>` per drive — tens of `usize`
-/// against a shard decode.
+/// `indices` is always an explicit list. An earlier revision had an
+/// `All(n)` / `Selected(v)` enum so a dense sweep could skip the allocation; it
+/// was collapsed, and the reason has since changed. It *was* that only one
+/// layout could ever produce each arm — coverage that reads as real and is not.
+/// That is no longer true: since [`StagingPlan::for_source`] the CSR path
+/// produces either arm, every shard when the source reports no row filter and a
+/// subset when it does. What still holds is the cost argument, which is the
+/// whole of it now: one `Vec<usize>` per drive, tens of `usize`, against a
+/// shard decode.
 ///
 /// The list must be strictly ascending: "in plan order" is what the prefetch
 /// pipeline preserves, so a shuffled list is delivered shuffled, not sorted.
@@ -71,6 +76,26 @@ impl StagingPlan {
     /// Plan covering an explicit ascending subset.
     pub(crate) fn selected(indices: Vec<usize>, depth: usize) -> Self {
         Self { indices, depth }
+    }
+
+    /// Plan for a row-major source, honouring a row filter.
+    ///
+    /// A source that filters rows inside `read_shard` answers
+    /// [`ShardSource::visible_shard_indices`] with the shards that still hold
+    /// one; the rest would be decoded, uploaded and found empty. `StagingPlan`
+    /// has to ask, because the driver cannot: it feeds through
+    /// `for_each_shard_ordered_uncached_selected`, which deliberately does not
+    /// consult the hook — second-guessing an explicit plan is how a staging
+    /// path skips a shard it meant to stage. Asking here is what keeps the GPU
+    /// DE routes in step with the CPU ones, which get the skip from the driver.
+    ///
+    /// `drive_shards` already skips an empty shard *after* decoding it; this
+    /// removes the decode.
+    pub(crate) fn for_source<S: ShardSource + ?Sized>(source: &S, depth: usize) -> Self {
+        match source.visible_shard_indices() {
+            Some(indices) => Self::selected(indices, depth),
+            None => Self::all(source.n_shards(), depth),
+        }
     }
 }
 

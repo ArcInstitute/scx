@@ -165,3 +165,101 @@ fn length_and_shape_mismatches_are_errors() {
     let mut acc = GroupNonzeroCounts::new(&[0], 1, 4);
     assert!(acc.add_csr(&bad, 0, &[0]).is_err());
 }
+
+// ── The `pts` pass under a row projection ───────────────────────────────
+//
+// `group_nonzero_counts_streaming` was the third hand-rolled
+// `for shard_idx in 0..n_shards` in this module, and it is the one whose row
+// cursor really indexes per-cell data (`groups[row_offset + row]`). Going
+// through the shared driver means a shard the projection empties is not read;
+// the cursor stays a running count of visible rows, because a skipped shard
+// would have advanced it by zero.
+
+/// A `GaugedSource` shard: `rows × 4` with a nonzero wherever `(global + c)`
+/// is not a multiple of 3, so no two shards carry the same counts.
+fn gauged_pts_shards() -> Vec<ScxCsr> {
+    (0..4usize)
+        .map(|s| {
+            let mut data = vec![0.0f32; 3 * 4];
+            for r in 0..3usize {
+                let global = s * 3 + r;
+                for c in 0..4 {
+                    if !(global + c).is_multiple_of(3) {
+                        data[r * 4 + c] = ((global * 5 + c) % 9 + 1) as f32;
+                    }
+                }
+            }
+            dense_to_csr(&data, 3, 4)
+        })
+        .collect()
+}
+
+#[test]
+fn the_pts_pass_skips_the_shards_a_row_projection_empties() {
+    use crate::test_support::GaugedSource;
+
+    let plan = vec![0usize, 3];
+    let src = GaugedSource::new(gauged_pts_shards(), 12, 4).with_plan(plan.clone());
+    let groups: Vec<usize> = (0..src.n_obs()).map(|i| i % 2).collect();
+
+    let streamed = group_nonzero_counts_streaming(&src, &groups, 2).unwrap();
+    assert_eq!(src.decoded_shards(), plan, "read a shard the plan excluded");
+    assert_eq!(src.decode_count(), plan.len(), "single pass, one read each");
+
+    // And the counts are those rows' counts — the skip changed nothing. The
+    // oracle is the CSR kernel on the same rows gathered into one matrix.
+    let shards = gauged_pts_shards();
+    let mut dense = Vec::new();
+    for &i in &plan {
+        let s = &shards[i];
+        for r in 0..s.n_rows() {
+            let mut row = vec![0.0f32; 4];
+            for j in s.indptr[r] as usize..s.indptr[r + 1] as usize {
+                row[s.indices[j] as usize] = s.data[j];
+            }
+            dense.extend_from_slice(&row);
+        }
+    }
+    let oracle = group_nonzero_counts_csr(&dense_to_csr(&dense, 6, 4), &groups, 2).unwrap();
+    assert_eq!(streamed, oracle);
+}
+
+/// The depth knob is not decoration: the prefetch pipeline's sequential
+/// fallback is silent and produces identical counts, so "did it engage" is only
+/// observable by pinning `d = 1` against `d > 1` and looking at which thread
+/// decoded. Wilcoxon and pdex carry the same pair.
+#[test]
+fn the_pts_pass_decodes_shards_concurrently() {
+    use crate::test_support::{assert_prefetch_engaged, pool_can_prefetch, GaugedSource};
+
+    if !pool_can_prefetch() {
+        return;
+    }
+    let src = GaugedSource::new(gauged_pts_shards(), 12, 4);
+    let groups: Vec<usize> = (0..12).map(|i| i % 2).collect();
+    group_nonzero_counts_streaming_with_depth(&src, &groups, 2, Some(4)).unwrap();
+    assert_prefetch_engaged(&src, "group_nonzero_counts_streaming");
+}
+
+#[test]
+fn depth_one_decodes_pts_shards_on_the_calling_thread() {
+    use crate::test_support::GaugedSource;
+
+    let src = GaugedSource::new(gauged_pts_shards(), 12, 4);
+    let groups: Vec<usize> = (0..12).map(|i| i % 2).collect();
+    group_nonzero_counts_streaming_with_depth(&src, &groups, 2, Some(1)).unwrap();
+    assert!(
+        !src.decoded_off_thread(std::thread::current().id()),
+        "depth 1 must decode inline on the calling thread"
+    );
+}
+
+#[test]
+fn without_a_projection_the_pts_pass_reads_every_shard() {
+    use crate::test_support::GaugedSource;
+
+    let src = GaugedSource::new(gauged_pts_shards(), 12, 4);
+    let groups: Vec<usize> = (0..12).map(|i| i % 2).collect();
+    group_nonzero_counts_streaming(&src, &groups, 2).unwrap();
+    assert_eq!(src.decoded_shards(), vec![0, 1, 2, 3]);
+}

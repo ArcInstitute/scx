@@ -190,6 +190,76 @@ pub fn de_gene_chunk_or_err(requested: usize, n_obs: usize, context: &str) -> Re
 /// for the semantics and its unit test.
 pub use scx_format_io::prefetch::clamp_prefetch_depth;
 
+/// Decode-prefetch depth for the streaming DE kernels, budgeted against what
+/// the dense gene-chunk workspace has already claimed.
+///
+/// The bounded pipeline holds up to `depth` decoded **full-width** shards where
+/// the hand-rolled loop held one — the gene-chunk column projection happens in
+/// the consumer, after the read — so the depth is a memory decision, not just a
+/// concurrency one. `dense_bytes` is the workspace the caller already committed
+/// to (`n_obs x chunk x 4`), so the prefetch only gets what is left of
+/// [`de_memory_budget`].
+///
+/// Two consequences worth knowing, because they are the memory claim:
+///
+/// * On a budget-bound atlas file the dense workspace has already taken the
+///   budget, so this collapses to 1 and the kernel behaves exactly as it did
+///   before there was a pipeline — no extra resident bytes, no regression.
+/// * On ordinary shapes there is room for the full depth: 100 k cells x 500
+///   genes is 200 MB of a 4 GiB budget.
+///
+/// A source with no [`shard_size_hint`](scx_format_io::ShardSource::shard_size_hint)
+/// falls to **depth 1**, not to the unclamped request. There is no per-shard
+/// byte estimate to divide by, and this is reachable on real files rather than
+/// only on a hypothetical third-party source: `BackedCsrReader::shard_size_hint`
+/// answers `None` whenever the catalog carries no per-shard `nnz`, and
+/// `LazyShardSource` forwards that. Granting the full depth there would stack
+/// `depth` decoded shards on top of a full dense workspace on exactly the files
+/// that cannot be measured — an unbounded term under a function whose contract
+/// is a bound.
+///
+/// This deliberately diverges from
+/// `scx_gpu::gpu_shard_source::resolve_staging_prefetch_depth_for`, which does
+/// return the unclamped request without a hint. That is consistent there: its
+/// budget (`SCX_GPU_STAGING_MEMORY_BUDGET`) is unset by default, so "no budget"
+/// and "no hint" both mean "no clamp was asked for". Here the budget always
+/// exists (4 GiB by default), so a missing hint is a measurement failure, not an
+/// opt-out.
+///
+/// Deliberately **not** done: shrinking the gene chunk to make room for
+/// prefetch. That would change chunk counts on exactly the files where the
+/// clamp binds, trading a measured win for an unmeasured one.
+pub(crate) fn de_prefetch_depth(
+    hint: Option<scx_format_io::ShardSizeHint>,
+    dense_bytes: u64,
+) -> usize {
+    de_prefetch_depth_for(
+        scx_format_io::prefetch::prefetch_depth(),
+        hint,
+        dense_bytes,
+        de_memory_budget(),
+    )
+}
+
+/// The pure half of [`de_prefetch_depth`]: no env reads, no pool query.
+///
+/// Split out for the same reason `de_gene_chunk_or_err`'s tests inject a budget
+/// — `de_memory_budget()` and `prefetch_depth()` are both `OnceLock`-cached env
+/// reads, so a test that went through them would be order-dependent.
+pub(crate) fn de_prefetch_depth_for(
+    requested: usize,
+    hint: Option<scx_format_io::ShardSizeHint>,
+    dense_bytes: u64,
+    budget: u64,
+) -> usize {
+    let Some(hint) = hint else {
+        // Unmeasurable, so unbounded — take the floor rather than the request.
+        return 1;
+    };
+    let remaining = budget.saturating_sub(dense_bytes);
+    clamp_prefetch_depth(requested, hint.decoded_bytes(), remaining)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +420,100 @@ mod tests {
             return Err(AccelError::InvalidInput(format!("{context}: unfittable")));
         }
         Ok(chunk)
+    }
+
+    // --- de_prefetch_depth ------------------------------------------------
+    //
+    // The depth is a memory decision: the pipeline holds `depth` decoded
+    // full-width shards where the hand-rolled loop held one.
+
+    fn hint(nnz: usize) -> Option<scx_format_io::ShardSizeHint> {
+        Some(scx_format_io::ShardSizeHint {
+            max_rows: 1,
+            max_nnz: nnz,
+        })
+    }
+
+    /// No per-shard estimate means the budget cannot be honoured, so the depth
+    /// takes the floor rather than the request.
+    ///
+    /// Reachable on real files, not just a third-party source:
+    /// `BackedCsrReader::shard_size_hint` answers `None` whenever the catalog
+    /// carries no per-shard `nnz`. Returning the request there would put an
+    /// unbounded term under a function whose contract is a bound.
+    #[test]
+    fn de_prefetch_depth_without_a_hint_falls_to_the_floor() {
+        assert_eq!(de_prefetch_depth_for(4, None, 0, 1024), 1);
+        assert_eq!(de_prefetch_depth_for(4, None, 1024, 1024), 1);
+        // And a roomy budget does not buy back the depth: the shard size, not
+        // the budget, is what is unknown.
+        assert_eq!(de_prefetch_depth_for(4, None, 0, u64::MAX), 1);
+    }
+
+    /// A budget-bound file: the dense gene-chunk workspace already claimed the
+    /// budget, so the prefetch gets nothing and the kernel reverts to the
+    /// pre-pipeline sequential behaviour rather than adding resident bytes.
+    #[test]
+    fn de_prefetch_depth_collapses_to_one_when_the_workspace_took_the_budget() {
+        let budget = 4 * 1024 * 1024;
+        assert_eq!(de_prefetch_depth_for(4, hint(1 << 20), budget, budget), 1);
+        // And past it — `saturating_sub`, not a wrap into a huge remainder.
+        assert_eq!(
+            de_prefetch_depth_for(4, hint(1 << 20), budget * 2, budget),
+            1
+        );
+    }
+
+    /// Room for everything: a small shard against a large remainder.
+    #[test]
+    fn de_prefetch_depth_keeps_the_request_when_there_is_room() {
+        assert_eq!(de_prefetch_depth_for(4, hint(8), 0, 4 * 1024 * 1024), 4);
+    }
+
+    /// Charging the *requested* gene chunk rather than the one actually
+    /// allocated collapses the depth on a narrow gene view — the regression
+    /// this arm records, with the numbers that make it matter.
+    ///
+    /// 10 M cells projected to 10 genes: the caller asks for 500-gene chunks,
+    /// `clamp_de_gene_chunk` leaves the request alone because it fits, and the
+    /// buffer is `n_obs x min(500, 10)` — about 400 MB. Billing the request
+    /// instead charges ~20 GB against a 4 GiB budget, leaves nothing, and pins
+    /// the depth at 1 while depth 4 fits many times over.
+    #[test]
+    fn charging_the_request_instead_of_the_active_chunk_collapses_the_depth() {
+        let n_obs = 10_000_000u64;
+        let budget = 4 * 1024 * 1024 * 1024u64;
+        let shard = Some(scx_format_io::ShardSizeHint {
+            max_rows: 16_384,
+            max_nnz: 16_384 * 10,
+        });
+
+        let allocated = n_obs * 10 * 4; // active chunk = min(500, 10)
+        let as_requested = n_obs * 500 * 4; // what charging the request bills
+
+        assert_eq!(
+            de_prefetch_depth_for(4, shard, as_requested, budget),
+            1,
+            "charging the request must be what collapses the depth — \
+             otherwise this arm proves nothing"
+        );
+        assert_eq!(
+            de_prefetch_depth_for(4, shard, allocated, budget),
+            4,
+            "charging only the allocated workspace must leave room for the \
+             full depth"
+        );
+    }
+
+    /// The interesting middle, and the arm that would catch a clamp applied to
+    /// the wrong quantity: exactly two shards fit the remainder, so the depth is
+    /// two even though four were requested.
+    #[test]
+    fn de_prefetch_depth_grants_what_the_remainder_holds() {
+        // `decoded_bytes()` for max_rows=1, max_nnz=nnz is (1+1)*8 + nnz*8.
+        let per_shard = hint(126).unwrap().decoded_bytes();
+        assert_eq!(per_shard, 1024);
+        // Budget 3 KiB, workspace 1 KiB -> 2 KiB left -> two shards.
+        assert_eq!(de_prefetch_depth_for(4, hint(126), 1024, 3 * 1024), 2);
     }
 }

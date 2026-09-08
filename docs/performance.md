@@ -765,6 +765,58 @@ a rayon worker — the GPU staging path is now fully sequential, where the old d
 "no ambient parallelism" configuration, and the worker-thread guard is what keeps a
 nested call from deadlocking.
 
+### Decode-prefetch reaches the DE kernels
+
+Task 4.2 wired every loop that could reach the pipeline. Three streaming DE
+kernels could not: `wilcoxon_rank_sum_streaming`, `pdex_ref_streaming` and the
+`pts` counting pass each ran their own `for shard_idx in 0..n_shards`, so neither
+knob above governed them and neither did the row-projection shard skip the
+`ShardSource::visible_shard_indices` hook gives every driver consumer.
+
+They are two different shapes, and only the first is a per-gene-chunk walk.
+Wilcoxon and pdex now share one `fill_gene_chunk_dense` over
+`for_each_shard_ordered`; `pts` makes a single whole-matrix counting pass and
+moved that one pass onto the same ordered driver. DE is where this matters most
+because *its* shard walk is **inner** to its gene-chunk walk — every visited
+shard is read once per gene chunk, so the cost is
+`n_gene_chunks × visited shards`, where `pts` pays `visited shards` once. Two
+separable effects, measured separately.
+
+**The row-projection skip**, counted in shard decodes (`SCX_CPU_PROFILE=1`, a
+120 × 200 file in 5 shards of 24, `cache_shards=0` so every read is a decode):
+
+| request | before | after |
+|---|--:|--:|
+| `rank_genes_groups` / `pdex_ref`, one-shard row window | 5 | **1** |
+| `rank_genes_groups(pts=True)` (two passes), one-shard window | 10 | **2** |
+| `rank_genes_groups(gene_chunk_size=64)` → 4 chunks, one-shard window | 20 | **4** |
+| `rank_genes_groups`, 4 chunks, two-shard mask | 20 | **8** |
+| any of them, no row projection | 5 / 10 / 20 | unchanged |
+
+**The decode-prefetch** is a wall-clock claim, and it is deliberately **not
+published here**. It could be expressed as a `benchmark × format × dataset`
+triple — `bench_csc_dispatch`'s `bench_csc__de_csr` / `bench_csc__pdex_ref_csr`
+on `tabula_sapiens_100k` run CPU DE on a backed file, which *is* the streaming
+kernel — and [docs/benchmark_manifest.md](benchmark_manifest.md) is explicit
+that a claim of that shape must be manifested, with the inline-disclosure tier
+reserved for kernel measurements that genuinely cannot take it. The local
+depth-1-vs-4 numbers are in the pull request that made the change; the durable
+figure waits on a capture of those two arms, neither of which carries a floor in
+`thresholds.yaml` today.
+
+(For the record on the *shape* of the win, which the counts above already
+establish: overlap only helps where decode is repeated, so it is largest with no
+shard cache and smallest once the LRU holds the file — and flat on a one-shard
+row window, which has nothing to prefetch ahead of.)
+
+Peak memory is bounded rather than assumed: the pipeline holds `depth` decoded
+shards where the loop held one, and the DE prefetch clamp (`scx-accel`, crate-internal)
+grants only what the dense `n_obs × chunk` workspace left of
+`SCX_ACCEL_DE_MEMORY_BUDGET`. A budget-bound file therefore resolves to depth 1
+and keeps its pre-change footprint; on a plain backed handle the in-flight
+`Arc`s are the same ones the LRU already holds, so there is no second copy at
+all. The GPU CSR staging plan learned the same skip (`StagingPlan::for_source`).
+
 ### GPU DE device residency + gene-chunk windowing (Phase-4 task 4.5)
 
 4.2 widened GPU staging's decode; it did not reduce how much decoding there was.

@@ -211,6 +211,178 @@ def test_single_chunk_declines_residency(scx_path):
     assert info["resident_csr"] is False
 
 
+@pytest.fixture(scope="module")
+def window_path(tmp_path_factory):
+    """The first `SHARD_SIZE` rows as a file of their own — the value oracle for
+    a row-windowed run, on the same backend so the tolerance stays tight."""
+    import anndata as ad
+    import pandas as pd
+
+    adata = ad.AnnData(X=_make_counts()[:SHARD_SIZE])
+    adata.obs_names = [f"c{i}" for i in range(SHARD_SIZE)]
+    adata.var_names = [f"g{i}" for i in range(N_VARS)]
+    adata.obs["grp"] = pd.Categorical(
+        ["a" if i % 2 == 0 else "b" for i in range(SHARD_SIZE)]
+    )
+    path = tmp_path_factory.mktemp("gpu_de_window") / "window.scx"
+    pyscx.from_anndata(adata, str(path), shard_size=SHARD_SIZE)
+    return path
+
+
+# Host decode is what the staging plan moves, and it is *not* `shards_decoded`:
+# that counter lives in the `for_each_gpu_csr_shard` consumer, which
+# `drive_shards` reaches only after `is_stageable` (`n_rows() != 0`) has already
+# dropped the empty shards — on the base commit too. Comparing it would pass
+# with `StagingPlan::for_source` reverted. The decode counter behind
+# `SCX_CPU_PROFILE` sits in the reader, below the feeder, so it sees the reads
+# the plan actually removes.
+_DECODE_ARM = textwrap.dedent(
+    """
+    import json, sys
+    import numpy as np
+    import pyscx
+
+    path, op, window = sys.argv[1], sys.argv[2], sys.argv[3] == "window"
+    adata = pyscx.open(path).to_anndata(backed=True, cache_shards=0)
+    n_shards = adata.X.n_shards
+    if window:
+        adata = adata[:{shard}]
+
+    pyscx.accel.cpu_profile_reset()
+    if op == "wilcoxon":
+        pyscx.accel.rank_genes_groups(
+            adata, "grp", device="gpu", gene_chunk_size={chunk}
+        )
+        res = adata.uns["rank_genes_groups"]
+        info = adata.uns["scx_accel"]["rank_genes_groups"]
+        values = {{
+            "names": [list(map(str, res["names"][f])) for f in res["names"].dtype.names],
+            "scores": [
+                list(map(float, res["scores"][f])) for f in res["scores"].dtype.names
+            ],
+        }}
+    else:
+        df = pyscx.accel.pdex_ref(
+            adata, "grp", reference="a", device="gpu", gene_chunk_size={chunk}
+        )
+        info = adata.uns["scx_accel"]["pdex_ref"]
+        values = {{
+            "feature": [str(v) for v in df["feature"]],
+            "p_value": [float(v) for v in df["p_value"]],
+            "target_mean": [float(v) for v in df["target_mean"]],
+        }}
+    snap = pyscx.accel.cpu_profile_snapshot()
+    print("@@JSON@@" + json.dumps({{
+        "enabled": snap["enabled"],
+        "decodes": snap["decode_scx1"]["count"] + snap["decode_generic"]["count"],
+        "n_shards": n_shards,
+        "route": info["route"],
+        "values": values,
+    }}))
+    """
+).format(chunk=GENE_CHUNK, shard=SHARD_SIZE)
+
+
+def _decode_arm(path, op: str, window: bool) -> dict:
+    env = dict(os.environ)
+    # The profiler gate is a `OnceLock` read, so it must be set before import.
+    env["SCX_CPU_PROFILE"] = "1"
+    env["SCX_DISABLE_CUDA_GRAPHS"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _DECODE_ARM, str(path), op, "window" if window else "all"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    assert proc.returncode == 0, (
+        f"{op} decode arm (window={window}) failed:\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    )
+    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("@@JSON@@"))
+    res = json.loads(line[len("@@JSON@@") :])
+    assert res["enabled"], "SCX_CPU_PROFILE did not take — the count is not a count"
+    return res
+
+
+@pytest.mark.parametrize("op", ["wilcoxon", "pdex_ref"])
+def test_a_row_window_decodes_only_the_shards_it_keeps(scx_path, op):
+    """The GPU staging plan honours a row-filtering source's shard plan.
+
+    `RawGpuShardSource::run` built `StagingPlan::all(n_shards)`, so a
+    row-windowed handle host-decoded every shard and `drive_shards` dropped the
+    empty ones at `is_stageable`, after the decode was paid for. It now builds
+    the plan with `StagingPlan::for_source`.
+
+    Asserted as a *ratio*, so it holds either side of the residency decision:
+    residency drains the source once, streaming drains it once per gene chunk.
+    Either way a one-of-six-shard window must cost a sixth.
+    """
+    n_shards = N_OBS // SHARD_SIZE
+    assert n_shards > 1, "premise: a single-shard file cannot show a skip"
+
+    full = _decode_arm(scx_path, op, window=False)
+    win = _decode_arm(scx_path, op, window=True)
+
+    assert full["n_shards"] == n_shards
+    assert full["route"] == "gpu_csr_v3", (
+        f"premise: the fixture must take the CSR staging route, got "
+        f"{full['route']!r} — the CSC route prefilters by column range and never "
+        "consults the row plan."
+    )
+    assert win["route"] == "gpu_csr_v3", (
+        f"premise: a row-windowed handle must stay on the CSR route, got "
+        f"{win['route']!r}"
+    )
+    assert full["decodes"] >= n_shards, (
+        f"premise: the unwindowed run must decode every shard, got "
+        f"{full['decodes']}"
+    )
+    assert win["decodes"] == full["decodes"] // n_shards, (
+        f"a one-of-{n_shards}-shard row window host-decoded {win['decodes']} "
+        f"shards against {full['decodes']} unwindowed; the projection empties "
+        f"the other {n_shards - 1}"
+    )
+    assert win["decodes"] >= 1, "the window keeps rows, so it must decode something"
+
+
+@pytest.mark.parametrize("op", ["wilcoxon", "pdex_ref"])
+def test_a_row_window_gives_the_same_answer_as_those_rows_alone(
+    scx_path, window_path, op
+):
+    """Skipping a shard must not move a row.
+
+    The GPU CSR passes scatter at a running count of visible rows, so a plan
+    that disagreed with the rows delivered would return a fully formed, shifted
+    result. The decode-count test above cannot see that; this one can. Compared
+    against the same rows written as their own file and run on the same backend,
+    so the tolerance stays tight rather than absorbing a CPU/GPU gap.
+    """
+    win = _decode_arm(scx_path, op, window=True)["values"]
+    ref = _decode_arm(window_path, op, window=False)["values"]
+
+    for key, got in win.items():
+        want = ref[key]
+        if key in ("names", "feature"):
+            assert got == want, f"{op}: {key} differs between the window and its own file"
+            continue
+        # The same split the residency test uses, and for the same reason: the
+        # pseudobulk fold is an f64 `atomicAdd` whose ordering is run-to-run
+        # nondeterministic, so means and fold changes are a tolerance question.
+        # Statistics and p-values come from the single-writer scatter slabs and
+        # are exact. These are two separate GPU processes, so `target_mean` is
+        # squarely in the nondeterministic bucket.
+        exact = key in ("scores", "p_value")
+        rtol, atol = (1e-9, 1e-12) if exact else (1e-5, 1e-7)
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float64),
+            np.asarray(want, dtype=np.float64),
+            rtol=rtol,
+            atol=atol,
+            err_msg=f"{op}: {key} differs between the window and its own file",
+        )
+
+
 def test_cpu_route_records_no_residency_decision(scx_path):
     """`resident_csr` is `None`, not `False`, where there is no decision to
     make — a CPU route never re-decodes per chunk in the first place."""

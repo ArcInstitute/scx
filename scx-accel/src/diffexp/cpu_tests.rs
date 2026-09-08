@@ -2204,3 +2204,337 @@ fn restrict_to_groups_rejects_unknown_and_duplicate_names() {
         .to_string();
     assert!(err.contains("twice"), "{err}");
 }
+
+// ── Prefetch-driver adoption: skip, concurrency, identity, coverage ──────
+//
+// Both CSR streaming kernels used to run their own `for shard_idx in
+// 0..n_shards` loop per gene chunk. Four properties are only observable with an
+// instrumented source, and none of the tests above can see any of them: which
+// shards were read, which thread read them, whether the depth changes the
+// numbers, and what happens when a source's plan disagrees with the rows it
+// hands over.
+
+use crate::test_support::{assert_prefetch_engaged, pool_can_prefetch, GaugedSource};
+
+const G_SHARDS: usize = 5;
+const G_ROWS: usize = 8;
+const G_VARS: usize = 6;
+
+/// `n_shards` CSR shards of `rows_per_shard × n_vars`. Values vary with both the
+/// global row and the column, so every gene has a nontrivial rank-sum across the
+/// two groups and no two shards are interchangeable — a misplaced row changes
+/// the answer.
+fn gauged_de_shards() -> Vec<scx_sparse::ScxCsr> {
+    (0..G_SHARDS)
+        .map(|s| {
+            let mut indptr = vec![0i64];
+            let mut indices = Vec::new();
+            let mut data = Vec::new();
+            for r in 0..G_ROWS {
+                let global = s * G_ROWS + r;
+                for c in 0..G_VARS {
+                    if !(global + c).is_multiple_of(3) {
+                        indices.push(c as i32);
+                        data.push(((global * 7 + c * 11) % 23 + 1) as f32);
+                    }
+                }
+                indptr.push(indices.len() as i64);
+            }
+            scx_sparse::ScxCsr::new_unchecked((G_ROWS, G_VARS), indptr, indices, data)
+        })
+        .collect()
+}
+
+/// Row-concatenate shards into one CSR — the in-memory oracle's input.
+fn concat_csr(shards: &[&scx_sparse::ScxCsr]) -> scx_sparse::ScxCsr {
+    let mut indptr = vec![0i64];
+    let mut indices = Vec::new();
+    let mut data = Vec::new();
+    let mut rows = 0usize;
+    for s in shards {
+        for r in 0..s.n_rows() {
+            for j in s.indptr[r] as usize..s.indptr[r + 1] as usize {
+                indices.push(s.indices[j]);
+                data.push(s.data[j]);
+            }
+            indptr.push(indices.len() as i64);
+            rows += 1;
+        }
+    }
+    scx_sparse::ScxCsr::new_unchecked((rows, G_VARS), indptr, indices, data)
+}
+
+fn de_names() -> Vec<String> {
+    (0..G_VARS).map(|c| format!("g{c}")).collect()
+}
+
+fn de_groups(n_obs: usize) -> Vec<usize> {
+    (0..n_obs).map(|i| i % 2).collect()
+}
+
+fn de_group_names() -> Vec<String> {
+    vec!["A".to_string(), "B".to_string()]
+}
+
+fn run_wilcoxon<S: ShardSource + Sync + ?Sized>(
+    src: &S,
+    chunk: usize,
+    depth: Option<usize>,
+) -> Result<DiffExpResult> {
+    let n_obs = src.n_obs();
+    wilcoxon_rank_sum_streaming_with_depth(
+        src,
+        &de_names(),
+        &de_groups(n_obs),
+        &de_group_names(),
+        None,
+        chunk,
+        false,
+        false,
+        true,
+        depth,
+    )
+}
+
+fn run_pdex<S: ShardSource + Sync + ?Sized>(
+    src: &S,
+    chunk: usize,
+    depth: Option<usize>,
+) -> Result<PdexRefResult> {
+    let n_obs = src.n_obs();
+    pdex_ref_streaming_with_depth(
+        src,
+        &de_names(),
+        &de_groups(n_obs),
+        &de_group_names(),
+        0,
+        chunk,
+        crate::pseudobulk::GeomMeanMode::ArithRaw,
+        1e-9,
+        None,
+        depth,
+    )
+}
+
+/// Exact, not `assert_diffexp_results_match`'s tolerance. `StableOrder` promises
+/// bit identity, so a tolerance here would let a genuine reordering through.
+fn assert_diffexp_identical(a: &DiffExpResult, b: &DiffExpResult, what: &str) {
+    assert_eq!(a.group_names, b.group_names, "{what}: group names");
+    assert_eq!(a.names, b.names, "{what}: gene order");
+    assert_eq!(a.gene_indices, b.gene_indices, "{what}: gene indices");
+    assert_eq!(a.scores, b.scores, "{what}: scores");
+    assert_eq!(a.pvals, b.pvals, "{what}: pvals");
+    assert_eq!(a.pvals_adj, b.pvals_adj, "{what}: pvals_adj");
+    assert_eq!(a.logfoldchanges, b.logfoldchanges, "{what}: logfoldchanges");
+}
+
+/// The headline: a shard the row projection empties is never read.
+///
+/// Before the kernels used the drivers this decoded all five shards, once per
+/// gene chunk, and the excluded ones contributed nothing after a full decode,
+/// transform pass and column projection.
+#[test]
+fn a_row_projection_skips_the_shards_it_empties() {
+    let plan = vec![0usize, 4];
+    for chunk in [G_VARS, 2] {
+        let src = GaugedSource::new(gauged_de_shards(), G_SHARDS * G_ROWS, G_VARS)
+            .with_plan(plan.clone());
+        run_wilcoxon(&src, chunk, None).unwrap();
+        assert_eq!(
+            src.decoded_shards(),
+            plan,
+            "wilcoxon (chunk {chunk}): read a shard the plan excluded"
+        );
+        let n_chunks = G_VARS.div_ceil(chunk);
+        assert_eq!(
+            src.decode_count(),
+            plan.len() * n_chunks,
+            "wilcoxon (chunk {chunk}): one read per planned shard per gene chunk"
+        );
+
+        src.reset();
+        run_pdex(&src, chunk, None).unwrap();
+        assert_eq!(
+            src.decoded_shards(),
+            plan,
+            "pdex (chunk {chunk}): read a shard the plan excluded"
+        );
+        assert_eq!(
+            src.decode_count(),
+            plan.len() * n_chunks,
+            "pdex (chunk {chunk})"
+        );
+    }
+}
+
+/// Accept side: with no plan every shard is still read, so the assertion above
+/// cannot be satisfied by a skip that fires unconditionally.
+#[test]
+fn without_a_projection_every_shard_is_still_read() {
+    let src = GaugedSource::new(gauged_de_shards(), G_SHARDS * G_ROWS, G_VARS);
+    run_wilcoxon(&src, 2, None).unwrap();
+    assert_eq!(src.decoded_shards(), (0..G_SHARDS).collect::<Vec<_>>());
+    assert_eq!(src.decode_count(), G_SHARDS * G_VARS.div_ceil(2));
+}
+
+/// The skip must not change the answer: DE over a plan equals DE by a different
+/// kernel on exactly those rows, gathered in memory.
+#[test]
+fn de_over_a_plan_matches_the_in_memory_kernel_on_the_same_rows() {
+    let shards = gauged_de_shards();
+    let plan = vec![0usize, 2, 4];
+    let oracle_csr = concat_csr(&plan.iter().map(|&i| &shards[i]).collect::<Vec<_>>());
+    let n_obs = oracle_csr.n_rows();
+
+    let src =
+        GaugedSource::new(gauged_de_shards(), G_SHARDS * G_ROWS, G_VARS).with_plan(plan.clone());
+    assert_eq!(src.n_obs(), n_obs, "premise: the plan carries these rows");
+
+    let streamed = run_wilcoxon(&src, 2, None).unwrap();
+    let oracle = wilcoxon_rank_sum_sparse(
+        &oracle_csr,
+        &de_names(),
+        &de_groups(n_obs),
+        &de_group_names(),
+        None,
+        2,
+        false,
+        false,
+        true,
+    )
+    .unwrap();
+    assert_diffexp_identical(&streamed, &oracle, "planned stream vs in-memory kernel");
+}
+
+/// The prefetch pipeline's sequential fallback is silent: it produces the same
+/// numbers as an engaged one, so nothing in a correctness test can tell them
+/// apart. Assert the structural property instead — a decode ran off the calling
+/// thread.
+#[test]
+fn streaming_de_decodes_shards_concurrently() {
+    if !pool_can_prefetch() {
+        return;
+    }
+    let src = GaugedSource::new(gauged_de_shards(), G_SHARDS * G_ROWS, G_VARS);
+    run_wilcoxon(&src, 2, Some(4)).unwrap();
+    assert_prefetch_engaged(&src, "wilcoxon_rank_sum_streaming");
+
+    src.reset();
+    run_pdex(&src, 2, Some(4)).unwrap();
+    assert_prefetch_engaged(&src, "pdex_ref_streaming");
+}
+
+/// Depth 1 must take the sequential fallback, which is what makes
+/// `SCX_ACCEL_PREFETCH_DEPTH=1` a genuine baseline for an A/B rather than
+/// merely an "off" label.
+#[test]
+fn depth_one_decodes_de_shards_on_the_calling_thread() {
+    let src = GaugedSource::new(gauged_de_shards(), G_SHARDS * G_ROWS, G_VARS);
+    run_wilcoxon(&src, 2, Some(1)).unwrap();
+    assert!(
+        !src.decoded_off_thread(std::thread::current().id()),
+        "depth 1 must decode inline on the calling thread"
+    );
+}
+
+/// Overlapped decode must not perturb the arithmetic. Exact equality, both
+/// kernels, with and without a plan.
+#[test]
+fn streaming_de_is_bit_identical_across_prefetch_depths() {
+    for plan in [None, Some(vec![0usize, 3])] {
+        let build = || {
+            let s = GaugedSource::new(gauged_de_shards(), G_SHARDS * G_ROWS, G_VARS);
+            match &plan {
+                Some(p) => s.with_plan(p.clone()),
+                None => s,
+            }
+        };
+        let seq = build();
+        let pre = build();
+        assert_diffexp_identical(
+            &run_wilcoxon(&seq, 2, Some(1)).unwrap(),
+            &run_wilcoxon(&pre, 2, Some(4)).unwrap(),
+            "wilcoxon depth 1 vs 4",
+        );
+
+        let seq = build();
+        let pre = build();
+        let a = run_pdex(&seq, 2, Some(1)).unwrap();
+        let b = run_pdex(&pre, 2, Some(4)).unwrap();
+        assert_eq!(a.feature_names, b.feature_names, "pdex feature order");
+        assert_eq!(a.target_means, b.target_means, "pdex target means");
+        assert_eq!(a.ref_means, b.ref_means, "pdex ref means");
+        assert_eq!(a.p_values, b.p_values, "pdex p-values");
+        assert_eq!(a.fdrs, b.fdrs, "pdex FDRs");
+        assert_eq!(a.statistics, b.statistics, "pdex statistics");
+        assert_eq!(a.percent_changes, b.percent_changes, "pdex percent changes");
+    }
+}
+
+/// A source whose plan omits a shard that *does* hold visible rows.
+///
+/// This is the one failure mode adopting the drivers introduces: the dense
+/// buffer is filled at a running visible-row cursor, so a short plan would place
+/// every later row one shard too early and still return a fully formed result.
+/// The kernels' two row-count checks turn that into an error.
+struct LyingPlanSource {
+    shards: Vec<scx_sparse::ScxCsr>,
+    n_obs: usize,
+    plan: Vec<usize>,
+}
+
+impl ShardSource for LyingPlanSource {
+    fn n_shards(&self) -> usize {
+        self.shards.len()
+    }
+    fn n_obs(&self) -> usize {
+        self.n_obs
+    }
+    fn n_vars(&self) -> usize {
+        G_VARS
+    }
+    fn visible_shard_indices(&self) -> Option<Vec<usize>> {
+        Some(self.plan.clone())
+    }
+    fn read_shard(&self, shard_idx: usize) -> scx_format_io::Result<scx_sparse::ScxCsr> {
+        Ok(self.shards[shard_idx].clone())
+    }
+}
+
+#[test]
+fn a_plan_that_under_covers_n_obs_is_an_error_not_a_shifted_result() {
+    // Claims 5 shards' worth of rows, plans 2.
+    let src = LyingPlanSource {
+        shards: gauged_de_shards(),
+        n_obs: G_SHARDS * G_ROWS,
+        plan: vec![0, 1],
+    };
+    for err in [
+        run_wilcoxon(&src, 2, None).unwrap_err().to_string(),
+        run_pdex(&src, 2, None).unwrap_err().to_string(),
+    ] {
+        assert!(
+            err.contains("cover 16 rows") && err.contains("n_obs = 40"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn a_plan_that_over_covers_n_obs_is_an_error_not_a_panic() {
+    // Claims one shard's worth of rows, plans three.
+    let src = LyingPlanSource {
+        shards: gauged_de_shards(),
+        n_obs: G_ROWS,
+        plan: vec![0, 1, 2],
+    };
+    for err in [
+        run_wilcoxon(&src, 2, None).unwrap_err().to_string(),
+        run_pdex(&src, 2, None).unwrap_err().to_string(),
+    ] {
+        assert!(
+            err.contains("exceeding n_obs = 8") && err.contains("shard 1"),
+            "{err}"
+        );
+    }
+}

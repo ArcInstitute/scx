@@ -26,6 +26,7 @@ mod wilcoxon_reference_tests;
 pub(crate) mod wilcoxon_reference_values;
 
 pub use groups::{partition_by_group, GroupPartition};
+
 pub use pts::{
     group_nonzero_counts_csr, group_nonzero_counts_dense, group_nonzero_counts_streaming,
     GroupNonzeroCounts, PtsFractions,

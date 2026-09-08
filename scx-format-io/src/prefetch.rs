@@ -299,9 +299,11 @@ where
 ///
 /// The GPU CSR staging path builds its plan as a list even when that list is
 /// `0..n_shards`, so that it and the CSC path run the *same* driver over the
-/// same plan type. A `StagingPlan` variant meaning "all of them" would have
-/// been an enum arm only one layout could ever produce — coverage that reads as
-/// real and is not.
+/// same plan type. (The rationale used to be that a variant meaning "all of
+/// them" would be an arm only one layout could produce; that stopped being true
+/// once the CSR path began asking the source for a visible-shard plan, and can
+/// itself produce either shape. What survives is that the caller has already
+/// resolved visibility, so the driver takes a resolved list and nothing else.)
 ///
 /// `indices` must be strictly ascending (see [`for_each_ordered_selected`]).
 ///

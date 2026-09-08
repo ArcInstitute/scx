@@ -42,6 +42,60 @@ use crate::route::{
 };
 use crate::{AccelError, Result};
 
+/// A [`scx_format_io::VisibleRowCursor`] for a shard callback typed on
+/// `GpuError`.
+///
+/// The callback cannot return an `AccelError`, and each drive blankets every
+/// `GpuError` it returns into [`AccelError::LinAlg`]. Letting the cursor's error
+/// go out that way reported an **over**-covering plan as `LinAlg` while the
+/// **under**-covering one `finish` catches stayed `ShapeError` — two spellings
+/// for one defect, on a backend whose CPU twin reports both as `ShapeError`. So
+/// the typed error is captured here and re-raised after the drive; the
+/// `GpuError` the callback returns exists only to stop it.
+struct GpuRowCursor {
+    inner: scx_format_io::VisibleRowCursor,
+    captured: Option<AccelError>,
+}
+
+impl GpuRowCursor {
+    fn new(n_obs: usize) -> Self {
+        Self {
+            inner: scx_format_io::VisibleRowCursor::new(n_obs),
+            captured: None,
+        }
+    }
+
+    /// Claim a shard's rows, returning the visible row its first row occupies.
+    /// The `Err` only aborts the drive — [`Self::take_error`] carries the real one.
+    fn advance(
+        &mut self,
+        n_rows: usize,
+        shard_idx: usize,
+        context: &str,
+    ) -> std::result::Result<usize, scx_gpu::GpuError> {
+        match self.inner.advance(n_rows, shard_idx, context) {
+            Ok(start) => Ok(start),
+            Err(msg) => {
+                self.captured = Some(AccelError::ShapeError(msg.clone()));
+                Err(scx_gpu::GpuError::InvalidShard(msg))
+            }
+        }
+    }
+
+    /// Re-raise a captured plan disagreement. Call **before** the drive's own
+    /// `map_err`, or it is relabelled as a device failure.
+    fn take_error(&mut self) -> Result<()> {
+        match self.captured.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn finish(&self, context: &str) -> Result<()> {
+        self.inner.finish(context).map_err(AccelError::ShapeError)
+    }
+}
+
 /// Stamp the planned execution info onto a `pdex_ref` GPU result and emit a
 /// structured route log line. The route is decided up front by
 /// [`plan_de_route`] (the single source of truth) so the stamped route always
@@ -1130,12 +1184,18 @@ fn pdex_ref_gpu_chunked_v3_csr(
 
         // Single CSR shard pass per chunk: scatter to ref + per-tg slabs +
         // accumulate pseudobulk sums via the v3 CSR-direct kernel.
-        let mut global_row = 0usize;
+        // The plan is the source's, not `0..n_shards`, since
+        // `StagingPlan::for_source` — so the cursor carries the same
+        // over/under-coverage checks the CPU kernels use. Over-coverage here is
+        // an out-of-bounds *device* read: the kernels index
+        // `cell_to_group[global_row + r]` into a buffer of length `n_obs`.
+        let mut cursor = GpuRowCursor::new(n_obs);
         source
-            .for_each_gpu_csr_shard(&mut |_idx, slot| {
+            .for_each_gpu_csr_shard(&mut |idx, slot| {
                 shards_decoded += 1;
                 let view = slot.view();
                 let n_rows = view.shape.0;
+                let global_row = cursor.advance(n_rows, idx, "GPU DE v3 CSR shard pass")?;
                 // group_id = 0 is the reference; 1..=n_test are the test groups
                 // (matches offsets_host layout: ref cells first, then each tg).
                 gpu_de_scatter_csr_to_gene_major_filtered(
@@ -1181,10 +1241,17 @@ fn pdex_ref_gpu_chunked_v3_csr(
                     c1,
                     mode_id,
                 )?;
-                global_row += n_rows;
                 Ok(())
             })
-            .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 CSR shard pass: {e}")))?;
+            .map_err(|e| {
+                // The cursor's own error first, so a plan disagreement is not
+                // relabelled as a device failure by this blanket wrap.
+                cursor
+                    .take_error()
+                    .err()
+                    .unwrap_or_else(|| AccelError::LinAlg(format!("GPU DE v3 CSR shard pass: {e}")))
+            })?;
+        cursor.finish("GPU DE v3 CSR shard pass")?;
 
         let (chunk_ref_means, chunk_target_means) =
             compute_pdex_means_from_sums(dev, &scratch.sums, sz, n_ref, &target_memberships, mode)?;
@@ -1199,11 +1266,13 @@ fn pdex_ref_gpu_chunked_v3_csr(
                 dev.stream()
                     .memset_zeros(&mut sums_view)
                     .map_err(|e| AccelError::LinAlg(format!("GPU DE v3 memset arith sums: {e}")))?;
-                let mut global_row2 = 0usize;
+                let mut cursor2 = GpuRowCursor::new(n_obs);
                 source
-                    .for_each_gpu_csr_shard(&mut |_idx, slot| {
+                    .for_each_gpu_csr_shard(&mut |idx, slot| {
                         let view = slot.view();
                         let n_rows = view.shape.0;
+                        let global_row2 =
+                            cursor2.advance(n_rows, idx, "GPU DE v3 CSR arith shard pass")?;
                         gpu_de_pseudobulk_csr_direct(
                             dev,
                             &view,
@@ -1215,12 +1284,14 @@ fn pdex_ref_gpu_chunked_v3_csr(
                             c1,
                             cpm_mode_id,
                         )?;
-                        global_row2 += n_rows;
                         Ok(())
                     })
                     .map_err(|e| {
-                        AccelError::LinAlg(format!("GPU DE v3 CSR arith shard pass: {e}"))
+                        cursor2.take_error().err().unwrap_or_else(|| {
+                            AccelError::LinAlg(format!("GPU DE v3 CSR arith shard pass: {e}"))
+                        })
                     })?;
+                cursor2.finish("GPU DE v3 CSR arith shard pass")?;
                 compute_pdex_means_from_sums(
                     dev,
                     &scratch.sums,
@@ -2445,13 +2516,15 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
                 n_slots,
                 sz,
             )?;
-            let mut global_row = 0usize;
+            let mut cursor = GpuRowCursor::new(n_obs);
             let mut shards = 0usize;
             source
-                .for_each_gpu_csr_shard(&mut |_idx, slot| {
+                .for_each_gpu_csr_shard(&mut |idx, slot| {
                     shards += 1;
                     let view = slot.view();
                     let n_rows = view.shape.0;
+                    let global_row =
+                        cursor.advance(n_rows, idx, "GPU DE Wilcoxon v3 CSR shard pass")?;
                     gpu_de_scatter_csr_to_gene_major_filtered(
                         dev,
                         &view,
@@ -2495,12 +2568,14 @@ fn wilcoxon_rank_sum_gpu_chunked_v3_csr(
                         c1,
                         0,
                     )?;
-                    global_row += n_rows;
                     Ok(())
                 })
                 .map_err(|e| {
-                    AccelError::LinAlg(format!("GPU DE Wilcoxon v3 CSR shard pass: {e}"))
+                    cursor.take_error().err().unwrap_or_else(|| {
+                        AccelError::LinAlg(format!("GPU DE Wilcoxon v3 CSR shard pass: {e}"))
+                    })
                 })?;
+            cursor.finish("GPU DE Wilcoxon v3 CSR shard pass")?;
             Ok(shards)
         },
     )?;

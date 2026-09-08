@@ -654,6 +654,50 @@ fn filter_and_build_result(
 /// Sorted group mapping shared by the GPU means paths: per-cell group id (i32,
 /// in the same lexicographic order as [`build_group_mapping`]), the sorted
 /// group labels, and per-group cell counts.
+/// Classify a `gpu_pseudobulk_means_csr` failure.
+///
+/// That call's shard pass guards the visible-row coverage its device kernel
+/// depends on, and reports a plan disagreement as `GpuError::InvalidShard` —
+/// the only `InvalidShard` it can produce. Blanket-wrapping every `GpuError` in
+/// [`AccelError::LinAlg`] relabelled that as a device failure, which is the
+/// asymmetry the GPU DE passes grew `GpuRowCursor` to avoid: a coverage error is
+/// a `ShapeError` on both backends and on both halves of the check.
+#[cfg(feature = "gpu")]
+fn pseudobulk_gpu_err(context: &str, e: scx_gpu::GpuError) -> crate::AccelError {
+    match e {
+        scx_gpu::GpuError::InvalidShard(msg) => crate::AccelError::ShapeError(msg),
+        other => crate::AccelError::LinAlg(format!("{context}: {other}")),
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_err_tests {
+    use super::pseudobulk_gpu_err;
+
+    /// A coverage error must keep its classification across the crate boundary,
+    /// and a device error must keep its context prefix. Runs on a CPU host: it
+    /// is a match on an error value, with no device in it.
+    #[test]
+    fn a_coverage_error_stays_a_shape_error_and_others_stay_linalg() {
+        let shape = pseudobulk_gpu_err(
+            "ctx",
+            scx_gpu::GpuError::InvalidShard("cover 4 rows but n_obs = 6".into()),
+        );
+        assert!(
+            matches!(shape, crate::AccelError::ShapeError(ref m) if m == "cover 4 rows but n_obs = 6"),
+            "{shape:?}"
+        );
+        // Unprefixed on purpose: the message is the cursor's own and already
+        // names the pass, so re-prefixing would double it.
+
+        let other = pseudobulk_gpu_err("ctx", scx_gpu::GpuError::OutOfMemory("vram".into()));
+        assert!(
+            matches!(other, crate::AccelError::LinAlg(ref m) if m.starts_with("ctx: ")),
+            "{other:?}"
+        );
+    }
+}
+
 #[cfg(feature = "gpu")]
 fn gpu_group_plan(
     obs_groups: &[Vec<String>],
@@ -699,7 +743,7 @@ pub fn pseudobulk_means_gpu_streaming<S: ShardSource + Sync>(
         n_vars,
         &cell_counts,
     )
-    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (streaming): {e}")))?;
+    .map_err(|e| pseudobulk_gpu_err("GPU pseudobulk means (streaming)", e))?;
 
     filter_and_build_result(
         means,
@@ -747,7 +791,7 @@ pub fn pseudobulk_means_gpu_from_slices(
         n_vars,
         &cell_counts,
     )
-    .map_err(|e| crate::AccelError::LinAlg(format!("GPU pseudobulk means (csr): {e}")))?;
+    .map_err(|e| pseudobulk_gpu_err("GPU pseudobulk means (csr)", e))?;
 
     filter_and_build_result(
         means,

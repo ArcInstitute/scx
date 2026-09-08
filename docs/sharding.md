@@ -516,8 +516,9 @@ Two mechanisms, because the row set arrives two ways:
   `col_sums_and_nnz_masked`, and their column-projected twins) ask
   `BackedCsrIndex::shards_with_kept_rows` for the shard list up front. That is
   catalog arithmetic — two `partition_point`s per shard, no I/O.
-- **Kernels that stream a `ShardSource`** (PCA, HVG, `score_genes`, `pflog`)
-  cannot see the row set: it belongs to the source. Those go through
+- **Kernels that stream a `ShardSource`** (PCA, HVG, `score_genes`, `pflog`,
+  and the DE kernels — Wilcoxon, pdex and the `pts` counting pass) cannot see
+  the row set: it belongs to the source. Those go through
   `ShardSource::visible_shard_indices`, which the lazy source overrides and the
   decode-prefetch drivers consult before scheduling a read. The default is
   `None` — "visit every shard" — so a source without a row filter is unaffected.
@@ -541,6 +542,10 @@ Measured on a 120 x 200 file in 5 shards of 24 rows, counting shard decodes:
 | `pca(mask_var=…)`, one-shard window (5 without the adapter forward) | 1 |
 | `highly_variable_genes(flavor="seurat_v3")` (two passes), one-shard window | 2 of 10 |
 | `normalize_total` + `log1p` chain, two-shard mask | 2 |
+| `rank_genes_groups` / `pdex_ref`, one-shard window | 1 of 5 |
+| `rank_genes_groups(pts=True)` (two passes), one-shard window | 2 of 10 |
+| `rank_genes_groups(gene_chunk_size=…)`, 4 chunks, one-shard window | 4 of 20 |
+| `rank_genes_groups`, 4 chunks, two-shard mask | 8 of 20 |
 
 A plan can also be **empty** — a projection that keeps no row in any shard, as
 `adata[:0]` does. That is where skipping needed care rather than just wiring: the
@@ -561,21 +566,34 @@ a global row offset, which now comes from the shard's own `row_start` rather
 than a running count of rows seen, since a running count under-counts once a
 shard is skipped.
 
-Two families are **not** covered — the first by design, the second measured
-rather than assumed:
+One family is **not** covered, by design: row-*axis* kernels.
+`calculate_qc_metrics`' fused row pass writes into `n_obs`-length vectors and
+ends by checking that the shards it saw tile `[0, n_obs)`; it applies its row
+projection after the pass, so its shard count is unchanged. That check is also
+why `BackedCsrReader` deliberately does not override `visible_shard_indices`
+even though it knows the file's deletion keep-mask. Everything else is covered —
+the streaming DE kernels were the last family running their own shard loop.
 
-- Row-*axis* kernels, deliberately. `calculate_qc_metrics`' fused row pass writes
-  into `n_obs`-length vectors and ends by checking that the shards it saw tile
-  `[0, n_obs)`; it applies its row projection after the pass, so its shard count
-  is unchanged by design.
-- **The streaming Wilcoxon / pdex kernels, not yet.** They do not use the
-  decode-prefetch drivers at all — each gene chunk runs its own
-  `for shard_idx in 0..n_shards` loop — so consulting the source never happens.
-  Measured: `rank_genes_groups` and `pdex_ref` on a one-of-five-shard row window
-  still decode 5 shards. Routing them through the drivers would pick up the skip
-  *and* the decode-prefetch they currently lack, at `n_gene_chunks x n_shards`
-  scale; it is a separate change to that kernel, with its own row-offset cursor
-  to rebase.
+The DE rows in the table above are the largest saving, because DE's shard walk
+is **inner** to its gene-chunk walk — every visited shard is read once per gene
+chunk, so the cost is `n_gene_chunks x visited shards`, not `n_shards`. That is
+also why the per-chunk factor is only paid in *decodes* when the shard LRU
+cannot hold the shards being revisited: with `cache_shards` sized to the file,
+the four-chunk run above costs the same 5 decodes as a one-chunk run, and the
+undersized-cache warning measures the cache against the shards a call visits
+rather than against the file.
+
+Going through the drivers also gave the DE kernels the bounded decode-prefetch
+they never had — a separate effect from the skip, measured separately, and not
+quoted here: it is a wall-clock claim of a shape
+[docs/benchmark_manifest.md](benchmark_manifest.md) requires a manifest entry
+for. Overlap helps where decode is repeated, so it is largest with no shard
+cache and vanishes on a one-shard window. Depth is clamped
+by the DE prefetch clamp (`scx-accel`, crate-internal) against whatever the dense
+`n_obs x chunk` workspace left of `SCX_ACCEL_DE_MEMORY_BUDGET`, so a
+budget-bound file falls back to depth 1 rather than growing: the pipeline holds
+`depth` decoded shards where the loop held one, and on a plain backed handle
+those are the same `Arc`s the LRU already holds.
 
 ## Row-group framing & scattered reads
 
