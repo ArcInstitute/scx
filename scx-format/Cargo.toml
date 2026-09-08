@@ -1,6 +1,6 @@
 [package]
 name = "scx-format"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 description = "On-disk layout/spec for the SCX format: header, catalog, shard structs, modality, codec selection (pure, no I/O)"
 license.workspace = true
