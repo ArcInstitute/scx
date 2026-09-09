@@ -30,6 +30,17 @@
 //! quoting a row as a guarantee; the flag is the difference between "we sized
 //! this" and "nothing exceeds this".
 //!
+//! That unbounded encoded-side term got **larger** when `encode_shard_framed`
+//! started encoding its row groups in parallel: a framed shard now holds every
+//! group's encoded bytes and the concatenated sub-streams at once, rather than
+//! the concatenation plus one group. Roughly 2x the encoded shard instead of
+//! 1x, per worker, and encoded bytes run 1-4 B/nnz against the 16 B/nnz this
+//! table reserves for the decoded working set — so it stays well inside the
+//! gap the paragraph above describes, and none of the shares below move.
+//! Anyone closing that gap must size from the *whole* worker phase and will
+//! need this term, which is why it is written down rather than left to be
+//! rediscovered from a peak-RSS graph.
+//!
 //! Deliberately **not** gated on `hdf5`, for the same reason `parallel_drain`
 //! is not: this is integer arithmetic, and keeping it feature-free is what lets
 //! `allocation_table_shares_sum_to_at_most_one_per_phase` (a `#[cfg(test)]`
