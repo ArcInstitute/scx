@@ -304,5 +304,17 @@ pub(crate) fn scan_shards<'a>(
     catalog: &'a scx_format_io::FullCatalog,
     positions: &[usize],
 ) -> Vec<&'a FullCatalogEntry> {
+    // Positions from a *different* catalog would index out of range here (or,
+    // worse, land on an entry of another section type). The only producer is
+    // `QueryPipeline::csr_shard_positions`, which derives them from the same
+    // reader every caller passes — so this states the coupling rather than
+    // defending against a reachable input.
+    debug_assert!(
+        positions.iter().all(|&i| catalog
+            .entries
+            .get(i)
+            .is_some_and(|e| e.section_type == scx_format_io::section::SectionType::CsrShard)),
+        "shard positions do not index this catalog's CSR shards"
+    );
     positions.iter().map(|&i| &catalog.entries[i]).collect()
 }
