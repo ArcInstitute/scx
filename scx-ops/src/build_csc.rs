@@ -214,51 +214,63 @@ pub fn run_build_csc(
     //    float/integer kind; if any is float the CSC must be Float32 (+ a
     //    float-safe codec), else use the widest integer width across shards.
     let csr_entries = reader.catalog().csr_shards_sorted();
-    // One header read per shard, not two: this scan, the CSC codec/encoding
-    // pick below and the per-shard CSR re-emit at step 11 all want the same
-    // two bytes off each shard header, and the re-emit used to read it again.
+    // One *standalone* `read_shard_header` per shard, not two plus one: this
+    // scan, the CSC codec/encoding pick below and the per-shard CSR re-emit at
+    // step 11 all want the same two bytes, and the re-emit used to read them
+    // again (as did a third call for shard 0's codec). `decode_shard_bytes`
+    // still parses the header out of the section it already fetched on the one
+    // surviving decode, so total header *parses* go 4n+1 -> 2n; what this loop
+    // removes is n+1 standalone reads, and with them the second decode pass.
+    //
+    // `widest_declared` is folded through `widest_value_encoding` — the
+    // crate-wide spelling of the SCX-004 widening rule, which `compact` uses
+    // for its own re-shard — rather than accumulated by hand. Folding a
+    // total-order max pairwise gives the same answer as one call over the whole
+    // list, and the `Uint8` seed matches what the helper returns for an empty
+    // one. Flooring on each shard's *declared* encoding matters beyond
+    // `stats.value_max`: a shard may lack stats (format-permitted), so
+    // `value_max` would contribute nothing and a wide integer shard could be
+    // under-picked as Uint8.
     let mut per_shard: Vec<(CodecId, ValueEncoding)> = Vec::with_capacity(csr_entries.len());
     let mut max_int_val: u32 = 0;
+    let mut widest_declared = ValueEncoding::Uint8;
     for entry in &csr_entries {
         let sh = reader.read_shard_header(entry)?;
-        let ve = ValueEncoding::from_u8(sh.value_encoding)
-            .ok_or(format!("unknown value encoding: {}", sh.value_encoding))?;
-        let ci = CodecId::from_u8(sh.codec_id).ok_or(format!("unknown codec: {}", sh.codec_id))?;
+        let ve = ValueEncoding::from_u8(sh.value_encoding).ok_or(
+            crate::error::OpsError::UnknownValueEncoding(sh.value_encoding),
+        )?;
+        let ci = CodecId::from_u8(sh.codec_id)
+            .ok_or(crate::error::OpsError::UnknownCodec(sh.codec_id))?;
         per_shard.push((ci, ve));
+        widest_declared = crate::helpers::widest_value_encoding(&[widest_declared, ve]);
         if let Some(stats) = entry.stats.as_ref() {
             max_int_val = max_int_val.max(stats.value_max);
         }
     }
-    // Floor the integer width on each shard's declared encoding, not only on
-    // `stats.value_max`: a shard may lack stats (format-permitted), in which
-    // case `value_max` contributes nothing and a wide integer shard could be
-    // under-picked as Uint8. `widest_value_encoding` is the crate-wide spelling
-    // of that rule (`compact` re-shards under the same one), and it maps any
-    // float shard to `Float32` — so its result doubles as the `any_float` test.
-    let declared: Vec<ValueEncoding> = per_shard.iter().map(|&(_, ve)| ve).collect();
-    let (csc_value_encoding, csc_codec) = match crate::helpers::widest_value_encoding(&declared) {
+    // The helper maps any float shard to `Float32` and never yields `Float16`,
+    // so this one predicate is the whole `any_float` test.
+    let (csc_value_encoding, csc_codec) = if matches!(widest_declared, ValueEncoding::Float32) {
         // Pcodec is the canonical float codec; the first shard's codec may be
         // an integer-only codec (Scx1) that cannot represent float values.
-        ValueEncoding::Float32 | ValueEncoding::Float16 => {
-            (ValueEncoding::Float32, CodecId::Pcodec)
-        }
-        widest_declared => {
-            let by_value = if max_int_val <= u8::MAX as u32 {
-                ValueEncoding::Uint8
-            } else if max_int_val <= u16::MAX as u32 {
-                ValueEncoding::Uint16
-            } else {
-                ValueEncoding::Uint32
-            };
-            // The wider of the value-derived and header-declared widths. Both
-            // are integer encodings here, so the helper's float arm cannot fire.
-            let enc = crate::helpers::widest_value_encoding(&[widest_declared, by_value]);
-            // `.first()` rather than `csr_entries[0]`: the guard above means a
-            // file with rows always has shards, so this reports the same
-            // condition that guard already names instead of panicking.
-            let (codec, _) = *per_shard.first().ok_or("Input file has no CSR shards")?;
-            (enc, codec)
-        }
+        (ValueEncoding::Float32, CodecId::Pcodec)
+    } else {
+        let by_value = if max_int_val <= u8::MAX as u32 {
+            ValueEncoding::Uint8
+        } else if max_int_val <= u16::MAX as u32 {
+            ValueEncoding::Uint16
+        } else {
+            ValueEncoding::Uint32
+        };
+        // The wider of the value-derived and declared widths. Both are integer
+        // encodings here, so the helper's float arm cannot fire.
+        let enc = crate::helpers::widest_value_encoding(&[widest_declared, by_value]);
+        // `.first()` rather than `csr_entries[0]`: the guard above means a file
+        // with rows always has shards, so this reports the same condition that
+        // guard already names instead of panicking.
+        let (codec, _) = *per_shard
+            .first()
+            .ok_or_else(|| "Input file has no CSR shards".to_string())?;
+        (enc, codec)
     };
 
     // 7. Read CSR shards individually (preserves shard boundaries for streaming transpose)
@@ -322,22 +334,14 @@ pub fn run_build_csc(
     // `read_shard_from_entry` would return. `csr_shards` is borrowed, not
     // consumed, because the transpose at step 13 still needs it.
     //
-    // `csr_shards` and `per_shard` are both built by mapping over `csr_entries`
-    // with no early exit in between, so all three have the same length. Checked
-    // rather than assumed, and in release too: a three-way zip over lists of
-    // different lengths truncates to the shortest, which would drop shards from
-    // the output with no error anywhere. Two comparisons per op, once.
-    assert_eq!(
-        csr_entries.len(),
-        csr_shards.len(),
-        "one decoded shard per catalog entry"
-    );
-    assert_eq!(
-        csr_entries.len(),
-        per_shard.len(),
-        "one (codec, encoding) pair per catalog entry"
-    );
-    for ((shard_entry, shard), &(ci, ve)) in csr_entries.iter().zip(&csr_shards).zip(&per_shard) {
+    // Indexed rather than zipped: `csr_shards` and `per_shard` are both built
+    // by mapping over `csr_entries` with no early exit in between, so all three
+    // are the same length — but a `zip(..).zip(..)` truncates to the shortest,
+    // which would drop shards from the output with no error anywhere, whereas
+    // an index that went out of step is a bounds panic.
+    for (i, shard) in csr_shards.iter().enumerate() {
+        let shard_entry = &csr_entries[i];
+        let (ci, ve) = per_shard[i];
         let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
 
         let indices_u32: Vec<u32> = shard.indices.iter().map(|&i| i as u32).collect();

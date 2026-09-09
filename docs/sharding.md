@@ -990,8 +990,8 @@ Measured throughput, from the `build_csc` rows of
 `--memory-limit 4G`): 0.22 s on `pbmc3k` (2.3M non-zeros), 19.4 s on
 `smartseq2` (131M), 29.3 s on `tabula_sapiens_100k` (195M), 201 s on
 `census_500k` (747M) and 1308 s on `census_1m` (1.40B). Cost tracks
-non-zeros, not cells. Encoding and the transpose dominate: one full CSR
-decode pass is ~10–13% of wall.
+non-zeros, not cells. Encoding and the transpose dominate: removing one of
+the two full CSR decode passes the op used to perform cut wall by 10–13%.
 
 ### Inspecting the CSC layout
 
