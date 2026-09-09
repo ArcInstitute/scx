@@ -3121,7 +3121,20 @@ jobs:
           python -m venv .venv
           . .venv/bin/activate
           pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.0;sys_platform=='linux'"
-          pip install maturin pytest pytest-xdist numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars pydeseq2
+          # `mudata` is pinned to the same range pyscx's `mudata` extra declares
+          # (pyproject.toml). Without it every test in
+          # tests/test_multimodal_training.py — the whole multimodal loader and
+          # MuData round-trip surface — is skipped by `pytest.importorskip`,
+          # which this job's own log makes visible as
+          # `Ignoring mudata: markers 'extra == "mudata"' don't match your
+          # environment`. The multimodal batch builder is a pyo3 function, so
+          # `cargo test` cannot reach it either (extension-module links no
+          # libpython) and Python was its only possible coverage.
+          #
+          # Deliberately NOT added to the `Base install (no extras)` job: that
+          # one exists to prove the optional packages do not leak into a base
+          # install, and asserts `mudata` is absent.
+          pip install maturin pytest pytest-xdist numpy scipy "pyarrow==23.0.1" anndata scanpy igraph scikit-misc python-dotenv formulaic polars pydeseq2 "mudata>=0.2,<1.0"
       # libhdf5 is needed by the `hdf5` pyscx feature, which exposes
       # `pyscx.from_h5ad` and the backed-AnnData → streaming router that
       # `tests/test_streaming_conversion.py` exercises.

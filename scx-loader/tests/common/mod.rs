@@ -566,6 +566,121 @@ pub fn write_multimodal_fixture(
     path.to_path_buf()
 }
 
+/// Build a multimodal file whose two modalities have deliberately **different
+/// shard layouts**, different widths, and different payloads — and one of which
+/// has its shards written out of `row_start` order.
+///
+/// Every property is load-bearing for `test_multimodal_shard_basis.rs`, the
+/// only coverage of the loader's per-modality shard-index basis:
+///
+/// * `adt` (id 1) is **one** shard covering `[0, n_obs)`; `rna` (id 2) is
+///   **two** shards of `n_obs / 2`. So code that resolved shard positions
+///   against the *unfiltered* CSR list would land on a shard with a different
+///   row count, and would bucket deletions into `[0, n_obs)` instead of the
+///   half-ranges.
+/// * `rna`'s shards are written `row_start = n_obs / 2` **first**, so its
+///   catalog order is the reverse of its row order and dropping the sort is
+///   observable.
+/// * each modality has its own `n_vars` and its own value base (`adt` 100,
+///   `rna` 200), so row `r` of one modality cannot be mistaken for row `r` of
+///   the other: `X[r]` is `base + r` at column `r % n_vars`.
+///
+/// Both modalities still tile `[0, n_obs)` on their own, so
+/// `TrainingPipeline::new(.., modality_id: Some(_))` accepts the file.
+///
+/// Returns `(path, adt_modality_id, rna_modality_id)`.
+pub fn write_multimodal_layout_fixture(
+    path: &std::path::Path,
+    n_obs: usize,
+) -> (std::path::PathBuf, u8, u8) {
+    use scx_format_io::modality::ModalityType;
+
+    assert!(
+        n_obs >= 2 && n_obs.is_multiple_of(2),
+        "fixture needs an even n_obs"
+    );
+    let half = n_obs / 2;
+    let adt_vars = 4usize;
+    let rna_vars = 7usize;
+
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        rna_vars.max(adt_vars) as u64,
+        (2 * n_obs) as u64,
+        n_obs as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+    writer.write_obs(&string_column("cell_id", n_obs)).unwrap();
+
+    let shard = |base: u8, n_vars: usize, row_start: usize, n_rows: usize| {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for r in row_start..row_start + n_rows {
+            indices.push((r % n_vars) as u32);
+            values.push(base.wrapping_add(r as u8));
+            indptr.push(indptr.last().unwrap() + 1);
+        }
+        (indptr, indices, values)
+    };
+    let write = |writer: &mut ScxWriter,
+                 modality_id: u8,
+                 base: u8,
+                 n_vars: usize,
+                 row_start: usize,
+                 n_rows: usize| {
+        let (indptr, indices, values) = shard(base, n_vars, row_start, n_rows);
+        writer
+            .write_csr_shard_for(
+                modality_id,
+                row_start as u64,
+                scx_format_io::ShardBuffers::new(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                ),
+            )
+            .unwrap();
+    };
+
+    let mut ids = Vec::new();
+    for (name, kind, m_vars) in [
+        ("adt", ModalityType::Protein, adt_vars),
+        ("rna", ModalityType::Rna, rna_vars),
+    ] {
+        let id = writer
+            .add_modality(name, kind, CodecId::None, ValueEncoding::Uint8, false)
+            .unwrap();
+        writer
+            .write_var_for(id, &string_column("gene_id", m_vars))
+            .unwrap();
+        writer.set_modality_n_vars(id, m_vars as u64).unwrap();
+        ids.push(id);
+    }
+    let (adt_id, rna_id) = (ids[0], ids[1]);
+
+    // adt: one shard over the whole obs axis.
+    write(&mut writer, adt_id, 100, adt_vars, 0, n_obs);
+    // rna: two shards, SECOND HALF FIRST.
+    write(&mut writer, rna_id, 200, rna_vars, half, half);
+    write(&mut writer, rna_id, 200, rna_vars, 0, half);
+
+    writer.finish().unwrap();
+    (path.to_path_buf(), adt_id, rna_id)
+}
+
+/// The dense row `write_multimodal_layout_fixture` stores for global row `r` of
+/// the modality whose value base is `base` and width `n_vars`.
+pub fn expected_modality_row(base: u8, n_vars: usize, r: usize) -> Vec<f32> {
+    let mut row = vec![0.0f32; n_vars];
+    row[r % n_vars] = f32::from(base.wrapping_add(r as u8));
+    row
+}
+
 /// Build a **valid** file whose single modality is registered in the modality
 /// table, so its only X is stamped `modality_id = 1` and modality 0 owns no
 /// shards at all.

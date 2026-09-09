@@ -127,28 +127,37 @@ saturated by overlapping I/O, decode, and consumption:
 └──────────────────┘                    └──────────────────┘               └───────────────┘
 ```
 
-The following sequence diagram shows how the three stages overlap in time:
+The following sequence diagram shows how the three stages overlap in time. Note
+that the I/O thread itself only *schedules*: every blocking operation — the
+`madvise` hints and the shard reads alike — runs on a `spawn_blocking` worker,
+which is the invariant § Why three runtimes? states.
 
 ```mermaid
 sequenceDiagram
     participant IO as I/O Thread<br/>(tokio current-thread)
+    participant Blk as Blocking Worker<br/>(spawn_blocking)
     participant Dec as Decode Thread<br/>(rayon pool)
     participant Py as Consumer<br/>(Python / GPU)
 
     Note over IO,Py: start_epoch() — I/O thread spawned, tokio runtime built
 
-    IO->>IO: madvise(WILLNEED) shard group 0
+    IO->>Blk: spawn_blocking(group 0)
+    Blk->>Blk: madvise(WILLNEED) groups 1,2 then 0<br/>+ read/decode shards
+    Blk-->>IO: ShardGroup 0
     IO->>Dec: ShardGroup 0 (tokio::mpsc, cap=2)
-    IO->>IO: madvise(WILLNEED) shard group 1
+    IO->>Blk: spawn_blocking(group 1)
 
     Dec->>Dec: pool.install(par_iter):<br/>decode + scatter + normalize
     Dec->>Py: Batch 0 (crossbeam, cap=prefetch)
 
+    Blk-->>IO: ShardGroup 1
     IO->>Dec: ShardGroup 1
     Dec->>Dec: decode + scatter + normalize
     Py->>Py: py.allow_threads()<br/>→ model.forward()
     Dec->>Py: Batch 1
 
+    IO->>Blk: spawn_blocking(group 2)
+    Blk-->>IO: ShardGroup 2
     IO->>Dec: ShardGroup 2
     Py->>Py: loss.backward()
     Dec->>Dec: decode + scatter + normalize
@@ -168,6 +177,32 @@ closure on each `start_epoch` call and dropped when the thread exits, so
 `TrainingPipeline` itself holds no long-lived runtime between epochs. This
 restructuring replaces the original `new_multi_thread().worker_threads(2)`
 field-on-pipeline runtime with a model that is fork-safe by construction.
+
+Both the shard reads and the coalesced `MADV_WILLNEED` hints — this group's
+byte range plus that of the next `PREFETCH_LOOKAHEAD` groups — are issued
+inside `tokio::task::spawn_blocking`, never in the async body: `advise_willneed`
+is a blocking `madvise(2)`, and [Why three runtimes?](#why-three-runtimes)
+below says the reactor thread makes no blocking syscall. Which groups get
+hinted, in what order, is
+`io_stage::advise_ranges_for_group` — split out as a pure function because a
+hint has no in-process observable effect, so the window and the ordering are
+the only parts a test can pin. Under `SCX_LOADER_PROFILE` the hints are timed
+into their own `advise_total`, deliberately **outside** `decode_total`: they
+block, so folding them into the decode window would attribute prefetch latency
+to codec decode and point the critical-path diagnosis the wrong way.
+
+The shard indices the shuffler produces are **positions in the selected
+modality's CSR shard list**, and the ordering rule is one primitive —
+`FullCatalog::csr_shard_indices`, which the two entry-returning accessors are
+also expressed in terms of. Each of the two stages that needs the list derives
+it once per epoch (`start_epoch` for the shuffle keys, `io_stage` for the
+per-group reads); `io_stage` shares its copy with the blocking closures as
+catalog **positions**, because a `&FullCatalogEntry` borrows the reader and
+cannot cross a `'static` closure. `ShardShuffler::shuffle_epoch_sorted` rejects
+a key list whose length disagrees with the shard count it was built for: it used
+to read keys with `sort_keys.get(idx).unwrap_or(u64::MAX)`, so a caller whose
+keys came from a different shard list got a silently degraded ordering rather
+than an error.
 
 ### Stage 2: Decode (std::thread + per-pipeline rayon pool)
 

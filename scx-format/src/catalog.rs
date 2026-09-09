@@ -843,17 +843,10 @@ impl FullCatalog {
     /// Return CSR shards belonging to a given modality, sorted by
     /// `row_start`.
     pub fn csr_shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {
-        let mut shards: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|e| e.section_type == SectionType::CsrShard && e.modality_id == modality_id)
-            .collect();
-        shards.sort_by_key(|e| {
-            e.stats
-                .as_ref()
-                .map_or(u64::MAX, |s| s.major_start(SectionType::CsrShard))
-        });
-        shards
+        self.csr_shard_indices(Some(modality_id))
+            .into_iter()
+            .map(|i| &self.entries[i])
+            .collect()
     }
 
     /// Whether the CSR shards of `modality_id` form disjoint
@@ -988,13 +981,45 @@ impl FullCatalog {
     /// [`Self::has_overlapping_csr_ranges`] to `debug_assert!` a clean single
     /// tiling where one is required.
     pub fn csr_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
-        let mut shards: Vec<_> = self
+        self.csr_shard_indices(None)
+            .into_iter()
+            .map(|i| &self.entries[i])
+            .collect()
+    }
+
+    /// Catalog **positions** of the CSR shards [`Self::csr_shards_sorted`]
+    /// (`modality_id = None`) and [`Self::csr_shards_for_modality`]
+    /// (`Some(mid)`) return, in exactly the same order.
+    ///
+    /// This is the single ordering rule: both entry-returning accessors are
+    /// expressed in terms of it, so a caller that needs positions cannot drift
+    /// from one that needs references. The filter preserves catalog order and
+    /// the sort is **stable**, so shards that share a `major_start` — and the
+    /// stats-less shards that all sort to `u64::MAX` — keep their catalog
+    /// order relative to one another.
+    ///
+    /// Positions rather than references because a `&FullCatalogEntry` borrows
+    /// the catalog: the training loader resolves shards inside `'static`
+    /// `spawn_blocking` closures that cannot carry the borrow, and it indexes
+    /// per-modality **positions** (`scx-loader/src/io_stage.rs`), so reading
+    /// the wrong basis reads the wrong shard.
+    ///
+    /// `Some(0)` means `modality_id == 0` — the implicit modality of v1 /
+    /// single-modality v2 files — not "every modality".
+    pub fn csr_shard_indices(&self, modality_id: Option<u8>) -> Vec<usize> {
+        let mut shards: Vec<usize> = self
             .entries
             .iter()
-            .filter(|e| e.section_type == SectionType::CsrShard)
+            .enumerate()
+            .filter(|(_, e)| {
+                e.section_type == SectionType::CsrShard
+                    && modality_id.is_none_or(|mid| e.modality_id == mid)
+            })
+            .map(|(i, _)| i)
             .collect();
-        shards.sort_by_key(|e| {
-            e.stats
+        shards.sort_by_key(|&i| {
+            self.entries[i]
+                .stats
                 .as_ref()
                 .map_or(u64::MAX, |s| s.major_start(SectionType::CsrShard))
         });

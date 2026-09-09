@@ -586,9 +586,21 @@ for batch in ds:
 > [!NOTE]
 > `MultimodalTrainingDataset` encodes categorical obs columns as decoded
 > `list[str]` values, **not** the `{"codes", "categories"}` dict format used
-> by `TrainingDataset`. `n_vars` returns a `dict[str, int]` mapping modality
-> names to per-modality variable counts. With `return_dict=False`, batches
-> are tuples of X arrays only (no obs or cell_indices).
+> by `TrainingDataset`, and its `cell_indices` is **uint64** where
+> `TrainingDataset`'s is int64. `n_vars` returns a `dict[str, int]` mapping
+> modality names to per-modality variable counts. With `return_dict=False`,
+> batches are tuples of X arrays only (no obs or cell_indices).
+>
+> Each modality's `X`, the numeric obs columns and `cell_indices` are **moved**
+> into their numpy arrays rather than copied, so handing a batch to Python
+> performs **no bulk payload copy**. It is not free per modality: one array is
+> still constructed and reshaped and inserted into the `X` dict for each one,
+> so the wrapper cost still scales with the modality count — what does not
+> scale is the bytes. Those arrays own the loader's decode buffers; they stay
+> valid for as long as you hold them, but writing into one writes into nothing
+> else's memory. A **categorical** obs column is the exception to the no-copy
+> half — its codes are decoded into a Python list of strings, which allocates
+> per batch and is not a numpy array at all.
 
 > [!WARNING]
 > **`hvg_indices` is not range-checked here — this class only.** A single panel

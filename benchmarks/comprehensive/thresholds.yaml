@@ -1990,31 +1990,47 @@ absolute_floors:
   # cells_per_sec is the cells/s the loader actually sustains and is
   # comparable across batch-size / batch-pinning changes.
   #
-  # Measured (release build, single worker node, 5-epoch median):
-  #   CITE-seq per-modality: 9,565 cells/s, 0.55 s TTFB.
-  #   Multiome per-modality: 1,717 cells/s, 1.61 s TTFB.
-  # Floors: ~0.5× measured cells/s; TTFB ~2.5× measured. Confirmed /
-  # refined by the Phase 5 SLURM recapture against LATEST.
+  # Re-anchored after OPT-LOADER-1 (the multimodal batch is moved into numpy
+  # instead of cloned). That removed a per-batch full copy of every modality's
+  # dense X on the consumer thread with the GIL held, and it was the dominant
+  # term: a main-vs-branch A/B on one worker node, 5 runs per arm, measured
+  #
+  #   per-modality CITE-seq:  9,738 -> 31,118 cells/s  (3.20x)
+  #   per-modality multiome:  1,781 ->  5,699 cells/s  (3.20x)
+  #
+  # with identical n_batches / n_cells and bit-identical epoch digests. The
+  # three non-SCX keys on the same datasets moved 0.89-1.07x, which is this
+  # node's noise floor.
+  #
+  # The floors are 0.7x of the measured median, NODE-NORMALISED: the same A/B's
+  # main arm measured 1,781 / 9,738 cells/s where the LATEST baseline records
+  # 1,627 / 8,470 on unchanged code, so this node is 1.10x / 1.15x faster and
+  # the raw medians would over-anchor by that much. 5,699 / 1.10 * 0.7 = 3,644
+  # and 31,118 / 1.15 * 0.7 = 18,942, rounded down. That is a tighter
+  # conservatism than the 0.5x these floors used to carry, and deliberately so:
+  # what was removed scaled with bytes copied, so the new level is structural
+  # rather than incidental. TTFB improved too (0.47 -> 0.19 s CITE-seq,
+  # 1.59 -> 1.47 s multiome) but its caps keep their cold-cache slack unchanged.
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: cite_seq_pbmc_5k
     metric: cells_per_sec
-    min: 4500        # ~0.5× measured 9,565
+    min: 18500       # 0.7× of 31,118 measured, normalised for a 1.15× node
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: cite_seq_pbmc_5k
     metric: time_to_first_batch_s
-    max: 1.5         # ~2.7× measured 0.55s; absorbs cold-cache jitter
+    max: 1.5         # unchanged; ~7.9× the 0.19s now measured, absorbs cold-cache jitter
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: multiome_pbmc_10k
     metric: cells_per_sec
-    min: 850         # ~0.5× measured 1,717
+    min: 3600        # 0.7× of 5,699 measured, normalised for a 1.10× node
   - benchmark: multimodal_training
     format: scx_multimodal_per_modality_auto
     dataset: multiome_pbmc_10k
     metric: time_to_first_batch_s
-    max: 4.0         # ~2.5× measured 1.61s
+    max: 4.0         # unchanged; ~2.7× the 1.47s now measured
 
   # ─── Streaming h5ad → SCX conversion (Phase 10) ─────────────────────
   # The streaming converter's whole point is bounded peak memory — bounded by

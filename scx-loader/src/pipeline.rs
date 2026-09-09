@@ -1180,54 +1180,39 @@ impl TrainingPipeline {
         // Collect into owned `Vec<u64>` first so the catalog borrow ends
         // before `ensure_decode_pool` (which needs `&mut self`).
         //
-        // Phase H.1: when `modality_id` is set, the shard list is
-        // filtered to that modality's CSR shards. The shuffler /
-        // io_stage operate on the filtered list (per-modality positions
-        // 0..N), which io_stage maps back to the original catalog
-        // entries via the same filter applied internally.
-        let shard_offsets: Vec<u64> = match self.config.modality_id {
-            Some(mid) => self
-                .reader
-                .catalog()
-                .csr_shards_for_modality(mid)
-                .iter()
-                .map(|e| e.offset)
-                .collect(),
-            None => self
-                .reader
-                .catalog()
-                .shards_sorted()
-                .iter()
-                .map(|e| e.offset)
-                .collect(),
-        };
-
+        // Phase H.1: when `modality_id` is set, the shard list is filtered to
+        // that modality's CSR shards. The shuffler / io_stage operate on
+        // positions in this list (per-modality positions 0..N), which io_stage
+        // resolves back to catalog entries through the *same*
+        // `FullCatalog::csr_shard_indices` call — one ordering rule, so the two
+        // sides cannot disagree about what position `n` means. Derived once
+        // here and read twice below; it used to be a filter+sort per vector.
+        let shard_indices = self
+            .reader
+            .catalog()
+            .csr_shard_indices(self.config.modality_id);
         // Per-position sort keys for the shuffle. Use each shard's `row_start`
-        // (the order `csr_shards_for_modality`/`shards_sorted` already return
-        // entries in) rather than the raw file offset, so the group ordering is
+        // (the order `csr_shard_indices` already returns positions in) rather
+        // than the raw file offset, so the group ordering is
         // layout-invariant: every modality shares the same per-position
         // `row_start` (checked by `check_uniform_modality_layouts`), so the
         // per-modality shufflers produce identical group sequences and the
         // per-batch cell axis stays aligned even if a rewrite reordered shards on
-        // disk. `shard_offsets` above stays byte offsets for the mmap smoke-read /
-        // prefetch below. Missing-stats shards map to `u64::MAX` identically for
-        // all modalities (stable sort keeps ties in RNG order). (H2)
-        let sort_keys: Vec<u64> = match self.config.modality_id {
-            Some(mid) => self
-                .reader
-                .catalog()
-                .csr_shards_for_modality(mid)
-                .iter()
-                .map(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
-                .collect(),
-            None => self
-                .reader
-                .catalog()
-                .shards_sorted()
-                .iter()
-                .map(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
-                .collect(),
-        };
+        // disk. Missing-stats shards map to `u64::MAX` identically for all
+        // modalities (stable sort keeps ties in RNG order). (H2)
+        //
+        // `shuffle_epoch_sorted` rejects a key list whose length disagrees with
+        // the shard count the shuffler was built for — the check lives there,
+        // on the data actually consumed, rather than here on one caller.
+        let sort_keys: Vec<u64> = shard_indices
+            .iter()
+            .map(|&i| {
+                self.reader.catalog().entries[i]
+                    .stats
+                    .as_ref()
+                    .map_or(u64::MAX, |s| s.row_start)
+            })
+            .collect();
 
         // Touch one byte of the first CSR shard's
         // backing region before spawning the I/O / decode threads. If the
@@ -1238,9 +1223,9 @@ impl TrainingPipeline {
         // hanging the I/O stage on an unreproducible read after the workers
         // have spawned. Cheap: a single byte fault on a region the I/O
         // stage was about to fault anyway.
-        if let Some(&first_offset) = shard_offsets.first() {
+        if let Some(&first_idx) = shard_indices.first() {
             let mmap = self.reader.mmap();
-            let off = first_offset as usize;
+            let off = self.reader.catalog().entries[first_idx].offset as usize;
             if off >= mmap.len() {
                 return Err(LoaderError::ShutdownError(format!(
                     "first shard offset {off} exceeds mmap length {}",
@@ -1257,7 +1242,7 @@ impl TrainingPipeline {
         // spawning the decode thread that uses it.
         let decode_pool = Arc::clone(self.ensure_decode_pool()?);
 
-        let shard_groups = self.shuffler.shuffle_epoch_sorted(&sort_keys);
+        let shard_groups = self.shuffler.shuffle_epoch_sorted(&sort_keys)?;
 
         // Create bounded channels
         //

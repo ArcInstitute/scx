@@ -85,25 +85,47 @@ impl ShardShuffler {
     /// order no longer tracks row order, desyncing the per-batch cell axis. In the
     /// common case offsets are written in row order, so the `row_start` key still
     /// yields a disk-sequential scan.
-    pub fn shuffle_epoch_sorted(&mut self, sort_keys: &[u64]) -> Vec<Vec<usize>> {
+    ///
+    /// **`sort_keys` must carry exactly one key per shard** — a mismatch is an
+    /// error, not a tolerated shape. It used to read its keys with
+    /// `sort_keys.get(idx).copied().unwrap_or(u64::MAX)`, so a caller that
+    /// derived its keys from a different shard list than the shuffler was built
+    /// for got a *silently degraded* ordering — every position past the end
+    /// collapsing to the same sentinel — instead of a failure. The caller in
+    /// question is `TrainingPipeline::start_epoch`, whose keys come from
+    /// `FullCatalog::csr_shard_indices(modality_id)` while the shuffler is sized
+    /// from a count resolved at construction; they can only disagree through a
+    /// bug, which is exactly the case worth failing on. Checking it here rather
+    /// than at that one call site covers every caller.
+    pub fn shuffle_epoch_sorted(
+        &mut self,
+        sort_keys: &[u64],
+    ) -> crate::error::Result<Vec<Vec<usize>>> {
+        if sort_keys.len() != self.n_shards {
+            return Err(crate::error::LoaderError::ConfigError {
+                reason: format!(
+                    "shuffle_epoch_sorted: got {} sort keys for {} shards - the key \
+                     list and the shuffler disagree about which shards this epoch covers",
+                    sort_keys.len(),
+                    self.n_shards,
+                ),
+            });
+        }
         let mut groups = self.shuffle_epoch_inner();
 
-        // Sort shards within each group by their key (ascending).
+        // Sort shards within each group by their key (ascending). Indexing is
+        // sound: `shuffle_epoch_inner` only emits positions in `[0, n_shards)`,
+        // and the check above pins `sort_keys` to that length.
         for group in &mut groups {
-            group.sort_by_key(|&idx| sort_keys.get(idx).copied().unwrap_or(u64::MAX));
+            group.sort_by_key(|&idx| sort_keys[idx]);
         }
 
-        // Sort groups by the minimum key within each group. `sort_by_cached_key`
-        // evaluates the per-group min once (not on every comparison).
-        groups.sort_by_cached_key(|group| {
-            group
-                .iter()
-                .filter_map(|&idx| sort_keys.get(idx).copied())
-                .min()
-                .unwrap_or(u64::MAX)
-        });
+        // Sort groups by the minimum key within each group — which, **because
+        // the loop above just sorted each group ascending on that same key**, is
+        // the first element. Do not reorder these two loops.
+        groups.sort_by_cached_key(|group| group.first().map_or(u64::MAX, |&idx| sort_keys[idx]));
 
-        groups
+        Ok(groups)
     }
 
     /// Core shuffle logic shared by `shuffle_epoch` and `shuffle_epoch_sorted`.
@@ -297,6 +319,40 @@ mod tests {
     // shuffle_epoch_sorted tests
     // ---------------------------------------------------------------
 
+    /// The reject side of the length check. Every other `shuffle_epoch_sorted`
+    /// test is the accept side; without this one the check could be deleted and
+    /// the suite would stay green.
+    ///
+    /// The mismatch used to be **silent**: `sort_keys.get(idx).unwrap_or(u64::MAX)`
+    /// gave every out-of-range position the same sentinel, so a caller whose key
+    /// list came from a different shard list than the shuffler was built for got
+    /// a degraded group order instead of an error.
+    #[test]
+    fn shuffle_epoch_sorted_rejects_a_key_list_of_the_wrong_length() {
+        for keys in [vec![0u64; 3], vec![0u64; 5], Vec::new()] {
+            let mut shuffler = ShardShuffler::new(4, 2, 7).unwrap();
+            let err = shuffler
+                .shuffle_epoch_sorted(&keys)
+                .expect_err("a key list of the wrong length must not be tolerated");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("got {} sort keys for 4 shards", keys.len())),
+                "the message should name both counts: {msg}"
+            );
+        }
+        // Accept side, so the check cannot be "reject everything".
+        let mut shuffler = ShardShuffler::new(4, 2, 7).unwrap();
+        assert_eq!(
+            shuffler
+                .shuffle_epoch_sorted(&[0, 1, 2, 3])
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .count(),
+            4
+        );
+    }
+
     #[test]
     fn test_shuffle_epoch_sorted_preserves_all_shards() {
         let n_shards = 17;
@@ -305,7 +361,7 @@ mod tests {
         let mut shuffler = ShardShuffler::new(n_shards, 5, 123).unwrap();
 
         for _ in 0..3 {
-            let groups = shuffler.shuffle_epoch_sorted(&offsets);
+            let groups = shuffler.shuffle_epoch_sorted(&offsets).unwrap();
             let flat: Vec<usize> = groups.into_iter().flatten().collect();
 
             assert_eq!(flat.len(), n_shards, "all shards should appear");
@@ -324,7 +380,7 @@ mod tests {
         let mut shuffler = ShardShuffler::new(n_shards, 4, 42).unwrap();
 
         for _ in 0..5 {
-            let groups = shuffler.shuffle_epoch_sorted(&offsets);
+            let groups = shuffler.shuffle_epoch_sorted(&offsets).unwrap();
 
             // Each group's min offset should be <= the next group's min offset
             let group_min_offsets: Vec<u64> = groups
@@ -350,7 +406,7 @@ mod tests {
         let mut shuffler = ShardShuffler::new(n_shards, 4, 42).unwrap();
 
         for _ in 0..5 {
-            let groups = shuffler.shuffle_epoch_sorted(&offsets);
+            let groups = shuffler.shuffle_epoch_sorted(&offsets).unwrap();
 
             for group in &groups {
                 let group_offsets: Vec<u64> = group.iter().map(|&idx| offsets[idx]).collect();
@@ -372,8 +428,8 @@ mod tests {
         let offsets: Vec<u64> = (0..n_shards).map(|i| (i as u64) * 1000).collect();
         let mut shuffler = ShardShuffler::new(n_shards, 4, 42).unwrap();
 
-        let epoch0 = shuffler.shuffle_epoch_sorted(&offsets);
-        let epoch1 = shuffler.shuffle_epoch_sorted(&offsets);
+        let epoch0 = shuffler.shuffle_epoch_sorted(&offsets).unwrap();
+        let epoch1 = shuffler.shuffle_epoch_sorted(&offsets).unwrap();
 
         // Groups contain different shard compositions across epochs
         // (even though both are offset-sorted)
@@ -395,8 +451,8 @@ mod tests {
         let mut shuffler1 = ShardShuffler::new(n_shards, 4, 42).unwrap();
         let mut shuffler2 = ShardShuffler::new(n_shards, 4, 42).unwrap();
 
-        let groups1 = shuffler1.shuffle_epoch_sorted(&offsets);
-        let groups2 = shuffler2.shuffle_epoch_sorted(&offsets);
+        let groups1 = shuffler1.shuffle_epoch_sorted(&offsets).unwrap();
+        let groups2 = shuffler2.shuffle_epoch_sorted(&offsets).unwrap();
 
         assert_eq!(groups1, groups2, "same seed + same epoch must be identical");
     }
@@ -422,8 +478,8 @@ mod tests {
         // Same seed per modality (as MultimodalTrainingDataset uses config.seed).
         let mut sh_a = ShardShuffler::new(n_shards, 4, 42).unwrap();
         let mut sh_b = ShardShuffler::new(n_shards, 4, 42).unwrap();
-        let groups_a = sh_a.shuffle_epoch_sorted(&row_start);
-        let groups_b = sh_b.shuffle_epoch_sorted(&row_start);
+        let groups_a = sh_a.shuffle_epoch_sorted(&row_start).unwrap();
+        let groups_b = sh_b.shuffle_epoch_sorted(&row_start).unwrap();
         assert_eq!(
             groups_a, groups_b,
             "row_start-keyed shuffle must be identical across modalities regardless \
@@ -434,8 +490,8 @@ mod tests {
         // is precisely the pre-fix desync path.
         let mut sh_a_off = ShardShuffler::new(n_shards, 4, 42).unwrap();
         let mut sh_b_off = ShardShuffler::new(n_shards, 4, 42).unwrap();
-        let groups_a_off = sh_a_off.shuffle_epoch_sorted(&offsets_a);
-        let groups_b_off = sh_b_off.shuffle_epoch_sorted(&offsets_b);
+        let groups_a_off = sh_a_off.shuffle_epoch_sorted(&offsets_a).unwrap();
+        let groups_b_off = sh_b_off.shuffle_epoch_sorted(&offsets_b).unwrap();
         assert_ne!(
             groups_a_off, groups_b_off,
             "divergent offset keys must produce different orderings (the bug)"
