@@ -31,9 +31,13 @@ pub use index::{
 pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult, TypedQueryResult};
 pub use predicate::{eval_rowset, evaluate, parse_predicate, Predicate, RowSetCtx, ScalarValue};
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var, CsrIndex};
-pub use pushdown::{
-    prune_shards_by_catalog, prune_shards_by_catalog_with_dict, CategoryDictionaries,
-    CategoryDictionary, ShardCandidate,
-};
+// `prune_shards_by_catalog_with_dict` is `pub(crate)`, and the modality-0
+// wrapper that used to sit beside it is gone (its only callers were its own
+// tests). Both were `pub` and re-exported here, so this is a source break for
+// any out-of-tree Rust consumer — taken deliberately: no workflow runs `cargo
+// publish`, the released artefacts are the `pyscx` wheel and the `scx-cli`
+// binary, and freezing the old signature as a shim would mean keeping a public
+// `(catalog, modality_id)` pair whose removal is the point.
+pub use pushdown::{CategoryDictionaries, CategoryDictionary, ShardCandidate};
 pub use reader::{BoxedSectionReader, SectionReader};
 pub use rowset::{shard_range_to_global, RowRange, RowSet};

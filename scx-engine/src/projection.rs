@@ -102,10 +102,15 @@ pub fn project_csr_row_into<I: CsrIndex, V: Copy>(
          pointer. Sort indices at the caller (e.g. via scipy `sort_indices()` or \
          `pyscx::convert::ensure_csr`) before invoking."
     );
+    // **Strictly** ascending, not merely non-decreasing: `gi` only advances
+    // while `gene_set[gi] < col`, so it parks on the first of a run of equal
+    // values and every later copy is an output column that can never fire.
+    // Duplicates are therefore as wrong as disorder, and were not covered.
     debug_assert!(
-        gene_set.windows(2).all(|w| w[0] <= w[1]),
-        "project_csr_row: gene_set is not sorted ascending — the merge scan \
-         requires it. `project_csr` sorts internally; direct callers must too."
+        gene_set.windows(2).all(|w| w[0] < w[1]),
+        "project_csr_row: gene_set is not strictly ascending — the merge scan \
+         requires ascending *and* unique. `project_csr` sorts and dedups \
+         internally; direct callers must too."
     );
 
     let mut gi = 0; // pointer into gene_set
@@ -255,12 +260,30 @@ pub fn decode_shard_projected(
     entry: &FullCatalogEntry,
     gene_indices: &[u32],
 ) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
-    let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
-
     // Sort gene indices for merge scan
     let mut sorted_genes: Vec<u32> = gene_indices.to_vec();
     sorted_genes.sort_unstable();
     sorted_genes.dedup();
+    decode_shard_projected_presorted(reader, entry, &sorted_genes)
+}
+
+/// [`decode_shard_projected`] for a caller that has already established the
+/// precondition: `gene_set` **strictly** ascending.
+///
+/// The query path resolves its projection once per query
+/// (`collect::execute::resolve_gene_projection` dedups through a `HashSet`, then
+/// sorts) and then decodes shard by shard, so re-establishing it inside the
+/// per-shard rayon closure was one `Vec<u32>` clone plus one sort per decoded
+/// shard, discarded on return. The typed decode
+/// (`collect::native::decode_shard_native_filtered`) already states and relies
+/// on this same precondition; `project_csr_row_into`'s own `debug_assert!` is
+/// what checks it.
+pub(crate) fn decode_shard_projected_presorted(
+    reader: &dyn SectionReader,
+    entry: &FullCatalogEntry,
+    sorted_genes: &[u32],
+) -> Result<(Vec<i64>, Vec<i32>, Vec<f32>)> {
+    let (indptr, indices, data) = reader.read_shard_from_entry(entry)?;
 
     let n_rows = indptr.len() - 1;
     let mut new_indptr = Vec::with_capacity(n_rows + 1);
@@ -278,7 +301,7 @@ pub fn decode_shard_projected(
             &mut new_data,
             &indices[start..end],
             &data[start..end],
-            &sorted_genes,
+            sorted_genes,
         );
         new_indptr.push(new_indices.len() as i64);
     }
@@ -758,6 +781,43 @@ mod tests {
         assert_eq!(projected.indptr, indptr2);
         assert_eq!(projected.indices, indices2);
         assert_eq!(projected.data, data2);
+    }
+
+    /// The public entry still normalises its gene set; only the internal
+    /// `_presorted` form assumes the caller did.
+    ///
+    /// The sort and dedup moved out of the per-shard body into this wrapper, so
+    /// the query path (which resolves a sorted, unique set once per query) stops
+    /// re-establishing it per shard. Nothing in the tree passes an unsorted set
+    /// today, which is exactly why the public contract needs a test rather than
+    /// a reader's trust: a caller outside this crate can, and the merge scan
+    /// silently drops columns when the order or the uniqueness is wrong.
+    #[test]
+    fn decode_projected_normalises_an_unsorted_duplicated_gene_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (n_obs, n_vars) = (10, 20);
+        let path = write_test_file(&dir, n_obs, n_vars);
+        let reader = ScxReader::open(&path).unwrap();
+        let entry = reader.catalog().shards_sorted()[0];
+
+        let sorted = vec![0u32, 2, 5, 10, 15];
+        let scrambled = vec![15u32, 2, 0, 10, 2, 5, 15];
+        assert_ne!(
+            scrambled, sorted,
+            "the input must not already be normalised"
+        );
+
+        let (ip_ref, idx_ref, data_ref) = decode_shard_projected(&reader, entry, &sorted).unwrap();
+        let (ip, idx, data) = decode_shard_projected(&reader, entry, &scrambled).unwrap();
+
+        assert_eq!(ip, ip_ref);
+        assert_eq!(idx, idx_ref);
+        assert_eq!(data, data_ref);
+        // Not vacuous: the projection actually kept something.
+        assert!(
+            !idx.is_empty(),
+            "the fixture must hit some projected column"
+        );
     }
 
     // -----------------------------------------------------------------------

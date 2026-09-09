@@ -664,7 +664,8 @@ interface rather than a branch buried mid-file.
 |---|---|
 | `mod.rs` | the re-exports every `collect::<name>` import path resolves through, and `rowset_pushdown_disabled_by_env` |
 | `retry.rs` | `par_map_with_shard_retry` — generic resilient parallel map, nothing query-specific |
-| `rows.rs` | `filter_csr_rows` — row selection inside one decoded shard |
+| `rows.rs` | `filter_csr_rows` / `filter_csr_rows_owned` — row selection inside one decoded shard; the owned form returns an all-kept shard by move |
+| `native.rs` | the fused native decode + filter + project for the dtype-selected (`collect_typed`) route |
 | `plan.rs` | `ExecutionPlan`: Level-1 catalog shard pruning and the category dictionaries both levels share |
 | `mask.rs` | the row-set fast path, the legacy full-decode fallback, and `compute_mask`, the fork between them |
 | `execute.rs` | `execute` / `count` / `exists`, `plan_and_mask` and `materialize` |

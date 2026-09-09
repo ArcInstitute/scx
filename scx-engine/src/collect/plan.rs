@@ -43,9 +43,15 @@ pub(crate) struct ExecutionPlan {
 /// Build an execution plan from a QueryPipeline.
 ///
 /// Runs catalog-level shard pruning and loads predicate indexes.
-pub(crate) fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
-    let catalog = pipeline.reader().catalog();
-
+///
+/// `sorted_shards` is the caller's already-derived
+/// [`scan_shards`] list for `pipeline`'s modality; taking it rather than
+/// re-deriving it is what makes the `shard_idx` positions in the returned
+/// `candidate_shards` indices into a list the caller still holds.
+pub(crate) fn build_plan(
+    pipeline: &QueryPipeline,
+    sorted_shards: &[&FullCatalogEntry],
+) -> Result<ExecutionPlan> {
     // Load the obs predicate index (C5) — needed for category dictionaries.
     // The var predicate index is not consumed by execution (no var-level
     // pushdown is wired into the query path), so it is not read here.
@@ -58,13 +64,13 @@ pub(crate) fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     // Maps column_name_hash → sorted list of category values, so Utf8 predicate
     // values can be resolved to CategoryBitset bit positions.
     // Completeness is judged over exactly the shards the pruner will iterate —
-    // `prune_shards_by_catalog_with_dict` scans the same modality below — so
-    // the claim "every shard being pruned was covered by this vocabulary's
-    // build" is checked against those shards and no others. (The index's own
+    // it is handed the same `sorted_shards` slice below, so the two cannot
+    // disagree about which shards those are — so the claim "every shard being
+    // pruned was covered by this vocabulary's build" is checked against those
+    // shards and no others. (The index's own
     // `shard_id` space does not enter into it: the test is per-entry, "does
     // this shard carry a `CategoryBitset` for this column hash".)
-    let pruned_shards = scan_shards(catalog, pipeline.modality_id());
-    let category_dicts = build_category_dicts(&obs_predicate_index, &pruned_shards);
+    let category_dicts = build_category_dicts(&obs_predicate_index, sorted_shards);
     let dicts_ref = if category_dicts.is_empty() {
         None
     } else {
@@ -72,14 +78,13 @@ pub(crate) fn build_plan(pipeline: &QueryPipeline) -> Result<ExecutionPlan> {
     };
 
     // Catalog-level shard pruning (B1), now with category dictionary support,
-    // scoped to the pipeline's modality (== shards_sorted() for the default
-    // single-modality axis).
+    // over the caller's shard list — already scoped to the pipeline's modality
+    // (== shards_sorted() for the default single-modality axis).
     let candidate_shards = prune_shards_by_catalog_with_dict(
-        catalog,
+        sorted_shards,
         pipeline.obs_predicates(),
         pipeline.deletion_vectors().as_ref(),
         dicts_ref,
-        pipeline.modality_id(),
     );
 
     // Level-2 row-set pushdown keys `ShardRange.shard_id` to the flattened
@@ -288,9 +293,36 @@ pub(crate) fn collect_bitset_coverage(
 /// (both filter `CsrShard` and sort by `row_start`; v1 entries carry
 /// `modality_id = 0`) — the default path is byte-for-byte unchanged. See
 /// `docs/multimodal.md` § 3.4.
-pub(crate) fn scan_shards(
-    catalog: &scx_format_io::FullCatalog,
-    modality_id: u8,
-) -> Vec<&FullCatalogEntry> {
-    catalog.csr_shards_for_modality(modality_id)
+///
+/// Takes the **positions** rather than a `modality_id` so that the filter and
+/// sort behind them run once per pipeline
+/// ([`QueryPipeline::csr_shard_positions`](crate::QueryPipeline::csr_shard_positions))
+/// and every consumer provably walks the same list. `positions` must come from
+/// `FullCatalog::csr_shard_indices` on this same catalog — it is the ordering
+/// rule `csr_shards_for_modality` is itself expressed in terms of.
+///
+/// Only [`plan_and_mask`](super::execute::plan_and_mask) resolves the whole
+/// list, because the pruner and the masker each take a slice of it. The two
+/// `materialize` halves hold a `shard_idx` — a position *in* this list — so
+/// they go through
+/// [`QueryPipeline::csr_shard_entry`](crate::QueryPipeline::csr_shard_entry)
+/// rather than allocating this vector again; `read_row_range` holds no
+/// `shard_idx` at all and walks the catalog positions directly.
+pub(crate) fn scan_shards<'a>(
+    catalog: &'a scx_format_io::FullCatalog,
+    positions: &[usize],
+) -> Vec<&'a FullCatalogEntry> {
+    // Positions from a *different* catalog would index out of range here (or,
+    // worse, land on an entry of another section type). The only producer is
+    // `QueryPipeline::csr_shard_positions`, which derives them from the same
+    // reader every caller passes — so this states the coupling rather than
+    // defending against a reachable input.
+    debug_assert!(
+        positions.iter().all(|&i| catalog
+            .entries
+            .get(i)
+            .is_some_and(|e| e.section_type == scx_format_io::section::SectionType::CsrShard)),
+        "shard positions do not index this catalog's CSR shards"
+    );
+    positions.iter().map(|&i| &catalog.entries[i]).collect()
 }

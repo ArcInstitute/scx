@@ -88,6 +88,9 @@ pub(crate) fn truncate_to_limit(results: &mut Vec<NativeShardRows>, limit: usize
 /// `gene_set` must be ascending and unique (`PlanAndMask::effective_gene_indices`
 /// already is; the merge scan silently drops columns otherwise, which
 /// `project_csr_row`'s own `debug_assert!` documents).
+///
+/// With no projection and every row kept, the decoded buffers are returned by
+/// move — see [`filter_project_rows_owned`].
 pub(crate) fn decode_shard_native_filtered(
     reader: &dyn SectionReader,
     entry: &FullCatalogEntry,
@@ -95,14 +98,14 @@ pub(crate) fn decode_shard_native_filtered(
     gene_set: Option<&[u32]>,
 ) -> Result<NativeShardRows> {
     let (indptr, indices, values) = reader.read_shard_from_entry_native(entry)?;
-    // Shared with the f32 row filter, so the two cannot end up disagreeing about
-    // what a valid mask is — and so a truncated shard is rejected here too
-    // rather than silently yielding fewer rows than the obs half will carry.
-    check_keep_mask_len(keep_mask.len(), indptr.len().saturating_sub(1))?;
-
+    // The mask check lives inside `filter_project_rows_owned`, which is where it
+    // has to be: it must precede that function's `all()` test, and a caller
+    // doing it first does not stop a later caller from forgetting. Shared with
+    // the f32 row filter, so the two cannot end up disagreeing about what a
+    // valid mask is.
     Ok(match values {
         ShardValuesNative::U32(v) => {
-            let (ip, ix, out) = filter_project_rows(&indptr, &indices, &v, keep_mask, gene_set);
+            let (ip, ix, out) = filter_project_rows_owned(indptr, indices, v, keep_mask, gene_set)?;
             NativeShardRows {
                 indptr: ip,
                 indices: ix,
@@ -110,7 +113,7 @@ pub(crate) fn decode_shard_native_filtered(
             }
         }
         ShardValuesNative::F32(v) => {
-            let (ip, ix, out) = filter_project_rows(&indptr, &indices, &v, keep_mask, gene_set);
+            let (ip, ix, out) = filter_project_rows_owned(indptr, indices, v, keep_mask, gene_set)?;
             NativeShardRows {
                 indptr: ip,
                 indices: ix,
@@ -118,6 +121,46 @@ pub(crate) fn decode_shard_native_filtered(
             }
         }
     })
+}
+
+/// [`filter_project_rows`] for a caller that owns the decoded arrays: with no
+/// projection and every row kept, they *are* the answer and are returned **by
+/// move**.
+///
+/// `read_shard_from_entry_native` guarantees `indptr[0] == 0` and
+/// `indptr.last() == indices.len()`, which is what makes the filter pass an
+/// identity in that case rather than merely equivalent — the same argument
+/// `rows::filter_csr_rows_owned` rests on for the f32 route.
+///
+/// Owned, and a separate function, so that the *move* is observable to a test:
+/// with the skip inlined in `decode_shard_native_filtered` above, the buffers it
+/// hands back are allocated inside that function and no caller can tell a move
+/// from a faithful copy — every existing test here compares values, and a copy
+/// has the same values. See
+/// `the_typed_skip_returns_the_decoded_buffers_by_moving_them`.
+///
+/// Checks the mask's length **itself**, before the `all()` — a `debug_assert`
+/// was not enough. `all()` over a mask shorter than the CSR is vacuously true,
+/// so in a release build a short mask would take the fast path and hand back
+/// every row of a shard the caller believes it truncated: exactly the silent
+/// truncation `check_keep_mask_len` exists to reject, and exactly what
+/// `rows::filter_csr_rows_owned` guards against by doing the check inside. The
+/// production caller checking first is not a substitute for the function
+/// defending itself.
+pub(crate) fn filter_project_rows_owned<V: Copy>(
+    indptr: Vec<i64>,
+    indices: Vec<u32>,
+    values: Vec<V>,
+    keep_mask: &[bool],
+    gene_set: Option<&[u32]>,
+) -> Result<(Vec<i64>, Vec<u32>, Vec<V>)> {
+    check_keep_mask_len(keep_mask.len(), indptr.len().saturating_sub(1))?;
+    if gene_set.is_none() && keep_mask.iter().all(|&k| k) {
+        return Ok((indptr, indices, values));
+    }
+    Ok(filter_project_rows(
+        &indptr, &indices, &values, keep_mask, gene_set,
+    ))
 }
 
 /// Keep `keep_mask` rows and (optionally) project their columns, in one pass.
@@ -134,19 +177,26 @@ fn filter_project_rows<V: Copy>(
     gene_set: Option<&[u32]>,
 ) -> (Vec<i64>, Vec<u32>, Vec<V>) {
     let n_rows = indptr.len().saturating_sub(1);
-    let kept = keep_mask.iter().filter(|&&k| k).count();
+    // One pass for both totals, as `rows::filter_csr_rows` does. The nnz sum is
+    // exact when there is no projection — the indptr gives it without touching
+    // the values — and an **upper** bound under one, since the merge scan can
+    // only drop entries; either way it is a safe reservation. (The first
+    // version reserved zero for every filtered query and mis-described the
+    // unprojected count as a lower bound.)
+    let (kept, kept_nnz) =
+        keep_mask
+            .iter()
+            .enumerate()
+            .fold((0usize, 0usize), |(rows, nnz), (row, &k)| {
+                if k {
+                    (rows + 1, nnz + (indptr[row + 1] - indptr[row]) as usize)
+                } else {
+                    (rows, nnz)
+                }
+            });
 
     let mut new_indptr = Vec::with_capacity(kept + 1);
     new_indptr.push(0i64);
-    // Exact when there is no projection: sum the kept rows' lengths, which the
-    // indptr already gives without touching the values. Under a projection it is
-    // an **upper** bound (the merge scan can only drop entries), so it is still
-    // a safe reservation — the first version reserved zero for every filtered
-    // query and mis-described the unprojected count as a lower bound.
-    let kept_nnz: usize = (0..n_rows)
-        .filter(|&row| keep_mask[row])
-        .map(|row| (indptr[row + 1] - indptr[row]) as usize)
-        .sum();
     let mut new_indices = Vec::with_capacity(kept_nnz);
     let mut new_values = Vec::with_capacity(kept_nnz);
 

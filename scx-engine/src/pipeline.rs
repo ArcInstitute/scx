@@ -10,6 +10,7 @@ use arrow::datatypes::Schema;
 use scx_format_io::ScxReader;
 use scx_sparse::{MaterializePlan, ScxCsr};
 
+use scx_format_io::catalog::FullCatalogEntry;
 use scx_format_io::DeletionVectors;
 
 use crate::error::Result;
@@ -139,6 +140,22 @@ pub struct QueryPipeline {
     /// once per pipeline by [`require_grouped`](Self::require_grouped); shared
     /// by all grouped-read calls on this pipeline.
     group_index: std::sync::OnceLock<crate::group::GroupIndex>,
+    /// Catalog **positions** of this pipeline's CSR shards, sorted by
+    /// `row_start` — the one derivation of that list for the pipeline's life.
+    ///
+    /// Eager rather than lazy: `collect` / `collect_typed` / `count` / `exists`
+    /// / `read_row_range` all need it, so there is no path that pays for it
+    /// without using it, and it sits beside `n_vars` and the two schemas, which
+    /// are resolved here for the same reason. (`group_index` is a `OnceLock`
+    /// because parsing that sidecar is I/O and only grouped reads touch it;
+    /// this is a filter and a sort over an already-parsed catalog.)
+    ///
+    /// **Positions**, not `&FullCatalogEntry`: a reference borrows the catalog
+    /// the reader owns, so it cannot be stored beside it. Same reason the
+    /// training loader caches positions (`scx-loader/src/io_stage.rs`), and
+    /// `FullCatalog::csr_shard_indices` is the one ordering rule both bases are
+    /// expressed in terms of.
+    csr_shard_positions: Vec<usize>,
 }
 
 impl std::fmt::Debug for QueryPipeline {
@@ -230,6 +247,9 @@ impl QueryPipeline {
         // they apply identically to any modality's CSR shards (each tiles
         // `[0, n_obs)`) — no per-modality remapping needed.
         let deletion_vectors = reader.read_deletion_vectors()?;
+        // The shard list every query path walks, derived once here — see the
+        // field's docs for why positions and why not lazily.
+        let csr_shard_positions = reader.catalog().csr_shard_indices(Some(modality_id));
 
         Ok(Self {
             reader,
@@ -246,6 +266,7 @@ impl QueryPipeline {
             deletion_vectors,
             rowset_pushdown: !crate::collect::rowset_pushdown_disabled_by_env(),
             group_index: std::sync::OnceLock::new(),
+            csr_shard_positions,
         })
     }
 
@@ -253,6 +274,32 @@ impl QueryPipeline {
     /// single-modality).
     pub fn modality_id(&self) -> u8 {
         self.modality_id
+    }
+
+    /// Catalog positions of this pipeline's CSR shards, sorted by `row_start`.
+    ///
+    /// The single derivation of that list for the whole pipeline: planning,
+    /// pruning, masking, both materialize paths and `read_row_range` all resolve
+    /// their shard view from this, so `ShardCandidate::shard_idx` /
+    /// `ShardInfo::shard_idx` — which are *positions in it* — cannot be read
+    /// against a differently-derived list. Was recomputed (filter over every
+    /// catalog entry, then a sort, then two allocations) four times per
+    /// `collect()` and once per `read_row_range` call.
+    pub(crate) fn csr_shard_positions(&self) -> &[usize] {
+        &self.csr_shard_positions
+    }
+
+    /// The CSR shard at `shard_idx` — a **position** in
+    /// [`csr_shard_positions`](Self::csr_shard_positions), which is what
+    /// `ShardCandidate::shard_idx` / `ShardInfo::shard_idx` hold.
+    ///
+    /// For the consumers that only ever index one shard at a time. Building a
+    /// whole `Vec<&FullCatalogEntry>` for that (as the decode loops did) is an
+    /// allocation per query per path with nothing to show for it; only
+    /// `plan_and_mask` genuinely needs the slice, because the pruner and the
+    /// masker both take one.
+    pub(crate) fn csr_shard_entry(&self, shard_idx: usize) -> &FullCatalogEntry {
+        &self.reader.catalog().entries[self.csr_shard_positions[shard_idx]]
     }
 
     // -- Builders ----------------------------------------------------------
@@ -556,8 +603,6 @@ impl QueryPipeline {
     /// Legacy single-section obs (and pre-stats files) fall back to a full read
     /// + slice.
     pub fn read_row_range(&self, start: u64, stop: u64) -> Result<QueryResult> {
-        use scx_format_io::catalog::FullCatalogEntry;
-
         let n_obs = self.reader.header().n_obs;
         let stop = stop.max(start);
         if stop > n_obs {
@@ -579,8 +624,10 @@ impl QueryPipeline {
             .as_ref()
             .map(|dv| dv.build_keep_mask(n_obs as usize, self.modality_id));
 
-        let csr_shards: Vec<&FullCatalogEntry> =
-            crate::collect::scan_shards(self.reader.catalog(), self.modality_id);
+        // Positions, not a resolved `Vec<&FullCatalogEntry>`: `grouped_read`
+        // calls this once per group label, and the loop below only ever needs
+        // one entry at a time.
+        let csr_positions = self.csr_shard_positions();
         debug_assert!(
             self.modality_id == 0
                 || self
@@ -590,7 +637,7 @@ impl QueryPipeline {
             "modality {} CSR shards must tile [0, n_obs)",
             self.modality_id
         );
-        let total_shards = csr_shards.len();
+        let total_shards = csr_positions.len();
 
         let mut merged_indptr: Vec<i64> = vec![0];
         let mut merged_indices: Vec<i32> = Vec::new();
@@ -604,7 +651,8 @@ impl QueryPipeline {
                                // obs slice). Empty when there are no deletion vectors.
         let mut keep_local: Vec<bool> = Vec::new();
 
-        for e in &csr_shards {
+        for &pos in csr_positions {
+            let e = &self.reader.catalog().entries[pos];
             let Some(stats) = e.stats.as_ref() else {
                 continue;
             };
@@ -618,6 +666,14 @@ impl QueryPipeline {
             let (indptr, indices, data) = self.reader.read_shard_from_entry(e)?;
             let lo = start.max(rs);
             let hi = stop.min(re);
+            // Exact for this shard's contribution, before the row loop appends
+            // it: the three buffers grew by doubling across every touched
+            // shard. An upper bound rather than the final size when a deletion
+            // vector drops rows, which is the only case it over-reserves.
+            merged_indptr.reserve((hi - lo) as usize);
+            let range_nnz = (indptr[(hi - rs) as usize] - indptr[(lo - rs) as usize]) as usize;
+            merged_indices.reserve(range_nnz);
+            merged_data.reserve(range_nnz);
             for g in lo..hi {
                 covered += 1;
                 let keep = keep_mask.as_ref().map(|m| m[g as usize]).unwrap_or(true);

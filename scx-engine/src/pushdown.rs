@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use scx_format_io::catalog::{ColumnStat, FullCatalog};
+use scx_format_io::catalog::{ColumnStat, FullCatalogEntry};
 use scx_format_io::column_name_hash;
 use scx_format_io::DeletionVectors;
 
@@ -50,9 +50,8 @@ impl CategoryDictionaries {
 
     /// Record `values` for `column_name_hash`.
     ///
-    /// `complete` must be `true` only when every shard the caller will pass to
-    /// [`prune_shards_by_catalog_with_dict`] was covered by the index build
-    /// that produced `values`. There is no default and no setter: a caller
+    /// `complete` must be `true` only when every shard the Level-1 pruner will
+    /// iterate was covered by the index build that produced `values`. There is no default and no setter: a caller
     /// cannot supply a vocabulary without stating what it is worth.
     ///
     /// An **empty** vocabulary is never complete, whatever the caller says. It
@@ -99,45 +98,44 @@ impl CategoryDictionaries {
 /// A shard that *may* contain matching rows after catalog-level pruning.
 #[derive(Debug, Clone)]
 pub struct ShardCandidate {
-    /// Index into `FullCatalog.shards_sorted()` result.
+    /// Position in the **modality-scoped** CSR shard list this candidate was
+    /// pruned from — the `sorted_shards` slice the pruner was handed, which is
+    /// the list the querying pipeline derived for its own modality. **Not** an
+    /// index into `FullCatalog.entries`, and not into the flattened
+    /// all-modality `shards_sorted()`; both differ from it on any multimodal
+    /// file. Whoever holds a `ShardCandidate` must index the same slice that
+    /// produced it.
     pub shard_idx: usize,
     /// Row mask within shard (None = all rows are candidates).
     pub row_mask: Option<Vec<Range<u32>>>,
 }
 
-/// Determine which shards may contain matching rows based on catalog-level
-/// statistics. Shards that definitely don't match are excluded.
+/// Crate-private, deliberately: this was `pub` and re-exported, and taking the
+/// shard slice instead of `(catalog, modality_id)` is a source break for any
+/// out-of-tree Rust caller. There are none — no workflow runs `cargo publish`,
+/// the released artefacts are the `pyscx` wheel and the `scx-cli` binary, and
+/// no crate outside `scx-engine` calls it (inside it, `collect::plan::build_plan`
+/// is the one caller). So the surface is removed rather than frozen: a
+/// compatibility wrapper would have to re-create the `(catalog, modality_id)`
+/// pair whose removal is the point.
 ///
-/// This is the "cheap" level 1 pushdown (docs/api.md (Query engine, optimizations)) that avoids reading
-/// any shard data. When `n_indexed_columns == 0` (Phase 1 files),
-/// all shards pass through to post-read filtering.
+/// Level-1 (catalog-statistics) shard pruning over the caller's own shard list,
+/// with an optional category dictionary for resolving `Utf8` predicate values
+/// against `CategoryBitset` column stats.
 ///
-/// If `deletion_vectors` is provided, fully-deleted shards are excluded
-/// and partially-deleted shards retain deletion info.
-pub fn prune_shards_by_catalog(
-    catalog: &FullCatalog,
-    predicates: &[Predicate],
-    deletion_vectors: Option<&DeletionVectors>,
-) -> Vec<ShardCandidate> {
-    prune_shards_by_catalog_with_dict(catalog, predicates, deletion_vectors, None, 0)
-}
-
-/// Like `prune_shards_by_catalog`, but accepts an optional category dictionary
-/// for resolving `Utf8` predicate values against `CategoryBitset` column stats,
-/// and a `modality_id` scoping the shard list. `modality_id == 0` is the global
-/// / single-modality axis (identical to the legacy `shards_sorted()` view);
-/// `>= 1` prunes only that modality's CSR shards. `shard_idx` in the returned
-/// candidates indexes the modality-scoped shard list — callers MUST index the
-/// same [`crate::collect::scan_shards`] list downstream.
-pub fn prune_shards_by_catalog_with_dict(
-    catalog: &FullCatalog,
+/// `sorted_shards` is one [`crate::collect::scan_shards`] result — already
+/// scoped to a modality (`modality_id == 0` being the global / single-modality
+/// axis, identical to the legacy `shards_sorted()` view). `shard_idx` in the
+/// returned candidates is a **position in that slice**, which is why the slice
+/// is a parameter rather than a `(catalog, modality_id)` pair the callee
+/// re-derives: the caller keeps the list it will index downstream, so the two
+/// cannot be derived from different bases.
+pub(crate) fn prune_shards_by_catalog_with_dict(
+    sorted_shards: &[&FullCatalogEntry],
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
     category_dicts: Option<&CategoryDictionaries>,
-    modality_id: u8,
 ) -> Vec<ShardCandidate> {
-    let sorted_shards = crate::collect::scan_shards(catalog, modality_id);
-
     let mut candidates = Vec::with_capacity(sorted_shards.len());
 
     for (shard_idx, entry) in sorted_shards.iter().enumerate() {
@@ -539,6 +537,14 @@ mod tests {
     use super::*;
     use roaring::RoaringBitmap;
     use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, ShardStats};
+
+    /// The modality-0 CSR shard list the pruner takes. Every fixture here is
+    /// single-modality, so this is `scan_shards`' result for it — the pruner
+    /// stopped deriving the list itself so that `shard_idx` positions and the
+    /// list the caller indexes cannot come from different derivations.
+    fn shards_of(catalog: &FullCatalog) -> Vec<&FullCatalogEntry> {
+        catalog.csr_shards_for_modality(0)
+    }
     use scx_format_io::section::SectionType;
     use scx_format_io::DeletionVectors;
 
@@ -630,7 +636,7 @@ mod tests {
             (100, 200, vec![minmax_stat("n_genes", 200.0, 800.0)]),
             (200, 300, vec![minmax_stat("n_genes", 50.0, 300.0)]),
         ]);
-        let candidates = prune_shards_by_catalog(&catalog, &[], None);
+        let candidates = prune_shards_by_catalog_with_dict(&shards_of(&catalog), &[], None, None);
         assert_eq!(candidates.len(), 3);
     }
 
@@ -649,7 +655,8 @@ mod tests {
             "n_genes".to_string(),
             ScalarValue::Int64(600),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
     }
@@ -729,7 +736,8 @@ mod tests {
             "n_genes".to_string(),
             ScalarValue::Int64(100),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 2);
     }
@@ -787,7 +795,8 @@ mod tests {
             "cell_type".to_string(),
             ScalarValue::Utf8("T cell".to_string()),
         )];
-        let candidates = prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&dicts));
         assert_eq!(candidates.len(), 1, "only shard 0 holds 'T cell'");
         assert_eq!(candidates[0].shard_idx, 0);
 
@@ -796,9 +805,13 @@ mod tests {
             "cell_type".to_string(),
             ScalarValue::Utf8("Nope".to_string()),
         )];
-        assert!(
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0).is_empty()
-        );
+        assert!(prune_shards_by_catalog_with_dict(
+            &shards_of(&catalog),
+            &preds,
+            None,
+            Some(&dicts)
+        )
+        .is_empty());
     }
 
     /// The dictionary miss is a claim about the whole file, so it may only be
@@ -830,14 +843,14 @@ mod tests {
 
         let complete = category_dicts_with_completeness("cell_type", values, true);
         assert!(
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&complete), 0)
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&complete))
                 .is_empty(),
             "a complete vocabulary proves 'Nope' is in no shard"
         );
 
         let partial = category_dicts_with_completeness("cell_type", values, false);
         let candidates =
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&partial), 0);
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&partial));
         assert_eq!(
             candidates.len(),
             2,
@@ -876,7 +889,7 @@ mod tests {
 
         let complete = category_dicts_with_completeness("cell_type", values, true);
         let candidates =
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&complete), 0);
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&complete));
         assert_eq!(
             candidates.len(),
             1,
@@ -887,7 +900,8 @@ mod tests {
 
         let partial = category_dicts_with_completeness("cell_type", values, false);
         assert_eq!(
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&partial), 0).len(),
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&partial))
+                .len(),
             2,
             "'Nope' is merely unresolvable under a partial vocabulary — it could \
              be the value shard 1 holds"
@@ -923,11 +937,10 @@ mod tests {
         ] {
             assert_eq!(
                 prune_shards_by_catalog_with_dict(
-                    &catalog,
+                    &shards_of(&catalog),
                     std::slice::from_ref(&pred),
                     None,
                     Some(&dicts),
-                    0
                 )
                 .len(),
                 1,
@@ -963,7 +976,8 @@ mod tests {
             "cell_type".to_string(),
             ScalarValue::Utf8("Appended cell".to_string()),
         )];
-        let candidates = prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&dicts));
         assert!(
             candidates.iter().any(|c| c.shard_idx == 1),
             "the appended shard must survive pruning or its rows are unreachable"
@@ -1003,11 +1017,10 @@ mod tests {
         ] {
             assert_eq!(
                 prune_shards_by_catalog_with_dict(
-                    &catalog,
+                    &shards_of(&catalog),
                     std::slice::from_ref(&pred),
                     None,
                     Some(&dicts),
-                    0
                 )
                 .len(),
                 1,
@@ -1055,11 +1068,10 @@ mod tests {
         ] {
             assert_eq!(
                 prune_shards_by_catalog_with_dict(
-                    &catalog,
+                    &shards_of(&catalog),
                     std::slice::from_ref(&pred),
                     None,
                     Some(&dicts),
-                    0
                 )
                 .len(),
                 2,
@@ -1091,7 +1103,8 @@ mod tests {
             ),
         ]);
         let preds = vec![Predicate::Eq("batch".to_string(), ScalarValue::Int64(2))];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(
             candidates.len(),
             2,
@@ -1119,7 +1132,12 @@ mod tests {
                 vec![ScalarValue::Int64(1), ScalarValue::Int64(2)],
             ),
         ] {
-            let candidates = prune_shards_by_catalog(&catalog, std::slice::from_ref(&pred), None);
+            let candidates = prune_shards_by_catalog_with_dict(
+                &shards_of(&catalog),
+                std::slice::from_ref(&pred),
+                None,
+                None,
+            );
             assert_eq!(
                 candidates.len(),
                 2,
@@ -1139,7 +1157,8 @@ mod tests {
             "other_column".to_string(),
             ScalarValue::Utf8("foo".to_string()),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 2);
     }
 
@@ -1159,7 +1178,8 @@ mod tests {
             Predicate::Gt("n_genes".to_string(), ScalarValue::Int64(100)),
             Predicate::Lt("n_genes".to_string(), ScalarValue::Int64(400)),
         ];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].shard_idx, 0);
         assert_eq!(candidates[1].shard_idx, 1);
@@ -1177,7 +1197,8 @@ mod tests {
             "n_genes".to_string(),
             ScalarValue::Int64(600),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         // All shards should pass through (no stats to prune on)
         assert_eq!(candidates.len(), 3);
     }
@@ -1200,7 +1221,8 @@ mod tests {
         let mut dv = DeletionVectors::new();
         // Shard 0 has row_start 0, so local rows == global obs rows.
         dv.deletions.insert(0, bm);
-        let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &[], Some(&dv), None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
     }
@@ -1219,7 +1241,8 @@ mod tests {
         let mut dv = DeletionVectors::new();
         // Shard 0 has row_start 0, so local rows == global obs rows.
         dv.deletions.insert(0, bm);
-        let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &[], Some(&dv), None);
         // Both shards included: shard 0 is only partially deleted
         assert_eq!(candidates.len(), 2);
     }

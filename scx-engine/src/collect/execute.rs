@@ -19,17 +19,16 @@ use crate::error::{EngineError, Result};
 use crate::fused_ops::apply_fused_ops;
 use crate::pipeline::{QueryPipeline, QueryResult, TypedQueryResult};
 use crate::predicate::evaluate;
-use crate::projection::{decode_shard_projected, project_var};
+use crate::projection::{decode_shard_projected_presorted, project_var};
 use crate::reader::SectionReader;
 
 use scx_format_io::assemble_filtered_metadata;
-use scx_format_io::catalog::FullCatalogEntry;
 
 use super::mask::{compute_mask, MaskResult, ShardInfo};
 use super::native::{decode_shard_native_filtered, truncate_to_limit, NativeShardRows};
 use super::plan::{build_plan, scan_shards, ExecutionPlan};
 use super::retry::par_map_with_shard_retry;
-use super::rows::filter_csr_rows;
+use super::rows::filter_csr_rows_owned;
 
 /// Result of the cheap planning + masking half of a query (CLI2): catalog
 /// shard elimination, obs/var predicate evaluation, per-shard row-keep masks,
@@ -80,7 +79,8 @@ pub(crate) struct ColumnReorder {
 /// path, the output column count, and the optional reorder back to the
 /// caller's requested order.
 struct GeneProjection {
-    /// Sorted, unique gene indices for `decode_shard_projected` / `project_var`
+    /// Sorted, unique gene indices for `decode_shard_projected_presorted` /
+    /// `project_var`
     /// (unchanged fast path). `None` = no projection (all genes).
     decode_indices: Option<Vec<u32>>,
     n_output_cols: usize,
@@ -188,17 +188,19 @@ fn resolve_gene_projection(
 /// Cheap half of query execution: catalog pruning + obs/var predicate
 /// evaluation + per-shard row-keep masks + gene projection. No X-shard decode.
 pub(crate) fn plan_and_mask(pipeline: &QueryPipeline) -> Result<PlanAndMask> {
-    let plan = build_plan(pipeline)?;
     let reader = pipeline.reader();
     let modality_id = pipeline.modality_id();
     // Per-modality X width (header().n_vars is the file-wide max, not the
     // modality's — docs/format.md § 13.4).
     let n_vars = pipeline.n_vars();
 
-    // Sorted CSR-shard view, computed once and reused across this function
-    // (was recomputed — filter+sort+alloc — ≥4× per query). OE6. Scoped to the
-    // pipeline's modality (== shards_sorted() for the single-modality default).
-    let sorted_shards = scan_shards(reader.catalog(), modality_id);
+    // Sorted CSR-shard view, resolved from the pipeline's cached positions and
+    // reused across this function *and* handed to `build_plan`, so the
+    // `shard_idx` positions in its candidates index this very list. Scoped to
+    // the pipeline's modality (== shards_sorted() for the single-modality
+    // default).
+    let sorted_shards = scan_shards(reader.catalog(), pipeline.csr_shard_positions());
+    let plan = build_plan(pipeline, &sorted_shards)?;
     debug_assert!(
         modality_id == 0
             || reader
@@ -370,10 +372,9 @@ pub(crate) fn materialize_typed(
     }
 
     let reader = pipeline.reader();
-    let sorted_shards = scan_shards(reader.catalog(), pipeline.modality_id());
 
     let decode_count = decode_prefix_len(&shard_infos, plan.limit);
-    let max_value = max_value_over_prefix(&sorted_shards, &shard_infos[..decode_count]);
+    let max_value = max_value_over_prefix(pipeline, &shard_infos[..decode_count]);
 
     // O(1) pre-decode guard, as the whole-matrix typed reader does: fail loud
     // before the decode and the big allocation when the target dtype cannot hold
@@ -389,7 +390,7 @@ pub(crate) fn materialize_typed(
     // whose own range gate then covers them.
     let mut shard_results: Vec<NativeShardRows> =
         par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
-            let entry = sorted_shards[si.shard_idx];
+            let entry = pipeline.csr_shard_entry(si.shard_idx);
             let mut rows = decode_shard_native_filtered(
                 reader,
                 entry,
@@ -591,7 +592,6 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
     } = pm;
 
     let reader = pipeline.reader();
-    let sorted_shards = scan_shards(reader.catalog(), pipeline.modality_id());
 
     // Step 7: Parallel shard decode with optional projection, over the prefix of
     // candidate shards `limit` can reach (see `decode_prefix_len`).
@@ -599,50 +599,67 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
 
     // Folded before the decode, not after: it comes from catalog stats and
     // `decode_count` alone, so a caller whose guard trips pays no decode.
-    let max_value = max_value_over_prefix(&sorted_shards, &shard_infos[..decode_count]);
+    let max_value = max_value_over_prefix(pipeline, &shard_infos[..decode_count]);
 
     // Each shard produces (indptr, indices, data) filtered to matching rows
     let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> =
         par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
-            let entry = sorted_shards[si.shard_idx];
+            let entry = pipeline.csr_shard_entry(si.shard_idx);
 
             // Decode shard (with or without projection)
             let (indptr, indices, data) = if let Some(ref gi) = effective_gene_indices {
-                decode_shard_projected(reader, entry, gi)?
+                decode_shard_projected_presorted(reader, entry, gi)?
             } else {
                 reader.read_shard_from_entry(entry)?
             };
 
-            // Filter to matching rows within the shard
-            let (filtered_indptr, filtered_indices, filtered_data) =
-                filter_csr_rows(&indptr, &indices, &data, &si.local_keep_mask)?;
-
-            Ok((filtered_indptr, filtered_indices, filtered_data))
+            // Filter to matching rows within the shard. Owned, so a shard the
+            // mask keeps whole is handed back rather than copied — the case for
+            // every shard of an unfiltered query, and for any shard a row-set
+            // fully covers.
+            filter_csr_rows_owned(indptr, indices, data, &si.local_keep_mask)
         })?;
 
-    // Step 8: Assemble CSR from per-shard results
-    let mut merged_indptr: Vec<i64> = Vec::new();
-    let mut merged_indices: Vec<i32> = Vec::new();
-    let mut merged_data: Vec<f32> = Vec::new();
-    let mut cumulative_nnz: i64 = 0;
+    // Step 8: Assemble CSR from per-shard results.
+    //
+    // The first shard's buffers *become* the merge buffers and the rest are
+    // appended into them, then dropped as the loop advances — so the assembled
+    // matrix costs one copy of every shard but the first, where it used to cost
+    // one copy of all of them into three `Vec::new()`s (doubling as they grew)
+    // while the whole per-shard copy stayed resident through fused ops, the
+    // limit slice and the entire obs/var metadata phase. A single-shard
+    // unfiltered `collect()` is now copy-free end to end.
+    let total_rows: usize = shard_results
+        .iter()
+        .map(|(indptr, _, _)| indptr.len().saturating_sub(1))
+        .sum();
+    let total_nnz: usize = shard_results
+        .iter()
+        .map(|(_, indices, _)| indices.len())
+        .sum();
 
-    for (i, (indptr, indices, data)) in shard_results.iter().enumerate() {
-        if i == 0 {
-            merged_indptr.extend_from_slice(indptr);
-        } else {
-            // Skip leading 0 and offset by cumulative nnz
-            for &v in &indptr[1..] {
-                merged_indptr.push(v + cumulative_nnz);
-            }
+    let mut shards = shard_results.into_iter();
+    // `[0]` for the no-shard case, which is what the old `is_empty` guard
+    // repaired after the fact.
+    let (mut merged_indptr, mut merged_indices, mut merged_data) = shards
+        .next()
+        .unwrap_or_else(|| (vec![0i64], Vec::new(), Vec::new()));
+    merged_indptr.reserve((total_rows + 1).saturating_sub(merged_indptr.len()));
+    merged_indices.reserve(total_nnz.saturating_sub(merged_indices.len()));
+    merged_data.reserve(total_nnz.saturating_sub(merged_data.len()));
+    // Each shard's indptr is rebased to 0 by the row filter, so the running
+    // offset is the accumulator's own last entry — for the first shard that is
+    // its nnz, exactly what the old loop added on its `i == 0` pass.
+    let mut cumulative_nnz: i64 = merged_indptr.last().copied().unwrap_or(0);
+
+    for (indptr, indices, data) in shards {
+        // Skip leading 0 and offset by cumulative nnz
+        for &v in &indptr[1..] {
+            merged_indptr.push(v + cumulative_nnz);
         }
         cumulative_nnz += indptr.last().copied().unwrap_or(0);
-        merged_indices.extend_from_slice(indices);
-        merged_data.extend_from_slice(data);
-    }
-
-    // Handle empty result case
-    if merged_indptr.is_empty() {
-        merged_indptr.push(0);
+        merged_indices.extend_from_slice(&indices);
+        merged_data.extend_from_slice(&data);
     }
 
     let n_rows = merged_indptr.len() - 1;
@@ -678,9 +695,12 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
 
     // Step 11: Filter obs metadata to matching rows
     // Build the list of global row indices that made it into the output.
-    // `shard_infos` come from `candidate_shards`, which derive from
-    // `catalog.shards_sorted()` (ascending `row_start`), so this list is
-    // globally ascending and aligns row-for-row with the assembled CSR.
+    // `shard_infos` come from `candidate_shards`, which derive from the
+    // modality-scoped CSR list the pipeline derived (ascending `row_start`), so
+    // this list is globally ascending and aligns row-for-row with the assembled
+    // CSR. Not `catalog.shards_sorted()`: that is the flattened all-modality
+    // view, which differs from this one on any multimodal file — the conclusion
+    // holds within a modality, which is the only scope a pipeline has.
     //
     // Only the decoded prefix (`shard_infos[..decode_count]`) contributes rows
     // to the assembled CSR; for a `limit`ed query the trailing shards were
@@ -761,10 +781,10 @@ fn decode_prefix_len(shard_infos: &[ShardInfo], limit: Option<usize>) -> usize {
 /// **narrower than a catalog-wide fold**: a large count in a shard the predicate
 /// skipped, or one past the `limit` cutoff, is never decoded and so must not
 /// refuse the read.
-fn max_value_over_prefix(sorted_shards: &[&FullCatalogEntry], prefix: &[ShardInfo]) -> u32 {
+fn max_value_over_prefix(pipeline: &QueryPipeline, prefix: &[ShardInfo]) -> u32 {
     prefix
         .iter()
-        .filter_map(|si| sorted_shards[si.shard_idx].stats.as_ref())
+        .filter_map(|si| pipeline.csr_shard_entry(si.shard_idx).stats.as_ref())
         .map(|s| s.value_max)
         .max()
         .unwrap_or(0)
