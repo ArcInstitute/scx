@@ -38,14 +38,17 @@
 //!   same way, so it moves with the code and agrees with it.
 //!
 //! What the pin turned out **not** to be needed for: a permutation of the
-//! concatenation that recomputes its offsets to stay self-consistent. Measured
-//! — that file does not read. `resolve_block_index` derives each group's byte
-//! range as `[offset[g], offset[g + 1])`, so the entry table's offsets must
-//! ascend with its rows; reversing the byte order and the entries together
-//! reddens `decode_shard_regions_framed_matches_unframed` and five backed-read
-//! tests, not just these. Byte order in a framed shard is structurally
-//! load-bearing, which is worth knowing before anyone proposes emitting groups
-//! in completion order "since the index says where they are".
+//! concatenation that recomputes its offsets to stay self-consistent. There is
+//! no such thing. `resolve_block_index` derives each group's byte range as
+//! `[offset[g], offset[g + 1])` and validates the offsets monotonic — the rule
+//! `docs/format.md` § Block index already states — so the entry table's
+//! offsets must ascend with its rows. Reversing the byte order and the entry
+//! table together produces an **unreadable** file, not merely a different one:
+//! measured, it reddens `decode_shard_regions_framed_matches_unframed` and
+//! five backed-read tests. Worth restating here because "the index says where
+//! each group is, so emit them in completion order" is the obvious wrong idea
+//! about this function, and the spec sentence that forbids it is three files
+//! away.
 //!
 //! The constants were blessed on `0383ea8f`, **before** the parallel encode
 //! landed, so they describe the pre-existing layout rather than the new code's
@@ -255,7 +258,7 @@ fn digest_framed(e: &EncodedShard, bi: &BlockIndex) -> String {
 ///
 /// Blessed on `0383ea8f` before the parallel encode existed. If a deliberate
 /// format change moves these, that is a **wire-format change**: say so in the
-/// commit, and check `docs/format.md` § row-group framing with it.
+/// commit, and check `docs/format.md` § Block index with it.
 #[test]
 fn framed_layout_is_byte_pinned() {
     // (codec, encoding, u16 indices, expected digest)
