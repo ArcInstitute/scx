@@ -581,6 +581,171 @@ fn framing_for_csc_rebuild_preserves_v4_and_re_selects_nothing() {
     assert!(scx_ops::framing_for_csc_rebuild(&unframed).is_none());
 }
 
+// ---------------------------------------------------------------------------
+// The preservation contract, part 2: the SCX-004 declared-width widening
+// ---------------------------------------------------------------------------
+//
+// `op_output_identity.rs`'s two build_csc arms already digest the rest of
+// `run_build_csc`'s re-emit loop — the entry-to-shard pairing, each shard's
+// `row_start`, each shard's codec and encoding, and "the sidecar takes the
+// FIRST shard's codec" (its `build_csc_indexed` input's two X shards are
+// `Scx1` and `Zstd`). Measured, not assumed: three of the mutations that break
+// this test move that golden too.
+//
+// What neither golden arm can see is the widest **declared** integer encoding
+// across shards: `mixed_codec_file` always carries a `Float32` shard, so the
+// integer arm never runs on it, and `compact` gives every output shard one
+// encoding, so the `_indexed` input's shards cannot disagree. A build-csc that
+// dropped the declared half of the scan and trusted `stats.value_max` alone
+// leaves both arms unmoved. That is what this owns.
+
+/// Row counts per shard — irregular, one-row shard in the middle, so an
+/// off-by-one in a running row offset is visible.
+const MS_SHARD_ROWS: [usize; 3] = [3, 1, 5];
+const MS_N_VARS: usize = 12;
+/// Small enough to emit several CSC shards over `MS_N_VARS`: the sidecar's
+/// codec/encoding is picked once for the whole sidecar, and a single-shard
+/// layout cannot witness that.
+const MS_CSC_COLS: usize = 4;
+
+/// `(codec, declared encoding)` per shard. Shard 1 declares `Uint16` while
+/// every value fits in a `u8` — the point of the fixture. Codecs are pairwise
+/// distinct so "each shard's own" and "shard 0's for all" disagree.
+const MS_SPECS: [(CodecId, ValueEncoding); 3] = [
+    (CodecId::None, ValueEncoding::Uint8),
+    (CodecId::Zstd, ValueEncoding::Uint16),
+    (CodecId::Scx1, ValueEncoding::Uint8),
+];
+
+/// Two nnz per row at shard-distinct columns and values. Values are `1..=200`:
+/// never 0 (`Scx1`'s Rice arm rejects zero) and never above 255 (no *value*
+/// may justify shard 1's `Uint16`). `base` is even and the two columns are
+/// consecutive, so they cannot wrap out of order.
+fn ms_shard_rows(shard: usize) -> (Vec<u64>, Vec<u32>, Vec<f32>) {
+    let (base_col, base_val) = (shard * 4, 1 + shard * 50);
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for r in 0..MS_SHARD_ROWS[shard] {
+        indices.push(((base_col + 2 * r) % MS_N_VARS) as u32);
+        indices.push(((base_col + 2 * r + 1) % MS_N_VARS) as u32);
+        values.push((base_val + 2 * r) as f32);
+        values.push((base_val + 2 * r + 1) as f32);
+        indptr.push(indices.len() as u64);
+    }
+    (indptr, indices, values)
+}
+
+#[test]
+fn build_csc_widens_the_sidecar_to_the_widest_declared_shard_encoding() {
+    let d = tmp();
+    let input = d.path().join("multi_int.scx");
+
+    let n_obs: usize = MS_SHARD_ROWS.iter().sum();
+    {
+        let mut header =
+            FileHeader::new_single_modality(n_obs as u64, MS_N_VARS as u64, 0, n_obs as u32, 0, 0);
+        header.index_dtype = 0;
+        let mut w = ScxWriter::new(&input, header).unwrap();
+        w.write_obs(&obs_batch(n_obs)).unwrap();
+        w.write_var(&var_batch(MS_N_VARS)).unwrap();
+        let mut row_start = 0u64;
+        for (shard, &(codec, encoding)) in MS_SPECS.iter().enumerate() {
+            let (indptr, indices, values) = ms_shard_rows(shard);
+            let raw = scx_codec::values_to_raw_bytes(&values, encoding).unwrap();
+            w.write_csr_shard(&indptr, &indices, &raw, codec, encoding, row_start)
+                .unwrap();
+            row_start += MS_SHARD_ROWS[shard] as u64;
+        }
+        w.finish().unwrap();
+    }
+
+    // --- premises: without these the assertions below are vacuous ----------
+    let in_dense = {
+        let r = ScxReader::open(&input).unwrap();
+        assert!(!r.header().has_csc(), "fixture must start with no sidecar");
+        let entries = r.catalog().csr_shards_sorted();
+        assert_eq!(entries.len(), 3, "fixture must write three CSR shards");
+        let encs: Vec<u8> = entries
+            .iter()
+            .map(|e| r.read_shard_header(e).unwrap().value_encoding)
+            .collect();
+        assert!(
+            encs.windows(2).any(|w| w[0] != w[1]),
+            "the shards' DECLARED encodings must differ — that is the contract under \
+             test: {encs:?}"
+        );
+        // The declared half of the scan is the only thing that can widen the
+        // sidecar past Uint8 here. Read from the catalog statistics build-csc
+        // actually consults, not from the generator that fed the writer.
+        let max_int_val = entries
+            .iter()
+            .filter_map(|e| e.stats.as_ref().map(|st| st.value_max))
+            .max()
+            .expect("the fixture's shards carry statistics");
+        assert!(
+            max_int_val <= u8::MAX as u32,
+            "every value must fit a u8, so the `stats.value_max` half of the scan \
+             would pick Uint8 on its own (max on disk: {max_int_val})"
+        );
+        r.read_all_csr_shards().unwrap().to_dense().unwrap()
+    };
+
+    // --- the op ------------------------------------------------------------
+    let output = d.path().join("multi_int_csc.scx");
+    scx_ops::build_csc::run_build_csc(&input, &output, "4G", false, MS_CSC_COLS, None).unwrap();
+
+    // The sidecar: widest DECLARED integer encoding across shards — Uint16, from
+    // shard 1. Per-shard codec / encoding / row_start preservation and "the
+    // sidecar takes the first shard's codec" are deliberately not restated here;
+    // both move the `op_output_identity` golden (measured).
+    let out_reader = ScxReader::open(&output).unwrap();
+    let csc: Vec<(u8, u8)> = out_reader
+        .catalog()
+        .csc_shards_sorted()
+        .iter()
+        .map(|e| {
+            let sh = out_reader.read_shard_header(e).unwrap();
+            (sh.codec_id, sh.value_encoding)
+        })
+        .collect();
+    assert!(
+        csc.len() >= 2,
+        "the fixture must emit several CSC shards, else the uniformity check below \
+         is vacuous (got {})",
+        csc.len()
+    );
+    assert!(
+        csc.windows(2).all(|w| w[0] == w[1]),
+        "build-csc picks ONE codec/encoding for the whole sidecar: {csc:?}"
+    );
+    assert_eq!(
+        csc[0].1,
+        ValueEncoding::Uint16 as u8,
+        "the sidecar must be wide enough for every shard's DECLARED encoding \
+         (SCX-004); shard 1 declares Uint16 while no value needs it"
+    );
+
+    // Content round-trips, both ways.
+    assert_eq!(
+        out_reader
+            .read_all_csr_shards()
+            .unwrap()
+            .to_dense()
+            .unwrap(),
+        in_dense,
+        "build-csc must not change X"
+    );
+    assert_eq!(
+        out_reader
+            .read_all_csc_shards()
+            .unwrap()
+            .to_dense()
+            .unwrap(),
+        in_dense,
+        "the CSC transpose must match the CSR data"
+    );
+}
+
 /// The other half of merge's raw-copy gate: `compact` must turn the fast path
 /// OFF and actually re-encode.
 ///
