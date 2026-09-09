@@ -488,6 +488,114 @@ fn full_catalog_shards_sorted() {
     assert!(starts.windows(2).all(|w| w[0] <= w[1]));
 }
 
+/// `csr_shard_indices` is the single ordering rule the two entry-returning
+/// accessors are built on, and the *only* thing the training loader can carry
+/// across a `'static spawn_blocking` boundary (`scx-loader/src/io_stage.rs`
+/// indexes per-modality positions; the wrong basis reads the wrong shard).
+/// This pins the positions against the references, per modality and unfiltered.
+#[test]
+fn csr_shard_indices_agree_with_the_entry_returning_twins() {
+    let mk = |name: &str, section_type: SectionType, modality_id: u8, row_start: u64| {
+        let mut s = sample_stats();
+        s.row_start = row_start;
+        FullCatalogEntry {
+            name: name.to_string(),
+            offset: 4352,
+            length: 50_000,
+            section_type,
+            checksum: [0u8; 32],
+            modality_id,
+            stats: Some(s),
+        }
+    };
+    // Two modalities, each with two CSR shards written **out of row order**,
+    // interleaved with each other and with non-CSR sections. Also one CSR
+    // shard with no stats at all, which must sort last within its modality.
+    let catalog = FullCatalog {
+        catalog_version: CURRENT_CATALOG_VERSION,
+        manifest_sequence: 0,
+        prev_catalog_offset: 0,
+        n_obs: 20,
+        entries: vec![
+            mk("obs", SectionType::ObsMetadata, 0, 0),
+            mk("X/rna/shard_1", SectionType::CsrShard, 1, 10),
+            mk("X_csc/rna/shard_0", SectionType::CscShard, 1, 0),
+            mk("X/atac/shard_1", SectionType::CsrShard, 2, 10),
+            mk("X/rna/shard_0", SectionType::CsrShard, 1, 0),
+            mk("var/atac", SectionType::VarMetadata, 2, 0),
+            mk("X/atac/shard_0", SectionType::CsrShard, 2, 0),
+            FullCatalogEntry {
+                stats: None,
+                ..mk("X/rna/shard_2", SectionType::CsrShard, 1, 0)
+            },
+        ],
+        data_generation: 0,
+        csc_build_generation: 0,
+    };
+
+    // Premise of the whole pin: the fixture can tell catalog order from
+    // row order. If the positions came back as `0..n` or already ascending,
+    // dropping the sort (or the filter) would still pass below.
+    let all = catalog.csr_shard_indices(None);
+    assert!(
+        !all.windows(2).all(|w| w[0] <= w[1]),
+        "fixture must interleave CSR shards so sorted order != catalog order: {all:?}"
+    );
+    assert_ne!(
+        all,
+        (0..catalog.entries.len()).collect::<Vec<_>>(),
+        "fixture must carry non-CSR sections so the filter is exercised"
+    );
+
+    for modality_id in [None, Some(1u8), Some(2u8)] {
+        let indices = catalog.csr_shard_indices(modality_id);
+        let entries = match modality_id {
+            Some(mid) => catalog.csr_shards_for_modality(mid),
+            None => catalog.csr_shards_sorted(),
+        };
+        assert_eq!(
+            indices.len(),
+            entries.len(),
+            "{modality_id:?}: position count must match the entry count"
+        );
+        let by_index: Vec<&str> = indices
+            .iter()
+            .map(|&i| catalog.entries[i].name.as_str())
+            .collect();
+        let by_entry: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            by_index, by_entry,
+            "{modality_id:?}: positions must resolve to the same entries, in the same order"
+        );
+    }
+
+    // And spell the expected order out once, so a change of ordering rule has
+    // to be a deliberate edit rather than a silently-agreeing pair.
+    let rna: Vec<&str> = catalog
+        .csr_shard_indices(Some(1))
+        .iter()
+        .map(|&i| catalog.entries[i].name.as_str())
+        .collect();
+    assert_eq!(
+        rna,
+        vec!["X/rna/shard_0", "X/rna/shard_1", "X/rna/shard_2"],
+        "row_start order, stats-less shard last"
+    );
+    // `shards_sorted()` is the alias the loader's global path calls.
+    assert_eq!(
+        catalog
+            .shards_sorted()
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        catalog
+            .csr_shard_indices(None)
+            .iter()
+            .map(|&i| catalog.entries[i].name.as_str())
+            .collect::<Vec<_>>(),
+    );
+}
+
 #[test]
 fn dense_mapping_shards_sorted_filters_and_sorts() {
     // Three obsm shards for key "X_pca" (out of order), plus a shard for

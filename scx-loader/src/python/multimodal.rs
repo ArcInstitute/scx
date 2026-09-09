@@ -466,7 +466,7 @@ impl MultimodalTrainingDataset {
         // Build the output. Both the dict and tuple paths share the
         // first batch's obs / cell_indices (cells are global, so the
         // obs record is identical across modalities).
-        let dict = build_multimodal_batch_dict(py, &batches, &self.modality_names)?;
+        let dict = build_multimodal_batch_dict(py, batches, &self.modality_names)?;
         if self.return_dict {
             Ok(Some(dict.into_any()))
         } else {
@@ -626,41 +626,63 @@ impl Drop for MultimodalTrainingDataset {
 }
 
 /// Phase H.2 helper: build a `{"X": {name: ndarray}, "obs": {...},
-/// "cell_indices": ndarray}` dict from a slice of per-modality
-/// `Batch`es. Uses the first batch's `obs` and `cell_indices` (cells
-/// are global across modalities).
+/// "cell_indices": ndarray}` dict from the per-modality `Batch`es. Uses the
+/// first batch's `obs` and `cell_indices` (cells are global across
+/// modalities).
+///
+/// Takes the batches **by value and moves every buffer into numpy**:
+/// `Vec<T>::into_pyarray` adopts the allocation rather than copying it, so a
+/// borrowed signature could only have handed Python a clone of each modality's
+/// dense `X` — ~183 MB per batch on a 253-row multiome batch, on the consumer
+/// thread with the GIL held. The single-modality
+/// [`batch_to_dict`](super::training) has always moved; this is the same
+/// contract for N modalities (OPT-LOADER-1).
+///
+/// Three details of the output are contract, not incidental, and are pinned by
+/// `pyscx/tests/test_multimodal_training.py`:
+///
+/// * `cell_indices` is **uint64** here (the single-modality builder casts to
+///   int64 — a divergence, deliberately left alone).
+/// * a categorical obs column is a **Python list of decoded strings**, not the
+///   `{"codes", "categories"}` dict `super::convert::obs_to_pydict` emits, so
+///   that helper is *not* a drop-in for this loop.
+/// * an empty batch reshapes to `(0, 0)`, not `(0, n_genes)`.
 fn build_multimodal_batch_dict<'py>(
     py: Python<'py>,
-    batches: &[Batch],
+    mut batches: Vec<Batch>,
     modality_names: &[String],
 ) -> PyResult<Bound<'py, PyDict>> {
     use numpy::IntoPyArray;
     let dict = PyDict::new(py);
 
+    // obs / cell_indices come from the first modality's batch (all batches
+    // share the global obs table), so lift them off before the X loop consumes
+    // every batch. `batches` is non-empty for the same reason `batches[0]` was
+    // sound before: it has one entry per pipeline, and the constructor rejects
+    // an empty `modalities` list.
+    let obs = std::mem::take(&mut batches[0].obs);
+    let cell_indices = std::mem::take(&mut batches[0].cell_indices);
+
     let x_dict = PyDict::new(py);
-    for (name, batch) in modality_names.iter().zip(batches.iter()) {
-        let n_genes = if batch.x_shape.0 > 0 {
-            batch.x_shape.1
-        } else {
-            0
-        };
-        let x_owned: Vec<f32> = batch.x.clone();
-        let x_arr = x_owned.into_pyarray(py);
-        let x_2d = x_arr
-            .reshape([batch.x_shape.0, n_genes])
+    for (name, batch) in modality_names.iter().zip(batches) {
+        // Copied out before `batch.x` is moved.
+        let (n_rows, n_vars) = batch.x_shape;
+        let n_genes = if n_rows > 0 { n_vars } else { 0 };
+        let x_2d = batch
+            .x
+            .into_pyarray(py)
+            .reshape([n_rows, n_genes])
             .map_err(|e| PyRuntimeError::new_err(format!("X reshape failed: {e}")))?;
         x_dict.set_item(name, x_2d)?;
     }
     dict.set_item("X", x_dict)?;
 
-    // obs and cell_indices come from the first modality's batch
-    // (all batches share the global obs table). Skip if obs_columns
-    // were not requested — empty dict.
+    // Empty when obs_columns were not requested.
     let obs_dict = PyDict::new(py);
-    for (col_name, col) in &batches[0].obs {
+    for (col_name, col) in obs {
         let arr_obj = match col {
-            ObsColumn::Float64(v) => v.clone().into_pyarray(py).into_any(),
-            ObsColumn::Int64(v) => v.clone().into_pyarray(py).into_any(),
+            ObsColumn::Float64(v) => v.into_pyarray(py).into_any(),
+            ObsColumn::Int64(v) => v.into_pyarray(py).into_any(),
             ObsColumn::Categorical(codes, cats) => {
                 // Decode codes to category strings; emit as a Python
                 // list (numpy lacks a native variable-width string
@@ -676,10 +698,7 @@ fn build_multimodal_batch_dict<'py>(
         obs_dict.set_item(col_name, arr_obj)?;
     }
     dict.set_item("obs", obs_dict)?;
-    dict.set_item(
-        "cell_indices",
-        batches[0].cell_indices.clone().into_pyarray(py),
-    )?;
+    dict.set_item("cell_indices", cell_indices.into_pyarray(py))?;
     Ok(dict)
 }
 

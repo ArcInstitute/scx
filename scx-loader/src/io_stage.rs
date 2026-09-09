@@ -103,10 +103,46 @@ fn reconstruct_deletion_map(
     map
 }
 
+/// How many groups ahead of the current one to hint. Read-ahead only: the
+/// current group's own range is always hinted regardless.
+#[cfg(unix)]
+const PREFETCH_LOOKAHEAD: usize = 2;
+
+/// The coalesced `MADV_WILLNEED` hints group `group` should issue, as
+/// `(offset, len)` pairs in the order they should be issued: the next
+/// [`PREFETCH_LOOKAHEAD`] groups first (read-ahead, so the kernel has the most
+/// time to act on them), then this group's own range.
+///
+/// Split out as a pure function because it is the only *decidable* part of the
+/// prefetch: `madvise(2)` is a hint with no in-process observable effect, so
+/// what a test can pin is the window (which groups), the order (read-ahead
+/// before current), and the skipping of degenerate ranges — not that the
+/// syscall happened.
+///
+/// Ranges are dropped when `start >= end`: a group whose shards all lack
+/// catalog entries leaves `min_offset = usize::MAX`, and `end - start` would
+/// underflow.
+#[cfg(unix)]
+fn advise_ranges_for_group(
+    group_byte_ranges: &[(usize, usize)],
+    group: usize,
+) -> Vec<(usize, usize)> {
+    let n_groups = group_byte_ranges.len();
+    (1..=PREFETCH_LOOKAHEAD)
+        .map(|ahead| group + ahead)
+        .filter(|&idx| idx < n_groups)
+        .chain(std::iter::once(group))
+        .filter_map(|idx| group_byte_ranges.get(idx).copied())
+        .filter(|&(start, end)| start < end)
+        .map(|(start, end)| (start, end - start))
+        .collect()
+}
+
 /// Run the I/O stage: read shard groups and send them to the decode stage.
 ///
 /// For each shard group in `shard_groups`:
-/// - Resolves shard indices to catalog entries via `reader.catalog().shards_sorted()`
+/// - Resolves shard indices to catalog entries via
+///   `reader.catalog().csr_shard_indices(modality_id)` — derived once per epoch
 /// - Reads each shard sequentially within the group (disk-sequential I/O)
 /// - Filters fully-deleted shards; attaches deletion bitmaps to partially-deleted shards
 /// - Sends the `ShardGroup` via bounded channel (back-pressure blocks automatically)
@@ -122,32 +158,39 @@ pub async fn io_stage(
     modality_id: Option<u8>,
     tx: tokio::sync::mpsc::Sender<ShardGroup>,
 ) -> Result<()> {
-    // Pre-compute the sorted shard catalog entries. The shard indices in
-    // `shard_groups` refer to positions in this sorted list.
+    // Catalog **positions** of this run's CSR shards, in the order the shard
+    // indices in `shard_groups` index them — derived once per epoch, then
+    // shared. `FullCatalog::csr_shard_indices` is the single ordering rule
+    // `pipeline.rs::start_epoch` also builds its shuffle keys from, so the two
+    // cannot disagree about what position `n` means; reading the wrong basis
+    // reads the wrong shard, silently.
     //
-    // Phase H.1: when `modality_id` is set, the entries are filtered to
-    // that modality's CSR shards (matching the filter applied in
-    // `pipeline.rs::start_epoch`). Per-modality and global runs use the
-    // same code path; only the entry list differs.
-    let sorted_entries: Vec<&scx_format_io::FullCatalogEntry> = match modality_id {
-        Some(mid) => reader.catalog().csr_shards_for_modality(mid),
-        None => reader.catalog().shards_sorted(),
-    };
+    // Positions and not `&FullCatalogEntry` because the per-group
+    // `spawn_blocking` closure below must be `'static` and a reference borrows
+    // the reader. That is what used to force the closure to re-derive the whole
+    // filtered, sorted list on every group.
+    //
+    // Phase H.1: `Some(mid)` filters to that modality's CSR shards.
+    // Per-modality and global runs use the same code path; only the list
+    // differs.
+    let shard_catalog_indices: Arc<Vec<usize>> =
+        Arc::new(reader.catalog().csr_shard_indices(modality_id));
 
     // Pre-compute per-shard deletion bitmaps for O(1) lookup.
-    // Map: output shard position (index into `sorted_entries`, matching the
-    // positions in `shard_groups`) → RoaringBitmap of deleted *shard-local* rows.
+    // Map: output shard position (index into `shard_catalog_indices`, matching
+    // the positions in `shard_groups`) → RoaringBitmap of deleted *shard-local*
+    // rows.
     //
     // The on-disk deletion vector is keyed by GLOBAL shard index (position in
     // `shards_sorted()`, how `scx delete` writes it) with shard-local bitmaps.
     // That losslessly encodes a set of deleted *global cell* indices (each
     // deleted cell is assigned to exactly one global shard). We reconstruct that
-    // global set and re-bucket it into `sorted_entries`' row ranges — so the
-    // per-modality path (where `sorted_entries` is one modality's shards, whose
+    // global set and re-bucket it into this run's row ranges — so the
+    // per-modality path (where the list is one modality's shards, whose
     // positions don't match the global DV keys) applies deletions correctly, and
     // all modalities skip the same global cells (alignment preserved). For the
-    // single-modality/global path (`sorted_entries == shards_sorted()`) this is
-    // byte-identical to a direct copy.
+    // single-modality/global path (`modality_id == None`) this is byte-identical
+    // to a direct copy.
     let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> =
         Arc::new(match &deletion_vectors {
             Some(dv) => {
@@ -156,9 +199,14 @@ pub async fn io_stage(
                     .iter()
                     .map(|e| e.stats.as_ref().map(|s| s.row_start))
                     .collect();
-                let target_ranges: Vec<Option<(u64, u64)>> = sorted_entries
+                let target_ranges: Vec<Option<(u64, u64)>> = shard_catalog_indices
                     .iter()
-                    .map(|e| e.stats.as_ref().map(|s| (s.row_start, s.row_end)))
+                    .map(|&ci| {
+                        reader.catalog().entries[ci]
+                            .stats
+                            .as_ref()
+                            .map(|s| (s.row_start, s.row_end))
+                    })
                     .collect();
                 reconstruct_deletion_map(dv, &global_row_starts, &target_ranges)
             }
@@ -174,7 +222,10 @@ pub async fn io_stage(
             let mut min_offset = usize::MAX;
             let mut max_end = 0usize;
             for &idx in group_indices {
-                if let Some(entry) = sorted_entries.get(idx) {
+                if let Some(entry) = shard_catalog_indices
+                    .get(idx)
+                    .and_then(|&ci| reader.catalog().entries.get(ci))
+                {
                     let start = entry.offset as usize;
                     let end = start.saturating_add(entry.length as usize);
                     min_offset = min_offset.min(start);
@@ -188,7 +239,6 @@ pub async fn io_stage(
     let profile = profiling_enabled();
     let io_start = Instant::now();
     let mut group_count = 0usize;
-    let n_groups = shard_groups.len();
     // D0 profiling accumulators (only meaningful when `profile`): the sum of
     // per-group whole-shard **decode** wall vs the sum of per-group `tx.send`
     // back-pressure wait. `decode_total` times the `read_shard_from_entry` call
@@ -201,64 +251,47 @@ pub async fn io_stage(
     let mut total_send_wait_us = 0u128;
 
     for group_indices in shard_groups {
-        // Prefetch upcoming groups with MADV_WILLNEED (look ahead 2 groups).
+        // Resolved here, where `group_byte_ranges` lives; *issued* inside
+        // `spawn_blocking` below, because `advise_willneed` is a blocking
+        // `madvise(2)` and the tokio reactor thread must not make blocking
+        // syscalls.
         #[cfg(unix)]
-        {
-            let lookahead = 2;
-            for ahead in 1..=lookahead {
-                let future_idx = group_count + ahead;
-                if future_idx < n_groups {
-                    let (start, end) = group_byte_ranges[future_idx];
-                    if start < end {
-                        reader.advise_willneed(start, end - start);
-                    }
-                }
-            }
-        }
-
-        // Capture pre-computed byte range for this group's MADV_WILLNEED hint.
-        #[cfg(unix)]
-        let current_byte_range = group_byte_ranges[group_count];
+        let advise_ranges = advise_ranges_for_group(&group_byte_ranges, group_count);
 
         // Clone Arc handles for the spawn_blocking closure.
         let reader = Arc::clone(&reader);
         let deletion_map = Arc::clone(&deletion_map);
+        let shard_catalog_indices = Arc::clone(&shard_catalog_indices);
         let group_num = group_count;
         group_count += 1;
 
         // Perform blocking shard reads inside spawn_blocking.
-        let group_modality_id = modality_id;
         let group =
             tokio::task::spawn_blocking(move || -> Result<(ShardGroup, std::time::Duration)> {
                 let t0 = Instant::now();
-                let sorted: Vec<&scx_format_io::FullCatalogEntry> = match group_modality_id {
-                    Some(mid) => reader.catalog().csr_shards_for_modality(mid),
-                    None => reader.catalog().shards_sorted(),
-                };
                 let mut shards = Vec::with_capacity(group_indices.len());
 
-                // Issue a coalesced MADV_WILLNEED for this group's byte range.
-                // Uses the pre-computed range to avoid reiterating over group_indices.
+                // Read-ahead hints for the next groups, then this group's own
+                // range. On this thread, never the reactor's — `madvise(2)`
+                // blocks. (`docs/multithreading.md` § Why three runtimes?)
                 #[cfg(unix)]
-                {
-                    let (min_offset, max_end) = current_byte_range;
-                    if min_offset < max_end {
-                        reader.advise_willneed(min_offset, max_end - min_offset);
-                    }
+                for (offset, len) in advise_ranges {
+                    reader.advise_willneed(offset, len);
                 }
 
                 for &shard_idx in &group_indices {
-                    if shard_idx >= sorted.len() {
+                    let Some(entry) = shard_catalog_indices
+                        .get(shard_idx)
+                        .and_then(|&ci| reader.catalog().entries.get(ci))
+                    else {
                         return Err(LoaderError::ConfigError {
                             reason: format!(
                                 "shard index {} out of bounds (file has {} shards)",
                                 shard_idx,
-                                sorted.len()
+                                shard_catalog_indices.len()
                             ),
                         });
-                    }
-
-                    let entry = sorted[shard_idx];
+                    };
 
                     // Extract row metadata from catalog stats.
                     let stats = entry
@@ -739,6 +772,44 @@ mod tests {
     // -----------------------------------------------------------------
     // 3F Tests: Prefetch scheduling
     // -----------------------------------------------------------------
+    /// The prefetch window, which `test_io_stage_prefetch_does_not_panic` only
+    /// smoke-tests. `madvise(2)` is a hint with no in-process observable
+    /// effect, so this is the whole of what can be pinned: *which* groups get
+    /// hinted, in *what order*, and that degenerate ranges are skipped rather
+    /// than underflowing `end - start`.
+    #[cfg(unix)]
+    #[test]
+    fn advise_ranges_cover_the_lookahead_window_then_the_current_group() {
+        // Group 2's range is degenerate (start == end) — the shape a group all
+        // of whose shard indices missed the catalog leaves behind.
+        let ranges = [(0usize, 10usize), (10, 30), (30, 30), (40, 50)];
+
+        assert_eq!(
+            advise_ranges_for_group(&ranges, 0),
+            vec![(10, 20), (0, 10)],
+            "groups 1 and 2 ahead (2 is empty, dropped), then group 0 LAST"
+        );
+        assert_eq!(
+            advise_ranges_for_group(&ranges, 1),
+            vec![(40, 10), (10, 20)],
+            "group 2 is empty; group 3 still hinted; current group last"
+        );
+        assert_eq!(
+            advise_ranges_for_group(&ranges, 2),
+            vec![(40, 10)],
+            "no group 4/5 to look ahead to, and the current group is empty"
+        );
+        assert_eq!(
+            advise_ranges_for_group(&ranges, 3),
+            vec![(40, 10)],
+            "the last group hints only itself"
+        );
+        assert_eq!(
+            PREFETCH_LOOKAHEAD, 2,
+            "the window the assertions above are written against"
+        );
+        assert!(advise_ranges_for_group(&[], 0).is_empty());
+    }
 
     #[test]
     fn test_io_stage_offset_sorted_order() {

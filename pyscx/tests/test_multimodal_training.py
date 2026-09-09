@@ -56,6 +56,121 @@ def cite_seq_path():
         yield path, n_obs, rna_n_vars, adt_n_vars
 
 
+@pytest.fixture
+def cite_seq_with_obs():
+    """CITE-seq fixture carrying one obs column of each type the batch builder
+    handles, plus the dense source matrices so batch values can be checked.
+
+    `cite_seq_path` asserts shapes and row counts only; nothing anywhere passed
+    `obs_columns=` to `MultimodalTrainingDataset`, so its `"obs"` branch — the
+    float64/int64 arms and the categorical code→string decode — was unasserted,
+    and no test compared a multimodal batch's `X` against the source matrix.
+    """
+    mudata = pytest.importorskip("mudata")
+    anndata = pytest.importorskip("anndata")
+    import pandas as pd
+    import scipy.sparse as sp
+
+    import pyscx
+
+    rng = np.random.default_rng(7)
+    n_obs, rna_n_vars, adt_n_vars = 48, 30, 6
+
+    rna_dense = rng.poisson(lam=0.6, size=(n_obs, rna_n_vars)).astype(np.float32)
+    adt_dense = rng.poisson(lam=0.6, size=(n_obs, adt_n_vars)).astype(np.float32)
+    rna_ad = anndata.AnnData(X=sp.csr_matrix(rna_dense))
+    rna_ad.var_names = [f"g{i}" for i in range(rna_n_vars)]
+    adt_ad = anndata.AnnData(X=sp.csr_matrix(adt_dense))
+    adt_ad.var_names = [f"a{i}" for i in range(adt_n_vars)]
+    mu = mudata.MuData({"rna": rna_ad, "adt": adt_ad})
+    mu.obs_names = [f"cell_{i}" for i in range(n_obs)]
+    obs = pd.DataFrame(
+        {
+            "qc_score": np.linspace(0.5, 2.5, n_obs),
+            "n_umi": np.arange(1000, 1000 + n_obs, dtype=np.int64),
+            "celltype": pd.Categorical(
+                ["B" if i % 3 == 0 else "T" if i % 3 == 1 else "NK" for i in range(n_obs)]
+            ),
+        },
+        index=mu.obs_names,
+    )
+    for col in obs.columns:
+        mu.obs[col] = obs[col]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "cite_obs.scx")
+        pyscx.from_mudata(mu, path)
+        yield path, obs, {"rna": rna_dense, "adt": adt_dense}
+
+
+def test_multimodal_batch_obs_cell_indices_and_x_values(cite_seq_with_obs):
+    """The full multimodal batch contract: per-modality `X` values, the three
+    `obs` column shapes, and `cell_indices`' dtype.
+
+    Every assertion here is a *contract*, not an observation of the current
+    implementation:
+
+    * `X[modality]` carries that modality's own rows, at raw counts, float32.
+    * an obs float64/int64 column arrives as a numpy array of that dtype;
+      a categorical arrives as a **Python list of decoded strings** — not the
+      `{"codes", "categories"}` dict the single-modality loader's
+      `obs_to_pydict` builds, which is why that helper is not reusable here.
+    * `cell_indices` is **uint64** (the single-modality builder casts to int64;
+      the divergence is deliberate and pinned so it cannot drift silently).
+    """
+    import pyscx
+
+    path, obs, dense = cite_seq_with_obs
+    n_obs = len(obs)
+    columns = ["qc_score", "n_umi", "celltype"]
+
+    ds = pyscx.MultimodalTrainingDataset(
+        path,
+        modalities=["rna", "adt"],
+        batch_size=16,
+        obs_columns=columns,
+        normalize=False,
+        log1p=False,
+        seed=11,
+    )
+
+    seen: list[int] = []
+    n_batches = 0
+    for batch in ds:
+        n_batches += 1
+        cells = batch["cell_indices"]
+        assert cells.dtype == np.uint64, "multimodal cell_indices are uint64"
+        rows = cells.astype(np.int64)
+        seen.extend(rows.tolist())
+
+        for name, source in dense.items():
+            x = batch["X"][name]
+            assert x.dtype == np.float32
+            assert x.shape == (len(rows), source.shape[1])
+            np.testing.assert_array_equal(
+                x, source[rows], err_msg=f"{name} rows must come from {name}'s own X"
+            )
+
+        assert "obs" in batch, "the obs sub-dict must be present when obs_columns is set"
+        assert set(batch["obs"]) == set(columns)
+
+        qc = batch["obs"]["qc_score"]
+        assert isinstance(qc, np.ndarray) and qc.dtype == np.float64
+        np.testing.assert_allclose(qc, obs["qc_score"].to_numpy()[rows])
+
+        umi = batch["obs"]["n_umi"]
+        assert isinstance(umi, np.ndarray) and umi.dtype == np.int64
+        np.testing.assert_array_equal(umi, obs["n_umi"].to_numpy()[rows])
+
+        ct = batch["obs"]["celltype"]
+        assert isinstance(ct, list), "a categorical obs column is a list of strings"
+        assert all(isinstance(v, str) for v in ct)
+        assert ct == list(obs["celltype"].astype(str).to_numpy()[rows])
+
+    assert n_batches > 1, "premise: more than one batch, so per-batch row selection matters"
+    assert sorted(seen) == list(range(n_obs)), "every cell exactly once per epoch"
+
+
 def test_multimodal_dataset_dict_batches(cite_seq_path):
     """Phase H.1 / H.2: dict-mode batches expose per-modality X arrays
     and a shared `cell_indices` row ordering."""

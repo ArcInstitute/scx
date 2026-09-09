@@ -1180,31 +1180,44 @@ impl TrainingPipeline {
         // Collect into owned `Vec<u64>` first so the catalog borrow ends
         // before `ensure_decode_pool` (which needs `&mut self`).
         //
-        // Phase H.1: when `modality_id` is set, the shard list is
-        // filtered to that modality's CSR shards. The shuffler /
-        // io_stage operate on the filtered list (per-modality positions
-        // 0..N), which io_stage maps back to the original catalog
-        // entries via the same filter applied internally.
-        let shard_offsets: Vec<u64> = match self.config.modality_id {
-            Some(mid) => self
-                .reader
-                .catalog()
-                .csr_shards_for_modality(mid)
-                .iter()
-                .map(|e| e.offset)
-                .collect(),
-            None => self
-                .reader
-                .catalog()
-                .shards_sorted()
-                .iter()
-                .map(|e| e.offset)
-                .collect(),
-        };
+        // Phase H.1: when `modality_id` is set, the shard list is filtered to
+        // that modality's CSR shards. The shuffler / io_stage operate on
+        // positions in this list (per-modality positions 0..N), which io_stage
+        // resolves back to catalog entries through the *same*
+        // `FullCatalog::csr_shard_indices` call — one ordering rule, so the two
+        // sides cannot disagree about what position `n` means. Derived once
+        // here and read twice below; it used to be a filter+sort per vector.
+        let shard_indices = self
+            .reader
+            .catalog()
+            .csr_shard_indices(self.config.modality_id);
+        // The shuffler is sized from `n_csr_shards`, resolved once at
+        // construction; the per-position sort keys below come from this list.
+        // `shuffle_epoch_sorted` reads its keys with `sort_keys.get(idx)` and
+        // falls back to `u64::MAX`, so a length disagreement between the two is
+        // **silent** — it degrades the shard ordering rather than failing, and
+        // `io_stage` would then resolve positions the shuffler never intended.
+        // That is exactly what a wrong modality filter on either side produces,
+        // so check it rather than trusting two derivations to agree.
+        if shard_indices.len() != self.n_csr_shards {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "shard list disagreement: start_epoch resolved {} CSR shards for \
+                     modality_id={:?} but the shuffler was built for {}",
+                    shard_indices.len(),
+                    self.config.modality_id,
+                    self.n_csr_shards,
+                ),
+            });
+        }
+        let shard_offsets: Vec<u64> = shard_indices
+            .iter()
+            .map(|&i| self.reader.catalog().entries[i].offset)
+            .collect();
 
         // Per-position sort keys for the shuffle. Use each shard's `row_start`
-        // (the order `csr_shards_for_modality`/`shards_sorted` already return
-        // entries in) rather than the raw file offset, so the group ordering is
+        // (the order `csr_shard_indices` already returns positions in) rather
+        // than the raw file offset, so the group ordering is
         // layout-invariant: every modality shares the same per-position
         // `row_start` (checked by `check_uniform_modality_layouts`), so the
         // per-modality shufflers produce identical group sequences and the
@@ -1212,22 +1225,15 @@ impl TrainingPipeline {
         // disk. `shard_offsets` above stays byte offsets for the mmap smoke-read /
         // prefetch below. Missing-stats shards map to `u64::MAX` identically for
         // all modalities (stable sort keeps ties in RNG order). (H2)
-        let sort_keys: Vec<u64> = match self.config.modality_id {
-            Some(mid) => self
-                .reader
-                .catalog()
-                .csr_shards_for_modality(mid)
-                .iter()
-                .map(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
-                .collect(),
-            None => self
-                .reader
-                .catalog()
-                .shards_sorted()
-                .iter()
-                .map(|e| e.stats.as_ref().map_or(u64::MAX, |s| s.row_start))
-                .collect(),
-        };
+        let sort_keys: Vec<u64> = shard_indices
+            .iter()
+            .map(|&i| {
+                self.reader.catalog().entries[i]
+                    .stats
+                    .as_ref()
+                    .map_or(u64::MAX, |s| s.row_start)
+            })
+            .collect();
 
         // Touch one byte of the first CSR shard's
         // backing region before spawning the I/O / decode threads. If the
