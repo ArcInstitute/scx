@@ -18,10 +18,17 @@
 //!   callers of this same framed encoder. A change to the concatenation moves
 //!   both arms identically and the assertion still passes.
 //!
-//! So a layout change — a group emitted in a different order, an offset
-//! rebased from the wrong base — produced a file that decoded *correctly*
-//! (the block index is self-consistent) with different bytes, and no test in
-//! the workspace said so. That is what the byte pin below is for.
+//! So the only thing standing between a layout change and a silently
+//! different file was a decode round-trip, which catches an *inconsistent*
+//! index and nothing else. It cannot see a change both the writer and the
+//! reader would make in step — a codec whose bytes shift, a group header
+//! field that starts being written differently. That is the gap the byte pin
+//! below closes.
+//!
+//! (An earlier version of this paragraph claimed a reordered concatenation
+//! "decoded correctly with different bytes". It does not — see the measured
+//! note further down. The pin's value is the change *both sides* would make,
+//! not a self-consistent permutation.)
 //!
 //! # The two oracles, and why both
 //!
@@ -35,7 +42,7 @@
 //!   `reference_framed` calls the same `scx_codec::encode_shard`, so a change
 //!   inside a codec moves the pin and leaves the differential green, while a
 //!   change to the framing moves both. Without it, a future codec tweak fails
-//!   six opaque hashes with nothing to say whether the framing is implicated.
+//!   the pin's hashes with nothing to say whether the framing is implicated.
 //!   It also reports *which* sub-stream or entry field differs, where the pin
 //!   reports one changed hex string.
 //! * [`framed_layout_is_byte_pinned`] compares a BLAKE3 of the three

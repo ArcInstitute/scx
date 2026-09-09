@@ -591,10 +591,12 @@ pub fn encode_shard_framed(
     //
     // The `cfg` switches the iterator and nothing else — passes 1 and 3 are
     // shared — so the sequential build cannot drift from the parallel one.
-    // That matters here more than usual: `cargo test -p scx-format-io
-    // --no-default-features` has never built (the test target names `rayon`
-    // unconditionally), so the `parallel`-off arm is only ever `cargo
-    // check`ed and a second implementation would go untested indefinitely.
+    // Two implementations could, and the proof that these do not is direct:
+    // `cargo test -p scx-format-io --no-default-features` builds and runs 366
+    // tests including `encoder_framed_tests`, so the same byte pin runs in
+    // both configurations and reports the same digests. CI clippies three
+    // `--all-targets` legs of this crate (with `deletion-vectors`, with
+    // `parallel`, and with neither).
     #[cfg(feature = "parallel")]
     let groups: Vec<Result<EncodedShard, ScxError>> = {
         use rayon::prelude::*;

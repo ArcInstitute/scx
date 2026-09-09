@@ -100,16 +100,22 @@ fn parallel_streaming_byte_identical_to_sequential() {
 /// `decode_target: Some(Auto)` turns on the dual encode, so this covers
 /// pool → join → par_iter.
 ///
-/// The geometry is also chosen so the send-block actually happens: 1400 rows
+/// The geometry also *allows* the send-block, which 3 shards did not: 1400 rows
 /// is **7** shards against `reader_threads + writer_queue_depth = 4 + 1 = 5`
-/// outstanding, so two items are still unspawned when the first five land and
-/// a worker really is parked in `tx.send` while another is inside
-/// `join`/`par_iter`. At 3 shards every item is primed up front and any send
-/// -block happens after all the encodes have finished — the interleaving would
-/// have been described and not exercised. Rayon runs an unstolen half inline,
-/// so a worker makes progress even with every other pool thread parked, but
-/// "should not deadlock" is worth an actual test, and the output must still be
-/// byte-identical to the one-thread run.
+/// outstanding, so two items are still unspawned when the first five land. At
+/// 3 shards every item is primed up front and any send-block necessarily
+/// happens after all the encodes have finished.
+///
+/// **What this asserts is completion and byte identity, not the interleaving.**
+/// More shards than the outstanding window makes a parked `tx.send` possible,
+/// not certain — the receiver may drain each send before the next worker
+/// finishes. Observing it would need a deterministic barrier, which the drain
+/// does not expose. So read this as: the nested shape (dedicated pool → `join`
+/// → `par_iter`) completes without deadlocking and produces the same bytes as
+/// one thread, over a fixture where the interleaving is reachable. Rayon runs
+/// an unstolen half inline, which is why a worker makes progress even with
+/// every other pool thread parked, but "does not deadlock" is worth a test
+/// rather than an argument.
 ///
 /// `skip_if_not_threadsafe` first, like the other route-dependent tests here:
 /// `run_streaming_writer_coordinator` falls back to the *sequential*
@@ -162,12 +168,13 @@ fn parallel_streaming_nested_multi_group_byte_identical_to_sequential() {
     // Premise: this fixture really is multi-shard AND multi-group. Without
     // both, the test passes while covering nothing — which is exactly the
     // state the existing sibling test is in.
-    // More shards than the drain will have outstanding at once (4 + 1), so a
-    // worker is genuinely blocked in `tx.send` while its siblings encode.
+    // More shards than the drain will have outstanding at once (4 + 1), so the
+    // send-block is reachable at all. Whether one actually happens on a given
+    // run is not asserted — see the note on the test.
     assert!(
         a.header().n_csr_shards > 5,
         "premise: more shards than `reader_threads + writer_queue_depth` = 5, \
-         so a worker actually blocks in `tx.send`; got {}",
+         so a parked `tx.send` is reachable; got {}",
         a.header().n_csr_shards
     );
     for entry in a
