@@ -586,9 +586,16 @@ for batch in ds:
 > [!NOTE]
 > `MultimodalTrainingDataset` encodes categorical obs columns as decoded
 > `list[str]` values, **not** the `{"codes", "categories"}` dict format used
-> by `TrainingDataset`. `n_vars` returns a `dict[str, int]` mapping modality
-> names to per-modality variable counts. With `return_dict=False`, batches
-> are tuples of X arrays only (no obs or cell_indices).
+> by `TrainingDataset`, and its `cell_indices` is **uint64** where
+> `TrainingDataset`'s is int64. `n_vars` returns a `dict[str, int]` mapping
+> modality names to per-modality variable counts. With `return_dict=False`,
+> batches are tuples of X arrays only (no obs or cell_indices).
+>
+> Every buffer in a batch — each modality's `X`, the obs columns and
+> `cell_indices` — is **moved** into its numpy array rather than copied, so a
+> multimodal batch costs no more to hand to Python than a single-modality one.
+> The arrays own the loader's decode buffers; they stay valid for as long as
+> you hold them, but writing into one writes into nothing else's memory.
 
 > [!WARNING]
 > **`hvg_indices` is not range-checked here — this class only.** A single panel

@@ -169,6 +169,26 @@ closure on each `start_epoch` call and dropped when the thread exits, so
 restructuring replaces the original `new_multi_thread().worker_threads(2)`
 field-on-pipeline runtime with a model that is fork-safe by construction.
 
+Both the shard reads and the coalesced `MADV_WILLNEED` hints — this group's
+byte range plus that of the next `PREFETCH_LOOKAHEAD` groups — are issued
+inside `tokio::task::spawn_blocking`, never in the async body: `advise_willneed`
+is a blocking `madvise(2)`, and [Why three runtimes?](#why-three-runtimes)
+below says the reactor thread makes no blocking syscall. Which groups get
+hinted, in what order, is
+`io_stage::advise_ranges_for_group` — split out as a pure function because a
+hint has no in-process observable effect, so the window and the ordering are
+the only parts a test can pin.
+
+The shard indices the shuffler produces are **positions in the selected
+modality's CSR shard list**, resolved through `FullCatalog::csr_shard_indices`
+— one call, derived once per epoch and shared with the per-group blocking
+closures as catalog positions (a `&FullCatalogEntry` borrows the reader and
+cannot cross a `'static` closure). `start_epoch` builds its shuffle keys from
+the same call and checks the length against the shard count the shuffler was
+built for, because `shuffle_epoch_sorted` reads keys with
+`sort_keys.get(idx).unwrap_or(u64::MAX)` and a disagreement would otherwise
+degrade the ordering silently.
+
 ### Stage 2: Decode (std::thread + per-pipeline rayon pool)
 
 A dedicated OS thread (`scx-decode`) receives shard groups and dispatches
