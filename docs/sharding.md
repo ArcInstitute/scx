@@ -969,7 +969,7 @@ Two reasons to split CSC by column range rather than emitting one
 giant shard:
 
 1. **Column-range pushdown.** `BackedCscReader::read_csc_columns(c_lo..c_hi)` consults `BackedCscIndex::shards_for_col_range(c_lo, c_hi)` and skips non-overlapping shards entirely; partial-overlap shards are sliced post-decode. With 5000 cols/shard on a 36K-gene matrix, a single-gene DE query touches one shard out of eight — a 7/8 I/O reduction even before catalog-level pushdown via `ShardStats.col_range`.
-2. **Bounded transpose memory.** The streaming CSR→CSC transpose chunks emitted shards by column range, so peak memory during `build-csc` (and convert-time CSC) scales with `csc_cols_per_shard × n_obs × 8 bytes` rather than the full matrix.
+2. **Bounded transpose working set.** The streaming CSR→CSC transpose chunks emitted shards by column range, so the *transpose's own* working set scales with `csc_cols_per_shard × n_obs × 8 bytes` rather than with the full matrix. That is not the same as bounding the op — see [Cost](#cost-write-time-transpose-equal-storage) below.
 
 ### Cost: write-time transpose, ~equal storage
 
@@ -980,9 +980,18 @@ under Scx1 / Zstd / Pcodec).
 
 Write-time cost is one full-matrix transpose. The streaming transpose
 in `scx-sparse::transpose::streaming_csr_to_csc_iter_with_cap` keeps
-peak RAM bounded by the `--memory-limit` budget (default 4G).
-Throughput on a typical 1M-cell × 30K-gene file: ~10–20 seconds for
-build-csc on a single core, dominated by codec encoding.
+its own working set inside the `--memory-limit` budget (default 4G) —
+but the op holds every decoded CSR shard resident alongside it, so the
+**process** peak is not bounded by that budget: measured at 2.0x the
+declared 4 GiB on `census_500k` and 3.6x on `census_1m`.
+
+Measured throughput, from the `build_csc` rows of
+`benchmarks/comprehensive/results/baselines/LATEST` (`scx_auto`,
+`--memory-limit 4G`): 0.22 s on `pbmc3k` (2.3M non-zeros), 19.4 s on
+`smartseq2` (131M), 29.3 s on `tabula_sapiens_100k` (195M), 201 s on
+`census_500k` (747M) and 1308 s on `census_1m` (1.40B). Cost tracks
+non-zeros, not cells. Encoding and the transpose dominate: one full CSR
+decode pass is ~10–13% of wall.
 
 ### Inspecting the CSC layout
 

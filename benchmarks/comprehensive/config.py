@@ -1683,6 +1683,21 @@ def estimate_time_minutes(
         # census_500k 135 min and census_1m 225. The 8/M default would have
         # budgeted 49 minutes for the 81-minute cell; an earlier 90/M gave
         # census_1m 135 minutes for a ~153-minute job.
+        #
+        # CAVEAT, unresolved: the two "Measured" figures above disagree with the
+        # captured baseline by ~9x. `results/baselines/LATEST` (= the
+        # `candidate_unpinned_20260903` snapshot) records median wall
+        # 29.3 s at tabula_sapiens_100k, 201 s at census_500k and 1308 s at
+        # census_1m, and a fresh 8-CPU `cpu_batch` A/B reproduced 24.6 s at
+        # tabula. The peak-RSS half of the same bespoke sweep (quoted in
+        # thresholds.yaml's deferred-floor item 14) DOES agree with LATEST, so
+        # this is a wall-clock-only divergence — most likely a thread-count or
+        # page-cache difference in the bespoke sweep, but that has not been
+        # established. The slope is left at 180 deliberately: over-provisioning
+        # a time budget is safe, under-provisioning kills a census-scale cell
+        # mid-capture, and nothing here justifies lowering it on warm-cache
+        # numbers. Do not quote the 259 s / 1630 s figures as build-csc
+        # throughput; quote LATEST.
         slope_minutes_per_million = 180
     elif benchmark == "shuffle_layout":
         # Every arm is O(nnz): each rewrite decodes and re-encodes the whole

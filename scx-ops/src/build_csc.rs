@@ -323,10 +323,20 @@ pub fn run_build_csc(
     // consumed, because the transpose at step 13 still needs it.
     //
     // `csr_shards` and `per_shard` are both built by mapping over `csr_entries`
-    // with no early exit in between, so all three have the same length — a
-    // three-way zip would otherwise truncate silently.
-    debug_assert_eq!(csr_entries.len(), csr_shards.len());
-    debug_assert_eq!(csr_entries.len(), per_shard.len());
+    // with no early exit in between, so all three have the same length. Checked
+    // rather than assumed, and in release too: a three-way zip over lists of
+    // different lengths truncates to the shortest, which would drop shards from
+    // the output with no error anywhere. Two comparisons per op, once.
+    assert_eq!(
+        csr_entries.len(),
+        csr_shards.len(),
+        "one decoded shard per catalog entry"
+    );
+    assert_eq!(
+        csr_entries.len(),
+        per_shard.len(),
+        "one (codec, encoding) pair per catalog entry"
+    );
     for ((shard_entry, shard), &(ci, ve)) in csr_entries.iter().zip(&csr_shards).zip(&per_shard) {
         let shard_row_start = shard_entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
 
