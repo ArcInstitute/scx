@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use scx_format_io::catalog::{ColumnStat, FullCatalog};
+use scx_format_io::catalog::{ColumnStat, FullCatalog, FullCatalogEntry};
 use scx_format_io::column_name_hash;
 use scx_format_io::DeletionVectors;
 
@@ -99,7 +99,12 @@ impl CategoryDictionaries {
 /// A shard that *may* contain matching rows after catalog-level pruning.
 #[derive(Debug, Clone)]
 pub struct ShardCandidate {
-    /// Index into `FullCatalog.shards_sorted()` result.
+    /// Position in the **modality-scoped** CSR shard list this candidate was
+    /// pruned from — the `sorted_shards` slice passed to
+    /// [`prune_shards_by_catalog_with_dict`], i.e. one
+    /// [`crate::collect::scan_shards`] result. **Not** an index into
+    /// `FullCatalog.entries` and not into the flattened all-modality
+    /// `shards_sorted()`, which differ from it on any multimodal file.
     pub shard_idx: usize,
     /// Row mask within shard (None = all rows are candidates).
     pub row_mask: Option<Vec<Range<u32>>>,
@@ -119,25 +124,27 @@ pub fn prune_shards_by_catalog(
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
 ) -> Vec<ShardCandidate> {
-    prune_shards_by_catalog_with_dict(catalog, predicates, deletion_vectors, None, 0)
+    let sorted_shards = catalog.csr_shards_for_modality(0);
+    prune_shards_by_catalog_with_dict(&sorted_shards, predicates, deletion_vectors, None)
 }
 
 /// Like `prune_shards_by_catalog`, but accepts an optional category dictionary
 /// for resolving `Utf8` predicate values against `CategoryBitset` column stats,
-/// and a `modality_id` scoping the shard list. `modality_id == 0` is the global
-/// / single-modality axis (identical to the legacy `shards_sorted()` view);
-/// `>= 1` prunes only that modality's CSR shards. `shard_idx` in the returned
-/// candidates indexes the modality-scoped shard list — callers MUST index the
-/// same [`crate::collect::scan_shards`] list downstream.
+/// and prunes the caller's own shard list.
+///
+/// `sorted_shards` is one [`crate::collect::scan_shards`] result — already
+/// scoped to a modality (`modality_id == 0` being the global / single-modality
+/// axis, identical to the legacy `shards_sorted()` view). `shard_idx` in the
+/// returned candidates is a **position in that slice**, which is why the slice
+/// is a parameter rather than a `(catalog, modality_id)` pair the callee
+/// re-derives: the caller keeps the list it will index downstream, so the two
+/// cannot be derived from different bases.
 pub fn prune_shards_by_catalog_with_dict(
-    catalog: &FullCatalog,
+    sorted_shards: &[&FullCatalogEntry],
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
     category_dicts: Option<&CategoryDictionaries>,
-    modality_id: u8,
 ) -> Vec<ShardCandidate> {
-    let sorted_shards = crate::collect::scan_shards(catalog, modality_id);
-
     let mut candidates = Vec::with_capacity(sorted_shards.len());
 
     for (shard_idx, entry) in sorted_shards.iter().enumerate() {
@@ -539,6 +546,14 @@ mod tests {
     use super::*;
     use roaring::RoaringBitmap;
     use scx_format_io::catalog::{FullCatalog, FullCatalogEntry, ShardStats};
+
+    /// The modality-0 CSR shard list the pruner takes. Every fixture here is
+    /// single-modality, so this is `scan_shards`' result for it — the pruner
+    /// stopped deriving the list itself so that `shard_idx` positions and the
+    /// list the caller indexes cannot come from different derivations.
+    fn shards_of(catalog: &FullCatalog) -> Vec<&FullCatalogEntry> {
+        catalog.csr_shards_for_modality(0)
+    }
     use scx_format_io::section::SectionType;
     use scx_format_io::DeletionVectors;
 
@@ -787,7 +802,8 @@ mod tests {
             "cell_type".to_string(),
             ScalarValue::Utf8("T cell".to_string()),
         )];
-        let candidates = prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&dicts));
         assert_eq!(candidates.len(), 1, "only shard 0 holds 'T cell'");
         assert_eq!(candidates[0].shard_idx, 0);
 
@@ -796,9 +812,13 @@ mod tests {
             "cell_type".to_string(),
             ScalarValue::Utf8("Nope".to_string()),
         )];
-        assert!(
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0).is_empty()
-        );
+        assert!(prune_shards_by_catalog_with_dict(
+            &shards_of(&catalog),
+            &preds,
+            None,
+            Some(&dicts)
+        )
+        .is_empty());
     }
 
     /// The dictionary miss is a claim about the whole file, so it may only be
@@ -830,14 +850,14 @@ mod tests {
 
         let complete = category_dicts_with_completeness("cell_type", values, true);
         assert!(
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&complete), 0)
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&complete))
                 .is_empty(),
             "a complete vocabulary proves 'Nope' is in no shard"
         );
 
         let partial = category_dicts_with_completeness("cell_type", values, false);
         let candidates =
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&partial), 0);
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&partial));
         assert_eq!(
             candidates.len(),
             2,
@@ -876,7 +896,7 @@ mod tests {
 
         let complete = category_dicts_with_completeness("cell_type", values, true);
         let candidates =
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&complete), 0);
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&complete));
         assert_eq!(
             candidates.len(),
             1,
@@ -887,7 +907,8 @@ mod tests {
 
         let partial = category_dicts_with_completeness("cell_type", values, false);
         assert_eq!(
-            prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&partial), 0).len(),
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&partial))
+                .len(),
             2,
             "'Nope' is merely unresolvable under a partial vocabulary — it could \
              be the value shard 1 holds"
@@ -923,11 +944,10 @@ mod tests {
         ] {
             assert_eq!(
                 prune_shards_by_catalog_with_dict(
-                    &catalog,
+                    &shards_of(&catalog),
                     std::slice::from_ref(&pred),
                     None,
                     Some(&dicts),
-                    0
                 )
                 .len(),
                 1,
@@ -963,7 +983,8 @@ mod tests {
             "cell_type".to_string(),
             ScalarValue::Utf8("Appended cell".to_string()),
         )];
-        let candidates = prune_shards_by_catalog_with_dict(&catalog, &preds, None, Some(&dicts), 0);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, Some(&dicts));
         assert!(
             candidates.iter().any(|c| c.shard_idx == 1),
             "the appended shard must survive pruning or its rows are unreachable"
@@ -1003,11 +1024,10 @@ mod tests {
         ] {
             assert_eq!(
                 prune_shards_by_catalog_with_dict(
-                    &catalog,
+                    &shards_of(&catalog),
                     std::slice::from_ref(&pred),
                     None,
                     Some(&dicts),
-                    0
                 )
                 .len(),
                 1,
@@ -1055,11 +1075,10 @@ mod tests {
         ] {
             assert_eq!(
                 prune_shards_by_catalog_with_dict(
-                    &catalog,
+                    &shards_of(&catalog),
                     std::slice::from_ref(&pred),
                     None,
                     Some(&dicts),
-                    0
                 )
                 .len(),
                 2,

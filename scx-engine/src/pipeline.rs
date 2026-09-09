@@ -139,6 +139,22 @@ pub struct QueryPipeline {
     /// once per pipeline by [`require_grouped`](Self::require_grouped); shared
     /// by all grouped-read calls on this pipeline.
     group_index: std::sync::OnceLock<crate::group::GroupIndex>,
+    /// Catalog **positions** of this pipeline's CSR shards, in
+    /// [`crate::collect::scan_shards`] order. Derived at most once per pipeline
+    /// by [`csr_shard_positions`](Self::csr_shard_positions).
+    ///
+    /// Sound without a key because `modality_id` is fixed at construction and
+    /// the catalog behind `reader` is an immutable `Arc<FullCatalog>` — the
+    /// filtered, sorted list cannot change under a live pipeline. A file that
+    /// changed on disk is refused by the reader's own freshness check, not
+    /// answered from this.
+    ///
+    /// **Positions**, not `&FullCatalogEntry`: a reference borrows the catalog
+    /// the reader owns, so it cannot be stored beside it. Same reason the
+    /// training loader caches positions (`scx-loader/src/io_stage.rs`), and
+    /// `FullCatalog::csr_shard_indices` is the one ordering rule both bases are
+    /// expressed in terms of.
+    csr_shard_positions: std::sync::OnceLock<Vec<usize>>,
 }
 
 impl std::fmt::Debug for QueryPipeline {
@@ -246,6 +262,7 @@ impl QueryPipeline {
             deletion_vectors,
             rowset_pushdown: !crate::collect::rowset_pushdown_disabled_by_env(),
             group_index: std::sync::OnceLock::new(),
+            csr_shard_positions: std::sync::OnceLock::new(),
         })
     }
 
@@ -253,6 +270,23 @@ impl QueryPipeline {
     /// single-modality).
     pub fn modality_id(&self) -> u8 {
         self.modality_id
+    }
+
+    /// Catalog positions of this pipeline's CSR shards, sorted by `row_start`.
+    ///
+    /// The single derivation of that list for the whole pipeline: planning,
+    /// pruning, masking, both materialize paths and `read_row_range` all resolve
+    /// their shard view from this, so `ShardCandidate::shard_idx` /
+    /// `ShardInfo::shard_idx` — which are *positions in it* — cannot be read
+    /// against a differently-derived list. Was recomputed (filter over every
+    /// catalog entry, then a sort, then two allocations) four times per
+    /// `collect()` and once per `read_row_range` call.
+    pub(crate) fn csr_shard_positions(&self) -> &[usize] {
+        self.csr_shard_positions.get_or_init(|| {
+            self.reader
+                .catalog()
+                .csr_shard_indices(Some(self.modality_id))
+        })
     }
 
     // -- Builders ----------------------------------------------------------
@@ -580,7 +614,7 @@ impl QueryPipeline {
             .map(|dv| dv.build_keep_mask(n_obs as usize, self.modality_id));
 
         let csr_shards: Vec<&FullCatalogEntry> =
-            crate::collect::scan_shards(self.reader.catalog(), self.modality_id);
+            crate::collect::scan_shards(self.reader.catalog(), self.csr_shard_positions());
         debug_assert!(
             self.modality_id == 0
                 || self
@@ -618,6 +652,14 @@ impl QueryPipeline {
             let (indptr, indices, data) = self.reader.read_shard_from_entry(e)?;
             let lo = start.max(rs);
             let hi = stop.min(re);
+            // Exact for this shard's contribution, before the row loop appends
+            // it: the three buffers grew by doubling across every touched
+            // shard. An upper bound rather than the final size when a deletion
+            // vector drops rows, which is the only case it over-reserves.
+            merged_indptr.reserve((hi - lo) as usize);
+            let range_nnz = (indptr[(hi - rs) as usize] - indptr[(lo - rs) as usize]) as usize;
+            merged_indices.reserve(range_nnz);
+            merged_data.reserve(range_nnz);
             for g in lo..hi {
                 covered += 1;
                 let keep = keep_mask.as_ref().map(|m| m[g as usize]).unwrap_or(true);

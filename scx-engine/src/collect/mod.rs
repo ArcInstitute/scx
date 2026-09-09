@@ -8,7 +8,7 @@
 //! | Module | Holds |
 //! |---|---|
 //! | `retry` | `par_map_with_shard_retry` — generic resilient parallel map, nothing query-specific |
-//! | `rows` | `filter_csr_rows` — row selection inside one decoded shard |
+//! | `rows` | `filter_csr_rows` / `_owned` — row selection inside one decoded shard |
 //! | `native` | the fused native decode+filter+project for the dtype-selected collect |
 //! | `plan` | the `ExecutionPlan`: catalog-level (Level-1) shard pruning and the category dictionaries |
 //! | `mask` | the row-set fast path, the legacy full-decode fallback, and the fork between them |
@@ -44,6 +44,8 @@ pub(crate) use plan::scan_shards;
 pub(crate) use execute::{materialize, plan_and_mask};
 #[cfg(test)]
 pub(crate) use plan::{build_plan, collect_bitset_coverage};
+#[cfg(test)]
+pub(crate) use rows::filter_csr_rows_owned;
 
 /// Env var (diagnostic only) that forces the legacy full-decode obs path,
 /// disabling row-set predicate pushdown.

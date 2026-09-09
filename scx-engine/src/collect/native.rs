@@ -98,7 +98,22 @@ pub(crate) fn decode_shard_native_filtered(
     // Shared with the f32 row filter, so the two cannot end up disagreeing about
     // what a valid mask is — and so a truncated shard is rejected here too
     // rather than silently yielding fewer rows than the obs half will carry.
+    // It also has to run *before* the all-kept test below: `all()` over a mask
+    // shorter than the CSR is vacuously true.
     check_keep_mask_len(keep_mask.len(), indptr.len().saturating_sub(1))?;
+
+    // Nothing to filter and nothing to project: the decoded arrays are already
+    // the answer. `read_shard_from_entry_native` guarantees `indptr[0] == 0` and
+    // `indptr.last() == indices.len()`, which is what makes the filter pass an
+    // identity here rather than merely equivalent — the same argument
+    // `filter_csr_rows_owned` rests on for the f32 route.
+    if gene_set.is_none() && keep_mask.iter().all(|&k| k) {
+        return Ok(NativeShardRows {
+            indptr,
+            indices,
+            values,
+        });
+    }
 
     Ok(match values {
         ShardValuesNative::U32(v) => {
