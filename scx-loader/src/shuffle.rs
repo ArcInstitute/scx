@@ -120,15 +120,10 @@ impl ShardShuffler {
             group.sort_by_key(|&idx| sort_keys[idx]);
         }
 
-        // Sort groups by the minimum key within each group. `sort_by_cached_key`
-        // evaluates the per-group min once (not on every comparison).
-        groups.sort_by_cached_key(|group| {
-            group
-                .iter()
-                .map(|&idx| sort_keys[idx])
-                .min()
-                .unwrap_or(u64::MAX)
-        });
+        // Sort groups by the minimum key within each group — which, **because
+        // the loop above just sorted each group ascending on that same key**, is
+        // the first element. Do not reorder these two loops.
+        groups.sort_by_cached_key(|group| group.first().map_or(u64::MAX, |&idx| sort_keys[idx]));
 
         Ok(groups)
     }

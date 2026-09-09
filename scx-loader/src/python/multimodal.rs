@@ -469,7 +469,7 @@ impl MultimodalTrainingDataset {
         // both on the floor. `obs_columns` is still read from disk by the decode
         // stage either way — only the Python conversion is skipped.
         if !self.return_dict {
-            let x = build_x_arrays(py, batches, &self.modality_names)?;
+            let x = build_x_arrays(py, batches)?;
             return Ok(Some(PyTuple::new(py, &x)?.into_any()));
         }
         // Dict form: obs / cell_indices come from the first batch (cells are
@@ -619,6 +619,34 @@ impl Drop for MultimodalTrainingDataset {
     }
 }
 
+/// Move each modality's dense `X` into a 2-D numpy array, in `batches` order —
+/// which is `modality_names` order, since both are built per pipeline. Shared by
+/// the dict and tuple batch forms so the ownership transfer and the reshape live
+/// in one place.
+///
+/// `Vec<f32>::into_pyarray` adopts the allocation instead of copying it, so the
+/// returned arrays own the loader's decode buffers.
+fn build_x_arrays<'py>(py: Python<'py>, batches: Vec<Batch>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    use numpy::IntoPyArray;
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        // Copied out before `batch.x` is moved.
+        let (n_rows, n_vars) = batch.x_shape;
+        // Defensive, and unreachable today: the only `Batch` producer builds one
+        // per `cell_indices.chunks(batch_size)` (`decode_stage.rs`), and
+        // `chunks()` yields nothing for an empty slice, so `n_rows == 0` cannot
+        // arrive here. Nothing pins the `(0, 0)` shape for that reason.
+        let n_genes = if n_rows > 0 { n_vars } else { 0 };
+        let x_2d = batch
+            .x
+            .into_pyarray(py)
+            .reshape([n_rows, n_genes])
+            .map_err(|e| PyRuntimeError::new_err(format!("X reshape failed: {e}")))?;
+        out.push(x_2d.into_any());
+    }
+    Ok(out)
+}
+
 /// Phase H.2 helper: build a `{"X": {name: ndarray}, "obs": {...},
 /// "cell_indices": ndarray}` dict from the per-modality `Batch`es. Uses the
 /// first batch's `obs` and `cell_indices` (cells are global across
@@ -648,37 +676,6 @@ impl Drop for MultimodalTrainingDataset {
 ///
 /// The empty-batch shape is **not** in that list: see `build_x_arrays`, where
 /// the `n_rows == 0` branch is unreachable and therefore unpinned.
-/// Move each modality's dense `X` into a 2-D numpy array, in `modality_names`
-/// order. Shared by the dict and tuple batch forms so the ownership transfer and
-/// the reshape live in one place.
-///
-/// `Vec<f32>::into_pyarray` adopts the allocation instead of copying it, so the
-/// returned arrays own the loader's decode buffers.
-fn build_x_arrays<'py>(
-    py: Python<'py>,
-    batches: Vec<Batch>,
-    modality_names: &[String],
-) -> PyResult<Vec<Bound<'py, PyAny>>> {
-    use numpy::IntoPyArray;
-    let mut out = Vec::with_capacity(modality_names.len());
-    for (_, batch) in modality_names.iter().zip(batches) {
-        // Copied out before `batch.x` is moved.
-        let (n_rows, n_vars) = batch.x_shape;
-        // Defensive, and unreachable today: the only `Batch` producer builds one
-        // per `cell_indices.chunks(batch_size)` (`decode_stage.rs`), and
-        // `chunks()` yields nothing for an empty slice, so `n_rows == 0` cannot
-        // arrive here. Nothing pins the `(0, 0)` shape for that reason.
-        let n_genes = if n_rows > 0 { n_vars } else { 0 };
-        let x_2d = batch
-            .x
-            .into_pyarray(py)
-            .reshape([n_rows, n_genes])
-            .map_err(|e| PyRuntimeError::new_err(format!("X reshape failed: {e}")))?;
-        out.push(x_2d.into_any());
-    }
-    Ok(out)
-}
-
 fn build_multimodal_batch_dict<'py>(
     py: Python<'py>,
     mut batches: Vec<Batch>,
@@ -696,10 +693,7 @@ fn build_multimodal_batch_dict<'py>(
     let cell_indices = std::mem::take(&mut batches[0].cell_indices);
 
     let x_dict = PyDict::new(py);
-    for (name, x) in modality_names
-        .iter()
-        .zip(build_x_arrays(py, batches, modality_names)?)
-    {
+    for (name, x) in modality_names.iter().zip(build_x_arrays(py, batches)?) {
         x_dict.set_item(name, x)?;
     }
     dict.set_item("X", x_dict)?;

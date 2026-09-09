@@ -280,15 +280,23 @@ pub async fn io_stage(
         // Perform blocking shard reads inside spawn_blocking.
         let group = tokio::task::spawn_blocking(
             move || -> Result<(ShardGroup, std::time::Duration, std::time::Duration)> {
-                let t_advise = Instant::now();
                 // Read-ahead hints for the next groups, then this group's own
                 // range. On this thread, never the reactor's — `madvise(2)`
                 // blocks. (`docs/multithreading.md` § Why three runtimes?)
+                //
+                // The timer is `cfg`-gated with the loop it times: leaving it
+                // ungated reported `Instant` overhead as prefetch wall on every
+                // non-Unix build, where there is no advice to measure at all.
                 #[cfg(unix)]
-                for (offset, len) in advise_ranges.into_iter().flatten() {
-                    reader.advise_willneed(offset, len);
-                }
-                let advise_elapsed = t_advise.elapsed();
+                let advise_elapsed = {
+                    let t_advise = Instant::now();
+                    for (offset, len) in advise_ranges.into_iter().flatten() {
+                        reader.advise_willneed(offset, len);
+                    }
+                    t_advise.elapsed()
+                };
+                #[cfg(not(unix))]
+                let advise_elapsed = std::time::Duration::ZERO;
 
                 // The decode timer starts AFTER the advice. `madvise(2)` blocks
                 // — that is the whole reason the hints moved onto this thread —
