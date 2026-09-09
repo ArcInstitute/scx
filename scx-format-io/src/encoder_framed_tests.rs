@@ -190,11 +190,14 @@ fn framing(g: u32) -> FramingConfig {
 /// which makes it a **dual-encode seed** under `codec="auto"` on any Multiome
 /// or TEA-seq write.
 ///
-/// `ValueEncoding::Float16` is deliberately absent, and not by oversight: no
-/// write path in the workspace produces it. `detect_value_encoding` returns
-/// `Float32` for every float input, and nothing else selects an encoding for a
-/// shard — Float16 exists for reading foreign data and for
-/// `ValueEncoding::widest`. If a writer ever emits one, it belongs here.
+/// `Float16` is here because a write path *can* produce it, contrary to an
+/// earlier version of this comment: `detect_value_encoding` never returns it,
+/// but `EncodeShardOptions::value_encoding` overrides that detection
+/// (`encoder.rs`'s `unwrap_or_else`), and `scx-ops`' external-layer attach and
+/// grouped sort both forward a pinned per-shard encoding through it unchanged.
+/// It matters here for one concrete reason: `byte_width() == 2`, so it is the
+/// only combination that exercises the `values_bytes[start * w_v..end * w_v]`
+/// slicing at a width other than 1 or 4.
 fn combos() -> Vec<(CodecId, ValueEncoding, bool)> {
     vec![
         (CodecId::None, ValueEncoding::Uint8, false),
@@ -203,6 +206,7 @@ fn combos() -> Vec<(CodecId, ValueEncoding, bool)> {
         (CodecId::ShufDeltaZstd, ValueEncoding::Uint32, false),
         (CodecId::Lz4Shuffle, ValueEncoding::Uint32, false),
         (CodecId::Pcodec, ValueEncoding::Float32, false),
+        (CodecId::Pcodec, ValueEncoding::Float16, false),
     ]
 }
 
@@ -315,6 +319,18 @@ fn framed_layout_is_byte_pinned() {
         (
             CodecId::Pcodec,
             ValueEncoding::Float32,
+            false,
+            "aa28644acc5bd13166205ed812fe9ef5bb230facd247ac59f890345dbbcb57ca",
+        ),
+        // Identical to the Float32 digest above, and that is the pin, not a
+        // copy-paste slip: `PcodecCodec::encode` widens f16 to f32 and
+        // compresses as f32 (`scx-codec/src/codecs/pcodec.rs:70-78`), and this
+        // fixture's values are small integers, exactly representable in f16.
+        // So the encoded stream *must* match — and if pcodec ever stops
+        // widening, these two rows stop agreeing and this is what says so.
+        (
+            CodecId::Pcodec,
+            ValueEncoding::Float16,
             false,
             "aa28644acc5bd13166205ed812fe9ef5bb230facd247ac59f890345dbbcb57ca",
         ),

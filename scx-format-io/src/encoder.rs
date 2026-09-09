@@ -641,6 +641,20 @@ pub fn encode_shard_framed(
                 c + e.values_bytes.len(),
             )
         });
+    // Bound the *totals* here, before reserving them. `offset_u32` below runs
+    // before each append, so it validates every group's starting offset and
+    // never the last group's end: a >4 GiB sub-stream whose final group starts
+    // under the limit slipped through — and did so before this function was
+    // parallelised, so this closes a pre-existing gap rather than one the
+    // change opened. Checking the fold also means the multi-gigabyte reserve
+    // never happens on the way to the error.
+    for (len, name) in [(ip_len, "indptr"), (ix_len, "indices"), (vv_len, "values")] {
+        if u32::try_from(len).is_err() {
+            return Err(ScxError::ShardStreamTooLarge(format!(
+                "framed {name} sub-stream is {len} bytes, which exceeds u32::MAX"
+            )));
+        }
+    }
     let mut indptr_stream: Vec<u8> = Vec::with_capacity(ip_len);
     let mut indices_stream: Vec<u8> = Vec::with_capacity(ix_len);
     let mut values_stream: Vec<u8> = Vec::with_capacity(vv_len);

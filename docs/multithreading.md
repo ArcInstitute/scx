@@ -548,8 +548,9 @@ parallelises **within** a single shard, on two independent axes:
   encoded twice — once at the value-distribution heuristic's pick, once at
   `ShufDeltaZstd` — and the smaller result wins. The two candidates share no
   state and are compared only by size, so they run under `rayon::join`.
-* **Row groups.** A row-group-framed (v4) shard is `⌈n_rows / G⌉` independent
-  sub-shards (`G = row_group_rows`, 256 by default). Group boundaries are
+* **Row groups.** A row-group-framed shard — file format v4, shard format v2 —
+  is `⌈n_rows / G⌉` independent sub-shards (`G = row_group_rows`, 256 by
+  default). Group boundaries are
   derived serially first — the `target_nnz` cap reads one row past each
   candidate boundary, so a group cannot decide its own extent — and then the
   groups encode under `par_iter` and are concatenated in group order.

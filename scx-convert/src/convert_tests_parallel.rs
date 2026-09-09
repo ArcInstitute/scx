@@ -96,17 +96,36 @@ fn parallel_streaming_byte_identical_to_sequential() {
 /// over two codec candidates, each of which `par_iter`s its row groups, while
 /// its siblings are blocked in `tx.send` on the bounded reorder channel.
 ///
-/// `G = 64` against `shard_size = 200` gives 4 groups per shard and 3 shards,
-/// and `decode_target: Some(Auto)` turns on the dual encode, so
-/// this covers pool → join → par_iter. Rayon runs an unstolen half inline, so
-/// a worker makes progress even when every other pool thread is parked in a
-/// channel send — but "should not deadlock" is worth an actual test, and the
-/// output must still be byte-identical to the one-thread run.
+/// `G = 64` against `shard_size = 200` gives 4 groups per shard, and
+/// `decode_target: Some(Auto)` turns on the dual encode, so this covers
+/// pool → join → par_iter.
+///
+/// The geometry is also chosen so the send-block actually happens: 1400 rows
+/// is **7** shards against `reader_threads + writer_queue_depth = 4 + 1 = 5`
+/// outstanding, so two items are still unspawned when the first five land and
+/// a worker really is parked in `tx.send` while another is inside
+/// `join`/`par_iter`. At 3 shards every item is primed up front and any send
+/// -block happens after all the encodes have finished — the interleaving would
+/// have been described and not exercised. Rayon runs an unstolen half inline,
+/// so a worker makes progress even with every other pool thread parked, but
+/// "should not deadlock" is worth an actual test, and the output must still be
+/// byte-identical to the one-thread run.
+///
+/// `skip_if_not_threadsafe` first, like the other route-dependent tests here:
+/// `run_streaming_writer_coordinator` falls back to the *sequential*
+/// coordinator on a libhdf5 without `--enable-threadsafe`, and without the
+/// guard this test would then convert twice sequentially and pass every
+/// assertion while covering none of the above.
 #[test]
 fn parallel_streaming_nested_multi_group_byte_identical_to_sequential() {
+    if crate::hdf5_threadsafe::skip_if_not_threadsafe(
+        "parallel_streaming_nested_multi_group_byte_identical_to_sequential",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let h5ad = dir.path().join("rt_nested.h5ad");
-    create_test_h5ad(&h5ad, 600, 23, "csr", false);
+    create_test_h5ad(&h5ad, 1400, 23, "csr", false);
 
     // One constant, used by both the config and the premise below. Written as
     // a literal in the assertion instead, the premise passed with G = 256 (200
@@ -118,7 +137,9 @@ fn parallel_streaming_nested_multi_group_byte_identical_to_sequential() {
         o.row_group_rows = Some(G);
         o.decode_target = Some(scx_format_io::DecodeTarget::Auto);
         o.reader_threads = Some(threads);
-        o.writer_queue_depth = 2;
+        // 1, not 2: `outstanding_cap = threads + queue_depth`, and the point
+        // is to keep it under the shard count.
+        o.writer_queue_depth = 1;
         o
     };
 
@@ -141,9 +162,12 @@ fn parallel_streaming_nested_multi_group_byte_identical_to_sequential() {
     // Premise: this fixture really is multi-shard AND multi-group. Without
     // both, the test passes while covering nothing — which is exactly the
     // state the existing sibling test is in.
+    // More shards than the drain will have outstanding at once (4 + 1), so a
+    // worker is genuinely blocked in `tx.send` while its siblings encode.
     assert!(
-        a.header().n_csr_shards > 1,
-        "premise: more than one shard, got {}",
+        a.header().n_csr_shards > 5,
+        "premise: more shards than `reader_threads + writer_queue_depth` = 5, \
+         so a worker actually blocks in `tx.send`; got {}",
         a.header().n_csr_shards
     );
     for entry in a
