@@ -86,6 +86,114 @@ fn parallel_streaming_byte_identical_to_sequential() {
     assert!(!bytes_a.is_empty() && !bytes_b.is_empty());
 }
 
+/// Nested rayon: the drain's own pool, running an encode that itself fans out.
+///
+/// `parallel_streaming_byte_identical_to_sequential` above uses
+/// `shard_size = 20` against the default `row_group_rows = 256`, so every
+/// shard is **one** row group and `encode_shard_framed`'s per-group `par_iter`
+/// has nothing to spread. That leaves the interesting shape untested: a worker
+/// on `ordered_parallel_drain`'s dedicated `ThreadPool` calling `rayon::join`
+/// over two codec candidates, each of which `par_iter`s its row groups, while
+/// its siblings are blocked in `tx.send` on the bounded reorder channel.
+///
+/// `G = 64` against `shard_size = 200` gives 4 groups per shard and 3 shards,
+/// and `decode_target: Some(Auto)` turns on the dual encode, so
+/// this covers pool → join → par_iter. Rayon runs an unstolen half inline, so
+/// a worker makes progress even when every other pool thread is parked in a
+/// channel send — but "should not deadlock" is worth an actual test, and the
+/// output must still be byte-identical to the one-thread run.
+#[test]
+fn parallel_streaming_nested_multi_group_byte_identical_to_sequential() {
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("rt_nested.h5ad");
+    create_test_h5ad(&h5ad, 600, 23, "csr", false);
+
+    // One constant, used by both the config and the premise below. Written as
+    // a literal in the assertion instead, the premise passed with G = 256 (200
+    // rows is still `> 64`) while covering exactly one group per shard — the
+    // state it exists to rule out.
+    const G: u32 = 64;
+    let framed = |threads: usize| {
+        let mut o = streaming_opts(200);
+        o.row_group_rows = Some(G);
+        o.decode_target = Some(scx_format_io::DecodeTarget::Auto);
+        o.reader_threads = Some(threads);
+        o.writer_queue_depth = 2;
+        o
+    };
+
+    let scx_seq = dir.path().join("nested_seq.scx");
+    let scx_par = dir.path().join("nested_par.scx");
+    for (out, threads) in [(&scx_seq, 1usize), (&scx_par, 4usize)] {
+        h5ad_to_scx_streaming(
+            &h5ad,
+            out,
+            &framed(threads),
+            &StreamingOverrides::default(),
+            &mut WarningSink::log(),
+        )
+        .unwrap();
+    }
+
+    let a = ScxReader::open(&scx_seq).unwrap();
+    let b = ScxReader::open(&scx_par).unwrap();
+
+    // Premise: this fixture really is multi-shard AND multi-group. Without
+    // both, the test passes while covering nothing — which is exactly the
+    // state the existing sibling test is in.
+    assert!(
+        a.header().n_csr_shards > 1,
+        "premise: more than one shard, got {}",
+        a.header().n_csr_shards
+    );
+    for entry in a
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::CsrShard)
+    {
+        let h = a.read_shard_header(entry).unwrap();
+        assert!(
+            h.shard_format_version > scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+            "premise: {} must be row-group-framed",
+            entry.name
+        );
+        assert!(
+            h.n_major.div_ceil(G) > 1,
+            "premise: {} has {} rows, which is {} row group(s) at G={G}",
+            entry.name,
+            h.n_major,
+            h.n_major.div_ceil(G)
+        );
+    }
+
+    assert_eq!(a.header().nnz, b.header().nnz);
+    assert_eq!(a.header().n_csr_shards, b.header().n_csr_shards);
+    let entries_a: Vec<_> = a
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::CsrShard)
+        .cloned()
+        .collect();
+    let entries_b: Vec<_> = b
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == FmtSectionType::CsrShard)
+        .cloned()
+        .collect();
+    assert_eq!(entries_a.len(), entries_b.len());
+    for (ea, eb) in entries_a.iter().zip(entries_b.iter()) {
+        assert_eq!(
+            a.read_raw_shard_bytes(ea).unwrap(),
+            b.read_raw_shard_bytes(eb).unwrap(),
+            "shard bytes diverge at name={}",
+            ea.name
+        );
+    }
+}
+
 #[test]
 fn parallel_streaming_with_layers_byte_identical() {
     let dir = tempfile::tempdir().unwrap();

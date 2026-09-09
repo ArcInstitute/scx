@@ -23,7 +23,6 @@ archive/
 tasks/
 tmp/
 learn/
-manuscript/
 .antigravitycli/
 .claude/*.lock
 data/*.h5ad

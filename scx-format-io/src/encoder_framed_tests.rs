@@ -29,6 +29,15 @@
 //!   `reference_framed`, a second implementation written the obvious way. It
 //!   catches a wrong rebase, a dropped group, a mis-sized offset — anything
 //!   where the two implementations disagree.
+//!
+//!   Every mutation tried so far reddens the pin as well, so this is not extra
+//!   *detection*. What it adds is the ability to tell **which layer moved**:
+//!   `reference_framed` calls the same `scx_codec::encode_shard`, so a change
+//!   inside a codec moves the pin and leaves the differential green, while a
+//!   change to the framing moves both. Without it, a future codec tweak fails
+//!   six opaque hashes with nothing to say whether the framing is implicated.
+//!   It also reports *which* sub-stream or entry field differs, where the pin
+//!   reports one changed hex string.
 //! * [`framed_layout_is_byte_pinned`] compares a BLAKE3 of the three
 //!   sub-streams and the entry table against a checked-in constant. It catches
 //!   the class the differential cannot: a change *both* implementations would
@@ -174,15 +183,25 @@ fn framing(g: u32) -> FramingConfig {
     }
 }
 
-/// The four (codec, encoding) combinations the framed writer actually emits,
-/// plus the u16-index variant. `Pcodec` is the float path; the other three are
-/// the integer ones an `auto` write can land on.
+/// Every `CodecId` a framed write can land on, with the u16-index variant on
+/// one of them. `Pcodec` is the float path; `Lz4Shuffle` is not merely
+/// user-forcible — `select_codec_for_modality` picks it automatically for
+/// non-binary integer ATAC peak counts (`scx-format/src/codec_select.rs:255`),
+/// which makes it a **dual-encode seed** under `codec="auto"` on any Multiome
+/// or TEA-seq write.
+///
+/// `ValueEncoding::Float16` is deliberately absent, and not by oversight: no
+/// write path in the workspace produces it. `detect_value_encoding` returns
+/// `Float32` for every float input, and nothing else selects an encoding for a
+/// shard — Float16 exists for reading foreign data and for
+/// `ValueEncoding::widest`. If a writer ever emits one, it belongs here.
 fn combos() -> Vec<(CodecId, ValueEncoding, bool)> {
     vec![
         (CodecId::None, ValueEncoding::Uint8, false),
         (CodecId::Scx1, ValueEncoding::Uint32, false),
         (CodecId::Zstd, ValueEncoding::Uint16, true),
         (CodecId::ShufDeltaZstd, ValueEncoding::Uint32, false),
+        (CodecId::Lz4Shuffle, ValueEncoding::Uint32, false),
         (CodecId::Pcodec, ValueEncoding::Float32, false),
     ]
 }
@@ -288,6 +307,12 @@ fn framed_layout_is_byte_pinned() {
             "d560fd219dc806741d9ed92f9f16923e9e03b70963738166485be076752eab38",
         ),
         (
+            CodecId::Lz4Shuffle,
+            ValueEncoding::Uint32,
+            false,
+            "78b62589452e8728e19d2ae2a890d9cb0ccc65b83737e9662bc86e3c3f521023",
+        ),
+        (
             CodecId::Pcodec,
             ValueEncoding::Float32,
             false,
@@ -310,8 +335,19 @@ fn framed_layout_is_byte_pinned() {
 }
 
 /// The three concatenated sub-streams are sized exactly, not doubling-grown.
-/// A `Vec` that grew by doubling reports a power-of-two capacity, so this
-/// pins the pre-size rather than merely the contents.
+/// A `Vec` that grew by doubling reports a larger capacity than length (the
+/// pre-change code measured 320 for a 194-byte indptr stream), so this pins
+/// the pre-size rather than merely the contents.
+///
+/// Kept rather than left to the benchmark, which measures time and cannot see
+/// an allocation: the exact sizing is now load-bearing for a **memory** claim.
+/// Parallel groups mean the encoded groups and the assembled streams are live
+/// together, and `scx-convert/src/budget.rs` prices that transient — a
+/// doubling-grown stream would add its overshoot, plus both buffers during the
+/// final realloc, on top. `Vec::with_capacity` is documented to allocate *at
+/// least* the request, so in principle an allocator could round up and make
+/// this fail; measured, it does not on any target this repo builds for, and a
+/// failure here would be a signal worth reading rather than noise.
 #[test]
 fn framed_streams_are_sized_exactly() {
     let (indptr, indices, values) = gen_csr(37, 4, 50, 7);

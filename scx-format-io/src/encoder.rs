@@ -451,10 +451,19 @@ pub fn encode_shard_adaptive(
             match pick_mode {
                 Some(mode) => {
                     // Two independent full encodes of the same input, compared
-                    // only by size — so they run concurrently. Both candidates
-                    // were already alive at the comparison below, so peak
-                    // memory is unchanged, and `?` is applied in the serial
-                    // order so the seed candidate's error still wins.
+                    // only by size — so they run concurrently. `?` is applied
+                    // in the serial order, so the seed candidate's error still
+                    // wins.
+                    //
+                    // This is where the change costs peak memory, and the cost
+                    // compounds with the parallel groups below rather than
+                    // being free. Serially, one candidate's internal transient
+                    // (its encoded groups plus the streams assembled from them)
+                    // had collapsed to a single `EncodedShard` before the other
+                    // started, so the peak was ~2x one shard's encoded bytes.
+                    // Under `join` the two transients overlap: ~4x.
+                    // `scx-convert/src/budget.rs` carries the measured figures
+                    // and which codecs can reach the worst case.
                     #[cfg(feature = "parallel")]
                     let (h, s) =
                         rayon::join(|| frame(seed_codec), || frame(CodecId::ShufDeltaZstd));
@@ -607,27 +616,37 @@ pub fn encode_shard_framed(
             ))
         })
     };
-    // Exact sizes are known now that every group is encoded, so the three
-    // streams are allocated once instead of doubling-grown. Folded over the
-    // `Ok` groups only: an `Err` bails out below, and over-reserving on the
-    // way to an error costs nothing.
-    let (ip_len, ix_len, vv_len) = groups.iter().filter_map(|g| g.as_ref().ok()).fold(
-        (0usize, 0usize, 0usize),
-        |(a, b, c), e| {
+    // Surface a failed group **before** reserving anything. The three streams
+    // below are sized for the whole shard, which at census scale is hundreds of
+    // megabytes — allocating them only to drop them on the next line can turn a
+    // recoverable encode error into an OOM.
+    //
+    // A *sequential* `collect` into `Result` short-circuits on the first `Err`
+    // in index order, which is the precedence the serial loop had. That is
+    // exactly the promise rayon's parallel collect does not make, and the
+    // reason pass 2 collects `Vec<Result<_>>` and the conversion happens here
+    // instead of there.
+    let encoded: Vec<EncodedShard> = groups.into_iter().collect::<Result<Vec<_>, _>>()?;
+
+    // Exact sizes, now that every group is encoded: the three streams are
+    // allocated once rather than doubling-grown. The overshoot this removes is
+    // load-bearing beyond tidiness — see `scx-convert/src/budget.rs` on the
+    // transient these buffers form with the group results they are built from.
+    let (ip_len, ix_len, vv_len) = encoded
+        .iter()
+        .fold((0usize, 0usize, 0usize), |(a, b, c), e| {
             (
                 a + e.indptr_bytes.len(),
                 b + e.indices_bytes.len(),
                 c + e.values_bytes.len(),
             )
-        },
-    );
+        });
     let mut indptr_stream: Vec<u8> = Vec::with_capacity(ip_len);
     let mut indices_stream: Vec<u8> = Vec::with_capacity(ix_len);
     let mut values_stream: Vec<u8> = Vec::with_capacity(vv_len);
     let mut entries = Vec::with_capacity(bounds.len());
 
-    for (&(r0, r1), group) in bounds.iter().zip(groups) {
-        let enc = group?;
+    for (&(r0, r1), enc) in bounds.iter().zip(encoded) {
         let nnz_in_block = indptr[r1] - indptr[r0];
         let ip_off = offset_u32(&indptr_stream, "indptr")?;
         let ix_off = offset_u32(&indices_stream, "indices")?;
