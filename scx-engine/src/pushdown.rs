@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use scx_format_io::catalog::{ColumnStat, FullCatalog, FullCatalogEntry};
+use scx_format_io::catalog::{ColumnStat, FullCatalogEntry};
 use scx_format_io::column_name_hash;
 use scx_format_io::DeletionVectors;
 
@@ -110,24 +110,14 @@ pub struct ShardCandidate {
     pub row_mask: Option<Vec<Range<u32>>>,
 }
 
-/// Determine which shards may contain matching rows based on catalog-level
-/// statistics. Shards that definitely don't match are excluded.
+/// Crate-private, deliberately: this was `pub` and re-exported, and taking the
+/// shard slice instead of `(catalog, modality_id)` is a source break for any
+/// out-of-tree Rust caller. There are none — no workflow runs `cargo publish`,
+/// the released artefacts are the `pyscx` wheel and the `scx-cli` binary, and
+/// nothing in the workspace calls it outside this module. So the surface is
+/// removed rather than frozen: a compatibility wrapper would have to re-create
+/// the `(catalog, modality_id)` pair whose removal is the point.
 ///
-/// This is the "cheap" level 1 pushdown (docs/api.md (Query engine, optimizations)) that avoids reading
-/// any shard data. When `n_indexed_columns == 0` (Phase 1 files),
-/// all shards pass through to post-read filtering.
-///
-/// If `deletion_vectors` is provided, fully-deleted shards are excluded
-/// and partially-deleted shards retain deletion info.
-pub fn prune_shards_by_catalog(
-    catalog: &FullCatalog,
-    predicates: &[Predicate],
-    deletion_vectors: Option<&DeletionVectors>,
-) -> Vec<ShardCandidate> {
-    let sorted_shards = catalog.csr_shards_for_modality(0);
-    prune_shards_by_catalog_with_dict(&sorted_shards, predicates, deletion_vectors, None)
-}
-
 /// Like `prune_shards_by_catalog`, but accepts an optional category dictionary
 /// for resolving `Utf8` predicate values against `CategoryBitset` column stats,
 /// and prunes the caller's own shard list.
@@ -139,7 +129,7 @@ pub fn prune_shards_by_catalog(
 /// is a parameter rather than a `(catalog, modality_id)` pair the callee
 /// re-derives: the caller keeps the list it will index downstream, so the two
 /// cannot be derived from different bases.
-pub fn prune_shards_by_catalog_with_dict(
+pub(crate) fn prune_shards_by_catalog_with_dict(
     sorted_shards: &[&FullCatalogEntry],
     predicates: &[Predicate],
     deletion_vectors: Option<&DeletionVectors>,
@@ -645,7 +635,7 @@ mod tests {
             (100, 200, vec![minmax_stat("n_genes", 200.0, 800.0)]),
             (200, 300, vec![minmax_stat("n_genes", 50.0, 300.0)]),
         ]);
-        let candidates = prune_shards_by_catalog(&catalog, &[], None);
+        let candidates = prune_shards_by_catalog_with_dict(&shards_of(&catalog), &[], None, None);
         assert_eq!(candidates.len(), 3);
     }
 
@@ -664,7 +654,8 @@ mod tests {
             "n_genes".to_string(),
             ScalarValue::Int64(600),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
     }
@@ -744,7 +735,8 @@ mod tests {
             "n_genes".to_string(),
             ScalarValue::Int64(100),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 2);
     }
@@ -1110,7 +1102,8 @@ mod tests {
             ),
         ]);
         let preds = vec![Predicate::Eq("batch".to_string(), ScalarValue::Int64(2))];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(
             candidates.len(),
             2,
@@ -1138,7 +1131,12 @@ mod tests {
                 vec![ScalarValue::Int64(1), ScalarValue::Int64(2)],
             ),
         ] {
-            let candidates = prune_shards_by_catalog(&catalog, std::slice::from_ref(&pred), None);
+            let candidates = prune_shards_by_catalog_with_dict(
+                &shards_of(&catalog),
+                std::slice::from_ref(&pred),
+                None,
+                None,
+            );
             assert_eq!(
                 candidates.len(),
                 2,
@@ -1158,7 +1156,8 @@ mod tests {
             "other_column".to_string(),
             ScalarValue::Utf8("foo".to_string()),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 2);
     }
 
@@ -1178,7 +1177,8 @@ mod tests {
             Predicate::Gt("n_genes".to_string(), ScalarValue::Int64(100)),
             Predicate::Lt("n_genes".to_string(), ScalarValue::Int64(400)),
         ];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].shard_idx, 0);
         assert_eq!(candidates[1].shard_idx, 1);
@@ -1196,7 +1196,8 @@ mod tests {
             "n_genes".to_string(),
             ScalarValue::Int64(600),
         )];
-        let candidates = prune_shards_by_catalog(&catalog, &preds, None);
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &preds, None, None);
         // All shards should pass through (no stats to prune on)
         assert_eq!(candidates.len(), 3);
     }
@@ -1219,7 +1220,8 @@ mod tests {
         let mut dv = DeletionVectors::new();
         // Shard 0 has row_start 0, so local rows == global obs rows.
         dv.deletions.insert(0, bm);
-        let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &[], Some(&dv), None);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].shard_idx, 1);
     }
@@ -1238,7 +1240,8 @@ mod tests {
         let mut dv = DeletionVectors::new();
         // Shard 0 has row_start 0, so local rows == global obs rows.
         dv.deletions.insert(0, bm);
-        let candidates = prune_shards_by_catalog(&catalog, &[], Some(&dv));
+        let candidates =
+            prune_shards_by_catalog_with_dict(&shards_of(&catalog), &[], Some(&dv), None);
         // Both shards included: shard 0 is only partially deleted
         assert_eq!(candidates.len(), 2);
     }

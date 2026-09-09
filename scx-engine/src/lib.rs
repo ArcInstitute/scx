@@ -31,9 +31,9 @@ pub use index::{
 pub use pipeline::{CountResult, NormalizeConfig, QueryPipeline, QueryResult, TypedQueryResult};
 pub use predicate::{eval_rowset, evaluate, parse_predicate, Predicate, RowSetCtx, ScalarValue};
 pub use projection::{decode_shard_projected, project_csr, project_csr_row, project_var, CsrIndex};
-pub use pushdown::{
-    prune_shards_by_catalog, prune_shards_by_catalog_with_dict, CategoryDictionaries,
-    CategoryDictionary, ShardCandidate,
-};
+// `prune_shards_by_catalog{,_with_dict}` are `pub(crate)`: the with-dict form now
+// takes the caller's shard slice, which is a source break, and there is no
+// out-of-tree Rust consumer to break (no `cargo publish` in any workflow).
+pub use pushdown::{CategoryDictionaries, CategoryDictionary, ShardCandidate};
 pub use reader::{BoxedSectionReader, SectionReader};
 pub use rowset::{shard_range_to_global, RowRange, RowSet};

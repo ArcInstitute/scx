@@ -88,6 +88,9 @@ pub(crate) fn truncate_to_limit(results: &mut Vec<NativeShardRows>, limit: usize
 /// `gene_set` must be ascending and unique (`PlanAndMask::effective_gene_indices`
 /// already is; the merge scan silently drops columns otherwise, which
 /// `project_csr_row`'s own `debug_assert!` documents).
+///
+/// With no projection and every row kept, the decoded buffers are returned by
+/// move — see [`filter_project_rows_owned`].
 pub(crate) fn decode_shard_native_filtered(
     reader: &dyn SectionReader,
     entry: &FullCatalogEntry,
@@ -98,26 +101,14 @@ pub(crate) fn decode_shard_native_filtered(
     // Shared with the f32 row filter, so the two cannot end up disagreeing about
     // what a valid mask is — and so a truncated shard is rejected here too
     // rather than silently yielding fewer rows than the obs half will carry.
-    // It also has to run *before* the all-kept test below: `all()` over a mask
-    // shorter than the CSR is vacuously true.
+    // It also has to run *before* the all-kept test inside
+    // `filter_project_rows_owned`: `all()` over a mask shorter than the CSR is
+    // vacuously true.
     check_keep_mask_len(keep_mask.len(), indptr.len().saturating_sub(1))?;
-
-    // Nothing to filter and nothing to project: the decoded arrays are already
-    // the answer. `read_shard_from_entry_native` guarantees `indptr[0] == 0` and
-    // `indptr.last() == indices.len()`, which is what makes the filter pass an
-    // identity here rather than merely equivalent — the same argument
-    // `filter_csr_rows_owned` rests on for the f32 route.
-    if gene_set.is_none() && keep_mask.iter().all(|&k| k) {
-        return Ok(NativeShardRows {
-            indptr,
-            indices,
-            values,
-        });
-    }
 
     Ok(match values {
         ShardValuesNative::U32(v) => {
-            let (ip, ix, out) = filter_project_rows(&indptr, &indices, &v, keep_mask, gene_set);
+            let (ip, ix, out) = filter_project_rows_owned(indptr, indices, v, keep_mask, gene_set);
             NativeShardRows {
                 indptr: ip,
                 indices: ix,
@@ -125,7 +116,7 @@ pub(crate) fn decode_shard_native_filtered(
             }
         }
         ShardValuesNative::F32(v) => {
-            let (ip, ix, out) = filter_project_rows(&indptr, &indices, &v, keep_mask, gene_set);
+            let (ip, ix, out) = filter_project_rows_owned(indptr, indices, v, keep_mask, gene_set);
             NativeShardRows {
                 indptr: ip,
                 indices: ix,
@@ -133,6 +124,38 @@ pub(crate) fn decode_shard_native_filtered(
             }
         }
     })
+}
+
+/// [`filter_project_rows`] for a caller that owns the decoded arrays: with no
+/// projection and every row kept, they *are* the answer and are returned **by
+/// move**.
+///
+/// `read_shard_from_entry_native` guarantees `indptr[0] == 0` and
+/// `indptr.last() == indices.len()`, which is what makes the filter pass an
+/// identity in that case rather than merely equivalent — the same argument
+/// `rows::filter_csr_rows_owned` rests on for the f32 route.
+///
+/// Owned, and a separate function, so that the *move* is observable to a test:
+/// with the skip inlined in `decode_shard_native_filtered` above, the buffers it
+/// hands back are allocated inside that function and no caller can tell a move
+/// from a faithful copy — every existing test here compares values, and a copy
+/// has the same values. See
+/// `the_typed_skip_returns_the_decoded_buffers_by_moving_them`.
+///
+/// The mask's length must already have been checked: `all()` over a short mask
+/// is vacuously true.
+pub(crate) fn filter_project_rows_owned<V: Copy>(
+    indptr: Vec<i64>,
+    indices: Vec<u32>,
+    values: Vec<V>,
+    keep_mask: &[bool],
+    gene_set: Option<&[u32]>,
+) -> (Vec<i64>, Vec<u32>, Vec<V>) {
+    debug_assert_eq!(keep_mask.len(), indptr.len().saturating_sub(1));
+    if gene_set.is_none() && keep_mask.iter().all(|&k| k) {
+        return (indptr, indices, values);
+    }
+    filter_project_rows(&indptr, &indices, &values, keep_mask, gene_set)
 }
 
 /// Keep `keep_mask` rows and (optionally) project their columns, in one pass.

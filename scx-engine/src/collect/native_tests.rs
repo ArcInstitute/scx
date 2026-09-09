@@ -406,6 +406,68 @@ fn an_empty_typed_result_keeps_its_shape_and_dtype() {
 
 /// White-box: the limit trim drops whole shards past the cutoff rather than
 /// keeping empty ones, so the merge's row/nnz totals match what it allocates.
+/// The typed all-kept skip returns the decoded buffers **by move**.
+///
+/// `filter_owned_keeps_all_rows_by_moving_them` pins that property for the f32
+/// route. The typed route had no analog and could not have one while the skip
+/// was inlined in `decode_shard_native_filtered`: the buffers it hands back are
+/// allocated inside that function, so no caller can tell a move from a faithful
+/// copy — and every other test in this file compares values, which a copy
+/// preserves. Deleting the skip left them all green. The decision now lives in
+/// an owned helper, which is callable with buffers whose addresses the test
+/// knows.
+#[test]
+fn the_typed_skip_returns_the_decoded_buffers_by_moving_them() {
+    use super::filter_project_rows_owned;
+
+    let indptr = vec![0i64, 2, 3, 5];
+    let indices = vec![0u32, 3, 1, 2, 3];
+    let values = vec![10u32, 11, 12, 13, 14];
+    let (ip_ptr, ix_ptr, v_ptr) = (indptr.as_ptr(), indices.as_ptr(), values.as_ptr());
+
+    let (ip, ix, v) = filter_project_rows_owned(indptr, indices, values, &[true; 3], None);
+    assert_eq!(ip.as_ptr(), ip_ptr, "indptr was copied, not moved");
+    assert_eq!(ix.as_ptr(), ix_ptr, "indices were copied, not moved");
+    assert_eq!(v.as_ptr(), v_ptr, "values were copied, not moved");
+    assert_eq!(ip, vec![0, 2, 3, 5]);
+    assert_eq!(ix, vec![0, 3, 1, 2, 3]);
+    assert_eq!(v, vec![10, 11, 12, 13, 14]);
+}
+
+/// …and does not fire when either half of its precondition fails.
+///
+/// The premises the move rests on, separately: a projection is present, or a
+/// row is dropped. Either way the buffers must be rebuilt — a skip that ignored
+/// `gene_set` would return unprojected columns, and one that ignored the mask
+/// would return rows the caller filtered out.
+#[test]
+fn the_typed_skip_does_not_fire_under_a_projection_or_a_partial_mask() {
+    use super::filter_project_rows_owned;
+
+    let indptr = vec![0i64, 2, 3, 5];
+    let indices = vec![0u32, 3, 1, 2, 3];
+    let values = vec![10u32, 11, 12, 13, 14];
+
+    // A projection: columns are remapped to `0..gene_set.len()`.
+    let (ip, ix, v) = filter_project_rows_owned(
+        indptr.clone(),
+        indices.clone(),
+        values.clone(),
+        &[true; 3],
+        Some(&[1u32, 3]),
+    );
+    assert_eq!(ip, vec![0, 1, 2, 3], "one kept column per row");
+    assert_eq!(ix, vec![1, 0, 1], "gene 3 -> col 1, gene 1 -> col 0");
+    assert_eq!(v, vec![11, 12, 14]);
+
+    // A dropped row.
+    let (ip, ix, v) =
+        filter_project_rows_owned(indptr, indices, values, &[true, false, true], None);
+    assert_eq!(ip, vec![0, 2, 4]);
+    assert_eq!(ix, vec![0, 3, 2, 3]);
+    assert_eq!(v, vec![10, 11, 13, 14]);
+}
+
 #[test]
 fn truncate_to_limit_drops_shards_past_the_cutoff() {
     let shard = |rows: usize| NativeShardRows {

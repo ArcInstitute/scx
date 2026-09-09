@@ -7,9 +7,9 @@ use crate::error::{EngineError, Result};
 /// Returns new `(indptr, indices, data)` arrays for the filtered subset.
 /// Operates on pre-decoded scipy-compatible types (i64/i32/f32).
 ///
-/// A caller that owns the decoded arrays should prefer
-/// [`filter_csr_rows_owned`], which can hand an all-true mask's rows straight
-/// back instead of copying them.
+/// Always copies. The crate-internal caller that owns its decoded arrays goes
+/// through an owned variant that can hand an all-kept shard straight back
+/// instead; this borrowing form cannot, since it does not own its input.
 pub fn filter_csr_rows(
     indptr: &[i64],
     indices: &[i32],
@@ -29,11 +29,17 @@ pub fn filter_csr_rows(
     // `collect::native` is an *upper* bound rather than exact, because there the
     // projection is fused into the same pass and can only drop entries. Here the
     // projection has already happened.)
-    let kept = keep_mask.iter().filter(|&&k| k).count();
-    let kept_nnz: usize = (0..mask_len)
-        .filter(|&row| keep_mask[row])
-        .map(|row| (indptr[row + 1] - indptr[row]) as usize)
-        .sum();
+    let (kept, kept_nnz) =
+        keep_mask
+            .iter()
+            .enumerate()
+            .fold((0usize, 0usize), |(rows, nnz), (row, &k)| {
+                if k {
+                    (rows + 1, nnz + (indptr[row + 1] - indptr[row]) as usize)
+                } else {
+                    (rows, nnz)
+                }
+            });
 
     let mut new_indptr = Vec::with_capacity(kept + 1);
     new_indptr.push(0i64);

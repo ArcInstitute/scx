@@ -34,7 +34,6 @@ pub use rows::filter_csr_rows;
 
 pub(crate) use execute::materialize_filtered_obs;
 pub(crate) use mask::obs_shard_ranges_from_catalog;
-pub(crate) use plan::scan_shards;
 
 // Reached only from `collect_tests.rs`, which is attached to this module and
 // so cannot see the submodules' items directly. Gated on `cfg(test)` so that a
@@ -42,6 +41,8 @@ pub(crate) use plan::scan_shards;
 // rather than quietly acquiring a crate-wide dependency on it.
 #[cfg(test)]
 pub(crate) use execute::{materialize, plan_and_mask};
+#[cfg(test)]
+pub(crate) use plan::scan_shards;
 #[cfg(test)]
 pub(crate) use plan::{build_plan, collect_bitset_coverage};
 #[cfg(test)]

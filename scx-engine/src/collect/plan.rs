@@ -300,6 +300,12 @@ pub(crate) fn collect_bitset_coverage(
 /// and every consumer provably walks the same list. `positions` must come from
 /// `FullCatalog::csr_shard_indices` on this same catalog — it is the ordering
 /// rule `csr_shards_for_modality` is itself expressed in terms of.
+///
+/// Only [`plan_and_mask`](super::execute::plan_and_mask) resolves the whole
+/// list, because the pruner and the masker each take a slice of it. Everything
+/// that needs one shard at a time goes through
+/// [`QueryPipeline::csr_shard_entry`](crate::QueryPipeline::csr_shard_entry)
+/// instead of allocating this vector again.
 pub(crate) fn scan_shards<'a>(
     catalog: &'a scx_format_io::FullCatalog,
     positions: &[usize],

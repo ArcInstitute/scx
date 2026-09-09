@@ -23,7 +23,6 @@ use crate::projection::{decode_shard_projected_presorted, project_var};
 use crate::reader::SectionReader;
 
 use scx_format_io::assemble_filtered_metadata;
-use scx_format_io::catalog::FullCatalogEntry;
 
 use super::mask::{compute_mask, MaskResult, ShardInfo};
 use super::native::{decode_shard_native_filtered, truncate_to_limit, NativeShardRows};
@@ -373,10 +372,9 @@ pub(crate) fn materialize_typed(
     }
 
     let reader = pipeline.reader();
-    let sorted_shards = scan_shards(reader.catalog(), pipeline.csr_shard_positions());
 
     let decode_count = decode_prefix_len(&shard_infos, plan.limit);
-    let max_value = max_value_over_prefix(&sorted_shards, &shard_infos[..decode_count]);
+    let max_value = max_value_over_prefix(pipeline, &shard_infos[..decode_count]);
 
     // O(1) pre-decode guard, as the whole-matrix typed reader does: fail loud
     // before the decode and the big allocation when the target dtype cannot hold
@@ -392,7 +390,7 @@ pub(crate) fn materialize_typed(
     // whose own range gate then covers them.
     let mut shard_results: Vec<NativeShardRows> =
         par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
-            let entry = sorted_shards[si.shard_idx];
+            let entry = pipeline.csr_shard_entry(si.shard_idx);
             let mut rows = decode_shard_native_filtered(
                 reader,
                 entry,
@@ -594,7 +592,6 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
     } = pm;
 
     let reader = pipeline.reader();
-    let sorted_shards = scan_shards(reader.catalog(), pipeline.csr_shard_positions());
 
     // Step 7: Parallel shard decode with optional projection, over the prefix of
     // candidate shards `limit` can reach (see `decode_prefix_len`).
@@ -602,12 +599,12 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
 
     // Folded before the decode, not after: it comes from catalog stats and
     // `decode_count` alone, so a caller whose guard trips pays no decode.
-    let max_value = max_value_over_prefix(&sorted_shards, &shard_infos[..decode_count]);
+    let max_value = max_value_over_prefix(pipeline, &shard_infos[..decode_count]);
 
     // Each shard produces (indptr, indices, data) filtered to matching rows
     let shard_results: Vec<(Vec<i64>, Vec<i32>, Vec<f32>)> =
         par_map_with_shard_retry(&shard_infos[..decode_count], |si| {
-            let entry = sorted_shards[si.shard_idx];
+            let entry = pipeline.csr_shard_entry(si.shard_idx);
 
             // Decode shard (with or without projection)
             let (indptr, indices, data) = if let Some(ref gi) = effective_gene_indices {
@@ -781,10 +778,10 @@ fn decode_prefix_len(shard_infos: &[ShardInfo], limit: Option<usize>) -> usize {
 /// **narrower than a catalog-wide fold**: a large count in a shard the predicate
 /// skipped, or one past the `limit` cutoff, is never decoded and so must not
 /// refuse the read.
-fn max_value_over_prefix(sorted_shards: &[&FullCatalogEntry], prefix: &[ShardInfo]) -> u32 {
+fn max_value_over_prefix(pipeline: &QueryPipeline, prefix: &[ShardInfo]) -> u32 {
     prefix
         .iter()
-        .filter_map(|si| sorted_shards[si.shard_idx].stats.as_ref())
+        .filter_map(|si| pipeline.csr_shard_entry(si.shard_idx).stats.as_ref())
         .map(|s| s.value_max)
         .max()
         .unwrap_or(0)

@@ -390,19 +390,24 @@ fn filter_owned_rejects_a_short_all_true_mask_rather_than_moving_it() {
     );
 }
 
-/// A filtered shard's buffers are sized to what it keeps, exactly.
+/// A filtered shard's buffers are reserved once, for exactly what it keeps.
 ///
-/// `len() == capacity()` is the observable form of that: the value buffers used
-/// to start empty and double, so they land on a power-of-two capacity above
-/// their length, and the indptr used to reserve the shard's *unfiltered* row
-/// count. Both totals are folds over the mask and the indptr, so exactness is
-/// free — it is the reallocation churn that was not.
+/// The capacities are compared against what `Vec::with_capacity(n)` *itself*
+/// returns for the same `n`, not against `n`. `with_capacity` promises only "at
+/// least", so asserting `capacity() == len()` would be pinning undocumented
+/// allocator behaviour and could fail on a conforming stdlib that over-allocates
+/// — a red test with no regression behind it. Comparing against the reference
+/// value states the actual claim ("this buffer was reserved up front for its
+/// final size") and stays true however much `with_capacity` rounds up, while
+/// still failing on the growth-from-empty it replaced: a doubling `Vec` lands on
+/// 8 for a length of 5 or 7, which is not what `with_capacity(5)` or
+/// `with_capacity(7)` gives.
 #[test]
 fn filter_sizes_its_buffers_to_the_kept_rows() {
     // 7 rows / 11 nnz, of which 4 rows and 7 non-zeros are kept: neither 5
-    // (`indptr`) nor 7 is a power of two, so a doubling allocator cannot land on
+    // (`indptr`) nor 7 is a power of two, so growth-from-empty cannot land on
     // either by coincidence — it reaches 8 for both, as does the old
-    // `mask_len + 1` indptr reservation.
+    // `mask_len + 1` indptr reservation (8 = 7 + 1).
     let indptr = vec![0i64, 2, 3, 5, 6, 8, 9, 11];
     let indices = vec![0i32, 1, 2, 0, 3, 1, 2, 3, 0, 1, 2];
     let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0];
@@ -412,13 +417,21 @@ fn filter_sizes_its_buffers_to_the_kept_rows() {
 
     assert_eq!(new_ip.len(), 5, "4 kept rows + the leading 0");
     assert_eq!(new_idx.len(), 7, "2 + 1 + 2 + 2 kept non-zeros");
-    // `Vec::with_capacity(n)` allocating *exactly* n is not a documented
-    // guarantee, only what every current allocator does. That is deliberate: if
-    // it ever stops holding, this fails loudly rather than letting the
-    // reservation silently drift back to over-allocating.
-    assert_eq!(new_ip.capacity(), new_ip.len(), "indptr over-reserved");
-    assert_eq!(new_idx.capacity(), new_idx.len(), "indices over-reserved");
-    assert_eq!(new_data.capacity(), new_data.len(), "data over-reserved");
+    assert_eq!(
+        new_ip.capacity(),
+        Vec::<i64>::with_capacity(5).capacity(),
+        "indptr was not reserved for its 4 kept rows + 1"
+    );
+    assert_eq!(
+        new_idx.capacity(),
+        Vec::<i32>::with_capacity(7).capacity(),
+        "indices were not reserved for their 7 kept non-zeros"
+    );
+    assert_eq!(
+        new_data.capacity(),
+        Vec::<f32>::with_capacity(7).capacity(),
+        "data was not reserved for its 7 kept non-zeros"
+    );
     // The values are still the kept rows', not just the right count of them.
     assert_eq!(new_ip, vec![0, 2, 3, 5, 7]);
     assert_eq!(new_idx, vec![0, 1, 2, 0, 3, 2, 3]);
