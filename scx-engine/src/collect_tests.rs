@@ -412,6 +412,10 @@ fn filter_sizes_its_buffers_to_the_kept_rows() {
 
     assert_eq!(new_ip.len(), 5, "4 kept rows + the leading 0");
     assert_eq!(new_idx.len(), 7, "2 + 1 + 2 + 2 kept non-zeros");
+    // `Vec::with_capacity(n)` allocating *exactly* n is not a documented
+    // guarantee, only what every current allocator does. That is deliberate: if
+    // it ever stops holding, this fails loudly rather than letting the
+    // reservation silently drift back to over-allocating.
     assert_eq!(new_ip.capacity(), new_ip.len(), "indptr over-reserved");
     assert_eq!(new_idx.capacity(), new_idx.len(), "indices over-reserved");
     assert_eq!(new_data.capacity(), new_data.len(), "data over-reserved");
