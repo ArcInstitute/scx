@@ -1605,6 +1605,18 @@ fn emit_x_in_memory(
 /// `concurrency` to `budget / per_block` (min 1), so `concurrency × per_block ≤
 /// budget`; concurrency 1 gives parity with the one-block-at-a-time `CsrEmitter`.
 ///
+/// ⚠️ **The "~1× that again for the encoded output" term is understated for a
+/// framed block, so the `≤ budget` promise above is not one.** This path takes
+/// `writer.framing()`, which under `--codec auto` carries a `decode_target`, so
+/// `encode_shard_adaptive` dual-encodes the block *and*
+/// `encode_shard_framed` holds every row group's encoded bytes alongside the
+/// streams assembled from them — up to ~4× the encoded block rather than ~1×.
+/// `scx-convert/src/budget.rs` carries the measured figures and the reachable
+/// worst case (~32 B/nnz on incompressible integer data). Closing it means
+/// re-deriving `per_block` from the whole encode phase and re-measuring what
+/// that does to grouped-sort wall time; the same is true of the convert
+/// derate, and neither is a footnote-sized change.
+///
 /// `None` budget keeps the full rayon-thread concurrency (the user opted out of
 /// budgeting). When a budget **is** set but the sub-flush is disabled
 /// (`block_byte_cap == 0`, i.e. `--group-write-block-bytes 0`), each block is a

@@ -30,6 +30,64 @@
 //! quoting a row as a guarantee; the flag is the difference between "we sized
 //! this" and "nothing exceeds this".
 //!
+//! That unbounded encoded-side term got **larger** when `encode_shard_framed`
+//! started encoding its row groups in parallel, and it got larger twice over.
+//! Both halves compose, so price them together:
+//!
+//! * **Per framed encode: ~2x one shard's encoded bytes.** Every group's
+//!   encoded bytes are live at once, alongside the three sub-streams assembled
+//!   from them. Previously it was the streams plus one group. (The streams are
+//!   now sized exactly, which removes the old doubling overshoot and the
+//!   double buffer during its final realloc — so ~2x is the honest figure, not
+//!   2x on top of a previous 1x.)
+//! * **x2 again under `codec="auto"`/`"compact"`/`compact-trial`.**
+//!   `encode_shard_adaptive` runs the two candidates under `rayon::join`, so
+//!   the two per-encode transients **overlap**: up to **~4x** the encoded
+//!   shard. Serially they did not — one candidate collapsed to a single
+//!   `EncodedShard` before the next began.
+//!
+//! In B/nnz, which is the unit the reservations below use: the compressing
+//! integer codecs run 1-4 B/nnz on real count data, so the common case is
+//! 4-16 B/nnz transient against the 16 B/nnz reserved for the decoded set —
+//! inside the gap. The worst *reachable* case is not: `select_codec_for_modality`
+//! picks `Lz4Shuffle` for non-binary integer ATAC peak counts, and on
+//! incompressible data LZ4 approaches its ~8 B/nnz input, so a dual-encoded
+//! ATAC shard can transiently hold ~32 B/nnz — twice the decoded reservation.
+//! `CodecId::None` is the other 8 B/nnz encoding and it is **not** reachable
+//! here: it exists only as an explicit `--codec none` force, and
+//! `resolve_codec` gives an explicit force `decode_target: None` and
+//! `codec_trial: false`, so it single-encodes (~2x, ~16 B/nnz).
+//!
+//! Measured on `scx compact --codec auto`, two release worktrees, 3 runs each,
+//! 16 cores:
+//!
+//! | fixture | wall | peak RSS |
+//! |---|---|---|
+//! | pbmc3k (1 shard) | 0.153 -> 0.083 s | 49 -> 78 MB (+59%) |
+//! | smartseq2 (4 shards) | 11.656 -> 4.659 s | 1364 -> 2010 MB (**+47%**) |
+//! | census_500k (31 shards) | 43.439 -> 18.553 s | 1678 -> 2030 MB (+21%) |
+//!
+//! The spread across fixtures is the thing to read, not the census number:
+//! the added term is one shard's *encoded* bytes, so it grows with nnz per
+//! shard and not with the file. smartseq2 is deep-sequenced — few cells, many
+//! nnz each — so its shards are large and the term is nearly half its peak,
+//! while census_500k's 31 thinner shards dilute it to a fifth. Size this from
+//! the widest, deepest shard a caller can produce, not from a census average.
+//!
+//! All three are the serial-encode path — `compact` encodes one shard at a
+//! time — so a parallel convert multiplies the term by its granted worker
+//! count. Every arm's per-section digests were identical to `main`'s (63
+//! sections on census_500k), so none of this is a fidelity question.
+//!
+//! **None of the shares below move, and that is a limitation, not a
+//! conclusion.** Every phase here is already claimed to exactly 1 (share x
+//! multiplicity), so this term cannot be added as a row without re-deriving
+//! `SHARD_BUDGET_SHARE` downward — which is the "measured change, not a
+//! footnote" the dense-slab row already describes, and it would give back the
+//! parallelism 11.5 restored. Until someone does that measurement, a
+//! budget-bound convert on incompressible integer data can exceed its budget,
+//! as it could before, by more than it could before.
+//!
 //! Deliberately **not** gated on `hdf5`, for the same reason `parallel_drain`
 //! is not: this is integer arithmetic, and keeping it feature-free is what lets
 //! `allocation_table_shares_sum_to_at_most_one_per_phase` (a `#[cfg(test)]`

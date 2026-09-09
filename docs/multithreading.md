@@ -18,6 +18,7 @@ runtimes are involved, and how it all stays safe.
 | **File mutations** | Advisory `flock()` via `fs4` | `scx-ops` |
 | **GPU decode** | CUDA kernel parallelism | `scx-gpu` |
 | **Shard encoding** (write) | Rayon `par_iter` over shard boundaries | `pyscx` |
+| **Shard encoding** (within one shard) | Rayon `join` over codec candidates + `par_iter` over row groups | `scx-format-io` |
 | **File writing** (I/O) | Sequential (atomic rename) | `scx-format-io` |
 
 ## Parallel shard decode
@@ -536,6 +537,46 @@ File writing has two phases: parallel encoding followed by sequential I/O.
 2. **Disk I/O (sequential)**: `ScxWriter` writes pre-encoded sections
    sequentially to a temporary file, then performs `fsync()` + `rename()` for
    atomic visibility. This guarantees readers never see a partially-written file.
+
+### Inside one shard (`scx-format-io`, `parallel` feature)
+
+Point 1 above spreads work across *shard boundaries*, which needs more shards
+than threads to fill a machine. `scx_format_io::encode_shard_adaptive` also
+parallelises **within** a single shard, on two independent axes:
+
+* **Codec candidates.** Under `codec="auto"` or `"compact"` an integer shard is
+  encoded twice — once at the value-distribution heuristic's pick, once at
+  `ShufDeltaZstd` — and the smaller result wins. The two candidates share no
+  state and are compared only by size, so they run under `rayon::join`.
+* **Row groups.** A row-group-framed shard — file format v4, shard format v2 —
+  is `⌈n_rows / G⌉` independent sub-shards (`G = row_group_rows`, 256 by
+  default). Group boundaries are
+  derived serially first — the `target_nnz` cap reads one row past each
+  candidate boundary, so a group cannot decide its own extent — and then the
+  groups encode under `par_iter` and are concatenated in group order.
+
+**The output is byte-identical at every thread count.** Each group's bytes
+depend on nothing but its own rows, the concatenation is by group index rather
+than completion order, and the block-index offsets are recorded from that
+concatenation. `scx-format-io`'s `encoder_framed_tests` pin the layout against
+both an independently written framer and a checked-in BLAKE3 constant, and
+`op_output_identity`'s `optimize_framed` arm pins it end to end through a real
+op. Byte order here is not a free choice: `resolve_block_index` derives each
+group's byte range from the *next* entry's offset, so emitting groups in
+completion order produces a file that does not read.
+
+With the `parallel` feature off, both axes fall back to a sequential iterator
+over the same boundaries and the same concatenation — one implementation, one
+`cfg`-switched iterator, so the two builds cannot drift.
+
+The two levels nest rather than conflict. `scx-convert`'s ingest coordinator
+already encodes each shard on a rayon worker, so on a threaded convert the pool
+is saturated across shards and the intra-shard fan-out is work-stealing that
+re-partitions the same work. Where it pays is the paths that encode one shard at
+a time on the calling thread: every `scx-ops` rewrite (`compact`, `merge`,
+`optimize`, `build-csc`, `append`, the external-layer attach), the sequential
+convert coordinator (taken when libhdf5 is not thread-safe), and any write whose
+shard count is below the thread count.
 
 ## GPU parallelism
 
