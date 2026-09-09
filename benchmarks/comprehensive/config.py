@@ -1641,15 +1641,18 @@ def estimate_time_minutes(
         # at all. `test_no_duplicate_keys_in_config_tables` now catches that.
         "fragment_ops":           55,
         # One in-place sidecar build per run, plus a file copy per run outside
-        # the timed region. O(nnz) with a column-major transpose on top: 259 s
-        # per run at tabula_sapiens_100k (195M nnz) and 1630 s at census_500k
-        # (747M nnz), i.e. ~1.3 us per non-zero. At N_RUNS_LARGE=3 that is
-        # 13 min and 81 min respectively, so the base alone cannot cover census
-        # — see the steeper slope below.
+        # the timed region. O(nnz) with a column-major transpose on top.
+        # Captured (`results/baselines/LATEST`): 29.3 s per run at
+        # tabula_sapiens_100k (195M nnz), 201 s at census_500k (747M nnz) and
+        # 1308 s at census_1m (1.40B) — ~0.27 us per non-zero. At
+        # N_RUNS_LARGE=3 that is ~1.5 min and ~10 min, so the base alone covers
+        # tabula but not census; the slope below is deliberately far more
+        # generous than these numbers require (see there for why).
         "build_csc":              45,
         # O(nnz) over a gzipped *text* triplet and neither direction streams —
-        # 3.5 us per non-zero on export, against `build_csc`'s 1.3, which makes
-        # this the slowest per-non-zero path in the suite. Measured on pbmc3k
+        # 3.5 us per non-zero on export, against `build_csc`'s captured 0.27,
+        # which makes this the slowest per-non-zero path in the suite. Measured
+        # on pbmc3k
         # (2,286,884 nnz): to_mtx 287k nnz/s, from_mtx 450k nnz/s. At
         # tabula_sapiens_100k (195M nnz) that is ~11 min per export and ~7 min
         # per ingest, so N_RUNS_LARGE=3 exports + 1 deletion export + 3 ingests
@@ -1672,32 +1675,26 @@ def estimate_time_minutes(
     elif benchmark == "build_csc":
         # NB this slope is per million **cells** (`per_million = n_obs / 1e6`),
         # while the op is O(nnz). The two coincide only at a fixed density, so
-        # the number below is calibrated at census density and says so.
+        # the number below is calibrated at census density.
         #
-        # Measured: 259 s per run at tabula_sapiens_100k (100K cells, 195M nnz)
-        # and 1630 s at census_500k (500K cells, 747M nnz) — 2.2 s per million
-        # non-zeros. At N_RUNS_LARGE=3: 13 min and 81 min.
+        # Captured (`results/baselines/LATEST`, median of 3): 29.3 s per run at
+        # tabula_sapiens_100k (100K cells, 195M nnz), 201 s at census_500k
+        # (500K cells, 747M nnz) and 1308 s at census_1m (1M cells, 1.40B nnz).
+        # At N_RUNS_LARGE=3 plus a per-run `shutil.copy2` of the input (2.8 GB
+        # at census_1m), that is ~1.5 / ~10 / ~70 min of real work.
         #
-        # census_1m carries 1.40B nnz, so 3 runs extrapolate to ~153 min, with a
-        # per-run `shutil.copy2` of a 2.8 GB file on top. 180/M gives
-        # census_500k 135 min and census_1m 225. The 8/M default would have
-        # budgeted 49 minutes for the 81-minute cell; an earlier 90/M gave
-        # census_1m 135 minutes for a ~153-minute job.
-        #
-        # CAVEAT, unresolved: the two "Measured" figures above disagree with the
-        # captured baseline by ~9x. `results/baselines/LATEST` (= the
-        # `candidate_unpinned_20260903` snapshot) records median wall
-        # 29.3 s at tabula_sapiens_100k, 201 s at census_500k and 1308 s at
-        # census_1m, and a fresh 8-CPU `cpu_batch` A/B reproduced 24.6 s at
-        # tabula. The peak-RSS half of the same bespoke sweep (quoted in
-        # thresholds.yaml's deferred-floor item 14) DOES agree with LATEST, so
-        # this is a wall-clock-only divergence — most likely a thread-count or
-        # page-cache difference in the bespoke sweep, but that has not been
-        # established. The slope is left at 180 deliberately: over-provisioning
-        # a time budget is safe, under-provisioning kills a census-scale cell
-        # mid-capture, and nothing here justifies lowering it on warm-cache
-        # numbers. Do not quote the 259 s / 1630 s figures as build-csc
-        # throughput; quote LATEST.
+        # **180/M is a deliberate safety margin, not a derivation** — it budgets
+        # 135 min for census_500k and 225 for census_1m, i.e. an order of
+        # magnitude over the captured wall. It is kept because a bespoke
+        # one-run-per-budget sweep on the same datasets measured 259 s at
+        # tabula and 1630 s at census_500k — ~9x slower than LATEST, on the
+        # same code — and that divergence has never been explained. (Its
+        # peak-RSS half, quoted in thresholds.yaml's deferred-floor item 14,
+        # DOES agree with LATEST, so it is wall-clock only; a thread-count or
+        # page-cache difference is the obvious suspect and is unconfirmed.)
+        # Under-provisioning kills a census-scale cell mid-capture, so the
+        # slope stays at the pessimistic end until that is settled. Quote
+        # LATEST for throughput, never the 259 s / 1630 s figures.
         slope_minutes_per_million = 180
     elif benchmark == "shuffle_layout":
         # Every arm is O(nnz): each rewrite decodes and re-encodes the whole

@@ -386,8 +386,12 @@ baseline (`benchmarks/comprehensive/results/baselines/LATEST`, `scx_auto`,
 (24.8M), 19.4 s on `smartseq2` (131M), 29.3 s on `tabula_sapiens_100k` (195M),
 201 s on `census_500k` (747M) and **1308 s on `census_1m`** (1.40B). Cost tracks
 non-zeros, not cells. Encoding and the transpose dominate: removing one of the
-two full CSR decode passes the op used to perform — together with `n + 1`
-standalone shard-header reads, which are 76 B each — cut wall by 10–13%.
+two full CSR decode passes the op used to perform, together with `n + 1`
+standalone 76-byte shard-header reads, took roughly a tenth off the wall — a
+branch A/B, so deliberately not quoted as a figure here (see
+[benchmark_manifest.md](benchmark_manifest.md): a number in a user-visible doc
+needs a capture whose `git_sha` is an ancestor of `main`, which a PR-branch
+capture never becomes).
 
 ### Multimodal support
 

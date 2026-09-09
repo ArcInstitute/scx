@@ -334,11 +334,24 @@ pub fn run_build_csc(
     // `read_shard_from_entry` would return. `csr_shards` is borrowed, not
     // consumed, because the transpose at step 13 still needs it.
     //
-    // Indexed rather than zipped: `csr_shards` and `per_shard` are both built
-    // by mapping over `csr_entries` with no early exit in between, so all three
-    // are the same length — but a `zip(..).zip(..)` truncates to the shortest,
-    // which would drop shards from the output with no error anywhere, whereas
-    // an index that went out of step is a bounds panic.
+    // `per_shard` stays a list beside `csr_shards` rather than being folded into
+    // it because `streaming_csr_to_csc_iter_with_cap` takes `&[ScxCsr]`
+    // (`scx-sparse/src/transpose.rs:253-259`) and borrows it for the iterator's
+    // lifetime: a `Vec<(CodecId, ValueEncoding, ScxCsr)>` could not feed the
+    // transpose without building a second `Vec<ScxCsr>`, which is the very copy
+    // this change removes.
+    //
+    // One check, both directions. All three lists are built by mapping over
+    // `csr_entries` with no early exit between, so they cannot diverge — but
+    // indexing only catches `csr_shards` being *longer* (a bounds panic); a
+    // shorter `csr_shards` would silently stop early and drop shards from the
+    // output with no error anywhere, which is the same hazard a truncating
+    // `zip` has.
+    assert_eq!(
+        csr_shards.len(),
+        csr_entries.len(),
+        "one decoded shard per catalog entry"
+    );
     for (i, shard) in csr_shards.iter().enumerate() {
         let shard_entry = &csr_entries[i];
         let (ci, ve) = per_shard[i];
