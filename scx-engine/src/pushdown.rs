@@ -50,9 +50,8 @@ impl CategoryDictionaries {
 
     /// Record `values` for `column_name_hash`.
     ///
-    /// `complete` must be `true` only when every shard the caller will pass to
-    /// the Level-1 pruner iterates was covered by the index build
-    /// that produced `values`. There is no default and no setter: a caller
+    /// `complete` must be `true` only when every shard the Level-1 pruner will
+    /// iterate was covered by the index build that produced `values`. There is no default and no setter: a caller
     /// cannot supply a vocabulary without stating what it is worth.
     ///
     /// An **empty** vocabulary is never complete, whatever the caller says. It
@@ -115,9 +114,10 @@ pub struct ShardCandidate {
 /// shard slice instead of `(catalog, modality_id)` is a source break for any
 /// out-of-tree Rust caller. There are none — no workflow runs `cargo publish`,
 /// the released artefacts are the `pyscx` wheel and the `scx-cli` binary, and
-/// nothing in the workspace calls it outside this module. So the surface is
-/// removed rather than frozen: a compatibility wrapper would have to re-create
-/// the `(catalog, modality_id)` pair whose removal is the point.
+/// no crate outside `scx-engine` calls it (inside it, `collect::plan::build_plan`
+/// is the one caller). So the surface is removed rather than frozen: a
+/// compatibility wrapper would have to re-create the `(catalog, modality_id)`
+/// pair whose removal is the point.
 ///
 /// Level-1 (catalog-statistics) shard pruning over the caller's own shard list,
 /// with an optional category dictionary for resolving `Utf8` predicate values

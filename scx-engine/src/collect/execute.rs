@@ -695,9 +695,12 @@ pub(crate) fn materialize(pipeline: &QueryPipeline, pm: PlanAndMask) -> Result<Q
 
     // Step 11: Filter obs metadata to matching rows
     // Build the list of global row indices that made it into the output.
-    // `shard_infos` come from `candidate_shards`, which derive from
-    // `catalog.shards_sorted()` (ascending `row_start`), so this list is
-    // globally ascending and aligns row-for-row with the assembled CSR.
+    // `shard_infos` come from `candidate_shards`, which derive from the
+    // modality-scoped CSR list the pipeline derived (ascending `row_start`), so
+    // this list is globally ascending and aligns row-for-row with the assembled
+    // CSR. Not `catalog.shards_sorted()`: that is the flattened all-modality
+    // view, which differs from this one on any multimodal file — the conclusion
+    // holds within a modality, which is the only scope a pipeline has.
     //
     // Only the decoded prefix (`shard_infos[..decode_count]`) contributes rows
     // to the assembled CSR; for a `limit`ed query the trailing shards were
