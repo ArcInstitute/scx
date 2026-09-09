@@ -404,8 +404,6 @@ fn an_empty_typed_result_keeps_its_shape_and_dtype() {
     assert_eq!(typed.obs.num_rows(), 0);
 }
 
-/// White-box: the limit trim drops whole shards past the cutoff rather than
-/// keeping empty ones, so the merge's row/nnz totals match what it allocates.
 /// The typed all-kept skip returns the decoded buffers **by move**.
 ///
 /// `filter_owned_keeps_all_rows_by_moving_them` pins that property for the f32
@@ -425,13 +423,45 @@ fn the_typed_skip_returns_the_decoded_buffers_by_moving_them() {
     let values = vec![10u32, 11, 12, 13, 14];
     let (ip_ptr, ix_ptr, v_ptr) = (indptr.as_ptr(), indices.as_ptr(), values.as_ptr());
 
-    let (ip, ix, v) = filter_project_rows_owned(indptr, indices, values, &[true; 3], None);
+    let (ip, ix, v) = filter_project_rows_owned(indptr, indices, values, &[true; 3], None).unwrap();
     assert_eq!(ip.as_ptr(), ip_ptr, "indptr was copied, not moved");
     assert_eq!(ix.as_ptr(), ix_ptr, "indices were copied, not moved");
     assert_eq!(v.as_ptr(), v_ptr, "values were copied, not moved");
     assert_eq!(ip, vec![0, 2, 3, 5]);
     assert_eq!(ix, vec![0, 3, 1, 2, 3]);
     assert_eq!(v, vec![10, 11, 12, 13, 14]);
+}
+
+/// The owned helper rejects a short all-true mask **itself**.
+///
+/// A `debug_assert` was not enough: `all()` over a mask shorter than the CSR is
+/// vacuously true, so a release build would take the fast path and hand back
+/// every row of a shard the caller believes it truncated. The production caller
+/// checking first does not stop a later one from forgetting, which is why the
+/// f32 analog puts `check_keep_mask_len` inside the owned function too.
+#[test]
+fn the_typed_owned_filter_rejects_a_short_all_true_mask() {
+    use super::filter_project_rows_owned;
+
+    let indptr = vec![0i64, 2, 3, 5];
+    let indices = vec![0u32, 3, 1, 2, 3];
+    let values = vec![10u32, 11, 12, 13, 14];
+
+    let err = filter_project_rows_owned(
+        indptr.clone(),
+        indices.clone(),
+        values.clone(),
+        &[true, true],
+        None,
+    )
+    .expect_err("a 2-entry mask must not be accepted for a 3-row shard")
+    .to_string();
+    assert!(err.contains("keep mask covers 2 rows"), "unexpected: {err}");
+
+    assert!(
+        filter_project_rows_owned(indptr, indices, values, &[true; 4], None).is_err(),
+        "a 4-entry mask must not be accepted for a 3-row shard either"
+    );
 }
 
 /// …and does not fire when either half of its precondition fails.
@@ -455,19 +485,22 @@ fn the_typed_skip_does_not_fire_under_a_projection_or_a_partial_mask() {
         values.clone(),
         &[true; 3],
         Some(&[1u32, 3]),
-    );
+    )
+    .unwrap();
     assert_eq!(ip, vec![0, 1, 2, 3], "one kept column per row");
     assert_eq!(ix, vec![1, 0, 1], "gene 3 -> col 1, gene 1 -> col 0");
     assert_eq!(v, vec![11, 12, 14]);
 
     // A dropped row.
     let (ip, ix, v) =
-        filter_project_rows_owned(indptr, indices, values, &[true, false, true], None);
+        filter_project_rows_owned(indptr, indices, values, &[true, false, true], None).unwrap();
     assert_eq!(ip, vec![0, 2, 4]);
     assert_eq!(ix, vec![0, 3, 2, 3]);
     assert_eq!(v, vec![10, 11, 13, 14]);
 }
 
+/// White-box: the limit trim drops whole shards past the cutoff rather than
+/// keeping empty ones, so the merge's row/nnz totals match what it allocates.
 #[test]
 fn truncate_to_limit_drops_shards_past_the_cutoff() {
     let shard = |rows: usize| NativeShardRows {

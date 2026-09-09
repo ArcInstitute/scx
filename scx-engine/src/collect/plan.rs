@@ -302,10 +302,12 @@ pub(crate) fn collect_bitset_coverage(
 /// rule `csr_shards_for_modality` is itself expressed in terms of.
 ///
 /// Only [`plan_and_mask`](super::execute::plan_and_mask) resolves the whole
-/// list, because the pruner and the masker each take a slice of it. Everything
-/// that needs one shard at a time goes through
+/// list, because the pruner and the masker each take a slice of it. The two
+/// `materialize` halves hold a `shard_idx` — a position *in* this list — so
+/// they go through
 /// [`QueryPipeline::csr_shard_entry`](crate::QueryPipeline::csr_shard_entry)
-/// instead of allocating this vector again.
+/// rather than allocating this vector again; `read_row_range` holds no
+/// `shard_idx` at all and walks the catalog positions directly.
 pub(crate) fn scan_shards<'a>(
     catalog: &'a scx_format_io::FullCatalog,
     positions: &[usize],

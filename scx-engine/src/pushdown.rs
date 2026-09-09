@@ -51,7 +51,7 @@ impl CategoryDictionaries {
     /// Record `values` for `column_name_hash`.
     ///
     /// `complete` must be `true` only when every shard the caller will pass to
-    /// [`prune_shards_by_catalog_with_dict`] was covered by the index build
+    /// the Level-1 pruner iterates was covered by the index build
     /// that produced `values`. There is no default and no setter: a caller
     /// cannot supply a vocabulary without stating what it is worth.
     ///
@@ -100,11 +100,12 @@ impl CategoryDictionaries {
 #[derive(Debug, Clone)]
 pub struct ShardCandidate {
     /// Position in the **modality-scoped** CSR shard list this candidate was
-    /// pruned from — the `sorted_shards` slice passed to
-    /// [`prune_shards_by_catalog_with_dict`], i.e. one
-    /// [`crate::collect::scan_shards`] result. **Not** an index into
-    /// `FullCatalog.entries` and not into the flattened all-modality
-    /// `shards_sorted()`, which differ from it on any multimodal file.
+    /// pruned from — the `sorted_shards` slice the pruner was handed, which is
+    /// the list the querying pipeline derived for its own modality. **Not** an
+    /// index into `FullCatalog.entries`, and not into the flattened
+    /// all-modality `shards_sorted()`; both differ from it on any multimodal
+    /// file. Whoever holds a `ShardCandidate` must index the same slice that
+    /// produced it.
     pub shard_idx: usize,
     /// Row mask within shard (None = all rows are candidates).
     pub row_mask: Option<Vec<Range<u32>>>,
@@ -118,9 +119,9 @@ pub struct ShardCandidate {
 /// removed rather than frozen: a compatibility wrapper would have to re-create
 /// the `(catalog, modality_id)` pair whose removal is the point.
 ///
-/// Like `prune_shards_by_catalog`, but accepts an optional category dictionary
-/// for resolving `Utf8` predicate values against `CategoryBitset` column stats,
-/// and prunes the caller's own shard list.
+/// Level-1 (catalog-statistics) shard pruning over the caller's own shard list,
+/// with an optional category dictionary for resolving `Utf8` predicate values
+/// against `CategoryBitset` column stats.
 ///
 /// `sorted_shards` is one [`crate::collect::scan_shards`] result — already
 /// scoped to a modality (`modality_id == 0` being the global / single-modality
