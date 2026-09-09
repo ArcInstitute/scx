@@ -1,7 +1,7 @@
 //! The committed byte-identity A/B matrix: what does each rewriting op write?
 //!
-//! Ten arms over eight ops, one manifest of per-section digests, three ways to
-//! use it:
+//! Twelve arms over nine ops, one manifest of per-section digests, three ways
+//! to use it:
 //!
 //! * **default** — assert against the checked-in golden. A refactor that
 //!   changes any op's output fails `cargo test`, in CI, without anybody having
@@ -43,7 +43,7 @@
 //! ## What this cannot see
 //!
 //! Read this before citing a green run as "the rewrite did not change bytes".
-//! It is true of these ten arms and of nothing else.
+//! It is true of these twelve arms and of nothing else.
 //!
 //! **Regions of the file.** `FileHeader::file_checksum` is deliberately outside
 //! the digest (it covers the `Provenance` section, which is itself excluded),
@@ -75,6 +75,13 @@
 //!   `obs_import` / `doublet_import` producers share that obs writer and are
 //!   not digested at all.
 //!
+//! **Framing, by exactly one arm.** `optimize_framed` is the only arm whose
+//! output goes through `scx_format_io::encode_shard_framed`; every other
+//! fixture here is unframed, so the eleven other arms say nothing about the
+//! row-group layout. Do not "simplify" its fixture — the row count and the
+//! `decode_target` are what make it cover anything, and its own premise
+//! assertions explain why.
+//!
 //! **Layout.** Every arm runs at `Strictness::Content`, which ignores section
 //! offsets. A change that only moves sections — a byte-passthrough or an
 //! in-place claim — is invisible here; that is what `Strictness::Layout` is for
@@ -98,13 +105,17 @@ use common::{
 use scx_codec::ValueEncoding;
 use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest};
 use scx_testkit::digest::Strictness;
-use scx_testkit::fixtures::mixed_codec_file;
+use scx_testkit::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts};
 
-/// Every arm, in the order the manifest reports them: the nine labels over the
-/// seven ops PR-01 names, with `compact` and `build_csc` doubled over an
+/// Every arm, in the order the manifest reports them (`labels()` walks a
+/// `BTreeMap`, so this constant is asserted **sorted**): the nine labels over
+/// the seven ops PR-01 names, with `compact` and `build_csc` doubled over an
 /// index-carrying input, plus `attach_obs` (the in-place obs attach, added with
-/// the categorical-fidelity change) and `attach_var` (its var-axis twin, added
-/// with the var attach) so both in-place attaches are pinned from here on.
+/// the categorical-fidelity change), `attach_var` (its var-axis twin, added
+/// with the var attach) so both in-place attaches are pinned from here on, and
+/// `optimize_framed` — twelve in all. That last one is the **only** arm whose
+/// output goes through the row-group-framed encoder; see its comment in
+/// `build_manifest` before changing its fixture.
 const EXPECTED_OPS: &[&str] = &[
     "append",
     "attach_obs",
@@ -116,6 +127,7 @@ const EXPECTED_OPS: &[&str] = &[
     "delete",
     "merge",
     "optimize",
+    "optimize_framed",
     "sort",
 ];
 
@@ -273,7 +285,90 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     m.record("attach_var", &target, Strictness::Content)
         .unwrap();
 
+    // --- the only arm that reaches the row-group-framed encoder ------------
+    //
+    // Every arm above writes **unframed** shards, and not by accident:
+    // `fixture_all_families` never calls `ScxWriter::set_framing`, so
+    // `framing_for_rewrite` sees an unframed input and hands the writer
+    // `None`; and `mixed_codec_file`'s one framed shard is re-encoded
+    // unframed by `run_build_csc(.., None)` above. So before this arm,
+    // `scx_format_io::encode_shard_framed` — the function every framed write
+    // in the workspace funnels through — was pinned by nothing here.
+    //
+    // Two properties of the fixture are load-bearing, not incidental:
+    //
+    // * `n_obs = 1545` gives three shards of 515 rows, so at G = 256 each is
+    //   **three row groups with a 3-row tail**. A single-group shard would
+    //   pin the framed layout no better than an unframed one — the same trap
+    //   `mixed_codec_file` calls out for its own framed shard, and the reason
+    //   the default `n_obs = 24` cannot be used here (515 > 256 is the whole
+    //   point). A rotation of the groups, a reversal, and an off-by-one on
+    //   the short tail are all visible in this digest and in none other.
+    // * `decode_target: Some(Auto)` makes the adaptive dual-encode fire on
+    //   the two integer shards, so the arm covers the candidate-selection
+    //   path as well as the group layout.
+    //
+    // `optimize_with_framing` rather than `optimize`: framing is an explicit
+    // argument there, so the arm cannot be silently un-framed by a change to
+    // how another op infers `output_framed` from its input's header.
+    let framed_src = mixed_codec_file_with(
+        &dir.join("framed_src.scx"),
+        &FixtureOpts {
+            n_obs: 1545,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let out = dir.join("optimize_framed.scx");
+    scx_ops::optimize_with_framing(
+        &framed_src,
+        &out,
+        None,
+        scx_format_io::ObsShardPolicy::Off,
+        Some(scx_format_io::FramingConfig {
+            row_group_rows: 256,
+            target_nnz: None,
+            trial: false,
+            decode_target: Some(scx_format_io::codec_select::DecodeTarget::Auto),
+        }),
+    )
+    .unwrap();
+    assert_output_shards_are_multi_group(&out);
+    m.record("optimize_framed", &out, Strictness::Content)
+        .unwrap();
+
     m
+}
+
+/// The premise `optimize_framed` rests on: its output's CSR shards really are
+/// row-group-framed and really do span more than one group.
+///
+/// Asserted rather than assumed because both halves are silent when they
+/// break. A future change to the fixture's `n_obs`, or to how `optimize`
+/// decides to frame, would leave the arm green while it quietly stopped
+/// covering the group layout — which is the only thing it is there for.
+fn assert_output_shards_are_multi_group(path: &Path) {
+    let reader = scx_format_io::ScxReader::open(path).unwrap();
+    let shards = reader.catalog().csr_shards_sorted();
+    assert!(!shards.is_empty(), "no CSR shards in {}", path.display());
+    for entry in shards {
+        let header = reader.read_shard_header(entry).unwrap();
+        assert!(
+            header.shard_format_version > scx_format_io::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+            "{}: shard {} is unframed (v{}), so it carries no block index",
+            path.display(),
+            entry.name,
+            header.shard_format_version
+        );
+        assert!(
+            header.n_major as usize > 256,
+            "{}: shard {} has {} rows, which is one row group at G=256 — \
+             the arm no longer covers the group layout",
+            path.display(),
+            entry.name,
+            header.n_major
+        );
+    }
 }
 
 /// Four of the fixture's genes, in reverse order (a key join, not a positional

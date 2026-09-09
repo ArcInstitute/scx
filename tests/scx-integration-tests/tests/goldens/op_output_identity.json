@@ -2157,6 +2157,106 @@
         }
       ]
     },
+    "optimize_framed": {
+      "strictness": "Content",
+      "excluded_section_types": [
+        11
+      ],
+      "header": {
+        "format_version": 4,
+        "flags": 0,
+        "n_obs": 1545,
+        "n_vars": 40,
+        "nnz": 4635,
+        "n_csr_shards": 3,
+        "n_csc_shards": 0,
+        "shard_target_rows": 10000,
+        "codec_id": 5,
+        "index_dtype": 0,
+        "manifest_sequence": 0,
+        "n_modalities": 0
+      },
+      "catalog": {
+        "catalog_version": 4,
+        "manifest_sequence": 0,
+        "n_obs": 1545,
+        "data_generation": 2,
+        "csc_build_generation": 0
+      },
+      "sections": [
+        {
+          "name": "X_shard_0",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 2025,
+          "blake3": "98c61614d384e5fc86e689f12e64ec59c3d595628a8fa745f1576721a29f3c0a",
+          "stats": {
+            "row_start": 0,
+            "row_end": 515,
+            "col_start": 0,
+            "col_end": 40,
+            "nnz": 1545,
+            "value_min": 1,
+            "value_max": 250,
+            "value_sum": 188655,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_shard_1",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 556,
+          "blake3": "c0654156128437a7bdbb2cc9f1c6b7768ef2f7441cd0715ba5153a58fc85fd3c",
+          "stats": {
+            "row_start": 515,
+            "row_end": 1030,
+            "col_start": 0,
+            "col_end": 40,
+            "nnz": 1545,
+            "value_min": 1,
+            "value_max": 9,
+            "value_sum": 7722,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_shard_2",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 1661,
+          "blake3": "41964d200e5106ff4fb0f724fb95c86ce27a1619649f61332aec5e224bf355cb",
+          "stats": {
+            "row_start": 1030,
+            "row_end": 1545,
+            "col_start": 0,
+            "col_end": 40,
+            "nnz": 1545,
+            "value_min": 0,
+            "value_max": 0,
+            "value_sum": 0,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "obs",
+          "section_type": 0,
+          "modality_id": 0,
+          "length": 48690,
+          "blake3": "d5e9caa1a7dc151e1dfcc7429ae9dfd7cba30df09b7f2daa7bbc07545416244a"
+        },
+        {
+          "name": "var",
+          "section_type": 2,
+          "modality_id": 0,
+          "length": 1330,
+          "blake3": "44a225e7535cc717d5074ccaeedf24094a96fbe183c78a0cf6bcc864711b7de3"
+        }
+      ]
+    },
     "sort": {
       "strictness": "Content",
       "excluded_section_types": [

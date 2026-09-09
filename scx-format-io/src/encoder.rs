@@ -450,8 +450,18 @@ pub fn encode_shard_adaptive(
             };
             match pick_mode {
                 Some(mode) => {
-                    let (e_h, bi_h) = frame(seed_codec)?;
-                    let (e_s, bi_s) = frame(CodecId::ShufDeltaZstd)?;
+                    // Two independent full encodes of the same input, compared
+                    // only by size — so they run concurrently. Both candidates
+                    // were already alive at the comparison below, so peak
+                    // memory is unchanged, and `?` is applied in the serial
+                    // order so the seed candidate's error still wins.
+                    #[cfg(feature = "parallel")]
+                    let (h, s) =
+                        rayon::join(|| frame(seed_codec), || frame(CodecId::ShufDeltaZstd));
+                    #[cfg(not(feature = "parallel"))]
+                    let (h, s) = (frame(seed_codec), frame(CodecId::ShufDeltaZstd));
+                    let (e_h, bi_h) = h?;
+                    let (e_s, bi_s) = s?;
                     let (size_h, size_s) = (framed_size(&e_h), framed_size(&e_s));
                     let pick_shufdelta = match mode {
                         FramedPick::Trial => size_s < size_h,
@@ -528,11 +538,11 @@ pub fn encode_shard_framed(
     let g = framing.row_group_rows.clamp(1, MAX_BLOCK_ROWS) as usize;
     let nnz_cap = framing.target_nnz.unwrap_or(u64::MAX);
 
-    let mut indptr_stream: Vec<u8> = Vec::new();
-    let mut indices_stream: Vec<u8> = Vec::new();
-    let mut values_stream: Vec<u8> = Vec::new();
-    let mut entries = Vec::with_capacity(n_rows.div_ceil(g).max(1));
-
+    // Pass 1 — group boundaries, serially and before any encode. The growth
+    // loop peeks one row past `r1`, so the boundaries are data-dependent
+    // whenever `target_nnz` is set and cannot be derived per group in
+    // isolation. Deriving them here is what makes pass 2 order-free.
+    let mut bounds: Vec<(usize, usize)> = Vec::with_capacity(n_rows.div_ceil(g).max(1));
     let mut r0 = 0usize;
     while r0 < n_rows {
         let base = indptr[r0];
@@ -543,32 +553,82 @@ pub fn encode_shard_framed(
         while r1 < max_r1 && (indptr[r1 + 1] - base) <= nnz_cap {
             r1 += 1;
         }
-        let end = indptr[r1] as usize;
-        let start = base as usize;
-        let nnz_in_block = indptr[r1] - base;
+        bounds.push((r0, r1));
+        r0 = r1;
+    }
 
+    // Pass 2 — encode each group. Every group reads disjoint slices of the
+    // caller's three inputs and writes only its own `EncodedShard`, so the
+    // work is order-free and the bytes depend on nothing but the group's own
+    // rows: running the groups concurrently cannot change the output.
+    let encode_group = |&(r0, r1): &(usize, usize)| -> Result<EncodedShard, ScxError> {
+        let base = indptr[r0];
+        let start = base as usize;
+        let end = indptr[r1] as usize;
         let local_indptr: Vec<u64> = indptr[r0..=r1].iter().map(|&v| v - base).collect();
-        let group_indices = &indices[start..end];
-        let group_values = &values_bytes[start * w_v..end * w_v];
-        let enc = encode_shard(
+        Ok(encode_shard(
             &local_indptr,
-            group_indices,
-            group_values,
+            &indices[start..end],
+            &values_bytes[start * w_v..end * w_v],
             codec,
             value_encoding,
             index_dtype_u16,
-        )?;
+        )?)
+    };
+    // `Vec<Result<_>>`, not `collect::<Result<Vec<_>, _>>()`: rayon does not
+    // define *which* error a short-circuiting collect returns, and the loop
+    // this replaced returned the lowest-indexed group's. Pass 3 takes the
+    // first `Err` in group order, which keeps that exactly.
+    //
+    // The `cfg` switches the iterator and nothing else — passes 1 and 3 are
+    // shared — so the sequential build cannot drift from the parallel one.
+    // That matters here more than usual: `cargo test -p scx-format-io
+    // --no-default-features` has never built (the test target names `rayon`
+    // unconditionally), so the `parallel`-off arm is only ever `cargo
+    // check`ed and a second implementation would go untested indefinitely.
+    #[cfg(feature = "parallel")]
+    let groups: Vec<Result<EncodedShard, ScxError>> = {
+        use rayon::prelude::*;
+        bounds.par_iter().map(encode_group).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let groups: Vec<Result<EncodedShard, ScxError>> = bounds.iter().map(encode_group).collect();
 
-        // Sub-stream offsets are u32 in BlockIndexEntry; a >4 GiB concatenated
-        // sub-stream would silently wrap. Fail loud instead (F-c).
-        let offset_u32 = |stream: &[u8], name: &str| -> Result<u32, ScxError> {
-            u32::try_from(stream.len()).map_err(|_| {
-                ScxError::ShardStreamTooLarge(format!(
-                    "framed {name} sub-stream offset {} exceeds u32::MAX",
-                    stream.len()
-                ))
-            })
-        };
+    // Pass 3 — concatenate in group order and record each group's offsets
+    // before its bytes are appended, exactly as the serial loop did.
+    //
+    // Sub-stream offsets are u32 in BlockIndexEntry; a >4 GiB concatenated
+    // sub-stream would silently wrap. Fail loud instead (F-c).
+    let offset_u32 = |stream: &[u8], name: &str| -> Result<u32, ScxError> {
+        u32::try_from(stream.len()).map_err(|_| {
+            ScxError::ShardStreamTooLarge(format!(
+                "framed {name} sub-stream offset {} exceeds u32::MAX",
+                stream.len()
+            ))
+        })
+    };
+    // Exact sizes are known now that every group is encoded, so the three
+    // streams are allocated once instead of doubling-grown. Folded over the
+    // `Ok` groups only: an `Err` bails out below, and over-reserving on the
+    // way to an error costs nothing.
+    let (ip_len, ix_len, vv_len) = groups.iter().filter_map(|g| g.as_ref().ok()).fold(
+        (0usize, 0usize, 0usize),
+        |(a, b, c), e| {
+            (
+                a + e.indptr_bytes.len(),
+                b + e.indices_bytes.len(),
+                c + e.values_bytes.len(),
+            )
+        },
+    );
+    let mut indptr_stream: Vec<u8> = Vec::with_capacity(ip_len);
+    let mut indices_stream: Vec<u8> = Vec::with_capacity(ix_len);
+    let mut values_stream: Vec<u8> = Vec::with_capacity(vv_len);
+    let mut entries = Vec::with_capacity(bounds.len());
+
+    for (&(r0, r1), group) in bounds.iter().zip(groups) {
+        let enc = group?;
+        let nnz_in_block = indptr[r1] - indptr[r0];
         let ip_off = offset_u32(&indptr_stream, "indptr")?;
         let ix_off = offset_u32(&indices_stream, "indices")?;
         let vv_off = offset_u32(&values_stream, "values")?;
@@ -584,7 +644,6 @@ pub fn encode_shard_framed(
             vv_off,
             nnz_in_block,
         )?);
-        r0 = r1;
     }
 
     Ok((
@@ -898,3 +957,7 @@ mod adaptive_codec_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "encoder_framed_tests.rs"]
+mod encoder_framed_tests;

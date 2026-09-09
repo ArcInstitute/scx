@@ -3614,6 +3614,7 @@ dependencies = [
  "arrow",
  "blake3",
  "byteorder",
+ "criterion",
  "crossbeam-channel",
  "half",
  "libc",
