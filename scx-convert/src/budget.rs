@@ -58,11 +58,26 @@
 //! `resolve_codec` gives an explicit force `decode_target: None` and
 //! `codec_trial: false`, so it single-encodes (~2x, ~16 B/nnz).
 //!
-//! Measured, `scx compact` on a 500k-cell fixture (31 shards x 16384 rows,
-//! G = 256, shufdelta, dual-encoded, 12 threads): peak RSS 1715.6 -> 2063.0 MB,
-//! **+20.2%**, while wall went 44.45 -> 20.67 s. That is the serial-encode
-//! path — one shard at a time — so a parallel convert multiplies the term by
-//! its granted worker count.
+//! Measured on `scx compact --codec auto`, two release worktrees, 3 runs each,
+//! 16 cores:
+//!
+//! | fixture | wall | peak RSS |
+//! |---|---|---|
+//! | pbmc3k (1 shard) | 0.153 -> 0.083 s | 49 -> 78 MB (+59%) |
+//! | smartseq2 (4 shards) | 11.656 -> 4.659 s | 1364 -> 2010 MB (**+47%**) |
+//! | census_500k (31 shards) | 43.439 -> 18.553 s | 1678 -> 2030 MB (+21%) |
+//!
+//! The spread across fixtures is the thing to read, not the census number:
+//! the added term is one shard's *encoded* bytes, so it grows with nnz per
+//! shard and not with the file. smartseq2 is deep-sequenced — few cells, many
+//! nnz each — so its shards are large and the term is nearly half its peak,
+//! while census_500k's 31 thinner shards dilute it to a fifth. Size this from
+//! the widest, deepest shard a caller can produce, not from a census average.
+//!
+//! All three are the serial-encode path — `compact` encodes one shard at a
+//! time — so a parallel convert multiplies the term by its granted worker
+//! count. Every arm's per-section digests were identical to `main`'s (63
+//! sections on census_500k), so none of this is a fidelity question.
 //!
 //! **None of the shares below move, and that is a limitation, not a
 //! conclusion.** Every phase here is already claimed to exactly 1 (share x
