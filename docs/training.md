@@ -592,12 +592,15 @@ for batch in ds:
 > batches are tuples of X arrays only (no obs or cell_indices).
 >
 > Each modality's `X`, the numeric obs columns and `cell_indices` are **moved**
-> into their numpy arrays rather than copied, so a multimodal batch costs no
-> more to hand to Python than a single-modality one. Those arrays own the
-> loader's decode buffers; they stay valid for as long as you hold them, but
-> writing into one writes into nothing else's memory. A **categorical** obs
-> column is the exception — its codes are decoded into a Python list of
-> strings, which allocates per batch and is not a numpy array at all.
+> into their numpy arrays rather than copied, so handing a batch to Python
+> performs **no bulk payload copy**. It is not free per modality: one array is
+> still constructed and reshaped and inserted into the `X` dict for each one,
+> so the wrapper cost still scales with the modality count — what does not
+> scale is the bytes. Those arrays own the loader's decode buffers; they stay
+> valid for as long as you hold them, but writing into one writes into nothing
+> else's memory. A **categorical** obs column is the exception to the no-copy
+> half — its codes are decoded into a Python list of strings, which allocates
+> per batch and is not a numpy array at all.
 
 > [!WARNING]
 > **`hvg_indices` is not range-checked here — this class only.** A single panel

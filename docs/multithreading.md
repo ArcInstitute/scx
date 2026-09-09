@@ -127,28 +127,37 @@ saturated by overlapping I/O, decode, and consumption:
 └──────────────────┘                    └──────────────────┘               └───────────────┘
 ```
 
-The following sequence diagram shows how the three stages overlap in time:
+The following sequence diagram shows how the three stages overlap in time. Note
+that the I/O thread itself only *schedules*: every blocking operation — the
+`madvise` hints and the shard reads alike — runs on a `spawn_blocking` worker,
+which is the invariant § Why three runtimes? states.
 
 ```mermaid
 sequenceDiagram
     participant IO as I/O Thread<br/>(tokio current-thread)
+    participant Blk as Blocking Worker<br/>(spawn_blocking)
     participant Dec as Decode Thread<br/>(rayon pool)
     participant Py as Consumer<br/>(Python / GPU)
 
     Note over IO,Py: start_epoch() — I/O thread spawned, tokio runtime built
 
-    IO->>IO: madvise(WILLNEED) shard group 0
+    IO->>Blk: spawn_blocking(group 0)
+    Blk->>Blk: madvise(WILLNEED) groups 1,2 then 0<br/>+ read/decode shards
+    Blk-->>IO: ShardGroup 0
     IO->>Dec: ShardGroup 0 (tokio::mpsc, cap=2)
-    IO->>IO: madvise(WILLNEED) shard group 1
+    IO->>Blk: spawn_blocking(group 1)
 
     Dec->>Dec: pool.install(par_iter):<br/>decode + scatter + normalize
     Dec->>Py: Batch 0 (crossbeam, cap=prefetch)
 
+    Blk-->>IO: ShardGroup 1
     IO->>Dec: ShardGroup 1
     Dec->>Dec: decode + scatter + normalize
     Py->>Py: py.allow_threads()<br/>→ model.forward()
     Dec->>Py: Batch 1
 
+    IO->>Blk: spawn_blocking(group 2)
+    Blk-->>IO: ShardGroup 2
     IO->>Dec: ShardGroup 2
     Py->>Py: loss.backward()
     Dec->>Dec: decode + scatter + normalize
