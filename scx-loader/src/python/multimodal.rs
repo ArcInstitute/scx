@@ -463,26 +463,20 @@ impl MultimodalTrainingDataset {
             }
         }
 
-        // Build the output. Both the dict and tuple paths share the
-        // first batch's obs / cell_indices (cells are global, so the
-        // obs record is identical across modalities).
-        let dict = build_multimodal_batch_dict(py, batches, &self.modality_names)?;
-        if self.return_dict {
-            Ok(Some(dict.into_any()))
-        } else {
-            // Tuple of X arrays in modality order.
-            let x_dict = dict.get_item("X")?.expect("X key always present");
-            let x_dict = x_dict.cast::<PyDict>()?;
-            let mut tuple_items: Vec<Bound<'_, PyAny>> =
-                Vec::with_capacity(self.modality_names.len());
-            for name in &self.modality_names {
-                let v = x_dict
-                    .get_item(name)?
-                    .expect("modality entry always present");
-                tuple_items.push(v);
-            }
-            Ok(Some(PyTuple::new(py, &tuple_items)?.into_any()))
+        // Build the output. The tuple form is documented as "X arrays only, no
+        // obs or cell_indices", so it does not go through the dict builder: it
+        // used to build the obs dict and the `cell_indices` array and then drop
+        // both on the floor. `obs_columns` is still read from disk by the decode
+        // stage either way — only the Python conversion is skipped.
+        if !self.return_dict {
+            let x = build_x_arrays(py, batches, &self.modality_names)?;
+            return Ok(Some(PyTuple::new(py, &x)?.into_any()));
         }
+        // Dict form: obs / cell_indices come from the first batch (cells are
+        // global, so the obs record is identical across modalities).
+        Ok(Some(
+            build_multimodal_batch_dict(py, batches, &self.modality_names)?.into_any(),
+        ))
     }
 
     /// Total observations (cells), shared across modalities (global obs axis).
@@ -630,15 +624,20 @@ impl Drop for MultimodalTrainingDataset {
 /// first batch's `obs` and `cell_indices` (cells are global across
 /// modalities).
 ///
-/// Takes the batches **by value and moves every buffer into numpy**:
-/// `Vec<T>::into_pyarray` adopts the allocation rather than copying it, so a
-/// borrowed signature could only have handed Python a clone of each modality's
-/// dense `X` — ~183 MB per batch on a 253-row multiome batch, on the consumer
-/// thread with the GIL held. The single-modality
-/// [`batch_to_dict`](super::training) has always moved; this is the same
-/// contract for N modalities (OPT-LOADER-1).
+/// Takes the batches **by value**, so `X`, the numeric obs columns and
+/// `cell_indices` are *moved* into numpy rather than copied:
+/// `Vec<T>::into_pyarray` adopts the allocation. A borrowed signature could
+/// only have handed Python a clone of each modality's dense `X` — ~183 MB per
+/// batch on a 253-row multiome batch, on the consumer thread with the GIL held.
+/// The single-modality [`batch_to_dict`](super::training) has always moved;
+/// this is the same contract for N modalities (OPT-LOADER-1).
 ///
-/// Three details of the output are contract, not incidental, and are pinned by
+/// **A categorical obs column is the exception**: its codes are decoded into a
+/// `Vec<&str>` and then into a `PyList` of Python strings, so that arm still
+/// allocates per batch and produces no numpy array at all. Moving it would mean
+/// changing the output shape, which is a contract change, not this one.
+///
+/// Two details of the output are contract, not incidental, and are pinned by
 /// `pyscx/tests/test_multimodal_training.py`:
 ///
 /// * `cell_indices` is **uint64** here (the single-modality builder casts to
@@ -646,7 +645,40 @@ impl Drop for MultimodalTrainingDataset {
 /// * a categorical obs column is a **Python list of decoded strings**, not the
 ///   `{"codes", "categories"}` dict `super::convert::obs_to_pydict` emits, so
 ///   that helper is *not* a drop-in for this loop.
-/// * an empty batch reshapes to `(0, 0)`, not `(0, n_genes)`.
+///
+/// The empty-batch shape is **not** in that list: see `build_x_arrays`, where
+/// the `n_rows == 0` branch is unreachable and therefore unpinned.
+/// Move each modality's dense `X` into a 2-D numpy array, in `modality_names`
+/// order. Shared by the dict and tuple batch forms so the ownership transfer and
+/// the reshape live in one place.
+///
+/// `Vec<f32>::into_pyarray` adopts the allocation instead of copying it, so the
+/// returned arrays own the loader's decode buffers.
+fn build_x_arrays<'py>(
+    py: Python<'py>,
+    batches: Vec<Batch>,
+    modality_names: &[String],
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    use numpy::IntoPyArray;
+    let mut out = Vec::with_capacity(modality_names.len());
+    for (_, batch) in modality_names.iter().zip(batches) {
+        // Copied out before `batch.x` is moved.
+        let (n_rows, n_vars) = batch.x_shape;
+        // Defensive, and unreachable today: the only `Batch` producer builds one
+        // per `cell_indices.chunks(batch_size)` (`decode_stage.rs`), and
+        // `chunks()` yields nothing for an empty slice, so `n_rows == 0` cannot
+        // arrive here. Nothing pins the `(0, 0)` shape for that reason.
+        let n_genes = if n_rows > 0 { n_vars } else { 0 };
+        let x_2d = batch
+            .x
+            .into_pyarray(py)
+            .reshape([n_rows, n_genes])
+            .map_err(|e| PyRuntimeError::new_err(format!("X reshape failed: {e}")))?;
+        out.push(x_2d.into_any());
+    }
+    Ok(out)
+}
+
 fn build_multimodal_batch_dict<'py>(
     py: Python<'py>,
     mut batches: Vec<Batch>,
@@ -664,16 +696,11 @@ fn build_multimodal_batch_dict<'py>(
     let cell_indices = std::mem::take(&mut batches[0].cell_indices);
 
     let x_dict = PyDict::new(py);
-    for (name, batch) in modality_names.iter().zip(batches) {
-        // Copied out before `batch.x` is moved.
-        let (n_rows, n_vars) = batch.x_shape;
-        let n_genes = if n_rows > 0 { n_vars } else { 0 };
-        let x_2d = batch
-            .x
-            .into_pyarray(py)
-            .reshape([n_rows, n_genes])
-            .map_err(|e| PyRuntimeError::new_err(format!("X reshape failed: {e}")))?;
-        x_dict.set_item(name, x_2d)?;
+    for (name, x) in modality_names
+        .iter()
+        .zip(build_x_arrays(py, batches, modality_names)?)
+    {
+        x_dict.set_item(name, x)?;
     }
     dict.set_item("X", x_dict)?;
 

@@ -1191,30 +1191,6 @@ impl TrainingPipeline {
             .reader
             .catalog()
             .csr_shard_indices(self.config.modality_id);
-        // The shuffler is sized from `n_csr_shards`, resolved once at
-        // construction; the per-position sort keys below come from this list.
-        // `shuffle_epoch_sorted` reads its keys with `sort_keys.get(idx)` and
-        // falls back to `u64::MAX`, so a length disagreement between the two is
-        // **silent** — it degrades the shard ordering rather than failing, and
-        // `io_stage` would then resolve positions the shuffler never intended.
-        // That is exactly what a wrong modality filter on either side produces,
-        // so check it rather than trusting two derivations to agree.
-        if shard_indices.len() != self.n_csr_shards {
-            return Err(LoaderError::ConfigError {
-                reason: format!(
-                    "shard list disagreement: start_epoch resolved {} CSR shards for \
-                     modality_id={:?} but the shuffler was built for {}",
-                    shard_indices.len(),
-                    self.config.modality_id,
-                    self.n_csr_shards,
-                ),
-            });
-        }
-        let shard_offsets: Vec<u64> = shard_indices
-            .iter()
-            .map(|&i| self.reader.catalog().entries[i].offset)
-            .collect();
-
         // Per-position sort keys for the shuffle. Use each shard's `row_start`
         // (the order `csr_shard_indices` already returns positions in) rather
         // than the raw file offset, so the group ordering is
@@ -1222,9 +1198,12 @@ impl TrainingPipeline {
         // `row_start` (checked by `check_uniform_modality_layouts`), so the
         // per-modality shufflers produce identical group sequences and the
         // per-batch cell axis stays aligned even if a rewrite reordered shards on
-        // disk. `shard_offsets` above stays byte offsets for the mmap smoke-read /
-        // prefetch below. Missing-stats shards map to `u64::MAX` identically for
-        // all modalities (stable sort keeps ties in RNG order). (H2)
+        // disk. Missing-stats shards map to `u64::MAX` identically for all
+        // modalities (stable sort keeps ties in RNG order). (H2)
+        //
+        // `shuffle_epoch_sorted` rejects a key list whose length disagrees with
+        // the shard count the shuffler was built for — the check lives there,
+        // on the data actually consumed, rather than here on one caller.
         let sort_keys: Vec<u64> = shard_indices
             .iter()
             .map(|&i| {
@@ -1244,9 +1223,9 @@ impl TrainingPipeline {
         // hanging the I/O stage on an unreproducible read after the workers
         // have spawned. Cheap: a single byte fault on a region the I/O
         // stage was about to fault anyway.
-        if let Some(&first_offset) = shard_offsets.first() {
+        if let Some(&first_idx) = shard_indices.first() {
             let mmap = self.reader.mmap();
-            let off = first_offset as usize;
+            let off = self.reader.catalog().entries[first_idx].offset as usize;
             if off >= mmap.len() {
                 return Err(LoaderError::ShutdownError(format!(
                     "first shard offset {off} exceeds mmap length {}",
@@ -1263,7 +1242,7 @@ impl TrainingPipeline {
         // spawning the decode thread that uses it.
         let decode_pool = Arc::clone(self.ensure_decode_pool()?);
 
-        let shard_groups = self.shuffler.shuffle_epoch_sorted(&sort_keys);
+        let shard_groups = self.shuffler.shuffle_epoch_sorted(&sort_keys)?;
 
         // Create bounded channels
         //

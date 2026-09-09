@@ -63,19 +63,21 @@ pub struct ShardData {
 /// - `target_ranges[p]` is the `(row_start, row_end)` of output shard position `p`
 ///   (`None` skips it). The returned map is keyed by `p`, matching the positions in
 ///   `shard_groups`, and holds shard-local (`global - row_start`) bitmaps.
-/// - `global_row_starts` is retained for signature stability with the caller but
-///   is unused under v2 (deletions are already global obs rows); it existed for
-///   the legacy v1 per-shard `global_row_starts[gid] + local` remapping.
 ///
 /// For the single-modality/global path (`target_ranges == global` ranges) this is
 /// byte-identical to bucketing the global deletion bitmap directly.
+///
+/// A `global_row_starts: &[Option<u64>]` parameter used to sit here "for
+/// signature stability", carrying the legacy v1 per-shard
+/// `global_row_starts[gid] + local` remapping; the body opened with
+/// `let _ = global_row_starts`. Under v2 it was dead, and building it cost the
+/// caller a `Vec<&FullCatalogEntry>` over **every** shard in the file plus a
+/// `Vec<Option<u64>>` on every epoch with deletions.
 fn reconstruct_deletion_map(
     dv: &scx_format_io::deletion_vectors::DeletionVectors,
-    global_row_starts: &[Option<u64>],
     target_ranges: &[Option<(u64, u64)>],
 ) -> std::collections::HashMap<usize, RoaringBitmap> {
-    let _ = global_row_starts; // unused under v2 (deletions are already global obs rows).
-                               // Recover the set of deleted global cell indices.
+    // Recover the set of deleted global cell indices.
     let mut deleted_global: Vec<u64> = match dv.global_deleted() {
         Some(bitmap) => bitmap.iter().map(|r| r as u64).collect(),
         None => Vec::new(),
@@ -119,23 +121,33 @@ const PREFETCH_LOOKAHEAD: usize = 2;
 /// before current), and the skipping of degenerate ranges — not that the
 /// syscall happened.
 ///
-/// Ranges are dropped when `start >= end`: a group whose shards all lack
-/// catalog entries leaves `min_offset = usize::MAX`, and `end - start` would
-/// underflow.
+/// Ranges are dropped (left `None`) when `start >= end`: a group whose shards
+/// all lack catalog entries leaves `min_offset = usize::MAX`, and `end - start`
+/// would underflow.
+///
+/// Returns a fixed-size array rather than a `Vec` so a group's prefetch costs
+/// no allocation; the caller iterates the `Some`s in order.
 #[cfg(unix)]
 fn advise_ranges_for_group(
     group_byte_ranges: &[(usize, usize)],
     group: usize,
-) -> Vec<(usize, usize)> {
+) -> [Option<(usize, usize)>; PREFETCH_LOOKAHEAD + 1] {
+    let mut out = [None; PREFETCH_LOOKAHEAD + 1];
     let n_groups = group_byte_ranges.len();
-    (1..=PREFETCH_LOOKAHEAD)
+    let mut n = 0;
+    for idx in (1..=PREFETCH_LOOKAHEAD)
         .map(|ahead| group + ahead)
         .filter(|&idx| idx < n_groups)
         .chain(std::iter::once(group))
-        .filter_map(|idx| group_byte_ranges.get(idx).copied())
-        .filter(|&(start, end)| start < end)
-        .map(|(start, end)| (start, end - start))
-        .collect()
+    {
+        if let Some(&(start, end)) = group_byte_ranges.get(idx) {
+            if start < end {
+                out[n] = Some((start, end - start));
+                n += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Run the I/O stage: read shard groups and send them to the decode stage.
@@ -194,11 +206,6 @@ pub async fn io_stage(
     let deletion_map: Arc<std::collections::HashMap<usize, RoaringBitmap>> =
         Arc::new(match &deletion_vectors {
             Some(dv) => {
-                let global = reader.catalog().shards_sorted();
-                let global_row_starts: Vec<Option<u64>> = global
-                    .iter()
-                    .map(|e| e.stats.as_ref().map(|s| s.row_start))
-                    .collect();
                 let target_ranges: Vec<Option<(u64, u64)>> = shard_catalog_indices
                     .iter()
                     .map(|&ci| {
@@ -208,7 +215,7 @@ pub async fn io_stage(
                             .map(|s| (s.row_start, s.row_end))
                     })
                     .collect();
-                reconstruct_deletion_map(dv, &global_row_starts, &target_ranges)
+                reconstruct_deletion_map(dv, &target_ranges)
             }
             None => std::collections::HashMap::new(),
         });
@@ -249,6 +256,11 @@ pub async fn io_stage(
     // behind the downstream consumer.
     let mut total_decode_us = 0u128;
     let mut total_send_wait_us = 0u128;
+    // Prefetch (`MADV_WILLNEED`) wall, kept apart from `decode_total` so the
+    // ratio above stays a decode-vs-back-pressure verdict. This PR moved the
+    // look-ahead hints onto the blocking thread; the claim that they cost ~0 is
+    // now readable rather than asserted.
+    let mut total_advise_us = 0u128;
 
     for group_indices in shard_groups {
         // Resolved here, where `group_byte_ranges` lives; *issued* inside
@@ -266,18 +278,25 @@ pub async fn io_stage(
         group_count += 1;
 
         // Perform blocking shard reads inside spawn_blocking.
-        let group =
-            tokio::task::spawn_blocking(move || -> Result<(ShardGroup, std::time::Duration)> {
-                let t0 = Instant::now();
-                let mut shards = Vec::with_capacity(group_indices.len());
-
+        let group = tokio::task::spawn_blocking(
+            move || -> Result<(ShardGroup, std::time::Duration, std::time::Duration)> {
+                let t_advise = Instant::now();
                 // Read-ahead hints for the next groups, then this group's own
                 // range. On this thread, never the reactor's — `madvise(2)`
                 // blocks. (`docs/multithreading.md` § Why three runtimes?)
                 #[cfg(unix)]
-                for (offset, len) in advise_ranges {
+                for (offset, len) in advise_ranges.into_iter().flatten() {
                     reader.advise_willneed(offset, len);
                 }
+                let advise_elapsed = t_advise.elapsed();
+
+                // The decode timer starts AFTER the advice. `madvise(2)` blocks
+                // — that is the whole reason the hints moved onto this thread —
+                // so timing them inside `decode_total` would attribute prefetch
+                // latency to codec decode and point the critical-path diagnosis
+                // the wrong way. They get their own accumulator instead.
+                let t0 = Instant::now();
+                let mut shards = Vec::with_capacity(group_indices.len());
 
                 for &shard_idx in &group_indices {
                     let Some(entry) = shard_catalog_indices
@@ -353,19 +372,23 @@ pub async fn io_stage(
                 if profile {
                     let total_rows: u32 = shards.iter().map(|s| s.n_rows).sum();
                     eprintln!(
-                    "[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows)",
+                    "[scx-loader profile] io_stage group {group_num}: {:?} ({} shards, {} rows, \
+                     advise {:?})",
                     decode_elapsed,
                     shards.len(),
-                    total_rows
+                    total_rows,
+                    advise_elapsed,
                 );
                 }
 
-                Ok((ShardGroup { shards }, decode_elapsed))
-            })
-            .await
-            .map_err(|e| LoaderError::ShutdownError(format!("I/O stage task panicked: {e}")))??;
-        let (group, decode_elapsed) = group;
+                Ok((ShardGroup { shards }, decode_elapsed, advise_elapsed))
+            },
+        )
+        .await
+        .map_err(|e| LoaderError::ShutdownError(format!("I/O stage task panicked: {e}")))??;
+        let (group, decode_elapsed, advise_elapsed) = group;
         total_decode_us += decode_elapsed.as_micros();
+        total_advise_us += advise_elapsed.as_micros();
 
         // Send the group via bounded channel (blocks if full = back-pressure).
         let t_send = Instant::now();
@@ -382,7 +405,8 @@ pub async fn io_stage(
     if profile {
         eprintln!(
             "[scx-loader profile] io_stage total: {:?} ({group_count} groups, \
-             decode_total={total_decode_us}µs, send_wait_total={total_send_wait_us}µs)",
+             decode_total={total_decode_us}µs, send_wait_total={total_send_wait_us}µs, \
+             advise_total={total_advise_us}µs)",
             io_start.elapsed()
         );
     }
@@ -687,11 +711,10 @@ mod tests {
     #[test]
     fn reconstruct_deletion_map_single_modality_identity() {
         // Two shards: [0,5) and [5,10). Delete global rows 1 and 3.
-        let global_row_starts = [Some(0u64), Some(5u64)];
         let ranges = [Some((0u64, 5u64)), Some((5u64, 10u64))];
         let dv = dv_global(&[1, 3]);
 
-        let map = reconstruct_deletion_map(&dv, &global_row_starts, &ranges);
+        let map = reconstruct_deletion_map(&dv, &ranges);
         assert_eq!(map.len(), 1);
         let bm = map.get(&0).unwrap();
         assert_eq!(bm.iter().collect::<Vec<_>>(), vec![1, 3]);
@@ -704,12 +727,11 @@ mod tests {
     fn reconstruct_deletion_map_cross_modality() {
         // Global deletes apply to every modality (v2 stores global obs rows).
         // Deleted global cells 1, 3, 5 must land in modality-B's shards too.
-        let global_row_starts = [Some(0u64), Some(0u64), Some(5u64), Some(5u64)];
         let dv = dv_global(&[1, 3, 5]);
 
         // Target = modality B's shards: positions 0=[0,5), 1=[5,10).
         let target_b = [Some((0u64, 5u64)), Some((5u64, 10u64))];
-        let map = reconstruct_deletion_map(&dv, &global_row_starts, &target_b);
+        let map = reconstruct_deletion_map(&dv, &target_b);
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(&0).unwrap().iter().collect::<Vec<_>>(), vec![1, 3]);
         assert_eq!(map.get(&1).unwrap().iter().collect::<Vec<_>>(), vec![0]); // cell 5 → local 0
@@ -719,12 +741,11 @@ mod tests {
     /// panicking.
     #[test]
     fn reconstruct_deletion_map_skips_out_of_range() {
-        let global_row_starts = [Some(0u64), Some(5u64)];
         let ranges = [Some((0u64, 5u64)), Some((5u64, 10u64))];
         // Global row 2 is in range; 99 is beyond all target ranges → dropped.
         let dv = dv_global(&[2, 99]);
 
-        let map = reconstruct_deletion_map(&dv, &global_row_starts, &ranges);
+        let map = reconstruct_deletion_map(&dv, &ranges);
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&0).unwrap().iter().collect::<Vec<_>>(), vec![2]);
     }
@@ -733,11 +754,10 @@ mod tests {
     /// count, so io_stage's `bm.len() >= n_rows` skip still fires.
     #[test]
     fn reconstruct_deletion_map_full_shard() {
-        let global_row_starts = [Some(0u64)];
         let ranges = [Some((0u64, 5u64))];
         let dv = dv_global(&[0, 1, 2, 3, 4]);
 
-        let map = reconstruct_deletion_map(&dv, &global_row_starts, &ranges);
+        let map = reconstruct_deletion_map(&dv, &ranges);
         assert_eq!(map.get(&0).unwrap().len(), 5);
     }
 
@@ -784,23 +804,31 @@ mod tests {
         // of whose shard indices missed the catalog leaves behind.
         let ranges = [(0usize, 10usize), (10, 30), (30, 30), (40, 50)];
 
+        // The `Some`s, in order — what the caller iterates.
+        let issued = |group: usize| -> Vec<(usize, usize)> {
+            advise_ranges_for_group(&ranges, group)
+                .into_iter()
+                .flatten()
+                .collect()
+        };
+
         assert_eq!(
-            advise_ranges_for_group(&ranges, 0),
+            issued(0),
             vec![(10, 20), (0, 10)],
             "groups 1 and 2 ahead (2 is empty, dropped), then group 0 LAST"
         );
         assert_eq!(
-            advise_ranges_for_group(&ranges, 1),
+            issued(1),
             vec![(40, 10), (10, 20)],
             "group 2 is empty; group 3 still hinted; current group last"
         );
         assert_eq!(
-            advise_ranges_for_group(&ranges, 2),
+            issued(2),
             vec![(40, 10)],
             "no group 4/5 to look ahead to, and the current group is empty"
         );
         assert_eq!(
-            advise_ranges_for_group(&ranges, 3),
+            issued(3),
             vec![(40, 10)],
             "the last group hints only itself"
         );
@@ -808,7 +836,11 @@ mod tests {
             PREFETCH_LOOKAHEAD, 2,
             "the window the assertions above are written against"
         );
-        assert!(advise_ranges_for_group(&[], 0).is_empty());
+        assert!(advise_ranges_for_group(&[], 0)
+            .into_iter()
+            .flatten()
+            .next()
+            .is_none());
     }
 
     #[test]

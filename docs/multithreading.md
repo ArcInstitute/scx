@@ -177,17 +177,23 @@ below says the reactor thread makes no blocking syscall. Which groups get
 hinted, in what order, is
 `io_stage::advise_ranges_for_group` — split out as a pure function because a
 hint has no in-process observable effect, so the window and the ordering are
-the only parts a test can pin.
+the only parts a test can pin. Under `SCX_LOADER_PROFILE` the hints are timed
+into their own `advise_total`, deliberately **outside** `decode_total`: they
+block, so folding them into the decode window would attribute prefetch latency
+to codec decode and point the critical-path diagnosis the wrong way.
 
 The shard indices the shuffler produces are **positions in the selected
-modality's CSR shard list**, resolved through `FullCatalog::csr_shard_indices`
-— one call, derived once per epoch and shared with the per-group blocking
-closures as catalog positions (a `&FullCatalogEntry` borrows the reader and
-cannot cross a `'static` closure). `start_epoch` builds its shuffle keys from
-the same call and checks the length against the shard count the shuffler was
-built for, because `shuffle_epoch_sorted` reads keys with
-`sort_keys.get(idx).unwrap_or(u64::MAX)` and a disagreement would otherwise
-degrade the ordering silently.
+modality's CSR shard list**, and the ordering rule is one primitive —
+`FullCatalog::csr_shard_indices`, which the two entry-returning accessors are
+also expressed in terms of. Each of the two stages that needs the list derives
+it once per epoch (`start_epoch` for the shuffle keys, `io_stage` for the
+per-group reads); `io_stage` shares its copy with the blocking closures as
+catalog **positions**, because a `&FullCatalogEntry` borrows the reader and
+cannot cross a `'static` closure. `ShardShuffler::shuffle_epoch_sorted` rejects
+a key list whose length disagrees with the shard count it was built for: it used
+to read keys with `sort_keys.get(idx).unwrap_or(u64::MAX)`, so a caller whose
+keys came from a different shard list got a silently degraded ordering rather
+than an error.
 
 ### Stage 2: Decode (std::thread + per-pipeline rayon pool)
 

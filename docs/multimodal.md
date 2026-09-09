@@ -172,7 +172,7 @@ ds = pyscx.MultimodalTrainingDataset(
 for batch in ds:
     rna_x = batch["X"]["rna"]       # numpy [batch_size × n_vars_rna]
     adt_x = batch["X"]["adt"]       # numpy [batch_size × n_vars_adt]
-    cells = batch["cell_indices"]   # int64, aligned across modalities
+    cells = batch["cell_indices"]   # uint64, aligned across modalities
     # Forward pass on (rna_x, adt_x) — e.g. totalVI / multivi.
     ...
 ```

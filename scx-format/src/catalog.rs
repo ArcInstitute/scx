@@ -843,7 +843,10 @@ impl FullCatalog {
     /// Return CSR shards belonging to a given modality, sorted by
     /// `row_start`.
     pub fn csr_shards_for_modality(&self, modality_id: u8) -> Vec<&FullCatalogEntry> {
-        self.entries_at(self.csr_shard_indices(Some(modality_id)))
+        self.csr_shard_indices(Some(modality_id))
+            .into_iter()
+            .map(|i| &self.entries[i])
+            .collect()
     }
 
     /// Whether the CSR shards of `modality_id` form disjoint
@@ -978,7 +981,10 @@ impl FullCatalog {
     /// [`Self::has_overlapping_csr_ranges`] to `debug_assert!` a clean single
     /// tiling where one is required.
     pub fn csr_shards_sorted(&self) -> Vec<&FullCatalogEntry> {
-        self.entries_at(self.csr_shard_indices(None))
+        self.csr_shard_indices(None)
+            .into_iter()
+            .map(|i| &self.entries[i])
+            .collect()
     }
 
     /// Catalog **positions** of the CSR shards [`Self::csr_shards_sorted`]
@@ -1018,12 +1024,6 @@ impl FullCatalog {
                 .map_or(u64::MAX, |s| s.major_start(SectionType::CsrShard))
         });
         shards
-    }
-
-    /// Resolve catalog positions to entries, preserving order. Companion to
-    /// [`Self::csr_shard_indices`] for the callers that want references.
-    fn entries_at(&self, indices: Vec<usize>) -> Vec<&FullCatalogEntry> {
-        indices.into_iter().map(|i| &self.entries[i]).collect()
     }
 
     /// Whether the flattened [`Self::csr_shards_sorted`] list contains
