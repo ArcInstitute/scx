@@ -78,6 +78,100 @@ fn encode_f32_uint32_preserves_decoded_u32_max() {
     assert!(ValueEncoding::Uint32.encode_f32_batch(&[f32::NAN]).is_err());
 }
 
+/// Every value the batch path writes must be the byte the per-value path would
+/// have written, for every encoding — the batch is a speed change and nothing
+/// else. The slice deliberately carries each encoding's edge values (`0`, the
+/// inclusive upper bound, the largest exact f32 below it) plus a fractional and
+/// a subnormal, because a width-specialised cast is where a truncation-vs-round
+/// or a saturation difference would show up.
+#[test]
+fn encode_f32_into_is_byte_identical_to_the_per_value_path() {
+    let cases: &[(ValueEncoding, &[f32])] = &[
+        (
+            ValueEncoding::Uint8,
+            &[0.0, 1.0, 7.9, 254.0, 255.0, f32::MIN_POSITIVE],
+        ),
+        (
+            ValueEncoding::Uint16,
+            &[0.0, 1.0, 255.5, 65534.0, 65535.0, f32::MIN_POSITIVE],
+        ),
+        (
+            ValueEncoding::Uint32,
+            // 2³² is the inclusive bound (a decoded on-disk `u32::MAX`), and
+            // 2³² - 2⁸ is the largest exact f32 below it.
+            &[0.0, 1.0, 4_294_967_040.0, (1u64 << 32) as f32],
+        ),
+        (
+            ValueEncoding::Float32,
+            &[0.0, -1.5, 3.25, f32::MIN_POSITIVE, f32::MAX, f32::NAN],
+        ),
+        (
+            // f16 saturates to inf above 65504 by design, and that is part of
+            // the contract the batch path must reproduce rather than reject.
+            ValueEncoding::Float16,
+            &[0.0, -1.5, 3.25, 65504.0, 70000.0, f32::NAN],
+        ),
+    ];
+    for &(enc, data) in cases {
+        let mut want = Vec::new();
+        for &v in data {
+            enc.encode_f32(&mut want, v)
+                .unwrap_or_else(|e| panic!("{enc:?} rejected {v} on the per-value path: {e}"));
+        }
+        let got = enc.encode_f32_batch(data).unwrap();
+        assert_eq!(got, want, "{enc:?} batch bytes differ from per-value bytes");
+        assert_eq!(
+            got.len(),
+            data.len() * enc.byte_width(),
+            "{enc:?} wrote the wrong number of bytes"
+        );
+
+        // Appending into a non-empty buffer must not disturb what is already
+        // there: this is how the rewrite ops accumulate a shard, row by row.
+        let mut acc = vec![0xAAu8; 3];
+        enc.encode_f32_into(&mut acc, data).unwrap();
+        assert_eq!(&acc[..3], &[0xAA; 3], "{enc:?} clobbered the prefix");
+        assert_eq!(&acc[3..], &want[..], "{enc:?} appended the wrong bytes");
+    }
+}
+
+/// An out-of-range value anywhere in the slice must be reported, and must leave
+/// the caller's buffer exactly as it was found. Position matters: the fast path
+/// tests the whole slice before writing anything, so a bug that wrote the good
+/// prefix first would only show up with the bad value in the middle or at the
+/// end.
+#[test]
+fn encode_f32_into_rejects_out_of_range_and_leaves_the_buffer_untouched() {
+    let bad: &[(ValueEncoding, f32)] = &[
+        (ValueEncoding::Uint8, 256.0),
+        (ValueEncoding::Uint8, -1.0),
+        (ValueEncoding::Uint8, f32::NAN),
+        (ValueEncoding::Uint16, 65536.0),
+        (ValueEncoding::Uint16, f32::NAN),
+        (ValueEncoding::Uint32, 8_589_934_592.0),
+        (ValueEncoding::Uint32, f32::NAN),
+    ];
+    for &(enc, offender) in bad {
+        for pos in 0..3 {
+            let mut data = vec![1.0f32, 2.0, 3.0];
+            data[pos] = offender;
+            let mut acc = vec![0x5Au8; 5];
+            let err = enc
+                .encode_f32_into(&mut acc, &data)
+                .expect_err(&format!("{enc:?} accepted {offender} at index {pos}"));
+            assert!(
+                format!("{err}").contains("out of range"),
+                "{enc:?} error does not name the problem: {err}"
+            );
+            assert_eq!(
+                acc,
+                vec![0x5Au8; 5],
+                "{enc:?} left bytes in the buffer after rejecting {offender} at index {pos}"
+            );
+        }
+    }
+}
+
 /// Build a small CSR matrix for testing.
 /// 3 rows, varying nnz:
 ///   row 0: cols [1, 3]       vals [5, 10]

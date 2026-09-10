@@ -88,6 +88,15 @@ pub enum CodecSelection {
     Explicit(CodecId),
 }
 
+/// The upper bound `Uint32` accepts, **inclusive at 2³²**.
+///
+/// Declared once because two things must agree on it: the per-value range check
+/// in [`ValueEncoding::encode_f32`] and the slice-wide one in
+/// [`ValueEncoding::encode_f32_into`]. The reason it is 2³² rather than
+/// `u32::MAX` is on `encode_f32`'s `Uint32` arm and is load-bearing — do not
+/// tighten it here without reading that comment.
+const UINT32_BOUND_F32: f32 = (1u128 << 32) as f32;
+
 /// Value encoding for the data array in a CSR shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueEncoding {
@@ -224,8 +233,7 @@ impl ValueEncoding {
                 //
                 // `contains` (not `<=`) so NaN is rejected rather than written
                 // as 0.
-                const UINT32_BOUND: f32 = (1u128 << 32) as f32;
-                if !(0.0..=UINT32_BOUND).contains(&value) {
+                if !(0.0..=UINT32_BOUND_F32).contains(&value) {
                     return Err(CodecError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("value {value} out of range for uint32"),
@@ -246,10 +254,94 @@ impl ValueEncoding {
     /// This is the inverse of `values_raw_to_f32`.
     pub fn encode_f32_batch(&self, data: &[f32]) -> Result<Vec<u8>, CodecError> {
         let mut bytes = Vec::with_capacity(data.len() * self.byte_width());
-        for &v in data {
-            self.encode_f32(&mut bytes, v)?;
-        }
+        self.encode_f32_into(&mut bytes, data)?;
         Ok(bytes)
+    }
+
+    /// [`Self::encode_f32_batch`] appending into a caller-owned buffer.
+    ///
+    /// Exists for the rewrite ops' per-shard accumulators, which append row by
+    /// row into one buffer and must not allocate per row, and it is where the
+    /// work actually happens — `encode_f32_batch` is a thin wrapper.
+    ///
+    /// **Why this is not a loop over [`Self::encode_f32`].** It was, and that
+    /// showed up: measured on `scx optimize` at census_1m,
+    /// `encode_f32`/`encode_f32_batch` accounted for **3.96 % of all cycles** —
+    /// and because they run on the serial critical path (every writer converts
+    /// values on the calling thread), that is roughly **10 % of the op's wall**,
+    /// against a parallel encode that PR-42 already spread across the pool. The
+    /// per-value shape costs a `match` on the encoding, a scalar range test and
+    /// a capacity check for every nonzero. Here the `match` is hoisted, the
+    /// range test is one pass a compiler can vectorise, and the capacity is
+    /// reserved once.
+    ///
+    /// Measured (`cargo bench -p scx-codec -- value_encode`, 100K values,
+    /// per-value -> batch): `Uint8` 314 -> 152 us (**2.07x**), `Uint16` 285 ->
+    /// 159 us (**1.79x**), `Uint32` 336 -> 197 us (**1.71x**), `Float32` 257 ->
+    /// 9.2 us (**27.8x** — little-endian f32 is an identity transform and
+    /// `extend` turns it into a bulk copy). The integer widths land well short
+    /// of the 5-10x the OPT plan projected; the residual is the saturating
+    /// float-to-int cast, costed in the comment on the write below.
+    ///
+    /// **`encode_f32` stays the single owner of the error.** A slice holding an
+    /// out-of-range value — or a NaN, which `contains` rejects rather than
+    /// letting `as uN` write a silent `0` — falls back to the per-value loop, so
+    /// the message still names the offending value and the bytes are identical
+    /// either way. `buf` is left exactly as it was found when that happens: the
+    /// caller's accumulator must not gain half a row's values behind an `Err`.
+    pub fn encode_f32_into(&self, buf: &mut Vec<u8>, data: &[f32]) -> Result<(), CodecError> {
+        // The bounds here MUST match `encode_f32`'s arm for arm; the fallback
+        // below is what makes a divergence merely slow rather than wrong, but a
+        // *looser* bound here would encode a value `encode_f32` rejects, which
+        // the fallback cannot catch. `Uint32`'s bound is shared as a constant
+        // for exactly that reason.
+        let in_range = match self {
+            Self::Uint8 => data.iter().all(|v| (0.0..=255.0).contains(v)),
+            Self::Uint16 => data.iter().all(|v| (0.0..=65535.0).contains(v)),
+            Self::Uint32 => data.iter().all(|v| (0.0..=UINT32_BOUND_F32).contains(v)),
+            // Every f32 is representable as itself, and `f16::from_f32`
+            // saturates to +/-inf by design rather than failing.
+            Self::Float32 | Self::Float16 => true,
+        };
+        let start = buf.len();
+        if !in_range {
+            for &v in data {
+                if let Err(e) = self.encode_f32(buf, v) {
+                    buf.truncate(start);
+                    return Err(e);
+                }
+            }
+            return Ok(());
+        }
+        buf.reserve(data.len() * self.byte_width());
+        // The remaining cost is the saturating `as` cast, not the write. Two
+        // alternatives were measured and rejected, at 100K values:
+        //   * writing through a `resize`d slice instead of `extend`: noise on
+        //     the integer widths (u8 152.8 -> 151.5 us) and **89 % worse** on
+        //     `Float32` (9.3 -> 17.7 us), because the `resize` memset costs
+        //     more than the bulk copy `extend` gets for an identity transform.
+        //   * `f32::to_int_unchecked` after the range pass: u8 152.8 -> 98.8 us
+        //     (a further 1.55x, 4.05x against the per-value path). Declined.
+        //     It buys ~0.8 s of a 33 s census_1m compact — ~2.4 % — in exchange
+        //     for an `unsafe` whose precondition lives twenty lines up in
+        //     another statement: any later edit that reorders, short-circuits or
+        //     loosens `in_range` turns a rejected value into UB, and the value
+        //     it turns into garbage is NaN, which is precisely what that pass
+        //     exists to catch. Revisit only with the check fused into the loop.
+        match self {
+            Self::Uint8 => buf.extend(data.iter().map(|&v| v as u8)),
+            Self::Uint16 => buf.extend(data.iter().flat_map(|&v| (v as u16).to_le_bytes())),
+            // Saturating `as` is the documented behaviour for a decoded
+            // `u32::MAX` (an f32 of exactly 2³²) and is why the bound above is
+            // inclusive. See `encode_f32`'s `Uint32` arm.
+            Self::Uint32 => buf.extend(data.iter().flat_map(|&v| (v as u32).to_le_bytes())),
+            Self::Float32 => buf.extend(data.iter().flat_map(|&v| v.to_le_bytes())),
+            Self::Float16 => buf.extend(
+                data.iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes()),
+            ),
+        }
+        Ok(())
     }
 }
 

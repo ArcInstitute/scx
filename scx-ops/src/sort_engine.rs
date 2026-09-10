@@ -95,7 +95,7 @@ use scx_format_io::{
 
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
-use crate::helpers::encode_value;
+use crate::helpers::encode_values;
 use crate::sort::{
     cap_spill_partitions, partition_target_rows, rebuild_obs_predicate_index_streaming,
     sort_provenance_entry, stable_argsort, SortKeyExtractor, SortOptions, SortStrategy,
@@ -1542,10 +1542,24 @@ impl CsrEmitter {
                 self.break_cursor += 1;
             }
         }
-        for (k, &col) in indices.iter().enumerate() {
-            self.acc_indices.push(col as u32);
-            encode_value(&mut self.acc_values, data[k], self.value_encoding)?;
-        }
+        // Every caller passes a CSR row's two parallel arrays, so these agree.
+        // Worth stating: the per-nonzero loop this replaced indexed `data[k]`
+        // from an `indices` walk, which would have panicked on a short `data`
+        // and ignored a long one. The batch call encodes all of `data`, so a
+        // future caller with mismatched lengths would write a shard whose
+        // values and indices disagree -- silently, without this.
+        debug_assert_eq!(
+            indices.len(),
+            data.len(),
+            "push_row needs one value per index (CSR row invariant)"
+        );
+        // One call per row, not per nonzero -- see `helpers::encode_values`.
+        // The accumulator's byte layout is unchanged, which matters here beyond
+        // speed: `block_cut_bytes_per_nnz` prices these exact bytes, and
+        // `emit_x_in_memory_grouped_fast` reproduces this loop's cut points.
+        self.acc_indices
+            .extend(indices.iter().map(|&col| col as u32));
+        encode_values(&mut self.acc_values, data, self.value_encoding)?;
         let prev = *self.acc_indptr.last().unwrap();
         self.acc_indptr.push(prev + indices.len() as u64);
         self.acc_row_count += 1;

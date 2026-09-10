@@ -204,6 +204,76 @@ fn bench_rice_encode(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// OPT-OPS-6 before/after: per-value `encode_f32` vs width-specialised
+// `encode_f32_into`.
+//
+// Measured on the real thing before this existed: `scx compact --codec auto` at
+// census_1m spent 5.08 % of all cycles in `scx_ops::helpers::encode_value`, and
+// `scx optimize` 3.96 % in `encode_f32`/`encode_f32_batch`. Both run on the
+// calling thread while the encode runs on the rayon pool, so against a 38 %
+// serial budget those are ~16 % and ~10 % of their op's wall respectively --
+// the largest serial term left after PR-42 parallelised the encode itself.
+//
+// Mirrors `bench_bitwriter_encode`: the two paths are asserted byte-identical
+// here, so the arm cannot report a speedup for output that drifted.
+//
+// At 100K values: u8 2.07x, u16 1.79x, u32 1.71x, f32 27.8x. The integer widths
+// are limited by the saturating float-to-int cast rather than by the write —
+// two faster shapes were measured and rejected on `encode_f32_into`.
+// ---------------------------------------------------------------------------
+
+fn bench_value_encode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("value_encode");
+    // Count-like values, all in range for every encoding under test, since the
+    // fast path's whole point is the in-range case. Uint8 and Uint32 bracket
+    // the width ladder; Float32 is the memcpy-shaped one.
+    for &(n, label) in &[(100_000usize, "100K"), (1_000_000, "1M")] {
+        let mut state: u64 = 0x5EED_1234_ABCD_9876;
+        let values: Vec<f32> = (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 200) as f32
+            })
+            .collect();
+        for enc in [
+            ValueEncoding::Uint8,
+            ValueEncoding::Uint16,
+            ValueEncoding::Uint32,
+            ValueEncoding::Float32,
+        ] {
+            // Sanity: the two paths must agree byte-for-byte.
+            let mut per_value = Vec::new();
+            for &v in &values {
+                enc.encode_f32(&mut per_value, v).unwrap();
+            }
+            assert_eq!(
+                per_value,
+                enc.encode_f32_batch(&values).unwrap(),
+                "per-value and batch value encode diverged for {enc:?}"
+            );
+
+            group.throughput(Throughput::Elements(n as u64));
+            let name = format!("{}_{label}", enc.numpy_name());
+            group.bench_with_input(BenchmarkId::new("per_value", &name), &values, |b, v| {
+                b.iter(|| {
+                    let mut out = Vec::with_capacity(v.len() * enc.byte_width());
+                    for &x in black_box(v) {
+                        enc.encode_f32(&mut out, x).unwrap();
+                    }
+                    black_box(out)
+                })
+            });
+            group.bench_with_input(BenchmarkId::new("batch", &name), &values, |b, v| {
+                b.iter(|| black_box(enc.encode_f32_batch(black_box(v)).unwrap()))
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_encode_shard(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_shard");
     for &(n_rows, avg_nnz, label) in &[(2048, 500, "2048r_500nnz"), (16384, 2000, "16384r_2000nnz")]
@@ -600,6 +670,7 @@ criterion_group!(
     bench_shufdelta_decode_stages,
     bench_bitwriter_encode,
     bench_rice_encode,
-    bench_encode_shard
+    bench_encode_shard,
+    bench_value_encode
 );
 criterion_main!(benches);
