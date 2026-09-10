@@ -31,7 +31,7 @@ use scx_format_io::ScxReader;
 
 use crate::append::unify_dict_columns;
 use crate::error::{OpsError, Result};
-use crate::helpers::{encode_value, widest_value_encoding};
+use crate::helpers::{encode_values, widest_value_encoding};
 
 /// True if any input carries an obsm (obs-axis dense mapping) section.
 /// Sorted merge does not yet reorder obsm — the caller errors when this is
@@ -371,9 +371,7 @@ fn emit_x_like(
             done += take;
             if rows_in_shard == target {
                 let mut bytes = Vec::new();
-                for &v in &data {
-                    encode_value(&mut bytes, v, value_encoding)?;
-                }
+                encode_values(&mut bytes, &data, value_encoding)?;
                 cumulative += write_shard(&indptr, &indices, &bytes, value_encoding, cumulative)?;
                 indptr = vec![0];
                 indices.clear();
@@ -385,9 +383,7 @@ fn emit_x_like(
     }
     if rows_in_shard > 0 {
         let mut bytes = Vec::new();
-        for &v in &data {
-            encode_value(&mut bytes, v, value_encoding)?;
-        }
+        encode_values(&mut bytes, &data, value_encoding)?;
         write_shard(&indptr, &indices, &bytes, value_encoding, cumulative)?;
     }
     Ok(())

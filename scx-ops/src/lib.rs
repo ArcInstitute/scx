@@ -10,6 +10,7 @@ pub mod checksum;
 pub mod codec_intent;
 pub mod compact;
 pub mod delete;
+mod encode_budget;
 pub mod error;
 pub mod external_layer;
 pub mod external_obs;
@@ -67,7 +68,7 @@ pub use merge_options::{MergeOptions, UnsPolicy};
 pub use modify_metadata::{
     modify_metadata, set_uns, update_uns, MetadataPatch, ModifyMetadataSummary,
 };
-pub use optimize::{optimize, optimize_with_framing, OptimizeStats};
+pub use optimize::{optimize, optimize_with_budget, optimize_with_framing, OptimizeStats};
 pub use predicate_index::{ObsVarIndexPass, PredicateIndexBuildSummary, StatsSink};
 pub use rebuild_csc::{framing_for_csc_rebuild, rebuild_csc_inplace};
 pub use rewrite_helpers::{

@@ -573,10 +573,102 @@ The two levels nest rather than conflict. `scx-convert`'s ingest coordinator
 already encodes each shard on a rayon worker, so on a threaded convert the pool
 is saturated across shards and the intra-shard fan-out is work-stealing that
 re-partitions the same work. Where it pays is the paths that encode one shard at
-a time on the calling thread: every `scx-ops` rewrite (`compact`, `merge`,
-`optimize`, `build-csc`, `append`, the external-layer attach), the sequential
-convert coordinator (taken when libhdf5 is not thread-safe), and any write whose
-shard count is below the thread count.
+a time on the calling thread: most `scx-ops` rewrites (`compact`, `merge`,
+`build-csc`, `append`, the external-layer attach), the sequential convert
+coordinator (taken when libhdf5 is not thread-safe), and any write whose shard
+count is below the thread count.
+
+### Across shards, in a rewrite op (`scx optimize`)
+
+Intra-shard parallelism has a ceiling, and it is reachable. Measured on
+census_1m with 16 cores, `scx optimize --codec auto` ran 87.0 s at one thread,
+43.7 s at eight and 42.4 s at sixteen — a 2.05x speedup that is **flat past
+eight cores**, leaving ~45 % of the wall on the serial path: the source-shard
+decode, the canonicalization, the value conversion and the write. `scx compact`
+has the same shape (79.4 / 35.4 / 33.4 s, 2.38x).
+
+`optimize` therefore re-encodes in bounded parallel chunks: each catalog entry's
+whole body — read, canonicalize, encode — runs on the pool, because it is a pure
+function of that entry and `ScxReader` is shareable (mmap plus an
+`Arc<FullCatalog>`). **The writer stays serial** and is fed in chunk order, and
+that is a correctness requirement rather than a simplification: a section's file
+offset, its position in the catalog, and `first_csr_codec` (first CSR write
+wins, and `finish()` stamps it as the file header's codec) are all decided by
+call order. Parallel encode is safe; parallel write is not.
+
+Chunk width is bounded in **bytes, not threads**. Encoding N shards at once
+costs N times one shard's live phase, so "fill the pool" would make an op's peak
+RSS scale with the host's core count: a census_1m shard carries ~8.2M nonzeros,
+priced at ~394 MB, so sixteen in flight would add ~6.3 GB to an op whose serial
+peak was ~3.3 GB. The default allowance is 1 GiB
+(`scx-ops/src/encode_budget.rs`), so files with small shards still fill the pool
+while the default peak increase stays a constant. `scx optimize
+--memory-budget` raises it, trading peak RSS for concurrency; a budget below one
+shard's phase still encodes one shard at a time, since a single shard's encode is
+irreducible.
+
+Output is byte-identical at every chunk width and thread count — the twelve-arm
+`op_output_identity` golden passes unchanged at `RAYON_NUM_THREADS` 1, 2 and 12,
+and `optimize_honours_an_explicit_codec_at_every_concurrency` sweeps the budget
+from one shard per chunk to all of them and compares both the shard contents and
+the catalog's own entry order (reading through `csr_shards_sorted` re-sorts by
+`row_start` and would hide a mis-ordered write entirely).
+
+#### Measured
+
+> [!NOTE]
+> These are **not** manifest-backed captures, and they are here rather than in
+> [performance.md](performance.md) for that reason. Producing them needs one
+> release binary per commit — a two-worktree A/B — which is not a shape the
+> comprehensive harness (`benchmark × format × dataset`) can take, so
+> [benchmark_manifest.md](benchmark_manifest.md)'s tier-1 rule cannot be
+> satisfied for them and its tier-2 microbenchmark disclosure is meant for
+> kernel measurements. They document the architecture above. The
+> `fragment_ops` `wall_s__optimize` / `peak_rss_mb__optimize` arm is
+> **instrumentation, not a gate**: no threshold in `thresholds.yaml` references
+> either key yet, so nothing fails on a regression there until one does. Gate
+> activation is deferred to the next baseline recapture.
+>
+> Provenance: `scx` CLI, `cpu_batch` with 16 dedicated cores, medians of 3
+> runs, 2026-09-10. Two release worktrees, so **three columns over two
+> binaries**: `base` is `441e7ae8`; the "batch value encode only" and
+> "`--memory-budget 8G`" columns are both `0e8db037` and differ only by the
+> flag, since at that commit `optimize`'s default in-flight allowance admits
+> about two census_1m shards.
+> census_1m is 2.8 GB / 245 shards.
+
+| op | dataset | base | batch value encode only | + `--memory-budget 8G` |
+|---|---|---:|---:|---:|
+| `compact --codec auto` | census_1m | 33.42s | **31.23s** (−6.6%) | n/a |
+| `compact --codec auto` | smartseq2 | 4.39s | **4.06s** (−7.5%) | n/a |
+| `optimize --codec auto` | census_1m | 41.64s | 40.37s (−3.0%) | **15.90s (2.54x)** |
+| `optimize --codec auto` | smartseq2 | 5.28s | 5.05s (−4.5%) | **2.47s (2.04x)** |
+
+Peak RSS, same runs:
+
+| op | dataset | base | default | `--memory-budget 8G` |
+|---|---|---:|---:|---:|
+| `compact` | census_1m | 3528 MB | 3532 MB (+0.1%) | n/a |
+| `optimize` | census_1m | 3354 MB | 3306 MB (−1.4%) | 5845 MB (**+77%**) |
+| `optimize` | smartseq2 | 1969 MB | 1975 MB (+0.3%) | 3694 MB (**+87%**) |
+
+Reading those two tables together is the point:
+
+- **Batching the value encode is free** — 6.6–7.5% off compact at no memory
+  cost, and it lands on every writer, because `values_to_raw_bytes` is a wrapper
+  over the same function. In isolation the batch is 1.7–2.1x on integer widths
+  and 27.8x on `Float32` (`cargo bench -p scx-codec -- value_encode`, same
+  machine and date); the op-level figure is that applied to a term worth ~16% of
+  wall.
+- **Encoding several shards at once is a wall-for-peak trade**, not a free win:
+  2.0–2.5x for +77–87% peak RSS.
+- **The default is conservative on purpose**, and it shows: a census_1m shard
+  prices at ~394 MB, so 1 GiB admits two of them and captures 3–4.5% of the
+  available 2.5x. Deep-shard files need `--memory-budget` to buy the rest.
+- **Bytes do not move.** Cross-arm per-section digests were identical on both
+  datasets (125 sections on census_1m compact, 129 on optimize), and census_1m
+  optimize at the default and at 8 GiB produced identical bytes — a different
+  concurrency is not a different file.
 
 ## GPU parallelism
 

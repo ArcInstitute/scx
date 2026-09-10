@@ -1181,7 +1181,11 @@ def mark_deleted(path: str, cell_indices: Sequence[int]) -> int:
 
 
 def optimize(
-    input: str, output: str, codec: str = ..., shard_obs: str = ...
+    input: str,
+    output: str,
+    codec: str = ...,
+    shard_obs: str = ...,
+    memory_budget: int | str | None = ...,
 ) -> None: ...
 
 

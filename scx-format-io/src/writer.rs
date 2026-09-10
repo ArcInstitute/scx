@@ -1006,6 +1006,58 @@ impl ScxWriter {
         self.framing
     }
 
+    /// The minor-axis extent this writer stamps on a shard of `section_type`.
+    ///
+    /// `write_shard_inner` derives the per-shard index width from this, and had
+    /// this same three-arm match written out three
+    /// times — for the index dtype, for the shard header's `n_minor`, and for
+    /// the stats' minor extent.
+    ///
+    /// * `RawCsrShard` is row-major but has its **own** column axis
+    ///   (`raw_n_vars`), independent of `header.n_vars`.
+    /// * Any column-major shard — `CscShard` **and** `LayerCscShard`; matching
+    ///   only the former once wrote a layer sidecar's stats on the row axis
+    ///   while the readers looked on the column axis — has `n_obs` as its minor
+    ///   axis.
+    /// * Everything else is row-major with a **per-modality** column count:
+    ///   inside a [`Self::with_modality`] scope that modality's `n_vars`, not
+    ///   the file-wide max, or every shard in a multi-modality file gets
+    ///   stamped with the max and column-range pruning breaks.
+    ///
+    /// **Known wrong for `ObspCsrShard`, and preserved as-is.** An obsp graph
+    /// is obs×obs, so its minor axis is `n_obs`, but it falls into the last arm
+    /// and gets `n_vars`. Two consequences, both already recorded at
+    /// `scx-cli/src/upgrade.rs`'s
+    /// `upgrade_reencodes_aux_csr_without_reshaping_or_renaming_it`: the
+    /// stamped extent can declare a matrix too narrow to hold its own data, and
+    /// where `n_vars <= u16::MAX < n_obs` the write fails outright with "index
+    /// N exceeds u16 range" — so a CSR-backed obsp cannot be written at all
+    /// through [`Self::write_obsp_shard`] on a file with more than ~65k cells
+    /// and an ordinary gene axis. `upgrade` works around it by going through
+    /// `encode_one_shard` with an extent it computes itself, and `optimize`
+    /// reads `sh.n_minor` back from the source header rather than re-deriving
+    /// it. Extracting this function did not change that behaviour and
+    /// deliberately does not fix it: correcting the arm changes the `n_minor`
+    /// stamped on every newly written obsp shard, which is an on-disk change
+    /// needing its own decision about existing files. It is now at least stated
+    /// in one place instead of three.
+    fn shard_n_minor(&self, section_type: SectionType) -> u64 {
+        match section_type {
+            SectionType::RawCsrShard => self.raw_n_vars,
+            st if crate::shard::is_column_major(st) => self.header.n_obs,
+            _ => {
+                if self.current_modality_id > 0 {
+                    self.modalities
+                        .get((self.current_modality_id - 1) as usize)
+                        .map(|m| m.n_vars)
+                        .unwrap_or(self.header.n_vars)
+                } else {
+                    self.header.n_vars
+                }
+            }
+        }
+    }
+
     /// Write a CSC shard (column-major sparse matrix).
     ///
     /// Structurally identical to a CSR shard but uses `SectionType::CscShard (5)`.
@@ -1096,43 +1148,18 @@ impl ScxWriter {
         let n_major = (indptr.len() - 1) as u32;
         let nnz = *indptr.last().unwrap_or(&0);
 
-        // Resolve the unbound-minor extent for this shard. For CSC shards
-        // the minor axis is rows (file-wide `n_obs`, shared across
-        // modalities). For row-major shards (CSR / LayerCsr / ObspCsr)
-        // the minor axis is columns, which is per-modality: when
-        // `current_modality_id > 0` we MUST use that modality's `n_vars`
-        // rather than the file-wide max (`self.header.n_vars`), otherwise
-        // every shard in a multi-modality file gets stamped with the max
-        // and column-range pruning / bounds checks break.
-        let row_major_n_minor: u64 = if self.current_modality_id > 0 {
-            self.modalities
-                .get((self.current_modality_id - 1) as usize)
-                .map(|m| m.n_vars)
-                .unwrap_or(self.header.n_vars)
-        } else {
-            self.header.n_vars
-        };
-
-        // Decide indices encoding width per shard, based on the actual
-        // index-value bound for THIS shard layout. CSC stores row
-        // indices (bounded by `n_obs`); CSR / LayerCsr / ObspCsr store
-        // column indices (bounded by `row_major_n_minor`). The file-
-        // level `header.index_dtype` was set at file creation from
-        // `n_vars` (CSR-correct); using it unconditionally for CSC
-        // breaks files with n_obs > 65535 and n_vars ≤ 65535 (e.g.
-        // census_500k / census_1m). The per-shard `index_dtype` field
-        // in `ShardHeader` is the source of truth at read time
-        // (see `sh.index_dtype == 0` in the reader), so widening to
-        // u32 here on a CSC shard is read-correct even when the file
+        // One rule, one implementation: see `Self::shard_n_minor`, which this
+        // function used to spell out three separate times. The index width is
+        // derived from the extent right here rather than through a second
+        // accessor that would recompute it: `0` = u16 indices, `1` = u32. The
+        // file-level `header.index_dtype` is set at creation from `n_vars` and
+        // is CSR-correct, so using it for a CSC shard breaks files with
+        // `n_obs > 65535` and `n_vars <= 65535` (census_500k / census_1m); the
+        // per-shard field is what the reader trusts (`sh.index_dtype == 0`), so
+        // widening to u32 on a CSC shard is read-correct even when the file
         // header says u16.
-        let index_max_value: u64 = match section_type {
-            // Raw is row-major but has its OWN column axis (`raw_n_vars`),
-            // independent of `header.n_vars`.
-            SectionType::RawCsrShard => self.raw_n_vars.saturating_sub(1),
-            st if crate::shard::is_column_major(st) => self.header.n_obs.saturating_sub(1),
-            _ => row_major_n_minor.saturating_sub(1),
-        };
-        let index_dtype_u16 = index_max_value <= u16::MAX as u64;
+        let shard_n_minor = self.shard_n_minor(section_type);
+        let index_dtype_u16 = shard_n_minor.saturating_sub(1) <= u16::MAX as u64;
         let shard_index_dtype: u8 = if index_dtype_u16 { 0 } else { 1 };
 
         // Encode the shard data. When row-group framing is enabled on the writer
@@ -1213,19 +1240,10 @@ impl ScxWriter {
             reserved_flags: [0; 3],
             n_major,
             n_minor: {
-                // CSC shards have n_obs as their minor axis (and
-                // `row_major_n_minor` is unused for those); row-major
-                // shards use the per-modality column count resolved
-                // above so multimodal files stamp the correct extent.
-                let header_n_minor = match section_type {
-                    SectionType::RawCsrShard => self.raw_n_vars,
-                    st if crate::shard::is_column_major(st) => self.header.n_obs,
-                    _ => row_major_n_minor,
-                };
-                if header_n_minor > u32::MAX as u64 {
-                    return Err(ScxError::NVarsOverflow(header_n_minor));
+                if shard_n_minor > u32::MAX as u64 {
+                    return Err(ScxError::NVarsOverflow(shard_n_minor));
                 }
-                header_n_minor as u32
+                shard_n_minor as u32
             },
             nnz,
             global_offset: row_start,
@@ -1280,15 +1298,17 @@ impl ScxWriter {
         // `write_csc_shard`, which passes its `col_start` argument as
         // the inner `row_start`).
         //
-        // `is_column_major` rather than a bare `CscShard` arm, here and in
-        // the two dispatches above: `LayerCscShard` is a CSC sidecar too,
-        // and matching only `CscShard` wrote its stats on the row axis
-        // while the readers looked for them on the column axis.
-        let (major_kind, n_minor) = match section_type {
-            SectionType::RawCsrShard => (MajorAxis::Row, self.raw_n_vars),
-            st if crate::shard::is_column_major(st) => (MajorAxis::Col, self.header.n_obs),
-            _ => (MajorAxis::Row, row_major_n_minor),
+        // `is_column_major` rather than a bare `CscShard` arm: `LayerCscShard`
+        // is a CSC sidecar too, and matching only `CscShard` wrote its stats on
+        // the row axis while the readers looked for them on the column axis.
+        // The extent itself comes from `shard_n_minor`, which encodes the same
+        // distinction once.
+        let major_kind = if crate::shard::is_column_major(section_type) {
+            MajorAxis::Col
+        } else {
+            MajorAxis::Row
         };
+        let n_minor = shard_n_minor;
         let stats = compute_shard_stats(
             values,
             value_encoding,

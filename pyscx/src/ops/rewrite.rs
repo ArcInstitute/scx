@@ -156,10 +156,24 @@ pub fn compact(
 ///
 ///             An already-sharded obs is preserved as shards regardless of
 ///             this setting.
+///     memory_budget: Cap on the memory the parallel shard re-encode may hold
+///             in flight, as a binary-prefixed size string (``"512M"``,
+///             ``"8G"``, ``"2GiB"``); decimal ``KB``/``MB``/``GB`` is
+///             rejected. Shards are re-encoded in chunks whose whole live
+///             phase fits this, so raising it buys concurrency on deep shards
+///             and costs peak RSS.
+///
+///             ``None`` (default) is **not** unbounded: it holds 1 GiB in
+///             flight, so peak memory does not scale with the machine's core
+///             count. Pass a small value (``"1"``) to pin the one-shard-at-a-
+///             time behaviour this function had before the re-encode became
+///             parallel — a budget below one shard's phase still encodes one
+///             shard, since a single shard's encode is irreducible.
 ///
 /// Raises:
-///     ValueError: If `codec` is not "auto"/"scx1" or `shard_obs` is not
-///         "off"/"auto"/"always".
+///     ValueError: If `codec` is not "auto"/"scx1", `shard_obs` is not
+///         "off"/"auto"/"always", or `memory_budget` is not a valid
+///         binary-prefixed size.
 ///     RuntimeError: If the file is multimodal, the input doesn't exist,
 ///         or the output already exists (no ``--force`` analogue; callers
 ///         should remove the target first or use ``output == input``).
@@ -169,14 +183,21 @@ pub fn compact(
 ///     pyscx.optimize("experiment.scx", "experiment.scx")  # in-place
 ///     pyscx.optimize("experiment.scx", "optimized.scx", codec="scx1")
 ///     pyscx.optimize("atlas.scx", "atlas.opt.scx", shard_obs="always")
+///     pyscx.optimize("atlas.scx", "atlas.opt.scx", memory_budget="8G")
 #[pyfunction]
-#[pyo3(signature = (input, output, codec="auto", shard_obs="auto"))]
+#[pyo3(signature = (input, output, codec="auto", shard_obs="auto", memory_budget=None))]
 pub fn optimize(
     py: Python<'_>,
     input: &str,
     output: &str,
     codec: &str,
     shard_obs: &str,
+    // `&Bound<PyAny>`, not `&str`: every other `memory_budget` kwarg in pyscx
+    // goes through `convert::parse_memory_budget` and accepts `None`, an int of
+    // bytes, or a string like `"8G"`. Typing this one as `&str` made
+    // `memory_budget=8_000_000_000` a `TypeError` on the one op whose default
+    // changed, which is the least helpful place to diverge.
+    memory_budget: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -211,8 +232,28 @@ pub fn optimize(
             output_path.display()
         )));
     }
-    py.detach(|| scx_ops::optimize(&input_path, &output_path, codec_id, obs_shard_policy))
-        .map_err(ops_to_pyerr)
+    // Parsed before the rewrite starts, so a malformed size raises rather than
+    // failing partway through -- though *after* the no-clobber path check
+    // above, so an invalid budget on a call that would also be refused for an
+    // existing output reports the output first.
+    let memory_budget = crate::convert::parse_memory_budget(memory_budget)?;
+    py.detach(|| {
+        scx_ops::optimize_with_budget(
+            &input_path,
+            &output_path,
+            codec_id,
+            obs_shard_policy,
+            // Framing is unchanged: this binding has never exposed it, and
+            // `scx_ops::optimize`'s wrapper passes `None` too. Only the budget
+            // is new, because this call *did* change behaviour without it --
+            // it held one shard at a time before the re-encode became
+            // parallel, and a memory-constrained caller had no way back.
+            None,
+            memory_budget,
+        )
+        .map(|_stats| ())
+    })
+    .map_err(ops_to_pyerr)
 }
 
 /// Parse the `reference` kwarg of `sort` into a [`ReferenceSpec`].

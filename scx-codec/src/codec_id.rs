@@ -88,6 +88,15 @@ pub enum CodecSelection {
     Explicit(CodecId),
 }
 
+/// The upper bound `Uint32` accepts, **inclusive at 2³²**.
+///
+/// Declared once because two things must agree on it: the per-value range check
+/// in [`ValueEncoding::encode_f32`] and the slice-wide one in
+/// [`ValueEncoding::encode_f32_into`]. The reason it is 2³² rather than
+/// `u32::MAX` is on `encode_f32`'s `Uint32` arm and is load-bearing — do not
+/// tighten it here without reading that comment.
+const UINT32_BOUND_F32: f32 = (1u128 << 32) as f32;
+
 /// Value encoding for the data array in a CSR shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueEncoding {
@@ -168,19 +177,21 @@ impl ValueEncoding {
         match self {
             Self::Uint8 => {
                 if !(0.0..=255.0).contains(&value) {
-                    return Err(CodecError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("value {value} out of range for uint8 (0..255)"),
-                    )));
+                    return Err(CodecError::ValueOutOfRange {
+                        value,
+                        encoding: "Uint8",
+                        max: u8::MAX as f64,
+                    });
                 }
                 buf.push(value as u8);
             }
             Self::Uint16 => {
                 if !(0.0..=65535.0).contains(&value) {
-                    return Err(CodecError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("value {value} out of range for uint16 (0..65535)"),
-                    )));
+                    return Err(CodecError::ValueOutOfRange {
+                        value,
+                        encoding: "Uint16",
+                        max: u16::MAX as f64,
+                    });
                 }
                 buf.extend_from_slice(&(value as u16).to_le_bytes());
             }
@@ -224,12 +235,12 @@ impl ValueEncoding {
                 //
                 // `contains` (not `<=`) so NaN is rejected rather than written
                 // as 0.
-                const UINT32_BOUND: f32 = (1u128 << 32) as f32;
-                if !(0.0..=UINT32_BOUND).contains(&value) {
-                    return Err(CodecError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("value {value} out of range for uint32"),
-                    )));
+                if !(0.0..=UINT32_BOUND_F32).contains(&value) {
+                    return Err(CodecError::ValueOutOfRange {
+                        value,
+                        encoding: "Uint32",
+                        max: u32::MAX as f64,
+                    });
                 }
                 buf.extend_from_slice(&(value as u32).to_le_bytes());
             }
@@ -246,10 +257,106 @@ impl ValueEncoding {
     /// This is the inverse of `values_raw_to_f32`.
     pub fn encode_f32_batch(&self, data: &[f32]) -> Result<Vec<u8>, CodecError> {
         let mut bytes = Vec::with_capacity(data.len() * self.byte_width());
-        for &v in data {
-            self.encode_f32(&mut bytes, v)?;
-        }
+        self.encode_f32_into(&mut bytes, data)?;
         Ok(bytes)
+    }
+
+    /// [`Self::encode_f32_batch`] appending into a caller-owned buffer.
+    ///
+    /// Exists for the rewrite ops' per-shard accumulators, which append row by
+    /// row into one buffer and must not allocate per row, and it is where the
+    /// work actually happens — `encode_f32_batch` is a thin wrapper.
+    ///
+    /// **Why this is not a loop over [`Self::encode_f32`].** It was, and that
+    /// showed up: measured on `scx optimize` at census_1m,
+    /// `encode_f32`/`encode_f32_batch` accounted for **3.96 % of all cycles** —
+    /// and because they run on the serial critical path (every writer converts
+    /// values on the calling thread), that is roughly **10 % of the op's wall**,
+    /// against a parallel encode that PR-42 already spread across the pool. The
+    /// per-value shape costs a `match` on the encoding, a scalar range test and
+    /// a capacity check for every nonzero. Here the `match` is hoisted, the
+    /// range test is one pass a compiler can vectorise, and the capacity is
+    /// reserved once.
+    ///
+    /// Measured (`cargo bench -p scx-codec -- value_encode`, 100K values,
+    /// per-value -> batch): `Uint8` 314 -> 152 us (**2.07x**), `Uint16` 285 ->
+    /// 159 us (**1.79x**), `Uint32` 336 -> 197 us (**1.71x**), `Float32` 257 ->
+    /// 9.2 us (**27.8x** — little-endian f32 is an identity transform and
+    /// `extend` turns it into a bulk copy). The integer widths land well short
+    /// of the 5-10x the OPT plan projected; the residual is the saturating
+    /// float-to-int cast, costed in the comment on the write below.
+    ///
+    /// **A rejected slice leaves `buf` untouched.** The range pass runs before
+    /// anything is written, and reports the *first* offending value in
+    /// [`CodecError::ValueOutOfRange`], so the caller's accumulator cannot gain
+    /// half a row behind an `Err` and no rollback is needed. NaN counts as
+    /// out of range, which is what stops `as uN` writing it as a silent `0`.
+    pub fn encode_f32_into(&self, buf: &mut Vec<u8>, data: &[f32]) -> Result<(), CodecError> {
+        // One pass to find the first unrepresentable value, and if there is one
+        // the error is built from it directly -- `buf` is never touched, so
+        // there is nothing to roll back. An earlier revision replayed the whole
+        // slice through `encode_f32` to rediscover the offender and truncated
+        // the partial writes; once `CodecError::ValueOutOfRange` began carrying
+        // the value that replay had nothing left to discover.
+        //
+        // The bounds MUST match `encode_f32`'s arm for arm -- this is the same
+        // range rule, applied to a slice -- which is why `Uint32`'s lives in a
+        // shared constant. `find`, not `all`, so the value survives; `contains`,
+        // not a comparison pair, so NaN is rejected rather than written as a
+        // silent `0` by `value as uN`.
+        let offender = match self {
+            Self::Uint8 => data
+                .iter()
+                .find(|v| !(0.0..=255.0).contains(*v))
+                .map(|&v| (v, "Uint8", u8::MAX as f64)),
+            Self::Uint16 => data
+                .iter()
+                .find(|v| !(0.0..=65535.0).contains(*v))
+                .map(|&v| (v, "Uint16", u16::MAX as f64)),
+            Self::Uint32 => data
+                .iter()
+                .find(|v| !(0.0..=UINT32_BOUND_F32).contains(*v))
+                .map(|&v| (v, "Uint32", u32::MAX as f64)),
+            // Every f32 is representable as itself, and `f16::from_f32`
+            // saturates to +/-inf by design rather than failing.
+            Self::Float32 | Self::Float16 => None,
+        };
+        if let Some((value, encoding, max)) = offender {
+            return Err(CodecError::ValueOutOfRange {
+                value,
+                encoding,
+                max,
+            });
+        }
+        buf.reserve(data.len() * self.byte_width());
+        // The remaining cost is the saturating `as` cast, not the write. Two
+        // alternatives were measured and rejected, at 100K values:
+        //   * writing through a `resize`d slice instead of `extend`: noise on
+        //     the integer widths (u8 152.8 -> 151.5 us) and **89 % worse** on
+        //     `Float32` (9.3 -> 17.7 us), because the `resize` memset costs
+        //     more than the bulk copy `extend` gets for an identity transform.
+        //   * `f32::to_int_unchecked` after the range pass: u8 152.8 -> 98.8 us
+        //     (a further 1.55x, 4.05x against the per-value path). Declined.
+        //     It buys ~0.8 s of a 33 s census_1m compact — ~2.4 % — in exchange
+        //     for an `unsafe` whose precondition lives twenty lines up in
+        //     another statement: any later edit that reorders, short-circuits or
+        //     loosens `in_range` turns a rejected value into UB, and the value
+        //     it turns into garbage is NaN, which is precisely what that pass
+        //     exists to catch. Revisit only with the check fused into the loop.
+        match self {
+            Self::Uint8 => buf.extend(data.iter().map(|&v| v as u8)),
+            Self::Uint16 => buf.extend(data.iter().flat_map(|&v| (v as u16).to_le_bytes())),
+            // Saturating `as` is the documented behaviour for a decoded
+            // `u32::MAX` (an f32 of exactly 2³²) and is why the bound above is
+            // inclusive. See `encode_f32`'s `Uint32` arm.
+            Self::Uint32 => buf.extend(data.iter().flat_map(|&v| (v as u32).to_le_bytes())),
+            Self::Float32 => buf.extend(data.iter().flat_map(|&v| v.to_le_bytes())),
+            Self::Float16 => buf.extend(
+                data.iter()
+                    .flat_map(|&v| half::f16::from_f32(v).to_le_bytes()),
+            ),
+        }
+        Ok(())
     }
 }
 
@@ -292,6 +399,23 @@ pub enum CodecError {
 
     #[error("malformed codec input: {0}")]
     MalformedInput(String),
+
+    /// An `f32` value cannot be represented by the target integer encoding —
+    /// out of range, or NaN.
+    ///
+    /// Typed rather than an `Io(InvalidData)` string so a caller can lift it
+    /// into its own error without parsing a message. `scx-ops` does exactly
+    /// that (`OpsError::ValueOutOfRange`, which pyscx maps and which names the
+    /// offending value), and before this variant existed it had to re-run the
+    /// whole per-value loop just to rediscover which value was bad.
+    /// Classification is unchanged: like the `Io` form it had before, this
+    /// falls through `ScxError`'s catch-all to `ScxError::Codec`.
+    #[error("f32 value {value} out of range for {encoding} encoding (max {max})")]
+    ValueOutOfRange {
+        value: f32,
+        encoding: &'static str,
+        max: f64,
+    },
 
     /// A decoded minor-axis index is at or past the caller-supplied bound.
     ///

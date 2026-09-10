@@ -18,7 +18,7 @@ use scx_format_io::ScxReader;
 use crate::codec_intent::{framing_for_rewrite, seed_codec};
 use crate::error::Result;
 use crate::flock::SharedFileLock;
-use crate::helpers::{encode_value, widest_value_encoding};
+use crate::helpers::{encode_values, widest_value_encoding};
 use crate::predicate_index::{
     requested_columns, user_wants_index, validate_forced_columns, PredicateIndexBuildSummary,
 };
@@ -348,11 +348,23 @@ pub fn compact_with_options(
             let row_end_nnz = indptr[local_row + 1] as usize;
             let row_nnz = row_end_nnz - row_start_nnz;
 
-            for j in row_start_nnz..row_end_nnz {
-                acc_indices.push(indices[j] as u32);
-                // Convert f32 back to raw bytes per value_encoding
-                encode_value(&mut acc_values, data[j], value_encoding)?;
-            }
+            // One call per row rather than per nonzero: a row's nonzeros are
+            // contiguous in the source, so the encoding match, the range test
+            // and the capacity check all hoist out of the inner loop.
+            // `encode_value` was 5.08 % of census_1m compact's cycles, and it
+            // runs on the calling thread while the encode runs on the rayon
+            // pool -- roughly 16 % of the op's wall. Same bytes: see
+            // `helpers::tests::encode_values_matches_the_per_value_loop`.
+            acc_indices.extend(
+                indices[row_start_nnz..row_end_nnz]
+                    .iter()
+                    .map(|&c| c as u32),
+            );
+            encode_values(
+                &mut acc_values,
+                &data[row_start_nnz..row_end_nnz],
+                value_encoding,
+            )?;
 
             let prev = *acc_indptr.last().unwrap();
             acc_indptr.push(prev + row_nnz as u64);
@@ -456,10 +468,12 @@ pub fn compact_with_options(
 
             let row_start = layer.indptr[row_idx] as usize;
             let row_end = layer.indptr[row_idx + 1] as usize;
-            for j in row_start..row_end {
-                layer_indices.push(layer.indices[j] as u32);
-                encode_value(&mut layer_values, layer.data[j], layer_value_encoding)?;
-            }
+            layer_indices.extend(layer.indices[row_start..row_end].iter().map(|&c| c as u32));
+            encode_values(
+                &mut layer_values,
+                &layer.data[row_start..row_end],
+                layer_value_encoding,
+            )?;
             let prev = *layer_indptr.last().unwrap();
             layer_indptr.push(prev + (row_end - row_start) as u64);
             layer_row_count += 1;
@@ -1252,10 +1266,16 @@ fn compact_multimodal(
                 let row_start_nnz = indptr[local_row] as usize;
                 let row_end_nnz = indptr[local_row + 1] as usize;
                 let row_nnz = row_end_nnz - row_start_nnz;
-                for j in row_start_nnz..row_end_nnz {
-                    acc_indices.push(indices[j] as u32);
-                    encode_value(&mut acc_values, data[j], value_encoding)?;
-                }
+                acc_indices.extend(
+                    indices[row_start_nnz..row_end_nnz]
+                        .iter()
+                        .map(|&c| c as u32),
+                );
+                encode_values(
+                    &mut acc_values,
+                    &data[row_start_nnz..row_end_nnz],
+                    value_encoding,
+                )?;
                 let prev = *acc_indptr.last().unwrap();
                 acc_indptr.push(prev + row_nnz as u64);
                 acc_rows += 1;
@@ -1426,10 +1446,12 @@ fn compact_multimodal(
                     let row_start = indptr[local_row] as usize;
                     let row_end = indptr[local_row + 1] as usize;
 
-                    for j in row_start..row_end {
-                        l_indices.push(indices[j] as u32);
-                        encode_value(&mut l_values, data[j], layer_value_encoding)?;
-                    }
+                    l_indices.extend(indices[row_start..row_end].iter().map(|&c| c as u32));
+                    encode_values(
+                        &mut l_values,
+                        &data[row_start..row_end],
+                        layer_value_encoding,
+                    )?;
                     let prev = *l_indptr.last().unwrap();
                     l_indptr.push(prev + (row_end - row_start) as u64);
                     l_rows += 1;

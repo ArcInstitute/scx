@@ -108,6 +108,28 @@ Takeaways:
 
 Source: `benchmarks/comprehensive/results/raw/parallel_write_scaling__{codec}__{dataset}.json` (`metadata.scaling_wall_s.full` and `metadata.scaling_wall_s.write_only`).
 
+### Rewrite ops: the parallel shard encode (2026-09-10)
+
+`scx compact` / `scx optimize` re-encode every shard, and since PR #524 that
+encode is parallel *inside* one shard. PR #526 measured what that left behind — both ops stop scaling well before the
+core count, with a substantial part of the wall on the serial per-shard path —
+and made `optimize` re-encode several shards at once under a byte-bounded
+in-flight cap.
+
+**Those wall and peak-RSS figures are not reproduced here.** They came from a
+two-worktree CLI A/B (one binary per commit), which is not a shape the
+comprehensive harness can produce, so they cannot be backed by a
+`benchmark × format × dataset` manifest entry — and
+[benchmark_manifest.md](benchmark_manifest.md) admits no exception for a claim
+of that shape in this file. They live in
+[multithreading.md § Across shards, in a rewrite op](multithreading.md#across-shards-in-a-rewrite-op-scx-optimize)
+instead, with their provenance, where they document the architecture rather than
+standing as captured results.
+
+What *will* appear here is the `fragment_ops` `wall_s__optimize` /
+`peak_rss_mb__optimize` arm added alongside them, once a capture runs — that one
+is a real triple.
+
 ### Streaming conversion (h5ad → SCX)
 
 `scx convert --stream` and `pyscx.from_h5ad(path, out)` use a

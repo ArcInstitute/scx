@@ -9,66 +9,70 @@ use crate::error::OpsError;
 /// Returns an error if the value is out of range for integer encodings.
 /// Used by compact, merge, and other operations that re-encode decoded
 /// float values back to their on-disk representation.
+///
+/// Thin over [`ValueEncoding::encode_f32`], which owns the range rules — the
+/// inclusive-at-2³² `Uint32` bound that lets a decoded `u32::MAX` round-trip,
+/// and the `contains` test that rejects NaN instead of writing `value as uN` as
+/// a silent `0`. This crate previously restated all three arms, so the bounds
+/// were declared twice and could drift; what it actually needs is not a second
+/// range check but its **own error type**, since
+/// [`OpsError::ValueOutOfRange`]'s `value` / `encoding` / `max` fields are what
+/// pyscx maps to a Python exception and what the tests below assert on.
 pub fn encode_value(
     buf: &mut Vec<u8>,
     value: f32,
     encoding: ValueEncoding,
 ) -> crate::error::Result<()> {
-    match encoding {
-        ValueEncoding::Uint8 => {
-            if !(0.0..=u8::MAX as f32).contains(&value) {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint8",
-                    max: u8::MAX as f64,
-                });
-            }
-            buf.push(value as u8);
-        }
-        ValueEncoding::Uint16 => {
-            if !(0.0..=u16::MAX as f32).contains(&value) {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint16",
-                    max: u16::MAX as f64,
-                });
-            }
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
-        }
-        ValueEncoding::Uint32 => {
-            // Inclusive at 2³² — see `ValueEncoding::encode_f32`, which this
-            // mirrors. `u32::MAX as f32` IS 2³², so this value is exactly what
-            // an on-disk `u32::MAX` decodes to; compact/merge/sort re-encode
-            // decoded f32 under the input's own encoding, and rejecting it
-            // would abort them on format-valid archives. `as u32` saturates
-            // back to `u32::MAX`, restoring the original value.
-            //
-            // Fresh out-of-range data is diverted to `Float32` by
-            // `detect_value_encoding`, on the detect path and on
-            // `attach_external_layer`'s post-canonicalization one.
-            // `encoding_for_canonicalized` deliberately does *not* divert at
-            // exactly 2³² — its values may be decoded originals, and saturating
-            // is what restores them — so the rewrite ops reach this arm by
-            // design. A caller passing an explicit encoding bypasses every
-            // detector; so does any `u32` above 2²⁴, which the f32 decode
-            // rounded long before reaching here. See `ValueEncoding::encode_f32`.
-            const UINT32_BOUND: f32 = (1u128 << 32) as f32;
-            if !(0.0..=UINT32_BOUND).contains(&value) {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint32",
-                    max: u32::MAX as f64,
-                });
-            }
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
-        ValueEncoding::Float16 => {
-            let f16_val = half::f16::from_f32(value);
-            buf.extend_from_slice(&f16_val.to_le_bytes());
-        }
+    encoding.encode_f32(buf, value).map_err(lift_range_error)
+}
+
+/// [`encode_value`] over a whole contiguous run of values.
+///
+/// The rewrite ops' accumulator loops call this once per kept row rather than
+/// once per nonzero. Measured on `scx compact --codec auto` at census_1m,
+/// `encode_value` was **5.08 % of all cycles**, and because it runs on the
+/// calling thread while the encode runs on the pool, that is roughly **16 % of
+/// the op's wall** — the largest serial term left after PR-42.
+///
+/// The width-specialised work is [`ValueEncoding::encode_f32_into`], so there is
+/// one implementation in the workspace — 1.7-2.1x on the integer widths and
+/// 27.8x on `Float32`, benched there. That is short of the 5-10x the OPT plan
+/// projected for this pass, so expect roughly 8 % off a census_1m compact from
+/// it, not 14 %.
+///
+/// `buf` is left exactly as it was found on error: an accumulator must not gain
+/// half a row behind an `Err`, because the failed row wrote nothing.
+pub fn encode_values(
+    buf: &mut Vec<u8>,
+    data: &[f32],
+    encoding: ValueEncoding,
+) -> crate::error::Result<()> {
+    encoding
+        .encode_f32_into(buf, data)
+        .map_err(lift_range_error)
+}
+
+/// Lift `scx-codec`'s typed range error into this crate's, preserving the
+/// offending value.
+///
+/// Only that one variant is re-shaped; everything else keeps its existing
+/// classification through `OpsError::Codec`. Before `CodecError` carried the
+/// value, this crate had to re-run the per-value loop after a batch failure
+/// just to rediscover which value was bad — two range passes and two error
+/// paths for one failure.
+fn lift_range_error(e: scx_codec::CodecError) -> OpsError {
+    match e {
+        scx_codec::CodecError::ValueOutOfRange {
+            value,
+            encoding,
+            max,
+        } => OpsError::ValueOutOfRange {
+            value,
+            encoding,
+            max,
+        },
+        other => OpsError::from(other),
     }
-    Ok(())
 }
 
 /// Pick one output value encoding wide enough to hold every input shard's
@@ -124,6 +128,75 @@ mod tests {
                 "NaN accepted by {enc:?}"
             );
             assert!(buf.is_empty());
+        }
+    }
+
+    /// `encode_values` is a speed change and nothing else: the bytes must equal
+    /// what the per-value loop it replaces would have written, for every
+    /// encoding, including into a buffer that already holds a previous row.
+    #[test]
+    fn encode_values_matches_the_per_value_loop() {
+        let cases: &[(ValueEncoding, &[f32])] = &[
+            (ValueEncoding::Uint8, &[0.0, 1.0, 7.9, 255.0]),
+            (ValueEncoding::Uint16, &[0.0, 300.0, 65535.0]),
+            (
+                ValueEncoding::Uint32,
+                &[0.0, 4_294_967_040.0, (1u64 << 32) as f32],
+            ),
+            (ValueEncoding::Float32, &[0.0, -1.5, f32::NAN]),
+            (ValueEncoding::Float16, &[0.0, -1.5, 70000.0]),
+        ];
+        for &(enc, data) in cases {
+            let mut want = vec![0xC3u8; 2];
+            for &v in data {
+                encode_value(&mut want, v, enc).unwrap();
+            }
+            let mut got = vec![0xC3u8; 2];
+            encode_values(&mut got, data, enc).unwrap();
+            assert_eq!(got, want, "{enc:?}");
+        }
+    }
+
+    /// The whole reason this crate keeps its own wrapper: `OpsError::
+    /// ValueOutOfRange`'s `value` / `encoding` / `max` fields are what pyscx
+    /// maps and what the sibling tests above assert on, so the batch path must
+    /// surface *this* crate's error rather than `scx-codec`'s. It carries the
+    /// same three fields now, so lifting it is a one-variant `map_err` — but
+    /// this test is what says the offending value survives that lift, and that
+    /// the accumulator is left untouched, since the row that failed wrote
+    /// nothing.
+    #[test]
+    fn encode_values_reports_the_ops_error_naming_the_offender() {
+        for (enc, offender, name) in [
+            (ValueEncoding::Uint8, 256.0f32, "Uint8"),
+            (ValueEncoding::Uint16, 65536.0f32, "Uint16"),
+            (ValueEncoding::Uint32, 8_589_934_592.0f32, "Uint32"),
+            (ValueEncoding::Uint8, f32::NAN, "Uint8"),
+        ] {
+            for pos in 0..3 {
+                let mut data = vec![1.0f32, 2.0, 3.0];
+                data[pos] = offender;
+                let mut buf = vec![0x11u8; 4];
+                match encode_values(&mut buf, &data, enc) {
+                    Err(OpsError::ValueOutOfRange {
+                        value, encoding, ..
+                    }) => {
+                        assert_eq!(encoding, name, "{enc:?} named the wrong encoding");
+                        assert!(
+                            value.to_bits() == offender.to_bits(),
+                            "{enc:?} reported {value} instead of the offender {offender}"
+                        );
+                    }
+                    other => {
+                        panic!("{enc:?} at index {pos}: expected ValueOutOfRange, got {other:?}")
+                    }
+                }
+                assert_eq!(
+                    buf,
+                    vec![0x11u8; 4],
+                    "{enc:?} left bytes behind at index {pos}"
+                );
+            }
         }
     }
 

@@ -16,6 +16,7 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
 use scx_codec::CodecId;
 use scx_format_io::encoder::{encode_one_shard, FramingConfig};
 use scx_format_io::header::{FileHeader, CURRENT_FORMAT_VERSION};
@@ -79,12 +80,48 @@ pub fn optimize(
 /// smaller of {heuristic winner, ShufDeltaZstd} per shard; a framed shard
 /// forgoes the Scx1 GPU/per-row decode sidecar (it uses the block index
 /// instead), so `compact-trial` optimizes for size + random access.
+/// Note this is the **unframed** entry point when `framing` is `None`: the
+/// output is stamped `format_version = 3`. Only a `Some(FramingConfig)` with
+/// `row_group_rows > 0` produces the framed v4 layout the CLI defaults to.
 pub fn optimize_with_framing(
     input_path: &Path,
     output_path: &Path,
     codec: Option<CodecId>,
     obs_shard_policy: ObsShardPolicy,
     framing: Option<FramingConfig>,
+) -> Result<OptimizeStats> {
+    optimize_with_budget(
+        input_path,
+        output_path,
+        codec,
+        obs_shard_policy,
+        framing,
+        None,
+    )
+}
+
+/// [`optimize_with_framing`] with a cap on what the parallel shard re-encode may
+/// hold in flight.
+///
+/// A separate entry point rather than a sixth parameter on
+/// `optimize_with_framing`: that function is documented in `docs/api.md` and
+/// `scx-ops` carries no `publish = false`, so a downstream git or path
+/// dependency would fail to compile on a changed arity. There is no behavioural
+/// difference — `optimize_with_framing` delegates here with `None`.
+///
+/// `memory_budget` bounds how many shards may be encoded concurrently: the
+/// re-encode runs in chunks whose whole live phase fits the budget. `None` does
+/// **not** mean unbounded — see `encode_budget::DEFAULT_IN_FLIGHT_BYTES`, which
+/// keeps the default peak increase a constant instead of a multiple of the
+/// host's core count. A budget smaller than one shard's phase still admits one
+/// shard, because a single shard's encode is irreducible.
+pub fn optimize_with_budget(
+    input_path: &Path,
+    output_path: &Path,
+    codec: Option<CodecId>,
+    obs_shard_policy: ObsShardPolicy,
+    framing: Option<FramingConfig>,
+    memory_budget: Option<u64>,
 ) -> Result<OptimizeStats> {
     let reader = ScxReader::open(input_path)?;
     if reader.is_multimodal() {
@@ -248,48 +285,115 @@ pub fn optimize_with_framing(
     // Set when canonicalising X actually changed the matrix — see the
     // detection-bitmap block far below, which is the only consumer.
     let mut x_was_rewritten = false;
-    for entry in x_entries
+    let entries: Vec<_> = x_entries
         .into_iter()
         .chain(layer_entries)
         .chain(obsp_csr_entries)
-    {
-        let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
-        // Use the shard's own minor dimension rather than the file-level
-        // `n_vars`: correct for `ObspCsrShard` (minor axis = `n_obs`) and robust
-        // against any per-shard width difference.
-        let n_minor = reader.read_shard_header(entry)?.n_minor;
-        let (indptr_i64, indices_i32, mut values) = reader.read_shard_from_entry(entry)?;
-        let mut indptr: Vec<u64> = indptr_i64.iter().map(|&v| v as u64).collect();
-        let mut indices: Vec<u32> = indices_i32.iter().map(|&v| v as u32).collect();
-        // Whether canonicalisation rewrote **X** specifically, which is what
-        // the detection bitmaps below are keyed to. `canonicalize_csr`
-        // short-circuits on already-canonical input, so this is the same test
-        // it runs internally and costs nothing extra on the common path.
-        if entry.section_type == SectionType::CsrShard
-            && !scx_sparse::is_canonical_csr(&indptr, &indices, &values)
-        {
-            x_was_rewritten = true;
-        }
-        canonicalize_csr(&mut indptr, &mut indices, &mut values);
+        .collect();
 
-        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
-            entry.name.clone(),
-            entry.section_type,
-            n_minor as u64,
-            row_start,
-            index_dtype,
-        );
-        enc_opts.explicit_codec = codec;
-        enc_opts.framing = framing;
-        let pre = encode_one_shard(&indptr, &indices, &values, &enc_opts)?;
-        stats.shards_total += 1;
-        if pre.shard_format_version() > scx_format_io::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
-            stats.shards_framed += 1;
-            if pre.codec_id() == CodecId::ShufDeltaZstd as u8 {
-                stats.shards_shufdelta += 1;
+    // Read the 76-byte shard headers up front. The serial loop this replaces
+    // read one per entry anyway (for `n_minor`); doing it here also gives the
+    // per-shard `nnz` the chunk planner needs, so the header reads are the same
+    // count, just hoisted.
+    let headers = entries
+        .iter()
+        .map(|e| reader.read_shard_header(e))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let nnz_per_shard: Vec<u64> = headers.iter().map(|h| h.nnz).collect();
+
+    // Re-encode in bounded parallel chunks. Each entry's work -- read,
+    // canonicalize, encode -- is a pure function of that entry, and `ScxReader`
+    // is shareable (mmap + `Arc<FullCatalog>`), so the *whole* body moves off
+    // the calling thread rather than just the encode. That matters here: the
+    // measured serial share of `scx optimize` at census_1m was 45 % of a 42.4 s
+    // wall (87.0 s at one thread, 43.7 s at eight, 42.4 s at sixteen -- flat
+    // past eight cores), and the source-shard decode is part of it.
+    //
+    // The writer stays serial and is fed in chunk order. That is not a
+    // simplification: `current_offset`, the catalog entry order and
+    // `first_csr_codec` (first CSR write wins, and `finish()` stamps it as the
+    // file header's codec) are all positional, so parallel encode is safe and
+    // parallel write is not.
+    let chunk_lens = crate::encode_budget::plan_encode_chunks(
+        &nnz_per_shard,
+        rayon::current_num_threads().max(1),
+        // `None` is not "unbounded" -- see `DEFAULT_IN_FLIGHT_BYTES`, which keeps
+        // the default peak a constant rather than a multiple of the core count.
+        memory_budget.unwrap_or(crate::encode_budget::DEFAULT_IN_FLIGHT_BYTES),
+    );
+    let mut at = 0usize;
+    for len in chunk_lens {
+        // `Vec<Result<_>>` rather than `collect::<Result<Vec<_>>>()`: rayon
+        // leaves it undefined *which* error a short-circuiting collect returns,
+        // and the op must fail with the first one in shard order however the
+        // pool happened to schedule. Same rule as `encode_shard_framed`'s
+        // per-group collect.
+        let encoded: Vec<Result<(scx_format_io::PreEncodedSection, bool)>> = entries[at..at + len]
+            .par_iter()
+            .zip(headers[at..at + len].par_iter())
+            .map(|(entry, sh)| {
+                let row_start = entry.stats.as_ref().map(|s| s.row_start).unwrap_or(0);
+                let (indptr_i64, indices_i32, mut values) = reader.read_shard_from_entry(entry)?;
+                let mut indptr: Vec<u64> = indptr_i64.iter().map(|&v| v as u64).collect();
+                let mut indices: Vec<u32> = indices_i32.iter().map(|&v| v as u32).collect();
+                // Whether canonicalisation rewrote **X** specifically, which is
+                // what the detection bitmaps below are keyed to.
+                // `canonicalize_csr` short-circuits on already-canonical input,
+                // so this is the same test it runs internally and costs nothing
+                // extra on the common path. Reported per shard and OR-ed in the
+                // serial fold below, since a `&mut bool` cannot cross into the
+                // pool.
+                let rewrote = entry.section_type == SectionType::CsrShard
+                    && !scx_sparse::is_canonical_csr(&indptr, &indices, &values);
+                canonicalize_csr(&mut indptr, &mut indices, &mut values);
+
+                // The shard's own stamped minor extent, read back from the
+                // source header, rather than the file-level `n_vars`. That is
+                // what makes this a faithful re-encode: whatever the source
+                // declares round-trips, including a per-shard width difference
+                // and including an `ObspCsrShard`, whose extent the *writer*
+                // derives wrongly (obs x obs, stamped from `n_vars` -- see
+                // `ScxWriter::shard_n_minor`). Re-deriving it here would either
+                // reproduce that defect or silently change the extent on files
+                // that already carry it.
+                let mut enc_opts = scx_format_io::EncodeShardOptions::new(
+                    entry.name.clone(),
+                    entry.section_type,
+                    sh.n_minor as u64,
+                    row_start,
+                    // The shard's own index width, for the same reason as its
+                    // own extent above -- and the two must agree or the pair is
+                    // incoherent. The file header's `index_dtype` is derived
+                    // from `n_vars` and is CSR-correct, so using it here forced
+                    // u16 indices onto an `ObspCsrShard`, whose minor axis is
+                    // `n_obs`: on a file with `n_vars <= 65535 < n_obs` the
+                    // re-encode failed outright with "index N exceeds u16
+                    // range". Found by Antigravity - Gemini 3.8 Flash.
+                    sh.index_dtype,
+                );
+                // Passed through as the caller gave it, `None` included: with
+                // no explicit codec the encoder runs its own selection, and
+                // substituting a pre-seeded codec here would change the pick.
+                enc_opts.explicit_codec = codec;
+                enc_opts.framing = framing;
+                let pre = encode_one_shard(&indptr, &indices, &values, &enc_opts)?;
+                Ok((pre, rewrote))
+            })
+            .collect();
+
+        for result in encoded {
+            let (pre, rewrote) = result?;
+            x_was_rewritten |= rewrote;
+            stats.shards_total += 1;
+            if pre.shard_format_version() > scx_format_io::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+                stats.shards_framed += 1;
+                if pre.codec_id() == CodecId::ShufDeltaZstd as u8 {
+                    stats.shards_shufdelta += 1;
+                }
             }
+            writer.write_preencoded_shard(pre)?;
         }
-        writer.write_preencoded_shard(pre)?;
+        at += len;
     }
 
     // Auxiliary matrices (obsm/varm + COO obsp/varp) are unchanged by optimize,
@@ -682,6 +786,218 @@ mod tests {
     /// T3.2: `optimize_with_framing` (the `scx optimize --codec compact-trial
     /// --row-group-rows N` path) upgrades a v2/v3 file to a v4/shard-v2 framed
     /// file, and the framed re-encode round-trips byte-identically.
+    /// An explicit codec must reach **every** shard, and the output must be
+    /// byte-identical however many shards the re-encode holds in flight.
+    ///
+    /// Both halves exist because of what the twelve-arm `op_output_identity`
+    /// golden cannot see here: every arm that drives `optimize` passes
+    /// `codec: None`, so replacing the caller's codec with `None` inside the
+    /// parallel map leaves the golden green. And a single-chunk run says nothing
+    /// about chunk boundaries, so the budget is swept from "one shard at a time"
+    /// to "all of them" and the bytes compared across the sweep.
+    /// An `ObspCsrShard`'s indices are bounded by `n_obs`, not `n_vars`, so
+    /// re-encoding one must use the shard's own index width rather than the
+    /// file header's.
+    ///
+    /// The fixture has to be built through `encode_one_shard` +
+    /// `write_preencoded_shard`, because `ScxWriter::write_obsp_shard` **cannot
+    /// express it**: it derives the extent from `n_vars` and would reject the
+    /// very shard this test needs ("index N exceeds u16 range"). That is the
+    /// known writer defect documented on `ScxWriter::shard_n_minor`, and it is
+    /// why `upgrade` builds its obsp fixtures the same way.
+    ///
+    /// Before the fix, `optimize` read `sh.n_minor` back from the source header
+    /// but took `index_dtype` from the *file* header, so the pair was
+    /// incoherent and this file failed to optimize at all.
+    /// Found by Antigravity - Gemini 3.8 Flash.
+    #[test]
+    fn optimize_reencodes_an_obsp_shard_wider_than_the_file_index_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        // n_vars small => the file header's index_dtype is u16; n_obs large =>
+        // the obsp graph's own minor axis needs u32.
+        let n_obs = 70_000u64;
+        let n_vars = 100u64;
+        let mut header = sample_header(n_obs, n_vars);
+        header.format_version = 2;
+        header.index_dtype = 0;
+        assert_eq!(
+            header.index_dtype, 0,
+            "the file axis must be the narrow one"
+        );
+
+        let obsp_col = 69_999u32;
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs as usize)).unwrap();
+            w.write_var(&sample_var(n_vars as usize)).unwrap();
+            w.write_csr_shard(
+                &[0u64, 1],
+                &[0u32],
+                &[1u8],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            // One obsp row with an endpoint past u16, stamped u32 / n_obs.
+            let mut opts = scx_format_io::EncodeShardOptions::new(
+                "obsp/connectivities_shard_0".to_string(),
+                SectionType::ObspCsrShard,
+                n_obs,
+                0,
+                1,
+            );
+            opts.explicit_codec = Some(CodecId::None);
+            opts.value_encoding = Some(ValueEncoding::Uint8);
+            let pre =
+                scx_format_io::encoder::encode_one_shard(&[0u64, 1], &[obsp_col], &[1.0f32], &opts)
+                    .unwrap();
+            w.write_preencoded_shard(pre).unwrap();
+            w.finish().unwrap();
+        }
+
+        let out = dir.path().join("out.scx");
+        optimize_with_framing(&input, &out, None, ObsShardPolicy::Off, None)
+            .expect("optimize must re-encode an obsp shard wider than the file's index dtype");
+
+        // The graph survives, at its own width.
+        let reader = ScxReader::open(&out).unwrap();
+        let obsp = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::ObspCsrShard)
+            .expect("obsp shard must be carried through");
+        let sh = reader.read_shard_header(obsp).unwrap();
+        assert_eq!(sh.index_dtype, 1, "the re-emitted obsp shard must stay u32");
+        assert_eq!(sh.n_minor as u64, n_obs, "and keep its own minor extent");
+        let (_, indices, _) = reader.read_shard_from_entry(obsp).unwrap();
+        assert_eq!(
+            indices,
+            vec![obsp_col as i32],
+            "the endpoint past u16 must round-trip"
+        );
+    }
+
+    #[test]
+    fn optimize_honours_an_explicit_codec_at_every_concurrency() {
+        let dir = tempfile::tempdir().unwrap();
+        // Several shards, so a chunk boundary can fall between them.
+        let n_obs = 40usize;
+        let shard_rows = 8usize;
+        let n_vars = 500usize;
+        let mut header = sample_header(n_obs as u64, n_vars as u64);
+        header.format_version = 2;
+        header.shard_target_rows = shard_rows as u32;
+
+        let input = dir.path().join("in.scx");
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs)).unwrap();
+            w.write_var(&sample_var(n_vars)).unwrap();
+            for shard in 0..(n_obs / shard_rows) {
+                let mut indptr = vec![0u64];
+                let mut indices: Vec<u32> = Vec::new();
+                let mut values: Vec<u8> = Vec::new();
+                for r in 0..shard_rows {
+                    let mut col = 0u32;
+                    for k in 0..16usize {
+                        col += 1 + ((shard * 31 + r * 13 + k * 7) % 20) as u32;
+                        indices.push(col);
+                        // Median <= 8 **on purpose**: `select_codec` picks
+                        // `Scx1` for this distribution, so forcing `Zstd` below
+                        // is a choice the heuristic would not have made. With a
+                        // high median both answers are `Zstd` and the assertion
+                        // holds whether or not the forced codec was honoured.
+                        values.push(1u8 + ((shard + r + k) % 4) as u8);
+                    }
+                    indptr.push(indices.len() as u64);
+                }
+                w.write_csr_shard(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                    (shard * shard_rows) as u64,
+                )
+                .unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        // `0` pins one shard per chunk; `u64::MAX` puts every shard in one.
+        // Anything in between is a real boundary. All must agree byte for byte,
+        // and every shard must carry the forced codec.
+        type Layout = Vec<(String, u64)>;
+        type Shards = Vec<(Vec<i64>, Vec<i32>, Vec<f32>)>;
+        let mut reference: Option<(Layout, Shards)> = None;
+        for budget in [Some(0u64), Some(1024), Some(64 * 1024 * 1024), None] {
+            let output = dir.path().join(format!("out_{budget:?}.scx"));
+            optimize_with_budget(
+                &input,
+                &output,
+                Some(CodecId::Zstd),
+                ObsShardPolicy::Off,
+                None,
+                budget,
+            )
+            .unwrap();
+
+            let reader = ScxReader::open(&output).unwrap();
+            let shards = reader.catalog().csr_shards_sorted();
+            assert!(shards.len() > 1, "need several shards to have a boundary");
+            for entry in &shards {
+                let sh = reader.read_shard_header(entry).unwrap();
+                assert_eq!(
+                    sh.codec_id,
+                    CodecId::Zstd as u8,
+                    "shard {} lost the forced codec at budget {budget:?}",
+                    entry.name
+                );
+            }
+
+            // Contents **and** file order. `read_csr_shard(i)` goes through
+            // `csr_shards_sorted`, which re-sorts by `row_start` and so hides a
+            // mis-ordered write entirely; the catalog's own entry order is what
+            // records where each shard actually landed. Both are compared
+            // across the sweep.
+            let layout: Vec<(String, u64)> = reader
+                .catalog()
+                .entries
+                .iter()
+                .filter(|e| e.section_type == SectionType::CsrShard)
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.stats.as_ref().map(|s| s.row_start).unwrap_or(0),
+                    )
+                })
+                .collect();
+            assert!(
+                layout.windows(2).all(|w| w[0].1 < w[1].1),
+                "shards must be written in ascending row order, got {layout:?} at budget {budget:?}"
+            );
+            let decoded: Vec<_> = (0..shards.len())
+                .map(|i| reader.read_csr_shard(i).unwrap())
+                .collect();
+            match &reference {
+                None => reference = Some((layout, decoded)),
+                Some((want_layout, want_decoded)) => {
+                    assert_eq!(
+                        &layout, want_layout,
+                        "shard layout differs at budget {budget:?}"
+                    );
+                    assert_eq!(
+                        &decoded, want_decoded,
+                        "shard contents differ at budget {budget:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn optimize_with_framing_upgrades_to_v4_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();

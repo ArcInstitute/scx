@@ -15,7 +15,7 @@ use crate::append::unify_dict_columns;
 use crate::codec_intent::{framing_for_rewrite, seed_codec};
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
-use crate::helpers::{encode_value, widest_value_encoding};
+use crate::helpers::{encode_values, widest_value_encoding};
 use crate::merge_options::MergeOptions;
 use crate::merge_pairwise;
 use crate::merge_sorted;
@@ -606,10 +606,12 @@ pub fn merge_with_options(
             let n_rows = indptr.len() - 1;
             let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
+            // `encode_values`, not `encode_f32_batch`: the wrapper lifts
+            // `CodecError::ValueOutOfRange` into `OpsError::ValueOutOfRange`,
+            // which pyscx maps and the widening tests reference. Same fast path
+            // either way -- only the error type differs.
             let mut values_bytes = Vec::new();
-            for &v in &data {
-                encode_value(&mut values_bytes, v, shard_value_encoding)?;
-            }
+            encode_values(&mut values_bytes, &data, shard_value_encoding)?;
 
             // Auto-select optimal codec for this shard's data
             let shard_codec = seed_codec(options.codec, &values_bytes, shard_value_encoding);
@@ -749,10 +751,8 @@ pub fn merge_with_options(
                 for local_row in 0..n_rows {
                     let s = indptr[local_row] as usize;
                     let e = indptr[local_row + 1] as usize;
-                    for j in s..e {
-                        layer_indices.push(indices[j] as u32);
-                        encode_value(&mut layer_values, data[j], layer_value_encoding)?;
-                    }
+                    layer_indices.extend(indices[s..e].iter().map(|&c| c as u32));
+                    encode_values(&mut layer_values, &data[s..e], layer_value_encoding)?;
                     let prev = *layer_indptr.last().unwrap();
                     layer_indptr.push(prev + (e - s) as u64);
                     layer_row_count += 1;
@@ -1294,9 +1294,7 @@ fn merge_multimodal(
                 let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
                 let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
                 let mut values_bytes = Vec::new();
-                for &v in &data {
-                    encode_value(&mut values_bytes, v, shard_value_encoding)?;
-                }
+                encode_values(&mut values_bytes, &data, shard_value_encoding)?;
                 let shard_codec = seed_codec(options.codec, &values_bytes, shard_value_encoding);
                 let shard = scx_format_io::ShardBuffers::new(
                     &indptr_u64,
@@ -1422,10 +1420,8 @@ fn merge_multimodal(
                     for local_row in 0..n_rows {
                         let s = indptr[local_row] as usize;
                         let e = indptr[local_row + 1] as usize;
-                        for j in s..e {
-                            l_indices.push(indices[j] as u32);
-                            encode_value(&mut l_values, data[j], layer_value_encoding)?;
-                        }
+                        l_indices.extend(indices[s..e].iter().map(|&c| c as u32));
+                        encode_values(&mut l_values, &data[s..e], layer_value_encoding)?;
                         let prev = *l_indptr.last().unwrap();
                         l_indptr.push(prev + (e - s) as u64);
                         l_rows += 1;
