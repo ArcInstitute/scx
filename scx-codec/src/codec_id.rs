@@ -286,35 +286,47 @@ impl ValueEncoding {
     /// of the 5-10x the OPT plan projected; the residual is the saturating
     /// float-to-int cast, costed in the comment on the write below.
     ///
-    /// **`encode_f32` stays the single owner of the error.** A slice holding an
-    /// out-of-range value — or a NaN, which `contains` rejects rather than
-    /// letting `as uN` write a silent `0` — falls back to the per-value loop, so
-    /// the message still names the offending value and the bytes are identical
-    /// either way. `buf` is left exactly as it was found when that happens: the
-    /// caller's accumulator must not gain half a row's values behind an `Err`.
+    /// **A rejected slice leaves `buf` untouched.** The range pass runs before
+    /// anything is written, and reports the *first* offending value in
+    /// [`CodecError::ValueOutOfRange`], so the caller's accumulator cannot gain
+    /// half a row behind an `Err` and no rollback is needed. NaN counts as
+    /// out of range, which is what stops `as uN` writing it as a silent `0`.
     pub fn encode_f32_into(&self, buf: &mut Vec<u8>, data: &[f32]) -> Result<(), CodecError> {
-        // The bounds here MUST match `encode_f32`'s arm for arm; the fallback
-        // below is what makes a divergence merely slow rather than wrong, but a
-        // *looser* bound here would encode a value `encode_f32` rejects, which
-        // the fallback cannot catch. `Uint32`'s bound is shared as a constant
-        // for exactly that reason.
-        let in_range = match self {
-            Self::Uint8 => data.iter().all(|v| (0.0..=255.0).contains(v)),
-            Self::Uint16 => data.iter().all(|v| (0.0..=65535.0).contains(v)),
-            Self::Uint32 => data.iter().all(|v| (0.0..=UINT32_BOUND_F32).contains(v)),
+        // One pass to find the first unrepresentable value, and if there is one
+        // the error is built from it directly -- `buf` is never touched, so
+        // there is nothing to roll back. An earlier revision replayed the whole
+        // slice through `encode_f32` to rediscover the offender and truncated
+        // the partial writes; once `CodecError::ValueOutOfRange` began carrying
+        // the value that replay had nothing left to discover.
+        //
+        // The bounds MUST match `encode_f32`'s arm for arm -- this is the same
+        // range rule, applied to a slice -- which is why `Uint32`'s lives in a
+        // shared constant. `find`, not `all`, so the value survives; `contains`,
+        // not a comparison pair, so NaN is rejected rather than written as a
+        // silent `0` by `value as uN`.
+        let offender = match self {
+            Self::Uint8 => data
+                .iter()
+                .find(|v| !(0.0..=255.0).contains(*v))
+                .map(|&v| (v, "Uint8", u8::MAX as f64)),
+            Self::Uint16 => data
+                .iter()
+                .find(|v| !(0.0..=65535.0).contains(*v))
+                .map(|&v| (v, "Uint16", u16::MAX as f64)),
+            Self::Uint32 => data
+                .iter()
+                .find(|v| !(0.0..=UINT32_BOUND_F32).contains(*v))
+                .map(|&v| (v, "Uint32", u32::MAX as f64)),
             // Every f32 is representable as itself, and `f16::from_f32`
             // saturates to +/-inf by design rather than failing.
-            Self::Float32 | Self::Float16 => true,
+            Self::Float32 | Self::Float16 => None,
         };
-        let start = buf.len();
-        if !in_range {
-            for &v in data {
-                if let Err(e) = self.encode_f32(buf, v) {
-                    buf.truncate(start);
-                    return Err(e);
-                }
-            }
-            return Ok(());
+        if let Some((value, encoding, max)) = offender {
+            return Err(CodecError::ValueOutOfRange {
+                value,
+                encoding,
+                max,
+            });
         }
         buf.reserve(data.len() * self.byte_width());
         // The remaining cost is the saturating `as` cast, not the write. Two

@@ -1,7 +1,7 @@
 """
 Fragment / Manifest Operation Throughput benchmark.
 
-Measures wall-clock and throughput for the five SCX fragment/manifest
+Measures wall-clock and throughput for the six SCX fragment/manifest
 mutations exposed by ``scx-ops`` via pyscx:
 
   * ``append``     — ingest new shards into a base ``.scx``
@@ -39,7 +39,7 @@ has always *timed* four in-place mutations, none of those timings was gateable �
 only ``median_wall_s``, pooled across every arm, and that number is dominated
 by whichever arm is cheapest.
 
-That matters here more than elsewhere, because four of these five ops
+That matters here more than elsewhere, because four of these six ops
 (``append``, ``delete``, ``obs_import``, ``rollback``) commit through
 ``commit_in_place`` → ``finalize_header_with_checksum``, which streams offset
 256 → EOF to recompute ``file_checksum`` regardless of how few bytes changed.

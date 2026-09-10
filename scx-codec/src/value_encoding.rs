@@ -85,8 +85,9 @@ pub fn detect_value_encoding_f64(data: &[f64]) -> ValueEncoding {
 /// Thin wrapper over [`ValueEncoding::encode_f32_batch`] — kept as the
 /// canonical entry point cited by historical call sites (`pyscx/anndata`,
 /// `scx-cli/convert/dtype`, `scx-mtx/convert`). Returns
-/// `Err(CodecError::Io(InvalidData))` if any value falls outside the
-/// range representable by the requested integer encoding — with one
+/// `Err(CodecError::ValueOutOfRange { value, encoding, max })` if any value
+/// falls outside the range representable by the requested integer encoding —
+/// naming the first such value, and with one
 /// documented exception: under `Uint32`, exactly 2³² is accepted and
 /// saturates to `u32::MAX`, because `u32::MAX as f32` *is* 2³² and the
 /// encoder cannot tell a fresh out-of-range value from the f32 image of a

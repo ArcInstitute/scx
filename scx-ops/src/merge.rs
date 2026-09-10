@@ -606,10 +606,10 @@ pub fn merge_with_options(
             let n_rows = indptr.len() - 1;
             let indptr_u64: Vec<u64> = indptr.iter().map(|&v| v as u64).collect();
             let indices_u32: Vec<u32> = indices.iter().map(|&v| v as u32).collect();
-            // `encode_f32_batch` would surface a `CodecError` here, changing what a
-            // too-wide value produces from `OpsError::ValueOutOfRange` -- which pyscx
-            // maps and the widening tests reference -- into a codec I/O error. The
-            // wrapper has the same fast path and keeps this crate's error.
+            // `encode_values`, not `encode_f32_batch`: the wrapper lifts
+            // `CodecError::ValueOutOfRange` into `OpsError::ValueOutOfRange`,
+            // which pyscx maps and the widening tests reference. Same fast path
+            // either way -- only the error type differs.
             let mut values_bytes = Vec::new();
             encode_values(&mut values_bytes, &data, shard_value_encoding)?;
 

@@ -1006,41 +1006,10 @@ impl ScxWriter {
         self.framing
     }
 
-    /// The per-shard `index_dtype` this writer stamps on a shard of
-    /// `section_type` — `0` for u16 indices, `1` for u32.
-    ///
-    /// The bound comes from the shard's layout, not the file header. CSC stores
-    /// row indices (bounded by `n_obs`); CSR / LayerCsr / ObspCsr store column
-    /// indices, which are **per-modality** — inside a [`Self::with_modality`]
-    /// scope the bound is that modality's `n_vars`, not the file-wide max, or
-    /// every shard in a multi-modality file gets stamped with the max and
-    /// column-range pruning breaks. `RawCsrShard` is row-major but carries its
-    /// own column axis (`raw_n_vars`). The file-level `header.index_dtype` was
-    /// set at creation from `n_vars` and is CSR-correct, so using it for a CSC
-    /// shard breaks files with `n_obs > 65535` and `n_vars <= 65535`
-    /// (census_500k / census_1m). The per-shard field is what the reader trusts
-    /// (`sh.index_dtype == 0`), so widening to u32 on a CSC shard is
-    /// read-correct even when the file header says u16.
-    ///
-    /// **Private, deliberately.** An earlier revision made this and
-    /// [`Self::shard_n_minor`] `pub` on the argument that a caller encoding
-    /// off-thread must fill `EncodeShardOptions` from the same rule — but no
-    /// such caller exists: `scx optimize`, the one this PR added, re-emits each
-    /// shard's *own* stamps read back from the source header, which is what
-    /// makes it a faithful re-encode. Promote them when a caller actually needs
-    /// the writer's rule, and convert that caller in the same change.
-    fn shard_index_dtype(&self, section_type: SectionType) -> u8 {
-        if self.shard_n_minor(section_type).saturating_sub(1) <= u16::MAX as u64 {
-            0
-        } else {
-            1
-        }
-    }
-
     /// The minor-axis extent this writer stamps on a shard of `section_type`.
     ///
-    /// The primitive [`Self::shard_index_dtype`] is derived from.
-    /// `write_shard_inner` had this same three-arm match written out three
+    /// `write_shard_inner` derives the per-shard index width from this, and had
+    /// this same three-arm match written out three
     /// times — for the index dtype, for the shard header's `n_minor`, and for
     /// the stats' minor extent.
     ///
@@ -1180,10 +1149,18 @@ impl ScxWriter {
         let nnz = *indptr.last().unwrap_or(&0);
 
         // One rule, one implementation: see `Self::shard_n_minor`, which this
-        // function used to spell out three separate times.
+        // function used to spell out three separate times. The index width is
+        // derived from the extent right here rather than through a second
+        // accessor that would recompute it: `0` = u16 indices, `1` = u32. The
+        // file-level `header.index_dtype` is set at creation from `n_vars` and
+        // is CSR-correct, so using it for a CSC shard breaks files with
+        // `n_obs > 65535` and `n_vars <= 65535` (census_500k / census_1m); the
+        // per-shard field is what the reader trusts (`sh.index_dtype == 0`), so
+        // widening to u32 on a CSC shard is read-correct even when the file
+        // header says u16.
         let shard_n_minor = self.shard_n_minor(section_type);
-        let shard_index_dtype = self.shard_index_dtype(section_type);
-        let index_dtype_u16 = shard_index_dtype == 0;
+        let index_dtype_u16 = shard_n_minor.saturating_sub(1) <= u16::MAX as u64;
+        let shard_index_dtype: u8 = if index_dtype_u16 { 0 } else { 1 };
 
         // Encode the shard data. When row-group framing is enabled on the writer
         // (F5-b), every sparse shard funneling through here — CSC sidecars,

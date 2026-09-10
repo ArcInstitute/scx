@@ -59,8 +59,9 @@ pub fn run_optimize(
     }
 
     let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
-    // Parsed before any file I/O, so a malformed size fails immediately rather
-    // than after a partial rewrite -- the same rule `scx convert` follows.
+    // Parsed before the rewrite starts, so a malformed size fails without
+    // touching the output -- though after the `--force` / existing-output check
+    // below, so a call that is wrong in both ways reports the output first.
     let memory_budget = match memory_budget {
         Some(spec) => Some(scx_format_io::MemoryBudget::parse(spec)?),
         None => None,
@@ -77,7 +78,7 @@ pub fn run_optimize(
     pb.set_message(format!("Optimizing {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let stats = scx_ops::optimize_with_framing(
+    let stats = scx_ops::optimize_with_budget(
         input,
         output,
         codec_id,

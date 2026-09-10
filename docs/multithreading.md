@@ -623,11 +623,18 @@ the catalog's own entry order (reading through `csr_shards_sorted` re-sorts by
 > comprehensive harness (`benchmark × format × dataset`) can take, so
 > [benchmark_manifest.md](benchmark_manifest.md)'s tier-1 rule cannot be
 > satisfied for them and its tier-2 microbenchmark disclosure is meant for
-> kernel measurements. They document the architecture above; treat the
-> `fragment_ops` `wall_s__optimize` arm as the gated figure.
+> kernel measurements. They document the architecture above. The
+> `fragment_ops` `wall_s__optimize` / `peak_rss_mb__optimize` arm is
+> **instrumentation, not a gate**: no threshold in `thresholds.yaml` references
+> either key yet, so nothing fails on a regression there until one does. Gate
+> activation is deferred to the next baseline recapture.
 >
-> Provenance: `scx` CLI, two release worktrees at `441e7ae8` (base) and this
-> change, `cpu_batch` with 16 dedicated cores, medians of 3 runs, 2026-09-10.
+> Provenance: `scx` CLI, `cpu_batch` with 16 dedicated cores, medians of 3
+> runs, 2026-09-10. Two release worktrees, so **three columns over two
+> binaries**: `base` is `441e7ae8`; the "batch value encode only" and
+> "`--memory-budget 8G`" columns are both `0e8db037` and differ only by the
+> flag, since at that commit `optimize`'s default in-flight allowance admits
+> about two census_1m shards.
 > census_1m is 2.8 GB / 245 shards.
 
 | op | dataset | base | batch value encode only | + `--memory-budget 8G` |

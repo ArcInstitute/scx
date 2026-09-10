@@ -1185,7 +1185,7 @@ def optimize(
     output: str,
     codec: str = ...,
     shard_obs: str = ...,
-    memory_budget: str | None = ...,
+    memory_budget: int | str | None = ...,
 ) -> None: ...
 
 

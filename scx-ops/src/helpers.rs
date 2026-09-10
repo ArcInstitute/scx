@@ -157,13 +157,14 @@ mod tests {
         }
     }
 
-    /// The whole reason this crate keeps its own wrapper: `scx-codec` reports an
-    /// out-of-range value as a `CodecError::Io` carrying only a message, and
-    /// `OpsError::ValueOutOfRange`'s `value` / `encoding` / `max` fields are
-    /// what pyscx maps and what the sibling tests above assert on. So the batch
-    /// path must surface *this* crate's error, with the offending value in it —
-    /// and must leave the accumulator untouched, since the row that failed
-    /// wrote nothing.
+    /// The whole reason this crate keeps its own wrapper: `OpsError::
+    /// ValueOutOfRange`'s `value` / `encoding` / `max` fields are what pyscx
+    /// maps and what the sibling tests above assert on, so the batch path must
+    /// surface *this* crate's error rather than `scx-codec`'s. It carries the
+    /// same three fields now, so lifting it is a one-variant `map_err` — but
+    /// this test is what says the offending value survives that lift, and that
+    /// the accumulator is left untouched, since the row that failed wrote
+    /// nothing.
     #[test]
     fn encode_values_reports_the_ops_error_naming_the_offender() {
         for (enc, offender, name) in [

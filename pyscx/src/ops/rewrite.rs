@@ -192,7 +192,12 @@ pub fn optimize(
     output: &str,
     codec: &str,
     shard_obs: &str,
-    memory_budget: Option<&str>,
+    // `&Bound<PyAny>`, not `&str`: every other `memory_budget` kwarg in pyscx
+    // goes through `convert::parse_memory_budget` and accepts `None`, an int of
+    // bytes, or a string like `"8G"`. Typing this one as `&str` made
+    // `memory_budget=8_000_000_000` a `TypeError` on the one op whose default
+    // changed, which is the least helpful place to diverge.
+    memory_budget: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
     let input_path = PathBuf::from(input);
     let output_path = PathBuf::from(output);
@@ -227,17 +232,13 @@ pub fn optimize(
             output_path.display()
         )));
     }
-    // Parsed before any file I/O, so a malformed size raises rather than
-    // failing partway through a rewrite -- the rule `scx convert` follows.
-    let memory_budget = match memory_budget {
-        Some(spec) => Some(
-            scx_format_io::MemoryBudget::parse(spec)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        ),
-        None => None,
-    };
+    // Parsed before the rewrite starts, so a malformed size raises rather than
+    // failing partway through -- though *after* the no-clobber path check
+    // above, so an invalid budget on a call that would also be refused for an
+    // existing output reports the output first.
+    let memory_budget = crate::convert::parse_memory_budget(memory_budget)?;
     py.detach(|| {
-        scx_ops::optimize_with_framing(
+        scx_ops::optimize_with_budget(
             &input_path,
             &output_path,
             codec_id,

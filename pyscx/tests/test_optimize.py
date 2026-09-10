@@ -71,3 +71,38 @@ class TestOptimize:
             _create_v2_scx(src)
             # Should not raise — 'auto' is the default
             pyscx.optimize(src, dst)
+
+    def test_optimize_memory_budget_accepts_str_int_and_none(self):
+        """The budget caps the parallel re-encode's in-flight bytes.
+
+        Three accepted spellings, matching every other pyscx ``memory_budget``:
+        ``None`` (the 1 GiB default, which is *not* unbounded), an int of bytes,
+        and a binary-prefixed string. A tiny budget is the documented way to pin
+        the one-shard-at-a-time behaviour this call had before the re-encode
+        became parallel, so it must succeed rather than refuse — a single
+        shard's encode is irreducible.
+        """
+        for budget in (None, 1, 1024, "512M", "2GiB"):
+            with tempfile.TemporaryDirectory() as tmp:
+                src = os.path.join(tmp, "in.scx")
+                dst = os.path.join(tmp, "out.scx")
+                _create_v2_scx(src)
+                pyscx.optimize(src, dst, memory_budget=budget)
+                assert os.path.exists(dst), f"budget {budget!r} produced no output"
+
+    # Byte identity across in-flight budgets is deliberately *not* asserted
+    # here: it is a property of the Rust re-encode, pinned by
+    # `optimize_honours_an_explicit_codec_at_every_concurrency` (which sweeps
+    # the budget from one shard per chunk to all of them and compares the
+    # catalog's entry order as well as the contents) and by cross-arm
+    # per-section digests at census scale. What Python owns is the kwarg's
+    # contract, which is what these tests cover.
+    def test_optimize_rejects_a_decimal_memory_budget(self):
+        """Decimal suffixes are ambiguous and rejected everywhere in scx."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in.scx")
+            _create_v2_scx(src)
+            with pytest.raises(ValueError):
+                pyscx.optimize(
+                    src, os.path.join(tmp, "out.scx"), memory_budget="10GB"
+                )

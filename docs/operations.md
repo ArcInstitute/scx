@@ -622,11 +622,21 @@ the policy — `optimize` never collapses or re-sizes existing obs shards (use
 single-section input is read whole by `read_obs()` either way, so the benefit is
 purely for future readers of the output.
 
-In Python: `pyscx.optimize(input, output, codec="auto", shard_obs="auto")`. The
-`codec` kwarg takes `"auto"` (default) or `"scx1"`, and `shard_obs` takes
+In Python:
+`pyscx.optimize(input, output, codec="auto", shard_obs="auto", memory_budget=None)`.
+The `codec` kwarg takes `"auto"` (default) or `"scx1"`, and `shard_obs` takes
 `"off"|"auto"|"always"` (default `"auto"`), with the same semantics as the CLI
-flags; any other value raises `ValueError`. There is no `force` analogue — pass
-`output == input` for an in-place upgrade, or remove the target first.
+flags; any other value raises `ValueError`. `memory_budget` takes `None`, an int
+of bytes, or a binary-prefixed string (`"512M"`, `"8G"`) — see
+[`scx optimize --memory-budget`](#scx-optimize---memory-budget); a small value
+pins the one-shard-at-a-time behaviour this call had before the re-encode became
+parallel. There is no `force` analogue — pass `output == input` for an in-place
+upgrade, or remove the target first.
+
+**The Python binding does not frame.** It exposes no framing knob and calls the
+unframed entry point, so it stamps `format_version = 3` where the CLI defaults
+to framed v4. If you need the row-group `BlockIndex` — sub-shard random access,
+or framed-Scx1 GPU device decode — use `scx optimize --row-group-rows N`.
 
 ## CellBender import
 

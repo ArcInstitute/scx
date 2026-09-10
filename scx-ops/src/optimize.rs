@@ -65,7 +65,7 @@ pub fn optimize(
     codec: Option<CodecId>,
     obs_shard_policy: ObsShardPolicy,
 ) -> Result<()> {
-    optimize_with_framing(input_path, output_path, codec, obs_shard_policy, None, None)?;
+    optimize_with_framing(input_path, output_path, codec, obs_shard_policy, None)?;
     Ok(())
 }
 
@@ -80,13 +80,42 @@ pub fn optimize(
 /// smaller of {heuristic winner, ShufDeltaZstd} per shard; a framed shard
 /// forgoes the Scx1 GPU/per-row decode sidecar (it uses the block index
 /// instead), so `compact-trial` optimizes for size + random access.
+/// Note this is the **unframed** entry point when `framing` is `None`: the
+/// output is stamped `format_version = 3`. Only a `Some(FramingConfig)` with
+/// `row_group_rows > 0` produces the framed v4 layout the CLI defaults to.
+pub fn optimize_with_framing(
+    input_path: &Path,
+    output_path: &Path,
+    codec: Option<CodecId>,
+    obs_shard_policy: ObsShardPolicy,
+    framing: Option<FramingConfig>,
+) -> Result<OptimizeStats> {
+    optimize_with_budget(
+        input_path,
+        output_path,
+        codec,
+        obs_shard_policy,
+        framing,
+        None,
+    )
+}
+
+/// [`optimize_with_framing`] with a cap on what the parallel shard re-encode may
+/// hold in flight.
+///
+/// A separate entry point rather than a sixth parameter on
+/// `optimize_with_framing`: that function is documented in `docs/api.md` and
+/// `scx-ops` carries no `publish = false`, so a downstream git or path
+/// dependency would fail to compile on a changed arity. There is no behavioural
+/// difference — `optimize_with_framing` delegates here with `None`.
+///
 /// `memory_budget` bounds how many shards may be encoded concurrently: the
 /// re-encode runs in chunks whose whole live phase fits the budget. `None` does
 /// **not** mean unbounded — see `encode_budget::DEFAULT_IN_FLIGHT_BYTES`, which
 /// keeps the default peak increase a constant instead of a multiple of the
 /// host's core count. A budget smaller than one shard's phase still admits one
 /// shard, because a single shard's encode is irreducible.
-pub fn optimize_with_framing(
+pub fn optimize_with_budget(
     input_path: &Path,
     output_path: &Path,
     codec: Option<CodecId>,
@@ -829,7 +858,7 @@ mod tests {
         }
 
         let out = dir.path().join("out.scx");
-        optimize_with_framing(&input, &out, None, ObsShardPolicy::Off, None, None)
+        optimize_with_framing(&input, &out, None, ObsShardPolicy::Off, None)
             .expect("optimize must re-encode an obsp shard wider than the file's index dtype");
 
         // The graph survives, at its own width.
@@ -906,7 +935,7 @@ mod tests {
         let mut reference: Option<(Layout, Shards)> = None;
         for budget in [Some(0u64), Some(1024), Some(64 * 1024 * 1024), None] {
             let output = dir.path().join(format!("out_{budget:?}.scx"));
-            optimize_with_framing(
+            optimize_with_budget(
                 &input,
                 &output,
                 Some(CodecId::Zstd),
@@ -1026,7 +1055,6 @@ mod tests {
                 trial: true,
                 decode_target: None,
             }),
-            None,
         )
         .unwrap();
         assert_eq!(stats.format_version, 4);

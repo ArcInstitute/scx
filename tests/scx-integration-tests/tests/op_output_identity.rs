@@ -331,12 +331,6 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
             trial: false,
             decode_target: Some(scx_format_io::codec_select::DecodeTarget::Auto),
         }),
-        // No memory budget: the arm's job is byte identity, and the default
-        // in-flight allowance is what every ordinary caller gets. Whether the
-        // parallel re-encode changes bytes at other concurrencies is a
-        // different question, answered by running this whole test at
-        // RAYON_NUM_THREADS 1 / 2 / 12 (see the module docs).
-        None,
     )
     .unwrap();
     assert_output_shards_are_multi_group(&out);
