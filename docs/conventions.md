@@ -473,17 +473,22 @@ dispatcher but with a simpler precondition set:
   `data_ds.write_slice`, `indptr_ds.write_slice`) stay on the calling
   thread. There is no concurrent HDF5 access on this path, so
   non-threadsafe libhdf5 builds work just as well as threadsafe ones.
-- **Exact per-shard memory budget.** Every CSR shard records its
-  `nnz` and row range in `FullCatalogEntry::stats` at convert time.
-  `per_shard_export_bytes(stats)` computes the working set
-  precisely — `nnz × 8` (indices + data) + `(n_rows + 1) × 8`
-  (indptr) + `nnz × 8` (**decoder** scratch, via
+- **Per-shard memory estimate from real shard statistics, not a
+  heuristic.** Every CSR shard records its `nnz` and row range in
+  `FullCatalogEntry::stats` at convert time, so
+  `per_shard_export_bytes(stats)` sizes the decode phase from measured
+  nnz — `nnz × 8` (indices + data) + `(n_rows + 1) × 8` (indptr) +
+  `nnz × 8` (**decoder** scratch, via
   `budget::shard_decode_working_set_bytes`). No density heuristic, no
   modality-type branching, and deliberately **not** the ingest model:
-  export decodes, so it carries no encode term. Still `enforced: false` —
-  `filter_shard` allocates past what this charges. The memory-budget derate constrains
-  `reader_threads + writer_queue_depth` against `max_shard_bytes` so
-  the rolling-window cap matches the budget directly.
+  export decodes, so it carries no encode term. It is still **not a
+  bound** and the row stays `enforced: false` — `filter_shard` builds a
+  `kept_indptr_tail` while `indptr_local` is live and grows
+  `kept_indices` / `kept_data` from empty by doubling alongside the
+  originals, none of which this charges. The memory-budget derate
+  constrains `reader_threads + writer_queue_depth` against
+  `max_shard_bytes` so the rolling-window cap matches the estimate
+  directly.
 - **No `max_slab_rows` clamp.** SCX shards are random-access via
   `ScxReader::read_shard_from_entry(entry)` — the export walk passes the
   catalog entry it already holds rather than an index the reader re-resolves,

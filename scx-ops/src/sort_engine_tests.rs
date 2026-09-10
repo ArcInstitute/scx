@@ -1972,6 +1972,79 @@ fn grouped_fast_path_deterministic() {
 /// total peak (`concurrency × per-block transient`) stays within the budget,
 /// instead of scaling with core count.
 #[test]
+fn grouped_block_byte_cap_keeps_one_block_inside_the_budget() {
+    use super::{
+        block_cut_bytes_per_nnz, grouped_block_byte_cap, grouped_fast_concurrency,
+        GROUPED_BLOCK_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ,
+    };
+    use scx_codec::ValueEncoding;
+
+    // `grouped_fast_concurrency_honors_budget` passes the *default* 256 MB cap,
+    // so it never exercises the clamp. This drives the production pair — the
+    // clamp and the concurrency cut — at every value encoding, which is where
+    // the two were denominated differently: the cap counted narrowed
+    // accumulator bytes and the gather held `i32 + f32`.
+    let mib = 1024 * 1024;
+    let default_cap = 256 * mib;
+    let threads = 192;
+
+    // Several budgets, because the two spellings differ only where the clamp
+    // *binds*: at 8 GiB the default cap is the smaller of the two and even the
+    // old arithmetic held, at 2 GiB the old clamp left the cap at 256 MB and a
+    // single Uint8 block cost 1.2x the budget, and at 256 MiB / 1 GiB the clamp
+    // is what sets the cap.
+    for &budget in &[256 * mib, 1024 * mib, 2048 * mib, 8 * 1024 * mib] {
+        for enc in [
+            ValueEncoding::Uint8,
+            ValueEncoding::Uint16,
+            ValueEncoding::Float16,
+            ValueEncoding::Uint32,
+            ValueEncoding::Float32,
+        ] {
+            let per_nnz_bytes = block_cut_bytes_per_nnz(enc);
+            let cap = grouped_block_byte_cap(default_cap, Some(budget), enc);
+            let c = grouped_fast_concurrency(threads, cap, per_nnz_bytes, Some(budget)) as u64;
+            let per_block =
+                (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ) * (cap / per_nnz_bytes).max(1);
+            assert!(
+                c * per_block <= budget,
+                "{enc:?} at budget {budget}: concurrency {c} x per_block {per_block} = {} \
+                 exceeds it (cap {cap}, per_nnz_bytes {per_nnz_bytes})",
+                c * per_block
+            );
+            assert!(c >= 1, "{enc:?}: concurrency must never fall below 1");
+        }
+    }
+
+    // No budget → the cap is passed through, and `0` (sub-flush disabled) stays
+    // `0` at every encoding rather than being floored to 1.
+    let budget = 8 * 1024 * mib;
+    assert_eq!(
+        grouped_block_byte_cap(default_cap, None, ValueEncoding::Uint8),
+        default_cap
+    );
+    assert_eq!(
+        grouped_block_byte_cap(0, Some(budget), ValueEncoding::Uint8),
+        0
+    );
+
+    // f32 is the arm the previous `budget / GROUPED_BLOCK_PHASE_MULTIPLE`
+    // spelling got right, so it must be byte-for-byte unchanged — the clamp is
+    // a narrow-encoding fix, not a re-tuning of the default path.
+    assert_eq!(
+        grouped_block_byte_cap(default_cap, Some(budget), ValueEncoding::Float32),
+        default_cap
+            .min(budget / GROUPED_BLOCK_PHASE_MULTIPLE)
+            .max(1)
+    );
+    // And `Uint8` is where it moved: 5/8 of the f32 cap.
+    assert_eq!(
+        grouped_block_byte_cap(default_cap, Some(budget), ValueEncoding::Uint8),
+        default_cap.min(budget * 5 / 48).max(1)
+    );
+}
+
+#[test]
 fn grouped_fast_concurrency_honors_budget() {
     use super::{grouped_fast_concurrency, GROUPED_BLOCK_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ};
 

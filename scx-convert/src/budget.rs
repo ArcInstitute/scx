@@ -227,6 +227,21 @@ pub(crate) const ENCODER_VALUE_COPY_MULTIPLE: u64 = 1;
 /// `WORKING_SET_SCRATCH_MULTIPLE = 2` that read "rebuild / encode scratch,
 /// bounded by the payload it is built from" — a bound that stopped holding.
 /// See `scx-format-io/src/encoder.rs`'s `rayon::join` comment.
+///
+/// ⚠️ **Charged unconditionally, including to jobs that provably
+/// single-encode.** The `x2` above is the dual-candidate overlap, which only
+/// `codec="auto"` / `"compact"` / `compact-trial` incur: `resolve_codec` gives
+/// the `fast` profile and every explicit codec `decode_target: None`, and an
+/// unframed output falls back to one encode. `run_streaming_writer_coordinator`
+/// asks `indexed.per_worker_bytes(...)` and passes none of `opts.codec`,
+/// `codec_trial` or `decode_target`, so a `--codec zstd` convert is charged
+/// ~2x the encode buffers it will hold. That is the **safe** direction for
+/// memory but not a free one: it costs those jobs threads, and it raises the
+/// smallest budget `ensure_shard_fits_budget` accepts. Closing it means
+/// threading the resolved encode plan through
+/// [`crate::stream::IndexedCsrShardStream::per_worker_bytes`] (four impls and
+/// two call sites) and splitting this into single- and dual-candidate costs;
+/// deliberately not done here.
 pub(crate) const ENCODE_TRANSIENT_MULTIPLE: u64 = 4;
 
 /// Bytes one nonzero costs across a worker's **whole** phase: the resident
@@ -337,8 +352,11 @@ pub(crate) const CSC_BUCKET_SHARE: Share = Share::new(1, 4);
 /// payload, the reader's rebuild scratch, the framed encode's buffers, and the
 /// indptr — [`WORKER_PHASE_BYTES_PER_NNZ`] per nonzero.
 ///
-/// Single source for the ingest worker derate and the export-side per-shard
-/// estimate, so the two cannot drift.
+/// **Ingest only.** It was the single source for the ingest derate and the
+/// export-side per-shard estimate until the encode charge landed; export holds
+/// no encode buffers, so a shared model over-derated a budgeted export
+/// threefold. The export side is [`shard_decode_working_set_bytes`], and the
+/// two are deliberately separate rather than one function two phases share.
 pub(crate) fn shard_working_set_bytes(nnz: u64, n_rows: u64) -> u64 {
     let indptr = n_rows
         .saturating_add(1)
@@ -395,17 +413,19 @@ pub(crate) fn estimated_worker_bytes(shard_target_rows: u64, n_vars: u64, densit
 /// case [`DENSE_SPARSIFY_BYTES_PER_ELEM`] already assumes, so the two terms
 /// are consistent rather than one being pessimistic against the other.
 ///
-/// It takes `dtype_bytes` and returns 44 at every width this crate supports
-/// (1/2/4/8 all make `dense_peak_bytes_per_elem` 12), which two reviewers
-/// correctly called an inert parameter. It stays a `const fn` anyway, for a
-/// reason that outweighs the tidiness: CI's "both dense budget sites derive
-/// from one table entry" guard counts `crate::budget::dense_*(` **calls** in
-/// `h5ad/dense_stream.rs` and fails below four. A constant is not a call, so
-/// collapsing this would drop the count to three and require weakening the
-/// guard — and that guard is exactly what keeps the slab cap and the
-/// per-worker estimate deriving from one figure, which is the drift this
-/// change actually hit (charging the encode at the estimate while the cap
-/// ignored it re-created §11.5). An inert parameter is the cheaper cost.
+/// It returns 44 at every width this crate supports today, so `dtype_bytes`
+/// looks inert — three reviewers have now suggested dropping it. It is not:
+/// [`dense_peak_bytes_per_elem`] is `max(dtype_bytes + 4, 12)`, constant only
+/// because every dtype the reader accepts is at most 8 bytes wide. Hard-coding
+/// 44 would bake that ceiling in silently, which is the property that function
+/// deliberately expresses as a `max` rather than as the literal 12. Both
+/// callers ([`dense_slab_bytes`], [`dense_max_slab_rows`]) already take
+/// `dtype_bytes` from the reader, so threading it costs nothing.
+///
+/// Keeping it a `const fn` rather than a `const` also keeps CI's "both dense
+/// budget sites derive from one table entry" guard working: it counts
+/// `crate::budget::dense_*(` **calls** in `h5ad/dense_stream.rs` and fails
+/// below four, and a constant is not a call.
 ///
 /// ⚠️ **Both dense sites must use this, not the slab alone.** Charging the
 /// encode term in `per_worker_bytes` while sizing the slab cap from the slab
@@ -590,6 +610,11 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         //   * **readers without an exact nnz.** `MaterializedCsrStream` and
         //     anything else on the trait default takes the 5%/10% density
         //     guess, which a dense-stored-as-CSR matrix under-estimates.
+        //     (`PermutedCsrReader` used to belong here for a different
+        //     reason — it delegated to the CSR override, whose source-aligned
+        //     window maximum does not describe the shard a permutation emits.
+        //     It now walks `perm` through the inner `indptr` instead, so a
+        //     sort- or group-on-convert prices the shard it will write.)
         //
         // Closing it means codec-specific worst cases plus an exact override
         // for the density-guess readers, with allocation tests for the

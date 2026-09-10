@@ -1081,7 +1081,25 @@ fn parallel_export_memory_budget_derates_workers() {
         memory_budget: Some(1500),
         ..ExportOptions::default()
     };
+    // Drain-peak oracle: without it both assertions below stay green when the
+    // export collapses to the sequential coordinator (the derate warning fires
+    // on the way *to* that collapse). The ingest twin grew this for exactly
+    // that blindness; recoupling `per_shard_export_bytes` to the ingest model
+    // would over-derate this fixture to threads=1 and neither warning
+    // assertion would notice.
+    super::parallel_drain::hooks::set_last_run_peak(0);
     scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut sink).unwrap();
+    let export_peak = super::parallel_drain::hooks::last_run_peak();
+    assert!(
+        export_peak > 0,
+        "expected the parallel export drain to run; last_run_peak() == 0 means \
+         the export took the sequential route"
+    );
+    assert!(
+        export_peak <= 3,
+        "granted threads + depth is 3 at this budget, so in-flight shards must \
+         not exceed it; got {export_peak}"
+    );
 
     let warnings = log.lock().unwrap();
     assert!(

@@ -19,33 +19,45 @@ Bit-level equality is asserted in the Rust round-trip test
 `scx-convert/src/tests.rs::streaming_round_trip_matches_non_streaming`;
 the benchmark only needs to flag drift, not characterise it.
 
-Two **extra streaming arms** run on the datasets named in `_EXTRA_ARMS`. Both
-exist because the arms above pass *no* conversion options at all — their only
-kwarg is `reader_threads` — so the bounded-memory contract this benchmark
-enforces has only ever been measured in the default configuration:
+**Three extra streaming arms** run on the datasets named in `_EXTRA_ARMS`. All
+three exist because the arms above pass *no* conversion options at all — their
+only kwarg is `reader_threads` — so this benchmark's memory numbers have only
+ever been measured in the default configuration:
 
 - **csc_always** — `from_h5ad(..., csc="always")`. `CscPolicy::default()` is
   `off`, so nothing in this suite has exercised `write_csc_sidecar`, which takes
   the whole CSR by value. Expected to breach the streaming ceiling.
 - **index_preset_cellxgene** — `from_h5ad(..., index_preset="cellxgene")`,
   materialising predicate indexes at write time.
-- **budget_bound** — `from_h5ad(..., memory_budget=2GiB, shard_size=2048)`, the
-  **only** arm anywhere in this suite that passes a memory budget to anything
-  other than `build_csc`. It carries
-  `peak_over_memory_budget__budget_bound`, which is the whole point: a ratio
-  ≤ 1 means the process stayed inside the budget it was handed. A premise check
-  refuses the arm unless a `reader_threads_derated` warning proves the budget
-  actually bound, because a dropped budget produces a *passing* number.
+- **budget_bound** — `from_h5ad(..., memory_budget=2GiB, shard_size=2048,
+  reader_threads=12)`, the **only** arm anywhere in this suite that passes a
+  memory budget to anything other than `build_csc`. It carries
+  `peak_over_memory_budget__budget_bound`: the process's peak RSS over the
+  budget it was handed.
+  Read that ratio as an **observed ceiling on a measured shape, not as proof of
+  a bound** — every row of `scx-convert`'s allocation table is `enforced:
+  false`, each naming what it does not price (frame expansion, intra-codec
+  planes, encoded indptr, the bitmap, the density-guess readers), so one
+  compressible fixture landing at ~0.55 cannot promote an estimate into a
+  contract. Its value is regression detection: the ratio moving up means
+  something started allocating that the model does not charge.
+  A premise check refuses the arm unless the Rust log shows
+  `granted < requested` reader threads — warning *presence* is not enough,
+  since the derate also fires when it shrinks only the queue depth, and a
+  dropped budget produces a *passing* number.
 
-Each is pinned to the same `GATED_READER_THREADS` as the gated arm so its number
-is comparable, and each gets `<label>_peak_rss_mb` / `<label>_wall_s` from the
-same f-string the base arms use — no separate emission path, and no chance of an
-extra arm polluting the floored `streaming_peak_rss_mb` key.
+`csc_always` and `index_preset_cellxgene` are pinned to the same
+`GATED_READER_THREADS` as the gated arm so their numbers are comparable;
+`budget_bound` pins **12** in its own kwargs, because at 4 the derate leaves
+threads alone and shrinks only depth. Each gets `<label>_peak_rss_mb` /
+`<label>_wall_s` from the same f-string the base arms use — no separate
+emission path, and no chance of an extra arm polluting the floored
+`streaming_peak_rss_mb` key.
 
-Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms are **not** swept — neither
+Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms are **not** swept — none
 varies along the thread axis, since each changes a conversion option — but they
-still run **once** at `GATED_READER_THREADS` before the sweep, so a sweep capture
-does not silently lose the non-default coverage.
+still run **once**, each at its own pinned thread count, before the sweep, so a
+sweep capture does not silently lose the non-default coverage.
 
 Thread scaling is opt-in via the `SCX_CONV_STREAM_THREAD_COUNTS` env
 var (comma-separated, e.g. `1,2,4,8,16,32`). When set, each thread
@@ -939,7 +951,10 @@ def _run_extra_arms_once(
     result: BenchmarkResult,
     dataset_name: str | None,
 ) -> None:
-    """Run each in-scope `_EXTRA_ARMS` entry once at `GATED_READER_THREADS`.
+    """Run each in-scope `_EXTRA_ARMS` entry once, at its own pinned threads.
+
+    `GATED_READER_THREADS` for `csc_always` / `index_preset_cellxgene`;
+    whatever the arm put in its own kwargs otherwise (`budget_bound` pins 12).
 
     Used by the thread-scaling path, which sweeps `streaming` vs `materialize`
     and has no reason to sweep these — neither arm varies along the thread axis;
