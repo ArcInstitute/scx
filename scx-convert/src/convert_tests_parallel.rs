@@ -1482,12 +1482,20 @@ fn parallel_export_worker_panic_does_not_deadlock() {
 /// The arithmetic, with `n_vars = 50` f32 (`row_bytes = 200`) and
 /// `memory_budget = 24_000`:
 ///
-/// | | before the fix | after |
-/// |---|---|---|
-/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(6000−8)/(50×12+8) = 9` |
-/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `9×50×12 + 10×8 = 5480` |
-/// | `outstanding_max` | 2 | 4 |
-/// | `granted_threads` | **1 → sequential** | **3 → parallel** |
+/// | | before §11.5's fix | after it | after the encode charge |
+/// |---|---|---|---|
+/// | per-element cost | `2 × sizeof(dtype)` | 12 (slab + sparsified) | **44** (+ the framed encode) |
+/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(6000−8)/(50×12+8) = 9` | `(6000−8)/(50×44+8) = 2` |
+/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `9×50×12 + 10×8 = 5480` | `2×50×44 + 3×8 = 4424` |
+/// | `outstanding_max` | 2 | 4 | 5 |
+/// | `granted_threads` | **1 → sequential** | **3 → parallel** | **4 → parallel** |
+///
+/// The third column is the point of charging the encode in
+/// `dense_worker_phase_bytes_per_elem` rather than adding it at
+/// `per_worker_bytes`: the cap shrinks with the cost, so
+/// `per_worker_bytes(max_slab_rows)` stays inside the share and the parallel
+/// route survives. Adding it only at the estimate gave `outstanding_max = 1`
+/// and put this test back in the state it was written to catch.
 ///
 /// The post-fix column includes the `u64` indptr and solves for rows affinely
 /// (`rows × (n_vars × 12 + 8) + 8 ≤ share`), both added in the review round. An

@@ -8,12 +8,23 @@ use scx_format_io::modality::ModalityType;
 
 use super::pipeline::ConvertError;
 
-/// Working-set bytes for processing one CSR shard of `nnz` non-zeros over
-/// `n_rows` rows: the decoded `i32` indices + `f32` values (8 B/nnz) plus an
-/// equal scratch allowance for the rebuild/encode buffers, plus the
-/// shard-local `u64` indptr. Single source shared by the ingest worker-derate
-/// (`IndexedCsrShardStream::per_worker_bytes`) and the export-side
-/// `per_shard_export_bytes`, so the two budgets can't drift.
+/// Working-set bytes for one CSR shard of `nnz` non-zeros over `n_rows` rows,
+/// in two flavours because ingest and export hold different things:
+///
+/// * `shard_working_set_bytes` — the **ingest** worker's whole phase, 48 B/nnz
+///   plus the indptr: the decoded `i32` indices + `f32` values, the encoder's
+///   own re-serialised copy of them, and the framed encode's buffers for the
+///   two candidates `codec="auto"` runs concurrently. Used by
+///   `IndexedCsrShardStream::per_worker_bytes`.
+/// * `shard_decode_working_set_bytes` — the **export** side, 16 B/nnz plus the
+///   indptr: payload and decoder scratch, no encode term, because
+///   `h5ad/stream_write.rs` contains no encode call. Used by
+///   `per_shard_export_bytes`.
+///
+/// They shared one function until the encode charge landed, on the argument
+/// that a single model cannot drift. That argument holds only while the two
+/// phases are the same, and they are not — the shared model over-derated a
+/// budgeted export threefold for memory it never holds.
 pub(crate) use crate::budget::{shard_decode_working_set_bytes, shard_working_set_bytes};
 
 /// Major axis of the source matrix. Streaming readers always emit

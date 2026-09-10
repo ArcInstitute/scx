@@ -424,8 +424,9 @@ validated by a suite that cannot fail is indistinguishable from a regression.
   value copy, and the framed encode's two candidates).
   `DenseXStreamReader` overrides this with `effective_target × n_vars ×
   budget::dense_worker_phase_bytes_per_elem` (44 B/element). Both size the
-  **whole worker phase**, not the reader stage, which is what lets the
-  ingest/export reservations be `enforced: true`. Every constant and
+  **whole worker phase**, not the reader stage — a 3x better estimate, not a
+  proven ceiling: all three per-shard reservations remain
+  `enforced: false` and each names what it does not bound. Every constant and
   fraction here comes from `scx-convert/src/budget.rs`; do not
   re-derive one at a call site. When `--memory-budget` is set, worker
   count is clamped to fit; a single shard exceeding the budget fails
@@ -479,8 +480,8 @@ dispatcher but with a simpler precondition set:
   (indptr) + `nnz × 8` (**decoder** scratch, via
   `budget::shard_decode_working_set_bytes`). No density heuristic, no
   modality-type branching, and deliberately **not** the ingest model:
-  export decodes, so it carries no encode term and is the one
-  per-shard reservation that is `enforced: true`. The memory-budget derate constrains
+  export decodes, so it carries no encode term. Still `enforced: false` —
+  `filter_shard` allocates past what this charges. The memory-budget derate constrains
   `reader_threads + writer_queue_depth` against `max_shard_bytes` so
   the rolling-window cap matches the budget directly.
 - **No `max_slab_rows` clamp.** SCX shards are random-access via

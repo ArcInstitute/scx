@@ -821,8 +821,16 @@ def _run_isolated(
     for label, (kwargs, datasets) in _EXTRA_ARMS.items():
         if dataset_name in datasets:
             # Pinned to GATED_READER_THREADS so an extra arm's number is
-            # comparable with the default arm's rather than with the runner.
-            arms.append((label, GATED_READER_THREADS, kwargs))
+            # comparable with the default arm's rather than with the runner —
+            # unless the arm pins its own (budget_bound does, so the budget
+            # derates the thread count and not only the queue depth). Resolved
+            # **here**, not left to `kwargs.update` inside the worker: the
+            # worker ran at 12 while every run's `extra["reader_threads"]` and
+            # the log line said 4, and the sweep companion (which resolves it
+            # with the same `.get`) then disagreed with this path under the
+            # same label.
+            arm_threads = kwargs.get("reader_threads", GATED_READER_THREADS)
+            arms.append((label, arm_threads, kwargs))
             applicable_extras.append(label)
         else:
             result.metadata.setdefault("extra_arms_skipped", {})[label] = (

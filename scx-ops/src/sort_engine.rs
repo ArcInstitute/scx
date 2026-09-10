@@ -1643,10 +1643,27 @@ fn emit_x_in_memory(
 /// ordinary f32 case: cap 256 MiB → `per_block` 1.5 GiB against a 256 MiB
 /// budget, and `(budget / per_block).max(1)` returned 1.
 ///
-/// It is still only an inequality about the *planned* nnz per block: block
-/// construction admits a whole row before testing the cap, so a single
-/// pathologically deep row can overshoot `nnz_per_block`. Bounded by one row,
-/// and unchanged by this model.
+/// ⚠️ **Two residuals, both of which predate this model and neither of which
+/// it closes.** Read them before quoting the inequality.
+///
+/// 1. **Narrow value encodings still overshoot.** The planner cuts blocks on
+///    `per_nnz_bytes = 4 + value_width` (5 B for `Uint8`) while the gather is
+///    `Vec<u32>` + `Vec<f32>` = [`GROUP_BYTES_PER_NNZ`] = 8 B/nnz, so a full
+///    block holds `cap / per_nnz_bytes` nonzeros that each cost the phase
+///    multiple of 8. The overshoot factor is
+///    `GROUP_BYTES_PER_NNZ / per_nnz_bytes` — 1.0 for f32, ~1.33 for
+///    Uint16/Float16, **1.6 for Uint8**. Before this model charged the encode
+///    at all the same inequality was false by 3x (f32) to 4.8x (Uint8), so
+///    this is a strict improvement and still not a bound. The exact fix is to
+///    thread `per_nnz_bytes` into the `block_byte_cap` binding so the cap is
+///    `budget / multiple * per_nnz_bytes / GROUP_BYTES_PER_NNZ`; that moves
+///    shard *layout* for budgeted sorts, so it is deferred rather than done
+///    here.
+/// 2. **A whole row is admitted before the cap is tested**, so one
+///    pathologically deep row can overshoot `nnz_per_block` by its own length.
+///
+/// And `.max(1)` cannot honour a budget smaller than one block's phase: there
+/// is no concurrency below one.
 ///
 /// The encode side is `4×` and not the `~1×` this used to charge, because this
 /// path takes `writer.framing()`, which under `--codec auto` carries a
@@ -1714,8 +1731,9 @@ fn grouped_fast_concurrency(
 /// so at most ~`concurrency` blocks' gather + encoded buffers are in flight on
 /// top of the resident source CSR — O(concurrency × block cap), independent of
 /// the block count (it does NOT buffer the whole encoded matrix). `block_byte_cap`
-/// is clamped to `--memory-budget` upstream, which bounds a *single* block's
-/// transient. The **total** peak is `concurrency × per-block transient`, so when a
+/// is clamped to `--memory-budget / GROUPED_BLOCK_PHASE_MULTIPLE` upstream,
+/// which is what bounds a *single* block's whole-phase transient — clamping it
+/// to the raw budget did not (see [`grouped_fast_concurrency`]). The **total** peak is `concurrency × per-block transient`, so when a
 /// `memory_budget` is set `concurrency` is additionally capped to
 /// `budget / per-block transient` (see [`grouped_fast_concurrency`]) — otherwise a
 /// many-core host would run `rayon::current_num_threads()` blocks in flight and

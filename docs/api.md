@@ -716,7 +716,7 @@ column chunk in pass 1 and a quarter for bucket records in pass 2, and those
 never coexist. A unit test asserts that each phase's concurrent claims sum to
 at most the whole budget.
 
-Four claims are declared but **not enforced**, and the `enforced` flag is the
+Seven claims are declared but **not enforced**, and the `enforced` flag is the
 difference between "we sized this" and "nothing exceeds this" — read it before
 quoting a row as a guarantee:
 
@@ -726,23 +726,37 @@ quoting a row as a guarantee:
   full-length index and value copies and the encoder's streams are live next to
   it, and the rebuild path additionally retains every source shard. It controls
   column and shard sizing, not a ceiling;
+- the three per-shard **ingest / export** rows: on ingest, `encoded <= payload`
+  is an estimate rather than a codec guarantee (frames can expand, a codec
+  holds its raw, shuffled and compressed planes at once, the encoded indptr is
+  priced at zero for an `nnz = 0` shard, the detection bitmap is uncharged, and
+  readers on the trait default take a density guess); on export,
+  `filter_shard` holds a second indptr and, when masked, doubling-grown output
+  buffers alongside the originals;
 - the CSC **column-chunk** row's scan always reads the first column whole before
   testing the budget, so one wide column exceeds the share (on a large atlas
   that is an ordinary ubiquitous gene), and its floor exceeds the share for
   budgets under 128 bytes.
 
 They are named in the table so each gap is visible rather than silent, and a
-unit test pins the count so a fifth cannot arrive unannounced.
+unit test pins the count so an eighth cannot arrive unannounced.
 
-The three per-shard **ingest / export** rows used to be on that list, because
-each sized a *reader* working set while the worker also held the encoded shard.
-They now size the whole worker phase and are enforced. The share did not
-change — what widened is the cost model the share is applied to — so a budget
-now buys **fewer concurrent workers and smaller shards** rather than the same
+The three per-shard **ingest / export** rows are still on that list, but their
+*estimates* changed. Each used to size a reader working set while the worker
+also held the encoded shard. The two ingest rows now size the whole worker
+phase — 3x larger on sparse, 3.7x on dense — and the export row is sized from
+its own decode model rather than borrowing the ingest one. The share did not
+change; what widened is the cost model the share is applied to. So a budget now
+buys **fewer concurrent workers and smaller shards** rather than the same
 concurrency over an unpriced buffer, and a budget too small to hold one whole
 phase is refused outright instead of being silently over-committed. Budgets are
 opt-in (`memory_budget` defaults to unset), so nothing derates that did not ask
 to.
+
+They remain unenforced because a better estimate is not a proof: each row names
+the terms it still does not bound (codec frame expansion and intra-codec planes
+on ingest, `filter_shard`'s second indptr and doubling-grown buffers on
+export).
 
 Three different things are called "no budget", and they are not
 interchangeable: an unset `memory_budget` means *no cap at all*; pyscx's

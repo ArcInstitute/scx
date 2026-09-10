@@ -88,7 +88,7 @@ fn unenforced_reservations_are_declared_not_silent() {
         .filter(|r| !r.enforced)
         .map(|r| r.name)
         .collect();
-    // Six, and the count is pinned so a seventh cannot arrive unannounced:
+    // Seven, and the count is pinned so an eighth cannot arrive unannounced:
     //
     //   * the two §11.4 CSC bucket rows — bucket count and bucket record
     //     buffer are sized from the *mean* nnz/row, so a right-skewed depth
@@ -108,15 +108,23 @@ fn unenforced_reservations_are_declared_not_silent() {
     //     it does not bound: frame expansion, intra-codec planes, the encoded
     //     indptr, the bitmap, and readers on the density guess.
     //
-    // **It was seven, and it is six**, because `Phase::Export` closed: that
-    // path decodes, so `shard_decode_working_set_bytes` charges everything
-    // `stream_csr_to_group_at` holds, from the catalog's exact nnz, with no
-    // codec planes to be unsure about. One row's gap actually closed; the
-    // other two got a much better size and kept their flag.
+    //   * the **export** row — no encode term (that path decodes) and sized
+    //     from the catalog's exact nnz, but `filter_shard` holds two indptrs
+    //     on its no-filter path and doubling-grown output buffers alongside
+    //     the originals on its masked one.
+    //
+    // **Still seven.** An intermediate revision of this PR flipped all three
+    // per-shard rows to `enforced: true` and then, on review, flipped two back
+    // and finally the third. What this PR changes is the *estimate* — 3x
+    // better on sparse ingest, 3.7x on dense, and no longer blind to the
+    // encoder — not any row's flag. The share did not move either, which is
+    // why `allocation_table_shares_sum_to_at_most_one_per_phase` is
+    // unaffected. Widening a cost model is not the same as proving a ceiling,
+    // and this count is what keeps the two from being confused.
     assert_eq!(
         unenforced.len(),
-        6,
-        "expected the four CSC rows plus the two ingest rows to be \
+        7,
+        "expected all four CSC rows plus the three per-shard rows to be \
          unenforced, got {unenforced:?}. Adding an unenforced row without \
          updating this count lets a known gap enter the table unannounced; \
          removing one means a gap actually closed and this test should say so."
