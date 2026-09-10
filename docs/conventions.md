@@ -476,8 +476,11 @@ dispatcher but with a simpler precondition set:
   `nnz` and row range in `FullCatalogEntry::stats` at convert time.
   `per_shard_export_bytes(stats)` computes the working set
   precisely — `nnz × 8` (indices + data) + `(n_rows + 1) × 8`
-  (indptr) + `nnz × 8` (codec scratch). No density heuristic, no
-  modality-type branching. The memory-budget derate constrains
+  (indptr) + `nnz × 8` (**decoder** scratch, via
+  `budget::shard_decode_working_set_bytes`). No density heuristic, no
+  modality-type branching, and deliberately **not** the ingest model:
+  export decodes, so it carries no encode term and is the one
+  per-shard reservation that is `enforced: true`. The memory-budget derate constrains
   `reader_threads + writer_queue_depth` against `max_shard_bytes` so
   the rolling-window cap matches the budget directly.
 - **No `max_slab_rows` clamp.** SCX shards are random-access via

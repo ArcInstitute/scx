@@ -58,6 +58,7 @@ in-process. Unset → in-process at the inherited thread count
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
@@ -185,11 +186,29 @@ def _skip_materialize_reason(n_obs: int) -> str | None:
 # a floor there is only evaluated under an explicit `--datasets`, which is why
 # it is recorded as a deferred floor rather than gated here.
 _BUDGET_ARM_BYTES = 2 * 1024 * 1024 * 1024
+# **Binary** MiB, matching `PeakRssSampler`, which divides by `1024 * 1024`
+# (`rss.py`). Dividing the peak by `_BUDGET_ARM_BYTES / 1e6` instead mixes
+# binary MiB into a decimal-MB denominator and skews the ratio ~4.8% low —
+# which for a floor set at exactly 1.0 is 4.8% of borrowed headroom.
+# `build_csc.py` uses the same convention (`_MEMORY_LIMIT_MB = 4 * 1024`).
+_BUDGET_ARM_MB = _BUDGET_ARM_BYTES / (1024 * 1024)
 
 _EXTRA_ARMS: dict[str, tuple[dict[str, object], frozenset[str]]] = {
     "csc_always": ({"csc": "always"}, frozenset({"tabula_sapiens_100k"})),
     "budget_bound": (
-        {"memory_budget": str(_BUDGET_ARM_BYTES), "shard_size": 2048},
+        # `reader_threads` is inside the arm's kwargs deliberately, so
+        # `kwargs.update` overrides the `GATED_READER_THREADS` pin every other
+        # extra arm inherits. At the pinned 4 with the default depth 4 the
+        # derate leaves threads at 4 and only shrinks depth 4 -> 1: the arm
+        # would have recorded a peak under a *depth* derate while claiming to
+        # gate a *thread* derate, and the PR's measured "12 -> 4" would never
+        # have happened on it. 12 forces `granted < requested` here, and keeps
+        # doing so if `ENCODE_TRANSIENT_MULTIPLE` is later re-derived downward.
+        {
+            "memory_budget": str(_BUDGET_ARM_BYTES),
+            "shard_size": 2048,
+            "reader_threads": 12,
+        },
         frozenset({"smartseq2"}),
     ),
     # census_500k / census_1m are EXCLUDED, and not because they lack the
@@ -296,20 +315,43 @@ def _timed_streaming(
     # thread count and stays comparable with the default one.
     if extra_kwargs:
         kwargs.update(extra_kwargs)
-    # Capture the conversion's warnings so a `memory_budget` arm can prove the
-    # budget actually bit. `emit_python_warnings` raises one `UserWarning` per
-    # warning *category*, whose text is
-    # `"scx conversion: N warning(s) of type 'reader_threads_derated'"`. A
-    # budget that is silently ignored produces a perfectly good number under
-    # the budget label, so the absence of that category is the failure mode
-    # this exists to catch — the same shape as `csc_always` recording a default
-    # conversion.
+    # Capture what the derate actually granted, so a `memory_budget` arm can
+    # prove the budget bound rather than inferring it.
+    #
+    # Two observables, and the second is the load-bearing one:
+    #
+    # * the `UserWarning` category (`"scx conversion: N warning(s) of type
+    #   'reader_threads_derated'"`) says *a* derate happened — but
+    #   `derate_threads_and_depth` emits it whenever
+    #   `requested_threads + requested_depth > outstanding_max`, **including
+    #   when the granted thread count is unchanged and only the queue depth
+    #   shrank**. Presence alone is therefore not evidence that the encode
+    #   charge moved anything.
+    # * the Rust log record carries `requested: N, granted: M` verbatim
+    #   (pyo3-log forwards it to Python `logging`), which is the actual
+    #   quantity. `granted < requested` is what "the budget bound the thread
+    #   count" means.
+    #
+    # Without either, a budget that never reaches the coordinator produces a
+    # perfectly good number under the budget label — the same shape as
+    # `csc_always` recording a default conversion.
+    log_buf = io.StringIO()
+    handler = logging.StreamHandler(log_buf)
+    handler.setLevel(logging.DEBUG)
+    root = logging.getLogger()
+    prev_level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
     t0 = time.perf_counter()
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        with PeakRssSampler() as sampler:
-            pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
-    wall = time.perf_counter() - t0
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with PeakRssSampler() as sampler:
+                pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
+        wall = time.perf_counter() - t0
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(prev_level)
     categories = sorted(
         {
             m.group(1)
@@ -317,10 +359,13 @@ def _timed_streaming(
             if (m := re.search(r"warning\(s\) of type '([^']+)'", str(w.message)))
         }
     )
+    derate = re.search(r"requested:\s*(\d+),\s*granted:\s*(\d+)", log_buf.getvalue())
     return {
         "wall_s": wall,
         "peak_rss_mb": sampler.peak_mb,
         "warning_categories": categories,
+        "derate_requested_threads": int(derate.group(1)) if derate else None,
+        "derate_granted_threads": int(derate.group(2)) if derate else None,
     }
 
 
@@ -349,7 +394,8 @@ def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
 # paired (streaming, materialize) conversions on the supplied h5ad,
 # emits one JSON list to stdout where each element is
 # `{"scenario", "run_idx", "wall_s", "peak_rss_mb",
-#   "warning_categories", "structural"?, "output_bytes"?}`. The first run of each scenario
+#   "warning_categories", "derate_requested_threads", "derate_granted_threads",
+#   "structural"?, "output_bytes"?}`. The first run of each scenario
 # also reports the structural fingerprint + output size so the parent
 # can detect path drift without re-opening files.
 _WORKER_SCRIPT = textwrap.dedent("""\
@@ -397,6 +443,8 @@ _WORKER_SCRIPT = textwrap.dedent("""\
                 # Only the streaming worker collects these; the materialize
                 # arm's helper does not take a budget.
                 "warning_categories": t.get("warning_categories", []),
+                "derate_requested_threads": t.get("derate_requested_threads"),
+                "derate_granted_threads": t.get("derate_granted_threads"),
             }
             if structural is None:
                 structural = _structural_summary(out)
@@ -655,26 +703,41 @@ def _assert_budget_arm_actually_derated(
     ratio then reports that an unconstrained conversion honoured a constraint
     it never saw. Same shape as `csc_always` timing the default conversion.
 
-    `reader_threads_derated` is the observable, and it is the *right* one
-    rather than a proxy: the warning is emitted by `derate_threads_and_depth`
-    itself, only on the branch where the granted thread count is below the
-    requested one. Its presence therefore means the budget was parsed, reached
-    the coordinator, and bound.
+    The observable is `granted < requested`, read from the derate's own log
+    record. **Not** the presence of the `reader_threads_derated` warning: that
+    is emitted whenever `requested_threads + requested_depth > outstanding_max`,
+    which includes the case where the granted thread count is unchanged and
+    only the queue depth shrank. An earlier version of this check used warning
+    presence and passed for exactly that reason — the arm was pinned to
+    `GATED_READER_THREADS = 4` with depth 4, so the budget shrank depth 4 -> 1
+    and left threads at 4, and the check reported that the encode charge had
+    bound the thread count when it had not.
+
+    Asserting the quantity also survives the follow-up this PR proposes: if
+    `ENCODE_TRANSIENT_MULTIPLE` is later re-derived downward, a presence-based
+    check would stop firing and refuse the arm as "budget did not bind",
+    making a cheaper-but-correct cost model indistinguishable from a dropped
+    budget.
     """
     if "budget_bound" not in labels:
         return
-    seen: set[str] = set()
+    pairs: list[tuple[int | None, int | None]] = []
     for run in result.runs:
         if run.extra.get("scenario") != "budget_bound":
             continue
-        seen.update(run.extra.get("warning_categories") or [])
-    if "reader_threads_derated" not in seen:
+        pairs.append(
+            (
+                run.extra.get("derate_requested_threads"),
+                run.extra.get("derate_granted_threads"),
+            )
+        )
+    if not [1 for r, g in pairs if r is not None and g is not None and g < r]:
         raise RuntimeError(
-            "the budget_bound arm emitted no `reader_threads_derated` warning: "
-            f"`memory_budget` did not bind (categories seen: {sorted(seen)}). "
-            "The arm therefore timed an unconstrained conversion under the "
-            "budget label, and its peak-over-budget ratio would be "
-            "meaningless. Refusing to record it."
+            "the budget_bound arm never recorded `granted < requested` reader "
+            f"threads (observed {pairs!r}): `memory_budget` did not bind the "
+            "thread count, so the arm timed a conversion the budget did not "
+            "constrain and its peak-over-budget ratio would be meaningless. "
+            "Refusing to record it."
         )
 
 
@@ -783,33 +846,9 @@ def _run_isolated(
             result.add_run(
                 wall_s=rec["wall_s"],
                 peak_rss_mb=rec["peak_rss_mb"],
-                **{
-                    "scenario": label,
-                    "run_idx": rec["run_idx"],
-                    "reader_threads": reader_threads,
-                    f"{label}_peak_rss_mb": rec["peak_rss_mb"],
-                    f"{label}_wall_s": rec["wall_s"],
-                    "warning_categories": rec.get("warning_categories") or [],
-                    # Dimensionless, and the only key that states the property
-                    # under test: did the process stay inside the budget it was
-                    # given? An absolute MB ceiling would also move with the
-                    # runner's interpreter baseline (~450-520 MB here), which a
-                    # ratio against a 2 GiB budget absorbs. Mirrors
-                    # `build_csc`'s `peak_over_memory_limit__*`.
-                    **(
-                        {
-                            f"peak_over_memory_budget__{label}": (
-                                rec["peak_rss_mb"] / (_BUDGET_ARM_BYTES / 1e6)
-                            )
-                        }
-                        if label == "budget_bound"
-                        else {}
-                    ),
-                    "from_h5ad_kwargs": (
-                        ", ".join(f"{k}={v!r}" for k, v in extra_kwargs.items())
-                        or "(none)"
-                    ),
-                },
+                **_extra_arm_run_extras(
+                    label, rec, reader_threads, extra_kwargs or {}
+                ),
             )
             result.metadata["scenarios"].append(label)
             log.info(
@@ -845,6 +884,48 @@ def _run_isolated(
     return result
 
 
+def _extra_arm_run_extras(
+    label: str,
+    rec: dict,
+    reader_threads: int | None,
+    kwargs: dict[str, object],
+) -> dict[str, object]:
+    """The `add_run` extras for one extra-arm record.
+
+    Shared by the default path and the thread-sweep companion because they had
+    already diverged once: the sweep path recorded the timings and dropped
+    `warning_categories`, the derate counts and
+    `peak_over_memory_budget__budget_bound`, so a sweep capture emitted no
+    value for the absolute floor that keys off it and skipped the premise
+    check entirely. Reviewers reproduced that with a mocked record. One
+    function, called twice, is what stops the next key from going missing on
+    one path only.
+    """
+    extras: dict[str, object] = {
+        "scenario": label,
+        "run_idx": rec["run_idx"],
+        "reader_threads": reader_threads,
+        f"{label}_peak_rss_mb": rec["peak_rss_mb"],
+        f"{label}_wall_s": rec["wall_s"],
+        "warning_categories": rec.get("warning_categories") or [],
+        "derate_requested_threads": rec.get("derate_requested_threads"),
+        "derate_granted_threads": rec.get("derate_granted_threads"),
+        "from_h5ad_kwargs": (
+            ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) or "(none)"
+        ),
+    }
+    if label == "budget_bound":
+        # Dimensionless, and the only key that states the property under test:
+        # did the process stay inside the budget it was given? An absolute MB
+        # ceiling would also move with the runner's interpreter baseline
+        # (~450-520 MB here), which a ratio against the budget absorbs.
+        # Mirrors `build_csc`'s `peak_over_memory_limit__*`.
+        extras[f"peak_over_memory_budget__{label}"] = (
+            rec["peak_rss_mb"] / _BUDGET_ARM_MB
+        )
+    return extras
+
+
 def _run_extra_arms_once(
     h5ad_path: Path,
     result: BenchmarkResult,
@@ -865,9 +946,14 @@ def _run_extra_arms_once(
     for label, (kwargs, datasets) in _EXTRA_ARMS.items():
         if dataset_name not in datasets:
             continue
+        # An arm may pin its own `reader_threads` in `kwargs` (budget_bound
+        # does, so the budget derates the thread count and not only the queue
+        # depth). Honour it here too, or the sweep companion runs a different
+        # configuration from the default path under the same label.
+        arm_threads = kwargs.get("reader_threads", GATED_READER_THREADS)
         records = _run_arm_subprocess(
             h5ad_path, 1, "streaming",
-            reader_threads=GATED_READER_THREADS, extra_kwargs=kwargs,
+            reader_threads=arm_threads, extra_kwargs=kwargs,
         )
         for rec in records:
             # Kept, not discarded: the premise checks below and after the sweep
@@ -881,16 +967,9 @@ def _run_extra_arms_once(
             result.add_run(
                 wall_s=rec["wall_s"],
                 peak_rss_mb=rec["peak_rss_mb"],
-                **{
-                    "scenario": label,
-                    "run_idx": rec["run_idx"],
-                    "reader_threads": GATED_READER_THREADS,
-                    f"{label}_peak_rss_mb": rec["peak_rss_mb"],
-                    f"{label}_wall_s": rec["wall_s"],
-                    "from_h5ad_kwargs": ", ".join(
-                        f"{k}={v!r}" for k, v in kwargs.items()
-                    ),
-                },
+                **_extra_arm_run_extras(
+                    label, rec, arm_threads, kwargs
+                ),
             )
             result.metadata["scenarios"].append(label)
         result.metadata.setdefault("extra_arms", []).append(label)
@@ -901,6 +980,10 @@ def _run_extra_arms_once(
     # the sweep has not written yet — the caller runs that one afterwards.
     _assert_csc_arm_built_a_sidecar(
         list(result.metadata.get("extra_arms", [])), structural
+    )
+    # Self-contained too: it reads only this arm's own runs.
+    _assert_budget_arm_actually_derated(
+        list(result.metadata.get("extra_arms", [])), result
     )
 
 

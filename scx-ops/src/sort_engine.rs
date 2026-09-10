@@ -425,7 +425,18 @@ pub fn sort_with_strategy(
             .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES);
         match (cap, opts.memory_budget) {
             (0, _) => 0,
-            (cap, Some(budget)) => cap.min(budget).max(1),
+            // `budget / GROUPED_BLOCK_PHASE_MULTIPLE`, not `budget`: the cap
+            // sizes a block's **gather** bytes, and one block's whole phase
+            // costs that times the multiple. Clamping the cap to the budget
+            // itself made `grouped_fast_concurrency`'s `concurrency x per_block
+            // <= budget` false in the ordinary case — at f32 with a 256 MiB
+            // budget the cap was 256 MiB, `per_block` 1.5 GiB, and the `.max(1)`
+            // floor then returned one block that alone exceeded the budget.
+            //
+            // Same shape as the dense slab cap in `scx-convert`: a cost model
+            // and the cap that feeds it must be derived from the same figure,
+            // or the cap hands the model rows it cannot afford.
+            (cap, Some(budget)) => cap.min(budget / GROUPED_BLOCK_PHASE_MULTIPLE).max(1),
             (cap, None) => cap,
         }
     };
@@ -1623,6 +1634,19 @@ fn emit_x_in_memory(
 /// full block holds at the cap. We cap `concurrency` to `budget / per_block`
 /// (min 1), so `concurrency × per_block ≤ budget`; concurrency 1 gives parity
 /// with the one-block-at-a-time `CsrEmitter`.
+///
+/// That inequality holds because the **caller's** `block_byte_cap` is itself
+/// `budget / GROUPED_BLOCK_PHASE_MULTIPLE` (`sort_engine.rs`'s
+/// `block_byte_cap` binding), so one block's whole phase fits the budget by
+/// construction and the `.max(1)` floor is never the branch that breaks it.
+/// Clamping the cap to the raw budget instead made the inequality false in the
+/// ordinary f32 case: cap 256 MiB → `per_block` 1.5 GiB against a 256 MiB
+/// budget, and `(budget / per_block).max(1)` returned 1.
+///
+/// It is still only an inequality about the *planned* nnz per block: block
+/// construction admits a whole row before testing the cap, so a single
+/// pathologically deep row can overshoot `nnz_per_block`. Bounded by one row,
+/// and unchanged by this model.
 ///
 /// The encode side is `4×` and not the `~1×` this used to charge, because this
 /// path takes `writer.framing()`, which under `--codec auto` carries a

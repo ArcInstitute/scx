@@ -1674,17 +1674,22 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     most once per process otherwise. `--memory-budget` derates the
     granted count to fit a per-worker estimate; the estimate is
     delegated to the reader: sparse readers assume density 5 % (RNA
-    and general) or 10 % (ATAC), times `n_vars × 16 B/nnz`; the
-    dense reader sizes the dense slab buffer at
-    `shard_target_rows × n_vars × 12 B/element`. When the dense
-    reader's `memory_budget`-derived slab cap is tighter than
-    `shard_target_rows`, the parallel coordinator silently clamps
-    its partition to that cap (matching the sequential path).
-    The 12 B/element and the quarter-of-the-budget share both come
+    and general) or 10 % (ATAC), times `n_vars × 48 B/nnz`; the
+    dense reader sizes its slab at
+    `shard_target_rows × n_vars × 44 B/element`. Both figures are the
+    **whole worker phase** — the payload or slab, the encoder's own copy
+    of the values, and the framed encode's buffers for the two codec
+    candidates `codec="auto"` runs concurrently — not the reader stage
+    alone. When the dense reader's `memory_budget`-derived slab cap is
+    tighter than `shard_target_rows`, the parallel coordinator silently
+    clamps its partition to that cap (matching the sequential path).
+    The 44 B/element and the quarter-of-the-budget share both come
     from the allocation table described under
     [Memory budgets](#memory-budgets); the dense figure does **not**
     scale with the source dtype width, because the resident slab is
     f32 whatever the input was.
+    Export is sized separately at 16 B/nnz, since it decodes and never
+    runs the encoder.
   - `writer_queue_depth`: backpressure window between the parallel
     encoder pool and the ordered writer. Default 4. The parallel
     coordinator caps outstanding shards (encoding + in channel + in

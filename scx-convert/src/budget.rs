@@ -93,13 +93,20 @@
 //! would reject it. What widened is the **cost model** the share is applied
 //! to, which leaves the invariant intact and needs no new `Phase`. The price
 //! is paid in granted concurrency instead: `derate_threads_and_depth` solves
-//! `budget / per_shard_bytes`, and `per_shard_bytes` is now 2.5x larger on the
-//! sparse path (16 -> 40 B/nnz), so a budgeted convert is granted
-//! correspondingly fewer workers and some budgets that were accepted are now
-//! refused outright by `ensure_shard_fits_budget`. That refusal is the correct
-//! answer — those runs were over-committing — and it is opt-in, because
-//! `memory_budget` defaults to `None` on every surface and `None` skips the
-//! derate entirely.
+//! `budget / per_shard_bytes`, and `per_shard_bytes` is **3x** larger on the
+//! sparse ingest path (16 -> 48 B/nnz) and 3.7x on the dense one
+//! (12 -> 44 B/element), so a budgeted convert is granted correspondingly
+//! fewer workers and some budgets that were accepted are now refused outright
+//! by `ensure_shard_fits_budget`. That refusal is the correct answer — those
+//! runs were over-committing — and it is opt-in, because `memory_budget`
+//! defaults to `None` on every surface and `None` skips the derate entirely.
+//!
+//! **Export is not charged this.** It decodes; `h5ad/stream_write.rs` contains
+//! no encode call, so it takes `shard_decode_working_set_bytes` (16 B/nnz) and
+//! is the one per-shard row that is `enforced: true`. Sharing the ingest model
+//! with it over-derated a budgeted export 3x for memory it never holds, and
+//! over-estimating is not the safe direction — `docs/conventions.md` records
+//! that it silently routes to the sequential coordinator.
 //!
 //! Deliberately **not** gated on `hdf5`, for the same reason `parallel_drain`
 //! is not: this is integer arithmetic, and keeping it feature-free is what lets
@@ -168,6 +175,14 @@ impl Share {
 
 /// `i32` column index + `f32` value, the resident cost of one nonzero.
 pub(crate) const PAYLOAD_BYTES_PER_NNZ: u64 = 8;
+
+/// Decoder scratch on the export path, as a multiple of the payload.
+///
+/// `stream_csr_to_group_at` decodes a shard and filters it before the
+/// hyperslab write, so a second copy of the payload is live. This is the term
+/// the old shared model called "codec scratch"; on a decode path it is the
+/// *whole* non-payload cost, because nothing there encodes.
+pub(crate) const DECODE_SCRATCH_MULTIPLE: u64 = 1;
 
 /// The encoder's own copy of the values, as a multiple of the payload.
 ///
@@ -327,15 +342,30 @@ pub(crate) fn shard_working_set_bytes(nnz: u64, n_rows: u64) -> u64 {
         .max(1)
 }
 
-/// The framed encode's transient for a shard holding `nnz` nonzeros.
+/// Resident bytes for one CSR shard on a **decode** path: the payload and the
+/// decoder's scratch, plus the indptr — no encode term.
 ///
-/// Separate from [`shard_working_set_bytes`] for the one caller whose reader
-/// term is **not** a CSR payload: the dense reader, whose slab cost is an
-/// element model. There the encode term is *added* to the slab, never folded
-/// into a multiplier — see `h5ad/dense_stream.rs::per_worker_bytes`.
-pub(crate) fn encode_transient_bytes(nnz: u64) -> u64 {
-    nnz.saturating_mul(PAYLOAD_BYTES_PER_NNZ)
-        .saturating_mul(ENCODE_TRANSIENT_MULTIPLE)
+/// This is the export estimate, and it is deliberately *not*
+/// [`shard_working_set_bytes`]. `h5ad/stream_write.rs` contains no encode call
+/// at all: it decodes a shard into a `DecodedShard { indptr, indices, data }`
+/// and hyperslab-writes it. Charging it the framed encode's 4x would derate a
+/// budgeted export threefold for memory it never holds — and
+/// `docs/conventions.md` is explicit that over-estimating is not the safe
+/// direction, because it silently routes to the sequential coordinator.
+///
+/// The two directions shared one function until the encode charge landed, on
+/// the argument that a single model cannot drift. That argument only holds
+/// while the two phases are the same; they are not, and the shared model was
+/// wrong for one of them.
+pub(crate) fn shard_decode_working_set_bytes(nnz: u64, n_rows: u64) -> u64 {
+    let payload = nnz.saturating_mul(PAYLOAD_BYTES_PER_NNZ);
+    let indptr = n_rows
+        .saturating_add(1)
+        .saturating_mul(INDPTR_BYTES_PER_ROW);
+    payload
+        .saturating_mul(1 + DECODE_SCRATCH_MULTIPLE)
+        .saturating_add(indptr)
+        .max(1)
 }
 
 /// The sparse readers' default per-worker estimate: a density guess over the
@@ -504,13 +534,13 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/dense_stream.rs::open_dense_streaming + per_worker_bytes",
-        // WHOLE WORKER PHASE, which is what makes this `enforced: true`.
-        // `per_worker_bytes` charges the slab **plus**
-        // `encode_transient_bytes`, so the `PreEncodedSection` that
-        // `encode_one_shard_worker` holds alongside the slab is inside the
-        // share rather than beside it. The bitmap is still uncharged — small
-        // beside the encode term, and named here rather than left implicit.
-        enforced: true,
+        // Sized from the whole worker phase — `dense_worker_phase_bytes_per_elem`
+        // covers the slab, its sparsified vectors and the framed encode, and
+        // the slab cap derives from the same figure so the two cannot drift.
+        // That is a 3.7x better estimate than the slab alone, and it is still
+        // **not a proof**, which is why this stays `enforced: false`. See the
+        // sparse row below for the list of terms it does not bound.
+        enforced: false,
     },
     Reservation {
         name: "CSR shard working set + encode transient, one in-flight shard",
@@ -518,11 +548,36 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/stream.rs::per_worker_bytes -> derate_threads_and_depth",
-        // Same as the dense row: `shard_working_set_bytes` charges
-        // `WORKER_PHASE_BYTES_PER_NNZ`, which includes the framed encode's
-        // buffers for both candidates, so the encoded output no longer
-        // overlaps the share unpriced.
-        enforced: true,
+        // `shard_working_set_bytes` charges `WORKER_PHASE_BYTES_PER_NNZ`, so
+        // the encoded output no longer overlaps the share unpriced — 48 B/nnz
+        // against the 16 this used to claim.
+        //
+        // Still `enforced: false`, and the honest reason is that
+        // `encoded <= payload` is a good estimate rather than a guarantee.
+        // What it does not bound:
+        //
+        //   * **frame expansion.** Zstd and LZ4 can emit slightly more than
+        //     their input on incompressible data; the model assumes they
+        //     cannot.
+        //   * **intra-codec planes.** A codec holds its raw input, its
+        //     shuffled/delta plane and its compressed output at once, so one
+        //     candidate's internal peak can exceed its own output.
+        //   * **the indptr.** Each candidate encodes it too; the model prices
+        //     the encode per *nnz* only, so a shard with `nnz = 0` is charged
+        //     one indptr and nothing else while both candidates still
+        //     allocate.
+        //   * **the bitmap.** `maybe_build_bitmap_shard` builds a `BTreeMap`
+        //     of `RoaringBitmap`s while the raw shard and the
+        //     `PreEncodedSection` are both live.
+        //   * **readers without an exact nnz.** `MaterializedCsrStream` and
+        //     anything else on the trait default takes the 5%/10% density
+        //     guess, which a dense-stored-as-CSR matrix under-estimates.
+        //
+        // Closing it means codec-specific worst cases plus an exact override
+        // for the density-guess readers, with allocation tests for the
+        // all-zero, shallow, incompressible and bitmap-enabled shapes. Until
+        // then this is a much better *size*, not a ceiling.
+        enforced: false,
     },
     Reservation {
         name: "export shard working set + encode transient, one in-flight shard",
@@ -530,11 +585,18 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
         site: "h5ad/stream_write.rs::per_shard_export_bytes -> derate_threads_and_depth",
-        // Via the same `shard_working_set_bytes` as the sparse ingest row.
-        // Export decodes rather than encodes, so the encode term is slack
-        // here, not a bound being met — the row is enforced because its
-        // charge is an over-estimate on this path, which is the safe
-        // direction and the reason both paths can share one cost model.
+        // The one row that IS enforced, and the only one whose phase is
+        // simple enough to be: `shard_decode_working_set_bytes` charges the
+        // payload plus the decoder's scratch, which is everything
+        // `stream_csr_to_group_at` holds — `stream_write.rs` contains no
+        // encode call, so there is no codec-plane or frame-expansion term to
+        // be unsure about. Sized from `ShardStats.nnz`, the catalog's exact
+        // count, not a density guess, and no bitmap is built on this path.
+        //
+        // It briefly shared the ingest model, which over-charged it 3x for an
+        // encoder it never runs. Over-estimating is not the safe direction
+        // here: `docs/conventions.md` records that it silently routes to the
+        // sequential coordinator.
         enforced: true,
     },
     Reservation {

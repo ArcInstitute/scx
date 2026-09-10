@@ -14,7 +14,7 @@ use super::pipeline::ConvertError;
 /// shard-local `u64` indptr. Single source shared by the ingest worker-derate
 /// (`IndexedCsrShardStream::per_worker_bytes`) and the export-side
 /// `per_shard_export_bytes`, so the two budgets can't drift.
-pub(crate) use crate::budget::shard_working_set_bytes;
+pub(crate) use crate::budget::{shard_decode_working_set_bytes, shard_working_set_bytes};
 
 /// Major axis of the source matrix. Streaming readers always emit
 /// CSR shards downstream; `Column` only appears as a marker on

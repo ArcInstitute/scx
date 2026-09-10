@@ -311,18 +311,27 @@ fn parallel_memory_budget_derates_workers() {
     create_test_h5ad(&h5ad, 80, 17, "csr", false);
     let scx = dir.path().join("out.scx");
 
-    // C7: per-worker bytes are now nnz-exact (derived from the resident
-    // indptr), not a density estimate. Each aligned 16-row window of this
-    // fixture holds 40 nnz (rows alternate 2/3 nnz), so per-worker working set
-    // = 16 B/nnz × 40 + 8 × (16 + 1) = 776 bytes. The derate now bounds peak
+    // C7: per-worker bytes are nnz-exact (derived from the resident indptr),
+    // not a density estimate. Each aligned 16-row window of this fixture holds
+    // 40 nnz (rows alternate 2/3 nnz), so per-worker working set =
+    // 48 B/nnz × 40 + 8 × (16 + 1) = **2056** bytes. The derate bounds peak
     // outstanding shards (threads + writer_queue_depth), not threads alone:
-    // budget = 2400 → outstanding_max = floor(2400 / 776) = 3. With requested
+    // budget = 6168 → outstanding_max = floor(6168 / 2056) = 3. With requested
     // threads = 8 + depth = 4 = 12 > 3, the derate shrinks depth first to 1 and
-    // grants 2 threads — staying on the parallel route while keeping peak RSS
-    // (2 + 1) × 776 = 2328 ≤ 2400.
+    // grants 2 threads — staying on the parallel route while keeping peak
+    // (2 + 1) × 2056 = 6168 ≤ 6168.
+    //
+    // ⚠️ The budget was 2400, sized for the old 16 B/nnz model. At 48 that is
+    // `outstanding_max = 1` → **one granted thread → the sequential
+    // coordinator**, and this test could not tell: its assertions check a
+    // warning substring and byte-equality with a sequential run, both of which
+    // a sequential run satisfies. That is the blindness
+    // `dense_convert_under_a_memory_budget_stays_parallel` was written to
+    // catch, so the drain-peak assertion below is now here too.
     let mut opts = streaming_opts(16);
     opts.reader_threads = Some(8);
-    opts.memory_budget = Some(2400);
+    opts.memory_budget = Some(6168);
+    super::parallel_drain::hooks::set_last_run_peak(0);
 
     // Capture warnings to assert ReaderThreadsDerated emitted.
     use std::sync::{Arc, Mutex};
@@ -356,6 +365,17 @@ fn parallel_memory_budget_derates_workers() {
             .any(|w| w.contains("writer_queue_depth granted = 1")),
         "expected derate to shrink depth first (writer_queue_depth granted = 1); got: {:?}",
         *warnings
+    );
+    // And the run actually went through the parallel drain. Without this the
+    // two assertions above pass on a sequential convert: `ReaderThreadsDerated`
+    // is emitted by the derate regardless of which coordinator then runs, and
+    // "writer_queue_depth granted = 1" is exactly what a collapse to one
+    // thread looks like.
+    assert!(
+        super::parallel_drain::hooks::last_run_peak() > 0,
+        "the budgeted convert did not enter the parallel drain — it took the \
+         sequential coordinator, so this test is asserting nothing about the \
+         derate's parallel branch"
     );
 
     // Output must still be valid and match the sequential path.
@@ -1098,13 +1118,9 @@ fn parallel_export_memory_budget_derates_workers() {
 #[test]
 fn per_shard_export_bytes_matches_payload_layout() {
     // Sanity: the helper computes exactly what the dispatcher documents — the
-    // whole worker phase at `budget::WORKER_PHASE_BYTES_PER_NNZ` (payload +
-    // the encoder's value copy + the framed encode's two candidates) plus the
-    // indptr. Anchors the budget arithmetic against accidental regressions.
-    //
-    // On export the encode term is slack rather than a bound being met — this
-    // path decodes — but both directions share one cost model on purpose, and
-    // over-charging is the safe direction. See the `Phase::Export` row.
+    // payload, the decoder's scratch, and the indptr, at
+    // `budget::shard_decode_working_set_bytes`. Anchors the budget arithmetic
+    // against accidental regressions.
     use crate::h5ad::stream_write::per_shard_export_bytes_for_test;
     use scx_format_io::catalog::ShardStats;
     let stats = ShardStats {
@@ -1120,9 +1136,13 @@ fn per_shard_export_bytes_matches_payload_layout() {
         column_stats: Vec::new(),
     };
     let bytes = per_shard_export_bytes_for_test(&stats);
-    // 50 × 48 + 101 × 8 = 2400 + 808 = 3208. It was 1608 (50×8 payload +
-    // 50×8 scratch + 808 indptr), i.e. 16 B/nnz.
-    assert_eq!(bytes, 3208);
+    // 50 × 16 + 101 × 8 = 800 + 808 = 1608 — unchanged, and that is the
+    // point. An earlier revision of this PR changed this expectation to 3208
+    // to make the shared ingest model pass, which is fixing the file instead
+    // of the formula: export decodes, `stream_write.rs` contains no encode
+    // call, and charging it the framed encode's 4x would derate a budgeted
+    // export threefold for memory it never holds.
+    assert_eq!(bytes, 1608);
 }
 
 /// Regression test for the deadlock fixed by routing the export parallel

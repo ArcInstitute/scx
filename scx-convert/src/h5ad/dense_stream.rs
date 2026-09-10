@@ -15,11 +15,17 @@
 // `shard_target_rows` so dense inputs with very large `n_vars` stay inside
 // their share of the budget.
 //
-// ⚠️ That bound covers the READER phase only. The worker calling it also holds
-// the encoded shard alongside the raw CSR — see the `enforced: false` note on
-// the ingest rows in `crate::budget::ALLOCATION_TABLE`. When the
-// budget is smaller than a single dense row, `open_dense_streaming`
-// returns an actionable error rather than silently disabling the cap.
+// ⚠️ `dense_peak_bytes_per_elem` is the READER's own peak. What the *budget*
+// is sized from is `dense_worker_phase_bytes_per_elem` (44 B/element), which
+// adds the framed encode's buffers — the worker calling `read_range` also
+// holds the encoded shard alongside the raw CSR. Both the slab cap and
+// `per_worker_bytes` derive from that wider figure, deliberately: charging the
+// encode at one and not the other made `outstanding_max` fall to 1 and
+// re-created §11.5. Even so the ingest rows stay `enforced: false` —
+// `crate::budget::ALLOCATION_TABLE` enumerates the terms 44 B/element still
+// does not bound. When the budget is smaller than a single dense row,
+// `open_dense_streaming` returns an actionable error rather than silently
+// disabling the cap.
 
 use ndarray::s;
 
@@ -353,8 +359,8 @@ impl IndexedCsrShardStream for DenseXStreamReader {
         // `outstanding_max = 2`, `granted_threads = 1`, and every budgeted
         // dense convert silently taking the sequential coordinator (§11.5).
         //
-        // Adding `encode_transient_bytes(rows × n_vars)` on top of a
-        // slab-only cap re-creates that from the other direction — measured,
+        // Adding the encode transient on top of a slab-only cap re-creates
+        // that from the other direction — measured,
         // it put `outstanding_max` at 1 for the fixture in
         // `dense_convert_under_a_memory_budget_stays_parallel`. The encode
         // term therefore belongs in the **per-element cost both sites share**,
