@@ -689,12 +689,17 @@ fn write_one_shard_to_prealloc(
 /// - `nnz × 4` for `indices` (i32),
 /// - `nnz × 4` for `data` (f32),
 /// - `(n_rows + 1) × 8` for `indptr` (i64),
-/// - `nnz × 8` for transient codec scratch (matches the ingest
-///   estimate's scratch line; the codec working set is bounded by
-///   the encoded shard size, which is ≤ the decoded payload).
+/// - `nnz × 8` for the decoder's transient scratch.
+///
+/// Via `budget::shard_decode_working_set_bytes`, **not** the ingest model:
+/// this function is on a decode path — this file contains no encode call at
+/// all — so it carries none of the framed encode's transient. It shared
+/// `shard_working_set_bytes` with ingest until that model started charging the
+/// encode, which over-derated a budgeted export threefold for memory it never
+/// holds.
 fn per_shard_export_bytes(stats: &ShardStats) -> u64 {
     let n_rows = stats.row_end.saturating_sub(stats.row_start);
-    crate::stream::shard_working_set_bytes(stats.nnz, n_rows)
+    crate::stream::shard_decode_working_set_bytes(stats.nnz, n_rows)
 }
 
 /// Test seam — exposes the per-shard export budget estimate so the

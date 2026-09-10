@@ -311,18 +311,27 @@ fn parallel_memory_budget_derates_workers() {
     create_test_h5ad(&h5ad, 80, 17, "csr", false);
     let scx = dir.path().join("out.scx");
 
-    // C7: per-worker bytes are now nnz-exact (derived from the resident
-    // indptr), not a density estimate. Each aligned 16-row window of this
-    // fixture holds 40 nnz (rows alternate 2/3 nnz), so per-worker working set
-    // = 16 B/nnz × 40 + 8 × (16 + 1) = 776 bytes. The derate now bounds peak
+    // C7: per-worker bytes are nnz-exact (derived from the resident indptr),
+    // not a density estimate. Each aligned 16-row window of this fixture holds
+    // 40 nnz (rows alternate 2/3 nnz), so per-worker working set =
+    // 48 B/nnz × 40 + 8 × (16 + 1) = **2056** bytes. The derate bounds peak
     // outstanding shards (threads + writer_queue_depth), not threads alone:
-    // budget = 2400 → outstanding_max = floor(2400 / 776) = 3. With requested
+    // budget = 6168 → outstanding_max = floor(6168 / 2056) = 3. With requested
     // threads = 8 + depth = 4 = 12 > 3, the derate shrinks depth first to 1 and
-    // grants 2 threads — staying on the parallel route while keeping peak RSS
-    // (2 + 1) × 776 = 2328 ≤ 2400.
+    // grants 2 threads — staying on the parallel route while keeping peak
+    // (2 + 1) × 2056 = 6168 ≤ 6168.
+    //
+    // ⚠️ The budget was 2400, sized for the old 16 B/nnz model. At 48 that is
+    // `outstanding_max = 1` → **one granted thread → the sequential
+    // coordinator**, and this test could not tell: its assertions check a
+    // warning substring and byte-equality with a sequential run, both of which
+    // a sequential run satisfies. That is the blindness
+    // `dense_convert_under_a_memory_budget_stays_parallel` was written to
+    // catch, so the drain-peak assertion below is now here too.
     let mut opts = streaming_opts(16);
     opts.reader_threads = Some(8);
-    opts.memory_budget = Some(2400);
+    opts.memory_budget = Some(6168);
+    super::parallel_drain::hooks::set_last_run_peak(0);
 
     // Capture warnings to assert ReaderThreadsDerated emitted.
     use std::sync::{Arc, Mutex};
@@ -356,6 +365,17 @@ fn parallel_memory_budget_derates_workers() {
             .any(|w| w.contains("writer_queue_depth granted = 1")),
         "expected derate to shrink depth first (writer_queue_depth granted = 1); got: {:?}",
         *warnings
+    );
+    // And the run actually went through the parallel drain. Without this the
+    // two assertions above pass on a sequential convert: `ReaderThreadsDerated`
+    // is emitted by the derate regardless of which coordinator then runs, and
+    // "writer_queue_depth granted = 1" is exactly what a collapse to one
+    // thread looks like.
+    assert!(
+        super::parallel_drain::hooks::last_run_peak() > 0,
+        "the budgeted convert did not enter the parallel drain — it took the \
+         sequential coordinator, so this test is asserting nothing about the \
+         derate's parallel branch"
     );
 
     // Output must still be valid and match the sequential path.
@@ -440,24 +460,28 @@ fn dense_parallel_with_memory_budget_byte_identical() {
     // 100 rows × 50 vars dense, f32 → row_bytes = 200.
     create_test_h5ad(&h5ad, 100, 50, "dense", false);
 
-    // budget = 8192, 50 vars at 12 B/element (`budget::dense_slab_bytes`):
-    //   one slab may claim SHARD_BUDGET_SHARE (1/4) = 2048 B
-    //   → max_slab_rows = 2048 / (50 × 12) = 3, well under shard_target 32,
-    //     so the partition clamp is exercised;
-    //   → per-worker = 3 × 50 × 12 = 1800 B, outstanding_max = 4.
+    // budget = 65_536, 50 vars at 44 B/element
+    // (`budget::dense_worker_phase_bytes_per_elem`: 12 for the slab and its
+    // sparsified vectors, plus 8 × 4 for the framed encode's two candidates):
+    //   one slab may claim SHARD_BUDGET_SHARE (1/4) = 16_384 B
+    //   → max_slab_rows = (16_384 − 8) / (50 × 44 + 8) = 7, under
+    //     shard_target 32, so the partition clamp is still exercised;
+    //   → per-worker = 7 × 50 × 44 + 8 × 8 = 15_464 B, outstanding_max = 4.
     //
-    // ⚠️ These numbers are derived, not decorative: the previous version of
-    // this comment read `(8192 / 200) / 4 = 10` and `10 × 50 × 4 × 2 = 4000`,
-    // which is the pre-fix arithmetic — the ÷4 keyed to the source dtype width
-    // and the ×2 that double-counted it. It went stale the moment the sizing
-    // changed, and a stale comment on a passing test is how the next reader
-    // learns the wrong model.
+    // ⚠️ These numbers are derived, not decorative, and this comment has now
+    // gone stale twice. It first read `(8192 / 200) / 4 = 10` and
+    // `10 × 50 × 4 × 2 = 4000` — the pre-§11.5 arithmetic. It then read
+    // 12 B/element, which was right until the encode transient was charged.
+    // The budget moved from 8192 to 65_536 in the same change, because at 44
+    // B/element an 8192-byte budget cannot admit even one row and
+    // `open_dense_streaming` now refuses it outright — see
+    // `dense_budget_too_small_for_the_whole_phase_is_refused`.
     let scx_seq = dir.path().join("seq.scx");
     let scx_par = dir.path().join("par.scx");
 
     let mut seq_opts = streaming_opts(32);
     seq_opts.reader_threads = Some(1);
-    seq_opts.memory_budget = Some(8192);
+    seq_opts.memory_budget = Some(65_536);
     h5ad_to_scx_streaming(
         &h5ad,
         &scx_seq,
@@ -469,7 +493,7 @@ fn dense_parallel_with_memory_budget_byte_identical() {
 
     let mut par_opts = streaming_opts(32);
     par_opts.reader_threads = Some(4);
-    par_opts.memory_budget = Some(8192);
+    par_opts.memory_budget = Some(65_536);
     h5ad_to_scx_streaming(
         &h5ad,
         &scx_par,
@@ -621,10 +645,13 @@ fn parallel_per_worker_bytes_atac_higher_density() {
     };
     let rna = r.per_worker_bytes(1024, ModalityType::Rna);
     let atac = r.per_worker_bytes(1024, ModalityType::Atac);
-    // 1024 × 30000 × 16 = 491_520_000.
-    // RNA: / 20 = 24_576_000. ATAC: / 10 = 49_152_000.
-    assert_eq!(rna, 24_576_000);
-    assert_eq!(atac, 49_152_000);
+    // 1024 × 30000 × 48 = 1_474_560_000, at
+    // `budget::WORKER_PHASE_BYTES_PER_NNZ` — payload, the encoder's value
+    // copy, and the framed encode's buffers for both candidates. It was 16,
+    // which charged the reader stage only.
+    // RNA: / 20 = 73_728_000. ATAC: / 10 = 147_456_000.
+    assert_eq!(rna, 73_728_000);
+    assert_eq!(atac, 147_456_000);
     assert_eq!(atac, rna * 2);
 }
 
@@ -652,7 +679,14 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     let reader = open_dense_streaming(&file, "X", &opts, &mut sink).unwrap();
     let indexed: &dyn IndexedCsrShardStream = &reader;
 
-    // 32 rows × 40 vars × 12 B/element + 33 × 8 B indptr = 15_624.
+    // Slab: 32 rows × 40 vars × 12 B/element + 33 × 8 B indptr = 15_624.
+    // Encode transient: 32 × 40 nnz upper bound × 8 B payload × 4 = 40_960.
+    // Total 56_584.
+    //
+    // The encode term is **added** to the slab, not multiplied into it — see
+    // `dense_stream.rs::per_worker_bytes`, which spells out why that
+    // distinction is the difference between charging a second allocation and
+    // re-charging the §11.5 one.
     //
     // ⚠️ This was `32 × 40 × 4 × 2 = 10_240`, and the change is the point of
     // the fix rather than a casualty of it. The old expression charged
@@ -669,7 +703,7 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
     // was an under-count that no fixture in the suite happened to expose.
     let bytes_rna = indexed.per_worker_bytes(32, ModalityType::Rna);
     let bytes_atac = indexed.per_worker_bytes(32, ModalityType::Atac);
-    assert_eq!(bytes_rna, 15_624);
+    assert_eq!(bytes_rna, 15_624 + 40_960);
     // Dense override ignores modality — same formula regardless.
     assert_eq!(bytes_rna, bytes_atac);
     // And it's never zero.
@@ -682,6 +716,56 @@ fn parallel_per_worker_bytes_dense_uses_dense_formula() {
 /// the cap below `usize::MAX`. Verifies the trait method is hooked
 /// up — `compute_shard_row_ranges` with the clamped value matches the
 /// sequential `next_csr_shard` partition.
+/// Charging the whole worker phase makes some previously-accepted budgets
+/// **refusals**, and that is the intended answer rather than a casualty.
+///
+/// 8192 bytes was the budget every dense test in this file used until the
+/// encode transient was charged. At 44 B/element a 50-var row costs 2208 B and
+/// the share is 2048, so not even one row fits — and `open_dense_streaming`
+/// refuses outright rather than capping to zero, per the T4.7 no-silent-cap
+/// rule. Those runs were over-committing before; they now say so.
+///
+/// The accept-side arm is what makes this a bound and not just a rejection:
+/// without it the test would pass against a build that refuses everything.
+#[test]
+fn dense_budget_too_small_for_the_whole_phase_is_refused() {
+    use crate::h5ad::dense_stream::open_dense_streaming;
+
+    let dir = tempfile::tempdir().unwrap();
+    let h5ad = dir.path().join("dense.h5ad");
+    create_test_h5ad(&h5ad, 100, 50, "dense", false);
+    let file = hdf5::File::open(&h5ad).unwrap();
+    let mut sink = WarningSink::log();
+
+    let too_small = IngestOptions {
+        shard_target_rows: 32,
+        memory_budget: Some(8192),
+        ..IngestOptions::default()
+    };
+    let err = open_dense_streaming(&file, "X", &too_small, &mut sink)
+        .expect_err("8192 bytes cannot hold one 50-var row of the whole worker phase");
+    let msg = err.to_string();
+    for needle in ["memory_budget", "8192", "44 B/element", "1/4 of the budget"] {
+        assert!(
+            msg.contains(needle),
+            "refusal must be actionable and name {needle}; got {msg}"
+        );
+    }
+
+    // Accept side: the budget the sibling tests now use does admit rows, so
+    // the refusal above is about this budget and not about every budget.
+    let workable = IngestOptions {
+        shard_target_rows: 32,
+        memory_budget: Some(65_536),
+        ..IngestOptions::default()
+    };
+    let reader = open_dense_streaming(&file, "X", &workable, &mut sink)
+        .expect("65_536 bytes admits several rows of the whole worker phase");
+    let indexed: &dyn super::stream::IndexedCsrShardStream = &reader;
+    let cap = indexed.max_slab_rows().expect("a budget implies a cap");
+    assert_eq!(cap, 7, "(65_536/4 − 8) / (50 × 44 + 8) = 7");
+}
+
 #[test]
 fn dense_max_slab_rows_clamps_partition() {
     use super::pipeline::compute_shard_row_ranges;
@@ -707,7 +791,7 @@ fn dense_max_slab_rows_clamps_partition() {
     // Tight budget → cap fires.
     let opts_capped = IngestOptions {
         shard_target_rows: 32,
-        memory_budget: Some(8192),
+        memory_budget: Some(65_536),
         ..IngestOptions::default()
     };
     let r_capped = open_dense_streaming(&file, "X", &opts_capped, &mut sink).unwrap();
@@ -997,7 +1081,25 @@ fn parallel_export_memory_budget_derates_workers() {
         memory_budget: Some(1500),
         ..ExportOptions::default()
     };
+    // Drain-peak oracle: without it both assertions below stay green when the
+    // export collapses to the sequential coordinator (the derate warning fires
+    // on the way *to* that collapse). The ingest twin grew this for exactly
+    // that blindness; recoupling `per_shard_export_bytes` to the ingest model
+    // would over-derate this fixture to threads=1 and neither warning
+    // assertion would notice.
+    super::parallel_drain::hooks::set_last_run_peak(0);
     scx_to_h5ad_streaming(&scx, &h5ad, &opts, &mut sink).unwrap();
+    let export_peak = super::parallel_drain::hooks::last_run_peak();
+    assert!(
+        export_peak > 0,
+        "expected the parallel export drain to run; last_run_peak() == 0 means \
+         the export took the sequential route"
+    );
+    assert!(
+        export_peak <= 3,
+        "granted threads + depth is 3 at this budget, so in-flight shards must \
+         not exceed it; got {export_peak}"
+    );
 
     let warnings = log.lock().unwrap();
     assert!(
@@ -1033,10 +1135,10 @@ fn parallel_export_memory_budget_derates_workers() {
 
 #[test]
 fn per_shard_export_bytes_matches_payload_layout() {
-    // Sanity: the helper computes exactly what the dispatcher
-    // documents — payload (nnz×8) + indptr ((n_rows+1)×8) +
-    // scratch (nnz×8). Anchors the budget arithmetic against
-    // accidental regressions.
+    // Sanity: the helper computes exactly what the dispatcher documents — the
+    // payload, the decoder's scratch, and the indptr, at
+    // `budget::shard_decode_working_set_bytes`. Anchors the budget arithmetic
+    // against accidental regressions.
     use crate::h5ad::stream_write::per_shard_export_bytes_for_test;
     use scx_format_io::catalog::ShardStats;
     let stats = ShardStats {
@@ -1052,7 +1154,12 @@ fn per_shard_export_bytes_matches_payload_layout() {
         column_stats: Vec::new(),
     };
     let bytes = per_shard_export_bytes_for_test(&stats);
-    // 50×8 + 101×8 + 50×8 = 400 + 808 + 400 = 1608
+    // 50 × 16 + 101 × 8 = 800 + 808 = 1608 — unchanged, and that is the
+    // point. An earlier revision of this PR changed this expectation to 3208
+    // to make the shared ingest model pass, which is fixing the file instead
+    // of the formula: export decodes, `stream_write.rs` contains no encode
+    // call, and charging it the framed encode's 4x would derate a budgeted
+    // export threefold for memory it never holds.
     assert_eq!(bytes, 1608);
 }
 
@@ -1393,12 +1500,20 @@ fn parallel_export_worker_panic_does_not_deadlock() {
 /// The arithmetic, with `n_vars = 50` f32 (`row_bytes = 200`) and
 /// `memory_budget = 24_000`:
 ///
-/// | | before the fix | after |
-/// |---|---|---|
-/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(6000−8)/(50×12+8) = 9` |
-/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `9×50×12 + 10×8 = 5480` |
-/// | `outstanding_max` | 2 | 4 |
-/// | `granted_threads` | **1 → sequential** | **3 → parallel** |
+/// | | before §11.5's fix | after it | after the encode charge |
+/// |---|---|---|---|
+/// | per-element cost | `2 × sizeof(dtype)` | 12 (slab + sparsified) | **44** (+ the framed encode) |
+/// | `max_slab_rows` | `(24000/200)/4 = 30` | `(6000−8)/(50×12+8) = 9` | `(6000−8)/(50×44+8) = 2` |
+/// | `per_worker_bytes` | `30×200×2 = 12000` (= B/2) | `9×50×12 + 10×8 = 5480` | `2×50×44 + 3×8 = 4424` |
+/// | `outstanding_max` | 2 | 4 | 5 |
+/// | `granted_threads` | **1 → sequential** | **3 → parallel** | **4 → parallel** |
+///
+/// The third column is the point of charging the encode in
+/// `dense_worker_phase_bytes_per_elem` rather than adding it at
+/// `per_worker_bytes`: the cap shrinks with the cost, so
+/// `per_worker_bytes(max_slab_rows)` stays inside the share and the parallel
+/// route survives. Adding it only at the estimate gave `outstanding_max = 1`
+/// and put this test back in the state it was written to catch.
 ///
 /// The post-fix column includes the `u64` indptr and solves for rows affinely
 /// (`rows × (n_vars × 12 + 8) + 8 ≤ share`), both added in the review round. An

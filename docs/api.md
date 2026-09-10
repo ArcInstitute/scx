@@ -701,10 +701,14 @@ single division and are now separate:
 - a **share** — what fraction of the budget one concurrent unit may claim.
   One in-flight shard takes a quarter, which is what leaves room for the
   derate to grant more than one worker.
-- a **cost model** — how many bytes that unit actually holds. A dense slab
-  costs 12 B per source element (the f32 slab plus the sparsified indices and
-  values, at exact capacity); a CSR shard costs 8 B/nnz plus scratch plus the
-  indptr.
+- a **cost model** — how many bytes that unit actually holds, across the
+  worker's *whole* phase rather than one stage. A CSR shard costs 48 B/nnz plus
+  the indptr: 8 for the resident payload, 8 for the encoder's own copy of the
+  values, and 32 for the framed encode's live buffers (it holds every row
+  group's encoded bytes alongside the streams assembled from them, and
+  `codec="auto"` runs two candidate codecs concurrently). A dense source
+  element costs 44 B: 12 for the f32 slab plus the sparsified indices and
+  values at exact capacity, plus the same 32 for the nonzero it may become.
 
 Reservations are declared per *phase*, and only reservations in the same phase
 are concurrent — the CSC external transpose claims half the budget for a
@@ -718,20 +722,41 @@ quoting a row as a guarantee:
 
 - the two CSC **bucket** rows are sized from the *mean* nnz per row, so a
   right-skewed sequencing-depth distribution overshoots them;
-- the three per-shard **ingest / export** rows size a *reader* working set,
-  while the worker holds the encoded shard alongside it — so the derate bounds
-  the stage, not the whole worker;
 - the CSC **sidecar** row's budget sizes the transpose chunk, while the writer's
   full-length index and value copies and the encoder's streams are live next to
   it, and the rebuild path additionally retains every source shard. It controls
   column and shard sizing, not a ceiling;
+- the three per-shard **ingest / export** rows: on ingest, `encoded <= payload`
+  is an estimate rather than a codec guarantee (frames can expand, a codec
+  holds its raw, shuffled and compressed planes at once, the encoded indptr is
+  priced at zero for an `nnz = 0` shard, the detection bitmap is uncharged, and
+  readers on the trait default take a density guess); on export,
+  `filter_shard` holds a second indptr and, when masked, doubling-grown output
+  buffers alongside the originals;
 - the CSC **column-chunk** row's scan always reads the first column whole before
   testing the budget, so one wide column exceeds the share (on a large atlas
   that is an ordinary ubiquitous gene), and its floor exceeds the share for
   budgets under 128 bytes.
 
 They are named in the table so each gap is visible rather than silent, and a
-unit test pins the count so a seventh cannot arrive unannounced.
+unit test pins the count so an eighth cannot arrive unannounced.
+
+The three per-shard **ingest / export** rows are still on that list, but their
+*estimates* changed. Each used to size a reader working set while the worker
+also held the encoded shard. The two ingest rows now size the whole worker
+phase — 3x larger on sparse, 3.7x on dense — and the export row is sized from
+its own decode model rather than borrowing the ingest one. The share did not
+change; what widened is the cost model the share is applied to. So a budget now
+buys **fewer concurrent workers and smaller shards** rather than the same
+concurrency over an unpriced buffer, and a budget too small to hold one whole
+phase is refused outright instead of being silently over-committed. Budgets are
+opt-in (`memory_budget` defaults to unset), so nothing derates that did not ask
+to.
+
+They remain unenforced because a better estimate is not a proof: each row names
+the terms it still does not bound (codec frame expansion and intra-codec planes
+on ingest, `filter_shard`'s second indptr and doubling-grown buffers on
+export).
 
 Three different things are called "no budget", and they are not
 interchangeable: an unset `memory_budget` means *no cap at all*; pyscx's
@@ -1663,17 +1688,22 @@ Apply configurable fused preprocessing ops on GPU-resident CSR.
     most once per process otherwise. `--memory-budget` derates the
     granted count to fit a per-worker estimate; the estimate is
     delegated to the reader: sparse readers assume density 5 % (RNA
-    and general) or 10 % (ATAC), times `n_vars × 16 B/nnz`; the
-    dense reader sizes the dense slab buffer at
-    `shard_target_rows × n_vars × 12 B/element`. When the dense
-    reader's `memory_budget`-derived slab cap is tighter than
-    `shard_target_rows`, the parallel coordinator silently clamps
-    its partition to that cap (matching the sequential path).
-    The 12 B/element and the quarter-of-the-budget share both come
+    and general) or 10 % (ATAC), times `n_vars × 48 B/nnz`; the
+    dense reader sizes its slab at
+    `shard_target_rows × n_vars × 44 B/element`. Both figures are the
+    **whole worker phase** — the payload or slab, the encoder's own copy
+    of the values, and the framed encode's buffers for the two codec
+    candidates `codec="auto"` runs concurrently — not the reader stage
+    alone. When the dense reader's `memory_budget`-derived slab cap is
+    tighter than `shard_target_rows`, the parallel coordinator silently
+    clamps its partition to that cap (matching the sequential path).
+    The 44 B/element and the quarter-of-the-budget share both come
     from the allocation table described under
     [Memory budgets](#memory-budgets); the dense figure does **not**
     scale with the source dtype width, because the resident slab is
     f32 whatever the input was.
+    Export is sized separately at 16 B/nnz, since it decodes and never
+    runs the encoder.
   - `writer_queue_depth`: backpressure window between the parallel
     encoder pool and the ordered writer. Default 4. The parallel
     coordinator caps outstanding shards (encoding + in channel + in

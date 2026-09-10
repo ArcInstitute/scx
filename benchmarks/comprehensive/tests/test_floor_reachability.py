@@ -1155,14 +1155,135 @@ def test_conversion_streaming_emits_its_floor_metric_at_the_top_of_extra():
     assert result.metadata["gated_reader_threads"] == cs.GATED_READER_THREADS
 
 
+def test_conversion_streaming_budget_arm_pins_its_threads_and_emits_the_ratio():
+    """The `budget_bound` arm's three load-bearing properties, on smartseq2.
+
+    None of them was covered: the sibling test drives tabula / census / pbmc
+    and never the arm's own dataset, so deleting the 12-thread pin, the ratio
+    metric or the premise check reddened nothing. Each of the three was
+    actually wrong at some point in this PR's history, which is why they are
+    asserted rather than described:
+
+    1. **the arm's own `reader_threads` reaches the worker AND the record.**
+       It shipped resolved in two places — the worker honoured 12 via
+       `kwargs.update` while the parent recorded `GATED_READER_THREADS` — so
+       both halves are checked.
+    2. **`peak_over_memory_budget__budget_bound` is emitted**, in binary MiB.
+       It is what `thresholds.yaml`'s only ratio floor keys off; an absent key
+       is a missing-metric violation, and a decimal-MB denominator silently
+       borrows 4.8% of headroom.
+    3. **the gated key stays off this arm**, or census's
+       `streaming_peak_rss_mb` median would mix configurations.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    calls = []
+
+    def fake_arm(h5ad_path, n_runs, scenario, thread_count=None,
+                 reader_threads=None, extra_kwargs=None):
+        calls.append((scenario, reader_threads, extra_kwargs))
+        kw = extra_kwargs or {}
+        return [{
+            "scenario": scenario, "run_idx": 0, "wall_s": 1.0,
+            "peak_rss_mb": 1024.0, "reader_threads": reader_threads,
+            "structural": {"n_obs": 1, "n_vars": 1, "nnz": 1,
+                           "shard_count": 1, "has_csc": 0},
+            "output_bytes": 10,
+            "derate_requested_threads": 12 if kw.get("memory_budget") else None,
+            "derate_granted_threads": 4 if kw.get("memory_budget") else None,
+            "warning_categories": (
+                ["reader_threads_derated"] if kw.get("memory_budget") else []
+            ),
+        }]
+
+    original = cs._run_arm_subprocess
+    try:
+        cs._run_arm_subprocess = fake_arm
+        result = cs._run_isolated(
+            pathlib.Path("/nonexistent.h5ad"), 1,
+            BenchmarkResult(
+                benchmark="conversion_streaming",
+                format="scx_streaming_vs_materialize",
+                dataset="smartseq2",
+                metadata={"scenarios": []},
+            ),
+            None,
+            "smartseq2",
+        )
+    finally:
+        cs._run_arm_subprocess = original
+
+    assert "budget_bound" in result.metadata["extra_arms"], result.metadata
+    budget_calls = [
+        (rt, kw) for _, rt, kw in calls if (kw or {}).get("memory_budget")
+    ]
+    assert budget_calls, calls
+    for rt, kw in budget_calls:
+        assert rt == 12, (
+            f"the arm requested reader_threads={rt}; at GATED_READER_THREADS "
+            f"the budget derates only the queue depth and the arm stops "
+            f"exercising a thread derate"
+        )
+        assert kw["shard_size"] == 2048
+
+    rows = [r for r in result.runs if r.extra["scenario"] == "budget_bound"]
+    assert rows
+    for r in rows:
+        assert r.extra["reader_threads"] == 12, (
+            "the parent recorded a different thread count from the one it ran"
+        )
+        ratio = r.extra["peak_over_memory_budget__budget_bound"]
+        # 1024 MiB peak against a 2048 MiB budget. A decimal-MB denominator
+        # would give 0.477 and quietly widen a floor set at exactly 1.0.
+        assert ratio == pytest.approx(0.5), ratio
+        assert "streaming_peak_rss_mb" not in r.extra
+
+
+def test_conversion_streaming_budget_premise_fails_closed():
+    """`_assert_budget_arm_actually_derated` refuses both silent-pass shapes.
+
+    It keyed off the presence of a `reader_threads_derated` warning until
+    review, which accepted a *depth-only* derate — the warning fires whenever
+    `threads + depth > outstanding_max`, so it reported that the encode charge
+    had bound the thread count when only the queue depth had moved.
+    """
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    def one(granted, requested):
+        r = BenchmarkResult(
+            benchmark="conversion_streaming", format="f", dataset="smartseq2"
+        )
+        r.add_run(
+            wall_s=1.0, peak_rss_mb=1.0, scenario="budget_bound",
+            derate_granted_threads=granted, derate_requested_threads=requested,
+            warning_categories=["reader_threads_derated"],
+        )
+        return r
+
+    # The budget bound the thread count.
+    cs._assert_budget_arm_actually_derated(["budget_bound"], one(4, 12))
+    # Budget dropped entirely — no derate record at all.
+    with pytest.raises(RuntimeError, match="granted < requested"):
+        cs._assert_budget_arm_actually_derated(["budget_bound"], one(None, None))
+    # Depth-only derate: the warning is present and the threads are untouched.
+    with pytest.raises(RuntimeError, match="granted < requested"):
+        cs._assert_budget_arm_actually_derated(["budget_bound"], one(4, 4))
+    # Not in scope -> no-op, so a dataset without the arm cannot fail.
+    cs._assert_budget_arm_actually_derated(["csc_always"], one(None, None))
+
+
 def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
     """`_EXTRA_ARMS` must reach the worker, and only on the right datasets.
 
-    The two extra arms (`csc_always`, `index_preset_cellxgene`) are the same
-    `from_h5ad` call with one conversion option changed, and the whole reason
-    they exist is that the default arm passes **no** conversion options — so the
-    bound `streaming_peak_rss_mb` enforces is measured in a configuration real
-    callers do not always use.
+    The three extra arms (`csc_always`, `index_preset_cellxgene`,
+    `budget_bound`) are the same `from_h5ad` call with one conversion option
+    changed, and the whole reason they exist is that the default arm passes
+    **no** conversion options — so the bound `streaming_peak_rss_mb` enforces
+    is measured in a configuration real callers do not always use.
 
     Two properties, both easy to lose in a refactor and neither visible in the
     result JSON if lost:
@@ -1171,7 +1292,11 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
        `extra_kwargs` would run the *default* conversion under an arm labelled
        `csc_always`, i.e. measure the wrong thing under the right name); and
     2. the arm is pinned to `GATED_READER_THREADS`, so its number is comparable
-       with the default arm's rather than with the runner's core count.
+       with the default arm's rather than with the runner's core count —
+       **unless it pins its own**, which `budget_bound` does at 12 so the
+       budget derates the *thread* count and not only the queue depth. That
+       resolution shipped twice, once per code path, and disagreed: the worker
+       ran at 12 while the recorded `reader_threads` said 4.
 
     Scope matters for a third reason recorded in the module: `csc_always` is
     expected to breach its ceiling and so needs a justification, and
@@ -1205,6 +1330,14 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
                 # default arm; that difference is the observable the parent
                 # checks, since `Experiment` exposes no `has_obs_index`.
                 "output_bytes": 20 if kw.get("index_preset") else 10,
+                # The budget arm's premise reads these, and a mock without
+                # them fails the happy path for the wrong reason. Model a
+                # worker whose budget bound the thread count.
+                "derate_requested_threads": 12 if kw.get("memory_budget") else None,
+                "derate_granted_threads": 4 if kw.get("memory_budget") else None,
+                "warning_categories": (
+                    ["reader_threads_derated"] if kw.get("memory_budget") else []
+                ),
             }]
 
         original = cs._run_arm_subprocess

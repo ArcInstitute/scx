@@ -88,16 +88,11 @@ fn unenforced_reservations_are_declared_not_silent() {
         .filter(|r| !r.enforced)
         .map(|r| r.name)
         .collect();
-    // Seven, in three groups, and the count is pinned so an eighth cannot arrive
-    // unannounced:
+    // Seven, and the count is pinned so an eighth cannot arrive unannounced:
     //
-    //   * the two §11.4 CSC rows — bucket count and bucket record buffer are
-    //     sized from the *mean* nnz/row, so a right-skewed depth distribution
-    //     overshoots them;
-    //   * the three per-shard ingest/export rows — each sizes a READER working
-    //     set, while `encode_one_shard_worker` holds the raw CSR across
-    //     `encode_one_shard`, so the encoded section is live alongside it. The
-    //     derate bounds the stage, not the whole worker;
+    //   * the two §11.4 CSC bucket rows — bucket count and bucket record
+    //     buffer are sized from the *mean* nnz/row, so a right-skewed depth
+    //     distribution overshoots them;
     //   * the CSC sidecar row — the budget sizes the transpose chunk, while the
     //     writer's full-length index/value copies and the encoder's streams are
     //     live alongside it (and `build_csc.rs` additionally retains every
@@ -106,18 +101,33 @@ fn unenforced_reservations_are_declared_not_silent() {
     //     whole before testing the budget, so one wide column exceeds the
     //     share, and the floor exceeds it for budgets under 128 bytes.
     //
-    // Closing the second group means sizing from the maximum complete worker
-    // phase and re-deriving the share, which trades away the parallelism §11.5
-    // restored. That is a measured change; until it happens, `enforced: false`
-    // is what keeps the table honest.
+    //   * the two **ingest** rows (sparse and dense) — now sized from the
+    //     whole worker phase rather than the reader stage, 48 B/nnz against
+    //     the 16 they used to claim, but `encoded <= payload` is an estimate
+    //     and not a codec guarantee. The sparse row enumerates exactly what
+    //     it does not bound: frame expansion, intra-codec planes, the encoded
+    //     indptr, the bitmap, and readers on the density guess.
+    //
+    //   * the **export** row — no encode term (that path decodes) and sized
+    //     from the catalog's exact nnz, but `filter_shard` holds two indptrs
+    //     on its no-filter path and doubling-grown output buffers alongside
+    //     the originals on its masked one.
+    //
+    // **Still seven.** An intermediate revision of this PR flipped all three
+    // per-shard rows to `enforced: true` and then, on review, flipped two back
+    // and finally the third. What this PR changes is the *estimate* — 3x
+    // better on sparse ingest, 3.7x on dense, and no longer blind to the
+    // encoder — not any row's flag. The share did not move either, which is
+    // why `allocation_table_shares_sum_to_at_most_one_per_phase` is
+    // unaffected. Widening a cost model is not the same as proving a ceiling,
+    // and this count is what keeps the two from being confused.
     assert_eq!(
         unenforced.len(),
         7,
-        "expected exactly the two §11.4 bucket rows plus the three reader-phase \
-         per-shard rows to be unenforced, got {unenforced:?}. Adding an \
-         unenforced row without updating this count lets a known gap enter the \
-         table unannounced; removing one means a gap actually closed and this \
-         test should say so."
+        "expected all four CSC rows plus the three per-shard rows to be \
+         unenforced, got {unenforced:?}. Adding an unenforced row without \
+         updating this count lets a known gap enter the table unannounced; \
+         removing one means a gap actually closed and this test should say so."
     );
 }
 
@@ -212,9 +222,54 @@ fn dense_slab_never_exceeds_its_share() {
 }
 
 #[test]
-fn shard_working_set_counts_payload_scratch_and_indptr() {
-    // 50 nnz, 100 rows: 50x8 payload, x2 scratch, plus 101x8 indptr.
-    assert_eq!(shard_working_set_bytes(50, 100), 50 * 8 * 2 + 101 * 8);
+fn shard_working_set_counts_the_whole_worker_phase_and_the_indptr() {
+    // 50 nnz, 100 rows. Spelled as the derivation rather than as a total, so
+    // a change to either multiple has to be made here deliberately instead of
+    // being pasted out of a failure message:
+    //
+    //   payload           50 x 8            = 400
+    //   encoder value copy 50 x 8 x 1       = 400
+    //   framed encode     50 x 8 x 4        = 1600
+    //   indptr            101 x 8           = 808
+    //                                        ----
+    //                                        3208
+    let payload = 50 * PAYLOAD_BYTES_PER_NNZ;
+    assert_eq!(
+        shard_working_set_bytes(50, 100),
+        payload
+            + payload * ENCODER_VALUE_COPY_MULTIPLE
+            + payload * ENCODE_TRANSIENT_MULTIPLE
+            + 101 * INDPTR_BYTES_PER_ROW
+    );
+    assert_eq!(shard_working_set_bytes(50, 100), 3208);
     // Never zero: a zero would make the derate treat the budget as unset.
     assert_eq!(shard_working_set_bytes(0, 0), 8);
+}
+
+/// The encode transient is actually charged, and charged *concurrently* — the
+/// whole-phase figure is strictly more than the payload plus one copy of it.
+///
+/// Watched red by setting `ENCODE_TRANSIENT_MULTIPLE` to 0: the first
+/// assertion then reports 16 B/nnz, which is the pre-PR-42 model and the state
+/// this item exists to leave.
+#[test]
+fn the_worker_phase_charges_the_framed_encode() {
+    assert_eq!(WORKER_PHASE_BYTES_PER_NNZ, 48);
+    // Export is on a **decode** path and must not carry the encode term:
+    // `stream_write.rs` has no encode call at all. 50 x 8 x 2 + 101 x 8.
+    assert_eq!(
+        shard_decode_working_set_bytes(50, 100),
+        50 * PAYLOAD_BYTES_PER_NNZ * (1 + DECODE_SCRATCH_MULTIPLE) + 101 * INDPTR_BYTES_PER_ROW
+    );
+    assert_eq!(shard_decode_working_set_bytes(50, 100), 1608);
+    assert!(
+        shard_decode_working_set_bytes(50, 100) < shard_working_set_bytes(50, 100),
+        "an export shard must be cheaper than an ingest shard, or the export \
+         derate is paying for an encoder it never runs"
+    );
+    // And the density-estimate path asks the table for the same figure.
+    assert_eq!(
+        estimated_worker_bytes(100, 1_000, PARALLEL_DENSITY_DEFAULT_DEN),
+        100 * 1_000 * WORKER_PHASE_BYTES_PER_NNZ / PARALLEL_DENSITY_DEFAULT_DEN
+    );
 }

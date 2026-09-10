@@ -329,6 +329,12 @@ impl IndexedCsrShardStream for XStreamReader {
     /// density-ceiling default that under-estimates dense-stored-as-CSR
     /// inputs and over-spawns workers into OOM. No I/O: `indptr` is loaded
     /// eagerly at open.
+    /// Resident and loaded eagerly at open, so the permuted adapter can price
+    /// a reordered shard from real per-row nnz.
+    fn source_row_indptr(&self) -> Option<&[i64]> {
+        Some(&self.indptr)
+    }
+
     fn per_worker_bytes(
         &self,
         shard_target_rows: u32,

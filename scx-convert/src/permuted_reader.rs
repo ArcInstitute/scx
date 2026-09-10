@@ -206,8 +206,187 @@ impl IndexedCsrShardStream for PermutedCsrReader {
     fn max_slab_rows(&self) -> Option<u32> {
         self.inner.max_slab_rows()
     }
+    /// Price the shard this reader will actually **emit**, not the source
+    /// windows the inner reader would have read.
+    ///
+    /// Delegating was an under-count with no bound: the CSR override scans
+    /// source-aligned windows `[0, t), [t, 2t), …` and takes their maximum nnz,
+    /// but a permutation can collect rows that were spread across those windows
+    /// into one output shard. A categorical sort that groups the deepest cells
+    /// together does exactly that, and the estimate the derate then works from
+    /// describes a partition that is never read.
+    ///
+    /// So when the inner reader can hand out its `indptr`
+    /// ([`IndexedCsrShardStream::source_row_indptr`]) this walks the *output*
+    /// rows through `perm` and takes a **sliding** window maximum. Sliding, not
+    /// aligned, because this method is asked for one width and serves two
+    /// partitions: the fixed path's aligned `[0, t), [t, 2t), …` (for which
+    /// sliding is exact at the maximum) and the grouped path's variable
+    /// group-aligned ranges, for which the caller passes only the largest row
+    /// count — any contiguous range of at most `shard_target_rows` rows is
+    /// covered by some window of exactly that width, so the sliding maximum
+    /// bounds every one of them. One O(n_obs) pass over resident memory, no I/O.
+    ///
+    /// Readers that cannot answer (`None`) still delegate; that is the dense
+    /// reader, whose own override sizes a slab and is permutation-independent.
+    ///
+    /// The **gather copy** is deliberately not an added term. Inside
+    /// [`Self::gather`] the source runs and the assembled output are both live
+    /// (~16 B/nnz), but the runs drop at the end of `gather` and only the
+    /// output reaches the encode — so that peak sits under the 48 B/nnz whole
+    /// phase [`crate::budget::shard_working_set_bytes`] already charges, and
+    /// adding it would double-count the way §11.5 did.
     fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
-        self.inner
-            .per_worker_bytes(shard_target_rows, modality_type)
+        let Some(indptr) = self.inner.source_row_indptr() else {
+            return self
+                .inner
+                .per_worker_bytes(shard_target_rows, modality_type);
+        };
+        let n = self.perm.len();
+        if n == 0 || indptr.len() < 2 {
+            return self
+                .inner
+                .per_worker_bytes(shard_target_rows, modality_type);
+        }
+        let t = (shard_target_rows.max(1) as usize).min(n);
+        let row_nnz = |out_row: usize| -> u64 {
+            let src = self.perm[out_row] as usize;
+            match (indptr.get(src), indptr.get(src + 1)) {
+                (Some(&lo), Some(&hi)) => hi.saturating_sub(lo).max(0) as u64,
+                _ => 0,
+            }
+        };
+        let mut window: u64 = (0..t).map(row_nnz).sum();
+        let mut max_nnz = window;
+        for i in t..n {
+            window = window
+                .saturating_add(row_nnz(i))
+                .saturating_sub(row_nnz(i - t));
+            max_nnz = max_nnz.max(window);
+        }
+        crate::budget::shard_working_set_bytes(max_nnz, t as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inner reader with a resident `indptr` and nothing else — enough to
+    /// exercise both estimators without libhdf5. `read_range` is never called.
+    struct IndptrOnlyReader {
+        indptr: Vec<i64>,
+        n_vars: u64,
+    }
+
+    impl IndexedCsrShardStream for IndptrOnlyReader {
+        fn n_obs(&self) -> u64 {
+            (self.indptr.len() - 1) as u64
+        }
+        fn n_vars(&self) -> u64 {
+            self.n_vars
+        }
+        fn source_matrix_name(&self) -> &str {
+            "X"
+        }
+        fn read_range(
+            &self,
+            _row_start: u64,
+            _n_rows: u32,
+        ) -> Result<StreamedCsrShard, ConvertError> {
+            unreachable!("the estimator does no I/O")
+        }
+        fn source_row_indptr(&self) -> Option<&[i64]> {
+            Some(&self.indptr)
+        }
+        fn per_worker_bytes(&self, shard_target_rows: u32, _m: ModalityType) -> u64 {
+            // The same source-aligned window scan `XStreamReader` runs.
+            let n_obs = self.indptr.len() - 1;
+            let t = (shard_target_rows.max(1) as usize).min(n_obs);
+            let mut max_nnz = 0u64;
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + t).min(n_obs);
+                max_nnz = max_nnz.max((self.indptr[end] - self.indptr[start]) as u64);
+                start = end;
+            }
+            crate::budget::shard_working_set_bytes(max_nnz, t as u64)
+        }
+    }
+
+    /// Four rows of 1, 9, 1, 9 nnz. Source-aligned 2-row windows both hold 10,
+    /// so the delegated estimate says 10 — but the permutation that puts the
+    /// two deep rows in one output shard emits 18.
+    fn deep_rows_spread_across_windows() -> IndptrOnlyReader {
+        IndptrOnlyReader {
+            indptr: vec![0, 1, 10, 11, 20],
+            n_vars: 32,
+        }
+    }
+
+    #[test]
+    fn permuted_estimate_prices_the_output_shard_not_the_source_windows() {
+        let inner = deep_rows_spread_across_windows();
+        let delegated = inner.per_worker_bytes(2, ModalityType::Rna);
+        assert_eq!(delegated, crate::budget::shard_working_set_bytes(10, 2));
+
+        // perm groups the deep rows (source 1 and 3) into output rows [0, 2).
+        let reader = PermutedCsrReader::new(Box::new(inner), Arc::new(vec![1, 3, 0, 2]));
+        let priced = reader.per_worker_bytes(2, ModalityType::Rna);
+        assert_eq!(
+            priced,
+            crate::budget::shard_working_set_bytes(18, 2),
+            "the permuted estimate must price the 18-nnz output shard"
+        );
+        assert!(
+            priced > delegated,
+            "delegating under-priced this permutation ({delegated} < {priced}), which is the \
+             defect: the derate would have spawned workers against a partition never read"
+        );
+    }
+
+    #[test]
+    fn permuted_estimate_bounds_every_grouped_range_of_that_width() {
+        // The grouped path passes only the largest range's row count, so the
+        // estimate must cover any contiguous output range of that width — the
+        // sliding maximum, not the aligned one. Here output rows are ordered
+        // 1, 3, 0, 2 (nnz 9, 9, 1, 1): the aligned 2-row windows are 18 and 2,
+        // and the worst *sliding* window is also 18, so a 3-row range (19) is
+        // priced at width 3.
+        let reader = PermutedCsrReader::new(
+            Box::new(deep_rows_spread_across_windows()),
+            Arc::new(vec![1, 3, 0, 2]),
+        );
+        assert_eq!(
+            reader.per_worker_bytes(3, ModalityType::Rna),
+            crate::budget::shard_working_set_bytes(19, 3)
+        );
+    }
+
+    #[test]
+    fn a_reader_without_a_resident_indptr_still_delegates() {
+        struct NoIndptr(u64);
+        impl IndexedCsrShardStream for NoIndptr {
+            fn n_obs(&self) -> u64 {
+                4
+            }
+            fn n_vars(&self) -> u64 {
+                self.0
+            }
+            fn source_matrix_name(&self) -> &str {
+                "X"
+            }
+            fn read_range(
+                &self,
+                _row_start: u64,
+                _n_rows: u32,
+            ) -> Result<StreamedCsrShard, ConvertError> {
+                unreachable!()
+            }
+        }
+        let inner = NoIndptr(1000);
+        let expected = inner.per_worker_bytes(2, ModalityType::Rna);
+        let reader = PermutedCsrReader::new(Box::new(inner), Arc::new(vec![3, 2, 1, 0]));
+        assert_eq!(reader.per_worker_bytes(2, ModalityType::Rna), expected);
     }
 }

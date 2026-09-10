@@ -8,13 +8,24 @@ use scx_format_io::modality::ModalityType;
 
 use super::pipeline::ConvertError;
 
-/// Working-set bytes for processing one CSR shard of `nnz` non-zeros over
-/// `n_rows` rows: the decoded `i32` indices + `f32` values (8 B/nnz) plus an
-/// equal scratch allowance for the rebuild/encode buffers, plus the
-/// shard-local `u64` indptr. Single source shared by the ingest worker-derate
-/// (`IndexedCsrShardStream::per_worker_bytes`) and the export-side
-/// `per_shard_export_bytes`, so the two budgets can't drift.
-pub(crate) use crate::budget::shard_working_set_bytes;
+/// Working-set bytes for one CSR shard of `nnz` non-zeros over `n_rows` rows,
+/// in two flavours because ingest and export hold different things:
+///
+/// * `shard_working_set_bytes` — the **ingest** worker's whole phase, 48 B/nnz
+///   plus the indptr: the decoded `i32` indices + `f32` values, the encoder's
+///   own re-serialised copy of them, and the framed encode's buffers for the
+///   two candidates `codec="auto"` runs concurrently. Used by
+///   `IndexedCsrShardStream::per_worker_bytes`.
+/// * `shard_decode_working_set_bytes` — the **export** side, 16 B/nnz plus the
+///   indptr: payload and decoder scratch, no encode term, because
+///   `h5ad/stream_write.rs` contains no encode call. Used by
+///   `per_shard_export_bytes`.
+///
+/// They shared one function until the encode charge landed, on the argument
+/// that a single model cannot drift. That argument holds only while the two
+/// phases are the same, and they are not — the shared model over-derated a
+/// budgeted export threefold for memory it never holds.
+pub(crate) use crate::budget::{shard_decode_working_set_bytes, shard_working_set_bytes};
 
 /// Major axis of the source matrix. Streaming readers always emit
 /// CSR shards downstream; `Column` only appears as a marker on
@@ -116,24 +127,37 @@ pub trait IndexedCsrShardStream: Send + Sync {
     /// Per-worker working-set estimate in bytes used by the
     /// memory-budget derate in the parallel-coordinator dispatcher.
     ///
-    /// The default impl is a density-based **ceiling**, not an exact
-    /// figure: it assumes the sparsified output binds and picks density
-    /// by modality (`Atac` → 10 %, everything else → 5 %), with ~16 B/nnz
-    /// (`i32` indices + `f32` values + amortised `indptr`). It is only a
-    /// fallback for readers that cannot cheaply know their nnz — a
-    /// dense-stored-as-CSR matrix would *under*-estimate here. Readers
-    /// with a resident `indptr` (CSR h5ad) override this to derive the
-    /// exact max-shard nnz via [`shard_working_set_bytes`]; dense readers
-    /// override it to size the dense slab buffer instead.
+    /// The default impl is a **guess**, and not a bound in either
+    /// direction: it assumes a density by modality (`Atac` → 10 %,
+    /// everything else → 5 %) and charges
+    /// [`crate::budget::WORKER_PHASE_BYTES_PER_NNZ`] per nonzero — the
+    /// payload, the reader's rebuild scratch and the framed encode's
+    /// buffers. Above that density it under-estimates, and a
+    /// dense-stored-as-CSR matrix (density 1.0) under-estimates by 10-20x.
+    /// It exists only for readers that cannot cheaply know their nnz.
+    /// Readers with a resident `indptr` (CSR h5ad) override this to derive
+    /// the max-shard nnz exactly via [`shard_working_set_bytes`];
+    /// [`crate::permuted_reader::PermutedCsrReader`] overrides it again
+    /// because it reorders rows and the source-aligned maximum does not
+    /// describe the shard it emits; dense readers override it to size the
+    /// dense slab buffer instead.
+    /// The source matrix's row prefix-sum (`indptr`), when the reader holds it
+    /// resident and can hand it out without I/O.
+    ///
+    /// Exists for one caller: `PermutedCsrReader`, which reorders rows and so
+    /// cannot price its output shards from the *source*-aligned windows
+    /// [`Self::per_worker_bytes`] scans. `None` means "I cannot answer cheaply",
+    /// and the adapter falls back to delegating.
+    fn source_row_indptr(&self) -> Option<&[i64]> {
+        None
+    }
+
     fn per_worker_bytes(&self, shard_target_rows: u32, modality_type: ModalityType) -> u64 {
         let density_den: u64 = match modality_type {
             ModalityType::Atac => crate::budget::PARALLEL_DENSITY_ATAC_DEN,
             _ => crate::budget::PARALLEL_DENSITY_DEFAULT_DEN,
         };
-        let est = (shard_target_rows as u64)
-            .saturating_mul(self.n_vars())
-            .saturating_mul(16)
-            / density_den;
-        est.max(1)
+        crate::budget::estimated_worker_bytes(shard_target_rows as u64, self.n_vars(), density_den)
+            .max(1)
     }
 }

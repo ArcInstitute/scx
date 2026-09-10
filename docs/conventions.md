@@ -419,9 +419,14 @@ validated by a suite that cannot fail is indistinguishable from a regression.
 - Memory derate: per-worker working-set estimate comes from
   `IndexedCsrShardStream::per_worker_bytes(effective_target,
   modality_type)`. Sparse readers (default impl) assume density 5 %
-  (RNA / general) or 10 % (ATAC), times `n_vars × 16 B/nnz`.
-  `DenseXStreamReader` overrides this with
-  `effective_target × n_vars × 12 B/element`. Every constant and
+  (RNA / general) or 10 % (ATAC), times `n_vars ×
+  budget::WORKER_PHASE_BYTES_PER_NNZ` (48 B/nnz — payload, the encoder's
+  value copy, and the framed encode's two candidates).
+  `DenseXStreamReader` overrides this with `effective_target × n_vars ×
+  budget::dense_worker_phase_bytes_per_elem` (44 B/element). Both size the
+  **whole worker phase**, not the reader stage — a 3x better estimate, not a
+  proven ceiling: all three per-shard reservations remain
+  `enforced: false` and each names what it does not bound. Every constant and
   fraction here comes from `scx-convert/src/budget.rs`; do not
   re-derive one at a call site. When `--memory-budget` is set, worker
   count is clamped to fit; a single shard exceeding the budget fails
@@ -468,14 +473,22 @@ dispatcher but with a simpler precondition set:
   `data_ds.write_slice`, `indptr_ds.write_slice`) stay on the calling
   thread. There is no concurrent HDF5 access on this path, so
   non-threadsafe libhdf5 builds work just as well as threadsafe ones.
-- **Exact per-shard memory budget.** Every CSR shard records its
-  `nnz` and row range in `FullCatalogEntry::stats` at convert time.
-  `per_shard_export_bytes(stats)` computes the working set
-  precisely — `nnz × 8` (indices + data) + `(n_rows + 1) × 8`
-  (indptr) + `nnz × 8` (codec scratch). No density heuristic, no
-  modality-type branching. The memory-budget derate constrains
-  `reader_threads + writer_queue_depth` against `max_shard_bytes` so
-  the rolling-window cap matches the budget directly.
+- **Per-shard memory estimate from real shard statistics, not a
+  heuristic.** Every CSR shard records its `nnz` and row range in
+  `FullCatalogEntry::stats` at convert time, so
+  `per_shard_export_bytes(stats)` sizes the decode phase from measured
+  nnz — `nnz × 8` (indices + data) + `(n_rows + 1) × 8` (indptr) +
+  `nnz × 8` (**decoder** scratch, via
+  `budget::shard_decode_working_set_bytes`). No density heuristic, no
+  modality-type branching, and deliberately **not** the ingest model:
+  export decodes, so it carries no encode term. It is still **not a
+  bound** and the row stays `enforced: false` — `filter_shard` builds a
+  `kept_indptr_tail` while `indptr_local` is live and grows
+  `kept_indices` / `kept_data` from empty by doubling alongside the
+  originals, none of which this charges. The memory-budget derate
+  constrains `reader_threads + writer_queue_depth` against
+  `max_shard_bytes` so the rolling-window cap matches the estimate
+  directly.
 - **No `max_slab_rows` clamp.** SCX shards are random-access via
   `ScxReader::read_shard_from_entry(entry)` — the export walk passes the
   catalog entry it already holds rather than an index the reader re-resolves,

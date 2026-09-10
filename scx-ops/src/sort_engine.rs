@@ -113,6 +113,91 @@ const K_PASS_MAX_CARDINALITY: usize = 32;
 /// sizes byte-mode shards identically to `scx sort`.
 pub const GROUP_BYTES_PER_NNZ: u64 = 8;
 
+/// Bytes one in-flight grouped block costs per nonzero, across its **whole**
+/// phase: the gather buffers ([`GROUP_BYTES_PER_NNZ`]), the encoder's own copy
+/// of the values, and the framed encode's live buffers.
+///
+/// `1 + 1 + 4`, the same derivation `scx-convert/src/budget.rs` carries for
+/// its **ingest** derate — export holds no encode buffers and is sized by its
+/// own decode-phase model there — `encode_shard_framed` holds every row
+/// group's encoded bytes alongside the streams assembled from them (2x), and
+/// `encode_shard_adaptive` runs two candidates under `rayon::join` (x2), each
+/// bounded by its input because every codec here is a compressor or a 1:1
+/// copy.
+///
+/// **Declared here rather than shared** with that table: `scx-convert` depends
+/// on `scx-ops`, so the dependency cannot run the other way, and every
+/// constant in `budget.rs` is `pub(crate)`. This is the same deliberate
+/// duplication as `GROUP_BYTES_PER_NNZ` (8) beside
+/// `budget::PAYLOAD_BYTES_PER_NNZ` (8) — one "i32 + f32" model, declared once
+/// per crate. Change one and change the other.
+const GROUPED_BLOCK_PHASE_MULTIPLE: u64 = 6;
+
+/// Bytes one nonzero adds to a grouped block's **cut accumulator** — a `u32`
+/// index element plus the value bytes `encode_value` pushes at the file-wide
+/// encoding.
+///
+/// This is the unit `--group-write-block-bytes` / `block_byte_cap` is
+/// denominated in, and it is deliberately *not*
+/// [`GROUP_BYTES_PER_NNZ`]: the accumulator tracks the narrowed bytes while
+/// the gather buffers hold `i32 + f32`. Both the cap's budget clamp and
+/// `emit_x_in_memory_grouped_fast`'s cut loop call this, so the cap and the
+/// cut points cannot be denominated differently — which is what let a narrow
+/// encoding admit 1.6x the nonzeros a budget could hold.
+fn block_cut_bytes_per_nnz(value_encoding: ValueEncoding) -> u64 {
+    let value_width: u64 = match value_encoding {
+        ValueEncoding::Uint8 => 1,
+        ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
+        ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
+    };
+    4 + value_width // 4 = u32 index element
+}
+
+/// Effective per-block byte cap for the grouped-write sub-flush: the caller's
+/// `--group-write-block-bytes` (or the 256 MB default), clamped so that one
+/// block's whole live phase fits `--memory-budget`.
+///
+/// Without the clamp a small budget paired with the larger default cap would
+/// let a block silently exceed the budget, and the M1 guard's
+/// downgrade-to-warning would be misleading. `0` keeps the sub-flush disabled
+/// (the guard then hard-errors) and is passed through untouched.
+///
+/// The clamp converts the budget **into the cap's own unit**. The cap counts
+/// [`block_cut_bytes_per_nnz`] — the emitter's narrowed accumulator — while a
+/// block in flight costs `GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ`
+/// per nonzero, so the nonzeros a cap admits (and therefore the memory it
+/// commits) depend on the value width. At `Float32` the two agree and this is
+/// `budget / GROUPED_BLOCK_PHASE_MULTIPLE`, exactly the prior arithmetic. At
+/// `Uint8` they do not: 5 accumulator bytes per nnz against 48 in memory, so
+/// the old `budget / 6` admitted 1.6x the nonzeros the budget could hold and
+/// [`grouped_fast_concurrency`]'s `concurrency x per_block <= budget` was false
+/// by that factor with no concurrency left to cut. Clamping to the raw budget
+/// was worse still — at f32 with a 256 MiB budget the cap was 256 MiB and
+/// `per_block` 1.5 GiB.
+///
+/// Same shape as the dense slab cap in `scx-convert`: a cost model and the cap
+/// that feeds it must be derived from the same figure, or the cap hands the
+/// model rows it cannot afford. Extracted from its single call site so
+/// `grouped_block_byte_cap_keeps_one_block_inside_the_budget` can assert that
+/// invariant across every value encoding, which is not reachable from a caller
+/// that needs a real file.
+fn grouped_block_byte_cap(
+    cap: u64,
+    memory_budget: Option<u64>,
+    value_encoding: ValueEncoding,
+) -> u64 {
+    match (cap, memory_budget) {
+        (0, _) => 0,
+        (cap, Some(budget)) => {
+            let phase_per_nnz = GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ;
+            let admissible =
+                budget.saturating_mul(block_cut_bytes_per_nnz(value_encoding)) / phase_per_nnz;
+            cap.min(admissible).max(1)
+        }
+        (cap, None) => cap,
+    }
+}
+
 /// F1: default oversize threshold as a multiple of the per-shard target when
 /// `--group-max-bytes` is not supplied. Public for the same reason as
 /// [`GROUP_BYTES_PER_NNZ`].
@@ -394,22 +479,17 @@ pub fn sort_with_strategy(
     // un-augmented — it feeds the X strategy selector / K-pass below (category
     // enumeration, null detection) and `compute_grouped_order` injects the
     // synthetic reference-first key on its own clone.
-    // F6: effective per-shard block cap for the grouped-write sub-flush. Clamp to
-    // `--memory-budget` when one is set so the emitter's (and fast path's)
-    // per-block buffer honours the budget — otherwise a small budget paired with
-    // the larger 256 MB default cap would let a block silently exceed the budget,
-    // and the M1 guard's downgrade-to-warning below would be misleading (codex
-    // P2). `Some(0)` keeps the sub-flush disabled (the guard then hard-errors).
-    let block_byte_cap: u64 = {
-        let cap = opts
-            .group_write_block_bytes
-            .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES);
-        match (cap, opts.memory_budget) {
-            (0, _) => 0,
-            (cap, Some(budget)) => cap.min(budget).max(1),
-            (cap, None) => cap,
-        }
-    };
+    // F6: effective per-shard block cap for the grouped-write sub-flush; see
+    // `grouped_block_byte_cap`. The file-wide value encoding is read first
+    // because the cap is denominated in the emitter's narrowed accumulation
+    // unit, and converting a budget into that unit depends on the width.
+    let value_encoding = x_value_encoding(&reader)?;
+    let block_byte_cap: u64 = grouped_block_byte_cap(
+        opts.group_write_block_bytes
+            .unwrap_or(DEFAULT_GROUP_WRITE_BLOCK_BYTES),
+        opts.memory_budget,
+        value_encoding,
+    );
     let mut grouped_reference_labels: Vec<String> = Vec::new();
     let (order_local, group_plan): (Vec<u64>, Option<crate::group_plan::GroupPlan>) =
         if let Some(group_col) = &opts.group_by {
@@ -653,7 +733,6 @@ pub fn sort_with_strategy(
     log::info!("scx sort: var written; starting X gather");
 
     // ----- X: strategy-specific gather -----
-    let value_encoding = x_value_encoding(&reader)?;
     // Estimate peak resident bytes for the in-memory strategy: X (nnz·8 +
     // indptr) plus the layers and obsm it also gathers whole — so the selector
     // does not pick `InMemory` when layers/obsm push total RSS over the budget.
@@ -1598,24 +1677,52 @@ fn emit_x_in_memory(
 /// transient honors `--memory-budget` (H1).
 ///
 /// Each in-flight block holds gather buffers (u32 index + f32 value =
-/// [`GROUP_BYTES_PER_NNZ`] bytes per nnz) plus ~1× that again for the encoded
-/// output, over the `nnz ≈ block_byte_cap / per_nnz_bytes` a full block holds at
-/// the cap — i.e. `per_block ≈ 2 × GROUP_BYTES_PER_NNZ × block_byte_cap /
-/// per_nnz_bytes` (`2× block_byte_cap` for f32, `~3.2×` for uint8). We cap
-/// `concurrency` to `budget / per_block` (min 1), so `concurrency × per_block ≤
-/// budget`; concurrency 1 gives parity with the one-block-at-a-time `CsrEmitter`.
+/// [`GROUP_BYTES_PER_NNZ`] bytes per nnz), the encoder's own copy of the
+/// values, and the framed encode's live buffers — `GROUPED_BLOCK_PHASE_MULTIPLE`
+/// times the gather cost, over the `nnz ≈ block_byte_cap / per_nnz_bytes` a
+/// full block holds at the cap. We cap `concurrency` to `budget / per_block`
+/// (min 1), so `concurrency × per_block ≤ budget`; concurrency 1 gives parity
+/// with the one-block-at-a-time `CsrEmitter`.
 ///
-/// ⚠️ **The "~1× that again for the encoded output" term is understated for a
-/// framed block, so the `≤ budget` promise above is not one.** This path takes
-/// `writer.framing()`, which under `--codec auto` carries a `decode_target`, so
-/// `encode_shard_adaptive` dual-encodes the block *and*
+/// That inequality holds because the **caller's** `block_byte_cap` is clamped
+/// to `budget * block_cut_bytes_per_nnz / (GROUPED_BLOCK_PHASE_MULTIPLE *
+/// GROUP_BYTES_PER_NNZ)` (`sort_engine.rs`'s `block_byte_cap` binding), so a
+/// block filled **to** the cap has a whole phase that fits the budget and the
+/// `.max(1)` floor is not the branch that breaks it. Two earlier spellings of that clamp did
+/// not hold: clamping to the raw budget made it false in the ordinary f32 case
+/// (cap 256 MiB → `per_block` 1.5 GiB against a 256 MiB budget), and clamping
+/// to `budget / GROUPED_BLOCK_PHASE_MULTIPLE` made it false by
+/// `GROUP_BYTES_PER_NNZ / block_cut_bytes_per_nnz` — 1.0 at f32 but **1.6 at
+/// `Uint8`**, because the cap counts narrowed accumulator bytes and the gather
+/// holds `i32 + f32`. Converting the budget through the cap's own unit closes
+/// that: at f32 the arithmetic is unchanged, and at a narrower encoding the cap
+/// shrinks by exactly the overshoot.
+///
+/// ⚠️ **One residual, which predates this model, and it is why the paragraph
+/// above says "filled to the cap" rather than "any block".** A whole row is
+/// admitted before the cap is tested, so one pathologically deep row can
+/// overshoot `nnz_per_block` — and therefore the budget — by its own length.
+/// `.max(1)` cannot honour a budget smaller than one block's phase either:
+/// there is no concurrency below one. So this is a much better estimate than
+/// the gather-only model it replaced, and still not a proven ceiling.
+///
+/// Conservative in the other direction on one axis, symmetrically with
+/// `scx-convert`'s `ENCODE_TRANSIENT_MULTIPLE`: the `4x` encode share assumes
+/// the dual-candidate `rayon::join`, which only `--codec auto`/`compact`
+/// incur, and it is charged whatever `writer.framing()` actually carries.
+///
+/// The encode side is `4×` and not the `~1×` this used to charge, because this
+/// path takes `writer.framing()`, which under `--codec auto` carries a
+/// `decode_target`: `encode_shard_adaptive` dual-encodes the block, and
 /// `encode_shard_framed` holds every row group's encoded bytes alongside the
-/// streams assembled from them — up to ~4× the encoded block rather than ~1×.
-/// `scx-convert/src/budget.rs` carries the measured figures and the reachable
-/// worst case (~32 B/nnz on incompressible integer data). Closing it means
-/// re-deriving `per_block` from the whole encode phase and re-measuring what
-/// that does to grouped-sort wall time; the same is true of the convert
-/// derate, and neither is a footnote-sized change.
+/// streams assembled from them. `scx-convert/src/budget.rs` carries the
+/// derivation and the measured figures; `GROUPED_BLOCK_PHASE_MULTIPLE`'s doc
+/// says why the constant is declared in this crate rather than shared.
+///
+/// What `per_block` still does **not** price, named rather than left implicit:
+/// the block's `local_indptr` (8 B/row, small beside a block's nnz) and the
+/// optional `BitmapShard`. Neither is the encode term, and neither was priced
+/// before either.
 ///
 /// `None` budget keeps the full rayon-thread concurrency (the user opted out of
 /// budgeting). When a budget **is** set but the sub-flush is disabled
@@ -1635,7 +1742,7 @@ fn grouped_fast_concurrency(
         // Sub-flush enabled: cap concurrency so `concurrency × per-block ≤ budget`.
         Some(budget) if block_byte_cap > 0 && per_nnz_bytes > 0 => {
             let nnz_per_block = (block_byte_cap / per_nnz_bytes).max(1);
-            let per_block = (2 * GROUP_BYTES_PER_NNZ)
+            let per_block = (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ)
                 .saturating_mul(nnz_per_block)
                 .max(1);
             // Compare in u64 before narrowing to avoid truncation on 32-bit usize.
@@ -1670,8 +1777,9 @@ fn grouped_fast_concurrency(
 /// so at most ~`concurrency` blocks' gather + encoded buffers are in flight on
 /// top of the resident source CSR — O(concurrency × block cap), independent of
 /// the block count (it does NOT buffer the whole encoded matrix). `block_byte_cap`
-/// is clamped to `--memory-budget` upstream, which bounds a *single* block's
-/// transient. The **total** peak is `concurrency × per-block transient`, so when a
+/// is clamped to `--memory-budget / GROUPED_BLOCK_PHASE_MULTIPLE` upstream,
+/// which is what bounds a *single* block's whole-phase transient — clamping it
+/// to the raw budget did not (see [`grouped_fast_concurrency`]). The **total** peak is `concurrency × per-block transient`, so when a
 /// `memory_budget` is set `concurrency` is additionally capped to
 /// `budget / per-block transient` (see [`grouped_fast_concurrency`]) — otherwise a
 /// many-core host would run `rayon::current_num_threads()` blocks in flight and
@@ -1700,15 +1808,10 @@ fn emit_x_in_memory_grouped_fast(
     let n_obs = order_old.len();
     let shard_starts = &plan.shard_starts;
 
-    // Per-element value byte width for the file-wide encoding — matches how
-    // `acc_values` grows in `CsrEmitter` (`encode_value` pushes this many bytes
-    // per nnz), so the block-cap cut points below are identical.
-    let value_width: u64 = match value_encoding {
-        ValueEncoding::Uint8 => 1,
-        ValueEncoding::Uint16 | ValueEncoding::Float16 => 2,
-        ValueEncoding::Uint32 | ValueEncoding::Float32 => 4,
-    };
-    let per_nnz_bytes = 4 + value_width; // 4 = u32 index element
+    // Matches how `acc_values` grows in `CsrEmitter` (`encode_value` pushes
+    // this many bytes per nnz), so the block-cap cut points below are
+    // identical — and it is the same function the cap's budget clamp uses.
+    let per_nnz_bytes = block_cut_bytes_per_nnz(value_encoding);
 
     // 1. Compute block row-ranges, reproducing `CsrEmitter::push_row` exactly: a
     //    planned break at emit-row `p` seals the block ending at `p`; the
