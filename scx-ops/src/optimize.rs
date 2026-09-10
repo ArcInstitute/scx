@@ -316,9 +316,15 @@ pub fn optimize_with_framing(
                     && !scx_sparse::is_canonical_csr(&indptr, &indices, &values);
                 canonicalize_csr(&mut indptr, &mut indices, &mut values);
 
-                // The shard's own minor dimension rather than the file-level
-                // `n_vars`: correct for `ObspCsrShard` (minor axis = `n_obs`)
-                // and robust against any per-shard width difference.
+                // The shard's own stamped minor extent, read back from the
+                // source header, rather than the file-level `n_vars`. That is
+                // what makes this a faithful re-encode: whatever the source
+                // declares round-trips, including a per-shard width difference
+                // and including an `ObspCsrShard`, whose extent the *writer*
+                // derives wrongly (obs x obs, stamped from `n_vars` -- see
+                // `ScxWriter::shard_n_minor`). Re-deriving it here would either
+                // reproduce that defect or silently change the extent on files
+                // that already carry it.
                 let mut enc_opts = scx_format_io::EncodeShardOptions::new(
                     entry.name.clone(),
                     entry.section_type,
