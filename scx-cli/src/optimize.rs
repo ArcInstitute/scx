@@ -16,6 +16,7 @@ pub fn run_optimize(
     row_group_rows: Option<u32>,
     row_group_target_nnz: Option<u64>,
     shard_obs: &str,
+    memory_budget: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !input.exists() {
         return Err(format!("input file does not exist: {}", input.display()).into());
@@ -58,6 +59,12 @@ pub fn run_optimize(
     }
 
     let obs_shard_policy = scx_format_io::ObsShardPolicy::parse(shard_obs)?;
+    // Parsed before any file I/O, so a malformed size fails immediately rather
+    // than after a partial rewrite -- the same rule `scx convert` follows.
+    let memory_budget = match memory_budget {
+        Some(spec) => Some(scx_format_io::MemoryBudget::parse(spec)?),
+        None => None,
+    };
 
     let before_size = std::fs::metadata(input)?.len();
 
@@ -70,7 +77,14 @@ pub fn run_optimize(
     pb.set_message(format!("Optimizing {}...", input.display()));
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let stats = scx_ops::optimize_with_framing(input, output, codec_id, obs_shard_policy, framing)?;
+    let stats = scx_ops::optimize_with_framing(
+        input,
+        output,
+        codec_id,
+        obs_shard_policy,
+        framing,
+        memory_budget,
+    )?;
 
     pb.finish_and_clear();
     let after_size = std::fs::metadata(output)?.len();

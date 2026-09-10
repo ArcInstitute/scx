@@ -113,25 +113,11 @@ const K_PASS_MAX_CARDINALITY: usize = 32;
 /// sizes byte-mode shards identically to `scx sort`.
 pub const GROUP_BYTES_PER_NNZ: u64 = 8;
 
-/// Bytes one in-flight grouped block costs per nonzero, across its **whole**
-/// phase: the gather buffers ([`GROUP_BYTES_PER_NNZ`]), the encoder's own copy
-/// of the values, and the framed encode's live buffers.
-///
-/// `1 + 1 + 4`, the same derivation `scx-convert/src/budget.rs` carries for
-/// its **ingest** derate — export holds no encode buffers and is sized by its
-/// own decode-phase model there — `encode_shard_framed` holds every row
-/// group's encoded bytes alongside the streams assembled from them (2x), and
-/// `encode_shard_adaptive` runs two candidates under `rayon::join` (x2), each
-/// bounded by its input because every codec here is a compressor or a 1:1
-/// copy.
-///
-/// **Declared here rather than shared** with that table: `scx-convert` depends
-/// on `scx-ops`, so the dependency cannot run the other way, and every
-/// constant in `budget.rs` is `pub(crate)`. This is the same deliberate
-/// duplication as `GROUP_BYTES_PER_NNZ` (8) beside
-/// `budget::PAYLOAD_BYTES_PER_NNZ` (8) — one "i32 + f32" model, declared once
-/// per crate. Change one and change the other.
-const GROUPED_BLOCK_PHASE_MULTIPLE: u64 = 6;
+/// The whole-phase cost of one in-flight shard now lives in
+/// [`crate::encode_budget`], because `compact` and `optimize` need the same
+/// figure. `GROUPED_BLOCK_PHASE_MULTIPLE` was its original name and this alias
+/// keeps the arithmetic below reading the same.
+use crate::encode_budget::ENCODE_PHASE_MULTIPLE as GROUPED_BLOCK_PHASE_MULTIPLE;
 
 /// Bytes one nonzero adds to a grouped block's **cut accumulator** — a `u32`
 /// index element plus the value bytes `encode_value` pushes at the file-wide

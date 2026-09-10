@@ -445,6 +445,16 @@ enum Commands {
         /// Already-sharded obs is preserved as-is regardless. Default: auto.
         #[arg(long = "shard-obs", default_value = "auto", value_parser = ["off", "auto", "always"])]
         shard_obs: String,
+        /// Cap on the memory the parallel shard re-encode may hold in flight.
+        /// Accepts a binary-prefixed size (`K`/`M`/`G`/`T` or `KiB`..`TiB`);
+        /// decimal `KB`/`MB`/`GB` is rejected. Shards are encoded in chunks
+        /// whose whole live phase fits this, so raising it buys concurrency on
+        /// deep shards and costs peak RSS. Omitted is not unbounded: the
+        /// default holds 1 GiB in flight, so the peak does not scale with the
+        /// machine's core count. A budget below one shard's phase still encodes
+        /// one shard at a time.
+        #[arg(long, value_name = "SIZE")]
+        memory_budget: Option<String>,
     },
     /// Rewrite file reclaiming space from deletions
     Compact {
@@ -1610,6 +1620,7 @@ fn main() {
             row_group_rows,
             row_group_target_nnz,
             shard_obs,
+            memory_budget,
         } => optimize::run_optimize(
             &input,
             &output,
@@ -1620,6 +1631,7 @@ fn main() {
             Some(row_group_rows),
             row_group_target_nnz,
             &shard_obs,
+            memory_budget.as_deref(),
         ),
         Commands::Compact {
             input,

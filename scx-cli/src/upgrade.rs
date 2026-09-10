@@ -786,6 +786,7 @@ mod tests {
             None,
             scx_format_io::ObsShardPolicy::Always,
             Some(scx_format_io::FramingConfig::default()),
+            None,
         )
         .unwrap();
 

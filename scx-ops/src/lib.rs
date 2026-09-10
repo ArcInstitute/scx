@@ -10,6 +10,7 @@ pub mod checksum;
 pub mod codec_intent;
 pub mod compact;
 pub mod delete;
+mod encode_budget;
 pub mod error;
 pub mod external_layer;
 pub mod external_obs;
