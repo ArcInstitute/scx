@@ -701,10 +701,14 @@ single division and are now separate:
 - a **share** — what fraction of the budget one concurrent unit may claim.
   One in-flight shard takes a quarter, which is what leaves room for the
   derate to grant more than one worker.
-- a **cost model** — how many bytes that unit actually holds. A dense slab
-  costs 12 B per source element (the f32 slab plus the sparsified indices and
-  values, at exact capacity); a CSR shard costs 8 B/nnz plus scratch plus the
-  indptr.
+- a **cost model** — how many bytes that unit actually holds, across the
+  worker's *whole* phase rather than one stage. A CSR shard costs 48 B/nnz plus
+  the indptr: 8 for the resident payload, 8 for the encoder's own copy of the
+  values, and 32 for the framed encode's live buffers (it holds every row
+  group's encoded bytes alongside the streams assembled from them, and
+  `codec="auto"` runs two candidate codecs concurrently). A dense source
+  element costs 44 B: 12 for the f32 slab plus the sparsified indices and
+  values at exact capacity, plus the same 32 for the nonzero it may become.
 
 Reservations are declared per *phase*, and only reservations in the same phase
 are concurrent — the CSC external transpose claims half the budget for a
@@ -712,15 +716,12 @@ column chunk in pass 1 and a quarter for bucket records in pass 2, and those
 never coexist. A unit test asserts that each phase's concurrent claims sum to
 at most the whole budget.
 
-Seven claims are declared but **not enforced**, and the `enforced` flag is the
+Four claims are declared but **not enforced**, and the `enforced` flag is the
 difference between "we sized this" and "nothing exceeds this" — read it before
 quoting a row as a guarantee:
 
 - the two CSC **bucket** rows are sized from the *mean* nnz per row, so a
   right-skewed sequencing-depth distribution overshoots them;
-- the three per-shard **ingest / export** rows size a *reader* working set,
-  while the worker holds the encoded shard alongside it — so the derate bounds
-  the stage, not the whole worker;
 - the CSC **sidecar** row's budget sizes the transpose chunk, while the writer's
   full-length index and value copies and the encoder's streams are live next to
   it, and the rebuild path additionally retains every source shard. It controls
@@ -731,7 +732,17 @@ quoting a row as a guarantee:
   budgets under 128 bytes.
 
 They are named in the table so each gap is visible rather than silent, and a
-unit test pins the count so a seventh cannot arrive unannounced.
+unit test pins the count so a fifth cannot arrive unannounced.
+
+The three per-shard **ingest / export** rows used to be on that list, because
+each sized a *reader* working set while the worker also held the encoded shard.
+They now size the whole worker phase and are enforced. The share did not
+change — what widened is the cost model the share is applied to — so a budget
+now buys **fewer concurrent workers and smaller shards** rather than the same
+concurrency over an unpriced buffer, and a budget too small to hold one whole
+phase is refused outright instead of being silently over-committed. Budgets are
+opt-in (`memory_budget` defaults to unset), so nothing derates that did not ask
+to.
 
 Three different things are called "no budget", and they are not
 interchangeable: an unset `memory_budget` means *no cap at all*; pyscx's

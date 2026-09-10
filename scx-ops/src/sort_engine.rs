@@ -113,6 +113,25 @@ const K_PASS_MAX_CARDINALITY: usize = 32;
 /// sizes byte-mode shards identically to `scx sort`.
 pub const GROUP_BYTES_PER_NNZ: u64 = 8;
 
+/// Bytes one in-flight grouped block costs per nonzero, across its **whole**
+/// phase: the gather buffers ([`GROUP_BYTES_PER_NNZ`]), the encoder's own copy
+/// of the values, and the framed encode's live buffers.
+///
+/// `1 + 1 + 4`, the same derivation `scx-convert/src/budget.rs` carries for
+/// the ingest and export derates — `encode_shard_framed` holds every row
+/// group's encoded bytes alongside the streams assembled from them (2x), and
+/// `encode_shard_adaptive` runs two candidates under `rayon::join` (x2), each
+/// bounded by its input because every codec here is a compressor or a 1:1
+/// copy.
+///
+/// **Declared here rather than shared** with that table: `scx-convert` depends
+/// on `scx-ops`, so the dependency cannot run the other way, and every
+/// constant in `budget.rs` is `pub(crate)`. This is the same deliberate
+/// duplication as `GROUP_BYTES_PER_NNZ` (8) beside
+/// `budget::PAYLOAD_BYTES_PER_NNZ` (8) — one "i32 + f32" model, declared once
+/// per crate. Change one and change the other.
+const GROUPED_BLOCK_PHASE_MULTIPLE: u64 = 6;
+
 /// F1: default oversize threshold as a multiple of the per-shard target when
 /// `--group-max-bytes` is not supplied. Public for the same reason as
 /// [`GROUP_BYTES_PER_NNZ`].
@@ -1598,24 +1617,25 @@ fn emit_x_in_memory(
 /// transient honors `--memory-budget` (H1).
 ///
 /// Each in-flight block holds gather buffers (u32 index + f32 value =
-/// [`GROUP_BYTES_PER_NNZ`] bytes per nnz) plus ~1× that again for the encoded
-/// output, over the `nnz ≈ block_byte_cap / per_nnz_bytes` a full block holds at
-/// the cap — i.e. `per_block ≈ 2 × GROUP_BYTES_PER_NNZ × block_byte_cap /
-/// per_nnz_bytes` (`2× block_byte_cap` for f32, `~3.2×` for uint8). We cap
-/// `concurrency` to `budget / per_block` (min 1), so `concurrency × per_block ≤
-/// budget`; concurrency 1 gives parity with the one-block-at-a-time `CsrEmitter`.
+/// [`GROUP_BYTES_PER_NNZ`] bytes per nnz), the encoder's own copy of the
+/// values, and the framed encode's live buffers — `GROUPED_BLOCK_PHASE_MULTIPLE`
+/// times the gather cost, over the `nnz ≈ block_byte_cap / per_nnz_bytes` a
+/// full block holds at the cap. We cap `concurrency` to `budget / per_block`
+/// (min 1), so `concurrency × per_block ≤ budget`; concurrency 1 gives parity
+/// with the one-block-at-a-time `CsrEmitter`.
 ///
-/// ⚠️ **The "~1× that again for the encoded output" term is understated for a
-/// framed block, so the `≤ budget` promise above is not one.** This path takes
-/// `writer.framing()`, which under `--codec auto` carries a `decode_target`, so
-/// `encode_shard_adaptive` dual-encodes the block *and*
+/// The encode side is `4×` and not the `~1×` this used to charge, because this
+/// path takes `writer.framing()`, which under `--codec auto` carries a
+/// `decode_target`: `encode_shard_adaptive` dual-encodes the block, and
 /// `encode_shard_framed` holds every row group's encoded bytes alongside the
-/// streams assembled from them — up to ~4× the encoded block rather than ~1×.
-/// `scx-convert/src/budget.rs` carries the measured figures and the reachable
-/// worst case (~32 B/nnz on incompressible integer data). Closing it means
-/// re-deriving `per_block` from the whole encode phase and re-measuring what
-/// that does to grouped-sort wall time; the same is true of the convert
-/// derate, and neither is a footnote-sized change.
+/// streams assembled from them. `scx-convert/src/budget.rs` carries the
+/// derivation and the measured figures; `GROUPED_BLOCK_PHASE_MULTIPLE`'s doc
+/// says why the constant is declared in this crate rather than shared.
+///
+/// What `per_block` still does **not** price, named rather than left implicit:
+/// the block's `local_indptr` (8 B/row, small beside a block's nnz) and the
+/// optional `BitmapShard`. Neither is the encode term, and neither was priced
+/// before either.
 ///
 /// `None` budget keeps the full rayon-thread concurrency (the user opted out of
 /// budgeting). When a budget **is** set but the sub-flush is disabled
@@ -1635,7 +1655,7 @@ fn grouped_fast_concurrency(
         // Sub-flush enabled: cap concurrency so `concurrency × per-block ≤ budget`.
         Some(budget) if block_byte_cap > 0 && per_nnz_bytes > 0 => {
             let nnz_per_block = (block_byte_cap / per_nnz_bytes).max(1);
-            let per_block = (2 * GROUP_BYTES_PER_NNZ)
+            let per_block = (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ)
                 .saturating_mul(nnz_per_block)
                 .max(1);
             // Compare in u64 before narrowing to avoid truncation on 32-bit usize.

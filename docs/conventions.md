@@ -419,9 +419,13 @@ validated by a suite that cannot fail is indistinguishable from a regression.
 - Memory derate: per-worker working-set estimate comes from
   `IndexedCsrShardStream::per_worker_bytes(effective_target,
   modality_type)`. Sparse readers (default impl) assume density 5 %
-  (RNA / general) or 10 % (ATAC), times `n_vars × 16 B/nnz`.
-  `DenseXStreamReader` overrides this with
-  `effective_target × n_vars × 12 B/element`. Every constant and
+  (RNA / general) or 10 % (ATAC), times `n_vars ×
+  budget::WORKER_PHASE_BYTES_PER_NNZ` (48 B/nnz — payload, the encoder's
+  value copy, and the framed encode's two candidates).
+  `DenseXStreamReader` overrides this with `effective_target × n_vars ×
+  budget::dense_worker_phase_bytes_per_elem` (44 B/element). Both size the
+  **whole worker phase**, not the reader stage, which is what lets the
+  ingest/export reservations be `enforced: true`. Every constant and
   fraction here comes from `scx-convert/src/budget.rs`; do not
   re-derive one at a call site. When `--memory-budget` is set, worker
   count is clamped to fit; a single shard exceeding the budget fails

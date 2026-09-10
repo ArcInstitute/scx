@@ -2863,7 +2863,12 @@ jobs:
           # guard tolerated a real call being inlined away and still passed
           # (verified). Comment lines are excluded and the floor is the actual
           # production call count, which makes losing any one of them fail.
-          n=$(grep -nE 'crate::budget::dense_(slab_bytes|max_slab_rows|min_budget|peak_bytes_per_elem)[[:space:]]*\(' \
+          # `worker_phase_bytes_per_elem` joined this list when the encode
+          # transient was charged: it is now THE per-element table entry both
+          # dense sites must derive from, and the refusal message moved from
+          # `peak_bytes_per_elem` to it. Without the name here the count fell
+          # to 3 and this guard failed on a change that was maintaining it.
+          n=$(grep -nE 'crate::budget::dense_(slab_bytes|max_slab_rows|min_budget|peak_bytes_per_elem|worker_phase_bytes_per_elem)[[:space:]]*\(' \
                 "$f" \
                 | grep -vE '^[0-9]+:[[:space:]]*(//|///|//!)' \
                 | wc -l)

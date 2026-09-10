@@ -88,16 +88,12 @@ fn unenforced_reservations_are_declared_not_silent() {
         .filter(|r| !r.enforced)
         .map(|r| r.name)
         .collect();
-    // Seven, in three groups, and the count is pinned so an eighth cannot arrive
+    // Four, all of them CSC, and the count is pinned so a fifth cannot arrive
     // unannounced:
     //
-    //   * the two §11.4 CSC rows — bucket count and bucket record buffer are
-    //     sized from the *mean* nnz/row, so a right-skewed depth distribution
-    //     overshoots them;
-    //   * the three per-shard ingest/export rows — each sizes a READER working
-    //     set, while `encode_one_shard_worker` holds the raw CSR across
-    //     `encode_one_shard`, so the encoded section is live alongside it. The
-    //     derate bounds the stage, not the whole worker;
+    //   * the two §11.4 CSC bucket rows — bucket count and bucket record
+    //     buffer are sized from the *mean* nnz/row, so a right-skewed depth
+    //     distribution overshoots them;
     //   * the CSC sidecar row — the budget sizes the transpose chunk, while the
     //     writer's full-length index/value copies and the encoder's streams are
     //     live alongside it (and `build_csc.rs` additionally retains every
@@ -106,18 +102,20 @@ fn unenforced_reservations_are_declared_not_silent() {
     //     whole before testing the budget, so one wide column exceeds the
     //     share, and the floor exceeds it for budgets under 128 bytes.
     //
-    // Closing the second group means sizing from the maximum complete worker
-    // phase and re-deriving the share, which trades away the parallelism §11.5
-    // restored. That is a measured change; until it happens, `enforced: false`
-    // is what keeps the table honest.
+    // **It was seven.** The three per-shard ingest/export rows each sized a
+    // *reader* working set while the worker also held the encoded shard, so
+    // the derate bounded the stage and not the worker. They are now sized from
+    // `WORKER_PHASE_BYTES_PER_NNZ` — payload, the encoder's value copy, and
+    // the framed encode's buffers for both candidates — and are enforced. The
+    // share did not move; the cost model did, which is why
+    // `allocation_table_shares_sum_to_at_most_one_per_phase` is unaffected.
     assert_eq!(
         unenforced.len(),
-        7,
-        "expected exactly the two §11.4 bucket rows plus the three reader-phase \
-         per-shard rows to be unenforced, got {unenforced:?}. Adding an \
-         unenforced row without updating this count lets a known gap enter the \
-         table unannounced; removing one means a gap actually closed and this \
-         test should say so."
+        4,
+        "expected exactly the four CSC rows to be unenforced, got \
+         {unenforced:?}. Adding an unenforced row without updating this count \
+         lets a known gap enter the table unannounced; removing one means a \
+         gap actually closed and this test should say so."
     );
 }
 
@@ -212,9 +210,48 @@ fn dense_slab_never_exceeds_its_share() {
 }
 
 #[test]
-fn shard_working_set_counts_payload_scratch_and_indptr() {
-    // 50 nnz, 100 rows: 50x8 payload, x2 scratch, plus 101x8 indptr.
-    assert_eq!(shard_working_set_bytes(50, 100), 50 * 8 * 2 + 101 * 8);
+fn shard_working_set_counts_the_whole_worker_phase_and_the_indptr() {
+    // 50 nnz, 100 rows. Spelled as the derivation rather than as a total, so
+    // a change to either multiple has to be made here deliberately instead of
+    // being pasted out of a failure message:
+    //
+    //   payload           50 x 8            = 400
+    //   encoder value copy 50 x 8 x 1       = 400
+    //   framed encode     50 x 8 x 4        = 1600
+    //   indptr            101 x 8           = 808
+    //                                        ----
+    //                                        3208
+    let payload = 50 * PAYLOAD_BYTES_PER_NNZ;
+    assert_eq!(
+        shard_working_set_bytes(50, 100),
+        payload
+            + payload * ENCODER_VALUE_COPY_MULTIPLE
+            + payload * ENCODE_TRANSIENT_MULTIPLE
+            + 101 * INDPTR_BYTES_PER_ROW
+    );
+    assert_eq!(shard_working_set_bytes(50, 100), 3208);
     // Never zero: a zero would make the derate treat the budget as unset.
     assert_eq!(shard_working_set_bytes(0, 0), 8);
+}
+
+/// The encode transient is actually charged, and charged *concurrently* — the
+/// whole-phase figure is strictly more than the payload plus one copy of it.
+///
+/// Watched red by setting `ENCODE_TRANSIENT_MULTIPLE` to 0: the first
+/// assertion then reports 16 B/nnz, which is the pre-PR-42 model and the state
+/// this item exists to leave.
+#[test]
+fn the_worker_phase_charges_the_framed_encode() {
+    assert_eq!(WORKER_PHASE_BYTES_PER_NNZ, 48);
+    // The dense path adds the same term rather than folding it into a
+    // multiplier — the §11.5 double-count is a multiplier, this is an addend.
+    assert_eq!(
+        encode_transient_bytes(50),
+        50 * PAYLOAD_BYTES_PER_NNZ * ENCODE_TRANSIENT_MULTIPLE
+    );
+    // And the density-estimate path asks the table for the same figure.
+    assert_eq!(
+        estimated_worker_bytes(100, 1_000, PARALLEL_DENSITY_DEFAULT_DEN),
+        100 * 1_000 * WORKER_PHASE_BYTES_PER_NNZ / PARALLEL_DENSITY_DEFAULT_DEN
+    );
 }

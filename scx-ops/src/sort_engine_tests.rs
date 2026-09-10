@@ -1973,12 +1973,17 @@ fn grouped_fast_path_deterministic() {
 /// instead of scaling with core count.
 #[test]
 fn grouped_fast_concurrency_honors_budget() {
-    use super::{grouped_fast_concurrency, GROUP_BYTES_PER_NNZ};
+    use super::{grouped_fast_concurrency, GROUPED_BLOCK_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ};
 
     // f32 encoding: per_nnz_bytes = 4 (index) + 4 (value) = 8.
     let per_nnz_bytes: u64 = 8;
     let block_byte_cap: u64 = 256 * 1024 * 1024; // default 256 MB cap
-    let per_block = (2 * GROUP_BYTES_PER_NNZ) * (block_byte_cap / per_nnz_bytes); // ≈ 2× cap = 512 MB
+                                                 // The whole block phase: gather buffers + the encoder's value copy + the
+                                                 // framed encode's two candidates. It was `2 *`, which charged the encode
+                                                 // side at ~1x and made the `<= budget` assertion below a statement about
+                                                 // the gather stage only.
+    let per_block =
+        (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ) * (block_byte_cap / per_nnz_bytes);
     let threads = 192;
 
     // No budget → full thread count.
@@ -1987,10 +1992,27 @@ fn grouped_fast_concurrency_honors_budget() {
         threads
     );
 
-    // 8 GB budget on a 192-core host → capped to budget/per_block (= 16), NOT 192.
+    // 8 GB budget on a 192-core host → capped to budget/per_block, NOT 192.
+    // (5 at the whole-phase cost, where the gather-only model gave 16.)
     let budget = 8u64 * 1024 * 1024 * 1024;
     let c = grouped_fast_concurrency(threads, block_byte_cap, per_nnz_bytes, Some(budget));
     assert_eq!(c, (budget / per_block) as usize);
+    // A **literal**, independent of the constant above. The assertion on the
+    // line before re-derives `per_block` from `GROUPED_BLOCK_PHASE_MULTIPLE`,
+    // so it moves with the production formula and cannot see a change to it —
+    // measured: it passes at both 2 and 6. This is what pins the charge:
+    //   per_block = 6 × 8 × (256 MiB / 8) = 1_610_612_736
+    //   8 GiB / that = 5   (the gather-only 2× model gave 16)
+    assert_eq!(
+        c, 5,
+        "concurrency at the whole-phase block cost; 16 would mean the encode \
+         term is uncharged again"
+    );
+    assert_eq!(
+        GROUPED_BLOCK_PHASE_MULTIPLE, 6,
+        "gather (1) + the encoder's value copy (1) + the framed encode's two \
+         candidates (4); see `scx-convert/src/budget.rs` for the derivation"
+    );
     assert!(c < threads, "budget must cap concurrency below core count");
     assert!(
         (c as u64) * per_block <= budget,

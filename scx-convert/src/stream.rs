@@ -118,10 +118,11 @@ pub trait IndexedCsrShardStream: Send + Sync {
     ///
     /// The default impl is a density-based **ceiling**, not an exact
     /// figure: it assumes the sparsified output binds and picks density
-    /// by modality (`Atac` → 10 %, everything else → 5 %), with ~16 B/nnz
-    /// (`i32` indices + `f32` values + amortised `indptr`). It is only a
-    /// fallback for readers that cannot cheaply know their nnz — a
-    /// dense-stored-as-CSR matrix would *under*-estimate here. Readers
+    /// by modality (`Atac` → 10 %, everything else → 5 %), at
+    /// [`crate::budget::WORKER_PHASE_BYTES_PER_NNZ`] per nonzero — the
+    /// payload, the reader's rebuild scratch and the framed encode's
+    /// buffers. It is only a fallback for readers that cannot cheaply know
+    /// their nnz — a dense-stored-as-CSR matrix would *under*-estimate here. Readers
     /// with a resident `indptr` (CSR h5ad) override this to derive the
     /// exact max-shard nnz via [`shard_working_set_bytes`]; dense readers
     /// override it to size the dense slab buffer instead.
@@ -130,10 +131,7 @@ pub trait IndexedCsrShardStream: Send + Sync {
             ModalityType::Atac => crate::budget::PARALLEL_DENSITY_ATAC_DEN,
             _ => crate::budget::PARALLEL_DENSITY_DEFAULT_DEN,
         };
-        let est = (shard_target_rows as u64)
-            .saturating_mul(self.n_vars())
-            .saturating_mul(16)
-            / density_den;
-        est.max(1)
+        crate::budget::estimated_worker_bytes(shard_target_rows as u64, self.n_vars(), density_den)
+            .max(1)
     }
 }

@@ -144,9 +144,10 @@ pub fn open_dense_streaming(
                 return Err(ConvertError::Other(format!(
                     "memory_budget {budget} bytes too small for dense streaming of \
                      {n_vars} vars × {dtype:?}; need at least {min_required} bytes \
-                     (one slab row at {} B/element, which is \
+                     (one row at {} B/element — the slab and its sparsified \
+                     vectors plus the framed encode's buffers — which is \
                      {}/{} of the budget)",
-                    crate::budget::dense_peak_bytes_per_elem(dtype_bytes),
+                    crate::budget::dense_worker_phase_bytes_per_elem(dtype_bytes),
                     crate::budget::SHARD_BUDGET_SHARE.numerator(),
                     crate::budget::SHARD_BUDGET_SHARE.denominator(),
                 )));
@@ -339,16 +340,27 @@ impl IndexedCsrShardStream for DenseXStreamReader {
         shard_target_rows: u32,
         _modality_type: scx_format_io::modality::ModalityType,
     ) -> u64 {
-        // The same cost model that sized the cap in `open_dense_streaming`.
+        // The same cost model that sized the cap in `open_dense_streaming` —
+        // and that model now covers the framed encode's transient too, via
+        // `budget::dense_worker_phase_bytes_per_elem`.
         //
-        // ⚠️ This deliberately does NOT apply a further multiplier. It used to
-        // multiply by 2 "so the dispatcher knows fits-or-doesn't", but
-        // `shard_target_rows` reaching here has already been clamped to
-        // `max_slab_rows`, which was itself produced by taking a quarter of the
-        // budget -- so the ×2 charged the same reserve a second time. The
-        // arithmetic worked out to `per_worker ≈ budget/2`, hence
+        // ⚠️ This deliberately does NOT apply a further multiplier, and it
+        // deliberately does not add the encode term *here*. The ×2 that was
+        // removed multiplied the slab: `shard_target_rows` reaching this
+        // function has already been clamped to `max_slab_rows`, itself a
+        // quarter of the budget, so ×2 charged the same reserve twice. The
+        // arithmetic came out at `per_worker ≈ budget/2`, hence
         // `outstanding_max = 2`, `granted_threads = 1`, and every budgeted
         // dense convert silently taking the sequential coordinator (§11.5).
+        //
+        // Adding `encode_transient_bytes(rows × n_vars)` on top of a
+        // slab-only cap re-creates that from the other direction — measured,
+        // it put `outstanding_max` at 1 for the fixture in
+        // `dense_convert_under_a_memory_budget_stays_parallel`. The encode
+        // term therefore belongs in the **per-element cost both sites share**,
+        // so the cap shrinks with it and
+        // `per_worker_bytes(max_slab_rows) ≈ share` still holds. A budget then
+        // buys smaller shards, not fewer workers.
         crate::budget::dense_slab_bytes(
             shard_target_rows as u64,
             self.n_vars,
