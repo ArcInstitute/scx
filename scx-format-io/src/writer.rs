@@ -1055,6 +1055,24 @@ impl ScxWriter {
     ///   inside a [`Self::with_modality`] scope that modality's `n_vars`, not
     ///   the file-wide max, or every shard in a multi-modality file gets
     ///   stamped with the max and column-range pruning breaks.
+    ///
+    /// **Known wrong for `ObspCsrShard`, and preserved as-is.** An obsp graph
+    /// is obs×obs, so its minor axis is `n_obs`, but it falls into the last arm
+    /// and gets `n_vars`. Two consequences, both already recorded at
+    /// `scx-cli/src/upgrade.rs`'s
+    /// `upgrade_reencodes_aux_csr_without_reshaping_or_renaming_it`: the
+    /// stamped extent can declare a matrix too narrow to hold its own data, and
+    /// where `n_vars <= u16::MAX < n_obs` the write fails outright with "index
+    /// N exceeds u16 range" — so a CSR-backed obsp cannot be written at all
+    /// through [`Self::write_obsp_shard`] on a file with more than ~65k cells
+    /// and an ordinary gene axis. `upgrade` works around it by going through
+    /// `encode_one_shard` with an extent it computes itself, and `optimize`
+    /// reads `sh.n_minor` back from the source header rather than re-deriving
+    /// it. Extracting this function did not change that behaviour and
+    /// deliberately does not fix it: correcting the arm changes the `n_minor`
+    /// stamped on every newly written obsp shard, which is an on-disk change
+    /// needing its own decision about existing files. It is now at least stated
+    /// in one place instead of three.
     pub fn shard_n_minor(&self, section_type: SectionType) -> u64 {
         match section_type {
             SectionType::RawCsrShard => self.raw_n_vars,
