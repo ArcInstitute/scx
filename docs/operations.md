@@ -180,6 +180,41 @@ either is v4 and lands in this branch. There is deliberately no
 `--allow-downgrade`: `scx optimize` owns framing in both directions, and
 `--row-group-rows 0` is the supported way to ask for unframed output.
 
+### `scx optimize --memory-budget`
+
+`optimize` re-encodes shards in parallel and writes them serially, so more
+shards in flight means more wall saved and more memory held. The knob bounds the
+in-flight side.
+
+Intra-shard parallelism alone saturates at about eight cores: measured on
+census_1m with 16 available, `scx optimize --codec auto` ran 87.0 s at one
+thread, 43.7 s at eight and 42.4 s at sixteen. What was left was the serial
+per-shard work — decode, canonicalize, convert values, write — and encoding
+several shards at once is what overlaps it.
+
+`--memory-budget` accepts a binary-prefixed size (`K`/`M`/`G`/`T` or
+`KiB`..`TiB`; decimal `KB`/`MB`/`GB` is rejected, as elsewhere). Shards are
+grouped into chunks whose whole live phase fits it, priced at 48 bytes per
+nonzero — the gather buffers, the encoder's value copy, and the framed encode's
+two concurrent candidates.
+
+Two things about it are worth knowing before you tune it:
+
+- **Omitting it is not "unbounded".** The default holds 1 GiB in flight, so an
+  op's peak does not scale with the machine's core count. A census_1m shard
+  carries ~8.2M nonzeros, which prices at ~394 MB, so the default admits two of
+  them; sixteen would have added ~6.3 GB to an op whose serial peak was ~3.3 GB.
+  Files with smaller shards still fill the pool, because the cap counts bytes
+  rather than shards.
+- **It is an estimate, not a guarantee.** The figure prices the buffers a
+  shard's encode is known to hold; allocator behaviour and a codec's internal
+  workspace are outside it. A budget below one shard's phase still encodes one
+  shard at a time rather than failing, because a single shard's encode is
+  irreducible — unlike `scx convert --memory-budget`, which can tell you to
+  lower `--shard-size` and so refuses instead.
+
+Output bytes do not depend on the budget or on the thread count.
+
 ### What `scx upgrade` does not carry
 
 The remaining branch — a genuinely pre-v3 file — **canonicalizes** X and every

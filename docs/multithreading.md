@@ -573,10 +573,46 @@ The two levels nest rather than conflict. `scx-convert`'s ingest coordinator
 already encodes each shard on a rayon worker, so on a threaded convert the pool
 is saturated across shards and the intra-shard fan-out is work-stealing that
 re-partitions the same work. Where it pays is the paths that encode one shard at
-a time on the calling thread: every `scx-ops` rewrite (`compact`, `merge`,
-`optimize`, `build-csc`, `append`, the external-layer attach), the sequential
-convert coordinator (taken when libhdf5 is not thread-safe), and any write whose
-shard count is below the thread count.
+a time on the calling thread: most `scx-ops` rewrites (`compact`, `merge`,
+`build-csc`, `append`, the external-layer attach), the sequential convert
+coordinator (taken when libhdf5 is not thread-safe), and any write whose shard
+count is below the thread count.
+
+### Across shards, in a rewrite op (`scx optimize`)
+
+Intra-shard parallelism has a ceiling, and it is reachable. Measured on
+census_1m with 16 cores, `scx optimize --codec auto` ran 87.0 s at one thread,
+43.7 s at eight and 42.4 s at sixteen — a 2.05x speedup that is **flat past
+eight cores**, leaving ~45 % of the wall on the serial path: the source-shard
+decode, the canonicalization, the value conversion and the write. `scx compact`
+has the same shape (79.4 / 35.4 / 33.4 s, 2.38x).
+
+`optimize` therefore re-encodes in bounded parallel chunks: each catalog entry's
+whole body — read, canonicalize, encode — runs on the pool, because it is a pure
+function of that entry and `ScxReader` is shareable (mmap plus an
+`Arc<FullCatalog>`). **The writer stays serial** and is fed in chunk order, and
+that is a correctness requirement rather than a simplification: a section's file
+offset, its position in the catalog, and `first_csr_codec` (first CSR write
+wins, and `finish()` stamps it as the file header's codec) are all decided by
+call order. Parallel encode is safe; parallel write is not.
+
+Chunk width is bounded in **bytes, not threads**. Encoding N shards at once
+costs N times one shard's live phase, so "fill the pool" would make an op's peak
+RSS scale with the host's core count: a census_1m shard carries ~8.2M nonzeros,
+priced at ~394 MB, so sixteen in flight would add ~6.3 GB to an op whose serial
+peak was ~3.3 GB. The default allowance is 1 GiB
+(`scx-ops/src/encode_budget.rs`), so files with small shards still fill the pool
+while the default peak increase stays a constant. `scx optimize
+--memory-budget` raises it, trading peak RSS for concurrency; a budget below one
+shard's phase still encodes one shard at a time, since a single shard's encode is
+irreducible.
+
+Output is byte-identical at every chunk width and thread count — the twelve-arm
+`op_output_identity` golden passes unchanged at `RAYON_NUM_THREADS` 1, 2 and 12,
+and `optimize_honours_an_explicit_codec_at_every_concurrency` sweeps the budget
+from one shard per chunk to all of them and compares both the shard contents and
+the catalog's own entry order (reading through `csr_shards_sorted` re-sorts by
+`row_start` and would hide a mis-ordered write entirely).
 
 ## GPU parallelism
 

@@ -7,6 +7,11 @@ mutations exposed by ``scx-ops`` via pyscx:
   * ``append``     — ingest new shards into a base ``.scx``
   * ``delete``     — deletion-vector construction for cell-index predicates
   * ``compact``    — full rewrite that reclaims deleted/orphaned bytes
+  * ``optimize``   — re-encode every shard; records ``wall_s__optimize`` and
+    ``peak_rss_mb__optimize``. Gates the bounded parallel chunking and, more to
+    the point, its memory: N shards in flight hold N times one shard's live
+    phase. Runs the **unframed** encode path, because ``pyscx.optimize``
+    exposes no framing knob — see ``_run_optimize``.
   * ``obs_import`` — key-joined in-place add of one obs column from a CSV
   * ``rollback``   — revert the active manifest to the prior sequence
 
@@ -285,6 +290,67 @@ def _run_compact(
         )
 
     dirty_path.unlink(missing_ok=True)
+
+
+def _run_optimize(
+    result: BenchmarkResult,
+    base_scx: Path,
+    workdir: Path,
+    n_runs: int,
+) -> None:
+    """Measure ``pyscx.optimize`` — the re-encode-every-shard rewrite.
+
+    Why this arm exists: ``optimize`` re-encodes shards in bounded parallel
+    chunks (OPT-OPS-4), and before this there was no ``optimize`` arm here at
+    all, so neither its wall nor its peak was gated. The peak is the half worth
+    watching: encoding N shards at once holds N times one shard's live phase, and
+    the in-flight allowance that bounds N is what keeps the peak from scaling
+    with the runner's core count.
+
+    **What it does not measure.** ``pyscx.optimize`` exposes no framing knob (it
+    calls the non-framing entry point), so this runs the **unframed** encode
+    path. The framed dual-candidate encode — what a ``scx convert`` output
+    actually carries, and where the parallel win was measured — is only
+    reachable through ``scx optimize --row-group-rows``, i.e. the CLI. Read this
+    arm as a gate on the parallel chunking and its memory, not as the framed
+    figure.
+
+    Nor does it measure the in-flight allowance, which has no pyscx kwarg: this
+    always runs at the default. A regression in the *default* is exactly what
+    would show up here, which is the point.
+    """
+    import pyscx
+
+    for i in range(n_runs):
+        input_path = workdir / f"optimize_in_{i}.scx"
+        output_path = workdir / f"optimize_out_{i}.scx"
+        _copy_scx(base_scx, input_path)
+        size_before = input_path.stat().st_size
+
+        wall, rss = _time_op(pyscx.optimize, str(input_path), str(output_path))
+
+        size_after = output_path.stat().st_size
+        throughput_mb_s = (size_before / (1024 * 1024)) / wall if wall > 0 else 0.0
+
+        result.add_run(
+            wall_s=wall,
+            peak_rss_mb=rss,
+            operation="optimize",
+            # Sparse `<metric>__<arm>` keys, because `peak_rss_mb` is a reserved
+            # `add_run` parameter: it lands on the RunRecord and never reaches
+            # `runs[].extra`, which is the only place a floor can read from.
+            wall_s__optimize=round(wall, 6),
+            peak_rss_mb__optimize=round(rss, 1),
+            size_before_bytes=size_before,
+            size_after_bytes=size_after,
+            throughput_mb_s=round(throughput_mb_s, 3),
+        )
+        input_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
+        logger.info(
+            "  optimize run %d/%d: wall=%.3fs peak=%.1f MB throughput=%.1f MB/s",
+            i + 1, n_runs, wall, rss, throughput_mb_s,
+        )
 
 
 def _run_compact_full(
@@ -613,7 +679,8 @@ def run(
             "n_runs_per_op": n_runs,
             "n_delete_indices": min(_DELETE_N, max(1, n_rows // 2)),
             "operations": [
-                "append", "delete", "compact", "obs_import", "rollback",
+                "append", "delete", "compact", "optimize", "obs_import",
+                "rollback",
             ],
         },
     )
@@ -650,6 +717,9 @@ def run(
 
         logger.info("compact: %s", dataset.name)
         _run_compact(result, converted_path, workdir, n_runs, n_rows)
+
+        logger.info("optimize: %s", dataset.name)
+        _run_optimize(result, converted_path, workdir, n_runs)
 
         if full_scx is not None:
             logger.info("compact_full: %s", dataset.name)
