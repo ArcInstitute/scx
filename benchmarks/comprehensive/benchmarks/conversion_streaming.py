@@ -29,6 +29,13 @@ enforces has only ever been measured in the default configuration:
   the whole CSR by value. Expected to breach the streaming ceiling.
 - **index_preset_cellxgene** — `from_h5ad(..., index_preset="cellxgene")`,
   materialising predicate indexes at write time.
+- **budget_bound** — `from_h5ad(..., memory_budget=2GiB, shard_size=2048)`, the
+  **only** arm anywhere in this suite that passes a memory budget to anything
+  other than `build_csc`. It carries
+  `peak_over_memory_budget__budget_bound`, which is the whole point: a ratio
+  ≤ 1 means the process stayed inside the budget it was handed. A premise check
+  refuses the arm unless a `reader_threads_derated` warning proves the budget
+  actually bound, because a dropped budget produces a *passing* number.
 
 Each is pinned to the same `GATED_READER_THREADS` as the gated arm so its number
 is comparable, and each gets `<label>_peak_rss_mb` / `<label>_wall_s` from the
@@ -54,12 +61,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import statistics
 import subprocess
 import sys
 import tempfile
 import textwrap
 import time
+import warnings
 from pathlib import Path
 
 from benchmarks.comprehensive.config import DatasetConfig
@@ -159,8 +168,30 @@ def _skip_materialize_reason(n_obs: int) -> str | None:
 #   ten. pbmc3k has none, and measurably runs it as a no-op: the arm's output is
 #   4,379,713 B against the default arm's 4,379,851 B, a 138-byte provenance
 #   difference and no index sections at all.
+# The budget arm's numbers, derived rather than guessed (measured from
+# smartseq2's `indptr`, 2026-09-09): at `shard_size=2048` its widest shard
+# holds 7,951,265 nnz, which at `budget::WORKER_PHASE_BYTES_PER_NNZ` = 48 is
+# 382 MB for one in-flight shard. A 2 GiB budget therefore admits
+# `2048/382 = 5` outstanding and grants 4 reader threads, against the ~16 a
+# runner would otherwise use — a real derate, which is what the premise check
+# below requires. Under the *old* 16 B/nnz model the same shard cost 127 MB and
+# 2 GiB granted 15, so this arm's granted-thread count is exactly what the
+# charge changed.
+#
+# smartseq2 because it is deep-sequenced (2,628 nnz/cell mean) **and** in every
+# `capture_baseline.TIERS` list, so a default gate run reaches it. The genuinely
+# worst case for an encode transient is `chemogenetic_rgfp` (~6,700 nnz/cell of
+# raw integer UMIs, where `encoded ~= payload` is tight), but it is off-tier —
+# a floor there is only evaluated under an explicit `--datasets`, which is why
+# it is recorded as a deferred floor rather than gated here.
+_BUDGET_ARM_BYTES = 2 * 1024 * 1024 * 1024
+
 _EXTRA_ARMS: dict[str, tuple[dict[str, object], frozenset[str]]] = {
     "csc_always": ({"csc": "always"}, frozenset({"tabula_sapiens_100k"})),
+    "budget_bound": (
+        {"memory_budget": str(_BUDGET_ARM_BYTES), "shard_size": 2048},
+        frozenset({"smartseq2"}),
+    ),
     # census_500k / census_1m are EXCLUDED, and not because they lack the
     # preset's columns — checked with h5py, both carry all ten, as does
     # tabula. `index_preset="cellxgene"` emits no predicate-index sections at
@@ -265,11 +296,32 @@ def _timed_streaming(
     # thread count and stays comparable with the default one.
     if extra_kwargs:
         kwargs.update(extra_kwargs)
+    # Capture the conversion's warnings so a `memory_budget` arm can prove the
+    # budget actually bit. `emit_python_warnings` raises one `UserWarning` per
+    # warning *category*, whose text is
+    # `"scx conversion: N warning(s) of type 'reader_threads_derated'"`. A
+    # budget that is silently ignored produces a perfectly good number under
+    # the budget label, so the absence of that category is the failure mode
+    # this exists to catch — the same shape as `csc_always` recording a default
+    # conversion.
     t0 = time.perf_counter()
-    with PeakRssSampler() as sampler:
-        pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with PeakRssSampler() as sampler:
+            pyscx.from_h5ad(str(h5ad_path), str(out_path), **kwargs)
     wall = time.perf_counter() - t0
-    return {"wall_s": wall, "peak_rss_mb": sampler.peak_mb}
+    categories = sorted(
+        {
+            m.group(1)
+            for w in caught
+            if (m := re.search(r"warning\(s\) of type '([^']+)'", str(w.message)))
+        }
+    )
+    return {
+        "wall_s": wall,
+        "peak_rss_mb": sampler.peak_mb,
+        "warning_categories": categories,
+    }
 
 
 def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
@@ -297,7 +349,7 @@ def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
 # paired (streaming, materialize) conversions on the supplied h5ad,
 # emits one JSON list to stdout where each element is
 # `{"scenario", "run_idx", "wall_s", "peak_rss_mb",
-#   "structural"?, "output_bytes"?}`. The first run of each scenario
+#   "warning_categories", "structural"?, "output_bytes"?}`. The first run of each scenario
 # also reports the structural fingerprint + output size so the parent
 # can detect path drift without re-opening files.
 _WORKER_SCRIPT = textwrap.dedent("""\
@@ -342,6 +394,9 @@ _WORKER_SCRIPT = textwrap.dedent("""\
                 "reader_threads": reader_threads,
                 "wall_s": t["wall_s"],
                 "peak_rss_mb": t["peak_rss_mb"],
+                # Only the streaming worker collects these; the materialize
+                # arm's helper does not take a budget.
+                "warning_categories": t.get("warning_categories", []),
             }
             if structural is None:
                 structural = _structural_summary(out)
@@ -587,6 +642,42 @@ def _assert_csc_arm_built_a_sidecar(
         )
 
 
+def _assert_budget_arm_actually_derated(
+    labels: list[str] | tuple[str, ...],
+    result: BenchmarkResult,
+) -> None:
+    """Refuse a `budget_bound` result whose budget did not bind.
+
+    The failure this exists for is silent and *passing*: a budget that never
+    reaches `derate_threads_and_depth` — dropped on either subprocess hop, or
+    resolved to `None` by a coercion change — produces a perfectly good peak
+    under the budget label, and the `peak_over_memory_budget__budget_bound`
+    ratio then reports that an unconstrained conversion honoured a constraint
+    it never saw. Same shape as `csc_always` timing the default conversion.
+
+    `reader_threads_derated` is the observable, and it is the *right* one
+    rather than a proxy: the warning is emitted by `derate_threads_and_depth`
+    itself, only on the branch where the granted thread count is below the
+    requested one. Its presence therefore means the budget was parsed, reached
+    the coordinator, and bound.
+    """
+    if "budget_bound" not in labels:
+        return
+    seen: set[str] = set()
+    for run in result.runs:
+        if run.extra.get("scenario") != "budget_bound":
+            continue
+        seen.update(run.extra.get("warning_categories") or [])
+    if "reader_threads_derated" not in seen:
+        raise RuntimeError(
+            "the budget_bound arm emitted no `reader_threads_derated` warning: "
+            f"`memory_budget` did not bind (categories seen: {sorted(seen)}). "
+            "The arm therefore timed an unconstrained conversion under the "
+            "budget label, and its peak-over-budget ratio would be "
+            "meaningless. Refusing to record it."
+        )
+
+
 def _assert_index_arm_changed_the_output(
     labels: list[str] | tuple[str, ...],
     result: BenchmarkResult,
@@ -698,6 +789,22 @@ def _run_isolated(
                     "reader_threads": reader_threads,
                     f"{label}_peak_rss_mb": rec["peak_rss_mb"],
                     f"{label}_wall_s": rec["wall_s"],
+                    "warning_categories": rec.get("warning_categories") or [],
+                    # Dimensionless, and the only key that states the property
+                    # under test: did the process stay inside the budget it was
+                    # given? An absolute MB ceiling would also move with the
+                    # runner's interpreter baseline (~450-520 MB here), which a
+                    # ratio against a 2 GiB budget absorbs. Mirrors
+                    # `build_csc`'s `peak_over_memory_limit__*`.
+                    **(
+                        {
+                            f"peak_over_memory_budget__{label}": (
+                                rec["peak_rss_mb"] / (_BUDGET_ARM_BYTES / 1e6)
+                            )
+                        }
+                        if label == "budget_bound"
+                        else {}
+                    ),
                     "from_h5ad_kwargs": (
                         ", ".join(f"{k}={v!r}" for k, v in extra_kwargs.items())
                         or "(none)"
@@ -718,6 +825,7 @@ def _run_isolated(
     # `metadata`, so storing `n_csc_shards` there was not a check.
     _assert_csc_arm_built_a_sidecar(applicable_extras, structural)
     _assert_index_arm_changed_the_output(applicable_extras, result)
+    _assert_budget_arm_actually_derated(applicable_extras, result)
 
     result.metadata["gated_reader_threads"] = GATED_READER_THREADS
     result.metadata["structural"] = {

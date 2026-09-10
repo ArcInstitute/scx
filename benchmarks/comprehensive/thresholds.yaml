@@ -2075,6 +2075,37 @@ absolute_floors:
     metric: streaming_peak_rss_mb     # the reader_threads=4 arm only
     max: 4096.0
 
+  # ─── The budget is a bound, not advice (OPT-CONVERT-10) ────────────
+  # The `budget_bound` arm hands `from_h5ad` a 2 GiB `memory_budget` at
+  # `shard_size=2048`, and this floor says the process stayed inside it.
+  # A **ratio**, not an MB ceiling, deliberately: the peak carries the
+  # runner's interpreter baseline (~450-520 MB, see the build_csc note
+  # below) and the budget is the only thing that makes the number mean
+  # anything, so dividing by it is what makes the floor portable.
+  #
+  # 1.0 is the contract, not a headroom multiple. Every other ceiling
+  # here is ~1.2x an observation because it is guarding a *trend*; this
+  # one is guarding a *promise*, and a promise with 20% slack is not one.
+  # Derivation, from smartseq2's own indptr: the widest shard at
+  # shard_size=2048 holds 7,951,265 nnz, which at 48 B/nnz whole-phase is
+  # 382 MB; the budget admits 5 outstanding and grants 4 threads, so the
+  # expected peak is ~1.5 GB plus baseline against a 2048 MB budget.
+  #
+  # This became gateable only when `budget.rs` started charging the framed
+  # encode's transient. Before that the same shard was priced at 127 MB,
+  # 2 GiB granted 15 threads, and the peak was bounded by nothing the
+  # budget knew about.
+  #
+  # ⚠️ smartseq2 because it is deep-sequenced AND in every tier. The
+  # genuinely worst case is `chemogenetic_rgfp` (~6,700 nnz/cell of raw
+  # integer UMIs, where `encoded ~= payload` is tight rather than slack),
+  # which is off-tier — see the deferred floor below.
+  - benchmark: conversion_streaming
+    format: scx_streaming_vs_materialize
+    dataset: smartseq2
+    metric: peak_over_memory_budget__budget_bound
+    max: 1.0
+
   # ─── Streaming SCX → h5ad / h5mu export (Phase 8) ──────────────────
   # Mirror of the ingestion floor above. Streaming export's contract
   # is the same: peak RSS bounded by one shard's worth of CSR per
@@ -3670,3 +3701,40 @@ absolute_floors:
 #     largest fixture, so pooling them produces a median describing neither.
 #     `test_cli_info_arm_adds_no_runs_and_leaves_the_pooled_medians_alone`
 #     enforces it.
+#
+#  16. **A budget-bound ceiling on the grouped-sort side, and on the genuinely
+#      worst fixture.** OPT-CONVERT-10 charged the framed encode's transient to
+#      both budgeted callers, and the ingest half is gated above
+#      (`peak_over_memory_budget__budget_bound` on smartseq2, verified at 0.550
+#      against a 1.0 contract). Two halves are deliberately NOT gated:
+#
+#      a. **`grouped_sort` under a memory budget.** `pyscx.sort` accepts
+#         `memory_budget` and `grouped_fast_concurrency` now charges the whole
+#         block phase (`GROUPED_BLOCK_PHASE_MULTIPLE`), so the arm is
+#         implementable — but two things would make its floor decorative. All
+#         five `GROUP_SPEC` datasets sit outside every `capture_baseline.TIERS`
+#         list, so a default gate run never produces the triple and the floor
+#         is skipped silently (the same shape as the three unevaluable
+#         `grouped_peak_rss_mb` ceilings above). And `grouped_sort` samples
+#         **in-process** with a `_gc()` between ops, so a budget arm's peak
+#         inherits the previous arm's retained glibc heap — the contamination
+#         that made `conversion_streaming` climb 1722 -> 2983 -> 3472 MB across
+#         three identical runs. Blockers, in order: port `grouped_sort` to the
+#         subprocess-per-arm pattern `conversion_streaming` uses, then either
+#         tier one grouping dataset or accept an explicitly `--datasets`-scoped
+#         floor.
+#
+#      b. **The worst reachable fixture.** The charge is set by
+#         `encoded <= payload`, which is *tight* only on incompressible integer
+#         data — `chemogenetic_rgfp` (~6,700 nnz/cell of raw integer UMIs) is
+#         the case where the bound is met rather than slacked, and
+#         `budget.rs`'s own derivation names integer ATAC peaks as the worst
+#         codec path (`Lz4Shuffle` approaching its 8 B/nnz input). smartseq2 is
+#         deep but compressible, which is why its ratio is 0.55 and not near 1.
+#         `chemogenetic_rgfp` is off-tier, and the only ATAC fixture
+#         (`multiome_pbmc`) is `.h5mu` and reachable only by the three
+#         multimodal benchmarks, so neither can carry a default-gate floor
+#         today. Measure under `--datasets chemogenetic_rgfp` before tiering
+#         anything: if that ratio is also well under 1, the bound is loose and
+#         `ENCODE_TRANSIENT_MULTIPLE` is worth re-deriving downward, which
+#         would give budgeted callers concurrency back.
