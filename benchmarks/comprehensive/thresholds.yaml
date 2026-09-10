@@ -3705,8 +3705,8 @@ absolute_floors:
 #  16. **A budget-bound ceiling on the grouped-sort side, and on the genuinely
 #      worst fixture.** OPT-CONVERT-10 charged the framed encode's transient to
 #      both budgeted callers, and the ingest half is gated above
-#      (`peak_over_memory_budget__budget_bound` on smartseq2, verified at 0.550
-#      against a 1.0 contract). Two halves are deliberately NOT gated:
+#      (`peak_over_memory_budget__budget_bound` on smartseq2, measured at
+#      0.55-0.58 against a 1.0 contract). Two halves are deliberately NOT gated:
 #
 #      a. **`grouped_sort` under a memory budget.** `pyscx.sort` accepts
 #         `memory_budget` and `grouped_fast_concurrency` now charges the whole
