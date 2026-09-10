@@ -108,80 +108,27 @@ Takeaways:
 
 Source: `benchmarks/comprehensive/results/raw/parallel_write_scaling__{codec}__{dataset}.json` (`metadata.scaling_wall_s.full` and `metadata.scaling_wall_s.write_only`).
 
-### Rewrite ops: where the wall goes after the intra-shard encode (2026-09-10)
+### Rewrite ops: the parallel shard encode (2026-09-10)
 
-`scx compact` / `scx optimize` re-encode every shard. Since PR #524 that encode is
-parallel *inside* one shard (two codec candidates under `rayon::join` x row groups
-under `par_iter`), and this is the measurement of what that left behind.
+`scx compact` / `scx optimize` re-encode every shard, and since PR #524 that
+encode is parallel *inside* one shard. PR #526 measured what that left behind —
+both ops are flat past eight cores, with 38–45% of the wall on the serial
+per-shard path — and made `optimize` re-encode several shards at once under a
+byte-bounded in-flight cap.
 
-**Thread scaling, census_1m, 16 dedicated cores, medians of 3.** Same command and
-same output bytes at every point — only `RAYON_NUM_THREADS` changes, so there is no
-codec or I/O confound.
+**Those wall and peak-RSS figures are not reproduced here.** They came from a
+two-worktree CLI A/B (one binary per commit), which is not a shape the
+comprehensive harness can produce, so they cannot be backed by a
+`benchmark × format × dataset` manifest entry — and
+[benchmark_manifest.md](benchmark_manifest.md) admits no exception for a claim
+of that shape in this file. They live in
+[multithreading.md § Across shards, in a rewrite op](multithreading.md#across-shards-in-a-rewrite-op-scx-optimize)
+instead, with their provenance, where they document the architecture rather than
+standing as captured results.
 
-| op | 1 thread | 8 threads | 16 threads | speedup | serial share |
-|---|---:|---:|---:|---:|---:|
-| `compact --codec auto` | 79.4s | 35.4s | 33.4s | 2.38x | ~38% |
-| `compact --codec fast` | 47.7s | 32.1s | 33.2s | 1.44x | ~67% |
-| `optimize --codec auto` | 87.0s | 43.7s | 42.4s | 2.05x | ~45% |
-| `optimize --codec fast` | 57.6s | 41.5s | 41.4s | 1.39x | ~70% |
-
-Serial share is Amdahl on the measured pair (`s = (n·T(n)/T(1) − 1)/(n − 1)`); the
-n=8 and n=16 estimates agree to within 5 points on every row.
-
-Takeaways:
-- **Both ops are flat past eight cores.** 8 → 16 buys 6% on compact and 3% on
-  optimize; `--codec fast` gets *worse*.
-- **The dual encode is already free in wall terms** — auto 33.4s against fast 33.2s
-  (+0.8%) — while costing +31.6s of CPU at one thread. Adaptive codec selection is
-  paid for out of otherwise-idle cores.
-- **What remains is serial per-shard work**: the source-shard decode, the row gather,
-  the value conversion, the write. `perf` puts the framed compressor at 68% of all
-  *cycles* (`ZSTD_compressBlock_doubleFast` 21.9%, `byte_shuffle` 15.5%,
-  `rice_encode` 14.0%) — all of it already parallel.
-- A flat `perf` percentage **understates** anything on the serial path, because it is
-  a share of core-seconds, not wall. `scx_ops::helpers::encode_value` showed as 5.08%
-  of cycles and was ~16% of compact's wall.
-
-### Rewrite ops: batch value encode + parallel `optimize` (2026-09-10)
-
-Two changes measured against `441e7ae8`, two release worktrees, 16 dedicated cores,
-medians of 3, `scx` CLI.
-
-| op | dataset | base | batch encode only | + `--memory-budget 8G` |
-|---|---|---:|---:|---:|
-| `compact --codec auto` | census_1m | 33.42s | **31.23s** (−6.6%) | n/a |
-| `compact --codec auto` | smartseq2 | 4.39s | **4.06s** (−7.5%) | n/a |
-| `optimize --codec auto` | census_1m | 41.64s | 40.37s (−3.0%) | **15.90s (2.54x)** |
-| `optimize --codec auto` | smartseq2 | 5.28s | 5.05s (−4.5%) | **2.47s (2.04x)** |
-
-Peak RSS, same runs:
-
-| op | dataset | base | default | `--memory-budget 8G` |
-|---|---|---:|---:|---:|
-| `compact` | census_1m | 3528 MB | 3532 MB (+0.1%) | n/a |
-| `optimize` | census_1m | 3354 MB | 3306 MB (−1.4%) | 5845 MB (**+77%**) |
-| `optimize` | smartseq2 | 1969 MB | 1975 MB (+0.3%) | 3694 MB (**+87%**) |
-
-Takeaways:
-- **Batching the value encode is free**: 6.6–7.5% off compact at no memory cost, and
-  it lands on every writer (convert, optimize, append, build-csc, upgrade) because
-  `values_to_raw_bytes` is a wrapper over the same function. In isolation the batch is
-  1.7–2.1x on integer widths and 27.8x on `Float32` (`cargo bench -p scx-codec --
-  value_encode`); the op-level figure is that applied to a term worth ~16% of wall.
-- **Encoding several shards at once is where the rest is**, and it is a deliberate
-  wall-for-peak trade rather than a free win: 2.0–2.5x for +77–87% peak RSS.
-- **The default is conservative on purpose.** It holds 1 GiB of in-flight encode
-  phase, so an op's peak does not scale with the host's core count — but a census_1m
-  shard prices at ~394 MB, so the default admits only two of them and captures 3–4.5%
-  of the available 2.5x. Deep-shard files need `scx optimize --memory-budget` to buy
-  the rest; see [operations.md](operations.md#scx-optimize---memory-budget).
-- **Output bytes do not move.** Cross-arm per-section digests are identical on both
-  datasets (125 sections on census_1m compact, 129 on optimize), and census_1m
-  optimize at the default and at 8 GiB produce identical bytes — a different
-  concurrency is not a different file.
-
-Source: two-worktree CLI A/B on census_1m (2.8 GB, 245 shards) and smartseq2; the
-per-section digests exclude `Provenance`, which stamps `SystemTime::now()`.
+What *will* appear here is the `fragment_ops` `wall_s__optimize` /
+`peak_rss_mb__optimize` arm added alongside them, once a capture runs — that one
+is a real triple.
 
 ### Streaming conversion (h5ad → SCX)
 

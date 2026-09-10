@@ -93,6 +93,7 @@ use scx_format_io::{
     ShardHeader, SHARD_HEADER_SIZE,
 };
 
+use crate::encode_budget::ENCODE_PHASE_MULTIPLE;
 use crate::error::{OpsError, Result};
 use crate::flock::SharedFileLock;
 use crate::helpers::encode_values;
@@ -112,12 +113,6 @@ const K_PASS_MAX_CARDINALITY: usize = 32;
 /// real shard size). Public so `scx convert --group-target-bytes`
 /// sizes byte-mode shards identically to `scx sort`.
 pub const GROUP_BYTES_PER_NNZ: u64 = 8;
-
-/// The whole-phase cost of one in-flight shard now lives in
-/// [`crate::encode_budget`], because `compact` and `optimize` need the same
-/// figure. `GROUPED_BLOCK_PHASE_MULTIPLE` was its original name and this alias
-/// keeps the arithmetic below reading the same.
-use crate::encode_budget::ENCODE_PHASE_MULTIPLE as GROUPED_BLOCK_PHASE_MULTIPLE;
 
 /// Bytes one nonzero adds to a grouped block's **cut accumulator** — a `u32`
 /// index element plus the value bytes `encode_value` pushes at the file-wide
@@ -150,10 +145,10 @@ fn block_cut_bytes_per_nnz(value_encoding: ValueEncoding) -> u64 {
 ///
 /// The clamp converts the budget **into the cap's own unit**. The cap counts
 /// [`block_cut_bytes_per_nnz`] — the emitter's narrowed accumulator — while a
-/// block in flight costs `GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ`
+/// block in flight costs `ENCODE_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ`
 /// per nonzero, so the nonzeros a cap admits (and therefore the memory it
 /// commits) depend on the value width. At `Float32` the two agree and this is
-/// `budget / GROUPED_BLOCK_PHASE_MULTIPLE`, exactly the prior arithmetic. At
+/// `budget / ENCODE_PHASE_MULTIPLE`, exactly the prior arithmetic. At
 /// `Uint8` they do not: 5 accumulator bytes per nnz against 48 in memory, so
 /// the old `budget / 6` admitted 1.6x the nonzeros the budget could hold and
 /// [`grouped_fast_concurrency`]'s `concurrency x per_block <= budget` was false
@@ -175,7 +170,7 @@ fn grouped_block_byte_cap(
     match (cap, memory_budget) {
         (0, _) => 0,
         (cap, Some(budget)) => {
-            let phase_per_nnz = GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ;
+            let phase_per_nnz = ENCODE_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ;
             let admissible =
                 budget.saturating_mul(block_cut_bytes_per_nnz(value_encoding)) / phase_per_nnz;
             cap.min(admissible).max(1)
@@ -1534,7 +1529,12 @@ impl CsrEmitter {
         // and ignored a long one. The batch call encodes all of `data`, so a
         // future caller with mismatched lengths would write a shard whose
         // values and indices disagree -- silently, without this.
-        debug_assert_eq!(
+        // `assert_eq!`, not `debug_assert_eq!`. The loop this replaced indexed
+        // `data[k]` from an `indices` walk, so a short `data` panicked in
+        // release too; guarding only in debug would have turned a loud failure
+        // into a shard whose values and indices disagree on disk. One length
+        // comparison per row is not measurable against the encode.
+        assert_eq!(
             indices.len(),
             data.len(),
             "push_row needs one value per index (CSR row invariant)"
@@ -1678,20 +1678,20 @@ fn emit_x_in_memory(
 ///
 /// Each in-flight block holds gather buffers (u32 index + f32 value =
 /// [`GROUP_BYTES_PER_NNZ`] bytes per nnz), the encoder's own copy of the
-/// values, and the framed encode's live buffers — `GROUPED_BLOCK_PHASE_MULTIPLE`
+/// values, and the framed encode's live buffers — `ENCODE_PHASE_MULTIPLE`
 /// times the gather cost, over the `nnz ≈ block_byte_cap / per_nnz_bytes` a
 /// full block holds at the cap. We cap `concurrency` to `budget / per_block`
 /// (min 1), so `concurrency × per_block ≤ budget`; concurrency 1 gives parity
 /// with the one-block-at-a-time `CsrEmitter`.
 ///
 /// That inequality holds because the **caller's** `block_byte_cap` is clamped
-/// to `budget * block_cut_bytes_per_nnz / (GROUPED_BLOCK_PHASE_MULTIPLE *
+/// to `budget * block_cut_bytes_per_nnz / (ENCODE_PHASE_MULTIPLE *
 /// GROUP_BYTES_PER_NNZ)` (`sort_engine.rs`'s `block_byte_cap` binding), so a
 /// block filled **to** the cap has a whole phase that fits the budget and the
 /// `.max(1)` floor is not the branch that breaks it. Two earlier spellings of that clamp did
 /// not hold: clamping to the raw budget made it false in the ordinary f32 case
 /// (cap 256 MiB → `per_block` 1.5 GiB against a 256 MiB budget), and clamping
-/// to `budget / GROUPED_BLOCK_PHASE_MULTIPLE` made it false by
+/// to `budget / ENCODE_PHASE_MULTIPLE` made it false by
 /// `GROUP_BYTES_PER_NNZ / block_cut_bytes_per_nnz` — 1.0 at f32 but **1.6 at
 /// `Uint8`**, because the cap counts narrowed accumulator bytes and the gather
 /// holds `i32 + f32`. Converting the budget through the cap's own unit closes
@@ -1716,7 +1716,7 @@ fn emit_x_in_memory(
 /// `decode_target`: `encode_shard_adaptive` dual-encodes the block, and
 /// `encode_shard_framed` holds every row group's encoded bytes alongside the
 /// streams assembled from them. `scx-convert/src/budget.rs` carries the
-/// derivation and the measured figures; `GROUPED_BLOCK_PHASE_MULTIPLE`'s doc
+/// derivation and the measured figures; `ENCODE_PHASE_MULTIPLE`'s doc
 /// says why the constant is declared in this crate rather than shared.
 ///
 /// What `per_block` still does **not** price, named rather than left implicit:
@@ -1742,7 +1742,7 @@ fn grouped_fast_concurrency(
         // Sub-flush enabled: cap concurrency so `concurrency × per-block ≤ budget`.
         Some(budget) if block_byte_cap > 0 && per_nnz_bytes > 0 => {
             let nnz_per_block = (block_byte_cap / per_nnz_bytes).max(1);
-            let per_block = (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ)
+            let per_block = (ENCODE_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ)
                 .saturating_mul(nnz_per_block)
                 .max(1);
             // Compare in u64 before narrowing to avoid truncation on 32-bit usize.
@@ -1777,7 +1777,7 @@ fn grouped_fast_concurrency(
 /// so at most ~`concurrency` blocks' gather + encoded buffers are in flight on
 /// top of the resident source CSR — O(concurrency × block cap), independent of
 /// the block count (it does NOT buffer the whole encoded matrix). `block_byte_cap`
-/// is clamped to `--memory-budget / GROUPED_BLOCK_PHASE_MULTIPLE` upstream,
+/// is clamped to `--memory-budget / ENCODE_PHASE_MULTIPLE` upstream,
 /// which is what bounds a *single* block's whole-phase transient — clamping it
 /// to the raw budget did not (see [`grouped_fast_concurrency`]). The **total** peak is `concurrency × per-block transient`, so when a
 /// `memory_budget` is set `concurrency` is additionally capped to

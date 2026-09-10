@@ -53,14 +53,27 @@ fn one_oversized_shard_is_admitted_alone_not_refused() {
 }
 
 /// With bytes effectively unlimited, `threads` is the only thing closing a
-/// chunk. Also pins that the default is a real number rather than "unbounded":
-/// a default of `u64::MAX` would make an op's peak scale with the host's core
-/// count, which is exactly what `DEFAULT_IN_FLIGHT_BYTES` exists to stop.
+/// chunk. The other half of the default's contract — that `None` resolves to
+/// `DEFAULT_IN_FLIGHT_BYTES` rather than "unbounded", because an unbounded
+/// default would make an op's peak scale with the host's core count — is now
+/// asserted on the planner's own behaviour: the constant must admit fewer
+/// shards than `u64::MAX` does on a file whose shards are big enough to matter.
 #[test]
 fn chunks_are_thread_sized_when_bytes_are_not_the_limit() {
-    assert_eq!(resolve_in_flight_budget(None), DEFAULT_IN_FLIGHT_BYTES);
-    assert_eq!(resolve_in_flight_budget(Some(123)), 123);
-    assert_eq!(resolve_in_flight_budget(Some(0)), 0);
+    // A census-sized shard (~8.2M nnz) prices at ~394 MB, so the 1 GiB default
+    // must admit strictly fewer than sixteen of them. This is what would break
+    // if the default were ever widened to "no limit".
+    let census_shard_nnz = 8_200_000u64;
+    let at_default = plan_encode_chunks(&[census_shard_nnz; 16], 16, DEFAULT_IN_FLIGHT_BYTES);
+    assert!(
+        at_default[0] < 16,
+        "the default must not admit a whole pool of census-sized shards: {at_default:?}"
+    );
+    assert_eq!(
+        plan_encode_chunks(&[census_shard_nnz; 16], 16, u64::MAX),
+        vec![16],
+        "with no byte limit the pool width is the only cap"
+    );
     let nnz = vec![10u64; 10];
     assert_eq!(plan_encode_chunks(&nnz, 4, u64::MAX), vec![4, 4, 2]);
     assert_eq!(plan_encode_chunks(&nnz, 1, u64::MAX), vec![1; 10]);

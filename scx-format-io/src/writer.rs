@@ -1009,14 +1009,6 @@ impl ScxWriter {
     /// The per-shard `index_dtype` this writer stamps on a shard of
     /// `section_type` — `0` for u16 indices, `1` for u32.
     ///
-    /// [`Self::write_shard_inner`] calls this, so it is *the* rule rather than a
-    /// description of one. It is public because a caller that encodes shards
-    /// off-thread and writes them through [`Self::write_preencoded_shard`] must
-    /// fill in `EncodeShardOptions::index_dtype` itself, and re-deriving this by
-    /// hand is how such a caller silently emits shards stamped differently from
-    /// the ones the writer encodes. Read it before the parallel region, like
-    /// [`Self::framing`] — both need `&self` while the loop needs `&mut`.
-    ///
     /// The bound comes from the shard's layout, not the file header. CSC stores
     /// row indices (bounded by `n_obs`); CSR / LayerCsr / ObspCsr store column
     /// indices, which are **per-modality** — inside a [`Self::with_modality`]
@@ -1029,7 +1021,15 @@ impl ScxWriter {
     /// (census_500k / census_1m). The per-shard field is what the reader trusts
     /// (`sh.index_dtype == 0`), so widening to u32 on a CSC shard is
     /// read-correct even when the file header says u16.
-    pub fn shard_index_dtype(&self, section_type: SectionType) -> u8 {
+    ///
+    /// **Private, deliberately.** An earlier revision made this and
+    /// [`Self::shard_n_minor`] `pub` on the argument that a caller encoding
+    /// off-thread must fill `EncodeShardOptions` from the same rule — but no
+    /// such caller exists: `scx optimize`, the one this PR added, re-emits each
+    /// shard's *own* stamps read back from the source header, which is what
+    /// makes it a faithful re-encode. Promote them when a caller actually needs
+    /// the writer's rule, and convert that caller in the same change.
+    fn shard_index_dtype(&self, section_type: SectionType) -> u8 {
         if self.shard_n_minor(section_type).saturating_sub(1) <= u16::MAX as u64 {
             0
         } else {
@@ -1039,11 +1039,10 @@ impl ScxWriter {
 
     /// The minor-axis extent this writer stamps on a shard of `section_type`.
     ///
-    /// The other half of what a caller encoding off-thread has to reproduce
-    /// (`EncodeShardOptions::n_minor`), and the primitive
-    /// [`Self::shard_index_dtype`] is derived from. `write_shard_inner` had
-    /// this same three-arm match written out three times — for the index dtype,
-    /// for the shard header's `n_minor`, and for the stats' minor extent.
+    /// The primitive [`Self::shard_index_dtype`] is derived from.
+    /// `write_shard_inner` had this same three-arm match written out three
+    /// times — for the index dtype, for the shard header's `n_minor`, and for
+    /// the stats' minor extent.
     ///
     /// * `RawCsrShard` is row-major but has its **own** column axis
     ///   (`raw_n_vars`), independent of `header.n_vars`.
@@ -1073,7 +1072,7 @@ impl ScxWriter {
     /// stamped on every newly written obsp shard, which is an on-disk change
     /// needing its own decision about existing files. It is now at least stated
     /// in one place instead of three.
-    pub fn shard_n_minor(&self, section_type: SectionType) -> u64 {
+    fn shard_n_minor(&self, section_type: SectionType) -> u64 {
         match section_type {
             SectionType::RawCsrShard => self.raw_n_vars,
             st if crate::shard::is_column_major(st) => self.header.n_obs,

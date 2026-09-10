@@ -1,11 +1,12 @@
 //! What one shard costs while it is being encoded, and how many may be in
 //! flight at once.
 //!
-//! Every rewrite op that encodes shards off the calling thread needs the same
-//! two answers, and before this module `scx sort` was the only one that had
-//! them — privately. The cost model here is the crate's single declaration of
-//! "bytes per nonzero for a shard in flight", the way
-//! `scx-convert/src/budget.rs` is that crate's.
+//! Two ops need the same two answers today — `scx sort`, which had them
+//! privately, and `scx optimize`, which is why they moved here. The cost model
+//! is the crate's single declaration of "bytes per nonzero for a shard in
+//! flight", the way `scx-convert/src/budget.rs` is that crate's. `compact` does
+//! **not** use it: its encode is driven by a serial row gather, so the figure
+//! it would need is a pipeline's, not a chunk's.
 //!
 //! **This is an estimate, not a bound.** The same honesty applies here as in
 //! that table, where every allocation row stays `enforced: false`: the figure
@@ -64,16 +65,6 @@ pub(crate) fn encode_phase_bytes(nnz: u64) -> u64 {
 /// what lets them compute it.
 pub(crate) const DEFAULT_IN_FLIGHT_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Resolve the caller's `--memory-budget` into an in-flight byte allowance.
-///
-/// `None` is the default on every surface, and it means
-/// [`DEFAULT_IN_FLIGHT_BYTES`] rather than "unbounded" — see that constant for
-/// why. An explicit budget is used as given, `0` included (which pins the
-/// concurrency to one shard).
-pub(crate) fn resolve_in_flight_budget(memory_budget: Option<u64>) -> u64 {
-    memory_budget.unwrap_or(DEFAULT_IN_FLIGHT_BYTES)
-}
-
 /// Group consecutive shards into chunks that may be encoded concurrently.
 ///
 /// Returns one length per chunk, in order, covering `nnz` exactly. A chunk is
@@ -83,9 +74,10 @@ pub(crate) fn resolve_in_flight_budget(memory_budget: Option<u64>) -> u64 {
 /// even one whose own phase exceeds the allowance — see the module note on the
 /// floor.
 ///
-/// `in_flight_bytes` is a resolved number, never an `Option`, so the default
-/// and the caller's budget travel the same path and are testable against each
-/// other; [`resolve_in_flight_budget`] maps one to the other.
+/// `in_flight_bytes` is a resolved number, never an `Option`: the caller writes
+/// `memory_budget.unwrap_or(DEFAULT_IN_FLIGHT_BYTES)`, so the default and an
+/// explicit budget travel the same path and the tests below exercise both by
+/// passing the number directly.
 ///
 /// Taking the *whole* list rather than answering one shard at a time is what
 /// lets this be tested against a real distribution of shard sizes, including

@@ -8,10 +8,11 @@ mutations exposed by ``scx-ops`` via pyscx:
   * ``delete``     — deletion-vector construction for cell-index predicates
   * ``compact``    — full rewrite that reclaims deleted/orphaned bytes
   * ``optimize``   — re-encode every shard; records ``wall_s__optimize`` and
-    ``peak_rss_mb__optimize``. Gates the bounded parallel chunking and, more to
-    the point, its memory: N shards in flight hold N times one shard's live
-    phase. Runs the **unframed** encode path, because ``pyscx.optimize``
-    exposes no framing knob — see ``_run_optimize``.
+    ``peak_rss_mb__optimize``. **Instrumentation, not yet a gate**: no
+    threshold in ``thresholds.yaml`` references either key, so nothing fails on
+    a regression here until one does — a key in ``runs[].extra`` only makes a
+    threshold *possible*. Runs the **unframed** encode path, because
+    ``pyscx.optimize`` exposes no framing knob — see ``_run_optimize``.
   * ``obs_import`` — key-joined in-place add of one obs column from a CSV
   * ``rollback``   — revert the active manifest to the prior sequence
 
@@ -302,22 +303,31 @@ def _run_optimize(
 
     Why this arm exists: ``optimize`` re-encodes shards in bounded parallel
     chunks (OPT-OPS-4), and before this there was no ``optimize`` arm here at
-    all, so neither its wall nor its peak was gated. The peak is the half worth
-    watching: encoding N shards at once holds N times one shard's live phase, and
-    the in-flight allowance that bounds N is what keeps the peak from scaling
-    with the runner's core count.
+    all, so neither its wall nor its peak was measured. The peak is the half
+    worth watching: encoding N shards at once holds N times one shard's live
+    phase, and the in-flight allowance that bounds N is what keeps the peak from
+    scaling with the runner's core count.
+
+    ⚠️ **This is instrumentation, not a gate — nothing fails on it yet.**
+    ``thresholds.yaml`` carries no floor or ceiling for ``wall_s__optimize`` or
+    ``peak_rss_mb__optimize``; emitting a key into ``runs[].extra`` only makes a
+    threshold *possible*, and the canonical gate ignores a metric no threshold
+    references. A floor is deliberately deferred: ``fragment_ops``' pooled
+    ``median_wall_s`` / ``peak_rss_mb_median`` are suppressed for all six
+    datasets until 2026-12-31, and a ceiling authored now would be set against
+    the already-improved arm rather than a baseline. Activate it with the next
+    recapture, alongside Deferred item 18.
 
     **What it does not measure.** ``pyscx.optimize`` exposes no framing knob (it
     calls the non-framing entry point), so this runs the **unframed** encode
     path. The framed dual-candidate encode — what a ``scx convert`` output
     actually carries, and where the parallel win was measured — is only
-    reachable through ``scx optimize --row-group-rows``, i.e. the CLI. Read this
-    arm as a gate on the parallel chunking and its memory, not as the framed
-    figure.
+    reachable through ``scx optimize --row-group-rows``, i.e. the CLI.
 
-    Nor does it measure the in-flight allowance, which has no pyscx kwarg: this
-    always runs at the default. A regression in the *default* is exactly what
-    would show up here, which is the point.
+    Nor does it vary the in-flight allowance: ``memory_budget`` is now a
+    ``pyscx.optimize`` kwarg, but this arm leaves it at the default on purpose,
+    since a regression in the *default* is what a future threshold here would
+    need to catch.
     """
     import pyscx
 

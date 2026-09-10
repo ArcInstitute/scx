@@ -288,7 +288,9 @@ pub fn optimize_with_framing(
     let chunk_lens = crate::encode_budget::plan_encode_chunks(
         &nnz_per_shard,
         rayon::current_num_threads().max(1),
-        crate::encode_budget::resolve_in_flight_budget(memory_budget),
+        // `None` is not "unbounded" -- see `DEFAULT_IN_FLIGHT_BYTES`, which keeps
+        // the default peak a constant rather than a multiple of the core count.
+        memory_budget.unwrap_or(crate::encode_budget::DEFAULT_IN_FLIGHT_BYTES),
     );
     let mut at = 0usize;
     for len in chunk_lens {
@@ -330,7 +332,15 @@ pub fn optimize_with_framing(
                     entry.section_type,
                     sh.n_minor as u64,
                     row_start,
-                    index_dtype,
+                    // The shard's own index width, for the same reason as its
+                    // own extent above -- and the two must agree or the pair is
+                    // incoherent. The file header's `index_dtype` is derived
+                    // from `n_vars` and is CSR-correct, so using it here forced
+                    // u16 indices onto an `ObspCsrShard`, whose minor axis is
+                    // `n_obs`: on a file with `n_vars <= 65535 < n_obs` the
+                    // re-encode failed outright with "index N exceeds u16
+                    // range". Found by Antigravity - Gemini 3.8 Flash.
+                    sh.index_dtype,
                 );
                 // Passed through as the caller gave it, `None` included: with
                 // no explicit codec the encoder runs its own selection, and
@@ -756,6 +766,91 @@ mod tests {
     /// parallel map leaves the golden green. And a single-chunk run says nothing
     /// about chunk boundaries, so the budget is swept from "one shard at a time"
     /// to "all of them" and the bytes compared across the sweep.
+    /// An `ObspCsrShard`'s indices are bounded by `n_obs`, not `n_vars`, so
+    /// re-encoding one must use the shard's own index width rather than the
+    /// file header's.
+    ///
+    /// The fixture has to be built through `encode_one_shard` +
+    /// `write_preencoded_shard`, because `ScxWriter::write_obsp_shard` **cannot
+    /// express it**: it derives the extent from `n_vars` and would reject the
+    /// very shard this test needs ("index N exceeds u16 range"). That is the
+    /// known writer defect documented on `ScxWriter::shard_n_minor`, and it is
+    /// why `upgrade` builds its obsp fixtures the same way.
+    ///
+    /// Before the fix, `optimize` read `sh.n_minor` back from the source header
+    /// but took `index_dtype` from the *file* header, so the pair was
+    /// incoherent and this file failed to optimize at all.
+    /// Found by Antigravity - Gemini 3.8 Flash.
+    #[test]
+    fn optimize_reencodes_an_obsp_shard_wider_than_the_file_index_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.scx");
+        // n_vars small => the file header's index_dtype is u16; n_obs large =>
+        // the obsp graph's own minor axis needs u32.
+        let n_obs = 70_000u64;
+        let n_vars = 100u64;
+        let mut header = sample_header(n_obs, n_vars);
+        header.format_version = 2;
+        header.index_dtype = 0;
+        assert_eq!(
+            header.index_dtype, 0,
+            "the file axis must be the narrow one"
+        );
+
+        let obsp_col = 69_999u32;
+        {
+            let mut w = ScxWriter::new(&input, header).unwrap();
+            w.write_obs(&sample_obs(n_obs as usize)).unwrap();
+            w.write_var(&sample_var(n_vars as usize)).unwrap();
+            w.write_csr_shard(
+                &[0u64, 1],
+                &[0u32],
+                &[1u8],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                0,
+            )
+            .unwrap();
+            // One obsp row with an endpoint past u16, stamped u32 / n_obs.
+            let mut opts = scx_format_io::EncodeShardOptions::new(
+                "obsp/connectivities_shard_0".to_string(),
+                SectionType::ObspCsrShard,
+                n_obs,
+                0,
+                1,
+            );
+            opts.explicit_codec = Some(CodecId::None);
+            opts.value_encoding = Some(ValueEncoding::Uint8);
+            let pre =
+                scx_format_io::encoder::encode_one_shard(&[0u64, 1], &[obsp_col], &[1.0f32], &opts)
+                    .unwrap();
+            w.write_preencoded_shard(pre).unwrap();
+            w.finish().unwrap();
+        }
+
+        let out = dir.path().join("out.scx");
+        optimize_with_framing(&input, &out, None, ObsShardPolicy::Off, None, None)
+            .expect("optimize must re-encode an obsp shard wider than the file's index dtype");
+
+        // The graph survives, at its own width.
+        let reader = ScxReader::open(&out).unwrap();
+        let obsp = reader
+            .catalog()
+            .entries
+            .iter()
+            .find(|e| e.section_type == SectionType::ObspCsrShard)
+            .expect("obsp shard must be carried through");
+        let sh = reader.read_shard_header(obsp).unwrap();
+        assert_eq!(sh.index_dtype, 1, "the re-emitted obsp shard must stay u32");
+        assert_eq!(sh.n_minor as u64, n_obs, "and keep its own minor extent");
+        let (_, indices, _) = reader.read_shard_from_entry(obsp).unwrap();
+        assert_eq!(
+            indices,
+            vec![obsp_col as i32],
+            "the endpoint past u16 must round-trip"
+        );
+    }
+
     #[test]
     fn optimize_honours_an_explicit_codec_at_every_concurrency() {
         let dir = tempfile::tempdir().unwrap();

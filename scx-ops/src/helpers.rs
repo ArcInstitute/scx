@@ -9,66 +9,21 @@ use crate::error::OpsError;
 /// Returns an error if the value is out of range for integer encodings.
 /// Used by compact, merge, and other operations that re-encode decoded
 /// float values back to their on-disk representation.
+///
+/// Thin over [`ValueEncoding::encode_f32`], which owns the range rules — the
+/// inclusive-at-2³² `Uint32` bound that lets a decoded `u32::MAX` round-trip,
+/// and the `contains` test that rejects NaN instead of writing `value as uN` as
+/// a silent `0`. This crate previously restated all three arms, so the bounds
+/// were declared twice and could drift; what it actually needs is not a second
+/// range check but its **own error type**, since
+/// [`OpsError::ValueOutOfRange`]'s `value` / `encoding` / `max` fields are what
+/// pyscx maps to a Python exception and what the tests below assert on.
 pub fn encode_value(
     buf: &mut Vec<u8>,
     value: f32,
     encoding: ValueEncoding,
 ) -> crate::error::Result<()> {
-    match encoding {
-        ValueEncoding::Uint8 => {
-            if !(0.0..=u8::MAX as f32).contains(&value) {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint8",
-                    max: u8::MAX as f64,
-                });
-            }
-            buf.push(value as u8);
-        }
-        ValueEncoding::Uint16 => {
-            if !(0.0..=u16::MAX as f32).contains(&value) {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint16",
-                    max: u16::MAX as f64,
-                });
-            }
-            buf.extend_from_slice(&(value as u16).to_le_bytes());
-        }
-        ValueEncoding::Uint32 => {
-            // Inclusive at 2³² — see `ValueEncoding::encode_f32`, which this
-            // mirrors. `u32::MAX as f32` IS 2³², so this value is exactly what
-            // an on-disk `u32::MAX` decodes to; compact/merge/sort re-encode
-            // decoded f32 under the input's own encoding, and rejecting it
-            // would abort them on format-valid archives. `as u32` saturates
-            // back to `u32::MAX`, restoring the original value.
-            //
-            // Fresh out-of-range data is diverted to `Float32` by
-            // `detect_value_encoding`, on the detect path and on
-            // `attach_external_layer`'s post-canonicalization one.
-            // `encoding_for_canonicalized` deliberately does *not* divert at
-            // exactly 2³² — its values may be decoded originals, and saturating
-            // is what restores them — so the rewrite ops reach this arm by
-            // design. A caller passing an explicit encoding bypasses every
-            // detector; so does any `u32` above 2²⁴, which the f32 decode
-            // rounded long before reaching here. See `ValueEncoding::encode_f32`.
-            const UINT32_BOUND: f32 = (1u128 << 32) as f32;
-            if !(0.0..=UINT32_BOUND).contains(&value) {
-                return Err(OpsError::ValueOutOfRange {
-                    value,
-                    encoding: "Uint32",
-                    max: u32::MAX as f64,
-                });
-            }
-            buf.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        ValueEncoding::Float32 => buf.extend_from_slice(&value.to_le_bytes()),
-        ValueEncoding::Float16 => {
-            let f16_val = half::f16::from_f32(value);
-            buf.extend_from_slice(&f16_val.to_le_bytes());
-        }
-    }
-    Ok(())
+    encoding.encode_f32(buf, value).map_err(lift_range_error)
 }
 
 /// [`encode_value`] over a whole contiguous run of values.
@@ -77,43 +32,47 @@ pub fn encode_value(
 /// once per nonzero. Measured on `scx compact --codec auto` at census_1m,
 /// `encode_value` was **5.08 % of all cycles**, and because it runs on the
 /// calling thread while the encode runs on the pool, that is roughly **16 % of
-/// the op's wall** — the largest single serial term left after PR-42.
+/// the op's wall** — the largest serial term left after PR-42.
 ///
-/// The fast path is [`ValueEncoding::encode_f32_into`], so there is one
-/// width-specialised implementation in the workspace rather than two — 1.7-2.1x
-/// on the integer widths and 27.8x on `Float32`, benched there. That is short of
-/// the 5-10x the OPT plan projected for this pass, so expect roughly 8 % off a
-/// census_1m compact from it, not 14 %. What this
-/// wrapper owns is the *error*: `scx-codec` reports an out-of-range value as a
-/// `CodecError::Io` carrying only a message, while this crate's
-/// [`OpsError::ValueOutOfRange`] carries `value` / `encoding` / `max` — which
-/// pyscx maps to a Python exception and three tests assert on. So on rejection
-/// it replays the run through [`encode_value`] to raise this crate's error.
+/// The width-specialised work is [`ValueEncoding::encode_f32_into`], so there is
+/// one implementation in the workspace — 1.7-2.1x on the integer widths and
+/// 27.8x on `Float32`, benched there. That is short of the 5-10x the OPT plan
+/// projected for this pass, so expect roughly 8 % off a census_1m compact from
+/// it, not 14 %.
 ///
 /// `buf` is left exactly as it was found on error: an accumulator must not gain
-/// half a row behind an `Err`, because compact's `widest_value_encoding` retry
-/// story assumes the failed row wrote nothing.
+/// half a row behind an `Err`, because the failed row wrote nothing.
 pub fn encode_values(
     buf: &mut Vec<u8>,
     data: &[f32],
     encoding: ValueEncoding,
 ) -> crate::error::Result<()> {
-    let start = buf.len();
-    if encoding.encode_f32_into(buf, data).is_ok() {
-        return Ok(());
+    encoding
+        .encode_f32_into(buf, data)
+        .map_err(lift_range_error)
+}
+
+/// Lift `scx-codec`'s typed range error into this crate's, preserving the
+/// offending value.
+///
+/// Only that one variant is re-shaped; everything else keeps its existing
+/// classification through `OpsError::Codec`. Before `CodecError` carried the
+/// value, this crate had to re-run the per-value loop after a batch failure
+/// just to rediscover which value was bad — two range passes and two error
+/// paths for one failure.
+fn lift_range_error(e: scx_codec::CodecError) -> OpsError {
+    match e {
+        scx_codec::CodecError::ValueOutOfRange {
+            value,
+            encoding,
+            max,
+        } => OpsError::ValueOutOfRange {
+            value,
+            encoding,
+            max,
+        },
+        other => OpsError::from(other),
     }
-    buf.truncate(start);
-    for &v in data {
-        if let Err(e) = encode_value(buf, v, encoding) {
-            buf.truncate(start);
-            return Err(e);
-        }
-    }
-    // Reached only if the two crates' range checks disagree — they are the same
-    // bounds arm for arm today, and `Uint32`'s is a shared constant. If one ever
-    // loosens, this crate's answer is the one the ops contract is written
-    // against, so a run `encode_value` accepts is a success, not an error.
-    Ok(())
 }
 
 /// Pick one output value encoding wide enough to hold every input shard's

@@ -614,6 +614,55 @@ from one shard per chunk to all of them and compares both the shard contents and
 the catalog's own entry order (reading through `csr_shards_sorted` re-sorts by
 `row_start` and would hide a mis-ordered write entirely).
 
+#### Measured
+
+> [!NOTE]
+> These are **not** manifest-backed captures, and they are here rather than in
+> [performance.md](performance.md) for that reason. Producing them needs one
+> release binary per commit — a two-worktree A/B — which is not a shape the
+> comprehensive harness (`benchmark × format × dataset`) can take, so
+> [benchmark_manifest.md](benchmark_manifest.md)'s tier-1 rule cannot be
+> satisfied for them and its tier-2 microbenchmark disclosure is meant for
+> kernel measurements. They document the architecture above; treat the
+> `fragment_ops` `wall_s__optimize` arm as the gated figure.
+>
+> Provenance: `scx` CLI, two release worktrees at `441e7ae8` (base) and this
+> change, `cpu_batch` with 16 dedicated cores, medians of 3 runs, 2026-09-10.
+> census_1m is 2.8 GB / 245 shards.
+
+| op | dataset | base | batch value encode only | + `--memory-budget 8G` |
+|---|---|---:|---:|---:|
+| `compact --codec auto` | census_1m | 33.42s | **31.23s** (−6.6%) | n/a |
+| `compact --codec auto` | smartseq2 | 4.39s | **4.06s** (−7.5%) | n/a |
+| `optimize --codec auto` | census_1m | 41.64s | 40.37s (−3.0%) | **15.90s (2.54x)** |
+| `optimize --codec auto` | smartseq2 | 5.28s | 5.05s (−4.5%) | **2.47s (2.04x)** |
+
+Peak RSS, same runs:
+
+| op | dataset | base | default | `--memory-budget 8G` |
+|---|---|---:|---:|---:|
+| `compact` | census_1m | 3528 MB | 3532 MB (+0.1%) | n/a |
+| `optimize` | census_1m | 3354 MB | 3306 MB (−1.4%) | 5845 MB (**+77%**) |
+| `optimize` | smartseq2 | 1969 MB | 1975 MB (+0.3%) | 3694 MB (**+87%**) |
+
+Reading those two tables together is the point:
+
+- **Batching the value encode is free** — 6.6–7.5% off compact at no memory
+  cost, and it lands on every writer, because `values_to_raw_bytes` is a wrapper
+  over the same function. In isolation the batch is 1.7–2.1x on integer widths
+  and 27.8x on `Float32` (`cargo bench -p scx-codec -- value_encode`, same
+  machine and date); the op-level figure is that applied to a term worth ~16% of
+  wall.
+- **Encoding several shards at once is a wall-for-peak trade**, not a free win:
+  2.0–2.5x for +77–87% peak RSS.
+- **The default is conservative on purpose**, and it shows: a census_1m shard
+  prices at ~394 MB, so 1 GiB admits two of them and captures 3–4.5% of the
+  available 2.5x. Deep-shard files need `--memory-budget` to buy the rest.
+- **Bytes do not move.** Cross-arm per-section digests were identical on both
+  datasets (125 sections on census_1m compact, 129 on optimize), and census_1m
+  optimize at the default and at 8 GiB produced identical bytes — a different
+  concurrency is not a different file.
+
 ## GPU parallelism
 
 The `scx-gpu` crate launches CUDA kernels with hundreds of GPU threads:

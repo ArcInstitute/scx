@@ -177,19 +177,21 @@ impl ValueEncoding {
         match self {
             Self::Uint8 => {
                 if !(0.0..=255.0).contains(&value) {
-                    return Err(CodecError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("value {value} out of range for uint8 (0..255)"),
-                    )));
+                    return Err(CodecError::ValueOutOfRange {
+                        value,
+                        encoding: "Uint8",
+                        max: u8::MAX as f64,
+                    });
                 }
                 buf.push(value as u8);
             }
             Self::Uint16 => {
                 if !(0.0..=65535.0).contains(&value) {
-                    return Err(CodecError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("value {value} out of range for uint16 (0..65535)"),
-                    )));
+                    return Err(CodecError::ValueOutOfRange {
+                        value,
+                        encoding: "Uint16",
+                        max: u16::MAX as f64,
+                    });
                 }
                 buf.extend_from_slice(&(value as u16).to_le_bytes());
             }
@@ -234,10 +236,11 @@ impl ValueEncoding {
                 // `contains` (not `<=`) so NaN is rejected rather than written
                 // as 0.
                 if !(0.0..=UINT32_BOUND_F32).contains(&value) {
-                    return Err(CodecError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("value {value} out of range for uint32"),
-                    )));
+                    return Err(CodecError::ValueOutOfRange {
+                        value,
+                        encoding: "Uint32",
+                        max: u32::MAX as f64,
+                    });
                 }
                 buf.extend_from_slice(&(value as u32).to_le_bytes());
             }
@@ -384,6 +387,23 @@ pub enum CodecError {
 
     #[error("malformed codec input: {0}")]
     MalformedInput(String),
+
+    /// An `f32` value cannot be represented by the target integer encoding —
+    /// out of range, or NaN.
+    ///
+    /// Typed rather than an `Io(InvalidData)` string so a caller can lift it
+    /// into its own error without parsing a message. `scx-ops` does exactly
+    /// that (`OpsError::ValueOutOfRange`, which pyscx maps and which names the
+    /// offending value), and before this variant existed it had to re-run the
+    /// whole per-value loop just to rediscover which value was bad.
+    /// Classification is unchanged: like the `Io` form it had before, this
+    /// falls through `ScxError`'s catch-all to `ScxError::Codec`.
+    #[error("f32 value {value} out of range for {encoding} encoding (max {max})")]
+    ValueOutOfRange {
+        value: f32,
+        encoding: &'static str,
+        max: f64,
+    },
 
     /// A decoded minor-axis index is at or past the caller-supplied bound.
     ///

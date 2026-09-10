@@ -1975,7 +1975,7 @@ fn grouped_fast_path_deterministic() {
 fn grouped_block_byte_cap_keeps_one_block_inside_the_budget() {
     use super::{
         block_cut_bytes_per_nnz, grouped_block_byte_cap, grouped_fast_concurrency,
-        GROUPED_BLOCK_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ,
+        ENCODE_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ,
     };
     use scx_codec::ValueEncoding;
 
@@ -2005,7 +2005,7 @@ fn grouped_block_byte_cap_keeps_one_block_inside_the_budget() {
             let cap = grouped_block_byte_cap(default_cap, Some(budget), enc);
             let c = grouped_fast_concurrency(threads, cap, per_nnz_bytes, Some(budget)) as u64;
             let per_block =
-                (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ) * (cap / per_nnz_bytes).max(1);
+                (ENCODE_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ) * (cap / per_nnz_bytes).max(1);
             assert!(
                 c * per_block <= budget,
                 "{enc:?} at budget {budget}: concurrency {c} x per_block {per_block} = {} \
@@ -2028,14 +2028,12 @@ fn grouped_block_byte_cap_keeps_one_block_inside_the_budget() {
         0
     );
 
-    // f32 is the arm the previous `budget / GROUPED_BLOCK_PHASE_MULTIPLE`
+    // f32 is the arm the previous `budget / ENCODE_PHASE_MULTIPLE`
     // spelling got right, so it must be byte-for-byte unchanged — the clamp is
     // a narrow-encoding fix, not a re-tuning of the default path.
     assert_eq!(
         grouped_block_byte_cap(default_cap, Some(budget), ValueEncoding::Float32),
-        default_cap
-            .min(budget / GROUPED_BLOCK_PHASE_MULTIPLE)
-            .max(1)
+        default_cap.min(budget / ENCODE_PHASE_MULTIPLE).max(1)
     );
     // And `Uint8` is where it moved: 5/8 of the f32 cap.
     assert_eq!(
@@ -2046,7 +2044,7 @@ fn grouped_block_byte_cap_keeps_one_block_inside_the_budget() {
 
 #[test]
 fn grouped_fast_concurrency_honors_budget() {
-    use super::{grouped_fast_concurrency, GROUPED_BLOCK_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ};
+    use super::{grouped_fast_concurrency, ENCODE_PHASE_MULTIPLE, GROUP_BYTES_PER_NNZ};
 
     // f32 encoding: per_nnz_bytes = 4 (index) + 4 (value) = 8.
     let per_nnz_bytes: u64 = 8;
@@ -2056,7 +2054,7 @@ fn grouped_fast_concurrency_honors_budget() {
                                                  // side at ~1x and made the `<= budget` assertion below a statement about
                                                  // the gather stage only.
     let per_block =
-        (GROUPED_BLOCK_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ) * (block_byte_cap / per_nnz_bytes);
+        (ENCODE_PHASE_MULTIPLE * GROUP_BYTES_PER_NNZ) * (block_byte_cap / per_nnz_bytes);
     let threads = 192;
 
     // No budget → full thread count.
@@ -2071,7 +2069,7 @@ fn grouped_fast_concurrency_honors_budget() {
     let c = grouped_fast_concurrency(threads, block_byte_cap, per_nnz_bytes, Some(budget));
     assert_eq!(c, (budget / per_block) as usize);
     // A **literal**, independent of the constant above. The assertion on the
-    // line before re-derives `per_block` from `GROUPED_BLOCK_PHASE_MULTIPLE`,
+    // line before re-derives `per_block` from `ENCODE_PHASE_MULTIPLE`,
     // so it moves with the production formula and cannot see a change to it —
     // measured: it passes at both 2 and 6. This is what pins the charge:
     //   per_block = 6 × 8 × (256 MiB / 8) = 1_610_612_736
@@ -2082,7 +2080,7 @@ fn grouped_fast_concurrency_honors_budget() {
          term is uncharged again"
     );
     assert_eq!(
-        GROUPED_BLOCK_PHASE_MULTIPLE, 6,
+        ENCODE_PHASE_MULTIPLE, 6,
         "gather (1) + the encoder's value copy (1) + the framed encode's two \
          candidates (4); see `scx-convert/src/budget.rs` for the derivation"
     );
