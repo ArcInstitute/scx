@@ -632,8 +632,14 @@ the same LRU as whole shards, keyed `(file_id, shard, group)`, under the same by
 (`max_memory_mb`); the `cache_shards` count cap applies to whole shards only. The per-shard
 framing layout (header scalars, sub-stream ranges, resolved block index) is memoized once
 per shard. A repeated gather over a hot region is served as
-`cache_metrics()["row_group_hits"]`, and the L2 prefetcher pre-decodes a plan's groups when
-they fit `budget / (lookahead + 1)`. `SCX_ROW_GROUP_CACHE=0` disables retention (the
+`cache_metrics()["row_group_hits"]`. Admission is per gather — a gather's groups are retained
+only if all of them fit the budget, else they decode and drop (a scan larger than the cache
+would otherwise churn the LRU for zero hits) — and the L2 prefetcher pre-decodes a plan's
+groups when they fit `budget / (lookahead + 1)`. Both rules size from the block index, no
+decode. The win is therefore capacity-bound: at G=256 and ~2k nnz/row a touched group is
+~4 MB, so a 512-row batch over a large file wants a budget of a few GB
+(`max_memory_mb`); a budget under one batch's groups gets the pre-change behaviour, not a
+slower one. `SCX_ROW_GROUP_CACHE=0` disables retention (the
 same-build A/B arm). Output is byte-identical either way. Opening **all-unframed** data with
 `scatter_block_index=True` emits a one-shot `UserWarning` on **both** classes — the fast
 path is inert there, so reframe with `scx optimize --row-group-rows 256 <file>`. On

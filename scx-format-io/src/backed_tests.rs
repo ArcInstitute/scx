@@ -4470,11 +4470,12 @@ fn row_group_lru_is_namespaced_by_file_id() {
     );
 }
 
-/// Row groups are bounded by the byte budget: a budget holding two groups
-/// evicts to fit as the four touched groups land, the output is still exact,
-/// and the resident bytes never exceed the budget. (An entry larger than the
-/// whole budget would still be admitted — `put_with_budget`'s contract — so
-/// the budget here is deliberately more than one group.)
+/// Row groups are bounded by the byte budget: two gathers that each fit a
+/// two-and-a-half-group budget but together exceed it evict the older groups
+/// to admit the newer, the output stays exact, and the resident bytes never
+/// exceed the budget. (An entry larger than the whole budget would still be
+/// admitted — `put_with_budget`'s contract — so the budget here is
+/// deliberately more than one group.)
 #[test]
 fn row_group_lru_evicts_to_fit_the_budget() {
     use std::sync::atomic::Ordering;
@@ -4485,30 +4486,95 @@ fn row_group_lru_evicts_to_fit_the_budget() {
         BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
     let m = backed.enable_metrics();
 
-    let rows = [2u64, 5, 6, 40, 41, 63];
-    rg_assert_matches_full(
-        &rg_gather(&backed, &rows),
-        &rows,
-        &full,
-        "cold under a tiny budget",
-    );
+    // Shard 0 groups {0, 1}, then shard 1 groups {2, 7}: each gather fits, the
+    // union does not.
+    let a = [2u64, 5, 6];
+    let b = [40u64, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &a), &a, &full, "gather A");
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    rg_assert_matches_full(&rg_gather(&backed, &b), &b, &full, "gather B");
     assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 4);
     assert!(
-        m.row_group_evictions.load(Ordering::Relaxed) >= 2,
-        "four groups through a two-group budget must evict (evictions={})",
+        m.row_group_evictions.load(Ordering::Relaxed) >= 1,
+        "B's two groups on top of A's two through a 2.5-group budget must evict (evictions={})",
         m.row_group_evictions.load(Ordering::Relaxed)
     );
     assert!(backed.cache_bytes_used() <= budget);
     assert!(m.peak_bytes_in_cache.load(Ordering::Relaxed) as usize <= budget);
 
-    // Still exact once the cache is churning.
-    rg_assert_matches_full(
-        &rg_gather(&backed, &rows),
-        &rows,
-        &full,
-        "warm under a tiny budget",
+    // Still exact once the cache is churning, and B (the newer) is what stayed.
+    rg_assert_matches_full(&rg_gather(&backed, &b), &b, &full, "B again");
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        2,
+        "B's groups survived A's eviction"
     );
+    rg_assert_matches_full(&rg_gather(&backed, &a), &a, &full, "A again");
     assert!(backed.cache_bytes_used() <= budget);
+}
+
+/// Admission: a gather whose row groups do not all fit the budget retains
+/// **nothing** — every group decodes and is dropped, no eviction, no resident
+/// bytes — instead of churning the LRU for zero hits (a scan larger than the
+/// cache). The very next gather that does fit is admitted as usual.
+#[test]
+fn over_budget_gather_bypasses_the_row_group_lru() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    let budget = 3 * RG_GROUP_BYTES;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Four groups through a three-group budget: bypass.
+    let big = [2u64, 5, 6, 40, 41, 63];
+    rg_assert_matches_full(
+        &rg_gather(&backed, &big),
+        &big,
+        &full,
+        "over budget, pass 1",
+    );
+    rg_assert_matches_full(
+        &rg_gather(&backed, &big),
+        &big,
+        &full,
+        "over budget, pass 2",
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        8,
+        "decoded twice — nothing retained"
+    );
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "not admitted"
+    );
+    assert_eq!(
+        m.row_group_evictions.load(Ordering::Relaxed),
+        0,
+        "and so nothing to evict"
+    );
+    assert_eq!(backed.cache_bytes_used(), 0);
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        4,
+        "the route is unchanged"
+    );
+
+    // Two groups through the same budget: admitted, and the repeat hits.
+    let small = [40u64, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "fits, pass 1");
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        2 * RG_GROUP_BYTES
+    );
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "fits, pass 2");
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 2);
+    assert_eq!(backed.cache_bytes_used(), 2 * RG_GROUP_BYTES);
 }
 
 /// `cache_shards` caps **whole shards** only. With a cap of one, resident row

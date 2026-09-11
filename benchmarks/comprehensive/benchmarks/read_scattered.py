@@ -74,10 +74,13 @@ _DEFAULT_PAIRS_PER_BATCH = 256
 # can decode ~512 groups of G rows — measured at 2–3.5 s/batch on
 # smartseq2/tabula before OPT-FORMATIO-1, when every batch re-decoded the
 # touched groups (nothing retained them). The groups now stay in the shard LRU
-# under `max_memory_mb`, so after the first pass most of a batch is served as
-# `row_group_hits` (recorded as `row_group_hit_rate`); the budget below holds
-# every group of the tier-small datasets. `SCX_ROW_GROUP_CACHE=0` restores the
-# pre-change regime for a same-build A/B. A fixed 200×5 batches×runs blew the
+# under `max_memory_mb` — but only when a batch's groups fit it: the loader's
+# auto-tune grants this benchmark `effective_cache_shards=2` on the multi-shard
+# datasets (`max_memory_mb=8192` less the `max_plan_size` batch buffers), i.e.
+# ≈435 MB on tabula against ≈890 MB of groups per batch, so there the gather
+# bypasses the LRU (`row_group_hit_rate` 0, no churn) and only pbmc3k, whose
+# eleven groups fit, is served as hits (99%). `SCX_ROW_GROUP_CACHE=0` restores
+# the pre-change regime for a same-build A/B. A fixed 200×5 batches×runs blew the
 # tier-small 240 s job budget in that regime, and the knobs are kept so the two
 # arms stay comparable while still proving adoption (`block_index_groups`) and
 # giving a p50.

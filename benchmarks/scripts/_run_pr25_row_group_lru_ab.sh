@@ -173,9 +173,12 @@ python "$CAPTURE" --name "$NAME_ON" \
 echo ""
 echo "=== gate: $NAME_ON vs LATEST ==="
 set +e
+# `--no-gpu` as well as `--no-accel`: without it the gate's pre-flight submits a
+# GPU probe to the starved `preemptible` partition and waits 600 s for it —
+# there is nothing GPU-shaped in this capture (job 2930275 sat in that wait).
 python benchmarks/comprehensive/scripts/gate_candidate.py --skip-capture --name "$NAME_ON" \
     --benchmarks read_scattered index_plan cellset_gather \
-    --formats $FORMATS scx_auto --datasets $DATASETS --no-accel \
+    --formats $FORMATS scx_auto --datasets $DATASETS --no-accel --no-gpu \
     -- --report-json "$OUT/gate_report.json" 2>&1 | tee "$OUT/gate.log"
 GATE_RC=${PIPESTATUS[0]}
 set -e

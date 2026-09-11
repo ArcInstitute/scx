@@ -1017,8 +1017,11 @@ impl BackedCsrReader {
         self.check_fresh()?;
         let n = local_end - local_start;
         layout.check_run(local_start, n)?;
+        // A window is `< shard_rows / 4` by construction (`read_rows`' plan),
+        // so its groups are at most a quarter of one shard's bytes — under any
+        // budget the reader runs with. Always admitted.
         let (indptr, indices, data) = assemble_row_run(&layout, local_start, n, |g| {
-            self.row_group(shard_idx, &layout, g)
+            self.row_group(shard_idx, &layout, g, true)
         })?;
         Ok(Some(ScxCsr::new_unchecked(
             (n, self.n_vars),
@@ -1030,7 +1033,9 @@ impl BackedCsrReader {
 
     /// Row group `g` of framed shard `shard_idx`: from the shard LRU when
     /// resident, else decoded (once, across concurrent callers — the same
-    /// singleflight as whole shards) and inserted under the byte budget. With
+    /// singleflight as whole shards) and, when `admit`, inserted under the
+    /// byte budget. `admit = false` is the caller saying this read's working
+    /// set does not fit — see [`Self::gather_row_groups_fit_budget`]. With
     /// row-group retention off ([`Self::set_row_group_cache`], a count-only
     /// cache, or no cache) it decodes uncached and touches no counter.
     fn row_group(
@@ -1038,14 +1043,40 @@ impl BackedCsrReader {
         shard_idx: usize,
         layout: &Arc<FramedShardLayout>,
         g: usize,
+        admit: bool,
     ) -> Result<Arc<ScxCsr>> {
         if !self.retains_row_groups() {
             return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
         let shard_cache = Arc::clone(&self.shard_cache);
-        shard_cache.get_or_decode(CacheKey::Group(self.file_id, shard_idx, g), || {
-            self.reader.decode_framed_row_group(layout, g).map(Arc::new)
-        })
+        shard_cache.get_or_decode_admit(
+            CacheKey::Group(self.file_id, shard_idx, g),
+            || self.reader.decode_framed_row_group(layout, g).map(Arc::new),
+            admit,
+        )
+    }
+
+    /// Whether the row groups a gather's block-index groups touch all fit the
+    /// LRU's byte budget — the admission rule `scatter_groups` applies once per
+    /// gather. `true` when the reader retains no row groups (nothing to decide)
+    /// and when nothing takes the block-index path.
+    fn gather_row_groups_fit_budget(
+        &self,
+        sorted_pairs: &[(u64, usize)],
+        groups: &[RowGroup],
+    ) -> bool {
+        if !self.retains_row_groups() {
+            return true;
+        }
+        let mut planned = 0usize;
+        for g in groups.iter().filter(|g| g.use_block_index) {
+            let rows: Vec<u64> = sorted_pairs[g.start..g.end]
+                .iter()
+                .map(|&(r, _)| r)
+                .collect();
+            planned = planned.saturating_add(self.planned_row_group_bytes(g.shard_idx, &rows));
+        }
+        planned <= self.shard_cache.bytes_budget()
     }
 
     /// Bytes the row groups `rows` (global row ids in `shard_idx`) touch would
@@ -1100,8 +1131,10 @@ impl BackedCsrReader {
         self.check_fresh()?;
         let mut groups = Self::touched_groups(&layout, s_start, rows);
         groups.dedup();
+        // Always admitted: the caller (the L2 prefetcher) has already checked
+        // the plan fits its share of the budget before asking for a warm.
         for &g in &groups {
-            self.row_group(shard_idx, &layout, g)?;
+            self.row_group(shard_idx, &layout, g, true)?;
         }
         Ok(groups.len())
     }
@@ -1323,6 +1356,16 @@ impl BackedCsrReader {
             .collect();
         self.warm_shards(&full_shards)?;
 
+        // Row-group admission, decided once for the whole gather: its groups
+        // are retained only if all of them fit the byte budget. A gather whose
+        // working set exceeds the budget would insert each group and evict it
+        // before the next gather could hit it — a scan larger than the cache,
+        // which an LRU makes strictly worse (eviction churn + resident bytes
+        // for zero hits; measured at 0 hits on tabula_sapiens_100k under
+        // `read_scattered`'s 2-shard budget). Sized exactly from the block
+        // index, no decode. Same rule the L2 prefetcher applies to a plan.
+        let admit_groups = self.gather_row_groups_fit_budget(sorted_pairs, groups);
+
         for g in groups {
             let group = &sorted_pairs[g.start..g.end];
 
@@ -1335,6 +1378,7 @@ impl BackedCsrReader {
                     g.shard_idx,
                     g.s_start,
                     group,
+                    admit_groups,
                     &mut scatter,
                 )?;
             }
@@ -1384,6 +1428,7 @@ impl BackedCsrReader {
         shard_idx: usize,
         s_start: u64,
         group: &[(u64, usize)],
+        admit: bool,
         scatter: &mut F,
     ) -> Result<bool>
     where
@@ -1411,7 +1456,7 @@ impl BackedCsrReader {
             let rg = match &current {
                 Some((cur_g, rg)) if *cur_g == g => rg,
                 _ => {
-                    current = Some((g, self.row_group(shard_idx, &layout, g)?));
+                    current = Some((g, self.row_group(shard_idx, &layout, g, admit)?));
                     &current.as_ref().expect("just set").1
                 }
             };

@@ -602,6 +602,26 @@ impl<K: CacheKeyKind, V: SizeHint> ShardCache<K, V> {
         key: K,
         decode: impl FnOnce() -> Result<Arc<V>>,
     ) -> Result<Arc<V>> {
+        self.get_or_decode_admit(key, decode, true)
+    }
+
+    /// [`Self::get_or_decode`] with **admission control**: a hit is served
+    /// either way, but a miss is inserted only when `admit` is true. The
+    /// caller passes `false` when it knows the working set of the read it is
+    /// serving does not fit the budget — inserting would then evict entries
+    /// that never get read again before they are gone (a scan larger than the
+    /// cache is the one access pattern an LRU makes strictly worse), paying
+    /// the eviction churn and the resident bytes for zero hits. The decode is
+    /// still deduplicated across concurrent callers through the singleflight
+    /// table, and it still counts as a miss — a `misses` that grows while
+    /// `bytes_inserted` stays flat is how an over-budget working set reads on
+    /// the counters.
+    pub(super) fn get_or_decode_admit(
+        &self,
+        key: K,
+        decode: impl FnOnce() -> Result<Arc<V>>,
+        admit: bool,
+    ) -> Result<Arc<V>> {
         let kind = key.kind();
         loop {
             // Cache hit fast path.
@@ -669,9 +689,11 @@ impl<K: CacheKeyKind, V: SizeHint> ShardCache<K, V> {
             // before `_guard` drops — a post-removal observer sees the entry
             // once it re-acquires `in_flight`.
             let value = decode()?;
-            if let Some(ref cache_mutex) = self.cache {
-                let mut cache = cache_mutex.lock().unwrap();
-                cache.put_with_budget(key, Arc::clone(&value));
+            if admit {
+                if let Some(ref cache_mutex) = self.cache {
+                    let mut cache = cache_mutex.lock().unwrap();
+                    cache.put_with_budget(key, Arc::clone(&value));
+                }
             }
             return Ok(value);
         }

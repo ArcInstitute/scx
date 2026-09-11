@@ -3082,13 +3082,17 @@ absolute_floors:
 #        gather takes is now emitted into runs[].extra per scenario, precisely
 #        so it can be floored — the shape `accel_de`'s `de_route_csc_direct`
 #        uses above, which turns a silent dispatch flip into a hard failure.
-#        Deferred because it cannot discriminate anything yet: all three floored
-#        fixtures (tabula_sapiens_100k / census_500k / census_1m `_auto.scx`)
-#        are `format_version = 3`, i.e. UNFRAMED, and `block_index_eligible`
-#        requires `shard_is_framed` — so the full-shard route is forced by the
-#        fixture, not chosen by the code, and a floor would read as coverage
-#        while providing none. That is exactly the failure this block exists to
-#        prevent.
+#        Deferred because it could not discriminate anything when written: the
+#        three floored fixtures (tabula_sapiens_100k / census_500k / census_1m
+#        `_auto.scx`) were `format_version = 3`, i.e. UNFRAMED, and
+#        `block_index_eligible` requires `shard_is_framed` — so the full-shard
+#        route was forced by the fixture, not chosen by the code, and a floor
+#        would have read as coverage while providing none. That is exactly the
+#        failure this block exists to prevent. **Status 2026-09-10:** `scx info
+#        --json` reports `format_version: 4` for `pbmc3k_auto.scx` and
+#        `tabula_sapiens_100k_auto.scx` (the PR-25 capture found `index_plan`'s
+#        scattered scenarios on them taking the row-group path), so step 1
+#        below is done for at least those two; steps 2–3 are still unauthored.
 #
 #        ACTIVATION, precisely (this is not a "move two rows up" — the rows
 #        below do not exist as YAML, they have to be authored):
