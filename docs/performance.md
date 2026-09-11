@@ -1436,17 +1436,17 @@ requested columns wider than one, into a run-local scratch — a scattered gene 
 serial loop.
 
 `cargo bench -p scx-accel --bench pseudobulk` on the Chimera worker `GPUCACE`, 12 cores,
-2026-09-11, both arms in one build of the PR-16 branch after its review round (the `before` arm
-is the replaced serial loop, replicated inline; both arms include the identical group-mapping
-step, so the scatter-only ratio is higher than shown). `Mean`, Criterion medians:
+2026-09-11, both arms in one build at commit `a4d09aa7` of the PR-16 branch (the `before` arm is
+the replaced serial loop, replicated inline; both arms include the identical group-mapping step,
+so the scatter-only ratio is higher than shown). `Mean`, Criterion medians:
 
 | Fixture | Groups | In-memory before → after | Streaming before → after |
 |---|--:|---|---|
-| 200k × 2 000 genes, 5 % (100 nnz/row) | 2 | 26.3 → 25.4 ms (1.03×, serial walk kept) | 39.3 → 29.2 ms (1.34×) |
-| | 64 | 33.4 → 17.0 ms (**1.96×**) | 51.2 → 19.4 ms (**2.64×**) |
-| | 2 048 | 86.1 → 19.4 ms (**4.44×**) | 102.3 → 29.0 ms (**3.53×**) |
-| 20k × 20 000 genes, 10 % (2 000 nnz/row) | 2 | 43.7 → 30.0 ms (**1.45×**, column blocks) | 80.1 → 44.9 ms (**1.78×**) |
-| | 64 | 115.8 → 11.7 ms (**9.90×**) | 154.6 → 45.2 ms (**3.42×**) |
+| 200k × 2 000 genes, 5 % (100 nnz/row) | 2 | 26.4 → 26.7 ms (0.99×, serial walk kept) | 43.0 → 32.2 ms (1.34×) |
+| | 64 | 32.5 → 17.5 ms (**1.86×**) | 51.9 → 19.9 ms (**2.61×**) |
+| | 2 048 | 86.0 → 19.5 ms (**4.42×**) | 104.9 → 29.2 ms (**3.60×**) |
+| 20k × 20 000 genes, 10 % (2 000 nnz/row) | 2 | 43.9 → 25.9 ms (**1.70×**, column blocks) | 76.6 → 50.1 ms (**1.53×**) |
+| | 64 | 114.6 → 11.8 ms (**9.75×**) | 145.7 → 36.5 ms (**3.99×**) |
 
 The gains scale with how badly the serial loop was missing cache: with two group rows resident
 in L1 it was already memory-bound near the node's bandwidth, and no partition can read the
@@ -1482,8 +1482,10 @@ class, where the serial pydeseq2 fit runs slower; its RSS is within 70 MB of `ma
 the clean recapture at `benchmarks/comprehensive/results/raw/bench_csc_dispatch__bench_csc__pseudobulk_{csr,csc}__tabula_sapiens_100k.json`,
 the `main` arm under `results/raw/pr16_pseudobulk_base/`, the round-1 capture under
 `results/raw/pr16_pseudobulk_r1_dirty_tree/`. Every row carries `git_dirty: true`: the harness
-flags any `git status --porcelain` output, and this checkout keeps untracked scratch notes at the
-repo root; the job log is where the tracked-tree state and the extension hash are recorded.
+flags any `git status --porcelain` output, and this checkout keeps four untracked scratch notes
+at the repo root (not named here — tracked files do not cite them — and read by neither the
+harness nor the build); the job log records every porcelain line, the tracked-tree state and the
+extension's sha256. The rows themselves carry neither, which would take a harness change.
 Against `LATEST` (captured 2026-09-03 at `33d52cd0`) the gate reports both cells ~550 MB higher in
 peak RSS; the `main` arm shows the same figure, so that delta belongs to the merges between the two
 snapshots, not to this change.
