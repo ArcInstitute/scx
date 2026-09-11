@@ -597,6 +597,11 @@ class TestMetrics:
             "peak_bytes_in_cache",
             "full_shard_groups",
             "block_index_groups",
+            "row_group_hits",
+            "row_group_misses",
+            "row_group_evictions",
+            "row_group_bytes_inserted",
+            "row_group_duplicate_waiters",
         }
         for k, v in m.items():
             assert isinstance(v, int), f"{k} should be int, got {type(v)}"
@@ -647,6 +652,11 @@ class TestMetrics:
             "peak_bytes_in_cache",
             "full_shard_groups",
             "block_index_groups",
+            "row_group_hits",
+            "row_group_misses",
+            "row_group_evictions",
+            "row_group_bytes_inserted",
+            "row_group_duplicate_waiters",
         }
 
     def test_iter_skips_prefetch_after_warmup(self, unframed_scx_path):
@@ -778,9 +788,16 @@ class TestMemoryBudget:
         assert after["peak_bytes_in_cache"] > 0, (
             "peak_bytes_in_cache should advance once any shard is cached"
         )
-        # Without eviction the peak equals cumulative bytes_inserted.
+        # Without eviction the peak equals cumulative bytes_inserted. The gauge
+        # spans whole shards and row groups (one budget), so the general bound
+        # is `peak <= bytes_inserted + row_group_bytes_inserted`; this unframed
+        # fixture retains no row groups, so the two coincide.
+        assert after["row_group_bytes_inserted"] == 0, "unframed: no row groups"
         if after["evictions"] == 0:
             assert after["peak_bytes_in_cache"] == after["bytes_inserted"]
+        assert after["peak_bytes_in_cache"] <= (
+            after["bytes_inserted"] + after["row_group_bytes_inserted"]
+        )
 
 
 class TestBlockIndexAdoption:
@@ -1423,3 +1440,112 @@ class TestGilDuringTeardown:
             f"released only on return. Same-duration GIL-holding control scored "
             f"{control_leading} leading / {control_whole} whole, as expected."
         )
+
+
+class TestRowGroupCache:
+    """OPT-FORMATIO-1: on a framed file the block-index gather retains the row
+    groups it decodes, in the same LRU as whole shards, under `max_memory_mb`.
+    A second batch over the same rows is served as `row_group_hits`; the
+    whole-shard counters stay at zero on this path; the L2 prefetcher
+    pre-decodes a plan's groups when they fit `budget / (lookahead + 1)`."""
+
+    @staticmethod
+    def _dataset(path, **kw):
+        kw.setdefault("normalize", False)
+        kw.setdefault("cache_shards", 4)
+        kw.setdefault("sort_by_shard", True)
+        kw.setdefault("scatter_block_index", True)
+        return pyscx.IndexPlanDataset(path, **kw)
+
+    @staticmethod
+    def _plan(seed=0, n=8):
+        rng = np.random.default_rng(seed)
+        return [(int(rng.integers(0, 400)), int(rng.integers(0, 400))) for _ in range(n)]
+
+    def test_second_plan_is_served_from_the_row_group_lru(self, tmp_path):
+        path = str(tmp_path / "framed_rg.scx")
+        TestBlockIndexAdoption._write_framed(path)
+        ds = self._dataset(path, lookahead=0)
+        plan = self._plan()
+        batches = list(ds.iter_with_plans(iter([list(plan), list(plan)]), lookahead=0))
+        assert len(batches) == 2
+        assert np.array_equal(batches[0]["X"], batches[1]["X"]), (
+            "the cached groups must reproduce the decoded ones exactly"
+        )
+        cm = ds.cache_metrics()
+        assert cm["block_index_groups"] > 0 and cm["full_shard_groups"] == 0, cm
+        assert cm["row_group_misses"] > 0, "premise: the first plan decoded groups"
+        assert cm["row_group_hits"] == cm["row_group_misses"], (
+            "the second identical plan must hit every group the first decoded: "
+            f"{cm}"
+        )
+        assert cm["hits"] + cm["misses"] == 0, (
+            "the row-group path never touches the whole-shard counters"
+        )
+        assert cm["row_group_bytes_inserted"] > 0
+        assert cm["peak_bytes_in_cache"] <= (
+            cm["bytes_inserted"] + cm["row_group_bytes_inserted"]
+        )
+
+    def test_lookahead_pre_decodes_the_plan_row_groups(self, tmp_path):
+        """One plan, `lookahead=1`: the prefetcher warms the plan's groups (they
+        fit their budget share by a wide margin here) and the gather hits them.
+        The same single plan at `lookahead=0` misses them all — a second
+        identical plan would hit through L1 either way, so the arm is one plan."""
+        path = str(tmp_path / "framed_rg_l2.scx")
+        TestBlockIndexAdoption._write_framed(path)
+        plan = self._plan(seed=3)
+
+        ds = self._dataset(path, lookahead=1)
+        it = ds.iter_with_plans(iter([list(plan)]), lookahead=1)
+        list(it)
+        pm = it.metrics()["prefetch"]
+        cm = ds.cache_metrics()
+        assert pm["prefetch_skipped_block_index"] > 0, pm
+        assert pm["prefetch_tasks_spawned"] == 0, (
+            "a row-group warm is not a whole-shard spawn"
+        )
+        assert cm["row_group_misses"] > 0, cm
+        assert cm["row_group_hits"] == cm["row_group_misses"], (
+            f"the gather must find every group the prefetcher decoded: {cm}"
+        )
+
+        ds0 = self._dataset(path, lookahead=0)
+        list(ds0.iter_with_plans(iter([list(plan)]), lookahead=0))
+        cm0 = ds0.cache_metrics()
+        assert cm0["row_group_misses"] > 0
+        assert cm0["row_group_hits"] == 0, f"no prefetch ran at lookahead=0: {cm0}"
+
+    def test_kill_switch_disables_retention(self, tmp_path):
+        """`SCX_ROW_GROUP_CACHE=0` (read once per process, hence a subprocess)
+        keeps the block-index route but retains nothing: every `row_group_*`
+        counter stays 0 across two identical plans."""
+        import json
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        path = str(tmp_path / "framed_rg_off.scx")
+        TestBlockIndexAdoption._write_framed(path)
+        plan = self._plan(seed=5)
+        src = textwrap.dedent(
+            f"""
+            import json, pyscx
+            ds = pyscx.IndexPlanDataset({path!r}, normalize=False, cache_shards=4,
+                                        sort_by_shard=True, lookahead=0,
+                                        scatter_block_index=True)
+            plan = {plan!r}
+            list(ds.iter_with_plans(iter([list(plan), list(plan)]), lookahead=0))
+            print(json.dumps(ds.cache_metrics()))
+            """
+        )
+        env = {**os.environ, "SCX_ROW_GROUP_CACHE": "0"}
+        r = subprocess.run(
+            [sys.executable, "-c", src], capture_output=True, text=True, env=env
+        )
+        assert r.returncode == 0, r.stderr
+        cm = json.loads(r.stdout.strip().splitlines()[-1])
+        assert cm["block_index_groups"] > 0, cm
+        assert cm["row_group_hits"] == 0 and cm["row_group_misses"] == 0, cm
+        assert cm["row_group_bytes_inserted"] == 0, cm

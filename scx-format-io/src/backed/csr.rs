@@ -5,6 +5,7 @@
 
 use super::index::ShardEntryLite;
 use super::*;
+use crate::reader::{assemble_row_run, FramedShardLayout};
 
 // ---------------------------------------------------------------------------
 // BackedCsrReader
@@ -98,16 +99,25 @@ pub struct BackedCsrReader {
     /// [`Self::set_scatter_block_index`]) so the off-switch disables both the L1
     /// gather and the L2 prefetch skip, not just the prefetch.
     scatter_block_index: bool,
-    /// Lazy per-shard "is framed?" memo for [`Self::shard_is_framed`], filled on
-    /// first probe (lock-free `AtomicU8`: 0 = unknown, 1 = framed, 2 = unframed).
-    /// `block_index_eligible` is called per prefetch-candidate + per gather group
-    /// on the training hot path; caching the 76-byte header parse avoids
-    /// re-reading it every batch for shards whose framing never changes.
-    framed_cache: OnceLock<Vec<AtomicU8>>,
+    /// Per-reader gate for retaining decoded row groups in the shard LRU
+    /// (OPT-FORMATIO-1). Defaults to `SCX_ROW_GROUP_CACHE`; see
+    /// [`Self::set_row_group_cache`]. With it off, a framed scattered read
+    /// decodes its touched groups and drops them, as before the row-group
+    /// entries existed.
+    row_group_cache: bool,
+    /// Lazy per-shard framing memo for [`Self::framed_layout`]: `None` once a
+    /// shard is known to be unframed (legacy v1), `Some` the resolved
+    /// [`FramedShardLayout`] otherwise. `block_index_eligible` probes it per
+    /// prefetch candidate + per gather group on the training hot path, and the
+    /// block-index decode re-uses the resolved layout instead of re-reading the
+    /// header and re-parsing the block index every call. Only a successful
+    /// resolve is stored, so an I/O error is retried next time.
+    framed_layouts: OnceLock<Vec<OnceLock<Option<Arc<FramedShardLayout>>>>>,
     /// Memo for [`Self::stored_value_encoding`]: the widest value encoding
     /// across this reader's shard family, folded from every shard header on
-    /// first request. Immutable for the reader's lifetime, like `framed_cache`;
-    /// only a successful fold is stored, so an I/O error is retried next time.
+    /// first request. Immutable for the reader's lifetime, like
+    /// `framed_layouts`; only a successful fold is stored, so an I/O error is
+    /// retried next time.
     stored_encoding: OnceLock<Option<scx_codec::ValueEncoding>>,
     /// Optional pool for this reader's own parallel decode
     /// ([`Self::warm_shards`]). `None` — the default for every constructor —
@@ -164,13 +174,56 @@ impl BackedCsrReader {
         Self::new_with_byte_budget(reader, cache_shards, usize::MAX)
     }
 
+    /// The byte budget a **count-only** reader actually runs with.
+    ///
+    /// `cache_shards` bounds whole shards by count; a decoded row group has no
+    /// count cap (the LRU holds them by bytes alone, see
+    /// [`SharedShardCache`]), so a `usize::MAX` budget would let a long-lived
+    /// reader's row groups grow without limit. Instead the count cap is
+    /// converted into the bytes it already implies: `cache_shards × the
+    /// largest decoded shard` (from the catalog's per-shard `nnz` + row range,
+    /// sized by the same model the LRU charges). That never binds before the
+    /// count cap for whole shards — every shard is at most the largest — so
+    /// whole-shard behaviour is unchanged, and row groups are bounded at "the
+    /// memory `cache_shards` whole shards could take".
+    ///
+    /// A finite `bytes_budget` is returned unchanged. Without a cache
+    /// (`cache_shards == 0`), or when any shard lacks stats (no `nnz` to size
+    /// by), or on an empty family, the budget stays `usize::MAX` and the LRU
+    /// stays whole-shard-only ([`ShardCache::caches_groups`] is false).
+    fn count_only_byte_budget(
+        cache_shards: usize,
+        bytes_budget: usize,
+        sorted: &[&CatalogViewEntry],
+    ) -> usize {
+        if bytes_budget != usize::MAX || cache_shards == 0 {
+            return bytes_budget;
+        }
+        let mut max_shard_bytes = 0usize;
+        for e in sorted {
+            let Some(stats) = e.stats.as_ref() else {
+                return usize::MAX;
+            };
+            let rows = stats.major_end.saturating_sub(stats.major_start) as usize;
+            let nnz = stats.nnz as usize;
+            max_shard_bytes = max_shard_bytes.max(csr_component_bytes(rows + 1, nnz, nnz));
+        }
+        if max_shard_bytes == 0 {
+            return usize::MAX;
+        }
+        cache_shards.saturating_mul(max_shard_bytes)
+    }
+
     /// Create a new backed reader for X shards with both a count cap and a
     /// byte cap on the LRU. Inserts evict oldest entries until both caps
     /// are satisfied (see `cache::WeightedLruCache::put_with_budget`).
     ///
     /// `cache_shards`: count cap on cached decoded shards (0 = no cache).
-    /// `bytes_budget`: byte cap on cumulative decoded shard bytes; pass
-    /// `usize::MAX` for count-only behavior.
+    /// `bytes_budget`: byte cap on cumulative decoded shard bytes **and** the
+    /// decoded row groups a framed scattered read retains; pass `usize::MAX`
+    /// for count-only behavior on whole shards, which
+    /// [`Self::count_only_byte_budget`] turns into the bytes that count implies
+    /// so row groups stay bounded too.
     pub fn new_with_byte_budget(
         reader: ScxReader,
         cache_shards: usize,
@@ -190,6 +243,7 @@ impl BackedCsrReader {
         let n_vars = reader.n_vars() as usize;
         let n_obs = reader.n_obs() as usize;
         let prefetch_count = cache_shards.max(2);
+        let bytes_budget = Self::count_only_byte_budget(cache_shards, bytes_budget, &sorted);
         BackedCsrReader {
             reader,
             index,
@@ -203,7 +257,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
-            framed_cache: OnceLock::new(),
+            row_group_cache: row_group_cache_enabled(),
+            framed_layouts: OnceLock::new(),
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
@@ -245,7 +300,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
-            framed_cache: OnceLock::new(),
+            row_group_cache: row_group_cache_enabled(),
+            framed_layouts: OnceLock::new(),
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
@@ -276,6 +332,7 @@ impl BackedCsrReader {
         };
         let n_obs = reader.n_obs() as usize;
         let prefetch_count = cache_shards.max(2);
+        let bytes_budget = Self::count_only_byte_budget(cache_shards, usize::MAX, &sorted);
         BackedCsrReader {
             reader,
             index,
@@ -284,12 +341,13 @@ impl BackedCsrReader {
             layer_name: None,
             x_sorted_entries,
             sorted_entries: Vec::new(),
-            shard_cache: SharedShardCache::new(cache_shards, usize::MAX),
+            shard_cache: SharedShardCache::new(cache_shards, bytes_budget),
             file_id: 0,
             prefetch_count,
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
-            framed_cache: OnceLock::new(),
+            row_group_cache: row_group_cache_enabled(),
+            framed_layouts: OnceLock::new(),
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
@@ -336,6 +394,7 @@ impl BackedCsrReader {
         // n_obs for layers is the same as for X — layer shards cover the same rows.
         let n_obs = reader.n_obs() as usize;
         let prefetch_count = cache_shards.max(2);
+        let bytes_budget = Self::count_only_byte_budget(cache_shards, bytes_budget, &sorted_layer);
         BackedCsrReader {
             reader,
             index,
@@ -349,7 +408,8 @@ impl BackedCsrReader {
             prefetch_count,
             cache_shards,
             scatter_block_index: scatter_block_index_enabled(),
-            framed_cache: OnceLock::new(),
+            row_group_cache: row_group_cache_enabled(),
+            framed_layouts: OnceLock::new(),
             stored_encoding: OnceLock::new(),
             #[cfg(feature = "parallel")]
             cpu_pool: None,
@@ -389,47 +449,70 @@ impl BackedCsrReader {
         self.shard_cache.contains(self.file_id, shard_idx)
     }
 
-    /// Whether a request-group of `group_len` rows landing in `shard_idx` would
-    /// Cheap "is this shard row-group framed (v2)?" probe. Reads only the
-    /// 76-byte shard header from the mmap (no payload decode, no catalog linear
-    /// scan — resolves the section via the retained [`ShardEntryLite`]), and
-    /// tests `shard_format_version > DEFAULT_WRITE_SHARD_FORMAT_VERSION`. Used by
-    /// [`Self::block_index_eligible`] to gate the block-index path **per shard**:
-    /// a v4 file may mix v2-framed and legacy v1 shards, so a file-level version
-    /// check would misclassify. Returns `false` on any missing entry / header
-    /// parse error (caller then falls back to the full-shard path). The header
-    /// parse is memoized per shard in `framed_cache` (a shard's framing is
-    /// immutable for the reader's lifetime), so repeated hot-path probes cost one
-    /// atomic load.
-    fn shard_is_framed(&self, shard_idx: usize) -> bool {
-        let cache = self
-            .framed_cache
-            .get_or_init(|| (0..self.shard_count()).map(|_| AtomicU8::new(0)).collect());
-        // 0 = unknown, 1 = framed, 2 = unframed. Out-of-range shard_idx (should
-        // not happen) falls through to a direct (uncached) compute.
-        if let Some(slot) = cache.get(shard_idx) {
-            match slot.load(Ordering::Relaxed) {
-                1 => return true,
-                2 => return false,
-                _ => {}
-            }
-            let framed = self.compute_shard_is_framed(shard_idx);
-            slot.store(if framed { 1 } else { 2 }, Ordering::Relaxed);
-            return framed;
+    /// The resolved framing layout of `shard_idx`, or `None` if the shard is
+    /// not row-group framed (legacy v1) — or on any missing entry / header
+    /// parse error, in which case the caller falls back to the full-shard path
+    /// and that path reports the error properly. A v4 file may mix v2-framed
+    /// and legacy v1 shards, so this is **per shard**, never a file-level
+    /// version check.
+    ///
+    /// Memoized per shard in `framed_layouts` (a shard's framing is immutable
+    /// for the reader's lifetime), so the hot-path probes in
+    /// [`Self::block_index_eligible`] cost one `OnceLock` load, and the
+    /// block-index decode itself re-uses the header scalars, sub-stream
+    /// ranges and resolved block index instead of re-deriving them per call.
+    /// Resolves the shard's real catalog entry once (`full_entry_at_offset` is
+    /// a linear scan — that used to run on every scattered decode) so the
+    /// `stats`-authenticated minor extent is reconciled, exactly as the
+    /// whole-shard decode does. Only `Ok` is memoized; an `Err` is retried.
+    pub(crate) fn framed_layout(&self, shard_idx: usize) -> Option<Arc<FramedShardLayout>> {
+        let memo = self
+            .framed_layouts
+            .get_or_init(|| (0..self.shard_count()).map(|_| OnceLock::new()).collect());
+        let Some(slot) = memo.get(shard_idx) else {
+            // Out-of-range shard_idx (should not happen): direct, uncached.
+            return self.resolve_framed_layout(shard_idx).ok().flatten();
+        };
+        if let Some(resolved) = slot.get() {
+            return resolved.clone();
         }
-        self.compute_shard_is_framed(shard_idx)
+        match self.resolve_framed_layout(shard_idx) {
+            Ok(resolved) => {
+                // A peer may have raced us; either value is the same fact.
+                let _ = slot.set(resolved.clone());
+                slot.get().cloned().flatten().or(resolved)
+            }
+            Err(_) => None,
+        }
     }
 
-    /// Uncached header read backing [`Self::shard_is_framed`].
-    fn compute_shard_is_framed(&self, shard_idx: usize) -> bool {
+    /// Uncached resolve backing [`Self::framed_layout`].
+    fn resolve_framed_layout(&self, shard_idx: usize) -> Result<Option<Arc<FramedShardLayout>>> {
         let Some(&lite) = self.shard_entry(shard_idx) else {
-            return false;
+            return Ok(None);
         };
-        let entry = lite.into_transient_full_entry();
-        self.reader
-            .read_shard_header(&entry)
-            .map(|h| h.shard_format_version > crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION)
-            .unwrap_or(false)
+        // The real entry carries `stats` (the authenticated minor extent) and
+        // the name error messages cite; the transient one is the fallback the
+        // header probe always had.
+        let transient;
+        let entry = match self
+            .reader
+            .full_entry_at_offset(lite.offset, lite.section_type)
+        {
+            Some(e) => e,
+            None => {
+                transient = lite.into_transient_full_entry();
+                &transient
+            }
+        };
+        Ok(self.reader.framed_shard_layout(entry)?.map(Arc::new))
+    }
+
+    /// Cheap "is this shard row-group framed (v2)?" probe — the memoized
+    /// [`Self::framed_layout`] answer. Used by [`Self::block_index_eligible`]
+    /// to gate the block-index path per shard.
+    fn shard_is_framed(&self, shard_idx: usize) -> bool {
+        self.framed_layout(shard_idx).is_some()
     }
 
     /// Override the per-reader block-index gate (default from
@@ -438,6 +521,37 @@ impl BackedCsrReader {
     /// gather adoption too, not just the L2 prefetch skip.
     pub fn set_scatter_block_index(&mut self, enabled: bool) {
         self.scatter_block_index = enabled;
+    }
+
+    /// Override the per-reader row-group retention gate (default from
+    /// `SCX_ROW_GROUP_CACHE`). Off, a framed scattered read decodes its
+    /// touched groups and drops them — the pre-OPT-FORMATIO-1 behaviour — and
+    /// none of the `row_group_*` counters move. Exists for the same-build A/B
+    /// and for tests; takes `&mut self` so it is set before the reader is
+    /// shared.
+    pub fn set_row_group_cache(&mut self, enabled: bool) {
+        self.row_group_cache = enabled;
+    }
+
+    /// The live byte budget of the shard LRU this reader draws on — shared by
+    /// whole shards and row groups. `usize::MAX` for a count-only cache that
+    /// could not be sized (see [`Self::count_only_byte_budget`]), `0` when no
+    /// cache is installed. The L2 prefetcher sizes a row-group warm against
+    /// this.
+    pub fn cache_bytes_budget(&self) -> usize {
+        self.shard_cache.bytes_budget()
+    }
+
+    /// Bytes currently resident in the shard LRU — whole shards and row groups
+    /// together, the quantity the byte budget bounds.
+    pub fn cache_bytes_used(&self) -> usize {
+        self.shard_cache.bytes_used()
+    }
+
+    /// Whether this reader retains decoded row groups: the per-reader gate is
+    /// on **and** the cache admits them (exists, finite budget).
+    fn retains_row_groups(&self) -> bool {
+        self.row_group_cache && self.shard_cache.caches_groups()
     }
 
     /// Run this reader's parallel shard warm ([`Self::warm_shards`]) on `pool`
@@ -475,13 +589,20 @@ impl BackedCsrReader {
     /// (row-group) scattered path rather than a full-shard decode. Eligible when
     /// the process-global `SCX_SCATTER_BLOCK_INDEX` kill-switch is on **and** this
     /// reader's per-reader `scatter_block_index` gate is on, the shard is not
-    /// already decoded in the LRU, the requested rows are a small fraction of the
-    /// shard (`group_len * ROW_RANGE_WINDOW_DIVISOR < shard_rows`), **and** the
-    /// shard is actually row-group framed. This is the single source of truth for
-    /// the block-index-vs-full-shard decision — it covers both the L1
-    /// `read_rows_with` gather and the L2 plan-prefetch warm-skip, so the gather
-    /// choice and the prefetch skip never drift. The framing header read is
-    /// ordered last so it only runs for cost-eligible, uncached candidates.
+    /// already decoded **whole** in the LRU, the requested rows are a small
+    /// fraction of the shard (`group_len * ROW_RANGE_WINDOW_DIVISOR <
+    /// shard_rows`), **and** the shard is actually row-group framed. This is the
+    /// single source of truth for the block-index-vs-full-shard decision — it
+    /// covers both the L1 `read_rows_with` gather and the L2 plan-prefetch
+    /// decision, so the gather choice and the prefetch never drift. The framing
+    /// probe is ordered last so it only runs for cost-eligible, uncached
+    /// candidates.
+    ///
+    /// Only the *whole-shard* entry disqualifies: a shard whose row groups are
+    /// resident stays eligible, and the block-index path then serves those
+    /// groups from the LRU (`row_group_hits`). A resident whole shard is the
+    /// cheapest source for any of its rows — slicing it beats decoding groups —
+    /// which is why that clause stays now that the group path caches too.
     pub fn block_index_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
         scatter_block_index_enabled()
             && self.scatter_block_index
@@ -498,8 +619,8 @@ impl BackedCsrReader {
     /// An all-unframed (legacy v1) file full-shard-decodes every scattered
     /// gather regardless of `scatter_block_index` — callers use this at open
     /// time to warn that the fast path is inert. Early-returns on the first
-    /// framed shard; reads only shard headers (no payload), memoized per shard
-    /// via `framed_cache`.
+    /// framed shard; reads only shard headers and block indexes (no payload),
+    /// memoized per shard via [`Self::framed_layout`].
     pub fn any_shard_framed(&self) -> bool {
         (0..self.shard_count()).any(|i| self.shard_is_framed(i))
     }
@@ -623,7 +744,8 @@ impl BackedCsrReader {
 
         // Plan each overlapping shard. A genuinely small window of an *uncached*
         // framed shard is decoded directly via the block-index row-range path
-        // (O(window); no full-shard decode, no cache pollution). Everything else
+        // (O(window); no full-shard decode — only the touched row groups enter
+        // the LRU, under the same byte budget). Everything else
         // — large windows, cached shards, unframed shards, repeated/sequential
         // access like the training loader — takes the full-decode + cache path.
         // The shared cache is keyed by `(file_id, shard)`, so membership is
@@ -704,9 +826,9 @@ impl BackedCsrReader {
         let mut data = vec![0f32; total_nnz];
 
         // Phase 2 — copy each window into its pre-carved slot. Row-range plans
-        // first (they never enter the cache; a `None` means the shard is not
-        // framed and joins the full-path chunks), then full-path plans in
-        // chunks of `cache_shards`.
+        // first (they retain only their touched row groups, never the whole
+        // shard; a `None` means the shard is not framed and joins the full-path
+        // chunks), then full-path plans in chunks of `cache_shards`.
         let mut full_plans: Vec<usize> = Vec::with_capacity(plans.len());
         for (i, plan) in plans.iter().enumerate() {
             if plan.use_row_range {
@@ -877,46 +999,122 @@ impl BackedCsrReader {
     /// Decode just rows `[local_start, local_end)` of shard `shard_idx` directly
     /// from its row-group block index (O(window)), returning `None` when the
     /// shard is not row-group framed so the caller can fall back to a full-shard
-    /// decode. Byte-identical to decoding the whole shard and slicing.
+    /// decode. Byte-identical to decoding the whole shard and slicing. The
+    /// touched groups go through the row-group LRU ([`Self::row_group`]), so a
+    /// repeated small window is served without a decode.
     fn try_row_range_slice(
         &self,
         shard_idx: usize,
         local_start: usize,
         local_end: usize,
     ) -> Result<Option<ScxCsr>> {
-        // Recover the *real* catalog entry for this shard. The `ShardEntryLite`
-        // table drops the name/checksum, but `full_entry_at_offset` restores the
-        // full entry the block-index decode needs. `(offset, section_type)`
-        // uniquely identifies the section.
-        let Some((offset, section_type)) = self
-            .shard_entry(shard_idx)
-            .map(|l| (l.offset, l.section_type))
-        else {
+        let Some(layout) = self.framed_layout(shard_idx) else {
             return Ok(None);
         };
-        let Some(entry) = self.reader.full_entry_at_offset(offset, section_type) else {
-            return Ok(None);
-        };
+        // A cache hit never reaches `section_bytes`, so the freshness check
+        // has to be here too — see `read_shard_cached_arc`.
+        self.check_fresh()?;
         let n = local_end - local_start;
-        match self
-            .reader
-            .decode_block_index_row_runs(entry, &[(local_start, n)])?
-        {
-            Some(mut runs) => {
-                let (indptr, indices, data) = runs.pop().ok_or_else(|| {
-                    ScxError::Io(std::io::Error::other(
-                        "block-index row-range decode returned no runs",
-                    ))
-                })?;
-                Ok(Some(ScxCsr::new_unchecked(
-                    (n, self.n_vars),
-                    indptr,
-                    indices,
-                    data,
-                )))
-            }
-            None => Ok(None),
+        layout.check_run(local_start, n)?;
+        let (indptr, indices, data) = assemble_row_run(&layout, local_start, n, |g| {
+            self.row_group(shard_idx, &layout, g)
+        })?;
+        Ok(Some(ScxCsr::new_unchecked(
+            (n, self.n_vars),
+            indptr,
+            indices,
+            data,
+        )))
+    }
+
+    /// Row group `g` of framed shard `shard_idx`: from the shard LRU when
+    /// resident, else decoded (once, across concurrent callers — the same
+    /// singleflight as whole shards) and inserted under the byte budget. With
+    /// row-group retention off ([`Self::set_row_group_cache`], a count-only
+    /// cache, or no cache) it decodes uncached and touches no counter.
+    fn row_group(
+        &self,
+        shard_idx: usize,
+        layout: &Arc<FramedShardLayout>,
+        g: usize,
+    ) -> Result<Arc<ScxCsr>> {
+        if !self.retains_row_groups() {
+            return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
+        let shard_cache = Arc::clone(&self.shard_cache);
+        shard_cache.get_or_decode(CacheKey::Group(self.file_id, shard_idx, g), || {
+            self.reader.decode_framed_row_group(layout, g).map(Arc::new)
+        })
+    }
+
+    /// Bytes the row groups `rows` (global row ids in `shard_idx`) touch would
+    /// occupy in the LRU, sized from the block index **without decoding**.
+    /// `0` when the shard is unframed, out of range, or this reader does not
+    /// retain row groups — i.e. when a warm could not retain anything. The L2
+    /// prefetcher sums this over a plan and warms only a plan that fits its
+    /// share of the budget; see `scx-loader`'s plan engine.
+    pub fn planned_row_group_bytes(&self, shard_idx: usize, rows: &[u64]) -> usize {
+        if !self.retains_row_groups() {
+            return 0;
+        }
+        let Some(layout) = self.framed_layout(shard_idx) else {
+            return 0;
+        };
+        let Some((s_start, _)) = self.index.shard_range(shard_idx) else {
+            return 0;
+        };
+        let mut groups = Self::touched_groups(&layout, s_start, rows);
+        groups.dedup();
+        groups.into_iter().map(|g| layout.group_bytes(g)).sum()
+    }
+
+    /// Decode the row groups `rows` (global row ids in `shard_idx`) touch into
+    /// the LRU ahead of a gather, so the gather serves them as
+    /// `row_group_hits`. Returns the number of distinct groups fetched (hit or
+    /// decoded). `Ok(0)` when the shard is unframed or this reader does not
+    /// retain row groups — nothing to warm into. Rows outside the shard are an
+    /// error, as on the gather.
+    pub fn warm_row_groups(&self, shard_idx: usize, rows: &[u64]) -> Result<usize> {
+        if !self.retains_row_groups() || rows.is_empty() {
+            return Ok(0);
+        }
+        let Some(layout) = self.framed_layout(shard_idx) else {
+            return Ok(0);
+        };
+        let (s_start, s_end) =
+            self.index
+                .shard_range(shard_idx)
+                .ok_or(ScxError::ShardIndexOutOfBounds {
+                    index: shard_idx,
+                    count: self.index.n_shards(),
+                })?;
+        for &row in rows {
+            if row < s_start || row >= s_end {
+                return Err(ScxError::Io(std::io::Error::other(format!(
+                    "row {row} is outside shard {shard_idx} ({s_start}..{s_end})"
+                ))));
+            }
+            layout.check_run((row - s_start) as usize, 1)?;
+        }
+        self.check_fresh()?;
+        let mut groups = Self::touched_groups(&layout, s_start, rows);
+        groups.dedup();
+        for &g in &groups {
+            self.row_group(shard_idx, &layout, g)?;
+        }
+        Ok(groups.len())
+    }
+
+    /// Sorted (not deduplicated) group indices of `rows`, each clamped into
+    /// the shard by `find_group`'s saturating search — callers that need an
+    /// error for an out-of-shard row check before calling.
+    fn touched_groups(layout: &FramedShardLayout, s_start: u64, rows: &[u64]) -> Vec<usize> {
+        let mut groups: Vec<usize> = rows
+            .iter()
+            .map(|&row| layout.find_group(row.saturating_sub(s_start) as usize))
+            .collect();
+        groups.sort_unstable();
+        groups
     }
 
     /// Read specific row indices as a scipy-compatible `ScxCsr`, in request
@@ -931,17 +1129,18 @@ impl BackedCsrReader {
     /// touched shard gives the exact per-row lengths — hence an exact
     /// request-order `indptr` — and the [`Self::read_rows_with`] scatter then
     /// copies every row straight into its window. Each touched shard is
-    /// decoded once; a sparse request group on a cold row-group-framed shard is
-    /// decoded by row group through the block index and is **not** inserted
-    /// into the LRU (see [`Self::block_index_eligible`]), so repeated small
-    /// gathers over one region re-decode row groups rather than paying a
-    /// full-shard decode each. Peak memory is the result plus the shard cache,
-    /// plus up to `cache_shards` shards decoding in flight while
-    /// [`Self::warm_shards`] fills that cache (a full LRU is evicted only as
-    /// each new shard lands, so at most `2 × cache_shards` decoded shards sit
-    /// beside the result) and one shard's block-index transient — not a
-    /// per-row `ScxCsr` per requested row and a second copy of the result, as
-    /// before.
+    /// decoded once; a sparse request group on a row-group-framed shard that
+    /// is not resident whole is decoded by row group through the block index
+    /// (see [`Self::block_index_eligible`]), and the touched groups are
+    /// retained in the LRU under the shared byte budget, so repeated small
+    /// gathers over one region are served from cache rather than re-decoding
+    /// groups or paying a full-shard decode each. Peak memory is the result
+    /// plus the shard cache (whole shards and row groups, one budget), plus up
+    /// to `cache_shards` shards decoding in flight while [`Self::warm_shards`]
+    /// fills that cache (a full LRU is evicted only as each new shard lands, so
+    /// at most `2 × cache_shards` decoded shards sit beside the result) and one
+    /// row group decoding — not a per-row `ScxCsr` per requested row and a
+    /// second copy of the result, as before.
     pub fn read_row_indices(&self, rows: &[u64]) -> Result<ScxCsr> {
         if rows.is_empty() {
             return Ok(Self::empty_csr(self.n_vars));
@@ -1167,11 +1366,18 @@ impl BackedCsrReader {
     }
 
     /// Scatter one shard's request group directly from the block index, for
-    /// **row-group-framed (v2)** shards: coalesce the request into consecutive
-    /// runs and decode only the touched row-groups via the block index
-    /// ([`ScxReader::decode_block_index_row_runs`]). Returns `Ok(false)` (nothing
-    /// scattered) for a non-framed shard so the caller falls back to full-shard
-    /// decode. Output is byte-identical to a full decode + slice.
+    /// **row-group-framed (v2)** shards: walk the (row-sorted) group, fetch each
+    /// touched row group once through the shard LRU ([`Self::row_group`] —
+    /// a hit, or a decode of that group alone), and scatter every requested
+    /// row straight out of it. Returns `Ok(false)` (nothing scattered) for a
+    /// non-framed shard so the caller falls back to full-shard decode. Output
+    /// is byte-identical to a full decode + slice.
+    ///
+    /// Returns `Ok(true)` whether the groups were decoded on this call or
+    /// served from the LRU — both are the block-index route, and
+    /// `block_index_groups` counts both. There is no intermediate run-local
+    /// CSR any more: the pre-OPT-FORMATIO-1 path copied every row into one and
+    /// then scattered it again.
     fn scatter_group_via_block_index<F>(
         &self,
         shard_idx: usize,
@@ -1182,55 +1388,37 @@ impl BackedCsrReader {
     where
         F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
     {
-        // Same consecutive-run coalescing as the sidecar path (absorbs gaps and
-        // duplicate requests); each run is (run_start_local, run_len).
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        let mut run_min = (group[0].0 - s_start) as usize;
-        let mut run_max = run_min;
-        for &(row, _) in &group[1..] {
-            let local = (row - s_start) as usize;
-            if local <= run_max + 1 {
-                run_max = run_max.max(local);
-            } else {
-                runs.push((run_min, run_max - run_min + 1));
-                run_min = local;
-                run_max = local;
-            }
-        }
-        runs.push((run_min, run_max - run_min + 1));
-
-        let Some((offset, section_type)) = self
-            .shard_entry(shard_idx)
-            .map(|l| (l.offset, l.section_type))
-        else {
-            return Ok(false);
-        };
-        let Some(entry) = self.reader.full_entry_at_offset(offset, section_type) else {
-            return Ok(false);
-        };
-
         // `None` ⇒ shard is not row-group-framed ⇒ caller falls back; nothing
         // scattered yet (all-or-nothing, same contract as the sidecar path).
-        let decoded = match self.reader.decode_block_index_row_runs(entry, &runs)? {
-            Some(d) => d,
-            None => return Ok(false),
+        let Some(layout) = self.framed_layout(shard_idx) else {
+            return Ok(false);
         };
-
-        let mut gi = 0usize;
-        for (&(run_start, _run_len), (indptr, indices, data)) in runs.iter().zip(&decoded) {
-            while gi < group.len() {
-                let (row, orig_pos) = group[gi];
-                let in_run = (row - s_start) as usize - run_start;
-                if in_run >= indptr.len() - 1 {
-                    break;
-                }
-                let lo = indptr[in_run] as usize;
-                let hi = indptr[in_run + 1] as usize;
-                scatter(orig_pos, &indices[lo..hi], &data[lo..hi])?;
-                gi += 1;
-            }
+        // A cache hit never reaches `section_bytes`, so the freshness check
+        // has to be here too — see `read_shard_cached_arc`.
+        self.check_fresh()?;
+        // Validate every requested row against the shard's own row count
+        // before any group indexing — `group` is built from `ShardStats`
+        // ranges, which are not otherwise checked against the header.
+        for &(row, _) in group {
+            layout.check_run((row - s_start) as usize, 1)?;
         }
-        debug_assert_eq!(gi, group.len(), "block-index scatter left rows unscattered");
+
+        let mut current: Option<(usize, Arc<ScxCsr>)> = None;
+        for &(row, orig_pos) in group {
+            let local = (row - s_start) as usize;
+            let g = layout.find_group(local);
+            let rg = match &current {
+                Some((cur_g, rg)) if *cur_g == g => rg,
+                _ => {
+                    current = Some((g, self.row_group(shard_idx, &layout, g)?));
+                    &current.as_ref().expect("just set").1
+                }
+            };
+            let in_group = local - layout.span(g).row_start as usize;
+            let lo = rg.indptr[in_group] as usize;
+            let hi = rg.indptr[in_group + 1] as usize;
+            scatter(orig_pos, &rg.indices[lo..hi], &rg.data[lo..hi])?;
+        }
         Ok(true)
     }
 
@@ -1571,7 +1759,9 @@ impl BackedCsrReader {
         // keyed by `(file_id, shard_idx)`; this reader owns the decode (it is
         // mmap/catalog-specific).
         let shard_cache = Arc::clone(&self.shard_cache);
-        shard_cache.get_or_decode((self.file_id, shard_idx), || self.decode_shard(shard_idx))
+        shard_cache.get_or_decode(CacheKey::Shard(self.file_id, shard_idx), || {
+            self.decode_shard(shard_idx)
+        })
     }
 
     /// Decode shard `shard_idx` from the underlying reader and trigger

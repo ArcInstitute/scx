@@ -233,6 +233,32 @@ def test_arm_exports_are_actually_placed_in_the_setup_commands():
     )
 
 
+def test_row_group_cache_kill_switch_is_forwarded_to_workers(monkeypatch):
+    """The OPT-FORMATIO-1 same-build A/B is `SCX_ROW_GROUP_CACHE=0` on the
+    orchestrator. submitit does not propagate the orchestrator's environment,
+    and pyscx caches the knob in a `OnceLock` on first read — so the export has
+    to be in the worker's setup commands, ahead of the env activation, or the
+    "off" arm silently measures the "on" build."""
+    from benchmarks.comprehensive.scripts.run_parallel import _slurm_setup_cmds
+
+    monkeypatch.setenv("SCX_ROW_GROUP_CACHE", "0")
+    cmds = _slurm_setup_cmds("scx-bench", "scx_compact_trial_g256")
+    assert "export SCX_ROW_GROUP_CACHE='0'" in cmds
+    knob = cmds.index("export SCX_ROW_GROUP_CACHE='0'")
+    activate = next(i for i, c in enumerate(cmds) if c.startswith("conda activate"))
+    assert knob < activate
+
+    monkeypatch.delenv("SCX_ROW_GROUP_CACHE", raising=False)
+    assert not any(
+        c.startswith("export SCX_ROW_GROUP_CACHE=") for c in _slurm_setup_cmds("scx-bench")
+    ), "unset on the orchestrator must stay unset (the shipped default) on the worker"
+
+    # The same-build A/B also points the workers at a specific checkout; the
+    # `.so` a worker imports is the one the orchestrator's PYTHONPATH names.
+    monkeypatch.setenv("PYTHONPATH", "/some/repo/pyscx/python")
+    assert "export PYTHONPATH='/some/repo/pyscx/python'" in _slurm_setup_cmds("scx-bench")
+
+
 def test_both_new_arm_families_route_to_the_gpu_conda_env():
     """nvcomp lives in `scx-bench-gpu/lib`; routing an arm elsewhere makes its
     `dlopen` fail and its decode fall back to the pipeline in silence."""

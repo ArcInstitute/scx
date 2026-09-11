@@ -171,9 +171,27 @@ def capture_environment() -> dict[str, Any]:
             "RAYON_NUM_THREADS": os.environ.get("RAYON_NUM_THREADS", "unset"),
             "OMP_NUM_THREADS":   os.environ.get("OMP_NUM_THREADS", "unset"),
             "MKL_NUM_THREADS":   os.environ.get("MKL_NUM_THREADS", "unset"),
+            # Reader-layer arm selectors `run_parallel._slurm_setup_cmds`
+            # forwards to every worker; `unset` is the shipped default (on).
+            "SCX_ROW_GROUP_CACHE": os.environ.get("SCX_ROW_GROUP_CACHE", "unset"),
+            "SCX_SCATTER_BLOCK_INDEX": os.environ.get("SCX_SCATTER_BLOCK_INDEX", "unset"),
         },
     }
     env["system"] = collect_system_info()
+    # Which pyscx build the workers will import. The version string alone has
+    # been misleading twice (a stale editable `.so`, a wheel from another
+    # branch left in the conda env), so record the file too. Workers see the
+    # same resolution as the orchestrator: `_slurm_setup_cmds` forwards
+    # `PYTHONPATH` and activates the same env.
+    try:
+        import pyscx  # noqa: F401
+
+        env["pyscx"] = {
+            "version": getattr(pyscx, "__version__", "unknown"),
+            "file": getattr(pyscx, "__file__", "unknown"),
+        }
+    except ImportError as e:  # pragma: no cover - fingerprints-off hosts
+        env["pyscx"] = {"version": "unavailable", "file": f"import failed: {e}"}
     return env
 
 

@@ -2266,8 +2266,9 @@ kill-switch) restore the legacy path for the fits-cache regime.
 The cell-set loader serves a cache-*friendly* regime (sorted data + a reused
 control-pool cache → a small working set that fits the shard cache and is touched
 on most batches). There the block-index "skip the warm, decode O(rows) each batch"
-strategy is a net loss: the hot shard is re-decoded every batch and the LRU never
-populates. So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
+strategy *was* a net loss when measured: the hot shard's groups were re-decoded every
+batch and nothing retained them (the row-group LRU that now does so landed later, in
+OPT-FORMATIO-1 — these numbers predate it). So `SparseCellSetDataset` defaults to the full-shard warm+cache path,
 recovering ≈ `.h5ad` parity on a 50-file Tahoe atlas (steps/s 2.80 → 4.55, gather
 337 → ~5 ms, cache populated to ~8 GB). ⚠️ **Provenance**: those Tahoe figures were
 measured on the *scx1 decode-sidecar* gather this knob replaced, not on the
@@ -2295,9 +2296,10 @@ quotient by ~10%. What is stable is the direction and the scale.
 Read it as the *extreme* of the cache-friendly regime. tabula's 7 shards sit
 inside the 128-shard default cache, so the working set is fully resident after
 the first pass (hit rate 0.9987) — exactly where re-decoding row groups per batch
-costs everything, because eligibility keys on `!cache.contains()` and the LRU
-therefore never populates. Tahoe's 1.6× is the same mechanism where the working
-set does not trivially fit.
+cost everything: at the time of this capture the block-index path retained nothing, so
+the LRU never populated on it (OPT-FORMATIO-1 has since made the touched groups
+resident under the same budget; this table is the pre-change measurement). Tahoe's
+1.6× is the same mechanism where the working set does not trivially fit.
 
 Captured 2026-08-29 on Lambda `standard`-partition node `vci-steady-state-node-022`
 at commit `15bac541`, one SLURM job per dataset (188733, 188734), via
@@ -2582,7 +2584,7 @@ alone, with **zero I/O**, via the pre-existing `BackedCsrIndex::shards_for_indic
 One more thing this shows, which was not the point of the experiment: at
 `cache_shards=31` the full-shard path reaches **546 sets/s against the block-index path's
 6.7** on the same file. Once the whole file is resident and decoded, every subsequent batch is
-served from RAM, whereas the block-index path re-decodes row-groups on each visit. That is
+served from RAM, whereas the block-index path — as captured here, before OPT-FORMATIO-1 — re-decoded row-groups on each visit. That is
 **conditional on the working set fitting** — 31 × 193 MB fits the 6.4 GB budget granted here
 and would not at atlas scale — so it is not an argument for changing the default. It does mean
 the block-index path is not universally faster, and a caller with a small file and repeated

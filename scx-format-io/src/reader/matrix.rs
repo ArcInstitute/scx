@@ -968,178 +968,36 @@ impl ScxReader {
     /// caller falls back to a full-shard decode. Each run's result is a run-local
     /// CSR (`indptr[0] == 0`) byte-identical to the matching slice of a full
     /// decode. Cost is O(touched-groups + touched-rows), not O(shard).
+    ///
+    /// This is the **uncached** form: the layout is resolved and the groups are
+    /// decoded per call and dropped. The CSR gather path in `BackedCsrReader`
+    /// memoizes the layout per shard and retains the groups in its LRU
+    /// ([`super::FramedShardLayout`], OPT-FORMATIO-1); the column-major
+    /// (`read_csc_columns`) callers and tests use this one.
     pub fn decode_block_index_row_runs(
         &self,
         entry: &FullCatalogEntry,
         runs: &[(usize, usize)],
     ) -> Result<Option<Vec<scx_codec::ScipyShard>>> {
-        self.guard_csc_sidecar_fresh(entry)?;
-        let header = self.read_shard_header(entry)?;
-        // Only framed shards carry a resolvable multi-entry block index.
-        if header.shard_format_version <= crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION {
+        let Some(layout) = self.framed_shard_layout(entry)? else {
             return Ok(None);
-        }
-        // Validate the requested runs against the shard's own row count before any
-        // group indexing. `runs` are built by callers from `ShardStats` ranges,
-        // which are not otherwise checked against this header's `n_major`; an
-        // out-of-range run would make `find_group`/`local` overshoot the decoded
-        // group CSR and panic on OOB indexing. Fail loud instead (readers return
-        // errors, not panics, on malformed input).
-        let n_major = header.n_major as usize;
+        };
         for &(run_start, run_len) in runs {
-            let run_end = run_start.checked_add(run_len).filter(|&e| e <= n_major);
-            if run_end.is_none() {
-                return Err(ScxError::InvalidCatalog(format!(
-                    "shard {} row run [{run_start}, +{run_len}) exceeds shard n_major {n_major}",
-                    entry.name
-                )));
-            }
+            layout.check_run(run_start, run_len)?;
         }
-        let codec_id =
-            CodecId::from_u8(header.codec_id).ok_or(ScxError::UnknownCodec(header.codec_id))?;
-        let venc = ValueEncoding::from_u8(header.value_encoding)
-            .ok_or(ScxError::UnknownValueEncoding(header.value_encoding))?;
-        let index_dtype_u16 = header.index_dtype == 0;
-        let section = self.section_bytes(entry)?;
-
-        let slice = |rel: u32, len: u32, label: &str| -> Result<&[u8]> {
-            let start = rel as usize;
-            let end = start
-                .checked_add(len as usize)
-                .filter(|&e| e <= section.len())
-                .ok_or_else(|| {
-                    ScxError::InvalidCatalog(format!(
-                        "shard {} {label} stream out of bounds",
-                        entry.name
-                    ))
-                })?;
-            Ok(&section[start..end])
-        };
-        let indptr_bytes = slice(header.indptr_rel_offset, header.indptr_length, "indptr")?;
-        let indices_bytes = slice(header.indices_rel_offset, header.indices_length, "indices")?;
-        let values_bytes = slice(header.values_rel_offset, header.values_length, "values")?;
-        let block_index_bytes = slice(
-            header.block_index_rel_offset,
-            header.block_index_length,
-            "block_index",
-        )?;
-
-        // Third seam: this path bounds decoded indices by `header.n_minor` alone,
-        // so without this it stayed the one way a widened payload could still get
-        // an out-of-range index out of the reader — via a *scattered* framed read
-        // while the whole-shard paths rejected the same file.
-        // The minor extent comes from the **catalog**, never from a
-        // re-derivation off the `FileHeader`. The catalog is checksummed and
-        // the shard payload is not, which is the whole point of reconciling at
-        // all — and it is what `check_header_against_catalog` already compares
-        // the whole-shard decode against, so the two seams accept the same set
-        // of files. Re-deriving it was wrong for a multimodal shard (stamped
-        // with its modality's `n_vars`, compared against the file-wide max),
-        // for `.raw` (its own gene axis, not on the header), and for an
-        // `ObspCsrShard` written before OPT-FORMATIO-4 (the legacy gene-axis
-        // stamp, which the catalog agrees with). An earlier version used
-        // `n_vars` for everything row-major, which also rejected every
-        // scattered CSC read — caught by
-        // `read_csc_columns_scattered_matches_full_decode`.
-        //
-        // No stats, no authority: skip, exactly as
-        // `check_header_against_catalog` does. Unreachable from here in
-        // practice — every in-tree caller resolves a real entry via
-        // `full_entry_at_offset`, and the backed reader's own stats-less
-        // whole-shard decodes go through `check_decoded_shard_minor`.
-        let authenticated_minor = entry
-            .stats
-            .as_ref()
-            .map(|stats| crate::shard_decode::catalog_minor_extent(stats, entry.section_type))
-            .unwrap_or(0);
-        crate::shard_decode::reconcile_declared_minor(
-            header.n_minor,
-            authenticated_minor,
-            &format!("shard '{}'", entry.name),
-        )?;
-
-        let spans = crate::shard::resolve_block_index(&header, block_index_bytes)?;
-        let find_group = |row: usize| -> usize {
-            spans
-                .partition_point(|s| (s.row_start as usize) <= row)
-                .saturating_sub(1)
-        };
-
-        // Collect the unique set of touched groups, then decode each exactly once.
-        let mut touched: Vec<usize> = runs
-            .iter()
-            .filter(|(_, len)| *len > 0)
-            .flat_map(|&(s, l)| find_group(s)..=find_group(s + l - 1))
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
-
-        let mut group_cache: HashMap<usize, scx_codec::ScipyShard> =
-            HashMap::with_capacity(touched.len());
-        for g in touched {
-            let decoded = scx_codec::decode_row_group(
-                codec_id,
-                &spans[g],
-                indptr_bytes,
-                indices_bytes,
-                values_bytes,
-                venc,
-                index_dtype_u16,
-            )
-            .map_err(|e| {
-                ScxError::InvalidCatalog(format!(
-                    "row-group decode of {} group {g}: {e}",
-                    entry.name
-                ))
-            })?;
-            // The third decode seam: this path calls `scx_codec::decode_row_group`
-            // directly and never passes through `decode_shard_regions_scipy`, so
-            // it has to supply the minor-axis bound itself. Without it a partial
-            // (block-index) read would be the one remaining way to get an
-            // unvalidated column index out of the reader.
-            let scipy = scx_codec::decoded_shard_to_scipy(
-                decoded,
-                venc,
-                scx_codec::clamp_index_bound(header.n_minor),
-            )
-            // An out-of-range index must keep its structured
-            // `ShardIndexOutOfRange` identity, so let the promoting
-            // `From<CodecError>` handle that variant and only wrap the rest with
-            // the shard name. Blanket-wrapping in `InvalidCatalog` kept the
-            // error class right but destroyed the variant, so a caller matching
-            // on `ShardIndexOutOfRange` saw this seam behave differently from
-            // every other one.
-            .map_err(|e| match e {
-                scx_codec::CodecError::IndexOutOfRange { .. } => ScxError::from(e),
-                other => ScxError::InvalidCatalog(format!(
-                    "row-group convert of {} group {g}: {other}",
-                    entry.name
-                )),
-            })?;
-            group_cache.insert(g, scipy);
-        }
-
-        // Build each run's run-local CSR by copying rows from their groups.
+        // Each touched group is decoded once per call and shared by every run
+        // that lands in it.
+        let mut groups: HashMap<usize, Arc<ScxCsr>> = HashMap::new();
         let mut out = Vec::with_capacity(runs.len());
         for &(run_start, run_len) in runs {
-            let mut r_indptr = Vec::with_capacity(run_len + 1);
-            r_indptr.push(0i64);
-            let mut r_indices = Vec::new();
-            let mut r_data = Vec::new();
-            let mut running = 0i64;
-            for row in run_start..run_start + run_len {
-                let g = find_group(row);
-                let span = &spans[g];
-                let local = row - span.row_start as usize;
-                let (g_ip, g_ix, g_data) = &group_cache[&g];
-                let lo = g_ip[local] as usize;
-                let hi = g_ip[local + 1] as usize;
-                r_indices.extend_from_slice(&g_ix[lo..hi]);
-                r_data.extend_from_slice(&g_data[lo..hi]);
-                running += (hi - lo) as i64;
-                r_indptr.push(running);
-            }
-            out.push((r_indptr, r_indices, r_data));
+            out.push(super::assemble_row_run(&layout, run_start, run_len, |g| {
+                if let Some(rg) = groups.get(&g) {
+                    return Ok(Arc::clone(rg));
+                }
+                let rg = Arc::new(self.decode_framed_row_group(&layout, g)?);
+                groups.insert(g, Arc::clone(&rg));
+                Ok(rg)
+            })?);
         }
         Ok(Some(out))
     }
@@ -1169,7 +1027,7 @@ impl ScxReader {
     /// chokepoint but is deliberately not used: `scx info` / `scx validate`
     /// must still be able to inspect and checksum a file whose sidecar is
     /// stale, and a byte fetch is not a decode.
-    fn guard_csc_sidecar_fresh(&self, entry: &FullCatalogEntry) -> Result<()> {
+    pub(super) fn guard_csc_sidecar_fresh(&self, entry: &FullCatalogEntry) -> Result<()> {
         if crate::shard::is_column_major(entry.section_type)
             && !self.full_catalog.csc_sidecar_is_fresh()
         {

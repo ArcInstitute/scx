@@ -1095,7 +1095,7 @@ will still raise); the guarantee covers pyscx's own entry points.
 - `cache_shards()` → `usize` — The requested LRU count cap this reader was built with (`0` = no cache; the cache clamps its own capacity to ≥ 1 internally). Read back by the pyscx handles' `cache_shards` getter.
 - `stored_value_encoding()` → `Result<Option<ValueEncoding>>` — The on-disk value encoding of this reader's shard family (X, the layer, or the modality it is scoped to — it walks the same `shard_entry` table every read does): one 76-byte header read per shard, no payload decode, memoised. A uniform family reports its own encoding; a mixed one the widest via `ValueEncoding::widest` (any float ⇒ `Float32`, else the widest integer); `None` for no shards. The encoding lives only in the shard header — `ShardStats` has no encoding field, and a `value_max` of 0 cannot tell a float shard from an all-zero one — so this is the one place a caller learns whether the stored values are integer counts without decoding.
 - `read_rows(start, end)` → `ScxCsr` — Decode rows `[start, end)` from the overlapping shards into one pre-sized result. A range that fits the LRU is warmed and copied from the cache; a bulk range (more full shards than `cache_shards`, e.g. the whole matrix) decodes uncached in parallel chunks of `cache_shards`, keeping the LRU's entries as they were (the residents it copies are promoted, as any hit is) — peak = result + up to `cache_shards` shards in flight, on top of whatever the LRU already holds (itself capped at `cache_shards`). `end > n_obs` is an error, and so is a catalog whose shards do not tile the range exactly (a gap, or the overlapping modalities of an unscoped reader on a multimodal file).
-- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + the shard cache + up to `cache_shards` shards decoding in flight while `warm_shards` fills it (at most `2 × cache_shards` decoded shards beside the result on a full cache) + one shard's block-index transient. A sparse request on a cold row-group-framed shard decodes only the touched row groups (block index) and is not inserted into the LRU. An out-of-range row is an error (it used to be dropped silently).
+- `read_row_indices(indices)` → `ScxCsr` — Decode specific rows by index (fancy indexing), in request order, duplicates allowed. Assembles the result once: an indptr-only prescan of each touched shard sizes the output exactly, then the `read_rows_with` scatter copies each row into place — peak = result + the shard cache + up to `cache_shards` shards decoding in flight while `warm_shards` fills it (at most `2 × cache_shards` decoded shards beside the result on a full cache) + one shard's block-index transient. A sparse request on a row-group-framed shard that is not resident whole decodes only the touched row groups (block index) and retains **those groups** in the same LRU under the same byte budget — the whole shard is never inserted — so a repeated small gather over one region is served from cache (`row_group_hits`). An out-of-range row is an error (it used to be dropped silently).
 - `read_shard_cached(idx)` → `ScxCsr` — Read shard through LRU cache (clones on hit)
 - `read_shard_uncached(idx)` → `ScxCsr` — Read shard bypassing cache (preferred for streaming)
 - `row_sums()` / `col_sums()` — Streaming per-row/column sums
@@ -3457,13 +3457,19 @@ loader-cumulative and identical to the dataset's `cache_metrics()`; the
 | `prefetch_tasks_spawned` | shards warmed into the LRU ahead of the gather |
 | `prefetch_skipped_cache_hit` | already resident |
 | `prefetch_skipped_in_flight` | a peer was already decoding it |
-| `prefetch_skipped_block_index` | left cold on purpose, so the gather takes the row-group path |
+| `prefetch_skipped_block_index` | not warmed *whole*, so the gather takes the row-group path; its touched row groups are pre-decoded into the row-group LRU instead when the plan fits `budget / (lookahead + 1)` |
 
 Both handles are cloned when the iterator is built, so `metrics()` is safe to
 call after the iterator has been drained.
 
 `prefetch_skipped_block_index` counts the **L2 prefetch-time** decision: shards
-left undecoded so the gather could take the row-group path. It is a useful
+not warmed whole so the gather could take the row-group path. The name predates
+the row-group LRU and is a contract; such a shard is no longer left cold — when
+the plan's row groups fit `max_memory_mb / (lookahead + 1)` (sized exactly from
+the block index, no decode) the prefetcher pre-decodes them into the row-group
+half of the LRU, and the gather reports them as
+`cache_metrics()["row_group_hits"]`; a plan too large for its share is left to
+the gather, which would only have evicted the warm. It is a useful
 confirmation that `scatter_block_index=True` had an effect — it stays 0 against
 an unframed file. Both classes now warn at construction when the kwarg is set
 and no shard is framed, so this is a confirmation rather than the only signal;
@@ -3585,7 +3591,7 @@ delimits each set's row range in the flat batch.
 
 - `iter_with_plans(plans, lookahead=None)` → `SparseCellSetBatchIter` — stream plans into §4.4 sparse batch dicts.
 - `suggested_cache_shards(plan)` → `int` — distinct `(file_id, shard)` pairs one plan touches. Takes the same four-tuple `iter_with_plans` consumes; `role_tags` / `set_offsets` are ignored.
-- `cache_metrics()` → `dict` — cumulative shard-cache counters, including `full_shard_groups` / `block_index_groups`, which report the scattered-read route the gathers actually took.
+- `cache_metrics()` → `dict` — cumulative shard-cache counters, including `full_shard_groups` / `block_index_groups`, which report the scattered-read route the gathers actually took, and the `row_group_*` set (`hits`, `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`) for the decoded row groups a framed `scatter_block_index=True` gather retains. `hits` / `misses` / `evictions` / `bytes_inserted` keep meaning **whole-shard** entries; both kinds share one LRU and one byte budget, and `peak_bytes_in_cache` gauges both, so `peak <= bytes_inserted + row_group_bytes_inserted`. `SCX_ROW_GROUP_CACHE=0` disables row-group retention process-wide.
 - `memory_budget()` → `dict` — `breakdown` plus `max_memory_mb`, `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`, `budget_exceeded`. Only `cache_bytes` and `python_overhead_bytes` are non-zero in the breakdown: on this path the shard cache *is* the budget. `budget_exceeded` means even a one-shard cache does not fit. It is a statement about the **cache this loader sizes**, not a guarantee about process RSS — see the `max_memory_mb` row for the two terms it does not cover.
 - `close()` — release the prefetch engine's tokio runtime, GIL detached, 5 s bound. Idempotent and **terminal** — see **Lifecycle — `close()` and `closed`** under [IndexPlanDataset](#indexplandataset).
 

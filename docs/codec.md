@@ -291,8 +291,11 @@ scattered request touches via the `BlockIndex` — the codec-agnostic random-acc
 path for all framed shards. A framed shard is block-index eligible
 (`BackedCsrReader::block_index_eligible`) — cost-eligible + framed — so a framed
 training file gets random-access decode without any per-row sidecar. The
-`IndexPlanDataset` prefetcher skips pre-warming block-index-eligible framed
-shards so the gather reaches the group-level path. `SparseCellSetDataset`
+`IndexPlanDataset` prefetcher never warms a block-index-eligible framed shard
+whole, so the gather reaches the group-level path; the groups it decodes are
+retained in the shard LRU under the loader's byte budget (see
+[sharding.md § Row-group LRU](sharding.md)), so a repeated gather does not
+re-decode them. `SparseCellSetDataset`
 defaults the other way (`scatter_block_index=False`) and pre-warms, because its
 regime is cache-friendly — see [performance.md § Loader adoption]. Both classes
 take the same per-dataset `scatter_block_index=` kwarg, in opposite defaults,

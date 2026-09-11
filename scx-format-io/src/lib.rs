@@ -50,8 +50,8 @@ pub use arrow_compat::{
     pandas_index_columns, resolve_index_columns, upcast_to_large_types,
 };
 pub use backed::{
-    BackedCscIndex, BackedCscReader, BackedCsrIndex, BackedCsrReader, BackedDenseReader,
-    CacheMetrics, ShardCache, SharedShardCache, SizeHint,
+    BackedCscIndex, BackedCscReader, BackedCsrIndex, BackedCsrReader, BackedDenseReader, CacheKey,
+    CacheKeyKind, CacheKind, CacheMetrics, ShardCache, SharedShardCache, SizeHint,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use bitmap::{

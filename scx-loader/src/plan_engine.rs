@@ -44,14 +44,16 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use scx_format_io::{BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
-use scx_sparse::ScxCsr;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
 
-type ShardJoin = JoinHandle<scx_format_io::Result<Arc<ScxCsr>>>;
+/// One prefetch task: a whole-shard warm (`read_shard_cached_arc`) or a
+/// row-group warm (`warm_row_groups`). Both are side effects on the shared
+/// cache; the decoded value itself is never handed back.
+type ShardJoin = JoinHandle<scx_format_io::Result<()>>;
 
 /// A `file_id → reader` map sharing one decoded-shard budget, plus a lazily
 /// built tokio runtime for prefetch. Wrap in `Arc` and call
@@ -281,25 +283,35 @@ impl PrefetchEngine {
 /// synchronization.
 ///
 /// **With prefetch enabled**, the four counters partition every shard a valid
-/// plan touches: each is either spawned or skipped for exactly one reason,
-/// which is what `tests/test_index_plan.rs`'s conservation law checks. At
-/// `lookahead == 0` there is no partition — `spawn_prefetches` returns before
-/// any of them, so all four stay zero while the gather still picks a route.
-/// These are prefetch-time decisions; `CacheMetrics::block_index_groups` is the
-/// route the gather actually took, and the two are not interchangeable.
+/// plan touches: each is either spawned as a whole-shard warm or not, for
+/// exactly one reason, which is what `tests/test_index_plan.rs`'s conservation
+/// law checks. At `lookahead == 0` there is no partition — `spawn_prefetches`
+/// returns before any of them, so all four stay zero while the gather still
+/// picks a route. These are prefetch-time decisions;
+/// `CacheMetrics::block_index_groups` is the route the gather actually took,
+/// and the two are not interchangeable.
 #[derive(Default, Debug)]
 pub struct IterMetrics {
-    /// `tokio::spawn_blocking` tasks queued onto the runtime's blocking pool.
+    /// Whole-shard `read_shard_cached_arc` tasks queued onto the runtime's
+    /// blocking pool. Row-group warms (see `prefetch_skipped_block_index`) are
+    /// not counted here, so the four-way partition of touched shards holds.
     pub prefetch_tasks_spawned: AtomicU64,
     /// Shards whose prefetch was skipped because the LRU already held them.
     pub prefetch_skipped_cache_hit: AtomicU64,
     /// Shards whose prefetch was skipped because a peer leader was already
     /// decoding them in the shared cache's singleflight table.
     pub prefetch_skipped_in_flight: AtomicU64,
-    /// Shards whose prefetch was skipped because the group is **block-index
-    /// eligible** (cold + sparse + row-group framed): the gather decodes only
-    /// the touched row-groups via the block index, so warming the whole shard
-    /// would negate the win (the L2 block-index-aware prefetch skip).
+    /// Shards whose **whole-shard** prefetch was skipped because the group is
+    /// **block-index eligible** (not resident whole + sparse + row-group
+    /// framed): the gather decodes only the touched row-groups via the block
+    /// index, so warming the whole shard would negate the win (the L2
+    /// block-index-aware prefetch skip). The name predates OPT-FORMATIO-1 and
+    /// is a contract; since then such a shard is not left cold — when the
+    /// plan's row groups fit `cache_bytes_budget / (lookahead + 1)`, its
+    /// touched groups are pre-decoded into the shard LRU instead
+    /// (`BackedCsrReader::warm_row_groups`), and the gather serves them as
+    /// `CacheMetrics::row_group_hits`. A plan too large for its share of the
+    /// budget is left to the gather, which would only have evicted the warm.
     pub prefetch_skipped_block_index: AtomicU64,
 }
 
@@ -457,7 +469,10 @@ where
 
     /// Spawn a `read_shard_cached_arc` prefetch per touched shard, fanned over
     /// the readers the plan's rows hit. Skips shards already cached / in flight
-    /// (per reader), so a window touching the same shard queues it once.
+    /// (per reader), so a window touching the same shard queues it once. A
+    /// block-index-eligible shard is never warmed whole; when the plan's row
+    /// groups fit their share of the budget it gets a `warm_row_groups` task
+    /// instead.
     fn spawn_prefetches(&self, plan: &P) -> Result<Vec<ShardJoin>> {
         if self.lookahead == 0 {
             return Ok(Vec::new());
@@ -490,22 +505,27 @@ where
             // warm the shard in between, and at `lookahead == 0` this code does
             // not run at all.
             let mut seen: HashSet<u64> = HashSet::with_capacity(rs.len());
-            let mut per_shard: HashMap<usize, usize> = HashMap::new();
+            let mut per_shard: HashMap<usize, Vec<u64>> = HashMap::new();
             for row in rs {
                 if seen.insert(row) {
                     if let Some(sidx) = reader.index().shard_for_row(row) {
-                        *per_shard.entry(sidx).or_insert(0) += 1;
+                        per_shard.entry(sidx).or_default().push(row);
                     }
                 }
             }
-            for (sidx, group_len) in per_shard {
+            // Block-index-eligible shards are collected rather than warmed one
+            // by one: whether their row groups get pre-decoded is a decision
+            // about the *plan's* total, below.
+            let mut eligible: Vec<(usize, Vec<u64>)> = Vec::new();
+            for (sidx, rows) in per_shard {
+                let group_len = rows.len();
                 // Attributed one reason at a time, not as a fused `||`: the
                 // three skips mean different things to an operator (a warm
                 // cache, a peer decode, the L2 block-index adoption) and a
                 // fused test can only ever check their sum.
                 //
-                // The third is the interesting one: leaving a cold + sparse +
-                // framed shard undecoded is what lets `read_rows_with` take the
+                // The third is the interesting one: not warming a sparse +
+                // framed shard *whole* is what lets `read_rows_with` take the
                 // group-level block-index path instead of being negated by a
                 // full-shard warm. Both sides call the same
                 // `block_index_eligible` on the same `group_len`, so neither
@@ -529,6 +549,7 @@ where
                     self.iter_metrics
                         .prefetch_skipped_block_index
                         .fetch_add(1, Ordering::Relaxed);
+                    eligible.push((sidx, rows));
                     continue;
                 }
                 self.iter_metrics
@@ -547,8 +568,39 @@ where
                     if let Some(gate) = gate {
                         gate.enter();
                     }
-                    reader.read_shard_cached_arc(sidx)
+                    reader.read_shard_cached_arc(sidx).map(|_| ())
                 }));
+            }
+
+            // Row-group warm (OPT-FORMATIO-1). The eligible shards' touched
+            // groups are pre-decoded into the shard LRU only when the whole
+            // plan's groups fit `budget / (lookahead + 1)`: up to `lookahead`
+            // plans are warming while one is being consumed, so that is the
+            // share under which a warm still resides when its gather arrives.
+            // A plan over its share is left to the gather — warming it would
+            // evict the groups before they are read and cost a second decode.
+            // Sized exactly from the block index, no decode.
+            if !eligible.is_empty() {
+                let planned: usize = eligible
+                    .iter()
+                    .map(|(sidx, rows)| reader.planned_row_group_bytes(*sidx, rows))
+                    .sum();
+                let share = reader.cache_bytes_budget() / (self.lookahead + 1);
+                if planned > 0 && planned <= share {
+                    for (sidx, mut rows) in eligible {
+                        rows.sort_unstable();
+                        let reader = Arc::clone(reader);
+                        #[cfg(test)]
+                        let gate = self.engine.prefetch_gate.get().cloned();
+                        joins.push(handle.spawn_blocking(move || {
+                            #[cfg(test)]
+                            if let Some(gate) = gate {
+                                gate.enter();
+                            }
+                            reader.warm_row_groups(sidx, &rows).map(|_| ())
+                        }));
+                    }
+                }
             }
         }
         Ok(joins)
@@ -560,7 +612,7 @@ where
         let runtime = self.engine.runtime()?;
         for h in prefetches {
             match runtime.block_on(h) {
-                Ok(Ok(_arc_shard)) => {
+                Ok(Ok(())) => {
                     // Warm in the shared cache; `process` will hit it.
                 }
                 Ok(Err(e)) => return Err(LoaderError::FormatError(e)),
@@ -646,6 +698,10 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
             let evictions = cm.evictions.load(Ordering::Relaxed);
             let bytes_inserted = cm.bytes_inserted.load(Ordering::Relaxed);
             let dup_waiters = cm.duplicate_waiters.load(Ordering::Relaxed);
+            let rg_hits = cm.row_group_hits.load(Ordering::Relaxed);
+            let rg_misses = cm.row_group_misses.load(Ordering::Relaxed);
+            let rg_evictions = cm.row_group_evictions.load(Ordering::Relaxed);
+            let rg_bytes_inserted = cm.row_group_bytes_inserted.load(Ordering::Relaxed);
             let spawned = im.prefetch_tasks_spawned.load(Ordering::Relaxed);
             let skip_hit = im.prefetch_skipped_cache_hit.load(Ordering::Relaxed);
             let skip_inflight = im.prefetch_skipped_in_flight.load(Ordering::Relaxed);
@@ -654,6 +710,9 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
                 "scx-loader PlanPrefetchIter cache_metrics: \
                  hits={hits} misses={misses} evictions={evictions} \
                  bytes_inserted={bytes_inserted} duplicate_waiters={dup_waiters} \
+                 row_group_hits={rg_hits} row_group_misses={rg_misses} \
+                 row_group_evictions={rg_evictions} \
+                 row_group_bytes_inserted={rg_bytes_inserted} \
                  prefetch_tasks_spawned={spawned} \
                  prefetch_skipped_cache_hit={skip_hit} \
                  prefetch_skipped_in_flight={skip_inflight} \

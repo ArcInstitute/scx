@@ -129,7 +129,19 @@ class IndexPlanDataset:
     def cache_metrics(self) -> dict[str, int]:
         """Cumulative shard-cache counters since construction: `hits`,
         `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
-        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`."""
+        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`,
+        `row_group_hits`, `row_group_misses`, `row_group_evictions`,
+        `row_group_bytes_inserted`, `row_group_duplicate_waiters`.
+
+        `hits` … `duplicate_waiters` describe **whole-shard** entries; the
+        `row_group_*` set describes the decoded **row groups** a framed
+        scattered gather retains in the same LRU, under the same byte budget
+        (`max_memory_mb`). On a framed file with `scatter_block_index=True`
+        the whole-shard counters stay at 0 and the row-group ones carry the
+        signal: `row_group_hits` is what the second batch over a hot region
+        gets for free. `peak_bytes_in_cache` gauges both kinds together, so
+        `peak <= bytes_inserted + row_group_bytes_inserted`.
+        `SCX_ROW_GROUP_CACHE=0` disables row-group retention process-wide."""
         ...
 
     def memory_budget(self) -> dict[str, Any]:
@@ -221,8 +233,12 @@ class SparseCellSetBatchIter:
         Safe after exhaustion.
 
         ``prefetch["prefetch_skipped_block_index"]`` counts the L2
-        *prefetch-time* decision: shards left undecoded so the gather could
-        take the block-index path. It stays 0 against an unframed file — and
+        *prefetch-time* decision: shards not warmed *whole* so the gather could
+        take the block-index path. Such a shard is not left cold: when the
+        plan's row groups fit ``max_memory_mb / (lookahead + 1)`` the
+        prefetcher pre-decodes them into the row-group LRU instead, and the
+        gather reports them as ``cache_metrics()["row_group_hits"]``. The
+        counter stays 0 against an unframed file — and
         constructing one *with* ``scatter_block_index=True`` also emits a
         preflight ``UserWarning``, though this class defaults that kwarg off, so
         the default path is silent. It is **not** interchangeable with
@@ -268,12 +284,16 @@ class SparseCellSetDataset:
         default because the typical cell-set workload is cache-friendly (sorted
         data + a reused control pool → a small working set that fits the shard
         cache): decoding each hot shard once into the LRU and reusing it across
-        batches beats re-decoding the touched row groups every batch, because the
-        eligibility predicate keys on ``not cache.contains()`` and so never lets
-        the LRU populate. Measured on a 50-file Tahoe atlas: 2.80 → 4.55 steps/s
-        and 337 ms → ~5 ms per gather with it off, at ≈ ``.h5ad`` parity. Pass
-        ``True`` for cache-hostile runs (working set ≫ cache, low shard reuse),
-        where the row-group decode's bounded peak RAM is the memory-safe choice.
+        batches was measured to beat the row-group path — 2.80 → 4.55 steps/s
+        and 337 ms → ~5 ms per gather on a 50-file Tahoe atlas, at ≈ ``.h5ad``
+        parity. That measurement predates the row-group LRU: the row-group
+        path then re-decoded a hot shard's groups every batch because nothing
+        retained them. It now retains them under the same ``max_memory_mb``
+        budget (see ``cache_metrics()["row_group_hits"]``), so the gap is
+        expected to be much smaller; the default stays ``False`` until that is
+        re-measured. Pass ``True`` for cache-hostile runs (working set ≫ cache,
+        low shard reuse), where the row-group decode's bounded peak RAM is the
+        memory-safe choice.
         The process-wide ``SCX_SCATTER_BLOCK_INDEX=0`` env var remains a hard
         kill-switch that forces the full-shard path regardless of this argument.
 
@@ -334,8 +354,11 @@ class SparseCellSetDataset:
     def cache_metrics(self) -> dict[str, Any]:
         """Cumulative shard-cache counters since construction: `hits`,
         `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
-        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups` — the
-        multi-file sibling of `IndexPlanDataset.cache_metrics`.
+        `peak_bytes_in_cache`, `full_shard_groups`, `block_index_groups`, and
+        the `row_group_*` set (`hits`, `misses`, `evictions`,
+        `bytes_inserted`, `duplicate_waiters`) for the decoded row groups a
+        framed `scatter_block_index=True` gather retains — the multi-file
+        sibling of `IndexPlanDataset.cache_metrics`, same keys and meanings.
 
         The last two report which scattered-read route the gathers took.
         `block_index_groups > 0` proves the row-group path ran and remains the
