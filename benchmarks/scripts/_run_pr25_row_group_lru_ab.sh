@@ -21,7 +21,12 @@
 # `--formats` is load-bearing, not tuning: `read_scattered` is scoped to the
 # four `scx_compact_trial_g*` keys, all of which are "additional"-tier, so a
 # capture without it produces NOTHING and the benchmark's 14 route floors are
-# skipped silently by `check_absolute_floors`.
+# skipped silently by `check_absolute_floors`. `--skip-smoke` is load-bearing
+# too: the pre-submit runner smoke matches `--formats` against the converter
+# runners, and these keys have none, so it refuses to submit ("matched none of
+# the 13 available runners") — a refusal `--mode dry-run` cannot show, because
+# the dry run never runs the smoke (job 2930269 died on exactly this after a
+# clean dry run).
 #
 # Preflight before either arm: one real gather through the feature under test,
 # in both arms, exiting non-zero if the counters do not move the way the arm
@@ -71,7 +76,7 @@ DATASETS="pbmc3k smartseq2 tabula_sapiens_100k"
 FORMATS="scx_compact_trial_g256 scx_compact_trial_g512"
 CAPTURE=benchmarks/comprehensive/scripts/capture_baseline.py
 COMMON=(--benchmarks read_scattered --formats $FORMATS --datasets $DATASETS
-        --skip-convert --skip-fingerprints --include-additional --no-accel)
+        --skip-convert --skip-fingerprints --skip-smoke --include-additional --no-accel)
 
 echo "=== PR-25 row-group LRU same-build A/B ==="
 echo "host      : $(hostname)"
@@ -159,7 +164,7 @@ unset SCX_ROW_GROUP_CACHE
 python "$CAPTURE" --name "$NAME_ON" \
     --benchmarks read_scattered index_plan cellset_gather \
     --formats $FORMATS scx_auto --datasets $DATASETS \
-    --skip-convert --skip-fingerprints --include-additional --no-accel 2>&1 \
+    --skip-convert --skip-fingerprints --skip-smoke --include-additional --no-accel 2>&1 \
     | tee "$OUT/capture_on.log"
 
 # ---------------------------------------------------------------------------

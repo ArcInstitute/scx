@@ -478,9 +478,10 @@ impl BackedCsrReader {
         }
         match self.resolve_framed_layout(shard_idx) {
             Ok(resolved) => {
-                // A peer may have raced us; either value is the same fact.
-                let _ = slot.set(resolved.clone());
-                slot.get().cloned().flatten().or(resolved)
+                // A peer may have raced us to `set`; either value is the same
+                // fact, and after `set` the slot is always populated.
+                let _ = slot.set(resolved);
+                slot.get().cloned().flatten()
             }
             Err(_) => None,
         }
