@@ -734,46 +734,6 @@ fn inmemory_aggregation_on_a_non_canonical_matrix_matches_the_oracle() {
     assert_bits_eq(&got.counts, &want, "public in-memory path, non-canonical");
 }
 
-/// Chunking the in-memory matrix into row chunks is result-invisible: 7-row
-/// chunks, one chunk, and the oracle all agree bitwise, at every pool width.
-#[test]
-fn in_memory_row_chunking_is_result_invisible() {
-    // Wide rows, so the one-group arm splits into blocks on the larger chunks.
-    let (n_rows, n_vars) = (500usize, 1024usize);
-    let csr = reassociating_csr(n_rows, n_vars, 7);
-    // Six groups route to the group partition, one group to the column blocks
-    // (on chunks wide enough to split), so both kernels see every chunking.
-    for groups in [6usize, 1] {
-        let (ctg, labels) = build_group_mapping(&cyclic_groups(n_rows, groups), n_rows);
-        let n_groups = labels.len();
-        let want = serial_oracle(&csr, &ctg, n_groups);
-        for threads in [1usize, 4] {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap();
-            pool.install(|| {
-                for chunk in [7usize, 64, n_rows, IN_MEMORY_ROW_CHUNK] {
-                    let mut counts = vec![0.0f64; n_groups * n_vars];
-                    scatter_in_memory(
-                        CsrRows::of(&csr),
-                        &ctg,
-                        &mut counts,
-                        n_vars,
-                        n_groups,
-                        chunk,
-                    );
-                    assert_bits_eq(
-                        &counts,
-                        &want,
-                        &format!("{groups} groups, chunk {chunk} on {threads} threads"),
-                    );
-                }
-            });
-        }
-    }
-}
-
 /// The streaming path over uneven shards — one of them a single row, two of
 /// them wide enough for several blocks — equals the in-memory path over the
 /// concatenation and the oracle, bit for bit, for `Sum` and `Mean`. Exercises
@@ -816,7 +776,18 @@ fn streaming_matches_inmemory_bitwise_across_uneven_shards() {
         let obs = cyclic_groups(n_rows, n_groups);
         let (ctg, labels) = build_group_mapping(&obs, n_rows);
         let want = serial_oracle(&full, &ctg, labels.len());
+        source.reset();
         let streamed = pseudobulk_aggregate(&source, &obs, &cols, &genes, method, 0).unwrap();
+        // The consume closure now runs a nested parallel scatter; the decode
+        // prefetch must still overlap it rather than collapse to
+        // decode-then-scatter (a single-thread pool takes the sequential
+        // fallback by design and is skipped here).
+        if crate::test_support::pool_can_prefetch() {
+            crate::test_support::assert_prefetch_engaged(
+                &source,
+                &format!("streaming pseudobulk, {n_groups} groups, {method:?}"),
+            );
+        }
         let inmem = pseudobulk_aggregate_inmemory(&full, &obs, &cols, &genes, method, 0).unwrap();
         assert_eq!(streamed.cell_counts, inmem.cell_counts);
         assert_eq!(streamed.group_labels, inmem.group_labels);
@@ -997,4 +968,114 @@ fn a_large_unsorted_matrix_matches_the_oracle_through_the_public_path() {
             "sorted and reversed input agree bitwise",
         );
     });
+}
+
+#[test]
+fn zero_groups_give_an_empty_result_on_every_csr_path() {
+    // An empty matrix: every obs column has zero entries, so the mapping has
+    // no groups and the kernels must return rather than index into nothing.
+    let csr = ScxCsr::new_unchecked((0, 4), vec![0], vec![], vec![]);
+    let obs: Vec<Vec<String>> = vec![vec![]];
+    let cols = ["g".to_string()];
+    let genes = gene_names(4);
+    for method in [AggregationMethod::Sum, AggregationMethod::Mean] {
+        let a = pseudobulk_aggregate_inmemory(&csr, &obs, &cols, &genes, method, 0).unwrap();
+        assert_eq!((a.n_groups, a.n_vars, a.counts.len()), (0, 4, 0));
+        let b = pseudobulk_aggregate_from_slices(
+            csr.shape,
+            &csr.indptr,
+            &csr.indices,
+            &csr.data,
+            &obs,
+            &cols,
+            &genes,
+            method,
+            0,
+        )
+        .unwrap();
+        assert_eq!((b.n_groups, b.counts.len()), (0, 0));
+        let source = crate::test_support::GaugedSource::new(vec![], 0, 4);
+        let c = pseudobulk_aggregate(&source, &obs, &cols, &genes, method, 0).unwrap();
+        assert_eq!((c.n_groups, c.counts.len()), (0, 0));
+    }
+    // And `choose_partition` itself, handed zero groups on a non-empty chunk.
+    let big = reassociating_csr(400, 64, 6);
+    assert_eq!(
+        choose_partition(CsrRows::of(&big), &[], 0, 64),
+        ScatterPartition::ColumnBlocks(1)
+    );
+}
+
+/// A source whose shards cover fewer rows than it claims: every cell was
+/// counted in `cell_counts`, so a mean over the partial sums would be silently
+/// wrong. The overrun twin is `a_shard_source_overrunning_n_obs_is_a_shape_error`.
+#[test]
+fn a_shard_source_underrunning_n_obs_is_a_shape_error() {
+    let csr = make_test_csr();
+    let (s, e) = (csr.indptr[0] as usize, csr.indptr[3] as usize);
+    let first_half = ScxCsr::new_unchecked(
+        (3, 4),
+        csr.indptr[0..=3].to_vec(),
+        csr.indices[s..e].to_vec(),
+        csr.data[s..e].to_vec(),
+    );
+    let source = crate::test_support::GaugedSource::new(vec![first_half], 6, 4);
+    let err = pseudobulk_aggregate(
+        &source,
+        &cyclic_groups(6, 2),
+        &["g".to_string()],
+        &gene_names(4),
+        AggregationMethod::Mean,
+        0,
+    );
+    assert!(
+        matches!(err, Err(crate::AccelError::ShapeError(_))),
+        "{err:?}"
+    );
+}
+
+/// The borrowed-slices entry point is public and its callers hand it raw
+/// numpy buffers; every malformed triple is a `ShapeError`, never a panic on
+/// a rayon worker or a silently dropped tail.
+#[test]
+fn from_slices_rejects_malformed_csr_triples() {
+    let csr = make_test_csr();
+    let obs = cyclic_groups(6, 2);
+    let cols = ["g".to_string()];
+    let genes = gene_names(4);
+    let run = |indptr: &[i64], indices: &[i32], data: &[f32]| {
+        pseudobulk_aggregate_from_slices(
+            csr.shape,
+            indptr,
+            indices,
+            data,
+            &obs,
+            &cols,
+            &genes,
+            AggregationMethod::Sum,
+            0,
+        )
+    };
+    let shape_error =
+        |r: Result<PseudobulkResult>| matches!(r, Err(crate::AccelError::ShapeError(_)));
+    // indices / data length mismatch (a short `data` would otherwise zip-drop).
+    assert!(shape_error(run(
+        &csr.indptr,
+        &csr.indices,
+        &csr.data[..csr.data.len() - 1]
+    )));
+    // indptr past the end of indices.
+    let mut long = csr.indptr.clone();
+    *long.last_mut().unwrap() += 5;
+    assert!(shape_error(run(&long, &csr.indices, &csr.data)));
+    // inverted offsets.
+    let mut inverted = csr.indptr.clone();
+    inverted[2] = inverted[3] + 1;
+    assert!(shape_error(run(&inverted, &csr.indices, &csr.data)));
+    // negative start.
+    let mut neg = csr.indptr.clone();
+    neg[0] = -1;
+    assert!(shape_error(run(&neg, &csr.indices, &csr.data)));
+    // The well-formed triple still goes through.
+    assert!(run(&csr.indptr, &csr.indices, &csr.data).is_ok());
 }

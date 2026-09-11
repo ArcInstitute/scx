@@ -17,8 +17,11 @@
 //! one group's row per worker when the rows are not canonical) and merging
 //! nothing, so for each `(group, gene)` the f64 sum is formed from the same
 //! f32 operands in the same ascending-row order as a serial loop, on any
-//! thread count. `RAYON_NUM_THREADS` / `SCX_ACCEL_NUM_THREADS` bound speed
-//! only. The dense path partitions by group the same way.
+//! thread count. `RAYON_NUM_THREADS` sizes the pool; `SCX_ACCEL_NUM_THREADS`
+//! caps the column-block count (and a CSC run's column tasks) as it caps PCA's
+//! blocks, while the group partition and the mean divide are one task per group
+//! row on the ambient pool. Neither knob can move a bit. The dense path
+//! partitions by group the same way.
 
 use std::collections::HashMap;
 
@@ -258,8 +261,8 @@ pub fn build_group_mapping(
 // the same operands in the same ascending row order the serial loop did, on
 // any thread count. Same thesis as `pca::colblocks`, whose planner this reuses.
 //
-// Two partitions, chosen per chunk (a shard, or a row chunk of an in-memory
-// matrix) by `choose_partition`:
+// Two partitions, chosen per chunk (a shard on the streaming path, the whole
+// matrix on the in-memory ones) by `choose_partition`:
 //
 // * `ByGroup` — each worker owns one group's row and walks that group's cells
 //   ascending, visiting each row's nonzeros in **stored** order. Reads every
@@ -296,10 +299,8 @@ pub fn build_group_mapping(
 // falls back to even column counts.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Rows of a CSR matrix borrowed as three slices — one shard, the whole
-/// in-memory matrix, or a row chunk of it. `indptr` has `n_rows + 1` entries
-/// and its offsets index `indices` / `data` **absolutely**, so a chunk is
-/// `indptr[lo..=hi]` over the full `indices` / `data`.
+/// Rows of a CSR matrix borrowed as three slices — one shard, or the whole
+/// in-memory matrix. `indptr` has `n_rows + 1` entries.
 #[derive(Clone, Copy)]
 struct CsrRows<'a> {
     indptr: &'a [i64],
@@ -334,15 +335,6 @@ impl<'a> CsrRows<'a> {
         let e = self.indptr[r + 1] as usize;
         (&self.indices[s..e], &self.data[s..e])
     }
-
-    /// Rows `[lo, hi)` as their own view.
-    fn rows(&self, lo: usize, hi: usize) -> CsrRows<'a> {
-        CsrRows {
-            indptr: &self.indptr[lo..=hi],
-            indices: self.indices,
-            data: self.data,
-        }
-    }
 }
 
 /// How one chunk of rows is split across workers. See the module comment
@@ -375,12 +367,6 @@ const GROUP_PARTITION_SLACK: usize = 2;
 /// serial walk), and pays nothing for the parallel machinery it cannot use.
 const MIN_BLOCK_WINDOW: usize = 64;
 
-/// Rows per parallel dispatch on the in-memory paths. Chunking a single matrix
-/// gives it the same per-chunk partition choice and adaptive block plan the
-/// streaming path gets, and is result-invisible: each `(group, col)` still
-/// sees its rows in ascending order.
-const IN_MEMORY_ROW_CHUNK: usize = 16_384;
-
 /// Whether every row's column indices are strictly increasing (sorted, no
 /// duplicates) — the canonical form. `O(nnz)` reads spread over the pool;
 /// allocates nothing.
@@ -410,7 +396,7 @@ fn choose_partition(
 ) -> ScatterPartition {
     let nnz = rows.nnz();
     let n_rows = rows.n_rows();
-    if nnz < MIN_NNZ_FOR_BLOCKS || n_rows == 0 {
+    if nnz < MIN_NNZ_FOR_BLOCKS || n_rows == 0 || n_groups == 0 {
         return ScatterPartition::ColumnBlocks(1);
     }
     let pool = colblocks::block_count(n_vars);
@@ -544,11 +530,11 @@ fn scatter_column_blocks(
         .map(|_| Vec::with_capacity(n_groups))
         .collect();
     for row in counts.chunks_mut(n_vars) {
-        for (b, piece) in colblocks::split_by_blocks(row, &blocks, 1)
-            .into_iter()
-            .enumerate()
-        {
+        let mut rest = row;
+        for (b, block) in blocks.iter().enumerate() {
+            let (piece, tail) = rest.split_at_mut(block.len());
             per_block[b].push(piece);
+            rest = tail;
         }
     }
     let weight_parts = colblocks::split_by_blocks(weights, &blocks, 1);
@@ -600,6 +586,13 @@ fn scatter_by_group(
         cells[cursor[g]] = r as u32;
         cursor[g] += 1;
     }
+    // One task per group row, scheduled by the ambient pool. Groups differ in
+    // size, so fine tasks balance where a fixed number of coarse ones does not:
+    // capping this at `block_count` tasks (contiguous runs of group rows) was
+    // measured 40 % slower on the streaming arms of the crate bench — eleven
+    // unequal tasks per 4 096-row shard against sixty-four rayon can steal.
+    // `SCX_ACCEL_NUM_THREADS` therefore caps the *block* splits (column blocks,
+    // a CSC run's columns), not this one; `RAYON_NUM_THREADS` sizes the pool.
     counts
         .par_chunks_mut(n_vars)
         .enumerate()
@@ -613,37 +606,37 @@ fn scatter_by_group(
         });
 }
 
-/// Scatter a whole in-memory matrix in `chunk_rows`-row chunks through
-/// [`scatter_rows`], each chunk choosing its partition and all of them sharing
-/// one weights histogram (see [`IN_MEMORY_ROW_CHUNK`]).
-fn scatter_in_memory(
+/// Scatter a whole in-memory matrix: one partition decision, one dispatch.
+/// A whole matrix always holds every group, so the per-shard routing the
+/// streaming path needs (a shard of a group-sorted file holds two groups) has
+/// nothing to buy here, and one dispatch beats a sequence of row-chunk waves.
+fn scatter_matrix(
     rows: CsrRows<'_>,
     cell_to_group: &[usize],
     counts: &mut [f64],
     n_vars: usize,
     n_groups: usize,
-    chunk_rows: usize,
 ) {
+    let part = choose_partition(rows, cell_to_group, n_groups, n_vars);
     let mut weights = vec![0u64; n_vars];
-    let n_rows = rows.n_rows();
-    let chunk_rows = chunk_rows.max(1);
-    let mut lo = 0usize;
-    while lo < n_rows {
-        let hi = (lo + chunk_rows).min(n_rows);
-        let chunk = rows.rows(lo, hi);
-        let groups = &cell_to_group[lo..hi];
-        let part = choose_partition(chunk, groups, n_groups, n_vars);
-        scatter_rows(chunk, groups, counts, n_vars, n_groups, part, &mut weights);
-        lo = hi;
-    }
+    scatter_rows(
+        rows,
+        cell_to_group,
+        counts,
+        n_vars,
+        n_groups,
+        part,
+        &mut weights,
+    );
 }
 
 /// Divide every group's row by its cell count, in place. One division per
 /// element, so the split across workers cannot move a bit.
-fn apply_mean(counts: &mut [f64], cell_counts: &[usize], n_vars: usize) {
-    if n_vars == 0 {
+pub(crate) fn apply_mean(counts: &mut [f64], cell_counts: &[usize], n_vars: usize) {
+    if n_vars == 0 || cell_counts.is_empty() {
         return;
     }
+    debug_assert_eq!(counts.len(), cell_counts.len() * n_vars);
     counts
         .par_chunks_mut(n_vars)
         .zip(cell_counts.par_iter())
@@ -751,6 +744,12 @@ pub fn pseudobulk_aggregate<S: ShardSource + Sync>(
             Ok(())
         },
     )?;
+    if global_row != n_obs {
+        return Err(crate::AccelError::ShapeError(format!(
+            "pseudobulk: shards covered {global_row} rows but n_obs = {n_obs}; every cell \
+             was counted in `cell_counts`, so a mean over these sums would be wrong"
+        )));
+    }
 
     if method == AggregationMethod::Mean {
         apply_mean(&mut counts, &cell_counts, n_vars);
@@ -799,13 +798,12 @@ pub fn pseudobulk_aggregate_inmemory(
         cell_counts[g] += 1;
     }
 
-    scatter_in_memory(
+    scatter_matrix(
         CsrRows::of(csr),
         &cell_to_group,
         &mut counts,
         n_vars,
         n_groups,
-        IN_MEMORY_ROW_CHUNK,
     );
 
     if method == AggregationMethod::Mean {
@@ -845,13 +843,7 @@ pub fn pseudobulk_aggregate_from_slices(
     let (n_obs, n_vars) = shape;
 
     validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
-    if indptr.len() != n_obs + 1 {
-        return Err(crate::AccelError::ShapeError(format!(
-            "indptr has {} entries but n_obs + 1 = {}",
-            indptr.len(),
-            n_obs + 1
-        )));
-    }
+    validate_csr_slices(indptr, indices, data, n_obs)?;
 
     let (cell_to_group, group_labels) = build_group_mapping(obs_groups, n_obs);
     let n_groups = group_labels.len();
@@ -863,7 +855,7 @@ pub fn pseudobulk_aggregate_from_slices(
         cell_counts[g] += 1;
     }
 
-    scatter_in_memory(
+    scatter_matrix(
         CsrRows {
             indptr,
             indices,
@@ -873,7 +865,6 @@ pub fn pseudobulk_aggregate_from_slices(
         &mut counts,
         n_vars,
         n_groups,
-        IN_MEMORY_ROW_CHUNK,
     );
 
     if method == AggregationMethod::Mean {
@@ -982,6 +973,47 @@ pub fn pseudobulk_aggregate_dense(
     )
 }
 
+/// Shape-check borrowed CSR slices before the kernel walks them: `indptr` has
+/// `n_obs + 1` non-decreasing entries that stay within `indices`, and
+/// `indices` / `data` have one entry per nonzero. The kernel indexes rows on
+/// rayon workers, so a malformed triple would otherwise panic there (or, on a
+/// short `data`, silently drop the tail through `zip`) instead of erroring.
+fn validate_csr_slices(indptr: &[i64], indices: &[i32], data: &[f32], n_obs: usize) -> Result<()> {
+    let shape_err = |msg: String| Err(crate::AccelError::ShapeError(msg));
+    if indptr.len() != n_obs + 1 {
+        return shape_err(format!(
+            "indptr has {} entries but n_obs + 1 = {}",
+            indptr.len(),
+            n_obs + 1
+        ));
+    }
+    if indices.len() != data.len() {
+        return shape_err(format!(
+            "indices has {} entries but data has {}",
+            indices.len(),
+            data.len()
+        ));
+    }
+    if indptr[0] < 0 {
+        return shape_err(format!("indptr[0] = {} is negative", indptr[0]));
+    }
+    if let Some(r) = indptr.windows(2).position(|w| w[1] < w[0]) {
+        return shape_err(format!(
+            "indptr is not non-decreasing at row {r}: {} > {}",
+            indptr[r],
+            indptr[r + 1]
+        ));
+    }
+    let last = indptr[n_obs];
+    if last as u64 > indices.len() as u64 {
+        return shape_err(format!(
+            "indptr ends at {last} but indices has {} entries",
+            indices.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Validate common inputs for both streaming and in-memory paths.
 fn validate_inputs(
     obs_groups: &[Vec<String>],
@@ -1024,7 +1056,7 @@ fn validate_inputs(
 
 /// Filter groups by min_cells and build the final `PseudobulkResult`.
 #[allow(clippy::too_many_arguments)]
-fn filter_and_build_result(
+pub(crate) fn filter_and_build_result(
     counts: Vec<f64>,
     group_labels: Vec<Vec<String>>,
     groupby_columns: &[String],

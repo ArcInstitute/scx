@@ -525,11 +525,11 @@ than added on top of it.
 Pseudobulk aggregation entered the pool the same way (OPT-ACCEL-4). Its four CSR
 scatter sites — the streaming `pseudobulk_aggregate`, the two in-memory paths, and
 the CSC projected path — used to be one serial `counts[g·n_vars + col] += v` per
-nonzero on the calling thread with the pool idle. Each shard (or 16 384-row chunk
-of an in-memory matrix) now picks one of two **output** partitions, and nothing is
+nonzero on the calling thread with the pool idle. Each shard (or an in-memory
+matrix as a whole) now picks one of two **output** partitions, and nothing is
 merged, so for each `(group, gene)` the f64 sum is formed from the same f32
 operands in the same ascending-cell order the serial loop used — bit-identical on
-any `RAYON_NUM_THREADS`. *By group*: one worker per group row, each row's
+any `RAYON_NUM_THREADS`. *By group*: one task per run of group rows, each row's
 nonzeros in stored order; reads every nonzero once and needs no sortedness, so it
 is also where a scipy CSR with unsorted or duplicated columns goes (a duplicate
 contributes both values, as it always did) — where PCA falls back to a serial
@@ -548,10 +548,15 @@ the serial loop streams, and that loop is already memory-bound when two group
 rows fit in L1 — so a short-row chunk gets fewer blocks, down to the serial walk
 (a two-group `pseudobulk_dex` on an HVG-subset matrix stays exactly as fast as
 before; the same call on a full transcriptome splits).
-`SCX_ACCEL_NUM_THREADS` caps the block count here as it does for PCA, and the plan
-is balanced by a per-column nonzero histogram the workers accumulate as they go,
-carried from shard to shard, rather than a separate pass. The CSC projected path
-parallelizes over the columns of each contiguous run it decodes.
+`SCX_ACCEL_NUM_THREADS` caps the column-block count here as it caps PCA's (the
+group partition is one task per group row on the ambient pool — sized by
+`RAYON_NUM_THREADS` — because groups differ in size and a fixed number of coarse
+tasks measured 40 % slower on the streaming arms than fine ones rayon can steal),
+and the block plan is balanced by a per-column nonzero histogram the workers
+accumulate as they go, carried from shard to shard, rather than a separate pass. The CSC projected path parallelises a contiguous run of
+requested columns wider than one into a run-local scratch; a scattered gene subset
+decodes one column per run and keeps the serial loop straight into its output
+column.
 
 > `errno 37` ("No locks available") on NFS/Lustre/GPFS.
 

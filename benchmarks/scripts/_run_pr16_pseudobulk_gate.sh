@@ -64,7 +64,13 @@ COMMON=(--benchmarks bench_csc_dispatch --formats $FORMATS --datasets $DATASETS
 echo "=== PR-16 parallel pseudobulk scatter: no-regression capture ==="
 echo "host      : $(hostname)"
 echo "commit    : $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD))"
-echo "dirty     : $(git status --porcelain | grep -vc '^??' || true) tracked file(s) modified"
+DIRTY=$(git status --porcelain | grep -v '^??' || true)
+echo "dirty     : $(printf '%s' "$DIRTY" | grep -c . || true) tracked file(s) modified"
+if [ -n "$DIRTY" ]; then
+    # A capture attributed to a SHA must be of that SHA's tree; name what is not.
+    echo "$DIRTY" | sed 's/^/             /'
+fi
+echo "so sha256 : $(sha256sum "$REPO"/pyscx/python/pyscx/pyscx.cpython-*.so | cut -c1-16)…"
 echo "python    : $(command -v python) ($(python -c 'import sys; print(sys.version.split()[0])'))"
 echo "pyscx     : $(python -c 'import pyscx, os; print(pyscx.__file__)')"
 echo "name      : $NAME"

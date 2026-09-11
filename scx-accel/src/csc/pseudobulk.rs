@@ -12,16 +12,19 @@
 //! Passing the full gene set works but defeats the purpose; pyscx
 //! gates on this and rejects empty `col_indices` for the CSC path.
 //!
-//! Within each decoded column run the scatter is parallel over the run's
-//! columns (each worker owns one whole column), and bit-identical to the
-//! serial per-run loop it replaced: a column's rows are visited in the
-//! ascending order the CSC stores them on both. See `pseudobulk.rs` for the
-//! CSR twin and the reasoning.
+//! A contiguous run of requested columns wide enough to split is scattered in
+//! parallel over its columns (each task owns whole columns, into a run-local
+//! scratch); a single-column run — the scattered-gene-subset production shape
+//! — keeps the serial loop straight into its output column. Both are
+//! bit-identical to the serial per-run loop they replaced: a column's rows are
+//! visited in the ascending order the CSC stores them. See `pseudobulk.rs` for
+//! the CSR twin and the reasoning.
 
 use rayon::prelude::*;
 
 use crate::error::{AccelError, Result};
-use crate::pseudobulk::{AggregationMethod, PseudobulkResult};
+use crate::pca::colblocks;
+use crate::pseudobulk::{apply_mean, filter_and_build_result, AggregationMethod, PseudobulkResult};
 use scx_format_io::ColumnShardSource;
 
 /// Aggregate counts per group on a CSC source, restricted to the
@@ -83,6 +86,28 @@ pub fn pseudobulk_aggregate_csc<S: ColumnShardSource + ?Sized>(
             cell_counts[g] += 1;
         }
     }
+    // The old serial loop's `min_cells_per_group <= 1` shortcut kept every
+    // group, zero-cell ones included; a floor of 0 reproduces that through the
+    // shared builder.
+    let min_cells = if min_cells_per_group <= 1 {
+        0
+    } else {
+        min_cells_per_group
+    };
+    if n_groups == 0 {
+        // Nothing to accumulate into, and `par_chunks_mut(0)` would panic
+        // below (reachable from pyscx on an empty AnnData with a gene subset).
+        return filter_and_build_result(
+            Vec::new(),
+            group_labels,
+            groupby_columns,
+            cell_counts,
+            gene_names,
+            0,
+            n_proj,
+            min_cells,
+        );
+    }
 
     // `read_csc_columns_subset` is on `BackedCscReader` only, not on
     // the trait. Walk `col_indices` in sorted contiguous-run order and
@@ -97,19 +122,7 @@ pub fn pseudobulk_aggregate_csc<S: ColumnShardSource + ?Sized>(
         .collect();
     sorted_with_pos.sort_by_key(|(c, _)| *c);
 
-    // Accumulate into a column-major scratch indexed by *sorted position*:
-    // the column at sorted position `p` owns `scratch[p·n_groups ..
-    // (p+1)·n_groups]`, so the columns of one decoded run are disjoint
-    // contiguous pieces and each rayon worker takes a whole column. Within a
-    // column the rows are visited in the ascending order the CSC stores them,
-    // exactly as the serial loop did, so every `(group, column)` sum is formed
-    // from the same operands in the same order — bit-identical on any thread
-    // count. The parallelism is over the *width of a run*: a scattered gene
-    // subset decodes one column per run and gains nothing here (that path is
-    // decode-bound in `read_csc_columns`, not scatter-bound). A duplicated
-    // column index breaks a run, so each output position still gets its own
-    // copy.
-    let mut scratch = vec![0.0f64; n_proj * n_groups];
+    let mut counts = vec![0.0f64; n_groups * n_proj];
     let mut i = 0;
     while i < sorted_with_pos.len() {
         let mut j = i + 1;
@@ -124,7 +137,8 @@ pub fn pseudobulk_aggregate_csc<S: ColumnShardSource + ?Sized>(
             .map_err(AccelError::Scx)?;
 
         // Consecutive sorted columns differ by exactly one, so the run's width
-        // is its span in `sorted_with_pos`.
+        // is its span in `sorted_with_pos`; a duplicated column index breaks a
+        // run, so each output position still gets its own copy.
         let run_n_cols = (run_end - run_start) as usize;
         debug_assert_eq!(run_n_cols, j - i);
         if csc_run.indptr.len() < run_n_cols + 1 {
@@ -133,101 +147,72 @@ pub fn pseudobulk_aggregate_csc<S: ColumnShardSource + ?Sized>(
                 csc_run.indptr.len().saturating_sub(1)
             )));
         }
-        scratch[i * n_groups..j * n_groups]
-            .par_chunks_mut(n_groups)
-            .enumerate()
-            .for_each(|(local_col, dst)| {
-                let s = csc_run.indptr[local_col] as usize;
-                let e = csc_run.indptr[local_col + 1] as usize;
-                for k in s..e {
-                    let row = csc_run.indices[k] as usize;
-                    if row >= n_obs {
-                        continue;
-                    }
-                    let group_idx = cell_to_group[row];
-                    if group_idx >= n_groups {
-                        continue;
-                    }
-                    dst[group_idx] += csc_run.data[k] as f64;
+        let accumulate = |local_col: usize, dst: &mut dyn FnMut(usize, f64)| {
+            let s = csc_run.indptr[local_col] as usize;
+            let e = csc_run.indptr[local_col + 1] as usize;
+            for k in s..e {
+                let row = csc_run.indices[k] as usize;
+                if row >= n_obs {
+                    continue;
                 }
-            });
+                let group_idx = cell_to_group[row];
+                if group_idx >= n_groups {
+                    continue;
+                }
+                dst(group_idx, csc_run.data[k] as f64);
+            }
+        };
+
+        if run_n_cols == 1 {
+            // The production shape — a scattered gene subset decodes one column
+            // per run — has nothing to parallelise across and pays no scratch:
+            // the serial loop straight into its output column, as before.
+            let output_col = sorted_with_pos[i].1;
+            accumulate(0, &mut |g, v| counts[g * n_proj + output_col] += v);
+        } else {
+            // A contiguous run wide enough to split: a run-local column-major
+            // scratch (`run_n_cols × n_groups`, never the whole result twice),
+            // one whole column per task with the fan-out capped like the CSR
+            // kernels', then a transpose into the requested output positions.
+            // Within a column the rows are visited in the ascending order the
+            // CSC stores them, exactly as the serial loop did, so every
+            // `(group, column)` sum is formed from the same operands in the same
+            // order — bit-identical on any thread count.
+            let mut scratch = vec![0.0f64; run_n_cols * n_groups];
+            let per_task = run_n_cols.div_ceil(colblocks::block_count(run_n_cols));
+            scratch
+                .par_chunks_mut(n_groups * per_task)
+                .enumerate()
+                .for_each(|(t, cols)| {
+                    for (k, dst) in cols.chunks_mut(n_groups).enumerate() {
+                        accumulate(t * per_task + k, &mut |g, v| dst[g] += v);
+                    }
+                });
+            for (local_col, &(_, output_col)) in sorted_with_pos[i..j].iter().enumerate() {
+                let col = &scratch[local_col * n_groups..(local_col + 1) * n_groups];
+                for (g, &v) in col.iter().enumerate() {
+                    counts[g * n_proj + output_col] = v;
+                }
+            }
+        }
 
         i = j;
     }
 
-    // Transpose into the row-major result at each column's requested output
-    // position, folding in the mean divide (one division per element, so the
-    // split cannot move a bit).
-    let want_mean = method == AggregationMethod::Mean;
-    let mut counts = vec![0.0f64; n_groups * n_proj];
-    counts
-        .par_chunks_mut(n_proj)
-        .enumerate()
-        .for_each(|(g, row)| {
-            let scale = if want_mean && cell_counts[g] > 0 {
-                Some(cell_counts[g] as f64)
-            } else {
-                None
-            };
-            for (p, &(_, out_col)) in sorted_with_pos.iter().enumerate() {
-                let v = scratch[p * n_groups + g];
-                row[out_col] = match scale {
-                    Some(cc) => v / cc,
-                    None => v,
-                };
-            }
-        });
-
-    // Filter groups by min_cells_per_group inline (the public helper
-    // in `pseudobulk` is private to that module; replicate the small
-    // amount of bookkeeping here).
-    if min_cells_per_group <= 1 {
-        return Ok(PseudobulkResult {
-            counts,
-            group_labels,
-            groupby_columns: groupby_columns.to_vec(),
-            cell_counts,
-            gene_names: gene_names.to_vec(),
-            n_groups,
-            n_vars: n_proj,
-        });
+    if method == AggregationMethod::Mean {
+        apply_mean(&mut counts, &cell_counts, n_proj);
     }
 
-    let kept: Vec<usize> = (0..n_groups)
-        .filter(|&g| cell_counts[g] >= min_cells_per_group)
-        .collect();
-
-    if kept.len() == n_groups {
-        return Ok(PseudobulkResult {
-            counts,
-            group_labels,
-            groupby_columns: groupby_columns.to_vec(),
-            cell_counts,
-            gene_names: gene_names.to_vec(),
-            n_groups,
-            n_vars: n_proj,
-        });
-    }
-
-    let new_n = kept.len();
-    let mut new_counts = Vec::with_capacity(new_n * n_proj);
-    let mut new_labels = Vec::with_capacity(new_n);
-    let mut new_cell_counts = Vec::with_capacity(new_n);
-    for &g in &kept {
-        new_counts.extend_from_slice(&counts[g * n_proj..(g + 1) * n_proj]);
-        new_labels.push(group_labels[g].clone());
-        new_cell_counts.push(cell_counts[g]);
-    }
-
-    Ok(PseudobulkResult {
-        counts: new_counts,
-        group_labels: new_labels,
-        groupby_columns: groupby_columns.to_vec(),
-        cell_counts: new_cell_counts,
-        gene_names: gene_names.to_vec(),
-        n_groups: new_n,
-        n_vars: n_proj,
-    })
+    filter_and_build_result(
+        counts,
+        group_labels,
+        groupby_columns,
+        cell_counts,
+        gene_names,
+        n_groups,
+        n_proj,
+        min_cells,
+    )
 }
 
 #[cfg(test)]
@@ -529,6 +514,39 @@ mod tests {
                         "{method:?} on {threads} threads, [{i}]: {a} != {b}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Zero groups (an empty AnnData with `prefer_format="csc"` and a gene
+    /// subset reaches this from pyscx) is an empty result, not a
+    /// `par_chunks_mut(0)` panic — for a single-column run and a wide one.
+    #[test]
+    fn zero_groups_give_an_empty_result_instead_of_panicking() {
+        let source = SingleCsc {
+            csc: reassociating_csc(50, 12, 4),
+        };
+        let cell_to_group = vec![0usize; 50]; // every id out of range for n_groups = 0
+        for col_indices in [vec![3u32], vec![2u32, 3, 4, 5]] {
+            let gene_names: Vec<String> = col_indices.iter().map(|c| format!("g{c}")).collect();
+            for method in [AggregationMethod::Sum, AggregationMethod::Mean] {
+                let got = pseudobulk_aggregate_csc(
+                    &source,
+                    &cell_to_group,
+                    0,
+                    Vec::new(),
+                    &["g".to_string()],
+                    &gene_names,
+                    &col_indices,
+                    method,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(
+                    (got.n_groups, got.n_vars, got.counts.len()),
+                    (0, col_indices.len(), 0)
+                );
+                assert!(got.group_labels.is_empty() && got.cell_counts.is_empty());
             }
         }
     }
