@@ -494,8 +494,10 @@ where
     /// **One decision per plan, over the shared budget.** Every reader of the
     /// engine draws on one `SharedShardCache`, and a plan's gathers may span
     /// several files (the cell-set loader) and several `read_rows_with` calls
-    /// (one per set). So the eligible row-group bytes are summed over the whole
-    /// plan — every file, every shard — and compared once against
+    /// (one per set). So the row-group bytes of every framed shard the plan
+    /// touches are summed over the whole plan — every file, every shard,
+    /// regardless of current residency or per-bucket density (see the body
+    /// for why those are not stable) — and compared once against
     /// `cache_bytes_budget / (lookahead + 1)`: up to `lookahead` plans are
     /// warming while one is consumed, so that is the share under which a warm
     /// still resides when its gather arrives, and under which the gathers'
@@ -533,17 +535,25 @@ where
         }
 
         // Plan-level admission, sized exactly from the block index (no decode).
+        // The sum is an upper bound on what the row-group route could retain
+        // for this plan, taken over every framed shard the plan touches — NOT
+        // filtered by `block_index_eligible`. That predicate is volatile in
+        // two ways the gather can disagree with by the time it runs (review on
+        // #528): its `!contains` clause looks at whole-shard residency, which a
+        // warm can change before the plan is consumed; and its density window
+        // sees this bucket's row count, while the cell-set loader gathers one
+        // set at a time and each set's smaller count can be sparse where the
+        // plan's union is dense. Counting a shard the gather then serves whole
+        // only makes the verdict conservative (a lost warm in a mixed regime),
+        // never unsafe. Eligibility still decides what L2 task to launch.
         let mut planned = 0usize;
         let mut budget = usize::MAX;
         let mut eligible: HashMap<(u32, usize), bool> = HashMap::with_capacity(per_shard.len());
         for (&(fid, sidx), rows) in &per_shard {
             let reader = &self.engine.readers[fid as usize];
-            let is_eligible = reader.block_index_eligible(sidx, rows.len());
-            if is_eligible {
-                planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, rows));
-            }
+            planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, rows));
             budget = budget.min(reader.cache_bytes_budget());
-            eligible.insert((fid, sidx), is_eligible);
+            eligible.insert((fid, sidx), reader.block_index_eligible(sidx, rows.len()));
         }
         let share = budget / (self.lookahead + 1);
         let admit_row_groups = planned <= share;

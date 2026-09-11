@@ -76,8 +76,7 @@ pub fn scatter_block_index_enabled() -> bool {
 /// (OPT-FORMATIO-1). Default on; `SCX_ROW_GROUP_CACHE=0` (or `false`) makes a
 /// framed scattered read decode its touched groups and drop them, as it did
 /// before the row-group entries existed — the same-build A/B arm for the
-/// `read_scattered` capture. Read once per process. A per-reader override is
-/// [`BackedCsrReader::set_row_group_cache`].
+/// `read_scattered` capture. Read once per process.
 pub fn row_group_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

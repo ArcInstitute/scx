@@ -1231,3 +1231,52 @@ fn engine_admits_row_groups_per_plan_not_per_file() {
         "control: one file fits and hits"
     );
 }
+
+/// **Review on #528 round 2 (codex).** The plan's admission sum must not key
+/// on whole-shard residency: a shard resident whole while the plan is queued
+/// can be evicted before the plan is gathered, and the gather then takes the
+/// row-group path for bytes a residency-filtered sum never counted. So the sum
+/// counts every framed shard the plan touches. Here shard 0 is resident whole;
+/// three groups fit the share, four do not — a residency-filtered sum (3
+/// groups) would admit and retain, the residency-free one refuses. Falsifier:
+/// any `row_group_bytes_inserted`.
+#[test]
+fn plan_admission_counts_resident_shards_too() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    // share ∈ [3, 4) groups.
+    let budget = 5 * (3 * FRAMED_GROUP_BYTES + FRAMED_GROUP_BYTES / 2);
+    assert!(
+        budget / 5 >= 3 * FRAMED_GROUP_BYTES && budget / 5 < 4 * FRAMED_GROUP_BYTES,
+        "premise"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+    // Shard 0 resident whole before the plan is queued.
+    let _ = engine.reader(0).read_shard_cached_arc(0).unwrap();
+    assert!(
+        engine.reader(0).cache_contains(0),
+        "premise: shard 0 is resident"
+    );
+
+    let out: Vec<_> = Arc::clone(&engine)
+        .iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "the resident shard's groups count toward the plan, so four groups do not fit the share"
+    );
+    assert_eq!(m.row_group_hits.load(AtomicOrdering::Relaxed), 0);
+    assert_eq!(
+        m.row_group_misses.load(AtomicOrdering::Relaxed),
+        3,
+        "the three non-resident shards decode their group uncached; shard 0 is sliced whole"
+    );
+    assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 1);
+}

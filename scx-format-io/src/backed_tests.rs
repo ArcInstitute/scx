@@ -4910,3 +4910,44 @@ fn read_rows_window_over_budget_is_not_retained() {
         RG_GROUP_BYTES
     );
 }
+
+/// `read_rows` takes one admission verdict over every row-range window of the
+/// read (review on #528 round 2): two edge windows that each fit the budget
+/// but not together would otherwise evict each other on every repeat of the
+/// same read.
+#[test]
+fn read_rows_edge_windows_are_admitted_together() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    // Budget holds one group and a half; rows 30..34 are one group in each
+    // shard (shard 0 rows 30-31 → group 7, shard 1 rows 0-1 → group 0).
+    let budget = RG_GROUP_BYTES + RG_GROUP_BYTES / 2;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    let got = backed.read_rows(30, 34).unwrap();
+    let want = full.row_slice(30, 34).unwrap();
+    assert_eq!(got.indices, want.indices);
+    assert_eq!(got.data, want.data);
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        2,
+        "two windows, two groups"
+    );
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "each window fits alone, the pair does not: neither is retained"
+    );
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(backed.cache_bytes_used(), 0);
+
+    // A single-window read of one of them fits and is retained.
+    let _ = backed.read_rows(30, 32).unwrap();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES
+    );
+}

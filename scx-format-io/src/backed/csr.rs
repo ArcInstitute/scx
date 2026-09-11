@@ -100,8 +100,8 @@ pub struct BackedCsrReader {
     /// gather and the L2 prefetch skip, not just the prefetch.
     scatter_block_index: bool,
     /// Per-reader gate for retaining decoded row groups in the shard LRU
-    /// (OPT-FORMATIO-1). Defaults to `SCX_ROW_GROUP_CACHE`; see
-    /// [`Self::set_row_group_cache`]. With it off, a framed scattered read
+    /// (OPT-FORMATIO-1). Defaults to `SCX_ROW_GROUP_CACHE`; a test-only setter
+    /// overrides it. With it off, a framed scattered read
     /// decodes its touched groups and drops them, as before the row-group
     /// entries existed.
     row_group_cache: bool,
@@ -222,7 +222,7 @@ impl BackedCsrReader {
     /// `bytes_budget`: byte cap on cumulative decoded shard bytes **and** the
     /// decoded row groups a framed scattered read retains; pass `usize::MAX`
     /// for count-only behavior on whole shards, which
-    /// [`Self::count_only_byte_budget`] turns into the bytes that count implies
+    /// `count_only_byte_budget` turns into the bytes that count implies
     /// so row groups stay bounded too.
     pub fn new_with_byte_budget(
         reader: ScxReader,
@@ -524,19 +524,9 @@ impl BackedCsrReader {
         self.scatter_block_index = enabled;
     }
 
-    /// Test-only override of the per-reader row-group retention gate (default
-    /// from `SCX_ROW_GROUP_CACHE`, which is also the same-build A/B switch).
-    /// Off, a framed scattered read decodes its touched groups and drops them
-    /// — the pre-OPT-FORMATIO-1 behaviour — and none of the `row_group_*`
-    /// counters move. No production caller changes it, so it is not API.
-    #[cfg(test)]
-    pub(crate) fn set_row_group_cache(&mut self, enabled: bool) {
-        self.row_group_cache = enabled;
-    }
-
     /// The live byte budget of the shard LRU this reader draws on — shared by
     /// whole shards and row groups. `usize::MAX` for a count-only cache that
-    /// could not be sized (see [`Self::count_only_byte_budget`]), `0` when no
+    /// could not be sized (see `count_only_byte_budget`), `0` when no
     /// cache is installed. The L2 prefetcher sizes a row-group warm against
     /// this.
     pub fn cache_bytes_budget(&self) -> usize {
@@ -605,9 +595,20 @@ impl BackedCsrReader {
     /// cheapest source for any of its rows — slicing it beats decoding groups —
     /// which is why that clause stays now that the group path caches too.
     pub fn block_index_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
+        self.block_index_candidate(shard_idx, group_len)
+            && !self.shard_cache.contains(self.file_id, shard_idx)
+    }
+
+    /// [`Self::block_index_eligible`] without the whole-shard residency clause:
+    /// the gates, the cost window and the framing — everything about the
+    /// decision that does not change under the caller between now and the
+    /// gather. The plan engine sizes a plan's row-group admission from this,
+    /// not from `block_index_eligible`: a shard resident whole while a plan is
+    /// queued may be evicted before the plan is gathered, and the gather then
+    /// takes the row-group path for bytes a residency-aware sum never counted.
+    pub fn block_index_candidate(&self, shard_idx: usize, group_len: usize) -> bool {
         scatter_block_index_enabled()
             && self.scatter_block_index
-            && !self.shard_cache.contains(self.file_id, shard_idx)
             && self
                 .index
                 .shard_range(shard_idx)
@@ -621,7 +622,7 @@ impl BackedCsrReader {
     /// gather regardless of `scatter_block_index` — callers use this at open
     /// time to warn that the fast path is inert. Early-returns on the first
     /// framed shard; reads only shard headers and block indexes (no payload),
-    /// memoized per shard via [`Self::framed_layout`].
+    /// memoized per shard via `framed_layout`.
     pub fn any_shard_framed(&self) -> bool {
         (0..self.shard_count()).any(|i| self.shard_is_framed(i))
     }
@@ -826,6 +827,27 @@ impl BackedCsrReader {
         let mut indices = vec![0i32; total_nnz];
         let mut data = vec![0f32; total_nnz];
 
+        // Row-group admission for this read, decided once over every row-range
+        // window it will decode: a read can have two edge windows (the first
+        // and last shard of the range) plus whole shards between, and two
+        // windows that fit the budget one at a time but not together would
+        // evict each other on every repeat of the same read (review on #528).
+        // Sized from the block index, no decode; `None` layouts (unframed)
+        // contribute nothing and take the full-shard path below.
+        let admit_windows = !self.retains_row_groups() || {
+            let bytes = plans
+                .iter()
+                .filter(|p| p.use_row_range)
+                .fold(0usize, |acc, p| {
+                    acc.saturating_add(self.window_group_bytes(
+                        p.shard_idx,
+                        p.local_start,
+                        p.local_end,
+                    ))
+                });
+            bytes <= self.shard_cache.bytes_budget()
+        };
+
         // Phase 2 — copy each window into its pre-carved slot. Row-range plans
         // first (they retain only their touched row groups, never the whole
         // shard; a `None` means the shard is not framed and joins the full-path
@@ -833,9 +855,12 @@ impl BackedCsrReader {
         let mut full_plans: Vec<usize> = Vec::with_capacity(plans.len());
         for (i, plan) in plans.iter().enumerate() {
             if plan.use_row_range {
-                if let Some(run) =
-                    self.try_row_range_slice(plan.shard_idx, plan.local_start, plan.local_end)?
-                {
+                if let Some(run) = self.try_row_range_slice(
+                    plan.shard_idx,
+                    plan.local_start,
+                    plan.local_end,
+                    admit_windows,
+                )? {
                     Self::copy_window(
                         &run,
                         0,
@@ -1008,6 +1033,7 @@ impl BackedCsrReader {
         shard_idx: usize,
         local_start: usize,
         local_end: usize,
+        admit: bool,
     ) -> Result<Option<ScxCsr>> {
         let Some(layout) = self.framed_layout(shard_idx) else {
             return Ok(None);
@@ -1017,21 +1043,10 @@ impl BackedCsrReader {
         self.check_fresh()?;
         let n = local_end - local_start;
         layout.check_run(local_start, n)?;
-        // Same admission as a scattered gather: a window is `< shard_rows / 4`
-        // by construction, but row groups are fixed-height, not fixed-nnz, so
-        // a skewed shard can put most of its bytes in a few groups — size the
-        // touched groups from the block index and retain them only if they
-        // fit the budget.
-        let admit = if n == 0 {
-            true
-        } else {
-            let (g0, g1) = (
-                layout.find_group(local_start),
-                layout.find_group(local_end - 1),
-            );
-            let bytes = (g0..=g1).fold(0usize, |acc, g| acc.saturating_add(layout.group_bytes(g)));
-            bytes <= self.shard_cache.bytes_budget()
-        };
+        // `admit` is `read_rows`' verdict over every window of the read — row
+        // groups are fixed-height, not fixed-nnz, so "a quarter of the rows"
+        // is not "a quarter of the bytes", and one window's fit says nothing
+        // about the read's other window.
         let (indptr, indices, data) = assemble_row_run(&layout, local_start, n, |g| {
             self.row_group(shard_idx, &layout, g, admit)
         })?;
@@ -1043,13 +1058,15 @@ impl BackedCsrReader {
         )))
     }
 
-    /// Row group `g` of framed shard `shard_idx`: from the shard LRU when
-    /// resident, else decoded (once, across concurrent callers — the same
-    /// singleflight as whole shards) and, when `admit`, inserted under the
-    /// byte budget. `admit = false` is the caller saying this read's working
-    /// set does not fit — see [`Self::gather_row_groups_fit_budget`]. With
-    /// row-group retention off ([`Self::set_row_group_cache`], a count-only
-    /// cache, or no cache) it decodes uncached and touches no counter.
+    /// Row group `g` of framed shard `shard_idx`. A resident group is a hit
+    /// either way. On a miss, an **admitted** lookup decodes once across
+    /// concurrent callers (the same singleflight as whole shards) and inserts
+    /// under the byte budget; a **non-admitted** one — the caller saying this
+    /// read's working set does not fit, see
+    /// [`Self::gather_row_groups_fit_budget`] — decodes independently, with no
+    /// insert and no singleflight slot, and counts as a miss. With row-group
+    /// retention off (the `SCX_ROW_GROUP_CACHE` gate, a count-only cache, or
+    /// no cache) it decodes uncached and touches no counter.
     fn row_group(
         &self,
         shard_idx: usize,
@@ -1104,6 +1121,26 @@ impl BackedCsrReader {
             planned = planned.saturating_add(Self::planned_bytes_sorted(&layout, locals));
         }
         planned <= self.shard_cache.bytes_budget()
+    }
+
+    /// Bytes of the row groups the contiguous shard-local window
+    /// `[local_start, local_end)` touches, from the block index; `0` for an
+    /// unframed shard or an empty window.
+    fn window_group_bytes(&self, shard_idx: usize, local_start: usize, local_end: usize) -> usize {
+        if local_end <= local_start {
+            return 0;
+        }
+        let Some(layout) = self.framed_layout(shard_idx) else {
+            return 0;
+        };
+        if local_end > layout.n_major {
+            return 0;
+        }
+        let (g0, g1) = (
+            layout.find_group(local_start),
+            layout.find_group(local_end - 1),
+        );
+        (g0..=g1).fold(0usize, |acc, g| acc.saturating_add(layout.group_bytes(g)))
     }
 
     /// Bytes of the distinct row groups the **ascending** shard-local `locals`
@@ -2124,3 +2161,20 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
 
 // `total_variance_from_col_sq` moved to `scx_sparse::total_variance_from_col_sq`
 // (pure statistics, not format I/O).
+
+// Test-only surface. Kept in its own `impl` at the END of the file: the I-ORG-1
+// dedup guards scan production code with `sed '/#\[cfg(test)\]/,$d'`, so a
+// `#[cfg(test)]` anywhere inside the production impl would truncate what they
+// see (the `get_or_decode` call sites below it) and fail the guard — which is
+// exactly what happened on #528 round 2.
+#[cfg(test)]
+impl BackedCsrReader {
+    /// Override of the per-reader row-group retention gate (default from
+    /// `SCX_ROW_GROUP_CACHE`, which is also the same-build A/B switch). Off, a
+    /// framed scattered read decodes its touched groups and drops them — the
+    /// pre-OPT-FORMATIO-1 behaviour — and none of the `row_group_*` counters
+    /// move. No production caller changes it, so it is not API.
+    pub(crate) fn set_row_group_cache(&mut self, enabled: bool) {
+        self.row_group_cache = enabled;
+    }
+}

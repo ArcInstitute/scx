@@ -651,7 +651,7 @@ impl SparseCellSetLoader {
     /// its verdict in, so sets that fit one at a time but not together do not
     /// churn the LRU. The `process` callback for the engine (shards already
     /// warmed).
-    pub fn gather_admitting(
+    pub(crate) fn gather_admitting(
         &self,
         engine: &PrefetchEngine,
         plan: &SparseCellSetPlan,

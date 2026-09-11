@@ -248,13 +248,10 @@ pub(crate) fn assemble_row_run(
     let mut current: Option<(usize, Arc<ScxCsr>)> = None;
     for row in run_start..run_start + run_len {
         let g = layout.find_group(row);
-        let group = match &current {
-            Some((cur_g, group)) if *cur_g == g => group,
-            _ => {
-                current = Some((g, lookup(g)?));
-                &current.as_ref().expect("just set").1
-            }
-        };
+        if current.as_ref().is_none_or(|(cur_g, _)| *cur_g != g) {
+            current = Some((g, lookup(g)?));
+        }
+        let group = &current.as_ref().expect("just set").1;
         let local = row - layout.spans[g].row_start as usize;
         let lo = group.indptr[local] as usize;
         let hi = group.indptr[local + 1] as usize;

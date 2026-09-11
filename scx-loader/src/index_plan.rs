@@ -745,7 +745,7 @@ impl IndexPlanLoader {
     /// caller: the prefetch engine's per-plan verdict when driven through
     /// `iter_with_plans`, `None` (decide per gather, against the whole budget)
     /// for a standalone call.
-    pub fn process_plan_admitting(
+    pub(crate) fn process_plan_admitting(
         &self,
         mut plan: Vec<(u64, u64)>,
         admit_row_groups: Option<bool>,

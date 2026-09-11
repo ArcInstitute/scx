@@ -114,13 +114,15 @@ pub struct CacheMetrics {
     pub block_index_groups: AtomicU64,
     /// Row-group lookups served from the LRU without decode.
     pub row_group_hits: AtomicU64,
-    /// Row-group lookups that decoded (singleflight leader).
+    /// Row-group lookups that decoded: an admitted lookup's singleflight
+    /// leader, or a non-admitted lookup's independent, uncached decode.
     pub row_group_misses: AtomicU64,
     /// Row-group entries dropped to fit a new entry under the byte budget.
     pub row_group_evictions: AtomicU64,
     /// Cumulative row-group bytes inserted.
     pub row_group_bytes_inserted: AtomicU64,
-    /// Row-group lookups that waited on a peer's in-flight decode.
+    /// Admitted row-group lookups that waited on a peer's in-flight decode
+    /// (a non-admitted lookup never takes a slot).
     pub row_group_duplicate_waiters: AtomicU64,
 }
 
@@ -437,7 +439,7 @@ type InFlightTable<K> = Mutex<HashMap<K, Arc<InFlightSlot>>>;
 
 /// Decoded-shard cache + singleflight table.
 ///
-/// The CSR instantiation is keyed by [`CacheKey`] — `(file_id, shard_id)` for
+/// The CSR instantiation is keyed by `CacheKey` — `(file_id, shard_id)` for
 /// a whole shard, plus the row-group index for a decoded row group — so it
 /// can be **shared across several `BackedCsrReader`s** that together back one
 /// multi-file run (the Phase 1 multi-reader prefetch engine). A standalone
