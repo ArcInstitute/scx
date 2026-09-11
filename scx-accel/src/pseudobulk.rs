@@ -13,9 +13,10 @@
 //! # Parallelism and bit-identity
 //!
 //! Every CSR path scatters in parallel by partitioning the **output** across
-//! rayon workers (a contiguous column block of every group's row by default;
-//! one group's row per worker when the rows are not canonical) and merging
-//! nothing, so for each `(group, gene)` the f64 sum is formed from the same
+//! rayon workers — one group's row per task while the largest group holds at
+//! most two pool-shares of the nonzeros (and always when the rows are not
+//! canonical), a contiguous column block of every group's row otherwise — and
+//! merging nothing, so for each `(group, gene)` the f64 sum is formed from the same
 //! f32 operands in the same ascending-row order as a serial loop, on any
 //! thread count. `RAYON_NUM_THREADS` sizes the pool; `SCX_ACCEL_NUM_THREADS`
 //! caps the column-block count (and a CSC run's column tasks) as it caps PCA's
@@ -423,7 +424,9 @@ fn choose_partition(
 ///
 /// `cell_to_group` is indexed by **local** row of `rows`. `weights` is the
 /// cumulative per-column nnz histogram (`n_vars` entries) the column-block
-/// partition plans from and adds to; `ByGroup` leaves it alone.
+/// partition plans from and adds to, when a later chunk will plan from it;
+/// `None` (the in-memory paths — one dispatch, nothing plans after it) gets even
+/// blocks and skips the per-nonzero bump. `ByGroup` leaves it alone either way.
 fn scatter_rows(
     rows: CsrRows<'_>,
     cell_to_group: &[usize],
@@ -431,11 +434,13 @@ fn scatter_rows(
     n_vars: usize,
     n_groups: usize,
     part: ScatterPartition,
-    weights: &mut [u64],
+    weights: Option<&mut [u64]>,
 ) {
     debug_assert_eq!(cell_to_group.len(), rows.n_rows());
     debug_assert_eq!(counts.len(), n_groups * n_vars);
-    debug_assert_eq!(weights.len(), n_vars);
+    if let Some(w) = &weights {
+        debug_assert_eq!(w.len(), n_vars);
+    }
     if rows.n_rows() == 0 || n_groups == 0 || n_vars == 0 {
         return;
     }
@@ -520,9 +525,17 @@ fn scatter_column_blocks(
     n_vars: usize,
     n_groups: usize,
     n_blocks: usize,
-    weights: &mut [u64],
+    weights: Option<&mut [u64]>,
 ) {
-    let blocks = colblocks::plan_blocks(weights, n_blocks);
+    // No histogram: even column counts (`plan_blocks` on all-zero weights).
+    let even;
+    let blocks = match &weights {
+        Some(w) => colblocks::plan_blocks(w, n_blocks),
+        None => {
+            even = vec![0u64; n_vars];
+            colblocks::plan_blocks(&even, n_blocks)
+        }
+    };
     let splits = RowSplits::plan(rows, &blocks);
     // Regroup the `[n_groups][n_blocks]` pieces as `[n_blocks][n_groups]` so
     // each worker holds one disjoint column window of every group's row.
@@ -537,7 +550,13 @@ fn scatter_column_blocks(
             rest = tail;
         }
     }
-    let weight_parts = colblocks::split_by_blocks(weights, &blocks, 1);
+    let weight_parts: Vec<Option<&mut [u64]>> = match weights {
+        Some(w) => colblocks::split_by_blocks(w, &blocks, 1)
+            .into_iter()
+            .map(Some)
+            .collect(),
+        None => (0..n_blocks).map(|_| None).collect(),
+    };
     blocks
         .par_iter()
         .enumerate()
@@ -545,17 +564,36 @@ fn scatter_column_blocks(
         .zip(weight_parts)
         .for_each(|(((b, block), mut rows_g), w)| {
             let a = block.start;
-            for (r, &g) in cell_to_group.iter().enumerate() {
-                let (lo, hi) = splits.window(r, b);
-                if lo == hi {
-                    continue;
+            // Two copies of the window loop rather than a per-nonzero branch on
+            // whether a histogram is being kept.
+            match w {
+                Some(w) => {
+                    for (r, &g) in cell_to_group.iter().enumerate() {
+                        let (lo, hi) = splits.window(r, b);
+                        if lo == hi {
+                            continue;
+                        }
+                        let (idx, dat) = rows.row(r);
+                        let dst = &mut *rows_g[g];
+                        for (&c, &v) in idx[lo..hi].iter().zip(&dat[lo..hi]) {
+                            let c = c as usize - a;
+                            dst[c] += v as f64;
+                            w[c] += 1;
+                        }
+                    }
                 }
-                let (idx, dat) = rows.row(r);
-                let dst = &mut *rows_g[g];
-                for (&c, &v) in idx[lo..hi].iter().zip(&dat[lo..hi]) {
-                    let c = c as usize - a;
-                    dst[c] += v as f64;
-                    w[c] += 1;
+                None => {
+                    for (r, &g) in cell_to_group.iter().enumerate() {
+                        let (lo, hi) = splits.window(r, b);
+                        if lo == hi {
+                            continue;
+                        }
+                        let (idx, dat) = rows.row(r);
+                        let dst = &mut *rows_g[g];
+                        for (&c, &v) in idx[lo..hi].iter().zip(&dat[lo..hi]) {
+                            dst[c as usize - a] += v as f64;
+                        }
+                    }
                 }
             }
         });
@@ -606,10 +644,12 @@ fn scatter_by_group(
         });
 }
 
-/// Scatter a whole in-memory matrix: one partition decision, one dispatch.
-/// A whole matrix always holds every group, so the per-shard routing the
-/// streaming path needs (a shard of a group-sorted file holds two groups) has
-/// nothing to buy here, and one dispatch beats a sequence of row-chunk waves.
+/// Scatter a whole in-memory matrix: one partition decision, one dispatch, no
+/// histogram (nothing plans after it, so the blocks are even and the kernel
+/// skips the per-nonzero bump). A whole matrix always holds every group, so
+/// the per-shard routing the streaming path needs (a shard of a group-sorted
+/// file holds two groups) has nothing to buy here, and one dispatch beats a
+/// sequence of row-chunk waves.
 fn scatter_matrix(
     rows: CsrRows<'_>,
     cell_to_group: &[usize],
@@ -618,16 +658,7 @@ fn scatter_matrix(
     n_groups: usize,
 ) {
     let part = choose_partition(rows, cell_to_group, n_groups, n_vars);
-    let mut weights = vec![0u64; n_vars];
-    scatter_rows(
-        rows,
-        cell_to_group,
-        counts,
-        n_vars,
-        n_groups,
-        part,
-        &mut weights,
-    );
+    scatter_rows(rows, cell_to_group, counts, n_vars, n_groups, part, None);
 }
 
 /// Divide every group's row by its cell count, in place. One division per
@@ -738,7 +769,7 @@ pub fn pseudobulk_aggregate<S: ShardSource + Sync>(
                 n_vars,
                 n_groups,
                 part,
-                &mut weights,
+                Some(&mut weights),
             );
             global_row += shard_n_rows;
             Ok(())
@@ -843,7 +874,7 @@ pub fn pseudobulk_aggregate_from_slices(
     let (n_obs, n_vars) = shape;
 
     validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
-    validate_csr_slices(indptr, indices, data, n_obs)?;
+    validate_csr_slices(indptr, indices, data, n_obs, n_vars)?;
 
     let (cell_to_group, group_labels) = build_group_mapping(obs_groups, n_obs);
     let n_groups = group_labels.len();
@@ -973,12 +1004,20 @@ pub fn pseudobulk_aggregate_dense(
     )
 }
 
-/// Shape-check borrowed CSR slices before the kernel walks them: `indptr` has
-/// `n_obs + 1` non-decreasing entries that stay within `indices`, and
-/// `indices` / `data` have one entry per nonzero. The kernel indexes rows on
-/// rayon workers, so a malformed triple would otherwise panic there (or, on a
-/// short `data`, silently drop the tail through `zip`) instead of erroring.
-fn validate_csr_slices(indptr: &[i64], indices: &[i32], data: &[f32], n_obs: usize) -> Result<()> {
+/// Shape-check borrowed CSR slices before the kernel walks them — the
+/// invariants `ScxCsr::new` enforces: `indptr` has `n_obs + 1` non-decreasing
+/// entries from `0` to exactly `indices.len()`, `indices` / `data` have one
+/// entry per nonzero, and every column index lies in `0..n_vars`. The kernel
+/// indexes rows on rayon workers, so a malformed triple would otherwise panic
+/// there — or silently drop leading / trailing nonzeros, or a short `data`'s
+/// tail through `zip` — instead of erroring.
+fn validate_csr_slices(
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+) -> Result<()> {
     let shape_err = |msg: String| Err(crate::AccelError::ShapeError(msg));
     if indptr.len() != n_obs + 1 {
         return shape_err(format!(
@@ -994,8 +1033,11 @@ fn validate_csr_slices(indptr: &[i64], indices: &[i32], data: &[f32], n_obs: usi
             data.len()
         ));
     }
-    if indptr[0] < 0 {
-        return shape_err(format!("indptr[0] = {} is negative", indptr[0]));
+    if indptr[0] != 0 {
+        return shape_err(format!(
+            "indptr[0] = {} but a CSR's first offset is 0",
+            indptr[0]
+        ));
     }
     if let Some(r) = indptr.windows(2).position(|w| w[1] < w[0]) {
         return shape_err(format!(
@@ -1005,10 +1047,22 @@ fn validate_csr_slices(indptr: &[i64], indices: &[i32], data: &[f32], n_obs: usi
         ));
     }
     let last = indptr[n_obs];
-    if last as u64 > indices.len() as u64 {
+    if last as u64 != indices.len() as u64 {
         return shape_err(format!(
             "indptr ends at {last} but indices has {} entries",
             indices.len()
+        ));
+    }
+    // One read pass over `indices`, spread over the pool; the serial search for
+    // the message runs only once the check has failed.
+    if !indices.par_iter().all(|&c| c >= 0 && (c as usize) < n_vars) {
+        let k = indices
+            .iter()
+            .position(|&c| c < 0 || (c as usize) >= n_vars)
+            .unwrap_or(0);
+        return shape_err(format!(
+            "indices[{k}] = {} is out of range for n_vars = {n_vars}",
+            indices[k]
         ));
     }
     Ok(())

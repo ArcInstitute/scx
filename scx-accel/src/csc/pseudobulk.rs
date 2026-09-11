@@ -13,9 +13,10 @@
 //! gates on this and rejects empty `col_indices` for the CSC path.
 //!
 //! A contiguous run of requested columns wide enough to split is scattered in
-//! parallel over its columns (each task owns whole columns, into a run-local
-//! scratch); a single-column run — the scattered-gene-subset production shape
-//! — keeps the serial loop straight into its output column. Both are
+//! parallel over its columns (each task owns whole columns, into a tile-local
+//! scratch of at most `CSC_RUN_TILE_COLS` columns); a single-column run — the
+//! scattered-gene-subset production shape — keeps the serial loop straight into
+//! its output column. Both are
 //! bit-identical to the serial per-run loop they replaced: a column's rows are
 //! visited in the ascending order the CSC stores them. See `pseudobulk.rs` for
 //! the CSR twin and the reasoning.
@@ -26,6 +27,39 @@ use crate::error::{AccelError, Result};
 use crate::pca::colblocks;
 use crate::pseudobulk::{apply_mean, filter_and_build_result, AggregationMethod, PseudobulkResult};
 use scx_format_io::ColumnShardSource;
+use scx_sparse::ScxCsc;
+
+/// Columns per tile of a wide contiguous run: the run-local scratch is at most
+/// `CSC_RUN_TILE_COLS × n_groups` f64s (20 MB at 10k groups) however wide the
+/// projection, never a second copy of the result.
+const CSC_RUN_TILE_COLS: usize = 256;
+
+/// Add one decoded column's nonzeros into `dst(group, value)`, rows in the
+/// ascending order the CSC stores them, skipping rows and group ids out of
+/// range exactly as the serial loop did. Generic so both call sites inline it.
+#[inline]
+fn accumulate_column<F: FnMut(usize, f64)>(
+    run: &ScxCsc,
+    local_col: usize,
+    n_obs: usize,
+    cell_to_group: &[usize],
+    n_groups: usize,
+    mut dst: F,
+) {
+    let s = run.indptr[local_col] as usize;
+    let e = run.indptr[local_col + 1] as usize;
+    for k in s..e {
+        let row = run.indices[k] as usize;
+        if row >= n_obs {
+            continue;
+        }
+        let group_idx = cell_to_group[row];
+        if group_idx >= n_groups {
+            continue;
+        }
+        dst(group_idx, run.data[k] as f64);
+    }
+}
 
 /// Aggregate counts per group on a CSC source, restricted to the
 /// `col_indices` gene subset.
@@ -147,52 +181,57 @@ pub fn pseudobulk_aggregate_csc<S: ColumnShardSource + ?Sized>(
                 csc_run.indptr.len().saturating_sub(1)
             )));
         }
-        let accumulate = |local_col: usize, dst: &mut dyn FnMut(usize, f64)| {
-            let s = csc_run.indptr[local_col] as usize;
-            let e = csc_run.indptr[local_col + 1] as usize;
-            for k in s..e {
-                let row = csc_run.indices[k] as usize;
-                if row >= n_obs {
-                    continue;
-                }
-                let group_idx = cell_to_group[row];
-                if group_idx >= n_groups {
-                    continue;
-                }
-                dst(group_idx, csc_run.data[k] as f64);
-            }
-        };
-
         if run_n_cols == 1 {
             // The production shape — a scattered gene subset decodes one column
             // per run — has nothing to parallelise across and pays no scratch:
             // the serial loop straight into its output column, as before.
             let output_col = sorted_with_pos[i].1;
-            accumulate(0, &mut |g, v| counts[g * n_proj + output_col] += v);
+            accumulate_column(&csc_run, 0, n_obs, cell_to_group, n_groups, |g, v| {
+                counts[g * n_proj + output_col] += v
+            });
         } else {
-            // A contiguous run wide enough to split: a run-local column-major
-            // scratch (`run_n_cols × n_groups`, never the whole result twice),
+            // A contiguous run wide enough to split, in tiles of at most
+            // `CSC_RUN_TILE_COLS` columns: a tile-local column-major scratch
+            // (bounded whatever the run's width — a contiguous projection of
+            // every gene is a valid input and must not hold the result twice),
             // one whole column per task with the fan-out capped like the CSR
-            // kernels', then a transpose into the requested output positions.
-            // Within a column the rows are visited in the ascending order the
-            // CSC stores them, exactly as the serial loop did, so every
-            // `(group, column)` sum is formed from the same operands in the same
-            // order — bit-identical on any thread count.
-            let mut scratch = vec![0.0f64; run_n_cols * n_groups];
-            let per_task = run_n_cols.div_ceil(colblocks::block_count(run_n_cols));
-            scratch
-                .par_chunks_mut(n_groups * per_task)
-                .enumerate()
-                .for_each(|(t, cols)| {
-                    for (k, dst) in cols.chunks_mut(n_groups).enumerate() {
-                        accumulate(t * per_task + k, &mut |g, v| dst[g] += v);
+            // blocks', then a transpose of the tile into its requested output
+            // positions. Within a column the rows are visited in the ascending
+            // order the CSC stores them, exactly as the serial loop did, so
+            // every `(group, column)` sum is formed from the same operands in
+            // the same order — bit-identical on any thread count.
+            let tile = run_n_cols.min(CSC_RUN_TILE_COLS);
+            let mut scratch = vec![0.0f64; tile * n_groups];
+            let mut lo = 0usize;
+            while lo < run_n_cols {
+                let hi = (lo + tile).min(run_n_cols);
+                let width = hi - lo;
+                let scratch = &mut scratch[..width * n_groups];
+                scratch.fill(0.0);
+                let per_task = width.div_ceil(colblocks::block_count(width));
+                scratch
+                    .par_chunks_mut(n_groups * per_task)
+                    .enumerate()
+                    .for_each(|(t, cols)| {
+                        for (k, dst) in cols.chunks_mut(n_groups).enumerate() {
+                            let local_col = lo + t * per_task + k;
+                            accumulate_column(
+                                &csc_run,
+                                local_col,
+                                n_obs,
+                                cell_to_group,
+                                n_groups,
+                                |g, v| dst[g] += v,
+                            );
+                        }
+                    });
+                for (k, &(_, output_col)) in sorted_with_pos[i + lo..i + hi].iter().enumerate() {
+                    let col = &scratch[k * n_groups..(k + 1) * n_groups];
+                    for (g, &v) in col.iter().enumerate() {
+                        counts[g * n_proj + output_col] = v;
                     }
-                });
-            for (local_col, &(_, output_col)) in sorted_with_pos[i..j].iter().enumerate() {
-                let col = &scratch[local_col * n_groups..(local_col + 1) * n_groups];
-                for (g, &v) in col.iter().enumerate() {
-                    counts[g * n_proj + output_col] = v;
                 }
+                lo = hi;
             }
         }
 
@@ -547,6 +586,52 @@ mod tests {
                     (0, col_indices.len(), 0)
                 );
                 assert!(got.group_labels.is_empty() && got.cell_counts.is_empty());
+            }
+        }
+    }
+
+    /// A contiguous run wider than one tile is scattered tile by tile into a
+    /// bounded scratch; the result is still the serial per-run loop's, bit for
+    /// bit, with the tile boundaries landing mid-run.
+    #[test]
+    fn a_run_wider_than_the_tile_matches_the_serial_loop_bitwise() {
+        let (n_obs, n_vars) = (200usize, 640usize);
+        let source = SingleCsc {
+            csc: reassociating_csc(n_obs, n_vars, 5),
+        };
+        let n_groups = 3usize;
+        let cell_to_group: Vec<usize> = (0..n_obs).map(|i| i % n_groups).collect();
+        let group_labels: Vec<Vec<String>> = (0..n_groups).map(|g| vec![format!("g{g}")]).collect();
+        // 600 contiguous columns: two full tiles and a partial third.
+        let col_indices: Vec<u32> = (20u32..620).collect();
+        assert!(
+            col_indices.len() > 2 * CSC_RUN_TILE_COLS,
+            "premise: wider than two tiles"
+        );
+        let gene_names: Vec<String> = col_indices.iter().map(|c| format!("g{c}")).collect();
+        for method in [AggregationMethod::Sum, AggregationMethod::Mean] {
+            let want = serial_csc_oracle(
+                &source,
+                &cell_to_group,
+                n_groups,
+                &col_indices,
+                method == AggregationMethod::Mean,
+            );
+            let got = pseudobulk_aggregate_csc(
+                &source,
+                &cell_to_group,
+                n_groups,
+                group_labels.clone(),
+                &["g".to_string()],
+                &gene_names,
+                &col_indices,
+                method,
+                0,
+            )
+            .unwrap();
+            assert_eq!(got.counts.len(), want.len());
+            for (i, (a, b)) in got.counts.iter().zip(&want).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{method:?} [{i}]: {a} != {b}");
             }
         }
     }

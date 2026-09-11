@@ -64,11 +64,15 @@ COMMON=(--benchmarks bench_csc_dispatch --formats $FORMATS --datasets $DATASETS
 echo "=== PR-16 parallel pseudobulk scatter: no-regression capture ==="
 echo "host      : $(hostname)"
 echo "commit    : $(git rev-parse HEAD) ($(git rev-parse --abbrev-ref HEAD))"
-DIRTY=$(git status --porcelain | grep -v '^??' || true)
+PORCELAIN=$(git status --porcelain || true)
+DIRTY=$(printf '%s\n' "$PORCELAIN" | grep -v '^??' | grep . || true)
 echo "dirty     : $(printf '%s' "$DIRTY" | grep -c . || true) tracked file(s) modified"
-if [ -n "$DIRTY" ]; then
-    # A capture attributed to a SHA must be of that SHA's tree; name what is not.
-    echo "$DIRTY" | sed 's/^/             /'
+# A capture attributed to a SHA must be of that SHA's tree; name every path
+# the harness's `git_dirty` flag sees, tracked modifications and untracked
+# files alike (the flag is any porcelain output).
+if [ -n "$PORCELAIN" ]; then
+    echo "porcelain :"
+    echo "$PORCELAIN" | sed 's/^/             /'
 fi
 echo "so sha256 : $(sha256sum "$REPO"/pyscx/python/pyscx/pyscx.cpython-*.so | cut -c1-16)…"
 echo "python    : $(command -v python) ($(python -c 'import sys; print(sys.version.split()[0])'))"

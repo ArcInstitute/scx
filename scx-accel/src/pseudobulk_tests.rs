@@ -537,12 +537,29 @@ fn column_blocks_are_bit_identical_to_the_serial_oracle_for_every_block_count() 
                     n_vars,
                     n_groups,
                     ScatterPartition::ColumnBlocks(n_blocks),
-                    &mut weights,
+                    Some(&mut weights),
                 );
                 assert_bits_eq(
                     &counts,
                     &want,
                     &format!("{n_blocks} blocks on {threads} threads"),
+                );
+                // Without a histogram (the in-memory paths): even blocks,
+                // no bump, same bits.
+                let mut counts_even = vec![0.0f64; n_groups * n_vars];
+                scatter_rows(
+                    CsrRows::of(&csr),
+                    &ctg,
+                    &mut counts_even,
+                    n_vars,
+                    n_groups,
+                    ScatterPartition::ColumnBlocks(n_blocks),
+                    None,
+                );
+                assert_bits_eq(
+                    &counts_even,
+                    &want,
+                    &format!("{n_blocks} even blocks on {threads} threads"),
                 );
                 // The one-block walk skips the histogram (a second store per
                 // nonzero on a memory-bound loop); every split bumps each
@@ -589,7 +606,7 @@ fn a_carried_weights_histogram_moves_the_plan_but_not_the_bits() {
             n_vars,
             n_groups,
             ScatterPartition::ColumnBlocks(4),
-            &mut weights,
+            Some(&mut weights),
         );
         assert_bits_eq(&counts, &want, "skewed vs even prior");
     }
@@ -620,7 +637,7 @@ fn the_group_partition_is_bit_identical_on_non_canonical_rows() {
         4,
         n_groups,
         ScatterPartition::ByGroup,
-        &mut weights,
+        Some(&mut weights),
     );
     assert_bits_eq(&counts, &want, "group partition on non-canonical rows");
     assert!(
@@ -644,7 +661,7 @@ fn the_group_partition_matches_the_oracle_on_the_float_fixture_too() {
         n_vars,
         n_groups,
         ScatterPartition::ByGroup,
-        &mut vec![0u64; n_vars],
+        Some(&mut vec![0u64; n_vars]),
     );
     assert_bits_eq(&counts, &want, "group partition on canonical float rows");
 }
@@ -1076,6 +1093,23 @@ fn from_slices_rejects_malformed_csr_triples() {
     let mut neg = csr.indptr.clone();
     neg[0] = -1;
     assert!(shape_error(run(&neg, &csr.indices, &csr.data)));
+    // positive start (would silently drop the leading nonzeros).
+    let mut late = csr.indptr.clone();
+    late[0] = 1;
+    assert!(shape_error(run(&late, &csr.indices, &csr.data)));
+    // trailing nonzeros past the last offset (would silently drop the tail).
+    let mut idx_long = csr.indices.clone();
+    idx_long.push(0);
+    let mut dat_long = csr.data.clone();
+    dat_long.push(1.0);
+    assert!(shape_error(run(&csr.indptr, &idx_long, &dat_long)));
+    // a column out of range, high and negative (would panic on a worker).
+    let mut high = csr.indices.clone();
+    high[5] = 4;
+    assert!(shape_error(run(&csr.indptr, &high, &csr.data)));
+    let mut negative = csr.indices.clone();
+    negative[5] = -1;
+    assert!(shape_error(run(&csr.indptr, &negative, &csr.data)));
     // The well-formed triple still goes through.
     assert!(run(&csr.indptr, &csr.indices, &csr.data).is_ok());
 }

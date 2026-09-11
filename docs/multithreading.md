@@ -499,7 +499,7 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 | **LISI** | `par_iter` over cells |
 | **HVG** (seurat_v3 / seurat) | Streaming shard-parallel gene statistics |
 | **Gene-set scoring** (`score_genes`) | Streaming shard-parallel mean/score computation |
-| **Pseudobulk** aggregation | Ordered shard stream; within a shard the scatter is partitioned by output column block across the pool (bit-identical to serial — see below) |
+| **Pseudobulk** aggregation | Ordered shard stream; within a shard the scatter is partitioned by output — a group row per task, or a column block of every row — across the pool (bit-identical to serial — see below) |
 | **Perturbation eval metrics** | `par_iter` over perturbations; faer `Par::rayon(0)` for distance matmul |
 
 Harmony builds an isolated `rayon::ThreadPool` scoped to the op to avoid
@@ -522,14 +522,14 @@ that knob bounds speed and memory and provably cannot change the numbers (see
 decoded-but-unconsumed shards are reserved out of `pca(memory_budget=…)` rather
 than added on top of it.
 
-Pseudobulk aggregation entered the pool the same way (OPT-ACCEL-4). Its four CSR
+Pseudobulk aggregation entered the pool the same way (OPT-ACCEL-4). Its four
 scatter sites — the streaming `pseudobulk_aggregate`, the two in-memory paths, and
 the CSC projected path — used to be one serial `counts[g·n_vars + col] += v` per
 nonzero on the calling thread with the pool idle. Each shard (or an in-memory
 matrix as a whole) now picks one of two **output** partitions, and nothing is
 merged, so for each `(group, gene)` the f64 sum is formed from the same f32
 operands in the same ascending-cell order the serial loop used — bit-identical on
-any `RAYON_NUM_THREADS`. *By group*: one task per run of group rows, each row's
+any `RAYON_NUM_THREADS`. *By group*: one task per group row, each row's
 nonzeros in stored order; reads every nonzero once and needs no sortedness, so it
 is also where a scipy CSR with unsorted or duplicated columns goes (a duplicate
 contributes both values, as it always did) — where PCA falls back to a serial
