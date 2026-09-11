@@ -613,13 +613,18 @@ fn copy_csr_class_aux(
             // typed writers (`write_obsp_shard` / `write_raw_csr_shard`) instead
             // was wrong twice over, and both were regressions:
             //
-            // 1. **The minor extent.** Those writers derive `n_minor` from the
-            //    file header — `n_vars` for a row-major shard. An `ObspCsrShard`
-            //    is obs×obs, so on any file where `n_obs != n_vars` the re-emit
-            //    either declared a graph too narrow to hold its own endpoints or
-            //    silently changed its shape. `optimize` reads `n_minor` off the
-            //    source shard for this reason and says so; this now does the
-            //    same, which is also robust to a per-shard width difference.
+            // 1. **The minor extent.** Those writers *re-derive* `n_minor`
+            //    from the writer's own state rather than carrying the source's.
+            //    They used to derive it wrongly for an `ObspCsrShard` — obs×obs,
+            //    stamped from `n_vars` — which on any file where
+            //    `n_obs != n_vars` either declared a graph too narrow to hold
+            //    its own endpoints or silently changed its shape
+            //    (OPT-FORMATIO-4, now fixed in `ScxWriter::shard_n_minor`).
+            //    Reading `n_minor` off the source shard is still the right
+            //    thing here even with the writer correct: a re-encode must
+            //    round-trip whatever a legacy file declares, not migrate it,
+            //    and it is also robust to a per-shard width difference.
+            //    `optimize` does the same and says so.
             // 2. **The section name.** `write_raw_csr_shard` names from
             //    `raw_csr_shard_count`, which `copy_section_verbatim`
             //    deliberately does not advance — the writer even predicts this

@@ -1487,6 +1487,54 @@ fn csc_arrays_for_col_range(
     (indptr, indices, values_bytes)
 }
 
+/// An obs batch of `n` synthetic cell ids, for fixtures whose row count is a
+/// parameter rather than the three-row `sample_obs`.
+fn wide_obs(n: u64) -> RecordBatch {
+    let ids: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap()
+}
+
+/// The var twin of [`wide_obs`].
+fn wide_var(n: u64) -> RecordBatch {
+    let ids: Vec<String> = (0..n).map(|i| format!("g{i}")).collect();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap()
+}
+
+/// A canonical CSR ring over `n_major` rows: row `i` holds one nonzero at
+/// column `(i + 1) % n_minor`, value `i + 1`. One entry per row is trivially
+/// strictly increasing and carries no explicit zero, so it satisfies the v3
+/// canonical-CSR invariant, and every index is `< n_minor` by construction.
+fn ring_csr(n_major: u64, n_minor: u64) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for row in 0..n_major {
+        indices.push(((row + 1) % n_minor) as u32);
+        values.push((row + 1) as u8);
+        indptr.push(indptr.last().unwrap() + 1);
+    }
+    (indptr, indices, values)
+}
+
 /// Build a header for a CSC round-trip test fixture.
 fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
     // u32 indices on disk (Phase A test fixtures use n_vars=6
@@ -1687,6 +1735,719 @@ fn test_csc_shard_large_n_obs_roundtrip() {
         );
         let expected_val = ((col % 200) as u8).saturating_add(1) as f32;
         assert_eq!(csc.data[start], expected_val, "col {col}: value mismatch");
+    }
+}
+
+/// An `ObspCsrShard` is obs x obs, so its minor extent is `n_obs` — not the
+/// per-modality `n_vars` the row-major fallthrough used to give it
+/// (OPT-FORMATIO-4).
+///
+/// This is the loud half of that defect and the case that had **no coverage at
+/// all**: with `n_vars <= u16::MAX < n_obs` the index width is derived from the
+/// same wrong extent, so `write_obsp_shard` failed the encode outright with
+/// `index 69999 exceeds u16 range`. A CSR-backed obsp graph could therefore not
+/// be written through the typed writer on any census-scale file with an
+/// ordinary gene axis; the two tests that needed the shape
+/// (`upgrade_reencodes_aux_csr_without_reshaping_or_renaming_it`,
+/// `optimize_reencodes_an_obsp_shard_wider_than_the_file_index_dtype`) had to
+/// build it through `encode_one_shard` + `write_preencoded_shard` instead.
+///
+/// Deliberately the same shape as `test_csc_shard_large_n_obs_roundtrip`, which
+/// pins the identical already-fixed bug on the CSC axis.
+#[test]
+fn obsp_csr_shard_wider_than_the_gene_axis_writes_and_round_trips() {
+    let n_obs: usize = 70_000;
+    let n_vars: usize = 100;
+    // Per-CSR-shard cap is u16 rows (BlockIndexEntry::new), so the X matrix is
+    // split; the obsp graph is one shard of one row.
+    let csr_rows_per_shard: usize = 35_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide_obsp.scx");
+    let header = csc_test_header(n_obs as u64, n_vars as u64);
+    assert_eq!(
+        header.index_dtype, 0,
+        "premise: the file's own gene axis is the narrow one, so only a \
+         per-shard widening can save the obsp graph"
+    );
+
+    let obs_ids: Vec<String> = (0..n_obs).map(|i| format!("c{i}")).collect();
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            obs_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    let var_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            var_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+
+    let mut writer = ScxWriter::new(&path, header).unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var).unwrap();
+    for shard_start in (0..n_obs).step_by(csr_rows_per_shard) {
+        let shard_rows = (shard_start + csr_rows_per_shard).min(n_obs) - shard_start;
+        writer
+            .write_csr_shard(
+                &vec![0u64; shard_rows + 1],
+                &[],
+                &[],
+                CodecId::None,
+                ValueEncoding::Uint8,
+                shard_start as u64,
+            )
+            .unwrap();
+    }
+
+    // One graph row with an endpoint at the far end of the obs axis — past
+    // u16, and far past `n_vars`.
+    let far_endpoint = (n_obs - 1) as u32;
+    let indptr: Vec<u64> = vec![0, 1];
+    let indices: Vec<u32> = vec![far_endpoint];
+    let values: Vec<u8> = vec![7];
+    writer
+        .write_obsp_shard(
+            "connectivities",
+            0,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .expect("an obs x obs graph must be writable on a file with a narrow gene axis");
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    assert_eq!(
+        reader.header().index_dtype,
+        0,
+        "the file-level width is unchanged; only the obsp shard widened"
+    );
+    let entry = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::ObspCsrShard)
+        .expect("the obsp shard is in the catalog");
+    let sh = reader.read_shard_header(entry).unwrap();
+    assert_eq!(
+        sh.n_minor as usize, n_obs,
+        "an obs x obs graph's minor extent is n_obs, not n_vars"
+    );
+    assert_eq!(
+        sh.index_dtype, 1,
+        "and its index width follows that extent, not the file header's"
+    );
+    assert_eq!(
+        entry.stats.as_ref().unwrap().col_end as usize,
+        n_obs,
+        "the catalog's minor extent must agree with the header's, or \
+         check_header_against_catalog rejects the shard on read"
+    );
+
+    // The read path has to accept it too: decode, and run the deep
+    // canonical-CSR check, which bounds every index by `n_minor`.
+    let (_, decoded_indices, decoded_values) = reader.read_shard_from_entry(entry).unwrap();
+    assert_eq!(decoded_indices, vec![far_endpoint as i32]);
+    assert_eq!(decoded_values, vec![7.0f32]);
+    reader.validate_canonical_csr_entry(entry).unwrap();
+}
+
+/// The quiet half of OPT-FORMATIO-4: on a file with fewer genes than cells but
+/// both under u16, `write_obsp_shard` **succeeded** and produced a file that
+/// failed on read, because the stamped extent declared a matrix too narrow to
+/// hold its own endpoints (`ShardIndexOutOfRange { index: 7, n_minor: 6 }`).
+///
+/// This is the shape three fixtures used to dodge by inflating `n_vars` above
+/// `n_obs`; the assertion order here puts the header first, so the read-side
+/// failure the comment below names is what you see once that one is removed.
+#[test]
+fn obsp_csr_shard_on_a_narrow_gene_axis_is_bounded_by_n_obs() {
+    let (n_obs, n_vars) = (8usize, 6usize);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("narrow_var_obsp.scx");
+
+    let obs_ids: Vec<String> = (0..n_obs).map(|i| format!("c{i}")).collect();
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            obs_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    let var_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            var_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+
+    let mut writer = ScxWriter::new(&path, csc_test_header(n_obs as u64, n_vars as u64)).unwrap();
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var).unwrap();
+    writer
+        .write_csr_shard(
+            &vec![0u64; n_obs + 1],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // A ring graph: row i -> (i + 1) % n_obs. Canonical CSR (one strictly
+    // increasing entry per row, no explicit zeros), and rows 5..8 have
+    // endpoints at or past `n_vars = 6`.
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for row in 0..n_obs {
+        indices.push(((row + 1) % n_obs) as u32);
+        values.push((row + 1) as u8);
+        indptr.push(indptr.last().unwrap() + 1);
+    }
+    writer
+        .write_obsp_shard(
+            "connectivities",
+            0,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    let entry = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::ObspCsrShard)
+        .unwrap();
+    assert_eq!(
+        reader.read_shard_header(entry).unwrap().n_minor as usize,
+        n_obs
+    );
+    // Before the fix this failed with `ShardIndexOutOfRange { index: 6,
+    // position: 5, n_minor: 6 }` — the file was written but could not be read.
+    // (Index 6, not the ring's largest endpoint: `check_minor_indices` reports
+    // the *first* offender, which is row 5's.)
+    reader.read_shard_from_entry(entry).unwrap();
+    let failures: Vec<_> = reader
+        .validate_canonical_csr_shards()
+        .into_iter()
+        .filter(|(_, ok)| !ok)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "deep validation must accept a graph whose endpoints reach n_obs: {failures:?}"
+    );
+}
+
+/// A **newly stamped** obsp shard survives the scattered framed read.
+///
+/// The positive counterpart to
+/// `the_scattered_framed_read_accepts_a_legacy_obsp_stamp`: between them they
+/// pin that both the old gene-axis stamp and the new obs-axis one are readable
+/// through this seam, which is what "the fix is for new files and must not
+/// break old ones" actually means.
+///
+/// `decode_block_index_row_runs` has no obsp caller in-tree, which is exactly
+/// why it needs a test: the same line had the identical defect on the CSC axis
+/// and it took `read_csc_columns_scattered_matches_full_decode` to surface it.
+#[test]
+fn the_scattered_framed_read_accepts_a_newly_stamped_obsp_shard() {
+    let (n_obs, n_vars) = (8usize, 6usize);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("framed_obsp.scx");
+
+    let obs_ids: Vec<String> = (0..n_obs).map(|i| format!("c{i}")).collect();
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            obs_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    let var_ids: Vec<String> = (0..n_vars).map(|i| format!("g{i}")).collect();
+    let var = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "gene_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            var_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+
+    let mut writer = ScxWriter::new(&path, csc_test_header(n_obs as u64, n_vars as u64)).unwrap();
+    // Row groups of 2 rows, so the graph is framed (shard v2) and the block
+    // index has several entries to scatter across.
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 2,
+        ..Default::default()
+    }));
+    writer.write_obs(&obs).unwrap();
+    writer.write_var(&var).unwrap();
+    writer
+        .write_csr_shard(
+            &vec![0u64; n_obs + 1],
+            &[],
+            &[],
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for row in 0..n_obs {
+        indices.push(((row + 1) % n_obs) as u32);
+        values.push((row + 1) as u8);
+        indptr.push(indptr.last().unwrap() + 1);
+    }
+    writer
+        .write_obsp_shard(
+            "connectivities",
+            0,
+            0,
+            ShardBuffers::new(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+            ),
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    let entry = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::ObspCsrShard)
+        .unwrap();
+    let header = reader.read_shard_header(entry).unwrap();
+    assert!(
+        header.shard_format_version > crate::shard::DEFAULT_WRITE_SHARD_FORMAT_VERSION,
+        "premise: the shard must be framed, or the scattered path returns None \
+         and this test passes without authenticating anything"
+    );
+
+    // Two runs in different row groups, one of them holding the endpoint that
+    // exceeds `n_vars`.
+    let runs = reader
+        .decode_block_index_row_runs(entry, &[(0, 2), (5, 2)])
+        .expect("a correctly-stamped obsp shard must survive authentication")
+        .expect("a framed shard resolves its block index");
+    assert_eq!(runs.len(), 2);
+    // Run-local CSR, byte-identical to the matching slice of a full decode.
+    assert_eq!(runs[0].1, vec![1i32, 2]);
+    assert_eq!(runs[1].1, vec![6i32, 7]);
+}
+
+/// A scattered framed read must authenticate a shard's declared `n_minor`
+/// against the **catalog**, not against a re-derivation from the file header.
+///
+/// The catalog is BLAKE3-checksummed and the shard payload is not, which is the
+/// whole reason this reconciliation exists — so the catalog's own minor extent
+/// is the authority, exactly as `check_header_against_catalog` already treats
+/// it. Re-deriving it from `FileHeader` instead was wrong in three separate
+/// ways, one per test below. Every in-tree caller of the scattered path
+/// resolves a real catalog entry (`full_entry_at_offset`), so the extent is
+/// always available.
+///
+/// These three are **accept-side only**, which on its own a check that always
+/// skipped would also satisfy. The reject side is
+/// `the_block_index_path_also_rejects_a_widened_header`, which widens a framed
+/// shard's stamped `n_minor` past the catalog's and requires the scattered
+/// read to refuse it; deleting the reconciliation reds that test, so the guard
+/// is load-bearing in both directions. Raised by Cursor Agent - Grok 4.6 High.
+///
+/// **A narrow modality's CSR shard.** `header.n_vars` is the file-wide
+/// *maximum* across modalities, while the writer correctly stamps each shard
+/// with its own modality's `n_vars` — so comparing the two rejected every
+/// framed shard of any modality that is not the widest, as "corrupt".
+/// **Pre-existing**, not introduced by the obsp fix: the arm read
+/// `if column-major { n_obs } else { n_vars }` before this PR too.
+/// Found by Antigravity - Gemini 3.8 Flash.
+#[test]
+fn the_scattered_framed_read_accepts_a_narrow_modalitys_shard() {
+    use crate::modality::ModalityType;
+
+    let (n_obs, wide_vars, narrow_vars) = (8u64, 40u64, 5u64);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multimodal_framed.scx");
+    let mut writer = ScxWriter::new(&path, csc_test_header(n_obs, wide_vars)).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 2,
+        ..Default::default()
+    }));
+    writer.write_obs(&wide_obs(n_obs)).unwrap();
+    let rna = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.set_modality_n_vars(rna, wide_vars).unwrap();
+    writer.set_modality_n_vars(adt, narrow_vars).unwrap();
+    for (modality_id, n_vars) in [(rna, wide_vars), (adt, narrow_vars)] {
+        let (indptr, indices, values) = ring_csr(n_obs, n_vars);
+        writer
+            .write_csr_shard_for(
+                modality_id,
+                0,
+                ShardBuffers::new(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                ),
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    let narrow = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::CsrShard && e.modality_id == adt)
+        .expect("the adt modality's CSR shard is in the catalog");
+    assert_eq!(
+        reader.read_shard_header(narrow).unwrap().n_minor as u64,
+        narrow_vars,
+        "premise: the writer stamps the modality's own n_vars, not the \
+         file-wide maximum, or this file cannot tell the two apart"
+    );
+    reader
+        .decode_block_index_row_runs(narrow, &[(0, 2)])
+        .expect("a narrow modality's framed shard must survive authentication")
+        .expect("it is framed");
+}
+
+/// A scattered framed read must authenticate a shard's declared `n_minor`
+/// against the **catalog**, not against a re-derivation from the file header.
+///
+/// The catalog is BLAKE3-checksummed and the shard payload is not, which is the
+/// whole reason this reconciliation exists — so the catalog's own minor extent
+/// is the authority, exactly as `check_header_against_catalog` already treats
+/// it. Re-deriving it from `FileHeader` instead was wrong in three separate
+/// ways, one per test below. Every in-tree caller of the scattered path
+/// resolves a real catalog entry (`full_entry_at_offset`), so the extent is
+/// always available.
+///
+/// These three are **accept-side only**, which on its own a check that always
+/// skipped would also satisfy. The reject side is
+/// `the_block_index_path_also_rejects_a_widened_header`, which widens a framed
+/// shard's stamped `n_minor` past the catalog's and requires the scattered
+/// read to refuse it; deleting the reconciliation reds that test, so the guard
+/// is load-bearing in both directions. Raised by Cursor Agent - Grok 4.6 High.
+///
+/// **A `.raw` shard.** `.raw` has its own, usually wider, gene axis, so the
+/// file's `n_vars` is simply the wrong number for it.
+/// Found by Cursor Agent - Grok 4.6 High.
+#[test]
+fn the_scattered_framed_read_accepts_a_raw_shard_on_its_own_gene_axis() {
+    let (n_obs, n_vars, raw_vars) = (8u64, 5u64, 40u64);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw_framed.scx");
+    let mut writer = ScxWriter::new(&path, csc_test_header(n_obs, n_vars)).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 2,
+        ..Default::default()
+    }));
+    writer.write_obs(&wide_obs(n_obs)).unwrap();
+    writer.write_var(&wide_var(n_vars)).unwrap();
+    let (indptr, indices, values) = ring_csr(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.set_raw_n_vars(raw_vars);
+    let (r_indptr, r_indices, r_values) = ring_csr(n_obs, raw_vars);
+    writer
+        .write_raw_csr_shard(
+            &r_indptr,
+            &r_indices,
+            &r_values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+    writer.write_raw_var(&wide_var(raw_vars)).unwrap();
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    let raw = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::RawCsrShard)
+        .unwrap();
+    assert_eq!(
+        reader.read_shard_header(raw).unwrap().n_minor as u64,
+        raw_vars,
+        "premise: .raw is stamped on its own gene axis"
+    );
+    reader
+        .decode_block_index_row_runs(raw, &[(0, 2)])
+        .expect("a .raw shard must survive authentication on its own axis")
+        .expect("it is framed");
+}
+
+/// A scattered framed read must authenticate a shard's declared `n_minor`
+/// against the **catalog**, not against a re-derivation from the file header.
+///
+/// The catalog is BLAKE3-checksummed and the shard payload is not, which is the
+/// whole reason this reconciliation exists — so the catalog's own minor extent
+/// is the authority, exactly as `check_header_against_catalog` already treats
+/// it. Re-deriving it from `FileHeader` instead was wrong in three separate
+/// ways, one per test below. Every in-tree caller of the scattered path
+/// resolves a real catalog entry (`full_entry_at_offset`), so the extent is
+/// always available.
+///
+/// These three are **accept-side only**, which on its own a check that always
+/// skipped would also satisfy. The reject side is
+/// `the_block_index_path_also_rejects_a_widened_header`, which widens a framed
+/// shard's stamped `n_minor` past the catalog's and requires the scattered
+/// read to refuse it; deleting the reconciliation reds that test, so the guard
+/// is load-bearing in both directions. Raised by Cursor Agent - Grok 4.6 High.
+///
+/// **A legacy obsp shard carrying the pre-fix `n_vars` stamp.** Such a file is
+/// accepted by the whole-shard decoder — which compares the header against the
+/// catalog, and the two agree — so authenticating the scattered path against
+/// `n_obs` instead would split one file across two public read paths. The
+/// writer fix is for new files; it must not make an old one unreadable through
+/// one seam and readable through another.
+/// Found by codex - gpt-5.6-sol.
+#[test]
+fn the_scattered_framed_read_accepts_a_legacy_obsp_stamp() {
+    // `n_vars > n_obs` is the only shape the pre-fix writer could emit an
+    // obsp shard on at all, which is exactly why it is the shape a legacy
+    // file has.
+    let (n_obs, n_vars) = (8u64, 12u64);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy_obsp_framed.scx");
+    let mut writer = ScxWriter::new(&path, csc_test_header(n_obs, n_vars)).unwrap();
+    writer.set_framing(Some(crate::encoder::FramingConfig {
+        row_group_rows: 2,
+        ..Default::default()
+    }));
+    writer.write_obs(&wide_obs(n_obs)).unwrap();
+    writer.write_var(&wide_var(n_vars)).unwrap();
+    let (indptr, indices, values) = ring_csr(n_obs, n_vars);
+    writer
+        .write_csr_shard(
+            &indptr,
+            &indices,
+            &values,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            0,
+        )
+        .unwrap();
+
+    // Stamped through the pre-encoded seam with the **old** extent, since
+    // the fixed typed writer can no longer produce it.
+    let (o_indptr, o_indices, o_values) = ring_csr(n_obs, n_obs);
+    let values_f32: Vec<f32> = o_values.iter().map(|&v| v as f32).collect();
+    let mut enc_opts = crate::EncodeShardOptions::new(
+        "obsp/connectivities_shard_0".to_string(),
+        SectionType::ObspCsrShard,
+        n_vars, // the legacy, wrong-axis extent
+        0,
+        0,
+    );
+    enc_opts.explicit_codec = Some(CodecId::None);
+    enc_opts.value_encoding = Some(ValueEncoding::Uint8);
+    enc_opts.framing = writer.framing();
+    let pre =
+        crate::encoder::encode_one_shard(&o_indptr, &o_indices, &values_f32, &enc_opts).unwrap();
+    writer.write_preencoded_shard(pre).unwrap();
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    let obsp = reader
+        .catalog()
+        .entries
+        .iter()
+        .find(|e| e.section_type == SectionType::ObspCsrShard)
+        .unwrap();
+    assert_eq!(
+        reader.read_shard_header(obsp).unwrap().n_minor as u64,
+        n_vars,
+        "premise: this fixture carries the legacy gene-axis stamp"
+    );
+    // The whole-shard decoder accepts it (header and catalog agree), so the
+    // scattered path must too, or one file reads two ways.
+    reader.read_shard_from_entry(obsp).unwrap();
+    reader
+        .decode_block_index_row_runs(obsp, &[(0, 2)])
+        .expect("a legacy obsp stamp must not split the two read paths")
+        .expect("it is framed");
+}
+
+/// `write_obsp_shard_for` writes inside a `with_modality` scope, where the
+/// row-major fallthrough resolves to *that modality's* `n_vars` — so the
+/// per-modality obsp writer was wrong twice over. The obs axis is file-global
+/// and shared by every modality, so `MinorAxis::Obs` must not be resolved
+/// per-modality.
+#[test]
+fn per_modality_obsp_takes_the_global_obs_axis_not_the_modality_gene_axis() {
+    use crate::modality::ModalityType;
+
+    let (n_obs, rna_vars, adt_vars) = (8u64, 5u64, 3u64);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("multimodal_obsp.scx");
+
+    let obs_ids: Vec<String> = (0..n_obs).map(|i| format!("c{i}")).collect();
+    let obs = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "cell_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(
+            obs_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+
+    // The file header's `n_vars` is the max across modalities; neither
+    // modality's own count equals `n_obs`, so a per-modality resolution and a
+    // file-wide one are both distinguishable from the right answer.
+    let mut writer = ScxWriter::new(&path, csc_test_header(n_obs, rna_vars)).unwrap();
+    writer.write_obs(&obs).unwrap();
+    let rna = writer
+        .add_modality(
+            "rna",
+            ModalityType::Rna,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    let adt = writer
+        .add_modality(
+            "adt",
+            ModalityType::Protein,
+            CodecId::None,
+            ValueEncoding::Uint8,
+            false,
+        )
+        .unwrap();
+    writer.set_modality_n_vars(rna, rna_vars).unwrap();
+    writer.set_modality_n_vars(adt, adt_vars).unwrap();
+
+    // A ring graph over the shared obs axis, written once per modality.
+    let mut indptr = vec![0u64];
+    let (mut indices, mut values) = (Vec::new(), Vec::new());
+    for row in 0..n_obs {
+        indices.push(((row + 1) % n_obs) as u32);
+        values.push((row + 1) as u8);
+        indptr.push(indptr.last().unwrap() + 1);
+    }
+    for modality_id in [rna, adt] {
+        writer
+            .write_obsp_shard_for(
+                modality_id,
+                "connectivities",
+                0,
+                0,
+                ShardBuffers::new(
+                    &indptr,
+                    &indices,
+                    &values,
+                    CodecId::None,
+                    ValueEncoding::Uint8,
+                ),
+            )
+            .expect("an obs x obs graph is expressible inside a modality scope");
+    }
+    writer.finish().unwrap();
+
+    let reader = crate::reader::ScxReader::open(&path).unwrap();
+    let entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == SectionType::ObspCsrShard)
+        .collect();
+    assert_eq!(entries.len(), 2, "one graph per modality");
+    for entry in entries {
+        let sh = reader.read_shard_header(entry).unwrap();
+        assert_eq!(
+            sh.n_minor as u64, n_obs,
+            "{}: obs is the global axis, so the extent is n_obs for every \
+             modality — not rna's {rna_vars} or adt's {adt_vars}",
+            entry.name
+        );
+        reader.read_shard_from_entry(entry).unwrap();
     }
 }
 

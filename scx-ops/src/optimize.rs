@@ -351,11 +351,12 @@ pub fn optimize_with_budget(
                 // source header, rather than the file-level `n_vars`. That is
                 // what makes this a faithful re-encode: whatever the source
                 // declares round-trips, including a per-shard width difference
-                // and including an `ObspCsrShard`, whose extent the *writer*
-                // derives wrongly (obs x obs, stamped from `n_vars` -- see
-                // `ScxWriter::shard_n_minor`). Re-deriving it here would either
-                // reproduce that defect or silently change the extent on files
-                // that already carry it.
+                // and including an `ObspCsrShard`, whose obs x obs extent the
+                // writer once derived from `n_vars` (OPT-FORMATIO-4, fixed in
+                // `ScxWriter::shard_n_minor`). Re-deriving it here would
+                // silently change the extent on a file that already carries the
+                // legacy value -- which is the one place that value must
+                // survive, since a faithful re-encode is not a migration.
                 let mut enc_opts = scx_format_io::EncodeShardOptions::new(
                     entry.name.clone(),
                     entry.section_type,
@@ -789,7 +790,7 @@ mod tests {
     /// An explicit codec must reach **every** shard, and the output must be
     /// byte-identical however many shards the re-encode holds in flight.
     ///
-    /// Both halves exist because of what the twelve-arm `op_output_identity`
+    /// Both halves exist because of what the thirteen-arm `op_output_identity`
     /// golden cannot see here: every arm that drives `optimize` passes
     /// `codec: None`, so replacing the caller's codec with `None` inside the
     /// parallel map leaves the golden green. And a single-chunk run says nothing
@@ -799,12 +800,15 @@ mod tests {
     /// re-encoding one must use the shard's own index width rather than the
     /// file header's.
     ///
-    /// The fixture has to be built through `encode_one_shard` +
-    /// `write_preencoded_shard`, because `ScxWriter::write_obsp_shard` **cannot
-    /// express it**: it derives the extent from `n_vars` and would reject the
-    /// very shard this test needs ("index N exceeds u16 range"). That is the
-    /// known writer defect documented on `ScxWriter::shard_n_minor`, and it is
-    /// why `upgrade` builds its obsp fixtures the same way.
+    /// The fixture is built through `encode_one_shard` +
+    /// `write_preencoded_shard`. That used to be forced —
+    /// `ScxWriter::write_obsp_shard` derived the extent from `n_vars` and
+    /// rejected this very shard with "index N exceeds u16 range" — and is now
+    /// only a convenience: OPT-FORMATIO-4 fixed `ScxWriter::shard_n_minor`, and
+    /// `obsp_csr_shard_wider_than_the_gene_axis_writes_and_round_trips` pins
+    /// the typed writer on exactly this shape. Kept on the pre-encoded seam so
+    /// this test still covers the *source* half it was written for: a shard
+    /// whose stamped width disagrees with the file header's.
     ///
     /// Before the fix, `optimize` read `sh.n_minor` back from the source header
     /// but took `index_dtype` from the *file* header, so the pair was

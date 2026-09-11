@@ -1028,16 +1028,30 @@ impl ScxReader {
         // so without this it stayed the one way a widened payload could still get
         // an out-of-range index out of the reader — via a *scattered* framed read
         // while the whole-shard paths rejected the same file.
-        // The minor axis is per shard *class*, not universal: a row-major shard's
-        // minor extent is the column count, a CSC sidecar's is `n_obs`. Using
-        // `n_vars` for both rejected every scattered CSC read — caught by
+        // The minor extent comes from the **catalog**, never from a
+        // re-derivation off the `FileHeader`. The catalog is checksummed and
+        // the shard payload is not, which is the whole point of reconciling at
+        // all — and it is what `check_header_against_catalog` already compares
+        // the whole-shard decode against, so the two seams accept the same set
+        // of files. Re-deriving it was wrong for a multimodal shard (stamped
+        // with its modality's `n_vars`, compared against the file-wide max),
+        // for `.raw` (its own gene axis, not on the header), and for an
+        // `ObspCsrShard` written before OPT-FORMATIO-4 (the legacy gene-axis
+        // stamp, which the catalog agrees with). An earlier version used
+        // `n_vars` for everything row-major, which also rejected every
+        // scattered CSC read — caught by
         // `read_csc_columns_scattered_matches_full_decode`.
-        let authenticated_minor =
-            if crate::shard_decode::catalog_says_column_major(entry.section_type) {
-                self.header.n_obs
-            } else {
-                self.header.n_vars
-            };
+        //
+        // No stats, no authority: skip, exactly as
+        // `check_header_against_catalog` does. Unreachable from here in
+        // practice — every in-tree caller resolves a real entry via
+        // `full_entry_at_offset`, and the backed reader's own stats-less
+        // whole-shard decodes go through `check_decoded_shard_minor`.
+        let authenticated_minor = entry
+            .stats
+            .as_ref()
+            .map(|stats| crate::shard_decode::catalog_minor_extent(stats, entry.section_type))
+            .unwrap_or(0);
         crate::shard_decode::reconcile_declared_minor(
             header.n_minor,
             authenticated_minor,

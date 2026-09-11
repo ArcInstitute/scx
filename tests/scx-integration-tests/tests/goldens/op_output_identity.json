@@ -2157,6 +2157,106 @@
         }
       ]
     },
+    "optimize_csr_obsp": {
+      "strictness": "Content",
+      "excluded_section_types": [
+        11
+      ],
+      "header": {
+        "format_version": 3,
+        "flags": 8,
+        "n_obs": 8,
+        "n_vars": 6,
+        "nnz": 16,
+        "n_csr_shards": 2,
+        "n_csc_shards": 0,
+        "shard_target_rows": 4,
+        "codec_id": 1,
+        "index_dtype": 0,
+        "manifest_sequence": 0,
+        "n_modalities": 0
+      },
+      "catalog": {
+        "catalog_version": 4,
+        "manifest_sequence": 0,
+        "n_obs": 8,
+        "data_generation": 2,
+        "csc_build_generation": 0
+      },
+      "sections": [
+        {
+          "name": "X_shard_0",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 144,
+          "blake3": "ac0ddaeebc11ba0e3dbfdf41e317879ff151c52f3210e3548ac7b83eb071e6d4",
+          "stats": {
+            "row_start": 0,
+            "row_end": 4,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 8,
+            "value_min": 2,
+            "value_max": 6,
+            "value_sum": 32,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "X_shard_1",
+          "section_type": 4,
+          "modality_id": 0,
+          "length": 145,
+          "blake3": "727195a89b55e250e72fb36fd3f03f59faacc3c5d9b43fe1a6f0eabca658f066",
+          "stats": {
+            "row_start": 4,
+            "row_end": 8,
+            "col_start": 0,
+            "col_end": 6,
+            "nnz": 8,
+            "value_min": 6,
+            "value_max": 10,
+            "value_sum": 64,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "obs",
+          "section_type": 0,
+          "modality_id": 0,
+          "length": 1658,
+          "blake3": "8441e85f0ed919793fffc17c10abf80e8b4ee8b53ae19879ddf3e421de1fe575"
+        },
+        {
+          "name": "obsp/connectivities_shard_0",
+          "section_type": 9,
+          "modality_id": 0,
+          "length": 156,
+          "blake3": "51eec423a0b368daeb6c69759350f66372f2c82117bc68cc21106ffb5c22dd38",
+          "stats": {
+            "row_start": 0,
+            "row_end": 8,
+            "col_start": 0,
+            "col_end": 8,
+            "nnz": 8,
+            "value_min": 1,
+            "value_max": 8,
+            "value_sum": 36,
+            "n_indexed_columns": 0,
+            "column_stats": []
+          }
+        },
+        {
+          "name": "var",
+          "section_type": 2,
+          "modality_id": 0,
+          "length": 1138,
+          "blake3": "694e7da91331e7f95fda16d1d1faba12c491a6726243c6084ecf58b21c78c28c"
+        }
+      ]
+    },
     "optimize_framed": {
       "strictness": "Content",
       "excluded_section_types": [

@@ -17,7 +17,7 @@ use crate::error::{Result, ScxError};
 use crate::header::{FileHeader, HEADER_SIZE};
 use crate::modality::{ModalityFlags, ModalityInfo, ModalityTable, ModalityType, MAX_MODALITIES};
 use crate::section::{align_to_8, SectionType};
-use crate::shard::{derive_shard_type, ShardHeader, SHARD_HEADER_SIZE};
+use crate::shard::{derive_shard_type, MinorAxis, ShardHeader, SHARD_HEADER_SIZE};
 
 use crate::provenance::{Provenance, ProvenanceEntry};
 
@@ -1009,43 +1009,46 @@ impl ScxWriter {
     /// The minor-axis extent this writer stamps on a shard of `section_type`.
     ///
     /// `write_shard_inner` derives the per-shard index width from this, and had
-    /// this same three-arm match written out three
-    /// times — for the index dtype, for the shard header's `n_minor`, and for
-    /// the stats' minor extent.
+    /// this same match written out three times — for the index dtype, for the
+    /// shard header's `n_minor`, and for the stats' minor extent. Which axis a
+    /// section measures its minor extent on is
+    /// [`scx_format::shard::minor_axis`]'s answer, not this function's; all
+    /// this does is resolve that axis against the writer's own state.
     ///
-    /// * `RawCsrShard` is row-major but has its **own** column axis
-    ///   (`raw_n_vars`), independent of `header.n_vars`.
-    /// * Any column-major shard — `CscShard` **and** `LayerCscShard`; matching
-    ///   only the former once wrote a layer sidecar's stats on the row axis
-    ///   while the readers looked on the column axis — has `n_obs` as its minor
-    ///   axis.
-    /// * Everything else is row-major with a **per-modality** column count:
-    ///   inside a [`Self::with_modality`] scope that modality's `n_vars`, not
+    /// * [`MinorAxis::RawVar`] — `.raw` is row-major but has its **own** column
+    ///   axis (`raw_n_vars`), independent of `header.n_vars`.
+    /// * [`MinorAxis::Obs`] — a column-major shard (`CscShard` **and**
+    ///   `LayerCscShard`; matching only the former once wrote a layer sidecar's
+    ///   stats on the row axis while the readers looked on the column axis),
+    ///   and `ObspCsrShard`, which is row-major but whose *columns* are cells:
+    ///   an obsp graph is obs x obs. Resolved from `header.n_obs` even inside a
+    ///   [`Self::with_modality`] scope, because obs is the global axis every
+    ///   modality shares — that is what makes
+    ///   [`Self::write_obsp_shard_for`] correct rather than stamping the
+    ///   modality's `n_vars` on a cell axis.
+    /// * [`MinorAxis::Var`] — everything else, with a **per-modality** column
+    ///   count: inside a `with_modality` scope that modality's `n_vars`, not
     ///   the file-wide max, or every shard in a multi-modality file gets
     ///   stamped with the max and column-range pruning breaks.
     ///
-    /// **Known wrong for `ObspCsrShard`, and preserved as-is.** An obsp graph
-    /// is obs×obs, so its minor axis is `n_obs`, but it falls into the last arm
-    /// and gets `n_vars`. Two consequences, both already recorded at
-    /// `scx-cli/src/upgrade.rs`'s
-    /// `upgrade_reencodes_aux_csr_without_reshaping_or_renaming_it`: the
-    /// stamped extent can declare a matrix too narrow to hold its own data, and
-    /// where `n_vars <= u16::MAX < n_obs` the write fails outright with "index
-    /// N exceeds u16 range" — so a CSR-backed obsp cannot be written at all
-    /// through [`Self::write_obsp_shard`] on a file with more than ~65k cells
-    /// and an ordinary gene axis. `upgrade` works around it by going through
-    /// `encode_one_shard` with an extent it computes itself, and `optimize`
-    /// reads `sh.n_minor` back from the source header rather than re-deriving
-    /// it. Extracting this function did not change that behaviour and
-    /// deliberately does not fix it: correcting the arm changes the `n_minor`
-    /// stamped on every newly written obsp shard, which is an on-disk change
-    /// needing its own decision about existing files. It is now at least stated
-    /// in one place instead of three.
+    /// The obsp arm is the fix for OPT-FORMATIO-4. Before it, an obsp graph was
+    /// stamped from `n_vars`, so `write_obsp_shard` could not emit one at all
+    /// on a file with more cells than genes: the index width derived from the
+    /// same wrong extent, so an endpoint past 65535 failed the encode outright,
+    /// and where it did write, the extent declared a matrix too narrow to hold
+    /// its own data and the shard failed on read. Three fixtures existed only
+    /// to dodge it, and `optimize` / `copy_csr_class_aux` still round-trip the
+    /// source shard's own `n_minor` rather than re-deriving it — correct for a
+    /// re-encode of a legacy file, and unrelated to this arm.
     fn shard_n_minor(&self, section_type: SectionType) -> u64 {
-        match section_type {
-            SectionType::RawCsrShard => self.raw_n_vars,
-            st if crate::shard::is_column_major(st) => self.header.n_obs,
-            _ => {
+        match crate::shard::minor_axis(section_type) {
+            Some(MinorAxis::RawVar) => self.raw_n_vars,
+            Some(MinorAxis::Obs) => self.header.n_obs,
+            // `None` is unreachable: every caller of `write_shard_inner`
+            // passes a sparse shard type. Resolving it to the gene axis keeps
+            // the old behaviour for a section that has no minor extent to
+            // record, rather than adding an error path no caller can hit.
+            Some(MinorAxis::Var) | None => {
                 if self.current_modality_id > 0 {
                     self.modalities
                         .get((self.current_modality_id - 1) as usize)
@@ -3163,10 +3166,12 @@ fn clear_csr_shard_column_stats_inner(
 /// `major_kind` distinguishes row-major (CSR/Layer/Obsp) and
 /// column-major (CSC) shards. `major_start` is the global index where
 /// this shard begins on its primary axis; `n_major` is the count of
-/// major-axis entries in the shard. `n_minor` is the count of entries
-/// on the OTHER axis (file-wide `n_vars` for row-major shards or
-/// file-wide `n_obs` for column-major shards) — used to populate the
-/// "full range" pair for v2 symmetry.
+/// major-axis entries in the shard. `n_minor` is the shard's extent on
+/// the OTHER axis — used to populate the "full range" pair for v2
+/// symmetry. Which file-level axis that is depends on the section
+/// type, **not** on storage order: `ScxWriter::shard_n_minor` resolves
+/// it, and an `ObspCsrShard` is the case that makes the distinction
+/// load-bearing (row-major, but obs x obs).
 pub fn compute_shard_stats(
     values: &[u8],
     value_encoding: ValueEncoding,

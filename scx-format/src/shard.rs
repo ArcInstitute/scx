@@ -215,6 +215,114 @@ pub fn is_column_major(section_type: SectionType) -> bool {
     )
 }
 
+/// Which **file-level** axis a shard's minor extent is measured on.
+///
+/// **The one place that question is answered**, and a different question from
+/// [`is_column_major`], which answers *storage order*. The two disagree for
+/// exactly one section type: an `ObspCsrShard` is row-major
+/// (`derive_shard_type == 0`, it tiles the obs axis like any CSR shard) but its
+/// columns are obs, not var — an obsp graph is obs x obs.
+///
+/// That disagreement is why this exists. The rule had been written out four
+/// separate times — the writer's `n_minor` / `index_dtype` / stats choice, the
+/// v1 catalog reconciliation, its open-time guard, and the scattered framed
+/// read's `authenticated_minor` — and every one of them spelled it as "`n_obs`
+/// if column-major else `n_vars`", so every one of them was wrong for obsp.
+/// The writer stamped a gene-axis extent on a cell-axis graph, which made
+/// `ScxWriter::write_obsp_shard` unable to emit a CSR-backed obsp graph at all
+/// on any file with more cells than genes.
+///
+/// [`MinorAxis::Obs`] is deliberately **not** per-modality: obs is the global
+/// axis every modality shares, so an obsp shard written inside a
+/// `with_modality` scope still takes `header.n_obs`, never that modality's
+/// `n_vars`.
+///
+/// **The match below is exhaustive on purpose — no `_` arm.** An earlier
+/// version wrapped up every non-sparse type with `_ => Var`, and a test swept
+/// every discriminant asserting the same table; adding a sparse section type
+/// would have fallen through both and passed silently. Listing the variants
+/// makes it a compile error in this crate instead, which is the only version of
+/// this guard that actually forces a decision. The cost is that the
+/// column-major pair is restated here rather than delegated to
+/// [`is_column_major`]; `scx-format-io`'s `minor_axis_agrees_with_storage_order`
+/// cross-checks the two so they cannot drift.
+///
+/// One production caller today: `ScxWriter::shard_n_minor`, which is the only
+/// place that *decides* a shard's extent. Readers do not consult this — they
+/// authenticate against the catalog's own recorded extent, which is
+/// checksummed. That asymmetry is deliberate and is half the fix: a reader that
+/// re-derives the axis is a reader that can disagree with the file in front of
+/// it.
+///
+/// Two reviewers proposed collapsing this into that one caller. Kept because
+/// it is the format rule `docs/format.md` states, and because it belongs next
+/// to `SectionType`: the exhaustive match is what makes adding a sparse
+/// section type a decision rather than a default, and an out-of-tree writer
+/// needs the rule without reimplementing it. The honest half of that objection
+/// — that it used to answer `Var` for 22 sections with no minor axis at all —
+/// is fixed by the `Option` return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinorAxis {
+    /// The per-modality gene axis (`header.n_vars`, or the modality's own
+    /// `n_vars` inside a `with_modality` scope). Every ordinary row-major CSR
+    /// shard.
+    Var,
+    /// The file-global cell axis (`header.n_obs`). Column-major sidecars, whose
+    /// minor axis is rows, and `ObspCsrShard`, whose columns are cells.
+    Obs,
+    /// `.raw`'s own wider gene axis (`raw_n_vars`), independent of
+    /// `header.n_vars`.
+    RawVar,
+}
+
+/// The axis a shard of `section_type` measures its minor extent on, or `None`
+/// for a section that has no minor axis at all. See [`MinorAxis`].
+///
+/// `None` rather than a defaulted [`MinorAxis::Var`]: Arrow IPC metadata,
+/// embeddings, blobs, indexes and sidecars have no second axis, and answering
+/// "var" for them is a false statement a caller cannot distinguish from a real
+/// one. Reported by codex - gpt-5.6-sol and Antigravity - Gemini 3.8 Flash.
+pub fn minor_axis(section_type: SectionType) -> Option<MinorAxis> {
+    use SectionType as S;
+    match section_type {
+        // `.raw` carries its own, usually wider, gene axis.
+        S::RawCsrShard => Some(MinorAxis::RawVar),
+        // Column-major: the minor axis is rows, i.e. cells. Kept in step with
+        // `is_column_major` by `minor_axis_agrees_with_storage_order`.
+        S::CscShard | S::LayerCscShard => Some(MinorAxis::Obs),
+        // Row-major, but the columns are cells: an obsp graph is obs x obs.
+        S::ObspCsrShard => Some(MinorAxis::Obs),
+        // Row-major on the gene axis, per modality.
+        S::CsrShard | S::LayerCsrShard => Some(MinorAxis::Var),
+        // No minor axis — Arrow IPC metadata, embeddings, blobs, indexes,
+        // sidecars. Listed rather than swept up by a `_` arm so that adding a
+        // section type is a compile error here rather than a silent default.
+        S::ObsMetadata
+        | S::ObsIndex
+        | S::VarMetadata
+        | S::VarIndex
+        | S::BitmapShard
+        | S::ObsmEmbedding
+        | S::UnsBlob
+        | S::Provenance
+        | S::DeletionVectors
+        | S::ObsPredicateIndex
+        | S::VarPredicateIndex
+        | S::ModalityTable
+        | S::VarmEmbedding
+        | S::ObspEmbedding
+        | S::VarpEmbedding
+        | S::ObsmEmbeddingShard
+        | S::VarmEmbeddingShard
+        | S::ObspEmbeddingShard
+        | S::VarpEmbeddingShard
+        | S::ObsMetadataShard
+        | S::VarMetadataShard
+        | S::RawVarMetadata
+        | S::GroupIndex => None,
+    }
+}
+
 impl ShardHeader {
     /// Returns true if this shard is column-major (CSC).
     ///

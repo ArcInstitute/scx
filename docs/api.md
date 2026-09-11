@@ -23,8 +23,19 @@ BitmapShard (6)        — Per-shard detection bitmap sidecar (gene →
                          [docs/format.md § Detection Bitmap](format.md#12-detection-bitmap-optional).
 LayerCsrShard (7)      — Alternative expression layers
 ObsmEmbedding (8)      — Embeddings (obsm)
-ObspCsrShard (9)       — Reserved (legacy); current obsp persistence uses
-                         ObspEmbedding (18).
+ObspCsrShard (9)       — CSR-backed obs x obs graph. Written by
+                         `ScxWriter::write_obsp_shard`, checked by
+                         `scx validate --deep` against the v3 canonical-CSR
+                         invariant, re-encoded by `scx optimize`, and
+                         preserved by `scx upgrade` / `scx build-csc` —
+                         build-csc copies it verbatim, while upgrade
+                         canonicalizes a non-canonical pre-v3 graph and
+                         re-encodes it, carrying the source shard's own
+                         minor extent rather than re-deriving one. No read
+                         API materialises it: `read_obsp` / `list_obsp` — and
+                         so `to_anndata`'s `obsp` — see only the COO forms,
+                         ObspEmbedding (18) / ObspEmbeddingShard (22), which
+                         is what every conversion path writes.
 UnsBlob (10)           — Unstructured metadata (JSON)
 Provenance (11)        — Operation history
 DeletionVectors (12)   — Logical deletion tracking (Roaring Bitmap)
@@ -117,7 +128,12 @@ GroupIndex (29)        — Condition/label-grouped sharding sidecar (one per
 - `write_obs(batch)`/`write_var(batch)` — Arrow IPC metadata
 - `write_csr_shard(indptr, indices, values, ...)` — CSR expression data
 - `write_layer_csr_shard(name, ...)` — Named layer CSR data
-- `write_obsp_shard(name, ...)` — Cell-cell graph CSR data
+- `write_obsp_shard(name, ...)` — Cell-cell graph CSR data. The shard's
+  minor extent is stamped from `header.n_obs` (an obsp graph is obs x obs), so
+  the per-shard index width follows the cell axis and not the gene axis; on a
+  multimodal file `write_obsp_shard_for` stamps the same global `n_obs`, never
+  the modality's `n_vars`. Canonical CSR is a precondition — this writer does
+  not canonicalize.
 - `write_obsm(name, batch)` — Embeddings
 - `write_uns(json)` — JSON metadata
 - `write_provenance(operations)` — Operation history

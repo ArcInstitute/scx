@@ -144,6 +144,12 @@ impl ScxReader {
     ///
     /// No-op for v2+, where the column pair is on disk and the reconciliation
     /// is itself a no-op.
+    ///
+    /// `ObspCsrShard` is checked against `n_vars` like the others, which is the
+    /// *wrong* axis for an obs x obs graph — deliberately, and only here. See
+    /// `FullCatalog::reconcile_v1_csr_col_range`: this asserts that the
+    /// reconciliation ran, so it must expect exactly what that function writes,
+    /// and that function keeps the legacy axis so legacy files stay readable.
     fn check_v1_catalog_reconciled(catalog: &FullCatalog, header: &FileHeader) -> Result<()> {
         if catalog.catalog_version >= 2 || header.n_vars == 0 {
             return Ok(());
