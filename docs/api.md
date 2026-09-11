@@ -26,8 +26,12 @@ ObsmEmbedding (8)      — Embeddings (obsm)
 ObspCsrShard (9)       — CSR-backed obs x obs graph. Written by
                          `ScxWriter::write_obsp_shard`, checked by
                          `scx validate --deep` against the v3 canonical-CSR
-                         invariant, re-encoded by `scx optimize` and carried
-                         verbatim by `scx upgrade` / `scx build-csc`. No read
+                         invariant, re-encoded by `scx optimize`, and
+                         preserved by `scx upgrade` / `scx build-csc` —
+                         build-csc copies it verbatim, while upgrade
+                         canonicalizes a non-canonical pre-v3 graph and
+                         re-encodes it, carrying the source shard's own
+                         minor extent rather than re-deriving one. No read
                          API materialises it: `read_obsp` / `list_obsp` — and
                          so `to_anndata`'s `obsp` — see only the COO forms,
                          ObspEmbedding (18) / ObspEmbeddingShard (22), which

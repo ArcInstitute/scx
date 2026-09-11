@@ -1368,7 +1368,7 @@ mod tests {
         ] {
             assert_eq!(
                 minor_axis(st),
-                expected,
+                Some(expected),
                 "{st:?}: minor_axis disagrees with docs/format.md \u{a7} Minor-axis \
                  extent by section type"
             );
@@ -1397,10 +1397,10 @@ mod tests {
             if is_column_major(st) {
                 assert_eq!(
                     minor_axis(st),
-                    MinorAxis::Obs,
+                    Some(MinorAxis::Obs),
                     "{st:?} (id {raw}): a column-major shard's minor axis is rows"
                 );
-            } else if minor_axis(st) == MinorAxis::Obs {
+            } else if minor_axis(st) == Some(MinorAxis::Obs) {
                 row_major_on_obs.push(st);
             }
         }
@@ -1409,6 +1409,22 @@ mod tests {
             vec![SectionType::ObspCsrShard],
             "exactly one section type is row-major yet measured on obs"
         );
+
+        // A section with no second axis says so, rather than answering `Var`
+        // — a caller cannot tell a defaulted answer from a real one.
+        for st in [
+            SectionType::ObsMetadata,
+            SectionType::UnsBlob,
+            SectionType::BitmapShard,
+            SectionType::ObspEmbeddingShard,
+            SectionType::GroupIndex,
+        ] {
+            assert_eq!(
+                minor_axis(st),
+                None,
+                "{st:?} is not a sparse shard and has no minor axis"
+            );
+        }
     }
 
     /// A minimal, otherwise-valid shard header for the dispatch sweep. Only

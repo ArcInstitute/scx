@@ -1042,9 +1042,13 @@ impl ScxWriter {
     /// re-encode of a legacy file, and unrelated to this arm.
     fn shard_n_minor(&self, section_type: SectionType) -> u64 {
         match crate::shard::minor_axis(section_type) {
-            MinorAxis::RawVar => self.raw_n_vars,
-            MinorAxis::Obs => self.header.n_obs,
-            MinorAxis::Var => {
+            Some(MinorAxis::RawVar) => self.raw_n_vars,
+            Some(MinorAxis::Obs) => self.header.n_obs,
+            // `None` is unreachable: every caller of `write_shard_inner`
+            // passes a sparse shard type. Resolving it to the gene axis keeps
+            // the old behaviour for a section that has no minor extent to
+            // record, rather than adding an error path no caller can hit.
+            Some(MinorAxis::Var) | None => {
                 if self.current_modality_id > 0 {
                     self.modalities
                         .get((self.current_modality_id - 1) as usize)
@@ -3162,10 +3166,12 @@ fn clear_csr_shard_column_stats_inner(
 /// `major_kind` distinguishes row-major (CSR/Layer/Obsp) and
 /// column-major (CSC) shards. `major_start` is the global index where
 /// this shard begins on its primary axis; `n_major` is the count of
-/// major-axis entries in the shard. `n_minor` is the count of entries
-/// on the OTHER axis (file-wide `n_vars` for row-major shards or
-/// file-wide `n_obs` for column-major shards) — used to populate the
-/// "full range" pair for v2 symmetry.
+/// major-axis entries in the shard. `n_minor` is the shard's extent on
+/// the OTHER axis — used to populate the "full range" pair for v2
+/// symmetry. Which file-level axis that is depends on the section
+/// type, **not** on storage order: `ScxWriter::shard_n_minor` resolves
+/// it, and an `ObspCsrShard` is the case that makes the distinction
+/// load-bearing (row-major, but obs x obs).
 pub fn compute_shard_stats(
     values: &[u8],
     value_encoding: ValueEncoding,

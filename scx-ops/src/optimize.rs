@@ -790,7 +790,7 @@ mod tests {
     /// An explicit codec must reach **every** shard, and the output must be
     /// byte-identical however many shards the re-encode holds in flight.
     ///
-    /// Both halves exist because of what the twelve-arm `op_output_identity`
+    /// Both halves exist because of what the thirteen-arm `op_output_identity`
     /// golden cannot see here: every arm that drives `optimize` passes
     /// `codec: None`, so replacing the caller's codec with `None` inside the
     /// parallel map leaves the golden green. And a single-chunk run says nothing

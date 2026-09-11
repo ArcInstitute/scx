@@ -571,10 +571,16 @@ graph unwritable on any file with more cells than genes: the per-shard
 the encode, and below that the stamped extent declared a matrix too narrow to
 hold its own endpoints.
 
-**Readers authenticate against the catalog, never against `header.n_vars`.**
-A shard's stats record `0..n_minor` on whichever axis is not the major one, and
-that recorded value — not a re-derivation — is what a declared `n_minor` is
-checked against. Re-deriving it is wrong three ways: a multimodal shard is
+**A reader holding a full catalog entry authenticates against the catalog,
+never against `header.n_vars`.** A shard's stats record `0..n_minor` on
+whichever axis is not the major one, and that recorded value — not a
+re-derivation — is what a declared `n_minor` is checked against. Both the
+whole-shard decode and the scattered row-group read do this, through one shared
+pair-pick, so they accept the same files. The exception is a reader working
+from a *stats-less* entry: the backed CSR reader deliberately carries transient
+entries with no stats and checks a decoded shard against the width it was
+opened for instead. There is no third answer — what must never happen is a
+reader re-deriving the axis from the file header. Re-deriving it is wrong three ways: a multimodal shard is
 stamped with its own modality's `n_vars` while the file header carries the
 file-wide maximum; `.raw`'s gene axis is not on the file header at all; and an
 `obsp_csr_shard` written before this rule existed carries the legacy gene-axis

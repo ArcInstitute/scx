@@ -1487,7 +1487,6 @@ fn csc_arrays_for_col_range(
     (indptr, indices, values_bytes)
 }
 
-/// Build a header for a CSC round-trip test fixture.
 /// An obs batch of `n` synthetic cell ids, for fixtures whose row count is a
 /// parameter rather than the three-row `sample_obs`.
 fn wide_obs(n: u64) -> RecordBatch {
@@ -1536,6 +1535,7 @@ fn ring_csr(n_major: u64, n_minor: u64) -> (Vec<u64>, Vec<u32>, Vec<u8>) {
     (indptr, indices, values)
 }
 
+/// Build a header for a CSC round-trip test fixture.
 fn csc_test_header(n_obs: u64, n_vars: u64) -> FileHeader {
     // u32 indices on disk (Phase A test fixtures use n_vars=6
     // which fits in u16, but we want index_dtype to track
@@ -2099,6 +2099,13 @@ fn the_scattered_framed_read_accepts_a_newly_stamped_obsp_shard() {
 /// resolves a real catalog entry (`full_entry_at_offset`), so the extent is
 /// always available.
 ///
+/// These three are **accept-side only**, which on its own a check that always
+/// skipped would also satisfy. The reject side is
+/// `the_block_index_path_also_rejects_a_widened_header`, which widens a framed
+/// shard's stamped `n_minor` past the catalog's and requires the scattered
+/// read to refuse it; deleting the reconciliation reds that test, so the guard
+/// is load-bearing in both directions. Raised by Cursor Agent - Grok 4.6 High.
+///
 /// **A narrow modality's CSR shard.** `header.n_vars` is the file-wide
 /// *maximum* across modalities, while the writer correctly stamps each shard
 /// with its own modality's `n_vars` — so comparing the two rejected every
@@ -2187,6 +2194,13 @@ fn the_scattered_framed_read_accepts_a_narrow_modalitys_shard() {
 /// resolves a real catalog entry (`full_entry_at_offset`), so the extent is
 /// always available.
 ///
+/// These three are **accept-side only**, which on its own a check that always
+/// skipped would also satisfy. The reject side is
+/// `the_block_index_path_also_rejects_a_widened_header`, which widens a framed
+/// shard's stamped `n_minor` past the catalog's and requires the scattered
+/// read to refuse it; deleting the reconciliation reds that test, so the guard
+/// is load-bearing in both directions. Raised by Cursor Agent - Grok 4.6 High.
+///
 /// **A `.raw` shard.** `.raw` has its own, usually wider, gene axis, so the
 /// file's `n_vars` is simply the wrong number for it.
 /// Found by Cursor Agent - Grok 4.6 High.
@@ -2256,6 +2270,13 @@ fn the_scattered_framed_read_accepts_a_raw_shard_on_its_own_gene_axis() {
 /// ways, one per test below. Every in-tree caller of the scattered path
 /// resolves a real catalog entry (`full_entry_at_offset`), so the extent is
 /// always available.
+///
+/// These three are **accept-side only**, which on its own a check that always
+/// skipped would also satisfy. The reject side is
+/// `the_block_index_path_also_rejects_a_widened_header`, which widens a framed
+/// shard's stamped `n_minor` past the catalog's and requires the scattered
+/// read to refuse it; deleting the reconciliation reds that test, so the guard
+/// is load-bearing in both directions. Raised by Cursor Agent - Grok 4.6 High.
 ///
 /// **A legacy obsp shard carrying the pre-fix `n_vars` stamp.** Such a file is
 /// accepted by the whole-shard decoder — which compares the header against the
