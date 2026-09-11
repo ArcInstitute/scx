@@ -1455,10 +1455,23 @@ in-memory arms at the high end.
 > under `benchmarks/comprehensive/results/`. `docs/benchmark_manifest.md` asks for a manifest
 > behind every number here; the manifest system is shaped for the SLURM comprehensive suite and
 > has no pseudobulk-aggregation triple, so the reproduction recipe above stands in for one.
-> `benchmarks/scripts/check_readme_manifests.py` does not flag these claims. The
-> comprehensive suite's pseudobulk-bearing cells (`bench_csc_dispatch` × `bench_csc__pseudobulk_*`
-> on tabula_sapiens_100k) time `pseudobulk_dex` end to end, where the pydeseq2 fit dominates; they
-> are the no-regression check for this change, not its measurement.
+> `benchmarks/scripts/check_readme_manifests.py` does not flag these claims.
+
+The comprehensive suite's pseudobulk-bearing cells — `bench_csc_dispatch` ×
+`bench_csc__pseudobulk_{csr,csc}` on tabula_sapiens_100k, which time `pseudobulk_dex` end to
+end with the pydeseq2 fit dominating — are the **no-regression** check for this change, not its
+measurement. Same build, same host pool, one job per arm (`benchmarks/scripts/_run_pr16_pseudobulk_gate.sh`;
+jobs 2932673 on `main` at `9e628f38` and 2932638 on the branch), medians of three:
+
+| Cell | `main` → branch, wall | `main` → branch, peak RSS | route floor |
+|---|---|---|---|
+| `bench_csc__pseudobulk_csr` | 13.70 → 13.51 s | 3 579 → 3 553 MB | `csc_dispatch_correct` 1.0 |
+| `bench_csc__pseudobulk_csc` | 0.74 → 0.78 s (runs 0.70–0.79 on both arms) | 3 414 → 3 433 MB | `csc_dispatch_correct` 1.0 |
+
+Manifest rows: the branch arm at `benchmarks/comprehensive/results/raw/bench_csc_dispatch__bench_csc__pseudobulk_{csr,csc}__tabula_sapiens_100k.json`,
+the `main` arm under `results/raw/pr16_pseudobulk_base/`. Against `LATEST` (captured 2026-09-03
+at `33d52cd0`) the gate reports both cells ~550 MB higher in peak RSS; the `main` arm shows the
+same figure, so that delta belongs to the merges between the two snapshots, not to this change.
 
 ### QC / filtering pass fusion (Phase-4 task 4.1)
 
