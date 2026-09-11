@@ -1028,27 +1028,30 @@ impl ScxReader {
         // so without this it stayed the one way a widened payload could still get
         // an out-of-range index out of the reader — via a *scattered* framed read
         // while the whole-shard paths rejected the same file.
-        // The minor axis is per shard *class*, not universal, and storage order
-        // is not the discriminant: `scx_format::shard::minor_axis` is. Using
-        // `n_vars` for everything row-major rejected every scattered CSC read
-        // (caught by `read_csc_columns_scattered_matches_full_decode`), and
-        // then, once that was patched with a column-major test, it still
-        // authenticated an `ObspCsrShard` — row-major, but obs x obs — against
-        // the gene axis. `raw_n_vars` is not on the `FileHeader`, so `.raw` is
-        // authenticated by the catalog's own column extent instead.
-        let authenticated_minor = match crate::shard::minor_axis(entry.section_type) {
-            crate::shard::MinorAxis::Obs => self.header.n_obs,
-            crate::shard::MinorAxis::Var => self.header.n_vars,
-            // `.raw`'s own gene axis is not on the `FileHeader`, so the
-            // authority is the (checksummed) catalog's column extent, which
-            // the writer stamps from the same value. `0` when the entry
-            // carries no stats: `reconcile_declared_minor` reads that as "no
-            // authority" and skips, rather than comparing the header against
-            // itself.
-            crate::shard::MinorAxis::RawVar => {
-                entry.stats.as_ref().map(|st| st.col_end).unwrap_or(0)
-            }
-        };
+        // The minor extent comes from the **catalog**, never from a
+        // re-derivation off the `FileHeader`. The catalog is checksummed and
+        // the shard payload is not, which is the whole point of reconciling at
+        // all — and it is what `check_header_against_catalog` already compares
+        // the whole-shard decode against, so the two seams accept the same set
+        // of files. Re-deriving it was wrong for a multimodal shard (stamped
+        // with its modality's `n_vars`, compared against the file-wide max),
+        // for `.raw` (its own gene axis, not on the header), and for an
+        // `ObspCsrShard` written before OPT-FORMATIO-4 (the legacy gene-axis
+        // stamp, which the catalog agrees with). An earlier version used
+        // `n_vars` for everything row-major, which also rejected every
+        // scattered CSC read — caught by
+        // `read_csc_columns_scattered_matches_full_decode`.
+        //
+        // No stats, no authority: skip, exactly as
+        // `check_header_against_catalog` does. Unreachable from here in
+        // practice — every in-tree caller resolves a real entry via
+        // `full_entry_at_offset`, and the backed reader's own stats-less
+        // whole-shard decodes go through `check_decoded_shard_minor`.
+        let authenticated_minor = entry
+            .stats
+            .as_ref()
+            .map(|stats| crate::shard_decode::catalog_minor_extent(stats, entry.section_type))
+            .unwrap_or(0);
         crate::shard_decode::reconcile_declared_minor(
             header.n_minor,
             authenticated_minor,

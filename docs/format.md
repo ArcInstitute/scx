@@ -550,7 +550,10 @@ pick which axis validates them.
 ### Minor-axis extent by section type
 
 `n_minor` is the shard's minor-axis extent, and **storage order does not
-determine which axis that is**. Four answers, one per section class:
+determine which axis that is**. Four answers below, one per section class —
+and they describe what a **writer** stamps. A **reader** does not re-derive
+them: it authenticates the declared value against the catalog's own recorded
+extent, which the catalog checksum covers and the shard payload does not.
 
 | Section type | `n_minor` is | Resolved from |
 |---|---|---|
@@ -561,13 +564,26 @@ determine which axis that is**. Four answers, one per section class:
 
 `obsp_csr_shard` is the one row-major section whose minor axis is not the gene
 axis. Writers stamped it from `n_vars` until the axis rule was declared in one
-place (`scx_format::shard::minor_axis`), which made a CSR-backed obsp graph
-unwritable on any file with more cells than genes: the per-shard `index_dtype`
-derives from this same extent, so an endpoint past 65535 failed the encode, and
-below that the stamped extent declared a matrix too narrow to hold its own
-endpoints. Readers of a **v1 catalog** still reconcile an `obsp_csr_shard`'s
-`col_start` / `col_end` against `n_vars`, deliberately: that path reconstructs
-what a legacy writer stamped, and no writer can emit a v1 catalog.
+place (`scx_format::shard::minor_axis`, exhaustive over the section types so a
+new one cannot inherit the gene axis by default), which made a CSR-backed obsp
+graph unwritable on any file with more cells than genes: the per-shard
+`index_dtype` derives from this same extent, so an endpoint past 65535 failed
+the encode, and below that the stamped extent declared a matrix too narrow to
+hold its own endpoints.
+
+**Readers authenticate against the catalog, never against `header.n_vars`.**
+A shard's stats record `0..n_minor` on whichever axis is not the major one, and
+that recorded value — not a re-derivation — is what a declared `n_minor` is
+checked against. Re-deriving it is wrong three ways: a multimodal shard is
+stamped with its own modality's `n_vars` while the file header carries the
+file-wide maximum; `.raw`'s gene axis is not on the file header at all; and an
+`obsp_csr_shard` written before this rule existed carries the legacy gene-axis
+stamp, which the catalog agrees with. A file must not read one way through the
+whole-shard decoder and another through a scattered row-group read.
+
+Readers of a **v1 catalog** reconcile an `obsp_csr_shard`'s `col_start` /
+`col_end` against `n_vars`, deliberately: that path reconstructs what a legacy
+writer stamped, and no writer can emit a v1 catalog.
 
 ### `ShardStats.row_start` / `row_end` axis overload (v1 only)
 

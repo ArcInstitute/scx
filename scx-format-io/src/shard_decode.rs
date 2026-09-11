@@ -14,7 +14,7 @@ use std::io::Cursor;
 
 use scx_codec::{CodecId, EncodedShardRef, ShardValuesNative, ValueEncoding};
 
-use crate::catalog::FullCatalogEntry;
+use crate::catalog::{FullCatalogEntry, ShardStats};
 use crate::error::{Result, ScxError};
 use crate::section::SectionType;
 use crate::shard::{
@@ -149,6 +149,30 @@ pub(crate) fn reconcile_declared_minor(
     Ok(())
 }
 
+/// The **minor**-axis extent the catalog assigns a shard of `section_type`.
+///
+/// The mirror of [`catalog_major_extent`]: `compute_shard_stats` writes the
+/// major range into one pair and `0..n_minor` into the other, so the minor
+/// extent is the *opposite* pair to the one the major extent reads.
+///
+/// **This, not the `FileHeader`, is the authority.** The catalog is covered by
+/// a BLAKE3 checksum and the shard payload is not — which is the entire reason
+/// a declared `n_minor` has to be reconciled against something. Re-deriving the
+/// number from `FileHeader` instead was wrong three ways: a multimodal CSR
+/// shard is stamped with its own modality's `n_vars` while the header carries
+/// the file-wide maximum; `.raw` has its own gene axis, which is not on the
+/// header at all; and an `ObspCsrShard` written before OPT-FORMATIO-4 carries
+/// the legacy gene-axis stamp, which the catalog agrees with and a
+/// re-derivation would not. Reading it means every seam accepts exactly the
+/// set of files the catalog vouches for.
+pub(crate) fn catalog_minor_extent(stats: &ShardStats, section_type: SectionType) -> u64 {
+    if catalog_says_column_major(section_type) {
+        stats.row_end
+    } else {
+        stats.col_end
+    }
+}
+
 /// The major-axis extent the **catalog** assigns this shard, or `None` when the
 /// entry carries no stats.
 ///
@@ -208,11 +232,7 @@ fn check_header_against_catalog(sh: &ShardHeader, entry: &FullCatalogEntry) -> R
     // comparisons would pass while the catalog says the section is row-major.
     // Letting unauthenticated bytes pick their own referee defeats the point of
     // reconciling against the catalog at all.
-    let authenticated = if catalog_says_column_major(entry.section_type) {
-        stats.row_end
-    } else {
-        stats.col_end
-    };
+    let authenticated = catalog_minor_extent(stats, entry.section_type);
     // Having fixed the axis from the catalog, require the payload to agree about
     // the layout too, in *both* directions.
     let payload_says_csc = sh.shard_type == 1;
@@ -1323,73 +1343,71 @@ mod tests {
         );
     }
 
-    /// The minor-axis sibling of `column_major_dispatch_is_exhaustive`.
+    /// The minor axis of every section type that has one.
     ///
-    /// Storage order and minor axis are *different* questions, and conflating
-    /// them is OPT-FORMATIO-4: four sites independently spelled the minor axis
-    /// as "`n_obs` if column-major else `n_vars`", and all four were wrong for
-    /// `ObspCsrShard` — row-major, but obs x obs. This sweep pins the answer
-    /// per discriminant so a new sparse section type cannot inherit `Var` by
-    /// falling through.
+    /// Deliberately **not** a sweep with a second copy of the table: the first
+    /// version of this walked all 256 discriminants asserting a mirror match
+    /// whose own catch-all was `_ => Var`, so a newly added sparse section type
+    /// would have satisfied both sides and passed. That guard now lives in the
+    /// type system — `minor_axis` is exhaustive over `SectionType`, so adding a
+    /// variant fails to compile in `scx-format` — and what is left here is the
+    /// part a compiler cannot check: that the six sparse types get the answers
+    /// the format spec claims. Reported by codex - gpt-5.6-sol and
+    /// Antigravity - Gemini 3.8 Flash.
     #[test]
-    fn minor_axis_dispatch_is_exhaustive() {
+    fn minor_axis_answers_the_spec_for_every_sparse_section() {
+        use crate::shard::{minor_axis, MinorAxis};
+
+        for (st, expected) in [
+            (SectionType::CsrShard, MinorAxis::Var),
+            (SectionType::LayerCsrShard, MinorAxis::Var),
+            (SectionType::CscShard, MinorAxis::Obs),
+            (SectionType::LayerCscShard, MinorAxis::Obs),
+            (SectionType::ObspCsrShard, MinorAxis::Obs),
+            (SectionType::RawCsrShard, MinorAxis::RawVar),
+        ] {
+            assert_eq!(
+                minor_axis(st),
+                expected,
+                "{st:?}: minor_axis disagrees with docs/format.md \u{a7} Minor-axis \
+                 extent by section type"
+            );
+        }
+    }
+
+    /// Storage order and minor axis are different questions, but they are not
+    /// independent: a column-major shard's minor axis is always rows.
+    ///
+    /// `minor_axis` restates the column-major pair rather than calling
+    /// [`crate::shard::is_column_major`], because a guard arm would defeat the
+    /// exhaustiveness check that is the whole point of it. This is what stops
+    /// the two lists drifting — and it pins the asymmetry that makes the split
+    /// worth having: `ObspCsrShard` is the **only** section that is row-major
+    /// and still measures its minor extent on obs, which is the defect
+    /// OPT-FORMATIO-4 fixed.
+    #[test]
+    fn minor_axis_agrees_with_storage_order() {
         use crate::shard::{is_column_major, minor_axis, MinorAxis};
 
-        let (mut seen_obs, mut seen_raw_var) = (0usize, 0usize);
-        // Row-major but NOT on the var axis: the case the fallthrough gets
-        // wrong.
         let mut row_major_on_obs = Vec::new();
-
         for raw in 0u8..=255 {
             let Some(st) = SectionType::from_u8(raw) else {
                 continue;
             };
-            let axis = minor_axis(st);
-            let expected = match raw {
-                5 | 16 => MinorAxis::Obs, // CscShard, LayerCscShard
-                9 => MinorAxis::Obs,      // ObspCsrShard: obs x obs
-                27 => MinorAxis::RawVar,  // RawCsrShard: .raw's own gene axis
-                _ => MinorAxis::Var,
-            };
-            assert_eq!(
-                axis, expected,
-                "{st:?} (id {raw}): minor_axis disagrees with the table in this \
-                 test — decide the axis deliberately, do not let it fall through"
-            );
-
-            seen_obs += usize::from(axis == MinorAxis::Obs);
-            seen_raw_var += usize::from(axis == MinorAxis::RawVar);
-
-            // Every column-major section measures its minor extent on obs; the
-            // converse is what this whole item is about, so it is not asserted.
             if is_column_major(st) {
                 assert_eq!(
-                    axis,
+                    minor_axis(st),
                     MinorAxis::Obs,
                     "{st:?} (id {raw}): a column-major shard's minor axis is rows"
                 );
-            } else if axis == MinorAxis::Obs {
+            } else if minor_axis(st) == MinorAxis::Obs {
                 row_major_on_obs.push(st);
             }
         }
-
-        // Guards the guard: without these, a predicate regressed to answering
-        // `Var` everywhere would satisfy every assertion above vacuously.
-        assert_eq!(
-            seen_obs, 3,
-            "expected exactly CscShard, LayerCscShard and ObspCsrShard on the \
-             obs axis; update this count deliberately when adding one"
-        );
-        assert_eq!(
-            seen_raw_var, 1,
-            "expected exactly RawCsrShard on the raw var axis"
-        );
         assert_eq!(
             row_major_on_obs,
             vec![SectionType::ObspCsrShard],
-            "ObspCsrShard is the one section that is row-major yet measures its \
-             minor extent on obs — the whole reason minor_axis exists apart \
-             from is_column_major"
+            "exactly one section type is row-major yet measured on obs"
         );
     }
 

@@ -1971,12 +1971,16 @@ mod tests {
     /// `upgrade_canonicalizes_the_csr_class_sections_it_carries` because that
     /// fixture is single-shard with `n_vars > n_obs`:
     ///
-    /// 1. **The minor extent.** `write_obsp_shard` derives `n_minor` from the
-    ///    file header's `n_vars`, but an `ObspCsrShard` is obs×obs. Here
-    ///    `n_obs = 6 > n_vars = 3` and the graph has an endpoint at column 5, so
-    ///    a re-emit stamped with `n_vars` declares a matrix too narrow to hold
-    ///    its own data and deep validation still fails — the very thing the
-    ///    round-1 fix existed to prevent.
+    /// 1. **The minor extent.** The typed writers *re-derive* `n_minor` from
+    ///    the writer's own state instead of carrying the source's. They used to
+    ///    derive it wrongly too — `write_obsp_shard` took `n_vars` for an
+    ///    obs×obs graph, fixed in OPT-FORMATIO-4 — and here
+    ///    `n_obs = 6 > n_vars = 3` with an endpoint at column 5, so a re-emit
+    ///    stamped with `n_vars` declared a matrix too narrow to hold its own
+    ///    data and deep validation still failed. With the writer correct the
+    ///    re-derivation is no longer *wrong*, but it is still the wrong thing
+    ///    to do here: a re-encode must round-trip whatever a legacy file
+    ///    declares, not migrate it.
     /// 2. **The section name.** `write_raw_csr_shard` names from
     ///    `raw_csr_shard_count`, which `copy_section_verbatim` does not advance.
     ///    Raw shard 0 here is already canonical (copied verbatim, counter stays
