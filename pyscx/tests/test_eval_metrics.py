@@ -169,6 +169,58 @@ class TestPseudobulkMeans:
             idx_mem = groups_mem.index(g)
             np.testing.assert_allclose(means[idx], means_mem[idx_mem], atol=1e-5)
 
+    def test_unsorted_scipy_csr_matches_sorted_exactly(self):
+        """A scipy CSR with unsorted column indices gives the same bits.
+
+        `pseudobulk_means` hands `csr_matrix(x)` to Rust without
+        `sort_indices()`, so rows may walk col_max -> col_min (the shape real
+        h5ad-derived CSRs arrive in). The Rust kernel routes such rows to its
+        order-preserving group partition; with no duplicate coordinates every
+        (group, gene) sum is formed from the same operands in the same
+        ascending-cell order on both partitions, so the answer is identical
+        bit for bit, not merely close. Float values, not integer counts: an
+        integer fixture sums exactly in any order and could not see a
+        reordering.
+        """
+        import pyscx
+
+        adata = self._make_adata(n_obs=300, n_vars=40, n_perts=6, seed=7)
+        rng = np.random.default_rng(11)
+        X = adata.X.tocsr().copy()
+        X.sort_indices()
+        # Log-uniform positive values spanning ten decades: their f64 sums
+        # depend on the order they are added in.
+        X.data = np.exp(rng.uniform(np.log(1e-5), np.log(1e5), size=X.nnz)).astype(
+            np.float32
+        )
+        adata.X = X
+
+        indptr = X.indptr.astype(np.int64).copy()
+        indices = X.indices.astype(np.int32).copy()
+        data = X.data.copy()
+        for r in range(indptr.size - 1):
+            lo, hi = int(indptr[r]), int(indptr[r + 1])
+            if hi - lo > 1:
+                indices[lo:hi] = indices[lo:hi][::-1]
+                data[lo:hi] = data[lo:hi][::-1]
+        unsorted = sp.csr_matrix((data, indices, indptr), shape=X.shape, copy=False)
+        unsorted.has_sorted_indices = False
+        assert not unsorted.has_sorted_indices
+
+        means_sorted, groups_sorted = pyscx.accel.pseudobulk_means(adata, "perturbation")
+        adata_unsorted = adata.copy()
+        adata_unsorted.X = unsorted
+        means_unsorted, groups_unsorted = pyscx.accel.pseudobulk_means(
+            adata_unsorted, "perturbation"
+        )
+
+        assert groups_sorted == groups_unsorted
+        assert means_sorted.dtype == means_unsorted.dtype == np.float64
+        # Bitwise, on purpose.
+        assert np.array_equal(
+            means_sorted.view(np.uint64), means_unsorted.view(np.uint64)
+        ), "sorted and unsorted CSR must give identical bits"
+
 
 class TestPerturbationMetrics:
     """Test pyscx.accel.perturbation_metrics()."""

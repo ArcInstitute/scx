@@ -9,11 +9,27 @@
 //! in-memory (`ScxCsr`) paths. Streaming callers holding a subset SCX handle
 //! must pass that handle's *view* (`as_shard_source()`), not the reader
 //! underneath it — `obs_groups` is indexed by visible cell.
+//!
+//! # Parallelism and bit-identity
+//!
+//! Every CSR path scatters in parallel by partitioning the **output** across
+//! rayon workers — one group's row per task while the largest group holds at
+//! most two pool-shares of the nonzeros (and always when the rows are not
+//! canonical), a contiguous column block of every group's row otherwise — and
+//! merging nothing, so for each `(group, gene)` the f64 sum is formed from the same
+//! f32 operands in the same ascending-row order as a serial loop, on any
+//! thread count. `RAYON_NUM_THREADS` sizes the pool; `SCX_ACCEL_NUM_THREADS`
+//! caps the column-block count (and a CSC run's column tasks) as it caps PCA's
+//! blocks, while the group partition and the mean divide are one task per group
+//! row on the ambient pool. Neither knob can move a bit. The dense path
+//! partitions by group the same way.
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
 use scx_format_io::ShardSource;
 
+use crate::pca::colblocks;
 use crate::Result;
 
 /// Aggregation method for pseudobulk.
@@ -121,7 +137,7 @@ pub struct PseudobulkResult {
     /// Aggregated count matrix `[n_groups × n_vars]`, row-major.
     pub counts: Vec<f64>,
     /// Group labels: `group_labels[i]` is a Vec of column values for group `i`.
-    /// E.g., for groupby `["perturbation", "donor"]`, group_labels[0] might be
+    /// E.g., for groupby `["perturbation", "donor"]`, `group_labels[0]` might be
     /// `["drug_A", "donor_1"]`.
     pub group_labels: Vec<Vec<String>>,
     /// Column names from groupby (e.g., `["perturbation", "donor"]`).
@@ -233,6 +249,438 @@ pub fn build_group_mapping(
     (remapped_cells, sorted_labels)
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// The CSR scatter kernel.
+//
+// Every CSR path below accumulates `counts[g * n_vars + col] += data[j]` for
+// each nonzero, cells in ascending row order. Written serially that is one
+// dependent load-add-store per nonzero on the calling thread while the pool
+// idles — memory-bound at ~1.4 ns per nonzero when the few group rows fit in
+// L1, several times that once `counts` is tens of megabytes. The kernels here
+// partition the **output** across rayon workers and never merge, so the
+// partition cannot reach the result: for a fixed `(g, col)` every worker adds
+// the same operands in the same ascending row order the serial loop did, on
+// any thread count. Same thesis as `pca::colblocks`, whose planner this reuses.
+//
+// Two partitions, chosen per chunk (a shard on the streaming path, the whole
+// matrix on the in-memory ones) by `choose_partition`:
+//
+// * `ByGroup` — each worker owns one group's row and walks that group's cells
+//   ascending, visiting each row's nonzeros in **stored** order. Reads every
+//   nonzero exactly once, needs no sortedness (so it is where a non-canonical
+//   scipy matrix goes — `aggregate_pseudobulk`'s in-memory arm passes
+//   `csr_matrix(x)` through without `sort_indices()`), and is bit-identical to
+//   the serial loop even with duplicate columns. Its wall is bounded below by
+//   the largest group's share of the chunk, so it is taken when that share is
+//   at most `GROUP_PARTITION_SLACK` pool-shares.
+// * `ColumnBlocks(n)` — each worker owns a contiguous column range of every
+//   group's row. Indifferent to group skew (a control arm at half the cells) and
+//   to cells sorted by group (a 4 096-row shard of a sorted file holds two or
+//   three groups), which is what the group partition cannot handle. Requires
+//   canonical rows. The obvious implementation — every block binary-searching
+//   its window in every row — was measured slower than the serial loop on
+//   100-nonzero rows: two dependent cache-missing search chains per row per
+//   block cost more than the eight adds they find. So the windows are planned
+//   **once**, in a parallel pass over rows that reads each row a single time
+//   (`RowSplits`), and the block workers then read only their own windows —
+//   two sequential passes over `indices`, one over `data`, no search. Even so
+//   a block must own `MIN_BLOCK_WINDOW` nonzeros of the average row to be
+//   worth a separate reader: twelve slivers of a 100-nonzero row touch more
+//   cache lines than the serial loop streams, and that loop is already
+//   memory-bound when two group rows fit in L1. Short-row chunks get fewer
+//   blocks, down to the serial walk, and lose nothing to the machinery they
+//   cannot use.
+//
+// Load balance for the column blocks comes from a per-column nnz histogram
+// (`weights`) that the block workers bump for their own columns as they go —
+// L1-resident, disjoint, free — and that accumulates across the chunks of one
+// call, so chunk `k` is planned from chunks `0..k`. A separate `O(nnz)` weights
+// pre-pass, which is what PCA does, would cost a fifth of the serial scatter it
+// is meant to replace. Chunk 0 sees all-zero weights, for which `plan_blocks`
+// falls back to even column counts.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Rows of a CSR matrix borrowed as three slices — one shard, or the whole
+/// in-memory matrix. `indptr` has `n_rows + 1` entries.
+#[derive(Clone, Copy)]
+struct CsrRows<'a> {
+    indptr: &'a [i64],
+    indices: &'a [i32],
+    data: &'a [f32],
+}
+
+impl<'a> CsrRows<'a> {
+    fn of(csr: &'a scx_sparse::ScxCsr) -> Self {
+        Self {
+            indptr: &csr.indptr,
+            indices: &csr.indices,
+            data: &csr.data,
+        }
+    }
+
+    fn n_rows(&self) -> usize {
+        self.indptr.len().saturating_sub(1)
+    }
+
+    /// Nonzeros in these rows.
+    fn nnz(&self) -> usize {
+        match self.indptr {
+            [first, .., last] => (*last - *first) as usize,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn row(&self, r: usize) -> (&'a [i32], &'a [f32]) {
+        let s = self.indptr[r] as usize;
+        let e = self.indptr[r + 1] as usize;
+        (&self.indices[s..e], &self.data[s..e])
+    }
+}
+
+/// How one chunk of rows is split across workers. See the module comment
+/// above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScatterPartition {
+    /// Exactly this many contiguous column blocks; requires canonical rows.
+    ColumnBlocks(usize),
+    /// One worker per group row; any row order.
+    ByGroup,
+}
+
+/// Below this many nonzeros a chunk is scattered as one block: the rayon
+/// dispatch would cost more than the work, and one block is the same
+/// arithmetic in the same order, so the threshold is invisible in the result.
+const MIN_NNZ_FOR_BLOCKS: usize = 4096;
+
+/// The group partition is taken while the largest group's nonzeros are at
+/// most this many pool-shares of the chunk's: its wall is bounded below by
+/// that group, and the column blocks cost roughly two shares (a planning pass
+/// and a scatter pass) regardless of how the cells are grouped.
+const GROUP_PARTITION_SLACK: usize = 2;
+
+/// A column block must own at least this many nonzeros of the average row to
+/// be worth a separate reader. Twelve blocks each reading a 32-byte sliver of
+/// a 100-nonzero row touch two to three times the cache lines the serial loop
+/// streams, and that loop is already memory-bound when the few group rows fit
+/// in L1 — measured 1.65× *slower* than serial on 2 000 genes at 5 % density
+/// with two groups. So a short-row chunk gets fewer blocks, down to one (the
+/// serial walk), and pays nothing for the parallel machinery it cannot use.
+const MIN_BLOCK_WINDOW: usize = 64;
+
+/// Whether every row's column indices are strictly increasing (sorted, no
+/// duplicates) — the canonical form. `O(nnz)` reads spread over the pool;
+/// allocates nothing.
+fn rows_strictly_increasing_par(rows: CsrRows<'_>) -> bool {
+    (0..rows.n_rows())
+        .into_par_iter()
+        .all(|r| rows.row(r).0.windows(2).all(|w| w[0] < w[1]))
+}
+
+/// Pick the partition for one chunk. `cell_to_group` is indexed by local row.
+///
+/// One block when there is too little work to split; the group partition when
+/// its largest group is within [`GROUP_PARTITION_SLACK`] pool-shares of the
+/// chunk (an `O(rows)` sum over `indptr`, no nonzero touched); otherwise as
+/// many column blocks as the rows are long enough to feed
+/// ([`MIN_BLOCK_WINDOW`]) when the rows are canonical, and the group partition
+/// again when they are not — a non-canonical row cannot be windowed. The
+/// canonical check is the one pass this can add; an SCX-decoded shard is
+/// canonical by the writer contract, but `ShardSource` is a trait and a wrong
+/// assumption here would silently drop nonzeros, so the streaming path pays
+/// for it too when it gets this far.
+fn choose_partition(
+    rows: CsrRows<'_>,
+    cell_to_group: &[usize],
+    n_groups: usize,
+    n_vars: usize,
+) -> ScatterPartition {
+    let nnz = rows.nnz();
+    let n_rows = rows.n_rows();
+    if nnz < MIN_NNZ_FOR_BLOCKS || n_rows == 0 || n_groups == 0 {
+        return ScatterPartition::ColumnBlocks(1);
+    }
+    let pool = colblocks::block_count(n_vars);
+    let mut nnz_by_group = vec![0usize; n_groups];
+    for (r, &g) in cell_to_group.iter().enumerate() {
+        nnz_by_group[g] += (rows.indptr[r + 1] - rows.indptr[r]) as usize;
+    }
+    let largest = nnz_by_group.iter().copied().max().unwrap_or(0);
+    if largest * pool <= GROUP_PARTITION_SLACK * nnz {
+        return ScatterPartition::ByGroup;
+    }
+    let n_blocks = (nnz / n_rows / MIN_BLOCK_WINDOW).clamp(1, pool);
+    if n_blocks == 1 {
+        return ScatterPartition::ColumnBlocks(1);
+    }
+    if rows_strictly_increasing_par(rows) {
+        ScatterPartition::ColumnBlocks(n_blocks)
+    } else {
+        ScatterPartition::ByGroup
+    }
+}
+
+/// Accumulate `rows` into `counts` (`[n_groups × n_vars]`, row-major).
+///
+/// `cell_to_group` is indexed by **local** row of `rows`. `weights` is the
+/// cumulative per-column nnz histogram (`n_vars` entries) the column-block
+/// partition plans from and adds to, when a later chunk will plan from it;
+/// `None` (the in-memory paths — one dispatch, nothing plans after it) gets even
+/// blocks and skips the per-nonzero bump. `ByGroup` leaves it alone either way.
+fn scatter_rows(
+    rows: CsrRows<'_>,
+    cell_to_group: &[usize],
+    counts: &mut [f64],
+    n_vars: usize,
+    n_groups: usize,
+    part: ScatterPartition,
+    weights: Option<&mut [u64]>,
+) {
+    debug_assert_eq!(cell_to_group.len(), rows.n_rows());
+    debug_assert_eq!(counts.len(), n_groups * n_vars);
+    if let Some(w) = &weights {
+        debug_assert_eq!(w.len(), n_vars);
+    }
+    if rows.n_rows() == 0 || n_groups == 0 || n_vars == 0 {
+        return;
+    }
+    match part {
+        ScatterPartition::ByGroup => {
+            scatter_by_group(rows, cell_to_group, counts, n_vars, n_groups)
+        }
+        ScatterPartition::ColumnBlocks(n_blocks) => {
+            let n_blocks = n_blocks.clamp(1, n_vars);
+            if n_blocks == 1 {
+                let mut rows_g: Vec<&mut [f64]> = counts.chunks_mut(n_vars).collect();
+                scatter_whole_rows(rows, cell_to_group, &mut rows_g);
+            } else {
+                scatter_column_blocks(
+                    rows,
+                    cell_to_group,
+                    counts,
+                    n_vars,
+                    n_groups,
+                    n_blocks,
+                    weights,
+                );
+            }
+        }
+    }
+}
+
+/// One block spanning every column: the serial walk, into per-group rows. It
+/// leaves the weights histogram alone — the bump would be a second store per
+/// nonzero on a loop that is memory-bound already, for a plan only a later
+/// multi-block chunk could use, and such a chunk plans from even splits fine.
+fn scatter_whole_rows(rows: CsrRows<'_>, cell_to_group: &[usize], rows_g: &mut [&mut [f64]]) {
+    for (r, &g) in cell_to_group.iter().enumerate() {
+        let (idx, dat) = rows.row(r);
+        let dst = &mut *rows_g[g];
+        for (&c, &v) in idx.iter().zip(dat) {
+            dst[c as usize] += v as f64;
+        }
+    }
+}
+
+/// Per-row block windows for the column-block kernel: row `r`'s nonzeros in
+/// block `b` are positions `[at(r, b), at(r, b + 1))` of that row's slice.
+/// Planned in one parallel pass that reads each row once (the row is then
+/// L1-resident for its `n_blocks − 1` boundary searches), so the block workers
+/// never search.
+struct RowSplits {
+    stride: usize,
+    at: Vec<u32>,
+}
+
+impl RowSplits {
+    fn plan(rows: CsrRows<'_>, blocks: &[std::ops::Range<usize>]) -> Self {
+        let n_blocks = blocks.len();
+        let stride = n_blocks + 1;
+        let mut at = vec![0u32; rows.n_rows() * stride];
+        at.par_chunks_mut(stride).enumerate().for_each(|(r, s)| {
+            let (idx, _) = rows.row(r);
+            let mut pos = 0usize;
+            for (b, block) in blocks.iter().enumerate().skip(1) {
+                pos += idx[pos..].partition_point(|&c| (c as usize) < block.start);
+                s[b] = pos as u32;
+            }
+            s[n_blocks] = idx.len() as u32;
+        });
+        Self { stride, at }
+    }
+
+    #[inline]
+    fn window(&self, r: usize, b: usize) -> (usize, usize) {
+        let base = r * self.stride + b;
+        (self.at[base] as usize, self.at[base + 1] as usize)
+    }
+}
+
+/// Column blocks: plan the row windows, carve every group's row into its block
+/// pieces, and let each block worker walk every row taking only its window.
+fn scatter_column_blocks(
+    rows: CsrRows<'_>,
+    cell_to_group: &[usize],
+    counts: &mut [f64],
+    n_vars: usize,
+    n_groups: usize,
+    n_blocks: usize,
+    weights: Option<&mut [u64]>,
+) {
+    // No histogram: even column counts (`plan_blocks` on all-zero weights).
+    let even;
+    let blocks = match &weights {
+        Some(w) => colblocks::plan_blocks(w, n_blocks),
+        None => {
+            even = vec![0u64; n_vars];
+            colblocks::plan_blocks(&even, n_blocks)
+        }
+    };
+    let splits = RowSplits::plan(rows, &blocks);
+    // Regroup the `[n_groups][n_blocks]` pieces as `[n_blocks][n_groups]` so
+    // each worker holds one disjoint column window of every group's row.
+    let mut per_block: Vec<Vec<&mut [f64]>> = (0..n_blocks)
+        .map(|_| Vec::with_capacity(n_groups))
+        .collect();
+    for row in counts.chunks_mut(n_vars) {
+        let mut rest = row;
+        for (b, block) in blocks.iter().enumerate() {
+            let (piece, tail) = rest.split_at_mut(block.len());
+            per_block[b].push(piece);
+            rest = tail;
+        }
+    }
+    let weight_parts: Vec<Option<&mut [u64]>> = match weights {
+        Some(w) => colblocks::split_by_blocks(w, &blocks, 1)
+            .into_iter()
+            .map(Some)
+            .collect(),
+        None => (0..n_blocks).map(|_| None).collect(),
+    };
+    blocks
+        .par_iter()
+        .enumerate()
+        .zip(per_block)
+        .zip(weight_parts)
+        .for_each(|(((b, block), mut rows_g), w)| {
+            let a = block.start;
+            // Two copies of the window loop rather than a per-nonzero branch on
+            // whether a histogram is being kept.
+            match w {
+                Some(w) => {
+                    for (r, &g) in cell_to_group.iter().enumerate() {
+                        let (lo, hi) = splits.window(r, b);
+                        if lo == hi {
+                            continue;
+                        }
+                        let (idx, dat) = rows.row(r);
+                        let dst = &mut *rows_g[g];
+                        for (&c, &v) in idx[lo..hi].iter().zip(&dat[lo..hi]) {
+                            let c = c as usize - a;
+                            dst[c] += v as f64;
+                            w[c] += 1;
+                        }
+                    }
+                }
+                None => {
+                    for (r, &g) in cell_to_group.iter().enumerate() {
+                        let (lo, hi) = splits.window(r, b);
+                        if lo == hi {
+                            continue;
+                        }
+                        let (idx, dat) = rows.row(r);
+                        let dst = &mut *rows_g[g];
+                        for (&c, &v) in idx[lo..hi].iter().zip(&dat[lo..hi]) {
+                            dst[c as usize - a] += v as f64;
+                        }
+                    }
+                }
+            }
+        });
+}
+
+/// One worker per group row. Cells are bucketed by group with a counting sort
+/// (two flat buffers, not one `Vec` per group — a 10k-group file streams 600
+/// shards) and visited ascending within the group; each row's nonzeros are
+/// taken in stored order, so this is exact for unsorted and duplicated
+/// columns alike.
+fn scatter_by_group(
+    rows: CsrRows<'_>,
+    cell_to_group: &[usize],
+    counts: &mut [f64],
+    n_vars: usize,
+    n_groups: usize,
+) {
+    let mut offsets = vec![0usize; n_groups + 1];
+    for &g in cell_to_group {
+        offsets[g + 1] += 1;
+    }
+    for g in 0..n_groups {
+        offsets[g + 1] += offsets[g];
+    }
+    let mut cursor = offsets[..n_groups].to_vec();
+    let mut cells = vec![0u32; cell_to_group.len()];
+    for (r, &g) in cell_to_group.iter().enumerate() {
+        cells[cursor[g]] = r as u32;
+        cursor[g] += 1;
+    }
+    // One task per group row, scheduled by the ambient pool. Groups differ in
+    // size, so fine tasks balance where a fixed number of coarse ones does not:
+    // capping this at `block_count` tasks (contiguous runs of group rows) was
+    // measured 40 % slower on the streaming arms of the crate bench — eleven
+    // unequal tasks per 4 096-row shard against sixty-four rayon can steal.
+    // `SCX_ACCEL_NUM_THREADS` therefore caps the *block* splits (column blocks,
+    // a CSC run's columns), not this one; `RAYON_NUM_THREADS` sizes the pool.
+    counts
+        .par_chunks_mut(n_vars)
+        .enumerate()
+        .for_each(|(g, dst)| {
+            for &r in &cells[offsets[g]..offsets[g + 1]] {
+                let (idx, dat) = rows.row(r as usize);
+                for (&c, &v) in idx.iter().zip(dat) {
+                    dst[c as usize] += v as f64;
+                }
+            }
+        });
+}
+
+/// Scatter a whole in-memory matrix: one partition decision, one dispatch, no
+/// histogram (nothing plans after it, so the blocks are even and the kernel
+/// skips the per-nonzero bump). A whole matrix always holds every group, so
+/// the per-shard routing the streaming path needs (a shard of a group-sorted
+/// file holds two groups) has nothing to buy here, and one dispatch beats a
+/// sequence of row-chunk waves.
+fn scatter_matrix(
+    rows: CsrRows<'_>,
+    cell_to_group: &[usize],
+    counts: &mut [f64],
+    n_vars: usize,
+    n_groups: usize,
+) {
+    let part = choose_partition(rows, cell_to_group, n_groups, n_vars);
+    scatter_rows(rows, cell_to_group, counts, n_vars, n_groups, part, None);
+}
+
+/// Divide every group's row by its cell count, in place. One division per
+/// element, so the split across workers cannot move a bit.
+pub(crate) fn apply_mean(counts: &mut [f64], cell_counts: &[usize], n_vars: usize) {
+    if n_vars == 0 || cell_counts.is_empty() {
+        return;
+    }
+    debug_assert_eq!(counts.len(), cell_counts.len() * n_vars);
+    counts
+        .par_chunks_mut(n_vars)
+        .zip(cell_counts.par_iter())
+        .for_each(|(row, &cc)| {
+            if cc > 0 {
+                let cc = cc as f64;
+                for v in row {
+                    *v /= cc;
+                }
+            }
+        });
+}
+
 /// Streaming pseudobulk aggregation over a CSR [`ShardSource`].
 ///
 /// Iterates shards one at a time, accumulating per-group sums without
@@ -242,6 +690,14 @@ pub fn build_group_mapping(
 /// `obs_groups` is indexed by *visible* cell: a caller holding a subset SCX
 /// handle must pass that handle's view (`as_shard_source()`), not the reader
 /// underneath it, or the group labels line up against the wrong rows.
+///
+/// Shards are consumed in order on the calling thread (the offset-dependent
+/// `global_row` cursor needs that); within a shard the scatter is partitioned
+/// across the rayon pool by output — one group's row per worker, or a column
+/// block of every row when the groups are too few or too skewed for that —
+/// which is bit-identical to the serial loop on any thread count; see the
+/// kernel comment above. Nothing about the result depends on
+/// `RAYON_NUM_THREADS` or `SCX_ACCEL_NUM_THREADS`; they bound speed only.
 ///
 /// # Arguments
 /// * `source` — CSR shard source for shard-by-shard iteration.
@@ -283,39 +739,51 @@ pub fn pseudobulk_aggregate<S: ShardSource + Sync>(
     // *uncached* prefetch variant: `read_shard` (not the LRU `read_shard_arc`),
     // preserving the pre-2.1 `read_shard_uncached` behaviour so this pass does
     // not warm/evict the shared shard cache (review feedback).
+    //
+    // The per-shard scatter runs *inside* the consume closure, partitioned
+    // across the pool — the sanctioned shape (the driver must not be called
+    // from a rayon region, but may spawn one). `weights` carries the column
+    // histogram across shards so each shard's blocks are planned from the ones
+    // before it.
+    let mut weights = vec![0u64; n_vars];
     let mut global_row = 0usize;
     crate::prefetch::for_each_shard_ordered_uncached(
         source,
         crate::prefetch::prefetch_depth(),
-        |_shard_idx, shard_csr| {
+        |shard_idx, shard_csr| {
             let _r = scx_format_io::reduction_guard();
             let shard_n_rows = shard_csr.n_rows();
-            for row in 0..shard_n_rows {
-                let cell_idx = global_row + row;
-                let group_idx = cell_to_group[cell_idx];
-
-                let start = shard_csr.indptr[row] as usize;
-                let end = shard_csr.indptr[row + 1] as usize;
-                for j in start..end {
-                    let col = shard_csr.indices[j] as usize;
-                    counts[group_idx * n_vars + col] += shard_csr.data[j] as f64;
-                }
+            if global_row + shard_n_rows > n_obs {
+                return Err(crate::AccelError::ShapeError(format!(
+                    "pseudobulk: shard {shard_idx} carries rows {global_row}..{} but n_obs = {n_obs}",
+                    global_row + shard_n_rows
+                )));
             }
+            let rows = CsrRows::of(&shard_csr);
+            let groups = &cell_to_group[global_row..global_row + shard_n_rows];
+            let part = choose_partition(rows, groups, n_groups, n_vars);
+            scatter_rows(
+                rows,
+                groups,
+                &mut counts,
+                n_vars,
+                n_groups,
+                part,
+                Some(&mut weights),
+            );
             global_row += shard_n_rows;
             Ok(())
         },
     )?;
+    if global_row != n_obs {
+        return Err(crate::AccelError::ShapeError(format!(
+            "pseudobulk: shards covered {global_row} rows but n_obs = {n_obs}; every cell \
+             was counted in `cell_counts`, so a mean over these sums would be wrong"
+        )));
+    }
 
-    // Apply mean if requested.
     if method == AggregationMethod::Mean {
-        for g in 0..n_groups {
-            if cell_counts[g] > 0 {
-                let cc = cell_counts[g] as f64;
-                for v in 0..n_vars {
-                    counts[g * n_vars + v] /= cc;
-                }
-            }
-        }
+        apply_mean(&mut counts, &cell_counts, n_vars);
     }
 
     // Filter by min_cells_per_group.
@@ -334,7 +802,11 @@ pub fn pseudobulk_aggregate<S: ShardSource + Sync>(
 /// In-memory pseudobulk aggregation from a pre-loaded `ScxCsr`.
 ///
 /// Same algorithm as `pseudobulk_aggregate()` but operates on a single
-/// already-decoded CSR matrix instead of streaming shards.
+/// already-decoded CSR matrix instead of streaming shards. The matrix need
+/// not be canonical: unsorted or duplicated column indices (a scipy CSR
+/// handed through without `sort_indices()` / `sum_duplicates()`) take the
+/// order-preserving group partition and give the same bits the serial loop
+/// would — a duplicate coordinate contributes both of its values.
 pub fn pseudobulk_aggregate_inmemory(
     csr: &scx_sparse::ScxCsr,
     obs_groups: &[Vec<String>],
@@ -357,25 +829,16 @@ pub fn pseudobulk_aggregate_inmemory(
         cell_counts[g] += 1;
     }
 
-    // Iterate all rows of the CSR.
-    for (row, &group_idx) in cell_to_group.iter().enumerate() {
-        let start = csr.indptr[row] as usize;
-        let end = csr.indptr[row + 1] as usize;
-        for j in start..end {
-            let col = csr.indices[j] as usize;
-            counts[group_idx * n_vars + col] += csr.data[j] as f64;
-        }
-    }
+    scatter_matrix(
+        CsrRows::of(csr),
+        &cell_to_group,
+        &mut counts,
+        n_vars,
+        n_groups,
+    );
 
     if method == AggregationMethod::Mean {
-        for g in 0..n_groups {
-            if cell_counts[g] > 0 {
-                let cc = cell_counts[g] as f64;
-                for v in 0..n_vars {
-                    counts[g * n_vars + v] /= cc;
-                }
-            }
-        }
+        apply_mean(&mut counts, &cell_counts, n_vars);
     }
 
     filter_and_build_result(
@@ -411,6 +874,7 @@ pub fn pseudobulk_aggregate_from_slices(
     let (n_obs, n_vars) = shape;
 
     validate_inputs(obs_groups, groupby_columns, gene_names, n_obs, n_vars)?;
+    validate_csr_slices(indptr, indices, data, n_obs, n_vars)?;
 
     let (cell_to_group, group_labels) = build_group_mapping(obs_groups, n_obs);
     let n_groups = group_labels.len();
@@ -422,25 +886,20 @@ pub fn pseudobulk_aggregate_from_slices(
         cell_counts[g] += 1;
     }
 
-    // Iterate all rows of the CSR using borrowed slices.
-    for (row, &group_idx) in cell_to_group.iter().enumerate() {
-        let start = indptr[row] as usize;
-        let end = indptr[row + 1] as usize;
-        for j in start..end {
-            let col = indices[j] as usize;
-            counts[group_idx * n_vars + col] += data[j] as f64;
-        }
-    }
+    scatter_matrix(
+        CsrRows {
+            indptr,
+            indices,
+            data,
+        },
+        &cell_to_group,
+        &mut counts,
+        n_vars,
+        n_groups,
+    );
 
     if method == AggregationMethod::Mean {
-        for g in 0..n_groups {
-            if cell_counts[g] > 0 {
-                let cc = cell_counts[g] as f64;
-                for v in 0..n_vars {
-                    counts[g * n_vars + v] /= cc;
-                }
-            }
-        }
+        apply_mean(&mut counts, &cell_counts, n_vars);
     }
 
     filter_and_build_result(
@@ -482,8 +941,6 @@ pub fn pseudobulk_aggregate_dense(
     method: AggregationMethod,
     min_cells_per_group: usize,
 ) -> Result<PseudobulkResult> {
-    use rayon::prelude::*;
-
     let (n_obs, n_vars) = shape;
     if data.len() != n_obs * n_vars {
         return Err(crate::AccelError::InvalidInput(format!(
@@ -547,6 +1004,70 @@ pub fn pseudobulk_aggregate_dense(
     )
 }
 
+/// Shape-check borrowed CSR slices before the kernel walks them — the
+/// invariants `ScxCsr::new` enforces: `indptr` has `n_obs + 1` non-decreasing
+/// entries from `0` to exactly `indices.len()`, `indices` / `data` have one
+/// entry per nonzero, and every column index lies in `0..n_vars`. The kernel
+/// indexes rows on rayon workers, so a malformed triple would otherwise panic
+/// there — or silently drop leading / trailing nonzeros, or a short `data`'s
+/// tail through `zip` — instead of erroring.
+fn validate_csr_slices(
+    indptr: &[i64],
+    indices: &[i32],
+    data: &[f32],
+    n_obs: usize,
+    n_vars: usize,
+) -> Result<()> {
+    let shape_err = |msg: String| Err(crate::AccelError::ShapeError(msg));
+    if indptr.len() != n_obs + 1 {
+        return shape_err(format!(
+            "indptr has {} entries but n_obs + 1 = {}",
+            indptr.len(),
+            n_obs + 1
+        ));
+    }
+    if indices.len() != data.len() {
+        return shape_err(format!(
+            "indices has {} entries but data has {}",
+            indices.len(),
+            data.len()
+        ));
+    }
+    if indptr[0] != 0 {
+        return shape_err(format!(
+            "indptr[0] = {} but a CSR's first offset is 0",
+            indptr[0]
+        ));
+    }
+    if let Some(r) = indptr.windows(2).position(|w| w[1] < w[0]) {
+        return shape_err(format!(
+            "indptr is not non-decreasing at row {r}: {} > {}",
+            indptr[r],
+            indptr[r + 1]
+        ));
+    }
+    let last = indptr[n_obs];
+    if last as u64 != indices.len() as u64 {
+        return shape_err(format!(
+            "indptr ends at {last} but indices has {} entries",
+            indices.len()
+        ));
+    }
+    // One read pass over `indices`, spread over the pool; the serial search for
+    // the message runs only once the check has failed.
+    if !indices.par_iter().all(|&c| c >= 0 && (c as usize) < n_vars) {
+        let k = indices
+            .iter()
+            .position(|&c| c < 0 || (c as usize) >= n_vars)
+            .unwrap_or(0);
+        return shape_err(format!(
+            "indices[{k}] = {} is out of range for n_vars = {n_vars}",
+            indices[k]
+        ));
+    }
+    Ok(())
+}
+
 /// Validate common inputs for both streaming and in-memory paths.
 fn validate_inputs(
     obs_groups: &[Vec<String>],
@@ -589,7 +1110,7 @@ fn validate_inputs(
 
 /// Filter groups by min_cells and build the final `PseudobulkResult`.
 #[allow(clippy::too_many_arguments)]
-fn filter_and_build_result(
+pub(crate) fn filter_and_build_result(
     counts: Vec<f64>,
     group_labels: Vec<Vec<String>>,
     groupby_columns: &[String],
@@ -871,379 +1392,5 @@ pub fn pseudobulk_means_gpu_dense(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_test_csr() -> scx_sparse::ScxCsr {
-        // 6 cells × 4 genes
-        // Cell 0: gene0=1, gene1=2
-        // Cell 1: gene0=3, gene2=4
-        // Cell 2: gene1=5, gene3=6
-        // Cell 3: gene0=7, gene1=8
-        // Cell 4: gene2=9, gene3=10
-        // Cell 5: gene0=11
-        let indptr = vec![0i64, 2, 4, 6, 8, 10, 11];
-        let indices = vec![0i32, 1, 0, 2, 1, 3, 0, 1, 2, 3, 0];
-        let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0];
-        scx_sparse::ScxCsr::new_unchecked((6, 4), indptr, indices, data)
-    }
-
-    #[test]
-    fn test_pseudobulk_sum_inmemory() {
-        let csr = make_test_csr();
-        // Groups: cells 0,1,2 → "A", cells 3,4,5 → "B"
-        let obs_groups = vec![vec![
-            "A".to_string(),
-            "A".to_string(),
-            "A".to_string(),
-            "B".to_string(),
-            "B".to_string(),
-            "B".to_string(),
-        ]];
-        let groupby = vec!["group".to_string()];
-        let genes = vec![
-            "g0".to_string(),
-            "g1".to_string(),
-            "g2".to_string(),
-            "g3".to_string(),
-        ];
-
-        let result = pseudobulk_aggregate_inmemory(
-            &csr,
-            &obs_groups,
-            &groupby,
-            &genes,
-            AggregationMethod::Sum,
-            0,
-        )
-        .unwrap();
-
-        assert_eq!(result.n_groups, 2);
-        assert_eq!(result.n_vars, 4);
-        assert_eq!(result.cell_counts, vec![3, 3]);
-
-        // Group A (cells 0,1,2): g0=1+3=4, g1=2+5=7, g2=4, g3=6
-        let a_idx = result
-            .group_labels
-            .iter()
-            .position(|l| l[0] == "A")
-            .unwrap();
-        let a_row = &result.counts[a_idx * 4..(a_idx + 1) * 4];
-        assert_eq!(a_row, &[4.0, 7.0, 4.0, 6.0]);
-
-        // Group B (cells 3,4,5): g0=7+11=18, g1=8, g2=9, g3=10
-        let b_idx = result
-            .group_labels
-            .iter()
-            .position(|l| l[0] == "B")
-            .unwrap();
-        let b_row = &result.counts[b_idx * 4..(b_idx + 1) * 4];
-        assert_eq!(b_row, &[18.0, 8.0, 9.0, 10.0]);
-    }
-
-    #[test]
-    fn test_pseudobulk_mean_inmemory() {
-        let csr = make_test_csr();
-        let obs_groups = vec![vec![
-            "A".to_string(),
-            "A".to_string(),
-            "A".to_string(),
-            "B".to_string(),
-            "B".to_string(),
-            "B".to_string(),
-        ]];
-        let groupby = vec!["group".to_string()];
-        let genes = vec![
-            "g0".to_string(),
-            "g1".to_string(),
-            "g2".to_string(),
-            "g3".to_string(),
-        ];
-
-        let result = pseudobulk_aggregate_inmemory(
-            &csr,
-            &obs_groups,
-            &groupby,
-            &genes,
-            AggregationMethod::Mean,
-            0,
-        )
-        .unwrap();
-
-        let a_idx = result
-            .group_labels
-            .iter()
-            .position(|l| l[0] == "A")
-            .unwrap();
-        let a_row = &result.counts[a_idx * 4..(a_idx + 1) * 4];
-        // Mean of group A: sum / 3
-        assert!((a_row[0] - 4.0 / 3.0).abs() < 1e-10);
-        assert!((a_row[1] - 7.0 / 3.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_min_cells_filter() {
-        let csr = make_test_csr();
-        // 3 groups: A (cells 0,1), B (cell 2), C (cells 3,4,5)
-        let obs_groups = vec![vec![
-            "A".to_string(),
-            "A".to_string(),
-            "B".to_string(),
-            "C".to_string(),
-            "C".to_string(),
-            "C".to_string(),
-        ]];
-        let groupby = vec!["group".to_string()];
-        let genes = vec![
-            "g0".to_string(),
-            "g1".to_string(),
-            "g2".to_string(),
-            "g3".to_string(),
-        ];
-
-        // min_cells=2 → B (1 cell) should be excluded
-        let result = pseudobulk_aggregate_inmemory(
-            &csr,
-            &obs_groups,
-            &groupby,
-            &genes,
-            AggregationMethod::Sum,
-            2,
-        )
-        .unwrap();
-
-        assert_eq!(result.n_groups, 2);
-        let labels: Vec<&str> = result.group_labels.iter().map(|l| l[0].as_str()).collect();
-        assert!(labels.contains(&"A"));
-        assert!(labels.contains(&"C"));
-        assert!(!labels.contains(&"B"));
-    }
-
-    #[test]
-    fn test_multi_column_groupby() {
-        let csr = make_test_csr();
-        // Two groupby columns: perturbation and donor
-        let obs_groups = vec![
-            vec![
-                "drug".to_string(),
-                "drug".to_string(),
-                "ctrl".to_string(),
-                "ctrl".to_string(),
-                "drug".to_string(),
-                "drug".to_string(),
-            ],
-            vec![
-                "d1".to_string(),
-                "d1".to_string(),
-                "d1".to_string(),
-                "d2".to_string(),
-                "d2".to_string(),
-                "d2".to_string(),
-            ],
-        ];
-        let groupby = vec!["perturbation".to_string(), "donor".to_string()];
-        let genes = vec![
-            "g0".to_string(),
-            "g1".to_string(),
-            "g2".to_string(),
-            "g3".to_string(),
-        ];
-
-        let result = pseudobulk_aggregate_inmemory(
-            &csr,
-            &obs_groups,
-            &groupby,
-            &genes,
-            AggregationMethod::Sum,
-            0,
-        )
-        .unwrap();
-
-        // Groups: (ctrl, d1)→cell2, (ctrl, d2)→cell3, (drug, d1)→cells0,1, (drug, d2)→cells4,5
-        assert_eq!(result.n_groups, 4);
-        assert_eq!(result.groupby_columns, vec!["perturbation", "donor"]);
-
-        // Check (drug, d1): cells 0,1 → g0=1+3=4, g1=2, g2=4, g3=0
-        let drug_d1_idx = result
-            .group_labels
-            .iter()
-            .position(|l| l[0] == "drug" && l[1] == "d1")
-            .unwrap();
-        let row = &result.counts[drug_d1_idx * 4..(drug_d1_idx + 1) * 4];
-        assert_eq!(row, &[4.0, 2.0, 4.0, 0.0]);
-        assert_eq!(result.cell_counts[drug_d1_idx], 2);
-    }
-
-    #[test]
-    fn test_validation_errors() {
-        let csr = make_test_csr();
-        let genes = vec![
-            "g0".to_string(),
-            "g1".to_string(),
-            "g2".to_string(),
-            "g3".to_string(),
-        ];
-
-        // Empty obs_groups
-        let err = pseudobulk_aggregate_inmemory(&csr, &[], &[], &genes, AggregationMethod::Sum, 0);
-        assert!(err.is_err());
-
-        // Wrong number of cells
-        let bad_groups = vec![vec!["A".to_string(), "B".to_string()]]; // only 2 cells, need 6
-        let err = pseudobulk_aggregate_inmemory(
-            &csr,
-            &bad_groups,
-            &["group".to_string()],
-            &genes,
-            AggregationMethod::Sum,
-            0,
-        );
-        assert!(err.is_err());
-
-        // Wrong number of genes
-        let obs = vec![vec!["A".to_string(); 6]];
-        let bad_genes = vec!["g0".to_string(), "g1".to_string()]; // only 2, need 4
-        let err = pseudobulk_aggregate_inmemory(
-            &csr,
-            &obs,
-            &["group".to_string()],
-            &bad_genes,
-            AggregationMethod::Sum,
-            0,
-        );
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn test_geom_mean_mode_transforms() {
-        // Each row: (mode, x, expected_pre, mean (sum/2), expected_post(mean))
-        let cases: &[(GeomMeanMode, f64)] = &[
-            (GeomMeanMode::ArithRaw, 2.5),
-            (GeomMeanMode::ArithLog1pExpand, 1.5),
-            (GeomMeanMode::GeomRaw, 1.5),
-            (GeomMeanMode::GeomLog1p, 0.5),
-        ];
-
-        for &(mode, x) in cases {
-            // f(0) == 0 invariant — required for CSR aggregation correctness.
-            assert!(
-                mode.pre(0.0).abs() < 1e-15,
-                "{:?}.pre(0.0) must equal 0 (got {})",
-                mode,
-                mode.pre(0.0)
-            );
-
-            // Match pdex's _math.pseudobulk reference behavior on a single value.
-            let pre = mode.pre(x);
-            let post = mode.post(pre);
-            let expected = match mode {
-                GeomMeanMode::ArithRaw => x,
-                GeomMeanMode::ArithLog1pExpand => x.exp_m1(),
-                GeomMeanMode::GeomRaw => x.ln_1p().exp_m1(), // = x for x > -1
-                GeomMeanMode::GeomLog1p => x.exp_m1(),
-            };
-            assert!(
-                (post - expected).abs() < 1e-12,
-                "{:?} round-trip: post(pre({})) = {} != {}",
-                mode,
-                x,
-                post,
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_geom_mean_mode_from_flags() {
-        assert_eq!(
-            GeomMeanMode::from_flags(false, false),
-            GeomMeanMode::ArithRaw
-        );
-        assert_eq!(
-            GeomMeanMode::from_flags(false, true),
-            GeomMeanMode::ArithLog1pExpand
-        );
-        assert_eq!(GeomMeanMode::from_flags(true, false), GeomMeanMode::GeomRaw);
-        assert_eq!(
-            GeomMeanMode::from_flags(true, true),
-            GeomMeanMode::GeomLog1p
-        );
-    }
-
-    #[test]
-    fn test_pseudobulk_dense_matches_csr_inmemory() {
-        // The dense kernel should produce bit-identical sums to the CSR
-        // kernel when given the dense expansion of the same matrix.
-        let csr = make_test_csr();
-        let (n_obs, n_vars) = csr.shape;
-        let mut dense = vec![0.0f32; n_obs * n_vars];
-        for row in 0..n_obs {
-            let s = csr.indptr[row] as usize;
-            let e = csr.indptr[row + 1] as usize;
-            for j in s..e {
-                let col = csr.indices[j] as usize;
-                dense[row * n_vars + col] = csr.data[j];
-            }
-        }
-
-        let obs_groups = vec![vec![
-            "A".to_string(),
-            "A".to_string(),
-            "A".to_string(),
-            "B".to_string(),
-            "B".to_string(),
-            "B".to_string(),
-        ]];
-        let groupby = vec!["group".to_string()];
-        let genes = vec![
-            "g0".to_string(),
-            "g1".to_string(),
-            "g2".to_string(),
-            "g3".to_string(),
-        ];
-
-        for method in [AggregationMethod::Sum, AggregationMethod::Mean] {
-            let csr_res =
-                pseudobulk_aggregate_inmemory(&csr, &obs_groups, &groupby, &genes, method, 0)
-                    .unwrap();
-            let dense_res = pseudobulk_aggregate_dense(
-                &dense,
-                (n_obs, n_vars),
-                &obs_groups,
-                &groupby,
-                &genes,
-                method,
-                0,
-            )
-            .unwrap();
-            assert_eq!(csr_res.n_groups, dense_res.n_groups);
-            assert_eq!(csr_res.cell_counts, dense_res.cell_counts);
-            assert_eq!(csr_res.group_labels, dense_res.group_labels);
-            // f64 sums of the exact same f32 values; bit-identical.
-            for (a, b) in csr_res.counts.iter().zip(dense_res.counts.iter()) {
-                assert!(
-                    (a - b).abs() < 1e-12,
-                    "method={method:?} mismatch: csr={a} dense={b}"
-                );
-            }
-        }
-    }
-    /// The parse vocabulary and its exact error text are a cross-binding
-    /// contract (pyscx surfaces the message as `RuntimeError`, rscx as an R
-    /// error) — pinned here so `cargo test -p scx-accel` catches drift.
-    #[test]
-    fn aggregation_method_parse_vocabulary_and_error_text() {
-        assert!(matches!(
-            AggregationMethod::parse("sum"),
-            Ok(AggregationMethod::Sum)
-        ));
-        assert!(matches!(
-            AggregationMethod::parse("mean"),
-            Ok(AggregationMethod::Mean)
-        ));
-        assert_eq!(
-            AggregationMethod::parse("median").unwrap_err().to_string(),
-            "unsupported aggr_method 'median': use 'sum' or 'mean'"
-        );
-    }
-}
+#[path = "pseudobulk_tests.rs"]
+mod tests;

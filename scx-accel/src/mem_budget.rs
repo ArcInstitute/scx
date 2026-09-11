@@ -127,10 +127,13 @@ fn parse_accel_num_threads(raw: Option<String>) -> Option<usize> {
 /// private integration pool, and — since PCA's reductions started partitioning
 /// their output — the number of column blocks those reductions split into
 /// (`scx_accel::pca::colblocks::block_count`) plus PCA's decode-prefetch depth.
-/// PCA no longer builds a private pool or a per-accumulator RAM cap: there is
-/// one shared accumulator, so on that op this knob bounds speed and memory only
-/// and provably cannot change the numbers. Ambient global-pool sizing for the
-/// many `rayon::current_num_threads()` callers stays controlled by
+/// The pseudobulk scatter's column blocks (and a CSC run's column tasks) take
+/// their count from the same function; its group partition is one task per
+/// group row on the ambient pool and is not capped here. PCA no longer builds a
+/// private pool or a per-accumulator RAM cap: there is one shared accumulator,
+/// so on those ops this knob bounds speed and memory only and provably cannot
+/// change the numbers. Ambient global-pool sizing for the many
+/// `rayon::current_num_threads()` callers stays controlled by
 /// `RAYON_NUM_THREADS`.
 pub fn accel_num_threads() -> Option<usize> {
     static N: OnceLock<Option<usize>> = OnceLock::new();

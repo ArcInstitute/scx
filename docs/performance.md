@@ -1410,6 +1410,86 @@ callers who need identity across thread counts, measured at ~2.3× slower on the
 route's eigendecomposition (n_vars = 2000) and ~1.65× *faster* on the randomized route's thin
 QR (200 K × 60).
 
+### Pseudobulk aggregation partitioning (OPT-ACCEL-4)
+
+The pseudobulk scatter — `counts[g · n_vars + col] += v` once per nonzero, behind
+`pyscx.accel.pseudobulk_means`, `perturbation_metrics` / cell-eval, `pseudobulk_dex` (whose
+default backend since v0.13 is the native `nb_glm`) and rscx's pseudobulk entry points — ran serially on the
+calling thread at all four of its sites (the streaming shard loop, the two in-memory paths and
+the CSC projected path) while the decode-prefetch pool idled. It now partitions its **output**
+the way the PCA reductions do, and merges nothing, so every `(group, gene)` sum is formed from
+the same f32 operands in the same ascending-cell order as before: **bit-identical** to the serial
+loop on any thread count, which the crate's tests pin against a float fixture whose sums are
+order-sensitive (integer counts sum exactly in any order and would hide a reordering). Two
+partitions, chosen per shard on the streaming path and once for an in-memory matrix: one
+group row per task while the largest group holds at most two pool-shares of the nonzeros (it
+reads every nonzero once and needs no sorted columns, so it is also where an unsorted scipy
+CSR goes — still parallel, where PCA falls back to serial); otherwise a column block of every
+group's row, with each row's block windows planned once in a parallel pass rather than
+binary-searched per block, and only when a block owns at least 64 nonzeros of the average row
+— on 100-nonzero rows every partition reads more cache lines than the memory-bound serial loop
+streams, so a two-group HVG-subset matrix keeps the serial walk and pays nothing.
+`SCX_ACCEL_NUM_THREADS` caps the column-block count as it caps PCA's; the group partition is
+one task per group row on the ambient pool (a fixed number of coarse tasks measured 40 % slower
+on the streaming arms below). The CSC projected path parallelises only a contiguous run of
+requested columns wider than one, into a run-local scratch — a scattered gene subset keeps the
+serial loop.
+
+`cargo bench -p scx-accel --bench pseudobulk` on the Chimera worker `GPUCACE`, 12 cores,
+2026-09-11, both arms in one build at commit `a4d09aa7` of the PR-16 branch (the `before` arm is
+the replaced serial loop, replicated inline; both arms include the identical group-mapping step,
+so the scatter-only ratio is higher than shown). `Mean`, Criterion medians:
+
+| Fixture | Groups | In-memory before → after | Streaming before → after |
+|---|--:|---|---|
+| 200k × 2 000 genes, 5 % (100 nnz/row) | 2 | 26.4 → 26.7 ms (0.99×, serial walk kept) | 43.0 → 32.2 ms (1.34×) |
+| | 64 | 32.5 → 17.5 ms (**1.86×**) | 51.9 → 19.9 ms (**2.61×**) |
+| | 2 048 | 86.0 → 19.5 ms (**4.42×**) | 104.9 → 29.2 ms (**3.60×**) |
+| 20k × 20 000 genes, 10 % (2 000 nnz/row) | 2 | 43.9 → 25.9 ms (**1.70×**, column blocks) | 76.6 → 50.1 ms (**1.53×**) |
+| | 64 | 114.6 → 11.8 ms (**9.75×**) | 145.7 → 36.5 ms (**3.99×**) |
+
+The gains scale with how badly the serial loop was missing cache: with two group rows resident
+in L1 it was already memory-bound near the node's bandwidth, and no partition can read the
+input faster than that; with 64 or more groups the dependent adds were the cost, and those
+divide across the pool. The streaming arms carry the per-shard decode (a clone here) on both
+sides and the ordered consumer keeps the pool partly idle during it, which is why they trail the
+in-memory arms at the high end.
+
+> [!NOTE]
+> These are **Criterion microbenchmark** medians from the in-repo bench, not a captured entry
+> under `benchmarks/comprehensive/results/`. `docs/benchmark_manifest.md` asks for a manifest
+> behind every number here; the manifest system is shaped for the SLURM comprehensive suite and
+> has no pseudobulk-aggregation triple, so the reproduction recipe above stands in for one.
+> `benchmarks/scripts/check_readme_manifests.py` does not flag these claims.
+
+The comprehensive suite's pseudobulk-bearing cells — `bench_csc_dispatch` ×
+`bench_csc__pseudobulk_{csr,csc}` on tabula_sapiens_100k, which time `pseudobulk_dex` end to
+end with the pydeseq2 fit dominating — are the **no-regression** check for this change, not its
+measurement. One job per arm (`benchmarks/scripts/_run_pr16_pseudobulk_gate.sh`; the job logs the
+extension's sha256 and any dirty tracked paths), medians of three; the harness's `cpu_preemptible`
+cells land on whichever node is free, and the node class moves `pseudobulk_dex`'s wall more than
+this change does, so the node is part of the row:
+
+| Arm (job) | Cell node | `pseudobulk_csr` wall / peak RSS | `pseudobulk_csc` wall / peak RSS | `csc_dispatch_correct` |
+|---|---|---|---|---|
+| `main` `9e628f38` (2932673) | CPUDFDC84 | 13.70 s (runs 17.1 / 13.5 / 13.7) / 3 579 MB | 0.74 s / 3 414 MB | 1.0 |
+| branch, round-1 kernel, dirty tree at `9e628f38` (2932638) | CPUDFDE34 | 13.51 s / 3 553 MB | 0.78 s / 3 433 MB | 1.0 |
+| branch, fix commit `9664b85e`, tracked tree clean (2933595) | GPU1298 / GPU726E | 15.43 s / 3 601 MB | 0.79 s / 3 482 MB | 1.0 |
+
+The two CPU-node captures are the like-for-like pair: wall within 1.5 % and RSS within 30 MB of
+`main`. The clean-commit recapture is the provenance-correct row and sits on a different node
+class, where the serial pydeseq2 fit runs slower; its RSS is within 70 MB of `main`. Manifest rows:
+the clean recapture at `benchmarks/comprehensive/results/raw/bench_csc_dispatch__bench_csc__pseudobulk_{csr,csc}__tabula_sapiens_100k.json`,
+the `main` arm under `results/raw/pr16_pseudobulk_base/`, the round-1 capture under
+`results/raw/pr16_pseudobulk_r1_dirty_tree/`. Every row carries `git_dirty: true`: the harness
+flags any `git status --porcelain` output, and this checkout keeps four untracked scratch notes
+at the repo root (not named here — tracked files do not cite them — and read by neither the
+harness nor the build); the job log records every porcelain line, the tracked-tree state and the
+extension's sha256. The rows themselves carry neither, which would take a harness change.
+Against `LATEST` (captured 2026-09-03 at `33d52cd0`) the gate reports both cells ~550 MB higher in
+peak RSS; the `main` arm shows the same figure, so that delta belongs to the merges between the two
+snapshots, not to this change.
+
 ### QC / filtering pass fusion (Phase-4 task 4.1)
 
 `calculate_qc_metrics` used to decode every shard once **per statistic**: per-cell

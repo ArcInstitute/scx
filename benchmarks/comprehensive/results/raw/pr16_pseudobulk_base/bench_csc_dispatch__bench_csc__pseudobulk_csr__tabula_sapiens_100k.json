@@ -1,0 +1,99 @@
+{
+  "schema_version": 2,
+  "benchmark": "bench_csc_dispatch",
+  "format": "bench_csc__pseudobulk_csr",
+  "dataset": "tabula_sapiens_100k",
+  "timestamp": "2026-09-11T09:37:48",
+  "system": {
+    "hostname": "CPUDFDC84",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M28N92X7GGCJFK9VY0Z9N9F9",
+      "git_sha": "9e628f384bef456cd6df6387a298fb15f5e40707",
+      "git_branch": "main",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-9-g9e628f38",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 17.099292520899326,
+      "user_s": 15.687304000000005,
+      "sys_s": 1.107073999999999,
+      "peak_rss_mb": 3558.78515625,
+      "extra": {
+        "dispatch_route": "cpu_csr",
+        "csc_dispatch_correct": 1.0
+      }
+    },
+    {
+      "wall_s": 13.478898852830753,
+      "user_s": 14.933219999999992,
+      "sys_s": 1.1228230000000003,
+      "peak_rss_mb": 3578.6484375,
+      "extra": {
+        "dispatch_route": "cpu_csr",
+        "csc_dispatch_correct": 1.0
+      }
+    },
+    {
+      "wall_s": 13.698834870010614,
+      "user_s": 14.917899000000006,
+      "sys_s": 1.1231860000000005,
+      "peak_rss_mb": 3583.484375,
+      "extra": {
+        "dispatch_route": "cpu_csr",
+        "csc_dispatch_correct": 1.0
+      }
+    }
+  ],
+  "median_wall_s": 13.698834870010614,
+  "wall_s_iqr": 3.620393668068573,
+  "n_runs": 3,
+  "metadata": {
+    "cold_cache": false,
+    "n_warmup": 1,
+    "n_obs": 100000,
+    "prefer_format": "csr",
+    "random_seed": 42
+  }
+}
