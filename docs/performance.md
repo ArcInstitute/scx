@@ -1410,6 +1410,56 @@ callers who need identity across thread counts, measured at ~2.3× slower on the
 route's eigendecomposition (n_vars = 2000) and ~1.65× *faster* on the randomized route's thin
 QR (200 K × 60).
 
+### Pseudobulk aggregation partitioning (OPT-ACCEL-4)
+
+The pseudobulk scatter — `counts[g · n_vars + col] += v` once per nonzero, behind
+`pyscx.accel.pseudobulk`, `pseudobulk_means`, `perturbation_metrics` / cell-eval, and
+`pseudobulk_dex`, whose default backend since v0.13 is the native `nb_glm` — ran serially on the
+calling thread at all four of its sites (the streaming shard loop, the two in-memory paths and
+the CSC projected path) while the decode-prefetch pool idled. It now partitions its **output**
+the way the PCA reductions do, and merges nothing, so every `(group, gene)` sum is formed from
+the same f32 operands in the same ascending-cell order as before: **bit-identical** to the serial
+loop on any thread count, which the crate's tests pin against a float fixture whose sums are
+order-sensitive (integer counts sum exactly in any order and would hide a reordering). Two
+partitions, chosen per shard: one group row per worker while the largest group holds at most
+two pool-shares of the shard's nonzeros (it reads every nonzero once and needs no sorted
+columns, so it is also where an unsorted scipy CSR goes — still parallel, where PCA falls back
+to serial); otherwise a column block of every group's row, with each row's block windows
+planned once in a parallel pass rather than binary-searched per block, and only when a block
+owns at least 64 nonzeros of the average row — on 100-nonzero rows every partition reads more
+cache lines than the memory-bound serial loop streams, so a two-group HVG-subset matrix keeps
+the serial walk and pays nothing.
+
+`cargo bench -p scx-accel --bench pseudobulk` on the Chimera worker `GPUCACE`, 12 cores,
+2026-09-11, both arms in one build at the PR-16 branch off `9e628f38` (the `before` arm is the
+replaced serial loop, replicated inline; both arms include the identical group-mapping step, so
+the scatter-only ratio is higher than shown). `Mean`, Criterion medians:
+
+| Fixture | Groups | In-memory before → after | Streaming before → after |
+|---|--:|---|---|
+| 200k × 2 000 genes, 5 % (100 nnz/row) | 2 | 28.5 → 26.3 ms (1.09×, serial walk kept) | 41.6 → 29.2 ms (1.43×) |
+| | 64 | 31.8 → 16.5 ms (**1.93×**) | 47.1 → 19.5 ms (**2.42×**) |
+| | 2 048 | 86.6 → 19.5 ms (**4.45×**) | 104.2 → 28.8 ms (**3.62×**) |
+| 20k × 20 000 genes, 10 % (2 000 nnz/row) | 2 | 43.4 → 29.6 ms (**1.47×**, column blocks) | 74.2 → 45.9 ms (**1.62×**) |
+| | 64 | 117.0 → 11.8 ms (**9.95×**) | 140.9 → 30.8 ms (**4.58×**) |
+
+The gains scale with how badly the serial loop was missing cache: with two group rows resident
+in L1 it was already memory-bound near the node's bandwidth, and no partition can read the
+input faster than that; with 64 or more groups the dependent adds were the cost, and those
+divide across the pool. The streaming arms carry the per-shard decode (a clone here) on both
+sides and the ordered consumer keeps the pool partly idle during it, which is why they trail the
+in-memory arms at the high end.
+
+> [!NOTE]
+> These are **Criterion microbenchmark** medians from the in-repo bench, not a captured entry
+> under `benchmarks/comprehensive/results/`. `docs/benchmark_manifest.md` asks for a manifest
+> behind every number here; the manifest system is shaped for the SLURM comprehensive suite and
+> has no pseudobulk-aggregation triple, so the reproduction recipe above stands in for one.
+> `benchmarks/scripts/check_readme_manifests.py` does not flag these claims. The
+> comprehensive suite's pseudobulk-bearing cells (`bench_csc_dispatch` × `bench_csc__pseudobulk_*`
+> on tabula_sapiens_100k) time `pseudobulk_dex` end to end, where the pydeseq2 fit dominates; they
+> are the no-regression check for this change, not its measurement.
+
 ### QC / filtering pass fusion (Phase-4 task 4.1)
 
 `calculate_qc_metrics` used to decode every shard once **per statistic**: per-cell

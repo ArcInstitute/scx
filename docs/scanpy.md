@@ -3931,7 +3931,7 @@ parallelism — see [docs/multithreading.md](multithreading.md).
 | `pyscx.accel.umap` (CPU) | Single-threaded SGD | Edge updates are serial on CPU; GPU path uses CUDA kernel parallelism |
 | `pyscx.accel.leiden` | Opt-in rayon via `parallel=True` | Sequential by default (reproduces C++ leidenalg's move-node ordering); parallel uses conflict-free graph coloring |
 | `pyscx.accel.rank_genes_groups` | Rayon | Parallel Wilcoxon rank-sum across genes |
-| `pyscx.accel.pseudobulk_dex` | Rayon (aggregation) | Streaming aggregation is parallel; downstream `pydeseq2` testing runs single-threaded |
+| `pyscx.accel.pseudobulk_dex`, `pseudobulk_means` | Rayon (aggregation) | The CSR scatter partitions its **output** across workers — a column block of every group's row (or one group's row per worker when a scipy matrix arrives with unsorted / duplicate columns) — so it is bit-identical to a serial loop on any thread count; shard decode overlaps it; downstream `pydeseq2` testing runs single-threaded, the native `nb_glm` fit is gene-parallel |
 | `pyscx.accel.highly_variable_genes` | Rayon (via streaming reader) | Parallelism comes from shard decode; the mean/var reduction itself is serial |
 | `pyscx.accel.perturbation_metrics`, `energy_distance` | Rayon (CPU) or GPU | CPU parallelizes across perturbations / pairwise-distance rows; GPU runs pseudobulk means (`perturbation_metrics`) or a gemm pairwise-distance mean (`energy_distance`, euclidean/cosine f32) on the device |
 | `pyscx.accel.discrimination_score` | Rayon (CPU only) | Parallelizes across perturbations; no GPU kernel (exact-rank parity not f32-safe) |

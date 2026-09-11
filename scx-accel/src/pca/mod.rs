@@ -4,7 +4,7 @@
 //! `COVARIANCE_PCA_THRESHOLD` routing ceiling; [`gpu`] (behind the `gpu`
 //! feature) is thin orchestration over the `scx-gpu` streaming PCA pipeline.
 
-mod colblocks;
+pub(crate) mod colblocks;
 pub mod cpu;
 #[cfg(feature = "gpu")]
 pub mod gpu;

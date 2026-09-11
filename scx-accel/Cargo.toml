@@ -65,3 +65,7 @@ harness = false
 [[bench]]
 name = "wilcoxon_ranking"
 harness = false
+
+[[bench]]
+name = "pseudobulk"
+harness = false

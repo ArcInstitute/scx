@@ -499,7 +499,7 @@ accelerator uses rayon's global thread pool or a locally-scoped pool:
 | **LISI** | `par_iter` over cells |
 | **HVG** (seurat_v3 / seurat) | Streaming shard-parallel gene statistics |
 | **Gene-set scoring** (`score_genes`) | Streaming shard-parallel mean/score computation |
-| **Pseudobulk** aggregation | Streaming shard-parallel group sums |
+| **Pseudobulk** aggregation | Ordered shard stream; within a shard the scatter is partitioned by output column block across the pool (bit-identical to serial — see below) |
 | **Perturbation eval metrics** | `par_iter` over perturbations; faer `Par::rayon(0)` for distance matmul |
 
 Harmony builds an isolated `rayon::ThreadPool` scoped to the op to avoid
@@ -521,6 +521,37 @@ that knob bounds speed and memory and provably cannot change the numbers (see
 [scanpy.md § PCA reproducibility](scanpy.md#reproducibility)). The
 decoded-but-unconsumed shards are reserved out of `pca(memory_budget=…)` rather
 than added on top of it.
+
+Pseudobulk aggregation entered the pool the same way (OPT-ACCEL-4). Its four CSR
+scatter sites — the streaming `pseudobulk_aggregate`, the two in-memory paths, and
+the CSC projected path — used to be one serial `counts[g·n_vars + col] += v` per
+nonzero on the calling thread with the pool idle. Each shard (or 16 384-row chunk
+of an in-memory matrix) now picks one of two **output** partitions, and nothing is
+merged, so for each `(group, gene)` the f64 sum is formed from the same f32
+operands in the same ascending-cell order the serial loop used — bit-identical on
+any `RAYON_NUM_THREADS`. *By group*: one worker per group row, each row's
+nonzeros in stored order; reads every nonzero once and needs no sortedness, so it
+is also where a scipy CSR with unsorted or duplicated columns goes (a duplicate
+contributes both values, as it always did) — where PCA falls back to a serial
+loop on such input, pseudobulk has nothing to fall back from. Its wall is bounded
+by the largest group, so it is taken while that group holds at most two
+pool-shares of the chunk's nonzeros. *By column block* otherwise (a two-group
+`pseudobulk_dex`, a control arm at half the cells, a shard of a group-sorted file
+holding two groups): reusing PCA's `colblocks` planner, a worker owns a contiguous
+column window of every group's row. The obvious form — each block binary-searching
+its window in every row — measured slower than the serial loop on 100-nonzero
+rows, so the windows are planned once, in a parallel pass over rows that reads
+each row a single time, and the block workers then read only their windows. Even
+so, a block must own at least 64 nonzeros of the average row to be worth a
+separate reader — twelve slivers of a 100-nonzero row touch more cache lines than
+the serial loop streams, and that loop is already memory-bound when two group
+rows fit in L1 — so a short-row chunk gets fewer blocks, down to the serial walk
+(a two-group `pseudobulk_dex` on an HVG-subset matrix stays exactly as fast as
+before; the same call on a full transcriptome splits).
+`SCX_ACCEL_NUM_THREADS` caps the block count here as it does for PCA, and the plan
+is balanced by a per-column nonzero histogram the workers accumulate as they go,
+carried from shard to shard, rather than a separate pass. The CSC projected path
+parallelizes over the columns of each contiguous run it decodes.
 
 > `errno 37` ("No locks available") on NFS/Lustre/GPFS.
 
