@@ -1015,7 +1015,7 @@ them.
 | `threads.rs` | reader-thread and queue-depth derating — the *consumer* of `budget.rs`, not a second copy of it |
 | `index.rs` | when to build a convert-time predicate index, and its per-column outcomes → `ConvertWarning` |
 | `entry.rs` | the eager entry points: `h5ad_to_scx`, `tenx_to_scx`, `scx_to_h5ad` |
-| `entry_streaming.rs` | `h5ad_to_scx_streaming`, the bounded-memory sequencer, and `convert_then_sort_grouped` |
+| `entry_streaming.rs` | `h5ad_to_scx_streaming` and `tenx_to_scx_streaming`, the bounded-memory sequencers, and `convert_then_sort_grouped` |
 | `coordinator.rs` | the four shard coordinators and `encode_one_shard_worker`; the pool, channel and reorder buffer are in `parallel_drain` |
 | `shards.rs` | X / `raw/X` / layer / CSC-sidecar shard writers |
 | `mappings.rs` | `obsm` / `varm` / `obsp` / `varp` row-sharded section writers |
@@ -1059,6 +1059,8 @@ need.
 
 **Streaming ingestion** (`scx convert --stream`, `pyscx.from_h5ad`,
 auto-routing on backed AnnData): `scx_convert::h5ad_to_scx_streaming`
+— and `tenx_to_scx_streaming`, which reuses the same reader over a 10x
+`/matrix` group (a CSC of genes×cells *is* a CSR of cells×genes) —
 loads the full `indptr` then iterates `XStreamReader::next_shard`,
 running `sort_csr_rows_in_place` + `drop_explicit_zeros_inplace` per
 shard before `encode_one_shard` → `ScxWriter::write_preencoded_shard`.

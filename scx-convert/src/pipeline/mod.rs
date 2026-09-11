@@ -63,7 +63,7 @@ mod threads;
 // is how a module surface grows without anyone deciding it should.
 pub use coordinator::{run_streaming_writer_coordinator, streaming_writer_coordinator};
 pub use entry::{h5ad_to_scx, scx_to_h5ad, scx_to_h5ad_streaming, tenx_to_scx};
-pub use entry_streaming::{h5ad_to_scx_streaming, StreamingOverrides};
+pub use entry_streaming::{h5ad_to_scx_streaming, tenx_to_scx_streaming, StreamingOverrides};
 pub use error::ConvertError;
 
 pub(crate) use threads::{derate_threads_and_depth, resolve_reader_threads};
@@ -87,6 +87,8 @@ pub(crate) use index::process_predicate_index_outcomes;
 // `pipeline` while `pipeline` re-exported `options`, which contradicted the
 // one-way dependency this module doc claims.
 pub use crate::options::{codec_selection_json, IngestOptions};
+
+use std::path::Path;
 
 use arrow::record_batch::RecordBatch;
 use scx_format_io::writer::ScxWriter;
@@ -137,6 +139,40 @@ pub(crate) fn write_ingest_obs(
         reshape,
         opts.shard_target_rows,
     )?)
+}
+
+/// Open a 10x HDF5 input and reject the two things that land here by file
+/// extension but are not a 10x CellRanger matrix.
+///
+/// Shared by [`tenx_to_scx`] and [`tenx_to_scx_streaming`] because the gate is
+/// the *direction's*, not a path's: `--from 10x` streams by default, so a gate
+/// living in only one of them would go silently missing for the default route.
+pub(crate) fn open_tenx_input(input: &Path) -> Result<hdf5::File, ConvertError> {
+    let file = hdf5::File::open(input)?;
+
+    let format = crate::detect::detect_input_format(&file)?;
+    if matches!(format, crate::detect::InputFormat::H5ad) {
+        return Err(ConvertError::FormatMismatch {
+            expected: "10x".to_string(),
+            got: "h5ad".to_string(),
+        });
+    }
+
+    // A CellBender output also has `/matrix/barcodes`, so it lands here by
+    // extension. Redirect rather than failing somewhere deep inside the 10x
+    // reader — and note this is a *different* operation, not a conversion:
+    // the corrected counts belong on an existing file's obs axis.
+    if file.group("droplet_latents").is_ok() {
+        return Err(ConvertError::Other(format!(
+            "'{}' looks like a CellBender remove-background output (it has a \
+             /droplet_latents group), not a 10x CellRanger matrix. Attach it to \
+             an existing SCX file with: scx cellbender-import <target.scx> {}",
+            input.display(),
+            input.display()
+        )));
+    }
+
+    Ok(file)
 }
 
 #[cfg(test)]

@@ -193,6 +193,32 @@ class DatasetConfig:
         return DATA_DIR / f"{self.name}_full.scx"
 
     @property
+    def tenx_path(self) -> Path:
+        """The 10x CellRanger-shaped HDF5 source built from this dataset's h5ad.
+
+        `scx convert --from 10x` streams since OPT-CONVERT-9, and the claim is a
+        memory one. Nothing in the suite could measure it: every entry in
+        `DATASETS` is sourced from an `.h5ad`, and the only 10x `.h5` the prep
+        scripts touch is pbmc3k's, which `download_datasets.sh` converts and
+        then deletes.
+
+        Same reasoning as `scx_full_path` for why this is a path on
+        `DatasetConfig` rather than a `FormatVariant` or a `DATASETS` entry: as a
+        variant the default format pool would not schedule it, and as a dataset
+        it would sit outside every `capture_baseline.TIERS` list, where
+        `check_absolute_floors` skips a triple that did not run *silently*. The
+        `conversion_streaming` 10x arms read this path instead, off a triple the
+        default gate already schedules.
+
+        Built by `benchmarks/scripts/prep_tenx_fixture.py`, which copies the
+        h5ad's `/X/{indptr,indices,data}` verbatim — an h5ad CSR over
+        cells x genes and a 10x CSC over genes x cells are the same three
+        arrays — so the fixture is a real 10x layout, not an approximation.
+        Absent until that script has been run for the dataset.
+        """
+        return DATA_DIR / f"{self.name}_10x.h5"
+
+    @property
     def scx_fast_path(self) -> Path:
         return DATA_DIR / f"{self.name}_fast.scx"
 

@@ -585,7 +585,12 @@ pub(crate) const ALLOCATION_TABLE: &[Reservation] = &[
         phase: Phase::SparseIngest,
         share: SHARD_BUDGET_SHARE,
         multiplicity: SHARD_BUDGET_SHARE.max_concurrent(),
-        site: "h5ad/stream.rs::per_worker_bytes -> derate_threads_and_depth",
+        // One site, two ingest directions: `XStreamReader` is also the 10x
+        // reader (`open_tenx_x_streaming`, OPT-CONVERT-9), so `--from 10x`
+        // derates through the same exact `per_worker_bytes` override. No
+        // second row, because it is not a second claim.
+        site: "h5ad/stream.rs::per_worker_bytes -> derate_threads_and_depth \
+               (h5ad and 10x ingest)",
         // `shard_working_set_bytes` charges `WORKER_PHASE_BYTES_PER_NNZ`, so
         // the encoded output no longer overlaps the share unpriced — 48 B/nnz
         // against the 16 this used to claim.

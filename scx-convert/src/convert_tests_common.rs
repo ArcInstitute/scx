@@ -46,7 +46,9 @@ pub(crate) use crate::h5ad::read::read_x_matrix;
 
 pub(crate) use crate::h5ad::stream::{open_layer_streaming, open_x_streaming};
 
-pub(crate) use super::pipeline::{h5ad_to_scx_streaming, StreamingOverrides};
+pub(crate) use super::pipeline::{
+    h5ad_to_scx_streaming, tenx_to_scx_streaming, StreamingOverrides,
+};
 
 pub(crate) use scx_format_io::section::SectionType as FmtSectionType;
 

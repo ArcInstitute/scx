@@ -2075,6 +2075,56 @@ absolute_floors:
     metric: streaming_peak_rss_mb     # the reader_threads=4 arm only
     max: 4096.0
 
+  # ─── Streaming 10x → SCX conversion (OPT-CONVERT-9) ─────────────────
+  # `scx convert --from 10x` had one materialising path until OPT-CONVERT-9:
+  # `read_tenx_h5` read `/matrix/{indptr,indices,data}` whole. It now streams,
+  # and by default, so this is the floor on the claim.
+  #
+  # Driven through the **CLI**, not `from_h5ad`, because the direction is not
+  # reachable from it: `pyscx.from_10x` routes through `scanpy.read_10x_h5` into
+  # `from_anndata` — a third path with no `stream` kwarg and no bounded reader.
+  # The source is a synthesised 10x fixture (`prep_tenx_fixture.py`), since no
+  # benchmark dataset is a 10x file; it copies the h5ad's CSR arrays verbatim,
+  # which *is* the 10x CSC-over-genes×cells layout, so the fixture is real.
+  #
+  # Derivation for census_500k, measured 2026-09-11 on a Chimera worker node
+  # with `target/release/scx` (`--features hdf5`), one run per arm, each in its
+  # own process (peak from `getrusage(RUSAGE_CHILDREN)` over a single `scx`
+  # child, so it is that convert's high-water mark and nothing else's).
+  #
+  # **Not yet a tracked capture.** Unlike the census_1m block above, which
+  # cites job 2834737's results JSON, these numbers come from a direct local
+  # run of the two arms — enough to derive a floor, not enough to quote in
+  # `docs/performance.md`, which needs a manifest entry
+  # (`docs/benchmark_manifest.md`). Replace this paragraph with the job id and
+  # results path once a full-tier capture has populated the metric.
+  #   500,000 cells × 61,497 genes, 747,048,147 nnz, 5.59 GB source
+  #   nnz/cell                    1494
+  #   31 CSR shards of 16384 rows, ~24.1M nnz each
+  #   one shard's worker phase    24.1M × 48 B  = 1156 MB  (budget.rs's model)
+  #   measured, --stream (rt=4)   2593 MB / 17.5 s
+  #   measured, --stream=false    8599 MB / 33.2 s
+  # Floor set at 4096 MB — 1.58× the measured streaming peak, and **less than
+  # half** the materialising arm's 8599 MB, so a regression back to a
+  # whole-matrix read fails this floor rather than merely looking slower. Same
+  # value as the census_1m h5ad floor above, which is a coincidence of scale
+  # rather than a shared derivation.
+  #
+  # Wall clock is not gated here either, for the reason above — though note the
+  # streaming arm is also 1.9× *faster*, because the eager path pays a full
+  # extra scan of `data` in `detect_value_encoding` plus a whole-matrix
+  # `values_to_raw_bytes` before it encodes anything.
+  #
+  # The `tenx_materialize` arm is the comparison baseline, not a contract, and
+  # is deliberately unfloored: `_assert_tenx_streaming_beat_materialize` raises
+  # when the pair stops demonstrating a bound, which is the property that
+  # matters and is not expressible as a ceiling on either arm alone.
+  - benchmark: conversion_streaming
+    format: scx_streaming_vs_materialize
+    dataset: census_500k
+    metric: tenx_streaming_peak_rss_mb   # the --stream=true, rt=4 arm only
+    max: 4096.0
+
   # ─── Observed RSS ceiling for a budgeted ingest (OPT-CONVERT-10) ───
   # The `budget_bound` arm hands `from_h5ad` a 2 GiB `memory_budget` at
   # `shard_size=2048`, and this floor says the process's peak RSS stayed

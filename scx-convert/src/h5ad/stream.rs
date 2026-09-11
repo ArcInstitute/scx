@@ -107,28 +107,76 @@ pub fn open_x_streaming(
         }
     }
 
-    let indptr_ds = group.dataset("indptr")?;
-    let indptr = read_i64_dataset(&indptr_ds)?;
-    if indptr.len() != n_obs + 1 {
-        return Err(ConvertError::Other(format!(
-            "indptr length {} != n_obs + 1 ({})",
-            indptr.len(),
-            n_obs + 1
-        )));
+    XStreamReader::from_group(&group, n_obs, n_vars, group_path)
+}
+
+/// Open a 10x `/matrix` group as a CSR row stream over **cells**.
+///
+/// A 10x file's `/matrix` is a CSC of genes×cells, which is byte-for-byte a CSR
+/// of cells×genes, so nothing is transposed — the same reinterpretation the
+/// eager [`crate::tenx_read::read_tenx_h5`] relies on.
+///
+/// Deliberately not [`open_x_streaming`] with `group_path = "matrix"`. Three of
+/// that function's assumptions are h5ad's, not the format's:
+///
+/// * [`read_shape_2d`] reads a `shape` **attribute** and returns
+///   `(n_obs, n_vars)`; 10x writes a `shape` **dataset** in `[n_genes, n_cells]`
+///   order — the transpose. Teaching `read_shape_2d` the dataset form would make
+///   it answer `(n_vars, n_obs)` here, i.e. lie to every other caller.
+/// * `/matrix` carries no `encoding-type`, so the h5ad reader would emit
+///   [`ConvertWarning::InferredEncoding`] on every 10x convert — a warning the
+///   eager 10x path never emits.
+/// * the `indptr.len() == n_obs + 1` check only passes once the axes are
+///   swapped, so it would reject every real 10x file with a shape error.
+///
+/// The row-range reads themselves are shared: this goes through the same
+/// [`XStreamReader::from_group`] initialiser and the same hyperslab path.
+/// Takes no [`WarningSink`], unlike every other opener in this module: there is
+/// nothing for this path to warn about. The absent `encoding-type` is the
+/// format's normal state, not an inference worth recording.
+pub(crate) fn open_tenx_x_streaming(file: &hdf5::File) -> Result<XStreamReader, ConvertError> {
+    let group = file.group("matrix")?;
+    let (n_genes, n_cells) = crate::tenx_read::read_tenx_shape(&group)?;
+    // The swap is the whole point: cells are the obs axis.
+    XStreamReader::from_group(&group, n_cells, n_genes, "matrix")
+}
+
+impl XStreamReader {
+    /// Build a reader over an already-opened sparse group whose shape the
+    /// caller has resolved (h5ad reads a `shape` attr as `(n_obs, n_vars)`, 10x
+    /// a `shape` dataset as `(n_genes, n_cells)` — so the axis resolution stays
+    /// with the format and only the field initialiser is shared).
+    ///
+    /// Loads `indptr` eagerly and opens `indices` / `data` as handles.
+    fn from_group(
+        group: &hdf5::Group,
+        n_obs: usize,
+        n_vars: usize,
+        source_name: &str,
+    ) -> Result<Self, ConvertError> {
+        let indptr_ds = group.dataset("indptr")?;
+        let indptr = read_i64_dataset(&indptr_ds)?;
+        if indptr.len() != n_obs + 1 {
+            return Err(ConvertError::Other(format!(
+                "indptr length {} != n_obs + 1 ({})",
+                indptr.len(),
+                n_obs + 1
+            )));
+        }
+
+        let indices_ds = group.dataset("indices")?;
+        let data_ds = group.dataset("data")?;
+
+        Ok(XStreamReader {
+            n_obs,
+            n_vars,
+            source_name: source_name.to_string(),
+            indptr,
+            indices_ds,
+            data_ds,
+            cursor: 0,
+        })
     }
-
-    let indices_ds = group.dataset("indices")?;
-    let data_ds = group.dataset("data")?;
-
-    Ok(XStreamReader {
-        n_obs,
-        n_vars,
-        source_name: group_path.to_string(),
-        indptr,
-        indices_ds,
-        data_ds,
-        cursor: 0,
-    })
 }
 
 /// Open `/layers/{layer_name}` for streaming reads. h5ad stores

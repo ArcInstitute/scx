@@ -1,4 +1,4 @@
-//! Streaming h5ad ingest.
+//! Streaming ingest: h5ad and 10x.
 //!
 //! The bounded-memory path: X is read shard by shard and never fully resident.
 //! [`h5ad_to_scx_streaming`] is the long one because it is the sequencer -- it
@@ -787,5 +787,145 @@ fn convert_then_sort_grouped(
             .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
         }
     }
+    Ok(())
+}
+
+/// Streaming 10x HDF5 → SCX conversion. Reads `/matrix` one shard's worth of
+/// rows at a time via [`crate::h5ad::stream::open_tenx_x_streaming`], so peak
+/// memory is bounded by the always-resident `indptr` (`(n_cells + 1) × 8`
+/// bytes), `obs` / `var`, and one shard's working set per outstanding worker —
+/// instead of the whole `indptr` + `indices` + `data` triple the eager
+/// [`tenx_to_scx`](super::entry::tenx_to_scx) holds.
+///
+/// Shard processing dispatches through [`run_streaming_writer_coordinator`],
+/// exactly as the h5ad path does, so the rayon fan-out, the
+/// `H5is_library_threadsafe` probe, the sequential fallback and the
+/// `--memory-budget` derate all apply unchanged.
+///
+/// **This is not byte-identical to the eager path, and neither is h5ad's.**
+/// `tenx_to_scx` detects one value encoding over the whole matrix and forces the
+/// resulting codec into every shard; the coordinator passes `opts.codec`
+/// through, which is `None` under the default `--codec auto`, so each shard
+/// seeds its own codec from its own values. Since `select_codec` samples only
+/// the first 10 000 values, shard 0 agrees by construction and later shards can
+/// differ. The values, the shard row ranges and every section but `Provenance`
+/// are identical — pinned by `convert_tests_tenx_stream`.
+///
+/// 10x has no `uns` / `obsm` / `varm` / `obsp` / `varp` / `layers` / `raw` and
+/// the CLI rejects `--sort-by` / `--group-by` on this direction, so this is the
+/// whole sequence: header → obs/var → X → indexes → provenance → CSC.
+pub fn tenx_to_scx_streaming(
+    input: &Path,
+    output: &Path,
+    opts: &IngestOptions,
+    sink: &mut WarningSink,
+) -> Result<(), ConvertError> {
+    // Same gate as the eager path: an h5ad misrouted here, and a CellBender
+    // output redirected to `scx cellbender-import`.
+    let file = super::open_tenx_input(input)?;
+
+    // Open the reader first — the header needs the shape before any section
+    // write, and `n_obs` is the *cell* axis (10x's `shape` is gene-major).
+    let mut x_reader = crate::h5ad::stream::open_tenx_x_streaming(&file)?;
+    let n_obs = x_reader.n_obs;
+    let n_vars = x_reader.n_vars;
+    let n_vars_u32: u32 = u32::try_from(n_vars)
+        .map_err(|_| ConvertError::Other(format!("n_vars {n_vars} exceeds u32::MAX")))?;
+    let index_dtype: u8 = index_dtype_for(n_vars as u64);
+
+    // Placeholder header. `nnz`, `n_csr_shards` and `codec_id` are overwritten
+    // by `ScxWriter::finish()` from running accumulators — the eager path can
+    // stamp them up front only because it has the whole matrix in hand.
+    let mut header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        0,
+        opts.shard_target_rows,
+        0,
+        index_dtype,
+    );
+    if opts.framing().is_some() {
+        header.format_version = scx_format_io::header::CURRENT_FORMAT_VERSION;
+    }
+
+    let mut writer = ScxWriter::new(output, header)?;
+    writer.set_framing(opts.framing());
+
+    let matrix = file.group("matrix")?;
+    let obs = crate::tenx_read::read_tenx_obs(&matrix)?;
+    let var = crate::tenx_read::read_tenx_var(&matrix, n_vars)?;
+    write_ingest_obs(&mut writer, &obs, opts)?;
+    writer.write_var(&var)?;
+
+    // `"X_shard"` uppercase is load-bearing (see the h5ad call site above);
+    // `explicit_ranges = None` because this direction has no reorder.
+    let (_csr_shard_count, csr_row_ranges) = run_streaming_writer_coordinator(
+        &mut x_reader,
+        &mut writer,
+        opts,
+        index_dtype,
+        n_vars_u32,
+        SectionType::CsrShard,
+        ModalityType::Rna,
+        "X_shard",
+        sink,
+        None,
+    )?;
+    drop(x_reader);
+
+    // Ranges come from the coordinator, never from an assumed partition.
+    let (obs_indexed, var_indexed) = build_and_write_predicate_indexes(
+        &mut writer,
+        &obs,
+        &var,
+        &csr_row_ranges,
+        n_vars,
+        opts,
+        &[],
+        sink,
+    )?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let resolved_reader_threads = resolve_reader_threads(opts.reader_threads);
+    writer.write_provenance(vec![ProvenanceEntry {
+        timestamp,
+        action: "convert".to_string(),
+        tool: opts.tool.clone(),
+        params_json: serde_json::json!({
+            "input": input.display().to_string(),
+            "format": "10x",
+            "stream": true,
+            "codec_selection": opts.codec_selection_value(),
+            "warnings": sink.summary_json(),
+            "predicate_index": {
+                "obs_columns": obs_indexed,
+                "var_columns": var_indexed,
+                "preset": opts.index_preset,
+            },
+            "reader_threads": resolved_reader_threads,
+            "writer_queue_depth": opts.writer_queue_depth,
+        })
+        .to_string(),
+        input_checksums: vec![],
+    }])?;
+
+    writer.finish()?;
+
+    // CSC sidecar (opt-in), in the streaming form: rebuild in place over the
+    // finished file rather than transposing resident arrays, which is what the
+    // eager path does and what streaming has no arrays for.
+    if opts.csc.should_build_csc(n_obs as u64, n_vars as u64) {
+        scx_ops::rebuild_csc_inplace(
+            output,
+            opts.csc_cols_per_shard,
+            &crate::budget::csc_sidecar_bytes(opts.memory_budget).to_string(),
+            opts.framing_preserving_codec(),
+        )
+        .map_err(|e| ConvertError::Other(format!("rebuild_csc_inplace failed: {e}")))?;
+    }
+
     Ok(())
 }

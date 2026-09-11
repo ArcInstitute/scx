@@ -268,29 +268,7 @@ pub fn tenx_to_scx(
     opts: &IngestOptions,
     sink: &mut WarningSink,
 ) -> Result<(), ConvertError> {
-    let file = hdf5::File::open(input)?;
-
-    let format = detect_input_format(&file)?;
-    if matches!(format, InputFormat::H5ad) {
-        return Err(ConvertError::FormatMismatch {
-            expected: "10x".to_string(),
-            got: "h5ad".to_string(),
-        });
-    }
-
-    // A CellBender output also has `/matrix/barcodes`, so it lands here by
-    // extension. Redirect rather than failing somewhere deep inside the 10x
-    // reader — and note this is a *different* operation, not a conversion:
-    // the corrected counts belong on an existing file's obs axis.
-    if file.group("droplet_latents").is_ok() {
-        return Err(ConvertError::Other(format!(
-            "'{}' looks like a CellBender remove-background output (it has a \
-             /droplet_latents group), not a 10x CellRanger matrix. Attach it to \
-             an existing SCX file with: scx cellbender-import <target.scx> {}",
-            input.display(),
-            input.display()
-        )));
-    }
+    let file = super::open_tenx_input(input)?;
 
     let tenx = read_tenx_h5(&file)?;
     let nnz = *tenx.indptr.last().unwrap_or(&0) as u64;

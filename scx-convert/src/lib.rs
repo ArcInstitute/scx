@@ -176,8 +176,8 @@ pub mod pipeline;
 #[cfg(feature = "hdf5")]
 pub use pipeline::{
     codec_selection_json, h5ad_to_scx, h5ad_to_scx_streaming, run_streaming_writer_coordinator,
-    scx_to_h5ad, scx_to_h5ad_streaming, streaming_writer_coordinator, tenx_to_scx, BitmapPolicy,
-    ConvertError, IngestOptions, StreamingOverrides,
+    scx_to_h5ad, scx_to_h5ad_streaming, streaming_writer_coordinator, tenx_to_scx,
+    tenx_to_scx_streaming, BitmapPolicy, ConvertError, IngestOptions, StreamingOverrides,
 };
 
 #[cfg(feature = "hdf5")]
@@ -218,6 +218,8 @@ mod convert_tests_sort;
 mod convert_tests_streaming;
 #[cfg(all(test, feature = "hdf5"))]
 mod convert_tests_strings;
+#[cfg(all(test, feature = "hdf5"))]
+mod convert_tests_tenx_stream;
 
 #[cfg(test)]
 mod mtx_tests;

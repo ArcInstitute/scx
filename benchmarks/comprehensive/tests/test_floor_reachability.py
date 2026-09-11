@@ -1405,6 +1405,160 @@ def test_conversion_streaming_extra_arms_are_dataset_scoped_and_pinned():
     assert result.metadata["extra_arms"] == []
 
 
+def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
+    """The 10x arms (OPT-CONVERT-9) must be scoped, pinned, and premise-checked.
+
+    `scx convert --from 10x` streams by default since OPT-CONVERT-9 and the
+    claim is a memory one. These two arms (`--stream=true` / `--stream=false`)
+    are the only thing in the suite that measures it — no `DATASETS` entry is a
+    10x file, and `pyscx.from_10x` cannot express either arm, so they are not
+    expressible as `_EXTRA_ARMS` kwargs and drive the CLI instead.
+
+    Four properties, each with a silent failure mode:
+
+    1. **Scope.** Only `census_500k`, the largest `full`-tier dataset with no
+       existing `conversion_streaming` floor and no expected-to-breach arm.
+       Sharing a dataset with `census_1m`'s `streaming_peak_rss_mb`,
+       `smartseq2`'s budget ratio or `tabula_sapiens_100k`'s two justification-
+       needing arms would put this floor one whole-triple justification away
+       from silently disarming.
+    2. **Pinned reader threads**, so the floor is a property of the code rather
+       than the runner's core count — the same reason `GATED_READER_THREADS`
+       exists for the h5ad arms.
+    3. **A skip is recorded, not silent.** A box without the fixture, or with a
+       stale `scx`, must still run the h5ad arms that carry this benchmark's
+       primary floors — and must say in `metadata` why the 10x pair is missing,
+       or an absent floor value reads as a pass.
+    4. **The bound is checked, not assumed.** If `--stream=false` stopped
+       reaching the eager reader, both arms would time the same path and both
+       clear the ceiling. The premise check has to raise.
+    """
+    import pathlib
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+    from benchmarks.comprehensive.config import DATASETS
+    from benchmarks.comprehensive.results import BenchmarkResult
+
+    # (1) Scope: in a tier, and disjoint from every live floor's dataset.
+    floors = yaml.safe_load(THRESHOLDS.read_text()).get("absolute_floors") or []
+    assert cs._TENX_ARM_DATASETS, "the 10x arms must name at least one dataset"
+    # The 10x arms' triple must carry **only** 10x floors. Justification
+    # suppression is whole-(benchmark, format, dataset), so an h5ad-arm floor
+    # sharing this dataset would be one 10x justification away from silently
+    # disarming, and vice versa.
+    foreign = sorted(
+        f["metric"] for f in floors
+        if f.get("benchmark") == "conversion_streaming"
+        and f.get("dataset") in cs._TENX_ARM_DATASETS
+        and not str(f.get("metric", "")).startswith("tenx_")
+    )
+    assert not foreign, (
+        f"the 10x arms are scoped to {sorted(cs._TENX_ARM_DATASETS)}, whose "
+        f"conversion_streaming triple also carries non-10x floors {foreign}. "
+        f"Justification suppression is whole-triple, so the two sets of floors "
+        f"would disarm each other."
+    )
+    assert any(
+        f.get("benchmark") == "conversion_streaming"
+        and f.get("dataset") in cs._TENX_ARM_DATASETS
+        and str(f.get("metric", "")).startswith("tenx_")
+        for f in floors
+    ), (
+        "the 10x arms run but no `tenx_*` absolute floor gates them; an arm "
+        "with no ceiling measures without enforcing anything"
+    )
+    breaching = {d for _, ds in cs._EXTRA_ARMS.values() for d in ds}
+    assert not (cs._TENX_ARM_DATASETS & breaching), (
+        f"the 10x arms share a dataset with an extra arm that needs a "
+        f"justification: {sorted(cs._TENX_ARM_DATASETS & breaching)}"
+    )
+    for name in cs._TENX_ARM_DATASETS:
+        assert name in DATASETS, name
+
+    # (2) Pinned, and equal to the h5ad arms' pin so the two are comparable.
+    assert cs.TENX_GATED_READER_THREADS == cs.GATED_READER_THREADS
+
+    def drive(dataset_name, exists=True, scx_bin="scx", peaks=(100.0, 900.0)):
+        calls = []
+
+        def fake_arm(tenx_path, n_runs, stream, reader_threads, binary):
+            calls.append((stream, reader_threads, binary))
+            return [{
+                "run_idx": 0,
+                "wall_s": 1.0,
+                "peak_rss_mb": peaks[0] if stream else peaks[1],
+                "structural": {
+                    "n_obs": 1, "n_vars": 1, "nnz": 1,
+                    "shard_count": 1, "has_csc": 0,
+                },
+                "output_bytes": 10,
+            }]
+
+        result = BenchmarkResult(
+            benchmark="conversion_streaming",
+            format="scx_streaming_vs_materialize",
+            dataset=dataset_name,
+            metadata={"scenarios": []},
+        )
+        original_arm = cs._run_tenx_arm_subprocess
+        original_exists = pathlib.Path.exists
+        original_stat = pathlib.Path.stat
+        import benchmarks.comprehensive.scx_cli as scx_cli
+        original_resolve = scx_cli.resolve_scx_bin
+
+        class _FakeStat:
+            st_size = 4096
+
+        try:
+            cs._run_tenx_arm_subprocess = fake_arm
+            pathlib.Path.exists = lambda self: exists
+            # The fixture is not on this box; `_run_tenx_arms` stats it for the
+            # `tenx_source_bytes` metadata, so `exists` alone is not enough.
+            pathlib.Path.stat = lambda self, **kw: _FakeStat()
+            scx_cli.resolve_scx_bin = lambda probe, requires=None: scx_bin
+            cs._run_tenx_arms(DATASETS[dataset_name], 1, result)
+        finally:
+            cs._run_tenx_arm_subprocess = original_arm
+            pathlib.Path.exists = original_exists
+            pathlib.Path.stat = original_stat
+            scx_cli.resolve_scx_bin = original_resolve
+        return calls, result
+
+    in_scope = sorted(cs._TENX_ARM_DATASETS)[0]
+
+    # Happy path: both arms run, streaming pinned, materialise unpinned.
+    calls, result = drive(in_scope)
+    assert [c[0] for c in calls] == [True, False], calls
+    assert calls[0][1] == cs.TENX_GATED_READER_THREADS, calls
+    assert calls[1][1] is None, "the materialising arm has no threads knob"
+    assert result.metadata["tenx_arms"] == ["tenx_streaming", "tenx_materialize"]
+    for label in ("tenx_streaming", "tenx_materialize"):
+        rows = [r for r in result.runs if r.extra["scenario"] == label]
+        assert rows and all(f"{label}_peak_rss_mb" in r.extra for r in rows)
+        assert all("streaming_peak_rss_mb" not in r.extra for r in rows), (
+            f"{label} must not emit the h5ad gated key, or the census_1m "
+            f"floor's median would mix arms from a different direction"
+        )
+
+    # (3) Skips are recorded. Out of scope, fixture absent, stale binary.
+    out_of_scope = next(n for n in DATASETS if n not in cs._TENX_ARM_DATASETS)
+    _, result = drive(out_of_scope)
+    assert "not in the 10x arms' dataset scope" in result.metadata["tenx_arms_skipped"]
+    assert "tenx_arms" not in result.metadata
+
+    calls, result = drive(in_scope, exists=False)
+    assert calls == []
+    assert "prep_tenx_fixture.py" in result.metadata["tenx_arms_skipped"]
+
+    calls, result = drive(in_scope, scx_bin=None)
+    assert calls == []
+    assert "--stream" in result.metadata["tenx_arms_skipped"]
+
+    # (4) The premise check raises when streaming did not bound anything.
+    with pytest.raises(RuntimeError, match="bounded path"):
+        drive(in_scope, peaks=(900.0, 100.0))
+
+
 def test_mtx_export_is_scoped_out_of_the_census_tiers():
     """The size cap has to stop the *scheduler*, not just `run()`.
 

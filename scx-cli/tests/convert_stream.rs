@@ -742,37 +742,48 @@ fn convert_tenx_to_scx_succeeds_with_no_flags() {
     assert_eq!(hdr.n_vars, 3);
 }
 
+/// Both `--stream` spellings now reach a real path on 10x → SCX, and produce
+/// the same matrix.
+///
+/// This test replaced `convert_stream_true_rejected_on_tenx`, which asserted
+/// the opposite: before OPT-CONVERT-9 an explicit `--stream` on this direction
+/// was an error. Inverting it rather than deleting it is the point — it goes
+/// red the moment `CONVERT_DIRECTIONS`'s bool moves in either direction.
 #[test]
-fn convert_stream_true_rejected_on_tenx() {
-    // Resolution precedes file I/O, so a nonexistent input is enough.
+fn convert_stream_accepted_on_tenx_in_both_spellings() {
     let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("absent.h5");
-    let out = dir.path().join("out.scx");
+    let tenx = dir.path().join("raw.h5");
+    create_test_tenx(&tenx, 12, 4);
 
     let scx_bin = env!("CARGO_BIN_EXE_scx");
-    let output = Command::new(scx_bin)
-        .args([
-            "convert",
-            "--from",
-            "10x",
-            "--stream",
-            missing.to_str().unwrap(),
-            out.to_str().unwrap(),
-        ])
-        .output()
-        .expect("scx convert failed to spawn");
-    assert!(
-        !output.status.success(),
-        "an explicit --stream on 10x → scx must be rejected"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--stream") && stderr.contains("tenx_to_scx"),
-        "expected a --stream rejection naming the direction; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("Re-run without"),
-        "the message must name the remedy; got: {stderr}"
+    let mut outputs = Vec::new();
+    for (label, flag) in [("stream", "--stream=true"), ("eager", "--stream=false")] {
+        let out = dir.path().join(format!("{label}.scx"));
+        let output = Command::new(scx_bin)
+            .args([
+                "convert",
+                "--from",
+                "10x",
+                flag,
+                tenx.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .expect("scx convert failed to spawn");
+        assert!(
+            output.status.success(),
+            "`{flag}` on 10x → scx must be accepted; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reader = ScxReader::open(&out).unwrap();
+        assert_eq!(reader.header().n_obs, 12, "{label}: cells are the obs axis");
+        assert_eq!(reader.header().n_vars, 4, "{label}: genes are the var axis");
+        let csr = reader.read_all_csr_shards().unwrap();
+        outputs.push((csr.indptr, csr.indices, csr.data));
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "the streaming and materialising 10x paths must decode to the same matrix"
     );
 }
 
