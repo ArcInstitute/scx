@@ -1,9 +1,9 @@
 {
-  "captured_at": "2026-09-10T20:33:09-0700",
-  "git_sha": "f5a9a171088ae1f355e161e53404f15208c57a40",
+  "captured_at": "2026-09-10T22:42:42-0700",
+  "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
   "git_branch": "pr25-row-group-lru",
   "git_dirty": true,
-  "git_describe": "pyscx-v0.18.0-11-gf5a9a171",
+  "git_describe": "pyscx-v0.18.0-16-g0f86625b",
   "determinism_env": {
     "RAYON_NUM_THREADS": "unset",
     "OMP_NUM_THREADS": "unset",
@@ -54,5 +54,5 @@
     "version": "0.18.0",
     "file": "/home/nickyoungblut/dev/rust/scx/pyscx/python/pyscx/__init__.py"
   },
-  "snapshot_name": "candidate_pr25_rg_off_f5a9a17"
+  "snapshot_name": "candidate_pr25_rg_off_0f86625"
 }

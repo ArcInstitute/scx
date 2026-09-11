@@ -2363,12 +2363,18 @@ plans; medians over the timed runs):
 
 | format | dataset | p50 gather, off → on | peak RSS off → on | row-group hit rate (on) |
 |---|---|---|---|---|
-| `scx_compact_trial_g256` | pbmc3k | 63.2 → 47.0 ms (**1.35×**) | 786 → 820 MB | 99.0 % |
-| `scx_compact_trial_g512` | pbmc3k | 63.5 → 46.6 ms (**1.36×**) | 790 → 841 MB | 99.0 % |
-| `scx_compact_trial_g256` | smartseq2 | 1099 → 1154 ms (0.95×) | 1182 → 1178 MB | 0 — bypassed |
-| `scx_compact_trial_g512` | smartseq2 | 1219 → 1235 ms (0.99×) | 1194 → 1172 MB | 0 — bypassed |
-| `scx_compact_trial_g256` | tabula_sapiens_100k | 994 → 1015 ms (0.98×) | 1126 → 1156 MB | 0 — bypassed |
-| `scx_compact_trial_g512` | tabula_sapiens_100k | 1292 → 1311 ms (0.99×) | 1122 → 1133 MB | 0 — bypassed |
+| `scx_compact_trial_g512` | pbmc3k | 69.6 → 50.5 ms (**1.38×**) | 781 → 815 MB | 99.0 % |
+| `scx_compact_trial_g256` | pbmc3k | 53.8 → 51.0 ms (1.05×) | 802 → 833 MB | 99.0 % |
+| `scx_compact_trial_g256` | smartseq2 | 1224 → 1233 ms (0.99×) | 1183 → 1178 MB | 0 — bypassed |
+| `scx_compact_trial_g512` | smartseq2 | 1291 → 1327 ms (0.97×) | 1172 → 1174 MB | 0 — bypassed |
+| `scx_compact_trial_g256` | tabula_sapiens_100k | 1051 → 1043 ms (1.01×) | 1124 → 1158 MB | 0 — bypassed |
+| `scx_compact_trial_g512` | tabula_sapiens_100k | 1401 → 1380 ms (1.02×) | 1140 → 1157 MB | 0 — bypassed |
+
+The pbmc3k `on` arm sits at ≈50 ms in every capture of this series; its `off`
+arm ran 53.8 ms on the G=256 cell here against 63–67 ms in the two earlier
+captures of the same cell (jobs 2930275, 2930348), so the small-file gain reads
+1.05–1.38× across captures at a constant 99 % hit rate — `cpu_preemptible`
+cells are not pinned to a node.
 
 Read the two regimes with the budget. `read_scattered` asks for 128 cached
 shards under 8 GiB, and `IndexPlanDataset`'s auto-tune grants what is left
@@ -2376,9 +2382,9 @@ after the `max_plan_size` batch buffers — on tabula_sapiens_100k (≈217 MB
 decoded per shard) that is `effective_cache_shards=2`, a ≈435 MB row-group
 budget against ≈890 MB of groups per 512-row batch, and smartseq2 is the same
 shape. There the plan is over its share, the admission rule bypasses the LRU,
-and the arm is the pre-change behaviour within run-to-run noise (the 0.95–0.99× are within the spread of
-the two OFF-arm captures of the same cells, 1144 vs 1099 ms). Without the
-rule — the first capture of this series, job 2930275 — the same two datasets
+and the arm is the pre-change behaviour within run-to-run noise (0.97–1.02×;
+the OFF arm itself moved 1099 → 1224 ms across captures of the same cell).
+Without the rule — the first capture of this series, job 2930275 — the same two datasets
 measured a **0.0 % hit rate** with +350–500 MB of resident bytes and 2–4 %
 slower batches: every group was inserted and evicted before the next gather
 reached it. On pbmc3k the file's eleven (G=256) or six (G=512) groups fit,
@@ -2395,13 +2401,13 @@ intervening commits are all write-side):
 
 | dataset | scenario | LATEST | this branch |
 |---|---|---|---|
-| smartseq2 | `pyscx_index_plan_random` | 65.9 s | **2.05 s** (32×) |
-| smartseq2 | `pyscx_index_plan_locality` | 61.8 s | **2.16 s** (29×) |
-| smartseq2 | `pyscx_index_plan_dataset_workers2` | 64.8 s | **2.48 s** (26×) |
-| tabula_sapiens_100k | `pyscx_index_plan_random` | 87.7 s | **1.53 s** (57×) |
+| smartseq2 | `pyscx_index_plan_random` | 65.9 s | **1.80 s** (37×) |
+| smartseq2 | `pyscx_index_plan_locality` | 61.8 s | **1.79 s** (35×) |
+| smartseq2 | `pyscx_index_plan_dataset_workers2` | 64.8 s | **2.28 s** (28×) |
+| tabula_sapiens_100k | `pyscx_index_plan_random` | 87.7 s | **1.58 s** (56×) |
 | tabula_sapiens_100k | `pyscx_index_plan_locality` | 69.7 s | **1.46 s** (48×) |
-| tabula_sapiens_100k | `pyscx_index_plan_dataset_workers2` | 75.0 s | **2.06 s** (36×) |
-| tabula_sapiens_100k | peak RSS (pooled max) | 2,708 MB | 3,127 MB |
+| tabula_sapiens_100k | `pyscx_index_plan_dataset_workers2` | 75.0 s | **2.12 s** (35×) |
+| tabula_sapiens_100k | peak RSS (pooled max) | 2,708 MB | 2,974 MB |
 
 `pyscx_backed_python_loop` (a Python-bound per-row loop) and
 `pyscx_training_dataset` (the sequential pipeline) are flat, as is every
@@ -2410,7 +2416,9 @@ route). The extra resident bytes are the configured budget being used for the
 first time on this path.
 
 Captured 2026-09-10 on Chimera (`cpu_preemptible` cells, `cpu_batch`
-orchestrator, SLURM job 2930348) at `f5a9a171`, via
+orchestrator, SLURM job 2930656) at `0f86625b` — the PR's final head, after
+the per-plan admission verdict replaced the per-gather rule the earlier
+captures of this series (jobs 2930275, 2930348) measured — via
 `sbatch benchmarks/scripts/_run_pr25_row_group_lru_ab.sh`: 2 timed runs per
 cell on smartseq2 / tabula (3 on pbmc3k) after a 3-batch warm-up, 12–50
 batches per run, `gate_candidate.py --skip-capture` against `LATEST` reporting

@@ -3,7 +3,7 @@
   "benchmark": "read_scattered",
   "format": "scx_compact_trial_g256",
   "dataset": "tabula_sapiens_100k",
-  "timestamp": "2026-09-10T20:33:27",
+  "timestamp": "2026-09-10T22:43:00",
   "system": {
     "hostname": "CPUDFDC84",
     "os": "Linux 5.15.0-190-generic",
@@ -42,11 +42,11 @@
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M278DKPP3NPV446BXP37Y5H3",
-      "git_sha": "f5a9a171088ae1f355e161e53404f15208c57a40",
+      "run_id": "01M27FTV71VPXG7C0WTKK106HC",
+      "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
       "git_branch": "pr25-row-group-lru",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.18.0-11-gf5a9a171",
+      "git_describe": "pyscx-v0.18.0-16-g0f86625b",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,13 +56,13 @@
   },
   "runs": [
     {
-      "wall_s": 11.974983508931473,
+      "wall_s": 12.608305412810296,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1120.1,
+      "peak_rss_mb": 1123.6,
       "extra": {
-        "gather_latency_ms_p50": 1000.479,
-        "gather_latency_ms_p99": 1025.655,
+        "gather_latency_ms_p50": 1052.228,
+        "gather_latency_ms_p99": 1090.271,
         "block_index_groups": 84,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -74,13 +74,13 @@
       }
     },
     {
-      "wall_s": 11.835271944990382,
+      "wall_s": 12.554134057136253,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1131.0,
+      "peak_rss_mb": 1125.3,
       "extra": {
-        "gather_latency_ms_p50": 986.423,
-        "gather_latency_ms_p99": 1021.042,
+        "gather_latency_ms_p50": 1050.293,
+        "gather_latency_ms_p99": 1085.554,
         "block_index_groups": 84,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -92,7 +92,7 @@
       }
     }
   ],
-  "median_wall_s": 11.905127726960927,
+  "median_wall_s": 12.581219734973274,
   "wall_s_iqr": null,
   "n_runs": 2,
   "file_size_bytes": 233530170,

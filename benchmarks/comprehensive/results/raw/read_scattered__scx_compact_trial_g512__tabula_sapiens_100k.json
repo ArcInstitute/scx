@@ -3,7 +3,7 @@
   "benchmark": "read_scattered",
   "format": "scx_compact_trial_g512",
   "dataset": "tabula_sapiens_100k",
-  "timestamp": "2026-09-10T20:34:33",
+  "timestamp": "2026-09-10T22:44:06",
   "system": {
     "hostname": "CPUDFDC84",
     "os": "Linux 5.15.0-190-generic",
@@ -42,11 +42,11 @@
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M278FJKY23P9Q162M7HSYPHA",
-      "git_sha": "f5a9a171088ae1f355e161e53404f15208c57a40",
+      "run_id": "01M27FWVX6V47PYGYR5D6VZ2TJ",
+      "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
       "git_branch": "pr25-row-group-lru",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.18.0-11-gf5a9a171",
+      "git_describe": "pyscx-v0.18.0-16-g0f86625b-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,13 +56,13 @@
   },
   "runs": [
     {
-      "wall_s": 15.694685275899246,
+      "wall_s": 16.835910693043843,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1132.0,
+      "peak_rss_mb": 1153.6,
       "extra": {
-        "gather_latency_ms_p50": 1308.141,
-        "gather_latency_ms_p99": 1366.475,
+        "gather_latency_ms_p50": 1401.278,
+        "gather_latency_ms_p99": 1473.56,
         "block_index_groups": 84,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -74,13 +74,13 @@
       }
     },
     {
-      "wall_s": 15.752729611936957,
+      "wall_s": 16.420418844092637,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1134.1,
+      "peak_rss_mb": 1159.7,
       "extra": {
-        "gather_latency_ms_p50": 1313.926,
-        "gather_latency_ms_p99": 1368.142,
+        "gather_latency_ms_p50": 1358.607,
+        "gather_latency_ms_p99": 1430.169,
         "block_index_groups": 84,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -92,7 +92,7 @@
       }
     }
   ],
-  "median_wall_s": 15.723707443918101,
+  "median_wall_s": 16.62816476856824,
   "wall_s_iqr": null,
   "n_runs": 2,
   "file_size_bytes": 233853082,

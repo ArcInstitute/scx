@@ -3,9 +3,9 @@
   "benchmark": "read_scattered",
   "format": "scx_compact_trial_g256",
   "dataset": "smartseq2",
-  "timestamp": "2026-09-10T20:34:30",
+  "timestamp": "2026-09-10T22:44:05",
   "system": {
-    "hostname": "CPUDFE024",
+    "hostname": "CPUDFDC84",
     "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
@@ -42,11 +42,11 @@
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M278FJKY23P9Q162M7HSYPHA",
-      "git_sha": "f5a9a171088ae1f355e161e53404f15208c57a40",
+      "run_id": "01M27FWVX6V47PYGYR5D6VZ2TJ",
+      "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
       "git_branch": "pr25-row-group-lru",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.18.0-11-gf5a9a171",
+      "git_describe": "pyscx-v0.18.0-16-g0f86625b-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,13 +56,13 @@
   },
   "runs": [
     {
-      "wall_s": 18.366330329095945,
+      "wall_s": 19.969133731909096,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1177.0,
+      "peak_rss_mb": 1176.6,
       "extra": {
-        "gather_latency_ms_p50": 1153.503,
-        "gather_latency_ms_p99": 1182.411,
+        "gather_latency_ms_p50": 1251.637,
+        "gather_latency_ms_p99": 1295.104,
         "block_index_groups": 64,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -74,13 +74,13 @@
       }
     },
     {
-      "wall_s": 18.379946744069457,
+      "wall_s": 19.406267561018467,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 1178.5,
+      "peak_rss_mb": 1179.9,
       "extra": {
-        "gather_latency_ms_p50": 1153.804,
-        "gather_latency_ms_p99": 1196.558,
+        "gather_latency_ms_p50": 1214.279,
+        "gather_latency_ms_p99": 1274.847,
         "block_index_groups": 64,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -92,7 +92,7 @@
       }
     }
   ],
-  "median_wall_s": 18.3731385365827,
+  "median_wall_s": 19.68770064646378,
   "wall_s_iqr": null,
   "n_runs": 2,
   "file_size_bytes": 262668092,

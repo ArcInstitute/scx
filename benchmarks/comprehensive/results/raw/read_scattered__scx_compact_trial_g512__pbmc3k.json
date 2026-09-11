@@ -3,9 +3,9 @@
   "benchmark": "read_scattered",
   "format": "scx_compact_trial_g512",
   "dataset": "pbmc3k",
-  "timestamp": "2026-09-10T20:34:30",
+  "timestamp": "2026-09-10T22:44:05",
   "system": {
-    "hostname": "CPUDFDE34",
+    "hostname": "CPUDFE024",
     "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
@@ -42,11 +42,11 @@
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M278FJKY23P9Q162M7HSYPHA",
-      "git_sha": "f5a9a171088ae1f355e161e53404f15208c57a40",
+      "run_id": "01M27FWVX6V47PYGYR5D6VZ2TJ",
+      "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
       "git_branch": "pr25-row-group-lru",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.18.0-11-gf5a9a171",
+      "git_describe": "pyscx-v0.18.0-16-g0f86625b-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -56,13 +56,13 @@
   },
   "runs": [
     {
-      "wall_s": 2.177983853034675,
+      "wall_s": 2.3909840839914978,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 820.0,
+      "peak_rss_mb": 792.4,
       "extra": {
-        "gather_latency_ms_p50": 46.577,
-        "gather_latency_ms_p99": 54.556,
+        "gather_latency_ms_p50": 50.25,
+        "gather_latency_ms_p99": 57.18,
         "block_index_groups": 50,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -74,13 +74,13 @@
       }
     },
     {
-      "wall_s": 2.177603553980589,
+      "wall_s": 2.3966397650074214,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 841.2,
+      "peak_rss_mb": 814.8,
       "extra": {
-        "gather_latency_ms_p50": 46.717,
-        "gather_latency_ms_p99": 53.483,
+        "gather_latency_ms_p50": 50.51,
+        "gather_latency_ms_p99": 57.223,
         "block_index_groups": 50,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -92,13 +92,13 @@
       }
     },
     {
-      "wall_s": 2.1945494320243597,
+      "wall_s": 2.49851948604919,
       "user_s": 0.0,
       "sys_s": 0.0,
-      "peak_rss_mb": 862.4,
+      "peak_rss_mb": 836.3,
       "extra": {
-        "gather_latency_ms_p50": 46.647,
-        "gather_latency_ms_p99": 53.829,
+        "gather_latency_ms_p50": 50.742,
+        "gather_latency_ms_p99": 59.428,
         "block_index_groups": 50,
         "full_shard_groups": 0,
         "sidecar_groups": 0,
@@ -110,8 +110,8 @@
       }
     }
   ],
-  "median_wall_s": 2.177983853034675,
-  "wall_s_iqr": 0.01694587804377079,
+  "median_wall_s": 2.3966397650074214,
+  "wall_s_iqr": 0.10753540205769241,
   "n_runs": 3,
   "file_size_bytes": 4455991,
   "metadata": {
