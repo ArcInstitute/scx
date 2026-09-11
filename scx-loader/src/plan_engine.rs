@@ -233,8 +233,9 @@ impl PrefetchEngine {
     /// argument is the plan's **row-group admission** verdict (see
     /// `spawn_prefetches`): the consumer passes it to
     /// `BackedCsrReader::read_rows_with_admission` for every gather the plan
-    /// makes, so the gathers retain exactly what the prefetcher warmed and a
-    /// plan whose union of gathers is over budget retains nothing.
+    /// makes, so the gathers retain only what the plan's verdict admits (the
+    /// warm pre-decodes the eligible subset of that) and a plan whose union of
+    /// gathers is over budget retains nothing.
     pub fn iter_with_plans<P, T, RowsFn, ProcFn, PlanIter>(
         self: Arc<Self>,
         plans: PlanIter,
@@ -494,10 +495,11 @@ where
     /// **One decision per plan, over the shared budget.** Every reader of the
     /// engine draws on one `SharedShardCache`, and a plan's gathers may span
     /// several files (the cell-set loader) and several `read_rows_with` calls
-    /// (one per set). So the row-group bytes of every framed shard the plan
-    /// touches are summed over the whole plan — every file, every shard,
-    /// regardless of current residency or per-bucket density (see the body
-    /// for why those are not stable) — and compared once against
+    /// (one per set). So the plan's footprint in that cache — the row-group
+    /// bytes of every framed shard it touches, regardless of current residency
+    /// or per-bucket density (see the body for why those are not stable), plus
+    /// the decoded size of every shard it will take whole — is summed over the
+    /// whole plan, every file, every shard, and compared once against
     /// `cache_bytes_budget / (lookahead + 1)`: up to `lookahead` plans are
     /// warming while one is consumed, so that is the share under which a warm
     /// still resides when its gather arrives, and under which the gathers'
@@ -534,26 +536,40 @@ where
             }
         }
 
-        // Plan-level admission, sized exactly from the block index (no decode).
-        // The sum is an upper bound on what the row-group route could retain
-        // for this plan, taken over every framed shard the plan touches — NOT
-        // filtered by `block_index_eligible`. That predicate is volatile in
-        // two ways the gather can disagree with by the time it runs (review on
-        // #528): its `!contains` clause looks at whole-shard residency, which a
-        // warm can change before the plan is consumed; and its density window
-        // sees this bucket's row count, while the cell-set loader gathers one
-        // set at a time and each set's smaller count can be sparse where the
-        // plan's union is dense. Counting a shard the gather then serves whole
-        // only makes the verdict conservative (a lost warm in a mixed regime),
-        // never unsafe. Eligibility still decides what L2 task to launch.
+        // Plan-level admission, sized exactly from the catalog and the block
+        // index (no decode). `planned` is an upper bound on the plan's whole
+        // footprint in the shared LRU — both kinds of entry, since they share
+        // one budget (review on #528, round 3):
+        //
+        // * the row-group bytes of every framed shard the plan touches — NOT
+        //   filtered by `block_index_eligible`, which is volatile in two ways
+        //   the gather can disagree with by the time it runs: its `!contains`
+        //   clause looks at whole-shard residency, which a warm can change
+        //   before the plan is consumed; and its density window sees this
+        //   bucket's row count, while the cell-set loader gathers one set at a
+        //   time and each set's smaller count can be sparse where the plan's
+        //   union is dense;
+        // * the decoded size of every shard the plan will take **whole** (the
+        //   non-eligible buckets, warmed by `read_shard_cached_arc` below or
+        //   already resident) — a mixed plan whose groups fit the share on
+        //   their own but not next to its whole shards would otherwise evict
+        //   one with the other on every repeat.
+        //
+        // Counting a shard the gather then happens to serve the other way only
+        // makes the verdict conservative (a lost warm in a mixed regime), never
+        // unsafe. Eligibility still decides what L2 task to launch.
         let mut planned = 0usize;
         let mut budget = usize::MAX;
         let mut eligible: HashMap<(u32, usize), bool> = HashMap::with_capacity(per_shard.len());
         for (&(fid, sidx), rows) in &per_shard {
             let reader = &self.engine.readers[fid as usize];
+            let is_eligible = reader.block_index_eligible(sidx, rows.len());
             planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, rows));
+            if !is_eligible {
+                planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
+            }
             budget = budget.min(reader.cache_bytes_budget());
-            eligible.insert((fid, sidx), reader.block_index_eligible(sidx, rows.len()));
+            eligible.insert((fid, sidx), is_eligible);
         }
         let share = budget / (self.lookahead + 1);
         let admit_row_groups = planned <= share;

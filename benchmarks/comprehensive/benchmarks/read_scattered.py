@@ -53,10 +53,12 @@ from benchmarks.comprehensive.runners import make_runner
 logger = logging.getLogger(__name__)
 
 
-# Framed compact-trial variants only. `scx_auto` is monolithic/unframed
-# (block_index_groups would always be 0), so it is deliberately excluded — the
-# adoption floor requires a framed fixture. Read by `run_parallel.py`'s cohort
-# builder and re-checked at the top of `run()` (defense-in-depth).
+# Framed compact-trial variants only. The adoption floors are pinned on the
+# explicit row-group geometries G=128..1024 — the `scx_auto` fixtures are framed
+# too since the v4 reconvert (`scx info` reports `format_version: 4`; the
+# `index_plan` benchmark exercises the row-group path on them), but they are
+# not a G sweep, so they stay out of this benchmark. Read by `run_parallel.py`'s
+# cohort builder and re-checked at the top of `run()` (defense-in-depth).
 SUPPORTED_FORMATS: frozenset[str] = frozenset(
     {
         "scx_compact_trial_g128",

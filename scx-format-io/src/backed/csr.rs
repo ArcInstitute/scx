@@ -595,25 +595,38 @@ impl BackedCsrReader {
     /// cheapest source for any of its rows — slicing it beats decoding groups —
     /// which is why that clause stays now that the group path caches too.
     pub fn block_index_eligible(&self, shard_idx: usize, group_len: usize) -> bool {
-        self.block_index_candidate(shard_idx, group_len)
+        self.block_index_route_enabled()
             && !self.shard_cache.contains(self.file_id, shard_idx)
-    }
-
-    /// [`Self::block_index_eligible`] without the whole-shard residency clause:
-    /// the gates, the cost window and the framing — everything about the
-    /// decision that does not change under the caller between now and the
-    /// gather. The plan engine sizes a plan's row-group admission from this,
-    /// not from `block_index_eligible`: a shard resident whole while a plan is
-    /// queued may be evicted before the plan is gathered, and the gather then
-    /// takes the row-group path for bytes a residency-aware sum never counted.
-    pub fn block_index_candidate(&self, shard_idx: usize, group_len: usize) -> bool {
-        scatter_block_index_enabled()
-            && self.scatter_block_index
             && self
                 .index
                 .shard_range(shard_idx)
                 .is_some_and(|(s, e)| (group_len as u64) * ROW_RANGE_WINDOW_DIVISOR < (e - s))
             && self.shard_is_framed(shard_idx)
+    }
+
+    /// The two static gates on the row-group route: the process-wide
+    /// `SCX_SCATTER_BLOCK_INDEX` switch and this reader's `scatter_block_index`.
+    /// With either off no gather can take the route, so nothing that only
+    /// serves it — the row-group admission sizing in particular — should
+    /// resolve a framing layout on its account.
+    fn block_index_route_enabled(&self) -> bool {
+        scatter_block_index_enabled() && self.scatter_block_index
+    }
+
+    /// Decoded size of shard `shard_idx` as the LRU would charge it
+    /// (`(rows + 1) × 8 + nnz × 8`), from the catalog's per-shard stats — `0`
+    /// when the shard is unknown or has no stats. What a whole-shard warm or
+    /// full-shard gather of that shard puts into the shared budget; the plan
+    /// engine counts it alongside the plan's row-group bytes.
+    pub fn shard_decoded_bytes(&self, shard_idx: usize) -> usize {
+        let Some(lite) = self.shard_entry(shard_idx) else {
+            return 0;
+        };
+        let Some((s, e)) = self.index.shard_range(shard_idx) else {
+            return 0;
+        };
+        let nnz = lite.nnz as usize;
+        csr_component_bytes((e - s) as usize + 1, nnz, nnz)
     }
 
     /// True if any CSR shard is row-group framed (`shard_format_version >= 2`),
@@ -1169,7 +1182,11 @@ impl BackedCsrReader {
     /// prefetcher sums this over a plan and warms only a plan that fits its
     /// share of the budget; see `scx-loader`'s plan engine.
     pub fn planned_row_group_bytes(&self, shard_idx: usize, rows: &[u64]) -> usize {
-        if !self.retains_row_groups() {
+        // Both gates before `framed_layout`: with the route statically off
+        // (the cell-set loader's default) no gather can retain a group, and
+        // resolving every touched shard's layout to size nothing would be new
+        // work on that path (review on #528).
+        if !self.block_index_route_enabled() || !self.retains_row_groups() {
             return 0;
         }
         let Some(layout) = self.framed_layout(shard_idx) else {
@@ -1193,7 +1210,7 @@ impl BackedCsrReader {
     /// retain row groups — nothing to warm into. Rows outside the shard are an
     /// error, as on the gather.
     pub fn warm_row_groups(&self, shard_idx: usize, rows: &[u64]) -> Result<usize> {
-        if !self.retains_row_groups() || rows.is_empty() {
+        if !self.block_index_route_enabled() || !self.retains_row_groups() || rows.is_empty() {
             return Ok(0);
         }
         let Some(layout) = self.framed_layout(shard_idx) else {
@@ -2164,9 +2181,9 @@ impl crate::shard_source::ShardSource for BackedCsrReader {
 
 // Test-only surface. Kept in its own `impl` at the END of the file: the I-ORG-1
 // dedup guards scan production code with `sed '/#\[cfg(test)\]/,$d'`, so a
-// `#[cfg(test)]` anywhere inside the production impl would truncate what they
-// see (the `get_or_decode` call sites below it) and fail the guard — which is
-// exactly what happened on #528 round 2.
+// `#[cfg(test)]` placed ahead of a production call site they count (the
+// `get_or_decode` calls) truncates what they see and fails the guard — which
+// is exactly what happened on #528 round 2.
 #[cfg(test)]
 impl BackedCsrReader {
     /// Override of the per-reader row-group retention gate (default from

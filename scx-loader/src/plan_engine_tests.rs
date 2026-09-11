@@ -1280,3 +1280,64 @@ fn plan_admission_counts_resident_shards_too() {
     );
     assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 1);
 }
+
+/// **Review on #528 round 3 (codex).** The plan's footprint is both kinds of
+/// entry, because they share one budget: a mixed plan whose row groups fit the
+/// share on their own but not next to the shard it takes **whole** would evict
+/// one with the other on every repeat. Shard 0 is dense (16 rows of 64 → the
+/// whole-shard route, ≈1 KB) but those 16 rows are **consecutive**, so they
+/// are one 264-byte group — the row-group sum alone cannot trip the share, only
+/// the whole-shard term can; shard 1 contributes one more group. The share
+/// holds the two groups but not groups + shard. Falsifier: a sum that omits
+/// the whole shard admits and inserts (confirmed by mutating the term out).
+#[test]
+fn plan_admission_counts_the_plans_whole_shards_too() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let mut plan: Plan = (0..16u64).map(|i| (0u32, i)).collect();
+    plan.push((0, 70)); // shard 1, one group
+    let shard_bytes = (64 + 1) * 8 + 64 * 8; // FRAMED fixture: 64 rows, 1 nnz/row
+                                             // share ∈ [2 groups, 2 groups + 1 shard).
+    let share = 2 * FRAMED_GROUP_BYTES + shard_bytes / 2;
+    let budget = 5 * share;
+    assert!(
+        budget / 5 >= 2 * FRAMED_GROUP_BYTES && budget / 5 < 2 * FRAMED_GROUP_BYTES + shard_bytes,
+        "premise"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+    assert_eq!(
+        engine.reader(0).shard_decoded_bytes(0),
+        shard_bytes,
+        "premise: shard size"
+    );
+    assert!(
+        !engine.reader(0).block_index_eligible(0, 16),
+        "premise: shard 0 is dense and takes the whole-shard route"
+    );
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        iter_metrics
+            .prefetch_tasks_spawned
+            .load(AtomicOrdering::Relaxed),
+        1,
+        "shard 0 was warmed whole"
+    );
+    assert!(engine.reader(0).cache_contains(0));
+    // The test gather is one `read_rows_with` per plan row: sixteen sliced from
+    // the resident whole shard, one through the row-group route.
+    assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 16);
+    assert_eq!(m.block_index_groups.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "the group fits the share alone but not beside the whole shard the plan also warms"
+    );
+    assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 1);
+}

@@ -4951,3 +4951,32 @@ fn read_rows_edge_windows_are_admitted_together() {
         RG_GROUP_BYTES
     );
 }
+
+/// Sizing a plan's row groups must not resolve framing layouts when the route
+/// is statically off (review on #528 round 3): the cell-set loader defaults
+/// `scatter_block_index` off, and its default path gained no new per-shard
+/// header/block-index work from the admission sum.
+#[test]
+fn planned_row_group_bytes_is_zero_with_the_route_off() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    assert!(
+        backed.planned_row_group_bytes(1, &[40, 41, 63]) > 0,
+        "premise: route on"
+    );
+
+    let mut off =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    off.set_scatter_block_index(false);
+    assert_eq!(off.planned_row_group_bytes(1, &[40, 41, 63]), 0);
+    assert_eq!(
+        off.warm_row_groups(1, &[40, 41, 63]).unwrap(),
+        0,
+        "nothing to warm into either"
+    );
+    // Whole-shard sizing is independent of the route.
+    assert_eq!(backed.shard_decoded_bytes(0), RG_SHARD_BYTES);
+    let _ = &mut backed;
+}
