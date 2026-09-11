@@ -1465,18 +1465,28 @@ in-memory arms at the high end.
 The comprehensive suite's pseudobulk-bearing cells — `bench_csc_dispatch` ×
 `bench_csc__pseudobulk_{csr,csc}` on tabula_sapiens_100k, which time `pseudobulk_dex` end to
 end with the pydeseq2 fit dominating — are the **no-regression** check for this change, not its
-measurement. Same build, same host pool, one job per arm (`benchmarks/scripts/_run_pr16_pseudobulk_gate.sh`;
-jobs 2932673 on `main` at `9e628f38` and 2932638 on the branch), medians of three:
+measurement. One job per arm (`benchmarks/scripts/_run_pr16_pseudobulk_gate.sh`; the job logs the
+extension's sha256 and any dirty tracked paths), medians of three; the harness's `cpu_preemptible`
+cells land on whichever node is free, and the node class moves `pseudobulk_dex`'s wall more than
+this change does, so the node is part of the row:
 
-| Cell | `main` → branch, wall | `main` → branch, peak RSS | route floor |
-|---|---|---|---|
-| `bench_csc__pseudobulk_csr` | 13.70 → 13.51 s | 3 579 → 3 553 MB | `csc_dispatch_correct` 1.0 |
-| `bench_csc__pseudobulk_csc` | 0.74 → 0.78 s (runs 0.70–0.79 on both arms) | 3 414 → 3 433 MB | `csc_dispatch_correct` 1.0 |
+| Arm (job) | Cell node | `pseudobulk_csr` wall / peak RSS | `pseudobulk_csc` wall / peak RSS | `csc_dispatch_correct` |
+|---|---|---|---|---|
+| `main` `9e628f38` (2932673) | CPUDFDC84 | 13.70 s (runs 17.1 / 13.5 / 13.7) / 3 579 MB | 0.74 s / 3 414 MB | 1.0 |
+| branch, round-1 kernel, dirty tree at `9e628f38` (2932638) | CPUDFDE34 | 13.51 s / 3 553 MB | 0.78 s / 3 433 MB | 1.0 |
+| branch, fix commit `9664b85e`, tracked tree clean (2933595) | GPU1298 / GPU726E | 15.43 s / 3 601 MB | 0.79 s / 3 482 MB | 1.0 |
 
-Manifest rows: the branch arm at `benchmarks/comprehensive/results/raw/bench_csc_dispatch__bench_csc__pseudobulk_{csr,csc}__tabula_sapiens_100k.json`,
-the `main` arm under `results/raw/pr16_pseudobulk_base/`. Against `LATEST` (captured 2026-09-03
-at `33d52cd0`) the gate reports both cells ~550 MB higher in peak RSS; the `main` arm shows the
-same figure, so that delta belongs to the merges between the two snapshots, not to this change.
+The two CPU-node captures are the like-for-like pair: wall within 1.5 % and RSS within 30 MB of
+`main`. The clean-commit recapture is the provenance-correct row and sits on a different node
+class, where the serial pydeseq2 fit runs slower; its RSS is within 70 MB of `main`. Manifest rows:
+the clean recapture at `benchmarks/comprehensive/results/raw/bench_csc_dispatch__bench_csc__pseudobulk_{csr,csc}__tabula_sapiens_100k.json`,
+the `main` arm under `results/raw/pr16_pseudobulk_base/`, the round-1 capture under
+`results/raw/pr16_pseudobulk_r1_dirty_tree/`. Every row carries `git_dirty: true`: the harness
+flags any `git status --porcelain` output, and this checkout keeps untracked scratch notes at the
+repo root; the job log is where the tracked-tree state and the extension hash are recorded.
+Against `LATEST` (captured 2026-09-03 at `33d52cd0`) the gate reports both cells ~550 MB higher in
+peak RSS; the `main` arm shows the same figure, so that delta belongs to the merges between the two
+snapshots, not to this change.
 
 ### QC / filtering pass fusion (Phase-4 task 4.1)
 

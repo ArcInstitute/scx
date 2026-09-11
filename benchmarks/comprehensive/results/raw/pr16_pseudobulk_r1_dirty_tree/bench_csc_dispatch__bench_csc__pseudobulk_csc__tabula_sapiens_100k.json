@@ -3,15 +3,15 @@
   "benchmark": "bench_csc_dispatch",
   "format": "bench_csc__pseudobulk_csc",
   "dataset": "tabula_sapiens_100k",
-  "timestamp": "2026-09-11T10:59:42",
+  "timestamp": "2026-09-11T09:27:55",
   "system": {
-    "hostname": "GPU726E",
+    "hostname": "CPUDFDE34",
     "os": "Linux 5.15.0-190-generic",
     "arch": "x86_64",
     "python_version": "3.13.13",
-    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu": "Intel(R) Xeon(R) 6740P",
     "cpu_cores_physical": 192,
-    "ram_gb": 1007,
+    "ram_gb": 2016,
     "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
     "library_versions": {
       "anndata": "0.12.10",
@@ -36,18 +36,17 @@
     "storage": {
       "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
       "scratch_fstype": "wekafs",
-      "has_nvme": true
+      "has_nvme": false
     },
     "gpu": {
-      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
       "nvidia_fs_loaded": false
     },
     "provenance": {
-      "run_id": "01M28SYZBD96HXGQRQ25GZFZJB",
-      "git_sha": "9664b85e04b45127d23e77071003d472ebbdf23b",
+      "run_id": "01M28MPX9A9TTCSNKG7RQ3PPQ4",
+      "git_sha": "9e628f384bef456cd6df6387a298fb15f5e40707",
       "git_branch": "pr16-parallel-pseudobulk",
       "git_dirty": true,
-      "git_describe": "pyscx-v0.18.0-12-g9664b85e",
+      "git_describe": "pyscx-v0.18.0-9-g9e628f38-dirty",
       "rayon_threads": "",
       "omp_threads": "",
       "mkl_threads": "",
@@ -57,38 +56,38 @@
   },
   "runs": [
     {
-      "wall_s": 0.7855544378980994,
-      "user_s": 2.6814199999999957,
-      "sys_s": 0.22499499999999983,
-      "peak_rss_mb": 3481.50390625,
+      "wall_s": 0.7745615779422224,
+      "user_s": 3.1709940000000003,
+      "sys_s": 0.21468699999999963,
+      "peak_rss_mb": 3425.70703125,
       "extra": {
         "dispatch_route": "cpu_csc",
         "csc_dispatch_correct": 1.0
       }
     },
     {
-      "wall_s": 0.8540315248537809,
-      "user_s": 2.600253000000002,
-      "sys_s": 0.1895439999999997,
-      "peak_rss_mb": 3477.1328125,
+      "wall_s": 0.7651456219609827,
+      "user_s": 3.0611399999999946,
+      "sys_s": 0.20343599999999995,
+      "peak_rss_mb": 3433.4921875,
       "extra": {
         "dispatch_route": "cpu_csc",
         "csc_dispatch_correct": 1.0
       }
     },
     {
-      "wall_s": 0.787201896077022,
-      "user_s": 2.5511920000000003,
-      "sys_s": 0.267239,
-      "peak_rss_mb": 3490.59765625,
+      "wall_s": 0.7782888051588088,
+      "user_s": 3.0942659999999975,
+      "sys_s": 0.24669199999999947,
+      "peak_rss_mb": 3439.16796875,
       "extra": {
         "dispatch_route": "cpu_csc",
         "csc_dispatch_correct": 1.0
       }
     }
   ],
-  "median_wall_s": 0.787201896077022,
-  "wall_s_iqr": 0.06847708695568144,
+  "median_wall_s": 0.7745615779422224,
+  "wall_s_iqr": 0.013143183197826147,
   "n_runs": 3,
   "metadata": {
     "cold_cache": false,
