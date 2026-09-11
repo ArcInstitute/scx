@@ -742,6 +742,16 @@ impl FullCatalog {
     /// readers after `read_from` to fill in the v2-shape stats. CSC
     /// entries are already reconciled inside `read_from` (no `n_vars`
     /// required). No-op on v2 catalogs.
+    ///
+    /// **`ObspCsrShard` gets `n_vars` here on purpose, even though its minor
+    /// axis is `n_obs`** ([`crate::shard::minor_axis`]). This reconciles a
+    /// *legacy* catalog against the shard headers a legacy writer stamped, and
+    /// that writer had the same defect: it wrote `n_vars` into an obsp shard's
+    /// `n_minor`. Reconciling to `n_obs` would make `check_header_against_catalog`
+    /// reject every existing v1 obsp file — the very files this path exists to
+    /// read. No writer can emit a v1 catalog (`FullCatalog::write_to`
+    /// auto-upgrades `catalog_version` to >= 2), so a correctly-stamped obsp
+    /// shard never reaches this function.
     pub fn reconcile_v1_csr_col_range(&mut self, n_vars: u64) {
         if self.catalog_version >= 2 {
             return;

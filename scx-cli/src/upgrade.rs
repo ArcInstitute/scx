@@ -1862,8 +1862,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("noncanonical_aux.scx");
-        // obsp is obs x obs, so `n_vars >= n_obs` keeps the graph's minor extent
-        // representable — the writer stamps it from the header.
+        // `n_vars >= n_obs` is no longer load-bearing: the writer used to stamp
+        // an obsp shard's minor extent from the header's `n_vars`, so a graph
+        // on a file with more cells than genes could not be written at all.
+        // `ScxWriter::shard_n_minor` now resolves the obs axis
+        // (OPT-FORMATIO-4), and the shape is pinned on its own by
+        // `obsp_csr_shard_on_a_narrow_gene_axis_is_bounded_by_n_obs`. These
+        // dimensions stay as they are because this test is about what the aux
+        // *carry* does, not about the extent.
         let (n_obs, n_vars) = (2usize, 4usize);
 
         let mut header = sample_header(n_obs as u64, n_vars as u64);
@@ -2032,14 +2038,16 @@ mod tests {
 
         // An obs x obs graph with an endpoint at column 5 — beyond `n_vars`.
         //
-        // Written through `encode_one_shard` rather than `write_obsp_shard`,
-        // because that writer derives `n_minor` from the header's `n_vars`
-        // and so **cannot express** an obs x obs graph on a file where
-        // `n_obs > n_vars` — it rejects this very shard with
-        // `ShardIndexOutOfRange { index: 5, n_minor: 3 }`. That is the same
-        // defect on the write side, and it is why `optimize` uses this API for
-        // this section type. Row 0 also stores an explicit zero, so the graph
-        // is non-canonical and takes the re-encode arm.
+        // Written through `encode_one_shard` rather than `write_obsp_shard`.
+        // That used to be forced: the typed writer derived `n_minor` from the
+        // header's `n_vars` and so could not express an obs x obs graph on a
+        // file where `n_obs > n_vars`, producing a shard that failed on read
+        // with `ShardIndexOutOfRange { index: 5, n_minor: 3 }`. That is fixed
+        // (OPT-FORMATIO-4, `ScxWriter::shard_n_minor`). It stays on this API
+        // because the graph must be **non-canonical** to take the re-encode
+        // arm, and `write_obsp_shard` documents canonical input as a
+        // precondition — so the explicit zero is patched in byte-wise below
+        // rather than handed to a writer that forbids it.
         let mut enc_opts = scx_format_io::EncodeShardOptions::new(
             "obsp/connectivities_shard_0".to_string(),
             SectionType::ObspCsrShard,
@@ -2061,8 +2069,8 @@ mod tests {
 
         // Make the graph non-canonical *after* writing, so it takes the
         // re-encode arm. `encode_one_shard` debug-asserts canonical input and
-        // `write_obsp_shard` cannot express `n_minor = n_obs` on this file, so
-        // there is no public API that produces this shape — which is precisely
+        // `write_obsp_shard` documents canonical input as a precondition, so
+        // no public API produces this shape — which is precisely
         // why it is `upgrade`'s job: a pre-v3 file from an older writer is
         // exactly the input this command exists to repair. Codec `None` +
         // `Uint8` means the values are raw bytes, so zeroing one in place is a

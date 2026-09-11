@@ -1028,16 +1028,27 @@ impl ScxReader {
         // so without this it stayed the one way a widened payload could still get
         // an out-of-range index out of the reader — via a *scattered* framed read
         // while the whole-shard paths rejected the same file.
-        // The minor axis is per shard *class*, not universal: a row-major shard's
-        // minor extent is the column count, a CSC sidecar's is `n_obs`. Using
-        // `n_vars` for both rejected every scattered CSC read — caught by
-        // `read_csc_columns_scattered_matches_full_decode`.
-        let authenticated_minor =
-            if crate::shard_decode::catalog_says_column_major(entry.section_type) {
-                self.header.n_obs
-            } else {
-                self.header.n_vars
-            };
+        // The minor axis is per shard *class*, not universal, and storage order
+        // is not the discriminant: `scx_format::shard::minor_axis` is. Using
+        // `n_vars` for everything row-major rejected every scattered CSC read
+        // (caught by `read_csc_columns_scattered_matches_full_decode`), and
+        // then, once that was patched with a column-major test, it still
+        // authenticated an `ObspCsrShard` — row-major, but obs x obs — against
+        // the gene axis. `raw_n_vars` is not on the `FileHeader`, so `.raw` is
+        // authenticated by the catalog's own column extent instead.
+        let authenticated_minor = match crate::shard::minor_axis(entry.section_type) {
+            crate::shard::MinorAxis::Obs => self.header.n_obs,
+            crate::shard::MinorAxis::Var => self.header.n_vars,
+            // `.raw`'s own gene axis is not on the `FileHeader`, so the
+            // authority is the (checksummed) catalog's column extent, which
+            // the writer stamps from the same value. `0` when the entry
+            // carries no stats: `reconcile_declared_minor` reads that as "no
+            // authority" and skips, rather than comparing the header against
+            // itself.
+            crate::shard::MinorAxis::RawVar => {
+                entry.stats.as_ref().map(|st| st.col_end).unwrap_or(0)
+            }
+        };
         crate::shard_decode::reconcile_declared_minor(
             header.n_minor,
             authenticated_minor,

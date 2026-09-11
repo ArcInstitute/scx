@@ -215,6 +215,55 @@ pub fn is_column_major(section_type: SectionType) -> bool {
     )
 }
 
+/// Which **file-level** axis a shard's minor extent is measured on.
+///
+/// **The one place that question is answered**, and a different question from
+/// [`is_column_major`], which answers *storage order*. The two disagree for
+/// exactly one section type: an `ObspCsrShard` is row-major
+/// (`derive_shard_type == 0`, it tiles the obs axis like any CSR shard) but its
+/// columns are obs, not var — an obsp graph is obs x obs.
+///
+/// That disagreement is why this exists. The rule had been written out four
+/// separate times — the writer's `n_minor` / `index_dtype` / stats choice, the
+/// v1 catalog reconciliation, its open-time guard, and the scattered framed
+/// read's `authenticated_minor` — and every one of them spelled it as "`n_obs`
+/// if column-major else `n_vars`", so every one of them was wrong for obsp.
+/// The writer stamped a gene-axis extent on a cell-axis graph, which made
+/// `ScxWriter::write_obsp_shard` unable to emit a CSR-backed obsp graph at all
+/// on any file with more cells than genes.
+///
+/// [`MinorAxis::Obs`] is deliberately **not** per-modality: obs is the global
+/// axis every modality shares, so an obsp shard written inside a
+/// `with_modality` scope still takes `header.n_obs`, never that modality's
+/// `n_vars`.
+///
+/// `scx-format-io`'s `minor_axis_dispatch_is_exhaustive` walks every
+/// discriminant, so adding a sparse section type forces a decision here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinorAxis {
+    /// The per-modality gene axis (`header.n_vars`, or the modality's own
+    /// `n_vars` inside a `with_modality` scope). Every ordinary row-major CSR
+    /// shard.
+    Var,
+    /// The file-global cell axis (`header.n_obs`). Column-major sidecars, whose
+    /// minor axis is rows, and `ObspCsrShard`, whose columns are cells.
+    Obs,
+    /// `.raw`'s own wider gene axis (`raw_n_vars`), independent of
+    /// `header.n_vars`.
+    RawVar,
+}
+
+/// The axis a shard of `section_type` measures its minor extent on. See
+/// [`MinorAxis`].
+pub fn minor_axis(section_type: SectionType) -> MinorAxis {
+    match section_type {
+        SectionType::RawCsrShard => MinorAxis::RawVar,
+        SectionType::ObspCsrShard => MinorAxis::Obs,
+        st if is_column_major(st) => MinorAxis::Obs,
+        _ => MinorAxis::Var,
+    }
+}
+
 impl ShardHeader {
     /// Returns true if this shard is column-major (CSC).
     ///

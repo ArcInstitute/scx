@@ -343,30 +343,24 @@ fn build_all_families_with_obs(
 /// while `compact` and `sort` never read it at all. A fixture carrying only COO
 /// obsp cannot tell those apart.
 pub fn fixture_with_csr_obsp(dir: &Path, name: &str) -> PathBuf {
-    // `n_vars > n_obs` on purpose. An `ObspCsrShard` is obs x obs, but the
-    // writer stamps every shard's minor extent from the header's `n_vars`, so a
-    // fixture with fewer genes than cells cannot hold a valid obs x obs graph —
-    // it fails with `ShardIndexOutOfRange` before any op sees it.
-    const CSR_OBSP_N_VARS: usize = N_OBS + 4;
+    // Plain `N_VARS` (6) against `N_OBS` (8): the ordinary shape, more cells
+    // than genes. It used to be a local `N_OBS + 4` because the writer stamped
+    // an obsp shard's minor extent from `n_vars`, so a fixture with fewer genes
+    // than cells could not hold a valid obs x obs graph — it failed with
+    // `ShardIndexOutOfRange` before any op saw it. `ScxWriter::shard_n_minor`
+    // now resolves the obs axis (OPT-FORMATIO-4); keeping the realistic shape
+    // here, and in the `optimize_csr_obsp` golden arm this feeds, is what stops
+    // the dodge from creeping back.
     let path = dir.join(name);
     let mut writer = ScxWriter::new(
         &path,
-        FileHeader::new_single_modality(
-            N_OBS as u64,
-            CSR_OBSP_N_VARS as u64,
-            0,
-            SHARD_ROWS as u32,
-            0,
-            0,
-        ),
+        FileHeader::new_single_modality(N_OBS as u64, N_VARS as u64, 0, SHARD_ROWS as u32, 0, 0),
     )
     .unwrap();
     writer.write_obs(&obs_batch()).unwrap();
-    writer
-        .write_var(&var_batch(CSR_OBSP_N_VARS, "gene"))
-        .unwrap();
+    writer.write_var(&var_batch(N_VARS, "gene")).unwrap();
     for row_start in (0..N_OBS).step_by(SHARD_ROWS) {
-        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, CSR_OBSP_N_VARS, 1);
+        let (indptr, indices, values) = csr_rows(row_start, SHARD_ROWS, N_VARS, 1);
         writer
             .write_csr_shard(
                 &indptr,

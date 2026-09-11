@@ -1323,6 +1323,76 @@ mod tests {
         );
     }
 
+    /// The minor-axis sibling of `column_major_dispatch_is_exhaustive`.
+    ///
+    /// Storage order and minor axis are *different* questions, and conflating
+    /// them is OPT-FORMATIO-4: four sites independently spelled the minor axis
+    /// as "`n_obs` if column-major else `n_vars`", and all four were wrong for
+    /// `ObspCsrShard` — row-major, but obs x obs. This sweep pins the answer
+    /// per discriminant so a new sparse section type cannot inherit `Var` by
+    /// falling through.
+    #[test]
+    fn minor_axis_dispatch_is_exhaustive() {
+        use crate::shard::{is_column_major, minor_axis, MinorAxis};
+
+        let (mut seen_obs, mut seen_raw_var) = (0usize, 0usize);
+        // Row-major but NOT on the var axis: the case the fallthrough gets
+        // wrong.
+        let mut row_major_on_obs = Vec::new();
+
+        for raw in 0u8..=255 {
+            let Some(st) = SectionType::from_u8(raw) else {
+                continue;
+            };
+            let axis = minor_axis(st);
+            let expected = match raw {
+                5 | 16 => MinorAxis::Obs, // CscShard, LayerCscShard
+                9 => MinorAxis::Obs,      // ObspCsrShard: obs x obs
+                27 => MinorAxis::RawVar,  // RawCsrShard: .raw's own gene axis
+                _ => MinorAxis::Var,
+            };
+            assert_eq!(
+                axis, expected,
+                "{st:?} (id {raw}): minor_axis disagrees with the table in this \
+                 test — decide the axis deliberately, do not let it fall through"
+            );
+
+            seen_obs += usize::from(axis == MinorAxis::Obs);
+            seen_raw_var += usize::from(axis == MinorAxis::RawVar);
+
+            // Every column-major section measures its minor extent on obs; the
+            // converse is what this whole item is about, so it is not asserted.
+            if is_column_major(st) {
+                assert_eq!(
+                    axis,
+                    MinorAxis::Obs,
+                    "{st:?} (id {raw}): a column-major shard's minor axis is rows"
+                );
+            } else if axis == MinorAxis::Obs {
+                row_major_on_obs.push(st);
+            }
+        }
+
+        // Guards the guard: without these, a predicate regressed to answering
+        // `Var` everywhere would satisfy every assertion above vacuously.
+        assert_eq!(
+            seen_obs, 3,
+            "expected exactly CscShard, LayerCscShard and ObspCsrShard on the \
+             obs axis; update this count deliberately when adding one"
+        );
+        assert_eq!(
+            seen_raw_var, 1,
+            "expected exactly RawCsrShard on the raw var axis"
+        );
+        assert_eq!(
+            row_major_on_obs,
+            vec![SectionType::ObspCsrShard],
+            "ObspCsrShard is the one section that is row-major yet measures its \
+             minor extent on obs — the whole reason minor_axis exists apart \
+             from is_column_major"
+        );
+    }
+
     /// A minimal, otherwise-valid shard header for the dispatch sweep. Only
     /// `shard_type` matters to the gates under test.
     fn sample_header_for_dispatch_test() -> ShardHeader {

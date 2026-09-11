@@ -323,6 +323,55 @@ fn v1_catalog_csr_reconcile_col_range() {
     assert_eq!(stats.col_end, 30_000);
 }
 
+/// An `ObspCsrShard` keeps the **legacy gene axis** on a v1 catalog, even
+/// though its minor axis is `n_obs` (`crate::shard::minor_axis`).
+///
+/// This looks like the OPT-FORMATIO-4 defect and is deliberately not it. The
+/// reconciliation reconstructs what a *legacy writer* stamped into the shard
+/// headers of a v1 file, and that writer had the bug: it wrote `n_vars` into an
+/// obsp shard's `n_minor`. Reconciling to `n_obs` would make the decoder's
+/// `check_header_against_catalog` reject every existing v1 obsp file, because
+/// the on-disk header and the reconstructed catalog would then disagree.
+///
+/// The fix is safe to leave out of this path because no writer can produce a v1
+/// catalog: `FullCatalog::write_to` auto-upgrades `catalog_version` to >= 2, so
+/// a correctly-stamped obsp shard never reaches here. Do not "make this
+/// consistent" — it would brick the files this path exists to read.
+#[test]
+fn v1_reconcile_keeps_the_legacy_gene_axis_for_obsp() {
+    let mut cat = sample_full_catalog();
+    cat.catalog_version = 1;
+    cat.entries.clear();
+    for (name, stype) in [
+        ("X_shard_0", SectionType::CsrShard),
+        ("obsp/connectivities_shard_0", SectionType::ObspCsrShard),
+    ] {
+        let mut entry = sample_full_entry(name, stype, true);
+        let stats = entry.stats.as_mut().unwrap();
+        stats.col_start = 0;
+        stats.col_end = 0; // v1 on disk carries no column pair
+        cat.entries.push(entry);
+    }
+
+    let (n_vars, n_obs) = (30_000u64, 70_000u64);
+    assert_ne!(
+        n_vars, n_obs,
+        "premise: the two axes must be distinguishable"
+    );
+    cat.reconcile_v1_csr_col_range(n_vars);
+
+    for entry in &cat.entries {
+        let stats = entry.stats.as_ref().unwrap();
+        assert_eq!(stats.col_start, 0);
+        assert_eq!(
+            stats.col_end, n_vars,
+            "{}: a v1 catalog is reconciled against what a legacy writer \
+             stamped, which is n_vars for every row-major entry including obsp",
+            entry.name
+        );
+    }
+}
+
 // -----------------------------------------------------------------------
 // FullCatalog tests (9.13–9.16)
 // -----------------------------------------------------------------------

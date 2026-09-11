@@ -100,7 +100,7 @@ use std::path::{Path, PathBuf};
 
 use common::{
     appendable_rows, fixture_all_families, fixture_all_families_with_categorical_obs,
-    fixture_all_families_without_raw,
+    fixture_all_families_without_raw, fixture_with_csr_obsp,
 };
 use scx_codec::ValueEncoding;
 use scx_testkit::ab::{assert_manifests_eq, resolve_against_env, OpDigestManifest};
@@ -113,9 +113,11 @@ use scx_testkit::fixtures::{mixed_codec_file, mixed_codec_file_with, FixtureOpts
 /// index-carrying input, plus `attach_obs` (the in-place obs attach, added with
 /// the categorical-fidelity change), `attach_var` (its var-axis twin, added
 /// with the var attach) so both in-place attaches are pinned from here on, and
-/// `optimize_framed` — twelve in all. That last one is the **only** arm whose
-/// output goes through the row-group-framed encoder; see its comment in
-/// `build_manifest` before changing its fixture.
+/// `optimize_framed` and `optimize_csr_obsp` — thirteen in all.
+/// `optimize_framed` is the **only** arm whose output goes through the
+/// row-group-framed encoder, and `optimize_csr_obsp` the **only** one whose
+/// output carries an `ObspCsrShard`; see their comments in `build_manifest`
+/// before changing either fixture.
 const EXPECTED_OPS: &[&str] = &[
     "append",
     "attach_obs",
@@ -127,6 +129,7 @@ const EXPECTED_OPS: &[&str] = &[
     "delete",
     "merge",
     "optimize",
+    "optimize_csr_obsp",
     "optimize_framed",
     "sort",
 ];
@@ -337,7 +340,67 @@ fn build_manifest(dir: &Path) -> OpDigestManifest {
     m.record("optimize_framed", &out, Strictness::Content)
         .unwrap();
 
+    // --- the only arm whose output carries a CSR-backed obsp graph --------
+    //
+    // `optimize` is the one op that keeps an `ObspCsrShard` (`carry.rs` drops
+    // it on compact / merge / sort), and `fixture_with_csr_obsp` is the one
+    // fixture that writes one — so without this arm the section's on-disk
+    // bytes are pinned by nothing at all. That is how OPT-FORMATIO-4 survived
+    // a format-level refactor: an obsp shard's minor extent was stamped from
+    // the gene axis instead of the cell axis, and all twelve other arms
+    // stayed green.
+    //
+    // The fixture has more cells than genes on purpose, which is what makes
+    // the two axes distinguishable in these bytes.
+    let obsp_src = fixture_with_csr_obsp(dir, "csr_obsp_src.scx");
+    let out = dir.join("optimize_csr_obsp.scx");
+    scx_ops::optimize(&obsp_src, &out, None, scx_format_io::ObsShardPolicy::Off).unwrap();
+    assert_output_carries_an_obsp_csr_graph(&out);
+    m.record("optimize_csr_obsp", &out, Strictness::Content)
+        .unwrap();
+
     m
+}
+
+/// The premise `optimize_csr_obsp` rests on: the output really carries a
+/// CSR-backed obsp graph, and its minor extent really is the obs axis.
+///
+/// Asserted rather than assumed for the same reason as
+/// `assert_output_shards_are_multi_group`: if `optimize` ever stopped carrying
+/// the section, or the fixture stopped writing one, the arm would stay green
+/// while covering nothing. The extent check is the narrower claim a digest
+/// cannot make — it records that the bytes did not move, not that they were
+/// right to begin with.
+fn assert_output_carries_an_obsp_csr_graph(path: &Path) {
+    let reader = scx_format_io::ScxReader::open(path).unwrap();
+    let entries: Vec<_> = reader
+        .catalog()
+        .entries
+        .iter()
+        .filter(|e| e.section_type == scx_format_io::section::SectionType::ObspCsrShard)
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "{}: no ObspCsrShard survived optimize — this arm covers nothing",
+        path.display()
+    );
+    let n_obs = reader.header().n_obs;
+    assert_ne!(
+        n_obs,
+        reader.header().n_vars,
+        "{}: the two axes must differ, or stamping the wrong one is invisible",
+        path.display()
+    );
+    for entry in entries {
+        let header = reader.read_shard_header(entry).unwrap();
+        assert_eq!(
+            header.n_minor as u64,
+            n_obs,
+            "{}: {} is obs x obs, so its minor extent is n_obs",
+            path.display(),
+            entry.name
+        );
+    }
 }
 
 /// The premise `optimize_framed` rests on: its output's CSR shards really are

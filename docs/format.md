@@ -374,7 +374,7 @@ decode, exploded `.scxd` layouts, and selective pull.
 | `index_dtype` | `u8` | 0 = u16, 1 = u32 |
 | `reserved_flags` | `[u8; 3]` | |
 | `n_major` | `u32` | Rows in this shard (CSR) |
-| `n_minor` | `u32` | Columns in full matrix |
+| `n_minor` | `u32` | Extent of the shard's **minor** axis in the full matrix. Which file-level axis that is depends on the section type — see [§ Minor-axis extent by section type](#minor-axis-extent-by-section-type) — not on storage order |
 | `nnz` | `u64` | |
 | `global_offset` | `u64` | First row index in full matrix |
 | `indptr_rel_offset` | `u32` | Relative to shard start |
@@ -546,6 +546,28 @@ and the shard live in separate files). The two must agree: a v2+ reader rejects
 a shard whose byte disagrees with the section type, in **both** directions, and
 does so before any extent check. Unauthenticated payload bytes do not get to
 pick which axis validates them.
+
+### Minor-axis extent by section type
+
+`n_minor` is the shard's minor-axis extent, and **storage order does not
+determine which axis that is**. Four answers, one per section class:
+
+| Section type | `n_minor` is | Resolved from |
+|---|---|---|
+| `csr_shard (4)`, `layer_csr_shard (7)` | columns (genes) | the **per-modality** `n_vars`, not the file-wide maximum |
+| `csc_shard (5)`, `layer_csc_shard (16)` | rows (cells) | `header.n_obs` |
+| `obsp_csr_shard (9)` | columns, which are **cells** — an obsp graph is obs × obs | `header.n_obs`, file-global; **not** per-modality, since obs is the axis every modality shares |
+| `raw_csr_shard (27)` | columns on `.raw`'s **own**, usually wider, gene axis | `raw.n_vars`, independent of `header.n_vars` |
+
+`obsp_csr_shard` is the one row-major section whose minor axis is not the gene
+axis. Writers stamped it from `n_vars` until the axis rule was declared in one
+place (`scx_format::shard::minor_axis`), which made a CSR-backed obsp graph
+unwritable on any file with more cells than genes: the per-shard `index_dtype`
+derives from this same extent, so an endpoint past 65535 failed the encode, and
+below that the stamped extent declared a matrix too narrow to hold its own
+endpoints. Readers of a **v1 catalog** still reconcile an `obsp_csr_shard`'s
+`col_start` / `col_end` against `n_vars`, deliberately: that path reconstructs
+what a legacy writer stamped, and no writer can emit a v1 catalog.
 
 ### `ShardStats.row_start` / `row_end` axis overload (v1 only)
 
@@ -1293,10 +1315,16 @@ here" is expressed by an empty CSR row in that modality's shard.
 ### 13.4 Per-modality `n_vars` vs the file-wide header
 
 Each modality has its own `n_vars` recorded in the modality table. The
-file-wide `header.n_vars` is the **maximum** across modalities (used
-to size shard headers' `n_minor` field uniformly across the file). To
+file-wide `header.n_vars` is the **maximum** across modalities. To
 get the canonical per-modality variable count, read it from the
 modality table — never compute it from `header.n_vars`.
+
+Shard headers' `n_minor` is **not** sized from that file-wide maximum: a
+gene-axis shard is stamped with its own modality's `n_vars`, or column-range
+pruning on a multimodal file breaks. And a shard whose minor axis is not the
+gene axis at all — `csc_shard`, `layer_csc_shard`, `obsp_csr_shard` — takes
+`header.n_obs`, which is global and identical for every modality. See
+[§ Minor-axis extent by section type](#minor-axis-extent-by-section-type).
 
 ### 13.5 Compatibility
 
