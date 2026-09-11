@@ -190,11 +190,16 @@ Two things to know:
   **2,486×** and halves peak RSS (cold capture; an earlier warm probe of the same
   comparison gave 269× — see
   [performance.md § Shard-cache sizing](performance.md#shard-cache-sizing-on-the-gather-path-data-load-phase-1-1a)).
-  Pass `scatter_block_index=True` and the opposite holds: on a framed (v4) file
+  Pass `scatter_block_index=True` and the picture changes: on a framed (v4) file
   the gather then routes through the row-group block-index path, which decodes
-  only the touched row-groups and never populates the whole-shard LRU, so
-  `cache_shards` drops off the critical path entirely. `IndexPlanDataset`
-  defaults the other way, so that is its normal regime rather than its opt-in.
+  only the touched row-groups and never inserts a whole shard, so
+  `cache_shards` as a *count* drops off the critical path. The touched groups
+  are retained in the same LRU under the same byte budget (`max_memory_mb`),
+  reported as `cache_metrics()["row_group_hits"]` / `["row_group_misses"]`, so
+  the budget still decides how much of a hot region the next batch gets for
+  free — before that retention existed the row-group path re-decoded every
+  group every batch. `IndexPlanDataset` defaults the other way, so that is its
+  normal regime rather than its opt-in.
 
 Both gather loaders sample their cache counters while iterating and emit a
 one-shot `UserWarning` if the observed miss/eviction pattern indicates the

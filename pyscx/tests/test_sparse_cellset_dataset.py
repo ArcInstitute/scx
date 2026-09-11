@@ -450,13 +450,15 @@ def test_scatter_block_index_defaults_off(framed_scx):
     assert m["block_index_groups"] == 0, (
         "the cell-set loader must default to the full-shard warm+cache path; "
         f"block_index_groups={m['block_index_groups']} means it took the "
-        "row-group path, which re-decodes a hot shard every batch"
+        "row-group path"
     )
     assert m["full_shard_groups"] > 0
     assert m["hits"] > 0, (
         "the point of the default: the second batch is served from the LRU the "
-        "first one populated. The block-index path keys on `not "
-        "cache.contains()`, so it never populates and never hits."
+        "first one populated as a whole shard."
+    )
+    assert m["row_group_hits"] + m["row_group_misses"] == 0, (
+        "the whole-shard path retains no row groups"
     )
 
 
@@ -471,8 +473,18 @@ def test_scatter_block_index_true_opts_into_the_block_index_path(framed_scx):
     assert m["block_index_groups"] > 0
     assert m["full_shard_groups"] == 0
     assert m["hits"] + m["misses"] == 0, (
-        "the row-group path bypasses the whole-shard LRU entirely, so "
-        "`cache_shards` is off the critical path here"
+        "the row-group path never inserts a whole shard, so the whole-shard "
+        "counters stay at zero"
+    )
+    # OPT-FORMATIO-1: what it does retain is the touched row groups — the
+    # second identical batch is served from them, under the same byte budget.
+    # Each group is decoded once (the singleflight dedups the L2 warm racing
+    # the gather); every later look-up — the second batch's gather, and the
+    # prefetcher's own warm of the second plan — is a hit, so hits are at least
+    # the two gathers' worth.
+    assert m["row_group_misses"] > 0, "the first batch decoded row groups"
+    assert m["row_group_hits"] >= 2 * m["row_group_misses"], (
+        f"both batches must be served from the groups the first decoded: {m}"
     )
 
 

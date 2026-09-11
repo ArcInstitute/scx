@@ -44,14 +44,16 @@ use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use scx_format_io::{BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
-use scx_sparse::ScxCsr;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
 
-type ShardJoin = JoinHandle<scx_format_io::Result<Arc<ScxCsr>>>;
+/// One prefetch task: a whole-shard warm (`read_shard_cached_arc`) or a
+/// row-group warm (`warm_row_groups`). Both are side effects on the shared
+/// cache; the decoded value itself is never handed back.
+type ShardJoin = JoinHandle<scx_format_io::Result<()>>;
 
 /// A `file_id → reader` map sharing one decoded-shard budget, plus a lazily
 /// built tokio runtime for prefetch. Wrap in `Arc` and call
@@ -227,7 +229,13 @@ impl PrefetchEngine {
     /// owner, so handing it over costs nothing, and it lets a consumer that
     /// needs to consume or reorder the plan — `IndexPlanLoader::process_plan`
     /// sorts in place and moves the result into the batch — do so without a
-    /// defensive clone on every batch of the training hot path.
+    /// defensive clone on every batch of the training hot path. Its third
+    /// argument is the plan's **row-group admission** verdict (see
+    /// `spawn_prefetches`): the consumer passes it to
+    /// `BackedCsrReader::read_rows_with_admission` for every gather the plan
+    /// makes, so the gathers retain only what the plan's verdict admits (the
+    /// warm pre-decodes the eligible subset of that) and a plan whose union of
+    /// gathers is over budget retains nothing.
     pub fn iter_with_plans<P, T, RowsFn, ProcFn, PlanIter>(
         self: Arc<Self>,
         plans: PlanIter,
@@ -239,7 +247,7 @@ impl PrefetchEngine {
         P: Send + 'static,
         PlanIter: Iterator<Item = Result<P>> + Send + 'static,
         RowsFn: Fn(&P) -> Vec<(u32, u64)>,
-        ProcFn: Fn(&PrefetchEngine, P) -> Result<T>,
+        ProcFn: Fn(&PrefetchEngine, P, bool) -> Result<T>,
     {
         let cap = lookahead.max(1);
         let (plan_tx, plan_rx) = bounded(cap);
@@ -281,25 +289,37 @@ impl PrefetchEngine {
 /// synchronization.
 ///
 /// **With prefetch enabled**, the four counters partition every shard a valid
-/// plan touches: each is either spawned or skipped for exactly one reason,
-/// which is what `tests/test_index_plan.rs`'s conservation law checks. At
-/// `lookahead == 0` there is no partition — `spawn_prefetches` returns before
-/// any of them, so all four stay zero while the gather still picks a route.
-/// These are prefetch-time decisions; `CacheMetrics::block_index_groups` is the
-/// route the gather actually took, and the two are not interchangeable.
+/// plan touches: each is either spawned as a whole-shard warm or not, for
+/// exactly one reason, which is what `tests/test_index_plan.rs`'s conservation
+/// law checks. At `lookahead == 0` there is no partition — `spawn_prefetches`
+/// returns before any of them, so all four stay zero while the gather still
+/// picks a route. These are prefetch-time decisions;
+/// `CacheMetrics::block_index_groups` is the route the gather actually took,
+/// and the two are not interchangeable.
 #[derive(Default, Debug)]
 pub struct IterMetrics {
-    /// `tokio::spawn_blocking` tasks queued onto the runtime's blocking pool.
+    /// Whole-shard `read_shard_cached_arc` tasks queued onto the runtime's
+    /// blocking pool. Row-group warms (see `prefetch_skipped_block_index`) are
+    /// not counted here, so the four-way partition of touched shards holds.
     pub prefetch_tasks_spawned: AtomicU64,
     /// Shards whose prefetch was skipped because the LRU already held them.
     pub prefetch_skipped_cache_hit: AtomicU64,
     /// Shards whose prefetch was skipped because a peer leader was already
     /// decoding them in the shared cache's singleflight table.
     pub prefetch_skipped_in_flight: AtomicU64,
-    /// Shards whose prefetch was skipped because the group is **block-index
-    /// eligible** (cold + sparse + row-group framed): the gather decodes only
-    /// the touched row-groups via the block index, so warming the whole shard
-    /// would negate the win (the L2 block-index-aware prefetch skip).
+    /// Shards whose **whole-shard** prefetch was skipped because the group is
+    /// **block-index eligible** (not resident whole + sparse + row-group
+    /// framed): the gather decodes only the touched row-groups via the block
+    /// index, so warming the whole shard would negate the win (the L2
+    /// block-index-aware prefetch skip). The name predates OPT-FORMATIO-1 and
+    /// is a contract; since then such a shard is not left cold — when the
+    /// whole plan's row groups (every file, every shard) fit
+    /// `cache_bytes_budget / (lookahead + 1)`, its touched groups are
+    /// pre-decoded into the shard LRU instead (`BackedCsrReader::warm_row_groups`),
+    /// and the gather serves them as `CacheMetrics::row_group_hits`. A plan
+    /// over its share is neither warmed nor retained by its gathers (the same
+    /// verdict reaches them through `process`'s third argument): warming it
+    /// would only have evicted the groups before they were read.
     pub prefetch_skipped_block_index: AtomicU64,
 }
 
@@ -356,6 +376,9 @@ struct InFlight<P> {
     /// Empty when `lookahead == 0`, the plan touches no rows, or every touched
     /// shard is already cached / in flight.
     prefetches: Vec<ShardJoin>,
+    /// The plan's row-group admission verdict (see `spawn_prefetches`), handed
+    /// to `process` so the gather retains exactly what the prefetcher warmed.
+    admit_row_groups: bool,
 }
 
 /// Iterator returned by [`PrefetchEngine::iter_with_plans`].
@@ -437,8 +460,12 @@ where
 
             match item {
                 Ok(plan) => match self.spawn_prefetches(&plan) {
-                    Ok(prefetches) => {
-                        self.in_flight.push_back(InFlight { plan, prefetches });
+                    Ok((prefetches, admit_row_groups)) => {
+                        self.in_flight.push_back(InFlight {
+                            plan,
+                            prefetches,
+                            admit_row_groups,
+                        });
                     }
                     Err(e) => {
                         // Runtime construction failed — latch through the
@@ -456,102 +483,169 @@ where
     }
 
     /// Spawn a `read_shard_cached_arc` prefetch per touched shard, fanned over
-    /// the readers the plan's rows hit. Skips shards already cached / in flight
-    /// (per reader), so a window touching the same shard queues it once.
-    fn spawn_prefetches(&self, plan: &P) -> Result<Vec<ShardJoin>> {
-        if self.lookahead == 0 {
-            return Ok(Vec::new());
-        }
+    /// the readers the plan's rows hit, and decide the plan's **row-group
+    /// admission** — returned alongside the join handles so `process` applies
+    /// the same verdict to every gather of the plan.
+    ///
+    /// Skips shards already cached / in flight (per reader), so a window
+    /// touching the same shard queues it once. A block-index-eligible shard is
+    /// never warmed whole; when the plan is admitted it gets a
+    /// `warm_row_groups` task instead.
+    ///
+    /// **One decision per plan, over the shared budget.** Every reader of the
+    /// engine draws on one `SharedShardCache`, and a plan's gathers may span
+    /// several files (the cell-set loader) and several `read_rows_with` calls
+    /// (one per set). So the plan's footprint in that cache — the row-group
+    /// bytes of every framed shard it touches, regardless of current residency
+    /// or per-bucket density (see the body for why those are not stable), plus
+    /// the decoded size of every shard it will take whole — is summed over the
+    /// whole plan, every file, every shard, and compared once against
+    /// `cache_bytes_budget / (lookahead + 1)`: up to `lookahead` plans are
+    /// warming while one is consumed, so that is the share under which a warm
+    /// still resides when its gather arrives, and under which the gathers'
+    /// own inserts cannot evict a peer plan's warm. A per-file or per-gather
+    /// verdict against the full budget let N files (or N sets) each pass while
+    /// their union thrashed the LRU — found by review on #528. At
+    /// `lookahead == 0` nothing is warmed and the share is the whole budget.
+    fn spawn_prefetches(&self, plan: &P) -> Result<(Vec<ShardJoin>, bool)> {
         let rows = (self.rows_of)(plan);
         if rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), true));
         }
 
-        // Group rows by file_id so each reader resolves its own shard set.
-        let mut by_file: HashMap<u32, Vec<u64>> = HashMap::new();
+        // Dedup rows and bucket them per (file, shard). The gather passes the
+        // same deduped set to `read_rows_with`, so each bucket's length is the
+        // `group_len` its block-index decision sees. Deciding on the same input
+        // is what keeps the skip below meaningful as evidence about the gather
+        // — though not a guarantee it agrees: a peer sharing the cache can
+        // warm a shard in between.
+        let mut seen: HashSet<(u32, u64)> = HashSet::with_capacity(rows.len());
+        let mut per_shard: HashMap<(u32, usize), Vec<u64>> = HashMap::new();
         for (fid, row) in rows {
-            by_file.entry(fid).or_default().push(row);
+            if !seen.insert((fid, row)) {
+                continue;
+            }
+            // Prefetch is best-effort: an out-of-range `file_id` from an
+            // untrusted plan is skipped here (no panic) and surfaces as a
+            // clean error from the gather's validation.
+            let Some(reader) = self.engine.readers.get(fid as usize) else {
+                continue;
+            };
+            if let Some(sidx) = reader.index().shard_for_row(row) {
+                per_shard.entry((fid, sidx)).or_default().push(row);
+            }
+        }
+
+        // Plan-level admission, sized exactly from the catalog and the block
+        // index (no decode). `planned` is an upper bound on the plan's whole
+        // footprint in the shared LRU — both kinds of entry, since they share
+        // one budget (review on #528, round 3):
+        //
+        // * the row-group bytes of every framed shard the plan touches — NOT
+        //   filtered by `block_index_eligible`, which is volatile in two ways
+        //   the gather can disagree with by the time it runs: its `!contains`
+        //   clause looks at whole-shard residency, which a warm can change
+        //   before the plan is consumed; and its density window sees this
+        //   bucket's row count, while the cell-set loader gathers one set at a
+        //   time and each set's smaller count can be sparse where the plan's
+        //   union is dense;
+        // * the decoded size of every shard the plan will take **whole** (the
+        //   non-eligible buckets, warmed by `read_shard_cached_arc` below or
+        //   already resident) — a mixed plan whose groups fit the share on
+        //   their own but not next to its whole shards would otherwise evict
+        //   one with the other on every repeat.
+        //
+        // Counting a shard the gather then happens to serve the other way only
+        // makes the verdict conservative (a lost warm in a mixed regime), never
+        // unsafe. Eligibility still decides what L2 task to launch.
+        let mut planned = 0usize;
+        let mut budget = usize::MAX;
+        let mut eligible: HashMap<(u32, usize), bool> = HashMap::with_capacity(per_shard.len());
+        for (&(fid, sidx), rows) in &per_shard {
+            let reader = &self.engine.readers[fid as usize];
+            let is_eligible = reader.block_index_eligible(sidx, rows.len());
+            planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, rows));
+            if !is_eligible {
+                planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
+            }
+            budget = budget.min(reader.cache_bytes_budget());
+            eligible.insert((fid, sidx), is_eligible);
+        }
+        let share = budget / (self.lookahead + 1);
+        let admit_row_groups = planned <= share;
+
+        if self.lookahead == 0 {
+            return Ok((Vec::new(), admit_row_groups));
         }
 
         let handle = self.engine.runtime()?.handle().clone();
         let mut joins = Vec::new();
-        for (fid, rs) in by_file {
-            // Prefetch is best-effort: an out-of-range `file_id` from an
-            // untrusted plan is skipped here (no panic) and surfaces as a
-            // clean error from `SparseCellSetLoader::gather`'s validation.
-            let Some(reader) = self.engine.readers.get(fid as usize) else {
-                continue;
-            };
-            // Dedup rows + count unique rows per shard. The gather passes the
-            // same deduped set to `read_rows_with`, so this `group_len` is the
-            // one its block-index decision sees. Deciding on the same input is
-            // what keeps the skip below meaningful as evidence about the gather
-            // — though not a guarantee it agrees: a peer sharing the cache can
-            // warm the shard in between, and at `lookahead == 0` this code does
-            // not run at all.
-            let mut seen: HashSet<u64> = HashSet::with_capacity(rs.len());
-            let mut per_shard: HashMap<usize, usize> = HashMap::new();
-            for row in rs {
-                if seen.insert(row) {
-                    if let Some(sidx) = reader.index().shard_for_row(row) {
-                        *per_shard.entry(sidx).or_insert(0) += 1;
-                    }
-                }
-            }
-            for (sidx, group_len) in per_shard {
-                // Attributed one reason at a time, not as a fused `||`: the
-                // three skips mean different things to an operator (a warm
-                // cache, a peer decode, the L2 block-index adoption) and a
-                // fused test can only ever check their sum.
-                //
-                // The third is the interesting one: leaving a cold + sparse +
-                // framed shard undecoded is what lets `read_rows_with` take the
-                // group-level block-index path instead of being negated by a
-                // full-shard warm. Both sides call the same
-                // `block_index_eligible` on the same `group_len`, so neither
-                // drifts from the other's *predicate* — but the cache can change
-                // under them, so this counter is the prefetch-time decision, not
-                // proof of the gather's route. Dense or large groups fall
-                // through and warm as before.
-                if reader.cache_contains(sidx) {
-                    self.iter_metrics
-                        .prefetch_skipped_cache_hit
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                if reader.in_flight_contains(sidx) {
-                    self.iter_metrics
-                        .prefetch_skipped_in_flight
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                if reader.block_index_eligible(sidx, group_len) {
-                    self.iter_metrics
-                        .prefetch_skipped_block_index
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+        for ((fid, sidx), mut rows) in per_shard {
+            let reader = &self.engine.readers[fid as usize];
+            // Attributed one reason at a time, not as a fused `||`: the three
+            // skips mean different things to an operator (a warm cache, a peer
+            // decode, the L2 block-index adoption) and a fused test can only
+            // ever check their sum.
+            //
+            // The third is the interesting one: not warming a sparse + framed
+            // shard *whole* is what lets `read_rows_with` take the group-level
+            // block-index path instead of being negated by a full-shard warm.
+            // Both sides call the same `block_index_eligible` on the same
+            // `group_len`, so neither drifts from the other's *predicate* — but
+            // the cache can change under them, so this counter is the
+            // prefetch-time decision, not proof of the gather's route. Dense
+            // or large groups fall through and warm as before.
+            if reader.cache_contains(sidx) {
                 self.iter_metrics
-                    .prefetch_tasks_spawned
+                    .prefetch_skipped_cache_hit
                     .fetch_add(1, Ordering::Relaxed);
-                // Capture the *reader*, never an owner further up: an
-                // already-started `spawn_blocking` cannot be aborted, so a task
-                // holding the engine or a loader could outlive this iter and
-                // release the final reference — dropping the runtime from one
-                // of its own threads. See `crate::runtime`.
-                let reader = Arc::clone(reader);
-                #[cfg(test)]
-                let gate = self.engine.prefetch_gate.get().cloned();
-                joins.push(handle.spawn_blocking(move || {
-                    #[cfg(test)]
-                    if let Some(gate) = gate {
-                        gate.enter();
-                    }
-                    reader.read_shard_cached_arc(sidx)
-                }));
+                continue;
             }
+            if reader.in_flight_contains(sidx) {
+                self.iter_metrics
+                    .prefetch_skipped_in_flight
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // Capture the *reader*, never an owner further up: an
+            // already-started `spawn_blocking` cannot be aborted, so a task
+            // holding the engine or a loader could outlive this iter and
+            // release the final reference — dropping the runtime from one of
+            // its own threads. See `crate::runtime`.
+            let reader = Arc::clone(reader);
+            #[cfg(test)]
+            let gate = self.engine.prefetch_gate.get().cloned();
+            if eligible[&(fid, sidx)] {
+                self.iter_metrics
+                    .prefetch_skipped_block_index
+                    .fetch_add(1, Ordering::Relaxed);
+                // Row-group warm (OPT-FORMATIO-1): only for an admitted plan —
+                // warming a plan over its share would evict the groups before
+                // they are read and cost a second decode.
+                if admit_row_groups && planned > 0 {
+                    rows.sort_unstable();
+                    joins.push(handle.spawn_blocking(move || {
+                        #[cfg(test)]
+                        if let Some(gate) = gate {
+                            gate.enter();
+                        }
+                        reader.warm_row_groups(sidx, &rows).map(|_| ())
+                    }));
+                }
+                continue;
+            }
+            self.iter_metrics
+                .prefetch_tasks_spawned
+                .fetch_add(1, Ordering::Relaxed);
+            joins.push(handle.spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.enter();
+                }
+                reader.read_shard_cached_arc(sidx).map(|_| ())
+            }));
         }
-        Ok(joins)
+        Ok((joins, admit_row_groups))
     }
 
     /// Block on every prefetch handle for the head plan, surfacing the first
@@ -560,7 +654,7 @@ where
         let runtime = self.engine.runtime()?;
         for h in prefetches {
             match runtime.block_on(h) {
-                Ok(Ok(_arc_shard)) => {
+                Ok(Ok(())) => {
                     // Warm in the shared cache; `process` will hit it.
                 }
                 Ok(Err(e)) => return Err(LoaderError::FormatError(e)),
@@ -578,7 +672,7 @@ where
 impl<P, T, RowsFn, ProcFn> Iterator for PlanPrefetchIter<P, T, RowsFn, ProcFn>
 where
     RowsFn: Fn(&P) -> Vec<(u32, u64)>,
-    ProcFn: Fn(&PrefetchEngine, P) -> Result<T>,
+    ProcFn: Fn(&PrefetchEngine, P, bool) -> Result<T>,
 {
     type Item = Result<T>;
 
@@ -587,7 +681,12 @@ where
         // plan is the only way to make progress.
         self.refill(true);
 
-        if let Some(InFlight { plan, prefetches }) = self.in_flight.pop_front() {
+        if let Some(InFlight {
+            plan,
+            prefetches,
+            admit_row_groups,
+        }) = self.in_flight.pop_front()
+        {
             // Keep the queue warm during the upcoming process call. Strictly
             // non-blocking: we already hold a plan, and the generator may be
             // waiting on the batch it produces.
@@ -596,7 +695,7 @@ where
             if let Err(e) = self.await_head(prefetches) {
                 return Some(Err(e));
             }
-            return Some((self.process)(&self.engine, plan));
+            return Some((self.process)(&self.engine, plan, admit_row_groups));
         }
 
         // Queue empty — surface a deferred plan-stream error one-shot.
@@ -646,6 +745,10 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
             let evictions = cm.evictions.load(Ordering::Relaxed);
             let bytes_inserted = cm.bytes_inserted.load(Ordering::Relaxed);
             let dup_waiters = cm.duplicate_waiters.load(Ordering::Relaxed);
+            let rg_hits = cm.row_group_hits.load(Ordering::Relaxed);
+            let rg_misses = cm.row_group_misses.load(Ordering::Relaxed);
+            let rg_evictions = cm.row_group_evictions.load(Ordering::Relaxed);
+            let rg_bytes_inserted = cm.row_group_bytes_inserted.load(Ordering::Relaxed);
             let spawned = im.prefetch_tasks_spawned.load(Ordering::Relaxed);
             let skip_hit = im.prefetch_skipped_cache_hit.load(Ordering::Relaxed);
             let skip_inflight = im.prefetch_skipped_in_flight.load(Ordering::Relaxed);
@@ -654,6 +757,9 @@ impl<P, T, RowsFn, ProcFn> Drop for PlanPrefetchIter<P, T, RowsFn, ProcFn> {
                 "scx-loader PlanPrefetchIter cache_metrics: \
                  hits={hits} misses={misses} evictions={evictions} \
                  bytes_inserted={bytes_inserted} duplicate_waiters={dup_waiters} \
+                 row_group_hits={rg_hits} row_group_misses={rg_misses} \
+                 row_group_evictions={rg_evictions} \
+                 row_group_bytes_inserted={rg_bytes_inserted} \
                  prefetch_tasks_spawned={spawned} \
                  prefetch_skipped_cache_hit={skip_hit} \
                  prefetch_skipped_in_flight={skip_inflight} \

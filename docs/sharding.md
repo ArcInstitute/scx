@@ -619,12 +619,31 @@ G=128–256 for scatter-heavy training; coarser G only pays off for sequential f
 scans. (See [codec.md §7b](codec.md) for the bit-level layout and the full G sweep.)
 
 **Loader adoption.** `IndexPlanDataset` defaults `scatter_block_index=True` and its
-prefetcher skips pre-warming block-index-eligible framed shards so the gather reaches the
+prefetcher never warms a block-index-eligible framed shard *whole*, so the gather reaches the
 group-level path; `SparseCellSetDataset` takes the same kwarg and defaults it off, because
-its regime is cache-friendly (see [performance.md](performance.md) for the measurement).
-The process-wide kill-switch is `SCX_SCATTER_BLOCK_INDEX=0`. Adoption is observable on
-**both** classes via `cache_metrics()["block_index_groups"]` (> 0 ⇒ framed path taken;
-`full_shard_groups` is the fallback). Opening **all-unframed** data with
+its regime is cache-friendly (see [performance.md](performance.md) for the measurement —
+taken before the row-group LRU below existed). The process-wide kill-switch is
+`SCX_SCATTER_BLOCK_INDEX=0`. Adoption is observable on **both** classes via
+`cache_metrics()["block_index_groups"]` (> 0 ⇒ framed path taken; `full_shard_groups` is the
+fallback).
+
+**Row-group LRU (OPT-FORMATIO-1).** The groups a block-index gather decodes are retained in
+the same LRU as whole shards, keyed `(file_id, shard, group)`, under the same byte budget
+(`max_memory_mb`); the `cache_shards` count cap applies to whole shards only. The per-shard
+framing layout (header scalars, sub-stream ranges, resolved block index) is memoized once
+per shard. A repeated gather over a hot region is served as
+`cache_metrics()["row_group_hits"]`. Admission is **one verdict per plan**, taken by the
+prefetch engine over every file and shard the plan touches against the plan's share of the
+budget, `budget / (lookahead + 1)` (up to `lookahead` plans are warming while one is
+consumed): an admitted plan is pre-decoded by the L2 prefetcher and retained by its gathers,
+an over-share plan is neither — else a plan of many individually-fitting gathers (the
+cell-set loader gathers one set at a time) would churn the LRU for zero hits. A standalone
+`read_rows_with` / `read_rows` outside the loaders decides for itself against the whole
+budget. Both size from the block index, no decode. The win is therefore capacity-bound: at G=256 and ~2k nnz/row a touched group is
+~4 MB, so a 512-row batch over a large file wants a budget of a few GB
+(`max_memory_mb`); a budget under one batch's groups gets the pre-change behaviour, not a
+slower one. `SCX_ROW_GROUP_CACHE=0` disables retention (the
+same-build A/B arm). Output is byte-identical either way. Opening **all-unframed** data with
 `scatter_block_index=True` emits a one-shot `UserWarning` on **both** classes — the fast
 path is inert there, so reframe with `scx optimize --row-group-rows 256 <file>`. On
 `SparseCellSetDataset` the check is *any file in the set*, since one framed file means the

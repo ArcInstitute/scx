@@ -93,6 +93,154 @@ fn open(path: &std::path::Path) -> ScxReader {
     ScxReader::open(path).unwrap()
 }
 
+/// **Review on #528 (codex).** A cell-set plan is gathered one
+/// `read_rows_with` call per set, so a per-gather admission rule sees one set
+/// at a time: two sets that each fit `budget / (lookahead + 1)` but whose union
+/// does not would both be retained and evict each other — the insert/evict/
+/// zero-hit scan the admission rule exists to bypass. The verdict is taken once
+/// per plan by the engine and carried into every set's gather. Falsifier:
+/// `row_group_bytes_inserted > 0` means a per-set decision admitted.
+#[test]
+fn cellset_plan_admission_is_per_plan_not_per_set() {
+    use crate::plan_engine::tests::{framed_expected, write_framed_fixture, FRAMED_GROUP_BYTES};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    write_framed_fixture(&p0);
+    // Set A: rows 5/70/140/200 → groups 0/4/8/12; set B: rows 20/85/155/215 →
+    // groups 1/5/9/13. Each set is 4 groups; the union is 8.
+    let per_set = 4 * FRAMED_GROUP_BYTES;
+    let budget = 5 * (per_set + per_set / 2);
+    assert!(budget / 5 >= per_set && budget / 5 < 2 * per_set, "premise");
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        /*cache_shards*/ 16,
+        Some(budget),
+        /*lookahead*/ 4,
+        /*remap*/ None,
+        /*n_global_genes*/ None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ true,
+    )
+    .unwrap();
+    let rows: Vec<u64> = vec![5, 70, 140, 200, 20, 85, 155, 215];
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 8],
+        rows: rows.clone(),
+        role_tags: vec![0, 0, 0, 0, 1, 1, 1, 1],
+        set_offsets: vec![0, 4, 8],
+    };
+    let batches: Vec<_> = StdArc::clone(&loader)
+        .iter_with_plans(vec![Ok(plan.clone())].into_iter(), 4)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(batches.len(), 1);
+    for (j, &row) in rows.iter().enumerate() {
+        let (idx, dat) = batch_row(&batches[0], j);
+        let (ecol, eval) = framed_expected(row);
+        assert_eq!((idx, dat), (&[ecol][..], &[eval][..]), "row {j}");
+    }
+    let m = loader.cache_metrics();
+    assert!(
+        m.block_index_groups.load(AtomicOrdering::Relaxed) > 0,
+        "premise: the framed gather took the row-group route"
+    );
+    assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 8);
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed)
+            + m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "two sets that fit one at a time but not together must retain nothing"
+    );
+}
+
+/// **Review on #528 round 2 (codex).** The plan's admission sum must not key
+/// on the plan-level density window either: the engine buckets a plan's rows
+/// per shard, but the cell-set loader gathers one set at a time, so a shard
+/// that is dense over the whole plan (`block_index_eligible` false — the sum
+/// would skip it) is sparse per set, and every set's gather takes the
+/// row-group path. Sixteen rows of one 64-row shard across four sets of four:
+/// dense as a plan, sparse per set. Four groups exceed the budget, so the plan
+/// must be refused; a density-filtered sum (0 bytes) would admit it and the
+/// four gathers would insert. Falsifier: any `row_group_bytes_inserted`.
+///
+/// `lookahead = 0` on purpose: with prefetch on, the dense plan-level bucket
+/// makes the prefetcher warm the shard **whole**, and the gathers then slice
+/// the resident shard (`full_shard_groups`) — the hole only opens when nothing
+/// warmed the shard first, which is exactly the no-prefetch path.
+#[test]
+fn cellset_plan_admission_ignores_plan_level_density() {
+    use crate::plan_engine::tests::{framed_expected, write_framed_fixture, FRAMED_GROUP_BYTES};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    write_framed_fixture(&p0);
+    // 16 rows in shard 0 (64 rows, 4 groups of 16): 16 × 4 ≥ 64 is dense at
+    // plan level; each set of 4 rows is sparse (4 × 4 < 64).
+    let rows: Vec<u64> = (0..16u64).map(|i| i * 4).collect();
+    // At lookahead 0 the share is the whole budget: three and a half groups.
+    let budget = 3 * FRAMED_GROUP_BYTES + FRAMED_GROUP_BYTES / 2;
+    assert!(
+        budget < 4 * FRAMED_GROUP_BYTES,
+        "premise: four groups exceed the budget"
+    );
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        /*cache_shards*/ 16,
+        Some(budget),
+        /*lookahead*/ 4,
+        /*remap*/ None,
+        /*n_global_genes*/ None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ true,
+    )
+    .unwrap();
+    assert!(
+        !loader.engine.reader(0).block_index_eligible(0, rows.len()),
+        "premise: dense at plan level"
+    );
+    assert!(
+        loader.engine.reader(0).block_index_eligible(0, 4),
+        "premise: sparse per set"
+    );
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 16],
+        rows: rows.clone(),
+        role_tags: vec![0; 16],
+        set_offsets: vec![0, 4, 8, 12, 16],
+    };
+    let batches: Vec<_> = StdArc::clone(&loader)
+        .iter_with_plans(vec![Ok(plan.clone())].into_iter(), /*lookahead*/ 0)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(batches.len(), 1);
+    for (j, &row) in rows.iter().enumerate() {
+        let (idx, dat) = batch_row(&batches[0], j);
+        let (ecol, eval) = framed_expected(row);
+        assert_eq!((idx, dat), (&[ecol][..], &[eval][..]), "row {j}");
+    }
+    let m = loader.cache_metrics();
+    assert_eq!(
+        m.block_index_groups.load(AtomicOrdering::Relaxed),
+        4,
+        "premise: every set's gather took the row-group route (cold shard, sparse per set)"
+    );
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "four sets, sparse each, dense together: the plan is over budget and retains nothing"
+    );
+    assert_eq!(m.row_group_hits.load(AtomicOrdering::Relaxed), 0);
+}
+
 /// **Pin (9b).** `SparseCellSetLoader::new` must pass `scatter_block_index`
 /// through to the engine rather than hard-coding either value.
 ///

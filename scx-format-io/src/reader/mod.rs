@@ -123,6 +123,7 @@ pub struct ScxReader {
 // entirety" header was false and `--no-default-features` did not build.
 #[cfg(feature = "deletion-vectors")]
 mod filtered;
+mod framed_layout;
 mod integrity;
 mod matrix;
 mod metadata;
@@ -132,6 +133,7 @@ mod open;
 // five of these are also flat-re-exported from `lib.rs`. The split has to keep
 // every one of them resolving, so everything reachable at `reader::<name>`
 // before is re-exported here at the same visibility.
+pub(crate) use framed_layout::{assemble_row_run, FramedShardLayout};
 pub(crate) use matrix::{check_decoded_lengths, plan_row_major_layout, X_LABELS};
 pub(crate) use metadata::DenseMappingLayout;
 pub use metadata::{

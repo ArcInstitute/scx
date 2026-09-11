@@ -737,7 +737,19 @@ impl IndexPlanLoader {
     /// `min(shard_of(p), shard_of(c))` before gathering. The returned
     /// `pairs` field reflects the post-sort order: row `i` of `x` / `x_paired`
     /// always corresponds to `pairs[i]`, regardless of the input order.
-    pub fn process_plan(&self, mut plan: Vec<(u64, u64)>) -> Result<IndexPlanBatch> {
+    pub fn process_plan(&self, plan: Vec<(u64, u64)>) -> Result<IndexPlanBatch> {
+        self.process_plan_admitting(plan, None)
+    }
+
+    /// [`Self::process_plan`] with the row-group admission decided by the
+    /// caller: the prefetch engine's per-plan verdict when driven through
+    /// `iter_with_plans`, `None` (decide per gather, against the whole budget)
+    /// for a standalone call.
+    pub(crate) fn process_plan_admitting(
+        &self,
+        mut plan: Vec<(u64, u64)>,
+        admit_row_groups: Option<bool>,
+    ) -> Result<IndexPlanBatch> {
         if plan.len() > self.max_plan_size {
             return Err(LoaderError::ConfigError {
                 reason: format!(
@@ -798,7 +810,7 @@ impl IndexPlanLoader {
             });
         }
 
-        let gathered = self.gather_pairs_dense(&plan)?;
+        let gathered = self.gather_pairs_dense(&plan, admit_row_groups)?;
 
         let obs = extract_obs_columns(
             &self.obs_metadata,
@@ -829,7 +841,11 @@ impl IndexPlanLoader {
     /// reuse the same CSR row slice and scatter once per destination
     /// occurrence, preserving duplicate-pair semantics without repeating shard
     /// lookup or row-pointer work.
-    fn gather_pairs_dense(&self, plan: &[(u64, u64)]) -> Result<PairedDenseGather> {
+    fn gather_pairs_dense(
+        &self,
+        plan: &[(u64, u64)],
+        admit_row_groups: Option<bool>,
+    ) -> Result<PairedDenseGather> {
         let n_pairs = plan.len();
         let n_cols = self.n_output_cols;
 
@@ -874,9 +890,10 @@ impl IndexPlanLoader {
         // a sentinel ScxError, then surface the original LoaderError afterward —
         // preserving the precise error variant rather than stringifying it.
         let mut scatter_err: Option<LoaderError> = None;
-        let res = self
-            .backed
-            .read_rows_with(&unique_rows, |orig_pos, idx, data| {
+        let res = self.backed.read_rows_with_admission(
+            &unique_rows,
+            admit_row_groups,
+            |orig_pos, idx, data| {
                 for &request in &row_to_requests[orig_pos] {
                     if let Err(e) = self.scatter_pair_request(
                         request,
@@ -895,7 +912,8 @@ impl IndexPlanLoader {
                     }
                 }
                 Ok(())
-            });
+            },
+        );
         // Invariant: the closure returns Err ONLY after setting `scatter_err`,
         // so a Some here is always the original scatter error — check it before
         // `res` so the precise LoaderError wins over the sentinel.
@@ -1057,7 +1075,9 @@ impl IndexPlanLoader {
             // The plan arrives by value, so `process_plan` keeps its in-place
             // `sort_by_shard` and moves the sorted plan straight into the
             // batch's `pairs` — no defensive clone per batch.
-            move |_engine: &PrefetchEngine, plan: Vec<(u64, u64)>| loader.process_plan(plan),
+            move |_engine: &PrefetchEngine, plan: Vec<(u64, u64)>, admit_row_groups: bool| {
+                loader.process_plan_admitting(plan, Some(admit_row_groups))
+            },
         );
         // Taken before boxing, which erases the inherent method.
         let iter_metrics = iter.iter_metrics();

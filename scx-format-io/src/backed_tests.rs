@@ -250,6 +250,37 @@ fn read_rows_with_block_index_all_codecs() {
             2,
             "{codec:?}: sparse cold gather must take the block-index path",
         );
+
+        // OPT-FORMATIO-1: the same gather again is served from the row-group
+        // LRU — every codec's decoded groups round-trip through the cache
+        // byte-identically, and nothing is decoded a second time.
+        let decoded_groups = m.row_group_misses.load(Ordering::Relaxed);
+        assert!(
+            decoded_groups > 0,
+            "{codec:?}: premise — groups were retained"
+        );
+        let mut again: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); sparse_rows.len()];
+        backed
+            .read_rows_with(&sparse_rows, |i, idx, data| {
+                again[i] = (idx.to_vec(), data.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            again, out,
+            "{codec:?}: cached groups must reproduce the decode"
+        );
+        assert_eq!(
+            m.row_group_misses.load(Ordering::Relaxed),
+            decoded_groups,
+            "{codec:?}: warm gather must decode nothing"
+        );
+        assert_eq!(
+            m.row_group_hits.load(Ordering::Relaxed),
+            decoded_groups,
+            "{codec:?}: warm gather must hit every group"
+        );
+        assert_eq!(m.block_index_groups.load(Ordering::Relaxed), 4);
     }
 }
 
@@ -4265,4 +4296,687 @@ fn stored_value_encoding_refuses_on_a_watched_reader_once_the_file_changed() {
         fresh.stored_value_encoding().unwrap(),
         Some(ValueEncoding::Uint16)
     );
+}
+
+// ---------------------------------------------------------------------------
+// OPT-FORMATIO-1 — the row-group LRU
+//
+// A scattered gather over a framed file takes the block-index path, which
+// before this series decoded the touched row groups per call and dropped them:
+// the whole-shard LRU never populated (its `!contains` clause is part of the
+// eligibility), so every batch re-decoded the same groups. The groups now live
+// in the same LRU under `CacheKey::Group`, bounded by the byte budget alone,
+// and report through the `row_group_*` counters so `hits` / `misses` keep
+// meaning "whole shard". Fixture geometry (`write_framed_file(.., 64, n_vars,
+// 2, 4, ..)`): 2 shards × 32 rows, 8 groups of 4 rows per shard, 2 nnz/row —
+// a group is `5 × 8 + 8 × 4 + 8 × 4 = 104` bytes, a shard `33 × 8 + 64 × 8 =
+// 776`.
+// ---------------------------------------------------------------------------
+
+const RG_GROUP_BYTES: usize = 5 * 8 + 8 * 4 + 8 * 4;
+const RG_SHARD_BYTES: usize = 33 * 8 + 64 * 4 + 64 * 4;
+
+/// Distinct `(shard, group)` pairs `rows` touch in the fixture above — the
+/// oracle for `row_group_misses` on a cold cache.
+fn rg_distinct_groups(rows: &[u64]) -> u64 {
+    let mut keys: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|&r| ((r / 32) as usize, ((r % 32) / 4) as usize))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.len() as u64
+}
+
+fn rg_gather(backed: &BackedCsrReader, rows: &[u64]) -> Vec<(Vec<i32>, Vec<f32>)> {
+    let mut out: Vec<(Vec<i32>, Vec<f32>)> = vec![Default::default(); rows.len()];
+    backed
+        .read_rows_with(rows, |i, idx, data| {
+            out[i] = (idx.to_vec(), data.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    out
+}
+
+fn rg_assert_matches_full(out: &[(Vec<i32>, Vec<f32>)], rows: &[u64], full: &ScxCsr, ctx: &str) {
+    for (i, &row) in rows.iter().enumerate() {
+        let lo = full.indptr[row as usize] as usize;
+        let hi = full.indptr[row as usize + 1] as usize;
+        assert_eq!(out[i].0, full.indices[lo..hi], "{ctx}: indices row {row}");
+        assert_eq!(out[i].1, full.data[lo..hi], "{ctx}: data row {row}");
+    }
+}
+
+/// The headline: the second identical gather decodes nothing. Every touched
+/// group is a `row_group_hit`, `row_group_misses` does not move, the output is
+/// byte-identical to the first pass and to a full decode, the whole-shard
+/// counters stay at zero (the row-group path never touches that half), and
+/// `block_index_groups` still counts the cache-served groups as block-index
+/// route — the `read_scattered` gate floors depend on that.
+#[test]
+fn second_gather_is_served_from_the_row_group_lru() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::ShufDeltaZstd);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    let m = backed.enable_metrics();
+
+    // shard 0: rows 2, 5, 6 → groups {0, 1}; shard 1: 40, 41, 63 → {2, 7}.
+    let rows = [2u64, 5, 6, 40, 41, 63, 5];
+    let distinct = rg_distinct_groups(&rows);
+    assert_eq!(distinct, 4, "fixture premise");
+
+    let first = rg_gather(&backed, &rows);
+    rg_assert_matches_full(&first, &rows, &full, "pass 1");
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        distinct,
+        "cold: one decode per group"
+    );
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(m.block_index_groups.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        backed.cache_bytes_used(),
+        distinct as usize * RG_GROUP_BYTES
+    );
+
+    let second = rg_gather(&backed, &rows);
+    assert_eq!(
+        second, first,
+        "the cached groups must reproduce the decoded ones exactly"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        distinct,
+        "warm: nothing decoded again"
+    );
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        distinct,
+        "warm: every group served from the LRU"
+    );
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        4,
+        "a cache-served group is still the block-index route"
+    );
+    assert_eq!(m.full_shard_groups.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.hits.load(Ordering::Relaxed) + m.misses.load(Ordering::Relaxed),
+        0,
+        "the row-group path never touches the whole-shard counters"
+    );
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        (distinct as usize * RG_GROUP_BYTES) as u64
+    );
+    assert!(
+        !backed.cache_contains(0) && !backed.cache_contains(1),
+        "no whole shard was inserted"
+    );
+}
+
+/// Two readers share one cache; the key carries `file_id`, so file 1's row
+/// group `(shard 1, group 2)` is not file 0's. The files differ in `n_vars`,
+/// which changes the column indices of every row ≥ 30 — a key without
+/// `file_id` would hand file 1 file 0's groups and fail the identity check.
+#[test]
+fn row_group_lru_is_namespaced_by_file_id() {
+    use std::sync::atomic::Ordering;
+    let d0 = TempDir::new().unwrap();
+    let d1 = TempDir::new().unwrap();
+    let (p0, full0) = write_framed_file(&d0, 64, 100, 2, 4, CodecId::None);
+    let (p1, full1) = write_framed_file(&d1, 64, 60, 2, 4, CodecId::None);
+    let rows = [40u64, 41, 63];
+    {
+        // `sample_shard_data` indexes `(local_row * 2) % n_vars`, so the two
+        // files agree until a shard-local row reaches 30; row 63 (shard 1,
+        // local 31) is where the group `(1, 7)` genuinely differs.
+        let lo = full0.indptr[63] as usize;
+        assert_ne!(
+            full0.indices[lo..lo + 2],
+            full1.indices[lo..lo + 2],
+            "fixture premise: the two files differ at the same (shard, group)"
+        );
+    }
+
+    let shared = SharedShardCache::new(4, 1 << 20);
+    let r0 =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&p0).unwrap(), 0, Arc::clone(&shared));
+    let r1 =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&p1).unwrap(), 1, Arc::clone(&shared));
+    let m = shared.enable_metrics();
+
+    rg_assert_matches_full(&rg_gather(&r0, &rows), &rows, &full0, "file 0");
+    rg_assert_matches_full(&rg_gather(&r1, &rows), &rows, &full1, "file 1");
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        2 * rg_distinct_groups(&rows),
+        "each file decodes its own groups"
+    );
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        0,
+        "no cross-file hit"
+    );
+    // And each reader is warm for its own file.
+    rg_assert_matches_full(&rg_gather(&r0, &rows), &rows, &full0, "file 0 warm");
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        rg_distinct_groups(&rows)
+    );
+}
+
+/// Row groups are bounded by the byte budget: two gathers that each fit a
+/// two-and-a-half-group budget but together exceed it evict the older groups
+/// to admit the newer, the output stays exact, and the resident bytes never
+/// exceed the budget. (An entry larger than the whole budget would still be
+/// admitted — `put_with_budget`'s contract — so the budget here is
+/// deliberately more than one group.)
+#[test]
+fn row_group_lru_evicts_to_fit_the_budget() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    let budget = 2 * RG_GROUP_BYTES + RG_GROUP_BYTES / 2;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Shard 0 groups {0, 1}, then shard 1 groups {2, 7}: each gather fits, the
+    // union does not.
+    let a = [2u64, 5, 6];
+    let b = [40u64, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &a), &a, &full, "gather A");
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    rg_assert_matches_full(&rg_gather(&backed, &b), &b, &full, "gather B");
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 4);
+    assert!(
+        m.row_group_evictions.load(Ordering::Relaxed) >= 1,
+        "B's two groups on top of A's two through a 2.5-group budget must evict (evictions={})",
+        m.row_group_evictions.load(Ordering::Relaxed)
+    );
+    assert!(backed.cache_bytes_used() <= budget);
+    assert!(m.peak_bytes_in_cache.load(Ordering::Relaxed) as usize <= budget);
+
+    // Still exact once the cache is churning, and B (the newer) is what stayed.
+    rg_assert_matches_full(&rg_gather(&backed, &b), &b, &full, "B again");
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        2,
+        "B's groups survived A's eviction"
+    );
+    rg_assert_matches_full(&rg_gather(&backed, &a), &a, &full, "A again");
+    assert!(backed.cache_bytes_used() <= budget);
+}
+
+/// Admission: a gather whose row groups do not all fit the budget retains
+/// **nothing** — every group decodes and is dropped, no eviction, no resident
+/// bytes — instead of churning the LRU for zero hits (a scan larger than the
+/// cache). The very next gather that does fit is admitted as usual.
+#[test]
+fn over_budget_gather_bypasses_the_row_group_lru() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    let budget = 3 * RG_GROUP_BYTES;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Four groups through a three-group budget: bypass.
+    let big = [2u64, 5, 6, 40, 41, 63];
+    rg_assert_matches_full(
+        &rg_gather(&backed, &big),
+        &big,
+        &full,
+        "over budget, pass 1",
+    );
+    rg_assert_matches_full(
+        &rg_gather(&backed, &big),
+        &big,
+        &full,
+        "over budget, pass 2",
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        8,
+        "decoded twice — nothing retained"
+    );
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "not admitted"
+    );
+    assert_eq!(
+        m.row_group_evictions.load(Ordering::Relaxed),
+        0,
+        "and so nothing to evict"
+    );
+    assert_eq!(backed.cache_bytes_used(), 0);
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        4,
+        "the route is unchanged"
+    );
+
+    // Two groups through the same budget: admitted, and the repeat hits.
+    let small = [40u64, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "fits, pass 1");
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        2 * RG_GROUP_BYTES
+    );
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "fits, pass 2");
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 2);
+    assert_eq!(backed.cache_bytes_used(), 2 * RG_GROUP_BYTES);
+}
+
+/// `cache_shards` caps **whole shards** only. With a cap of one, resident row
+/// groups survive a whole-shard insert, and the second whole shard evicts the
+/// first (the LRU *shard*), not the groups.
+#[test]
+fn shard_count_cap_applies_to_whole_shards_only() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 1, 1 << 20);
+    let m = backed.enable_metrics();
+
+    let rows = [2u64, 5, 6, 40, 41, 63];
+    let _ = rg_gather(&backed, &rows);
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 4);
+    assert_eq!(backed.cache_bytes_used(), 4 * RG_GROUP_BYTES);
+
+    let _ = backed.read_shard_cached_arc(0).unwrap();
+    assert!(backed.cache_contains(0));
+    assert_eq!(
+        m.row_group_evictions.load(Ordering::Relaxed),
+        0,
+        "groups survive a shard insert"
+    );
+    assert_eq!(m.evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        backed.cache_bytes_used(),
+        4 * RG_GROUP_BYTES + RG_SHARD_BYTES
+    );
+
+    let _ = backed.read_shard_cached_arc(1).unwrap();
+    assert!(backed.cache_contains(1));
+    assert!(
+        !backed.cache_contains(0),
+        "cap 1: the older whole shard goes"
+    );
+    assert_eq!(m.evictions.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        m.row_group_evictions.load(Ordering::Relaxed),
+        0,
+        "the count cap must skip over the (older) row groups"
+    );
+    assert_eq!(
+        backed.cache_bytes_used(),
+        4 * RG_GROUP_BYTES + RG_SHARD_BYTES
+    );
+    assert_eq!(backed.cache_capacity(), 1);
+}
+
+/// A count-only reader (`BackedCsrReader::new`) does not get an unbounded
+/// row-group cache: its `cache_shards` is converted into the bytes that many
+/// of its largest shards would take, which bounds groups and never binds
+/// before the count cap for whole shards. A cache built externally with
+/// `usize::MAX` stays count-only and retains no groups at all.
+#[test]
+fn count_only_reader_bounds_groups_at_cache_shards_worth_of_bytes() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let rows = [2u64, 5, 6, 40, 41, 63];
+
+    let mut backed = BackedCsrReader::new(ScxReader::open(&path).unwrap(), 2);
+    assert_eq!(backed.cache_bytes_budget(), 2 * RG_SHARD_BYTES);
+    let m = backed.enable_metrics();
+    rg_assert_matches_full(&rg_gather(&backed, &rows), &rows, &full, "derived budget");
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        4,
+        "groups are retained"
+    );
+    // Whole-shard behaviour is unchanged: two shards fit the count cap and
+    // the derived bytes alike.
+    let _ = backed.read_shard_cached_arc(0).unwrap();
+    let _ = backed.read_shard_cached_arc(1).unwrap();
+    assert!(backed.cache_contains(0) && backed.cache_contains(1));
+    assert_eq!(m.evictions.load(Ordering::Relaxed), 0);
+
+    let shared = SharedShardCache::new(4, usize::MAX);
+    let mut counted =
+        BackedCsrReader::with_shared_cache(ScxReader::open(&path).unwrap(), 0, shared);
+    assert_eq!(counted.cache_bytes_budget(), usize::MAX);
+    let m2 = counted.enable_metrics();
+    rg_assert_matches_full(&rg_gather(&counted, &rows), &rows, &full, "count-only");
+    rg_assert_matches_full(
+        &rg_gather(&counted, &rows),
+        &rows,
+        &full,
+        "count-only again",
+    );
+    assert_eq!(
+        m2.row_group_misses.load(Ordering::Relaxed) + m2.row_group_hits.load(Ordering::Relaxed),
+        0,
+        "a count-only cache retains no row groups"
+    );
+    assert_eq!(
+        m2.block_index_groups.load(Ordering::Relaxed),
+        4,
+        "the route is unchanged"
+    );
+    assert_eq!(counted.cache_bytes_used(), 0);
+}
+
+/// Both off-switches — the per-reader gate and `cache_shards = 0` — leave the
+/// block-index route in place but retain nothing and move no `row_group_*`
+/// counter; the output is unchanged. This is the arm the same-build A/B
+/// capture runs (`SCX_ROW_GROUP_CACHE=0`).
+#[test]
+fn row_group_cache_off_decodes_uncached() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::ShufDeltaZstd);
+    let rows = [2u64, 5, 6, 40, 41, 63];
+
+    let mut gated =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    gated.set_row_group_cache(false);
+    let m = gated.enable_metrics();
+    rg_assert_matches_full(&rg_gather(&gated, &rows), &rows, &full, "gate off, pass 1");
+    rg_assert_matches_full(&rg_gather(&gated, &rows), &rows, &full, "gate off, pass 2");
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 0);
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(m.row_group_bytes_inserted.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.block_index_groups.load(Ordering::Relaxed),
+        4,
+        "route unchanged"
+    );
+    assert_eq!(gated.cache_bytes_used(), 0);
+
+    let mut uncached =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 0, 1 << 20);
+    let m = uncached.enable_metrics();
+    rg_assert_matches_full(&rg_gather(&uncached, &rows), &rows, &full, "no cache");
+    rg_assert_matches_full(
+        &rg_gather(&uncached, &rows),
+        &rows,
+        &full,
+        "no cache, again",
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed) + m.row_group_hits.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(m.block_index_groups.load(Ordering::Relaxed), 4);
+}
+
+/// The framing layout (header scalars, sub-stream ranges, resolved block index)
+/// is resolved once per shard and shared by every later read — the same `Arc`
+/// comes back, not a re-parse. An unframed file resolves to `None` per shard.
+#[test]
+fn framed_layout_is_resolved_once_per_shard() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let backed = BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+
+    let first = backed.framed_layout(0).expect("framed shard has a layout");
+    assert_eq!(first.spans.len(), 8, "32 rows / G=4");
+    assert_eq!(first.n_major, 32);
+    let again = backed.framed_layout(0).unwrap();
+    assert!(Arc::ptr_eq(&first, &again), "memoized, not re-resolved");
+
+    let rows = [2u64, 5, 6, 40, 41, 63];
+    let _ = rg_gather(&backed, &rows);
+    let _ = rg_gather(&backed, &rows);
+    let after = backed.framed_layout(0).unwrap();
+    assert!(Arc::ptr_eq(&first, &after), "the gathers re-used the memo");
+    assert!(backed.framed_layout(1).is_some());
+    assert!(
+        backed.framed_layout(2).is_none(),
+        "out of range: no shard, no layout"
+    );
+
+    let (unframed, _) = write_test_file_and_open(&dir, 64, 100, 4, 4);
+    for s in 0..4 {
+        assert!(unframed.framed_layout(s).is_none(), "unframed shard {s}");
+    }
+    assert_eq!(unframed.planned_row_group_bytes(0, &[1, 2]), 0);
+    assert_eq!(unframed.warm_row_groups(0, &[1, 2]).unwrap(), 0);
+}
+
+/// `read_rows(start, end)`'s narrow-window path goes through the same row-group
+/// LRU: the second identical window is all hits and byte-identical.
+#[test]
+fn read_rows_window_path_hits_the_row_group_lru() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::ShufDeltaZstd);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    let m = backed.enable_metrics();
+
+    // Rows 2..5 of shard 0: groups 0 (rows 0-3) and 1 (row 4); 3 × 4 < 32 so
+    // the window takes the row-range (block-index) plan.
+    let first = backed.read_rows(2, 5).unwrap();
+    let want = full.row_slice(2, 5).unwrap();
+    assert_eq!(first.indptr, want.indptr);
+    assert_eq!(first.indices, want.indices);
+    assert_eq!(first.data, want.data);
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert!(
+        !backed.cache_contains(0),
+        "a narrow window never decodes the whole shard"
+    );
+
+    let second = backed.read_rows(2, 5).unwrap();
+    assert_eq!(second.indices, first.indices);
+    assert_eq!(second.data, first.data);
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 2);
+}
+
+/// The L2 prefetcher sizes a warm from the block index before decoding:
+/// `planned_row_group_bytes` must equal what the LRU then charges, and
+/// `warm_row_groups` must leave the gather with nothing to decode.
+#[test]
+fn planned_row_group_bytes_matches_decoded_size_and_warm_feeds_the_gather() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::Zstd);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    let m = backed.enable_metrics();
+
+    // Shard 1, rows 40, 41, 63 → groups 2 and 7. Unsorted on purpose.
+    let rows = [63u64, 40, 41];
+    let planned = backed.planned_row_group_bytes(1, &rows);
+    assert_eq!(planned, 2 * RG_GROUP_BYTES);
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        0,
+        "planning decodes nothing"
+    );
+
+    assert_eq!(backed.warm_row_groups(1, &rows).unwrap(), 2);
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        planned
+    );
+    assert_eq!(backed.cache_bytes_used(), planned);
+
+    rg_assert_matches_full(&rg_gather(&backed, &rows), &rows, &full, "after warm");
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        2,
+        "the gather decoded nothing"
+    );
+    assert_eq!(m.row_group_hits.load(Ordering::Relaxed), 2);
+    assert_eq!(m.block_index_groups.load(Ordering::Relaxed), 1);
+
+    // A row outside the shard is an error, as on the gather.
+    assert!(backed.warm_row_groups(1, &[5]).is_err());
+    assert!(backed.warm_row_groups(0, &[64]).is_err());
+}
+
+/// A non-admitted gather still serves resident groups as hits — admission only
+/// stops *misses* from being inserted — and its misses decode uncached with no
+/// singleflight slot (the leader of a slot that inserts nothing would make
+/// every waiter re-decode in turn; review on #528).
+#[test]
+fn bypassed_gather_still_hits_resident_groups() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let budget = 3 * RG_GROUP_BYTES;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Two groups admitted (they fit).
+    let small = [40u64, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "fits");
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        2 * RG_GROUP_BYTES
+    );
+
+    // Four groups, over budget: the two resident ones are hits, the other two
+    // decode and drop; nothing is inserted or evicted.
+    let big = [2u64, 5, 6, 40, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &big), &big, &full, "over budget");
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        2,
+        "resident groups served"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        4,
+        "2 admitted + 2 uncached"
+    );
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        2 * RG_GROUP_BYTES
+    );
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(backed.cache_bytes_used(), 2 * RG_GROUP_BYTES);
+}
+
+/// `read_rows(start, end)`'s window path applies the same admission: a window
+/// whose groups do not fit the budget decodes and drops rather than evicting
+/// everything to retain them (review on #528: row groups are fixed-height, not
+/// fixed-nnz, so "a quarter of the rows" is not "a quarter of the bytes").
+#[test]
+fn read_rows_window_over_budget_is_not_retained() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    // Budget holds one group; rows 2..5 touch two.
+    let budget = RG_GROUP_BYTES + RG_GROUP_BYTES / 2;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    let got = backed.read_rows(2, 5).unwrap();
+    let want = full.row_slice(2, 5).unwrap();
+    assert_eq!(got.indices, want.indices);
+    assert_eq!(got.data, want.data);
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "not retained"
+    );
+    assert_eq!(backed.cache_bytes_used(), 0);
+
+    // A one-group window fits and is retained.
+    let _ = backed.read_rows(0, 3).unwrap();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES
+    );
+}
+
+/// `read_rows` takes one admission verdict over every row-range window of the
+/// read (review on #528 round 2): two edge windows that each fit the budget
+/// but not together would otherwise evict each other on every repeat of the
+/// same read.
+#[test]
+fn read_rows_edge_windows_are_admitted_together() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    // Budget holds one group and a half; rows 30..34 are one group in each
+    // shard (shard 0 rows 30-31 → group 7, shard 1 rows 0-1 → group 0).
+    let budget = RG_GROUP_BYTES + RG_GROUP_BYTES / 2;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    let got = backed.read_rows(30, 34).unwrap();
+    let want = full.row_slice(30, 34).unwrap();
+    assert_eq!(got.indices, want.indices);
+    assert_eq!(got.data, want.data);
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        2,
+        "two windows, two groups"
+    );
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "each window fits alone, the pair does not: neither is retained"
+    );
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(backed.cache_bytes_used(), 0);
+
+    // A single-window read of one of them fits and is retained.
+    let _ = backed.read_rows(30, 32).unwrap();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES
+    );
+}
+
+/// Sizing a plan's row groups must not resolve framing layouts when the route
+/// is statically off (review on #528 round 3): the cell-set loader defaults
+/// `scatter_block_index` off, and its default path gained no new per-shard
+/// header/block-index work from the admission sum.
+#[test]
+fn planned_row_group_bytes_is_zero_with_the_route_off() {
+    let dir = TempDir::new().unwrap();
+    let (path, _full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    assert!(
+        backed.planned_row_group_bytes(1, &[40, 41, 63]) > 0,
+        "premise: route on"
+    );
+
+    let mut off =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, 1 << 20);
+    off.set_scatter_block_index(false);
+    assert_eq!(off.planned_row_group_bytes(1, &[40, 41, 63]), 0);
+    assert_eq!(
+        off.warm_row_groups(1, &[40, 41, 63]).unwrap(),
+        0,
+        "nothing to warm into either"
+    );
+    // Whole-shard sizing is independent of the route.
+    assert_eq!(backed.shard_decoded_bytes(0), RG_SHARD_BYTES);
+    let _ = &mut backed;
 }

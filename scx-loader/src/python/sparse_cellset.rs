@@ -94,13 +94,16 @@ impl SparseCellSetDataset {
     ///         from cache; True decodes only the touched row-groups per batch.
     ///         Off by default because the cell-set regime is cache-*friendly*
     ///         (sorted data + a reused control pool → a small working set that
-    ///         fits the shard cache and is touched most batches), and the
-    ///         block-index predicate keys on `!cache.contains()`, so a hot shard
-    ///         stays eligible forever, is re-decoded every batch, and the LRU
-    ///         never populates. Measured on a 50-file Tahoe atlas: steps/s
-    ///         2.80 → 4.55 and gather 337 ms → ~5 ms with it off, at ≈ .h5ad
-    ///         parity. Pass True for a genuinely cache-hostile run (working set
-    ///         ≫ cache), where the row-group-scoped decode's bounded peak RAM is
+    ///         fits the shard cache and is touched most batches). Measured on
+    ///         a 50-file Tahoe atlas: steps/s 2.80 → 4.55 and gather 337 ms →
+    ///         ~5 ms with it off, at ≈ .h5ad parity — measured **before**
+    ///         OPT-FORMATIO-1, when the row-group path retained nothing and so
+    ///         re-decoded a hot shard's groups every batch. The touched groups
+    ///         now stay in the same LRU under the same byte budget
+    ///         (`cache_metrics()["row_group_hits"]`), so the gap is expected
+    ///         to be much smaller; the default stays False until re-measured.
+    ///         Pass True for a genuinely cache-hostile run (working set ≫
+    ///         cache), where the row-group-scoped decode's bounded peak RAM is
     ///         the memory-safe choice. `SCX_SCATTER_BLOCK_INDEX=0` is the
     ///         process-wide reader-layer kill-switch over both settings.
     #[new]
@@ -399,8 +402,11 @@ impl SparseCellSetDataset {
     /// construction (the multi-file sibling of `IndexPlanDataset.cache_metrics`).
     /// Returns a dict with keys: `hits`, `misses` (= shard decodes), `evictions`,
     /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`,
-    /// `full_shard_groups`, `block_index_groups`. All `int`; atomic, lock-free —
-    /// sample as often as you like.
+    /// `full_shard_groups`, `block_index_groups`, and the `row_group_*` set
+    /// (`hits`, `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`)
+    /// for the decoded row groups a framed `scatter_block_index=True` gather
+    /// retains — `hits` … `duplicate_waiters` themselves keep meaning whole
+    /// shards. All `int`; atomic, lock-free — sample as often as you like.
     ///
     /// The last two are the **route** this dataset's gathers actually took:
     /// `block_index_groups > 0` proves the row-group path ran, and
@@ -508,7 +514,9 @@ impl SparseCellSetBatchIter {
     ///
     /// ```text
     /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters,
-    ///            peak_bytes_in_cache, full_shard_groups, block_index_groups},
+    ///            peak_bytes_in_cache, full_shard_groups, block_index_groups,
+    ///            row_group_hits, row_group_misses, row_group_evictions,
+    ///            row_group_bytes_inserted, row_group_duplicate_waiters},
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,

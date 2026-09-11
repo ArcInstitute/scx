@@ -106,13 +106,13 @@ fn rows_of(plan: &Plan) -> Vec<(u32, u64)> {
 /// Takes the plan **by value**, matching `ProcFn` since ORG-9.10-1: the queue
 /// is the plan's last owner, so a consumer that needs to consume or reorder it
 /// (the pair loader sorts in place) does not have to clone per batch.
-fn gather(engine: &PrefetchEngine, plan: Plan) -> Result<Vec<(i32, f32)>> {
+fn gather(engine: &PrefetchEngine, plan: Plan, admit_row_groups: bool) -> Result<Vec<(i32, f32)>> {
     let mut out = Vec::with_capacity(plan.len());
     for &(fid, row) in &plan {
         let mut got: Option<(i32, f32)> = None;
         engine
             .reader(fid)
-            .read_rows_with(&[row], |_pos, idx, data| {
+            .read_rows_with_admission(&[row], Some(admit_row_groups), |_pos, idx, data| {
                 got = idx.first().copied().zip(data.first().copied());
                 Ok(())
             })
@@ -522,6 +522,18 @@ pub(crate) fn framed_expected(row: u64) -> (i32, f32) {
 /// side. It has one now (9b), so this is the production constructor with the
 /// gate passed through, which is what makes these tests cover the real path.
 fn framed_engine(dir: &std::path::Path, scatter_block_index: bool) -> Arc<PrefetchEngine> {
+    // `usize::MAX` is a count-only cache: it retains no row groups (see
+    // `ShardCache::caches_groups`), so these engines exercise the block-index
+    // route without the row-group LRU. The row-group tests below pass a
+    // finite budget.
+    framed_engine_with_budget(dir, scatter_block_index, usize::MAX)
+}
+
+fn framed_engine_with_budget(
+    dir: &std::path::Path,
+    scatter_block_index: bool,
+    bytes_budget: usize,
+) -> Arc<PrefetchEngine> {
     let path = dir.join("framed.scx");
     write_framed_fixture(&path);
     PrefetchEngine::from_scx_readers(
@@ -530,11 +542,17 @@ fn framed_engine(dir: &std::path::Path, scatter_block_index: bool) -> Arc<Prefet
         // is the only thing that decides whether they warm.
         /*cache_shards*/
         8,
-        usize::MAX,
+        bytes_budget,
         /*default_lookahead*/ 4,
         scatter_block_index,
     )
 }
+
+/// Bytes one decoded row group of the framed fixture occupies in the LRU:
+/// `FRAMED_ROW_GROUP_ROWS` rows at one non-zero each — `(16 + 1) × 8 + 16 × 4 +
+/// 16 × 4`. The row-group warm tests size their budgets from it.
+pub(crate) const FRAMED_GROUP_BYTES: usize =
+    (FRAMED_ROW_GROUP_ROWS as usize + 1) * 8 + FRAMED_ROW_GROUP_ROWS as usize * 8;
 
 /// **Pin (ORG-9.10-1, drift (a)/L2).** The engine's prefetch must NOT warm a
 /// shard whose group is block-index-eligible — leaving it undecoded is what
@@ -608,7 +626,7 @@ fn engine_does_not_warm_a_block_index_eligible_shard() {
         assert!(
             !engine.reader(0).cache_contains(sidx),
             "shard {sidx} must still be cold: the block-index path decodes row \
-             groups without populating the shard LRU"
+             groups without inserting the whole shard into the LRU"
         );
     }
 }
@@ -998,4 +1016,328 @@ fn drop_does_not_keep_pulling_from_an_endless_plan_generator() {
         elapsed < std::time::Duration::from_secs(5),
         "drop took {elapsed:?}"
     );
+}
+
+/// **OPT-FORMATIO-1, the L2 half.** A block-index-eligible shard is still
+/// never warmed *whole* (`prefetch_skipped_block_index` counts it, the
+/// whole-shard LRU stays cold — the pin above is untouched), but when the
+/// plan's row groups fit `budget / (lookahead + 1)` the prefetcher pre-decodes
+/// them into the shard LRU, and the gather serves every one as a
+/// `row_group_hit`. The same single plan at `lookahead = 0` (no prefetch at
+/// all) decodes the same groups on the gather instead — one plan, not two,
+/// because a second identical plan would hit through L1 regardless of what
+/// the prefetcher did.
+#[test]
+fn engine_warms_row_groups_for_an_eligible_plan() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    // One row in each of shards 0..3 → one group per shard, 4 groups.
+    let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    let planned = 4 * FRAMED_GROUP_BYTES;
+    // Fits its share with lookahead 4: budget / 5 ≥ planned.
+    let budget = 8 * planned;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+    assert_eq!(
+        engine.reader(0).cache_bytes_budget(),
+        budget,
+        "premise: finite budget"
+    );
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want.clone()], "the gather must still be correct");
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_block_index
+            .load(AtomicOrdering::Relaxed),
+        4,
+        "still counted as block-index eligible — the counter is a contract"
+    );
+    assert_eq!(
+        iter_metrics
+            .prefetch_tasks_spawned
+            .load(AtomicOrdering::Relaxed),
+        0,
+        "a row-group warm is not a whole-shard spawn (the four-way partition holds)"
+    );
+    for sidx in 0..4 {
+        assert!(
+            !engine.reader(0).cache_contains(sidx),
+            "shard {sidx} must not be resident whole"
+        );
+    }
+    assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 0);
+    assert!(m.block_index_groups.load(AtomicOrdering::Relaxed) > 0);
+    assert_eq!(
+        m.row_group_misses.load(AtomicOrdering::Relaxed),
+        4,
+        "the prefetcher decoded each touched group once"
+    );
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed),
+        4,
+        "the gather found every group already resident"
+    );
+    assert_eq!(m.row_group_evictions.load(AtomicOrdering::Relaxed), 0);
+
+    // lookahead = 0: no prefetch ran, so the gather itself decodes the groups.
+    let dir0 = tempfile::tempdir().unwrap();
+    let engine0 = framed_engine_with_budget(dir0.path(), true, budget);
+    let out0: Vec<_> = Arc::clone(&engine0)
+        .iter_with_plans(into_iter(vec![plan.clone()]), 0, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out0, vec![want]);
+    let m0 = engine0.cache_metrics();
+    assert_eq!(m0.row_group_misses.load(AtomicOrdering::Relaxed), 4);
+    assert_eq!(
+        m0.row_group_hits.load(AtomicOrdering::Relaxed),
+        0,
+        "nothing pre-decoded them: a hit here would mean a warm ran at lookahead 0"
+    );
+}
+
+/// The negative arm: a plan whose row groups do **not** fit their share of the
+/// budget is neither warmed nor retained. The verdict is one per plan and
+/// reaches the gather through `process`'s third argument, so the L1 gather
+/// bypasses the LRU too — the budget is chosen so the whole plan fits the
+/// *cache* (an L1-only rule against the full budget would admit it) but not
+/// `budget / (lookahead + 1)`. Falsifiers: a warm that ran anyway shows up as
+/// hits; a gather that admitted on its own shows up as inserted bytes.
+#[test]
+fn engine_bypasses_row_groups_over_their_budget_share() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    let planned = 4 * FRAMED_GROUP_BYTES;
+    // 2 × planned holds every group, but / 5 is under it.
+    let budget = 2 * planned;
+    assert!(
+        budget / 5 < planned && budget >= planned,
+        "premise: fits the cache, not the share"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_block_index
+            .load(AtomicOrdering::Relaxed),
+        4
+    );
+    assert_eq!(
+        m.row_group_misses.load(AtomicOrdering::Relaxed),
+        4,
+        "the gather decoded them"
+    );
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed),
+        0,
+        "no warm ran: the plan's groups exceed budget / (lookahead + 1)"
+    );
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "and the gather did not retain them either — one verdict per plan"
+    );
+    assert_eq!(engine.reader(0).cache_bytes_used(), 0);
+}
+
+/// **Review on #528 (Antigravity, codex).** The admission verdict is over the
+/// whole plan, not per file: two files each fit `budget / (lookahead + 1)` on
+/// their own, their union does not, and the shared cache sees the union. A
+/// per-file verdict warmed and retained both halves and let them evict each
+/// other. Falsifier: `row_group_bytes_inserted > 0` (or any hit) means a
+/// per-file decision admitted.
+#[test]
+fn engine_admits_row_groups_per_plan_not_per_file() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    let p1 = dir.path().join("f1.scx");
+    write_framed_fixture(&p0);
+    write_framed_fixture(&p1);
+    // One row in each of shards 0..3 of BOTH files: 4 groups per file.
+    let per_file = 4 * FRAMED_GROUP_BYTES;
+    // share ∈ [per_file, 2 × per_file): each file fits, the union does not.
+    let budget = 5 * (per_file + per_file / 2);
+    assert!(
+        budget / 5 >= per_file && budget / 5 < 2 * per_file,
+        "premise"
+    );
+    let engine = PrefetchEngine::from_scx_readers(
+        vec![ScxReader::open(&p0).unwrap(), ScxReader::open(&p1).unwrap()],
+        8,
+        budget,
+        4,
+        true,
+    );
+    let plan: Plan = vec![
+        (0u32, 5u64),
+        (0, 70),
+        (0, 140),
+        (0, 200),
+        (1, 5),
+        (1, 70),
+        (1, 140),
+        (1, 200),
+    ];
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_block_index
+            .load(AtomicOrdering::Relaxed),
+        8,
+        "all eight (file, shard) buckets are block-index eligible"
+    );
+    assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 8);
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed)
+            + m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "the union is over the share: nothing warmed, nothing retained"
+    );
+
+    // Control: the same plan on one file alone fits, is warmed, and hits.
+    let dir1 = tempfile::tempdir().unwrap();
+    let engine1 = framed_engine_with_budget(dir1.path(), true, budget);
+    let half: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    let want1: Vec<(i32, f32)> = half.iter().map(|&(_, r)| framed_expected(r)).collect();
+    let out1: Vec<_> = Arc::clone(&engine1)
+        .iter_with_plans(into_iter(vec![half]), 4, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out1, vec![want1]);
+    let m1 = engine1.cache_metrics();
+    assert_eq!(
+        m1.row_group_hits.load(AtomicOrdering::Relaxed),
+        4,
+        "control: one file fits and hits"
+    );
+}
+
+/// **Review on #528 round 2 (codex).** The plan's admission sum must not key
+/// on whole-shard residency: a shard resident whole while the plan is queued
+/// can be evicted before the plan is gathered, and the gather then takes the
+/// row-group path for bytes a residency-filtered sum never counted. So the sum
+/// counts every framed shard the plan touches. Here shard 0 is resident whole;
+/// three groups fit the share, four do not — a residency-filtered sum (3
+/// groups) would admit and retain, the residency-free one refuses. Falsifier:
+/// any `row_group_bytes_inserted`.
+#[test]
+fn plan_admission_counts_resident_shards_too() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    // share ∈ [3, 4) groups.
+    let budget = 5 * (3 * FRAMED_GROUP_BYTES + FRAMED_GROUP_BYTES / 2);
+    assert!(
+        budget / 5 >= 3 * FRAMED_GROUP_BYTES && budget / 5 < 4 * FRAMED_GROUP_BYTES,
+        "premise"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+    // Shard 0 resident whole before the plan is queued.
+    let _ = engine.reader(0).read_shard_cached_arc(0).unwrap();
+    assert!(
+        engine.reader(0).cache_contains(0),
+        "premise: shard 0 is resident"
+    );
+
+    let out: Vec<_> = Arc::clone(&engine)
+        .iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "the resident shard's groups count toward the plan, so four groups do not fit the share"
+    );
+    assert_eq!(m.row_group_hits.load(AtomicOrdering::Relaxed), 0);
+    assert_eq!(
+        m.row_group_misses.load(AtomicOrdering::Relaxed),
+        3,
+        "the three non-resident shards decode their group uncached; shard 0 is sliced whole"
+    );
+    assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 1);
+}
+
+/// **Review on #528 round 3 (codex).** The plan's footprint is both kinds of
+/// entry, because they share one budget: a mixed plan whose row groups fit the
+/// share on their own but not next to the shard it takes **whole** would evict
+/// one with the other on every repeat. Shard 0 is dense (16 rows of 64 → the
+/// whole-shard route, ≈1 KB) but those 16 rows are **consecutive**, so they
+/// are one 264-byte group — the row-group sum alone cannot trip the share, only
+/// the whole-shard term can; shard 1 contributes one more group. The share
+/// holds the two groups but not groups + shard. Falsifier: a sum that omits
+/// the whole shard admits and inserts (confirmed by mutating the term out).
+#[test]
+fn plan_admission_counts_the_plans_whole_shards_too() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let mut plan: Plan = (0..16u64).map(|i| (0u32, i)).collect();
+    plan.push((0, 70)); // shard 1, one group
+    let shard_bytes = (64 + 1) * 8 + 64 * 8; // FRAMED fixture: 64 rows, 1 nnz/row
+                                             // share ∈ [2 groups, 2 groups + 1 shard).
+    let share = 2 * FRAMED_GROUP_BYTES + shard_bytes / 2;
+    let budget = 5 * share;
+    assert!(
+        budget / 5 >= 2 * FRAMED_GROUP_BYTES && budget / 5 < 2 * FRAMED_GROUP_BYTES + shard_bytes,
+        "premise"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = framed_engine_with_budget(dir.path(), true, budget);
+    assert_eq!(
+        engine.reader(0).shard_decoded_bytes(0),
+        shard_bytes,
+        "premise: shard size"
+    );
+    assert!(
+        !engine.reader(0).block_index_eligible(0, 16),
+        "premise: shard 0 is dense and takes the whole-shard route"
+    );
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        iter_metrics
+            .prefetch_tasks_spawned
+            .load(AtomicOrdering::Relaxed),
+        1,
+        "shard 0 was warmed whole"
+    );
+    assert!(engine.reader(0).cache_contains(0));
+    // The test gather is one `read_rows_with` per plan row: sixteen sliced from
+    // the resident whole shard, one through the row-group route.
+    assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 16);
+    assert_eq!(m.block_index_groups.load(AtomicOrdering::Relaxed), 1);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "the group fits the share alone but not beside the whole shard the plan also warms"
+    );
+    assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 1);
 }

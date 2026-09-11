@@ -17,8 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use lru::LruCache;
@@ -45,7 +44,11 @@ mod index;
 // from `lib.rs`. The split has to keep every one of them resolving, so
 // everything reachable at `backed::<name>` before is re-exported here at the
 // same visibility.
+pub(crate) use cache::csr_component_bytes;
 pub use cache::{CacheMetrics, ShardCache, SharedShardCache, SizeHint};
+// The key/kind types stay in `cache`: `SharedShardCache` names them, but no
+// caller outside this module spells them (review on #528).
+pub(super) use cache::{CacheKey, CacheKind};
 pub use csc::{BackedCscIndex, BackedCscReader};
 pub use csr::BackedCsrReader;
 pub use dense::BackedDenseReader;
@@ -64,6 +67,20 @@ pub fn scatter_block_index_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("SCX_SCATTER_BLOCK_INDEX")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true)
+    })
+}
+
+/// Process-wide switch for retaining decoded **row groups** in the shard LRU
+/// (OPT-FORMATIO-1). Default on; `SCX_ROW_GROUP_CACHE=0` (or `false`) makes a
+/// framed scattered read decode its touched groups and drop them, as it did
+/// before the row-group entries existed — the same-build A/B arm for the
+/// `read_scattered` capture. Read once per process.
+pub fn row_group_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("SCX_ROW_GROUP_CACHE")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true)
     })

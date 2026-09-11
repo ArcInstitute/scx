@@ -42,6 +42,26 @@ pub(super) fn cache_metrics_to_pydict<'py>(
         "block_index_groups",
         m.block_index_groups.load(Ordering::Relaxed),
     )?;
+    // The row-group LRU entries a framed scattered read retains
+    // (OPT-FORMATIO-1). Separate from `hits` / `misses`, which keep meaning
+    // the whole-shard LRU.
+    dict.set_item("row_group_hits", m.row_group_hits.load(Ordering::Relaxed))?;
+    dict.set_item(
+        "row_group_misses",
+        m.row_group_misses.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "row_group_evictions",
+        m.row_group_evictions.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "row_group_bytes_inserted",
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "row_group_duplicate_waiters",
+        m.row_group_duplicate_waiters.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 

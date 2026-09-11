@@ -932,11 +932,25 @@ def _slurm_setup_cmds(env_name: str | None = None, format_key: str | None = None
     # (io/decode/reduction/marshalling → `runs[].extra["cpu_profile_*"]`); it is
     # read once at profiler init, so it must be exported before the worker
     # imports pyscx — hence forward it here like the other runtime knobs.
+    # `SCX_ROW_GROUP_CACHE` / `SCX_SCATTER_BLOCK_INDEX` are the reader-layer
+    # kill-switches for the row-group LRU (OPT-FORMATIO-1) and the block-index
+    # scattered path; both are `OnceLock`-cached per process, so a same-build
+    # A/B (`SCX_ROW_GROUP_CACHE=0 capture_baseline.py ...`) only selects its
+    # arm if the value reaches the worker before it imports pyscx. Recorded in
+    # the snapshot's `environment.json` so the arm is legible after the fact.
+    # `PYTHONPATH` is forwarded so an orchestrator can point every worker at a
+    # specific pyscx checkout (`PYTHONPATH=<repo>/pyscx/python`) without
+    # reinstalling anything into the shared conda env — the env has carried a
+    # wheel from an earlier branch A/B before, and `environment.json` now
+    # records `pyscx.file` so a snapshot says which build it measured.
     for var in ("GCS_TEST_BUCKET", "GCP_PROJECT", "GCP_BUCKET_REGION",
                 "SCX_DATA_DIR", "SCX_WORK_DIR",
                 "SCX_DISABLE_CUDA_GRAPHS",
                 "SCX_CPU_PROFILE",
-                "SCX_BENCH_WITH_CSC"):
+                "SCX_BENCH_WITH_CSC",
+                "SCX_ROW_GROUP_CACHE",
+                "SCX_SCATTER_BLOCK_INDEX",
+                "PYTHONPATH"):
         val = os.environ.get(var, "").strip()
         if val:
             val = os.path.expanduser(val) if "DIR" in var else val

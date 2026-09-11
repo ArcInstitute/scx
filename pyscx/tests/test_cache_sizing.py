@@ -31,8 +31,10 @@ def multishard_path(tmp_path):
 
     **Unframed is load-bearing.** Framing (the default) routes a scattered gather
     through the block-index path, which decodes only the touched row-groups and
-    never populates the whole-shard LRU — so a framed fixture cannot thrash and
-    these tests would pass vacuously.
+    never inserts a whole shard — the row groups it retains report through the
+    `row_group_*` counters, not `hits`/`misses`/`evictions` — so a framed
+    fixture cannot thrash the whole-shard counters these tests read and they
+    would pass vacuously.
     """
     import anndata
 

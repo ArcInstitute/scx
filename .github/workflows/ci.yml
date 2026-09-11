@@ -525,17 +525,26 @@ jobs:
       # `stale_csc_sidecar_is_refused_on_every_reader_csc_path`, which runs both
       # the framed and unframed arms. The grep is a structural tripwire layered
       # over that test, not a replacement for it.
+      # The block-index decode's guard lives in reader/framed_layout.rs since
+      # OPT-FORMATIO-1: `framed_shard_layout` runs it once per resolved layout,
+      # and every block-index path — `decode_block_index_row_runs` and
+      # `BackedCsrReader::framed_layout`'s memo — resolves through it. Both
+      # files are scanned so the count sees the guard where it now is.
       - name: Every shard-decode entry point guards CSC sidecar freshness
         run: |
           set -e
-          prod() { sed '/#\[cfg(test)\]/,$d' scx-format-io/src/reader/matrix.rs; }
-          if ! prod | grep -qE 'fn guard_csc_sidecar_fresh'; then
+          prod() {
+            for f in matrix framed_layout; do
+              sed '/#\[cfg(test)\]/,$d' "scx-format-io/src/reader/$f.rs"
+            done
+          }
+          if ! sed '/#\[cfg(test)\]/,$d' scx-format-io/src/reader/matrix.rs | grep -qE 'fn guard_csc_sidecar_fresh'; then
             echo "::error::reader/matrix.rs no longer defines guard_csc_sidecar_fresh (§4.7)."
             exit 1
           fi
           n=$(prod | grep -cE 'self\.guard_csc_sidecar_fresh\(' || true)
           if [ "$n" -lt 4 ]; then
-            echo "::error::guard_csc_sidecar_fresh has $n call sites in production code, expected at least 4 (read_shard_from_entry_inner, read_shard_from_entry_native, read_shard_indptr_from_entry, decode_block_index_row_runs). A decode path that skips it serves a stale sidecar (§4.7)."
+            echo "::error::guard_csc_sidecar_fresh has $n call sites in production code across reader/matrix.rs + reader/framed_layout.rs, expected at least 4 (read_shard_from_entry_inner, read_shard_from_entry_native, read_shard_indptr_from_entry, framed_shard_layout — the block-index decodes resolve through the last). A decode path that skips it serves a stale sidecar (§4.7)."
             exit 1
           fi
 

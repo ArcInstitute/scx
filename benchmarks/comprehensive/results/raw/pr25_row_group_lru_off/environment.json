@@ -1,0 +1,58 @@
+{
+  "captured_at": "2026-09-10T22:42:42-0700",
+  "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
+  "git_branch": "pr25-row-group-lru",
+  "git_dirty": true,
+  "git_describe": "pyscx-v0.18.0-16-g0f86625b",
+  "determinism_env": {
+    "RAYON_NUM_THREADS": "unset",
+    "OMP_NUM_THREADS": "unset",
+    "MKL_NUM_THREADS": "unset",
+    "SCX_ROW_GROUP_CACHE": "0",
+    "SCX_SCATTER_BLOCK_INDEX": "unset"
+  },
+  "system": {
+    "hostname": "GPUCACE",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu_cores_physical": 192,
+    "ram_gb": 1007,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": true
+    },
+    "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
+      "nvidia_fs_loaded": false
+    }
+  },
+  "pyscx": {
+    "version": "0.18.0",
+    "file": "/home/nickyoungblut/dev/rust/scx/pyscx/python/pyscx/__init__.py"
+  },
+  "snapshot_name": "candidate_pr25_rg_off_0f86625"
+}

@@ -53,10 +53,12 @@ from benchmarks.comprehensive.runners import make_runner
 logger = logging.getLogger(__name__)
 
 
-# Framed compact-trial variants only. `scx_auto` is monolithic/unframed
-# (block_index_groups would always be 0), so it is deliberately excluded — the
-# adoption floor requires a framed fixture. Read by `run_parallel.py`'s cohort
-# builder and re-checked at the top of `run()` (defense-in-depth).
+# Framed compact-trial variants only. The adoption floors are pinned on the
+# explicit row-group geometries G=128..1024 — the `scx_auto` fixtures are framed
+# too since the v4 reconvert (`scx info` reports `format_version: 4`; the
+# `index_plan` benchmark exercises the row-group path on them), but they are
+# not a G sweep, so they stay out of this benchmark. Read by `run_parallel.py`'s
+# cohort builder and re-checked at the top of `run()` (defense-in-depth).
 SUPPORTED_FORMATS: frozenset[str] = frozenset(
     {
         "scx_compact_trial_g128",
@@ -69,14 +71,21 @@ SUPPORTED_FORMATS: frozenset[str] = frozenset(
 # Scattered plans: small per-batch pair count so each shard is touched sparsely
 # (the block-index win regime — a handful of rows out of a ~16k-row shard).
 _DEFAULT_PAIRS_PER_BATCH = 256
-# Batch/run counts are scaled DOWN for large datasets: with the sidecar off +
-# prefetch skipped, every batch re-decodes the touched row-groups (no shard cache
-# reuse), and on a broadly-scattered plan each of the ~512 rows lands in a
-# distinct row-group, so a single batch can decode ~512 groups of G rows —
-# measured at 2–3.5 s/batch on smartseq2/tabula (a deliberate worst-case; real
-# training uses locality + caching). A fixed 200×5 batches×runs blows the
-# tier-small 240 s job budget. The knobs below keep the per-cell wall well under
-# it while still proving adoption (`block_index_groups`) and giving a rough p50.
+# Batch/run counts are scaled DOWN for large datasets: on a broadly-scattered
+# plan each of the ~512 rows lands in a distinct row-group, so a single batch
+# can decode ~512 groups of G rows — measured at 2–3.5 s/batch on
+# smartseq2/tabula before OPT-FORMATIO-1, when every batch re-decoded the
+# touched groups (nothing retained them). The groups now stay in the shard LRU
+# under `max_memory_mb` — but only when a batch's groups fit it: the loader's
+# auto-tune grants this benchmark `effective_cache_shards=2` on the multi-shard
+# datasets (`max_memory_mb=8192` less the `max_plan_size` batch buffers), i.e.
+# ≈435 MB on tabula against ≈890 MB of groups per batch, so there the gather
+# bypasses the LRU (`row_group_hit_rate` 0, no churn) and only pbmc3k, whose
+# eleven groups fit, is served as hits (99%). `SCX_ROW_GROUP_CACHE=0` restores
+# the pre-change regime for a same-build A/B. A fixed 200×5 batches×runs blew the
+# tier-small 240 s job budget in that regime, and the knobs are kept so the two
+# arms stay comparable while still proving adoption (`block_index_groups`) and
+# giving a p50.
 _MAX_N_BATCHES = 50
 _MIN_N_BATCHES = 12
 # Datasets at/above this get the reduced (2) timed-run count.
@@ -195,8 +204,26 @@ def _one_run(scx_path: str, n_obs: int, pairs_per_batch: int, n_batches: int) ->
         sidecar_groups = int(cm.get("sidecar_groups", 0))
         full_shard_groups = int(cm.get("full_shard_groups", 0))
         block_index_groups = int(cm.get("block_index_groups", 0))
+        row_group_hits = int(cm.get("row_group_hits", 0))
+        row_group_misses = int(cm.get("row_group_misses", 0))
     except Exception:
         sidecar_groups = full_shard_groups = block_index_groups = None
+        row_group_hits = row_group_misses = None
+
+    # Row-group LRU effectiveness (OPT-FORMATIO-1): the share of group lookups
+    # the gather served without a decode. `None` when the path never ran (an
+    # unframed file, or the whole-shard route) — as for the adoption rate, an
+    # absent metric must not read as a 0.0 floor failure.
+    if (
+        row_group_hits is None
+        or row_group_misses is None
+        or (row_group_hits + row_group_misses) == 0
+    ):
+        row_group_hit_rate = None
+    else:
+        row_group_hit_rate = round(
+            row_group_hits / (row_group_hits + row_group_misses), 4
+        )
 
     # Steady-state latency: drop the first interval (prefetch fill + lazy
     # tokio-runtime spin-up, not steady-state gather).
@@ -229,6 +256,9 @@ def _one_run(scx_path: str, n_obs: int, pairs_per_batch: int, n_batches: int) ->
         "full_shard_groups": full_shard_groups,
         "sidecar_groups": sidecar_groups,
         "block_index_adoption_rate": adoption_rate,
+        "row_group_hits": row_group_hits,
+        "row_group_misses": row_group_misses,
+        "row_group_hit_rate": row_group_hit_rate,
     }
 
 
@@ -291,6 +321,9 @@ def run(
             full_shard_groups=m["full_shard_groups"],
             sidecar_groups=m["sidecar_groups"],
             block_index_adoption_rate=m["block_index_adoption_rate"],
+            row_group_hits=m["row_group_hits"],
+            row_group_misses=m["row_group_misses"],
+            row_group_hit_rate=m["row_group_hit_rate"],
             n_batches=m["n_batches"],
         )
 

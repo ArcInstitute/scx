@@ -1,0 +1,124 @@
+{
+  "schema_version": 2,
+  "benchmark": "read_scattered",
+  "format": "scx_compact_trial_g256",
+  "dataset": "pbmc3k",
+  "timestamp": "2026-09-10T22:43:00",
+  "system": {
+    "hostname": "CPUDFE024",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) 6740P",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2016,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": false
+    },
+    "gpu": {
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M27FTV71VPXG7C0WTKK106HC",
+      "git_sha": "0f86625bca7fef0e90db0d387d34888ca245ec56",
+      "git_branch": "pr25-row-group-lru",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-16-g0f86625b",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 2.850459795212373,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 776.1,
+      "extra": {
+        "gather_latency_ms_p50": 54.703,
+        "gather_latency_ms_p99": 73.232,
+        "block_index_groups": 50,
+        "full_shard_groups": 0,
+        "sidecar_groups": 0,
+        "block_index_adoption_rate": 1.0,
+        "row_group_hits": 0,
+        "row_group_misses": 0,
+        "row_group_hit_rate": null,
+        "n_batches": 50
+      }
+    },
+    {
+      "wall_s": 2.753052259096876,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 802.1,
+      "extra": {
+        "gather_latency_ms_p50": 53.75,
+        "gather_latency_ms_p99": 66.898,
+        "block_index_groups": 50,
+        "full_shard_groups": 0,
+        "sidecar_groups": 0,
+        "block_index_adoption_rate": 1.0,
+        "row_group_hits": 0,
+        "row_group_misses": 0,
+        "row_group_hit_rate": null,
+        "n_batches": 50
+      }
+    },
+    {
+      "wall_s": 2.6949083688668907,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 802.4,
+      "extra": {
+        "gather_latency_ms_p50": 53.107,
+        "gather_latency_ms_p99": 62.386,
+        "block_index_groups": 50,
+        "full_shard_groups": 0,
+        "sidecar_groups": 0,
+        "block_index_adoption_rate": 1.0,
+        "row_group_hits": 0,
+        "row_group_misses": 0,
+        "row_group_hit_rate": null,
+        "n_batches": 50
+      }
+    }
+  ],
+  "median_wall_s": 2.753052259096876,
+  "wall_s_iqr": 0.15555142634548247,
+  "n_runs": 3,
+  "file_size_bytes": 4460559,
+  "metadata": {
+    "pairs_per_batch": 256,
+    "n_batches_target": 50,
+    "row_group_rows": 256,
+    "scatter_block_index": true,
+    "n_runs": 3
+  }
+}
