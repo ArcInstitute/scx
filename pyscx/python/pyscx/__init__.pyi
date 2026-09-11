@@ -140,7 +140,10 @@ class IndexPlanDataset:
         the whole-shard counters stay at 0 and the row-group ones carry the
         signal: `row_group_hits` is what the second batch over a hot region
         gets for free. `peak_bytes_in_cache` gauges both kinds together, so
-        `peak <= bytes_inserted + row_group_bytes_inserted`.
+        `peak <= bytes_inserted + row_group_bytes_inserted`. A gather's groups
+        are admitted only if all of them fit the budget, so `row_group_misses`
+        growing while `row_group_bytes_inserted` stays flat means the working
+        set is over budget (raise `max_memory_mb`), not that the cache is off.
         `SCX_ROW_GROUP_CACHE=0` disables row-group retention process-wide."""
         ...
 

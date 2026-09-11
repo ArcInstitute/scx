@@ -2335,6 +2335,99 @@ row-group-scoped decode's bounded peak RAM is the memory-safe choice. The gate i
 per-reader: the `IndexPlanDataset` defaults above are unchanged, and
 `SCX_SCATTER_BLOCK_INDEX=0` remains a hard master kill-switch over both.
 
+#### Row-group LRU on the scattered gather (OPT-FORMATIO-1)
+
+Everything above in this section was measured before the row groups a
+block-index gather decodes were retained anywhere: `decode_block_index_row_runs`
+decoded the touched groups per call and dropped them, and the whole-shard LRU
+could not populate on that path (its `!contains` clause is part of the
+eligibility). Since OPT-FORMATIO-1 the groups live in the same LRU as whole
+shards under `(file_id, shard, group)` keys, bounded by the loader's byte
+budget (`cache_shards` caps whole shards only); each shard's framing layout is
+resolved once; a gather's groups are **admitted only if all of them fit the
+budget** (sized from the block index, no decode — a scan larger than the cache
+is the one pattern an LRU makes strictly worse, so an over-budget gather
+decodes and drops instead); and the L2 prefetcher pre-decodes a plan's groups
+when they fit `budget / (lookahead + 1)`. `cache_metrics()` reports the new
+half as `row_group_hits` / `row_group_misses`; `hits` / `misses` keep meaning
+whole shards.
+
+**Same-build A/B on `read_scattered`** (256 random `(pert, ctrl)` pairs per
+batch, `cache_shards=128`, `max_memory_mb=8192`, `lookahead=4`,
+`scatter_block_index=True`; the arm is `SCX_ROW_GROUP_CACHE=0` — the pre-change
+regime — against the shipped default; one `.so`, same fixtures, same seeded
+plans; medians over the timed runs):
+
+| format | dataset | p50 gather, off → on | peak RSS off → on | row-group hit rate (on) |
+|---|---|---|---|---|
+| `scx_compact_trial_g256` | pbmc3k | 63.2 → 47.0 ms (**1.35×**) | 786 → 820 MB | 99.0 % |
+| `scx_compact_trial_g512` | pbmc3k | 63.5 → 46.6 ms (**1.36×**) | 790 → 841 MB | 99.0 % |
+| `scx_compact_trial_g256` | smartseq2 | 1099 → 1154 ms (0.95×) | 1182 → 1178 MB | 0 — bypassed |
+| `scx_compact_trial_g512` | smartseq2 | 1219 → 1235 ms (0.99×) | 1194 → 1172 MB | 0 — bypassed |
+| `scx_compact_trial_g256` | tabula_sapiens_100k | 994 → 1015 ms (0.98×) | 1126 → 1156 MB | 0 — bypassed |
+| `scx_compact_trial_g512` | tabula_sapiens_100k | 1292 → 1311 ms (0.99×) | 1122 → 1133 MB | 0 — bypassed |
+
+Read the two regimes with the budget. `read_scattered` asks for 128 cached
+shards under 8 GiB, and `IndexPlanDataset`'s auto-tune grants what is left
+after the `max_plan_size` batch buffers — on tabula_sapiens_100k (≈217 MB
+decoded per shard) that is `effective_cache_shards=2`, a ≈435 MB row-group
+budget against ≈890 MB of groups per 512-row batch, and smartseq2 is the same
+shape. There the admission rule bypasses the LRU and the arm is the pre-change
+behaviour within run-to-run noise (the 0.95–0.99× are within the spread of
+the two OFF-arm captures of the same cells, 1144 vs 1099 ms). Without the
+rule — the first capture of this series, job 2930275 — the same two datasets
+measured a **0.0 % hit rate** with +350–500 MB of resident bytes and 2–4 %
+slower batches: every group was inserted and evicted before the next gather
+reached it. On pbmc3k the file's eleven (G=256) or six (G=512) groups fit,
+and 99 % of lookups are hits. `block_index_adoption_rate` is 1.0 on both arms
+and all six cells — a cache-served group is still the block-index route, so
+the gate's route floors do not move.
+
+**Where the working set fits, the win is the estimate the review made.** The
+`index_plan` benchmark's scattered scenarios run on the `_auto.scx` fixtures,
+which `scx info` reports as `format_version: 4` (framed), with the default
+`IndexPlanDataset` budget; against `LATEST` (`v0.16.0-opt-instruments`,
+captured 2026-09-03 at `cafeb2ce` — **not** a same-build A/B, though the
+intervening commits are all write-side):
+
+| dataset | scenario | LATEST | this branch |
+|---|---|---|---|
+| smartseq2 | `pyscx_index_plan_random` | 65.9 s | **2.05 s** (32×) |
+| smartseq2 | `pyscx_index_plan_locality` | 61.8 s | **2.16 s** (29×) |
+| smartseq2 | `pyscx_index_plan_dataset_workers2` | 64.8 s | **2.48 s** (26×) |
+| tabula_sapiens_100k | `pyscx_index_plan_random` | 87.7 s | **1.53 s** (57×) |
+| tabula_sapiens_100k | `pyscx_index_plan_locality` | 69.7 s | **1.46 s** (48×) |
+| tabula_sapiens_100k | `pyscx_index_plan_dataset_workers2` | 75.0 s | **2.06 s** (36×) |
+| tabula_sapiens_100k | peak RSS (pooled max) | 2,708 MB | 3,127 MB |
+
+`pyscx_backed_python_loop` (a Python-bound per-row loop) and
+`pyscx_training_dataset` (the sequential pipeline) are flat, as is every
+`cellset_gather` scenario (`SparseCellSetDataset` defaults to the whole-shard
+route). The extra resident bytes are the configured budget being used for the
+first time on this path.
+
+Captured 2026-09-10 on Chimera (`cpu_preemptible` cells, `cpu_batch`
+orchestrator, SLURM job 2930348) at `f5a9a171`, via
+`sbatch benchmarks/scripts/_run_pr25_row_group_lru_ab.sh`: 2 timed runs per
+cell on smartseq2 / tabula (3 on pbmc3k) after a 3-batch warm-up, 12–50
+batches per run, `gate_candidate.py --skip-capture` against `LATEST` reporting
+0 peak-RSS regressions and 0 floor violations (its 26 "timing regressions" are
+`DISAPPEARED` rows for triples the narrowed capture did not run).
+
+> [!NOTE]
+> Manifest entries: the ON-arm rows are the canonical triples
+> `results/raw/read_scattered__scx_compact_trial_g{256,512}__{pbmc3k,smartseq2,tabula_sapiens_100k}.json`
+> and `results/raw/index_plan__scx_auto__{pbmc3k,smartseq2,tabula_sapiens_100k}.json`
+> (reproducible by `gate_candidate.py --benchmarks read_scattered index_plan
+> --formats scx_compact_trial_g256 scx_compact_trial_g512 scx_auto`); the six
+> OFF-arm rows sit beside them under `results/raw/pr25_row_group_lru_off/`
+> with the same names plus that snapshot's `environment.json`, whose
+> `determinism_env.SCX_ROW_GROUP_CACHE` is `"0"` — **one file per arm**, for
+> the reason the note above gives. Both snapshots' `environment.json` also
+> record `pyscx.file`, so the build each row measured is legible from the
+> file. Force-added (`results/raw/` is gitignored); `git_dirty` is `true` only
+> for the untracked scratch markdown in the repo root.
+
 **Framing is a write-time property** (v4 writers row-group-frame all shards by
 default; codec-agnostic, so it covers every codec, not just Scx1). `.scx` files
 written before framing (pre-v4) carry no `BlockIndex` and silently fall back to
