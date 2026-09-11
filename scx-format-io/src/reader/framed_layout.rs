@@ -8,7 +8,7 @@
 //! only on the shard — `BackedCsrReader` memoizes one per shard for the
 //! reader's lifetime — and [`ScxReader::decode_framed_row_group`] is the part
 //! that depends on the group, which the shard LRU retains under
-//! [`crate::backed::CacheKey::Group`] (OPT-FORMATIO-1).
+//! `CacheKey::Group` (OPT-FORMATIO-1).
 
 use std::ops::Range;
 

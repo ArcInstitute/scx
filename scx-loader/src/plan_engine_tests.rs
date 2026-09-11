@@ -106,13 +106,13 @@ fn rows_of(plan: &Plan) -> Vec<(u32, u64)> {
 /// Takes the plan **by value**, matching `ProcFn` since ORG-9.10-1: the queue
 /// is the plan's last owner, so a consumer that needs to consume or reorder it
 /// (the pair loader sorts in place) does not have to clone per batch.
-fn gather(engine: &PrefetchEngine, plan: Plan) -> Result<Vec<(i32, f32)>> {
+fn gather(engine: &PrefetchEngine, plan: Plan, admit_row_groups: bool) -> Result<Vec<(i32, f32)>> {
     let mut out = Vec::with_capacity(plan.len());
     for &(fid, row) in &plan {
         let mut got: Option<(i32, f32)> = None;
         engine
             .reader(fid)
-            .read_rows_with(&[row], |_pos, idx, data| {
+            .read_rows_with_admission(&[row], Some(admit_row_groups), |_pos, idx, data| {
                 got = idx.first().copied().zip(data.first().copied());
                 Ok(())
             })
@@ -551,7 +551,7 @@ fn framed_engine_with_budget(
 /// Bytes one decoded row group of the framed fixture occupies in the LRU:
 /// `FRAMED_ROW_GROUP_ROWS` rows at one non-zero each — `(16 + 1) × 8 + 16 × 4 +
 /// 16 × 4`. The row-group warm tests size their budgets from it.
-const FRAMED_GROUP_BYTES: usize =
+pub(crate) const FRAMED_GROUP_BYTES: usize =
     (FRAMED_ROW_GROUP_ROWS as usize + 1) * 8 + FRAMED_ROW_GROUP_ROWS as usize * 8;
 
 /// **Pin (ORG-9.10-1, drift (a)/L2).** The engine's prefetch must NOT warm a
@@ -1102,15 +1102,18 @@ fn engine_warms_row_groups_for_an_eligible_plan() {
 }
 
 /// The negative arm: a plan whose row groups do **not** fit their share of the
-/// budget is left to the gather. The budget is chosen so the whole plan fits
-/// the cache (no eviction) but not `budget / (lookahead + 1)` — so a warm that
-/// ran anyway would show up as four hits, not as evictions.
+/// budget is neither warmed nor retained. The verdict is one per plan and
+/// reaches the gather through `process`'s third argument, so the L1 gather
+/// bypasses the LRU too — the budget is chosen so the whole plan fits the
+/// *cache* (an L1-only rule against the full budget would admit it) but not
+/// `budget / (lookahead + 1)`. Falsifiers: a warm that ran anyway shows up as
+/// hits; a gather that admitted on its own shows up as inserted bytes.
 #[test]
-fn engine_does_not_warm_row_groups_over_their_budget_share() {
+fn engine_bypasses_row_groups_over_their_budget_share() {
     use std::sync::atomic::Ordering as AtomicOrdering;
     let plan: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
     let planned = 4 * FRAMED_GROUP_BYTES;
-    // 2 × planned holds every group the gather inserts, but / 5 is under it.
+    // 2 × planned holds every group, but / 5 is under it.
     let budget = 2 * planned;
     assert!(
         budget / 5 < planned && budget >= planned,
@@ -1143,8 +1146,88 @@ fn engine_does_not_warm_row_groups_over_their_budget_share() {
         "no warm ran: the plan's groups exceed budget / (lookahead + 1)"
     );
     assert_eq!(
-        m.row_group_evictions.load(AtomicOrdering::Relaxed),
+        m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
         0,
-        "and they all fit"
+        "and the gather did not retain them either — one verdict per plan"
+    );
+    assert_eq!(engine.reader(0).cache_bytes_used(), 0);
+}
+
+/// **Review on #528 (Antigravity, codex).** The admission verdict is over the
+/// whole plan, not per file: two files each fit `budget / (lookahead + 1)` on
+/// their own, their union does not, and the shared cache sees the union. A
+/// per-file verdict warmed and retained both halves and let them evict each
+/// other. Falsifier: `row_group_bytes_inserted > 0` (or any hit) means a
+/// per-file decision admitted.
+#[test]
+fn engine_admits_row_groups_per_plan_not_per_file() {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    let p1 = dir.path().join("f1.scx");
+    write_framed_fixture(&p0);
+    write_framed_fixture(&p1);
+    // One row in each of shards 0..3 of BOTH files: 4 groups per file.
+    let per_file = 4 * FRAMED_GROUP_BYTES;
+    // share ∈ [per_file, 2 × per_file): each file fits, the union does not.
+    let budget = 5 * (per_file + per_file / 2);
+    assert!(
+        budget / 5 >= per_file && budget / 5 < 2 * per_file,
+        "premise"
+    );
+    let engine = PrefetchEngine::from_scx_readers(
+        vec![ScxReader::open(&p0).unwrap(), ScxReader::open(&p1).unwrap()],
+        8,
+        budget,
+        4,
+        true,
+    );
+    let plan: Plan = vec![
+        (0u32, 5u64),
+        (0, 70),
+        (0, 140),
+        (0, 200),
+        (1, 5),
+        (1, 70),
+        (1, 140),
+        (1, 200),
+    ];
+    let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
+    let iter_metrics = it.iter_metrics();
+    let out: Vec<_> = it.map(|r| r.unwrap()).collect();
+    let want: Vec<(i32, f32)> = plan.iter().map(|&(_, r)| framed_expected(r)).collect();
+    assert_eq!(out, vec![want]);
+
+    let m = engine.cache_metrics();
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_block_index
+            .load(AtomicOrdering::Relaxed),
+        8,
+        "all eight (file, shard) buckets are block-index eligible"
+    );
+    assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 8);
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed)
+            + m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "the union is over the share: nothing warmed, nothing retained"
+    );
+
+    // Control: the same plan on one file alone fits, is warmed, and hits.
+    let dir1 = tempfile::tempdir().unwrap();
+    let engine1 = framed_engine_with_budget(dir1.path(), true, budget);
+    let half: Plan = vec![(0u32, 5u64), (0, 70), (0, 140), (0, 200)];
+    let want1: Vec<(i32, f32)> = half.iter().map(|&(_, r)| framed_expected(r)).collect();
+    let out1: Vec<_> = Arc::clone(&engine1)
+        .iter_with_plans(into_iter(vec![half]), 4, rows_of, gather)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(out1, vec![want1]);
+    let m1 = engine1.cache_metrics();
+    assert_eq!(
+        m1.row_group_hits.load(AtomicOrdering::Relaxed),
+        4,
+        "control: one file fits and hits"
     );
 }

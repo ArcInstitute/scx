@@ -419,6 +419,13 @@ impl IndexPlanDataset {
     ///                       skipped redundant decode work
     /// peak_bytes_in_cache - high-water mark of the cache's resident byte
     ///                       budget; useful for sizing `max_memory_mb`
+    /// full_shard_groups   - scattered request-groups served by a whole-shard decode
+    /// block_index_groups  - scattered request-groups served by the row-group path
+    /// row_group_hits / row_group_misses / row_group_evictions /
+    /// row_group_bytes_inserted / row_group_duplicate_waiters
+    ///                     - the same five counters for the decoded row groups a
+    ///                       framed gather retains (the counters above keep
+    ///                       meaning whole shards)
     /// ```
     ///
     /// All values are `int`. Counters are atomic and read with `Relaxed`
@@ -597,7 +604,9 @@ impl IndexPlanBatchIter {
     ///
     /// ```text
     /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters,
-    ///            peak_bytes_in_cache},
+    ///            peak_bytes_in_cache, full_shard_groups, block_index_groups,
+    ///            row_group_hits, row_group_misses, row_group_evictions,
+    ///            row_group_bytes_inserted, row_group_duplicate_waiters},
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,

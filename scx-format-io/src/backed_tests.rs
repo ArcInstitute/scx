@@ -4831,3 +4831,82 @@ fn planned_row_group_bytes_matches_decoded_size_and_warm_feeds_the_gather() {
     assert!(backed.warm_row_groups(1, &[5]).is_err());
     assert!(backed.warm_row_groups(0, &[64]).is_err());
 }
+
+/// A non-admitted gather still serves resident groups as hits — admission only
+/// stops *misses* from being inserted — and its misses decode uncached with no
+/// singleflight slot (the leader of a slot that inserts nothing would make
+/// every waiter re-decode in turn; review on #528).
+#[test]
+fn bypassed_gather_still_hits_resident_groups() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    let budget = 3 * RG_GROUP_BYTES;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    // Two groups admitted (they fit).
+    let small = [40u64, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &small), &small, &full, "fits");
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        2 * RG_GROUP_BYTES
+    );
+
+    // Four groups, over budget: the two resident ones are hits, the other two
+    // decode and drop; nothing is inserted or evicted.
+    let big = [2u64, 5, 6, 40, 41, 63];
+    rg_assert_matches_full(&rg_gather(&backed, &big), &big, &full, "over budget");
+    assert_eq!(
+        m.row_group_hits.load(Ordering::Relaxed),
+        2,
+        "resident groups served"
+    );
+    assert_eq!(
+        m.row_group_misses.load(Ordering::Relaxed),
+        4,
+        "2 admitted + 2 uncached"
+    );
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        2 * RG_GROUP_BYTES
+    );
+    assert_eq!(m.row_group_evictions.load(Ordering::Relaxed), 0);
+    assert_eq!(backed.cache_bytes_used(), 2 * RG_GROUP_BYTES);
+}
+
+/// `read_rows(start, end)`'s window path applies the same admission: a window
+/// whose groups do not fit the budget decodes and drops rather than evicting
+/// everything to retain them (review on #528: row groups are fixed-height, not
+/// fixed-nnz, so "a quarter of the rows" is not "a quarter of the bytes").
+#[test]
+fn read_rows_window_over_budget_is_not_retained() {
+    use std::sync::atomic::Ordering;
+    let dir = TempDir::new().unwrap();
+    let (path, full) = write_framed_file(&dir, 64, 100, 2, 4, CodecId::None);
+    // Budget holds one group; rows 2..5 touch two.
+    let budget = RG_GROUP_BYTES + RG_GROUP_BYTES / 2;
+    let mut backed =
+        BackedCsrReader::new_with_byte_budget(ScxReader::open(&path).unwrap(), 4, budget);
+    let m = backed.enable_metrics();
+
+    let got = backed.read_rows(2, 5).unwrap();
+    let want = full.row_slice(2, 5).unwrap();
+    assert_eq!(got.indices, want.indices);
+    assert_eq!(got.data, want.data);
+    assert_eq!(m.row_group_misses.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed),
+        0,
+        "not retained"
+    );
+    assert_eq!(backed.cache_bytes_used(), 0);
+
+    // A one-group window fits and is retained.
+    let _ = backed.read_rows(0, 3).unwrap();
+    assert_eq!(
+        m.row_group_bytes_inserted.load(Ordering::Relaxed) as usize,
+        RG_GROUP_BYTES
+    );
+}

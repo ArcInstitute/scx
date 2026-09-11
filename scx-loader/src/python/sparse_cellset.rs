@@ -402,8 +402,11 @@ impl SparseCellSetDataset {
     /// construction (the multi-file sibling of `IndexPlanDataset.cache_metrics`).
     /// Returns a dict with keys: `hits`, `misses` (= shard decodes), `evictions`,
     /// `bytes_inserted`, `duplicate_waiters`, `peak_bytes_in_cache`,
-    /// `full_shard_groups`, `block_index_groups`. All `int`; atomic, lock-free —
-    /// sample as often as you like.
+    /// `full_shard_groups`, `block_index_groups`, and the `row_group_*` set
+    /// (`hits`, `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`)
+    /// for the decoded row groups a framed `scatter_block_index=True` gather
+    /// retains — `hits` … `duplicate_waiters` themselves keep meaning whole
+    /// shards. All `int`; atomic, lock-free — sample as often as you like.
     ///
     /// The last two are the **route** this dataset's gathers actually took:
     /// `block_index_groups > 0` proves the row-group path ran, and
@@ -511,7 +514,9 @@ impl SparseCellSetBatchIter {
     ///
     /// ```text
     /// {"cache": {hits, misses, evictions, bytes_inserted, duplicate_waiters,
-    ///            peak_bytes_in_cache, full_shard_groups, block_index_groups},
+    ///            peak_bytes_in_cache, full_shard_groups, block_index_groups,
+    ///            row_group_hits, row_group_misses, row_group_evictions,
+    ///            row_group_bytes_inserted, row_group_duplicate_waiters},
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,

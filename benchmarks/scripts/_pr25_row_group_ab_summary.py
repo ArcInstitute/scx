@@ -30,13 +30,13 @@ def _rows(snapshot: Path, benchmark: str) -> dict[tuple[str, str], dict]:
 
 
 def _median_extra(d: dict, key: str) -> float | None:
-    vals = [r["extra"].get(key) for r in d.get("runs", []) if r.get("extra")]
+    vals = [r["extra"].get(key) for r in (d.get("runs") or []) if r and r.get("extra")]
     vals = [v for v in vals if v is not None]
     return statistics.median(vals) if vals else None
 
 
 def _median_top(d: dict, key: str) -> float | None:
-    vals = [r.get(key) for r in d.get("runs", [])]
+    vals = [r.get(key) for r in (d.get("runs") or []) if r]
     vals = [v for v in vals if v is not None]
     return statistics.median(vals) if vals else None
 

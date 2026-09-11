@@ -93,6 +93,71 @@ fn open(path: &std::path::Path) -> ScxReader {
     ScxReader::open(path).unwrap()
 }
 
+/// **Review on #528 (codex).** A cell-set plan is gathered one
+/// `read_rows_with` call per set, so a per-gather admission rule sees one set
+/// at a time: two sets that each fit `budget / (lookahead + 1)` but whose union
+/// does not would both be retained and evict each other — the insert/evict/
+/// zero-hit scan the admission rule exists to bypass. The verdict is taken once
+/// per plan by the engine and carried into every set's gather. Falsifier:
+/// `row_group_bytes_inserted > 0` means a per-set decision admitted.
+#[test]
+fn cellset_plan_admission_is_per_plan_not_per_set() {
+    use crate::plan_engine::tests::{framed_expected, write_framed_fixture, FRAMED_GROUP_BYTES};
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("f0.scx");
+    write_framed_fixture(&p0);
+    // Set A: rows 5/70/140/200 → groups 0/4/8/12; set B: rows 20/85/155/215 →
+    // groups 1/5/9/13. Each set is 4 groups; the union is 8.
+    let per_set = 4 * FRAMED_GROUP_BYTES;
+    let budget = 5 * (per_set + per_set / 2);
+    assert!(budget / 5 >= per_set && budget / 5 < 2 * per_set, "premise");
+    let loader = SparseCellSetLoader::new(
+        vec![open(&p0)],
+        /*cache_shards*/ 16,
+        Some(budget),
+        /*lookahead*/ 4,
+        /*remap*/ None,
+        /*n_global_genes*/ None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ true,
+    )
+    .unwrap();
+    let rows: Vec<u64> = vec![5, 70, 140, 200, 20, 85, 155, 215];
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 8],
+        rows: rows.clone(),
+        role_tags: vec![0, 0, 0, 0, 1, 1, 1, 1],
+        set_offsets: vec![0, 4, 8],
+    };
+    let batches: Vec<_> = StdArc::clone(&loader)
+        .iter_with_plans(vec![Ok(plan.clone())].into_iter(), 4)
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(batches.len(), 1);
+    for (j, &row) in rows.iter().enumerate() {
+        let (idx, dat) = batch_row(&batches[0], j);
+        let (ecol, eval) = framed_expected(row);
+        assert_eq!((idx, dat), (&[ecol][..], &[eval][..]), "row {j}");
+    }
+    let m = loader.cache_metrics();
+    assert!(
+        m.block_index_groups.load(AtomicOrdering::Relaxed) > 0,
+        "premise: the framed gather took the row-group route"
+    );
+    assert_eq!(m.row_group_misses.load(AtomicOrdering::Relaxed), 8);
+    assert_eq!(
+        m.row_group_hits.load(AtomicOrdering::Relaxed)
+            + m.row_group_bytes_inserted.load(AtomicOrdering::Relaxed),
+        0,
+        "two sets that fit one at a time but not together must retain nothing"
+    );
+}
+
 /// **Pin (9b).** `SparseCellSetLoader::new` must pass `scatter_block_index`
 /// through to the engine rather than hard-coding either value.
 ///

@@ -618,7 +618,9 @@ impl SparseCellSetLoader {
                     .zip(plan.rows.iter().copied())
                     .collect()
             },
-            move |eng: &PrefetchEngine, plan: SparseCellSetPlan| loader.gather(eng, &plan),
+            move |eng: &PrefetchEngine, plan: SparseCellSetPlan, admit_row_groups: bool| {
+                loader.gather_admitting(eng, &plan, Some(admit_row_groups))
+            },
         );
         // Taken before boxing: `Box<dyn Iterator>` erases the inherent method,
         // and the counters are per-iter (they reset every `iter_with_plans`
@@ -630,12 +632,30 @@ impl SparseCellSetLoader {
         }
     }
 
-    /// Gather one batch of cell sets into the §4.4 contract. The `process`
-    /// callback for the engine (shards already warmed).
+    /// Gather one batch of cell sets into the §4.4 contract. Row-group
+    /// admission is decided per gather here; the engine-driven path
+    /// ([`Self::iter_with_plans`]) goes through [`Self::gather_admitting`]
+    /// with the plan-level verdict instead.
     pub fn gather(
         &self,
         engine: &PrefetchEngine,
         plan: &SparseCellSetPlan,
+    ) -> Result<SparseCellSetBatch> {
+        self.gather_admitting(engine, plan, None)
+    }
+
+    /// [`Self::gather`] with the row-group admission decided by the caller.
+    /// A plan is gathered one `read_rows_with` call per set (and per file on
+    /// the cross-file path), so only the caller sees the plan's whole working
+    /// set: the prefetch engine sums it over every file and shard and passes
+    /// its verdict in, so sets that fit one at a time but not together do not
+    /// churn the LRU. The `process` callback for the engine (shards already
+    /// warmed).
+    pub fn gather_admitting(
+        &self,
+        engine: &PrefetchEngine,
+        plan: &SparseCellSetPlan,
+        admit_row_groups: Option<bool>,
     ) -> Result<SparseCellSetBatch> {
         let total_rows = plan.rows.len();
         if plan.file_ids.len() != total_rows || plan.role_tags.len() != total_rows {
@@ -712,7 +732,7 @@ impl SparseCellSetLoader {
                 let fid = set_fids[0];
                 let reader = engine.reader(fid);
                 reader
-                    .read_rows_with(set_rows, |orig_pos, idx, dat| {
+                    .read_rows_with_admission(set_rows, admit_row_groups, |orig_pos, idx, dat| {
                         // `orig_pos` is the position in `set_rows`, not the row id
                         // — the scatter fires in shard-grouped order. The row id is
                         // what keys the downsample RNG, so read it back through the
@@ -739,7 +759,7 @@ impl SparseCellSetLoader {
                     let reader = engine.reader(f);
                     let rs: Vec<u64> = items.iter().map(|&(_, r)| r).collect();
                     reader
-                        .read_rows_with(&rs, |orig_pos, idx, dat| {
+                        .read_rows_with_admission(&rs, admit_row_groups, |orig_pos, idx, dat| {
                             let (within_set_pos, src_row) = items[orig_pos];
                             per_row[within_set_pos] =
                                 Some(self.transform_row(f, src_row, idx, dat));

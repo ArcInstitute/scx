@@ -589,6 +589,31 @@ impl<K: CacheKeyKind, V: SizeHint> ShardCache<K, V> {
         m
     }
 
+    /// The cached value for `key`, if resident — a hit (counted, recency
+    /// touched), never a decode. The bypass half of the CSR reader's row-group
+    /// admission: a gather whose working set does not fit the budget still
+    /// serves whatever is already resident, then decodes the rest uncached
+    /// (see [`Self::note_uncached_miss`]) instead of inserting and evicting.
+    pub(super) fn get_cached(&self, key: K) -> Option<Arc<V>> {
+        let cache_mutex = self.cache.as_ref()?;
+        let hit = cache_mutex.lock().unwrap().get(&key);
+        if hit.is_some() {
+            if let Some(m) = self.metrics.get() {
+                m.counters(key.kind()).hits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        hit
+    }
+
+    /// Count a decode the caller ran **outside** the cache — neither inserted
+    /// nor singleflighted — so a working set that is over budget still reads as
+    /// `misses` growing while `bytes_inserted` stays flat.
+    pub(super) fn note_uncached_miss(&self, kind: CacheKind) {
+        if let Some(m) = self.metrics.get() {
+            m.counters(kind).misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Return the cached value for `key`, or run `decode` exactly once across
     /// concurrent callers (singleflight) and cache the result under the budget.
     /// `decode` produces the decoded shard; the caller (the reader) owns the
@@ -601,26 +626,6 @@ impl<K: CacheKeyKind, V: SizeHint> ShardCache<K, V> {
         &self,
         key: K,
         decode: impl FnOnce() -> Result<Arc<V>>,
-    ) -> Result<Arc<V>> {
-        self.get_or_decode_admit(key, decode, true)
-    }
-
-    /// [`Self::get_or_decode`] with **admission control**: a hit is served
-    /// either way, but a miss is inserted only when `admit` is true. The
-    /// caller passes `false` when it knows the working set of the read it is
-    /// serving does not fit the budget — inserting would then evict entries
-    /// that never get read again before they are gone (a scan larger than the
-    /// cache is the one access pattern an LRU makes strictly worse), paying
-    /// the eviction churn and the resident bytes for zero hits. The decode is
-    /// still deduplicated across concurrent callers through the singleflight
-    /// table, and it still counts as a miss — a `misses` that grows while
-    /// `bytes_inserted` stays flat is how an over-budget working set reads on
-    /// the counters.
-    pub(super) fn get_or_decode_admit(
-        &self,
-        key: K,
-        decode: impl FnOnce() -> Result<Arc<V>>,
-        admit: bool,
     ) -> Result<Arc<V>> {
         let kind = key.kind();
         loop {
@@ -689,11 +694,9 @@ impl<K: CacheKeyKind, V: SizeHint> ShardCache<K, V> {
             // before `_guard` drops — a post-removal observer sees the entry
             // once it re-acquires `in_flight`.
             let value = decode()?;
-            if admit {
-                if let Some(ref cache_mutex) = self.cache {
-                    let mut cache = cache_mutex.lock().unwrap();
-                    cache.put_with_budget(key, Arc::clone(&value));
-                }
+            if let Some(ref cache_mutex) = self.cache {
+                let mut cache = cache_mutex.lock().unwrap();
+                cache.put_with_budget(key, Arc::clone(&value));
             }
             return Ok(value);
         }

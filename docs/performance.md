@@ -2344,13 +2344,16 @@ could not populate on that path (its `!contains` clause is part of the
 eligibility). Since OPT-FORMATIO-1 the groups live in the same LRU as whole
 shards under `(file_id, shard, group)` keys, bounded by the loader's byte
 budget (`cache_shards` caps whole shards only); each shard's framing layout is
-resolved once; a gather's groups are **admitted only if all of them fit the
-budget** (sized from the block index, no decode — a scan larger than the cache
-is the one pattern an LRU makes strictly worse, so an over-budget gather
-decodes and drops instead); and the L2 prefetcher pre-decodes a plan's groups
-when they fit `budget / (lookahead + 1)`. `cache_metrics()` reports the new
-half as `row_group_hits` / `row_group_misses`; `hits` / `misses` keep meaning
-whole shards.
+resolved once; and retention is **one admission verdict per plan**, taken by
+the prefetch engine over every file and shard the plan touches against the
+plan's share of the budget, `budget / (lookahead + 1)`, sized from the block
+index with no decode — an admitted plan is pre-decoded by the L2 prefetcher
+and retained by its gathers, an over-share plan is neither (a scan larger than
+the cache is the one pattern an LRU makes strictly worse, so it decodes and
+drops instead; a standalone `read_rows_with` outside the loaders decides for
+itself against the whole budget). `cache_metrics()` reports the new half as
+`row_group_hits` / `row_group_misses`; `hits` / `misses` keep meaning whole
+shards.
 
 **Same-build A/B on `read_scattered`** (256 random `(pert, ctrl)` pairs per
 batch, `cache_shards=128`, `max_memory_mb=8192`, `lookahead=4`,
@@ -2372,8 +2375,8 @@ shards under 8 GiB, and `IndexPlanDataset`'s auto-tune grants what is left
 after the `max_plan_size` batch buffers — on tabula_sapiens_100k (≈217 MB
 decoded per shard) that is `effective_cache_shards=2`, a ≈435 MB row-group
 budget against ≈890 MB of groups per 512-row batch, and smartseq2 is the same
-shape. There the admission rule bypasses the LRU and the arm is the pre-change
-behaviour within run-to-run noise (the 0.95–0.99× are within the spread of
+shape. There the plan is over its share, the admission rule bypasses the LRU,
+and the arm is the pre-change behaviour within run-to-run noise (the 0.95–0.99× are within the spread of
 the two OFF-arm captures of the same cells, 1144 vs 1099 ms). Without the
 rule — the first capture of this series, job 2930275 — the same two datasets
 measured a **0.0 % hit rate** with +350–500 MB of resident bytes and 2–4 %

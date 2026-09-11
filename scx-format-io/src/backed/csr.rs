@@ -524,13 +524,13 @@ impl BackedCsrReader {
         self.scatter_block_index = enabled;
     }
 
-    /// Override the per-reader row-group retention gate (default from
-    /// `SCX_ROW_GROUP_CACHE`). Off, a framed scattered read decodes its
-    /// touched groups and drops them — the pre-OPT-FORMATIO-1 behaviour — and
-    /// none of the `row_group_*` counters move. Exists for the same-build A/B
-    /// and for tests; takes `&mut self` so it is set before the reader is
-    /// shared.
-    pub fn set_row_group_cache(&mut self, enabled: bool) {
+    /// Test-only override of the per-reader row-group retention gate (default
+    /// from `SCX_ROW_GROUP_CACHE`, which is also the same-build A/B switch).
+    /// Off, a framed scattered read decodes its touched groups and drops them
+    /// — the pre-OPT-FORMATIO-1 behaviour — and none of the `row_group_*`
+    /// counters move. No production caller changes it, so it is not API.
+    #[cfg(test)]
+    pub(crate) fn set_row_group_cache(&mut self, enabled: bool) {
         self.row_group_cache = enabled;
     }
 
@@ -1017,11 +1017,23 @@ impl BackedCsrReader {
         self.check_fresh()?;
         let n = local_end - local_start;
         layout.check_run(local_start, n)?;
-        // A window is `< shard_rows / 4` by construction (`read_rows`' plan),
-        // so its groups are at most a quarter of one shard's bytes — under any
-        // budget the reader runs with. Always admitted.
+        // Same admission as a scattered gather: a window is `< shard_rows / 4`
+        // by construction, but row groups are fixed-height, not fixed-nnz, so
+        // a skewed shard can put most of its bytes in a few groups — size the
+        // touched groups from the block index and retain them only if they
+        // fit the budget.
+        let admit = if n == 0 {
+            true
+        } else {
+            let (g0, g1) = (
+                layout.find_group(local_start),
+                layout.find_group(local_end - 1),
+            );
+            let bytes = (g0..=g1).fold(0usize, |acc, g| acc.saturating_add(layout.group_bytes(g)));
+            bytes <= self.shard_cache.bytes_budget()
+        };
         let (indptr, indices, data) = assemble_row_run(&layout, local_start, n, |g| {
-            self.row_group(shard_idx, &layout, g, true)
+            self.row_group(shard_idx, &layout, g, admit)
         })?;
         Ok(Some(ScxCsr::new_unchecked(
             (n, self.n_vars),
@@ -1041,19 +1053,30 @@ impl BackedCsrReader {
     fn row_group(
         &self,
         shard_idx: usize,
-        layout: &Arc<FramedShardLayout>,
+        layout: &FramedShardLayout,
         g: usize,
         admit: bool,
     ) -> Result<Arc<ScxCsr>> {
         if !self.retains_row_groups() {
             return self.reader.decode_framed_row_group(layout, g).map(Arc::new);
         }
-        let shard_cache = Arc::clone(&self.shard_cache);
-        shard_cache.get_or_decode_admit(
-            CacheKey::Group(self.file_id, shard_idx, g),
-            || self.reader.decode_framed_row_group(layout, g).map(Arc::new),
-            admit,
-        )
+        let key = CacheKey::Group(self.file_id, shard_idx, g);
+        if admit {
+            let shard_cache = Arc::clone(&self.shard_cache);
+            return shard_cache.get_or_decode(key, || {
+                self.reader.decode_framed_row_group(layout, g).map(Arc::new)
+            });
+        }
+        // Not admitted: a resident group is still a hit, but a miss decodes
+        // uncached — no insert, and no singleflight either (a slot whose
+        // leader inserts nothing would make every waiter re-decode in turn;
+        // concurrent non-admitted decodes of one group run independently
+        // instead, which is what "not retained" means).
+        if let Some(rg) = self.shard_cache.get_cached(key) {
+            return Ok(rg);
+        }
+        self.shard_cache.note_uncached_miss(CacheKind::RowGroup);
+        self.reader.decode_framed_row_group(layout, g).map(Arc::new)
     }
 
     /// Whether the row groups a gather's block-index groups touch all fit the
@@ -1070,13 +1093,36 @@ impl BackedCsrReader {
         }
         let mut planned = 0usize;
         for g in groups.iter().filter(|g| g.use_block_index) {
-            let rows: Vec<u64> = sorted_pairs[g.start..g.end]
+            let Some(layout) = self.framed_layout(g.shard_idx) else {
+                continue;
+            };
+            // `sorted_pairs` is row-sorted, so the group's rows are too — no
+            // copy, no re-sort.
+            let locals = sorted_pairs[g.start..g.end]
                 .iter()
-                .map(|&(r, _)| r)
-                .collect();
-            planned = planned.saturating_add(self.planned_row_group_bytes(g.shard_idx, &rows));
+                .map(|&(r, _)| (r - g.s_start) as usize);
+            planned = planned.saturating_add(Self::planned_bytes_sorted(&layout, locals));
         }
         planned <= self.shard_cache.bytes_budget()
+    }
+
+    /// Bytes of the distinct row groups the **ascending** shard-local `locals`
+    /// touch, sized from the block index (`FramedShardLayout::group_bytes`).
+    /// Consecutive rows in one group are counted once; no allocation.
+    fn planned_bytes_sorted(
+        layout: &FramedShardLayout,
+        locals: impl Iterator<Item = usize>,
+    ) -> usize {
+        let mut planned = 0usize;
+        let mut last: Option<usize> = None;
+        for local in locals {
+            let g = layout.find_group(local);
+            if last != Some(g) {
+                planned = planned.saturating_add(layout.group_bytes(g));
+                last = Some(g);
+            }
+        }
+        planned
     }
 
     /// Bytes the row groups `rows` (global row ids in `shard_idx`) touch would
@@ -1095,9 +1141,12 @@ impl BackedCsrReader {
         let Some((s_start, _)) = self.index.shard_range(shard_idx) else {
             return 0;
         };
-        let mut groups = Self::touched_groups(&layout, s_start, rows);
-        groups.dedup();
-        groups.into_iter().map(|g| layout.group_bytes(g)).sum()
+        let mut locals: Vec<usize> = rows
+            .iter()
+            .map(|&row| row.saturating_sub(s_start) as usize)
+            .collect();
+        locals.sort_unstable();
+        Self::planned_bytes_sorted(&layout, locals.into_iter())
     }
 
     /// Decode the row groups `rows` (global row ids in `shard_idx`) touch into
@@ -1202,7 +1251,7 @@ impl BackedCsrReader {
         let mut data = vec![0f32; nnz];
         let mut fired = 0usize;
         let mut copied = 0usize;
-        self.scatter_groups(&sorted, &groups, |pos, idx, val| {
+        self.scatter_groups(&sorted, &groups, None, |pos, idx, val| {
             let lo = indptr[pos] as usize;
             let hi = indptr[pos + 1] as usize;
             if idx.len() != hi - lo || val.len() != hi - lo {
@@ -1261,12 +1310,33 @@ impl BackedCsrReader {
     where
         F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
     {
+        self.read_rows_with_admission(rows, None, scatter)
+    }
+
+    /// [`Self::read_rows_with`] with the row-group admission decided by the
+    /// caller. `None` decides per gather (this call's groups must fit the
+    /// whole byte budget); `Some(admit)` is a verdict taken over a larger
+    /// working set — `scx-loader`'s plan engine decides once per plan, over
+    /// every gather the plan will make and against the plan's share of the
+    /// budget, so the L1 gathers and the L2 warm cannot disagree and a plan of
+    /// many individually-fitting gathers whose union does not fit cannot churn
+    /// the LRU. A resident group is served as a hit either way; `Some(false)`
+    /// only stops misses from being inserted.
+    pub fn read_rows_with_admission<F>(
+        &self,
+        rows: &[u64],
+        admit_row_groups: Option<bool>,
+        scatter: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, &[i32], &[f32]) -> Result<()>,
+    {
         if rows.is_empty() {
             return Ok(());
         }
         let sorted = Self::sort_rows(rows);
         let groups = self.plan_row_groups(&sorted)?;
-        self.scatter_groups(&sorted, &groups, scatter)
+        self.scatter_groups(&sorted, &groups, admit_row_groups, scatter)
     }
 
     /// `(row, orig_pos)` sorted by row so duplicates / requests for the same
@@ -1342,6 +1412,7 @@ impl BackedCsrReader {
         &self,
         sorted_pairs: &[(u64, usize)],
         groups: &[RowGroup],
+        admit_row_groups: Option<bool>,
         mut scatter: F,
     ) -> Result<()>
     where
@@ -1356,15 +1427,19 @@ impl BackedCsrReader {
             .collect();
         self.warm_shards(&full_shards)?;
 
-        // Row-group admission, decided once for the whole gather: its groups
-        // are retained only if all of them fit the byte budget. A gather whose
-        // working set exceeds the budget would insert each group and evict it
-        // before the next gather could hit it — a scan larger than the cache,
-        // which an LRU makes strictly worse (eviction churn + resident bytes
-        // for zero hits; measured at 0 hits on tabula_sapiens_100k under
-        // `read_scattered`'s 2-shard budget). Sized exactly from the block
-        // index, no decode. Same rule the L2 prefetcher applies to a plan.
-        let admit_groups = self.gather_row_groups_fit_budget(sorted_pairs, groups);
+        // Row-group admission: retained groups must fit, or a working set
+        // larger than the cache inserts each group and evicts it before the
+        // next gather could hit it — a scan larger than the cache, which an
+        // LRU makes strictly worse (eviction churn + resident bytes for zero
+        // hits; measured at 0 hits on tabula_sapiens_100k under
+        // `read_scattered`'s 2-shard budget). A caller that sees a larger
+        // working set than this one call — the plan loaders, whose plan spans
+        // several gathers and whose prefetcher holds `lookahead` plans' warms
+        // alongside — decides once per plan and passes the verdict in
+        // (`read_rows_with_admission`); a standalone gather decides for itself
+        // against the whole budget. Sized from the block index, no decode.
+        let admit_groups = admit_row_groups
+            .unwrap_or_else(|| self.gather_row_groups_fit_budget(sorted_pairs, groups));
 
         for g in groups {
             let group = &sorted_pairs[g.start..g.end];
@@ -1442,24 +1517,23 @@ impl BackedCsrReader {
         // A cache hit never reaches `section_bytes`, so the freshness check
         // has to be here too — see `read_shard_cached_arc`.
         self.check_fresh()?;
-        // Validate every requested row against the shard's own row count
-        // before any group indexing — `group` is built from `ShardStats`
-        // ranges, which are not otherwise checked against the header.
-        for &(row, _) in group {
-            layout.check_run((row - s_start) as usize, 1)?;
+        // Validate the request against the shard's own row count before any
+        // group indexing — `group` is built from `ShardStats` ranges, which are
+        // not otherwise checked against the header. Rows are ascending and
+        // `>= s_start` by construction (`plan_row_groups`), so the last one is
+        // the only bound that can fail.
+        if let Some(&(max_row, _)) = group.last() {
+            layout.check_run((max_row - s_start) as usize, 1)?;
         }
 
         let mut current: Option<(usize, Arc<ScxCsr>)> = None;
         for &(row, orig_pos) in group {
             let local = (row - s_start) as usize;
             let g = layout.find_group(local);
-            let rg = match &current {
-                Some((cur_g, rg)) if *cur_g == g => rg,
-                _ => {
-                    current = Some((g, self.row_group(shard_idx, &layout, g, admit)?));
-                    &current.as_ref().expect("just set").1
-                }
-            };
+            if current.as_ref().is_none_or(|(cur_g, _)| *cur_g != g) {
+                current = Some((g, self.row_group(shard_idx, &layout, g, admit)?));
+            }
+            let rg = &current.as_ref().expect("just set").1;
             let in_group = local - layout.span(g).row_start as usize;
             let lo = rg.indptr[in_group] as usize;
             let hi = rg.indptr[in_group + 1] as usize;

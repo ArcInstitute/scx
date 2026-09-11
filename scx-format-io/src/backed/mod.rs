@@ -45,9 +45,10 @@ mod index;
 // everything reachable at `backed::<name>` before is re-exported here at the
 // same visibility.
 pub(crate) use cache::csr_component_bytes;
-pub use cache::{
-    CacheKey, CacheKeyKind, CacheKind, CacheMetrics, ShardCache, SharedShardCache, SizeHint,
-};
+pub use cache::{CacheMetrics, ShardCache, SharedShardCache, SizeHint};
+// The key/kind types stay in `cache`: `SharedShardCache` names them, but no
+// caller outside this module spells them (review on #528).
+pub(super) use cache::{CacheKey, CacheKind};
 pub use csc::{BackedCscIndex, BackedCscReader};
 pub use csr::BackedCsrReader;
 pub use dense::BackedDenseReader;
