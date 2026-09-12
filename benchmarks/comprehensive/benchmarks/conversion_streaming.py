@@ -513,7 +513,7 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
             "output_bytes": out.stat().st_size,
         }
 
-    print(json.dumps([rec]))
+    print(json.dumps(rec))
 """)
 
 
@@ -577,7 +577,7 @@ def _run_tenx_arm_subprocess(
                 f"--- stderr ---\n{proc.stderr}\n--- stdout ---\n{proc.stdout}"
             )
         try:
-            records.extend(json.loads(proc.stdout.strip().splitlines()[-1]))
+            records.append(json.loads(proc.stdout.strip().splitlines()[-1]))
         except (json.JSONDecodeError, IndexError) as exc:
             raise RuntimeError(
                 f"Failed to parse 10x worker JSON output: {exc}\n"
@@ -607,7 +607,18 @@ def _assert_tenx_streaming_beat_materialize(result: BenchmarkResult) -> None:
             if value is not None:
                 peaks[label] = max(peaks.get(label, 0.0), float(value))
     if len(peaks) < 2:
-        return  # one arm did not run; nothing to compare, and not a claim
+        # Unreachable by construction — `_run_tenx_arms` collects both arms
+        # before recording either, so a half-pair cannot be on the result. It
+        # was reachable, and that is exactly how the floored
+        # `tenx_streaming_peak_rss_mb` once passed with the comparison it exists
+        # for silently gone. An early `return` here is a hatch that re-opens the
+        # moment recording moves back inside the arm loop, so it raises.
+        raise RuntimeError(
+            f"only {sorted(peaks)} recorded a peak; the 10x arms are a pair and "
+            f"either both run or neither does. A half-pair means recording moved "
+            f"back inside the arm loop — the bound would go unchecked while the "
+            f"ceiling still passed."
+        )
     if peaks["tenx_streaming"] >= peaks["tenx_materialize"]:
         raise RuntimeError(
             f"the 10x streaming arm peaked at "

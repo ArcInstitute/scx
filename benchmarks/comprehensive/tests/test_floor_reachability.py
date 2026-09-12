@@ -42,6 +42,7 @@ becomes necessary, add the name here with the blocker written down, not silently
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import pytest
@@ -1580,8 +1581,37 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
     with pytest.raises(RuntimeError, match="bounded path"):
         drive(in_scope, peaks=(900.0, 100.0))
 
+    # (5) A skip on the *second* arm must leave nothing recorded. This is the
+    # layer the round-2 fix actually changed (collect both arms, then record),
+    # and the round-2 test could not see it: it raised on the first call. A
+    # half-pair here would leave the floored `tenx_streaming_peak_rss_mb` on the
+    # result with the comparison disarmed. Found by Cursor Agent - Grok 4.6 High.
+    def streaming_ok_then(exc):
+        def arm(tenx_path, n_runs, stream, reader_threads, binary):
+            if stream:
+                return [{
+                    "run_idx": 0, "wall_s": 1.0, "peak_rss_mb": 100.0,
+                    "structural": {"n_obs": 1, "n_vars": 1, "nnz": 1,
+                                   "shard_count": 1, "has_csc": 0},
+                    "output_bytes": 10,
+                }]
+            raise exc
+        return arm
 
-def test_tenx_arm_classifies_only_scx_own_rejection_as_unavailable():
+    _, result = drive(
+        in_scope, arm=streaming_ok_then(cs.TenxArmUnavailable("materialize gone"))
+    )
+    assert "materialize gone" in result.metadata["tenx_arms_skipped"]
+    assert "tenx_arms" not in result.metadata
+    assert not any("tenx_streaming_peak_rss_mb" in r.extra for r in result.runs), (
+        "a skip after the streaming arm succeeded must record nothing at all"
+    )
+
+    with pytest.raises(RuntimeError, match="materialize crashed"):
+        drive(in_scope, arm=streaming_ok_then(RuntimeError("materialize crashed")))
+
+
+def test_tenx_arm_classifies_only_scx_own_rejection_as_unavailable(tmp_path):
     """A failing convert is a failure unless `scx` itself said it cannot.
 
     `_run_tenx_arm_subprocess` decides skip-vs-crash by substring, over the
@@ -1601,15 +1631,16 @@ def test_tenx_arm_classifies_only_scx_own_rejection_as_unavailable():
     Found by **Cursor Agent - Grok 4.6 High**.
     """
     import stat
-    import tempfile
-    from pathlib import Path
 
     from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
 
+    counter = itertools.count()
+
     def fake_scx(exit_message: str):
         """A stub `scx` that fails with *exit_message* on stderr."""
-        d = tempfile.mkdtemp()
-        binary = Path(d) / "scx"
+        d = tmp_path / f"stub{next(counter)}"
+        d.mkdir()
+        binary = d / "scx"
         binary.write_text(
             "#!/bin/sh\n"
             f"echo {exit_message!r} >&2\n"
@@ -1618,7 +1649,7 @@ def test_tenx_arm_classifies_only_scx_own_rejection_as_unavailable():
         binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
         return str(binary)
 
-    src = Path(tempfile.mkdtemp()) / "in.h5"
+    src = tmp_path / "in.h5"
     src.write_bytes(b"\x89HDF\r\n\x1a\n")
 
     # `scx` itself naming the rejection -> a skip.

@@ -171,9 +171,12 @@ fn convert_both(
     (streamed, eager)
 }
 
-/// Single shard, default options: the two paths agree **byte for byte** on every
-/// section but `Provenance` (which the digest excludes, and which legitimately
-/// differs — the streaming stamp carries `"stream": true`).
+/// Single shard, default options: the two paths agree on **every section's
+/// content** — `Strictness::Content` compares each section's BLAKE3, length,
+/// type and `ShardStats` plus the 12 compared header fields, excluding
+/// `Provenance` (which legitimately differs — the streaming stamp carries
+/// `"stream": true`) and not pinning physical offsets. That is a strong claim,
+/// but it is not a whole-file byte compare, and this docstring used to say one.
 ///
 /// This is the strongest identity claim in the tree for a stream/eager pair:
 /// before this, the only such proof was value-level (`read_all_csr_shards`).
@@ -348,8 +351,11 @@ fn streaming_tenx_seeds_the_codec_per_shard() {
     );
 
     // Positive control: the divergence is *only* about the unforced seed. Name a
-    // codec and both paths honour it on every shard, so the two files agree
-    // byte for byte on the same multi-shard fixture that diverges above.
+    // codec and both paths honour it on every shard, so the two files agree on
+    // every section's *content* — `Strictness::Content`, which excludes
+    // `Provenance` and does not pin physical offsets, so this is not a
+    // whole-file byte compare — on the same multi-shard fixture that diverges
+    // above.
     let forced = IngestOptions {
         codec: Some(CodecId::Zstd),
         ..opts

@@ -131,6 +131,19 @@ def _build(dataset: DatasetConfig, out_path: Path, dry_run: bool) -> None:
             )
         shape = x.attrs["shape"]
         n_cells, n_genes = int(shape[0]), int(shape[1])
+        # A missing `encoding-type` is tolerated only where the indptr length
+        # can still settle the orientation. On a **square** matrix it cannot:
+        # `n_genes + 1 == n_cells + 1`, so a CSC group with no attribute passes
+        # every check below and its arrays get copied as though they were CSR —
+        # producing a fixture of the transposed matrix, silently. Refuse instead.
+        if enc is None and n_cells == n_genes:
+            raise RuntimeError(
+                f"{src}: /X has no `encoding-type` attribute and is square "
+                f"({n_cells} x {n_genes}), so its orientation cannot be "
+                f"determined — the indptr length is the same for CSR and CSC. "
+                f"Stamp `encoding-type = 'csr_matrix'` on /X, or use a "
+                f"non-square source."
+            )
         src_indptr = x["indptr"]
         src_indices = x["indices"]
         src_data = x["data"]

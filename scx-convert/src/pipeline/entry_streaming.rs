@@ -808,8 +808,15 @@ fn convert_then_sort_grouped(
 /// through, which is `None` under the default `--codec auto`, so each shard
 /// seeds its own codec from its own values. Since `select_codec` samples only
 /// the first 10 000 values, shard 0 agrees by construction and later shards can
-/// differ. The values, the shard row ranges and every section but `Provenance`
-/// are identical — pinned by `convert_tests_tenx_stream`.
+/// differ — and a shard that picked a different codec differs in its payload,
+/// its shard header and its catalog length and checksum, so the claim is
+/// **not** "every section but `Provenance` is identical". What holds under
+/// `auto` is: the decoded values and the shard row ranges agree, and the
+/// non-CSR sections agree. Naming a codec makes the two paths agree on every
+/// section's content (`Strictness::Content`, which excludes `Provenance` and
+/// does not pin physical offsets). Both are pinned by
+/// `convert_tests_tenx_stream`, and nothing here claims a whole-file byte
+/// compare.
 ///
 /// 10x has no `uns` / `obsm` / `varm` / `obsp` / `varp` / `layers` / `raw` and
 /// the CLI rejects `--sort-by` / `--group-by` on this direction, so this is the
