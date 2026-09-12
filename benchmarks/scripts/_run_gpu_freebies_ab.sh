@@ -69,6 +69,33 @@ export SCX_DISABLE_CUDA_GRAPHS=1
 export NUMBA_NUM_THREADS=8
 export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 
+# `maturin develop` REPOINTS the env's editable install at whatever directory it
+# was run from — here, a worktree this script then deletes. Without a restore
+# the env is left with a `pyscx.pth` naming a path that no longer exists, and
+# `import pyscx` then *succeeds* as an empty namespace package (`__file__ is
+# None`) and fails at first use. That is worse than an ImportError, because
+# nothing announces it. Observed on job 2938363, which left `scx-bench-gpu`
+# broken exactly this way.
+#
+# Runs on every exit path, including the `FATAL:` returns and a SIGTERM from
+# the scheduler.
+restore_shared_env() {
+    echo ""
+    echo "=== restoring ${ENV}'s pyscx from ${SCX_DIR} ==="
+    ( cd "${SCX_DIR}/pyscx" \
+      && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-pr12-restore \
+         "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) \
+        >"${OUT}/restore.log" 2>&1 \
+      && "${ENV}/bin/python" -c "import pyscx, sys; sys.exit(0 if pyscx.__file__ else 1)" \
+      && echo "  ok  ${ENV} restored" \
+      || {
+          echo "  !! RESTORE FAILED — ${ENV} may still point at a deleted worktree."
+          echo "     See ${OUT}/restore.log. Manual fix:"
+          echo "       cd ${SCX_DIR}/pyscx && VIRTUAL_ENV=${ENV} ${ENV}/bin/maturin develop --release --features hdf5,gpu"
+      }
+}
+trap restore_shared_env EXIT
+
 run_arm() {
     local name="$1" dir="$2"
     local target="/home/nickyoungblut/.cargo-target-pr12-${name}"
@@ -148,7 +175,13 @@ done
 
 echo ""
 echo "########## SUMMARY ##########"
-python - "${OUT}" <<'PY'
+# `export LD_LIBRARY_PATH=/usr/local/cuda/lib64:...` above makes numpy's MKL
+# pick up the wrong libcblas and abort with `Intel oneMKL FATAL ERROR: Cannot
+# load .../libcblas.so.3` — which killed this summary on job 2938363 *after*
+# every measurement had been written. The raw JSON and the .npy embeddings are
+# all on disk, so the summary is a convenience; drop the CUDA prefix for it
+# rather than risk losing the run's readable output again.
+env -u LD_LIBRARY_PATH python - "${OUT}" <<'PY'
 import json, sys
 from pathlib import Path
 
