@@ -1,5 +1,5 @@
 """
-Streaming h5ad → SCX conversion benchmark.
+Streaming → SCX conversion benchmark: h5ad, plus 10x since OPT-CONVERT-9.
 
 For a given dataset, this benchmark runs the two h5ad → SCX
 conversion entry points back-to-back and records peak RSS, wall
@@ -14,10 +14,13 @@ clock, and basic output-equality metadata for each path:
   triplet.
 
 Output equality between the two paths is measured at the "structural"
-level (n_obs / n_vars / nnz / catalog shard_count / has_csc).
-Bit-level equality is asserted in the Rust round-trip test
-`scx-convert/src/tests.rs::streaming_round_trip_matches_non_streaming`;
-the benchmark only needs to flag drift, not characterise it.
+level (n_obs / n_vars / nnz / catalog shard_count / has_csc). The finer claims
+live in Rust — `convert_tests_streaming.rs::streaming_round_trip_matches_non_streaming`
+for h5ad values, `convert_tests_tenx_stream.rs` for the 10x pair (a `scx-testkit`
+digest A/B on a single shard, and an explicit pin on the multi-shard codec-seed
+divergence). The benchmark only needs to flag drift, not characterise it. Note
+the paths are *not* byte-identical under the default `--codec auto` on either
+format: eager forces one whole-matrix codec seed, streaming seeds per shard.
 
 **Three extra streaming arms** run on the datasets named in `_EXTRA_ARMS`. All
 three exist because the arms above pass *no* conversion options at all — their
@@ -54,10 +57,21 @@ threads alone and shrinks only depth. Each gets `<label>_peak_rss_mb` /
 emission path, and no chance of an extra arm polluting the floored
 `streaming_peak_rss_mb` key.
 
-Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms are **not** swept — none
-varies along the thread axis, since each changes a conversion option — but they
-still run **once**, each at its own pinned thread count, before the sweep, so a
-sweep capture does not silently lose the non-default coverage.
+**Two 10x arms** (`tenx_streaming` / `tenx_materialize`) run on the datasets in
+`_TENX_ARM_DATASETS`, gating `scx convert --from 10x`'s bounded-memory claim.
+They are not `_EXTRA_ARMS` entries because this direction is not reachable from
+`from_h5ad` at all — `pyscx.from_10x` routes through `scanpy.read_10x_h5` into
+`from_anndata`, a third code path with no `stream` kwarg — so they drive the
+**CLI**, each `scx convert` in its own process (the peak comes from
+`getrusage(RUSAGE_CHILDREN)`, which is cumulative across reaped children).
+Their source is a synthesised fixture, since no dataset in the suite is a 10x
+file; `prep_tenx_fixture.py` builds it, and without it both arms skip.
+
+Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms and the 10x pair are
+**not** swept — none varies along the thread axis, since each changes a
+conversion option and the 10x materialising arm has no threads knob at all —
+but they still run **once**, each at its own pinned thread count, before the
+sweep, so a sweep capture does not silently lose the non-default coverage.
 
 Thread scaling is opt-in via the `SCX_CONV_STREAM_THREAD_COUNTS` env
 var (comma-separated, e.g. `1,2,4,8,16,32`). When set, each thread
@@ -410,6 +424,334 @@ def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
 #   "structural"?, "output_bytes"?}`. The first run of each scenario
 # also reports the structural fingerprint + output size so the parent
 # can detect path drift without re-opening files.
+# ---------------------------------------------------------------------------
+# The 10x arms (OPT-CONVERT-9)
+# ---------------------------------------------------------------------------
+
+# `scx convert --from 10x` streams since OPT-CONVERT-9 and does so **by
+# default**; `--stream=false` reaches the eager whole-matrix reader. These two
+# arms measure that pair.
+#
+# Why they are not `_EXTRA_ARMS` entries: every entry there is a `from_h5ad`
+# kwarg dict, and this direction is not reachable from `from_h5ad` at all.
+# `pyscx.from_10x` exists but routes through `scanpy.read_10x_h5` into
+# `from_anndata` — a third code path with no `stream` kwarg and no bounded
+# reader — so it cannot express either arm. The CLI can, and is what a real
+# CellBender-workflow caller uses.
+#
+# Scoped to `census_500k` deliberately, on two counts. It is in the `full`
+# capture tier, so a default `gate_candidate.py` run reaches it — unlike an
+# off-tier dataset, where `check_absolute_floors` skips the triple *silently*
+# and a floor reads as coverage while providing none. And it is the largest
+# tier dataset carrying **no** existing `conversion_streaming` floor and no
+# expected-to-breach arm: `census_1m` holds `streaming_peak_rss_mb`,
+# `smartseq2` holds `peak_over_memory_budget__budget_bound`, and
+# `tabula_sapiens_100k` hosts both arms that need a justification. Justification
+# suppression is whole-triple, so sharing a dataset with any of those would put
+# this floor one justification away from silently disarming.
+_TENX_ARM_DATASETS: frozenset[str] = frozenset({"census_500k"})
+
+
+_TENX_WORKER_SCRIPT = textwrap.dedent("""\
+    import json
+    import resource
+    import subprocess
+    import sys
+    import tempfile
+    import time
+    from pathlib import Path
+
+    tenx_path = sys.argv[1]
+    run_idx = int(sys.argv[2])
+    stream = sys.argv[3]            # "true" | "false"
+    reader_threads = sys.argv[4]    # or "" to inherit
+    scx_bin = sys.argv[5]
+
+    from benchmarks.comprehensive.benchmarks.conversion_streaming import (
+        _structural_summary,
+    )
+
+    # One convert per worker process, no loop: `getrusage(RUSAGE_CHILDREN)` is a
+    # cumulative high-water mark over every reaped child, so a second convert
+    # here would inherit the first's peak and every later run would report a
+    # monotone non-decreasing number. The parent spawns one of these per run.
+    with tempfile.TemporaryDirectory(prefix="scx_bench_tenx_") as tmp:
+        out = Path(tmp) / "out.scx"
+        argv = [scx_bin, "convert", "--from", "10x", "--stream=" + stream]
+        if reader_threads:
+            argv += ["--reader-threads", reader_threads]
+        argv += [tenx_path, str(out)]
+        t0 = time.perf_counter()
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        wall_s = time.perf_counter() - t0
+        if proc.returncode != 0:
+            # Terse, and deliberately NOT naming any string the parent
+            # classifies on. An earlier version explained the stale-binary case
+            # here; because `python -c` prints SystemExit's argument to stderr,
+            # every failure -- an OOM, a corrupt fixture, a real convert bug --
+            # then carried the parent's needle and was recorded as "stale
+            # binary, arms skipped". Reproduced on a corrupt fixture with a
+            # current binary. `scx`'s own stderr is the only source of truth.
+            raise SystemExit(
+                "scx convert --from 10x --stream=" + stream + " exited "
+                + str(proc.returncode) + "\\n" + proc.stderr
+            )
+        # RUSAGE_CHILDREN, not RUSAGE_SELF: the thing being measured is the
+        # `scx` process, and this worker exists so that `scx` is its only child.
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        # `ru_maxrss` is KiB on Linux and bytes on Darwin -- the same split
+        # `rss.py` already handles. Without the branch a macOS run reports
+        # 1024x high and trips every ceiling.
+        peak_rss_mb = (
+            ru / (1024.0 * 1024.0) if sys.platform == "darwin" else ru / 1024.0
+        )
+        rec = {
+            "run_idx": run_idx,
+            "wall_s": wall_s,
+            "peak_rss_mb": peak_rss_mb,
+            "structural": _structural_summary(out),
+            "output_bytes": out.stat().st_size,
+        }
+
+    print(json.dumps(rec))
+""")
+
+
+class TenxArmUnavailable(RuntimeError):
+    """The 10x arms cannot run here — a stale/mis-featured `scx`, not a result.
+
+    Distinct from a plain `RuntimeError` because the two need opposite handling:
+    a genuine worker crash should fail the run, while a binary that predates
+    OPT-CONVERT-9 (or was built without `--features hdf5`) must leave the h5ad
+    arms — which carry this benchmark's primary floors — untouched. There is no
+    probe that separates them up front: every `scx` since the flag shipped
+    answers `convert --help` with `--stream`, including the builds that reject
+    it on this direction, so the convert itself is the capability test.
+    """
+
+
+def _run_tenx_arm_subprocess(
+    tenx_path: Path,
+    n_runs: int,
+    stream: bool,
+    reader_threads: int | None,
+    scx_bin: str,
+) -> list[dict]:
+    """Run ``n_runs`` of one 10x arm, each `scx convert` in its own process.
+
+    The worker is a Python shim rather than a direct `subprocess.run` from here
+    because the peak comes from `getrusage(RUSAGE_CHILDREN)`, which is scoped to
+    *all* of the calling process's reaped children. One worker per **run** keeps
+    `scx` the only child it ever reaps, so neither the other arm's peak nor the
+    previous run's can leak into a record — the same process-boundary
+    requirement :func:`_run_arm_subprocess` documents for the h5ad arms, for the
+    same reason with a different mechanism.
+    """
+    records: list[dict] = []
+    for run_idx in range(n_runs):
+        proc = subprocess.run(
+            [
+                sys.executable, "-c", _TENX_WORKER_SCRIPT,
+                str(tenx_path), str(run_idx), "true" if stream else "false",
+                "" if reader_threads is None else str(reader_threads),
+                scx_bin,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=14400,
+        )
+        if proc.returncode != 0:
+            combined = f"{proc.stdout}\n{proc.stderr}"
+            if (
+                "--stream is not supported for direction" in combined
+                or "requires the 'hdf5' feature" in combined
+            ):
+                raise TenxArmUnavailable(
+                    f"`{scx_bin}` cannot run the 10x arms (stream={stream}): it "
+                    f"predates OPT-CONVERT-9 or lacks --features hdf5. Set "
+                    f"$SCX_CLI_BIN or rebuild target/release/scx.\n{combined.strip()}"
+                )
+            raise RuntimeError(
+                f"conversion_streaming 10x worker failed (stream={stream}, "
+                f"run={run_idx}, exit={proc.returncode}).\n"
+                f"--- stderr ---\n{proc.stderr}\n--- stdout ---\n{proc.stdout}"
+            )
+        try:
+            records.append(json.loads(proc.stdout.strip().splitlines()[-1]))
+        except (json.JSONDecodeError, IndexError) as exc:
+            raise RuntimeError(
+                f"Failed to parse 10x worker JSON output: {exc}\n"
+                f"--- stdout ---\n{proc.stdout}"
+            ) from exc
+    return records
+
+
+def _assert_tenx_streaming_beat_materialize(result: BenchmarkResult) -> None:
+    """Refuse a 10x pair where the streaming arm did not bound anything.
+
+    The arms exist to measure a bound, and both of the ways they could stop
+    doing so are silent. If `--stream=false` stopped reaching the eager reader
+    the two arms would record the same path under two labels and both pass; if
+    the streaming path regressed to a whole-matrix read the peaks would converge
+    the other way. Either way `tenx_streaming_peak_rss_mb` would still be
+    emitted and still clear its ceiling, having measured the wrong thing.
+
+    A bare inequality is the check, not a ratio: the margin is a property of the
+    dataset's nnz-per-cell and the shard size, so pinning a multiple here would
+    be a second, unmeasured threshold. `thresholds.yaml` carries the ceiling.
+    """
+    peaks: dict[str, float] = {}
+    for run in result.runs:
+        for label in ("tenx_streaming", "tenx_materialize"):
+            value = run.extra.get(f"{label}_peak_rss_mb")
+            if value is not None:
+                peaks[label] = max(peaks.get(label, 0.0), float(value))
+    if len(peaks) < 2:
+        # Unreachable by construction — `_run_tenx_arms` collects both arms
+        # before recording either, so a half-pair cannot be on the result. It
+        # was reachable, and that is exactly how the floored
+        # `tenx_streaming_peak_rss_mb` once passed with the comparison it exists
+        # for silently gone. An early `return` here is a hatch that re-opens the
+        # moment recording moves back inside the arm loop, so it raises.
+        raise RuntimeError(
+            f"only {sorted(peaks)} recorded a peak; the 10x arms are a pair and "
+            f"either both run or neither does. A half-pair means recording moved "
+            f"back inside the arm loop — the bound would go unchecked while the "
+            f"ceiling still passed."
+        )
+    if peaks["tenx_streaming"] >= peaks["tenx_materialize"]:
+        raise RuntimeError(
+            f"the 10x streaming arm peaked at "
+            f"{peaks['tenx_streaming']:.1f} MB against the materialising arm's "
+            f"{peaks['tenx_materialize']:.1f} MB. Streaming is supposed to be "
+            f"the bounded path, so either `--stream=false` no longer reaches "
+            f"the eager reader (both arms timed the same path) or the streaming "
+            f"path regressed to a whole-matrix read. Refusing to record a "
+            f"bound that was not measured."
+        )
+
+
+def _run_tenx_arms(
+    dataset: DatasetConfig,
+    n_runs: int,
+    result: BenchmarkResult,
+) -> None:
+    """Add the `tenx_streaming` / `tenx_materialize` arms when in scope.
+
+    Skips — recorded in `metadata`, never silently — when the dataset is out of
+    scope, when `prep_tenx_fixture.py` has not been run for it, or when no
+    resolvable `scx` binary has a `convert --stream`. A missing fixture is a
+    skip rather than an error because the h5ad arms carry this benchmark's
+    primary floors and must still run on a box where the 10x fixture was never
+    built.
+    """
+    from benchmarks.comprehensive import scx_cli
+
+    if dataset.name not in _TENX_ARM_DATASETS:
+        result.metadata["tenx_arms_skipped"] = (
+            f"{dataset.name} is not in the 10x arms' dataset scope "
+            f"({sorted(_TENX_ARM_DATASETS)})"
+        )
+        return
+
+    tenx_path = dataset.tenx_path
+    if not tenx_path.exists():
+        result.metadata["tenx_arms_skipped"] = (
+            f"10x fixture not built: {tenx_path} is absent. Build it with "
+            f"`python benchmarks/scripts/prep_tenx_fixture.py --datasets "
+            f"{dataset.name}`."
+        )
+        log.warning("%s", result.metadata["tenx_arms_skipped"])
+        return
+
+    # Inlined rather than a named constant: there is one caller, and this probe
+    # does not settle the question on its own — every `scx` since the flag
+    # shipped answers with `--stream`, including builds that reject it on 10x.
+    # It only weeds out a binary with no `convert --stream` at all; the convert
+    # itself is the real capability test (`TenxArmUnavailable`).
+    scx_bin = scx_cli.resolve_scx_bin(("convert", "--help"), requires=b"--stream")
+    if scx_bin is None:
+        result.metadata["tenx_arms_skipped"] = (
+            "no resolvable `scx` binary has `convert --stream`; set "
+            "$SCX_CLI_BIN or build target/release/scx"
+        )
+        log.warning("%s", result.metadata["tenx_arms_skipped"])
+        return
+
+    result.metadata["tenx_source_bytes"] = tenx_path.stat().st_size
+    result.metadata["tenx_gated_reader_threads"] = GATED_READER_THREADS
+    # Both arms run to completion **before** anything is recorded. A skip that
+    # fired mid-loop used to leave a half-pair on the result: `tenx_streaming`
+    # had already `add_run`'d, so the floored `tenx_streaming_peak_rss_mb`
+    # survived while `_assert_tenx_streaming_beat_materialize` returned early on
+    # `len(peaks) < 2` — the floor passing with the comparison it exists for
+    # silently gone. The realistic trigger is the materialising arm, which is
+    # the one that can OOM (8599 MB against streaming's 2593 MB on census_500k).
+    arms = (
+        ("tenx_streaming", True, GATED_READER_THREADS),
+        ("tenx_materialize", False, None),
+    )
+    try:
+        collected = [
+            (label, threads, _run_tenx_arm_subprocess(
+                tenx_path, n_runs, stream, threads, scx_bin
+            ))
+            for label, stream, threads in arms
+        ]
+    except TenxArmUnavailable as exc:
+        # A binary that cannot run this direction must not take the h5ad arms
+        # down with it: they carry this benchmark's primary floors, and the
+        # docstring above promises a recorded skip rather than a crash. Only
+        # this one shape is caught — a genuine worker failure still raises, or
+        # the arms would go quiet for the wrong reason.
+        result.metadata["tenx_arms_skipped"] = str(exc)
+        log.warning("10x arms skipped: %s", exc)
+        return
+
+    structural: dict[str, dict | None] = {}
+    ran: list[str] = []
+    for label, threads, records in collected:
+        ran.append(label)
+        for rec in records:
+            if rec.get("structural") is not None and label not in structural:
+                structural[label] = rec["structural"]
+                if rec.get("output_bytes") is not None:
+                    result.metadata[f"{label}_output_bytes"] = rec["output_bytes"]
+            result.add_run(
+                wall_s=rec["wall_s"],
+                peak_rss_mb=rec["peak_rss_mb"],
+                scenario=label,
+                run_idx=rec["run_idx"],
+                reader_threads=threads,
+                **{
+                    f"{label}_peak_rss_mb": rec["peak_rss_mb"],
+                    f"{label}_wall_s": rec["wall_s"],
+                },
+            )
+            result.metadata["scenarios"].append(label)
+            log.info(
+                "  %s (reader_threads=%s) run %d: wall=%.2fs peak_rss=%.1f MB",
+                label, threads, rec["run_idx"], rec["wall_s"], rec["peak_rss_mb"],
+            )
+
+    result.metadata["tenx_arms"] = ran
+    # The two paths must produce the same matrix. They are *not* byte-identical
+    # — the eager path forces one file-wide codec seed while the coordinator
+    # seeds per shard — so this is the structural comparison, which is the same
+    # claim the h5ad pair makes here. Bit-level agreement on the parts that do
+    # agree is pinned in Rust (`convert_tests_tenx_stream`).
+    result.metadata["tenx_structural"] = {
+        **structural,
+        "equal": structural.get("tenx_streaming") == structural.get("tenx_materialize"),
+    }
+    if structural.get("tenx_streaming") != structural.get("tenx_materialize"):
+        log.warning(
+            "10x structural mismatch streaming=%s materialize=%s",
+            structural.get("tenx_streaming"), structural.get("tenx_materialize"),
+        )
+    _assert_tenx_streaming_beat_materialize(result)
+
+
 _WORKER_SCRIPT = textwrap.dedent("""\
     import json
     import sys
@@ -661,9 +1003,13 @@ def run(
         log.info("materialize arm skipped: %s", skip_materialize)
 
     if thread_counts is None:
-        return _run_isolated(
+        result = _run_isolated(
             h5ad_path, n_runs, result, skip_materialize, dataset.name,
         )
+        # After the h5ad arms, so a 10x fixture that is absent or a stale `scx`
+        # binary cannot cost this benchmark its primary floors.
+        _run_tenx_arms(dataset, n_runs, result)
+        return result
 
     # The sweep-above-the-cap refusal is hoisted above input resolution near the
     # top of this function, so there is deliberately no second copy here.
@@ -677,6 +1023,10 @@ def run(
     _assert_index_arm_changed_the_output(
         list(swept.metadata.get("extra_arms", [])), swept
     )
+    # Run once, not swept: neither 10x arm varies along the thread axis (the
+    # materialising one has no reader-threads knob at all), and a sweep capture
+    # that silently dropped them would emit no value for the 10x floor.
+    _run_tenx_arms(dataset, n_runs, swept)
     return swept
 
 

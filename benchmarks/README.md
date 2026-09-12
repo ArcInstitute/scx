@@ -725,6 +725,40 @@ node; `census_1m` (~11 GB source) wants a high-memory allocation. All three are
 built (`census_1m_full.scx` was produced during the v0.16.0-opt-instruments
 capture); rebuild one with `--datasets <name>`.
 
+### Build the 10x fixtures (a CellRanger-shaped `.h5` source)
+
+Required by `conversion_streaming`'s `tenx_streaming` / `tenx_materialize`
+arms, which gate `scx convert --from 10x`'s bounded-memory claim
+(OPT-CONVERT-9). Same rule as the `_full` fixtures above: without the fixture
+both arms skip, and a threshold whose metric no run carries counts as a
+**violation** rather than a skip, so the gate fails rather than quietly
+narrowing.
+
+```bash
+.venv/bin/python benchmarks/scripts/prep_tenx_fixture.py --datasets census_500k
+```
+
+Writes `$SCX_DATA_DIR/<name>_10x.h5` with `/matrix/{shape,indptr,indices,data,
+barcodes,features/*}` in the CellRanger v3 layout — `shape` as an i32 **dataset**
+holding `[n_genes, n_cells]`, which is what real 10x output writes.
+
+It exists because **no benchmark dataset is a 10x file**: every `DATASETS` entry
+is sourced from an `.h5ad`, and the one 10x `.h5` the prep scripts download
+(pbmc3k's) is converted to h5ad and then deleted. So there was nothing to
+measure the 10x ingest path on at all.
+
+The copy is verbatim and bounded: an h5ad CSR over cells x genes and a 10x CSC
+over genes x cells are the same three arrays — `indptr` runs over cells in both
+and `indices` are gene ids in both — which is the reinterpretation
+`scx-convert`'s readers rely on. The sparse arrays are streamed in 32M-value
+chunks, so this needs no high-memory allocation: census_500k (747M nnz, 5.6 GB
+out) takes ~16 s, pbmc3k under a second. Idempotent; `--force` rebuilds,
+`--dry-run` reports. A CSC-on-disk or dense source h5ad is refused rather than
+transposed.
+
+Scoped to `census_500k` only — see the `tenx_streaming_peak_rss_mb` derivation
+in `thresholds.yaml` for why that dataset and not another.
+
 ### Verify datasets
 
 ```bash

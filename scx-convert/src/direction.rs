@@ -49,12 +49,12 @@ pub fn determine_convert_direction(
 /// catch-all and was silently classified as non-streaming, and no test could
 /// tell that apart from a deliberate `false`.
 ///
-/// `true` = h5ad → scx (Phase 0/1/2), h5mu → scx (Phase 3) and scx → h5ad /
-/// h5mu (Phase 8), which each have a shard-at-a-time path alongside the legacy
-/// materializing one, selected by the resolved `--stream`. `false` = a single
-/// materializing path with nothing to select: `scx-mtx` reads the whole MTX
-/// directory into memory (`read_mtx_directory`), `write_scx_to_mtx` assembles
-/// the whole CSR, and the `tenx_to_scx` dispatch arm never consults the flag.
+/// `true` = h5ad → scx (Phase 0/1/2), h5mu → scx (Phase 3), 10x → scx
+/// (OPT-CONVERT-9) and scx → h5ad / h5mu (Phase 8), which each have a
+/// shard-at-a-time path alongside the legacy materializing one, selected by the
+/// resolved `--stream`. `false` = a single materializing path with nothing to
+/// select: `scx-mtx` reads the whole MTX directory into memory
+/// (`read_mtx_directory`) and `write_scx_to_mtx` assembles the whole CSR.
 ///
 /// **Limitation, stated precisely.** Rust cannot reflect over the match arms
 /// of [`determine_convert_direction`], so a new arm there that is never
@@ -67,7 +67,7 @@ pub const CONVERT_DIRECTIONS: [(&str, bool); 7] = [
     ("mtx_to_scx", false),
     ("h5ad_to_scx", true),
     ("h5mu_to_scx", true),
-    ("tenx_to_scx", false),
+    ("tenx_to_scx", true),
     ("scx_to_mtx", false),
     ("scx_to_h5ad", true),
     ("scx_to_h5mu", true),
@@ -106,9 +106,9 @@ pub fn resolve_stream(requested: Option<bool>, direction: &str) -> Result<bool, 
         Some(true) if supported => Ok(true),
         Some(true) => Err(format!(
             "--stream is not supported for direction '{direction}'. Streaming is implemented \
-             only for h5ad → scx, h5mu → scx, scx → h5ad and scx → h5mu; mtx ↔ scx and \
-             10x → scx have a single materializing path. Re-run without --stream — the flag \
-             is not needed for this direction."
+             only for h5ad → scx, h5mu → scx, 10x → scx, scx → h5ad and scx → h5mu; mtx ↔ scx \
+             has a single materializing path. Re-run without --stream — the flag is not needed \
+             for this direction."
         )),
     }
 }
@@ -129,8 +129,13 @@ mod tests {
         (None, Some("h5mu"), "scx_to_h5mu"),
     ];
 
-    const STREAMING_DIRECTIONS: [&str; 4] =
-        ["h5ad_to_scx", "h5mu_to_scx", "scx_to_h5ad", "scx_to_h5mu"];
+    const STREAMING_DIRECTIONS: [&str; 5] = [
+        "h5ad_to_scx",
+        "h5mu_to_scx",
+        "tenx_to_scx",
+        "scx_to_h5ad",
+        "scx_to_h5mu",
+    ];
 
     #[test]
     fn explicit_from_h5ad_with_scx_extension() {
@@ -340,7 +345,7 @@ mod tests {
         let expected: BTreeSet<&str> = STREAMING_DIRECTIONS.into_iter().collect();
         assert_eq!(
             streaming, expected,
-            "only h5ad/h5mu ↔ scx have a streaming path; if that changed, \
+            "h5ad/h5mu ↔ scx and 10x → scx have a streaming path; if that changed, \
              update STREAMING_DIRECTIONS deliberately"
         );
     }

@@ -55,9 +55,11 @@ and extendr. Build it explicitly with `cargo build -p rscx` (see
 
 ### HDF5 feature build
 
-The `hdf5` feature on `scx-cli` enables `scx convert --from h5ad` using the
-Rust `hdf5` crate (unmaintained upstream — fallback is a Python subprocess
-via h5py). Requires `libhdf5-dev` system headers.
+The `hdf5` feature on `scx-cli` enables `scx convert --from h5ad|h5mu|10x`
+using the Rust `hdf5` crate (unmaintained upstream). Requires `libhdf5-dev`
+system headers, and is **required** for those directions: a build without it
+does not fall back to anything, it exits asking you to rebuild with
+`--features hdf5`. (MTX ↔ SCX needs no HDF5 and is always available.)
 
 ```bash
 # Install system dependency (Ubuntu/Debian)
@@ -72,8 +74,9 @@ cargo build -p scx-cli --features hdf5-static
 ```
 
 **Parallel streaming reader and libhdf5 thread-safety.** The parallel
-streaming convert path (`scx convert --reader-threads N`, `pyscx.from_h5ad(...,
-reader_threads=N)`, both with `N > 1`; default `None` auto-resolves to
+streaming convert path (`scx convert --reader-threads N` on any streaming
+ingest direction, h5ad / h5mu / 10x, `pyscx.from_h5ad(..., reader_threads=N)`,
+both with `N > 1`; default `None` auto-resolves to
 `RAYON_NUM_THREADS` or CPU count) requires a libhdf5 build with
 `--enable-threadsafe`. Conda-forge `hdf5=1.12.*=nompi*` and the Ubuntu
 system package ship this option by default. The runtime probe

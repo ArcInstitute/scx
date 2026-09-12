@@ -150,10 +150,10 @@ enum Commands {
         /// Stream the conversion instead of materializing the full X
         /// matrix in memory.
         ///
-        /// Only h5ad ↔ SCX and h5mu ↔ SCX have a streaming
+        /// h5ad ↔ SCX, h5mu ↔ SCX and 10x → SCX have a streaming
         /// implementation, and those directions stream by default;
-        /// MTX ↔ SCX and 10x → SCX have a single materializing path.
-        /// Omit the flag to get the right behavior for your direction.
+        /// MTX ↔ SCX has a single materializing path. Omit the flag to
+        /// get the right behavior for your direction.
         ///
         /// `--stream=false` opts into the legacy materializing path on
         /// a streaming direction, and is accepted as a no-op elsewhere.
@@ -2061,7 +2061,7 @@ fn run_convert(
 
     // Resolve `--stream` against the direction. `None` (flag absent) means
     // "whatever this direction does natively": streaming for h5ad / h5mu ↔
-    // scx, materializing for mtx ↔ scx and 10x → scx. Only an *explicit*
+    // scx and 10x → scx, materializing for mtx ↔ scx. Only an *explicit*
     // `--stream` / `--stream=true` on a non-streaming direction is rejected —
     // the flag carries no clap default precisely so that a value the user
     // never passed can never make a direction unreachable. Everything below
@@ -2534,7 +2534,13 @@ fn dispatch_convert(
                 convert::h5mu_to_scx(input, output, &opts, &mut sink)
             }
         }
-        "tenx_to_scx" => convert::tenx_to_scx(input, output, &opts, &mut sink),
+        "tenx_to_scx" => {
+            if stream {
+                convert::tenx_to_scx_streaming(input, output, &opts, &mut sink)
+            } else {
+                convert::tenx_to_scx(input, output, &opts, &mut sink)
+            }
+        }
         "scx_to_h5ad" => match modality {
             Some(name) => {
                 if stream {
