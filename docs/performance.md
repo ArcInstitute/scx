@@ -1261,8 +1261,9 @@ inside `consume` exactly as the embeddings pass already did.)* Streaming CPU PCA
 calling Python thread, never from a worker.
 
 Six loops now prefetch: the fused column-means pass (`col_means_and_sum_sq_prefetched`,
-added to `scx-format-io` beside the pipeline so GPU PCA's identical serial loop can adopt
-it later), the covariance build, the covariance embeddings pass, both streaming SpMM
+added to `scx-format-io` beside the pipeline rather than to `scx-accel`, so that GPU PCA's
+identical serial loop could adopt it without another move — which it since has, in
+`scx_gpu::gpu_pca::randomized_pca_core`), the covariance build, the covariance embeddings pass, both streaming SpMM
 passes, and the rare centered-variance re-stream. The covariance embeddings pass also
 stopped hand-inlining `spmm_forward_into` — same accumulation, same order, same mean
 correction, but serial, where the randomized route already called the shared parallel

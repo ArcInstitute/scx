@@ -260,6 +260,28 @@ pub fn decode_shard_gpu_with_stats(
     dev: &GpuDevice,
     shard_bytes: &[u8],
 ) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+    decode_shard_gpu_with_indptr(dev, shard_bytes).map(|(csr, stats, _indptr)| (csr, stats))
+}
+
+/// [`decode_shard_gpu_with_stats`], also handing back the shard's **host**
+/// indptr (`n_rows + 1` entries, shard-local, starting at 0).
+///
+/// Every decode path already has this vector: the unframed Scx1 path
+/// Delta-Golomb-decodes it, the host-bounce path gets it from
+/// `decode_shard_regions_scipy`, the framed paths assemble it in
+/// `prescan_*_group_indptr`, and all of them then upload it. Before this
+/// existed the multi-shard assemble loop recovered it with a per-shard
+/// `dev.dtoh_copy(shard.indptr())`, which on pageable host memory is
+/// host-synchronous: one full pipeline drain per shard, to read back a vector
+/// the host itself had just produced.
+///
+/// The per-shard **H2D** upload is *not* removed. Each path still builds a
+/// `GpuCsr`, which owns a device indptr; skipping that would take a decode
+/// variant that never constructs one, across all five paths.
+pub(crate) fn decode_shard_gpu_with_indptr(
+    dev: &GpuDevice,
+    shard_bytes: &[u8],
+) -> Result<(GpuCsr, DeviceDecodeStats, Vec<i64>), GpuError> {
     // 1. Parse 76-byte shard header
     if shard_bytes.len() < SHARD_HEADER_SIZE {
         return Err(GpuError::InvalidShard(format!(
@@ -413,7 +435,7 @@ fn decode_scx1_gpu(
     n_rows: usize,
     n_cols: usize,
     nnz: usize,
-) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+) -> Result<(GpuCsr, DeviceDecodeStats, Vec<i64>), GpuError> {
     if !value_encoding.is_integer() {
         return Err(GpuError::InvalidShard(
             "Scx1 codec does not support float value encodings".into(),
@@ -483,6 +505,7 @@ fn decode_scx1_gpu(
             "unframed Scx1 shard",
         )?,
         stats,
+        indptr_i64,
     ))
 }
 
@@ -503,7 +526,7 @@ fn decode_host_bounce(
     indices_bytes: &[u8],
     values_bytes: &[u8],
     block_index_bytes: &[u8],
-) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+) -> Result<(GpuCsr, DeviceDecodeStats, Vec<i64>), GpuError> {
     let n_rows = header.n_major as usize;
     let n_cols = header.n_minor as usize;
 
@@ -544,6 +567,7 @@ fn decode_host_bounce(
             "host-bounced shard",
         )?,
         stats,
+        indptr,
     ))
 }
 
@@ -568,7 +592,7 @@ fn decode_framed_scx1_gpu(
     indices_bytes: &[u8],
     values_bytes: &[u8],
     block_index_bytes: &[u8],
-) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+) -> Result<(GpuCsr, DeviceDecodeStats, Vec<i64>), GpuError> {
     let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
         GpuError::InvalidShard(format!("unknown value_encoding: {}", header.value_encoding))
     })?;
@@ -643,7 +667,8 @@ fn decode_framed_scx1_gpu(
         ..DeviceDecodeStats::default()
     };
 
-    Ok((combined.finish(dev, n_cols, "framed Scx1 shard")?, stats))
+    let (csr, indptr) = combined.finish_with_indptr(dev, n_cols, "framed Scx1 shard")?;
+    Ok((csr, stats, indptr))
 }
 
 /// GPU decode of a **framed (v2) ShufDeltaZstd** shard. Selects the fastest
@@ -666,7 +691,7 @@ fn decode_framed_shufdelta_gpu(
     indices_bytes: &[u8],
     values_bytes: &[u8],
     block_index_bytes: &[u8],
-) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+) -> Result<(GpuCsr, DeviceDecodeStats, Vec<i64>), GpuError> {
     let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
         GpuError::InvalidShard(format!("unknown value_encoding: {}", header.value_encoding))
     })?;
@@ -725,7 +750,7 @@ fn decode_framed_shufdelta_gpu(
             n_shards_shufdelta_gpu: 1,
             ..DeviceDecodeStats::default()
         };
-        return Ok((pcsr.csr, stats));
+        return Ok((pcsr.csr, stats, pcsr.indptr));
     }
     if spans.len() >= 2 && !force_sequential {
         let pcsr = crate::shufdelta_gpu::decode_framed_shufdelta_gpu_pipelined(
@@ -747,7 +772,7 @@ fn decode_framed_shufdelta_gpu(
             n_shards_shufdelta_gpu: 1,
             ..DeviceDecodeStats::default()
         };
-        return Ok((pcsr.csr, stats));
+        return Ok((pcsr.csr, stats, pcsr.indptr));
     }
 
     let mut combined = CombinedCsr::new(dev, nnz, n_rows, indptr_bytes.len())?;
@@ -803,10 +828,9 @@ fn decode_framed_shufdelta_gpu(
         ..DeviceDecodeStats::default()
     };
 
-    Ok((
-        combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (sequential)")?,
-        stats,
-    ))
+    let (csr, indptr) =
+        combined.finish_with_indptr(dev, n_cols, "framed ShufDeltaZstd shard (sequential)")?;
+    Ok((csr, stats, indptr))
 }
 
 /// GPU decode of an **unframed (v1) ShufDeltaZstd** shard (whole shard as a
@@ -820,7 +844,7 @@ fn decode_shufdelta_gpu(
     indices_bytes: &[u8],
     values_bytes: &[u8],
     block_index_bytes: &[u8],
-) -> Result<(GpuCsr, DeviceDecodeStats), GpuError> {
+) -> Result<(GpuCsr, DeviceDecodeStats, Vec<i64>), GpuError> {
     let value_encoding = ValueEncoding::from_u8(header.value_encoding).ok_or_else(|| {
         GpuError::InvalidShard(format!("unknown value_encoding: {}", header.value_encoding))
     })?;
@@ -885,13 +909,14 @@ fn decode_shufdelta_gpu(
             "unframed ShufDeltaZstd shard",
         )?,
         stats,
+        combined_indptr,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::build_test_shard;
+    use crate::test_utils::{build_dense_csr, build_framed_test_shard, build_test_shard};
     use scx_codec::{decode_shard_scipy, EncodedShardRef};
     use scx_format_io::shard::ShardHeader;
 
@@ -1008,33 +1033,6 @@ mod tests {
         assert_eq!(gpu_data, cpu_data, "data mismatch");
     }
 
-    /// Build a deterministic CSR with the given per-row nnz counts. Columns are
-    /// strictly increasing within each row (FOR-BP requires sorted indices).
-    /// Returns `(indptr, indices, values_u16)`.
-    fn build_dense_csr(row_nnzs: &[usize], n_cols: u32) -> (Vec<u64>, Vec<u32>, Vec<u16>) {
-        let mut indptr = vec![0u64];
-        let mut indices: Vec<u32> = Vec::new();
-        let mut values_u16: Vec<u16> = Vec::new();
-        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
-        for &nnz_row in row_nnzs {
-            let mut col = 0u32;
-            for _ in 0..nnz_row {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                col += (state % 4 + 1) as u32; // strictly increasing
-                assert!(col < n_cols, "test column overflow — widen n_cols");
-                indices.push(col);
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                values_u16.push((state % 7 + 1) as u16);
-            }
-            indptr.push(indices.len() as u64);
-        }
-        (indptr, indices, values_u16)
-    }
-
     fn assert_gpu_cpu_decode_match(
         dev: &GpuDevice,
         indptr: &[u64],
@@ -1118,51 +1116,6 @@ mod tests {
         assert_gpu_cpu_decode_match(&dev, &indptr, &indices, &values_u16, n_cols);
     }
 
-    /// Assemble a full shard-section byte buffer (header + payload + block
-    /// index) from an [`encode_one_shard`] result, mirroring the on-disk layout
-    /// the writer produces. Used to exercise the GPU framed-shard host-bounce.
-    fn framed_section_bytes(
-        indptr: &[u64],
-        indices: &[u32],
-        values_f32: &[f32],
-        explicit_codec: CodecId,
-        n_cols: u32,
-        row_group_rows: u32,
-    ) -> Vec<u8> {
-        use scx_format_io::section::SectionType;
-        let index_dtype = if n_cols <= 65535 { 0u8 } else { 1u8 };
-        let framing = scx_format_io::FramingConfig {
-            row_group_rows,
-            target_nnz: None,
-            trial: false,
-            decode_target: None,
-        };
-        let mut enc_opts = scx_format_io::EncodeShardOptions::new(
-            "X_shard_0".to_string(),
-            SectionType::CsrShard,
-            n_cols as u64,
-            0,
-            index_dtype,
-        );
-        enc_opts.explicit_codec = Some(explicit_codec);
-        enc_opts.framing = Some(framing);
-        let section = scx_format_io::encode_one_shard(indptr, indices, values_f32, &enc_opts)
-            .expect("encode_one_shard (framed) failed");
-        // Framing must actually have kicked in (shard v2), else the test would
-        // vacuously pass on an unframed shard.
-        assert_eq!(
-            section.shard_format_version(),
-            2,
-            "expected framed (v2) shard for codec {explicit_codec:?}"
-        );
-        let mut buf = section.header_buf.clone();
-        buf.extend_from_slice(&section.encoded.indptr_bytes);
-        buf.extend_from_slice(&section.encoded.indices_bytes);
-        buf.extend_from_slice(&section.encoded.values_bytes);
-        buf.extend_from_slice(&section.block_index_bytes);
-        buf
-    }
-
     /// Host-only unit test for the shared
     /// [`crate::shufdelta_gpu::prescan_framed_group_indptr`] helper (no GPU
     /// required — pure host indptr work). All five framed GPU decode bodies now
@@ -1183,7 +1136,7 @@ mod tests {
         let row_group_rows = 4u32;
 
         for codec in [CodecId::Scx1, CodecId::ShufDeltaZstd] {
-            let section = framed_section_bytes(
+            let section = build_framed_test_shard(
                 &indptr,
                 &indices,
                 &values_f32,
@@ -1274,7 +1227,7 @@ mod tests {
             // nvcomp Phase-2 path (fully_device_decoded=true) is opt-in and
             // covered by `test_shard_decode_gpu_shufdelta_nvcomp`.
             let want_device = matches!(codec, CodecId::Scx1);
-            let section = framed_section_bytes(&indptr, &indices, &values_f32, codec, n_cols, 4);
+            let section = build_framed_test_shard(&indptr, &indices, &values_f32, codec, n_cols, 4);
             let (gpu_csr, stats) = decode_shard_gpu_with_stats(&dev, &section)
                 .unwrap_or_else(|e| panic!("framed {codec:?} GPU decode failed: {e}"));
             let g_indptr = dev.dtoh_copy(&gpu_csr.indptr).unwrap();
@@ -1307,7 +1260,7 @@ mod tests {
         let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
         let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
 
-        let section = framed_section_bytes(
+        let section = build_framed_test_shard(
             indptr,
             indices,
             &values_f32,
@@ -1445,7 +1398,7 @@ mod tests {
         let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
         let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
 
-        let section = framed_section_bytes(
+        let section = build_framed_test_shard(
             &indptr,
             &indices,
             &values_f32,
@@ -1507,7 +1460,7 @@ mod tests {
         let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
         let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
         // row_group_rows = 4 → 4 groups → pipeline eligible.
-        let section = framed_section_bytes(
+        let section = build_framed_test_shard(
             &indptr,
             &indices,
             &values_f32,
@@ -1578,7 +1531,7 @@ mod tests {
         let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
         let want_indptr: Vec<i64> = indptr.iter().map(|&v| v as i64).collect();
         let want_indices: Vec<i32> = indices.iter().map(|&v| v as i32).collect();
-        let section = framed_section_bytes(
+        let section = build_framed_test_shard(
             &indptr,
             &indices,
             &values_f32,
@@ -1645,7 +1598,7 @@ mod tests {
             want_data.extend_from_slice(&values_f32);
             nnz_base += *indptr.last().unwrap() as i64;
             total_rows += row_nnzs.len();
-            sections.push(framed_section_bytes(
+            sections.push(build_framed_test_shard(
                 &indptr,
                 &indices,
                 &values_f32,
@@ -1752,7 +1705,7 @@ mod tests {
             want_data.extend_from_slice(&values_f32);
             nnz_base += *indptr.last().unwrap() as i64;
             total_rows += row_nnzs.len();
-            sections.push(framed_section_bytes(
+            sections.push(build_framed_test_shard(
                 &indptr,
                 &indices,
                 &values_f32,
@@ -1818,7 +1771,7 @@ mod tests {
             want_data.extend_from_slice(&values_f32);
             nnz_base += *indptr.last().unwrap() as i64;
             total_rows += row_nnzs.len();
-            sections.push(framed_section_bytes(
+            sections.push(build_framed_test_shard(
                 &indptr,
                 &indices,
                 &values_f32,
@@ -1882,7 +1835,7 @@ mod tests {
         let row_nnzs = vec![1000usize; 16384];
         let (indptr, indices, values_u16) = build_dense_csr(&row_nnzs, n_cols);
         let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
-        let section = framed_section_bytes(
+        let section = build_framed_test_shard(
             &indptr,
             &indices,
             &values_f32,
@@ -2011,7 +1964,8 @@ mod tests {
         );
 
         // Framed Scx1 (per-group device decode), 4 rows per group → 4 groups.
-        let framed = framed_section_bytes(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
+        let framed =
+            build_framed_test_shard(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
         let (f_csr, f_stats) = decode_shard_gpu_with_stats(&dev, &framed).unwrap();
         assert!(
             f_stats.fully_device_decoded,
@@ -2051,7 +2005,7 @@ mod tests {
         let n_rows = indptr.len() - 1;
 
         let section =
-            framed_section_bytes(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
+            build_framed_test_shard(&indptr, &indices, &values_f32, CodecId::Scx1, n_cols, 4);
         let (gpu_csr, stats) = decode_shard_gpu_with_stats(&dev, &section).unwrap();
         assert!(stats.fully_device_decoded, "framed Scx1 must device-decode");
         assert_eq!(gpu_csr.shape, (n_rows, n_cols as usize));

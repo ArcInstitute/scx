@@ -707,9 +707,10 @@ fn wilcoxon_chunk_gpu_sequence_v3(
     chunk_max: usize,
     is_ref_mode: bool,
 ) -> Result<()> {
-    // Pool slab is pre-populated by the shard pass; sort + tie on it. The pool
-    // is the reference group in ref-mode or every cell in 1-vs-rest; either way
-    // `scratch.ref_slab` holds it and `scratch.tie_term` holds its tie term.
+    // Pool slab is pre-populated by the shard pass; sort it. The pool is the
+    // reference group in ref-mode or every cell in 1-vs-rest; either way
+    // `scratch.ref_slab` holds it. The sort is needed on **both** paths --
+    // `gpu_de_searchsorted_u_stat` / `_ranksum` below both require it.
     gpu_de_block_sort(
         dev,
         &mut scratch.ref_slab,
@@ -718,8 +719,24 @@ fn wilcoxon_chunk_gpu_sequence_v3(
         pool_len,
     )
     .map_err(|e| AccelError::LinAlg(format!("GPU DE sort pool (wil v3): {e}")))?;
-    gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, pool_len)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE pool tie (wil v3): {e}")))?;
+    // The pool tie, however, is 1-vs-rest only. `scratch.tie_term` has exactly
+    // three readers, and none of them reads the pool value in ref-mode: the
+    // host dtoh below is gated `!is_ref_mode`; the `memcpy_dtod` into
+    // `tie_per_group` inside the ref-mode branch stages the *combined* tie that
+    // `gpu_de_combined_tie_term` wrote two lines earlier; and pdex's
+    // `gpu_de_pvalues` likewise reads a just-written combined value. So in
+    // ref-mode this launch was pure waste -- and the worst-configured launch in
+    // the sequence, because `gpu_de_tie_term` takes its `block_dim = 1`
+    // `*_simple_kernel` branch whenever `pool_len < GPU_DE_TIE_BLOCK_THRESHOLD`
+    // (8192), which every ref-mode reference group in the test suite is.
+    //
+    // Ref-mode therefore leaves `scratch.tie_term` **undefined on entry to the
+    // loop** -- deliberately. Every ref-mode read is of a value written inside
+    // the same iteration, so there is nothing to leave stale.
+    if !is_ref_mode {
+        gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, pool_len)
+            .map_err(|e| AccelError::LinAlg(format!("GPU DE pool tie (wil v3): {e}")))?;
+    }
 
     // Per-test-group sequence. Each tg's slab is pre-populated; no scatter.
     for (tg_idx, &g) in test_groups.iter().enumerate() {
@@ -835,11 +852,16 @@ fn pdex_ref_chunk_gpu_sequence_v2(
     n_ref: usize,
     chunk_max: usize,
 ) -> Result<()> {
-    // Ref slab is pre-populated by the v2 shard pass; sort + tie on it.
+    // Ref slab is pre-populated by the v2 shard pass; sort it. The sort is
+    // required -- `gpu_de_searchsorted_u_stat` below needs a sorted `ref_slab`.
+    //
+    // The ref *tie* is not. This function is ref-mode by construction (unlike
+    // its wilcoxon sibling it has no `is_ref_mode` parameter), so the per-tg
+    // loop below unconditionally overwrites `scratch.tie_term` with the
+    // combined ref-union-group tie, and `gpu_de_pvalues` reads only that. The
+    // ref tie launch that used to stand here wrote a value nothing ever read.
     gpu_de_block_sort(dev, &mut scratch.ref_slab, &mut scratch.slab_aux, sz, n_ref)
         .map_err(|e| AccelError::LinAlg(format!("GPU DE sort ref (v2): {e}")))?;
-    gpu_de_tie_term(dev, &scratch.ref_slab, &mut scratch.tie_term, sz, n_ref)
-        .map_err(|e| AccelError::LinAlg(format!("GPU DE tie term ref (v2): {e}")))?;
 
     // Per-test-group sequence. The pool slab for each tg is pre-populated;
     // sort + searchsort + combined-tie + p-values + stage_dtod on it.
