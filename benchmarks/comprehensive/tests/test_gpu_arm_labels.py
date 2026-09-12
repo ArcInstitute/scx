@@ -34,6 +34,7 @@ SHUF = "accel_to_gpu_anndata__shufdelta_gpu"
 SHUF_NVCOMP = "accel_to_gpu_anndata__shufdelta_gpu_nvcomp"
 PCA_RESIDENT = "accel_pca__pyscx_gpu_rand_hh"
 PCA_STREAMING = "accel_pca__pyscx_gpu_streaming"
+PCA_BACKED = "accel_pca__pyscx_gpu_backed"
 
 
 @pytest.fixture(scope="module")
@@ -284,7 +285,7 @@ def test_every_arm_floor_names_a_triple_that_actually_runs(floors):
     from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import ARMS
 
     known = {f.key for f in c.accel_formats()}
-    for fmt in (SHUF, SHUF_NVCOMP, PCA_STREAMING):
+    for fmt in (SHUF, SHUF_NVCOMP, PCA_STREAMING, PCA_BACKED):
         specs = [f for f in floors if f.get("format") == fmt]
         assert specs, f"{fmt} carries no floors — the arm would run ungated"
         assert fmt in known, f"{fmt} is floored but not registered"
@@ -421,6 +422,99 @@ def test_every_arm_variant_declares_a_dataset_scope_the_orchestrator_reads():
     assert tga.FORMAT_DATASET_SCOPE[SHUF_NVCOMP] == tga.ARMS[SHUF_NVCOMP].datasets
     assert PCA_STREAMING in pca.FORMAT_DATASET_SCOPE
     assert "census_1m" not in pca.FORMAT_DATASET_SCOPE[PCA_STREAMING]
+
+
+def test_the_backed_pca_arm_is_registered_and_dispatchable():
+    """The out-of-core GPU PCA path had no benchmark at all.
+
+    Every other `accel_pca` variant runs on the runner's **in-memory** adata,
+    which reaches GPU PCA through pyscx's `BorrowedCsrSource` — `n_shards()` is
+    hard-coded 1, so the decode-prefetch pipeline takes its sequential fallback
+    and the multi-shard column-means pass is unobservable. `__pyscx_gpu_streaming`
+    is not an exception: it differs only by `SCX_GPU_PCA_RESIDENT=0` and reads
+    the same single-shard source. Measured on pbmc3k, an in-memory
+    `device="gpu"` PCA reports `route: rapids_singlecell_gpu` and never enters
+    the native path at all.
+    """
+    import benchmarks.comprehensive.config as c
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    assert PCA_BACKED in {f.key for f in c.accel_formats()}
+    assert PCA_BACKED in pca._VARIANT_IMPLS
+    impl, requires_gpu = pca._VARIANT_IMPLS[PCA_BACKED]
+    assert requires_gpu, "a CPU host must skip this arm, not run it on the CPU"
+    assert impl is pca._run_pyscx_gpu_backed
+
+
+def test_the_backed_pca_arm_is_scoped_away_from_single_shard_datasets():
+    """One shard means the prefetch pipeline takes its sequential fallback and
+    this arm measures exactly what the in-memory arms do — under a name that
+    claims otherwise. Shard count follows `n_obs` at the writer's default
+    `shard_target_rows` (16384): pbmc3k's 2,700 cells are one shard;
+    tabula_sapiens_100k gives 7 and census_500k 31."""
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    scope = pca.FORMAT_DATASET_SCOPE.get(PCA_BACKED)
+    assert scope, f"{PCA_BACKED} declares no dataset scope"
+    assert "pbmc3k" not in scope, "pbmc3k is single-shard — the arm would be a duplicate"
+    assert scope == frozenset({"tabula_sapiens_100k", "census_500k"})
+
+
+def test_the_backed_pca_arm_floors_its_shard_count_premise(floors):
+    """The scope is a claim about shard counts; this is the claim being checked
+    at run time. Without it, a change to the writer's default `shard_target_rows`
+    silently turns this arm into a second in-memory measurement and every wall
+    floor below still passes — faster, on a smaller problem."""
+    specs = _floors_for(floors, PCA_BACKED, "pca_backed_n_shards")
+    assert specs, "the multi-shard premise is unfloored — the arm can degrade silently"
+    scope = _scope_for(PCA_BACKED)
+    covered = {s["dataset"] for s in specs}
+    assert covered == set(scope), (
+        f"pca_backed_n_shards floors cover {covered}, scope runs {set(scope)}"
+    )
+    for s in specs:
+        assert s.get("min", 0) >= 2, "a floor of <2 shards asserts nothing"
+
+
+def test_the_backed_pca_wall_floor_names_a_metric_the_gate_can_read(floors):
+    """`check_absolute_floors` reads **`runs[].extra` only**
+    (`_load_current_raw_metric`). `wall_s` is a named `add_run` parameter and so
+    lands at the top level of the record, where the floor gate cannot see it — a
+    `metric: wall_s` floor resolves to "missing", which counts as a violation on
+    every single run. The arm therefore emits its own `pca_backed_wall_s` extra,
+    and this pins that the floor names that one."""
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    specs = [f for f in floors if f.get("format") == PCA_BACKED]
+    assert specs, f"{PCA_BACKED} carries no floors — the 1.4x it exists to gate is ungated"
+    wall_specs = [s for s in specs if "wall" in s["metric"]]
+    assert wall_specs, "no wall ceiling — a regression in the means pass would not fail"
+    src = inspect.getsource(pca.run)
+    for s in wall_specs:
+        assert s["metric"] != "wall_s", (
+            "`wall_s` is not readable by the absolute-floor gate; emit an extra"
+        )
+        assert f'extras["{s["metric"]}"]' in src, (
+            f"{s['metric']} is floored but `accel_pca.run` never emits it"
+        )
+        assert "max" in s, "a wall ceiling is a `max`, not a `min`"
+
+
+def test_the_backed_pca_arm_refuses_to_run_without_its_fixture():
+    """Falling back to the in-memory X would report a single-shard number under
+    the multi-shard arm's name — the precise failure the arm exists to prevent.
+    It raises instead."""
+    import pytest as _pytest
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    class _Adata:
+        uns: dict = {}
+
+    with _pytest.raises(RuntimeError, match="no backed fixture"):
+        pca._run_pyscx_gpu_backed(_Adata(), 50, 0)
 
 
 def test_the_orchestrator_refuses_out_of_scope_triples_before_submitting():

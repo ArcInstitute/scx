@@ -86,7 +86,7 @@ restore_shared_env() {
       && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-pr12-restore \
          "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) \
         >"${OUT}/restore.log" 2>&1 \
-      && "${ENV}/bin/python" -c "import pyscx, sys; sys.exit(0 if pyscx.__file__ else 1)" \
+      && env -u LD_LIBRARY_PATH "${ENV}/bin/python" -c "import pyscx, sys; sys.exit(0 if pyscx.__file__ else 1)" \
       && echo "  ok  ${ENV} restored" \
       || {
           echo "  !! RESTORE FAILED — ${ENV} may still point at a deleted worktree."
