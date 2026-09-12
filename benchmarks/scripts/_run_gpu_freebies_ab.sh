@@ -37,9 +37,14 @@ CONDA=/home/nickyoungblut/miniforge3
 ENV="${CONDA}/envs/scx-bench-gpu"
 WORK=/home/nickyoungblut/scx-bench-pr12
 OUT="${WORK}/gpu_ab_${SLURM_JOB_ID:-manual}"
-WT="${WORK}/wt-pr12-main"
+WT_MAIN="${WORK}/wt-pr12-main"
+WT_BRANCH="${WORK}/wt-pr12-branch"
 BASE=$(git -C "${SCX_DIR}" rev-parse main)
-HEAD_SHA=$(git -C "${SCX_DIR}" rev-parse HEAD)
+# Pinned at submit time via `sbatch --export=ALL,PR12_BRANCH_SHA=$(git rev-parse HEAD)`.
+# Without the pin this resolves `HEAD` when the job *starts*, which on a
+# queue that spans a review round is a different tree from the one the
+# numbers get attributed to.
+HEAD_SHA=${PR12_BRANCH_SHA:-$(git -C "${SCX_DIR}" rev-parse HEAD)}
 mkdir -p "${OUT}"
 
 echo "=== node: $(hostname) ==="
@@ -118,19 +123,28 @@ PY
         2>&1 | tee "${OUT}/de_${name}.txt" | grep -vE "warn|^\s*$"
 }
 
-rm -rf "${WT}"; git -C "${SCX_DIR}" worktree prune
-git -C "${SCX_DIR}" worktree add --detach "${WT}" "${BASE}" >/dev/null 2>&1 || {
-    echo "FATAL: worktree add failed"; exit 1; }
-# `profile_gpu_freebies.py` does not exist at main; pin it into both arms so
-# the only difference between them is the library. Benchmark-only, and the
-# manifest rules permit it -- both arms will report `git_dirty`.
-cp "${SCX_DIR}/benchmarks/scripts/profile_gpu_freebies.py" "${WT}/benchmarks/scripts/"
-cp "${SCX_DIR}/.env" "${WT}/.env"
+# BOTH arms run from a detached worktree at a pinned SHA, including the branch
+# one. The precedent scripts run the branch arm out of the live tree, which
+# makes the measurement hostage to any edit landing while the job sits in the
+# queue -- and on this PR the queue spans review rounds.
+rm -rf "${WT_MAIN}" "${WT_BRANCH}"; git -C "${SCX_DIR}" worktree prune
+git -C "${SCX_DIR}" worktree add --detach "${WT_MAIN}" "${BASE}" >/dev/null 2>&1 || {
+    echo "FATAL: worktree add (main) failed"; exit 1; }
+git -C "${SCX_DIR}" worktree add --detach "${WT_BRANCH}" "${HEAD_SHA}" >/dev/null 2>&1 || {
+    echo "FATAL: worktree add (branch) failed"; exit 1; }
+# `profile_gpu_freebies.py` does not exist at main; pin it into that arm so the
+# only difference between the two is the library. Benchmark-only, and the
+# manifest rules permit it -- the main arm will report `git_dirty`.
+cp "${SCX_DIR}/benchmarks/scripts/profile_gpu_freebies.py" "${WT_MAIN}/benchmarks/scripts/"
+cp "${SCX_DIR}/.env" "${WT_MAIN}/.env"
+cp "${SCX_DIR}/.env" "${WT_BRANCH}/.env"
 
-run_arm main   "${WT}"
-run_arm branch "${SCX_DIR}"
+run_arm main   "${WT_MAIN}"
+run_arm branch "${WT_BRANCH}"
 
-git -C "${SCX_DIR}" worktree remove --force "${WT}" 2>/dev/null; rm -rf "${WT}"
+for w in "${WT_MAIN}" "${WT_BRANCH}"; do
+    git -C "${SCX_DIR}" worktree remove --force "$w" 2>/dev/null; rm -rf "$w"
+done
 
 echo ""
 echo "########## SUMMARY ##########"

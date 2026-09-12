@@ -29,7 +29,11 @@ SCX_DIR=/home/nickyoungblut/dev/rust/scx
 WORK=/home/nickyoungblut/scx-bench-pr12
 WT="${WORK}/wt-pr12-red"
 TARGET=/home/nickyoungblut/.cargo-target-pr12-red
-HEAD_SHA=$(git -C "${SCX_DIR}" rev-parse HEAD)
+# Pinned at submit time via `sbatch --export=ALL,PR12_BRANCH_SHA=$(git rev-parse HEAD)`.
+# Without the pin this resolves `HEAD` when the job *starts*, which on a
+# queue that spans a review round is a different tree from the one the
+# numbers get attributed to.
+HEAD_SHA=${PR12_BRANCH_SHA:-$(git -C "${SCX_DIR}" rev-parse HEAD)}
 mkdir -p "${WORK}"
 
 echo "=== node: $(hostname) ==="
