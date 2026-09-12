@@ -136,18 +136,25 @@ def _measure_pca_backed(dataset: str) -> dict:
             "the decode-prefetch this measures needs more than one"
         )
     walls: list[float] = []
-    emb = None
+    embs: list = []
     info: dict = {}
     for _ in range(N_RUNS):
         adata = pyscx.open(str(scx_path)).to_anndata(backed=True)
         t0 = time.perf_counter()
         pyscx.accel.pca(adata, n_comps=N_COMPS, device="gpu", random_state=SEED)
         walls.append(time.perf_counter() - t0)
-        emb = np.asarray(adata.obsm["X_pca"], dtype=np.float64)
+        embs.append(np.asarray(adata.obsm["X_pca"], dtype=np.float64))
         info = dict(adata.uns.get("scx_accel", {}).get("pca", {}))
         del adata
+    emb = embs[0] if embs else None
     if emb is not None:
         np.save(EMB_DIR / f"pca_backed__{dataset}.npy", emb)
+        # Same-arm repeat, exactly as the in-memory arm saves one. Without it a
+        # cross-arm difference has no scale: GPU PCA's power loop and QR are not
+        # obviously run-to-run deterministic, so "the arms differ by 4e-11" and
+        # "this build differs from itself by 4e-11" are indistinguishable — and
+        # the first reads as a fidelity regression while the second is nothing.
+        np.save(EMB_DIR / f"pca_backed_repeat__{dataset}.npy", embs[-1])
     return {
         "n_shards": n_shards,
         "walls_s": walls,
@@ -155,6 +162,10 @@ def _measure_pca_backed(dataset: str) -> dict:
         "peak_rss_mb": _peak_rss_mb(),
         "route": info.get("route"),
         "emb_shape": list(emb.shape) if emb is not None else None,
+        "self_cosine_min": _cosine_min(embs[0], embs[-1]) if len(embs) > 1 else None,
+        "self_bit_identical": bool(np.array_equal(embs[0], embs[-1]))
+        if len(embs) > 1
+        else None,
     }
 
 
