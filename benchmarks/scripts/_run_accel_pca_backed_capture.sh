@@ -82,7 +82,11 @@ set -a; . ./.env; set +a
 
 # The summary checks that THIS job produced each scoped dataset, not that some
 # file with the right name exists in the shared raw directory.
-JOB_START_EPOCH=$(date +%s)
+# Nanoseconds: `date +%s` is integral, and `st_mtime < started` then accepts a
+# pre-existing file written in the same second (codex, round 3). The expected
+# paths are also removed up front, so "exists and is newer" cannot be satisfied
+# by anything this job did not write.
+JOB_START_EPOCH=$(date +%s.%N)
 EXPECTED_DATASETS=$(python -c "
 import sys; sys.path.insert(0, '${SCX_DIR}')
 from benchmarks.comprehensive.benchmarks import accel_pca
@@ -90,6 +94,10 @@ print(','.join(sorted(accel_pca.FORMAT_DATASET_SCOPE['accel_pca__pyscx_gpu_backe
 ") || { echo "FATAL: could not resolve the arm's dataset scope"; exit 1; }
 export JOB_START_EPOCH EXPECTED_DATASETS
 echo "expecting results for: ${EXPECTED_DATASETS}"
+RAW_DIR="${SCX_DIR}/benchmarks/comprehensive/results/raw"
+for d in ${EXPECTED_DATASETS//,/ }; do
+    rm -f "${RAW_DIR}/accel_pca__accel_pca__pyscx_gpu_backed__${d}.json"
+done
 
 # Drive the benchmark module directly rather than through `run_all.py`: its
 # `ALL_FORMATS` does not contain accel variants at all (they come from

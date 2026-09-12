@@ -612,6 +612,12 @@ def test_the_backed_fixture_path_does_not_fall_back_to_the_cwd(monkeypatch, tmp_
     monkeypatch.delenv("SCX_BENCH_TMPDIR", raising=False)
     monkeypatch.delenv("SCX_WORK_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
+    # Redirect the fallback so the unset-env branch is still the one under test
+    # but nothing is created on the real shared /tmp. Round 2 dropped the global
+    # `Path.exists` patch but left `out_dir.mkdir` running against /tmp, and the
+    # commit message claimed otherwise (Cursor Agent, round 3).
+    fallback = tmp_path / "fallback_tmp" / "scx_pca_backed_fixtures"
+    monkeypatch.setattr(pca, "_FALLBACK_FIXTURE_DIR", fallback)
 
     class _Adata:
         n_obs, n_vars = 10, 4
@@ -630,9 +636,10 @@ def test_the_backed_fixture_path_does_not_fall_back_to_the_cwd(monkeypatch, tmp_
     assert got is None, "the stub adata cannot convert; this test is about the path"
     assert calls, "the builder never logged its target path"
     chosen = str(calls[-1])
-    assert chosen.startswith("/tmp/scx_pca_backed_fixtures"), (
-        f"fixture resolved to {chosen}, not the /tmp fallback"
+    assert chosen.startswith(str(fallback)), (
+        f"fixture resolved to {chosen}, not the documented fallback directory"
     )
+    # The cwd — the directory `Path("").is_dir()` used to resolve to — is untouched.
     assert not (tmp_path / "scx_pca_backed_fixtures").exists()
 
 

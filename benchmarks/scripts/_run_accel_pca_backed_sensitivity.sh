@@ -110,10 +110,10 @@ run_arm() {
     cd "${dir}" || return 1
     python -c "import pyscx; print('so:', pyscx.__file__)"
     set -a; . ./.env; set +a
-    # Force a rebuild of the backed fixture per arm: it is written by the arm's
-    # own pyscx, and a cached one from the other arm would silently make both
-    # arms read a file only one of them produced.
-    SCX_BENCH_REBUILD_BACKED=1 ARM="${name}" OUTDIR="${OUT}" python - <<'PYEOF' 2>&1 | tail -30
+    # `_ensure_scx_backed_fixture` now rebuilds unconditionally and names the file
+    # per process, so the old `SCX_BENCH_REBUILD_BACKED=1` here is dead and gone:
+    # each arm's fixture is written by its own pyscx by construction.
+    ARM="${name}" OUTDIR="${OUT}" python - <<'PYEOF' 2>&1 | tail -30
 import json, os, statistics, sys
 from pathlib import Path
 
@@ -123,11 +123,17 @@ from benchmarks.comprehensive.config import DATASETS
 
 KEY = "accel_pca__pyscx_gpu_backed"
 variant = next(v for v in accel_pca.accel_pca_variants() if v.key == KEY)
+# EVERY scoped dataset must produce a result, as capture requires. Writing
+# whatever `rows` happened to fill and exiting 0 let an arm measure half its
+# declared scope — or nothing — and still be compared (codex, Cursor Agent,
+# round 3). The shell's `[ $? -eq 0 ]` cannot see that; only this can.
+WANT = ("tabula_sapiens_100k", "census_500k")
 rows = {}
-for name in ("tabula_sapiens_100k", "census_500k"):
+missing = []
+for name in WANT:
     res = accel_pca.run(DATASETS[name], variant, n_runs=3)
     if res is None:
-        print(f"  {name}: run() returned None"); continue
+        print(f"  {name}: run() returned None"); missing.append(name); continue
     walls = [r.extra["pca_backed_wall_s"] for r in res.runs if "pca_backed_wall_s" in r.extra]
     shards = [r.extra.get("pca_backed_n_shards") for r in res.runs]
     rows[name] = {"median_wall_s": statistics.median(walls), "walls": walls,
@@ -135,6 +141,9 @@ for name in ("tabula_sapiens_100k", "census_500k"):
     print(f"  {name}: median={rows[name]['median_wall_s']:.3f}s shards={rows[name]['n_shards']}",
           flush=True)
 Path(os.environ["OUTDIR"], f"sens_{os.environ['ARM']}.json").write_text(json.dumps(rows, indent=2))
+if missing:
+    print(f"!! arm produced no result for: {', '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
     # PIPESTATUS, not $?: the pipeline above ends in `tail`, whose status is 0
     # even when the python inside died. Job 2938468's branch arm exited on a
@@ -177,8 +186,16 @@ try:
 except Exception as e:
     print("could not read both arms:", e); raise SystemExit(1)
 
+# The intersection is not a coverage check: `{}` and `{}` intersect to nothing
+# and printed a bare header, and both arms missing census compared only tabula —
+# either way exit 0 (codex, Cursor Agent, round 3). Require the exact set.
+WANT = {"tabula_sapiens_100k", "census_500k"}
+if set(m) != WANT or set(b) != WANT:
+    print(f"!! incomplete arms — main={sorted(m)} branch={sorted(b)} want={sorted(WANT)}")
+    raise SystemExit(1)
+
 print(f"{'dataset':<24} {'main s':>9} {'branch s':>9} {'speedup':>8} {'1.25x ceiling catches?':>24}")
-for k in sorted(set(m) & set(b)):
+for k in sorted(WANT):
     a, c = m[k]["median_wall_s"], b[k]["median_wall_s"]
     speed = a / c if c else float("nan")
     # A ceiling at 1.25x the branch median fails only if a regression pushes the

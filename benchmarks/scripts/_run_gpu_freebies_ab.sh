@@ -237,11 +237,11 @@ def load(p):
 
 
 fb_main, fb_branch = load(out / "freebies_main.json"), load(out / "freebies_branch.json")
-de_pre_m, de_pre_b = load(out / "de_main.json"), load(out / "de_branch.json")
+de_main, de_branch = load(out / "de_main.json"), load(out / "de_branch.json")
 # `load` returning None used to skip the table silently and still exit 0 — an
 # A/B that compared nothing, reported as success (all three reviewers, round 2).
 _absent = [n for n, v in (("freebies_main", fb_main), ("freebies_branch", fb_branch),
-                          ("de_main", de_pre_m), ("de_branch", de_pre_b)) if not v]
+                          ("de_main", de_main), ("de_branch", de_branch)) if not v]
 if fb_main and fb_branch:
     print("\n-- wall (min of 3), main -> branch --")
     print(f"{'measurement':<46} {'main':>10} {'branch':>10} {'speedup':>9}")
@@ -286,12 +286,22 @@ for name in ("pca_inmem__pbmc3k", "pca_backed__tabula_sapiens_100k",
           f"bit-identical={ident}")
 
 print("\n-- GPU DE (OPT-GPU-1); hvg is the control and should not move --")
-de_main, de_branch = load(out / "de_main.json"), load(out / "de_branch.json")
 if de_main and de_branch:
     # `profile_gpu_de_resident.py` writes a flat list of rows keyed by
     # (dataset, op), with a **median** `wall_ms` of 3 runs.
     def key(r):
         return (r.get('dataset'), r.get('op'))
+    # Non-empty is not coverage: `profile_gpu_de_resident.py` returns 0 whenever
+    # ANY row survives, so pbmc3k rows can make both files truthy while every
+    # tabula row is absent and the A/B still exits 0 (codex, round 3). Require
+    # the full requested product of datasets x ops on both arms.
+    WANT_DE = {(d, o) for d in ("pbmc3k", "tabula_sapiens_100k")
+               for o in ("pdex_ref", "wilcoxon", "hvg")}
+    have_m, have_b = {key(r) for r in de_main}, {key(r) for r in de_branch}
+    if not (WANT_DE <= have_m and WANT_DE <= have_b):
+        print(f"!! DE coverage incomplete — main missing {sorted(WANT_DE - have_m)}, "
+              f"branch missing {sorted(WANT_DE - have_b)}")
+        _absent.append("de coverage")
     bm = {key(r): r for r in de_main}
     print(f"{'dataset/op':<34} {'main ms':>10} {'branch ms':>10} {'speedup':>9}  route")
     for r in de_branch:

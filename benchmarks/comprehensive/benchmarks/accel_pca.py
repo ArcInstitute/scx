@@ -229,6 +229,11 @@ def _run_pyscx_gpu_streaming(adata: Any, n_comps: int, seed: int) -> str:
 # `accel_de` uses for its CSC fixture (`_bench_scx_with_csc_path`).
 _BACKED_UNS_KEY = "_bench_scx_backed_path"
 
+#: Where backed fixtures go when neither `SCX_BENCH_TMPDIR` nor `SCX_WORK_DIR` is
+#: set. A module constant rather than a literal so a test can redirect it — the
+#: alternative was a unit test mkdir'ing a directory on the real shared `/tmp`.
+_FALLBACK_FIXTURE_DIR = Path("/tmp/scx_pca_backed_fixtures")
+
 
 def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
     """Materialise the preprocessed adata as an SCX file so PCA can run on a
@@ -256,9 +261,7 @@ def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
     # note, as `accel_preprocess._ensure_scx_fixture`.
     base_str = os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", "")
     out_dir = (
-        Path(base_str) / "scx_pca_backed_fixtures"
-        if base_str
-        else Path("/tmp/scx_pca_backed_fixtures")
+        Path(base_str) / "scx_pca_backed_fixtures" if base_str else _FALLBACK_FIXTURE_DIR
     )
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -281,7 +284,15 @@ def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
     # so the cost is one conversion per (dataset, variant) cell — paid for a
     # correctness property, and the alternative is a real content fingerprint
     # over the whole matrix, which costs a full pass anyway.
-    scx_path = out_dir / f"{dataset_name}.bench_pca_backed.scx"
+    # Per-invocation filename. Rebuilding every time removes *sequential* stale
+    # reuse but not *simultaneous* collision: `SCX_WORK_DIR` is shared across
+    # SLURM jobs and the capture script says it can run beside others, so two
+    # backed-PCA processes for the same dataset would unlink and rewrite one
+    # deterministic path — and one arm could again be scored against the other's
+    # matrix (codex, round 3). `run()` resolves this once and reuses it across
+    # warm-up and every timed run, so the per-process suffix costs nothing.
+    owner = f"{os.environ.get('SLURM_JOB_ID', 'local')}.{os.getpid()}"
+    scx_path = out_dir / f"{dataset_name}.{owner}.bench_pca_backed.scx"
     try:
         import pyscx
 
