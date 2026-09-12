@@ -611,8 +611,8 @@ where
 /// A free function rather than a trait method because the pipeline needs
 /// `Self: Sync`, and putting that bound on a *provided* method would make it
 /// unavailable through the `&dyn ShardSource` boundaries `scx-gpu` uses. Callers
-/// that can name a `Sync` source (CPU PCA today, GPU PCA's identical serial loop
-/// in `scx_gpu::gpu_pca` next) opt in here; everyone else keeps the default.
+/// that can name a `Sync` source (CPU PCA, and GPU PCA's `randomized_pca_core`,
+/// which has since adopted it) opt in here; everyone else keeps the default.
 pub fn col_means_and_sum_sq_prefetched<S>(
     source: &S,
     zero_center: bool,

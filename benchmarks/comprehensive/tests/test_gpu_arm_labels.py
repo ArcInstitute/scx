@@ -23,6 +23,7 @@ skipped in silence, which is how a gate exits 0 having measured nothing.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import yaml
@@ -34,6 +35,7 @@ SHUF = "accel_to_gpu_anndata__shufdelta_gpu"
 SHUF_NVCOMP = "accel_to_gpu_anndata__shufdelta_gpu_nvcomp"
 PCA_RESIDENT = "accel_pca__pyscx_gpu_rand_hh"
 PCA_STREAMING = "accel_pca__pyscx_gpu_streaming"
+PCA_BACKED = "accel_pca__pyscx_gpu_backed"
 
 
 @pytest.fixture(scope="module")
@@ -284,7 +286,7 @@ def test_every_arm_floor_names_a_triple_that_actually_runs(floors):
     from benchmarks.comprehensive.benchmarks.accel_to_gpu_anndata import ARMS
 
     known = {f.key for f in c.accel_formats()}
-    for fmt in (SHUF, SHUF_NVCOMP, PCA_STREAMING):
+    for fmt in (SHUF, SHUF_NVCOMP, PCA_STREAMING, PCA_BACKED):
         specs = [f for f in floors if f.get("format") == fmt]
         assert specs, f"{fmt} carries no floors — the arm would run ungated"
         assert fmt in known, f"{fmt} is floored but not registered"
@@ -421,6 +423,224 @@ def test_every_arm_variant_declares_a_dataset_scope_the_orchestrator_reads():
     assert tga.FORMAT_DATASET_SCOPE[SHUF_NVCOMP] == tga.ARMS[SHUF_NVCOMP].datasets
     assert PCA_STREAMING in pca.FORMAT_DATASET_SCOPE
     assert "census_1m" not in pca.FORMAT_DATASET_SCOPE[PCA_STREAMING]
+
+
+def test_the_backed_pca_arm_is_registered_and_dispatchable():
+    """The out-of-core GPU PCA path had no benchmark at all.
+
+    Every other `accel_pca` variant runs on the runner's **in-memory** adata,
+    which reaches GPU PCA through pyscx's `BorrowedCsrSource` — `n_shards()` is
+    hard-coded 1, so the decode-prefetch pipeline takes its sequential fallback
+    and the multi-shard column-means pass is unobservable. `__pyscx_gpu_streaming`
+    is not an exception: it differs only by `SCX_GPU_PCA_RESIDENT=0` and reads
+    the same single-shard source. Measured on pbmc3k, an in-memory
+    `device="gpu"` PCA reports `route: rapids_singlecell_gpu` and never enters
+    the native path at all.
+    """
+    import benchmarks.comprehensive.config as c
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    assert PCA_BACKED in {f.key for f in c.accel_formats()}
+    assert PCA_BACKED in pca._VARIANT_IMPLS
+    impl, requires_gpu = pca._VARIANT_IMPLS[PCA_BACKED]
+    assert requires_gpu, "a CPU host must skip this arm, not run it on the CPU"
+    assert impl is pca._run_pyscx_gpu_backed
+
+
+def test_the_backed_pca_arm_is_scoped_away_from_single_shard_datasets():
+    """One shard means the prefetch pipeline takes its sequential fallback and
+    this arm measures exactly what the in-memory arms do — under a name that
+    claims otherwise. Shard count follows `n_obs` at the writer's default
+    `shard_target_rows` (16384): pbmc3k's 2,700 cells are one shard;
+    tabula_sapiens_100k gives 7 and census_500k 31."""
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    scope = pca.FORMAT_DATASET_SCOPE.get(PCA_BACKED)
+    assert scope, f"{PCA_BACKED} declares no dataset scope"
+    assert "pbmc3k" not in scope, "pbmc3k is single-shard — the arm would be a duplicate"
+    assert scope == frozenset({"tabula_sapiens_100k", "census_500k"})
+
+
+def test_the_backed_pca_arm_floors_its_shard_count_premise(floors):
+    """The scope is a claim about shard counts; this is the claim being checked
+    at run time. Without it, a change to the writer's default `shard_target_rows`
+    silently turns this arm into a second in-memory measurement and every wall
+    floor below still passes — faster, on a smaller problem."""
+    specs = _floors_for(floors, PCA_BACKED, "pca_backed_n_shards")
+    assert specs, "the multi-shard premise is unfloored — the arm can degrade silently"
+    scope = _scope_for(PCA_BACKED)
+    covered = {s["dataset"] for s in specs}
+    assert covered == set(scope), (
+        f"pca_backed_n_shards floors cover {covered}, scope runs {set(scope)}"
+    )
+    for s in specs:
+        assert s.get("min", 0) >= 2, "a floor of <2 shards asserts nothing"
+
+
+def test_the_backed_pca_wall_floor_names_a_metric_the_gate_can_read(floors):
+    """`check_absolute_floors` reads **`runs[].extra` only**
+    (`_load_current_raw_metric`). `wall_s` is a named `add_run` parameter and so
+    lands at the top level of the record, where the floor gate cannot see it — a
+    `metric: wall_s` floor resolves to "missing", which counts as a violation on
+    every single run. The arm therefore emits its own `pca_backed_wall_s` extra,
+    and this pins that the floor names that one."""
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    specs = [f for f in floors if f.get("format") == PCA_BACKED]
+    assert specs, f"{PCA_BACKED} carries no floors — the 1.4x it exists to gate is ungated"
+    wall_specs = [s for s in specs if "wall" in s["metric"]]
+    assert wall_specs, "no wall ceiling — a regression in the means pass would not fail"
+    src = inspect.getsource(pca.run)
+    for s in wall_specs:
+        assert s["metric"] != "wall_s", (
+            "`wall_s` is not readable by the absolute-floor gate; emit an extra"
+        )
+        assert f'extras["{s["metric"]}"]' in src, (
+            f"{s['metric']} is floored but `accel_pca.run` never emits it"
+        )
+        assert "max" in s, "a wall ceiling is a `max`, not a `min`"
+
+
+def test_the_backed_pca_wall_ceiling_is_only_where_it_can_fire(floors):
+    """The wall ceiling is on tabula_sapiens_100k and deliberately NOT on
+    census_500k.
+
+    Measured main vs branch in one job, same host, identical shard counts
+    (SLURM 2938504):
+
+        tabula_sapiens_100k   1.615 -> 1.141 s   1.42x   1.25x ceiling = 1.43  FIRES
+        census_500k           4.033 -> 3.573 s   1.13x   1.25x ceiling = 4.47  cannot
+
+    A census ceiling at the house 1.25x would sit above the *reverted* wall, so
+    deleting the optimisation outright would leave it green. That is worse than
+    no floor: it reads as coverage. This test exists so a later "we floored one
+    dataset, let's floor the other for symmetry" has to produce a number first.
+    """
+    walls = [f for f in floors
+             if f.get("format") == PCA_BACKED and "wall" in f.get("metric", "")]
+    covered = {f["dataset"] for f in walls}
+    assert covered == {"tabula_sapiens_100k"}, (
+        f"wall ceilings on {covered}; census_500k's 1.13x cannot be caught by a "
+        "1.25x ceiling — re-measure before adding one"
+    )
+    # And the exact floors DO cover both, so census still gates what it can.
+    for metric in ("pca_backed_n_shards", "pca_route_gpu_correct"):
+        exact = {f["dataset"] for f in _floors_for(floors, PCA_BACKED, metric)}
+        assert exact == set(_scope_for(PCA_BACKED)), (
+            f"{metric} covers {exact}; every scoped dataset must carry it"
+        )
+
+
+def test_the_backed_pca_arm_gates_the_answer_and_not_only_the_speed(floors):
+    """Shard count + route + a wall ceiling gate that it ran multi-shard, on the
+    GPU, fast. None of them gate that the numbers are right — a broken
+    column-means pass reporting a `gpu_*` route under 1.43 s would pass all
+    three. `run()` already emits the subspace extras for every variant, so the
+    arm was carrying them unfloored (found by Cursor Agent)."""
+    for metric in ("subspace_cos_mean", "subspace_cos_min"):
+        specs = _floors_for(floors, PCA_BACKED, metric)
+        covered = {s["dataset"] for s in specs}
+        assert covered == set(_scope_for(PCA_BACKED)), (
+            f"{metric} covers {covered}; every scoped dataset must gate correctness"
+        )
+
+
+def test_the_backed_pca_arm_refuses_to_run_without_its_fixture():
+    """Falling back to the in-memory X would report a single-shard number under
+    the multi-shard arm's name — the precise failure the arm exists to prevent.
+    It raises instead."""
+    import pytest as _pytest
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    class _Adata:
+        uns: dict = {}
+
+    with _pytest.raises(RuntimeError, match="no backed fixture"):
+        pca._run_pyscx_gpu_backed(_Adata(), 50, 0)
+
+
+def test_every_write_missing_result_call_binds_the_real_signature():
+    """The fixture-failure path is the backed arm's whole safety story — "record
+    missing, never silently measure the in-memory X". It shipped omitting
+    `write_missing_result`'s required `missing_reason`, so it raised `TypeError`
+    and failed the job instead (Cursor Agent, codex).
+
+    Checks **every** call site in the module, via `ast`, not the first one a
+    regex happens to match: the first draft of this test matched a *sibling*
+    call that already passed the argument, and so stayed green against the
+    unfixed code.
+    """
+    import ast
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+    from benchmarks.comprehensive.results import write_missing_result
+
+    required = {
+        n for n, prm in inspect.signature(write_missing_result).parameters.items()
+        if prm.default is inspect.Parameter.empty
+    }
+    tree = ast.parse(inspect.getsource(pca))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None))
+        == "write_missing_result"
+    ]
+    assert calls, "accel_pca no longer calls write_missing_result"
+    for node in calls:
+        kwargs = {kw.arg for kw in node.keywords if kw.arg}
+        n_pos = len(node.args)
+        missing = sorted(required - kwargs)[n_pos:] if n_pos else sorted(required - kwargs)
+        assert not missing, (
+            f"write_missing_result at line {node.lineno} omits {missing} — "
+            "that call raises TypeError on the path it exists to handle"
+        )
+
+
+def test_the_backed_fixture_path_does_not_fall_back_to_the_cwd(monkeypatch, tmp_path):
+    """`Path("")` is `PosixPath(".")` and `.is_dir()` is True, so an unset
+    `SCX_BENCH_TMPDIR`/`SCX_WORK_DIR` used to land the fixture in whatever
+    directory launched the benchmark instead of the documented `/tmp` fallback —
+    on a shared node, next to another job's. `accel_preprocess` carries a NOTE
+    about this exact trap; this arm had reproduced it (Antigravity, codex)."""
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    monkeypatch.delenv("SCX_BENCH_TMPDIR", raising=False)
+    monkeypatch.delenv("SCX_WORK_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    # Redirect the fallback so the unset-env branch is still the one under test
+    # but nothing is created on the real shared /tmp. Round 2 dropped the global
+    # `Path.exists` patch but left `out_dir.mkdir` running against /tmp, and the
+    # commit message claimed otherwise (Cursor Agent, round 3).
+    fallback = tmp_path / "fallback_tmp" / "scx_pca_backed_fixtures"
+    monkeypatch.setattr(pca, "_FALLBACK_FIXTURE_DIR", fallback)
+
+    class _Adata:
+        n_obs, n_vars = 10, 4
+
+    # Resolve the directory the function would choose, without letting it write:
+    # `pyscx.from_anndata` on this stub raises, the function logs and returns
+    # None, and the assertion is about WHERE it tried. Patching `Path.exists`
+    # globally (the first version of this test) also made it mkdir the real
+    # shared `/tmp` from a unit test.
+    calls: list[str] = []
+    monkeypatch.setattr(pca, "logger", type("L", (), {
+        "info": lambda self, *a: calls.append(a[2] if len(a) > 2 else ""),
+        "warning": lambda self, *a: None,
+    })())
+    got = pca._ensure_scx_backed_fixture(_Adata(), "ds")
+    assert got is None, "the stub adata cannot convert; this test is about the path"
+    assert calls, "the builder never logged its target path"
+    chosen = str(calls[-1])
+    assert chosen.startswith(str(fallback)), (
+        f"fixture resolved to {chosen}, not the documented fallback directory"
+    )
+    # The cwd — the directory `Path("").is_dir()` used to resolve to — is untouched.
+    assert not (tmp_path / "scx_pca_backed_fixtures").exists()
 
 
 def test_the_orchestrator_refuses_out_of_scope_triples_before_submitting():

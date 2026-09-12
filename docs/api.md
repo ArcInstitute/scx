@@ -1106,7 +1106,12 @@ will still raise); the guarantee covers pyscx's own entry points.
 - `row_max()` / `col_max()` / `row_min()` / `col_min()` — Streaming extrema
 
 - `total_nnz()` — Total NNZ across all shards
-- `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA
+- `col_means_and_sum_sq(zero_center)` — Single-pass column statistics for PCA.
+  Decodes one shard at a time on the calling thread; a caller that can name a
+  `Sync` source should prefer `scx_format_io::col_means_and_sum_sq_prefetched`,
+  which overlaps decode across shards and is bit-identical to it (the trait
+  default is that function's test oracle, so the two cannot drift). Both CPU and
+  GPU PCA take the prefetched form.
 - Masked variants (deletion-vector aware): `col_sums_masked(kept_rows)`, `col_nnz_masked(kept_rows)`, `col_max_masked(kept_rows)`, `col_min_masked(kept_rows)`, `col_var_masked(kept_rows)`
 
 ### Overfull-axis rejection in the aggregations

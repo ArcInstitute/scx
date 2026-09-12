@@ -407,6 +407,13 @@ type GroupPlanes = (usize, Vec<u8>, Vec<u8>); // (group_idx, indices_planes, val
 pub struct PipelinedCsr {
     pub csr: GpuCsr,
     pub host_uploaded_bytes: u64,
+    /// The assembled **host** indptr, `n_rows + 1` entries, shard-local.
+    ///
+    /// Handed back rather than dropped so the multi-shard assemble loop can
+    /// fold it without a per-shard `dtoh_copy` — which on pageable host memory
+    /// drains the whole stream once per shard. It is a byte-for-byte copy of
+    /// what `csr`'s device indptr holds.
+    pub indptr: Vec<i64>,
 }
 
 /// Pipelined GPU decode of a framed ShufDeltaZstd shard. Returns the combined
@@ -446,9 +453,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
     let mut host_uploaded_bytes = (combined.indptr.len() * 8) as u64;
 
     if nnz == 0 {
+        let (csr, indptr) =
+            combined.finish_with_indptr(dev, n_cols, "framed ShufDeltaZstd shard (pipelined)")?;
         return Ok(PipelinedCsr {
-            csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (pipelined)")?,
+            csr,
             host_uploaded_bytes,
+            indptr,
         });
     }
 
@@ -644,9 +654,12 @@ pub fn decode_framed_shufdelta_gpu_pipelined(
         }
     }
 
+    let (csr, indptr) =
+        combined.finish_with_indptr(dev, n_cols, "framed ShufDeltaZstd shard (pipelined)")?;
     Ok(PipelinedCsr {
-        csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (pipelined)")?,
+        csr,
         host_uploaded_bytes,
+        indptr,
     })
 }
 
@@ -772,9 +785,12 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
     let mut host_uploaded_bytes = (combined.indptr.len() * 8) as u64;
 
     if nnz == 0 {
+        let (csr, indptr) =
+            combined.finish_with_indptr(dev, n_cols, "framed ShufDeltaZstd shard (nvcomp)")?;
         return Ok(PipelinedCsr {
-            csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (nvcomp)")?,
+            csr,
             host_uploaded_bytes,
+            indptr,
         });
     }
 
@@ -827,9 +843,12 @@ pub fn decode_framed_shufdelta_gpu_nvcomp(
     }
     profile::record_gpu_decode_since(t_gpu);
 
+    let (csr, indptr) =
+        combined.finish_with_indptr(dev, n_cols, "framed ShufDeltaZstd shard (nvcomp)")?;
     Ok(PipelinedCsr {
-        csr: combined.finish(dev, n_cols, "framed ShufDeltaZstd shard (nvcomp)")?,
+        csr,
         host_uploaded_bytes,
+        indptr,
     })
 }
 

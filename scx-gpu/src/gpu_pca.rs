@@ -24,7 +24,7 @@ use cudarc::driver::safe::LaunchConfig;
 use cudarc::driver::PushKernelArg;
 use faer::Mat;
 
-use scx_format_io::ShardSource;
+use scx_format_io::{col_means_and_sum_sq_prefetched, ShardSource};
 use scx_sparse::total_variance_from_col_sq;
 
 use crate::cublas::{gpu_sgemm, gpu_sgemv, gpu_transpose_f32, CublasHandle};
@@ -470,10 +470,27 @@ fn randomized_pca_core(
     // pre-2.5 fp32 numerics; AllowTf32 trades mantissa precision for speed.
     cublas_handle.set_math_mode(tuning.math_mode)?;
 
-    // Step 1: Compute column means and sum-of-squares (CPU-side, 1 pass)
-    let (means, col_sum_sq) = source
-        .col_means_and_sum_sq(zero_center)
-        .map_err(format_scx_error)?;
+    // Step 1: column means and sum-of-squares (host-side, one pass over X).
+    //
+    // Through the **prefetched** twin, not `ShardSource::col_means_and_sum_sq`.
+    // The two are bit-identical by construction — consumption is single-threaded
+    // and in strict shard order, so the float accumulation order is the same —
+    // and that is pinned by `scx_format_io`'s
+    // `col_means_prefetched_is_bit_identical_to_the_trait_default`, over a
+    // fixture built to be shard-order-sensitive (a cancelling ±1e16 pair, so a
+    // reordering cannot come out equal by luck). The trait default stays as that
+    // test's oracle and as the fallback for `&dyn ShardSource` callers that
+    // cannot name `Sync`; this call site was its last production caller.
+    //
+    // The budget is the staging one on purpose: this pass decodes shards into
+    // host memory exactly as `RawGpuShardSource`'s staging loop does, so it
+    // should answer to the same `SCX_GPU_STAGING_MEMORY_BUDGET`. On a
+    // single-shard source (every in-memory `X`, via pyscx's `BorrowedCsrSource`)
+    // the pipeline takes its sequential fallback, so this is a no-op there.
+    let depth =
+        crate::gpu_shard_source::resolve_staging_prefetch_depth_for(source.shard_size_hint());
+    let (means, col_sum_sq) =
+        col_means_and_sum_sq_prefetched(source, zero_center, depth).map_err(format_scx_error)?;
 
     // Upload means to GPU for mean correction (if centering)
     let d_means: Option<CudaSlice<f32>> = means
@@ -1037,9 +1054,9 @@ pub(crate) fn gpu_scale_columns(
 }
 
 // NOTE: `compute_means_and_col_sq` has been replaced by
-// `BackedCsrReader::col_means_and_sum_sq()` in scx-format-io.
-// `compute_total_variance_from_col_sq` has been replaced by
-// `scx_sparse::total_variance_from_col_sq()`.
+// `scx_format_io::col_means_and_sum_sq_prefetched` (see step 1 of
+// `randomized_pca_core`). `compute_total_variance_from_col_sq` has been
+// replaced by `scx_sparse::total_variance_from_col_sq()`.
 
 /// Format ScxError as GpuError.
 fn format_scx_error(e: scx_format_io::ScxError) -> GpuError {

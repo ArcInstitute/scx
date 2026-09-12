@@ -110,6 +110,11 @@ def accel_pca_variants() -> list[FormatVariant]:
             key="accel_pca__pyscx_gpu_streaming",
             category="accel", runner="accel_runner",
         ),
+        FormatVariant(
+            name="pyscx PCA (GPU, backed multi-shard X)",
+            key="accel_pca__pyscx_gpu_backed",
+            category="accel", runner="accel_runner",
+        ),
     ]
 
 
@@ -216,6 +221,146 @@ def _run_pyscx_gpu_streaming(adata: Any, n_comps: int, seed: int) -> str:
         adata, n_comps=n_comps, device="gpu",
         method="randomized", qr_method="householder", random_state=seed,
     )
+    return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
+
+
+# The backed-X arm's fixture. Keyed in `uns` rather than passed, because the
+# variant impls take `(adata, n_comps, seed)` and nothing else — the same seam
+# `accel_de` uses for its CSC fixture (`_bench_scx_with_csc_path`).
+_BACKED_UNS_KEY = "_bench_scx_backed_path"
+
+#: Where backed fixtures go when neither `SCX_BENCH_TMPDIR` nor `SCX_WORK_DIR` is
+#: set. A module constant rather than a literal so a test can redirect it — the
+#: alternative was a unit test mkdir'ing a directory on the real shared `/tmp`.
+_FALLBACK_FIXTURE_DIR = Path("/tmp/scx_pca_backed_fixtures")
+
+
+def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
+    """Materialise the preprocessed adata as an SCX file so PCA can run on a
+    **backed, multi-shard** ``X``.
+
+    Deliberately not a CSC fixture: PCA rejects `prefer_format="csc"` outright,
+    so the sidecar would be built and never read. `csc="off"` skips it.
+
+    `shard_size` is left at the writer's default on purpose — the point of this
+    arm is the layout a user actually gets from `pyscx.from_anndata`, and
+    pinning a bespoke value here would gate a layout nothing produces. The shard
+    count is asserted at run time instead (see `_run_pyscx_gpu_backed`), so a
+    default that drifts to one shard fails the floor rather than silently
+    turning this arm into a copy of the in-memory ones.
+
+    Written under ``$SCX_BENCH_TMPDIR/scx_pca_backed_fixtures/`` (falling back to
+    ``/tmp``) and **rebuilt on every invocation** — see the body for why a cache
+    key cannot be trusted here.
+    """
+    import os
+
+    # NOTE: `Path("")` is `PosixPath(".")` and `.is_dir()` is True, so an unset
+    # env must be detected on the raw STRING before constructing the Path — else
+    # the fixture lands in the cwd instead of the /tmp fallback. Same trap, same
+    # note, as `accel_preprocess._ensure_scx_fixture`.
+    base_str = os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", "")
+    out_dir = (
+        Path(base_str) / "scx_pca_backed_fixtures" if base_str else _FALLBACK_FIXTURE_DIR
+    )
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("accel_pca: cannot create %s (%s); no backed fixture", out_dir, e)
+        return None
+    # **Rebuilt every invocation, never reused from disk.**
+    #
+    # A cache key can only be as good as what it hashes. Keying on the dataset
+    # name let any later job reuse another's file; keying on
+    # `(n_obs, n_vars, nnz)` — the first attempt at a fix — still collides
+    # whenever the *values* change while the sparsity pattern does not, which is
+    # exactly what a normalization or preprocessing change does. This arm feeds
+    # its embedding to the runner's cosine comparison against a freshly computed
+    # scanpy reference, so a stale matrix would be scored against the wrong
+    # reference and the new subspace floors would be validating an answer to a
+    # different question.
+    #
+    # `run()` builds this once and reuses it across warm-up and every timed run,
+    # so the cost is one conversion per (dataset, variant) cell — paid for a
+    # correctness property, and the alternative is a real content fingerprint
+    # over the whole matrix, which costs a full pass anyway.
+    # Per-invocation filename. Rebuilding every time removes *sequential* stale
+    # reuse but not *simultaneous* collision: `SCX_WORK_DIR` is shared across
+    # SLURM jobs and the capture script says it can run beside others, so two
+    # backed-PCA processes for the same dataset would unlink and rewrite one
+    # deterministic path — and one arm could again be scored against the other's
+    # matrix (codex, round 3). `run()` resolves this once and reuses it across
+    # warm-up and every timed run, so the per-process suffix costs nothing.
+    owner = f"{os.environ.get('SLURM_JOB_ID', 'local')}.{os.getpid()}"
+    scx_path = out_dir / f"{dataset_name}.{owner}.bench_pca_backed.scx"
+    try:
+        import pyscx
+
+        # Inside the guard: an `unlink` that hits a permission or locking error
+        # must return None so the caller can record a missing result, not escape
+        # and fail the job (the bot's round-1 note; codex round 2).
+        if scx_path.exists():
+            scx_path.unlink()
+        logger.info(
+            "accel_pca: building backed fixture for %s -> %s (n_obs=%d n_vars=%d)",
+            dataset_name, scx_path, int(adata.n_obs), int(adata.n_vars),
+        )
+        pyscx.from_anndata(adata, str(scx_path), csc="off")
+    except (OSError, Exception) as e:  # noqa: BLE001
+        logger.warning(
+            "accel_pca: pyscx.from_anndata(%s) failed: %s; the backed arm will "
+            "report no measurement rather than silently measuring the in-memory path",
+            dataset_name, e,
+        )
+        return None
+    return scx_path
+
+
+def _run_pyscx_gpu_backed(adata: Any, n_comps: int, seed: int) -> str:
+    """GPU PCA over a **backed, multi-shard** ``X`` — the out-of-core path.
+
+    This is the only arm that reaches `scx_gpu::gpu_pca::randomized_pca_core`
+    with more than one shard, and therefore the only one that can observe
+    anything about how the column-means pass iterates them. Every other arm
+    here — `__pyscx_gpu_rand_hh`, `__pyscx_gpu_rand_chol` and
+    `__pyscx_gpu_streaming` alike — runs on the runner's **in-memory** adata,
+    which reaches GPU PCA through pyscx's `BorrowedCsrSource`, whose
+    `n_shards()` is hard-coded 1. (`__pyscx_gpu_streaming` differs only by
+    `SCX_GPU_PCA_RESIDENT=0`; it is the same single-shard source.) Measured:
+    an in-memory `device="gpu"` PCA on pbmc3k reports
+    `route: rapids_singlecell_gpu` and never enters the native path at all.
+
+    Writes `X_pca` and the route stamp back onto the caller's adata so the
+    runner's cosine / subspace correctness checks see this arm's embedding —
+    it is the same matrix, only backed, so those numbers stay comparable to the
+    sibling arms'.
+    """
+    import numpy as np
+    import pyscx
+
+    scx_path = adata.uns.get(_BACKED_UNS_KEY)
+    if not scx_path:
+        raise RuntimeError(
+            "accel_pca__pyscx_gpu_backed: no backed fixture on this adata. "
+            "Without one this arm would run on the in-memory X and report a "
+            "single-shard number under a multi-shard name."
+        )
+    exp = pyscx.open(str(scx_path))
+    n_shards = int(exp.shard_count)
+    backed = exp.to_anndata(backed=True)
+    pyscx.accel.pca(
+        backed, n_comps=n_comps, device="gpu",
+        method="randomized", qr_method="householder", random_state=seed,
+    )
+    adata.obsm["X_pca"] = np.asarray(backed.obsm["X_pca"])
+    # The premise, carried as a number so it is gated rather than assumed.
+    adata.uns["_bench_pca_backed_n_shards"] = n_shards
+    # Assigned directly, and deliberately allowed to raise. A helper that
+    # swallowed a failure here would turn a missing route stamp into a missing
+    # `pca_route_gpu_correct` extra, which the floor gate reports as a violation
+    # with no indication of the cause.
+    adata.uns["scx_accel"] = dict(backed.uns["scx_accel"])
+    adata.uns["pca"] = dict(backed.uns.get("pca") or {})
     return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
 
 
@@ -397,6 +542,14 @@ def emit_route_signal(
 # `run_parallel._bench_format_dataset_scope`.
 FORMAT_DATASET_SCOPE: dict[str, frozenset[str]] = {
     "accel_pca__pyscx_gpu_streaming": frozenset({"pbmc3k", "tabula_sapiens_100k"}),
+    # The backed arm needs a **multi-shard** source to mean anything, and shard
+    # count follows n_obs: at the writer's default `shard_target_rows` (16384)
+    # pbmc3k's 2,700 cells are one shard, where the decode-prefetch pipeline
+    # takes its sequential fallback and this arm measures exactly what the
+    # in-memory ones do. tabula_sapiens_100k gives 7 shards and census_500k 31.
+    # `pca_backed_n_shards` is floored at >= 2 so a drifting default fails here
+    # rather than quietly making the arm a duplicate.
+    "accel_pca__pyscx_gpu_backed": frozenset({"tabula_sapiens_100k", "census_500k"}),
 }
 
 
@@ -409,6 +562,7 @@ _VARIANT_IMPLS: dict[str, tuple[Callable[..., str], bool]] = {
     "accel_pca__rapids_singlecell_gpu": (_run_rapids_singlecell, True),
     "accel_pca__pyscx_gpu_no_rapids": (_run_pyscx_gpu_no_rapids, True),
     "accel_pca__pyscx_gpu_streaming": (_run_pyscx_gpu_streaming, True),
+    "accel_pca__pyscx_gpu_backed": (_run_pyscx_gpu_backed, True),
 }
 
 
@@ -550,6 +704,28 @@ def run(
 
     fixture = _load_preprocessed(dataset, n_comps=n_comps)
 
+    # The backed arm needs an SCX file to open. Built once here, from the same
+    # preprocessed matrix the in-memory arms use, and stashed in `uns` so it
+    # survives the per-run `fixture.adata.copy()`. Built only for the arm that
+    # wants it — every other variant would pay a whole conversion for a file it
+    # never opens.
+    if variant_key == "accel_pca__pyscx_gpu_backed":
+        backed_path = _ensure_scx_backed_fixture(fixture.adata, dataset.name)
+        if backed_path is None:
+            logger.warning(
+                "accel_pca__pyscx_gpu_backed: no backed fixture for %s; recording "
+                "a missing result rather than measuring the in-memory path under "
+                "this arm's name",
+                dataset.name,
+            )
+            write_missing_result(
+                benchmark="accel_pca", format_key=variant_key, dataset=dataset.name,
+                missing_reason="backed_fixture_build_failed",
+                notes="backed SCX fixture could not be built",
+            )
+            return None
+        fixture.adata.uns[_BACKED_UNS_KEY] = str(backed_path)
+
     result = BenchmarkResult(
         benchmark="accel_pca",
         format=variant_key,
@@ -673,6 +849,23 @@ def run(
         resident = _extract_resident_csr(t_adata, "pca")
         if resident is not None:
             extras["pca_resident_csr"] = 1.0 if resident else 0.0
+
+        # Backed arm: the shard count and this run's wall, as floorable extras.
+        #
+        # `wall_s` is a named `add_run` parameter, so it lands at the top level
+        # of the record and the absolute-floor gate — which reads only
+        # `runs[].extra` — cannot see it. A wall ceiling on this arm therefore
+        # needs its own extra, or the floor resolves to "metric missing", which
+        # counts as a violation on every run.
+        #
+        # `pca_backed_n_shards` is the premise. One shard means the decode
+        # prefetch took its sequential fallback and this arm measured the same
+        # thing the in-memory arms do; floored at >= 2 it fails loudly instead.
+        if variant_key == "accel_pca__pyscx_gpu_backed":
+            extras["pca_backed_wall_s"] = wall
+            n_shards = t_adata.uns.get("_bench_pca_backed_n_shards")
+            if n_shards is not None:
+                extras["pca_backed_n_shards"] = float(n_shards)
 
         result.add_run(
             wall_s=wall,

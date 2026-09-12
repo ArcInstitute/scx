@@ -217,11 +217,36 @@ impl CombinedCsr {
     /// are queued async on `dev.stream()`, and a downstream cuPy consumer
     /// adopting these buffers must not race them.
     pub(crate) fn finish(
-        mut self,
+        self,
         dev: &GpuDevice,
         n_cols: usize,
         what: &str,
     ) -> Result<GpuCsr, GpuError> {
+        self.finish_with_indptr(dev, n_cols, what)
+            .map(|(csr, _indptr)| csr)
+    }
+
+    /// [`finish`](Self::finish), also handing back the assembled **host**
+    /// indptr instead of dropping it.
+    ///
+    /// The host vector is built either by `CombinedCsr::with_indptr`'s caller or
+    /// by the framed paths' `prescan_*_group_indptr`, uploaded once here, and
+    /// then — before this existed — discarded. `gpu_csr_assemble`'s multi-shard
+    /// loop wanted exactly that vector and used to recover it with a per-shard
+    /// `dtoh_copy`, which on pageable host memory is a **host-synchronous**
+    /// copy: one full pipeline drain per shard, purely to read back something
+    /// the host had just computed.
+    ///
+    /// Note this removes the copy, **not** the barrier — the `dev.synchronize()`
+    /// below still runs per shard when a decode path routes through here. A
+    /// variant that skipped it would have to promise callers an unsynchronized
+    /// result, which `decode_shard_gpu`'s consumers cannot accept.
+    pub(crate) fn finish_with_indptr(
+        mut self,
+        dev: &GpuDevice,
+        n_cols: usize,
+        what: &str,
+    ) -> Result<(GpuCsr, Vec<i64>), GpuError> {
         check_coverage(
             &mut self.placed_indices,
             &mut self.placed_values,
@@ -230,12 +255,13 @@ impl CombinedCsr {
         )?;
         let d_indptr = dev.htod_copy(&self.indptr)?;
         dev.synchronize()?;
-        GpuCsr::new(
+        let csr = GpuCsr::new(
             d_indptr,
             self.indices,
             self.data,
             (self.n_rows, n_cols),
             what,
-        )
+        )?;
+        Ok((csr, self.indptr))
     }
 }

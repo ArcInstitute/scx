@@ -51,8 +51,20 @@ impl Drop for CurandGenerator {
 /// Uses cuRAND's XORWOW generator for speed. The output is a `CudaSlice<f32>`
 /// of `rows × cols` elements drawn from N(0, 1).
 ///
-/// **Note:** cuRAND requires an even number of elements for normal generation.
-/// If `rows × cols` is odd, we allocate one extra element and trim.
+/// **Note:** cuRAND requires an even number of elements for normal generation
+/// (Box-Muller produces them in pairs). If `rows × cols` is odd we generate
+/// into an `alloc_count = total + 1` scratch and copy `[..total]` into an
+/// exact-length buffer with one **device-to-device** `memcpy_dtod` — cudarc
+/// 0.19's `CudaSlice` has no owned shrink, and a host round-trip to drop one
+/// element would be both a full-buffer D2H+H2D and a `capture_guard` violation
+/// (`memcpy_dtod` carries no such guard; `dtoh_copy` / `htod_copy` do).
+///
+/// The odd branch is **not on any default path**: the only production caller is
+/// `gpu_pca::randomized_pca_core`, where `k = n_components + n_oversamples`
+/// clamped by `n_vars` / `n_obs`, and every pyscx default gives `k = 60`. It
+/// takes a caller passing an odd `n_comps + n_oversamples` *and* an odd clamped
+/// dimension to reach it. So this is a correctness path, not a hot one — do not
+/// quote a per-PCA saving for it.
 ///
 /// # Arguments
 ///
@@ -107,12 +119,38 @@ pub fn random_gaussian_gpu(
     // `gen` is destroyed by its `Drop` impl when it falls out of scope below
     // (after the optional trim) — no explicit `destroy_generator` needed.
 
-    // If we allocated an extra element for even count, trim via round-trip.
-    // Only 1 extra element so the overhead is trivial.
+    // If we allocated an extra element for the even count, trim on the device:
+    // the surviving values are the scratch's first `total`, bit-for-bit, so the
+    // random subspace — and therefore PCA's output — is unchanged from what the
+    // generator produced. Taking any other window would silently change it.
     if alloc_count != total {
-        let mut host = dev.dtoh_copy(&buf)?;
-        host.truncate(total);
-        Ok(dev.htod_copy(&host)?)
+        let mut out = dev.alloc_zeros::<f32>(total)?;
+        let src = buf.try_slice(..total).ok_or_else(|| {
+            GpuError::CudaError(format!(
+                "random_gaussian_gpu: could not view scratch[..{total}] of {alloc_count}"
+            ))
+        })?;
+        stream
+            .memcpy_dtod(&src, &mut out)
+            .map_err(|e| GpuError::CudaError(format!("dtod trim (random_gaussian_gpu): {e}")))?;
+        // `buf` — the scratch `src` views — is dropped when this block ends, and
+        // cudarc frees it stream-ordered. The copy above was queued on `stream`,
+        // which this function accepts as a parameter and is publicly re-exported
+        // with, so it need not be `dev`'s. Wait on **that** stream.
+        //
+        // `dev.synchronize()` was the first attempt and is wrong here: it is
+        // `self.stream.synchronize()`, so it settles the device's stream and
+        // leaves a copy queued on any other one still in flight — closing the
+        // race only in the case that never needed closing (codex, Cursor Agent).
+        //
+        // This is the one place the D2D form reintroduces a host block, and it
+        // is free in practice: the branch is unreachable at every pyscx default
+        // (`k = 60`, so `n_vars * k` is even). It also makes this path
+        // capture-illegal again — `synchronize_stream` is `capture_guard`-checked
+        // — which is the correct outcome, since a host sync inside a capture
+        // region is exactly what that guard exists to reject.
+        dev.synchronize_stream(stream)?;
+        Ok(out)
     } else {
         Ok(buf)
     }
@@ -149,17 +187,66 @@ mod tests {
         );
     }
 
+    /// The odd-count trim keeps the generator's **first** `total` values,
+    /// bit-for-bit.
+    ///
+    /// Until the device trim landed this test asserted `host.len() == 21` and
+    /// nothing else, which cannot distinguish the right 21 of 22 elements from
+    /// any other 21 — and picking a different window silently changes the
+    /// random subspace, and therefore PCA's output, without failing anything.
+    ///
+    /// The oracle is cuRAND itself: `alloc_count` is `total + 1`, the generator
+    /// is seeded identically, and XORWOW is deterministic, so an *even* request
+    /// for `total + 1` elements at the same seed produces exactly the scratch
+    /// this odd request generates internally. Its first `total` must be what
+    /// comes back.
     #[test]
     #[ignore = "requires a CUDA GPU"]
     fn test_random_gaussian_gpu_odd_count() {
         let dev = require_gpu!();
 
-        // 7 × 3 = 21 elements (odd) — tests the padding logic
+        // 7 × 3 = 21 elements (odd) — takes the pad-and-trim branch.
         let buf = random_gaussian_gpu(&dev, dev.stream(), 7, 3, 123).unwrap();
         dev.synchronize().unwrap();
-
         let host = dev.dtoh_copy(&buf).unwrap();
         assert_eq!(host.len(), 21);
+
+        // 1 × 22 = 22 elements (even) — the same generator, the same seed, no
+        // trim. This is the untrimmed scratch the odd call allocated.
+        let scratch = random_gaussian_gpu(&dev, dev.stream(), 1, 22, 123).unwrap();
+        dev.synchronize().unwrap();
+        let scratch_host = dev.dtoh_copy(&scratch).unwrap();
+        assert_eq!(scratch_host.len(), 22);
+
+        for (i, (&got, &want)) in host.iter().zip(scratch_host.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "trimmed element {i}: {got} != scratch prefix {want}"
+            );
+        }
+    }
+
+    /// The odd-count path is reproducible across calls, like the even one.
+    ///
+    /// `test_random_gaussian_gpu_reproducible` covers 500 elements (even), so
+    /// before this the trim branch had no same-seed-same-values coverage at all.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_random_gaussian_gpu_odd_count_reproducible() {
+        let dev = require_gpu!();
+
+        let a = random_gaussian_gpu(&dev, dev.stream(), 5, 9, 7).unwrap();
+        let b = random_gaussian_gpu(&dev, dev.stream(), 5, 9, 7).unwrap();
+        dev.synchronize().unwrap();
+
+        let ha = dev.dtoh_copy(&a).unwrap();
+        let hb = dev.dtoh_copy(&b).unwrap();
+        assert_eq!(ha.len(), 45);
+        assert_eq!(hb.len(), 45);
+        for (i, (&x, &y)) in ha.iter().zip(hb.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "element {i} differs across calls");
+        }
     }
 
     #[test]

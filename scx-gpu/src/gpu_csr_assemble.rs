@@ -26,7 +26,7 @@ use crate::csr_placement::Placement;
 use crate::device::GpuDevice;
 use crate::error::GpuError;
 use crate::shard_decode::{
-    check_device_len, decode_shard_gpu_with_stats, DeviceDecodeStats, GpuCsr,
+    check_device_len, decode_shard_gpu_with_indptr, DeviceDecodeStats, GpuCsr,
 };
 
 /// Decode all CSR shards of a modality straight onto the device and concatenate
@@ -128,7 +128,7 @@ pub fn decode_csr_shards_to_device_with_stats(
     let mut stats = DeviceDecodeStats::default();
     for (i, bytes) in shards.iter().enumerate() {
         let (rows, nnz) = per_shard[i];
-        let (shard, shard_stats) = decode_shard_gpu_with_stats(dev, bytes)?;
+        let (shard, shard_stats, shard_indptr) = decode_shard_gpu_with_indptr(dev, bytes)?;
         stats.merge(&shard_stats);
         // Catalog stats vs. what the shard actually decoded to. This is one of
         // only two places the length half of the placement check has content —
@@ -150,9 +150,26 @@ pub fn decode_csr_shards_to_device_with_stats(
         combined.place(dev, at, shard.indices(), shard.data())?;
 
         // Fold the shard's indptr (shard-local, starts at 0) into the global
-        // array, offset by the running nnz base. The small indptr is the only
-        // array that round-trips to the host.
-        let shard_indptr = dev.dtoh_copy(shard.indptr())?;
+        // array, offset by the running nnz base.
+        //
+        // The decoder hands this back rather than us reading it off the device.
+        // Every decode path builds the vector on the host and then uploads it,
+        // so the `dev.dtoh_copy(shard.indptr())` that used to stand here was
+        // reading back something the host had just produced — and on pageable
+        // host memory `cuMemcpyDtoHAsync` is host-synchronous, so it drained the
+        // whole stream once per shard.
+        //
+        // What this removes is the redundant COPY, not the barrier: the framed
+        // paths and unframed ShufDeltaZstd still synchronize before returning,
+        // because a `decode_shard_gpu` caller may adopt the buffers at once. On
+        // the canonical framed layout the loop therefore still costs one barrier
+        // per shard plus the outer one — which is why this measured flat.
+        // Unframed Scx1 is the exception: it synchronizes only under profiling,
+        // so that path does lose a barrier here and leans on the outer `finish`.
+        //
+        // The length check stays, and means more than it did: it now compares
+        // the decoder's own output against the catalog rather than checking a
+        // round-trip against itself.
         check_device_len(shard_indptr.len(), rows + 1, &format!("shard {i} indptr"))?;
         for &v in &shard_indptr[1..=rows] {
             combined.indptr.push(nnz_base as i64 + v);
@@ -174,7 +191,7 @@ pub fn decode_csr_shards_to_device_with_stats(
 mod tests {
     use super::*;
     use crate::shard_decode::decode_shard_gpu;
-    use crate::test_utils::build_test_shard;
+    use crate::test_utils::{build_dense_csr, build_framed_test_shard, build_test_shard};
     use scx_codec::{decode_shard_scipy, CodecId, EncodedShardRef, ValueEncoding};
 
     /// Build one Scx1 shard from explicit CSR arrays (u16 values).
@@ -277,6 +294,87 @@ mod tests {
 
         let refs: Vec<&[u8]> = shard_bytes_vec.iter().map(|v| v.as_slice()).collect();
         let gpu_csr = decode_csr_shards_to_device(&dev, &refs).unwrap();
+
+        let total_rows: usize = shard_specs.iter().map(|s| s.len()).sum();
+        assert_eq!(gpu_csr.shape(), (total_rows, n_cols as usize));
+        assert_eq!(
+            dev.dtoh_copy(gpu_csr.indptr()).unwrap(),
+            exp_indptr,
+            "indptr"
+        );
+        assert_eq!(
+            dev.dtoh_copy(gpu_csr.indices()).unwrap(),
+            exp_indices,
+            "indices"
+        );
+        assert_eq!(dev.dtoh_copy(gpu_csr.data()).unwrap(), exp_data, "data");
+    }
+
+    /// The **framed** (shard v2) multi-shard fold matches a host decode-and-concat.
+    ///
+    /// `test_decode_csr_shards_to_device_matches_host_concat` above covers
+    /// unframed Scx1 only, and unframed is the one path whose host indptr was
+    /// already a plain live `Vec<i64>`. The framed paths build theirs inside
+    /// `CombinedCsr` and used to *destroy* it in `finish`, which is why the loop
+    /// recovered it with a per-shard `dtoh_copy` — so framed is the path the
+    /// indptr plumbing actually rewires, and it is what
+    /// `accel_to_gpu_anndata__scx1_gpu` runs.
+    ///
+    /// Shard 0 is deliberately multi-group (8 rows at `row_group_rows = 3`): a
+    /// single-group framed shard would exercise the fold with one span and
+    /// could not see a per-group offset error. `build_framed_test_shard`
+    /// asserts `shard_format_version == 2`, so this cannot silently degrade
+    /// into a second unframed test.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn test_decode_csr_shards_to_device_matches_host_concat_framed() {
+        let dev = require_gpu!();
+        let n_cols: u32 = 4_000;
+        let row_group_rows = 3u32;
+
+        // Three shards, uneven rows; the first spans three row groups with a
+        // two-row tail, and carries a fully-empty row.
+        let shard_specs: [&[usize]; 3] = [
+            &[4, 0, 6, 2, 5, 1, 3, 7], // 8 rows -> groups 0..3, 3..6, 6..8
+            &[2, 2, 2],                // 3 rows -> one full group
+            &[9, 0, 0, 1],             // 4 rows -> groups 0..3, 3..4
+        ];
+
+        let mut shard_bytes_vec: Vec<Vec<u8>> = Vec::new();
+        let mut exp_indptr: Vec<i64> = vec![0];
+        let mut exp_indices: Vec<i32> = Vec::new();
+        let mut exp_data: Vec<f32> = Vec::new();
+        let mut nnz_base: i64 = 0;
+
+        for rows in shard_specs {
+            let (indptr, indices, values_u16) = build_dense_csr(rows, n_cols);
+            let values_f32: Vec<f32> = values_u16.iter().map(|&v| v as f32).collect();
+            let bytes = build_framed_test_shard(
+                &indptr,
+                &indices,
+                &values_f32,
+                CodecId::Scx1,
+                n_cols,
+                row_group_rows,
+            );
+            // Host reference: the CSR we encoded, offset into the global arrays.
+            for &v in &indptr[1..] {
+                exp_indptr.push(nnz_base + v as i64);
+            }
+            exp_indices.extend(indices.iter().map(|&c| c as i32));
+            exp_data.extend_from_slice(&values_f32);
+            nnz_base += *indptr.last().unwrap() as i64;
+            shard_bytes_vec.push(bytes);
+        }
+
+        let refs: Vec<&[u8]> = shard_bytes_vec.iter().map(|v| v.as_slice()).collect();
+        let (gpu_csr, stats) = decode_csr_shards_to_device_with_stats(&dev, &refs).unwrap();
+
+        // Premise: this really took the in-VRAM framed Scx1 route, not a
+        // host bounce that would make the assertions below vacuous about the
+        // path they claim to cover.
+        assert_eq!(stats.n_shards_scx1_gpu, 3, "expected 3 framed Scx1 decodes");
+        assert_eq!(stats.n_shards_host_bounced, 0, "unexpected host bounce");
 
         let total_rows: usize = shard_specs.iter().map(|s| s.len()).sum();
         assert_eq!(gpu_csr.shape(), (total_rows, n_cols as usize));

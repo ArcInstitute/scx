@@ -71,8 +71,10 @@ two of its three consumers and both sit below `scx-accel` in the crate graph.
 and the `SCX_ACCEL_PREFETCH_DEPTH` / `SCX_ACCEL_REDUCTION_MODE` knobs are
 unchanged — those knobs now also govern the backed aggregation kernels
 (`row_sums`, `col_sums`, `col_var`, the QC/filter passes, …), pyscx's
-column-projected and lazy/transformed twins, the streaming DE kernels, and
-GPU staging.
+column-projected and lazy/transformed twins, the streaming DE kernels, GPU
+staging, and GPU PCA's column-means pass (which is depth-clamped by
+`SCX_GPU_STAGING_MEMORY_BUDGET` rather than the accel knob, since it decodes
+into host memory exactly as the staging loop does).
 
 Two constraints on callers:
 
@@ -755,6 +757,41 @@ mean/variance for neither, which on a row-major shard is no scan at all. It redu
 first offender any worker finds, so the error still names the same position the
 serial scan named — an error message that changes under load is not one a user
 can act on.
+
+### Multi-shard CSR assembly (`to_gpu_anndata`)
+
+`decode_csr_shards_to_device` decodes N shards onto the device and folds their
+indptrs into one global array. The fold needs each shard's indptr **on the
+host**, and every decode path already builds it there before uploading it — the
+unframed Scx1 path Delta-Golomb-decodes it, the host-bounce path gets it from
+`decode_shard_regions_scipy`, and the framed paths assemble it in
+`prescan_*_group_indptr`.
+
+The loop nonetheless used to recover it with a per-shard
+`dev.dtoh_copy(shard.indptr())` — on pageable host memory a host-synchronous
+copy, read back to obtain something the host had just computed. The decoders now
+hand the vector back instead (`decode_shard_gpu_with_indptr`,
+`CombinedCsr::finish_with_indptr`).
+
+**What that removes is the redundant copy, not the per-shard barrier.** The
+framed paths and unframed ShufDeltaZstd still synchronize before returning —
+`CombinedCsr::finish{,_with_indptr}` calls `dev.synchronize()` and the unframed
+ShufDeltaZstd path calls it directly — because a caller of `decode_shard_gpu` may
+adopt those buffers immediately. So a multi-shard assemble of the canonical framed
+layout still costs one barrier per shard plus the outer one; only the D2H traffic
+is gone.
+
+Unframed **Scx1** is the exception: it synchronizes only when GPU profiling is
+enabled (`if t_gpu.is_some()`), so that path genuinely loses a barrier here and
+now relies on the outer assembly's. That is sound — `CombinedCsr::finish`
+synchronizes before any consumer sees the result — but it is a real change in
+where the barrier sits, not a no-op. The per-shard H→D upload of the indptr
+also stays, since each path still builds a `GpuCsr`, which owns a device indptr.
+Collapsing the inner barriers would need a decode entry point that promises an
+unsynchronized result, and is why this change measured flat on `to_gpu_anndata`
+at 7 and 31 shards.
+
+The nvcomp cross-shard batched path never entered this loop and is unchanged.
 
 ### GPU DE device residency
 

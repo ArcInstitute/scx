@@ -1042,6 +1042,113 @@ absolute_floors:
     dataset: pbmc3k
     metric: leiden_route_gpu_correct
     min: 1.0
+
+  # --- accel_pca: the backed (out-of-core) GPU arm ---
+  #
+  # This arm exists because OPT-GPU-13's 1.36-1.40x on out-of-core GPU PCA was
+  # ungated and could not have been gated by any existing variant: they all run
+  # on the runner's IN-MEMORY adata, which reaches GPU PCA through pyscx's
+  # `BorrowedCsrSource` (`n_shards()` hard-coded 1), so the decode-prefetch
+  # pipeline takes its sequential fallback and the multi-shard column-means pass
+  # is unobservable. `__pyscx_gpu_streaming` is no exception — it differs only by
+  # `SCX_GPU_PCA_RESIDENT=0` and reads the same single-shard source. Measured,
+  # in-memory `device="gpu"` PCA on pbmc3k reports `route:
+  # rapids_singlecell_gpu` and never enters the native path at all.
+  #
+  # THE PREMISE, floored on both datasets. One shard means the prefetch took its
+  # sequential fallback and this arm measured what the in-memory arms measure —
+  # under a name claiming otherwise. Shard count follows `n_obs` at the writer's
+  # default `shard_target_rows` (16384); a drift to one shard fails here rather
+  # than silently making every timing floor below pass on a smaller problem.
+  # Observed 2026-09-12: tabula_sapiens_100k 7, census_500k 31.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: pca_backed_n_shards
+    min: 2.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: census_500k
+    metric: pca_backed_n_shards
+    min: 2.0
+  # Native GPU route, both datasets. A `cpu_*` or rapids route here means the
+  # backed source silently stopped reaching `randomized_pca_core`.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: pca_route_gpu_correct
+    min: 1.0
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: census_500k
+    metric: pca_route_gpu_correct
+    min: 1.0
+  # THE WALL CEILING — tabula_sapiens_100k ONLY, and that asymmetry is measured,
+  # not an oversight.
+  #
+  # Sensitivity run (SLURM 2938504, one host, one job, both arms, identical
+  # shard counts, `_run_accel_pca_backed_sensitivity.sh`):
+  #
+  #   dataset               main      branch   speedup   1.25x ceiling catches a revert?
+  #   tabula_sapiens_100k   1.615 s   1.141 s   1.42x    YES  (ceiling 1.43 < main 1.615)
+  #   census_500k           4.033 s   3.573 s   1.13x    NO   (ceiling 4.47 > main 4.033)
+  #
+  # So a census_500k wall ceiling at the house 1.25x would be a threshold that
+  # cannot fire: reverting the change entirely leaves the arm comfortably under
+  # it. Authoring one anyway would put a green check on an ungated path, which is
+  # worse than no floor at all because it reads as coverage. Tightening it to
+  # ~1.10x would fire, but 10% on a wall time is inside cross-node variation and
+  # would flake. census_500k therefore carries the exact floors (shard count,
+  # route) and no timing floor.
+  #
+  # Why census is LESS sensitive despite 4x the shards: the arm runs on the
+  # runner's HVG-subset fixture (2,000 genes), so at 500k rows the SpMM and QR
+  # dominate and the host-side means pass is a smaller share of the wall. The
+  # 1.36-1.40x PR-12 measured was on the full gene axis, where it is not.
+  #
+  # 1.43 = 1.25x the branch median of 1.141 s. Re-derive after any recapture.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: pca_backed_wall_s
+    max: 1.43
+  # CORRECTNESS, both datasets. Without these the arm gates speed and route but
+  # not the answer: a broken column-means pass that still reports a `gpu_*` route
+  # and finishes under 1.43 s on tabula — and under nothing at all on census —
+  # stays green. `run()` already emits these extras for every variant, so the
+  # arm was carrying them unfloored (Cursor Agent).
+  #
+  # Same bars as the sibling native randomized arms (`__pyscx_gpu_rand_hh` /
+  # `_chol` on tabula: mean 0.85, min 0.01) — and adopted only after checking
+  # this arm clears them. Observed 2026-09-12, median of 3:
+  #
+  #   tabula_sapiens_100k   subspace_cos_mean 0.9228   subspace_cos_min 0.0413
+  #   census_500k           subspace_cos_mean 0.9527   subspace_cos_min 0.4730
+  #
+  # `subspace_cos_min` sits low on both because randomized PCA returns a rotated
+  # subspace: the floor is a collapse detector (all-zero / degenerate embedding),
+  # not a numerical-agreement bar. That is the same reading the sibling arms'
+  # 0.01 carries, and why the mean is the informative one.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_mean
+    min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.01
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: census_500k
+    metric: subspace_cos_mean
+    min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: census_500k
+    metric: subspace_cos_min
+    min: 0.01
   # Harmony GPU route gate. `device="gpu"` reporting a `cpu_*` route means
   # device resolution silently fell back — a hard failure, not a slow run.
   # Phase 7e moved the M-step onto the device arm, so a fallback now also means
