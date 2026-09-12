@@ -1,5 +1,5 @@
 """
-Streaming h5ad → SCX conversion benchmark.
+Streaming → SCX conversion benchmark: h5ad, plus 10x since OPT-CONVERT-9.
 
 For a given dataset, this benchmark runs the two h5ad → SCX
 conversion entry points back-to-back and records peak RSS, wall
@@ -14,10 +14,13 @@ clock, and basic output-equality metadata for each path:
   triplet.
 
 Output equality between the two paths is measured at the "structural"
-level (n_obs / n_vars / nnz / catalog shard_count / has_csc).
-Bit-level equality is asserted in the Rust round-trip test
-`scx-convert/src/tests.rs::streaming_round_trip_matches_non_streaming`;
-the benchmark only needs to flag drift, not characterise it.
+level (n_obs / n_vars / nnz / catalog shard_count / has_csc). The finer claims
+live in Rust — `convert_tests_streaming.rs::streaming_round_trip_matches_non_streaming`
+for h5ad values, `convert_tests_tenx_stream.rs` for the 10x pair (a `scx-testkit`
+digest A/B on a single shard, and an explicit pin on the multi-shard codec-seed
+divergence). The benchmark only needs to flag drift, not characterise it. Note
+the paths are *not* byte-identical under the default `--codec auto` on either
+format: eager forces one whole-matrix codec seed, streaming seeds per shard.
 
 **Three extra streaming arms** run on the datasets named in `_EXTRA_ARMS`. All
 three exist because the arms above pass *no* conversion options at all — their
@@ -54,10 +57,21 @@ threads alone and shrinks only depth. Each gets `<label>_peak_rss_mb` /
 emission path, and no chance of an extra arm polluting the floored
 `streaming_peak_rss_mb` key.
 
-Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms are **not** swept — none
-varies along the thread axis, since each changes a conversion option — but they
-still run **once**, each at its own pinned thread count, before the sweep, so a
-sweep capture does not silently lose the non-default coverage.
+**Two 10x arms** (`tenx_streaming` / `tenx_materialize`) run on the datasets in
+`_TENX_ARM_DATASETS`, gating `scx convert --from 10x`'s bounded-memory claim.
+They are not `_EXTRA_ARMS` entries because this direction is not reachable from
+`from_h5ad` at all — `pyscx.from_10x` routes through `scanpy.read_10x_h5` into
+`from_anndata`, a third code path with no `stream` kwarg — so they drive the
+**CLI**, each `scx convert` in its own process (the peak comes from
+`getrusage(RUSAGE_CHILDREN)`, which is cumulative across reaped children).
+Their source is a synthesised fixture, since no dataset in the suite is a 10x
+file; `prep_tenx_fixture.py` builds it, and without it both arms skip.
+
+Under `SCX_CONV_STREAM_THREAD_COUNTS` the extra arms and the 10x pair are
+**not** swept — none varies along the thread axis, since each changes a
+conversion option and the 10x materialising arm has no threads knob at all —
+but they still run **once**, each at its own pinned thread count, before the
+sweep, so a sweep capture does not silently lose the non-default coverage.
 
 Thread scaling is opt-in via the `SCX_CONV_STREAM_THREAD_COUNTS` env
 var (comma-separated, e.g. `1,2,4,8,16,32`). When set, each thread
@@ -437,20 +451,6 @@ def _timed_materialize(h5ad_path: Path, out_path: Path) -> dict[str, float]:
 # this floor one justification away from silently disarming.
 _TENX_ARM_DATASETS: frozenset[str] = frozenset({"census_500k"})
 
-# Reader threads for the gated 10x streaming arm. Same value and same reason as
-# `GATED_READER_THREADS` on the h5ad arms — the parallel reader's bound is
-# `shards_in_flight x per_shard_working_set`, so leaving it to the runner's core
-# count makes the floor a property of the machine. Named separately only so the
-# two can move independently; pinned equal by
-# `test_tenx_arms_pin_their_reader_threads`.
-TENX_GATED_READER_THREADS: int = GATED_READER_THREADS
-
-#: Probe for a `scx` build whose `convert` has `--stream`. Not sufficient on its
-#: own — every build since the flag shipped passes it, including the ones that
-#: *reject* `--stream` on 10x — so the streaming arm's own failure is what names
-#: a stale binary (see `_TENX_WORKER_SCRIPT`).
-TENX_PROBE: tuple[str, ...] = ("convert", "--help")
-
 
 _TENX_WORKER_SCRIPT = textwrap.dedent("""\
     import json
@@ -462,7 +462,7 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
     from pathlib import Path
 
     tenx_path = sys.argv[1]
-    n_runs = int(sys.argv[2])
+    run_idx = int(sys.argv[2])
     stream = sys.argv[3]            # "true" | "false"
     reader_threads = sys.argv[4]    # or "" to inherit
     scx_bin = sys.argv[5]
@@ -473,7 +473,7 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
 
     records = []
     structural = None
-    for run_idx in range(n_runs):
+    for _ in (0,):
         with tempfile.TemporaryDirectory(prefix="scx_bench_tenx_") as tmp:
             out = Path(tmp) / "out.scx"
             argv = [scx_bin, "convert", "--from", "10x",
@@ -494,11 +494,17 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
                 )
             # RUSAGE_CHILDREN, not RUSAGE_SELF: the thing being measured is the
             # `scx` process, and this worker exists so that `scx` is its only
-            # child. It is a cumulative max across reaped children, which across
-            # n_runs identical converts is exactly the max-over-runs the
-            # downstream aggregation takes anyway.
+            # child. It is a *cumulative* max across every reaped child, which is
+            # why the parent spawns one worker per run rather than looping here:
+            # a second convert in this process would inherit the first's peak and
+            # every later run would report a monotone non-decreasing number.
             ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-            peak_rss_mb = ru / 1024.0   # Linux reports KiB
+            # `ru_maxrss` is KiB on Linux and bytes on Darwin -- the same split
+            # `rss.py` already handles. Without the branch a macOS run reports
+            # 1024x high and trips every ceiling.
+            peak_rss_mb = (
+                ru / (1024.0 * 1024.0) if sys.platform == "darwin" else ru / 1024.0
+            )
             rec = {
                 "run_idx": run_idx,
                 "wall_s": wall_s,
@@ -514,6 +520,19 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
 """)
 
 
+class TenxArmUnavailable(RuntimeError):
+    """The 10x arms cannot run here — a stale/mis-featured `scx`, not a result.
+
+    Distinct from a plain `RuntimeError` because the two need opposite handling:
+    a genuine worker crash should fail the run, while a binary that predates
+    OPT-CONVERT-9 (or was built without `--features hdf5`) must leave the h5ad
+    arms — which carry this benchmark's primary floors — untouched. There is no
+    probe that separates them up front: every `scx` since the flag shipped
+    answers `convert --help` with `--stream`, including the builds that reject
+    it on this direction, so the convert itself is the capability test.
+    """
+
+
 def _run_tenx_arm_subprocess(
     tenx_path: Path,
     n_runs: int,
@@ -525,36 +544,49 @@ def _run_tenx_arm_subprocess(
 
     The worker is a Python shim rather than a direct `subprocess.run` from here
     because the peak comes from `getrusage(RUSAGE_CHILDREN)`, which is scoped to
-    *all* of the calling process's reaped children. One worker per arm keeps
-    `scx` the only child, so the streaming arm's number cannot inherit the
-    materialising arm's — the same process-boundary requirement
-    :func:`_run_arm_subprocess` documents for the h5ad arms, for the same
-    reason with a different mechanism.
+    *all* of the calling process's reaped children. One worker per **run** keeps
+    `scx` the only child it ever reaps, so neither the other arm's peak nor the
+    previous run's can leak into a record — the same process-boundary
+    requirement :func:`_run_arm_subprocess` documents for the h5ad arms, for the
+    same reason with a different mechanism.
     """
-    proc = subprocess.run(
-        [
-            sys.executable, "-c", _TENX_WORKER_SCRIPT,
-            str(tenx_path), str(n_runs), "true" if stream else "false",
-            "" if reader_threads is None else str(reader_threads),
-            scx_bin,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=14400,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"conversion_streaming 10x worker failed (stream={stream}, "
-            f"exit={proc.returncode}).\n"
-            f"--- stderr ---\n{proc.stderr}\n--- stdout ---\n{proc.stdout}"
+    records: list[dict] = []
+    for run_idx in range(n_runs):
+        proc = subprocess.run(
+            [
+                sys.executable, "-c", _TENX_WORKER_SCRIPT,
+                str(tenx_path), str(run_idx), "true" if stream else "false",
+                "" if reader_threads is None else str(reader_threads),
+                scx_bin,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=14400,
         )
-    try:
-        return json.loads(proc.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError) as exc:
-        raise RuntimeError(
-            f"Failed to parse 10x worker JSON output: {exc}\n"
-            f"--- stdout ---\n{proc.stdout}"
-        ) from exc
+        if proc.returncode != 0:
+            combined = f"{proc.stdout}\n{proc.stderr}"
+            if (
+                "--stream is not supported for direction" in combined
+                or "requires the 'hdf5' feature" in combined
+            ):
+                raise TenxArmUnavailable(
+                    f"`{scx_bin}` cannot run the 10x arms (stream={stream}): it "
+                    f"predates OPT-CONVERT-9 or lacks --features hdf5. Set "
+                    f"$SCX_CLI_BIN or rebuild target/release/scx.\n{combined.strip()}"
+                )
+            raise RuntimeError(
+                f"conversion_streaming 10x worker failed (stream={stream}, "
+                f"run={run_idx}, exit={proc.returncode}).\n"
+                f"--- stderr ---\n{proc.stderr}\n--- stdout ---\n{proc.stdout}"
+            )
+        try:
+            records.extend(json.loads(proc.stdout.strip().splitlines()[-1]))
+        except (json.JSONDecodeError, IndexError) as exc:
+            raise RuntimeError(
+                f"Failed to parse 10x worker JSON output: {exc}\n"
+                f"--- stdout ---\n{proc.stdout}"
+            ) from exc
+    return records
 
 
 def _assert_tenx_streaming_beat_materialize(result: BenchmarkResult) -> None:
@@ -624,7 +656,12 @@ def _run_tenx_arms(
         log.warning("%s", result.metadata["tenx_arms_skipped"])
         return
 
-    scx_bin = scx_cli.resolve_scx_bin(TENX_PROBE, requires=b"--stream")
+    # Inlined rather than a named constant: there is one caller, and this probe
+    # does not settle the question on its own — every `scx` since the flag
+    # shipped answers with `--stream`, including builds that reject it on 10x.
+    # It only weeds out a binary with no `convert --stream` at all; the convert
+    # itself is the real capability test (`TenxArmUnavailable`).
+    scx_bin = scx_cli.resolve_scx_bin(("convert", "--help"), requires=b"--stream")
     if scx_bin is None:
         result.metadata["tenx_arms_skipped"] = (
             "no resolvable `scx` binary has `convert --stream`; set "
@@ -634,16 +671,27 @@ def _run_tenx_arms(
         return
 
     result.metadata["tenx_source_bytes"] = tenx_path.stat().st_size
-    result.metadata["tenx_gated_reader_threads"] = TENX_GATED_READER_THREADS
+    result.metadata["tenx_gated_reader_threads"] = GATED_READER_THREADS
     structural: dict[str, dict | None] = {}
     ran: list[str] = []
     for label, stream, threads in (
-        ("tenx_streaming", True, TENX_GATED_READER_THREADS),
+        ("tenx_streaming", True, GATED_READER_THREADS),
         ("tenx_materialize", False, None),
     ):
-        records = _run_tenx_arm_subprocess(
-            tenx_path, n_runs, stream, threads, scx_bin
-        )
+        try:
+            records = _run_tenx_arm_subprocess(
+                tenx_path, n_runs, stream, threads, scx_bin
+            )
+        except TenxArmUnavailable as exc:
+            # A binary that cannot run this direction must not take the h5ad
+            # arms down with it: they carry this benchmark's primary floors, and
+            # the docstring above promises a recorded skip rather than a crash.
+            # Only this one shape is caught — a genuine worker failure still
+            # raises, or the arms would go quiet for the wrong reason.
+            result.metadata["tenx_arms_skipped"] = str(exc)
+            result.metadata.pop("tenx_arms", None)
+            log.warning("10x arms skipped: %s", exc)
+            return
         ran.append(label)
         for rec in records:
             if rec.get("structural") is not None and label not in structural:

@@ -455,6 +455,94 @@ fn streaming_tenx_shards_obs_above_the_threshold() {
     assert_eq!(reader.read_obs().unwrap().num_rows(), 40);
 }
 
+/// An axis length that disagrees with `/matrix/shape` is refused, on **both**
+/// paths, rather than converting into a file whose header and `obs` disagree.
+///
+/// This was a silent corruption before, and `scx validate --deep` could not see
+/// it: a fixture with `shape[1] = 20` and 5 barcodes converted without a
+/// warning on either path and cleared all 8 deep checks, leaving a file that
+/// reports `n_obs = 20` and hands back 5 obs rows. The two lengths are
+/// independent reads of the same file, so one has to check the other.
+///
+/// Found by **Antigravity - Gemini 3.8 Flash**.
+#[test]
+fn streaming_tenx_refuses_an_axis_that_disagrees_with_the_shape() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for (label, n_barcodes, n_feature_rows, needle) in [
+        ("short barcodes", Some(5), None, "/matrix/barcodes"),
+        ("long barcodes", Some(25), None, "/matrix/barcodes"),
+        ("short features", None, Some(3), "/matrix/features"),
+    ] {
+        let tenx = dir.path().join(format!("{}.h5", label.replace(' ', "_")));
+        write_tenx(&tenx, 20, 6, ShapeForm::Dataset, 2, |c, _| {
+            (c % 4 + 1) as f32
+        });
+        // Rewrite the axis the case is about, leaving `/matrix/shape` alone.
+        {
+            let file = hdf5::File::open_rw(&tenx).unwrap();
+            let matrix = file.group("matrix").unwrap();
+            if let Some(n) = n_barcodes {
+                matrix.unlink("barcodes").unwrap();
+                let vals: Vec<VarLenUnicode> = (0..n).map(|i| vlu(&format!("BC{i}"))).collect();
+                matrix
+                    .new_dataset::<VarLenUnicode>()
+                    .shape([n])
+                    .create("barcodes")
+                    .unwrap()
+                    .write(&vals)
+                    .unwrap();
+            }
+            if let Some(n) = n_feature_rows {
+                let features = matrix.group("features").unwrap();
+                for col in ["id", "name", "feature_type"] {
+                    features.unlink(col).unwrap();
+                    let vals: Vec<VarLenUnicode> = (0..n).map(|i| vlu(&format!("g{i}"))).collect();
+                    features
+                        .new_dataset::<VarLenUnicode>()
+                        .shape([n])
+                        .create(col)
+                        .unwrap()
+                        .write(&vals)
+                        .unwrap();
+                }
+            }
+        }
+
+        let out = dir.path().join("out.scx");
+        for (path_label, result) in [
+            (
+                "streaming",
+                tenx_to_scx_streaming(
+                    &tenx,
+                    &out,
+                    &IngestOptions::default(),
+                    &mut WarningSink::log(),
+                ),
+            ),
+            (
+                "eager",
+                tenx_to_scx(
+                    &tenx,
+                    &out,
+                    &IngestOptions::default(),
+                    &mut WarningSink::log(),
+                ),
+            ),
+        ] {
+            let err = match result {
+                Ok(()) => panic!("{label} via {path_label} converted silently; it must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(needle) && err.contains("disagree"),
+                "{label} via {path_label}: message must name the axis and the \
+                 disagreement, got: {err}"
+            );
+        }
+    }
+}
+
 /// An h5ad misrouted to `--from 10x`, and a CellBender output, are rejected on
 /// the streaming path too. Streaming is the **default** for this direction, so a
 /// gate that lived only in `tenx_to_scx` would be missing from the route

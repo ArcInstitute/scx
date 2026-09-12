@@ -48,24 +48,52 @@ pub(crate) fn read_tenx_shape(matrix: &hdf5::Group) -> Result<(usize, usize), Co
             shape.len()
         )));
     }
-    let n_genes = shape[0] as usize;
-    let n_cells = shape[1] as usize;
-    Ok((n_genes, n_cells))
+    // `try_from`, not `as usize`: a negative dimension in a corrupt file wraps
+    // to ~1.8e19 and only fails much later, somewhere unrelated. Same guard
+    // `read_shape_2d` documents for the h5ad side.
+    let to_dim = |v: i64| {
+        usize::try_from(v)
+            .map_err(|_| ConvertError::Other(format!("invalid /matrix/shape dimension {v}")))
+    };
+    Ok((to_dim(shape[0])?, to_dim(shape[1])?))
 }
 
 /// Build `obs` from `/matrix/barcodes`: one `barcode` column, no nulls.
-pub(crate) fn read_tenx_obs(matrix: &hdf5::Group) -> Result<RecordBatch, ConvertError> {
+///
+/// Validated against `n_cells` because nothing downstream does. A `barcodes`
+/// dataset shorter than `/matrix/shape[1]` used to convert **silently** on both
+/// paths: the header took `n_cells` from `shape` while `obs` took its length
+/// from `barcodes`, and the result passed `scx validate --deep` — measured, a
+/// 20-cell header over a 5-row `obs` cleared all 8 checks. The axis lengths are
+/// two independent reads of the same file, so one has to check the other.
+pub(crate) fn read_tenx_obs(
+    matrix: &hdf5::Group,
+    n_cells: usize,
+) -> Result<RecordBatch, ConvertError> {
     let barcodes_ds = matrix.dataset("barcodes")?;
     let obs_schema = Schema::new(vec![Field::new("barcode", DataType::Utf8, false)]);
-    Ok(RecordBatch::try_new(
+    let batch = RecordBatch::try_new(
         Arc::new(obs_schema),
         vec![Arc::new(read_string_array(&barcodes_ds)?) as ArrayRef],
-    )?)
+    )?;
+    if batch.num_rows() != n_cells {
+        return Err(ConvertError::Other(format!(
+            "/matrix/barcodes has {} entries but /matrix/shape declares {n_cells} cells; \
+             the obs axis and the matrix disagree",
+            batch.num_rows()
+        )));
+    }
+    Ok(batch)
 }
 
 /// Build `var` from `/matrix/features`, keeping each column under its source
 /// name. Every column is optional; the group is not. When none of the three is
 /// present, fabricate `gene_id` so the var axis still has an identity.
+///
+/// Validated against `n_genes` for the same reason [`read_tenx_obs`] is
+/// validated against `n_cells` — before this, `n_genes` reached only the
+/// fallback branch, so a `features/*` column of the wrong length produced a
+/// file whose header and `var` disagreed, with nothing downstream to catch it.
 pub(crate) fn read_tenx_var(
     matrix: &hdf5::Group,
     n_genes: usize,
@@ -81,7 +109,7 @@ pub(crate) fn read_tenx_var(
         }
     }
 
-    Ok(if var_fields.is_empty() {
+    let batch = if var_fields.is_empty() {
         // Fallback: create dummy var
         let ids: Vec<String> = (0..n_genes).map(|i| format!("gene_{i}")).collect();
         RecordBatch::try_new(
@@ -94,7 +122,15 @@ pub(crate) fn read_tenx_var(
         )?
     } else {
         RecordBatch::try_new(Arc::new(Schema::new(var_fields)), var_arrays)?
-    })
+    };
+    if batch.num_rows() != n_genes {
+        return Err(ConvertError::Other(format!(
+            "/matrix/features columns have {} entries but /matrix/shape declares \
+             {n_genes} genes; the var axis and the matrix disagree",
+            batch.num_rows()
+        )));
+    }
+    Ok(batch)
 }
 
 /// Read a 10x Genomics HDF5 file **whole**.
@@ -121,7 +157,7 @@ pub fn read_tenx_h5(file: &hdf5::File) -> Result<TenXData, ConvertError> {
     let csr_indices = read_i32_dataset(&matrix.dataset("indices")?)?;
     let csr_data = read_f32_dataset(&matrix.dataset("data")?)?;
 
-    let obs = read_tenx_obs(&matrix)?;
+    let obs = read_tenx_obs(&matrix, n_cells)?;
     let var = read_tenx_var(&matrix, n_genes)?;
 
     Ok(TenXData {

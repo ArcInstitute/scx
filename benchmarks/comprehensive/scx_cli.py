@@ -1,9 +1,12 @@
 """Locating the `scx` CLI binary — one implementation, one place.
 
-Three benchmark arms shell out to `scx`, and each needs a *different* binary to
+Four benchmark arms shell out to `scx`, and each needs a *different* binary to
 count as usable: `shuffle_layout` needs `info --json` for per-section sizes,
-`accel_to_gpu_anndata` needs an `optimize` that accepts `--codec`, and
-`cloud_metadata`'s CLI arm needs a build compiled with `--features cloud`. The
+`accel_to_gpu_anndata` needs an `optimize` that accepts `--codec`,
+`cloud_metadata`'s CLI arm needs a build compiled with `--features cloud`, and
+`conversion_streaming`'s 10x arms need a `convert` that streams `--from 10x`
+(OPT-CONVERT-9) — the one probe that cannot be answered by `--help` alone, so
+it inlines its probe here and lets the convert itself be the capability test. The
 search order is identical in every case — `$SCX_CLI_BIN`, then the repo's
 `target/release/scx`, then a PATH `scx` — and it was written out twice, with
 `shuffle_layout`'s own docstring noting that the other copy "uses the same

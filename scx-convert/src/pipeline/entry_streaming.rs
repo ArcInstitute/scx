@@ -852,7 +852,7 @@ pub fn tenx_to_scx_streaming(
     writer.set_framing(opts.framing());
 
     let matrix = file.group("matrix")?;
-    let obs = crate::tenx_read::read_tenx_obs(&matrix)?;
+    let obs = crate::tenx_read::read_tenx_obs(&matrix, n_obs)?;
     let var = crate::tenx_read::read_tenx_var(&matrix, n_vars)?;
     write_ingest_obs(&mut writer, &obs, opts)?;
     writer.write_var(&var)?;

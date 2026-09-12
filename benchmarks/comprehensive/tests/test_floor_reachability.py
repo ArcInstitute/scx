@@ -1422,18 +1422,22 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
        `smartseq2`'s budget ratio or `tabula_sapiens_100k`'s two justification-
        needing arms would put this floor one whole-triple justification away
        from silently disarming.
-    2. **Pinned reader threads**, so the floor is a property of the code rather
-       than the runner's core count — the same reason `GATED_READER_THREADS`
-       exists for the h5ad arms.
+    2. **The streaming arm is pinned to `GATED_READER_THREADS`**, so the floor
+       is a property of the code rather than the runner's core count.
     3. **A skip is recorded, not silent.** A box without the fixture, or with a
        stale `scx`, must still run the h5ad arms that carry this benchmark's
        primary floors — and must say in `metadata` why the 10x pair is missing,
-       or an absent floor value reads as a pass.
+       or an absent floor value reads as a pass. The stale-binary case has no
+       up-front probe (every `scx` since the flag shipped answers
+       `convert --help` with `--stream`), so it surfaces as
+       `TenxArmUnavailable` out of the convert itself and must be caught.
     4. **The bound is checked, not assumed.** If `--stream=false` stopped
        reaching the eager reader, both arms would time the same path and both
        clear the ceiling. The premise check has to raise.
     """
     import pathlib
+    import tempfile
+    from unittest import mock
 
     from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
     from benchmarks.comprehensive.config import DATASETS
@@ -1475,10 +1479,8 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
     for name in cs._TENX_ARM_DATASETS:
         assert name in DATASETS, name
 
-    # (2) Pinned, and equal to the h5ad arms' pin so the two are comparable.
-    assert cs.TENX_GATED_READER_THREADS == cs.GATED_READER_THREADS
-
-    def drive(dataset_name, exists=True, scx_bin="scx", peaks=(100.0, 900.0)):
+    def drive(dataset_name, exists=True, scx_bin="scx", peaks=(100.0, 900.0),
+              arm=None):
         calls = []
 
         def fake_arm(tenx_path, n_runs, stream, reader_threads, binary):
@@ -1500,28 +1502,32 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
             dataset=dataset_name,
             metadata={"scenarios": []},
         )
-        original_arm = cs._run_tenx_arm_subprocess
-        original_exists = pathlib.Path.exists
-        original_stat = pathlib.Path.stat
+        # A real file in a temp dir, and `DatasetConfig.tenx_path` pointed at
+        # it. Deliberately not a `pathlib.Path.exists` / `.stat` monkeypatch:
+        # that mutates the stdlib class process-wide for every other test and
+        # thread, and `_run_tenx_arms` stats the fixture for its metadata, so
+        # patching `exists` alone would not even be enough. Patching the
+        # property is both narrower and closer to the real thing — the fixture
+        # genuinely exists or genuinely does not.
         import benchmarks.comprehensive.scx_cli as scx_cli
-        original_resolve = scx_cli.resolve_scx_bin
+        from benchmarks.comprehensive.config import DatasetConfig
 
-        class _FakeStat:
-            st_size = 4096
-
-        try:
-            cs._run_tenx_arm_subprocess = fake_arm
-            pathlib.Path.exists = lambda self: exists
-            # The fixture is not on this box; `_run_tenx_arms` stats it for the
-            # `tenx_source_bytes` metadata, so `exists` alone is not enough.
-            pathlib.Path.stat = lambda self, **kw: _FakeStat()
-            scx_cli.resolve_scx_bin = lambda probe, requires=None: scx_bin
-            cs._run_tenx_arms(DATASETS[dataset_name], 1, result)
-        finally:
-            cs._run_tenx_arm_subprocess = original_arm
-            pathlib.Path.exists = original_exists
-            pathlib.Path.stat = original_stat
-            scx_cli.resolve_scx_bin = original_resolve
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = pathlib.Path(tmp) / "fake_10x.h5"
+            if exists:
+                fixture.write_bytes(b"\x89HDF\r\n\x1a\n" + b"0" * 4088)
+            with (
+                mock.patch.object(cs, "_run_tenx_arm_subprocess", arm or fake_arm),
+                mock.patch.object(
+                    DatasetConfig, "tenx_path",
+                    property(lambda self: fixture),
+                ),
+                mock.patch.object(
+                    scx_cli, "resolve_scx_bin",
+                    lambda probe, requires=None: scx_bin,
+                ),
+            ):
+                cs._run_tenx_arms(DATASETS[dataset_name], 1, result)
         return calls, result
 
     in_scope = sorted(cs._TENX_ARM_DATASETS)[0]
@@ -1529,7 +1535,7 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
     # Happy path: both arms run, streaming pinned, materialise unpinned.
     calls, result = drive(in_scope)
     assert [c[0] for c in calls] == [True, False], calls
-    assert calls[0][1] == cs.TENX_GATED_READER_THREADS, calls
+    assert calls[0][1] == cs.GATED_READER_THREADS, calls
     assert calls[1][1] is None, "the materialising arm has no threads knob"
     assert result.metadata["tenx_arms"] == ["tenx_streaming", "tenx_materialize"]
     for label in ("tenx_streaming", "tenx_materialize"):
@@ -1553,6 +1559,22 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
     calls, result = drive(in_scope, scx_bin=None)
     assert calls == []
     assert "--stream" in result.metadata["tenx_arms_skipped"]
+
+    # A binary that passes the `--help` probe and *then* rejects the direction
+    # is the case no probe can catch. It must skip, not take the h5ad arms down
+    # with it — and only that shape: a genuine worker failure still raises.
+    def stale(*_a, **_kw):
+        raise cs.TenxArmUnavailable("predates OPT-CONVERT-9")
+
+    _, result = drive(in_scope, arm=stale)
+    assert "predates OPT-CONVERT-9" in result.metadata["tenx_arms_skipped"]
+    assert "tenx_arms" not in result.metadata
+
+    def broken(*_a, **_kw):
+        raise RuntimeError("worker segfaulted")
+
+    with pytest.raises(RuntimeError, match="segfaulted"):
+        drive(in_scope, arm=broken)
 
     # (4) The premise check raises when streaming did not bound anything.
     with pytest.raises(RuntimeError, match="bounded path"):

@@ -2061,7 +2061,7 @@ fn run_convert(
 
     // Resolve `--stream` against the direction. `None` (flag absent) means
     // "whatever this direction does natively": streaming for h5ad / h5mu ↔
-    // scx, materializing for mtx ↔ scx and 10x → scx. Only an *explicit*
+    // scx and 10x → scx, materializing for mtx ↔ scx. Only an *explicit*
     // `--stream` / `--stream=true` on a non-streaming direction is rejected —
     // the flag carries no clap default precisely so that a value the user
     // never passed can never make a direction unreachable. Everything below

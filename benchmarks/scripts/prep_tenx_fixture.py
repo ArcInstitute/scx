@@ -85,7 +85,7 @@ _CHUNK_NNZ = 32 * 1024 * 1024
 _FEATURE_TYPE = "Gene Expression"
 
 
-def _read_index(group, axis: str) -> list[str]:
+def _read_index(group) -> list[str]:
     """The obs/var index of an h5ad dataframe group, as a list of `str`.
 
     Reads the dataset named by the group's `_index` attribute rather than
@@ -145,8 +145,8 @@ def _build(dataset: DatasetConfig, out_path: Path, dry_run: bool) -> None:
             "  %s: %d cells x %d genes, nnz=%d", src.name, n_cells, n_genes, nnz
         )
 
-        barcodes = _read_index(fin["obs"], "obs")
-        gene_ids = _read_index(fin["var"], "var")
+        barcodes = _read_index(fin["obs"])
+        gene_ids = _read_index(fin["var"])
         if len(barcodes) != n_cells or len(gene_ids) != n_genes:
             raise RuntimeError(
                 f"{src}: obs index has {len(barcodes)} entries and var index "
@@ -174,7 +174,7 @@ def _build(dataset: DatasetConfig, out_path: Path, dry_run: bool) -> None:
                 out_data[start:end] = src_data[start:end]
                 logger.info("  copied nnz [%d, %d) of %d", start, end, nnz)
 
-            vlen = h5py.special_dtype(vlen=str)
+            vlen = h5py.string_dtype(encoding="utf-8")
             matrix.create_dataset("barcodes", data=barcodes, dtype=vlen)
             features = matrix.create_group("features")
             features.create_dataset("id", data=gene_ids, dtype=vlen)

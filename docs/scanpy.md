@@ -336,6 +336,17 @@ Caveats:
 pyscx.from_10x("filtered_feature_bc_matrix.h5", "dataset.scx")
 ```
 
+`from_10x` reads through `scanpy.read_10x_h5` and hands the in-memory AnnData to
+`from_anndata`, so peak memory scales with the whole matrix. That is fine for a
+*filtered* matrix and wrong for a raw all-droplet one. For
+`raw_feature_bc_matrix.h5` — the CellBender input, millions of droplets — use
+the CLI, which streams by default and bounds peak memory to the resident
+`indptr` plus one shard per outstanding worker:
+
+```bash
+scx convert --from 10x raw_feature_bc_matrix.h5 raw.scx
+```
+
 ### From Cell Ranger MTX directory
 
 ```python
