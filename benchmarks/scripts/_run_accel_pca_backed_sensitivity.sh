@@ -58,6 +58,12 @@ export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 restore_shared_env() {
     echo ""
     echo "=== restoring ${ENV}'s pyscx from ${SCX_DIR} ==="
+    # Wholesale, exactly as the arm builds do. A reused target dir lets cargo
+    # report "Finished in 0.59s" and re-link a 0-byte artifact from release/,
+    # and maturin then dies on `Object is too small` — which is how job 2938504
+    # left the env pointing at a worktree it had just deleted, the very thing
+    # this function exists to prevent.
+    rm -rf /home/nickyoungblut/.cargo-target-pr12-restore
     ( cd "${SCX_DIR}/pyscx" \
       && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-pr12-restore \
          "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) \

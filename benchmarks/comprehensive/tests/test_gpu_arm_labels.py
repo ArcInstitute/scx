@@ -502,6 +502,36 @@ def test_the_backed_pca_wall_floor_names_a_metric_the_gate_can_read(floors):
         assert "max" in s, "a wall ceiling is a `max`, not a `min`"
 
 
+def test_the_backed_pca_wall_ceiling_is_only_where_it_can_fire(floors):
+    """The wall ceiling is on tabula_sapiens_100k and deliberately NOT on
+    census_500k.
+
+    Measured main vs branch in one job, same host, identical shard counts
+    (SLURM 2938504):
+
+        tabula_sapiens_100k   1.615 -> 1.141 s   1.42x   1.25x ceiling = 1.43  FIRES
+        census_500k           4.033 -> 3.573 s   1.13x   1.25x ceiling = 4.47  cannot
+
+    A census ceiling at the house 1.25x would sit above the *reverted* wall, so
+    deleting the optimisation outright would leave it green. That is worse than
+    no floor: it reads as coverage. This test exists so a later "we floored one
+    dataset, let's floor the other for symmetry" has to produce a number first.
+    """
+    walls = [f for f in floors
+             if f.get("format") == PCA_BACKED and "wall" in f.get("metric", "")]
+    covered = {f["dataset"] for f in walls}
+    assert covered == {"tabula_sapiens_100k"}, (
+        f"wall ceilings on {covered}; census_500k's 1.13x cannot be caught by a "
+        "1.25x ceiling — re-measure before adding one"
+    )
+    # And the exact floors DO cover both, so census still gates what it can.
+    for metric in ("pca_backed_n_shards", "pca_route_gpu_correct"):
+        exact = {f["dataset"] for f in _floors_for(floors, PCA_BACKED, metric)}
+        assert exact == set(_scope_for(PCA_BACKED)), (
+            f"{metric} covers {exact}; every scoped dataset must carry it"
+        )
+
+
 def test_the_backed_pca_arm_refuses_to_run_without_its_fixture():
     """Falling back to the in-memory X would report a single-shard number under
     the multi-shard arm's name — the precise failure the arm exists to prevent.
