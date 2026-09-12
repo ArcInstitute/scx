@@ -67,11 +67,22 @@ run_test() {
         -- --include-ignored --nocapture --test-threads=1 \
         >"${WORK}/red_${label}.log" 2>&1
     local rc=$?
-    # A filter that selects nothing exits 0 and looks exactly like a pass.
-    if grep -qE 'running 0 tests' "${WORK}/red_${label}.log"; then
-        echo "  !! ${label}: the filter '${filter}' selected NO tests"
+    # A filter that selects nothing exits 0 and looks exactly like a pass, so
+    # count the tests that actually EXECUTED.
+    #
+    # Not `grep 'running 0 tests'`: `cargo test -p scx-gpu` starts several test
+    # binaries and the ones the filter does not reach legitimately report
+    # `running 0 tests` — `tests/gpu_test_gating.rs` does on every filter here.
+    # The first version of this check keyed on that line and so failed all three
+    # mutations before any of them ran, on a build where the target tests had
+    # just passed.
+    local n_ran
+    n_ran=$(grep -cE '^test .+ \.\.\. ' "${WORK}/red_${label}.log" || true)
+    if [ "${n_ran:-0}" -eq 0 ]; then
+        echo "  !! ${label}: the filter '${filter}' executed NO tests"
         return 99
     fi
+    echo "  (${n_ran} test(s) executed under filter '${filter}')"
     return ${rc}
 }
 
