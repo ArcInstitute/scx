@@ -129,6 +129,15 @@ run_arm() {
     rm -rf "${target}"
     ( cd "${dir}/pyscx" && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR="${target}" \
         "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) 2>&1 | tail -3
+    local build_rc=${PIPESTATUS[0]}
+    [ "${build_rc}" -eq 0 ] || {
+        # A failed rebuild leaves the shared editable install pointing at the
+        # PREVIOUS arm, so the import check and the GPU preflight below both
+        # pass — on the wrong binary — and the job reports an A/B it never ran
+        # (all three reviewers, round 2).
+        echo "  !! arm ${name}: maturin build exited ${build_rc}"
+        return "${build_rc}"
+    }
     cd "${dir}" || return 1
     python -c "import pyscx; print('so:', pyscx.__file__)"
 
@@ -228,6 +237,11 @@ def load(p):
 
 
 fb_main, fb_branch = load(out / "freebies_main.json"), load(out / "freebies_branch.json")
+de_pre_m, de_pre_b = load(out / "de_main.json"), load(out / "de_branch.json")
+# `load` returning None used to skip the table silently and still exit 0 — an
+# A/B that compared nothing, reported as success (all three reviewers, round 2).
+_absent = [n for n, v in (("freebies_main", fb_main), ("freebies_branch", fb_branch),
+                          ("de_main", de_pre_m), ("de_branch", de_pre_b)) if not v]
 if fb_main and fb_branch:
     print("\n-- wall (min of 3), main -> branch --")
     print(f"{'measurement':<46} {'main':>10} {'branch':>10} {'speedup':>9}")
@@ -290,7 +304,12 @@ if de_main and de_branch:
         label = f"{key(r)[0]}/{key(r)[1]}"
         print(f"{label:<34} {a:>10.1f} {b:>10.1f} {a/b:>8.2f}x  "
               f"{m.get('route')} -> {r.get('route')}")
+
+if _absent:
+    print(f"\n!! MISSING RESULT FILES: {', '.join(_absent)} — nothing was compared")
+    raise SystemExit(1)
 PY
+[ $? -eq 0 ] || fail "the A/B summary could not compare both arms"
 
 echo ""
 echo "=== done; raw under ${OUT} ==="

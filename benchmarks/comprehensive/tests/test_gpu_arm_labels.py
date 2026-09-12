@@ -613,17 +613,26 @@ def test_the_backed_fixture_path_does_not_fall_back_to_the_cwd(monkeypatch, tmp_
     monkeypatch.delenv("SCX_WORK_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
 
-    class _X:
-        nnz = 7
-
     class _Adata:
-        n_obs, n_vars, X = 10, 4, _X()
+        n_obs, n_vars = 10, 4
 
-    # No pyscx write happens: the cached-path branch returns before building.
-    target = Path("/tmp/scx_pca_backed_fixtures") / "ds.10x4x7.bench_pca_backed.scx"
-    monkeypatch.setattr(Path, "exists", lambda self: self == target)
+    # Resolve the directory the function would choose, without letting it write:
+    # `pyscx.from_anndata` on this stub raises, the function logs and returns
+    # None, and the assertion is about WHERE it tried. Patching `Path.exists`
+    # globally (the first version of this test) also made it mkdir the real
+    # shared `/tmp` from a unit test.
+    calls: list[str] = []
+    monkeypatch.setattr(pca, "logger", type("L", (), {
+        "info": lambda self, *a: calls.append(a[2] if len(a) > 2 else ""),
+        "warning": lambda self, *a: None,
+    })())
     got = pca._ensure_scx_backed_fixture(_Adata(), "ds")
-    assert got == target, f"fixture resolved to {got}, not the /tmp fallback"
+    assert got is None, "the stub adata cannot convert; this test is about the path"
+    assert calls, "the builder never logged its target path"
+    chosen = str(calls[-1])
+    assert chosen.startswith("/tmp/scx_pca_backed_fixtures"), (
+        f"fixture resolved to {chosen}, not the /tmp fallback"
+    )
     assert not (tmp_path / "scx_pca_backed_fixtures").exists()
 
 

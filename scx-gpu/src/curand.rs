@@ -134,19 +134,22 @@ pub fn random_gaussian_gpu(
             .memcpy_dtod(&src, &mut out)
             .map_err(|e| GpuError::CudaError(format!("dtod trim (random_gaussian_gpu): {e}")))?;
         // `buf` — the scratch `src` views — is dropped when this block ends, and
-        // cudarc frees it stream-ordered on the stream it was ALLOCATED on
-        // (`dev`'s), not necessarily the `stream` the copy was queued on. Every
-        // caller today passes `dev.stream()`, so the two coincide; a caller that
-        // did not would free the source out from under an in-flight copy. Sync
-        // rather than rely on an invariant the signature does not enforce.
+        // cudarc frees it stream-ordered. The copy above was queued on `stream`,
+        // which this function accepts as a parameter and is publicly re-exported
+        // with, so it need not be `dev`'s. Wait on **that** stream.
+        //
+        // `dev.synchronize()` was the first attempt and is wrong here: it is
+        // `self.stream.synchronize()`, so it settles the device's stream and
+        // leaves a copy queued on any other one still in flight — closing the
+        // race only in the case that never needed closing (codex, Cursor Agent).
         //
         // This is the one place the D2D form reintroduces a host block, and it
         // is free in practice: the branch is unreachable at every pyscx default
         // (`k = 60`, so `n_vars * k` is even). It also makes this path
-        // capture-illegal again — `GpuDevice::synchronize` is `capture_guard`-
-        // checked, which is the correct outcome, since a host sync inside a
-        // capture region is exactly what that guard exists to reject.
-        dev.synchronize()?;
+        // capture-illegal again — `synchronize_stream` is `capture_guard`-checked
+        // — which is the correct outcome, since a host sync inside a capture
+        // region is exactly what that guard exists to reject.
+        dev.synchronize_stream(stream)?;
         Ok(out)
     } else {
         Ok(buf)

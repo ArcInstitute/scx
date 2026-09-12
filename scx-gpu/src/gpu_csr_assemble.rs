@@ -159,11 +159,13 @@ pub fn decode_csr_shards_to_device_with_stats(
         // host memory `cuMemcpyDtoHAsync` is host-synchronous, so it drained the
         // whole stream once per shard.
         //
-        // What this removes is the redundant COPY, not the barrier: every decode
-        // path still synchronizes before returning (`CombinedCsr::finish*`, and
-        // the two unframed paths directly), because a `decode_shard_gpu` caller
-        // may adopt the buffers at once. The loop therefore still costs one
-        // barrier per shard plus the outer one — which is why this measured flat.
+        // What this removes is the redundant COPY, not the barrier: the framed
+        // paths and unframed ShufDeltaZstd still synchronize before returning,
+        // because a `decode_shard_gpu` caller may adopt the buffers at once. On
+        // the canonical framed layout the loop therefore still costs one barrier
+        // per shard plus the outer one — which is why this measured flat.
+        // Unframed Scx1 is the exception: it synchronizes only under profiling,
+        // so that path does lose a barrier here and leans on the outer `finish`.
         //
         // The length check stays, and means more than it did: it now compares
         // the decoder's own output against the catalog rather than checking a

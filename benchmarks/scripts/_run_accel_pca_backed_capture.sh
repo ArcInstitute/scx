@@ -80,6 +80,17 @@ PY
 cd "${SCX_DIR}" || exit 1
 set -a; . ./.env; set +a
 
+# The summary checks that THIS job produced each scoped dataset, not that some
+# file with the right name exists in the shared raw directory.
+JOB_START_EPOCH=$(date +%s)
+EXPECTED_DATASETS=$(python -c "
+import sys; sys.path.insert(0, '${SCX_DIR}')
+from benchmarks.comprehensive.benchmarks import accel_pca
+print(','.join(sorted(accel_pca.FORMAT_DATASET_SCOPE['accel_pca__pyscx_gpu_backed'])))
+") || { echo "FATAL: could not resolve the arm's dataset scope"; exit 1; }
+export JOB_START_EPOCH EXPECTED_DATASETS
+echo "expecting results for: ${EXPECTED_DATASETS}"
+
 # Drive the benchmark module directly rather than through `run_all.py`: its
 # `ALL_FORMATS` does not contain accel variants at all (they come from
 # `config.get_formats(include_accel=True)`, which only `run_parallel.py` calls),
@@ -98,16 +109,22 @@ from benchmarks.comprehensive.results import write_result
 KEY = "accel_pca__pyscx_gpu_backed"
 variant = next(v for v in accel_pca.accel_pca_variants() if v.key == KEY)
 scope = accel_pca.FORMAT_DATASET_SCOPE[KEY]
-rc = 1
+# EVERY scoped dataset must produce a result. The first version started `rc = 1`
+# and set it to 0 on the first success, so one dataset succeeding made the job
+# green while the other silently produced nothing — under a `fail` message that
+# claimed to reject exactly that (all three reviewers, round 2).
+missing = []
 for name in sorted(scope):
     print(f"\n=== {name} ===", flush=True)
     res = accel_pca.run(DATASETS[name], variant, n_runs=3)
     if res is None:
         print(f"  {name}: run() returned None (variant unavailable here)")
+        missing.append(name)
         continue
     print(f"  wrote {write_result(res)}", flush=True)
-    rc = 0
-sys.exit(rc)
+if missing:
+    print(f"!! no result for: {', '.join(missing)}", file=sys.stderr)
+sys.exit(1 if (missing or not scope) else 0)
 PYEOF
 [ ${PIPESTATUS[0]} -eq 0 ] || fail "the capture produced no result for at least one dataset"
 
@@ -118,11 +135,26 @@ import json, statistics, sys
 from pathlib import Path
 
 out = Path(sys.argv[1])
-# `write_result` writes to the fixed RAW_RESULTS_DIR, not to --output-dir.
-raws = sorted(
-    Path("/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/results/raw")
-    .glob("*accel_pca__pyscx_gpu_backed*.json")
+# `write_result` writes to the fixed RAW_RESULTS_DIR, not to --output-dir. That
+# directory is SHARED across runs, so a plain glob lets a stale file from an
+# earlier invocation stand in for a dataset this one failed to produce. Require
+# the exact set this run was scoped to, and require each file to be newer than
+# the job's start (all three reviewers, round 2).
+import os
+import time
+
+raw_dir = Path("/home/nickyoungblut/dev/rust/scx/benchmarks/comprehensive/results/raw")
+started = float(os.environ.get("JOB_START_EPOCH", "0"))
+expected = sorted(
+    (raw_dir / f"accel_pca__accel_pca__pyscx_gpu_backed__{d}.json")
+    for d in os.environ["EXPECTED_DATASETS"].split(",")
 )
+stale = [p.name for p in expected if p.exists() and p.stat().st_mtime < started]
+absent = [p.name for p in expected if not p.exists()]
+if absent or stale:
+    print(f"MISSING: {absent}   STALE (predate this job): {stale}")
+    raise SystemExit(1)
+raws = expected
 if not raws:
     print("NO RAW RESULTS — the arm produced nothing"); raise SystemExit(1)
 for p in raws:

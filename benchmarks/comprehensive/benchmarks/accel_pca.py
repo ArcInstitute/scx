@@ -244,8 +244,9 @@ def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
     default that drifts to one shard fails the floor rather than silently
     turning this arm into a copy of the in-memory ones.
 
-    Cached on disk under ``$SCX_BENCH_TMPDIR/scx_pca_backed_fixtures/``;
-    ``SCX_BENCH_REBUILD_BACKED=1`` forces a rebuild.
+    Written under ``$SCX_BENCH_TMPDIR/scx_pca_backed_fixtures/`` (falling back to
+    ``/tmp``) and **rebuilt on every invocation** — see the body for why a cache
+    key cannot be trusted here.
     """
     import os
 
@@ -264,30 +265,37 @@ def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
     except OSError as e:
         logger.warning("accel_pca: cannot create %s (%s); no backed fixture", out_dir, e)
         return None
-    # The filename carries the matrix's shape and nnz. A bare
-    # `{dataset}.bench_pca_backed.scx` in a shared `/tmp` is reused by any later
-    # job for the same dataset name, so a fixture built from a *different*
-    # preprocessed matrix (a changed HVG count, another branch's writer) would be
-    # measured against this run's in-memory reference — incomparable cosines, and
-    # on census no wall ceiling to notice the smaller problem.
-    nnz = int(getattr(adata.X, "nnz", 0) or 0)
-    ident = f"{int(adata.n_obs)}x{int(adata.n_vars)}x{nnz}"
-    scx_path = out_dir / f"{dataset_name}.{ident}.bench_pca_backed.scx"
-    rebuild = os.environ.get("SCX_BENCH_REBUILD_BACKED", "") in ("1", "true", "TRUE")
-    if scx_path.exists() and not rebuild:
-        logger.info("accel_pca: reusing cached backed fixture %s", scx_path)
-        return scx_path
-    if scx_path.exists():
-        scx_path.unlink()
+    # **Rebuilt every invocation, never reused from disk.**
+    #
+    # A cache key can only be as good as what it hashes. Keying on the dataset
+    # name let any later job reuse another's file; keying on
+    # `(n_obs, n_vars, nnz)` — the first attempt at a fix — still collides
+    # whenever the *values* change while the sparsity pattern does not, which is
+    # exactly what a normalization or preprocessing change does. This arm feeds
+    # its embedding to the runner's cosine comparison against a freshly computed
+    # scanpy reference, so a stale matrix would be scored against the wrong
+    # reference and the new subspace floors would be validating an answer to a
+    # different question.
+    #
+    # `run()` builds this once and reuses it across warm-up and every timed run,
+    # so the cost is one conversion per (dataset, variant) cell — paid for a
+    # correctness property, and the alternative is a real content fingerprint
+    # over the whole matrix, which costs a full pass anyway.
+    scx_path = out_dir / f"{dataset_name}.bench_pca_backed.scx"
     try:
         import pyscx
 
+        # Inside the guard: an `unlink` that hits a permission or locking error
+        # must return None so the caller can record a missing result, not escape
+        # and fail the job (the bot's round-1 note; codex round 2).
+        if scx_path.exists():
+            scx_path.unlink()
         logger.info(
             "accel_pca: building backed fixture for %s -> %s (n_obs=%d n_vars=%d)",
             dataset_name, scx_path, int(adata.n_obs), int(adata.n_vars),
         )
         pyscx.from_anndata(adata, str(scx_path), csc="off")
-    except Exception as e:  # noqa: BLE001
+    except (OSError, Exception) as e:  # noqa: BLE001
         logger.warning(
             "accel_pca: pyscx.from_anndata(%s) failed: %s; the backed arm will "
             "report no measurement rather than silently measuring the in-memory path",

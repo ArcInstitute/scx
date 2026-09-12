@@ -773,12 +773,19 @@ copy, read back to obtain something the host had just computed. The decoders now
 hand the vector back instead (`decode_shard_gpu_with_indptr`,
 `CombinedCsr::finish_with_indptr`).
 
-**What that removes is the redundant copy, not the per-shard barrier.** Each
-decode path still synchronizes before it returns — `CombinedCsr::finish{,_with_indptr}`
-calls `dev.synchronize()`, and the unframed Scx1 and ShufDeltaZstd paths call it
-directly — because a caller of `decode_shard_gpu` may adopt those buffers
-immediately. So a multi-shard assemble still costs one barrier per shard plus the
-outer one; only the D2H traffic is gone. The per-shard H→D upload of the indptr
+**What that removes is the redundant copy, not the per-shard barrier.** The
+framed paths and unframed ShufDeltaZstd still synchronize before returning —
+`CombinedCsr::finish{,_with_indptr}` calls `dev.synchronize()` and the unframed
+ShufDeltaZstd path calls it directly — because a caller of `decode_shard_gpu` may
+adopt those buffers immediately. So a multi-shard assemble of the canonical framed
+layout still costs one barrier per shard plus the outer one; only the D2H traffic
+is gone.
+
+Unframed **Scx1** is the exception: it synchronizes only when GPU profiling is
+enabled (`if t_gpu.is_some()`), so that path genuinely loses a barrier here and
+now relies on the outer assembly's. That is sound — `CombinedCsr::finish`
+synchronizes before any consumer sees the result — but it is a real change in
+where the barrier sits, not a no-op. The per-shard H→D upload of the indptr
 also stays, since each path still builds a `GpuCsr`, which owns a device indptr.
 Collapsing the inner barriers would need a decode entry point that promises an
 unsynchronized result, and is why this change measured flat on `to_gpu_anndata`

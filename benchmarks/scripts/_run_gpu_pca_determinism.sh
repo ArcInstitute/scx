@@ -64,6 +64,10 @@ echo "  before: $(cat "${ENV}"/lib/python*/site-packages/pyscx.pth 2>/dev/null)"
 ( cd "${SCX_DIR}/pyscx" \
   && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR=/home/nickyoungblut/.cargo-target-pr12-det \
      "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) 2>&1 | tail -3
+BUILD_RC=${PIPESTATUS[0]}
+# A failed rebuild leaves the shared editable install pointing wherever it did
+# before, so the import check below passes on the wrong binary.
+[ "${BUILD_RC}" -eq 0 ] || { echo "FATAL: maturin build exited ${BUILD_RC}"; exit "${BUILD_RC}"; }
 echo "  after : $(cat "${ENV}"/lib/python*/site-packages/pyscx.pth 2>/dev/null)"
 python -c "import pyscx; print('  import:', pyscx.__file__)" \
     || { echo "FATAL: pyscx still broken after rebuild"; exit 1; }

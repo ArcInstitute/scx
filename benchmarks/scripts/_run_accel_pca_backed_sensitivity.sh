@@ -98,6 +98,15 @@ run_arm() {
     rm -rf "${target}"
     ( cd "${dir}/pyscx" && VIRTUAL_ENV="${ENV}" CARGO_TARGET_DIR="${target}" \
         "${ENV}/bin/maturin" develop --release --features hdf5,gpu ) 2>&1 | tail -2
+    local build_rc=${PIPESTATUS[0]}
+    [ "${build_rc}" -eq 0 ] || {
+        # A failed rebuild leaves the shared editable install pointing at the
+        # PREVIOUS arm, so the import check and the GPU preflight below both
+        # pass — on the wrong binary — and the job reports an A/B it never ran
+        # (all three reviewers, round 2).
+        echo "  !! arm ${name}: maturin build exited ${build_rc}"
+        return "${build_rc}"
+    }
     cd "${dir}" || return 1
     python -c "import pyscx; print('so:', pyscx.__file__)"
     set -a; . ./.env; set +a
@@ -178,6 +187,10 @@ for k in sorted(set(m) & set(b)):
     print(f"{k:<24} {a:>9.3f} {c:>9.3f} {speed:>7.2f}x {catches:>24}")
     print(f"{'':<24} shards main={m[k]['n_shards']} branch={b[k]['n_shards']}")
 PYEOF
+# Capture got this check in round 1 and sensitivity did not — an incomplete copy
+# of the same patch. Without `set -e` the summary's `SystemExit(1)` (missing or
+# unreadable arm JSON) leaves the shell running straight on to `exit "${STATUS}"`.
+[ $? -eq 0 ] || fail "the sensitivity summary could not compare both arms"
 
 echo ""
 echo "=== done; raw under ${OUT} ==="
