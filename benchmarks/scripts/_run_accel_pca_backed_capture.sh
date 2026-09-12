@@ -27,6 +27,15 @@
 #SBATCH --error=/home/nickyoungblut/scx-bench-pr12/pca_backed_cap_%j.out
 
 set -uo pipefail
+
+# Exit status tracks the MEASUREMENT, not the last echo. Every one of these
+# scripts used to end on a successful `echo`, so a crashed profiler or a
+# half-finished capture produced a SLURM job reporting COMPLETED 0:0 — job
+# 2938439 "COMPLETED" in 15 s having measured nothing. GitHub CI runs none of
+# the GPU tests, so a green SLURM job is the only signal here, and a green one
+# that measured nothing is worse than a red one.
+STATUS=0
+fail() { echo "!! $*" >&2; STATUS=1; }
 SCX_DIR=/home/nickyoungblut/dev/rust/scx
 CONDA=/home/nickyoungblut/miniforge3
 ENV="${CONDA}/envs/scx-bench-gpu"
@@ -100,6 +109,7 @@ for name in sorted(scope):
     rc = 0
 sys.exit(rc)
 PYEOF
+[ ${PIPESTATUS[0]} -eq 0 ] || fail "the capture produced no result for at least one dataset"
 
 echo ""
 echo "########## FLOOR INPUTS ##########"
@@ -129,6 +139,12 @@ for p in raws:
           f"routes={routes}")
     print(f"  median pca_backed_wall_s = {med:.3f}s   -> floor at 1.25x = {med*1.25:.2f}")
 PY
+[ $? -eq 0 ] || fail "the floor-input summary could not read the results"
 
 echo ""
 echo "=== done; raw under ${OUT} ==="
+
+if [ "${STATUS}" -ne 0 ]; then
+    echo "=== FAILED: at least one step above did not complete; see !! lines ==="
+fi
+exit "${STATUS}"

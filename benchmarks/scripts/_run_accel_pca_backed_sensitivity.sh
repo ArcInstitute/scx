@@ -24,6 +24,22 @@
 #SBATCH --error=/home/nickyoungblut/scx-bench-pr12/pca_backed_sens_%j.out
 
 set -uo pipefail
+
+# Exit status tracks the MEASUREMENT, not the last echo.
+#
+# These scripts run `set -uo pipefail` (not `-e`: an arm that fails should still
+# let the other arm and the summary run), and every one of them used to end on a
+# successful `echo`, so a failed build, a crashed profiler or a half-finished
+# capture produced a SLURM job that reported COMPLETED 0:0. That is not
+# hypothetical here: job 2938439 "COMPLETED" in 15 s having measured nothing,
+# and 2938468 "COMPLETED" with one of its two arms dead. Since GitHub CI runs
+# none of the GPU tests, a green SLURM job is the only signal these produce, and
+# a green one that measured nothing is worse than a red one.
+#
+# `fail <msg>` records a failure and keeps going; the script exits non-zero at
+# the end if anything called it.
+STATUS=0
+fail() { echo "!! $*" >&2; STATUS=1; }
 SCX_DIR=/home/nickyoungblut/dev/rust/scx
 CONDA=/home/nickyoungblut/miniforge3
 ENV="${CONDA}/envs/scx-bench-gpu"
@@ -111,6 +127,12 @@ for name in ("tabula_sapiens_100k", "census_500k"):
           flush=True)
 Path(os.environ["OUTDIR"], f"sens_{os.environ['ARM']}.json").write_text(json.dumps(rows, indent=2))
 PYEOF
+    # PIPESTATUS, not $?: the pipeline above ends in `tail`, whose status is 0
+    # even when the python inside died. Job 2938468's branch arm exited on a
+    # StopIteration and the job still reported COMPLETED 0:0.
+    local rc=${PIPESTATUS[0]}
+    [ "${rc}" -eq 0 ] || { echo "  !! arm ${name}: measurement exited ${rc}"; return "${rc}"; }
+    return 0
 }
 
 rm -rf "${WT_MAIN}" "${WT_BRANCH}"; git -C "${SCX_DIR}" worktree prune
@@ -126,8 +148,8 @@ cp "${SCX_DIR}/benchmarks/comprehensive/benchmarks/accel_pca.py" \
 cp "${SCX_DIR}/.env" "${WT_MAIN}/.env"
 cp "${SCX_DIR}/.env" "${WT_BRANCH}/.env"
 
-run_arm main   "${WT_MAIN}"
-run_arm branch "${WT_BRANCH}"
+run_arm main   "${WT_MAIN}" || fail "run_arm main failed"
+run_arm branch "${WT_BRANCH}" || fail "run_arm branch failed"
 
 for w in "${WT_MAIN}" "${WT_BRANCH}"; do
     git -C "${SCX_DIR}" worktree remove --force "$w" 2>/dev/null; rm -rf "$w"
@@ -159,3 +181,8 @@ PYEOF
 
 echo ""
 echo "=== done; raw under ${OUT} ==="
+
+if [ "${STATUS}" -ne 0 ]; then
+    echo "=== FAILED: at least one step above did not complete; see !! lines ==="
+fi
+exit "${STATUS}"

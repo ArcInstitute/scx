@@ -32,6 +32,22 @@
 #SBATCH --error=/home/nickyoungblut/scx-bench-pr12/gpu_ab_%j.out
 
 set -uo pipefail
+
+# Exit status tracks the MEASUREMENT, not the last echo.
+#
+# These scripts run `set -uo pipefail` (not `-e`: an arm that fails should still
+# let the other arm and the summary run), and every one of them used to end on a
+# successful `echo`, so a failed build, a crashed profiler or a half-finished
+# capture produced a SLURM job that reported COMPLETED 0:0. That is not
+# hypothetical here: job 2938439 "COMPLETED" in 15 s having measured nothing,
+# and 2938468 "COMPLETED" with one of its two arms dead. Since GitHub CI runs
+# none of the GPU tests, a green SLURM job is the only signal these produce, and
+# a green one that measured nothing is worse than a red one.
+#
+# `fail <msg>` records a failure and keeps going; the script exits non-zero at
+# the end if anything called it.
+STATUS=0
+fail() { echo "!! $*" >&2; STATUS=1; }
 SCX_DIR=/home/nickyoungblut/dev/rust/scx
 CONDA=/home/nickyoungblut/miniforge3
 ENV="${CONDA}/envs/scx-bench-gpu"
@@ -144,6 +160,7 @@ PY
         GPU_FB_EMB_DIR="${OUT}/emb-${name}" \
         python benchmarks/scripts/profile_gpu_freebies.py \
         2>&1 | tee "${OUT}/freebies_${name}.txt" | grep -vE "warn|^\s*$"
+    local fb_rc=${PIPESTATUS[0]}
 
     # OPT-GPU-1: the GPU DE routes. `hvg` is the control -- this PR touches
     # neither the HVG kernels nor the staging driver they share, so a moved
@@ -154,6 +171,12 @@ PY
         GPU_DE_OUT="${OUT}/de_${name}.json" \
         python benchmarks/scripts/profile_gpu_de_resident.py \
         2>&1 | tee "${OUT}/de_${name}.txt" | grep -vE "warn|^\s*$"
+    # PIPESTATUS, not $?: both pipelines end in `grep`, whose status says
+    # nothing about whether the profiler ran. Checked per measurement block.
+    local de_rc=${PIPESTATUS[0]}
+    [ "${fb_rc:-0}" -eq 0 ] || { echo "  !! arm ${name}: freebies profile exited ${fb_rc}"; return "${fb_rc}"; }
+    [ "${de_rc}" -eq 0 ] || { echo "  !! arm ${name}: DE profile exited ${de_rc}"; return "${de_rc}"; }
+    return 0
 }
 
 # BOTH arms run from a detached worktree at a pinned SHA, including the branch
@@ -172,8 +195,8 @@ cp "${SCX_DIR}/benchmarks/scripts/profile_gpu_freebies.py" "${WT_MAIN}/benchmark
 cp "${SCX_DIR}/.env" "${WT_MAIN}/.env"
 cp "${SCX_DIR}/.env" "${WT_BRANCH}/.env"
 
-run_arm main   "${WT_MAIN}"
-run_arm branch "${WT_BRANCH}"
+run_arm main   "${WT_MAIN}" || fail "run_arm main failed"
+run_arm branch "${WT_BRANCH}" || fail "run_arm branch failed"
 
 for w in "${WT_MAIN}" "${WT_BRANCH}"; do
     git -C "${SCX_DIR}" worktree remove --force "$w" 2>/dev/null; rm -rf "$w"
@@ -271,3 +294,8 @@ PY
 
 echo ""
 echo "=== done; raw under ${OUT} ==="
+
+if [ "${STATUS}" -ne 0 ]; then
+    echo "=== FAILED: at least one step above did not complete; see !! lines ==="
+fi
+exit "${STATUS}"

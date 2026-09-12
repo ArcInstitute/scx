@@ -768,13 +768,21 @@ unframed Scx1 path Delta-Golomb-decodes it, the host-bounce path gets it from
 `prescan_*_group_indptr`.
 
 The loop nonetheless used to recover it with a per-shard
-`dev.dtoh_copy(shard.indptr())`. On pageable host memory `cuMemcpyDtoHAsync` is
-host-synchronous, so that drained the whole stream once per shard: N
-serialization points to read back something the host had just computed. The
-decoders now hand the vector back (`decode_shard_gpu_with_indptr`,
-`CombinedCsr::finish_with_indptr`) and the only synchronization left is
-`finish`'s, once. The per-shard H→D upload of the indptr stays — each path still
-builds a `GpuCsr`, which owns a device indptr.
+`dev.dtoh_copy(shard.indptr())` — on pageable host memory a host-synchronous
+copy, read back to obtain something the host had just computed. The decoders now
+hand the vector back instead (`decode_shard_gpu_with_indptr`,
+`CombinedCsr::finish_with_indptr`).
+
+**What that removes is the redundant copy, not the per-shard barrier.** Each
+decode path still synchronizes before it returns — `CombinedCsr::finish{,_with_indptr}`
+calls `dev.synchronize()`, and the unframed Scx1 and ShufDeltaZstd paths call it
+directly — because a caller of `decode_shard_gpu` may adopt those buffers
+immediately. So a multi-shard assemble still costs one barrier per shard plus the
+outer one; only the D2H traffic is gone. The per-shard H→D upload of the indptr
+also stays, since each path still builds a `GpuCsr`, which owns a device indptr.
+Collapsing the inner barriers would need a decode entry point that promises an
+unsynchronized result, and is why this change measured flat on `to_gpu_anndata`
+at 7 and 31 shards.
 
 The nvcomp cross-shard batched path never entered this loop and is unchanged.
 

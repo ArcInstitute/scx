@@ -249,16 +249,30 @@ def _ensure_scx_backed_fixture(adata: Any, dataset_name: str) -> Path | None:
     """
     import os
 
-    base = Path(os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", ""))
-    out_dir = (base / "scx_pca_backed_fixtures") if base.is_dir() else Path(
-        "/tmp/scx_pca_backed_fixtures"
+    # NOTE: `Path("")` is `PosixPath(".")` and `.is_dir()` is True, so an unset
+    # env must be detected on the raw STRING before constructing the Path — else
+    # the fixture lands in the cwd instead of the /tmp fallback. Same trap, same
+    # note, as `accel_preprocess._ensure_scx_fixture`.
+    base_str = os.environ.get("SCX_BENCH_TMPDIR") or os.environ.get("SCX_WORK_DIR", "")
+    out_dir = (
+        Path(base_str) / "scx_pca_backed_fixtures"
+        if base_str
+        else Path("/tmp/scx_pca_backed_fixtures")
     )
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         logger.warning("accel_pca: cannot create %s (%s); no backed fixture", out_dir, e)
         return None
-    scx_path = out_dir / f"{dataset_name}.bench_pca_backed.scx"
+    # The filename carries the matrix's shape and nnz. A bare
+    # `{dataset}.bench_pca_backed.scx` in a shared `/tmp` is reused by any later
+    # job for the same dataset name, so a fixture built from a *different*
+    # preprocessed matrix (a changed HVG count, another branch's writer) would be
+    # measured against this run's in-memory reference — incomparable cosines, and
+    # on census no wall ceiling to notice the smaller problem.
+    nnz = int(getattr(adata.X, "nnz", 0) or 0)
+    ident = f"{int(adata.n_obs)}x{int(adata.n_vars)}x{nnz}"
+    scx_path = out_dir / f"{dataset_name}.{ident}.bench_pca_backed.scx"
     rebuild = os.environ.get("SCX_BENCH_REBUILD_BACKED", "") in ("1", "true", "TRUE")
     if scx_path.exists() and not rebuild:
         logger.info("accel_pca: reusing cached backed fixture %s", scx_path)
@@ -322,27 +336,13 @@ def _run_pyscx_gpu_backed(adata: Any, n_comps: int, seed: int) -> str:
     adata.obsm["X_pca"] = np.asarray(backed.obsm["X_pca"])
     # The premise, carried as a number so it is gated rather than assumed.
     adata.uns["_bench_pca_backed_n_shards"] = n_shards
-    _propagate_pca_route(backed, adata)
-    return backed.uns.get("pca", {}).get("backend", "scx-gpu-cusparse")
-
-
-def _propagate_pca_route(src: Any, dst: Any) -> None:
-    """Merge `uns["scx_accel"]` / `uns["pca"]` from the backed adata onto the
-    runner's, so route + residency extraction reads this arm's run rather than
-    a stale entry from the warm-up."""
-    for key in ("scx_accel", "pca"):
-        try:
-            val = src.uns.get(key)
-        except Exception:  # noqa: BLE001
-            val = None
-        if not val:
-            continue
-        try:
-            merged = dict(dst.uns.get(key, {}) or {})
-            merged.update(val)
-            dst.uns[key] = merged
-        except Exception:  # noqa: BLE001
-            pass
+    # Assigned directly, and deliberately allowed to raise. A helper that
+    # swallowed a failure here would turn a missing route stamp into a missing
+    # `pca_route_gpu_correct` extra, which the floor gate reports as a violation
+    # with no indication of the cause.
+    adata.uns["scx_accel"] = dict(backed.uns["scx_accel"])
+    adata.uns["pca"] = dict(backed.uns.get("pca") or {})
+    return adata.uns["pca"].get("backend", "scx-gpu-cusparse")
 
 
 def _run_rapids_singlecell(adata: Any, n_comps: int, seed: int) -> str:
@@ -701,6 +701,7 @@ def run(
             )
             write_missing_result(
                 benchmark="accel_pca", format_key=variant_key, dataset=dataset.name,
+                missing_reason="backed_fixture_build_failed",
                 notes="backed SCX fixture could not be built",
             )
             return None

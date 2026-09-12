@@ -23,6 +23,7 @@ skipped in silence, which is how a gate exits 0 having measured nothing.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import yaml
@@ -532,6 +533,20 @@ def test_the_backed_pca_wall_ceiling_is_only_where_it_can_fire(floors):
         )
 
 
+def test_the_backed_pca_arm_gates_the_answer_and_not_only_the_speed(floors):
+    """Shard count + route + a wall ceiling gate that it ran multi-shard, on the
+    GPU, fast. None of them gate that the numbers are right — a broken
+    column-means pass reporting a `gpu_*` route under 1.43 s would pass all
+    three. `run()` already emits the subspace extras for every variant, so the
+    arm was carrying them unfloored (found by Cursor Agent)."""
+    for metric in ("subspace_cos_mean", "subspace_cos_min"):
+        specs = _floors_for(floors, PCA_BACKED, metric)
+        covered = {s["dataset"] for s in specs}
+        assert covered == set(_scope_for(PCA_BACKED)), (
+            f"{metric} covers {covered}; every scoped dataset must gate correctness"
+        )
+
+
 def test_the_backed_pca_arm_refuses_to_run_without_its_fixture():
     """Falling back to the in-memory X would report a single-shard number under
     the multi-shard arm's name — the precise failure the arm exists to prevent.
@@ -545,6 +560,71 @@ def test_the_backed_pca_arm_refuses_to_run_without_its_fixture():
 
     with _pytest.raises(RuntimeError, match="no backed fixture"):
         pca._run_pyscx_gpu_backed(_Adata(), 50, 0)
+
+
+def test_every_write_missing_result_call_binds_the_real_signature():
+    """The fixture-failure path is the backed arm's whole safety story — "record
+    missing, never silently measure the in-memory X". It shipped omitting
+    `write_missing_result`'s required `missing_reason`, so it raised `TypeError`
+    and failed the job instead (Cursor Agent, codex).
+
+    Checks **every** call site in the module, via `ast`, not the first one a
+    regex happens to match: the first draft of this test matched a *sibling*
+    call that already passed the argument, and so stayed green against the
+    unfixed code.
+    """
+    import ast
+    import inspect
+
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+    from benchmarks.comprehensive.results import write_missing_result
+
+    required = {
+        n for n, prm in inspect.signature(write_missing_result).parameters.items()
+        if prm.default is inspect.Parameter.empty
+    }
+    tree = ast.parse(inspect.getsource(pca))
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None))
+        == "write_missing_result"
+    ]
+    assert calls, "accel_pca no longer calls write_missing_result"
+    for node in calls:
+        kwargs = {kw.arg for kw in node.keywords if kw.arg}
+        n_pos = len(node.args)
+        missing = sorted(required - kwargs)[n_pos:] if n_pos else sorted(required - kwargs)
+        assert not missing, (
+            f"write_missing_result at line {node.lineno} omits {missing} — "
+            "that call raises TypeError on the path it exists to handle"
+        )
+
+
+def test_the_backed_fixture_path_does_not_fall_back_to_the_cwd(monkeypatch, tmp_path):
+    """`Path("")` is `PosixPath(".")` and `.is_dir()` is True, so an unset
+    `SCX_BENCH_TMPDIR`/`SCX_WORK_DIR` used to land the fixture in whatever
+    directory launched the benchmark instead of the documented `/tmp` fallback —
+    on a shared node, next to another job's. `accel_preprocess` carries a NOTE
+    about this exact trap; this arm had reproduced it (Antigravity, codex)."""
+    from benchmarks.comprehensive.benchmarks import accel_pca as pca
+
+    monkeypatch.delenv("SCX_BENCH_TMPDIR", raising=False)
+    monkeypatch.delenv("SCX_WORK_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    class _X:
+        nnz = 7
+
+    class _Adata:
+        n_obs, n_vars, X = 10, 4, _X()
+
+    # No pyscx write happens: the cached-path branch returns before building.
+    target = Path("/tmp/scx_pca_backed_fixtures") / "ds.10x4x7.bench_pca_backed.scx"
+    monkeypatch.setattr(Path, "exists", lambda self: self == target)
+    got = pca._ensure_scx_backed_fixture(_Adata(), "ds")
+    assert got == target, f"fixture resolved to {got}, not the /tmp fallback"
+    assert not (tmp_path / "scx_pca_backed_fixtures").exists()
 
 
 def test_the_orchestrator_refuses_out_of_scope_triples_before_submitting():

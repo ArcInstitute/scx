@@ -133,6 +133,20 @@ pub fn random_gaussian_gpu(
         stream
             .memcpy_dtod(&src, &mut out)
             .map_err(|e| GpuError::CudaError(format!("dtod trim (random_gaussian_gpu): {e}")))?;
+        // `buf` — the scratch `src` views — is dropped when this block ends, and
+        // cudarc frees it stream-ordered on the stream it was ALLOCATED on
+        // (`dev`'s), not necessarily the `stream` the copy was queued on. Every
+        // caller today passes `dev.stream()`, so the two coincide; a caller that
+        // did not would free the source out from under an in-flight copy. Sync
+        // rather than rely on an invariant the signature does not enforce.
+        //
+        // This is the one place the D2D form reintroduces a host block, and it
+        // is free in practice: the branch is unreachable at every pyscx default
+        // (`k = 60`, so `n_vars * k` is even). It also makes this path
+        // capture-illegal again — `GpuDevice::synchronize` is `capture_guard`-
+        // checked, which is the correct outcome, since a host sync inside a
+        // capture region is exactly what that guard exists to reject.
+        dev.synchronize()?;
         Ok(out)
     } else {
         Ok(buf)

@@ -27,6 +27,15 @@
 #SBATCH --error=/home/nickyoungblut/scx-bench-pr12/determinism_%j.out
 
 set -uo pipefail
+
+# Exit status tracks the MEASUREMENT, not the last echo. Every one of these
+# scripts used to end on a successful `echo`, so a crashed profiler or a
+# half-finished capture produced a SLURM job reporting COMPLETED 0:0 — job
+# 2938439 "COMPLETED" in 15 s having measured nothing. GitHub CI runs none of
+# the GPU tests, so a green SLURM job is the only signal here, and a green one
+# that measured nothing is worse than a red one.
+STATUS=0
+fail() { echo "!! $*" >&2; STATUS=1; }
 SCX_DIR=/home/nickyoungblut/dev/rust/scx
 CONDA=/home/nickyoungblut/miniforge3
 ENV="${CONDA}/envs/scx-bench-gpu"
@@ -104,5 +113,11 @@ for dataset in ("tabula_sapiens_100k", "census_500k"):
     np.save(out / f"det__{dataset}__run0.npy", embs[0])
     print(flush=True)
 PY
+[ $? -eq 0 ] || fail "the determinism comparison did not complete"
 
 echo "=== done; raw under ${OUT} ==="
+
+if [ "${STATUS}" -ne 0 ]; then
+    echo "=== FAILED: at least one step above did not complete; see !! lines ==="
+fi
+exit "${STATUS}"

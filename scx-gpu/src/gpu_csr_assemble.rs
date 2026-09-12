@@ -157,7 +157,13 @@ pub fn decode_csr_shards_to_device_with_stats(
         // so the `dev.dtoh_copy(shard.indptr())` that used to stand here was
         // reading back something the host had just produced — and on pageable
         // host memory `cuMemcpyDtoHAsync` is host-synchronous, so it drained the
-        // whole stream once per shard. Now the only sync is `finish`'s, once.
+        // whole stream once per shard.
+        //
+        // What this removes is the redundant COPY, not the barrier: every decode
+        // path still synchronizes before returning (`CombinedCsr::finish*`, and
+        // the two unframed paths directly), because a `decode_shard_gpu` caller
+        // may adopt the buffers at once. The loop therefore still costs one
+        // barrier per shard plus the outer one — which is why this measured flat.
         //
         // The length check stays, and means more than it did: it now compares
         // the decoder's own output against the catalog rather than checking a

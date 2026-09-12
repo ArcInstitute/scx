@@ -1112,6 +1112,43 @@ absolute_floors:
     dataset: tabula_sapiens_100k
     metric: pca_backed_wall_s
     max: 1.43
+  # CORRECTNESS, both datasets. Without these the arm gates speed and route but
+  # not the answer: a broken column-means pass that still reports a `gpu_*` route
+  # and finishes under 1.43 s on tabula — and under nothing at all on census —
+  # stays green. `run()` already emits these extras for every variant, so the
+  # arm was carrying them unfloored (Cursor Agent).
+  #
+  # Same bars as the sibling native randomized arms (`__pyscx_gpu_rand_hh` /
+  # `_chol` on tabula: mean 0.85, min 0.01) — and adopted only after checking
+  # this arm clears them. Observed 2026-09-12, median of 3:
+  #
+  #   tabula_sapiens_100k   subspace_cos_mean 0.9228   subspace_cos_min 0.0413
+  #   census_500k           subspace_cos_mean 0.9527   subspace_cos_min 0.4730
+  #
+  # `subspace_cos_min` sits low on both because randomized PCA returns a rotated
+  # subspace: the floor is a collapse detector (all-zero / degenerate embedding),
+  # not a numerical-agreement bar. That is the same reading the sibling arms'
+  # 0.01 carries, and why the mean is the informative one.
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_mean
+    min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: tabula_sapiens_100k
+    metric: subspace_cos_min
+    min: 0.01
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: census_500k
+    metric: subspace_cos_mean
+    min: 0.85
+  - benchmark: accel_pca
+    format: accel_pca__pyscx_gpu_backed
+    dataset: census_500k
+    metric: subspace_cos_min
+    min: 0.01
   # Harmony GPU route gate. `device="gpu"` reporting a `cpu_*` route means
   # device resolution silently fell back — a hard failure, not a slow run.
   # Phase 7e moved the M-step onto the device arm, so a fallback now also means

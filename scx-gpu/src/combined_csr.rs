@@ -236,6 +236,11 @@ impl CombinedCsr {
     /// `dtoh_copy`, which on pageable host memory is a **host-synchronous**
     /// copy: one full pipeline drain per shard, purely to read back something
     /// the host had just computed.
+    ///
+    /// Note this removes the copy, **not** the barrier — the `dev.synchronize()`
+    /// below still runs per shard when a decode path routes through here. A
+    /// variant that skipped it would have to promise callers an unsynchronized
+    /// result, which `decode_shard_gpu`'s consumers cannot accept.
     pub(crate) fn finish_with_indptr(
         mut self,
         dev: &GpuDevice,
