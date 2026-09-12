@@ -471,52 +471,49 @@ _TENX_WORKER_SCRIPT = textwrap.dedent("""\
         _structural_summary,
     )
 
-    records = []
-    structural = None
-    for _ in (0,):
-        with tempfile.TemporaryDirectory(prefix="scx_bench_tenx_") as tmp:
-            out = Path(tmp) / "out.scx"
-            argv = [scx_bin, "convert", "--from", "10x",
-                    "--stream=" + stream]
-            if reader_threads:
-                argv += ["--reader-threads", reader_threads]
-            argv += [tenx_path, str(out)]
-            t0 = time.perf_counter()
-            proc = subprocess.run(argv, capture_output=True, text=True)
-            wall_s = time.perf_counter() - t0
-            if proc.returncode != 0:
-                raise SystemExit(
-                    "scx convert --from 10x --stream=" + stream + " failed "
-                    "(exit " + str(proc.returncode) + "). A rejection naming "
-                    "'--stream is not supported for direction' means the "
-                    "resolved binary predates OPT-CONVERT-9 -- set $SCX_CLI_BIN "
-                    "or rebuild target/release/scx.\\n" + proc.stderr
-                )
-            # RUSAGE_CHILDREN, not RUSAGE_SELF: the thing being measured is the
-            # `scx` process, and this worker exists so that `scx` is its only
-            # child. It is a *cumulative* max across every reaped child, which is
-            # why the parent spawns one worker per run rather than looping here:
-            # a second convert in this process would inherit the first's peak and
-            # every later run would report a monotone non-decreasing number.
-            ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-            # `ru_maxrss` is KiB on Linux and bytes on Darwin -- the same split
-            # `rss.py` already handles. Without the branch a macOS run reports
-            # 1024x high and trips every ceiling.
-            peak_rss_mb = (
-                ru / (1024.0 * 1024.0) if sys.platform == "darwin" else ru / 1024.0
+    # One convert per worker process, no loop: `getrusage(RUSAGE_CHILDREN)` is a
+    # cumulative high-water mark over every reaped child, so a second convert
+    # here would inherit the first's peak and every later run would report a
+    # monotone non-decreasing number. The parent spawns one of these per run.
+    with tempfile.TemporaryDirectory(prefix="scx_bench_tenx_") as tmp:
+        out = Path(tmp) / "out.scx"
+        argv = [scx_bin, "convert", "--from", "10x", "--stream=" + stream]
+        if reader_threads:
+            argv += ["--reader-threads", reader_threads]
+        argv += [tenx_path, str(out)]
+        t0 = time.perf_counter()
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        wall_s = time.perf_counter() - t0
+        if proc.returncode != 0:
+            # Terse, and deliberately NOT naming any string the parent
+            # classifies on. An earlier version explained the stale-binary case
+            # here; because `python -c` prints SystemExit's argument to stderr,
+            # every failure -- an OOM, a corrupt fixture, a real convert bug --
+            # then carried the parent's needle and was recorded as "stale
+            # binary, arms skipped". Reproduced on a corrupt fixture with a
+            # current binary. `scx`'s own stderr is the only source of truth.
+            raise SystemExit(
+                "scx convert --from 10x --stream=" + stream + " exited "
+                + str(proc.returncode) + "\\n" + proc.stderr
             )
-            rec = {
-                "run_idx": run_idx,
-                "wall_s": wall_s,
-                "peak_rss_mb": peak_rss_mb,
-            }
-            if structural is None:
-                structural = _structural_summary(out)
-                rec["structural"] = structural
-                rec["output_bytes"] = out.stat().st_size
-            records.append(rec)
+        # RUSAGE_CHILDREN, not RUSAGE_SELF: the thing being measured is the
+        # `scx` process, and this worker exists so that `scx` is its only child.
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        # `ru_maxrss` is KiB on Linux and bytes on Darwin -- the same split
+        # `rss.py` already handles. Without the branch a macOS run reports
+        # 1024x high and trips every ceiling.
+        peak_rss_mb = (
+            ru / (1024.0 * 1024.0) if sys.platform == "darwin" else ru / 1024.0
+        )
+        rec = {
+            "run_idx": run_idx,
+            "wall_s": wall_s,
+            "peak_rss_mb": peak_rss_mb,
+            "structural": _structural_summary(out),
+            "output_bytes": out.stat().st_size,
+        }
 
-    print(json.dumps(records))
+    print(json.dumps([rec]))
 """)
 
 
@@ -672,26 +669,37 @@ def _run_tenx_arms(
 
     result.metadata["tenx_source_bytes"] = tenx_path.stat().st_size
     result.metadata["tenx_gated_reader_threads"] = GATED_READER_THREADS
-    structural: dict[str, dict | None] = {}
-    ran: list[str] = []
-    for label, stream, threads in (
+    # Both arms run to completion **before** anything is recorded. A skip that
+    # fired mid-loop used to leave a half-pair on the result: `tenx_streaming`
+    # had already `add_run`'d, so the floored `tenx_streaming_peak_rss_mb`
+    # survived while `_assert_tenx_streaming_beat_materialize` returned early on
+    # `len(peaks) < 2` — the floor passing with the comparison it exists for
+    # silently gone. The realistic trigger is the materialising arm, which is
+    # the one that can OOM (8599 MB against streaming's 2593 MB on census_500k).
+    arms = (
         ("tenx_streaming", True, GATED_READER_THREADS),
         ("tenx_materialize", False, None),
-    ):
-        try:
-            records = _run_tenx_arm_subprocess(
+    )
+    try:
+        collected = [
+            (label, threads, _run_tenx_arm_subprocess(
                 tenx_path, n_runs, stream, threads, scx_bin
-            )
-        except TenxArmUnavailable as exc:
-            # A binary that cannot run this direction must not take the h5ad
-            # arms down with it: they carry this benchmark's primary floors, and
-            # the docstring above promises a recorded skip rather than a crash.
-            # Only this one shape is caught — a genuine worker failure still
-            # raises, or the arms would go quiet for the wrong reason.
-            result.metadata["tenx_arms_skipped"] = str(exc)
-            result.metadata.pop("tenx_arms", None)
-            log.warning("10x arms skipped: %s", exc)
-            return
+            ))
+            for label, stream, threads in arms
+        ]
+    except TenxArmUnavailable as exc:
+        # A binary that cannot run this direction must not take the h5ad arms
+        # down with it: they carry this benchmark's primary floors, and the
+        # docstring above promises a recorded skip rather than a crash. Only
+        # this one shape is caught — a genuine worker failure still raises, or
+        # the arms would go quiet for the wrong reason.
+        result.metadata["tenx_arms_skipped"] = str(exc)
+        log.warning("10x arms skipped: %s", exc)
+        return
+
+    structural: dict[str, dict | None] = {}
+    ran: list[str] = []
+    for label, threads, records in collected:
         ran.append(label)
         for rec in records:
             if rec.get("structural") is not None and label not in structural:

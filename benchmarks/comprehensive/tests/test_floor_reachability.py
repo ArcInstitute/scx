@@ -1581,6 +1581,67 @@ def test_conversion_streaming_tenx_arms_are_scoped_and_bound_checked():
         drive(in_scope, peaks=(900.0, 100.0))
 
 
+def test_tenx_arm_classifies_only_scx_own_rejection_as_unavailable():
+    """A failing convert is a failure unless `scx` itself said it cannot.
+
+    `_run_tenx_arm_subprocess` decides skip-vs-crash by substring, over the
+    worker's combined stdout+stderr. The worker used to *explain* the
+    stale-binary case in its own error text, and `python -c` prints
+    `SystemExit`'s argument to stderr — so every failure carried the needle and
+    every failure was recorded as "stale binary, arms skipped": an OOM, a
+    corrupt fixture, a real convert bug. Reproduced at the time on a corrupt
+    fixture with a **current** binary, which reported "predates
+    OPT-CONVERT-9".
+
+    The round-1 unit test could not catch this: it patched
+    `_run_tenx_arm_subprocess` itself, so it exercised the catch in
+    `_run_tenx_arms` and never the substring match that the real worker feeds.
+    This one drives the actual subprocess path with a stub `scx`.
+
+    Found by **Cursor Agent - Grok 4.6 High**.
+    """
+    import stat
+    import tempfile
+    from pathlib import Path
+
+    from benchmarks.comprehensive.benchmarks import conversion_streaming as cs
+
+    def fake_scx(exit_message: str):
+        """A stub `scx` that fails with *exit_message* on stderr."""
+        d = tempfile.mkdtemp()
+        binary = Path(d) / "scx"
+        binary.write_text(
+            "#!/bin/sh\n"
+            f"echo {exit_message!r} >&2\n"
+            "exit 1\n"
+        )
+        binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
+        return str(binary)
+
+    src = Path(tempfile.mkdtemp()) / "in.h5"
+    src.write_bytes(b"\x89HDF\r\n\x1a\n")
+
+    # `scx` itself naming the rejection -> a skip.
+    with pytest.raises(cs.TenxArmUnavailable):
+        cs._run_tenx_arm_subprocess(
+            src, 1, True, 4,
+            fake_scx("--stream is not supported for direction 'tenx_to_scx'."),
+        )
+
+    # Any other failure -> a crash, even though the worker's own wrapper text
+    # travels on the same stderr.
+    for other in (
+        "Error: failed to open input: Invalid HDF5 file signature",
+        "memory allocation of 8589934592 bytes failed",
+    ):
+        with pytest.raises(RuntimeError) as exc:
+            cs._run_tenx_arm_subprocess(src, 1, True, 4, fake_scx(other))
+        assert not isinstance(exc.value, cs.TenxArmUnavailable), (
+            f"{other!r} was classified as a stale binary; the worker's wrapper "
+            f"text must not carry any string the parent classifies on"
+        )
+
+
 def test_mtx_export_is_scoped_out_of_the_census_tiers():
     """The size cap has to stop the *scheduler*, not just `run()`.
 

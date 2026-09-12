@@ -815,12 +815,18 @@ adata = exp.to_anndata()              # → AnnData (zero-copy CSR + Arrow→pan
 
 # Write
 pyscx.from_anndata(adata, "output.scx", codec="auto")
-pyscx.from_10x("matrix.h5", "output.scx")
+pyscx.from_10x("matrix.h5", "output.scx")   # materializes — see note below
 pyscx.from_mtx("/path/to/filtered_feature_bc_matrix", "output.scx")
 
 # Export to Cell Ranger MTX directory
 pyscx.to_mtx("output.scx", "/path/to/mtx_dir")
 ```
+
+`from_10x` reads through `scanpy.read_10x_h5` and hands the in-memory AnnData to
+`from_anndata`, so peak memory scales with the whole matrix. For a *raw*
+all-droplet `raw_feature_bc_matrix.h5`, use `scx convert --from 10x`, which
+streams by default — see [docs/scanpy.md § From 10x HDF5](scanpy.md#from-10x-hdf5).
+
 
 The `to_anndata()` path is **zero-copy** for the expression matrix — `ScxCsr`'s
 `i64/i32/f32` arrays are handed directly to scipy via numpy buffer protocol.

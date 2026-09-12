@@ -16,7 +16,7 @@
 //! | `threads`         | reader-thread derating against `crate::budget`'s shares    |
 //! | `index`           | convert-time predicate-index build and its outcomes        |
 //! | `entry`           | the eager entry points: h5ad, 10x, SCX -> h5ad             |
-//! | `entry_streaming` | streaming h5ad ingest and its grouped two-pass sibling     |
+//! | `entry_streaming` | streaming h5ad **and 10x** ingest, and the grouped two-pass sibling |
 //! | `coordinator`     | the four shard coordinators and the encode worker          |
 //! | `shards`          | X / raw / layer / CSC shard writers                        |
 //! | `mappings`        | obsm / varm / obsp / varp section writers                  |
