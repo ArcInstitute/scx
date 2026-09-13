@@ -3938,3 +3938,44 @@ absolute_floors:
 #         anything: if that ratio is also well under 1, the bound is loose and
 #         `ENCODE_TRANSIENT_MULTIPLE` is worth re-deriving downward, which
 #         would give budgeted callers concurrency back.
+#
+# 21. data-wait fraction (`data_wait_fraction*__*`) — a gate input, not a gate
+#     `ml_loader`'s `gpu_train` scenario and `index_plan`'s
+#     `pyscx_index_plan_dataset_workers2` now emit
+#     `data_wait_fraction_steady__*` (the headline), `data_wait_fraction__*`,
+#     `ttfb_s__*`, `n_steady_steps__*`, `batch_wait_ms_p50__*` and
+#     `batch_wait_ms_p95__*`: the fraction of a timed epoch the consumer spent
+#     blocked in `next(iterator)`, with time-to-first-batch split out. Quote
+#     the steady one — the all-steps figure folds in a once-per-epoch startup
+#     and on a short benchmark epoch reads ~50x higher (a 98-step tabula
+#     `gpu_train` epoch: 0.85 all-steps against a 13-microsecond per-batch
+#     p50). See benchmarks/README.md. This is the
+#     number the ML-loader plan's tier-3 items are conditioned on — a decoder
+#     speedup `s` over an exposed fraction `p` is worth `1 / [(1 - p) + p/s]`
+#     and no more, which is 1.006x at the one `p` on record (STATE3, 0.006).
+#
+#     It is deliberately NOT floored, for two independent reasons, and neither
+#     is expected to resolve:
+#
+#       a. **It is `None` on most scenarios by design.** Only a consumer with a
+#          model step can define the fraction; four of `index_plan`'s five
+#          scenarios have none, and `index_plan`'s R3 arm has one only when
+#          `SCX_BENCH_R3_NULL_MODEL_MS` is set (default 0 = off, so a registered
+#          capture is unchanged). `compare_against_baseline._load_current_raw_metric`
+#          skips `None` and medians what is left, so a floor on a
+#          mostly-`None` key synthesises a missing-metric violation on every
+#          default run — the same shape as deferred item 1.
+#
+#       b. **A bound on it would point the wrong way.** Lower `p` is better,
+#          so the natural floor is a `max:` — but `p` falls when the *model*
+#          gets slower and rises when the model gets faster, on an unchanged
+#          loader. The fixture's consumer here is a fixed VAE / a fixed sleep,
+#          so a threshold would be pinning the ratio of two unrelated things.
+#          What IS gated, and stays gated, is the loader's own throughput:
+#          `batches_per_sec__gpu_train` above.
+#
+#     Read the published values as a decision input recorded in
+#     `docs/performance.md`, not as a contract. They are CPU-side *exposed*
+#     wait (the H2D copy is `non_blocking=True` and there is no per-step
+#     synchronise), so they measure what a consumer actually stalls on rather
+#     than total I/O — which is the quantity the tier decision needs.

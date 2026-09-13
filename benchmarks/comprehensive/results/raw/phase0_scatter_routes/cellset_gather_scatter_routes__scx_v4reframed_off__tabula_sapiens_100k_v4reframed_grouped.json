@@ -1,0 +1,515 @@
+{
+  "schema_version": 2,
+  "benchmark": "cellset_gather_scatter_routes",
+  "format": "scx_v4reframed_off",
+  "dataset": "tabula_sapiens_100k_v4reframed_grouped",
+  "timestamp": "2026-09-13T15:28:19",
+  "system": {
+    "hostname": "GPUCACE",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu_cores_physical": 192,
+    "ram_gb": 1007,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": true
+    },
+    "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M2EE5ET4A129EBREP3NE426S",
+      "git_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "git_branch": "phase0-dataload-gate",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-12-gab0fb96b-dirty",
+      "rayon_threads": "",
+      "omp_threads": "1",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 0.9848,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 2273.1,
+      "extra": {
+        "scenario": "gather_grouped",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": false,
+        "cellsets_per_sec": 812.37,
+        "ttfb_first_set_s": 0.5607,
+        "full_shard_groups": 4709,
+        "block_index_groups": 0
+      }
+    },
+    {
+      "wall_s": 0.9522,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 2285.8,
+      "extra": {
+        "scenario": "gather_grouped",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": false,
+        "cellsets_per_sec": 840.17,
+        "ttfb_first_set_s": 0.4884,
+        "full_shard_groups": 4709,
+        "block_index_groups": 0
+      }
+    },
+    {
+      "wall_s": 1.0388,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 2283.3,
+      "extra": {
+        "scenario": "gather_grouped",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": false,
+        "cellsets_per_sec": 770.12,
+        "ttfb_first_set_s": 0.5894,
+        "full_shard_groups": 4709,
+        "block_index_groups": 0
+      }
+    }
+  ],
+  "median_wall_s": 0.9848,
+  "wall_s_iqr": 0.0865999999999999,
+  "n_runs": 3,
+  "file_size_bytes": 233530330,
+  "metadata": {
+    "arm": "off",
+    "plan": "grouped",
+    "scatter_block_index": false,
+    "median_cellsets_per_sec": 812.37,
+    "full_shard_groups": 4709,
+    "block_index_groups": 0,
+    "shard_cache_hit_rate": 0.9985,
+    "source": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/tabula_sapiens_100k_auto.scx",
+    "framed_path": "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/tabula_grouped/tabula_sapiens_100k_auto_framed.scx",
+    "source_info": {
+      "codec": "shufdelta",
+      "codec_breakdown": {
+        "shufdelta": 7
+      },
+      "codec_default": "scx1",
+      "file_size_bytes": 233530210,
+      "format_version": 4,
+      "has_csc": false,
+      "index_dtype": "u16",
+      "manifest_sequence": 1,
+      "n_csc_shards": 0,
+      "n_csr_shards": 7,
+      "n_obs": 100000,
+      "n_vars": 61497,
+      "nnz": 194891401,
+      "provenance": [
+        {
+          "action": "from_anndata",
+          "params": "{\"codec_selection\":{\"profile\":\"auto\"}}",
+          "timestamp": 1783894490,
+          "tool": "pyscx 0.11.0"
+        }
+      ],
+      "sections": [
+        {
+          "length": 1779586,
+          "name": "obs_metadata/shard_0",
+          "offset": 4352,
+          "type": "obs_metadata/shard_0"
+        },
+        {
+          "length": 1793482,
+          "name": "obs_metadata/shard_1",
+          "offset": 1783944,
+          "type": "obs_metadata/shard_1"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_2",
+          "offset": 3577432,
+          "type": "obs_metadata/shard_2"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_3",
+          "offset": 5375720,
+          "type": "obs_metadata/shard_3"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_4",
+          "offset": 7174008,
+          "type": "obs_metadata/shard_4"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_5",
+          "offset": 8972296,
+          "type": "obs_metadata/shard_5"
+        },
+        {
+          "length": 215818,
+          "name": "obs_metadata/shard_6",
+          "offset": 10770584,
+          "type": "obs_metadata/shard_6"
+        },
+        {
+          "length": 2257626,
+          "name": "var_metadata/shard_0",
+          "offset": 10986408,
+          "type": "var_metadata/shard_0"
+        },
+        {
+          "length": 2268706,
+          "name": "var_metadata/shard_1",
+          "offset": 13244040,
+          "type": "var_metadata/shard_1"
+        },
+        {
+          "length": 2268706,
+          "name": "var_metadata/shard_2",
+          "offset": 15512752,
+          "type": "var_metadata/shard_2"
+        },
+        {
+          "length": 1970594,
+          "name": "var_metadata/shard_3",
+          "offset": 17781464,
+          "type": "var_metadata/shard_3"
+        },
+        {
+          "length": 32789338,
+          "name": "X_shard_0",
+          "offset": 19752064,
+          "type": "X/csr"
+        },
+        {
+          "length": 33360484,
+          "name": "X_shard_1",
+          "offset": 52541408,
+          "type": "X/csr"
+        },
+        {
+          "length": 34596601,
+          "name": "X_shard_2",
+          "offset": 85901896,
+          "type": "X/csr"
+        },
+        {
+          "length": 30302184,
+          "name": "X_shard_3",
+          "offset": 120498504,
+          "type": "X/csr"
+        },
+        {
+          "length": 30648476,
+          "name": "X_shard_4",
+          "offset": 150800688,
+          "type": "X/csr"
+        },
+        {
+          "length": 33502641,
+          "name": "X_shard_5",
+          "offset": 181449168,
+          "type": "X/csr"
+        },
+        {
+          "length": 2710921,
+          "name": "X_shard_6",
+          "offset": 214951816,
+          "type": "X/csr"
+        },
+        {
+          "length": 15643322,
+          "name": "obs_predicate_index",
+          "offset": 217662744,
+          "type": "obs_predicate_index"
+        },
+        {
+          "length": 218350,
+          "name": "var_predicate_index",
+          "offset": 233306072,
+          "type": "var_predicate_index"
+        },
+        {
+          "length": 84,
+          "name": "provenance",
+          "offset": 233524424,
+          "type": "provenance"
+        }
+      ],
+      "shard_target_rows": 16384
+    },
+    "framed_info": {
+      "codec": "shufdelta",
+      "codec_breakdown": {
+        "shufdelta": 7
+      },
+      "codec_default": "shufdelta",
+      "file_size_bytes": 233530330,
+      "format_version": 4,
+      "has_csc": false,
+      "index_dtype": "u16",
+      "manifest_sequence": 0,
+      "n_csc_shards": 0,
+      "n_csr_shards": 7,
+      "n_obs": 100000,
+      "n_vars": 61497,
+      "nnz": 194891401,
+      "provenance": [
+        {
+          "action": "from_anndata",
+          "params": "{\"codec_selection\":{\"profile\":\"auto\"}}",
+          "timestamp": 1783894490,
+          "tool": "pyscx 0.11.0"
+        },
+        {
+          "action": "optimize",
+          "params": "{\"canonicalize\":true,\"sidecars\":true,\"shard_obs\":\"auto\",\"obs_resharded\":false}",
+          "timestamp": 1789338137,
+          "tool": "scx-cli 0.18.0"
+        }
+      ],
+      "sections": [
+        {
+          "length": 1779586,
+          "name": "obs_metadata/shard_0",
+          "offset": 4352,
+          "type": "obs_metadata/shard_0"
+        },
+        {
+          "length": 1793482,
+          "name": "obs_metadata/shard_1",
+          "offset": 1783944,
+          "type": "obs_metadata/shard_1"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_2",
+          "offset": 3577432,
+          "type": "obs_metadata/shard_2"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_3",
+          "offset": 5375720,
+          "type": "obs_metadata/shard_3"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_4",
+          "offset": 7174008,
+          "type": "obs_metadata/shard_4"
+        },
+        {
+          "length": 1798282,
+          "name": "obs_metadata/shard_5",
+          "offset": 8972296,
+          "type": "obs_metadata/shard_5"
+        },
+        {
+          "length": 215818,
+          "name": "obs_metadata/shard_6",
+          "offset": 10770584,
+          "type": "obs_metadata/shard_6"
+        },
+        {
+          "length": 2257626,
+          "name": "var_metadata/shard_0",
+          "offset": 10986408,
+          "type": "var_metadata/shard_0"
+        },
+        {
+          "length": 2268706,
+          "name": "var_metadata/shard_1",
+          "offset": 13244040,
+          "type": "var_metadata/shard_1"
+        },
+        {
+          "length": 2268706,
+          "name": "var_metadata/shard_2",
+          "offset": 15512752,
+          "type": "var_metadata/shard_2"
+        },
+        {
+          "length": 1970594,
+          "name": "var_metadata/shard_3",
+          "offset": 17781464,
+          "type": "var_metadata/shard_3"
+        },
+        {
+          "length": 32789338,
+          "name": "X_shard_0",
+          "offset": 19752064,
+          "type": "X/csr"
+        },
+        {
+          "length": 33360484,
+          "name": "X_shard_1",
+          "offset": 52541408,
+          "type": "X/csr"
+        },
+        {
+          "length": 34596601,
+          "name": "X_shard_2",
+          "offset": 85901896,
+          "type": "X/csr"
+        },
+        {
+          "length": 30302184,
+          "name": "X_shard_3",
+          "offset": 120498504,
+          "type": "X/csr"
+        },
+        {
+          "length": 30648476,
+          "name": "X_shard_4",
+          "offset": 150800688,
+          "type": "X/csr"
+        },
+        {
+          "length": 33502641,
+          "name": "X_shard_5",
+          "offset": 181449168,
+          "type": "X/csr"
+        },
+        {
+          "length": 2710921,
+          "name": "X_shard_6",
+          "offset": 214951816,
+          "type": "X/csr"
+        },
+        {
+          "length": 15643322,
+          "name": "obs_predicate_index",
+          "offset": 217662744,
+          "type": "obs_predicate_index"
+        },
+        {
+          "length": 218350,
+          "name": "var_predicate_index",
+          "offset": 233306072,
+          "type": "var_predicate_index"
+        },
+        {
+          "length": 201,
+          "name": "provenance",
+          "offset": 233524424,
+          "type": "provenance"
+        }
+      ],
+      "shard_target_rows": 16384,
+      "_reframe_wall_s": 5.8
+    },
+    "pyscx_version": "0.18.0",
+    "n_obs": 100000,
+    "set_size": 64,
+    "cache_shards": null,
+    "max_memory_mb": null,
+    "cache_sizing": "7 shards need 1729 MB, the adaptive budget already grants 4087 MB \u2014 left alone (sizing must never shrink it)",
+    "block_index_reachable": true,
+    "speedup_off_over_on": 117.056,
+    "speedup_default_over_on": 116.076,
+    "default_matches_off": true,
+    "premises": {
+      "on arm reached the block-index route": true,
+      "off arm took the full-shard route": true,
+      "off arm did not reach the block-index route": true,
+      "the default agrees with the explicit False": true
+    },
+    "provenance": {
+      "checkout_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "branch": "phase0-dataload-gate",
+      "dirty": true,
+      "dirty_paths": [
+        "benchmarks/README.md",
+        "benchmarks/comprehensive/benchmarks/cellset_gather.py",
+        "benchmarks/comprehensive/benchmarks/index_plan.py",
+        "benchmarks/comprehensive/benchmarks/ml_loader.py",
+        "benchmarks/comprehensive/benchmarks/obs_open.py",
+        "benchmarks/comprehensive/data_wait.py",
+        "benchmarks/comprehensive/tests/test_phase0_data_wait.py",
+        "benchmarks/comprehensive/thresholds.yaml",
+        "benchmarks/scripts/_phase0_data_wait_summary.py",
+        "benchmarks/scripts/_run_phase0_data_wait_gate.sh",
+        "benchmarks/scripts/_run_phase0_ml_loader_ab.sh",
+        "benchmarks/scripts/bench_cellset_scatter_routes.py",
+        "benchmarks/scripts/bench_cellset_scatter_routes.sbatch",
+        "docs/performance.md",
+        "2026-08-05_CODE-REVIEW.md",
+        "2026-08-05_CODE-REVIEW_ORGANIZE.md",
+        "2026-08-25_CODE-REVIEW_OPT.md",
+        "2026-09-12_ML-LOADER-OPT.md",
+        "IDENT-MARKER-HIGH-MEM.md"
+      ],
+      "dirty_tracked_paths": [
+        "benchmarks/README.md",
+        "benchmarks/comprehensive/benchmarks/cellset_gather.py",
+        "benchmarks/comprehensive/benchmarks/index_plan.py",
+        "benchmarks/comprehensive/benchmarks/ml_loader.py",
+        "benchmarks/comprehensive/benchmarks/obs_open.py",
+        "benchmarks/comprehensive/data_wait.py",
+        "benchmarks/comprehensive/tests/test_phase0_data_wait.py",
+        "benchmarks/comprehensive/thresholds.yaml",
+        "benchmarks/scripts/_phase0_data_wait_summary.py",
+        "benchmarks/scripts/_run_phase0_data_wait_gate.sh",
+        "benchmarks/scripts/_run_phase0_ml_loader_ab.sh",
+        "benchmarks/scripts/bench_cellset_scatter_routes.py",
+        "benchmarks/scripts/bench_cellset_scatter_routes.sbatch",
+        "docs/performance.md"
+      ],
+      "hostname": "GPUCACE",
+      "slurm_job_id": "2945103",
+      "slurm_partition": "cpu_batch",
+      "argv": [
+        "--source",
+        "/large_storage/arcinfra/projects/scx/benchmarks/datasets/tabula_sapiens_100k_auto.scx",
+        "--workdir",
+        "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/tabula_grouped",
+        "--out",
+        "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/tabula_sapiens_100k_auto.json",
+        "--n-runs",
+        "3",
+        "--n-batches",
+        "50",
+        "--plan",
+        "grouped",
+        "--raw-subdir",
+        "phase0_scatter_routes"
+      ]
+    }
+  }
+}

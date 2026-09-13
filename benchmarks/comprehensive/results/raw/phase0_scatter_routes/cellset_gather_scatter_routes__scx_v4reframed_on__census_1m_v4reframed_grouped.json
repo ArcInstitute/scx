@@ -1,0 +1,1822 @@
+{
+  "schema_version": 2,
+  "benchmark": "cellset_gather_scatter_routes",
+  "format": "scx_v4reframed_on",
+  "dataset": "census_1m_v4reframed_grouped",
+  "timestamp": "2026-09-13T14:37:23",
+  "system": {
+    "hostname": "GPUCACE",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu_cores_physical": 192,
+    "ram_gb": 1007,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": true
+    },
+    "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M2EB85965YH01NSKT52QDBP9",
+      "git_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "git_branch": "phase0-dataload-gate",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-12-gab0fb96b-dirty",
+      "rayon_threads": "",
+      "omp_threads": "1",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 1.7428,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 12062.6,
+      "extra": {
+        "scenario": "gather_grouped",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": true,
+        "cellsets_per_sec": 459.03,
+        "ttfb_first_set_s": 0.6223,
+        "full_shard_groups": 0,
+        "block_index_groups": 1354
+      }
+    },
+    {
+      "wall_s": 1.8757,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 12001.1,
+      "extra": {
+        "scenario": "gather_grouped",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": true,
+        "cellsets_per_sec": 426.51,
+        "ttfb_first_set_s": 0.6767,
+        "full_shard_groups": 0,
+        "block_index_groups": 1354
+      }
+    },
+    {
+      "wall_s": 1.7437,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 12101.2,
+      "extra": {
+        "scenario": "gather_grouped",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": true,
+        "cellsets_per_sec": 458.8,
+        "ttfb_first_set_s": 0.5444,
+        "full_shard_groups": 0,
+        "block_index_groups": 1354
+      }
+    }
+  ],
+  "median_wall_s": 1.7437,
+  "wall_s_iqr": 0.13290000000000002,
+  "n_runs": 3,
+  "file_size_bytes": 2800057517,
+  "metadata": {
+    "arm": "on",
+    "plan": "grouped",
+    "scatter_block_index": true,
+    "median_cellsets_per_sec": 458.8,
+    "full_shard_groups": 0,
+    "block_index_groups": 1354,
+    "shard_cache_hit_rate": null,
+    "source": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/census_1m_auto.scx",
+    "framed_path": "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/census_1m_grouped/census_1m_auto_framed.scx",
+    "source_info": {
+      "codec": "shufdelta",
+      "codec_breakdown": {
+        "shufdelta": 62
+      },
+      "codec_default": "zstd",
+      "file_size_bytes": 2800057397,
+      "format_version": 4,
+      "has_csc": false,
+      "index_dtype": "u16",
+      "manifest_sequence": 1,
+      "n_csc_shards": 0,
+      "n_csr_shards": 62,
+      "n_obs": 1000000,
+      "n_vars": 61497,
+      "nnz": 1402381960,
+      "provenance": [
+        {
+          "action": "from_anndata",
+          "params": "{\"codec_selection\":{\"profile\":\"auto\"}}",
+          "timestamp": 1783894542,
+          "tool": "pyscx 0.11.0"
+        }
+      ],
+      "sections": [
+        {
+          "length": 19387482,
+          "name": "obs_metadata/shard_0",
+          "offset": 4352,
+          "type": "obs_metadata/shard_0"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_1",
+          "offset": 19391840,
+          "type": "obs_metadata/shard_1"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_2",
+          "offset": 38790408,
+          "type": "obs_metadata/shard_2"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_3",
+          "offset": 58188976,
+          "type": "obs_metadata/shard_3"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_4",
+          "offset": 77587544,
+          "type": "obs_metadata/shard_4"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_5",
+          "offset": 96986112,
+          "type": "obs_metadata/shard_5"
+        },
+        {
+          "length": 19387490,
+          "name": "obs_metadata/shard_6",
+          "offset": 116384680,
+          "type": "obs_metadata/shard_6"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_7",
+          "offset": 135772176,
+          "type": "obs_metadata/shard_7"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_8",
+          "offset": 155170744,
+          "type": "obs_metadata/shard_8"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_9",
+          "offset": 174569312,
+          "type": "obs_metadata/shard_9"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_10",
+          "offset": 193967880,
+          "type": "obs_metadata/shard_10"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_11",
+          "offset": 213366448,
+          "type": "obs_metadata/shard_11"
+        },
+        {
+          "length": 19387490,
+          "name": "obs_metadata/shard_12",
+          "offset": 232765016,
+          "type": "obs_metadata/shard_12"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_13",
+          "offset": 252152512,
+          "type": "obs_metadata/shard_13"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_14",
+          "offset": 271551080,
+          "type": "obs_metadata/shard_14"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_15",
+          "offset": 290949648,
+          "type": "obs_metadata/shard_15"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_16",
+          "offset": 310348216,
+          "type": "obs_metadata/shard_16"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_17",
+          "offset": 329746784,
+          "type": "obs_metadata/shard_17"
+        },
+        {
+          "length": 19387490,
+          "name": "obs_metadata/shard_18",
+          "offset": 349145352,
+          "type": "obs_metadata/shard_18"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_19",
+          "offset": 368532848,
+          "type": "obs_metadata/shard_19"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_20",
+          "offset": 387931416,
+          "type": "obs_metadata/shard_20"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_21",
+          "offset": 407329984,
+          "type": "obs_metadata/shard_21"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_22",
+          "offset": 426728552,
+          "type": "obs_metadata/shard_22"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_23",
+          "offset": 446127120,
+          "type": "obs_metadata/shard_23"
+        },
+        {
+          "length": 19387874,
+          "name": "obs_metadata/shard_24",
+          "offset": 465525688,
+          "type": "obs_metadata/shard_24"
+        },
+        {
+          "length": 19398178,
+          "name": "obs_metadata/shard_25",
+          "offset": 484913568,
+          "type": "obs_metadata/shard_25"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_26",
+          "offset": 504311752,
+          "type": "obs_metadata/shard_26"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_27",
+          "offset": 523710320,
+          "type": "obs_metadata/shard_27"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_28",
+          "offset": 543108888,
+          "type": "obs_metadata/shard_28"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_29",
+          "offset": 562507456,
+          "type": "obs_metadata/shard_29"
+        },
+        {
+          "length": 19389602,
+          "name": "obs_metadata/shard_30",
+          "offset": 581906024,
+          "type": "obs_metadata/shard_30"
+        },
+        {
+          "length": 19396514,
+          "name": "obs_metadata/shard_31",
+          "offset": 601295632,
+          "type": "obs_metadata/shard_31"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_32",
+          "offset": 620692152,
+          "type": "obs_metadata/shard_32"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_33",
+          "offset": 640090720,
+          "type": "obs_metadata/shard_33"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_34",
+          "offset": 659489288,
+          "type": "obs_metadata/shard_34"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_35",
+          "offset": 678887856,
+          "type": "obs_metadata/shard_35"
+        },
+        {
+          "length": 19391266,
+          "name": "obs_metadata/shard_36",
+          "offset": 698286424,
+          "type": "obs_metadata/shard_36"
+        },
+        {
+          "length": 19394786,
+          "name": "obs_metadata/shard_37",
+          "offset": 717677696,
+          "type": "obs_metadata/shard_37"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_38",
+          "offset": 737072488,
+          "type": "obs_metadata/shard_38"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_39",
+          "offset": 756471056,
+          "type": "obs_metadata/shard_39"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_40",
+          "offset": 775869624,
+          "type": "obs_metadata/shard_40"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_41",
+          "offset": 795268192,
+          "type": "obs_metadata/shard_41"
+        },
+        {
+          "length": 19392994,
+          "name": "obs_metadata/shard_42",
+          "offset": 814666760,
+          "type": "obs_metadata/shard_42"
+        },
+        {
+          "length": 19393122,
+          "name": "obs_metadata/shard_43",
+          "offset": 834059760,
+          "type": "obs_metadata/shard_43"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_44",
+          "offset": 853452888,
+          "type": "obs_metadata/shard_44"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_45",
+          "offset": 872851456,
+          "type": "obs_metadata/shard_45"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_46",
+          "offset": 892250024,
+          "type": "obs_metadata/shard_46"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_47",
+          "offset": 911648592,
+          "type": "obs_metadata/shard_47"
+        },
+        {
+          "length": 19394658,
+          "name": "obs_metadata/shard_48",
+          "offset": 931047160,
+          "type": "obs_metadata/shard_48"
+        },
+        {
+          "length": 19391394,
+          "name": "obs_metadata/shard_49",
+          "offset": 950441824,
+          "type": "obs_metadata/shard_49"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_50",
+          "offset": 969833224,
+          "type": "obs_metadata/shard_50"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_51",
+          "offset": 989231792,
+          "type": "obs_metadata/shard_51"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_52",
+          "offset": 1008630360,
+          "type": "obs_metadata/shard_52"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_53",
+          "offset": 1028028928,
+          "type": "obs_metadata/shard_53"
+        },
+        {
+          "length": 19396386,
+          "name": "obs_metadata/shard_54",
+          "offset": 1047427496,
+          "type": "obs_metadata/shard_54"
+        },
+        {
+          "length": 19389730,
+          "name": "obs_metadata/shard_55",
+          "offset": 1066823888,
+          "type": "obs_metadata/shard_55"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_56",
+          "offset": 1086213624,
+          "type": "obs_metadata/shard_56"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_57",
+          "offset": 1105612192,
+          "type": "obs_metadata/shard_57"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_58",
+          "offset": 1125010760,
+          "type": "obs_metadata/shard_58"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_59",
+          "offset": 1144409328,
+          "type": "obs_metadata/shard_59"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_60",
+          "offset": 1163807896,
+          "type": "obs_metadata/shard_60"
+        },
+        {
+          "length": 17839194,
+          "name": "obs_metadata/shard_61",
+          "offset": 1183206464,
+          "type": "obs_metadata/shard_61"
+        },
+        {
+          "length": 205866,
+          "name": "var_metadata/shard_0",
+          "offset": 1201045664,
+          "type": "var_metadata/shard_0"
+        },
+        {
+          "length": 216938,
+          "name": "var_metadata/shard_1",
+          "offset": 1201251536,
+          "type": "var_metadata/shard_1"
+        },
+        {
+          "length": 216938,
+          "name": "var_metadata/shard_2",
+          "offset": 1201468480,
+          "type": "var_metadata/shard_2"
+        },
+        {
+          "length": 164010,
+          "name": "var_metadata/shard_3",
+          "offset": 1201685424,
+          "type": "var_metadata/shard_3"
+        },
+        {
+          "length": 25096590,
+          "name": "X_shard_0",
+          "offset": 1201849440,
+          "type": "X/csr"
+        },
+        {
+          "length": 22122372,
+          "name": "X_shard_1",
+          "offset": 1226946032,
+          "type": "X/csr"
+        },
+        {
+          "length": 30692077,
+          "name": "X_shard_2",
+          "offset": 1249068408,
+          "type": "X/csr"
+        },
+        {
+          "length": 28574851,
+          "name": "X_shard_3",
+          "offset": 1279760488,
+          "type": "X/csr"
+        },
+        {
+          "length": 23812127,
+          "name": "X_shard_4",
+          "offset": 1308335344,
+          "type": "X/csr"
+        },
+        {
+          "length": 16993073,
+          "name": "X_shard_5",
+          "offset": 1332147472,
+          "type": "X/csr"
+        },
+        {
+          "length": 16336391,
+          "name": "X_shard_6",
+          "offset": 1349140552,
+          "type": "X/csr"
+        },
+        {
+          "length": 19726925,
+          "name": "X_shard_7",
+          "offset": 1365476944,
+          "type": "X/csr"
+        },
+        {
+          "length": 5860194,
+          "name": "X_shard_8",
+          "offset": 1385203872,
+          "type": "X/csr"
+        },
+        {
+          "length": 7645201,
+          "name": "X_shard_9",
+          "offset": 1391064072,
+          "type": "X/csr"
+        },
+        {
+          "length": 31104046,
+          "name": "X_shard_10",
+          "offset": 1398709280,
+          "type": "X/csr"
+        },
+        {
+          "length": 35881149,
+          "name": "X_shard_11",
+          "offset": 1429813328,
+          "type": "X/csr"
+        },
+        {
+          "length": 18540275,
+          "name": "X_shard_12",
+          "offset": 1465694480,
+          "type": "X/csr"
+        },
+        {
+          "length": 22895173,
+          "name": "X_shard_13",
+          "offset": 1484234760,
+          "type": "X/csr"
+        },
+        {
+          "length": 27149562,
+          "name": "X_shard_14",
+          "offset": 1507129936,
+          "type": "X/csr"
+        },
+        {
+          "length": 33505607,
+          "name": "X_shard_15",
+          "offset": 1534279504,
+          "type": "X/csr"
+        },
+        {
+          "length": 19989434,
+          "name": "X_shard_16",
+          "offset": 1567785112,
+          "type": "X/csr"
+        },
+        {
+          "length": 19291795,
+          "name": "X_shard_17",
+          "offset": 1587774552,
+          "type": "X/csr"
+        },
+        {
+          "length": 30225194,
+          "name": "X_shard_18",
+          "offset": 1607066352,
+          "type": "X/csr"
+        },
+        {
+          "length": 39689798,
+          "name": "X_shard_19",
+          "offset": 1637291552,
+          "type": "X/csr"
+        },
+        {
+          "length": 24898336,
+          "name": "X_shard_20",
+          "offset": 1676981352,
+          "type": "X/csr"
+        },
+        {
+          "length": 26224695,
+          "name": "X_shard_21",
+          "offset": 1701879688,
+          "type": "X/csr"
+        },
+        {
+          "length": 23627990,
+          "name": "X_shard_22",
+          "offset": 1728104384,
+          "type": "X/csr"
+        },
+        {
+          "length": 32963591,
+          "name": "X_shard_23",
+          "offset": 1751732376,
+          "type": "X/csr"
+        },
+        {
+          "length": 35978757,
+          "name": "X_shard_24",
+          "offset": 1784695968,
+          "type": "X/csr"
+        },
+        {
+          "length": 35528670,
+          "name": "X_shard_25",
+          "offset": 1820674728,
+          "type": "X/csr"
+        },
+        {
+          "length": 25592331,
+          "name": "X_shard_26",
+          "offset": 1856203400,
+          "type": "X/csr"
+        },
+        {
+          "length": 25719609,
+          "name": "X_shard_27",
+          "offset": 1881795736,
+          "type": "X/csr"
+        },
+        {
+          "length": 25317175,
+          "name": "X_shard_28",
+          "offset": 1907515352,
+          "type": "X/csr"
+        },
+        {
+          "length": 24242954,
+          "name": "X_shard_29",
+          "offset": 1932832528,
+          "type": "X/csr"
+        },
+        {
+          "length": 27809005,
+          "name": "X_shard_30",
+          "offset": 1957075488,
+          "type": "X/csr"
+        },
+        {
+          "length": 27582973,
+          "name": "X_shard_31",
+          "offset": 1984884496,
+          "type": "X/csr"
+        },
+        {
+          "length": 27519872,
+          "name": "X_shard_32",
+          "offset": 2012467472,
+          "type": "X/csr"
+        },
+        {
+          "length": 31779828,
+          "name": "X_shard_33",
+          "offset": 2039987344,
+          "type": "X/csr"
+        },
+        {
+          "length": 19589734,
+          "name": "X_shard_34",
+          "offset": 2071767176,
+          "type": "X/csr"
+        },
+        {
+          "length": 21820788,
+          "name": "X_shard_35",
+          "offset": 2091356912,
+          "type": "X/csr"
+        },
+        {
+          "length": 15491178,
+          "name": "X_shard_36",
+          "offset": 2113177704,
+          "type": "X/csr"
+        },
+        {
+          "length": 27372891,
+          "name": "X_shard_37",
+          "offset": 2128668888,
+          "type": "X/csr"
+        },
+        {
+          "length": 18691949,
+          "name": "X_shard_38",
+          "offset": 2156041784,
+          "type": "X/csr"
+        },
+        {
+          "length": 19957569,
+          "name": "X_shard_39",
+          "offset": 2174733736,
+          "type": "X/csr"
+        },
+        {
+          "length": 18294561,
+          "name": "X_shard_40",
+          "offset": 2194691312,
+          "type": "X/csr"
+        },
+        {
+          "length": 22500270,
+          "name": "X_shard_41",
+          "offset": 2212985880,
+          "type": "X/csr"
+        },
+        {
+          "length": 22407092,
+          "name": "X_shard_42",
+          "offset": 2235486152,
+          "type": "X/csr"
+        },
+        {
+          "length": 27868241,
+          "name": "X_shard_43",
+          "offset": 2257893248,
+          "type": "X/csr"
+        },
+        {
+          "length": 26450676,
+          "name": "X_shard_44",
+          "offset": 2285761496,
+          "type": "X/csr"
+        },
+        {
+          "length": 24652319,
+          "name": "X_shard_45",
+          "offset": 2312212176,
+          "type": "X/csr"
+        },
+        {
+          "length": 26214208,
+          "name": "X_shard_46",
+          "offset": 2336864496,
+          "type": "X/csr"
+        },
+        {
+          "length": 25198563,
+          "name": "X_shard_47",
+          "offset": 2363078704,
+          "type": "X/csr"
+        },
+        {
+          "length": 20523704,
+          "name": "X_shard_48",
+          "offset": 2388277272,
+          "type": "X/csr"
+        },
+        {
+          "length": 16977546,
+          "name": "X_shard_49",
+          "offset": 2408800976,
+          "type": "X/csr"
+        },
+        {
+          "length": 15973060,
+          "name": "X_shard_50",
+          "offset": 2425778528,
+          "type": "X/csr"
+        },
+        {
+          "length": 18872923,
+          "name": "X_shard_51",
+          "offset": 2441751592,
+          "type": "X/csr"
+        },
+        {
+          "length": 19162518,
+          "name": "X_shard_52",
+          "offset": 2460624520,
+          "type": "X/csr"
+        },
+        {
+          "length": 16719945,
+          "name": "X_shard_53",
+          "offset": 2479787040,
+          "type": "X/csr"
+        },
+        {
+          "length": 26184957,
+          "name": "X_shard_54",
+          "offset": 2496506992,
+          "type": "X/csr"
+        },
+        {
+          "length": 25613689,
+          "name": "X_shard_55",
+          "offset": 2522691952,
+          "type": "X/csr"
+        },
+        {
+          "length": 18166681,
+          "name": "X_shard_56",
+          "offset": 2548305648,
+          "type": "X/csr"
+        },
+        {
+          "length": 25321614,
+          "name": "X_shard_57",
+          "offset": 2566472336,
+          "type": "X/csr"
+        },
+        {
+          "length": 10375439,
+          "name": "X_shard_58",
+          "offset": 2591793952,
+          "type": "X/csr"
+        },
+        {
+          "length": 25370717,
+          "name": "X_shard_59",
+          "offset": 2602169392,
+          "type": "X/csr"
+        },
+        {
+          "length": 25506564,
+          "name": "X_shard_60",
+          "offset": 2627540112,
+          "type": "X/csr"
+        },
+        {
+          "length": 623192,
+          "name": "X_shard_61",
+          "offset": 2653046680,
+          "type": "X/csr"
+        },
+        {
+          "length": 146337551,
+          "name": "obs_predicate_index",
+          "offset": 2653669872,
+          "type": "obs_predicate_index"
+        },
+        {
+          "length": 84,
+          "name": "provenance",
+          "offset": 2800007424,
+          "type": "provenance"
+        }
+      ],
+      "shard_target_rows": 16384
+    },
+    "framed_info": {
+      "codec": "shufdelta",
+      "codec_breakdown": {
+        "shufdelta": 62
+      },
+      "codec_default": "shufdelta",
+      "file_size_bytes": 2800057517,
+      "format_version": 4,
+      "has_csc": false,
+      "index_dtype": "u16",
+      "manifest_sequence": 0,
+      "n_csc_shards": 0,
+      "n_csr_shards": 62,
+      "n_obs": 1000000,
+      "n_vars": 61497,
+      "nnz": 1402381960,
+      "provenance": [
+        {
+          "action": "from_anndata",
+          "params": "{\"codec_selection\":{\"profile\":\"auto\"}}",
+          "timestamp": 1783894542,
+          "tool": "pyscx 0.11.0"
+        },
+        {
+          "action": "optimize",
+          "params": "{\"canonicalize\":true,\"sidecars\":true,\"shard_obs\":\"auto\",\"obs_resharded\":false}",
+          "timestamp": 1789335407,
+          "tool": "scx-cli 0.18.0"
+        }
+      ],
+      "sections": [
+        {
+          "length": 19387482,
+          "name": "obs_metadata/shard_0",
+          "offset": 4352,
+          "type": "obs_metadata/shard_0"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_1",
+          "offset": 19391840,
+          "type": "obs_metadata/shard_1"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_2",
+          "offset": 38790408,
+          "type": "obs_metadata/shard_2"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_3",
+          "offset": 58188976,
+          "type": "obs_metadata/shard_3"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_4",
+          "offset": 77587544,
+          "type": "obs_metadata/shard_4"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_5",
+          "offset": 96986112,
+          "type": "obs_metadata/shard_5"
+        },
+        {
+          "length": 19387490,
+          "name": "obs_metadata/shard_6",
+          "offset": 116384680,
+          "type": "obs_metadata/shard_6"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_7",
+          "offset": 135772176,
+          "type": "obs_metadata/shard_7"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_8",
+          "offset": 155170744,
+          "type": "obs_metadata/shard_8"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_9",
+          "offset": 174569312,
+          "type": "obs_metadata/shard_9"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_10",
+          "offset": 193967880,
+          "type": "obs_metadata/shard_10"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_11",
+          "offset": 213366448,
+          "type": "obs_metadata/shard_11"
+        },
+        {
+          "length": 19387490,
+          "name": "obs_metadata/shard_12",
+          "offset": 232765016,
+          "type": "obs_metadata/shard_12"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_13",
+          "offset": 252152512,
+          "type": "obs_metadata/shard_13"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_14",
+          "offset": 271551080,
+          "type": "obs_metadata/shard_14"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_15",
+          "offset": 290949648,
+          "type": "obs_metadata/shard_15"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_16",
+          "offset": 310348216,
+          "type": "obs_metadata/shard_16"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_17",
+          "offset": 329746784,
+          "type": "obs_metadata/shard_17"
+        },
+        {
+          "length": 19387490,
+          "name": "obs_metadata/shard_18",
+          "offset": 349145352,
+          "type": "obs_metadata/shard_18"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_19",
+          "offset": 368532848,
+          "type": "obs_metadata/shard_19"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_20",
+          "offset": 387931416,
+          "type": "obs_metadata/shard_20"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_21",
+          "offset": 407329984,
+          "type": "obs_metadata/shard_21"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_22",
+          "offset": 426728552,
+          "type": "obs_metadata/shard_22"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_23",
+          "offset": 446127120,
+          "type": "obs_metadata/shard_23"
+        },
+        {
+          "length": 19387874,
+          "name": "obs_metadata/shard_24",
+          "offset": 465525688,
+          "type": "obs_metadata/shard_24"
+        },
+        {
+          "length": 19398178,
+          "name": "obs_metadata/shard_25",
+          "offset": 484913568,
+          "type": "obs_metadata/shard_25"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_26",
+          "offset": 504311752,
+          "type": "obs_metadata/shard_26"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_27",
+          "offset": 523710320,
+          "type": "obs_metadata/shard_27"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_28",
+          "offset": 543108888,
+          "type": "obs_metadata/shard_28"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_29",
+          "offset": 562507456,
+          "type": "obs_metadata/shard_29"
+        },
+        {
+          "length": 19389602,
+          "name": "obs_metadata/shard_30",
+          "offset": 581906024,
+          "type": "obs_metadata/shard_30"
+        },
+        {
+          "length": 19396514,
+          "name": "obs_metadata/shard_31",
+          "offset": 601295632,
+          "type": "obs_metadata/shard_31"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_32",
+          "offset": 620692152,
+          "type": "obs_metadata/shard_32"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_33",
+          "offset": 640090720,
+          "type": "obs_metadata/shard_33"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_34",
+          "offset": 659489288,
+          "type": "obs_metadata/shard_34"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_35",
+          "offset": 678887856,
+          "type": "obs_metadata/shard_35"
+        },
+        {
+          "length": 19391266,
+          "name": "obs_metadata/shard_36",
+          "offset": 698286424,
+          "type": "obs_metadata/shard_36"
+        },
+        {
+          "length": 19394786,
+          "name": "obs_metadata/shard_37",
+          "offset": 717677696,
+          "type": "obs_metadata/shard_37"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_38",
+          "offset": 737072488,
+          "type": "obs_metadata/shard_38"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_39",
+          "offset": 756471056,
+          "type": "obs_metadata/shard_39"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_40",
+          "offset": 775869624,
+          "type": "obs_metadata/shard_40"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_41",
+          "offset": 795268192,
+          "type": "obs_metadata/shard_41"
+        },
+        {
+          "length": 19392994,
+          "name": "obs_metadata/shard_42",
+          "offset": 814666760,
+          "type": "obs_metadata/shard_42"
+        },
+        {
+          "length": 19393122,
+          "name": "obs_metadata/shard_43",
+          "offset": 834059760,
+          "type": "obs_metadata/shard_43"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_44",
+          "offset": 853452888,
+          "type": "obs_metadata/shard_44"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_45",
+          "offset": 872851456,
+          "type": "obs_metadata/shard_45"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_46",
+          "offset": 892250024,
+          "type": "obs_metadata/shard_46"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_47",
+          "offset": 911648592,
+          "type": "obs_metadata/shard_47"
+        },
+        {
+          "length": 19394658,
+          "name": "obs_metadata/shard_48",
+          "offset": 931047160,
+          "type": "obs_metadata/shard_48"
+        },
+        {
+          "length": 19391394,
+          "name": "obs_metadata/shard_49",
+          "offset": 950441824,
+          "type": "obs_metadata/shard_49"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_50",
+          "offset": 969833224,
+          "type": "obs_metadata/shard_50"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_51",
+          "offset": 989231792,
+          "type": "obs_metadata/shard_51"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_52",
+          "offset": 1008630360,
+          "type": "obs_metadata/shard_52"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_53",
+          "offset": 1028028928,
+          "type": "obs_metadata/shard_53"
+        },
+        {
+          "length": 19396386,
+          "name": "obs_metadata/shard_54",
+          "offset": 1047427496,
+          "type": "obs_metadata/shard_54"
+        },
+        {
+          "length": 19389730,
+          "name": "obs_metadata/shard_55",
+          "offset": 1066823888,
+          "type": "obs_metadata/shard_55"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_56",
+          "offset": 1086213624,
+          "type": "obs_metadata/shard_56"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_57",
+          "offset": 1105612192,
+          "type": "obs_metadata/shard_57"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_58",
+          "offset": 1125010760,
+          "type": "obs_metadata/shard_58"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_59",
+          "offset": 1144409328,
+          "type": "obs_metadata/shard_59"
+        },
+        {
+          "length": 19398562,
+          "name": "obs_metadata/shard_60",
+          "offset": 1163807896,
+          "type": "obs_metadata/shard_60"
+        },
+        {
+          "length": 17839194,
+          "name": "obs_metadata/shard_61",
+          "offset": 1183206464,
+          "type": "obs_metadata/shard_61"
+        },
+        {
+          "length": 205866,
+          "name": "var_metadata/shard_0",
+          "offset": 1201045664,
+          "type": "var_metadata/shard_0"
+        },
+        {
+          "length": 216938,
+          "name": "var_metadata/shard_1",
+          "offset": 1201251536,
+          "type": "var_metadata/shard_1"
+        },
+        {
+          "length": 216938,
+          "name": "var_metadata/shard_2",
+          "offset": 1201468480,
+          "type": "var_metadata/shard_2"
+        },
+        {
+          "length": 164010,
+          "name": "var_metadata/shard_3",
+          "offset": 1201685424,
+          "type": "var_metadata/shard_3"
+        },
+        {
+          "length": 25096590,
+          "name": "X_shard_0",
+          "offset": 1201849440,
+          "type": "X/csr"
+        },
+        {
+          "length": 22122372,
+          "name": "X_shard_1",
+          "offset": 1226946032,
+          "type": "X/csr"
+        },
+        {
+          "length": 30692077,
+          "name": "X_shard_2",
+          "offset": 1249068408,
+          "type": "X/csr"
+        },
+        {
+          "length": 28574851,
+          "name": "X_shard_3",
+          "offset": 1279760488,
+          "type": "X/csr"
+        },
+        {
+          "length": 23812127,
+          "name": "X_shard_4",
+          "offset": 1308335344,
+          "type": "X/csr"
+        },
+        {
+          "length": 16993073,
+          "name": "X_shard_5",
+          "offset": 1332147472,
+          "type": "X/csr"
+        },
+        {
+          "length": 16336391,
+          "name": "X_shard_6",
+          "offset": 1349140552,
+          "type": "X/csr"
+        },
+        {
+          "length": 19726925,
+          "name": "X_shard_7",
+          "offset": 1365476944,
+          "type": "X/csr"
+        },
+        {
+          "length": 5860194,
+          "name": "X_shard_8",
+          "offset": 1385203872,
+          "type": "X/csr"
+        },
+        {
+          "length": 7645201,
+          "name": "X_shard_9",
+          "offset": 1391064072,
+          "type": "X/csr"
+        },
+        {
+          "length": 31104046,
+          "name": "X_shard_10",
+          "offset": 1398709280,
+          "type": "X/csr"
+        },
+        {
+          "length": 35881149,
+          "name": "X_shard_11",
+          "offset": 1429813328,
+          "type": "X/csr"
+        },
+        {
+          "length": 18540275,
+          "name": "X_shard_12",
+          "offset": 1465694480,
+          "type": "X/csr"
+        },
+        {
+          "length": 22895173,
+          "name": "X_shard_13",
+          "offset": 1484234760,
+          "type": "X/csr"
+        },
+        {
+          "length": 27149562,
+          "name": "X_shard_14",
+          "offset": 1507129936,
+          "type": "X/csr"
+        },
+        {
+          "length": 33505607,
+          "name": "X_shard_15",
+          "offset": 1534279504,
+          "type": "X/csr"
+        },
+        {
+          "length": 19989434,
+          "name": "X_shard_16",
+          "offset": 1567785112,
+          "type": "X/csr"
+        },
+        {
+          "length": 19291795,
+          "name": "X_shard_17",
+          "offset": 1587774552,
+          "type": "X/csr"
+        },
+        {
+          "length": 30225194,
+          "name": "X_shard_18",
+          "offset": 1607066352,
+          "type": "X/csr"
+        },
+        {
+          "length": 39689798,
+          "name": "X_shard_19",
+          "offset": 1637291552,
+          "type": "X/csr"
+        },
+        {
+          "length": 24898336,
+          "name": "X_shard_20",
+          "offset": 1676981352,
+          "type": "X/csr"
+        },
+        {
+          "length": 26224695,
+          "name": "X_shard_21",
+          "offset": 1701879688,
+          "type": "X/csr"
+        },
+        {
+          "length": 23627990,
+          "name": "X_shard_22",
+          "offset": 1728104384,
+          "type": "X/csr"
+        },
+        {
+          "length": 32963591,
+          "name": "X_shard_23",
+          "offset": 1751732376,
+          "type": "X/csr"
+        },
+        {
+          "length": 35978757,
+          "name": "X_shard_24",
+          "offset": 1784695968,
+          "type": "X/csr"
+        },
+        {
+          "length": 35528670,
+          "name": "X_shard_25",
+          "offset": 1820674728,
+          "type": "X/csr"
+        },
+        {
+          "length": 25592331,
+          "name": "X_shard_26",
+          "offset": 1856203400,
+          "type": "X/csr"
+        },
+        {
+          "length": 25719609,
+          "name": "X_shard_27",
+          "offset": 1881795736,
+          "type": "X/csr"
+        },
+        {
+          "length": 25317175,
+          "name": "X_shard_28",
+          "offset": 1907515352,
+          "type": "X/csr"
+        },
+        {
+          "length": 24242954,
+          "name": "X_shard_29",
+          "offset": 1932832528,
+          "type": "X/csr"
+        },
+        {
+          "length": 27809005,
+          "name": "X_shard_30",
+          "offset": 1957075488,
+          "type": "X/csr"
+        },
+        {
+          "length": 27582973,
+          "name": "X_shard_31",
+          "offset": 1984884496,
+          "type": "X/csr"
+        },
+        {
+          "length": 27519872,
+          "name": "X_shard_32",
+          "offset": 2012467472,
+          "type": "X/csr"
+        },
+        {
+          "length": 31779828,
+          "name": "X_shard_33",
+          "offset": 2039987344,
+          "type": "X/csr"
+        },
+        {
+          "length": 19589734,
+          "name": "X_shard_34",
+          "offset": 2071767176,
+          "type": "X/csr"
+        },
+        {
+          "length": 21820788,
+          "name": "X_shard_35",
+          "offset": 2091356912,
+          "type": "X/csr"
+        },
+        {
+          "length": 15491178,
+          "name": "X_shard_36",
+          "offset": 2113177704,
+          "type": "X/csr"
+        },
+        {
+          "length": 27372891,
+          "name": "X_shard_37",
+          "offset": 2128668888,
+          "type": "X/csr"
+        },
+        {
+          "length": 18691949,
+          "name": "X_shard_38",
+          "offset": 2156041784,
+          "type": "X/csr"
+        },
+        {
+          "length": 19957569,
+          "name": "X_shard_39",
+          "offset": 2174733736,
+          "type": "X/csr"
+        },
+        {
+          "length": 18294561,
+          "name": "X_shard_40",
+          "offset": 2194691312,
+          "type": "X/csr"
+        },
+        {
+          "length": 22500270,
+          "name": "X_shard_41",
+          "offset": 2212985880,
+          "type": "X/csr"
+        },
+        {
+          "length": 22407092,
+          "name": "X_shard_42",
+          "offset": 2235486152,
+          "type": "X/csr"
+        },
+        {
+          "length": 27868241,
+          "name": "X_shard_43",
+          "offset": 2257893248,
+          "type": "X/csr"
+        },
+        {
+          "length": 26450676,
+          "name": "X_shard_44",
+          "offset": 2285761496,
+          "type": "X/csr"
+        },
+        {
+          "length": 24652319,
+          "name": "X_shard_45",
+          "offset": 2312212176,
+          "type": "X/csr"
+        },
+        {
+          "length": 26214208,
+          "name": "X_shard_46",
+          "offset": 2336864496,
+          "type": "X/csr"
+        },
+        {
+          "length": 25198563,
+          "name": "X_shard_47",
+          "offset": 2363078704,
+          "type": "X/csr"
+        },
+        {
+          "length": 20523704,
+          "name": "X_shard_48",
+          "offset": 2388277272,
+          "type": "X/csr"
+        },
+        {
+          "length": 16977546,
+          "name": "X_shard_49",
+          "offset": 2408800976,
+          "type": "X/csr"
+        },
+        {
+          "length": 15973060,
+          "name": "X_shard_50",
+          "offset": 2425778528,
+          "type": "X/csr"
+        },
+        {
+          "length": 18872923,
+          "name": "X_shard_51",
+          "offset": 2441751592,
+          "type": "X/csr"
+        },
+        {
+          "length": 19162518,
+          "name": "X_shard_52",
+          "offset": 2460624520,
+          "type": "X/csr"
+        },
+        {
+          "length": 16719945,
+          "name": "X_shard_53",
+          "offset": 2479787040,
+          "type": "X/csr"
+        },
+        {
+          "length": 26184957,
+          "name": "X_shard_54",
+          "offset": 2496506992,
+          "type": "X/csr"
+        },
+        {
+          "length": 25613689,
+          "name": "X_shard_55",
+          "offset": 2522691952,
+          "type": "X/csr"
+        },
+        {
+          "length": 18166681,
+          "name": "X_shard_56",
+          "offset": 2548305648,
+          "type": "X/csr"
+        },
+        {
+          "length": 25321614,
+          "name": "X_shard_57",
+          "offset": 2566472336,
+          "type": "X/csr"
+        },
+        {
+          "length": 10375439,
+          "name": "X_shard_58",
+          "offset": 2591793952,
+          "type": "X/csr"
+        },
+        {
+          "length": 25370717,
+          "name": "X_shard_59",
+          "offset": 2602169392,
+          "type": "X/csr"
+        },
+        {
+          "length": 25506564,
+          "name": "X_shard_60",
+          "offset": 2627540112,
+          "type": "X/csr"
+        },
+        {
+          "length": 623192,
+          "name": "X_shard_61",
+          "offset": 2653046680,
+          "type": "X/csr"
+        },
+        {
+          "length": 146337551,
+          "name": "obs_predicate_index",
+          "offset": 2653669872,
+          "type": "obs_predicate_index"
+        },
+        {
+          "length": 201,
+          "name": "provenance",
+          "offset": 2800007424,
+          "type": "provenance"
+        }
+      ],
+      "shard_target_rows": 16384,
+      "_reframe_wall_s": 41.3
+    },
+    "pyscx_version": "0.18.0",
+    "n_obs": 1000000,
+    "set_size": 64,
+    "cache_shards": 62,
+    "max_memory_mb": 12100,
+    "cache_sizing": "sized to hold all 62 shards (12100 MB)",
+    "block_index_reachable": true,
+    "speedup_off_over_on": 0.653,
+    "speedup_default_over_on": 0.612,
+    "default_matches_off": true,
+    "premises": {
+      "on arm reached the block-index route": true,
+      "off arm took the full-shard route": true,
+      "off arm did not reach the block-index route": true,
+      "the default agrees with the explicit False": true
+    },
+    "provenance": {
+      "checkout_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "branch": "phase0-dataload-gate",
+      "dirty": true,
+      "dirty_paths": [
+        "benchmarks/README.md",
+        "benchmarks/comprehensive/benchmarks/cellset_gather.py",
+        "benchmarks/comprehensive/benchmarks/index_plan.py",
+        "benchmarks/comprehensive/benchmarks/ml_loader.py",
+        "benchmarks/comprehensive/benchmarks/obs_open.py",
+        "benchmarks/comprehensive/data_wait.py",
+        "benchmarks/comprehensive/tests/test_phase0_data_wait.py",
+        "benchmarks/comprehensive/thresholds.yaml",
+        "benchmarks/scripts/_phase0_data_wait_summary.py",
+        "benchmarks/scripts/_run_phase0_data_wait_gate.sh",
+        "benchmarks/scripts/_run_phase0_ml_loader_ab.sh",
+        "benchmarks/scripts/bench_cellset_scatter_routes.py",
+        "benchmarks/scripts/bench_cellset_scatter_routes.sbatch",
+        "docs/performance.md",
+        "2026-08-05_CODE-REVIEW.md",
+        "2026-08-05_CODE-REVIEW_ORGANIZE.md",
+        "2026-08-25_CODE-REVIEW_OPT.md",
+        "2026-09-12_ML-LOADER-OPT.md"
+      ],
+      "dirty_tracked_paths": [
+        "benchmarks/README.md",
+        "benchmarks/comprehensive/benchmarks/cellset_gather.py",
+        "benchmarks/comprehensive/benchmarks/index_plan.py",
+        "benchmarks/comprehensive/benchmarks/ml_loader.py",
+        "benchmarks/comprehensive/benchmarks/obs_open.py",
+        "benchmarks/comprehensive/data_wait.py",
+        "benchmarks/comprehensive/tests/test_phase0_data_wait.py",
+        "benchmarks/comprehensive/thresholds.yaml",
+        "benchmarks/scripts/_phase0_data_wait_summary.py",
+        "benchmarks/scripts/_run_phase0_data_wait_gate.sh",
+        "benchmarks/scripts/_run_phase0_ml_loader_ab.sh",
+        "benchmarks/scripts/bench_cellset_scatter_routes.py",
+        "benchmarks/scripts/bench_cellset_scatter_routes.sbatch",
+        "docs/performance.md"
+      ],
+      "hostname": "GPUCACE",
+      "slurm_job_id": "2943670",
+      "slurm_partition": "cpu_batch",
+      "argv": [
+        "--source",
+        "/large_storage/arcinfra/projects/scx/benchmarks/datasets/census_1m_auto.scx",
+        "--workdir",
+        "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/census_1m_grouped",
+        "--out",
+        "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/census_1m_auto.json",
+        "--n-runs",
+        "3",
+        "--n-batches",
+        "50",
+        "--plan",
+        "grouped",
+        "--raw-subdir",
+        "phase0_scatter_routes"
+      ]
+    }
+  }
+}

@@ -1544,6 +1544,114 @@ and diff. Two pitfalls show up reliably:
 
    Run each side at least twice (after a warm-up); take the second number.
 
+### Data-wait fraction (`p`) — measuring whether a loader is on the critical path
+
+`ml_loader`'s `gpu_train` scenario and `index_plan`'s
+`pyscx_index_plan_dataset_workers2` scenario both emit the share of a timed
+epoch the consumer spent blocked in `next(iterator)`, plus the per-batch wait
+distribution: `batch_wait_ms_p50__*`, `_p95__*`, `_p99__*` and `_max__*`.
+
+**Read the tail, not just the middle.** At census scale the wait is carried by
+a handful of stalls, not by a level: census_1m measured p50 13 microseconds and
+p95 799 microseconds against a steady fraction of 0.76 — ~10 s of wait over
+~976 steps, which only reconciles if a few tens of steps cost ~200 ms each.
+p50/p95 alone would report "sub-millisecond batches" underneath a number
+saying three quarters of the step budget is data wait. That is why p99 and the
+max are in the set.
+
+**Quote `data_wait_fraction_steady__*`, not `data_wait_fraction__*`.** The
+first `next()` pays tokio spin-up, the first shard decode and (on the
+`workers2` path) DataLoader worker spawn, once per epoch. The all-steps
+fraction folds that in, so on a short benchmark epoch it measures epoch length
+rather than the loader: a 98-step tabula `gpu_train` epoch read **0.85**
+all-steps while its own per-batch p50/p95 were **13 / 15 microseconds** —
+2.04 s of "wait" in a 2.4 s region, essentially all of it step 1.
+`ttfb_s__*` carries that startup separately and `n_steady_steps__*` says how
+many steps the steady figure is over.
+
+It is a **decision input, not a gate**: a decoder
+speedup `s` over an exposed fraction `p` is worth `1 / [(1 - p) + p/s]` and no
+more, so loader throughput work is funded per regime by what `p` actually is.
+Deliberately unfloored — see `thresholds.yaml`'s deferred item 21 for why a
+`max:` bound on it would be pinning the ratio of two unrelated things.
+
+`None` means *unmeasured*, never "the loader never stalled". Only a consumer
+with a model step can define the fraction:
+
+* `gpu_train` has one (an scVI-equivalent VAE), so it reports a number
+  whenever the scenario runs.
+* `pyscx_index_plan_dataset_workers2` has none — it counts batches — so its
+  fraction would be ~1.0 by construction. **`SCX_BENCH_R3_NULL_MODEL_MS`**
+  buys it a fixed-cost stand-in step (`time.sleep`, per batch). Default `0` =
+  off, so a registered capture is byte-for-byte unchanged; a capture with it
+  set carries wall-clock the registered rows do not, so name that snapshot
+  separately and **never diff it against `LATEST`**.
+
+⚠️ **`p` is a ratio whose denominator is the benchmark's model, not yours.**
+R1's consumer is a small VAE and R3's is a literal `sleep`, so both make the
+step cheap and `p` correspondingly high; a heavier model lowers `p` with the
+loader unchanged. The transferable quantity is the **absolute** wait per
+batch: R3's ~18 ms/batch is `p = 0.40` against its 25 ms step but `p ~ 0.12`
+against the 130 ms step STATE3 measured. Report both.
+
+```bash
+# One job, both regimes, chained after any scatter-route captures.
+sbatch benchmarks/scripts/_run_phase0_data_wait_gate.sh
+```
+
+⚠️ **A null-model capture overwrites tracked manifest rows.** Every benchmark
+writes `results/raw/<benchmark>__<format>__<dataset>.json` before its snapshot
+is copied, and some of those files are git-tracked (force-added) because
+`docs/performance.md` cites them — the three `index_plan__scx_auto__*` rows
+among them. A capture with `SCX_BENCH_R3_NULL_MODEL_MS` set therefore replaces
+a published 25.14 batches/s row with a 16.89 one whose slowdown is the `sleep`
+the knob inserted. `_run_phase0_data_wait_gate.sh` restores those three paths
+after its R3 arm; do the same in any other job that sets the knob, and check
+`git status benchmarks/comprehensive/results/raw/` before committing.
+
+### Read the `.err`, not just the `.out`
+
+`#SBATCH --output=` and `--error=` route stdout and stderr to *different files*
+in several of the capture wrappers. Python `UserWarning`s — which is how the
+loader reports cache thrash, unframed-file route fallbacks and budget sizing —
+go to **stderr**, so a run that looks clean in the `.out` can be carrying a
+warning that names both the problem and its fix.
+
+Concretely: a census_1m scatter capture spent six hours at 0.14 cellsets/s
+before timing out, while its `.err` held, four times over, *"shard-cache thrash
+detected — 78% of 8358 shard reads missed ... raise max_memory_mb to >=10707
+(enough for ~62 shards)."* The remedy eventually applied was that number. Grep
+both streams before concluding anything about a slow arm:
+
+```bash
+grep -iE "warning|thrash|fallback" benchmarks/comprehensive/logs/<job>.{out,err}
+```
+
+### Which pyscx a SLURM job actually imports
+
+⚠️ **The `scx-bench` conda env has a pyscx *wheel* in `site-packages`**
+(installed from `/tmp/pr08-wheel-branch-*`). It reports the same
+`__version__` as the checkout while being a different binary, and a bare
+`import pyscx` finds it. Putting the repo root on `PYTHONPATH` does **not**
+fix this: the repo root holds the `pyscx/` *crate* directory, which has no
+`__init__.py`, so the import falls through to `site-packages` anyway.
+
+```bash
+export PYTHONPATH="$REPO/pyscx/python:$REPO${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+`run_parallel._slurm_setup_cmds` forwards `PYTHONPATH` to every worker, so
+that one line selects the build for a whole capture without touching the env.
+
+This is not a hygiene note. A phase-0 scatter-route A/B ran against the wheel
+first: it predates OPT-FORMATIO-1's row-group LRU and has no `row_group_*`
+keys in `cache_metrics()` at all, so the job would have reproduced the
+pre-LRU numbers under a heading saying "current `main`" — the measurement
+whose whole purpose was to see whether that changed. Every capture script
+should print `pyscx.__file__` and assert the prefix; the scatter-route driver
+additionally refuses outright when `cache_metrics()` lacks the row-group
+counters (`_require_row_group_counters`).
+
 ### Promoting a canonical baseline
 
 Snapshots land in `benchmarks/comprehensive/results/<name>/` from
