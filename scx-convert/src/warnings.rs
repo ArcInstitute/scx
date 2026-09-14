@@ -185,8 +185,14 @@ pub enum ConvertWarning {
     EagerAssemblyMemoryHigh {
         estimated_bytes: u64,
         budget_bytes: u64,
-        /// Stored nonzeros in `X` (the estimate's dominant term).
-        nnz: u64,
+        /// Stored nonzeros in the `X` this call assembles, and the estimate's
+        /// dominant term.
+        ///
+        /// `None` when it assembles **no host `X`** at all — `to_gpu_anndata`'s
+        /// device path decodes straight to the GPU, so a warning it triggers is
+        /// about `adata.raw` and the metadata, and explaining it in nonzeros
+        /// would describe a buffer that is never built.
+        nnz: Option<u64>,
         /// Bytes per value in the assembled matrix, from the caller's
         /// `data_dtype`. The message derives its per-nonzero figure from this
         /// and `index_bytes` rather than assuming `f32`: a `float64` read is
@@ -200,10 +206,14 @@ pub enum ConvertWarning {
         /// file with **deletion vectors**, where `nnz` is physical and scipy
         /// decides from the live count, which the catalog cannot supply.
         index_bytes: Option<u64>,
-        /// `true` when the caller asked for `container="dense"`, so the estimate
-        /// is `n_obs × n_vars × value_bytes` and the nonzero count does not
-        /// bound it.
-        dense_request: bool,
+        /// The `(rows, columns)` a dense request will actually allocate, when
+        /// the caller asked for `container="dense"`.
+        ///
+        /// The **shape the estimate used**, not the file's: under a `var_names`
+        /// projection it is the selected column count, and a message that
+        /// printed `n_vars` there would explain a ~2 GB estimate as an 8 GB
+        /// buffer.
+        dense_shape: Option<(u64, u64)>,
         /// `n_obs × n_vars × value_bytes`, when `container="dense"` would be
         /// smaller than the **sparse `X` term alone** — not than
         /// `estimated_bytes`, which also carries `adata.raw` and the metadata,
@@ -399,7 +409,7 @@ impl fmt::Display for ConvertWarning {
                 nnz,
                 value_bytes,
                 index_bytes,
-                dense_request,
+                dense_shape,
                 dense_bytes,
             } => {
                 let gib = 1024.0 * 1024.0 * 1024.0;
@@ -407,34 +417,48 @@ impl fmt::Display for ConvertWarning {
                 let budget = *budget_bytes as f64 / gib;
                 // Why it is that big: the index array is two thirds of a wide
                 // matrix's footprint and nothing else surfaces that.
-                let n = group_thousands(*nnz);
                 // Every figure here is derived from the plan the estimate was
-                // priced with. Hard-coding f32/i32 widths made the message
-                // contradict its own total on any other request: a float64 CSR
-                // is 12 B/nnz below the int64 line and 16 above, not 8 and 12.
-                let why = match (*dense_request, *index_bytes) {
-                    (true, _) => format!(
-                        " A dense container is n_obs x n_vars x {value_bytes} B, so the {n} \
-                         stored nonzeros do not bound it."
-                    ),
-                    (false, Some(ix)) => {
-                        let per = value_bytes.saturating_add(ix);
-                        let wide = if ix == 8 {
-                            ", the larger half, because above 2^31 nonzeros scipy holds int64 \
-                             column indices"
-                        } else {
-                            ""
-                        };
+                // priced with, and from the shape it used. Hard-coding widths or
+                // the file's own shape made the message contradict its own total
+                // — twice, on two different axes.
+                let why = match (nnz, dense_shape) {
+                    // No host X: the budget was tripped by raw and metadata, and
+                    // there is no matrix here to explain.
+                    (None, _) => String::new(),
+                    (Some(nnz), Some((rows, cols))) => {
+                        let n = group_thousands(*nnz);
                         format!(
-                            " {n} nonzeros at {per} B each: {value_bytes} B of value and {ix} B \
-                             of column index{wide}."
+                            " A dense container is {rows} x {cols} x {value_bytes} B, so the \
+                             {n} stored nonzeros do not bound it."
                         )
                     }
-                    (false, None) => format!(
-                        " {n} stored nonzeros at {value_bytes} B of value each, plus a column \
-                         index whose width scipy picks from the count after deletions — a \
-                         count the catalog cannot supply, so this figure assumes the wider one."
-                    ),
+                    (Some(nnz), None) => {
+                        let n = group_thousands(*nnz);
+                        match index_bytes {
+                            Some(ix) => {
+                                let per = value_bytes.saturating_add(*ix);
+                                let wide = if *ix == 8 && ix > value_bytes {
+                                    ", the larger half, because above 2^31 nonzeros scipy holds \
+                                     int64 column indices"
+                                } else if *ix == 8 {
+                                    ", because above 2^31 nonzeros scipy holds int64 column \
+                                     indices"
+                                } else {
+                                    ""
+                                };
+                                format!(
+                                    " {n} nonzeros at {per} B each: {value_bytes} B of value and \
+                                     {ix} B of column index{wide}."
+                                )
+                            }
+                            None => format!(
+                                " {n} stored nonzeros at {value_bytes} B of value each, plus a \
+                                 column index whose width scipy picks from the count after \
+                                 deletions — a count the catalog cannot supply, so this figure \
+                                 assumes the wider one."
+                            ),
+                        }
+                    }
                 };
                 let dense = match dense_bytes {
                     Some(b) => format!(
@@ -599,10 +623,10 @@ mod tests {
         let w = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 25_239_799_332,
             budget_bytes: 8_589_934_592,
-            nnz: 1_000_000_000,
+            nnz: Some(1_000_000_000),
             value_bytes: 4,
             index_bytes: Some(4),
-            dense_request: false,
+            dense_shape: None,
             dense_bytes: None,
         };
         let rendered = format!("{w}");
@@ -632,14 +656,16 @@ mod tests {
         let w = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 22_000_000_000,
             budget_bytes: 8_589_934_592,
-            nnz: 1_000_000_000,
+            nnz: Some(1_000_000_000),
             value_bytes: 4,
             index_bytes: None,
-            dense_request: true,
+            dense_shape: Some((50_000, 4_000)),
             dense_bytes: None,
         };
         let rendered = format!("{w}");
         assert!(rendered.contains("do not bound it"), "{rendered}");
+        // The shape the estimate used, printed, not the file's own.
+        assert!(rendered.contains("50000 x 4000 x 4 B"), "{rendered}");
         assert!(rendered.contains("1,000,000,000"), "{rendered}");
         assert!(!rendered.contains("column indices"), "{rendered}");
         assert!(!rendered.contains("B each"), "{rendered}");
@@ -659,10 +685,10 @@ mod tests {
         let f64_wide = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 40_000_000_000,
             budget_bytes: 8_589_934_592,
-            nnz: 2_500_000_000,
+            nnz: Some(2_500_000_000),
             value_bytes: 8,
             index_bytes: Some(8),
-            dense_request: false,
+            dense_shape: None,
             dense_bytes: None,
         };
         let rendered = format!("{f64_wide}");
@@ -676,10 +702,10 @@ mod tests {
         let u8_narrow = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 12_000_000_000,
             budget_bytes: 8_589_934_592,
-            nnz: 2_000_000_000,
+            nnz: Some(2_000_000_000),
             value_bytes: 1,
             index_bytes: Some(4),
-            dense_request: false,
+            dense_shape: None,
             dense_bytes: None,
         };
         let rendered = format!("{u8_narrow}");
@@ -695,10 +721,10 @@ mod tests {
         let w = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 40_000_000_000,
             budget_bytes: 8_589_934_592,
-            nnz: 2_650_704_199,
+            nnz: Some(2_650_704_199),
             value_bytes: 4,
             index_bytes: None,
-            dense_request: false,
+            dense_shape: None,
             dense_bytes: None,
         };
         let rendered = format!("{w}");
@@ -707,6 +733,59 @@ mod tests {
         // No per-nonzero total, because the index half of it is unknown.
         assert!(!rendered.contains(" B each:"), "{rendered}");
         assert!(!rendered.contains("int64"), "{rendered}");
+    }
+
+    /// A call that assembles no host `X` explains none.
+    ///
+    /// `to_gpu_anndata`'s device path decodes straight to the GPU; a warning it
+    /// trips came from `adata.raw` and the metadata, and a nonzero count would
+    /// be describing a buffer that is never built.
+    #[test]
+    fn no_host_x_means_no_nonzero_explanation() {
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 20_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: None,
+            value_bytes: 4,
+            index_bytes: None,
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("18.6 GiB"), "{rendered}");
+        assert!(!rendered.contains("nonzero"), "{rendered}");
+        assert!(!rendered.contains("column index"), "{rendered}");
+        // Still says what it covers and offers the routes.
+        assert!(rendered.contains("assembly only"), "{rendered}");
+        assert!(rendered.contains("backed=True"), "{rendered}");
+    }
+
+    /// An 8 B value next to an 8 B index is not "the larger half".
+    #[test]
+    fn the_index_is_only_called_larger_when_it_is() {
+        let equal = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_500_000_000),
+            value_bytes: 8,
+            index_bytes: Some(8),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{equal}");
+        assert!(rendered.contains("int64 column indices"), "{rendered}");
+        assert!(!rendered.contains("larger half"), "{rendered}");
+
+        let larger = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_500_000_000),
+            value_bytes: 4,
+            index_bytes: Some(8),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        assert!(format!("{larger}").contains("larger half"));
     }
 
     #[test]
@@ -729,10 +808,10 @@ mod tests {
         let wide = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 31_782_000_000,
             budget_bytes: 8_589_934_592,
-            nnz: 2_650_704_199,
+            nnz: Some(2_650_704_199),
             value_bytes: 4,
             index_bytes: Some(8),
-            dense_request: false,
+            dense_shape: None,
             dense_bytes: Some(23_600_000_000),
         };
         let rendered = format!("{wide}");
@@ -746,10 +825,10 @@ mod tests {
         let narrow = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 25_239_799_332,
             budget_bytes: 8_589_934_592,
-            nnz: 1_000_000_000,
+            nnz: Some(1_000_000_000),
             value_bytes: 4,
             index_bytes: Some(4),
-            dense_request: false,
+            dense_shape: None,
             dense_bytes: None,
         };
         let rendered = format!("{narrow}");

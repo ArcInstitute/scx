@@ -271,7 +271,7 @@ impl ScxReader {
             .map(|((ip, ix), val)| (ip, ix, val))
             .collect();
 
-        let decode_into = |(i, (ip_out, ix_out, val_out)): (
+        let decode_into = &|(i, (ip_out, ix_out, val_out)): (
             usize,
             (&mut [i64], IndexSliceMut<'_>, ValueSliceMut<'_>),
         )|
@@ -311,10 +311,21 @@ impl ScxReader {
 
         match strategy {
             #[cfg(feature = "parallel")]
-            RowMajorStrategy::Parallel => chunks
-                .into_par_iter()
-                .enumerate()
-                .try_for_each(decode_into)?,
+            RowMajorStrategy::Parallel => {
+                // Bounded fan-out, not a free-for-all. Each task first
+                // materializes one *whole* shard's native buffers
+                // (`read_shard_from_entry_native`), and a pool at least as wide
+                // as the shard count starts every one of them — turning the
+                // serial path's one-shard transient into an all-shards-at-once
+                // one. Measured on a 59-shard, 2.65e9-nnz file: +6.3 GiB of
+                // process high-water at 64 threads, and none of it at 4. These
+                // are the reads a caller asks for *because* they want less
+                // memory, so the concurrency is capped by bytes in flight
+                // rather than left to the pool's width.
+                for batch in in_flight_batches(chunks, &shard_sizes) {
+                    batch.into_par_iter().try_for_each(decode_into)?;
+                }
+            }
             RowMajorStrategy::Sequential => {
                 chunks.into_iter().enumerate().try_for_each(decode_into)?
             }
@@ -367,6 +378,68 @@ impl ScxReader {
             values,
         ))
     }
+}
+
+/// Bytes of *native* decode buffers a single shard holds while it is being cast
+/// into its slice: `u32` indices and `u32`/`f32` values at 4 B each, plus the
+/// shard's own `i64` indptr.
+///
+/// This is what the fan-out has to bound. The output buffers are pre-sized and
+/// carved before the loop, so they are not concurrency-dependent; only these
+/// are.
+///
+/// `cfg`-gated with its only consumer, like the fixture in `typed_read_tests.rs`
+/// — without `parallel` there is no fan-out to bound and it is dead code under
+/// the `--no-default-features` clippy legs.
+#[cfg(feature = "parallel")]
+pub(crate) fn native_shard_bytes((n_rows, nnz): (usize, usize)) -> u64 {
+    (nnz as u64)
+        .saturating_mul(8)
+        .saturating_add((n_rows as u64).saturating_add(1).saturating_mul(8))
+}
+
+/// In-flight budget for concurrent native shard decodes.
+///
+/// Not the pool width and not a thread count: the cost that scales with
+/// concurrency is the native buffers, and shards differ in size by orders of
+/// magnitude across files. 2 GiB is large enough that an ordinary shard list
+/// runs at full width (a 64 MB shard gives a window of 32) and small enough that
+/// an atlas-scale one cannot hold every shard at once — on the 59-shard,
+/// 2.65e9-nnz file this was measured against, ~360 MB per shard gives a window
+/// of 5 rather than 59.
+#[cfg(feature = "parallel")]
+pub(crate) const IN_FLIGHT_NATIVE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Split the carved per-shard chunks into consecutive batches whose in-flight
+/// native decode buffers stay under [`IN_FLIGHT_NATIVE_BUDGET_BYTES`].
+///
+/// Sized from the **largest** shard in the list rather than a running sum:
+/// rayon may schedule any subset of a batch simultaneously, so a batch is only
+/// as safe as its worst member. At least one shard per batch, always — a single
+/// shard over the budget has to be decoded regardless, and refusing would make
+/// a legal file unreadable.
+#[cfg(feature = "parallel")]
+pub(crate) fn in_flight_batches<T>(
+    chunks: Vec<T>,
+    shard_sizes: &[(usize, usize)],
+) -> Vec<Vec<(usize, T)>> {
+    let widest = shard_sizes
+        .iter()
+        .map(|&s| native_shard_bytes(s))
+        .max()
+        .unwrap_or(0);
+    let window = (IN_FLIGHT_NATIVE_BUDGET_BYTES / widest.max(1)).max(1) as usize;
+    let mut batches: Vec<Vec<(usize, T)>> = Vec::new();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        if i % window == 0 {
+            batches.push(Vec::with_capacity(window));
+        }
+        batches
+            .last_mut()
+            .expect("a batch was pushed on the first iteration")
+            .push((i, chunk));
+    }
+    batches
 }
 
 /// The `value_max` decode-loss guard, dispatched from the runtime

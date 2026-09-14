@@ -919,3 +919,45 @@ fn typed_parallel_matches_sequential() {
         "fixture must have no zero values, or an unwritten slot reads as correct"
     );
 }
+
+/// The fan-out is bounded by bytes in flight, not by the pool's width.
+///
+/// Each task materializes one whole shard's native buffers, so an unbounded
+/// `into_par_iter` over 59 shards on a 64-thread pool holds all 59 at once —
+/// measured as +6.3 GiB of process high-water on a 2.65e9-nnz file, and zero at
+/// 4 threads. The window is computed from the widest shard because rayon may
+/// run any subset of a batch simultaneously.
+#[test]
+#[cfg(feature = "parallel")]
+fn the_in_flight_window_is_sized_from_the_widest_shard() {
+    use crate::typed_read::{in_flight_batches, native_shard_bytes, IN_FLIGHT_NATIVE_BUDGET_BYTES};
+
+    // 4 B of index + 4 B of value per nonzero, plus this shard's own i64 indptr.
+    assert_eq!(native_shard_bytes((10, 100)), 100 * 8 + 11 * 8);
+
+    // Shards small enough that the budget does not bind: one batch.
+    let small = vec![(1_000usize, 1_000usize); 8];
+    let batches = in_flight_batches((0..8).collect::<Vec<_>>(), &small);
+    assert_eq!(batches.len(), 1, "a small shard list must not be split");
+    assert_eq!(batches[0].len(), 8);
+
+    // One shard at just under half the budget: two at a time, so four batches of
+    // two. (`- 8` leaves room for the shard's own one-element indptr, which
+    // `native_shard_bytes` also counts — at exactly half it is one over and the
+    // window collapses to 1, which is the boundary being pinned.)
+    let half = ((IN_FLIGHT_NATIVE_BUDGET_BYTES / 2 - 8) / 8) as usize;
+    let big = vec![(0usize, half); 8];
+    let batches = in_flight_batches((0..8).collect::<Vec<_>>(), &big);
+    assert_eq!(batches.len(), 4);
+    assert!(batches.iter().all(|b| b.len() == 2), "{batches:?}");
+
+    // The indices survive the regrouping, in order — they select the shard.
+    let flat: Vec<usize> = batches.iter().flatten().map(|(i, _)| *i).collect();
+    assert_eq!(flat, (0..8).collect::<Vec<_>>());
+
+    // A single shard larger than the whole budget still gets decoded.
+    let huge = vec![(0usize, IN_FLIGHT_NATIVE_BUDGET_BYTES as usize); 3];
+    let batches = in_flight_batches((0..3).collect::<Vec<_>>(), &huge);
+    assert_eq!(batches.len(), 3);
+    assert!(batches.iter().all(|b| b.len() == 1));
+}
