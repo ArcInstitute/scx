@@ -2045,11 +2045,15 @@ fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
         b.indices.capacity(),
         b.indices.len()
     );
-    // The estimate itself is the mean, below the truth. Pinned so a silent
-    // return to an exact prescan — which would make this equal — is visible.
+    // Even with the bias, a densest-rows plan exceeds the estimate — the one
+    // case the estimate cannot serve without reading the data, and the reason
+    // the assertion above is `>=` rather than an equality. Pinned so a silent
+    // return to an exact prescan, which would make this case free, is visible.
     assert!(
-        (n_dense as f64 * 2.5).ceil() as usize <= b.indices.len(),
-        "the mean should under-estimate a densest-rows plan"
+        crate::sparse_cellset::presize_nnz(n_dense, 2.5) < b.indices.len(),
+        "a densest-rows plan should still exceed the biased estimate: {} vs {}",
+        crate::sparse_cellset::presize_nnz(n_dense, 2.5),
+        b.indices.len()
     );
 
     // Sparsest rows only (r % 4 == 0 ⇒ 1 nnz each): the mean over-shoots.
@@ -2064,29 +2068,34 @@ fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
         b.indices.len()
     );
 
-    // Whole file: the mean is exact over every row, so this is the one plan
-    // where the estimate and the truth coincide.
+    // Whole file: the mean is exact over every row, so the estimate before the
+    // bias is the truth — and the bias is then pure headroom, which is what
+    // keeps even this plan free of a reallocation.
     let b = gather((0..64).collect());
     assert_eq!(b.indices.len(), 160, "sum of (r % 4) + 1 over 64 rows");
-    assert_eq!(b.indices.capacity(), b.indices.len());
+    assert_eq!(
+        b.indices.capacity(),
+        crate::sparse_cellset::presize_nnz(64, 2.5),
+        "the whole-file plan should not have reallocated"
+    );
+    assert!(b.indices.capacity() > b.indices.len(), "bias is headroom");
 }
 
-/// W1: the gather pre-sizes `indices`/`data`, so the append loop does not grow
-/// them geometrically from empty.
+/// W1: the gather pre-sizes `indices`/`data`, so the append loop never
+/// reallocates.
 ///
-/// The size is an **estimate** — `total_rows x mean_nnz_per_row` from the
-/// catalog — not a count of the plan's actual rows. `capacity() == len()` holds
-/// here because `write_fixture` gives every row exactly one non-zero, so the
-/// manifest mean is 1.0 and the estimate is exact *on this fixture*. That is a
-/// property of the fixture, not a contract: on real data the estimate is close,
-/// not exact, which is all `with_capacity` needs — see
-/// `gather_presize_is_an_estimate_on_a_non_uniform_fixture`.
+/// The assertion is `capacity() == presize_nnz(rows, mean)` — the capacity the
+/// policy asks for, untouched — rather than `capacity() == len()`. Those were
+/// the same thing while the estimate was unbiased, and pinning the wrong one
+/// hid a defect: the estimate then landed just *under* the truth about half the
+/// time, taking one reallocation at full size, which measured slower than
+/// growing from empty. An equality against the policy catches any growth
+/// (a realloc lands on a different, larger capacity) without re-asserting the
+/// arithmetic, so it keeps working when the bias changes.
 ///
-/// Exactness is still the right assertion to make here, because it is the
-/// strongest available witness that no doubling growth happened. Watched
-/// failing before the pre-sizing existed: with `Vec::new()` the finished
-/// `indices` has a power-of-two capacity above its length, the signature of
-/// geometric growth.
+/// Watched failing before the pre-sizing existed: with `Vec::new()` the
+/// finished `indices` has a power-of-two capacity, the signature of geometric
+/// growth.
 #[test]
 fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -2125,20 +2134,28 @@ fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
     let b = &batches[0];
 
     assert_eq!(b.indices.len(), 640, "one nnz per row in this fixture");
+    // Every row carries one non-zero, so the manifest mean is 1.0 and the
+    // policy asks for 640 + 640/8. Anything else means the vector grew.
+    let want = crate::sparse_cellset::presize_nnz(640, 1.0);
     assert_eq!(
         b.indices.capacity(),
-        b.indices.len(),
-        "indices was not pre-sized exactly: capacity {} != len {}",
+        want,
+        "indices reallocated: capacity {} != the {} it was pre-sized to (len {})",
         b.indices.capacity(),
+        want,
         b.indices.len()
     );
     assert_eq!(
         b.data.capacity(),
-        b.data.len(),
-        "data was not pre-sized exactly: capacity {} != len {}",
+        want,
+        "data reallocated: capacity {} != the {} it was pre-sized to (len {})",
         b.data.capacity(),
+        want,
         b.data.len()
     );
+    // And the bias is an over-allocation, never an under-one: a capacity below
+    // the length is the shape that costs a full-size copy.
+    assert!(b.indices.capacity() > b.indices.len());
 }
 
 /// The prescan must be a *bound*, never a truncation: `capacity >= len` on a

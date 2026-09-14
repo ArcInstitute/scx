@@ -192,6 +192,17 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
     (avg_bytes, mean_nnz_per_row)
 }
 
+/// Capacity to pre-size a gathered batch's `indices` / `data` to.
+///
+/// `rows x mean_nnz_per_row`, biased up by an eighth. Shared with the tests so
+/// they assert against the policy rather than restating its arithmetic, which
+/// is what lets them keep proving "no reallocation happened" when the bias
+/// changes.
+pub(crate) fn presize_nnz(rows: usize, mean_nnz_per_row: f64) -> usize {
+    let est = (rows as f64 * mean_nnz_per_row).ceil() as usize;
+    est.saturating_add(est / 8)
+}
+
 use crate::budget::BudgetModel;
 
 /// Resolve the cache count in **closed form**, and return it in the same
@@ -812,10 +823,26 @@ impl SparseCellSetLoader {
         // the I/O: `mean_nnz_per_row` comes from the catalog walk the budget
         // model already does at construction, and reads nothing.
         //
+        // **Biased upward by an eighth, and that is the whole point.** The two
+        // errors are not symmetric: overshooting wastes transient bytes, while
+        // undershooting by any margin at all forces a reallocation at FULL
+        // size — the single most expensive one, copying the whole batch. A
+        // mean-exact estimate lands just under the truth about half the time,
+        // and an A/B caught that costing the entire win: on pbmc3k the plan's
+        // rows average 850.5 non-zeros against the manifest's 847.0, so the
+        // unbiased estimate came 0.4 % short, took that one full-size copy, and
+        // measured *slower* than growing from empty (3949 vs 4799 sets/s).
+        //
+        // An eighth is a shift, covers ordinary sampling variation in row
+        // density, and costs ~0.9 MB on a 1024-row pbmc3k batch. A plan that
+        // deliberately selects the densest rows can still exceed it and pay the
+        // one reallocation; that is the rare case, and it is the case the
+        // estimate cannot serve without reading the data.
+        //
         // 0 when no shard carried stats, which is the same "size unknown"
         // signal the byte budget falls back on — capacity 0 is exactly the
         // pre-change behaviour, so an unknowable file is no worse off.
-        let planned_nnz = (total_rows as f64 * self.mean_nnz_per_row).ceil() as usize;
+        let planned_nnz = presize_nnz(total_rows, self.mean_nnz_per_row);
         let mut indices: Vec<i32> = Vec::with_capacity(planned_nnz);
         let mut data: Vec<f32> = Vec::with_capacity(planned_nnz);
         let mut cell_indices: Vec<u64> = Vec::with_capacity(total_rows);
