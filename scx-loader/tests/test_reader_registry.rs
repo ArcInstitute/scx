@@ -264,16 +264,43 @@ fn iterator_at_lookahead_zero_does_not_lease_the_plans_width() {
     // prefetch to launch, so nothing should need more than the sizing and the
     // gather — both of which handle one file at a time.
     let plans: Vec<_> = (0..2).map(|_| Ok(one_set_per_file(32))).collect();
-    let n = Arc::clone(&loader)
-        .iter_with_plans(plans.into_iter(), 0)
-        .count();
+    let iter = Arc::clone(&loader).iter_with_plans(plans.into_iter(), 0);
+    let iter_metrics = iter.iter_metrics();
+    let n = iter.count();
     assert_eq!(n, 2);
+
+    // The counter, not just the residency. At `lookahead == 0` the declined
+    // path and the no-prefetch path now do the *same* sizing work, so residency
+    // and open counts cannot tell them apart — only this can. Leaving it
+    // unasserted is what let the decline sit unreachable behind the
+    // `lookahead == 0` early return for a whole round. **Review on #536
+    // (Antigravity).**
+    assert_eq!(
+        iter_metrics
+            .prefetch_skipped_reader_limit
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "both 32-file plans exceed reader_limit=4 and must be counted as \
+         declined, whatever the lookahead"
+    );
 
     let hwm = metrics.hwm.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
         hwm <= 5,
         "a 32-file plan at reader_limit=4, lookahead=0 held {hwm} readers; the \
          prefetcher has no tasks to launch and must not lease the plan's width"
+    );
+    // `opens` as well as `hwm`, because they fail independently. Asserting
+    // residency alone is how the `lookahead == 0` decline stayed unreachable
+    // through a whole review round: the bulk lease was gone, so `hwm` looked
+    // right, while the plan still paid a sizing pass nothing counted.
+    // **Review on #536 (Antigravity).**
+    let opens = metrics.opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        opens <= 2 * (2 * 32) + 8,
+        "{opens} opens for two 32-file plans at reader_limit=4, lookahead=0: the \
+         budget is one sizing pass and one gather pass per plan, and a third \
+         pass means the prefetcher leased the width it has no tasks for"
     );
 }
 
@@ -376,15 +403,21 @@ fn a_wide_plan_declines_prefetch_rather_than_exceeding_the_limit() {
         "residency high-water {hwm} against reader_limit=2: the prefetcher must \
          decline a plan it cannot hold, not pin its width"
     );
-    // Two plans over 32 files at a cap of 2 still reopen a lot — that is the
-    // cost of the shape, and it is the caller's to avoid. What must not happen
-    // is a *second* pass per plan on top of the gather's. Sizing used to be
-    // that second pass, and declining to size a plan that is already refused
-    // admission removes it: 129 opens before, 64 after.
+    // Two plans over 32 files at a cap of 2 reopen a lot — that is the cost of
+    // the shape and it is the caller's to avoid. The budget is one sizing pass
+    // plus one gather pass per plan; the defect this pins is the *third*, from
+    // the bulk lease, which codex measured at 65 opens for a single plan.
+    //
+    // The sizing pass is deliberately kept rather than skipped: it is what
+    // produces a real admission verdict, and a plan whose readers cannot all
+    // stay resident can still have its row groups fit the byte budget — the
+    // two live in different places and `CacheKey::Group` outlives a handle
+    // eviction. Trading that for a lower open count was the wrong trade.
     assert!(
-        opens <= 2 * 32 + 2,
-        "{opens} opens for two 32-file plans at reader_limit=2; more than one \
-         pass per plan means something is reopening what it just closed"
+        opens <= 2 * 32 * 2 + 4,
+        "{opens} opens for two 32-file plans at reader_limit=2; more than a \
+         sizing pass and a gather pass each means something is reopening what \
+         it just closed"
     );
 }
 

@@ -152,7 +152,6 @@ pub use metadata::{
 pub(crate) use matrix::RowMajorStrategy;
 
 impl ScxReader {
-    /// The path this reader was opened from.
     /// The inode this reader's mapping was taken from, captured at open time
     /// from the same `File`. The only sound source for a file identity — see
     /// [`crate::freshness::FileIdentity::of`].
@@ -160,6 +159,7 @@ impl ScxReader {
         self.inode
     }
 
+    /// The path this reader was opened from.
     pub fn path(&self) -> &Path {
         &self.path
     }

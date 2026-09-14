@@ -915,10 +915,6 @@ impl ScxReader {
         names
     }
 
-    /// Read the shard header from a catalog entry without decoding the shard data.
-    ///
-    /// Useful when callers need per-shard codec/encoding info before or alongside
-    /// `read_shard_from_entry`.
     /// True if any CSR shard in this file resolves a row-group framing layout.
     ///
     /// **The one definition.** [`crate::BackedCsrReader::any_shard_framed`]
@@ -942,6 +938,10 @@ impl ScxReader {
             .any(|e| matches!(self.framed_shard_layout(e), Ok(Some(_))))
     }
 
+    /// Read the shard header from a catalog entry without decoding the shard data.
+    ///
+    /// Useful when callers need per-shard codec/encoding info before or alongside
+    /// `read_shard_from_entry`.
     pub fn read_shard_header(&self, entry: &FullCatalogEntry) -> Result<ShardHeader> {
         let section = self.section_bytes(entry)?;
         let vs = crate::validated_section::ValidatedSection::new(section);

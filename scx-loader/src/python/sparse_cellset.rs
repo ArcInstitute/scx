@@ -699,7 +699,8 @@ impl SparseCellSetBatchIter {
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,
-    ///               prefetch_skipped_block_index}}
+    ///               prefetch_skipped_block_index,
+    ///               prefetch_skipped_reader_limit}}
     /// ```
     ///
     /// `cache` is loader-cumulative (shared with

@@ -106,6 +106,10 @@ pub(super) fn iter_metrics_to_pydict<'py>(
         "prefetch_skipped_block_index",
         m.prefetch_skipped_block_index.load(Ordering::Relaxed),
     )?;
+    dict.set_item(
+        "prefetch_skipped_reader_limit",
+        m.prefetch_skipped_reader_limit.load(Ordering::Relaxed),
+    )?;
     Ok(dict)
 }
 

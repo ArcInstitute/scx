@@ -247,6 +247,11 @@ class SparseCellSetBatchIter:
         ``prefetch`` is per-iter and resets on each `iter_with_plans` call.
         Safe after exhaustion.
 
+        ``prefetch["prefetch_skipped_reader_limit"]`` counts plans that were not
+        prefetched at all because they touch more distinct files than
+        ``reader_limit`` can keep resident; such a plan still gets a real
+        admission verdict, and the key is 0 on any dataset without a limit.
+
         ``prefetch["prefetch_skipped_block_index"]`` counts the L2
         *prefetch-time* decision: shards not warmed *whole* so the gather could
         take the block-index path. Such a shard is not left cold: when the

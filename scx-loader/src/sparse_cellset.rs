@@ -15,7 +15,7 @@
 //! remap/coalesce to the caller.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -391,6 +391,37 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
     }
 }
 
+/// Make a manifest entry independent of the process working directory.
+///
+/// A reopen happens at an arbitrary later time, so a relative entry would be
+/// resolved against whatever cwd the process has *then* — a bounded-mode
+/// regression against `main`, where every mmap was established in the
+/// constructor and held, so cwd could not matter. Reproduced on #536 by
+/// codex - gpt-5.6-sol and confirmed by Cursor Agent and Antigravity.
+///
+/// Hand-rolled rather than `std::path::absolute`, which is Rust 1.79 and would
+/// have silently broken the >= 1.78 floor that `README.md` and
+/// `docs/development.md` document and no `rust-version` key enforces — so no CI
+/// leg would have caught it. **Caught on #536 by codex.**
+///
+/// Deliberately not `canonicalize`: this removes the cwd dependence without
+/// resolving symlinks, which would change which file a repointed link names.
+/// A failure is an error, never a silent fallback to the relative spelling —
+/// that spelling is the bug.
+fn absolute_manifest_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir().map_err(|e| LoaderError::ConfigError {
+        reason: format!(
+            "cannot resolve the relative manifest entry {} — the process working \
+             directory is unreadable ({e}); pass absolute paths",
+            path.display()
+        ),
+    })?;
+    Ok(cwd.join(path))
+}
+
 /// One pass over the manifest, holding at most `reader_limit` files open.
 ///
 /// Everything the constructor needs from a file — the CSR-range validation, the
@@ -447,7 +478,12 @@ impl ManifestScan {
             any_framed: want_framing.then_some(false),
         };
         for (fid, path) in paths.iter().enumerate() {
-            let reader = ScxReader::open(path).map_err(|e| LoaderError::ConfigError {
+            // Resolved BEFORE the open, and the resolved path is what gets
+            // opened. Doing it afterwards left a window in which a concurrent
+            // `set_current_dir` mapped one directory's file and recorded the
+            // other's as the reopen target. **Review on #536 (codex).**
+            let path = absolute_manifest_path(path)?;
+            let reader = ScxReader::open(&path).map_err(|e| LoaderError::ConfigError {
                 reason: format!("failed to open {}: {e}", path.display()),
             })?;
             let retain = limit.is_none_or(|k| scan.retained.len() < k);
@@ -482,18 +518,10 @@ impl ManifestScan {
             self.any_framed = Some(true);
         }
         self.files.push(FileSlot {
-            // ABSOLUTE, not the caller's spelling. A reopen happens at an
-            // arbitrary later time, and `std::env::set_current_dir` between
-            // construction and that reopen would otherwise resolve a relative
-            // manifest entry against a different directory — a bounded-mode
-            // regression against `main`, where every mmap was established in
-            // the constructor and held, so cwd could not matter. Reproduced on
-            // #536 by codex and confirmed by Cursor Agent and Antigravity.
-            // `absolute` rather than `canonicalize`: it fixes the cwd
-            // dependence without silently resolving symlinks, which would
-            // change which file a repointed link names.
-            path: std::path::absolute(reader.path())
-                .unwrap_or_else(|_| reader.path().to_path_buf()),
+            // Already absolute: `from_paths` resolved it before opening, and
+            // `from_open_readers` is handed readers whose paths the caller
+            // chose. See `absolute_manifest_path`.
+            path: reader.path().to_path_buf(),
             n_obs: reader.n_obs(),
             index: BackedCsrIndex::from_catalog(reader.catalog()),
             // Stamped whenever the registry could reopen at all — which is

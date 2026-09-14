@@ -506,6 +506,7 @@ _PREFETCH_KEYS = {
     "prefetch_skipped_cache_hit",
     "prefetch_skipped_in_flight",
     "prefetch_skipped_block_index",
+    "prefetch_skipped_reader_limit",
 }
 
 

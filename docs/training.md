@@ -594,7 +594,8 @@ Four things to know before setting it:
   a lease on every file it launches work for, so on such a plan it would pin the
   plan's whole width and the cap would stop meaning anything. It stands down
   instead and the gather reads one file at a time, staying inside the cap.
-  `cache_metrics()["prefetch_skipped_reader_limit"]` counts those plans — a
+  `iter.metrics()["prefetch"]["prefetch_skipped_reader_limit"]` counts those
+  plans — a
   non-zero value means the cap and your plan shape are fighting, and the answer
   is a larger `reader_limit` or plans with more file locality.
 - **A file replaced at its path between gathers is refused, not served.** A
