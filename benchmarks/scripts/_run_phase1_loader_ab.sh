@@ -27,11 +27,25 @@
 # `BenchmarkResult` JSONs through `write_result`, which is what the manifest
 # rule requires.
 #
-# FOUR ARMS, in both orders (before, after, after, before). The expected W2
-# effect (>=25%) clears the position effect comfortably, but "clears it" is a
-# claim, and running the orderings back to back is what tests it: if the two
-# before arms disagree with each other by more than the before/after gap, the
-# measurement is host noise and this job's numbers are void.
+# INTERLEAVED ROUNDS, not four blocks. The first version of this job ran
+# before-block then after-block then after-block then before-block, and that
+# design failed exactly as a shared node makes it fail: on a quiet node
+# (GPUCACE) the within-arm spread was ~1% and the signal was clean, while on a
+# contended one (GPU389E, co-tenant array jobs arriving and leaving) the spread
+# reached 7-34% and every verdict but two came back "within noise" -- with the
+# two exceptions disagreeing with the quiet run. Neighbour load drifts on the
+# timescale of a block, so a block design aliases it straight onto the arm.
+#
+# So the arms alternate per REPETITION, and the statistic is paired: each round
+# runs before and after back to back on the same dataset, the ratio is taken
+# WITHIN the round, and the reported figure is the median of those ratios plus a
+# sign test over them. Drift that is slow compared to one round cancels, because
+# it moves both members of a pair together. The within-pair order also flips on
+# alternate rounds, so a systematic first-slot advantage cancels too.
+#
+# This cannot rescue a node so noisy that the effect is below round-to-round
+# variation -- nothing can -- but it reports that honestly as a sign test near
+# 50% rather than as a confident ratio.
 #
 # `PYTHONPATH` selects the arm. Each worktree gets its own
 # `pyscx/python/pyscx/*.so` from its own `maturin develop`, and PYTHONPATH
@@ -75,7 +89,11 @@ AFTER_SHA=$(git -C "$REPO" rev-parse HEAD)
 DATASETS="pbmc3k tabula_sapiens_100k"
 FORMAT_KEY="scx_auto"
 FORMAT_RUNNER="scx_runner"
-N_RUNS=3
+# One timed run per invocation; the repetition that matters is ROUNDS, because
+# only a round boundary alternates the arm. n_runs>1 would just make each
+# block longer and each pair further apart in time.
+N_RUNS=1
+ROUNDS=${ROUNDS:-12}
 
 export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 # The gather arms hold ten batches resident; the cap the harness honours.
@@ -188,78 +206,101 @@ PY
 # ---------------------------------------------------------------------------
 # One arm = one in-process pass over the cells.
 # ---------------------------------------------------------------------------
-cat > "$OUT/run_arm.py" <<'PY'
-"""Run cellset_gather for one arm, in process, writing BenchmarkResult JSONs."""
-import json, os, pathlib, sys
+cat > "$OUT/run_one.py" <<'PY'
+"""Run cellset_gather once, for one arm and one dataset, in process.
+
+Emits one JSON line of the metrics the A/B compares, so the shell can
+accumulate rounds without the two arms ever sharing a process — each has its
+own pyscx extension module, so they cannot coexist in one interpreter.
+"""
+import json, os, pathlib, statistics, sys
 
 from benchmarks.comprehensive.scripts.run_parallel import _run_benchmark
 
-arm = os.environ["ARM_NAME"]
-label = os.environ["ARM_LABEL"]          # arm name + pass number
-out_dir = pathlib.Path(os.environ["ARM_OUT"])
-out_dir.mkdir(parents=True, exist_ok=True)
+METRICS = (
+    "us_per_cell__collate",
+    "cellsets_per_sec__collate_rust",
+    "cellsets_per_sec__gather_random",
+    "cellsets_per_sec__gather_grouped",
+    "cellsets_per_sec__gather_random_s512",
+    "cellsets_per_sec__gather_grouped_s512",
+)
 
-datasets = os.environ["ARM_DATASETS"].split()
-fmt_key = os.environ["ARM_FORMAT_KEY"]
-fmt_runner = os.environ["ARM_FORMAT_RUNNER"]
-n_runs = int(os.environ["ARM_N_RUNS"])
+ds = os.environ["ARM_DATASET"]
+res = _run_benchmark(
+    bench_name="cellset_gather",
+    dataset_name=ds,
+    format_key=os.environ["ARM_FORMAT_KEY"],
+    format_runner=os.environ["ARM_FORMAT_RUNNER"],
+    format_params={"codec": "auto"},
+    n_runs=int(os.environ["ARM_N_RUNS"]),
+    cold_cache=True,
+    converted_path_str=None,
+)
+if res.get("skipped"):
+    sys.exit(f"{ds} was skipped: {res}")
 
-rows = {}
-for ds in datasets:
-    print(f"--- {label}: cellset_gather / {ds} / {fmt_key} ---", flush=True)
-    res = _run_benchmark(
-        bench_name="cellset_gather",
-        dataset_name=ds,
-        format_key=fmt_key,
-        format_runner=fmt_runner,
-        format_params={"codec": "auto"},
-        n_runs=n_runs,
-        cold_cache=True,
-        converted_path_str=None,
-    )
-    if res.get("skipped"):
-        sys.exit(f"{label}: {ds} was skipped — {res}")
-    rows[ds] = res
-    # Copy the raw row out of the shared results dir immediately: the next arm
-    # writes to the same `<benchmark>__<format>__<dataset>.json` path.
-    src = (pathlib.Path(os.environ["ARM_WT"]) / "benchmarks" / "comprehensive"
-           / "results" / "raw" / f"cellset_gather__{fmt_key}__{ds}.json")
-    if not src.exists():
-        sys.exit(f"{label}: no raw row at {src}")
-    (out_dir / src.name).write_bytes(src.read_bytes())
+out = {"arm": os.environ["ARM_NAME"], "round": int(os.environ["ARM_ROUND"]),
+       "dataset": ds}
+for m in METRICS:
+    vals = []
+    for r in res.get("runs", []) or []:
+        v = (r.get("extra") or {}).get(m)
+        if isinstance(v, (int, float)):
+            vals.append(float(v))
+    out[m] = statistics.median(vals) if vals else None
+out["peak_rss_mb_median"] = res.get("peak_rss_mb_median")
 
-(out_dir / "_arm.json").write_text(json.dumps(
-    {"arm": arm, "label": label, "datasets": datasets, "rows": rows}, indent=1, default=str))
-print(f"{label}: wrote {len(rows)} rows to {out_dir}", flush=True)
+pathlib.Path(os.environ["ARM_OUT"]).write_text(json.dumps(out))
+print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
+                  for k, v in out.items()}), flush=True)
 PY
 
-run_arm() {
-    local name="$1" pass="$2"
+run_one() {
+    local name="$1" round="$2" ds="$3"
     local wt="$WORK/wt-$name"
-    local label="${name}${pass}"
 
-    echo ""
-    echo "=== arm $label ==="
-    export ARM_NAME="$name" ARM_LABEL="$label" ARM_WT="$wt"
-    export ARM_OUT="$OUT/raw-$label"
-    export ARM_DATASETS="$DATASETS" ARM_FORMAT_KEY="$FORMAT_KEY"
-    export ARM_FORMAT_RUNNER="$FORMAT_RUNNER" ARM_N_RUNS="$N_RUNS"
+    export ARM_NAME="$name" ARM_ROUND="$round" ARM_WT="$wt" ARM_DATASET="$ds"
+    export ARM_OUT="$OUT/rounds/${ds}__r$(printf '%02d' "$round")__${name}.json"
+    export ARM_FORMAT_KEY="$FORMAT_KEY" ARM_FORMAT_RUNNER="$FORMAT_RUNNER"
+    export ARM_N_RUNS="$N_RUNS"
     # This worktree's pyscx AND this worktree's harness, ahead of everything.
     export PYTHONPATH="$wt/pyscx/python:$wt"
 
     ( cd "$wt" && set -a && . ./.env && set +a \
-      && "$VENV/bin/python" "$OUT/preflight.py" \
-      && "$VENV/bin/python" "$OUT/run_arm.py" ) 2>&1 | tee "$OUT/arm-$label.log"
+      && "$VENV/bin/python" "$OUT/preflight.py" >/dev/null \
+      && "$VENV/bin/python" "$OUT/run_one.py" )
 }
 
-# Both orderings, back to back. If before1 and before2 disagree by more than
-# the before/after gap, this job measured the host, not the change.
-run_arm before 1
-run_arm after  1
-run_arm after  2
-run_arm before 2
+mkdir -p "$OUT/rounds"
+
+# Preflight both builds ONCE and loudly before the timed rounds start. It also
+# runs inside every invocation, silently, as a cheap guard against a PYTHONPATH
+# that stops taking partway through a long job.
+for arm in before after; do
+    ARM_NAME="$arm" ARM_WT="$WORK/wt-$arm" \
+        PYTHONPATH="$WORK/wt-$arm/pyscx/python:$WORK/wt-$arm" \
+        "$VENV/bin/python" "$OUT/preflight.py"
+done
+
+for ds in $DATASETS; do
+    echo ""
+    echo "=== $ds: $ROUNDS interleaved rounds ==="
+    for round in $(seq 1 "$ROUNDS"); do
+        # Flip the within-pair order on alternate rounds, so a first-slot
+        # advantage — page cache left warm by the sibling process, say —
+        # cancels across the pair instead of accruing to one arm.
+        if [ $((round % 2)) -eq 1 ]; then
+            run_one before "$round" "$ds"
+            run_one after  "$round" "$ds"
+        else
+            run_one after  "$round" "$ds"
+            run_one before "$round" "$ds"
+        fi
+    done
+done
 
 echo ""
 echo "=== done ==="
-echo "raw rows : $OUT/raw-{before1,after1,after2,before2}/"
+echo "rounds   : $OUT/rounds/"
 echo "summarise: .venv/bin/python benchmarks/scripts/_phase1_loader_ab_summary.py $OUT"
