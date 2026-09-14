@@ -1244,6 +1244,40 @@ impl FullCatalog {
             .unwrap_or(0)
     }
 
+    /// Sum of [`ShardStats::nnz`] over `entries`, saturating.
+    ///
+    /// Same "an entry without stats contributes 0" rule as
+    /// [`Self::fold_value_max`], and the same consequence: the answer is only as
+    /// complete as the catalog. Saturating because these folds run on catalogs
+    /// read from disk, and a reader must not panic on a hostile one.
+    fn fold_nnz<'a>(entries: impl Iterator<Item = &'a FullCatalogEntry>) -> u64 {
+        entries
+            .filter_map(|e| e.stats.as_ref())
+            .fold(0u64, |acc, s| acc.saturating_add(s.nnz))
+    }
+
+    /// Total stored nonzeros over the CSR `X` shards in scope — every modality
+    /// when `modality_id` is `None`, else just that modality's.
+    ///
+    /// Catalog-only, O(shards), no payload reads. Distinct from the header's
+    /// `nnz` field, which is whole-file and cannot be scoped; a consumer that
+    /// needs "the nnz of the matrix I am about to assemble" — sizing a buffer,
+    /// or deciding an index width — needs this one.
+    pub fn csr_total_nnz(&self, modality_id: Option<u8>) -> u64 {
+        let shards = match modality_id {
+            Some(m) => self.csr_shards_for_modality(m),
+            None => self.csr_shards_sorted(),
+        };
+        Self::fold_nnz(shards.into_iter())
+    }
+
+    /// Total stored nonzeros over the `adata.raw` CSR shards
+    /// ([`SectionType::RawCsrShard`]). Not modality-scoped; raw is a
+    /// single-modality concept. Same semantics as [`Self::csr_total_nnz`].
+    pub fn raw_csr_total_nnz(&self) -> u64 {
+        Self::fold_nnz(self.raw_csr_shards_sorted().into_iter())
+    }
+
     /// Return CSC shard entries sorted by `stats.col_start`. Entries
     /// without stats go at the end.
     pub fn csc_shards_sorted(&self) -> Vec<&FullCatalogEntry> {

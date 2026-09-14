@@ -176,9 +176,24 @@ pub enum ConvertWarning {
     /// will exceed `memory_budget`. The assembly still proceeds; the
     /// warning recommends `to_anndata(backed=True)` or
     /// `pyscx.open(path).query()` for atlas-scale files.
+    ///
+    /// `estimated_bytes` covers **assembly** — `X`, `adata.raw` when it is
+    /// assembled too, and the obs / var metadata — and nothing that reads the
+    /// matrix afterwards. It is a floor on process RSS, not a job size; the
+    /// message says so, because a figure an operator can size a node from is
+    /// the one thing this warning cannot supply.
     EagerAssemblyMemoryHigh {
         estimated_bytes: u64,
         budget_bytes: u64,
+        /// Stored nonzeros in `X` (the estimate's dominant term).
+        nnz: u64,
+        /// `true` when `nnz` is above `i32::MAX`, so the assembled CSR holds
+        /// int64 column indices — 8 of the 12 bytes per nonzero.
+        wide_indices: bool,
+        /// `n_obs × n_vars × 4`, when `container="dense"` would be *smaller*
+        /// than `estimated_bytes`. `None` when it would not be, or when the
+        /// shape overflows.
+        dense_bytes: Option<u64>,
     },
     /// SCX → h5ad export coerced null entries in an obs/var column to a
     /// sentinel value (`0` / `""`) because the column cannot carry a null
@@ -275,6 +290,22 @@ impl ConvertWarning {
     }
 }
 
+/// `2650704199` -> `2,650,704,199`.
+///
+/// A ten-digit run is not a number a reader parses at a glance, and this one is
+/// the term that explains the whole estimate.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl fmt::Display for ConvertWarning {
     /// Human-readable rendering used by `WarningSink::log()`. The
     /// special-cased variant is `PresetNoColumnsMatched`, which earns a
@@ -349,16 +380,41 @@ impl fmt::Display for ConvertWarning {
             Self::EagerAssemblyMemoryHigh {
                 estimated_bytes,
                 budget_bytes,
+                nnz,
+                wide_indices,
+                dense_bytes,
             } => {
                 let gib = 1024.0 * 1024.0 * 1024.0;
-                let est_gb = *estimated_bytes as f64 / gib;
-                let budget_gb = *budget_bytes as f64 / gib;
+                let est = *estimated_bytes as f64 / gib;
+                let budget = *budget_bytes as f64 / gib;
+                // Why it is that big: the index array is two thirds of a wide
+                // matrix's footprint and nothing else surfaces that.
+                let n = group_thousands(*nnz);
+                let why = if *wide_indices {
+                    format!(
+                        " {n} nonzeros at 12 B each: above 2^31 nonzeros scipy holds int64 \
+                         column indices, which is two thirds of that."
+                    )
+                } else {
+                    format!(" {n} nonzeros at 8 B each (int32 column indices).")
+                };
+                let dense = match dense_bytes {
+                    Some(b) => format!(
+                        " container=\"dense\" would be {:.1} GiB here;",
+                        *b as f64 / gib
+                    ),
+                    None => String::new(),
+                };
                 write!(
                     f,
-                    "estimated host assembly ~{est_gb:.1} GB exceeds the {budget_gb:.1} GB \
-                     budget; proceeding (peak host RSS may be high). Pass a smaller \
-                     var_names / obs_filter subset, open with backed=True, or raise \
-                     memory_budget to reduce it."
+                    "estimated host assembly ~{est:.1} GiB exceeds the {budget:.1} GiB budget; \
+                     proceeding (peak host RSS may be high). That estimate covers assembly \
+                     only — X, adata.raw when the read includes it, and obs/var — and excludes \
+                     everything that reads the matrix afterwards, so it is a floor on process \
+                     RSS, not a job size.{why} \
+                     Cheaper routes: open with backed=True, which streams and assembles \
+                     nothing;{dense} or pass a smaller var_names / obs_filter subset. Raising \
+                     memory_budget silences this without changing what it costs."
                 )
             }
             other => write!(f, "{other:?}"),
@@ -505,15 +561,70 @@ mod tests {
         let w = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 25_239_799_332,
             budget_bytes: 8_589_934_592,
+            nnz: 1_000_000_000,
+            wide_indices: false,
+            dense_bytes: None,
         };
         let rendered = format!("{w}");
-        assert!(rendered.contains("23.5 GB"), "{rendered}");
-        assert!(rendered.contains("8.0 GB"), "{rendered}");
+        // The figures are GiB and are labelled GiB. They were computed by
+        // dividing by 1024^3 and printed as "GB", which is how an operator
+        // reads ~39.7 and sizes a node for a job that peaked at 84.76 GiB.
+        assert!(rendered.contains("23.5 GiB"), "{rendered}");
+        assert!(rendered.contains("8.0 GiB"), "{rendered}");
+        assert!(!rendered.contains(" GB"), "{rendered}");
         assert!(rendered.contains("proceeding"), "{rendered}");
         assert!(rendered.contains("backed=True"), "{rendered}");
+        // The scope caveat is the point of the message: this number cannot
+        // size a job, and saying so is the only honest thing it can do.
+        assert!(rendered.contains("assembly only"), "{rendered}");
+        assert!(rendered.contains("not a job size"), "{rendered}");
         // Must NOT leak the debug struct shape.
         assert!(!rendered.contains("EagerAssemblyMemoryHigh"), "{rendered}");
         assert!(!rendered.contains("estimated_bytes"), "{rendered}");
+    }
+
+    #[test]
+    fn group_thousands_groups_from_the_right() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(7), "7");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(12_345), "12,345");
+        assert_eq!(group_thousands(2_650_704_199), "2,650,704,199");
+        assert_eq!(group_thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    /// Above `i32::MAX` nonzeros the message names the int64 promotion and its
+    /// share of the footprint, and offers `container="dense"` when dense is
+    /// genuinely smaller. Below it, neither claim appears — a narrow matrix
+    /// told to go dense would be advised into more memory, not less.
+    #[test]
+    fn eager_assembly_memory_high_names_int64_and_dense_only_when_true() {
+        let wide = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 31_782_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: 2_650_704_199,
+            wide_indices: true,
+            dense_bytes: Some(23_600_000_000),
+        };
+        let rendered = format!("{wide}");
+        assert!(rendered.contains("2,650,704,199 nonzeros"), "{rendered}");
+        assert!(rendered.contains("int64"), "{rendered}");
+        assert!(rendered.contains("12 B each"), "{rendered}");
+        assert!(rendered.contains("container=\"dense\""), "{rendered}");
+        assert!(rendered.contains("22.0 GiB"), "{rendered}");
+
+        let narrow = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 25_239_799_332,
+            budget_bytes: 8_589_934_592,
+            nnz: 1_000_000_000,
+            wide_indices: false,
+            dense_bytes: None,
+        };
+        let rendered = format!("{narrow}");
+        assert!(rendered.contains("8 B each"), "{rendered}");
+        assert!(!rendered.contains("int64"), "{rendered}");
+        assert!(!rendered.contains("dense"), "{rendered}");
     }
 
     #[test]

@@ -76,15 +76,18 @@ def test_csr_data_dtype_matrix(tmp_dir, data_dtype, np_dtype):
     )
 
 
-@pytest.mark.parametrize("index_dtype,np_dtype", [("int16", np.int16), ("int64", np.int64)])
-def test_csr_index_dtype(tmp_dir, index_dtype, np_dtype):
+@pytest.mark.parametrize("index_dtype", ["int16", "int64"])
+def test_csr_index_dtype(tmp_dir, index_dtype):
     adata = _counts_adata()
     path = _write(tmp_dir, adata)
     rt = pyscx.open(path).to_anndata(index_dtype=index_dtype)
-    # scipy may canonicalize index dtype on construction; assert values, and that
-    # the requested dtype is at least honored at build time for int16 (n_vars<32k).
     np.testing.assert_array_equal(rt.X.toarray(), adata.X.toarray())
-    assert rt.X.indices.dtype == np_dtype or rt.X.indices.dtype in (np.int32, np.int64)
+    # Neither width survives on a small matrix, and for the same reason:
+    # `csr_matrix` resolves the index dtype from `max(nnz, n_rows)` and ignores
+    # what it was handed, so int16 is upcast and int64 is *downcast* — both to
+    # int32. The narrow int16 buffer is still built and range-gated on the way
+    # through. See `test_scipy_resolves_the_index_dtype_from_the_contents`.
+    assert rt.X.indices.dtype == np.int32
 
 
 # --------------------------------------------------------------------------
@@ -293,3 +296,114 @@ def test_query_result_default_zero_copy(tmp_dir):
     rt = result.to_anndata()
     assert rt.X.data.dtype == np.float32
     assert rt.X.indices.dtype == np.int32
+
+
+# --------------------------------------------------------------------------
+# Automatic int64 indices above 2**31 nonzeros
+# --------------------------------------------------------------------------
+
+
+def _run_with_threshold(script, threshold):
+    """Run `script` in a child with `SCX_EAGER_INT64_NNZ_THRESHOLD` set.
+
+    A child rather than `monkeypatch`, because the threshold is resolved once
+    per process (`OnceLock`) — a same-process flip would be read after the
+    first eager read had already fixed it.
+    """
+    import os
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        env={**os.environ, "SCX_EAGER_INT64_NNZ_THRESHOLD": str(threshold)},
+    )
+
+
+def test_scipy_resolves_the_index_dtype_from_the_contents():
+    """The premise the auto-widen exists for, pinned against scipy itself.
+
+    `csr_matrix` resolves **one** index dtype for `indices` and `indptr` from
+    `max(nnz, n_rows)`, not from the arrays it was handed. Two consequences,
+    and the widen depends on both:
+
+    * above `i32::MAX` it picks int64, so the int32 `indices` array pyscx hands
+      it is **copied** — while that array is still alive. That is the
+      16.3 B/nnz assembly transient measured on a 2.65e9-nonzero file, and
+      what decoding int64 directly removes.
+    * at or below it, int64 inputs are **downcast** — so widening a matrix that
+      does not need it would *add* a copy. That is why the widen is gated on
+      the same threshold rather than applied whenever it might help.
+
+    Three elements are enough to state the rule; building a real 2**31-nonzero
+    matrix is not an option in a test. If this ever changes, the widen in
+    `to_anndata` stops buying anything and should go.
+    """
+    try:
+        from scipy.sparse._sputils import get_index_dtype
+    except ImportError:  # pragma: no cover - scipy < 1.8 spelling
+        from scipy.sparse.sputils import get_index_dtype
+
+    i32 = (np.array([0, 1], dtype=np.int32), np.array([0], dtype=np.int32))
+    i64 = (np.array([0, 1], dtype=np.int64), np.array([0], dtype=np.int64))
+
+    assert get_index_dtype(i32, maxval=2**31 - 1, check_contents=True) == np.int32
+    assert get_index_dtype(i32, maxval=2**31, check_contents=True) == np.int64
+    # The input width does not enter into it, in either direction.
+    assert get_index_dtype(i64, maxval=1, check_contents=True) == np.int32
+    assert get_index_dtype(i64, maxval=2**31, check_contents=True) == np.int64
+
+
+def test_eager_read_widens_indices_above_the_threshold(tmp_dir):
+    """The widened decode produces the same matrix, value for value.
+
+    No fixture can carry 2**31 nonzeros, so the threshold is lowered instead.
+    That exercises the real typed decode end to end — the reader assembles an
+    int64 index buffer and hands it to scipy — rather than the plan selection
+    alone, which `widen_indices_only_touches_a_default_plan_over_the_line`
+    covers on the Rust side.
+
+    What it cannot assert is `indices.dtype == int64` on the way out: on a
+    fixture this small scipy downcasts it straight back to int32 (see
+    `test_scipy_resolves_the_index_dtype_from_the_contents`). The dtype is only
+    observable above the real threshold, which is what the cluster arm on the
+    2.65e9-nonzero object measures. What *is* observable here, and is the risk
+    a cast introduces, is whether the values and column indices survive it.
+    """
+    adata = _counts_adata(n_obs=60, n_vars=20, seed=3)
+    path = _write(tmp_dir, adata, name="widen.scx")
+
+    control = pyscx.open(path).to_anndata()
+    assert control.X.indices.dtype == np.int32
+
+    out = str(tmp_dir / "widened.npz")
+    _run_with_threshold(
+        f"""
+import numpy as np, pyscx, scipy.sparse as sp
+a = pyscx.open({path!r}).to_anndata()
+assert sp.issparse(a.X) and a.X.format == "csr", a.X
+assert a.X.data.dtype == np.float32, a.X.data.dtype
+sp.save_npz({out!r}, a.X)
+""",
+        0,
+    )
+
+    widened = sp.load_npz(out)
+    assert widened.shape == control.X.shape
+    np.testing.assert_array_equal(widened.indptr, control.X.indptr)
+    np.testing.assert_array_equal(widened.indices, control.X.indices)
+    np.testing.assert_array_equal(widened.data, control.X.data)
+    np.testing.assert_array_equal(widened.toarray(), adata.X.toarray())
+def test_widen_leaves_an_explicit_index_dtype_alone(tmp_dir):
+    """An explicit `index_dtype=` is the caller's decision, threshold or not."""
+    adata = _counts_adata(n_obs=30, n_vars=10, seed=4)
+    path = _write(tmp_dir, adata, name="explicit.scx")
+    _run_with_threshold(
+        f"""
+import numpy as np, pyscx
+a = pyscx.open({path!r}).to_anndata(index_dtype="int32")
+assert a.X.indices.dtype == np.int32, a.X.indices.dtype
+""",
+        0,
+    )
