@@ -341,7 +341,11 @@ def test_var_names_shrinks_the_eager_assembly_estimate(tmp_dir):
     )
     exp = pyscx.open(path)
     # A budget under the full estimate and (comfortably) over 1/2000th of it.
-    budget = exp.nnz * 16 // 2
+    # 8 B/nnz is what the assembled CSR costs below 2**31 nonzeros (f32 values +
+    # int32 column indices); above that scipy holds int64 indices and it is 12.
+    # Deriving it rather than hard-coding a constant keeps this arm honest if
+    # the per-nonzero cost moves again.
+    budget = exp.nnz * 8 // 2
 
     with pytest.warns(UserWarning, match="eager_assembly_memory_high"):
         pyscx.open(path).to_anndata(memory_budget=budget)

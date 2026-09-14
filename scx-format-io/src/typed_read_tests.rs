@@ -798,3 +798,166 @@ fn dense_scatter_rejects_an_index_the_seam_bound_let_through() {
         other => panic!("wrong arm: {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------------
+// Parallel typed assembly
+// -----------------------------------------------------------------------
+
+/// A shard whose rows carry a *varying* number of nonzeros, with distinct
+/// nonzero values.
+///
+/// Both properties are load-bearing for the carve-up the parallel assembler
+/// depends on: with a uniform nnz per row a shard's nnz is recoverable from its
+/// row count, so a chunk sized from the wrong shard still lands correctly; and a
+/// value of `0` is indistinguishable from an untouched slot in a freshly zeroed
+/// buffer, which is exactly what a mis-sized chunk leaves behind. Same reasoning
+/// as `irregular_row` on the f32 side.
+///
+/// `cfg`-gated with its only consumer: without `parallel` there is no `Parallel`
+/// arm to compare against, so an ungated helper is dead code under `-D warnings`
+/// on the `--no-default-features` clippy legs.
+#[cfg(feature = "parallel")]
+fn irregular_u8_shard(n_rows: usize, n_vars: usize, row_start: u64, val_base: u8) -> ShardSpec {
+    let mut indptr = vec![0u64];
+    let mut indices = Vec::new();
+    let mut values = Vec::new();
+    for row in 0..n_rows {
+        let global = row_start as usize + row;
+        let nnz = (global % 4) + 1;
+        let mut cols: Vec<u32> = (0..nnz)
+            .map(|k| ((global + k * 3) % n_vars) as u32)
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        for (k, col) in cols.iter().enumerate() {
+            indices.push(*col);
+            values.push(val_base.wrapping_add((global * 7 + k * 3) as u8) | 1);
+        }
+        indptr.push(indptr.last().unwrap() + cols.len() as u64);
+    }
+    (indptr, indices, values, ValueEncoding::Uint8, row_start)
+}
+
+/// Fanning the typed assembly's writes across threads must not reorder or
+/// overlap them: `Parallel` and `Sequential` produce byte-identical `indptr` /
+/// `indices` / `values`.
+///
+/// Not a differential between two implementations — there is one, and the
+/// strategy is its only parameter. What it pins is the `chunks_mut` carve-up,
+/// which is the whole reason the loop can be fanned out at all: every shard
+/// writes only the region its own `(n_rows, nnz)` claims, and those regions tile
+/// the allocation exactly.
+#[test]
+#[cfg(feature = "parallel")]
+fn typed_parallel_matches_sequential() {
+    use crate::reader::RowMajorStrategy;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n_vars = 24usize;
+    // Five shards of *differing* row counts, so the indptr carve (shard 0 takes
+    // n_rows + 1, the rest n_rows) cannot be satisfied by a uniform stride.
+    let row_counts = [7usize, 3, 11, 5, 9];
+    let mut shards = Vec::new();
+    let mut row_start = 0u64;
+    for (i, &rows) in row_counts.iter().enumerate() {
+        shards.push(irregular_u8_shard(rows, n_vars, row_start, (i * 13) as u8));
+        row_start += rows as u64;
+    }
+    let n_obs = row_start as usize;
+    let path = write_file(&dir, "typed_par_seq.scx", n_obs, n_vars, &shards);
+
+    let reader = ScxReader::open(&path).unwrap();
+    let entries = reader.catalog().shards_sorted();
+    assert_eq!(
+        entries.len(),
+        row_counts.len(),
+        "fixture must be multi-shard"
+    );
+
+    // i64 indices + f64 values: the widest arms, so a chunk boundary computed in
+    // elements rather than bytes (or vice versa) cannot cancel out.
+    let plan = MaterializePlan {
+        container: Container::Csr,
+        data_dtype: ValueDtype::F64,
+        index_dtype: IndexDtype::I64,
+        allow_lossy: false,
+    };
+
+    let sequential = reader
+        .assemble_shards_typed_with(&entries, n_vars, &plan, RowMajorStrategy::Sequential)
+        .unwrap();
+    let parallel = reader
+        .assemble_shards_typed_with(&entries, n_vars, &plan, RowMajorStrategy::Parallel)
+        .unwrap();
+
+    assert_eq!(sequential.shape, parallel.shape);
+    assert_eq!(sequential.indptr, parallel.indptr);
+    match (&sequential.indices, &parallel.indices) {
+        (IndexBuffer::I64(a), IndexBuffer::I64(b)) => assert_eq!(a, b, "indices differ"),
+        _ => panic!("expected I64 index arms"),
+    }
+    match (&sequential.values, &parallel.values) {
+        (ValueBuffer::F64(a), ValueBuffer::F64(b)) => assert_eq!(a, b, "values differ"),
+        _ => panic!("expected F64 value arms"),
+    }
+
+    // And both agree with the f32 assembler, so "identical" is not "identically
+    // wrong" — a carve that dropped the last shard would agree with itself.
+    let f32_csr = reader.read_all_csr_shards().unwrap();
+    assert_eq!(parallel.indptr, f32_csr.indptr);
+    let want_ix: Vec<i64> = checked_cast_indices(&f32_csr.indices, false).unwrap();
+    let want_v: Vec<f64> = checked_cast_values(&f32_csr.data, false).unwrap();
+    match (&parallel.indices, &parallel.values) {
+        (IndexBuffer::I64(ix), ValueBuffer::F64(v)) => {
+            assert_eq!(ix, &want_ix);
+            assert_eq!(v, &want_v);
+        }
+        _ => panic!("wrong buffer arms"),
+    }
+    assert!(
+        want_v.iter().all(|v| *v != 0.0),
+        "fixture must have no zero values, or an unwritten slot reads as correct"
+    );
+}
+
+/// The fan-out is bounded by bytes in flight, not by the pool's width.
+///
+/// Each task materializes one whole shard's native buffers, so an unbounded
+/// `into_par_iter` over 59 shards on a 64-thread pool holds all 59 at once —
+/// measured as +6.3 GiB of process high-water on a 2.65e9-nnz file, and zero at
+/// 4 threads. The window is computed from the widest shard because rayon may
+/// run any subset of a batch simultaneously.
+#[test]
+#[cfg(feature = "parallel")]
+fn the_in_flight_window_is_sized_from_the_widest_shard() {
+    use crate::typed_read::{in_flight_batches, native_shard_bytes, IN_FLIGHT_NATIVE_BUDGET_BYTES};
+
+    // 4 B of index + 4 B of value per nonzero, plus this shard's own i64 indptr.
+    assert_eq!(native_shard_bytes((10, 100)), 100 * 8 + 11 * 8);
+
+    // Shards small enough that the budget does not bind: one batch.
+    let small = vec![(1_000usize, 1_000usize); 8];
+    let batches = in_flight_batches((0..8).collect::<Vec<_>>(), &small);
+    assert_eq!(batches.len(), 1, "a small shard list must not be split");
+    assert_eq!(batches[0].len(), 8);
+
+    // One shard at just under half the budget: two at a time, so four batches of
+    // two. (`- 8` leaves room for the shard's own one-element indptr, which
+    // `native_shard_bytes` also counts — at exactly half it is one over and the
+    // window collapses to 1, which is the boundary being pinned.)
+    let half = ((IN_FLIGHT_NATIVE_BUDGET_BYTES / 2 - 8) / 8) as usize;
+    let big = vec![(0usize, half); 8];
+    let batches = in_flight_batches((0..8).collect::<Vec<_>>(), &big);
+    assert_eq!(batches.len(), 4);
+    assert!(batches.iter().all(|b| b.len() == 2), "{batches:?}");
+
+    // The indices survive the regrouping, in order — they select the shard.
+    let flat: Vec<usize> = batches.iter().flatten().map(|(i, _)| *i).collect();
+    assert_eq!(flat, (0..8).collect::<Vec<_>>());
+
+    // A single shard larger than the whole budget still gets decoded.
+    let huge = vec![(0usize, IN_FLIGHT_NATIVE_BUDGET_BYTES as usize); 3];
+    let batches = in_flight_batches((0..3).collect::<Vec<_>>(), &huge);
+    assert_eq!(batches.len(), 3);
+    assert!(batches.iter().all(|b| b.len() == 1));
+}

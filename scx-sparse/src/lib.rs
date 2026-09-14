@@ -14,8 +14,8 @@ pub use csr::{
     total_variance_from_col_sq, CsrError, ScxCsr,
 };
 pub use materialize::{
-    Container, IndexBuffer, IndexDtype, MaterializePlan, TypedCsr, TypedDense, ValueBuffer,
-    ValueDtype,
+    split_into_chunks_mut, Container, IndexBuffer, IndexDtype, IndexSliceMut, MaterializePlan,
+    TypedCsr, TypedDense, ValueBuffer, ValueDtype, ValueSliceMut,
 };
 pub use moments::{
     closed_form_variance_health, closed_form_variance_unstable, finalize_column_moments,

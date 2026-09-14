@@ -1786,3 +1786,61 @@ fn value_max_folds_treat_missing_stats_as_zero() {
     assert_eq!(empty.csr_max_value(None), 0);
     assert_eq!(empty.raw_csr_max_value(), 0);
 }
+
+/// A catalog entry carrying a chosen `nnz` (or no stats at all).
+fn nnz_entry(
+    name: &str,
+    stype: SectionType,
+    modality_id: u8,
+    nnz: Option<u64>,
+) -> FullCatalogEntry {
+    FullCatalogEntry {
+        modality_id,
+        stats: nnz.map(|n| ShardStats {
+            nnz: n,
+            ..sample_stats()
+        }),
+        ..sample_full_entry(name, stype, false)
+    }
+}
+
+#[test]
+fn csr_total_nnz_scopes_by_modality_and_section_family() {
+    let cat = catalog_with(vec![
+        nnz_entry("rna/X_shard_0", SectionType::CsrShard, 0, Some(10)),
+        nnz_entry("rna/X_shard_1", SectionType::CsrShard, 0, Some(7)),
+        nnz_entry("atac/X_shard_0", SectionType::CsrShard, 1, Some(100)),
+        // Neither of these belongs to the X fold, and X does not belong to raw's.
+        nnz_entry("raw/X_shard_0", SectionType::RawCsrShard, 0, Some(1_000)),
+        nnz_entry(
+            "layer/rna/counts/shard_0",
+            SectionType::LayerCsrShard,
+            0,
+            Some(2_000),
+        ),
+    ]);
+    assert_eq!(cat.csr_total_nnz(None), 117);
+    assert_eq!(cat.csr_total_nnz(Some(0)), 17);
+    assert_eq!(cat.csr_total_nnz(Some(1)), 100);
+    assert_eq!(cat.csr_total_nnz(Some(2)), 0);
+    assert_eq!(cat.raw_csr_total_nnz(), 1_000);
+}
+
+/// A stats-less entry contributes 0 rather than poisoning the sum, and the fold
+/// saturates instead of overflowing on a catalog that claims impossible sizes —
+/// a reader must not panic on a hostile file.
+#[test]
+fn nnz_folds_skip_missing_stats_and_saturate() {
+    let cat = catalog_with(vec![
+        nnz_entry("X_shard_0", SectionType::CsrShard, 0, Some(5)),
+        nnz_entry("X_shard_1", SectionType::CsrShard, 0, None),
+    ]);
+    assert_eq!(cat.csr_total_nnz(None), 5);
+    assert_eq!(cat.raw_csr_total_nnz(), 0);
+
+    let hostile = catalog_with(vec![
+        nnz_entry("X_shard_0", SectionType::CsrShard, 0, Some(u64::MAX)),
+        nnz_entry("X_shard_1", SectionType::CsrShard, 0, Some(u64::MAX)),
+    ]);
+    assert_eq!(hostile.csr_total_nnz(None), u64::MAX);
+}

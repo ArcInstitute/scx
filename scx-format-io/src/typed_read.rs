@@ -2,10 +2,16 @@
 //!
 //! Assembles a whole-matrix CSR (or dense) **directly at the caller's target
 //! dtype**, never allocating the intermediate full-matrix `f32` [`ScxCsr`] the
-//! default read path builds. Each shard is still decoded one-at-a-time, but to
-//! its *native* stream (integer shards → `u32`, float shards → `f32`) and cast
-//! straight into the target-width buffer via the fail-loud cast gate
-//! (`scx_codec::checked_cast_*_into`). Two consequences:
+//! default read path builds. Each shard is decoded to its *native* stream
+//! (integer shards → `u32`, float shards → `f32`) and cast straight into the
+//! target-width buffer via the fail-loud cast gate
+//! (`scx_codec::checked_cast_*_into`), on the same rayon fan-out the `f32`
+//! assembler uses — the output buffers are carved into per-shard exclusive
+//! slices (`IndexBuffer::chunks_mut` / `ValueBuffer::chunks_mut`) before the
+//! loop starts, so the borrow checker proves the regions disjoint and the
+//! fan-out needs no `unsafe`. The carve resolves the runtime dtype once per
+//! buffer; the per-shard fill still matches the slice enum, exactly as the
+//! range-taking form always did. Two consequences:
 //!
 //! - **Peak-RSS drop** — a narrow `data_dtype="uint16"` read allocates the value
 //!   buffer at 2 B/nnz, not 4 B/nnz (f32) + a 2 B/nnz cast copy.
@@ -23,12 +29,18 @@ use scx_codec::{
     checked_cast_f32_into, checked_cast_u32_into, guard_decode_loss_for, ShardValuesNative,
 };
 use scx_sparse::{
-    IndexBuffer, IndexDtype, MaterializePlan, TypedCsr, TypedDense, ValueBuffer, ValueDtype,
+    split_into_chunks_mut, IndexBuffer, IndexDtype, IndexSliceMut, MaterializePlan, TypedCsr,
+    TypedDense, ValueBuffer, ValueDtype, ValueSliceMut,
 };
 
 use crate::catalog::FullCatalogEntry;
 use crate::error::{Result, ScxError};
-use crate::reader::{check_decoded_lengths, plan_row_major_layout, ScxReader, X_LABELS};
+use crate::reader::{
+    check_decoded_lengths, plan_row_major_layout, RowMajorStrategy, ScxReader, X_LABELS,
+};
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 impl ScxReader {
     /// Read the whole `X` matrix as a [`TypedCsr`] materialized directly at
@@ -92,8 +104,9 @@ impl ScxReader {
     /// f32 path can fall back to the assembled shard extent).
     ///
     /// `plan.index_dtype` narrows the returned [`TypedCsr`]'s index buffer, but is
-    /// effectively a **no-op for a Python CSR** consumer: scipy upcasts `int16 →
-    /// int32` on `csr_matrix` construction (see `docs/api.md`).
+    /// effectively a **no-op for a Python CSR** consumer whose matrix fits in
+    /// int32: scipy resolves the width from `max(nnz, n_rows)` and canonicalizes
+    /// in both directions on `csr_matrix` construction (see `docs/api.md`).
     pub fn read_all_csr_shards_for_typed(
         &self,
         modality_id: u8,
@@ -123,14 +136,47 @@ impl ScxReader {
         self.assemble_shards_typed(&shards, self.n_vars() as usize, plan)
     }
 
-    /// Shared sequential typed assembly: pre-size from catalog stats, decode each
-    /// shard to native, cast into the target-width slices. Unfiltered (callers
-    /// apply deletion vectors as needed).
+    /// Unreachable given the prefix sums the carve is built from, but a
+    /// returned error rather than a panic: readers return errors on malformed
+    /// input, and a catalog whose stats disagree between the two sums is
+    /// malformed input.
+    fn typed_split_overflow(buffer: &str) -> ScxError {
+        ScxError::InvalidCatalog(format!(
+            "{}: {buffer} output regions do not tile the allocation implied by catalog stats",
+            X_LABELS.shard
+        ))
+    }
+
+    /// Shared typed assembly: pre-size from catalog stats, decode each shard to
+    /// native, cast into the target-width slices. Unfiltered (callers apply
+    /// deletion vectors as needed).
+    ///
+    /// Runs on this build's default strategy — parallel when the `parallel`
+    /// feature is on, exactly as the `f32` assembler does.
     fn assemble_shards_typed(
         &self,
         shards: &[&FullCatalogEntry],
         n_cols: usize,
         plan: &MaterializePlan,
+    ) -> Result<TypedCsr> {
+        self.assemble_shards_typed_with(shards, n_cols, plan, RowMajorStrategy::for_build())
+    }
+
+    /// [`assemble_shards_typed`](Self::assemble_shards_typed) with an explicit
+    /// strategy.
+    ///
+    /// The strategy is a parameter rather than a `#[cfg]` for the same reason it
+    /// is on `assemble_row_major`: `typed_parallel_matches_sequential` runs both
+    /// arms against one file. The differential does not prove two
+    /// implementations agree — there is one — but that fanning the writes across
+    /// threads neither reorders nor overlaps them, which is the property the
+    /// `chunks_mut` carve-up is responsible for.
+    pub(crate) fn assemble_shards_typed_with(
+        &self,
+        shards: &[&FullCatalogEntry],
+        n_cols: usize,
+        plan: &MaterializePlan,
+        strategy: RowMajorStrategy,
     ) -> Result<TypedCsr> {
         if shards.is_empty() {
             return Ok(TypedCsr::new_unchecked(
@@ -161,16 +207,77 @@ impl ScxReader {
         // the fill helpers is the real guarantee.
         guard_decode_loss_dtype(max_value, plan.data_dtype, plan.allow_lossy)?;
 
+        // Hint aggressive readahead across the shard region, as the f32
+        // assembler does — same shards, same access pattern. Entirely checked
+        // and silent on failure: these are raw catalog values, so `offset +
+        // length` on a hostile catalog must not overflow here (`section_bytes`
+        // rejects the bad entry a moment later, which is where it belongs).
+        #[cfg(unix)]
+        {
+            let min_offset = shards.iter().map(|e| e.offset).min().unwrap_or(0);
+            let max_end = shards
+                .iter()
+                .filter_map(|e| e.offset.checked_add(e.length))
+                .max()
+                .unwrap_or(0);
+            if let (Ok(start), Some(len)) = (
+                usize::try_from(min_offset),
+                max_end
+                    .checked_sub(min_offset)
+                    .and_then(|n| usize::try_from(n).ok()),
+            ) {
+                self.advise_sequential(start, len);
+            }
+        }
+
+        // Per-shard cumulative nnz, needed to rebase each shard's indptr once
+        // the fill no longer runs in order.
+        let mut nnz_offsets = Vec::with_capacity(shard_sizes.len());
+        let mut running = 0usize;
+        for &(_, nnz) in &shard_sizes {
+            nnz_offsets.push(running);
+            running += nnz;
+        }
+
         let mut indptr = vec![0i64; total_rows + 1];
         let mut indices = IndexBuffer::zeroed(plan.index_dtype, total_nnz);
         let mut values = ValueBuffer::zeroed(plan.data_dtype, total_nnz);
 
-        let mut cum_rows = 0usize;
-        let mut cum_nnz = 0usize;
+        // Carve the outputs into per-shard exclusive slices up front, exactly as
+        // `assemble_row_major` does: shard 0 takes `n_rows + 1` indptr slots (it
+        // owns the leading 0), every later shard takes `n_rows` and lands at
+        // `row_offset + 1`. The sizes sum to the buffer lengths by construction
+        // of `total_rows` / `total_nnz`, so a `None` here means catalog stats
+        // drifted between the two sums — a returned error, never a panic.
+        let ip_sizes: Vec<usize> = shard_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &(n_rows, _))| if i == 0 { n_rows + 1 } else { n_rows })
+            .collect();
+        let nnz_sizes: Vec<usize> = shard_sizes.iter().map(|&(_, nnz)| nnz).collect();
+        let ip_chunks = split_into_chunks_mut(&mut indptr, &ip_sizes)
+            .ok_or_else(|| Self::typed_split_overflow("indptr"))?;
+        let ix_chunks = indices
+            .chunks_mut(&nnz_sizes)
+            .ok_or_else(|| Self::typed_split_overflow("indices"))?;
+        let val_chunks = values
+            .chunks_mut(&nnz_sizes)
+            .ok_or_else(|| Self::typed_split_overflow("values"))?;
 
-        for (i, entry) in shards.iter().enumerate() {
+        let chunks: Vec<_> = ip_chunks
+            .into_iter()
+            .zip(ix_chunks)
+            .zip(val_chunks)
+            .map(|((ip, ix), val)| (ip, ix, val))
+            .collect();
+
+        let decode_into = &|(i, (ip_out, ix_out, val_out)): (
+            usize,
+            (&mut [i64], IndexSliceMut<'_>, ValueSliceMut<'_>),
+        )|
+         -> Result<()> {
             let (n_rows, nnz) = shard_sizes[i];
-            let (shard_ip, shard_ix, shard_vals) = self.read_shard_from_entry_native(entry)?;
+            let (shard_ip, shard_ix, shard_vals) = self.read_shard_from_entry_native(shards[i])?;
 
             // Decoded-vs-catalog length checks (returned errors, not asserts —
             // a stat-drifted catalog must not panic the slice writes below).
@@ -185,22 +292,43 @@ impl ScxReader {
                 native_values_len(&shard_vals),
             )?;
 
-            let range = cum_nnz..cum_nnz + nnz;
-            cast_native_indices_into(&mut indices, range.clone(), &shard_ix, plan.allow_lossy)?;
-            cast_native_values_into(&mut values, range, &shard_vals, plan.allow_lossy)?;
+            cast_native_indices_into_slice(ix_out, &shard_ix, plan.allow_lossy)?;
+            cast_native_values_into_slice(val_out, &shard_vals, plan.allow_lossy)?;
 
-            // Rebase indptr with the cumulative nnz offset.
+            // Shard 0 owns indptr[0] and copies its decoded indptr verbatim (its
+            // nnz offset is 0); every later shard copies `[1..]` rebased by the
+            // running nnz.
             if i == 0 {
-                indptr[0..n_rows + 1].copy_from_slice(&shard_ip);
+                ip_out.copy_from_slice(&shard_ip);
             } else {
-                let nnz_off_i64 = cum_nnz as i64;
-                for j in 0..n_rows {
-                    indptr[cum_rows + 1 + j] = shard_ip[j + 1] + nnz_off_i64;
+                let nnz_off_i64 = nnz_offsets[i] as i64;
+                for (slot, &src) in ip_out.iter_mut().zip(&shard_ip[1..]) {
+                    *slot = src + nnz_off_i64;
                 }
             }
+            Ok(())
+        };
 
-            cum_rows += n_rows;
-            cum_nnz += nnz;
+        match strategy {
+            #[cfg(feature = "parallel")]
+            RowMajorStrategy::Parallel => {
+                // Bounded fan-out, not a free-for-all. Each task first
+                // materializes one *whole* shard's native buffers
+                // (`read_shard_from_entry_native`), and a pool at least as wide
+                // as the shard count starts every one of them — turning the
+                // serial path's one-shard transient into an all-shards-at-once
+                // one. Measured on a 59-shard, 2.65e9-nnz file: +6.3 GiB of
+                // process high-water at 64 threads, and none of it at 4. These
+                // are the reads a caller asks for *because* they want less
+                // memory, so the concurrency is capped by bytes in flight
+                // rather than left to the pool's width.
+                for batch in in_flight_batches(chunks, &shard_sizes) {
+                    batch.into_par_iter().try_for_each(decode_into)?;
+                }
+            }
+            RowMajorStrategy::Sequential => {
+                chunks.into_iter().enumerate().try_for_each(decode_into)?
+            }
         }
 
         let n_rows = indptr.len().saturating_sub(1);
@@ -252,6 +380,68 @@ impl ScxReader {
     }
 }
 
+/// Bytes of *native* decode buffers a single shard holds while it is being cast
+/// into its slice: `u32` indices and `u32`/`f32` values at 4 B each, plus the
+/// shard's own `i64` indptr.
+///
+/// This is what the fan-out has to bound. The output buffers are pre-sized and
+/// carved before the loop, so they are not concurrency-dependent; only these
+/// are.
+///
+/// `cfg`-gated with its only consumer, like the fixture in `typed_read_tests.rs`
+/// — without `parallel` there is no fan-out to bound and it is dead code under
+/// the `--no-default-features` clippy legs.
+#[cfg(feature = "parallel")]
+pub(crate) fn native_shard_bytes((n_rows, nnz): (usize, usize)) -> u64 {
+    (nnz as u64)
+        .saturating_mul(8)
+        .saturating_add((n_rows as u64).saturating_add(1).saturating_mul(8))
+}
+
+/// In-flight budget for concurrent native shard decodes.
+///
+/// Not the pool width and not a thread count: the cost that scales with
+/// concurrency is the native buffers, and shards differ in size by orders of
+/// magnitude across files. 2 GiB is large enough that an ordinary shard list
+/// runs at full width (a 64 MB shard gives a window of 32) and small enough that
+/// an atlas-scale one cannot hold every shard at once — on the 59-shard,
+/// 2.65e9-nnz file this was measured against, ~360 MB per shard gives a window
+/// of 5 rather than 59.
+#[cfg(feature = "parallel")]
+pub(crate) const IN_FLIGHT_NATIVE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Split the carved per-shard chunks into consecutive batches whose in-flight
+/// native decode buffers stay under [`IN_FLIGHT_NATIVE_BUDGET_BYTES`].
+///
+/// Sized from the **largest** shard in the list rather than a running sum:
+/// rayon may schedule any subset of a batch simultaneously, so a batch is only
+/// as safe as its worst member. At least one shard per batch, always — a single
+/// shard over the budget has to be decoded regardless, and refusing would make
+/// a legal file unreadable.
+#[cfg(feature = "parallel")]
+pub(crate) fn in_flight_batches<T>(
+    chunks: Vec<T>,
+    shard_sizes: &[(usize, usize)],
+) -> Vec<Vec<(usize, T)>> {
+    let widest = shard_sizes
+        .iter()
+        .map(|&s| native_shard_bytes(s))
+        .max()
+        .unwrap_or(0);
+    let window = (IN_FLIGHT_NATIVE_BUDGET_BYTES / widest.max(1)).max(1) as usize;
+    let mut batches: Vec<Vec<(usize, T)>> = Vec::new();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        if i % window == 0 {
+            batches.push(Vec::with_capacity(window));
+        }
+        batches
+            .last_mut()
+            .expect("a batch was pushed on the first iteration")
+            .push((i, chunk));
+    }
+    batches
+}
+
 /// The `value_max` decode-loss guard, dispatched from the runtime
 /// [`ValueDtype`] to the generic `scx_codec::guard_decode_loss_for::<T>`
 /// (scx-codec can't see `ValueDtype`): fails loud iff the shards' `max_value`
@@ -298,10 +488,28 @@ pub fn cast_native_indices_into(
     src: &[u32],
     allow_lossy: bool,
 ) -> Result<()> {
+    cast_native_indices_into_slice(dst.slice_mut(range), src, allow_lossy)
+}
+
+/// [`cast_native_indices_into`] against a pre-carved slice rather than a
+/// `(buffer, range)` pair.
+///
+/// The whole-matrix assembler carves its output once and hands each shard its
+/// own disjoint chunk, so it cannot hold the `&mut IndexBuffer` the range form
+/// needs — two shards would need it at the same time. Both forms narrow through
+/// the same gate because one calls the other.
+///
+/// `pub(crate)`: the crate root re-exports only the range forms, and the one
+/// out-of-crate consumer (`scx-engine`'s typed collect) uses those.
+pub(crate) fn cast_native_indices_into_slice(
+    dst: IndexSliceMut<'_>,
+    src: &[u32],
+    allow_lossy: bool,
+) -> Result<()> {
     match dst {
-        IndexBuffer::I16(v) => checked_cast_u32_into::<i16>(src, &mut v[range], allow_lossy)?,
-        IndexBuffer::I32(v) => checked_cast_u32_into::<i32>(src, &mut v[range], allow_lossy)?,
-        IndexBuffer::I64(v) => checked_cast_u32_into::<i64>(src, &mut v[range], allow_lossy)?,
+        IndexSliceMut::I16(v) => checked_cast_u32_into::<i16>(src, v, allow_lossy)?,
+        IndexSliceMut::I32(v) => checked_cast_u32_into::<i32>(src, v, allow_lossy)?,
+        IndexSliceMut::I64(v) => checked_cast_u32_into::<i64>(src, v, allow_lossy)?,
     }
     Ok(())
 }
@@ -317,15 +525,28 @@ pub fn cast_native_values_into(
     src: &ShardValuesNative,
     allow_lossy: bool,
 ) -> Result<()> {
+    cast_native_values_into_slice(dst.slice_mut(range), src, allow_lossy)
+}
+
+/// [`cast_native_values_into`] against a pre-carved slice. Same reason as
+/// [`cast_native_indices_into_slice`]; one line per value dtype, both source
+/// variants generated by the macro.
+///
+/// `pub(crate)` for the same reason as the index form.
+pub(crate) fn cast_native_values_into_slice(
+    dst: ValueSliceMut<'_>,
+    src: &ShardValuesNative,
+    allow_lossy: bool,
+) -> Result<()> {
     macro_rules! value_arms {
         ($( $arm:ident => $ty:ty ),* $(,)?) => {
             match (dst, src) {
                 $(
-                    (ValueBuffer::$arm(v), ShardValuesNative::U32(s)) => {
-                        checked_cast_u32_into::<$ty>(s, &mut v[range.clone()], allow_lossy)?
+                    (ValueSliceMut::$arm(v), ShardValuesNative::U32(s)) => {
+                        checked_cast_u32_into::<$ty>(s, v, allow_lossy)?
                     }
-                    (ValueBuffer::$arm(v), ShardValuesNative::F32(s)) => {
-                        checked_cast_f32_into::<$ty>(s, &mut v[range.clone()], allow_lossy)?
+                    (ValueSliceMut::$arm(v), ShardValuesNative::F32(s)) => {
+                        checked_cast_f32_into::<$ty>(s, v, allow_lossy)?
                     }
                 )*
             }

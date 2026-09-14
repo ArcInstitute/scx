@@ -176,9 +176,50 @@ pub enum ConvertWarning {
     /// will exceed `memory_budget`. The assembly still proceeds; the
     /// warning recommends `to_anndata(backed=True)` or
     /// `pyscx.open(path).query()` for atlas-scale files.
+    ///
+    /// `estimated_bytes` covers **assembly** — `X`, `adata.raw` when it is
+    /// assembled too, and the obs / var metadata — and nothing that reads the
+    /// matrix afterwards. It is a floor on process RSS, not a job size; the
+    /// message says so, because a figure an operator can size a node from is
+    /// the one thing this warning cannot supply.
     EagerAssemblyMemoryHigh {
         estimated_bytes: u64,
         budget_bytes: u64,
+        /// Stored nonzeros in the `X` this call assembles, and the estimate's
+        /// dominant term.
+        ///
+        /// `None` when it assembles **no host `X`** at all — `to_gpu_anndata`'s
+        /// device path decodes straight to the GPU, so a warning it triggers is
+        /// about `adata.raw` and the metadata, and explaining it in nonzeros
+        /// would describe a buffer that is never built.
+        nnz: Option<u64>,
+        /// Bytes per value in the assembled matrix, from the caller's
+        /// `data_dtype`. The message derives its per-nonzero figure from this
+        /// and `index_bytes` rather than assuming `f32`: a `float64` read is
+        /// 12 B/nnz below the int64 line and 16 above it, not 8 and 12.
+        value_bytes: u64,
+        /// Bytes per column index: `Some(4)` or `Some(8)` for a CSR read —
+        /// scipy's choice, from `max(nnz, n_rows)`, not the caller's.
+        ///
+        /// `None` means the message must not claim a width. Two cases: a
+        /// `container="dense"` request, which has no index array at all; and a
+        /// file with **deletion vectors**, where `nnz` is physical and scipy
+        /// decides from the live count, which the catalog cannot supply.
+        index_bytes: Option<u64>,
+        /// The `(rows, columns)` a dense request will actually allocate, when
+        /// the caller asked for `container="dense"`.
+        ///
+        /// The **shape the estimate used**, not the file's: under a `var_names`
+        /// projection it is the selected column count, and a message that
+        /// printed `n_vars` there would explain a ~2 GB estimate as an 8 GB
+        /// buffer.
+        dense_shape: Option<(u64, u64)>,
+        /// `n_obs × n_vars × value_bytes`, when `container="dense"` would be
+        /// smaller than the **sparse `X` term alone** — not than
+        /// `estimated_bytes`, which also carries `adata.raw` and the metadata,
+        /// and raw is assembled either way. `None` when it would not be, when
+        /// this call assembles no host CSR `X`, or when the product saturates.
+        dense_bytes: Option<u64>,
     },
     /// SCX → h5ad export coerced null entries in an obs/var column to a
     /// sentinel value (`0` / `""`) because the column cannot carry a null
@@ -275,6 +316,22 @@ impl ConvertWarning {
     }
 }
 
+/// `2650704199` -> `2,650,704,199`.
+///
+/// A ten-digit run is not a number a reader parses at a glance, and this one is
+/// the term that explains the whole estimate.
+fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl fmt::Display for ConvertWarning {
     /// Human-readable rendering used by `WarningSink::log()`. The
     /// special-cased variant is `PresetNoColumnsMatched`, which earns a
@@ -349,16 +406,77 @@ impl fmt::Display for ConvertWarning {
             Self::EagerAssemblyMemoryHigh {
                 estimated_bytes,
                 budget_bytes,
+                nnz,
+                value_bytes,
+                index_bytes,
+                dense_shape,
+                dense_bytes,
             } => {
                 let gib = 1024.0 * 1024.0 * 1024.0;
-                let est_gb = *estimated_bytes as f64 / gib;
-                let budget_gb = *budget_bytes as f64 / gib;
+                let est = *estimated_bytes as f64 / gib;
+                let budget = *budget_bytes as f64 / gib;
+                // Why it is that big: the index array is two thirds of a wide
+                // matrix's footprint and nothing else surfaces that.
+                // Every figure here is derived from the plan the estimate was
+                // priced with, and from the shape it used. Hard-coding widths or
+                // the file's own shape made the message contradict its own total
+                // — twice, on two different axes.
+                let why = match (nnz, dense_shape) {
+                    // No host X: the budget was tripped by raw and metadata, and
+                    // there is no matrix here to explain.
+                    (None, _) => String::new(),
+                    (Some(nnz), Some((rows, cols))) => {
+                        let n = group_thousands(*nnz);
+                        format!(
+                            " A dense container is {rows} x {cols} x {value_bytes} B, so the \
+                             {n} stored nonzeros do not bound it."
+                        )
+                    }
+                    (Some(nnz), None) => {
+                        let n = group_thousands(*nnz);
+                        match index_bytes {
+                            Some(ix) => {
+                                let per = value_bytes.saturating_add(*ix);
+                                let wide = if *ix == 8 && ix > value_bytes {
+                                    ", the larger half, because above 2^31 nonzeros scipy holds \
+                                     int64 column indices"
+                                } else if *ix == 8 {
+                                    ", because above 2^31 nonzeros scipy holds int64 column \
+                                     indices"
+                                } else {
+                                    ""
+                                };
+                                format!(
+                                    " {n} nonzeros at {per} B each: {value_bytes} B of value and \
+                                     {ix} B of column index{wide}."
+                                )
+                            }
+                            None => format!(
+                                " {n} stored nonzeros at {value_bytes} B of value each, plus a \
+                                 column index whose width scipy picks from the count after \
+                                 deletions — a count the catalog cannot supply, so this figure \
+                                 assumes the wider one."
+                            ),
+                        }
+                    }
+                };
+                let dense = match dense_bytes {
+                    Some(b) => format!(
+                        " container=\"dense\" would be {:.1} GiB here;",
+                        *b as f64 / gib
+                    ),
+                    None => String::new(),
+                };
                 write!(
                     f,
-                    "estimated host assembly ~{est_gb:.1} GB exceeds the {budget_gb:.1} GB \
-                     budget; proceeding (peak host RSS may be high). Pass a smaller \
-                     var_names / obs_filter subset, open with backed=True, or raise \
-                     memory_budget to reduce it."
+                    "estimated host assembly ~{est:.1} GiB exceeds the {budget:.1} GiB budget; \
+                     proceeding (peak host RSS may be high). That estimate covers assembly \
+                     only — X, adata.raw when the read includes it, and obs/var — and excludes \
+                     everything that reads the matrix afterwards, so it is a floor on process \
+                     RSS, not a job size.{why} \
+                     Cheaper routes: open with backed=True, which streams and assembles \
+                     nothing;{dense} or pass a smaller var_names / obs_filter subset. Raising \
+                     memory_budget silences this without changing what it costs."
                 )
             }
             other => write!(f, "{other:?}"),
@@ -505,15 +623,219 @@ mod tests {
         let w = ConvertWarning::EagerAssemblyMemoryHigh {
             estimated_bytes: 25_239_799_332,
             budget_bytes: 8_589_934_592,
+            nnz: Some(1_000_000_000),
+            value_bytes: 4,
+            index_bytes: Some(4),
+            dense_shape: None,
+            dense_bytes: None,
         };
         let rendered = format!("{w}");
-        assert!(rendered.contains("23.5 GB"), "{rendered}");
-        assert!(rendered.contains("8.0 GB"), "{rendered}");
+        // The figures are GiB and are labelled GiB. They were computed by
+        // dividing by 1024^3 and printed as "GB", which is how an operator
+        // reads ~39.7 and sizes a node for a job that peaked at 84.76 GiB.
+        assert!(rendered.contains("23.5 GiB"), "{rendered}");
+        assert!(rendered.contains("8.0 GiB"), "{rendered}");
+        assert!(!rendered.contains(" GB"), "{rendered}");
         assert!(rendered.contains("proceeding"), "{rendered}");
         assert!(rendered.contains("backed=True"), "{rendered}");
+        // The scope caveat is the point of the message: this number cannot
+        // size a job, and saying so is the only honest thing it can do.
+        assert!(rendered.contains("assembly only"), "{rendered}");
+        assert!(rendered.contains("not a job size"), "{rendered}");
         // Must NOT leak the debug struct shape.
         assert!(!rendered.contains("EagerAssemblyMemoryHigh"), "{rendered}");
         assert!(!rendered.contains("estimated_bytes"), "{rendered}");
+    }
+
+    /// A `container="dense"` request is `n_obs x n_vars x value_width`; the
+    /// nonzero count does not bound it, and there is no column-index array for
+    /// the int64 story to be about. Saying "N nonzeros at 8 B each (int32
+    /// column indices)" there describes a buffer the read is not building.
+    #[test]
+    fn a_dense_request_is_not_explained_in_nonzeros() {
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 22_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(1_000_000_000),
+            value_bytes: 4,
+            index_bytes: None,
+            dense_shape: Some((50_000, 4_000)),
+            dense_bytes: None,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("do not bound it"), "{rendered}");
+        // The shape the estimate used, printed, not the file's own.
+        assert!(rendered.contains("50000 x 4000 x 4 B"), "{rendered}");
+        assert!(rendered.contains("1,000,000,000"), "{rendered}");
+        assert!(!rendered.contains("column indices"), "{rendered}");
+        assert!(!rendered.contains("B each"), "{rendered}");
+    }
+
+    /// Every figure in the message is derived from the plan the estimate was
+    /// priced with.
+    ///
+    /// The message hard-coded 8 and 12 B/nnz while the estimate had moved to the
+    /// caller's value width — so a `data_dtype="float64"` read reported a total
+    /// computed at 12 B/nnz and explained it at 8, and called an int64 index
+    /// "two thirds" of a footprint where it is half. A regression introduced by
+    /// the fix that made the estimate plan-aware, and the reason this asserts
+    /// arithmetic rather than a phrase.
+    #[test]
+    fn the_per_nonzero_explanation_follows_the_plans_widths() {
+        let f64_wide = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_500_000_000),
+            value_bytes: 8,
+            index_bytes: Some(8),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{f64_wide}");
+        assert!(rendered.contains("at 16 B each"), "{rendered}");
+        assert!(
+            rendered.contains("8 B of value and 8 B of column index"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("two thirds"), "{rendered}");
+
+        let u8_narrow = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 12_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_000_000_000),
+            value_bytes: 1,
+            index_bytes: Some(4),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{u8_narrow}");
+        assert!(rendered.contains("at 5 B each"), "{rendered}");
+        assert!(!rendered.contains("int64"), "{rendered}");
+    }
+
+    /// On a file with deletion vectors the nonzero count is physical and scipy
+    /// picks the index width from the live count, which the catalog cannot
+    /// supply. The widen refuses to guess it; so must the message.
+    #[test]
+    fn an_unknown_index_width_is_not_asserted() {
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_650_704_199),
+            value_bytes: 4,
+            index_bytes: None,
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("after deletions"), "{rendered}");
+        assert!(rendered.contains("assumes the wider one"), "{rendered}");
+        // No per-nonzero total, because the index half of it is unknown.
+        assert!(!rendered.contains(" B each:"), "{rendered}");
+        assert!(!rendered.contains("int64"), "{rendered}");
+    }
+
+    /// A call that assembles no host `X` explains none.
+    ///
+    /// `to_gpu_anndata`'s device path decodes straight to the GPU; a warning it
+    /// trips came from `adata.raw` and the metadata, and a nonzero count would
+    /// be describing a buffer that is never built.
+    #[test]
+    fn no_host_x_means_no_nonzero_explanation() {
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 20_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: None,
+            value_bytes: 4,
+            index_bytes: None,
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("18.6 GiB"), "{rendered}");
+        assert!(!rendered.contains("nonzero"), "{rendered}");
+        assert!(!rendered.contains("column index"), "{rendered}");
+        // Still says what it covers and offers the routes.
+        assert!(rendered.contains("assembly only"), "{rendered}");
+        assert!(rendered.contains("backed=True"), "{rendered}");
+    }
+
+    /// An 8 B value next to an 8 B index is not "the larger half".
+    #[test]
+    fn the_index_is_only_called_larger_when_it_is() {
+        let equal = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_500_000_000),
+            value_bytes: 8,
+            index_bytes: Some(8),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{equal}");
+        assert!(rendered.contains("int64 column indices"), "{rendered}");
+        assert!(!rendered.contains("larger half"), "{rendered}");
+
+        let larger = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_500_000_000),
+            value_bytes: 4,
+            index_bytes: Some(8),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        assert!(format!("{larger}").contains("larger half"));
+    }
+
+    #[test]
+    fn group_thousands_groups_from_the_right() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(7), "7");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(1_000), "1,000");
+        assert_eq!(group_thousands(12_345), "12,345");
+        assert_eq!(group_thousands(2_650_704_199), "2,650,704,199");
+        assert_eq!(group_thousands(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    /// Above `i32::MAX` nonzeros the message names the int64 promotion and its
+    /// share of the footprint, and offers `container="dense"` when dense is
+    /// genuinely smaller. Below it, neither claim appears — a narrow matrix
+    /// told to go dense would be advised into more memory, not less.
+    #[test]
+    fn eager_assembly_memory_high_names_int64_and_dense_only_when_true() {
+        let wide = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 31_782_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(2_650_704_199),
+            value_bytes: 4,
+            index_bytes: Some(8),
+            dense_shape: None,
+            dense_bytes: Some(23_600_000_000),
+        };
+        let rendered = format!("{wide}");
+        assert!(rendered.contains("2,650,704,199 nonzeros"), "{rendered}");
+        assert!(rendered.contains("int64"), "{rendered}");
+        assert!(rendered.contains("12 B each"), "{rendered}");
+        assert!(rendered.contains("4 B of value and 8 B"), "{rendered}");
+        assert!(rendered.contains("container=\"dense\""), "{rendered}");
+        assert!(rendered.contains("22.0 GiB"), "{rendered}");
+
+        let narrow = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 25_239_799_332,
+            budget_bytes: 8_589_934_592,
+            nnz: Some(1_000_000_000),
+            value_bytes: 4,
+            index_bytes: Some(4),
+            dense_shape: None,
+            dense_bytes: None,
+        };
+        let rendered = format!("{narrow}");
+        assert!(rendered.contains("8 B each"), "{rendered}");
+        assert!(rendered.contains("4 B of value and 4 B"), "{rendered}");
+        assert!(!rendered.contains("int64"), "{rendered}");
+        assert!(!rendered.contains("dense"), "{rendered}");
     }
 
     #[test]

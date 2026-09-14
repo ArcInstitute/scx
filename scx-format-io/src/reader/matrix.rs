@@ -14,8 +14,9 @@ use super::*;
 pub(crate) struct RowMajorLabels {
     /// Names an offending *catalog entry* ("... has no stats block").
     entry: &'static str,
-    /// Names an offending *shard* ("... length mismatch").
-    shard: &'static str,
+    /// Names an offending *shard* ("... length mismatch"). `pub(crate)` so
+    /// `typed_read.rs` can build its own error text from the same label.
+    pub(crate) shard: &'static str,
 }
 
 /// Labels for `X`, a modality's `X`, and named layers.
