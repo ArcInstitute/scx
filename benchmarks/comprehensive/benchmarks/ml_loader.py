@@ -49,6 +49,10 @@ from benchmarks.comprehensive.config import (
     QUERY_N_HVGS,
     RANDOM_SEED,
 )
+from benchmarks.comprehensive.data_wait import (
+    data_wait_fraction,
+    steady_state_wait,
+)
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.runners import make_runner
 
@@ -1068,6 +1072,21 @@ class _GpuEpochResult:
     cells_per_sec: float = 0.0
     avg_gpu_util_pct: float = 0.0
     gpu_util_samples: int = 0
+    # Phase-0 gate: how much of the timed epoch the consumer spent blocked in
+    # `next(iterator)`. `None` (not 0.0) when no step ran — see
+    # `data_wait_fraction`.
+    data_wait_s: float = 0.0
+    data_wait_fraction: float | None = None
+    batch_wait_ms_p50: float | None = None
+    batch_wait_ms_p95: float | None = None
+    batch_wait_ms_p99: float | None = None
+    batch_wait_ms_max: float | None = None
+    # The headline `p`: the first `next()` pays tokio spin-up and the first
+    # shard decode once per epoch, and folding that into the fraction makes it
+    # a function of epoch length rather than of the loader.
+    ttfb_s: float | None = None
+    data_wait_fraction_steady: float | None = None
+    n_steady_steps: int = 0
 
 
 def _build_scvi_vae(n_input: int):
@@ -1173,6 +1192,11 @@ def _run_gpu_train_epoch(
     # Timed training epoch
     n_batches = 0
     n_cells = 0
+    # One `next()` duration per step. Driven through an explicit iterator
+    # rather than `for batch in ds:` purely to get that seam: the fraction of
+    # step time a model spends waiting on data is what gates the tier-3 loader
+    # work, and a bare `for` leaves nowhere to measure it.
+    waits_s: list[float] = []
     try:
         # Re-create dataset for fresh epoch
         ds = pyscx.TrainingDataset(
@@ -1184,8 +1208,21 @@ def _run_gpu_train_epoch(
             seed=seed + 1,
             max_memory_mb=_scx_memory_budget_mb(),
         )
+        # `t0` BEFORE `iter(ds)`: `TrainingDataset.__iter__` calls
+        # `TrainingPipeline::start_epoch`, which builds the epoch stages. Timing
+        # from after it put that cost outside both `wall_s` and `ttfb_s`, while
+        # the docs said the first `next()` pays pipeline spin-up. Fold iterator
+        # construction into the first wait so `ttfb_s` measures what it claims.
         t0 = time.perf_counter()
-        for batch in ds:
+        it = iter(ds)
+        first_wait_from = t0
+        while True:
+            w0 = first_wait_from if not waits_s else time.perf_counter()
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            waits_s.append(time.perf_counter() - w0)
             X = torch.from_numpy(batch["X"]).to(device, non_blocking=True)
             loss = model(X)
             loss.backward()
@@ -1215,6 +1252,10 @@ def _run_gpu_train_epoch(
     bps = n_batches / wall_s if wall_s > 0 else 0.0
     cps = n_cells / wall_s if wall_s > 0 else 0.0
 
+    # Percentiles come from `steady`, which computes them on the post-startup
+    # slice. Taking them from `wait_percentiles(waits_s)` made `max_ms` equal to
+    # `ttfb_s` restated in ms.
+    steady = steady_state_wait(waits_s, wall_s)
     return _GpuEpochResult(
         n_batches=n_batches,
         n_cells=n_cells,
@@ -1223,6 +1264,15 @@ def _run_gpu_train_epoch(
         cells_per_sec=cps,
         avg_gpu_util_pct=avg_util,
         gpu_util_samples=len(gpu_utils),
+        data_wait_s=sum(waits_s),
+        data_wait_fraction=data_wait_fraction(waits_s, wall_s),
+        batch_wait_ms_p50=steady["p50_ms"],
+        batch_wait_ms_p95=steady["p95_ms"],
+        batch_wait_ms_p99=steady["p99_ms"],
+        batch_wait_ms_max=steady["max_ms"],
+        ttfb_s=steady["ttfb_s"],
+        data_wait_fraction_steady=steady["data_wait_fraction_steady"],
+        n_steady_steps=steady["n_steady_steps"],
     )
 
 
@@ -1793,13 +1843,54 @@ def run(
                         batches_per_sec__gpu_train=round(gpu_res.batches_per_sec, 1),
                         cells_per_sec__gpu_train=round(gpu_res.cells_per_sec, 0),
                         avg_gpu_util_pct__gpu_train=round(gpu_res.avg_gpu_util_pct, 1),
+                        # Phase-0 gate (R1). `n_steps` is `n_batches` above;
+                        # the model and batch size are already recorded on
+                        # this run and in `result.scenario`.
+                        data_wait_fraction__gpu_train=(
+                            None
+                            if gpu_res.data_wait_fraction is None
+                            else round(gpu_res.data_wait_fraction, 5)
+                        ),
+                        data_wait_s__gpu_train=round(gpu_res.data_wait_s, 4),
+                        batch_wait_ms_p50__gpu_train=gpu_res.batch_wait_ms_p50,
+                        batch_wait_ms_p95__gpu_train=gpu_res.batch_wait_ms_p95,
+                        # p99 and max, not p50/p95 alone: at census scale the
+                        # wait is a tail and p95 does not show it.
+                        batch_wait_ms_p99__gpu_train=gpu_res.batch_wait_ms_p99,
+                        batch_wait_ms_max__gpu_train=gpu_res.batch_wait_ms_max,
+                        # The headline `p` for R1 — startup excluded. See
+                        # `steady_state_wait` for why the all-steps fraction
+                        # above is not the number to quote.
+                        data_wait_fraction_steady__gpu_train=(
+                            None
+                            if gpu_res.data_wait_fraction_steady is None
+                            else round(gpu_res.data_wait_fraction_steady, 6)
+                        ),
+                        ttfb_s__gpu_train=(
+                            None if gpu_res.ttfb_s is None else round(gpu_res.ttfb_s, 4)
+                        ),
+                        n_steady_steps__gpu_train=gpu_res.n_steady_steps,
                     )
 
                     logger.info(
-                        "    wall=%.3fs  bps=%.1f  gpu_util=%.1f%%",
+                        "    wall=%.3fs  bps=%.1f  gpu_util=%.1f%%  "
+                        "data_wait=%s steady (%s all-steps; ttfb=%ss; "
+                        "p50=%s p95=%s p99=%s max=%s ms over %d steps)",
                         gpu_res.wall_s,
                         gpu_res.batches_per_sec,
                         gpu_res.avg_gpu_util_pct,
+                        "n/a"
+                        if gpu_res.data_wait_fraction_steady is None
+                        else f"{gpu_res.data_wait_fraction_steady:.3%}",
+                        "n/a"
+                        if gpu_res.data_wait_fraction is None
+                        else f"{gpu_res.data_wait_fraction:.1%}",
+                        gpu_res.ttfb_s,
+                        gpu_res.batch_wait_ms_p50,
+                        gpu_res.batch_wait_ms_p95,
+                        gpu_res.batch_wait_ms_p99,
+                        gpu_res.batch_wait_ms_max,
+                        gpu_res.n_batches,
                     )
 
                 if gpu_results:
@@ -1808,6 +1899,39 @@ def run(
                     avg_util = statistics.median(
                         r.avg_gpu_util_pct for r in gpu_results
                     )
+                    fractions = [
+                        r.data_wait_fraction
+                        for r in gpu_results
+                        if r.data_wait_fraction is not None
+                    ]
+                    steadies = [
+                        r.data_wait_fraction_steady
+                        for r in gpu_results
+                        if r.data_wait_fraction_steady is not None
+                    ]
+                    ttfbs = [r.ttfb_s for r in gpu_results if r.ttfb_s is not None]
+                    p50s = [
+                        r.batch_wait_ms_p50
+                        for r in gpu_results
+                        if r.batch_wait_ms_p50 is not None
+                    ]
+                    p95s = [
+                        r.batch_wait_ms_p95
+                        for r in gpu_results
+                        if r.batch_wait_ms_p95 is not None
+                    ]
+                    p99s = [
+                        r.batch_wait_ms_p99
+                        for r in gpu_results
+                        if r.batch_wait_ms_p99 is not None
+                    ]
+                    # The max ACROSS runs, not a median of maxima: the tail is
+                    # the subject and a median over three would hide the worst.
+                    maxes = [
+                        r.batch_wait_ms_max
+                        for r in gpu_results
+                        if r.batch_wait_ms_max is not None
+                    ]
                     scenario_summary["gpu_train"] = {
                         "n_runs": len(gpu_results),
                         "median_batches_per_sec": round(med_bps, 1),
@@ -1815,6 +1939,40 @@ def run(
                         "avg_gpu_util_pct": round(avg_util, 1),
                         "target_gpu_util_pct": 85,
                         "pass": avg_util >= 85,
+                        # Phase-0 gate (R1): the `p` that decides whether the
+                        # tier-3 loader work is worth funding for this regime.
+                        # The startup-excluded figure is the headline; the
+                        # all-steps one rides beside it because on a short
+                        # epoch it is dominated by a single time-to-first-batch
+                        # and reads ~50x higher. `None` in either means no
+                        # epoch produced a step — an unmeasured cell, not a
+                        # loader that never stalled.
+                        "median_data_wait_fraction_steady": (
+                            round(statistics.median(steadies), 6)
+                            if steadies
+                            else None
+                        ),
+                        "median_ttfb_s": (
+                            round(statistics.median(ttfbs), 4) if ttfbs else None
+                        ),
+                        "median_data_wait_fraction_all_steps": (
+                            round(statistics.median(fractions), 5)
+                            if fractions
+                            else None
+                        ),
+                        "median_batch_wait_ms_p50": (
+                            round(statistics.median(p50s), 3) if p50s else None
+                        ),
+                        "median_batch_wait_ms_p95": (
+                            round(statistics.median(p95s), 3) if p95s else None
+                        ),
+                        "median_batch_wait_ms_p99": (
+                            round(statistics.median(p99s), 3) if p99s else None
+                        ),
+                        "max_batch_wait_ms": (max(maxes) if maxes else None),
+                        "n_steps": [r.n_batches for r in gpu_results],
+                        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+                        "batch_size": ML_BATCH_SIZE,
                     }
             except Exception as e:
                 logger.error("  GPU training failed: %s", e)

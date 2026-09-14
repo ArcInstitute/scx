@@ -6,10 +6,24 @@ model: each scans obs up front to build global vocab / one-hot maps. STATE3
 hand-rolled a `_H5adFastBacked` reader specifically to dodge ``anndata``'s eager
 obs load (60–80 s + tens of GB per file), and its manifests reach **26,453 files**,
 so per-file open cost is multiplied by files × workers × ranks. This microbench
-measures it directly. Results, including the finding that ~87% of SCX's per-file
-cost is open + catalog parse rather than obs reading, are in
-``docs/performance.md`` § "Out-of-core loader — cold-cache measurements and the
-P-1 premise gate".
+measures it directly. Results are in ``docs/performance.md`` § "Out-of-core
+loader — cold-cache measurements and the P-1 premise gate".
+
+**The measured split: obs reading is 96–99.8% of per-file cost at every scale**
+(53.8 / 498.8 / 1251.2 ms on tabula_sapiens_100k / census_500k / census_1m),
+against 0.09–20 ms for open + mmap + header + catalog parse and ≤ 1.2 ms for
+the BLAKE3 catalog verify. That is what settles P0.1b's ``ScxObsReader``
+proposal — against it: there is no per-file open cost worth removing, and the
+numpy ``(codes, categories)`` accessor is aimed at the right term.
+
+⚠️ This docstring previously reported the **opposite** split ("~87% of SCX's
+per-file cost is open + catalog parse rather than obs reading"). That figure
+came from a warm interactive smoke of these same scenarios, where the first
+``pyscx.open`` absorbed interpreter and pyo3 init plus page first-touch that
+``posix_fadvise`` does not evict. It was retracted in ``docs/performance.md``,
+but survived here and kept the withdrawn work item alive — a small-fixture
+interactive smoke is not a measurement, and a cost *ratio* between a
+first-touch-contaminated term and a steady-state term can invert outright.
 
 Two formats:
   * ``scx_auto``  — ``pyscx.open(path).read_obs([col])`` (matrix-free; no X mmap).

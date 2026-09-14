@@ -2369,6 +2369,16 @@ cellsets/s (**188×**) at 462 vs 411 MB: the throughput gap holds while the memo
 gap nearly vanishes, because the block-index route's bounded peak buys nothing
 until a whole shard is large.
 
+> [!WARNING]
+> **These two ratios are superseded.** They predate the row-group LRU
+> (OPT-FORMATIO-1), which is the whole reason they were re-measured: see
+> [Cell-set scatter routes, re-measured after the row-group
+> LRU](#cell-set-scatter-routes-re-measured-after-the-row-group-lru-phase-0-gate),
+> where the comparison is redone as a 2×2 of corpus size × plan locality. The
+> headline changes shape: there is no fixed winner. Full-shard wins 167× at
+> 100 k cells, 1.6× at 1 M, and **loses** 1.53× at 1 M once the plan has the
+> locality a real model's sets have.
+
 Treat the ratio as an order of magnitude, not a constant — three captures of the
 same tabula arm pair landed at 184×, 187× and 206×, since the `on` arm's absolute
 rate (2.6–3.2 cellsets/s) is small enough that ordinary node variance moves the
@@ -2527,6 +2537,180 @@ full-shard — **regenerate fixtures** (or `scx optimize` in place; `scx info <f
 --json` reports framed shards) before expecting the win. Sweep results:
 `benchmarks/comprehensive/results/phase5/T5_sidecar_sweep.md`; driver
 `benchmarks/scripts/phase5_sidecar_sweep.py`.
+
+#### Cell-set scatter routes, re-measured after the row-group LRU (phase-0 gate)
+
+The 206x / 188x table above is the **pre-LRU** measurement, and it asked the
+wrong question: it compared the two routes on one fixture and one plan shape.
+Re-measured across a 2x2 of corpus size and plan locality, cold, `N_RUNS=3`,
+`N_BATCHES=50`, S=64, one SLURM job per cell:
+
+Every figure below is `median_cellsets_per_sec` / median `peak_rss_mb` read
+back out of the committed manifests under
+`results/raw/phase0_scatter_routes/` — `default` / `off` is the arm pair, and
+the ratio is that file's own `speedup_off_over_on`:
+
+| fixture | cells / shards | plan | `default` | `off` | `on` | off/on | peak RSS `off` -> `on` |
+|---|---|---|---|---|---|---|---|
+| tabula_sapiens_100k | 100 k / 7 | random | 874.8 | 899.1 | 5.40 | full-shard **166.5x** | 2 216 -> 783 MB |
+| tabula_sapiens_100k | 100 k / 7 | grouped | 805.6 | 812.4 | 6.94 | full-shard **117.1x** | 2 283 -> 818 MB |
+| census_1m | 1 M / 62 | random | 11.13 | 11.41 | 6.93 | full-shard **1.65x** | 14 338 -> 3 853 MB |
+| census_1m | 1 M / 62 | grouped | 280.9 | 299.7 | **458.8** | **block-index 1.53x** | 13 606 -> 12 063 MB |
+| pbmc10k | 11.8 k / 1 | random | 1 166.9 | 1 222.3 | 1 161.5 | 1.05x | 619 -> 678 MB |
+
+**There is no fixed winner — there is a crossover, and a real corpus sits on
+the far side of it.** The two routes scale differently:
+
+* **Full-shard** pays to keep shards resident. It is superb while the whole
+  shard set fits the cache and is touched often — ~900 sets/s on tabula's seven
+  shards at a 0.9985 hit rate — and it degrades as the corpus grows: 11.4
+  sets/s on census_1m's 62 shards, holding 14.3 GB to do it.
+* **Block-index** pays per touched row group and holds almost nothing. It is
+  roughly flat in corpus size on a given plan shape (5.40 on tabula random,
+  6.99 on census_1m random) and it tracks plan locality strongly: a grouped
+  plan touches ~23x fewer groups than a random one (1 354 vs 31 878 over the
+  same batch count), which is why grouped census runs at 458.8.
+
+So full-shard's advantage is 117–167x at 100 k cells, 1.65x at 1 M, and
+**already inverted** at 1 M once the plan has the locality a real model's sets
+have.
+Block-index also holds 3.8x less memory at census scale on random plans
+(3.8 GB against 14.3 GB), which is the axis that decides whether a job fits a
+node at all.
+
+**What this means for the default.** `SparseCellSetDataset.scatter_block_index`
+stays `false` for now — flipping it unconditionally would cost 117–173x on
+100 k-cell corpora, which is where the registered fixtures and most current
+users are. But "the default is correct" is not what these numbers say. They
+say the correct route is **a function of corpus size and plan locality**, the
+crossover is near 1 M cells, and datasets past it — many files, millions of
+cells, covariate-grouped sets — are the case the default gets wrong. Choosing
+the route per dataset (or estimating `planned` bytes against the budget at
+plan time, which the loader already computes for admission) is the follow-on
+this gate actually motivates, and it supersedes the "flip or do not flip"
+framing the phase was written around.
+
+**Admission is the other half, and it is off at scale by default.** Row-group
+retention (`cache_metrics()`, shipped default budget, random plans):
+
+| fixture | shards | cells | `row_group_hits` | `row_group_misses` | hit rate |
+|---|---|---|---|---|---|
+| pbmc10k | 1 | 11 769 | 3 597 | 46 | **0.987** |
+| tabula_sapiens_100k | 7 | 100 000 | **0** | 5 681 | 0.000 |
+| census_500k | 31 | 500 000 | **0** | 6 038 | 0.000 |
+| census_1m | 62 | 1 000 000 | **0** | 6 098 | 0.000 |
+
+Every multi-shard fixture retains nothing on a random plan. The rule is
+`admit_row_groups = planned <= budget / (lookahead + 1)`, taken once per plan
+over every file and shard it touches (`plan_engine.rs`), and `planned` is the
+decoded footprint of the row groups the plan's rows land in. Grouped plans
+clear it where random ones do not (census_500k 0.421, census_1m 0.447), and
+removing the share divisor lifts tabula to 0.931 and census_1m to 0.310 —
+so most of what is forfeited is recoverable by admitting on a reuse signal
+rather than all-or-nothing per plan.
+
+**The file count is not the variable — the shard size is.** On the real
+256-file manifest fixture (tabula split into 390-cell, 1-shard, 10.3 MB files)
+retention is healthy at every file count that exercises the route: 64 files
+0.667, 256 files 0.603. Spreading the same plans over 1 -> 32 readers on one
+1-shard fixture moves the hit rate only 0.928 -> 0.888. A many-small-file
+atlas admits and retains; a few-large-shard corpus does not. The untested
+corner is many files that each carry census-sized shards.
+
+> [!NOTE]
+> The census_1m random row was captured twice. A first run shared its node with
+> this session's interactive shell while diagnostic probes ran there, so its
+> `default` / `off` arms were potentially depressed; it measured 12.00 / 11.21 /
+> 6.99 cellsets/s (ratio 1.604). The clean re-run above measured 11.13 / 11.41 /
+> 6.93 (ratio 1.646) — within 3 %, with an identical block-index arm. The
+> contention was immaterial here, but the published row is the clean one.
+
+> [!IMPORTANT]
+> **Size the cache, or measure the wrong thing — and the loader will tell you
+> which.** census_1m's adaptive budget resolves to ~4.0 GB inside a 128 GB
+> allocation — 23 of its 62 shards — and a random plan touches nearly all of
+> them every batch. Under that budget the full-shard arm runs at **0.14
+> cellsets/s** at a 0.215 hit rate; sized to hold all 62 shards (12.1 GB) the
+> same arm runs at **11.4** at 0.988, an **80x** difference that has nothing to
+> do with routes.
+>
+> This is **not** a silent trap. `SparseCellSetDataset` emits a `UserWarning`
+> naming the pathology, the measurement and the exact remedy — *"shard-cache
+> thrash detected — 78% of 8358 shard reads missed ... raise max_memory_mb to
+> >=10707 (enough for ~62 shards of ~176837 KB). Raising cache_shards alone
+> cannot help."* — and the 12.1 GB used above is that recommendation rounded up.
+> The warning goes to **stderr**, so a capture that splits stdout and stderr
+> into separate files (as `bench_cellset_scatter_routes.sbatch` does) will hide
+> it from anyone reading only the `.out`. Read the `.err`. `docs/performance.md`'s
+> data-load 1A capture is the same pathology from the other side. Every row in
+> the 2x2 above is measured with the cache sized to the file, via the driver's
+> `_sized_budget`, which may only ever *raise* the budget: an earlier version
+> sized tabula *down* from 4.23 GB to 1.73 GB, starving the full-shard arm
+> (hit rate 0.9987 -> 0.5408, 936 -> 1.12 sets/s) and making block-index look
+> 6.2x faster. That row was discarded, not published.
+
+> [!NOTE]
+> **The premise about fixture versions changed, but only for some fixtures.**
+> The 2026-08-29 capture reframed v3 / `scx1` / pyscx-0.9.1 sources, and the
+> driver's docstring justified the reframe by saying both routes collapse to
+> full-shard without it. That is no longer true of the fixtures this A/B uses:
+> `pbmc10k`, `tabula_sapiens_100k`, `census_500k`, `census_1m`, `pbmc3k`,
+> `smartseq2` and `chemogenetic_rgfp` are all v4 / framed today, and the
+> block-index route is reachable on them directly — a 256-row scattered plan
+> over `pbmc10k_auto.scx` reports `block_index_groups=4` at
+> `scatter_block_index=True` and `full_shard_groups=4` at `False`.
+>
+> It is **not** true of the fixture set as a whole, and the exceptions matter:
+> `census_5m_auto.scx` is **format v1** (306 shards, 15.1 GB, mixed
+> `scx1`/`zstd`), and `tahoe_c38`, `replogle_k562` and the three `_lognorm`
+> fixtures are v3. None carries a `BlockIndex`, so on those the block-index
+> route cannot fire at all and `SparseCellSetDataset(scatter_block_index=True)`
+> warns and full-shard-decodes. That is why the scale probe above stops at
+> census_1m: extending it to 5M cells would mean reframing a 15 GB v1 file
+> first, not just pointing the probe at a bigger fixture. The perturbation
+> fixtures closest to a real STATE-style workload (`tahoe_c38`,
+> `replogle_k562`) are among the unframed ones.
+>
+> The reframe is kept for a reason unrelated to either: `scx optimize
+> --row-group-rows 256` pins the row-group geometry the arms are compared at
+> and keeps `_v4reframed` naming the same subject the 08-29 rows measured.
+
+> [!NOTE]
+> Manifest entries: the fifteen schema-v2 results
+> `results/raw/phase0_scatter_routes/cellset_gather_scatter_routes__scx_v4reframed_{default,off,on}__{tabula_sapiens_100k,pbmc10k}_v4reframed.json`
+> and `…__{tabula_sapiens_100k,census_1m}_v4reframed_grouped.json` and
+> `…__census_1m_v4reframed.json`
+> — **one per arm**, for the reason the 08-29 note gives, and in their own
+> subdirectory so the tracked 08-29 rows that back the table above are not
+> overwritten by a re-measure. Force-added (`results/raw/` is gitignored) and
+> deliberately **not promoted**: the subject is a reframed *copy* of a
+> registered fixture, so no `gate_candidate.py` run reproduces these rows.
+> Every sample records `cache_policy: cold_fadvise`; the driver refuses a
+> median labelled cold if any sample fell back to warm, refuses a ratio unless
+> each arm reached its own route, and refuses to start at all against a pyscx
+> whose `cache_metrics()` lacks the `row_group_*` counters — a build predating
+> OPT-FORMATIO-1 would otherwise reproduce the pre-LRU numbers under this
+> heading, which is what the first attempt at this capture did.
+> `provenance.dirty_tracked_paths` names this PR's own benchmark-harness
+> edits, which are the subject of the capture rather than a contaminant; no
+> `scx-*` crate is modified, so the measured `.so` is `main`'s.
+>
+> ⚠️ **Capture vintage differs across the 2×2.** The tabula and pbmc *random*
+> rows were captured before the driver's `_sized_budget` helper existed
+> (`cache_sizing: null` in their metadata); the census rows after it. That does
+> not move their values — tabula needs 1.73 GB and the adaptive tuner already
+> grants 4.23 GB, so sizing is a no-op there, which is why the helper now
+> refuses to lower a budget — but the artifacts are not one vintage and should
+> not be read as a single campaign.
+>
+> **What is not manifested**: the `row_group_*`, budget-sweep, scale and
+> file-count tables above come from read-only `cache_metrics()` probes over
+> the same fixtures and plan generator, not from timed benchmark arms — they
+> report counters, not wall clock, so they carry no `BenchmarkResult`. The two
+> captures ran on the same node this session's probes ran on; the default
+> arm reproduced to 0.1 % across them (873.8 / 874.8 sets/s), so contention
+> was immaterial, but the timed rows above are the manifested ones and the
+> counter tables are diagnostics.
 
 ### Out-of-core loader — cold-cache measurements and the P-1 premise gate
 
@@ -2718,6 +2902,115 @@ not certify multi-node DDP (no NCCL in the picture), they do not measure a real
 warm-cache training throughput, which is what STATE3's own 4.55 steps/s figure covers. A
 regime that shows up in any of those is not excluded by the table above — it is simply not
 evidenced today.
+
+### Data-wait fraction per regime (`p`) — the loader-work gate
+
+Every throughput item in the ML-loader plan is conditional on one number per
+access regime: `p`, the fraction of a training step spent waiting on data. The
+arithmetic is unforgiving — accelerating an exposed fraction `p` by `s` is
+worth `1 / [(1 - p) + p/s]` and no more, so at `p = 0.006` (STATE3's measured
+figure) even `s = infinity` buys 1.006x. Tier-3 loader work is funded per
+regime by what `p` actually is, not by how fast a decoder could be.
+
+**Quote `data_wait_fraction_steady`, not `data_wait_fraction`.** The first
+`next()` of an epoch pays tokio spin-up, the first shard decode and (on the
+`DataLoader` path) worker spawn. Folding that into the fraction measures how
+long the benchmark's epoch happens to be: a 98-step `gpu_train` epoch over
+tabula reports **0.85** all-steps against a **0.009** steady figure, because
+2.04 s of its 2.4 s "wait" is step 1. `ttfb_s` carries that startup separately.
+
+| regime | consumer | dataset | cells | `p` (steady) | wait p50 | wait p95 | ttfb | steps |
+|---|---|---|---|---|---|---|---|---|
+| **R1** i.i.d. minibatches | scVI-equivalent VAE (2L/128h/128z), batch 1024, HVG+normalise+log1p | tabula_sapiens_100k | 100 k | **0.0086** / 0.0035 | 13 us | 16 us | 2.04 / 1.88 s | 98 |
+| | | census_1m | 1 M | **0.759** / 0.749 | 13 us | 799 / 256 us | 2.02 / 1.93 s | 977 |
+| **R2** grouped sets | STATE3 — consumer-side, not measured here | — | — | *(not measured)* | — | — | — | — |
+| **R3** paired batches | `IndexPlanDataset` + a 25 ms fixed step | tabula_sapiens_100k | 100 k | **0.41** (0.401–0.421) | 9.7 ms | 29 ms | 0.76 s | 49 |
+
+Two figures per R1 cell are `scx_auto` / `scx_fast`. **R3 ran `scx_auto`
+only** — its figure is the median over two timed runs, with their range in
+parentheses. R1 is `ml_loader`'s `gpu_train` scenario, R3 `index_plan`'s
+`pyscx_index_plan_dataset_workers2`.
+
+**R1 does not have one answer — it has two, and scale is the variable.** At
+100 k cells the loader is nowhere near the critical path (`p` under 1 %,
+per-batch wait 13 microseconds, agreeing with the D0 profile's ~4 microsecond
+send-wait). At 1 M cells it is roughly three quarters of steady-state step
+time. The single-fixture reading that "no model on record is data-starved on
+SCX" does not survive the move to census scale with this consumer.
+
+**And at census scale the wait is a tail, not a level — by arithmetic, not yet
+by direct measurement.** p50 is 13 microseconds and p95 799 microseconds, yet
+the steady fraction is 0.759. Over a ~12.6 s steady region, 95 % of 976 steps
+at or below 799 us account for under 0.8 s, so the remaining ~49 steps must
+carry ~9 s — of order 200 ms each. Both inputs to that (the steady fraction and
+p95) are sound, but it is an inference: the metric that would show the stall
+directly, `batch_wait_ms_max`, was **defective in the captures published here**
+and is fixed but not yet re-captured (see the correction below). The work this
+points at is deeper cross-batch prefetch, not faster decode: the median batch
+is already free.
+
+> ### ⚠️ Correction — the published `batch_wait_ms_max` is time-to-first-batch
+>
+> The captures behind this table computed the wait percentiles over the **full**
+> per-step list, including the first `next()`. `batch_wait_ms_max` is therefore
+> the startup cost restated in milliseconds — `ttfb_s` 1.933 against `max_ms`
+> 1932.967 in `results/raw/phase0_p/ml_loader__scx_fast__census_1m.json` — and
+> `p99` collapses onto it on short epochs, where nearest rank puts 0.99 at the
+> last index. **The steady fraction and p50/p95 are unaffected** (p95 sits at
+> index 927 of 977, far below the startup entry), so the `p` values and the tail
+> arithmetic above stand.
+>
+> **Fixed** by moving the percentiles inside `steady_state_wait`, which computes
+> them on the post-startup slice; `wait_percentiles` remains for the all-steps
+> view and nothing publishes it. Guarded by
+> `test_steady_percentiles_exclude_the_startup_batch` and an AST check that
+> neither emitter can call it over the full list again. The `max`/`p99` columns
+> are omitted from the table above rather than printed from the defective
+> captures. Found by **codex - gpt-5.6-terra** and **Antigravity - Gemini 3.8
+> Flash**.
+
+> [!IMPORTANT]
+> **`p` is a ratio, and the denominator here is a benchmark's model, not
+> yours.** R1's consumer is a deliberately small VAE, so its step is cheap and
+> `p` is correspondingly high; a heavier model lowers `p` without the loader
+> changing at all. R3's step is a literal 25 ms `sleep`. Read the **absolute**
+> wait, which is a property of the loader alone, and divide by your own step:
+> R3's ~18 ms of wait per batch is `p = 0.40` against a 25 ms step but would be
+> `p ≈ 0.12` against the 130 ms step STATE3 measured. The fractions above are
+> reported because the gate's threshold is stated as a fraction, not because a
+> fraction transfers between consumers.
+
+**R3's `p` exists only because the scenario was given a step to have a
+fraction of.** `pyscx_index_plan_dataset_workers2` counts batches and does no
+model work, so its unmodified data-wait fraction is ~1.0 by construction and
+says nothing. `SCX_BENCH_R3_NULL_MODEL_MS` buys a fixed-cost stand-in step
+(default `0` = off, so registered captures are unchanged); the row above is a
+separate, deliberately unpromoted capture at 25 ms/batch. Its two runs
+disagree sharply on p50 (0.196 ms vs 19.29 ms) at the same p95 — DataLoader
+worker scheduling, and a reason to read R3's median rather than either run.
+
+**R2 is consumer-side.** STATE3 is the reference consumer and the only model
+with a previously published `p` (0.8 ms of a 130 ms step, 0.6 %, at S=64/B=4
+warm). Reproducing it on the backed and native paths is a STATE3-repository
+measurement, not one this benchmark suite can make, so the cell is **empty
+rather than zero** — the distinction the `None`-not-`0.0` rule in
+`benchmarks/comprehensive/data_wait.py` exists to preserve.
+
+> [!NOTE]
+> Manifest entries, all force-added under
+> `results/raw/phase0_p/`: `ml_loader__scx_{auto,fast}__{tabula_sapiens_100k,census_1m}.json`
+> (R1) and `index_plan__scx_auto__tabula_sapiens_100k_nullmodel25ms.json` (R3).
+> The R3 row carries a **distinct filename** so it can never overwrite the
+> tracked `results/raw/index_plan__scx_auto__tabula_sapiens_100k.json`, whose
+> 25.14 batches/s backs the OPT-FORMATIO-1 claims — a null-model capture did
+> exactly that once. ⚠️ These captures predate the percentile fix above, so
+> their `batch_wait_ms_p99` / `_max` keys (where present at all) are not
+> trustworthy; the `p`, p50 and p95 values this section quotes are. The metric is **not**
+> floored — see `thresholds.yaml`'s deferred item 21: it is `None` on most
+> scenarios by construction, and a bound on it would pin the ratio of two
+> unrelated things (it falls when the *model* slows down). These are cold-cache,
+> single-node, single-rank numbers against the stated consumers; they do not
+> certify multi-node DDP, a real `DistributedSampler`, or any other model.
 
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 

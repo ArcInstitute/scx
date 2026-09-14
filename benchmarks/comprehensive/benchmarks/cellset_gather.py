@@ -1337,11 +1337,19 @@ def run(
     # triple's timing and RSS rows. That is not hypothetical: the committed
     # `cellset_gather_s512_raises_pooled_rss.md` justification exists precisely
     # because adding the S=512 arms moved pooled `peak_rss_mb_median` +19.47%.
-    # It would also become a wall-clock trap the moment the fixtures are
-    # reframed to v4: on framed tabula the block-index route runs at 3.19 vs
-    # 587.5 cellsets/s, so a timed 50-batch arm costs ~4 minutes per run. The
-    # priced comparison lives in `benchmarks/scripts/bench_cellset_scatter_routes.py`,
-    # which reframes a copy so the two routes actually differ.
+    # It is also a wall-clock trap to time: on framed tabula the block-index
+    # route runs at 3.19 vs 587.5 cellsets/s, so a timed 50-batch arm costs ~4
+    # minutes per run. The priced comparison lives in
+    # `benchmarks/scripts/bench_cellset_scatter_routes.py`, which reframes a
+    # copy at a pinned row-group geometry.
+    #
+    # ⚠️ That trap is no longer hypothetical. This comment used to read "the
+    # moment the fixtures are reframed to v4" — the registered `*_auto.scx`
+    # fixtures ARE v4-framed today (pyscx 0.11.0, `shufdelta`), against the
+    # v3 / `scx1` ones this block was written for. So the probe below reaches
+    # the block-index route on the registered fixture, and the reader default
+    # `scatter_block_index=false` is the only thing keeping the *timed*
+    # scenarios on the full-shard path.
     probe_sc = _SCENARIOS[0]  # gather_random @ S=64
     if not _supports_scatter_block_index():
         logger.warning(

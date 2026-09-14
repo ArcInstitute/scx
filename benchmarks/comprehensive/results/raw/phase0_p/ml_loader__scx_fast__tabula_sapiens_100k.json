@@ -1,0 +1,539 @@
+{
+  "schema_version": 2,
+  "benchmark": "ml_loader",
+  "format": "scx_fast",
+  "dataset": "tabula_sapiens_100k",
+  "timestamp": "2026-09-13T06:52:29",
+  "system": {
+    "hostname": "GPU11AE",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2015,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": true
+    },
+    "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
+      "driver_version": "560.35.05",
+      "gpu_name": "NVIDIA H100 80GB HBM3",
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M2DGMD8HDT8CAVJM55QCM2VX",
+      "git_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "git_branch": "phase0-dataload-gate",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-12-gab0fb96b-dirty",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 2.878042471129447,
+      "user_s": 2.0007069999999985,
+      "sys_s": 7.226765,
+      "peak_rss_mb": 923.1875,
+      "extra": {
+        "scenario": "raw",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 34.1,
+        "cells_per_sec": 34746.0,
+        "batches_per_sec__raw": 34.1,
+        "cells_per_sec__raw": 34746.0,
+        "ttfb_median_s__raw": 2.0443
+      }
+    },
+    {
+      "wall_s": 2.8621598398312926,
+      "user_s": 1.9426089999999991,
+      "sys_s": 7.352309999999999,
+      "peak_rss_mb": 928.2421875,
+      "extra": {
+        "scenario": "raw",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 34.2,
+        "cells_per_sec": 34939.0,
+        "batches_per_sec__raw": 34.2,
+        "cells_per_sec__raw": 34939.0
+      }
+    },
+    {
+      "wall_s": 2.9615476971957833,
+      "user_s": 1.9088010000000004,
+      "sys_s": 8.016095,
+      "peak_rss_mb": 928.2421875,
+      "extra": {
+        "scenario": "raw",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 33.1,
+        "cells_per_sec": 33766.0,
+        "batches_per_sec__raw": 33.1,
+        "cells_per_sec__raw": 33766.0
+      }
+    },
+    {
+      "wall_s": 2.0678092760499567,
+      "user_s": 1.4938590000000005,
+      "sys_s": 0.8039449999999988,
+      "peak_rss_mb": 916.09375,
+      "extra": {
+        "scenario": "hvg",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 47.4,
+        "cells_per_sec": 48360.0,
+        "batches_per_sec__hvg": 47.4,
+        "cells_per_sec__hvg": 48360.0,
+        "ttfb_median_s__hvg": 2.004
+      }
+    },
+    {
+      "wall_s": 2.080718572018668,
+      "user_s": 1.773418000000003,
+      "sys_s": 0.7448679999999968,
+      "peak_rss_mb": 916.09375,
+      "extra": {
+        "scenario": "hvg",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 47.1,
+        "cells_per_sec": 48060.0,
+        "batches_per_sec__hvg": 47.1,
+        "cells_per_sec__hvg": 48060.0
+      }
+    },
+    {
+      "wall_s": 2.081360184820369,
+      "user_s": 1.6114129999999989,
+      "sys_s": 0.730552000000003,
+      "peak_rss_mb": 913.5234375,
+      "extra": {
+        "scenario": "hvg",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 47.1,
+        "cells_per_sec": 48046.0,
+        "batches_per_sec__hvg": 47.1,
+        "cells_per_sec__hvg": 48046.0
+      }
+    },
+    {
+      "wall_s": 8.268572600092739,
+      "user_s": 26.528215000000003,
+      "sys_s": 27.301815999999988,
+      "peak_rss_mb": 930.140625,
+      "extra": {
+        "scenario": "norm",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 11.9,
+        "cells_per_sec": 12094.0,
+        "batches_per_sec__norm": 11.9,
+        "cells_per_sec__norm": 12094.0,
+        "ttfb_median_s__norm": 2.1418
+      }
+    },
+    {
+      "wall_s": 8.451018200954422,
+      "user_s": 27.311279,
+      "sys_s": 27.373970999999997,
+      "peak_rss_mb": 930.140625,
+      "extra": {
+        "scenario": "norm",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 11.6,
+        "cells_per_sec": 11833.0,
+        "batches_per_sec__norm": 11.6,
+        "cells_per_sec__norm": 11833.0
+      }
+    },
+    {
+      "wall_s": 8.427314620930701,
+      "user_s": 27.418815999999993,
+      "sys_s": 26.934956,
+      "peak_rss_mb": 927.078125,
+      "extra": {
+        "scenario": "norm",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 11.6,
+        "cells_per_sec": 11866.0,
+        "batches_per_sec__norm": 11.6,
+        "cells_per_sec__norm": 11866.0
+      }
+    },
+    {
+      "wall_s": 2.1947651419322938,
+      "user_s": 2.646007999999995,
+      "sys_s": 0.6567610000000172,
+      "peak_rss_mb": 914.68359375,
+      "extra": {
+        "scenario": "hvg_norm",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 44.7,
+        "cells_per_sec": 45563.0,
+        "batches_per_sec__hvg_norm": 44.7,
+        "cells_per_sec__hvg_norm": 45563.0,
+        "ttfb_median_s__hvg_norm": 2.0103
+      }
+    },
+    {
+      "wall_s": 2.214883086970076,
+      "user_s": 2.7867940000000146,
+      "sys_s": 0.6271059999999977,
+      "peak_rss_mb": 917.55859375,
+      "extra": {
+        "scenario": "hvg_norm",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 44.2,
+        "cells_per_sec": 45149.0,
+        "batches_per_sec__hvg_norm": 44.2,
+        "cells_per_sec__hvg_norm": 45149.0
+      }
+    },
+    {
+      "wall_s": 2.2008001231588423,
+      "user_s": 2.727574000000004,
+      "sys_s": 0.6966679999999883,
+      "peak_rss_mb": 917.55859375,
+      "extra": {
+        "scenario": "hvg_norm",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 44.5,
+        "cells_per_sec": 45438.0,
+        "batches_per_sec__hvg_norm": 44.5,
+        "cells_per_sec__hvg_norm": 45438.0
+      }
+    },
+    {
+      "wall_s": 2.22403207491152,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1407.2421875,
+      "extra": {
+        "scenario": "gpu_train",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 44.1,
+        "cells_per_sec": 44963.0,
+        "avg_gpu_util_pct": 3.5,
+        "gpu_util_samples": 6,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batches_per_sec__gpu_train": 44.1,
+        "cells_per_sec__gpu_train": 44963.0,
+        "avg_gpu_util_pct__gpu_train": 3.5,
+        "data_wait_fraction__gpu_train": 0.84286,
+        "data_wait_s__gpu_train": 1.8745,
+        "batch_wait_ms_p50__gpu_train": 0.013,
+        "batch_wait_ms_p95__gpu_train": 0.015,
+        "data_wait_fraction_steady__gpu_train": 0.009607,
+        "ttfb_s__gpu_train": 1.8712,
+        "n_steady_steps__gpu_train": 97
+      }
+    },
+    {
+      "wall_s": 2.2281680449377745,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1402.5546875,
+      "extra": {
+        "scenario": "gpu_train",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 44.0,
+        "cells_per_sec": 44880.0,
+        "avg_gpu_util_pct": 2.5,
+        "gpu_util_samples": 6,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batches_per_sec__gpu_train": 44.0,
+        "cells_per_sec__gpu_train": 44880.0,
+        "avg_gpu_util_pct__gpu_train": 2.5,
+        "data_wait_fraction__gpu_train": 0.8432,
+        "data_wait_s__gpu_train": 1.8788,
+        "batch_wait_ms_p50__gpu_train": 0.013,
+        "batch_wait_ms_p95__gpu_train": 0.015,
+        "data_wait_fraction_steady__gpu_train": 0.003546,
+        "ttfb_s__gpu_train": 1.8775,
+        "n_steady_steps__gpu_train": 97
+      }
+    },
+    {
+      "wall_s": 2.307518335059285,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 1410.46484375,
+      "extra": {
+        "scenario": "gpu_train",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "batches_per_sec": 42.5,
+        "cells_per_sec": 43337.0,
+        "avg_gpu_util_pct": 0.0,
+        "gpu_util_samples": 6,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batches_per_sec__gpu_train": 42.5,
+        "cells_per_sec__gpu_train": 43337.0,
+        "avg_gpu_util_pct__gpu_train": 0.0,
+        "data_wait_fraction__gpu_train": 0.81802,
+        "data_wait_s__gpu_train": 1.8876,
+        "batch_wait_ms_p50__gpu_train": 0.013,
+        "batch_wait_ms_p95__gpu_train": 0.016,
+        "data_wait_fraction_steady__gpu_train": 0.003105,
+        "ttfb_s__gpu_train": 1.8863,
+        "n_steady_steps__gpu_train": 97
+      }
+    },
+    {
+      "wall_s": 3.359821999911219,
+      "user_s": 0.2979909999999961,
+      "sys_s": 0.702272999999991,
+      "peak_rss_mb": 1421.8671875,
+      "extra": {
+        "scenario": "pyscx_training_dataset_workers2",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "n_epochs_per_run": 1,
+        "wall_s_per_epoch": 3.3598,
+        "batches_per_sec": 29.2,
+        "cells_per_sec": 29763.0,
+        "batches_per_sec__pyscx_training_dataset_workers2": 29.2,
+        "cells_per_sec__pyscx_training_dataset_workers2": 29763.0,
+        "peak_rss_mb__pyscx_training_dataset_workers2": 1421.9
+      }
+    },
+    {
+      "wall_s": 3.3466658238321543,
+      "user_s": 0.26073400000001357,
+      "sys_s": 0.7606910000000084,
+      "peak_rss_mb": 1421.6796875,
+      "extra": {
+        "scenario": "pyscx_training_dataset_workers2",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "n_epochs_per_run": 1,
+        "wall_s_per_epoch": 3.3467,
+        "batches_per_sec": 29.3,
+        "cells_per_sec": 29880.0,
+        "batches_per_sec__pyscx_training_dataset_workers2": 29.3,
+        "cells_per_sec__pyscx_training_dataset_workers2": 29880.0,
+        "peak_rss_mb__pyscx_training_dataset_workers2": 1421.7
+      }
+    },
+    {
+      "wall_s": 3.3889337610453367,
+      "user_s": 0.3276369999999815,
+      "sys_s": 0.7210269999999923,
+      "peak_rss_mb": 1411.23828125,
+      "extra": {
+        "scenario": "pyscx_training_dataset_workers2",
+        "n_batches": 98,
+        "n_cells": 100000,
+        "n_epochs_per_run": 1,
+        "wall_s_per_epoch": 3.3889,
+        "batches_per_sec": 28.9,
+        "cells_per_sec": 29508.0,
+        "batches_per_sec__pyscx_training_dataset_workers2": 28.9,
+        "cells_per_sec__pyscx_training_dataset_workers2": 29508.0,
+        "peak_rss_mb__pyscx_training_dataset_workers2": 1411.2
+      }
+    },
+    {
+      "wall_s": 6.618008038960397,
+      "user_s": 0.5721529999999859,
+      "sys_s": 1.6700859999999977,
+      "peak_rss_mb": 1429.68359375,
+      "extra": {
+        "scenario": "pyscx_training_dataset_workers2_persistent",
+        "n_batches": 196,
+        "n_cells": 200000,
+        "n_epochs_per_run": 2,
+        "wall_s_per_epoch": 3.309,
+        "batches_per_sec": 14.8,
+        "cells_per_sec": 15110.0,
+        "batches_per_sec__pyscx_training_dataset_workers2_persistent": 14.8,
+        "cells_per_sec__pyscx_training_dataset_workers2_persistent": 15110.0,
+        "peak_rss_mb__pyscx_training_dataset_workers2_persistent": 1429.7
+      }
+    },
+    {
+      "wall_s": 6.529116166057065,
+      "user_s": 0.5342709999999897,
+      "sys_s": 1.3753480000000025,
+      "peak_rss_mb": 1424.17578125,
+      "extra": {
+        "scenario": "pyscx_training_dataset_workers2_persistent",
+        "n_batches": 196,
+        "n_cells": 200000,
+        "n_epochs_per_run": 2,
+        "wall_s_per_epoch": 3.2646,
+        "batches_per_sec": 15.0,
+        "cells_per_sec": 15316.0,
+        "batches_per_sec__pyscx_training_dataset_workers2_persistent": 15.0,
+        "cells_per_sec__pyscx_training_dataset_workers2_persistent": 15316.0,
+        "peak_rss_mb__pyscx_training_dataset_workers2_persistent": 1424.2
+      }
+    },
+    {
+      "wall_s": 6.514962879940867,
+      "user_s": 0.5401600000000144,
+      "sys_s": 1.526200000000017,
+      "peak_rss_mb": 1421.68359375,
+      "extra": {
+        "scenario": "pyscx_training_dataset_workers2_persistent",
+        "n_batches": 196,
+        "n_cells": 200000,
+        "n_epochs_per_run": 2,
+        "wall_s_per_epoch": 3.2575,
+        "batches_per_sec": 15.0,
+        "cells_per_sec": 15349.0,
+        "batches_per_sec__pyscx_training_dataset_workers2_persistent": 15.0,
+        "cells_per_sec__pyscx_training_dataset_workers2_persistent": 15349.0,
+        "peak_rss_mb__pyscx_training_dataset_workers2_persistent": 1421.7
+      }
+    }
+  ],
+  "median_wall_s": 2.878042471129447,
+  "wall_s_iqr": 4.314197917934507,
+  "n_runs": 21,
+  "file_size_bytes": 448877610,
+  "metadata": {
+    "batch_size": 1024,
+    "n_hvgs": 2000,
+    "n_warmup_epochs": 1,
+    "n_ttfb_runs": 3,
+    "cold_cache": false,
+    "loader_type": "scx",
+    "gpu_available": true,
+    "scenario_summary": {
+      "raw": {
+        "n_runs": 3,
+        "median_batches_per_sec": 34.1,
+        "median_cells_per_sec": 34746.0,
+        "median_peak_rss_mb": 928.2,
+        "ttfb_median_s": 2.0443,
+        "ttfb_all_s": [
+          2.0649,
+          2.0443,
+          2.0217
+        ]
+      },
+      "hvg": {
+        "n_runs": 3,
+        "median_batches_per_sec": 47.1,
+        "median_cells_per_sec": 48060.0,
+        "median_peak_rss_mb": 916.1,
+        "ttfb_median_s": 2.004,
+        "ttfb_all_s": [
+          2.004,
+          1.9941,
+          2.006
+        ]
+      },
+      "norm": {
+        "n_runs": 3,
+        "median_batches_per_sec": 11.6,
+        "median_cells_per_sec": 11866.0,
+        "median_peak_rss_mb": 930.1,
+        "ttfb_median_s": 2.1418,
+        "ttfb_all_s": [
+          2.1418,
+          2.1216,
+          2.1722
+        ]
+      },
+      "hvg_norm": {
+        "n_runs": 3,
+        "median_batches_per_sec": 44.5,
+        "median_cells_per_sec": 45438.0,
+        "median_peak_rss_mb": 917.6,
+        "ttfb_median_s": 2.0103,
+        "ttfb_all_s": [
+          2.0183,
+          2.002,
+          2.0103
+        ]
+      },
+      "gpu_train": {
+        "n_runs": 3,
+        "median_batches_per_sec": 44.0,
+        "median_cells_per_sec": 44880.0,
+        "avg_gpu_util_pct": 2.5,
+        "target_gpu_util_pct": 85,
+        "pass": false,
+        "median_data_wait_fraction_steady": 0.003546,
+        "median_ttfb_s": 1.8775,
+        "median_data_wait_fraction_all_steps": 0.84286,
+        "median_batch_wait_ms_p50": 0.013,
+        "median_batch_wait_ms_p95": 0.015,
+        "n_steps": [
+          98,
+          98,
+          98
+        ],
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batch_size": 1024
+      },
+      "pyscx_training_dataset_workers2": {
+        "n_runs": 3,
+        "median_batches_per_sec": 29.2,
+        "median_cells_per_sec": 29763.0,
+        "median_peak_rss_mb": 1421.7,
+        "num_workers": 2,
+        "persistent_workers": false,
+        "n_epochs_per_run": 1
+      },
+      "pyscx_training_dataset_workers2_persistent": {
+        "n_runs": 3,
+        "median_batches_per_sec": 15.0,
+        "median_cells_per_sec": 15316.0,
+        "median_peak_rss_mb": 1424.2,
+        "num_workers": 2,
+        "persistent_workers": true,
+        "n_epochs_per_run": 2
+      }
+    }
+  },
+  "scenario": {
+    "name": "default",
+    "batch_size": 1024,
+    "n_hvgs": 2000,
+    "device": "gpu"
+  }
+}

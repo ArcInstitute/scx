@@ -1,0 +1,347 @@
+{
+  "schema_version": 2,
+  "benchmark": "cellset_gather_scatter_routes",
+  "format": "scx_v4reframed_on",
+  "dataset": "pbmc10k_v4reframed",
+  "timestamp": "2026-09-13T06:51:34",
+  "system": {
+    "hostname": "GPUCACE",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu_cores_physical": 192,
+    "ram_gb": 1007,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": true
+    },
+    "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M2DGK7AV774BB15D4WXX0WKR",
+      "git_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "git_branch": "phase0-dataload-gate",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-12-gab0fb96b-dirty",
+      "rayon_threads": "",
+      "omp_threads": "1",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 0.7422,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 678.2,
+      "extra": {
+        "scenario": "gather_random",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": true,
+        "cellsets_per_sec": 1077.91,
+        "ttfb_first_set_s": 0.2567,
+        "full_shard_groups": 0,
+        "block_index_groups": 800
+      }
+    },
+    {
+      "wall_s": 0.619,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 686.4,
+      "extra": {
+        "scenario": "gather_random",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": true,
+        "cellsets_per_sec": 1292.34,
+        "ttfb_first_set_s": 0.2622,
+        "full_shard_groups": 0,
+        "block_index_groups": 800
+      }
+    },
+    {
+      "wall_s": 0.6888,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 677.4,
+      "extra": {
+        "scenario": "gather_random",
+        "set_size": 64,
+        "cache_policy": "cold_fadvise",
+        "scatter_block_index": true,
+        "cellsets_per_sec": 1161.48,
+        "ttfb_first_set_s": 0.2587,
+        "full_shard_groups": 0,
+        "block_index_groups": 800
+      }
+    }
+  ],
+  "median_wall_s": 0.6888,
+  "wall_s_iqr": 0.12319999999999998,
+  "n_runs": 3,
+  "file_size_bytes": 30101723,
+  "metadata": {
+    "arm": "on",
+    "scatter_block_index": true,
+    "median_cellsets_per_sec": 1161.48,
+    "full_shard_groups": 0,
+    "block_index_groups": 800,
+    "shard_cache_hit_rate": null,
+    "source": "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc10k_auto.scx",
+    "framed_path": "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/pbmc10k/pbmc10k_auto_framed.scx",
+    "source_info": {
+      "codec": "shufdelta",
+      "codec_breakdown": {
+        "shufdelta": 1
+      },
+      "codec_default": "scx1",
+      "file_size_bytes": 30101603,
+      "format_version": 4,
+      "has_csc": false,
+      "index_dtype": "u16",
+      "manifest_sequence": 1,
+      "n_csc_shards": 0,
+      "n_csr_shards": 1,
+      "n_obs": 11769,
+      "n_vars": 33538,
+      "nnz": 24825783,
+      "provenance": [
+        {
+          "action": "from_anndata",
+          "params": "{\"codec_selection\":{\"profile\":\"auto\"}}",
+          "timestamp": 1783894488,
+          "tool": "pyscx 0.11.0"
+        }
+      ],
+      "sections": [
+        {
+          "length": 358154,
+          "name": "obs",
+          "offset": 4352,
+          "type": "obs_metadata"
+        },
+        {
+          "length": 670730,
+          "name": "var_metadata/shard_0",
+          "offset": 362512,
+          "type": "var_metadata/shard_0"
+        },
+        {
+          "length": 671762,
+          "name": "var_metadata/shard_1",
+          "offset": 1033248,
+          "type": "var_metadata/shard_1"
+        },
+        {
+          "length": 36362,
+          "name": "var_metadata/shard_2",
+          "offset": 1705016,
+          "type": "var_metadata/shard_2"
+        },
+        {
+          "length": 28026659,
+          "name": "X_shard_0",
+          "offset": 1741384,
+          "type": "X/csr"
+        },
+        {
+          "length": 332488,
+          "name": "obs_predicate_index",
+          "offset": 29768048,
+          "type": "obs_predicate_index"
+        },
+        {
+          "length": 89,
+          "name": "var_predicate_index",
+          "offset": 30100536,
+          "type": "var_predicate_index"
+        },
+        {
+          "length": 84,
+          "name": "provenance",
+          "offset": 30100632,
+          "type": "provenance"
+        }
+      ],
+      "shard_target_rows": 16384
+    },
+    "framed_info": {
+      "codec": "shufdelta",
+      "codec_breakdown": {
+        "shufdelta": 1
+      },
+      "codec_default": "shufdelta",
+      "file_size_bytes": 30101723,
+      "format_version": 4,
+      "has_csc": false,
+      "index_dtype": "u16",
+      "manifest_sequence": 0,
+      "n_csc_shards": 0,
+      "n_csr_shards": 1,
+      "n_obs": 11769,
+      "n_vars": 33538,
+      "nnz": 24825783,
+      "provenance": [
+        {
+          "action": "from_anndata",
+          "params": "{\"codec_selection\":{\"profile\":\"auto\"}}",
+          "timestamp": 1783894488,
+          "tool": "pyscx 0.11.0"
+        },
+        {
+          "action": "optimize",
+          "params": "{\"canonicalize\":true,\"sidecars\":true,\"shard_obs\":\"auto\",\"obs_resharded\":false}",
+          "timestamp": 1789307485,
+          "tool": "scx-cli 0.18.0"
+        }
+      ],
+      "sections": [
+        {
+          "length": 358154,
+          "name": "obs",
+          "offset": 4352,
+          "type": "obs_metadata"
+        },
+        {
+          "length": 670730,
+          "name": "var_metadata/shard_0",
+          "offset": 362512,
+          "type": "var_metadata/shard_0"
+        },
+        {
+          "length": 671762,
+          "name": "var_metadata/shard_1",
+          "offset": 1033248,
+          "type": "var_metadata/shard_1"
+        },
+        {
+          "length": 36362,
+          "name": "var_metadata/shard_2",
+          "offset": 1705016,
+          "type": "var_metadata/shard_2"
+        },
+        {
+          "length": 28026659,
+          "name": "X_shard_0",
+          "offset": 1741384,
+          "type": "X/csr"
+        },
+        {
+          "length": 332488,
+          "name": "obs_predicate_index",
+          "offset": 29768048,
+          "type": "obs_predicate_index"
+        },
+        {
+          "length": 89,
+          "name": "var_predicate_index",
+          "offset": 30100536,
+          "type": "var_predicate_index"
+        },
+        {
+          "length": 201,
+          "name": "provenance",
+          "offset": 30100632,
+          "type": "provenance"
+        }
+      ],
+      "shard_target_rows": 16384,
+      "_reframe_wall_s": 0.8
+    },
+    "pyscx_version": "0.18.0",
+    "n_obs": 11769,
+    "set_size": 64,
+    "block_index_reachable": true,
+    "speedup_off_over_on": 1.052,
+    "speedup_default_over_on": 1.005,
+    "default_matches_off": true,
+    "premises": {
+      "on arm reached the block-index route": true,
+      "off arm took the full-shard route": true,
+      "off arm did not reach the block-index route": true,
+      "the default agrees with the explicit False": true
+    },
+    "provenance": {
+      "checkout_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "branch": "phase0-dataload-gate",
+      "dirty": true,
+      "dirty_paths": [
+        "benchmarks/README.md",
+        "benchmarks/comprehensive/benchmarks/cellset_gather.py",
+        "benchmarks/comprehensive/benchmarks/index_plan.py",
+        "benchmarks/comprehensive/benchmarks/ml_loader.py",
+        "benchmarks/comprehensive/benchmarks/obs_open.py",
+        "benchmarks/comprehensive/thresholds.yaml",
+        "benchmarks/scripts/bench_cellset_scatter_routes.py",
+        "benchmarks/scripts/bench_cellset_scatter_routes.sbatch",
+        "docs/performance.md",
+        "2026-08-05_CODE-REVIEW.md",
+        "2026-08-05_CODE-REVIEW_ORGANIZE.md",
+        "2026-08-25_CODE-REVIEW_OPT.md",
+        "2026-09-12_ML-LOADER-OPT.md",
+        "REVIEW.md",
+        "benchmarks/comprehensive/data_wait.py",
+        "benchmarks/comprehensive/tests/test_phase0_data_wait.py",
+        "benchmarks/scripts/_phase0_data_wait_summary.py",
+        "benchmarks/scripts/_run_phase0_data_wait_gate.sh"
+      ],
+      "dirty_tracked_paths": [
+        "benchmarks/README.md",
+        "benchmarks/comprehensive/benchmarks/cellset_gather.py",
+        "benchmarks/comprehensive/benchmarks/index_plan.py",
+        "benchmarks/comprehensive/benchmarks/ml_loader.py",
+        "benchmarks/comprehensive/benchmarks/obs_open.py",
+        "benchmarks/comprehensive/thresholds.yaml",
+        "benchmarks/scripts/bench_cellset_scatter_routes.py",
+        "benchmarks/scripts/bench_cellset_scatter_routes.sbatch",
+        "docs/performance.md"
+      ],
+      "hostname": "GPUCACE",
+      "slurm_job_id": "2943593",
+      "slurm_partition": "cpu_batch",
+      "argv": [
+        "--source",
+        "/large_storage/arcinfra/projects/scx/benchmarks/datasets/pbmc10k_auto.scx",
+        "--workdir",
+        "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/pbmc10k",
+        "--out",
+        "/large_storage/arcinfra/projects/scx/scratch/phase0/routes/pbmc10k_auto.json",
+        "--n-runs",
+        "3",
+        "--n-batches",
+        "50",
+        "--raw-subdir",
+        "phase0_scatter_routes"
+      ]
+    }
+  }
+}

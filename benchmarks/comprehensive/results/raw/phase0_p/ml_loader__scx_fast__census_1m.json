@@ -1,0 +1,427 @@
+{
+  "schema_version": 2,
+  "benchmark": "ml_loader",
+  "format": "scx_fast",
+  "dataset": "census_1m",
+  "timestamp": "2026-09-13T15:29:15",
+  "system": {
+    "hostname": "GPU1142",
+    "os": "Linux 5.15.0-190-generic",
+    "arch": "x86_64",
+    "python_version": "3.13.13",
+    "cpu": "Intel(R) Xeon(R) Platinum 8468",
+    "cpu_cores_physical": 192,
+    "ram_gb": 2015,
+    "rust_version": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "library_versions": {
+      "anndata": "0.12.10",
+      "scanpy": "1.12",
+      "zarr": "3.1.5",
+      "h5py": "3.16.0",
+      "scipy": "1.17.1",
+      "numpy": "2.4.3",
+      "pandas": "2.3.3",
+      "pyarrow": "23.0.1",
+      "tiledbsoma": "2.3.0",
+      "torch": "2.5.1+cu121",
+      "matplotlib": "3.10.8",
+      "seaborn": "0.13.2",
+      "scikit-learn": "1.8.0",
+      "umap-learn": "0.5.11",
+      "leidenalg": "0.11.0",
+      "igraph": "1.0.0",
+      "psutil": "7.2.2",
+      "pyscx": "0.18.0"
+    },
+    "storage": {
+      "scratch_device": "172.18.140.201,172.18.140.202,172.18.140.203,172.18.140.204,172.18.140.205,172.18.140.206,172.18.140.207,172.18.140.208/scratch",
+      "scratch_fstype": "wekafs",
+      "has_nvme": true
+    },
+    "gpu": {
+      "cuda_runtime": "Cuda compilation tools, release 12.6, V12.6.85",
+      "driver_version": "560.35.05",
+      "gpu_name": "NVIDIA H100 80GB HBM3",
+      "nvidia_fs_loaded": false
+    },
+    "provenance": {
+      "run_id": "01M2EE64AM7A5THSX3KYCF3QVN",
+      "git_sha": "ab0fb96b03c376c7382f41b704c2c2c04fed3383",
+      "git_branch": "phase0-dataload-gate",
+      "git_dirty": true,
+      "git_describe": "pyscx-v0.18.0-12-gab0fb96b-dirty",
+      "rayon_threads": "",
+      "omp_threads": "",
+      "mkl_threads": "",
+      "conda_env": "scx-bench",
+      "pyscx_features": ""
+    }
+  },
+  "runs": [
+    {
+      "wall_s": 22.647590158041567,
+      "user_s": 21.640337000000002,
+      "sys_s": 66.811979,
+      "peak_rss_mb": 2256.4375,
+      "extra": {
+        "scenario": "raw",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 43.1,
+        "cells_per_sec": 44155.0,
+        "batches_per_sec__raw": 43.1,
+        "cells_per_sec__raw": 44155.0,
+        "ttfb_median_s__raw": 11.6438
+      }
+    },
+    {
+      "wall_s": 22.613931437022984,
+      "user_s": 21.068548000000007,
+      "sys_s": 65.77049,
+      "peak_rss_mb": 2394.46484375,
+      "extra": {
+        "scenario": "raw",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 43.2,
+        "cells_per_sec": 44221.0,
+        "batches_per_sec__raw": 43.2,
+        "cells_per_sec__raw": 44221.0
+      }
+    },
+    {
+      "wall_s": 22.208030123030767,
+      "user_s": 20.909999,
+      "sys_s": 63.946544999999986,
+      "peak_rss_mb": 2394.46484375,
+      "extra": {
+        "scenario": "raw",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 44.0,
+        "cells_per_sec": 45029.0,
+        "batches_per_sec__raw": 44.0,
+        "cells_per_sec__raw": 45029.0
+      }
+    },
+    {
+      "wall_s": 20.60129530285485,
+      "user_s": 17.916627000000005,
+      "sys_s": 6.476625000000013,
+      "peak_rss_mb": 2316.78515625,
+      "extra": {
+        "scenario": "hvg",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 47.4,
+        "cells_per_sec": 48541.0,
+        "batches_per_sec__hvg": 47.4,
+        "cells_per_sec__hvg": 48541.0,
+        "ttfb_median_s__hvg": 10.8078
+      }
+    },
+    {
+      "wall_s": 21.09352115401998,
+      "user_s": 19.933650999999998,
+      "sys_s": 6.844337999999993,
+      "peak_rss_mb": 2359.0234375,
+      "extra": {
+        "scenario": "hvg",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 46.3,
+        "cells_per_sec": 47408.0,
+        "batches_per_sec__hvg": 46.3,
+        "cells_per_sec__hvg": 47408.0
+      }
+    },
+    {
+      "wall_s": 20.13568271114491,
+      "user_s": 16.891969000000017,
+      "sys_s": 7.09119800000002,
+      "peak_rss_mb": 2359.0234375,
+      "extra": {
+        "scenario": "hvg",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 48.5,
+        "cells_per_sec": 49663.0,
+        "batches_per_sec__hvg": 48.5,
+        "cells_per_sec__hvg": 49663.0
+      }
+    },
+    {
+      "wall_s": 75.27996501186863,
+      "user_s": 270.6136919999999,
+      "sys_s": 295.0995459999999,
+      "peak_rss_mb": 2462.26171875,
+      "extra": {
+        "scenario": "norm",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 13.0,
+        "cells_per_sec": 13284.0,
+        "batches_per_sec__norm": 13.0,
+        "cells_per_sec__norm": 13284.0,
+        "ttfb_median_s__norm": 11.4842
+      }
+    },
+    {
+      "wall_s": 75.35798222804442,
+      "user_s": 270.3453860000001,
+      "sys_s": 290.130767,
+      "peak_rss_mb": 2450.0390625,
+      "extra": {
+        "scenario": "norm",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 13.0,
+        "cells_per_sec": 13270.0,
+        "batches_per_sec__norm": 13.0,
+        "cells_per_sec__norm": 13270.0
+      }
+    },
+    {
+      "wall_s": 74.56093345605768,
+      "user_s": 269.821543,
+      "sys_s": 294.23935099999994,
+      "peak_rss_mb": 2450.0390625,
+      "extra": {
+        "scenario": "norm",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 13.1,
+        "cells_per_sec": 13412.0,
+        "batches_per_sec__norm": 13.1,
+        "cells_per_sec__norm": 13412.0
+      }
+    },
+    {
+      "wall_s": 20.334189750021324,
+      "user_s": 26.169681999999966,
+      "sys_s": 6.4487759999999525,
+      "peak_rss_mb": 2496.21875,
+      "extra": {
+        "scenario": "hvg_norm",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 48.0,
+        "cells_per_sec": 49178.0,
+        "batches_per_sec__hvg_norm": 48.0,
+        "cells_per_sec__hvg_norm": 49178.0,
+        "ttfb_median_s__hvg_norm": 10.2225
+      }
+    },
+    {
+      "wall_s": 21.174616735894233,
+      "user_s": 26.84597800000006,
+      "sys_s": 7.054742000000033,
+      "peak_rss_mb": 2427.78515625,
+      "extra": {
+        "scenario": "hvg_norm",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 46.1,
+        "cells_per_sec": 47226.0,
+        "batches_per_sec__hvg_norm": 46.1,
+        "cells_per_sec__hvg_norm": 47226.0
+      }
+    },
+    {
+      "wall_s": 20.648370962124318,
+      "user_s": 26.764310000000023,
+      "sys_s": 6.7477040000001125,
+      "peak_rss_mb": 2418.3359375,
+      "extra": {
+        "scenario": "hvg_norm",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 47.3,
+        "cells_per_sec": 48430.0,
+        "batches_per_sec__hvg_norm": 47.3,
+        "cells_per_sec__hvg_norm": 48430.0
+      }
+    },
+    {
+      "wall_s": 13.37704077293165,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3075.80078125,
+      "extra": {
+        "scenario": "gpu_train",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 73.0,
+        "cells_per_sec": 74755.0,
+        "avg_gpu_util_pct": 2.4,
+        "gpu_util_samples": 24,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batches_per_sec__gpu_train": 73.0,
+        "cells_per_sec__gpu_train": 74755.0,
+        "avg_gpu_util_pct__gpu_train": 2.4,
+        "data_wait_fraction__gpu_train": 0.78327,
+        "data_wait_s__gpu_train": 10.4778,
+        "batch_wait_ms_p50__gpu_train": 0.013,
+        "batch_wait_ms_p95__gpu_train": 0.016,
+        "batch_wait_ms_p99__gpu_train": 0.557,
+        "batch_wait_ms_max__gpu_train": 1932.967,
+        "data_wait_fraction_steady__gpu_train": 0.746661,
+        "ttfb_s__gpu_train": 1.933,
+        "n_steady_steps__gpu_train": 976
+      }
+    },
+    {
+      "wall_s": 13.671433770097792,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3046.09375,
+      "extra": {
+        "scenario": "gpu_train",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 71.5,
+        "cells_per_sec": 73145.0,
+        "avg_gpu_util_pct": 7.9,
+        "gpu_util_samples": 25,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batches_per_sec__gpu_train": 71.5,
+        "cells_per_sec__gpu_train": 73145.0,
+        "avg_gpu_util_pct__gpu_train": 7.9,
+        "data_wait_fraction__gpu_train": 0.78092,
+        "data_wait_s__gpu_train": 10.6763,
+        "batch_wait_ms_p50__gpu_train": 0.013,
+        "batch_wait_ms_p95__gpu_train": 0.256,
+        "batch_wait_ms_p99__gpu_train": 2.246,
+        "batch_wait_ms_max__gpu_train": 1800.794,
+        "data_wait_fraction_steady__gpu_train": 0.753819,
+        "ttfb_s__gpu_train": 1.5049,
+        "n_steady_steps__gpu_train": 976
+      }
+    },
+    {
+      "wall_s": 14.003398132044822,
+      "user_s": 0.0,
+      "sys_s": 0.0,
+      "peak_rss_mb": 3053.30078125,
+      "extra": {
+        "scenario": "gpu_train",
+        "n_batches": 977,
+        "n_cells": 1000000,
+        "batches_per_sec": 69.8,
+        "cells_per_sec": 71411.0,
+        "avg_gpu_util_pct": 5.3,
+        "gpu_util_samples": 25,
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batches_per_sec__gpu_train": 69.8,
+        "cells_per_sec__gpu_train": 71411.0,
+        "avg_gpu_util_pct__gpu_train": 5.3,
+        "data_wait_fraction__gpu_train": 0.78437,
+        "data_wait_s__gpu_train": 10.9839,
+        "batch_wait_ms_p50__gpu_train": 0.013,
+        "batch_wait_ms_p95__gpu_train": 0.284,
+        "batch_wait_ms_p99__gpu_train": 1.058,
+        "batch_wait_ms_max__gpu_train": 1983.115,
+        "data_wait_fraction_steady__gpu_train": 0.748798,
+        "ttfb_s__gpu_train": 1.9831,
+        "n_steady_steps__gpu_train": 976
+      }
+    }
+  ],
+  "median_wall_s": 21.09352115401998,
+  "wall_s_iqr": 2.5119074468966573,
+  "n_runs": 15,
+  "file_size_bytes": 3988754629,
+  "metadata": {
+    "batch_size": 1024,
+    "n_hvgs": 2000,
+    "n_warmup_epochs": 1,
+    "n_ttfb_runs": 3,
+    "cold_cache": false,
+    "loader_type": "scx",
+    "gpu_available": true,
+    "scenario_summary": {
+      "raw": {
+        "n_runs": 3,
+        "median_batches_per_sec": 43.2,
+        "median_cells_per_sec": 44221.0,
+        "median_peak_rss_mb": 2394.5,
+        "ttfb_median_s": 11.6438,
+        "ttfb_all_s": [
+          11.6438,
+          11.6645,
+          11.416
+        ]
+      },
+      "hvg": {
+        "n_runs": 3,
+        "median_batches_per_sec": 47.4,
+        "median_cells_per_sec": 48541.0,
+        "median_peak_rss_mb": 2359.0,
+        "ttfb_median_s": 10.8078,
+        "ttfb_all_s": [
+          10.8078,
+          11.3085,
+          10.7418
+        ]
+      },
+      "norm": {
+        "n_runs": 3,
+        "median_batches_per_sec": 13.0,
+        "median_cells_per_sec": 13284.0,
+        "median_peak_rss_mb": 2450.0,
+        "ttfb_median_s": 11.4842,
+        "ttfb_all_s": [
+          11.5473,
+          11.2783,
+          11.4842
+        ]
+      },
+      "hvg_norm": {
+        "n_runs": 3,
+        "median_batches_per_sec": 47.3,
+        "median_cells_per_sec": 48430.0,
+        "median_peak_rss_mb": 2427.8,
+        "ttfb_median_s": 10.2225,
+        "ttfb_all_s": [
+          10.8108,
+          10.2225,
+          10.124
+        ]
+      },
+      "gpu_train": {
+        "n_runs": 3,
+        "median_batches_per_sec": 71.5,
+        "median_cells_per_sec": 73145.0,
+        "avg_gpu_util_pct": 5.3,
+        "target_gpu_util_pct": 85,
+        "pass": false,
+        "median_data_wait_fraction_steady": 0.748798,
+        "median_ttfb_s": 1.933,
+        "median_data_wait_fraction_all_steps": 0.78327,
+        "median_batch_wait_ms_p50": 0.013,
+        "median_batch_wait_ms_p95": 0.256,
+        "median_batch_wait_ms_p99": 1.058,
+        "max_batch_wait_ms": 1983.115,
+        "n_steps": [
+          977,
+          977,
+          977
+        ],
+        "model": "scVI-equivalent VAE (2L, 128h, 128z)",
+        "batch_size": 1024
+      },
+      "pyscx_training_dataset_workers2": {
+        "skipped": "n_obs 1000000 > 250000"
+      },
+      "pyscx_training_dataset_workers2_persistent": {
+        "skipped": "n_obs 1000000 > 250000"
+      }
+    }
+  },
+  "scenario": {
+    "name": "default",
+    "batch_size": 1024,
+    "n_hvgs": 2000,
+    "device": "gpu"
+  }
+}

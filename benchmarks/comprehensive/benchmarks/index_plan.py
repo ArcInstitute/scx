@@ -66,6 +66,10 @@ from benchmarks.comprehensive.config import (
     ML_BATCH_SIZE,
     QUERY_N_HVGS,
 )
+from benchmarks.comprehensive.data_wait import (
+    data_wait_fraction,
+    steady_state_wait,
+)
 from benchmarks.comprehensive.results import BenchmarkResult
 
 logger = logging.getLogger(__name__)
@@ -143,6 +147,40 @@ def _have_pyscx() -> bool:
 def _peak_rss_mb() -> float:
     """High-water-mark RSS via ``ru_maxrss``."""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def _null_model_ms() -> float:
+    """Per-batch fixed cost for the R3 data-wait arm, in ms. ``0`` = off.
+
+    ``pyscx_index_plan_dataset_workers2`` drives a consumer loop with **no
+    model step at all** — it counts batches — so a data-wait fraction measured
+    against it is ~1.0 by construction and says nothing about whether a
+    training run would be data-bound. The fraction needs a step to be a
+    fraction *of*, so this knob buys one: ``time.sleep`` (not a spin, because
+    releasing the GIL while the two DataLoader workers prefetch is what a real
+    step does) of a declared duration per batch.
+
+    Read per call rather than pinned at import so a test can set the env and
+    re-read it without reloading the module, and **default 0**: a fixed cost
+    added unconditionally would inflate this benchmark's pooled
+    ``median_wall_s``, which is gated against ``LATEST``, and read as a timing
+    regression on a benchmark whose subject did not change. Phase 0 turns it on
+    for one separate, non-promoted capture.
+
+    A malformed value resolves to ``0`` rather than raising: this is read
+    inside a capture that may already be hours in.
+    """
+    raw = os.environ.get("SCX_BENCH_R3_NULL_MODEL_MS", "")
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "SCX_BENCH_R3_NULL_MODEL_MS=%r is not a number — R3 null model off",
+            raw,
+        )
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +275,27 @@ class _ScenarioOutcome:
     gather_latency_ms_mean: float | None = None
     gather_latency_ms_p50: float | None = None
     gather_latency_ms_p99: float | None = None
+    # Phase-0 gate (R3): the fraction of the timed region the consumer spent
+    # blocked in `next(loader)`, against the fixed-cost step `_null_model_ms()`
+    # buys. **Only the two fractions are gated on the knob** — a fraction needs
+    # a step to be a fraction *of*, so it is `None` when the knob is off (and
+    # `None` rather than `0.0`: the gate skips a null metric, while a zero would
+    # read as "the loader never stalled", the claim the metric exists to test).
+    # `ttfb_s`, the percentiles and `n_steady_steps` are properties of the
+    # loader alone, meaningful with or without a consumer step, so they are
+    # always emitted.
+    data_wait_fraction: float | None = None
+    batch_wait_ms_p50: float | None = None
+    batch_wait_ms_p95: float | None = None
+    batch_wait_ms_p99: float | None = None
+    batch_wait_ms_max: float | None = None
+    null_model_ms: float | None = None
+    # Startup split out — see `steady_state_wait`. The first `next(loader)`
+    # also pays DataLoader worker spawn here, which is larger than the tokio
+    # spin-up the single-process path pays.
+    ttfb_s: float | None = None
+    data_wait_fraction_steady: float | None = None
+    n_steady_steps: int = 0
 
 
 def _run_index_plan(
@@ -522,18 +581,65 @@ def _run_index_plan_workers2(
         collate_fn=_passthrough_collate,
     )
 
+    # Explicit iterator, not `for batch in loader:`, so each `next()` can be
+    # timed: the R3 half of the phase-0 data-wait gate. `null_ms` is 0 by
+    # default, in which case this is the same loop plus two `perf_counter()`
+    # calls per batch and the fraction is reported as `None`.
+    null_ms = _null_model_ms()
+    null_s = null_ms / 1000.0
+    waits_s: list[float] = []
+    # `t0` BEFORE `iter(loader)`: PyTorch spawns the worker processes while
+    # building the iterator, so timing from after it excluded worker spawn from
+    # both `wall` and `ttfb_s` while the docs credited it to the first `next()`.
     t0 = time.perf_counter()
+    it = iter(loader)
+    first_wait_from = t0
     seen = 0
     cells = 0
-    for batch in loader:
+    wall = 0.0
+    while True:
+        w0 = first_wait_from if not waits_s else time.perf_counter()
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        waits_s.append(time.perf_counter() - w0)
         seen += 1
         cells += 2 * batch["X"].shape[0]
-    wall = time.perf_counter() - t0
+        if null_s:
+            # The stand-in training step. Sleeping (rather than spinning)
+            # releases the GIL so the two worker processes prefetch behind it,
+            # which is the overlap a real step gives the loader.
+            time.sleep(null_s)
+        # Close the timed region after the last SUCCESSFUL step. The `next()`
+        # that raises StopIteration also runs `_shutdown_workers()` under
+        # `persistent_workers=False`, and that join lands in `wall` but not in
+        # `waits_s` — biasing `data_wait_fraction` down by a teardown cost that
+        # is a real fraction of a 50-batch region.
+        wall = time.perf_counter() - t0
+    # Percentiles from `steady` (post-startup slice) — see `steady_state_wait`.
+    steady = steady_state_wait(waits_s, wall)
     return _ScenarioOutcome(
         n_batches=seen,
         n_cells=cells,
         wall_s=wall,
         peak_rss_mb=max(rss0, _peak_rss_mb()),
+        # Only meaningful against a step: with no null model the consumer is a
+        # counter, so the fraction would be ~1.0 by construction and would say
+        # nothing about a training run.
+        data_wait_fraction=(
+            data_wait_fraction(waits_s, wall) if null_ms else None
+        ),
+        batch_wait_ms_p50=steady["p50_ms"],
+        batch_wait_ms_p95=steady["p95_ms"],
+        batch_wait_ms_p99=steady["p99_ms"],
+        batch_wait_ms_max=steady["max_ms"],
+        null_model_ms=null_ms,
+        ttfb_s=steady["ttfb_s"],
+        data_wait_fraction_steady=(
+            steady["data_wait_fraction_steady"] if null_ms else None
+        ),
+        n_steady_steps=steady["n_steady_steps"],
     )
 
 
@@ -816,6 +922,23 @@ def run(
                 f"estimate_overshoot_mb__{scenario_name}": (
                     outcome.estimate_overshoot_mb
                 ),
+                # Phase-0 gate (R3). `None` on every scenario that does not
+                # drive a consumer against a step — which is all of them
+                # unless `SCX_BENCH_R3_NULL_MODEL_MS` is set. The slot is
+                # emitted uniformly so the key stays stable, exactly as
+                # `shard_cache_hit_rate__*` above.
+                f"data_wait_fraction__{scenario_name}": outcome.data_wait_fraction,
+                f"batch_wait_ms_p50__{scenario_name}": outcome.batch_wait_ms_p50,
+                f"batch_wait_ms_p95__{scenario_name}": outcome.batch_wait_ms_p95,
+                f"batch_wait_ms_p99__{scenario_name}": outcome.batch_wait_ms_p99,
+                f"batch_wait_ms_max__{scenario_name}": outcome.batch_wait_ms_max,
+                f"null_model_ms__{scenario_name}": outcome.null_model_ms,
+                # The headline `p` for R3 — startup excluded.
+                f"data_wait_fraction_steady__{scenario_name}": (
+                    outcome.data_wait_fraction_steady
+                ),
+                f"ttfb_s__{scenario_name}": outcome.ttfb_s,
+                f"n_steady_steps__{scenario_name}": outcome.n_steady_steps,
             }
             result.add_run(
                 wall_s=wall,
