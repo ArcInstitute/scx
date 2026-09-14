@@ -707,8 +707,34 @@ impl SparseCellSetLoader {
 
         let mut indptr: Vec<i64> = Vec::with_capacity(total_rows + 1);
         indptr.push(0);
-        let mut indices: Vec<i32> = Vec::new();
-        let mut data: Vec<f32> = Vec::new();
+        // Pre-size the two nnz-sized outputs from the plan's stored row
+        // lengths so the append loop below never reallocates. Without this
+        // they grow geometrically from empty, and the cost is an allocation
+        // plus a full copy of everything written so far at each doubling —
+        // priced as allocations, not memcpys.
+        //
+        // The sum is exact for raw-local output and an upper bound once a
+        // transform can drop entries (`-1` remap sentinels, coalescing, a
+        // seeded downsample's pruning), so capacity >= final length on every
+        // path. `nnz_for_rows` reads indptr only and never touches the LRU, so
+        // prescanning here cannot change which row groups the gather admits.
+        //
+        // A prescan failure is not fatal: it only costs the pre-sizing, so a
+        // reader that cannot answer falls back to growth rather than failing a
+        // gather that would otherwise succeed.
+        let planned_nnz: usize = {
+            let mut by_file: std::collections::HashMap<u32, Vec<u64>> =
+                std::collections::HashMap::new();
+            for (&fid, &row) in plan.file_ids.iter().zip(plan.rows.iter()) {
+                by_file.entry(fid).or_default().push(row);
+            }
+            by_file
+                .into_iter()
+                .map(|(fid, rows)| engine.reader(fid).nnz_for_rows(&rows).unwrap_or(0))
+                .sum()
+        };
+        let mut indices: Vec<i32> = Vec::with_capacity(planned_nnz);
+        let mut data: Vec<f32> = Vec::with_capacity(planned_nnz);
         let mut cell_indices: Vec<u64> = Vec::with_capacity(total_rows);
         let mut out_file_ids: Vec<u32> = Vec::with_capacity(total_rows);
         let mut role_tags: Vec<i32> = Vec::with_capacity(total_rows);

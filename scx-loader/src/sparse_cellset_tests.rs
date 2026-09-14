@@ -1738,3 +1738,117 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
          have gone down through BoundedRuntime::drop"
     );
 }
+
+/// W1: the gather pre-sizes `indices`/`data` from the plan's stored row
+/// lengths, so the append loop never reallocates.
+///
+/// The prescan sums the stored row lengths for every `(file, row)` in the plan
+/// before the set loop. On the raw-local path that sum is *exact*, so the
+/// finished vectors are both full and un-reallocated — `capacity() == len()`
+/// is the strongest available witness that no doubling growth happened.
+///
+/// Watched failing before the prescan existed: with `Vec::new()` the finished
+/// `indices` has a power-of-two capacity above its length, the signature of
+/// geometric growth.
+#[test]
+fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presize.scx");
+    write_fixture(&path, 640, 32, 4);
+
+    let loader = SparseCellSetLoader::new(
+        vec![open(&path)],
+        /*cache_shards*/ 8,
+        None,
+        /*lookahead*/ 4,
+        /*remap*/ None,
+        /*n_global_genes*/ None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+    )
+    .unwrap();
+
+    // Every row of the fixture carries exactly one non-zero, so the expected
+    // total is the row count — known independently of the code under test.
+    let rows: Vec<u64> = (0..640).collect();
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 640],
+        rows,
+        role_tags: vec![0; 640],
+        set_offsets: vec![0, 320, 640],
+    };
+    let batches: Vec<_> = loader
+        .iter_with_plans(vec![Ok(plan)].into_iter(), 4)
+        .map(|r| r.unwrap())
+        .collect();
+    let b = &batches[0];
+
+    assert_eq!(b.indices.len(), 640, "one nnz per row in this fixture");
+    assert_eq!(
+        b.indices.capacity(),
+        b.indices.len(),
+        "indices was not pre-sized exactly: capacity {} != len {}",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+    assert_eq!(
+        b.data.capacity(),
+        b.data.len(),
+        "data was not pre-sized exactly: capacity {} != len {}",
+        b.data.capacity(),
+        b.data.len()
+    );
+}
+
+/// The prescan must be a *bound*, never a truncation: `capacity >= len` on a
+/// path where the transform drops entries (remap sentinels).
+#[test]
+fn gather_presize_is_an_upper_bound_when_remap_drops_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presize_remap.scx");
+    write_fixture(&path, 64, 8, 2);
+
+    // Map column 0 to the `-1` drop sentinel, every other column to itself.
+    let mut table: Vec<i32> = (0..8).collect();
+    table[0] = -1;
+    let loader = SparseCellSetLoader::new(
+        vec![open(&path)],
+        /*cache_shards*/ 4,
+        None,
+        /*lookahead*/ 2,
+        /*remap*/ Some(vec![table]),
+        /*n_global_genes*/ Some(8),
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+    )
+    .unwrap();
+
+    let rows: Vec<u64> = (0..64).collect();
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 64],
+        rows,
+        role_tags: vec![0; 64],
+        set_offsets: vec![0, 64],
+    };
+    let batches: Vec<_> = loader
+        .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .map(|r| r.unwrap())
+        .collect();
+    let b = &batches[0];
+
+    assert!(
+        b.indices.capacity() >= b.indices.len(),
+        "prescan under-allocated: capacity {} < len {}",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+    // Rows whose single non-zero sat at column 0 dropped out entirely.
+    let dropped = (0..64u64).filter(|r| r % 8 == 0).count();
+    assert_eq!(b.indices.len(), 64 - dropped);
+}
