@@ -121,8 +121,9 @@ impl SparseCellSetDataset {
     ///         class has no `max_plan_size`: plan width is the caller's, so
     ///         only the caller can say what a batch costs, and a guessed
     ///         default would silently shrink the cache on every existing
-    ///         dataset. Declare it when the budget is meant to bound the
-    ///         process rather than just the cache; `memory_budget()` then
+    ///         dataset. What it bounds is the plan's **row count**, not its
+    ///         bytes: the charge uses the manifest's mean density, so a plan of
+    ///         denser-than-average rows can still exceed it. `memory_budget()`
     ///         reports the term as `breakdown["batch_buffer_bytes"]`.
     #[new]
     #[allow(clippy::too_many_arguments)]

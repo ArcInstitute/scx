@@ -199,12 +199,6 @@ impl PrefetchEngine {
     /// verdict was introduced to stop on the iterator path.
     ///
     /// Sized from the catalog and the block index; decodes nothing.
-    pub(crate) fn plan_fits_budget(&self, file_ids: &[u32], rows: &[u64]) -> bool {
-        let per_shard = self.bucket_plan_rows(file_ids.iter().copied().zip(rows.iter().copied()));
-        let (planned, budget) = self.plan_footprint(&per_shard);
-        planned <= budget
-    }
-
     /// Deduplicate a plan's `(file, row)` pairs into per-`(file, shard)` buckets.
     ///
     /// The gather passes the same deduplicated set to `read_rows_with`, so each
@@ -215,7 +209,13 @@ impl PrefetchEngine {
         &self,
         pairs: impl Iterator<Item = (u32, u64)>,
     ) -> HashMap<(u32, usize), Vec<u64>> {
-        let mut seen: HashSet<(u32, u64)> = HashSet::new();
+        // Reserved from the iterator's own hint, not left to grow: both callers
+        // pass an exact-size iterator, and letting `seen` rehash its way up on
+        // every admission decision is the same allocation-and-copy work W1
+        // exists to remove. Regression introduced when this walk was extracted
+        // from its two copies, each of which did reserve.
+        let (lower, upper) = pairs.size_hint();
+        let mut seen: HashSet<(u32, u64)> = HashSet::with_capacity(upper.unwrap_or(lower));
         let mut per_shard: HashMap<(u32, usize), Vec<u64>> = HashMap::new();
         for (fid, row) in pairs {
             if !seen.insert((fid, row)) {
@@ -677,10 +677,9 @@ where
         // makes the verdict conservative (a lost warm in a mixed regime), never
         // unsafe. Eligibility still decides what L2 task to launch.
         let (planned, budget) = self.engine.plan_footprint(&per_shard);
-        // Eligibility is the prefetcher's own concern — it decides which L2 task
-        // to launch — and is deliberately NOT part of the footprint: the sum
-        // counts a shard both ways rather than filtering by a verdict that can
-        // change before the plan is consumed.
+        // Recomputed here because the prefetcher needs it per bucket to choose
+        // which L2 task to launch; `plan_footprint` consumes the same verdict
+        // internally to decide whether to add whole-shard bytes.
         let eligible: HashMap<(u32, usize), bool> = per_shard
             .iter()
             .map(|(&(fid, sidx), rows)| {

@@ -764,8 +764,15 @@ impl SparseCellSetLoader {
     /// whose union does not, evict its own row groups set by set.
     pub fn gather(&self, plan: &SparseCellSetPlan) -> Result<SparseCellSetBatch> {
         self.check_plan_width(plan)?;
-        let admit = self.engine.plan_fits_budget(&plan.file_ids, &plan.rows);
-        self.gather_admitting(&self.engine, plan, Some(admit))
+        // One verdict, inline: the prefetcher makes the same two calls and
+        // compares against its divided share, so the only thing that differed
+        // was the comparison — a named wrapper around it added a hop and no
+        // decision.
+        let per_shard = self
+            .engine
+            .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
+        let (planned, budget) = self.engine.plan_footprint(&per_shard);
+        self.gather_admitting(&self.engine, plan, Some(planned <= budget))
     }
 
     /// [`Self::gather`] with the row-group admission decided by the caller.

@@ -1190,6 +1190,19 @@ fn a_plan_wider_than_max_plan_rows_is_refused() {
         .expect("the stream must yield the refusal, not end");
     let msg = first.unwrap_err().to_string();
     assert!(msg.contains("max_plan_rows"), "{msg}");
+    // The error alone would also be produced by a LATE refusal, after the
+    // prefetcher had sized the plan and awaited decodes — which is the thing
+    // the fix is about. Zero cache activity is what distinguishes refusing in
+    // the stream from refusing at the end of it. Review on #535 round 3
+    // (Cursor Agent).
+    drop(it);
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let m = streamed.cache_metrics();
+    assert_eq!(
+        m.misses.load(AtomicOrdering::Relaxed) + m.row_group_misses.load(AtomicOrdering::Relaxed),
+        0,
+        "an over-wide plan must be refused before the prefetcher touches a shard"
+    );
 }
 
 /// A loader whose budget was not exceeded must fit the breakdown it reports.

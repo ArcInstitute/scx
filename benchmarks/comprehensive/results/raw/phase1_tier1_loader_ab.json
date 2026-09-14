@@ -29,7 +29,7 @@
    "peak RSS \u2014 not in the driver's metric list this run; the pre-size bias adds 12.5% of a batch's CSR payload (measured on pbmc3k: capacity 975,737 vs 870,886 used = 0.84 MB per batch), which is arithmetic, not a capture",
    "census \u2014 a cellset_gather census cell does not finish (census_500k killed at 205 min on run 1 of 3 of cache_undersized)"
   ],
-  "record_shape": "REDUCED: per-round metric scalars, not BenchmarkResult.to_dict(). Each round's real BenchmarkResult was written inside the arm's scratch worktree, which the job removes on exit. The published table recomputes exactly from these records (see _phase1_loader_ab_summary.py, which reads this file), but they lack the schema_version / system / runs envelope docs/benchmark_manifest.md describes. The driver now carries the full result through, so the next capture conforms; this one does not."
+  "record_shape": "REDUCED, and NOT BenchmarkResult.to_dict(). Each round's real BenchmarkResult was written inside the arm's scratch worktree, which the job removes on exit; what is here is the per-round metric scalars. The published table recomputes exactly from these (see _phase1_loader_ab_summary.py, which reads this file), but the file does not carry the schema_version / benchmark / format / dataset / system / runs envelope docs/benchmark_manifest.md requires. The driver now carries the full result through per round, so a future capture PRESERVES it \u2014 but this envelope is still not manifest-shaped at the top level, so a conforming artifact needs one result per (arm, dataset) with the paired rounds in runs[*].extra. Recorded as an open gap, not as compliance."
  },
  "rounds": [
   {

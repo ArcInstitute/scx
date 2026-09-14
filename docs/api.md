@@ -3465,7 +3465,13 @@ ds = pyscx.IndexPlanDataset("atlas.scx", cache_shards=128, lookahead=4,
                             max_plan_size=16384, max_memory_mb=256)
 print(ds.effective_cache_shards(), ds.effective_lookahead())
 # Detects when auto-tuning kicked in.
+print(ds.memory_budget()["max_blocking_threads"])
 ```
+
+`max_blocking_threads` is the cap on simultaneously-running shard decodes. It
+lives on the prefetch engine this class shares with `SparseCellSetDataset`, and
+is sized from the **constructor** `lookahead` — which bounds in-flight *plans*,
+not the blocking task a plan spawns per distinct `(file, shard)` it touches.
 
 **Lifecycle — `close()` and `closed`**
 

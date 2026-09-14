@@ -601,12 +601,17 @@ fn plan_fits_budget_sizes_the_union_not_the_largest_set() {
     let budget = 6 * FRAMED_GROUP_BYTES;
     let engine = framed_engine_with_budget(dir.path(), /*scatter_block_index*/ true, budget);
 
+    let fits = |rows: &[u64]| {
+        let per_shard = engine.bucket_plan_rows(rows.iter().map(|&r| (0u32, r)));
+        let (planned, budget) = engine.plan_footprint(&per_shard);
+        planned <= budget
+    };
     assert!(
-        engine.plan_fits_budget(&vec![0u32; set_a.len()], &set_a),
+        fits(&set_a),
         "one set is 4 groups against a 6-group budget and must fit"
     );
     assert!(
-        !engine.plan_fits_budget(&vec![0u32; union.len()], &union),
+        !fits(&union),
         "the union is 8 groups against a 6-group budget and must not fit — \
          sizing the largest set instead of the union would admit it"
     );

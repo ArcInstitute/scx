@@ -3102,7 +3102,10 @@ magnitude a block design discards as noise, and 12 wins out of 12 is not.
   ratios, sign counts and p-values — but the file does not carry the
   `schema_version` / `system` / `runs` envelope
   [docs/benchmark_manifest.md](benchmark_manifest.md) describes. The driver now
-  preserves the full records, so the next capture conforms; this one does not.
+  preserves each round's full record, but the folded envelope is still not
+  manifest-shaped at the top level — a conforming artifact needs one result per
+  (arm, dataset) with the paired rounds in `runs[*].extra`. This is an open gap,
+  not compliance.
 - **Peak RSS was not captured** in this A/B. The pre-size bias adds 12.5% of a
   batch's CSR payload — on the pbmc3k arm, a measured capacity of 975,737
   elements against 870,886 used, so 0.84 MB per batch. That is arithmetic from
