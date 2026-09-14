@@ -178,14 +178,35 @@ Two things to know:
   Since ORG-9.10-5 the constant interpreter/numpy/Arrow overhead (~50 MB) is
   subtracted before the cache is sized, on every loader class — so
   `max_memory_mb` is no longer a bare cache cap. It is **not** a hard ceiling on
-  process RSS either: on `SparseCellSetDataset` the gathered batch and its
-  transients are not charged, and the LRU keeps one oversize shard rather than
-  refusing to cache it. Sizing a budget by hand therefore means
-  `cache_shards × shard_decoded_bytes + non-cache terms`; both are in
-  `memory_budget()`, and the sizing `UserWarning` already quotes the total in
-  its "pass `max_memory_mb>=…`" advice.
+  process RSS either: on `SparseCellSetDataset` the batch's transients are never
+  charged and the batch itself only if you pass `max_plan_rows` (below), and the
+  LRU keeps one oversize shard rather than refusing to cache it. Sizing a budget
+  by hand therefore means `cache_shards × shard_decoded_bytes + non-cache
+  terms`; both are in `memory_budget()`, and the sizing `UserWarning` already
+  quotes the total in its "pass `max_memory_mb>=…`" advice.
+- **`lookahead` does not bound decode concurrency.** It bounds in-flight
+  *plans*; each plan issues one blocking task per distinct `(file, shard)` it
+  touches, which plan width controls. `memory_budget()["max_blocking_threads"]`
+  reports the cap on how many of those run at once — on both plan-driven
+  classes, since it lives on the shared prefetch engine.
+- **Charge the batch to stop the budget ignoring it entirely.**
+  `SparseCellSetDataset(paths, max_memory_mb=…, max_plan_rows=N)` costs one
+  gathered CSR batch of `N` rows at the manifest's mean density and subtracts it
+  before sizing the cache; `memory_budget()["breakdown"]["batch_buffer_bytes"]`
+  reports it and `effective_cache_shards` falls accordingly, and a plan wider
+  than `max_plan_rows` is **refused** — a cache sized for N rows while the
+  gather accepts 100N would not be a bound at all. What it bounds is the plan's
+  **row count**, not its bytes: the charge uses the manifest's mean density, so
+  a plan of denser-than-average rows can still exceed the charged figure. Treat
+  `batch_buffer_bytes` as a sized estimate that the row count keeps honest, not
+  as a ceiling on process RSS. It is **opt-in** and defaults to uncharged and
+  unenforced: this class has no `max_plan_size`, so plan width is
+  yours to declare, and a default guess would shrink the cache — the lever worth
+  2,486× below — on every existing caller.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class
-  defaults `scatter_block_index=False`, so a scattered gather decodes whole
+  defaults `scatter_block_index=False` (and no route wins everywhere — the two
+  cross near 1M cells, see [Cell-set scatter routes](performance.md#cell-set-scatter-routes-re-measured-after-the-row-group-lru-phase-0-gate)),
+  so a scattered gather decodes whole
   shards into the LRU and serves reuse from cache — sizing it correctly is worth
   **2,486×** and halves peak RSS (cold capture; an earlier warm probe of the same
   comparison gave 269× — see
@@ -489,6 +510,29 @@ reference implementation.
 the crop/mask/target semantics, the accepted preprocess-mode strings, and the
 gather stage's value contract. A consumer mirroring the kernel should assert it
 at setup so version skew fails loudly rather than mid-training.
+
+Encoder masking is the kernel's one non-obvious cost, and it is now paid per
+*set* rather than per cell: the decoder query panel is sorted once for the set
+that shares it, and each row's withheld genes are found by binary-searching that
+panel and testing the row's own mask bits. The panel is not deduplicated, so a
+gene id appearing at several query positions is withheld when **any** of them is
+flagged. Output is unchanged — this is a throughput change, not a contract one.
+
+### One plan at a time
+
+`iter_with_plans` is for driving an epoch. For a single plan — an interactive
+probe, a unit test, a neighbourhood lookup — `gather` returns the same batch
+dict synchronously:
+
+```python
+batch = ds.gather(*plan)          # (file_ids, rows, role_tags, set_offsets)
+```
+
+The two differ only in row-group admission: the iterator takes one verdict
+per plan against its divided share (`budget / (lookahead + 1)`), `gather` decides once over the plan
+against the whole byte budget. That changes what the shard cache *retains*, not
+what is read, so the batches are identical — but `gather` runs on the calling
+thread with no prefetch, so it is not the way to stream.
 
 ### Count-depth downsampling
 

@@ -157,7 +157,14 @@ class IndexPlanDataset:
         uses — plus
         `max_memory_mb` (the resolved value in force, adaptive when the
         constructor was passed none), `effective_cache_shards` and
-        `effective_lookahead`."""
+        `effective_lookahead`.
+
+        Also `max_blocking_threads`: the cap on simultaneously-running shard
+        decodes. It lives on the prefetch engine this class shares with
+        `SparseCellSetDataset`, and is sized from the CONSTRUCTOR `lookahead` —
+        which bounds in-flight plans, not the blocking task a plan spawns per
+        distinct `(file, shard)` it touches.
+        """
         ...
 
     def suggested_cache_shards(self, plan: list[tuple[int, int]]) -> int:
@@ -284,6 +291,7 @@ class SparseCellSetDataset:
         downsample_method: Literal["binomial", "multinomial"] | None = None,
         downsample_seed: int | None = None,
         scatter_block_index: bool | None = None,
+        max_plan_rows: int | None = None,
     ) -> None:
         """``scatter_block_index`` (default ``False`` — the opposite of
         ``IndexPlanDataset``) gates the block-index (row-group) scattered gather
@@ -293,14 +301,19 @@ class SparseCellSetDataset:
         cache): decoding each hot shard once into the LRU and reusing it across
         batches was measured to beat the row-group path — 2.80 → 4.55 steps/s
         and 337 ms → ~5 ms per gather on a 50-file Tahoe atlas, at ≈ ``.h5ad``
-        parity. That measurement predates the row-group LRU: the row-group
-        path then re-decoded a hot shard's groups every batch because nothing
-        retained them. It now retains them under the same ``max_memory_mb``
-        budget (see ``cache_metrics()["row_group_hits"]``), so the gap is
-        expected to be much smaller; the default stays ``False`` until that is
-        re-measured. Pass ``True`` for cache-hostile runs (working set ≫ cache,
-        low shard reuse), where the row-group decode's bounded peak RAM is the
-        memory-safe choice.
+        parity.
+
+        That measurement predated the row-group LRU, and the re-measure (cache
+        sized to the file, sets/s off vs on) found no fixed winner: tabula
+        100k/7 shards 899 vs 5.4 random and 812 vs 6.9 grouped, but census_1m/62
+        shards 11.4 vs 6.9 random and **300 vs 459 grouped**. Full-shard
+        degrades with corpus size; the row-group route is roughly flat in it and
+        tracks plan locality, and the two cross near 1M cells. The default stays
+        ``False`` because flipping it costs 117–167× on 100k-cell corpora.
+
+        Pass ``True`` for a large corpus with local plans, or for cache-hostile
+        runs (working set ≫ cache, low shard reuse), where the row-group
+        decode's bounded peak RAM is the memory-safe choice.
         The process-wide ``SCX_SCATTER_BLOCK_INDEX=0`` env var remains a hard
         kill-switch that forces the full-shard path regardless of this argument.
 
@@ -358,6 +371,35 @@ class SparseCellSetDataset:
         """
         ...
 
+    def gather(
+        self,
+        file_ids: Sequence[int],
+        rows: Sequence[int],
+        role_tags: Sequence[int],
+        set_offsets: Sequence[int],
+    ) -> _SparseCellSetBatchDict:
+        """Gather **one** plan synchronously and return its batch dict.
+
+        The same plan shape ``iter_with_plans`` consumes and the same batch dict
+        it yields, for a caller holding a single plan rather than a stream::
+
+            batch = ds.gather(*plan)
+
+        **Admission is decided per call.** ``iter_with_plans`` takes one
+        row-group verdict per plan and compares it against its divided share
+        of the budget (``budget / (lookahead + 1)``), since a lookahead window's
+        worth of plans has to coexist; a standalone ``gather`` has no window, so
+        it takes one verdict over the plan against the whole byte budget. Output is
+        identical either way — the verdict changes what the cache *retains*, not
+        what is read — but the batch is gathered on the calling thread rather
+        than a prefetched one, so this is not the way to drive an epoch.
+
+        Raises exactly as the iterator does: ``RuntimeError`` for a malformed
+        plan or a cross-file set with no ``remap_tables``, ``IndexError`` for a
+        row past a file's ``n_obs``.
+        """
+        ...
+
     def cache_metrics(self) -> dict[str, Any]:
         """Cumulative shard-cache counters since construction: `hits`,
         `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,
@@ -381,20 +423,30 @@ class SparseCellSetDataset:
         """Resolved shard-cache budget: `breakdown` (the six-key
         `BudgetBreakdown` every class that reports a budget uses), plus `max_memory_mb`
         (the value in force — adaptive when the constructor was passed none),
-        `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes` and
-        `budget_exceeded`.
+        `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`,
+        `max_plan_rows`, `mean_nnz_per_row`, `max_blocking_threads` and
+        `budget_exceeded`. `max_plan_rows`, when set, also REFUSES a plan wider
+        than it — `gather` / `iter_with_plans` raise rather than allocate for a
+        batch the cache was not sized for.
 
-        Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
-        breakdown: on the sparse path the shard cache *is* the budget, so there
-        is no batch-buffer or plan-tuple term. `total_bytes` fits
+        `cache_bytes` and `python_overhead_bytes` are the non-zero terms by
+        default: on the sparse path the shard cache *is* the budget, and there
+        is no plan-tuple term. Pass `max_plan_rows` and `batch_buffer_bytes`
+        joins them. `total_bytes` fits
         `max_memory_mb` unless `budget_exceeded` is True, which means even a
         one-shard cache does not fit.
 
         That is a statement about the cache this loader sizes, not a ceiling on
-        process RSS: the gathered batch and its transients are not charged (this
-        path has no `max_plan_size`), and the LRU keeps a single oversize shard
-        rather than refusing to cache it, so one above-average shard can sit
-        above the byte cap."""
+        process RSS: the batch's transients are never charged and the batch
+        itself only when `max_plan_rows` declares how wide plans get (this path
+        has no `max_plan_size`, so plan width is otherwise the caller's), and
+        the LRU keeps a single oversize shard rather than refusing to cache it,
+        so one above-average shard can sit above the byte cap.
+
+        `max_blocking_threads` is the cap on simultaneously-running shard
+        decodes in the prefetch engine — the other thing between a wide plan and
+        unbounded transient memory. `lookahead` bounds in-flight *plans*, not
+        the tasks a plan spawns."""
         ...
 
     def suggested_cache_shards(

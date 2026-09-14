@@ -96,16 +96,35 @@ impl SparseCellSetDataset {
     ///         (sorted data + a reused control pool → a small working set that
     ///         fits the shard cache and is touched most batches). Measured on
     ///         a 50-file Tahoe atlas: steps/s 2.80 → 4.55 and gather 337 ms →
-    ///         ~5 ms with it off, at ≈ .h5ad parity — measured **before**
-    ///         OPT-FORMATIO-1, when the row-group path retained nothing and so
-    ///         re-decoded a hot shard's groups every batch. The touched groups
-    ///         now stay in the same LRU under the same byte budget
-    ///         (`cache_metrics()["row_group_hits"]`), so the gap is expected
-    ///         to be much smaller; the default stays False until re-measured.
-    ///         Pass True for a genuinely cache-hostile run (working set ≫
-    ///         cache), where the row-group-scoped decode's bounded peak RAM is
-    ///         the memory-safe choice. `SCX_SCATTER_BLOCK_INDEX=0` is the
-    ///         process-wide reader-layer kill-switch over both settings.
+    ///         ~5 ms with it off, at ≈ .h5ad parity.
+    ///         **Re-measured after OPT-FORMATIO-1**, with the cache sized to
+    ///         the file, as a 2×2 over corpus size × plan locality (sets/s,
+    ///         off vs on): tabula 100k/7 shards 899 vs 5.4 random and 812 vs
+    ///         6.9 grouped; census_1m/62 shards 11.4 vs 6.9 random and **300
+    ///         vs 459 grouped**. So there is no fixed winner — full-shard
+    ///         degrades with corpus size while block-index is roughly flat and
+    ///         tracks plan locality, and they cross somewhere near 1M cells.
+    ///         The default stays False because flipping it costs 117–167× on
+    ///         100k-cell corpora, which is the common case; the right answer at
+    ///         scale is per-dataset route selection, not a different constant.
+    ///         Pass True for a large corpus with local plans, or for a
+    ///         genuinely cache-hostile run (working set ≫ cache) where the
+    ///         row-group-scoped decode's bounded peak RAM is the memory-safe
+    ///         choice. `SCX_SCATTER_BLOCK_INDEX=0` is the process-wide
+    ///         reader-layer kill-switch over both settings.
+    ///     max_plan_rows: Upper bound on rows per plan. Charges one gathered
+    ///         batch against `max_memory_mb` before the shard cache is sized,
+    ///         AND refuses a plan wider than it — a cache sized for `N` rows
+    ///         while the gather accepts any width is not a bound.
+    ///         Default `None` — **uncharged**, and the resolved cache is then
+    ///         byte-identical to what it was before this argument existed. This
+    ///         class has no `max_plan_size`: plan width is the caller's, so
+    ///         only the caller can say what a batch costs, and a guessed
+    ///         default would silently shrink the cache on every existing
+    ///         dataset. What it bounds is the plan's **row count**, not its
+    ///         bytes: the charge uses the manifest's mean density, so a plan of
+    ///         denser-than-average rows can still exceed it. `memory_budget()`
+    ///         reports the term as `breakdown["batch_buffer_bytes"]`.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -122,6 +141,7 @@ impl SparseCellSetDataset {
         downsample_method=None,
         downsample_seed=None,
         scatter_block_index=None,
+        max_plan_rows=None,
     ))]
     fn new(
         py: Python<'_>,
@@ -138,6 +158,7 @@ impl SparseCellSetDataset {
         downsample_method: Option<String>,
         downsample_seed: Option<u64>,
         scatter_block_index: Option<bool>,
+        max_plan_rows: Option<usize>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -151,51 +172,101 @@ impl SparseCellSetDataset {
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
-        // Default OFF, unlike `IndexPlanDataset`. The cell-set workload is
-        // cache-friendly (sorted data + a reused control pool → high shard
-        // reuse), and the block-index gather keys on `!cache.contains()`, so a
-        // hot shard stays eligible forever: it is re-decoded every batch and the
-        // LRU never populates. Measured on a 50-file Tahoe atlas (PR #299, on
-        // the equivalent gather this knob replaced): steps/s 2.80 → 4.55, gather
-        // 337 ms → ~5 ms, cache populated to 8.25 GB — at ≈ .h5ad parity.
-        // Pass `scatter_block_index=True` for a cache-hostile run (working set
-        // ≫ cache), where the row-group decode's bounded peak RAM wins.
+        // Default OFF, unlike `IndexPlanDataset`, and re-measured after the
+        // row-group LRU (OPT-FORMATIO-1) rather than inherited: full-shard wins
+        // 167× on tabula random and 117× grouped, 1.65× on census_1m random,
+        // and LOSES 1.53× on census_1m grouped. The two routes cross near 1M
+        // cells — full-shard degrades with corpus size, block-index is flat in
+        // it and tracks plan locality — so `false` is the right default for the
+        // 100k-cell common case, not a universal answer. The general fix is
+        // per-dataset route selection off the per-plan `planned` footprint the
+        // engine already computes, not a different constant here.
         let scatter_block_index = scatter_block_index.unwrap_or(false);
+        // A zero bound would charge nothing and reject every non-empty plan —
+        // the two halves of the contract pointing opposite ways. `ValueError`
+        // for the same reason as the downsample checks below: it is a bad
+        // *value*, and `IndexPlanLoader` refuses `max_plan_size < 1` likewise.
+        if max_plan_rows == Some(0) {
+            return Err(PyValueError::new_err(
+                "max_plan_rows must be >= 1 (pass None to leave the batch uncharged)",
+            ));
+        }
         // Raised as `ValueError`, not the `loader_err_to_py` default of
         // `RuntimeError`: every argument check on this path is a bad *value*,
         // and a caller catching malformed input would otherwise have to catch
         // two exception types to cover one constructor. Same reasoning, and the
         // same shape, as the `validate_indptr` call in `downsample_counts_csr`.
-        let downsample = crate::downsample::resolve_downsample_config(
-            &paths,
-            downsample_target_library_size,
-            downsample_method.as_deref(),
-            downsample_seed,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // Built before the open below takes ownership of `paths`. A count plus
+        // up to two names: actionable without being a wall of paths, and enough
+        // text for Python's per-message dedup to make the warning one-shot per
+        // dataset. String formatting only — it costs nothing to build eagerly,
+        // and the alternative is keeping a clone of every path alive for a
+        // warning that usually does not fire.
+        let unframed_target = match paths.as_slice() {
+            [one] => format!("'{one}'"),
+            _ => {
+                let shown: Vec<String> = paths.iter().take(2).map(|p| format!("'{p}'")).collect();
+                let ellipsis = if paths.len() > 2 { ", …" } else { "" };
+                format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
+            }
+        };
 
-        let mut readers = Vec::with_capacity(paths.len());
-        for p in &paths {
-            readers.push(
-                ScxReader::open(p)
-                    .map_err(|e| PyRuntimeError::new_err(format!("failed to open {p}: {e}")))?,
-            );
+        // Everything from here to the loader is pure Rust over owned data —
+        // `paths` and `remap_tables` are already `Vec`s and no `Bound` crosses
+        // — and it is not cheap: a stat per path to resolve the downsample
+        // config, an mmap and catalog parse per file, then `ScxReader`-wide
+        // range validation and the budget tune. Holding the GIL through it
+        // stalls every other Python thread for the whole open, which on a
+        // many-file manifest is the dominant cost of constructing the dataset.
+        //
+        // The error is carried out of the closure and turned into a `PyErr`
+        // after re-attaching, since building one needs the GIL. Each arm keeps
+        // the exception type it had: `ValueError` for a bad downsample value,
+        // `RuntimeError` naming the path for a failed open.
+        enum OpenError {
+            Downsample(String),
+            Open(String),
+            Loader(crate::error::LoaderError),
         }
+        let loader = py
+            .detach(move || {
+                let downsample = crate::downsample::resolve_downsample_config(
+                    &paths,
+                    downsample_target_library_size,
+                    downsample_method.as_deref(),
+                    downsample_seed,
+                )
+                .map_err(|e| OpenError::Downsample(e.to_string()))?;
 
-        let loader = SparseCellSetLoader::new(
-            readers,
-            cache_shards,
-            bytes_budget,
-            lookahead,
-            remap_tables,
-            n_global_genes,
-            normalize,
-            log1p,
-            target_sum,
-            downsample,
-            scatter_block_index,
-        )
-        .map_err(loader_err_to_py)?;
+                let mut readers = Vec::with_capacity(paths.len());
+                for p in &paths {
+                    readers.push(
+                        ScxReader::open(p)
+                            .map_err(|e| OpenError::Open(format!("failed to open {p}: {e}")))?,
+                    );
+                }
+
+                SparseCellSetLoader::new(
+                    readers,
+                    cache_shards,
+                    bytes_budget,
+                    lookahead,
+                    remap_tables,
+                    n_global_genes,
+                    normalize,
+                    log1p,
+                    target_sum,
+                    downsample,
+                    scatter_block_index,
+                    max_plan_rows,
+                )
+                .map_err(OpenError::Loader)
+            })
+            .map_err(|e| match e {
+                OpenError::Downsample(m) => PyValueError::new_err(m),
+                OpenError::Open(m) => PyRuntimeError::new_err(m),
+                OpenError::Loader(e) => loader_err_to_py(e),
+            })?;
 
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
@@ -205,19 +276,7 @@ impl SparseCellSetDataset {
             scx_format_io::backed::scatter_block_index_enabled(),
             || loader.any_shard_framed(),
         ) {
-            // A count plus up to two names: actionable without being a wall of
-            // paths, and enough text for Python's per-message dedup to make the
-            // warning one-shot per dataset.
-            let target = match paths.as_slice() {
-                [one] => format!("'{one}'"),
-                _ => {
-                    let shown: Vec<String> =
-                        paths.iter().take(2).map(|p| format!("'{p}'")).collect();
-                    let ellipsis = if paths.len() > 2 { ", …" } else { "" };
-                    format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
-                }
-            };
-            warn_unframed_scatter(py, "SparseCellSetDataset", &target)?;
+            warn_unframed_scatter(py, "SparseCellSetDataset", &unframed_target)?;
         }
 
         Ok(Self {
@@ -303,6 +362,62 @@ impl SparseCellSetDataset {
         })
     }
 
+    /// Gather **one** plan synchronously and return its batch dict.
+    ///
+    /// The same `(file_ids, rows, role_tags, set_offsets)` plan
+    /// `iter_with_plans` consumes, and the same §4.4 batch dict it yields, for
+    /// a caller that has one plan in hand and no stream to drive:
+    ///
+    /// ```python
+    /// batch = ds.gather(*plan)
+    /// ```
+    ///
+    /// **Admission is decided per call.** The streaming path takes one
+    /// row-group verdict per plan across every file and shard the prefetcher
+    /// will touch, and compares it against its divided share of the budget
+    /// (`budget / (lookahead + 1)`), because a lookahead window's worth of
+    /// plans has to coexist. A standalone `gather` has no such window, so it
+    /// takes one verdict over the plan against the WHOLE budget. Identical
+    /// output either way — the verdict changes what the cache *retains*, not
+    /// what is read — but a plan that retains nothing under `iter_with_plans`
+    /// may retain here, and the batch is gathered on the calling thread rather
+    /// than a prefetched one, so it is not the way to drive an epoch.
+    ///
+    /// Raises the same errors as the iterator, from the same validation:
+    /// `RuntimeError` for a malformed plan or a cross-file set with no
+    /// `remap_tables`, `IndexError` for a row past a file's `n_obs`.
+    fn gather<'py>(
+        &self,
+        py: Python<'py>,
+        file_ids: Bound<'py, PyAny>,
+        rows: Bound<'py, PyAny>,
+        role_tags: Bound<'py, PyAny>,
+        set_offsets: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.SparseCellSetDataset requires num_workers=0 (or lazy per-worker \
+                 construction). The Rust shard cache and mmap state are not fork-safe.",
+            ));
+        }
+        // Closed-state check before the plan is extracted, as on `iter_with_plans`.
+        let loader = Arc::clone(self.loader()?);
+
+        // Repacked into the tuple `extract_cellset_plan` takes rather than
+        // extracted per argument, so a malformed plan raises the one message
+        // that names the whole expected shape — the same text the iterator
+        // raises, which `test_plan_extraction_failure_names_the_expected_tuple`
+        // pins.
+        let tuple = PyTuple::new(py, [file_ids, rows, role_tags, set_offsets])?;
+        let plan = extract_cellset_plan(tuple.as_any()).map_err(loader_err_to_py)?;
+
+        let batch = py
+            .detach(move || loader.gather(&plan))
+            .map_err(loader_err_to_py)?;
+
+        sparse_cellset_batch_to_dict(py, batch)
+    }
+
     /// Number of distinct `(file_id, shard)` pairs a cell-set plan touches — the
     /// `cache_shards` that would let the whole batch stay resident.
     ///
@@ -363,11 +478,16 @@ impl SparseCellSetDataset {
     /// cache_shards           - requested count cap
     /// effective_cache_shards - shards the byte budget holds at average size
     /// shard_decoded_bytes    - average decoded bytes per CSR shard
+    /// max_plan_rows          - declared rows-per-plan bound, or None
+    /// mean_nnz_per_row       - manifest density the batch charge uses
+    /// max_blocking_threads   - cap on simultaneous shard decodes
     /// ```
     ///
-    /// Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
-    /// breakdown: on this path the shard cache *is* the budget — there is no
-    /// batch-buffer or plan-tuple term.
+    /// `cache_bytes` and `python_overhead_bytes` are the non-zero terms: on this
+    /// path the shard cache *is* the budget, with no plan-tuple staging. Pass
+    /// `max_plan_rows` and `batch_buffer_bytes` joins them — one gathered CSR
+    /// batch that wide at `mean_nnz_per_row`, subtracted before the cache is
+    /// sized, so `effective_cache_shards` falls accordingly.
     ///
     /// `budget_exceeded` is `True` when even a one-shard cache does not fit.
     /// Before ORG-9.10-5 `total_bytes` could exceed `max_memory_mb` routinely,
@@ -375,11 +495,17 @@ impl SparseCellSetDataset {
     /// included.
     ///
     /// That is a statement about **the cache this loader sizes**, not a ceiling
-    /// on process RSS: the gathered batch and its transients are not charged
-    /// (this path has no `max_plan_size`, so plan output size is
-    /// caller-controlled), and the shared LRU keeps a single oversize shard
-    /// rather than refusing to cache it, so one above-average shard can sit
-    /// above the byte cap.
+    /// on process RSS: the batch's transients are never charged and the batch
+    /// itself only when `max_plan_rows` says how wide plans get (this path has
+    /// no `max_plan_size`, so plan output size is otherwise caller-controlled
+    /// and unbounded), and the shared LRU keeps a single oversize shard rather
+    /// than refusing to cache it, so one above-average shard can sit above the
+    /// byte cap.
+    ///
+    /// `max_blocking_threads` is reported beside them because it is the other
+    /// thing standing between a wide plan and unbounded transient memory: it
+    /// caps how many shard decodes run at once. `lookahead` bounds in-flight
+    /// *plans*, not the tasks a plan spawns.
     ///
     /// ORG-9.10-4 renamed `affordable_cache_shards` to `effective_cache_shards`:
     /// it is the same quantity `IndexPlanDataset` reports under that name, and
@@ -394,6 +520,9 @@ impl SparseCellSetDataset {
         dict.set_item("cache_shards", loader.cache_shards())?;
         dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
+        dict.set_item("max_plan_rows", loader.max_plan_rows())?;
+        dict.set_item("mean_nnz_per_row", loader.mean_nnz_per_row())?;
+        dict.set_item("max_blocking_threads", loader.max_blocking_threads())?;
         dict.set_item("budget_exceeded", loader.budget_exceeded())?;
         Ok(dict)
     }

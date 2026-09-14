@@ -59,8 +59,6 @@
 //! Version history: **v1** initial; **v2** = #356's mode strings (retroactively)
 //! + Phase 1B's clip and downsample.
 
-use std::collections::HashSet;
-
 use crate::error::{LoaderError, Result};
 
 /// Per-cell preprocessing mode — mirrors `preprocessing.py:preprocess_cell_counts`.
@@ -113,6 +111,81 @@ pub struct CellOut<'a> {
     pub target: &'a mut [f32],     // [k_dec]
 }
 
+/// A set's decoder query panel, sorted for membership tests.
+///
+/// Built **once per set** (the panel is shared across the set's rows) and
+/// consulted per row against that row's own `enc_mask_positions`. This is the
+/// only sound way to hoist any part of the withheld-gene test out of the row
+/// loop: `query` is sliced per set but the mask bits are sliced per row, so
+/// hoisting the *withheld id set* itself would apply row 0's bits to every row
+/// of the set.
+///
+/// Replaces a per-row `HashSet<i64>` that was rebuilt from `k_dec` ids and then
+/// SipHash-probed once per surviving top-K gene — measured at ~34 % of collate
+/// wall (78.7 vs 120.1 us/cell at 25 % withheld, pbmc3k, k_enc=2048/k_dec=1024).
+pub struct SetQueryIndex {
+    /// `(gene_id, position_in_query)`, sorted by id then position.
+    ///
+    /// `position` is the id's offset in the ORIGINAL panel, not its rank here:
+    /// `enc_mask_positions` is parallel to `query`, so the bit must be read at
+    /// the offset the caller wrote it at.
+    sorted: Vec<(i32, u32)>,
+}
+
+impl SetQueryIndex {
+    /// Sort a copy of one set's query panel. `query` carries no ordering
+    /// contract (only `CellIn::gene_ids` does) and is not deduplicated.
+    pub fn new(query: &[i32]) -> Self {
+        let mut sorted: Vec<(i32, u32)> = query
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| (g, i as u32))
+            .collect();
+        // Unstable is fine and faster: the `(id, position)` pairs are distinct,
+        // so the order is total.
+        sorted.sort_unstable();
+        Self { sorted }
+    }
+
+    /// Is `gid` withheld from this row's encoder crop?
+    ///
+    /// True iff **any** position carrying `gid` is flagged — the semantics of
+    /// the `HashSet` this replaces, which collected every flagged position's id
+    /// (mirroring Python's `query_gene_ids[role_target_mask]`). A repeated id is
+    /// reachable on real input, so the fold over the equal-id run is required,
+    /// not defensive: stopping at the first match would silently keep a gene the
+    /// caller withheld at a later position.
+    #[inline]
+    fn withholds(&self, gid: i32, maskpos: &[u8]) -> bool {
+        let lo = self.sorted.partition_point(|&(g, _)| g < gid);
+        self.sorted[lo..]
+            .iter()
+            .take_while(|&&(g, _)| g == gid)
+            // `get`, not an index: the `zip` this replaced stopped at the
+            // shorter of `query` / `enc_mask_positions`, so a short mask left
+            // the excess positions unflagged. Indexing would panic there
+            // instead — a tolerated malformed input turned into a crash on a
+            // `pub` kernel. `collate_gathered` validates the length, so this
+            // only guards direct callers.
+            .any(|&(_, p)| maskpos.get(p as usize).is_some_and(|&m| m != 0))
+    }
+}
+
+/// One row's encoder mask, inseparable from the panel it indexes.
+///
+/// A struct rather than two `Option` fields on [`CellIn`] so the pair cannot be
+/// supplied half-set: the bits are meaningless without the panel that says
+/// which gene each offset refers to, and a mask-without-index would silently
+/// withhold nothing — a wrong answer on a cross-repo numeric contract, where a
+/// compile error is what is wanted.
+#[derive(Clone, Copy)]
+pub struct RowMask<'a> {
+    /// `[k_dec]` flags over the set's `query`, for THIS row.
+    pub positions: &'a [u8],
+    /// The set's sorted panel — built once per set, shared by its rows.
+    pub index: &'a SetQueryIndex,
+}
+
 /// Immutable, RNG-resolved inputs for one cell.
 pub struct CellIn<'a> {
     /// Global gene ids, **sorted ascending, unique** (post-remap/coalesce).
@@ -121,9 +194,10 @@ pub struct CellIn<'a> {
     pub raw: &'a [f32],
     /// Decoder query gene ids for this set (length `k_dec`); shared across the set.
     pub query: &'a [i32],
-    /// `[k_dec]` per-cell encoder-mask positions over `query` (obs role mask).
-    /// `None` ⇒ no query-based encoder masking (perturbation path).
-    pub enc_mask_positions: Option<&'a [u8]>,
+    /// This row's encoder mask over `query`, with its set's sorted panel.
+    /// `None` ⇒ no query-based encoder masking (perturbation path), which also
+    /// means the panel is never sorted on that path.
+    pub mask: Option<RowMask<'a>>,
     /// Hide gene identity (readout mask) ⇒ single `GENE_MASK` encoder token.
     pub hide_readout: bool,
 }
@@ -150,7 +224,10 @@ pub struct CollateConfig {
 /// Collate one cell into `out`; returns its `library_size`.
 ///
 /// `out.enc_*` must be length `cfg.k_enc`; `out.target` and (if present)
-/// `cin.enc_mask_positions` must be length `cin.query.len()` (= `k_dec`).
+/// `cin.mask.positions` must be length `cin.query.len()` (= `k_dec`).
+///
+/// `cin.mask`, when present, must carry
+/// [`SetQueryIndex::new(cin.query)`](SetQueryIndex::new) for this row's set.
 // Index-based loops below walk several parallel arrays (raw / enc_vals / tgt_vals)
 // in lockstep, so explicit indexing is clearer than zipped iterators.
 #[allow(clippy::needless_range_loop)]
@@ -250,18 +327,17 @@ pub fn collate_cell(cin: &CellIn, cfg: &CollateConfig, out: &mut CellOut) -> f32
             });
             let take = k_enc.min(order.len());
 
-            // Encoder masking (obs): the set of gene ids withheld from the encoder
-            // crop — the cell's role query positions flagged in `enc_mask_positions`
-            // (mirrors `mask_gene_ids = query_gene_ids[role_target_mask]`, task.py:1154).
-            // `None` ⇒ perturbation path (no masking).
-            let masked: Option<HashSet<i64>> = cin.enc_mask_positions.map(|maskpos| {
-                cin.query
-                    .iter()
-                    .zip(maskpos.iter())
-                    .filter(|(_, &m)| m != 0)
-                    .map(|(&g, _)| g as i64)
-                    .collect()
-            });
+            // Encoder masking (obs): a gene is withheld from the crop when one of
+            // this cell's role query positions carrying it is flagged in
+            // `enc_mask_positions` (mirrors `mask_gene_ids =
+            // query_gene_ids[role_target_mask]`, task.py:1154). `None` ⇒
+            // perturbation path (no masking).
+            //
+            // The panel is searched through the set's `SetQueryIndex` rather
+            // than collected into a per-row `HashSet`: the sort is amortised
+            // over the set's rows, and the crop loop below does a binary search
+            // instead of a SipHash probe per surviving gene.
+            let masked = cin.mask;
 
             // Walk the top-K order, DROPPING withheld genes (their slot is left PAD;
             // no backfill from beyond `take`) and compacting survivors to the left.
@@ -269,11 +345,11 @@ pub fn collate_cell(cin: &CellIn, cfg: &CollateConfig, out: &mut CellOut) -> f32
             // withheld genes are absent (PAD), never a GENE_MASK token.
             let mut slot = 0usize;
             for &i in order.iter().take(take) {
-                let gid = cin.gene_ids[i] as i64;
-                if masked.as_ref().is_some_and(|m| m.contains(&gid)) {
+                let g = cin.gene_ids[i];
+                if masked.is_some_and(|m| m.index.withholds(g, m.positions)) {
                     continue;
                 }
-                out.enc_ids[slot] = gid;
+                out.enc_ids[slot] = g as i64;
                 out.enc_counts[slot] = enc_vals[i];
                 out.enc_pad[slot] = 0;
                 slot += 1;

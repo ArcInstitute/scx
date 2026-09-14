@@ -125,6 +125,7 @@ fn cellset_plan_admission_is_per_plan_not_per_set() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ true,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     let rows: Vec<u64> = vec![5, 70, 140, 200, 20, 85, 155, 215];
@@ -201,6 +202,7 @@ fn cellset_plan_admission_ignores_plan_level_density() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ true,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     assert!(
@@ -277,6 +279,7 @@ fn loader_threads_the_block_index_gate_into_the_engine() {
             0.0,
             /*downsample*/ None,
             gate,
+            /*max_plan_rows*/ None,
         )
         .unwrap();
 
@@ -344,6 +347,7 @@ fn gather_single_file_sets_matches_reference_in_order() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -405,6 +409,7 @@ fn empty_set_keeps_boundary_without_rows() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     // set 0: two rows; set 1: empty; set 2: one row.
@@ -459,6 +464,7 @@ fn gather_cross_file_set_concatenates_in_global_space() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -516,6 +522,7 @@ fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap()
 }
@@ -550,6 +557,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -609,6 +617,70 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
     assert_eq!(&b.encoder_gene_ids[4..8], &[5, 9, 9, 9]);
     assert_eq!(&b.target_counts[4..8], &[0.0, 6.0, 0.0, 0.0]);
     assert_eq!(b.library_size[1], 6.0);
+}
+
+/// Two rows of ONE set, one shared query panel, different withheld genes.
+///
+/// The per-set `query` and the per-row `enc_mask_positions` are sliced on
+/// different axes (`sparse_cellset.rs`'s rayon row loop takes `query` at
+/// `s * k_dec` and the mask at `r * k_dec`), which is exactly why the withheld
+/// set may not be hoisted out of the row loop: hoisting applies row 0's bits to
+/// every row of the set. Nothing covered that — the one pre-existing
+/// `collate_gathered` test passes an empty mask, and every masking test in
+/// `sparse_cellset_collate_tests.rs` drives a single cell through
+/// `collate_cell`, where a one-row set cannot tell the two axes apart.
+///
+/// Built from synthetic CSR rather than a real gather because the shared
+/// fixture writes one non-zero per row, and a one-gene cell has no top-K to
+/// withhold from.
+#[test]
+fn collate_gathered_applies_each_rows_own_mask_within_a_set() {
+    use crate::sparse_cellset_collate::PreprocessMode;
+
+    // Two identical cells: genes [1,3,5] with counts [3,2,1] (already rank
+    // order, so `order` is [1,3,5] and `take` is the whole row at k_enc=3).
+    let indptr = [0i64, 3, 6];
+    let indices = [1i32, 3, 5, 1, 3, 5];
+    let data = [3.0f32, 2.0, 1.0, 3.0, 2.0, 1.0];
+    let set_offsets = [0i64, 2]; // ONE set spanning both rows
+
+    let scalars = CollateScalars {
+        k_enc: 3,
+        // PassThrough so encoder counts are the raw values and compare exactly.
+        mode: PreprocessMode::PassThrough,
+        target_sum: 1e4,
+        pflog_alpha: None,
+        n_genes_total: 8, // ⇒ GENE_MASK = 8, PAD = 9
+        lib_size_redef: false,
+    };
+    let b = collate_gathered(
+        &indptr,
+        &indices,
+        &data,
+        &set_offsets,
+        vec![0u64, 1],
+        vec![0u32, 0],
+        vec![0i32, 0],
+        /*k_dec*/ 3,
+        /*query, per SET*/ &[1, 3, 5],
+        // Per ROW, k_dec each: row 0 withholds gene 1, row 1 withholds gene 5.
+        /*enc_mask_positions*/
+        &[1, 0, 0, 0, 0, 1],
+        &[0, 0],
+        &[3],
+        &scalars,
+    )
+    .unwrap();
+
+    // Row 0 drops gene 1, survivors compact left.
+    assert_eq!(&b.encoder_gene_ids[0..3], &[3, 5, 9]);
+    assert_eq!(&b.encoder_counts[0..3], &[2.0, 1.0, 0.0]);
+    // Row 1 drops gene 5 — NOT gene 1. This is the assertion a hoist breaks.
+    assert_eq!(&b.encoder_gene_ids[3..6], &[1, 3, 9]);
+    assert_eq!(&b.encoder_counts[3..6], &[3.0, 2.0, 0.0]);
+    // Neither row is all-masked, so no GENE_MASK token and no set expr mask.
+    assert_eq!(&b.encoder_mask[0..6], &[0, 0, 0, 0, 0, 0]);
+    assert_eq!(&b.encoder_pad_mask[0..6], &[0, 0, 1, 0, 0, 1]);
 }
 
 #[test]
@@ -704,6 +776,7 @@ fn budget_loader(
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap()
 }
@@ -903,17 +976,23 @@ fn avg_shard_decoded_bytes_ignores_stat_less_shards_in_the_divisor() {
     let p0 = dir.path().join("s0.scx");
     write_fixture(&p0, 32, 8, 4);
     let one = avg_shard_decoded_bytes(&[open(&p0)]);
-    assert_eq!(one, 128, "8 rows x 1 nnz => (8*8 + 8*8)/1 per shard");
+    assert_eq!(one.0, 128, "8 rows x 1 nnz => (8*8 + 8*8)/1 per shard");
 
     // Two identical files: twice the shards, twice the totals, same average.
     let p1 = dir.path().join("s1.scx");
     write_fixture(&p1, 32, 8, 4);
     let two = avg_shard_decoded_bytes(&[open(&p0), open(&p1)]);
     assert_eq!(
-        two, one,
+        two.0, one.0,
         "the average must be scale-invariant; a drift here means the divisor \
          and the numerator are counting different shard sets"
     );
+
+    // The mean density rides the same walk and the same divisor rule, but is
+    // per ROW: `write_fixture` gives every row exactly one non-zero, so shards
+    // of unequal height cannot pull it away from 1.0.
+    assert_eq!(one.1, 1.0, "8 rows x 1 nnz => 1 nnz/row");
+    assert_eq!(two.1, one.1, "density must be scale-invariant too");
 }
 
 /// No shard carries stats ⇒ size unknown ⇒ the byte cap says nothing, so the
@@ -923,7 +1002,7 @@ fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
     // An empty reader set is the degenerate "no shards carry stats" case the
     // helper must survive; `SparseCellSetLoader::new` rejects zero files, so the
     // helper is exercised directly.
-    assert_eq!(avg_shard_decoded_bytes(&[]), 0);
+    assert_eq!(avg_shard_decoded_bytes(&[]), (0, 0.0));
 }
 
 /// The **byte** half of that fallback, which the test above never covered.
@@ -980,8 +1059,150 @@ fn sized_budget_loader(
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap()
+}
+
+/// A loader built with an explicit `max_plan_rows` charges one gathered batch.
+fn batch_charged_loader(
+    dir: &std::path::Path,
+    cache_shards: usize,
+    bytes_budget: Option<usize>,
+    max_plan_rows: Option<usize>,
+) -> StdArc<SparseCellSetLoader> {
+    let p0 = dir.join("b0.scx");
+    write_fixture(&p0, 8192, 64, 4);
+    SparseCellSetLoader::new(
+        vec![open(&p0)],
+        cache_shards,
+        bytes_budget,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+        max_plan_rows,
+    )
+    .unwrap()
+}
+
+/// `max_plan_rows` is what turns the batch charge on; without it, nothing moves.
+///
+/// The default has to be byte-identical rather than merely "small": this class
+/// has no `max_plan_size`, so any default would be a guess about plan width, and
+/// on a file where the byte budget already binds a guess spends cache — the
+/// lever `cache_shards` 16 -> 31 measured at 2,486x on census_500k — to buy an
+/// estimate the caller never asked for.
+#[test]
+fn the_batch_is_uncharged_until_max_plan_rows_is_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = Some(50 * 1024 * 1024 + 64 * 32_768);
+
+    let plain = batch_charged_loader(dir.path(), 64, budget, None);
+    assert_eq!(
+        plain.budget_breakdown().batch_buffer_bytes,
+        0,
+        "an undeclared plan width must cost nothing"
+    );
+    assert_eq!(plain.max_plan_rows(), None);
+
+    // `write_fixture` gives one non-zero per row, so a 4096-row plan is
+    // 4096 nnz x 8 B + 4097 x 8 B of indptr.
+    let declared = batch_charged_loader(dir.path(), 64, budget, Some(4096));
+    assert_eq!(declared.mean_nnz_per_row(), 1.0);
+    // Against the pre-size POLICY, not the raw mean: the gather allocates
+    // `presize_nnz`, so a charge computed from the unbiased estimate would
+    // under-report the batch by the eighth the bias adds. Restating the
+    // arithmetic here instead would let the two drift apart silently, which is
+    // the same trap the capacity assertions fell into.
+    assert_eq!(
+        declared.budget_breakdown().batch_buffer_bytes,
+        crate::sparse_cellset::presize_nnz(4096, 1.0) * 8 + 4097 * 8
+    );
+    assert_eq!(declared.max_plan_rows(), Some(4096));
+
+    // Same budget, same shards requested: the charge comes out of the cache.
+    assert!(
+        declared.effective_cache_shards() < plain.effective_cache_shards(),
+        "charging a batch must shrink the affordable cache: {} vs {}",
+        declared.effective_cache_shards(),
+        plain.effective_cache_shards()
+    );
+
+    // ...and monotonically so, which is what makes the term a bound rather
+    // than a flag.
+    let wider = batch_charged_loader(dir.path(), 64, budget, Some(16384));
+    assert!(
+        wider.effective_cache_shards() < declared.effective_cache_shards(),
+        "a wider plan must cost more cache: {} vs {}",
+        wider.effective_cache_shards(),
+        declared.effective_cache_shards()
+    );
+    assert!(
+        wider.budget_breakdown().total_bytes <= wider.cache_bytes_budget()
+            || wider.budget_exceeded(),
+        "the charged breakdown must still fit the budget it was tuned against"
+    );
+}
+
+/// `max_plan_rows` is an upper bound, so it must actually refuse.
+///
+/// It sizes the shard cache down as though plans were at most that wide. A
+/// value that only ever shrinks the budget while the gather accepts any plan is
+/// not a bound — the cache would be sized for 4096 rows and the batch allocated
+/// for a million. `IndexPlanLoader` refuses past `max_plan_size` for exactly
+/// this reason; this mirrors it.
+#[test]
+fn a_plan_wider_than_max_plan_rows_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = batch_charged_loader(dir.path(), 64, None, Some(4));
+
+    let plan = |n: usize| SparseCellSetPlan {
+        file_ids: vec![0; n],
+        rows: (0..n as u64).collect(),
+        role_tags: vec![0; n],
+        set_offsets: vec![0, n as i64],
+    };
+
+    // At the bound: accepted.
+    assert!(run_one(StdArc::clone(&loader), plan(4)).is_ok());
+    // Past it: refused, and the message names the knob and the sizing.
+    let err = run_one(StdArc::clone(&loader), plan(5)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("max_plan_rows"), "{msg}");
+    assert!(msg.contains('5') && msg.contains('4'), "{msg}");
+
+    // An undeclared bound refuses nothing — the default must stay inert.
+    let unbounded = batch_charged_loader(dir.path(), 64, None, None);
+    assert!(run_one(unbounded, plan(64)).is_ok());
+
+    // The ITERATOR route refuses too, and refuses in the stream: the plan must
+    // not reach the prefetcher, which would size it and await shard decodes
+    // before the gather rejected it. Review on #535 round 2 (codex).
+    let streamed = batch_charged_loader(dir.path(), 64, None, Some(4));
+    let mut it = StdArc::clone(&streamed).iter_with_plans(vec![Ok(plan(5))].into_iter(), 4);
+    let first = it
+        .next()
+        .expect("the stream must yield the refusal, not end");
+    let msg = first.unwrap_err().to_string();
+    assert!(msg.contains("max_plan_rows"), "{msg}");
+    // The error alone would also be produced by a LATE refusal, after the
+    // prefetcher had sized the plan and awaited decodes — which is the thing
+    // the fix is about. Zero cache activity is what distinguishes refusing in
+    // the stream from refusing at the end of it. Review on #535 round 3
+    // (Cursor Agent).
+    drop(it);
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let m = streamed.cache_metrics();
+    assert_eq!(
+        m.misses.load(AtomicOrdering::Relaxed) + m.row_group_misses.load(AtomicOrdering::Relaxed),
+        0,
+        "an over-wide plan must be refused before the prefetcher touches a shard"
+    );
 }
 
 /// A loader whose budget was not exceeded must fit the breakdown it reports.
@@ -1037,6 +1258,7 @@ fn closed_form_agrees_with_the_shared_driver() {
     const SHARD: usize = 32_768;
     let model = SparseCellSetBudgetModel {
         shard_decoded_bytes: SHARD,
+        batch_bytes: 0,
     };
     let py = crate::budget::PYTHON_OVERHEAD_BYTES;
     let budgets = [
@@ -1076,6 +1298,7 @@ fn the_sparse_reduction_chain_is_monotone() {
         crate::budget::assert_monotone_reduction_chain(
             &SparseCellSetBudgetModel {
                 shard_decoded_bytes,
+                batch_bytes: 0,
             },
             SparseCellSetParams { cache_shards: 128 },
         );
@@ -1252,6 +1475,7 @@ fn gather_clips_negatives_in_the_emitted_csr() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1288,6 +1512,7 @@ fn gather_clip_runs_after_coalescing_not_before() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1325,6 +1550,7 @@ fn gather_downsamples_to_the_target_with_multinomial() {
             vec![ident],
         )),
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1356,6 +1582,7 @@ fn gather_without_downsample_leaves_counts_untouched() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     let (_, dat) = {
@@ -1395,6 +1622,7 @@ fn gather_downsample_is_reproducible_across_loader_instances() {
                 vec![ident],
             )),
             /*scatter_block_index*/ false,
+            /*max_plan_rows*/ None,
         )
         .unwrap()
     };
@@ -1431,6 +1659,7 @@ fn gather_downsample_is_invariant_to_row_order_within_a_plan() {
             vec![ident],
         )),
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1476,6 +1705,7 @@ fn gather_downsample_is_invariant_to_manifest_order() {
                 idents,
             )),
             /*scatter_block_index*/ false,
+            /*max_plan_rows*/ None,
         )
         .unwrap()
     };
@@ -1517,6 +1747,7 @@ fn gather_rejects_an_invalid_downsample_config() {
             0.0,
             Some(cfg),
             /*scatter_block_index*/ false,
+            /*max_plan_rows*/ None,
         )
     };
 
@@ -1582,6 +1813,7 @@ fn gather_rejects_an_empty_identity_table_across_multiple_files() {
             vec![],
         )),
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .err()
     .expect("multi-file downsample without identities must be rejected")
@@ -1701,6 +1933,7 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
         /*target_sum*/ 1e4,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1737,4 +1970,305 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
         "the engine outlived every explicit owner, so its runtime must still \
          have gone down through BoundedRuntime::drop"
     );
+}
+
+/// Like [`write_fixture`] but with **ragged** rows: row `r` carries
+/// `(r % 4) + 1` non-zeros, so the manifest mean is 2.5 and no single row has
+/// it. Exists so the pre-sizing estimate can be tested where it is genuinely an
+/// estimate — `write_fixture`'s uniform one-non-zero-per-row makes the mean
+/// exact for every plan, which cannot distinguish an estimate from a count.
+fn write_ragged_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize, n_shards: usize) {
+    assert!(n_obs.is_multiple_of(n_shards));
+    let rows_per_shard = n_obs / n_shards;
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        // Header nnz must match what the shards actually store, or the catalog
+        // stats the estimate reads disagree with the payload.
+        (0..n_obs).map(|r| (r % 4) as u64 + 1).sum::<u64>(),
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(obs_schema),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(var_schema),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            let nnz = (row % 4) + 1;
+            for k in 0..nnz {
+                // Ascending and unique within the row, as CSR requires.
+                indices.push(((row + k) % n_vars) as u32);
+                values.push(((row + k + 1) & 0xFF) as u8);
+            }
+            indptr.push(*indptr.last().unwrap() + nnz as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// W1: the pre-size is an estimate, and is wrong in both directions by design.
+///
+/// The capacity comes from the manifest's mean density, so a plan that selects
+/// denser-than-average rows under-shoots (one reallocation, which the caller
+/// would have paid anyway) and one that selects sparser rows over-shoots (a few
+/// transient bytes). Neither can affect the output, and that is the whole
+/// argument for preferring the estimate to the exact indptr prescan it
+/// replaced (`BackedCsrReader::nnz_for_rows`, added and then deleted in this
+/// series) —
+/// `with_capacity` is a hint, so nothing here needs a bound, and buying one
+/// cost an indptr decode per touched shard per plan (~9 % of
+/// `gather_grouped_s512` on tabula in the two-build A/B).
+#[test]
+fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ragged.scx");
+    // Rows 0..64, row r has (r % 4) + 1 non-zeros ⇒ mean 2.5.
+    write_ragged_fixture(&path, 64, 16, 2);
+
+    let gather = |rows: Vec<u64>| {
+        let loader = SparseCellSetLoader::new(
+            vec![open(&path)],
+            8,
+            None,
+            4,
+            None,
+            None,
+            false,
+            false,
+            0.0,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let n = rows.len();
+        let plan = SparseCellSetPlan {
+            file_ids: vec![0; n],
+            rows,
+            role_tags: vec![0; n],
+            set_offsets: vec![0, n as i64],
+        };
+        loader
+            .iter_with_plans(vec![Ok(plan)].into_iter(), 4)
+            .map(|r| r.unwrap())
+            .next()
+            .unwrap()
+    };
+
+    // Densest rows only (r % 4 == 3 ⇒ 4 nnz each): the mean under-shoots.
+    let dense: Vec<u64> = (0..64).filter(|r| r % 4 == 3).collect();
+    let n_dense = dense.len();
+    let b = gather(dense);
+    assert_eq!(b.indices.len(), n_dense * 4, "4 nnz per selected row");
+    assert!(
+        b.indices.capacity() >= b.indices.len(),
+        "capacity {} < len {} — a Vec cannot hold less than it holds",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+    // Even with the bias, a densest-rows plan exceeds the estimate — the one
+    // case the estimate cannot serve without reading the data, and the reason
+    // the assertion above is `>=` rather than an equality. Pinned so a silent
+    // return to an exact indptr prescan, which would make this case free, is
+    // visible.
+    assert!(
+        crate::sparse_cellset::presize_nnz(n_dense, 2.5) < b.indices.len(),
+        "a densest-rows plan should still exceed the biased estimate: {} vs {}",
+        crate::sparse_cellset::presize_nnz(n_dense, 2.5),
+        b.indices.len()
+    );
+
+    // Sparsest rows only (r % 4 == 0 ⇒ 1 nnz each): the mean over-shoots.
+    let sparse: Vec<u64> = (0..64).filter(|r| r % 4 == 0).collect();
+    let n_sparse = sparse.len();
+    let b = gather(sparse);
+    assert_eq!(b.indices.len(), n_sparse, "1 nnz per selected row");
+    assert!(
+        b.indices.capacity() > b.indices.len(),
+        "the mean should over-estimate a sparsest-rows plan: capacity {} vs len {}",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+
+    // Whole file: the mean is exact over every row, so the estimate before the
+    // bias is the truth — and the bias is then pure headroom, which is what
+    // keeps even this plan free of a reallocation.
+    let b = gather((0..64).collect());
+    assert_eq!(b.indices.len(), 160, "sum of (r % 4) + 1 over 64 rows");
+    assert_eq!(
+        b.indices.capacity(),
+        crate::sparse_cellset::presize_nnz(64, 2.5),
+        "the whole-file plan should not have reallocated"
+    );
+    assert!(b.indices.capacity() > b.indices.len(), "bias is headroom");
+}
+
+/// W1: the gather pre-sizes `indices`/`data`, so the append loop never
+/// reallocates.
+///
+/// The assertion is `capacity() == presize_nnz(rows, mean)` — the capacity the
+/// policy asks for, untouched — rather than `capacity() == len()`. Those were
+/// the same thing while the estimate was unbiased, and pinning the wrong one
+/// hid a defect: the estimate then landed just *under* the truth about half the
+/// time, taking one reallocation at full size, which measured slower than
+/// growing from empty. An equality against the policy catches any growth
+/// (a realloc lands on a different, larger capacity) without re-asserting the
+/// arithmetic, so it keeps working when the bias changes.
+///
+/// Watched failing before the pre-sizing existed: with `Vec::new()` the
+/// finished `indices` has a power-of-two capacity, the signature of geometric
+/// growth.
+#[test]
+fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presize.scx");
+    write_fixture(&path, 640, 32, 4);
+
+    let loader = SparseCellSetLoader::new(
+        vec![open(&path)],
+        /*cache_shards*/ 8,
+        None,
+        /*lookahead*/ 4,
+        /*remap*/ None,
+        /*n_global_genes*/ None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
+    )
+    .unwrap();
+
+    // Every row of the fixture carries exactly one non-zero, so the expected
+    // total is the row count — known independently of the code under test.
+    let rows: Vec<u64> = (0..640).collect();
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 640],
+        rows,
+        role_tags: vec![0; 640],
+        set_offsets: vec![0, 320, 640],
+    };
+    let batches: Vec<_> = loader
+        .iter_with_plans(vec![Ok(plan)].into_iter(), 4)
+        .map(|r| r.unwrap())
+        .collect();
+    let b = &batches[0];
+
+    assert_eq!(b.indices.len(), 640, "one nnz per row in this fixture");
+    // Every row carries one non-zero, so the manifest mean is 1.0 and the
+    // policy asks for 640 + 640/8. Anything else means the vector grew.
+    let want = crate::sparse_cellset::presize_nnz(640, 1.0);
+    assert_eq!(
+        b.indices.capacity(),
+        want,
+        "indices reallocated: capacity {} != the {} it was pre-sized to (len {})",
+        b.indices.capacity(),
+        want,
+        b.indices.len()
+    );
+    assert_eq!(
+        b.data.capacity(),
+        want,
+        "data reallocated: capacity {} != the {} it was pre-sized to (len {})",
+        b.data.capacity(),
+        want,
+        b.data.len()
+    );
+    // And the bias is an over-allocation, never an under-one: a capacity below
+    // the length is the shape that costs a full-size copy.
+    assert!(b.indices.capacity() > b.indices.len());
+}
+
+/// The pre-size must be a *bound*, never a truncation: `capacity >= len` on a
+/// path where the transform drops entries (remap sentinels).
+#[test]
+fn gather_presize_is_an_upper_bound_when_remap_drops_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("presize_remap.scx");
+    write_fixture(&path, 64, 8, 2);
+
+    // Map column 0 to the `-1` drop sentinel, every other column to itself.
+    let mut table: Vec<i32> = (0..8).collect();
+    table[0] = -1;
+    let loader = SparseCellSetLoader::new(
+        vec![open(&path)],
+        /*cache_shards*/ 4,
+        None,
+        /*lookahead*/ 2,
+        /*remap*/ Some(vec![table]),
+        /*n_global_genes*/ Some(8),
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
+    )
+    .unwrap();
+
+    let rows: Vec<u64> = (0..64).collect();
+    let plan = SparseCellSetPlan {
+        file_ids: vec![0; 64],
+        rows,
+        role_tags: vec![0; 64],
+        set_offsets: vec![0, 64],
+    };
+    let batches: Vec<_> = loader
+        .iter_with_plans(vec![Ok(plan)].into_iter(), 2)
+        .map(|r| r.unwrap())
+        .collect();
+    let b = &batches[0];
+
+    assert!(
+        b.indices.capacity() >= b.indices.len(),
+        "pre-size under-allocated: capacity {} < len {}",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+    // Rows whose single non-zero sat at column 0 dropped out entirely.
+    let dropped = (0..64u64).filter(|r| r % 8 == 0).count();
+    assert_eq!(b.indices.len(), 64 - dropped);
 }

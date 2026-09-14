@@ -6,7 +6,9 @@ batches as sparse CSR (the §4.4 contract) and must match the backed
 """
 
 import multiprocessing as mp
+import shutil
 
+import anndata
 import numpy as np
 import pytest
 import scipy.sparse as sp
@@ -738,4 +740,121 @@ def test_one_framed_file_in_the_set_suppresses_the_warning(framed_scx,
         ).close()
     assert not [w for w in caught if "row-group framed" in str(w.message)], (
         [str(w.message) for w in caught]
+    )
+
+
+# ---------------------------------------------------------------------------
+# gather(plan) — the synchronous one-plan entry point
+# ---------------------------------------------------------------------------
+
+
+def test_gather_equals_the_iterator_batch_field_for_field(two_scx):
+    """`gather` and `iter_with_plans` must agree on every array of the batch.
+
+    They take different admission routes — the iterator carries one row-group
+    verdict for the whole plan from the prefetch engine, `gather` decides for
+    itself against the full byte budget — and the point of this test is that the
+    verdict changes only what the cache *retains*, never what is read.
+    """
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset(list(two_scx))
+    try:
+        streamed = next(iter(ds.iter_with_plans(iter([_PLAN]))))
+        direct = ds.gather(*_PLAN)
+
+        assert direct.keys() == streamed.keys()
+        assert direct["shape"] == streamed["shape"]
+        for k in ("indptr", "indices", "data", "cell_indices", "file_ids", "set_offsets",
+                  "role_tags"):
+            assert direct[k].dtype == streamed[k].dtype, k
+            np.testing.assert_array_equal(direct[k], streamed[k], err_msg=k)
+    finally:
+        ds.close()
+
+
+def test_gather_raises_the_same_errors_as_the_iterator(two_scx):
+    """Validation lives in the shared gather, so both paths raise identically.
+
+    Checked as a pair rather than against literal types, so the two cannot drift
+    apart: an error the iterator raises but `gather` swallows (or vice versa) is
+    the failure mode, not the specific class.
+    """
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset(list(two_scx))
+    try:
+        bad_plans = {
+            # file_id past the manifest.
+            "file_id": ([0, 9], [1, 2], [0, 0], [0, 2]),
+            # row past the file's n_obs.
+            "row": ([0, 0], [0, 10**9], [0, 0], [0, 2]),
+            # set_offsets not monotonic.
+            "set_offsets": ([0, 0], [0, 1], [0, 0], [0, 2, 1]),
+            # a set spanning two files with no remap_tables.
+            "cross_file": ([0, 1], [0, 1], [0, 0], [0, 2]),
+        }
+        for name, plan in bad_plans.items():
+            with pytest.raises(Exception) as via_iter:
+                next(iter(ds.iter_with_plans(iter([plan]))))
+            with pytest.raises(Exception) as via_gather:
+                ds.gather(*plan)
+            assert type(via_gather.value) is type(via_iter.value), name
+            assert str(via_gather.value) == str(via_iter.value), name
+    finally:
+        ds.close()
+
+
+def test_gather_on_a_closed_dataset_raises_before_reading_the_plan(two_scx):
+    """Terminal-state error wins over argument handling, as on `iter_with_plans`."""
+    import pyscx
+
+    ds = pyscx.SparseCellSetDataset(list(two_scx))
+    ds.close()
+    # A plan so malformed that extraction would fail if it were reached first.
+    with pytest.raises(RuntimeError, match="close"):
+        ds.gather(None, None, None, None)
+
+
+def test_constructor_releases_the_gil(tmp_dir):
+    """A Python thread must keep running while the constructor opens files.
+
+    The constructor mmaps and parses a catalog per path and then validates every
+    CSR range, all pure Rust over owned data — but it held the GIL throughout,
+    so a manifest-sized open froze every other thread in the process.
+
+    Sized deliberately. The measured cost is dominated by SHARD count, not file
+    count or cell count: 512 single-shard files open in 3.8 ms and a 200k-cell
+    file in 20 ms, both far under `_gil_probe`'s measurable floor, while 600
+    shards x 200 files clears it. A 50-file manifest here would skip on every
+    run and read as coverage.
+    """
+    import pyscx
+    from _gil_probe import largest_gap_during
+
+    n_obs, shard_size, n_files = 30000, 50, 200  # 600 shards per file
+    x = sp.random(n_obs, 40, density=0.02, format="csr", random_state=0, dtype=np.float32)
+    base = str(tmp_dir / "base.scx")
+    pyscx.from_anndata(anndata.AnnData(x), base, shard_size=shard_size)
+    paths = []
+    for i in range(n_files):
+        p = str(tmp_dir / f"m{i}.scx")
+        shutil.copyfile(base, p)
+        paths.append(p)
+
+    # Warm the process's lazily-built pools, so the timed open measures the
+    # open rather than one-time initialisation.
+    pyscx.SparseCellSetDataset([base]).close()
+
+    held = {}
+    duration, largest_gap = largest_gap_during(
+        lambda: held.setdefault("ds", pyscx.SparseCellSetDataset(paths))
+    )
+    held["ds"].close()
+
+    if duration < 0.05:
+        pytest.skip(f"constructor too fast to measure the gap ({duration * 1000:.1f} ms)")
+    assert largest_gap < 0.5 * duration, (
+        f"monitor thread stalled {largest_gap * 1000:.1f} ms of a "
+        f"{duration * 1000:.1f} ms constructor — the GIL was held across the open"
     )

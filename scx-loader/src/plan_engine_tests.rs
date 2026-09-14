@@ -548,6 +548,75 @@ fn framed_engine_with_budget(
     )
 }
 
+/// The blocking-cap arithmetic, pinned where its inputs are available.
+///
+/// **Review on #535 round 2 (Cursor Agent, codex), after CI went red.** The
+/// first attempt at pinning this lived in Python and re-derived the decode
+/// pool's width with `os.cpu_count()` — logical CPUs — while `cpu_pool` uses
+/// `num_cpus::get_physical()`. On a 2-vCPU / 1-physical runner that is 4 vs a
+/// predicted 5. The override spellings diverge too: Rust trims and treats `0`
+/// as "fall back", Python's `isdigit()` does neither.
+///
+/// So the arithmetic is pinned here, against supplied inputs, and Python only
+/// asserts the surfaces agree with each other.
+#[test]
+fn the_blocking_cap_clamps_between_two_and_tokios_default() {
+    use crate::plan_engine::clamp_blocking_threads;
+
+    // Floor: a one-thread pool with no lookahead still gets two.
+    assert_eq!(clamp_blocking_threads(1, 0), 2);
+    // The ordinary case: the default clamp(1, 8) pool plus lookahead 4.
+    assert_eq!(clamp_blocking_threads(8, 4), 12);
+    // Ceiling: SCX_LOADER_CPU_THREADS may exceed the pool's own clamp, and the
+    // cap must never rise above the tokio default it replaces.
+    assert_eq!(clamp_blocking_threads(508, 8), 512);
+    assert_eq!(clamp_blocking_threads(usize::MAX, 8), 512);
+}
+
+/// `plan_fits_budget` sizes the WHOLE plan against the WHOLE budget.
+///
+/// **Review on #535 (codex).** The synchronous `SparseCellSetLoader::gather`
+/// used to pass `None` for admission, letting every set decide for itself; two
+/// sets that each fit but whose union does not would then evict each other's
+/// row groups. This is the decision function that fixed it.
+///
+/// Tested here rather than through `gather` on purpose: at the loader level the
+/// budget model subtracts a ~50 MB interpreter constant before sizing, so a
+/// group-sized budget yields a cache that retains nothing either way — an
+/// integration assertion of "retains nothing" passes with the bug applied. This
+/// helper takes the byte budget verbatim, so both answers are observable.
+///
+/// Two directions, because one of them alone is unfalsifiable: a function that
+/// always returns `false` satisfies the union case, and one that always returns
+/// `true` satisfies the single-set case.
+#[test]
+fn plan_fits_budget_sizes_the_union_not_the_largest_set() {
+    let dir = tempfile::tempdir().unwrap();
+    // Set A → groups 0/4/8/12, set B → groups 1/5/9/13: 4 groups each, union 8.
+    let set_a: Vec<u64> = vec![5, 70, 140, 200];
+    let set_b: Vec<u64> = vec![20, 85, 155, 215];
+    let union: Vec<u64> = set_a.iter().chain(set_b.iter()).copied().collect();
+
+    // Between one set and the pair.
+    let budget = 6 * FRAMED_GROUP_BYTES;
+    let engine = framed_engine_with_budget(dir.path(), /*scatter_block_index*/ true, budget);
+
+    let fits = |rows: &[u64]| {
+        let per_shard = engine.bucket_plan_rows(rows.iter().map(|&r| (0u32, r)));
+        let (planned, budget) = engine.plan_footprint(&per_shard);
+        planned <= budget
+    };
+    assert!(
+        fits(&set_a),
+        "one set is 4 groups against a 6-group budget and must fit"
+    );
+    assert!(
+        !fits(&union),
+        "the union is 8 groups against a 6-group budget and must not fit — \
+         sizing the largest set instead of the union would admit it"
+    );
+}
+
 /// Bytes one decoded row group of the framed fixture occupies in the LRU:
 /// `FRAMED_ROW_GROUP_ROWS` rows at one non-zero each — `(16 + 1) × 8 + 16 × 4 +
 /// 16 × 4`. The row-group warm tests size their budgets from it.

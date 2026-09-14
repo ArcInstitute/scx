@@ -632,6 +632,17 @@ impl IndexPlanLoader {
         self.effective_lookahead
     }
 
+    /// Cap on simultaneously-running shard decodes in the prefetch engine.
+    ///
+    /// Lives on the shared [`PrefetchEngine`], so this class is subject to it
+    /// exactly as `SparseCellSetDataset` is; reported here so an operator
+    /// reading only this budget still sees it. `lookahead` bounds in-flight
+    /// *plans*, not the one `spawn_blocking` a plan issues per distinct
+    /// `(file, shard)`.
+    pub fn max_blocking_threads(&self) -> usize {
+        self.engine().max_blocking_threads()
+    }
+
     /// Whether block-index adoption is enabled for this dataset (default
     /// `true`). Reports the value [`Self::set_scatter_block_index`] pushed into
     /// the backed reader, which is where the decision actually lives:

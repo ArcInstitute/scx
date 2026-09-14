@@ -22,7 +22,9 @@ use scx_format_io::{CacheMetrics, ScxReader};
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::{IterMetrics, PrefetchEngine};
-use crate::sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode};
+use crate::sparse_cellset_collate::{
+    collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode, RowMask, SetQueryIndex,
+};
 
 /// One batch of cell sets to gather. Rows are flat across all sets in the
 /// batch; `set_offsets` (length `n_sets + 1`) delimits each set's row range.
@@ -107,6 +109,11 @@ pub struct SparseCellSetLoader {
     /// misleading on a large-shard file where the byte budget binds first, which
     /// is exactly the STATE3 regime this loader targets.
     affordable_cache_shards: usize,
+    /// Caller-declared upper bound on rows per plan, or `None` (uncharged).
+    max_plan_rows: Option<usize>,
+    /// Manifest-wide mean non-zeros per row — the density the batch charge and
+    /// its `memory_budget()` report are computed at.
+    mean_nnz_per_row: f64,
     /// Average decoded bytes per CSR shard across every file, the unit the
     /// budget model counts in.
     shard_decoded_bytes: usize,
@@ -141,7 +148,13 @@ pub struct SparseCellSetLoader {
 /// only (no decode). Same per-shard model as `IndexPlanLoader`'s auto-tune and
 /// as `scx_format_io`'s `SizeHint for ScxCsr`: `nnz × 8` (i32 indices + f32
 /// data) + `rows × 8` (i64 indptr).
-fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
+///
+/// Also returns the manifest's mean non-zeros per row, which the same walk
+/// already accumulates and used to discard. That is the per-row size a gathered
+/// batch is charged at (see [`SparseCellSetBudgetModel`]); deriving it here
+/// rather than in a second catalog walk keeps one definition of which shards
+/// count, and the divisor rule below applies to both.
+fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
     let mut total_nnz = 0u64;
     let mut total_rows = 0u64;
     // Only shards that CONTRIBUTED to the totals may count toward the divisor.
@@ -163,11 +176,31 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
     // No shard carried stats ⇒ the size is genuinely unknown. Returning 0 is the
     // signal `SparseCellSetLoader::new` reads as "the byte cap tells us nothing",
     // falling back to the count cap rather than to a fabricated average.
-    total_nnz
+    let avg_bytes = total_nnz
         .saturating_mul(8)
         .saturating_add(total_rows.saturating_mul(8))
         .checked_div(n_counted)
-        .unwrap_or(0) as usize
+        .unwrap_or(0) as usize;
+    // Rows, not shards, in this divisor: the mean is per row of the manifest,
+    // so shards of unequal height must not be weighted equally. 0.0 when no
+    // shard carried stats, matching `avg_bytes`'s "genuinely unknown" signal.
+    let mean_nnz_per_row = if total_rows == 0 {
+        0.0
+    } else {
+        total_nnz as f64 / total_rows as f64
+    };
+    (avg_bytes, mean_nnz_per_row)
+}
+
+/// Capacity to pre-size a gathered batch's `indices` / `data` to.
+///
+/// `rows x mean_nnz_per_row`, biased up by an eighth. Shared with the tests so
+/// they assert against the policy rather than restating its arithmetic, which
+/// is what lets them keep proving "no reallocation happened" when the bias
+/// changes.
+pub(crate) fn presize_nnz(rows: usize, mean_nnz_per_row: f64) -> usize {
+    let est = (rows as f64 * mean_nnz_per_row).ceil() as usize;
+    est.saturating_add(est / 8)
 }
 
 use crate::budget::BudgetModel;
@@ -257,9 +290,16 @@ pub(crate) struct SparseCellSetParams {
 ///
 /// * **Charged**: the decoded shard cache, sized and enforced from this model,
 ///   plus the interpreter/numpy/Arrow constant every path pays.
-/// * **Not charged**: the gathered batch itself and its transients. Unlike
-///   `IndexPlanLoader`, this path has no `max_plan_size`, so a plan's output
-///   size is caller-controlled and unbounded — there is nothing fixed to cost.
+/// * **Charged only if declared**: the gathered batch. Unlike `IndexPlanLoader`
+///   this path has no `max_plan_size` — a plan's output size is caller-controlled
+///   and unbounded, so there is nothing fixed to cost until the caller says how
+///   wide its plans get. `max_plan_rows` is that declaration, and it is opt-in
+///   on purpose: charging a guessed default would shrink the cache on every
+///   existing caller, and on a file where the adaptive cap already binds
+///   (census_500k affords 22 of the 31 shards it wants) that is throughput
+///   traded away for an estimate nobody asked for.
+/// * **Not charged**: the batch's transients, and the batch at all when
+///   `max_plan_rows` is `None`.
 /// * **Not a hard cap**: `WeightedLruCache::put_with_budget` deliberately keeps
 ///   a single entry that exceeds the byte budget on its own (refusing would
 ///   defeat the cache for any outsized shard), so one above-average shard can
@@ -275,6 +315,28 @@ pub(crate) struct SparseCellSetParams {
 /// absurd budget must keep warning rather than start raising.
 pub(crate) struct SparseCellSetBudgetModel {
     shard_decoded_bytes: usize,
+    /// One gathered batch at the caller's declared `max_plan_rows`, or 0.
+    batch_bytes: usize,
+}
+
+impl SparseCellSetBudgetModel {
+    /// Bytes one gathered batch of `rows` occupies, at `mean_nnz_per_row`.
+    ///
+    /// The §4.4 batch is CSR, so this is the `csr_component_bytes` shape —
+    /// `nnz × 8` for the i32 indices plus the f32 data, and `(rows + 1) × 8` for
+    /// the i64 indptr — not `IndexPlanLoader`'s dense `2 × rows × n_cols × 4`.
+    /// The per-row obs and id arrays are left out: they are two orders of
+    /// magnitude smaller than the CSR at any realistic density, and a term that
+    /// small would lend the estimate a precision it does not have.
+    fn batch_bytes_for(max_plan_rows: usize, mean_nnz_per_row: f64) -> usize {
+        // `presize_nnz`, not the raw mean: the gather allocates the biased
+        // figure, so charging the unbiased one would under-report the batch by
+        // exactly the eighth the bias adds — on a term whose whole purpose is
+        // to make `max_memory_mb` mean something.
+        let nnz = presize_nnz(max_plan_rows, mean_nnz_per_row);
+        nnz.saturating_mul(8)
+            .saturating_add(max_plan_rows.saturating_add(1).saturating_mul(8))
+    }
 }
 
 impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
@@ -283,7 +345,10 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
     fn estimate(&self, p: SparseCellSetParams) -> crate::budget::BudgetBreakdown {
         crate::budget::BudgetBreakdown::new(
             p.cache_shards.saturating_mul(self.shard_decoded_bytes),
-            0,
+            // The existing `batch_buffer_bytes` slot, rather than a seventh key:
+            // every loader class reports the same six, and the breakdown's shape
+            // is pinned by `test_every_budget_carries_the_same_breakdown`.
+            self.batch_bytes,
             0,
             0,
             crate::budget::PYTHON_OVERHEAD_BYTES,
@@ -329,6 +394,7 @@ impl SparseCellSetLoader {
         target_sum: f64,
         downsample: Option<crate::downsample::DownsampleConfig>,
         scatter_block_index: bool,
+        max_plan_rows: Option<usize>,
     ) -> Result<Arc<Self>> {
         // Same reason as `IndexPlanLoader`: this loader resolves cells by global
         // obs row through `BackedCsrReader`, so a multimodal file's flattened
@@ -396,9 +462,16 @@ impl SparseCellSetLoader {
         };
         // Resolve the cache byte budget before the readers are moved into the
         // engine: the adaptive path needs their catalog stats.
-        let shard_decoded_bytes = avg_shard_decoded_bytes(&scx_readers);
+        let (shard_decoded_bytes, mean_nnz_per_row) = avg_shard_decoded_bytes(&scx_readers);
+        // `None` ⇒ 0 ⇒ the breakdown and the resolved cache are byte-identical
+        // to what this loader produced before the term existed. Only a caller
+        // who declares how wide its plans get pays for one.
+        let batch_bytes = max_plan_rows
+            .map(|rows| SparseCellSetBudgetModel::batch_bytes_for(rows, mean_nnz_per_row))
+            .unwrap_or(0);
         let model = SparseCellSetBudgetModel {
             shard_decoded_bytes,
+            batch_bytes,
         };
         let requested = SparseCellSetParams { cache_shards };
         let cache_bytes_budget = match bytes_budget {
@@ -465,6 +538,8 @@ impl SparseCellSetLoader {
             cache_bytes_budget,
             cache_shards,
             affordable_cache_shards,
+            max_plan_rows,
+            mean_nnz_per_row,
             shard_decoded_bytes,
             budget_breakdown,
             enforced_cache_bytes,
@@ -484,6 +559,21 @@ impl SparseCellSetLoader {
     /// the value that actually binds.
     pub fn cache_shards(&self) -> usize {
         self.cache_shards
+    }
+
+    /// Caller-declared rows-per-plan bound, or `None` if the batch is uncharged.
+    pub fn max_plan_rows(&self) -> Option<usize> {
+        self.max_plan_rows
+    }
+
+    /// Manifest-wide mean non-zeros per row (0.0 when no shard carries stats).
+    pub fn mean_nnz_per_row(&self) -> f64 {
+        self.mean_nnz_per_row
+    }
+
+    /// Cap on simultaneously-running shard decodes in the prefetch engine.
+    pub fn max_blocking_threads(&self) -> usize {
+        self.engine.max_blocking_threads()
     }
 
     /// Shard-cache entries actually affordable: `min(cache_shards, budget /
@@ -507,10 +597,12 @@ impl SparseCellSetLoader {
     /// Per-component memory estimate, in the one shape every class that reports
     /// a budget uses (ORG-9.10-4).
     ///
-    /// Only two terms are non-zero, and that is the model, not an omission: the
-    /// shard cache **is** this loader's budget — there is no batch buffer,
-    /// no plan-tuple staging and no per-batch obs scratch on the gather path —
-    /// plus the interpreter/numpy/Arrow constant every path pays.
+    /// Two terms are non-zero by default, and that is the model, not an
+    /// omission: the shard cache **is** this loader's budget — no plan-tuple
+    /// staging and no per-batch obs scratch on the gather path — plus the
+    /// interpreter/numpy/Arrow constant every path pays. A caller that declares
+    /// `max_plan_rows` adds a third, `batch_buffer_bytes`: one gathered CSR
+    /// batch at that width and the manifest's mean density.
     ///
     /// Since ORG-9.10-5 the interpreter constant is **budgeted**, not merely
     /// reported: the auto-tune subtracts it before sizing the cache, so
@@ -608,6 +700,12 @@ impl SparseCellSetLoader {
     {
         let engine = Arc::clone(&self.engine);
         let loader = Arc::clone(&self);
+        // Width is refused in the STREAM, so an over-wide plan never reaches
+        // `spawn_prefetches` — which would otherwise size it and await real
+        // shard decodes before the gather rejected it.
+        let gate = Arc::clone(&self);
+        let plans =
+            plans.map(move |p| p.and_then(|plan| gate.check_plan_width(&plan).map(|()| plan)));
         let iter = engine.iter_with_plans(
             plans,
             lookahead,
@@ -632,16 +730,49 @@ impl SparseCellSetLoader {
         }
     }
 
-    /// Gather one batch of cell sets into the §4.4 contract. Row-group
-    /// admission is decided per gather here; the engine-driven path
-    /// ([`Self::iter_with_plans`]) goes through [`Self::gather_admitting`]
-    /// with the plan-level verdict instead.
-    pub fn gather(
-        &self,
-        engine: &PrefetchEngine,
-        plan: &SparseCellSetPlan,
-    ) -> Result<SparseCellSetBatch> {
-        self.gather_admitting(engine, plan, None)
+    /// Refuse a plan wider than the caller's declared `max_plan_rows`.
+    ///
+    /// **Review on #535 round 2 (codex).** Called BEFORE any admission sizing
+    /// or prefetch I/O on both public routes. The first version checked inside
+    /// `gather_admitting`, which meant an over-wide plan had already allocated
+    /// its dedup set and — on the iterator path — spawned and awaited shard
+    /// decodes before the refusal it was promised. A limit that only takes
+    /// effect after the work it was meant to prevent is not a limit.
+    fn check_plan_width(&self, plan: &SparseCellSetPlan) -> Result<()> {
+        if let Some(limit) = self.max_plan_rows {
+            let total_rows = plan.rows.len();
+            if total_rows > limit {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "plan has {total_rows} rows, exceeding max_plan_rows {limit} \
+                         (raise max_plan_rows at construction, or split the plan; \
+                         the shard cache was sized against {limit})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Gather one batch of cell sets into the §4.4 contract, synchronously.
+    ///
+    /// Takes **one** row-group admission verdict over the whole plan, sized
+    /// against the entire byte budget, and carries it into every set's read —
+    /// the same shape the engine-driven path ([`Self::iter_with_plans`]) uses,
+    /// differing only in that it has no lookahead window to divide the budget
+    /// by. Deciding per set instead would let a plan whose sets each fit, but
+    /// whose union does not, evict its own row groups set by set.
+    pub fn gather(&self, plan: &SparseCellSetPlan) -> Result<SparseCellSetBatch> {
+        self.check_plan_width(plan)?;
+        // One verdict, inline: the prefetcher makes the same two calls and
+        // compares against its divided share, so the only thing that differed
+        // was the comparison — a named wrapper around it added a hop and no
+        // decision.
+        let per_shard = self
+            .engine
+            .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
+        let (planned, budget) = self.engine.plan_footprint(&per_shard);
+        self.gather_admitting(&self.engine, plan, Some(planned <= budget))
     }
 
     /// [`Self::gather`] with the row-group admission decided by the caller.
@@ -658,6 +789,9 @@ impl SparseCellSetLoader {
         admit_row_groups: Option<bool>,
     ) -> Result<SparseCellSetBatch> {
         let total_rows = plan.rows.len();
+        // Width is checked by `check_plan_width` on both public routes, before
+        // any admission sizing or prefetch I/O — not here, where the work it
+        // refuses has already happened.
         if plan.file_ids.len() != total_rows || plan.role_tags.len() != total_rows {
             return Err(LoaderError::ConfigError {
                 reason: "plan file_ids/rows/role_tags length mismatch".into(),
@@ -707,8 +841,46 @@ impl SparseCellSetLoader {
 
         let mut indptr: Vec<i64> = Vec::with_capacity(total_rows + 1);
         indptr.push(0);
-        let mut indices: Vec<i32> = Vec::new();
-        let mut data: Vec<f32> = Vec::new();
+        // Pre-size the two nnz-sized outputs so the append loop below does not
+        // grow them geometrically from empty, which costs an allocation plus a
+        // copy of everything written so far at each doubling — priced as
+        // allocations, not memcpys.
+        //
+        // **An estimate from catalog stats, deliberately, not an exact count.**
+        // `with_capacity` is a hint: undershooting costs a reallocation the
+        // caller would have paid anyway, overshooting costs transient bytes.
+        // Nothing here needs a bound, so nothing here should pay for one — and
+        // the exact version did pay. Summing the plan's true row lengths means
+        // decoding each touched shard's indptr, once per plan, and a two-build
+        // A/B measured that at ~9 % of `gather_grouped_s512` on tabula (medians
+        // 89.4 → 80.8 sets/s in one arm ordering and 77.7 → 84.6 in the other,
+        // both agreeing) against a 1.85–2.07× win on pbmc3k, whose single-shard
+        // batches made the decode free. The estimate keeps the win and drops
+        // the I/O: `mean_nnz_per_row` comes from the catalog walk the budget
+        // model already does at construction, and reads nothing.
+        //
+        // **Biased upward by an eighth, and that is the whole point.** The two
+        // errors are not symmetric: overshooting wastes transient bytes, while
+        // undershooting by any margin at all forces a reallocation at FULL
+        // size — the single most expensive one, copying the whole batch. A
+        // mean-exact estimate lands just under the truth about half the time,
+        // and an A/B caught that costing the entire win: on pbmc3k the plan's
+        // rows average 850.5 non-zeros against the manifest's 847.0, so the
+        // unbiased estimate came 0.4 % short, took that one full-size copy, and
+        // measured *slower* than growing from empty (3949 vs 4799 sets/s).
+        //
+        // An eighth is a shift, covers ordinary sampling variation in row
+        // density, and costs ~0.9 MB on a 1024-row pbmc3k batch. A plan that
+        // deliberately selects the densest rows can still exceed it and pay the
+        // one reallocation; that is the rare case, and it is the case the
+        // estimate cannot serve without reading the data.
+        //
+        // 0 when no shard carried stats, which is the same "size unknown"
+        // signal the byte budget falls back on — capacity 0 is exactly the
+        // pre-change behaviour, so an unknowable file is no worse off.
+        let planned_nnz = presize_nnz(total_rows, self.mean_nnz_per_row);
+        let mut indices: Vec<i32> = Vec::with_capacity(planned_nnz);
+        let mut data: Vec<f32> = Vec::with_capacity(planned_nnz);
         let mut cell_indices: Vec<u64> = Vec::with_capacity(total_rows);
         let mut out_file_ids: Vec<u32> = Vec::with_capacity(total_rows);
         let mut role_tags: Vec<i32> = Vec::with_capacity(total_rows);
@@ -924,6 +1096,18 @@ pub fn collate_gathered(
         }
     }
 
+    // One sorted query panel per set, built before the row loop because the
+    // panel is per-set while the mask bits below are per-row. Skipped entirely
+    // on the perturbation path (no mask ⇒ nothing to look up), so that path
+    // pays neither the sort nor the allocation.
+    let query_indices: Vec<SetQueryIndex> = if has_mask {
+        (0..n_sets)
+            .map(|s| SetQueryIndex::new(&query_gene_ids[s * k_dec..(s + 1) * k_dec]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut enc_ids = vec![0i64; n_rows * k_enc];
     let mut enc_counts = vec![0f32; n_rows * k_enc];
     let mut enc_mask = vec![0u8; n_rows * k_enc];
@@ -953,11 +1137,10 @@ pub fn collate_gathered(
                     gene_ids: &indices[lo..hi],
                     raw: &data[lo..hi],
                     query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
-                    enc_mask_positions: if has_mask {
-                        Some(&enc_mask_positions[r * k_dec..(r + 1) * k_dec])
-                    } else {
-                        None
-                    },
+                    mask: has_mask.then(|| RowMask {
+                        positions: &enc_mask_positions[r * k_dec..(r + 1) * k_dec],
+                        index: &query_indices[s],
+                    }),
                     hide_readout: hide_readout[r] != 0,
                 };
                 let cfg = CollateConfig {
