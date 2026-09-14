@@ -1114,9 +1114,14 @@ fn the_batch_is_uncharged_until_max_plan_rows_is_declared() {
     // 4096 nnz x 8 B + 4097 x 8 B of indptr.
     let declared = batch_charged_loader(dir.path(), 64, budget, Some(4096));
     assert_eq!(declared.mean_nnz_per_row(), 1.0);
+    // Against the pre-size POLICY, not the raw mean: the gather allocates
+    // `presize_nnz`, so a charge computed from the unbiased estimate would
+    // under-report the batch by the eighth the bias adds. Restating the
+    // arithmetic here instead would let the two drift apart silently, which is
+    // the same trap the capacity assertions fell into.
     assert_eq!(
         declared.budget_breakdown().batch_buffer_bytes,
-        4096 * 8 + 4097 * 8
+        crate::sparse_cellset::presize_nnz(4096, 1.0) * 8 + 4097 * 8
     );
     assert_eq!(declared.max_plan_rows(), Some(4096));
 
@@ -1142,6 +1147,38 @@ fn the_batch_is_uncharged_until_max_plan_rows_is_declared() {
             || wider.budget_exceeded(),
         "the charged breakdown must still fit the budget it was tuned against"
     );
+}
+
+/// `max_plan_rows` is an upper bound, so it must actually refuse.
+///
+/// It sizes the shard cache down as though plans were at most that wide. A
+/// value that only ever shrinks the budget while the gather accepts any plan is
+/// not a bound — the cache would be sized for 4096 rows and the batch allocated
+/// for a million. `IndexPlanLoader` refuses past `max_plan_size` for exactly
+/// this reason; this mirrors it.
+#[test]
+fn a_plan_wider_than_max_plan_rows_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = batch_charged_loader(dir.path(), 64, None, Some(4));
+
+    let plan = |n: usize| SparseCellSetPlan {
+        file_ids: vec![0; n],
+        rows: (0..n as u64).collect(),
+        role_tags: vec![0; n],
+        set_offsets: vec![0, n as i64],
+    };
+
+    // At the bound: accepted.
+    assert!(run_one(StdArc::clone(&loader), plan(4)).is_ok());
+    // Past it: refused, and the message names the knob and the sizing.
+    let err = run_one(StdArc::clone(&loader), plan(5)).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("max_plan_rows"), "{msg}");
+    assert!(msg.contains('5') && msg.contains('4'), "{msg}");
+
+    // An undeclared bound refuses nothing — the default must stay inert.
+    let unbounded = batch_charged_loader(dir.path(), 64, None, None);
+    assert!(run_one(unbounded, plan(64)).is_ok());
 }
 
 /// A loader whose budget was not exceeded must fit the breakdown it reports.
@@ -1993,7 +2030,9 @@ fn write_ragged_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize, n_s
 /// denser-than-average rows under-shoots (one reallocation, which the caller
 /// would have paid anyway) and one that selects sparser rows over-shoots (a few
 /// transient bytes). Neither can affect the output, and that is the whole
-/// argument for preferring the estimate to the exact prescan it replaced —
+/// argument for preferring the estimate to the exact indptr prescan it
+/// replaced (`BackedCsrReader::nnz_for_rows`, added and then deleted in this
+/// series) —
 /// `with_capacity` is a hint, so nothing here needs a bound, and buying one
 /// cost an indptr decode per touched shard per plan (~9 % of
 /// `gather_grouped_s512` on tabula in the two-build A/B).
@@ -2048,7 +2087,8 @@ fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
     // Even with the bias, a densest-rows plan exceeds the estimate — the one
     // case the estimate cannot serve without reading the data, and the reason
     // the assertion above is `>=` rather than an equality. Pinned so a silent
-    // return to an exact prescan, which would make this case free, is visible.
+    // return to an exact indptr prescan, which would make this case free, is
+    // visible.
     assert!(
         crate::sparse_cellset::presize_nnz(n_dense, 2.5) < b.indices.len(),
         "a densest-rows plan should still exceed the biased estimate: {} vs {}",
@@ -2158,7 +2198,7 @@ fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
     assert!(b.indices.capacity() > b.indices.len());
 }
 
-/// The prescan must be a *bound*, never a truncation: `capacity >= len` on a
+/// The pre-size must be a *bound*, never a truncation: `capacity >= len` on a
 /// path where the transform drops entries (remap sentinels).
 #[test]
 fn gather_presize_is_an_upper_bound_when_remap_drops_entries() {
@@ -2200,7 +2240,7 @@ fn gather_presize_is_an_upper_bound_when_remap_drops_entries() {
 
     assert!(
         b.indices.capacity() >= b.indices.len(),
-        "prescan under-allocated: capacity {} < len {}",
+        "pre-size under-allocated: capacity {} < len {}",
         b.indices.capacity(),
         b.indices.len()
     );

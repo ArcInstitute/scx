@@ -329,7 +329,11 @@ impl SparseCellSetBudgetModel {
     /// magnitude smaller than the CSR at any realistic density, and a term that
     /// small would lend the estimate a precision it does not have.
     fn batch_bytes_for(max_plan_rows: usize, mean_nnz_per_row: f64) -> usize {
-        let nnz = (max_plan_rows as f64 * mean_nnz_per_row).ceil() as usize;
+        // `presize_nnz`, not the raw mean: the gather allocates the biased
+        // figure, so charging the unbiased one would under-report the batch by
+        // exactly the eighth the bias adds — on a term whose whole purpose is
+        // to make `max_memory_mb` mean something.
+        let nnz = presize_nnz(max_plan_rows, mean_nnz_per_row);
         nnz.saturating_mul(8)
             .saturating_add(max_plan_rows.saturating_add(1).saturating_mul(8))
     }
@@ -720,26 +724,17 @@ impl SparseCellSetLoader {
         }
     }
 
-    /// Gather one batch of cell sets into the §4.4 contract. Row-group
-    /// admission is decided per gather here; the engine-driven path
-    /// ([`Self::iter_with_plans`]) goes through [`Self::gather_admitting`]
-    /// with the plan-level verdict instead.
-    pub fn gather(
-        &self,
-        engine: &PrefetchEngine,
-        plan: &SparseCellSetPlan,
-    ) -> Result<SparseCellSetBatch> {
-        self.gather_admitting(engine, plan, None)
-    }
-
-    /// [`Self::gather`] against this loader's own engine.
+    /// Gather one batch of cell sets into the §4.4 contract, synchronously.
     ///
-    /// The engine is private, so [`Self::gather`]'s two-argument form is only
-    /// callable from inside the engine-driven path. This is what a synchronous
-    /// one-plan caller (`SparseCellSetDataset.gather`) uses; it exposes no more
-    /// of the loader than `gather` already implies.
-    pub fn gather_plan(&self, plan: &SparseCellSetPlan) -> Result<SparseCellSetBatch> {
-        self.gather(&self.engine, plan)
+    /// Takes **one** row-group admission verdict over the whole plan, sized
+    /// against the entire byte budget, and carries it into every set's read —
+    /// the same shape the engine-driven path ([`Self::iter_with_plans`]) uses,
+    /// differing only in that it has no lookahead window to divide the budget
+    /// by. Deciding per set instead would let a plan whose sets each fit, but
+    /// whose union does not, evict its own row groups set by set.
+    pub fn gather(&self, plan: &SparseCellSetPlan) -> Result<SparseCellSetBatch> {
+        let admit = self.engine.plan_fits_budget(&plan.file_ids, &plan.rows);
+        self.gather_admitting(&self.engine, plan, Some(admit))
     }
 
     /// [`Self::gather`] with the row-group admission decided by the caller.
@@ -756,6 +751,23 @@ impl SparseCellSetLoader {
         admit_row_groups: Option<bool>,
     ) -> Result<SparseCellSetBatch> {
         let total_rows = plan.rows.len();
+        // An "upper bound" that is only ever used to shrink the cache is not a
+        // bound at all: the budget would be sized for `max_plan_rows` while the
+        // gather happily allocated for a plan ten times wider. `IndexPlanLoader`
+        // rejects past `max_plan_size` for the same reason, and this mirrors its
+        // message. Only when the caller declared a bound — `None` charges
+        // nothing and refuses nothing, exactly as before the option existed.
+        if let Some(limit) = self.max_plan_rows {
+            if total_rows > limit {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "plan has {total_rows} rows, exceeding max_plan_rows {limit} \
+                         (raise max_plan_rows at construction, or split the plan; \
+                         the shard cache was sized against {limit})"
+                    ),
+                });
+            }
+        }
         if plan.file_ids.len() != total_rows || plan.role_tags.len() != total_rows {
             return Err(LoaderError::ConfigError {
                 reason: "plan file_ids/rows/role_tags length mismatch".into(),

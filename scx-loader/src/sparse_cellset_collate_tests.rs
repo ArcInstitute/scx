@@ -488,3 +488,33 @@ fn unsorted_query_positions_index_the_mask_at_the_original_offset() {
     assert_eq!(b.counts, vec![3.0, 1.0, 0.0]);
     assert_eq!(b.pad, vec![0, 0, 1]);
 }
+
+/// A mask shorter than the query panel must not panic.
+///
+/// The `zip` this kernel used before W2 stopped at the shorter of `query` and
+/// `enc_mask_positions`, so a short mask silently left the excess positions
+/// unflagged. `collate_cell` is `pub` and re-exported from the crate root, so a
+/// direct caller can pass a mismatched pair — and indexing `maskpos[p]` would
+/// turn that tolerated input into a crash. `collate_gathered` validates the
+/// length, so this covers only the direct-caller path, which is exactly the one
+/// with no validation in front of it.
+#[test]
+fn a_mask_shorter_than_the_query_panel_leaves_the_excess_unflagged() {
+    let c = cfg(PreprocessMode::PassThrough, 3);
+    // query has 3 positions; the mask supplies only the first two. Gene 5 sits
+    // at position 2 and is therefore beyond the mask: unflagged, so kept.
+    let (b, _) = run(
+        &[1, 3, 5],
+        &[3.0, 2.0, 1.0],
+        &[1, 3, 5],
+        Some(&[0, 1]),
+        false,
+        &c,
+    );
+    assert_eq!(
+        b.ids,
+        vec![1, 5, PAD],
+        "gene 3 withheld, gene 5 past the mask"
+    );
+    assert_eq!(b.pad, vec![0, 0, 1]);
+}

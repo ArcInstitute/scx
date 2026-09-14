@@ -1,1 +1,0 @@
-{"arm": "before", "round": 10, "dataset": "tabula_sapiens_100k", "us_per_cell__collate": 22.403, "cellsets_per_sec__collate_rust": 697.5, "cellsets_per_sec__gather_random": 681.2, "cellsets_per_sec__gather_grouped": 686.9, "cellsets_per_sec__gather_random_s512": 85.5, "cellsets_per_sec__gather_grouped_s512": 82.7, "peak_rss_mb_median": null}

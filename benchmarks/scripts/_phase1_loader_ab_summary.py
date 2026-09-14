@@ -52,6 +52,26 @@ def _binom_two_sided(wins: int, n: int) -> float:
     return min(1.0, 2 * tail)
 
 
+def write_manifest(root: pathlib.Path, dest: pathlib.Path) -> None:
+    """Fold the per-round files into ONE committed artifact.
+
+    The rounds are the evidence — the published figure is a median of
+    within-round ratios and a sign test over them, so the pairing has to
+    survive — but 48 one-line files is a poor way to carry 48 records. This
+    keeps every record, with its arm and round intact, in a single file.
+    Nothing is pooled: the "one file per arm, never pooled" rule exists so
+    distinct arms are not averaged together, which folding by round does not do.
+    """
+    rounds = sorted(
+        (json.loads(f.read_text()) for f in (root / "rounds").glob("*.json")),
+        key=lambda r: (r["dataset"], r["round"], r["arm"]),
+    )
+    prov = json.loads((root / "provenance.json").read_text()) if (
+        root / "provenance.json").exists() else {}
+    dest.write_text(json.dumps({"provenance": prov, "rounds": rounds}, indent=1) + "\n")
+    print(f"wrote {len(rounds)} rounds to {dest}")
+
+
 def main(root: pathlib.Path) -> int:
     rounds_dir = root / "rounds"
     if not rounds_dir.is_dir():
@@ -121,6 +141,9 @@ def main(root: pathlib.Path) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[2] == "--manifest":
+        write_manifest(pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[3]))
+        raise SystemExit(0)
     if len(sys.argv) != 2:
         print(__doc__, file=sys.stderr)
         raise SystemExit(2)

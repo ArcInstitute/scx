@@ -112,8 +112,10 @@ impl SparseCellSetDataset {
     ///         row-group-scoped decode's bounded peak RAM is the memory-safe
     ///         choice. `SCX_SCATTER_BLOCK_INDEX=0` is the process-wide
     ///         reader-layer kill-switch over both settings.
-    ///     max_plan_rows: Upper bound on rows per plan, charging one gathered
-    ///         batch against `max_memory_mb` before the shard cache is sized.
+    ///     max_plan_rows: Upper bound on rows per plan. Charges one gathered
+    ///         batch against `max_memory_mb` before the shard cache is sized,
+    ///         AND refuses a plan wider than it — a cache sized for `N` rows
+    ///         while the gather accepts any width is not a bound.
     ///         Default `None` — **uncharged**, and the resolved cache is then
     ///         byte-identical to what it was before this argument existed. This
     ///         class has no `max_plan_size`: plan width is the caller's, so
@@ -179,6 +181,15 @@ impl SparseCellSetDataset {
         // per-dataset route selection off the per-plan `planned` footprint the
         // engine already computes, not a different constant here.
         let scatter_block_index = scatter_block_index.unwrap_or(false);
+        // A zero bound would charge nothing and reject every non-empty plan —
+        // the two halves of the contract pointing opposite ways. `ValueError`
+        // for the same reason as the downsample checks below: it is a bad
+        // *value*, and `IndexPlanLoader` refuses `max_plan_size < 1` likewise.
+        if max_plan_rows == Some(0) {
+            return Err(PyValueError::new_err(
+                "max_plan_rows must be >= 1 (pass None to leave the batch uncharged)",
+            ));
+        }
         // Raised as `ValueError`, not the `loader_err_to_py` default of
         // `RuntimeError`: every argument check on this path is a bad *value*,
         // and a caller catching malformed input would otherwise have to catch
@@ -399,7 +410,7 @@ impl SparseCellSetDataset {
         let plan = extract_cellset_plan(tuple.as_any()).map_err(loader_err_to_py)?;
 
         let batch = py
-            .detach(move || loader.gather_plan(&plan))
+            .detach(move || loader.gather(&plan))
             .map_err(loader_err_to_py)?;
 
         sparse_cellset_batch_to_dict(py, batch)

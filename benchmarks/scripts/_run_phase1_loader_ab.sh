@@ -1,7 +1,8 @@
 #!/bin/bash
 # Phase 1 of the ML-loader plan — two-build A/B of the tier-1 loader fixes.
 #
-# W1 pre-sizes the cell-set gather's `indices`/`data` from a plan prescan, W2
+# W1 pre-sizes the cell-set gather's `indices`/`data` from a catalog estimate
+# (`rows x mean_nnz_per_row`, biased up an eighth), W2
 # replaces `collate_cell`'s per-row withheld-gene `HashSet` with a per-SET
 # sorted query panel + binary search, W4 adds an opt-in batch charge (off by
 # default, so it must move nothing here). The headline is `us_per_cell__collate`,

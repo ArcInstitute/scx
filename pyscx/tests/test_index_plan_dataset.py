@@ -731,6 +731,11 @@ class TestMemoryBudget:
             "max_memory_mb",
             "effective_cache_shards",
             "effective_lookahead",
+            # On the SHARED PrefetchEngine, so this class is subject to it just
+            # as SparseCellSetDataset is — and an operator reading only this
+            # budget would otherwise never learn that `effective_lookahead`
+            # bounds in-flight plans, not the blocking tasks a plan spawns.
+            "max_blocking_threads",
         }
         assert set(b["breakdown"]) == {
             "cache_bytes",

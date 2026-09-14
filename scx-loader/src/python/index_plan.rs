@@ -477,6 +477,10 @@ impl IndexPlanDataset {
         dict.set_item("max_memory_mb", loader.max_memory_mb())?;
         dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("effective_lookahead", loader.effective_lookahead())?;
+        // Reported here as well as on `SparseCellSetDataset`: the cap lives on
+        // the shared `PrefetchEngine`, so this class is equally subject to it
+        // and an operator reading only this budget would not know it exists.
+        dict.set_item("max_blocking_threads", loader.max_blocking_threads())?;
         Ok(dict)
     }
 

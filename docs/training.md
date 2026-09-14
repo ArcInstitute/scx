@@ -184,12 +184,20 @@ Two things to know:
   by hand therefore means `cache_shards × shard_decoded_bytes + non-cache
   terms`; both are in `memory_budget()`, and the sizing `UserWarning` already
   quotes the total in its "pass `max_memory_mb>=…`" advice.
+- **`lookahead` does not bound decode concurrency.** It bounds in-flight
+  *plans*; each plan issues one blocking task per distinct `(file, shard)` it
+  touches, which plan width controls. `memory_budget()["max_blocking_threads"]`
+  reports the cap on how many of those run at once — on both plan-driven
+  classes, since it lives on the shared prefetch engine.
 - **Charge the batch if the budget is meant to bound the process.**
   `SparseCellSetDataset(paths, max_memory_mb=…, max_plan_rows=N)` costs one
   gathered CSR batch of `N` rows at the manifest's mean density and subtracts it
   before sizing the cache; `memory_budget()["breakdown"]["batch_buffer_bytes"]`
-  reports it and `effective_cache_shards` falls accordingly. It is **opt-in**
-  and defaults to uncharged: this class has no `max_plan_size`, so plan width is
+  reports it and `effective_cache_shards` falls accordingly. It is a real
+  bound, not just a budgeting hint — a plan wider than `max_plan_rows` is
+  refused, because a cache sized for N rows while the gather accepts 100N is
+  not a bound at all. It is **opt-in** and defaults to uncharged (and
+  unenforced): this class has no `max_plan_size`, so plan width is
   yours to declare, and a default guess would shrink the cache — the lever worth
   2,486× below — on every existing caller.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class

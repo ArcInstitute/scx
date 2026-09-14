@@ -417,7 +417,9 @@ class SparseCellSetDataset:
         (the value in force — adaptive when the constructor was passed none),
         `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`,
         `max_plan_rows`, `mean_nnz_per_row`, `max_blocking_threads` and
-        `budget_exceeded`.
+        `budget_exceeded`. `max_plan_rows`, when set, also REFUSES a plan wider
+        than it — `gather` / `iter_with_plans` raise rather than allocate for a
+        batch the cache was not sized for.
 
         `cache_bytes` and `python_overhead_bytes` are the non-zero terms by
         default: on the sparse path the shard cache *is* the budget, and there

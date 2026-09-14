@@ -548,6 +548,45 @@ fn framed_engine_with_budget(
     )
 }
 
+/// `plan_fits_budget` sizes the WHOLE plan against the WHOLE budget.
+///
+/// **Review on #535 (codex).** The synchronous `SparseCellSetLoader::gather`
+/// used to pass `None` for admission, letting every set decide for itself; two
+/// sets that each fit but whose union does not would then evict each other's
+/// row groups. This is the decision function that fixed it.
+///
+/// Tested here rather than through `gather` on purpose: at the loader level the
+/// budget model subtracts a ~50 MB interpreter constant before sizing, so a
+/// group-sized budget yields a cache that retains nothing either way — an
+/// integration assertion of "retains nothing" passes with the bug applied. This
+/// helper takes the byte budget verbatim, so both answers are observable.
+///
+/// Two directions, because one of them alone is unfalsifiable: a function that
+/// always returns `false` satisfies the union case, and one that always returns
+/// `true` satisfies the single-set case.
+#[test]
+fn plan_fits_budget_sizes_the_union_not_the_largest_set() {
+    let dir = tempfile::tempdir().unwrap();
+    // Set A → groups 0/4/8/12, set B → groups 1/5/9/13: 4 groups each, union 8.
+    let set_a: Vec<u64> = vec![5, 70, 140, 200];
+    let set_b: Vec<u64> = vec![20, 85, 155, 215];
+    let union: Vec<u64> = set_a.iter().chain(set_b.iter()).copied().collect();
+
+    // Between one set and the pair.
+    let budget = 6 * FRAMED_GROUP_BYTES;
+    let engine = framed_engine_with_budget(dir.path(), /*scatter_block_index*/ true, budget);
+
+    assert!(
+        engine.plan_fits_budget(&vec![0u32; set_a.len()], &set_a),
+        "one set is 4 groups against a 6-group budget and must fit"
+    );
+    assert!(
+        !engine.plan_fits_budget(&vec![0u32; union.len()], &union),
+        "the union is 8 groups against a 6-group budget and must not fit — \
+         sizing the largest set instead of the union would admit it"
+    );
+}
+
 /// Bytes one decoded row group of the framed fixture occupies in the LRU:
 /// `FRAMED_ROW_GROUP_ROWS` rows at one non-zero each — `(16 + 1) × 8 + 16 × 4 +
 /// 16 × 4`. The row-group warm tests size their budgets from it.

@@ -161,7 +161,13 @@ impl SetQueryIndex {
         self.sorted[lo..]
             .iter()
             .take_while(|&&(g, _)| g == gid)
-            .any(|&(_, p)| maskpos[p as usize] != 0)
+            // `get`, not an index: the `zip` this replaced stopped at the
+            // shorter of `query` / `enc_mask_positions`, so a short mask left
+            // the excess positions unflagged. Indexing would panic there
+            // instead — a tolerated malformed input turned into a crash on a
+            // `pub` kernel. `collate_gathered` validates the length, so this
+            // only guards direct callers.
+            .any(|&(_, p)| maskpos.get(p as usize).is_some_and(|&m| m != 0))
     }
 }
 

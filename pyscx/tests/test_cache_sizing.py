@@ -617,10 +617,28 @@ class TestSparseCellSetBatchCharge:
         ceiling was 512 simultaneous shard decodes, which for a census-sized
         shard bounds nothing useful.
         """
-        ds = pyscx.SparseCellSetDataset([multishard_path])
+        import os
+
+        # Pin the arithmetic, not a range. `2 <= cap < 512` passed for every
+        # intended value AND for several wrong ones, and it was environment-
+        # dependent: `SCX_LOADER_CPU_THREADS` is documented as able to exceed
+        # the decode pool's default clamp, so a large override would have made
+        # the old assertion fail for the wrong reason.
+        lookahead = 3
+        ds = pyscx.SparseCellSetDataset([multishard_path], lookahead=lookahead)
+        ip = pyscx.IndexPlanDataset(multishard_path, scatter_block_index=False)
         try:
             cap = ds.memory_budget()["max_blocking_threads"]
-            assert isinstance(cap, int)
-            assert 2 <= cap < 512, f"blocking cap {cap} is not a useful bound"
+            override = os.environ.get("SCX_LOADER_CPU_THREADS")
+            pool = int(override) if override and override.isdigit() else min(
+                os.cpu_count() or 1, 8
+            )
+            assert cap == max(2, min(pool + lookahead, 512)), (
+                f"cap {cap} != clamp(pool {pool} + lookahead {lookahead})"
+            )
+            # The cap lives on the shared PrefetchEngine, so IndexPlanDataset is
+            # subject to it too and must report it.
+            assert "max_blocking_threads" in ip.memory_budget()
         finally:
             ds.close()
+            ip.close()

@@ -50,6 +50,10 @@ use tokio::task::JoinHandle;
 use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
 
+/// tokio's own default `max_blocking_threads`. The engine's cap is clamped to
+/// it so the change can only ever tighten concurrency, never widen it.
+const TOKIO_DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
+
 /// One prefetch task: a whole-shard warm (`read_shard_cached_arc`) or a
 /// row-group warm (`warm_row_groups`). Both are side effects on the shared
 /// cache; the decoded value itself is never handed back.
@@ -168,14 +172,53 @@ impl PrefetchEngine {
         self.readers.iter().any(|r| r.any_shard_framed())
     }
 
+    /// Does this plan's whole LRU footprint fit the shared byte budget?
+    ///
+    /// The same sizing the prefetcher does per plan — dedup `(file, row)`,
+    /// bucket per shard, sum the row-group bytes of every touched framed shard
+    /// plus the decoded size of every shard taken whole — but compared against
+    /// the **whole** budget rather than `budget / (lookahead + 1)`, because a
+    /// synchronous one-plan caller has no lookahead window to share with.
+    ///
+    /// This exists so a standalone gather makes ONE verdict over the plan
+    /// instead of letting each set decide for itself. Per-set decisions let a
+    /// plan whose sets individually fit, but whose union does not, insert and
+    /// evict row groups against each other — exactly the churn the plan-level
+    /// verdict was introduced to stop on the iterator path.
+    ///
+    /// Sized from the catalog and the block index; decodes nothing.
+    pub(crate) fn plan_fits_budget(&self, file_ids: &[u32], rows: &[u64]) -> bool {
+        let mut seen: HashSet<(u32, u64)> = HashSet::with_capacity(rows.len());
+        let mut per_shard: HashMap<(u32, usize), Vec<u64>> = HashMap::new();
+        for (&fid, &row) in file_ids.iter().zip(rows.iter()) {
+            if !seen.insert((fid, row)) {
+                continue;
+            }
+            // An out-of-range `file_id` is skipped, never panicked on: the
+            // gather's own validation is what reports it, and this runs first.
+            let Some(reader) = self.readers.get(fid as usize) else {
+                continue;
+            };
+            if let Some(sidx) = reader.index().shard_for_row(row) {
+                per_shard.entry((fid, sidx)).or_default().push(row);
+            }
+        }
+        let mut planned = 0usize;
+        let mut budget = usize::MAX;
+        for (&(fid, sidx), shard_rows) in &per_shard {
+            let reader = &self.readers[fid as usize];
+            planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
+            if !reader.block_index_eligible(sidx, shard_rows.len()) {
+                planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
+            }
+            budget = budget.min(reader.cache_bytes_budget());
+        }
+        planned <= budget
+    }
+
     /// Default lookahead depth.
     pub fn default_lookahead(&self) -> usize {
         self.default_lookahead
-    }
-
-    /// Cap on simultaneously-running shard decodes — see [`Self::blocking_threads`].
-    pub fn max_blocking_threads(&self) -> usize {
-        self.blocking_threads()
     }
 
     /// Shared handle to the readers' one `SharedShardCache` counters. Always
@@ -214,11 +257,23 @@ impl PrefetchEngine {
     /// case at 5 and serialise exactly the wide plans this loader exists for.
     /// The `+ lookahead` keeps the next plans' warms able to start while the
     /// current one's decodes occupy the pool.
-    fn blocking_threads(&self) -> usize {
+    /// Cap on simultaneously-running shard decodes in the blocking pool.
+    ///
+    /// **Clamped to tokio's own default of 512 at the top**, so this can only
+    /// ever tighten the bound, never loosen it: `cpu_pool`'s size is
+    /// `physical.clamp(1, 8)` by default but `SCX_LOADER_CPU_THREADS` is
+    /// documented as able to exceed that clamp, and without the ceiling a large
+    /// override would permit MORE concurrent blocking tasks than the default
+    /// this replaces.
+    ///
+    /// Sized from `default_lookahead`, the constructor's value — a per-iterator
+    /// `lookahead` passed to `iter_with_plans` does not resize a runtime that
+    /// is built once and shared.
+    pub fn max_blocking_threads(&self) -> usize {
         crate::pool::cpu_pool()
             .current_num_threads()
             .saturating_add(self.default_lookahead)
-            .max(2)
+            .clamp(2, TOKIO_DEFAULT_MAX_BLOCKING_THREADS)
     }
 
     /// Lazily build the prefetch runtime (2 blocking-friendly worker threads),
@@ -230,7 +285,7 @@ impl PrefetchEngine {
         }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .max_blocking_threads(self.blocking_threads())
+            .max_blocking_threads(self.max_blocking_threads())
             .enable_all()
             .thread_name("scx-plan-engine")
             .build()

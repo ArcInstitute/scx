@@ -1,1 +1,0 @@
-{"arm": "before", "round": 2, "dataset": "pbmc3k", "us_per_cell__collate": 13.743, "cellsets_per_sec__collate_rust": 1137.0, "cellsets_per_sec__gather_random": 4367.1, "cellsets_per_sec__gather_grouped": 5369.3, "cellsets_per_sec__gather_random_s512": 545.4, "cellsets_per_sec__gather_grouped_s512": 555.7, "peak_rss_mb_median": null}
