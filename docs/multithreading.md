@@ -35,6 +35,13 @@ concurrently via `assemble_row_major(.., RowMajorStrategy::Parallel)`. Each
 shard's slices of the merged output buffers are carved with `split_at_mut`
 before the loop starts, so the fan-out needs no `unsafe` and no bounds
 `assert!`: the borrow checker has already proved the regions disjoint.
+The **typed** whole-matrix assembler (`read_all_csr_shards_typed` and siblings,
+which serve every non-default `container` / `data_dtype` / `index_dtype`
+request) takes the same `RowMajorStrategy` and the same carve — through
+`IndexBuffer::chunks_mut` / `ValueBuffer::chunks_mut`, which do the dtype match
+once and hand each shard a plain `&mut [T]`. It was the one whole-matrix read
+that stayed sequential, so a narrow read paid a serial decode the default read
+did not.
 Each shard is independently decompressible — the reader issues `MADV_SEQUENTIAL`
 on the shard byte range before the parallel decode loop. Within each shard,
 FOR-BP index decode uses SIMD BitPacker4x (4 × 32-element blocks) for rows

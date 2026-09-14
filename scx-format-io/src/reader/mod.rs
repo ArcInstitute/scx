@@ -142,9 +142,9 @@ pub use metadata::{
     scatter_batch_to_physical,
 };
 
-// Reached only from `reader_tests.rs`, which is attached to this module and so
-// cannot see `matrix`'s items directly.
-#[cfg(test)]
+// Reached from `typed_read.rs` (the typed assembler takes the same strategy) and
+// from `reader_tests.rs`, which is attached to this module and so cannot see
+// `matrix`'s items directly.
 pub(crate) use matrix::RowMajorStrategy;
 
 impl ScxReader {
@@ -340,7 +340,7 @@ impl ScxReader {
 
     /// Hint sequential access for a byte range (`MADV_SEQUENTIAL`).
     #[cfg(unix)]
-    fn advise_sequential(&self, offset: usize, len: usize) {
+    pub(crate) fn advise_sequential(&self, offset: usize, len: usize) {
         use memmap2::Advice;
         let _ = self.mmap.advise_range(Advice::Sequential, offset, len);
     }

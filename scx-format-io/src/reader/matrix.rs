@@ -18,6 +18,13 @@ pub(crate) struct RowMajorLabels {
     shard: &'static str,
 }
 
+impl RowMajorLabels {
+    /// The shard label, for error text built outside this module.
+    pub(crate) fn shard(&self) -> &'static str {
+        self.shard
+    }
+}
+
 /// Labels for `X`, a modality's `X`, and named layers.
 pub(crate) const X_LABELS: RowMajorLabels = RowMajorLabels {
     entry: "shard entry",
