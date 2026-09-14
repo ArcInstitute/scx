@@ -587,7 +587,10 @@ impl SparseCellSetDataset {
     /// one is, never that a gather actually took the route.
     ///
     /// Since ORG-9.10-1 the prefetch half is visible too, through
-    /// `SparseCellSetBatchIter.metrics()["prefetch"]`. That is a different
+    /// `SparseCellSetBatchIter.metrics()["prefetch"]`, which since the reader
+    /// registry also carries `prefetch_skipped_reader_limit` — plans the
+    /// prefetcher declined because they touch more distinct files than
+    /// `reader_limit` can hold resident. That is a different
     /// signal, not a second reading of this one: it records what the
     /// *prefetcher* decided, and is all-zero when prefetching is off
     /// (`lookahead=0`) even though the gather still adopts the route. These

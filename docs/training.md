@@ -563,8 +563,8 @@ per catalog entry, so it scales with shards per file rather than cells:
 
 Per process, before multiplying by DataLoader workers and ranks.
 
-`reader_limit=N` caps how many readers are resident; the rest are reopened on
-demand, and what a vacated slot keeps is the path, the row count, the shard
+`reader_limit=N` caps how many readers the loader will **keep** resident; the
+rest are reopened on demand, and what a vacated slot keeps is the path, the row count, the shard
 index and the file's identity — a few kB, not a hundred.
 
 ```python
@@ -590,6 +590,13 @@ Four things to know before setting it:
   plan that needs more files at once than the limit exceeds it rather than
   blocking — blocking would deadlock against a caller already holding readers
   from the same plan. `reader_hwm` is what reports the truth.
+- **A plan wider than the limit is not prefetched at all.** The prefetcher holds
+  a lease on every file it launches work for, so on such a plan it would pin the
+  plan's whole width and the cap would stop meaning anything. It stands down
+  instead and the gather reads one file at a time, staying inside the cap.
+  `cache_metrics()["prefetch_skipped_reader_limit"]` counts those plans — a
+  non-zero value means the cap and your plan shape are fighting, and the answer
+  is a larger `reader_limit` or plans with more file locality.
 - **A file replaced at its path between gathers is refused, not served.** A
   reopen compares the file's inode and header catalog pointer against what the
   constructor scanned and raises if either moved, because the decoded-shard

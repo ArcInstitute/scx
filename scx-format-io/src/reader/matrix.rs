@@ -919,6 +919,29 @@ impl ScxReader {
     ///
     /// Useful when callers need per-shard codec/encoding info before or alongside
     /// `read_shard_from_entry`.
+    /// True if any CSR shard in this file resolves a row-group framing layout.
+    ///
+    /// **The one definition.** [`crate::BackedCsrReader::any_shard_framed`]
+    /// delegates here rather than keeping its own walk, so a caller that only
+    /// has an `ScxReader` — the loader's manifest scan, which needs the answer
+    /// while the file is open anyway — gets the same verdict the gather routes
+    /// on. A second predicate derived from shard headers alone would be free to
+    /// drift from this one. **Review on #536 (codex, Cursor Agent,
+    /// Antigravity):** the loader was reopening a whole bounded manifest to
+    /// answer this because the predicate was not reachable from here.
+    ///
+    /// Reads shard headers and block indexes only, never payload, and
+    /// short-circuits on the first framed shard — so an all-framed file stops
+    /// at shard 0 and only an all-unframed one pays the full walk. An
+    /// unreadable shard counts as not framed: this feeds a diagnostic, and the
+    /// next real read reports the failure properly.
+    pub fn any_csr_shard_framed(&self) -> bool {
+        self.catalog()
+            .csr_shards_sorted()
+            .into_iter()
+            .any(|e| matches!(self.framed_shard_layout(e), Ok(Some(_))))
+    }
+
     pub fn read_shard_header(&self, entry: &FullCatalogEntry) -> Result<ShardHeader> {
         let section = self.section_bytes(entry)?;
         let vs = crate::validated_section::ValidatedSection::new(section);

@@ -82,6 +82,10 @@ pub struct ReaderDebugCounts {
 
 pub struct ScxReader {
     mmap: Mmap,
+    /// Which inode `mmap` is a mapping of, read from the same `File` that
+    /// created it. Kept so a later identity check cannot pair this reader's
+    /// catalog with some other file's inode — see `map_with_path_context`.
+    inode: crate::freshness::InodeIdentity,
     /// The path this reader was opened from. Kept unconditionally: it is what
     /// [`Self::watching`] stamps against, and it lets errors name the file
     /// without every caller threading the path back in alongside the reader.
@@ -149,6 +153,13 @@ pub(crate) use matrix::RowMajorStrategy;
 
 impl ScxReader {
     /// The path this reader was opened from.
+    /// The inode this reader's mapping was taken from, captured at open time
+    /// from the same `File`. The only sound source for a file identity — see
+    /// [`crate::freshness::FileIdentity::of`].
+    pub(crate) fn inode_identity(&self) -> crate::freshness::InodeIdentity {
+        self.inode
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

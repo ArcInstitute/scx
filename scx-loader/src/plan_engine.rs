@@ -490,6 +490,16 @@ pub struct IterMetrics {
     /// verdict reaches them through `process`'s third argument): warming it
     /// would only have evicted the groups before they were read.
     pub prefetch_skipped_block_index: AtomicU64,
+    /// Plans whose L2 prefetch was declined outright because they touch more
+    /// distinct files than `reader_limit` allows to be resident.
+    ///
+    /// Zero on every unbounded dataset, which is the default. Non-zero means
+    /// the manifest cap and the plan shape are fighting: prefetch cannot hold a
+    /// lease per launched file without pinning more than the cap, so it stands
+    /// down and the synchronous gather reads one file at a time instead. The
+    /// fix is on the caller's side — a wider `reader_limit`, or plans with more
+    /// file locality — and this counter is how they find out it is happening.
+    pub prefetch_skipped_reader_limit: AtomicU64,
 }
 
 /// Test-only rendezvous for holding prefetch tasks in flight.
@@ -726,6 +736,44 @@ where
         if self.lookahead == 0 {
             let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
             return Ok((Vec::new(), planned <= budget / (self.lookahead + 1)));
+        }
+
+        // A plan touching more distinct files than the registry may keep
+        // resident does not get prefetched at all.
+        //
+        // The prefetcher has to hold a lease on every file it launches work
+        // for — the tasks are unabortable and slice the mapping — so on a
+        // wider-than-the-limit plan it would pin the plan's whole width,
+        // defeating `reader_limit` outright, and then hand the gather a set of
+        // handles the next trim evicts, so the gather reparses them. Measured
+        // on #536 by codex - gpt-5.6-sol: a 32-file plan at `reader_limit=2,
+        // lookahead=4` moved `opens/hwm` from 2/2 to 65/32.
+        //
+        // Declining is not a throughput loss worth defending against: at that
+        // shape the registry is thrashing anyway, and the synchronous gather
+        // that follows leases one file at a time and stays inside the cap. The
+        // configuration this protects is one the docs already tell callers to
+        // avoid; what it must not do is silently stop being bounded.
+        //
+        // Unbounded registries (`reader_limit = None`, the default) never take
+        // this branch, so the default path is untouched.
+        if let Some(limit) = self.engine.registry().limit() {
+            let touched: HashSet<u32> = per_shard.keys().map(|&(fid, _)| fid).collect();
+            if touched.len() > limit {
+                self.iter_metrics
+                    .prefetch_skipped_reader_limit
+                    .fetch_add(1, Ordering::Relaxed);
+                // Not admitted, and not sized either. Sizing would lease all
+                // `touched` files one at a time — a whole pass that the gather
+                // then repeats, because at this width every one of them is
+                // evicted again before it is read. And the verdict is already
+                // determined: a plan whose readers cannot stay resident is the
+                // over-budget working set the admission rule exists to refuse,
+                // so retaining its row groups would churn the LRU for hits that
+                // cannot happen. `false` is the conservative direction — it can
+                // cost a cache hit, never correctness.
+                return Ok((Vec::new(), false));
+            }
         }
 
         // One lease per touched file for the whole of the rest of this

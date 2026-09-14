@@ -75,13 +75,13 @@ fn bounded_registry(dir: &std::path::Path, n: usize, limit: usize) -> StdArc<Rea
             path: path.clone(),
             n_obs: reader.n_obs(),
             index: BackedCsrIndex::from_catalog(reader.catalog()),
-            identity: Some(FileIdentity::stamp(&path, reader.header()).unwrap()),
+            identity: Some(FileIdentity::of(&reader)),
         });
         if i < limit {
             retained.push((i as u32, wrap_reader(reader, i as u32, &shared, false)));
         }
     }
-    ReaderRegistry::from_scan(slots, retained, Some(limit), shared, false)
+    ReaderRegistry::from_scan(slots, retained, Some(limit), shared, false, None)
 }
 
 /// **The safety property the design rests on.** A handle with an outstanding
@@ -188,7 +188,7 @@ fn a_reopenable_slot_without_an_identity_is_refused() {
         identity: None,
     }];
     // Retain nothing, so the first lease must go through the reopen path.
-    let reg = ReaderRegistry::from_scan(slots, Vec::new(), Some(1), shared, false);
+    let reg = ReaderRegistry::from_scan(slots, Vec::new(), Some(1), shared, false, None);
 
     let err = match reg.lease(0) {
         Err(e) => e.to_string(),

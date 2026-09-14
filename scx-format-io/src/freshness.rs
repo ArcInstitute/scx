@@ -59,13 +59,13 @@ use crate::header::{FileHeader, HEADER_SIZE};
 /// *only* the identity: no size, no timestamps — see the module docs for why
 /// those cannot carry the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InodeIdentity {
+pub(crate) struct InodeIdentity {
     dev: u64,
     ino: u64,
 }
 
 impl InodeIdentity {
-    fn of(meta: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -149,19 +149,24 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    /// Stamp `path`'s identity, using the header a reader has already parsed
-    /// from it. One `stat`; the header is never re-read.
-    pub fn stamp(path: &Path, header: &FileHeader) -> Result<Self> {
-        let meta = std::fs::metadata(path).map_err(|e| {
-            ScxError::Io(std::io::Error::new(
-                e.kind(),
-                format!("cannot stat '{}': {}", path.display(), e),
-            ))
-        })?;
-        Ok(Self {
-            inode: InodeIdentity::of(&meta),
-            catalog: CatalogIdentity::of(header),
-        })
+    /// Stamp the identity of a reader that is already open.
+    ///
+    /// **Both halves come from that one reader** — the inode it captured from
+    /// the `File` behind its mapping, and the header it parsed out of that same
+    /// mapping. Costs no syscall.
+    ///
+    /// The earlier form took `(&Path, &FileHeader)` and re-`stat`ed the path,
+    /// which is how a rename landing between the mmap and the stat could pair
+    /// one file's inode with another file's catalog — a hybrid stamp that a
+    /// later reopen of the *replacement* then matches. An API that accepts a
+    /// path and a header from unrelated sources cannot be used safely, so it is
+    /// gone rather than documented. **Review on #536 (codex - gpt-5.6-sol,
+    /// Cursor Agent, Antigravity).**
+    pub fn of(reader: &crate::reader::ScxReader) -> Self {
+        Self {
+            inode: reader.inode_identity(),
+            catalog: CatalogIdentity::of(reader.header()),
+        }
     }
 
     /// `Ok(())` when `now` names the same inode and the same catalog as `self`.
@@ -285,9 +290,25 @@ impl FreshnessGuard {
         if catalog == self.catalog {
             return Ok(());
         }
+        // Same split as `FileIdentity::ensure_same`: the sequence counter is
+        // the usual mover but not the only field compared, and reporting
+        // "manifest_sequence 1 → 1" for an in-place rewrite that kept it sends
+        // the reader at the wrong field. **Review on #536 (Cursor Agent,
+        // Antigravity)** — the twin was fixed and this one left behind.
+        if self.catalog.manifest_sequence != catalog.manifest_sequence {
+            return Err(self.changed(format!(
+                "changed on disk since it was opened (manifest_sequence {} → {})",
+                self.catalog.manifest_sequence, catalog.manifest_sequence
+            )));
+        }
         Err(self.changed(format!(
-            "changed on disk since it was opened (manifest_sequence {} → {})",
-            self.catalog.manifest_sequence, catalog.manifest_sequence
+            "changed on disk since it was opened (manifest_sequence unchanged at {}, but the \
+             catalog moved: offset {} → {}, length {} → {})",
+            self.catalog.manifest_sequence,
+            self.catalog.full_catalog_offset,
+            catalog.full_catalog_offset,
+            self.catalog.full_catalog_length,
+            catalog.full_catalog_length
         )))
     }
 

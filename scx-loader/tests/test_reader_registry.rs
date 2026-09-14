@@ -110,13 +110,23 @@ fn manifest(dir: &Path, n: usize) -> Vec<PathBuf> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn open_loader(paths: Vec<PathBuf>, reader_limit: Option<usize>) -> Arc<SparseCellSetLoader> {
+    open_loader_lookahead(paths, reader_limit, 0)
+}
+
+/// The same loader with a caller-chosen `lookahead`, so a test can drive the
+/// prefetching path rather than only the synchronous gather.
+#[allow(clippy::too_many_arguments)]
+fn open_loader_lookahead(
+    paths: Vec<PathBuf>,
+    reader_limit: Option<usize>,
+    lookahead: usize,
+) -> Arc<SparseCellSetLoader> {
     SparseCellSetLoader::open(
         paths,
         /* cache_shards */ 4,
         /* bytes_budget */ Some(1 << 20),
-        /* lookahead */ 0,
+        lookahead,
         /* remap */ None,
         /* n_global_genes */ None,
         /* normalize */ false,
@@ -304,16 +314,18 @@ fn iterator_residency_is_bounded_on_narrow_plans() {
     }
 }
 
-/// The soft cap, pinned in the direction it actually gives way.
+/// A plan wider than the limit completes, and the synchronous gather stays
+/// inside the cap while doing it.
 ///
-/// `reader_limit` bounds handles the registry is free to drop, not handles in
-/// existence. A plan touching more files than the limit exceeds it rather than
-/// blocking — blocking would deadlock against a caller already holding leases
-/// from the same plan. The docs say so; this is the test that makes it a
-/// contract rather than a sentence, and it is also what would catch a future
-/// "fix" that made the registry block instead.
+/// Renamed from `a_plan_wider_than_the_limit_exceeds_it_rather_than_blocking`,
+/// which is not what it checked. `gather` sizes and reads one file at a time,
+/// so residency here is *naturally* bounded — the old name and doc claimed it
+/// pinned the soft cap giving way, and the assertion said the opposite.
+/// **Review on #536 (Cursor Agent, codex, Antigravity — all three.)** The
+/// contract it was supposed to pin is now in
+/// `a_wide_plan_declines_prefetch_rather_than_exceeding_the_limit`.
 #[test]
-fn a_plan_wider_than_the_limit_exceeds_it_rather_than_blocking() {
+fn a_wide_plan_gathers_without_exceeding_the_cap() {
     let dir = tempfile::tempdir().unwrap();
     let paths = manifest(dir.path(), 32);
     let loader = open_loader(paths, Some(4));
@@ -330,6 +342,88 @@ fn a_plan_wider_than_the_limit_exceeds_it_rather_than_blocking() {
         "the synchronous gather sizes and reads one file at a time, so even a \
          32-file plan should not need more than the cap plus one; got {hwm}"
     );
+}
+
+/// **The production-path bound, with prefetch on.**
+///
+/// A plan touching more distinct files than `reader_limit` cannot be
+/// prefetched: the prefetcher holds a lease per launched file, so it would pin
+/// the plan's width and the cap would stop meaning anything. It declines
+/// instead, and the gather reads one file at a time.
+///
+/// codex - gpt-5.6-sol measured the unfixed behaviour at head `d5edc405`:
+/// one 32-file plan at `reader_limit=2, lookahead=4` moved `opens/hwm` from
+/// `2/2` to `65/32`. Both numbers are asserted here, because either alone
+/// misses half the defect — residency was 16x the cap AND the catalogs were
+/// reparsed.
+#[test]
+fn a_wide_plan_declines_prefetch_rather_than_exceeding_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = manifest(dir.path(), 32);
+    let loader = open_loader_lookahead(paths, Some(2), 4);
+    let metrics = loader.reader_metrics();
+
+    let plans: Vec<_> = (0..2).map(|_| Ok(one_set_per_file(32))).collect();
+    let n = Arc::clone(&loader)
+        .iter_with_plans(plans.into_iter(), 4)
+        .count();
+    assert_eq!(n, 2);
+
+    let hwm = metrics.hwm.load(std::sync::atomic::Ordering::Relaxed);
+    let opens = metrics.opens.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        hwm <= 3,
+        "residency high-water {hwm} against reader_limit=2: the prefetcher must \
+         decline a plan it cannot hold, not pin its width"
+    );
+    // Two plans over 32 files at a cap of 2 still reopen a lot — that is the
+    // cost of the shape, and it is the caller's to avoid. What must not happen
+    // is a *second* pass per plan on top of the gather's. Sizing used to be
+    // that second pass, and declining to size a plan that is already refused
+    // admission removes it: 129 opens before, 64 after.
+    assert!(
+        opens <= 2 * 32 + 2,
+        "{opens} opens for two 32-file plans at reader_limit=2; more than one \
+         pass per plan means something is reopening what it just closed"
+    );
+}
+
+/// **A relative manifest path survives a `chdir`.**
+///
+/// Before this PR every mmap was established in the constructor and held, so
+/// the process's cwd could not affect a later batch. A registry that evicts
+/// reopens by path, so storing the caller's spelling made a bounded dataset
+/// break on `set_current_dir` — a regression against `main` that only bounded
+/// mode has. Reproduced on #536 by codex - gpt-5.6-sol and confirmed by Cursor
+/// Agent and Antigravity; the scan now stores `std::path::absolute`.
+///
+/// `set_current_dir` is process-wide and `cargo test` runs these in parallel,
+/// so this is only safe because every other test in this binary opens absolute
+/// tempdir paths and is therefore immune to the cwd moving. It is restored
+/// before the assertion. Do not add a test here that resolves a relative path
+/// without reading this first.
+#[test]
+fn a_relative_manifest_path_survives_a_chdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = manifest(dir.path(), 8);
+    let names: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| PathBuf::from(p.file_name().unwrap()))
+        .collect();
+
+    // Relative spellings, resolved against the fixture dir at construction.
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir.path()).unwrap();
+    let loader = open_loader(names, Some(2));
+    // Somewhere the relative names cannot resolve.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::env::set_current_dir(elsewhere.path()).unwrap();
+
+    let got = loader.gather(&one_set_per_file(8));
+    std::env::set_current_dir(prev).unwrap();
+
+    let batch = got.expect("a bounded reopen must not depend on the process cwd");
+    assert_eq!(batch.cell_indices.len(), 8);
 }
 
 /// A file replaced between gathers is refused on reopen rather than served.

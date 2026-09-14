@@ -3183,11 +3183,19 @@ not answer, and it is answered below.
 #### Does the leased-`Arc` seam cost anything? (phase 2)
 
 The engine now hands out a leased `Arc` from a mutex-guarded map where it
-previously indexed an array, and `plan_footprint` takes a lease per touched
-file. Two-build A/B, SLURM `2951009`, host `GPU3694`, `main` `aba3c114` against
+previously indexed an array, and sizing a plan takes a lease per touched file.
+Two-build A/B, SLURM `2951009`, host `GPU3694`, `main` `aba3c114` against
 `phase2-reader-registry` `9833d075`, 12 interleaved rounds per dataset, median
 of within-round ratios with an exact two-sided sign test. Raw rows under
 `results/raw/phase2_reader_registry/cellset_gather_ab.json`.
+
+⚠️ **The A/B measures `9833d075`, not the branch head.** Two later commits
+changed lease ordering on the prefetch path — sizing now reuses the leases the
+prefetcher already holds, and a plan touching more files than `reader_limit` is
+not prefetched at all. Neither can fire in the arms measured here, which all run
+`reader_limit=None`: an unbounded registry never evicts, so there is nothing to
+reorder and no cap to exceed. The measurement stands for the seam it names; it
+is not a measurement of the bounded path, which was never timed.
 
 Every arm runs `reader_limit=None`, where nothing is ever evicted or reopened.
 Flat was the expected result and the gate.

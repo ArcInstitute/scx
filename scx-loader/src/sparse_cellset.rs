@@ -92,9 +92,6 @@ pub struct SparseCellSetLoader {
     /// "open everything" (the default, and what every caller got before this
     /// existed). Reported through `SparseCellSetDataset.memory_budget()`.
     reader_limit: Option<usize>,
-    /// Registry counters (opens / evictions / residency high-water), cloned so
-    /// callers can sample them without reaching through the engine.
-    reader_metrics: Arc<crate::reader_registry::ReaderMetrics>,
     /// Optional per-`file_id` `local→global` table (`-1` = gene absent). When
     /// set, gathered indices are remapped into the global vocab; otherwise
     /// indices are raw-local (the default — state3 remaps in Python).
@@ -412,6 +409,10 @@ struct ManifestScan {
     retained: Vec<(u32, ScxReader)>,
     n_vars_max: usize,
     stats: ShardStatsAccum,
+    /// Folded here, while every file is open anyway, so nothing has to reopen
+    /// the manifest later to answer it. `None` when the caller did not ask for
+    /// the block-index route, which is its only consumer.
+    any_framed: Option<bool>,
 }
 
 impl ManifestScan {
@@ -420,12 +421,13 @@ impl ManifestScan {
     /// The path behind `SparseCellSetLoader::new`, which exists for callers
     /// that hold `ScxReader`s rather than paths. No slot carries an index or an
     /// identity: nothing here can ever be evicted, so nothing can be reopened.
-    fn from_open_readers(readers: Vec<ScxReader>) -> Result<Self> {
+    fn from_open_readers(readers: Vec<ScxReader>, want_framing: bool) -> Result<Self> {
         let mut scan = Self {
             files: Vec::with_capacity(readers.len()),
             retained: Vec::with_capacity(readers.len()),
             n_vars_max: 0,
             stats: ShardStatsAccum::default(),
+            any_framed: want_framing.then_some(false),
         };
         for (fid, reader) in readers.into_iter().enumerate() {
             scan.absorb(
@@ -436,12 +438,13 @@ impl ManifestScan {
     }
 
     /// Open each path in turn, keeping at most `limit` of the handles.
-    fn from_paths(paths: &[PathBuf], limit: Option<usize>) -> Result<Self> {
+    fn from_paths(paths: &[PathBuf], limit: Option<usize>, want_framing: bool) -> Result<Self> {
         let mut scan = Self {
             files: Vec::with_capacity(paths.len()),
             retained: Vec::with_capacity(limit.unwrap_or(paths.len()).min(paths.len())),
             n_vars_max: 0,
             stats: ShardStatsAccum::default(),
+            any_framed: want_framing.then_some(false),
         };
         for (fid, path) in paths.iter().enumerate() {
             let reader = ScxReader::open(path).map_err(|e| LoaderError::ConfigError {
@@ -472,19 +475,34 @@ impl ManifestScan {
         )?;
         self.n_vars_max = self.n_vars_max.max(reader.n_vars() as usize);
         self.stats.add(&reader);
+        // Folded while the file is open. Answering it later meant reopening
+        // every slot the scan had just closed, on a bounded manifest, to
+        // produce a constructor warning. **Review on #536.**
+        if self.any_framed == Some(false) && reader.any_csr_shard_framed() {
+            self.any_framed = Some(true);
+        }
         self.files.push(FileSlot {
-            path: reader.path().to_path_buf(),
+            // ABSOLUTE, not the caller's spelling. A reopen happens at an
+            // arbitrary later time, and `std::env::set_current_dir` between
+            // construction and that reopen would otherwise resolve a relative
+            // manifest entry against a different directory — a bounded-mode
+            // regression against `main`, where every mmap was established in
+            // the constructor and held, so cwd could not matter. Reproduced on
+            // #536 by codex and confirmed by Cursor Agent and Antigravity.
+            // `absolute` rather than `canonicalize`: it fixes the cwd
+            // dependence without silently resolving symlinks, which would
+            // change which file a repointed link names.
+            path: std::path::absolute(reader.path())
+                .unwrap_or_else(|_| reader.path().to_path_buf()),
             n_obs: reader.n_obs(),
             index: BackedCsrIndex::from_catalog(reader.catalog()),
             // Stamped whenever the registry could reopen at all — which is
             // every path-built loader, not only a limited one. `open(paths, …,
             // None)` never evicts and so never reopens today, but it holds the
             // recipe that would, and a slot without an identity is a hole
-            // waiting for whoever next changes when eviction runs. One `stat`
-            // per file at construction is the price.
-            identity: reopenable
-                .then(|| FileIdentity::stamp(reader.path(), reader.header()))
-                .transpose()?,
+            // waiting for whoever next changes when eviction runs. Free: both
+            // halves come from the reader already in hand.
+            identity: reopenable.then(|| FileIdentity::of(&reader)),
         });
         if retain {
             self.retained.push((file_id, reader));
@@ -532,7 +550,7 @@ impl SparseCellSetLoader {
         max_plan_rows: Option<usize>,
     ) -> Result<Arc<Self>> {
         Self::from_scan(
-            ManifestScan::from_open_readers(scx_readers)?,
+            ManifestScan::from_open_readers(scx_readers, scatter_block_index)?,
             cache_shards,
             bytes_budget,
             lookahead,
@@ -584,7 +602,7 @@ impl SparseCellSetLoader {
             });
         }
         Self::from_scan(
-            ManifestScan::from_paths(&paths, reader_limit)?,
+            ManifestScan::from_paths(&paths, reader_limit, scatter_block_index)?,
             cache_shards,
             bytes_budget,
             lookahead,
@@ -755,13 +773,12 @@ impl SparseCellSetLoader {
             reader_limit,
             shared,
             scatter_block_index,
+            scan.any_framed,
         );
-        let reader_metrics = registry.metrics();
         let engine = PrefetchEngine::over_registry(registry, lookahead, cache_metrics);
         Ok(Arc::new(SparseCellSetLoader {
             engine,
             reader_limit,
-            reader_metrics,
             remap,
             normalize,
             log1p,
@@ -929,7 +946,7 @@ impl SparseCellSetLoader {
     /// and the other two never move — which is the shape of the assertion that
     /// the default path really does nothing new.
     pub fn reader_metrics(&self) -> Arc<crate::reader_registry::ReaderMetrics> {
-        Arc::clone(&self.reader_metrics)
+        self.engine.registry().metrics()
     }
 
     /// CSR column count of emitted batches.

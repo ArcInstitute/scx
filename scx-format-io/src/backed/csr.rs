@@ -637,7 +637,9 @@ impl BackedCsrReader {
     /// framed shard; reads only shard headers and block indexes (no payload),
     /// memoized per shard via `framed_layout`.
     pub fn any_shard_framed(&self) -> bool {
-        (0..self.shard_count()).any(|i| self.shard_is_framed(i))
+        // Delegated so there is exactly one answer to this question, reachable
+        // from a bare `ScxReader` too — see `ScxReader::any_csr_shard_framed`.
+        self.reader.any_csr_shard_framed()
     }
 
     /// Live count cap on the decoded-shard LRU. `0` means no cache was

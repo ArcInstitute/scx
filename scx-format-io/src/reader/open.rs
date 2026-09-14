@@ -33,7 +33,17 @@ impl ScxReader {
     /// Shared by both constructors so neither can quietly lose the context;
     /// `open_with_shared_catalog` did, for exactly as long as it had its own
     /// copy of these four lines.
-    fn map_with_path_context(path: &Path) -> Result<Mmap> {
+    /// Returns the mapping **and the identity of the inode it was taken
+    /// from**, read through the very `File` that produced it.
+    ///
+    /// The identity has to come from here and nowhere else. Deriving it later
+    /// from a second `std::fs::metadata(path)` leaves a window in which an
+    /// atomic rename lands between the two, pairing the *new* file's inode with
+    /// the *old* file's catalog — a hybrid stamp that a reopen of the new file
+    /// then matches, so the reader silently changes files underneath a stable
+    /// `file_id`. Found on #536 by codex - gpt-5.6-sol and confirmed
+    /// independently by Cursor Agent and Antigravity.
+    fn map_with_path_context(path: &Path) -> Result<(Mmap, crate::freshness::InodeIdentity)> {
         let file = File::open(path).map_err(|e| {
             ScxError::Io(std::io::Error::new(
                 e.kind(),
@@ -58,6 +68,14 @@ impl ScxReader {
             let _ = mmap.advise(Advice::Normal);
         }
 
+        let meta = file.metadata().map_err(|e| {
+            ScxError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot stat '{}': {}", path.display(), e),
+            ))
+        })?;
+        let inode = crate::freshness::InodeIdentity::of(&meta);
+
         // Check minimum file size (header + root catalog placeholder)
         if mmap.len() < HEADER_SIZE {
             return Err(ScxError::Io(std::io::Error::new(
@@ -69,7 +87,7 @@ impl ScxReader {
                 ),
             )));
         }
-        Ok(mmap)
+        Ok((mmap, inode))
     }
 
     /// Read the root catalog at offset 256.
@@ -178,7 +196,7 @@ impl ScxReader {
 
     fn open_inner(path: impl AsRef<Path>, verify_catalog: bool) -> Result<Self> {
         let path = path.as_ref();
-        let mmap = Self::map_with_path_context(path)?;
+        let (mmap, inode) = Self::map_with_path_context(path)?;
 
         // Read and validate file header
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
@@ -216,6 +234,7 @@ impl ScxReader {
 
         Ok(ScxReader {
             mmap,
+            inode,
             path: path.to_path_buf(),
             freshness: None,
             header,
@@ -281,7 +300,7 @@ impl ScxReader {
     ) -> Result<Self> {
         let path = path.as_ref();
 
-        let mmap = Self::map_with_path_context(path)?;
+        let (mmap, inode) = Self::map_with_path_context(path)?;
 
         let header = FileHeader::read_from(&mut Cursor::new(&mmap[..HEADER_SIZE]))?;
 
@@ -303,6 +322,7 @@ impl ScxReader {
 
         Ok(ScxReader {
             mmap,
+            inode,
             path: path.to_path_buf(),
             freshness: None,
             header,
