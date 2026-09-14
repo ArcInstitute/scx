@@ -5,11 +5,13 @@ batches as sparse CSR (the §4.4 contract) and must match the backed
 `to_anndata().X[rows]` reference, in plan order, across multiple files.
 """
 
+import gc
 import multiprocessing as mp
 import shutil
 
 import anndata
 import numpy as np
+import pyscx
 import pytest
 import scipy.sparse as sp
 
@@ -858,3 +860,136 @@ def test_constructor_releases_the_gil(tmp_dir):
         f"monitor thread stalled {largest_gap * 1000:.1f} ms of a "
         f"{duration * 1000:.1f} ms constructor — the GIL was held across the open"
     )
+
+
+# --------------------------------------------------------------------------
+# reader_limit — the bounded reader registry (W8)
+# --------------------------------------------------------------------------
+#
+# What `reader_limit` bounds is RESIDENT MEMORY, not file descriptors.
+# `ScxReader::open` mmaps and lets the descriptor go, and the loader never opens
+# a *watching* reader, so a manifest of N files holds N mappings and no
+# descriptors — measured on this very constructor, a 5,000-file manifest
+# constructs and gathers under `ulimit -n 1024` with the process's descriptor
+# count flat at 7. An FD-count assertion here would pass with or without the
+# feature and prove nothing.
+#
+# What an open reader does cost is the parsed `FullCatalog`: 147-197 kB apiece
+# on the fixture below, ~101 kB on tabula_sapiens_100k, ~119 kB on census_1m.
+
+
+@pytest.fixture
+def many_shard_scx(tmp_dir):
+    """One file with ~100 CSR shards, so a reader's catalog is worth measuring.
+
+    Shard count, not cell count, is what a catalog parse costs, and it is the
+    term `reader_limit` bounds copies of.
+    """
+    import scipy.sparse as _sp
+
+    path = str(tmp_dir / "manyshard.scx")
+    x = _sp.random(2000, 200, density=0.05, format="csr", random_state=0, dtype=np.float32)
+    pyscx.from_anndata(anndata.AnnData(x), path, shard_size=20)
+    return path
+
+
+def _rss_kb():
+    with open("/proc/self/status") as fh:
+        for line in fh:
+            if line.startswith("VmRSS"):
+                return int(line.split()[1])
+    raise RuntimeError("VmRSS not reported")
+
+
+def test_reader_limit_bounds_manifest_resident_memory(many_shard_scx):
+    """The claim the whole phase rests on, asserted as a ratio, not a constant.
+
+    A ratio because the absolute per-reader cost varies with the file's catalog
+    (147-197 kB here, ~101 kB on tabula) and with the allocator; what does not
+    vary is that the unbounded manifest pays it N times and the bounded one
+    pays it `reader_limit` times. The measured gap is ~25x at these sizes,
+    which is the margin that makes an RSS assertion safe to commit at all.
+
+    Fail-first: on a build without the kwarg this raises `TypeError`, and
+    without the registry behind it the bounded arm's delta would track N.
+    """
+    n = 1000
+    paths = [many_shard_scx] * n
+
+    gc.collect()
+    before = _rss_kb()
+    unbounded = pyscx.SparseCellSetDataset(paths=paths)
+    unbounded_kb = _rss_kb() - before
+    assert unbounded.n_files == n
+    del unbounded
+    gc.collect()
+
+    before = _rss_kb()
+    bounded = pyscx.SparseCellSetDataset(paths=paths, reader_limit=16)
+    bounded_kb = _rss_kb() - before
+    assert bounded.n_files == n
+
+    assert unbounded_kb > 20_000, (
+        f"premise failed: {n} open readers cost only {unbounded_kb} kB, so this "
+        "fixture cannot show a saving — the test would pass vacuously"
+    )
+    assert bounded_kb * 5 < unbounded_kb, (
+        f"reader_limit=16 held {bounded_kb} kB against {unbounded_kb} kB unbounded; "
+        "the registry is not dropping the parsed catalogs it evicts"
+    )
+
+
+def test_reader_limit_does_not_change_the_gathered_batch(two_scx):
+    """Residency is the only thing that may differ."""
+    full = pyscx.SparseCellSetDataset(paths=two_scx).gather(*_PLAN)
+    for limit in (1, 2, 8):
+        got = pyscx.SparseCellSetDataset(paths=two_scx, reader_limit=limit).gather(*_PLAN)
+        assert got.keys() == full.keys()
+        for k in full:
+            np.testing.assert_array_equal(got[k], full[k], err_msg=f"{k} at reader_limit={limit}")
+            # `shape` is a plain tuple; everything else is a numpy array whose
+            # dtype is as much part of the contract as its values.
+            if hasattr(full[k], "dtype"):
+                assert got[k].dtype == full[k].dtype
+
+
+def test_cache_metrics_reports_the_reader_registry(two_scx):
+    """The default path must be visibly inert, and the bounded one visibly not."""
+    ds = pyscx.SparseCellSetDataset(paths=two_scx)
+    m = ds.cache_metrics()
+    for k in ("reader_opens", "reader_evictions", "reader_resident", "reader_hwm"):
+        assert k in m, f"{k} missing from cache_metrics()"
+    assert m["reader_opens"] == 2
+    assert m["reader_evictions"] == 0
+    assert m["reader_hwm"] == 2
+
+    bounded = pyscx.SparseCellSetDataset(paths=two_scx, reader_limit=1)
+    bounded.gather(*_PLAN)
+    b = bounded.cache_metrics()
+    assert b["reader_hwm"] <= 1 or b["reader_opens"] > 2, (
+        "a 2-file plan at reader_limit=1 must either stay within the cap or show "
+        f"the reopens that exceeding it costs; got {b}"
+    )
+    assert b["reader_evictions"] > 0
+
+
+def test_index_plan_dataset_has_no_reader_registry_keys(two_scx):
+    """The single-file class must not gain four permanently-zero keys."""
+    ds = pyscx.IndexPlanDataset(two_scx[0])
+    m = ds.cache_metrics()
+    assert not [k for k in m if k.startswith("reader_")], (
+        f"IndexPlanDataset is single-file and has no reader registry: {m}"
+    )
+
+
+def test_memory_budget_reports_reader_limit(two_scx):
+    assert pyscx.SparseCellSetDataset(paths=two_scx).memory_budget()["reader_limit"] is None
+    assert (
+        pyscx.SparseCellSetDataset(paths=two_scx, reader_limit=4).memory_budget()["reader_limit"]
+        == 4
+    )
+
+
+def test_reader_limit_zero_is_refused(two_scx):
+    with pytest.raises(ValueError, match="reader_limit must be >= 1"):
+        pyscx.SparseCellSetDataset(paths=two_scx, reader_limit=0)

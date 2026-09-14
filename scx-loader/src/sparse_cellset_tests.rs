@@ -206,11 +206,15 @@ fn cellset_plan_admission_ignores_plan_level_density() {
     )
     .unwrap();
     assert!(
-        !loader.engine.reader(0).block_index_eligible(0, rows.len()),
+        !loader
+            .engine
+            .lease(0)
+            .unwrap()
+            .block_index_eligible(0, rows.len()),
         "premise: dense at plan level"
     );
     assert!(
-        loader.engine.reader(0).block_index_eligible(0, 4),
+        loader.engine.lease(0).unwrap().block_index_eligible(0, 4),
         "premise: sparse per set"
     );
     let plan = SparseCellSetPlan {

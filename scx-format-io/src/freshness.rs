@@ -126,6 +126,67 @@ impl CatalogIdentity {
     }
 }
 
+/// A file's identity at a point in time, stamped without retaining a descriptor.
+///
+/// [`FreshnessGuard`] answers "has the file under this *open* reader changed",
+/// and keeps the descriptor open so its re-read is a single `pread`. A bounded
+/// reader registry asks a narrower question — "is the file I am about to
+/// *reopen* still the one I scanned?" — and must hold nothing at all between
+/// the two opens, since the descriptor it would retain is the resource it
+/// exists to bound. Same two fields and the same verdict as `check()`; only
+/// the descriptor differs, which is why this lives here rather than being
+/// re-derived by the caller from `header()` and a `stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    inode: InodeIdentity,
+    catalog: CatalogIdentity,
+}
+
+impl FileIdentity {
+    /// Stamp `path`'s identity, using the header a reader has already parsed
+    /// from it. One `stat`; the header is never re-read.
+    pub fn stamp(path: &Path, header: &FileHeader) -> Result<Self> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            ScxError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot stat '{}': {}", path.display(), e),
+            ))
+        })?;
+        Ok(Self {
+            inode: InodeIdentity::of(&meta),
+            catalog: CatalogIdentity::of(header),
+        })
+    }
+
+    /// `Ok(())` when `now` names the same inode and the same catalog as `self`.
+    ///
+    /// The two clauses are not redundant: an in-place op (`append`, `rollback`)
+    /// keeps the inode and moves the catalog pointer, while a copy-out op
+    /// (`compact`, `sort`, `merge`) renames a new inode into place and may land
+    /// on any pointer at all. Timestamps and size decide neither — see the
+    /// module docs.
+    pub fn ensure_same(&self, path: &Path, now: &Self) -> Result<()> {
+        if now.inode != self.inode {
+            return Err(ScxError::FileChangedOnDisk {
+                path: path.display().to_string(),
+                detail: "was replaced on disk since it was first opened (a copy-out op such \
+                         as compact, sort or merge writes a new file and renames it into place)"
+                    .to_string(),
+            });
+        }
+        if now.catalog != self.catalog {
+            return Err(ScxError::FileChangedOnDisk {
+                path: path.display().to_string(),
+                detail: format!(
+                    "changed on disk since it was first opened (manifest_sequence {} \u{2192} {})",
+                    self.catalog.manifest_sequence, now.catalog.manifest_sequence
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Watches the file a reader was opened from for changes made behind its back.
 ///
 /// Attached to an [`crate::reader::ScxReader`] only when the caller opts in via

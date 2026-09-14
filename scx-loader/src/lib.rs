@@ -16,6 +16,7 @@ pub mod projection;
 pub mod pyimport;
 #[cfg(feature = "python")]
 pub mod python;
+pub mod reader_registry;
 pub(crate) mod runtime;
 pub(crate) mod seed;
 pub mod shuffle;

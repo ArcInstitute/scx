@@ -15,13 +15,16 @@
 //! remap/coalesce to the caller.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use scx_format_io::{CacheMetrics, ScxReader};
+use scx_format_io::freshness::FileIdentity;
+use scx_format_io::{BackedCsrIndex, BackedCsrReader, CacheMetrics, ScxReader, SharedShardCache};
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::{IterMetrics, PrefetchEngine};
+use crate::reader_registry::ScannedFile;
 use crate::sparse_cellset_collate::{
     collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode, RowMask, SetQueryIndex,
 };
@@ -85,6 +88,13 @@ pub struct CollatedCellSetBatch {
 /// Drives the prefetch engine to gather sparse cell-set batches.
 pub struct SparseCellSetLoader {
     engine: Arc<PrefetchEngine>,
+    /// Caller-declared cap on simultaneously-resident readers, or `None` for
+    /// "open everything" (the default, and what every caller got before this
+    /// existed). Reported through `SparseCellSetDataset.memory_budget()`.
+    reader_limit: Option<usize>,
+    /// Registry counters (opens / evictions / residency high-water), cloned so
+    /// callers can sample them without reaching through the engine.
+    reader_metrics: Arc<crate::reader_registry::ReaderMetrics>,
     /// Optional per-`file_id` `local→global` table (`-1` = gene absent). When
     /// set, gathered indices are remapped into the global vocab; otherwise
     /// indices are raw-local (the default — state3 remaps in Python).
@@ -154,42 +164,64 @@ pub struct SparseCellSetLoader {
 /// batch is charged at (see [`SparseCellSetBudgetModel`]); deriving it here
 /// rather than in a second catalog walk keeps one definition of which shards
 /// count, and the divisor rule below applies to both.
-fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
-    let mut total_nnz = 0u64;
-    let mut total_rows = 0u64;
+#[derive(Default)]
+struct ShardStatsAccum {
+    total_nnz: u64,
+    total_rows: u64,
     // Only shards that CONTRIBUTED to the totals may count toward the divisor.
     // Counting stat-less shards in the denominator averages their 0 bytes into
     // the result, *under*-estimating the per-shard size — which then
     // *over*-estimates how many shards the byte budget affords and makes the
     // sizing diagnostic under-warn on exactly the files whose catalogs are
     // incomplete. Flagged independently by all three round-2 reviewers.
-    let mut n_counted = 0u64;
-    for r in readers {
-        for e in r.catalog().shards_sorted() {
+    n_counted: u64,
+}
+
+impl ShardStatsAccum {
+    /// Fold one file in. Per file rather than over a slice because the manifest
+    /// scan may hold only `reader_limit` readers at once and has no slice of
+    /// all of them to hand at the end.
+    fn add(&mut self, reader: &ScxReader) {
+        for e in reader.catalog().shards_sorted() {
             if let Some(s) = e.stats.as_ref() {
-                total_nnz += s.nnz;
-                total_rows += s.row_end - s.row_start;
-                n_counted += 1;
+                self.total_nnz += s.nnz;
+                self.total_rows += s.row_end - s.row_start;
+                self.n_counted += 1;
             }
         }
     }
-    // No shard carried stats ⇒ the size is genuinely unknown. Returning 0 is the
-    // signal `SparseCellSetLoader::new` reads as "the byte cap tells us nothing",
-    // falling back to the count cap rather than to a fabricated average.
-    let avg_bytes = total_nnz
-        .saturating_mul(8)
-        .saturating_add(total_rows.saturating_mul(8))
-        .checked_div(n_counted)
-        .unwrap_or(0) as usize;
-    // Rows, not shards, in this divisor: the mean is per row of the manifest,
-    // so shards of unequal height must not be weighted equally. 0.0 when no
-    // shard carried stats, matching `avg_bytes`'s "genuinely unknown" signal.
-    let mean_nnz_per_row = if total_rows == 0 {
-        0.0
-    } else {
-        total_nnz as f64 / total_rows as f64
-    };
-    (avg_bytes, mean_nnz_per_row)
+
+    fn finish(&self) -> (usize, f64) {
+        // No shard carried stats ⇒ the size is genuinely unknown. Returning 0
+        // is the signal the constructor reads as "the byte cap tells us
+        // nothing", falling back to the count cap rather than to a fabricated
+        // average.
+        let avg_bytes = self
+            .total_nnz
+            .saturating_mul(8)
+            .saturating_add(self.total_rows.saturating_mul(8))
+            .checked_div(self.n_counted)
+            .unwrap_or(0) as usize;
+        // Rows, not shards, in this divisor: the mean is per row of the
+        // manifest, so shards of unequal height must not be weighted equally.
+        // 0.0 when no shard carried stats, matching `avg_bytes`'s "genuinely
+        // unknown" signal.
+        let mean_nnz_per_row = if self.total_rows == 0 {
+            0.0
+        } else {
+            self.total_nnz as f64 / self.total_rows as f64
+        };
+        (avg_bytes, mean_nnz_per_row)
+    }
+}
+
+#[cfg(test)]
+fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
+    let mut acc = ShardStatsAccum::default();
+    for r in readers {
+        acc.add(r);
+    }
+    acc.finish()
 }
 
 /// Capacity to pre-size a gathered batch's `indices` / `data` to.
@@ -362,6 +394,103 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
     }
 }
 
+/// One pass over the manifest, holding at most `reader_limit` files open.
+///
+/// Everything the constructor needs from a file — the CSR-range validation, the
+/// column count, the catalog's shard stats, the row count and the shard index —
+/// comes from its catalog, so there is no way to learn it without opening the
+/// file. What a bounded scan changes is not *whether* each file is opened but
+/// how many are open **at once**, which is the term that costs ~101 kB of
+/// resident memory apiece (see [`crate::reader_registry`]).
+struct ManifestScan {
+    files: Vec<ScannedFile>,
+    /// The handles the scan kept: all of them at `reader_limit = None`, the
+    /// first `limit` otherwise. First rather than most-recent because a scan
+    /// has no access pattern to learn from yet, and the alternative — keeping
+    /// the *last* `limit` — would evict exactly the files a plan starting at
+    /// `file_id` 0 asks for next.
+    retained: Vec<(u32, ScxReader)>,
+    n_vars_max: usize,
+    stats: ShardStatsAccum,
+}
+
+impl ManifestScan {
+    /// Scan readers the caller has already opened, keeping every one.
+    ///
+    /// The path behind `SparseCellSetLoader::new`, which exists for callers
+    /// that hold `ScxReader`s rather than paths. No slot carries an index or an
+    /// identity: nothing here can ever be evicted, so nothing can be reopened.
+    fn from_open_readers(readers: Vec<ScxReader>) -> Result<Self> {
+        let mut scan = Self {
+            files: Vec::with_capacity(readers.len()),
+            retained: Vec::with_capacity(readers.len()),
+            n_vars_max: 0,
+            stats: ShardStatsAccum::default(),
+        };
+        for (fid, reader) in readers.into_iter().enumerate() {
+            scan.absorb(
+                fid as u32, reader, /* retain */ true, /* reopenable */ false,
+            )?;
+        }
+        Ok(scan)
+    }
+
+    /// Open each path in turn, keeping at most `limit` of the handles.
+    fn from_paths(paths: &[PathBuf], limit: Option<usize>) -> Result<Self> {
+        let mut scan = Self {
+            files: Vec::with_capacity(paths.len()),
+            retained: Vec::with_capacity(limit.unwrap_or(paths.len()).min(paths.len())),
+            n_vars_max: 0,
+            stats: ShardStatsAccum::default(),
+        };
+        for (fid, path) in paths.iter().enumerate() {
+            let reader = ScxReader::open(path).map_err(|e| LoaderError::ConfigError {
+                reason: format!("failed to open {}: {e}", path.display()),
+            })?;
+            let retain = limit.is_none_or(|k| scan.retained.len() < k);
+            scan.absorb(fid as u32, reader, retain, limit.is_some())?;
+        }
+        Ok(scan)
+    }
+
+    fn absorb(
+        &mut self,
+        file_id: u32,
+        reader: ScxReader,
+        retain: bool,
+        reopenable: bool,
+    ) -> Result<()> {
+        // Same reason as `IndexPlanLoader`: this loader resolves cells by
+        // global obs row through `BackedCsrReader`, so a multimodal file's
+        // flattened shard list would answer from an arbitrary modality. Checked
+        // during the scan, while the file is open, so a manifest with a bad
+        // file still fails at construction rather than at first gather.
+        crate::pipeline::ensure_csr_ranges_are_readable(
+            &reader,
+            None,
+            &format!("SparseCellSetLoader (file {file_id})"),
+        )?;
+        self.n_vars_max = self.n_vars_max.max(reader.n_vars() as usize);
+        self.stats.add(&reader);
+        self.files.push(ScannedFile {
+            path: reader.path().to_path_buf(),
+            n_obs: reader.n_obs(),
+            index: BackedCsrIndex::from_catalog(reader.catalog()),
+            identity: reopenable
+                .then(|| FileIdentity::stamp(reader.path(), reader.header()))
+                .transpose()?,
+        });
+        if retain {
+            self.retained.push((file_id, reader));
+        }
+        Ok(())
+    }
+
+    fn n_files(&self) -> usize {
+        self.files.len()
+    }
+}
+
 impl SparseCellSetLoader {
     /// Build a loader over `scx_readers` (one per `file_id`, in slice order),
     /// sharing one decoded-shard budget. `remap`/`n_global_genes` enable global
@@ -396,16 +525,92 @@ impl SparseCellSetLoader {
         scatter_block_index: bool,
         max_plan_rows: Option<usize>,
     ) -> Result<Arc<Self>> {
-        // Same reason as `IndexPlanLoader`: this loader resolves cells by global
-        // obs row through `BackedCsrReader`, so a multimodal file's flattened
-        // shard list would answer from an arbitrary modality.
-        for (file_id, reader) in scx_readers.iter().enumerate() {
-            crate::pipeline::ensure_csr_ranges_are_readable(
-                reader,
-                None,
-                &format!("SparseCellSetLoader (file {file_id})"),
-            )?;
+        Self::from_scan(
+            ManifestScan::from_open_readers(scx_readers)?,
+            cache_shards,
+            bytes_budget,
+            lookahead,
+            remap,
+            n_global_genes,
+            normalize,
+            log1p,
+            target_sum,
+            downsample,
+            scatter_block_index,
+            max_plan_rows,
+            None,
+        )
+    }
+
+    /// Build a loader over a manifest of **paths**, opening at most
+    /// `reader_limit` of them at a time and keeping at most that many resident.
+    ///
+    /// `reader_limit = None` is the default and opens everything, exactly as
+    /// [`SparseCellSetLoader::new`] does — identical sizing, identical gather
+    /// output, and nothing ever reopened. A `Some(k)` trades resident memory
+    /// for reopens: each open reader costs ~101 kB, over 90 % of it the parsed
+    /// `FullCatalog`, which at a 26 k-file manifest is ~2.9 GB per process.
+    /// A reopen re-parses that catalog, which is what makes the saving real —
+    /// see [`crate::reader_registry`].
+    ///
+    /// Every other argument means what it does on `new`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        paths: Vec<PathBuf>,
+        cache_shards: usize,
+        bytes_budget: Option<usize>,
+        lookahead: usize,
+        remap: Option<Vec<Vec<i32>>>,
+        n_global_genes: Option<usize>,
+        normalize: bool,
+        log1p: bool,
+        target_sum: f64,
+        downsample: Option<crate::downsample::DownsampleConfig>,
+        scatter_block_index: bool,
+        max_plan_rows: Option<usize>,
+        reader_limit: Option<usize>,
+    ) -> Result<Arc<Self>> {
+        if reader_limit == Some(0) {
+            return Err(LoaderError::ConfigError {
+                reason: "reader_limit must be >= 1 (a gather needs at least one open reader); \
+                         pass None to keep every file open"
+                    .into(),
+            });
         }
+        Self::from_scan(
+            ManifestScan::from_paths(&paths, reader_limit)?,
+            cache_shards,
+            bytes_budget,
+            lookahead,
+            remap,
+            n_global_genes,
+            normalize,
+            log1p,
+            target_sum,
+            downsample,
+            scatter_block_index,
+            max_plan_rows,
+            reader_limit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_scan(
+        scan: ManifestScan,
+        cache_shards: usize,
+        bytes_budget: Option<usize>,
+        lookahead: usize,
+        remap: Option<Vec<Vec<i32>>>,
+        n_global_genes: Option<usize>,
+        normalize: bool,
+        log1p: bool,
+        target_sum: f64,
+        downsample: Option<crate::downsample::DownsampleConfig>,
+        scatter_block_index: bool,
+        max_plan_rows: Option<usize>,
+        reader_limit: Option<usize>,
+    ) -> Result<Arc<Self>> {
+        let n_files = scan.n_files();
         if let Some(cfg) = &downsample {
             cfg.validate()?;
             // An empty table means "no stable per-file identity", which keys on
@@ -414,33 +619,33 @@ impl SparseCellSetLoader {
             // than fall back to `file_id`, which would be construction-order
             // keying: a reordered manifest or a debugging subset silently redrawing
             // every cell while producing perfectly plausible output.
-            if cfg.file_identities.is_empty() && scx_readers.len() > 1 {
+            if cfg.file_identities.is_empty() && n_files > 1 {
                 return Err(LoaderError::ConfigError {
                     reason: format!(
                         "downsample over {} files requires file_identities (one stable \
                          per-file id, e.g. scx_loader::downsample::file_identity(path)); \
                          without them two files' row N would share a draw",
-                        scx_readers.len()
+                        n_files
                     ),
                 });
             }
-            if !cfg.file_identities.is_empty() && cfg.file_identities.len() != scx_readers.len() {
+            if !cfg.file_identities.is_empty() && cfg.file_identities.len() != n_files {
                 return Err(LoaderError::ConfigError {
                     reason: format!(
                         "downsample file_identities has {} entries but there are {} files",
                         cfg.file_identities.len(),
-                        scx_readers.len()
+                        n_files
                     ),
                 });
             }
         }
         if let Some(tables) = &remap {
-            if tables.len() != scx_readers.len() {
+            if tables.len() != n_files {
                 return Err(LoaderError::ConfigError {
                     reason: format!(
                         "remap has {} tables but there are {} files",
                         tables.len(),
-                        scx_readers.len()
+                        n_files
                     ),
                 });
             }
@@ -454,15 +659,12 @@ impl SparseCellSetLoader {
                 .max()
                 .map(|g| g as usize + 1)
                 .unwrap_or(0),
-            (None, _) => scx_readers
-                .iter()
-                .map(|r| r.n_vars() as usize)
-                .max()
-                .unwrap_or(0),
+            (None, _) => scan.n_vars_max,
         };
-        // Resolve the cache byte budget before the readers are moved into the
-        // engine: the adaptive path needs their catalog stats.
-        let (shard_decoded_bytes, mean_nnz_per_row) = avg_shard_decoded_bytes(&scx_readers);
+        // Both from the scan's incremental fold over each file's catalog: the
+        // adaptive budget path needs these, and a bounded scan has no slice of
+        // all the readers left to walk.
+        let (shard_decoded_bytes, mean_nnz_per_row) = scan.stats.finish();
         // `None` ⇒ 0 ⇒ the breakdown and the resolved cache are byte-identical
         // to what this loader produced before the term existed. Only a caller
         // who declares how wide its plans get pays for one.
@@ -521,15 +723,39 @@ impl SparseCellSetLoader {
         // when actual shard sizes diverge from the average. Before ORG-9.10-5
         // this path handed over the raw request and the raw byte budget, so the
         // numbers it reported described a cache it was not enforcing.
-        let engine = PrefetchEngine::from_scx_readers(
-            scx_readers,
-            affordable_cache_shards,
-            enforced_cache_bytes,
-            lookahead,
+        let shared = SharedShardCache::new(affordable_cache_shards, enforced_cache_bytes);
+        let retained: Vec<(u32, Arc<BackedCsrReader>)> = scan
+            .retained
+            .into_iter()
+            .map(|(fid, r)| {
+                (
+                    fid,
+                    crate::reader_registry::wrap_reader(r, fid, &shared, scatter_block_index),
+                )
+            })
+            .collect();
+        // Read back the one aggregate handle `wrap_reader`'s `enable_metrics`
+        // installed on the shared cache, as `PrefetchEngine::new` does. A
+        // zeroed default only when the manifest retained nothing, which the
+        // `reader_limit >= 1` check above makes unreachable for a non-empty
+        // manifest.
+        let cache_metrics = retained
+            .iter()
+            .find_map(|(_, r)| r.metrics().cloned())
+            .unwrap_or_else(|| Arc::new(CacheMetrics::default()));
+        let registry = crate::reader_registry::ReaderRegistry::from_scan(
+            scan.files,
+            retained,
+            reader_limit,
+            shared,
             scatter_block_index,
         );
+        let reader_metrics = registry.metrics();
+        let engine = PrefetchEngine::over_registry(registry, lookahead, cache_metrics);
         Ok(Arc::new(SparseCellSetLoader {
             engine,
+            reader_limit,
+            reader_metrics,
             remap,
             normalize,
             log1p,
@@ -639,7 +865,7 @@ impl SparseCellSetLoader {
     /// shared cache, which is keyed `(file_id, shard)`.
     pub fn total_shards(&self) -> usize {
         (0..self.engine.n_readers())
-            .map(|fid| self.engine.reader(fid as u32).index().n_shards())
+            .map(|fid| self.engine.registry().n_shards(fid as u32))
             .sum()
     }
 
@@ -662,7 +888,7 @@ impl SparseCellSetLoader {
         by_file
             .into_iter()
             .filter(|(f, _)| (*f as usize) < self.engine.n_readers())
-            .map(|(f, rs)| self.engine.reader(f).index().shards_for_indices(&rs).len())
+            .map(|(f, rs)| self.engine.registry().shards_touched(f, &rs))
             .sum()
     }
 
@@ -685,6 +911,19 @@ impl SparseCellSetLoader {
     /// (hits / misses / evictions / …), cumulative since construction.
     pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
         self.engine.cache_metrics()
+    }
+
+    /// Cap on simultaneously-resident readers, or `None` for "open everything".
+    pub fn reader_limit(&self) -> Option<usize> {
+        self.reader_limit
+    }
+
+    /// Registry counters (opens / evictions / residency), cumulative since
+    /// construction. At `reader_limit = None` `opens` equals the manifest size
+    /// and the other two never move — which is the shape of the assertion that
+    /// the default path really does nothing new.
+    pub fn reader_metrics(&self) -> Arc<crate::reader_registry::ReaderMetrics> {
+        Arc::clone(&self.reader_metrics)
     }
 
     /// CSR column count of emitted batches.
@@ -771,7 +1010,7 @@ impl SparseCellSetLoader {
         let per_shard = self
             .engine
             .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
-        let (planned, budget) = self.engine.plan_footprint(&per_shard);
+        let (planned, budget) = self.engine.plan_footprint(&per_shard)?;
         self.gather_admitting(&self.engine, plan, Some(planned <= budget))
     }
 
@@ -831,7 +1070,10 @@ impl SparseCellSetLoader {
         // Row indices must be in range for their file, surfaced as `IndexError`
         // (consistent with `Experiment.gather_rows_sparse` and the pair loader).
         for (&fid, &row) in plan.file_ids.iter().zip(plan.rows.iter()) {
-            let n_obs = engine.reader(fid).n_obs();
+            // From the registry's slot, not from a handle: the `file_id` range
+            // check above has already run, and validating a plan must not be
+            // what pulls every file it names into residence.
+            let n_obs = engine.registry().n_obs(fid).unwrap_or(0) as usize;
             if row as usize >= n_obs {
                 return Err(LoaderError::IndexOutOfRange { idx: row, n_obs });
             }
@@ -902,7 +1144,7 @@ impl SparseCellSetLoader {
             if uniform {
                 // --- single-file fast path (the only current configuration) ---
                 let fid = set_fids[0];
-                let reader = engine.reader(fid);
+                let reader = engine.lease(fid)?;
                 reader
                     .read_rows_with_admission(set_rows, admit_row_groups, |orig_pos, idx, dat| {
                         // `orig_pos` is the position in `set_rows`, not the row id
@@ -928,7 +1170,7 @@ impl SparseCellSetLoader {
                     by_file.entry(f).or_default().push((j, r));
                 }
                 for (f, items) in by_file {
-                    let reader = engine.reader(f);
+                    let reader = engine.lease(f)?;
                     let rs: Vec<u64> = items.iter().map(|&(_, r)| r).collect();
                     reader
                         .read_rows_with_admission(&rs, admit_row_groups, |orig_pos, idx, dat| {
