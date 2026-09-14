@@ -812,6 +812,11 @@ fn dense_scatter_rejects_an_index_the_seam_bound_let_through() {
 /// value of `0` is indistinguishable from an untouched slot in a freshly zeroed
 /// buffer, which is exactly what a mis-sized chunk leaves behind. Same reasoning
 /// as `irregular_row` on the f32 side.
+///
+/// `cfg`-gated with its only consumer: without `parallel` there is no `Parallel`
+/// arm to compare against, so an ungated helper is dead code under `-D warnings`
+/// on the `--no-default-features` clippy legs.
+#[cfg(feature = "parallel")]
 fn irregular_u8_shard(n_rows: usize, n_vars: usize, row_start: u64, val_base: u8) -> ShardSpec {
     let mut indptr = vec![0u64];
     let mut indices = Vec::new();

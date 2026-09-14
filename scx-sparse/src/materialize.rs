@@ -33,6 +33,20 @@ pub enum ValueDtype {
 
 impl ValueDtype {
     /// numpy dtype name for this value dtype.
+    /// Width of one value in bytes.
+    ///
+    /// What a materialized buffer costs per element, which is what a
+    /// memory estimate for an eager read needs — the numpy name is not enough,
+    /// since a caller sizing an allocation has to resolve it back to a width.
+    pub fn size_bytes(self) -> u64 {
+        match self {
+            ValueDtype::I8 | ValueDtype::U8 => 1,
+            ValueDtype::F16 | ValueDtype::I16 | ValueDtype::U16 => 2,
+            ValueDtype::F32 | ValueDtype::I32 | ValueDtype::U32 => 4,
+            ValueDtype::F64 | ValueDtype::I64 => 8,
+        }
+    }
+
     pub fn numpy_name(self) -> &'static str {
         match self {
             ValueDtype::F16 => "float16",
@@ -646,6 +660,29 @@ mod tests {
             let mut buf = IndexBuffer::zeroed(dtype, 5);
             assert_eq!(buf.chunks_mut(&[1, 4]).unwrap().len(), 2, "{dtype:?}");
             assert!(buf.chunks_mut(&[1, 1]).is_none(), "{dtype:?}");
+        }
+    }
+
+    /// `size_bytes` must agree with what `zeroed` actually allocates — the two
+    /// are the only places the width of a `ValueDtype` is written down, and an
+    /// estimate built on a stale one is wrong in the direction nobody checks.
+    #[test]
+    fn value_dtype_size_bytes_matches_what_zeroed_allocates() {
+        for dtype in ALL_VALUE_DTYPES {
+            let buf = ValueBuffer::zeroed(dtype, 4);
+            let bytes = match &buf {
+                ValueBuffer::F16(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::F32(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::F64(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::I8(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::I16(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::I32(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::I64(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::U8(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::U16(v) => std::mem::size_of_val(&v[..]),
+                ValueBuffer::U32(v) => std::mem::size_of_val(&v[..]),
+            };
+            assert_eq!(bytes as u64, 4 * dtype.size_bytes(), "{dtype:?}");
         }
     }
 

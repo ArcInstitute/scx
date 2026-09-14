@@ -290,13 +290,14 @@ back to CPU with `FallbackReason::NoRapids`.
 `uns["scx_accel"]["to_gpu_anndata"]["transfer_mode"]`: `scx_device_decode_gpu`
 (in-VRAM decode, only the indptr uploaded — needs Scx1 count shards + decode
 sidecars) vs `scx_device_handoff_streamed` (host-bounce, used for mixed-codec /
-sidecar-less files). It's **≤VRAM only** (raises if the matrix won't fit) and may
-emit an `eager_assembly_memory_high` warning on large files — that's non-fatal;
-pass `var_names=`/`obs_filter=` to shrink the handoff. Read that warning's
-figure for what it says it is: an **assembly** estimate for `X` (plus
-`adata.raw` when the read includes it) and obs/var, so it is a floor on process
-RSS and not a number to size a job from — whatever consumes the matrix next is
-not in it.
+sidecar-less files). It's **≤VRAM only** (raises if the matrix won't fit). The
+device path assembles no host `X`, so it is not charged for one by the
+`eager_assembly_memory_high` budget; the host-assembling fallback is, and that
+warning is non-fatal — pass `var_names=`/`obs_filter=` to shrink the handoff.
+Read that warning's figure for what it says it is: an **assembly** estimate for
+`X` (plus `adata.raw` when the read includes it) and obs/var, so it is a floor
+on process RSS and not a number to size a job from — whatever consumes the
+matrix next is not in it.
 Env vars: `SCX_FORCE_NATIVE_GPU=1` pins surviving native GPU paths;
 `SCX_DISABLE_RAPIDS=1` forces the no-rapids CPU fallback for testing.
 

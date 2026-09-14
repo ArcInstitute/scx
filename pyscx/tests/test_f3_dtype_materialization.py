@@ -395,15 +395,74 @@ sp.save_npz({out!r}, a.X)
     np.testing.assert_array_equal(widened.indices, control.X.indices)
     np.testing.assert_array_equal(widened.data, control.X.data)
     np.testing.assert_array_equal(widened.toarray(), adata.X.toarray())
+
+
 def test_widen_leaves_an_explicit_index_dtype_alone(tmp_dir):
-    """An explicit `index_dtype=` is the caller's decision, threshold or not."""
+    """An explicit `index_dtype=` is the caller's decision, threshold or not.
+
+    `index_dtype="int32"` would NOT test this: that plan is still
+    `is_default_csr_f32()`, so the widen rewrites it and the assertion holds
+    either way. `int16` is the non-default branch the contract is about — the
+    read must take the narrowing typed path (and range-gate it) rather than
+    being silently promoted to int64 because the threshold was lowered.
+
+    scipy still hands back int32 (it canonicalizes in both directions on a
+    fixture this small), so the dtype is not the evidence; the evidence is that
+    the values survive the narrow, which they would not if the widen had
+    replaced the plan.
+    """
     adata = _counts_adata(n_obs=30, n_vars=10, seed=4)
     path = _write(tmp_dir, adata, name="explicit.scx")
+    out = str(tmp_dir / "explicit.npz")
     _run_with_threshold(
         f"""
-import numpy as np, pyscx
-a = pyscx.open({path!r}).to_anndata(index_dtype="int32")
-assert a.X.indices.dtype == np.int32, a.X.indices.dtype
+import numpy as np, pyscx, scipy.sparse as sp
+a = pyscx.open({path!r}).to_anndata(index_dtype="int16")
+assert a.X.data.dtype == np.float32, a.X.data.dtype
+sp.save_npz({out!r}, a.X)
 """,
         0,
     )
+    got = sp.load_npz(out)
+    np.testing.assert_array_equal(got.toarray(), adata.X.toarray())
+
+
+def test_widen_is_disabled_on_a_file_with_deletion_vectors(tmp_dir):
+    """Deletion vectors are applied *after* assembly, so the catalog's nnz is an
+    upper bound on what scipy is handed.
+
+    A file whose physical nnz crosses the line but whose live nnz does not would
+    get an int64 index buffer twice the size it needs **and** scipy's downcast
+    copy — strictly worse than the untouched f32 path, on exactly the
+    atlas-scale read the widen exists to make lighter. The live count is not
+    derivable from the catalog, so the widen is off for such files.
+
+    The threshold is lowered to 0 here, which is the "physically over the line"
+    half; the deletions are the "logically under it" half. What is asserted is
+    that the knob changes nothing: same rows, same values, both ways.
+
+    This is a correctness guard, not a memory one — dropping the gate would
+    still return the right matrix, just through a larger buffer. The gate itself
+    is pinned in Rust by
+    `widen_indices_only_touches_a_default_plan_over_the_line`.
+    """
+    adata = _counts_adata(n_obs=40, n_vars=12, seed=5)
+    path = _write(tmp_dir, adata, name="deleted.scx")
+    pyscx.mark_deleted(path, [0, 3, 7])
+
+    baseline = pyscx.open(path).to_anndata()
+    assert baseline.n_obs == 37, baseline.n_obs
+
+    out = str(tmp_dir / "deleted.npz")
+    _run_with_threshold(
+        f"""
+import numpy as np, pyscx, scipy.sparse as sp
+a = pyscx.open({path!r}).to_anndata()
+sp.save_npz({out!r}, a.X)
+""",
+        0,
+    )
+    got = sp.load_npz(out)
+    assert got.shape == baseline.X.shape
+    np.testing.assert_array_equal(got.toarray(), baseline.X.toarray())
+    np.testing.assert_array_equal(got.indices, baseline.X.indices)

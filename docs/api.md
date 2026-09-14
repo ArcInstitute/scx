@@ -558,7 +558,7 @@ recorded under `ProvenanceEntry.params_json.warnings`.
 | `BitmapSkipped { reason }` | Detection bitmap auto policy | `--bitmap auto` rejected emission (e.g. `n_vars > 1_000_000`, estimated bitmap size > 15% of encoded CSR, dense X). |
 | `DroppedObsp { name, reason }` | h5ad ingest (obsp/varp routing) and `scx merge` (multimodal) | A pairwise `obsp`/`varp` matrix could not be preserved: on ingest, a CSC or otherwise unsupported pairwise layout is dropped (CSR is stored directly; a **dense** pairwise matrix is preserved as nonzero COO, not dropped); on `scx merge`, a **modality-scoped** `obsp`/`varp` graph is dropped (the format has no per-modality pairwise reader), as is a **CSR-backed** `obsp` in any scope. A file-scope COO `obsp` is carried and rebased into the merged obs axis since Phase 5b — the older "axis semantics don't compose" was true of merge before that. Default-dropped with a warning. |
 | `MappingPeakFootprintHigh { mapping, estimated_bytes, budget_bytes }` | `pyscx.from_anndata` | A single mapping's estimated in-memory footprint exceeds `memory_budget`. |
-| `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes, nnz, wide_indices, dense_bytes }` | `Experiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. `estimated_bytes` covers **assembly** — `X`, `adata.raw` when the read includes it, and obs/var — and nothing that reads the matrix afterwards, so it is a floor on process RSS, not a job size; the message says so. `wide_indices` reports whether `nnz` crosses `i32::MAX`, where scipy holds int64 column indices (12 B/nnz rather than 8) and two thirds of the footprint is the index array. `dense_bytes` is `n_obs × n_vars × 4` and is `Some` only when `container="dense"` would genuinely be smaller. |
+| `EagerAssemblyMemoryHigh { estimated_bytes, budget_bytes, nnz, wide_indices, dense_request, dense_bytes }` | `Experiment.to_anndata` | Estimated eager assembly footprint exceeds `memory_budget` (default 8 GiB). Warn-only, does not block. `estimated_bytes` covers **assembly** — `X`, `adata.raw` when the read includes it, and obs/var — and nothing that reads the matrix afterwards, so it is a floor on process RSS, not a job size; the message says so. `wide_indices` reports whether `nnz` crosses `i32::MAX`, where scipy holds int64 column indices (12 B/nnz rather than 8) and two thirds of the footprint is the index array; it is always `false` under `dense_request`, which has no index array and whose size the nonzero count does not bound. `dense_bytes` is `n_obs × n_vars × value_width` and is `Some` only when this call assembles a host CSR `X` **and** dense would be smaller than that sparse `X` — compared against the `X` term alone, since a large `adata.raw` is assembled either way and would otherwise make a larger dense `X` look like a saving. |
 | `Hdf5NotThreadsafe` | Parallel streaming reader fallback | libhdf5 was not built thread-safe; parallel streaming fell back to the sequential coordinator. |
 | `DroppedRaw { raw_n_vars }` | `Experiment.to_anndata` | The file carries an `adata.raw` matrix but the current reconstruction mode (obs-filtered query, backed mode, or deletion-vectors active) cannot reproduce raw's obs-axis filtering, so raw is omitted. The on-disk raw sections are preserved. Pass `to_anndata(raw=False)` to opt out of raw entirely — no rebuild and no notice. |
 | `DroppedRawOnWrite { raw_n_vars, reason }` | `pyscx.from_anndata` with SCX-backed / lazy `X`; `from_h5ad` / `scx convert` with `--sort-by` / `--group-by` | The **source** carries raw that the file being written will not. Distinct from `DroppedRaw`: its "on-disk raw sections are preserved" reassurance is true of the source and says nothing about the output, where raw is gone for good. `reason` is supplied **per call site**, because the doors differ — the SCX → SCX rewrite loses raw because the in-memory AnnData does not hold it (convert from the h5ad instead), while reorder-on-convert loses it because raw streams unpermuted (convert without the reorder instead). A single baked-in remedy would be wrong on one of them. |
@@ -2170,9 +2170,16 @@ the repr onto `Experiment.info() -> str`, whose tokens now include
     includes it, and obs/var — and is a floor on process RSS rather than a
     figure a job can be sized from: whatever reads the matrix afterwards
     (scanpy's per-group copies, a write-back) is not in it and cannot be.
-    Per stored nonzero it counts the `f32` value plus the column-index width
-    the assembled CSR will actually hold: **8 B below `i32::MAX` nonzeros and
-    12 B above it**, where scipy resolves int64 indices. It was a flat 16 B —
+    It prices the plan the read will actually use: `container="dense"` is
+    `n_obs × n_vars × value_width` with no index array, and the value width
+    comes from `data_dtype` (a `float64` read holds 8 B per value). For a CSR
+    read it counts that value width plus the column-index width the assembled
+    CSR will hold — **4 B below `i32::MAX` nonzeros and 8 B above it**, which
+    is scipy's choice and not the caller's, so `index_dtype=` does not enter
+    into it. `to_gpu_anndata`'s device path assembles no host `X` and so is not
+    charged for one; its host-assembling fallback is. Counts are **physical**:
+    on a file with deletion vectors the matrix is assembled and then compacted,
+    so the estimate bounds the peak and overstates the steady state. It was a flat 16 B —
     right for a wide matrix before the widened decode below landed, and 2×
     conservative for every matrix under the line, which never paid an upcast.
     So a file between roughly 0.5 and 1 billion nonzeros no longer trips the
@@ -2379,7 +2386,7 @@ choice applied afterwards and cannot lose anything.
 |-------|--------|---------|-------|
 | `container` | `"csr"` \| `"dense"` | `"csr"` | `"dense"` returns a row-major `numpy.ndarray` (no scipy CSR) |
 | `data_dtype` | `float16/32/64`, `int8/16/32/64`, `uint8/16/32` | `None` → `float32` | numeric dtype of the values |
-| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` below `i32::MAX` nonzeros, `int64` above | CSR column-index dtype; ignored (warns) for `"dense"`. **Note:** `csr_matrix` resolves the index dtype from `max(nnz, n_rows)` and ignores the width it was handed, so on a matrix that fits in int32 **neither** `int16` nor `int64` survives — int16 is upcast, int64 is downcast, both to int32. The narrow int16 buffer is still built and range-gated on the way through (a column index ≥ 32768 fails loud). The default is resolved per matrix (`X` and `adata.raw` decide separately) — see **int64 above 2³¹ nonzeros** below |
+| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` below `i32::MAX` nonzeros, `int64` above (never on a file with deletion vectors) | CSR column-index dtype; ignored (warns) for `"dense"`. **Note:** `csr_matrix` resolves the index dtype from `max(nnz, n_rows)` and ignores the width it was handed, so on a matrix that fits in int32 **neither** `int16` nor `int64` survives — int16 is upcast, int64 is downcast, both to int32. The narrow int16 buffer is still built and range-gated on the way through (a column index ≥ 32768 fails loud). The default is resolved per matrix (`X` and `adata.raw` decide separately) — see **int64 above 2³¹ nonzeros** below |
 | `allow_lossy` | `bool` | `False` | fail-loud cast gate — see below |
 
 **Zero-copy default preserved.** `container="csr"` with no dtype kwargs takes the
@@ -2400,9 +2407,15 @@ whole extra index array is alive at the peak.
 
 The gate matters in both directions: at or below the line scipy **downcasts**
 int64 inputs, so widening a matrix that does not need it would add a copy rather
-than remove one. `X` and `adata.raw` decide independently, because scipy decides
-per `csr_matrix`. An explicit `index_dtype=` is never overridden, and
-`container="dense"` has no column-index array to widen.
+than remove one. That is also why it is **off entirely on a file with deletion
+vectors**: those are applied after assembly, so the catalog's nnz is an upper
+bound on what scipy is handed, and a matrix whose physical nnz is over the line
+but whose live nnz is under it would pay an oversized index buffer *and* the
+downcast copy. The live count is not derivable from the catalog, so such files
+keep the pre-existing behaviour exactly. `X` and `adata.raw` decide
+independently, because scipy decides per `csr_matrix`. An explicit
+`index_dtype=` is never overridden, and `container="dense"` has no column-index
+array to widen.
 `SCX_EAGER_INT64_NNZ_THRESHOLD` overrides the threshold; it exists so a small
 fixture can exercise the widened decode, not as a tuning knob — the threshold is
 scipy's, and below it the widen is a pessimization.

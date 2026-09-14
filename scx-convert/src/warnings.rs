@@ -188,8 +188,14 @@ pub enum ConvertWarning {
         /// Stored nonzeros in `X` (the estimate's dominant term).
         nnz: u64,
         /// `true` when `nnz` is above `i32::MAX`, so the assembled CSR holds
-        /// int64 column indices — 8 of the 12 bytes per nonzero.
+        /// int64 column indices — 8 of the 12 bytes per nonzero. Always `false`
+        /// for a dense request, which has no column-index array.
         wide_indices: bool,
+        /// `true` when the caller asked for `container="dense"`. The estimate is
+        /// then `n_obs × n_vars × value_width` and the nonzero count does not
+        /// bound it — saying "N nonzeros at 8 B each" would be describing a
+        /// buffer the read is not building.
+        dense_request: bool,
         /// `n_obs × n_vars × 4`, when `container="dense"` would be *smaller*
         /// than `estimated_bytes`. `None` when it would not be, or when the
         /// shape overflows.
@@ -382,6 +388,7 @@ impl fmt::Display for ConvertWarning {
                 budget_bytes,
                 nnz,
                 wide_indices,
+                dense_request,
                 dense_bytes,
             } => {
                 let gib = 1024.0 * 1024.0 * 1024.0;
@@ -390,7 +397,12 @@ impl fmt::Display for ConvertWarning {
                 // Why it is that big: the index array is two thirds of a wide
                 // matrix's footprint and nothing else surfaces that.
                 let n = group_thousands(*nnz);
-                let why = if *wide_indices {
+                let why = if *dense_request {
+                    format!(
+                        " A dense container is n_obs x n_vars x the value width, so the \
+                         {n} stored nonzeros do not bound it."
+                    )
+                } else if *wide_indices {
                     format!(
                         " {n} nonzeros at 12 B each: above 2^31 nonzeros scipy holds int64 \
                          column indices, which is two thirds of that."
@@ -563,6 +575,7 @@ mod tests {
             budget_bytes: 8_589_934_592,
             nnz: 1_000_000_000,
             wide_indices: false,
+            dense_request: false,
             dense_bytes: None,
         };
         let rendered = format!("{w}");
@@ -581,6 +594,27 @@ mod tests {
         // Must NOT leak the debug struct shape.
         assert!(!rendered.contains("EagerAssemblyMemoryHigh"), "{rendered}");
         assert!(!rendered.contains("estimated_bytes"), "{rendered}");
+    }
+
+    /// A `container="dense"` request is `n_obs x n_vars x value_width`; the
+    /// nonzero count does not bound it, and there is no column-index array for
+    /// the int64 story to be about. Saying "N nonzeros at 8 B each (int32
+    /// column indices)" there describes a buffer the read is not building.
+    #[test]
+    fn a_dense_request_is_not_explained_in_nonzeros() {
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 22_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: 1_000_000_000,
+            wide_indices: false,
+            dense_request: true,
+            dense_bytes: None,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("do not bound it"), "{rendered}");
+        assert!(rendered.contains("1,000,000,000"), "{rendered}");
+        assert!(!rendered.contains("column indices"), "{rendered}");
+        assert!(!rendered.contains("B each"), "{rendered}");
     }
 
     #[test]
@@ -605,6 +639,7 @@ mod tests {
             budget_bytes: 8_589_934_592,
             nnz: 2_650_704_199,
             wide_indices: true,
+            dense_request: false,
             dense_bytes: Some(23_600_000_000),
         };
         let rendered = format!("{wide}");
@@ -619,6 +654,7 @@ mod tests {
             budget_bytes: 8_589_934_592,
             nnz: 1_000_000_000,
             wide_indices: false,
+            dense_request: false,
             dense_bytes: None,
         };
         let rendered = format!("{narrow}");

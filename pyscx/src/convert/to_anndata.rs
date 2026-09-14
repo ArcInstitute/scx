@@ -147,19 +147,25 @@ pub(crate) fn int64_nnz_threshold() -> u64 {
 }
 
 /// Bytes the assembled CSR holds per stored nonzero, once scipy is done with
-/// it: 4 for the `f32` value plus the width of one column index.
+/// it: the value width plus the width of one column index.
 ///
 /// scipy resolves **one** index dtype for `indices` and `indptr` at
 /// `csr_matrix` construction, from `max(nnz, n_rows)` rather than from the
-/// arrays it was handed; above `i32::MAX` it picks int64. So a matrix over the
-/// line costs 12 B/nnz and one under it costs 8 — measured 11.9 B/nnz steady on
-/// a 2.65e9-nnz file.
-fn assembled_bytes_per_nnz(nnz: u64) -> u64 {
-    if nnz > SCIPY_INT64_NNZ_THRESHOLD {
-        12
-    } else {
+/// arrays it was handed; above `i32::MAX` it picks int64, at or below it picks
+/// int32 — in **both** directions, so the caller's `index_dtype=` does not enter
+/// into it. So a default-dtype matrix over the line costs 12 B/nnz and one under
+/// it costs 8 — measured 11.9 B/nnz steady on a 2.65e9-nnz file.
+///
+/// `value_bytes` does come from the caller's plan: a `data_dtype="float64"` read
+/// holds 8 B per value, not 4, and pricing it at `f32` understates the read by
+/// half its value buffer.
+fn assembled_bytes_per_nnz(nnz: u64, value_bytes: u64) -> u64 {
+    let index_bytes = if nnz > SCIPY_INT64_NNZ_THRESHOLD {
         8
-    }
+    } else {
+        4
+    };
+    value_bytes.saturating_add(index_bytes)
 }
 
 /// Whole-file nnz scaled to a gene projection.
@@ -196,6 +202,14 @@ fn scale_nnz_for_selection(nnz: u64, n_vars: u64, selected_vars: Option<usize>) 
 /// **downcasts** int64 inputs, so widening a matrix that does not need it would
 /// add a copy rather than remove one.
 ///
+/// Which is why `deletions_active` turns it off entirely. Deletion vectors are
+/// applied **after** assembly, so the catalog's `nnz` is an upper bound on what
+/// scipy is handed: a file whose physical nnz is over the line but whose live
+/// nnz is under it would get an int64 buffer twice the size it needs *and* then
+/// scipy's downcast copy — strictly worse than the untouched f32 path. The live
+/// count is not derivable from the catalog (there are no per-row nnz), so the
+/// conservative half is to leave such a file exactly as it is today.
+///
 /// Only a **default** plan is widened. An explicit `index_dtype=` is the
 /// caller's decision, and `container="dense"` has no column-index array (the
 /// dense reader pins `I32` internally regardless).
@@ -207,8 +221,21 @@ fn scale_nnz_for_selection(nnz: u64, n_vars: u64, selected_vars: Option<usize>) 
 pub(crate) fn widen_indices_for_scipy(
     plan: &scx_sparse::MaterializePlan,
     nnz: u64,
+    deletions_active: bool,
 ) -> scx_sparse::MaterializePlan {
-    if plan.is_default_csr_f32() && nnz > int64_nnz_threshold() {
+    widen_indices_for_scipy_at(plan, nnz, deletions_active, int64_nnz_threshold())
+}
+
+/// [`widen_indices_for_scipy`] against an explicit threshold, so a unit test can
+/// exercise both sides of the boundary without depending on a process-global
+/// `OnceLock` that the first eager read in the process has already fixed.
+fn widen_indices_for_scipy_at(
+    plan: &scx_sparse::MaterializePlan,
+    nnz: u64,
+    deletions_active: bool,
+    threshold: u64,
+) -> scx_sparse::MaterializePlan {
+    if plan.is_default_csr_f32() && !deletions_active && nnz > threshold {
         scx_sparse::MaterializePlan {
             index_dtype: scx_sparse::IndexDtype::I64,
             ..*plan
@@ -218,14 +245,26 @@ pub(crate) fn widen_indices_for_scipy(
     }
 }
 
-/// Catalog-only estimate of the bytes required to assemble the full X
-/// matrix — plus `adata.raw` when raw will be assembled too — and the
-/// obs / var metadata into an in-memory AnnData.
+/// Catalog-only estimate of the bytes this call will assemble into an in-memory
+/// AnnData: `X` when it builds one, `adata.raw` when it will build that too, and
+/// the obs / var metadata.
 ///
-/// Per matrix: `nnz × `[`assembled_bytes_per_nnz`] (the `f32` values plus the
-/// column-index width scipy will end up holding), `n_rows × 8` for the
-/// assembled CSR indptr (i64). Plus the on-disk size of every obs / var section
-/// (sharded or single). Walks `reader.catalog()` only — no payload reads.
+/// Priced from the plan the read will actually use, not from the default:
+///
+/// - `container="dense"` is `n_obs × n_vars × value_width` with no index array,
+///   which on a sparse matrix is *larger* than the CSR estimate, sometimes by
+///   orders of magnitude. Pricing a dense request from `nnz` let a read allocate
+///   tens of GiB without tripping the budget.
+/// - the value width comes from `data_dtype`; `float64` costs 8 B per value.
+/// - the index width is scipy's, not the caller's — see
+///   [`assembled_bytes_per_nnz`].
+///
+/// `MatrixMode::SkipX` assembles **no host X** (`to_gpu_anndata`'s device path
+/// decodes straight to the GPU), so X is excluded rather than counted. Its
+/// host-assembling fallback passes `Eager` and is counted.
+/// `MatrixMode::Skeleton` (the `var_names` projection) does build X, but through
+/// the projecting assembler, which is `f32`/`i32` whatever the plan says — so it
+/// is priced at the default width over the projected nnz.
 ///
 /// `raw_selected` must be the same predicate [`attach_raw`] applies, or the
 /// estimate describes a matrix that is not built (or misses one that is).
@@ -233,15 +272,21 @@ pub(crate) fn widen_indices_for_scipy(
 /// and cast afterwards, and which of them are eager depends on a filter this
 /// function cannot see. The warning says what it covers for that reason.
 ///
-/// Takes the catalog and `n_vars` rather than the reader because that is all it
+/// **Deletion vectors:** the catalog's counts are *physical*. A file with
+/// deletions assembles the physical matrix and compacts it, so the estimate is
+/// an upper bound on the steady state and an accurate one for the peak.
+///
+/// Takes the catalog and the shape rather than the reader because that is all it
 /// reads, which is also what makes it unit-testable against a synthetic catalog
 /// — the same reasoning as [`decode_window`].
 pub(crate) fn estimate_eager_assembly_bytes(
     catalog: &scx_format_io::FullCatalog,
-    n_vars: u64,
-    selected_vars: Option<usize>,
+    shape: (u64, u64),
+    mode: MatrixMode,
     raw_selected: bool,
+    plan: &scx_sparse::MaterializePlan,
 ) -> u64 {
+    let (n_obs, n_vars) = shape;
     let entries = &catalog.entries;
     let mut nnz: u64 = 0;
     let mut x_rows: u64 = 0;
@@ -266,24 +311,48 @@ pub(crate) fn estimate_eager_assembly_bytes(
             _ => {}
         }
     }
-    nnz = scale_nnz_for_selection(nnz, n_vars, selected_vars);
+    let value_bytes = plan.data_dtype.size_bytes();
+    let x_bytes = match mode {
+        // No host X on this path at all.
+        MatrixMode::SkipX => 0,
+        // The projecting assembler, which is f32/i32 regardless of the plan.
+        MatrixMode::Skeleton { n_selected_vars } => {
+            let projected = scale_nnz_for_selection(nnz, n_vars, Some(n_selected_vars));
+            projected
+                .saturating_mul(assembled_bytes_per_nnz(projected, 4))
+                .saturating_add(x_rows.saturating_mul(8))
+        }
+        MatrixMode::Eager => match plan.container {
+            scx_sparse::Container::Dense => dense_bytes_for(n_obs, n_vars, value_bytes),
+            scx_sparse::Container::Csr => nnz
+                .saturating_mul(assembled_bytes_per_nnz(nnz, value_bytes))
+                .saturating_add(x_rows.saturating_mul(8)),
+        },
+    };
     // `adata.raw` is a second whole matrix on the same obs axis, with its own
     // (wider) gene axis and its own index-width decision — scipy resolves one
-    // dtype per `csr_matrix`, not one per AnnData. Counting it with X's
-    // per-nnz cost would be wrong on a file where only one of them crosses the
-    // line.
+    // dtype per `csr_matrix`, not one per AnnData. Counting it with X's per-nnz
+    // cost would be wrong on a file where only one of them crosses the line.
+    // Raw stays CSR even under `container="dense"` (the conventional raw
+    // representation), so it is never priced dense.
     let raw_bytes = if raw_selected {
         let raw_nnz = catalog.raw_csr_total_nnz();
         raw_nnz
-            .saturating_mul(assembled_bytes_per_nnz(raw_nnz))
+            .saturating_mul(assembled_bytes_per_nnz(raw_nnz, value_bytes))
             .saturating_add(x_rows.saturating_mul(8))
     } else {
         0
     };
-    nnz.saturating_mul(assembled_bytes_per_nnz(nnz))
-        .saturating_add(x_rows.saturating_mul(8))
-        .saturating_add(meta_bytes)
-        .saturating_add(raw_bytes)
+    x_bytes.saturating_add(meta_bytes).saturating_add(raw_bytes)
+}
+
+/// `n_obs × n_vars × value_width`, saturating — the size of a dense `X`.
+///
+/// Shared by the estimate (for a `container="dense"` request) and by the
+/// warning's "dense would be smaller" suggestion, so the number the message
+/// offers and the number it would be compared against cannot disagree.
+fn dense_bytes_for(n_obs: u64, n_vars: u64, value_bytes: u64) -> u64 {
+    n_obs.saturating_mul(n_vars).saturating_mul(value_bytes)
 }
 
 // The decode-loss guard folds `ShardStats::value_max` over the shards in scope
@@ -338,38 +407,62 @@ pub(crate) fn to_anndata_with_layers<'py>(
     let budget = memory_budget.unwrap_or(DEFAULT_EAGER_MEMORY_BUDGET_BYTES);
     let x_nnz = reader.catalog().csr_total_nnz(Some(0));
     let raw_selected = filters.raw && reader.has_raw() && !reader.header().has_deletion_vectors();
-    let selected_vars = match mode {
-        MatrixMode::Skeleton { n_selected_vars } => Some(n_selected_vars),
-        _ => None,
-    };
+
+    let deletions_active = reader.header().has_deletion_vectors();
+
+    // Priced from the plan the read will actually use, so a `container="dense"`
+    // or `data_dtype="float64"` request is estimated as itself rather than as a
+    // default f32 CSR.
     let est_bytes = estimate_eager_assembly_bytes(
         reader.catalog(),
-        reader.n_vars(),
-        selected_vars,
+        (reader.n_obs(), reader.n_vars()),
+        mode,
         raw_selected,
+        plan,
     );
     if est_bytes > budget {
-        let n_obs = reader.n_obs();
-        let n_vars = reader.n_vars();
         // The count the message quotes is the one the assembled matrix will
         // have — a gene projection builds fewer, and it is that matrix scipy
         // picks an index dtype for.
-        let reported_nnz = scale_nnz_for_selection(x_nnz, n_vars, selected_vars);
-        // Dense is `n_obs × n_vars × 4` (f32, no index array). Offered only when
-        // it is actually smaller than the sparse estimate — at 44.9 % density
-        // with int64 indices it is, which is the case worth naming; below the
-        // crossover the advice would cost memory.
-        let dense_bytes = n_obs
-            .checked_mul(n_vars)
-            .and_then(|cells| cells.checked_mul(4))
-            .filter(|d| *d < est_bytes);
+        let selected_vars = match mode {
+            MatrixMode::Skeleton { n_selected_vars } => Some(n_selected_vars),
+            _ => None,
+        };
+        let reported_nnz = scale_nnz_for_selection(x_nnz, reader.n_vars(), selected_vars);
+        // Offer `container="dense"` only when it is advice this call could take
+        // and would gain from:
+        //
+        // - only when this call assembles a host CSR `X` (`Eager` + `Csr`) —
+        //   `to_gpu_anndata`'s `SkipX` path rejects a non-default container
+        //   outright, and the projected path is not this assembler;
+        // - compared against the **sparse X term alone**, not `est_bytes`. A
+        //   large `adata.raw` inflates the total, and raw is assembled either
+        //   way, so comparing against the total could recommend a dense X that
+        //   is larger than the sparse one it replaces.
+        let dense_request = plan.container == scx_sparse::Container::Dense;
+        let dense_bytes = match (mode, plan.container) {
+            (MatrixMode::Eager, scx_sparse::Container::Csr) => {
+                let sparse_x = x_nnz
+                    .saturating_mul(assembled_bytes_per_nnz(x_nnz, plan.data_dtype.size_bytes()));
+                let dense = dense_bytes_for(
+                    reader.n_obs(),
+                    reader.n_vars(),
+                    plan.data_dtype.size_bytes(),
+                );
+                (dense > 0 && dense < sparse_x).then_some(dense)
+            }
+            _ => None,
+        };
         warn_python_convert(
             py,
             &scx_convert::ConvertWarning::EagerAssemblyMemoryHigh {
                 estimated_bytes: est_bytes,
                 budget_bytes: budget,
                 nnz: reported_nnz,
-                wide_indices: reported_nnz > SCIPY_INT64_NNZ_THRESHOLD,
+                // A dense read has no column-index array, so the int64 story
+                // does not apply to it whatever the nonzero count is.
+                wide_indices: !dense_request && reported_nnz > SCIPY_INT64_NNZ_THRESHOLD,
+                dense_request,
                 dense_bytes,
             },
         )?;
@@ -392,7 +485,7 @@ pub(crate) fn to_anndata_with_layers<'py>(
     // scipy's own upcast copy. Identical result, one fewer whole index array
     // alive at the peak. Scoped to this read: the caller's `plan` is untouched,
     // so nothing else that branches on `is_default_csr_f32()` moves.
-    let x_plan = widen_indices_for_scipy(plan, x_nnz);
+    let x_plan = widen_indices_for_scipy(plan, x_nnz, deletions_active);
 
     // X — assemble all CSR shards (with deletion vector filtering).
     //
@@ -1110,7 +1203,13 @@ pub(crate) fn attach_raw(
     // Raw decides its own index width: it is a separate `csr_matrix` on a wider
     // gene axis, and scipy resolves the dtype per matrix. See
     // `widen_indices_for_scipy`.
-    let raw_plan = widen_indices_for_scipy(plan, reader.catalog().raw_csr_total_nnz());
+    // `attach_raw` returns early on a file with deletion vectors, so the flag is
+    // belt and braces here — but it is the same rule, spelled once.
+    let raw_plan = widen_indices_for_scipy(
+        plan,
+        reader.catalog().raw_csr_total_nnz(),
+        reader.header().has_deletion_vectors(),
+    );
     let raw_x = if raw_plan.is_default_csr_f32() {
         let raw_csr = reader.read_all_raw_csr_shards().map_err(to_pyerr)?;
         csr_to_scipy(py, raw_csr)?
@@ -2364,7 +2463,7 @@ mod tests {
     }
 
     /// The per-nonzero constant follows the index width the reader will
-    /// actually hold: 8 B below `i32::MAX` nonzeros, 12 above it.
+    /// actually hold: 8 B below `i32::MAX` nonzeros, 12 above.
     ///
     /// It was a flat 16 — right for a wide matrix *before* the widened decode
     /// landed (i32 + f32 alive while scipy wrote its i64 copy), and 2x
@@ -2373,42 +2472,18 @@ mod tests {
     #[test]
     fn the_estimate_follows_the_index_width_the_reader_holds() {
         let rows = 1_000u64;
+        let plan = scx_sparse::MaterializePlan::default_csr_f32();
         let narrow = nnz_catalog(SectionType::CsrShard, 4, 1_000_000, rows / 4);
         assert_eq!(
-            estimate_eager_assembly_bytes(&narrow, 500, None, false),
+            estimate_eager_assembly_bytes(&narrow, (rows, 500), MatrixMode::Eager, false, &plan),
             1_000_000 * 8 + rows * 8
         );
 
         let wide_nnz = SCIPY_INT64_NNZ_THRESHOLD + 1_000;
         let wide = nnz_catalog(SectionType::CsrShard, 4, wide_nnz, rows / 4);
         assert_eq!(
-            estimate_eager_assembly_bytes(&wide, 500, None, false),
+            estimate_eager_assembly_bytes(&wide, (rows, 500), MatrixMode::Eager, false, &plan),
             wide_nnz * 12 + rows * 8
-        );
-    }
-
-    /// The estimate's per-nonzero cost is keyed to **scipy's** threshold, not to
-    /// the one `SCX_EAGER_INT64_NNZ_THRESHOLD` moves.
-    ///
-    /// Moving that knob changes what pyscx decodes and changes nothing about
-    /// what scipy then holds, so keying both off it makes the estimate describe
-    /// a matrix that is not the one being built. Caught by the real-object A/B,
-    /// whose control arm (knob pinned past `u64`'s reach) quoted ~19.9 GiB for
-    /// an assembly that peaked at 43.05 GiB and held int64 indices throughout.
-    #[test]
-    fn the_estimates_per_nnz_cost_is_scipys_threshold_not_the_knob() {
-        assert_eq!(SCIPY_INT64_NNZ_THRESHOLD, i32::MAX as u64);
-        assert_eq!(assembled_bytes_per_nnz(SCIPY_INT64_NNZ_THRESHOLD), 8);
-        assert_eq!(assembled_bytes_per_nnz(SCIPY_INT64_NNZ_THRESHOLD + 1), 12);
-        // And it does not consult the overridable one. Under the default they
-        // are equal, so the assertion above is what pins the boundary; this is
-        // the statement of intent a future edit has to contradict on purpose.
-        assert_eq!(
-            assembled_bytes_per_nnz(SCIPY_INT64_NNZ_THRESHOLD + 1),
-            12,
-            "per-nnz cost must not move when int64_nnz_threshold() is overridden \
-             (currently {})",
-            int64_nnz_threshold()
         );
     }
 
@@ -2420,45 +2495,124 @@ mod tests {
     #[test]
     fn the_estimate_counts_raw_only_when_raw_is_assembled() {
         let rows = 1_000u64;
+        let plan = scx_sparse::MaterializePlan::default_csr_f32();
         let mut cat = nnz_catalog(SectionType::CsrShard, 2, 1_000_000, rows / 2);
         let raw = nnz_catalog(SectionType::RawCsrShard, 2, 4_000_000, rows / 2);
         cat.entries.extend(raw.entries);
 
         let x_only = 1_000_000 * 8 + rows * 8;
         assert_eq!(
-            estimate_eager_assembly_bytes(&cat, 500, None, false),
+            estimate_eager_assembly_bytes(&cat, (rows, 500), MatrixMode::Eager, false, &plan),
             x_only
         );
         assert_eq!(
-            estimate_eager_assembly_bytes(&cat, 500, None, true),
+            estimate_eager_assembly_bytes(&cat, (rows, 500), MatrixMode::Eager, true, &plan),
             x_only + 4_000_000 * 8 + rows * 8
         );
     }
 
-    /// Only a default plan is widened, and only above the threshold. An
-    /// explicit `index_dtype=` is the caller's decision; `container="dense"`
-    /// has no column-index array at all.
+    /// The estimate prices the plan the read will use, not the default.
+    ///
+    /// `container="dense"` is `n_obs × n_vars × value_width` with no index
+    /// array. Pricing it from `nnz` is the dangerous direction: a sparse matrix
+    /// can allocate tens of GiB dense while the nnz estimate stays under the
+    /// budget, so no warning fires at all. A wide `data_dtype` is undercounted
+    /// the same way — by half its value buffer for `float64`.
+    #[test]
+    fn the_estimate_prices_the_container_and_value_width_it_was_asked_for() {
+        let (rows, cols) = (1_000u64, 4_000u64);
+        // 0.25 % dense: the shape where the two containers disagree most.
+        let cat = nnz_catalog(SectionType::CsrShard, 4, 10_000, rows / 4);
+        let csr = scx_sparse::MaterializePlan::default_csr_f32();
+
+        let sparse =
+            estimate_eager_assembly_bytes(&cat, (rows, cols), MatrixMode::Eager, false, &csr);
+        assert_eq!(sparse, 10_000 * 8 + rows * 8);
+
+        let dense_plan = scx_sparse::MaterializePlan {
+            container: scx_sparse::Container::Dense,
+            ..csr
+        };
+        let dense = estimate_eager_assembly_bytes(
+            &cat,
+            (rows, cols),
+            MatrixMode::Eager,
+            false,
+            &dense_plan,
+        );
+        assert_eq!(dense, rows * cols * 4);
+        assert!(dense > 40 * sparse, "dense {dense} vs sparse {sparse}");
+
+        let f64_plan = scx_sparse::MaterializePlan {
+            data_dtype: scx_sparse::ValueDtype::F64,
+            ..csr
+        };
+        assert_eq!(
+            estimate_eager_assembly_bytes(&cat, (rows, cols), MatrixMode::Eager, false, &f64_plan),
+            10_000 * 12 + rows * 8,
+            "float64 values are 8 B, not 4"
+        );
+    }
+
+    /// `MatrixMode::SkipX` assembles no host `X` — `to_gpu_anndata`'s device
+    /// path decodes straight to the GPU — so counting one described memory that
+    /// is never allocated. Its host-assembling fallback passes `Eager` and is
+    /// still counted.
+    #[test]
+    fn the_estimate_excludes_x_when_no_host_x_is_assembled() {
+        let (rows, cols) = (1_000u64, 500u64);
+        let plan = scx_sparse::MaterializePlan::default_csr_f32();
+        let cat = nnz_catalog(SectionType::CsrShard, 4, 1_000_000, rows / 4);
+        assert_eq!(
+            estimate_eager_assembly_bytes(&cat, (rows, cols), MatrixMode::SkipX, false, &plan),
+            0,
+            "the only terms left are obs/var sections, and the stub carries none"
+        );
+        assert!(
+            estimate_eager_assembly_bytes(&cat, (rows, cols), MatrixMode::Eager, false, &plan) > 0
+        );
+    }
+
+    /// Only a default plan is widened, only above the threshold, and never on a
+    /// file with deletion vectors.
+    ///
+    /// An explicit `index_dtype=` is the caller's decision; `container="dense"`
+    /// has no column-index array at all; and a deletion-bearing file's catalog
+    /// nnz is an upper bound on what scipy sees, so widening from it can cost
+    /// an oversized buffer *and* scipy's downcast copy.
+    ///
+    /// Takes the threshold explicitly rather than reading `int64_nnz_threshold()`
+    /// — that is a `OnceLock` the first eager read in the process fixes, so a
+    /// test that depended on it would depend on test order.
     #[test]
     fn widen_indices_only_touches_a_default_plan_over_the_line() {
         use scx_sparse::{Container, IndexDtype, MaterializePlan, ValueDtype};
 
-        let threshold = int64_nnz_threshold();
+        let t = SCIPY_INT64_NNZ_THRESHOLD;
         let default = MaterializePlan::default_csr_f32();
 
         assert_eq!(
-            widen_indices_for_scipy(&default, threshold).index_dtype,
+            widen_indices_for_scipy_at(&default, t, false, t).index_dtype,
             IndexDtype::I32,
             "at the threshold scipy still fits int32"
         );
         assert_eq!(
-            widen_indices_for_scipy(&default, threshold + 1).index_dtype,
+            widen_indices_for_scipy_at(&default, t + 1, false, t).index_dtype,
             IndexDtype::I64
         );
         // Everything else about the plan is carried through untouched.
-        let widened = widen_indices_for_scipy(&default, threshold + 1);
+        let widened = widen_indices_for_scipy_at(&default, t + 1, false, t);
         assert_eq!(widened.container, default.container);
         assert_eq!(widened.data_dtype, default.data_dtype);
         assert_eq!(widened.allow_lossy, default.allow_lossy);
+
+        // Deletion vectors: physical nnz is over the line, live nnz may not be,
+        // and the catalog cannot tell us which. Do not widen.
+        assert_eq!(
+            widen_indices_for_scipy_at(&default, t + 1, true, t).index_dtype,
+            IndexDtype::I32,
+            "a deletion-bearing file keeps today's behaviour"
+        );
 
         // An explicit narrow index request is left alone even over the line —
         // it will fail loud in the cast gate, which is the honest answer.
@@ -2467,7 +2621,7 @@ mod tests {
             ..default
         };
         assert_eq!(
-            widen_indices_for_scipy(&explicit, threshold + 1).index_dtype,
+            widen_indices_for_scipy_at(&explicit, t + 1, false, t).index_dtype,
             IndexDtype::I16
         );
         // A non-default value dtype is already off the zero-copy path.
@@ -2476,7 +2630,7 @@ mod tests {
             ..default
         };
         assert_eq!(
-            widen_indices_for_scipy(&narrowed, threshold + 1).index_dtype,
+            widen_indices_for_scipy_at(&narrowed, t + 1, false, t).index_dtype,
             IndexDtype::I32
         );
         let dense = MaterializePlan {
@@ -2484,7 +2638,13 @@ mod tests {
             ..default
         };
         assert_eq!(
-            widen_indices_for_scipy(&dense, threshold + 1).index_dtype,
+            widen_indices_for_scipy_at(&dense, t + 1, false, t).index_dtype,
+            IndexDtype::I32
+        );
+
+        // The public form is the same rule at the process threshold.
+        assert_eq!(
+            widen_indices_for_scipy(&default, int64_nnz_threshold(), false).index_dtype,
             IndexDtype::I32
         );
     }
