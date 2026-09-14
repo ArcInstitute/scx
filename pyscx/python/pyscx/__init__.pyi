@@ -465,11 +465,11 @@ class SparseCellSetDataset:
 
         `reader_limit` is reported but deliberately **not** in `breakdown`: the
         breakdown is the byte model the shard cache is sized against, and an
-        open reader's ~101 kB is not one of its terms. Charging readers there
+        open reader's ~104 kB is not one of its terms. Charging readers there
         would shrink the cache by something the tuner has never accounted for;
         reporting the cap here says what the knob is without pretending it is
         priced. At `None` every file in the manifest stays open, which on a
-        26k-file manifest is ~2.9 GB that no budget here describes."""
+        26k-file manifest is ~2.8-3.2 GB that no budget here describes."""
         ...
 
     def suggested_cache_shards(

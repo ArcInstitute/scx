@@ -558,7 +558,7 @@ per catalog entry, so it scales with shards per file rather than cells:
 
 | manifest | per open reader | 26,453 files |
 |---|---|---|
-| `tabula_sapiens_100k` | ~106 kB | ~2.8 GB |
+| `tabula_sapiens_100k` | ~104 kB | ~2.8 GB |
 | `census_1m` | ~121 kB | ~3.2 GB |
 
 Per process, before multiplying by DataLoader workers and ranks.

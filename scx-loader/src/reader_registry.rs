@@ -21,12 +21,15 @@
 //!
 //! ```text
 //! ScxReader alone                       91.8 kB
-//! + BackedCsrReader wrapper            101.0 kB   (tabula_sapiens_100k)
-//!                                      118.8 kB   (census_1m)
+//! + BackedCsrReader wrapper            104.4 kB   (tabula_sapiens_100k)
+//!                                      120.6 kB   (census_1m)
 //! ```
 //!
-//! At 26,453 files — a real consumer manifest size — that is ~2.9 GB per
-//! process, before multiplying by DataLoader workers and ranks.
+//! At 26,453 files — a real consumer manifest size — that is ~2.8-3.2 GB per
+//! process, before multiplying by DataLoader workers and ranks. `reader_limit`
+//! brings it down 66-76x; the capture is
+//! `benchmarks/scripts/measure_reader_registry_rss.py` and its rows are under
+//! `results/raw/phase2_reader_registry/`.
 //!
 //! The consequence for this module is counter-intuitive and load-bearing:
 //! **eviction must drop the catalog, and a reopen must re-parse it.** The
@@ -113,7 +116,7 @@ struct FileSlot {
     /// mutex, and `bucket_plan_rows` asks `shard_for_row` **once per row**, so
     /// the default path would have acquired a lock per row of every plan to
     /// save `n_shards x 24 B` per file — about 1.5 kB on census_1m's 62 shards,
-    /// against the ~119 kB the handle itself costs.
+    /// against the ~121 kB the handle itself costs.
     index: BackedCsrIndex,
     /// Stamped at first open, compared on every reopen. `None` at
     /// `reader_limit = None`, where no reopen can happen and the `stat` it

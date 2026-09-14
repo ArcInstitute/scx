@@ -8,7 +8,7 @@
 //! holds N mappings and **zero** descriptors — measured on the real Python
 //! constructor, a 5,000-file manifest constructs and gathers under
 //! `ulimit -n 1024` with the process's descriptor count flat. What an open
-//! reader costs is ~101 kB resident, over 90 % of it the parsed `FullCatalog`.
+//! reader costs is ~104 kB resident, over 90 % of it the parsed `FullCatalog`.
 //! `reader_limit` bounds how many of those exist at once.
 //!
 //! Every file here carries a distinct `tag` in its values, so a registry that

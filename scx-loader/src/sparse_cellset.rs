@@ -400,7 +400,7 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
 /// column count, the catalog's shard stats, the row count and the shard index —
 /// comes from its catalog, so there is no way to learn it without opening the
 /// file. What a bounded scan changes is not *whether* each file is opened but
-/// how many are open **at once**, which is the term that costs ~101 kB of
+/// how many are open **at once**, which is the term that costs ~104 kB of
 /// resident memory apiece (see [`crate::reader_registry`]).
 struct ManifestScan {
     files: Vec<ScannedFile>,
@@ -554,8 +554,8 @@ impl SparseCellSetLoader {
     /// `reader_limit = None` is the default and opens everything, exactly as
     /// [`SparseCellSetLoader::new`] does — identical sizing, identical gather
     /// output, and nothing ever reopened. A `Some(k)` trades resident memory
-    /// for reopens: each open reader costs ~101 kB, over 90 % of it the parsed
-    /// `FullCatalog`, which at a 26 k-file manifest is ~2.9 GB per process.
+    /// for reopens: each open reader costs ~104 kB, over 90 % of it the parsed
+    /// `FullCatalog`, which at a 26 k-file manifest is ~2.8-3.2 GB per process.
     /// A reopen re-parses that catalog, which is what makes the saving real —
     /// see [`crate::reader_registry`].
     ///

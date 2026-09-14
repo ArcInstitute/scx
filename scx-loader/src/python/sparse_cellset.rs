@@ -133,8 +133,8 @@ impl SparseCellSetDataset {
     ///         mappings and no descriptors — measured, a 5,000-file manifest
     ///         constructs and gathers under a 1024 descriptor limit with the
     ///         process's descriptor count flat. What an open reader does cost
-    ///         is ~101 kB resident, over 90% of it the parsed `FullCatalog`;
-    ///         at 26k files that is ~2.9 GB per process, before multiplying by
+    ///         is ~104 kB resident, over 90% of it the parsed `FullCatalog`;
+    ///         at 26k files that is ~2.8-3.2 GB per process, before multiplying by
     ///         DataLoader workers and ranks. The saving is real only because
     ///         an eviction drops that catalog and a reopen re-parses it
     ///         (0.09-20 ms per file), so set this when the manifest is large
