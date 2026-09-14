@@ -3175,10 +3175,14 @@ Raw rows: `results/raw/phase2_reader_registry/manifest_rss.json`, produced by
 **What this does not say.** These are allocation counts around one constructor,
 not throughput. Nothing here measures what a bounded limit costs a *gather*: a
 plan that fans across more files than the limit reopens on every batch, and no
-arm at a bounded limit was timed, so no floor is proposed for one. The default
-`reader_limit=None` path is covered separately by the `cellset_gather` A/B
-below; the change it has to survive is that the engine now hands out a leased
-`Arc` from a mutex-guarded map where it previously indexed an array.
+arm at a bounded limit was timed, so no floor is proposed for one.
+
+The default `reader_limit=None` path raises a separate question these numbers do
+not answer: the engine now hands out a leased `Arc` from a mutex-guarded map
+where it previously indexed an array, and `plan_footprint` takes a lease per
+touched file. That is a throughput question, measured by a two-build
+`cellset_gather` A/B (`benchmarks/scripts/_run_phase2_reader_registry_ab.sh`) on
+the same paired/sign-test design phase 1 used.
 
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
