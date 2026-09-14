@@ -611,6 +611,70 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
     assert_eq!(b.library_size[1], 6.0);
 }
 
+/// Two rows of ONE set, one shared query panel, different withheld genes.
+///
+/// The per-set `query` and the per-row `enc_mask_positions` are sliced on
+/// different axes (`sparse_cellset.rs`'s rayon row loop takes `query` at
+/// `s * k_dec` and the mask at `r * k_dec`), which is exactly why the withheld
+/// set may not be hoisted out of the row loop: hoisting applies row 0's bits to
+/// every row of the set. Nothing covered that — the one pre-existing
+/// `collate_gathered` test passes an empty mask, and every masking test in
+/// `sparse_cellset_collate_tests.rs` drives a single cell through
+/// `collate_cell`, where a one-row set cannot tell the two axes apart.
+///
+/// Built from synthetic CSR rather than a real gather because the shared
+/// fixture writes one non-zero per row, and a one-gene cell has no top-K to
+/// withhold from.
+#[test]
+fn collate_gathered_applies_each_rows_own_mask_within_a_set() {
+    use crate::sparse_cellset_collate::PreprocessMode;
+
+    // Two identical cells: genes [1,3,5] with counts [3,2,1] (already rank
+    // order, so `order` is [1,3,5] and `take` is the whole row at k_enc=3).
+    let indptr = [0i64, 3, 6];
+    let indices = [1i32, 3, 5, 1, 3, 5];
+    let data = [3.0f32, 2.0, 1.0, 3.0, 2.0, 1.0];
+    let set_offsets = [0i64, 2]; // ONE set spanning both rows
+
+    let scalars = CollateScalars {
+        k_enc: 3,
+        // PassThrough so encoder counts are the raw values and compare exactly.
+        mode: PreprocessMode::PassThrough,
+        target_sum: 1e4,
+        pflog_alpha: None,
+        n_genes_total: 8, // ⇒ GENE_MASK = 8, PAD = 9
+        lib_size_redef: false,
+    };
+    let b = collate_gathered(
+        &indptr,
+        &indices,
+        &data,
+        &set_offsets,
+        vec![0u64, 1],
+        vec![0u32, 0],
+        vec![0i32, 0],
+        /*k_dec*/ 3,
+        /*query, per SET*/ &[1, 3, 5],
+        // Per ROW, k_dec each: row 0 withholds gene 1, row 1 withholds gene 5.
+        /*enc_mask_positions*/
+        &[1, 0, 0, 0, 0, 1],
+        &[0, 0],
+        &[3],
+        &scalars,
+    )
+    .unwrap();
+
+    // Row 0 drops gene 1, survivors compact left.
+    assert_eq!(&b.encoder_gene_ids[0..3], &[3, 5, 9]);
+    assert_eq!(&b.encoder_counts[0..3], &[2.0, 1.0, 0.0]);
+    // Row 1 drops gene 5 — NOT gene 1. This is the assertion a hoist breaks.
+    assert_eq!(&b.encoder_gene_ids[3..6], &[1, 3, 9]);
+    assert_eq!(&b.encoder_counts[3..6], &[3.0, 2.0, 0.0]);
+    // Neither row is all-masked, so no GENE_MASK token and no set expr mask.
+    assert_eq!(&b.encoder_mask[0..6], &[0, 0, 0, 0, 0, 0]);
+    assert_eq!(&b.encoder_pad_mask[0..6], &[0, 0, 1, 0, 0, 1]);
+}
+
 #[test]
 fn malformed_plan_file_id_out_of_range_returns_error_not_panic() {
     let dir = tempfile::tempdir().unwrap();

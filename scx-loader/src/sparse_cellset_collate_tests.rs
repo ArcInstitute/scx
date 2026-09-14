@@ -39,11 +39,18 @@ fn run(
         pad: vec![0; cfg.k_enc],
         target: vec![0.0; query.len()],
     };
+    // The index is the caller's job and is built from `query` here exactly as
+    // `collate_gathered` builds it per set, so every test drives the real
+    // pairing rather than a test-only shortcut.
+    let idx = enc_mask_positions.map(|_| SetQueryIndex::new(query));
     let cin = CellIn {
         gene_ids,
         raw,
         query,
-        enc_mask_positions,
+        mask: enc_mask_positions.map(|positions| RowMask {
+            positions,
+            index: idx.as_ref().unwrap(),
+        }),
         hide_readout: hide,
     };
     let lib = {
@@ -425,3 +432,59 @@ fn normalize_log1p_zero_library_uses_factor_one() {
 /// blake3 prefix of `tests/data/encoder_crop_golden.json`. The state3 copy must be
 /// byte-identical; `state3/tests/_gen_encoder_crop_golden.py --check` verifies both.
 const ENCODER_GOLDEN_BLAKE3_PREFIX: &str = "e7b2ef4fceecf514";
+
+/// One gene id at two query positions, flagged at only one of them.
+///
+/// `query` is not deduplicated anywhere: the only in-repo producer draws it
+/// with `replace=True` whenever a set holds fewer than `k_dec` distinct genes
+/// (`benchmarks/.../cellset_gather.py::_collate_inputs`), so a repeated id is
+/// reachable on real input. The set-of-ids semantics this pins is "withheld iff
+/// **any** flagged position carries that id" — the `filter(m != 0).map(g)`
+/// collect, mirroring Python's `query_gene_ids[role_target_mask]`.
+///
+/// A lookup that stops at the first matching position instead of folding over
+/// the whole equal-id run silently answers "kept" here.
+#[test]
+fn duplicate_query_ids_withhold_if_any_flagged_position() {
+    let c = cfg(PreprocessMode::PassThrough, 3);
+    // order = [1(3), 3(2), 5(1)]; take = 3, so the whole row is selected.
+    let (b, _) = run(
+        &[1, 3, 5],
+        &[3.0, 2.0, 1.0],
+        // gene 3 twice: position 0 unflagged, position 1 flagged.
+        &[3, 3, 1],
+        Some(&[0, 1, 0]),
+        false,
+        &c,
+    );
+    assert_eq!(b.ids, vec![1, 5, PAD]);
+    assert_eq!(b.counts, vec![3.0, 1.0, 0.0]);
+    assert_eq!(b.mask, vec![0, 0, 0]);
+    assert_eq!(b.pad, vec![0, 0, 1]);
+}
+
+/// An unsorted query panel: the mask bit lives at the id's ORIGINAL position.
+///
+/// `query` carries no ordering contract (only `gene_ids` does), and 8 of the 9
+/// golden cases are in fact unsorted. A lookup that sorts the panel must carry
+/// each id's original index with it and read `enc_mask_positions` there — using
+/// the id's rank in the sorted order instead reads a different row's bit and,
+/// on this input, answers "kept" for a gene that was withheld.
+#[test]
+fn unsorted_query_positions_index_the_mask_at_the_original_offset() {
+    let c = cfg(PreprocessMode::PassThrough, 3);
+    // query [5,1,3] sorts to [1,3,5] with original positions [1,2,0]; the flag
+    // is at position 2, which is rank 1. Reading rank instead of position finds
+    // the unset bit at index 1.
+    let (b, _) = run(
+        &[1, 3, 5],
+        &[3.0, 2.0, 1.0],
+        &[5, 1, 3],
+        Some(&[0, 0, 1]),
+        false,
+        &c,
+    );
+    assert_eq!(b.ids, vec![1, 5, PAD]);
+    assert_eq!(b.counts, vec![3.0, 1.0, 0.0]);
+    assert_eq!(b.pad, vec![0, 0, 1]);
+}

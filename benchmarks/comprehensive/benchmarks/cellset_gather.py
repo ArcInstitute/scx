@@ -70,10 +70,10 @@ Scenarios
 
     Two premises the arm asserts rather than assumes. ``enc_mask_positions``
     is **non-empty** and withholds a non-zero number of positions: the kernel
-    builds its withheld-gene ``HashSet`` (and pays a probe per surviving top-K
-    gene) only when the mask array is non-empty, so the empty "perturbation
-    path" — what the one pre-existing Python call site passes — would skip the
-    allocation the arm exists to price. And ``hide_readout`` is all-zero,
+    tests a gene against the withheld set (a lookup per surviving top-K gene)
+    only when the mask array is non-empty, so the empty "perturbation path" —
+    what the one pre-existing Python call site passes — would skip the branch
+    the arm exists to price. And ``hide_readout`` is all-zero,
     because a set bit short-circuits the whole encoder path to a single
     GENE_MASK token. ``k_enc`` / ``k_dec`` / ``mode`` / the mask fraction are
     pinned module constants, since the metric is a rate per cell and every one
@@ -83,8 +83,16 @@ Scenarios
     (``k_enc=2048``, ``k_dec=1024``, 25% withheld, ten S=64 batches), collating
     the *same* batches with the mask array replaced by an empty one runs at
     **78.7 µs/cell against 120.1 µs/cell — 1.53×**. So ~34% of this arm's wall
-    is the withheld-gene set and its per-gene probe, and an empty-mask arm
+    was the withheld-gene set and its per-gene probe, and an empty-mask arm
     would have been blind to it.
+
+    That 34% is what OPT-LOADER-4 went after, and the mechanism has since
+    changed: the kernel no longer rebuilds a per-row ``HashSet`` from the
+    ``k_dec`` query ids and SipHash-probes it, but sorts each *set's* panel once
+    and binary-searches it per surviving gene. The branch the premise selects is
+    the same one, so the premise and the pinned shape still hold; the figures
+    above describe the pre-change kernel and are the "before" side of that
+    change, not a current measurement.
 
 Per-run ``extra`` keys (sparse per-scenario):
     ``cellsets_per_sec__<sc>``  — sets/s (the STATE3-relevant throughput)
@@ -792,11 +800,12 @@ _COLLATE_MODE = "pass_through"
 
 # Fraction of each cell's query positions withheld from the encoder crop.
 #
-# This is NOT a tuning knob, it is the arm's premise. `collate_cell` builds its
-# `masked: Option<HashSet<i64>>` — and pays the SipHash probe per surviving
-# top-K gene — only when `enc_mask_positions` is non-empty; an empty array is
-# the perturbation path and takes `None`, skipping the allocation the arm
-# exists to measure. The one pre-existing Python call site
+# This is NOT a tuning knob, it is the arm's premise. `collate_cell` consults
+# the withheld set — a lookup per surviving top-K gene — only when
+# `enc_mask_positions` is non-empty; an empty array is the perturbation path and
+# takes `None`, skipping the branch the arm exists to measure (and, since
+# OPT-LOADER-4, also skipping the per-set panel sort that replaced the per-row
+# `HashSet` build). The one pre-existing Python call site
 # (`pyscx/tests/test_fork_safety.py`) passes empty, so copying it would have
 # produced a green arm over the wrong branch.
 _COLLATE_MASK_FRACTION = 0.25

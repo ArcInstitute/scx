@@ -2738,13 +2738,17 @@ def test_deliberate_suppression_allowlist_has_no_stale_entries():
 def test_collate_arm_builds_a_mask_that_actually_withholds():
     """An empty — or all-zero — `enc_mask_positions` measures the wrong branch.
 
-    `collate_cell` builds its withheld-gene `HashSet<i64>` (and pays a probe
-    per surviving top-K gene) **only** when the mask array is non-empty. An
-    empty array is the perturbation path and takes `None`, skipping the
-    allocation OPT-LOADER-4 removes — measured on pbmc3k as 78.7 µs/cell
-    against 120.1, so ~34% of the arm's subject. And an all-zero array is
-    non-empty but withholds nothing, so the compaction loop has nothing to
-    skip.
+    `collate_cell` consults the withheld set — a lookup per surviving top-K
+    gene — **only** when the mask array is non-empty. An empty array is the
+    perturbation path and takes `None`, skipping the branch OPT-LOADER-4
+    changed — measured on pbmc3k as 78.7 µs/cell against 120.1, so ~34% of the
+    arm's subject before that change. And an all-zero array is non-empty but
+    withholds nothing, so the compaction loop has nothing to skip.
+
+    The premise is unchanged by OPT-LOADER-4: the kernel now sorts each set's
+    query panel once and binary-searches it instead of rebuilding a per-row
+    `HashSet`, but it is the same `Some`/`None` branch that the mask array
+    selects.
 
     Driven on a hand-built batch rather than grepped: an earlier version
     asserted the literals `"masked_positions == 0"` and

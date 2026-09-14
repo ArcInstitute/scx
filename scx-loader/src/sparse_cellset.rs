@@ -22,7 +22,9 @@ use scx_format_io::{CacheMetrics, ScxReader};
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::{IterMetrics, PrefetchEngine};
-use crate::sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode};
+use crate::sparse_cellset_collate::{
+    collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode, RowMask, SetQueryIndex,
+};
 
 /// One batch of cell sets to gather. Rows are flat across all sets in the
 /// batch; `set_offsets` (length `n_sets + 1`) delimits each set's row range.
@@ -950,6 +952,18 @@ pub fn collate_gathered(
         }
     }
 
+    // One sorted query panel per set, built before the row loop because the
+    // panel is per-set while the mask bits below are per-row. Skipped entirely
+    // on the perturbation path (no mask ⇒ nothing to look up), so that path
+    // pays neither the sort nor the allocation.
+    let query_indices: Vec<SetQueryIndex> = if has_mask {
+        (0..n_sets)
+            .map(|s| SetQueryIndex::new(&query_gene_ids[s * k_dec..(s + 1) * k_dec]))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut enc_ids = vec![0i64; n_rows * k_enc];
     let mut enc_counts = vec![0f32; n_rows * k_enc];
     let mut enc_mask = vec![0u8; n_rows * k_enc];
@@ -979,11 +993,10 @@ pub fn collate_gathered(
                     gene_ids: &indices[lo..hi],
                     raw: &data[lo..hi],
                     query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
-                    enc_mask_positions: if has_mask {
-                        Some(&enc_mask_positions[r * k_dec..(r + 1) * k_dec])
-                    } else {
-                        None
-                    },
+                    mask: has_mask.then(|| RowMask {
+                        positions: &enc_mask_positions[r * k_dec..(r + 1) * k_dec],
+                        index: &query_indices[s],
+                    }),
                     hide_readout: hide_readout[r] != 0,
                 };
                 let cfg = CollateConfig {
