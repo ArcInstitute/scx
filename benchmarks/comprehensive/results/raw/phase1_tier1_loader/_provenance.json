@@ -1,0 +1,31 @@
+{
+ "capture": "phase1_tier1_loader_ab",
+ "slurm_job_id": 2949908,
+ "host": "GPU71BA",
+ "node_shared": "yes \u2014 co-tenant jobs present (CPULoad 20.2 of 184 CPUs); this is why the design is paired rather than blocked",
+ "driver": "benchmarks/scripts/_run_phase1_loader_ab.sh",
+ "summary": "benchmarks/scripts/_phase1_loader_ab_summary.py",
+ "before_sha": "0870ac39e9fb5a217c51f0e9831a498b6ab68a70",
+ "before_ref": "main",
+ "after_sha": "19ec5256e80d8de4caab7482b8d90433aef07dba",
+ "after_ref": "phase1-tier1-loader",
+ "git_dirty": false,
+ "benchmark": "cellset_gather",
+ "format": "scx_auto",
+ "datasets": [
+  "pbmc3k",
+  "tabula_sapiens_100k"
+ ],
+ "design": {
+  "kind": "two-build, paired, interleaved",
+  "rounds": 12,
+  "n_runs_per_invocation": 1,
+  "arm_alternates": "per round; within-pair order flips on alternate rounds",
+  "statistic": "median of within-round ratios + exact two-sided sign test",
+  "why": "a block design was tried first and failed on a contended node (7-34% within-arm spread, verdicts contradicting a quiet-node run); neighbour load drifts on the timescale of a block and aliases onto the arm"
+ },
+ "not_measured": [
+  "peak RSS \u2014 not in the driver's metric list this run; the pre-size bias adds 12.5% of a batch's CSR payload (measured on pbmc3k: capacity 975,737 vs 870,886 used = 0.84 MB per batch), which is arithmetic, not a capture",
+  "census \u2014 a cellset_gather census cell does not finish (census_500k killed at 205 min on run 1 of 3 of cache_undersized)"
+ ]
+}

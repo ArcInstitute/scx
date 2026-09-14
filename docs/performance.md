@@ -3012,6 +3012,94 @@ rather than zero** — the distinction the `None`-not-`0.0` rule in
 > single-node, single-rank numbers against the stated consumers; they do not
 > certify multi-node DDP, a real `DistributedSampler`, or any other model.
 
+### Tier-1 loader fixes: gather pre-sizing and the crop mask (phase 1)
+
+Two changes to `SparseCellSetDataset`, measured together as a two-build A/B
+(SLURM `2949908`, host `GPU71BA`, `main` `0870ac39` against
+`phase1-tier1-loader` `19ec5256`; raw rows under
+`results/raw/phase1_tier1_loader/`).
+
+- **The gather pre-sizes its CSR outputs.** `indices` and `data` used to grow
+  from empty, reallocating and copying at every doubling. They are now sized up
+  front from `rows x mean_nnz_per_row` (catalog stats, no I/O), biased up by an
+  eighth.
+- **The collate kernel's withheld-gene test is per set.** `collate_cell` rebuilt
+  a `HashSet` of withheld ids for every cell out of the `k_dec` ids its whole
+  *set* shares; it now sorts that panel once per set and binary-searches it.
+
+| dataset | metric | `main` | phase 1 | ratio | rounds won | p |
+|---|---|---|---|---|---|---|
+| pbmc3k | `cellsets_per_sec__gather_random` | 4692 | 10210 | **2.20x** | 12/12 | <0.001 |
+| pbmc3k | `cellsets_per_sec__gather_random_s512` | 558.0 | 1063 | **1.93x** | 12/12 | <0.001 |
+| pbmc3k | `cellsets_per_sec__gather_grouped_s512` | 506.9 | 821.7 | **1.59x** | 11/12 | 0.006 |
+| pbmc3k | `cellsets_per_sec__gather_grouped` | 4961 | 7051 | **1.56x** | 12/12 | <0.001 |
+| pbmc3k | `us_per_cell__collate` | 13.69 | 12.84 | 1.06x | 12/12 | <0.001 |
+| tabula_sapiens_100k | `cellsets_per_sec__gather_grouped` | 661.6 | 839.5 | **1.27x** | 12/12 | <0.001 |
+| tabula_sapiens_100k | `cellsets_per_sec__gather_random` | 646.4 | 837.1 | **1.26x** | 12/12 | <0.001 |
+| tabula_sapiens_100k | `cellsets_per_sec__gather_random_s512` | 84.55 | 93.45 | 1.10x | 10/12 | 0.039 |
+| tabula_sapiens_100k | `cellsets_per_sec__gather_grouped_s512` | 82.85 | 86.75 | 1.05x | 8/12 | 0.388 |
+| tabula_sapiens_100k | `us_per_cell__collate` | 22.30 | 21.75 | 1.02x | 10/12 | 0.039 |
+
+Ratios are oriented so `>1` always means faster. The last tabula row is **not a
+result** — 8 of 12 rounds is what a coin does — and is listed so the one metric
+without a reliable difference is visible rather than omitted.
+
+#### The crop mask is reliable and small, which is not what was predicted
+
+The per-set panel was expected to be worth ~25%, on the strength of an earlier
+measurement that collating with an empty mask ran at 78.7 us/cell against 120.1
+with 25% of query positions withheld — ~34% of collate wall. It is worth **6% on
+pbmc3k and 2% on tabula**.
+
+The earlier figure was sound but measured the wrong thing for this purpose: it
+covered the `HashSet` **build and its probe together**, and only the build is
+removed. The probe became a binary search — about `log2(k_dec)` ≈ 10 comparisons
+per surviving gene against one hash — so on cells with many genes it costs more
+than it saves, which is why tabula (~1950 non-zeros per cell) gains less than
+pbmc3k. Removing the per-row allocation is the durable part.
+
+The change that would collect the rest is a merge: walk the cell's own sorted
+`gene_ids` against the sorted panel once, `O(n + k_dec)` with no per-gene search.
+That needs a per-row scratch buffer to mark the withheld genes in, and
+allocating one per row would reintroduce exactly the allocation this removed —
+so it belongs with the caller-supplied scratch the tokenisation kernels
+introduce, not here.
+
+#### Why the numbers are paired, and what the first attempt got wrong
+
+The arms alternate **per round**: each round gathers once on each build, back to
+back on the same dataset, and the statistic is the median of the within-round
+ratios plus a sign test over them. The within-pair order flips on alternate
+rounds.
+
+That is not ceremony. The first version of this capture compared arm-sized
+blocks and produced two mutually contradictory answers depending on which node
+SLURM picked. On an idle node the within-arm spread was ~1% and the signal was
+clean; on a node shared with a dev shell and a co-tenant array job it reached
+7-34%, and the two metrics that cleared the noise bar disagreed with the quiet
+run — one of them reporting a 1.85x speedup as a 0.81x regression. Neighbour
+load drifts on the timescale of a block, so a block design lays it directly on
+top of whichever arm was running.
+
+Pairing cancels drift that is slow compared to one round, because it moves both
+members of a pair together. The sign test then answers the question that
+survives heavy noise — did the change win more rounds than chance allows —
+rather than the one that does not, which is by how much. It is also what makes
+the 6% collate figure reportable at all: a 6% median ratio is exactly the
+magnitude a block design discards as noise, and 12 wins out of 12 is not.
+
+#### What this does not say
+
+- **Peak RSS was not captured** in this A/B. The pre-size bias adds 12.5% of a
+  batch's CSR payload — on the pbmc3k arm, a measured capacity of 975,737
+  elements against 870,886 used, so 0.84 MB per batch. That is arithmetic from
+  the capacities, not a measurement of process RSS.
+- **No census.** A `cellset_gather` census cell does not finish: `census_500k`
+  was killed at 205 minutes still on run 1 of 3 of its `cache_undersized`
+  scenario. That is the same reason the collate floors were prescribed on
+  tabula alone.
+- Single node, single rank, one format (`scx_auto`).
+
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
 The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered
