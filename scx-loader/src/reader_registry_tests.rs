@@ -71,7 +71,7 @@ fn bounded_registry(dir: &std::path::Path, n: usize, limit: usize) -> StdArc<Rea
         let path = dir.join(format!("f{i}.scx"));
         write_tiny(&path);
         let reader = ScxReader::open(&path).unwrap();
-        slots.push(ScannedFile {
+        slots.push(FileSlot {
             path: path.clone(),
             n_obs: reader.n_obs(),
             index: BackedCsrIndex::from_catalog(reader.catalog()),
@@ -181,7 +181,7 @@ fn a_reopenable_slot_without_an_identity_is_refused() {
     write_tiny(&path);
     let shared = SharedShardCache::new(4, 1 << 20);
     let reader = ScxReader::open(&path).unwrap();
-    let slots = vec![ScannedFile {
+    let slots = vec![FileSlot {
         path: path.clone(),
         n_obs: reader.n_obs(),
         index: BackedCsrIndex::from_catalog(reader.catalog()),

@@ -105,9 +105,14 @@ impl ReaderMetrics {
 
 /// What survives a handle eviction: everything needed to plan against the file
 /// and to reopen it, and nothing that costs per-file kilobytes.
-struct FileSlot {
-    path: PathBuf,
-    n_obs: u64,
+///
+/// Built by the constructor's manifest scan and handed here as-is. There used
+/// to be a second, field-identical `ScannedFile` that `from_scan` repacked into
+/// this one — a round-trip that could not diverge without becoming a bug.
+/// **Review on #536 (Cursor Agent, Antigravity).**
+pub(crate) struct FileSlot {
+    pub(crate) path: PathBuf,
+    pub(crate) n_obs: u64,
     /// The shard index, retained for **every** file whatever the limit.
     ///
     /// The first version retained it only when the registry could evict, on the
@@ -117,11 +122,18 @@ struct FileSlot {
     /// the default path would have acquired a lock per row of every plan to
     /// save `n_shards x 24 B` per file — about 1.5 kB on census_1m's 62 shards,
     /// against the ~121 kB the handle itself costs.
-    index: BackedCsrIndex,
-    /// Stamped at first open, compared on every reopen. `None` at
-    /// `reader_limit = None`, where no reopen can happen and the `stat` it
-    /// costs would be pure waste.
-    identity: Option<FileIdentity>,
+    pub(crate) index: BackedCsrIndex,
+    /// Stamped at first open, compared on every reopen.
+    ///
+    /// `Some` for every slot of a registry that holds a reopen recipe — which
+    /// is every path-built loader, limited or not — and `None` only for
+    /// [`ReaderRegistry::from_open`], which has no recipe and so cannot reopen
+    /// at all. An earlier version stamped only when a limit was set, on the
+    /// reasoning that an unlimited registry never evicts and so never reopens.
+    /// That was true and still a hole: it left the check depending on *when*
+    /// eviction happens to run, and `lease` now refuses a reopen it cannot
+    /// verify rather than falling through. Do not "save the stat" here.
+    pub(crate) identity: Option<FileIdentity>,
 }
 
 /// One currently-open handle, with the tick at which it was last leased.
@@ -150,12 +162,6 @@ struct OpenHandles {
 struct OpenRecipe {
     shared: Arc<SharedShardCache>,
     scatter_block_index: bool,
-}
-
-impl OpenRecipe {
-    fn wrap(&self, reader: ScxReader, file_id: u32) -> Arc<BackedCsrReader> {
-        wrap_reader(reader, file_id, &self.shared, self.scatter_block_index)
-    }
 }
 
 /// Attach a freshly opened `ScxReader` to the shared cache as `file_id`.
@@ -204,10 +210,7 @@ pub(crate) struct ReaderRegistry {
     /// therefore never need to reopen.
     recipe: Option<OpenRecipe>,
     metrics: Arc<ReaderMetrics>,
-    /// Computed on demand, not during the manifest scan: for an all-unframed
-    /// file the walk reads every shard header, and doing that eagerly for a
-    /// 26k-file manifest would pay the whole cost to answer a question only the
-    /// constructor's warning asks.
+    /// Memoized answer to "does any file here have a framed CSR shard".
     any_framed: OnceLock<bool>,
 }
 
@@ -256,7 +259,7 @@ impl ReaderRegistry {
     /// all of them when `limit` is `None`, which is the default and is today's
     /// behaviour: nothing is ever evicted and nothing is ever reopened.
     pub(crate) fn from_scan(
-        slots: Vec<ScannedFile>,
+        slots: Vec<FileSlot>,
         retained: Vec<(u32, Arc<BackedCsrReader>)>,
         limit: Option<usize>,
         shared: Arc<SharedShardCache>,
@@ -277,15 +280,7 @@ impl ReaderRegistry {
             tick += 1;
         }
         Arc::new(Self {
-            slots: slots
-                .into_iter()
-                .map(|s| FileSlot {
-                    path: s.path,
-                    n_obs: s.n_obs,
-                    index: s.index,
-                    identity: s.identity,
-                })
-                .collect(),
+            slots,
             open: Mutex::new(OpenHandles { by_file, tick }),
             limit,
             recipe: Some(OpenRecipe {
@@ -359,6 +354,15 @@ impl ReaderRegistry {
             self.limit.unwrap_or(usize::MAX).saturating_sub(1),
         );
 
+        // Opened with the registry lock held, deliberately. It serialises
+        // concurrent reopens, which is the point: two threads missing on the
+        // same `file_id` would otherwise both parse its catalog and one of the
+        // two would be thrown away. Nothing reached from here re-enters the
+        // registry — `wrap_reader` only touches the reader and the process-wide
+        // rayon pool — so there is no lock-order cycle to worry about. The
+        // contention this costs is nil on today's callers: the gather leases on
+        // one consumer thread, and prefetch tasks are handed their `Arc`s
+        // before they are spawned rather than leasing for themselves.
         let slot = &self.slots[idx];
         let reader = ScxReader::open(&slot.path).map_err(|e| LoaderError::ConfigError {
             reason: format!("failed to reopen {}: {e}", slot.path.display()),
@@ -387,7 +391,7 @@ impl ReaderRegistry {
             })?;
         let now = FileIdentity::stamp(&slot.path, reader.header())?;
         stamped.ensure_same(&slot.path, &now)?;
-        let wrapped = recipe.wrap(reader, file_id);
+        let wrapped = wrap_reader(reader, file_id, &recipe.shared, recipe.scatter_block_index);
         self.metrics.note_open();
         open.by_file.insert(
             file_id,
@@ -467,17 +471,53 @@ impl ReaderRegistry {
 
     /// True if any file in the set has a row-group-framed CSR shard.
     ///
-    /// Leases one file at a time and short-circuits, so the answer costs at
-    /// most one resident reader beyond whatever is already open — and on the
-    /// common framed manifest it stops at the first file.
+    /// **Answered from the resident handles first, and only then by reopening
+    /// the rest.** At `reader_limit = None` every file is resident, so the walk
+    /// opens nothing at all — which is the default and the overwhelmingly
+    /// common case. Under a bound it costs a reopen only for files the scan
+    /// already closed, and only until the first framed one.
+    ///
+    /// That ordering is the whole fix. Leasing every slot in turn — the first
+    /// version — meant a bounded 26k-file all-unframed manifest reopened and
+    /// re-parsed 26k catalogs the scan had closed seconds earlier, to answer a
+    /// constructor warning. **Review on #536 (Cursor Agent, Antigravity).**
+    ///
+    /// The predicate itself stays on `BackedCsrReader`, where the block-index
+    /// resolution it depends on lives; re-deriving "is this framed" from a
+    /// shard header in this crate would be a second answer free to drift from
+    /// the one the gather actually routes on.
+    ///
+    /// The one caller is the constructor's "you asked for a route that can
+    /// never fire" warning, and `should_warn_unframed_scatter` short-circuits
+    /// on `scatter_block_index` before reaching here, so the default path never
+    /// pays for this at all.
     pub(crate) fn any_shard_framed(&self) -> bool {
         *self.any_framed.get_or_init(|| {
+            // Resident first. Collected under the lock and released before any
+            // reopen, so this never holds the registry mutex across I/O.
+            let resident: Vec<Arc<BackedCsrReader>> = {
+                let open = self.open.lock().expect("reader registry mutex poisoned");
+                open.by_file
+                    .values()
+                    .map(|h| Arc::clone(&h.reader))
+                    .collect()
+            };
+            if resident.iter().any(|r| r.any_shard_framed()) {
+                return true;
+            }
+            let seen: std::collections::HashSet<u32> = {
+                let open = self.open.lock().expect("reader registry mutex poisoned");
+                open.by_file.keys().copied().collect()
+            };
             for fid in 0..self.slots.len() as u32 {
+                if seen.contains(&fid) {
+                    continue;
+                }
                 match self.lease(fid) {
                     Ok(r) if r.any_shard_framed() => return true,
                     // A file that cannot be reopened cannot be shown to be
                     // framed. This feeds a constructor *warning*; turning it
-                    // into an error here would fail a construction over a
+                    // into an error would fail a construction over a
                     // diagnostic, and the next real read reports it properly.
                     Ok(_) | Err(_) => continue,
                 }
@@ -485,18 +525,6 @@ impl ReaderRegistry {
             false
         })
     }
-}
-
-/// One manifest entry as the constructor's scan saw it, before the registry
-/// decides whether to keep its handle.
-pub(crate) struct ScannedFile {
-    pub(crate) path: PathBuf,
-    pub(crate) n_obs: u64,
-    /// Retained for every file whatever the limit — see `FileSlot::index`.
-    pub(crate) index: BackedCsrIndex,
-    /// `Some` only when a reopen is possible; `None` saves the `stat` that
-    /// stamping it costs, on a path where nothing can ever compare it.
-    pub(crate) identity: Option<FileIdentity>,
 }
 
 #[cfg(test)]

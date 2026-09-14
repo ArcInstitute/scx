@@ -603,7 +603,7 @@ fn plan_fits_budget_sizes_the_union_not_the_largest_set() {
 
     let fits = |rows: &[u64]| {
         let per_shard = engine.bucket_plan_rows(rows.iter().map(|&r| (0u32, r)));
-        let (planned, budget) = engine.plan_footprint(&per_shard).unwrap();
+        let (planned, budget) = engine.plan_footprint(&per_shard, None).unwrap();
         planned <= budget
     };
     assert!(

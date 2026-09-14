@@ -14,9 +14,6 @@ use scx_format_io::CacheMetrics;
 use crate::batch::ObsColumn;
 use crate::plan_engine::IterMetrics;
 
-/// Encode `CacheMetrics` (atomic counters from `BackedCsrReader`) as a Python
-/// dict of `int` keys. Counters are loaded with `Relaxed` ordering — values
-/// are statistical and not used for synchronization on the Python side.
 /// Add the reader-registry counters to an existing `cache_metrics()` dict.
 ///
 /// A separate function, and a separate call, rather than four more lines inside
@@ -36,6 +33,9 @@ pub(super) fn reader_metrics_into(
     Ok(())
 }
 
+/// Encode `CacheMetrics` (atomic counters from `BackedCsrReader`) as a Python
+/// dict of `int` keys. Counters are loaded with `Relaxed` ordering — values
+/// are statistical and not used for synchronization on the Python side.
 pub(super) fn cache_metrics_to_pydict<'py>(
     py: Python<'py>,
     m: &CacheMetrics,

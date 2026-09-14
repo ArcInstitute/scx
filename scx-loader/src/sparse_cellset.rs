@@ -24,7 +24,7 @@ use scx_format_io::{BackedCsrIndex, BackedCsrReader, CacheMetrics, ScxReader, Sh
 
 use crate::error::{LoaderError, Result};
 use crate::plan_engine::{IterMetrics, PrefetchEngine};
-use crate::reader_registry::ScannedFile;
+use crate::reader_registry::FileSlot;
 use crate::sparse_cellset_collate::{
     collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode, RowMask, SetQueryIndex,
 };
@@ -403,7 +403,7 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
 /// how many are open **at once**, which is the term that costs ~104 kB of
 /// resident memory apiece (see [`crate::reader_registry`]).
 struct ManifestScan {
-    files: Vec<ScannedFile>,
+    files: Vec<FileSlot>,
     /// The handles the scan kept: all of them at `reader_limit = None`, the
     /// first `limit` otherwise. First rather than most-recent because a scan
     /// has no access pattern to learn from yet, and the alternative — keeping
@@ -472,7 +472,7 @@ impl ManifestScan {
         )?;
         self.n_vars_max = self.n_vars_max.max(reader.n_vars() as usize);
         self.stats.add(&reader);
-        self.files.push(ScannedFile {
+        self.files.push(FileSlot {
             path: reader.path().to_path_buf(),
             n_obs: reader.n_obs(),
             index: BackedCsrIndex::from_catalog(reader.catalog()),
@@ -1016,7 +1016,7 @@ impl SparseCellSetLoader {
         let per_shard = self
             .engine
             .bucket_plan_rows(plan.file_ids.iter().copied().zip(plan.rows.iter().copied()));
-        let (planned, budget) = self.engine.plan_footprint(&per_shard)?;
+        let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
         self.gather_admitting(&self.engine, plan, Some(planned <= budget))
     }
 

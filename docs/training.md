@@ -580,9 +580,12 @@ Four things to know before setting it:
 - **A reopen re-parses the catalog** (0.09–20 ms per file). That is not an
   oversight — the catalog is over 90 % of what the eviction reclaims, so
   retaining it to make reopens cheap would make the whole thing pointless.
-  Match `reader_limit` to how many files your plans actually touch together;
-  a manifest of 26k files whose plans each touch three is the good case, and a
-  plan that fans across thousands of files every batch is the bad one.
+  Match `reader_limit` to how many files are in flight at once, which on the
+  streaming path is **not** one plan's worth: `iter_with_plans` keeps up to
+  `lookahead` plans prefetching, and each holds a lease on every file it
+  touches, so the working figure is roughly `files-per-plan × (lookahead + 1)`.
+  A manifest of 26k files whose plans each touch three is the good case; a plan
+  that fans across thousands of files every batch is the bad one.
 - **It bounds handles the loader is free to drop, not handles in existence.** A
   plan that needs more files at once than the limit exceeds it rather than
   blocking — blocking would deadlock against a caller already holding readers

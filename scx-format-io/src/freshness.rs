@@ -131,11 +131,17 @@ impl CatalogIdentity {
 /// [`FreshnessGuard`] answers "has the file under this *open* reader changed",
 /// and keeps the descriptor open so its re-read is a single `pread`. A bounded
 /// reader registry asks a narrower question — "is the file I am about to
-/// *reopen* still the one I scanned?" — and must hold nothing at all between
-/// the two opens, since the descriptor it would retain is the resource it
-/// exists to bound. Same two fields and the same verdict as `check()`; only
-/// the descriptor differs, which is why this lives here rather than being
-/// re-derived by the caller from `header()` and a `stat`.
+/// *reopen* still the one I scanned?" — and wants to hold nothing at all
+/// between the two opens.
+///
+/// Not because a descriptor is scarce: an unwatched `ScxReader` holds none, and
+/// what a bounded registry reclaims is the parsed catalog, not an fd. The
+/// reason is that `watching()` is a property of the reader for its whole life —
+/// it would put a `stat` and a `pread` on every section read of the default
+/// path, to answer a question only a reopen asks. Same two fields and the same
+/// verdict as `check()`; only the descriptor differs, which is why this lives
+/// here rather than being re-derived by the caller from `header()` and a
+/// `stat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileIdentity {
     inode: InodeIdentity,
@@ -175,12 +181,30 @@ impl FileIdentity {
             });
         }
         if now.catalog != self.catalog {
-            return Err(ScxError::FileChangedOnDisk {
-                path: path.display().to_string(),
-                detail: format!(
+            // The sequence counter is the usual mover, but it is not the only
+            // field compared: an op that rewrites in place without bumping it
+            // still moves the catalog pointer, and reporting
+            // "manifest_sequence 1 -> 1" for that sends the reader looking at
+            // the wrong thing. **Review on #536 (Antigravity).**
+            let detail = if self.catalog.manifest_sequence != now.catalog.manifest_sequence {
+                format!(
                     "changed on disk since it was first opened (manifest_sequence {} \u{2192} {})",
                     self.catalog.manifest_sequence, now.catalog.manifest_sequence
-                ),
+                )
+            } else {
+                format!(
+                    "changed on disk since it was first opened (manifest_sequence unchanged at \
+                     {}, but the catalog moved: offset {} \u{2192} {}, length {} \u{2192} {})",
+                    self.catalog.manifest_sequence,
+                    self.catalog.full_catalog_offset,
+                    now.catalog.full_catalog_offset,
+                    self.catalog.full_catalog_length,
+                    now.catalog.full_catalog_length
+                )
+            };
+            return Err(ScxError::FileChangedOnDisk {
+                path: path.display().to_string(),
+                detail,
             });
         }
         Ok(())

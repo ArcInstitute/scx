@@ -261,27 +261,41 @@ impl PrefetchEngine {
     ///
     /// Unlike `bucket_plan_rows`, this needs a real handle per touched file —
     /// the framing memo and the per-shard decoded size are not in the retained
-    /// index — so a plan's **touched-file count**, not the manifest size, is
-    /// what sets peak residency here.
+    /// index.
+    ///
+    /// `held` is what makes that affordable for both callers, which want
+    /// opposite things. A synchronous `gather` passes `None`: this leases one
+    /// file at a time and drops each, so sizing costs one resident handle
+    /// whatever the plan's width. The prefetcher passes the leases it is
+    /// already holding, because it needs every touched file anyway — and
+    /// without that, a plan touching more files than `reader_limit` would have
+    /// this function evict each file as it moved to the next, then watch
+    /// `spawn_prefetches` reopen and re-parse every one of them a line later.
+    /// **Review on #536 (Antigravity, Cursor Agent):** that thrash was real,
+    /// and it was introduced by the fix that made sizing lease one at a time.
     pub(crate) fn plan_footprint(
         &self,
         per_shard: &HashMap<(u32, usize), Vec<u64>>,
+        held: Option<&HashMap<u32, Arc<BackedCsrReader>>>,
     ) -> Result<(usize, usize)> {
         let mut planned = 0usize;
         let mut budget = usize::MAX;
-        // Regrouped per file, and each file's lease dropped before the next is
-        // taken, so sizing a plan holds **one** handle at a time rather than
-        // one per touched file. Holding them all was the first version, and it
-        // defeated `reader_limit` outright: a 64-file plan pinned 64 readers
-        // before a single row was read, so nothing was ever evictable and the
-        // residency high-water equalled the manifest size. Caught by
+        // Regrouped per file so that, with `held` absent, each file's lease is
+        // dropped before the next is taken and sizing holds **one** handle at a
+        // time. Holding them all was the first version, and it defeated
+        // `reader_limit` outright: a 64-file plan pinned 64 readers before a
+        // single row was read, so nothing was ever evictable and the residency
+        // high-water equalled the manifest size. Caught by
         // `residency_is_bounded_by_reader_limit`.
         let mut by_file: HashMap<u32, Vec<(usize, &Vec<u64>)>> = HashMap::new();
         for (&(fid, sidx), shard_rows) in per_shard {
             by_file.entry(fid).or_default().push((sidx, shard_rows));
         }
         for (fid, shards) in by_file {
-            let reader = self.registry.lease(fid)?;
+            let reader = match held.and_then(|m| m.get(&fid)) {
+                Some(r) => Arc::clone(r),
+                None => self.registry.lease(fid)?,
+            };
             for (sidx, shard_rows) in shards {
                 planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
                 if !reader.block_index_eligible(sidx, shard_rows.len()) {
@@ -703,20 +717,36 @@ where
         // Counting a shard the gather then happens to serve the other way only
         // makes the verdict conservative (a lost warm in a mixed regime), never
         // unsafe. Eligibility still decides what L2 task to launch.
-        let (planned, budget) = self.engine.plan_footprint(&per_shard)?;
+        // At `lookahead == 0` there is no prefetch to launch, so the plan needs
+        // its admission verdict and nothing else: neither the leases nor the
+        // eligibility map below survives the early return. Taking them first
+        // spiked residency to the plan's width in order to compute one `bool`,
+        // on a configuration documented as disabling prefetch entirely.
+        // **Review on #536 (Cursor Agent).**
+        if self.lookahead == 0 {
+            let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
+            return Ok((Vec::new(), planned <= budget / (self.lookahead + 1)));
+        }
+
         // One lease per touched file for the whole of the rest of this
-        // function. Taken up front, and held, for two reasons: the eligibility
-        // map and the warm loop below would otherwise lease the same file once
-        // per bucket, and — the load-bearing one — a handle re-leased between
-        // the two could in principle be a *different* `Arc` if a bounded
-        // registry evicted and reopened it in between, so the predicate and the
-        // task it launches would be reading different objects.
+        // function. Taken up front, and held, for three reasons: the
+        // eligibility map and the warm loop below would otherwise lease the
+        // same file once per bucket; a handle re-leased between the two could
+        // be a *different* `Arc` if a bounded registry evicted and reopened it
+        // in between, so the predicate and the task it launches would be
+        // reading different objects; and taking them BEFORE the sizing below is
+        // what stops a plan wider than `reader_limit` from being sized
+        // file-by-file, evicting as it goes, and then reopening every one of
+        // them here.
         let mut leased: HashMap<u32, Arc<BackedCsrReader>> = HashMap::new();
         for &(fid, _) in per_shard.keys() {
             if let std::collections::hash_map::Entry::Vacant(e) = leased.entry(fid) {
                 e.insert(self.engine.lease(fid)?);
             }
         }
+        // Sized against the handles already held, so no file is opened twice
+        // for one plan.
+        let (planned, budget) = self.engine.plan_footprint(&per_shard, Some(&leased))?;
         // Recomputed here because the prefetcher needs it per bucket to choose
         // which L2 task to launch; `plan_footprint` consumes the same verdict
         // internally to decide whether to add whole-shard bytes.
@@ -729,10 +759,6 @@ where
             .collect();
         let share = budget / (self.lookahead + 1);
         let admit_row_groups = planned <= share;
-
-        if self.lookahead == 0 {
-            return Ok((Vec::new(), admit_row_groups));
-        }
 
         let handle = self.engine.runtime()?.handle().clone();
         let mut joins = Vec::new();

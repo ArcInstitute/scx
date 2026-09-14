@@ -228,6 +228,110 @@ fn residency_is_bounded_by_reader_limit() {
     assert!(m.evictions.load(std::sync::atomic::Ordering::Relaxed) > 0);
 }
 
+/// **Residency on the path consumers actually run.**
+///
+/// Every other residency assertion in this file drives `gather`, the
+/// synchronous one-plan entry point. Production drives `iter_with_plans`, which
+/// goes through `PlanPrefetchIter::spawn_prefetches` — a different function
+/// with its own leases. Review on #536 (Cursor Agent) pointed out that the
+/// gather-path tests would keep reporting the cap as held while the iterator
+/// blew through it.
+///
+/// **The plans here are WIDE, and that is the whole point.** The first version
+/// of this test used one file per plan, which passes with the defect still in
+/// place — a "bulk lease" of one file is not a spike. Watched: with the
+/// pre-fix order restored (bulk-lease + eligibility map before the
+/// `lookahead == 0` early return) this fails at 32 against a ceiling of 5,
+/// and the narrow version does not notice at all.
+#[test]
+fn iterator_at_lookahead_zero_does_not_lease_the_plans_width() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = manifest(dir.path(), 32);
+    let loader = open_loader(paths, Some(4));
+    let metrics = loader.reader_metrics();
+
+    // Two plans, each touching all 32 files. At `lookahead == 0` there is no
+    // prefetch to launch, so nothing should need more than the sizing and the
+    // gather — both of which handle one file at a time.
+    let plans: Vec<_> = (0..2).map(|_| Ok(one_set_per_file(32))).collect();
+    let n = Arc::clone(&loader)
+        .iter_with_plans(plans.into_iter(), 0)
+        .count();
+    assert_eq!(n, 2);
+
+    let hwm = metrics.hwm.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        hwm <= 5,
+        "a 32-file plan at reader_limit=4, lookahead=0 held {hwm} readers; the \
+         prefetcher has no tasks to launch and must not lease the plan's width"
+    );
+}
+
+/// The same iterator with prefetch on: narrow plans stay inside the cap.
+///
+/// Separate from the wide case because the two bound different things. Here the
+/// in-flight lookahead window is the only thing that can raise residency, and
+/// each plan touches one file, so the ceiling is the cap plus the window.
+#[test]
+fn iterator_residency_is_bounded_on_narrow_plans() {
+    for lookahead in [0usize, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = manifest(dir.path(), 64);
+        let loader = open_loader(paths, Some(8));
+        let plans: Vec<_> = (0..64u32)
+            .map(|f| {
+                Ok(SparseCellSetPlan {
+                    file_ids: vec![f],
+                    rows: vec![0],
+                    role_tags: vec![0],
+                    set_offsets: vec![0, 1],
+                })
+            })
+            .collect();
+        let metrics = loader.reader_metrics();
+        let n = Arc::clone(&loader)
+            .iter_with_plans(plans.into_iter(), lookahead)
+            .count();
+        assert_eq!(n, 64, "lookahead={lookahead}");
+
+        let hwm = metrics.hwm.load(std::sync::atomic::Ordering::Relaxed);
+        let ceiling = 8 + lookahead as u64 + 1;
+        assert!(
+            hwm <= ceiling,
+            "lookahead={lookahead}: residency high-water {hwm} exceeded {ceiling} \
+             on 64 single-file plans at reader_limit=8"
+        );
+    }
+}
+
+/// The soft cap, pinned in the direction it actually gives way.
+///
+/// `reader_limit` bounds handles the registry is free to drop, not handles in
+/// existence. A plan touching more files than the limit exceeds it rather than
+/// blocking — blocking would deadlock against a caller already holding leases
+/// from the same plan. The docs say so; this is the test that makes it a
+/// contract rather than a sentence, and it is also what would catch a future
+/// "fix" that made the registry block instead.
+#[test]
+fn a_plan_wider_than_the_limit_exceeds_it_rather_than_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = manifest(dir.path(), 32);
+    let loader = open_loader(paths, Some(4));
+    let plan = one_set_per_file(32);
+
+    let batch = loader.gather(&plan).expect("a wide plan must not deadlock");
+    assert_eq!(batch.cell_indices.len(), 32);
+    let hwm = loader
+        .reader_metrics()
+        .hwm
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        hwm <= 4 + 1,
+        "the synchronous gather sizes and reads one file at a time, so even a \
+         32-file plan should not need more than the cap plus one; got {hwm}"
+    );
+}
+
 /// A file replaced between gathers is refused on reopen rather than served.
 ///
 /// Mutation (applied, seen to fail): drop the `FileIdentity::ensure_same` call
