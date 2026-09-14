@@ -2179,7 +2179,11 @@ the repr onto `Experiment.info() -> str`, whose tokens now include
     into it. `to_gpu_anndata`'s device path assembles no host `X` and so is not
     charged for one; its host-assembling fallback is. Counts are **physical**:
     on a file with deletion vectors the matrix is assembled and then compacted,
-    so the estimate bounds the peak and overstates the steady state. It was a flat 16 B —
+    so the estimate describes the physical matrix rather than the returned one.
+    It is a floor on the objects a read leaves resident, not a bound on its
+    transients — the dense reader builds a CSR and scatters from it, a
+    compaction holds both buffers at once, and the assembler's in-flight shard
+    decodes are not in it either. It was a flat 16 B —
     right for a wide matrix before the widened decode below landed, and 2×
     conservative for every matrix under the line, which never paid an upcast.
     So a file between roughly 0.5 and 1 billion nonzeros no longer trips the
@@ -2386,7 +2390,7 @@ choice applied afterwards and cannot lose anything.
 |-------|--------|---------|-------|
 | `container` | `"csr"` \| `"dense"` | `"csr"` | `"dense"` returns a row-major `numpy.ndarray` (no scipy CSR) |
 | `data_dtype` | `float16/32/64`, `int8/16/32/64`, `uint8/16/32` | `None` → `float32` | numeric dtype of the values |
-| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` below `i32::MAX` nonzeros, `int64` above (never on a file with deletion vectors) | CSR column-index dtype; ignored (warns) for `"dense"`. **Note:** `csr_matrix` resolves the index dtype from `max(nnz, n_rows)` and ignores the width it was handed, so on a matrix that fits in int32 **neither** `int16` nor `int64` survives — int16 is upcast, int64 is downcast, both to int32. The narrow int16 buffer is still built and range-gated on the way through (a column index ≥ 32768 fails loud). The default is resolved per matrix (`X` and `adata.raw` decide separately) — see **int64 above 2³¹ nonzeros** below |
+| `index_dtype` | `int16` \| `int32` \| `int64` | `None` → `int32` below `i32::MAX` nonzeros, `int64` above (pyscx does not choose `int64` on a file with deletion vectors; scipy still may) | CSR column-index dtype; ignored (warns) for `"dense"`. **Note:** `csr_matrix` resolves the index dtype from `max(nnz, n_rows)` and ignores the width it was handed, so on a matrix that fits in int32 **neither** `int16` nor `int64` survives — int16 is upcast, int64 is downcast, both to int32. The narrow int16 buffer is still built and range-gated on the way through (a column index ≥ 32768 fails loud). The default is resolved per matrix (`X` and `adata.raw` decide separately) — see **int64 above 2³¹ nonzeros** below |
 | `allow_lossy` | `bool` | `False` | fail-loud cast gate — see below |
 
 **Zero-copy default preserved.** `container="csr"` with no dtype kwargs takes the

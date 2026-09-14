@@ -38,8 +38,8 @@ before the loop starts, so the fan-out needs no `unsafe` and no bounds
 The **typed** whole-matrix assembler (`read_all_csr_shards_typed` and siblings,
 which serve every non-default `container` / `data_dtype` / `index_dtype`
 request) takes the same `RowMajorStrategy` and the same carve — through
-`IndexBuffer::chunks_mut` / `ValueBuffer::chunks_mut`, which do the dtype match
-once and hand each shard a plain `&mut [T]`. It was the one whole-matrix read
+`IndexBuffer::chunks_mut` / `ValueBuffer::chunks_mut`, which resolve the runtime
+dtype for the carve and hand each shard a typed slice. It was the one whole-matrix read
 that stayed sequential, so a narrow read paid a serial decode the default read
 did not.
 Each shard is independently decompressible — the reader issues `MADV_SEQUENTIAL`

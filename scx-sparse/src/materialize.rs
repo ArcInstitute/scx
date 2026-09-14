@@ -32,7 +32,6 @@ pub enum ValueDtype {
 }
 
 impl ValueDtype {
-    /// numpy dtype name for this value dtype.
     /// Width of one value in bytes.
     ///
     /// What a materialized buffer costs per element, which is what a
@@ -47,6 +46,7 @@ impl ValueDtype {
         }
     }
 
+    /// The numpy dtype name for this value dtype.
     pub fn numpy_name(self) -> &'static str {
         match self {
             ValueDtype::F16 => "float16",
@@ -412,9 +412,10 @@ impl IndexBuffer {
 
 /// A mutable slice of an [`IndexBuffer`], at one dtype (mirrors `IndexDtype`).
 ///
-/// Produced by [`IndexBuffer::slice_mut`] / [`IndexBuffer::chunks_mut`] so a
-/// consumer matches the dtype **once** and then writes through a plain
-/// `&mut [T]`, rather than re-matching per element or per shard.
+/// Produced by [`IndexBuffer::slice_mut`] / [`IndexBuffer::chunks_mut`], which
+/// resolve the runtime dtype for the carve and hand out typed slices — so a
+/// consumer writes through a plain `&mut [T]` rather than re-matching per
+/// element. (It still matches this enum once per slice it fills.)
 #[derive(Debug)]
 pub enum IndexSliceMut<'a> {
     I16(&'a mut [i16]),

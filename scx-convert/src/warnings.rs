@@ -187,18 +187,28 @@ pub enum ConvertWarning {
         budget_bytes: u64,
         /// Stored nonzeros in `X` (the estimate's dominant term).
         nnz: u64,
-        /// `true` when `nnz` is above `i32::MAX`, so the assembled CSR holds
-        /// int64 column indices — 8 of the 12 bytes per nonzero. Always `false`
-        /// for a dense request, which has no column-index array.
-        wide_indices: bool,
-        /// `true` when the caller asked for `container="dense"`. The estimate is
-        /// then `n_obs × n_vars × value_width` and the nonzero count does not
-        /// bound it — saying "N nonzeros at 8 B each" would be describing a
-        /// buffer the read is not building.
+        /// Bytes per value in the assembled matrix, from the caller's
+        /// `data_dtype`. The message derives its per-nonzero figure from this
+        /// and `index_bytes` rather than assuming `f32`: a `float64` read is
+        /// 12 B/nnz below the int64 line and 16 above it, not 8 and 12.
+        value_bytes: u64,
+        /// Bytes per column index: `Some(4)` or `Some(8)` for a CSR read —
+        /// scipy's choice, from `max(nnz, n_rows)`, not the caller's.
+        ///
+        /// `None` means the message must not claim a width. Two cases: a
+        /// `container="dense"` request, which has no index array at all; and a
+        /// file with **deletion vectors**, where `nnz` is physical and scipy
+        /// decides from the live count, which the catalog cannot supply.
+        index_bytes: Option<u64>,
+        /// `true` when the caller asked for `container="dense"`, so the estimate
+        /// is `n_obs × n_vars × value_bytes` and the nonzero count does not
+        /// bound it.
         dense_request: bool,
-        /// `n_obs × n_vars × 4`, when `container="dense"` would be *smaller*
-        /// than `estimated_bytes`. `None` when it would not be, or when the
-        /// shape overflows.
+        /// `n_obs × n_vars × value_bytes`, when `container="dense"` would be
+        /// smaller than the **sparse `X` term alone** — not than
+        /// `estimated_bytes`, which also carries `adata.raw` and the metadata,
+        /// and raw is assembled either way. `None` when it would not be, when
+        /// this call assembles no host CSR `X`, or when the product saturates.
         dense_bytes: Option<u64>,
     },
     /// SCX → h5ad export coerced null entries in an obs/var column to a
@@ -387,7 +397,8 @@ impl fmt::Display for ConvertWarning {
                 estimated_bytes,
                 budget_bytes,
                 nnz,
-                wide_indices,
+                value_bytes,
+                index_bytes,
                 dense_request,
                 dense_bytes,
             } => {
@@ -397,18 +408,33 @@ impl fmt::Display for ConvertWarning {
                 // Why it is that big: the index array is two thirds of a wide
                 // matrix's footprint and nothing else surfaces that.
                 let n = group_thousands(*nnz);
-                let why = if *dense_request {
-                    format!(
-                        " A dense container is n_obs x n_vars x the value width, so the \
-                         {n} stored nonzeros do not bound it."
-                    )
-                } else if *wide_indices {
-                    format!(
-                        " {n} nonzeros at 12 B each: above 2^31 nonzeros scipy holds int64 \
-                         column indices, which is two thirds of that."
-                    )
-                } else {
-                    format!(" {n} nonzeros at 8 B each (int32 column indices).")
+                // Every figure here is derived from the plan the estimate was
+                // priced with. Hard-coding f32/i32 widths made the message
+                // contradict its own total on any other request: a float64 CSR
+                // is 12 B/nnz below the int64 line and 16 above, not 8 and 12.
+                let why = match (*dense_request, *index_bytes) {
+                    (true, _) => format!(
+                        " A dense container is n_obs x n_vars x {value_bytes} B, so the {n} \
+                         stored nonzeros do not bound it."
+                    ),
+                    (false, Some(ix)) => {
+                        let per = value_bytes.saturating_add(ix);
+                        let wide = if ix == 8 {
+                            ", the larger half, because above 2^31 nonzeros scipy holds int64 \
+                             column indices"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            " {n} nonzeros at {per} B each: {value_bytes} B of value and {ix} B \
+                             of column index{wide}."
+                        )
+                    }
+                    (false, None) => format!(
+                        " {n} stored nonzeros at {value_bytes} B of value each, plus a column \
+                         index whose width scipy picks from the count after deletions — a \
+                         count the catalog cannot supply, so this figure assumes the wider one."
+                    ),
                 };
                 let dense = match dense_bytes {
                     Some(b) => format!(
@@ -574,7 +600,8 @@ mod tests {
             estimated_bytes: 25_239_799_332,
             budget_bytes: 8_589_934_592,
             nnz: 1_000_000_000,
-            wide_indices: false,
+            value_bytes: 4,
+            index_bytes: Some(4),
             dense_request: false,
             dense_bytes: None,
         };
@@ -606,7 +633,8 @@ mod tests {
             estimated_bytes: 22_000_000_000,
             budget_bytes: 8_589_934_592,
             nnz: 1_000_000_000,
-            wide_indices: false,
+            value_bytes: 4,
+            index_bytes: None,
             dense_request: true,
             dense_bytes: None,
         };
@@ -615,6 +643,70 @@ mod tests {
         assert!(rendered.contains("1,000,000,000"), "{rendered}");
         assert!(!rendered.contains("column indices"), "{rendered}");
         assert!(!rendered.contains("B each"), "{rendered}");
+    }
+
+    /// Every figure in the message is derived from the plan the estimate was
+    /// priced with.
+    ///
+    /// The message hard-coded 8 and 12 B/nnz while the estimate had moved to the
+    /// caller's value width — so a `data_dtype="float64"` read reported a total
+    /// computed at 12 B/nnz and explained it at 8, and called an int64 index
+    /// "two thirds" of a footprint where it is half. A regression introduced by
+    /// the fix that made the estimate plan-aware, and the reason this asserts
+    /// arithmetic rather than a phrase.
+    #[test]
+    fn the_per_nonzero_explanation_follows_the_plans_widths() {
+        let f64_wide = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: 2_500_000_000,
+            value_bytes: 8,
+            index_bytes: Some(8),
+            dense_request: false,
+            dense_bytes: None,
+        };
+        let rendered = format!("{f64_wide}");
+        assert!(rendered.contains("at 16 B each"), "{rendered}");
+        assert!(
+            rendered.contains("8 B of value and 8 B of column index"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("two thirds"), "{rendered}");
+
+        let u8_narrow = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 12_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: 2_000_000_000,
+            value_bytes: 1,
+            index_bytes: Some(4),
+            dense_request: false,
+            dense_bytes: None,
+        };
+        let rendered = format!("{u8_narrow}");
+        assert!(rendered.contains("at 5 B each"), "{rendered}");
+        assert!(!rendered.contains("int64"), "{rendered}");
+    }
+
+    /// On a file with deletion vectors the nonzero count is physical and scipy
+    /// picks the index width from the live count, which the catalog cannot
+    /// supply. The widen refuses to guess it; so must the message.
+    #[test]
+    fn an_unknown_index_width_is_not_asserted() {
+        let w = ConvertWarning::EagerAssemblyMemoryHigh {
+            estimated_bytes: 40_000_000_000,
+            budget_bytes: 8_589_934_592,
+            nnz: 2_650_704_199,
+            value_bytes: 4,
+            index_bytes: None,
+            dense_request: false,
+            dense_bytes: None,
+        };
+        let rendered = format!("{w}");
+        assert!(rendered.contains("after deletions"), "{rendered}");
+        assert!(rendered.contains("assumes the wider one"), "{rendered}");
+        // No per-nonzero total, because the index half of it is unknown.
+        assert!(!rendered.contains(" B each:"), "{rendered}");
+        assert!(!rendered.contains("int64"), "{rendered}");
     }
 
     #[test]
@@ -638,7 +730,8 @@ mod tests {
             estimated_bytes: 31_782_000_000,
             budget_bytes: 8_589_934_592,
             nnz: 2_650_704_199,
-            wide_indices: true,
+            value_bytes: 4,
+            index_bytes: Some(8),
             dense_request: false,
             dense_bytes: Some(23_600_000_000),
         };
@@ -646,6 +739,7 @@ mod tests {
         assert!(rendered.contains("2,650,704,199 nonzeros"), "{rendered}");
         assert!(rendered.contains("int64"), "{rendered}");
         assert!(rendered.contains("12 B each"), "{rendered}");
+        assert!(rendered.contains("4 B of value and 8 B"), "{rendered}");
         assert!(rendered.contains("container=\"dense\""), "{rendered}");
         assert!(rendered.contains("22.0 GiB"), "{rendered}");
 
@@ -653,12 +747,14 @@ mod tests {
             estimated_bytes: 25_239_799_332,
             budget_bytes: 8_589_934_592,
             nnz: 1_000_000_000,
-            wide_indices: false,
+            value_bytes: 4,
+            index_bytes: Some(4),
             dense_request: false,
             dense_bytes: None,
         };
         let rendered = format!("{narrow}");
         assert!(rendered.contains("8 B each"), "{rendered}");
+        assert!(rendered.contains("4 B of value and 4 B"), "{rendered}");
         assert!(!rendered.contains("int64"), "{rendered}");
         assert!(!rendered.contains("dense"), "{rendered}");
     }

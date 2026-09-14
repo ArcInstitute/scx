@@ -493,8 +493,9 @@ per-shard stats arithmetic and the decoded-vs-catalog checks, and
 `RowMajorStrategy`. Output buffers are carved into per-shard exclusive slices
 with `split_at_mut` before decode, so the parallel path needs no `unsafe`; the
 typed assembler carves the same way through `IndexBuffer::chunks_mut` /
-`ValueBuffer::chunks_mut`, which resolve the runtime dtype once per buffer
-instead of once per shard.
+`ValueBuffer::chunks_mut`, which resolve the runtime dtype once for the carve;
+the per-shard fill matches the slice enum again, as the range-taking form always
+did.
 
 **madvise hints** (Unix only, `#[cfg(unix)]`):
 - `MADV_SEQUENTIAL` on the shard byte range during `assemble_row_major()` — tells kernel to readahead aggressively for full reads

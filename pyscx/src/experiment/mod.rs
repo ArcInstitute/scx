@@ -1049,9 +1049,11 @@ impl PyExperiment {
     ///     memory_budget: Optional budget for the eager non-backed
     ///            assembly path. Accepts `None` (default 8 GiB), an int
     ///            byte count, or a string like `"4G"` / `"512MiB"`.
-    ///            When the catalog-only estimate of the assembled
-    ///            `X` + indptr + obs/var bytes — plus `adata.raw` when
-    ///            the read will assemble it — exceeds the budget,
+    ///            When the catalog-only estimate of what this call will
+    ///            assemble — `X` at the requested `container` and
+    ///            `data_dtype` (a dense request is
+    ///            `n_obs * n_vars * value_width`), `adata.raw` when the
+    ///            read will assemble it, and obs/var — exceeds the budget,
     ///            `to_anndata()` emits a `UserWarning` recommending
     ///            `backed=True` or `pyscx.open(path).query()`.
     ///            Assembly still proceeds — the warning is advisory.

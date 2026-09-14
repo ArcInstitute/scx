@@ -302,8 +302,8 @@ impl ScxReader {
                 ip_out.copy_from_slice(&shard_ip);
             } else {
                 let nnz_off_i64 = nnz_offsets[i] as i64;
-                for (j, slot) in ip_out.iter_mut().enumerate() {
-                    *slot = shard_ip[j + 1] + nnz_off_i64;
+                for (slot, &src) in ip_out.iter_mut().zip(&shard_ip[1..]) {
+                    *slot = src + nnz_off_i64;
                 }
             }
             Ok(())

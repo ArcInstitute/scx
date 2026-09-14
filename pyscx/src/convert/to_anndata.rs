@@ -287,20 +287,13 @@ pub(crate) fn estimate_eager_assembly_bytes(
     plan: &scx_sparse::MaterializePlan,
 ) -> u64 {
     let (n_obs, n_vars) = shape;
-    let entries = &catalog.entries;
-    let mut nnz: u64 = 0;
-    let mut x_rows: u64 = 0;
-    for entry in entries {
-        if entry.section_type != SectionType::CsrShard || entry.modality_id != 0 {
-            continue;
-        }
-        if let Some(stats) = &entry.stats {
-            nnz = nnz.saturating_add(stats.nnz);
-            x_rows = x_rows.saturating_add(stats.row_end.saturating_sub(stats.row_start));
-        }
-    }
+    // `csr_total_nnz` is the same modality-0 `CsrShard` fold this used to inline,
+    // and `n_obs` is the row count the assembled indptr will have — so the
+    // second walk over the catalog, and the hand-rolled sum, both go.
+    let nnz = catalog.csr_total_nnz(Some(0));
+    let indptr_bytes = n_obs.saturating_mul(8);
     let mut meta_bytes: u64 = 0;
-    for entry in entries {
+    for entry in &catalog.entries {
         match entry.section_type {
             SectionType::ObsMetadata
             | SectionType::VarMetadata
@@ -315,18 +308,35 @@ pub(crate) fn estimate_eager_assembly_bytes(
     let x_bytes = match mode {
         // No host X on this path at all.
         MatrixMode::SkipX => 0,
-        // The projecting assembler, which is f32/i32 regardless of the plan.
+        // The projecting assembler is f32/i32 regardless of the plan, and
+        // `csr_to_scipy_typed` then converts its output into whatever was asked
+        // for — so on a non-default plan **both** are live, and pricing only the
+        // staged f32 CSR is how a `var_names=` + `container="dense"` read could
+        // allocate a projected dense matrix without the budget ever firing.
         MatrixMode::Skeleton { n_selected_vars } => {
             let projected = scale_nnz_for_selection(nnz, n_vars, Some(n_selected_vars));
-            projected
+            let staged = projected
                 .saturating_mul(assembled_bytes_per_nnz(projected, 4))
-                .saturating_add(x_rows.saturating_mul(8))
+                .saturating_add(indptr_bytes);
+            let delivered = if plan.is_default_csr_f32() {
+                0
+            } else {
+                match plan.container {
+                    scx_sparse::Container::Dense => {
+                        dense_bytes_for(n_obs, n_selected_vars as u64, value_bytes)
+                    }
+                    scx_sparse::Container::Csr => projected
+                        .saturating_mul(assembled_bytes_per_nnz(projected, value_bytes))
+                        .saturating_add(indptr_bytes),
+                }
+            };
+            staged.saturating_add(delivered)
         }
         MatrixMode::Eager => match plan.container {
             scx_sparse::Container::Dense => dense_bytes_for(n_obs, n_vars, value_bytes),
             scx_sparse::Container::Csr => nnz
                 .saturating_mul(assembled_bytes_per_nnz(nnz, value_bytes))
-                .saturating_add(x_rows.saturating_mul(8)),
+                .saturating_add(indptr_bytes),
         },
     };
     // `adata.raw` is a second whole matrix on the same obs axis, with its own
@@ -339,7 +349,7 @@ pub(crate) fn estimate_eager_assembly_bytes(
         let raw_nnz = catalog.raw_csr_total_nnz();
         raw_nnz
             .saturating_mul(assembled_bytes_per_nnz(raw_nnz, value_bytes))
-            .saturating_add(x_rows.saturating_mul(8))
+            .saturating_add(indptr_bytes)
     } else {
         0
     };
@@ -459,9 +469,18 @@ pub(crate) fn to_anndata_with_layers<'py>(
                 estimated_bytes: est_bytes,
                 budget_bytes: budget,
                 nnz: reported_nnz,
-                // A dense read has no column-index array, so the int64 story
-                // does not apply to it whatever the nonzero count is.
-                wide_indices: !dense_request && reported_nnz > SCIPY_INT64_NNZ_THRESHOLD,
+                value_bytes: plan.data_dtype.size_bytes(),
+                // A dense read has no column-index array; a deletion-bearing
+                // file's `nnz` is physical, and scipy decides the width from the
+                // live count — which is exactly the thing the widen gate above
+                // refuses to guess, so the message must not guess it either.
+                index_bytes: if dense_request || deletions_active {
+                    None
+                } else if reported_nnz > SCIPY_INT64_NNZ_THRESHOLD {
+                    Some(8)
+                } else {
+                    Some(4)
+                },
                 dense_request,
                 dense_bytes,
             },
@@ -2551,6 +2570,56 @@ mod tests {
             estimate_eager_assembly_bytes(&cat, (rows, cols), MatrixMode::Eager, false, &f64_plan),
             10_000 * 12 + rows * 8,
             "float64 values are 8 B, not 4"
+        );
+    }
+
+    /// A `var_names=` projection delivers whatever the plan asked for, so the
+    /// estimate has to price that too.
+    ///
+    /// The projecting assembler is f32/i32 whatever the plan says, and
+    /// `csr_to_scipy_typed` converts its output afterwards — both are live at
+    /// once. Pricing only the staged f32 CSR meant a projected
+    /// `container="dense"` read could allocate `n_obs × n_selected × width`
+    /// while the estimate stayed at a few MiB of projected nonzeros, so the
+    /// budget never fired on the read that needed it most.
+    #[test]
+    fn the_estimate_prices_a_projected_read_at_what_it_delivers() {
+        let (rows, cols) = (100_000u64, 20_000u64);
+        let selected = 5_000usize;
+        // 0.05 % dense over the whole matrix: projected nnz is tiny, projected
+        // dense is not.
+        let cat = nnz_catalog(SectionType::CsrShard, 4, 1_000_000, rows / 4);
+        let mode = MatrixMode::Skeleton {
+            n_selected_vars: selected,
+        };
+        let csr = scx_sparse::MaterializePlan::default_csr_f32();
+
+        let projected_nnz = 1_000_000 * selected as u64 / cols;
+        let staged = projected_nnz * 8 + rows * 8;
+        assert_eq!(
+            estimate_eager_assembly_bytes(&cat, (rows, cols), mode, false, &csr),
+            staged,
+            "a default plan delivers the staged CSR itself, so it is counted once"
+        );
+
+        let dense_plan = scx_sparse::MaterializePlan {
+            container: scx_sparse::Container::Dense,
+            ..csr
+        };
+        let dense = estimate_eager_assembly_bytes(&cat, (rows, cols), mode, false, &dense_plan);
+        assert_eq!(dense, staged + rows * selected as u64 * 4);
+        // The projected dense buffer is the term that was missing, and it
+        // dominates by three orders of magnitude on this shape.
+        assert!(dense > 100 * staged, "dense {dense} vs staged {staged}");
+
+        // A non-default *value* dtype is delivered as a second CSR.
+        let f64_plan = scx_sparse::MaterializePlan {
+            data_dtype: scx_sparse::ValueDtype::F64,
+            ..csr
+        };
+        assert_eq!(
+            estimate_eager_assembly_bytes(&cat, (rows, cols), mode, false, &f64_plan),
+            staged + (projected_nnz * 12 + rows * 8)
         );
     }
 

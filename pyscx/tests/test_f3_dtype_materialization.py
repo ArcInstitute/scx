@@ -400,31 +400,48 @@ sp.save_npz({out!r}, a.X)
 def test_widen_leaves_an_explicit_index_dtype_alone(tmp_dir):
     """An explicit `index_dtype=` is the caller's decision, threshold or not.
 
-    `index_dtype="int32"` would NOT test this: that plan is still
-    `is_default_csr_f32()`, so the widen rewrites it and the assertion holds
-    either way. `int16` is the non-default branch the contract is about — the
-    read must take the narrowing typed path (and range-gate it) rather than
-    being silently promoted to int64 because the threshold was lowered.
+    Two earlier versions of this test proved nothing. `index_dtype="int32"` is
+    still `is_default_csr_f32()`, so the widen rewrote the plan and the
+    assertion held either way. Asserting *values* under `int16` was no better:
+    index width does not change values, so an accidental promotion to I64 would
+    have passed too.
 
-    scipy still hands back int32 (it canonicalizes in both directions on a
-    fixture this small), so the dtype is not the evidence; the evidence is that
-    the values survive the narrow, which they would not if the widen had
-    replaced the plan.
+    What discriminates is the **range gate**. On a matrix wider than
+    `i16::MAX` columns with a nonzero above that column, an honoured `int16`
+    request must fail loud; a plan silently rewritten to `int64` would sail
+    through. So the refusal is the evidence that the explicit request survived.
     """
-    adata = _counts_adata(n_obs=30, n_vars=10, seed=4)
-    path = _write(tmp_dir, adata, name="explicit.scx")
-    out = str(tmp_dir / "explicit.npz")
+    n_vars = 40_000  # > i16::MAX, so a high column index cannot fit int16
+    rng = np.random.default_rng(6)
+    dense = np.zeros((4, n_vars), dtype=np.float32)
+    dense[0, 0] = 1.0
+    dense[1, n_vars - 1] = 2.0  # column 39,999 — the one int16 cannot hold
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(dense),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(4)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(n_vars)]),
+    )
+    path = _write(tmp_dir, adata, name="explicit_wide.scx")
+
+    # Premise: the default read is fine, so the refusal below is about int16 and
+    # not about the fixture.
+    assert pyscx.open(path).to_anndata().X.nnz == 2
+
     _run_with_threshold(
         f"""
-import numpy as np, pyscx, scipy.sparse as sp
-a = pyscx.open({path!r}).to_anndata(index_dtype="int16")
-assert a.X.data.dtype == np.float32, a.X.data.dtype
-sp.save_npz({out!r}, a.X)
+import pyscx
+try:
+    pyscx.open({path!r}).to_anndata(index_dtype="int16")
+except ValueError as e:
+    assert "int16" in str(e) or "range" in str(e).lower(), e
+else:
+    raise AssertionError(
+        "index_dtype='int16' was honoured nowhere: a column index of 39,999 "
+        "must fail the range gate. A plan rewritten to int64 would not."
+    )
 """,
         0,
     )
-    got = sp.load_npz(out)
-    np.testing.assert_array_equal(got.toarray(), adata.X.toarray())
 
 
 def test_widen_is_disabled_on_a_file_with_deletion_vectors(tmp_dir):
