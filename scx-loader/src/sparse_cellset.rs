@@ -109,6 +109,11 @@ pub struct SparseCellSetLoader {
     /// misleading on a large-shard file where the byte budget binds first, which
     /// is exactly the STATE3 regime this loader targets.
     affordable_cache_shards: usize,
+    /// Caller-declared upper bound on rows per plan, or `None` (uncharged).
+    max_plan_rows: Option<usize>,
+    /// Manifest-wide mean non-zeros per row — the density the batch charge and
+    /// its `memory_budget()` report are computed at.
+    mean_nnz_per_row: f64,
     /// Average decoded bytes per CSR shard across every file, the unit the
     /// budget model counts in.
     shard_decoded_bytes: usize,
@@ -143,7 +148,13 @@ pub struct SparseCellSetLoader {
 /// only (no decode). Same per-shard model as `IndexPlanLoader`'s auto-tune and
 /// as `scx_format_io`'s `SizeHint for ScxCsr`: `nnz × 8` (i32 indices + f32
 /// data) + `rows × 8` (i64 indptr).
-fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
+///
+/// Also returns the manifest's mean non-zeros per row, which the same walk
+/// already accumulates and used to discard. That is the per-row size a gathered
+/// batch is charged at (see [`SparseCellSetBudgetModel`]); deriving it here
+/// rather than in a second catalog walk keeps one definition of which shards
+/// count, and the divisor rule below applies to both.
+fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> (usize, f64) {
     let mut total_nnz = 0u64;
     let mut total_rows = 0u64;
     // Only shards that CONTRIBUTED to the totals may count toward the divisor.
@@ -165,11 +176,20 @@ fn avg_shard_decoded_bytes(readers: &[ScxReader]) -> usize {
     // No shard carried stats ⇒ the size is genuinely unknown. Returning 0 is the
     // signal `SparseCellSetLoader::new` reads as "the byte cap tells us nothing",
     // falling back to the count cap rather than to a fabricated average.
-    total_nnz
+    let avg_bytes = total_nnz
         .saturating_mul(8)
         .saturating_add(total_rows.saturating_mul(8))
         .checked_div(n_counted)
-        .unwrap_or(0) as usize
+        .unwrap_or(0) as usize;
+    // Rows, not shards, in this divisor: the mean is per row of the manifest,
+    // so shards of unequal height must not be weighted equally. 0.0 when no
+    // shard carried stats, matching `avg_bytes`'s "genuinely unknown" signal.
+    let mean_nnz_per_row = if total_rows == 0 {
+        0.0
+    } else {
+        total_nnz as f64 / total_rows as f64
+    };
+    (avg_bytes, mean_nnz_per_row)
 }
 
 use crate::budget::BudgetModel;
@@ -259,9 +279,16 @@ pub(crate) struct SparseCellSetParams {
 ///
 /// * **Charged**: the decoded shard cache, sized and enforced from this model,
 ///   plus the interpreter/numpy/Arrow constant every path pays.
-/// * **Not charged**: the gathered batch itself and its transients. Unlike
-///   `IndexPlanLoader`, this path has no `max_plan_size`, so a plan's output
-///   size is caller-controlled and unbounded — there is nothing fixed to cost.
+/// * **Charged only if declared**: the gathered batch. Unlike `IndexPlanLoader`
+///   this path has no `max_plan_size` — a plan's output size is caller-controlled
+///   and unbounded, so there is nothing fixed to cost until the caller says how
+///   wide its plans get. `max_plan_rows` is that declaration, and it is opt-in
+///   on purpose: charging a guessed default would shrink the cache on every
+///   existing caller, and on a file where the adaptive cap already binds
+///   (census_500k affords 22 of the 31 shards it wants) that is throughput
+///   traded away for an estimate nobody asked for.
+/// * **Not charged**: the batch's transients, and the batch at all when
+///   `max_plan_rows` is `None`.
 /// * **Not a hard cap**: `WeightedLruCache::put_with_budget` deliberately keeps
 ///   a single entry that exceeds the byte budget on its own (refusing would
 ///   defeat the cache for any outsized shard), so one above-average shard can
@@ -277,6 +304,24 @@ pub(crate) struct SparseCellSetParams {
 /// absurd budget must keep warning rather than start raising.
 pub(crate) struct SparseCellSetBudgetModel {
     shard_decoded_bytes: usize,
+    /// One gathered batch at the caller's declared `max_plan_rows`, or 0.
+    batch_bytes: usize,
+}
+
+impl SparseCellSetBudgetModel {
+    /// Bytes one gathered batch of `rows` occupies, at `mean_nnz_per_row`.
+    ///
+    /// The §4.4 batch is CSR, so this is the `csr_component_bytes` shape —
+    /// `nnz × 8` for the i32 indices plus the f32 data, and `(rows + 1) × 8` for
+    /// the i64 indptr — not `IndexPlanLoader`'s dense `2 × rows × n_cols × 4`.
+    /// The per-row obs and id arrays are left out: they are two orders of
+    /// magnitude smaller than the CSR at any realistic density, and a term that
+    /// small would lend the estimate a precision it does not have.
+    fn batch_bytes_for(max_plan_rows: usize, mean_nnz_per_row: f64) -> usize {
+        let nnz = (max_plan_rows as f64 * mean_nnz_per_row).ceil() as usize;
+        nnz.saturating_mul(8)
+            .saturating_add(max_plan_rows.saturating_add(1).saturating_mul(8))
+    }
 }
 
 impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
@@ -285,7 +330,10 @@ impl crate::budget::BudgetModel for SparseCellSetBudgetModel {
     fn estimate(&self, p: SparseCellSetParams) -> crate::budget::BudgetBreakdown {
         crate::budget::BudgetBreakdown::new(
             p.cache_shards.saturating_mul(self.shard_decoded_bytes),
-            0,
+            // The existing `batch_buffer_bytes` slot, rather than a seventh key:
+            // every loader class reports the same six, and the breakdown's shape
+            // is pinned by `test_every_budget_carries_the_same_breakdown`.
+            self.batch_bytes,
             0,
             0,
             crate::budget::PYTHON_OVERHEAD_BYTES,
@@ -331,6 +379,7 @@ impl SparseCellSetLoader {
         target_sum: f64,
         downsample: Option<crate::downsample::DownsampleConfig>,
         scatter_block_index: bool,
+        max_plan_rows: Option<usize>,
     ) -> Result<Arc<Self>> {
         // Same reason as `IndexPlanLoader`: this loader resolves cells by global
         // obs row through `BackedCsrReader`, so a multimodal file's flattened
@@ -398,9 +447,16 @@ impl SparseCellSetLoader {
         };
         // Resolve the cache byte budget before the readers are moved into the
         // engine: the adaptive path needs their catalog stats.
-        let shard_decoded_bytes = avg_shard_decoded_bytes(&scx_readers);
+        let (shard_decoded_bytes, mean_nnz_per_row) = avg_shard_decoded_bytes(&scx_readers);
+        // `None` ⇒ 0 ⇒ the breakdown and the resolved cache are byte-identical
+        // to what this loader produced before the term existed. Only a caller
+        // who declares how wide its plans get pays for one.
+        let batch_bytes = max_plan_rows
+            .map(|rows| SparseCellSetBudgetModel::batch_bytes_for(rows, mean_nnz_per_row))
+            .unwrap_or(0);
         let model = SparseCellSetBudgetModel {
             shard_decoded_bytes,
+            batch_bytes,
         };
         let requested = SparseCellSetParams { cache_shards };
         let cache_bytes_budget = match bytes_budget {
@@ -467,6 +523,8 @@ impl SparseCellSetLoader {
             cache_bytes_budget,
             cache_shards,
             affordable_cache_shards,
+            max_plan_rows,
+            mean_nnz_per_row,
             shard_decoded_bytes,
             budget_breakdown,
             enforced_cache_bytes,
@@ -486,6 +544,21 @@ impl SparseCellSetLoader {
     /// the value that actually binds.
     pub fn cache_shards(&self) -> usize {
         self.cache_shards
+    }
+
+    /// Caller-declared rows-per-plan bound, or `None` if the batch is uncharged.
+    pub fn max_plan_rows(&self) -> Option<usize> {
+        self.max_plan_rows
+    }
+
+    /// Manifest-wide mean non-zeros per row (0.0 when no shard carries stats).
+    pub fn mean_nnz_per_row(&self) -> f64 {
+        self.mean_nnz_per_row
+    }
+
+    /// Cap on simultaneously-running shard decodes in the prefetch engine.
+    pub fn max_blocking_threads(&self) -> usize {
+        self.engine.max_blocking_threads()
     }
 
     /// Shard-cache entries actually affordable: `min(cache_shards, budget /
@@ -509,10 +582,12 @@ impl SparseCellSetLoader {
     /// Per-component memory estimate, in the one shape every class that reports
     /// a budget uses (ORG-9.10-4).
     ///
-    /// Only two terms are non-zero, and that is the model, not an omission: the
-    /// shard cache **is** this loader's budget — there is no batch buffer,
-    /// no plan-tuple staging and no per-batch obs scratch on the gather path —
-    /// plus the interpreter/numpy/Arrow constant every path pays.
+    /// Two terms are non-zero by default, and that is the model, not an
+    /// omission: the shard cache **is** this loader's budget — no plan-tuple
+    /// staging and no per-batch obs scratch on the gather path — plus the
+    /// interpreter/numpy/Arrow constant every path pays. A caller that declares
+    /// `max_plan_rows` adds a third, `batch_buffer_bytes`: one gathered CSR
+    /// batch at that width and the manifest's mean density.
     ///
     /// Since ORG-9.10-5 the interpreter constant is **budgeted**, not merely
     /// reported: the auto-tune subtracts it before sizing the cache, so

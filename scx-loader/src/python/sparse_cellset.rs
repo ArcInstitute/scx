@@ -96,16 +96,32 @@ impl SparseCellSetDataset {
     ///         (sorted data + a reused control pool → a small working set that
     ///         fits the shard cache and is touched most batches). Measured on
     ///         a 50-file Tahoe atlas: steps/s 2.80 → 4.55 and gather 337 ms →
-    ///         ~5 ms with it off, at ≈ .h5ad parity — measured **before**
-    ///         OPT-FORMATIO-1, when the row-group path retained nothing and so
-    ///         re-decoded a hot shard's groups every batch. The touched groups
-    ///         now stay in the same LRU under the same byte budget
-    ///         (`cache_metrics()["row_group_hits"]`), so the gap is expected
-    ///         to be much smaller; the default stays False until re-measured.
-    ///         Pass True for a genuinely cache-hostile run (working set ≫
-    ///         cache), where the row-group-scoped decode's bounded peak RAM is
-    ///         the memory-safe choice. `SCX_SCATTER_BLOCK_INDEX=0` is the
-    ///         process-wide reader-layer kill-switch over both settings.
+    ///         ~5 ms with it off, at ≈ .h5ad parity.
+    ///         **Re-measured after OPT-FORMATIO-1**, with the cache sized to
+    ///         the file, as a 2×2 over corpus size × plan locality (sets/s,
+    ///         off vs on): tabula 100k/7 shards 899 vs 5.4 random and 812 vs
+    ///         6.9 grouped; census_1m/62 shards 11.4 vs 6.9 random and **300
+    ///         vs 459 grouped**. So there is no fixed winner — full-shard
+    ///         degrades with corpus size while block-index is roughly flat and
+    ///         tracks plan locality, and they cross somewhere near 1M cells.
+    ///         The default stays False because flipping it costs 117–167× on
+    ///         100k-cell corpora, which is the common case; the right answer at
+    ///         scale is per-dataset route selection, not a different constant.
+    ///         Pass True for a large corpus with local plans, or for a
+    ///         genuinely cache-hostile run (working set ≫ cache) where the
+    ///         row-group-scoped decode's bounded peak RAM is the memory-safe
+    ///         choice. `SCX_SCATTER_BLOCK_INDEX=0` is the process-wide
+    ///         reader-layer kill-switch over both settings.
+    ///     max_plan_rows: Upper bound on rows per plan, charging one gathered
+    ///         batch against `max_memory_mb` before the shard cache is sized.
+    ///         Default `None` — **uncharged**, and the resolved cache is then
+    ///         byte-identical to what it was before this argument existed. This
+    ///         class has no `max_plan_size`: plan width is the caller's, so
+    ///         only the caller can say what a batch costs, and a guessed
+    ///         default would silently shrink the cache on every existing
+    ///         dataset. Declare it when the budget is meant to bound the
+    ///         process rather than just the cache; `memory_budget()` then
+    ///         reports the term as `breakdown["batch_buffer_bytes"]`.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -122,6 +138,7 @@ impl SparseCellSetDataset {
         downsample_method=None,
         downsample_seed=None,
         scatter_block_index=None,
+        max_plan_rows=None,
     ))]
     fn new(
         py: Python<'_>,
@@ -138,6 +155,7 @@ impl SparseCellSetDataset {
         downsample_method: Option<String>,
         downsample_seed: Option<u64>,
         scatter_block_index: Option<bool>,
+        max_plan_rows: Option<usize>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -151,15 +169,15 @@ impl SparseCellSetDataset {
         let normalize = normalize.unwrap_or(false);
         let log1p = log1p.unwrap_or(false);
         let target_sum = target_sum.unwrap_or(1e4);
-        // Default OFF, unlike `IndexPlanDataset`. The cell-set workload is
-        // cache-friendly (sorted data + a reused control pool → high shard
-        // reuse), and the block-index gather keys on `!cache.contains()`, so a
-        // hot shard stays eligible forever: it is re-decoded every batch and the
-        // LRU never populates. Measured on a 50-file Tahoe atlas (PR #299, on
-        // the equivalent gather this knob replaced): steps/s 2.80 → 4.55, gather
-        // 337 ms → ~5 ms, cache populated to 8.25 GB — at ≈ .h5ad parity.
-        // Pass `scatter_block_index=True` for a cache-hostile run (working set
-        // ≫ cache), where the row-group decode's bounded peak RAM wins.
+        // Default OFF, unlike `IndexPlanDataset`, and re-measured after the
+        // row-group LRU (OPT-FORMATIO-1) rather than inherited: full-shard wins
+        // 167× on tabula random and 117× grouped, 1.65× on census_1m random,
+        // and LOSES 1.53× on census_1m grouped. The two routes cross near 1M
+        // cells — full-shard degrades with corpus size, block-index is flat in
+        // it and tracks plan locality — so `false` is the right default for the
+        // 100k-cell common case, not a universal answer. The general fix is
+        // per-dataset route selection off the per-plan `planned` footprint the
+        // engine already computes, not a different constant here.
         let scatter_block_index = scatter_block_index.unwrap_or(false);
         // Raised as `ValueError`, not the `loader_err_to_py` default of
         // `RuntimeError`: every argument check on this path is a bad *value*,
@@ -228,6 +246,7 @@ impl SparseCellSetDataset {
                     target_sum,
                     downsample,
                     scatter_block_index,
+                    max_plan_rows,
                 )
                 .map_err(OpenError::Loader)
             })
@@ -446,11 +465,16 @@ impl SparseCellSetDataset {
     /// cache_shards           - requested count cap
     /// effective_cache_shards - shards the byte budget holds at average size
     /// shard_decoded_bytes    - average decoded bytes per CSR shard
+    /// max_plan_rows          - declared rows-per-plan bound, or None
+    /// mean_nnz_per_row       - manifest density the batch charge uses
+    /// max_blocking_threads   - cap on simultaneous shard decodes
     /// ```
     ///
-    /// Only `cache_bytes` and `python_overhead_bytes` are non-zero in the
-    /// breakdown: on this path the shard cache *is* the budget — there is no
-    /// batch-buffer or plan-tuple term.
+    /// `cache_bytes` and `python_overhead_bytes` are the non-zero terms: on this
+    /// path the shard cache *is* the budget, with no plan-tuple staging. Pass
+    /// `max_plan_rows` and `batch_buffer_bytes` joins them — one gathered CSR
+    /// batch that wide at `mean_nnz_per_row`, subtracted before the cache is
+    /// sized, so `effective_cache_shards` falls accordingly.
     ///
     /// `budget_exceeded` is `True` when even a one-shard cache does not fit.
     /// Before ORG-9.10-5 `total_bytes` could exceed `max_memory_mb` routinely,
@@ -458,11 +482,17 @@ impl SparseCellSetDataset {
     /// included.
     ///
     /// That is a statement about **the cache this loader sizes**, not a ceiling
-    /// on process RSS: the gathered batch and its transients are not charged
-    /// (this path has no `max_plan_size`, so plan output size is
-    /// caller-controlled), and the shared LRU keeps a single oversize shard
-    /// rather than refusing to cache it, so one above-average shard can sit
-    /// above the byte cap.
+    /// on process RSS: the batch's transients are never charged and the batch
+    /// itself only when `max_plan_rows` says how wide plans get (this path has
+    /// no `max_plan_size`, so plan output size is otherwise caller-controlled
+    /// and unbounded), and the shared LRU keeps a single oversize shard rather
+    /// than refusing to cache it, so one above-average shard can sit above the
+    /// byte cap.
+    ///
+    /// `max_blocking_threads` is reported beside them because it is the other
+    /// thing standing between a wide plan and unbounded transient memory: it
+    /// caps how many shard decodes run at once. `lookahead` bounds in-flight
+    /// *plans*, not the tasks a plan spawns.
     ///
     /// ORG-9.10-4 renamed `affordable_cache_shards` to `effective_cache_shards`:
     /// it is the same quantity `IndexPlanDataset` reports under that name, and
@@ -477,6 +507,9 @@ impl SparseCellSetDataset {
         dict.set_item("cache_shards", loader.cache_shards())?;
         dict.set_item("effective_cache_shards", loader.effective_cache_shards())?;
         dict.set_item("shard_decoded_bytes", per_shard)?;
+        dict.set_item("max_plan_rows", loader.max_plan_rows())?;
+        dict.set_item("mean_nnz_per_row", loader.mean_nnz_per_row())?;
+        dict.set_item("max_blocking_threads", loader.max_blocking_threads())?;
         dict.set_item("budget_exceeded", loader.budget_exceeded())?;
         Ok(dict)
     }

@@ -173,6 +173,11 @@ impl PrefetchEngine {
         self.default_lookahead
     }
 
+    /// Cap on simultaneously-running shard decodes — see [`Self::blocking_threads`].
+    pub fn max_blocking_threads(&self) -> usize {
+        self.blocking_threads()
+    }
+
     /// Shared handle to the readers' one `SharedShardCache` counters. Always
     /// populated; cloning the `Arc` lets callers sample without the cache lock.
     pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
@@ -194,6 +199,28 @@ impl PrefetchEngine {
         self.runtime.get().is_some()
     }
 
+    /// Concurrent shard decodes this engine's blocking pool will run at once.
+    ///
+    /// `lookahead` bounds in-flight **plans**, not tasks: `spawn_prefetches`
+    /// issues one `spawn_blocking` per distinct `(file, shard)` a plan touches,
+    /// which is caller-controlled through plan width and reaches 48+ on the
+    /// STATE3 shapes `suggested_cache_shards` was written for. Left at tokio's
+    /// default the ceiling is **512** simultaneously decoding shards, which for
+    /// a census-sized shard is not a bound in any useful sense.
+    ///
+    /// Sized to the decode pool rather than to `lookahead`: the work is
+    /// CPU-bound, so more concurrent decodes than cores buys queueing, not
+    /// throughput — while a bound of `lookahead + 1` would cap the ~192-task
+    /// case at 5 and serialise exactly the wide plans this loader exists for.
+    /// The `+ lookahead` keeps the next plans' warms able to start while the
+    /// current one's decodes occupy the pool.
+    fn blocking_threads(&self) -> usize {
+        crate::pool::cpu_pool()
+            .current_num_threads()
+            .saturating_add(self.default_lookahead)
+            .max(2)
+    }
+
     /// Lazily build the prefetch runtime (2 blocking-friendly worker threads),
     /// Never built at construction, so a
     /// forked child starts with an empty `OnceLock`.
@@ -203,6 +230,7 @@ impl PrefetchEngine {
         }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .max_blocking_threads(self.blocking_threads())
             .enable_all()
             .thread_name("scx-plan-engine")
             .build()

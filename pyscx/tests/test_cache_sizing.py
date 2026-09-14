@@ -555,3 +555,72 @@ class TestThrashWarning:
         assert run(True) == 0, (
             "the suppression recipe printed in the warning must actually work"
         )
+
+
+class TestSparseCellSetBatchCharge:
+    """`max_plan_rows` charges one gathered batch against the byte budget.
+
+    The class has no `max_plan_size`: a plan's row count is the caller's, so
+    only the caller can say what a batch costs. That is why the charge is
+    opt-in — the test below that the default is *unchanged* is as load-bearing
+    as the one that the charge works, since a guessed default would shrink the
+    shard cache on every existing dataset, and cache size is the lever worth
+    2,486x on a file whose working set does not fit.
+    """
+
+    def test_default_reports_no_batch_term(self, multishard_path):
+        ds = pyscx.SparseCellSetDataset([multishard_path])
+        try:
+            b = ds.memory_budget()
+            assert b["max_plan_rows"] is None
+            assert b["breakdown"]["batch_buffer_bytes"] == 0
+            assert b["mean_nnz_per_row"] > 0, (
+                "the density is reported whether or not it is charged; 0 would "
+                "mean no shard carried catalog stats"
+            )
+        finally:
+            ds.close()
+
+    def test_declaring_plan_width_charges_a_batch_and_shrinks_the_cache(
+        self, multishard_path
+    ):
+        budget_mb = 64
+        plain = pyscx.SparseCellSetDataset([multishard_path], max_memory_mb=budget_mb)
+        wide = pyscx.SparseCellSetDataset(
+            [multishard_path], max_memory_mb=budget_mb, max_plan_rows=100_000
+        )
+        try:
+            pb, wb = plain.memory_budget(), wide.memory_budget()
+            assert wb["max_plan_rows"] == 100_000
+            assert wb["breakdown"]["batch_buffer_bytes"] > 0
+            assert pb["breakdown"]["batch_buffer_bytes"] == 0
+            # The charge comes out of the cache, not out of thin air.
+            assert (
+                wb["effective_cache_shards"] <= pb["effective_cache_shards"]
+            ), f"{wb['effective_cache_shards']} vs {pb['effective_cache_shards']}"
+            # And the six-key breakdown still sums, with the new term included.
+            bd = wb["breakdown"]
+            assert (
+                sum(v for k, v in bd.items() if k != "total_bytes")
+                == bd["total_bytes"]
+            )
+        finally:
+            plain.close()
+            wide.close()
+
+    def test_blocking_thread_cap_is_reported_and_bounded(self, multishard_path):
+        """`lookahead` bounds in-flight plans, not the tasks a plan spawns.
+
+        Each plan issues one `spawn_blocking` per distinct `(file, shard)` it
+        touches — caller-controlled through plan width, and 48+ on the shapes
+        `suggested_cache_shards` was written for. Left at tokio's default the
+        ceiling was 512 simultaneous shard decodes, which for a census-sized
+        shard bounds nothing useful.
+        """
+        ds = pyscx.SparseCellSetDataset([multishard_path])
+        try:
+            cap = ds.memory_budget()["max_blocking_threads"]
+            assert isinstance(cap, int)
+            assert 2 <= cap < 512, f"blocking cap {cap} is not a useful bound"
+        finally:
+            ds.close()

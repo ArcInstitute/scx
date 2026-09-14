@@ -125,6 +125,7 @@ fn cellset_plan_admission_is_per_plan_not_per_set() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ true,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     let rows: Vec<u64> = vec![5, 70, 140, 200, 20, 85, 155, 215];
@@ -201,6 +202,7 @@ fn cellset_plan_admission_ignores_plan_level_density() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ true,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     assert!(
@@ -277,6 +279,7 @@ fn loader_threads_the_block_index_gate_into_the_engine() {
             0.0,
             /*downsample*/ None,
             gate,
+            /*max_plan_rows*/ None,
         )
         .unwrap();
 
@@ -344,6 +347,7 @@ fn gather_single_file_sets_matches_reference_in_order() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -405,6 +409,7 @@ fn empty_set_keeps_boundary_without_rows() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     // set 0: two rows; set 1: empty; set 2: one row.
@@ -459,6 +464,7 @@ fn gather_cross_file_set_concatenates_in_global_space() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -516,6 +522,7 @@ fn malformed_plan_loader(dir: &std::path::Path) -> StdArc<SparseCellSetLoader> {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap()
 }
@@ -550,6 +557,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -768,6 +776,7 @@ fn budget_loader(
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap()
 }
@@ -967,17 +976,23 @@ fn avg_shard_decoded_bytes_ignores_stat_less_shards_in_the_divisor() {
     let p0 = dir.path().join("s0.scx");
     write_fixture(&p0, 32, 8, 4);
     let one = avg_shard_decoded_bytes(&[open(&p0)]);
-    assert_eq!(one, 128, "8 rows x 1 nnz => (8*8 + 8*8)/1 per shard");
+    assert_eq!(one.0, 128, "8 rows x 1 nnz => (8*8 + 8*8)/1 per shard");
 
     // Two identical files: twice the shards, twice the totals, same average.
     let p1 = dir.path().join("s1.scx");
     write_fixture(&p1, 32, 8, 4);
     let two = avg_shard_decoded_bytes(&[open(&p0), open(&p1)]);
     assert_eq!(
-        two, one,
+        two.0, one.0,
         "the average must be scale-invariant; a drift here means the divisor \
          and the numerator are counting different shard sets"
     );
+
+    // The mean density rides the same walk and the same divisor rule, but is
+    // per ROW: `write_fixture` gives every row exactly one non-zero, so shards
+    // of unequal height cannot pull it away from 1.0.
+    assert_eq!(one.1, 1.0, "8 rows x 1 nnz => 1 nnz/row");
+    assert_eq!(two.1, one.1, "density must be scale-invariant too");
 }
 
 /// No shard carries stats ⇒ size unknown ⇒ the byte cap says nothing, so the
@@ -987,7 +1002,7 @@ fn effective_cache_shards_falls_back_to_the_count_when_size_is_unknown() {
     // An empty reader set is the degenerate "no shards carry stats" case the
     // helper must survive; `SparseCellSetLoader::new` rejects zero files, so the
     // helper is exercised directly.
-    assert_eq!(avg_shard_decoded_bytes(&[]), 0);
+    assert_eq!(avg_shard_decoded_bytes(&[]), (0, 0.0));
 }
 
 /// The **byte** half of that fallback, which the test above never covered.
@@ -1044,8 +1059,89 @@ fn sized_budget_loader(
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap()
+}
+
+/// A loader built with an explicit `max_plan_rows` charges one gathered batch.
+fn batch_charged_loader(
+    dir: &std::path::Path,
+    cache_shards: usize,
+    bytes_budget: Option<usize>,
+    max_plan_rows: Option<usize>,
+) -> StdArc<SparseCellSetLoader> {
+    let p0 = dir.join("b0.scx");
+    write_fixture(&p0, 8192, 64, 4);
+    SparseCellSetLoader::new(
+        vec![open(&p0)],
+        cache_shards,
+        bytes_budget,
+        4,
+        None,
+        None,
+        false,
+        false,
+        0.0,
+        /*downsample*/ None,
+        /*scatter_block_index*/ false,
+        max_plan_rows,
+    )
+    .unwrap()
+}
+
+/// `max_plan_rows` is what turns the batch charge on; without it, nothing moves.
+///
+/// The default has to be byte-identical rather than merely "small": this class
+/// has no `max_plan_size`, so any default would be a guess about plan width, and
+/// on a file where the byte budget already binds a guess spends cache — the
+/// lever `cache_shards` 16 -> 31 measured at 2,486x on census_500k — to buy an
+/// estimate the caller never asked for.
+#[test]
+fn the_batch_is_uncharged_until_max_plan_rows_is_declared() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = Some(50 * 1024 * 1024 + 64 * 32_768);
+
+    let plain = batch_charged_loader(dir.path(), 64, budget, None);
+    assert_eq!(
+        plain.budget_breakdown().batch_buffer_bytes,
+        0,
+        "an undeclared plan width must cost nothing"
+    );
+    assert_eq!(plain.max_plan_rows(), None);
+
+    // `write_fixture` gives one non-zero per row, so a 4096-row plan is
+    // 4096 nnz x 8 B + 4097 x 8 B of indptr.
+    let declared = batch_charged_loader(dir.path(), 64, budget, Some(4096));
+    assert_eq!(declared.mean_nnz_per_row(), 1.0);
+    assert_eq!(
+        declared.budget_breakdown().batch_buffer_bytes,
+        4096 * 8 + 4097 * 8
+    );
+    assert_eq!(declared.max_plan_rows(), Some(4096));
+
+    // Same budget, same shards requested: the charge comes out of the cache.
+    assert!(
+        declared.effective_cache_shards() < plain.effective_cache_shards(),
+        "charging a batch must shrink the affordable cache: {} vs {}",
+        declared.effective_cache_shards(),
+        plain.effective_cache_shards()
+    );
+
+    // ...and monotonically so, which is what makes the term a bound rather
+    // than a flag.
+    let wider = batch_charged_loader(dir.path(), 64, budget, Some(16384));
+    assert!(
+        wider.effective_cache_shards() < declared.effective_cache_shards(),
+        "a wider plan must cost more cache: {} vs {}",
+        wider.effective_cache_shards(),
+        declared.effective_cache_shards()
+    );
+    assert!(
+        wider.budget_breakdown().total_bytes <= wider.cache_bytes_budget()
+            || wider.budget_exceeded(),
+        "the charged breakdown must still fit the budget it was tuned against"
+    );
 }
 
 /// A loader whose budget was not exceeded must fit the breakdown it reports.
@@ -1101,6 +1197,7 @@ fn closed_form_agrees_with_the_shared_driver() {
     const SHARD: usize = 32_768;
     let model = SparseCellSetBudgetModel {
         shard_decoded_bytes: SHARD,
+        batch_bytes: 0,
     };
     let py = crate::budget::PYTHON_OVERHEAD_BYTES;
     let budgets = [
@@ -1140,6 +1237,7 @@ fn the_sparse_reduction_chain_is_monotone() {
         crate::budget::assert_monotone_reduction_chain(
             &SparseCellSetBudgetModel {
                 shard_decoded_bytes,
+                batch_bytes: 0,
             },
             SparseCellSetParams { cache_shards: 128 },
         );
@@ -1316,6 +1414,7 @@ fn gather_clips_negatives_in_the_emitted_csr() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1352,6 +1451,7 @@ fn gather_clip_runs_after_coalescing_not_before() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1389,6 +1489,7 @@ fn gather_downsamples_to_the_target_with_multinomial() {
             vec![ident],
         )),
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1420,6 +1521,7 @@ fn gather_without_downsample_leaves_counts_untouched() {
         0.0,
         None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
     let (_, dat) = {
@@ -1459,6 +1561,7 @@ fn gather_downsample_is_reproducible_across_loader_instances() {
                 vec![ident],
             )),
             /*scatter_block_index*/ false,
+            /*max_plan_rows*/ None,
         )
         .unwrap()
     };
@@ -1495,6 +1598,7 @@ fn gather_downsample_is_invariant_to_row_order_within_a_plan() {
             vec![ident],
         )),
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1540,6 +1644,7 @@ fn gather_downsample_is_invariant_to_manifest_order() {
                 idents,
             )),
             /*scatter_block_index*/ false,
+            /*max_plan_rows*/ None,
         )
         .unwrap()
     };
@@ -1581,6 +1686,7 @@ fn gather_rejects_an_invalid_downsample_config() {
             0.0,
             Some(cfg),
             /*scatter_block_index*/ false,
+            /*max_plan_rows*/ None,
         )
     };
 
@@ -1646,6 +1752,7 @@ fn gather_rejects_an_empty_identity_table_across_multiple_files() {
             vec![],
         )),
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .err()
     .expect("multi-file downsample without identities must be rejected")
@@ -1765,6 +1872,7 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
         /*target_sum*/ 1e4,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1832,6 +1940,7 @@ fn gather_presizes_indices_and_data_exactly_on_the_raw_local_path() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 
@@ -1890,6 +1999,7 @@ fn gather_presize_is_an_upper_bound_when_remap_drops_entries() {
         0.0,
         /*downsample*/ None,
         /*scatter_block_index*/ false,
+        /*max_plan_rows*/ None,
     )
     .unwrap();
 

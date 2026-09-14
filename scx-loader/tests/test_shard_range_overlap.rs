@@ -178,7 +178,7 @@ fn the_cell_set_loader_refuses_a_multimodal_file() {
     let readers = vec![ScxReader::open(&path).unwrap()];
     let err = SparseCellSetLoader::new(
         readers, 4, None, 4, None, None, /*normalize=*/ false, /*log1p=*/ false, 1e4,
-        None, /*scatter_block_index*/ false,
+        None, /*scatter_block_index*/ false, /*max_plan_rows*/ None,
     )
     .err()
     .expect("SparseCellSetLoader must refuse a multimodal file");
@@ -200,7 +200,7 @@ fn the_cell_set_loader_still_opens_a_single_modality_file() {
     let readers = vec![ScxReader::open(&path).unwrap()];
     SparseCellSetLoader::new(
         readers, 4, None, 4, None, None, false, false, 1e4, None,
-        /*scatter_block_index*/ false,
+        /*scatter_block_index*/ false, /*max_plan_rows*/ None,
     )
     .expect("a clean file must still open");
 }
@@ -264,7 +264,7 @@ fn accepts_a_file_whose_only_modality_is_registered_as_id_1() {
     let readers = vec![ScxReader::open(&path).unwrap()];
     SparseCellSetLoader::new(
         readers, 4, None, 4, None, None, false, false, 1e4, None,
-        /*scatter_block_index*/ false,
+        /*scatter_block_index*/ false, /*max_plan_rows*/ None,
     )
     .expect("SparseCellSetLoader must accept a sole registered modality");
 }
