@@ -95,7 +95,7 @@ def main(root: pathlib.Path) -> int:
         pairs.setdefault((rec["dataset"], rec["round"]), {})[rec["arm"]] = rec
 
     datasets = sorted({ds for ds, _ in pairs})
-    print(f"# phase-1 loader A/B (paired) — {root.name}\n")
+    print(f"# two-build loader A/B (paired) — {root.name}\n")
 
     for ds in datasets:
         complete = sorted(

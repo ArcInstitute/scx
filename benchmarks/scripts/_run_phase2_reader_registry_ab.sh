@@ -285,6 +285,32 @@ run_one() {
 
 mkdir -p "$OUT/rounds"
 
+# Provenance, written by the JOB rather than by hand afterwards.
+#
+# Phase 1's equivalent file was hand-written after the fact, which works exactly
+# once: the facts live in the job's stdout, and a capture whose provenance is
+# assembled by whoever remembers to is a capture that eventually ships without
+# one. Everything here is read from the running job.
+cat > "$OUT/provenance.json" <<JSON
+{
+ "job_id": "${SLURM_JOB_ID:-manual}",
+ "host": "$(hostname)",
+ "before_sha": "$BEFORE_SHA",
+ "after_sha": "$AFTER_SHA",
+ "before_ref": "main",
+ "after_ref": "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)",
+ "datasets": "$DATASETS",
+ "format_key": "$FORMAT_KEY",
+ "rounds": $ROUNDS,
+ "n_runs_per_invocation": $N_RUNS,
+ "rayon_num_threads": "${RAYON_NUM_THREADS}",
+ "design": "Two builds, one host. Arms interleaved per round with the within-pair order flipped on alternate rounds; the statistic is the median of WITHIN-round ratios plus an exact two-sided sign test. A block design was tried in phase 1 and failed on a contended node, reporting a 1.85x speedup as a 0.81x regression.",
+ "what_is_under_test": "The reader-registry seam on the DEFAULT path. Every arm runs reader_limit=None, where nothing is ever evicted or reopened, so the claim is that leasing an Arc from a mutex-guarded map costs nothing measurable against the array index it replaced. Flat is the expected result and the gate; a regression is a finding.",
+ "what_this_is_not": "Not the phase's headline, which is resident memory and is captured by measure_reader_registry_rss.py. No arm is bounded: a bounded arm's cost is reopen latency, a function of how many files a plan touches rather than of this change.",
+ "records_are_reduced": "Each round is the median over the benchmark's own runs of the named metrics, not a full BenchmarkResult.to_dict()."
+}
+JSON
+
 # Preflight both builds ONCE and loudly before the timed rounds start. It also
 # runs inside every invocation, silently, as a cheap guard against a PYTHONPATH
 # that stops taking partway through a long job.

@@ -3178,11 +3178,38 @@ plan that fans across more files than the limit reopens on every batch, and no
 arm at a bounded limit was timed, so no floor is proposed for one.
 
 The default `reader_limit=None` path raises a separate question these numbers do
-not answer: the engine now hands out a leased `Arc` from a mutex-guarded map
-where it previously indexed an array, and `plan_footprint` takes a lease per
-touched file. That is a throughput question, measured by a two-build
-`cellset_gather` A/B (`benchmarks/scripts/_run_phase2_reader_registry_ab.sh`) on
-the same paired/sign-test design phase 1 used.
+not answer, and it is answered below.
+
+#### Does the leased-`Arc` seam cost anything? (phase 2)
+
+The engine now hands out a leased `Arc` from a mutex-guarded map where it
+previously indexed an array, and `plan_footprint` takes a lease per touched
+file. Two-build A/B, SLURM `2951009`, host `GPU3694`, `main` `aba3c114` against
+`phase2-reader-registry` `9833d075`, 12 interleaved rounds per dataset, median
+of within-round ratios with an exact two-sided sign test. Raw rows under
+`results/raw/phase2_reader_registry/cellset_gather_ab.json`.
+
+Every arm runs `reader_limit=None`, where nothing is ever evicted or reopened.
+Flat was the expected result and the gate.
+
+| metric | pbmc3k | tabula_sapiens_100k |
+|---|---|---|
+| `us_per_cell__collate` | 1.00× (6/12, p 1.000) | 1.03× (9/12, p 0.146) |
+| `cellsets_per_sec__collate_rust` | 1.00× (6/12, p 1.000) | 1.03× (9/12, p 0.146) |
+| `cellsets_per_sec__gather_random` | 0.996× (6/12, p 1.000) | 0.992× (5/12, p 0.774) |
+| `cellsets_per_sec__gather_grouped` | 0.987× (5/12, p 0.774) | 0.999× (6/12, p 1.000) |
+| `cellsets_per_sec__gather_random_s512` | 1.02× (8/12, p 0.388) | 0.971× (4/12, p 0.388) |
+| `cellsets_per_sec__gather_grouped_s512` | 1.01× (8/12, p 0.388) | 1.03× (9/12, p 0.146) |
+
+Ratios are oriented so > 1 means the change helped. **All twelve cells are "no
+reliable difference"** — every sign test is p ≥ 0.146, and no median ratio
+leaves 0.97–1.03.
+
+Read that as a resolution, not as proof of zero. Twelve paired rounds can rule
+out an effect of roughly the size the spread here admits; they cannot
+distinguish 1.00× from 1.01×. The claim this supports is the one the gate asked
+for — the seam costs nothing a consumer would notice at the default — not that
+the two builds are identical instruction for instruction.
 
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
