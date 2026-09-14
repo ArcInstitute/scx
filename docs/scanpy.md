@@ -2067,9 +2067,11 @@ For the on-disk format and sharding granularity, see
 ### GPU-supported vs GPU-fast
 
 `device="gpu"` runs a column algorithm on the GPU, but **running on the GPU
-is not the same as running fast on the GPU**. For differential expression,
-peak GPU throughput requires a *column-major* substrate so the kernel reads
-contiguous gene columns instead of decoding and projecting every row.
+is not the same as running fast on the GPU**. For `pdex_ref`, peak GPU
+throughput requires a *column-major* substrate so the kernel reads contiguous
+gene columns instead of decoding and projecting every row. Whether that
+generalises to `rank_genes_groups` is **not** established — see the second
+bullet; the only direct measurement points the other way.
 
 - **`pdex_ref` is GPU-fast only with a CSC sidecar.** With a backed SCX file
   that has a CSC sidecar, the dispatch takes the
@@ -2078,10 +2080,42 @@ contiguous gene columns instead of decoding and projecting every row.
   pre-filter. Without a sidecar — e.g. an in-memory scipy CSR — the same call
   falls back to `gpu_csr_v3` (`fallback_reason == "no_csc_sidecar"`), which is
   *GPU-supported but not GPU-fast*.
-- **Wilcoxon rank-sum (`rank_genes_groups`) takes the same v3 routes as `pdex_ref`.** With a
-  CSC sidecar it runs CSC-direct (`gpu_csc_v3`); without one it runs CSR-direct
-  (`gpu_csr_v3`, `fallback_reason == "no_csc_sidecar"`) — GPU-supported but not
-  GPU-fast. So a CSC sidecar makes Wilcoxon rank-sum GPU-fast too.
+- **Wilcoxon rank-sum (`rank_genes_groups`) takes the same v3 *routes* as `pdex_ref` — but
+  not, on the one shape measured, the same *timing*.** With a CSC sidecar it runs CSC-direct
+  (`gpu_csc_v3`); without one it runs CSR-direct (`gpu_csr_v3`,
+  `fallback_reason == "no_csc_sidecar"`).
+
+  > **Do not build a sidecar for `rank_genes_groups` without measuring your own shape.** This
+  > bullet used to conclude "so a CSC sidecar makes Wilcoxon rank-sum GPU-fast too". That was an
+  > inference from `pdex_ref`'s numbers across a shared route, not a measurement of this op, and
+  > the one direct measurement now available contradicts it. On a 960,195 × **6,143** log1p file
+  > (nnz 2.65e9, 59 CSR shards), H100, `reference="rest"`, `n_genes=60`, `pts=True`:
+  >
+  > | route | sidecar | wall | peak RSS |
+  > |---|---|---|---|
+  > | `gpu_csr_v3` | no | **42.5 s** | **7.4 GiB** |
+  > | `gpu_csc_v3` | yes | 85.3 s | 26.1 GiB |
+  >
+  > — **2.0× slower and 3.5× heavier with the sidecar**, before counting the 628.7 s / 28.1 GiB
+  > build and the +348 % it added on disk (4.34 → 19.44 GB). Results were bit-identical, so this
+  > is a cost question, not a correctness one. The likely mechanism is the gene axis: at 6,143
+  > genes the CSC shards are ~160 M nnz each (~1.3 GB decoded), so the CSC route trades 767 cheap
+  > CSR decodes for 29 very expensive ones and holds them. A ~36 k-gene file has a very different
+  > shard geometry and may well behave as the old text claimed — **that case is unmeasured in
+  > either direction.**
+  >
+  > None of this touches `pdex_ref`, whose CSC-direct advantage *is* measured
+  > ([`pdex_ref` GPU v3-CSC table](performance.md#per-operation-timing)) and is enforced by the
+  > `de_route_csc_direct` floor in `benchmarks/comprehensive/thresholds.yaml`. Note when reading
+  > that table that its 13–24× is against **`v2-CSR GPU (former)`**, a route no longer taken; the
+  > margin against today's `gpu_csr_v3` is described qualitatively there and has not been
+  > measured for either op.
+  >
+  > *Provenance:* one-off capture, 2026-09-13, single H100 80 GB, pyscx built at `14ef8ae3`
+  > (an ancestor of `main`); both arms the same binary, so the comparison is within-build. This
+  > is **not** a `benchmarks/comprehensive` capture and has no manifest entry — it is one shape,
+  > measured once, reported because it contradicts an inference that had no measurement at all.
+  > Treat it as a reason to measure your own file, not as a new performance claim.
 - **PCA / kNN / UMAP / Leiden are not column algorithms** — they operate on
   row-major `X` or on PCA embeddings / kNN graphs, so CSC does not apply.
 - **CSC-direct does not double VRAM usage.** The `gpu_csc_v3` route reads CSC
