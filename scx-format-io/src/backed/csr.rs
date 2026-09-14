@@ -1181,64 +1181,6 @@ impl BackedCsrReader {
     /// retain row groups — i.e. when a warm could not retain anything. The L2
     /// prefetcher sums this over a plan and warms only a plan that fits its
     /// share of the budget; see `scx-loader`'s plan engine.
-    /// Total stored non-zeros across `rows`, from the indptr alone.
-    ///
-    /// Decodes each touched shard's indptr once and sums `ip[r+1] - ip[r]`; it
-    /// never decodes a payload and never touches the LRU (see
-    /// [`Self::shard_indptr`]), so calling it between planning and warming
-    /// cannot change which groups [`Self::block_index_eligible`] admits.
-    ///
-    /// Exists so a caller assembling a CSR batch can size its `indices` /
-    /// `data` once instead of growing them geometrically. The figure is exact
-    /// for the stored rows; a caller that then drops entries (a remap
-    /// sentinel, a seeded downsample) must treat it as an upper bound.
-    ///
-    /// Duplicated rows count once per occurrence, matching what a gather that
-    /// emits one output row per plan entry will actually write.
-    pub fn nnz_for_rows(&self, rows: &[u64]) -> Result<usize> {
-        if rows.is_empty() {
-            return Ok(0);
-        }
-        // Group by shard so each indptr is decoded at most once, however the
-        // plan interleaves its rows.
-        let mut by_shard: std::collections::HashMap<usize, Vec<u64>> =
-            std::collections::HashMap::new();
-        for &row in rows {
-            let shard = self.index.shard_for_row(row).ok_or_else(|| {
-                ScxError::Io(std::io::Error::other(format!(
-                    "row index {row} out of range (n_obs={})",
-                    self.n_obs
-                )))
-            })?;
-            by_shard.entry(shard).or_default().push(row);
-        }
-        let mut total: usize = 0;
-        for (shard_idx, shard_rows) in by_shard {
-            let ip = self.shard_indptr(shard_idx)?;
-            let (s_start, _) =
-                self.index
-                    .shard_range(shard_idx)
-                    .ok_or(ScxError::ShardIndexOutOfBounds {
-                        index: shard_idx,
-                        count: self.shard_count(),
-                    })?;
-            for row in shard_rows {
-                let local = row.saturating_sub(s_start) as usize;
-                let (lo, hi) = match (ip.get(local), ip.get(local + 1)) {
-                    (Some(&lo), Some(&hi)) => (lo, hi),
-                    _ => {
-                        return Err(ScxError::Io(std::io::Error::other(format!(
-                            "row index {row} out of range (n_obs={})",
-                            self.n_obs
-                        ))))
-                    }
-                };
-                total = total.saturating_add((hi - lo).max(0) as usize);
-            }
-        }
-        Ok(total)
-    }
-
     pub fn planned_row_group_bytes(&self, shard_idx: usize, rows: &[u64]) -> usize {
         // Both gates before `framed_layout`: with the route statically off
         // (the cell-set loader's default) no gather can retain a group, and

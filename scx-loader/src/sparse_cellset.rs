@@ -794,32 +794,28 @@ impl SparseCellSetLoader {
 
         let mut indptr: Vec<i64> = Vec::with_capacity(total_rows + 1);
         indptr.push(0);
-        // Pre-size the two nnz-sized outputs from the plan's stored row
-        // lengths so the append loop below never reallocates. Without this
-        // they grow geometrically from empty, and the cost is an allocation
-        // plus a full copy of everything written so far at each doubling —
-        // priced as allocations, not memcpys.
+        // Pre-size the two nnz-sized outputs so the append loop below does not
+        // grow them geometrically from empty, which costs an allocation plus a
+        // copy of everything written so far at each doubling — priced as
+        // allocations, not memcpys.
         //
-        // The sum is exact for raw-local output and an upper bound once a
-        // transform can drop entries (`-1` remap sentinels, coalescing, a
-        // seeded downsample's pruning), so capacity >= final length on every
-        // path. `nnz_for_rows` reads indptr only and never touches the LRU, so
-        // prescanning here cannot change which row groups the gather admits.
+        // **An estimate from catalog stats, deliberately, not an exact count.**
+        // `with_capacity` is a hint: undershooting costs a reallocation the
+        // caller would have paid anyway, overshooting costs transient bytes.
+        // Nothing here needs a bound, so nothing here should pay for one — and
+        // the exact version did pay. Summing the plan's true row lengths means
+        // decoding each touched shard's indptr, once per plan, and a two-build
+        // A/B measured that at ~9 % of `gather_grouped_s512` on tabula (medians
+        // 89.4 → 80.8 sets/s in one arm ordering and 77.7 → 84.6 in the other,
+        // both agreeing) against a 1.85–2.07× win on pbmc3k, whose single-shard
+        // batches made the decode free. The estimate keeps the win and drops
+        // the I/O: `mean_nnz_per_row` comes from the catalog walk the budget
+        // model already does at construction, and reads nothing.
         //
-        // A prescan failure is not fatal: it only costs the pre-sizing, so a
-        // reader that cannot answer falls back to growth rather than failing a
-        // gather that would otherwise succeed.
-        let planned_nnz: usize = {
-            let mut by_file: std::collections::HashMap<u32, Vec<u64>> =
-                std::collections::HashMap::new();
-            for (&fid, &row) in plan.file_ids.iter().zip(plan.rows.iter()) {
-                by_file.entry(fid).or_default().push(row);
-            }
-            by_file
-                .into_iter()
-                .map(|(fid, rows)| engine.reader(fid).nnz_for_rows(&rows).unwrap_or(0))
-                .sum()
-        };
+        // 0 when no shard carried stats, which is the same "size unknown"
+        // signal the byte budget falls back on — capacity 0 is exactly the
+        // pre-change behaviour, so an unknowable file is no worse off.
+        let planned_nnz = (total_rows as f64 * self.mean_nnz_per_row).ceil() as usize;
         let mut indices: Vec<i32> = Vec::with_capacity(planned_nnz);
         let mut data: Vec<f32> = Vec::with_capacity(planned_nnz);
         let mut cell_indices: Vec<u64> = Vec::with_capacity(total_rows);

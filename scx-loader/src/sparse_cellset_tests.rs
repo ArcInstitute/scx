@@ -1911,15 +1911,180 @@ fn teardown_through_the_real_iter_ownership_graph_is_bounded() {
     );
 }
 
-/// W1: the gather pre-sizes `indices`/`data` from the plan's stored row
-/// lengths, so the append loop never reallocates.
+/// Like [`write_fixture`] but with **ragged** rows: row `r` carries
+/// `(r % 4) + 1` non-zeros, so the manifest mean is 2.5 and no single row has
+/// it. Exists so the pre-sizing estimate can be tested where it is genuinely an
+/// estimate — `write_fixture`'s uniform one-non-zero-per-row makes the mean
+/// exact for every plan, which cannot distinguish an estimate from a count.
+fn write_ragged_fixture(path: &std::path::Path, n_obs: usize, n_vars: usize, n_shards: usize) {
+    assert!(n_obs.is_multiple_of(n_shards));
+    let rows_per_shard = n_obs / n_shards;
+    let header = FileHeader::new_single_modality(
+        n_obs as u64,
+        n_vars as u64,
+        // Header nnz must match what the shards actually store, or the catalog
+        // stats the estimate reads disagree with the payload.
+        (0..n_obs).map(|r| (r % 4) as u64 + 1).sum::<u64>(),
+        rows_per_shard as u32,
+        0,
+        0,
+    );
+    let mut writer = ScxWriter::new(path, header).unwrap();
+
+    let obs_schema = Schema::new(vec![Field::new("cell_id", DataType::Utf8, false)]);
+    let cell_ids: Vec<String> = (0..n_obs).map(|i| format!("cell_{i}")).collect();
+    writer
+        .write_obs(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(obs_schema),
+                vec![StdArc::new(StringArray::from(
+                    cell_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let var_schema = Schema::new(vec![Field::new("gene_id", DataType::Utf8, false)]);
+    let gene_ids: Vec<String> = (0..n_vars).map(|i| format!("gene_{i}")).collect();
+    writer
+        .write_var(
+            &arrow::record_batch::RecordBatch::try_new(
+                StdArc::new(var_schema),
+                vec![StdArc::new(StringArray::from(
+                    gene_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                ))],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    for s in 0..n_shards {
+        let row_start = s * rows_per_shard;
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        for local in 0..rows_per_shard {
+            let row = row_start + local;
+            let nnz = (row % 4) + 1;
+            for k in 0..nnz {
+                // Ascending and unique within the row, as CSR requires.
+                indices.push(((row + k) % n_vars) as u32);
+                values.push(((row + k + 1) & 0xFF) as u8);
+            }
+            indptr.push(*indptr.last().unwrap() + nnz as u64);
+        }
+        writer
+            .write_csr_shard(
+                &indptr,
+                &indices,
+                &values,
+                CodecId::None,
+                ValueEncoding::Uint8,
+                row_start as u64,
+            )
+            .unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// W1: the pre-size is an estimate, and is wrong in both directions by design.
 ///
-/// The prescan sums the stored row lengths for every `(file, row)` in the plan
-/// before the set loop. On the raw-local path that sum is *exact*, so the
-/// finished vectors are both full and un-reallocated — `capacity() == len()`
-/// is the strongest available witness that no doubling growth happened.
+/// The capacity comes from the manifest's mean density, so a plan that selects
+/// denser-than-average rows under-shoots (one reallocation, which the caller
+/// would have paid anyway) and one that selects sparser rows over-shoots (a few
+/// transient bytes). Neither can affect the output, and that is the whole
+/// argument for preferring the estimate to the exact prescan it replaced —
+/// `with_capacity` is a hint, so nothing here needs a bound, and buying one
+/// cost an indptr decode per touched shard per plan (~9 % of
+/// `gather_grouped_s512` on tabula in the two-build A/B).
+#[test]
+fn gather_presize_is_an_estimate_on_a_non_uniform_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ragged.scx");
+    // Rows 0..64, row r has (r % 4) + 1 non-zeros ⇒ mean 2.5.
+    write_ragged_fixture(&path, 64, 16, 2);
+
+    let gather = |rows: Vec<u64>| {
+        let loader = SparseCellSetLoader::new(
+            vec![open(&path)],
+            8,
+            None,
+            4,
+            None,
+            None,
+            false,
+            false,
+            0.0,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let n = rows.len();
+        let plan = SparseCellSetPlan {
+            file_ids: vec![0; n],
+            rows,
+            role_tags: vec![0; n],
+            set_offsets: vec![0, n as i64],
+        };
+        loader
+            .iter_with_plans(vec![Ok(plan)].into_iter(), 4)
+            .map(|r| r.unwrap())
+            .next()
+            .unwrap()
+    };
+
+    // Densest rows only (r % 4 == 3 ⇒ 4 nnz each): the mean under-shoots.
+    let dense: Vec<u64> = (0..64).filter(|r| r % 4 == 3).collect();
+    let n_dense = dense.len();
+    let b = gather(dense);
+    assert_eq!(b.indices.len(), n_dense * 4, "4 nnz per selected row");
+    assert!(
+        b.indices.capacity() >= b.indices.len(),
+        "capacity {} < len {} — a Vec cannot hold less than it holds",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+    // The estimate itself is the mean, below the truth. Pinned so a silent
+    // return to an exact prescan — which would make this equal — is visible.
+    assert!(
+        (n_dense as f64 * 2.5).ceil() as usize <= b.indices.len(),
+        "the mean should under-estimate a densest-rows plan"
+    );
+
+    // Sparsest rows only (r % 4 == 0 ⇒ 1 nnz each): the mean over-shoots.
+    let sparse: Vec<u64> = (0..64).filter(|r| r % 4 == 0).collect();
+    let n_sparse = sparse.len();
+    let b = gather(sparse);
+    assert_eq!(b.indices.len(), n_sparse, "1 nnz per selected row");
+    assert!(
+        b.indices.capacity() > b.indices.len(),
+        "the mean should over-estimate a sparsest-rows plan: capacity {} vs len {}",
+        b.indices.capacity(),
+        b.indices.len()
+    );
+
+    // Whole file: the mean is exact over every row, so this is the one plan
+    // where the estimate and the truth coincide.
+    let b = gather((0..64).collect());
+    assert_eq!(b.indices.len(), 160, "sum of (r % 4) + 1 over 64 rows");
+    assert_eq!(b.indices.capacity(), b.indices.len());
+}
+
+/// W1: the gather pre-sizes `indices`/`data`, so the append loop does not grow
+/// them geometrically from empty.
 ///
-/// Watched failing before the prescan existed: with `Vec::new()` the finished
+/// The size is an **estimate** — `total_rows x mean_nnz_per_row` from the
+/// catalog — not a count of the plan's actual rows. `capacity() == len()` holds
+/// here because `write_fixture` gives every row exactly one non-zero, so the
+/// manifest mean is 1.0 and the estimate is exact *on this fixture*. That is a
+/// property of the fixture, not a contract: on real data the estimate is close,
+/// not exact, which is all `with_capacity` needs — see
+/// `gather_presize_is_an_estimate_on_a_non_uniform_fixture`.
+///
+/// Exactness is still the right assertion to make here, because it is the
+/// strongest available witness that no doubling growth happened. Watched
+/// failing before the pre-sizing existed: with `Vec::new()` the finished
 /// `indices` has a power-of-two capacity above its length, the signature of
 /// geometric growth.
 #[test]
