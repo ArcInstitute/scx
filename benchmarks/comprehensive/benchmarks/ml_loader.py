@@ -52,7 +52,6 @@ from benchmarks.comprehensive.config import (
 from benchmarks.comprehensive.data_wait import (
     data_wait_fraction,
     steady_state_wait,
-    wait_percentiles,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
 from benchmarks.comprehensive.runners import make_runner
@@ -1209,10 +1208,16 @@ def _run_gpu_train_epoch(
             seed=seed + 1,
             max_memory_mb=_scx_memory_budget_mb(),
         )
-        it = iter(ds)
+        # `t0` BEFORE `iter(ds)`: `TrainingDataset.__iter__` calls
+        # `TrainingPipeline::start_epoch`, which builds the epoch stages. Timing
+        # from after it put that cost outside both `wall_s` and `ttfb_s`, while
+        # the docs said the first `next()` pays pipeline spin-up. Fold iterator
+        # construction into the first wait so `ttfb_s` measures what it claims.
         t0 = time.perf_counter()
+        it = iter(ds)
+        first_wait_from = t0
         while True:
-            w0 = time.perf_counter()
+            w0 = first_wait_from if not waits_s else time.perf_counter()
             try:
                 batch = next(it)
             except StopIteration:
@@ -1247,7 +1252,9 @@ def _run_gpu_train_epoch(
     bps = n_batches / wall_s if wall_s > 0 else 0.0
     cps = n_cells / wall_s if wall_s > 0 else 0.0
 
-    pct = wait_percentiles(waits_s)
+    # Percentiles come from `steady`, which computes them on the post-startup
+    # slice. Taking them from `wait_percentiles(waits_s)` made `max_ms` equal to
+    # `ttfb_s` restated in ms.
     steady = steady_state_wait(waits_s, wall_s)
     return _GpuEpochResult(
         n_batches=n_batches,
@@ -1259,10 +1266,10 @@ def _run_gpu_train_epoch(
         gpu_util_samples=len(gpu_utils),
         data_wait_s=sum(waits_s),
         data_wait_fraction=data_wait_fraction(waits_s, wall_s),
-        batch_wait_ms_p50=pct["p50_ms"],
-        batch_wait_ms_p95=pct["p95_ms"],
-        batch_wait_ms_p99=pct["p99_ms"],
-        batch_wait_ms_max=pct["max_ms"],
+        batch_wait_ms_p50=steady["p50_ms"],
+        batch_wait_ms_p95=steady["p95_ms"],
+        batch_wait_ms_p99=steady["p99_ms"],
+        batch_wait_ms_max=steady["max_ms"],
         ttfb_s=steady["ttfb_s"],
         data_wait_fraction_steady=steady["data_wait_fraction_steady"],
         n_steady_steps=steady["n_steady_steps"],

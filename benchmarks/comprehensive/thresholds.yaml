@@ -3943,8 +3943,8 @@ absolute_floors:
 #     `ml_loader`'s `gpu_train` scenario and `index_plan`'s
 #     `pyscx_index_plan_dataset_workers2` now emit
 #     `data_wait_fraction_steady__*` (the headline), `data_wait_fraction__*`,
-#     `ttfb_s__*`, `n_steady_steps__*`, `batch_wait_ms_p50__*` and
-#     `batch_wait_ms_p95__*`: the fraction of a timed epoch the consumer spent
+#     `ttfb_s__*`, `n_steady_steps__*` and the post-startup wait distribution
+#     `batch_wait_ms_{p50,p95,p99,max}__*`: the fraction of a timed epoch spent
 #     blocked in `next(iterator)`, with time-to-first-batch split out. Quote
 #     the steady one — the all-steps figure folds in a once-per-epoch startup
 #     and on a short benchmark epoch reads ~50x higher (a 98-step tabula

@@ -227,12 +227,22 @@ python "$CAPTURE" --name "$NAME_R3" \
 # `results/$NAME_R3/raw/` keeps the null-model numbers, which is where they
 # belong.
 echo "restoring tracked index_plan manifest rows clobbered by the null-model arm"
+# NOT `2>/dev/null || true`: a restore that fails (wrong cwd, missing file,
+# permissions) would leave the null-model numbers standing in a tracked,
+# published row and let the job continue into the gate — the exact
+# contamination this step exists to undo. `set -e` is in force, so a failure
+# here stops the job.
 git -C "$REPO" checkout -- \
     benchmarks/comprehensive/results/raw/index_plan__scx_auto__pbmc3k.json \
     benchmarks/comprehensive/results/raw/index_plan__scx_auto__smartseq2.json \
-    benchmarks/comprehensive/results/raw/index_plan__scx_auto__tabula_sapiens_100k.json \
-    2>/dev/null || true
-git -C "$REPO" status --porcelain benchmarks/comprehensive/results/raw/ | head
+    benchmarks/comprehensive/results/raw/index_plan__scx_auto__tabula_sapiens_100k.json
+if ! git -C "$REPO" diff --quiet -- \
+        benchmarks/comprehensive/results/raw/index_plan__scx_auto__pbmc3k.json \
+        benchmarks/comprehensive/results/raw/index_plan__scx_auto__smartseq2.json \
+        benchmarks/comprehensive/results/raw/index_plan__scx_auto__tabula_sapiens_100k.json; then
+    echo "tracked index_plan rows still differ from HEAD after restore" >&2
+    exit 3
+fi
 
 # ---------------------------------------------------------------------------
 # Gate the R1 capture against LATEST. The instrumentation added two

@@ -84,9 +84,10 @@ def test_wait_percentiles_expose_the_tail_not_just_the_middle():
     """
     from benchmarks.comprehensive.data_wait import wait_percentiles
 
-    # 950 fast steps, 49 at ~1 ms, 1 catastrophic stall.
-    waits = [1e-5] * 950 + [1e-3] * 49 + [0.2]
-    p = wait_percentiles(waits)
+    # 950 fast steps, 49 at ~1 ms, 1 catastrophic stall. A leading 0 keeps
+    # the startup slot out of the way; the tail is the subject here.
+    waits = [0.0] + [1e-5] * 950 + [1e-3] * 49 + [0.2]
+    p = wait_percentiles(waits[1:])
     assert set(p) == {"p50_ms", "p95_ms", "p99_ms", "max_ms"}
     assert p["p50_ms"] == pytest.approx(0.01, abs=1e-6)
     assert p["max_ms"] == pytest.approx(200.0)
@@ -100,6 +101,94 @@ def test_wait_percentiles_are_all_none_without_steps():
     assert wait_percentiles([]) == {
         "p50_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None,
     }
+
+
+def test_steady_percentiles_exclude_the_startup_batch():
+    """An oversized first wait must not become the reported steady max.
+
+    Found in review (codex, Antigravity): both emitters called
+    `wait_percentiles(waits_s)` on the FULL list beside `steady_state_wait`, so
+    the published `batch_wait_ms_max` was time-to-first-batch restated in ms.
+    Measured on the committed census_1m capture: `ttfb_s` 1.933 against
+    `max_ms` 1932.967, and 1.9831 against 1983.115 — the max was literally TTFB.
+    `p99` collapsed onto it too for short epochs, where nearest rank puts 0.99
+    at the last index.
+    """
+    from benchmarks.comprehensive.data_wait import steady_state_wait
+
+    waits = [2.0] + [1e-5] * 97 + [0.2]          # 2 s startup, 0.2 s real stall
+    st = steady_state_wait(waits, 2.6)
+    assert st["ttfb_s"] == pytest.approx(2.0)
+    assert st["max_ms"] == pytest.approx(200.0), "max must be the stall, not ttfb"
+    assert st["max_ms"] * 1e-3 < st["ttfb_s"]
+    assert st["p99_ms"] <= st["max_ms"]
+
+
+def test_steady_percentiles_survive_a_short_epoch():
+    """The R3 case: n small enough that nearest-rank p99 lands on the last index."""
+    from benchmarks.comprehensive.data_wait import steady_state_wait
+
+    waits = [0.76] + [0.02] * 48                  # 49 steps, like R3
+    st = steady_state_wait(waits, 3.0)
+    assert st["n_steady_steps"] == 48
+    assert st["max_ms"] == pytest.approx(20.0)
+    assert st["p99_ms"] == pytest.approx(20.0)
+    assert st["max_ms"] < st["ttfb_s"] * 1000
+
+
+def test_emitters_take_percentiles_from_the_steady_slice():
+    """Neither emitter may publish percentiles computed over the full list."""
+    for mod in ("ml_loader.py", "index_plan.py"):
+        src = (BENCH_DIR / mod).read_text()
+        # Parsed, not grepped: the comment explaining this very fix contains the
+        # string `wait_percentiles(waits_s)`, and a substring check cannot tell
+        # a call from a sentence about one — it failed on exactly that.
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "wait_percentiles"
+                    and node.args
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == "waits_s"):
+                raise AssertionError(
+                    f"{mod}:{node.lineno} calls wait_percentiles over the full "
+                    "list, reintroducing time-to-first-batch into "
+                    "batch_wait_ms_max"
+                )
+        for k in ("p50_ms", "p95_ms", "p99_ms", "max_ms"):
+            assert f'steady["{k}"]' in src, f"{mod} does not publish steady {k}"
+
+
+def test_ttfb_includes_iterator_construction():
+    """`t0` must precede `iter(...)`, or ttfb misses what the docs credit to it.
+
+    `TrainingDataset.__iter__` starts the epoch pipeline and PyTorch's
+    `DataLoader.__iter__` spawns worker processes; timing from after them put
+    that cost outside both the wall and ttfb.
+    """
+    for mod, it in (("ml_loader.py", "iter(ds)"), ("index_plan.py", "iter(loader)")):
+        src = (BENCH_DIR / mod).read_text()
+        i_iter, i_t0 = src.index(it), src.index("t0 = time.perf_counter()")
+        assert i_t0 < i_iter, f"{mod}: t0 must be taken before {it}"
+
+
+def test_index_plan_wall_excludes_dataloader_teardown():
+    """`wall` closes after the last successful step, not after StopIteration.
+
+    With `persistent_workers=False` the exhausting `next()` also runs
+    `_shutdown_workers()`; that join lands in `wall` but never in `waits_s`, so
+    it biases `data_wait_fraction` down. Found in review (Cursor Agent).
+    """
+    src = (BENCH_DIR / "index_plan.py").read_text()
+    body = src[src.index("def _run_index_plan_workers2"):]
+    body = body[:body.index("\ndef ")]
+    i_break = body.index("break")
+    i_wall = body.rindex("wall = time.perf_counter() - t0")
+    assert i_wall > i_break, (
+        "wall is computed after the StopIteration path, so DataLoader teardown "
+        "is inside the timed region"
+    )
 
 
 def test_steady_state_fraction_excludes_the_first_batch():

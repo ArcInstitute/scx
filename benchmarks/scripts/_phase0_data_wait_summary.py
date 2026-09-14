@@ -69,6 +69,20 @@ def _median_of(runs: list[dict], key: str) -> float | None:
     return statistics.median(vals) if vals else None
 
 
+def _max_of(runs: list[dict], key: str) -> float | None:
+    """Max over the runs carrying *key*, skipping nulls. `None` if none do."""
+    vals = []
+    for r in runs:
+        v = (r.get("extra") or {}).get(key)
+        if v is None:
+            continue
+        try:
+            vals.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    return max(vals) if vals else None
+
+
 def _rows(snapshot: Path) -> list[dict[str, Any]]:
     raw = snapshot / "raw"
     if not raw.is_dir():
@@ -94,7 +108,12 @@ def _rows(snapshot: Path) -> list[dict[str, Any]]:
                 "git_dirty": data.get("system", {}).get("provenance", {}).get("git_dirty"),
             }
             for m in _METRICS:
-                row[m] = _median_of(scoped, f"{m}__{scenario}")
+                # `batch_wait_ms_max` is aggregated with max, not median. The
+                # tail IS the subject (ml_loader's emitter says the same of its
+                # cross-run max), and a median over three maxima hides the worst
+                # stall — which is the one number the metric exists to show.
+                agg = _max_of if m == "batch_wait_ms_max" else _median_of
+                row[m] = agg(scoped, f"{m}__{scenario}")
             # `batches_per_sec` is emitted unsuffixed on gpu_train too; fall
             # back so the table can show throughput beside the fraction.
             if row["batches_per_sec"] is None:

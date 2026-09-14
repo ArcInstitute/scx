@@ -77,40 +77,44 @@ def wait_percentiles(waits_s: list[float]) -> dict[str, float | None]:
 
 
 def steady_state_wait(waits_s: list[float], wall_s: float) -> dict[str, float | int | None]:
-    """Split time-to-first-batch out of the wait, and report the rest.
+    """Split time-to-first-batch out, and describe **only** the steady state.
 
-    Returns ``ttfb_s`` (the first ``next()``), ``data_wait_fraction_steady``
-    (every later step's wait over the region after the first batch arrived),
-    and ``n_steady_steps``.
+    Returns ``ttfb_s`` (the first ``next()``), ``data_wait_fraction_steady``,
+    ``n_steady_steps``, and the steady-state wait distribution
+    ``p50_ms`` / ``p95_ms`` / ``p99_ms`` / ``max_ms``.
 
-    **This, not the all-steps fraction, is the number that answers "is the
-    loader on the critical path".** The first ``next()`` pays tokio spin-up
-    and the first shard decode once per epoch; every later one is served from
-    a running pipeline. Folding the two together makes the answer a function
-    of how long the benchmark's epoch happens to be.
+    **The percentiles are computed here, on the post-startup slice, rather than
+    left to the caller.** Both emitters previously called
+    ``wait_percentiles(waits_s)`` on the *full* list beside this function, so
+    the published `batch_wait_ms_max` was simply time-to-first-batch restated in
+    milliseconds — measured on census_1m: `ttfb_s` 1.933 against `max_ms`
+    1932.967, and 1.9831 against 1983.115. `p99` collapsed onto it too whenever
+    ``n <= ~101`` (nearest rank puts 0.99 at the last index), which is exactly
+    the short-epoch R3 case. That defeated the purpose of the tail metrics while
+    looking like a tail measurement.
 
-    That is not a hypothetical. On a 98-step `gpu_train` epoch over
-    tabula_sapiens_100k the all-steps fraction read **0.85** while the same
-    run's per-batch p50 and p95 were **13 and 15 microseconds** — 2.04 s of
-    "wait" in a 2.4 s region, essentially all of it in step 1. Published
-    unqualified it would have said the loader is on the critical path 85 % of
-    the time, contradicting both its own p95 and the D0 profile's 4 microsecond
-    send-wait, and would have argued for throughput work that the measurement
-    actually rules out.
+    Returning the percentiles from the same call that removes the startup is
+    what makes the two impossible to get out of step; `wait_percentiles` stays
+    public for callers that genuinely want the all-steps view, and nothing in
+    this repo publishes that.
 
-    ``None`` for the fraction when there is no steady state to describe: fewer
-    than two steps, or a startup that consumed the whole timed region.
+    ``None`` for the fraction and the percentiles when there is no steady state
+    to describe: fewer than two steps, or a startup that consumed the whole
+    timed region.
     """
+    empty = {
+        "ttfb_s": None, "data_wait_fraction_steady": None, "n_steady_steps": 0,
+        "p50_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None,
+    }
     if not waits_s:
-        return {"ttfb_s": None, "data_wait_fraction_steady": None, "n_steady_steps": 0}
+        return empty
     ttfb = waits_s[0]
     rest = waits_s[1:]
     if not rest:
-        return {"ttfb_s": ttfb, "data_wait_fraction_steady": None, "n_steady_steps": 0}
-    steady_wall = wall_s - ttfb
-    frac = data_wait_fraction(rest, steady_wall)
+        return {**empty, "ttfb_s": ttfb}
     return {
         "ttfb_s": ttfb,
-        "data_wait_fraction_steady": frac,
+        "data_wait_fraction_steady": data_wait_fraction(rest, wall_s - ttfb),
         "n_steady_steps": len(rest),
+        **wait_percentiles(rest),
     }

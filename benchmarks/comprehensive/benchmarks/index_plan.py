@@ -69,7 +69,6 @@ from benchmarks.comprehensive.config import (
 from benchmarks.comprehensive.data_wait import (
     data_wait_fraction,
     steady_state_wait,
-    wait_percentiles,
 )
 from benchmarks.comprehensive.results import BenchmarkResult
 
@@ -278,10 +277,13 @@ class _ScenarioOutcome:
     gather_latency_ms_p99: float | None = None
     # Phase-0 gate (R3): the fraction of the timed region the consumer spent
     # blocked in `next(loader)`, against the fixed-cost step `_null_model_ms()`
-    # buys. `None` for every scenario that does not drive a consumer with a
-    # step — which is all of them when the knob is off, i.e. by default. `None`
-    # rather than `0.0`: the gate skips a null metric, and a zero here would be
-    # read as "the loader never stalled", the claim the metric exists to test.
+    # buys. **Only the two fractions are gated on the knob** — a fraction needs
+    # a step to be a fraction *of*, so it is `None` when the knob is off (and
+    # `None` rather than `0.0`: the gate skips a null metric, while a zero would
+    # read as "the loader never stalled", the claim the metric exists to test).
+    # `ttfb_s`, the percentiles and `n_steady_steps` are properties of the
+    # loader alone, meaningful with or without a consumer step, so they are
+    # always emitted.
     data_wait_fraction: float | None = None
     batch_wait_ms_p50: float | None = None
     batch_wait_ms_p95: float | None = None
@@ -586,12 +588,17 @@ def _run_index_plan_workers2(
     null_ms = _null_model_ms()
     null_s = null_ms / 1000.0
     waits_s: list[float] = []
-    it = iter(loader)
+    # `t0` BEFORE `iter(loader)`: PyTorch spawns the worker processes while
+    # building the iterator, so timing from after it excluded worker spawn from
+    # both `wall` and `ttfb_s` while the docs credited it to the first `next()`.
     t0 = time.perf_counter()
+    it = iter(loader)
+    first_wait_from = t0
     seen = 0
     cells = 0
+    wall = 0.0
     while True:
-        w0 = time.perf_counter()
+        w0 = first_wait_from if not waits_s else time.perf_counter()
         try:
             batch = next(it)
         except StopIteration:
@@ -604,8 +611,13 @@ def _run_index_plan_workers2(
             # releases the GIL so the two worker processes prefetch behind it,
             # which is the overlap a real step gives the loader.
             time.sleep(null_s)
-    wall = time.perf_counter() - t0
-    pct = wait_percentiles(waits_s)
+        # Close the timed region after the last SUCCESSFUL step. The `next()`
+        # that raises StopIteration also runs `_shutdown_workers()` under
+        # `persistent_workers=False`, and that join lands in `wall` but not in
+        # `waits_s` — biasing `data_wait_fraction` down by a teardown cost that
+        # is a real fraction of a 50-batch region.
+        wall = time.perf_counter() - t0
+    # Percentiles from `steady` (post-startup slice) — see `steady_state_wait`.
     steady = steady_state_wait(waits_s, wall)
     return _ScenarioOutcome(
         n_batches=seen,
@@ -618,10 +630,10 @@ def _run_index_plan_workers2(
         data_wait_fraction=(
             data_wait_fraction(waits_s, wall) if null_ms else None
         ),
-        batch_wait_ms_p50=pct["p50_ms"],
-        batch_wait_ms_p95=pct["p95_ms"],
-        batch_wait_ms_p99=pct["p99_ms"],
-        batch_wait_ms_max=pct["max_ms"],
+        batch_wait_ms_p50=steady["p50_ms"],
+        batch_wait_ms_p95=steady["p95_ms"],
+        batch_wait_ms_p99=steady["p99_ms"],
+        batch_wait_ms_max=steady["max_ms"],
         null_model_ms=null_ms,
         ttfb_s=steady["ttfb_s"],
         data_wait_fraction_steady=(

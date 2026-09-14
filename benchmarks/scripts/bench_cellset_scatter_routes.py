@@ -406,8 +406,6 @@ def main() -> int:
             "changes whether the LRU admits the plan at all."
         ),
     )
-    ap.add_argument("--cache-shards", type=int, default=None)
-    ap.add_argument("--max-memory-mb", type=int, default=None)
     ap.add_argument(
         "--adaptive-budget",
         action="store_true",
@@ -471,10 +469,7 @@ def main() -> int:
     # test. `False` is the same setting passed explicitly — if the two disagree
     # the default is not what this PR says it is.
     plans = _plan_factory(args.plan, framed, n_obs)
-    if args.cache_shards is not None or args.max_memory_mb is not None:
-        cache_shards, budget_mb = args.cache_shards, args.max_memory_mb
-        why = "explicit --cache-shards/--max-memory-mb"
-    elif args.adaptive_budget:
+    if args.adaptive_budget:
         cache_shards, budget_mb, why = None, None, "--adaptive-budget: the shipped auto-tune"
     else:
         cache_shards, budget_mb, why = _sized_budget(framed)
