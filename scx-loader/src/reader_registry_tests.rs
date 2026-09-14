@@ -166,6 +166,37 @@ fn an_unbounded_registry_refuses_a_lease_it_cannot_serve() {
     assert!(err.contains("out of range"), "{err}");
 }
 
+/// A reopening registry whose slot carries no identity refuses rather than
+/// serving the file unverified.
+///
+/// Unreachable through either constructor — the manifest scan stamps every slot
+/// it hands to a registry that can reopen — and pinned precisely so it stays
+/// unreachable. Falling through instead of refusing would make a future
+/// constructor that forgot to stamp serve a replaced file silently, which is
+/// the failure the identity check exists for.
+#[test]
+fn a_reopenable_slot_without_an_identity_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.scx");
+    write_tiny(&path);
+    let shared = SharedShardCache::new(4, 1 << 20);
+    let reader = ScxReader::open(&path).unwrap();
+    let slots = vec![ScannedFile {
+        path: path.clone(),
+        n_obs: reader.n_obs(),
+        index: BackedCsrIndex::from_catalog(reader.catalog()),
+        identity: None,
+    }];
+    // Retain nothing, so the first lease must go through the reopen path.
+    let reg = ReaderRegistry::from_scan(slots, Vec::new(), Some(1), shared, false);
+
+    let err = match reg.lease(0) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an unverifiable reopen must be refused, not served"),
+    };
+    assert!(err.contains("carries no identity"), "{err}");
+}
+
 /// Residency is bounded when nothing is leased across calls — the plain
 /// sequential-access case, which is what a plan-per-file iteration looks like.
 #[test]

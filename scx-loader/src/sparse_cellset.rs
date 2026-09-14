@@ -448,7 +448,7 @@ impl ManifestScan {
                 reason: format!("failed to open {}: {e}", path.display()),
             })?;
             let retain = limit.is_none_or(|k| scan.retained.len() < k);
-            scan.absorb(fid as u32, reader, retain, limit.is_some())?;
+            scan.absorb(fid as u32, reader, retain, /* reopenable */ true)?;
         }
         Ok(scan)
     }
@@ -476,6 +476,12 @@ impl ManifestScan {
             path: reader.path().to_path_buf(),
             n_obs: reader.n_obs(),
             index: BackedCsrIndex::from_catalog(reader.catalog()),
+            // Stamped whenever the registry could reopen at all — which is
+            // every path-built loader, not only a limited one. `open(paths, …,
+            // None)` never evicts and so never reopens today, but it holds the
+            // recipe that would, and a slot without an identity is a hole
+            // waiting for whoever next changes when eviction runs. One `stat`
+            // per file at construction is the price.
             identity: reopenable
                 .then(|| FileIdentity::stamp(reader.path(), reader.header()))
                 .transpose()?,

@@ -365,10 +365,25 @@ impl ReaderRegistry {
         // retain a descriptor per reader for the reader's whole life and add a
         // `stat` + `pread` to every section read — a behaviour change on the
         // default path, to answer a question only a reopen asks.
-        if let Some(stamped) = slot.identity.as_ref() {
-            let now = FileIdentity::stamp(&slot.path, reader.header())?;
-            stamped.ensure_same(&slot.path, &now)?;
-        }
+        //
+        // A missing stamp is an error, not a skipped check. Today it is
+        // unreachable (a registry with a recipe is built by the manifest scan,
+        // which stamps every slot it can reopen), and the point of refusing
+        // rather than falling through is to keep it unreachable: a future
+        // constructor that forgot to stamp would otherwise serve a replaced
+        // file silently, which is the exact failure this check exists for.
+        let stamped = slot
+            .identity
+            .as_ref()
+            .ok_or_else(|| LoaderError::ConfigError {
+                reason: format!(
+                    "cannot reopen {} — this registry can reopen but slot {file_id} carries no \
+                     identity to verify the file against",
+                    slot.path.display()
+                ),
+            })?;
+        let now = FileIdentity::stamp(&slot.path, reader.header())?;
+        stamped.ensure_same(&slot.path, &now)?;
         let wrapped = recipe.wrap(reader, file_id);
         self.metrics.note_open();
         open.by_file.insert(
