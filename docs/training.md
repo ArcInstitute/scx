@@ -189,15 +189,18 @@ Two things to know:
   touches, which plan width controls. `memory_budget()["max_blocking_threads"]`
   reports the cap on how many of those run at once — on both plan-driven
   classes, since it lives on the shared prefetch engine.
-- **Charge the batch if the budget is meant to bound the process.**
+- **Charge the batch to stop the budget ignoring it entirely.**
   `SparseCellSetDataset(paths, max_memory_mb=…, max_plan_rows=N)` costs one
   gathered CSR batch of `N` rows at the manifest's mean density and subtracts it
   before sizing the cache; `memory_budget()["breakdown"]["batch_buffer_bytes"]`
-  reports it and `effective_cache_shards` falls accordingly. It is a real
-  bound, not just a budgeting hint — a plan wider than `max_plan_rows` is
-  refused, because a cache sized for N rows while the gather accepts 100N is
-  not a bound at all. It is **opt-in** and defaults to uncharged (and
-  unenforced): this class has no `max_plan_size`, so plan width is
+  reports it and `effective_cache_shards` falls accordingly, and a plan wider
+  than `max_plan_rows` is **refused** — a cache sized for N rows while the
+  gather accepts 100N would not be a bound at all. What it bounds is the plan's
+  **row count**, not its bytes: the charge uses the manifest's mean density, so
+  a plan of denser-than-average rows can still exceed the charged figure. Treat
+  `batch_buffer_bytes` as a sized estimate that the row count keeps honest, not
+  as a ceiling on process RSS. It is **opt-in** and defaults to uncharged and
+  unenforced: this class has no `max_plan_size`, so plan width is
   yours to declare, and a default guess would shrink the cache — the lever worth
   2,486× below — on every existing caller.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class
@@ -526,7 +529,7 @@ batch = ds.gather(*plan)          # (file_ids, rows, role_tags, set_offsets)
 ```
 
 The two differ only in row-group admission: the iterator takes one verdict
-across everything its lookahead window will touch, `gather` decides for itself
+per plan against its divided share (`budget / (lookahead + 1)`), `gather` decides once over the plan
 against the whole byte budget. That changes what the shard cache *retains*, not
 what is read, so the batches are identical — but `gather` runs on the calling
 thread with no prefetch, so it is not the way to stream.

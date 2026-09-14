@@ -157,7 +157,14 @@ class IndexPlanDataset:
         uses — plus
         `max_memory_mb` (the resolved value in force, adaptive when the
         constructor was passed none), `effective_cache_shards` and
-        `effective_lookahead`."""
+        `effective_lookahead`.
+
+        Also `max_blocking_threads`: the cap on simultaneously-running shard
+        decodes. It lives on the prefetch engine this class shares with
+        `SparseCellSetDataset`, and is sized from the CONSTRUCTOR `lookahead` —
+        which bounds in-flight plans, not the blocking task a plan spawns per
+        distinct `(file, shard)` it touches.
+        """
         ...
 
     def suggested_cache_shards(self, plan: list[tuple[int, int]]) -> int:
@@ -379,9 +386,10 @@ class SparseCellSetDataset:
             batch = ds.gather(*plan)
 
         **Admission is decided per call.** ``iter_with_plans`` takes one
-        row-group verdict per plan over everything its lookahead window will
-        touch and carries it into the gathers; a standalone ``gather`` has no
-        window and decides for itself against the whole byte budget. Output is
+        row-group verdict per plan and compares it against its divided share
+        of the budget (``budget / (lookahead + 1)``), since a lookahead window's
+        worth of plans has to coexist; a standalone ``gather`` has no window, so
+        it takes one verdict over the plan against the whole byte budget. Output is
         identical either way — the verdict changes what the cache *retains*, not
         what is read — but the batch is gathered on the calling thread rather
         than a prefetched one, so this is not the way to drive an epoch.

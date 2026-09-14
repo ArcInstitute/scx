@@ -63,8 +63,7 @@ def write_manifest(root: pathlib.Path, dest: pathlib.Path) -> None:
     distinct arms are not averaged together, which folding by round does not do.
     """
     rounds = sorted(
-        (json.loads(f.read_text()) for f in (root / "rounds").glob("*.json")),
-        key=lambda r: (r["dataset"], r["round"], r["arm"]),
+        _load_rounds(root), key=lambda r: (r["dataset"], r["round"], r["arm"])
     )
     prov = json.loads((root / "provenance.json").read_text()) if (
         root / "provenance.json").exists() else {}
@@ -72,16 +71,27 @@ def write_manifest(root: pathlib.Path, dest: pathlib.Path) -> None:
     print(f"wrote {len(rounds)} rounds to {dest}")
 
 
-def main(root: pathlib.Path) -> int:
+def _load_rounds(root: pathlib.Path) -> list[dict]:
+    """Accept either a live job directory or the committed artifact.
+
+    The published table has to be recomputable from what is in the tree, not
+    only from a scratch directory that the job deletes on exit — otherwise the
+    committed evidence is unreplayable and `--manifest` is a one-way door.
+    """
+    if root.is_file():
+        return json.loads(root.read_text())["rounds"]
     rounds_dir = root / "rounds"
     if not rounds_dir.is_dir():
-        print(f"no rounds directory at {rounds_dir}", file=sys.stderr)
-        return 2
+        raise SystemExit(
+            f"{root} is neither a folded A/B json nor a job dir with rounds/"
+        )
+    return [json.loads(f.read_text()) for f in sorted(rounds_dir.glob("*.json"))]
 
+
+def main(root: pathlib.Path) -> int:
     # (dataset, round) -> {arm: record}
     pairs: dict[tuple[str, int], dict[str, dict]] = {}
-    for f in sorted(rounds_dir.glob("*.json")):
-        rec = json.loads(f.read_text())
+    for rec in _load_rounds(root):
         pairs.setdefault((rec["dataset"], rec["round"]), {})[rec["arm"]] = rec
 
     datasets = sorted({ds for ds, _ in pairs})

@@ -548,6 +548,31 @@ fn framed_engine_with_budget(
     )
 }
 
+/// The blocking-cap arithmetic, pinned where its inputs are available.
+///
+/// **Review on #535 round 2 (Cursor Agent, codex), after CI went red.** The
+/// first attempt at pinning this lived in Python and re-derived the decode
+/// pool's width with `os.cpu_count()` — logical CPUs — while `cpu_pool` uses
+/// `num_cpus::get_physical()`. On a 2-vCPU / 1-physical runner that is 4 vs a
+/// predicted 5. The override spellings diverge too: Rust trims and treats `0`
+/// as "fall back", Python's `isdigit()` does neither.
+///
+/// So the arithmetic is pinned here, against supplied inputs, and Python only
+/// asserts the surfaces agree with each other.
+#[test]
+fn the_blocking_cap_clamps_between_two_and_tokios_default() {
+    use crate::plan_engine::clamp_blocking_threads;
+
+    // Floor: a one-thread pool with no lookahead still gets two.
+    assert_eq!(clamp_blocking_threads(1, 0), 2);
+    // The ordinary case: the default clamp(1, 8) pool plus lookahead 4.
+    assert_eq!(clamp_blocking_threads(8, 4), 12);
+    // Ceiling: SCX_LOADER_CPU_THREADS may exceed the pool's own clamp, and the
+    // cap must never rise above the tokio default it replaces.
+    assert_eq!(clamp_blocking_threads(508, 8), 512);
+    assert_eq!(clamp_blocking_threads(usize::MAX, 8), 512);
+}
+
 /// `plan_fits_budget` sizes the WHOLE plan against the WHOLE budget.
 ///
 /// **Review on #535 (codex).** The synchronous `SparseCellSetLoader::gather`

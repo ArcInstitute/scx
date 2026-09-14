@@ -54,6 +54,18 @@ use crate::error::{LoaderError, Result};
 /// it so the change can only ever tighten concurrency, never widen it.
 const TOKIO_DEFAULT_MAX_BLOCKING_THREADS: usize = 512;
 
+/// The blocking-cap arithmetic, as a pure function of its two inputs.
+///
+/// Split out so it can be pinned by a test that supplies the pool width instead
+/// of guessing it. A Python test that re-derived the width with
+/// `os.cpu_count()` went red on CI: `cpu_pool` resolves from
+/// `num_cpus::get_physical()`, and on a 2-vCPU / 1-physical runner the two
+/// disagree — the second environment-dependent version of the same test.
+pub(crate) fn clamp_blocking_threads(pool: usize, lookahead: usize) -> usize {
+    pool.saturating_add(lookahead)
+        .clamp(2, TOKIO_DEFAULT_MAX_BLOCKING_THREADS)
+}
+
 /// One prefetch task: a whole-shard warm (`read_shard_cached_arc`) or a
 /// row-group warm (`warm_row_groups`). Both are side effects on the shared
 /// cache; the decoded value itself is never handed back.
@@ -188,14 +200,27 @@ impl PrefetchEngine {
     ///
     /// Sized from the catalog and the block index; decodes nothing.
     pub(crate) fn plan_fits_budget(&self, file_ids: &[u32], rows: &[u64]) -> bool {
-        let mut seen: HashSet<(u32, u64)> = HashSet::with_capacity(rows.len());
+        let per_shard = self.bucket_plan_rows(file_ids.iter().copied().zip(rows.iter().copied()));
+        let (planned, budget) = self.plan_footprint(&per_shard);
+        planned <= budget
+    }
+
+    /// Deduplicate a plan's `(file, row)` pairs into per-`(file, shard)` buckets.
+    ///
+    /// The gather passes the same deduplicated set to `read_rows_with`, so each
+    /// bucket's length is the `group_len` the block-index decision sees.
+    /// An out-of-range `file_id` is skipped rather than panicked on: the
+    /// gather's own validation is what reports it, and this runs first.
+    pub(crate) fn bucket_plan_rows(
+        &self,
+        pairs: impl Iterator<Item = (u32, u64)>,
+    ) -> HashMap<(u32, usize), Vec<u64>> {
+        let mut seen: HashSet<(u32, u64)> = HashSet::new();
         let mut per_shard: HashMap<(u32, usize), Vec<u64>> = HashMap::new();
-        for (&fid, &row) in file_ids.iter().zip(rows.iter()) {
+        for (fid, row) in pairs {
             if !seen.insert((fid, row)) {
                 continue;
             }
-            // An out-of-range `file_id` is skipped, never panicked on: the
-            // gather's own validation is what reports it, and this runs first.
             let Some(reader) = self.readers.get(fid as usize) else {
                 continue;
             };
@@ -203,9 +228,29 @@ impl PrefetchEngine {
                 per_shard.entry((fid, sidx)).or_default().push(row);
             }
         }
+        per_shard
+    }
+
+    /// `(planned bytes, byte budget)` for a bucketed plan — the ONE definition
+    /// of "this plan's footprint in the shared LRU".
+    ///
+    /// **Review on #535 round 2 (Cursor Agent, codex):** this walk existed
+    /// twice, once here and once inline in `spawn_prefetches`, differing only in
+    /// what the result is compared against — the whole budget for a synchronous
+    /// one-plan caller, `budget / (lookahead + 1)` for a prefetcher sharing it
+    /// with a lookahead window. Two copies of the sizing is exactly how the
+    /// per-set/union split this method exists to close would come back.
+    ///
+    /// Counts the row-group bytes of every touched shard, plus the decoded size
+    /// of any shard the plan will take **whole** — both kinds share one budget.
+    /// Sized from the catalog and the block index; decodes nothing.
+    pub(crate) fn plan_footprint(
+        &self,
+        per_shard: &HashMap<(u32, usize), Vec<u64>>,
+    ) -> (usize, usize) {
         let mut planned = 0usize;
         let mut budget = usize::MAX;
-        for (&(fid, sidx), shard_rows) in &per_shard {
+        for (&(fid, sidx), shard_rows) in per_shard {
             let reader = &self.readers[fid as usize];
             planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
             if !reader.block_index_eligible(sidx, shard_rows.len()) {
@@ -213,7 +258,7 @@ impl PrefetchEngine {
             }
             budget = budget.min(reader.cache_bytes_budget());
         }
-        planned <= budget
+        (planned, budget)
     }
 
     /// Default lookahead depth.
@@ -270,10 +315,10 @@ impl PrefetchEngine {
     /// `lookahead` passed to `iter_with_plans` does not resize a runtime that
     /// is built once and shared.
     pub fn max_blocking_threads(&self) -> usize {
-        crate::pool::cpu_pool()
-            .current_num_threads()
-            .saturating_add(self.default_lookahead)
-            .clamp(2, TOKIO_DEFAULT_MAX_BLOCKING_THREADS)
+        clamp_blocking_threads(
+            crate::pool::cpu_pool().current_num_threads(),
+            self.default_lookahead,
+        )
     }
 
     /// Lazily build the prefetch runtime (2 blocking-friendly worker threads),
@@ -602,22 +647,12 @@ where
         // is what keeps the skip below meaningful as evidence about the gather
         // — though not a guarantee it agrees: a peer sharing the cache can
         // warm a shard in between.
-        let mut seen: HashSet<(u32, u64)> = HashSet::with_capacity(rows.len());
-        let mut per_shard: HashMap<(u32, usize), Vec<u64>> = HashMap::new();
-        for (fid, row) in rows {
-            if !seen.insert((fid, row)) {
-                continue;
-            }
-            // Prefetch is best-effort: an out-of-range `file_id` from an
-            // untrusted plan is skipped here (no panic) and surfaces as a
-            // clean error from the gather's validation.
-            let Some(reader) = self.engine.readers.get(fid as usize) else {
-                continue;
-            };
-            if let Some(sidx) = reader.index().shard_for_row(row) {
-                per_shard.entry((fid, sidx)).or_default().push(row);
-            }
-        }
+        // Bucketed through the engine's shared helper, so the prefetcher and a
+        // synchronous `gather` cannot drift on what a plan's footprint means.
+        // Prefetch is best-effort: an out-of-range `file_id` from an untrusted
+        // plan is skipped there (no panic) and surfaces as a clean error from
+        // the gather's validation.
+        let per_shard = self.engine.bucket_plan_rows(rows.into_iter());
 
         // Plan-level admission, sized exactly from the catalog and the block
         // index (no decode). `planned` is an upper bound on the plan's whole
@@ -641,19 +676,18 @@ where
         // Counting a shard the gather then happens to serve the other way only
         // makes the verdict conservative (a lost warm in a mixed regime), never
         // unsafe. Eligibility still decides what L2 task to launch.
-        let mut planned = 0usize;
-        let mut budget = usize::MAX;
-        let mut eligible: HashMap<(u32, usize), bool> = HashMap::with_capacity(per_shard.len());
-        for (&(fid, sidx), rows) in &per_shard {
-            let reader = &self.engine.readers[fid as usize];
-            let is_eligible = reader.block_index_eligible(sidx, rows.len());
-            planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, rows));
-            if !is_eligible {
-                planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
-            }
-            budget = budget.min(reader.cache_bytes_budget());
-            eligible.insert((fid, sidx), is_eligible);
-        }
+        let (planned, budget) = self.engine.plan_footprint(&per_shard);
+        // Eligibility is the prefetcher's own concern — it decides which L2 task
+        // to launch — and is deliberately NOT part of the footprint: the sum
+        // counts a shard both ways rather than filtering by a verdict that can
+        // change before the plan is consumed.
+        let eligible: HashMap<(u32, usize), bool> = per_shard
+            .iter()
+            .map(|(&(fid, sidx), rows)| {
+                let reader = &self.engine.readers[fid as usize];
+                ((fid, sidx), reader.block_index_eligible(sidx, rows.len()))
+            })
+            .collect();
         let share = budget / (self.lookahead + 1);
         let admit_row_groups = planned <= share;
 

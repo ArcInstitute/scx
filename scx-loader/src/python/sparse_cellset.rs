@@ -373,9 +373,10 @@ impl SparseCellSetDataset {
     ///
     /// **Admission is decided per call.** The streaming path takes one
     /// row-group verdict per plan across every file and shard the prefetcher
-    /// will touch, and carries it into the gathers, so a lookahead window's
-    /// worth of plans is sized together. A standalone `gather` has no such
-    /// window: it decides for itself, against the whole byte budget. Identical
+    /// will touch, and compares it against its divided share of the budget
+    /// (`budget / (lookahead + 1)`), because a lookahead window's worth of
+    /// plans has to coexist. A standalone `gather` has no such window, so it
+    /// takes one verdict over the plan against the WHOLE budget. Identical
     /// output either way — the verdict changes what the cache *retains*, not
     /// what is read — but a plan that retains nothing under `iter_with_plans`
     /// may retain here, and the batch is gathered on the calling thread rather

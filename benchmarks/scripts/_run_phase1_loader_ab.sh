@@ -252,9 +252,15 @@ for m in METRICS:
     out[m] = statistics.median(vals) if vals else None
 out["peak_rss_mb_median"] = res.get("peak_rss_mb_median")
 
+# Keep the FULL BenchmarkResult beside the reduced record. Each arm writes it
+# inside its own scratch worktree, which the job removes on exit, so without
+# this the committed evidence is metric scalars only and does not carry the
+# schema_version / system / runs envelope docs/benchmark_manifest.md describes.
+out["result"] = res
+
 pathlib.Path(os.environ["ARM_OUT"]).write_text(json.dumps(out))
 print(json.dumps({k: (round(v, 3) if isinstance(v, float) else v)
-                  for k, v in out.items()}), flush=True)
+                  for k, v in out.items() if k != "result"}), flush=True)
 PY
 
 run_one() {

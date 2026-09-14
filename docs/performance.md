@@ -3014,10 +3014,15 @@ rather than zero** — the distinction the `None`-not-`0.0` rule in
 
 ### Tier-1 loader fixes: gather pre-sizing and the crop mask (phase 1)
 
-Two changes to `SparseCellSetDataset`, measured together as a two-build A/B
+Two changes to `SparseCellSetDataset`, measured as a two-build A/B
 (SLURM `2949908`, host `GPU71BA`, `main` `0870ac39` against
 `phase1-tier1-loader` `19ec5256`; raw rows under
-`results/raw/phase1_tier1_loader/`).
+`results/raw/phase1_tier1_loader_ab.json`).
+
+The measured `after` build carries **all** of phase 1, W4 included, so the
+blocking-thread cap is in the timed arm even though the two changes below are
+what the table is about. `IndexPlanDataset`, the other consumer of that shared
+cap, was not timed at all.
 
 - **The gather pre-sizes its CSR outputs.** `indices` and `data` used to grow
   from empty, reallocating and copying at every doubling. They are now sized up
@@ -3090,6 +3095,14 @@ magnitude a block design discards as noise, and 12 wins out of 12 is not.
 
 #### What this does not say
 
+- **The committed rows are reduced records, not `BenchmarkResult`s.** Each
+  round's real `BenchmarkResult` was written inside the arm's scratch worktree,
+  which the job removes on exit; what is committed is the per-round metric
+  scalars the driver copied out. The table recomputes exactly from them — medians,
+  ratios, sign counts and p-values — but the file does not carry the
+  `schema_version` / `system` / `runs` envelope
+  [docs/benchmark_manifest.md](benchmark_manifest.md) describes. The driver now
+  preserves the full records, so the next capture conforms; this one does not.
 - **Peak RSS was not captured** in this A/B. The pre-size bias adds 12.5% of a
   batch's CSR payload — on the pbmc3k arm, a measured capacity of 975,737
   elements against 870,886 used, so 0.84 MB per batch. That is arithmetic from

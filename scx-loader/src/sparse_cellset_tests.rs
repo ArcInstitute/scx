@@ -1179,6 +1179,17 @@ fn a_plan_wider_than_max_plan_rows_is_refused() {
     // An undeclared bound refuses nothing — the default must stay inert.
     let unbounded = batch_charged_loader(dir.path(), 64, None, None);
     assert!(run_one(unbounded, plan(64)).is_ok());
+
+    // The ITERATOR route refuses too, and refuses in the stream: the plan must
+    // not reach the prefetcher, which would size it and await shard decodes
+    // before the gather rejected it. Review on #535 round 2 (codex).
+    let streamed = batch_charged_loader(dir.path(), 64, None, Some(4));
+    let mut it = StdArc::clone(&streamed).iter_with_plans(vec![Ok(plan(5))].into_iter(), 4);
+    let first = it
+        .next()
+        .expect("the stream must yield the refusal, not end");
+    let msg = first.unwrap_err().to_string();
+    assert!(msg.contains("max_plan_rows"), "{msg}");
 }
 
 /// A loader whose budget was not exceeded must fit the breakdown it reports.

@@ -700,6 +700,12 @@ impl SparseCellSetLoader {
     {
         let engine = Arc::clone(&self.engine);
         let loader = Arc::clone(&self);
+        // Width is refused in the STREAM, so an over-wide plan never reaches
+        // `spawn_prefetches` — which would otherwise size it and await real
+        // shard decodes before the gather rejected it.
+        let gate = Arc::clone(&self);
+        let plans =
+            plans.map(move |p| p.and_then(|plan| gate.check_plan_width(&plan).map(|()| plan)));
         let iter = engine.iter_with_plans(
             plans,
             lookahead,
@@ -724,6 +730,30 @@ impl SparseCellSetLoader {
         }
     }
 
+    /// Refuse a plan wider than the caller's declared `max_plan_rows`.
+    ///
+    /// **Review on #535 round 2 (codex).** Called BEFORE any admission sizing
+    /// or prefetch I/O on both public routes. The first version checked inside
+    /// `gather_admitting`, which meant an over-wide plan had already allocated
+    /// its dedup set and — on the iterator path — spawned and awaited shard
+    /// decodes before the refusal it was promised. A limit that only takes
+    /// effect after the work it was meant to prevent is not a limit.
+    fn check_plan_width(&self, plan: &SparseCellSetPlan) -> Result<()> {
+        if let Some(limit) = self.max_plan_rows {
+            let total_rows = plan.rows.len();
+            if total_rows > limit {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "plan has {total_rows} rows, exceeding max_plan_rows {limit} \
+                         (raise max_plan_rows at construction, or split the plan; \
+                         the shard cache was sized against {limit})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Gather one batch of cell sets into the §4.4 contract, synchronously.
     ///
     /// Takes **one** row-group admission verdict over the whole plan, sized
@@ -733,6 +763,7 @@ impl SparseCellSetLoader {
     /// by. Deciding per set instead would let a plan whose sets each fit, but
     /// whose union does not, evict its own row groups set by set.
     pub fn gather(&self, plan: &SparseCellSetPlan) -> Result<SparseCellSetBatch> {
+        self.check_plan_width(plan)?;
         let admit = self.engine.plan_fits_budget(&plan.file_ids, &plan.rows);
         self.gather_admitting(&self.engine, plan, Some(admit))
     }
@@ -751,23 +782,9 @@ impl SparseCellSetLoader {
         admit_row_groups: Option<bool>,
     ) -> Result<SparseCellSetBatch> {
         let total_rows = plan.rows.len();
-        // An "upper bound" that is only ever used to shrink the cache is not a
-        // bound at all: the budget would be sized for `max_plan_rows` while the
-        // gather happily allocated for a plan ten times wider. `IndexPlanLoader`
-        // rejects past `max_plan_size` for the same reason, and this mirrors its
-        // message. Only when the caller declared a bound — `None` charges
-        // nothing and refuses nothing, exactly as before the option existed.
-        if let Some(limit) = self.max_plan_rows {
-            if total_rows > limit {
-                return Err(LoaderError::ConfigError {
-                    reason: format!(
-                        "plan has {total_rows} rows, exceeding max_plan_rows {limit} \
-                         (raise max_plan_rows at construction, or split the plan; \
-                         the shard cache was sized against {limit})"
-                    ),
-                });
-            }
-        }
+        // Width is checked by `check_plan_width` on both public routes, before
+        // any admission sizing or prefetch I/O — not here, where the work it
+        // refuses has already happened.
         if plan.file_ids.len() != total_rows || plan.role_tags.len() != total_rows {
             return Err(LoaderError::ConfigError {
                 reason: "plan file_ids/rows/role_tags length mismatch".into(),
