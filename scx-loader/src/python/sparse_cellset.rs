@@ -166,36 +166,76 @@ impl SparseCellSetDataset {
         // and a caller catching malformed input would otherwise have to catch
         // two exception types to cover one constructor. Same reasoning, and the
         // same shape, as the `validate_indptr` call in `downsample_counts_csr`.
-        let downsample = crate::downsample::resolve_downsample_config(
-            &paths,
-            downsample_target_library_size,
-            downsample_method.as_deref(),
-            downsample_seed,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // Built before the open below takes ownership of `paths`. A count plus
+        // up to two names: actionable without being a wall of paths, and enough
+        // text for Python's per-message dedup to make the warning one-shot per
+        // dataset. String formatting only — it costs nothing to build eagerly,
+        // and the alternative is keeping a clone of every path alive for a
+        // warning that usually does not fire.
+        let unframed_target = match paths.as_slice() {
+            [one] => format!("'{one}'"),
+            _ => {
+                let shown: Vec<String> = paths.iter().take(2).map(|p| format!("'{p}'")).collect();
+                let ellipsis = if paths.len() > 2 { ", …" } else { "" };
+                format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
+            }
+        };
 
-        let mut readers = Vec::with_capacity(paths.len());
-        for p in &paths {
-            readers.push(
-                ScxReader::open(p)
-                    .map_err(|e| PyRuntimeError::new_err(format!("failed to open {p}: {e}")))?,
-            );
+        // Everything from here to the loader is pure Rust over owned data —
+        // `paths` and `remap_tables` are already `Vec`s and no `Bound` crosses
+        // — and it is not cheap: a stat per path to resolve the downsample
+        // config, an mmap and catalog parse per file, then `ScxReader`-wide
+        // range validation and the budget tune. Holding the GIL through it
+        // stalls every other Python thread for the whole open, which on a
+        // many-file manifest is the dominant cost of constructing the dataset.
+        //
+        // The error is carried out of the closure and turned into a `PyErr`
+        // after re-attaching, since building one needs the GIL. Each arm keeps
+        // the exception type it had: `ValueError` for a bad downsample value,
+        // `RuntimeError` naming the path for a failed open.
+        enum OpenError {
+            Downsample(String),
+            Open(String),
+            Loader(crate::error::LoaderError),
         }
+        let loader = py
+            .detach(move || {
+                let downsample = crate::downsample::resolve_downsample_config(
+                    &paths,
+                    downsample_target_library_size,
+                    downsample_method.as_deref(),
+                    downsample_seed,
+                )
+                .map_err(|e| OpenError::Downsample(e.to_string()))?;
 
-        let loader = SparseCellSetLoader::new(
-            readers,
-            cache_shards,
-            bytes_budget,
-            lookahead,
-            remap_tables,
-            n_global_genes,
-            normalize,
-            log1p,
-            target_sum,
-            downsample,
-            scatter_block_index,
-        )
-        .map_err(loader_err_to_py)?;
+                let mut readers = Vec::with_capacity(paths.len());
+                for p in &paths {
+                    readers.push(
+                        ScxReader::open(p)
+                            .map_err(|e| OpenError::Open(format!("failed to open {p}: {e}")))?,
+                    );
+                }
+
+                SparseCellSetLoader::new(
+                    readers,
+                    cache_shards,
+                    bytes_budget,
+                    lookahead,
+                    remap_tables,
+                    n_global_genes,
+                    normalize,
+                    log1p,
+                    target_sum,
+                    downsample,
+                    scatter_block_index,
+                )
+                .map_err(OpenError::Loader)
+            })
+            .map_err(|e| match e {
+                OpenError::Downsample(m) => PyValueError::new_err(m),
+                OpenError::Open(m) => PyRuntimeError::new_err(m),
+                OpenError::Loader(e) => loader_err_to_py(e),
+            })?;
 
         if let Some(v) = loader.cache_sizing() {
             warn_cache_sizing(py, "SparseCellSetDataset", &v)?;
@@ -205,19 +245,7 @@ impl SparseCellSetDataset {
             scx_format_io::backed::scatter_block_index_enabled(),
             || loader.any_shard_framed(),
         ) {
-            // A count plus up to two names: actionable without being a wall of
-            // paths, and enough text for Python's per-message dedup to make the
-            // warning one-shot per dataset.
-            let target = match paths.as_slice() {
-                [one] => format!("'{one}'"),
-                _ => {
-                    let shown: Vec<String> =
-                        paths.iter().take(2).map(|p| format!("'{p}'")).collect();
-                    let ellipsis = if paths.len() > 2 { ", …" } else { "" };
-                    format!("{} files ({}{})", paths.len(), shown.join(", "), ellipsis)
-                }
-            };
-            warn_unframed_scatter(py, "SparseCellSetDataset", &target)?;
+            warn_unframed_scatter(py, "SparseCellSetDataset", &unframed_target)?;
         }
 
         Ok(Self {
@@ -301,6 +329,61 @@ impl SparseCellSetDataset {
                 loader.shard_decoded_bytes(),
             ),
         })
+    }
+
+    /// Gather **one** plan synchronously and return its batch dict.
+    ///
+    /// The same `(file_ids, rows, role_tags, set_offsets)` plan
+    /// `iter_with_plans` consumes, and the same §4.4 batch dict it yields, for
+    /// a caller that has one plan in hand and no stream to drive:
+    ///
+    /// ```python
+    /// batch = ds.gather(*plan)
+    /// ```
+    ///
+    /// **Admission is decided per call.** The streaming path takes one
+    /// row-group verdict per plan across every file and shard the prefetcher
+    /// will touch, and carries it into the gathers, so a lookahead window's
+    /// worth of plans is sized together. A standalone `gather` has no such
+    /// window: it decides for itself, against the whole byte budget. Identical
+    /// output either way — the verdict changes what the cache *retains*, not
+    /// what is read — but a plan that retains nothing under `iter_with_plans`
+    /// may retain here, and the batch is gathered on the calling thread rather
+    /// than a prefetched one, so it is not the way to drive an epoch.
+    ///
+    /// Raises the same errors as the iterator, from the same validation:
+    /// `RuntimeError` for a malformed plan or a cross-file set with no
+    /// `remap_tables`, `IndexError` for a row past a file's `n_obs`.
+    fn gather<'py>(
+        &self,
+        py: Python<'py>,
+        file_ids: Bound<'py, PyAny>,
+        rows: Bound<'py, PyAny>,
+        role_tags: Bound<'py, PyAny>,
+        set_offsets: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if std::process::id() != self.creation_pid {
+            return Err(PyRuntimeError::new_err(
+                "scx.SparseCellSetDataset requires num_workers=0 (or lazy per-worker \
+                 construction). The Rust shard cache and mmap state are not fork-safe.",
+            ));
+        }
+        // Closed-state check before the plan is extracted, as on `iter_with_plans`.
+        let loader = Arc::clone(self.loader()?);
+
+        // Repacked into the tuple `extract_cellset_plan` takes rather than
+        // extracted per argument, so a malformed plan raises the one message
+        // that names the whole expected shape — the same text the iterator
+        // raises, which `test_plan_extraction_failure_names_the_expected_tuple`
+        // pins.
+        let tuple = PyTuple::new(py, [file_ids, rows, role_tags, set_offsets])?;
+        let plan = extract_cellset_plan(tuple.as_any()).map_err(loader_err_to_py)?;
+
+        let batch = py
+            .detach(move || loader.gather_plan(&plan))
+            .map_err(loader_err_to_py)?;
+
+        sparse_cellset_batch_to_dict(py, batch)
     }
 
     /// Number of distinct `(file_id, shard)` pairs a cell-set plan touches — the

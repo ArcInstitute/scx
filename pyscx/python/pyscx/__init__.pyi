@@ -358,6 +358,34 @@ class SparseCellSetDataset:
         """
         ...
 
+    def gather(
+        self,
+        file_ids: Sequence[int],
+        rows: Sequence[int],
+        role_tags: Sequence[int],
+        set_offsets: Sequence[int],
+    ) -> _SparseCellSetBatchDict:
+        """Gather **one** plan synchronously and return its batch dict.
+
+        The same plan shape ``iter_with_plans`` consumes and the same batch dict
+        it yields, for a caller holding a single plan rather than a stream::
+
+            batch = ds.gather(*plan)
+
+        **Admission is decided per call.** ``iter_with_plans`` takes one
+        row-group verdict per plan over everything its lookahead window will
+        touch and carries it into the gathers; a standalone ``gather`` has no
+        window and decides for itself against the whole byte budget. Output is
+        identical either way — the verdict changes what the cache *retains*, not
+        what is read — but the batch is gathered on the calling thread rather
+        than a prefetched one, so this is not the way to drive an epoch.
+
+        Raises exactly as the iterator does: ``RuntimeError`` for a malformed
+        plan or a cross-file set with no ``remap_tables``, ``IndexError`` for a
+        row past a file's ``n_obs``.
+        """
+        ...
+
     def cache_metrics(self) -> dict[str, Any]:
         """Cumulative shard-cache counters since construction: `hits`,
         `misses`, `evictions`, `bytes_inserted`, `duplicate_waiters`,

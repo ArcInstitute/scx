@@ -228,15 +228,28 @@ impl IndexPlanDataset {
         let max_plan_size = max_plan_size.unwrap_or(16384);
         let scatter_block_index = scatter_block_index.unwrap_or(true);
 
-        let mut loader = IndexPlanLoader::new(
-            path,
-            config,
-            cache_shards,
-            sort_by_shard,
-            lookahead,
-            max_plan_size,
-        )
-        .map_err(loader_err_to_py)?;
+        // GIL released for the open: `IndexPlanLoader::new` mmaps the file,
+        // parses its catalog, validates every CSR range, and then decodes the
+        // whole obs frame on the rayon pool (`cpu_pool().install(read_obs)`)
+        // and builds its category dictionaries — the longest pure-Rust stretch
+        // on any loader constructor. `py` is not needed again until the
+        // warnings below.
+        //
+        // `path` is owned first: it arrives borrowed from a `Bound`, which
+        // cannot cross the detach.
+        let owned_path = path.to_owned();
+        let mut loader = py
+            .detach(move || {
+                IndexPlanLoader::new(
+                    &owned_path,
+                    config,
+                    cache_shards,
+                    sort_by_shard,
+                    lookahead,
+                    max_plan_size,
+                )
+            })
+            .map_err(loader_err_to_py)?;
         loader.set_scatter_block_index(scatter_block_index);
 
         if let Some(v) = loader.cache_sizing() {

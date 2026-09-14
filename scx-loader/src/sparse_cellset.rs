@@ -646,6 +646,16 @@ impl SparseCellSetLoader {
         self.gather_admitting(engine, plan, None)
     }
 
+    /// [`Self::gather`] against this loader's own engine.
+    ///
+    /// The engine is private, so [`Self::gather`]'s two-argument form is only
+    /// callable from inside the engine-driven path. This is what a synchronous
+    /// one-plan caller (`SparseCellSetDataset.gather`) uses; it exposes no more
+    /// of the loader than `gather` already implies.
+    pub fn gather_plan(&self, plan: &SparseCellSetPlan) -> Result<SparseCellSetBatch> {
+        self.gather(&self.engine, plan)
+    }
+
     /// [`Self::gather`] with the row-group admission decided by the caller.
     /// A plan is gathered one `read_rows_with` call per set (and per file on
     /// the cross-file path), so only the caller sees the plan's whole working
