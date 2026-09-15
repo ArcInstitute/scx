@@ -138,7 +138,11 @@ pub fn bin_values(
         return Ok(());
     }
 
-    let owned_edges = match edges {
+    // On the quantile path the edges are APPENDED to `buf` behind the sorted
+    // values rather than collected into a fresh `Vec`: this runs once per row,
+    // and a 50-element allocation per cell is exactly the cost the caller-owned
+    // scratch exists to remove.
+    let edges_at = match edges {
         BinEdges::Fixed(e) => {
             if e.is_empty() {
                 return Err(LoaderError::ConfigError {
@@ -154,13 +158,15 @@ pub fn bin_values(
         }
         BinEdges::PerCellQuantile => {
             buf.sort_by(|a, b| a.partial_cmp(b).expect("clipped values are finite"));
-            Some(quantile_edges(buf, n_bins - 1))
+            let m = buf.len();
+            push_quantile_edges(buf, m, n_bins - 1);
+            Some(m)
         }
     };
-    let edges: &[f64] = match (&owned_edges, edges) {
-        (Some(e), _) => e,
+    let edges: &[f64] = match (edges_at, edges) {
+        (Some(m), _) => &buf[m..],
         (None, BinEdges::Fixed(e)) => e,
-        (None, BinEdges::PerCellQuantile) => unreachable!("quantile path always owns its edges"),
+        (None, BinEdges::PerCellQuantile) => unreachable!("quantile path always appends its edges"),
     };
 
     let mut rng = match tie {
@@ -197,25 +203,29 @@ pub fn bin_values(
     Ok(())
 }
 
-/// `np.quantile(sorted, np.linspace(0, 1, n))` with numpy's `linear` method.
+/// Append `np.quantile(buf[..m], np.linspace(0, 1, n))` — numpy's `linear`
+/// method — to `buf`, behind the `m` ascending values it reads.
 ///
-/// `sorted` must already be ascending. `n == 1` gives the single point `q = 0`,
-/// matching `np.linspace(0, 1, 1) == [0.0]`.
-fn quantile_edges(sorted: &[f64], n: usize) -> Vec<f64> {
-    let m = sorted.len();
-    (0..n)
-        .map(|j| {
-            let q = if n <= 1 {
-                0.0
-            } else {
-                j as f64 / (n - 1) as f64
-            };
-            let h = (m - 1) as f64 * q;
-            let lo = h.floor() as usize;
-            let hi = h.ceil() as usize;
-            sorted[lo] + (h - lo as f64) * (sorted[hi] - sorted[lo])
-        })
-        .collect()
+/// `buf[..m]` must already be ascending. `n == 1` gives the single point
+/// `q = 0`, matching `np.linspace(0, 1, 1) == [0.0]`.
+///
+/// Appending rather than returning a `Vec` is what keeps the kernel free of
+/// per-row allocations: at `n_bins = 51` a returned vector is a 50-element
+/// allocation per cell. The two reads are copied into locals before the push,
+/// so a reallocation mid-loop is harmless; each iteration re-indexes.
+fn push_quantile_edges(buf: &mut Vec<f64>, m: usize, n: usize) {
+    for j in 0..n {
+        let q = if n <= 1 {
+            0.0
+        } else {
+            j as f64 / (n - 1) as f64
+        };
+        let h = (m - 1) as f64 * q;
+        let lo = h.floor() as usize;
+        let hi = h.ceil() as usize;
+        let (a, b) = (buf[lo], buf[hi]);
+        buf.push(a + (h - lo as f64) * (b - a));
+    }
 }
 
 /// `np.digitize(x, bins)` for increasing `bins` = `searchsorted(bins, x, "right")`.

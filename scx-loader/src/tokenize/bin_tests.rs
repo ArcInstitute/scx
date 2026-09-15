@@ -21,7 +21,11 @@ fn edges_of(vals: &[f32], n_bins: usize) -> Vec<f64> {
         .map(|&v| v as f64)
         .collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    quantile_edges(&sorted, n_bins - 1)
+    // Through the SAME helper the kernel uses, so a change to the interpolation
+    // cannot pass here and fail there.
+    let m = sorted.len();
+    push_quantile_edges(&mut sorted, m, n_bins - 1);
+    sorted.split_off(m)
 }
 
 // Reference vectors produced by numpy 2.4.4:
