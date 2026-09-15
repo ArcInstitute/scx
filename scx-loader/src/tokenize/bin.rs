@@ -84,25 +84,28 @@ pub enum BinTie {
     /// rather than on numpy's global RNG: `ceil(u * (right - left) + left)` with
     /// `u` drawn from `ChaCha8Rng` keyed by `(seed, file, row)`.
     ///
+    /// The row index is **not** carried here — it is the one part of the key
+    /// that changes per call, so it is an ordinary argument to [`bin_values`],
+    /// exactly as it is to [`sample_genes`](crate::tokenize::sample::sample_genes).
+    /// Carrying it meant every caller rebuilt this enum inside its row loop.
+    ///
     /// This is a **different stream** from the reference's. It reproduces the
     /// reference's *distribution*, not its draws, and it is reproducible across
     /// runs and machines, which numpy's global RNG is not.
-    SeededUniform {
-        seed: u64,
-        file_identity: u64,
-        row: u64,
-    },
+    SeededUniform { seed: u64, file_identity: u64 },
 }
 
 /// Bin one row's values into `out`, which must be the same length as `values`.
 ///
 /// `buf` is caller-owned scratch reused across rows; on the
 /// [`BinEdges::PerCellQuantile`] path it holds the row's edges.
+#[allow(clippy::too_many_arguments)]
 pub fn bin_values(
     values: &[f32],
     edges: BinEdges<'_>,
     n_bins: usize,
     tie: BinTie,
+    row_index: u64,
     buf: &mut Vec<f64>,
     out: &mut [i64],
 ) -> Result<()> {
@@ -121,6 +124,27 @@ pub fn bin_values(
         return Err(LoaderError::ConfigError {
             reason: format!("bin_values: n_bins must be >= 3, got {n_bins}"),
         });
+    }
+
+    // Validated BEFORE the all-zero early return below. An earlier version
+    // validated inside the edge match, which sits after that return, so an
+    // empty or all-zero batch silently accepted descending, NaN or empty
+    // edges — checked: `edges=[3.0, 1.0]` on an all-zero row returned Ok.
+    if let BinEdges::Fixed(e) = edges {
+        if e.len() + 1 != n_bins {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "bin_values: Fixed edges must be exactly n_bins - 1 = {} long, got {}; otherwise the emitted bins and the declared n_bins disagree",
+                    n_bins - 1,
+                    e.len()
+                ),
+            });
+        }
+        if e.windows(2).any(|w| w[1] < w[0]) || e.iter().any(|v| !v.is_finite()) {
+            return Err(LoaderError::ConfigError {
+                reason: "bin_values: Fixed edges must be finite and non-decreasing".to_string(),
+            });
+        }
     }
 
     for o in out.iter_mut() {
@@ -142,43 +166,25 @@ pub fn bin_values(
     // values rather than collected into a fresh `Vec`: this runs once per row,
     // and a 50-element allocation per cell is exactly the cost the caller-owned
     // scratch exists to remove.
-    let edges_at = match edges {
-        BinEdges::Fixed(e) => {
-            if e.is_empty() {
-                return Err(LoaderError::ConfigError {
-                    reason: "bin_values: Fixed edges are empty".to_string(),
-                });
-            }
-            if e.windows(2).any(|w| w[1] < w[0]) || e.iter().any(|v| !v.is_finite()) {
-                return Err(LoaderError::ConfigError {
-                    reason: "bin_values: Fixed edges must be finite and non-decreasing".to_string(),
-                });
-            }
-            None
-        }
+    let edges: &[f64] = match edges {
+        BinEdges::Fixed(e) => e,
         BinEdges::PerCellQuantile => {
             buf.sort_by(|a, b| a.partial_cmp(b).expect("clipped values are finite"));
             let m = buf.len();
             push_quantile_edges(buf, m, n_bins - 1);
-            Some(m)
+            &buf[m..]
         }
-    };
-    let edges: &[f64] = match (edges_at, edges) {
-        (Some(m), _) => &buf[m..],
-        (None, BinEdges::Fixed(e)) => e,
-        (None, BinEdges::PerCellQuantile) => unreachable!("quantile path always appends its edges"),
     };
 
     let mut rng = match tie {
         BinTie::SeededUniform {
             seed,
             file_identity,
-            row,
         } => Some(ChaCha8Rng::seed_from_u64(row_seed(
             seed,
             TOKENIZE_BIN_TAG,
             file_identity,
-            row,
+            row_index,
         ))),
         _ => None,
     };

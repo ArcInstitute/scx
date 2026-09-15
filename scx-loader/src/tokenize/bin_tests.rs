@@ -1,12 +1,17 @@
 use super::*;
 
 fn run(vals: &[f32], n_bins: usize, tie: BinTie) -> Vec<i64> {
+    run_at(vals, n_bins, tie, 0)
+}
+
+fn run_at(vals: &[f32], n_bins: usize, tie: BinTie, row: u64) -> Vec<i64> {
     let mut out = vec![-9i64; vals.len()];
     bin_values(
         vals,
         BinEdges::PerCellQuantile,
         n_bins,
         tie,
+        row,
         &mut Vec::new(),
         &mut out,
     )
@@ -102,14 +107,14 @@ fn the_seeded_randomisation_stays_within_the_two_deterministic_bounds() {
     let right = run(&vals, 6, BinTie::Right);
     let mut seen = std::collections::BTreeSet::new();
     for row in 0..200u64 {
-        let got = run(
+        let got = run_at(
             &vals,
             6,
             BinTie::SeededUniform {
                 seed: 7,
                 file_identity: 11,
-                row,
             },
+            row,
         );
         for i in 0..vals.len() {
             assert!(
@@ -136,14 +141,14 @@ fn a_value_strictly_inside_a_bin_has_no_tiebreak_to_make() {
     // ever fires on an edge.
     let vals = [1.0f32, 2.0, 5.0, 11.0];
     let l = run(&vals, 6, BinTie::Left);
-    let seeded = run(
+    let seeded = run_at(
         &vals,
         6,
         BinTie::SeededUniform {
             seed: 1,
             file_identity: 2,
-            row: 3,
         },
+        3,
     );
     // Position 1 (value 2.0) sits strictly between edges 1.75 and 3.5.
     assert_eq!(l[1], seeded[1]);
@@ -184,35 +189,34 @@ fn a_single_nonzero_value_is_the_degenerate_case_too() {
 #[test]
 fn seeded_draws_are_reproducible_and_keyed_on_the_row() {
     let vals = [4.0f32; 16];
-    let key = |row| BinTie::SeededUniform {
+    let k = BinTie::SeededUniform {
         seed: 42,
         file_identity: 99,
-        row,
     };
-    assert_eq!(run(&vals, 8, key(5)), run(&vals, 8, key(5)));
-    assert_ne!(run(&vals, 8, key(5)), run(&vals, 8, key(6)));
+    assert_eq!(run_at(&vals, 8, k, 5), run_at(&vals, 8, k, 5));
+    assert_ne!(run_at(&vals, 8, k, 5), run_at(&vals, 8, k, 6));
     assert_ne!(
-        run(&vals, 8, key(5)),
-        run(
+        run_at(&vals, 8, k, 5),
+        run_at(
             &vals,
             8,
             BinTie::SeededUniform {
                 seed: 42,
-                file_identity: 100,
-                row: 5
-            }
+                file_identity: 100
+            },
+            5
         )
     );
     assert_ne!(
-        run(&vals, 8, key(5)),
-        run(
+        run_at(&vals, 8, k, 5),
+        run_at(
             &vals,
             8,
             BinTie::SeededUniform {
                 seed: 43,
-                file_identity: 99,
-                row: 5
-            }
+                file_identity: 99
+            },
+            5
         )
     );
 }
@@ -223,8 +227,9 @@ fn fixed_edges_are_used_as_given() {
     bin_values(
         &[0.5, 1.5, 2.5, 3.5],
         BinEdges::Fixed(&[1.0, 2.0, 3.0]),
-        5,
+        4,
         BinTie::Left,
+        0,
         &mut Vec::new(),
         &mut out,
     )
@@ -235,13 +240,14 @@ fn fixed_edges_are_used_as_given() {
 #[test]
 fn fixed_edges_must_be_finite_and_non_decreasing() {
     let mut out = vec![0i64; 1];
-    for bad in [vec![2.0, 1.0], vec![1.0, f64::NAN], vec![]] {
+    for bad in [vec![2.0, 1.0], vec![1.0, f64::NAN]] {
         assert!(
             bin_values(
                 &[1.0],
                 BinEdges::Fixed(&bad),
-                5,
+                3,
                 BinTie::Left,
+                0,
                 &mut Vec::new(),
                 &mut out
             )
@@ -249,6 +255,31 @@ fn fixed_edges_must_be_finite_and_non_decreasing() {
             "{bad:?} was accepted"
         );
     }
+    // Edge count must match `n_bins`, or the emitted bins and the declared
+    // range disagree: `edges=[1,2,3]` with `n_bins=3` emitted bin 3.
+    assert!(bin_values(
+        &[1.0],
+        BinEdges::Fixed(&[1.0, 2.0, 3.0]),
+        3,
+        BinTie::Left,
+        0,
+        &mut Vec::new(),
+        &mut out
+    )
+    .is_err());
+    // ...and it is checked BEFORE the all-zero early return, or a batch with
+    // nothing to bin accepts any edges at all.
+    let mut zeros = vec![0i64; 2];
+    assert!(bin_values(
+        &[0.0, 0.0],
+        BinEdges::Fixed(&[3.0, 1.0]),
+        3,
+        BinTie::Left,
+        0,
+        &mut Vec::new(),
+        &mut zeros
+    )
+    .is_err());
 }
 
 #[test]
@@ -259,6 +290,7 @@ fn shape_and_parameter_errors_are_returned_not_panicked() {
         BinEdges::PerCellQuantile,
         5,
         BinTie::Left,
+        0,
         &mut Vec::new(),
         &mut short
     )
@@ -271,6 +303,7 @@ fn shape_and_parameter_errors_are_returned_not_panicked() {
                 BinEdges::PerCellQuantile,
                 n_bins,
                 BinTie::Left,
+                0,
                 &mut Vec::new(),
                 &mut out
             )
@@ -292,6 +325,7 @@ fn reusing_one_buffer_across_rows_is_not_observable() {
             BinEdges::PerCellQuantile,
             6,
             BinTie::Left,
+            0,
             &mut Vec::new(),
             &mut fresh,
         )
@@ -301,6 +335,7 @@ fn reusing_one_buffer_across_rows_is_not_observable() {
             BinEdges::PerCellQuantile,
             6,
             BinTie::Left,
+            0,
             &mut shared,
             &mut reused,
         )

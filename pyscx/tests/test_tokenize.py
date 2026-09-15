@@ -189,8 +189,10 @@ def test_rank_tokens_refuses_a_non_positive_statistic():
 
 
 def test_rank_tokens_refuses_a_gene_outside_the_vocabulary():
+    # The public-entry guard fires before the kernel's own, so the message is
+    # the entry's; the kernel's wording is pinned Rust-side.
     indptr, indices, data = csr([[(5, 1.0)]])
-    with pytest.raises(ValueError, match="outside the normalisation vocabulary"):
+    with pytest.raises(ValueError, match="outside the vocabulary"):
         tok.rank_tokens(indptr, indices, data, np.ones(3, dtype=np.float32), 1, "v")
 
 
@@ -245,10 +247,31 @@ def test_bin_values_zeros_stay_in_bin_zero():
 
 
 def test_bin_values_fixed_edges_are_used_as_given():
+    # n_bins must be len(edges) + 1. An earlier version of this test passed
+    # n_bins=5 with three edges and asserted bins up to 3 — which contradicted
+    # the documented [1, n_bins - 1] range and was the bug, not the fixture.
     indptr, indices, data = csr([[(0, 0.5), (1, 1.5), (2, 2.5), (3, 3.5)]])
     edges = np.array([1.0, 2.0, 3.0], dtype=np.float64)
-    got = tok.bin_values(indptr, indices, data, 5, edges=edges, tie="left")["bins"]
+    got = tok.bin_values(indptr, indices, data, 4, edges=edges, tie="left")["bins"]
     assert got.tolist() == [0, 1, 2, 3]
+
+
+def test_bin_values_rejects_edges_that_disagree_with_n_bins():
+    indptr, indices, data = csr([[(0, 0.5), (1, 1.5)]])
+    edges = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    with pytest.raises(ValueError, match="exactly n_bins - 1"):
+        tok.bin_values(indptr, indices, data, 3, edges=edges, tie="left")
+
+
+def test_bin_values_validates_edges_even_on_an_all_zero_batch():
+    # The check has to precede the all-zero early return, or a batch with
+    # nothing to bin silently accepts descending edges.
+    indptr, indices, data = csr([[(0, 0.0), (1, 0.0)]])
+    with pytest.raises(ValueError, match="non-decreasing"):
+        tok.bin_values(
+            indptr, indices, data, 3,
+            edges=np.array([3.0, 1.0], dtype=np.float64), tie="left",
+        )
 
 
 def test_bin_values_rejects_an_unknown_tie():
@@ -370,6 +393,60 @@ def test_measured_mask_marks_panel_positions_the_row_carries():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# The CSR row invariant, enforced at the public entry
+# ---------------------------------------------------------------------------
+#
+# `CsrRow` documents gene ids as sorted ascending, unique and in range, and the
+# kernels used to rely on that without checking — on an entry that takes
+# arbitrary numpy arrays, and where `scipy.sparse` does not sort its indices
+# until you call `sort_indices()`. Each case below was reproduced as a
+# `pyo3_runtime.PanicException` or a silently wrong answer before being closed.
+
+
+def test_a_negative_gene_id_raises_rather_than_panicking():
+    indptr, indices, data = csr([[(2, 1.0)]])
+    indices = np.array([-1], dtype=np.int32)
+    with pytest.raises(ValueError, match="negative"):
+        tok.rank_tokens(indptr, indices, data, np.ones(4, dtype=np.float32), 2, "v")
+
+
+def test_an_unsorted_row_raises_rather_than_indexing_out_of_bounds():
+    # `[7, 1]` against a 3-gene vocabulary: the LAST id is in range, so a
+    # last-element bounds check passed and `stat[7]` panicked.
+    indptr = np.array([0, 2], dtype=np.int64)
+    indices = np.array([7, 1], dtype=np.int32)
+    data = np.array([1.0, 1.0], dtype=np.float32)
+    with pytest.raises(ValueError):
+        tok.rank_tokens(indptr, indices, data, np.ones(3, dtype=np.float32), 2, "v")
+
+
+def test_measured_mask_refuses_an_unsorted_row_instead_of_answering_wrongly():
+    # Returned [1, 0, 0] where [1, 1, 1] is correct — a wrong mask, not a crash.
+    indptr = np.array([0, 3], dtype=np.int64)
+    indices = np.array([0, 2, 1], dtype=np.int32)
+    with pytest.raises(ValueError, match="ascending"):
+        tok.measured_mask(indptr, indices, np.array([0, 1, 2], dtype=np.int32))
+
+
+def test_top_k_refuses_a_gene_id_that_would_collide_with_the_mask_token():
+    # `n_genes_total` IS the GENE_MASK id and `+1` is PAD, so an id at or above
+    # it emits a real gene indistinguishable from a sentinel. Reproduced:
+    # ids [5, 9] at n_genes_total=5 returned [5, 9, 6].
+    indptr = np.array([0, 2], dtype=np.int64)
+    indices = np.array([5, 9], dtype=np.int32)
+    data = np.array([3.0, 1.0], dtype=np.float32)
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        tok.top_k(indptr, indices, data, 3, 5)
+
+
+def test_a_sorted_in_range_batch_still_works():
+    """Anti-vacuity for the four guards above: the valid shape is unaffected."""
+    indptr, indices, data = random_csr(8, n_genes=100, nnz_per_row=10, seed=5)
+    assert tok.top_k(indptr, indices, data, 4, 100)["n_rows"] == 8
+    assert tok.measured_mask(indptr, indices, np.array([1], dtype=np.int32)).size == 8
+
+
 @pytest.mark.parametrize(
     "call",
     [
@@ -479,14 +556,25 @@ def test_kernels_release_the_gil(big_batch, name):
         "sample_genes": lambda: tok.sample_genes(indptr, indices, data, 1024, 1, 2),
     }
     duration, largest_gap = largest_gap_during(ops[name])
-    if duration < MIN_MEASURABLE_S:
-        pytest.skip(f"{name} too fast to measure ({duration * 1000:.1f} ms)")
+    # FAIL, not skip. A skip here is silently lost coverage — that is exactly
+    # how three of these four arms stopped testing anything when a release
+    # build replaced a debug one, and a skip gives nobody a reason to look. The
+    # fixture is sized with 1.8-5.1x margin on release, so falling under the
+    # floor means the build got materially faster and the fixture needs raising.
+    assert duration >= MIN_MEASURABLE_S, (
+        f"{name} ran in {duration * 1000:.1f} ms, under the {MIN_MEASURABLE_S * 1000:.0f} ms "
+        f"floor this measurement needs. Raise GIL_N_ROWS (currently {GIL_N_ROWS}) "
+        "until it clears — do not convert the lost coverage into a skip."
+    )
     assert largest_gap < MAX_GAP_FRACTION * duration, (
         f"{name} held the GIL: largest monitor gap {largest_gap:.4f}s of a "
         f"{duration:.4f}s call"
     )
 
 
-def test_contract_version_is_reachable_from_both_spellings():
-    assert tok.CONTRACT_VERSION == tok.contract_version()
+def test_contract_version_is_a_constant_not_also_a_function():
+    # One surface, matching `pyscx.COLLATE_CELLSET_CONTRACT_VERSION` and
+    # `pyscx.accel`, which ships no `accel.contract_version()` either.
+    assert isinstance(tok.CONTRACT_VERSION, int)
     assert pyscx.tokenize.CONTRACT_VERSION == tok.CONTRACT_VERSION
+    assert not hasattr(tok, "contract_version")

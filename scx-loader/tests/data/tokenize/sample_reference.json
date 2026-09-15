@@ -1,9 +1,9 @@
 {
   "_comment": "GENERATED FILE - do not edit by hand. Regenerate with `.venv/bin/python benchmarks/scripts/gen_tokenize_goldens.py`, then update the blake3 prefix in scx-loader/src/tokenize/golden_tests.rs. See the generator's docstring for what this file's numbers do and do not claim.",
   "_provenance": {
-    "reference": "UCE eval_data.py sample_cell_sentences @ main@2026-09-14 (github.com/snap-stanford/UCE, eval_data.py)",
+    "reference": "UCE eval_data.py sample_cell_sentences @ 9c416007be15ad6753dc84af4468c1dc10421ab9 (github.com/snap-stanford/UCE, eval_data.py)",
     "produced_by": "numpy running a verbatim transcription of the reference kernel; the package itself is installed nowhere on this machine",
-    "claim": "DISTRIBUTIONAL ONLY: np.random.choice draws from numpy's global RNG, so no SCX output reproduces its draws. The probabilities are exact; the frozen SCX draws live in sample_golden.json, whose source of truth is Rust (regenerate with the #[ignore]d test).",
+    "claim": "DISTRIBUTIONAL ONLY, and a float64 RECONSTRUCTION of UCE's formula rather than UCE's own numbers. np.random.choice draws from numpy's global RNG, so no SCX output reproduces its draws. Separately, UCE computes its weights through torch, which may round them to float32 before numpy widens p for the cumsum; that would move CDF boundaries relative to the f64 arithmetic here and in SCX's kernel. A float32 reconstruction was attempted and produced a p numpy's own choice would reject (sum off by ~1e-7 against its 1.49e-8 tolerance), so the precision question is OPEN and needs a run of the real package. The frozen SCX draws live in sample_golden.json, whose source of truth is Rust (regenerate with the #[ignore]d test).",
     "numpy": "2.4.4"
   },
   "cases": [

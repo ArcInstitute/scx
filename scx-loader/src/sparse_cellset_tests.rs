@@ -2503,3 +2503,74 @@ fn each_row_consults_its_own_query_panel() {
     // Row 1 (1.0, 9.0, 3.0 on genes 1, 3, 5) loses gene 3 — NOT gene 1.
     assert_eq!(&b.encoder_gene_ids[4..6], &[5, 1]);
 }
+
+#[test]
+fn collate_gathered_rejects_the_three_shapes_that_used_to_panic() {
+    // All three were reproduced against the built extension as
+    // `pyo3_runtime.PanicException` or as silently non-finite output before
+    // being closed; `validate_indptr` had already covered the fourth.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let (indptr, indices, data, set_offsets) = v3_fixture();
+    let call = |k_enc: usize, k_dec: usize, ix: &[i32], dt: &[f32], nm: &[u32], mode| {
+        let mut scalars = sc;
+        scalars.k_enc = k_enc;
+        scalars.mode = mode;
+        collate_gathered(
+            &indptr,
+            ix,
+            dt,
+            &set_offsets,
+            vec![0u64, 1],
+            vec![0u32, 0],
+            vec![0i32, 0],
+            k_dec,
+            &[1],
+            None,
+            &[],
+            &[0, 0],
+            nm,
+            &scalars,
+        )
+    };
+    // k_enc == 0 => `par_chunks_mut(0)` panics with "chunk_size must not be zero".
+    assert!(call(0, 1, &indices, &data, &[3], PreprocessMode::PassThrough).is_err());
+    // k_dec == 0 => same, on the target chunks.
+    assert!(call(4, 0, &indices, &data, &[3], PreprocessMode::PassThrough).is_err());
+    // A short `indices` against a well-formed `indptr` over `data` slices OOB.
+    assert!(call(
+        4,
+        1,
+        &indices[..3],
+        &data,
+        &[3],
+        PreprocessMode::PassThrough
+    )
+    .is_err());
+    // PflogRaw with n_measured == 0 centres by a zero denominator and wrote
+    // -inf into every encoder slot rather than erroring.
+    let mut pflog = sc;
+    pflog.mode = PreprocessMode::PflogRaw;
+    let err = collate_gathered(
+        &indptr,
+        &indices,
+        &data,
+        &set_offsets,
+        vec![0u64, 1],
+        vec![0u32, 0],
+        vec![0i32, 0],
+        1,
+        &[1],
+        None,
+        &[],
+        &[0, 0],
+        &[0],
+        &pflog,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("n_measured >= 1"),
+        "unexpected error: {err}"
+    );
+    // And the well-formed call still works, so the guards are not vacuous.
+    assert!(call(4, 1, &indices, &data, &[3], PreprocessMode::PassThrough).is_ok());
+}

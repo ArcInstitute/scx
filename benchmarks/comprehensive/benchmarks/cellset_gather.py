@@ -941,12 +941,6 @@ def _tokenize_inputs(
             f"a probed row has {distinct_min} distinct value(s); every quantile "
             "edge would collapse and the arm would time the degenerate branch"
         )
-    if median_nnz <= _TOKENIZE_SAMPLE_N:
-        skip["sample"] = (
-            f"median nnz/cell {median_nnz} <= n {_TOKENIZE_SAMPLE_N}; the draw "
-            "would cover essentially the whole row, so the inverse-CDF search "
-            "would not be representative"
-        )
     if median_nnz and median_nnz * 4 < _TOKENIZE_K:
         logger.warning(
             "  tokenize crop arm: median nnz/cell %d is under a quarter of k=%d, "

@@ -1375,6 +1375,22 @@ pub fn collate_gathered(
             reason: format!("collate_gathered: {what} len {got} != {exp}"),
         })
     };
+    // Three panics this entry could still reach across the FFI, all reproduced
+    // against the built extension before being closed here. `validate_indptr`
+    // below closed the non-monotonic case; these are its siblings.
+    if k_enc == 0 || k_dec == 0 {
+        // `par_chunks_mut(0)` panics with "chunk_size must not be zero".
+        return Err(LoaderError::ConfigError {
+            reason: format!(
+                "collate_gathered: k_enc and k_dec must be >= 1, got {k_enc} and {k_dec}"
+            ),
+        });
+    }
+    if indices.len() != data.len() {
+        // A short `indices` with a well-formed `indptr` over `data` slices out
+        // of bounds in the row loop.
+        return want("indices", indices.len(), data.len());
+    }
     if indptr.len() != n_rows + 1 {
         return want("indptr", indptr.len(), n_rows + 1);
     }
@@ -1476,6 +1492,23 @@ pub fn collate_gathered(
             (rows, n_measured.to_vec(), n_rows)
         }
     };
+
+    // `pflog_raw` divides by `n_measured`, so a zero yields a non-finite centre
+    // and writes -inf into every encoder slot of that row. `transform::pflog_raw`
+    // documented that "the collator validates it upstream" and the collator did
+    // not — checked: a v2-shaped call with `n_measured = [0]` returned
+    // `encoder_counts [-inf, -inf]`. Contract v3 makes the array per-row, so one
+    // bad entry poisons one cell rather than a set, which is easier to pass by
+    // accident on a ragged or empty query.
+    if scalars.mode == PreprocessMode::PflogRaw {
+        if let Some(i) = measured_of_row.iter().position(|&m| m == 0) {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "collate_gathered: PflogRaw requires n_measured >= 1; row {i} has 0, which would centre by a zero denominator"
+                ),
+            });
+        }
+    }
 
     // One sorted panel per distinct query, built before the row loop because on
     // the per-set path the panel is shared by the set's rows while the mask bits

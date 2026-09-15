@@ -75,6 +75,50 @@ fn rows_of<'a>(
     })
 }
 
+/// Check one row's gene ids against the invariant [`CsrRow`] documents.
+///
+/// `CsrRow`'s doc says the kernels rely on ids being sorted ascending, unique
+/// and in range, and that they "do not re-verify it, because the verification
+/// would cost more than the kernels do". That was measured against the wrong
+/// thing: this entry takes **arbitrary numpy arrays**, and `scipy.sparse` does
+/// not sort its indices until you call `sort_indices()`. Three reproduced
+/// consequences, all on ordinary input:
+///
+/// * `rank_tokens` on `[-1, 2]` — `-1i32 as usize` wraps and indexes the
+///   statistics vector out of bounds, panicking across the FFI;
+/// * `rank_tokens` on an unsorted `[7, 1]` against a 3-gene vocabulary — same
+///   panic, because a last-element bounds check cannot see the 7;
+/// * `measured_mask` on an unsorted `[0, 2, 1]` — no panic, a silently wrong
+///   mask, which is worse.
+///
+/// So the check happens, once, at the public entry. It runs inside each
+/// kernel's existing per-row closure where the row is already in cache, so it
+/// costs one pass over data the kernel is about to read anyway.
+#[inline]
+fn check_row_ids(ids: &[i32], vocab: Option<usize>, what: &str) -> Result<(), String> {
+    let mut prev: i32 = -1;
+    for &g in ids {
+        if g < 0 {
+            return Err(format!("{what}: gene id {g} is negative"));
+        }
+        if g <= prev {
+            return Err(format!(
+                "{what}: gene ids must be strictly ascending within a row (saw {prev} then {g}); \
+                 call `sort_indices()` on a scipy CSR first"
+            ));
+        }
+        if let Some(n) = vocab {
+            if g as usize >= n {
+                return Err(format!(
+                    "{what}: gene id {g} is outside the vocabulary of size {n}"
+                ));
+            }
+        }
+        prev = g;
+    }
+    Ok(())
+}
+
 /// Per-row keys for the seeded kernels.
 ///
 /// Defaults to the row's position in this batch, which is reproducible only for
@@ -98,12 +142,6 @@ fn row_keys(rows: Option<PyReadonlyArray1<'_, u64>>, n_rows: usize) -> PyResult<
             Ok(r.to_vec())
         }
     }
-}
-
-/// The version of the kernel contract this build implements.
-#[pyfunction]
-fn contract_version() -> u32 {
-    crate::tokenize::TOKENIZE_CONTRACT_VERSION
 }
 
 /// `GENE_MASK` token id for a vocabulary of `n_genes_total` genes.
@@ -145,15 +183,26 @@ fn top_k<'py>(
     let mut values = vec![0f32; n_rows * k];
     let mut mask = vec![0u8; n_rows * k];
     let mut pad = vec![0u8; n_rows * k];
-    py.detach(|| {
+    let out: Result<(), String> = py.detach(|| {
         crate::pool::cpu_pool().install(|| {
             ids.par_chunks_mut(k)
                 .zip(values.par_chunks_mut(k))
                 .zip(mask.par_chunks_mut(k))
                 .zip(pad.par_chunks_mut(k))
                 .enumerate()
-                .for_each_init(Vec::new, |order, (r, (((i, v), m), p))| {
+                .map_init(Vec::new, |order, (r, (((i, v), m), p))| {
                     let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
+                    // `n_genes_total` is the vocabulary bound: a gene id equal
+                    // to it IS the GENE_MASK token and one above it is PAD, so
+                    // an out-of-range id emits a real gene indistinguishable
+                    // from a sentinel. Reproduced: ids `[5, 9]` at
+                    // `n_genes_total = 5` returned `[5, 9, 6]`, where the
+                    // leading 5 is the mask token.
+                    check_row_ids(
+                        &indices[lo..hi],
+                        Some(n_genes_total.max(0) as usize),
+                        "top_k",
+                    )?;
                     crop::top_k(
                         &crop::CropIn {
                             row: CsrRow {
@@ -173,9 +222,12 @@ fn top_k<'py>(
                             pad: p,
                         },
                     );
-                });
+                    Ok(())
+                })
+                .collect()
         })
     });
+    out.map_err(PyValueError::new_err)?;
     let dict = PyDict::new(py);
     dict.set_item("ids", PyArray1::from_vec(py, ids))?;
     dict.set_item("values", PyArray1::from_vec(py, values))?;
@@ -244,6 +296,7 @@ fn rank_tokens<'py>(
                     || (Vec::new(), Vec::new()),
                     |(order, values), (r, (slot, len))| {
                         let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
+                        check_row_ids(&indices[lo..hi], Some(norm.len()), "rank_tokens")?;
                         let n = rank::rank_tokens(
                             CsrRow {
                                 gene_ids: &indices[lo..hi],
@@ -330,18 +383,20 @@ fn bin_values<'py>(
         ),
         None => None,
     };
-    // Parsed once. An earlier version validated the string here and then
-    // re-matched it per row with a `_ => Left` arm, which would have turned a
-    // future fourth spelling into a silent Left instead of an error.
-    enum TieKind {
-        Left,
-        Right,
-        Seeded,
-    }
-    let kind = match tie {
-        "left" => TieKind::Left,
-        "right" => TieKind::Right,
-        "seeded" => TieKind::Seeded,
+    // Parsed once, straight into the kernel's own enum. An earlier version
+    // needed a local `TieKind` shim because `BinTie::SeededUniform` carried the
+    // row index, so the enum had to be rebuilt inside the row loop; the row is
+    // now an ordinary argument to `bin_values`, mirroring `sample_genes`, and
+    // the shim is gone. (An even earlier version re-matched the *string* per row
+    // with a `_ => Left` arm, which would have turned a future fourth spelling
+    // into a silent Left rather than an error.)
+    let tie = match tie {
+        "left" => BinTie::Left,
+        "right" => BinTie::Right,
+        "seeded" => BinTie::SeededUniform {
+            seed,
+            file_identity,
+        },
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown tie {other:?} (expected \"left\", \"right\" or \"seeded\")"
@@ -352,26 +407,14 @@ fn bin_values<'py>(
     let mut bins = vec![0i64; data.len()];
     let out: Result<(), String> = py.detach(|| {
         crate::pool::cpu_pool().install(|| {
-            let spans: Vec<(usize, usize)> = (0..n_rows)
-                .map(|r| (indptr[r] as usize, indptr[r + 1] as usize))
-                .collect();
-            split_by_spans(&mut bins, &spans)
+            split_by_rows(&mut bins, indptr)
                 .into_par_iter()
                 .enumerate()
                 // Per-worker edge buffer: the quantile path sorts the row's
                 // non-zeros into it, so a fresh `Vec` per row would allocate on
                 // every cell.
                 .map_init(Vec::new, |buf, (r, slot)| {
-                    let (lo, hi) = spans[r];
-                    let t = match kind {
-                        TieKind::Left => BinTie::Left,
-                        TieKind::Right => BinTie::Right,
-                        TieKind::Seeded => BinTie::SeededUniform {
-                            seed,
-                            file_identity,
-                            row: keys[r],
-                        },
-                    };
+                    let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
                     bin::bin_values(
                         &data[lo..hi],
                         match fixed {
@@ -379,7 +422,8 @@ fn bin_values<'py>(
                             None => BinEdges::PerCellQuantile,
                         },
                         n_bins,
-                        t,
+                        tie,
+                        keys[r],
                         buf,
                         slot,
                     )
@@ -449,6 +493,7 @@ fn sample_genes<'py>(
                 // Per-worker CDF buffer; see `rank_tokens` above.
                 .map_init(Vec::new, |buf, (r, (slot, len))| {
                     let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
+                    check_row_ids(&indices[lo..hi], None, "sample_genes")?;
                     let drawn = sample::sample_genes(
                         CsrRow {
                             gene_ids: &indices[lo..hi],
@@ -500,7 +545,6 @@ fn transform_values<'py>(
     let indptr = indptr.as_slice().map_err(err)?;
     let data = data.as_slice().map_err(err)?;
     validate_indptr(indptr, data.len()).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let n_rows = indptr.len() - 1;
     let mode = PreprocessMode::parse(mode).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let (alpha, measured) = if mode == PreprocessMode::PflogRaw {
         let a = pflog_alpha.ok_or_else(|| {
@@ -528,14 +572,11 @@ fn transform_values<'py>(
     let mut out = vec![0f32; data.len()];
     py.detach(|| {
         crate::pool::cpu_pool().install(|| {
-            let spans: Vec<(usize, usize)> = (0..n_rows)
-                .map(|r| (indptr[r] as usize, indptr[r + 1] as usize))
-                .collect();
-            split_by_spans(&mut out, &spans)
+            split_by_rows(&mut out, indptr)
                 .into_par_iter()
                 .enumerate()
                 .for_each(|(r, slot)| {
-                    let (lo, hi) = spans[r];
+                    let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
                     let src = &data[lo..hi];
                     match mode {
                         PreprocessMode::PassThrough => transform::pass_through(src, slot),
@@ -605,31 +646,42 @@ fn measured_mask<'py>(
     let n_rows = indptr.len() - 1;
     let width = panel.len().max(1);
     let mut out = vec![0u8; n_rows * panel.len()];
-    py.detach(|| {
+    let res: Result<(), String> = py.detach(|| {
         crate::pool::cpu_pool().install(|| {
-            out.par_chunks_mut(width).enumerate().for_each(|(r, slot)| {
-                let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
-                transform::measured_mask(&indices[lo..hi], panel, slot);
-            });
+            out.par_chunks_mut(width)
+                .enumerate()
+                .map(|(r, slot)| {
+                    let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
+                    // The exact-match binary search is silently WRONG on an
+                    // unsorted row rather than loud: `[0, 2, 1]` against panel
+                    // `[0, 1, 2]` returned `[1, 0, 0]` where `[1, 1, 1]` is
+                    // correct. A wrong mask is worse than a panic.
+                    check_row_ids(&indices[lo..hi], None, "measured_mask")?;
+                    transform::measured_mask(&indices[lo..hi], panel, slot);
+                    Ok(())
+                })
+                .collect()
         })
     });
+    res.map_err(PyValueError::new_err)?;
     Ok(PyArray1::from_vec(py, out))
 }
 
-/// Split a flat buffer into one mutable slice per row span.
+/// Split a flat buffer into one mutable slice per CSR row.
 ///
-/// The spans come straight from a validated `indptr`, so they are contiguous,
-/// non-overlapping and in order — which is what makes `split_at_mut` sound here.
-fn split_by_spans<'a, T>(buf: &'a mut [T], spans: &[(usize, usize)]) -> Vec<&'a mut [T]> {
+/// Takes `indptr` directly rather than a precomputed span list: a validated
+/// `indptr` already *is* the span list, so materialising `Vec<(usize, usize)>`
+/// first was a second allocation per call carrying no information the first
+/// did not. `validate_indptr` guarantees the rows are contiguous,
+/// non-overlapping, in order and tile `[0, len)`, which is what makes the
+/// `split_at_mut` chain sound.
+fn split_by_rows<'a, T>(buf: &'a mut [T], indptr: &[i64]) -> Vec<&'a mut [T]> {
     let mut rest = buf;
-    let mut cursor = 0usize;
-    let mut out = Vec::with_capacity(spans.len());
-    for &(lo, hi) in spans {
-        debug_assert_eq!(lo, cursor, "spans must tile the buffer in order");
-        let (head, tail) = rest.split_at_mut(hi - lo);
+    let mut out = Vec::with_capacity(indptr.len().saturating_sub(1));
+    for w in indptr.windows(2) {
+        let (head, tail) = rest.split_at_mut((w[1] - w[0]) as usize);
         out.push(head);
         rest = tail;
-        cursor = hi;
     }
     out
 }
@@ -644,7 +696,6 @@ pub fn register_tokenize(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "CONTRACT_VERSION",
         crate::tokenize::TOKENIZE_CONTRACT_VERSION,
     )?;
-    m.add_function(wrap_pyfunction!(contract_version, m)?)?;
     m.add_function(wrap_pyfunction!(gene_mask_id, m)?)?;
     m.add_function(wrap_pyfunction!(pad_id, m)?)?;
     m.add_function(wrap_pyfunction!(top_k, m)?)?;

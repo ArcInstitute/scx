@@ -10,6 +10,14 @@ Every kernel takes a whole batch as `(indptr, indices, data)` — the arrays
 `SparseCellSetDataset.gather()` and `iter_with_plans()` hand back — and returns
 numpy arrays moved, not copied, out of Rust.
 
+**Gene ids must be non-negative and strictly ascending within each row**, which
+is what a gathered batch always is. This is *enforced*, not assumed: a `scipy`
+CSR does not sort its indices until you call `sort_indices()`, and an unsorted
+or negative id previously reached an out-of-bounds panic in `rank_tokens` and a
+silently wrong answer in `measured_mask`. Both now raise `ValueError` naming the
+offending id. `top_k` additionally requires every id to be below
+`n_genes_total`, since that value *is* the `GENE_MASK` token.
+
 ```python
 import numpy as np
 import pyscx
@@ -30,8 +38,10 @@ ids, lengths = ranked["ids"], ranked["lengths"]
 
 ## The contract
 
-`pyscx.tokenize.CONTRACT_VERSION` pins the kernels' semantics. Assert it at
-setup so version skew fails loudly rather than mid-training. It covers, exactly:
+`pyscx.tokenize.CONTRACT_VERSION` pins the kernels' semantics — a module
+constant, not also a function, matching `pyscx.COLLATE_CELLSET_CONTRACT_VERSION`.
+Assert it at setup so version skew fails loudly rather than mid-training. It
+covers, exactly:
 
 1. the numeric semantics of every kernel — ordering, tie rules, bin-edge
    computation, weight transforms, and what each returns;
@@ -100,7 +110,11 @@ by zero on them.
 Bins each row's expressed values into `[1, n_bins - 1]`, leaving zeros at 0.
 `edges=None` recomputes per-cell quantile edges for every row, as scGPT's
 `Preprocessor` does; supplying `edges` pins them corpus-wide, in which case they
-become part of the tokeniser's identity and must be recorded with it.
+become part of the tokeniser's identity and must be recorded with it. Explicit
+edges must be exactly `n_bins - 1` long, finite and non-decreasing, and that is
+checked **before** the all-zero early return — otherwise a batch with nothing to
+bin accepts any edges at all, and a mismatched count emits bins outside the
+declared `[1, n_bins - 1]` range while still reporting `n_bins`.
 
 Edges are `np.quantile(non_zero, np.linspace(0, 1, n_bins - 1))` with numpy's
 default `linear` interpolation, computed in `f64`. That is not a style choice:
@@ -220,12 +234,25 @@ replacement**, so a highly expressed gene appears several times in one sentence
 by design; and the stream is numpy's global RNG, so no golden can be taken from
 it.
 
-`sample_genes` reproduces the algorithm exactly — numpy's `choice` with `p` and
+`sample_genes` reproduces the algorithm — numpy's `choice` with `p` and
 `replace=True` is inverse-CDF sampling (`cdf = p.cumsum(); cdf /= cdf[-1];
 cdf.searchsorted(uniform, side="right")`), and this kernel does the same three
-steps in `f64` — so for a given sequence of uniforms it selects the same genes.
-Its parity test is therefore distributional: empirical frequencies against the
-reference's exact normalised weights at large N.
+steps in `f64`. Its parity test is therefore distributional: empirical
+frequencies against a reconstruction of the reference's normalised weights at
+large N.
+
+⚠️ **Weight precision is an open question, not a settled match.** UCE builds its
+weights through torch, so if the counts are `float32` then `torch.log1p` and the
+`/ torch.sum(...)` are too, and numpy's `choice` widens `p` to `float64` only
+for the cumsum. That would move CDF boundaries relative to the `f64` arithmetic
+this kernel uses, so "the same uniforms select the same genes" holds for the
+algorithm but not necessarily for a value sitting exactly on a boundary. A
+`float32` reconstruction was tried and produced a `p` that numpy's own `choice`
+would **reject** — off by ~1e-7 against its 1.49e-8 tolerance — which says the
+reconstruction is wrong about UCE rather than that UCE is broken. Settling it
+needs a run of the real package, which is not installable here. The committed
+`sample_reference.json` is therefore labelled a *float64 reconstruction of UCE's
+formula*, not UCE's own probabilities.
 
 ### Negatives and NaN
 
@@ -268,7 +295,7 @@ argsort and the weights in every case.
 | `crop_golden.json` | exact — `np.lexsort` is deterministic |
 | `rank_golden.json` | exact within each equal-value run |
 | `bin_golden.json` | exact for the edges and both digitize bounds; the randomised form bracketed |
-| `sample_reference.json` | distributional only |
+| `sample_reference.json` | distributional only, and a float64 *reconstruction* of the formula — see the precision note above |
 | `seeded_golden.json` | SCX's own frozen stream (source of truth is Rust; regenerate with the `#[ignore]`d test) |
 
 To close the gap, create an environment with the real packages and replace each

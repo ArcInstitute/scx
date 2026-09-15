@@ -76,10 +76,13 @@ OUT = REPO / "scx-loader" / "tests" / "data" / "tokenize"
 
 # Pinned revisions the transcriptions below were taken from.
 SCGPT_REV = "cebd6fae655b9c585a4807daa3ac31bb764f06b4"
-# Geneformer lives on HuggingFace, whose `main` is mutable. Record the resolved
-# commit, not the branch name.
-GENEFORMER_REV = "main@2026-09-14 (huggingface.co/ctheodoris/Geneformer)"
-UCE_REV = "main@2026-09-14 (github.com/snap-stanford/UCE, eval_data.py)"
+# Geneformer lives on HuggingFace, whose `main` is mutable, so the branch name
+# is not a pin. Resolved via the HF API on 2026-09-14
+# (`GET /api/models/ctheodoris/Geneformer` -> .sha); an earlier revision of this
+# file said "record the resolved commit" and then recorded `main@<date>`, which
+# is the thing that sentence warns against.
+GENEFORMER_REV = "1f7fbae4e469a5f4f1af8c111a529cfe1b3829f5 (huggingface.co/ctheodoris/Geneformer)"
+UCE_REV = "9c416007be15ad6753dc84af4468c1dc10421ab9 (github.com/snap-stanford/UCE, eval_data.py)"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +184,25 @@ def _reference_sample_weights(counts):
 
     Note `replace=True`. Only the weights are returned: the draw itself is
     numpy's global RNG and cannot be reproduced in Rust.
+
+    ⚠️ **Precision is an OPEN divergence, not a match.** UCE feeds a torch
+    tensor to `torch.log1p`, so if those counts are float32 the weights and the
+    normalisation are float32 too, and numpy's `choice` then widens `p` to
+    float64 for its cumsum — which would move CDF boundaries relative to the
+    f64 arithmetic below and in SCX's kernel.
+
+    This generator does NOT try to reproduce that. Reconstructing it (log1p and
+    the divide in float32, widened after) was attempted and produces
+    probabilities that sum to 1 only within ~1e-7 — outside the 1.49e-8
+    tolerance `np.random.choice` itself enforces, i.e. a `p` numpy would
+    *reject*. That is evidence the float32 reconstruction is wrong about UCE,
+    not evidence UCE is broken, and the package is not installable here to
+    settle it.
+
+    So the arithmetic below is float64 throughout, matching SCX's kernel, and
+    the resulting numbers are labelled a **float64 reconstruction of UCE's
+    formula** rather than UCE's probabilities. Resolving it needs a run of the
+    real package. Recorded in `docs/tokenize.md` alongside the RNG divergence.
     """
     w = np.log1p(np.clip(np.asarray(counts, dtype=np.float32).astype(np.float64), 0, None))
     total = w.sum()
@@ -386,10 +408,17 @@ def main() -> int:
         assert abs(p.sum() - 1.0) < 1e-12 or p.sum() == 0.0
     write(
         "sample_reference.json",
-        "DISTRIBUTIONAL ONLY: np.random.choice draws from numpy's global RNG, "
-        "so no SCX output reproduces its draws. The probabilities are exact; "
-        "the frozen SCX draws live in sample_golden.json, whose source of truth "
-        "is Rust (regenerate with the #[ignore]d test).",
+        "DISTRIBUTIONAL ONLY, and a float64 RECONSTRUCTION of UCE's formula "
+        "rather than UCE's own numbers. np.random.choice draws from numpy's "
+        "global RNG, so no SCX output reproduces its draws. Separately, UCE "
+        "computes its weights through torch, which may round them to float32 "
+        "before numpy widens p for the cumsum; that would move CDF boundaries "
+        "relative to the f64 arithmetic here and in SCX's kernel. A float32 "
+        "reconstruction was attempted and produced a p numpy's own choice would "
+        "reject (sum off by ~1e-7 against its 1.49e-8 tolerance), so the "
+        "precision question is OPEN and needs a run of the real package. The "
+        "frozen SCX draws live in sample_golden.json, whose source of truth is "
+        "Rust (regenerate with the #[ignore]d test).",
         f"UCE eval_data.py sample_cell_sentences @ {UCE_REV}",
         cases,
     )

@@ -133,6 +133,73 @@ fn a_gene_id_outside_the_vocabulary_is_an_error_not_a_panic() {
 }
 
 #[test]
+fn a_negative_gene_id_is_an_error_even_when_the_last_id_is_in_range() {
+    // `-1i32 as usize` wraps to usize::MAX. An earlier bounds check looked only
+    // at `gene_ids.last()` on the reasoning that the row is sorted, so `[-1, 2]`
+    // passed it and then indexed the statistics vector out of bounds — a panic
+    // across the FFI, reproduced against the built extension.
+    let n = norm(&[1.0; 4]);
+    let mut out = vec![0i64; 2];
+    let err = rank_tokens(
+        CsrRow {
+            gene_ids: &[-1, 2],
+            values: &[1.0, 1.0],
+        },
+        &n,
+        1e4,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("-1"), "unexpected error: {err}");
+}
+
+#[test]
+fn an_out_of_range_gene_id_is_an_error_even_when_it_is_not_last() {
+    // An unsorted row reaches the same panic by the other route: `[7, 1]`
+    // against a 3-gene vocabulary has an in-range LAST id. scipy CSR does not
+    // sort its indices until `sort_indices()`, so this is ordinary input.
+    let n = norm(&[1.0; 3]);
+    let mut out = vec![0i64; 2];
+    let err = rank_tokens(
+        CsrRow {
+            gene_ids: &[7, 1],
+            values: &[1.0, 1.0],
+        },
+        &n,
+        1e4,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("outside the normalisation vocabulary"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn mismatched_row_lengths_are_an_error_not_a_panic() {
+    let n = norm(&[1.0; 4]);
+    let mut out = vec![0i64; 2];
+    assert!(rank_tokens(
+        CsrRow {
+            gene_ids: &[1, 2, 3],
+            values: &[1.0, 1.0],
+        },
+        &n,
+        1e4,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut out,
+    )
+    .is_err());
+}
+
+#[test]
 fn a_statistics_vector_with_a_non_positive_or_non_finite_entry_is_refused() {
     for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
         let err = PerGeneNorm::new(vec![1.0, bad, 1.0].into(), "v").unwrap_err();

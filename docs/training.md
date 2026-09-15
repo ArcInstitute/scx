@@ -514,9 +514,13 @@ by the caller — which is what makes it cheap to hold byte-exact against a Pyth
 reference implementation.
 
 `pyscx.COLLATE_CELLSET_CONTRACT_VERSION` (currently `3`) pins that contract:
-the crop/mask/target semantics, the accepted preprocess-mode strings, and the
-gather stage's value contract. A consumer mirroring the kernel should assert it
-at setup so version skew fails loudly rather than mid-training.
+the crop/mask/target semantics, the accepted preprocess-mode strings, the
+gather stage's value contract, **how the decoder query is addressed** (per set,
+or per row via `query_offsets`) and **the set of keys the batch emits**. The
+last two were added at v3 — before it, the contract explicitly excluded shapes
+and key names, which stopped being true once v3 existed for addressing and
+added `target_pad_mask`. A consumer mirroring the kernel should assert it at
+setup so version skew fails loudly rather than mid-training.
 
 Encoder masking is the kernel's one non-obvious cost, and it is now paid per
 *set* rather than per cell: the decoder query panel is sorted once for the set

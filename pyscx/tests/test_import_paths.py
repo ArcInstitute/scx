@@ -86,7 +86,7 @@ def test_pyscx_tokenize_has_expected_surface():
 
     for name in ("top_k", "rank_tokens", "bin_values", "sample_genes",
                  "transform_values", "library_size", "measured_mask",
-                 "gene_mask_id", "pad_id", "contract_version"):
+                 "gene_mask_id", "pad_id"):
         assert hasattr(tokenize, name), f"pyscx.tokenize missing {name!r}"
     assert isinstance(tokenize.CONTRACT_VERSION, int)
 

@@ -91,7 +91,10 @@ pub fn normalize_log1p(src: &[f32], dst: &mut [f32], target_sum: f64, lib: f64) 
 /// the version's scope is now enumerated.
 ///
 /// `n_measured` is the measured panel size — the denominator `D`. Passing `0`
-/// yields a non-finite centre; the collator validates it upstream.
+/// yields a non-finite centre, so every caller must reject it: `collate_gathered`
+/// and `pyscx.tokenize.transform_values` both do. An earlier version of this
+/// sentence said the collator validated it upstream, and the collator did not —
+/// a `n_measured = [0]` call returned `encoder_counts [-inf, -inf]`.
 pub fn pflog_raw(src: &[f32], dst: &mut [f32], alpha: f64, n_measured: usize) {
     let four_alpha = 4.0 * alpha;
     for (d, &s) in dst.iter_mut().zip(src) {

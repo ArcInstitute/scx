@@ -36,9 +36,6 @@ TransformMode = Literal["pass_through", "log1p_raw", "normalize_log1p", "pflog_r
 CONTRACT_VERSION: int
 
 
-def contract_version() -> int: ...
-
-
 def gene_mask_id(n_genes_total: int) -> int: ...
 
 
@@ -74,6 +71,8 @@ def bin_values(
     indices: np.ndarray,
     data: np.ndarray,
     n_bins: int,
+    # When given, must be exactly `n_bins - 1` finite non-decreasing edges, or
+    # the emitted bins and the declared `n_bins` disagree.
     edges: np.ndarray | None = None,
     tie: BinTie = "left",
     seed: int = 0,

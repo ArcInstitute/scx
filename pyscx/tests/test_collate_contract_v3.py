@@ -137,3 +137,56 @@ def test_malformed_query_offsets_raise_rather_than_panicking(offsets, query, n_m
 def test_k_dec_narrower_than_the_widest_row_query_is_refused():
     with pytest.raises(Exception, match="narrower than the widest per-row query"):
         collate(k_dec=1, query=[1, 3, 5], offsets=[0, 2, 3], n_measured=[3, 3])
+
+
+# ---------------------------------------------------------------------------
+# Panics this entry could reach across the FFI
+# ---------------------------------------------------------------------------
+#
+# `validate_indptr` closed the non-monotonic case in an earlier PR; these three
+# are its siblings, each reproduced against the built extension first.
+
+
+def _raw(**over):
+    b = one_set_two_rows()
+    args = dict(
+        indptr=b["indptr"], indices=b["indices"], data=b["data"],
+        set_offsets=b["set_offsets"], cell_indices=b["cell_indices"],
+        file_ids=b["file_ids"], role_tags=b["role_tags"], k_dec=1,
+        query=np.array([1], dtype=np.int32), mask=np.array([], dtype=np.uint8),
+        hide=b["hide_readout"], n_measured=np.array([3], dtype=np.uint32),
+        k_enc=4, mode="pass_through", n_genes=8, alpha=None,
+    )
+    args.update(over)
+    return pyscx.collate_cellset_gathered(
+        args["indptr"], args["indices"], args["data"], args["set_offsets"],
+        args["cell_indices"], args["file_ids"], args["role_tags"], args["k_dec"],
+        args["query"], args["mask"], args["hide"], args["n_measured"],
+        args["k_enc"], args["mode"], args["n_genes"], pflog_alpha=args["alpha"],
+    )
+
+
+def test_zero_k_enc_or_k_dec_raises_rather_than_panicking_in_rayon():
+    # `par_chunks_mut(0)` panics with "chunk_size must not be zero".
+    with pytest.raises(Exception, match="must be >= 1"):
+        _raw(k_enc=0)
+    with pytest.raises(Exception, match="must be >= 1"):
+        _raw(k_dec=0)
+
+
+def test_indices_shorter_than_data_raises_rather_than_slicing_out_of_bounds():
+    with pytest.raises(Exception, match="indices"):
+        _raw(indices=np.array([1, 3], dtype=np.int32),
+             data=np.array([4.0, 2.0, 6.0], dtype=np.float32))
+
+
+def test_pflog_with_a_zero_n_measured_raises_instead_of_writing_minus_inf():
+    # Centring by a zero denominator wrote -inf into every encoder slot; the
+    # kernel's own doc claimed the collator rejected it, and it did not.
+    with pytest.raises(Exception, match="n_measured >= 1"):
+        _raw(mode="pflog_raw", alpha=0.25,
+             n_measured=np.array([0], dtype=np.uint32))
+    # Anti-vacuity: the same call with a real panel size succeeds.
+    out = _raw(mode="pflog_raw", alpha=0.25,
+               n_measured=np.array([3], dtype=np.uint32))
+    assert np.isfinite(out["encoder_counts"]).all()

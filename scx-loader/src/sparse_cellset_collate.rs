@@ -49,15 +49,33 @@
 //!    *requires* (e.g. `pflog_raw` requires `pflog_alpha`), and the meaning of
 //!    each mode;
 //! 3. the §4.4 gather-stage **value** contract — the non-negativity clip and the
-//!    optional seeded downsample in `sparse_cellset::SparseCellSetLoader`.
+//!    optional seeded downsample in `sparse_cellset::SparseCellSetLoader`;
+//! 4. **how the decoder query is addressed** — per set, or per row via
+//!    `query_offsets` — and which arrays that addressing makes per-row
+//!    (`n_measured`, `enc_mask_positions`);
+//! 5. the **set of keys** the batch emits, so an added output like
+//!    `target_pad_mask` is a version-visible change.
 //!
-//! It does **not** cover the batch's array *shapes* or key names (a
-//! length-validation error surfaces those loudly at the first batch), nor the
-//! `pe_mask` omission noted on [`CellOut`], which is an agreed non-emission rather
-//! than a version-dependent behaviour.
+//! Items 4 and 5 were added at v3. Before that this list said the version does
+//! **not** cover array shapes or key names — which was true while the only
+//! addressing was per-set, and became false the moment v3 existed *for*
+//! addressing and added an output key. Leaving it would have made the bump look
+//! like a false mismatch against the scope text in the same file.
 //!
-//! Version history: **v1** initial; **v2** = #356's mode strings (retroactively)
-//! + Phase 1B's clip and downsample.
+//! It still does not cover the batch's array *lengths* (a length-validation
+//! error surfaces those loudly at the first batch), nor the `pe_mask` omission
+//! noted on [`CellOut`], which is an agreed non-emission rather than a
+//! version-dependent behaviour.
+//!
+//! Version history:
+//!
+//! - **v1** initial.
+//! - **v2** = #356's mode strings (retroactively) + Phase 1B's clip and
+//!   downsample.
+//! - **v3** = per-row query addressing (`query_offsets`, with per-row
+//!   `n_measured` and a ragged `enc_mask_positions`) plus the `target_pad_mask`
+//!   output. A call that omits `query_offsets` produces byte-identical output
+//!   to v2's.
 
 use crate::error::{LoaderError, Result};
 use crate::tokenize::crop::{self, CropConfig, CropIn, CropOut};

@@ -33,9 +33,9 @@ use crate::tokenize::rank::PerGeneNorm;
 use serde_json::Value;
 
 const CROP_GOLDEN_BLAKE3_PREFIX: &str = "1090c3a399faff12";
-const RANK_GOLDEN_BLAKE3_PREFIX: &str = "cb25a0b653484ce4";
+const RANK_GOLDEN_BLAKE3_PREFIX: &str = "f88fb644184ccf45";
 const BIN_GOLDEN_BLAKE3_PREFIX: &str = "13fbb730650b0161";
-const SAMPLE_REFERENCE_BLAKE3_PREFIX: &str = "9a2cc310f735c37c";
+const SAMPLE_REFERENCE_BLAKE3_PREFIX: &str = "2183e1f46dc3c5e7";
 
 /// Read a golden and assert its bytes have not drifted.
 fn load(name: &str, expect_prefix: &str) -> Value {
@@ -239,6 +239,7 @@ fn bin_edges_and_both_digitize_bounds_match_the_reference_exactly() {
                 BinEdges::PerCellQuantile,
                 n_bins,
                 tie,
+                0,
                 &mut Vec::new(),
                 &mut out,
             )
@@ -444,8 +445,8 @@ fn seeded_outputs() -> Vec<(String, Vec<i64>, Vec<i64>)> {
                 BinTie::SeededUniform {
                     seed: c.seed,
                     file_identity: c.file_identity,
-                    row: c.row,
                 },
+                c.row,
                 &mut Vec::new(),
                 &mut bins,
             )

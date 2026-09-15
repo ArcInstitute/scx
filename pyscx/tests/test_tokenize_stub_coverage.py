@@ -108,5 +108,4 @@ def test_tokenize_stub_signatures_match_runtime():
 
 def test_contract_version_is_exported_and_stubbed():
     assert isinstance(tok.CONTRACT_VERSION, int)
-    assert tok.CONTRACT_VERSION == tok.contract_version()
     assert "CONTRACT_VERSION: int" in _pyi_path().read_text()

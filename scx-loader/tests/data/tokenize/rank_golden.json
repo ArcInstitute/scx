@@ -1,7 +1,7 @@
 {
   "_comment": "GENERATED FILE - do not edit by hand. Regenerate with `.venv/bin/python benchmarks/scripts/gen_tokenize_goldens.py`, then update the blake3 prefix in scx-loader/src/tokenize/golden_tests.rs. See the generator's docstring for what this file's numbers do and do not claim.",
   "_provenance": {
-    "reference": "Geneformer tokenizer.py @ main@2026-09-14 (huggingface.co/ctheodoris/Geneformer)",
+    "reference": "Geneformer tokenizer.py @ 1f7fbae4e469a5f4f1af8c111a529cfe1b3829f5 (huggingface.co/ctheodoris/Geneformer)",
     "produced_by": "numpy running a verbatim transcription of the reference kernel; the package itself is installed nowhere on this machine",
     "claim": "exact within each equal-value run; np.argsort's default kind is quicksort, so the reference's order INSIDE a run follows no rule",
     "numpy": "2.4.4"
