@@ -3979,3 +3979,50 @@ absolute_floors:
 #     wait (the H2D copy is `non_blocking=True` and there is no per-step
 #     synchronise), so they measure what a consumer actually stalls on rather
 #     than total I/O — which is the quantity the tier decision needs.
+#
+# 22. cellset_gather / per-kernel tokenisation arms (W6)
+#     `us_per_cell__{crop,rank,bin,sample}` and
+#     `cellsets_per_sec__tokenize_{crop,rank,bin,sample}` are emitted as of the
+#     tokenisation-kernel PR. NO floor is proposed here, and that is the phase's
+#     own gate talking: the arms must be captured twice on pbmc3k and tabula
+#     before anyone reads a number off them, and no baseline carries
+#     `cellset_gather` rows at all (the same blocker as item 15, which is still
+#     open for `us_per_cell__collate` and stays open).
+#
+#     ONE of the four arms is fixture-gated, and that is reported per arm rather
+#     than silently skipped — `metadata.tokenize.arms.<arm>` carries
+#     `{"applicable": false, "reason": ...}`:
+#       * `bin` needs at least two distinct non-zero values in every probed row,
+#         or every quantile edge collapses onto one value and the arm times the
+#         degenerate branch instead of the interpolation.
+#
+#     `sample` was gated the same way — median nnz/cell above `n` (1024, UCE's
+#     sample_size) — and that gate is DELETED. Its stated reason, "the draw would
+#     cover essentially the whole row", is an argument about sampling WITHOUT
+#     replacement; this kernel samples WITH replacement, as UCE does, so repeats
+#     are the expected output, the inverse-CDF search is O(n log nnz) either way,
+#     and a shallow cell is a real workload rather than a degenerate one. It had
+#     suppressed pbmc3k's number for a reason that did not apply.
+#
+#     One premise is deliberately NOT gated, because gating it would assert
+#     something false: the crop does not get more expensive when it truncates.
+#     Its cost is the sort over the row's positive entries, which runs whatever
+#     `k` is — Phase 1 measured exactly this and concluded a partial select
+#     saves nothing at `k_enc=2048` against ~1950 nnz/cell. The arm records
+#     `crop_fill_ratio` (median nnz / k) so a reader can see how much of the
+#     wall is the PAD-init loop, and warns when it drops below a quarter.
+#
+#     ACTIVATION, once a baseline carries the arms:
+#       1. Read the medians from
+#          `<candidate>/raw/cellset_gather__scx_auto__<dataset>.json`, from the
+#          runs whose `extra.scenario == "tokenize_<arm>"`.
+#       2. Author, per applicable (dataset, arm):
+#              metric: us_per_cell__<arm>  ->  max: 1.18 x median
+#          and only for arms whose `metadata.tokenize.arms.<arm>.applicable` is
+#          true on that dataset. A floor on a skipped arm synthesises a
+#          "missing metric" violation on every run.
+#       3. The floors bind only while the shape stays pinned. `_TOKENIZE_K`,
+#          `_TOKENIZE_L_MAX`, `_TOKENIZE_N_BINS` and `_TOKENIZE_SAMPLE_N` are
+#          module constants for exactly that reason and are echoed into
+#          `runs[].extra`; changing any of them invalidates the numbers above
+#          and the floors with them.

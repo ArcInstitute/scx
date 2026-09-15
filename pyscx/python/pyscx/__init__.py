@@ -26,21 +26,23 @@ from .pyscx import (  # noqa: E402
     ScxLazyTransformedDataset,
 )
 
-# Register the Rust-side `accel`
-# submodule under `sys.modules` so the dotted import idiom works
+# Register the Rust-side `accel` and `tokenize`
+# submodules under `sys.modules` so the dotted import idiom works
 # symmetrically with the already-working `from pyscx import accel`. PyO3's
-# `m.add_submodule(&accel_module)?` (see pyscx/src/lib.rs:774-787) exposes
-# `accel` as an *attribute* on the parent C-extension module but does not
+# `m.add_submodule(&accel_module)?` (see pyscx/src/lib.rs) exposes each one
+# as an *attribute* on the parent C-extension module but does not
 # populate `sys.modules`; Python's import machinery needs the entry there
-# to resolve `import pyscx.accel as a`. `accel` is the only Rust-side
-# submodule pyscx exposes today; other public surface comes from the
+# to resolve `import pyscx.accel as a`. Those two are the only Rust-side
+# submodules pyscx exposes; other public surface comes from the
 # `from .pyscx import *` line above. `setdefault` is the safe variant —
 # if anything else has already registered the submodule (rewriting
 # loaders, test harnesses, future Python), we don't clobber it.
 import sys as _sys  # noqa: E402
 from .pyscx import accel as _accel_submodule  # noqa: E402
+from .pyscx import tokenize as _tokenize_submodule  # noqa: E402
 
 _sys.modules.setdefault("pyscx.accel", _accel_submodule)
+_sys.modules.setdefault("pyscx.tokenize", _tokenize_submodule)
 
 
 def _pflog_reconstruct(adata, baseline_key="pflog_baseline"):

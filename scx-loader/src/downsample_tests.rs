@@ -82,22 +82,25 @@ fn mixer_does_not_collide_across_components() {
     // Under the crate's existing additive scheme (`seed + epoch * PHI`), the
     // pairs below would alias. Assert they do not.
     let m = DownsampleMethod::Binomial;
-    let base = row_seed(10, m, 20, 30);
-    assert_ne!(base, row_seed(11, m, 20, 29));
-    assert_ne!(base, row_seed(11, m, 19, 30));
-    assert_ne!(base, row_seed(10, m, 21, 29));
-    assert_ne!(base, row_seed(9, m, 21, 30));
+    let base = row_seed(10, m.tag(), 20, 30);
+    assert_ne!(base, row_seed(11, m.tag(), 20, 29));
+    assert_ne!(base, row_seed(11, m.tag(), 19, 30));
+    assert_ne!(base, row_seed(10, m.tag(), 21, 29));
+    assert_ne!(base, row_seed(9, m.tag(), 21, 30));
     // And the method tag separates the streams.
-    assert_ne!(base, row_seed(10, DownsampleMethod::Multinomial, 20, 30));
+    assert_ne!(
+        base,
+        row_seed(10, DownsampleMethod::Multinomial.tag(), 20, 30)
+    );
 }
 
 #[test]
 fn mixer_is_sensitive_to_every_component() {
     let m = DownsampleMethod::Multinomial;
-    let base = row_seed(7, m, 7, 7);
-    assert_ne!(base, row_seed(8, m, 7, 7), "seed ignored");
-    assert_ne!(base, row_seed(7, m, 8, 7), "file identity ignored");
-    assert_ne!(base, row_seed(7, m, 7, 8), "row ignored");
+    let base = row_seed(7, m.tag(), 7, 7);
+    assert_ne!(base, row_seed(8, m.tag(), 7, 7), "seed ignored");
+    assert_ne!(base, row_seed(7, m.tag(), 8, 7), "file identity ignored");
+    assert_ne!(base, row_seed(7, m.tag(), 7, 8), "row ignored");
 }
 
 /// Anti-tautology guard for the mixer tests above: an *additive* key — the
@@ -113,8 +116,8 @@ fn an_additive_key_would_collide_where_the_mixer_does_not() {
     // The exact pair the real mixer keeps distinct.
     assert_eq!(additive(10, 20, 30), additive(11, 20, 29));
     assert_ne!(
-        row_seed(10, DownsampleMethod::Binomial, 20, 30),
-        row_seed(11, DownsampleMethod::Binomial, 20, 29)
+        row_seed(10, DownsampleMethod::Binomial.tag(), 20, 30),
+        row_seed(11, DownsampleMethod::Binomial.tag(), 20, 29)
     );
 }
 

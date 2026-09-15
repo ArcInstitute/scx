@@ -49,17 +49,47 @@
 //!    *requires* (e.g. `pflog_raw` requires `pflog_alpha`), and the meaning of
 //!    each mode;
 //! 3. the §4.4 gather-stage **value** contract — the non-negativity clip and the
-//!    optional seeded downsample in `sparse_cellset::SparseCellSetLoader`.
+//!    optional seeded downsample in `sparse_cellset::SparseCellSetLoader`;
+//! 4. **how the decoder query is addressed** — per set, or per row via
+//!    `query_offsets` — and which arrays that addressing makes per-row
+//!    (`n_measured`, `enc_mask_positions`);
+//! 5. the **set of keys** the batch emits, so an added output like
+//!    `target_pad_mask` is a version-visible change.
 //!
-//! It does **not** cover the batch's array *shapes* or key names (a
-//! length-validation error surfaces those loudly at the first batch), nor the
-//! `pe_mask` omission noted on [`CellOut`], which is an agreed non-emission rather
-//! than a version-dependent behaviour.
+//! Items 4 and 5 were added at v3. Before that this list said the version does
+//! **not** cover array shapes or key names — which was true while the only
+//! addressing was per-set, and became false the moment v3 existed *for*
+//! addressing and added an output key. Leaving it would have made the bump look
+//! like a false mismatch against the scope text in the same file.
 //!
-//! Version history: **v1** initial; **v2** = #356's mode strings (retroactively)
-//! + Phase 1B's clip and downsample.
+//! It still does not cover the batch's array *lengths* (a length-validation
+//! error surfaces those loudly at the first batch), nor the `pe_mask` omission
+//! noted on [`CellOut`], which is an agreed non-emission rather than a
+//! version-dependent behaviour.
+//!
+//! Version history:
+//!
+//! - **v1** initial.
+//! - **v2** = #356's mode strings (retroactively) + Phase 1B's clip and
+//!   downsample.
+//! - **v3** = per-row query addressing (`query_offsets`, with per-row
+//!   `n_measured` and a ragged `enc_mask_positions`) plus the `target_pad_mask`
+//!   output. A call that omits `query_offsets` produces byte-identical values
+//!   in every **pre-existing field**; the returned payload is not identical,
+//!   because `target_pad_mask` is a new key on every path (all zeros on the
+//!   per-set one). A consumer that unpacks named keys is unaffected; one that
+//!   asserts an exact key set is not.
 
 use crate::error::{LoaderError, Result};
+use crate::tokenize::crop::{self, CropConfig, CropIn, CropOut};
+use crate::tokenize::transform;
+use crate::tokenize::{CsrRow, Scratch};
+
+// The withheld-gene panel and its per-row mask moved to `tokenize::crop` with the
+// crop itself — they are the crop's inputs and nothing else consults them. Re-
+// exported here so every existing `sparse_cellset_collate::{RowMask, SetQueryIndex}`
+// import keeps resolving; there is one type, not two.
+pub use crate::tokenize::crop::{RowMask, SetQueryIndex};
 
 /// Per-cell preprocessing mode — mirrors `preprocessing.py:preprocess_cell_counts`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,18 +112,23 @@ impl PreprocessMode {
             }),
         }
     }
-}
 
-/// `GENE_MASK` sentinel = `n_genes_total` (`task.py:_special_gene_mask_id`).
-#[inline]
-fn gene_mask_id(n_genes_total: i64) -> i64 {
-    n_genes_total
-}
-
-/// `PAD` sentinel = `n_genes_total + 1` (`task.py:_special_pad_id`).
-#[inline]
-fn pad_id(n_genes_total: i64) -> i64 {
-    n_genes_total + 1
+    /// Does this mode's decoder target repeat the encoder value, or is it the
+    /// raw count?
+    ///
+    /// The two log-on-raw modes keep the target in raw counts — the model
+    /// predicts counts and only *reads* a transform — while the two modes that
+    /// rescale the whole cell use the same value on both sides. Stating the rule
+    /// once here is what lets the transform dispatch be a table: otherwise each
+    /// arm has to remember its own target convention, which is how
+    /// `pflog1ppf_raw` and `pflog_raw` came to share a contract version.
+    #[inline]
+    pub fn target_is_encoder_value(&self) -> bool {
+        match self {
+            Self::PassThrough | Self::NormalizeLog1p => true,
+            Self::Log1pRaw | Self::PflogRaw => false,
+        }
+    }
 }
 
 /// Mutable output slices for one cell (caller-owned; sized `k_enc`/`k_dec`).
@@ -109,81 +144,6 @@ pub struct CellOut<'a> {
     pub enc_mask: &'a mut [u8],    // [k_enc]
     pub enc_pad: &'a mut [u8],     // [k_enc]
     pub target: &'a mut [f32],     // [k_dec]
-}
-
-/// A set's decoder query panel, sorted for membership tests.
-///
-/// Built **once per set** (the panel is shared across the set's rows) and
-/// consulted per row against that row's own `enc_mask_positions`. This is the
-/// only sound way to hoist any part of the withheld-gene test out of the row
-/// loop: `query` is sliced per set but the mask bits are sliced per row, so
-/// hoisting the *withheld id set* itself would apply row 0's bits to every row
-/// of the set.
-///
-/// Replaces a per-row `HashSet<i64>` that was rebuilt from `k_dec` ids and then
-/// SipHash-probed once per surviving top-K gene — measured at ~34 % of collate
-/// wall (78.7 vs 120.1 us/cell at 25 % withheld, pbmc3k, k_enc=2048/k_dec=1024).
-pub struct SetQueryIndex {
-    /// `(gene_id, position_in_query)`, sorted by id then position.
-    ///
-    /// `position` is the id's offset in the ORIGINAL panel, not its rank here:
-    /// `enc_mask_positions` is parallel to `query`, so the bit must be read at
-    /// the offset the caller wrote it at.
-    sorted: Vec<(i32, u32)>,
-}
-
-impl SetQueryIndex {
-    /// Sort a copy of one set's query panel. `query` carries no ordering
-    /// contract (only `CellIn::gene_ids` does) and is not deduplicated.
-    pub fn new(query: &[i32]) -> Self {
-        let mut sorted: Vec<(i32, u32)> = query
-            .iter()
-            .enumerate()
-            .map(|(i, &g)| (g, i as u32))
-            .collect();
-        // Unstable is fine and faster: the `(id, position)` pairs are distinct,
-        // so the order is total.
-        sorted.sort_unstable();
-        Self { sorted }
-    }
-
-    /// Is `gid` withheld from this row's encoder crop?
-    ///
-    /// True iff **any** position carrying `gid` is flagged — the semantics of
-    /// the `HashSet` this replaces, which collected every flagged position's id
-    /// (mirroring Python's `query_gene_ids[role_target_mask]`). A repeated id is
-    /// reachable on real input, so the fold over the equal-id run is required,
-    /// not defensive: stopping at the first match would silently keep a gene the
-    /// caller withheld at a later position.
-    #[inline]
-    fn withholds(&self, gid: i32, maskpos: &[u8]) -> bool {
-        let lo = self.sorted.partition_point(|&(g, _)| g < gid);
-        self.sorted[lo..]
-            .iter()
-            .take_while(|&&(g, _)| g == gid)
-            // `get`, not an index: the `zip` this replaced stopped at the
-            // shorter of `query` / `enc_mask_positions`, so a short mask left
-            // the excess positions unflagged. Indexing would panic there
-            // instead — a tolerated malformed input turned into a crash on a
-            // `pub` kernel. `collate_gathered` validates the length, so this
-            // only guards direct callers.
-            .any(|&(_, p)| maskpos.get(p as usize).is_some_and(|&m| m != 0))
-    }
-}
-
-/// One row's encoder mask, inseparable from the panel it indexes.
-///
-/// A struct rather than two `Option` fields on [`CellIn`] so the pair cannot be
-/// supplied half-set: the bits are meaningless without the panel that says
-/// which gene each offset refers to, and a mask-without-index would silently
-/// withhold nothing — a wrong answer on a cross-repo numeric contract, where a
-/// compile error is what is wanted.
-#[derive(Clone, Copy)]
-pub struct RowMask<'a> {
-    /// `[k_dec]` flags over the set's `query`, for THIS row.
-    pub positions: &'a [u8],
-    /// The set's sorted panel — built once per set, shared by its rows.
-    pub index: &'a SetQueryIndex,
 }
 
 /// Immutable, RNG-resolved inputs for one cell.
@@ -228,146 +188,79 @@ pub struct CollateConfig {
 ///
 /// `cin.mask`, when present, must carry
 /// [`SetQueryIndex::new(cin.query)`](SetQueryIndex::new) for this row's set.
-// Index-based loops below walk several parallel arrays (raw / enc_vals / tgt_vals)
-// in lockstep, so explicit indexing is clearer than zipped iterators.
-#[allow(clippy::needless_range_loop)]
-pub fn collate_cell(cin: &CellIn, cfg: &CollateConfig, out: &mut CellOut) -> f32 {
+///
+/// `scratch` is caller-owned and reused across rows; hand one per rayon worker
+/// through `for_each_init`. It replaced three `Vec`s this function used to
+/// allocate per cell — the two preprocessed-value arrays and the selection
+/// index — which at the collate arm's pinned shape is three allocations per
+/// cell, 64 cells per set.
+pub fn collate_cell(
+    cin: &CellIn,
+    cfg: &CollateConfig,
+    scratch: &mut Scratch,
+    out: &mut CellOut,
+) -> f32 {
     let n = cin.gene_ids.len();
-    let mask = gene_mask_id(cfg.n_genes_total);
-    let pad = pad_id(cfg.n_genes_total);
 
     // --- library size: sum of raw (clipped >=0); integer counts ⇒ f32-exact. ---
-    let lib: f64 = cin.raw.iter().map(|&v| v.max(0.0) as f64).sum();
+    let lib = transform::library_size(cin.raw);
 
     // --- per-element preprocessing → (encoder value, target value). ---
     // Parallel to gene_ids. Mirrors preprocess_cell_counts (preprocessing.py:74).
-    let mut enc_vals = vec![0f32; n];
-    let mut tgt_vals = vec![0f32; n];
+    scratch.reset_values(n);
+    // Destructured so the crop below can borrow `enc_vals` immutably while it
+    // mutates `order`; the two are disjoint fields of one bundle.
+    let Scratch {
+        order,
+        enc_vals,
+        tgt_vals,
+        ..
+    } = scratch;
     match cfg.mode {
-        PreprocessMode::PassThrough => {
-            for i in 0..n {
-                let rc = cin.raw[i].max(0.0);
-                enc_vals[i] = rc;
-                tgt_vals[i] = rc;
-            }
-        }
-        PreprocessMode::Log1pRaw => {
-            for i in 0..n {
-                let rc = cin.raw[i].max(0.0);
-                enc_vals[i] = rc.ln_1p();
-                tgt_vals[i] = rc;
-            }
-        }
+        PreprocessMode::PassThrough => transform::pass_through(cin.raw, enc_vals),
+        PreprocessMode::Log1pRaw => transform::log1p_raw(cin.raw, enc_vals),
         PreprocessMode::NormalizeLog1p => {
-            let factor = if lib > 0.0 {
-                (cfg.target_sum / lib) as f32
-            } else {
-                1.0
-            };
-            for i in 0..n {
-                let rc = cin.raw[i].max(0.0);
-                let scaled = if lib > 0.0 { rc * factor } else { rc };
-                let v = scaled.ln_1p();
-                enc_vals[i] = v;
-                tgt_vals[i] = v;
-            }
+            transform::normalize_log1p(cin.raw, enc_vals, cfg.target_sum, lib)
         }
-        PreprocessMode::PflogRaw => {
-            // v4: raw-count shifted log `log1p(4α·rc)`, centered by `n_measured`.
-            // No per-cell depth (an empty cell → all enc 0 → center 0 → stays 0).
-            let four_alpha = 4.0
-                * cfg
-                    .pflog_alpha
-                    .expect("pflog_alpha required for PflogRaw mode (validated at the caller)");
-            for i in 0..n {
-                let rc = cin.raw[i].max(0.0) as f64;
-                enc_vals[i] = (four_alpha * rc).ln_1p() as f32;
-            }
-            let center =
-                (enc_vals.iter().map(|&v| v as f64).sum::<f64>() / cfg.n_measured as f64) as f32;
-            for i in 0..n {
-                enc_vals[i] -= center;
-                tgt_vals[i] = cin.raw[i].max(0.0);
-            }
-        }
+        PreprocessMode::PflogRaw => transform::pflog_raw(
+            cin.raw,
+            enc_vals,
+            cfg.pflog_alpha
+                .expect("pflog_alpha required for PflogRaw mode (validated at the caller)"),
+            cfg.n_measured,
+        ),
+    }
+    if cfg.mode.target_is_encoder_value() {
+        tgt_vals.copy_from_slice(enc_vals);
+    } else {
+        transform::pass_through(cin.raw, tgt_vals);
     }
 
     // --- encoder inputs (top-K), mirroring _sparse_encoder_inputs (task.py:122). ---
-    let k_enc = cfg.k_enc;
-    for slot in 0..k_enc {
-        out.enc_ids[slot] = pad;
-        out.enc_counts[slot] = 0.0;
-        out.enc_mask[slot] = 0;
-        out.enc_pad[slot] = 1;
-    }
-    if cin.hide_readout {
-        out.enc_ids[0] = mask;
-        out.enc_mask[0] = 1;
-        out.enc_pad[0] = 0;
-    } else {
-        // positive selection uses RAW counts (selection_counts=raw_counts).
-        let pos: Vec<usize> = (0..n).filter(|&i| cin.raw[i].max(0.0) > 0.0).collect();
-        if pos.is_empty() {
-            // Degenerate cell: one GENE_MASK token, no expr mask (task.py:178).
-            out.enc_ids[0] = mask;
-            out.enc_pad[0] = 0;
-        } else {
-            // lexsort((gene_id, -selection)): selection DESC, gene_id ASC tiebreak.
-            // gene_ids are unique within a cell, so this is a total order (stability
-            // irrelevant); matches np.lexsort exactly for the selected set.
-            let mut order = pos;
-            order.sort_by(|&a, &b| {
-                let ra = cin.raw[a].max(0.0);
-                let rb = cin.raw[b].max(0.0);
-                // unwrap is safe: `max(0.0)` yields a finite, non-NaN f32, so
-                // partial_cmp is always `Some`.
-                rb.partial_cmp(&ra)
-                    .unwrap()
-                    .then(cin.gene_ids[a].cmp(&cin.gene_ids[b]))
-            });
-            let take = k_enc.min(order.len());
-
-            // Encoder masking (obs): a gene is withheld from the crop when one of
-            // this cell's role query positions carrying it is flagged in
-            // `enc_mask_positions` (mirrors `mask_gene_ids =
-            // query_gene_ids[role_target_mask]`, task.py:1154). `None` ⇒
-            // perturbation path (no masking).
-            //
-            // The panel is searched through the set's `SetQueryIndex` rather
-            // than collected into a per-row `HashSet`: the sort is amortised
-            // over the set's rows, and the crop loop below does a binary search
-            // instead of a SipHash probe per surviving gene.
-            let masked = cin.mask;
-
-            // Walk the top-K order, DROPPING withheld genes (their slot is left PAD;
-            // no backfill from beyond `take`) and compacting survivors to the left.
-            // Mirrors `_sparse_encoder_inputs`' `selected[keep]` (task.py:231-252):
-            // withheld genes are absent (PAD), never a GENE_MASK token.
-            let mut slot = 0usize;
-            for &i in order.iter().take(take) {
-                let g = cin.gene_ids[i];
-                if masked.is_some_and(|m| m.index.withholds(g, m.positions)) {
-                    continue;
-                }
-                out.enc_ids[slot] = g as i64;
-                out.enc_counts[slot] = enc_vals[i];
-                out.enc_pad[slot] = 0;
-                slot += 1;
-            }
-
-            // All-masked fallback: every selected top-K gene was withheld ⇒ a single
-            // active GENE_MASK token at slot 0 (task.py:235-247). Distinct from the
-            // degenerate-cell branch above, which leaves `enc_mask[0]=0`; here
-            // `enc_mask[0]=1`. `enc_counts[0]` stays 0 (matches Python `counts[0]`).
-            if slot == 0 {
-                out.enc_ids[0] = mask;
-                out.enc_mask[0] = 1;
-                out.enc_pad[0] = 0;
-            }
-            // Slots [slot..k_enc] keep their PAD-init values (id=pad, enc_pad=1,
-            // counts=0, enc_mask=0).
-        }
-    }
+    // Selection is over RAW counts (state3 `selection_counts=raw_counts`) while the
+    // emitted values are the preprocessed ones — which is why `CropIn` carries both.
+    crop::top_k(
+        &CropIn {
+            row: CsrRow {
+                gene_ids: cin.gene_ids,
+                values: cin.raw,
+            },
+            emit: enc_vals,
+            withheld: cin.mask,
+            hide_readout: cin.hide_readout,
+        },
+        &CropConfig {
+            k: cfg.k_enc,
+            n_genes_total: cfg.n_genes_total,
+        },
+        order,
+        &mut CropOut {
+            ids: &mut out.enc_ids[..],
+            values: &mut out.enc_counts[..],
+            mask: &mut out.enc_mask[..],
+            pad: &mut out.enc_pad[..],
+        },
+    );
 
     // --- target gather at query positions (_gather_counts_at, task.py:210). ---
     // gene_ids sorted ascending unique ⇒ exact-match binary search.

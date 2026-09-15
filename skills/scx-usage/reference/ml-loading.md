@@ -188,6 +188,42 @@ control) reads hit the shard LRU cache when groups are co-located.
 scatters across 30–50 shards (large `cache_shards` + high RSS); with grouping
 each perturbation is in 1–2 shards.
 
+## Tokenisation kernels (`pyscx.tokenize`)
+
+The per-cell numeric steps a transformer-class tokeniser is built from, over a
+gathered CSR batch. Use these instead of a Python loop over cells:
+
+```python
+import pyscx, pyscx.tokenize as tok
+
+ds = pyscx.SparseCellSetDataset(["atlas.scx"])
+b = ds.gather(file_ids, rows, role_tags, set_offsets)
+ip, ix, dt = b["indptr"], b["indices"], b["data"]
+
+tok.top_k(ip, ix, dt, k=2048, n_genes_total=n_genes)        # fixed-length crop
+tok.rank_tokens(ip, ix, dt, gene_stats, 2048, "corpus-v2")  # Geneformer-style
+tok.bin_values(ip, ix, dt, n_bins=51)                       # scGPT-style
+tok.sample_genes(ip, ix, dt, n=1024, seed=0,                # UCE-style
+                 file_identity=pyscx.downsample_file_identity(path),
+                 rows=b["cell_indices"])
+```
+
+Each takes the whole batch, so the row loop runs in Rust with the GIL released,
+and returns numpy arrays moved rather than copied. Assert
+`pyscx.tokenize.CONTRACT_VERSION` at setup.
+
+**Read `docs/tokenize.md` before wiring one into a training run.** Three of the
+reference tokenisers are stochastic or underdetermined — scGPT randomises at bin
+edges from numpy's global RNG, Geneformer's tie order is `np.argsort`'s unstable
+default, UCE samples *with* replacement — so these kernels diverge from them in
+stated ways rather than silently. Two gotchas that bite first:
+
+- Pass real row ids in `rows` and the file's `downsample_file_identity`, or the
+  seeded kernels key on batch position and are reproducible only for that batch.
+- `library_size` sums the row **as given**. On a panel-projected batch that is
+  not the cell's sequencing depth, and a model normalised against whole-cell
+  depth must not be fed it.
+
 ## Train / val / test splits
 
 - **Query-based (recommended):** if obs has a `split` column, materialize each

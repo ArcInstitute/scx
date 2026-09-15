@@ -254,6 +254,34 @@ GPU diagnostics
    estimate_gpu_memory
    gpu_info
 
+Tokenisation kernels (``pyscx.tokenize``)
+----------------------------------------
+
+Numeric kernels over a gathered CSR batch — the per-cell steps a
+transformer-class model's tokeniser is built from. Each takes the whole batch as
+``(indptr, indices, data)`` and returns numpy arrays moved out of Rust with the
+GIL released. ``pyscx.tokenize.CONTRACT_VERSION`` pins their semantics.
+
+Three of the reference tokenisers these follow are stochastic or
+underdetermined, so SCX diverges from them in stated ways; see
+:doc:`tokenize` before wiring one into a training run.
+
+.. currentmodule:: pyscx.tokenize
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   top_k
+   rank_tokens
+   bin_values
+   sample_genes
+   transform_values
+   library_size
+   measured_mask
+   gene_mask_id
+   pad_id
+
 ML framework integrations
 -------------------------
 

@@ -1372,6 +1372,7 @@ def collate_cellset_gathered(
     target_sum: float | None = None,
     lib_size_redef: bool | None = None,
     pflog_alpha: float | None = None,
+    query_offsets: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Collate an already-gathered, **global-vocab** CSR batch (from
     `SparseCellSetDataset.iter_with_plans`) into stacked encoder/target tensors
@@ -1383,7 +1384,18 @@ def collate_cellset_gathered(
     manifest. Note this kernel does **not** downsample — count-depth augmentation
     belongs in the gather stage, ahead of query sampling; see
     `SparseCellSetDataset`'s ``downsample_*`` arguments and
-    `downsample_counts_csr`."""
+    `downsample_counts_csr`.
+
+    ``query_offsets`` (contract v3) switches the decoder query from per-set to
+    per-row. Omitted, the query is the per-set ``[n_sets, k_dec]`` panel it has
+    always been and every **pre-existing field** is byte-identical to v2's — the
+    returned dict is not identical, because ``target_pad_mask`` is a new key on
+    every path. Supplied, it is an
+    ``[n_rows + 1]`` prefix array over a ragged ``query_gene_ids``,
+    ``n_measured`` becomes per-row, ``enc_mask_positions`` becomes parallel to
+    the ragged query rather than ``k_dec``-strided, and ``k_dec`` is the padded
+    output width — ``target_pad_mask`` in the returned dict says which target
+    slots are padding rather than a real zero."""
     ...
 
 
@@ -1567,9 +1579,13 @@ def read_cloud(
 
 
 # Contract version for the native cell-set path: the kernel's
-# encoder-crop/mask/target semantics, the accepted preprocess-mode strings, and
-# the gather stage's value contract (clip, downsample). Consumers (e.g. state3)
-# assert this at rust_collate setup to fail loudly on version skew. Currently 2.
+# encoder-crop/mask/target semantics, the accepted preprocess-mode strings, the
+# gather stage's value contract (clip, downsample), and since v3 the per-row
+# query addressing (`query_offsets`) plus the `target_pad_mask` output.
+# Consumers (e.g. state3) assert this at rust_collate setup to fail loudly on
+# version skew. Currently 3; a call that omits `query_offsets` reproduces every
+# pre-existing field byte for byte, but the returned dict gains a
+# `target_pad_mask` key on every path, so the payload is not identical.
 # See scx-loader/src/sparse_cellset_collate.rs for what it does and does not cover.
 COLLATE_CELLSET_CONTRACT_VERSION: int
 

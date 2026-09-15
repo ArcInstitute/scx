@@ -61,7 +61,10 @@ fn run(
             enc_pad: &mut b.pad,
             target: &mut b.target,
         };
-        collate_cell(&cin, cfg, &mut out)
+        // A fresh `Scratch` per call: reuse across rows is what the production
+        // caller does, but a test that shared one could pass on a stale buffer
+        // the kernel forgot to reset.
+        collate_cell(&cin, cfg, &mut Scratch::new(), &mut out)
     };
     (b, lib)
 }

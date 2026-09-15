@@ -784,6 +784,67 @@ def test_fork_downsample_counts_csr(fixture_paths: list[str]) -> None:
     assert n == 513  # n_rows + 1
 
 
+def _child_tokenize_kernels(conn) -> None:
+    """Every `pyscx.tokenize` kernel, in a forked child with no dataset.
+
+    Same hazard as the collate kernel: these are bare pyfunctions, so no PID
+    check in `python/` guards them, and each dispatches rayon inside
+    `py.detach`. A global-pool dispatch from a forked child hangs forever rather
+    than failing, so the parent's timeout is the real assertion.
+    """
+    try:
+        import numpy as np
+
+        import pyscx
+        import pyscx.tokenize as tok
+
+        n_rows, k, n_genes = 256, 24, 64
+        indptr = np.arange(0, n_rows * k + 1, k, dtype=np.int64)
+        indices = np.tile(np.arange(k, dtype=np.int32), n_rows)
+        # Distinct values per row, so the bin kernel takes the interpolation
+        # branch rather than the collapsed-edge one.
+        data = np.tile(np.arange(1, k + 1, dtype=np.float32), n_rows)
+        stats = np.linspace(0.5, 1.5, n_genes).astype(np.float32)
+
+        got = {
+            "top_k": int(tok.top_k(indptr, indices, data, 8, n_genes)["n_rows"]),
+            "rank": int(tok.rank_tokens(indptr, indices, data, stats, 8, "v")["n_rows"]),
+            "bin": int(tok.bin_values(indptr, indices, data, 5)["n_rows"]),
+            "sample": int(
+                tok.sample_genes(indptr, indices, data, 4, 1, 2)["n_rows"]
+            ),
+            "transform": int(
+                tok.transform_values(indptr, data, "log1p_raw").shape[0]
+            ),
+            "library_size": int(tok.library_size(indptr, data).shape[0]),
+        }
+        conn.send(("ok", got))
+    except BaseException as exc:  # noqa: BLE001
+        conn.send(("err", repr(exc)))
+    finally:
+        conn.close()
+
+
+def test_fork_tokenize_kernels(fixture_paths: list[str]) -> None:
+    """The W6 kernels — reachable from a forked DataLoader worker with no
+    dataset in hand, so none of the PID checks in `python/` apply.
+
+    Depends on `fixture_paths` for the same reason the collate test does: the
+    parent must have armed the global rayon registry first, or the child
+    initialises a fresh one of its own and passes regardless.
+    """
+    assert fixture_paths
+    got = _run_forked_child(_child_tokenize_kernels, (), "pyscx.tokenize kernels")
+    assert got == {
+        "top_k": 256,
+        "rank": 256,
+        "bin": 256,
+        "sample": 256,
+        "transform": 256 * 24,
+        "library_size": 256,
+    }
+
+
 def _child_iterate_training_dataset(scx_path: str, conn) -> None:
     try:
         import pyscx

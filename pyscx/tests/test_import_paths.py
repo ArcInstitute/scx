@@ -6,6 +6,10 @@
 straight into the broken import. The fix registers the Rust-side
 `accel` submodule under `sys.modules["pyscx.accel"]` so both idioms
 resolve and the user gets the same object either way.
+
+`pyscx.tokenize` is the second Rust-side submodule and needs the same
+registration — `m.add_submodule` sets an attribute and nothing else — so it is
+covered by the same four checks rather than being assumed to inherit them.
 """
 
 import subprocess
@@ -57,3 +61,48 @@ def test_dotted_import_works_in_a_fresh_interpreter():
         f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
     )
     assert "function pca" in result.stdout or "pca" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# pyscx.tokenize — the second Rust-side submodule (W6)
+# ---------------------------------------------------------------------------
+
+
+def test_pyscx_tokenize_in_sys_modules_after_import_pyscx():
+    import pyscx  # noqa: F401 — triggers __init__.py side effects
+
+    assert "pyscx.tokenize" in sys.modules
+
+
+def test_tokenize_dotted_and_from_import_yield_same_object():
+    import pyscx.tokenize as via_dotted
+    from pyscx import tokenize as via_from
+
+    assert via_dotted is via_from
+
+
+def test_pyscx_tokenize_has_expected_surface():
+    import pyscx.tokenize as tokenize
+
+    for name in ("top_k", "rank_tokens", "bin_values", "sample_genes",
+                 "transform_values", "library_size", "measured_mask",
+                 "gene_mask_id", "pad_id"):
+        assert hasattr(tokenize, name), f"pyscx.tokenize missing {name!r}"
+    assert isinstance(tokenize.CONTRACT_VERSION, int)
+
+
+def test_tokenize_dotted_import_works_in_a_fresh_interpreter():
+    """Cold import in a clean subprocess — the strongest variant, and the one
+    that would have caught a missing `sys.modules` entry."""
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import pyscx.tokenize as t; print(t.CONTRACT_VERSION)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"`import pyscx.tokenize` failed in a fresh subprocess.\n"
+        f"stdout: {result.stdout!r}\nstderr: {result.stderr!r}"
+    )
+    assert result.stdout.strip().isdigit()

@@ -22,6 +22,7 @@ pub(crate) mod seed;
 pub mod shuffle;
 pub mod sparse_cellset;
 pub mod sparse_cellset_collate;
+pub mod tokenize;
 
 pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};
@@ -49,6 +50,7 @@ pub use sparse_cellset_collate::{collate_cell, CellIn, CellOut, CollateConfig, P
 
 #[cfg(feature = "python")]
 pub use python::{
-    collate_cellset_gathered, downsample_counts_csr, downsample_file_identity, IndexPlanDataset,
-    MultimodalTrainingDataset, SparseCellSetBatchIter, SparseCellSetDataset, TrainingDataset,
+    collate_cellset_gathered, downsample_counts_csr, downsample_file_identity, register_tokenize,
+    IndexPlanDataset, MultimodalTrainingDataset, SparseCellSetBatchIter, SparseCellSetDataset,
+    TrainingDataset,
 };

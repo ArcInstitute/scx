@@ -1118,7 +1118,18 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     //     different transform behind a version the assertion still called equal.
     //   * Phase 1B added the gather-stage negative clip and the optional seeded
     //     downsample, so the emitted CSR's values are no longer a pass-through.
-    m.add("COLLATE_CELLSET_CONTRACT_VERSION", 2u32)?;
+    //
+    // v2 -> v3 is per-row query addressing (W6): `collate_cellset_gathered`
+    // accepts `query_offsets`, under which `query_gene_ids` becomes ragged,
+    // `n_measured` becomes per-row and `enc_mask_positions` becomes parallel to
+    // the ragged query rather than `k_dec`-strided. Every v2 call shape — i.e.
+    // `query_offsets` omitted — reproduces every **pre-existing field** byte for
+    // byte. The returned dict is NOT identical: it gained a `target_pad_mask`
+    // key on every path (all zeros on the per-set one), which is what keeps a
+    // padded target slot distinguishable from a real zero once queries can be
+    // ragged. A consumer that unpacks named keys is unaffected; one that asserts
+    // an exact key set is not, and that is part of what the bump is for.
+    m.add("COLLATE_CELLSET_CONTRACT_VERSION", 3u32)?;
 
     // Build profile ("release" / "debug"). Benchmarks MUST run against a
     // release build — a debug `.so` runs ~4-10x slower uniformly and silently
@@ -1187,6 +1198,15 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_col_aggs(&accel_module)?;
     register_eval_metrics(&accel_module)?;
     m.add_submodule(&accel_module)?;
+
+    // Tokenisation kernels submodule (W6). Flat, like `accel`, and registered
+    // through one helper in `scx-loader` so adding a kernel touches that helper
+    // rather than this block. `pyscx/python/pyscx/__init__.py` must also add it
+    // to `sys.modules` — `add_submodule` sets an attribute and nothing else, so
+    // `import pyscx.tokenize` fails without that line.
+    let tokenize_module = PyModule::new(m.py(), "tokenize")?;
+    scx_loader::register_tokenize(&tokenize_module)?;
+    m.add_submodule(&tokenize_module)?;
 
     // Route Rust-side `log::*!` calls through Python's `logging` module so
     // Python users can configure severity/filtering/sinks via the standard

@@ -59,7 +59,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::Binomial;
 
 use crate::error::{LoaderError, Result};
-use crate::seed::splitmix64;
+use crate::seed::row_seed;
 
 /// Which sampler redistributes the row's counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,24 +163,6 @@ pub fn file_identity(path: &str) -> u64 {
     )
 }
 
-/// Derive this row's RNG seed from `(seed, method, file_identity, row)`.
-///
-/// Chained rather than additive — see [`crate::seed`] for why. This four-component
-/// key is where the convention started; `shuffle.rs` and `decode_stage.rs` were
-/// converted to it later.
-///
-/// **Do not change this derivation.** Its output is pinned by a blake3 golden
-/// (`downsample_tests.rs`) that `state3` also consumes, so a change here is a
-/// cross-repo break — see the failure message on that test for the full
-/// regeneration procedure.
-#[inline]
-fn row_seed(seed: u64, method: DownsampleMethod, file_identity: u64, row: u64) -> u64 {
-    let mut h = splitmix64(seed);
-    h = splitmix64(h ^ method.tag());
-    h = splitmix64(h ^ file_identity);
-    splitmix64(h ^ row)
-}
-
 /// Clip negative values to zero, in place.
 ///
 /// Separate from downsampling because it applies unconditionally to the emitted
@@ -256,7 +238,8 @@ pub fn downsample_row(
         return;
     }
 
-    let mut rng = ChaCha8Rng::seed_from_u64(row_seed(cfg.seed, cfg.method, file_identity, row));
+    let mut rng =
+        ChaCha8Rng::seed_from_u64(row_seed(cfg.seed, cfg.method.tag(), file_identity, row));
     let sampled = match cfg.method {
         DownsampleMethod::Binomial => {
             sample_binomial(&trials, library_size, cfg.target_library_size, &mut rng)

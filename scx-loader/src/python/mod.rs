@@ -51,6 +51,7 @@ mod index_plan;
 mod multimodal;
 mod plan_iter;
 mod sparse_cellset;
+mod tokenize;
 mod training;
 
 // Named, never globbed: a `pub use child::*` would silently publish any `pub`
@@ -61,6 +62,7 @@ pub use collate::{collate_cellset_gathered, downsample_counts_csr, downsample_fi
 pub use index_plan::{IndexPlanBatchIter, IndexPlanDataset};
 pub use multimodal::MultimodalTrainingDataset;
 pub use sparse_cellset::{SparseCellSetBatchIter, SparseCellSetDataset};
+pub use tokenize::register_tokenize;
 pub use training::TrainingDataset;
 
 // The remaining three hold `pub(super)` items only, reached by siblings through

@@ -56,6 +56,7 @@ Benchmarks, operational semantics (append/delete/compact), and test infrastructu
 quickstart
 migrating-from-h5ad
 training
+tokenize
 scanpy
 pseudobulk_nb_glm
 gpu-setup
