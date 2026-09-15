@@ -49,6 +49,7 @@ use tokio::task::JoinHandle;
 
 use crate::budget::profiling_enabled;
 use crate::error::{LoaderError, Result};
+use crate::reader_registry::ReaderRegistry;
 
 /// tokio's own default `max_blocking_threads`. The engine's cap is clamped to
 /// it so the change can only ever tighten concurrency, never widen it.
@@ -75,9 +76,12 @@ type ShardJoin = JoinHandle<scx_format_io::Result<()>>;
 /// built tokio runtime for prefetch. Wrap in `Arc` and call
 /// [`PrefetchEngine::iter_with_plans`].
 pub struct PrefetchEngine {
-    /// Readers indexed by `file_id` (the index into this vec). All share one
-    /// [`SharedShardCache`] via [`BackedCsrReader::with_shared_cache`].
-    readers: Vec<Arc<BackedCsrReader>>,
+    /// `file_id → reader`, opened lazily and bounded by `reader_limit` when
+    /// the caller sets one. All handles share one [`SharedShardCache`] via
+    /// [`BackedCsrReader::with_shared_cache`]. See [`ReaderRegistry`] for why
+    /// a handle is leased rather than borrowed, and for the measurement that
+    /// says the resource being bounded is resident memory, not descriptors.
+    registry: Arc<ReaderRegistry>,
     /// Lazily built so it is never inherited across a fork — mirrors
     /// `IndexPlanLoader`. Built on the first `iter_with_plans` consumption.
     runtime: OnceLock<crate::runtime::BoundedRuntime>,
@@ -105,8 +109,24 @@ impl PrefetchEngine {
             .iter()
             .find_map(|r| r.metrics().cloned())
             .unwrap_or_else(|| Arc::new(CacheMetrics::default()));
+        Self::over_registry(
+            ReaderRegistry::from_open(readers),
+            default_lookahead,
+            cache_metrics,
+        )
+    }
+
+    /// Build an engine over an already-constructed registry.
+    ///
+    /// The seam a bounded manifest scan enters through: it has opened at most
+    /// `reader_limit` of the files and cannot hand over a `Vec` of all of them.
+    pub(crate) fn over_registry(
+        registry: Arc<ReaderRegistry>,
+        default_lookahead: usize,
+        cache_metrics: Arc<CacheMetrics>,
+    ) -> Arc<Self> {
         Arc::new(PrefetchEngine {
-            readers,
+            registry,
             runtime: OnceLock::new(),
             default_lookahead,
             cache_metrics,
@@ -137,24 +157,14 @@ impl PrefetchEngine {
         scatter_block_index: bool,
     ) -> Arc<Self> {
         let shared = SharedShardCache::new(cache_shards, bytes_budget);
+        // Through the shared factory, which owns the pre-`Arc` sequence — the
+        // block-index gate, the shared pool, metrics — so that a reader the
+        // registry reopens later is configured identically to one opened here.
         let readers = scx_readers
             .into_iter()
             .enumerate()
             .map(|(fid, r)| {
-                let mut backed =
-                    BackedCsrReader::with_shared_cache(r, fid as u32, Arc::clone(&shared));
-                // Set before the `Arc`: `BackedCsrReader` exposes no interior
-                // mutability for this, and `PrefetchEngine` hands out `&` only.
-                backed.set_scatter_block_index(scatter_block_index);
-                // One pool for every reader, not one each: `cpu_pool()` is
-                // process-wide, so an N-file engine does not spawn N pools.
-                // Same fork rationale as `IndexPlanLoader` — see `crate::pool`.
-                backed.set_cpu_pool(crate::pool::cpu_pool());
-                // Always-on metrics. `enable_metrics`
-                // is idempotent on the shared cache, so doing it per reader installs
-                // one aggregate handle that `new` reads back via `metrics()`.
-                backed.enable_metrics();
-                Arc::new(backed)
+                crate::reader_registry::wrap_reader(r, fid as u32, &shared, scatter_block_index)
             })
             .collect();
         Self::new(readers, default_lookahead)
@@ -162,12 +172,23 @@ impl PrefetchEngine {
 
     /// Number of readers (`file_id` range is `0..n_readers`).
     pub fn n_readers(&self) -> usize {
-        self.readers.len()
+        self.registry.n_files()
     }
 
-    /// Borrow the reader for `file_id`.
-    pub fn reader(&self, file_id: u32) -> &BackedCsrReader {
-        &self.readers[file_id as usize]
+    /// The registry, for callers that need a file's metadata without a handle.
+    pub(crate) fn registry(&self) -> &Arc<ReaderRegistry> {
+        &self.registry
+    }
+
+    /// An owned handle for `file_id`, valid until the caller drops it.
+    ///
+    /// Owned, not borrowed: a bounded registry may close a handle to reclaim
+    /// its parsed catalog, and the reads this feeds hold their receiver across
+    /// a parallel decode, a single-flight wait, or — in the prefetcher's case —
+    /// an unabortable `spawn_blocking` that outlives the iterator. Fallible
+    /// because a reopen can fail or land on a replaced file.
+    pub fn lease(&self, file_id: u32) -> Result<Arc<BackedCsrReader>> {
+        self.registry.lease(file_id)
     }
 
     /// True if **any** reader has at least one row-group-framed CSR shard, i.e.
@@ -181,24 +202,9 @@ impl PrefetchEngine {
     /// memoized per shard, and both this and it short-circuit on the first
     /// framed shard, so the cost is paid in full only by an all-unframed set.
     pub fn any_shard_framed(&self) -> bool {
-        self.readers.iter().any(|r| r.any_shard_framed())
+        self.registry.any_shard_framed()
     }
 
-    /// Does this plan's whole LRU footprint fit the shared byte budget?
-    ///
-    /// The same sizing the prefetcher does per plan — dedup `(file, row)`,
-    /// bucket per shard, sum the row-group bytes of every touched framed shard
-    /// plus the decoded size of every shard taken whole — but compared against
-    /// the **whole** budget rather than `budget / (lookahead + 1)`, because a
-    /// synchronous one-plan caller has no lookahead window to share with.
-    ///
-    /// This exists so a standalone gather makes ONE verdict over the plan
-    /// instead of letting each set decide for itself. Per-set decisions let a
-    /// plan whose sets individually fit, but whose union does not, insert and
-    /// evict row groups against each other — exactly the churn the plan-level
-    /// verdict was introduced to stop on the iterator path.
-    ///
-    /// Sized from the catalog and the block index; decodes nothing.
     /// Deduplicate a plan's `(file, row)` pairs into per-`(file, shard)` buckets.
     ///
     /// The gather passes the same deduplicated set to `read_rows_with`, so each
@@ -221,10 +227,11 @@ impl PrefetchEngine {
             if !seen.insert((fid, row)) {
                 continue;
             }
-            let Some(reader) = self.readers.get(fid as usize) else {
-                continue;
-            };
-            if let Some(sidx) = reader.index().shard_for_row(row) {
+            // Served from the registry's retained shard index, so bucketing a
+            // plan opens nothing. That is what keeps a wide plan's admission
+            // sizing from pulling every file it touches into residence before
+            // the gather has decided it wants them.
+            if let Some(sidx) = self.registry.shard_for_row(fid, row) {
                 per_shard.entry((fid, sidx)).or_default().push(row);
             }
         }
@@ -244,26 +251,60 @@ impl PrefetchEngine {
     /// Counts the row-group bytes of every touched shard, plus the decoded size
     /// of any shard the plan will take **whole** — both kinds share one budget.
     /// Sized from the catalog and the block index; decodes nothing.
+    ///
+    /// Returning the budget alongside the footprint is what lets a standalone
+    /// gather make ONE verdict over the plan instead of letting each set decide
+    /// for itself: per-set decisions let a plan whose sets individually fit,
+    /// but whose union does not, insert and evict row groups against each
+    /// other — exactly the churn the plan-level verdict was introduced to stop
+    /// on the iterator path.
+    ///
+    /// Unlike `bucket_plan_rows`, this needs a real handle per touched file —
+    /// the framing memo and the per-shard decoded size are not in the retained
+    /// index.
+    ///
+    /// `held` is what makes that affordable for both callers, which want
+    /// opposite things. A synchronous `gather` passes `None`: this leases one
+    /// file at a time and drops each, so sizing costs one resident handle
+    /// whatever the plan's width. The prefetcher passes the leases it is
+    /// already holding, because it needs every touched file anyway — and
+    /// without that, a plan touching more files than `reader_limit` would have
+    /// this function evict each file as it moved to the next, then watch
+    /// `spawn_prefetches` reopen and re-parse every one of them a line later.
+    /// **Review on #536 (Antigravity, Cursor Agent):** that thrash was real,
+    /// and it was introduced by the fix that made sizing lease one at a time.
     pub(crate) fn plan_footprint(
         &self,
         per_shard: &HashMap<(u32, usize), Vec<u64>>,
-    ) -> (usize, usize) {
+        held: Option<&HashMap<u32, Arc<BackedCsrReader>>>,
+    ) -> Result<(usize, usize)> {
         let mut planned = 0usize;
         let mut budget = usize::MAX;
+        // Regrouped per file so that, with `held` absent, each file's lease is
+        // dropped before the next is taken and sizing holds **one** handle at a
+        // time. Holding them all was the first version, and it defeated
+        // `reader_limit` outright: a 64-file plan pinned 64 readers before a
+        // single row was read, so nothing was ever evictable and the residency
+        // high-water equalled the manifest size. Caught by
+        // `residency_is_bounded_by_reader_limit`.
+        let mut by_file: HashMap<u32, Vec<(usize, &Vec<u64>)>> = HashMap::new();
         for (&(fid, sidx), shard_rows) in per_shard {
-            let reader = &self.readers[fid as usize];
-            planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
-            if !reader.block_index_eligible(sidx, shard_rows.len()) {
-                planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
+            by_file.entry(fid).or_default().push((sidx, shard_rows));
+        }
+        for (fid, shards) in by_file {
+            let reader = match held.and_then(|m| m.get(&fid)) {
+                Some(r) => Arc::clone(r),
+                None => self.registry.lease(fid)?,
+            };
+            for (sidx, shard_rows) in shards {
+                planned = planned.saturating_add(reader.planned_row_group_bytes(sidx, shard_rows));
+                if !reader.block_index_eligible(sidx, shard_rows.len()) {
+                    planned = planned.saturating_add(reader.shard_decoded_bytes(sidx));
+                }
             }
             budget = budget.min(reader.cache_bytes_budget());
         }
-        (planned, budget)
-    }
-
-    /// Default lookahead depth.
-    pub fn default_lookahead(&self) -> usize {
-        self.default_lookahead
+        Ok((planned, budget))
     }
 
     /// Shared handle to the readers' one `SharedShardCache` counters. Always
@@ -449,6 +490,16 @@ pub struct IterMetrics {
     /// verdict reaches them through `process`'s third argument): warming it
     /// would only have evicted the groups before they were read.
     pub prefetch_skipped_block_index: AtomicU64,
+    /// Plans whose L2 prefetch was declined outright because they touch more
+    /// distinct files than `reader_limit` allows to be resident.
+    ///
+    /// Zero on every unbounded dataset, which is the default. Non-zero means
+    /// the manifest cap and the plan shape are fighting: prefetch cannot hold a
+    /// lease per launched file without pinning more than the cap, so it stands
+    /// down and the synchronous gather reads one file at a time instead. The
+    /// fix is on the caller's side — a wider `reader_limit`, or plans with more
+    /// file locality — and this counter is how they find out it is happening.
+    pub prefetch_skipped_reader_limit: AtomicU64,
 }
 
 /// Test-only rendezvous for holding prefetch tasks in flight.
@@ -676,28 +727,92 @@ where
         // Counting a shard the gather then happens to serve the other way only
         // makes the verdict conservative (a lost warm in a mixed regime), never
         // unsafe. Eligibility still decides what L2 task to launch.
-        let (planned, budget) = self.engine.plan_footprint(&per_shard);
+        // At `lookahead == 0` there is no prefetch to launch, so the plan needs
+        // its admission verdict and nothing else: neither the leases nor the
+        // eligibility map below survives the early return. Taking them first
+        // spiked residency to the plan's width in order to compute one `bool`,
+        // on a configuration documented as disabling prefetch entirely.
+        // **Review on #536 (Cursor Agent).**
+        // Two ways to reach "no prefetch tasks", both of which still owe the
+        // caller a real admission verdict.
+        //
+        // `lookahead == 0` disables prefetch outright. And a plan touching more
+        // distinct files than the registry may keep resident cannot be
+        // prefetched either: the prefetcher holds a lease on every file it
+        // launches work for — the tasks are unabortable and slice the mapping —
+        // so it would pin the plan's whole width, defeat `reader_limit`, and
+        // then hand the gather handles the next trim evicts. Measured on #536
+        // by codex - gpt-5.6-sol: a 32-file plan at `reader_limit=2,
+        // lookahead=4` moved `opens/hwm` from 2/2 to 65/32.
+        //
+        // **The verdict is still computed, not assumed.** An earlier version
+        // returned a flat `false` here on the reasoning that a plan whose
+        // readers cannot stay resident cannot get row-group hits either. That
+        // conflates two lifetimes: `CacheKey::Group` entries live in the shared
+        // byte-budgeted cache and outlive a handle eviction — this module's own
+        // docs say so — so a wide plan's few touched groups can fit and hit on
+        // the next epoch while its catalogs cannot all stay open. Admission is
+        // a statement about the decoded-cache footprint, never about the file
+        // count. Flagged independently by codex and Cursor Agent on #536.
+        //
+        // Sizing here costs one lease per touched file, taken and dropped one
+        // at a time, which on a wide plan the gather then repeats. That is the
+        // price of a correct verdict; the cheaper answer is a per-shard byte
+        // summary retained by the manifest scan, which is a larger change than
+        // this round should carry.
+        //
+        // Unbounded registries (`reader_limit = None`, the default) never take
+        // the second branch, so the default path is untouched.
+        let declined_for_reader_limit = self.engine.registry().limit().is_some_and(|limit| {
+            let touched: HashSet<u32> = per_shard.keys().map(|&(fid, _)| fid).collect();
+            touched.len() > limit
+        });
+        if declined_for_reader_limit {
+            self.iter_metrics
+                .prefetch_skipped_reader_limit
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if self.lookahead == 0 || declined_for_reader_limit {
+            let (planned, budget) = self.engine.plan_footprint(&per_shard, None)?;
+            return Ok((Vec::new(), planned <= budget / (self.lookahead + 1)));
+        }
+
+        // One lease per touched file for the whole of the rest of this
+        // function. Taken up front, and held, for three reasons: the
+        // eligibility map and the warm loop below would otherwise lease the
+        // same file once per bucket; a handle re-leased between the two could
+        // be a *different* `Arc` if a bounded registry evicted and reopened it
+        // in between, so the predicate and the task it launches would be
+        // reading different objects; and taking them BEFORE the sizing below is
+        // what stops a plan wider than `reader_limit` from being sized
+        // file-by-file, evicting as it goes, and then reopening every one of
+        // them here.
+        let mut leased: HashMap<u32, Arc<BackedCsrReader>> = HashMap::new();
+        for &(fid, _) in per_shard.keys() {
+            if let std::collections::hash_map::Entry::Vacant(e) = leased.entry(fid) {
+                e.insert(self.engine.lease(fid)?);
+            }
+        }
+        // Sized against the handles already held, so no file is opened twice
+        // for one plan.
+        let (planned, budget) = self.engine.plan_footprint(&per_shard, Some(&leased))?;
         // Recomputed here because the prefetcher needs it per bucket to choose
         // which L2 task to launch; `plan_footprint` consumes the same verdict
         // internally to decide whether to add whole-shard bytes.
         let eligible: HashMap<(u32, usize), bool> = per_shard
             .iter()
             .map(|(&(fid, sidx), rows)| {
-                let reader = &self.engine.readers[fid as usize];
+                let reader = &leased[&fid];
                 ((fid, sidx), reader.block_index_eligible(sidx, rows.len()))
             })
             .collect();
         let share = budget / (self.lookahead + 1);
         let admit_row_groups = planned <= share;
 
-        if self.lookahead == 0 {
-            return Ok((Vec::new(), admit_row_groups));
-        }
-
         let handle = self.engine.runtime()?.handle().clone();
         let mut joins = Vec::new();
         for ((fid, sidx), mut rows) in per_shard {
-            let reader = &self.engine.readers[fid as usize];
+            let reader = &leased[&fid];
             // Attributed one reason at a time, not as a fused `||`: the three
             // skips mean different things to an operator (a warm cache, a peer
             // decode, the L2 block-index adoption) and a fused test can only

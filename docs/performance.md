@@ -3116,6 +3116,109 @@ magnitude a block design discards as noise, and 12 wins out of 12 is not.
   tabula alone.
 - Single node, single rank, one format (`scx_auto`).
 
+### Bounded reader registry: what a large manifest actually costs (phase 2)
+
+`SparseCellSetDataset` takes a list of paths. Before phase 2 it opened all of
+them in the constructor and held them for the dataset's lifetime; `reader_limit`
+now caps how many are resident and reopens the rest on demand. Default `None`
+keeps the old behaviour.
+
+**The resource being bounded is resident memory, not file descriptors.** That is
+worth stating first because the opposite is the intuitive answer and it is
+wrong. Opening an SCX file mmaps it and closes the descriptor, and the loader's
+readers do not watch their files, so they retain none. Every arm below records
+the process's descriptor count before and after; it is **7 in all twelve**, at
+every manifest size and every limit. A 5,000-file manifest constructs *and*
+gathers under `ulimit -n 1024` on unmodified `main`.
+
+What an open reader does cost is the parsed catalog — one owned entry per
+catalog entry, so it scales with shards per file, not cells. Measured per open
+reader, `n_files = 1000`:
+
+| fixture | CSR shards | `None` | 256 | 64 | 16 |
+|---|---|---|---|---|---|
+| `tabula_sapiens_100k` | 7 | 102.0 MB (104.4 kB/file) | 24.7 MB | 6.2 MB | 1.6 MB |
+| `census_1m_preprocessed` | 62 | 117.8 MB (120.6 kB/file) | 26.3 MB | 6.6 MB | 1.7 MB |
+| synthetic, 100 shards | 100 | 151.7 MB (155.3 kB/file) | 31.9 MB | 8.1 MB | 2.0 MB |
+
+`reader_limit=16` against the default is **66× / 71× / 76×** (release build).
+Two runs of the capture agreed to 0.1 MB on every arm except the smallest, whose
+~2 MB delta is near the resolution of a `VmRSS` reading and moved the third
+ratio between 74× and 76× — read that column as "about 75×", not as three
+significant figures. The mmap count
+falls with it exactly — 1000 → 256 → 64 → 16 additional VMAs — which matters at
+the second, looser wall: `vm.max_map_count` is 65,530 by default, so an
+unbounded manifest also stops working somewhere near 64k files.
+
+Splitting the ~105 kB: an `ScxReader` alone is 91.8 kB and the
+`BackedCsrReader` wrapper adds ~9 kB. **Over 90% of the cost is the catalog**,
+which is why an eviction drops it and a reopen re-parses it (0.09–20 ms per
+file, from the per-file open measurements above). Retaining
+`Arc<FullCatalog>` and reopening through `open_with_shared_catalog` — the
+obvious way to make reopens cheap — would have reclaimed the 9 kB and left the
+100.
+
+The default arm carries ~1 kB/file more than a reader strictly needs: the shard
+index is retained per file whatever the limit, because the alternative — reading
+it back through the resident handle — puts a mutex acquisition on a path that
+runs once per *row* of every plan. 0.9% of the per-file cost to keep plan
+bucketing lock-free.
+
+Extrapolated to the manifest size this exists for, 26,453 files: **~2.8 GB
+(tabula-shaped) to ~3.2 GB (census-shaped) per process**, before multiplying by
+DataLoader workers and ranks. That is arithmetic on the per-file figures, not a
+26k-file measurement — no such capture was run.
+
+Raw rows: `results/raw/phase2_reader_registry/manifest_rss.json`, produced by
+`benchmarks/scripts/measure_reader_registry_rss.py`.
+
+**What this does not say.** These are allocation counts around one constructor,
+not throughput. Nothing here measures what a bounded limit costs a *gather*: a
+plan that fans across more files than the limit reopens on every batch, and no
+arm at a bounded limit was timed, so no floor is proposed for one.
+
+The default `reader_limit=None` path raises a separate question these numbers do
+not answer, and it is answered below.
+
+#### Does the leased-`Arc` seam cost anything? (phase 2)
+
+The engine now hands out a leased `Arc` from a mutex-guarded map where it
+previously indexed an array, and sizing a plan takes a lease per touched file.
+Two-build A/B, SLURM `2951009`, host `GPU3694`, `main` `aba3c114` against
+`phase2-reader-registry` `9833d075`, 12 interleaved rounds per dataset, median
+of within-round ratios with an exact two-sided sign test. Raw rows under
+`results/raw/phase2_reader_registry/cellset_gather_ab.json`.
+
+⚠️ **The A/B measures `9833d075`, not the branch head.** Two later commits
+changed lease ordering on the prefetch path — sizing now reuses the leases the
+prefetcher already holds, and a plan touching more files than `reader_limit` is
+not prefetched at all. Neither can fire in the arms measured here, which all run
+`reader_limit=None`: an unbounded registry never evicts, so there is nothing to
+reorder and no cap to exceed. The measurement stands for the seam it names; it
+is not a measurement of the bounded path, which was never timed.
+
+Every arm runs `reader_limit=None`, where nothing is ever evicted or reopened.
+Flat was the expected result and the gate.
+
+| metric | pbmc3k | tabula_sapiens_100k |
+|---|---|---|
+| `us_per_cell__collate` | 1.00× (6/12, p 1.000) | 1.03× (9/12, p 0.146) |
+| `cellsets_per_sec__collate_rust` | 1.00× (6/12, p 1.000) | 1.03× (9/12, p 0.146) |
+| `cellsets_per_sec__gather_random` | 0.996× (6/12, p 1.000) | 0.992× (5/12, p 0.774) |
+| `cellsets_per_sec__gather_grouped` | 0.987× (5/12, p 0.774) | 0.999× (6/12, p 1.000) |
+| `cellsets_per_sec__gather_random_s512` | 1.02× (8/12, p 0.388) | 0.971× (4/12, p 0.388) |
+| `cellsets_per_sec__gather_grouped_s512` | 1.01× (8/12, p 0.388) | 1.03× (9/12, p 0.146) |
+
+Ratios are oriented so > 1 means the change helped. **All twelve cells are "no
+reliable difference"** — every sign test is p ≥ 0.146, and no median ratio
+leaves 0.97–1.03.
+
+Read that as a resolution, not as proof of zero. Twelve paired rounds can rule
+out an effect of roughly the size the spread here admits; they cannot
+distinguish 1.00× from 1.01×. The claim this supports is the one the gate asked
+for — the seam costs nothing a consumer would notice at the default — not that
+the two builds are identical instruction for instruction.
+
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
 The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered

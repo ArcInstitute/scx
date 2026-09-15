@@ -111,7 +111,7 @@ fn gather(engine: &PrefetchEngine, plan: Plan, admit_row_groups: bool) -> Result
     for &(fid, row) in &plan {
         let mut got: Option<(i32, f32)> = None;
         engine
-            .reader(fid)
+            .lease(fid)?
             .read_rows_with_admission(&[row], Some(admit_row_groups), |_pos, idx, data| {
                 got = idx.first().copied().zip(data.first().copied());
                 Ok(())
@@ -217,9 +217,9 @@ fn engine_warms_shards_across_both_readers() {
         .collect();
     assert_eq!(out.len(), 1);
     // Prefetch warmed the touched shards in BOTH readers (shared cache).
-    assert!(engine.reader(0).cache_contains(0));
-    assert!(engine.reader(0).cache_contains(3));
-    assert!(engine.reader(1).cache_contains(1));
+    assert!(engine.lease(0).unwrap().cache_contains(0));
+    assert!(engine.lease(0).unwrap().cache_contains(3));
+    assert!(engine.lease(1).unwrap().cache_contains(1));
 }
 
 // --- lazy runtime / fork-safety (Phase 1.2) -------------------------------
@@ -603,7 +603,7 @@ fn plan_fits_budget_sizes_the_union_not_the_largest_set() {
 
     let fits = |rows: &[u64]| {
         let per_shard = engine.bucket_plan_rows(rows.iter().map(|&r| (0u32, r)));
-        let (planned, budget) = engine.plan_footprint(&per_shard);
+        let (planned, budget) = engine.plan_footprint(&per_shard, None).unwrap();
         planned <= budget
     };
     assert!(
@@ -693,7 +693,7 @@ fn engine_does_not_warm_a_block_index_eligible_shard() {
     );
     for sidx in 0..4 {
         assert!(
-            !engine.reader(0).cache_contains(sidx),
+            !engine.lease(0).unwrap().cache_contains(sidx),
             "shard {sidx} must still be cold: the block-index path decodes row \
              groups without inserting the whole shard into the LRU"
         );
@@ -728,7 +728,7 @@ fn engine_warms_the_same_shards_when_the_reader_gate_is_off() {
     assert!(m.full_shard_groups.load(AtomicOrdering::Relaxed) > 0);
     for sidx in 0..4 {
         assert!(
-            engine.reader(0).cache_contains(sidx),
+            engine.lease(0).unwrap().cache_contains(sidx),
             "shard {sidx} must be warm with the gate off"
         );
     }
@@ -788,7 +788,7 @@ fn from_scx_readers_applies_the_block_index_gate_to_every_reader() {
         for fid in 0..2u32 {
             for sidx in 0..4 {
                 assert_eq!(
-                    engine.reader(fid).cache_contains(sidx),
+                    engine.lease(fid).unwrap().cache_contains(sidx),
                     !gate,
                     "gate={gate}: file {fid} shard {sidx} — with the gate off every \
                      touched shard warms into the LRU; with it on none of them do. A \
@@ -1108,7 +1108,7 @@ fn engine_warms_row_groups_for_an_eligible_plan() {
     let dir = tempfile::tempdir().unwrap();
     let engine = framed_engine_with_budget(dir.path(), true, budget);
     assert_eq!(
-        engine.reader(0).cache_bytes_budget(),
+        engine.lease(0).unwrap().cache_bytes_budget(),
         budget,
         "premise: finite budget"
     );
@@ -1135,7 +1135,7 @@ fn engine_warms_row_groups_for_an_eligible_plan() {
     );
     for sidx in 0..4 {
         assert!(
-            !engine.reader(0).cache_contains(sidx),
+            !engine.lease(0).unwrap().cache_contains(sidx),
             "shard {sidx} must not be resident whole"
         );
     }
@@ -1219,7 +1219,7 @@ fn engine_bypasses_row_groups_over_their_budget_share() {
         0,
         "and the gather did not retain them either — one verdict per plan"
     );
-    assert_eq!(engine.reader(0).cache_bytes_used(), 0);
+    assert_eq!(engine.lease(0).unwrap().cache_bytes_used(), 0);
 }
 
 /// **Review on #528 (Antigravity, codex).** The admission verdict is over the
@@ -1322,9 +1322,9 @@ fn plan_admission_counts_resident_shards_too() {
     let dir = tempfile::tempdir().unwrap();
     let engine = framed_engine_with_budget(dir.path(), true, budget);
     // Shard 0 resident whole before the plan is queued.
-    let _ = engine.reader(0).read_shard_cached_arc(0).unwrap();
+    let _ = engine.lease(0).unwrap().read_shard_cached_arc(0).unwrap();
     assert!(
-        engine.reader(0).cache_contains(0),
+        engine.lease(0).unwrap().cache_contains(0),
         "premise: shard 0 is resident"
     );
 
@@ -1376,12 +1376,12 @@ fn plan_admission_counts_the_plans_whole_shards_too() {
     let dir = tempfile::tempdir().unwrap();
     let engine = framed_engine_with_budget(dir.path(), true, budget);
     assert_eq!(
-        engine.reader(0).shard_decoded_bytes(0),
+        engine.lease(0).unwrap().shard_decoded_bytes(0),
         shard_bytes,
         "premise: shard size"
     );
     assert!(
-        !engine.reader(0).block_index_eligible(0, 16),
+        !engine.lease(0).unwrap().block_index_eligible(0, 16),
         "premise: shard 0 is dense and takes the whole-shard route"
     );
     let it = Arc::clone(&engine).iter_with_plans(into_iter(vec![plan.clone()]), 4, rows_of, gather);
@@ -1398,7 +1398,7 @@ fn plan_admission_counts_the_plans_whole_shards_too() {
         1,
         "shard 0 was warmed whole"
     );
-    assert!(engine.reader(0).cache_contains(0));
+    assert!(engine.lease(0).unwrap().cache_contains(0));
     // The test gather is one `read_rows_with` per plan row: sixteen sliced from
     // the resident whole shard, one through the row-group route.
     assert_eq!(m.full_shard_groups.load(AtomicOrdering::Relaxed), 16);

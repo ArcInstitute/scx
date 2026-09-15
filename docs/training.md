@@ -203,6 +203,13 @@ Two things to know:
   unenforced: this class has no `max_plan_size`, so plan width is
   yours to declare, and a default guess would shrink the cache — the lever worth
   2,486× below — on every existing caller.
+- **Bound the manifest itself when it is very large.**
+  `SparseCellSetDataset(paths, reader_limit=N)` keeps at most `N` of the
+  manifest's files open at a time, reopening on demand. Default `None` opens
+  every file and never closes one, which is what this class has always done.
+  See [Very large manifests](#very-large-manifests) — the resource it bounds is
+  **resident memory**, not file descriptors, and none of it is charged to
+  `max_memory_mb`.
 - **On `SparseCellSetDataset` this is load-bearing by default.** The class
   defaults `scatter_block_index=False` (and no route wins everywhere — the two
   cross near 1M cells, see [Cell-set scatter routes](performance.md#cell-set-scatter-routes-re-measured-after-the-row-group-lru-phase-0-gate)),
@@ -533,6 +540,77 @@ per plan against its divided share (`budget / (lookahead + 1)`), `gather` decide
 against the whole byte budget. That changes what the shard cache *retains*, not
 what is read, so the batches are identical — but `gather` runs on the calling
 thread with no prefetch, so it is not the way to stream.
+
+### Very large manifests
+
+`SparseCellSetDataset` takes a list of paths and, by default, opens all of them
+in the constructor and holds them for the dataset's lifetime. Manifests in this
+regime reach tens of thousands of files, so it is worth being precise about what
+that costs — the intuitive answer is wrong.
+
+**It is not file descriptors.** Opening an SCX file mmaps it and closes the
+descriptor; the loader's readers do not watch their files, so they retain none.
+Measured on this constructor: a 5,000-file manifest constructs *and* gathers
+under `ulimit -n 1024` with the process's descriptor count unchanged.
+
+**It is resident memory**, almost all of it the parsed catalog — one owned entry
+per catalog entry, so it scales with shards per file rather than cells:
+
+| manifest | per open reader | 26,453 files |
+|---|---|---|
+| `tabula_sapiens_100k` | ~104 kB | ~2.8 GB |
+| `census_1m` | ~121 kB | ~3.2 GB |
+
+Per process, before multiplying by DataLoader workers and ranks.
+
+`reader_limit=N` caps how many readers the loader will **keep** resident; the
+rest are reopened on demand, and what a vacated slot keeps is the path, the row count, the shard
+index and the file's identity — a few kB, not a hundred.
+
+```python
+ds = pyscx.SparseCellSetDataset(paths, reader_limit=64)
+m = ds.cache_metrics()
+m["reader_hwm"]        # peak simultaneously-open readers
+m["reader_opens"]      # > len(paths) once plans revisit evicted files
+m["reader_evictions"]
+```
+
+Four things to know before setting it:
+
+- **A reopen re-parses the catalog** (0.09–20 ms per file). That is not an
+  oversight — the catalog is over 90 % of what the eviction reclaims, so
+  retaining it to make reopens cheap would make the whole thing pointless.
+  Match `reader_limit` to how many files are in flight at once, which on the
+  streaming path is **not** one plan's worth: `iter_with_plans` keeps up to
+  `lookahead` plans prefetching, and each holds a lease on every file it
+  touches, so the working figure is roughly `files-per-plan × (lookahead + 1)`.
+  A manifest of 26k files whose plans each touch three is the good case; a plan
+  that fans across thousands of files every batch is the bad one.
+- **It bounds handles the loader is free to drop, not handles in existence.** A
+  plan that needs more files at once than the limit exceeds it rather than
+  blocking — blocking would deadlock against a caller already holding readers
+  from the same plan. `reader_hwm` is what reports the truth.
+- **A plan wider than the limit is not prefetched at all.** The prefetcher holds
+  a lease on every file it launches work for, so on such a plan it would pin the
+  plan's whole width and the cap would stop meaning anything. It stands down
+  instead and the gather reads one file at a time, staying inside the cap.
+  `iter.metrics()["prefetch"]["prefetch_skipped_reader_limit"]` counts those
+  plans — a
+  non-zero value means the cap and your plan shape are fighting, and the answer
+  is a larger `reader_limit` or plans with more file locality.
+- **A file replaced at its path between gathers is refused, not served.** A
+  reopen compares the file's inode and header catalog pointer against what the
+  constructor scanned and raises if either moved, because the decoded-shard
+  cache is keyed by manifest position with no notion of file generation. At the
+  default `reader_limit=None` nothing is ever reopened, so nothing checks, and
+  the behaviour is exactly what it was before this option existed.
+- **None of it is charged to `max_memory_mb`.** That budget sizes the decoded
+  shard cache; an open reader's catalog is not one of its terms.
+  `memory_budget()["reader_limit"]` reports the cap, deliberately outside
+  `breakdown`, rather than pretending the readers are priced.
+
+`IndexPlanDataset` takes a single path and has no manifest, so it has no
+`reader_limit` and its `cache_metrics()` carries no `reader_*` keys.
 
 ### Count-depth downsampling
 

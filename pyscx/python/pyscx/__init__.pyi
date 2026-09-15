@@ -233,9 +233,10 @@ class SparseCellSetBatchIter:
     def __repr__(self) -> str: ...
 
     def cache_metrics(self) -> dict[str, int]:
-        """Shared shard-cache counters — same keys as
-        `SparseCellSetDataset.cache_metrics`. The flat, cache-only half of
-        `metrics()`, kept because it predates it. Safe after exhaustion."""
+        """Shared shard-cache and reader-registry counters — same keys as
+        `SparseCellSetDataset.cache_metrics`, including the `reader_*` set. The
+        flat half of `metrics()`, kept because it predates it. Safe after
+        exhaustion."""
         ...
 
     def metrics(self) -> dict[str, dict[str, int]]:
@@ -245,6 +246,11 @@ class SparseCellSetBatchIter:
         loader-cumulative (shared with `SparseCellSetDataset.cache_metrics`);
         ``prefetch`` is per-iter and resets on each `iter_with_plans` call.
         Safe after exhaustion.
+
+        ``prefetch["prefetch_skipped_reader_limit"]`` counts plans that were not
+        prefetched at all because they touch more distinct files than
+        ``reader_limit`` can keep resident; such a plan still gets a real
+        admission verdict, and the key is 0 on any dataset without a limit.
 
         ``prefetch["prefetch_skipped_block_index"]`` counts the L2
         *prefetch-time* decision: shards not warmed *whole* so the gather could
@@ -292,6 +298,7 @@ class SparseCellSetDataset:
         downsample_seed: int | None = None,
         scatter_block_index: bool | None = None,
         max_plan_rows: int | None = None,
+        reader_limit: int | None = None,
     ) -> None:
         """``scatter_block_index`` (default ``False`` — the opposite of
         ``IndexPlanDataset``) gates the block-index (row-group) scattered gather
@@ -409,6 +416,19 @@ class SparseCellSetDataset:
         framed `scatter_block_index=True` gather retains — the multi-file
         sibling of `IndexPlanDataset.cache_metrics`, same keys and meanings.
 
+        Four further keys describe the **reader registry** rather than the
+        shard cache: `reader_opens`, `reader_evictions`, `reader_resident` and
+        `reader_hwm`. They are absent from `IndexPlanDataset.cache_metrics`,
+        which is single-file and would report them as permanently zero. At the
+        default `reader_limit=None`, `reader_opens` equals the manifest size
+        and the other three never move. `reader_opens` counts the *registry's*
+        opens — the handles it was given plus every reopen since — not the
+        constructor's manifest scan, which opens every file once whatever the
+        limit and would report a constant. Compare `reader_hwm` with
+        `reader_limit`: the limit bounds handles the registry may drop, so a
+        plan leasing more files at once than the limit exceeds it rather than
+        blocking, and `reader_hwm` is where that shows.
+
         The last two report which scattered-read route the gathers took.
         `block_index_groups > 0` proves the row-group path ran and remains the
         authority on which route was taken. Opening an all-unframed set with
@@ -424,8 +444,8 @@ class SparseCellSetDataset:
         `BudgetBreakdown` every class that reports a budget uses), plus `max_memory_mb`
         (the value in force — adaptive when the constructor was passed none),
         `cache_shards`, `effective_cache_shards`, `shard_decoded_bytes`,
-        `max_plan_rows`, `mean_nnz_per_row`, `max_blocking_threads` and
-        `budget_exceeded`. `max_plan_rows`, when set, also REFUSES a plan wider
+        `max_plan_rows`, `mean_nnz_per_row`, `max_blocking_threads`,
+        `reader_limit` and `budget_exceeded`. `max_plan_rows`, when set, also REFUSES a plan wider
         than it — `gather` / `iter_with_plans` raise rather than allocate for a
         batch the cache was not sized for.
 
@@ -446,7 +466,15 @@ class SparseCellSetDataset:
         `max_blocking_threads` is the cap on simultaneously-running shard
         decodes in the prefetch engine — the other thing between a wide plan and
         unbounded transient memory. `lookahead` bounds in-flight *plans*, not
-        the tasks a plan spawns."""
+        the tasks a plan spawns.
+
+        `reader_limit` is reported but deliberately **not** in `breakdown`: the
+        breakdown is the byte model the shard cache is sized against, and an
+        open reader's ~104 kB is not one of its terms. Charging readers there
+        would shrink the cache by something the tuner has never accounted for;
+        reporting the cap here says what the knob is without pretending it is
+        priced. At `None` every file in the manifest stays open, which on a
+        26k-file manifest is ~2.8-3.2 GB that no budget here describes."""
         ...
 
     def suggested_cache_shards(

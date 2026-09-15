@@ -12,7 +12,6 @@ use scx_format_io::CacheMetrics;
 use crate::error::LoaderError;
 use crate::plan_engine::IterMetrics;
 use crate::sparse_cellset::{SparseCellSetBatch, SparseCellSetLoader, SparseCellSetPlan};
-use scx_format_io::ScxReader;
 
 use super::*;
 
@@ -125,6 +124,25 @@ impl SparseCellSetDataset {
     ///         bytes: the charge uses the manifest's mean density, so a plan of
     ///         denser-than-average rows can still exceed it. `memory_budget()`
     ///         reports the term as `breakdown["batch_buffer_bytes"]`.
+    ///     reader_limit: Cap on how many of the manifest's files are open at
+    ///         once. Default `None` — open every file and never close one,
+    ///         which is what this class has always done and is byte-identical
+    ///         in sizing, throughput and gather output. What it bounds is
+    ///         **resident memory, not file descriptors**: `ScxReader::open`
+    ///         mmaps and closes the descriptor, so an N-file manifest holds N
+    ///         mappings and no descriptors — measured, a 5,000-file manifest
+    ///         constructs and gathers under a 1024 descriptor limit with the
+    ///         process's descriptor count flat. What an open reader does cost
+    ///         is ~104 kB resident, over 90% of it the parsed `FullCatalog`;
+    ///         at 26k files that is ~2.8-3.2 GB per process, before multiplying by
+    ///         DataLoader workers and ranks. The saving is real only because
+    ///         an eviction drops that catalog and a reopen re-parses it
+    ///         (0.09-20 ms per file), so set this when the manifest is large
+    ///         enough for the memory to matter and plans have locality, and
+    ///         leave it `None` otherwise. It caps handles the registry is free
+    ///         to drop, so a plan leasing more files at once than the limit
+    ///         exceeds it rather than blocking; `cache_metrics()["reader_hwm"]`
+    ///         reports what actually happened.
     #[new]
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -142,6 +160,7 @@ impl SparseCellSetDataset {
         downsample_seed=None,
         scatter_block_index=None,
         max_plan_rows=None,
+        reader_limit=None,
     ))]
     fn new(
         py: Python<'_>,
@@ -159,6 +178,7 @@ impl SparseCellSetDataset {
         downsample_seed: Option<u64>,
         scatter_block_index: Option<bool>,
         max_plan_rows: Option<usize>,
+        reader_limit: Option<usize>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyRuntimeError::new_err(
@@ -189,6 +209,13 @@ impl SparseCellSetDataset {
         if max_plan_rows == Some(0) {
             return Err(PyValueError::new_err(
                 "max_plan_rows must be >= 1 (pass None to leave the batch uncharged)",
+            ));
+        }
+        // Same shape: a gather needs at least one open reader, so a cap of zero
+        // is a bad value rather than a tighter bound.
+        if reader_limit == Some(0) {
+            return Err(PyValueError::new_err(
+                "reader_limit must be >= 1 (pass None to keep every file open)",
             ));
         }
         // Raised as `ValueError`, not the `loader_err_to_py` default of
@@ -222,10 +249,12 @@ impl SparseCellSetDataset {
         // The error is carried out of the closure and turned into a `PyErr`
         // after re-attaching, since building one needs the GIL. Each arm keeps
         // the exception type it had: `ValueError` for a bad downsample value,
-        // `RuntimeError` naming the path for a failed open.
+        // `RuntimeError` for everything the loader reports — including a failed
+        // open, which now reaches us as a `ConfigError` naming the path,
+        // because the manifest scan owns the opening and it is the thing that
+        // knows how many files may be open at once.
         enum OpenError {
             Downsample(String),
-            Open(String),
             Loader(crate::error::LoaderError),
         }
         let loader = py
@@ -238,16 +267,8 @@ impl SparseCellSetDataset {
                 )
                 .map_err(|e| OpenError::Downsample(e.to_string()))?;
 
-                let mut readers = Vec::with_capacity(paths.len());
-                for p in &paths {
-                    readers.push(
-                        ScxReader::open(p)
-                            .map_err(|e| OpenError::Open(format!("failed to open {p}: {e}")))?,
-                    );
-                }
-
-                SparseCellSetLoader::new(
-                    readers,
+                SparseCellSetLoader::open(
+                    paths.iter().map(std::path::PathBuf::from).collect(),
                     cache_shards,
                     bytes_budget,
                     lookahead,
@@ -259,12 +280,12 @@ impl SparseCellSetDataset {
                     downsample,
                     scatter_block_index,
                     max_plan_rows,
+                    reader_limit,
                 )
                 .map_err(OpenError::Loader)
             })
             .map_err(|e| match e {
                 OpenError::Downsample(m) => PyValueError::new_err(m),
-                OpenError::Open(m) => PyRuntimeError::new_err(m),
                 OpenError::Loader(e) => loader_err_to_py(e),
             })?;
 
@@ -348,6 +369,7 @@ impl SparseCellSetDataset {
             inner: Some(inner),
             iter_metrics,
             cache_metrics: loader.cache_metrics(),
+            reader_metrics: loader.reader_metrics(),
             thrash: ThrashSampler::new(
                 "SparseCellSetDataset",
                 // The *affordable* count, not the requested one: on a large-shard
@@ -523,6 +545,12 @@ impl SparseCellSetDataset {
         dict.set_item("max_plan_rows", loader.max_plan_rows())?;
         dict.set_item("mean_nnz_per_row", loader.mean_nnz_per_row())?;
         dict.set_item("max_blocking_threads", loader.max_blocking_threads())?;
+        // Deliberately not folded into `breakdown`: the breakdown is the byte
+        // model the shard cache is sized against, and an open reader's cost is
+        // not in it. Charging readers there would shrink the cache by a term
+        // the tuner has never accounted for; reporting the cap here says what
+        // the knob is without pretending it is priced.
+        dict.set_item("reader_limit", loader.reader_limit())?;
         dict.set_item("budget_exceeded", loader.budget_exceeded())?;
         Ok(dict)
     }
@@ -537,6 +565,18 @@ impl SparseCellSetDataset {
     /// retains — `hits` … `duplicate_waiters` themselves keep meaning whole
     /// shards. All `int`; atomic, lock-free — sample as often as you like.
     ///
+    /// Four further keys describe the **reader registry** rather than the shard
+    /// cache: `reader_opens`, `reader_evictions`, `reader_resident` and
+    /// `reader_hwm`. They appear only here and on `SparseCellSetBatchIter`,
+    /// not on the single-file `IndexPlanDataset`, where they would be
+    /// structurally always zero. At the default `reader_limit=None`,
+    /// `reader_opens` equals the manifest size and the other three never move
+    /// — which is how you check that a dataset is paying nothing for the
+    /// bounded path. `reader_hwm` is the one to compare against `reader_limit`:
+    /// the limit bounds handles the registry is free to drop, so a plan that
+    /// leases more files at once than the limit exceeds it rather than
+    /// blocking, and this is where that shows up.
+    ///
     /// The last two are the **route** this dataset's gathers actually took:
     /// `block_index_groups > 0` proves the row-group path ran, and
     /// `full_shard_groups > 0` is the warm-into-the-LRU default. Opening an
@@ -547,13 +587,19 @@ impl SparseCellSetDataset {
     /// one is, never that a gather actually took the route.
     ///
     /// Since ORG-9.10-1 the prefetch half is visible too, through
-    /// `SparseCellSetBatchIter.metrics()["prefetch"]`. That is a different
+    /// `SparseCellSetBatchIter.metrics()["prefetch"]`, which since the reader
+    /// registry also carries `prefetch_skipped_reader_limit` — plans the
+    /// prefetcher declined because they touch more distinct files than
+    /// `reader_limit` can hold resident. That is a different
     /// signal, not a second reading of this one: it records what the
     /// *prefetcher* decided, and is all-zero when prefetching is off
     /// (`lookahead=0`) even though the gather still adopts the route. These
     /// counters remain the authority on which route ran.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        cache_metrics_to_pydict(py, &self.loader()?.cache_metrics())
+        let loader = self.loader()?;
+        let dict = cache_metrics_to_pydict(py, &loader.cache_metrics())?;
+        reader_metrics_into(&dict, &loader.reader_metrics())?;
+        Ok(dict)
     }
 
     /// Never raises, closed or not.
@@ -596,6 +642,8 @@ pub struct SparseCellSetBatchIter {
     /// no counters at all, so the sparse path's block-index adoption could only
     /// be inferred from the cache-side `block_index_groups`.
     iter_metrics: Arc<IterMetrics>,
+    /// Reader-registry counters, cloned for the same post-drain stability.
+    reader_metrics: Arc<crate::reader_registry::ReaderMetrics>,
     /// Samples `cache_metrics` as batches are yielded and warns once on thrash.
     thrash: ThrashSampler,
 }
@@ -635,7 +683,9 @@ impl SparseCellSetBatchIter {
     /// `SparseCellSetDataset.cache_metrics`). The flat, cache-only half of
     /// [`Self::metrics`], kept because it predates it; safe after exhaustion.
     fn cache_metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        cache_metrics_to_pydict(py, &self.cache_metrics)
+        let dict = cache_metrics_to_pydict(py, &self.cache_metrics)?;
+        crate::python::convert::reader_metrics_into(&dict, &self.reader_metrics)?;
+        Ok(dict)
     }
 
     /// Snapshot of cache- and prefetch-side counters as a dict-of-dicts,
@@ -649,7 +699,8 @@ impl SparseCellSetBatchIter {
     ///  "prefetch": {prefetch_tasks_spawned,
     ///               prefetch_skipped_cache_hit,
     ///               prefetch_skipped_in_flight,
-    ///               prefetch_skipped_block_index}}
+    ///               prefetch_skipped_block_index,
+    ///               prefetch_skipped_reader_limit}}
     /// ```
     ///
     /// `cache` is loader-cumulative (shared with
@@ -666,7 +717,9 @@ impl SparseCellSetBatchIter {
     /// construction, so this is safe after the iterator has been drained.
     fn metrics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
-        dict.set_item("cache", cache_metrics_to_pydict(py, &self.cache_metrics)?)?;
+        let cache = cache_metrics_to_pydict(py, &self.cache_metrics)?;
+        crate::python::convert::reader_metrics_into(&cache, &self.reader_metrics)?;
+        dict.set_item("cache", cache)?;
         dict.set_item("prefetch", iter_metrics_to_pydict(py, &self.iter_metrics)?)?;
         Ok(dict)
     }

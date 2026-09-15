@@ -59,13 +59,13 @@ use crate::header::{FileHeader, HEADER_SIZE};
 /// *only* the identity: no size, no timestamps — see the module docs for why
 /// those cannot carry the verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InodeIdentity {
+pub(crate) struct InodeIdentity {
     dev: u64,
     ino: u64,
 }
 
 impl InodeIdentity {
-    fn of(meta: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -123,6 +123,96 @@ impl CatalogIdentity {
             f.read_exact(&mut buf)?;
         }
         Ok(Self::of(&FileHeader::read_from(&mut Cursor::new(&buf))?))
+    }
+}
+
+/// A file's identity at a point in time, stamped without retaining a descriptor.
+///
+/// [`FreshnessGuard`] answers "has the file under this *open* reader changed",
+/// and keeps the descriptor open so its re-read is a single `pread`. A bounded
+/// reader registry asks a narrower question — "is the file I am about to
+/// *reopen* still the one I scanned?" — and wants to hold nothing at all
+/// between the two opens.
+///
+/// Not because a descriptor is scarce: an unwatched `ScxReader` holds none, and
+/// what a bounded registry reclaims is the parsed catalog, not an fd. The
+/// reason is that `watching()` is a property of the reader for its whole life —
+/// it would put a `stat` and a `pread` on every section read of the default
+/// path, to answer a question only a reopen asks. Same two fields and the same
+/// verdict as `check()`; only the descriptor differs, which is why this lives
+/// here rather than being re-derived by the caller from `header()` and a
+/// `stat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    inode: InodeIdentity,
+    catalog: CatalogIdentity,
+}
+
+impl FileIdentity {
+    /// Stamp the identity of a reader that is already open.
+    ///
+    /// **Both halves come from that one reader** — the inode it captured from
+    /// the `File` behind its mapping, and the header it parsed out of that same
+    /// mapping. Costs no syscall.
+    ///
+    /// The earlier form took `(&Path, &FileHeader)` and re-`stat`ed the path,
+    /// which is how a rename landing between the mmap and the stat could pair
+    /// one file's inode with another file's catalog — a hybrid stamp that a
+    /// later reopen of the *replacement* then matches. An API that accepts a
+    /// path and a header from unrelated sources cannot be used safely, so it is
+    /// gone rather than documented. **Review on #536 (codex - gpt-5.6-sol,
+    /// Cursor Agent, Antigravity).**
+    pub fn of(reader: &crate::reader::ScxReader) -> Self {
+        Self {
+            inode: reader.inode_identity(),
+            catalog: CatalogIdentity::of(reader.header()),
+        }
+    }
+
+    /// `Ok(())` when `now` names the same inode and the same catalog as `self`.
+    ///
+    /// The two clauses are not redundant: an in-place op (`append`, `rollback`)
+    /// keeps the inode and moves the catalog pointer, while a copy-out op
+    /// (`compact`, `sort`, `merge`) renames a new inode into place and may land
+    /// on any pointer at all. Timestamps and size decide neither — see the
+    /// module docs.
+    pub fn ensure_same(&self, path: &Path, now: &Self) -> Result<()> {
+        if now.inode != self.inode {
+            return Err(ScxError::FileChangedOnDisk {
+                path: path.display().to_string(),
+                detail: "was replaced on disk since it was first opened (a copy-out op such \
+                         as compact, sort or merge writes a new file and renames it into place)"
+                    .to_string(),
+            });
+        }
+        if now.catalog != self.catalog {
+            // The sequence counter is the usual mover, but it is not the only
+            // field compared: an op that rewrites in place without bumping it
+            // still moves the catalog pointer, and reporting
+            // "manifest_sequence 1 -> 1" for that sends the reader looking at
+            // the wrong thing. **Review on #536 (Antigravity).**
+            let detail = if self.catalog.manifest_sequence != now.catalog.manifest_sequence {
+                format!(
+                    "changed on disk since it was first opened (manifest_sequence {} \u{2192} {})",
+                    self.catalog.manifest_sequence, now.catalog.manifest_sequence
+                )
+            } else {
+                format!(
+                    "changed on disk since it was first opened (manifest_sequence unchanged at \
+                     {}, but the catalog moved: offset {} \u{2192} {}, length {} \u{2192} {})",
+                    self.catalog.manifest_sequence,
+                    self.catalog.full_catalog_offset,
+                    now.catalog.full_catalog_offset,
+                    self.catalog.full_catalog_length,
+                    now.catalog.full_catalog_length
+                )
+            };
+            return Err(ScxError::FileChangedOnDisk {
+                path: path.display().to_string(),
+                detail,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -200,9 +290,25 @@ impl FreshnessGuard {
         if catalog == self.catalog {
             return Ok(());
         }
+        // Same split as `FileIdentity::ensure_same`: the sequence counter is
+        // the usual mover but not the only field compared, and reporting
+        // "manifest_sequence 1 → 1" for an in-place rewrite that kept it sends
+        // the reader at the wrong field. **Review on #536 (Cursor Agent,
+        // Antigravity)** — the twin was fixed and this one left behind.
+        if self.catalog.manifest_sequence != catalog.manifest_sequence {
+            return Err(self.changed(format!(
+                "changed on disk since it was opened (manifest_sequence {} → {})",
+                self.catalog.manifest_sequence, catalog.manifest_sequence
+            )));
+        }
         Err(self.changed(format!(
-            "changed on disk since it was opened (manifest_sequence {} → {})",
-            self.catalog.manifest_sequence, catalog.manifest_sequence
+            "changed on disk since it was opened (manifest_sequence unchanged at {}, but the \
+             catalog moved: offset {} → {}, length {} → {})",
+            self.catalog.manifest_sequence,
+            self.catalog.full_catalog_offset,
+            catalog.full_catalog_offset,
+            self.catalog.full_catalog_length,
+            catalog.full_catalog_length
         )))
     }
 

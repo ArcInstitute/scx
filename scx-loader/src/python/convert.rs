@@ -14,6 +14,25 @@ use scx_format_io::CacheMetrics;
 use crate::batch::ObsColumn;
 use crate::plan_engine::IterMetrics;
 
+/// Add the reader-registry counters to an existing `cache_metrics()` dict.
+///
+/// A separate function, and a separate call, rather than four more lines inside
+/// [`cache_metrics_to_pydict`]: that one is shared by five Python surfaces,
+/// including the single-file `IndexPlanDataset`, which has no registry and
+/// would gain four keys that are always zero. A key that can only ever read
+/// zero is worse than no key — it invites a reader to conclude the registry
+/// never opened anything.
+pub(super) fn reader_metrics_into(
+    dict: &Bound<'_, PyDict>,
+    m: &crate::reader_registry::ReaderMetrics,
+) -> PyResult<()> {
+    dict.set_item("reader_opens", m.opens.load(Ordering::Relaxed))?;
+    dict.set_item("reader_evictions", m.evictions.load(Ordering::Relaxed))?;
+    dict.set_item("reader_resident", m.resident.load(Ordering::Relaxed))?;
+    dict.set_item("reader_hwm", m.hwm.load(Ordering::Relaxed))?;
+    Ok(())
+}
+
 /// Encode `CacheMetrics` (atomic counters from `BackedCsrReader`) as a Python
 /// dict of `int` keys. Counters are loaded with `Relaxed` ordering — values
 /// are statistical and not used for synchronization on the Python side.
@@ -86,6 +105,10 @@ pub(super) fn iter_metrics_to_pydict<'py>(
     dict.set_item(
         "prefetch_skipped_block_index",
         m.prefetch_skipped_block_index.load(Ordering::Relaxed),
+    )?;
+    dict.set_item(
+        "prefetch_skipped_reader_limit",
+        m.prefetch_skipped_reader_limit.load(Ordering::Relaxed),
     )?;
     Ok(dict)
 }

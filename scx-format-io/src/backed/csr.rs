@@ -637,7 +637,9 @@ impl BackedCsrReader {
     /// framed shard; reads only shard headers and block indexes (no payload),
     /// memoized per shard via `framed_layout`.
     pub fn any_shard_framed(&self) -> bool {
-        (0..self.shard_count()).any(|i| self.shard_is_framed(i))
+        // Delegated so there is exactly one answer to this question, reachable
+        // from a bare `ScxReader` too — see `ScxReader::any_csr_shard_framed`.
+        self.reader.any_csr_shard_framed()
     }
 
     /// Live count cap on the decoded-shard LRU. `0` means no cache was
@@ -691,6 +693,15 @@ impl BackedCsrReader {
     /// Access the underlying shard index.
     pub fn index(&self) -> &BackedCsrIndex {
         &self.index
+    }
+
+    /// The path the wrapped reader was opened from.
+    ///
+    /// Exists for callers that must be able to *reopen* this file later — a
+    /// bounded reader registry that evicts handles to reclaim the parsed
+    /// catalog has nothing else to reopen from once the handle is gone.
+    pub fn path(&self) -> &std::path::Path {
+        self.reader.path()
     }
 
     /// Get the lightweight catalog row for a shard by index.

@@ -642,7 +642,16 @@ class TestMetrics:
             "prefetch_skipped_cache_hit",
             "prefetch_skipped_in_flight",
             "prefetch_skipped_block_index",
+            # Present here and always zero: this class is single-file, so its
+            # registry is unbounded and no plan can ever exceed the cap. It
+            # stays in the shared dict because both loaders drive the same
+            # `PlanPrefetchIter` and the counter is a property of that iterator,
+            # not of the dataset class — unlike the `reader_*` keys on
+            # `cache_metrics()`, which `IndexPlanDataset` deliberately lacks
+            # because it has no registry to report on at all.
+            "prefetch_skipped_reader_limit",
         }
+        assert m["prefetch"]["prefetch_skipped_reader_limit"] == 0
         assert set(m["cache"]) == {
             "hits",
             "misses",
