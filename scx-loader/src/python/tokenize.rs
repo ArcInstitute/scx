@@ -8,6 +8,16 @@
 //! Buffers are **moved** into numpy (`PyArray1::from_vec` adopts the
 //! allocation), so nothing is copied at the boundary.
 //!
+//! # Every rayon closure here must use an `_init` variant
+//!
+//! The kernels take reusable scratch precisely so they allocate nothing per row.
+//! A `map`/`for_each` closure that creates its buffers inside itself puts every
+//! one of those allocations straight back, per cell, and nothing fails — the
+//! output is identical and only the wall moves. That happened here once, in
+//! three of the four kernels, and was caught by reading the code rather than by
+//! a test, because a per-row allocation has no observable behaviour to assert.
+//! `map_init` / `for_each_init` create the buffers once per worker; use them.
+//!
 //! The crop is exposed here without the withheld-gene masking that
 //! `collate_cellset_gathered` layers on it: the mask is STATE3's query-panel
 //! contract, not a property of a top-K crop, and duplicating its plumbing on a
@@ -227,24 +237,29 @@ fn rank_tokens<'py>(
             ids.par_chunks_mut(l_max)
                 .zip(lengths.par_iter_mut())
                 .enumerate()
-                .map(|(r, (slot, len))| {
-                    let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
-                    let mut scratch = (Vec::new(), Vec::new());
-                    let n = rank::rank_tokens(
-                        CsrRow {
-                            gene_ids: &indices[lo..hi],
-                            values: &data[lo..hi],
-                        },
-                        &norm,
-                        target_sum,
-                        &mut scratch.0,
-                        &mut scratch.1,
-                        slot,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    *len = n as u32;
-                    Ok(())
-                })
+                // `map_init`, not `map`: the kernel takes reusable scratch so it
+                // allocates nothing per row, and creating the buffers inside the
+                // closure would put the allocations straight back.
+                .map_init(
+                    || (Vec::new(), Vec::new()),
+                    |(order, values), (r, (slot, len))| {
+                        let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
+                        let n = rank::rank_tokens(
+                            CsrRow {
+                                gene_ids: &indices[lo..hi],
+                                values: &data[lo..hi],
+                            },
+                            &norm,
+                            target_sum,
+                            order,
+                            values,
+                            slot,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        *len = n as u32;
+                        Ok(())
+                    },
+                )
                 .collect()
         })
     });
@@ -306,19 +321,24 @@ fn bin_values<'py>(
         ),
         None => None,
     };
-    let make_tie = |row: u64| match tie {
-        "left" => Ok(BinTie::Left),
-        "right" => Ok(BinTie::Right),
-        "seeded" => Ok(BinTie::SeededUniform {
-            seed,
-            file_identity,
-            row,
-        }),
-        other => Err(PyValueError::new_err(format!(
-            "unknown tie {other:?} (expected \"left\", \"right\" or \"seeded\")"
-        ))),
+    // Parsed once. An earlier version validated the string here and then
+    // re-matched it per row with a `_ => Left` arm, which would have turned a
+    // future fourth spelling into a silent Left instead of an error.
+    enum TieKind {
+        Left,
+        Right,
+        Seeded,
+    }
+    let kind = match tie {
+        "left" => TieKind::Left,
+        "right" => TieKind::Right,
+        "seeded" => TieKind::Seeded,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown tie {other:?} (expected \"left\", \"right\" or \"seeded\")"
+            )))
+        }
     };
-    make_tie(0)?;
 
     let mut bins = vec![0i64; data.len()];
     let out: Result<(), String> = py.detach(|| {
@@ -329,16 +349,19 @@ fn bin_values<'py>(
             split_by_spans(&mut bins, &spans)
                 .into_par_iter()
                 .enumerate()
-                .map(|(r, slot)| {
+                // Per-worker edge buffer: the quantile path sorts the row's
+                // non-zeros into it, so a fresh `Vec` per row would allocate on
+                // every cell.
+                .map_init(Vec::new, |buf, (r, slot)| {
                     let (lo, hi) = spans[r];
-                    let t = match tie {
-                        "right" => BinTie::Right,
-                        "seeded" => BinTie::SeededUniform {
+                    let t = match kind {
+                        TieKind::Left => BinTie::Left,
+                        TieKind::Right => BinTie::Right,
+                        TieKind::Seeded => BinTie::SeededUniform {
                             seed,
                             file_identity,
                             row: keys[r],
                         },
-                        _ => BinTie::Left,
                     };
                     bin::bin_values(
                         &data[lo..hi],
@@ -348,7 +371,7 @@ fn bin_values<'py>(
                         },
                         n_bins,
                         t,
-                        &mut Vec::new(),
+                        buf,
                         slot,
                     )
                     .map_err(|e| e.to_string())
@@ -414,7 +437,8 @@ fn sample_genes<'py>(
             ids.par_chunks_mut(n)
                 .zip(lengths.par_iter_mut())
                 .enumerate()
-                .map(|(r, (slot, len))| {
+                // Per-worker CDF buffer; see `rank_tokens` above.
+                .map_init(Vec::new, |buf, (r, (slot, len))| {
                     let (lo, hi) = (indptr[r] as usize, indptr[r + 1] as usize);
                     let drawn = sample::sample_genes(
                         CsrRow {
@@ -425,7 +449,7 @@ fn sample_genes<'py>(
                         seed,
                         file_identity,
                         keys[r],
-                        &mut Vec::new(),
+                        buf,
                         slot,
                     )
                     .map_err(|e| e.to_string())?;
