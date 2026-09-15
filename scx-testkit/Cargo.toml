@@ -1,6 +1,6 @@
 [package]
 name = "scx-testkit"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2021"
 description = "Test-only harness for asserting SCX output identity across refactors"
 license.workspace = true
