@@ -34,7 +34,7 @@ use crate::sparse_cellset::validate_indptr;
 use crate::sparse_cellset_collate::PreprocessMode;
 use crate::tokenize::bin::{BinEdges, BinTie};
 use crate::tokenize::sample::WeightTransform;
-use crate::tokenize::{bin, crop, rank, sample, transform, CsrRow};
+use crate::tokenize::{bin, check_row_ids, crop, rank, sample, transform, CsrRow};
 
 use super::*;
 
@@ -73,50 +73,6 @@ fn rows_of<'a>(
         data,
         n_rows,
     })
-}
-
-/// Check one row's gene ids against the invariant [`CsrRow`] documents.
-///
-/// `CsrRow`'s doc says the kernels rely on ids being sorted ascending, unique
-/// and in range, and that they "do not re-verify it, because the verification
-/// would cost more than the kernels do". That was measured against the wrong
-/// thing: this entry takes **arbitrary numpy arrays**, and `scipy.sparse` does
-/// not sort its indices until you call `sort_indices()`. Three reproduced
-/// consequences, all on ordinary input:
-///
-/// * `rank_tokens` on `[-1, 2]` — `-1i32 as usize` wraps and indexes the
-///   statistics vector out of bounds, panicking across the FFI;
-/// * `rank_tokens` on an unsorted `[7, 1]` against a 3-gene vocabulary — same
-///   panic, because a last-element bounds check cannot see the 7;
-/// * `measured_mask` on an unsorted `[0, 2, 1]` — no panic, a silently wrong
-///   mask, which is worse.
-///
-/// So the check happens, once, at the public entry. It runs inside each
-/// kernel's existing per-row closure where the row is already in cache, so it
-/// costs one pass over data the kernel is about to read anyway.
-#[inline]
-fn check_row_ids(ids: &[i32], vocab: Option<usize>, what: &str) -> Result<(), String> {
-    let mut prev: i32 = -1;
-    for &g in ids {
-        if g < 0 {
-            return Err(format!("{what}: gene id {g} is negative"));
-        }
-        if g <= prev {
-            return Err(format!(
-                "{what}: gene ids must be strictly ascending within a row (saw {prev} then {g}); \
-                 call `sort_indices()` on a scipy CSR first"
-            ));
-        }
-        if let Some(n) = vocab {
-            if g as usize >= n {
-                return Err(format!(
-                    "{what}: gene id {g} is outside the vocabulary of size {n}"
-                ));
-            }
-        }
-        prev = g;
-    }
-    Ok(())
 }
 
 /// Per-row keys for the seeded kernels.

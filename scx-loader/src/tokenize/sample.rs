@@ -27,10 +27,16 @@
 //! idx = cdf.searchsorted(random_sample(size), side="right")
 //! ```
 //!
-//! This kernel does the same three steps in `f64`, so for a given sequence of
-//! uniforms it selects the same genes. That is the strongest structural match
-//! available, and it is why the parity test is distributional (expected counts
-//! at large N) rather than element-wise.
+//! This kernel does the same three steps, so the algorithm and the distribution
+//! match, which is why the parity test is distributional (expected counts at
+//! large N) rather than element-wise.
+//!
+//! ⚠️ It does **not** follow that the same uniforms select the same genes. UCE
+//! normalises its weights in **float32** (torch's `log1p` on an int64 tensor
+//! returns float32, and numpy widens `p` only for the cumsum) while this kernel
+//! accumulates in `f64`, so a uniform landing on a CDF boundary can select an
+//! adjacent gene. An earlier version of this comment claimed the stronger
+//! property; `docs/tokenize.md` carries the measurement.
 //!
 //! # Seeding
 //!

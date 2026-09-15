@@ -232,3 +232,13 @@ def test_passthrough_array_lengths_are_checked():
         _raw(file_ids=np.zeros(5, dtype=np.uint32))
     with pytest.raises(Exception, match="role_tags"):
         _raw(role_tags=np.zeros(5, dtype=np.int32))
+
+
+def test_collate_rejects_a_non_positive_vocabulary():
+    # The twin of `pyscx.tokenize.top_k`'s guard: `n_genes_total` fixes the
+    # sentinels, and the per-row id check never runs on an empty row, so a
+    # negative vocabulary emitted `[-5, -4]` as tokens.
+    with pytest.raises(Exception, match="n_genes_total must be >= 1"):
+        _raw(n_genes=-5)
+    with pytest.raises(Exception, match="n_genes_total must be >= 1"):
+        _raw(n_genes=0)

@@ -1123,10 +1123,12 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // accepts `query_offsets`, under which `query_gene_ids` becomes ragged,
     // `n_measured` becomes per-row and `enc_mask_positions` becomes parallel to
     // the ragged query rather than `k_dec`-strided. Every v2 call shape — i.e.
-    // `query_offsets` omitted — produces byte-identical output, so only the
-    // assertion moves. The batch also gained a `target_pad_mask` key, which the
-    // per-set path fills with zeros; it is what keeps a padded target slot
-    // distinguishable from a real zero once queries can be ragged.
+    // `query_offsets` omitted — reproduces every **pre-existing field** byte for
+    // byte. The returned dict is NOT identical: it gained a `target_pad_mask`
+    // key on every path (all zeros on the per-set one), which is what keeps a
+    // padded target slot distinguishable from a real zero once queries can be
+    // ragged. A consumer that unpacks named keys is unaffected; one that asserts
+    // an exact key set is not, and that is part of what the bump is for.
     m.add("COLLATE_CELLSET_CONTRACT_VERSION", 3u32)?;
 
     // Build profile ("release" / "debug"). Benchmarks MUST run against a

@@ -3989,17 +3989,20 @@ absolute_floors:
 #     `cellset_gather` rows at all (the same blocker as item 15, which is still
 #     open for `us_per_cell__collate` and stays open).
 #
-#     Two of the four arms are ALSO fixture-gated, and that is reported per arm
-#     rather than silently skipped — `metadata.tokenize.arms.<arm>` carries
+#     ONE of the four arms is fixture-gated, and that is reported per arm rather
+#     than silently skipped — `metadata.tokenize.arms.<arm>` carries
 #     `{"applicable": false, "reason": ...}`:
 #       * `bin` needs at least two distinct non-zero values in every probed row,
 #         or every quantile edge collapses onto one value and the arm times the
 #         degenerate branch instead of the interpolation.
-#       * `sample` needs median nnz/cell above `n` (1024, UCE's sample_size), or
-#         the draw covers essentially the whole row.
-#     pbmc3k is the fixture most likely to silence `sample`; tabula (~1950
-#     nnz/cell) should carry all four. Whether it does is a measurement this
-#     entry does not pre-empt.
+#
+#     `sample` was gated the same way — median nnz/cell above `n` (1024, UCE's
+#     sample_size) — and that gate is DELETED. Its stated reason, "the draw would
+#     cover essentially the whole row", is an argument about sampling WITHOUT
+#     replacement; this kernel samples WITH replacement, as UCE does, so repeats
+#     are the expected output, the inverse-CDF search is O(n log nnz) either way,
+#     and a shallow cell is a real workload rather than a degenerate one. It had
+#     suppressed pbmc3k's number for a reason that did not apply.
 #
 #     One premise is deliberately NOT gated, because gating it would assert
 #     something false: the crop does not get more expensive when it truncates.

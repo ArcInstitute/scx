@@ -60,8 +60,16 @@ pub const TOKENIZE_CONTRACT_VERSION: u32 = 1;
 /// `gene_ids` is **sorted ascending and unique** — what `remap_row`
 /// (`sparse_cellset.rs`) produces, mirroring state3's `finalize_csr_row`. Kernels
 /// rely on it for exact-match binary search and for the gene-id tiebreak being a
-/// total order; they do not re-verify it, because the verification would cost
-/// more than the kernels do.
+/// total order.
+///
+/// It **is** verified, at every public boundary, by [`check_row_ids`]. An
+/// earlier version of this comment said the kernels do not re-verify it
+/// "because the verification would cost more than the kernels do" — measured
+/// against the wrong thing, since these entries take arbitrary numpy arrays and
+/// `scipy.sparse` does not sort its indices until `sort_indices()`. Unverified,
+/// it produced an out-of-bounds panic in `rank_tokens` and a silently wrong mask
+/// in `measured_mask`. The check runs inside each caller's existing per-row
+/// loop, where the row is already in cache.
 #[derive(Clone, Copy)]
 pub struct CsrRow<'a> {
     pub gene_ids: &'a [i32],
@@ -78,6 +86,50 @@ impl<'a> CsrRow<'a> {
     pub fn is_empty(&self) -> bool {
         self.gene_ids.is_empty()
     }
+}
+
+/// Check one row's gene ids against the invariant [`CsrRow`] documents.
+///
+/// `vocab` is the exclusive upper bound when the caller has one, and it means
+/// different things per caller — for `rank_tokens` it is the length of the
+/// normalisation statistics vector; for the crop and the collator it is
+/// `n_genes_total`, which IS the `GENE_MASK` token, so an id at or above it
+/// would emit a real gene indistinguishable from a sentinel. The message stays
+/// generic for that reason and the caller's `what` supplies the context; an
+/// earlier version hard-coded "which is the GENE_MASK token", which is simply
+/// false on the rank path.
+///
+/// One function, called from both public CSR boundaries (`pyscx.tokenize`'s
+/// entries and `collate_gathered`). They had a copy each for one commit, which
+/// is how the asymmetry that let `collate_gathered` mis-answer on an unsorted
+/// row got in; a third copy at the next boundary would do it again.
+#[inline]
+pub(crate) fn check_row_ids(
+    ids: &[i32],
+    vocab: Option<usize>,
+    what: &str,
+) -> std::result::Result<(), String> {
+    let mut prev: i32 = -1;
+    for &g in ids {
+        if g < 0 {
+            return Err(format!("{what}: gene id {g} is negative"));
+        }
+        if g <= prev {
+            return Err(format!(
+                "{what}: gene ids must be strictly ascending within a row (saw {prev} then {g}); \
+                 call `sort_indices()` on a scipy CSR first"
+            ));
+        }
+        if let Some(n) = vocab {
+            if g as usize >= n {
+                return Err(format!(
+                    "{what}: gene id {g} is outside the vocabulary of size {n}"
+                ));
+            }
+        }
+        prev = g;
+    }
+    Ok(())
 }
 
 /// Per-thread reusable buffers for the collate path's kernel chain.

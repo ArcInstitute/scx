@@ -2664,7 +2664,7 @@ fn collate_gathered_refuses_a_gene_id_that_would_collide_with_gene_mask() {
     )
     .unwrap_err();
     assert!(
-        err.to_string().contains("GENE_MASK"),
+        err.to_string().contains("outside the vocabulary"),
         "unexpected error: {err}"
     );
 }

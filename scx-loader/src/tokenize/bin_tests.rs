@@ -387,3 +387,31 @@ fn reusing_one_buffer_across_rows_is_not_observable() {
         assert_eq!(fresh, reused);
     }
 }
+
+#[test]
+fn tie_right_maps_the_minimum_to_bin_zero_and_that_is_numpy() {
+    // Documented rather than "fixed": `np.digitize(x, bins, right=True)` counts
+    // edges strictly less than x, so a value equal to `edges[0]` — on the
+    // quantile path, the row's own minimum — returns 0, colliding with the
+    // reserved unexpressed bin. `Right` is one of the two BOUNDS the reference
+    // interpolates between, not a production tie rule; `Left` and
+    // `SeededUniform` both keep the [1, n_bins - 1] invariant.
+    let vals = [1.0f32, 2.0, 5.0, 11.0];
+    assert_eq!(run(&vals, 6, BinTie::Right)[0], 0, "numpy's own answer");
+    assert!(run(&vals, 6, BinTie::Left)[0] >= 1);
+    for row in 0..32u64 {
+        let seeded = run_at(
+            &vals,
+            6,
+            BinTie::SeededUniform {
+                seed: 1,
+                file_identity: 2,
+            },
+            row,
+        );
+        assert!(
+            seeded[0] >= 1,
+            "the seeded tiebreak must never emit the reserved bin for a positive value"
+        );
+    }
+}

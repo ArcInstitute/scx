@@ -107,7 +107,8 @@ by zero on them.
 
 ### `bin_values`
 
-Bins each row's expressed values into `[1, n_bins - 1]`, leaving zeros at 0.
+Bins each row's expressed values into `[1, n_bins - 1]` (see the `tie="right"`
+caveat below), leaving zeros at 0.
 `edges=None` recomputes per-cell quantile edges for every row, as scGPT's
 `Preprocessor` does; supplying `edges` pins them corpus-wide, in which case they
 become part of the tokeniser's identity and must be recorded with it. Explicit
@@ -127,6 +128,21 @@ Computing the edges in `f32` gives different answers.
 `tie="seeded"`, pass `seed`, `file_identity` and the file's physical row ids in
 `rows`, exactly as for [`sample_genes`](#sample_genes); the default keys on the
 row's position in this batch and is reproducible only for this batch.
+
+A positive value **below** the first edge is refused rather than binned: it would
+digitize to 0, and bin 0 is reserved for unexpressed genes. That cannot arise on
+the quantile path (`edges[0]` *is* the row minimum) and is entirely a property of
+a caller-supplied edge set that does not cover its data. Refused rather than
+clamped, because merging a 0.5 into the same token as a 1.5 changes training
+without saying so.
+
+⚠️ **`tie="right"` does not keep the `[1, n_bins - 1]` invariant, by
+construction.** It is `np.digitize(x, bins, right=True)`, which counts edges
+strictly less than `x`, so a value *equal* to `edges[0]` — on the quantile path,
+the row's own minimum — returns **0**, colliding with the reserved bin. That is
+numpy's behaviour and the goldens pin it (`expected_right` starts at 0). `Right`
+exists to be the lower of the two bounds the reference interpolates between, not
+as a production tie rule; use `"left"` or `"seeded"` for tokeniser output.
 
 ### `sample_genes`
 

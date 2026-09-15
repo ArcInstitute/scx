@@ -886,8 +886,8 @@ def _tokenize_inputs(
     produce a number. Same rule as the collate arm's all-zero-mask guard.
 
     **A property of the fixture ⇒ report, and skip that arm.** Whether a file's
-    cells carry more non-zeros than `n`, or more than one distinct value per
-    row, is not something this arm can arrange. `_downsample_supported` already
+    cells carry more than one distinct value per row is not something this arm
+    can arrange. `_downsample_supported` already
     set the precedent of gathering a real batch to learn whether the fixture is
     deep enough; the difference is that these are per-kernel, so one thin
     fixture silences one arm rather than all four.
