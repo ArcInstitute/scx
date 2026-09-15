@@ -3219,6 +3219,89 @@ distinguish 1.00× from 1.01×. The claim this supports is the one the gate aske
 for — the seam costs nothing a consumer would notice at the default — not that
 the two builds are identical instruction for instruction.
 
+### Tokenisation kernels: what each per-cell step costs (phase 3)
+
+The W6 kernel set (`pyscx.tokenize`) is the per-cell numerics every
+transformer-class model re-implements in Python — rank, bin, top-K crop,
+expression-weighted sampling. These are their first captured numbers.
+
+Two-build A/B, SLURM `2953087`, host `GPU3694`, `main` `e8d1f9a9` against
+`phase3-tokenize-kernels` `8844fd35`, 12 interleaved rounds per dataset,
+`RAYON_NUM_THREADS=16`. Raw rows under
+`results/raw/phase3_tokenize/tokenize_ab.json`.
+
+#### The existing collate arm, which had to stay flat
+
+The top-K crop moved out of `collate_cell` into `tokenize::crop::top_k`, and the
+kernel now takes reusable scratch instead of allocating three `Vec`s per cell.
+The crop is byte-identical — the cross-repo `encoder_crop_golden.json` is
+unchanged and green — so only the wall could move, in either direction: the
+scratch removes allocations, the call boundary adds one. Flat was the expected
+result; a move in either direction was to be reported, not budgeted for.
+
+| metric | pbmc3k | tabula_sapiens_100k |
+|---|---|---|
+| `us_per_cell__collate` | **1.07× (12/12, p 0.000)** | 1.02× (8/12, p 0.388) |
+| `cellsets_per_sec__collate_rust` | **1.07× (12/12, p 0.000)** | 1.02× (8/12, p 0.388) |
+| `cellsets_per_sec__gather_random` | 1.02× (8/12, p 0.388) | 1.01× (6/12, p 1.000) |
+| `cellsets_per_sec__gather_grouped` | 0.971× (5/12, p 0.774) | 1.03× (9/12, p 0.146) |
+| `cellsets_per_sec__gather_random_s512` | 0.993× (5/12, p 0.774) | 0.934× (4/12, p 0.388) |
+| `cellsets_per_sec__gather_grouped_s512` | 0.981× (5/12, p 0.774) | 1.03× (8/12, p 0.388) |
+
+Ratios are oriented so > 1 means the change helped. The collate arm came out
+**better than flat on pbmc3k** — 14.2 → 13.25 µs/cell, every one of twelve
+rounds — and within noise on tabula (23.46 → 22.89). The three removed
+allocations per cell more than pay for the new call boundary, and they are worth
+proportionally more where cells are shallow, which is what the pbmc3k/tabula
+split shows. All four gather arms are "no reliable difference", as they must be:
+this change does not touch the gather.
+
+⚠️ **One row is a good argument for the paired design.** `gather_grouped` on
+pbmc3k reads 9857 → 6556 in the *median-of-rounds* columns while its
+within-round ratio is 0.971× at p 0.774. That arm's between-round variance
+swamps any effect of the change; an unpaired table would have published a 33 %
+regression that is not there. Phase 1 hit the same trap in the other direction
+and it is why every loader A/B since has been paired and sign-tested.
+
+#### Per-kernel cost, first capture
+
+Each kernel timed alone over the same gathered batches, at the shapes the models
+actually use: `k = 2048` (STATE3 / Geneformer v2), `l_max = 2048`,
+`n_bins = 51` (scGPT), `n = 1024` (UCE's `sample_size`).
+
+| kernel | pbmc3k µs/cell | tabula µs/cell |
+|---|---|---|
+| `crop` (top-K) | 8.36 (8.01–9.78) | 17.48 (16.16–17.61) |
+| `rank` (Geneformer-style) | 12.11 (11.41–12.26) | 28.12 (26.44–28.64) |
+| `bin` (scGPT-style) | 4.25 (4.03–5.69) | 7.32 (7.04–8.13) |
+| `sample` (UCE-style) | — *not applicable* | 8.22 (7.71–8.64) |
+| `collate` (the whole STATE3 chain) | 13.25 | 22.89 |
+
+Median over 12 rounds, min–max in brackets.
+
+**`sample` is absent on pbmc3k on purpose, and the reason is the number.**
+pbmc3k's median cell carries **817** non-zeros against UCE's `n = 1024`, so a
+draw of 1024 genes would cover essentially the whole row and the inverse-CDF
+search would not be representative of what the kernel does on real data. The arm
+reports itself not applicable with that reason recorded in the capture rather
+than emitting a number over the wrong shape. tabula's median cell carries 1699
+and clears it.
+
+**What these numbers are not.** They are a first capture, and **no floor is
+proposed from them** — `thresholds.yaml`'s deferred item 22 records what would
+have to be true to author one, and the same blocker that has kept the collate
+arm's floors deferred since PR-02c applies: no baseline carries `cellset_gather`
+rows at all. They are also not a claim about any model's end-to-end tokenise
+time, which depends on that model's own sequence assembly, special tokens and
+masking — all of which stay with the consumer.
+
+One shape worth reading off the table rather than inferring: the crop's cost
+tracks nnz, not `k`. pbmc3k fills 40 % of a 2048-wide crop and tabula 83 %, and
+the costs are 8.4 and 17.5 µs — roughly proportional to the 817 and 1699
+non-zeros being sorted, not to the constant output width. That is why the crop
+arm does not assert that it truncates: truncation makes it cheaper, and at these
+shapes it does not truncate at all.
+
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
 The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered

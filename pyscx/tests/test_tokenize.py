@@ -425,11 +425,44 @@ def test_outputs_carry_the_declared_dtypes():
 # ---------------------------------------------------------------------------
 
 
+# Sized so every kernel clears MIN_MEASURABLE_S **on a release build**.
+#
+# This is the whole trap, and it caught this file once: sized against a
+# `maturin develop` debug `.so` the batch looked ample, and the moment a
+# `--release` build was installed (4-10x faster) three of the four arms started
+# reporting "too fast to measure" and skipping — passing tests that had stopped
+# testing anything. Measured on release at 6,000 x 600: rank 45.5 ms, sample
+# 28.8 ms, bin 20.4 ms, all under the 50 ms floor.
+#
+# At 24,000 x 600 on the same build every kernel clears it with margin:
+# top_k 254 ms (5.1x), rank 186 ms (3.7x), sample 118 ms (2.4x), bin 92 ms
+# (1.8x). `bin` is the tightest and is the one to re-check if a future build
+# gets materially faster.
+#
+# The gene ids are a per-row contiguous run rather than a random draw, which is
+# sorted and unique by construction and builds in one vectorised step instead of
+# 24,000 `rng.choice(replace=False)` calls. This is a GIL-release property test,
+# not a numerics test — the kernels' semantics are pinned by the goldens and the
+# unit tests above — so a structured batch is the right fixture here.
+GIL_N_ROWS = 24_000
+GIL_NNZ = 600
+GIL_N_GENES = 20_000
+
+
 @pytest.fixture(scope="module")
 def big_batch():
-    # Sized so each kernel clears MIN_MEASURABLE_S; a batch too small skips on
-    # every run and reads as coverage.
-    return random_csr(6000, n_genes=20_000, nnz_per_row=600, seed=99)
+    indptr = np.arange(0, GIL_N_ROWS * GIL_NNZ + 1, GIL_NNZ, dtype=np.int64)
+    starts = (np.arange(GIL_N_ROWS) * 7) % (GIL_N_GENES - GIL_NNZ)
+    indices = (starts[:, None] + np.arange(GIL_NNZ)).astype(np.int32).ravel()
+    # The VALUES must be random, and that is not cosmetic: every one of these
+    # kernels sorts or searches on them, and an ascending `arange` hands the
+    # crop's and the rank's comparator an already-ordered input. Tried it — the
+    # measured cost fell instead of rising with the batch size, which is the
+    # measurement quietly changing subject. Distinct within a row either way, so
+    # the bin kernel still takes the interpolation branch.
+    rng = np.random.default_rng(99)
+    data = rng.integers(1, 4000, size=GIL_N_ROWS * GIL_NNZ).astype(np.float32)
+    return indptr, indices, data
 
 
 @pytest.mark.parametrize(
@@ -438,9 +471,9 @@ def big_batch():
 )
 def test_kernels_release_the_gil(big_batch, name):
     indptr, indices, data = big_batch
-    stats = np.ones(20_000, dtype=np.float32)
+    stats = np.linspace(0.5, 1.5, GIL_N_GENES).astype(np.float32)
     ops = {
-        "top_k": lambda: tok.top_k(indptr, indices, data, 2048, 20_000),
+        "top_k": lambda: tok.top_k(indptr, indices, data, 2048, GIL_N_GENES),
         "rank_tokens": lambda: tok.rank_tokens(indptr, indices, data, stats, 2048, "v"),
         "bin_values": lambda: tok.bin_values(indptr, indices, data, 51),
         "sample_genes": lambda: tok.sample_genes(indptr, indices, data, 1024, 1, 2),

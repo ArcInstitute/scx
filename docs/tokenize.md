@@ -109,7 +109,10 @@ happens on the widened values and `np.digitize` then compares in `f64`.
 Computing the edges in `f32` gives different answers.
 
 `tie` decides where a value sitting exactly on an edge lands — see
-[Divergences](#divergences-from-the-reference-implementations) below.
+[Divergences](#divergences-from-the-reference-implementations) below. With
+`tie="seeded"`, pass `seed`, `file_identity` and the file's physical row ids in
+`rows`, exactly as for [`sample_genes`](#sample_genes); the default keys on the
+row's position in this batch and is reproducible only for this batch.
 
 ### `sample_genes`
 

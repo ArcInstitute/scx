@@ -313,6 +313,15 @@ fn bin_values<'py>(
         ..
     } = rows_of(&indptr, &indices, &data)?;
     let keys = row_keys(rows, n_rows)?;
+    // Checked here as well as in the kernel: on an empty batch the kernel never
+    // runs, so an invalid `n_bins` would be silently accepted. The repo's rule
+    // is that a guard belongs at the public entry, and `top_k` / `rank_tokens` /
+    // `sample_genes` all validate their width here too.
+    if n_bins < 3 {
+        return Err(PyValueError::new_err(format!(
+            "n_bins must be >= 3, got {n_bins}"
+        )));
+    }
     let edge_owner = edges;
     let fixed: Option<&[f64]> = match edge_owner.as_ref() {
         Some(e) => Some(
