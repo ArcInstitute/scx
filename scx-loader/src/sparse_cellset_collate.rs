@@ -74,8 +74,11 @@
 //!   downsample.
 //! - **v3** = per-row query addressing (`query_offsets`, with per-row
 //!   `n_measured` and a ragged `enc_mask_positions`) plus the `target_pad_mask`
-//!   output. A call that omits `query_offsets` produces byte-identical output
-//!   to v2's.
+//!   output. A call that omits `query_offsets` produces byte-identical values
+//!   in every **pre-existing field**; the returned payload is not identical,
+//!   because `target_pad_mask` is a new key on every path (all zeros on the
+//!   per-set one). A consumer that unpacks named keys is unaffected; one that
+//!   asserts an exact key set is not.
 
 use crate::error::{LoaderError, Result};
 use crate::tokenize::crop::{self, CropConfig, CropIn, CropOut};

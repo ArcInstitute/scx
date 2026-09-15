@@ -35,7 +35,7 @@ use serde_json::Value;
 const CROP_GOLDEN_BLAKE3_PREFIX: &str = "1090c3a399faff12";
 const RANK_GOLDEN_BLAKE3_PREFIX: &str = "f88fb644184ccf45";
 const BIN_GOLDEN_BLAKE3_PREFIX: &str = "13fbb730650b0161";
-const SAMPLE_REFERENCE_BLAKE3_PREFIX: &str = "2183e1f46dc3c5e7";
+const SAMPLE_REFERENCE_BLAKE3_PREFIX: &str = "433b88a490be730c";
 
 /// Read a golden and assert its bytes have not drifted.
 fn load(name: &str, expect_prefix: &str) -> Value {

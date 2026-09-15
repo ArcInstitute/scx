@@ -241,18 +241,23 @@ steps in `f64`. Its parity test is therefore distributional: empirical
 frequencies against a reconstruction of the reference's normalised weights at
 large N.
 
-⚠️ **Weight precision is an open question, not a settled match.** UCE builds its
-weights through torch, so if the counts are `float32` then `torch.log1p` and the
-`/ torch.sum(...)` are too, and numpy's `choice` widens `p` to `float64` only
-for the cumsum. That would move CDF boundaries relative to the `f64` arithmetic
-this kernel uses, so "the same uniforms select the same genes" holds for the
-algorithm but not necessarily for a value sitting exactly on a boundary. A
-`float32` reconstruction was tried and produced a `p` that numpy's own `choice`
-would **reject** — off by ~1e-7 against its 1.49e-8 tolerance — which says the
-reconstruction is wrong about UCE rather than that UCE is broken. Settling it
-needs a run of the real package, which is not installable here. The committed
-`sample_reference.json` is therefore labelled a *float64 reconstruction of UCE's
-formula*, not UCE's own probabilities.
+⚠️ **One precision difference remains, and it is measured rather than assumed.**
+At the pinned revision UCE reads counts as `int64` and calls `torch.log1p`, which
+returns **float32**; the `/ torch.sum(...)` stays float32 and numpy widens `p` to
+float64 only for its cumsum. The committed `sample_reference.json` follows that
+exactly — verified against this workspace's torch and numpy, matching the real
+`torch.log1p(...) / torch.sum(...)` output at `atol=0`.
+
+SCX's kernel accumulates its CDF in `f64` throughout. So the weights agree to
+float32 and the CDF boundaries can differ in the last bits, which means "the same
+uniforms select the same genes" holds for the algorithm and for every value not
+sitting exactly on a boundary. That is the declared divergence.
+
+*(This paragraph is the second answer to the question. The first said the
+precision question was open, on the grounds that a float32 reconstruction
+produced probabilities summing to 1 only within ~1e-7 against the 1.49e-8
+tolerance `np.random.choice` enforces. That reasoning was wrong: numpy's check
+runs over the float32 array it is handed and accepts it — verified directly.)*
 
 ### Negatives and NaN
 
@@ -295,7 +300,7 @@ argsort and the weights in every case.
 | `crop_golden.json` | exact — `np.lexsort` is deterministic |
 | `rank_golden.json` | exact within each equal-value run |
 | `bin_golden.json` | exact for the edges and both digitize bounds; the randomised form bracketed |
-| `sample_reference.json` | distributional only, and a float64 *reconstruction* of the formula — see the precision note above |
+| `sample_reference.json` | distributional only; weights follow torch's float32 precision and match the real torch path at `atol=0`, while SCX's CDF is f64 — see the precision note above |
 | `seeded_golden.json` | SCX's own frozen stream (source of truth is Rust; regenerate with the `#[ignore]`d test) |
 
 To close the gap, create an environment with the real packages and replace each

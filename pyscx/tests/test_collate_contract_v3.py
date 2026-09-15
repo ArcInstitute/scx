@@ -2,7 +2,10 @@
 
 `collate_cellset_gathered` grew one optional argument, `query_offsets`. Omitted,
 the decoder query is the per-set `[n_sets, k_dec]` panel it has always been and
-the output is byte-identical to contract v2's. Supplied, the query is ragged and
+every **pre-existing field** is byte-identical to contract v2's. The returned
+dict is not identical: `target_pad_mask` is a new key on every path, all zeros
+on the per-set one. A consumer that unpacks named keys is unaffected; one that
+asserts an exact key set is not — which is part of what the bump is for. Supplied, the query is ragged and
 indexed per row, `n_measured` becomes per-row, `enc_mask_positions` becomes
 parallel to the ragged query, and `target_pad_mask` says which target slots are
 padding rather than a real zero.
@@ -190,3 +193,42 @@ def test_pflog_with_a_zero_n_measured_raises_instead_of_writing_minus_inf():
     out = _raw(mode="pflog_raw", alpha=0.25,
                n_measured=np.array([3], dtype=np.uint32))
     assert np.isfinite(out["encoder_counts"]).all()
+
+
+def test_malformed_set_offsets_raise_rather_than_misassigning_rows():
+    # `set_offsets` was the one prefix array on this entry nothing validated:
+    # `[0, 1]` over two rows was accepted and row 1 silently kept set 0.
+    with pytest.raises(Exception, match="set_offsets"):
+        _raw(set_offsets=np.array([0, 1], dtype=np.int64))
+    with pytest.raises(Exception, match="set_offsets"):
+        _raw(set_offsets=np.array([1, 2], dtype=np.int64))
+
+
+def test_an_unsorted_row_raises_instead_of_gathering_zero_targets():
+    # A row {0: 5, 2: 7, 1: 9} queried with [0, 1, 2] returned targets
+    # [5.0, 0.0, 0.0] instead of [5.0, 9.0, 7.0] — corrupted batches, no error.
+    with pytest.raises(Exception, match="strictly ascending"):
+        pyscx.collate_cellset_gathered(
+            np.array([0, 3], dtype=np.int64),
+            np.array([0, 2, 1], dtype=np.int32),
+            np.array([5.0, 7.0, 9.0], dtype=np.float32),
+            np.array([0, 1], dtype=np.int64),
+            np.array([0], dtype=np.uint64),
+            np.zeros(1, dtype=np.uint32),
+            np.zeros(1, dtype=np.int32),
+            3,
+            np.array([0, 1, 2], dtype=np.int32),
+            np.array([], dtype=np.uint8),
+            np.zeros(1, dtype=np.uint8),
+            np.array([8], dtype=np.uint32),
+            3,
+            "pass_through",
+            8,
+        )
+
+
+def test_passthrough_array_lengths_are_checked():
+    with pytest.raises(Exception, match="file_ids"):
+        _raw(file_ids=np.zeros(5, dtype=np.uint32))
+    with pytest.raises(Exception, match="role_tags"):
+        _raw(role_tags=np.zeros(5, dtype=np.int32))

@@ -3,7 +3,7 @@
   "_provenance": {
     "reference": "UCE eval_data.py sample_cell_sentences @ 9c416007be15ad6753dc84af4468c1dc10421ab9 (github.com/snap-stanford/UCE, eval_data.py)",
     "produced_by": "numpy running a verbatim transcription of the reference kernel; the package itself is installed nowhere on this machine",
-    "claim": "DISTRIBUTIONAL ONLY, and a float64 RECONSTRUCTION of UCE's formula rather than UCE's own numbers. np.random.choice draws from numpy's global RNG, so no SCX output reproduces its draws. Separately, UCE computes its weights through torch, which may round them to float32 before numpy widens p for the cumsum; that would move CDF boundaries relative to the f64 arithmetic here and in SCX's kernel. A float32 reconstruction was attempted and produced a p numpy's own choice would reject (sum off by ~1e-7 against its 1.49e-8 tolerance), so the precision question is OPEN and needs a run of the real package. The frozen SCX draws live in sample_golden.json, whose source of truth is Rust (regenerate with the #[ignore]d test).",
+    "claim": "DISTRIBUTIONAL ONLY. np.random.choice draws from numpy's global RNG, so no SCX output reproduces its draws. The probabilities here follow torch's precision \u2014 log1p and the normalisation in float32, widened once the way numpy widens p \u2014 while SCX's kernel accumulates its CDF in f64, so a value sitting exactly on a boundary can fall either way. That remaining difference is a declared divergence. The frozen SCX draws live in sample_golden.json, whose source of truth is Rust (regenerate with the #[ignore]d test).",
     "numpy": "2.4.4"
   },
   "cases": [
@@ -37,8 +37,8 @@
       "weight": "log1p",
       "replace": true,
       "expected_probabilities": [
-        0.09118075768650505,
-        0.908819242313495
+        0.09118075668811798,
+        0.9088192582130432
       ]
     },
     {
@@ -58,10 +58,10 @@
       "weight": "log1p",
       "replace": true,
       "expected_probabilities": [
-        0.1,
-        0.2,
-        0.3,
-        0.4
+        0.10000000149011612,
+        0.20000000298023224,
+        0.30000001192092896,
+        0.4000000059604645
       ]
     },
     {

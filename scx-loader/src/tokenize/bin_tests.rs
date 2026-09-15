@@ -223,9 +223,11 @@ fn seeded_draws_are_reproducible_and_keyed_on_the_row() {
 
 #[test]
 fn fixed_edges_are_used_as_given() {
+    // Every positive value at or above the first edge, so all land in
+    // [1, n_bins - 1] as the contract says.
     let mut out = vec![0i64; 4];
     bin_values(
-        &[0.5, 1.5, 2.5, 3.5],
+        &[1.0, 1.5, 2.5, 3.5],
         BinEdges::Fixed(&[1.0, 2.0, 3.0]),
         4,
         BinTie::Left,
@@ -234,7 +236,49 @@ fn fixed_edges_are_used_as_given() {
         &mut out,
     )
     .unwrap();
-    assert_eq!(out, vec![0, 1, 2, 3]);
+    assert_eq!(out, vec![1, 1, 2, 3]);
+}
+
+#[test]
+fn a_positive_value_below_the_first_fixed_edge_is_refused() {
+    // It would digitize to 0, which is the reserved "not expressed" bin — the
+    // quantile path cannot produce that (edges[0] IS the minimum), the fixed
+    // path can, and an earlier version of the test above asserted exactly that
+    // collision as correct behaviour.
+    let mut out = vec![0i64; 2];
+    let err = bin_values(
+        &[0.5, 1.5],
+        BinEdges::Fixed(&[1.0, 2.0, 3.0]),
+        4,
+        BinTie::Left,
+        0,
+        &mut Vec::new(),
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("reserved for unexpressed"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn the_quantile_path_never_puts_a_positive_value_in_bin_zero() {
+    // The invariant the refusal above protects, checked on the path that
+    // guarantees it structurally rather than by validation.
+    for vals in [
+        vec![1.0f32, 2.0, 5.0, 11.0],
+        vec![0.01f32, 0.02, 900.0],
+        vec![7.0f32],
+        vec![0.0f32, 3.0, 0.0, 4.0],
+    ] {
+        let got = run(&vals, 6, BinTie::Left);
+        for (i, &v) in vals.iter().enumerate() {
+            if v > 0.0 {
+                assert!(got[i] >= 1, "{vals:?} position {i} landed in bin 0");
+            }
+        }
+    }
 }
 
 #[test]

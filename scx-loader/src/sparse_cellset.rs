@@ -1305,6 +1305,40 @@ impl SparseCellSetLoader {
     }
 }
 
+/// Check one gathered row's gene ids against the invariant `collate_cell` relies on.
+///
+/// `collate_cell` exact-match binary-searches `gene_ids` for its target gather
+/// and for the `lib_size_redef` sum, and `tokenize::crop` treats
+/// `n_genes_total` as the GENE_MASK token. Neither is safe on a row that is not
+/// sorted, unique and in range — and `collate_cellset_gathered` takes arbitrary
+/// numpy arrays, so the invariant has to be checked rather than assumed. This is
+/// the same check `pyscx.tokenize` applies; the two were asymmetric for one
+/// commit, which is how it was found.
+#[inline]
+fn check_collate_row(ids: &[i32], n_genes_total: i64) -> std::result::Result<(), String> {
+    let vocab = n_genes_total.max(0) as usize;
+    let mut prev: i32 = -1;
+    for &g in ids {
+        if g < 0 {
+            return Err(format!("collate_gathered: gene id {g} is negative"));
+        }
+        if g <= prev {
+            return Err(format!(
+                "collate_gathered: gene ids must be strictly ascending within a row (saw {prev} \
+                 then {g}); call `sort_indices()` on a scipy CSR first"
+            ));
+        }
+        if g as usize >= vocab {
+            return Err(format!(
+                "collate_gathered: gene id {g} is at or above n_genes_total {vocab}, which is the \
+                 GENE_MASK token"
+            ));
+        }
+        prev = g;
+    }
+    Ok(())
+}
+
 /// Where one row's decoder query and its mask live, resolved once for both
 /// addressings so the parallel loop has no branch.
 struct RowQuery {
@@ -1401,6 +1435,50 @@ pub fn collate_gathered(
     validate_indptr(indptr, data.len())?;
     if hide_readout.len() != n_rows {
         return want("hide_readout", hide_readout.len(), n_rows);
+    }
+    // `set_offsets` is the other prefix array on this entry and was the only one
+    // never validated. `validate_indptr` is exactly the right check for it: it
+    // must start at 0, be non-decreasing, and END at `n_rows`. Without the last
+    // clause `set_offsets = [0, 1]` over two rows was ACCEPTED and row 1 kept
+    // `row_set = 0` — a silently wrong set assignment rather than a panic, which
+    // is the worse failure. (With `n_sets = 0` the same hole reached an
+    // out-of-bounds index on `n_measured`; that path is now unreachable because
+    // it needs `k_dec == 0`, which is rejected above, but the array is validated
+    // rather than left resting on that coincidence.)
+    match set_offsets.first() {
+        None => {
+            return Err(LoaderError::ConfigError {
+                reason: "collate_gathered: set_offsets is empty (expected at least one entry)"
+                    .to_string(),
+            })
+        }
+        Some(&f) if f != 0 => {
+            return Err(LoaderError::ConfigError {
+                reason: format!("collate_gathered: set_offsets[0] must be 0, got {f}"),
+            })
+        }
+        _ => {}
+    }
+    if set_offsets.windows(2).any(|w| w[1] < w[0]) {
+        return Err(LoaderError::ConfigError {
+            reason: "collate_gathered: set_offsets must be non-decreasing".to_string(),
+        });
+    }
+    if *set_offsets.last().expect("checked non-empty") != n_rows as i64 {
+        return Err(LoaderError::ConfigError {
+            reason: format!(
+                "collate_gathered: set_offsets must end at n_rows {n_rows}, got {}; rows past the last set would silently keep set 0",
+                set_offsets.last().expect("checked non-empty")
+            ),
+        });
+    }
+    // These three pass through untouched into the batch, so a wrong length
+    // yields a batch whose arrays disagree with `n_rows`.
+    if file_ids.len() != n_rows {
+        return want("file_ids", file_ids.len(), n_rows);
+    }
+    if role_tags.len() != n_rows {
+        return want("role_tags", role_tags.len(), n_rows);
     }
     let has_mask = !enc_mask_positions.is_empty();
 
@@ -1544,7 +1622,10 @@ pub fn collate_gathered(
     // worker can call it with no dataset in hand and therefore no PID check in
     // front of it — and a global-pool dispatch from a forked child hangs
     // forever. See `crate::pool`.
-    crate::pool::cpu_pool().install(|| {
+    // `map_init` rather than `for_each_init` so the per-row invariant check
+    // below can fail the call: the row is already in cache at that point, so the
+    // check costs no extra pass over the data.
+    let row_check: std::result::Result<(), String> = crate::pool::cpu_pool().install(|| {
         enc_ids
             .par_chunks_mut(k_enc)
             .zip(enc_counts.par_chunks_mut(k_enc))
@@ -1556,13 +1637,24 @@ pub fn collate_gathered(
             .enumerate()
             // `for_each_init`, not `for_each`: the kernel's per-row buffers are
             // created once per rayon worker instead of three `Vec`s per cell.
-            .for_each_init(
+            .map_init(
                 Scratch::new,
                 |scratch, (r, ((((((eid, ecnt), emask), epad), tgt), tpad), libslot))| {
                     let q = &rows[r];
                     let qlen = q.q_hi - q.q_lo;
                     let lo = indptr[r] as usize;
                     let hi = indptr[r + 1] as usize;
+                    // Same invariant `pyscx.tokenize` enforces, and for the same
+                    // reason: `collate_cell`'s target gather and its
+                    // `lib_size_redef` sum both exact-match binary-search
+                    // `gene_ids`, so an unsorted row silently answers 0.0 for a
+                    // gene the row actually carries. Reproduced on the built
+                    // extension: a row `{0: 5, 2: 7, 1: 9}` queried with
+                    // `[0, 1, 2]` returned `[5.0, 0.0, 0.0]` instead of
+                    // `[5.0, 9.0, 7.0]` — corrupted targets, no error. The crop
+                    // also needs ids below `n_genes_total`, which IS the
+                    // GENE_MASK token.
+                    check_collate_row(&indices[lo..hi], scalars.n_genes_total)?;
                     let cin = CellIn {
                         gene_ids: &indices[lo..hi],
                         raw: &data[lo..hi],
@@ -1597,9 +1689,12 @@ pub fn collate_gathered(
                     for slot in tpad.iter_mut().skip(qlen) {
                         *slot = 1;
                     }
+                    Ok(())
                 },
-            );
+            )
+            .collect()
     });
+    row_check.map_err(|reason| LoaderError::ConfigError { reason })?;
 
     Ok(CollatedCellSetBatch {
         encoder_gene_ids: enc_ids,

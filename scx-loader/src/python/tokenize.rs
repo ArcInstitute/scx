@@ -179,6 +179,15 @@ fn top_k<'py>(
     if k == 0 {
         return Err(PyValueError::new_err("k must be >= 1"));
     }
+    // `n_genes_total` fixes the two sentinels (`n` is GENE_MASK, `n + 1` is
+    // PAD), so a non-positive vocabulary emits nonsense token ids on any row the
+    // per-row check never sees — an empty row at `n_genes_total = -5` returned
+    // `[-5, -4]`.
+    if n_genes_total < 1 {
+        return Err(PyValueError::new_err(format!(
+            "n_genes_total must be >= 1, got {n_genes_total}"
+        )));
+    }
     let mut ids = vec![0i64; n_rows * k];
     let mut values = vec![0f32; n_rows * k];
     let mut mask = vec![0u8; n_rows * k];
@@ -383,6 +392,23 @@ fn bin_values<'py>(
         ),
         None => None,
     };
+    // Validated here as well as in the kernel, for the same reason `n_bins` is:
+    // on an empty batch the kernel never runs, so `edges=[3.0, 1.0]` on
+    // `indptr=[0]` was accepted and returned an empty result.
+    if let Some(e) = fixed {
+        if e.len() + 1 != n_bins {
+            return Err(PyValueError::new_err(format!(
+                "edges must be exactly n_bins - 1 = {} long, got {}",
+                n_bins - 1,
+                e.len()
+            )));
+        }
+        if e.windows(2).any(|w| w[1] < w[0]) || e.iter().any(|v| !v.is_finite()) {
+            return Err(PyValueError::new_err(
+                "edges must be finite and non-decreasing",
+            ));
+        }
+    }
     // Parsed once, straight into the kernel's own enum. An earlier version
     // needed a local `TieKind` shim because `BinTie::SeededUniform` carried the
     // row index, so the enum had to be rebuilt inside the row loop; the row is

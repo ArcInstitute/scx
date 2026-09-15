@@ -185,28 +185,34 @@ def _reference_sample_weights(counts):
     Note `replace=True`. Only the weights are returned: the draw itself is
     numpy's global RNG and cannot be reproduced in Rust.
 
-    ⚠️ **Precision is an OPEN divergence, not a match.** UCE feeds a torch
-    tensor to `torch.log1p`, so if those counts are float32 the weights and the
-    normalisation are float32 too, and numpy's `choice` then widens `p` to
-    float64 for its cumsum — which would move CDF boundaries relative to the
-    f64 arithmetic below and in SCX's kernel.
+    ⚠️ **Computed in float32, because torch is — and this was got wrong once.**
+    At the pinned revision UCE reads counts as `int64`, wraps them with
+    `torch.tensor`, and calls `torch.log1p`, which returns **float32**; the
+    `/ torch.sum(...)` stays float32 and numpy's `choice` widens `p` to float64
+    only for its cumsum.
 
-    This generator does NOT try to reproduce that. Reconstructing it (log1p and
-    the divide in float32, widened after) was attempted and produces
-    probabilities that sum to 1 only within ~1e-7 — outside the 1.49e-8
-    tolerance `np.random.choice` itself enforces, i.e. a `p` numpy would
-    *reject*. That is evidence the float32 reconstruction is wrong about UCE,
-    not evidence UCE is broken, and the package is not installable here to
-    settle it.
+    An earlier version of this generator did the whole thing in float64 and
+    called the result exact. A first attempt at the fix then reconstructed the
+    float32 path, observed that the probabilities sum to 1 only within ~1e-7,
+    compared that against the 1.49e-8 tolerance `np.random.choice` enforces, and
+    concluded the reconstruction must be wrong about UCE. That conclusion was
+    itself wrong: numpy's check runs over the float32 array it is given, and it
+    **accepts** it — verified directly against this workspace's numpy with a
+    20,000-element float32 `p` whose float64 sum is off by ~2e-7. The float32
+    path is reproducible after all.
 
-    So the arithmetic below is float64 throughout, matching SCX's kernel, and
-    the resulting numbers are labelled a **float64 reconstruction of UCE's
-    formula** rather than UCE's probabilities. Resolving it needs a run of the
-    real package. Recorded in `docs/tokenize.md` alongside the RNG divergence.
+    So the arithmetic below is float32 where torch's is, widened once at the end
+    the way numpy widens `p`. SCX's kernel still accumulates its CDF in f64, and
+    that remaining difference is declared in `docs/tokenize.md` rather than
+    hidden by matching precision on both sides.
     """
-    w = np.log1p(np.clip(np.asarray(counts, dtype=np.float32).astype(np.float64), 0, None))
-    total = w.sum()
-    return (w / total) if total > 0 else np.zeros_like(w)
+    c = np.clip(np.asarray(counts, dtype=np.float32), 0, None)
+    w = np.log1p(c)  # float32, as torch.log1p on an int64 tensor returns
+    total = w.sum(dtype=np.float32)
+    if total <= 0:
+        return np.zeros(len(w), dtype=np.float64)
+    p32 = (w / total).astype(np.float32)  # float32, as `weights / torch.sum`
+    return p32.astype(np.float64)  # numpy's choice widens p for the cumsum
 
 
 # ---------------------------------------------------------------------------
@@ -405,20 +411,20 @@ def main() -> int:
                 "expected_probabilities": [float(x) for x in p],
             }
         )
-        assert abs(p.sum() - 1.0) < 1e-12 or p.sum() == 0.0
+        # float32 tolerance, not float64: the weights are rounded to f32 the
+        # way torch rounds them, so the f64 view of their sum is off by ~1e-7.
+        # numpy's own `choice` accepts exactly this, verified directly.
+        assert abs(p.sum() - 1.0) < 1e-6 or p.sum() == 0.0
     write(
         "sample_reference.json",
-        "DISTRIBUTIONAL ONLY, and a float64 RECONSTRUCTION of UCE's formula "
-        "rather than UCE's own numbers. np.random.choice draws from numpy's "
-        "global RNG, so no SCX output reproduces its draws. Separately, UCE "
-        "computes its weights through torch, which may round them to float32 "
-        "before numpy widens p for the cumsum; that would move CDF boundaries "
-        "relative to the f64 arithmetic here and in SCX's kernel. A float32 "
-        "reconstruction was attempted and produced a p numpy's own choice would "
-        "reject (sum off by ~1e-7 against its 1.49e-8 tolerance), so the "
-        "precision question is OPEN and needs a run of the real package. The "
-        "frozen SCX draws live in sample_golden.json, whose source of truth is "
-        "Rust (regenerate with the #[ignore]d test).",
+        "DISTRIBUTIONAL ONLY. np.random.choice draws from numpy's global RNG, "
+        "so no SCX output reproduces its draws. The probabilities here follow "
+        "torch's precision — log1p and the normalisation in float32, widened "
+        "once the way numpy widens p — while SCX's kernel accumulates its CDF "
+        "in f64, so a value sitting exactly on a boundary can fall either way. "
+        "That remaining difference is a declared divergence. The frozen SCX "
+        "draws live in sample_golden.json, whose source of truth is Rust "
+        "(regenerate with the #[ignore]d test).",
         f"UCE eval_data.py sample_cell_sentences @ {UCE_REV}",
         cases,
     )

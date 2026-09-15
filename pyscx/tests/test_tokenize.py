@@ -250,10 +250,19 @@ def test_bin_values_fixed_edges_are_used_as_given():
     # n_bins must be len(edges) + 1. An earlier version of this test passed
     # n_bins=5 with three edges and asserted bins up to 3 — which contradicted
     # the documented [1, n_bins - 1] range and was the bug, not the fixture.
-    indptr, indices, data = csr([[(0, 0.5), (1, 1.5), (2, 2.5), (3, 3.5)]])
+    indptr, indices, data = csr([[(0, 1.0), (1, 1.5), (2, 2.5), (3, 3.5)]])
     edges = np.array([1.0, 2.0, 3.0], dtype=np.float64)
     got = tok.bin_values(indptr, indices, data, 4, edges=edges, tie="left")["bins"]
-    assert got.tolist() == [0, 1, 2, 3]
+    assert got.tolist() == [1, 1, 2, 3]
+
+
+def test_bin_values_refuses_a_positive_value_below_the_first_fixed_edge():
+    # Bin 0 is reserved for unexpressed genes. `np.digitize` would return 0 for
+    # a value under edges[0], silently marking a positive count unexpressed.
+    indptr, indices, data = csr([[(0, 0.5), (1, 1.5)]])
+    edges = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    with pytest.raises(Exception, match="reserved for unexpressed"):
+        tok.bin_values(indptr, indices, data, 4, edges=edges, tie="left")
 
 
 def test_bin_values_rejects_edges_that_disagree_with_n_bins():
@@ -272,6 +281,30 @@ def test_bin_values_validates_edges_even_on_an_all_zero_batch():
             indptr, indices, data, 3,
             edges=np.array([3.0, 1.0], dtype=np.float64), tie="left",
         )
+
+
+def test_bin_values_validates_fixed_edges_on_an_empty_batch_too():
+    # The kernel never runs on an empty batch, so the entry has to check:
+    # `edges=[3.0, 1.0]` on `indptr=[0]` was accepted and returned an empty
+    # result.
+    empty = (np.array([0], dtype=np.int64), np.array([], dtype=np.int32),
+             np.array([], dtype=np.float32))
+    with pytest.raises(ValueError, match="non-decreasing"):
+        tok.bin_values(*empty, 3, edges=np.array([3.0, 1.0]), tie="left")
+    with pytest.raises(ValueError, match="exactly n_bins - 1"):
+        tok.bin_values(*empty, 3, edges=np.array([1.0, 2.0, 3.0]), tie="left")
+
+
+def test_top_k_rejects_a_non_positive_vocabulary():
+    # `n_genes_total` fixes the sentinels, so a non-positive value emits
+    # nonsense token ids on rows the per-row check never sees: an empty row at
+    # n_genes_total=-5 returned [-5, -4].
+    empty = (np.array([0, 0], dtype=np.int64), np.array([], dtype=np.int32),
+             np.array([], dtype=np.float32))
+    with pytest.raises(ValueError, match="n_genes_total must be >= 1"):
+        tok.top_k(*empty, 2, -5)
+    with pytest.raises(ValueError, match="n_genes_total must be >= 1"):
+        tok.top_k(*empty, 2, 0)
 
 
 def test_bin_values_rejects_an_unknown_tie():

@@ -651,8 +651,10 @@ which parameters are part of a tokeniser's output identity.
 ### Per-row decoder queries (collate contract v3)
 
 `collate_cellset_gathered` takes an optional `query_offsets`. Omitted, the
-decoder query is the per-set `[n_sets, k_dec]` panel it has always been and the
-output is byte-identical to contract v2's — every existing caller is unaffected.
+decoder query is the per-set `[n_sets, k_dec]` panel it has always been and every
+**pre-existing field** is byte-identical to contract v2's. The returned dict is
+not identical: `target_pad_mask` is a new key on every path. A consumer that
+unpacks named keys is unaffected; one that asserts an exact key set is not.
 
 Supplied, it is an `[n_rows + 1]` prefix array over a ragged `query_gene_ids`,
 so two cells in one set can query different genes and different numbers of them.

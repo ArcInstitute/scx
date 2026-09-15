@@ -1388,7 +1388,9 @@ def collate_cellset_gathered(
 
     ``query_offsets`` (contract v3) switches the decoder query from per-set to
     per-row. Omitted, the query is the per-set ``[n_sets, k_dec]`` panel it has
-    always been and the output is byte-identical to v2's. Supplied, it is an
+    always been and every **pre-existing field** is byte-identical to v2's — the
+    returned dict is not identical, because ``target_pad_mask`` is a new key on
+    every path. Supplied, it is an
     ``[n_rows + 1]`` prefix array over a ragged ``query_gene_ids``,
     ``n_measured`` becomes per-row, ``enc_mask_positions`` becomes parallel to
     the ragged query rather than ``k_dec``-strided, and ``k_dec`` is the padded
@@ -1581,8 +1583,9 @@ def read_cloud(
 # gather stage's value contract (clip, downsample), and since v3 the per-row
 # query addressing (`query_offsets`) plus the `target_pad_mask` output.
 # Consumers (e.g. state3) assert this at rust_collate setup to fail loudly on
-# version skew. Currently 3; a call that omits `query_offsets` is byte-identical
-# to what v2 produced.
+# version skew. Currently 3; a call that omits `query_offsets` reproduces every
+# pre-existing field byte for byte, but the returned dict gains a
+# `target_pad_mask` key on every path, so the payload is not identical.
 # See scx-loader/src/sparse_cellset_collate.rs for what it does and does not cover.
 COLLATE_CELLSET_CONTRACT_VERSION: int
 

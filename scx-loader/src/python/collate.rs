@@ -54,7 +54,9 @@ fn collated_cellset_batch_to_dict<'py>(
 ///
 /// `query_offsets` (contract v3) switches the decoder query from per-set to
 /// per-row. Omitted or `None` is the per-set addressing every v2 caller uses and
-/// is byte-identical to what it has always produced. Supplied, it is a
+/// reproduces its values byte for byte in every **pre-existing field** — the
+/// returned dict is not identical, because `target_pad_mask` is a new key on
+/// every path. Supplied, it is a
 /// `[n_rows + 1]` prefix array over a ragged `query_gene_ids`, `n_measured`
 /// becomes per-row, `enc_mask_positions` becomes parallel to the ragged query
 /// rather than `k_dec`-strided, and `k_dec` is the padded output width — with

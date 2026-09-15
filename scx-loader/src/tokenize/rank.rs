@@ -164,6 +164,29 @@ pub fn rank_tokens(
             ),
         });
     }
+    // EVERY id, not just the last one. An earlier version checked
+    // `gene_ids.last()` on the reasoning that the row is sorted ascending, so
+    // the last id is the maximum — true, and not sufficient. `[-1, 2]` has a
+    // last id in range and `-1i32 as usize` wraps to `usize::MAX`; an unsorted
+    // `[7, 1]` has a last id in range and `stat[7]` is out of bounds. Both are
+    // ordinary numpy CSR arriving at a `pub` entry, and both reached an
+    // index-out-of-bounds panic across the FFI.
+    //
+    // Before the zero-library early return, not after: a row of all-zero counts
+    // with a malformed id would otherwise report `Ok(0)` and never look at the
+    // ids at all. `bin_values` validates before its own early return for the
+    // same reason; the two were inconsistent.
+    for &g in row.gene_ids {
+        if g < 0 || g as usize >= norm.stat.len() {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "rank_tokens: gene id {g} is outside the normalisation vocabulary of size {}",
+                    norm.stat.len()
+                ),
+            });
+        }
+    }
+
     let lib = transform::library_size(row.values);
     if lib <= 0.0 {
         return Ok(0);
@@ -173,22 +196,6 @@ pub fn rank_tokens(
     values.clear();
     values.reserve(row.len());
     for (&g, &v) in row.gene_ids.iter().zip(row.values) {
-        // EVERY id, not just the last one. An earlier version checked
-        // `gene_ids.last()` on the reasoning that the row is sorted ascending,
-        // so the last id is the maximum — true, and not sufficient. `[-1, 2]`
-        // has a last id in range and `-1i32 as usize` wraps to `usize::MAX`;
-        // an unsorted `[7, 1]` has a last id in range and `stat[7]` is out of
-        // bounds. Both are ordinary numpy CSR arriving at a `pub` entry, and
-        // both reached an index-out-of-bounds panic across the FFI. This loop
-        // already runs, so the check is free.
-        if g < 0 || g as usize >= norm.stat.len() {
-            return Err(LoaderError::ConfigError {
-                reason: format!(
-                    "rank_tokens: gene id {g} is outside the normalisation vocabulary of size {}",
-                    norm.stat.len()
-                ),
-            });
-        }
         let normalised = (v.max(0.0) as f64) * factor / (norm.stat[g as usize] as f64);
         values.push(normalised as f32);
     }

@@ -195,6 +195,23 @@ pub fn bin_values(
             continue;
         }
         let x = c as f64;
+        // Bin 0 means "not expressed". `np.digitize` returns 0 for anything
+        // below `edges[0]`, so a caller-supplied edge set that does not cover
+        // its data silently marks a positive value as unexpressed — which on
+        // the quantile path cannot happen (`edges[0]` IS the minimum) and on the
+        // fixed path is entirely the caller's edge choice. Refused rather than
+        // clamped: merging a 0.5 into the same token as a 1.5 is the kind of
+        // change that alters training without telling anyone.
+        if x < edges[0] {
+            return Err(LoaderError::ConfigError {
+                reason: format!(
+                    "bin_values: value {x} is below the first edge {}, so it would land in bin 0, \
+                     which is reserved for unexpressed genes; widen the fixed edges to cover the \
+                     data",
+                    edges[0]
+                ),
+            });
+        }
         let left = digitize_left(edges, x);
         *o = match tie {
             BinTie::Left => left,

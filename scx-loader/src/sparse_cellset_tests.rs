@@ -2574,3 +2574,97 @@ fn collate_gathered_rejects_the_three_shapes_that_used_to_panic() {
     // And the well-formed call still works, so the guards are not vacuous.
     assert!(call(4, 1, &indices, &data, &[3], PreprocessMode::PassThrough).is_ok());
 }
+
+#[test]
+fn collate_gathered_validates_set_offsets_like_any_other_prefix_array() {
+    // `set_offsets` was the one prefix array on this entry that nothing checked.
+    // `[0, 1]` over two rows was ACCEPTED and left row 1 with `row_set = 0` — a
+    // silently wrong set assignment, which is worse than the panic the same hole
+    // reached at `n_sets = 0`.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let (indptr, indices, data, _) = v3_fixture();
+    let call = |set_offsets: &[i64], n_measured: &[u32]| {
+        collate_gathered(
+            &indptr,
+            &indices,
+            &data,
+            set_offsets,
+            vec![0u64, 1],
+            vec![0u32, 0],
+            vec![0i32, 0],
+            1,
+            &[1, 1],
+            None,
+            &[],
+            &[0, 0],
+            n_measured,
+            &sc,
+        )
+    };
+    // Does not reach the last row.
+    assert!(call(&[0, 1], &[3]).is_err());
+    // Does not start at 0.
+    assert!(call(&[1, 2], &[3]).is_err());
+    // Non-monotonic.
+    assert!(call(&[0, 2, 1], &[3, 3]).is_err());
+    // Anti-vacuity: the well-formed two-singleton-set case is accepted.
+    assert!(call(&[0, 1, 2], &[3, 3]).is_ok());
+}
+
+#[test]
+fn collate_gathered_refuses_an_unsorted_row_instead_of_gathering_zeros() {
+    // `collate_cell` exact-match binary-searches `gene_ids` for its target
+    // gather. On the built extension a row `{0: 5, 2: 7, 1: 9}` queried with
+    // `[0, 1, 2]` returned targets `[5.0, 0.0, 0.0]` instead of
+    // `[5.0, 9.0, 7.0]` — corrupted training batches, no error.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let err = collate_gathered(
+        &[0, 3],
+        &[0, 2, 1],
+        &[5.0, 7.0, 9.0],
+        &[0, 1],
+        vec![0u64],
+        vec![0u32],
+        vec![0i32],
+        3,
+        &[0, 1, 2],
+        None,
+        &[],
+        &[0],
+        &[8],
+        &sc,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("strictly ascending"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn collate_gathered_refuses_a_gene_id_that_would_collide_with_gene_mask() {
+    // `n_genes_total` IS the GENE_MASK token, so an id at or above it emits a
+    // real gene indistinguishable from the sentinel.
+    let sc = v3_scalars(PreprocessMode::PassThrough); // n_genes_total = 8
+    let err = collate_gathered(
+        &[0, 2],
+        &[3, 8],
+        &[5.0, 7.0],
+        &[0, 1],
+        vec![0u64],
+        vec![0u32],
+        vec![0i32],
+        1,
+        &[3],
+        None,
+        &[],
+        &[0],
+        &[8],
+        &sc,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("GENE_MASK"),
+        "unexpected error: {err}"
+    );
+}
