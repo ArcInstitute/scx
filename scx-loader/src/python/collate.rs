@@ -32,6 +32,10 @@ fn collated_cellset_batch_to_dict<'py>(
         PyArray1::from_vec(py, batch.encoder_pad_mask),
     )?;
     dict.set_item("target_counts", PyArray1::from_vec(py, batch.target_counts))?;
+    dict.set_item(
+        "target_pad_mask",
+        PyArray1::from_vec(py, batch.target_pad_mask),
+    )?;
     dict.set_item("library_size", PyArray1::from_vec(py, batch.library_size))?;
     dict.set_item("cell_indices", PyArray1::from_vec(py, batch.cell_indices))?;
     dict.set_item("file_ids", PyArray1::from_vec(py, batch.file_ids))?;
@@ -47,12 +51,20 @@ fn collated_cellset_batch_to_dict<'py>(
 /// (state3 "3A hybrid"). Pure compute; releases the GIL. Python gathers (via
 /// `iter_with_plans`) and samples the query, then collates here. `set_offsets`
 /// delimits the sets; `enc_mask_positions` may be empty (perturbation path).
+///
+/// `query_offsets` (contract v3) switches the decoder query from per-set to
+/// per-row. Omitted or `None` is the per-set addressing every v2 caller uses and
+/// is byte-identical to what it has always produced. Supplied, it is a
+/// `[n_rows + 1]` prefix array over a ragged `query_gene_ids`, `n_measured`
+/// becomes per-row, `enc_mask_positions` becomes parallel to the ragged query
+/// rather than `k_dec`-strided, and `k_dec` is the padded output width — with
+/// `target_pad_mask` saying which target slots are padding.
 #[pyfunction]
 #[pyo3(signature = (
     indptr, indices, data, set_offsets, cell_indices, file_ids, role_tags,
     k_dec, query_gene_ids, enc_mask_positions, hide_readout, n_measured,
     k_enc, mode, n_genes_total, target_sum=None, lib_size_redef=None,
-    pflog_alpha=None,
+    pflog_alpha=None, query_offsets=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn collate_cellset_gathered<'py>(
@@ -75,6 +87,7 @@ pub fn collate_cellset_gathered<'py>(
     target_sum: Option<f64>,
     lib_size_redef: Option<bool>,
     pflog_alpha: Option<f64>,
+    query_offsets: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let mode = PreprocessMode::parse(&mode).map_err(loader_err_to_py)?;
     // v4 PFlog collate mode needs a pinned α (no dataset to estimate from here).
@@ -114,6 +127,13 @@ pub fn collate_cellset_gathered<'py>(
     let encmask = enc_mask_positions.as_slice().map_err(err)?;
     let hide = hide_readout.as_slice().map_err(err)?;
     let nmeas = n_measured.as_slice().map_err(err)?;
+    // Bound before the detach: `PyReadonlyArray1` is GIL-bound, so the borrow
+    // has to be taken here and only the `&[i64]` crosses.
+    let qoff_owner = query_offsets;
+    let qoff: Option<&[i64]> = match qoff_owner.as_ref() {
+        Some(a) => Some(a.as_slice().map_err(err)?),
+        None => None,
+    };
     let batch = py
         .detach(|| {
             crate::sparse_cellset::collate_gathered(
@@ -126,6 +146,7 @@ pub fn collate_cellset_gathered<'py>(
                 role_tags_v,
                 k_dec,
                 query,
+                qoff,
                 encmask,
                 hide,
                 nmeas,

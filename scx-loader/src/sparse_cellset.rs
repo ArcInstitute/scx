@@ -76,6 +76,11 @@ pub struct CollatedCellSetBatch {
     pub encoder_mask: Vec<u8>,      // [n_rows * k_enc]
     pub encoder_pad_mask: Vec<u8>,  // [n_rows * k_enc]
     pub target_counts: Vec<f32>,    // [n_rows * k_dec]
+    /// `1` where a `target_counts` slot is padding rather than a real query
+    /// position — all zero unless per-row queries are in use and some row's
+    /// query is shorter than `k_dec`. Without it a padded `0.0` is
+    /// indistinguishable from a real zero target.
+    pub target_pad_mask: Vec<u8>, // [n_rows * k_dec]
     pub library_size: Vec<f32>,     // [n_rows]
     pub cell_indices: Vec<u64>,
     pub file_ids: Vec<u32>,
@@ -1300,6 +1305,21 @@ impl SparseCellSetLoader {
     }
 }
 
+/// Where one row's decoder query and its mask live, resolved once for both
+/// addressings so the parallel loop has no branch.
+struct RowQuery {
+    /// Span of this row's query ids in the flat `query_gene_ids`.
+    q_lo: usize,
+    q_hi: usize,
+    /// Start of this row's mask bits. The mask is `k_dec`-strided per row on the
+    /// per-set path and parallel to the ragged query on the per-row path, so it
+    /// needs its own offset rather than reusing `q_lo`.
+    m_lo: usize,
+    /// Index into the sorted-panel table. Rows of one set share a panel on the
+    /// per-set path; every row has its own on the per-row path.
+    panel: usize,
+}
+
 /// Run the per-cell collation kernel over an already-gathered, **global-vocab**
 /// CSR batch (each row sorted-unique, as `remap_row` / state3's `finalize_csr_row`
 /// produce). Pure compute — rayon over rows, no I/O. The query gene ids and
@@ -1320,6 +1340,7 @@ pub fn collate_gathered(
     role_tags: Vec<i32>,
     k_dec: usize,
     query_gene_ids: &[i32],
+    query_offsets: Option<&[i64]>,
     enc_mask_positions: &[u8],
     hide_readout: &[u8],
     n_measured: &[u32],
@@ -1362,23 +1383,10 @@ pub fn collate_gathered(
     // rather than erroring. Pre-existing gap on this entry point, closed here
     // because the check is shared with `downsample_counts_csr`.
     validate_indptr(indptr, data.len())?;
-    if query_gene_ids.len() != n_sets * k_dec {
-        return want("query_gene_ids", query_gene_ids.len(), n_sets * k_dec);
-    }
     if hide_readout.len() != n_rows {
         return want("hide_readout", hide_readout.len(), n_rows);
     }
-    if n_measured.len() != n_sets {
-        return want("n_measured", n_measured.len(), n_sets);
-    }
     let has_mask = !enc_mask_positions.is_empty();
-    if has_mask && enc_mask_positions.len() != n_rows * k_dec {
-        return want(
-            "enc_mask_positions",
-            enc_mask_positions.len(),
-            n_rows * k_dec,
-        );
-    }
 
     // Row → set index, for per-set query / n_measured lookup.
     let mut row_set = vec![0usize; n_rows];
@@ -1390,13 +1398,101 @@ pub fn collate_gathered(
         }
     }
 
-    // One sorted query panel per set, built before the row loop because the
-    // panel is per-set while the mask bits below are per-row. Skipped entirely
-    // on the perturbation path (no mask ⇒ nothing to look up), so that path
-    // pays neither the sort nor the allocation.
+    // Resolve each row's query span, mask span, panel and `n_measured` once,
+    // so the parallel loop below is identical on both addressings.
+    //
+    // The choice is made on `query_offsets.is_some()` and never on a length:
+    // `n_sets == n_rows` whenever every set is a singleton, which is the common
+    // shape for R4 consumers, so a length-sniffing dispatch would pick the
+    // wrong reading exactly where it matters most.
+    let (rows, measured_of_row, n_panels) = match query_offsets {
+        None => {
+            if query_gene_ids.len() != n_sets * k_dec {
+                return want("query_gene_ids", query_gene_ids.len(), n_sets * k_dec);
+            }
+            if n_measured.len() != n_sets {
+                return want("n_measured", n_measured.len(), n_sets);
+            }
+            if has_mask && enc_mask_positions.len() != n_rows * k_dec {
+                return want(
+                    "enc_mask_positions",
+                    enc_mask_positions.len(),
+                    n_rows * k_dec,
+                );
+            }
+            let rows: Vec<RowQuery> = (0..n_rows)
+                .map(|r| {
+                    let s = row_set[r];
+                    RowQuery {
+                        q_lo: s * k_dec,
+                        q_hi: (s + 1) * k_dec,
+                        m_lo: r * k_dec,
+                        panel: s,
+                    }
+                })
+                .collect();
+            let measured: Vec<u32> = (0..n_rows).map(|r| n_measured[row_set[r]]).collect();
+            (rows, measured, n_sets)
+        }
+        Some(off) => {
+            if off.len() != n_rows + 1 {
+                return want("query_offsets", off.len(), n_rows + 1);
+            }
+            // Same reason as `indptr`: the loop slices straight from these, so a
+            // non-monotonic or negative offset would panic rather than error.
+            validate_indptr(off, query_gene_ids.len()).map_err(|e| LoaderError::ConfigError {
+                reason: format!("collate_gathered: query_offsets {e}"),
+            })?;
+            let widest = (0..n_rows)
+                .map(|r| (off[r + 1] - off[r]) as usize)
+                .max()
+                .unwrap_or(0);
+            if widest > k_dec {
+                return Err(LoaderError::ConfigError {
+                    reason: format!(
+                        "collate_gathered: k_dec {k_dec} is narrower than the widest per-row query ({widest}); k_dec is the padded output width"
+                    ),
+                });
+            }
+            if n_measured.len() != n_rows {
+                return want("n_measured", n_measured.len(), n_rows);
+            }
+            // Per-row masks are parallel to the ragged query, not `k_dec`-strided.
+            if has_mask && enc_mask_positions.len() != query_gene_ids.len() {
+                return want(
+                    "enc_mask_positions",
+                    enc_mask_positions.len(),
+                    query_gene_ids.len(),
+                );
+            }
+            let rows: Vec<RowQuery> = (0..n_rows)
+                .map(|r| RowQuery {
+                    q_lo: off[r] as usize,
+                    q_hi: off[r + 1] as usize,
+                    m_lo: off[r] as usize,
+                    panel: r,
+                })
+                .collect();
+            (rows, n_measured.to_vec(), n_rows)
+        }
+    };
+
+    // One sorted panel per distinct query, built before the row loop because on
+    // the per-set path the panel is shared by the set's rows while the mask bits
+    // are per-row. Skipped entirely on the perturbation path (no mask ⇒ nothing
+    // to look up), so that path pays neither the sort nor the allocation.
+    //
+    // Per-row queries cost one sort per row instead of one per set — the price
+    // of the addressing, not a regression in the per-set path.
     let query_indices: Vec<SetQueryIndex> = if has_mask {
-        (0..n_sets)
-            .map(|s| SetQueryIndex::new(&query_gene_ids[s * k_dec..(s + 1) * k_dec]))
+        let mut by_panel: Vec<Option<SetQueryIndex>> = (0..n_panels).map(|_| None).collect();
+        for row in &rows {
+            by_panel[row.panel]
+                .get_or_insert_with(|| SetQueryIndex::new(&query_gene_ids[row.q_lo..row.q_hi]));
+        }
+        by_panel
+            .into_iter()
+            .map(|p| p.unwrap_or_else(|| SetQueryIndex::new(&[])))
             .collect()
     } else {
         Vec::new()
@@ -1407,6 +1503,7 @@ pub fn collate_gathered(
     let mut enc_mask = vec![0u8; n_rows * k_enc];
     let mut enc_pad = vec![0u8; n_rows * k_enc];
     let mut target = vec![0f32; n_rows * k_dec];
+    let mut target_pad = vec![0u8; n_rows * k_dec];
     let mut library = vec![0f32; n_rows];
 
     // On the loader's pool, never rayon's global registry. This kernel is
@@ -1421,23 +1518,25 @@ pub fn collate_gathered(
             .zip(enc_mask.par_chunks_mut(k_enc))
             .zip(enc_pad.par_chunks_mut(k_enc))
             .zip(target.par_chunks_mut(k_dec))
+            .zip(target_pad.par_chunks_mut(k_dec))
             .zip(library.par_iter_mut())
             .enumerate()
             // `for_each_init`, not `for_each`: the kernel's per-row buffers are
             // created once per rayon worker instead of three `Vec`s per cell.
             .for_each_init(
                 Scratch::new,
-                |scratch, (r, (((((eid, ecnt), emask), epad), tgt), libslot))| {
-                    let s = row_set[r];
+                |scratch, (r, ((((((eid, ecnt), emask), epad), tgt), tpad), libslot))| {
+                    let q = &rows[r];
+                    let qlen = q.q_hi - q.q_lo;
                     let lo = indptr[r] as usize;
                     let hi = indptr[r + 1] as usize;
                     let cin = CellIn {
                         gene_ids: &indices[lo..hi],
                         raw: &data[lo..hi],
-                        query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
+                        query: &query_gene_ids[q.q_lo..q.q_hi],
                         mask: has_mask.then(|| RowMask {
-                            positions: &enc_mask_positions[r * k_dec..(r + 1) * k_dec],
-                            index: &query_indices[s],
+                            positions: &enc_mask_positions[q.m_lo..q.m_lo + qlen],
+                            index: &query_indices[q.panel],
                         }),
                         hide_readout: hide_readout[r] != 0,
                     };
@@ -1445,7 +1544,7 @@ pub fn collate_gathered(
                         k_enc,
                         mode: scalars.mode,
                         target_sum: scalars.target_sum,
-                        n_measured: n_measured[s] as usize,
+                        n_measured: measured_of_row[r] as usize,
                         pflog_alpha: scalars.pflog_alpha,
                         n_genes_total: scalars.n_genes_total,
                         lib_size_redef: scalars.lib_size_redef,
@@ -1458,6 +1557,13 @@ pub fn collate_gathered(
                         target: tgt,
                     };
                     *libslot = collate_cell(&cin, &cfg, scratch, &mut out);
+                    // Slots past this row's query are padding. `collate_cell`
+                    // writes only `query.len()` targets, so the tail keeps the
+                    // 0.0 it was allocated with — indistinguishable from a real
+                    // zero target without this mask.
+                    for slot in tpad.iter_mut().skip(qlen) {
+                        *slot = 1;
+                    }
                 },
             );
     });
@@ -1468,6 +1574,7 @@ pub fn collate_gathered(
         encoder_mask: enc_mask,
         encoder_pad_mask: enc_pad,
         target_counts: target,
+        target_pad_mask: target_pad,
         library_size: library,
         cell_indices,
         file_ids,

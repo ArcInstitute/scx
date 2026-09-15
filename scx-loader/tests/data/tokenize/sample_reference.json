@@ -1,0 +1,105 @@
+{
+  "_comment": "GENERATED FILE - do not edit by hand. Regenerate with `.venv/bin/python benchmarks/scripts/gen_tokenize_goldens.py`, then update the blake3 prefix in scx-loader/src/tokenize/golden_tests.rs. See the generator's docstring for what this file's numbers do and do not claim.",
+  "_provenance": {
+    "reference": "UCE eval_data.py sample_cell_sentences @ main@2026-09-14 (github.com/snap-stanford/UCE, eval_data.py)",
+    "produced_by": "numpy running a verbatim transcription of the reference kernel; the package itself is installed nowhere on this machine",
+    "claim": "DISTRIBUTIONAL ONLY: np.random.choice draws from numpy's global RNG, so no SCX output reproduces its draws. The probabilities are exact; the frozen SCX draws live in sample_golden.json, whose source of truth is Rust (regenerate with the #[ignore]d test).",
+    "numpy": "2.4.4"
+  },
+  "cases": [
+    {
+      "name": "two_genes_equal",
+      "gene_ids": [
+        3,
+        8
+      ],
+      "counts": [
+        5.0,
+        5.0
+      ],
+      "weight": "log1p",
+      "replace": true,
+      "expected_probabilities": [
+        0.5,
+        0.5
+      ]
+    },
+    {
+      "name": "wide_dynamic_range",
+      "gene_ids": [
+        1,
+        2
+      ],
+      "counts": [
+        1.0,
+        1000.0
+      ],
+      "weight": "log1p",
+      "replace": true,
+      "expected_probabilities": [
+        0.09118075768650505,
+        0.908819242313495
+      ]
+    },
+    {
+      "name": "four_genes",
+      "gene_ids": [
+        10,
+        20,
+        30,
+        40
+      ],
+      "counts": [
+        1.0,
+        3.0,
+        7.0,
+        15.0
+      ],
+      "weight": "log1p",
+      "replace": true,
+      "expected_probabilities": [
+        0.1,
+        0.2,
+        0.3,
+        0.4
+      ]
+    },
+    {
+      "name": "a_zero_weight_gene",
+      "gene_ids": [
+        1,
+        2,
+        3
+      ],
+      "counts": [
+        0.0,
+        5.0,
+        0.0
+      ],
+      "weight": "log1p",
+      "replace": true,
+      "expected_probabilities": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "name": "all_zero",
+      "gene_ids": [
+        1,
+        2
+      ],
+      "counts": [
+        0.0,
+        0.0
+      ],
+      "weight": "log1p",
+      "replace": true,
+      "expected_probabilities": [
+        0.0,
+        0.0
+      ]
+    }
+  ]
+}

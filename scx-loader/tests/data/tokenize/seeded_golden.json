@@ -1,0 +1,205 @@
+{
+  "_comment": "GENERATED FILE - source of truth is Rust. Regenerate with `cargo test -p scx-loader regenerate_seeded_golden -- --ignored --nocapture`, then update SEEDED_GOLDEN_BLAKE3_PREFIX. These values come from ChaCha8Rng keyed through crate::seed::row_seed; no reference implementation can produce them, so what they pin is that SCX's own stream has not moved.",
+  "cases": [
+    {
+      "bin_n_bins": 9,
+      "bin_seeded": [
+        8,
+        7
+      ],
+      "counts": [
+        5.0,
+        5.0
+      ],
+      "file_identity": 2,
+      "gene_ids": [
+        3,
+        8
+      ],
+      "name": "two_genes_equal",
+      "row": 0,
+      "sample_ids": [
+        3,
+        8,
+        8,
+        8,
+        3,
+        8,
+        3,
+        8,
+        3,
+        8,
+        3,
+        3
+      ],
+      "sample_n": 12,
+      "seed": 1
+    },
+    {
+      "bin_n_bins": 9,
+      "bin_seeded": [
+        1,
+        8
+      ],
+      "counts": [
+        1.0,
+        1000.0
+      ],
+      "file_identity": 6,
+      "gene_ids": [
+        1,
+        2
+      ],
+      "name": "wide_dynamic_range",
+      "row": 7,
+      "sample_ids": [
+        2,
+        1,
+        2,
+        2,
+        2,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "sample_n": 12,
+      "seed": 5
+    },
+    {
+      "bin_n_bins": 9,
+      "bin_seeded": [
+        1,
+        3,
+        5,
+        8
+      ],
+      "counts": [
+        1.0,
+        3.0,
+        7.0,
+        15.0
+      ],
+      "file_identity": 43981,
+      "gene_ids": [
+        10,
+        20,
+        30,
+        40
+      ],
+      "name": "four_genes",
+      "row": 42,
+      "sample_ids": [
+        40,
+        30,
+        30,
+        30,
+        10,
+        40,
+        40,
+        20,
+        10,
+        30,
+        20,
+        10
+      ],
+      "sample_n": 12,
+      "seed": 20260914
+    },
+    {
+      "bin_n_bins": 9,
+      "bin_seeded": [
+        1,
+        3,
+        5,
+        8
+      ],
+      "counts": [
+        1.0,
+        3.0,
+        7.0,
+        15.0
+      ],
+      "file_identity": 43981,
+      "gene_ids": [
+        10,
+        20,
+        30,
+        40
+      ],
+      "name": "same_cell_different_row_key",
+      "row": 43,
+      "sample_ids": [
+        20,
+        30,
+        30,
+        40,
+        10,
+        30,
+        40,
+        30,
+        30,
+        40,
+        40,
+        40
+      ],
+      "sample_n": 12,
+      "seed": 20260914
+    },
+    {
+      "bin_n_bins": 9,
+      "bin_seeded": [
+        6,
+        7,
+        4,
+        3,
+        5,
+        2,
+        4,
+        5
+      ],
+      "counts": [
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0,
+        4.0
+      ],
+      "file_identity": 9,
+      "gene_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "name": "flat_cell_for_the_bin_tiebreak",
+      "row": 11,
+      "sample_ids": [
+        5,
+        5,
+        7,
+        7,
+        2,
+        4,
+        4,
+        3,
+        3,
+        8,
+        4,
+        3
+      ],
+      "sample_n": 12,
+      "seed": 3
+    }
+  ]
+}

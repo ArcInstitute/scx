@@ -123,3 +123,7 @@ impl Scratch {
         self.tgt_vals.resize(n, 0.0);
     }
 }
+
+#[cfg(test)]
+#[path = "golden_tests.rs"]
+mod golden_tests;

@@ -600,6 +600,7 @@ fn collate_gathered_emits_stacked_tensors_matching_kernel() {
         g.role_tags,
         /*k_dec*/ 4,
         &[2, 5, 7, 0], // query (shared across the set)
+        None,          // query_offsets: per-set addressing (contract v2 shape)
         &[],           // enc_mask_positions: pert-style (no encoder masking)
         &[0, 0],       // hide_readout
         &[8],          // n_measured
@@ -667,6 +668,7 @@ fn collate_gathered_applies_each_rows_own_mask_within_a_set() {
         vec![0i32, 0],
         /*k_dec*/ 3,
         /*query, per SET*/ &[1, 3, 5],
+        /*query_offsets*/ None,
         // Per ROW, k_dec each: row 0 withholds gene 1, row 1 withholds gene 5.
         /*enc_mask_positions*/
         &[1, 0, 0, 0, 0, 1],
@@ -1892,6 +1894,7 @@ fn collate_gathered_errors_rather_than_panicking_on_a_bad_indptr() {
         vec![0, 0],
         1,
         &[1],
+        None,
         &[],
         &[0, 0],
         &[2],
@@ -2275,4 +2278,228 @@ fn gather_presize_is_an_upper_bound_when_remap_drops_entries() {
     // Rows whose single non-zero sat at column 0 dropped out entirely.
     let dropped = (0..64u64).filter(|r| r % 8 == 0).count();
     assert_eq!(b.indices.len(), 64 - dropped);
+}
+
+// --------------------------------------------------------------------------
+// Contract v3 — per-row query addressing
+// --------------------------------------------------------------------------
+
+fn v3_scalars(mode: PreprocessMode) -> CollateScalars {
+    CollateScalars {
+        k_enc: 4,
+        mode,
+        target_sum: 1e4,
+        pflog_alpha: Some(0.25),
+        n_genes_total: 8,
+        lib_size_redef: false,
+    }
+}
+
+/// Two rows in one set, three expressed genes each.
+fn v3_fixture() -> (Vec<i64>, Vec<i32>, Vec<f32>, Vec<i64>) {
+    (
+        vec![0, 3, 6],
+        vec![1, 3, 5, 1, 3, 5],
+        vec![4.0, 2.0, 6.0, 1.0, 9.0, 3.0],
+        vec![0, 2],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn v3_collate(
+    k_dec: usize,
+    query: &[i32],
+    offsets: Option<&[i64]>,
+    mask: &[u8],
+    n_measured: &[u32],
+    scalars: &CollateScalars,
+) -> CollatedCellSetBatch {
+    let (indptr, indices, data, set_offsets) = v3_fixture();
+    collate_gathered(
+        &indptr,
+        &indices,
+        &data,
+        &set_offsets,
+        vec![0u64, 1],
+        vec![0u32, 0],
+        vec![0i32, 0],
+        k_dec,
+        query,
+        offsets,
+        mask,
+        &[0, 0],
+        n_measured,
+        scalars,
+    )
+    .unwrap()
+}
+
+fn assert_same_batch(a: &CollatedCellSetBatch, b: &CollatedCellSetBatch) {
+    assert_eq!(a.encoder_gene_ids, b.encoder_gene_ids);
+    assert_eq!(a.encoder_counts, b.encoder_counts);
+    assert_eq!(a.encoder_mask, b.encoder_mask);
+    assert_eq!(a.encoder_pad_mask, b.encoder_pad_mask);
+    assert_eq!(a.target_counts, b.target_counts);
+    assert_eq!(a.target_pad_mask, b.target_pad_mask);
+    assert_eq!(a.library_size, b.library_size);
+    assert_eq!((a.n_rows, a.k_enc, a.k_dec), (b.n_rows, b.k_enc, b.k_dec));
+}
+
+#[test]
+fn per_row_queries_reproduce_the_per_set_call_when_the_rows_share_a_query() {
+    // The compatibility claim: v2's addressing is a special case of v3's, so a
+    // caller that duplicates the set's panel per row gets byte-identical output.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let mask = [1u8, 0, 0, 0, 0, 1];
+    let per_set = v3_collate(3, &[1, 3, 5], None, &mask, &[3], &sc);
+    let per_row = v3_collate(
+        3,
+        &[1, 3, 5, 1, 3, 5],
+        Some(&[0, 3, 6]),
+        &mask,
+        &[3, 3],
+        &sc,
+    );
+    assert_same_batch(&per_set, &per_row);
+}
+
+#[test]
+fn per_row_queries_let_two_rows_of_one_set_query_different_genes() {
+    // The capability v3 exists for. Row 0 asks for gene 1, row 1 for gene 3; a
+    // per-set call cannot express this at all.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let b = v3_collate(1, &[1, 3], Some(&[0, 1, 2]), &[], &[3, 3], &sc);
+    assert_eq!(b.target_counts, vec![4.0, 9.0]);
+    assert_eq!(b.target_pad_mask, vec![0, 0]);
+}
+
+#[test]
+fn per_row_queries_pad_short_rows_and_mark_the_padding() {
+    // Row 0 queries two genes, row 1 one. `k_dec` is the padded output width, and
+    // without the mask the padded 0.0 is indistinguishable from a real zero.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let b = v3_collate(2, &[1, 3, 5], Some(&[0, 2, 3]), &[], &[3, 3], &sc);
+    assert_eq!(b.k_dec, 2);
+    assert_eq!(b.target_counts, vec![4.0, 2.0, 3.0, 0.0]);
+    assert_eq!(b.target_pad_mask, vec![0, 0, 0, 1]);
+}
+
+#[test]
+fn a_real_zero_target_is_distinguishable_from_padding() {
+    // Gene 7 is not in either row, so its target is a genuine 0.0 with pad 0 —
+    // the pair the mask exists to separate.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let b = v3_collate(2, &[7, 1, 3], Some(&[0, 2, 3]), &[], &[3, 3], &sc);
+    assert_eq!(b.target_counts, vec![0.0, 4.0, 9.0, 0.0]);
+    assert_eq!(b.target_pad_mask, vec![0, 0, 0, 1]);
+}
+
+#[test]
+fn target_pad_mask_is_all_zero_on_the_per_set_path() {
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let b = v3_collate(3, &[1, 3, 5], None, &[], &[3], &sc);
+    assert_eq!(b.target_pad_mask, vec![0u8; 2 * 3]);
+}
+
+#[test]
+fn per_row_masks_are_parallel_to_the_ragged_query_not_k_dec_strided() {
+    // Row 0's query is [1, 3] and row 1's is [5]; the mask has three entries, one
+    // per query position, and withholds gene 3 from row 0 only.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let b = v3_collate(2, &[1, 3, 5], Some(&[0, 2, 3]), &[0, 1, 0], &[3, 3], &sc);
+    // Row 0: genes 5, 1 survive (3 withheld) in count-desc order 6.0, 4.0.
+    assert_eq!(&b.encoder_gene_ids[0..2], &[5, 1]);
+    // Row 1: nothing withheld, all three genes present, 9.0 > 3.0 > 1.0.
+    assert_eq!(&b.encoder_gene_ids[4..7], &[3, 5, 1]);
+}
+
+#[test]
+fn n_measured_is_read_per_row_when_query_offsets_are_supplied() {
+    // Discriminating because `n_measured` is the PFlog centring denominator:
+    // two rows of one set with different panel sizes must centre differently,
+    // which a per-set read cannot produce.
+    let sc = v3_scalars(PreprocessMode::PflogRaw);
+    let same = v3_collate(1, &[1, 1], Some(&[0, 1, 2]), &[], &[3, 3], &sc);
+    let differ = v3_collate(1, &[1, 1], Some(&[0, 1, 2]), &[], &[3, 100], &sc);
+    assert_eq!(same.encoder_counts[0], differ.encoder_counts[0]);
+    assert_ne!(
+        same.encoder_counts[sc.k_enc], differ.encoder_counts[sc.k_enc],
+        "row 1's centring must follow row 1's n_measured"
+    );
+}
+
+#[test]
+fn a_batch_of_singleton_sets_still_reads_the_per_set_addressing() {
+    // `n_sets == n_rows` here, so a dispatch that sniffed lengths instead of
+    // checking `query_offsets.is_some()` would read the per-set panel as a
+    // ragged one and silently give every row the first set's query.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let (indptr, indices, data, _) = v3_fixture();
+    let b = collate_gathered(
+        &indptr,
+        &indices,
+        &data,
+        &[0, 1, 2], // two singleton sets
+        vec![0u64, 1],
+        vec![0u32, 0],
+        vec![0i32, 0],
+        2,
+        &[1, 3, 5, 7], // per-SET: [1, 3] for set 0, [5, 7] for set 1
+        None,
+        &[],
+        &[0, 0],
+        &[3, 3],
+        &sc,
+    )
+    .unwrap();
+    assert_eq!(b.target_counts, vec![4.0, 2.0, 3.0, 0.0]);
+}
+
+#[test]
+fn malformed_query_offsets_are_errors_not_panics() {
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let (indptr, indices, data, set_offsets) = v3_fixture();
+    let call = |k_dec: usize, query: &[i32], off: &[i64], nm: &[u32]| {
+        collate_gathered(
+            &indptr,
+            &indices,
+            &data,
+            &set_offsets,
+            vec![0u64, 1],
+            vec![0u32, 0],
+            vec![0i32, 0],
+            k_dec,
+            query,
+            Some(off),
+            &[],
+            &[0, 0],
+            nm,
+            &sc,
+        )
+    };
+    // Wrong length.
+    assert!(call(3, &[1, 3, 5], &[0, 3], &[3, 3]).is_err());
+    // Non-monotonic, last == len.
+    assert!(call(3, &[1, 3, 5], &[0, 5, 3], &[3, 3]).is_err());
+    // Does not end at the flat query length.
+    assert!(call(3, &[1, 3, 5], &[0, 1, 2], &[3, 3]).is_err());
+    // k_dec narrower than the widest row query.
+    assert!(call(1, &[1, 3, 5], &[0, 2, 3], &[3, 3]).is_err());
+    // n_measured still per-set.
+    assert!(call(3, &[1, 3, 5], &[0, 2, 3], &[3]).is_err());
+}
+
+#[test]
+fn each_row_consults_its_own_query_panel() {
+    // Both rows of the set flag their single query position, but they query
+    // DIFFERENT genes — so a lookup that reused the set's first panel would
+    // withhold gene 1 from both instead of gene 1 from row 0 and gene 3 from
+    // row 1. The weaker version of this test (row 1 flagging nothing) passes
+    // with the panel indexed by set, which is why it is written this way.
+    let sc = v3_scalars(PreprocessMode::PassThrough);
+    let b = v3_collate(1, &[1, 3], Some(&[0, 1, 2]), &[1, 1], &[3, 3], &sc);
+    // Row 0 (4.0, 2.0, 6.0 on genes 1, 3, 5) loses gene 1.
+    assert_eq!(&b.encoder_gene_ids[0..2], &[5, 3]);
+    // Row 1 (1.0, 9.0, 3.0 on genes 1, 3, 5) loses gene 3 — NOT gene 1.
+    assert_eq!(&b.encoder_gene_ids[4..6], &[5, 1]);
 }
