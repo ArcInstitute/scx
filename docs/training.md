@@ -513,7 +513,7 @@ RNG-free by design — the decoder query gene ids and per-cell masks are supplie
 by the caller — which is what makes it cheap to hold byte-exact against a Python
 reference implementation.
 
-`pyscx.COLLATE_CELLSET_CONTRACT_VERSION` (currently `2`) pins that contract:
+`pyscx.COLLATE_CELLSET_CONTRACT_VERSION` (currently `3`) pins that contract:
 the crop/mask/target semantics, the accepted preprocess-mode strings, and the
 gather stage's value contract. A consumer mirroring the kernel should assert it
 at setup so version skew fails loudly rather than mid-training.
@@ -611,6 +611,55 @@ Four things to know before setting it:
 
 `IndexPlanDataset` takes a single path and has no manifest, so it has no
 `reader_limit` and its `cache_metrics()` carries no `reader_*` keys.
+
+### Tokenisation kernels
+
+`collate_cellset_gathered` is one model's tokeniser — STATE3's — wired as a
+single call. `pyscx.tokenize` is the kernel set underneath it, addressed through
+plain arrays, for the models whose tokeniser is a different configuration of the
+same steps:
+
+```python
+import pyscx.tokenize as tok
+
+batch = ds.gather(file_ids, rows, role_tags, set_offsets)
+ip, ix, dt = batch["indptr"], batch["indices"], batch["data"]
+
+crop   = tok.top_k(ip, ix, dt, k=2048, n_genes_total=n_genes)
+ranked = tok.rank_tokens(ip, ix, dt, gene_stats, 2048, "genecorpus-30M-v2")
+bins   = tok.bin_values(ip, ix, dt, n_bins=51)
+drawn  = tok.sample_genes(ip, ix, dt, n=1024, seed=0,
+                          file_identity=pyscx.downsample_file_identity(path),
+                          rows=batch["cell_indices"])
+```
+
+Each takes a whole batch so the per-cell loop runs in Rust with the GIL
+released, and returns arrays moved rather than copied. Assert
+`pyscx.tokenize.CONTRACT_VERSION` at setup, as with the collate contract.
+
+Three of the reference tokenisers these follow — scGPT's binning, Geneformer's
+rank order, UCE's sampler — are stochastic or underdetermined, so SCX diverges
+from them in stated ways rather than silently. **Read
+[`docs/tokenize.md`](tokenize.md) before wiring one into a training run**: it
+lists every divergence, what each committed golden does and does not claim, and
+which parameters are part of a tokeniser's output identity.
+
+### Per-row decoder queries (collate contract v3)
+
+`collate_cellset_gathered` takes an optional `query_offsets`. Omitted, the
+decoder query is the per-set `[n_sets, k_dec]` panel it has always been and the
+output is byte-identical to contract v2's — every existing caller is unaffected.
+
+Supplied, it is an `[n_rows + 1]` prefix array over a ragged `query_gene_ids`,
+so two cells in one set can query different genes and different numbers of them.
+Under it, `n_measured` is per-row and `enc_mask_positions` is parallel to the
+ragged query rather than `k_dec`-strided. `k_dec` becomes the padded output
+width, and the batch's `target_pad_mask` — all-zero on the per-set path — says
+which target slots are padding rather than a real zero target.
+
+The addressing is chosen by whether `query_offsets` is present, never by a
+length: `n_sets == n_rows` whenever every set is a singleton, which is the
+common shape for a tokenisation consumer.
 
 ### Count-depth downsampling
 

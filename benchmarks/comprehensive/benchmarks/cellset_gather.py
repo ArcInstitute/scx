@@ -819,6 +819,196 @@ _COLLATE_N_BATCHES = 10
 _COLLATE_SEED = 20260902
 
 
+# ---------------------------------------------------------------------------
+# W6: per-kernel tokenisation arms
+# ---------------------------------------------------------------------------
+#
+# The collate arm above times the whole kernel chain on one shape. These four
+# time each `pyscx.tokenize` kernel on its own, so a change to one is not
+# averaged away by the other three. They reuse the batches the collate arm
+# already gathered — a second gather would dominate the wall and would measure
+# scattered reads, which every other arm in this module already covers.
+#
+# Every shape below is PINNED for the same reason the collate arm's are: the
+# metric is a rate per cell and each kernel's cost is a function of its
+# parameters. A host-dependent value would make the numbers incomparable
+# between captures.
+
+# Encoder crop width — the same as the collate arm's, so the two are comparable.
+_TOKENIZE_K = _COLLATE_K_ENC
+# Geneformer v2's context length.
+_TOKENIZE_L_MAX = 2048
+# scGPT's bin count.
+_TOKENIZE_N_BINS = 51
+# UCE's sample_size.
+_TOKENIZE_SAMPLE_N = 1024
+# Fixed so two captures draw the same statistics vector and the same samples.
+_TOKENIZE_SEED = 20260914
+
+_TOKENIZE_ARMS = ("crop", "rank", "bin", "sample")
+
+
+def _tokenize_supported() -> tuple[bool, str | None]:
+    """Whether the installed pyscx exposes the W6 kernels.
+
+    Never raises, for the same reason `_collate_supported` does not: a raise out
+    of `run` fails the whole cohort SLURM job and this is one optional arm.
+    """
+    try:
+        import pyscx
+
+        tok = getattr(pyscx, "tokenize", None)
+        if tok is None:
+            return False, "pyscx build predates the tokenize namespace"
+        version = getattr(tok, "CONTRACT_VERSION", None)
+        if version is None:
+            return False, "pyscx.tokenize exposes no CONTRACT_VERSION"
+        missing = [k for k in ("top_k", "rank_tokens", "bin_values", "sample_genes")
+                   if not hasattr(tok, k)]
+        if missing:
+            return False, f"pyscx.tokenize is missing {missing}"
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, f"probe failed: {e}"
+
+
+def _tokenize_inputs(
+    batch: dict, rng: np.random.Generator, scx_path: str
+) -> dict[str, Any]:
+    """Build the per-kernel inputs, assert what is load-bearing, record the rest.
+
+    Two kinds of premise, treated differently on purpose:
+
+    **Under this function's control ⇒ raise.** The rank kernel's whole
+    difference from a bare sort is the per-gene divide, and an all-ones (or
+    near-constant) statistics vector makes it a no-op that reorders nothing. The
+    vector is drawn here, so a violation is a bug in this file and must not
+    produce a number. Same rule as the collate arm's all-zero-mask guard.
+
+    **A property of the fixture ⇒ report, and skip that arm.** Whether a file's
+    cells carry more non-zeros than `n`, or more than one distinct value per
+    row, is not something this arm can arrange. `_downsample_supported` already
+    set the precedent of gathering a real batch to learn whether the fixture is
+    deep enough; the difference is that these are per-kernel, so one thin
+    fixture silences one arm rather than all four.
+
+    One premise is deliberately NOT asserted, because stating it would be
+    wrong: the crop does not get *more* expensive when it truncates. Its cost is
+    the sort over the row's positive entries, which runs whatever `k` is; `k`
+    only decides how much of the output is PAD-init. At the shapes here
+    (`k = 2048` against ~1950 nnz/cell on tabula) it does not truncate at all —
+    Phase 1 measured exactly that and concluded a partial select would save
+    nothing. So the ratio is **recorded** rather than gated, and a fixture whose
+    rows are far thinner than `k` gets a warning saying the arm is mostly timing
+    the PAD-init loop.
+    """
+    import pyscx
+
+    indptr = batch["indptr"]
+    data = batch["data"]
+    n_rows = int(batch["shape"][0])
+    n_genes_total = int(batch["shape"][1])
+    row_nnz = np.diff(indptr.astype(np.int64))
+    median_nnz = int(np.median(row_nnz)) if n_rows else 0
+
+    # Strictly positive, and deliberately NOT constant — see the docstring.
+    gene_stats = rng.random(n_genes_total).astype(np.float32) * 0.9 + 0.05
+    if float(gene_stats.min()) <= 0.0:
+        raise RuntimeError("tokenize rank arm: a non-positive gene statistic")
+    if float(gene_stats.std()) < 0.05:
+        raise RuntimeError(
+            "tokenize rank arm: the statistics vector is nearly constant, so the "
+            "per-gene divide would not reorder anything and the arm would time a "
+            "bare sort"
+        )
+
+    # Distinct non-zero values per row, probed rather than computed over every
+    # row: the bin kernel's quantile edges all collapse onto one value when a
+    # row carries fewer than two, and it then takes the degenerate branch.
+    probe = min(n_rows, 64)
+    distinct = [
+        int(len(np.unique(data[int(indptr[r]) : int(indptr[r + 1])])))
+        for r in range(probe)
+    ]
+    distinct_min = min(distinct) if distinct else 0
+
+    skip: dict[str, str] = {}
+    if median_nnz == 0:
+        for arm in _TOKENIZE_ARMS:
+            skip[arm] = "every probed row is empty"
+    if distinct_min < 2:
+        skip["bin"] = (
+            f"a probed row has {distinct_min} distinct value(s); every quantile "
+            "edge would collapse and the arm would time the degenerate branch"
+        )
+    if median_nnz <= _TOKENIZE_SAMPLE_N:
+        skip["sample"] = (
+            f"median nnz/cell {median_nnz} <= n {_TOKENIZE_SAMPLE_N}; the draw "
+            "would cover essentially the whole row, so the inverse-CDF search "
+            "would not be representative"
+        )
+    if median_nnz and median_nnz * 4 < _TOKENIZE_K:
+        logger.warning(
+            "  tokenize crop arm: median nnz/cell %d is under a quarter of k=%d, "
+            "so much of this arm's wall is the PAD-init loop rather than the sort",
+            median_nnz,
+            _TOKENIZE_K,
+        )
+
+    return {
+        "gene_stats": gene_stats,
+        "n_genes_total": n_genes_total,
+        "n_rows": n_rows,
+        "n_sets": len(batch["set_offsets"]) - 1,
+        "file_identity": int(pyscx.downsample_file_identity(scx_path)),
+        "median_nnz": median_nnz,
+        "crop_fill_ratio": round(median_nnz / _TOKENIZE_K, 4) if median_nnz else 0.0,
+        "distinct_values_min": distinct_min,
+        "skip": skip,
+    }
+
+
+def _run_tokenize(arm: str, prepared: list[tuple[dict, dict[str, Any]]]) -> _Outcome:
+    """Time one kernel over every prepared batch."""
+    import pyscx.tokenize as tok
+
+    gc.collect()
+    n_sets = n_cells = 0
+    ttfb_s = 0.0
+    with PeakRssSampler() as sampler:
+        t0 = time.perf_counter()
+        for i, (batch, aux) in enumerate(prepared):
+            ip, ix, dt = batch["indptr"], batch["indices"], batch["data"]
+            if arm == "crop":
+                tok.top_k(ip, ix, dt, _TOKENIZE_K, aux["n_genes_total"])
+            elif arm == "rank":
+                tok.rank_tokens(
+                    ip, ix, dt, aux["gene_stats"], _TOKENIZE_L_MAX, "bench",
+                )
+            elif arm == "bin":
+                tok.bin_values(ip, ix, dt, _TOKENIZE_N_BINS)
+            elif arm == "sample":
+                tok.sample_genes(
+                    ip, ix, dt, _TOKENIZE_SAMPLE_N,
+                    _TOKENIZE_SEED, aux["file_identity"],
+                )
+            else:  # pragma: no cover - guarded by _TOKENIZE_ARMS
+                raise ValueError(f"unknown tokenize arm {arm!r}")
+            if i == 0:
+                ttfb_s = time.perf_counter() - t0
+            n_sets += aux["n_sets"]
+            n_cells += aux["n_rows"]
+        wall_s = time.perf_counter() - t0
+    return _Outcome(
+        n_sets=n_sets,
+        n_cells=n_cells,
+        wall_s=wall_s,
+        ttfb_s=ttfb_s,
+        peak_rss_mb=sampler.peak_mb,
+        shard_cache_hit_rate=None,
+    )
+
+
 def _budget_mb_for(scx_path: str, cache_shards: int) -> int | None:
     """``max_memory_mb`` that holds ``cache_shards`` average shards, +12% headroom.
 
@@ -1603,6 +1793,117 @@ def run(
                     ),
                     "median_us_per_cell": round(statistics.median(co_us), 3),
                 }
+        # --- W6: per-kernel tokenisation arms ----------------------------
+        # Reuses the batches the collate arm gathered, so this costs no I/O.
+        tk_ok, tk_reason = _tokenize_supported()
+        if not tk_ok:
+            logger.info("  tokenize arms not applicable: %s", tk_reason)
+            result.metadata["tokenize"] = {"applicable": False, "reason": tk_reason}
+        elif not co_batches:
+            result.metadata["tokenize"] = {
+                "applicable": False,
+                "reason": "no gathered batches (the collate arm's gather failed)",
+            }
+        else:
+            tk_rng = np.random.default_rng(_TOKENIZE_SEED)
+            # Deliberately NOT wrapped in a try: a premise failure inside
+            # `_tokenize_inputs` must propagate. The arm would still produce a
+            # number without its premise, and a number over the wrong branch is
+            # worse than no number — the same rule as the collate arm's
+            # all-zero-mask guard, which also raises.
+            tk_prepared = [
+                (b, _tokenize_inputs(b, tk_rng, scx_path)) for b in co_batches
+            ]
+            tk_summary: dict[str, Any] = {
+                "applicable": True,
+                "contract_version": int(
+                    __import__("pyscx").tokenize.CONTRACT_VERSION
+                ),
+                "k": _TOKENIZE_K,
+                "l_max": _TOKENIZE_L_MAX,
+                "n_bins": _TOKENIZE_N_BINS,
+                "sample_n": _TOKENIZE_SAMPLE_N,
+                "n_batches": len(tk_prepared),
+                "median_nnz_per_cell": tk_prepared[0][1]["median_nnz"],
+                "crop_fill_ratio": tk_prepared[0][1]["crop_fill_ratio"],
+                "min_distinct_values_per_probed_row": tk_prepared[0][1][
+                    "distinct_values_min"
+                ],
+                "arms": {},
+            }
+            # A fixture-driven skip is recorded per arm, never silently dropped:
+            # an absent metric reads as "not captured", and the reason is what
+            # tells a later reader whether to go find a deeper fixture.
+            tk_skips = tk_prepared[0][1]["skip"]
+            for arm in _TOKENIZE_ARMS:
+                tk_arm = f"tokenize_{arm}"
+                if arm in tk_skips:
+                    logger.info("  tokenize %s arm skipped: %s", arm, tk_skips[arm])
+                    tk_summary["arms"][arm] = {
+                        "applicable": False,
+                        "reason": tk_skips[arm],
+                    }
+                    continue
+                try:
+                    _run_tokenize(arm, tk_prepared)  # warm kernel + allocator
+                except Exception as e:  # noqa: BLE001
+                    logger.error("  tokenize %s warmup failed: %s", arm, e)
+                    tk_summary["arms"][arm] = {"error": str(e)}
+                    continue
+                tk_us: list[float] = []
+                for i in range(n_runs):
+                    try:
+                        out = _run_tokenize(arm, tk_prepared)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(
+                            "  tokenize %s run %d/%d failed: %s",
+                            arm, i + 1, n_runs, e,
+                        )
+                        continue
+                    sps = out.n_sets / out.wall_s if out.wall_s > 0 else 0.0
+                    us_per_cell = (
+                        out.wall_s * 1e6 / out.n_cells if out.n_cells else 0.0
+                    )
+                    result.add_run(
+                        wall_s=out.wall_s,
+                        peak_rss_mb=out.peak_rss_mb,
+                        scenario=tk_arm,
+                        set_size=co_sc.set_size,
+                        n_sets=out.n_sets,
+                        n_cells=out.n_cells,
+                        # Recorded beside the rate: each kernel's cost is a
+                        # function of its own parameter, so a rate without it is
+                        # not comparable between captures.
+                        k_enc=_TOKENIZE_K,
+                        l_max=_TOKENIZE_L_MAX,
+                        n_bins=_TOKENIZE_N_BINS,
+                        sample_n=_TOKENIZE_SAMPLE_N,
+                        cache_policy="in_memory",
+                        **{
+                            f"cellsets_per_sec__{tk_arm}": round(sps, 1),
+                            f"us_per_cell__{arm}": round(us_per_cell, 3),
+                            f"peak_rss_mb__{tk_arm}": round(out.peak_rss_mb, 1),
+                            f"ttfb_first_set_s__{tk_arm}": round(out.ttfb_s, 4),
+                        },
+                    )
+                    tk_us.append(us_per_cell)
+                    logger.info(
+                        "    tokenize %s: us/cell=%.2f rss=%.1fMB",
+                        arm, us_per_cell, out.peak_rss_mb,
+                    )
+                if tk_us:
+                    tk_summary["arms"][arm] = {
+                        "n_runs": len(tk_us),
+                        "median_us_per_cell": round(statistics.median(tk_us), 3),
+                    }
+                    result.metadata.setdefault("scenario_summary", {})[tk_arm] = {
+                        "n_runs": len(tk_us),
+                        "set_size": co_sc.set_size,
+                        "median_us_per_cell": round(statistics.median(tk_us), 3),
+                    }
+            result.metadata["tokenize"] = tk_summary
+            tk_prepared = None
+
         # Both names have to go: `prepared` holds references to the same batch
         # dicts, so dropping only `co_batches` would leave ~160 MB of CSR
         # resident through the rank arm and into this triple's pooled peak.
