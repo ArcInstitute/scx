@@ -22,6 +22,7 @@ pub(crate) mod seed;
 pub mod shuffle;
 pub mod sparse_cellset;
 pub mod sparse_cellset_collate;
+pub mod tokenize;
 
 pub use batch::{Batch, ObsColumn};
 pub use budget::{BudgetBreakdown, PYTHON_OVERHEAD_BYTES};

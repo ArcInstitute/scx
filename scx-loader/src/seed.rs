@@ -30,6 +30,12 @@ pub(crate) const SHARD_SHUFFLE_TAG: u64 = 0x5343_5853_4852_4431; // b"SCXSHRD1"
 /// Domain tag for the Level-2 within-group row shuffle (`decode_stage.rs`).
 pub(crate) const ROW_SHUFFLE_TAG: u64 = 0x5343_5852_4F57_5F32; // b"SCXROW_2"
 
+/// Domain tag for the expression-weighted gene sampler (`tokenize::sample`).
+pub(crate) const TOKENIZE_SAMPLE_TAG: u64 = 0x5343_5854_4B53_4D50; // b"SCXTKSMP"
+
+/// Domain tag for the randomised bin tiebreak (`tokenize::bin`).
+pub(crate) const TOKENIZE_BIN_TAG: u64 = 0x5343_5854_4B42_494E; // b"SCXTKBIN"
+
 /// SplitMix64 finalizer. Used to *chain* key components rather than add them.
 #[inline]
 pub(crate) fn splitmix64(x: u64) -> u64 {
@@ -48,6 +54,27 @@ pub(crate) fn splitmix64(x: u64) -> u64 {
 pub(crate) fn epoch_stream_seed(seed: u64, domain_tag: u64, epoch: u64) -> u64 {
     let h = splitmix64(seed);
     splitmix64(splitmix64(h ^ domain_tag) ^ epoch)
+}
+
+/// Derive a per-row RNG seed from `(seed, domain tag, file identity, row)`.
+///
+/// `downsample.rs` introduced this four-component key and this module is where it
+/// now lives, so the seeded tokenisation kernels reuse the derivation instead of
+/// writing a second one. The `domain` argument is what keeps the reusers apart:
+/// `DownsampleMethod::tag()` supplies `0x1` / `0x2`, and the tokenise kernels
+/// supply [`TOKENIZE_SAMPLE_TAG`] / [`TOKENIZE_BIN_TAG`].
+///
+/// **Do not change this derivation.** Its output is pinned by a blake3 golden
+/// (`downsample_tests.rs`) that `state3` also consumes, so a change here is a
+/// cross-repo break — see the failure message on that test for the full
+/// regeneration procedure. Adding a new `domain` value is not a change to it:
+/// existing tags keep their streams.
+#[inline]
+pub(crate) fn row_seed(seed: u64, domain: u64, file_identity: u64, row: u64) -> u64 {
+    let mut h = splitmix64(seed);
+    h = splitmix64(h ^ domain);
+    h = splitmix64(h ^ file_identity);
+    splitmix64(h ^ row)
 }
 
 #[cfg(test)]

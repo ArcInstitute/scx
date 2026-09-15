@@ -28,6 +28,7 @@ use crate::reader_registry::FileSlot;
 use crate::sparse_cellset_collate::{
     collate_cell, CellIn, CellOut, CollateConfig, PreprocessMode, RowMask, SetQueryIndex,
 };
+use crate::tokenize::Scratch;
 
 /// One batch of cell sets to gather. Rows are flat across all sets in the
 /// batch; `set_offsets` (length `n_sets + 1`) delimits each set's row range.
@@ -1422,38 +1423,43 @@ pub fn collate_gathered(
             .zip(target.par_chunks_mut(k_dec))
             .zip(library.par_iter_mut())
             .enumerate()
-            .for_each(|(r, (((((eid, ecnt), emask), epad), tgt), libslot))| {
-                let s = row_set[r];
-                let lo = indptr[r] as usize;
-                let hi = indptr[r + 1] as usize;
-                let cin = CellIn {
-                    gene_ids: &indices[lo..hi],
-                    raw: &data[lo..hi],
-                    query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
-                    mask: has_mask.then(|| RowMask {
-                        positions: &enc_mask_positions[r * k_dec..(r + 1) * k_dec],
-                        index: &query_indices[s],
-                    }),
-                    hide_readout: hide_readout[r] != 0,
-                };
-                let cfg = CollateConfig {
-                    k_enc,
-                    mode: scalars.mode,
-                    target_sum: scalars.target_sum,
-                    n_measured: n_measured[s] as usize,
-                    pflog_alpha: scalars.pflog_alpha,
-                    n_genes_total: scalars.n_genes_total,
-                    lib_size_redef: scalars.lib_size_redef,
-                };
-                let mut out = CellOut {
-                    enc_ids: eid,
-                    enc_counts: ecnt,
-                    enc_mask: emask,
-                    enc_pad: epad,
-                    target: tgt,
-                };
-                *libslot = collate_cell(&cin, &cfg, &mut out);
-            });
+            // `for_each_init`, not `for_each`: the kernel's per-row buffers are
+            // created once per rayon worker instead of three `Vec`s per cell.
+            .for_each_init(
+                Scratch::new,
+                |scratch, (r, (((((eid, ecnt), emask), epad), tgt), libslot))| {
+                    let s = row_set[r];
+                    let lo = indptr[r] as usize;
+                    let hi = indptr[r + 1] as usize;
+                    let cin = CellIn {
+                        gene_ids: &indices[lo..hi],
+                        raw: &data[lo..hi],
+                        query: &query_gene_ids[s * k_dec..(s + 1) * k_dec],
+                        mask: has_mask.then(|| RowMask {
+                            positions: &enc_mask_positions[r * k_dec..(r + 1) * k_dec],
+                            index: &query_indices[s],
+                        }),
+                        hide_readout: hide_readout[r] != 0,
+                    };
+                    let cfg = CollateConfig {
+                        k_enc,
+                        mode: scalars.mode,
+                        target_sum: scalars.target_sum,
+                        n_measured: n_measured[s] as usize,
+                        pflog_alpha: scalars.pflog_alpha,
+                        n_genes_total: scalars.n_genes_total,
+                        lib_size_redef: scalars.lib_size_redef,
+                    };
+                    let mut out = CellOut {
+                        enc_ids: eid,
+                        enc_counts: ecnt,
+                        enc_mask: emask,
+                        enc_pad: epad,
+                        target: tgt,
+                    };
+                    *libslot = collate_cell(&cin, &cfg, scratch, &mut out);
+                },
+            );
     });
 
     Ok(CollatedCellSetBatch {
