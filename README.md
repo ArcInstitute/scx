@@ -1,13 +1,12 @@
 # SCX — Sparse Cell eXpression System
 
-> **⚠️ Research project that will no longer be maintained.** SCX was built as a
+> **⚠️ Archived research project — no longer maintained.** SCX was built as a
 > research exploration and is **not maintained**: no further development, bug
-> fixes, or support should be expected. It is shared as-is for reference. Do
-> not adopt it for production or long-term use.
-
-> **Status:** pre-1.0 (v0.7.x). Install from
-> [GitHub Releases](https://github.com/ArcInstitute/scx/releases); PyPI + conda
-> planned at public release.
+> fixes, or releases should be expected, and issues/PRs will not be reviewed.
+> It is shared as-is for reference — do not adopt it for production or
+> long-term use. Install from
+> [GitHub Releases](https://github.com/ArcInstitute/scx/releases) for the
+> last published build.
 
 A purpose-built binary file format for single-cell RNA-seq data. SCX replaces h5ad with **3-7× smaller files** (vs uncompressed h5ad), **fastest reads at census scale** (1.5× faster than Zarr on 1M cells, up to 7× with parallel decode, up to 3.2× parallel write scaling), **up to 10× less memory**, a **GPU-saturating training loader**, and a **lazy query engine** — with native bindings for both **Python** and **R**, fully compatible with the [scverse](https://scverse.org/) ecosystem (scanpy, scVI, AnnData) and [Seurat v5](https://satijalab.org/seurat/).
 
@@ -584,8 +583,9 @@ GitHub-Release-wheel-vs-source guidance aimed at agents, see
 **Pre-built binaries (recommended)** — published on each `scx-cli-v*` tag at [GitHub Releases](https://github.com/ArcInstitute/scx/releases). Linux only (x86_64 and arm64), glibc ≥ 2.35 (Ubuntu 22.04+, Debian 13+, RHEL 10+). Bundles `hdf5` (h5ad conversion) and `cloud` (S3/GCS/Azure); libhdf5 is statically linked so no system libraries are required at runtime.
 
 ```bash
-# Set to the latest release version — see https://github.com/ArcInstitute/scx/releases
-VERSION=0.7.1
+# Last published release — see https://github.com/ArcInstitute/scx/releases
+# for whether a newer one ever shipped
+VERSION=0.18.1
 # Pick the matching target for your platform:
 #   linux x86_64 → x86_64-unknown-linux-gnu
 #   linux arm64  → aarch64-unknown-linux-gnu
@@ -602,7 +602,7 @@ tar xzf "scx-cli-${VERSION}-${TARGET}.tar.gz"
 install -m 0755 "scx-cli-${VERSION}-${TARGET}/scx" ~/.local/bin/scx
 ```
 
-Once the repository is public, the asset can also be fetched without `gh`:
+If the repository is public, the asset can also be fetched without `gh`:
 
 ```bash
 curl -L "https://github.com/ArcInstitute/scx/releases/download/scx-cli-v${VERSION}/scx-cli-${VERSION}-${TARGET}.tar.gz" | tar xz
