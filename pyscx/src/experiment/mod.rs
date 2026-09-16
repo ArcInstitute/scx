@@ -363,6 +363,19 @@ impl PyExperiment {
     /// row the file holds, no deletion filtering, column extent
     /// `n_obs_physical`. On a file with no deletions the two coincide.
     ///
+    /// Two costs worth knowing, neither of which the plan builders pay:
+    ///
+    /// - **Each call resolves the graph's shard layout afresh**, which reads
+    ///   every shard's Arrow IPC footer schema (no payload). That is nothing on
+    ///   a handful of shards and adds up if a caller walks a thousand-shard
+    ///   graph a block at a time. `pyscx.neighborhood_plans_from_graph` holds
+    ///   one reader for the whole build and does not.
+    /// - **A `logical` range is bounded by the PHYSICAL span it covers.** Live
+    ///   rows `[start, stop)` may be spread over far more physical rows, and the
+    ///   shards covering that span are what gets decoded — in the limit, two
+    ///   live rows at opposite ends of a heavily deleted file read the whole
+    ///   graph. `logical=False` has no such gap.
+    ///
     /// The training loader's plan builders
     /// (`pyscx.neighborhood_plans_from_graph`) work in physical space and do
     /// their own dropping, so they do not go through this method.

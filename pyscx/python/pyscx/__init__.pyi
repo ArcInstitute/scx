@@ -972,7 +972,12 @@ class Experiment:
         ``start`` / ``stop`` as live row indices, drops any edge whose either
         endpoint is deleted and renumbers both axes into live space, so the
         column extent is ``n_obs``. ``logical=False`` is the physical graph with
-        no filtering and column extent ``n_obs_physical``."""
+        no filtering and column extent ``n_obs_physical``.
+
+        Each call resolves the shard layout afresh (footer schemas only, no
+        payload), and a ``logical`` range is bounded by the **physical** span it
+        covers — two live rows at opposite ends of a heavily deleted file read
+        the whole graph."""
         ...
 
     def obsm_keys(self) -> list[str]: ...

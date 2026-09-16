@@ -176,9 +176,10 @@ pub fn plans_from_graph_chunk(
                     .then(a.1.cmp(&b.1))
             });
             scratch.truncate(k);
-            // Restore graph order among the chosen edges so a set's rows are
-            // ascending whatever `k` was — the gather is cheapest that way and
-            // the choice of *which* edges is what `k` is for.
+            // Restore column order among the chosen edges, so which edges `k`
+            // picked does not also change the order they are emitted in. Note
+            // this makes the NEIGHBOURS ascending, not the set: the centre is
+            // pushed first and its row may be larger than any of them.
             scratch.sort_by_key(|&(_, c)| c);
         }
         let mut set: Vec<u64> = Vec::with_capacity(scratch.len() + 1);
