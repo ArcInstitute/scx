@@ -194,7 +194,14 @@ def deleted_lattice(tmp_path):
     # Row 9 is an interior spot (a neighbour of several centres); row 0 is a
     # corner. Deleting both covers "a deleted centre" and "a deleted neighbour"
     # in one file.
-    pyscx.mark_deleted(str(path), [0, 9])
+    #
+    # Row 31 is there for a different reason and is load-bearing: it sits in the
+    # MIDDLE of the row axis, so a logical block that starts above it spans a
+    # deletion and its live->physical mapping is no longer a constant offset.
+    # With deletions only at 0 and 9, `k[i] - k[start]` and `i - start` agree
+    # for every range above 9, and a mutation replacing the first with the
+    # second passed every mid-range assertion.
+    pyscx.mark_deleted(str(path), [0, 9, 31])
     return str(path)
 
 
@@ -202,16 +209,16 @@ def test_deleted_centres_and_neighbours_are_dropped(deleted_lattice):
     exp = pyscx.open(deleted_lattice)
     assert exp.has_deletions
     keep = np.ones(N, dtype=bool)
-    keep[[0, 9]] = False
+    keep[[0, 9, 31]] = False
 
     graph = _lattice_adata().obsp["connectivities"].tocsr()
     plans, centers = pyscx.neighborhood_plans_from_graph(exp, file_id=0)
     want_rows, want_centers = reference_graph_plans(graph, keep=keep)
     assert list(map(int, centers)) == want_centers
-    assert 0 not in want_centers and 9 not in want_centers
+    assert not ({0, 9, 31} & set(want_centers))
     assert as_rows(plans) == want_rows
     for plan in plans:
-        assert not ({0, 9} & set(map(int, plan[1])))
+        assert not ({0, 9, 31} & set(map(int, plan[1])))
 
     coords = _lattice_adata().obsm["spatial"]
     cplans, ccenters = pyscx.neighborhood_plans_from_coords(exp, k=3, file_id=0)
@@ -385,7 +392,7 @@ def test_read_obsp_rows_equals_the_whole_matrix_sliced(lattice):
 def test_read_obsp_rows_logical_and_physical_differ_under_deletions(deleted_lattice):
     exp = pyscx.open(deleted_lattice)
     n_logical, n_physical = exp.n_obs, exp.n_obs_physical
-    assert n_logical == n_physical - 2
+    assert n_logical == n_physical - 3
 
     logical = exp.read_obsp_rows("connectivities", 0, n_logical)
     assert logical.shape == (n_logical, n_logical)
@@ -404,6 +411,36 @@ def test_read_obsp_rows_logical_and_physical_differ_under_deletions(deleted_latt
 
     with pytest.raises(IndexError):
         exp.read_obsp_rows("connectivities", 0, n_physical)
+
+
+def test_read_obsp_rows_mid_range_logical_block_matches_the_whole(deleted_lattice):
+    """A logical range that does not start at 0 is the interesting case.
+
+    The physical span covering live rows [a, b) is neither contiguous nor
+    aligned to them, so the block read has to map each live row through the
+    keep list rather than offsetting by `a`.
+
+    ⚠️ The ranges below are chosen to straddle the fixture's MIDDLE deletion.
+    Below it, `k[i] - k[start]` and `i - start` are the same number, so a
+    mutation replacing the keep-list mapping with a plain offset passed every
+    range this test originally used — which is what put a deletion at row 31.
+    """
+    exp = pyscx.open(deleted_lattice)
+    whole = exp.to_anndata().obsp["connectivities"].tocsr()
+    n = exp.n_obs
+    for start, stop in [(0, 5), (7, 8), (11, 40), (n - 4, n), (5, 5)]:
+        block = exp.read_obsp_rows("connectivities", start, stop)
+        assert block.shape == (stop - start, n)
+        np.testing.assert_allclose(
+            block.toarray(), whole[start:stop].toarray(), rtol=0, atol=0
+        )
+    # And the same for the physical space, where the mapping is the identity.
+    physical = exp.read_obsp_rows("connectivities", 0, exp.n_obs_physical, logical=False)
+    for start, stop in [(3, 9), (20, 21)]:
+        block = exp.read_obsp_rows("connectivities", start, stop, logical=False)
+        np.testing.assert_allclose(
+            block.toarray(), physical[start:stop].toarray(), rtol=0, atol=0
+        )
 
 
 # ---------------------------------------------------------------------------
