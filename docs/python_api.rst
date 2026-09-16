@@ -126,6 +126,22 @@ ML training datasets
 
    TrainingDataset
    IndexPlanDataset
+   SparseCellSetDataset
+
+Neighbourhood plans
+-------------------
+
+Turn a stored ``obsp`` graph or ``obsm`` coordinates into the cell-set plans
+``SparseCellSetDataset`` consumes — the centre role-tagged, its neighbours
+beside it. See :doc:`training` § Neighbourhood plans.
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   neighborhood_plans_from_graph
+   neighborhood_plans_from_coords
+   batch_plans
 
 Multimodal
 ----------

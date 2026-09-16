@@ -104,11 +104,12 @@ impl BackedDenseReader {
         cache_shards: usize,
         bytes_budget: usize,
     ) -> Result<Self> {
-        let layout = reader.dense_mapping_layout(
+        let layout = reader.row_sharded_mapping_layout(
             "obsm",
             name,
             SectionType::ObsmEmbeddingShard,
             SectionType::ObsmEmbedding,
+            crate::reader::LegacyRowCount::BatchRows,
         )?;
         Ok(Self::from_layout(
             reader,
@@ -122,7 +123,7 @@ impl BackedDenseReader {
     fn from_layout(
         reader: ScxReader,
         name: &str,
-        layout: crate::reader::DenseMappingLayout,
+        layout: crate::reader::MappingLayout,
         cache_shards: usize,
         bytes_budget: usize,
     ) -> Self {

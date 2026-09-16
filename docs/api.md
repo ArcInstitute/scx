@@ -2302,7 +2302,8 @@ the repr onto `Experiment.info() -> str`, whose tokens now include
 - `reload()` — Re-open the file, picking up anything written since the handle was opened. See **Handles and files that change underneath them** below.
 - `close()` — Release the file mapping. Idempotent; reads afterwards raise. Also available as a context manager (`with pyscx.open(p) as exp:`).
 - Properties: `n_obs`, `n_vars`, `nnz`, `shard_count`, `format_version`, `codec_id`, `index_dtype`, `path`, `has_csc`, `has_deletions`, `closed`.
-- List-returning accessors — callable **methods** (not properties): `layer_names()`, and the AnnData-style key accessors `obs_keys()`, `var_keys()`, `obsm_keys()`, `varm_keys()`, `uns_keys()` (all cheap — schema/catalog reads, no matrix decode; `obs_keys()`/`var_keys()` exclude the pandas index column).
+- List-returning accessors — callable **methods** (not properties): `layer_names()`, and the AnnData-style key accessors `obs_keys()`, `var_keys()`, `obsm_keys()`, `obsp_keys()`, `varm_keys()`, `uns_keys()` (all cheap — schema/catalog reads, no matrix decode; `obs_keys()`/`var_keys()` exclude the pandas index column; `obsp_keys()` lists only the COO forms every conversion path writes, since the CSR-backed `ObspCsrShard` has no read API).
+- `read_obsp_rows(key, start, stop, *, logical=True)` — rows `[start, stop)` of an `obsp` graph as a scipy CSR, decoding only the shards the range covers. The bounded counterpart to `to_anndata().obsp[key]`, which materialises the whole matrix. `logical=True` (the default, matching `read_obs`) takes the bounds in **live** row space, drops any edge whose either endpoint is deleted and renumbers both axes into live space; `logical=False` is the physical graph, unfiltered, with column extent `n_obs_physical`. ⚠️ A graph stored as one unsharded section — what `scx sort` emits — is decoded whole whatever range is asked for.
 
 #### Handles and files that change underneath them
 
@@ -3684,6 +3685,54 @@ Gene ids must be non-negative and strictly ascending within each row — what a 
 | `library_size` | `(indptr, data)` | `[n_rows]` `float64`. ⚠️ The sum of the row **as given** — on a panel-projected batch that is the library size after feature filtering, not the cell's sequencing depth. |
 | `measured_mask` | `(indptr, indices, panel)` | `[n_rows * len(panel)]` `uint8`. "Measured", not "non-zero": a gene the row does not carry is absent from the CSR, which on a heterogeneous panel is a different claim from a zero count. |
 | `gene_mask_id` / `pad_id` | `(n_genes_total)` | the two crop sentinels, `n` and `n + 1`. `top_k` rejects any gene id `>= n_genes_total` for exactly this reason. |
+
+### Neighbourhood plans
+
+Turn a stored `obsp` graph, or `obsm` coordinates, into the plans
+`SparseCellSetDataset.gather` / `.iter_with_plans` already take. Each plan is
+**one set**: the centre at position 0 with `role_tag` 0, then its neighbours
+with `role_tag` 1. See [docs/training.md § Neighbourhood
+plans](training.md#neighbourhood-plans) for the worked example.
+
+| Function | Signature | Returns |
+|---|---|---|
+| `neighborhood_plans_from_graph` | `(path, key="connectivities", *, file_id, k=None, weight_order=None, include_center=True, drop_deleted=True, chunk_rows=65536)` | `(plans, centers)`. `plans` is a list of `(file_ids, rows, role_tags, set_offsets)` numpy tuples, one per surviving centre; `centers` is those centres' physical rows. `k` keeps `k` edges from the `weight_order` end (required with `k`), ties by column ascending — a rule this function declares because a stored graph carries none; `k=None` keeps every stored edge in column order. Non-finite weights sort last either way, so a distance graph's `inf` is never picked as a near neighbour. The graph is read one `chunk_rows` range at a time. |
+| `neighborhood_plans_from_coords` | `(path, obsm_key="spatial", *, file_id, k=None, radius=None, include_center=True, drop_deleted=True)` | `(plans, centers)`, as above. Exactly one of `k` / `radius` is required; neither or both raises rather than resolving to one. A uniform grid is built at call time (O(n), no on-disk index) and searched ring by ring, so the answer is **exact**; ties order by squared distance then row ascending. **1-D, 2-D or 3-D only** — the search is exponential in the dimensionality, so a wide key raises rather than not returning. Integer and float64 columns narrow to float32. |
+| `batch_plans` | `(plans, sets_per_batch, *, shuffle_seed=None)` | Single-set plans concatenated into batch plans. `shuffle_seed` reorders the **sets**, never a set's members. The last batch is short, not dropped. |
+
+- `path` accepts a `str`, an `os.PathLike`, or an open `Experiment`.
+- ⚠️ **`file_id` is a manifest position, not a file identity** — the index of
+  this file in the `SparseCellSetDataset` the plans will be gathered with.
+  Plans built from file A and fed to a dataset whose manifest puts A third
+  gather the *first* file's rows, silently. Keyword-only and **required**: a
+  default of `0` would make the documented hazard the quiet path.
+- ⚠️ **`weight_order` is required whenever `k` is given, and has no default.**
+  `"desc"` suits an affinity graph (`connectivities`: larger = closer); `"asc"`
+  suits a distance graph (`distances`: larger = farther). A default of `"desc"`
+  would be right for the default key and silently wrong the moment a caller
+  changed only the key — returning each cell's `k` **farthest** neighbours —
+  so the direction is stated rather than documented.
+- ⚠️ **The two builders order a set's neighbours differently.**
+  `_from_graph` emits them **column-ascending** — a stored graph carries no
+  other order, and re-sorting by weight would make which edges `k` picked also
+  change where they land. `_from_coords` emits them **nearest first**, the
+  order it computed. Position 1 is therefore the nearest neighbour on the
+  coordinate path and simply the lowest-numbered one on the graph path.
+- With `k`, a deleted row is **not a candidate**, so the `k` best of the *live*
+  neighbours are taken and the set is still `k` wide. Without `k`, a set is
+  simply short by whatever is gone. Different answers, both intended.
+- A `Float64` COO `data` column is narrowed to `f32` before ranking, so `k`
+  over a float64 distance graph can order two very close weights differently
+  from `to_anndata().obsp[key]`, which keeps them wide.
+- Rows are **physical**. A deleted centre yields no set (so `centers` is
+  shorter than `n_obs`); a deleted neighbour is never emitted. What that costs
+  a set is the `k` / no-`k` split above. `drop_deleted=False` opts out.
+- A NaN or infinite coordinate on a kept cell **raises**. That differs from the
+  tokenisation kernels, which clip a NaN value to zero: zero is a meaningful
+  expression level, and a NaN coordinate has no defensible grid cell.
+- Sets never span files, so these plans never need `remap_tables`.
+- `scx-accel`'s kNN is deliberately not used: it dispatches to approximate HNSW
+  above 5,000 cells and has no radius mode.
 
 ## CLI (`scx`)
 

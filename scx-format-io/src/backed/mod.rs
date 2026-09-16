@@ -14,6 +14,7 @@
 //! | `aggregate` | the native shard-by-shard statistics kernels built on it |
 //! | `csc` | [`BackedCscReader`] — the optional gene-major sidecar |
 //! | `dense` | [`BackedDenseReader`] — row gather over an `obsm` mapping |
+//! | `pairwise` | [`BackedPairwiseReader`] — bounded row ranges over an `obsp` COO graph |
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -38,6 +39,7 @@ mod csc;
 mod csr;
 mod dense;
 mod index;
+mod pairwise;
 
 // `backed::<name>` is an import path in pyscx, rscx, scx-accel, scx-loader and
 // this crate's own `writer_tests.rs`, and six of these are also flat-re-exported
@@ -53,6 +55,7 @@ pub use csc::{BackedCscIndex, BackedCscReader};
 pub use csr::BackedCsrReader;
 pub use dense::BackedDenseReader;
 pub use index::BackedCsrIndex;
+pub use pairwise::{BackedPairwiseReader, PairwiseRows};
 
 /// Process-wide switch for the codec-agnostic **block-index** scattered read
 /// path (F5 Phase 1). Default on; `SCX_SCATTER_BLOCK_INDEX=0` (or `false`)

@@ -1105,6 +1105,14 @@ fn pyscx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the path-identity helper that keys its RNG.
     m.add_function(wrap_pyfunction!(scx_loader::downsample_counts_csr, m)?)?;
     m.add_function(wrap_pyfunction!(scx_loader::downsample_file_identity, m)?)?;
+    // Neighbourhood plan builders (W7 steps 1-2). Flat rather than a submodule:
+    // two builders and a batching helper is below the bar that justified
+    // `tokenize`, and the loader's other free functions live here too. The two
+    // builders are registered under leading-underscore names because
+    // `pyscx/python/pyscx/__init__.py` wraps them to accept an `Experiment`
+    // handle as well as a path; `batch_plans` needs no coercion and is exported
+    // under its own name.
+    scx_loader::register_neighborhood(m)?;
     // Contract version for the native cell-set path. Bump on ANY change to what
     // the consumer's mirrored implementation must match: the kernel's
     // encoder-crop / masking / target semantics, **the accepted preprocess-mode

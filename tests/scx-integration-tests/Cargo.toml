@@ -12,6 +12,9 @@ scx-ops = { path = "../../scx-ops" }
 scx-engine = { path = "../../scx-engine" }
 scx-sparse = { path = "../../scx-sparse" }
 scx-accel = { path = "../../scx-accel" }
+# Phase 4: the neighbourhood-plan reorder test needs both the plan builder
+# (scx-loader) and the sort op (scx-ops), and this is the only crate with both.
+scx-loader = { path = "../../scx-loader" }
 scx-cloud = { path = "../../scx-cloud" }
 roaring = { workspace = true }
 rand = { workspace = true }

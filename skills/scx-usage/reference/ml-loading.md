@@ -224,6 +224,63 @@ stated ways rather than silently. Two gotchas that bite first:
   not the cell's sequencing depth, and a model normalised against whole-cell
   depth must not be fed it.
 
+## Neighbourhood plans (spatial / graph context)
+
+A neighbourhood is a cell set with the centre role-tagged, so no new gather is
+needed — only a plan. Build one from whichever relationship the file already
+stores:
+
+```python
+import pyscx
+
+exp = pyscx.open("tissue.scx")
+
+# From a stored obsp graph. `weight_order` says which end `k` keeps:
+# "desc" for an affinity (connectivities), "asc" for a distance graph.
+plans, centers = pyscx.neighborhood_plans_from_graph(
+    exp, "connectivities", file_id=0, k=8, weight_order="desc")
+
+# Or straight from obsm["spatial"], with no graph and no index
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, k=8)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, file_id=0, radius=50.0)
+
+ds = pyscx.SparseCellSetDataset(["tissue.scx"])
+for batch in ds.iter_with_plans(pyscx.batch_plans(plans, sets_per_batch=64)):
+    ...   # role_tags: 0 for each set's centre, 1 for its neighbours
+```
+
+The plans feed `gather` / `iter_with_plans` and the tokenisation kernels above
+unchanged. Four things that bite first:
+
+- **`file_id` is a manifest position, not a file identity** — the index of this
+  file in the `SparseCellSetDataset` you will gather with. Get it wrong and you
+  gather a different file's rows with nothing raising, which is why it is
+  required rather than defaulting to 0.
+- **`weight_order` is required with `k`, and has no default.** It decides which
+  end of the weights `k` keeps, and the key's name does not say: `"desc"` for
+  an affinity graph (`connectivities`), `"asc"` for a distance graph
+  (`distances`). A default would make `k=8` on `"distances"` silently return
+  each cell's eight *farthest* neighbours.
+- **The coordinate builder takes 1-D, 2-D or 3-D only.** `obsm_key="X_pca"` on
+  a wide embedding is refused; write a kNN into `obsp` and use the graph
+  builder instead.
+- **Rows are physical, and deletions are dropped.** A deleted centre yields no
+  set at all (so `centers` is shorter than `n_obs` and tells you which
+  survived). A deleted neighbour is never emitted — and what that costs the set
+  depends on `k`: without it the set is simply short, with it the `k` best
+  *live* neighbours are taken and the set stays `k` wide.
+- **Layout, not the builder, decides what this costs.** A converted spatial file
+  is usually in barcode order, where a 7-cell neighbourhood is scattered across
+  the whole row axis and every batch touches every shard. `scx sort` on a key
+  that tracks position is the lever; measure before and after.
+- **`radius` and `k` are mutually exclusive** on the coordinate builder, and
+  passing neither or both raises rather than picking one.
+
+`Experiment.read_obsp_rows(key, start, stop)` is the bounded graph read the
+builder uses, and is public — use it instead of `to_anndata().obsp[k]`, which
+materialises the whole matrix. It is only bounded on a *sharded* graph; `scx
+sort` re-emits obsp unsharded.
+
 ## Train / val / test splits
 
 - **Query-based (recommended):** if obs has a `split` column, materialize each

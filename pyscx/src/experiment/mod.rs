@@ -335,6 +335,167 @@ impl PyExperiment {
         Ok(self.reader()?.list_obsm())
     }
 
+    /// Keys of the `obsp` pairwise graphs. Pure catalog scan.
+    /// Callable method (`exp.obsp_keys()`) to match AnnData.
+    ///
+    /// Lists only the COO forms (`ObspEmbedding` / `ObspEmbeddingShard`), which
+    /// is every graph any conversion path writes. The CSR-backed
+    /// `ObspCsrShard` has no read API anywhere and is dropped by `compact`,
+    /// `sort` and `merge`, so listing it would name something unreadable.
+    fn obsp_keys(&self) -> PyResult<Vec<String>> {
+        Ok(self.reader()?.list_obsp())
+    }
+
+    /// Read rows `[start, stop)` of `obsp/<key>` as a scipy CSR matrix.
+    ///
+    /// The bounded counterpart to `to_anndata().obsp[key]`, which materialises
+    /// the whole graph: only the shards covering the range are decoded, so a
+    /// caller can walk an atlas-scale graph a block at a time. (A graph stored
+    /// as one unsharded section — what `scx sort` emits — has to be decoded
+    /// whole whatever range is asked for; the range is then applied to the
+    /// decoded triples.)
+    ///
+    /// **Row space.** `logical=True` (the default, matching `read_obs`) treats
+    /// `start` / `stop` as **live** row indices, drops any edge whose *either*
+    /// endpoint is deleted, and renumbers both axes into live space — the same
+    /// rule `to_anndata()` applies to the whole matrix. The result's column
+    /// extent is then `n_obs`. `logical=False` is the **physical** graph: every
+    /// row the file holds, no deletion filtering, column extent
+    /// `n_obs_physical`. On a file with no deletions the two coincide.
+    ///
+    /// Two costs worth knowing, neither of which the plan builders pay:
+    ///
+    /// - **Each call resolves the graph's shard layout afresh**, which reads
+    ///   every shard's Arrow IPC footer schema (no payload). That is nothing on
+    ///   a handful of shards and adds up if a caller walks a thousand-shard
+    ///   graph a block at a time. `pyscx.neighborhood_plans_from_graph` holds
+    ///   one reader for the whole build and does not.
+    /// - **A `logical` range is bounded by the PHYSICAL span it covers.** Live
+    ///   rows `[start, stop)` may be spread over far more physical rows, and the
+    ///   shards covering that span are what gets decoded — in the limit, two
+    ///   live rows at opposite ends of a heavily deleted file read the whole
+    ///   graph. `logical=False` has no such gap.
+    ///
+    /// The training loader's plan builders
+    /// (`pyscx.neighborhood_plans_from_graph`) work in physical space and do
+    /// their own dropping, so they do not go through this method.
+    #[pyo3(signature = (key, start, stop, *, logical=true))]
+    fn read_obsp_rows<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        start: usize,
+        stop: usize,
+        logical: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if stop < start {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "read_obsp_rows: stop ({stop}) is before start ({start})"
+            )));
+        }
+        // Gate on *this* handle's view first: the bounded read below re-opens
+        // from `self.path` (`BackedPairwiseReader` takes an owned reader), and a
+        // fresh reader is fresh by definition — without this the handle would
+        // answer here while refusing everywhere else. Same reasoning, same
+        // shape as `materialize::gather_rows_sparse_impl`.
+        // Gate on this handle's freshness, then do nothing else attached.
+        // `compute_kept_to_global` used to run here, and it decodes the
+        // deletion section and allocates an `n_obs` mask — real work, under the
+        // GIL, on the path the rest of this method was just moved off. The
+        // detached block below builds the mask from the reader it opens anyway.
+        let _fresh = self.reader()?;
+        let path = self.path.clone();
+        let key = key.to_string();
+
+        // Everything below is file I/O, Arrow decompression, a counting sort
+        // and — on the logical path — a remap over every edge in the range.
+        // It ran under the GIL, which on the surface documented as the
+        // atlas-scale bounded read starves every other Python thread for the
+        // duration; both plan builders detach and this did not. Only the numpy
+        // and scipy object construction stays attached, as it must.
+        /// `(indptr, indices, data, column extent)` of one decoded block.
+        type ObspBlock = (Vec<i64>, Vec<i64>, Vec<f32>, usize);
+        let decoded: PyResult<ObspBlock> = py.detach(move || {
+            let scx = ScxReader::open(&path).map_err(to_pyerr)?;
+            let kept: Option<Vec<u64>> = if logical {
+                crate::convert::compute_kept_to_global(&scx)?
+            } else {
+                None
+            };
+            let backed =
+                scx_format_io::BackedPairwiseReader::new_obsp(scx, &key).map_err(to_pyerr)?;
+            let n_axis = match &kept {
+                Some(k) => k.len(),
+                None => backed.n_rows() as usize,
+            };
+            if stop > n_axis {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "read_obsp_rows: stop ({stop}) exceeds the {} row count ({n_axis})",
+                    if logical { "logical" } else { "physical" }
+                )));
+            }
+            let n_rows = stop - start;
+            match &kept {
+                None => {
+                    let rows = backed
+                        .read_rows_range(start as u64, stop as u64)
+                        .map_err(to_pyerr)?;
+                    Ok((rows.indptr, rows.indices, rows.data, n_axis))
+                }
+                Some(k) => {
+                    // A logical range is a set of non-contiguous physical rows,
+                    // so read the physical span that covers it and pick out the
+                    // kept ones. Renumbering both axes through `k` is what makes
+                    // the result square in live space.
+                    let mut indptr = vec![0i64];
+                    let mut indices: Vec<i64> = Vec::new();
+                    let mut data: Vec<f32> = Vec::new();
+                    if n_rows > 0 {
+                        let lo = k[start];
+                        let hi = k[stop - 1] + 1;
+                        let rows = backed.read_rows_range(lo, hi).map_err(to_pyerr)?;
+                        // One inverted table rather than a binary search per
+                        // edge: the column remap runs once per non-zero, and
+                        // `k` is up to n_obs long, so the search was
+                        // O(nnz log n_obs) over a cold cache for a lookup that
+                        // is O(1) against one pass to build it.
+                        let mut live_of: Vec<i64> = vec![-1; backed.n_rows() as usize];
+                        for (live, &phys) in k.iter().enumerate() {
+                            if (phys as usize) < live_of.len() {
+                                live_of[phys as usize] = live as i64;
+                            }
+                        }
+                        for &phys in &k[start..stop] {
+                            let local = (phys - lo) as usize;
+                            let (cols, vals) = rows.row(local);
+                            for (&c, &v) in cols.iter().zip(vals) {
+                                let live = live_of.get(c as usize).copied().unwrap_or(-1);
+                                if live >= 0 {
+                                    indices.push(live);
+                                    data.push(v);
+                                }
+                            }
+                            indptr.push(indices.len() as i64);
+                        }
+                    }
+                    Ok((indptr, indices, data, n_axis))
+                }
+            }
+        });
+        let (indptr, indices, data, n_axis) = decoded?;
+        let n_rows = stop - start;
+
+        let scipy_sparse = crate::pyimport::import_module(py, "scipy.sparse")?;
+        let args = ((
+            PyArray1::from_vec(py, data),
+            PyArray1::from_vec(py, indices),
+            PyArray1::from_vec(py, indptr),
+        ),);
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("shape", (n_rows, n_axis))?;
+        scipy_sparse.call_method("csr_matrix", args, Some(&kwargs))
+    }
+
     /// Keys of the `varm` gene-embedding mappings. Pure catalog scan.
     /// Callable method (`exp.varm_keys()`) to match AnnData.
     fn varm_keys(&self) -> PyResult<Vec<String>> {

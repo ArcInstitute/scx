@@ -3298,6 +3298,102 @@ non-zeros being sorted, not to the constant output width. That is why the crop
 arm does not assert that it truncates: truncation makes it cheaper, and at these
 shapes it does not truncate at all.
 
+### Neighbourhood plans: what a spatial gather costs (phase 4)
+
+R6 — spatial and graph-context workloads — had no loader surface before this:
+coordinates and graphs were stored and nothing turned either into a plan. These
+are the first captured numbers for the two builders and for gathering what they
+produce.
+
+One-armed capture, SLURM `2961099`, host `GPU0F98`, partition
+`cpu_batch_high_mem`, `phase4-neighborhood-plans` `5a69d7ad`, 8 rounds x 3
+timed runs on `visium_lymph_node` (4,035 spots x 36,601 genes, 8 shards),
+`RAYON_NUM_THREADS=16`, page cache dropped before every run. Raw rows under
+`results/raw/phase4_neighborhood/neighborhood.json`.
+
+⚠️ **This capture replaces two earlier ones, and what it does *not* reproduce
+is worth stating.** The first (job `2959318`, 2 rounds) and second (`2959338`,
+8 rounds) were taken at `ab156ab9`, before two review fix commits changed the
+timed path — the graph open now compares every shard's schema and the COO
+decode validates every row against its shard's stamped span. Publishing pre-fix
+figures as the current builders' numbers is a provenance slip a reader cannot
+detect, so the capture was re-run at the reviewed head rather than annotated,
+and the superseded artifacts are not shipped.
+
+Those earlier captures showed a first-touch effect — round 1 running 1.4x
+slower than rounds 2–8 even though every run drops the page cache — and **this
+one does not**: its eight rounds span 5.5 % and 1.6 %. So that effect was a
+property of those runs, not of the code, and no claim is made about it here.
+It is the reason the capture takes eight rounds rather than the two the phase
+gate asks for.
+
+#### Steady state, at k = 6 and 146 sets per batch
+
+| metric | graph-driven | coordinate-driven |
+|---|---|---|
+| sets/s | **15,474** (15,239–16,083) | **14,971** (14,845–15,084) |
+| µs/cell | 9.96 (9.58–10.11) | 9.54 (9.47–9.62) |
+| plan build, whole file | **2.9 ms** | **13 ms** |
+| peak RSS | 1,813 MB (1,599–2,006) | 1,839 MB (1,596–2,005) |
+
+Median over 8 rounds, min–max in brackets. Spread is 5.5 % and 1.6 % on the
+rates — unlike the superseded capture, this one has no first-touch outlier, so
+every round is reported rather than round 1 being split out. The two paths
+agree to within 3.4 % on the gather, which they should: at k = 6 on a lattice
+they select nearly the same cells, and the gather does not know which builder
+produced the plan.
+
+**Building the plans is not the cost.** 4,035 neighbourhoods come out of the
+stored graph in 2.9 ms and out of the coordinates in 13 ms — against roughly
+260 ms to gather them. The coordinate builder is ~4.5x the graph one and still
+under 1 % of the round, which answers "should the grid search be parallel" with
+a measurement rather than a guess. The per-row span validation added between
+the two captures is invisible at this scale: 3.2 ms before, 2.9 ms after.
+
+At Xenium scale (10⁵ cells) the build term is the one that grows, and this
+capture does not reach it.
+
+#### What these numbers are and are not
+
+**They are the pessimal scattered read.** The fixture's obs order is barcode
+order, which has nothing to do with position: a 7-cell neighbourhood spans a
+median of **3,024 row indices of 4,035** and every batch touches **all 8
+shards**. `scx sort` on a key that tracks position is the lever that turns
+these into contiguous reads, and this capture does not pull it — so read these
+as the floor a spatial file gets for free, not as what the regime can do.
+
+⚠️ **This capture cannot show that nothing else regressed.** Every run is a
+*head* build — the driver never builds `main` — so the four pre-existing
+`gather_*` metrics recorded on the same runs are within-build variance, not a
+comparison. Three of the four are steady across all eight rounds (782.9 sets/s
+`gather_random`, spread 5.4 %; 897.2 `gather_grouped`, 7.0 %; 85.6
+`gather_random_s512`, 9.8 %), which is worth knowing and is not the same claim.
+The fourth, `gather_grouped_s512`, is not steady and resolves nothing: its
+median is 95.3 but one round reads 233.2. At 4,035 spots an S=512 grouped batch
+is most of the file, so that arm runs a handful of very large plans and one
+scheduling hiccup moves it 2.4x. Reported rather than trimmed.
+
+**No floor is proposed**, and `thresholds.yaml` item 23 records three separate
+blockers, one specific to this phase: these arms run on a single dataset that is
+deliberately outside every `capture_baseline.TIERS` list, and a floor on a
+triple the default gate never schedules reads as coverage while providing none.
+
+**The reuse signal this regime was supposed to provide is not set overlap.** The
+design called overlapping neighbourhoods "the reuse signal". Measured on the
+graph arm at its own parameters — k = 6, 146 sets/batch, `shuffle_seed`
+20260915 — the batch duplicate factor is 1.1023 in centre order, **1.1084**
+shuffled (the value the committed artifact carries, under
+`neighborhood.arms.graph.locality.batch_duplicate_factor`), and **1.1286 for a
+random-plan control of the same set size and batch width**. Random sets
+duplicate rows *more* than neighbourhoods do, because neighbourhoods partition
+the tissue while random draws collide freely. The coordinate arm is the same
+story: 1.113 / 1.1185 / 1.1286. The reuse that is real is shard locality, which
+is a property of layout, not of the plan.
+
+The ordered and random-control figures are reproducible from the fixture in
+seconds with `pyscx.batch_plans` and carry no timing, so they need no capture;
+the shuffled one is read off the committed artifact.
+
 ### Shard-cache sizing on the gather path (data-load Phase 1, 1A)
 
 The pathology that motivated this work: STATE3 measured **143 s/batch** on a scattered

@@ -84,6 +84,13 @@ class DatasetConfig:
     # multimodal_compression / multimodal_training benchmarks branch on
     # this flag.
     multimodal: bool = False
+    # Rows per X / obsm / obsp shard at conversion time. `None` takes the
+    # writer's default, which is what every dataset here wants — a fixture whose
+    # n_obs is below that default emits ONE shard per section, and a benchmark
+    # whose point is a bounded per-shard read then measures a whole-matrix
+    # decode without saying so. `visium_lymph_node` is the one dataset that
+    # cares: at 4,035 spots the default gives a single obsp shard.
+    shard_size: int | None = None
     modality_names: tuple[str, ...] = ()
 
     @property
@@ -719,6 +726,26 @@ DATASETS: dict[str, DatasetConfig] = {
         n_obs=50_000, n_vars=5_000,
         protocol="synthetic (uint8)", source="generated on /scratch",
         approx_h5ad_mb=40, available=True,
+    ),
+    # The suite's only spatial dataset, and the only one carrying obsm or obsp
+    # at all (see `scx_full_path` above: no source h5ad here has either). Built
+    # by `benchmarks/scripts/download_visium.py`, which downloads the sample via
+    # `sc.datasets.visium_sge` and computes the obsp graph from the coordinates
+    # — Visium ships obsm["spatial"] and no obsp.
+    #
+    # Deliberately **not** in any `capture_baseline.TIERS` list. `scx_full_path`
+    # above spells out why that matters: a dataset outside every tier makes its
+    # floors read as coverage while providing none, and 53 floors are already in
+    # that state. The `cellset_gather` neighbourhood arms run against it from an
+    # explicit capture driver instead, and no floor is proposed for them.
+    "visium_lymph_node": DatasetConfig(
+        id="SP1", name="visium_lymph_node",
+        n_obs=4_035, n_vars=36_601,
+        protocol="10x Visium (spatial)", source="10x Genomics via scanpy.datasets.visium_sge",
+        approx_h5ad_mb=195, available=True,
+        # Eight X/obsm/obsp shards rather than one, so the neighbourhood arms'
+        # bounded obsp read is what they actually measure.
+        shard_size=512,
     ),
 }
 

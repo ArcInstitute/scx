@@ -11,33 +11,70 @@ use super::*;
 /// sharded reader path to verify a contiguous, ordered cover of the
 /// logical matrix. Distinct from `crate::shard::ShardHeader`, which is
 /// the on-disk 76-byte CSR/CSC shard header.
-struct ObsmShardMetadata {
+struct RowShardMetadata {
     shard_idx: u32,
     row_start: u64,
     n_shard_rows: u64,
     n_rows_total: u64,
 }
 
-/// Physical layout of a row-sharded dense mapping, resolved by
-/// [`ScxReader::dense_mapping_layout`] and consumed by
-/// [`crate::BackedDenseReader`].
-pub(crate) struct DenseMappingLayout {
+/// Physical layout of a row-sharded Arrow IPC mapping, resolved by
+/// [`ScxReader::row_sharded_mapping_layout`] and consumed by
+/// [`crate::BackedDenseReader`] (`obsm`, dense) and
+/// [`crate::BackedPairwiseReader`] (`obsp`, COO).
+///
+/// The shard cover is identical for both families — every sharded
+/// mapping stamps `shard_idx` / `row_start` / `n_shard_rows` /
+/// `n_rows_total` through `writer::stamp_dense_shard_meta`. What differs
+/// is the *legacy* single-section case and what the column fields mean;
+/// see [`LegacyRowCount`].
+pub(crate) struct MappingLayout {
     /// Per-shard rows, ordered by `shard_idx` (== sorted by `row_start`).
-    pub(crate) entries: Vec<DenseShardLayoutEntry>,
+    pub(crate) entries: Vec<MappingShardLayoutEntry>,
     /// Total logical row count (last shard's `n_rows_total`).
     pub(crate) n_rows: u64,
-    /// Embedding dimensionality (number of dense columns).
+    /// Number of Arrow columns. Dense: the embedding dimensionality.
+    /// **Pairwise: 3** (`row` / `col` / `data`) — it is *not* the
+    /// matrix's column count, which lives in the `n_cols` schema
+    /// metadata key instead.
     pub(crate) n_cols: usize,
     /// Column-0 dtype, as a representative for the whole mapping.
     pub(crate) dtype: arrow::datatypes::DataType,
     /// Canonical column fields (per-shard schema metadata stripped) —
     /// the row-gather output schema. Taken from the first shard.
     pub(crate) fields: arrow::datatypes::Fields,
+    /// The **matrix's** column count, from the `n_cols` schema metadata
+    /// key. Only pairwise (COO) sections stamp it, because only they
+    /// have a column axis that the Arrow columns do not describe; `None`
+    /// on a dense mapping, where `n_cols` above is the answer.
+    pub(crate) matrix_n_cols: Option<u64>,
+}
+
+/// How to read the row count of a **legacy single-section** mapping,
+/// which carries no `row_start` / `n_shard_rows` stamp.
+///
+/// This is the one place the dense and pairwise families genuinely
+/// diverge, and getting it wrong is silent: for a dense `obsm` section
+/// one Arrow row *is* one obs row, but for a COO `obsp` section one
+/// Arrow row is one `(row, col, data)` triple, so `batch.num_rows()`
+/// answers **nnz**. `scx sort` writes obsp back unsharded
+/// (`scx-ops/src/sort_engine.rs` calls `write_obsp`, not
+/// `write_obsp_shard_coo`), so this is not a hypothetical branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegacyRowCount {
+    /// One Arrow row per logical row — dense `obsm` / `varm`.
+    BatchRows,
+    /// The `n_rows` schema metadata key — COO `obsp` / `varp`.
+    SchemaNRows,
 }
 
 /// One shard's catalog offset + stamped row range. Mirrors the fields
-/// `BackedDenseReader` needs (no `nnz`, since dense shards aren't CSR).
-pub(crate) struct DenseShardLayoutEntry {
+/// the backed readers need (no `nnz`, since these are not CSR shards).
+///
+/// `Copy` so a backed reader can retain these directly rather than defining a
+/// private twin with the same six fields and copying them across one by one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MappingShardLayoutEntry {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) section_type: SectionType,
@@ -50,7 +87,7 @@ pub(crate) struct DenseShardLayoutEntry {
 /// off a sharded batch's schema metadata. Returns
 /// `ScxError::InvalidCatalog` if any field is missing or unparseable,
 /// naming the logical section so the caller can produce a useful error.
-fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardMetadata> {
+fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<RowShardMetadata> {
     parse_shard_metadata_md(logical, batch.schema_ref().metadata())
 }
 
@@ -60,7 +97,7 @@ fn parse_shard_metadata(logical: &str, batch: &RecordBatch) -> Result<ObsmShardM
 fn parse_shard_metadata_md(
     logical: &str,
     md: &std::collections::HashMap<String, String>,
-) -> Result<ObsmShardMetadata> {
+) -> Result<RowShardMetadata> {
     let get = |key: &str| -> Result<u64> {
         md.get(key)
             .ok_or_else(|| {
@@ -76,7 +113,7 @@ fn parse_shard_metadata_md(
     };
     let shard_idx = u32::try_from(get("shard_idx")?)
         .map_err(|_| ScxError::InvalidCatalog(format!("{logical}: shard_idx exceeds u32::MAX")))?;
-    Ok(ObsmShardMetadata {
+    Ok(RowShardMetadata {
         shard_idx,
         row_start: get("row_start")?,
         n_shard_rows: get("n_shard_rows")?,
@@ -1017,28 +1054,34 @@ impl ScxReader {
         self.read_arrow_ipc(entry)
     }
 
-    /// Resolve the per-shard physical layout of a row-sharded dense
-    /// mapping (e.g. `obsm/<name>`) for the backed dense row-gather
-    /// reader ([`crate::BackedDenseReader`]).
+    /// Resolve the per-shard physical layout of a row-sharded Arrow IPC
+    /// mapping — `obsm/<name>` (dense) or `obsp/<name>` (COO) — for the
+    /// backed row-range readers ([`crate::BackedDenseReader`],
+    /// [`crate::BackedPairwiseReader`]).
     ///
-    /// Unlike CSR shards, `ObsmEmbeddingShard` catalog entries carry no
-    /// `stats` block, so the per-shard row ranges live only in each
-    /// shard's Arrow schema metadata (`row_start` / `n_shard_rows` /
-    /// `n_rows_total`, stamped by `writer::stamp_dense_shard_meta`).
-    /// We read each shard's IPC **footer schema only** (no batch
-    /// deserialisation) and validate a contiguous, ordered cover with
-    /// the same invariant as [`assemble_sharded_metadata`].
+    /// Unlike CSR shards, these catalog entries carry no `stats` block,
+    /// so the per-shard row ranges live only in each shard's Arrow
+    /// schema metadata (`row_start` / `n_shard_rows` / `n_rows_total`,
+    /// stamped by `writer::stamp_dense_shard_meta`). We read each
+    /// shard's IPC **footer schema only** (no batch deserialisation) and
+    /// validate a contiguous, ordered cover with the same invariant as
+    /// [`assemble_sharded_metadata`].
     ///
     /// Falls back to the legacy single-section layout (`single_type`)
-    /// treated as one shard spanning `[0, num_rows)` — that path
-    /// deserialises the one batch to learn its row count.
-    pub(crate) fn dense_mapping_layout(
+    /// treated as one shard spanning `[0, n_rows)`. How that path learns its
+    /// row count is [`LegacyRowCount`]'s decision, and the two differ in cost
+    /// as well as in meaning: `BatchRows` must deserialise the one batch,
+    /// because the count IS `batch.num_rows()`; `SchemaNRows` reads the IPC
+    /// footer schema only, which matters because the batch it would otherwise
+    /// decode-and-drop is every triple in the graph.
+    pub(crate) fn row_sharded_mapping_layout(
         &self,
         prefix: &str,
         name: &str,
         shard_type: SectionType,
         single_type: SectionType,
-    ) -> Result<DenseMappingLayout> {
+        legacy_rows: LegacyRowCount,
+    ) -> Result<MappingLayout> {
         let shard_name_prefix = format!("{prefix}/{name}_shard_");
         let logical = format!("{prefix}/{name}");
 
@@ -1056,8 +1099,9 @@ impl ScxReader {
 
         if !shards.is_empty() {
             shards.sort_by_key(|(idx, _)| *idx);
-            let mut entries: Vec<DenseShardLayoutEntry> = Vec::with_capacity(shards.len());
+            let mut entries: Vec<MappingShardLayoutEntry> = Vec::with_capacity(shards.len());
             let mut n_cols = 0usize;
+            let mut matrix_n_cols: Option<u64> = None;
             let mut dtype = arrow::datatypes::DataType::Float32;
             let mut fields: arrow::datatypes::Fields = Default::default();
             let mut prev_n_rows_total = 0u64;
@@ -1085,6 +1129,10 @@ impl ScxReader {
                         dtype = schema.field(0).data_type().clone();
                     }
                     fields = schema.fields().clone();
+                    matrix_n_cols = schema
+                        .metadata()
+                        .get("n_cols")
+                        .and_then(|v| v.parse::<u64>().ok());
                     prev_n_rows_total = hdr.n_rows_total;
                     next_expected_row_start = hdr.n_shard_rows;
                 } else {
@@ -1104,9 +1152,31 @@ impl ScxReader {
                     next_expected_row_start =
                         next_expected_row_start.saturating_add(hdr.n_shard_rows);
                     prev_n_rows_total = hdr.n_rows_total;
+                    // The column extent is taken from shard 0 and then used for
+                    // the whole mapping, so a later shard that disagrees about
+                    // it would be read against the wrong axis. Checked only
+                    // where shard 0 had one — a dense `obsm` stamps no
+                    // `n_cols`, and absence there is not a disagreement.
+                    if let Some(expected) = matrix_n_cols {
+                        let here = schema
+                            .metadata()
+                            .get("n_cols")
+                            .and_then(|v| v.parse::<u64>().ok());
+                        if here != Some(expected) {
+                            return Err(ScxError::InvalidCatalog(format!(
+                                "{logical}: shard {i} declares n_cols={here:?} but shard 0 \
+                                 declares {expected}"
+                            )));
+                        }
+                    }
+                    if schema.fields() != &fields {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: shard {i}'s column schema differs from shard 0's"
+                        )));
+                    }
                 }
                 let _ = idx;
-                entries.push(DenseShardLayoutEntry {
+                entries.push(MappingShardLayoutEntry {
                     offset: entry.offset,
                     length: entry.length,
                     section_type: entry.section_type,
@@ -1121,12 +1191,13 @@ impl ScxReader {
                      n_rows_total is {prev_n_rows_total}"
                 )));
             }
-            return Ok(DenseMappingLayout {
+            return Ok(MappingLayout {
                 entries,
                 n_rows: prev_n_rows_total,
                 n_cols,
                 dtype,
                 fields,
+                matrix_n_cols,
             });
         }
 
@@ -1136,17 +1207,67 @@ impl ScxReader {
             .get(&logical)
             .filter(|e| e.section_type == single_type)
             .ok_or_else(|| ScxError::SectionNotFound(logical.clone()))?;
-        let batch = self.read_arrow_ipc(entry)?;
-        let n_rows = batch.num_rows() as u64;
-        let n_cols = batch.num_columns();
-        let dtype = if n_cols > 0 {
-            batch.column(0).data_type().clone()
-        } else {
-            arrow::datatypes::DataType::Float32
+
+        // The pairwise arm reads the IPC **footer schema** and stops there.
+        // Everything it needs — the column fields, the dtype, and the `n_rows`
+        // / `n_cols` stamps — is in the schema, while the payload is every COO
+        // triple in the graph: on an atlas-scale unsharded obsp that is a
+        // multi-gigabyte decode, performed here only to be dropped and then
+        // performed again by the first `read_rows_range`. The dense arm cannot
+        // take this path: its row count IS `batch.num_rows()`, which the footer
+        // does not carry.
+        let (n_rows, n_cols, dtype, fields, matrix_n_cols) = match legacy_rows {
+            LegacyRowCount::SchemaNRows => {
+                let schema = self.read_arrow_ipc_schema_physical(entry)?;
+                let md = schema.metadata();
+                let n_rows = md
+                    .get("n_rows")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        ScxError::InvalidCatalog(format!(
+                            "{logical}: legacy pairwise section has no parseable 'n_rows' schema \
+                             metadata, so its logical row count is unknown"
+                        ))
+                    })?;
+                let n_cols = schema.fields().len();
+                let dtype = if n_cols > 0 {
+                    schema.field(0).data_type().clone()
+                } else {
+                    arrow::datatypes::DataType::Float32
+                };
+                let matrix_n_cols = md.get("n_cols").and_then(|v| v.parse::<u64>().ok());
+                (
+                    n_rows,
+                    n_cols,
+                    dtype,
+                    schema.fields().clone(),
+                    matrix_n_cols,
+                )
+            }
+            LegacyRowCount::BatchRows => {
+                let batch = self.read_arrow_ipc(entry)?;
+                let n_cols = batch.num_columns();
+                let dtype = if n_cols > 0 {
+                    batch.column(0).data_type().clone()
+                } else {
+                    arrow::datatypes::DataType::Float32
+                };
+                let matrix_n_cols = batch
+                    .schema_ref()
+                    .metadata()
+                    .get("n_cols")
+                    .and_then(|v| v.parse::<u64>().ok());
+                (
+                    batch.num_rows() as u64,
+                    n_cols,
+                    dtype,
+                    batch.schema_ref().fields().clone(),
+                    matrix_n_cols,
+                )
+            }
         };
-        let fields = batch.schema_ref().fields().clone();
-        Ok(DenseMappingLayout {
-            entries: vec![DenseShardLayoutEntry {
+        Ok(MappingLayout {
+            entries: vec![MappingShardLayoutEntry {
                 offset: entry.offset,
                 length: entry.length,
                 section_type: entry.section_type,
@@ -1158,6 +1279,7 @@ impl ScxReader {
             n_cols,
             dtype,
             fields,
+            matrix_n_cols,
         })
     }
 

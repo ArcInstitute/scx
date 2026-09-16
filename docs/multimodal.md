@@ -442,7 +442,90 @@ are resolved.
 
 ---
 
-## 6. Limitations and follow-ons
+## 6. Spatial
+
+Spatial data is a *layout*, not a separate storage path: coordinates live in
+`obsm["spatial"]` and the neighbourhood relationship, when there is one, lives
+in `obsp` — both ordinary obs-aligned sections that `scx convert` and
+`pyscx.from_anndata` carry. A "spatial file" is therefore an ordinary SCX file
+that happens to have those two keys, and everything else on it works unchanged.
+The `Spatial` modality type in the v2 multimodal layout names an assay; it is
+not what makes a file spatial.
+
+### What SCX serves
+
+The loader turns either key into cell-set plans — see
+[docs/training.md § Neighbourhood plans](training.md#neighbourhood-plans) for
+the API and [docs/api.md § Neighbourhood plans](api.md#neighbourhood-plans) for
+the parameter table. A neighbourhood is a set with the centre role-tagged, so
+the gather, the collation and the tokenisation kernels are the same ones the
+perturbation regime uses.
+
+### Identity rules
+
+Five, and each has bitten something:
+
+1. **Rows are physical.** Plans name physical file rows, because that is what
+   the gather takes. Deletion vectors are applied by *dropping*, not
+   renumbering: a deleted centre yields no set and a deleted neighbour is
+   dropped from every set. `Experiment.read_obsp_rows(..., logical=True)` is the
+   other convention — live row space with both axes renumbered, matching what
+   `to_anndata().obsp[key]` returns — and the two must not be mixed.
+2. **`file_id` is a manifest position.** It says where this file sits in the
+   `SparseCellSetDataset` the plans will be gathered with. Nothing checks it
+   against the file, so a plan built from one file and gathered against another
+   manifest reads the wrong rows silently — which is why it is required rather
+   than defaulting to `0`.
+3. **Row order survives, plan caches do not.** `scx sort` permutes `obsm` and
+   remaps `obsp` in lockstep with obs, so plans *rebuilt* from a sorted file
+   name the same cells. A plan list cached outside the file does not follow the
+   permutation and must be rebuilt.
+4. **Coordinates must be finite, and at most 3-D.** A NaN or infinite
+   coordinate on a live cell is refused rather than bucketed, because a point
+   with no defensible grid cell would otherwise land in some neighbourhood it
+   is not in. Dimensionality above 3 is refused too: the ring search is
+   exponential in it, so a wide embedding would not return rather than merely
+   being slow.
+5. **A stored graph's weights have no self-describing direction.** `k` keeps
+   the `weight_order` end, and that is the caller's to state: scanpy's
+   `connectivities` is an affinity (larger = closer) and its `distances` is a
+   metric (larger = farther), so one setting against the other graph returns
+   each cell's farthest neighbours instead of its nearest.
+
+### Two things worth knowing about how `obsp` is stored
+
+- **It is COO, not CSR.** `ObspEmbedding` / `ObspEmbeddingShard` hold an Arrow
+  IPC batch of `row` / `col` / `data` with global row indices — there is no
+  indptr on disk, so a CSR view of a row range is derived by counting triples.
+  A second encoding, `ObspCsrShard`, exists in the format and **no read API
+  materialises it**; `compact`, `sort` and `merge` all drop it. Every
+  conversion path writes COO.
+- **A bounded read needs a sharded graph.** `read_obsp_rows` decodes only the
+  shards a range covers, but a graph written as one unsharded section is a
+  single Arrow batch and must be decoded whole. `scx sort` re-emits `obsp`
+  through the unsharded writer, so a sorted file's graph is always that case.
+
+### Layout is what decides the cost
+
+The plans say which cells; the file's row order decides how expensive they are
+to fetch. A converted spatial file is usually in **barcode order**, which has
+nothing to do with position — measured on a 4,035-spot Visium sample, a 7-cell
+neighbourhood spans a median of 3,024 row indices and every batch touches every
+shard. `scx sort` on a key that tracks position (a grid bin, a niche label) is
+the lever that turns those into contiguous reads. SCX does not sort for you.
+
+### Deferred: the on-disk spatial index
+
+Grid bucketing at plan-build time is O(n) and needs no index, which covers a
+fixed `k` or radius over a file you are about to read anyway. An on-disk grid or
+R-tree sidecar — freshness-guarded like the CSC sidecar, safely ignorable by
+older readers — is worth it only when plan-build time or repeated radius queries
+over very large sections justify it, and it needs its own compatibility review.
+Nothing in the current builders depends on it arriving.
+
+---
+
+## 7. Limitations and follow-ons
 
 ### Supported multimodal operations
 
@@ -520,10 +603,11 @@ are resolved.
 
 ---
 
-## 7. Cross-references
+## 8. Cross-references
 
 - [docs/format.md § 13 Multimodal Extension](format.md#13-multimodal-extension-optional) — on-disk byte layout.
 - [docs/api.md § Multimodal API](api.md#multimodal-api) — Rust + PyO3 surface.
 - [docs/codec.md § Per-modality codec defaults](codec.md#8a-per-modality-codec-defaults) — auto-codec routing per modality.
 - [docs/cloud.md § Exploded `.scxd/` layout](cloud.md#exploded-scxd-layout) — `_modality_table.bin` + `X/{modality}/` directories.
 - [docs/scanpy.md](scanpy.md) — single-modality scanpy/AnnData integration (multimodal example follows the same `pyscx.from_mudata` / `to_mudata` pattern shown here).
+- [docs/training.md § Neighbourhood plans](training.md#neighbourhood-plans) — the spatial regime's loader surface.

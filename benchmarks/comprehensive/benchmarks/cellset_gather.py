@@ -848,6 +848,270 @@ _TOKENIZE_SEED = 20260914
 _TOKENIZE_ARMS = ("crop", "rank", "bin", "sample")
 
 
+# ---------------------------------------------------------------------------
+# W7: neighbourhood plan builder arms
+# ---------------------------------------------------------------------------
+#
+# R6 — spatial / neighbourhood context — is the regime SCX stored but did not
+# serve: `obsm["spatial"]` and `obsp` were on disk with no way to turn either
+# into a plan. These two arms time the builders and the gather over what they
+# produce, so the cost of "a neighbourhood workload" is a number rather than an
+# inference from the S=64 random arm.
+#
+# They are arms, NOT `_SCENARIOS` entries. `_SCENARIOS`' names are frozen (six
+# `thresholds.yaml` floors key off them and `tests/test_dataload_phase0.py`
+# asserts the exact tuple), and an entry there would also schedule these against
+# every dataset — none of which has an obsp at all.
+#
+# Shapes pinned for the same reason the tokenise arms' are: a rate per cell is
+# only comparable at a fixed neighbourhood size.
+
+# Graph arm: the `k` heaviest stored edges per centre. 6 is the Visium
+# hexagonal lattice's immediate ring, which is what the fixture's graph was
+# built with.
+_NEIGHBORHOOD_K_GRAPH = 6
+# Coordinate arm: the same neighbourhood size through the other path, so the
+# two arms differ in method rather than in shape.
+_NEIGHBORHOOD_K_COORDS = 6
+# Sets per gathered batch. Matched to the S=64 arm's batch cell count
+# (64 x 16 = 1024 cells) at a set size of k + 1 = 7, so the gather half of
+# these arms moves a comparable number of cells per batch.
+_NEIGHBORHOOD_SETS_PER_BATCH = 146
+# Fixed so two captures batch and shuffle identically.
+_NEIGHBORHOOD_SEED = 20260915
+# Below this the sets are effectively singletons and the arm times the plan
+# machinery rather than a neighbourhood.
+_NEIGHBORHOOD_MIN_MEAN_DEGREE = 2.0
+# A neighbourhood's members must be *near* its centre — otherwise the arm is
+# timing an arbitrary cell-set gather that happens to have been built by these
+# functions. Expressed as a fraction of the fixture's own coordinate extent, so
+# it is scale-free: a random set of the same size sits near 0.5, and the Visium
+# fixture measures 0.015.
+_NEIGHBORHOOD_MAX_SET_RADIUS_FRACTION = 0.10
+# Rows per shard on the spatial fixture (`DatasetConfig.shard_size`). Used only
+# to report how many shards a batch touches; a wrong value misreports that one
+# number and changes nothing that is timed.
+_NEIGHBORHOOD_SHARD_ROWS_HINT = 512
+
+_NEIGHBORHOOD_ARMS = ("graph", "coords")
+
+
+def _neighborhood_supported() -> tuple[bool, str | None]:
+    """Whether the installed pyscx exposes the W7 plan builders.
+
+    Never raises, for the same reason `_tokenize_supported` does not: a raise
+    out of `run` fails the whole cohort SLURM job and this is one optional arm.
+    """
+    try:
+        import pyscx
+
+        missing = [
+            n
+            for n in (
+                "neighborhood_plans_from_graph",
+                "neighborhood_plans_from_coords",
+                "batch_plans",
+            )
+            if not hasattr(pyscx, n)
+        ]
+        if missing:
+            return False, f"pyscx build predates the plan builders: missing {missing}"
+        return True, None
+    except Exception as e:  # noqa: BLE001
+        return False, f"probe failed: {e}"
+
+
+def _neighborhood_premises(scx_path: str) -> dict[str, Any]:
+    """What this fixture can and cannot support, measured rather than assumed.
+
+    Two kinds of finding, handled differently — the same split the tokenise
+    arms use. A property of the **fixture** (no graph, no coordinates, a graph
+    with no edges) is reported and the arm is skipped, because no choice here
+    can fix it. A property that would silently turn the arm into a measurement
+    of *something else* raises, because a number over the wrong branch is worse
+    than no number.
+
+    Set overlap is recorded, **not** gated, and that is a correction to the
+    obvious design. "Neighbourhoods overlap, and overlap is the reuse signal"
+    does not discriminate: measured on the Visium fixture at 146 sets/batch,
+    1.1023 in centre order, **1.1084** shuffled (the value a capture's
+    `locality.batch_duplicate_factor` carries) and **1.1286** for a random-plan
+    control of the same set size and batch width. Random sets duplicate rows *more* than neighbourhoods do, because
+    neighbourhoods partition the tissue while random draws collide freely, so a
+    bar anywhere near those numbers would have passed on random plans and told
+    nobody anything. What is gated instead is that the sets really are
+    neighbourhoods — their members are close to their centre.
+    """
+    import pyscx
+
+    exp = pyscx.open(scx_path)
+    out: dict[str, Any] = {"skip": {}}
+    out["obsp_keys"] = exp.obsp_keys()
+    out["obsm_keys"] = exp.obsm_keys()
+    out["coords"] = None
+
+    if "connectivities" not in out["obsp_keys"]:
+        out["skip"]["graph"] = (
+            f"no obsp['connectivities'] on this fixture "
+            f"(has {out['obsp_keys'] or 'none'})"
+        )
+    else:
+        # Mean degree over the first block — enough to tell a real graph from an
+        # empty one without decoding the whole thing.
+        probe_rows = min(exp.n_obs, 1024)
+        block = exp.read_obsp_rows("connectivities", 0, probe_rows)
+        mean_degree = block.nnz / probe_rows if probe_rows else 0.0
+        out["mean_degree"] = round(mean_degree, 3)
+        if mean_degree < _NEIGHBORHOOD_MIN_MEAN_DEGREE:
+            out["skip"]["graph"] = (
+                f"mean degree {mean_degree:.2f} < {_NEIGHBORHOOD_MIN_MEAN_DEGREE} — "
+                "the sets would be near-singletons and the arm would time the plan "
+                "machinery rather than a neighbourhood gather"
+            )
+
+    if "spatial" not in out["obsm_keys"]:
+        out["skip"]["coords"] = (
+            f"no obsm['spatial'] on this fixture (has {out['obsm_keys'] or 'none'})"
+        )
+    else:
+        coords = np.asarray(exp.to_anndata().obsm["spatial"], dtype=np.float64)
+        extent = float(np.ptp(coords, axis=0).max())
+        out["coord_extent"] = round(extent, 3)
+        out["coord_dims"] = int(coords.shape[1])
+        out["coords"] = coords
+        if not np.isfinite(extent) or extent <= 0.0:
+            raise RuntimeError(
+                f"neighborhood coords arm: obsm['spatial'] has extent {extent} — "
+                "every point is in one grid cell, so the arm would time an O(n^2) "
+                "brute force and report it as a grid search"
+            )
+    return out
+
+
+def _neighborhood_locality(plans: list, coords, shard_rows: int | None) -> dict[str, Any]:
+    """Measured shape of the built plans — what they are, not whether they pass.
+
+    Set-level facts (radius, size, row-index span) are computed **per set**, by
+    walking each plan's `set_offsets`, so the same function answers correctly
+    for one-set plans and for batched ones. Reading a batched plan as a single
+    set is not a small error: on the Visium fixture it reported a median "set
+    radius" of 8,038 against a coordinate extent of 9,239 — the width of the
+    whole tissue — for neighbourhoods whose real radius is 138.
+
+    Batch-level facts (duplicate factor, shards touched) stay per plan, because
+    that is the unit the shard cache sees.
+
+    These are recorded beside the rate because they change how the rate should
+    be read. On a spatial file whose obs order is **not** spatial — Visium's is
+    barcode order — a 7-cell neighbourhood is scattered across the whole row
+    axis and every batch touches every shard, so the arm measures the pessimal
+    scattered read. A spatially sorted file would be the other extreme, and a
+    rate quoted without these numbers cannot be told apart from it.
+    """
+    if not plans:
+        return {}
+    total = 0
+    distinct = 0
+    touched: list[int] = []
+    sizes: list[int] = []
+    spans: list[int] = []
+    radii: list[float] = []
+    for plan in plans:
+        rows = np.asarray(plan[1])
+        offsets = np.asarray(plan[3])
+        total += rows.size
+        distinct += np.unique(rows).size
+        if shard_rows:
+            touched.append(len(set((rows // shard_rows).tolist())))
+        for lo, hi in zip(offsets[:-1], offsets[1:]):
+            members = rows[int(lo) : int(hi)]
+            sizes.append(members.size)
+            if members.size > 1:
+                spans.append(int(np.ptp(members)))
+                if coords is not None and len(radii) < 500:
+                    radii.append(
+                        float(
+                            np.linalg.norm(
+                                coords[members[1:]] - coords[members[0]], axis=1
+                            ).max()
+                        )
+                    )
+    info: dict[str, Any] = {
+        "batch_duplicate_factor": round(total / distinct, 4) if distinct else 0.0,
+        "median_set_size": int(np.median(sizes)) if sizes else 0,
+        "median_set_row_index_span": int(np.median(spans)) if spans else 0,
+    }
+    if touched:
+        info["mean_shards_touched_per_batch"] = round(float(np.mean(touched)), 2)
+    if radii:
+        info["median_set_radius"] = round(float(np.median(radii)), 3)
+    return info
+
+
+def _build_neighborhood_plans(
+    scx_path: str, arm: str, premises: dict[str, Any]
+) -> tuple[list, float, int, dict[str, Any]]:
+    """Build one arm's plans and batch them.
+
+    Returns `(batched, build_s, n_sets, locality)`.
+
+    `build_s` times **the builder alone** — not the premise check and not
+    `batch_plans`, both of which run after the clock stops. The gather is timed
+    separately again, because conflating the three would hide which one a change
+    moved. `batch_plans` is excluded on purpose rather than by accident: it is a
+    caller-side convenience over already-built plans, and its cost is dominated
+    by pyo3 extracting numpy arrays element-wise, which is a property of how this
+    arm calls it rather than of the regime.
+    """
+    import pyscx
+
+    t0 = time.perf_counter()
+    if arm == "graph":
+        plans, _ = pyscx.neighborhood_plans_from_graph(
+            scx_path,
+            "connectivities",
+            file_id=0,
+            k=_NEIGHBORHOOD_K_GRAPH,
+            # An affinity graph: larger means closer. `obsp["distances"]` would
+            # need "asc", and getting it wrong here would silently time each
+            # cell's k FARTHEST neighbours.
+            weight_order="desc",
+        )
+    else:
+        plans, _ = pyscx.neighborhood_plans_from_coords(
+            scx_path, "spatial", file_id=0, k=_NEIGHBORHOOD_K_COORDS
+        )
+    build_s = time.perf_counter() - t0
+    n_sets = len(plans)
+
+    # The premise that discriminates: these are neighbourhoods, not arbitrary
+    # sets of the same size. Checked on the UNBATCHED plans, one set at a time,
+    # against the fixture's own extent.
+    coords = premises.get("coords")
+    extent = premises.get("coord_extent")
+    if coords is not None and extent:
+        radius = _neighborhood_locality(plans, coords, None).get("median_set_radius")
+        if radius is None:
+            raise RuntimeError(
+                f"neighborhood {arm} arm: every probed set is a singleton, so there "
+                "is no neighbourhood to time"
+            )
+        if radius > _NEIGHBORHOOD_MAX_SET_RADIUS_FRACTION * extent:
+            raise RuntimeError(
+                f"neighborhood {arm} arm: the median set radius is {radius:.1f}, "
+                f"{radius / extent:.1%} of the fixture's {extent:.0f} coordinate "
+                f"extent (bar: {_NEIGHBORHOOD_MAX_SET_RADIUS_FRACTION:.0%}) — these "
+                "sets are not neighbourhoods and the arm would time an arbitrary "
+                "cell-set gather under a spatial name"
+            )
+
+    batched = pyscx.batch_plans(
+        plans, _NEIGHBORHOOD_SETS_PER_BATCH, shuffle_seed=_NEIGHBORHOOD_SEED
+    )
+    locality = _neighborhood_locality(batched, coords, _NEIGHBORHOOD_SHARD_ROWS_HINT)
+    return batched, build_s, n_sets, locality
+
+
 def _tokenize_supported() -> tuple[bool, str | None]:
     """Whether the installed pyscx exposes the W6 kernels.
 
@@ -1903,6 +2167,127 @@ def run(
         # resident through the rank arm and into this triple's pooled peak.
         co_batches = None
         prepared = None
+        gc.collect()
+
+    # --- W7: neighbourhood plan arms --------------------------------------
+    # Its own gather, unlike the tokenise arms: the point is the plan shape, so
+    # reusing the collate arm's random batches would measure nothing new.
+    nb_ok, nb_reason = _neighborhood_supported()
+    if not nb_ok:
+        logger.info("  neighborhood arms not applicable: %s", nb_reason)
+        result.metadata["neighborhood"] = {"applicable": False, "reason": nb_reason}
+    else:
+        try:
+            nb_premises = _neighborhood_premises(scx_path)
+        except Exception as e:  # noqa: BLE001
+            # A raise here is a premise failure, not a missing fixture: it means
+            # the arm would have measured the wrong branch. Recorded loudly and
+            # the arms dropped, rather than run anyway.
+            logger.error("  neighborhood premises failed: %s", e)
+            result.metadata["neighborhood"] = {"applicable": False, "reason": str(e)}
+            nb_premises = None
+        if nb_premises is not None:
+            nb_summary: dict[str, Any] = {
+                "applicable": True,
+                "k_graph": _NEIGHBORHOOD_K_GRAPH,
+                "k_coords": _NEIGHBORHOOD_K_COORDS,
+                "sets_per_batch": _NEIGHBORHOOD_SETS_PER_BATCH,
+                "obsp_keys": nb_premises["obsp_keys"],
+                "obsm_keys": nb_premises["obsm_keys"],
+                "mean_degree": nb_premises.get("mean_degree"),
+                "coord_extent": nb_premises.get("coord_extent"),
+                "coord_dims": nb_premises.get("coord_dims"),
+                "arms": {},
+            }
+            nb_skips = nb_premises["skip"]
+            for arm in _NEIGHBORHOOD_ARMS:
+                nb_sc = f"gather_neighborhood_{arm}"
+                if arm in nb_skips:
+                    logger.info("  neighborhood %s arm skipped: %s", arm, nb_skips[arm])
+                    nb_summary["arms"][arm] = {
+                        "applicable": False,
+                        "reason": nb_skips[arm],
+                    }
+                    continue
+                try:
+                    batched, build_s, n_plans, locality = _build_neighborhood_plans(
+                        scx_path, arm, nb_premises
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("  neighborhood %s arm failed to build: %s", arm, e)
+                    nb_summary["arms"][arm] = {"error": str(e)}
+                    continue
+                nb_summary["arms"][arm] = {
+                    "n_plans": n_plans,
+                    "n_batches": len(batched),
+                    "locality": locality,
+                }
+                nb_rates: list[float] = []
+                for i in range(n_runs):
+                    cache_policy = drop_file_cache(scx_path) if cold_cache else "warm"
+                    try:
+                        out = _run_gather(scx_path, lambda b=batched: iter(b))
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(
+                            "  neighborhood %s run %d/%d failed: %s",
+                            arm, i + 1, n_runs, e,
+                        )
+                        continue
+                    sps = out.n_sets / out.wall_s if out.wall_s > 0 else 0.0
+                    us_per_cell = (
+                        out.wall_s * 1e6 / out.n_cells if out.n_cells else 0.0
+                    )
+                    result.add_run(
+                        wall_s=out.wall_s,
+                        peak_rss_mb=out.peak_rss_mb,
+                        scenario=nb_sc,
+                        set_size=locality.get("median_set_size", 0),
+                        n_sets=out.n_sets,
+                        n_cells=out.n_cells,
+                        # Beside the rate, because the rate is only comparable at
+                        # a fixed neighbourhood size and batch width.
+                        k_neighbors=(
+                            _NEIGHBORHOOD_K_GRAPH
+                            if arm == "graph"
+                            else _NEIGHBORHOOD_K_COORDS
+                        ),
+                        sets_per_batch=_NEIGHBORHOOD_SETS_PER_BATCH,
+                        cache_policy=cache_policy,
+                        **{
+                            f"cellsets_per_sec__{nb_sc}": round(sps, 1),
+                            f"us_per_cell__neighborhood_{arm}": round(us_per_cell, 3),
+                            # The builder, timed apart from the gather: on a
+                            # large file these are different orders of magnitude
+                            # and a combined number would hide which moved.
+                            f"plan_build_s__neighborhood_{arm}": round(build_s, 4),
+                            f"peak_rss_mb__{nb_sc}": round(out.peak_rss_mb, 1),
+                            f"ttfb_first_set_s__{nb_sc}": round(out.ttfb_s, 4),
+                            f"shard_cache_hit_rate__{nb_sc}": out.shard_cache_hit_rate,
+                        },
+                    )
+                    nb_rates.append(sps)
+                    logger.info(
+                        "    %s: %.1f sets/s us/cell=%.2f build=%.3fs rss=%.1fMB cache=%s",
+                        nb_sc, sps, us_per_cell, build_s, out.peak_rss_mb, cache_policy,
+                    )
+                if nb_rates:
+                    nb_summary["arms"][arm]["n_runs"] = len(nb_rates)
+                    nb_summary["arms"][arm]["median_cellsets_per_sec"] = round(
+                        statistics.median(nb_rates), 1
+                    )
+                    result.metadata.setdefault("scenario_summary", {})[nb_sc] = {
+                        "n_runs": len(nb_rates),
+                        "set_size": locality.get("median_set_size", 0),
+                        "median_cellsets_per_sec": round(statistics.median(nb_rates), 1),
+                        "locality": locality,
+                    }
+                batched = None
+                gc.collect()
+            # `coords` is an n x d float64 array held only for the premise
+            # checks; dropping the name keeps it out of the rank arm's pooled
+            # peak RSS.
+            nb_premises["coords"] = None
+            result.metadata["neighborhood"] = nb_summary
         gc.collect()
 
     # --- P-1(c): N concurrent ranks ---------------------------------------
