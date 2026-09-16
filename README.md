@@ -1,5 +1,10 @@
 # SCX — Sparse Cell eXpression System
 
+> **⚠️ Research project that will no longer be maintained.** SCX was built as a
+> research exploration and is **not maintained**: no further development, bug
+> fixes, or support should be expected. It is shared as-is for reference. Do
+> not adopt it for production or long-term use.
+
 > **Status:** pre-1.0 (v0.7.x). Install from
 > [GitHub Releases](https://github.com/ArcInstitute/scx/releases); PyPI + conda
 > planned at public release.
@@ -466,52 +471,22 @@ sizes in our benchmarks.
   on Census 1M, SLAF's SQL path returns the matching expression records in
   10 s — same order of magnitude as SCX's catalog pushdown.
 
-#### shardad
-
-A sister Arc Institute format: a single `.shad` file of condition-grouped,
-narrow-dtype, bitshuffle+zstd CSR shards, purpose-built for CRISPR perturbation
-screens. Its `read_group` / `read_reference` API targets the same axis as SCX's
-F1/F2 grouped sharding, so we benchmark it head-to-head (release builds; full
-numbers in [`docs/performance.md`](docs/performance.md#grouped-sharding-scx-sort---group-by--scx-convert---group-by) and the
-comprehensive report's "Grouped Read/Write", "Out-of-Core Peak RSS", and
-"Format Capability Matrix" sections).
-
-- **shardad's genuine strengths.** Integer-count **compression** — smaller than
-  SCX on raw UMI counts, though the margin is codec-dependent: **~1.0–1.7×** vs
-  SCX's best integer codec (`compact_trial`; `census_1m` 1.6 vs 2.8 GB ≈1.7×,
-  ≈parity on `tabula_100k`, SCX smaller on `pbmc3k`), larger only against the
-  default `auto` codec (`census_1m` 1.6 vs 4.0 GB). ≈parity on log-normalized/
-  float data. Also **single-shot grouped-write** speed on in-RAM-sized data (it
-  loads an in-memory CSR then encodes; SCX streams).
-- **Where SCX wins.** Per-perturbation `read_group` (up to **13×** faster — a
-  byte-range read of just the group's rows); **out-of-core** reads (at
-  `census_5m`, SCX streaming peaks at ~19 GB vs shardad's ~87 GB full
-  materialize — shardad has no streaming path); **parallel read scaling**
-  (SCX 3.6–4.5× to 32 threads vs shardad ~1–2×, which is materialization-bound);
-  and **ML training throughput** (SCX `TrainingDataset` 45–1,193 batches/s vs a
-  shardad random-access row-slice loader at ~0.6, since shardad has no native
-  batched loader).
-- **Scope.** shardad is Python-only and counts-focused (no query engine, cloud
-  I/O, analysis accelerators, GPU-accelerated reads, multimodal, or R bindings);
-  SCX is a broad platform. Both pass read-back correctness + reference-isolation
-  on every fixture.
-
 #### SCX addresses all of these
 
-| Issue | h5ad | Zarr | TileDB-SOMA | SLAF | shardad | SCX |
-|-------|------|------|-------------|------|---------|-----|
-| Single file | Yes | No (directory) | No (directory) | No (directory) | **Yes** | **Yes** |
-| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | No (inode flood) | **Yes** (single file) | **Yes** (mmap, advisory locks) |
-| Atomic writes | No | No | Fragment-based | Fragment-based | Metadata-tail only | **Yes** (atomic rename) |
-| Integrity verification | Partial | None | Per-fragment | Per-fragment | Per-shard markers | **Full** (BLAKE3: catalog verified on open; `validate()` re-hashes all section payloads) |
-| Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | Process-level (mat.-bound) | **Shard-level** (rayon) |
-| Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | Metadata only | **Yes** (append sections) |
-| Cloud-native access | No | Yes | Yes | Yes | No | **Yes** (explode/pack, selective pull) |
-| Built-in query engine | No | No | Yes | **Yes (SQL)** | Grouped read only | **Yes** (predicate pushdown) |
-| Domain-specific compression | No | No | No | No | **Yes** (bitshuffle+zstd; strong on counts) | **Yes** (Scx1 codec, 2-5× better) |
-| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (uint32 low-plane) | **Yes** (uint8/uint16 auto-detect) |
-| ML training loader | No | No | Yes (tiledbsoma-ml) | Yes (slow) | No (random-access only) | **Yes** (1,405 batches/s) |
-| Out-of-core / backed reads | Partial (r+) | Partial | Partial | No (full materialize) | No (full materialize) | **Yes** (streaming + backed) |
+| Issue | h5ad | Zarr | TileDB-SOMA | SLAF | SCX |
+|-------|------|------|-------------|------|-----|
+| Single file | Yes | No (directory) | No (directory) | No (directory) | **Yes** |
+| HPC filesystem friendly | No (flock) | No (inode flood) | No (inode flood) | No (inode flood) | **Yes** (mmap, advisory locks) |
+| Atomic writes | No | No | Fragment-based | Fragment-based | **Yes** (atomic rename) |
+| Integrity verification | Partial | None | Per-fragment | Per-fragment | **Full** (BLAKE3: catalog verified on open; `validate()` re-hashes all section payloads) |
+| Parallel reads | No (GIL) | Chunk-level | Tile-level | Fragment-level | **Shard-level** (rayon) |
+| Append without rewrite | No | No | Yes (fragments) | Yes (fragments) | **Yes** (append sections) |
+| Cloud-native access | No | Yes | Yes | Yes | **Yes** (explode/pack, selective pull) |
+| Built-in query engine | No | No | Yes | **Yes (SQL)** | **Yes** (predicate pushdown) |
+| Domain-specific compression | No | No | No | No | **Yes** (Scx1 codec, 2-5× better) |
+| Integer-aware storage | No (float32) | No (float32) | No (float64) | u16 per-cell | **Yes** (uint8/uint16 auto-detect) |
+| ML training loader | No | No | Yes (tiledbsoma-ml) | Yes (slow) | **Yes** (1,405 batches/s) |
+| Out-of-core / backed reads | Partial (r+) | Partial | Partial | No (full materialize) | **Yes** (streaming + backed) |
 
 ## Installation
 
@@ -817,45 +792,6 @@ SCX is a Rust workspace with 16 crates:
 | `scx-integration-tests` | Cross-crate integration tests: golden files, conformance vectors, lifecycle |
 
 For technical details, see [`docs/architecture.md`](docs/architecture.md), [`docs/format.md`](docs/format.md), [`docs/codec.md`](docs/codec.md), [`docs/api.md`](docs/api.md), [`docs/sharding.md`](docs/sharding.md), [`docs/multithreading.md`](docs/multithreading.md), [`docs/cloud.md`](docs/cloud.md), and [`docs/scanpy.md`](docs/scanpy.md). For agent-oriented install and usage workflows in Claude Code, see [`skills/scx-usage/SKILL.md`](skills/scx-usage/SKILL.md).
-
-## Attributions
-
-The following SCX features were adapted from initial implementations by
-**Alex Dobin**:
-
-| # | Feature | Description |
-|---|---------|-------------|
-| **F1** | **Condition/label-grouped sharding** | Group-by + reference-in-shard-0 layout for 100–1000× I/O reduction per group read; converts scatter-gather across all shards into contiguous 1–2 shard reads. |
-| **F2** | **`read_group` / `read_reference` / `iter_group_shards` API** | One-line per-perturbation reads, first-class reference/control access, and streaming group-by-group processing at bounded RAM. |
-| **F3** | **In-decode dtype/density materialization** | Read-side `container`, `data_dtype`, `index_dtype` kwargs for 50–75% memory savings via dtype narrowing and elimination of CSR→dense double buffer. |
-| **F4** | **Fail-loud lossless-cast gate (`allow_lossy`)** | Fixes silent u32→f32 narrowing above 2²⁴ with an O(1) per-shard catalog check; makes dtype flexibility safe by construction. |
-| **F5** | **Byte-shuffle + byte-delta + zstd codec** | Measured 1.5–2.5× smaller on integer counts vs Scx1; row-group-framed design preserves random-row access. |
-
-The following major capabilities were designed and implemented in the SCX
-codebase by **Nick Youngblut**:
-
-| # | Feature | Description |
-|---|---------|-------------|
-| **F1** | **Scx1 domain-specific codec** | Delta-Golomb-Rice + FOR-BP + adaptive Rice codec achieving ~2.2 bits/value on UMI counts; GPU-decodable; per-shard auto-codec selection. |
-| **F2** | **ML training loader** | Triple-buffered Rust pipeline (tokio I/O → rayon decode → Python consumer); 1,405 batches/s, 82× faster than TileDB-SOMA-ML; zero Python on hot path. |
-| **F3** | **Analysis accelerators** | Rust-native PCA, kNN, UMAP, DE, HVG, Leiden, Harmony2, pseudobulk NB-GLM, gene scoring, LISI — 2–528× over scanpy on CPU/GPU. |
-| **F4** | **Backed/lazy mode** | `ScxBackedSparseDataset` + `ScxLazyTransformedDataset` enabling out-of-core pipelines; chained normalize→log1p→scale without materialization; 6× peak RAM reduction. |
-| **F5** | **Query engine with predicate pushdown** | Categorical/numeric indexes, shard pruning, bitmap sidecars; arbitrary predicates, gene projection, compound filters. |
-| **F6** | **Streaming ingest/export** | Parallel h5ad/h5mu ↔ SCX streaming with memory-budget-bounded encoding; 16× less peak RSS on ingest. |
-| **F7** | **GPU decode pipeline** | In-VRAM Rice/FOR-BP decode, sparse→dense CUDA kernels, cuSPARSE interop, rapids-singlecell integration. |
-| **F8** | **Operations** | Streaming merge, append, sort, compact, subset, logical delete, and rollback. |
-| **F9** | **Per-shard BLAKE3 checksums** | Truncated-64 per shard + full-256 catalog; `scx validate` for end-to-end integrity verification. |
-| **F10** | **Extensible section-type system** | 29 section types with forward-compatible unknown-section skip — no format-version bump needed for new sidecars. |
-| **F11** | **CSC sidecar** | Optional column-major storage for 13–24× faster GPU DE and gene-axis streaming without full transpose. |
-| **F12** | **Multi-layer / sharded metadata** | Layers, obsm, varm, obsp, varp stored as sharded sections for full AnnData round-trip. |
-| **F13** | **Cloud-native reads** | `open_cloud()`, HTTP range reads per shard, `scx pull --filter` for selective download; S3, GCS, and Azure support. |
-| **F14** | **PFlog (v4) / shifted-log normalization** | Booeshaghi et al. method (raw counts, matrix-wide Anscombe pseudocount `1/(4α)`, α estimated once): sparse delta + per-cell baseline decomposition → out-of-core baseline-aware PCA, streaming materialize-to-SCX in compact `delta_baseline` / `dense` representations; integrated across accel, format, loader, and rscx. |
-| **F15** | **Multimodal** | CITE-seq, 10x Multiome, TEA-seq support in a single v2 file with per-modality codec routing and h5mu streaming. |
-| **F16** | **Perturbation evaluation metrics (cell-eval / arc-bench parity)** | Rust-accelerated pseudobulk means, bulk metrics (pearson_delta / mse / mae), discrimination score, energy distance, knockdown efficiency, and clustering agreement — 5–52× speedups, 32/32 numerical parity. |
-| **F17** | **Fuzzing & property-based testing** | 13 libfuzzer targets + 7 proptest suites; CI fuzz build check on every PR touching the fuzzed crates, plus a weekly scheduled run. |
-| **F18** | **R bindings (rscx)** | Seurat v5 + SingleCellExperiment integration via extendr. |
-| **F19** | **Comprehensive benchmarking framework** | 42 benchmark modules, 9 format runners, regression gating, SLURM integration, dashboard — ~60K lines across 216 files. |
-| **F20** | **Comprehensive documentation** | 23 docs (~14K lines): format spec, codec spec, architecture, API reference, migration guides, GPU setup, and more. |
 
 ## License
 
