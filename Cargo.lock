@@ -3668,6 +3668,7 @@ dependencies = [
  "scx-codec",
  "scx-engine",
  "scx-format-io",
+ "scx-loader",
  "scx-ops",
  "scx-sparse",
  "scx-testkit",

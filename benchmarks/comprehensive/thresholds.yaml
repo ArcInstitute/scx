@@ -4026,3 +4026,53 @@ absolute_floors:
 #          module constants for exactly that reason and are echoed into
 #          `runs[].extra`; changing any of them invalidates the numbers above
 #          and the floors with them.
+#
+# 23. cellset_gather / neighbourhood plan arms (W7)
+#     `cellsets_per_sec__gather_neighborhood_{graph,coords}`,
+#     `us_per_cell__neighborhood_{graph,coords}`,
+#     `plan_build_s__neighborhood_{graph,coords}`,
+#     `peak_rss_mb__*`, `ttfb_first_set_s__*` and
+#     `shard_cache_hit_rate__*` are emitted as of the neighbourhood-plan-builder
+#     PR. NO floor is proposed here, and three separate things say so:
+#
+#     (a) The phase's own gate is "two captures before a floor", the same
+#         sequencing item 22 follows.
+#     (b) No baseline carries `cellset_gather` rows at all — the same blocker
+#         item 15 records for `us_per_cell__collate`.
+#     (c) These arms run on ONE dataset, `visium_lymph_node`, which is the
+#         suite's only fixture with an `obsm` or an `obsp` and is deliberately
+#         **outside every `capture_baseline.TIERS` list** (see its `DATASETS`
+#         entry). A floor on a triple the default gate never schedules reads as
+#         coverage while providing none, which is exactly the state 53 floors
+#         are already in. Either the dataset joins a tier or these stay here.
+#
+#     ⚠️ Read the rate together with `metadata.neighborhood.arms.<arm>.locality`.
+#     A Visium file's obs order is **barcode order, not spatial**: measured on
+#     this fixture a 7-cell neighbourhood spans a median of 3,024 row indices
+#     out of 4,035 and every batch touches all 8 shards, so these numbers are
+#     the *pessimal* scattered-read case. A spatially sorted file
+#     (`scx sort --group-by` on a spatial key) would be the other extreme and is
+#     not measured here. A floor authored from these numbers would therefore
+#     bind to a layout, not just to a shape.
+#
+#     Also recorded rather than gated: `batch_duplicate_factor`. The intuitive
+#     premise — "neighbourhoods overlap, and overlap is the reuse signal" —
+#     does not discriminate. Measured at 146 sets/batch: ordered 1.102,
+#     shuffled 1.105, random-plan control of the same shape 1.133. Random sets
+#     duplicate rows MORE than neighbourhoods do.
+#
+#     ACTIVATION, once a baseline carries the arms AND the dataset is in a tier:
+#       1. Read the medians from
+#          `<candidate>/raw/cellset_gather__scx_auto__visium_lymph_node.json`,
+#          from the runs whose `extra.scenario == "gather_neighborhood_<arm>"`.
+#       2. Author, per arm:
+#              metric: cellsets_per_sec__gather_neighborhood_<arm>  ->  min: 0.85 x median
+#          and only for arms whose `metadata.neighborhood.arms.<arm>.applicable`
+#          is not false. A floor on a skipped arm synthesises a "missing metric"
+#          violation on every run.
+#       3. The floors bind only while the shape stays pinned.
+#          `_NEIGHBORHOOD_K_GRAPH`, `_NEIGHBORHOOD_K_COORDS` and
+#          `_NEIGHBORHOOD_SETS_PER_BATCH` are module constants for exactly that
+#          reason and are echoed into `runs[].extra`; so is the fixture's
+#          `DatasetConfig.shard_size`, which decides how many shards a batch
+#          touches. Changing any of them invalidates the numbers above.

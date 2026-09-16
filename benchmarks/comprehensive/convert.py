@@ -43,6 +43,12 @@ def convert_dataset_format(
     )
 
     runner = make_runner(format_variant)
+    # Per-dataset shard target, where the dataset declares one. Only the SCX
+    # runner has the knob; on every other runner the attribute simply is not
+    # there and the dataset's request is a no-op, which is correct — the
+    # constraint it exists for (a bounded per-shard SCX read) has no analogue.
+    if getattr(dataset, "shard_size", None) is not None and hasattr(runner, "shard_size"):
+        runner.shard_size = dataset.shard_size
     if dataset.multimodal:
         # Phase K: multimodal datasets ship as `.h5mu`; route through
         # the multimodal-aware converter on the runner. Single-modality

@@ -947,6 +947,34 @@ class Experiment:
     def layer_names(self) -> list[str]: ...
     def obs_keys(self) -> list[str]: ...
     def var_keys(self) -> list[str]: ...
+    def obsp_keys(self) -> list[str]:
+        """Keys of the ``obsp`` pairwise graphs. Pure catalog scan.
+
+        Lists only the COO forms every conversion path writes; the CSR-backed
+        ``ObspCsrShard`` has no read API and is not named here."""
+        ...
+
+    def read_obsp_rows(
+        self,
+        key: str,
+        start: int,
+        stop: int,
+        *,
+        logical: bool = True,
+    ) -> Any:
+        """Rows ``[start, stop)`` of ``obsp/<key>`` as a scipy CSR matrix.
+
+        The bounded counterpart to ``to_anndata().obsp[key]``: only the shards
+        covering the range are decoded. A graph stored as one unsharded section
+        — what ``scx sort`` emits — is decoded whole and then sliced.
+
+        **Row space.** ``logical=True`` (the default, matching `read_obs`) takes
+        ``start`` / ``stop`` as live row indices, drops any edge whose either
+        endpoint is deleted and renumbers both axes into live space, so the
+        column extent is ``n_obs``. ``logical=False`` is the physical graph with
+        no filtering and column extent ``n_obs_physical``."""
+        ...
+
     def obsm_keys(self) -> list[str]: ...
     def varm_keys(self) -> list[str]: ...
     def uns_keys(self, modality: str | None = ...) -> list[str]: ...
@@ -1396,6 +1424,73 @@ def collate_cellset_gathered(
     the ragged query rather than ``k_dec``-strided, and ``k_dec`` is the padded
     output width — ``target_pad_mask`` in the returned dict says which target
     slots are padding rather than a real zero."""
+    ...
+
+
+_NeighborhoodPlan = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+"""One cell-set plan: ``(file_ids, rows, role_tags, set_offsets)``, the shape
+`SparseCellSetDataset.gather` and `.iter_with_plans` take."""
+
+
+def neighborhood_plans_from_graph(
+    path: Any,
+    key: str = "connectivities",
+    *,
+    k: int | None = None,
+    include_center: bool = True,
+    file_id: int = 0,
+    drop_deleted: bool = True,
+    chunk_rows: int = 65536,
+) -> tuple[list[_NeighborhoodPlan], np.ndarray]:
+    """One cell-set plan per cell, from a stored ``obsp`` neighbourhood graph.
+
+    Each set is the centre first (``role_tag`` 0) then its neighbours
+    (``role_tag`` 1). ``k`` keeps only the ``k`` heaviest edges — weight
+    descending, ties by column ascending; ``None`` keeps every stored edge in
+    column order. Rows are **physical**: a deleted centre yields no set (so the
+    returned ``centers`` is shorter than ``n_obs``) and a deleted neighbour is
+    dropped rather than backfilled.
+
+    ``file_id`` is this file's position in the `SparseCellSetDataset` manifest
+    the plans will be gathered with, not a file identity.
+
+    The graph is read one ``chunk_rows`` range at a time; a graph stored as a
+    single unsharded section — what ``scx sort`` emits — is decoded whole."""
+    ...
+
+
+def neighborhood_plans_from_coords(
+    path: Any,
+    obsm_key: str = "spatial",
+    *,
+    k: int | None = None,
+    radius: float | None = None,
+    include_center: bool = True,
+    file_id: int = 0,
+    drop_deleted: bool = True,
+) -> tuple[list[_NeighborhoodPlan], np.ndarray]:
+    """One cell-set plan per cell, from ``obsm`` coordinates, with no index.
+
+    Exactly one of ``k`` or ``radius`` is required. A per-file uniform grid is
+    built at call time (O(n)) and searched ring by ring, so the answer is exact;
+    ties are ordered by squared distance ascending, then row ascending. Integer
+    and float64 coordinate columns are narrowed to float32. A NaN or infinite
+    coordinate on a kept cell raises rather than being bucketed somewhere."""
+    ...
+
+
+def batch_plans(
+    plans: Iterable[_NeighborhoodPlan],
+    sets_per_batch: int,
+    *,
+    shuffle_seed: int | None = None,
+) -> list[_NeighborhoodPlan]:
+    """Concatenate single-set plans into batch plans of ``sets_per_batch`` sets.
+
+    Overlapping neighbourhoods are the reuse signal the shard cache acts on, and
+    batching is what puts overlapping sets in one plan where it can see them.
+    ``shuffle_seed`` reorders the **sets**, never a set's members, reproducibly.
+    The last batch is short rather than dropped."""
     ...
 
 

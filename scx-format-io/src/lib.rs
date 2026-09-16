@@ -51,7 +51,7 @@ pub use arrow_compat::{
 };
 pub use backed::{
     BackedCscIndex, BackedCscReader, BackedCsrIndex, BackedCsrReader, BackedDenseReader,
-    CacheMetrics, ShardCache, SharedShardCache, SizeHint,
+    BackedPairwiseReader, CacheMetrics, PairwiseRows, ShardCache, SharedShardCache, SizeHint,
 };
 #[cfg(feature = "deletion-vectors")]
 pub use bitmap::{

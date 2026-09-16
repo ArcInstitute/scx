@@ -469,6 +469,7 @@ _EXPERIMENT_CALLS = {
     "modality_info": lambda e: e.modality_info(1),
     "layer_names": lambda e: e.layer_names(),
     "obsm_keys": lambda e: e.obsm_keys(),
+    "obsp_keys": lambda e: e.obsp_keys(),
     "varm_keys": lambda e: e.varm_keys(),
     "info": lambda e: e.info(),
     # section reads
@@ -481,6 +482,11 @@ _EXPERIMENT_CALLS = {
     "distinct_values": lambda e: e.distinct_values("grp"),
     "obs_categorical": lambda e: e.obs_categorical("grp"),
     "obs_categorical_many": lambda e: e.obs_categorical_many(["grp"]),
+    # Re-opens its own reader for the bounded obsp read (BackedPairwiseReader
+    # takes an owned ScxReader), so it gates on `self.reader()` FIRST — a fresh
+    # reader is fresh by definition, and without that gate this one member would
+    # answer from a changed file while every sibling refused.
+    "read_obsp_rows": lambda e: e.read_obsp_rows("conn", 0, 1),
     "provenance": lambda e: e.provenance(),
     "validate": lambda e: e.validate(),
     "to_anndata": lambda e: e.to_anndata(),
