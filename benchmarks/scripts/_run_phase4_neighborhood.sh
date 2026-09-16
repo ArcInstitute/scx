@@ -59,6 +59,7 @@ export SCX_BENCH_OOC_MEM_CAP_GB=${SCX_BENCH_OOC_MEM_CAP_GB:-48}
 
 echo "=== phase 4: neighbourhood plan arms (one-armed) ==="
 echo "host    : $(hostname)"
+echo "part    : ${SLURM_JOB_PARTITION:-unknown}"
 echo "head    : $HEAD_SHA ($(git -C "$REPO" rev-parse --abbrev-ref HEAD))"
 echo "dirty   : $(git -C "$REPO" status --porcelain | grep -vc '^??' || true) tracked file(s) modified"
 echo "datasets: $DATASETS"
@@ -269,6 +270,8 @@ cat > "$OUT/provenance.json" <<JSON
 {
  "job_id": "${SLURM_JOB_ID:-manual}",
  "host": "$(hostname)",
+ "partition": "${SLURM_JOB_PARTITION:-unknown}",
+ "partition_note": "Read from the running job, not from the #SBATCH directive, because sbatch --partition= overrides it. The directive asks for cpu_batch (what phases 1-3 used); a capture that landed elsewhere says so here rather than being compared across hardware classes by someone who assumed.",
  "head_sha": "$HEAD_SHA",
  "head_ref": "$(git -C "$REPO" rev-parse --abbrev-ref HEAD)",
  "datasets": "$DATASETS",
