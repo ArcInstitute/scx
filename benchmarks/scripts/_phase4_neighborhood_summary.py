@@ -46,13 +46,27 @@ def _load_rounds(root: pathlib.Path) -> list[dict]:
     raise SystemExit(f"no rounds/ directory and no folded JSON under {root}")
 
 
+def _fmt(v: float) -> str:
+    """Readable at both ends of the range these metrics span.
+
+    `%.4g` turns 15051.4 into `1.505e+04`, which is exactly the wrong rendering
+    for a sets/s figure; a plain `%.4f` turns 0.0037 into `0.0037` but 15051.4
+    into a wall of digits. Split on magnitude.
+    """
+    if abs(v) >= 1000:
+        return f"{v:,.1f}"
+    if abs(v) >= 1:
+        return f"{v:.3f}"
+    return f"{v:.5f}"
+
+
 def _stat(values: list[float]) -> str:
     if not values:
         return "—"
     med = statistics.median(values)
     if len(values) == 1:
-        return f"{med:.4g} (n=1)"
-    return f"{med:.4g}  [{min(values):.4g}, {max(values):.4g}]  (n={len(values)})"
+        return f"{_fmt(med)} (n=1)"
+    return f"{_fmt(med)}  [{_fmt(min(values))}, {_fmt(max(values))}]  (n={len(values)})"
 
 
 def main(root: pathlib.Path) -> int:
