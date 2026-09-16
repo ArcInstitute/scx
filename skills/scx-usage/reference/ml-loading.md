@@ -256,15 +256,19 @@ unchanged. Four things that bite first:
   file in the `SparseCellSetDataset` you will gather with. Get it wrong and you
   gather a different file's rows with nothing raising, which is why it is
   required rather than defaulting to 0.
-- **`weight_order` is not inferred from the key's name.** `k=8` with the
-  default `"desc"` on `obsp["distances"]` returns each cell's eight *farthest*
-  neighbours. Use `"asc"` for a distance graph.
+- **`weight_order` is required with `k`, and has no default.** It decides which
+  end of the weights `k` keeps, and the key's name does not say: `"desc"` for
+  an affinity graph (`connectivities`), `"asc"` for a distance graph
+  (`distances`). A default would make `k=8` on `"distances"` silently return
+  each cell's eight *farthest* neighbours.
 - **The coordinate builder takes 1-D, 2-D or 3-D only.** `obsm_key="X_pca"` on
   a wide embedding is refused; write a kNN into `obsp` and use the graph
   builder instead.
 - **Rows are physical, and deletions are dropped.** A deleted centre yields no
-  set at all (so `centers` is shorter than `n_obs` and tells you which survived)
-  and a deleted neighbour is dropped from every set rather than backfilled.
+  set at all (so `centers` is shorter than `n_obs` and tells you which
+  survived). A deleted neighbour is never emitted — and what that costs the set
+  depends on `k`: without it the set is simply short, with it the `k` best
+  *live* neighbours are taken and the set stays `k` wide.
 - **Layout, not the builder, decides what this costs.** A converted spatial file
   is usually in barcode order, where a 7-cell neighbourhood is scattered across
   the whole row axis and every batch touches every shard. `scx sort` on a key

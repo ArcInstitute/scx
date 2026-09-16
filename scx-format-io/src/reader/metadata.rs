@@ -1068,9 +1068,12 @@ impl ScxReader {
     /// [`assemble_sharded_metadata`].
     ///
     /// Falls back to the legacy single-section layout (`single_type`)
-    /// treated as one shard spanning `[0, n_rows)` — that path
-    /// deserialises the one batch to learn its row count, which
-    /// `legacy_rows` decides how to read (see [`LegacyRowCount`]).
+    /// treated as one shard spanning `[0, n_rows)`. How that path learns its
+    /// row count is [`LegacyRowCount`]'s decision, and the two differ in cost
+    /// as well as in meaning: `BatchRows` must deserialise the one batch,
+    /// because the count IS `batch.num_rows()`; `SchemaNRows` reads the IPC
+    /// footer schema only, which matters because the batch it would otherwise
+    /// decode-and-drop is every triple in the graph.
     pub(crate) fn row_sharded_mapping_layout(
         &self,
         prefix: &str,
@@ -1149,6 +1152,28 @@ impl ScxReader {
                     next_expected_row_start =
                         next_expected_row_start.saturating_add(hdr.n_shard_rows);
                     prev_n_rows_total = hdr.n_rows_total;
+                    // The column extent is taken from shard 0 and then used for
+                    // the whole mapping, so a later shard that disagrees about
+                    // it would be read against the wrong axis. Checked only
+                    // where shard 0 had one — a dense `obsm` stamps no
+                    // `n_cols`, and absence there is not a disagreement.
+                    if let Some(expected) = matrix_n_cols {
+                        let here = schema
+                            .metadata()
+                            .get("n_cols")
+                            .and_then(|v| v.parse::<u64>().ok());
+                        if here != Some(expected) {
+                            return Err(ScxError::InvalidCatalog(format!(
+                                "{logical}: shard {i} declares n_cols={here:?} but shard 0 \
+                                 declares {expected}"
+                            )));
+                        }
+                    }
+                    if schema.fields() != &fields {
+                        return Err(ScxError::InvalidCatalog(format!(
+                            "{logical}: shard {i}'s column schema differs from shard 0's"
+                        )));
+                    }
                 }
                 let _ = idx;
                 entries.push(MappingShardLayoutEntry {

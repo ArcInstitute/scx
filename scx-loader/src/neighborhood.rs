@@ -620,6 +620,11 @@ impl Grid {
     }
 }
 
+/// One set ended at `total`; record the boundary.
+fn rows_len_checked(set_offsets: &mut Vec<i64>, total: usize) {
+    set_offsets.push(total as i64);
+}
+
 /// (squared distance ascending, row ascending) — the declared tie order.
 ///
 /// `total_cmp` rather than `partial_cmp(..).unwrap_or(Equal)`: the latter is not
@@ -660,15 +665,19 @@ fn cmp_weight(a: (f32, i64), b: (f32, i64), order: WeightOrder) -> std::cmp::Ord
 // Batching
 // ---------------------------------------------------------------------------
 
-/// Concatenate single-set plans into batch plans of `sets_per_batch` sets.
+/// Concatenate **single-set** plans into batch plans of `sets_per_batch` sets.
 ///
-/// Overlapping neighbourhoods — a cell that is a neighbour of many centres —
-/// are the reuse signal a later admission policy can act on, and batching is
-/// what puts overlapping sets in the same plan where the shard cache can see
-/// them. `shuffle_seed` shuffles the *set* order (never a set's members) with
-/// `ChaCha8Rng`, so an epoch is reproducible across runs and machines.
+/// Every input must be one set — `set_offsets == [0, rows.len()]`, which is
+/// what both builders emit — so `sets_per_batch` counts what its name says.
+/// An earlier version accepted multi-set inputs and re-based each set, which
+/// meant the parameter silently chunked *plans* rather than sets: re-batching
+/// an already-batched list at `sets_per_batch = 2` produced outputs of six
+/// sets each. Nothing needed that, and a knob that means two different things
+/// depending on its input is worse than one that refuses.
 ///
-/// The last batch is short rather than dropped.
+/// `shuffle_seed` shuffles the *set* order (never a set's members) with
+/// `ChaCha8Rng`, so an epoch is reproducible across runs and machines. The
+/// last batch is short rather than dropped.
 pub fn batch_plans(
     plans: &[SparseCellSetPlan],
     sets_per_batch: usize,
@@ -679,26 +688,20 @@ pub fn batch_plans(
             reason: "batch_plans: sets_per_batch must be >= 1".into(),
         });
     }
-    // Every input's offsets must be a true indptr, because the rebase below adds
-    // a running base to them. A plan starting at a non-zero offset would be
-    // rebased to the wrong place and produce a batch whose sets are silently
-    // shifted — the builders here always emit `[0, n]`, but this is public and
-    // takes whatever a caller has.
+    // One set per input, so `sets_per_batch` counts sets. Also what makes the
+    // rebase below correct: it appends exactly one offset per input.
     for (i, p) in plans.iter().enumerate() {
         let off = &p.set_offsets;
-        if off.first() != Some(&0) || off.last() != Some(&(p.rows.len() as i64)) {
+        if off.as_slice() != [0, p.rows.len() as i64] {
             return Err(LoaderError::ConfigError {
                 reason: format!(
-                    "batch_plans: plan {i} has set_offsets {:?} over {} rows; each plan's \
-                     set_offsets must start at 0 and end at its row count",
+                    "batch_plans: plan {i} has set_offsets {:?} over {} rows, so it is not a \
+                     single set. Every input must be one set ([0, rows.len()]) — which is what \
+                     the neighbourhood builders emit — so that sets_per_batch counts sets. To \
+                     re-batch an already-batched list, rebuild the single-set plans instead.",
                     off,
                     p.rows.len()
                 ),
-            });
-        }
-        if off.windows(2).any(|w| w[1] < w[0]) {
-            return Err(LoaderError::ConfigError {
-                reason: format!("batch_plans: plan {i} has non-monotonic set_offsets {off:?}"),
             });
         }
         if p.file_ids.len() != p.rows.len() || p.role_tags.len() != p.rows.len() {
@@ -727,13 +730,10 @@ pub fn batch_plans(
             // Each input is expected to be a single set; a multi-set input is
             // re-based set by set rather than collapsed into one, so batching
             // an already-batched list is idempotent in shape.
-            let base = rows.len() as i64;
             file_ids.extend_from_slice(&p.file_ids);
             rows.extend_from_slice(&p.rows);
             role_tags.extend_from_slice(&p.role_tags);
-            for &off in p.set_offsets.iter().skip(1) {
-                set_offsets.push(base + off);
-            }
+            rows_len_checked(&mut set_offsets, rows.len());
         }
         out.push(SparseCellSetPlan {
             file_ids,
@@ -829,9 +829,19 @@ pub fn read_coords(path: &std::path::Path, key: &str) -> Result<(Vec<f32>, usize
 pub fn read_coords_from(scx: ScxReader, key: &str) -> Result<(Vec<f32>, usize)> {
     let reader = BackedDenseReader::new_obsm(scx, key, 1)?;
     let (n_rows, d) = reader.shape();
-    if d == 0 {
+    // Checked HERE, from the layout, before anything is decoded. Left to
+    // `plans_from_coords` the refusal still happened, but only after the whole
+    // n x d array had been read and allocated — which on an atlas-scale file
+    // and a mistyped `obsm_key="X_pca"` is the cost the refusal exists to
+    // avoid.
+    if d == 0 || d > MAX_COORD_DIMS {
         return Err(LoaderError::ConfigError {
-            reason: format!("obsm/{key} has no columns, so it carries no coordinates"),
+            reason: format!(
+                "obsm/{key} has {d} columns; coordinates must be 1..={MAX_COORD_DIMS}-D. The \
+                 grid search is exponential in the dimensionality. To build neighbourhoods in a \
+                 wide embedding, write a kNN graph into obsp (scanpy: \
+                 sc.pp.neighbors(use_rep=...)) and use the graph builder instead."
+            ),
         });
     }
     let batch = reader.read_rows_range(0, n_rows as u64)?;
@@ -855,6 +865,21 @@ pub fn read_coords_from(scx: ScxReader, key: &str) -> Result<(Vec<f32>, usize)> 
 
 fn coord_column_f32(col: &dyn arrow::array::Array, key: &str, j: usize) -> Result<Vec<f32>> {
     use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array};
+    // Before the dtype dispatch: `values()` hands back the raw buffer, so a
+    // null slot reads as whatever is in it. The COO decoder got this check in
+    // round 1 and the coordinate path did not, which is worse here than there
+    // — a bogus-but-finite coordinate sails past the `is_finite` guard and
+    // lands the cell in a neighbourhood it is not in, while a non-finite bit
+    // pattern raises "NaN coordinate" and names the wrong defect.
+    if col.null_count() > 0 {
+        return Err(LoaderError::ConfigError {
+            reason: format!(
+                "obsm/{key} column {j} has {} null entries; a coordinate has no meaning when \
+                 it is missing, so the row must be dropped or imputed before building plans",
+                col.null_count()
+            ),
+        });
+    }
     macro_rules! try_as {
         ($ty:ty) => {
             if let Some(a) = col.as_any().downcast_ref::<$ty>() {

@@ -417,8 +417,13 @@ fn a_nullable_coo_column_is_refused_rather_than_read_as_garbage() {
 
 #[test]
 fn a_later_shard_with_the_wrong_column_count_errors_rather_than_panicking() {
-    // The layout resolver takes `n_cols` from shard 0 only, so this used to
-    // reach `batch.column(2)` — which arrow PANICS on out of bounds.
+    // This used to reach `batch.column(2)` — which arrow PANICS on out of
+    // bounds — because the layout resolver read shard 0's schema and no other.
+    // It is now refused at OPEN, by the resolver's cross-shard schema check,
+    // which is earlier and better: nothing decodes at all. The per-shard
+    // `num_columns() != 3` guard in `decode_shard` stays as defence in depth —
+    // it still covers the legacy single-section path, which has no later shard
+    // to compare against.
     let dir = tempfile::tempdir().unwrap();
     let n = 8;
     let path = dir.path().join("ragged.scx");
@@ -450,8 +455,107 @@ fn a_later_shard_with_the_wrong_column_count_errors_rather_than_panicking() {
     w.write_obsp_shard_coo("connectivities", 1, 4, 4, n as u64, &batch)
         .unwrap();
     w.finish().unwrap();
-    let err = open(&path).read_rows_range(0, 8).unwrap_err().to_string();
-    assert!(err.contains("expected the 3-column COO"), "{err}");
+    let err =
+        match BackedPairwiseReader::new_obsp(ScxReader::open(&path).unwrap(), "connectivities") {
+            Ok(_) => panic!("a ragged shard schema was accepted"),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("column schema differs from shard 0"), "{err}");
+}
+
+#[test]
+fn shards_that_disagree_about_the_matrix_extent_are_refused() {
+    // The column extent is taken from shard 0 and used for the whole mapping,
+    // so a later shard that disagrees would be read against the wrong axis —
+    // and the only symptom would be edges silently rejected as out of range,
+    // or accepted when they should not be.
+    let dir = tempfile::tempdir().unwrap();
+    let n = 8;
+    let path = dir.path().join("extent.scx");
+    let mut w = ScxWriter::new(&path, header(n as u64)).unwrap();
+    w.write_obs(&obs(n)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    w.write_obsp_shard_coo(
+        "connectivities",
+        0,
+        0,
+        4,
+        n as u64,
+        &coo_i32(&[(0, 1, 1.0)], n, n),
+    )
+    .unwrap();
+    // Same three columns, but the second shard claims a different n_cols.
+    w.write_obsp_shard_coo(
+        "connectivities",
+        1,
+        4,
+        4,
+        n as u64,
+        &coo_i32(&[(4, 5, 1.0)], n, n + 3),
+    )
+    .unwrap();
+    w.finish().unwrap();
+    let err =
+        match BackedPairwiseReader::new_obsp(ScxReader::open(&path).unwrap(), "connectivities") {
+            Ok(_) => panic!("shards disagreeing about n_cols were accepted"),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("declares n_cols"), "{err}");
+}
+
+#[test]
+fn a_non_square_obsp_is_refused() {
+    // `obsp` is obs x obs by definition and the plan builders treat a column
+    // index as a row id. A non-square one would hand the gather rows that do
+    // not exist, so it is refused here rather than at gather time.
+    let dir = tempfile::tempdir().unwrap();
+    let n = 6;
+    let path = dir.path().join("oblong.scx");
+    let mut w = ScxWriter::new(&path, header(n as u64)).unwrap();
+    w.write_obs(&obs(n)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    w.write_obsp("connectivities", &coo_i32(&[(0, 1, 1.0)], n, n + 5))
+        .unwrap();
+    w.finish().unwrap();
+    let err =
+        match BackedPairwiseReader::new_obsp(ScxReader::open(&path).unwrap(), "connectivities") {
+            Ok(_) => panic!("a non-square obsp was accepted"),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("square"), "{err}");
+}
+
+#[test]
+fn a_three_column_batch_with_the_wrong_field_names_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = 4;
+    let path = dir.path().join("misnamed.scx");
+    let mut w = ScxWriter::new(&path, header(n as u64)).unwrap();
+    w.write_obs(&obs(n)).unwrap();
+    w.write_var(&var(4)).unwrap();
+    let schema = Schema::new(vec![
+        Field::new("i", DataType::Int32, false),
+        Field::new("j", DataType::Int32, false),
+        Field::new("v", DataType::Float32, false),
+    ])
+    .with_metadata(coo_meta(n, n));
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Int32Array::from(vec![0])),
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Float32Array::from(vec![1.0f32])),
+        ],
+    )
+    .unwrap();
+    w.write_obsp("connectivities", &batch).unwrap();
+    w.finish().unwrap();
+    let err =
+        match BackedPairwiseReader::new_obsp(ScxReader::open(&path).unwrap(), "connectivities") {
+            Ok(_) => panic!("a batch with the wrong field names was read as COO"),
+            Err(e) => e.to_string(),
+        };
+    assert!(err.contains("row/col/data"), "{err}");
 }
 
 #[test]
@@ -528,7 +632,7 @@ fn a_non_coo_section_under_obsp_is_refused_rather_than_misread() {
             Ok(_) => panic!("a 2-column section under obsp/ was accepted as COO"),
             Err(e) => e.to_string(),
         };
-    assert!(err.contains("3-column COO batch"), "{err}");
+    assert!(err.contains("row/col/data"), "{err}");
 }
 
 #[test]

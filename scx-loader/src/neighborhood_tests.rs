@@ -555,12 +555,13 @@ fn batch_plans_shuffle_is_seed_reproducible_and_seed_sensitive() {
 }
 
 #[test]
-fn batch_plans_rebases_an_already_batched_list() {
-    // `batch_plans` accepts multi-set plans and re-bases each set, not just the
-    // whole input — so batching an already-batched list is idempotent in shape
-    // rather than collapsing its sets into one. That generality was untested,
-    // which is the only thing wrong with having it.
-    let n = 12;
+fn batch_plans_refuses_a_multi_set_plan_so_sets_per_batch_means_sets() {
+    // `sets_per_batch` used to chunk *plans*, so on a multi-set input it
+    // silently meant something else: re-batching an already-batched list at 2
+    // produced outputs of six sets each. A knob that means two things
+    // depending on its input is worse than one that refuses, and nothing
+    // needed the multi-set mode.
+    let n = 9;
     let rows = rows_from(&ring(n), n);
     let mut singles = NeighborhoodPlans::default();
     plans_from_graph_chunk(
@@ -573,35 +574,14 @@ fn batch_plans_rebases_an_already_batched_list() {
     );
 
     let once = batch_plans(&singles.plans, 3, None).unwrap();
-    let twice = batch_plans(&once, 2, None).unwrap();
-
-    // Six sets of three, re-batched two plans at a time: two plans out, each
-    // holding six sets, and every set still delimited on its own.
-    assert_eq!(once.len(), 4);
-    assert_eq!(twice.len(), 2);
-    let sets = |v: &Vec<SparseCellSetPlan>| -> Vec<Vec<u64>> {
-        v.iter()
-            .flat_map(|p| {
-                p.set_offsets
-                    .windows(2)
-                    .map(|w| p.rows[w[0] as usize..w[1] as usize].to_vec())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    };
-    assert_eq!(sets(&twice), sets(&once));
-    assert_eq!(
-        sets(&twice),
-        singles
-            .plans
-            .iter()
-            .map(|p| p.rows.clone())
-            .collect::<Vec<_>>()
-    );
-    for p in &twice {
-        assert_eq!(p.set_offsets[0], 0);
-        assert_eq!(*p.set_offsets.last().unwrap() as usize, p.rows.len());
+    assert_eq!(once.len(), 3);
+    for b in &once {
+        assert_eq!(b.set_offsets.len() - 1, 3, "three sets per batch, as asked");
     }
+
+    let err = batch_plans(&once, 2, None).unwrap_err().to_string();
+    assert!(err.contains("not a single set"), "{err}");
+    assert!(err.contains("sets_per_batch counts sets"), "{err}");
 }
 
 #[test]
@@ -611,11 +591,10 @@ fn batch_plans_refuses_a_zero_batch_size() {
 }
 
 #[test]
-fn batch_plans_refuses_a_plan_whose_offsets_are_not_an_indptr() {
-    // The rebase adds a running base to each input's offsets, so a plan that
-    // does not start at 0 would be shifted into the wrong place and produce a
-    // batch whose sets are silently wrong. `batch_plans` is public and takes
-    // whatever a caller has, so this is refused rather than assumed.
+fn batch_plans_refuses_a_plan_that_is_not_exactly_one_set() {
+    // Every input must be `[0, rows.len()]`. That is what makes the rebase
+    // correct — it appends exactly one offset per input — and what makes
+    // `sets_per_batch` count sets rather than plans.
     let good = SparseCellSetPlan {
         file_ids: vec![0; 3],
         rows: vec![1, 2, 3],
@@ -630,21 +609,21 @@ fn batch_plans_refuses_a_plan_whose_offsets_are_not_an_indptr() {
                 set_offsets: vec![1, 3],
                 ..good.clone()
             },
-            "must start at 0",
+            "not a single set",
         ),
         (
             SparseCellSetPlan {
                 set_offsets: vec![0, 2],
                 ..good.clone()
             },
-            "must start at 0",
+            "not a single set",
         ),
         (
             SparseCellSetPlan {
-                set_offsets: vec![0, 2, 1, 3],
+                set_offsets: vec![0, 2, 3],
                 ..good.clone()
             },
-            "non-monotonic",
+            "not a single set",
         ),
         (
             SparseCellSetPlan {
@@ -702,7 +681,7 @@ mod fixture {
         pub coords: Vec<f32>,
     }
 
-    fn obs(n: usize) -> arrow::array::RecordBatch {
+    pub fn obs_batch(n: usize) -> arrow::array::RecordBatch {
         let ids: Vec<String> = (0..n).map(|i| format!("spot_{i}")).collect();
         arrow::array::RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -717,7 +696,7 @@ mod fixture {
         .unwrap()
     }
 
-    fn var(n: usize) -> arrow::array::RecordBatch {
+    pub fn var_batch(n: usize) -> arrow::array::RecordBatch {
         let ids: Vec<String> = (0..n).map(|i| format!("gene_{i}")).collect();
         arrow::array::RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
@@ -835,8 +814,8 @@ mod fixture {
             FileHeader::new_single_modality(n as u64, 4, 0, 16384, 0, 0),
         )
         .unwrap();
-        w.write_obs(&obs(n)).unwrap();
-        w.write_var(&var(4)).unwrap();
+        w.write_obs(&obs_batch(n)).unwrap();
+        w.write_var(&var_batch(4)).unwrap();
         if sharded {
             let per = n.div_ceil(n_shards);
             for s in 0..n_shards {
@@ -1314,4 +1293,58 @@ fn the_two_builders_order_a_set_differently_and_both_are_pinned() {
     cs.sort();
     assert_eq!(gs, cs);
     assert_ne!(grows, crows);
+}
+
+#[test]
+fn a_null_coordinate_is_refused_rather_than_read_from_the_buffer() {
+    // `values()` on a nullable Arrow column hands back the raw buffer, so a
+    // null slot reads as whatever is in it. Round 1 added this guard to the
+    // COO decoder and not here, where it matters more: a bogus-but-finite
+    // value sails past the `is_finite` check and puts the cell in a
+    // neighbourhood it is not in, while a non-finite bit pattern raises "NaN
+    // coordinate" and names the wrong defect.
+    //
+    // Written at this layer rather than in pyscx because `from_anndata` does
+    // not round-trip a nullable `obsm` — the writer is what would have to
+    // change for the Python route to exist at all.
+    use arrow::array::Float32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use scx_format_io::header::FileHeader;
+    use scx_format_io::writer::ScxWriter;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let n = 6usize;
+    let path = dir.path().join("nullcoord.scx");
+    let mut w = ScxWriter::new(
+        &path,
+        FileHeader::new_single_modality(n as u64, 4, 0, 16384, 0, 0),
+    )
+    .unwrap();
+    w.write_obs(&fixture::obs_batch(n)).unwrap();
+    w.write_var(&fixture::var_batch(4)).unwrap();
+    let schema = Schema::new(vec![
+        Field::new("0", DataType::Float32, true),
+        Field::new("1", DataType::Float32, true),
+    ]);
+    let xs: Vec<Option<f32>> = (0..n).map(|i| Some(i as f32)).collect();
+    let mut ys: Vec<Option<f32>> = (0..n).map(|i| Some(i as f32)).collect();
+    ys[2] = None;
+    let batch = arrow::array::RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(Float32Array::from(xs)),
+            Arc::new(Float32Array::from(ys)),
+        ],
+    )
+    .unwrap();
+    w.write_obsm("spatial", &batch).unwrap();
+    w.finish().unwrap();
+
+    let err = read_coords(&path, "spatial").unwrap_err().to_string();
+    assert!(err.contains("null entries"), "{err}");
+    assert!(
+        err.contains("column 1"),
+        "the error must name the column: {err}"
+    );
 }

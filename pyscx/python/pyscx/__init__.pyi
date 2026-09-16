@@ -1443,7 +1443,7 @@ def neighborhood_plans_from_graph(
     *,
     file_id: int,
     k: int | None = None,
-    weight_order: Literal["desc", "asc"] = "desc",
+    weight_order: Literal["desc", "asc"] | None = None,
     include_center: bool = True,
     drop_deleted: bool = True,
     chunk_rows: int = 65536,
@@ -1455,19 +1455,22 @@ def neighborhood_plans_from_graph(
     ``weight_order`` end with ties by column ascending; ``None`` keeps every
     stored edge in column order.
 
-    ⚠️ ``weight_order`` has no safe per-key default and is not inferred from the
-    key's name. ``"desc"`` suits an affinity graph (``connectivities``: larger =
-    closer); ``"asc"`` suits a distance graph (``distances``: larger = farther).
-    The wrong one with ``k`` returns each cell's ``k`` **farthest** neighbours.
+    ⚠️ ``weight_order`` is **required whenever ``k`` is given** and has no
+    default: ``"desc"`` suits an affinity graph (``connectivities``: larger =
+    closer), ``"asc"`` a distance graph (``distances``: larger = farther). A
+    default would be right for the default key and silently wrong the moment a
+    caller changed only the key, returning each cell's ``k`` **farthest**
+    neighbours.
 
     ``file_id`` is **required** — this file's position in the
     `SparseCellSetDataset` manifest the plans will be gathered with, not a file
     identity, and nothing checks it against the file.
 
     Rows are **physical**: a deleted centre yields no set (so ``centers`` is
-    shorter than ``n_obs``). Without ``k`` a set is short by whatever neighbours
-    are gone; with ``k``, deleted rows are not candidates, so the ``k`` best
-    *live* neighbours are taken and the set is still ``k`` wide.
+    shorter than ``n_obs``) and a deleted neighbour is never emitted. Without
+    ``k`` a set is short by whatever is gone; with ``k``, deleted rows are not
+    candidates, so the ``k`` best *live* neighbours are taken and the set is
+    still ``k`` wide.
 
     The graph is read one ``chunk_rows`` range at a time; a graph stored as a
     single unsharded section — what ``scx sort`` emits — is decoded whole."""

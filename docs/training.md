@@ -662,12 +662,13 @@ file A, hand them to a dataset whose manifest puts A third, and you gather the
 *first* file's rows with nothing raising — so it is keyword-only and required
 rather than defaulting to `0`, which would make that the quiet path.
 
-**`weight_order` decides which end of the graph `k` keeps, and the key's name
-does not.** scanpy's `obsp["connectivities"]` is an affinity — larger means
-closer, so `"desc"`. Its `obsp["distances"]` is a metric — larger means
-farther, so `"asc"`. Asking for `k=8` on a distance graph under the default
-returns each spot's eight **farthest** stored neighbours: a valid plan, and the
-opposite of the query. Non-finite weights sort last either way, so a distance
+**`weight_order` decides which end of the graph `k` keeps, and it is required
+whenever `k` is given.** scanpy's `obsp["connectivities"]` is an affinity —
+larger means closer, so `"desc"`. Its `obsp["distances"]` is a metric — larger
+means farther, so `"asc"`. There is deliberately no default: one would be right
+for the default key and silently wrong the moment you changed only the key,
+handing back each spot's eight **farthest** stored neighbours — a valid plan,
+and the opposite of the query. Non-finite weights sort last either way, so a distance
 graph's `inf` for "not connected" is never chosen as a near neighbour. Sets never span files: a neighbourhood is
 within-file by construction, which is what spares this regime the
 `remap_tables` requirement R2 has.
@@ -675,8 +676,8 @@ within-file by construction, which is what spares this regime the
 **Deleted cells are dropped, not renumbered.** The emitted rows are physical
 file rows, which is what the gather wants. A deleted centre yields no set at all
 — `centers` is then shorter than `n_obs` and says which centres survived — and a
-deleted neighbour is dropped from every set it appeared in. Pass
-`drop_deleted=False` to build over physical rows including deleted ones.
+deleted neighbour is never emitted. Pass `drop_deleted=False` to build over
+physical rows including deleted ones.
 
 What "dropped" costs a set depends on `k`. **Without** it — every stored edge,
 or a radius query — the set is simply short by whatever is gone. **With** it,

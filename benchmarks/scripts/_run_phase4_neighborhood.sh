@@ -5,7 +5,11 @@
 # `gather_neighborhood_graph` / `_coords` do not exist on `main` — there is no
 # "before" build that emits them, so there is no ratio to take and no sign test
 # to run. A two-build job here would spend half its wall producing a column of
-# `None`. What the two builds WOULD have told us — that nothing else regressed —
+# `None`. ⚠️ The four pre-existing `cellsets_per_sec__gather_*` metrics this job
+# records on the same runs are NOT a substitute: every run is a head build, so
+# their stability is within-build variance and not a comparison against `main`.
+# They would show a shared gather path going unstable under the new arms sharing
+# its process; they cannot show a regression. What the two builds WOULD have told us —
 # is covered instead by the four pre-existing `cellsets_per_sec__gather_*`
 # metrics, which this job records on the same runs: they come from the same
 # module and the same fixture, so a change in the shared gather path shows up in
@@ -189,8 +193,10 @@ import json, os, pathlib, statistics, sys
 from benchmarks.comprehensive.scripts.run_parallel import _run_benchmark
 
 # The first six are the NEW arms; the last four are the pre-existing gather
-# scenarios, recorded on the same runs so that "nothing else moved" is a
-# measurement on this fixture rather than an inference from another one.
+# scenarios, recorded on the same runs. See the header: every run is a head
+# build, so those four are within-build variance and NOT a comparison against
+# `main` — they would catch a shared gather path going unstable under the new
+# arms, and they cannot catch a regression.
 METRICS = (
     "cellsets_per_sec__gather_neighborhood_graph",
     "cellsets_per_sec__gather_neighborhood_coords",

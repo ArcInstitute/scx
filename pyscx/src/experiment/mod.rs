@@ -398,12 +398,12 @@ impl PyExperiment {
         // fresh reader is fresh by definition — without this the handle would
         // answer here while refusing everywhere else. Same reasoning, same
         // shape as `materialize::gather_rows_sparse_impl`.
-        let reader = self.reader()?;
-        let kept: Option<Vec<u64>> = if logical {
-            crate::convert::compute_kept_to_global(reader)?
-        } else {
-            None
-        };
+        // Gate on this handle's freshness, then do nothing else attached.
+        // `compute_kept_to_global` used to run here, and it decodes the
+        // deletion section and allocates an `n_obs` mask — real work, under the
+        // GIL, on the path the rest of this method was just moved off. The
+        // detached block below builds the mask from the reader it opens anyway.
+        let _fresh = self.reader()?;
         let path = self.path.clone();
         let key = key.to_string();
 
@@ -416,11 +416,14 @@ impl PyExperiment {
         /// `(indptr, indices, data, column extent)` of one decoded block.
         type ObspBlock = (Vec<i64>, Vec<i64>, Vec<f32>, usize);
         let decoded: PyResult<ObspBlock> = py.detach(move || {
-            let backed = scx_format_io::BackedPairwiseReader::new_obsp(
-                ScxReader::open(&path).map_err(to_pyerr)?,
-                &key,
-            )
-            .map_err(to_pyerr)?;
+            let scx = ScxReader::open(&path).map_err(to_pyerr)?;
+            let kept: Option<Vec<u64>> = if logical {
+                crate::convert::compute_kept_to_global(&scx)?
+            } else {
+                None
+            };
+            let backed =
+                scx_format_io::BackedPairwiseReader::new_obsp(scx, &key).map_err(to_pyerr)?;
             let n_axis = match &kept {
                 Some(k) => k.len(),
                 None => backed.n_rows() as usize,

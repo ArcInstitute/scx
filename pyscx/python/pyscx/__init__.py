@@ -1180,7 +1180,11 @@ def _coerce_read_path(p):
     reason and with the same message.
     """
     if getattr(p, "reload", None) is not None and isinstance(getattr(p, "path", None), str):
-        p.n_obs  # noqa: B018 — the guard IS the side effect
+        # `n_obs_physical`, not `n_obs`: both go through the guarded reader, but
+        # `n_obs` also decodes the deletion section and builds an n_obs mask —
+        # work the builder is about to do again on its own reader. This probe
+        # exists to make the handle raise, not to compute anything.
+        p.n_obs_physical  # noqa: B018 — the guard IS the side effect
     return _coerce_path(p)
 
 
@@ -1190,7 +1194,7 @@ def neighborhood_plans_from_graph(
     *,
     file_id,
     k=None,
-    weight_order="desc",
+    weight_order=None,
     include_center=True,
     drop_deleted=True,
     chunk_rows=65536,
@@ -1216,8 +1220,8 @@ def neighborhood_plans_from_graph(
     Rows are **physical** file rows, which is what the gather wants. Deleted
     cells are dropped rather than renumbered: a deleted centre produces no set
     at all (so `centers` is shorter than `n_obs` and says which survived), and a
-    deleted neighbour is dropped from every set, leaving a shorter set rather
-    than a backfilled one.
+    deleted neighbour is never emitted. What that costs a set depends on `k` —
+    see the `k` argument.
 
     Args:
         path: The SCX file (str, os.PathLike, or an open Experiment).
@@ -1235,16 +1239,18 @@ def neighborhood_plans_from_graph(
             centre whose nearest neighbour is deleted gets its next one. Without
             `k`, a set is simply short by whatever is gone. Both are stated
             because they are different answers, not an inconsistency.
-        weight_order: `"desc"` (default) keeps the **largest** weights — an
-            affinity graph such as scanpy's `obsp["connectivities"]`, where
-            larger means closer. `"asc"` keeps the smallest — a distance graph
-            such as `obsp["distances"]`, where larger means farther.
+        weight_order: **Required whenever `k` is given**, and ignored without it.
+            `"desc"` keeps the **largest** weights — an affinity graph such as
+            scanpy's `obsp["connectivities"]`, where larger means closer.
+            `"asc"` keeps the smallest — a distance graph such as
+            `obsp["distances"]`, where larger means farther.
 
-            ⚠️ There is no safe per-key default and this is not inferred from
-            the key's name, which is yours to choose: `k` with `"desc"` against
-            a distance graph returns each cell's `k` **farthest** stored
-            neighbours, a structurally valid plan that answers the opposite
-            question.
+            ⚠️ There is no default, deliberately. A default of `"desc"` is
+            right for the default key and silently wrong the moment you change
+            only the key: `k=8` on `"distances"` would return each cell's eight
+            **farthest** stored neighbours, a structurally valid plan that
+            answers the opposite question. Documenting that is weaker than
+            refusing it, so the direction is yours to state.
         include_center: Emit the centre at position 0 with `role_tag` 0.
             With False a set is its neighbours only, and a self-loop is then an
             ordinary edge rather than a duplicate of the centre.

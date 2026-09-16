@@ -62,21 +62,6 @@ struct PairwiseShard {
     vals: Vec<f32>,
 }
 
-/// `MappingShardLayoutEntry` → a transient `FullCatalogEntry` the section
-/// reader can take. The layout entry is retained as-is rather than copied into
-/// a private twin: the two carried the same six fields.
-fn transient_entry(e: &crate::reader::MappingShardLayoutEntry) -> FullCatalogEntry {
-    FullCatalogEntry {
-        name: String::new(),
-        offset: e.offset,
-        length: e.length,
-        section_type: e.section_type,
-        checksum: [0u8; 32],
-        modality_id: e.modality_id,
-        stats: None,
-    }
-}
-
 /// One row range of a pairwise mapping, as CSR.
 ///
 /// `indptr` has `n_rows + 1` entries and starts at 0; row `i` of the range is
@@ -160,10 +145,14 @@ impl BackedPairwiseReader {
         // The COO schema is exactly `row` / `col` / `data`. Anything else is a
         // section written by something this reader does not understand, and
         // reading it as COO would answer confidently wrong.
-        if layout.n_cols != 3 {
+        // Three columns, and the right three. A batch that happens to have
+        // three of something else would be read as coordinates and answer
+        // confidently wrong; the names are the only thing distinguishing a COO
+        // section from an arbitrary triple.
+        let names: Vec<&str> = layout.fields.iter().map(|f| f.name().as_str()).collect();
+        if names != ["row", "col", "data"] {
             return Err(ScxError::InvalidCatalog(format!(
-                "obsp/{name}: expected a 3-column COO batch (row/col/data), found {} columns",
-                layout.n_cols
+                "obsp/{name}: expected the 3-column COO schema row/col/data, found {names:?}"
             )));
         }
         let n_cols = layout.matrix_n_cols.ok_or_else(|| {
@@ -172,6 +161,16 @@ impl BackedPairwiseReader {
                  extent is unknown"
             ))
         })?;
+        // `obsp` is obs x obs by definition, and the plan builders read a
+        // column index as a row id — so a non-square one hands the gather rows
+        // that do not exist. Refused here, where the shape is known, rather
+        // than at gather time where it is someone else's error message.
+        if n_cols != layout.n_rows {
+            return Err(ScxError::InvalidCatalog(format!(
+                "obsp/{name}: {} rows x {n_cols} columns — a pairwise obs mapping must be square",
+                layout.n_rows
+            )));
+        }
         let sorted_entries = layout.entries;
         Ok(BackedPairwiseReader {
             reader,
@@ -275,7 +274,18 @@ impl BackedPairwiseReader {
         // `scx-ops::merge_pairwise` already reads COO obsp shards through it.
         let batch = self
             .reader
-            .read_dense_mapping_entry(&transient_entry(&lite))?;
+            // The layout entry is retained as-is (it carries exactly these
+            // fields); the section reader wants a catalog entry, so one is
+            // built here at the single call site.
+            .read_dense_mapping_entry(&FullCatalogEntry {
+                name: String::new(),
+                offset: lite.offset,
+                length: lite.length,
+                section_type: lite.section_type,
+                checksum: [0u8; 32],
+                modality_id: lite.modality_id,
+                stats: None,
+            })?;
         // Per shard, not once at open. The layout resolver takes `n_cols` from
         // shard 0 only, so a later shard with a different schema reached
         // `batch.column(2)` — and arrow's `column` **panics** out of bounds

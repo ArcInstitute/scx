@@ -60,26 +60,43 @@ fn built_to_py(py: Python<'_>, built: NeighborhoodPlans) -> PyResult<Bound<'_, P
     PyTuple::new(py, [plans.into_any(), centers.into_any()])
 }
 
-/// `"desc"` / `"asc"` → [`WeightOrder`], refusing anything else by name.
-fn parse_weight_order(s: &str) -> PyResult<WeightOrder> {
-    match s {
-        "desc" => Ok(WeightOrder::Desc),
-        "asc" => Ok(WeightOrder::Asc),
-        other => Err(PyValueError::new_err(format!(
-            "weight_order must be 'desc' (a connectivity/affinity graph, larger = closer) or \
-             'asc' (a distance graph, larger = farther); got {other:?}"
+/// `"desc"` / `"asc"` → [`WeightOrder`], **required whenever `k` is given**.
+///
+/// A default here is the whole defect: `weight_order="desc"` is right for the
+/// default key and silently wrong the moment a caller changes only the key, and
+/// `neighborhood_plans_from_graph(exp, "distances", file_id=0, k=8)` then
+/// returns each cell's *farthest* stored neighbours. Documenting that is weaker
+/// than refusing it, so with `k` the caller states the direction and without
+/// `k` there is no ranking for it to mean anything about.
+fn resolve_weight_order(k: Option<usize>, order: Option<&str>) -> PyResult<WeightOrder> {
+    match (k, order) {
+        (_, Some("desc")) => Ok(WeightOrder::Desc),
+        (_, Some("asc")) => Ok(WeightOrder::Asc),
+        (_, Some(other)) => Err(PyValueError::new_err(format!(
+            "weight_order must be 'desc' (an affinity graph such as obsp['connectivities'], \
+             where larger means closer) or 'asc' (a distance graph such as obsp['distances'], \
+             where larger means farther); got {other:?}"
         ))),
+        // No ranking happens, so any answer would be a lie about what ran.
+        (None, None) => Ok(WeightOrder::Desc),
+        (Some(_), None) => Err(PyValueError::new_err(
+            "weight_order is required when k is given: it decides which end of the graph's \
+             weights k keeps, and the key's name does not say. Pass weight_order='desc' for an \
+             affinity graph (obsp['connectivities'], larger = closer) or 'asc' for a distance \
+             graph (obsp['distances'], larger = farther). Without it, k on a distance graph \
+             would silently return each cell's FARTHEST neighbours.",
+        )),
     }
 }
 
 /// Graph-driven neighbourhood plans from `obsp/<key>`.
 ///
-/// `file_id` has **no default** — see the module docs. `weight_order` has none
-/// either when `k` is given: the right answer depends on whether the graph's
-/// weights are affinities or distances, and the key's name is the caller's.
+/// `file_id` has **no default** — see the module docs. Nor does `weight_order`
+/// when `k` is given: the right answer depends on whether the graph's weights
+/// are affinities or distances, and the key's name is the caller's.
 #[pyfunction]
 #[pyo3(signature = (
-    path, key="connectivities", *, file_id, k=None, weight_order="desc",
+    path, key="connectivities", *, file_id, k=None, weight_order=None,
     include_center=true, drop_deleted=true, chunk_rows=DEFAULT_GRAPH_CHUNK_ROWS
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -89,7 +106,7 @@ fn _neighborhood_plans_from_graph<'py>(
     key: &str,
     file_id: u32,
     k: Option<usize>,
-    weight_order: &str,
+    weight_order: Option<&str>,
     include_center: bool,
     drop_deleted: bool,
     chunk_rows: u64,
@@ -97,7 +114,7 @@ fn _neighborhood_plans_from_graph<'py>(
     if let Some(0) = k {
         return Err(PyValueError::new_err("k must be >= 1 or None"));
     }
-    let order = parse_weight_order(weight_order)?;
+    let order = resolve_weight_order(k, weight_order)?;
     let p = std::path::Path::new(path);
     let cfg = NeighborhoodConfig {
         include_center,
@@ -160,7 +177,17 @@ fn _neighborhood_plans_from_coords<'py>(
     };
     let built = py
         .detach(|| build_coord_plans(p, obsm_key, drop_deleted, query, cfg))
-        .map_err(loader_err_to_py)?;
+        // A bad argument is a `ValueError`, as `k = 0` already is here — the
+        // dimensionality refusal is the same class of mistake and was arriving
+        // as a `RuntimeError` through `loader_err_to_py`'s catch-all.
+        .map_err(|e| match &e {
+            crate::error::LoaderError::ConfigError { reason }
+                if reason.contains("must be 1..=") || reason.contains("coordinates must be") =>
+            {
+                PyValueError::new_err(reason.clone())
+            }
+            _ => loader_err_to_py(e),
+        })?;
     built_to_py(py, built)
 }
 

@@ -3696,7 +3696,7 @@ plans](training.md#neighbourhood-plans) for the worked example.
 
 | Function | Signature | Returns |
 |---|---|---|
-| `neighborhood_plans_from_graph` | `(path, key="connectivities", *, file_id, k=None, weight_order="desc", include_center=True, drop_deleted=True, chunk_rows=65536)` | `(plans, centers)`. `plans` is a list of `(file_ids, rows, role_tags, set_offsets)` numpy tuples, one per surviving centre; `centers` is those centres' physical rows. `k` keeps `k` edges from the `weight_order` end, ties by column ascending — a rule this function declares because a stored graph carries none; `None` keeps every stored edge in column order. Non-finite weights sort last either way, so a distance graph's `inf` is never picked as a near neighbour. The graph is read one `chunk_rows` range at a time. |
+| `neighborhood_plans_from_graph` | `(path, key="connectivities", *, file_id, k=None, weight_order=None, include_center=True, drop_deleted=True, chunk_rows=65536)` | `(plans, centers)`. `plans` is a list of `(file_ids, rows, role_tags, set_offsets)` numpy tuples, one per surviving centre; `centers` is those centres' physical rows. `k` keeps `k` edges from the `weight_order` end (required with `k`), ties by column ascending — a rule this function declares because a stored graph carries none; `k=None` keeps every stored edge in column order. Non-finite weights sort last either way, so a distance graph's `inf` is never picked as a near neighbour. The graph is read one `chunk_rows` range at a time. |
 | `neighborhood_plans_from_coords` | `(path, obsm_key="spatial", *, file_id, k=None, radius=None, include_center=True, drop_deleted=True)` | `(plans, centers)`, as above. Exactly one of `k` / `radius` is required; neither or both raises rather than resolving to one. A uniform grid is built at call time (O(n), no on-disk index) and searched ring by ring, so the answer is **exact**; ties order by squared distance then row ascending. **1-D, 2-D or 3-D only** — the search is exponential in the dimensionality, so a wide key raises rather than not returning. Integer and float64 columns narrow to float32. |
 | `batch_plans` | `(plans, sets_per_batch, *, shuffle_seed=None)` | Single-set plans concatenated into batch plans. `shuffle_seed` reorders the **sets**, never a set's members. The last batch is short, not dropped. |
 
@@ -3706,11 +3706,12 @@ plans](training.md#neighbourhood-plans) for the worked example.
   Plans built from file A and fed to a dataset whose manifest puts A third
   gather the *first* file's rows, silently. Keyword-only and **required**: a
   default of `0` would make the documented hazard the quiet path.
-- ⚠️ **`weight_order` has no safe per-key default and is not inferred from the
-  key's name.** `"desc"` suits an affinity graph (`connectivities`: larger =
-  closer); `"asc"` suits a distance graph (`distances`: larger = farther). The
-  wrong one with `k` returns each cell's `k` **farthest** neighbours — a
-  structurally valid plan that answers the opposite question.
+- ⚠️ **`weight_order` is required whenever `k` is given, and has no default.**
+  `"desc"` suits an affinity graph (`connectivities`: larger = closer); `"asc"`
+  suits a distance graph (`distances`: larger = farther). A default of `"desc"`
+  would be right for the default key and silently wrong the moment a caller
+  changed only the key — returning each cell's `k` **farthest** neighbours —
+  so the direction is stated rather than documented.
 - ⚠️ **The two builders order a set's neighbours differently.**
   `_from_graph` emits them **column-ascending** — a stored graph carries no
   other order, and re-sorting by weight would make which edges `k` picked also
@@ -3724,8 +3725,8 @@ plans](training.md#neighbourhood-plans) for the worked example.
   over a float64 distance graph can order two very close weights differently
   from `to_anndata().obsp[key]`, which keeps them wide.
 - Rows are **physical**. A deleted centre yields no set (so `centers` is
-  shorter than `n_obs`); a deleted neighbour is dropped from every set, leaving
-  a short set rather than a backfilled one. `drop_deleted=False` opts out.
+  shorter than `n_obs`); a deleted neighbour is never emitted. What that costs
+  a set is the `k` / no-`k` split above. `drop_deleted=False` opts out.
 - A NaN or infinite coordinate on a kept cell **raises**. That differs from the
   tokenisation kernels, which clip a NaN value to zero: zero is a meaningful
   expression level, and a NaN coordinate has no defensible grid cell.

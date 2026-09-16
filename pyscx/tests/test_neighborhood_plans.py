@@ -139,7 +139,9 @@ def test_graph_plans_match_the_numpy_reference(lattice):
 def test_graph_top_k_matches_the_numpy_reference(lattice, k):
     exp = pyscx.open(lattice)
     graph = exp.to_anndata().obsp["connectivities"].tocsr()
-    plans, _ = pyscx.neighborhood_plans_from_graph(exp, file_id=0, k=k)
+    plans, _ = pyscx.neighborhood_plans_from_graph(
+        exp, file_id=0, k=k, weight_order="desc"
+    )
     want_rows, _ = reference_graph_plans(graph, k=k)
     assert as_rows(plans) == want_rows
 
@@ -497,7 +499,7 @@ def big_spatial(tmp_path_factory):
 def test_the_builders_release_the_gil(big_spatial, which):
     if which == "graph":
         call = lambda: pyscx.neighborhood_plans_from_graph(  # noqa: E731
-            big_spatial, k=100, file_id=0
+            big_spatial, file_id=0, k=100, weight_order="desc"
         )
     else:
         call = lambda: pyscx.neighborhood_plans_from_coords(  # noqa: E731
@@ -669,3 +671,68 @@ def test_read_obsp_rows_releases_the_gil(big_spatial):
         f"read_obsp_rows starved a concurrent Python thread for {largest_gap:.3f}s of a "
         f"{duration:.3f}s read ({largest_gap / duration:.0%}) — it is holding the GIL"
     )
+
+
+# ---------------------------------------------------------------------------
+# Review round 2
+# ---------------------------------------------------------------------------
+
+
+def test_k_without_weight_order_is_refused(lattice):
+    """The round-1 fix added the knob and left the wrong answer as the default.
+
+    `weight_order="desc"` is right for the default key and silently wrong the
+    moment a caller changes only the key, so
+    `neighborhood_plans_from_graph(exp, "distances", file_id=0, k=8)` still
+    returned each cell's farthest neighbours. Documenting that is weaker than
+    refusing it.
+    """
+    exp = pyscx.open(lattice)
+    with pytest.raises(ValueError, match="weight_order is required when k is given"):
+        pyscx.neighborhood_plans_from_graph(exp, "connectivities", file_id=0, k=4)
+    with pytest.raises(ValueError, match="weight_order is required when k is given"):
+        pyscx.neighborhood_plans_from_graph(exp, "distances", file_id=0, k=4)
+
+    # Without `k` there is no ranking, so nothing to state: this must work.
+    plans, _ = pyscx.neighborhood_plans_from_graph(exp, file_id=0)
+    assert len(plans) == N
+    # And with both, as before.
+    plans, _ = pyscx.neighborhood_plans_from_graph(
+        exp, file_id=0, k=4, weight_order="asc"
+    )
+    assert len(plans) == N
+
+
+def test_the_dimensionality_refusal_is_a_value_error(tmp_path):
+    """Same class of mistake as `k=0`, so the same exception type.
+
+    It was arriving as a `RuntimeError` through `loader_err_to_py`'s catch-all
+    while `k=0` had been lifted to `ValueError` at both entry points.
+    """
+    import anndata as ad
+    import pandas as pd
+
+    n = 32
+    rng = np.random.default_rng(7)
+    a = ad.AnnData(
+        X=sp.csr_matrix((np.ones(n, dtype=np.float32), (np.arange(n), np.arange(n) % 4)),
+                        shape=(n, 4)),
+        obs=pd.DataFrame(index=[f"c{i}" for i in range(n)]),
+        var=pd.DataFrame(index=[f"g{i}" for i in range(4)]),
+    )
+    a.obsm["X_pca"] = rng.random((n, 12), dtype=np.float32)
+    path = tmp_path / "wide2.scx"
+    pyscx.from_anndata(a, str(path), shard_size=8)
+    exp = pyscx.open(str(path))
+    with pytest.raises(ValueError, match="1..=3|must be 1"):
+        pyscx.neighborhood_plans_from_coords(exp, "X_pca", file_id=0, k=4)
+
+
+def test_batch_plans_requires_single_set_inputs(lattice):
+    """`sets_per_batch` must count sets, not plans."""
+    exp = pyscx.open(lattice)
+    plans, _ = pyscx.neighborhood_plans_from_graph(exp, file_id=0)
+    once = pyscx.batch_plans(plans, 8)
+    assert len(once[0][3]) - 1 == 8, "eight sets in the first batch, as asked"
+    with pytest.raises(Exception, match="not a single set"):
+        pyscx.batch_plans(once, 2)
