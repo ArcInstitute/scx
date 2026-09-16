@@ -224,6 +224,50 @@ stated ways rather than silently. Two gotchas that bite first:
   not the cell's sequencing depth, and a model normalised against whole-cell
   depth must not be fed it.
 
+## Neighbourhood plans (spatial / graph context)
+
+A neighbourhood is a cell set with the centre role-tagged, so no new gather is
+needed — only a plan. Build one from whichever relationship the file already
+stores:
+
+```python
+import pyscx
+
+exp = pyscx.open("tissue.scx")
+
+# From a stored obsp graph (scanpy's connectivities, a spatial adjacency, ...)
+plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8, file_id=0)
+
+# Or straight from obsm["spatial"], with no graph and no index
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, k=8, file_id=0)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, radius=50.0, file_id=0)
+
+ds = pyscx.SparseCellSetDataset(["tissue.scx"])
+for batch in ds.iter_with_plans(pyscx.batch_plans(plans, sets_per_batch=64)):
+    ...   # role_tags: 0 for each set's centre, 1 for its neighbours
+```
+
+The plans feed `gather` / `iter_with_plans` and the tokenisation kernels above
+unchanged. Four things that bite first:
+
+- **`file_id` is a manifest position, not a file identity** — the index of this
+  file in the `SparseCellSetDataset` you will gather with. Get it wrong and you
+  gather a different file's rows with nothing raising.
+- **Rows are physical, and deletions are dropped.** A deleted centre yields no
+  set at all (so `centers` is shorter than `n_obs` and tells you which survived)
+  and a deleted neighbour is dropped from every set rather than backfilled.
+- **Layout, not the builder, decides what this costs.** A converted spatial file
+  is usually in barcode order, where a 7-cell neighbourhood is scattered across
+  the whole row axis and every batch touches every shard. `scx sort` on a key
+  that tracks position is the lever; measure before and after.
+- **`radius` and `k` are mutually exclusive** on the coordinate builder, and
+  passing neither or both raises rather than picking one.
+
+`Experiment.read_obsp_rows(key, start, stop)` is the bounded graph read the
+builder uses, and is public — use it instead of `to_anndata().obsp[k]`, which
+materialises the whole matrix. It is only bounded on a *sharded* graph; `scx
+sort` re-emits obsp unsharded.
+
 ## Train / val / test splits
 
 - **Query-based (recommended):** if obs has a `split` column, materialize each

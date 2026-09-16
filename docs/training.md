@@ -616,6 +616,93 @@ Four things to know before setting it:
 `IndexPlanDataset` takes a single path and has no manifest, so it has no
 `reader_limit` and its `cache_metrics()` carries no `reader_*` keys.
 
+### Neighbourhood plans
+
+A neighbourhood *is* a cell set with the centre role-tagged, so a spatial or
+graph-context workload needs no new gather — only a plan. Two builders produce
+one, from either of the two places the relationship is already stored:
+
+```python
+import pyscx
+
+exp = pyscx.open("tissue.scx")
+
+# From a stored graph — scanpy's obsp["connectivities"], a spatial adjacency,
+# any obs x obs sparse matrix. `k` keeps the heaviest edges per centre.
+plans, centers = pyscx.neighborhood_plans_from_graph(exp, k=8, file_id=0)
+
+# Or straight from coordinates, with no stored graph and no index.
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, k=8, file_id=0)
+plans, centers = pyscx.neighborhood_plans_from_coords(exp, radius=50.0, file_id=0)
+
+ds = pyscx.SparseCellSetDataset(["tissue.scx"])
+for batch in ds.iter_with_plans(pyscx.batch_plans(plans, sets_per_batch=64)):
+    ...   # batch["role_tags"] is 0 for each set's centre, 1 for its neighbours
+```
+
+Each plan is one set: the centre at position 0 with `role_tag` 0, then its
+neighbours with `role_tag` 1. That maps onto Nicheformer's cell + context tokens
+and feeds the [tokenisation kernels](#tokenisation-kernels) per set member
+unchanged. `batch_plans` concatenates single-set plans into batches for
+`iter_with_plans`; `shuffle_seed` reorders the sets, never a set's members.
+
+**`file_id` is a manifest position, not a file identity.** It is the index of
+this file in the `SparseCellSetDataset` you will gather with. Build plans from
+file A, hand them to a dataset whose manifest puts A third, and you gather the
+*first* file's rows with nothing raising — so it is a required argument rather
+than a default that guesses. Sets never span files: a neighbourhood is
+within-file by construction, which is what spares this regime the
+`remap_tables` requirement R2 has.
+
+**Deleted cells are dropped, not renumbered.** The emitted rows are physical
+file rows, which is what the gather wants. A deleted centre yields no set at all
+— `centers` is then shorter than `n_obs` and says which centres survived — and a
+deleted neighbour is dropped from every set it appeared in, leaving a shorter
+set rather than a backfilled one. Pass `drop_deleted=False` to build over
+physical rows including deleted ones.
+
+**The coordinate builder is exact, not approximate.** It bins the points into a
+uniform grid at call time (O(n), no on-disk index) and searches ring by ring, so
+the answer is the true k-nearest or the true radius ball, with ties ordered by
+distance then row. It is deliberately not `scx-accel`'s kNN, which dispatches to
+approximate HNSW above 5,000 cells and has no radius mode. Integer and float64
+coordinate columns are narrowed to float32 — scanpy writes Visium's
+`obsm["spatial"]` as int64 pixel positions. A NaN or infinite coordinate on a
+kept cell raises: unlike an expression value, which clips to zero, a NaN
+coordinate has no defensible grid cell and bucketing it somewhere would put a
+cell in a neighbourhood it is not in.
+
+#### Layout decides what this costs
+
+The plans say *which* cells; the file's row order decides how expensive they are
+to fetch. A spatial file straight from conversion is usually in **barcode
+order**, which has nothing to do with position: on a 4,035-spot Visium sample a
+7-cell neighbourhood spans a median of 3,024 row indices and every batch touches
+every shard — the worst case for a scattered read. `scx sort` on a key that
+tracks position (a grid bin, a cluster label) is the lever that turns those into
+contiguous reads, and it is worth pulling before concluding anything about
+throughput. SCX does not sort for you, and the builders do not care either way.
+
+#### Reading a graph without materialising it
+
+`Experiment.read_obsp_rows(key, start, stop)` is the bounded read the graph
+builder uses, and it is public:
+
+```python
+block = exp.read_obsp_rows("connectivities", 0, 10_000)   # scipy CSR
+```
+
+Only the shards covering the range are decoded, so an atlas-scale graph can be
+walked a block at a time instead of through `to_anndata().obsp[key]`, which
+materialises all of it. Two caveats worth knowing:
+
+- `logical=True` (the default, matching `read_obs`) takes `start` / `stop` in
+  live row space, drops any edge whose *either* endpoint is deleted and
+  renumbers both axes into live space. `logical=False` is the physical graph.
+- A graph stored as **one unsharded section** has to be decoded whole whatever
+  range you ask for — it is a single Arrow batch. `scx sort` writes obsp back
+  that way, so a sorted file's graph is always the unbounded case.
+
 ### Tokenisation kernels
 
 `collate_cellset_gathered` is one model's tokeniser — STATE3's — wired as a
