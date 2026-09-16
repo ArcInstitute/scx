@@ -3314,9 +3314,17 @@ timed runs on `visium_lymph_node` (4,035 spots × 36,601 genes, 8 shards),
 ⚠️ **One-armed, not the paired A/B phases 1–3 ran.** These arms do not exist on
 `main`, so there is no before build and no ratio. The four pre-existing
 `gather_*` metrics were recorded on the same runs instead, so "nothing else
-moved on this fixture" is measured rather than inferred; they sit at 659.8 /
-708.05 sets/s (S=64 random / grouped) and 62.6 / 67.2 (S=512) across all eight
-rounds, spread ≤ 8 %.
+moved on this fixture" is measured rather than inferred. Three of the four are
+steady across all eight rounds — 659.8 sets/s `gather_random` (spread 7.9 %),
+708.05 `gather_grouped` (6.2 %) and 62.6 `gather_random_s512` (3.8 %) — and
+that is what carries the claim.
+
+The fourth, `gather_grouped_s512`, is **not** steady and resolves nothing here:
+its median is 67.2 but round 7 reads 122.2, and that round's own three runs span
+66.0 / 122.2 / 171.0 sets/s. On this 4,035-spot fixture an S=512 grouped batch
+is most of the file, so the arm runs a handful of very large plans and a single
+scheduling hiccup moves it 2.6×. The figure is reported rather than trimmed, and
+it is not evidence either way.
 
 #### Steady state, at k = 6 and 146 sets per batch
 
