@@ -4057,8 +4057,9 @@ absolute_floors:
 #
 #     Also recorded rather than gated: `batch_duplicate_factor`. The intuitive
 #     premise — "neighbourhoods overlap, and overlap is the reuse signal" —
-#     does not discriminate. Measured at 146 sets/batch: ordered 1.102,
-#     shuffled 1.105, random-plan control of the same shape 1.133. Random sets
+#     does not discriminate. Measured at 146 sets/batch: 1.1023 in centre order,
+#     shuffled 1.1084, random-plan control of the same set size and batch
+#     width 1.1286. Random sets
 #     duplicate rows MORE than neighbourhoods do.
 #
 #     ACTIVATION, once a baseline carries the arms AND the dataset is in a tier:

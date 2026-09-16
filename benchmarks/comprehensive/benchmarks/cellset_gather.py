@@ -934,8 +934,9 @@ def _neighborhood_premises(scx_path: str) -> dict[str, Any]:
     Set overlap is recorded, **not** gated, and that is a correction to the
     obvious design. "Neighbourhoods overlap, and overlap is the reuse signal"
     does not discriminate: measured on the Visium fixture at 146 sets/batch,
-    ordered 1.102, shuffled 1.105, and a random-plan control of the same shape
-    **1.133**. Random sets duplicate rows *more* than neighbourhoods do, because
+    1.1023 in centre order, **1.1084** shuffled (the value a capture's
+    `locality.batch_duplicate_factor` carries) and **1.1286** for a random-plan
+    control of the same set size and batch width. Random sets duplicate rows *more* than neighbourhoods do, because
     neighbourhoods partition the tissue while random draws collide freely, so a
     bar anywhere near those numbers would have passed on random plans and told
     nobody anything. What is gated instead is that the sets really are
